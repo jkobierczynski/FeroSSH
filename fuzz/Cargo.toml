@@ -11,6 +11,8 @@ cargo-fuzz = true
 [dependencies]
 libfuzzer-sys = "0.4"
 ferossh-ipc = { path = "../crates/ipc" }
+ferossh-render = { path = "../crates/render" }
+ferossh-term = { path = "../crates/term" }
 
 # Kept out of the main workspace: fuzzing needs nightly and libFuzzer.
 [workspace]
@@ -18,6 +20,13 @@ ferossh-ipc = { path = "../crates/ipc" }
 [[bin]]
 name = "ipc_decode"
 path = "fuzz_targets/ipc_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "term_feed"
+path = "fuzz_targets/term_feed.rs"
 test = false
 doc = false
 bench = false
