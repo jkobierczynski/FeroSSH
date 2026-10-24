@@ -47,6 +47,9 @@ impl Flags {
     pub const WIDE: Flags = Flags(1 << 4);
     /// The right half of a double-width character; draws nothing itself.
     pub const WIDE_SPACER: Flags = Flags(1 << 5);
+    /// Faint text: drawn halfway between foreground and background.
+    pub const DIM: Flags = Flags(1 << 6);
+    pub const STRIKEOUT: Flags = Flags(1 << 7);
 
     pub const fn empty() -> Self {
         Flags(0)
@@ -77,6 +80,9 @@ pub struct Cell {
     pub fg: Color,
     pub bg: Color,
     pub flags: Flags,
+    /// Combining marks drawn with `ch`, as an index into the grid's cluster
+    /// table plus one; 0 means none.
+    pub cluster: u16,
 }
 
 impl Cell {
@@ -85,7 +91,19 @@ impl Cell {
         fg: Color::Default,
         bg: Color::Default,
         flags: Flags::empty(),
+        cluster: 0,
     };
+
+    /// A cell with no combining marks.
+    pub const fn new(ch: char, fg: Color, bg: Color, flags: Flags) -> Self {
+        Self {
+            ch,
+            fg,
+            bg,
+            flags,
+            cluster: 0,
+        }
+    }
 
     /// True when the cell shows no glyph (its background may still show).
     pub fn is_empty_glyph(&self) -> bool {

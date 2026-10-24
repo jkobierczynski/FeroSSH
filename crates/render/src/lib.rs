@@ -10,6 +10,7 @@
 
 mod atlas;
 mod cell;
+mod cursor;
 #[cfg(windows)]
 mod d2d;
 mod font;
@@ -18,8 +19,9 @@ mod theme;
 
 pub use atlas::{AtlasPacker, Slot};
 pub use cell::{Cell, Color, Flags, Rgb};
+pub use cursor::{Cursor, CursorShape};
 #[cfg(windows)]
-pub use d2d::{Cursor, CursorShape, Frame, PaneView, PixelRect, Renderer};
+pub use d2d::{Frame, PaneView, PixelRect, Renderer};
 pub use font::{CellMetrics, DesignMetrics, FontSpec};
 pub use grid::Grid;
 pub use theme::Theme;

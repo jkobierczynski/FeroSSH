@@ -1,14 +1,20 @@
 //! FeroSSH entry point.
 //!
-//! Milestone 1 opens one terminal pane that shows the renderer test pattern
-//! and echoes what you type, so the window, renderer and DPI handling can be
-//! checked before a terminal emulator or SSH session exists.
+//! Milestone 2 opens one terminal pane on a local shell (ConPTY), so the
+//! emulator, keyboard and mouse handling can be used for real before SSH
+//! sessions arrive in milestone 3. `ferossh.exe <command>` runs that
+//! command instead of `cmd.exe`, for example `ferossh.exe wsl` or
+//! `ferossh.exe ssh host`.
 
 #![cfg_attr(windows, windows_subsystem = "windows")]
 
+#[cfg(windows)]
+mod clipboard;
+#[cfg(windows)]
+mod conpty;
 // Only the Windows build has a window to show it in.
 #[cfg_attr(not(windows), allow(dead_code))]
-mod echo;
+mod pattern;
 #[cfg(windows)]
 mod win;
 

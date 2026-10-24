@@ -9,6 +9,8 @@ pub struct Grid {
     rows: usize,
     cells: Vec<Cell>,
     dirty: Vec<bool>,
+    /// Combining marks for cells whose `cluster` is non-zero.
+    clusters: Vec<String>,
 }
 
 impl Grid {
@@ -21,6 +23,7 @@ impl Grid {
             rows,
             cells: vec![Cell::BLANK; cols * rows],
             dirty: vec![true; rows],
+            clusters: Vec::new(),
         }
     }
 
@@ -49,6 +52,65 @@ impl Grid {
         }
         self.mark_dirty(y);
         self.cells.get_mut(y * self.cols + x)
+    }
+
+    /// Replaces one row, marking it dirty only if it changed. `cells` is
+    /// cut or padded with blanks to the grid width.
+    pub fn set_row(&mut self, y: usize, cells: impl IntoIterator<Item = Cell>) {
+        if y >= self.rows {
+            return;
+        }
+        let start = y * self.cols;
+        let Some(row) = self.cells.get_mut(start..start + self.cols) else {
+            return;
+        };
+        let mut src = cells.into_iter();
+        let mut changed = false;
+        for dst in row.iter_mut() {
+            let cell = src.next().unwrap_or(Cell::BLANK);
+            if *dst != cell {
+                *dst = cell;
+                changed = true;
+            }
+        }
+        if changed {
+            self.mark_dirty(y);
+        }
+    }
+
+    /// Forgets the combining-mark clusters once more than `max` have piled
+    /// up, and marks every row dirty because their ids are now stale. Ids
+    /// are otherwise stable, so `set_row` can compare cells by id. Call it
+    /// only before refilling the whole grid.
+    pub fn trim_clusters(&mut self, max: usize) {
+        if self.clusters.len() > max {
+            self.clusters.clear();
+            self.cells.fill(Cell::BLANK);
+            self.mark_all_dirty();
+        }
+    }
+
+    /// Stores combining marks and returns the id for `Cell::cluster`, or 0
+    /// when the table is full (the marks are then dropped).
+    pub fn add_cluster(&mut self, marks: &str) -> u16 {
+        if let Some(i) = self.clusters.iter().position(|c| c == marks) {
+            return u16::try_from(i + 1).unwrap_or(0);
+        }
+        match u16::try_from(self.clusters.len() + 1) {
+            Ok(id) if id < u16::MAX => {
+                self.clusters.push(marks.to_owned());
+                id
+            }
+            _ => 0,
+        }
+    }
+
+    /// The combining marks of a cell, or "" if it has none.
+    pub fn cluster(&self, cell: &Cell) -> &str {
+        usize::from(cell.cluster)
+            .checked_sub(1)
+            .and_then(|i| self.clusters.get(i))
+            .map_or("", String::as_str)
     }
 
     /// Blanks every cell of one row.
@@ -96,6 +158,9 @@ impl Grid {
         self.rows = rows;
         self.cells = cells;
         self.dirty = vec![true; rows];
+        if self.cells.iter().all(|c| c.cluster == 0) {
+            self.clusters.clear();
+        }
     }
 
     pub fn is_dirty(&self, y: usize) -> bool {
@@ -162,6 +227,43 @@ mod tests {
         g.scroll_up();
         assert_eq!(g.cell(0, 0).unwrap().ch, 'b');
         assert_eq!(g.cell(0, 1).unwrap().ch, ' ');
+    }
+
+    #[test]
+    fn set_row_marks_only_changes() {
+        let mut g = Grid::new(3, 2);
+        g.clear_dirty();
+        g.set_row(1, [Cell::BLANK; 3]);
+        assert!(!g.any_dirty());
+        let x = Cell {
+            ch: 'x',
+            ..Cell::BLANK
+        };
+        g.set_row(1, [x]);
+        assert_eq!(g.dirty_span(), Some((1, 1)));
+        assert_eq!(g.row(1).unwrap(), &[x, Cell::BLANK, Cell::BLANK]);
+        g.set_row(5, [x]);
+    }
+
+    #[test]
+    fn clusters_are_interned() {
+        let mut g = Grid::new(2, 1);
+        let a = g.add_cluster("\u{301}");
+        assert_eq!(g.add_cluster("\u{301}"), a);
+        let b = g.add_cluster("\u{308}");
+        assert_ne!(a, b);
+        let cell = Cell {
+            cluster: b,
+            ..Cell::BLANK
+        };
+        assert_eq!(g.cluster(&cell), "\u{308}");
+        assert_eq!(g.cluster(&Cell::BLANK), "");
+        g.clear_dirty();
+        g.trim_clusters(2);
+        assert!(!g.any_dirty());
+        g.trim_clusters(1);
+        assert!(g.any_dirty());
+        assert_eq!(g.cluster(&cell), "");
     }
 
     #[test]

@@ -41,6 +41,7 @@ use windows::core::{BOOL, Error, HSTRING, Result, w};
 
 use crate::atlas::{AtlasPacker, Slot};
 use crate::cell::{Cell, Flags, Rgb};
+use crate::cursor::{Cursor, CursorShape};
 use crate::font::{CellMetrics, DesignMetrics, FontSpec};
 use crate::grid::Grid;
 use crate::theme::Theme;
@@ -72,21 +73,6 @@ pub struct PixelRect {
     pub top: i32,
     pub right: i32,
     pub bottom: i32,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum CursorShape {
-    /// Filled cell, for the focused pane.
-    Block,
-    /// Outline, for an unfocused pane.
-    Hollow,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Cursor {
-    pub x: usize,
-    pub y: usize,
-    pub shape: CursorShape,
 }
 
 /// One pane to draw: its cells and how it wants them to look.
@@ -130,16 +116,18 @@ impl FontKey {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 struct GlyphKey {
     ch: char,
+    /// Combining marks drawn with `ch`; empty (and unallocated) for most.
+    marks: String,
     /// Index into `Font::formats`: bit 0 bold, bit 1 italic.
     style: u8,
     wide: bool,
 }
 
 impl GlyphKey {
-    fn of(cell: &Cell) -> Self {
+    fn of(cell: &Cell, grid: &Grid) -> Self {
         let mut style = 0;
         if cell.flags.contains(Flags::BOLD) {
             style |= 1;
@@ -149,6 +137,7 @@ impl GlyphKey {
         }
         Self {
             ch: cell.ch,
+            marks: grid.cluster(cell).to_owned(),
             style,
             wide: cell.flags.contains(Flags::WIDE),
         }
@@ -284,7 +273,11 @@ impl Renderer {
             let keys = needed.entry(FontKey::new(p.font, dpi)).or_default();
             for y in rows_to_draw(p, fresh) {
                 if let Some(row) = p.grid.row(y) {
-                    keys.extend(row.iter().filter(|c| !c.is_empty_glyph()).map(GlyphKey::of));
+                    keys.extend(
+                        row.iter()
+                            .filter(|c| !c.is_empty_glyph())
+                            .map(|c| GlyphKey::of(c, p.grid)),
+                    );
                 }
             }
         }
@@ -499,7 +492,7 @@ impl Atlas {
         }
         let (cw, ch) = (font.metrics.width, font.metrics.height);
         let mut evicted = false;
-        let mut utf16 = [0u16; 2];
+        let mut utf16: Vec<u16> = Vec::new();
         // SAFETY: drawing calls on our own atlas target between Begin and
         // EndDraw, with valid pointers to locals.
         unsafe {
@@ -530,8 +523,12 @@ impl Atlas {
                     .PushAxisAlignedClip(&rect, D2D1_ANTIALIAS_MODE_ALIASED);
                 self.rt.Clear(Some(&TRANSPARENT));
                 if let Some(format) = font.formats.get(usize::from(key.style)) {
+                    utf16.clear();
+                    let mut unit = [0u16; 2];
+                    utf16.extend_from_slice(key.ch.encode_utf16(&mut unit));
+                    utf16.extend(key.marks.encode_utf16());
                     self.rt.DrawText(
-                        key.ch.encode_utf16(&mut utf16),
+                        &utf16,
                         format,
                         &rect,
                         &self.ink,
@@ -540,7 +537,7 @@ impl Atlas {
                     );
                 }
                 self.rt.PopAxisAlignedClip();
-                self.slots.insert(*key, slot);
+                self.slots.insert(key.clone(), slot);
             }
             self.rt.EndDraw(None, None)
         }
@@ -599,7 +596,10 @@ fn draw_pane(
             if block_at(x, cell) {
                 return (theme.cursor_text, theme.cursor);
             }
-            let (fg, bg) = (theme.fg(cell.fg), theme.bg(cell.bg));
+            let (mut fg, bg) = (theme.fg(cell.fg), theme.bg(cell.bg));
+            if cell.flags.contains(Flags::DIM) {
+                fg = blend(fg, bg);
+            }
             if cell.flags.contains(Flags::INVERSE) {
                 (bg, fg)
             } else {
@@ -623,7 +623,7 @@ fn draw_pane(
             let left = ox + x as f32 * cw;
             let (fg, _) = colours(x, cell);
             if !cell.is_empty_glyph()
-                && let Some(slot) = atlas.slots.get(&GlyphKey::of(cell))
+                && let Some(slot) = atlas.slots.get(&GlyphKey::of(cell, pane.grid))
             {
                 let src = slot_rect(slot);
                 let dst = rect(left, top, left + slot.w as f32, top + slot.h as f32);
@@ -642,6 +642,25 @@ fn draw_pane(
             if cell.flags.contains(Flags::UNDERLINE) {
                 let u = top + m.underline_top;
                 fill(&rect(left, u, left + cw, u + m.underline_thickness), fg);
+            }
+            if cell.flags.contains(Flags::STRIKEOUT) {
+                // Through the middle of lowercase letters.
+                let s = top + (m.baseline * 0.7).round();
+                fill(&rect(left, s, left + cw, s + m.underline_thickness), fg);
+            }
+        }
+        if let Some(c) = cursor {
+            let left = ox + c.x as f32 * cw;
+            let bar = (m.underline_thickness * 2.0).max(2.0).round();
+            match c.shape {
+                CursorShape::Underline => {
+                    fill(
+                        &rect(left, top + ch - bar, left + cw, top + ch),
+                        theme.cursor,
+                    );
+                }
+                CursorShape::Beam => fill(&rect(left, top, left + bar, top + ch), theme.cursor),
+                CursorShape::Block | CursorShape::Hollow => {}
             }
         }
         if let Some(c) = cursor.filter(|c| c.shape == CursorShape::Hollow) {
@@ -678,6 +697,12 @@ fn slot_rect(s: &Slot) -> D2D_RECT_F {
         (s.x + s.w) as f32,
         (s.y + s.h) as f32,
     )
+}
+
+/// Halfway between two colours, for dim text.
+fn blend(a: Rgb, b: Rgb) -> Rgb {
+    let mix = |x: u8, y: u8| ((u16::from(x) + u16::from(y)) / 2) as u8;
+    Rgb::new(mix(a.r, b.r), mix(a.g, b.g), mix(a.b, b.b))
 }
 
 fn color(c: Rgb) -> D2D1_COLOR_F {

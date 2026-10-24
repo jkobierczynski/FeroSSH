@@ -4,19 +4,26 @@
 
 FeroSSH aims to be the smallest, most secure open-source SSH client for Windows: a native PuTTY replacement with tabs, splits, tmux integration and file transfer, shipped as one signed exe with nothing to install.
 
-> **Status:** milestone 1 (window and renderer). The exe opens one terminal pane with a renderer test pattern and local echo; the first SSH session arrives in milestone 3.
+> **Status:** milestone 2 (terminal emulation). The exe opens one terminal pane on a local shell through ConPTY, so the emulator, keyboard and mouse handling can be used for real; the first SSH session arrives in milestone 3.
 
-## Trying the milestone 1 build
+## Trying the milestone 2 build
 
-Download `ferossh-exe` from the latest CI run and start `ferossh.exe`. Type to test local echo; Ctrl+L redraws the test pattern.
+Download `ferossh-exe` from the latest CI run and start `ferossh.exe`. It runs `cmd.exe`; give it a command to run something else, for example `ferossh.exe wsl` or `ferossh.exe ssh myhost` (Windows OpenSSH), which is the easiest way to try vim, htop, tmux or vttest before milestone 3.
 
 | Shortcut | Action |
 | --- | --- |
-| Ctrl+= / Ctrl+- / Ctrl+0 | Larger, smaller, default text size |
+| Ctrl+Shift+C / Ctrl+Shift+V | Copy the selection, paste (also Ctrl+Insert / Shift+Insert) |
+| Ctrl+Shift+F | Find in scrollback (Enter: older match, Shift+Enter: newer, Esc: close) |
+| Shift+PgUp / Shift+PgDn | Scroll back a page, forward a page (Ctrl+Shift+Home/End: top, bottom) |
+| Mouse drag, double-click, triple-click | Select characters, words, lines; Alt+drag selects a block |
+| Shift+drag | Select even when the program has mouse reporting on |
+| Ctrl+click | Open a link (OSC 8) after showing its real target |
+| Ctrl+= / Ctrl+- / Ctrl+0, Ctrl+wheel | Larger, smaller, default text size |
 | Ctrl+Shift+M | Hide the menu bar (Alt shows it again) |
 | View > Font, View > Theme | Font family and colour theme for this pane |
+| View > Show test pattern | Colours, styles, box drawing, wide and combining characters |
 
-Drag the window between monitors with different scaling: the text should stay sharp and the grid should keep its 80x24 cells.
+Edit > Copy on select and Edit > Right-click pastes turn on the PuTTY habits; both are off by default.
 
 ## Design
 
@@ -50,7 +57,9 @@ cargo build --release -p ferossh
 
 The release profile optimises for size and links the C runtime statically, so `target\release\ferossh.exe` runs on a clean Windows 10 1903+ machine.
 
-Checks run in CI: `cargo fmt`, `cargo clippy`, `cargo test`, `cargo deny`, `cargo audit`, and a fuzz smoke run (`cargo +nightly fuzz run --target x86_64-unknown-linux-gnu ipc_decode`).
+Checks run in CI: `cargo fmt`, `cargo clippy`, `cargo test`, `cargo deny`, `cargo audit`, and fuzz smoke runs of the IPC decoder and the terminal (`cargo +nightly fuzz run --target x86_64-unknown-linux-gnu term_feed`).
+
+On Linux or macOS, `cargo run -p ferossh-term --example vttest -- 1 2 8` drives [vttest](https://invisible-island.net/vttest/) through the emulator and prints every screen as text.
 
 ## Licence
 
