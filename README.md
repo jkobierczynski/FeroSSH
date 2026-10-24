@@ -4,7 +4,19 @@
 
 FeroSSH aims to be the smallest, most secure open-source SSH client for Windows: a native PuTTY replacement with tabs, splits, tmux integration and file transfer, shipped as one signed exe with nothing to install.
 
-> **Status:** milestone 0 (foundations). Nothing usable yet; the first SSH session arrives in milestone 3.
+> **Status:** milestone 1 (window and renderer). The exe opens one terminal pane with a renderer test pattern and local echo; the first SSH session arrives in milestone 3.
+
+## Trying the milestone 1 build
+
+Download `ferossh-exe` from the latest CI run and start `ferossh.exe`. Type to test local echo; Ctrl+L redraws the test pattern.
+
+| Shortcut | Action |
+| --- | --- |
+| Ctrl+= / Ctrl+- / Ctrl+0 | Larger, smaller, default text size |
+| Ctrl+Shift+M | Hide the menu bar (Alt shows it again) |
+| View > Font, View > Theme | Font family and colour theme for this pane |
+
+Drag the window between monitors with different scaling: the text should stay sharp and the grid should keep its 80x24 cells.
 
 ## Design
 
