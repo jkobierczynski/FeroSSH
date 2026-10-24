@@ -38,7 +38,7 @@ cargo build --release -p ferossh
 
 The release profile optimises for size and links the C runtime statically, so `target\release\ferossh.exe` runs on a clean Windows 10 1903+ machine.
 
-Checks run in CI: `cargo fmt`, `cargo clippy`, `cargo test`, `cargo deny`, `cargo audit`, and a fuzz smoke run (`cargo +nightly fuzz run ipc_decode`).
+Checks run in CI: `cargo fmt`, `cargo clippy`, `cargo test`, `cargo deny`, `cargo audit`, and a fuzz smoke run (`cargo +nightly fuzz run --target x86_64-unknown-linux-gnu ipc_decode`).
 
 ## Licence
 

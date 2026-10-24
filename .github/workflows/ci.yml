@@ -61,4 +61,6 @@ jobs:
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-fuzz
-      - run: cargo +nightly fuzz run ipc_decode -- -max_total_time=60
+      # The prebuilt cargo-fuzz is a musl binary and would default to the musl
+      # target, which AddressSanitizer does not support.
+      - run: cargo +nightly fuzz run --target x86_64-unknown-linux-gnu ipc_decode -- -max_total_time=60
