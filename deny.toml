@@ -1,0 +1,39 @@
+# cargo-deny: licences, advisories, bans and sources for every dependency.
+[graph]
+targets = ["x86_64-pc-windows-msvc"]
+all-features = true
+
+[advisories]
+yanked = "deny"
+ignore = [
+    # Marvin timing attack in the `rsa` crate (no fixed release yet). It
+    # affects private-key operations only. FeroSSH verifies RSA host keys
+    # (public-key only) and signs through the agent, Pageant or CNG, never
+    # with an in-process RSA private key. Revisit before PPK import (M4).
+    { id = "RUSTSEC-2023-0071", reason = "no in-process RSA private-key operations" },
+]
+
+[licenses]
+confidence-threshold = 0.9
+allow = [
+    "Apache-2.0",
+    "BSD-3-Clause",
+    "ISC",
+    "MIT",
+    "Unicode-3.0",
+]
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+allow-wildcard-paths = true
+deny = [
+    # The spec's no-C-crypto rule: one backend only, and not this one.
+    { name = "aws-lc-rs" },
+    { name = "aws-lc-sys" },
+    { name = "openssl-sys" },
+]
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"

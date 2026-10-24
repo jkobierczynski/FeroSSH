@@ -1,0 +1,23 @@
+[package]
+name = "ferossh-fuzz"
+version = "0.0.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+ferossh-ipc = { path = "../crates/ipc" }
+
+# Kept out of the main workspace: fuzzing needs nightly and libFuzzer.
+[workspace]
+
+[[bin]]
+name = "ipc_decode"
+path = "fuzz_targets/ipc_decode.rs"
+test = false
+doc = false
+bench = false

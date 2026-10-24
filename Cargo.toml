@@ -1,0 +1,42 @@
+[workspace]
+resolver = "3"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.97"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/jkobierczynski/FeroSSH"
+publish = false
+
+[workspace.dependencies]
+ferossh-auth = { path = "crates/auth" }
+ferossh-config = { path = "crates/config" }
+ferossh-ipc = { path = "crates/ipc" }
+ferossh-render = { path = "crates/render" }
+ferossh-sftp = { path = "crates/sftp" }
+ferossh-term = { path = "crates/term" }
+ferossh-tmuxcc = { path = "crates/tmuxcc" }
+ferossh-worker = { path = "crates/worker" }
+
+# Crypto backend is `ring`: russh has no pure-RustCrypto backend, and ring
+# builds with the MSVC toolchain alone (no CMake or NASM).
+russh = { version = "0.64", default-features = false, features = ["ring", "rsa"] }
+
+[workspace.lints.rust]
+unsafe_code = "deny"
+missing_debug_implementations = "warn"
+
+[workspace.lints.clippy]
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+indexing_slicing = "deny"
+
+[profile.release]
+opt-level = "z"
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = true
