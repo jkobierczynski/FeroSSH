@@ -1,0 +1,15 @@
+[package]
+name = "ferossh-worker"
+description = "FeroSSH: Sandboxed SSH worker: russh sessions, channels, forwards"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+russh.workspace = true
+
+[lints]
+workspace = true
