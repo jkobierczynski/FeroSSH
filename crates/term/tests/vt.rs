@@ -212,7 +212,7 @@ fn device_queries_get_fixed_replies() {
 #[test]
 fn colour_queries_answer_from_the_theme() {
     let mut t = term(10, 2);
-    let theme = Theme::light();
+    let theme = Theme::by_name("One Half Light").unwrap_or_default();
     t.set_theme(&theme);
     t.feed(b"\x1b]10;?\x07\x1b]4;1;?\x1b\\");
     let fg = theme.foreground;
