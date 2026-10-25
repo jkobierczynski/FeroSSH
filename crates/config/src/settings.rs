@@ -6,6 +6,8 @@
 //!
 //! ```text
 //! SidePane right
+//! DownloadFolder "D:\Transfers"
+//! VerifyTransfers yes
 //! Favourite web
 //! ThemeRule
 //!     Hosts prod-* *.prod.example.com
@@ -63,6 +65,14 @@ pub struct Settings {
     pub right_click_paste: bool,
     /// Lines of scrollback for panes without a profile that sets it.
     pub scrollback: Option<usize>,
+    /// Where downloads go; the user's Downloads folder when unset.
+    pub download_folder: Option<String>,
+    /// Compare SHA-256 on both sides after each transfer.
+    pub verify_transfers: bool,
+    /// Files transferred at once.
+    pub parallel_transfers: Option<usize>,
+    /// The file view follows the shell's working directory (OSC 7).
+    pub follow_directory: bool,
 }
 
 /// Scrollback is capped here, as the terminal caps it.
@@ -86,6 +96,10 @@ impl Default for Settings {
             copy_on_select: false,
             right_click_paste: false,
             scrollback: None,
+            download_folder: None,
+            verify_transfers: false,
+            parallel_transfers: None,
+            follow_directory: true,
         }
     }
 }
@@ -179,6 +193,24 @@ impl Settings {
                     block = Block::Top;
                     s.right_click_paste = yes(&args).unwrap_or(false);
                 }
+                "downloadfolder" => {
+                    block = Block::Top;
+                    s.download_folder = Some(joined).filter(|f| !f.is_empty());
+                }
+                "verifytransfers" => {
+                    block = Block::Top;
+                    s.verify_transfers = yes(&args).unwrap_or(false);
+                }
+                "paralleltransfers" => {
+                    block = Block::Top;
+                    s.parallel_transfers = first
+                        .and_then(|v| v.parse::<usize>().ok())
+                        .map(|n| n.clamp(1, 8));
+                }
+                "followdirectory" => {
+                    block = Block::Top;
+                    s.follow_directory = yes(&args).unwrap_or(true);
+                }
                 "scrollback" if matches!(block, Block::Profile(_)) => {
                     if let Block::Profile(i) = block
                         && let Some(p) = s.profiles.get_mut(i)
@@ -252,6 +284,14 @@ impl Settings {
         if let Some(n) = self.scrollback {
             let _ = writeln!(out, "Scrollback {n}");
         }
+        if let Some(d) = &self.download_folder {
+            let _ = writeln!(out, "DownloadFolder {}", arg(d));
+        }
+        let _ = writeln!(out, "VerifyTransfers {}", flag(self.verify_transfers));
+        if let Some(n) = self.parallel_transfers {
+            let _ = writeln!(out, "ParallelTransfers {n}");
+        }
+        let _ = writeln!(out, "FollowDirectory {}", flag(self.follow_directory));
         for f in &self.favourites {
             let _ = writeln!(out, "Favourite {}", arg(f));
         }
@@ -350,6 +390,10 @@ mod tests {
 SidePane right
 TabStrip no
 Scrollback 50000
+DownloadFolder "D:\My Transfers"
+VerifyTransfers yes
+ParallelTransfers 20
+FollowDirectory no
 Favourite web "db one"
 Favorite WEB
 ThemeRule
@@ -391,6 +435,10 @@ NewKeyword later
         assert_eq!(web.theme.as_deref(), Some("Dracula"));
         assert_eq!(web.scrollback, Some(1_000_000));
         assert_eq!(s.scrollback, Some(50_000));
+        assert_eq!(s.download_folder.as_deref(), Some("D:\\My Transfers"));
+        assert!(s.verify_transfers);
+        assert_eq!(s.parallel_transfers, Some(8));
+        assert!(!s.follow_directory);
         let big = s.profile("big").unwrap();
         assert_eq!(big.font_size, None);
         assert_eq!(big.theme.as_deref(), Some("Solarized Dark"));

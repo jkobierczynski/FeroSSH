@@ -15,17 +15,22 @@
 //!   host-chosen text (title reports, DECRQSS, clipboard reads) is
 //!   answered.
 //!
+//! OSC 7 working-directory reports come out as
+//! [`Action::WorkingDirectory`], for the file view to follow.
+//!
 //! [`LogWriter`] writes a tab's session log, as plain text or raw bytes.
 //!
 //! It also encodes keys and mouse events the way xterm does, honouring the
 //! modes the host has set. Everything here is platform-neutral and tested
 //! on any host.
 
+mod cwd;
 mod input;
 mod log;
 mod sanitize;
 mod terminal;
 
+pub use cwd::WorkingDir;
 pub use input::{Key, Mods, MouseButton, MouseEvent};
 pub use log::{LogWriter, log_file_name};
 pub use sanitize::{Paste, check_link, clipboard_preview, prepare_paste, sanitize_title};
