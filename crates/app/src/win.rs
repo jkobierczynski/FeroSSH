@@ -60,20 +60,21 @@ use windows::Win32::UI::Shell::{
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT, CheckMenuItem, CheckMenuRadioItem,
-    CreateMenu, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW,
-    FLASHW_TIMERNOFG, FLASHW_TRAY, FLASHWINFO, FlashWindowEx, GetClientRect, GetCursorPos,
-    GetMessageW, HCURSOR, HMENU, HTCLIENT, IDC_ARROW, IDC_IBEAM, IDC_SIZEALL, IDC_SIZENS,
-    IDC_SIZEWE, IDYES, KillTimer, LoadCursorW, MB_DEFBUTTON2, MB_ICONERROR, MB_ICONINFORMATION,
-    MB_ICONQUESTION, MB_ICONWARNING, MB_OK, MB_YESNO, MESSAGEBOX_RESULT, MESSAGEBOX_STYLE,
-    MF_BYCOMMAND, MF_CHECKED, MF_POPUP, MF_SEPARATOR, MF_STRING, MF_UNCHECKED, MSG, MessageBoxW,
-    PM_REMOVE, PeekMessageW, PostMessageW, PostQuitMessage, RegisterClassW, SIZE_MINIMIZED,
-    SW_SHOW, SW_SHOWNORMAL, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOZORDER, SetCursor, SetMenu, SetTimer,
-    SetWindowPos, SetWindowTextW, ShowWindow, TranslateMessage, WINDOW_EX_STYLE, WINDOW_STYLE,
-    WM_APP, WM_CHAR, WM_CLOSE, WM_COMMAND, WM_DESTROY, WM_DPICHANGED, WM_DROPFILES, WM_ERASEBKGND,
-    WM_GETDPISCALEDSIZE, WM_IME_COMPOSITION, WM_IME_STARTCOMPOSITION, WM_KEYDOWN, WM_KILLFOCUS,
-    WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL,
-    WM_PAINT, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SETCURSOR, WM_SETFOCUS, WM_SIZE, WM_SYSCHAR,
-    WM_SYSKEYDOWN, WM_SYSKEYUP, WM_TIMER, WNDCLASSW, WS_EX_APPWINDOW, WS_OVERLAPPEDWINDOW,
+    CreateMenu, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyMenu, DestroyWindow,
+    DispatchMessageW, FLASHW_TIMERNOFG, FLASHW_TRAY, FLASHWINFO, FlashWindowEx, GetClientRect,
+    GetCursorPos, GetMessageW, HCURSOR, HMENU, HTCLIENT, IDC_ARROW, IDC_IBEAM, IDC_SIZEALL,
+    IDC_SIZENS, IDC_SIZEWE, IDYES, KillTimer, LoadCursorW, MB_DEFBUTTON2, MB_ICONERROR,
+    MB_ICONINFORMATION, MB_ICONQUESTION, MB_ICONWARNING, MB_OK, MB_YESNO, MESSAGEBOX_RESULT,
+    MESSAGEBOX_STYLE, MF_BYCOMMAND, MF_CHECKED, MF_POPUP, MF_SEPARATOR, MF_STRING, MF_UNCHECKED,
+    MSG, MessageBoxW, PM_REMOVE, PeekMessageW, PostMessageW, PostQuitMessage, RegisterClassW,
+    SIZE_MINIMIZED, SW_SHOW, SW_SHOWNORMAL, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOZORDER, SetCursor,
+    SetMenu, SetTimer, SetWindowPos, SetWindowTextW, ShowWindow, TPM_NONOTIFY, TPM_RETURNCMD,
+    TrackPopupMenu, TranslateMessage, WINDOW_EX_STYLE, WINDOW_STYLE, WM_APP, WM_CHAR, WM_CLOSE,
+    WM_COMMAND, WM_DESTROY, WM_DPICHANGED, WM_DROPFILES, WM_ERASEBKGND, WM_GETDPISCALEDSIZE,
+    WM_IME_COMPOSITION, WM_IME_STARTCOMPOSITION, WM_KEYDOWN, WM_KILLFOCUS, WM_LBUTTONDOWN,
+    WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_PAINT,
+    WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SETCURSOR, WM_SETFOCUS, WM_SIZE, WM_SYSCHAR, WM_SYSKEYDOWN,
+    WM_SYSKEYUP, WM_TIMER, WNDCLASSW, WS_EX_APPWINDOW, WS_OVERLAPPEDWINDOW,
 };
 use windows::core::{HSTRING, PCWSTR, PWSTR, Result, w};
 
@@ -90,6 +91,8 @@ use crate::sandbox;
 use crate::sessions::{HostItem, SessionList, SideAction, SideKey};
 use crate::ssh::{Effect, Env, SshSession, State, Target};
 use crate::tabstrip::{self, Health, Hit, Palette, StripLayout, TabLabel};
+use crate::tmux::{self, Mode as TmuxMode, Tmux};
+use ferossh_tmuxcc::saved as tmux_saved;
 
 const DEFAULT_COLS: usize = 80;
 const DEFAULT_ROWS: usize = 24;
@@ -179,6 +182,13 @@ mod cmd {
     pub const LOG_FOLDER: u32 = 602;
     pub const REPLACE_KEY: u32 = 603;
     pub const VERIFY: u32 = 604;
+    pub const TMUX_ATTACH: u32 = 610;
+    pub const TMUX_DETACH: u32 = 611;
+    pub const TMUX_PICK: u32 = 612;
+    pub const TMUX_LAYOUT: u32 = 613;
+    /// Plus the index in the session picker's list; the one past the
+    /// last is "New session".
+    pub const TMUX_SESSION: u32 = 800;
     pub const SPLIT_RIGHT: u32 = 700;
     pub const SPLIT_DOWN: u32 = 701;
     pub const NEXT_TAB: u32 = 702;
@@ -210,6 +220,12 @@ enum Host {
         exited: bool,
     },
     Ssh(Box<SshSession>),
+    /// A pane of the tmux session that SSH pane `gateway` runs in control
+    /// mode; `label` names the host.
+    Tmux {
+        gateway: PaneId,
+        label: String,
+    },
 }
 
 /// The worker process and the pipes to it.
@@ -268,6 +284,7 @@ impl Pane {
             Host::Ssh(s) => s.target.label(),
             Host::Local { .. } => "local".to_owned(),
             Host::Ask(_) => "new tab".to_owned(),
+            Host::Tmux { label, .. } => label.clone(),
         }
     }
 
@@ -278,12 +295,23 @@ impl Pane {
                 State::Connecting => Health::Connecting,
                 State::Blocked | State::Ended => Health::Idle,
             },
+            // tmux panes exist only while the gateway is logged in.
+            Host::Tmux { .. } => Health::Connected,
             _ => Health::Idle,
         }
     }
 
     fn connected(&self) -> bool {
         matches!(&self.host, Host::Ssh(s) if s.state() == State::Connected)
+            || matches!(self.host, Host::Tmux { .. })
+    }
+
+    /// The SSH pane carrying a tmux pane.
+    fn gateway(&self) -> Option<PaneId> {
+        match self.host {
+            Host::Tmux { gateway, .. } => Some(gateway),
+            _ => None,
+        }
     }
 }
 
@@ -410,6 +438,14 @@ struct Window {
     /// The host the file view shows: the focused pane's.
     files_key: Option<String>,
     transfer_timer: bool,
+    /// tmux control mode, per SSH pane that has run `tmux -CC`.
+    tmux: HashMap<PaneId, Tmux>,
+    /// SSH panes whose connection dropped while tmux ran: the host's
+    /// queue key and the session to attach again after the next login.
+    reattach: HashMap<PaneId, (String, String)>,
+    /// Commands decided outside a handler that returns them; the next
+    /// redraw runs them.
+    queued: Vec<Command>,
 }
 
 thread_local! {
@@ -670,6 +706,9 @@ fn create_and_run(launch: Launch, theme: Option<String>) -> Result<()> {
                 files: FilesView::default(),
                 files_key: None,
                 transfer_timer: false,
+                tmux: HashMap::new(),
+                reattach: HashMap::new(),
+                queued: Vec::new(),
             });
         });
         // Files dropped from Explorer are uploaded, after a confirmation.
@@ -772,6 +811,15 @@ fn build_menu() -> Result<HMENU> {
         item(session, cmd::REPLACE_KEY, "Replace host &key...")?;
         separator(session)?;
         item(session, cmd::VERIFY, "&Verify transfers (SHA-256)")?;
+        separator(session)?;
+        item(session, cmd::TMUX_ATTACH, "&Attach tmux")?;
+        item(session, cmd::TMUX_PICK, "S&witch tmux session...")?;
+        item(session, cmd::TMUX_DETACH, "&Detach tmux")?;
+        item(
+            session,
+            cmd::TMUX_LAYOUT,
+            "tmux: one &window per pane (own fonts)",
+        )?;
 
         let edit = CreatePopupMenu()?;
         item(edit, cmd::COPY, "&Copy\tCtrl+Shift+C")?;
@@ -1094,6 +1142,276 @@ impl Window {
         })
     }
 
+    /// The pane with the SSH session for pane `id`: the gateway of a tmux
+    /// pane, else the pane itself.
+    fn host_pane(&self, id: PaneId) -> PaneId {
+        self.panes.get(&id).and_then(Pane::gateway).unwrap_or(id)
+    }
+
+    /// A tmux pane in tmux layout, whose place tmux decides: it does not
+    /// move between tabs natively.
+    fn locked(&self, id: PaneId) -> bool {
+        self.panes
+            .get(&id)
+            .and_then(Pane::gateway)
+            .and_then(|g| self.tmux.get(&g))
+            .is_some_and(|t| t.mode() == TmuxMode::Tmux)
+    }
+
+    fn locked_tab(&self, i: usize) -> bool {
+        self.ws
+            .tabs
+            .get(i)
+            .is_some_and(|t| t.root.panes().iter().any(|id| self.locked(*id)))
+    }
+
+    /// Lines of scrollback for `target`'s panes.
+    fn scrollback_for(&self, target: &Target) -> Option<usize> {
+        self.settings
+            .profile(&target.alias)
+            .and_then(|p| p.scrollback)
+            .or(self.settings.scrollback)
+    }
+
+    /// A tmux watcher for SSH pane `id`, with its host's preferences.
+    fn new_tmux(&self, id: PaneId) -> Tmux {
+        let (mode, history) = match self.panes.get(&id).map(|p| &p.host) {
+            Some(Host::Ssh(s)) => (
+                self.settings
+                    .profile(&s.target.alias)
+                    .and_then(|p| p.tmux_layout.as_deref())
+                    .and_then(TmuxMode::parse)
+                    .unwrap_or(TmuxMode::Ferossh),
+                self.scrollback_for(&s.target),
+            ),
+            _ => (TmuxMode::Ferossh, None),
+        };
+        Tmux::new(
+            id,
+            mode,
+            history.unwrap_or(TermSettings::DEFAULT_SCROLLBACK),
+        )
+    }
+
+    /// Writes to the host of SSH pane `id`, past any local prompt: tmux
+    /// commands, and the line that starts tmux.
+    fn send_host(&mut self, id: PaneId, bytes: &[u8]) {
+        let effects = match self.panes.get_mut(&id).map(|p| &mut p.host) {
+            Some(Host::Ssh(s)) => s.input(bytes),
+            _ => return,
+        };
+        self.apply(id, effects);
+    }
+
+    /// Output from SSH pane `id`'s host, which may be tmux in control
+    /// mode.
+    fn host_output(&mut self, id: PaneId, bytes: &[u8]) {
+        if !self.tmux.contains_key(&id) {
+            let t = self.new_tmux(id);
+            self.tmux.insert(id, t);
+        }
+        let Some(t) = self.tmux.get_mut(&id) else {
+            return;
+        };
+        let actions = t.feed(&mut self.ws, bytes);
+        self.run_tmux(id, actions);
+    }
+
+    /// Carries out what gateway `gateway`'s tmux watcher decided.
+    fn run_tmux(&mut self, gateway: PaneId, actions: Vec<tmux::Action>) {
+        let mut structure = false;
+        for action in actions {
+            match action {
+                tmux::Action::Write(bytes) => self.send_host(gateway, &bytes),
+                tmux::Action::GatewayOutput(bytes) => {
+                    if let Some(p) = self.panes.get_mut(&gateway) {
+                        p.term.feed(&bytes);
+                    }
+                    self.log(gateway, &bytes);
+                }
+                tmux::Action::Create {
+                    native,
+                    look,
+                    cols,
+                    rows,
+                    ..
+                } => self.add_tmux_pane(gateway, native, &look, cols, rows),
+                tmux::Action::Feed { native, bytes } => {
+                    if let Some(p) = self.panes.get_mut(&native) {
+                        p.term.feed(&bytes);
+                    }
+                    self.log(native, &bytes);
+                }
+                tmux::Action::Resize { native, cols, rows } => {
+                    if let Some(p) = self.panes.get_mut(&native) {
+                        p.term.resize(usize::from(cols), usize::from(rows));
+                        p.grid.mark_all_dirty();
+                    }
+                }
+                tmux::Action::Remove { native } => {
+                    self.stop_log(native);
+                    self.panes.remove(&native);
+                    if self.mouse.pane == Some(native) {
+                        self.mouse.pane = None;
+                    }
+                    structure = true;
+                }
+                tmux::Action::Focus { .. }
+                | tmux::Action::ShowGateway
+                | tmux::Action::Structure => structure = true,
+                tmux::Action::Picker(names) => {
+                    self.queued.push(Command::TmuxPicker { gateway, names });
+                }
+                tmux::Action::Notice(text) => {
+                    let text = crate::ssh::sanitize(&text);
+                    self.show(gateway, &format!("\x1b[0;90m{text}\x1b[0m\r\n"));
+                }
+            }
+        }
+        if structure {
+            self.after_structure_change();
+        }
+    }
+
+    /// A native pane for a tmux pane: the gateway's look, with the font,
+    /// size and theme the session saved for its window.
+    fn add_tmux_pane(
+        &mut self,
+        gateway: PaneId,
+        native: PaneId,
+        look: &tmux_saved::Look,
+        cols: u16,
+        rows: u16,
+    ) {
+        let Some(g) = self.panes.get(&gateway) else {
+            return;
+        };
+        let (label, scrollback) = match &g.host {
+            Host::Ssh(s) => (s.target.label(), self.scrollback_for(&s.target)),
+            _ => (String::new(), None),
+        };
+        let mut font = g.font.clone();
+        let mut metrics = g.metrics;
+        let theme = look
+            .theme
+            .as_deref()
+            .and_then(Theme::by_name)
+            .unwrap_or_else(|| g.theme.clone());
+        if look.font.is_some() || look.size.is_some() {
+            let wanted = FontSpec::new(
+                look.font.as_deref().unwrap_or(&font.family),
+                look.size.unwrap_or(font.size_pt),
+            );
+            if let Ok(m) = self.renderer.metrics(&wanted, self.dpi) {
+                font = wanted;
+                metrics = m;
+            }
+        }
+        let mut pane = new_pane(native, font, theme, metrics, scrollback);
+        pane.term.resize(usize::from(cols), usize::from(rows));
+        pane.host = Host::Tmux { gateway, label };
+        pane.log.enabled = self.panes.get(&gateway).is_some_and(|g| g.log.enabled);
+        pane.log.raw = self.panes.get(&gateway).is_some_and(|g| g.log.raw);
+        self.panes.insert(native, pane);
+        self.start_log(native);
+    }
+
+    /// Tells each tmux session its panes' sizes, and saves its layout and
+    /// looks when they changed.
+    fn sync_tmux(&mut self) {
+        let pad = padding(self.dpi);
+        let gateways: Vec<PaneId> = self
+            .tmux
+            .iter()
+            .filter(|(_, t)| t.active())
+            .map(|(g, _)| *g)
+            .collect();
+        for g in gateways {
+            let panes = &self.panes;
+            let cells = |n: PaneId| {
+                let p = panes.get(&n)?;
+                let m = p.metrics;
+                let cols = (p.rect.w - 2 * pad).max(0) / m.width.max(1) as i32;
+                let rows = (p.rect.h - 2 * pad).max(0) / m.height.max(1) as i32;
+                Some((
+                    u16::try_from(cols.max(1)).unwrap_or(u16::MAX),
+                    u16::try_from(rows.max(1)).unwrap_or(u16::MAX),
+                ))
+            };
+            let look_of = |n: PaneId| {
+                panes
+                    .get(&n)
+                    .map(|p| tmux_saved::Look {
+                        font: Some(p.font.family.clone()),
+                        size: Some(p.font.size_pt),
+                        theme: Some(p.theme.name.to_owned()),
+                    })
+                    .unwrap_or_default()
+            };
+            let Some(t) = self.tmux.get_mut(&g) else {
+                continue;
+            };
+            let mut actions = t.sync_sizes(&self.ws, &cells);
+            actions.extend(t.sync_saved(&self.ws, &look_of));
+            self.run_tmux(g, actions);
+        }
+    }
+
+    /// SSH pane `id` lost its connection: if it ran tmux, its panes go
+    /// and the session is attached again after the next login.
+    fn tmux_lost(&mut self, id: PaneId) {
+        let key = self.pane_sftp_key(id);
+        let Some(t) = self.tmux.get_mut(&id) else {
+            return;
+        };
+        let actions = t.connection_lost(&mut self.ws);
+        if let (Some(name), Some(key)) = (t.reattach.take(), key) {
+            self.reattach.insert(id, (key, name));
+        }
+        self.run_tmux(id, actions);
+    }
+
+    /// After a login on SSH pane `id`: attach tmux again after a dropped
+    /// connection, or when the host's profile asks for it. Only one pane
+    /// per host runs tmux, so a second tab on the host stays a shell.
+    fn tmux_after_login(&mut self, id: PaneId) {
+        let Some(Host::Ssh(s)) = self.panes.get(&id).map(|p| &p.host) else {
+            return;
+        };
+        let key = sftp_key(&s.target);
+        let profile = self
+            .settings
+            .profile(&s.target.alias)
+            .and_then(|p| p.tmux.clone());
+        let name = match self.reattach.remove(&id) {
+            Some((k, name)) if k == key => name,
+            _ => match profile {
+                Some(name) => name,
+                None => return,
+            },
+        };
+        let busy = self.tmux.iter().any(|(g, t)| {
+            *g != id && t.active() && self.pane_sftp_key(*g).as_deref() == Some(key.as_str())
+        });
+        if !busy {
+            self.attach_tmux(id, &name, false);
+        }
+    }
+
+    /// Types the line that starts tmux in control mode at pane `id`'s
+    /// shell.
+    fn attach_tmux(&mut self, id: PaneId, name: &str, pick: bool) {
+        if !self.tmux.contains_key(&id) {
+            let t = self.new_tmux(id);
+            self.tmux.insert(id, t);
+        }
+        let Some(t) = self.tmux.get_mut(&id) else {
+            return;
+        };
+        let line = t.attach(name, pick);
+        self.send_host(id, &line);
+    }
+
     /// Feeds local text (not from the host) to a pane's terminal.
     fn show(&mut self, id: PaneId, text: &str) {
         if let Some(p) = self.panes.get_mut(&id) {
@@ -1103,6 +1421,12 @@ impl Window {
 
     /// Ends whatever the pane is connected to.
     fn end_host(&mut self, id: PaneId) {
+        // tmux on it is over too; a reattach after a dropped connection
+        // stays wanted.
+        if let Some(mut t) = self.tmux.remove(&id) {
+            let actions = t.connection_lost(&mut self.ws);
+            self.run_tmux(id, actions);
+        }
         let effects = match self.panes.get_mut(&id).map(|p| &mut p.host) {
             Some(Host::Ssh(session)) => session.close(),
             _ => Vec::new(),
@@ -1330,12 +1654,7 @@ impl Window {
                     }
                 }
                 Effect::Show(text) => self.show(id, &text),
-                Effect::Output(bytes) => {
-                    if let Some(p) = self.panes.get_mut(&id) {
-                        p.term.feed(&bytes);
-                    }
-                    self.log(id, &bytes);
-                }
+                Effect::Output(bytes) => self.host_output(id, &bytes),
                 Effect::Broker(job) => {
                     let channel = match self.panes.get(&id).map(|p| &p.host) {
                         Some(Host::Ssh(s)) => s.channel,
@@ -1350,8 +1669,10 @@ impl Window {
                     self.start_log(id);
                     self.sftp_connected(id);
                     self.refresh_chrome();
+                    self.tmux_after_login(id);
                 }
                 Effect::Ended => {
+                    self.tmux_lost(id);
                     self.stop_log(id);
                     self.prune_sftp();
                     self.refresh_chrome();
@@ -1371,6 +1692,7 @@ impl Window {
         let label = match &p.host {
             Host::Ssh(s) if s.state() == State::Connected => s.target.label(),
             Host::Local { exited: false, .. } => "local".to_owned(),
+            Host::Tmux { label, .. } => label.clone(),
             _ => return,
         };
         let raw = p.log.raw;
@@ -1453,6 +1775,15 @@ impl Window {
     /// Sends the terminal's answers and other non-user bytes to the host.
     /// They never go into a local prompt.
     fn send(&mut self, id: PaneId, bytes: Vec<u8>) {
+        if let Some(gateway) = self.panes.get(&id).and_then(Pane::gateway) {
+            let actions = self
+                .tmux
+                .get_mut(&gateway)
+                .map(|t| t.input(id, &bytes))
+                .unwrap_or_default();
+            self.run_tmux(gateway, actions);
+            return;
+        }
         let effects = match self.panes.get_mut(&id).map(|p| &mut p.host) {
             Some(Host::Local {
                 shell: Some(shell),
@@ -1522,7 +1853,7 @@ impl Window {
                     self.reconnect(id);
                 }
             }
-            Host::Ssh(_) => self.send(id, bytes),
+            Host::Ssh(_) | Host::Tmux { .. } => self.send(id, bytes),
         }
     }
 
@@ -1705,6 +2036,9 @@ impl Window {
             }
             for action in actions {
                 match action {
+                    // tmux answered its panes' queries already.
+                    Action::Reply(_)
+                        if self.panes.get(&id).is_some_and(|p| p.gateway().is_some()) => {}
                     Action::Reply(bytes) => self.send(id, bytes),
                     Action::Title(title) => {
                         if let Some(p) = self.panes.get_mut(&id) {
@@ -1743,6 +2077,7 @@ impl Window {
             self.refresh_chrome();
         }
         self.refresh_visible();
+        commands.append(&mut self.queued);
         commands
     }
 
@@ -1966,6 +2301,12 @@ impl Window {
                 continue;
             };
             p.rect = rect;
+            if p.gateway().is_some() {
+                // tmux sizes its panes; see sync_tmux.
+                let m = p.metrics;
+                p.term.set_cell_size(m.width, m.height);
+                continue;
+            }
             let m = p.metrics;
             let cols = ((rect.w - 2 * pad).max(0) / m.width.max(1) as i32).max(1) as usize;
             let rows = ((rect.h - 2 * pad).max(0) / m.height.max(1) as i32).max(1) as usize;
@@ -1986,6 +2327,7 @@ impl Window {
                 self.apply(id, vec![e]);
             }
         }
+        self.sync_tmux();
         self.refresh_chrome();
         self.refresh_visible();
         self.request_full_redraw();
@@ -2484,6 +2826,7 @@ impl Window {
             Local,
             Ask,
         }
+        let from = self.host_pane(from);
         let like = match self.panes.get(&from).map(|p| &p.host) {
             Some(Host::Ssh(s)) => Like::Ssh(s.target.clone()),
             Some(Host::Local { .. }) => Like::Local,
@@ -2506,8 +2849,17 @@ impl Window {
         self.update_menu_checks();
     }
 
-    /// Closes a pane; the last one closes the window.
+    /// Closes a pane; the last one closes the window. A tmux pane is
+    /// closed in tmux, and goes when tmux says it went.
     fn close_pane(&mut self, id: PaneId) -> Option<Command> {
+        if let Some(gateway) = self.panes.get(&id).and_then(Pane::gateway)
+            && let Some(t) = self.tmux.get_mut(&gateway).filter(|t| t.active())
+        {
+            let actions = t.close(id);
+            self.run_tmux(gateway, actions);
+            return None;
+        }
+        self.reattach.remove(&id);
         match self.ws.close(id) {
             Some(Closed::Window) => return Some(Command::Destroy),
             Some(_) => {}
@@ -2775,7 +3127,11 @@ impl Window {
         } = drag
         {
             let joined = match self.spot(x, y) {
-                Spot::Pane(target) if self.ws.tab_of(target) != Some(index) => {
+                Spot::Pane(target)
+                    if self.ws.tab_of(target) != Some(index)
+                        && !self.locked_tab(index)
+                        && !self.locked(target) =>
+                {
                     let r = self.panes.get(&target).map(|p| p.rect).unwrap_or_default();
                     self.ws.join_tab(index, target, layout::join_side(r, x, y))
                 }
@@ -2792,6 +3148,7 @@ impl Window {
         if let Drag::Pane {
             id, active: true, ..
         } = drag
+            && !self.locked(id)
         {
             let moved = if self.areas.strip.is_some_and(|s| s.contains(x, y)) {
                 self.ws.pane_to_tab(id)
@@ -3127,8 +3484,18 @@ impl Window {
             cmd::IMPORT_PUTTY => return Some(Command::ImportPutty),
             cmd::RESTART_SHELL => self.start_shell(pane),
             cmd::CONNECT => self.ask_destination(pane),
-            cmd::RECONNECT => self.reconnect(pane),
+            cmd::RECONNECT => self.reconnect(self.host_pane(pane)),
             cmd::NEW_TAB => {
+                // A tmux pane's new tab is a new tmux window.
+                if let Some(gateway) = self.panes.get(&pane).and_then(Pane::gateway) {
+                    let actions = self
+                        .tmux
+                        .get_mut(&gateway)
+                        .map(|t| t.new_tab(pane))
+                        .unwrap_or_default();
+                    self.run_tmux(gateway, actions);
+                    return None;
+                }
                 let id = self.new_tab_pane();
                 self.fill_like(id, pane);
             }
@@ -3138,20 +3505,83 @@ impl Window {
                 } else {
                     Dir::Down
                 };
+                if let Some(gateway) = self.panes.get(&pane).and_then(Pane::gateway) {
+                    let actions = self
+                        .tmux
+                        .get_mut(&gateway)
+                        .map(|t| t.split(pane, dir))
+                        .unwrap_or_default();
+                    self.run_tmux(gateway, actions);
+                    return None;
+                }
                 if let Some(new) = self.split(dir) {
                     self.fill_like(new, pane);
                 }
             }
             cmd::CLOSE_PANE => return self.close_pane(pane),
             cmd::PANE_TO_TAB => {
-                if self.ws.pane_to_tab(pane) {
+                if !self.locked(pane) && self.ws.pane_to_tab(pane) {
                     self.after_structure_change();
                 }
             }
             cmd::JOIN_TAB => {
-                if self.ws.join_neighbour() {
+                let next = if self.ws.active == 0 {
+                    1
+                } else {
+                    self.ws.active - 1
+                };
+                if !self.locked_tab(self.ws.active)
+                    && !self.locked_tab(next)
+                    && self.ws.join_neighbour()
+                {
                     self.after_structure_change();
                 }
+            }
+            cmd::TMUX_ATTACH => {
+                let host = self.host_pane(pane);
+                if host != pane {
+                    // Already in tmux: offer the other sessions.
+                    let actions = self
+                        .tmux
+                        .get_mut(&host)
+                        .map(Tmux::pick_session)
+                        .unwrap_or_default();
+                    self.run_tmux(host, actions);
+                    return None;
+                }
+                let name = match self.panes.get(&pane).map(|p| &p.host) {
+                    Some(Host::Ssh(s)) if s.state() == State::Connected && !s.prompt_active() => {
+                        self.settings
+                            .profile(&s.target.alias)
+                            .and_then(|p| p.tmux.clone())
+                            .unwrap_or_else(|| "main".to_owned())
+                    }
+                    _ => return Some(Command::Notice(NOT_IN_SHELL.into())),
+                };
+                self.attach_tmux(pane, &name, true);
+            }
+            cmd::TMUX_DETACH | cmd::TMUX_PICK | cmd::TMUX_LAYOUT => {
+                let host = self.host_pane(pane);
+                let Some(t) = self.tmux.get_mut(&host).filter(|t| t.active()) else {
+                    return Some(Command::Notice(
+                        "This pane is not showing a tmux session. Session > Attach tmux \
+                         starts one."
+                            .into(),
+                    ));
+                };
+                let actions = match id {
+                    cmd::TMUX_DETACH => t.detach(),
+                    cmd::TMUX_PICK => t.pick_session(),
+                    _ => {
+                        let mode = match t.mode() {
+                            TmuxMode::Ferossh => TmuxMode::Tmux,
+                            TmuxMode::Tmux => TmuxMode::Ferossh,
+                        };
+                        t.set_mode(mode)
+                    }
+                };
+                self.run_tmux(host, actions);
+                self.update_menu_checks();
             }
             cmd::NEXT_TAB | cmd::PREV_TAB => {
                 let mut ws = self.ws.clone();
@@ -3250,6 +3680,8 @@ impl Window {
             }
             cmd::FOLLOW_CD => self.toggle_follow(),
             cmd::DISCONNECT => {
+                let pane = self.host_pane(pane);
+                self.tmux_lost(pane);
                 let effects = match self.panes.get_mut(&pane).map(|p| &mut p.host) {
                     Some(Host::Ssh(session))
                         if matches!(session.state(), State::Connecting | State::Connected) =>
@@ -3345,6 +3777,8 @@ impl Window {
             id if (cmd::THEME..cmd::THEME + Theme::builtin().len() as u32).contains(&id) => {
                 if let Some(theme) = Theme::builtin().get((id - cmd::THEME) as usize) {
                     self.set_theme(pane, theme.clone());
+                    // A tmux pane's theme is kept in the session.
+                    self.sync_tmux();
                     self.refresh_chrome();
                     self.request_full_redraw();
                 }
@@ -3379,7 +3813,8 @@ impl Window {
     fn save_look(&mut self) -> std::result::Result<String, String> {
         let pane = self.focused_id();
         let p = self.panes.get(&pane).ok_or_else(String::new)?;
-        let Host::Ssh(s) = &p.host else {
+        let host = self.panes.get(&self.host_pane(pane)).map(|g| &g.host);
+        let Some(Host::Ssh(s)) = host else {
             return Err(
                 "Only a pane connected to an SSH host has a host to save the look for.".into(),
             );
@@ -3408,6 +3843,10 @@ impl Window {
         let last_font = cmd::FONT + FONT_CHOICES.len() as u32 - 1;
         let last_theme = cmd::THEME + Theme::builtin().len() as u32 - 1;
         let check = |on: bool| if on { MF_CHECKED } else { MF_UNCHECKED };
+        let own_layout = self
+            .tmux
+            .get(&self.host_pane(self.focused_id()))
+            .is_some_and(|t| t.active() && t.mode() == TmuxMode::Ferossh);
         let s = &self.settings;
         // SAFETY: valid menu handle; ids are ours. A missing id just leaves
         // the group unchecked.
@@ -3431,6 +3870,7 @@ impl Window {
                 (cmd::VERIFY, s.verify_transfers),
                 (cmd::SIDE_RIGHT, s.side_pane_right),
                 (cmd::TAB_STRIP, s.tab_strip),
+                (cmd::TMUX_LAYOUT, own_layout),
             ] {
                 CheckMenuItem(self.menu, id, (MF_BYCOMMAND | check(on)).0);
             }
@@ -3506,7 +3946,7 @@ impl Window {
 
     /// The transfer queue's key for pane `id`, if it is an SSH pane.
     fn pane_sftp_key(&self, id: PaneId) -> Option<String> {
-        match &self.panes.get(&id)?.host {
+        match &self.panes.get(&self.host_pane(id))?.host {
             Host::Ssh(s) => Some(sftp_key(&s.target)),
             _ => None,
         }
@@ -3530,7 +3970,7 @@ impl Window {
         let Some(p) = self.panes.get(&id) else {
             return;
         };
-        let Host::Ssh(s) = &p.host else {
+        let Some(Host::Ssh(s)) = self.panes.get(&self.host_pane(id)).map(|g| &g.host) else {
             return;
         };
         if s.state() != State::Connected || self.worker.is_none() {
@@ -3683,7 +4123,7 @@ impl Window {
         let Some(p) = self.panes.get_mut(&id) else {
             return false;
         };
-        if !matches!(p.host, Host::Ssh(_)) {
+        if !matches!(p.host, Host::Ssh(_) | Host::Tmux { .. }) {
             return false;
         }
         let host = dir.host.to_ascii_lowercase();
@@ -3807,8 +4247,11 @@ impl Window {
                 .unwrap_or_default(),
             None => self.ws.all_panes(),
         };
+        // Leaving the window only detaches tmux; closing a tab closes its
+        // tmux windows.
         ids.iter()
-            .filter(|id| self.panes.get(id).is_some_and(Pane::connected))
+            .filter_map(|id| self.panes.get(id))
+            .filter(|p| p.connected() && (tab.is_some() || p.gateway().is_none()))
             .count()
     }
 
@@ -3929,6 +4372,11 @@ enum Command {
         key: String,
         dir: Vec<u8>,
     },
+    /// A menu of tmux sessions to switch gateway `gateway`'s client to.
+    TmuxPicker {
+        gateway: PaneId,
+        names: Vec<String>,
+    },
 }
 
 /// A modal message box; `None` if another one is already open.
@@ -3949,6 +4397,11 @@ fn run_commands(hwnd: HWND, commands: Vec<Command>) {
         run_command(hwnd, command);
     }
 }
+
+/// Session > Attach tmux on a pane that is not at a logged-in shell.
+const NOT_IN_SHELL: &str = "Log in to an SSH host in this pane first; Attach tmux types \
+                            `tmux -CC new-session -A -s main` at its shell (the session name \
+                            comes from the host's Tmux setting in ferossh.conf).";
 
 /// The message for file transfer without a logged-in pane.
 const NOT_CONNECTED: &str = "Log in to an SSH host in this pane first; files go to and from \
@@ -4228,6 +4681,46 @@ fn run_command(hwnd: HWND, command: Command) {
                     }
                     w.flush_sftp();
                     w.refresh_chrome();
+                });
+            }
+        }
+        Command::TmuxPicker { gateway, names } => {
+            let new = cmd::TMUX_SESSION + names.len() as u32;
+            // SAFETY: a popup menu of our own on our window, destroyed
+            // after use. TPM_RETURNCMD returns the picked id, 0 for none.
+            let picked = unsafe {
+                let Ok(menu) = CreatePopupMenu() else {
+                    return;
+                };
+                for (id, name) in (cmd::TMUX_SESSION..).zip(&names) {
+                    let text = crate::ssh::sanitize(name).replace('&', "&&");
+                    let _ = AppendMenuW(menu, MF_STRING, id as usize, &HSTRING::from(text));
+                }
+                let _ = AppendMenuW(menu, MF_SEPARATOR, 0, None);
+                let _ = AppendMenuW(menu, MF_STRING, new as usize, w!("&New tmux session"));
+                let mut pt = POINT::default();
+                let _ = GetCursorPos(&mut pt);
+                let chosen = TrackPopupMenu(
+                    menu,
+                    TPM_RETURNCMD | TPM_NONOTIFY,
+                    pt.x,
+                    pt.y,
+                    None,
+                    hwnd,
+                    None,
+                );
+                let _ = DestroyMenu(menu);
+                u32::try_from(chosen.0).unwrap_or(0)
+            };
+            if (cmd::TMUX_SESSION..=new).contains(&picked) {
+                let name = names.get((picked - cmd::TMUX_SESSION) as usize).cloned();
+                with_window(|w| {
+                    let actions = w
+                        .tmux
+                        .get_mut(&gateway)
+                        .map(|t| t.switch_session(name.as_deref()))
+                        .unwrap_or_default();
+                    w.run_tmux(gateway, actions);
                 });
             }
         }
@@ -4601,6 +5094,17 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                 // Dropping the window closes the shells' consoles, finishes
                 // the logs and closes the worker's job, which ends it.
                 with_window(|w| {
+                    // tmux keeps its sessions; leave them detached.
+                    let gateways: Vec<PaneId> = w.tmux.keys().copied().collect();
+                    for g in gateways {
+                        let actions = w
+                            .tmux
+                            .get_mut(&g)
+                            .filter(|t| t.active())
+                            .map(Tmux::detach)
+                            .unwrap_or_default();
+                        w.run_tmux(g, actions);
+                    }
                     let ids: Vec<PaneId> = w.panes.keys().copied().collect();
                     for id in ids {
                         w.end_host(id);

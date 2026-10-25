@@ -121,6 +121,12 @@ impl<T: Clone> Client<T> {
         while let Some(&b) = bytes.get(i) {
             i += 1;
             if !self.control {
+                if self.matched == 0 && b != 0x1b {
+                    // Most output has no escape at all: skip to the next.
+                    let rest = bytes.get(i..).unwrap_or_default();
+                    i += rest.iter().position(|&c| c == 0x1b).unwrap_or(rest.len());
+                    continue;
+                }
                 if INTRO.get(self.matched) == Some(&b) {
                     self.matched += 1;
                 } else {
