@@ -281,8 +281,12 @@ fn real_tmux_round_trip() {
     let actions = a.tmux.input(second, b"echo two\r");
     a.apply(actions);
     a.until("the second echo", |h| h.text(second).contains("two"));
-    // A program like htop turns on click reports in SGR form.
-    let actions = a.tmux.input(second, b"printf '\\033[?1000h\\033[?1006h'\r");
+    // A program like htop or vim turns on application cursor keys and
+    // keypad, and click reports in SGR form.
+    let actions = a.tmux.input(
+        second,
+        b"printf '\\033[?1h\\033=\\033[?1000h\\033[?1006h'\r",
+    );
     a.apply(actions);
     a.until("the mouse modes", |_| {
         tmux_cmd(
@@ -318,6 +322,14 @@ fn real_tmux_round_trip() {
     let modes = b.text(restored[1]);
     assert!(modes.contains("\x1b[?1000h\x1b[?1006h"), "{modes:?}");
     assert!(!modes.contains("\x1b[?1003h"), "{modes:?}");
+    // Arrow keys go out as vim asked for them (ESC O A, not ESC [ A).
+    let mut term = ferossh_term::Terminal::new(40, 30, &ferossh_term::Settings::default());
+    term.feed(modes.as_bytes());
+    assert_eq!(
+        term.key(ferossh_term::Key::Up, ferossh_term::Mods::default()),
+        Some(b"\x1bOA".to_vec()),
+        "{modes:?}"
+    );
     assert!(!b.text(restored[0]).contains("\x1b[?1000h"));
     drop(b);
 
