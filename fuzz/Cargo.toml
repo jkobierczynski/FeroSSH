@@ -12,6 +12,7 @@ cargo-fuzz = true
 libfuzzer-sys = "0.4"
 ferossh-ipc = { path = "../crates/ipc" }
 ferossh-render = { path = "../crates/render" }
+ferossh-sftp = { path = "../crates/sftp" }
 ferossh-term = { path = "../crates/term" }
 
 # Kept out of the main workspace: fuzzing needs nightly and libFuzzer.
@@ -27,6 +28,13 @@ bench = false
 [[bin]]
 name = "term_feed"
 path = "fuzz_targets/term_feed.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "sftp_decode"
+path = "fuzz_targets/sftp_decode.rs"
 test = false
 doc = false
 bench = false

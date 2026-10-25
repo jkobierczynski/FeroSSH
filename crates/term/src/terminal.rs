@@ -19,6 +19,7 @@ use alacritty_terminal::vte::ansi::{
 };
 use ferossh_render::{Cell, Color, Cursor, CursorShape, Flags, Grid, Rgb, Theme};
 
+use crate::cwd::{CwdScanner, WorkingDir};
 use crate::input::{self, Key, Mods, MouseButton, MouseEvent};
 use crate::sanitize::{Paste, prepare_paste, sanitize_title};
 
@@ -59,6 +60,8 @@ pub enum Action {
     /// user before doing it.
     ClipboardRequest(String),
     Bell,
+    /// The shell reported its working directory (OSC 7).
+    WorkingDirectory(WorkingDir),
 }
 
 /// How a mouse selection grows.
@@ -132,6 +135,9 @@ pub struct Terminal {
     theme: Theme,
     cell_px: (u16, u16),
     search: Option<Search>,
+    cwd: CwdScanner,
+    /// Working directories reported since the last `take_actions`.
+    reported: Vec<WorkingDir>,
 }
 
 impl std::fmt::Debug for Terminal {
@@ -159,6 +165,8 @@ impl Terminal {
             theme: Theme::default(),
             cell_px: (8, 16),
             search: None,
+            cwd: CwdScanner::default(),
+            reported: Vec::new(),
         }
     }
 
@@ -201,6 +209,12 @@ impl Terminal {
 
     /// Processes output from the host. Call [`Self::take_actions`] after.
     pub fn feed(&mut self, bytes: &[u8]) {
+        let found = self.cwd.scan(bytes);
+        // Only the last report of a burst matters.
+        if let Some(last) = found.into_iter().last() {
+            self.reported.clear();
+            self.reported.push(last);
+        }
         self.parser.advance(&mut self.term, bytes);
     }
 
@@ -218,7 +232,9 @@ impl Terminal {
     /// What the host's output asked the UI to do, in order.
     pub fn take_actions(&mut self) -> Vec<Action> {
         let events = std::mem::take(&mut *self.events.0.borrow_mut());
-        events.into_iter().filter_map(|e| self.action(e)).collect()
+        let mut actions: Vec<Action> = events.into_iter().filter_map(|e| self.action(e)).collect();
+        actions.extend(self.reported.drain(..).map(Action::WorkingDirectory));
+        actions
     }
 
     fn action(&self, event: Event) -> Option<Action> {

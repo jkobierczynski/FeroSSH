@@ -4,12 +4,14 @@
 //! use the network, and talks to it over two inherited pipes. The worker
 //! cannot open the user's files or keys: everything it needs from them
 //! (known_hosts verdicts, public keys, signatures, passwords) it asks the
-//! UI for over IPC. This crate is that worker, minus the process setup,
+//! UI for over IPC; file transfers stream through IPC for the same reason
+//! ([`sftp`]). This crate is that worker, minus the process setup,
 //! and runs anywhere tokio does, so it is tested against a real OpenSSH
 //! server on Linux.
 
 pub mod crypto_policy;
 mod session;
+mod sftp;
 
 use std::collections::HashMap;
 use std::io::{Read, Write};
@@ -24,9 +26,9 @@ pub use session::Params;
 /// Messages queued in each direction before the sender waits.
 const QUEUE: usize = 64;
 
-/// Serves the UI: one task per shell channel, routed by channel id; shells
-/// opened with [`Message::OpenChannel`] share their host's connection. Returns
-/// when the UI closes its end.
+/// Serves the UI: one task per shell or SFTP channel, routed by channel id;
+/// shells opened with [`Message::OpenChannel`] and SFTP channels share their
+/// host's connection. Returns when the UI closes its end.
 pub async fn serve(mut inbox: mpsc::Receiver<Message>, out: mpsc::Sender<Message>) {
     let hello = Message::Hello {
         version: PROTOCOL_VERSION,
@@ -58,6 +60,24 @@ pub async fn serve(mut inbox: mpsc::Receiver<Message>, out: mpsc::Sender<Message
                     channel,
                     connection,
                     (cols, rows),
+                    rx,
+                    out.clone(),
+                    connections.clone(),
+                ));
+            }
+            Message::SftpOpen {
+                channel,
+                connection,
+            } => {
+                sessions.retain(|_, tx| !tx.is_closed());
+                if sessions.contains_key(&channel) {
+                    continue;
+                }
+                let (tx, rx) = mpsc::channel(QUEUE);
+                sessions.insert(channel, tx);
+                tokio::spawn(sftp::run(
+                    channel,
+                    connection,
                     rx,
                     out.clone(),
                     connections.clone(),

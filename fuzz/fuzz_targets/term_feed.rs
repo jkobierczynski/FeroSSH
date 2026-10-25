@@ -30,6 +30,10 @@ fuzz_target!(|data: &[u8]| {
                     assert!(title.chars().count() <= 256);
                 }
                 Action::Title(None) | Action::ClipboardRequest(_) | Action::Bell => {}
+                Action::WorkingDirectory(dir) => {
+                    assert!(!dir.path.contains(&0));
+                    assert!(dir.path.len() <= 4096);
+                }
             }
         }
         // Vary the size and view now and then, driven by the input.

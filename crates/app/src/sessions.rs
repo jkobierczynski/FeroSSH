@@ -60,6 +60,10 @@ pub enum SideKey {
     Backspace,
     /// Ctrl+D.
     ToggleFavourite,
+    Delete,
+    Tab,
+    /// F5.
+    Refresh,
     Char(char),
 }
 
@@ -315,7 +319,7 @@ impl SessionList {
                 self.selected = 0;
                 self.scroll = 0;
             }
-            SideKey::Char(_) => {}
+            SideKey::Char(_) | SideKey::Delete | SideKey::Tab | SideKey::Refresh => {}
         }
         self.clamp(visible);
         None

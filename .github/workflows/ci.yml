@@ -49,6 +49,7 @@ jobs:
       - run: sudo apt-get update && sudo apt-get install -y openssh-server putty-tools
       - run: sudo mkdir -p /run/sshd
       - run: cargo test --locked -p ferossh-worker --test sshd
+      - run: cargo test --locked -p ferossh-sftp --test queue
       - run: cargo test --locked -p ferossh ssh_e2e
       - run: cargo test --locked -p ferossh-auth keyfile
 
@@ -83,3 +84,4 @@ jobs:
       # target, which AddressSanitizer does not support.
       - run: cargo +nightly fuzz run --target x86_64-unknown-linux-gnu ipc_decode -- -max_total_time=60
       - run: cargo +nightly fuzz run --target x86_64-unknown-linux-gnu term_feed -- -max_total_time=60
+      - run: cargo +nightly fuzz run --target x86_64-unknown-linux-gnu sftp_decode -- -max_total_time=60

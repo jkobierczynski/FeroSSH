@@ -440,3 +440,205 @@ async fn second_shell_shares_the_connection() {
         }
     }
 }
+
+/// Logs in on channel 1 and returns the worker's channels once the shell
+/// is open.
+#[cfg(unix)]
+async fn login(server: &Server) -> (mpsc::Sender<Message>, mpsc::Receiver<Message>) {
+    let (to_worker, worker_in) = mpsc::channel(64);
+    let (worker_out, mut from_worker) = mpsc::channel(64);
+    tokio::spawn(ferossh_worker::serve(worker_in, worker_out));
+    let user = whoami();
+    let key = KeyFile::load(&server.user_key).unwrap();
+    to_worker
+        .send(Message::Hello {
+            version: PROTOCOL_VERSION,
+        })
+        .await
+        .unwrap();
+    to_worker
+        .send(Message::Connect {
+            channel: 1,
+            host: "127.0.0.1".into(),
+            port: server.port,
+            user,
+            cols: 80,
+            rows: 24,
+            host_key_algs: vec![],
+        })
+        .await
+        .unwrap();
+    loop {
+        let msg = tokio::time::timeout(Duration::from_secs(30), from_worker.recv())
+            .await
+            .expect("timed out logging in")
+            .expect("worker hung up");
+        let reply = match msg {
+            Message::HostKey { channel, .. } => Message::HostKeyVerdict {
+                channel,
+                accept: true,
+            },
+            Message::IdentitiesRequest { channel } => Message::Identities {
+                channel,
+                keys: vec![key.public.clone()],
+            },
+            Message::SignRequest { channel, data, .. } => Message::Signature {
+                channel,
+                signature: key.sign(None, &data).unwrap(),
+            },
+            Message::Connected { .. } => return (to_worker, from_worker),
+            Message::Disconnected { reason, .. } => panic!("login failed: {reason}"),
+            _ => continue,
+        };
+        to_worker.send(reply).await.unwrap();
+    }
+}
+
+/// Runs the UI's transfer queue against the worker until `done` holds.
+#[cfg(unix)]
+async fn drive(
+    remote: &mut ferossh_sftp::Remote,
+    to_worker: &mpsc::Sender<Message>,
+    from_worker: &mut mpsc::Receiver<Message>,
+    done: impl Fn(&ferossh_sftp::Remote) -> bool,
+) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    loop {
+        for msg in remote.take_outbox() {
+            to_worker.send(msg).await.unwrap();
+        }
+        if done(remote) {
+            return;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "timed out: {:?}",
+            remote.jobs()
+        );
+        match tokio::time::timeout(Duration::from_millis(20), from_worker.recv()).await {
+            Ok(Some(msg)) if msg.channel() == Some(2) => {
+                if let Message::Disconnected { reason, .. } = &msg {
+                    panic!("SFTP ended: {reason}");
+                }
+                remote.on_message(msg);
+            }
+            Ok(Some(_)) => {}
+            Ok(None) => panic!("worker hung up"),
+            Err(_) => remote.poll(),
+        }
+    }
+}
+
+/// SFTP on the shell's connection: list, download, upload and a folder
+/// download, each checked with the server's sha256sum, and a link out of
+/// the folder left alone.
+#[cfg(unix)]
+#[tokio::test]
+async fn transfers_files_over_sftp() {
+    use ferossh_sftp::{Remote, State};
+    if !available() {
+        return;
+    }
+    let server = start("sftp", "Subsystem sftp internal-sftp");
+    let (to_worker, mut from_worker) = login(&server).await;
+    let remote_dir = server.dir.join("files");
+    let local_dir = server.dir.join("local");
+    std::fs::create_dir_all(&remote_dir).unwrap();
+    std::fs::create_dir_all(&local_dir).unwrap();
+    let data: Vec<u8> = (0..3_000_000u32).map(|i| (i % 253) as u8).collect();
+    std::fs::write(remote_dir.join("big.bin"), &data).unwrap();
+    std::os::unix::fs::symlink("/etc/passwd", remote_dir.join("passwd-link")).unwrap();
+
+    let mut remote = Remote::new("test");
+    remote.verify = true;
+    remote.attach(2, 1);
+    drive(&mut remote, &to_worker, &mut from_worker, |r| {
+        r.is_ready() && !r.listing.loading
+    })
+    .await;
+    assert!(remote.home.is_some());
+    let dir = remote_dir.to_str().unwrap().as_bytes().to_vec();
+    remote.browse(&dir);
+    drive(&mut remote, &to_worker, &mut from_worker, |r| {
+        !r.listing.loading && r.listing.path == dir
+    })
+    .await;
+    let names: Vec<&[u8]> = remote.listing.entries.iter().map(|e| &e.name[..]).collect();
+    assert_eq!(names, [&b"big.bin"[..], b"passwd-link"]);
+
+    let settled = |r: &Remote| r.jobs().iter().all(|j| j.state.finished());
+    let big = remote.listing.entries[0].clone();
+    remote.download(&big, &local_dir).unwrap();
+    drive(&mut remote, &to_worker, &mut from_worker, settled).await;
+    let job = &remote.jobs()[0];
+    assert_eq!(job.state, State::Done, "{:?}", job.note);
+    assert_eq!(job.note.as_deref(), Some("SHA-256 verified"));
+    assert_eq!(std::fs::read(local_dir.join("big.bin")).unwrap(), data);
+
+    let up = local_dir.join("up.bin");
+    std::fs::write(&up, &data[..1_000_001]).unwrap();
+    remote.upload(&up, &dir).unwrap();
+    drive(&mut remote, &to_worker, &mut from_worker, settled).await;
+    let job = &remote.jobs()[1];
+    assert_eq!(job.state, State::Done, "{:?}", job.note);
+    assert_eq!(job.note.as_deref(), Some("SHA-256 verified"));
+    assert_eq!(
+        std::fs::read(remote_dir.join("up.bin")).unwrap(),
+        &data[..1_000_001]
+    );
+
+    // The whole folder: the link to /etc/passwd stays behind.
+    remote.browse(remote_dir.parent().unwrap().to_str().unwrap().as_bytes());
+    drive(&mut remote, &to_worker, &mut from_worker, |r| {
+        !r.listing.loading
+    })
+    .await;
+    let files = remote
+        .listing
+        .entries
+        .iter()
+        .find(|e| e.name == b"files")
+        .unwrap()
+        .clone();
+    let into = local_dir.join("copy");
+    std::fs::create_dir_all(&into).unwrap();
+    remote.download(&files, &into).unwrap();
+    drive(&mut remote, &to_worker, &mut from_worker, settled).await;
+    let folder = remote.jobs().last().unwrap();
+    let folder = remote
+        .jobs()
+        .iter()
+        .find(|j| j.parent.is_none() && j.name == "files")
+        .unwrap_or(folder);
+    assert_eq!(folder.state, State::Done, "{:?}", folder.note);
+    assert!(
+        folder
+            .note
+            .as_deref()
+            .unwrap_or_default()
+            .contains("1 link skipped"),
+        "{:?}",
+        folder.note
+    );
+    assert_eq!(std::fs::read(into.join("files/big.bin")).unwrap(), data);
+    assert!(!into.join("files/passwd-link").exists());
+
+    // Closing the SFTP channel leaves the shell's connection alone.
+    to_worker.send(Message::Close { channel: 2 }).await.unwrap();
+    to_worker
+        .send(Message::Data {
+            channel: 1,
+            bytes: b"echo still$((40+2)); exit\n".to_vec(),
+        })
+        .await
+        .unwrap();
+    let mut out = Vec::new();
+    loop {
+        match from_worker.recv().await.unwrap() {
+            Message::Data { channel: 1, bytes } => out.extend(bytes),
+            Message::Disconnected { channel: 1, .. } => break,
+            _ => {}
+        }
+    }
+    assert!(String::from_utf8_lossy(&out).contains("still42"));
+}
