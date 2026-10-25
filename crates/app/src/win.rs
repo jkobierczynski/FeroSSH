@@ -4002,7 +4002,6 @@ impl Window {
                     _ => FontSpec::new(&font.family, FontSpec::DEFAULT_PT),
                 };
                 self.set_font(pane, font);
-                self.layout();
             }
             cmd::TEST_PATTERN => {
                 let p = self.panes.get_mut(&pane)?;
@@ -4043,7 +4042,6 @@ impl Window {
                 if let Some(family) = FONT_CHOICES.get((id - cmd::FONT) as usize) {
                     let size = self.panes.get(&pane)?.font.size_pt;
                     self.set_font(pane, FontSpec::new(family, size));
-                    self.layout();
                 }
             }
             id if (cmd::THEME..cmd::THEME + Theme::builtin().len() as u32).contains(&id) => {
@@ -4061,7 +4059,8 @@ impl Window {
     }
 
     /// Changes a pane's font; the window keeps its size and the grid gains
-    /// or loses cells at the next layout.
+    /// or loses cells right away, so a shell started next (the pty-req of
+    /// a new connection) gets the rows and columns that fit.
     fn set_font(&mut self, id: PaneId, font: FontSpec) {
         let Ok(metrics) = self.renderer.metrics(&font, self.dpi) else {
             return;
@@ -4070,6 +4069,7 @@ impl Window {
             p.font = font;
             p.metrics = metrics;
         }
+        self.layout();
         self.update_menu_checks();
     }
 
