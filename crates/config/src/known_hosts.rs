@@ -3,8 +3,9 @@
 //! FeroSSH shares the file with Windows OpenSSH (`~/.ssh/known_hosts`), so a
 //! host trusted in one is trusted in the other. New entries are written with
 //! hashed hostnames (`|1|salt|hmac`), as `HashKnownHosts yes` does.
-//! `@cert-authority` lines are kept but not used until host certificates
-//! arrive (milestone 6); `@revoked` keys are always refused.
+//! `@cert-authority` lines name the CAs trusted to sign host certificates
+//! for the hosts they match; `@revoked` keys (host keys or CAs) are always
+//! refused.
 
 use std::fs;
 use std::io::{self, Write};
@@ -136,6 +137,32 @@ impl KnownHosts {
             .collect();
         other_types.dedup();
         Status::Unknown { other_types }
+    }
+
+    /// Whether `key` (a host key or a CA) is marked `@revoked`.
+    pub fn is_revoked(&self, key: &[u8]) -> bool {
+        self.entries
+            .iter()
+            .any(|e| e.marker == Some(Marker::Revoked) && e.key == key)
+    }
+
+    fn authorities<'a>(&'a self, token: &'a str) -> impl Iterator<Item = &'a Entry> + 'a {
+        self.entries.iter().filter(move |e| {
+            e.marker == Some(Marker::CertAuthority) && host_matches(&e.hosts, token)
+        })
+    }
+
+    /// Whether an `@cert-authority` line matches `host` on `port`, so the
+    /// worker should ask for a host certificate.
+    pub fn has_authority(&self, host: &str, port: u16) -> bool {
+        self.authorities(&host_token(host, port)).next().is_some()
+    }
+
+    /// Whether `ca` (SSH wire format) is trusted to sign host certificates
+    /// for `host` on `port`.
+    pub fn is_authority_for(&self, host: &str, port: u16, ca: &[u8]) -> bool {
+        self.authorities(&host_token(host, port))
+            .any(|e| e.key == ca)
     }
 
     /// The key types listed for a host, so the worker can ask the server
@@ -343,6 +370,35 @@ mod tests {
             key_type(key).unwrap(),
             Base64::encode_string(key)
         )
+    }
+
+    #[test]
+    fn cert_authorities() {
+        let ca = blob("ssh-ed25519", b"ca");
+        let other = blob("ssh-ed25519", b"other-ca");
+        let text = format!(
+            "@cert-authority {}\n@cert-authority {}\n@revoked {}\n",
+            line("*.example.org,!bad.example.org", &ca),
+            line("[*.lab]:2222", &other),
+            line("*", &blob("ssh-ed25519", b"gone"))
+        );
+        let kh = KnownHosts::parse(&text);
+        assert!(kh.has_authority("web.example.org", 22));
+        assert!(kh.is_authority_for("web.example.org", 22, &ca));
+        assert!(!kh.is_authority_for("web.example.org", 22, &other));
+        assert!(!kh.has_authority("bad.example.org", 22));
+        assert!(!kh.has_authority("example.com", 22));
+        assert!(kh.is_authority_for("sw1.lab", 2222, &other));
+        assert!(!kh.is_authority_for("sw1.lab", 22, &other));
+        assert!(kh.is_revoked(&blob("ssh-ed25519", b"gone")));
+        assert!(!kh.is_revoked(&ca));
+        // A CA line never trusts the CA key as a plain host key.
+        assert_eq!(
+            kh.check("web.example.org", 22, &ca),
+            Status::Unknown {
+                other_types: vec![]
+            }
+        );
     }
 
     #[test]

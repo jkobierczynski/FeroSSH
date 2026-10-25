@@ -28,6 +28,18 @@ const AMBER: &str = "\x1b[0;33m";
 const BOLD: &str = "\x1b[1m";
 const RESET: &str = "\x1b[0m";
 
+/// A host certificate as the worker reports it.
+#[derive(Debug)]
+struct HostCert {
+    ca: Vec<u8>,
+    key: Vec<u8>,
+    principals: Vec<String>,
+    /// Valid from, valid before: seconds since the Unix epoch.
+    valid: (u64, u64),
+    key_id: String,
+    serial: u64,
+}
+
 /// Where to connect, after applying `ssh_config`.
 #[derive(Debug, Clone)]
 pub struct Target {
@@ -271,7 +283,11 @@ impl SshSession {
     /// Starts connecting with a pane of `cols` x `rows`.
     pub fn start(&mut self, cols: u16, rows: u16) -> Vec<Effect> {
         let t = &self.target;
-        let host_key_algs = self.known().key_types(&t.hostname, t.port);
+        let known = self.known();
+        let mut host_key_algs = known.key_types(&t.hostname, t.port);
+        if known.has_authority(&t.hostname, t.port) {
+            host_key_algs.push(crypto_policy::CERT_AUTHORITY.to_owned());
+        }
         let mut text = format!("Connecting to {}", t.label());
         if t.hostname != t.alias {
             text.push_str(&format!(" ({})", t.hostname));
@@ -362,6 +378,29 @@ impl SshSession {
     pub fn on_worker(&mut self, msg: Message) -> Vec<Effect> {
         match msg {
             Message::HostKey { key, .. } => self.on_host_key(key),
+            Message::HostCert {
+                ca,
+                key,
+                principals,
+                valid_after,
+                valid_before,
+                key_id,
+                serial,
+                ..
+            } => {
+                let cert = HostCert {
+                    ca,
+                    key,
+                    principals,
+                    valid: (valid_after, valid_before),
+                    key_id,
+                    serial,
+                };
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_or(0, |d| d.as_secs());
+                self.on_host_cert(&cert, now)
+            }
             Message::Banner { text, .. } => vec![Effect::Show(sanitize(&text))],
             Message::Notice { text, .. } => vec![Effect::Show(dim(&sanitize(&text)))],
             Message::IdentitiesRequest { .. } => vec![Effect::Broker(Job::Identities {
@@ -442,6 +481,71 @@ impl SshSession {
             channel: self.channel,
             accept,
         })
+    }
+
+    /// A host certificate the worker checked the CA signature of: trusted
+    /// when known_hosts names its CA for this host, the hostname is one of
+    /// its principals, it is valid now and nothing in it is revoked. There
+    /// is no prompt either way, as in OpenSSH.
+    fn on_host_cert(&mut self, cert: &HostCert, now: u64) -> Vec<Effect> {
+        let (host, port) = (self.target.hostname.clone(), self.target.port);
+        let (Some(ca), Some(key)) = (hostkey::describe(&cert.ca), hostkey::describe(&cert.key))
+        else {
+            return vec![self.verdict(false)];
+        };
+        let known = self.known();
+        let problem = if known.is_revoked(&cert.ca) {
+            Some(format!(
+                "its CA key {} is marked as revoked",
+                ca.fingerprint
+            ))
+        } else if known.is_revoked(&cert.key) {
+            Some(format!(
+                "its host key {} is marked as revoked",
+                key.fingerprint
+            ))
+        } else if !known.is_authority_for(&host, port, &cert.ca) {
+            Some(format!(
+                "it is signed by CA {} {}, which no @cert-authority line in known_hosts \
+                 trusts for {host}",
+                ca.kind, ca.fingerprint
+            ))
+        } else if !cert
+            .principals
+            .iter()
+            .any(|p| p.eq_ignore_ascii_case(&host))
+        {
+            Some(format!(
+                "it is not issued for {host} (it names {})",
+                if cert.principals.is_empty() {
+                    "no hosts".to_owned()
+                } else {
+                    cert.principals.join(", ")
+                }
+            ))
+        } else if now < cert.valid.0 {
+            Some("it is not valid yet".to_owned())
+        } else if now >= cert.valid.1 {
+            Some("it has expired".to_owned())
+        } else {
+            None
+        };
+        match problem {
+            Some(why) => vec![
+                Effect::Show(sanitize(&format!(
+                    "{RED}The host certificate offered by {host} is not accepted: {why}. \
+                     Not connecting.{RESET}\r\n"
+                ))),
+                self.verdict(false),
+            ],
+            None => vec![
+                Effect::Show(dim(&sanitize(&format!(
+                    "Host certificate \"{}\" (serial {}) for {} key {}, signed by trusted CA {}.",
+                    cert.key_id, cert.serial, key.kind, key.fingerprint, ca.fingerprint
+                )))),
+                self.verdict(true),
+            ],
+        }
     }
 
     fn on_host_key(&mut self, key: Vec<u8>) -> Vec<Effect> {
@@ -874,6 +978,86 @@ mod tests {
         let t = Target::resolve("root@other:23", &e).unwrap();
         assert_eq!(t.label(), "root@other:23");
         assert!(Target::resolve("bad host", &e).is_none());
+    }
+
+    const CA: &str =
+        "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIHBotJ7Eq4j3xY4L22Rdv6r113TCdKlCUcMe9icH6KGY";
+
+    fn ca_blob() -> Vec<u8> {
+        russh::keys::PublicKey::from_openssh(CA)
+            .unwrap()
+            .to_bytes()
+            .unwrap()
+    }
+
+    #[test]
+    fn host_certificates_need_a_trusted_ca_principal_and_validity() {
+        let dir = temp("cert");
+        let e = env(&dir);
+        std::fs::create_dir_all(dir.join(".ssh")).unwrap();
+        let known = |text: &str| std::fs::write(e.known_hosts(), text).unwrap();
+        let mut s = SshSession::new(1, Target::resolve("host", &e).unwrap(), e.known_hosts());
+        // No CA: no certificates asked for.
+        let fx = s.start(80, 24);
+        assert!(
+            matches!(&sent(&fx)[..], [Message::Connect { host_key_algs, .. }] if host_key_algs.is_empty())
+        );
+        known(&format!("@cert-authority *.lab,host {CA}\n"));
+        let fx = s.start(80, 24);
+        assert!(
+            matches!(&sent(&fx)[..], [Message::Connect { host_key_algs, .. }]
+            if host_key_algs == &[crypto_policy::CERT_AUTHORITY])
+        );
+
+        let cert = |principals: &[&str], valid: (u64, u64)| HostCert {
+            ca: ca_blob(),
+            key: ed25519_blob(),
+            principals: principals.iter().map(|p| (*p).to_owned()).collect(),
+            valid,
+            key_id: "host-2026".into(),
+            serial: 9,
+        };
+        let verdict = |fx: &[Effect]| match sent(fx)[..] {
+            [Message::HostKeyVerdict { accept, .. }] => *accept,
+            _ => panic!("no verdict"),
+        };
+        let fx = s.on_host_cert(&cert(&["HOST"], (100, 200)), 150);
+        assert!(verdict(&fx), "{}", shown(&fx));
+        assert!(shown(&fx).contains("\"host-2026\" (serial 9)"));
+        for (c, now, why) in [
+            (
+                cert(&["other"], (100, 200)),
+                150,
+                "not issued for host (it names other)",
+            ),
+            (cert(&[], (100, 200)), 150, "names no hosts"),
+            (cert(&["host"], (100, 200)), 99, "not valid yet"),
+            (cert(&["host"], (100, 200)), 200, "expired"),
+        ] {
+            let fx = s.on_host_cert(&c, now);
+            assert!(!verdict(&fx));
+            assert!(shown(&fx).contains(why), "{}", shown(&fx));
+        }
+        // Not this host's CA, or revoked.
+        known(&format!("@cert-authority *.lab {CA}\n"));
+        let fx = s.on_host_cert(&cert(&["host"], (100, 200)), 150);
+        assert!(!verdict(&fx));
+        assert!(
+            shown(&fx).contains("no @cert-authority line"),
+            "{}",
+            shown(&fx)
+        );
+        known(&format!("@cert-authority host {CA}\n@revoked * {CA}\n"));
+        let fx = s.on_host_cert(&cert(&["host"], (100, 200)), 150);
+        assert!(!verdict(&fx));
+        assert!(shown(&fx).contains("CA key SHA256:"), "{}", shown(&fx));
+        // A CA line is no plain host key: known_hosts stays as it was.
+        assert_eq!(
+            KnownHosts::load(&e.known_hosts())
+                .unwrap()
+                .check("host", 22, &ca_blob()),
+            Status::Revoked
+        );
     }
 
     #[test]

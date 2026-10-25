@@ -26,7 +26,10 @@ use ferossh_ipc::{
 };
 use russh::client::{self, AuthResult, DisconnectReason, Handle, KeyboardInteractiveAuthResponse};
 use russh::keys::agent::AgentIdentity;
-use russh::keys::{Algorithm, HashAlg, PublicKey, PublicKeyOrCertificate};
+use russh::keys::ssh_encoding::Encode;
+use russh::keys::ssh_key::certificate::CertType;
+use russh::keys::ssh_key::public::KeyData;
+use russh::keys::{Algorithm, Certificate, HashAlg, PublicKey, PublicKeyOrCertificate};
 use russh::{
     AlgorithmKind, Channel, ChannelMsg, ChannelOpenFailure, Disconnect, MethodKind, MethodSet,
     Names, Preferred, SshId,
@@ -370,19 +373,11 @@ impl client::Handler for Client {
     }
 
     async fn check_server_key(&mut self, key: &PublicKeyOrCertificate) -> Result<bool, Failure> {
-        let PublicKeyOrCertificate::PublicKey { key, .. } = key else {
-            return Err(Failure::Refused(
-                "The server sent a host certificate; certificates arrive in milestone 6.".into(),
-            ));
+        let key = match key {
+            PublicKeyOrCertificate::PublicKey { key, .. } => key,
+            PublicKeyOrCertificate::Certificate(cert) => return self.check_host_cert(cert).await,
         };
-        if let Some(rsa) = key.key_data().rsa()
-            && (rsa.key_size() as usize) < MIN_RSA_BITS
-        {
-            return Err(Failure::Refused(format!(
-                "The server's RSA host key has {} bits; FeroSSH requires at least {MIN_RSA_BITS}.",
-                rsa.key_size()
-            )));
-        }
+        check_key_size(key.key_data(), "host key")?;
         let blob = key
             .to_bytes()
             .map_err(|_| Failure::Refused("The server's host key is malformed.".into()))?;
@@ -498,6 +493,82 @@ impl client::Handler for Client {
                 Ok(())
             }
             DisconnectReason::Error(e) => Err(e),
+        }
+    }
+}
+
+/// Refuses RSA keys below [`MIN_RSA_BITS`]; `what` names the key.
+fn check_key_size(key: &KeyData, what: &str) -> Result<(), Failure> {
+    match key.rsa() {
+        Some(rsa) if (rsa.key_size() as usize) < MIN_RSA_BITS => Err(Failure::Refused(format!(
+            "The server's RSA {what} has {} bits; FeroSSH requires at least {MIN_RSA_BITS}.",
+            rsa.key_size()
+        ))),
+        _ => Ok(()),
+    }
+}
+
+/// What makes a host certificate unusable before the UI sees it: the wrong
+/// type, a bad CA signature, or a CA key or signature outside the policy.
+fn cert_problem(cert: &Certificate) -> Option<String> {
+    if cert.cert_type() != CertType::Host {
+        return Some("is a user certificate, not a host certificate".into());
+    }
+    let ca = cert.signature_key();
+    match ca.algorithm() {
+        Algorithm::Ed25519 | Algorithm::Ecdsa { .. } => {}
+        Algorithm::Rsa { .. } => {
+            if ca
+                .rsa()
+                .is_some_and(|r| (r.key_size() as usize) < MIN_RSA_BITS)
+            {
+                return Some(format!(
+                    "is signed by an RSA CA key under {MIN_RSA_BITS} bits"
+                ));
+            }
+            // ssh-rsa signatures are SHA-1.
+            if cert.signature().algorithm().as_str() == "ssh-rsa" {
+                return Some("is signed with SHA-1 (ssh-rsa)".into());
+            }
+        }
+        other => return Some(format!("is signed by a {} CA key", other.as_str())),
+    }
+    if let Err(e) = cert.verify_signature() {
+        return Some(format!("has a CA signature that does not verify ({e})"));
+    }
+    None
+}
+
+impl Client {
+    /// Checks what the worker can of a host certificate, then asks the UI
+    /// whether its CA is trusted for this host.
+    async fn check_host_cert(&mut self, cert: &Certificate) -> Result<bool, Failure> {
+        if let Some(problem) = cert_problem(cert) {
+            return Err(Failure::Refused(format!(
+                "The server's host certificate {problem}. Not connecting."
+            )));
+        }
+        check_key_size(cert.public_key(), "certified host key")?;
+        let malformed = || Failure::Refused("The server's host certificate is malformed.".into());
+        let ca = cert.signature_key().encode_vec().map_err(|_| malformed())?;
+        let key = cert.public_key().encode_vec().map_err(|_| malformed())?;
+        let (tx, rx) = oneshot::channel();
+        with(&self.shared, |s| s.verdict = Some(tx));
+        let msg = Message::HostCert {
+            channel: self.channel,
+            ca,
+            key,
+            principals: cert.valid_principals().to_vec(),
+            valid_after: cert.valid_after(),
+            valid_before: cert.valid_before(),
+            key_id: cert.key_id().to_owned(),
+            serial: cert.serial(),
+        };
+        self.out.send(msg).await.map_err(|_| Failure::Cancelled)?;
+        match rx.await {
+            Ok(true) => Ok(true),
+            Ok(false) => Err(Failure::Refused("Host certificate not accepted.".into())),
+            Err(_) => Err(Failure::Cancelled),
         }
     }
 }
