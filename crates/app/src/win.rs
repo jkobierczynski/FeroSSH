@@ -83,7 +83,7 @@ use windows::core::{HSTRING, PCWSTR, PWSTR, Result, w};
 use crate::Launch;
 use crate::clipboard;
 use crate::conpty::{self, Output, Shell};
-use crate::desktop::{Desktop, Update as DesktopUpdate};
+use crate::desktop::{Desktop, Protocol, Update as DesktopUpdate};
 use crate::files::{FilesAction, FilesView};
 use crate::forwards::{ConnView, DesktopEvent, Forwarder, Setup as ForwardSetup, desktop_port_for};
 use crate::fwdview::{ForwardsView, FwdAction};
@@ -202,6 +202,7 @@ mod cmd {
     pub const TMUX_LAYOUT: u32 = 613;
     pub const DESKTOP: u32 = 614;
     pub const DESKTOP_TAB: u32 = 615;
+    pub const DESKTOP_TAB_RDP: u32 = 616;
     /// Plus the index in the session picker's list; the one past the
     /// last is "New session".
     pub const TMUX_SESSION: u32 = 800;
@@ -244,7 +245,7 @@ enum Host {
     },
     /// The built-in viewer's remote desktop (in the pane's `desktop`);
     /// `label` names the host.
-    #[cfg_attr(not(feature = "desktop-viewer"), allow(dead_code))]
+    #[cfg_attr(not(feature = "viewer"), allow(dead_code))]
     Desktop {
         label: String,
     },
@@ -512,13 +513,18 @@ struct Window {
     desktops: HashMap<(ChannelId, u16), DesktopWant>,
 }
 
-/// A remote desktop asked for in pane `pane`.
+/// A remote desktop asked for.
 #[derive(Debug, Clone)]
 enum DesktopWant {
     /// Windows' Remote Desktop Connection, over RDP.
     Rdp { pane: PaneId },
-    /// The built-in viewer in a new tab, over VNC; `label` names the host.
-    Tab { pane: PaneId, label: String },
+    /// The built-in viewer in a new tab; `label` names the host and
+    /// `user` is the SSH user, offered for RDP.
+    Tab {
+        label: String,
+        user: String,
+        protocol: Protocol,
+    },
 }
 
 thread_local! {
@@ -928,11 +934,18 @@ fn build_menu() -> Result<HMENU> {
         )?;
         separator(session)?;
         item(session, cmd::DESKTOP, "Open remote &desktop\tCtrl+Shift+D")?;
-        if cfg!(feature = "desktop-viewer") {
+        if cfg!(feature = "rdp-viewer") {
+            item(
+                session,
+                cmd::DESKTOP_TAB_RDP,
+                "Open remote desktop in a &tab (RDP)",
+            )?;
+        }
+        if cfg!(feature = "vnc-viewer") {
             item(
                 session,
                 cmd::DESKTOP_TAB,
-                "Open remote desktop in a &tab (VNC)",
+                "Open remote desktop in a tab (&VNC)",
             )?;
         }
 
@@ -1775,9 +1788,9 @@ impl Window {
 
     /// Session > Open remote desktop: asks the forwarding engine for a
     /// tunnel to the host's RDP port (or, for the built-in viewer in a
-    /// tab, its VNC port); [`Self::desktop_events`] opens the viewer once
-    /// it listens.
-    fn open_desktop(&mut self, pane: PaneId, tab: bool) -> Option<Command> {
+    /// tab, its RDP or VNC port); [`Self::desktop_events`] opens the
+    /// viewer once it listens.
+    fn open_desktop(&mut self, pane: PaneId, tab: Option<Protocol>) -> Option<Command> {
         let host = self.host_pane(pane);
         let (Some(connection), Some(Host::Ssh(s))) = (
             self.pane_connection(pane),
@@ -1787,15 +1800,32 @@ impl Window {
         };
         let profile = self.settings.profile(&s.target.alias);
         let label = s.target.label();
-        let (port, local, want) = if tab {
-            let port = profile.and_then(|p| p.vnc_port).unwrap_or(DEFAULT_VNC_PORT);
-            // Only the viewer connects; any free port will do.
-            (port, 0, DesktopWant::Tab { pane, label })
-        } else {
-            let port = profile
-                .and_then(|p| p.desktop_port)
-                .unwrap_or(DEFAULT_DESKTOP_PORT);
-            (port, desktop_port_for(&label), DesktopWant::Rdp { pane })
+        let rdp_port = profile
+            .and_then(|p| p.desktop_port)
+            .unwrap_or(DEFAULT_DESKTOP_PORT);
+        let (port, local, want) = match tab {
+            Some(protocol) => {
+                let port = match protocol {
+                    Protocol::Rdp => rdp_port,
+                    Protocol::Vnc => profile.and_then(|p| p.vnc_port).unwrap_or(DEFAULT_VNC_PORT),
+                };
+                let user = s.target.user.clone();
+                // Only the viewer connects; any free port will do.
+                (
+                    port,
+                    0,
+                    DesktopWant::Tab {
+                        label,
+                        user,
+                        protocol,
+                    },
+                )
+            }
+            None => (
+                rdp_port,
+                desktop_port_for(&label),
+                DesktopWant::Rdp { pane },
+            ),
         };
         let w = self.worker.as_ref()?;
         w.forwarder.open_desktop(connection, port, local);
@@ -1838,7 +1868,11 @@ impl Window {
                         self.show(pane, &note);
                         self.refresh(pane);
                     }
-                    Some(DesktopWant::Tab { pane, label }) => self.desktop_tab(pane, label, &addr),
+                    Some(DesktopWant::Tab {
+                        label,
+                        user,
+                        protocol,
+                    }) => self.desktop_tab(label, user, protocol, &addr),
                     None => {}
                 },
                 DesktopEvent::Failed {
@@ -1847,7 +1881,10 @@ impl Window {
                     why,
                 } => {
                     let advice = match self.desktops.remove(&(connection, port)) {
-                        Some(DesktopWant::Tab { .. }) => {
+                        Some(DesktopWant::Tab {
+                            protocol: Protocol::Vnc,
+                            ..
+                        }) => {
                             " Start a VNC server for your desktop there (x11vnc or TigerVNC \
                              for X11, wayvnc or GNOME's VNC mode for Wayland), or set VncPort \
                              in this host's profile if it listens elsewhere."
@@ -1865,41 +1902,52 @@ impl Window {
     }
 
     /// Opens the built-in viewer on the tunnel at `addr` in a new tab.
-    #[cfg(feature = "desktop-viewer")]
-    fn desktop_tab(&mut self, from: PaneId, label: String, addr: &str) {
+    #[cfg(feature = "viewer")]
+    fn desktop_tab(&mut self, label: String, user: String, protocol: Protocol, addr: &str) {
+        let id = self.new_tab_pane();
+        // An RDP server draws the desktop at the size of the tab.
+        let (width, height) = self
+            .panes
+            .get(&id)
+            .map(|p| (p.rect.w, p.rect.h))
+            .unwrap_or((1024, 768));
+        let session = crate::desktop::Session {
+            protocol,
+            width: u16::try_from(width.clamp(200, 8192)).unwrap_or(1024),
+            height: u16::try_from(height.clamp(200, 8192)).unwrap_or(768),
+            layout: keyboard_layout(),
+            user,
+        };
         let started = sandbox::spawn_viewer().and_then(|v| {
             let to = v.to_worker.try_clone().map_err(io_error)?;
             let from = v.from_worker.try_clone().map_err(io_error)?;
-            Desktop::start(addr, to, from, Box::new(v), self.notifier()).map_err(io_error)
+            Desktop::start(addr, session, to, from, Box::new(v), self.notifier()).map_err(io_error)
         });
-        match started {
+        let note = match started {
             Ok(desktop) => {
-                let id = self.new_tab_pane();
                 if let Some(p) = self.panes.get_mut(&id) {
                     p.host = Host::Desktop {
                         label: format!("desktop {label}"),
                     };
                     p.desktop = Some(Box::new(desktop));
                 }
-                self.show(
-                    id,
-                    "\x1b[0;90mConnecting to the VNC server through the SSH tunnel...\x1b[0m\r\n",
-                );
-                self.refresh(id);
-                self.update_title();
+                let server = match protocol {
+                    Protocol::Rdp => "RDP",
+                    Protocol::Vnc => "VNC",
+                };
+                format!(
+                    "\x1b[0;90mConnecting to the {server} server through the SSH tunnel...\x1b[0m\r\n"
+                )
             }
-            Err(e) => {
-                self.show(
-                    from,
-                    &format!("\x1b[0;31mThe desktop viewer did not start: {e}\x1b[0m\r\n"),
-                );
-                self.refresh(from);
-            }
-        }
+            Err(e) => format!("\x1b[0;31mThe desktop viewer did not start: {e}\x1b[0m\r\n"),
+        };
+        self.show(id, &note);
+        self.refresh(id);
+        self.update_title();
     }
 
-    #[cfg(not(feature = "desktop-viewer"))]
-    fn desktop_tab(&mut self, _from: PaneId, _label: String, _addr: &str) {}
+    #[cfg(not(feature = "viewer"))]
+    fn desktop_tab(&mut self, _label: String, _user: String, _protocol: Protocol, _addr: &str) {}
 
     /// Applies what the remote desktops sent.
     fn poll_desktops(&mut self) {
@@ -1937,8 +1985,8 @@ impl Window {
                             self.refresh_chrome();
                         }
                     }
-                    DesktopUpdate::AskPassword => {
-                        self.show(id, "VNC password: ");
+                    DesktopUpdate::Ask(prompt) => {
+                        self.show(id, &prompt);
                         self.refresh(id);
                     }
                     DesktopUpdate::Ended(why) => {
@@ -1999,15 +2047,14 @@ impl Window {
                 let Some(d) = self.panes.get_mut(&id).and_then(|p| p.desktop.as_mut()) else {
                     return false;
                 };
-                let asking = d.asking_password();
-                if !asking && !d.running() {
+                if !d.asking() && !d.running() {
                     return false;
                 }
                 let Some(c) = char::from_u32(wparam.0 as u32) else {
                     return true;
                 };
-                if d.char(c) {
-                    self.show(id, "\r\n");
+                if let Some(echo) = d.char(c) {
+                    self.show(id, &echo);
                     self.refresh(id);
                 }
                 true
@@ -4289,8 +4336,9 @@ impl Window {
                 };
                 self.attach_tmux(pane, &name, true);
             }
-            cmd::DESKTOP => return self.open_desktop(pane, false),
-            cmd::DESKTOP_TAB => return self.open_desktop(pane, true),
+            cmd::DESKTOP => return self.open_desktop(pane, None),
+            cmd::DESKTOP_TAB => return self.open_desktop(pane, Some(Protocol::Vnc)),
+            cmd::DESKTOP_TAB_RDP => return self.open_desktop(pane, Some(Protocol::Rdp)),
             cmd::TMUX_DETACH | cmd::TMUX_PICK | cmd::TMUX_LAYOUT => {
                 let host = self.host_pane(pane);
                 let Some(t) = self.tmux.get_mut(&host).filter(|t| t.active()) else {
@@ -5152,6 +5200,15 @@ const NOT_CONNECTED: &str = "Log in to an SSH host in this pane first; files go 
 
 /// Starts Windows' Remote Desktop Connection on `addr`, from System32 so
 /// nothing earlier on PATH stands in for it.
+/// The keyboard layout's language id (0x409 for US English), which an
+/// RDP server needs to read the scan codes the viewer sends.
+#[cfg(feature = "viewer")]
+fn keyboard_layout() -> u32 {
+    // SAFETY: no arguments to get wrong; 0 is this thread.
+    let hkl = unsafe { windows::Win32::UI::Input::KeyboardAndMouse::GetKeyboardLayout(0) };
+    (hkl.0 as usize & 0xffff) as u32
+}
+
 fn launch_rdp_client(addr: &str) -> std::io::Result<()> {
     let root = std::env::var_os("SystemRoot").unwrap_or_else(|| "C:\\Windows".into());
     let mstsc = PathBuf::from(root).join("System32").join("mstsc.exe");

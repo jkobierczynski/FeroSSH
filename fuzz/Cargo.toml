@@ -16,7 +16,7 @@ ferossh-render = { path = "../crates/render" }
 ferossh-sftp = { path = "../crates/sftp" }
 ferossh-term = { path = "../crates/term" }
 ferossh-tmuxcc = { path = "../crates/tmuxcc" }
-ferossh-vnc = { path = "../crates/vnc" }
+ferossh-viewer = { path = "../crates/viewer", features = ["vnc", "rdp"] }
 
 # Kept out of the main workspace: fuzzing needs nightly and libFuzzer.
 [workspace]
@@ -59,6 +59,13 @@ bench = false
 [[bin]]
 name = "vnc_decode"
 path = "fuzz_targets/vnc_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "rdp_decode"
+path = "fuzz_targets/rdp_decode.rs"
 test = false
 doc = false
 bench = false

@@ -13,7 +13,7 @@
 //! (and WSL through localhost) is unreachable from the sandbox; such hosts
 //! need `--no-sandbox` for now.
 //!
-//! With the `desktop-viewer` feature, the same exe also runs as the
+//! With a desktop viewer (`vnc-viewer`, `rdp-viewer`), the same exe runs as the
 //! remote desktop viewer (`--viewer`), in its own AppContainer
 //! ("FeroSSH.Viewer") with no capabilities at all: no network, and, like
 //! the worker, none of the user's files or registry. It is always
@@ -64,7 +64,7 @@ use windows::core::{HSTRING, PWSTR, Result, w};
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Kind {
     Worker,
-    #[cfg(feature = "desktop-viewer")]
+    #[cfg(feature = "viewer")]
     Viewer,
 }
 
@@ -84,7 +84,7 @@ impl Kind {
                 w!("FeroSSH SSH worker"),
                 w!("Runs FeroSSH's network connections with network access only."),
             ),
-            #[cfg(feature = "desktop-viewer")]
+            #[cfg(feature = "viewer")]
             Kind::Viewer => (
                 w!("FeroSSH.Viewer"),
                 w!("FeroSSH desktop viewer"),
@@ -98,7 +98,7 @@ impl Kind {
     fn flag(self) -> &'static str {
         match self {
             Kind::Worker => "--worker",
-            #[cfg(feature = "desktop-viewer")]
+            #[cfg(feature = "viewer")]
             Kind::Viewer => "--viewer",
         }
     }
@@ -274,7 +274,7 @@ pub fn spawn_worker(sandbox: bool) -> Result<Worker> {
 }
 
 /// Starts a remote desktop viewer, always in its AppContainer.
-#[cfg(feature = "desktop-viewer")]
+#[cfg(feature = "viewer")]
 pub fn spawn_viewer() -> Result<Worker> {
     spawn(Kind::Viewer, true)
 }

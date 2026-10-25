@@ -7,9 +7,9 @@
 
 #![no_main]
 
-use ferossh_vnc::framebuffer::Framebuffer;
-use ferossh_vnc::pipe::{FromViewer, ToViewer};
-use ferossh_vnc::rfb::{Client, Event};
+use ferossh_viewer::framebuffer::Framebuffer;
+use ferossh_viewer::pipe::{FromViewer, ToViewer};
+use ferossh_viewer::vnc::{Client, Event};
 use libfuzzer_sys::fuzz_target;
 
 /// A 3.8 login without a password to a 64x48 screen.

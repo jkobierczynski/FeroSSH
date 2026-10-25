@@ -19,10 +19,10 @@
 mod clipboard;
 #[cfg(windows)]
 mod conpty;
-#[cfg(feature = "desktop-viewer")]
+#[cfg(feature = "viewer")]
 #[cfg_attr(not(windows), allow(dead_code))]
 mod desktop;
-#[cfg(not(feature = "desktop-viewer"))]
+#[cfg(not(feature = "viewer"))]
 #[cfg_attr(not(windows), allow(dead_code))]
 #[path = "desktop_off.rs"]
 mod desktop;
@@ -118,7 +118,7 @@ fn parse_args(args: &[String]) -> Result<Launch, String> {
                 };
                 return Ok(Launch::Worker(i.clone(), o.clone()));
             }
-            "--viewer" if cfg!(feature = "desktop-viewer") => {
+            "--viewer" if cfg!(feature = "viewer") => {
                 let (Some(i), Some(o)) = (iter.next(), iter.next()) else {
                     return Err("--viewer needs two handles".into());
                 };
@@ -179,11 +179,11 @@ fn main() -> windows::core::Result<()> {
             Ok(())
         }
         Ok(Launch::NewSecurityKey(key)) => win::new_security_key(&key),
-        #[cfg(feature = "desktop-viewer")]
+        #[cfg(feature = "viewer")]
         Ok(Launch::Viewer(input, output)) => {
             // Decoding only: no window, no network, no files.
             if let Some((input, output)) = sandbox::worker_pipes(&input, &output) {
-                let _ = ferossh_vnc::viewer::run(
+                let _ = ferossh_viewer::viewer::run(
                     std::io::BufReader::new(input),
                     std::io::BufWriter::new(output),
                 );

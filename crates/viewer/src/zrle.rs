@@ -6,7 +6,7 @@
 use miniz_oxide::inflate::stream::{InflateState, inflate};
 use miniz_oxide::{MZFlush, MZStatus};
 
-use crate::rfb::fill;
+use crate::vnc::fill;
 
 const TILE: u16 = 64;
 

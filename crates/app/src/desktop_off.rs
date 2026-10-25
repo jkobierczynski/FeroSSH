@@ -1,8 +1,16 @@
 //! Stands in for the remote desktop pane when FeroSSH is built without
-//! the `desktop-viewer` feature: [`Desktop`] has no values, so the
+//! a desktop viewer (the `vnc-viewer` or `rdp-viewer` feature): [`Desktop`] has no values, so the
 //! window's desktop paths compile to nothing and no viewer code ships.
 
 use ferossh_render::Image;
+
+/// Which protocol a desktop tab speaks; the menu offers neither.
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Protocol {
+    Vnc,
+    Rdp,
+}
 
 /// Never made; see the module docs.
 #[derive(Debug)]
@@ -15,7 +23,7 @@ pub enum Update {
     Redraw,
     Title(String),
     Bell,
-    AskPassword,
+    Ask(String),
     Ended(String),
 }
 
@@ -28,7 +36,7 @@ impl Desktop {
         match *self {}
     }
 
-    pub fn asking_password(&self) -> bool {
+    pub fn asking(&self) -> bool {
         match *self {}
     }
 
@@ -44,7 +52,7 @@ impl Desktop {
         match *self {}
     }
 
-    pub fn char(&mut self, _c: char) -> bool {
+    pub fn char(&mut self, _c: char) -> Option<String> {
         match *self {}
     }
 

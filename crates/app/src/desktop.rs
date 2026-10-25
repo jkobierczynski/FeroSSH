@@ -1,7 +1,7 @@
-//! A remote desktop in a pane: the window's half of the built-in VNC
-//! viewer (the `desktop-viewer` feature).
+//! A remote desktop in a pane: the window's half of the built-in VNC and
+//! RDP viewer (the `vnc-viewer` and `rdp-viewer` features).
 //!
-//! Three parties: the VNC server, reached only through an SSH tunnel on
+//! Three parties: the desktop server, reached only through an SSH tunnel on
 //! loopback; the viewer process, which parses everything the server sends
 //! and has no network, file or registry access; and this side, which moves
 //! bytes between the two and keeps the picture. What the viewer sends back
@@ -18,9 +18,10 @@ use std::net::{Shutdown, TcpStream};
 use std::sync::mpsc::{self, Receiver, Sender};
 
 use ferossh_render::{Image, fit};
-use ferossh_vnc::framebuffer::{Applied, Framebuffer};
-use ferossh_vnc::keysym::Keyboard;
-use ferossh_vnc::pipe::{FromViewer, MAX_NET, ToViewer, read_frame, write_frame};
+use ferossh_viewer::framebuffer::{Applied, Framebuffer};
+use ferossh_viewer::keysym;
+pub use ferossh_viewer::pipe::Protocol;
+use ferossh_viewer::pipe::{FromViewer, MAX_NET, ToViewer, read_frame, write_frame};
 use zeroize::Zeroizing;
 
 /// What the window should do after [`Desktop::poll`].
@@ -31,8 +32,8 @@ pub enum Update {
     /// The desktop's name, for the tab.
     Title(String),
     Bell,
-    /// Show the password prompt; typing goes to it until Enter.
-    AskPassword,
+    /// Show this prompt; typing goes to it until Enter.
+    Ask(String),
     /// The session is over, and why.
     Ended(String),
 }
@@ -41,6 +42,8 @@ pub enum Update {
 #[derive(Debug)]
 enum Phase {
     Connecting,
+    /// Asking for the user name (RDP), with what was typed so far.
+    User(String),
     Password(Zeroizing<String>),
     Running,
     Ended,
@@ -51,8 +54,22 @@ enum FromThreads {
     Ended(String),
 }
 
+/// What to open: the protocol, the screen size to ask an RDP server
+/// for, the Windows keyboard layout id, and the user name to offer.
+#[derive(Debug, Clone)]
+pub struct Session {
+    pub protocol: Protocol,
+    pub width: u16,
+    pub height: u16,
+    pub layout: u32,
+    pub user: String,
+}
+
 /// One remote desktop session.
 pub struct Desktop {
+    protocol: Protocol,
+    /// The user name offered when the prompt is left empty.
+    user: String,
     to_viewer: Sender<ToViewer>,
     from: Receiver<FromThreads>,
     tunnel: TcpStream,
@@ -60,7 +77,6 @@ pub struct Desktop {
     /// Changed since the last drawn frame: left, top, right, bottom.
     dirty: Option<(u32, u32, u32, u32)>,
     phase: Phase,
-    keyboard: Keyboard,
     buttons: u8,
     /// Keeps the viewer process alive; dropping it ends the process.
     _process: Box<dyn Send>,
@@ -75,16 +91,18 @@ impl std::fmt::Debug for Desktop {
     }
 }
 
-/// Wheel up and down, as VNC buttons 4 and 5.
+/// Wheel up and down, as VNC buttons 4 and 5 (the RDP viewer turns them
+/// into wheel turns).
 const WHEEL_UP: u8 = 1 << 3;
 const WHEEL_DOWN: u8 = 1 << 4;
 
 impl Desktop {
-    /// Connects to the tunnel at `addr` and starts relaying through the
+    /// Connects to the tunnel at `addr` and starts `session` in the
     /// viewer process behind `to_viewer` and `from_viewer`. `notify`
     /// wakes the window when something arrives.
     pub fn start(
         addr: &str,
+        session: Session,
         to_viewer: impl Write + Send + 'static,
         from_viewer: impl Read + Send + 'static,
         process: Box<dyn Send>,
@@ -94,6 +112,13 @@ impl Desktop {
         let _ = tunnel.set_nodelay(true);
         let (tx, queue) = mpsc::channel::<ToViewer>();
         let (events, from) = mpsc::channel();
+        let _ = tx.send(ToViewer::Start {
+            protocol: session.protocol,
+            width: session.width,
+            height: session.height,
+            layout: session.layout,
+            user: session.user.clone(),
+        });
 
         // Window and tunnel to viewer.
         let ended = events.clone();
@@ -157,7 +182,7 @@ impl Desktop {
                     match msg {
                         FromViewer::Net(bytes) => {
                             if net.write_all(&bytes).is_err() {
-                                break "The tunnel to the VNC server closed.".to_owned();
+                                break "The tunnel to the remote desktop closed.".to_owned();
                             }
                         }
                         FromViewer::Failed(why) => break why,
@@ -175,13 +200,14 @@ impl Desktop {
             })?;
 
         Ok(Self {
+            protocol: session.protocol,
+            user: session.user,
             to_viewer: tx,
             from,
             tunnel,
             fb: Framebuffer::default(),
             dirty: None,
             phase: Phase::Connecting,
-            keyboard: Keyboard::default(),
             buttons: 0,
             _process: process,
         })
@@ -224,10 +250,16 @@ impl Desktop {
                 }
                 Ok(Applied::Other(FromViewer::Name(n))) => out.push(Update::Title(n)),
                 Ok(Applied::Other(FromViewer::Bell)) => out.push(Update::Bell),
-                Ok(Applied::Other(FromViewer::NeedPassword)) => {
-                    self.phase = Phase::Password(Zeroizing::new(String::new()));
-                    out.push(Update::AskPassword);
-                }
+                Ok(Applied::Other(FromViewer::NeedPassword)) => match self.protocol {
+                    Protocol::Vnc => {
+                        self.phase = Phase::Password(Zeroizing::new(String::new()));
+                        out.push(Update::Ask("VNC password: ".into()));
+                    }
+                    Protocol::Rdp => {
+                        self.phase = Phase::User(String::new());
+                        out.push(Update::Ask(self.user_prompt()));
+                    }
+                },
                 Ok(Applied::Other(_)) => {}
                 Err(why) => self.end(why, &mut out),
             }
@@ -250,9 +282,17 @@ impl Desktop {
         matches!(self.phase, Phase::Running) && self.fb.width() > 0
     }
 
-    /// Whether typing goes to the password prompt.
-    pub fn asking_password(&self) -> bool {
-        matches!(self.phase, Phase::Password(_))
+    /// Whether typing goes to a prompt.
+    pub fn asking(&self) -> bool {
+        matches!(self.phase, Phase::User(_) | Phase::Password(_))
+    }
+
+    fn user_prompt(&self) -> String {
+        if self.user.is_empty() {
+            "User name: ".into()
+        } else {
+            format!("User name [{}]: ", self.user)
+        }
     }
 
     /// The picture for the renderer, `key` naming it.
@@ -271,45 +311,72 @@ impl Desktop {
         self.dirty = None;
     }
 
-    /// A key went down or up; `false` when it types a character, which
-    /// then comes to [`char`](Self::char).
+    /// A key went down or up; `true` when the desktop took the whole key,
+    /// so its character (`WM_CHAR`) must not follow. RDP sends every key
+    /// as a scan code and the server's layout types it; VNC sends keys
+    /// that type nothing here and the rest by character.
     pub fn key(&mut self, vk: u16, extended: bool, scan: u16, down: bool) -> bool {
         if !self.running() {
             return false;
         }
-        let keys = self.keyboard.key(vk, extended, scan, down);
-        let handled = !keys.is_empty();
-        for (down, keysym) in keys {
-            self.send(ToViewer::Key { down, keysym });
+        self.send(ToViewer::Key {
+            vk,
+            scan,
+            extended,
+            down,
+        });
+        match self.protocol {
+            Protocol::Rdp => true,
+            Protocol::Vnc => keysym::special(vk, extended, scan).is_some(),
         }
-        handled
     }
 
-    /// A typed character. While the password prompt is up it goes there;
-    /// `true` when Enter sent the password.
-    pub fn char(&mut self, c: char) -> bool {
-        if let Phase::Password(typed) = &mut self.phase {
-            match c {
-                '\r' | '\n' => {
-                    let password = Zeroizing::new(typed.as_bytes().to_vec());
-                    self.phase = Phase::Connecting;
-                    self.send(ToViewer::Password(password.to_vec()));
-                    return true;
+    /// A typed character. While a prompt is up it goes there; the result
+    /// is what to echo in the pane.
+    pub fn char(&mut self, c: char) -> Option<String> {
+        let enter = matches!(c, '\r' | '\n');
+        match &mut self.phase {
+            Phase::User(typed) => match c {
+                _ if enter => {
+                    let user = if typed.is_empty() {
+                        self.user.clone()
+                    } else {
+                        typed.clone()
+                    };
+                    self.send(ToViewer::User(user));
+                    self.phase = Phase::Password(Zeroizing::new(String::new()));
+                    Some("\r\nPassword: ".into())
                 }
-                '\u{8}' => {
-                    typed.pop();
+                '\u{8}' => typed.pop().map(|_| "\u{8} \u{8}".into()),
+                c if !c.is_control() => {
+                    typed.push(c);
+                    Some(c.to_string())
                 }
-                c if !c.is_control() => typed.push(c),
-                _ => {}
+                _ => None,
+            },
+            Phase::Password(typed) => {
+                match c {
+                    _ if enter => {
+                        let password = Zeroizing::new(typed.as_bytes().to_vec());
+                        self.phase = Phase::Connecting;
+                        self.send(ToViewer::Password(password.to_vec()));
+                        return Some("\r\n".into());
+                    }
+                    '\u{8}' => {
+                        typed.pop();
+                    }
+                    c if !c.is_control() => typed.push(c),
+                    _ => {}
+                }
+                None
             }
-            return false;
-        }
-        if self.running() {
-            for (down, keysym) in self.keyboard.char(c) {
-                self.send(ToViewer::Key { down, keysym });
+            _ => {
+                if self.running() && self.protocol == Protocol::Vnc {
+                    self.send(ToViewer::Char(c));
+                }
+                None
             }
         }
-        false
     }
 
     /// The remote screen point under (`x`, `y`) when the picture fills
@@ -375,8 +442,8 @@ impl Desktop {
 
     /// The pane lost the keyboard: let go of held modifiers.
     pub fn focus_lost(&mut self) {
-        for (down, keysym) in self.keyboard.release_all() {
-            self.send(ToViewer::Key { down, keysym });
+        if self.running() {
+            self.send(ToViewer::Release);
         }
     }
 }
@@ -388,7 +455,7 @@ impl Drop for Desktop {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "vnc-viewer"))]
 #[allow(clippy::unwrap_used, clippy::indexing_slicing, clippy::panic)]
 mod tests {
     //! A real VNC exchange over TCP: a small RFB server here, the viewer
@@ -419,7 +486,10 @@ mod tests {
             assert_eq!(read(1), [2]);
             let challenge = [3u8; 16];
             out.write_all(&challenge).unwrap();
-            assert_eq!(read(16), ferossh_vnc::rfb::vnc_response(b"pw", &challenge));
+            assert_eq!(
+                read(16),
+                ferossh_viewer::vnc::vnc_response(b"pw", &challenge)
+            );
             out.write_all(&0u32.to_be_bytes()).unwrap();
             assert_eq!(read(1), [1]);
             let mut init = vec![0, 3, 0, 2];
@@ -448,15 +518,23 @@ mod tests {
         let (addr, srv) = server();
         let (viewer_in, window_out) = std::io::pipe().unwrap();
         let (window_in, viewer_out) = std::io::pipe().unwrap();
-        std::thread::spawn(move || ferossh_vnc::viewer::run(viewer_in, viewer_out));
-        let mut d = Desktop::start(&addr, window_out, window_in, Box::new(()), || {}).unwrap();
+        std::thread::spawn(move || ferossh_viewer::viewer::run(viewer_in, viewer_out));
+        let session = Session {
+            protocol: Protocol::Vnc,
+            width: 0,
+            height: 0,
+            layout: 0,
+            user: String::new(),
+        };
+        let mut d =
+            Desktop::start(&addr, session, window_out, window_in, Box::new(()), || {}).unwrap();
         let deadline = Instant::now() + Duration::from_secs(10);
         let mut seen = Vec::new();
         while !d.running() {
             assert!(Instant::now() < deadline, "{seen:?}");
             for u in d.poll() {
-                if u == Update::AskPassword {
-                    assert!(d.asking_password());
+                if u == Update::Ask("VNC password: ".into()) {
+                    assert!(d.asking());
                     for c in "pX\u{8}w\r".chars() {
                         d.char(c);
                     }

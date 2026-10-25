@@ -9,9 +9,13 @@ repository.workspace = true
 publish.workspace = true
 
 [features]
-# The built-in VNC desktop viewer in a tab. Off by default: the standard
-# exe has none of its code. See crates/vnc.
-desktop-viewer = ["dep:ferossh-vnc", "ferossh-render/images"]
+# The built-in remote desktop viewer in a tab, for VNC, RDP or both
+# (desktop-viewer). Off by default: the standard exe has none of its
+# code. See crates/viewer. `viewer` is what both have in common.
+desktop-viewer = ["vnc-viewer", "rdp-viewer"]
+vnc-viewer = ["viewer", "ferossh-viewer/vnc"]
+rdp-viewer = ["viewer", "ferossh-viewer/rdp"]
+viewer = ["dep:ferossh-viewer", "ferossh-render/images"]
 
 [dependencies]
 ferossh-auth.workspace = true
@@ -22,7 +26,7 @@ ferossh-render.workspace = true
 ferossh-sftp.workspace = true
 ferossh-term.workspace = true
 ferossh-tmuxcc.workspace = true
-ferossh-vnc = { workspace = true, optional = true }
+ferossh-viewer = { workspace = true, optional = true }
 ferossh-worker.workspace = true
 # The forwarding engine's sockets; the worker already links tokio.
 tokio = { version = "1.54", features = ["rt", "net", "time", "sync", "macros", "io-util"] }

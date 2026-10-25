@@ -22,23 +22,50 @@ const MAX_TEXT: usize = 4096;
 /// The longest VNC password; VNC uses only eight bytes.
 const MAX_PASSWORD: usize = 256;
 
+/// Which protocol a viewer session speaks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Protocol {
+    Vnc,
+    Rdp,
+}
+
 /// Window to viewer.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ToViewer {
-    /// Bytes from the VNC server.
+    /// The first message: the protocol, the screen size an RDP server
+    /// should give (VNC servers choose their own), the Windows keyboard
+    /// layout id and the user name to offer.
+    Start {
+        protocol: Protocol,
+        width: u16,
+        height: u16,
+        layout: u32,
+        user: String,
+    },
+    /// Bytes from the server.
     Net(Vec<u8>),
     /// The server's connection closed.
     Closed,
+    /// A key went down or up: its virtual-key code, scan code and
+    /// whether it is an extended key.
     Key {
+        vk: u16,
+        scan: u16,
+        extended: bool,
         down: bool,
-        keysym: u32,
     },
+    /// A typed character (`WM_CHAR`).
+    Char(char),
     Pointer {
         buttons: u8,
         x: u16,
         y: u16,
     },
+    /// The user name to sign in as, sent before [`ToViewer::Password`].
+    User(String),
     Password(Vec<u8>),
+    /// The pane lost the keyboard: let go of every key held down.
+    Release,
 }
 
 /// Viewer to window.
@@ -140,9 +167,41 @@ impl<'a> Fields<'a> {
         Some(s.chars().filter(|c| !c.is_control()).collect())
     }
 
+    fn flag(&mut self) -> Option<bool> {
+        match self.u8()? {
+            0 => Some(false),
+            1 => Some(true),
+            _ => None,
+        }
+    }
+
+    /// A length-prefixed UTF-8 string of at most `max` bytes, without
+    /// control characters.
+    fn string(&mut self, max: usize) -> Option<String> {
+        let len = usize::from(self.u16()?);
+        if len > max {
+            return None;
+        }
+        let s = std::str::from_utf8(self.take(len)?).ok()?;
+        (!s.chars().any(char::is_control)).then(|| s.to_owned())
+    }
+
     fn end(&self) -> Option<()> {
         self.data.is_empty().then_some(())
     }
+}
+
+/// The longest user name.
+const MAX_USER: usize = 256;
+
+fn put_string(v: &mut Vec<u8>, text: &str) {
+    let mut end = text.len().min(MAX_USER);
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    let part = text.get(..end).unwrap_or_default();
+    v.extend(u16::try_from(part.len()).unwrap_or(0).to_le_bytes());
+    v.extend(part.as_bytes());
 }
 
 impl ToViewer {
@@ -154,9 +213,16 @@ impl ToViewer {
                 v.extend(b);
             }
             ToViewer::Closed => v.push(2),
-            ToViewer::Key { down, keysym } => {
-                v.extend([3, u8::from(*down)]);
-                v.extend(keysym.to_le_bytes());
+            ToViewer::Key {
+                vk,
+                scan,
+                extended,
+                down,
+            } => {
+                v.push(3);
+                v.extend(vk.to_le_bytes());
+                v.extend(scan.to_le_bytes());
+                v.extend([u8::from(*extended), u8::from(*down)]);
             }
             ToViewer::Pointer { buttons, x, y } => {
                 v.extend([4, *buttons]);
@@ -167,6 +233,32 @@ impl ToViewer {
                 v.push(5);
                 v.extend(p);
             }
+            ToViewer::Start {
+                protocol,
+                width,
+                height,
+                layout,
+                user,
+            } => {
+                v.push(6);
+                v.push(match protocol {
+                    Protocol::Vnc => 0,
+                    Protocol::Rdp => 1,
+                });
+                v.extend(width.to_le_bytes());
+                v.extend(height.to_le_bytes());
+                v.extend(layout.to_le_bytes());
+                put_string(&mut v, user);
+            }
+            ToViewer::Char(c) => {
+                v.push(7);
+                v.extend(u32::from(*c).to_le_bytes());
+            }
+            ToViewer::User(u) => {
+                v.push(8);
+                put_string(&mut v, u);
+            }
+            ToViewer::Release => v.push(9),
         }
         v
     }
@@ -176,23 +268,39 @@ impl ToViewer {
         let msg = match f.u8()? {
             1 => ToViewer::Net(f.rest(MAX_NET)?.to_vec()),
             2 => ToViewer::Closed,
-            3 => {
-                let down = match f.u8()? {
-                    0 => false,
-                    1 => true,
-                    _ => return None,
-                };
-                ToViewer::Key {
-                    down,
-                    keysym: f.u32()?,
-                }
-            }
+            3 => ToViewer::Key {
+                vk: f.u16()?,
+                scan: f.u16()?,
+                extended: f.flag()?,
+                down: f.flag()?,
+            },
             4 => ToViewer::Pointer {
                 buttons: f.u8()?,
                 x: f.u16()?,
                 y: f.u16()?,
             },
             5 => ToViewer::Password(f.rest(MAX_PASSWORD)?.to_vec()),
+            6 => {
+                let protocol = match f.u8()? {
+                    0 => Protocol::Vnc,
+                    1 => Protocol::Rdp,
+                    _ => return None,
+                };
+                let (width, height) = (f.u16()?, f.u16()?);
+                if width > MAX_SIDE || height > MAX_SIDE {
+                    return None;
+                }
+                ToViewer::Start {
+                    protocol,
+                    width,
+                    height,
+                    layout: f.u32()?,
+                    user: f.string(MAX_USER)?,
+                }
+            }
+            7 => ToViewer::Char(char::from_u32(f.u32()?)?),
+            8 => ToViewer::User(f.string(MAX_USER)?),
+            9 => ToViewer::Release,
             _ => return None,
         };
         f.end()?;
@@ -323,8 +431,20 @@ mod tests {
             ToViewer::Net(vec![1, 2, 3]),
             ToViewer::Closed,
             ToViewer::Key {
+                vk: 0x0d,
+                scan: 0x1c,
+                extended: false,
                 down: true,
-                keysym: 0xff0d,
+            },
+            ToViewer::Char('é'),
+            ToViewer::User("jurgen".into()),
+            ToViewer::Release,
+            ToViewer::Start {
+                protocol: Protocol::Rdp,
+                width: 1280,
+                height: 800,
+                layout: 0x0813,
+                user: "jurgen".into(),
             },
             ToViewer::Pointer {
                 buttons: 5,
@@ -390,7 +510,13 @@ mod tests {
         assert_eq!(FromViewer::decode(&s), None);
         // Trailing bytes and bad flags.
         assert_eq!(ToViewer::decode(&[2, 0]), None);
-        assert_eq!(ToViewer::decode(&[3, 2, 0, 0, 0, 0]), None);
+        assert_eq!(ToViewer::decode(&[3, 0, 0, 0, 0, 2, 0]), None);
+        assert_eq!(ToViewer::decode(&[7, 0, 0xd8, 0, 0]), None, "a surrogate");
+        assert_eq!(
+            ToViewer::decode(&[8, 1, 0, b'\n']),
+            None,
+            "control characters"
+        );
         assert_eq!(FromViewer::decode(&[3, 0xff]), None, "not UTF-8");
     }
 
