@@ -38,6 +38,10 @@ ferossh.exe --local [command]  # a local shell, as in milestone 2
       TmuxLayout ferossh
   ```
 
+  ![FeroSSH with four tmux windows as split panes: pstree, top, htop and Midnight Commander](docs/screenshot-tmux.png)
+
+  *These are tmux windows, you can close FeroSSH and return to pickup the session.*
+
 - **Host keys.** A new host shows its SHA-256 fingerprint and randomart, and you type `yes` to trust it; the key is saved hashed to `known_hosts`. A changed key fills the window with a warning and cannot be bypassed: if you know why it changed, use Session > Replace host key..., which asks twice.
 - **Sign-in.** Keys are tried from the OpenSSH agent first, then Pageant, then key files (`id_ed25519` and `id_ecdsa` unless the config names others). Key files may be Ed25519 or ECDSA P-256, encrypted or not; the passphrase is asked in the terminal and never kept. RSA keys work only through an agent, need 3072 bits or more, and sign with SHA-2. Then keyboard-interactive (one-time codes) and passwords.
 - **Sandbox.** The worker that talks to the network runs in an AppContainer with network access only: it cannot read your files or keys, and asks the window for every signature. Windows does not let AppContainers reach 127.0.0.1, so use `--no-sandbox` for SSH servers on the same machine.
