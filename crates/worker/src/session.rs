@@ -637,9 +637,17 @@ impl russh::Signer for IpcSigner {
                 .as_str()
                 .to_owned(),
             ),
-            AgentIdentity::Certificate { certificate, .. } => {
-                (Vec::new(), certificate.algorithm().as_str().to_owned())
-            }
+            // The certificate goes to the UI to find its signer; the
+            // signature is made by the key inside it.
+            AgentIdentity::Certificate { certificate, .. } => (
+                certificate.to_bytes().unwrap_or_default(),
+                match certificate.public_key().algorithm() {
+                    Algorithm::Rsa { .. } => Algorithm::Rsa { hash: hash_alg },
+                    other => other,
+                }
+                .as_str()
+                .to_owned(),
+            ),
         };
         async move {
             let (tx, rx) = oneshot::channel();
@@ -1106,8 +1114,13 @@ async fn public_keys(
     remaining.push(MethodKind::PublicKey);
     let mut rsa_hash: Option<Option<HashAlg>> = None;
     for blob in keys {
-        let Ok(key) = PublicKey::from_bytes(&blob) else {
-            continue;
+        // A user certificate, or a plain key.
+        let (key, cert) = match Certificate::from_bytes(&blob) {
+            Ok(cert) => (PublicKey::new(cert.public_key().clone(), ""), Some(cert)),
+            Err(_) => match PublicKey::from_bytes(&blob) {
+                Ok(key) => (key, None),
+                Err(_) => continue,
+            },
         };
         let hash = if key.algorithm().is_rsa() {
             if rsa_hash.is_none() {
@@ -1129,12 +1142,24 @@ async fn public_keys(
             out: ctx.out.clone(),
             shared: ctx.shared.clone(),
         };
-        let result = drive(
-            handle.authenticate_publickey_with(&p.user, key, hash, &mut signer),
-            inbox,
-            ctx,
-        )
-        .await??;
+        let result = match cert {
+            Some(cert) => {
+                drive(
+                    handle.authenticate_certificate_with(&p.user, cert, hash, &mut signer),
+                    inbox,
+                    ctx,
+                )
+                .await??
+            }
+            None => {
+                drive(
+                    handle.authenticate_publickey_with(&p.user, key, hash, &mut signer),
+                    inbox,
+                    ctx,
+                )
+                .await??
+            }
+        };
         match result {
             AuthResult::Success => return Ok(Step::Done),
             AuthResult::Failure {

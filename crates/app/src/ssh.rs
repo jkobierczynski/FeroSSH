@@ -706,10 +706,13 @@ impl SshSession {
             }
         };
         // Name the host and key, so a surprise request is visible.
-        let desc = hostkey::describe(key);
-        let what = desc
-            .map(|d| format!("{} key {}", d.kind, d.fingerprint))
-            .unwrap_or_else(|| "key".into());
+        let what = if userauth::is_certificate(key) {
+            hostkey::describe_certificate(key)
+                .map(|d| format!("{} certificate for key {}", d.kind, d.fingerprint))
+        } else {
+            hostkey::describe(key).map(|d| format!("{} key {}", d.kind, d.fingerprint))
+        }
+        .unwrap_or_else(|| "key".into());
         let from = match &identity.source {
             Source::Agent(a) if !identity.comment.is_empty() => {
                 format!("{}, {}", a.label(), identity.comment)

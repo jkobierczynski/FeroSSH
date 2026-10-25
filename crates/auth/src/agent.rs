@@ -5,9 +5,9 @@
 //! small runtime, never on the UI thread. A connection is opened per
 //! request, as `ssh` does, so an agent started after FeroSSH still works.
 
-use russh::keys::HashAlg;
 use russh::keys::agent::AgentIdentity;
 use russh::keys::agent::client::{AgentClient, AgentStream};
+use russh::keys::{Certificate, HashAlg};
 use tokio::runtime::Runtime;
 
 use crate::userauth::{SSH_AGENT_RSA_SHA2_256, SSH_AGENT_RSA_SHA2_512};
@@ -52,8 +52,16 @@ async fn list_from<S: AgentStream + Unpin + Send>(
                 public: key.to_bytes().ok()?,
                 comment,
             }),
-            // Certificates arrive in milestone 6.
-            AgentIdentity::Certificate { .. } => None,
+            // A user certificate: offered as the certificate, signed with
+            // the key inside it.
+            AgentIdentity::Certificate {
+                certificate,
+                comment,
+            } => Some(AgentKey {
+                agent,
+                public: certificate.to_bytes().ok()?,
+                comment,
+            }),
         })
         .collect())
 }
@@ -64,7 +72,7 @@ async fn sign_with<S: AgentStream + Unpin + Send>(
     data: &[u8],
     flags: u32,
 ) -> Result<Vec<u8>, String> {
-    let key = russh::keys::PublicKey::from_bytes(public).map_err(|e| e.to_string())?;
+    let identity = identity(public)?;
     let hash = match flags {
         SSH_AGENT_RSA_SHA2_512 => Some(HashAlg::Sha512),
         SSH_AGENT_RSA_SHA2_256 => Some(HashAlg::Sha256),
@@ -73,7 +81,7 @@ async fn sign_with<S: AgentStream + Unpin + Send>(
     // The client appends the signature to the data as an SSH string, and
     // checks that an RSA signature uses the hash asked for.
     let signed = client
-        .sign_request(&key.into(), hash, data.to_vec())
+        .sign_request(&identity, hash, data.to_vec())
         .await
         .map_err(|e| e.to_string())?;
     let blob = signed
@@ -83,6 +91,19 @@ async fn sign_with<S: AgentStream + Unpin + Send>(
         .map(|(_, blob)| blob.to_vec())
         .ok_or("the agent returned a malformed signature")?;
     Ok(blob)
+}
+
+/// The agent identity for a public key or certificate blob.
+fn identity(public: &[u8]) -> Result<AgentIdentity, String> {
+    if crate::userauth::is_certificate(public) {
+        let certificate = Certificate::from_bytes(public).map_err(|e| e.to_string())?;
+        return Ok(AgentIdentity::Certificate {
+            certificate,
+            comment: String::new(),
+        });
+    }
+    let key = russh::keys::PublicKey::from_bytes(public).map_err(|e| e.to_string())?;
+    Ok(key.into())
 }
 
 #[cfg(windows)]
