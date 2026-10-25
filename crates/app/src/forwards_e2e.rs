@@ -271,6 +271,9 @@ fn local_remote_dynamic_and_x11_forwards() {
             }
         }
         if session.state() == State::Ended {
+            // Only the exit sent below may end the shell: opening forwards
+            // or a desktop on the connection must leave it alone.
+            assert!(sent_exit, "the shell ended early:\n{shown}\n{output}");
             break;
         }
         if session.prompt_active() {
