@@ -42,8 +42,8 @@ pub const MAX_HISTORY: usize = 10_000;
 /// What each pane's state line holds, in this order.
 const PANE_FORMAT: &str = "#{pane_id} #{window_id} #{pane_width} #{pane_height} \
     #{cursor_x} #{cursor_y} #{alternate_on} #{cursor_flag} #{keypad_cursor_flag} \
-    #{keypad_flag} #{mouse_standard_flag} #{mouse_button_flag} #{mouse_any_flag} \
-    #{mouse_sgr_flag} #{insert_flag} #{wrap_flag} #{scroll_region_upper} \
+    #{keypad_flag} #{mouse_standard_flag} #{mouse_button_flag} #{mouse_all_flag} \
+    #{mouse_sgr_flag} #{mouse_utf8_flag} #{origin_flag} #{insert_flag} #{wrap_flag} #{scroll_region_upper} \
     #{scroll_region_lower} #{window_layout}";
 
 /// How a session's windows map to native panes.
@@ -150,8 +150,12 @@ struct PaneState {
     keypad: bool,
     mouse_standard: bool,
     mouse_button: bool,
-    mouse_any: bool,
+    /// Motion reporting (1003); tmux's `mouse_any_flag` is any mouse
+    /// mode at all, not this.
+    mouse_all: bool,
     mouse_sgr: bool,
+    mouse_utf8: bool,
+    origin: bool,
     insert: bool,
     wrap: bool,
     region: (u16, u16),
@@ -183,6 +187,8 @@ fn parse_pane_line(line: &[u8]) -> Option<PaneLine> {
         mb,
         ma,
         sgr,
+        utf8,
+        origin,
         ins,
         wrap,
         top,
@@ -208,8 +214,10 @@ fn parse_pane_line(line: &[u8]) -> Option<PaneLine> {
             keypad: b(kp),
             mouse_standard: b(ms),
             mouse_button: b(mb),
-            mouse_any: b(ma),
+            mouse_all: b(ma),
             mouse_sgr: b(sgr),
+            mouse_utf8: b(utf8),
+            origin: b(origin),
             insert: b(ins),
             wrap: *wrap != "0",
             region: (n(top), n(bottom)),
@@ -245,8 +253,10 @@ fn restore_bytes(state: &PaneState, normal: &[Vec<u8>], alternate: &[Vec<u8>]) -
         (state.keypad, b"\x1b="),
         (state.mouse_standard, b"\x1b[?1000h"),
         (state.mouse_button, b"\x1b[?1002h"),
-        (state.mouse_any, b"\x1b[?1003h"),
+        (state.mouse_all, b"\x1b[?1003h"),
+        (state.mouse_utf8, b"\x1b[?1005h"),
         (state.mouse_sgr, b"\x1b[?1006h"),
+        (state.origin, b"\x1b[?6h"),
         (state.insert, b"\x1b[4h"),
         (!state.wrap, b"\x1b[?7l"),
         (!state.cursor, b"\x1b[?25l"),
@@ -255,9 +265,14 @@ fn restore_bytes(state: &PaneState, normal: &[Vec<u8>], alternate: &[Vec<u8>]) -
             out.extend_from_slice(seq);
         }
     }
-    out.extend_from_slice(
-        format!("\x1b[{};{}H", state.cursor_y + 1, state.cursor_x + 1).as_bytes(),
-    );
+    // tmux gives the cursor row from the top of the screen; in origin
+    // mode the move counts from the top of the scroll region.
+    let row = if state.origin {
+        state.cursor_y.saturating_sub(top)
+    } else {
+        state.cursor_y
+    };
+    out.extend_from_slice(format!("\x1b[{};{}H", row + 1, state.cursor_x + 1).as_bytes());
     out
 }
 
@@ -1384,7 +1399,7 @@ mod tests {
     /// A pane state line for `%pane` in `@window` of `w` x `h`.
     fn pane_line(pane: u32, window: u32, w: u16, h: u16, layout: &str) -> String {
         format!(
-            "%{pane} @{window} {w} {h} 2 3 0 1 0 0 0 0 0 0 0 1 0 {} {layout}",
+            "%{pane} @{window} {w} {h} 2 3 0 1 0 0 0 0 0 0 0 0 0 1 0 {} {layout}",
             h - 1
         )
     }
@@ -1443,7 +1458,7 @@ mod tests {
         assert_eq!((l.state.cursor_x, l.state.cursor_y), (2, 3));
         assert!(l.state.cursor && l.state.wrap && !l.state.alternate);
         assert!(parse_pane_line(b"%1 @1 80 24").is_none());
-        assert!(parse_pane_line(b"x @1 80 24 0 0 0 0 0 0 0 0 0 0 0 0 0 0 l").is_none());
+        assert!(parse_pane_line(b"x @1 80 24 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 l").is_none());
     }
 
     #[test]
@@ -1468,6 +1483,38 @@ mod tests {
             "\x1b[0m\x1b[H\x1b[2Ja\r\nb\x1b[0m\x1b[?1049h\x1b[H\x1b[2Jvim\x1b[0m\
              \x1b[?1h\x1b[?1006h\x1b[?25l\x1b[2;5H"
         );
+    }
+
+    #[test]
+    fn restores_only_the_mouse_modes_that_were_on() {
+        // htop's modes as tmux reports them: 1000 and 1006 on, and
+        // `mouse_any_flag` (any mode) 1, which must not become 1003.
+        let line = "%1 @1 80 24 0 0 1 1 0 0 1 0 0 1 0 0 0 1 0 23 l";
+        let state = parse_pane_line(line.as_bytes()).unwrap().state;
+        assert!(state.mouse_standard && state.mouse_sgr && !state.mouse_all);
+        let text = String::from_utf8(restore_bytes(&state, &[], &[])).unwrap();
+        assert!(text.contains("\x1b[?1000h\x1b[?1006h"), "{text:?}");
+        assert!(
+            !text.contains("?1003h") && !text.contains("?1002h"),
+            "{text:?}"
+        );
+    }
+
+    #[test]
+    fn origin_mode_moves_within_the_region() {
+        let state = PaneState {
+            width: 80,
+            height: 24,
+            cursor_x: 0,
+            cursor_y: 7,
+            cursor: true,
+            wrap: true,
+            origin: true,
+            region: (5, 20),
+            ..PaneState::default()
+        };
+        let text = String::from_utf8(restore_bytes(&state, &[], &[])).unwrap();
+        assert!(text.ends_with("\x1b[6;21r\x1b[?6h\x1b[3;1H"), "{text:?}");
     }
 
     #[test]

@@ -240,6 +240,16 @@ fn real_tmux_round_trip() {
     let actions = a.tmux.input(second, b"echo two\r");
     a.apply(actions);
     a.until("the second echo", |h| h.text(second).contains("two"));
+    // A program like htop turns on click reports in SGR form.
+    let actions = a.tmux.input(second, b"printf '\\033[?1000h\\033[?1006h'\r");
+    a.apply(actions);
+    a.until("the mouse modes", |_| {
+        tmux_cmd(
+            &server,
+            &["list-panes", "-s", "-t", "e2e", "-F", "#{mouse_sgr_flag}"],
+        )
+        .contains('1')
+    });
     a.save(|n| Look {
         font: Some("Consolas".into()),
         size: Some(if n == first { 10.0 } else { 18.0 }),
@@ -262,6 +272,12 @@ fn real_tmux_round_trip() {
     let restored = b.ws.all_panes();
     assert!(b.text(restored[0]).contains("one-42"));
     assert!(b.text(restored[1]).contains("two"));
+    // The same mouse modes come back, and no motion reports (1003),
+    // which would type garbage at the shell once htop is gone.
+    let modes = b.text(restored[1]);
+    assert!(modes.contains("\x1b[?1000h\x1b[?1006h"), "{modes:?}");
+    assert!(!modes.contains("\x1b[?1003h"), "{modes:?}");
+    assert!(!b.text(restored[0]).contains("\x1b[?1000h"));
     drop(b);
 
     // tmux layout: each window becomes a tab, and splits are tmux's.
