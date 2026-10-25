@@ -40,17 +40,20 @@ jobs:
     env:
       FEROSSH_REQUIRE_SSHD: 1
       FEROSSH_REQUIRE_PUTTYGEN: 1
+      FEROSSH_REQUIRE_TMUX: 1
     steps:
       - uses: actions/checkout@v4
       - run: rustup show active-toolchain
       # The worker and the window's SSH path log in to a throwaway sshd on
       # 127.0.0.1, and the .ppk tests make keys with puttygen; without them
-      # these tests skip, so install both.
-      - run: sudo apt-get update && sudo apt-get install -y openssh-server putty-tools
+      # these tests skip, so install both. The tmux test drives a real tmux.
+      - run: sudo apt-get update && sudo apt-get install -y openssh-server putty-tools tmux
       - run: sudo mkdir -p /run/sshd
       - run: cargo test --locked -p ferossh-worker --test sshd
       - run: cargo test --locked -p ferossh-sftp --test queue
       - run: cargo test --locked -p ferossh ssh_e2e
+      - run: tmux -V
+      - run: cargo test --locked -p ferossh tmux_e2e
       - run: cargo test --locked -p ferossh-auth keyfile
 
   deny:
@@ -85,3 +88,4 @@ jobs:
       - run: cargo +nightly fuzz run --target x86_64-unknown-linux-gnu ipc_decode -- -max_total_time=60
       - run: cargo +nightly fuzz run --target x86_64-unknown-linux-gnu term_feed -- -max_total_time=60
       - run: cargo +nightly fuzz run --target x86_64-unknown-linux-gnu sftp_decode -- -max_total_time=60
+      - run: cargo +nightly fuzz run --target x86_64-unknown-linux-gnu tmux_feed -- -max_total_time=60
