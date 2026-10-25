@@ -23,6 +23,8 @@ use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 use ferossh_auth::keyfile::KeyFile;
+use ferossh_auth::sk::soft::SoftAuthenticator;
+use ferossh_auth::sk::{self, DEFAULT_APPLICATION, EnrollRequest, SkAlgorithm};
 use ferossh_auth::userauth;
 use ferossh_ipc::{Message, PROTOCOL_VERSION, Timing};
 use ferossh_term::{Action, Settings, Terminal};
@@ -276,7 +278,10 @@ async fn session(
                 userauth::check(&data, "fero", &k).expect("a user-auth request");
                 send(Message::Signature {
                     channel: 1,
-                    signature: key.sign(None, &data).unwrap(),
+                    // Security keys sign through the software authenticator.
+                    signature: key
+                        .sign_with(None, &data, &SoftAuthenticator::new())
+                        .unwrap(),
                 })
                 .await;
             }
@@ -349,6 +354,82 @@ async fn servers_of_every_age() {
         );
         if !ok {
             failures.push(format!("{name}: expected {expect:?}, got {seen:?}"));
+        }
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(failures.is_empty(), "\n{}", failures.join("\n"));
+}
+
+/// Servers that take FIDO2 security keys: OpenSSH from 8.2, Dropbear from
+/// 2020.79 when built with them (Ubuntu's 2020.81 is not).
+const SK_SERVERS: &[(&str, &str)] = &[
+    ("20.04", "openssh"),
+    ("22.04", "openssh"),
+    ("24.04", "openssh"),
+    ("26.04", "openssh"),
+    ("24.04", "dropbear"),
+    ("26.04", "dropbear"),
+];
+
+/// FeroSSH's own sk key files (as `ferossh --new-security-key` writes
+/// them), their public halves in `authorized_keys`.
+fn security_keys(dir: &Path) -> Vec<KeyFile> {
+    let mut authorized = String::new();
+    let mut keys = Vec::new();
+    for (name, algorithm) in [
+        ("id_ed25519_sk", SkAlgorithm::Ed25519),
+        ("id_ecdsa_sk", SkAlgorithm::EcdsaP256),
+    ] {
+        let enrolled = sk::enroll(
+            &SoftAuthenticator::new(),
+            &EnrollRequest {
+                algorithm,
+                application: DEFAULT_APPLICATION,
+                challenge: b"interop",
+                platform: false,
+                user_verification: false,
+            },
+            name,
+        )
+        .unwrap();
+        let path = dir.join(name);
+        std::fs::write(&path, &enrolled.private).unwrap();
+        authorized.push_str(&enrolled.public);
+        keys.push(KeyFile::load(&path).unwrap());
+    }
+    std::fs::write(dir.join("authorized_keys"), authorized).unwrap();
+    keys
+}
+
+/// Logs in with each security key type on every server that takes them,
+/// the signatures made by the software authenticator as Windows' WebAuthn
+/// makes them in the window.
+#[tokio::test]
+async fn security_keys_on_servers_of_every_age() {
+    if !available() {
+        return;
+    }
+    let dir = std::env::temp_dir().join(format!("ferossh-interop-sk-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let keys = security_keys(&dir);
+    let mut failures = Vec::new();
+    for &(tag, server) in SK_SERVERS {
+        let container = Server::start(tag, server, &dir);
+        for key in &keys {
+            let name = format!("{} on {server} {tag}", key.comment);
+            let seen = connect(
+                container.port,
+                std::slice::from_ref(key),
+                false,
+                "echo fero$((6*7)); exit\n",
+            )
+            .await;
+            let ok = String::from_utf8_lossy(&seen.output).contains("fero42");
+            eprintln!("{name}: {}", if ok { "logged in" } else { "failed" });
+            if !ok {
+                failures.push(format!("{name}: {seen:?}"));
+            }
         }
     }
     let _ = std::fs::remove_dir_all(&dir);

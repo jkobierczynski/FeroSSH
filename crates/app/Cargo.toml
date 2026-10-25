@@ -20,6 +20,7 @@ ferossh-tmuxcc.workspace = true
 ferossh-worker.workspace = true
 # The forwarding engine's sockets; the worker already links tokio.
 tokio = { version = "1.54", features = ["rt", "net", "time", "sync", "macros", "io-util"] }
+getrandom = "0.4"
 unicode-width = "0.2"
 zeroize = "1.9"
 
@@ -53,6 +54,7 @@ windows = { version = "0.62", features = [
 ] }
 
 [dev-dependencies]
+ferossh-auth = { workspace = true, features = ["soft-authenticator"] }
 russh.workspace = true
 tokio = { version = "1.54", features = ["rt", "macros", "time"] }
 
