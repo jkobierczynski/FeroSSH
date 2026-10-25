@@ -29,3 +29,18 @@ docker rm -f $id
 
 Behind an HTTPS-only proxy, set `HTTPS_PROXY` and `INTEROP_CA` (the proxy's
 CA bundle) before `build.sh`.
+
+`security_keys_on_servers_of_every_age` logs in with FIDO2 security key
+files (Ed25519 and ECDSA) signed by FeroSSH's software authenticator, on
+every image whose server takes them: OpenSSH 8.2 and later, and Dropbear
+2022.83 and later (Ubuntu builds 2020.81 without them).
+
+`sk-dummy.sh` builds OpenSSH's own software security key from the source
+of the OpenSSH installed on the host, so `ssh-keygen -w` and `ssh-agent`
+can make and use security keys with no hardware. The `security_keys`
+worker test uses it:
+
+```sh
+interop/sk-dummy.sh /tmp/sk-dummy.so
+FEROSSH_SK_DUMMY=/tmp/sk-dummy.so cargo test -p ferossh-worker --test security_keys
+```

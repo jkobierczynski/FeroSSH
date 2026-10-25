@@ -6,8 +6,9 @@
 //! the key and a signature is needed. Only Ed25519 and ECDSA P-256 keys are
 //! used from files: RSA keys must go through the agent or Pageant, so no
 //! RSA private-key operation ever runs in FeroSSH (see the `rsa` advisory
-//! exception in `deny.toml`), and FIDO2 key handles need the token
-//! (milestone 6).
+//! exception in `deny.toml`). FIDO2 security key files (`id_ed25519_sk`,
+//! `id_ecdsa_sk`) hold only a key handle; the security key signs, through
+//! an [`Authenticator`].
 //!
 //! A `.ppk` file keeps its public key in the clear, so FeroSSH reads that
 //! part itself; the private part, its MAC and its encryption are checked
@@ -20,6 +21,8 @@ use russh::keys::signature::Signer;
 use russh::keys::ssh_encoding::Encode;
 use russh::keys::{Algorithm, EcdsaCurve, PrivateKey};
 use zeroize::Zeroizing;
+
+use crate::sk::{Authenticator, SkKey, Unavailable};
 
 /// Why a key file cannot be used, or a signature failed.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -36,6 +39,8 @@ pub enum KeyFileError {
     NeedsPassphrase,
     /// Signing failed.
     SignFailed,
+    /// The security key did not sign.
+    SecurityKey(String),
 }
 
 impl fmt::Display for KeyFileError {
@@ -49,6 +54,7 @@ impl fmt::Display for KeyFileError {
             Self::WrongPassphrase => f.write_str("wrong passphrase"),
             Self::NeedsPassphrase => f.write_str("it needs a passphrase"),
             Self::SignFailed => f.write_str("signing failed"),
+            Self::SecurityKey(e) => write!(f, "security key: {e}"),
         }
     }
 }
@@ -128,6 +134,7 @@ fn usable(alg: &Algorithm) -> Result<(), KeyFileError> {
         Algorithm::Ecdsa {
             curve: EcdsaCurve::NistP256,
         } => Ok(()),
+        Algorithm::SkEd25519 | Algorithm::SkEcdsaSha2NistP256 => Ok(()),
         other => Err(KeyFileError::Unsupported(other.as_str().to_owned())),
     }
 }
@@ -176,9 +183,25 @@ impl KeyFile {
         }
     }
 
+    /// Whether the private half lives on a FIDO2 security key.
+    pub fn is_security_key(&self) -> bool {
+        crate::userauth::key_type(&self.public).is_some_and(|t| t.starts_with("sk-"))
+    }
+
     /// Signs `data` and returns the SSH signature blob. The decrypted key
-    /// lives only for this call.
+    /// lives only for this call. Security keys cannot sign this way; see
+    /// [`KeyFile::sign_with`].
     pub fn sign(&self, passphrase: Option<&str>, data: &[u8]) -> Result<Vec<u8>, KeyFileError> {
+        self.sign_with(passphrase, data, &Unavailable)
+    }
+
+    /// [`KeyFile::sign`], with `authenticator` for security keys.
+    pub fn sign_with(
+        &self,
+        passphrase: Option<&str>,
+        data: &[u8],
+        authenticator: &dyn Authenticator,
+    ) -> Result<Vec<u8>, KeyFileError> {
         let decrypted;
         let key = match &self.key {
             Secret::OpenSsh(key) if key.is_encrypted() => {
@@ -210,6 +233,11 @@ impl KeyFile {
                 &decrypted
             }
         };
+        if let Some(sk) = SkKey::from_private(key) {
+            return sk
+                .sign(authenticator, data)
+                .map_err(KeyFileError::SecurityKey);
+        }
         let sig = key.try_sign(data).map_err(|_| KeyFileError::SignFailed)?;
         let mut blob = Vec::new();
         sig.encode(&mut blob)

@@ -20,7 +20,7 @@ tokio = { version = "1.54", features = ["rt", "net", "time", "sync", "macros"] }
 
 
 [dev-dependencies]
-ferossh-auth.workspace = true
+ferossh-auth = { workspace = true, features = ["soft-authenticator"] }
 ferossh-render.workspace = true
 ferossh-sftp.workspace = true
 ferossh-term.workspace = true

@@ -1,6 +1,7 @@
 //! The signing broker: a thread in the UI process that lists the user's
-//! public keys and makes signatures, so slow agents, Pageant confirmations
-//! and passphrase key derivation never stall the window.
+//! public keys and makes signatures, so slow agents, Pageant confirmations,
+//! passphrase key derivation and waiting for a security key touch never
+//! stall the window.
 //!
 //! The UI checks each request with [`crate::userauth::check`] before it
 //! submits a [`Job::Sign`].
@@ -15,6 +16,7 @@ use zeroize::Zeroizing;
 
 use crate::agent::{self, AgentKind};
 use crate::keyfile::{KeyFile, KeyFileError};
+use crate::sk::Authenticator;
 use crate::userauth::{allowed_algorithms, is_certificate, key_type};
 
 /// The smallest RSA key used for user authentication.
@@ -171,7 +173,11 @@ fn identities(rt: &tokio::runtime::Runtime, files: Vec<KeyFileSpec>) -> Reply {
     Reply::Identities { keys, notes }
 }
 
-fn sign(rt: &tokio::runtime::Runtime, job: Job) -> Option<Reply> {
+fn sign(
+    rt: &tokio::runtime::Runtime,
+    authenticator: &dyn Authenticator,
+    job: Job,
+) -> Option<Reply> {
     let Job::Sign {
         identity,
         data,
@@ -186,7 +192,11 @@ fn sign(rt: &tokio::runtime::Runtime, job: Job) -> Option<Reply> {
             agent::sign(rt, *a, &identity.public, &data, flags).map_err(SignError::Failed)
         }
         Source::File(f) => f
-            .sign(passphrase.as_deref().map(String::as_str), &data)
+            .sign_with(
+                passphrase.as_deref().map(String::as_str),
+                &data,
+                authenticator,
+            )
             .map_err(|e| match e {
                 KeyFileError::NeedsPassphrase => SignError::NeedsPassphrase,
                 KeyFileError::WrongPassphrase => SignError::WrongPassphrase,
@@ -203,9 +213,25 @@ pub struct Broker {
     replies: Receiver<Reply>,
 }
 
+/// The authenticator security key files sign through on this system.
+pub fn platform_authenticator() -> Box<dyn Authenticator> {
+    #[cfg(windows)]
+    return Box::new(crate::webauthn::WebAuthn);
+    #[cfg(not(windows))]
+    return Box::new(crate::sk::Unavailable);
+}
+
 impl Broker {
     /// Starts the thread; `notify` runs after each reply is queued.
     pub fn spawn(notify: impl Fn() + Send + 'static) -> std::io::Result<Self> {
+        Self::spawn_with(notify, platform_authenticator())
+    }
+
+    /// [`Broker::spawn`] with another authenticator for security keys.
+    pub fn spawn_with(
+        notify: impl Fn() + Send + 'static,
+        authenticator: Box<dyn Authenticator>,
+    ) -> std::io::Result<Self> {
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()?;
@@ -217,7 +243,7 @@ impl Broker {
                 while let Ok(job) = job_rx.recv() {
                     let reply = match job {
                         Job::Identities { files } => Some(identities(&rt, files)),
-                        sign_job @ Job::Sign { .. } => sign(&rt, sign_job),
+                        sign_job @ Job::Sign { .. } => sign(&rt, authenticator.as_ref(), sign_job),
                     };
                     if let Some(reply) = reply {
                         if reply_tx.send(reply).is_err() {

@@ -104,7 +104,7 @@ impl Target {
             .collect();
         // Like ssh: the default keys only when the config names none.
         if key_files.is_empty() {
-            for name in ["id_ed25519", "id_ecdsa"] {
+            for name in ["id_ed25519", "id_ecdsa", "id_ecdsa_sk", "id_ed25519_sk"] {
                 key_files.push(KeyFileSpec {
                     path: env.home.join(".ssh").join(name),
                     explicit: false,
@@ -725,15 +725,19 @@ impl SshSession {
         )));
         self.passphrase_tries = 0;
         self.signing = Some((identity.clone(), data.clone(), flags));
-        vec![
-            Effect::Show(note),
-            Effect::Broker(Job::Sign {
-                identity,
-                data,
-                flags,
-                passphrase: None,
-            }),
-        ]
+        let mut effects = vec![Effect::Show(note)];
+        if userauth::key_type(key).is_some_and(|t| t.starts_with("sk-")) {
+            effects.push(Effect::Show(dim(
+                "Touch your security key, or confirm with Windows Hello.",
+            )));
+        }
+        effects.push(Effect::Broker(Job::Sign {
+            identity,
+            data,
+            flags,
+            passphrase: None,
+        }));
+        effects
     }
 
     fn ask_passphrase(&mut self, wrong: bool) -> Vec<Effect> {
@@ -989,7 +993,8 @@ mod tests {
             (t.hostname.as_str(), t.user.as_str(), t.port),
             ("prod.example.org", "admin", 2200)
         );
-        assert_eq!(t.key_files.len(), 2);
+        assert_eq!(t.key_files.len(), 4);
+        assert!(t.key_files[3].path.ends_with("id_ed25519_sk"));
         assert!(!t.key_files[0].explicit);
         let t = Target::resolve("root@other:23", &e).unwrap();
         assert_eq!(t.label(), "root@other:23");

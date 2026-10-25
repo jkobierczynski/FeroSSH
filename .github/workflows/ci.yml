@@ -47,11 +47,21 @@ jobs:
       # The worker and the window's SSH path log in to a throwaway sshd on
       # 127.0.0.1, and the .ppk tests make keys with puttygen; without them
       # these tests skip, so install both. sshd needs xauth for X11
-      # forwarding, and the tmux test drives a real tmux.
-      - run: sudo apt-get update && sudo apt-get install -y openssh-server putty-tools xauth tmux
+      # forwarding, and the tmux test drives a real tmux. The security key
+      # test builds OpenSSH's software security key from the installed
+      # OpenSSH's source (interop/sk-dummy.sh), so it needs deb-src.
+      - run: |
+          sudo sed -i 's/^Types: deb$/Types: deb deb-src/' /etc/apt/sources.list.d/ubuntu.sources
+          sudo apt-get update
+          sudo apt-get install -y openssh-server putty-tools xauth tmux dpkg-dev autoconf libssl-dev zlib1g-dev
       - run: sudo mkdir -p /run/sshd
       - run: cargo test --locked -p ferossh-worker --test sshd
       - run: cargo test --locked -p ferossh-worker --test agent
+      - run: interop/sk-dummy.sh "$RUNNER_TEMP/sk-dummy.so"
+      - run: cargo test --locked -p ferossh-worker --test security_keys
+        env:
+          FEROSSH_SK_DUMMY: ${{ runner.temp }}/sk-dummy.so
+          FEROSSH_REQUIRE_SK_DUMMY: 1
       - run: cargo test --locked -p ferossh-sftp --test queue
       - run: cargo test --locked -p ferossh ssh_e2e
       - run: cargo test --locked -p ferossh forwards_e2e

@@ -563,6 +563,7 @@ dependencies = [
  "ferossh-term",
  "ferossh-tmuxcc",
  "ferossh-worker",
+ "getrandom 0.4.3",
  "russh",
  "tokio",
  "unicode-width",
@@ -575,8 +576,10 @@ name = "ferossh-auth"
 version = "0.1.0"
 dependencies = [
  "getrandom 0.4.3",
+ "p256",
  "russh",
  "tokio",
+ "windows",
  "zeroize",
 ]
 

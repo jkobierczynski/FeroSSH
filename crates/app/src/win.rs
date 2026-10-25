@@ -521,10 +521,39 @@ pub fn run(launch: Launch, theme: Option<String>) -> Result<()> {
 pub fn run_error(problem: &str) -> Result<()> {
     let text = HSTRING::from(format!(
         "{problem}\n\nUsage:\n  ferossh [--theme NAME] [-l user] [-p port] [--no-sandbox] [user@]host[:port]\n  \
-         ferossh [--theme NAME] --local [command]"
+         ferossh [--theme NAME] --local [command]\n  \
+         ferossh --new-security-key [--hello] [--ed25519] FILE"
     ));
     // SAFETY: plain message box with valid strings.
     unsafe { MessageBoxW(None, &text, w!("FeroSSH"), MB_OK | MB_ICONERROR) };
+    Ok(())
+}
+
+/// `ferossh --new-security-key`: makes the key through Windows' WebAuthn
+/// dialog and says what happened.
+pub fn new_security_key(key: &crate::newkey::NewKey) -> Result<()> {
+    let env = |k: &str| std::env::var(k).unwrap_or_default();
+    let comment = format!("{}@{}", env("USERNAME"), env("COMPUTERNAME"));
+    let (text, icon) = match crate::newkey::make(&ferossh_auth::webauthn::WebAuthn, key, &comment) {
+        Ok(line) => (
+            format!(
+                "Made {} and {}.pub.\n\nAdd this line to ~/.ssh/authorized_keys on the server \
+                 (Ctrl+C copies this message):\n\n{line}\n\nThen log in with IdentityFile {} \
+                 in ~/.ssh/config, or name the file id_ecdsa_sk or id_ed25519_sk in ~/.ssh.",
+                key.path.display(),
+                key.path.display(),
+                key.path.display(),
+            ),
+            MB_ICONINFORMATION,
+        ),
+        Err(e) => (
+            format!("Could not make the security key: {e}"),
+            MB_ICONERROR,
+        ),
+    };
+    let text = HSTRING::from(text);
+    // SAFETY: plain message box with valid strings.
+    unsafe { MessageBoxW(None, &text, w!("FeroSSH"), MB_OK | icon) };
     Ok(())
 }
 

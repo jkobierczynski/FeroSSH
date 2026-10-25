@@ -10,7 +10,8 @@
 //! without the AppContainer, for hosts on localhost), and
 //! `--local [command]`, which opens a local shell through ConPTY as
 //! milestone 2 did. `--theme NAME`, before the rest, picks the pane's
-//! colour theme.
+//! colour theme. `--new-security-key [--hello] [--ed25519] FILE` makes a
+//! FIDO2 security key file (see `newkey`).
 
 #![cfg_attr(windows, windows_subsystem = "windows")]
 
@@ -33,6 +34,8 @@ mod layout;
 mod link;
 #[cfg_attr(not(windows), allow(dead_code))]
 mod look;
+#[cfg_attr(not(windows), allow(dead_code))]
+mod newkey;
 #[cfg_attr(not(windows), allow(dead_code))]
 mod pattern;
 #[cfg(windows)]
@@ -69,6 +72,8 @@ enum Launch {
     },
     /// A local shell (milestone 2's test host).
     Local(String),
+    /// Make a security key file.
+    NewSecurityKey(newkey::NewKey),
 }
 
 #[cfg_attr(not(windows), allow(dead_code))]
@@ -107,6 +112,10 @@ fn parse_args(args: &[String]) -> Result<Launch, String> {
             "--local" => {
                 let command: Vec<String> = iter.map(|a| quote(a)).collect();
                 return Ok(Launch::Local(command.join(" ")));
+            }
+            "--new-security-key" => {
+                let rest: Vec<String> = iter.cloned().collect();
+                return newkey::parse(&rest).map(Launch::NewSecurityKey);
             }
             "--no-sandbox" => sandbox = false,
             "-p" => port = Some(iter.next().ok_or("-p needs a port")?.clone()),
@@ -154,6 +163,7 @@ fn main() -> windows::core::Result<()> {
             }
             Ok(())
         }
+        Ok(Launch::NewSecurityKey(key)) => win::new_security_key(&key),
         Ok(launch) => win::run(launch, theme),
         Err(e) => win::run_error(&e),
     }
@@ -197,6 +207,10 @@ mod tests {
             parse(&["--worker", "12", "16"]),
             Ok(Launch::Worker("12".into(), "16".into()))
         );
+        assert!(matches!(
+            parse(&["--new-security-key", "--hello", "id_ecdsa_sk"]),
+            Ok(Launch::NewSecurityKey(k)) if k.hello
+        ));
         assert!(parse(&["-x"]).is_err());
         assert!(parse(&["a", "b"]).is_err());
         assert!(parse(&["-p", "22"]).is_err());
