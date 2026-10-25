@@ -51,6 +51,21 @@ fn pub_path(path: &Path) -> PathBuf {
     PathBuf::from(p)
 }
 
+/// Adds what to do when Windows Hello cannot make the key: on many PCs,
+/// often ones without a TPM, it makes only RSA keys, which OpenSSH's
+/// security key types do not include.
+fn explain(key: &NewKey, error: String) -> String {
+    if key.hello && error.contains("NotSupportedError") {
+        format!(
+            "{error}\n\nWindows Hello on this PC cannot make this kind of key \
+             (it often makes only RSA keys, and OpenSSH security keys are ECDSA \
+             or Ed25519). Leave out --hello to use a security key or a phone instead."
+        )
+    } else {
+        error
+    }
+}
+
 /// Makes the key with `authenticator` and writes `path` and `path.pub`;
 /// returns the public key line for `authorized_keys`.
 pub fn make(
@@ -76,7 +91,8 @@ pub fn make(
             user_verification: false,
         },
         comment,
-    )?;
+    )
+    .map_err(|e| explain(key, e))?;
     let write = |p: &Path, text: &str| {
         std::fs::write(p, text).map_err(|e| format!("cannot write {}: {e}", p.display()))
     };
@@ -113,6 +129,15 @@ mod tests {
         assert!(parse(&args(&[])).is_err());
         assert!(parse(&args(&["--hello", "--ed25519", "k"])).is_err());
         assert!(parse(&args(&["a", "b"])).is_err());
+    }
+
+    #[test]
+    fn says_what_to_do_when_hello_cannot() {
+        let mut key = parse(&args(&["--hello", "k"])).unwrap();
+        let e = "The parameter is incorrect. (NotSupportedError)".to_owned();
+        assert!(explain(&key, e.clone()).contains("Leave out --hello"));
+        key.hello = false;
+        assert_eq!(explain(&key, e.clone()), e);
     }
 
     #[test]
