@@ -3,6 +3,10 @@
 //! and detach. tmux runs as `tmux -C` over pipes, which speaks the same
 //! protocol as `-CC` without the terminal, so the test adds the DCS that
 //! `-CC` would write. Skipped where tmux is missing.
+//!
+//! With `FEROSSH_TMUX_CONTAINER` set to a running container (one of the
+//! `interop/` images), tmux runs inside it instead, which is how CI covers
+//! other tmux versions.
 
 #![allow(
     clippy::unwrap_used,
@@ -29,9 +33,7 @@ struct Server {
 
 impl Drop for Server {
     fn drop(&mut self) {
-        let _ = Command::new("tmux")
-            .args(["-L", &self.socket, "kill-server"])
-            .status();
+        let _ = tmux().args(["-L", &self.socket, "kill-server"]).status();
     }
 }
 
@@ -55,11 +57,34 @@ impl Drop for Harness {
     }
 }
 
+/// `tmux`, here or in `FEROSSH_TMUX_CONTAINER`, with the shell the tests
+/// expect.
+fn tmux() -> Command {
+    match std::env::var("FEROSSH_TMUX_CONTAINER") {
+        Ok(id) if !id.is_empty() => {
+            let mut c = Command::new("docker");
+            c.args([
+                "exec",
+                "-i",
+                "-e",
+                "SHELL=/bin/sh",
+                "-e",
+                "PS1=$ ",
+                &id,
+                "tmux",
+            ]);
+            c
+        }
+        _ => {
+            let mut c = Command::new("tmux");
+            c.env("SHELL", "/bin/sh").env("PS1", "$ ");
+            c
+        }
+    }
+}
+
 fn tmux_available() -> bool {
-    let found = Command::new("tmux")
-        .arg("-V")
-        .output()
-        .is_ok_and(|o| o.status.success());
+    let found = tmux().arg("-V").output().is_ok_and(|o| o.status.success());
     if !found {
         assert!(
             std::env::var_os("FEROSSH_REQUIRE_TMUX").is_none(),
@@ -72,11 +97,9 @@ fn tmux_available() -> bool {
 
 impl Harness {
     fn attach(server: &Server, preferred: Mode) -> Self {
-        let mut child = Command::new("tmux")
+        let mut child = tmux()
             .args(["-L", &server.socket, "-f", "/dev/null", "-C"])
             .args(["new-session", "-A", "-s", "e2e", "-x", "80", "-y", "24"])
-            .env("SHELL", "/bin/sh")
-            .env("PS1", "$ ")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
@@ -188,7 +211,7 @@ impl Harness {
 }
 
 fn tmux_cmd(server: &Server, args: &[&str]) -> String {
-    let out = Command::new("tmux")
+    let out = tmux()
         .args(["-L", &server.socket])
         .args(args)
         .output()
