@@ -360,6 +360,33 @@ fn run<W: Write>(pipe: &mut Pipe<'_, W>, config: ironrdp_connector::Config) -> R
     }
 }
 
+/// Whether a PDU that came while the display is being reset belongs to
+/// the reset's finalization. A server still drawing at the old size (xrdp
+/// after a resize) can send updates and channel data in between, which
+/// IronRDP's finalization takes for an error; they are dropped, and the
+/// server draws everything again at the new size. Anything that does not
+/// decode goes to the finalization, which says what is wrong with it.
+fn finalization_pdu(pdu: &[u8], io_channel: u16) -> bool {
+    use ironrdp_pdu::rdp::headers::{ShareDataPdu, decode_share_data};
+    let Ok(ctx) = ironrdp_pdu::mcs::decode_send_data_indication(pdu) else {
+        return true;
+    };
+    if ctx.channel_id != io_channel {
+        return false;
+    }
+    let Ok(share) = decode_share_data(ctx) else {
+        return true;
+    };
+    matches!(
+        share.pdu,
+        ShareDataPdu::Synchronize(_)
+            | ShareDataPdu::Control(_)
+            | ShareDataPdu::ServerSetErrorInfo(_)
+            | ShareDataPdu::MonitorLayout(_)
+            | ShareDataPdu::FontMap(_)
+    )
+}
+
 /// TLS on ring, accepting the server's certificate as it is (see the
 /// module docs) but checking that the server holds its key.
 fn tls_config() -> Result<Arc<rustls::ClientConfig>, Failure> {
@@ -624,6 +651,13 @@ impl Active {
             let written = match seq.next_pdu_hint() {
                 Some(hint) => {
                     let pdu = framed.read_by_hint(hint).map_err(|e| io_failure(&e))?;
+                    let finalizing = matches!(
+                        seq.connection_activation_state(),
+                        ConnectionActivationState::ConnectionFinalization { .. }
+                    );
+                    if finalizing && !finalization_pdu(&pdu, seq.io_channel_id()) {
+                        continue;
+                    }
                     seq.step(&pdu, framed.last_read_at(), &mut buf)
                 }
                 None => seq.step_no_input(&mut buf),
