@@ -71,6 +71,28 @@ impl fmt::Display for ForwardSpec {
     }
 }
 
+impl ForwardSpec {
+    /// The `ssh_config` line: `LocalForward 8080 db:5432`.
+    pub fn config_line(&self) -> String {
+        let keyword = match self.kind {
+            ForwardKind::Local => "LocalForward",
+            ForwardKind::Remote => "RemoteForward",
+            ForwardKind::Dynamic => "DynamicForward",
+        };
+        let mut out = format!("{keyword} ");
+        if let Some(bind) = &self.bind {
+            let bind = if bind.is_empty() { "*" } else { bind };
+            out.push_str(&host_text(bind));
+            out.push(':');
+        }
+        out.push_str(&self.port.to_string());
+        if let Some((host, port)) = &self.target {
+            out.push_str(&format!(" {}:{port}", host_text(host)));
+        }
+        out
+    }
+}
+
 /// Splits on `:` outside brackets, dropping the brackets.
 fn fields(text: &str) -> Option<Vec<String>> {
     let mut out = Vec::new();
@@ -247,6 +269,14 @@ mod tests {
         ] {
             let spec = parse_option(text).unwrap();
             assert_eq!(spec.to_string(), text);
+            let line = spec.config_line();
+            let (keyword, rest) = line.split_once(' ').unwrap();
+            let kind = match keyword {
+                "LocalForward" => ForwardKind::Local,
+                "RemoteForward" => ForwardKind::Remote,
+                _ => ForwardKind::Dynamic,
+            };
+            assert_eq!(parse_config(kind, &args(rest)), Some(spec), "{line}");
         }
         assert_eq!(
             parse_option("l 8080 db:5432"),

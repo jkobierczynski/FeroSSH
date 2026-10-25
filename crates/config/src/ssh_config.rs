@@ -162,7 +162,7 @@ impl Line {
 }
 
 /// `# folder: Name` or `#folder Name`, as the session manager's folders.
-fn folder_comment(line: &str) -> Option<String> {
+pub(crate) fn folder_comment(line: &str) -> Option<String> {
     let rest = line.trim().strip_prefix('#')?.trim_start();
     let head = rest.get(..6)?;
     if !head.eq_ignore_ascii_case("folder") {
