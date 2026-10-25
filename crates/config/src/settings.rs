@@ -22,6 +22,8 @@
 //!     TmuxLayout ferossh
 //! Profile core-switch
 //!     LegacyAlgorithms yes
+//! Profile desktop-box
+//!     DesktopPort 3390
 //! ```
 //!
 //! FeroSSH rewrites the file when a setting changes. Unknown keywords are
@@ -52,7 +54,13 @@ pub struct Profile {
     /// 14 to 18 with SHA-2, AES-CTR, plain HMAC-SHA-2) for older switches,
     /// routers and servers.
     pub legacy_algorithms: bool,
+    /// The server's RDP port for Session > Open remote desktop; 3389 when
+    /// unset.
+    pub desktop_port: Option<u16>,
 }
+
+/// The RDP port xrdp and GNOME Remote Desktop listen on by default.
+pub const DEFAULT_DESKTOP_PORT: u16 = 3389;
 
 impl Profile {
     fn is_empty(&self) -> bool {
@@ -63,6 +71,7 @@ impl Profile {
             && self.tmux.is_none()
             && self.tmux_layout.is_none()
             && !self.legacy_algorithms
+            && self.desktop_port.is_none()
     }
 }
 
@@ -266,6 +275,11 @@ impl Settings {
                                 p.legacy_algorithms =
                                     first.is_some_and(|v| v.eq_ignore_ascii_case("yes"));
                             }
+                            "desktopport" => {
+                                p.desktop_port = first
+                                    .and_then(|v| v.parse::<u16>().ok())
+                                    .filter(|&v| v != 0);
+                            }
                             "tmuxlayout" => {
                                 p.tmux_layout = first
                                     .map(|l| l.to_ascii_lowercase())
@@ -372,6 +386,9 @@ impl Settings {
             if p.legacy_algorithms {
                 let _ = writeln!(out, "    LegacyAlgorithms yes");
             }
+            if let Some(port) = p.desktop_port {
+                let _ = writeln!(out, "    DesktopPort {port}");
+            }
         }
         out
     }
@@ -460,6 +477,7 @@ Profile web
     Tmux work
     TmuxLayout TMUX
     LegacyAlgorithms YES
+    DesktopPort 3390
     Unknown thing
 Profile big
     FontSize 400
@@ -467,6 +485,7 @@ Profile big
     Tmux no
     TmuxLayout split
     LegacyAlgorithms maybe
+    DesktopPort 0
 NewKeyword later
 "#;
 
@@ -492,6 +511,7 @@ NewKeyword later
         assert_eq!(web.tmux.as_deref(), Some("work"));
         assert_eq!(web.tmux_layout.as_deref(), Some("tmux"));
         assert!(web.legacy_algorithms);
+        assert_eq!(web.desktop_port, Some(3390));
         assert_eq!(s.scrollback, Some(50_000));
         assert_eq!(s.download_folder.as_deref(), Some("D:\\My Transfers"));
         assert!(s.verify_transfers);
@@ -504,6 +524,7 @@ NewKeyword later
         assert_eq!(big.tmux, None, "tmux stays off unless a session is named");
         assert_eq!(big.tmux_layout, None);
         assert!(!big.legacy_algorithms, "only `yes` turns it on");
+        assert_eq!(big.desktop_port, None, "port 0 is no port");
     }
 
     #[test]

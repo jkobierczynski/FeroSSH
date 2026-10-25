@@ -3,8 +3,9 @@
 //! `sshd`, as on Windows. Local, SOCKS 4a and SOCKS 5 forwards are used
 //! from this process; a remote forward and X11 from the shell on the
 //! server, with a stand-in X server here that checks it gets the real
-//! cookie. Skipped where `sshd` or `ssh-keygen` is missing; the X11 part
-//! also needs `xauth`.
+//! cookie. A remote desktop tunnel goes to the echo server as if it were
+//! an RDP server, after one to a closed port is refused. Skipped where
+//! `sshd` or `ssh-keygen` is missing; the X11 part also needs `xauth`.
 
 #![allow(
     clippy::unwrap_used,
@@ -23,10 +24,11 @@ use ferossh_config::ForwardKind;
 use ferossh_forward::x11::{Display, MIT_COOKIE};
 use ferossh_ipc::X11Auth;
 
-use crate::forwards::{Forwarder, FwdState, Setup};
+use crate::forwards::{DesktopEvent, Forwarder, FwdState, Setup};
 use crate::link::{Link, LinkEvent};
 use crate::ssh::{Effect, Env, SshSession, State, Target};
 use crate::ssh_e2e::{local_user, start_sshd};
+use ferossh_ipc::ChannelId;
 
 const XAUTH: &str = "/usr/bin/xauth";
 const REAL_COOKIE: [u8; 16] = [0x5a; 16];
@@ -146,6 +148,34 @@ fn local_side(local: u16, dynamic: u16, echo: u16, closed_target: u16) {
     let mut reply = [0u8; 10];
     s.read_exact(&mut reply).unwrap();
     assert_ne!(reply[1], 0, "connecting to a closed port succeeded");
+}
+
+fn desktop_event(forwarder: &Forwarder) -> DesktopEvent {
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        if let Some(e) = forwarder.take_desktop_events().into_iter().next() {
+            return e;
+        }
+        assert!(Instant::now() < deadline, "no remote desktop answer");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+/// Opens a remote desktop on a closed port, then on the echo server.
+fn desktop_side(forwarder: &Forwarder, connection: ChannelId, echo: u16, closed: u16) {
+    forwarder.open_desktop(connection, closed, 0);
+    match desktop_event(forwarder) {
+        DesktopEvent::Failed { why, .. } => {
+            assert!(why.contains("no remote desktop service"), "{why}");
+        }
+        e => panic!("a closed port opened a desktop: {e:?}"),
+    }
+    forwarder.open_desktop(connection, echo, free_port());
+    let DesktopEvent::Ready { addr, .. } = desktop_event(forwarder) else {
+        panic!("the desktop tunnel failed");
+    };
+    let s = TcpStream::connect(addr.as_str()).unwrap();
+    assert_eq!(echo_through(s, b"rdp"), b"rdp");
 }
 
 #[test]
@@ -273,8 +303,10 @@ fn local_remote_dynamic_and_x11_forwards() {
             }
             if listening {
                 sent_command = true;
+                let (fw, conn) = (forwarder.clone(), session.connection);
                 client = Some(std::thread::spawn(move || {
                     local_side(local, dynamic, echo, closed_target);
+                    desktop_side(&fw, conn, echo, closed_target);
                 }));
                 effects.extend(session.input(command.as_bytes()));
                 continue;
