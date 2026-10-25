@@ -19,6 +19,13 @@
 mod clipboard;
 #[cfg(windows)]
 mod conpty;
+#[cfg(feature = "viewer")]
+#[cfg_attr(not(windows), allow(dead_code))]
+mod desktop;
+#[cfg(not(feature = "viewer"))]
+#[cfg_attr(not(windows), allow(dead_code))]
+#[path = "desktop_off.rs"]
+mod desktop;
 // Platform-neutral, tested everywhere; only the Windows build uses them.
 #[cfg_attr(not(windows), allow(dead_code))]
 mod files;
@@ -65,6 +72,8 @@ mod win;
 enum Launch {
     /// Run as the SSH worker on these inherited handles.
     Worker(String, String),
+    /// Run as the remote desktop viewer on these inherited handles.
+    Viewer(String, String),
     /// Connect to a host, or ask for one.
     Ssh {
         destination: Option<String>,
@@ -108,6 +117,12 @@ fn parse_args(args: &[String]) -> Result<Launch, String> {
                     return Err("--worker needs two handles".into());
                 };
                 return Ok(Launch::Worker(i.clone(), o.clone()));
+            }
+            "--viewer" if cfg!(feature = "viewer") => {
+                let (Some(i), Some(o)) = (iter.next(), iter.next()) else {
+                    return Err("--viewer needs two handles".into());
+                };
+                return Ok(Launch::Viewer(i.clone(), o.clone()));
             }
             "--local" => {
                 let command: Vec<String> = iter.map(|a| quote(a)).collect();
@@ -164,6 +179,17 @@ fn main() -> windows::core::Result<()> {
             Ok(())
         }
         Ok(Launch::NewSecurityKey(key)) => win::new_security_key(&key),
+        #[cfg(feature = "viewer")]
+        Ok(Launch::Viewer(input, output)) => {
+            // Decoding only: no window, no network, no files.
+            if let Some((input, output)) = sandbox::worker_pipes(&input, &output) {
+                let _ = ferossh_viewer::viewer::run(
+                    std::io::BufReader::new(input),
+                    std::io::BufWriter::new(output),
+                );
+            }
+            Ok(())
+        }
         Ok(launch) => win::run(launch, theme),
         Err(e) => win::run_error(&e),
     }

@@ -12,7 +12,10 @@ ignore = [
     # with an in-process RSA private key. Revisited for .ppk support
     # (milestone 4): key files, OpenSSH or PuTTY, are Ed25519 or P-256 only
     # and RSA .ppk keys are refused with a pointer to Pageant, so this
-    # still holds. Revisit if in-process RSA keys are ever wanted.
+    # still holds. Revisit if in-process RSA keys are ever wanted. The
+    # optional RDP viewer (IronRDP: sspi, picky, winscard) links rsa too,
+    # but logs in with a password (NTLM); its RSA private-key paths are
+    # for smart cards and Kerberos PKINIT, which it never uses.
     { id = "RUSTSEC-2023-0071", reason = "no in-process RSA private-key operations" },
 ]
 

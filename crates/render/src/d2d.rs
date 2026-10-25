@@ -88,6 +88,9 @@ pub struct PaneView<'a> {
     pub cursor: Option<Cursor>,
     /// Redraw every row and the padding, not only the grid's dirty rows.
     pub full: bool,
+    /// A picture to show instead of the cells (with the `images` feature;
+    /// without it the cells are drawn).
+    pub image: Option<crate::Image<'a>>,
 }
 
 /// Result of a draw call.
@@ -165,6 +168,9 @@ struct Target {
     rt: ID2D1HwndRenderTarget,
     brush: ID2D1SolidColorBrush,
     atlases: HashMap<FontKey, Atlas>,
+    /// Pictures on the GPU by key, with their size.
+    #[cfg(feature = "images")]
+    images: HashMap<u64, (ID2D1Bitmap, u32, u32)>,
 }
 
 /// Draws panes of terminal cells into one window.
@@ -315,7 +321,16 @@ impl Renderer {
                 rt.Clear(Some(&color(bg)));
             }
         }
+        #[cfg(feature = "images")]
+        target
+            .images
+            .retain(|k, _| panes.iter().any(|p| p.image.is_some_and(|i| i.key == *k)));
         for p in panes {
+            #[cfg(feature = "images")]
+            if let Some(image) = &p.image {
+                draw_image(rt, &target.brush, &mut target.images, image, p, fresh)?;
+                continue;
+            }
             let key = FontKey::new(p.font, dpi);
             if let (Some(font), Some(atlas)) = (self.fonts.get(&key), target.atlases.get(&key)) {
                 draw_pane(rt, &target.brush, atlas, &font.metrics, p, fresh);
@@ -368,6 +383,8 @@ impl Renderer {
                 rt,
                 brush,
                 atlases: HashMap::new(),
+                #[cfg(feature = "images")]
+                images: HashMap::new(),
             })
         }
     }
@@ -567,6 +584,113 @@ impl Atlas {
 fn rows_to_draw<'a>(pane: &'a PaneView<'_>, force: bool) -> impl Iterator<Item = usize> + 'a {
     let all = pane.full || force;
     (0..pane.grid.rows()).filter(move |y| all || pane.grid.is_dirty(*y))
+}
+
+/// Draws a pane's picture, uploading what changed first.
+#[cfg(feature = "images")]
+fn draw_image(
+    rt: &ID2D1RenderTarget,
+    brush: &ID2D1SolidColorBrush,
+    images: &mut HashMap<u64, (ID2D1Bitmap, u32, u32)>,
+    image: &crate::Image<'_>,
+    pane: &PaneView<'_>,
+    fresh: bool,
+) -> Result<()> {
+    use windows::Win32::Graphics::Direct2D::Common::D2D_RECT_U;
+    use windows::Win32::Graphics::Direct2D::{
+        D2D1_BITMAP_INTERPOLATION_MODE_LINEAR, D2D1_BITMAP_PROPERTIES,
+    };
+    let (w, h) = (image.width, image.height);
+    let needed = (w as usize).saturating_mul(h as usize);
+    if w == 0 || h == 0 || image.pixels.len() < needed {
+        return Ok(());
+    }
+    let pitch = w * 4;
+    let created = match images.get(&image.key) {
+        Some((_, bw, bh)) if (*bw, *bh) == (w, h) => false,
+        _ => {
+            let props = D2D1_BITMAP_PROPERTIES {
+                pixelFormat: D2D1_PIXEL_FORMAT {
+                    format: DXGI_FORMAT_B8G8R8A8_UNORM,
+                    alphaMode: D2D1_ALPHA_MODE_IGNORE,
+                },
+                dpiX: 96.0,
+                dpiY: 96.0,
+            };
+            // SAFETY: `pixels` holds at least w*h u32s (checked above),
+            // read with a pitch of one row.
+            let bitmap = unsafe {
+                rt.CreateBitmap(
+                    D2D_SIZE_U {
+                        width: w,
+                        height: h,
+                    },
+                    Some(image.pixels.as_ptr().cast()),
+                    pitch,
+                    &props,
+                )?
+            };
+            images.insert(image.key, (bitmap, w, h));
+            true
+        }
+    };
+    let Some((bitmap, ..)) = images.get(&image.key) else {
+        return Ok(());
+    };
+    if !created && let Some((l, t, r, b)) = image.dirty {
+        let (r, b) = (r.min(w), b.min(h));
+        if l < r && t < b {
+            let start = t as usize * w as usize + l as usize;
+            if let Some(src) = image.pixels.get(start..) {
+                let area = D2D_RECT_U {
+                    left: l,
+                    top: t,
+                    right: r,
+                    bottom: b,
+                };
+                // SAFETY: `src` starts at (l, t) and holds every row up to
+                // `b` at this pitch, since the picture is w x h.
+                unsafe { bitmap.CopyFromMemory(Some(&area), src.as_ptr().cast(), pitch)? };
+            }
+        }
+    }
+    // Rows Windows asked to repaint arrive as dirty grid rows.
+    let whole = pane.full || fresh || created || pane.grid.any_dirty();
+    if !whole && image.dirty.is_none() {
+        return Ok(());
+    }
+    let area = (
+        pane.rect.left,
+        pane.rect.top,
+        pane.rect.right,
+        pane.rect.bottom,
+    );
+    let (l, t, r, b) = crate::fit(area, w, h);
+    let bounds = rect(
+        pane.rect.left as f32,
+        pane.rect.top as f32,
+        pane.rect.right as f32,
+        pane.rect.bottom as f32,
+    );
+    let dest = rect(l as f32, t as f32, r as f32, b as f32);
+    // SAFETY: drawing calls inside the caller's BeginDraw; the clip is
+    // popped below.
+    unsafe {
+        rt.PushAxisAlignedClip(&bounds, D2D1_ANTIALIAS_MODE_ALIASED);
+        if whole {
+            brush.SetColor(&color(pane.theme.background));
+            rt.FillRectangle(&bounds, brush);
+        }
+        rt.DrawBitmap(
+            bitmap,
+            Some(&dest),
+            1.0,
+            D2D1_BITMAP_INTERPOLATION_MODE_LINEAR,
+            None,
+        );
+        rt.PopAxisAlignedClip();
+    }
+    Ok(())
 }
 
 fn draw_pane(

@@ -12,6 +12,12 @@
 //! AppContainers cannot connect to loopback addresses, so `localhost`
 //! (and WSL through localhost) is unreachable from the sandbox; such hosts
 //! need `--no-sandbox` for now.
+//!
+//! With a desktop viewer (`vnc-viewer`, `rdp-viewer`), the same exe runs as the
+//! remote desktop viewer (`--viewer`), in its own AppContainer
+//! ("FeroSSH.Viewer") with no capabilities at all: no network, and, like
+//! the worker, none of the user's files or registry. It is always
+//! sandboxed; `--no-sandbox` only concerns the worker.
 
 // AppContainer, pipe, job and process calls are Win32 FFI; each unsafe block
 // is a direct call with handles and buffers this module owns.
@@ -54,8 +60,49 @@ use windows::Win32::System::Threading::{
 };
 use windows::core::{HSTRING, PWSTR, Result, w};
 
-/// The AppContainer profile name; Windows derives its SID from this.
-const PROFILE: windows::core::PCWSTR = w!("FeroSSH.Worker");
+/// Which sandboxed process to start.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Kind {
+    Worker,
+    #[cfg(feature = "viewer")]
+    Viewer,
+}
+
+impl Kind {
+    /// The AppContainer profile name (Windows derives its SID from this),
+    /// its display name and description.
+    fn profile(
+        self,
+    ) -> (
+        windows::core::PCWSTR,
+        windows::core::PCWSTR,
+        windows::core::PCWSTR,
+    ) {
+        match self {
+            Kind::Worker => (
+                w!("FeroSSH.Worker"),
+                w!("FeroSSH SSH worker"),
+                w!("Runs FeroSSH's network connections with network access only."),
+            ),
+            #[cfg(feature = "viewer")]
+            Kind::Viewer => (
+                w!("FeroSSH.Viewer"),
+                w!("FeroSSH desktop viewer"),
+                w!(
+                    "Decodes remote desktop pictures for FeroSSH, with no network, file or registry access."
+                ),
+            ),
+        }
+    }
+
+    fn flag(self) -> &'static str {
+        match self {
+            Kind::Worker => "--worker",
+            #[cfg(feature = "viewer")]
+            Kind::Viewer => "--viewer",
+        }
+    }
+}
 /// SE_GROUP_ENABLED: the capability is in force.
 const SE_GROUP_ENABLED: u32 = 4;
 /// Largest SID, in bytes (SECURITY_MAX_SID_SIZE).
@@ -106,19 +153,15 @@ impl Drop for ContainerSid {
     }
 }
 
-fn container_sid() -> Result<ContainerSid> {
+fn container_sid(kind: Kind) -> Result<ContainerSid> {
+    let (profile, name, description) = kind.profile();
     // SAFETY: constant strings; the profile is created once per user and
     // looked up afterwards.
     unsafe {
-        match CreateAppContainerProfile(
-            PROFILE,
-            w!("FeroSSH SSH worker"),
-            w!("Runs FeroSSH's network connections with network access only."),
-            None,
-        ) {
+        match CreateAppContainerProfile(profile, name, description, None) {
             Ok(sid) => Ok(ContainerSid(sid)),
             Err(e) if e.code() == ERROR_ALREADY_EXISTS.to_hresult() => {
-                DeriveAppContainerSidFromAppContainerName(PROFILE).map(ContainerSid)
+                DeriveAppContainerSidFromAppContainerName(profile).map(ContainerSid)
             }
             Err(e) => Err(e),
         }
@@ -227,11 +270,21 @@ fn kill_on_close_job() -> Result<Owned> {
 /// Starts the worker; `sandbox` false runs it as a plain child process
 /// (the `--no-sandbox` escape hatch).
 pub fn spawn_worker(sandbox: bool) -> Result<Worker> {
+    spawn(Kind::Worker, sandbox)
+}
+
+/// Starts a remote desktop viewer, always in its AppContainer.
+#[cfg(feature = "viewer")]
+pub fn spawn_viewer() -> Result<Worker> {
+    spawn(Kind::Viewer, true)
+}
+
+fn spawn(kind: Kind, sandbox: bool) -> Result<Worker> {
     let exe = std::env::current_exe()
         .map_err(|e| windows::core::Error::new(windows::core::HRESULT(-1), e.to_string()))?;
     let exe_w = HSTRING::from(exe.as_os_str());
     let sid = if sandbox {
-        Some(container_sid()?)
+        Some(container_sid(kind)?)
     } else {
         None
     };
@@ -256,9 +309,19 @@ pub fn spawn_worker(sandbox: bool) -> Result<Worker> {
             Attributes: SE_GROUP_ENABLED,
         },
     ];
+    // The viewer gets no capabilities at all.
+    let caps: &mut [SID_AND_ATTRIBUTES] = if kind == Kind::Worker {
+        &mut caps
+    } else {
+        &mut []
+    };
     let security = sid.as_ref().map(|sid| SECURITY_CAPABILITIES {
         AppContainerSid: sid.0,
-        Capabilities: caps.as_mut_ptr(),
+        Capabilities: if caps.is_empty() {
+            std::ptr::null_mut()
+        } else {
+            caps.as_mut_ptr()
+        },
         CapabilityCount: caps.len() as u32,
         Reserved: 0,
     });
@@ -302,8 +365,9 @@ pub fn spawn_worker(sandbox: bool) -> Result<Worker> {
         si.StartupInfo.cb = std::mem::size_of::<STARTUPINFOEXW>() as u32;
         si.lpAttributeList = list;
         let cmdline = format!(
-            "\"{}\" --worker {} {}",
+            "\"{}\" {} {} {}",
             exe.display(),
+            kind.flag(),
             child_in.0.0 as usize,
             child_out.0.0 as usize
         );

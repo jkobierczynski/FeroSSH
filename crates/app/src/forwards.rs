@@ -63,12 +63,20 @@ pub fn desktop_port_for(label: &str) -> u16 {
 /// What became of a request to open a remote desktop.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DesktopEvent {
-    /// The tunnel listens at `addr` (`127.0.0.1:port`); a viewer may
-    /// connect.
-    Ready { connection: ChannelId, addr: String },
-    /// Nothing answers on the server's port, or the tunnel could not
+    /// The tunnel to the server's `port` listens at `addr`
+    /// (`127.0.0.1:port`); a viewer may connect.
+    Ready {
+        connection: ChannelId,
+        port: u16,
+        addr: String,
+    },
+    /// Nothing answers on the server's `port`, or the tunnel could not
     /// listen.
-    Failed { connection: ChannelId, why: String },
+    Failed {
+        connection: ChannelId,
+        port: u16,
+        why: String,
+    },
 }
 
 /// What a connection forwards, from its ssh_config.
@@ -675,6 +683,7 @@ impl Engine {
         if !self.conns.contains_key(&connection) {
             self.desktop_events.push(DesktopEvent::Failed {
                 connection,
+                port,
                 why: "That connection is not logged in.".into(),
             });
             return;
@@ -707,12 +716,13 @@ impl Engine {
         if let Err(why) = answer {
             let why = format!(
                 "Nothing answers on the server's port {port}, so it has no remote desktop \
-                 service there ({why}). Install xrdp (sudo apt install xrdp) or turn on \
-                 GNOME Remote Desktop, or set DesktopPort in this host's profile if it \
-                 listens elsewhere."
+                 service there ({why})."
             );
-            self.desktop_events
-                .push(DesktopEvent::Failed { connection, why });
+            self.desktop_events.push(DesktopEvent::Failed {
+                connection,
+                port,
+                why,
+            });
             return;
         }
         // A tunnel already open for this port serves again.
@@ -725,8 +735,11 @@ impl Engine {
             match &f.state {
                 FwdState::Listening(addrs) => {
                     let addr = first_addr(addrs);
-                    self.desktop_events
-                        .push(DesktopEvent::Ready { connection, addr });
+                    self.desktop_events.push(DesktopEvent::Ready {
+                        connection,
+                        port,
+                        addr,
+                    });
                 }
                 _ => f.desktop_waiting = true,
             }
@@ -751,6 +764,7 @@ impl Engine {
         match result {
             Ok(addrs) => self.desktop_events.push(DesktopEvent::Ready {
                 connection,
+                port,
                 addr: first_addr(&addrs),
             }),
             // The host's own port is taken: any free one will do.
@@ -763,9 +777,11 @@ impl Engine {
                 }
                 self.add_fwd(connection, desktop_spec(0, port), Some(port));
             }
-            Err(why) => self
-                .desktop_events
-                .push(DesktopEvent::Failed { connection, why }),
+            Err(why) => self.desktop_events.push(DesktopEvent::Failed {
+                connection,
+                port,
+                why,
+            }),
         }
     }
 
@@ -1323,11 +1339,13 @@ mod tests {
             channel,
             reason: "localhost:3389: the server could not connect (ConnectFailed).".into(),
         });
-        let DesktopEvent::Failed { connection: 1, why } = desktop_event(&fwd) else {
+        let DesktopEvent::Failed {
+            connection: 1, why, ..
+        } = desktop_event(&fwd)
+        else {
             panic!("no failure");
         };
         assert!(why.contains("no remote desktop service"), "{why}");
-        assert!(why.contains("xrdp"), "{why}");
         // No tunnel was left listening.
         assert!(fwd.view()[0].forwards.is_empty());
         // Not logged in: refused at once.
@@ -1355,6 +1373,7 @@ mod tests {
         let DesktopEvent::Ready {
             connection: 1,
             addr,
+            ..
         } = desktop_event(&fwd)
         else {
             panic!("not ready");
@@ -1396,6 +1415,7 @@ mod tests {
             desktop_event(&fwd),
             DesktopEvent::Ready {
                 connection: 1,
+                port: 3390,
                 addr: at.to_string()
             }
         );

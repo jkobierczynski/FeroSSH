@@ -1,0 +1,50 @@
+[package]
+name = "ferossh-viewer"
+description = "FeroSSH: the optional built-in desktop viewer's protocol code (VNC and RDP clients) and the viewer process's pipe protocol"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[features]
+default = []
+# The VNC (RFB) client.
+vnc = ["dep:des", "dep:miniz_oxide"]
+# The RDP client, on IronRDP, with TLS from rustls on ring.
+rdp = [
+    "dep:ironrdp-blocking",
+    "dep:ironrdp-connector",
+    "dep:ironrdp-core",
+    "dep:ironrdp-graphics",
+    "dep:ironrdp-input",
+    "dep:ironrdp-pdu",
+    "dep:ironrdp-session",
+    "dep:ironrdp-svc",
+    "dep:rustls",
+    "dep:x509-cert",
+]
+
+[dependencies]
+# VNC password authentication is DES, as RFC 6143 fixes it.
+des = { version = "0.9", optional = true }
+# ZRLE rectangles are zlib streams.
+miniz_oxide = { version = "0.8", optional = true }
+zeroize = "1.9"
+# RDP: IronRDP for the protocol (connection, NLA, graphics codecs),
+# rustls on ring (already in the exe for SSH) for its TLS, and x509-cert
+# for the server key CredSSP binds to.
+ironrdp-blocking = { version = "0.11", optional = true }
+ironrdp-connector = { version = "0.11", optional = true }
+ironrdp-core = { version = "0.3", optional = true }
+ironrdp-graphics = { version = "0.10", optional = true }
+ironrdp-input = { version = "0.8", optional = true }
+ironrdp-pdu = { version = "0.10", optional = true }
+ironrdp-session = { version = "0.12", optional = true }
+ironrdp-svc = { version = "0.9", optional = true }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"], optional = true }
+x509-cert = { version = "0.3", default-features = false, features = ["std"], optional = true }
+
+[lints]
+workspace = true

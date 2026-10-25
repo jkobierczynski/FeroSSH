@@ -8,6 +8,10 @@ license.workspace = true
 repository.workspace = true
 publish.workspace = true
 
+[features]
+# Draws pictures (the built-in desktop viewer's remote screen) in panes.
+images = []
+
 [dependencies]
 
 [target.'cfg(windows)'.dependencies]

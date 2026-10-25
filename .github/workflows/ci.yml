@@ -21,18 +21,48 @@ jobs:
       - run: rustup show active-toolchain
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      # The optional built-in desktop viewer (Cargo features, off by
+      # default): VNC only, RDP only, and both.
+      - run: cargo clippy -p ferossh --all-targets --features vnc-viewer --locked -- -D warnings
+      - run: cargo clippy -p ferossh --all-targets --features rdp-viewer --locked -- -D warnings
+      - run: cargo clippy -p ferossh --all-targets --features desktop-viewer --locked -- -D warnings
       - run: cargo test --workspace --locked
+      - run: cargo test -p ferossh --features desktop-viewer --locked
+      # Three exes: the standard one, with none of the viewer's code;
+      # ferossh-vnc.exe with the VNC viewer; ferossh-desktop.exe with the
+      # VNC and RDP viewers.
       - run: cargo build --release --locked -p ferossh
-      - name: Report exe size
+      - run: |
+          mkdir dist
+          copy target\release\ferossh.exe dist\ferossh.exe
+        shell: cmd
+      - run: cargo build --release --locked -p ferossh --features vnc-viewer
+      - run: copy target\release\ferossh.exe dist\ferossh-vnc.exe
+        shell: cmd
+      - run: cargo build --release --locked -p ferossh --features desktop-viewer
+      - run: copy target\release\ferossh.exe dist\ferossh-desktop.exe
+        shell: cmd
+      - name: Report exe sizes
         shell: pwsh
         run: |
-          $exe = Get-Item target/release/ferossh.exe
-          $kb = [math]::Round($exe.Length / 1KB)
-          "ferossh.exe: $kb KB" | Tee-Object -Append $env:GITHUB_STEP_SUMMARY
+          $std = (Get-Item dist/ferossh.exe).Length
+          $vnc = (Get-Item dist/ferossh-vnc.exe).Length
+          $desk = (Get-Item dist/ferossh-desktop.exe).Length
+          "ferossh.exe: $([math]::Round($std / 1KB)) KB" | Tee-Object -Append $env:GITHUB_STEP_SUMMARY
+          "ferossh-vnc.exe (VNC viewer): $([math]::Round($vnc / 1KB)) KB, +$([math]::Round(($vnc - $std) / 1KB)) KB" | Tee-Object -Append $env:GITHUB_STEP_SUMMARY
+          "ferossh-desktop.exe (VNC and RDP viewers): $([math]::Round($desk / 1KB)) KB, +$([math]::Round(($desk - $std) / 1KB)) KB (RDP: +$([math]::Round(($desk - $vnc) / 1KB)) KB)" | Tee-Object -Append $env:GITHUB_STEP_SUMMARY
       - uses: actions/upload-artifact@v4
         with:
           name: ferossh-exe
-          path: target/release/ferossh.exe
+          path: dist/ferossh.exe
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ferossh-vnc-viewer-exe
+          path: dist/ferossh-vnc.exe
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ferossh-desktop-viewer-exe
+          path: dist/ferossh-desktop.exe
 
   sshd:
     name: SSH tests against OpenSSH (Linux)
@@ -68,6 +98,30 @@ jobs:
       - run: tmux -V
       - run: cargo test --locked -p ferossh tmux_e2e
       - run: cargo test --locked -p ferossh-auth keyfile
+
+  rdp:
+    name: RDP viewer against xrdp (Linux)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup show active-toolchain
+      # A throwaway xrdp with an Xorg session running one xterm, whose
+      # background colour the test waits for; then it types a command.
+      - run: sudo apt-get update && sudo apt-get install -y xrdp xorgxrdp xterm
+      - run: |
+          sudo useradd -m -s /bin/bash rdptest
+          echo 'rdptest:Secret-pw1' | sudo chpasswd
+          printf '#!/bin/sh\nexec xterm -geometry 80x24+10+10 -bg "#336699"\n' | sudo tee /home/rdptest/.xsession
+          sudo chmod +x /home/rdptest/.xsession
+          sudo chown rdptest /home/rdptest/.xsession
+          sudo sed -i 's/allowed_users=console/allowed_users=anybody/' /etc/X11/Xwrapper.config
+          # xrdp falls back to old RDP security without TLS when it cannot
+          # read its key, which the viewer refuses.
+          sudo adduser xrdp ssl-cert
+          sudo systemctl restart xrdp-sesman xrdp
+      - run: "cargo test --locked -p ferossh-viewer --features rdp rdp::"
+        env:
+          FEROSSH_TEST_RDP: "127.0.0.1:3389 rdptest Secret-pw1"
 
   interop:
     name: Interop against older and newer servers (Linux)
@@ -127,3 +181,5 @@ jobs:
       - run: cargo +nightly fuzz run --target x86_64-unknown-linux-gnu sftp_decode -- -max_total_time=60
       - run: cargo +nightly fuzz run --target x86_64-unknown-linux-gnu forward_parse -- -max_total_time=60
       - run: cargo +nightly fuzz run --target x86_64-unknown-linux-gnu tmux_feed -- -max_total_time=60
+      - run: cargo +nightly fuzz run --target x86_64-unknown-linux-gnu vnc_decode -- -max_total_time=60
+      - run: cargo +nightly fuzz run --target x86_64-unknown-linux-gnu rdp_decode -- -max_total_time=60
