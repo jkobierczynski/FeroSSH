@@ -25,6 +25,7 @@ use std::time::{Duration, Instant};
 use ferossh_auth::keyfile::KeyFile;
 use ferossh_auth::userauth;
 use ferossh_ipc::{Message, PROTOCOL_VERSION, Timing};
+use ferossh_term::{Action, Settings, Terminal};
 use tokio::sync::mpsc;
 
 /// What a case should end with.
@@ -426,6 +427,50 @@ async fn dead_and_restarted_servers() {
         String::from_utf8_lossy(&seen.output).contains("fero42"),
         "{seen:?}"
     );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A full-screen app that sets the title and quits gives the title back,
+/// whether the host's terminfo saves and restores it around the alternate
+/// screen (xterm-256color) or not (screen, like mc on some Debian hosts).
+#[tokio::test]
+async fn full_screen_apps_give_the_title_back() {
+    if !available() {
+        return;
+    }
+    let dir = std::env::temp_dir().join(format!("ferossh-interop-title-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let keys = user_keys(&dir);
+    let container = Server::start("24.04", "openssh", &dir);
+    for term in ["xterm-256color", "screen"] {
+        let command = format!(
+            "printf '\\033]2;shell\\007'; export TERM={term}; tput smcup; \
+             printf '\\033]0;mc [fero]:~\\007'; tput rmcup; echo fero$((6*7)); exit\n"
+        );
+        let seen = connect(container.port, &keys, false, &command).await;
+        let output = String::from_utf8_lossy(&seen.output);
+        assert!(output.contains("fero42"), "{term}: {seen:?}");
+        let mut t = Terminal::new(80, 24, &Settings::default());
+        t.feed(&seen.output);
+        let titles: Vec<Option<String>> = t
+            .take_actions()
+            .into_iter()
+            .filter_map(|a| match a {
+                Action::Title(t) => Some(t),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            titles.contains(&Some("mc [fero]:~".to_owned())),
+            "{term}: {titles:?}"
+        );
+        assert_eq!(
+            titles.last(),
+            Some(&Some("shell".to_owned())),
+            "{term}: {titles:?}"
+        );
+    }
     let _ = std::fs::remove_dir_all(&dir);
 }
 

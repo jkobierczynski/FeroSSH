@@ -263,6 +263,65 @@ fn titles_are_sanitised() {
     );
 }
 
+fn titles(t: &mut Terminal) -> Vec<Option<String>> {
+    t.take_actions()
+        .into_iter()
+        .filter_map(|a| match a {
+            Action::Title(t) => Some(t),
+            _ => None,
+        })
+        .collect()
+}
+
+#[test]
+fn full_screen_apps_give_the_title_back() {
+    let mc = Some("mc [user@Debian]:~".to_owned());
+    // mc where terminfo has no title stack (smcup is only 1049h): the
+    // title from before comes back when it leaves.
+    let mut t = term(20, 4);
+    t.feed(b"\x1b[?1049h\x1b]0;mc [user@Debian]:~\x07\x1b[?1049l");
+    assert_eq!(titles(&mut t), [mc.clone(), None]);
+    t.feed(b"\x1b]2;bash\x07\x1b[?1049h");
+    t.feed(b"\x1b]0;mc [user@Debian]:~\x07");
+    t.feed(b"\x1b[?1049l");
+    assert_eq!(
+        titles(&mut t),
+        [Some("bash".to_owned()), mc.clone(), Some("bash".to_owned())]
+    );
+    // Byte by byte, and with other modes in the same sequence.
+    for (enter, leave) in [("?1049h", "?1049l"), ("?1;1049h", "?1049;1l")] {
+        let mut t = term(20, 4);
+        let bytes = format!("\x1b[{enter}\x1b]0;mc\x07x\x1b[{leave}");
+        for b in bytes.as_bytes() {
+            t.feed(&[*b]);
+        }
+        assert_eq!(titles(&mut t), [Some("mc".to_owned()), None], "{enter}");
+    }
+    // With a title stack (xterm-256color smcup and rmcup), the app's own
+    // restore and ours agree.
+    let mut t = term(20, 4);
+    t.feed(b"\x1b]2;bash\x07\x1b[?1049h\x1b[22;0;0t\x1b]0;mc\x07");
+    t.feed(b"\x1b[?1049l\x1b[23;0;0t");
+    assert_eq!(titles(&mut t).last(), Some(&Some("bash".to_owned())));
+}
+
+#[test]
+fn titles_outside_full_screen_apps_stay() {
+    // An app that leaves its title on purpose by setting it after the
+    // alternate screen, and one that never changed it.
+    let mut t = term(20, 4);
+    t.feed(b"\x1b[?1049h\x1b[?1049l\x1b]0;job done\x07");
+    assert_eq!(titles(&mut t), [Some("job done".to_owned())]);
+    t.feed(b"\x1b[?1049hless\x1b[?1049l");
+    assert_eq!(titles(&mut t), Vec::<Option<String>>::new());
+    // An app that set the old title back itself.
+    t.feed(b"\x1b[?1049h\x1b]0;vim\x07\x1b]0;job done\x07\x1b[?1049l");
+    assert_eq!(
+        titles(&mut t),
+        [Some("vim".to_owned()), Some("job done".to_owned())]
+    );
+}
+
 #[test]
 fn clipboard_writes_need_confirmation() {
     let mut t = term(10, 2);

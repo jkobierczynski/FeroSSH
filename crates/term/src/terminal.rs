@@ -15,7 +15,8 @@ use alacritty_terminal::term::{
     ClipboardType, Config, Osc52, Term, TermMode, point_to_viewport, viewport_to_point,
 };
 use alacritty_terminal::vte::ansi::{
-    Color as TermColor, CursorShape as TermCursorShape, NamedColor, Processor, Rgb as TermRgb,
+    Color as TermColor, CursorShape as TermCursorShape, Handler, NamedColor, Processor,
+    Rgb as TermRgb,
 };
 use ferossh_render::{Cell, Color, Cursor, CursorShape, Flags, Grid, Rgb, Theme};
 
@@ -138,6 +139,11 @@ pub struct Terminal {
     cwd: CwdScanner,
     /// Working directories reported since the last `take_actions`.
     reported: Vec<WorkingDir>,
+    /// The title the host last set, as the UI was told.
+    title: Option<String>,
+    /// While the alternate screen is up: the title from before it, and
+    /// whether the app on it set another.
+    alt_title: Option<(Option<String>, bool)>,
 }
 
 impl std::fmt::Debug for Terminal {
@@ -167,6 +173,8 @@ impl Terminal {
             search: None,
             cwd: CwdScanner::default(),
             reported: Vec::new(),
+            title: None,
+            alt_title: None,
         }
     }
 
@@ -215,7 +223,49 @@ impl Terminal {
             self.reported.clear();
             self.reported.push(last);
         }
-        self.parser.advance(&mut self.term, bytes);
+        // Fed in pieces that end at alternate screen switches, so the
+        // titles set on it are told apart from the ones around it.
+        let mut start = 0;
+        for end in alt_switch_ends(bytes).chain([bytes.len()]) {
+            if let Some(piece) = bytes.get(start..end).filter(|p| !p.is_empty()) {
+                let queued = self.events.0.borrow().len();
+                self.parser.advance(&mut self.term, piece);
+                self.follow_title(queued);
+            }
+            start = end;
+        }
+    }
+
+    /// Notes the titles set since event `queued`, then what the alternate
+    /// screen did. An app that set a title on the alternate screen and
+    /// leaves it without restoring the old one (mc on hosts whose
+    /// terminfo has no title stack) gets the old one put back: its title
+    /// does not describe the shell after it.
+    fn follow_title(&mut self, queued: usize) {
+        let mut set = None;
+        for event in self.events.0.borrow().iter().skip(queued) {
+            match event {
+                Event::Title(t) => set = Some(Some(t.clone())),
+                Event::ResetTitle => set = Some(None),
+                _ => {}
+            }
+        }
+        if let Some(title) = set {
+            if let Some((before, changed)) = &mut self.alt_title {
+                *changed = title != *before;
+            }
+            self.title = title;
+        }
+        let alt = self.term.mode().contains(TermMode::ALT_SCREEN);
+        match (alt, self.alt_title.take()) {
+            (true, None) => self.alt_title = Some((self.title.clone(), false)),
+            (true, kept) => self.alt_title = kept,
+            (false, Some((before, true))) if before != self.title => {
+                self.title.clone_from(&before);
+                self.term.set_title(before);
+            }
+            (false, _) => {}
+        }
     }
 
     /// When a synchronized update (DEC mode 2026) started by the host
@@ -589,6 +639,15 @@ impl Terminal {
             shape,
         })
     }
+}
+
+/// Where in `bytes` a sequence that may switch the alternate screen ends:
+/// the `h` or `l` after 1049, the only mode the emulator switches it for.
+/// A false match only splits the feed once more.
+fn alt_switch_ends(bytes: &[u8]) -> impl Iterator<Item = usize> + '_ {
+    bytes.iter().enumerate().filter_map(|(i, &b)| {
+        ((b == b'h' || b == b'l') && bytes.get(..i)?.ends_with(b"1049")).then_some(i + 1)
+    })
 }
 
 fn config(settings: &Settings) -> Config {
