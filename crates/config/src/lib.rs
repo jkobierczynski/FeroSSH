@@ -1,11 +1,14 @@
-//! ssh_config parser, known_hosts and PuTTY import.
+//! `ssh_config` parser, known_hosts and PuTTY import.
 //!
-//! The parser arrives in milestone 4; see the architecture plan. Until then
-//! this crate holds the pieces session profiles build on: OpenSSH host
-//! patterns and per-host colour themes.
+//! Everything here runs in the UI process, which owns the user's files; the
+//! sandboxed worker never reads them. Per-host colour themes build on the
+//! OpenSSH host patterns and are used once session profiles land.
 
 mod host_theme;
+pub mod hostkey;
+pub mod known_hosts;
 mod pattern;
+pub mod ssh_config;
 
 pub use host_theme::{HostThemes, ThemeRule};
 pub use pattern::{match_host, match_pattern};

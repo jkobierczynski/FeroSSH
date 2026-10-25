@@ -554,22 +554,45 @@ checksum = "da7c62ceae207dd37ea5b845da6a0696c799f85e97da1ab5b7910be3c1c80223"
 name = "ferossh"
 version = "0.1.0"
 dependencies = [
+ "ferossh-auth",
+ "ferossh-config",
+ "ferossh-ipc",
  "ferossh-render",
  "ferossh-term",
+ "ferossh-worker",
+ "russh",
+ "tokio",
  "windows",
+ "zeroize",
 ]
 
 [[package]]
 name = "ferossh-auth"
 version = "0.1.0"
+dependencies = [
+ "getrandom 0.4.3",
+ "russh",
+ "tokio",
+ "zeroize",
+]
 
 [[package]]
 name = "ferossh-config"
 version = "0.1.0"
+dependencies = [
+ "base64ct",
+ "getrandom 0.4.3",
+ "hmac",
+ "russh",
+ "sha1",
+]
 
 [[package]]
 name = "ferossh-ipc"
 version = "0.1.0"
+dependencies = [
+ "zeroize",
+]
 
 [[package]]
 name = "ferossh-render"
@@ -598,7 +621,10 @@ version = "0.1.0"
 name = "ferossh-worker"
 version = "0.1.0"
 dependencies = [
+ "ferossh-auth",
+ "ferossh-ipc",
  "russh",
+ "tokio",
 ]
 
 [[package]]

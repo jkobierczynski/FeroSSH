@@ -58,6 +58,32 @@ pub fn preferred() -> Preferred {
     }
 }
 
+/// The key type a host key algorithm verifies with, as known_hosts names
+/// it.
+pub fn key_type(alg: &Algorithm) -> &'static str {
+    match alg {
+        Algorithm::Rsa { .. } => "ssh-rsa",
+        Algorithm::Ed25519 => "ssh-ed25519",
+        Algorithm::Ecdsa {
+            curve: EcdsaCurve::NistP256,
+        } => "ecdsa-sha2-nistp256",
+        _ => "",
+    }
+}
+
+/// [`preferred`] with the host key algorithms for `known_types` (the key
+/// types known_hosts lists for the host) moved to the front, so a server
+/// with several host keys presents the one already trusted. Nothing outside
+/// the policy can be added.
+pub fn preferred_for(known_types: &[String]) -> Preferred {
+    let mut keys: Vec<Algorithm> = HOST_KEYS.to_vec();
+    keys.sort_by_key(|a| !known_types.iter().any(|t| t == key_type(a)));
+    Preferred {
+        key: Cow::Owned(keys),
+        ..preferred()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -95,6 +121,23 @@ mod tests {
         let p = preferred();
         assert_eq!(p.kex.first(), Some(&kex::MLKEM768X25519_SHA256));
         assert!(p.kex.contains(&kex::EXTENSION_OPENSSH_STRICT_KEX_AS_CLIENT));
+    }
+
+    #[test]
+    fn known_key_types_go_first_without_widening_the_policy() {
+        let p = preferred_for(&["ssh-rsa".into(), "ssh-dss".into()]);
+        assert_eq!(
+            p.key.first(),
+            Some(&Algorithm::Rsa {
+                hash: Some(HashAlg::Sha512)
+            })
+        );
+        assert_eq!(p.key.get(2), Some(&Algorithm::Ed25519));
+        let mut got = names(&p);
+        let mut want = names(&preferred());
+        got.sort();
+        want.sort();
+        assert_eq!(got, want);
     }
 
     #[test]

@@ -5,22 +5,28 @@
 
 use std::cell::{Cell as StdCell, RefCell};
 use std::ffi::c_void;
+use std::fs::File;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
+use ferossh_auth::Broker;
+use ferossh_ipc::Message;
 use ferossh_render::{
     CellMetrics, Cursor, FontSpec, Frame, Grid, PaneView, PixelRect, Renderer, Theme,
 };
 use ferossh_term::{
-    Action, Key, Mods, MouseButton, MouseEvent, SelectionKind, Settings, Terminal, check_link,
-    clipboard_preview,
+    Action, Key, LogWriter, Mods, MouseButton, MouseEvent, SelectionKind, Settings, Terminal,
+    check_link, clipboard_preview, log_file_name,
 };
+use windows::Win32::Foundation::E_FAIL;
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, SIZE, WPARAM};
 use windows::Win32::Graphics::Gdi::{
     BeginPaint, EndPaint, InvalidateRect, LOGFONTW, PAINTSTRUCT, ScreenToClient,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows::Win32::System::SystemInformation::GetLocalTime;
 use windows::Win32::UI::HiDpi::{
     AdjustWindowRectExForDpi, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, GetDpiForWindow,
     SetProcessDpiAwarenessContext,
@@ -54,9 +60,13 @@ use windows::Win32::UI::WindowsAndMessaging::{
 };
 use windows::core::{HSTRING, Result, w};
 
+use crate::Launch;
 use crate::clipboard;
 use crate::conpty::{self, Output, Shell};
+use crate::link::{Link, LinkEvent};
 use crate::pattern;
+use crate::sandbox;
+use crate::ssh::{Effect, Env, SshSession, State, Target};
 
 const DEFAULT_COLS: usize = 80;
 const DEFAULT_ROWS: usize = 24;
@@ -66,7 +76,8 @@ const STYLE: WINDOW_STYLE = WS_OVERLAPPEDWINDOW;
 const EX_STYLE: WINDOW_EX_STYLE = WS_EX_APPWINDOW;
 const APP_NAME: &str = "FeroSSH";
 
-/// Posted by the shell's threads when output is waiting.
+/// Posted by the shell's, worker link's and broker's threads when
+/// something is waiting.
 const WM_SHELL_OUTPUT: u32 = WM_APP + 1;
 /// Fires when a synchronized update must be shown even though it has not
 /// ended.
@@ -86,6 +97,9 @@ const FONT_CHOICES: [&str; 3] = ["Cascadia Mono", "Consolas", "Courier New"];
 mod cmd {
     pub const RESTART_SHELL: u32 = 100;
     pub const EXIT: u32 = 101;
+    pub const CONNECT: u32 = 102;
+    pub const RECONNECT: u32 = 103;
+    pub const DISCONNECT: u32 = 104;
     pub const ZOOM_IN: u32 = 200;
     pub const ZOOM_OUT: u32 = 201;
     pub const ZOOM_RESET: u32 = 202;
@@ -105,18 +119,52 @@ mod cmd {
     pub const SCROLL_PAGE_DOWN: u32 = 511;
     pub const SCROLL_TOP: u32 = 512;
     pub const SCROLL_BOTTOM: u32 = 513;
+    pub const LOG_TOGGLE: u32 = 600;
+    pub const LOG_RAW: u32 = 601;
+    pub const LOG_FOLDER: u32 = 602;
+    pub const REPLACE_KEY: u32 = 603;
 }
 
-/// One terminal pane with its own font and colour theme. Milestone 2 has
+/// The prompt shown when no host was given.
+const CONNECT_PROMPT: &str = "\x1b[0mConnect to (user@host[:port], or a Host from ~/.ssh/config): ";
+
+/// What a pane is connected to.
+enum Host {
+    /// Asking for a destination; the text typed so far.
+    Ask(String),
+    /// A local shell on ConPTY (`--local`); `exited` once it ended, when
+    /// Enter starts a new one.
+    Local {
+        shell: Option<Shell>,
+        exited: bool,
+    },
+    Ssh(Box<SshSession>),
+}
+
+/// The worker process and the pipes to it.
+struct WorkerConn {
+    link: Link,
+    _process: sandbox::Worker,
+}
+
+/// Session logging for a tab: on or off, plain or raw, and the open file.
+#[derive(Default)]
+struct Logging {
+    enabled: bool,
+    raw: bool,
+    writer: Option<LogWriter<File>>,
+    path: Option<PathBuf>,
+}
+
+/// One terminal pane with its own font and colour theme. Milestone 3 has
 /// exactly one; tabs and splits add more.
 struct Pane {
     term: Terminal,
     /// What the renderer draws: the visible part of `term`.
     grid: Grid,
     cursor: Option<Cursor>,
-    shell: Option<Shell>,
-    /// The shell exited; Enter starts a new one.
-    exited: bool,
+    host: Host,
+    log: Logging,
     font: FontSpec,
     theme: Theme,
     metrics: CellMetrics,
@@ -160,8 +208,14 @@ struct Window {
     options: Options,
     /// The command line the local shell runs.
     command: String,
-    /// Set while a WM_SHELL_OUTPUT is queued, so the shell's threads post
-    /// one message per batch rather than one per read.
+    /// Run the worker in the AppContainer (off only with `--no-sandbox`).
+    sandbox: bool,
+    worker: Option<WorkerConn>,
+    broker: Option<Broker>,
+    /// The channel id of the next SSH connection.
+    next_channel: u32,
+    /// Set while a WM_SHELL_OUTPUT is queued, so the background threads
+    /// post one message per batch rather than one per read.
     output_pending: Arc<AtomicBool>,
 }
 
@@ -183,8 +237,8 @@ fn with_window<R>(f: impl FnOnce(&mut Window) -> R) -> Option<R> {
     })
 }
 
-pub fn run() -> Result<()> {
-    let result = create_and_run();
+pub fn run(launch: Launch, theme: Option<String>) -> Result<()> {
+    let result = create_and_run(launch, theme);
     if let Err(e) = &result {
         let text = HSTRING::from(format!("FeroSSH could not start:\n\n{}", e.message()));
         // SAFETY: plain message box with valid strings.
@@ -193,39 +247,57 @@ pub fn run() -> Result<()> {
     result
 }
 
-/// The command line after the program name, or the default shell.
-/// The command line: `[--theme NAME] [command...]`. With no command the
-/// pane runs the default shell; an unknown theme name falls back to Nord.
-fn command_line() -> (Theme, String) {
-    let mut args: Vec<String> = std::env::args_os()
-        .skip(1)
-        .map(|a| a.to_string_lossy().into_owned())
-        .collect();
-    let mut theme = Theme::default();
-    if args.first().is_some_and(|a| a == "--theme") && args.len() >= 2 {
-        let name: Vec<String> = args.drain(..2).collect();
-        if let Some(t) = name.get(1).and_then(|n| Theme::by_name(n)) {
-            theme = t;
-        }
-    }
-    if args.is_empty() {
-        return (theme, conpty::default_command());
-    }
-    let command = args
-        .iter()
-        .map(|a| {
-            if a.is_empty() || a.contains([' ', '\t']) {
-                format!("\"{a}\"")
-            } else {
-                a.clone()
-            }
-        })
-        .collect::<Vec<_>>()
-        .join(" ");
-    (theme, command)
+/// A command line FeroSSH does not understand.
+pub fn run_error(problem: &str) -> Result<()> {
+    let text = HSTRING::from(format!(
+        "{problem}\n\nUsage:\n  ferossh [--theme NAME] [-l user] [-p port] [--no-sandbox] [user@]host[:port]\n  \
+         ferossh [--theme NAME] --local [command]"
+    ));
+    // SAFETY: plain message box with valid strings.
+    unsafe { MessageBoxW(None, &text, w!("FeroSSH"), MB_OK | MB_ICONERROR) };
+    Ok(())
 }
 
-fn create_and_run() -> Result<()> {
+/// The user's home folder, account name and ssh_config.
+fn ssh_env() -> Env {
+    let home = std::env::var_os("USERPROFILE").map_or_else(|| PathBuf::from("."), PathBuf::from);
+    let config = std::fs::read_to_string(home.join(".ssh").join("config")).unwrap_or_default();
+    Env {
+        local_user: std::env::var("USERNAME").unwrap_or_default(),
+        home,
+        config,
+    }
+}
+
+/// Where tab logs go: `%LOCALAPPDATA%\FeroSSH\logs`.
+fn log_dir() -> PathBuf {
+    std::env::var_os("LOCALAPPDATA")
+        .map_or_else(|| PathBuf::from("."), PathBuf::from)
+        .join("FeroSSH")
+        .join("logs")
+}
+
+/// The local time as (year, month, day, hour, minute, second).
+fn local_time() -> (u16, u8, u8, u8, u8, u8) {
+    // SAFETY: plain query.
+    let t = unsafe { GetLocalTime() };
+    let b = |v: u16| u8::try_from(v).unwrap_or(0);
+    (
+        t.wYear,
+        b(t.wMonth),
+        b(t.wDay),
+        b(t.wHour),
+        b(t.wMinute),
+        b(t.wSecond),
+    )
+}
+
+fn timestamp() -> String {
+    let (y, mo, d, h, mi, s) = local_time();
+    format!("{y:04}-{mo:02}-{d:02} {h:02}:{mi:02}:{s:02}")
+}
+
+fn create_and_run(launch: Launch, theme: Option<String>) -> Result<()> {
     // SAFETY: plain Win32 calls on this thread with valid arguments; the
     // window procedure below upholds the WNDPROC contract.
     unsafe {
@@ -267,7 +339,8 @@ fn create_and_run() -> Result<()> {
         // opened on.
         let dpi = GetDpiForWindow(hwnd);
         let font = FontSpec::default();
-        let (theme, command) = command_line();
+        // An unknown theme name falls back to the default (Nord).
+        let theme = theme.and_then(|n| Theme::by_name(&n)).unwrap_or_default();
         let mut renderer = Renderer::new(hwnd, 1, 1)?;
         let metrics = renderer.metrics(&font, dpi)?;
         let (width, height) = window_size(&metrics, DEFAULT_COLS, DEFAULT_ROWS, dpi, true);
@@ -284,8 +357,8 @@ fn create_and_run() -> Result<()> {
                     term,
                     grid: Grid::new(DEFAULT_COLS, DEFAULT_ROWS),
                     cursor: None,
-                    shell: None,
-                    exited: false,
+                    host: Host::Ask(String::new()),
+                    log: Logging::default(),
                     font,
                     theme,
                     metrics,
@@ -297,7 +370,14 @@ fn create_and_run() -> Result<()> {
                 high_surrogate: None,
                 mouse: Mouse::default(),
                 options: Options::default(),
-                command,
+                command: match &launch {
+                    Launch::Local(c) if !c.is_empty() => c.clone(),
+                    _ => conpty::default_command(),
+                },
+                sandbox: !matches!(launch, Launch::Ssh { sandbox: false, .. }),
+                worker: None,
+                broker: None,
+                next_channel: 1,
                 output_pending: Arc::new(AtomicBool::new(false)),
             });
         });
@@ -312,7 +392,14 @@ fn create_and_run() -> Result<()> {
             height,
             SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE,
         )?;
-        with_window(Window::start_shell);
+        match launch {
+            Launch::Local(_) => with_window(Window::start_shell),
+            Launch::Ssh {
+                destination: Some(d),
+                ..
+            } => with_window(|w| w.connect(&d)),
+            _ => with_window(Window::ask_destination),
+        };
         let _ = ShowWindow(hwnd, SW_SHOW);
 
         let mut msg = MSG::default();
@@ -336,9 +423,20 @@ fn build_menu() -> Result<HMENU> {
     // SAFETY: menu construction with valid handles.
     unsafe {
         let file = CreatePopupMenu()?;
-        item(file, cmd::RESTART_SHELL, "&Restart local shell")?;
+        item(file, cmd::CONNECT, "&Connect to...\tCtrl+Shift+N")?;
+        item(file, cmd::RECONNECT, "&Reconnect\tCtrl+Shift+R")?;
+        item(file, cmd::DISCONNECT, "&Disconnect")?;
+        separator(file)?;
+        item(file, cmd::RESTART_SHELL, "Open &local shell")?;
         separator(file)?;
         item(file, cmd::EXIT, "E&xit\tAlt+F4")?;
+
+        let session = CreatePopupMenu()?;
+        item(session, cmd::LOG_TOGGLE, "&Log to file")?;
+        item(session, cmd::LOG_RAW, "Log &raw output (keep escape codes)")?;
+        item(session, cmd::LOG_FOLDER, "Open log &folder")?;
+        separator(session)?;
+        item(session, cmd::REPLACE_KEY, "Replace host &key...")?;
 
         let edit = CreatePopupMenu()?;
         item(edit, cmd::COPY, "&Copy\tCtrl+Shift+C")?;
@@ -383,8 +481,13 @@ fn build_menu() -> Result<HMENU> {
         AppendMenuW(bar, MF_POPUP, file.0 as usize, w!("&File"))?;
         AppendMenuW(bar, MF_POPUP, edit.0 as usize, w!("&Edit"))?;
         AppendMenuW(bar, MF_POPUP, view.0 as usize, w!("&View"))?;
+        AppendMenuW(bar, MF_POPUP, session.0 as usize, w!("&Session"))?;
         Ok(bar)
     }
+}
+
+fn io_error(e: std::io::Error) -> windows::core::Error {
+    windows::core::Error::new(E_FAIL, e.to_string())
 }
 
 fn padding(dpi: u32) -> i32 {
@@ -466,11 +569,12 @@ enum KeyOutcome {
 }
 
 impl Window {
-    fn start_shell(&mut self) {
-        self.pane.shell = None;
+    /// Wakes the window from a background thread: one WM_SHELL_OUTPUT per
+    /// batch.
+    fn notifier(&self) -> impl Fn() + Send + Clone + 'static {
         let pending = self.output_pending.clone();
         let hwnd = self.hwnd.0 as isize;
-        let notify = move || {
+        move || {
             if !pending.swap(true, Ordering::AcqRel) {
                 // SAFETY: posting to our window; if it is gone the post
                 // fails harmlessly.
@@ -483,12 +587,35 @@ impl Window {
                     );
                 }
             }
-        };
+        }
+    }
+
+    /// Feeds local text (not from the host) to the terminal.
+    fn show(&mut self, text: &str) {
+        self.pane.term.feed(text.as_bytes());
+    }
+
+    /// Ends whatever the pane is connected to.
+    fn end_host(&mut self) {
+        if let Host::Ssh(session) = &mut self.pane.host {
+            let effects = session.close();
+            self.apply(effects);
+        }
+        self.stop_log();
+        self.pane.host = Host::Ask(String::new());
+    }
+
+    fn start_shell(&mut self) {
+        self.end_host();
+        let notify = self.notifier();
         let (cols, rows) = (self.pane.term.cols(), self.pane.term.rows());
         match Shell::spawn(&self.command, cols, rows, notify) {
             Ok(shell) => {
-                self.pane.shell = Some(shell);
-                self.pane.exited = false;
+                self.pane.host = Host::Local {
+                    shell: Some(shell),
+                    exited: false,
+                };
+                self.start_log();
             }
             Err(e) => {
                 let text = format!(
@@ -496,62 +623,399 @@ impl Window {
                     self.command,
                     e.message()
                 );
-                self.pane.term.feed(text.as_bytes());
-                self.pane.exited = true;
+                self.show(&text);
+                self.pane.host = Host::Local {
+                    shell: None,
+                    exited: true,
+                };
             }
         }
         self.refresh();
     }
 
-    /// Sends the host's answers and other non-user bytes.
-    fn send(&self, bytes: Vec<u8>) {
-        if let Some(shell) = &self.pane.shell
-            && !self.pane.exited
+    /// Shows the connect prompt.
+    fn ask_destination(&mut self) {
+        self.end_host();
+        self.pane.term.scroll_to_bottom();
+        self.show(&format!("\r\n{CONNECT_PROMPT}"));
+        self.set_title_text(APP_NAME);
+        self.refresh();
+    }
+
+    fn set_title_text(&self, text: &str) {
+        // SAFETY: our window and a valid string.
+        let _ = unsafe { SetWindowTextW(self.hwnd, &HSTRING::from(text)) };
+    }
+
+    /// Starts the worker if it is not running.
+    fn ensure_worker(&mut self) -> bool {
+        if self.worker.is_some() {
+            return true;
+        }
+        let result = sandbox::spawn_worker(self.sandbox).and_then(|w| {
+            let input = w.from_worker.try_clone().map_err(io_error)?;
+            let output = w.to_worker.try_clone().map_err(io_error)?;
+            let link = Link::start(input, output, self.notifier()).map_err(io_error)?;
+            Ok(WorkerConn { link, _process: w })
+        });
+        match result {
+            Ok(conn) => {
+                self.worker = Some(conn);
+                true
+            }
+            Err(e) => {
+                let text = format!(
+                    "\x1b[0;31mCould not start the sandboxed SSH worker: {}\x1b[0m\r\n\
+                     If this Windows does not allow AppContainers, start FeroSSH with \
+                     --no-sandbox.\r\n",
+                    e.message()
+                );
+                self.show(&text);
+                false
+            }
+        }
+    }
+
+    fn ensure_broker(&mut self) -> bool {
+        if self.broker.is_some() {
+            return true;
+        }
+        match Broker::spawn(self.notifier()) {
+            Ok(b) => {
+                self.broker = Some(b);
+                true
+            }
+            Err(e) => {
+                self.show(&format!(
+                    "\x1b[0;31mCould not start the signing broker: {e}\x1b[0m\r\n"
+                ));
+                false
+            }
+        }
+    }
+
+    /// Connects the pane to `destination` (`[user@]host[:port]` or a
+    /// Host from ssh_config).
+    fn connect(&mut self, destination: &str) {
+        let env = ssh_env();
+        let Some(target) = Target::resolve(destination, &env) else {
+            let text = format!(
+                "\x1b[0;31m\"{}\" is not a host name.\x1b[0m\r\n",
+                crate::ssh::sanitize(destination)
+            );
+            self.end_host();
+            self.show(&text);
+            self.ask_destination();
+            return;
+        };
+        self.connect_to(target, &env);
+    }
+
+    fn connect_to(&mut self, target: Target, env: &Env) {
+        self.end_host();
+        self.pane.term.scroll_to_bottom();
+        if !self.ensure_worker() || !self.ensure_broker() {
+            self.refresh();
+            return;
+        }
+        if !self.sandbox {
+            self.show(
+                "\x1b[0;31mThe SSH worker runs without its sandbox (--no-sandbox).\x1b[0m\r\n",
+            );
+        }
+        let channel = self.next_channel;
+        self.next_channel = self.next_channel.wrapping_add(1).max(1);
+        self.set_title_text(&format!("{} - {APP_NAME}", target.label()));
+        let mut session = SshSession::new(channel, target, env.known_hosts());
+        let (cols, rows) = (self.pane.term.cols(), self.pane.term.rows());
+        let clamp = |v: usize| u16::try_from(v).unwrap_or(u16::MAX);
+        let effects = session.start(clamp(cols), clamp(rows));
+        self.pane.host = Host::Ssh(Box::new(session));
+        self.apply(effects);
+        self.refresh();
+    }
+
+    /// Connects again to the pane's host, or asks for one.
+    fn reconnect(&mut self) {
+        match &self.pane.host {
+            Host::Ssh(s) => {
+                let target = s.target.clone();
+                self.connect_to(target, &ssh_env());
+            }
+            Host::Local { .. } => self.start_shell(),
+            Host::Ask(_) => {}
+        }
+    }
+
+    /// Carries out what the SSH session decided.
+    fn apply(&mut self, effects: Vec<Effect>) {
+        for effect in effects {
+            match effect {
+                Effect::Send(msg) => {
+                    if let Some(w) = &self.worker {
+                        w.link.send(msg);
+                    }
+                }
+                Effect::Show(text) => self.show(&text),
+                Effect::Output(bytes) => {
+                    self.pane.term.feed(&bytes);
+                    self.log(&bytes);
+                }
+                Effect::Broker(job) => {
+                    if let Some(b) = &self.broker {
+                        b.submit(job);
+                    }
+                }
+                Effect::Connected => self.start_log(),
+                Effect::Ended => self.stop_log(),
+            }
+        }
+    }
+
+    /// Opens the tab's log if logging is on and the pane has a host.
+    fn start_log(&mut self) {
+        if !self.pane.log.enabled || self.pane.log.writer.is_some() {
+            return;
+        }
+        let label = match &self.pane.host {
+            Host::Ssh(s) if s.state() == State::Connected => s.target.label(),
+            Host::Local { exited: false, .. } => "local".to_owned(),
+            _ => return,
+        };
+        let host = label.rsplit('@').next().unwrap_or(&label).to_owned();
+        let dir = log_dir();
+        let base = log_file_name(&host, 1, local_time());
+        let opened = std::fs::create_dir_all(&dir).and_then(|()| {
+            // Never overwrite: a second log in the same minute gets a number.
+            let mut n = 1;
+            loop {
+                let name = if n == 1 {
+                    base.clone()
+                } else {
+                    base.replace(".log", &format!("-{n}.log"))
+                };
+                let path = dir.join(name);
+                match std::fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(&path)
+                {
+                    Ok(f) => return Ok((f, path)),
+                    Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists && n < 100 => n += 1,
+                    Err(e) => return Err(e),
+                }
+            }
+        });
+        let header = format!("FeroSSH log of {label}, started {}", timestamp());
+        match opened
+            .and_then(|(f, path)| Ok((LogWriter::new(f, self.pane.log.raw, &header)?, path)))
         {
-            shell.write(bytes);
+            Ok((writer, path)) => {
+                self.show(&format!(
+                    "\x1b[0;90mLogging to {}\x1b[0m\r\n",
+                    path.display()
+                ));
+                self.pane.log.writer = Some(writer);
+                self.pane.log.path = Some(path);
+            }
+            Err(e) => {
+                self.show(&format!(
+                    "\x1b[0;31mCould not open a log file in {}: {e}\x1b[0m\r\n",
+                    dir.display()
+                ));
+                self.pane.log.enabled = false;
+                self.update_menu_checks();
+            }
+        }
+    }
+
+    fn stop_log(&mut self) {
+        if let Some(writer) = self.pane.log.writer.take() {
+            let _ = writer.finish(&format!("Log ended {}", timestamp()));
+        }
+    }
+
+    fn log(&mut self, bytes: &[u8]) {
+        let Some(writer) = &mut self.pane.log.writer else {
+            return;
+        };
+        if let Err(e) = writer.write(bytes) {
+            self.pane.log.writer = None;
+            self.pane.log.enabled = false;
+            self.show(&format!("\r\n\x1b[0;31mLogging stopped: {e}\x1b[0m\r\n"));
+            self.update_menu_checks();
+        }
+    }
+
+    /// Sends the terminal's answers and other non-user bytes to the host.
+    /// They never go into a local prompt.
+    fn send(&mut self, bytes: Vec<u8>) {
+        match &mut self.pane.host {
+            Host::Local {
+                shell: Some(shell),
+                exited: false,
+            } => shell.write(bytes),
+            Host::Ssh(session) if !session.prompt_active() => {
+                let effects = session.input(&bytes);
+                self.apply(effects);
+            }
+            _ => {}
         }
     }
 
     /// Sends what the user typed or pasted; brings the view to the bottom.
+    /// Local prompts, the connect prompt and "Press Enter to reconnect"
+    /// take it first.
     fn input(&mut self, bytes: Vec<u8>) {
-        if self.pane.exited {
-            return;
-        }
         if self.pane.term.display_offset() != 0 {
             self.pane.term.scroll_to_bottom();
             self.refresh();
         }
-        self.send(bytes);
+        let enter = matches!(bytes.as_slice(), b"\r" | b"\r\n" | b"\n");
+        match &mut self.pane.host {
+            Host::Local { exited: true, .. } => {
+                if enter {
+                    self.start_shell();
+                }
+            }
+            Host::Local { .. } => self.send(bytes),
+            Host::Ask(text) => {
+                if enter {
+                    let destination = std::mem::take(text);
+                    self.show("\r\n");
+                    if destination.trim().is_empty() {
+                        self.show(CONNECT_PROMPT);
+                    } else {
+                        self.connect(destination.trim());
+                    }
+                } else if let [0x7f] | [0x08] = bytes.as_slice() {
+                    if text.pop().is_some() {
+                        self.show("\x08 \x08");
+                    }
+                } else if !bytes.starts_with(&[0x1b]) {
+                    let typed: String = String::from_utf8_lossy(&bytes)
+                        .chars()
+                        .filter(|c| !c.is_control())
+                        .collect();
+                    text.push_str(&typed);
+                    self.show(&typed);
+                }
+                self.refresh();
+            }
+            Host::Ssh(session) if session.prompt_active() => {
+                let effects = session.prompt_input(&bytes);
+                self.apply(effects);
+                self.refresh();
+            }
+            Host::Ssh(session) if session.state() == State::Ended => {
+                if enter {
+                    self.reconnect();
+                }
+            }
+            Host::Ssh(_) => self.send(bytes),
+        }
     }
 
-    /// Reads waiting shell output into the terminal.
+    /// Pastes into a local prompt; `false` if no prompt is open and the
+    /// paste goes to the host.
+    fn paste_local(&mut self, text: &str) -> bool {
+        match &mut self.pane.host {
+            Host::Ssh(session) if session.prompt_active() => {
+                let effects = session.prompt_paste(text);
+                self.apply(effects);
+            }
+            Host::Ask(typed) => {
+                let clean: String = text.chars().filter(|c| !c.is_control()).collect();
+                typed.push_str(&clean);
+                self.show(&clean);
+            }
+            _ => return false,
+        }
+        self.refresh();
+        true
+    }
+
+    /// Reads what the shell, the worker and the broker have queued.
     fn on_output(&mut self) -> Vec<Command> {
         self.output_pending.store(false, Ordering::Release);
         let mut fed = 0;
-        while let Some(out) = self.pane.shell.as_ref().and_then(Shell::try_read) {
+        let mut more = false;
+        // The local shell.
+        while let Host::Local {
+            shell: Some(shell),
+            exited: false,
+        } = &self.pane.host
+        {
+            let Some(out) = shell.try_read() else {
+                break;
+            };
             match out {
                 Output::Data(data) => {
                     fed += data.len();
                     self.pane.term.feed(&data);
+                    self.log(&data);
                 }
                 Output::Exited(code) => {
-                    self.pane.exited = true;
+                    self.stop_log();
+                    self.pane.host = Host::Local {
+                        shell: None,
+                        exited: true,
+                    };
                     let text = format!(
                         "\r\n\x1b[0;90m[Process exited with code {code}. Press Enter to start a new one.]\x1b[0m\r\n"
                     );
-                    self.pane.term.feed(text.as_bytes());
+                    self.show(&text);
                 }
             }
             if fed >= OUTPUT_BUDGET {
-                // Let the window paint, then carry on.
-                if !self.output_pending.swap(true, Ordering::AcqRel) {
-                    // SAFETY: posting to our own window.
-                    unsafe {
-                        let _ =
-                            PostMessageW(Some(self.hwnd), WM_SHELL_OUTPUT, WPARAM(0), LPARAM(0));
+                more = true;
+                break;
+            }
+        }
+        // The signing broker.
+        while let Some(reply) = self.broker.as_ref().and_then(Broker::try_recv) {
+            if let Host::Ssh(session) = &mut self.pane.host {
+                let effects = session.on_broker(reply);
+                self.apply(effects);
+            }
+        }
+        // The worker.
+        while !more {
+            let Some(event) = self.worker.as_ref().and_then(|w| w.link.try_recv()) else {
+                break;
+            };
+            match event {
+                LinkEvent::Message(msg) => {
+                    if let Message::Data { bytes, .. } = &msg {
+                        fed += bytes.len();
+                    }
+                    if let Host::Ssh(session) = &mut self.pane.host
+                        && msg.channel() == Some(session.channel)
+                    {
+                        let effects = session.on_worker(msg);
+                        self.apply(effects);
                     }
                 }
-                break;
+                LinkEvent::Closed(why) => {
+                    self.worker = None;
+                    if let Host::Ssh(session) = &mut self.pane.host
+                        && matches!(session.state(), State::Connecting | State::Connected)
+                    {
+                        let effects = session.on_worker(Message::Disconnected {
+                            channel: session.channel,
+                            reason: why,
+                        });
+                        self.apply(effects);
+                    }
+                }
+            }
+            more = fed >= OUTPUT_BUDGET;
+        }
+        if more && !self.output_pending.swap(true, Ordering::AcqRel) {
+            // Let the window paint, then carry on.
+            // SAFETY: posting to our own window.
+            unsafe {
+                let _ = PostMessageW(Some(self.hwnd), WM_SHELL_OUTPUT, WPARAM(0), LPARAM(0));
             }
         }
         self.after_feed()
@@ -625,8 +1089,18 @@ impl Window {
         let rows = ((h - 2 * pad).max(0) / m.height.max(1) as i32).max(1) as usize;
         self.pane.term.resize(cols, rows);
         self.pane.term.set_cell_size(m.width, m.height);
-        if let Some(shell) = &self.pane.shell {
-            shell.resize(self.pane.term.cols(), self.pane.term.rows());
+        let (cols, rows) = (self.pane.term.cols(), self.pane.term.rows());
+        match &self.pane.host {
+            Host::Local {
+                shell: Some(shell), ..
+            } => shell.resize(cols, rows),
+            Host::Ssh(session) => {
+                let clamp = |v: usize| u16::try_from(v).unwrap_or(u16::MAX);
+                if let Some(effect) = session.resize(clamp(cols), clamp(rows)) {
+                    self.apply(vec![effect]);
+                }
+            }
+            _ => {}
         }
         self.refresh();
         self.request_full_redraw();
@@ -746,12 +1220,6 @@ impl Window {
         }
         if let Some(key) = terminal_key(vk) {
             drop_pending_char(self.hwnd);
-            if self.pane.exited {
-                if key == Key::Enter {
-                    self.start_shell();
-                }
-                return KeyOutcome::Handled;
-            }
             if let Some(bytes) = self.pane.term.key(key, mods) {
                 self.input(bytes);
             }
@@ -1004,7 +1472,41 @@ impl Window {
             cmd::HIDE_MENU => return Some(Command::SetMenuVisible(!self.menu_visible)),
             cmd::COPY => return Some(Command::Copy),
             cmd::PASTE => return Some(Command::Paste),
+            cmd::REPLACE_KEY => return Some(Command::ReplaceHostKey),
             cmd::RESTART_SHELL => self.start_shell(),
+            cmd::CONNECT => self.ask_destination(),
+            cmd::RECONNECT => self.reconnect(),
+            cmd::DISCONNECT => {
+                if let Host::Ssh(session) = &mut self.pane.host
+                    && matches!(session.state(), State::Connecting | State::Connected)
+                {
+                    let effects = session.close();
+                    self.apply(effects);
+                    self.stop_log();
+                    self.show("\r\n\x1b[0;90m[Disconnected. Press Enter to reconnect.]\x1b[0m\r\n");
+                    self.refresh();
+                }
+            }
+            cmd::LOG_TOGGLE => {
+                self.pane.log.enabled = !self.pane.log.enabled;
+                if self.pane.log.enabled {
+                    self.start_log();
+                } else {
+                    self.stop_log();
+                    if let Some(path) = &self.pane.log.path {
+                        let text = format!("\x1b[0;90mLog saved to {}\x1b[0m\r\n", path.display());
+                        self.show(&text);
+                    }
+                }
+                self.update_menu_checks();
+                self.refresh();
+            }
+            cmd::LOG_RAW => {
+                // Takes effect for the next log file.
+                self.pane.log.raw = !self.pane.log.raw;
+                self.update_menu_checks();
+            }
+            cmd::LOG_FOLDER => return Some(Command::OpenFolder(log_dir())),
             cmd::ZOOM_IN => self.set_font(self.pane.font.zoomed(1)),
             cmd::ZOOM_OUT => self.set_font(self.pane.font.zoomed(-1)),
             cmd::ZOOM_RESET => {
@@ -1098,6 +1600,16 @@ impl Window {
                 cmd::RIGHT_CLICK_PASTE,
                 (MF_BYCOMMAND | check(self.options.right_click_paste)).0,
             );
+            CheckMenuItem(
+                self.menu,
+                cmd::LOG_TOGGLE,
+                (MF_BYCOMMAND | check(self.pane.log.enabled)).0,
+            );
+            CheckMenuItem(
+                self.menu,
+                cmd::LOG_RAW,
+                (MF_BYCOMMAND | check(self.pane.log.raw)).0,
+            );
         }
     }
 
@@ -1154,6 +1666,8 @@ fn shortcut(vk: VIRTUAL_KEY, m: Mods) -> Option<u32> {
             v if v == key(b'C') && m.shift => Some(cmd::COPY),
             v if v == key(b'V') && m.shift => Some(cmd::PASTE),
             v if v == key(b'F') && m.shift => Some(cmd::FIND),
+            v if v == key(b'N') && m.shift => Some(cmd::CONNECT),
+            v if v == key(b'R') && m.shift => Some(cmd::RECONNECT),
             VK_INSERT if !m.shift => Some(cmd::COPY),
             VK_HOME if m.shift => Some(cmd::SCROLL_TOP),
             VK_END if m.shift => Some(cmd::SCROLL_BOTTOM),
@@ -1186,6 +1700,9 @@ enum Command {
     OpenLink(String),
     SetTitle(Option<String>),
     Bell,
+    /// Session > Replace host key: two confirmations, then replace.
+    ReplaceHostKey,
+    OpenFolder(PathBuf),
 }
 
 /// A modal message box; `None` if another one is already open.
@@ -1238,6 +1755,9 @@ fn run_command(hwnd: HWND, command: Command) {
             let Some(text) = clipboard::get_text(hwnd) else {
                 return;
             };
+            if with_window(|w| w.paste_local(&text)) != Some(false) {
+                return;
+            }
             let Some(paste) = with_window(|w| w.pane.term.paste(&text)) else {
                 return;
             };
@@ -1302,6 +1822,21 @@ fn run_command(hwnd: HWND, command: Command) {
             // SAFETY: our window and a valid string.
             let _ = unsafe { SetWindowTextW(hwnd, &HSTRING::from(text)) };
         }
+        Command::ReplaceHostKey => replace_host_key(hwnd),
+        Command::OpenFolder(dir) => {
+            let _ = std::fs::create_dir_all(&dir);
+            // SAFETY: our own log folder handed to Explorer.
+            unsafe {
+                ShellExecuteW(
+                    Some(hwnd),
+                    w!("open"),
+                    &HSTRING::from(dir.as_os_str()),
+                    None,
+                    None,
+                    SW_SHOWNORMAL,
+                );
+            }
+        }
         Command::Bell => {
             let info = FLASHWINFO {
                 cbSize: std::mem::size_of::<FLASHWINFO>() as u32,
@@ -1314,6 +1849,61 @@ fn run_command(hwnd: HWND, command: Command) {
             let _ = unsafe { FlashWindowEx(&info) };
         }
     }
+}
+
+/// The changed-key screen's only way forward: replace the stored key,
+/// behind two confirmations, then reconnect.
+fn replace_host_key(hwnd: HWND) {
+    let info = with_window(|w| match &w.pane.host {
+        Host::Ssh(s) => s.changed_key().map(|k| {
+            let desc = ferossh_config::hostkey::describe(k)
+                .map(|d| format!("{} {}", d.kind, d.fingerprint))
+                .unwrap_or_default();
+            (s.target.hostname.clone(), desc)
+        }),
+        _ => None,
+    })
+    .flatten();
+    let Some((host, fingerprint)) = info else {
+        dialog(
+            hwnd,
+            "There is no changed host key to replace. This is only needed after FeroSSH \
+             refused a connection because a host key changed.",
+            MB_OK | MB_ICONWARNING,
+        );
+        return;
+    };
+    let first = format!(
+        "Replace the stored host key of {host}?\n\nThe server now offers:\n{fingerprint}\n\n\
+         Only do this if you have checked this fingerprint with the server's administrator \
+         or on the server's console. If the key changed unexpectedly, someone may be \
+         intercepting the connection."
+    );
+    if dialog(hwnd, &first, MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2) != Some(IDYES) {
+        return;
+    }
+    let second = format!(
+        "Are you sure? FeroSSH will forget every stored key of {host} and trust\n{fingerprint}\n\n\
+         from now on."
+    );
+    if dialog(hwnd, &second, MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2) != Some(IDYES) {
+        return;
+    }
+    with_window(|w| {
+        let result = match &mut w.pane.host {
+            Host::Ssh(s) => s.replace_host_key(),
+            _ => Ok(()),
+        };
+        match result {
+            Ok(()) => w.reconnect(),
+            Err(e) => {
+                w.show(&format!(
+                    "\x1b[0;31mCould not update known_hosts: {e}\x1b[0m\r\n"
+                ));
+                w.refresh();
+            }
+        }
+    });
 }
 
 fn loword(v: usize) -> u32 {
@@ -1470,7 +2060,9 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                 LRESULT(0)
             }
             WM_DESTROY => {
-                // Dropping the window closes the shell's console.
+                // Dropping the window closes the shell's console, finishes
+                // the log and closes the worker's job, which ends it.
+                with_window(Window::end_host);
                 let window =
                     WINDOW.with(|cell| cell.try_borrow_mut().ok().and_then(|mut w| w.take()));
                 drop(window);

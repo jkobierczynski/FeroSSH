@@ -4,14 +4,29 @@
 
 FeroSSH aims to be the smallest, most secure open-source SSH client for Windows: a native PuTTY replacement with tabs, splits, tmux integration and file transfer, shipped as one signed exe with nothing to install.
 
-> **Status:** milestone 2 (terminal emulation). The exe opens one terminal pane on a local shell through ConPTY, so the emulator, keyboard and mouse handling can be used for real; the first SSH session arrives in milestone 3.
+> **Status:** milestone 3 (real SSH in one tab). FeroSSH connects with russh from a sandboxed worker process, checks host keys against `~/.ssh/known_hosts`, and signs in with the Windows OpenSSH agent, Pageant, key files, keyboard-interactive or a password. Tabs arrive in milestone 4.
 
-## Trying the milestone 2 build
+## Trying the milestone 3 build
 
-Download `ferossh-exe` from the latest CI run and start `ferossh.exe`. It runs `cmd.exe`; give it a command to run something else, for example `ferossh.exe wsl` or `ferossh.exe ssh myhost` (Windows OpenSSH), which is the easiest way to try vim, htop, tmux or vttest before milestone 3.
+Download `ferossh-exe` from the latest CI run and start it with a host, or without one to be asked:
+
+```
+ferossh.exe [user@]host[:port]
+ferossh.exe -l user -p 2222 host
+ferossh.exe myalias            # a Host from ~/.ssh/config
+ferossh.exe --local [command]  # a local shell, as in milestone 2
+```
+
+`HostName`, `User`, `Port` and `IdentityFile` are read from `~/.ssh/config`.
+
+- **Host keys.** A new host shows its SHA-256 fingerprint and randomart, and you type `yes` to trust it; the key is saved hashed to `known_hosts`. A changed key fills the window with a warning and cannot be bypassed: if you know why it changed, use Session > Replace host key..., which asks twice.
+- **Sign-in.** Keys are tried from the OpenSSH agent first, then Pageant, then key files (`id_ed25519` and `id_ecdsa` unless the config names others). Key files may be Ed25519 or ECDSA P-256, encrypted or not; the passphrase is asked in the terminal and never kept. RSA keys work only through an agent, need 3072 bits or more, and sign with SHA-2. Then keyboard-interactive (one-time codes) and passwords.
+- **Sandbox.** The worker that talks to the network runs in an AppContainer with network access only: it cannot read your files or keys, and asks the window for every signature. Windows does not let AppContainers reach 127.0.0.1, so use `--no-sandbox` for SSH servers on the same machine.
+- **Logs.** Session > Log to file writes what the host sends to `%LOCALAPPDATA%\FeroSSH\logs`, one file per tab named by host, tab and time (`host_tab1_2026-10-24_2215.log`). Plain logs keep the readable text; Session > Log raw output keeps every byte. Passwords and passphrases never reach the log.
 
 | Shortcut | Action |
 | --- | --- |
+| Ctrl+Shift+N / Ctrl+Shift+R | Connect to another host, reconnect |
 | Ctrl+Shift+C / Ctrl+Shift+V | Copy the selection, paste (also Ctrl+Insert / Shift+Insert) |
 | Ctrl+Shift+F | Find in scrollback (Enter: older match, Shift+Enter: newer, Esc: close) |
 | Shift+PgUp / Shift+PgDn | Scroll back a page, forward a page (Ctrl+Shift+Home/End: top, bottom) |
@@ -27,7 +42,7 @@ Edit > Copy on select and Edit > Right-click pastes turn on the PuTTY habits; bo
 
 ### Colour themes
 
-Built in: Nord (the default), Dracula, Catppuccin Mocha, Gruvbox Dark, Solarized Dark, Tokyo Night, One Dark, Monokai, Rosé Pine, Everforest, Campbell and One Half Light, plus two warning themes: **Production** (muted red background, red cursor) and **Staging** (amber). `ferossh.exe --theme Production ssh prod-db` opens a pane in a given theme, which is handy for desktop shortcuts until session profiles arrive.
+Built in: Nord (the default), Dracula, Catppuccin Mocha, Gruvbox Dark, Solarized Dark, Tokyo Night, One Dark, Monokai, Rosé Pine, Everforest, Campbell and One Half Light, plus two warning themes: **Production** (muted red background, red cursor) and **Staging** (amber). `ferossh.exe --theme Production prod-db` opens a session in a given theme, which is handy for desktop shortcuts until session profiles arrive.
 
 From milestone 4, the theme follows the host automatically: a host tagged `production`, `staging` or `development` with ssh_config's `Tag` keyword gets Production, Staging or Nord, and your own rules can match host patterns (`*.prod.example.com !prod-sandbox`) or tags, with an optional red or amber tint over any theme. The palettes are the themes' published terminal colours; all are MIT licensed except Tokyo Night's terminal port (Apache-2.0).
 
@@ -63,7 +78,7 @@ cargo build --release -p ferossh
 
 The release profile optimises for size and links the C runtime statically, so `target\release\ferossh.exe` runs on a clean Windows 10 1903+ machine.
 
-Checks run in CI: `cargo fmt`, `cargo clippy`, `cargo test`, `cargo deny`, `cargo audit`, and fuzz smoke runs of the IPC decoder and the terminal (`cargo +nightly fuzz run --target x86_64-unknown-linux-gnu term_feed`).
+Checks run in CI: `cargo fmt`, `cargo clippy`, `cargo test`, `cargo deny`, `cargo audit`, SSH tests against a real OpenSSH server on Linux (`cargo test -p ferossh-worker --test sshd`, skipped where `sshd` is not installed), and fuzz smoke runs of the IPC decoder and the terminal (`cargo +nightly fuzz run --target x86_64-unknown-linux-gnu term_feed`).
 
 On Linux or macOS, `cargo run -p ferossh-term --example vttest -- 1 2 8` drives [vttest](https://invisible-island.net/vttest/) through the emulator and prints every screen as text.
 
