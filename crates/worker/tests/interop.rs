@@ -657,11 +657,14 @@ async fn sftp_edge_cases() {
         assert_eq!(read("x_y").as_deref(), Some("pipe"), "{name}: {names:?}");
         assert_eq!(read("sub/inner.txt").as_deref(), Some("inside"), "{name}");
         // "a:b" and "a_b" both become a_b, and README and readme are one
-        // name to Windows: neither may be lost or asked about.
-        for (pair, texts) in [
-            (["a_b", "a_b (2)"], ["colon", "under"]),
-            (["README", "readme (2)"], ["readme", "lower"]),
-        ] {
+        // name to Windows: neither may be lost or asked about. Which of
+        // each pair gets the " (2)" depends on the server's listing order.
+        for (stem, texts) in [("a_b", ["colon", "under"]), ("readme", ["readme", "lower"])] {
+            let pair: Vec<&String> = names
+                .iter()
+                .filter(|n| n.to_lowercase().starts_with(stem))
+                .collect();
+            assert_eq!(pair.len(), 2, "{name}: {names:?}");
             let mut got: Vec<String> = pair.iter().filter_map(|n| read(n)).collect();
             got.sort();
             let mut want = texts.map(str::to_owned).to_vec();
