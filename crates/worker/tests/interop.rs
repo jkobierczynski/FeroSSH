@@ -245,6 +245,7 @@ async fn connect(port: u16, key: &KeyFile, command: &str) -> Outcome {
         cols: 80,
         rows: 24,
         host_key_algs: vec![],
+        x11: None,
     })
     .await;
     let mut seen = Outcome::default();
