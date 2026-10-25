@@ -9,7 +9,14 @@ repository.workspace = true
 publish.workspace = true
 
 [dependencies]
+ferossh-ipc.workspace = true
 russh.workspace = true
+tokio = { version = "1.54", features = ["rt", "net", "time", "sync", "macros"] }
+
+
+[dev-dependencies]
+ferossh-auth.workspace = true
+tokio = { version = "1.54", features = ["rt", "macros", "time"] }
 
 [lints]
 workspace = true

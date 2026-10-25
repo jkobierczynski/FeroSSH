@@ -9,6 +9,12 @@ repository.workspace = true
 publish.workspace = true
 
 [dependencies]
+russh.workspace = true
+tokio = { version = "1.54", features = ["rt", "net", "time"] }
+zeroize = "1.9"
+
+[dev-dependencies]
+getrandom = { version = "0.4", features = ["sys_rng"] }
 
 [lints]
 workspace = true

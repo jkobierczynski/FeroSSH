@@ -34,6 +34,21 @@ jobs:
           name: ferossh-exe
           path: target/release/ferossh.exe
 
+  sshd:
+    name: SSH tests against OpenSSH (Linux)
+    runs-on: ubuntu-latest
+    env:
+      FEROSSH_REQUIRE_SSHD: 1
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup show active-toolchain
+      # The worker and the window's SSH path log in to a throwaway sshd on
+      # 127.0.0.1; without sshd these tests skip, so install it.
+      - run: sudo apt-get update && sudo apt-get install -y openssh-server
+      - run: sudo mkdir -p /run/sshd
+      - run: cargo test --locked -p ferossh-worker --test sshd
+      - run: cargo test --locked -p ferossh ssh_e2e
+
   deny:
     name: cargo deny
     runs-on: ubuntu-latest

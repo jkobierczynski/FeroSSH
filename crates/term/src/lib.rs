@@ -15,14 +15,18 @@
 //!   host-chosen text (title reports, DECRQSS, clipboard reads) is
 //!   answered.
 //!
+//! [`LogWriter`] writes a tab's session log, as plain text or raw bytes.
+//!
 //! It also encodes keys and mouse events the way xterm does, honouring the
 //! modes the host has set. Everything here is platform-neutral and tested
 //! on any host.
 
 mod input;
+mod log;
 mod sanitize;
 mod terminal;
 
 pub use input::{Key, Mods, MouseButton, MouseEvent};
+pub use log::{LogWriter, log_file_name};
 pub use sanitize::{Paste, check_link, clipboard_preview, prepare_paste, sanitize_title};
 pub use terminal::{Action, SelectionKind, Settings, Terminal};

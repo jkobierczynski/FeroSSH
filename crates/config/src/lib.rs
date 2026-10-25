@@ -1,3 +1,8 @@
-//! ssh_config parser, known_hosts and PuTTY import.
+//! `ssh_config` parser, known_hosts and PuTTY import.
 //!
-//! Placeholder until its milestone; see the architecture plan.
+//! Everything here runs in the UI process, which owns the user's files; the
+//! sandboxed worker never reads them.
+
+pub mod hostkey;
+pub mod known_hosts;
+pub mod ssh_config;
