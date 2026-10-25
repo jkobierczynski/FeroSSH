@@ -98,15 +98,26 @@ pub fn key_type(alg: &Algorithm) -> &'static str {
     }
 }
 
+/// The pseudo key type the UI lists in `known_types` when known_hosts has
+/// an `@cert-authority` line for the host.
+pub const CERT_AUTHORITY: &str = "@cert-authority";
+
 /// [`preferred`] with the host key algorithms for `known_types` (the key
 /// types known_hosts lists for the host) moved to the front, so a server
-/// with several host keys presents the one already trusted. Nothing outside
-/// the policy can be added.
+/// with several host keys presents the one already trusted. With
+/// [`CERT_AUTHORITY`] among them, host certificates of the same
+/// algorithms are asked for first. Nothing outside the policy can be added.
 pub fn preferred_for(known_types: &[String]) -> Preferred {
     let mut keys: Vec<Algorithm> = HOST_KEYS.to_vec();
     keys.sort_by_key(|a| !known_types.iter().any(|t| t == key_type(a)));
+    let certificates = if known_types.iter().any(|t| t == CERT_AUTHORITY) {
+        Cow::Borrowed(HOST_KEYS)
+    } else {
+        Cow::Borrowed(&[][..])
+    };
     Preferred {
         key: Cow::Owned(keys),
+        host_key_certificates: certificates,
         ..preferred()
     }
 }
@@ -143,9 +154,15 @@ pub fn with_legacy(p: Preferred) -> Preferred {
     let (algs, markers): (Vec<_>, Vec<_>) = p.kex.iter().cloned().partition(|k| {
         *k != kex::EXTENSION_SUPPORT_AS_CLIENT && *k != kex::EXTENSION_OPENSSH_STRICT_KEX_AS_CLIENT
     });
+    let certificates = if p.host_key_certificates.is_empty() {
+        p.host_key_certificates.clone()
+    } else {
+        Cow::Owned(add(&p.host_key_certificates, LEGACY_HOST_KEYS))
+    };
     Preferred {
         kex: Cow::Owned([algs, LEGACY_KEX.to_vec(), markers].concat()),
         key: Cow::Owned(add(&p.key, LEGACY_HOST_KEYS)),
+        host_key_certificates: certificates,
         cipher: Cow::Owned(add(&p.cipher, LEGACY_CIPHERS)),
         mac: Cow::Owned(add(&p.mac, LEGACY_MACS)),
         ..p
@@ -291,6 +308,24 @@ mod tests {
             p.mac
                 .iter()
                 .all(|m| !m.as_ref().ends_with("-etm@openssh.com"))
+        );
+    }
+
+    #[test]
+    fn certificates_only_with_a_cert_authority() {
+        assert!(
+            preferred_for(&["ssh-ed25519".into()])
+                .host_key_certificates
+                .is_empty()
+        );
+        let p = preferred_for(&[CERT_AUTHORITY.into()]);
+        assert_eq!(&p.host_key_certificates[..], HOST_KEYS);
+        assert!(with_legacy(preferred()).host_key_certificates.is_empty());
+        let legacy = with_legacy(p);
+        assert!(
+            LEGACY_HOST_KEYS
+                .iter()
+                .all(|a| legacy.host_key_certificates.contains(a))
         );
     }
 

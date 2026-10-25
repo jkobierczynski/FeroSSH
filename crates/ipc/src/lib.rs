@@ -40,7 +40,7 @@ use std::fmt;
 use zeroize::Zeroize;
 
 /// Protocol version carried in every frame. Bump on any wire change.
-pub const PROTOCOL_VERSION: u8 = 6;
+pub const PROTOCOL_VERSION: u8 = 7;
 
 /// Largest frame body accepted, in bytes. Terminal and SFTP data is chunked
 /// below this, so anything larger is a bug or an attack.
@@ -354,6 +354,24 @@ pub enum Message {
     /// The server's host key (SSH wire format), for the UI to check against
     /// known_hosts. The worker waits for a [`Message::HostKeyVerdict`].
     HostKey { channel: ChannelId, key: Vec<u8> },
+    /// The server proved its identity with a host certificate whose CA
+    /// signature, type and algorithms the worker has checked. The UI
+    /// decides whether `ca` is trusted for this host (known_hosts
+    /// `@cert-authority`), and checks the principals, validity and
+    /// revocation; the worker waits for a [`Message::HostKeyVerdict`].
+    HostCert {
+        channel: ChannelId,
+        /// The CA's public key, SSH wire format.
+        ca: Vec<u8>,
+        /// The certified host key, SSH wire format.
+        key: Vec<u8>,
+        principals: Vec<String>,
+        /// Seconds since the Unix epoch.
+        valid_after: u64,
+        valid_before: u64,
+        key_id: String,
+        serial: u64,
+    },
     /// The server's pre-login banner.
     Banner { channel: ChannelId, text: String },
     /// The server accepts public keys: which ones does the UI have?
@@ -494,6 +512,7 @@ impl Message {
             Message::ForwardIncoming { .. } => 27,
             Message::Window { .. } => 28,
             Message::Eof { .. } => 29,
+            Message::HostCert { .. } => 30,
         }
     }
 
@@ -510,6 +529,7 @@ impl Message {
             | Message::Signature { channel, .. }
             | Message::Answers { channel, .. }
             | Message::HostKey { channel, .. }
+            | Message::HostCert { channel, .. }
             | Message::Banner { channel, .. }
             | Message::IdentitiesRequest { channel }
             | Message::SignRequest { channel, .. }
@@ -809,6 +829,25 @@ pub fn encode(msg: &Message, out: &mut Vec<u8>) -> Result<(), Error> {
         Message::HostKey { channel, key } => {
             w.u32(*channel);
             w.bytes(key);
+        }
+        Message::HostCert {
+            channel,
+            ca,
+            key,
+            principals,
+            valid_after,
+            valid_before,
+            key_id,
+            serial,
+        } => {
+            w.u32(*channel);
+            w.bytes(ca);
+            w.bytes(key);
+            w.list(principals, |w, s| w.str(s));
+            w.u64(*valid_after);
+            w.u64(*valid_before);
+            w.str(key_id);
+            w.u64(*serial);
         }
         Message::Banner { channel, text }
         | Message::Notice { channel, text }
@@ -1165,6 +1204,16 @@ fn decode_body(body: &[u8]) -> Result<Message, Error> {
             bytes: r.u32()?,
         },
         29 => Message::Eof { channel: r.u32()? },
+        30 => Message::HostCert {
+            channel: r.u32()?,
+            ca: r.bytes()?.to_vec(),
+            key: r.bytes()?.to_vec(),
+            principals: r.list(Reader::string)?,
+            valid_after: r.u64()?,
+            valid_before: r.u64()?,
+            key_id: r.string()?,
+            serial: r.u64()?,
+        },
         tag => return Err(Error::Tag(tag)),
     };
     match r.0.len() {
@@ -1420,6 +1469,16 @@ mod tests {
                 channel: 1,
                 key: vec![0; 51],
             },
+            Message::HostCert {
+                channel: 1,
+                ca: vec![1; 51],
+                key: vec![2; 51],
+                principals: vec!["host.example.org".into(), "10.0.0.1".into()],
+                valid_after: 0,
+                valid_before: u64::MAX,
+                key_id: "host-key".into(),
+                serial: 7,
+            },
             Message::Banner {
                 channel: 1,
                 text: "Authorised users only\n".into(),
@@ -1634,7 +1693,7 @@ mod tests {
         let mut tags: Vec<u8> = samples().iter().map(Message::tag).collect();
         tags.sort_unstable();
         tags.dedup();
-        assert_eq!(tags, (0..=29).collect::<Vec<u8>>());
+        assert_eq!(tags, (0..=30).collect::<Vec<u8>>());
     }
 
     #[test]

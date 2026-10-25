@@ -33,6 +33,8 @@ struct Server {
     child: Child,
     host_key: Vec<u8>,
     user_key: PathBuf,
+    /// The CA that signed the host certificate, if the server has one.
+    ca_key: Option<Vec<u8>>,
 }
 
 impl Drop for Server {
@@ -81,6 +83,17 @@ fn available() -> bool {
 
 /// Starts sshd with `extra` appended to a minimal config.
 fn start(name: &str, extra: &str) -> Server {
+    start_full(name, extra, None)
+}
+
+/// Like [`start`], with a host certificate for `principals` signed by a
+/// fresh CA (`ssh-keygen -s -h -n principals`), valid for `validity`
+/// (`-V`).
+fn start_with_cert(name: &str, principals: &str, validity: &str) -> Server {
+    start_full(name, "", Some((principals, validity)))
+}
+
+fn start_full(name: &str, extra: &str, cert: Option<(&str, &str)>) -> Server {
     let dir = std::env::temp_dir().join(format!("ferossh-sshd-{name}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
@@ -89,6 +102,26 @@ fn start(name: &str, extra: &str) -> Server {
     keygen(&host, "ed25519");
     keygen(&user, "ed25519");
     std::fs::copy(user.with_extension("pub"), dir.join("authorized_keys")).unwrap();
+    let mut extra = extra.to_owned();
+    let mut ca_key = None;
+    if let Some((principals, validity)) = cert {
+        let ca = dir.join("ca_ed25519");
+        keygen(&ca, "ed25519");
+        let ok = Command::new("ssh-keygen")
+            .args(["-q", "-h", "-I", "ferossh-test", "-z", "42", "-s"])
+            .arg(&ca)
+            .args(["-n", principals, "-V", validity])
+            .arg(host.with_extension("pub"))
+            .status()
+            .unwrap()
+            .success();
+        assert!(ok);
+        extra.push_str(&format!(
+            "\nHostCertificate {}\n",
+            dir.join("host_ed25519-cert.pub").display()
+        ));
+        ca_key = Some(public_blob(&ca));
+    }
     let port = TcpListener::bind("127.0.0.1:0")
         .unwrap()
         .local_addr()
@@ -121,6 +154,7 @@ fn start(name: &str, extra: &str) -> Server {
     Server {
         host_key: public_blob(&host),
         user_key: user,
+        ca_key,
         dir,
         port,
         child,
@@ -156,10 +190,17 @@ struct Seen {
     connected: Option<(String, String, String)>,
     disconnected: String,
     signed: usize,
+    /// A host certificate's CA, principals, key id and serial.
+    cert: Option<(Vec<u8>, Vec<String>, String, u64)>,
 }
 
 /// Plays the UI for one connection until the worker reports it is gone.
 async fn run_ui(server: &Server, command: &str, trust: bool) -> Seen {
+    run_ui_with(server, command, trust, vec![]).await
+}
+
+/// [`run_ui`] with the key types the UI's known_hosts lists for the host.
+async fn run_ui_with(server: &Server, command: &str, trust: bool, known: Vec<String>) -> Seen {
     let (to_worker, worker_in) = mpsc::channel(64);
     let (worker_out, mut from_worker) = mpsc::channel(64);
     tokio::spawn(ferossh_worker::serve(worker_in, worker_out));
@@ -180,7 +221,7 @@ async fn run_ui(server: &Server, command: &str, trust: bool) -> Seen {
         user: user.clone(),
         cols: 80,
         rows: 24,
-        host_key_algs: vec![],
+        host_key_algs: known,
         x11: None,
         legacy: false,
     })
@@ -197,6 +238,25 @@ async fn run_ui(server: &Server, command: &str, trust: bool) -> Seen {
             Message::Hello { version } => assert_eq!(version, PROTOCOL_VERSION),
             Message::HostKey { key, .. } => {
                 assert_eq!(key, server.host_key);
+                send(Message::HostKeyVerdict {
+                    channel: 1,
+                    accept: trust,
+                })
+                .await;
+            }
+            Message::HostCert {
+                ca,
+                key,
+                principals,
+                key_id,
+                serial,
+                valid_after,
+                valid_before,
+                ..
+            } => {
+                assert_eq!(key, server.host_key);
+                assert!(valid_after < valid_before);
+                seen.cert = Some((ca, principals, key_id, serial));
                 send(Message::HostKeyVerdict {
                     channel: 1,
                     accept: trust,
@@ -266,6 +326,36 @@ async fn logs_in_with_a_key_and_runs_a_shell() {
     );
     assert_eq!(cipher, "chacha20-poly1305@openssh.com");
     assert_eq!(host_key, "ssh-ed25519");
+}
+
+/// With a CA for the host in known_hosts, the server's host certificate
+/// comes to the UI to decide; without one, the plain key does.
+#[tokio::test]
+async fn host_certificates_when_a_cert_authority_is_known() {
+    if !available() {
+        return;
+    }
+    let server = start_with_cert("cert", "127.0.0.1,localhost", "-5m:+1h");
+    let known = vec![ferossh_worker::crypto_policy::CERT_AUTHORITY.to_owned()];
+    let seen = run_ui_with(&server, "echo fero$((6*7)); exit\n", true, known).await;
+    let (ca, principals, key_id, serial) = seen.cert.clone().expect("a host certificate");
+    assert_eq!(Some(ca), server.ca_key);
+    assert_eq!(principals, ["127.0.0.1", "localhost"]);
+    assert_eq!((key_id.as_str(), serial), ("ferossh-test", 42));
+    assert!(
+        String::from_utf8_lossy(&seen.output).contains("fero42"),
+        "{seen:?}"
+    );
+
+    let seen = run_ui(&server, "exit\n", true).await;
+    assert!(seen.cert.is_none());
+    assert!(seen.connected.is_some(), "{seen:?}");
+
+    // The UI's refusal stops the login.
+    let known = vec![ferossh_worker::crypto_policy::CERT_AUTHORITY.to_owned()];
+    let seen = run_ui_with(&server, "", false, known).await;
+    assert_eq!(seen.signed, 0);
+    assert!(seen.disconnected.contains("not accepted"), "{seen:?}");
 }
 
 #[tokio::test]
