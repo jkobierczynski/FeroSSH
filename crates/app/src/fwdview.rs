@@ -99,6 +99,9 @@ fn describe(f: &FwdView) -> String {
         FwdState::Listening(_) if f.open > 0 => text.push_str(&format!(" · {} open", f.open)),
         FwdState::Listening(_) => {}
     }
+    if f.desktop {
+        text.push_str(" · remote desktop");
+    }
     text
 }
 
@@ -368,6 +371,7 @@ mod tests {
                     total: 3,
                     streams: vec!["127.0.0.1:50000 → db:5432".into()],
                     error: None,
+                    desktop: false,
                 },
                 FwdView {
                     spec: spec("-R 9000:localhost:3000"),
@@ -376,6 +380,7 @@ mod tests {
                     total: 0,
                     streams: Vec::new(),
                     error: None,
+                    desktop: false,
                 },
                 FwdView {
                     spec: spec("-D 1080"),
@@ -384,6 +389,7 @@ mod tests {
                     total: 0,
                     streams: Vec::new(),
                     error: Some("x".into()),
+                    desktop: false,
                 },
             ],
             x11: Some(X11View {

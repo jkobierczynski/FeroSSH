@@ -19,6 +19,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use ferossh_auth::Broker;
+use ferossh_config::settings::DEFAULT_DESKTOP_PORT;
 use ferossh_config::{Settings, putty, ssh_config};
 use ferossh_forward::x11::{Display, find_cookie, xauth_entries};
 use ferossh_ipc::{ChannelId, DirEntry, FORWARD_IDS, Message, SftpReply, X11Auth};
@@ -83,7 +84,7 @@ use crate::Launch;
 use crate::clipboard;
 use crate::conpty::{self, Output, Shell};
 use crate::files::{FilesAction, FilesView};
-use crate::forwards::{ConnView, Forwarder, Setup as ForwardSetup};
+use crate::forwards::{ConnView, DesktopEvent, Forwarder, Setup as ForwardSetup, desktop_port_for};
 use crate::fwdview::{ForwardsView, FwdAction};
 use crate::layout::{self, Axis, Closed, Dir, Drop, PaneId, Rect, Workspace};
 use crate::link::{Link, LinkEvent};
@@ -196,6 +197,7 @@ mod cmd {
     pub const TMUX_DETACH: u32 = 611;
     pub const TMUX_PICK: u32 = 612;
     pub const TMUX_LAYOUT: u32 = 613;
+    pub const DESKTOP: u32 = 614;
     /// Plus the index in the session picker's list; the one past the
     /// last is "New session".
     pub const TMUX_SESSION: u32 = 800;
@@ -487,6 +489,9 @@ struct Window {
     /// Commands decided outside a handler that returns them; the next
     /// redraw runs them.
     queued: Vec<Command>,
+    /// Remote desktops asked for and not yet open: the pane that asked, by
+    /// connection.
+    desktops: HashMap<ChannelId, PaneId>,
 }
 
 thread_local! {
@@ -751,6 +756,7 @@ fn create_and_run(launch: Launch, theme: Option<String>) -> Result<()> {
                 tmux: HashMap::new(),
                 reattach: HashMap::new(),
                 queued: Vec::new(),
+                desktops: HashMap::new(),
             });
         });
         // Files dropped from Explorer are uploaded, after a confirmation.
@@ -863,6 +869,8 @@ fn build_menu() -> Result<HMENU> {
             cmd::TMUX_LAYOUT,
             "tmux: one &window per pane (own fonts)",
         )?;
+        separator(session)?;
+        item(session, cmd::DESKTOP, "Open remote &desktop\tCtrl+Shift+D")?;
 
         let edit = CreatePopupMenu()?;
         item(edit, cmd::COPY, "&Copy\tCtrl+Shift+C")?;
@@ -1700,6 +1708,70 @@ impl Window {
         }
     }
 
+    /// Session > Open remote desktop: asks the forwarding engine for a
+    /// tunnel to the host's RDP port; [`Self::desktop_events`] opens the
+    /// viewer once it listens.
+    fn open_desktop(&mut self, pane: PaneId) -> Option<Command> {
+        let host = self.host_pane(pane);
+        let (Some(connection), Some(Host::Ssh(s))) = (
+            self.pane_connection(pane),
+            self.panes.get(&host).map(|p| &p.host),
+        ) else {
+            return Some(Command::Notice(NO_DESKTOP_HOST.into()));
+        };
+        let port = self
+            .settings
+            .profile(&s.target.alias)
+            .and_then(|p| p.desktop_port)
+            .unwrap_or(DEFAULT_DESKTOP_PORT);
+        let local = desktop_port_for(&s.target.label());
+        let w = self.worker.as_ref()?;
+        w.forwarder.open_desktop(connection, port, local);
+        self.desktops.insert(connection, pane);
+        self.show(
+            pane,
+            &format!(
+                "\x1b[0;90mOpening the remote desktop on port {port} of the server...\x1b[0m\r\n"
+            ),
+        );
+        self.refresh(pane);
+        None
+    }
+
+    /// Opens Remote Desktop Connection on the desktop tunnels that are
+    /// ready, and says why the others failed.
+    fn desktop_events(&mut self) {
+        let events = match &self.worker {
+            Some(w) => w.forwarder.take_desktop_events(),
+            None => return,
+        };
+        for event in events {
+            match event {
+                DesktopEvent::Ready { connection, addr } => {
+                    let pane = self.desktops.remove(&connection);
+                    let note = match launch_rdp_client(&addr) {
+                        Ok(()) => format!(
+                            "\x1b[0;90mRemote desktop tunnel at {addr}; Remote Desktop \
+                             Connection opens on it. It closes with this connection.\x1b[0m\r\n"
+                        ),
+                        Err(e) => format!(
+                            "\x1b[0;31mThe remote desktop tunnel listens at {addr}, but Remote \
+                             Desktop Connection (mstsc.exe) did not start: {e}\x1b[0m\r\n"
+                        ),
+                    };
+                    if let Some(pane) = pane {
+                        self.show(pane, &note);
+                        self.refresh(pane);
+                    }
+                }
+                DesktopEvent::Failed { connection, why } => {
+                    self.desktops.remove(&connection);
+                    self.queued.push(Command::Notice(why));
+                }
+            }
+        }
+    }
+
     /// Carries out what the forwards view asked for.
     fn forwards_action(&mut self, action: Option<FwdAction>) -> Option<Command> {
         match action {
@@ -2265,6 +2337,7 @@ impl Window {
                 self.refresh_chrome();
             }
         }
+        self.desktop_events();
         // The forwards list and the tab badges.
         if self
             .worker
@@ -3889,6 +3962,7 @@ impl Window {
                 };
                 self.attach_tmux(pane, &name, true);
             }
+            cmd::DESKTOP => return self.open_desktop(pane),
             cmd::TMUX_DETACH | cmd::TMUX_PICK | cmd::TMUX_LAYOUT => {
                 let host = self.host_pane(pane);
                 let Some(t) = self.tmux.get_mut(&host).filter(|t| t.active()) else {
@@ -4652,6 +4726,7 @@ fn shortcut(vk: VIRTUAL_KEY, m: Mods, tabs: bool, split: bool) -> Option<u32> {
             v if v == key(b'S') && m.shift => Some(cmd::SESSIONS),
             v if v == key(b'E') && m.shift => Some(cmd::FILES),
             v if v == key(b'P') && m.shift => Some(cmd::FORWARDS),
+            v if v == key(b'D') && m.shift => Some(cmd::DESKTOP),
             v if v == key(b'U') && m.shift => Some(cmd::UPLOAD),
             VK_INSERT if !m.shift => Some(cmd::COPY),
             VK_HOME if m.shift => Some(cmd::SCROLL_TOP),
@@ -4738,9 +4813,25 @@ const NOT_IN_SHELL: &str = "Log in to an SSH host in this pane first; Attach tmu
                             `tmux -CC new-session -A -s main` at its shell (the session name \
                             comes from the host's Tmux setting in ferossh.conf).";
 
+/// Session > Open remote desktop on a pane that is not logged in.
+const NO_DESKTOP_HOST: &str = "Log in to an SSH host in this pane first. Open remote desktop \
+                               tunnels the host's Remote Desktop (RDP) port over that \
+                               connection and opens Remote Desktop Connection on it.";
+
 /// The message for file transfer without a logged-in pane.
 const NOT_CONNECTED: &str = "Log in to an SSH host in this pane first; files go to and from \
                              the host of the focused pane.";
+
+/// Starts Windows' Remote Desktop Connection on `addr`, from System32 so
+/// nothing earlier on PATH stands in for it.
+fn launch_rdp_client(addr: &str) -> std::io::Result<()> {
+    let root = std::env::var_os("SystemRoot").unwrap_or_else(|| "C:\\Windows".into());
+    let mstsc = PathBuf::from(root).join("System32").join("mstsc.exe");
+    std::process::Command::new(mstsc)
+        .arg(format!("/v:{addr}"))
+        .spawn()
+        .map(drop)
+}
 
 /// The key of a host's transfer queue: one per user, host name and port.
 fn sftp_key(t: &Target) -> String {
