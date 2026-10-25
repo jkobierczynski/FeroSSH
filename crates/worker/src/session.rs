@@ -83,7 +83,7 @@ impl fmt::Display for Failure {
 }
 
 /// A logged-in connection, shared by the channels (shells) on it.
-type Connection = Handle<Client>;
+pub(crate) type Connection = Handle<Client>;
 
 /// Live connections by the channel that made them, for
 /// [`Message::OpenChannel`]. Weak: each shell holds its connection, and the
@@ -112,7 +112,7 @@ impl Connections {
         }
     }
 
-    fn get(&self, channel: ChannelId) -> Option<(Arc<Connection>, Names3)> {
+    pub(crate) fn get(&self, channel: ChannelId) -> Option<(Arc<Connection>, Names3)> {
         let map = self.0.lock().ok()?;
         let (weak, names) = map.get(&channel)?;
         let conn = weak.upgrade().filter(|c| !c.is_closed())?;
@@ -139,7 +139,7 @@ fn with<R>(shared: &SharedRef, f: impl FnOnce(&mut Shared) -> R) -> Option<R> {
     shared.lock().ok().map(|mut s| f(&mut s))
 }
 
-struct Client {
+pub(crate) struct Client {
     channel: ChannelId,
     out: mpsc::Sender<Message>,
     shared: SharedRef,

@@ -16,13 +16,20 @@
 //! answers. One `channel` is one shell; the first channel on a host makes
 //! the SSH connection, and [`Message::OpenChannel`] opens further shells on
 //! that connection for new tabs and panes.
+//!
+//! File transfer runs as SFTP on another channel of the same connection
+//! ([`Message::SftpOpen`]). The worker speaks the SFTP protocol to the
+//! server and the UI asks it for one operation at a time
+//! ([`Message::SftpRequest`]); file contents travel in those requests and
+//! their replies, because the worker cannot open files. Paths and names are
+//! bytes, as the server sends them: a name need not be UTF-8.
 
 use std::fmt;
 
 use zeroize::Zeroize;
 
 /// Protocol version carried in every frame. Bump on any wire change.
-pub const PROTOCOL_VERSION: u8 = 3;
+pub const PROTOCOL_VERSION: u8 = 4;
 
 /// Largest frame body accepted, in bytes. Terminal and SFTP data is chunked
 /// below this, so anything larger is a bug or an attack.
@@ -71,6 +78,154 @@ impl Drop for Secrets {
             s.zeroize();
         }
     }
+}
+
+/// File attributes, as far as the server sent them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct FileAttrs {
+    pub size: Option<u64>,
+    /// Unix mode bits, file type included.
+    pub permissions: Option<u32>,
+    /// Modification time, seconds since 1970.
+    pub mtime: Option<u32>,
+}
+
+impl FileAttrs {
+    const TYPE_MASK: u32 = 0o170_000;
+
+    fn file_type(&self) -> Option<u32> {
+        self.permissions.map(|p| p & Self::TYPE_MASK)
+    }
+
+    pub fn is_dir(&self) -> bool {
+        self.file_type() == Some(0o040_000)
+    }
+
+    pub fn is_symlink(&self) -> bool {
+        self.file_type() == Some(0o120_000)
+    }
+
+    /// A regular file, or a server that did not say.
+    pub fn is_file(&self) -> bool {
+        matches!(self.file_type(), Some(0o100_000) | None)
+    }
+}
+
+/// One name in a directory listing. `.` and `..` are left out.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DirEntry {
+    pub name: Vec<u8>,
+    /// Not following symlinks: a link is listed as a link.
+    pub attrs: FileAttrs,
+}
+
+/// How [`SftpOp::Open`] opens a remote file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OpenMode {
+    Read,
+    /// Write, creating the file if it is missing; `truncate` empties it.
+    Write {
+        truncate: bool,
+    },
+}
+
+/// One SFTP operation the UI asks the worker for. Handles are the worker's
+/// small numbers, not the server's.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SftpOp {
+    /// The absolute, canonical form of `path` (symlinks resolved).
+    RealPath {
+        path: Vec<u8>,
+    },
+    /// Attributes of `path`; `follow` resolves a final symlink.
+    Stat {
+        path: Vec<u8>,
+        follow: bool,
+    },
+    /// The names in directory `path`, in one or more
+    /// [`SftpReply::Entries`].
+    List {
+        path: Vec<u8>,
+    },
+    Open {
+        path: Vec<u8>,
+        mode: OpenMode,
+    },
+    /// Up to `len` bytes at `offset`; [`SftpReply::Eof`] past the end.
+    Read {
+        handle: u32,
+        offset: u64,
+        len: u32,
+    },
+    Write {
+        handle: u32,
+        offset: u64,
+        data: Vec<u8>,
+    },
+    Close {
+        handle: u32,
+    },
+    Mkdir {
+        path: Vec<u8>,
+    },
+    Remove {
+        path: Vec<u8>,
+    },
+    Rmdir {
+        path: Vec<u8>,
+    },
+    /// Renames `from` to `to`; with `overwrite`, an existing `to` is
+    /// replaced.
+    Rename {
+        from: Vec<u8>,
+        to: Vec<u8>,
+        overwrite: bool,
+    },
+    /// The SHA-256 of a remote file, computed on the server by
+    /// `sha256sum` (an exec channel, not SFTP). Fails where the server has
+    /// no such command.
+    Checksum {
+        path: Vec<u8>,
+    },
+}
+
+/// The outcome of one [`SftpOp`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SftpReply {
+    Done,
+    /// The server's status code ([`sftp_code`]) and message.
+    Failed {
+        code: u32,
+        message: String,
+    },
+    Path(Vec<u8>),
+    Attrs(FileAttrs),
+    /// Part of a listing; `last` ends it.
+    Entries {
+        entries: Vec<DirEntry>,
+        last: bool,
+    },
+    Opened {
+        handle: u32,
+    },
+    Data(Vec<u8>),
+    Eof,
+    /// Lower-case hex.
+    Checksum(String),
+}
+
+/// Status codes in [`SftpReply::Failed`]: SFTP's own (RFC draft 02), and
+/// FeroSSH's above 1000.
+pub mod sftp_code {
+    pub const EOF: u32 = 1;
+    pub const NO_SUCH_FILE: u32 = 2;
+    pub const PERMISSION_DENIED: u32 = 3;
+    pub const FAILURE: u32 = 4;
+    pub const UNSUPPORTED: u32 = 8;
+    /// The worker refused the request (unknown handle, too many open).
+    pub const REFUSED: u32 = 1001;
+    /// The SFTP channel or the connection is gone.
+    pub const GONE: u32 = 1002;
 }
 
 /// A message on the UI/worker pipe.
@@ -168,6 +323,31 @@ pub enum Message {
     ExitStatus { channel: ChannelId, code: u32 },
     /// The connection is gone; no more messages for this channel follow.
     Disconnected { channel: ChannelId, reason: String },
+
+    // SFTP.
+    /// UI to worker: open an SFTP channel on the connection `connection`
+    /// made. The worker answers with [`Message::SftpReady`], or with
+    /// [`Message::Disconnected`] when the connection is gone or the server
+    /// has no SFTP.
+    SftpOpen {
+        channel: ChannelId,
+        connection: ChannelId,
+    },
+    /// Worker to UI: SFTP is up; `home` is the server's starting directory
+    /// (usually the user's home).
+    SftpReady { channel: ChannelId, home: Vec<u8> },
+    /// UI to worker: one operation; `id` is the UI's, for the reply.
+    SftpRequest {
+        channel: ChannelId,
+        id: u32,
+        op: SftpOp,
+    },
+    /// Worker to UI: the outcome of request `id`.
+    SftpReply {
+        channel: ChannelId,
+        id: u32,
+        reply: SftpReply,
+    },
 }
 
 impl Message {
@@ -192,6 +372,10 @@ impl Message {
             Message::ExitStatus { .. } => 16,
             Message::Disconnected { .. } => 17,
             Message::OpenChannel { .. } => 18,
+            Message::SftpOpen { .. } => 19,
+            Message::SftpReady { .. } => 20,
+            Message::SftpRequest { .. } => 21,
+            Message::SftpReply { .. } => 22,
         }
     }
 
@@ -216,7 +400,11 @@ impl Message {
             | Message::Connected { channel, .. }
             | Message::ExitStatus { channel, .. }
             | Message::Disconnected { channel, .. }
-            | Message::OpenChannel { channel, .. } => *channel,
+            | Message::OpenChannel { channel, .. }
+            | Message::SftpOpen { channel, .. }
+            | Message::SftpReady { channel, .. }
+            | Message::SftpRequest { channel, .. }
+            | Message::SftpReply { channel, .. } => *channel,
         })
     }
 }
@@ -269,8 +457,142 @@ impl Writer {
         self.0.extend_from_slice(&v.to_le_bytes());
     }
 
+    fn u64(&mut self, v: u64) {
+        self.0.extend_from_slice(&v.to_le_bytes());
+    }
+
     fn bool(&mut self, v: bool) {
         self.u8(u8::from(v));
+    }
+
+    fn opt<T: Copy>(&mut self, v: Option<T>, mut item: impl FnMut(&mut Self, T)) {
+        self.bool(v.is_some());
+        if let Some(v) = v {
+            item(self, v);
+        }
+    }
+
+    fn attrs(&mut self, a: &FileAttrs) {
+        self.opt(a.size, Self::u64);
+        self.opt(a.permissions, Self::u32);
+        self.opt(a.mtime, Self::u32);
+    }
+
+    fn op(&mut self, op: &SftpOp) {
+        match op {
+            SftpOp::RealPath { path } => {
+                self.u8(0);
+                self.bytes(path);
+            }
+            SftpOp::Stat { path, follow } => {
+                self.u8(1);
+                self.bytes(path);
+                self.bool(*follow);
+            }
+            SftpOp::List { path } => {
+                self.u8(2);
+                self.bytes(path);
+            }
+            SftpOp::Open { path, mode } => {
+                self.u8(3);
+                self.bytes(path);
+                match mode {
+                    OpenMode::Read => self.u8(0),
+                    OpenMode::Write { truncate: false } => self.u8(1),
+                    OpenMode::Write { truncate: true } => self.u8(2),
+                }
+            }
+            SftpOp::Read {
+                handle,
+                offset,
+                len,
+            } => {
+                self.u8(4);
+                self.u32(*handle);
+                self.u64(*offset);
+                self.u32(*len);
+            }
+            SftpOp::Write {
+                handle,
+                offset,
+                data,
+            } => {
+                self.u8(5);
+                self.u32(*handle);
+                self.u64(*offset);
+                self.bytes(data);
+            }
+            SftpOp::Close { handle } => {
+                self.u8(6);
+                self.u32(*handle);
+            }
+            SftpOp::Mkdir { path } => {
+                self.u8(7);
+                self.bytes(path);
+            }
+            SftpOp::Remove { path } => {
+                self.u8(8);
+                self.bytes(path);
+            }
+            SftpOp::Rmdir { path } => {
+                self.u8(9);
+                self.bytes(path);
+            }
+            SftpOp::Rename {
+                from,
+                to,
+                overwrite,
+            } => {
+                self.u8(10);
+                self.bytes(from);
+                self.bytes(to);
+                self.bool(*overwrite);
+            }
+            SftpOp::Checksum { path } => {
+                self.u8(11);
+                self.bytes(path);
+            }
+        }
+    }
+
+    fn reply(&mut self, reply: &SftpReply) {
+        match reply {
+            SftpReply::Done => self.u8(0),
+            SftpReply::Failed { code, message } => {
+                self.u8(1);
+                self.u32(*code);
+                self.str(message);
+            }
+            SftpReply::Path(path) => {
+                self.u8(2);
+                self.bytes(path);
+            }
+            SftpReply::Attrs(a) => {
+                self.u8(3);
+                self.attrs(a);
+            }
+            SftpReply::Entries { entries, last } => {
+                self.u8(4);
+                self.list(entries, |w, e| {
+                    w.bytes(&e.name);
+                    w.attrs(&e.attrs);
+                });
+                self.bool(*last);
+            }
+            SftpReply::Opened { handle } => {
+                self.u8(5);
+                self.u32(*handle);
+            }
+            SftpReply::Data(data) => {
+                self.u8(6);
+                self.bytes(data);
+            }
+            SftpReply::Eof => self.u8(7),
+            SftpReply::Checksum(hex) => {
+                self.u8(8);
+                self.str(hex);
+            }
+        }
     }
 
     /// A length-prefixed byte string. Lengths above `u32::MAX` cannot fit
@@ -406,6 +728,27 @@ pub fn encode(msg: &Message, out: &mut Vec<u8>) -> Result<(), Error> {
             w.u32(*connection);
             w.u16(*cols);
             w.u16(*rows);
+        }
+        Message::SftpOpen {
+            channel,
+            connection,
+        } => {
+            w.u32(*channel);
+            w.u32(*connection);
+        }
+        Message::SftpReady { channel, home } => {
+            w.u32(*channel);
+            w.bytes(home);
+        }
+        Message::SftpRequest { channel, id, op } => {
+            w.u32(*channel);
+            w.u32(*id);
+            w.op(op);
+        }
+        Message::SftpReply { channel, id, reply } => {
+            w.u32(*channel);
+            w.u32(*id);
+            w.reply(reply);
         }
     }
     let mut body = w.0;
@@ -567,6 +910,24 @@ fn decode_body(body: &[u8]) -> Result<Message, Error> {
             cols: r.u16()?,
             rows: r.u16()?,
         },
+        19 => Message::SftpOpen {
+            channel: r.u32()?,
+            connection: r.u32()?,
+        },
+        20 => Message::SftpReady {
+            channel: r.u32()?,
+            home: r.bytes()?.to_vec(),
+        },
+        21 => Message::SftpRequest {
+            channel: r.u32()?,
+            id: r.u32()?,
+            op: r.op()?,
+        },
+        22 => Message::SftpReply {
+            channel: r.u32()?,
+            id: r.u32()?,
+            reply: r.reply()?,
+        },
         tag => return Err(Error::Tag(tag)),
     };
     match r.0.len() {
@@ -596,12 +957,110 @@ impl<'a> Reader<'a> {
         self.take().map(u32::from_le_bytes)
     }
 
+    fn u64(&mut self) -> Result<u64, Error> {
+        self.take().map(u64::from_le_bytes)
+    }
+
     fn bool(&mut self) -> Result<bool, Error> {
         match self.u8()? {
             0 => Ok(false),
             1 => Ok(true),
             _ => Err(Error::Invalid),
         }
+    }
+
+    fn opt<T>(
+        &mut self,
+        item: impl FnOnce(&mut Self) -> Result<T, Error>,
+    ) -> Result<Option<T>, Error> {
+        if self.bool()? {
+            item(self).map(Some)
+        } else {
+            Ok(None)
+        }
+    }
+
+    fn path(&mut self) -> Result<Vec<u8>, Error> {
+        self.bytes().map(<[u8]>::to_vec)
+    }
+
+    fn attrs(&mut self) -> Result<FileAttrs, Error> {
+        Ok(FileAttrs {
+            size: self.opt(Self::u64)?,
+            permissions: self.opt(Self::u32)?,
+            mtime: self.opt(Self::u32)?,
+        })
+    }
+
+    fn op(&mut self) -> Result<SftpOp, Error> {
+        Ok(match self.u8()? {
+            0 => SftpOp::RealPath { path: self.path()? },
+            1 => SftpOp::Stat {
+                path: self.path()?,
+                follow: self.bool()?,
+            },
+            2 => SftpOp::List { path: self.path()? },
+            3 => SftpOp::Open {
+                path: self.path()?,
+                mode: match self.u8()? {
+                    0 => OpenMode::Read,
+                    1 => OpenMode::Write { truncate: false },
+                    2 => OpenMode::Write { truncate: true },
+                    _ => return Err(Error::Invalid),
+                },
+            },
+            4 => SftpOp::Read {
+                handle: self.u32()?,
+                offset: self.u64()?,
+                len: self.u32()?,
+            },
+            5 => SftpOp::Write {
+                handle: self.u32()?,
+                offset: self.u64()?,
+                data: self.path()?,
+            },
+            6 => SftpOp::Close {
+                handle: self.u32()?,
+            },
+            7 => SftpOp::Mkdir { path: self.path()? },
+            8 => SftpOp::Remove { path: self.path()? },
+            9 => SftpOp::Rmdir { path: self.path()? },
+            10 => SftpOp::Rename {
+                from: self.path()?,
+                to: self.path()?,
+                overwrite: self.bool()?,
+            },
+            11 => SftpOp::Checksum { path: self.path()? },
+            _ => return Err(Error::Invalid),
+        })
+    }
+
+    fn reply(&mut self) -> Result<SftpReply, Error> {
+        Ok(match self.u8()? {
+            0 => SftpReply::Done,
+            1 => SftpReply::Failed {
+                code: self.u32()?,
+                message: self.string()?,
+            },
+            2 => SftpReply::Path(self.path()?),
+            3 => SftpReply::Attrs(self.attrs()?),
+            4 => SftpReply::Entries {
+                entries: self.list(|r| {
+                    Ok(DirEntry {
+                        name: r.path()?,
+                        attrs: r.attrs()?,
+                    })
+                })?,
+                last: self.bool()?,
+            },
+            5 => SftpReply::Opened {
+                handle: self.u32()?,
+            },
+            6 => SftpReply::Data(self.path()?),
+            7 => SftpReply::Eof,
+            8 => SftpReply::Checksum(self.string()?),
+            _ => return Err(Error::Invalid),
+        })
     }
 
     fn bytes(&mut self) -> Result<&'a [u8], Error> {
@@ -650,7 +1109,7 @@ mod tests {
     use super::*;
 
     fn samples() -> Vec<Message> {
-        vec![
+        let mut v = vec![
             Message::Hello {
                 version: PROTOCOL_VERSION,
             },
@@ -747,7 +1206,107 @@ mod tests {
                 cols: 100,
                 rows: 30,
             },
-        ]
+            Message::SftpOpen {
+                channel: 5,
+                connection: 1,
+            },
+            Message::SftpReady {
+                channel: 5,
+                home: b"/home/j\xfcrgen".to_vec(),
+            },
+        ];
+        let ops = [
+            SftpOp::RealPath {
+                path: b".".to_vec(),
+            },
+            SftpOp::Stat {
+                path: b"/etc".to_vec(),
+                follow: true,
+            },
+            SftpOp::List {
+                path: b"/".to_vec(),
+            },
+            SftpOp::Open {
+                path: b"a".to_vec(),
+                mode: OpenMode::Read,
+            },
+            SftpOp::Open {
+                path: b"a".to_vec(),
+                mode: OpenMode::Write { truncate: false },
+            },
+            SftpOp::Open {
+                path: b"a".to_vec(),
+                mode: OpenMode::Write { truncate: true },
+            },
+            SftpOp::Read {
+                handle: 3,
+                offset: u64::MAX,
+                len: 32768,
+            },
+            SftpOp::Write {
+                handle: 3,
+                offset: 1 << 40,
+                data: vec![7; 10],
+            },
+            SftpOp::Close { handle: 3 },
+            SftpOp::Mkdir {
+                path: b"d".to_vec(),
+            },
+            SftpOp::Remove {
+                path: b"f".to_vec(),
+            },
+            SftpOp::Rmdir {
+                path: b"d".to_vec(),
+            },
+            SftpOp::Rename {
+                from: b"a.filepart".to_vec(),
+                to: b"a".to_vec(),
+                overwrite: true,
+            },
+            SftpOp::Checksum {
+                path: b"a".to_vec(),
+            },
+        ];
+        let replies = [
+            SftpReply::Done,
+            SftpReply::Failed {
+                code: sftp_code::NO_SUCH_FILE,
+                message: "No such file".into(),
+            },
+            SftpReply::Path(b"/home/j".to_vec()),
+            SftpReply::Attrs(FileAttrs {
+                size: Some(5),
+                permissions: Some(0o100_644),
+                mtime: None,
+            }),
+            SftpReply::Attrs(FileAttrs::default()),
+            SftpReply::Entries {
+                entries: vec![DirEntry {
+                    name: b"x\xff".to_vec(),
+                    attrs: FileAttrs {
+                        size: None,
+                        permissions: Some(0o040_755),
+                        mtime: Some(1_700_000_000),
+                    },
+                }],
+                last: true,
+            },
+            SftpReply::Opened { handle: 9 },
+            SftpReply::Data(vec![1, 2, 3]),
+            SftpReply::Eof,
+            SftpReply::Checksum("ab".repeat(32)),
+        ];
+        for (id, op) in (1..).zip(ops) {
+            v.push(Message::SftpRequest { channel: 5, id, op });
+        }
+        for (id, reply) in (1..).zip(replies) {
+            v.push(Message::SftpReply {
+                channel: 5,
+                id,
+                reply,
+            });
+        }
+        v
     }
 
     #[test]
@@ -767,7 +1326,7 @@ mod tests {
         let mut tags: Vec<u8> = samples().iter().map(Message::tag).collect();
         tags.sort_unstable();
         tags.dedup();
-        assert_eq!(tags, (0..=18).collect::<Vec<u8>>());
+        assert_eq!(tags, (0..=22).collect::<Vec<u8>>());
     }
 
     #[test]
@@ -809,7 +1368,7 @@ mod tests {
     #[test]
     fn rejects_malformed_bodies() {
         let v = PROTOCOL_VERSION;
-        let cases: [(&[u8], Error); 9] = [
+        let cases: [(&[u8], Error); 11] = [
             (&[9, 0, 1], Error::Version(9)),
             (&[v, 200], Error::Tag(200)),
             (&[v, 2, 1, 0], Error::Truncated),
@@ -827,6 +1386,13 @@ mod tests {
             ),
             // Prompt of an unknown kind.
             (&[v, 13, 1, 0, 0, 0, 7], Error::Invalid),
+            // An SFTP request with an unknown operation.
+            (&[v, 21, 1, 0, 0, 0, 1, 0, 0, 0, 99], Error::Invalid),
+            // An SFTP open with an unknown mode.
+            (
+                &[v, 21, 1, 0, 0, 0, 1, 0, 0, 0, 3, 1, 0, 0, 0, b'a', 3],
+                Error::Invalid,
+            ),
         ];
         for (body, want) in cases {
             let mut dec = Decoder::new();

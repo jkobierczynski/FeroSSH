@@ -605,6 +605,10 @@ dependencies = [
 [[package]]
 name = "ferossh-sftp"
 version = "0.1.0"
+dependencies = [
+ "ferossh-ipc",
+ "sha2",
+]
 
 [[package]]
 name = "ferossh-term"
@@ -624,6 +628,7 @@ version = "0.1.0"
 dependencies = [
  "ferossh-auth",
  "ferossh-ipc",
+ "ferossh-sftp",
  "russh",
  "tokio",
 ]
