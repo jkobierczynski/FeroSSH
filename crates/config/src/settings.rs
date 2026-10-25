@@ -18,6 +18,8 @@
 //!     Font "Cascadia Mono"
 //!     FontSize 12
 //!     Theme Dracula
+//!     Tmux main
+//!     TmuxLayout ferossh
 //! ```
 //!
 //! FeroSSH rewrites the file when a setting changes. Unknown keywords are
@@ -39,6 +41,11 @@ pub struct Profile {
     pub theme: Option<String>,
     /// Lines of scrollback for this host's panes.
     pub scrollback: Option<usize>,
+    /// Attach to this tmux session after logging in (off when unset).
+    pub tmux: Option<String>,
+    /// The tmux layout for new sessions: `ferossh` (one window per pane)
+    /// or `tmux` (tmux's own splits).
+    pub tmux_layout: Option<String>,
 }
 
 impl Profile {
@@ -47,6 +54,8 @@ impl Profile {
             && self.font_size.is_none()
             && self.theme.is_none()
             && self.scrollback.is_none()
+            && self.tmux.is_none()
+            && self.tmux_layout.is_none()
     }
 }
 
@@ -243,6 +252,14 @@ impl Settings {
                                     .filter(|v| (4.0..=96.0).contains(v));
                             }
                             "theme" => p.theme = Some(joined).filter(|t| !t.is_empty()),
+                            "tmux" => {
+                                p.tmux = first.filter(|t| !t.eq_ignore_ascii_case("no"));
+                            }
+                            "tmuxlayout" => {
+                                p.tmux_layout = first
+                                    .map(|l| l.to_ascii_lowercase())
+                                    .filter(|l| l == "ferossh" || l == "tmux");
+                            }
                             _ => {}
                         }
                     }
@@ -335,6 +352,12 @@ impl Settings {
             if let Some(n) = p.scrollback {
                 let _ = writeln!(out, "    Scrollback {n}");
             }
+            if let Some(t) = &p.tmux {
+                let _ = writeln!(out, "    Tmux {}", arg(t));
+            }
+            if let Some(l) = &p.tmux_layout {
+                let _ = writeln!(out, "    TmuxLayout {l}");
+            }
         }
         out
     }
@@ -420,10 +443,14 @@ Profile web
     FontSize 12.5
     Theme Dracula
     Scrollback 99999999
+    Tmux work
+    TmuxLayout TMUX
     Unknown thing
 Profile big
     FontSize 400
     Theme Solarized Dark
+    Tmux no
+    TmuxLayout split
 NewKeyword later
 "#;
 
@@ -446,6 +473,8 @@ NewKeyword later
         assert_eq!(web.font_size, Some(12.5));
         assert_eq!(web.theme.as_deref(), Some("Dracula"));
         assert_eq!(web.scrollback, Some(1_000_000));
+        assert_eq!(web.tmux.as_deref(), Some("work"));
+        assert_eq!(web.tmux_layout.as_deref(), Some("tmux"));
         assert_eq!(s.scrollback, Some(50_000));
         assert_eq!(s.download_folder.as_deref(), Some("D:\\My Transfers"));
         assert!(s.verify_transfers);
@@ -455,6 +484,8 @@ NewKeyword later
         let big = s.profile("big").unwrap();
         assert_eq!(big.font_size, None);
         assert_eq!(big.theme.as_deref(), Some("Solarized Dark"));
+        assert_eq!(big.tmux, None, "tmux stays off unless a session is named");
+        assert_eq!(big.tmux_layout, None);
     }
 
     #[test]

@@ -212,6 +212,25 @@ impl Node {
         }
     }
 
+    /// Puts the tree `new` where leaf `id` is. `false` if `id` is not in
+    /// the tree.
+    pub fn replace_leaf(&mut self, id: PaneId, new: Node) -> bool {
+        match self {
+            Node::Leaf(p) if *p == id => {
+                *self = new;
+                true
+            }
+            Node::Leaf(_) => false,
+            Node::Split { first, second, .. } => {
+                if first.contains(id) {
+                    first.replace_leaf(id, new)
+                } else {
+                    second.replace_leaf(id, new)
+                }
+            }
+        }
+    }
+
     /// Exchanges two panes' places.
     pub fn swap(&mut self, a: PaneId, b: PaneId) {
         match self {
@@ -453,6 +472,66 @@ impl Workspace {
         id
     }
 
+    /// A pane id for a pane that the caller places itself.
+    pub fn alloc_id(&mut self) -> PaneId {
+        self.fresh_id()
+    }
+
+    /// Inserts a tab at `at` (at most the end); the active tab stays the
+    /// same tab.
+    pub fn insert_tab(&mut self, at: usize, root: Node, focus: PaneId) {
+        let at = at.min(self.tabs.len());
+        self.tabs.insert(at, Tab { root, focus });
+        if at <= self.active && self.tabs.len() > 1 {
+            self.active += 1;
+        }
+    }
+
+    /// Takes pane `id` out of the layout, its tab too if it was the tab's
+    /// only pane. `false` if it is not there or is the window's last pane.
+    pub fn remove_pane(&mut self, id: PaneId) -> bool {
+        if self.tab_of(id).is_none() || self.all_panes() == [id] {
+            return false;
+        }
+        self.detach(id).is_some()
+    }
+
+    /// Puts the tree `new` in place of the panes `members` (those still in
+    /// the layout): where the first of them is, the others closing up.
+    /// With none of them in the layout, `new` opens as a tab at the end.
+    pub fn replace_group(&mut self, members: &[PaneId], new: Node) {
+        let present: Vec<PaneId> = members
+            .iter()
+            .copied()
+            .filter(|m| self.tab_of(*m).is_some())
+            .collect();
+        let focus = new.panes().first().copied().unwrap_or(0);
+        let Some((&keep, rest)) = present.split_first() else {
+            self.tabs.push(Tab { root: new, focus });
+            return;
+        };
+        for m in rest {
+            self.detach(*m);
+        }
+        if let Some(t) = self.tab_of(keep).and_then(|i| self.tabs.get_mut(i)) {
+            if t.focus == keep || !t.root.contains(t.focus) {
+                t.focus = focus;
+            }
+            t.root.replace_leaf(keep, new);
+            if !t.root.contains(t.focus) {
+                t.focus = focus;
+            }
+        }
+    }
+
+    /// Splits pane `target` with the tree `new` on side `side`.
+    pub fn graft(&mut self, target: PaneId, new: Node, side: Dir) -> bool {
+        let Some(tab) = self.tab_of(target).and_then(|i| self.tabs.get_mut(i)) else {
+            return false;
+        };
+        tab.root.graft(target, new, side)
+    }
+
     pub fn tab(&self) -> Option<&Tab> {
         self.tabs.get(self.active)
     }
@@ -681,6 +760,34 @@ mod tests {
     use super::*;
 
     const AREA: Rect = Rect::new(0, 0, 1001, 601);
+
+    #[test]
+    fn places_panes_from_outside() {
+        let (mut ws, first) = Workspace::new();
+        let a = ws.alloc_id();
+        let b = ws.alloc_id();
+        let mut root = Node::Leaf(a);
+        root.split(a, b, Dir::Right);
+        ws.insert_tab(0, root, b);
+        assert_eq!(ws.active, 1, "the active tab stays the same tab");
+        assert_eq!(ws.tabs[0].root.panes(), [a, b]);
+        assert!(ws.remove_pane(first));
+        assert_eq!(ws.tabs.len(), 1);
+        assert_eq!(ws.active, 0);
+        // A group becomes one tree where its first member was.
+        let c = ws.alloc_id();
+        let mut group = Node::Leaf(c);
+        group.split(c, a, Dir::Down);
+        ws.replace_group(&[a, b, 99], group);
+        assert_eq!(ws.tabs[0].root.panes(), [c, a]);
+        assert!(ws.tabs[0].root.contains(ws.tabs[0].focus));
+        assert!(ws.graft(c, Node::Leaf(first), Dir::Left));
+        assert_eq!(ws.all_panes(), [first, c, a]);
+        assert!(ws.remove_pane(c) && ws.remove_pane(a));
+        assert!(!ws.remove_pane(first), "the last pane stays");
+        ws.replace_group(&[42], Node::Leaf(42));
+        assert_eq!(ws.tabs.len(), 2);
+    }
 
     #[test]
     fn splits_and_lays_out() {

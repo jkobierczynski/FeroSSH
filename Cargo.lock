@@ -561,6 +561,7 @@ dependencies = [
  "ferossh-render",
  "ferossh-sftp",
  "ferossh-term",
+ "ferossh-tmuxcc",
  "ferossh-worker",
  "russh",
  "tokio",

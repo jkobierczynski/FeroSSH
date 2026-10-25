@@ -158,8 +158,7 @@ pub fn profile(s: &Session) -> Option<Profile> {
         host: s.alias.clone(),
         font: s.font.clone(),
         font_size: s.font_size,
-        theme: None,
-        scrollback: None,
+        ..Profile::default()
     })
 }
 

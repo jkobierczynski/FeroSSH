@@ -177,6 +177,7 @@ dependencies = [
  "ferossh-render",
  "ferossh-sftp",
  "ferossh-term",
+ "ferossh-tmuxcc",
  "libfuzzer-sys",
 ]
 
@@ -209,6 +210,10 @@ dependencies = [
  "alacritty_terminal",
  "ferossh-render",
 ]
+
+[[package]]
+name = "ferossh-tmuxcc"
+version = "0.1.0"
 
 [[package]]
 name = "find-msvc-tools"

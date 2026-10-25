@@ -16,6 +16,7 @@ ferossh-ipc.workspace = true
 ferossh-render.workspace = true
 ferossh-sftp.workspace = true
 ferossh-term.workspace = true
+ferossh-tmuxcc.workspace = true
 ferossh-worker.workspace = true
 # The forwarding engine's sockets; the worker already links tokio.
 tokio = { version = "1.54", features = ["rt", "net", "time", "sync", "macros", "io-util"] }

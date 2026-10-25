@@ -4,7 +4,7 @@
 
 FeroSSH aims to be the smallest, most secure open-source SSH client for Windows: a native PuTTY replacement with tabs, splits, tmux integration and file transfer, shipped as one signed exe with nothing to install.
 
-> **Status:** milestone 5 (file transfer over SFTP). FeroSSH connects with russh from a sandboxed worker process, checks host keys against `~/.ssh/known_hosts`, and signs in with the Windows OpenSSH agent, Pageant, key files, keyboard-interactive or a password. Tabs, splits and a session manager came in milestone 4.
+> **Status:** milestone 6 (tmux integration). FeroSSH connects with russh from a sandboxed worker process, checks host keys against `~/.ssh/known_hosts`, and signs in with the Windows OpenSSH agent, Pageant, key files, keyboard-interactive or a password. Tabs, splits and a session manager came in milestone 4, file transfer over SFTP in milestone 5.
 
 ## Trying the build
 
@@ -28,6 +28,17 @@ ferossh.exe --local [command]  # a local shell, as in milestone 2
 - **Port forwarding.** `LocalForward`, `RemoteForward` and `DynamicForward` in `~/.ssh/config` start when you log in; View > Port forwards (Ctrl+Shift+P) lists every connection's forwards with their state and open connections, adds one to the focused pane's connection (type `-L 8080:db.internal:5432`, `-R 9000:localhost:3000` or `-D 1080`, then Enter) and stops the selected one (Del). A dynamic forward is a SOCKS proxy speaking SOCKS 4, 4a and 5. Local listeners take `127.0.0.1` and `::1` unless you give an address (`*:8080`, or `GatewayPorts yes`). Forwards live as long as a tab on that connection does. A tab whose connection forwards shows `⇄`, in amber when the server can reach back into your PC (remote forwards or X11).
 - **X11 forwarding.** `ForwardX11 yes` for a host sends X programs on the server to an X server on Windows, such as VcXsrv or X410 (FeroSSH ships none); the X server must listen on TCP. The display is `X11Display` in `ferossh.conf`, else `DISPLAY`, else `localhost:0`. The server gets a fake cookie; FeroSSH checks it on each X connection and puts the real one from `%XAUTHORITY%` or `~\.Xauthority` in its place (none, for an X server without access control). X11 is off unless a host turns it on: X programs on the server can see and type into your other X windows.
 - **Per-host look.** View > Font and View > Theme change the focused pane; Session > Save font and theme for this host keeps them for the next connection.
+- **tmux.** tmux is never started for you unless you ask. Session > Attach tmux types `tmux -CC new-session -A -s main` at the pane's shell (typing `tmux -CC` yourself works too), and tmux's windows and panes become native tabs and panes: no status bar, no prefix key, native scrollback with tmux's history in it, and native copy, paste and search. Splits, new tabs and closing panes go to tmux. Session > Detach tmux, or closing the FeroSSH window, leaves everything running on the server; attach again from any PC and the tabs, splits, fonts and themes come back. A dropped connection reattaches after you log in again. Session > Switch tmux session lists the other sessions (also offered right after attaching). Two layouts, kept per session:
+  - *One window per pane* (the default; tmux 3.3 or later): every native pane is its own tmux window, so each pane can have its own font, text size and theme. FeroSSH keeps the splits and looks in the session (`@ferossh-layout`). A plain tmux client shows the panes as separate windows.
+  - *tmux's own splits* (untick Session > tmux: one window per pane, or older tmux): each tmux window is a tab and tmux's splits are the panes, one font per window; resizing a pane resizes it in tmux.
+
+  To attach on every login to a host, name the session in its profile. GNU screen has no control mode and runs as an ordinary terminal.
+
+  ```
+  Profile web1
+      Tmux main
+      TmuxLayout ferossh
+  ```
 
 - **Host keys.** A new host shows its SHA-256 fingerprint and randomart, and you type `yes` to trust it; the key is saved hashed to `known_hosts`. A changed key fills the window with a warning and cannot be bypassed: if you know why it changed, use Session > Replace host key..., which asks twice.
 - **Sign-in.** Keys are tried from the OpenSSH agent first, then Pageant, then key files (`id_ed25519` and `id_ecdsa` unless the config names others). Key files may be Ed25519 or ECDSA P-256, encrypted or not; the passphrase is asked in the terminal and never kept. RSA keys work only through an agent, need 3072 bits or more, and sign with SHA-2. Then keyboard-interactive (one-time codes) and passwords.
@@ -113,7 +124,7 @@ cargo build --release -p ferossh
 
 The release profile optimises for size and links the C runtime statically, so `target\release\ferossh.exe` runs on a clean Windows 10 1903+ machine.
 
-Checks run in CI: `cargo fmt`, `cargo clippy`, `cargo test`, `cargo deny`, `cargo audit`, SSH tests against a real OpenSSH server on Linux (`cargo test -p ferossh-worker --test sshd`, skipped where `sshd` is not installed), and fuzz smoke runs of the IPC decoder, the SFTP decoder, the SOCKS and X11 parsers and the terminal (`cargo +nightly fuzz run --target x86_64-unknown-linux-gnu term_feed`).
+Checks run in CI: `cargo fmt`, `cargo clippy`, `cargo test`, `cargo deny`, `cargo audit`, SSH tests against a real OpenSSH server on Linux (`cargo test -p ferossh-worker --test sshd`, skipped where `sshd` is not installed), the tmux integration against a real tmux (`cargo test -p ferossh tmux_e2e`, skipped without tmux), and fuzz smoke runs of the IPC decoder, the SFTP decoder, the tmux control-mode client, the SOCKS and X11 parsers and the terminal (`cargo +nightly fuzz run --target x86_64-unknown-linux-gnu term_feed`).
 
 On Linux or macOS, `cargo run -p ferossh-term --example vttest -- 1 2 8` drives [vttest](https://invisible-island.net/vttest/) through the emulator and prints every screen as text.
 
