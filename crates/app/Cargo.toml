@@ -15,6 +15,7 @@ ferossh-ipc.workspace = true
 ferossh-render.workspace = true
 ferossh-sftp.workspace = true
 ferossh-term.workspace = true
+ferossh-tmuxcc.workspace = true
 ferossh-worker.workspace = true
 unicode-width = "0.2"
 zeroize = "1.9"
