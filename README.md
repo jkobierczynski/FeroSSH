@@ -17,7 +17,7 @@ ferossh.exe myalias            # a Host from ~/.ssh/config
 ferossh.exe --local [command]  # a local shell, as in milestone 2
 ```
 
-`HostName`, `User`, `Port`, `IdentityFile`, `Tag` and `Include` are read from `~/.ssh/config`.
+`HostName`, `User`, `Port`, `IdentityFile`, `Tag`, `Include` and the forwarding keywords (`LocalForward`, `RemoteForward`, `DynamicForward`, `ForwardX11`, `GatewayPorts`, `ClearAllForwardings`) are read from `~/.ssh/config`.
 
 - **Tabs and splits.** The window starts with one pane and no tab strip. Ctrl+Shift+T opens a tab, Alt+Shift+= and Alt+Shift+- split the pane; the tab strip appears once there are two tabs. A new tab or pane on a host you are already logged in to opens another channel on the same connection, so there is no second login. Drag a divider to resize, drag a tab to reorder, and Ctrl+Shift+drag a pane onto another pane's edge to move it there (or its middle to swap them). To merge a tab back in as a pane, drag the tab down out of the strip onto a pane of the tab that appears, or use Window > Join tab into the tab before it (Ctrl+Shift+J); dropping a pane on the tab strip makes it a tab again.
 - **Session manager.** Ctrl+Shift+S shows the hosts from `~/.ssh/config` in a side pane, hidden by default. Type to filter, Enter connects in this tab (Shift+Enter in a split), Ctrl+D marks a favourite. A `# folder: Name` comment above a `Host` groups hosts. View > Side pane on right moves it; drag its edge to resize it.
@@ -25,6 +25,8 @@ ferossh.exe --local [command]  # a local shell, as in milestone 2
 - **File transfer.** Ctrl+Shift+E shows the focused pane's host over SFTP in the side pane, on the same connection (no second login). Enter opens a folder or downloads a file, D downloads (folders whole), U or Ctrl+Shift+U uploads, Del deletes after asking, Tab moves to the transfer queue (Space pauses or resumes, R retries, X cancels, C clears finished ones). Drop files or folders from Explorer on a pane to upload them to the shell's current folder, after a confirmation. Downloads go to your Downloads folder (`DownloadFolder` in `ferossh.conf` changes it). Three files move at once; a dropped connection pauses the queue and it carries on, from where each file stopped, when you log in again. Session > Verify transfers compares SHA-256 on both ends after each file (the server needs `sha256sum`).
 - **Safe file names.** An existing file is never overwritten without asking (Overwrite, Skip or Keep both, Shift for all). A folder download does not follow links that lead outside the folder, and server names Windows cannot hold (`CON`, `a:b`, trailing dots, control characters) are made safe or refused. Partial files are `.part` locally and `.filepart` on the server until complete.
 - **Following `cd`.** The file view follows the shell's directory when the shell reports it with OSC 7. fish does by default; for bash, add this to `~/.bashrc` on the server: `PROMPT_COMMAND='printf "\e]7;file://%s%s\e\\" "$HOSTNAME" "$PWD"'`. View > File transfer follows cd (or F in the view) turns it off.
+- **Port forwarding.** `LocalForward`, `RemoteForward` and `DynamicForward` in `~/.ssh/config` start when you log in; View > Port forwards (Ctrl+Shift+P) lists every connection's forwards with their state and open connections, adds one to the connection you click in the list, or else the focused pane's (type `-L 8080:db.internal:5432`, `-R 9000:localhost:3000` or `-D 1080`, then Enter) and stops the selected one (Del). A dynamic forward is a SOCKS proxy speaking SOCKS 4, 4a and 5. Local listeners take `127.0.0.1` and `::1` unless you give an address (`*:8080`, or `GatewayPorts yes`). Forwards live as long as a tab on that connection does. A tab whose connection forwards shows `⇄`, in amber when the server can reach back into your PC (remote forwards or X11).
+- **X11 forwarding.** `ForwardX11 yes` for a host sends X programs on the server to an X server on Windows, such as VcXsrv or X410 (FeroSSH ships none); the X server must listen on TCP. The display is `X11Display` in `ferossh.conf`, else `DISPLAY`, else `localhost:0`. The server gets a fake cookie; FeroSSH checks it on each X connection and puts the real one from `%XAUTHORITY%` or `~\.Xauthority` in its place (none, for an X server without access control). X11 is off unless a host turns it on: X programs on the server can see and type into your other X windows.
 - **Per-host look.** View > Font and View > Theme change the focused pane; Session > Save font and theme for this host keeps them for the next connection.
 - **tmux.** tmux is never started for you unless you ask. Session > Attach tmux types `tmux -CC new-session -A -s main` at the pane's shell (typing `tmux -CC` yourself works too), and tmux's windows and panes become native tabs and panes: no status bar, no prefix key, native scrollback with tmux's history in it, and native copy, paste and search. Splits, new tabs and closing panes go to tmux. Session > Detach tmux, or closing the FeroSSH window, leaves everything running on the server; attach again from any PC and the tabs, splits, fonts and themes come back. A dropped connection reattaches after you log in again. Session > Switch tmux session lists the other sessions (also offered right after attaching). Two layouts, kept per session:
   - *One window per pane* (the default; tmux 3.3 or later): every native pane is its own tmux window, so each pane can have its own font, text size and theme. FeroSSH keeps the splits and looks in the session (`@ferossh-layout`). A plain tmux client shows the panes as separate windows.
@@ -44,7 +46,7 @@ ferossh.exe --local [command]  # a local shell, as in milestone 2
 
 - **Host keys.** A new host shows its SHA-256 fingerprint and randomart, and you type `yes` to trust it; the key is saved hashed to `known_hosts`. A changed key fills the window with a warning and cannot be bypassed: if you know why it changed, use Session > Replace host key..., which asks twice.
 - **Sign-in.** Keys are tried from the OpenSSH agent first, then Pageant, then key files (`id_ed25519` and `id_ecdsa` unless the config names others). Key files may be Ed25519 or ECDSA P-256, encrypted or not; the passphrase is asked in the terminal and never kept. RSA keys work only through an agent, need 3072 bits or more, and sign with SHA-2. Then keyboard-interactive (one-time codes) and passwords.
-- **Sandbox.** The worker that talks to the network runs in an AppContainer with network access only: it cannot read your files or keys, and asks the window for every signature. Windows does not let AppContainers reach 127.0.0.1, so use `--no-sandbox` for SSH servers on the same machine.
+- **Sandbox.** The worker that talks to the network runs in an AppContainer with network access only: it cannot read your files or keys, and asks the window for every signature. Windows does not let AppContainers reach 127.0.0.1, so use `--no-sandbox` for SSH servers on the same machine. Forwards to and from localhost work in the sandbox: the window holds those sockets, and the worker parses what arrives (SOCKS requests, X11 setups).
 - **Logs.** Session > Log to file writes what the host sends to `%LOCALAPPDATA%\FeroSSH\logs`, one file per tab named by host, tab and time (`host_tab1_2026-10-24_2215.log`). Plain logs keep the readable text; Session > Log raw output keeps every byte. Passwords and passphrases never reach the log.
 
 | Shortcut | Action |
@@ -57,6 +59,7 @@ ferossh.exe --local [command]  # a local shell, as in milestone 2
 | Ctrl+Shift+J | Join this tab into the tab before it, as a pane |
 | Ctrl+Shift+S | Session manager |
 | Ctrl+Shift+E / Ctrl+Shift+U | File transfer, upload files |
+| Ctrl+Shift+P | Port forwards |
 | Ctrl+Shift+C / Ctrl+Shift+V | Copy the selection, paste (also Ctrl+Insert / Shift+Insert) |
 | Ctrl+Shift+F | Find in scrollback (Enter: older match, Shift+Enter: newer, Esc: close) |
 | Shift+PgUp / Shift+PgDn | Scroll back a page, forward a page (Ctrl+Shift+Home/End: top, bottom) |
@@ -111,6 +114,7 @@ Profile web1
 | [`ipc`](crates/ipc) | UI/worker message types, framing and fuzz targets |
 | [`auth`](crates/auth) | Agent, Pageant, WebAuthn and CNG signing broker |
 | [`sftp`](crates/sftp) | SFTP codec, transfer queue and file-tree model |
+| [`forward`](crates/forward) | SOCKS 4/4a/5 handshake, X11 display, `.Xauthority` and cookie swap |
 | [`tmuxcc`](crates/tmuxcc) | tmux control-mode parser and layout mapping |
 | [`config`](crates/config) | `ssh_config` parser, known_hosts and PuTTY import |
 
@@ -124,7 +128,7 @@ cargo build --release -p ferossh
 
 The release profile optimises for size and links the C runtime statically, so `target\release\ferossh.exe` runs on a clean Windows 10 1903+ machine.
 
-Checks run in CI: `cargo fmt`, `cargo clippy`, `cargo test`, `cargo deny`, `cargo audit`, SSH tests against a real OpenSSH server on Linux (`cargo test -p ferossh-worker --test sshd`, skipped where `sshd` is not installed), the tmux integration against a real tmux (`cargo test -p ferossh tmux_e2e`, skipped without tmux), and fuzz smoke runs of the IPC decoder, the SFTP decoder, the tmux control-mode client and the terminal (`cargo +nightly fuzz run --target x86_64-unknown-linux-gnu term_feed`).
+Checks run in CI: `cargo fmt`, `cargo clippy`, `cargo test`, `cargo deny`, `cargo audit`, SSH tests against a real OpenSSH server on Linux (`cargo test -p ferossh-worker --test sshd`, skipped where `sshd` is not installed), the tmux integration against a real tmux (`cargo test -p ferossh tmux_e2e`, skipped without tmux), and fuzz smoke runs of the IPC decoder, the SFTP decoder, the tmux control-mode client, the SOCKS and X11 parsers and the terminal (`cargo +nightly fuzz run --target x86_64-unknown-linux-gnu term_feed`).
 
 On Linux or macOS, `cargo run -p ferossh-term --example vttest -- 1 2 8` drives [vttest](https://invisible-island.net/vttest/) through the emulator and prints every screen as text.
 

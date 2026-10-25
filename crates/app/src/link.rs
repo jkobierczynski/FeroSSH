@@ -1,12 +1,13 @@
 //! The UI's end of the worker pipes: a reader thread that decodes frames
 //! and a writer thread that encodes them, so a slow or stuck worker never
-//! blocks the window.
+//! blocks the window. Messages for forward channels go straight to the
+//! forwarding engine and never queue behind terminal output.
 
 use std::io::{Read, Write};
 use std::sync::mpsc::{Receiver, Sender, SyncSender, channel, sync_channel};
 use std::thread;
 
-use ferossh_ipc::{Decoder, Message, PROTOCOL_VERSION, encode};
+use ferossh_ipc::{Decoder, Message, PROTOCOL_VERSION, encode, is_forward_channel};
 
 /// Messages buffered from the worker; a flooding host is slowed down to
 /// what the window can show.
@@ -25,7 +26,12 @@ pub struct Link {
     rx: Receiver<LinkEvent>,
 }
 
-fn reader(mut input: impl Read, tx: &SyncSender<LinkEvent>, notify: &(impl Fn() + Send)) -> String {
+fn reader(
+    mut input: impl Read,
+    tx: &SyncSender<LinkEvent>,
+    notify: &(impl Fn() + Send),
+    divert: &(impl Fn(Message) + Send),
+) -> String {
     let mut decoder = Decoder::new();
     let mut buf = vec![0u8; 64 * 1024];
     let mut greeted = false;
@@ -51,6 +57,10 @@ fn reader(mut input: impl Read, tx: &SyncSender<LinkEvent>, notify: &(impl Fn() 
                     _ => return "The SSH worker speaks another protocol version.".into(),
                 }
             }
+            if msg.channel().is_some_and(is_forward_channel) {
+                divert(msg);
+                continue;
+            }
             if tx.send(LinkEvent::Message(msg)).is_err() {
                 return String::new();
             }
@@ -61,18 +71,20 @@ fn reader(mut input: impl Read, tx: &SyncSender<LinkEvent>, notify: &(impl Fn() 
 
 impl Link {
     /// Starts both threads and greets the worker. `notify` runs whenever
-    /// an event is queued.
+    /// an event is queued; messages for forward channels go to `divert`
+    /// instead.
     pub fn start(
         input: impl Read + Send + 'static,
         mut output: impl Write + Send + 'static,
         notify: impl Fn() + Send + Clone + 'static,
+        divert: impl Fn(Message) + Send + 'static,
     ) -> std::io::Result<Self> {
         let (event_tx, rx) = sync_channel(BACKLOG);
         let (tx, msg_rx) = channel::<Message>();
         thread::Builder::new()
             .name("worker reader".into())
             .spawn(move || {
-                let why = reader(input, &event_tx, &notify);
+                let why = reader(input, &event_tx, &notify, &divert);
                 if event_tx.send(LinkEvent::Closed(why)).is_ok() {
                     notify();
                 }
@@ -102,6 +114,16 @@ impl Link {
 
     pub fn send(&self, msg: Message) {
         let _ = self.tx.send(msg);
+    }
+
+    /// Sends to the worker from another thread.
+    pub fn sender(&self) -> impl Fn(Message) + Send + Sync + 'static {
+        let tx = std::sync::Mutex::new(self.tx.clone());
+        move |msg| {
+            if let Ok(tx) = tx.lock() {
+                let _ = tx.send(msg);
+            }
+        }
     }
 
     pub fn try_recv(&self) -> Option<LinkEvent> {

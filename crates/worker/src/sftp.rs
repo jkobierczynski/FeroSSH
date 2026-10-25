@@ -490,7 +490,7 @@ pub async fn run(
     connections: Connections,
 ) {
     let reason = match connections.get(connection) {
-        Some((conn, _)) => {
+        Some((conn, ..)) => {
             let result = serve(channel, conn.clone(), &mut inbox, out.clone()).await;
             release(conn).await;
             match result {

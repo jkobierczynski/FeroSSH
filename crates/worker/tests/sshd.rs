@@ -110,8 +110,10 @@ fn start(name: &str, extra: &str) -> Server {
         .stderr(Stdio::null())
         .spawn()
         .unwrap();
+    // Wait for sshd's own banner, not just an open port, so a slow start
+    // cannot be mistaken for a refused login.
     for _ in 0..100 {
-        if std::net::TcpStream::connect(("127.0.0.1", port)).is_ok() {
+        if banner(port) {
             break;
         }
         std::thread::sleep(Duration::from_millis(50));
@@ -123,6 +125,17 @@ fn start(name: &str, extra: &str) -> Server {
         port,
         child,
     }
+}
+
+/// True once something on `port` greets with an SSH banner.
+fn banner(port: u16) -> bool {
+    use std::io::Read;
+    let Ok(mut stream) = std::net::TcpStream::connect(("127.0.0.1", port)) else {
+        return false;
+    };
+    let _ = stream.set_read_timeout(Some(Duration::from_millis(500)));
+    let mut first = [0u8; 4];
+    stream.read_exact(&mut first).is_ok() && &first == b"SSH-"
 }
 
 fn whoami() -> String {
@@ -168,6 +181,7 @@ async fn run_ui(server: &Server, command: &str, trust: bool) -> Seen {
         cols: 80,
         rows: 24,
         host_key_algs: vec![],
+        x11: None,
     })
     .await;
     let mut seen = Seen::default();
@@ -240,7 +254,10 @@ async fn logs_in_with_a_key_and_runs_a_shell() {
     assert!(output.contains("fero42"), "{seen:?}");
     assert_eq!(seen.exit, Some(3));
     assert_eq!(seen.signed, 1);
-    let (kex, cipher, host_key) = seen.connected.unwrap();
+    let (kex, cipher, host_key) = seen
+        .connected
+        .clone()
+        .unwrap_or_else(|| panic!("not connected: {seen:?}"));
     // OpenSSH 9.9 and later offer ML-KEM; older ones stop at curve25519.
     assert!(
         kex == "mlkem768x25519-sha256" || kex == "curve25519-sha256",
@@ -300,7 +317,10 @@ async fn falls_back_to_aes_gcm() {
         "Ciphers aes256-gcm@openssh.com\nKexAlgorithms curve25519-sha256",
     );
     let seen = run_ui(&server, "exit\n", true).await;
-    let (kex, cipher, _) = seen.connected.unwrap();
+    let (kex, cipher, _) = seen
+        .connected
+        .clone()
+        .unwrap_or_else(|| panic!("not connected: {seen:?}"));
     assert_eq!(kex, "curve25519-sha256");
     assert_eq!(cipher, "aes256-gcm@openssh.com");
 }
@@ -335,6 +355,7 @@ async fn second_shell_shares_the_connection() {
         cols: 80,
         rows: 24,
         host_key_algs: vec![],
+        x11: None,
     })
     .await;
     let (mut host_keys, mut signed) = (0, 0);
@@ -379,6 +400,7 @@ async fn second_shell_shares_the_connection() {
                     connection: 1,
                     cols: 80,
                     rows: 24,
+                    x11: None,
                 })
                 .await;
             }
@@ -427,6 +449,7 @@ async fn second_shell_shares_the_connection() {
         connection: 1,
         cols: 80,
         rows: 24,
+        x11: None,
     })
     .await;
     loop {
@@ -465,6 +488,7 @@ async fn login(server: &Server) -> (mpsc::Sender<Message>, mpsc::Receiver<Messag
             cols: 80,
             rows: 24,
             host_key_algs: vec![],
+            x11: None,
         })
         .await
         .unwrap();

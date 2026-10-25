@@ -23,13 +23,24 @@
 //! ([`Message::SftpRequest`]); file contents travel in those requests and
 //! their replies, because the worker cannot open files. Paths and names are
 //! bytes, as the server sends them: a name need not be UTF-8.
+//!
+//! Port forwards are streams: one channel per forwarded TCP connection,
+//! carrying [`Message::Data`], [`Message::Eof`] and [`Message::Close`]. The
+//! UI holds the sockets (the AppContainer cannot use loopback), the worker
+//! holds the SSH channels. Each direction of a stream may have at most
+//! [`STREAM_WINDOW`] bytes in flight; the receiver hands credit back with
+//! [`Message::Window`] as it delivers them, so one slow socket never stalls
+//! the pipe for the others. Channel ids come from three ranges: the
+//! window's below [`FORWARD_IDS`], the UI's forwarding engine's from there
+//! to [`WORKER_IDS`], and the worker's (connections the server opens to
+//! this side) above.
 
 use std::fmt;
 
 use zeroize::Zeroize;
 
 /// Protocol version carried in every frame. Bump on any wire change.
-pub const PROTOCOL_VERSION: u8 = 4;
+pub const PROTOCOL_VERSION: u8 = 5;
 
 /// Largest frame body accepted, in bytes. Terminal and SFTP data is chunked
 /// below this, so anything larger is a bug or an attack.
@@ -39,6 +50,24 @@ pub const MAX_BODY_LEN: usize = 1 << 20;
 pub const MAX_DATA_CHUNK: usize = 64 * 1024;
 
 const LEN_PREFIX: usize = 4;
+
+/// Bytes either side of a forwarded stream may send before the other
+/// side's [`Message::Window`] gives credit back.
+pub const STREAM_WINDOW: u32 = 512 * 1024;
+
+/// The first channel id of the UI's forwarding engine; the window's ids
+/// stay below it.
+pub const FORWARD_IDS: ChannelId = 0x4000_0000;
+
+/// The first channel id the worker hands out, for connections the server
+/// opens (remote forwards and X11).
+pub const WORKER_IDS: ChannelId = 0x8000_0000;
+
+/// Whether a channel belongs to the forwarding engine rather than to a
+/// window's pane.
+pub fn is_forward_channel(channel: ChannelId) -> bool {
+    channel >= FORWARD_IDS
+}
 
 /// Identifies one SSH channel (terminal, SFTP, forward) inside a worker.
 pub type ChannelId = u32;
@@ -77,6 +106,34 @@ impl Drop for Secrets {
         for s in &mut self.0 {
             s.zeroize();
         }
+    }
+}
+
+/// What X11 forwarding on a shell needs: the screen, and the authorisation
+/// the local X server expects (empty when it needs none). The worker gives
+/// the server a fake cookie and puts this one in its place when a client
+/// connects; this one never leaves the PC. `Debug` leaves the cookie out.
+#[derive(Clone, PartialEq, Eq, Default)]
+pub struct X11Auth {
+    pub screen: u32,
+    /// Usually `MIT-MAGIC-COOKIE-1`.
+    pub protocol: String,
+    pub cookie: Vec<u8>,
+}
+
+impl fmt::Debug for X11Auth {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("X11Auth")
+            .field("screen", &self.screen)
+            .field("protocol", &self.protocol)
+            .field("cookie", &format_args!("<{} bytes>", self.cookie.len()))
+            .finish()
+    }
+}
+
+impl Drop for X11Auth {
+    fn drop(&mut self) {
+        self.cookie.zeroize();
     }
 }
 
@@ -247,7 +304,8 @@ pub enum Message {
     // UI to worker.
     /// Connect to `host`, authenticate as `user` and open a shell on a pty
     /// of `cols` x `rows`. `host_key_algs` are the key types known_hosts
-    /// already holds for this host; the worker asks for those first.
+    /// already holds for this host; the worker asks for those first. With
+    /// `x11`, the shell asks the server for X11 forwarding.
     Connect {
         channel: ChannelId,
         host: String,
@@ -256,6 +314,7 @@ pub enum Message {
         cols: u16,
         rows: u16,
         host_key_algs: Vec<String>,
+        x11: Option<X11Auth>,
     },
     /// Open another shell on the connection that `connection` (a channel
     /// that made it with [`Message::Connect`]) belongs to. No new login:
@@ -266,6 +325,7 @@ pub enum Message {
         connection: ChannelId,
         cols: u16,
         rows: u16,
+        x11: Option<X11Auth>,
     },
     /// The user (or known_hosts) trusts, or rejects, the key in the last
     /// [`Message::HostKey`].
@@ -348,6 +408,55 @@ pub enum Message {
         id: u32,
         reply: SftpReply,
     },
+
+    // Port forwarding and X11.
+    /// UI to worker: a program connected to a local listener. Open a
+    /// `direct-tcpip` channel on `connection` to `target`; without a
+    /// target the stream speaks SOCKS 4, 4a or 5 first and the worker
+    /// opens the channel the client asks for. The worker answers with
+    /// [`Message::ForwardOpened`], or with [`Message::Disconnected`].
+    ForwardOpen {
+        channel: ChannelId,
+        connection: ChannelId,
+        target: Option<(String, u16)>,
+        origin_host: String,
+        origin_port: u16,
+    },
+    /// Worker to UI: the stream is open to `host`:`port`.
+    ForwardOpened {
+        channel: ChannelId,
+        host: String,
+        port: u16,
+    },
+    /// UI to worker: ask the server to listen on `bind`:`port` and send
+    /// connections back. The worker answers with
+    /// [`Message::ForwardListening`], or with [`Message::Disconnected`];
+    /// [`Message::Close`] stops the listener.
+    RemoteForward {
+        channel: ChannelId,
+        connection: ChannelId,
+        bind: String,
+        port: u16,
+    },
+    /// Worker to UI: the server listens on `port` (the one it chose, when
+    /// asked for port 0).
+    ForwardListening { channel: ChannelId, port: u16 },
+    /// Worker to UI: the server opened stream `channel` for remote forward
+    /// `listener`, or for X11 when `x11` is set (`listener` is then the
+    /// connection). The UI connects it to the forward's target, or closes
+    /// it.
+    ForwardIncoming {
+        channel: ChannelId,
+        listener: ChannelId,
+        x11: bool,
+        origin_host: String,
+        origin_port: u16,
+    },
+    /// Either side: `bytes` more of the stream's data were delivered, so
+    /// the other side may send that much more.
+    Window { channel: ChannelId, bytes: u32 },
+    /// Either side: no more data in this direction on the stream.
+    Eof { channel: ChannelId },
 }
 
 impl Message {
@@ -376,6 +485,13 @@ impl Message {
             Message::SftpReady { .. } => 20,
             Message::SftpRequest { .. } => 21,
             Message::SftpReply { .. } => 22,
+            Message::ForwardOpen { .. } => 23,
+            Message::ForwardOpened { .. } => 24,
+            Message::RemoteForward { .. } => 25,
+            Message::ForwardListening { .. } => 26,
+            Message::ForwardIncoming { .. } => 27,
+            Message::Window { .. } => 28,
+            Message::Eof { .. } => 29,
         }
     }
 
@@ -404,7 +520,14 @@ impl Message {
             | Message::SftpOpen { channel, .. }
             | Message::SftpReady { channel, .. }
             | Message::SftpRequest { channel, .. }
-            | Message::SftpReply { channel, .. } => *channel,
+            | Message::SftpReply { channel, .. }
+            | Message::ForwardOpen { channel, .. }
+            | Message::ForwardOpened { channel, .. }
+            | Message::RemoteForward { channel, .. }
+            | Message::ForwardListening { channel, .. }
+            | Message::ForwardIncoming { channel, .. }
+            | Message::Window { channel, .. }
+            | Message::Eof { channel } => *channel,
         })
     }
 }
@@ -469,6 +592,15 @@ impl Writer {
         self.bool(v.is_some());
         if let Some(v) = v {
             item(self, v);
+        }
+    }
+
+    fn x11(&mut self, x: &Option<X11Auth>) {
+        self.bool(x.is_some());
+        if let Some(x) = x {
+            self.u32(x.screen);
+            self.str(&x.protocol);
+            self.bytes(&x.cookie);
         }
     }
 
@@ -632,7 +764,9 @@ pub fn encode(msg: &Message, out: &mut Vec<u8>) -> Result<(), Error> {
             w.u16(*cols);
             w.u16(*rows);
         }
-        Message::Close { channel } | Message::IdentitiesRequest { channel } => w.u32(*channel),
+        Message::Close { channel }
+        | Message::IdentitiesRequest { channel }
+        | Message::Eof { channel } => w.u32(*channel),
         Message::Connect {
             channel,
             host,
@@ -641,6 +775,7 @@ pub fn encode(msg: &Message, out: &mut Vec<u8>) -> Result<(), Error> {
             cols,
             rows,
             host_key_algs,
+            x11,
         } => {
             w.u32(*channel);
             w.str(host);
@@ -649,6 +784,7 @@ pub fn encode(msg: &Message, out: &mut Vec<u8>) -> Result<(), Error> {
             w.u16(*cols);
             w.u16(*rows);
             w.list(host_key_algs, |w, s| w.str(s));
+            w.x11(x11);
         }
         Message::HostKeyVerdict { channel, accept } => {
             w.u32(*channel);
@@ -723,11 +859,13 @@ pub fn encode(msg: &Message, out: &mut Vec<u8>) -> Result<(), Error> {
             connection,
             cols,
             rows,
+            x11,
         } => {
             w.u32(*channel);
             w.u32(*connection);
             w.u16(*cols);
             w.u16(*rows);
+            w.x11(x11);
         }
         Message::SftpOpen {
             channel,
@@ -749,6 +887,64 @@ pub fn encode(msg: &Message, out: &mut Vec<u8>) -> Result<(), Error> {
             w.u32(*channel);
             w.u32(*id);
             w.reply(reply);
+        }
+        Message::ForwardOpen {
+            channel,
+            connection,
+            target,
+            origin_host,
+            origin_port,
+        } => {
+            w.u32(*channel);
+            w.u32(*connection);
+            w.bool(target.is_some());
+            if let Some((host, port)) = target {
+                w.str(host);
+                w.u16(*port);
+            }
+            w.str(origin_host);
+            w.u16(*origin_port);
+        }
+        Message::ForwardOpened {
+            channel,
+            host,
+            port,
+        } => {
+            w.u32(*channel);
+            w.str(host);
+            w.u16(*port);
+        }
+        Message::RemoteForward {
+            channel,
+            connection,
+            bind,
+            port,
+        } => {
+            w.u32(*channel);
+            w.u32(*connection);
+            w.str(bind);
+            w.u16(*port);
+        }
+        Message::ForwardListening { channel, port } => {
+            w.u32(*channel);
+            w.u16(*port);
+        }
+        Message::ForwardIncoming {
+            channel,
+            listener,
+            x11,
+            origin_host,
+            origin_port,
+        } => {
+            w.u32(*channel);
+            w.u32(*listener);
+            w.bool(*x11);
+            w.str(origin_host);
+            w.u16(*origin_port);
+        }
+        Message::Window { channel, bytes } => {
+            w.u32(*channel);
+            w.u32(*bytes);
         }
     }
     let mut body = w.0;
@@ -839,6 +1035,7 @@ fn decode_body(body: &[u8]) -> Result<Message, Error> {
             cols: r.u16()?,
             rows: r.u16()?,
             host_key_algs: r.list(Reader::string)?,
+            x11: r.x11()?,
         },
         5 => Message::HostKeyVerdict {
             channel: r.u32()?,
@@ -909,6 +1106,7 @@ fn decode_body(body: &[u8]) -> Result<Message, Error> {
             connection: r.u32()?,
             cols: r.u16()?,
             rows: r.u16()?,
+            x11: r.x11()?,
         },
         19 => Message::SftpOpen {
             channel: r.u32()?,
@@ -928,6 +1126,40 @@ fn decode_body(body: &[u8]) -> Result<Message, Error> {
             id: r.u32()?,
             reply: r.reply()?,
         },
+        23 => Message::ForwardOpen {
+            channel: r.u32()?,
+            connection: r.u32()?,
+            target: r.opt(|r| Ok((r.string()?, r.u16()?)))?,
+            origin_host: r.string()?,
+            origin_port: r.u16()?,
+        },
+        24 => Message::ForwardOpened {
+            channel: r.u32()?,
+            host: r.string()?,
+            port: r.u16()?,
+        },
+        25 => Message::RemoteForward {
+            channel: r.u32()?,
+            connection: r.u32()?,
+            bind: r.string()?,
+            port: r.u16()?,
+        },
+        26 => Message::ForwardListening {
+            channel: r.u32()?,
+            port: r.u16()?,
+        },
+        27 => Message::ForwardIncoming {
+            channel: r.u32()?,
+            listener: r.u32()?,
+            x11: r.bool()?,
+            origin_host: r.string()?,
+            origin_port: r.u16()?,
+        },
+        28 => Message::Window {
+            channel: r.u32()?,
+            bytes: r.u32()?,
+        },
+        29 => Message::Eof { channel: r.u32()? },
         tag => return Err(Error::Tag(tag)),
     };
     match r.0.len() {
@@ -978,6 +1210,16 @@ impl<'a> Reader<'a> {
         } else {
             Ok(None)
         }
+    }
+
+    fn x11(&mut self) -> Result<Option<X11Auth>, Error> {
+        self.opt(|r| {
+            Ok(X11Auth {
+                screen: r.u32()?,
+                protocol: r.string()?,
+                cookie: r.path()?,
+            })
+        })
     }
 
     fn path(&mut self) -> Result<Vec<u8>, Error> {
@@ -1135,6 +1377,21 @@ mod tests {
                 cols: 80,
                 rows: 24,
                 host_key_algs: vec!["ssh-ed25519".into(), "rsa-sha2-512".into()],
+                x11: None,
+            },
+            Message::Connect {
+                channel: 3,
+                host: "x".into(),
+                port: 2222,
+                user: "u".into(),
+                cols: 1,
+                rows: 1,
+                host_key_algs: Vec::new(),
+                x11: Some(X11Auth {
+                    screen: 0,
+                    protocol: "MIT-MAGIC-COOKIE-1".into(),
+                    cookie: vec![0xab; 16],
+                }),
             },
             Message::HostKeyVerdict {
                 channel: 1,
@@ -1205,6 +1462,50 @@ mod tests {
                 connection: 1,
                 cols: 100,
                 rows: 30,
+                x11: Some(X11Auth::default()),
+            },
+            Message::ForwardOpen {
+                channel: FORWARD_IDS,
+                connection: 1,
+                target: Some(("db.internal".into(), 5432)),
+                origin_host: "127.0.0.1".into(),
+                origin_port: 50123,
+            },
+            Message::ForwardOpen {
+                channel: FORWARD_IDS + 1,
+                connection: 1,
+                target: None,
+                origin_host: "::1".into(),
+                origin_port: 1,
+            },
+            Message::ForwardOpened {
+                channel: FORWARD_IDS,
+                host: "db.internal".into(),
+                port: 5432,
+            },
+            Message::RemoteForward {
+                channel: FORWARD_IDS + 2,
+                connection: 1,
+                bind: "localhost".into(),
+                port: 0,
+            },
+            Message::ForwardListening {
+                channel: FORWARD_IDS + 2,
+                port: 40001,
+            },
+            Message::ForwardIncoming {
+                channel: WORKER_IDS,
+                listener: FORWARD_IDS + 2,
+                x11: false,
+                origin_host: "10.0.0.9".into(),
+                origin_port: 33000,
+            },
+            Message::Window {
+                channel: WORKER_IDS,
+                bytes: STREAM_WINDOW,
+            },
+            Message::Eof {
+                channel: WORKER_IDS,
             },
             Message::SftpOpen {
                 channel: 5,
@@ -1326,7 +1627,7 @@ mod tests {
         let mut tags: Vec<u8> = samples().iter().map(Message::tag).collect();
         tags.sort_unstable();
         tags.dedup();
-        assert_eq!(tags, (0..=22).collect::<Vec<u8>>());
+        assert_eq!(tags, (0..=29).collect::<Vec<u8>>());
     }
 
     #[test]
@@ -1400,6 +1701,25 @@ mod tests {
             dec.feed(body);
             assert_eq!(dec.next_message(), Err(want), "{body:?}");
         }
+    }
+
+    #[test]
+    fn x11_cookies_are_not_printed() {
+        let auth = X11Auth {
+            screen: 0,
+            protocol: "MIT-MAGIC-COOKIE-1".into(),
+            cookie: b"sekrit-cookie".to_vec(),
+        };
+        assert!(!format!("{auth:?}").contains("sekrit"));
+    }
+
+    #[test]
+    fn channel_ranges() {
+        assert!(!is_forward_channel(1));
+        assert!(!is_forward_channel(FORWARD_IDS - 1));
+        assert!(is_forward_channel(FORWARD_IDS));
+        assert!(is_forward_channel(WORKER_IDS));
+        assert!(is_forward_channel(u32::MAX));
     }
 
     #[test]

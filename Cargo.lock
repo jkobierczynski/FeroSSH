@@ -556,6 +556,7 @@ version = "0.1.0"
 dependencies = [
  "ferossh-auth",
  "ferossh-config",
+ "ferossh-forward",
  "ferossh-ipc",
  "ferossh-render",
  "ferossh-sftp",
@@ -589,6 +590,10 @@ dependencies = [
  "russh",
  "sha1",
 ]
+
+[[package]]
+name = "ferossh-forward"
+version = "0.1.0"
 
 [[package]]
 name = "ferossh-ipc"
@@ -629,8 +634,10 @@ name = "ferossh-worker"
 version = "0.1.0"
 dependencies = [
  "ferossh-auth",
+ "ferossh-forward",
  "ferossh-ipc",
  "ferossh-sftp",
+ "getrandom 0.4.3",
  "russh",
  "tokio",
 ]

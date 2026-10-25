@@ -18,10 +18,10 @@ use crate::ssh::{Effect, Env, SshSession, State, Target};
 
 const SSHD: &str = "/usr/sbin/sshd";
 
-struct Server {
-    dir: PathBuf,
+pub(crate) struct Server {
+    pub(crate) dir: PathBuf,
     child: Child,
-    port: u16,
+    pub(crate) port: u16,
 }
 
 impl Drop for Server {
@@ -41,7 +41,9 @@ fn keygen(path: &Path, passphrase: &str) {
     assert!(ok);
 }
 
-fn start_sshd() -> Option<Server> {
+/// Starts a throwaway sshd whose config ends with `extra`; the user key
+/// `~/.ssh/id_ed25519` under its folder has the passphrase "secret".
+pub(crate) fn start_sshd(name: &str, extra: &str) -> Option<Server> {
     if !Path::new(SSHD).exists()
         || Command::new("ssh-keygen")
             .arg("-?")
@@ -57,7 +59,7 @@ fn start_sshd() -> Option<Server> {
         eprintln!("sshd or ssh-keygen not found; skipping");
         return None;
     }
-    let dir = std::env::temp_dir().join(format!("ferossh-e2e-{}", std::process::id()));
+    let dir = std::env::temp_dir().join(format!("ferossh-e2e-{name}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(dir.join(".ssh")).unwrap();
     let host = dir.join("host_ed25519");
@@ -73,7 +75,7 @@ fn start_sshd() -> Option<Server> {
     let config = format!(
         "ListenAddress 127.0.0.1\nPort {port}\nHostKey {}\nAuthorizedKeysFile {}\nPidFile none\n\
          StrictModes no\nUsePAM no\nPermitRootLogin yes\nPasswordAuthentication no\n\
-         KbdInteractiveAuthentication no\n",
+         KbdInteractiveAuthentication no\n{extra}\n",
         host.display(),
         dir.join("authorized_keys").display()
     );
@@ -94,7 +96,7 @@ fn start_sshd() -> Option<Server> {
     Some(Server { dir, child, port })
 }
 
-fn local_user() -> String {
+pub(crate) fn local_user() -> String {
     let out = Command::new("id").arg("-un").output().unwrap();
     String::from_utf8(out.stdout).unwrap().trim().to_owned()
 }
@@ -113,7 +115,7 @@ fn connect(env: &Env, command: &str, answers: &[(&str, &str)]) -> (Run, SshSessi
     let (ui_read, worker_write) = std::io::pipe().unwrap();
     let (worker_read, ui_write) = std::io::pipe().unwrap();
     std::thread::spawn(move || ferossh_worker::run_blocking(worker_read, worker_write));
-    let link = Link::start(ui_read, ui_write, || {}).unwrap();
+    let link = Link::start(ui_read, ui_write, || {}, |_| {}).unwrap();
     let broker = Broker::spawn(|| {}).unwrap();
 
     let target = Target::resolve("testhost", env).unwrap();
@@ -165,7 +167,7 @@ fn connect(env: &Env, command: &str, answers: &[(&str, &str)]) -> (Run, SshSessi
 
 #[test]
 fn trusts_a_new_host_signs_with_a_key_file_and_runs_a_shell() {
-    let Some(server) = start_sshd() else {
+    let Some(server) = start_sshd("login", "") else {
         return;
     };
     let user = local_user();

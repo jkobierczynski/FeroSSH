@@ -9,7 +9,9 @@ repository.workspace = true
 publish.workspace = true
 
 [dependencies]
+ferossh-forward.workspace = true
 ferossh-ipc.workspace = true
+getrandom = "0.4"
 ferossh-sftp.workspace = true
 russh.workspace = true
 tokio = { version = "1.54", features = ["rt", "net", "time", "sync", "macros"] }
