@@ -475,7 +475,6 @@ async fn full_screen_apps_give_the_title_back() {
 }
 
 /// Logs in and leaves the shell open; returns the worker's channels.
-#[cfg(unix)]
 async fn log_in(port: u16, keys: &[KeyFile]) -> (mpsc::Sender<Message>, mpsc::Receiver<Message>) {
     let (to_worker, worker_in) = mpsc::channel(64);
     let (worker_out, mut from_worker) = mpsc::channel(64);
@@ -737,6 +736,532 @@ async fn sftp_edge_cases() {
             "{name}"
         );
         let _ = std::fs::remove_dir_all(&local);
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A terminal pane on a real shell: what the server sends goes into
+/// FeroSSH's terminal, and its replies (cursor reports, device
+/// attributes) go back, as in the window.
+struct Pane {
+    term: ferossh_term::Terminal,
+    to_worker: mpsc::Sender<Message>,
+    from_worker: mpsc::Receiver<Message>,
+}
+
+impl Pane {
+    async fn open(port: u16, keys: &[KeyFile]) -> Pane {
+        let (to_worker, from_worker) = log_in(port, keys).await;
+        let term = ferossh_term::Terminal::new(80, 24, &ferossh_term::Settings::default());
+        Pane {
+            term,
+            to_worker,
+            from_worker,
+        }
+    }
+
+    async fn send(&self, keys: &str) {
+        self.to_worker
+            .send(Message::Data {
+                channel: 1,
+                bytes: keys.as_bytes().to_vec(),
+            })
+            .await
+            .unwrap();
+    }
+
+    async fn resize(&mut self, cols: u16, rows: u16) {
+        self.term.resize(cols.into(), rows.into());
+        self.to_worker
+            .send(Message::Resize {
+                channel: 1,
+                cols,
+                rows,
+            })
+            .await
+            .unwrap();
+    }
+
+    fn grid(&self) -> ferossh_render::Grid {
+        let mut grid = ferossh_render::Grid::new(1, 1);
+        self.term.draw_into(&mut grid, true);
+        grid
+    }
+
+    /// The screen's rows as text, wide characters once.
+    fn lines(&self) -> Vec<String> {
+        let grid = self.grid();
+        (0..grid.rows())
+            .map(|y| {
+                grid.row(y)
+                    .unwrap()
+                    .iter()
+                    .filter(|c| !c.flags.contains(ferossh_render::Flags::WIDE_SPACER))
+                    .map(|c| c.ch)
+                    .collect::<String>()
+                    .trim_end()
+                    .to_owned()
+            })
+            .collect()
+    }
+
+    /// The character drawn in column `x` of row `y`.
+    fn at(&self, x: usize, y: usize) -> char {
+        self.grid().cell(x, y).unwrap().ch
+    }
+
+    /// Feeds the server's output in, answering the terminal's replies,
+    /// until `done` holds or `limit` passes; whether it held.
+    async fn wait(&mut self, limit: Duration, done: impl Fn(&Pane) -> bool) -> bool {
+        let deadline = tokio::time::Instant::now() + limit;
+        while !done(self) {
+            let left = deadline.saturating_duration_since(tokio::time::Instant::now());
+            match tokio::time::timeout(left, self.from_worker.recv()).await {
+                Ok(Some(Message::Data { bytes, .. })) => {
+                    self.term.feed(&bytes);
+                    for action in self.term.take_actions() {
+                        if let ferossh_term::Action::Reply(bytes) = action {
+                            self.to_worker
+                                .send(Message::Data { channel: 1, bytes })
+                                .await
+                                .unwrap();
+                        }
+                    }
+                }
+                Ok(Some(Message::Disconnected { reason, .. })) => panic!("disconnected: {reason}"),
+                Ok(Some(_)) => {}
+                Ok(None) => panic!("worker hung up"),
+                Err(_) => return false,
+            }
+        }
+        true
+    }
+
+    fn dump(&self) -> String {
+        self.lines().join("\n")
+    }
+
+    /// Waits for `done`, then for the program to finish drawing.
+    async fn until(&mut self, what: &str, done: impl Fn(&Pane) -> bool) {
+        if !self.wait(Duration::from_secs(20), done).await {
+            panic!("{what}: timed out; screen:\n{}", self.dump());
+        }
+        self.wait(Duration::from_millis(300), |_| false).await;
+    }
+
+    /// Presses Return until `done`: vttest pauses after every screen,
+    /// and some screens (132 columns) are passed over unchecked.
+    async fn next(&mut self, what: &str, done: impl Fn(&Pane) -> bool) {
+        for _ in 0..12 {
+            self.send("\r").await;
+            if self.wait(Duration::from_secs(3), &done).await {
+                self.wait(Duration::from_millis(300), |_| false).await;
+                return;
+            }
+        }
+        panic!("{what}: never came; screen:\n{}", self.dump());
+    }
+
+    fn has(&self, text: &str) -> bool {
+        self.lines().iter().any(|l| l.contains(text))
+    }
+
+    /// The cell `text` starts at, counting a wide character as two.
+    fn find(&self, text: &str) -> Option<(usize, usize)> {
+        let want: Vec<char> = text.chars().collect();
+        let grid = self.grid();
+        (0..grid.rows()).find_map(|y| {
+            let cells: Vec<(usize, char)> = grid
+                .row(y)?
+                .iter()
+                .enumerate()
+                .filter(|(_, c)| !c.flags.contains(ferossh_render::Flags::WIDE_SPACER))
+                .map(|(x, c)| (x, c.ch))
+                .collect();
+            cells
+                .windows(want.len())
+                .find(|w| w.iter().map(|(_, c)| *c).eq(want.iter().copied()))
+                .map(|w| (w[0].0, y))
+        })
+    }
+
+    fn flags(&self, x: usize, y: usize) -> ferossh_render::Flags {
+        self.grid().cell(x, y).unwrap().flags
+    }
+
+    /// Waits for the shell prompt as the last thing on the screen.
+    async fn prompt(&mut self, what: &str) {
+        self.until(what, |p| {
+            p.lines()
+                .iter()
+                .rev()
+                .find(|l| !l.is_empty())
+                .map(String::as_str)
+                == Some("READY$")
+        })
+        .await;
+    }
+}
+
+fn repeat(c: char, n: usize) -> String {
+    std::iter::repeat_n(c, n).collect()
+}
+
+/// vttest's checks of cursor movement, wrapping, tabs, scroll regions,
+/// origin mode, attributes, insert and delete, reports and DEC line
+/// drawing, each screen compared with what a VT102 shows. The 132-column
+/// screens are skipped: FeroSSH, like xterm by default, keeps the pane's
+/// width.
+async fn vttest(p: &mut Pane, name: &str) {
+    use ferossh_render::Flags;
+    let menu = |p: &Pane| p.has("Enter choice number (0 - 12)");
+    let stars = repeat('*', 80);
+    p.send("vttest\r").await;
+    p.until(name, menu).await;
+
+    p.send("1\r").await;
+    p.until(name, |p| {
+        p.lines()[23] == repeat('*', 80) && p.has("Push <RETURN>")
+    })
+    .await;
+    let l = p.lines();
+    let plus = format!("*{}*", repeat('+', 78));
+    assert_eq!(
+        (&l[0], &l[1], &l[22], &l[23]),
+        (&stars, &plus, &plus, &stars),
+        "{name}: border\n{}",
+        p.dump()
+    );
+    assert!(
+        l[2..22]
+            .iter()
+            .all(|r| r.starts_with("*+") && r.ends_with("+*")),
+        "{name}\n{}",
+        p.dump()
+    );
+    assert_eq!(
+        l[8],
+        format!("*+{0}{1}{0}+*", repeat(' ', 8), repeat('E', 60)),
+        "{name}"
+    );
+    p.next(name, |p| {
+        p.lines()[0].starts_with("Test of autowrap") && p.has("Push <RETURN>")
+    })
+    .await;
+    let l = p.lines();
+    for (y, c) in (2..20).zip('I'..='Z') {
+        let want = format!("{c}{}{}", repeat(' ', 78), c.to_ascii_lowercase());
+        assert_eq!(l[y], want, "{name}: autowrap\n{}", p.dump());
+    }
+    p.next(name, |p| {
+        p.has("inside ESC sequences") && p.has("Push <RETURN>")
+    })
+    .await;
+    assert!(
+        p.lines()[3..7].iter().all(|r| r == "A B C D E F G H I"),
+        "{name}\n{}",
+        p.dump()
+    );
+    p.next(name, |p| p.has("leading zeros") && p.has("Push <RETURN>"))
+        .await;
+    assert!(p.has("This is a correct sentence"), "{name}\n{}", p.dump());
+    p.next(name, menu).await;
+
+    p.send("2\r").await;
+    p.until(name, |p| p.has("WRAP AROUND") && p.has("Push <RETURN>"))
+        .await;
+    assert!(
+        p.lines()[0..3].iter().all(|r| *r == stars),
+        "{name}: wrap\n{}",
+        p.dump()
+    );
+    p.next(name, |p| p.has("TAB setting") && p.has("Push <RETURN>"))
+        .await;
+    let l = p.lines();
+    assert_eq!(l[0], l[1], "{name}: tabs");
+    assert_eq!(l[0].find('*'), Some(6), "{name}: tabs");
+    assert_eq!(l[0].matches('*').count(), 13, "{name}: tabs");
+    p.next(name, |p| {
+        p.has("Origin mode test") && p.has("one above the bottom")
+    })
+    .await;
+    let l = p.lines();
+    assert!(
+        l[23].starts_with("Origin mode test."),
+        "{name}: origin\n{}",
+        p.dump()
+    );
+    assert!(
+        l[22].starts_with("This line should be the one above the bottom"),
+        "{name}\n{}",
+        p.dump()
+    );
+    p.next(name, |p| {
+        p.lines()[0].starts_with("This line should be at the top")
+    })
+    .await;
+    assert!(
+        p.lines()[23].starts_with("Origin mode test."),
+        "{name}\n{}",
+        p.dump()
+    );
+    p.next(name, |p| {
+        p.has("Graphic rendition") && p.has("Dark background")
+    })
+    .await;
+    // Bold, underlined, inverse.
+    for (word, want) in [
+        ("vanilla", (false, false, false)),
+        ("bold underline blink negative", (true, true, true)),
+        ("bold negative", (true, false, true)),
+        ("underline negative", (false, true, true)),
+        ("bold", (true, false, false)),
+    ] {
+        let (x, y) = p
+            .find(word)
+            .unwrap_or_else(|| panic!("{name}: {word}\n{}", p.dump()));
+        let f = p.flags(x, y);
+        let got = (
+            f.contains(Flags::BOLD),
+            f.contains(Flags::UNDERLINE),
+            f.contains(Flags::INVERSE),
+        );
+        assert_eq!(got, want, "{name}: {word}");
+    }
+    p.next(name, menu).await;
+
+    p.send("8\r").await;
+    p.until(name, |p| {
+        p.has("Screen accordion") && p.lines()[23] == repeat('X', 80)
+    })
+    .await;
+    let l = p.lines();
+    for (y, c) in (0..24).zip('A'..='X').filter(|(y, _)| *y != 3) {
+        assert_eq!(
+            l[y],
+            repeat(c, 80),
+            "{name}: insert/delete line\n{}",
+            p.dump()
+        );
+    }
+    p.next(name, |p| p.has("Top line: A's")).await;
+    let l = p.lines();
+    assert_eq!(
+        (&l[0], &l[23]),
+        (&repeat('A', 80), &repeat('X', 80)),
+        "{name}\n{}",
+        p.dump()
+    );
+    assert!(
+        l[2..23].iter().all(String::is_empty),
+        "{name}\n{}",
+        p.dump()
+    );
+    p.next(name, |p| p.has("'Insert Mode'")).await;
+    assert_eq!(
+        p.lines()[0],
+        format!("A{}B", repeat('*', 78)),
+        "{name}: insert mode"
+    );
+    p.next(name, |p| p.has("'Delete Character'")).await;
+    assert_eq!(p.lines()[0], "AB", "{name}: delete character");
+    p.next(name, |p| {
+        p.has("staggered") && p.lines()[23].starts_with('X')
+    })
+    .await;
+    let l = p.lines();
+    for (y, c) in (0..24).zip('A'..='X').filter(|(y, _)| *y > 4) {
+        assert_eq!(
+            l[y],
+            repeat(c, 79 - y),
+            "{name}: delete character\n{}",
+            p.dump()
+        );
+    }
+    p.next(name, |p| {
+        p.has("staggered") && p.lines()[23] == repeat('X', 16)
+    })
+    .await;
+    let l = p.lines();
+    for (y, c) in (0..24).zip('A'..='X').filter(|(y, _)| *y > 4) {
+        assert_eq!(
+            l[y],
+            repeat(c, 39 - y),
+            "{name}: delete character\n{}",
+            p.dump()
+        );
+    }
+    p.next(name, |p| p.has("'Insert Character'")).await;
+    let row = "  A B C D E F G H I J K L M N O P Q R S T U V W X Y Z";
+    assert_eq!(
+        p.lines().iter().filter(|l| *l == row).count(),
+        2,
+        "{name}: insert character\n{}",
+        p.dump()
+    );
+    p.next(name, menu).await;
+
+    p.send("6\r").await;
+    let reports = |p: &Pane| p.has("Enter choice number (0 - 7)");
+    p.until(name, reports).await;
+    p.send("4\r").await;
+    p.until(name, |p| p.has("Report is:") && p.has("Push <RETURN>"))
+        .await;
+    assert!(
+        p.has("-- means VT102"),
+        "{name}: device attributes\n{}",
+        p.dump()
+    );
+    p.next(name, reports).await;
+    p.send("3\r").await;
+    p.until(name, |p| {
+        p.has("report cursor position") && p.has("Push <RETURN>")
+    })
+    .await;
+    assert!(
+        p.has("means \"TERMINAL OK\""),
+        "{name}: status\n{}",
+        p.dump()
+    );
+    assert!(
+        p.has("<27> [ 5 ; 1 R  -- OK"),
+        "{name}: cursor report\n{}",
+        p.dump()
+    );
+    p.next(name, reports).await;
+    p.send("5\r").await;
+    p.until(name, |p| {
+        p.has("Secondary Device Attributes") && p.has("Push <RETURN>")
+    })
+    .await;
+    assert!(
+        p.has("<27> [ > "),
+        "{name}: secondary attributes\n{}",
+        p.dump()
+    );
+    p.next(name, reports).await;
+    p.send("0\r").await;
+    p.until(name, menu).await;
+
+    // vttest before 2.7 (2017) shows the character sets straight away,
+    // later ones from a menu.
+    let sets = |p: &Pane| p.has("These are the installed character sets");
+    let charsets_menu = |p: &Pane| p.has("Enter choice number") && !menu(p);
+    p.send("3\r").await;
+    p.until(name, |p| sets(p) || charsets_menu(p)).await;
+    if !sets(p) {
+        p.send("8\r").await;
+        p.until(name, sets).await;
+    }
+    let drawing = "◆▒␉␌␍␊°±␤␋┘┐┌└┼⎺⎻─⎼⎽├┤┴┬│≤≥π≠£·";
+    assert!(
+        p.lines().iter().any(|l| l.matches(drawing).count() == 2),
+        "{name}: line drawing in G0 and G1\n{}",
+        p.dump()
+    );
+    p.next(name, |p| menu(p) || charsets_menu(p)).await;
+    if !menu(p) {
+        p.send("0\r").await;
+        p.until(name, menu).await;
+    }
+    p.send("0\r").await;
+    p.prompt(name).await;
+}
+
+/// Real programs on real servers through the worker into FeroSSH's
+/// terminal, as in a tab: vttest, wide and combining characters, less
+/// and vi on the alternate screen, and a resize the server's pty sees.
+#[tokio::test]
+async fn real_programs_draw_correctly() {
+    if !available() {
+        return;
+    }
+    let dir = std::env::temp_dir().join(format!("ferossh-interop-vt-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let keys = user_keys(&dir);
+    for (tag, server) in [
+        ("18.04", "openssh"),
+        ("26.04", "openssh"),
+        ("26.04", "dropbear"),
+    ] {
+        let label = format!("{server} on {tag}");
+        let name = label.as_str();
+        let running = Server::start(tag, server, &dir);
+        let mut p = Pane::open(running.port, &keys).await;
+        p.send("export LANG=C.UTF-8 PS1='READY$ '; clear\r").await;
+        p.prompt(name).await;
+
+        // vttest checks the terminal, not the server: one old and one new
+        // build of it is enough.
+        if server == "openssh" {
+            vttest(&mut p, name).await;
+        }
+
+        // Typed as octal so the line editor sees only ASCII.
+        p.send("clear; printf '\\346\\227\\245\\346\\234\\254|\\n\\360\\237\\231\\202|\\ne\\314\\201|\\n'\r")
+            .await;
+        p.prompt(name).await;
+        let (x, y) = p
+            .find("日本|")
+            .unwrap_or_else(|| panic!("{name}\n{}", p.dump()));
+        assert_eq!((x, p.at(4, y)), (0, '|'), "{name}: wide characters");
+        assert_eq!(
+            p.at(2, y + 1),
+            '|',
+            "{name}: emoji is two cells\n{}",
+            p.dump()
+        );
+        assert_eq!(
+            (p.at(0, y + 2), p.at(1, y + 2)),
+            ('e', '|'),
+            "{name}: combining accent"
+        );
+
+        p.send("seq 1 200 | less\r").await;
+        p.until(name, |p| {
+            let l = p.lines();
+            l[0] == "1" && l[22] == "23" && l[23].starts_with(':')
+        })
+        .await;
+        p.send(" ").await;
+        p.until(name, |p| p.lines()[0] == "24").await;
+        p.send("G").await;
+        p.until(name, |p| p.lines()[22] == "200").await;
+        p.send("q").await;
+        p.prompt(name).await;
+        // Back from the alternate screen: what was there before is again.
+        assert!(
+            p.find("日本|").is_some() && !p.lines().iter().any(|l| l == "200"),
+            "{name}\n{}",
+            p.dump()
+        );
+
+        p.send("clear; printf 'alpha\\nbeta\\n' > f.txt; vim.tiny -u NONE f.txt\r")
+            .await;
+        p.until(name, |p| {
+            let l = p.lines();
+            l[0] == "alpha" && l[1] == "beta" && l[2] == "~" && l[23].contains("f.txt")
+        })
+        .await;
+        p.send("Gowide 日本\x1b:wq\r").await;
+        p.prompt(name).await;
+        p.send("clear; cat f.txt\r").await;
+        p.prompt(name).await;
+        assert!(p.has("wide 日本"), "{name}: vi wrote\n{}", p.dump());
+
+        p.resize(100, 30).await;
+        p.send("clear; stty size\r").await;
+        p.prompt(name).await;
+        assert!(p.has("30 100"), "{name}: resize\n{}", p.dump());
+        p.send("printf '%099d|\\n' 0\r").await;
+        p.prompt(name).await;
+        assert_eq!(
+            p.find("0|").map(|(x, _)| x),
+            Some(98),
+            "{name}: 100 columns\n{}",
+            p.dump()
+        );
     }
     let _ = std::fs::remove_dir_all(&dir);
 }

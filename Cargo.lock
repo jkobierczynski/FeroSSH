@@ -636,6 +636,7 @@ dependencies = [
  "ferossh-auth",
  "ferossh-forward",
  "ferossh-ipc",
+ "ferossh-render",
  "ferossh-sftp",
  "ferossh-term",
  "getrandom 0.4.3",
