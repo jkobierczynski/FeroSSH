@@ -28,13 +28,13 @@ use russh::client::{self, AuthResult, DisconnectReason, Handle, KeyboardInteract
 use russh::keys::agent::AgentIdentity;
 use russh::keys::{Algorithm, HashAlg, PublicKey, PublicKeyOrCertificate};
 use russh::{
-    Channel, ChannelMsg, ChannelOpenFailure, Disconnect, MethodKind, MethodSet, Names, SshId,
-    cipher,
+    Channel, ChannelMsg, ChannelOpenFailure, Disconnect, MethodKind, MethodSet, Names, Preferred,
+    SshId, cipher,
 };
 use tokio::net::TcpStream;
 use tokio::sync::{mpsc, oneshot, watch};
 
-use crate::crypto_policy::{MIN_RSA_BITS, preferred_for};
+use crate::crypto_policy::{MIN_RSA_BITS, preferred_for, without_chacha};
 use crate::forward::{self, Incoming};
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
@@ -45,6 +45,9 @@ const KEEPALIVE_MAX: usize = 3;
 const MAX_ATTEMPTS: usize = 3;
 const TERM: &str = "xterm-256color";
 const CLIENT_ID: &str = "SSH-2.0-FeroSSH";
+const TERRAPIN: &str = "The server offers ChaCha20-Poly1305 without strict key exchange, which \
+     is open to the Terrapin attack, and no AES-GCM to use instead. Update the server's \
+     SSH software.";
 
 /// What the UI asked for in [`Message::Connect`].
 #[derive(Debug, Clone)]
@@ -64,6 +67,9 @@ pub enum Failure {
     Ssh(russh::Error),
     /// A policy refusal or a user decision, already worded for the user.
     Refused(String),
+    /// The server chose ChaCha20-Poly1305 but has no strict key exchange,
+    /// which leaves it open to Terrapin. [`session`] retries without it.
+    NoStrictKex,
     /// The UI closed the channel or went away.
     Cancelled,
 }
@@ -90,6 +96,7 @@ impl fmt::Display for Failure {
             ),
             Failure::Ssh(e) => write!(f, "{e}."),
             Failure::Refused(why) => f.write_str(why),
+            Failure::NoStrictKex => f.write_str(TERRAPIN),
             Failure::Cancelled => f.write_str("Cancelled."),
         }
     }
@@ -292,6 +299,9 @@ struct Shared {
     names: Option<(String, String, String)>,
     /// The server's disconnect message.
     server_said: Option<String>,
+    /// The host key the UI accepted, so a retried connection to the same
+    /// server does not ask again.
+    accepted_key: Option<Vec<u8>>,
 }
 
 type SharedRef = Arc<Mutex<Shared>>;
@@ -353,15 +363,21 @@ impl client::Handler for Client {
         let blob = key
             .to_bytes()
             .map_err(|_| Failure::Refused("The server's host key is malformed.".into()))?;
+        if with(&self.shared, |s| s.accepted_key.as_ref() == Some(&blob)) == Some(true) {
+            return Ok(true);
+        }
         let (tx, rx) = oneshot::channel();
         with(&self.shared, |s| s.verdict = Some(tx));
         let msg = Message::HostKey {
             channel: self.channel,
-            key: blob,
+            key: blob.clone(),
         };
         self.out.send(msg).await.map_err(|_| Failure::Cancelled)?;
         match rx.await {
-            Ok(true) => Ok(true),
+            Ok(true) => {
+                with(&self.shared, |s| s.accepted_key = Some(blob));
+                Ok(true)
+            }
             Ok(false) => Err(Failure::Refused("Host key not accepted.".into())),
             Err(_) => Err(Failure::Cancelled),
         }
@@ -377,11 +393,7 @@ impl client::Handler for Client {
         // without strict key exchange. FeroSSH offers no EtM-only cipher,
         // so ChaCha20 is the case to refuse; AES-GCM is not affected.
         if names.cipher == cipher::CHACHA20_POLY1305 && !names.strict_kex() {
-            return Err(Failure::Refused(
-                "The server negotiated ChaCha20-Poly1305 without strict key exchange, which is \
-                 open to the Terrapin attack. Update the server's OpenSSH (9.6 or later)."
-                    .into(),
-            ));
+            return Err(Failure::NoStrictKex);
         }
         let found = (
             names.kex.as_ref().to_owned(),
@@ -692,9 +704,41 @@ async fn session(
     ctx: &mut Ctx,
     connections: &Connections,
 ) -> Result<Ended, Failure> {
+    // A server without strict key exchange may not use ChaCha20, but that
+    // only shows once it has chosen it: connect again without it.
+    let preferred = preferred_for(&p.host_key_algs);
+    let (mut handle, forwards) = match connect(p, preferred.clone(), inbox, ctx, connections).await
+    {
+        Err(Failure::NoStrictKex) => {
+            match connect(p, without_chacha(preferred), inbox, ctx, connections).await {
+                Err(Failure::Ssh(russh::Error::NoCommonAlgo { .. })) => {
+                    return Err(Failure::NoStrictKex);
+                }
+                other => other?,
+            }
+        }
+        other => other?,
+    };
+
+    authenticate(&mut handle, p, inbox, ctx).await?;
+    let conn = Arc::new(handle);
+    let names = with(&ctx.shared, |s| s.names.clone()).flatten();
+    connections.insert(ctx.channel, &conn, names, forwards.clone());
+    ctx.forwards = Some(forwards);
+    shell(conn, inbox, ctx).await
+}
+
+/// Opens the TCP connection and runs key exchange with `preferred`.
+async fn connect(
+    p: &Params,
+    preferred: Preferred,
+    inbox: &mut mpsc::Receiver<Message>,
+    ctx: &mut Ctx,
+    connections: &Connections,
+) -> Result<(Connection, Arc<ConnForwards>), Failure> {
     let config = Arc::new(client::Config {
         client_id: SshId::Standard(CLIENT_ID.into()),
-        preferred: preferred_for(&p.host_key_algs),
+        preferred,
         keepalive_interval: Some(KEEPALIVE),
         keepalive_max: KEEPALIVE_MAX,
         nodelay: true,
@@ -725,14 +769,8 @@ async fn session(
         connections: connections.clone(),
         _alive: alive_tx,
     };
-    let mut handle = drive(client::connect_stream(config, tcp, handler), inbox, ctx).await??;
-
-    authenticate(&mut handle, p, inbox, ctx).await?;
-    let conn = Arc::new(handle);
-    let names = with(&ctx.shared, |s| s.names.clone()).flatten();
-    connections.insert(ctx.channel, &conn, names, forwards.clone());
-    ctx.forwards = Some(forwards);
-    shell(conn, inbox, ctx).await
+    let handle = drive(client::connect_stream(config, tcp, handler), inbox, ctx).await??;
+    Ok((handle, forwards))
 }
 
 /// Opens a shell on `conn` and pumps it until it closes. Disconnects the

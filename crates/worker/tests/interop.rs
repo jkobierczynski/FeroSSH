@@ -46,13 +46,20 @@ const C25519: &str = "curve25519-sha256";
 const C25519_LIBSSH: &str = "curve25519-sha256@libssh.org";
 const CHACHA: &str = "chacha20-poly1305@openssh.com";
 const NO_ALGO: &str = "FeroSSH allows";
-const TERRAPIN: &str = "Terrapin";
+const GCM: &str = "aes256-gcm@openssh.com";
 
 /// (image tag, server, expected outcome).
 const CASES: &[(&str, &str, Expect)] = &[
-    // OpenSSH 7.6 has neither strict key exchange nor ML-KEM. It offers
-    // AES-GCM too, but FeroSSH picks ChaCha20 first and then refuses it.
-    ("18.04", "openssh", Refused(TERRAPIN)),
+    // OpenSSH 7.6 has no strict key exchange, so ChaCha20 is out and
+    // FeroSSH connects again with AES-GCM.
+    (
+        "18.04",
+        "openssh",
+        Login {
+            kex: C25519,
+            cipher: GCM,
+        },
+    ),
     // Ubuntu backported strict key exchange to 8.2 and later.
     (
         "20.04",
@@ -221,6 +228,7 @@ struct Outcome {
     connected: Option<(String, String, String)>,
     output: Vec<u8>,
     disconnected: String,
+    host_key_prompts: usize,
 }
 
 /// Plays the UI for one connection: accepts the host key, signs with the
@@ -258,6 +266,7 @@ async fn connect(port: u16, key: &KeyFile, command: &str) -> Outcome {
         };
         match msg {
             Message::HostKey { .. } => {
+                seen.host_key_prompts += 1;
                 send(Message::HostKeyVerdict {
                     channel: 1,
                     accept: true,
@@ -324,7 +333,8 @@ async fn servers_of_every_age() {
             (Login { kex, cipher }, Some((k, c, _))) => {
                 // Older OpenSSH and Dropbear name curve25519 the libssh way.
                 let kex_ok = k == kex || (kex == C25519 && k == C25519_LIBSSH);
-                kex_ok && c == cipher && output.contains("fero42")
+                // A retry without ChaCha20 must not ask about the key again.
+                kex_ok && c == cipher && output.contains("fero42") && seen.host_key_prompts == 1
             }
             (Refused(why), None) => seen.disconnected.contains(why),
             _ => false,

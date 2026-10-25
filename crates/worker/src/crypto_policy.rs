@@ -84,6 +84,21 @@ pub fn preferred_for(known_types: &[String]) -> Preferred {
     }
 }
 
+/// `p` without ChaCha20-Poly1305, for a server that lacks strict key
+/// exchange (Terrapin, CVE-2023-48795). AES-GCM is not affected.
+pub fn without_chacha(p: Preferred) -> Preferred {
+    Preferred {
+        cipher: Cow::Owned(
+            p.cipher
+                .iter()
+                .filter(|c| **c != cipher::CHACHA20_POLY1305)
+                .cloned()
+                .collect(),
+        ),
+        ..p
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
