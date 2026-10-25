@@ -91,6 +91,7 @@ use crate::look;
 use crate::pattern;
 use crate::putty_reg;
 use crate::sandbox;
+use crate::scrollmark;
 use crate::sessions::{HostItem, SessionList, SideAction, SideKey};
 use crate::ssh::{Effect, Env, SshSession, State, Target};
 use crate::tabstrip::{self, Forwarding, Health, Hit, Palette, StripLayout, TabLabel};
@@ -101,6 +102,11 @@ const DEFAULT_COLS: usize = 80;
 const DEFAULT_ROWS: usize = 24;
 /// Space between a pane's edge and its grid, in DIPs.
 const PADDING_DIP: i32 = 4;
+/// The scroll mark's width, its gap to the pane's right edge and its
+/// shortest length, in DIPs. Width plus gap stays inside the padding.
+const MARK_WIDTH_DIP: i32 = 3;
+const MARK_INSET_DIP: i32 = 1;
+const MARK_MIN_DIP: i32 = 12;
 /// Space around the tab strip's and side pane's text, in DIPs.
 const CHROME_PADDING_DIP: i32 = 3;
 /// Extra pixels either side of a divider that still grab it, in DIPs.
@@ -272,6 +278,9 @@ struct Pane {
     /// The host name in the first report: reports naming another host
     /// come from a nested `ssh` and are not this connection's.
     cwd_host: Option<String>,
+    /// Where the scroll mark was last drawn, so moving or hiding it can
+    /// repaint the rows it covered.
+    mark: Option<Rect>,
 }
 
 impl Pane {
@@ -279,6 +288,30 @@ impl Pane {
     fn origin(&self, dpi: u32) -> (i32, i32) {
         let pad = padding(dpi);
         (self.rect.x + pad, self.rect.y + pad)
+    }
+
+    /// The scroll mark's place while the view is scrolled back: a thin bar
+    /// in the right padding, beside the rows, never over the text.
+    fn scroll_mark(&self, dpi: u32) -> Option<Rect> {
+        let (_, oy) = self.origin(dpi);
+        let rows = self.grid.rows();
+        let len = (rows as i32 * self.metrics.height as i32).min(self.rect.bottom() - oy);
+        let (offset, size) = scrollmark::thumb(
+            len,
+            rows,
+            self.term.history_len(),
+            self.term.display_offset(),
+            scale(MARK_MIN_DIP, dpi),
+        )?;
+        let w = scale(MARK_WIDTH_DIP, dpi).max(2);
+        let right = self.rect.right() - scale(MARK_INSET_DIP, dpi).max(1);
+        Some(Rect::new(right - w, oy + offset, w, size))
+    }
+
+    /// The scroll mark's colour: the theme's text, faded well into its
+    /// background.
+    fn mark_colour(&self) -> Rgb {
+        mix(self.theme.background, self.theme.foreground, 0.4)
     }
 
     /// What the tab strip and window title call this pane.
@@ -777,6 +810,7 @@ fn new_pane(
         bell: false,
         cwd: None,
         cwd_host: None,
+        mark: None,
     }
 }
 
@@ -2344,6 +2378,22 @@ impl Window {
                 pane.grid.mark_dirty(c.y);
             }
         }
+        // A moved or hidden mark: repaint the rows under where it was and
+        // where it goes; the mark itself is drawn over them as a fill.
+        let mark = pane.scroll_mark(self.dpi);
+        if mark != pane.mark {
+            let (_, oy) = pane.origin(self.dpi);
+            let ch = pane.metrics.height.max(1) as i32;
+            let last = pane.grid.rows().saturating_sub(1);
+            for r in [pane.mark, mark].into_iter().flatten() {
+                let first = ((r.y - oy) / ch).max(0) as usize;
+                let end = ((r.bottom() - 1 - oy) / ch).max(0) as usize;
+                for y in first.min(last)..=end.min(last) {
+                    pane.grid.mark_dirty(y);
+                }
+            }
+            pane.mark = mark;
+        }
         self.invalidate_dirty(id);
     }
 
@@ -2627,6 +2677,13 @@ impl Window {
             && let Some(p) = self.panes.get(&tab.focus)
         {
             frame(p.rect, g, p.theme.cursor, &mut out);
+        }
+        for id in self.visible_ids() {
+            if let Some(p) = self.panes.get(&id)
+                && let Some(m) = p.scroll_mark(self.dpi)
+            {
+                out.push((pixel(m), p.mark_colour()));
+            }
         }
         if let Some(Drag::Pane { active: true, .. } | Drag::Tab { out: true, .. }) = &self.drag {
             let accent = Rgb::new(0xe5, 0xb5, 0x3b);
