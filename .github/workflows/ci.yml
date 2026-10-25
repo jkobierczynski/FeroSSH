@@ -116,9 +116,9 @@ jobs:
           sudo chown rdptest /home/rdptest/.xsession
           sudo sed -i 's/allowed_users=console/allowed_users=anybody/' /etc/X11/Xwrapper.config
           sudo systemctl restart xrdp-sesman xrdp
-      - run: cargo test --locked -p ferossh-viewer --features rdp rdp::
+      - run: "cargo test --locked -p ferossh-viewer --features rdp rdp::"
         env:
-          FEROSSH_TEST_RDP: 127.0.0.1:3389 rdptest Secret-pw1
+          FEROSSH_TEST_RDP: "127.0.0.1:3389 rdptest Secret-pw1"
 
   interop:
     name: Interop against older and newer servers (Linux)
