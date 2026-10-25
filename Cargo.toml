@@ -13,6 +13,7 @@ publish = false
 [workspace.dependencies]
 ferossh-auth = { path = "crates/auth" }
 ferossh-config = { path = "crates/config" }
+ferossh-forward = { path = "crates/forward" }
 ferossh-ipc = { path = "crates/ipc" }
 ferossh-render = { path = "crates/render" }
 ferossh-sftp = { path = "crates/sftp" }

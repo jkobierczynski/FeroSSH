@@ -5,30 +5,32 @@
 //! cannot open the user's files or keys: everything it needs from them
 //! (known_hosts verdicts, public keys, signatures, passwords) it asks the
 //! UI for over IPC; file transfers stream through IPC for the same reason
-//! ([`sftp`]). This crate is that worker, minus the process setup,
+//! ([`sftp`]), and so do forwarded connections, whose sockets the UI holds
+//! ([`forward`]). This crate is that worker, minus the process setup,
 //! and runs anywhere tokio does, so it is tested against a real OpenSSH
 //! server on Linux.
 
 pub mod crypto_policy;
+mod forward;
 mod session;
 mod sftp;
 
-use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::thread;
 
 use ferossh_ipc::{ChannelId, Decoder, Message, PROTOCOL_VERSION, encode};
 use tokio::sync::mpsc;
 
-use session::Connections;
 pub use session::Params;
+use session::{Connections, Route};
 
 /// Messages queued in each direction before the sender waits.
 const QUEUE: usize = 64;
 
-/// Serves the UI: one task per shell or SFTP channel, routed by channel id;
-/// shells opened with [`Message::OpenChannel`] and SFTP channels share their
-/// host's connection. Returns when the UI closes its end.
+/// Serves the UI: one task per shell, SFTP channel, remote forward
+/// listener and forwarded stream, routed by channel id; shells opened with
+/// [`Message::OpenChannel`], SFTP and forwards share their host's
+/// connection. Returns when the UI closes its end.
 pub async fn serve(mut inbox: mpsc::Receiver<Message>, out: mpsc::Sender<Message>) {
     let hello = Message::Hello {
         version: PROTOCOL_VERSION,
@@ -40,8 +42,13 @@ pub async fn serve(mut inbox: mpsc::Receiver<Message>, out: mpsc::Sender<Message
         Some(Message::Hello { version }) if version == PROTOCOL_VERSION => {}
         _ => return,
     }
-    let mut sessions: HashMap<ChannelId, mpsc::Sender<Message>> = HashMap::new();
     let connections = Connections::default();
+    let routes = connections.routes.clone();
+    // A queue for a session task, or `None` when the id is taken.
+    let session = |channel: ChannelId| {
+        let (tx, rx) = mpsc::channel(QUEUE);
+        routes.insert(channel, Route::Session(tx)).then_some(rx)
+    };
     while let Some(msg) = inbox.recv().await {
         match msg {
             Message::OpenChannel {
@@ -49,17 +56,14 @@ pub async fn serve(mut inbox: mpsc::Receiver<Message>, out: mpsc::Sender<Message
                 connection,
                 cols,
                 rows,
+                x11,
             } => {
-                sessions.retain(|_, tx| !tx.is_closed());
-                if sessions.contains_key(&channel) {
-                    continue;
-                }
-                let (tx, rx) = mpsc::channel(QUEUE);
-                sessions.insert(channel, tx);
+                let Some(rx) = session(channel) else { continue };
                 tokio::spawn(session::open(
                     channel,
                     connection,
                     (cols, rows),
+                    x11,
                     rx,
                     out.clone(),
                     connections.clone(),
@@ -69,12 +73,7 @@ pub async fn serve(mut inbox: mpsc::Receiver<Message>, out: mpsc::Sender<Message
                 channel,
                 connection,
             } => {
-                sessions.retain(|_, tx| !tx.is_closed());
-                if sessions.contains_key(&channel) {
-                    continue;
-                }
-                let (tx, rx) = mpsc::channel(QUEUE);
-                sessions.insert(channel, tx);
+                let Some(rx) = session(channel) else { continue };
                 tokio::spawn(sftp::run(
                     channel,
                     connection,
@@ -91,13 +90,9 @@ pub async fn serve(mut inbox: mpsc::Receiver<Message>, out: mpsc::Sender<Message
                 cols,
                 rows,
                 host_key_algs,
+                x11,
             } => {
-                sessions.retain(|_, tx| !tx.is_closed());
-                if sessions.contains_key(&channel) {
-                    continue;
-                }
-                let (tx, rx) = mpsc::channel(QUEUE);
-                sessions.insert(channel, tx);
+                let Some(rx) = session(channel) else { continue };
                 let params = Params {
                     host,
                     port,
@@ -105,6 +100,7 @@ pub async fn serve(mut inbox: mpsc::Receiver<Message>, out: mpsc::Sender<Message
                     cols,
                     rows,
                     host_key_algs,
+                    x11,
                 };
                 tokio::spawn(session::run(
                     channel,
@@ -114,14 +110,55 @@ pub async fn serve(mut inbox: mpsc::Receiver<Message>, out: mpsc::Sender<Message
                     connections.clone(),
                 ));
             }
+            Message::RemoteForward {
+                channel,
+                connection,
+                bind,
+                port,
+            } => {
+                let Some(rx) = session(channel) else { continue };
+                tokio::spawn(forward::remote(
+                    channel,
+                    connection,
+                    bind,
+                    port,
+                    rx,
+                    out.clone(),
+                    connections.clone(),
+                ));
+            }
+            Message::ForwardOpen {
+                channel,
+                connection,
+                target,
+                origin_host,
+                origin_port,
+            } => {
+                let (tx, rx) = mpsc::unbounded_channel();
+                if !routes.insert(channel, Route::Stream(tx)) {
+                    continue;
+                }
+                tokio::spawn(forward::open(
+                    channel,
+                    connection,
+                    target,
+                    (origin_host, origin_port),
+                    rx,
+                    out.clone(),
+                    connections.clone(),
+                ));
+            }
             other => {
                 let Some(channel) = other.channel() else {
                     continue;
                 };
-                if let Some(tx) = sessions.get(&channel)
-                    && tx.send(other).await.is_err()
-                {
-                    sessions.remove(&channel);
+                let delivered = match routes.get(channel) {
+                    Some(Route::Session(tx)) => tx.send(other).await.is_ok(),
+                    Some(Route::Stream(tx)) => tx.send(other).is_ok(),
+                    None => true,
+                };
+                if !delivered {
+                    routes.remove(channel);
                 }
             }
         }

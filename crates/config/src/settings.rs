@@ -82,6 +82,9 @@ pub struct Settings {
     pub parallel_transfers: Option<usize>,
     /// The file view follows the shell's working directory (OSC 7).
     pub follow_directory: bool,
+    /// The X server forwarded X11 goes to (`DISPLAY` syntax); the `DISPLAY`
+    /// environment variable, or `localhost:0`, when unset.
+    pub x11_display: Option<String>,
 }
 
 /// Scrollback is capped here, as the terminal caps it.
@@ -109,6 +112,7 @@ impl Default for Settings {
             verify_transfers: false,
             parallel_transfers: None,
             follow_directory: true,
+            x11_display: None,
         }
     }
 }
@@ -220,6 +224,10 @@ impl Settings {
                     block = Block::Top;
                     s.follow_directory = yes(&args).unwrap_or(true);
                 }
+                "x11display" => {
+                    block = Block::Top;
+                    s.x11_display = first.filter(|d| !d.is_empty());
+                }
                 "scrollback" if matches!(block, Block::Profile(_)) => {
                     if let Block::Profile(i) = block
                         && let Some(p) = s.profiles.get_mut(i)
@@ -309,6 +317,9 @@ impl Settings {
             let _ = writeln!(out, "ParallelTransfers {n}");
         }
         let _ = writeln!(out, "FollowDirectory {}", flag(self.follow_directory));
+        if let Some(d) = &self.x11_display {
+            let _ = writeln!(out, "X11Display {}", arg(d));
+        }
         for f in &self.favourites {
             let _ = writeln!(out, "Favourite {}", arg(f));
         }
@@ -417,6 +428,7 @@ DownloadFolder "D:\My Transfers"
 VerifyTransfers yes
 ParallelTransfers 20
 FollowDirectory no
+X11Display 192.168.1.5:0.0
 Favourite web "db one"
 Favorite WEB
 ThemeRule
@@ -468,6 +480,7 @@ NewKeyword later
         assert!(s.verify_transfers);
         assert_eq!(s.parallel_transfers, Some(8));
         assert!(!s.follow_directory);
+        assert_eq!(s.x11_display.as_deref(), Some("192.168.1.5:0.0"));
         let big = s.profile("big").unwrap();
         assert_eq!(big.font_size, None);
         assert_eq!(big.theme.as_deref(), Some("Solarized Dark"));
