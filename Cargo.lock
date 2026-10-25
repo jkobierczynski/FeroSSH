@@ -562,6 +562,7 @@ dependencies = [
  "ferossh-worker",
  "russh",
  "tokio",
+ "unicode-width",
  "windows",
  "zeroize",
 ]

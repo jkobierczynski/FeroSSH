@@ -20,15 +20,25 @@ mod clipboard;
 mod conpty;
 // Platform-neutral, tested everywhere; only the Windows build uses them.
 #[cfg_attr(not(windows), allow(dead_code))]
+mod layout;
+#[cfg_attr(not(windows), allow(dead_code))]
 mod link;
+#[cfg_attr(not(windows), allow(dead_code))]
+mod look;
 #[cfg_attr(not(windows), allow(dead_code))]
 mod pattern;
 #[cfg(windows)]
+mod putty_reg;
+#[cfg(windows)]
 mod sandbox;
+#[cfg_attr(not(windows), allow(dead_code))]
+mod sessions;
 #[cfg_attr(not(windows), allow(dead_code))]
 mod ssh;
 #[cfg(all(test, unix))]
 mod ssh_e2e;
+#[cfg_attr(not(windows), allow(dead_code))]
+mod tabstrip;
 #[cfg(windows)]
 mod win;
 

@@ -22,8 +22,8 @@ use ferossh_render::{Cell, Color, Cursor, CursorShape, Flags, Grid, Rgb, Theme};
 use crate::input::{self, Key, Mods, MouseButton, MouseEvent};
 use crate::sanitize::{Paste, prepare_paste, sanitize_title};
 
-/// Per-session terminal settings. Session profiles (milestone 4) will
-/// store these; until then every pane uses the defaults.
+/// Per-session terminal settings, from the window's settings file and the
+/// host's session profile.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Settings {
     /// Lines of scrollback kept above the screen.
