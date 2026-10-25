@@ -3,14 +3,18 @@
 //!
 //! Each tab shows a state dot (green: logged in, amber: connecting, grey:
 //! closed or local), its title and a close mark; a `+` at the end opens a
-//! new tab. It is drawn into a [`Grid`] like a terminal row, in the colours
-//! of the active pane's theme, so it needs nothing from the renderer.
+//! new tab. It is drawn into a [`Grid`] like a terminal row, so it needs
+//! nothing from the renderer. On Windows its colours follow the system menu
+//! bar, with the active tab in the window colour.
 
 use ferossh_render::{Cell, Color, Flags, Grid, Rgb, Theme};
 use unicode_width::UnicodeWidthChar;
 
 /// The longest title a tab shows, in cells.
 const MAX_TITLE: usize = 24;
+/// Short titles are padded to this many cells while there is room, so
+/// tabs are easy to hit.
+const MIN_TITLE: usize = 10;
 
 /// A tab's connection state, as its dot shows it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -59,6 +63,15 @@ impl StripLayout {
         (self.new_tab == Some(col)).then_some(Hit::NewTab)
     }
 
+    /// The cells tab `i` covers: first, one past the last.
+    pub fn span(&self, i: usize) -> Option<(usize, usize)> {
+        self.tabs.get(i).map(|&(start, _, end)| (start, end))
+    }
+
+    pub fn len(&self) -> usize {
+        self.tabs.len()
+    }
+
     /// The tab a dragged tab would land on at `col`: the nearest one.
     pub fn slot(&self, col: usize) -> usize {
         self.tabs
@@ -68,27 +81,50 @@ impl StripLayout {
     }
 }
 
-fn mix(a: Rgb, b: Rgb, amount: f32) -> Rgb {
+pub fn mix(a: Rgb, b: Rgb, amount: f32) -> Rgb {
     let m = |x: u8, y: u8| (f32::from(x) * (1.0 - amount) + f32::from(y) * amount).round() as u8;
     Rgb::new(m(a.r, b.r), m(a.g, b.g), m(a.b, b.b))
 }
 
-/// The strip's colours, from a pane theme.
+/// The strip's (and side pane's) colours.
 #[derive(Clone, Copy, Debug)]
 pub struct Palette {
     pub strip: Rgb,
     pub active: Rgb,
     pub text: Rgb,
     pub dim: Rgb,
+    /// The line over the active tab.
+    pub accent: Rgb,
 }
 
 impl Palette {
+    /// From a pane theme.
     pub fn of(theme: &Theme) -> Self {
         Self {
             strip: mix(theme.background, theme.foreground, 0.08),
             active: theme.background,
             text: theme.foreground,
             dim: mix(theme.foreground, theme.background, 0.45),
+            accent: theme.cursor,
+        }
+    }
+
+    /// From the system's menu bar colours: tabs on `menu`, the active one
+    /// in `window` with `text`; `gray` for the rest.
+    pub fn menu_bar(menu: Rgb, window: Rgb, text: Rgb, gray: Rgb, accent: Rgb) -> Self {
+        // A window colour equal to the menu's (some high contrast themes)
+        // would hide the active tab.
+        let active = if window == menu {
+            mix(menu, text, 0.12)
+        } else {
+            window
+        };
+        Self {
+            strip: menu,
+            active,
+            text,
+            dim: mix(gray, text, 0.35),
+            accent,
         }
     }
 }
@@ -147,8 +183,8 @@ impl Row {
 /// Tabs share the width; titles shrink when space runs out.
 pub fn draw(grid: &mut Grid, tabs: &[TabLabel], active: usize, palette: &Palette) -> StripLayout {
     let width = grid.cols();
-    // " ● " + title + " × " per tab, and " + " at the end.
-    let fixed = 6;
+    // "  ● " + title + "  ×  " per tab, and " + " at the end.
+    let fixed = 9;
     let room = width.saturating_sub(3) / tabs.len().max(1);
     let title_max = room.saturating_sub(fixed).clamp(1, MAX_TITLE);
     let mut row = Row { cells: Vec::new() };
@@ -170,7 +206,7 @@ pub fn draw(grid: &mut Grid, tabs: &[TabLabel], active: usize, palette: &Palette
             Health::Connecting => Rgb::new(0xe5, 0xb5, 0x3b),
             Health::Idle => palette.dim,
         };
-        row.put(" ", fg, bg, Flags::empty());
+        row.put("  ", fg, bg, Flags::empty());
         row.put(if tab.bell { "◆" } else { "●" }, dot, bg, Flags::empty());
         row.put(" ", fg, bg, Flags::empty());
         let flags = if i == active {
@@ -178,11 +214,14 @@ pub fn draw(grid: &mut Grid, tabs: &[TabLabel], active: usize, palette: &Palette
         } else {
             Flags::empty()
         };
-        row.put(&fit(&tab.title, title_max), fg, bg, flags);
-        row.put(" ", fg, bg, Flags::empty());
+        let title = fit(&tab.title, title_max);
+        let shown: usize = title.chars().map(|c| c.width().unwrap_or(0)).sum();
+        row.put(&title, fg, bg, flags);
+        let pad = MIN_TITLE.min(title_max).saturating_sub(shown);
+        row.put(&" ".repeat(pad + 2), fg, bg, Flags::empty());
         let close = row.cells.len();
         row.put("×", palette.dim, bg, Flags::empty());
-        row.put(" ", fg, bg, Flags::empty());
+        row.put("  ", fg, bg, Flags::empty());
         layout.tabs.push((start, close, row.cells.len()));
     }
     row.put(" ", palette.dim, palette.strip, Flags::empty());
@@ -239,18 +278,23 @@ mod tests {
         let p = Palette::of(&Theme::default());
         let l = draw(&mut grid, &[label("web"), label("db")], 1, &p);
         let t = text(&grid);
-        assert!(t.starts_with(" ● web ×  ● db ×  + "), "{t:?}");
+        // Short titles are padded, so tabs keep a useful width.
+        assert!(
+            t.starts_with("  ● web         ×    ● db          ×   + "),
+            "{t:?}"
+        );
+        assert_eq!(l.span(0), Some((0, 19)));
         assert_eq!(l.hit(0), Some(Hit::Tab(0)));
-        assert_eq!(l.hit(7), Some(Hit::Close(0)));
-        assert_eq!(l.hit(10), Some(Hit::Tab(1)));
-        assert_eq!(l.hit(15), Some(Hit::Close(1)));
-        assert_eq!(l.hit(18), Some(Hit::NewTab));
-        assert_eq!(l.hit(40), None);
+        assert_eq!(l.hit(16), Some(Hit::Close(0)));
+        assert_eq!(l.hit(19), Some(Hit::Tab(1)));
+        assert_eq!(l.hit(35), Some(Hit::Close(1)));
+        assert_eq!(l.hit(39), Some(Hit::NewTab));
+        assert_eq!(l.hit(50), None);
         assert_eq!(l.slot(0), 0);
-        assert_eq!(l.slot(12), 1);
-        assert_eq!(l.slot(50), 1);
+        assert_eq!(l.slot(25), 1);
+        assert_eq!(l.slot(55), 1);
         // The active tab is bold on the pane's background.
-        let cell = grid.cell(12, 0).unwrap();
+        let cell = grid.cell(23, 0).unwrap();
         assert!(cell.flags.contains(Flags::BOLD));
         assert_eq!(cell.bg, Color::Rgb(Theme::default().background));
     }
@@ -264,5 +308,16 @@ mod tests {
         assert_eq!(l.hit(0), Some(Hit::Tab(0)));
         assert!(text(&grid).contains('…'));
         assert!(l.tabs.iter().all(|&(_, _, end)| end <= 40));
+    }
+
+    #[test]
+    fn menu_bar_palette_keeps_the_active_tab_visible() {
+        let grey = Rgb::new(0xf0, 0xf0, 0xf0);
+        let black = Rgb::new(0, 0, 0);
+        let p = Palette::menu_bar(grey, Rgb::new(255, 255, 255), black, grey, black);
+        assert_eq!(p.strip, grey);
+        assert_eq!(p.active, Rgb::new(255, 255, 255));
+        let p = Palette::menu_bar(grey, grey, black, grey, black);
+        assert_ne!(p.active, p.strip);
     }
 }

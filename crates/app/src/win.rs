@@ -32,7 +32,8 @@ use ferossh_term::{
 use windows::Win32::Foundation::E_FAIL;
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, SIZE, WPARAM};
 use windows::Win32::Graphics::Gdi::{
-    BeginPaint, EndPaint, InvalidateRect, LOGFONTW, PAINTSTRUCT, ScreenToClient,
+    BeginPaint, COLOR_GRAYTEXT, COLOR_HIGHLIGHT, COLOR_MENUBAR, COLOR_MENUTEXT, COLOR_WINDOW,
+    EndPaint, GetSysColor, InvalidateRect, LOGFONTW, PAINTSTRUCT, SYS_COLOR_INDEX, ScreenToClient,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::SystemInformation::GetLocalTime;
@@ -100,8 +101,14 @@ const CHROME_PADDING_DIP: i32 = 3;
 const GRAB_DIP: i32 = 3;
 /// The side pane's width when first shown, in chrome cells.
 const SIDE_COLS: i32 = 34;
-/// The tab strip and side pane font size.
+/// The side pane font size.
 const CHROME_PT: f32 = 9.5;
+/// The tab strip font size.
+const STRIP_PT: f32 = 10.5;
+/// Space above and below the tab titles, in DIPs.
+const STRIP_PAD_DIP: i32 = 6;
+/// The line over the active tab, in DIPs.
+const ACCENT_DIP: i32 = 2;
 /// How far Alt+Shift+arrow moves a divider.
 const RESIZE_STEP: f32 = 0.05;
 /// Pixels the mouse moves before a press becomes a drag.
@@ -370,6 +377,8 @@ struct Window {
     side: Side,
     chrome_font: FontSpec,
     chrome_metrics: CellMetrics,
+    strip_font: FontSpec,
+    strip_metrics: CellMetrics,
     menu: HMENU,
     menu_visible: bool,
     focused: bool,
@@ -603,6 +612,8 @@ fn create_and_run(launch: Launch, theme: Option<String>) -> Result<()> {
         let metrics = renderer.metrics(&font, dpi)?;
         let chrome_font = FontSpec::new(&font.family, CHROME_PT);
         let chrome_metrics = renderer.metrics(&chrome_font, dpi)?;
+        let strip_font = FontSpec::new(&font.family, STRIP_PT);
+        let strip_metrics = renderer.metrics(&strip_font, dpi)?;
         let (width, height) = window_size(&metrics, DEFAULT_COLS, DEFAULT_ROWS, dpi, true);
         let (ws, first) = Workspace::new();
         let pane = new_pane(
@@ -634,6 +645,8 @@ fn create_and_run(launch: Launch, theme: Option<String>) -> Result<()> {
                 },
                 chrome_font,
                 chrome_metrics,
+                strip_font,
+                strip_metrics,
                 menu,
                 menu_visible: true,
                 focused: false,
@@ -887,6 +900,22 @@ fn client_to_window(w: i32, h: i32, dpi: u32, menu: bool) -> (i32, i32) {
     // used as is, which only makes the window slightly small.
     let _ = unsafe { AdjustWindowRectExForDpi(&mut r, STYLE, menu, EX_STYLE, dpi) };
     (r.right - r.left, r.bottom - r.top)
+}
+
+fn win_rect(r: Rect) -> RECT {
+    RECT {
+        left: r.x,
+        top: r.y,
+        right: r.right(),
+        bottom: r.bottom(),
+    }
+}
+
+/// A system colour (`GetSysColor` is 0x00BBGGRR).
+fn sys_color(index: SYS_COLOR_INDEX) -> Rgb {
+    // SAFETY: plain query.
+    let c = unsafe { GetSysColor(index) };
+    Rgb::new(c as u8, (c >> 8) as u8, (c >> 16) as u8)
 }
 
 fn pixel(r: Rect) -> PixelRect {
@@ -1766,6 +1795,18 @@ impl Window {
         Palette::of(&theme)
     }
 
+    /// The tab strip's colours: the system menu bar's, so the strip reads
+    /// as part of the window frame rather than of a terminal.
+    fn strip_palette(&self) -> Palette {
+        Palette::menu_bar(
+            sys_color(COLOR_MENUBAR),
+            sys_color(COLOR_WINDOW),
+            sys_color(COLOR_MENUTEXT),
+            sys_color(COLOR_GRAYTEXT),
+            sys_color(COLOR_HIGHLIGHT),
+        )
+    }
+
     /// A theme whose background is the chrome's, for drawing its padding.
     fn chrome_theme(&self) -> Theme {
         let mut t = self
@@ -1780,6 +1821,7 @@ impl Window {
     fn refresh_chrome(&mut self) {
         let palette = self.chrome_palette();
         if let Some(strip) = self.areas.strip {
+            let palette = self.strip_palette();
             let active = self.ws.active;
             let labels: Vec<TabLabel> = self
                 .ws
@@ -1801,7 +1843,12 @@ impl Window {
                 })
                 .collect();
             self.strip_layout = tabstrip::draw(&mut self.strip_grid, &labels, active, &palette);
-            self.invalidate_grid(strip, false);
+            // The strip is drawn whole (the active tab's background and
+            // line reach past the text row).
+            // SAFETY: valid window and rect.
+            unsafe {
+                let _ = InvalidateRect(Some(self.hwnd), Some(&win_rect(strip)), false);
+            }
         }
         self.sync_files();
         if let Some(side) = self.areas.side {
@@ -1819,17 +1866,13 @@ impl Window {
                     );
                 }
             }
-            self.invalidate_grid(side, true);
+            self.invalidate_grid(side);
         }
     }
 
-    /// Invalidates the dirty rows of a chrome grid in `area`.
-    fn invalidate_grid(&self, area: Rect, side: bool) {
-        let grid = if side {
-            &self.side.grid
-        } else {
-            &self.strip_grid
-        };
+    /// Invalidates the dirty rows of the side pane's grid in `area`.
+    fn invalidate_grid(&self, area: Rect) {
+        let grid = &self.side.grid;
         let Some((first, last)) = grid.dirty_span() else {
             return;
         };
@@ -1872,7 +1915,7 @@ impl Window {
             }
         }
         if self.settings.tab_strip && self.ws.tabs.len() >= 2 {
-            let sh = cm.height as i32 + 2 * cpad;
+            let sh = self.strip_metrics.height as i32 + 2 * scale(STRIP_PAD_DIP, self.dpi);
             areas.strip = Some(Rect::new(main.x, main.y, main.w, sh));
             main = Rect::new(main.x, main.y + sh, main.w, (main.h - sh).max(0));
         }
@@ -1900,7 +1943,8 @@ impl Window {
             )
         };
         if let Some(s) = self.areas.strip {
-            self.strip_grid.resize(cells(s).0, 1);
+            let cols = ((s.w - 2 * cpad).max(0) / self.strip_metrics.width.max(1) as i32).max(1);
+            self.strip_grid.resize(cols as usize, 1);
             self.strip_grid.mark_all_dirty();
         }
         if let Some(s) = self.areas.side {
@@ -1986,6 +2030,9 @@ impl Window {
         if let Some(e) = self.areas.side_edge {
             out.push((pixel(e), line));
         }
+        if let Some(s) = self.areas.strip {
+            self.strip_fills(s, &mut out);
+        }
         let Some(tab) = self.ws.tab() else {
             return out;
         };
@@ -2006,6 +2053,39 @@ impl Window {
             }
         }
         out
+    }
+
+    /// The tab strip's shapes: the active tab's background above and below
+    /// its text row, its accent line, and thin lines between the others.
+    fn strip_fills(&self, s: Rect, out: &mut Vec<(PixelRect, Rgb)>) {
+        let p = self.strip_palette();
+        let cpad = scale(CHROME_PADDING_DIP, self.dpi);
+        let spad = scale(STRIP_PAD_DIP, self.dpi);
+        let cw = self.strip_metrics.width as i32;
+        let ch = self.strip_metrics.height as i32;
+        let g = gap(self.dpi);
+        let x_of = |col: usize| s.x + cpad + col as i32 * cw;
+        let active = self.ws.active;
+        for i in 0..self.strip_layout.len() {
+            let Some((start, end)) = self.strip_layout.span(i) else {
+                continue;
+            };
+            let (x0, x1) = (x_of(start), x_of(end));
+            if i == active {
+                let top = Rect::new(x0, s.y, x1 - x0, spad);
+                let bottom =
+                    Rect::new(x0, s.y + spad + ch, x1 - x0, s.bottom() - (s.y + spad + ch));
+                out.push((pixel(top), p.active));
+                out.push((pixel(bottom), p.active));
+                let accent = scale(ACCENT_DIP, self.dpi).max(1);
+                out.push((pixel(Rect::new(x0, s.y, x1 - x0, accent)), p.accent));
+            } else if i + 1 != active {
+                // A short line after each inactive tab not next to the
+                // active one.
+                let line = Rect::new(x1 - g, s.y + spad, g, ch);
+                out.push((pixel(line), tabstrip::mix(p.strip, p.text, 0.25)));
+            }
+        }
     }
 
     /// Where a dragged pane or tab would land, outlined while dragging.
@@ -2088,7 +2168,10 @@ impl Window {
         }
         let full = self.full_redraw;
         let chrome_theme = self.chrome_theme();
+        let mut strip_theme = chrome_theme.clone();
+        strip_theme.background = self.strip_palette().strip;
         let cpad = scale(CHROME_PADDING_DIP, self.dpi);
+        let spad = scale(STRIP_PAD_DIP, self.dpi);
         let fills = self.fills();
         let mut views: Vec<PaneView<'_>> = Vec::new();
         for id in &ids {
@@ -2108,12 +2191,12 @@ impl Window {
         if let Some(s) = self.areas.strip {
             views.push(PaneView {
                 grid: &self.strip_grid,
-                font: &self.chrome_font,
-                theme: &chrome_theme,
+                font: &self.strip_font,
+                theme: &strip_theme,
                 rect: pixel(s),
-                origin: (s.x + cpad, s.y + cpad),
+                origin: (s.x + cpad, s.y + spad),
                 cursor: None,
-                full,
+                full: true,
             });
         }
         if let Some(s) = self.areas.side {
@@ -2499,7 +2582,7 @@ impl Window {
             && s.contains(x, y)
         {
             let cpad = scale(CHROME_PADDING_DIP, self.dpi);
-            let col = ((x - s.x - cpad).max(0) / self.chrome_metrics.width.max(1) as i32) as usize;
+            let col = ((x - s.x - cpad).max(0) / self.strip_metrics.width.max(1) as i32) as usize;
             return Spot::Strip(col);
         }
         if let Some(tab) = self.ws.tab() {
@@ -2777,8 +2860,8 @@ impl Window {
                         return;
                     }
                     let cpad = scale(CHROME_PADDING_DIP, self.dpi);
-                    let col = ((x - s.x - cpad).max(0) / self.chrome_metrics.width.max(1) as i32)
-                        as usize;
+                    let col =
+                        ((x - s.x - cpad).max(0) / self.strip_metrics.width.max(1) as i32) as usize;
                     let to = self.strip_layout.slot(col);
                     if to != *index {
                         let from = *index;
@@ -3387,6 +3470,9 @@ impl Window {
         }
         if let Ok(m) = self.renderer.metrics(&self.chrome_font, dpi) {
             self.chrome_metrics = m;
+        }
+        if let Ok(m) = self.renderer.metrics(&self.strip_font, dpi) {
+            self.strip_metrics = m;
         }
         self.side.width = 0;
         self.full_redraw = true;
