@@ -2031,6 +2031,11 @@ impl Window {
                 let Some(d) = self.panes.get_mut(&id).and_then(|p| p.desktop.as_mut()) else {
                     return false;
                 };
+                // A prompt (user name, password) reads WM_CHAR, Enter and
+                // Backspace included: keep the terminal from taking them.
+                if d.asking() {
+                    return true;
+                }
                 if !d.running() {
                     return false;
                 }
