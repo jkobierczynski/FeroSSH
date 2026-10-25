@@ -105,6 +105,24 @@ pub fn refusal(public: &[u8]) -> Option<String> {
     None
 }
 
+/// Says where FeroSSH looked, so "Permission denied (publickey)" that
+/// follows is not a mystery.
+fn no_keys_note(files: &[String]) -> String {
+    let agents = if cfg!(windows) {
+        "the OpenSSH agent and Pageant"
+    } else {
+        "the SSH agent"
+    };
+    if files.is_empty() {
+        format!("No SSH keys found: {agents} hold none.")
+    } else {
+        format!(
+            "No SSH keys found: {agents} hold none, and there is no usable key in {}.",
+            files.join(", ")
+        )
+    }
+}
+
 fn identities(rt: &tokio::runtime::Runtime, files: Vec<KeyFileSpec>) -> Reply {
     let (agent_keys, mut notes) = agent::list(rt);
     let mut keys: Vec<Identity> = Vec::new();
@@ -123,6 +141,7 @@ fn identities(rt: &tokio::runtime::Runtime, files: Vec<KeyFileSpec>) -> Reply {
             source: Source::Agent(k.agent),
         });
     }
+    let files_tried: Vec<String> = files.iter().map(|f| f.path.display().to_string()).collect();
     for spec in files {
         match KeyFile::load(&spec.path) {
             Ok(kf) => {
@@ -139,6 +158,9 @@ fn identities(rt: &tokio::runtime::Runtime, files: Vec<KeyFileSpec>) -> Reply {
             Err(KeyFileError::Unreadable(_)) if !spec.explicit => {}
             Err(e) => notes.push(format!("Skipping key file {}: {e}.", spec.path.display())),
         }
+    }
+    if keys.is_empty() {
+        notes.push(no_keys_note(&files_tried));
     }
     Reply::Identities { keys, notes }
 }
@@ -212,6 +234,7 @@ impl Broker {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::panic)]
 mod tests {
     use super::*;
     use crate::userauth::tests::string;
@@ -229,5 +252,28 @@ mod tests {
         // An RSA blob that does not parse counts as 0 bits.
         assert!(refusal(&key("ssh-rsa")).is_some());
         assert!(refusal(&key("ssh-ed25519")).is_none());
+    }
+
+    #[test]
+    fn says_where_it_looked_when_there_are_no_keys() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let missing = std::env::temp_dir().join("ferossh-no-such-key");
+        let Reply::Identities { keys, notes } = identities(
+            &rt,
+            vec![KeyFileSpec {
+                path: missing.clone(),
+                explicit: false,
+            }],
+        ) else {
+            panic!("not identities");
+        };
+        if keys.is_empty() {
+            let last = notes.last().unwrap();
+            assert!(last.starts_with("No SSH keys found"), "{last}");
+            assert!(last.contains(&missing.display().to_string()), "{last}");
+        }
     }
 }
