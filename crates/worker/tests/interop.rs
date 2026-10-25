@@ -24,7 +24,7 @@ use std::time::{Duration, Instant};
 
 use ferossh_auth::keyfile::KeyFile;
 use ferossh_auth::userauth;
-use ferossh_ipc::{Message, PROTOCOL_VERSION};
+use ferossh_ipc::{Message, PROTOCOL_VERSION, Timing};
 use tokio::sync::mpsc;
 
 /// What a case should end with.
@@ -198,11 +198,27 @@ struct Outcome {
     output: Vec<u8>,
     disconnected: String,
     host_key_prompts: usize,
+    /// From logging in to the worker reporting the connection gone.
+    lasted: Option<Duration>,
 }
 
 /// Plays the UI for one connection: accepts the host key, signs with the
 /// user key, runs `command` once logged in.
 async fn connect(port: u16, keys: &[KeyFile], legacy: bool, command: &str) -> Outcome {
+    session(port, keys, legacy, Timing::default(), command, || {}).await
+}
+
+/// [`connect`] with `timing`, calling `on_login` once logged in.
+async fn session(
+    port: u16,
+    keys: &[KeyFile],
+    legacy: bool,
+    timing: Timing,
+    command: &str,
+    on_login: impl FnOnce(),
+) -> Outcome {
+    let mut on_login = Some(on_login);
+    let mut since: Option<Instant> = None;
     let (to_worker, worker_in) = mpsc::channel(64);
     let (worker_out, mut from_worker) = mpsc::channel(64);
     tokio::spawn(ferossh_worker::serve(worker_in, worker_out));
@@ -224,6 +240,7 @@ async fn connect(port: u16, keys: &[KeyFile], legacy: bool, command: &str) -> Ou
         host_key_algs: vec![],
         x11: None,
         legacy,
+        timing,
     })
     .await;
     let mut seen = Outcome::default();
@@ -274,12 +291,17 @@ async fn connect(port: u16, keys: &[KeyFile], legacy: bool, command: &str) -> Ou
                     bytes: command.as_bytes().to_vec(),
                 })
                 .await;
+                since = Some(Instant::now());
+                if let Some(f) = on_login.take() {
+                    f();
+                }
             }
             Message::Data { bytes, .. } => seen.output.extend_from_slice(&bytes),
             // The keys were refused and the server fell back to a password.
             Message::Prompt { .. } => panic!("asked for a password; so far {seen:?}"),
             Message::Disconnected { reason, .. } => {
                 seen.disconnected = reason;
+                seen.lasted = since.map(|t| t.elapsed());
                 return seen;
             }
             _ => {}
@@ -330,4 +352,79 @@ async fn servers_of_every_age() {
     }
     let _ = std::fs::remove_dir_all(&dir);
     assert!(failures.is_empty(), "\n{}", failures.join("\n"));
+}
+
+/// A server that stops answering (frozen, or the network gone) is noticed
+/// by the keepalives within interval x count, and the reason says so; one
+/// that restarts ends the session at once. Either way a new connection
+/// works afterwards.
+#[tokio::test]
+async fn dead_and_restarted_servers() {
+    if !available() {
+        return;
+    }
+    let dir = std::env::temp_dir().join(format!("ferossh-interop-dead-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let keys = user_keys(&dir);
+    let container = Server::start("24.04", "openssh", &dir);
+    let timing = Timing {
+        connect_timeout: 5,
+        alive_interval: 1,
+        alive_max: 2,
+    };
+
+    let seen = session(container.port, &keys, false, timing, "", || {
+        docker(&["pause", &container.id]).expect("docker pause");
+    })
+    .await;
+    let _ = docker(&["unpause", &container.id]);
+    let lasted = seen.lasted.expect("logged in");
+    assert!(lasted < Duration::from_secs(10), "{seen:?}");
+    assert!(seen.disconnected.contains("stopped responding"), "{seen:?}");
+
+    // Silent keepalives keep an idle session open.
+    let seen = session(
+        container.port,
+        &keys,
+        false,
+        timing,
+        "sleep 4; exit\n",
+        || {},
+    )
+    .await;
+    assert!(
+        seen.lasted.expect("logged in") >= Duration::from_secs(4),
+        "{seen:?}"
+    );
+
+    let seen = session(container.port, &keys, false, timing, "", || {
+        docker(&["restart", "-t", "0", &container.id]).expect("docker restart");
+    })
+    .await;
+    assert!(
+        seen.lasted.expect("logged in") < Duration::from_secs(10),
+        "{seen:?}"
+    );
+    assert!(
+        seen.disconnected.contains("closed the connection") || seen.disconnected.contains("reset"),
+        "{seen:?}"
+    );
+
+    // The published port can change on restart.
+    let port = docker(&["port", &container.id, "22/tcp"])
+        .and_then(|p| p.lines().next()?.rsplit(':').next()?.parse().ok())
+        .unwrap();
+    let restarted = Server {
+        id: container.id.clone(),
+        port,
+    };
+    restarted.wait_for_banner();
+    std::mem::forget(restarted);
+    let seen = connect(port, &keys, false, "echo fero$((6*7)); exit\n").await;
+    assert!(
+        String::from_utf8_lossy(&seen.output).contains("fero42"),
+        "{seen:?}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
 }

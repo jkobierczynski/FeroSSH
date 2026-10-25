@@ -22,7 +22,8 @@ use std::time::Duration;
 
 use ferossh_forward::x11::{MIT_COOKIE, hex};
 use ferossh_ipc::{
-    ChannelId, MAX_DATA_CHUNK, Message, PromptField, PromptKind, Secrets, WORKER_IDS, X11Auth,
+    ChannelId, MAX_DATA_CHUNK, Message, PromptField, PromptKind, Secrets, Timing, WORKER_IDS,
+    X11Auth,
 };
 use russh::client::{self, AuthResult, DisconnectReason, Handle, KeyboardInteractiveAuthResponse};
 use russh::keys::agent::AgentIdentity;
@@ -42,10 +43,6 @@ use crate::crypto_policy::{
 };
 use crate::forward::{self, Incoming};
 
-const CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
-/// Like `ServerAliveInterval 30` with `ServerAliveCountMax 3`.
-const KEEPALIVE: Duration = Duration::from_secs(30);
-const KEEPALIVE_MAX: usize = 3;
 /// Password and keyboard-interactive rounds, like `NumberOfPasswordPrompts`.
 const MAX_ATTEMPTS: usize = 3;
 const TERM: &str = "xterm-256color";
@@ -69,6 +66,7 @@ pub struct Params {
     pub x11: Option<X11Auth>,
     /// Also offer the legacy algorithm set.
     pub legacy: bool,
+    pub timing: Timing,
 }
 
 /// Why a session ended early.
@@ -120,6 +118,19 @@ impl fmt::Display for Failure {
                     offered.join(", ")
                 )
             }
+            Failure::Ssh(russh::Error::KeepaliveTimeout) => f.write_str(
+                "The server stopped responding (no reply to keepalives); the connection is \
+                 closed.",
+            ),
+            Failure::Ssh(russh::Error::IO(e)) => match e.kind() {
+                std::io::ErrorKind::UnexpectedEof => {
+                    f.write_str("The server closed the connection without saying why.")
+                }
+                std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::ConnectionAborted => {
+                    f.write_str("The connection was reset.")
+                }
+                _ => write!(f, "The connection broke: {e}."),
+            },
             Failure::Ssh(e) => write!(f, "{e}."),
             Failure::Refused(why) => f.write_str(why),
             Failure::NoStrictKex => f.write_str(TERRAPIN),
@@ -325,6 +336,8 @@ struct Shared {
     names: Option<(String, String, String)>,
     /// The server's disconnect message.
     server_said: Option<String>,
+    /// Why the connection broke, when it did not close cleanly.
+    lost: Option<String>,
     /// The host key the UI accepted, so a retried connection to the same
     /// server does not ask again.
     accepted_key: Option<Vec<u8>>,
@@ -492,7 +505,11 @@ impl client::Handler for Client {
                 with(&self.shared, |s| s.server_said = Some(info.message));
                 Ok(())
             }
-            DisconnectReason::Error(e) => Err(e),
+            DisconnectReason::Error(e) => {
+                // The shells only see their channels close; keep why.
+                with(&self.shared, |s| s.lost = Some(e.to_string()));
+                Err(e)
+            }
         }
     }
 }
@@ -731,11 +748,12 @@ pub async fn run(
     };
     let result = session(&params, &mut inbox, &mut ctx, &connections).await;
     let server_said = with(&shared, |s| s.server_said.take()).flatten();
+    let lost = with(&shared, |s| s.lost.take()).flatten();
     let reason = match (result, server_said) {
         (_, Some(said)) if !said.trim().is_empty() => {
             format!("The server closed the connection: {}", said.trim())
         }
-        (Ok(Ended::Connection), _) => "Connection closed.".to_owned(),
+        (Ok(Ended::Connection), _) => lost.unwrap_or_else(|| "Connection closed.".to_owned()),
         (Ok(Ended::Shell), _) => SHELL_CLOSED.to_owned(),
         (Err(e), _) => e.to_string(),
     };
@@ -851,14 +869,18 @@ async fn connect(
     let config = Arc::new(client::Config {
         client_id: SshId::Standard(CLIENT_ID.into()),
         preferred,
-        keepalive_interval: Some(KEEPALIVE),
-        keepalive_max: KEEPALIVE_MAX,
+        keepalive_interval: (p.timing.alive_interval > 0)
+            .then(|| Duration::from_secs(p.timing.alive_interval.into())),
+        keepalive_max: p.timing.alive_max.max(1) as usize,
         nodelay: true,
         ..Default::default()
     });
     let addr = (p.host.as_str(), p.port);
     let tcp = drive(
-        tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect(addr)),
+        tokio::time::timeout(
+            Duration::from_secs(p.timing.connect_timeout.max(1).into()),
+            TcpStream::connect(addr),
+        ),
         inbox,
         ctx,
     )

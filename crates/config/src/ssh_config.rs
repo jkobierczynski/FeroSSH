@@ -38,6 +38,13 @@ pub struct HostConfig {
     pub gateway_ports: Option<bool>,
     /// `ClearAllForwardings yes`: no forwards at all.
     pub clear_all_forwardings: Option<bool>,
+    /// Seconds between keepalives when the server is quiet; 0 turns them
+    /// off.
+    pub server_alive_interval: Option<u32>,
+    /// Unanswered keepalives before the connection counts as dead.
+    pub server_alive_count_max: Option<u32>,
+    /// Seconds to wait for the TCP connection and the server's banner.
+    pub connect_timeout: Option<u32>,
 }
 
 impl HostConfig {
@@ -49,6 +56,11 @@ impl HostConfig {
             &self.forwards
         }
     }
+}
+
+/// A whole number of seconds (or a count), capped at a day.
+fn seconds(args: &[String]) -> Option<u32> {
+    args.first()?.parse::<u32>().ok().map(|n| n.min(86_400))
 }
 
 /// `yes` or `no` (and `true`/`false`), as ssh_config writes flags.
@@ -351,6 +363,15 @@ pub fn resolve_in(text: &str, name: &str, includes: &dyn Includes) -> HostConfig
             "clearallforwardings" if cfg.clear_all_forwardings.is_none() => {
                 cfg.clear_all_forwardings = flag(&args);
             }
+            "serveraliveinterval" if cfg.server_alive_interval.is_none() => {
+                cfg.server_alive_interval = seconds(&args);
+            }
+            "serveralivecountmax" if cfg.server_alive_count_max.is_none() => {
+                cfg.server_alive_count_max = seconds(&args).filter(|&n| n > 0);
+            }
+            "connecttimeout" if cfg.connect_timeout.is_none() => {
+                cfg.connect_timeout = seconds(&args).filter(|&n| n > 0);
+            }
             _ => {}
         }
     }
@@ -506,6 +527,31 @@ Host *
         assert_eq!(other.forward_x11, Some(false));
         let cleared = resolve(&format!("ClearAllForwardings yes\n{text}"), "db");
         assert!(cleared.active_forwards().is_empty());
+    }
+
+    #[test]
+    fn keepalive_and_timeout() {
+        let text = "\
+Host sw*
+    ServerAliveInterval 5
+    ServerAliveCountMax 0
+    ConnectTimeout 999999
+Host *
+    ServerAliveInterval 60
+    ServerAliveCountMax 4
+    ConnectTimeout x
+";
+        let c = resolve(text, "sw1");
+        assert_eq!(c.server_alive_interval, Some(5));
+        assert_eq!(c.server_alive_count_max, Some(4), "0 is not a count");
+        assert_eq!(c.connect_timeout, Some(86_400));
+        let c = resolve(text, "web");
+        assert_eq!(c.server_alive_interval, Some(60));
+        assert_eq!(c.connect_timeout, None);
+        assert_eq!(
+            resolve("ServerAliveInterval 0", "x").server_alive_interval,
+            Some(0)
+        );
     }
 
     #[test]

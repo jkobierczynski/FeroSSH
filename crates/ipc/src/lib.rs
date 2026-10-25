@@ -40,7 +40,7 @@ use std::fmt;
 use zeroize::Zeroize;
 
 /// Protocol version carried in every frame. Bump on any wire change.
-pub const PROTOCOL_VERSION: u8 = 7;
+pub const PROTOCOL_VERSION: u8 = 8;
 
 /// Largest frame body accepted, in bytes. Terminal and SFTP data is chunked
 /// below this, so anything larger is a bug or an attack.
@@ -113,6 +113,30 @@ impl Drop for Secrets {
 /// the local X server expects (empty when it needs none). The worker gives
 /// the server a fake cookie and puts this one in its place when a client
 /// connects; this one never leaves the PC. `Debug` leaves the cookie out.
+/// How long the worker waits for a server, from ssh_config's
+/// `ConnectTimeout`, `ServerAliveInterval` and `ServerAliveCountMax`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Timing {
+    /// Seconds for the TCP connection and the server's first reply.
+    pub connect_timeout: u32,
+    /// Seconds of silence before a keepalive; 0 sends none.
+    pub alive_interval: u32,
+    /// Unanswered keepalives before the connection counts as dead.
+    pub alive_max: u32,
+}
+
+impl Default for Timing {
+    /// FeroSSH's defaults: 20 s to connect, a keepalive after 30 s of
+    /// silence, dead after 3 unanswered.
+    fn default() -> Self {
+        Self {
+            connect_timeout: 20,
+            alive_interval: 30,
+            alive_max: 3,
+        }
+    }
+}
+
 #[derive(Clone, PartialEq, Eq, Default)]
 pub struct X11Auth {
     pub screen: u32,
@@ -317,6 +341,7 @@ pub enum Message {
         x11: Option<X11Auth>,
         /// Also offer the legacy algorithm set (`LegacyAlgorithms yes`).
         legacy: bool,
+        timing: Timing,
     },
     /// Open another shell on the connection that `connection` (a channel
     /// that made it with [`Message::Connect`]) belongs to. No new login:
@@ -799,6 +824,7 @@ pub fn encode(msg: &Message, out: &mut Vec<u8>) -> Result<(), Error> {
             host_key_algs,
             x11,
             legacy,
+            timing,
         } => {
             w.u32(*channel);
             w.str(host);
@@ -809,6 +835,9 @@ pub fn encode(msg: &Message, out: &mut Vec<u8>) -> Result<(), Error> {
             w.list(host_key_algs, |w, s| w.str(s));
             w.x11(x11);
             w.bool(*legacy);
+            w.u32(timing.connect_timeout);
+            w.u32(timing.alive_interval);
+            w.u32(timing.alive_max);
         }
         Message::HostKeyVerdict { channel, accept } => {
             w.u32(*channel);
@@ -1080,6 +1109,11 @@ fn decode_body(body: &[u8]) -> Result<Message, Error> {
             host_key_algs: r.list(Reader::string)?,
             x11: r.x11()?,
             legacy: r.bool()?,
+            timing: Timing {
+                connect_timeout: r.u32()?,
+                alive_interval: r.u32()?,
+                alive_max: r.u32()?,
+            },
         },
         5 => Message::HostKeyVerdict {
             channel: r.u32()?,
@@ -1433,6 +1467,7 @@ mod tests {
                 host_key_algs: vec!["ssh-ed25519".into(), "rsa-sha2-512".into()],
                 x11: None,
                 legacy: false,
+                timing: Timing::default(),
             },
             Message::Connect {
                 channel: 3,
@@ -1448,6 +1483,11 @@ mod tests {
                     cookie: vec![0xab; 16],
                 }),
                 legacy: true,
+                timing: Timing {
+                    connect_timeout: 5,
+                    alive_interval: 0,
+                    alive_max: 1,
+                },
             },
             Message::HostKeyVerdict {
                 channel: 1,
