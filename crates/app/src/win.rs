@@ -2971,6 +2971,19 @@ impl Window {
         }
     }
 
+    /// Connect to...: asks for a destination in `pane` if it is already
+    /// waiting at the connect prompt, else in a new tab, so the shells
+    /// already open keep running.
+    fn connect_in_new_tab(&mut self, pane: PaneId) {
+        let idle = matches!(
+            self.panes.get(&pane).map(|p| &p.host),
+            Some(Host::Ask(t)) if t.is_empty()
+        );
+        let id = if idle { pane } else { self.new_tab_pane() };
+        self.focus_terminal();
+        self.ask_destination(id);
+    }
+
     /// Gives the keyboard back to the focused pane.
     fn focus_terminal(&mut self) {
         if self.side.focused {
@@ -3721,7 +3734,7 @@ impl Window {
             cmd::REPLACE_KEY => return Some(Command::ReplaceHostKey),
             cmd::IMPORT_PUTTY => return Some(Command::ImportPutty),
             cmd::RESTART_SHELL => self.start_shell(pane),
-            cmd::CONNECT => self.ask_destination(pane),
+            cmd::CONNECT => self.connect_in_new_tab(pane),
             cmd::RECONNECT => self.reconnect(self.host_pane(pane)),
             cmd::NEW_TAB => {
                 // A tmux pane's new tab is a new tmux window.

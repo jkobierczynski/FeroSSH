@@ -51,7 +51,7 @@ ferossh.exe --local [command]  # a local shell, as in milestone 2
 
 | Shortcut | Action |
 | --- | --- |
-| Ctrl+Shift+N / Ctrl+Shift+R | Connect to another host, reconnect |
+| Ctrl+Shift+N / Ctrl+Shift+R | Connect to another host in a new tab, reconnect |
 | Ctrl+Shift+T / Ctrl+Shift+W | New tab, close the pane |
 | Alt+Shift+= / Alt+Shift+- | Split right, split down |
 | Alt+arrows / Alt+Shift+arrows | Focus the pane in that direction, grow the pane |
