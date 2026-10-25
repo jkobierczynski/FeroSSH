@@ -1,5 +1,5 @@
 #!/bin/sh
-# Usage: entrypoint.sh openssh|dropbear|gear
+# Usage: entrypoint.sh openssh|dropbear|gear|cbc
 # The test mounts the user's public key at /keys/authorized_keys.
 set -e
 install -d -m 700 -o fero -g fero /home/fero/.ssh
@@ -11,13 +11,18 @@ openssh)
     ;;
 gear)
     # Algorithms as a typical switch or router offers them: no curve25519,
-    # no AEAD ciphers. FeroSSH reaches these only with its compat set.
+    # no AEAD ciphers. FeroSSH reaches these only with its legacy set.
     ssh-keygen -A >/dev/null
     exec /usr/sbin/sshd -D -e \
         -o KexAlgorithms=ecdh-sha2-nistp256,diffie-hellman-group14-sha256 \
         -o Ciphers=aes128-ctr,aes256-ctr \
-        -o MACs=hmac-sha2-256,hmac-sha2-512 \
+        -o MACs=hmac-sha2-256-etm@openssh.com,hmac-sha2-256,hmac-sha2-512 \
         -o HostKeyAlgorithms=ecdsa-sha2-nistp256,rsa-sha2-256
+    ;;
+cbc)
+    # Nothing FeroSSH allows, even with its legacy set.
+    ssh-keygen -A >/dev/null
+    exec /usr/sbin/sshd -D -e -o Ciphers=aes128-cbc,aes256-cbc
     ;;
 dropbear)
     for t in ed25519 ecdsa rsa; do

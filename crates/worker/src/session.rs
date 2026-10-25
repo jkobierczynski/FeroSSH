@@ -28,13 +28,15 @@ use russh::client::{self, AuthResult, DisconnectReason, Handle, KeyboardInteract
 use russh::keys::agent::AgentIdentity;
 use russh::keys::{Algorithm, HashAlg, PublicKey, PublicKeyOrCertificate};
 use russh::{
-    Channel, ChannelMsg, ChannelOpenFailure, Disconnect, MethodKind, MethodSet, Names, SshId,
-    cipher,
+    AlgorithmKind, Channel, ChannelMsg, ChannelOpenFailure, Disconnect, MethodKind, MethodSet,
+    Names, Preferred, SshId,
 };
 use tokio::net::TcpStream;
 use tokio::sync::{mpsc, oneshot, watch};
 
-use crate::crypto_policy::{MIN_RSA_BITS, preferred_for};
+use crate::crypto_policy::{
+    MIN_RSA_BITS, legacy_would_help, preferred_for, terrapin_prone, with_legacy, without_terrapin,
+};
 use crate::forward::{self, Incoming};
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
@@ -45,6 +47,12 @@ const KEEPALIVE_MAX: usize = 3;
 const MAX_ATTEMPTS: usize = 3;
 const TERM: &str = "xterm-256color";
 const CLIENT_ID: &str = "SSH-2.0-FeroSSH";
+const TERRAPIN: &str = "The server has no strict key exchange, so its ChaCha20-Poly1305 and EtM \
+     MACs are open to the Terrapin attack, and it offers nothing else FeroSSH allows. Update \
+     the server's SSH software.";
+/// Added to a negotiation failure when the legacy set would have helped.
+const LEGACY_HINT: &str = "If this is older equipment you trust, add `LegacyAlgorithms yes` to \
+     its profile in ferossh.conf.";
 
 /// What the UI asked for in [`Message::Connect`].
 #[derive(Debug, Clone)]
@@ -56,6 +64,8 @@ pub struct Params {
     pub rows: u16,
     pub host_key_algs: Vec<String>,
     pub x11: Option<X11Auth>,
+    /// Also offer the legacy algorithm set.
+    pub legacy: bool,
 }
 
 /// Why a session ended early.
@@ -64,6 +74,10 @@ pub enum Failure {
     Ssh(russh::Error),
     /// A policy refusal or a user decision, already worded for the user.
     Refused(String),
+    /// The server chose ChaCha20-Poly1305 (or CTR with an EtM MAC) but has
+    /// no strict key exchange, which leaves it open to Terrapin.
+    /// [`session`] retries without those.
+    NoStrictKex,
     /// The UI closed the channel or went away.
     Cancelled,
 }
@@ -83,13 +97,29 @@ impl From<russh::SendError> for Failure {
 impl fmt::Display for Failure {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Failure::Ssh(russh::Error::NoCommonAlgo { kind, theirs, .. }) => write!(
-                f,
-                "The server offers no {kind:?} algorithm that FeroSSH allows. The server offers: {}.",
-                theirs.join(", ")
-            ),
+            Failure::Ssh(russh::Error::NoCommonAlgo { kind, theirs, .. }) => {
+                let kind = match kind {
+                    AlgorithmKind::Kex => "key exchange",
+                    AlgorithmKind::Key => "host key",
+                    AlgorithmKind::Cipher => "cipher",
+                    AlgorithmKind::Mac => "MAC",
+                    AlgorithmKind::Compression => "compression",
+                };
+                // The pseudo-algorithms say nothing useful here.
+                let offered: Vec<&str> = theirs
+                    .iter()
+                    .map(String::as_str)
+                    .filter(|n| !n.starts_with("ext-info-") && !n.starts_with("kex-strict-"))
+                    .collect();
+                write!(
+                    f,
+                    "The server offers no {kind} algorithm that FeroSSH allows. It offers: {}.",
+                    offered.join(", ")
+                )
+            }
             Failure::Ssh(e) => write!(f, "{e}."),
             Failure::Refused(why) => f.write_str(why),
+            Failure::NoStrictKex => f.write_str(TERRAPIN),
             Failure::Cancelled => f.write_str("Cancelled."),
         }
     }
@@ -292,6 +322,9 @@ struct Shared {
     names: Option<(String, String, String)>,
     /// The server's disconnect message.
     server_said: Option<String>,
+    /// The host key the UI accepted, so a retried connection to the same
+    /// server does not ask again.
+    accepted_key: Option<Vec<u8>>,
 }
 
 type SharedRef = Arc<Mutex<Shared>>;
@@ -353,15 +386,21 @@ impl client::Handler for Client {
         let blob = key
             .to_bytes()
             .map_err(|_| Failure::Refused("The server's host key is malformed.".into()))?;
+        if with(&self.shared, |s| s.accepted_key.as_ref() == Some(&blob)) == Some(true) {
+            return Ok(true);
+        }
         let (tx, rx) = oneshot::channel();
         with(&self.shared, |s| s.verdict = Some(tx));
         let msg = Message::HostKey {
             channel: self.channel,
-            key: blob,
+            key: blob.clone(),
         };
         self.out.send(msg).await.map_err(|_| Failure::Cancelled)?;
         match rx.await {
-            Ok(true) => Ok(true),
+            Ok(true) => {
+                with(&self.shared, |s| s.accepted_key = Some(blob));
+                Ok(true)
+            }
             Ok(false) => Err(Failure::Refused("Host key not accepted.".into())),
             Err(_) => Err(Failure::Cancelled),
         }
@@ -374,14 +413,9 @@ impl client::Handler for Client {
         _session: &mut client::Session,
     ) -> Result<(), Failure> {
         // Terrapin (CVE-2023-48795) needs ChaCha20-Poly1305 or an EtM MAC
-        // without strict key exchange. FeroSSH offers no EtM-only cipher,
-        // so ChaCha20 is the case to refuse; AES-GCM is not affected.
-        if names.cipher == cipher::CHACHA20_POLY1305 && !names.strict_kex() {
-            return Err(Failure::Refused(
-                "The server negotiated ChaCha20-Poly1305 without strict key exchange, which is \
-                 open to the Terrapin attack. Update the server's OpenSSH (9.6 or later)."
-                    .into(),
-            ));
+        // without strict key exchange; AES-GCM is not affected.
+        if !names.strict_kex() && terrapin_prone(&names.cipher, &names.client_mac) {
+            return Err(Failure::NoStrictKex);
         }
         let found = (
             names.kex.as_ref().to_owned(),
@@ -692,9 +726,60 @@ async fn session(
     ctx: &mut Ctx,
     connections: &Connections,
 ) -> Result<Ended, Failure> {
+    // A server without strict key exchange may not use ChaCha20, but that
+    // only shows once it has chosen it: connect again without it.
+    let mut preferred = preferred_for(&p.host_key_algs);
+    if p.legacy {
+        preferred = with_legacy(preferred);
+    }
+    let first = connect(p, preferred.clone(), inbox, ctx, connections).await;
+    let (mut handle, forwards) = match first {
+        Err(Failure::NoStrictKex) => {
+            match connect(p, without_terrapin(preferred), inbox, ctx, connections).await {
+                Err(Failure::Ssh(russh::Error::NoCommonAlgo { .. })) => {
+                    return Err(Failure::NoStrictKex);
+                }
+                other => other?,
+            }
+        }
+        Err(Failure::Ssh(e @ russh::Error::NoCommonAlgo { .. })) if !p.legacy => {
+            return Err(suggest_legacy(e));
+        }
+        other => other?,
+    };
+
+    authenticate(&mut handle, p, inbox, ctx).await?;
+    let conn = Arc::new(handle);
+    let names = with(&ctx.shared, |s| s.names.clone()).flatten();
+    connections.insert(ctx.channel, &conn, names, forwards.clone());
+    ctx.forwards = Some(forwards);
+    shell(conn, inbox, ctx).await
+}
+
+/// A negotiation failure, with the hint to turn on the legacy set when the
+/// server offers something in it.
+fn suggest_legacy(e: russh::Error) -> Failure {
+    let helps =
+        matches!(&e, russh::Error::NoCommonAlgo { theirs, .. } if legacy_would_help(theirs));
+    let failure = Failure::Ssh(e);
+    if helps {
+        Failure::Refused(format!("{failure} {LEGACY_HINT}"))
+    } else {
+        failure
+    }
+}
+
+/// Opens the TCP connection and runs key exchange with `preferred`.
+async fn connect(
+    p: &Params,
+    preferred: Preferred,
+    inbox: &mut mpsc::Receiver<Message>,
+    ctx: &mut Ctx,
+    connections: &Connections,
+) -> Result<(Connection, Arc<ConnForwards>), Failure> {
     let config = Arc::new(client::Config {
         client_id: SshId::Standard(CLIENT_ID.into()),
-        preferred: preferred_for(&p.host_key_algs),
+        preferred,
         keepalive_interval: Some(KEEPALIVE),
         keepalive_max: KEEPALIVE_MAX,
         nodelay: true,
@@ -725,14 +810,8 @@ async fn session(
         connections: connections.clone(),
         _alive: alive_tx,
     };
-    let mut handle = drive(client::connect_stream(config, tcp, handler), inbox, ctx).await??;
-
-    authenticate(&mut handle, p, inbox, ctx).await?;
-    let conn = Arc::new(handle);
-    let names = with(&ctx.shared, |s| s.names.clone()).flatten();
-    connections.insert(ctx.channel, &conn, names, forwards.clone());
-    ctx.forwards = Some(forwards);
-    shell(conn, inbox, ctx).await
+    let handle = drive(client::connect_stream(config, tcp, handler), inbox, ctx).await??;
+    Ok((handle, forwards))
 }
 
 /// Opens a shell on `conn` and pumps it until it closes. Disconnects the

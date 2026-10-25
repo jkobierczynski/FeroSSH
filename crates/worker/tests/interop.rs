@@ -18,7 +18,7 @@
 
 use std::io::Read;
 use std::net::TcpStream;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
@@ -41,81 +41,48 @@ enum Expect {
 
 use Expect::{Login, Refused};
 
+const fn login(kex: &'static str, cipher: &'static str) -> Expect {
+    Login { kex, cipher }
+}
+
 const MLKEM: &str = "mlkem768x25519-sha256";
 const C25519: &str = "curve25519-sha256";
 const C25519_LIBSSH: &str = "curve25519-sha256@libssh.org";
+const NISTP256: &str = "ecdh-sha2-nistp256";
 const CHACHA: &str = "chacha20-poly1305@openssh.com";
+const GCM: &str = "aes256-gcm@openssh.com";
+const CTR: &str = "aes256-ctr";
 const NO_ALGO: &str = "FeroSSH allows";
-const TERRAPIN: &str = "Terrapin";
+const HINT: &str = "LegacyAlgorithms yes";
 
-/// (image tag, server, expected outcome).
-const CASES: &[(&str, &str, Expect)] = &[
-    // OpenSSH 7.6 has neither strict key exchange nor ML-KEM. It offers
-    // AES-GCM too, but FeroSSH picks ChaCha20 first and then refuses it.
-    ("18.04", "openssh", Refused(TERRAPIN)),
+/// (image tag, server, legacy set on, expected outcome).
+const CASES: &[(&str, &str, bool, Expect)] = &[
+    // OpenSSH 7.6 has no strict key exchange, so ChaCha20 is out and
+    // FeroSSH connects again with AES-GCM.
+    ("18.04", "openssh", false, login(C25519, GCM)),
     // Ubuntu backported strict key exchange to 8.2 and later.
-    (
-        "20.04",
-        "openssh",
-        Login {
-            kex: C25519,
-            cipher: CHACHA,
-        },
-    ),
-    (
-        "22.04",
-        "openssh",
-        Login {
-            kex: C25519,
-            cipher: CHACHA,
-        },
-    ),
-    (
-        "24.04",
-        "openssh",
-        Login {
-            kex: C25519,
-            cipher: CHACHA,
-        },
-    ),
-    (
-        "26.04",
-        "openssh",
-        Login {
-            kex: MLKEM,
-            cipher: CHACHA,
-        },
-    ),
-    // Dropbear 2017.75: no Ed25519 host key, P-521 and SHA-1 RSA only.
-    ("18.04", "dropbear", Refused(NO_ALGO)),
+    ("20.04", "openssh", false, login(C25519, CHACHA)),
+    ("22.04", "openssh", false, login(C25519, CHACHA)),
+    ("24.04", "openssh", false, login(C25519, CHACHA)),
+    ("26.04", "openssh", false, login(MLKEM, CHACHA)),
+    // Dropbear 2017.75: P-521 and SHA-1 RSA host keys, CTR ciphers.
+    ("18.04", "dropbear", false, Refused(HINT)),
+    ("18.04", "dropbear", true, login(C25519, CTR)),
     // Dropbear 2019.78: CTR and CBC ciphers only.
-    ("20.04", "dropbear", Refused(NO_ALGO)),
-    (
-        "22.04",
-        "dropbear",
-        Login {
-            kex: C25519,
-            cipher: CHACHA,
-        },
-    ),
-    (
-        "24.04",
-        "dropbear",
-        Login {
-            kex: C25519,
-            cipher: CHACHA,
-        },
-    ),
-    (
-        "26.04",
-        "dropbear",
-        Login {
-            kex: MLKEM,
-            cipher: CHACHA,
-        },
-    ),
-    // A switch- or router-like algorithm set.
-    ("24.04", "gear", Refused(NO_ALGO)),
+    ("20.04", "dropbear", false, Refused(HINT)),
+    ("20.04", "dropbear", true, login(C25519, CTR)),
+    ("22.04", "dropbear", false, login(C25519, CHACHA)),
+    ("24.04", "dropbear", false, login(C25519, CHACHA)),
+    ("26.04", "dropbear", false, login(MLKEM, CHACHA)),
+    // A switch- or router-like algorithm set: refused with the hint, and
+    // reached with the legacy set. On OpenSSH 7.6 (no strict key exchange)
+    // the EtM MAC it offers is open to Terrapin, so FeroSSH connects again
+    // with the plain one.
+    ("24.04", "gear", false, Refused(HINT)),
+    ("24.04", "gear", true, login(NISTP256, CTR)),
+    ("18.04", "gear", true, login(NISTP256, CTR)),
+    // Only CBC: nothing FeroSSH allows, and no hint either.
+    ("24.04", "cbc", true, Refused(NO_ALGO)),
 ];
 
 fn docker(args: &[&str]) -> Option<String> {
@@ -202,18 +169,27 @@ impl Server {
     }
 }
 
-/// A throwaway user key, its public half as `authorized_keys`.
-fn user_key(dir: &Path) -> PathBuf {
-    let key = dir.join("id_ed25519");
-    let ok = Command::new("ssh-keygen")
-        .args(["-q", "-t", "ed25519", "-N", "", "-C", "interop", "-f"])
-        .arg(&key)
-        .status()
-        .unwrap()
-        .success();
-    assert!(ok);
-    std::fs::copy(key.with_extension("pub"), dir.join("authorized_keys")).unwrap();
-    key
+/// Throwaway Ed25519 and P-256 user keys (Dropbear before 2020.79 has no
+/// Ed25519), their public halves in `authorized_keys`.
+fn user_keys(dir: &Path) -> Vec<KeyFile> {
+    let mut authorized = String::new();
+    let mut keys = Vec::new();
+    for (kind, bits) in [("ed25519", "256"), ("ecdsa", "256")] {
+        let path = dir.join(format!("id_{kind}"));
+        let ok = Command::new("ssh-keygen")
+            .args([
+                "-q", "-t", kind, "-b", bits, "-N", "", "-C", "interop", "-f",
+            ])
+            .arg(&path)
+            .status()
+            .unwrap()
+            .success();
+        assert!(ok);
+        authorized.push_str(&std::fs::read_to_string(path.with_extension("pub")).unwrap());
+        keys.push(KeyFile::load(&path).unwrap());
+    }
+    std::fs::write(dir.join("authorized_keys"), authorized).unwrap();
+    keys
 }
 
 #[derive(Debug, Default)]
@@ -221,11 +197,12 @@ struct Outcome {
     connected: Option<(String, String, String)>,
     output: Vec<u8>,
     disconnected: String,
+    host_key_prompts: usize,
 }
 
 /// Plays the UI for one connection: accepts the host key, signs with the
 /// user key, runs `command` once logged in.
-async fn connect(port: u16, key: &KeyFile, command: &str) -> Outcome {
+async fn connect(port: u16, keys: &[KeyFile], legacy: bool, command: &str) -> Outcome {
     let (to_worker, worker_in) = mpsc::channel(64);
     let (worker_out, mut from_worker) = mpsc::channel(64);
     tokio::spawn(ferossh_worker::serve(worker_in, worker_out));
@@ -246,6 +223,7 @@ async fn connect(port: u16, key: &KeyFile, command: &str) -> Outcome {
         rows: 24,
         host_key_algs: vec![],
         x11: None,
+        legacy,
     })
     .await;
     let mut seen = Outcome::default();
@@ -258,6 +236,7 @@ async fn connect(port: u16, key: &KeyFile, command: &str) -> Outcome {
         };
         match msg {
             Message::HostKey { .. } => {
+                seen.host_key_prompts += 1;
                 send(Message::HostKeyVerdict {
                     channel: 1,
                     accept: true,
@@ -267,11 +246,15 @@ async fn connect(port: u16, key: &KeyFile, command: &str) -> Outcome {
             Message::IdentitiesRequest { .. } => {
                 send(Message::Identities {
                     channel: 1,
-                    keys: vec![key.public.clone()],
+                    keys: keys.iter().map(|k| k.public.clone()).collect(),
                 })
                 .await;
             }
             Message::SignRequest { key: k, data, .. } => {
+                let key = keys
+                    .iter()
+                    .find(|key| key.public == k)
+                    .expect("one of ours");
                 userauth::check(&data, "fero", &k).expect("a user-auth request");
                 send(Message::Signature {
                     channel: 1,
@@ -293,6 +276,8 @@ async fn connect(port: u16, key: &KeyFile, command: &str) -> Outcome {
                 .await;
             }
             Message::Data { bytes, .. } => seen.output.extend_from_slice(&bytes),
+            // The keys were refused and the server fell back to a password.
+            Message::Prompt { .. } => panic!("asked for a password; so far {seen:?}"),
             Message::Disconnected { reason, .. } => {
                 seen.disconnected = reason;
                 return seen;
@@ -312,19 +297,22 @@ async fn servers_of_every_age() {
     let dir = std::env::temp_dir().join(format!("ferossh-interop-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
-    let key_path = user_key(&dir);
-    let key = KeyFile::load(&key_path).unwrap();
+    let keys = user_keys(&dir);
     let mut failures = Vec::new();
-    for &(tag, server, expect) in CASES {
-        let name = format!("{server} on ubuntu {tag}");
+    for &(tag, server, legacy, expect) in CASES {
+        let name = format!(
+            "{server} on ubuntu {tag}{}",
+            if legacy { " (legacy)" } else { "" }
+        );
         let container = Server::start(tag, server, &dir);
-        let seen = connect(container.port, &key, "echo fero$((6*7)); exit\n").await;
+        let seen = connect(container.port, &keys, legacy, "echo fero$((6*7)); exit\n").await;
         let output = String::from_utf8_lossy(&seen.output);
         let ok = match (expect, &seen.connected) {
             (Login { kex, cipher }, Some((k, c, _))) => {
                 // Older OpenSSH and Dropbear name curve25519 the libssh way.
                 let kex_ok = k == kex || (kex == C25519 && k == C25519_LIBSSH);
-                kex_ok && c == cipher && output.contains("fero42")
+                // A retry without ChaCha20 must not ask about the key again.
+                kex_ok && c == cipher && output.contains("fero42") && seen.host_key_prompts == 1
             }
             (Refused(why), None) => seen.disconnected.contains(why),
             _ => false,

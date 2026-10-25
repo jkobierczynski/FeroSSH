@@ -91,6 +91,7 @@ pub async fn serve(mut inbox: mpsc::Receiver<Message>, out: mpsc::Sender<Message
                 rows,
                 host_key_algs,
                 x11,
+                legacy,
             } => {
                 let Some(rx) = session(channel) else { continue };
                 let params = Params {
@@ -101,6 +102,7 @@ pub async fn serve(mut inbox: mpsc::Receiver<Message>, out: mpsc::Sender<Message
                     rows,
                     host_key_algs,
                     x11,
+                    legacy,
                 };
                 tokio::spawn(session::run(
                     channel,
