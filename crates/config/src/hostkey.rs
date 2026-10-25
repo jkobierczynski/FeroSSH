@@ -51,6 +51,17 @@ pub fn describe(blob: &[u8]) -> Option<KeyDescription> {
     })
 }
 
+/// Describes an OpenSSH certificate by the key inside it; `None` if the
+/// blob is not a certificate.
+pub fn describe_certificate(blob: &[u8]) -> Option<KeyDescription> {
+    let cert = russh::keys::Certificate::from_bytes(blob).ok()?;
+    describe(
+        &PublicKey::new(cert.public_key().clone(), "")
+            .to_bytes()
+            .ok()?,
+    )
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {

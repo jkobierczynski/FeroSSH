@@ -46,16 +46,33 @@ impl<'a> Reader<'a> {
     }
 }
 
+/// Whether a public key blob is an OpenSSH certificate.
+pub fn is_certificate(key: &[u8]) -> bool {
+    key_type(key).is_some_and(|t| t.ends_with("-cert-v01@openssh.com"))
+}
+
 /// The key type (first string) of an SSH wire-format public key.
 pub fn key_type(key: &[u8]) -> Option<&str> {
     std::str::from_utf8(Reader(key).string()?).ok()
 }
 
-/// The signature algorithms FeroSSH allows for a key type.
+/// The signature algorithms FeroSSH allows for a key type. Certificates
+/// (`*-cert-v01@openssh.com`) are named by their own algorithm.
 pub fn allowed_algorithms(key_type: &str) -> &'static [&'static str] {
     match key_type {
         "ssh-ed25519" => &["ssh-ed25519"],
         "ecdsa-sha2-nistp256" => &["ecdsa-sha2-nistp256"],
+        // PIV cards and some HSMs hold these; SHA-384 and SHA-512.
+        "ecdsa-sha2-nistp384" => &["ecdsa-sha2-nistp384"],
+        "ecdsa-sha2-nistp521" => &["ecdsa-sha2-nistp521"],
+        "ssh-ed25519-cert-v01@openssh.com" => &["ssh-ed25519-cert-v01@openssh.com"],
+        "ecdsa-sha2-nistp256-cert-v01@openssh.com" => &["ecdsa-sha2-nistp256-cert-v01@openssh.com"],
+        "ecdsa-sha2-nistp384-cert-v01@openssh.com" => &["ecdsa-sha2-nistp384-cert-v01@openssh.com"],
+        "ecdsa-sha2-nistp521-cert-v01@openssh.com" => &["ecdsa-sha2-nistp521-cert-v01@openssh.com"],
+        "ssh-rsa-cert-v01@openssh.com" => &[
+            "rsa-sha2-512-cert-v01@openssh.com",
+            "rsa-sha2-256-cert-v01@openssh.com",
+        ],
         "sk-ssh-ed25519@openssh.com" => &["sk-ssh-ed25519@openssh.com"],
         "sk-ecdsa-sha2-nistp256@openssh.com" => &["sk-ecdsa-sha2-nistp256@openssh.com"],
         // Never "ssh-rsa": that is SHA-1.
@@ -101,8 +118,8 @@ pub fn check(data: &[u8], user: &str, key: &[u8]) -> Result<SignTarget, &'static
         return Err("algorithm not allowed for this key");
     }
     let flags = match algorithm {
-        "rsa-sha2-256" => SSH_AGENT_RSA_SHA2_256,
-        "rsa-sha2-512" => SSH_AGENT_RSA_SHA2_512,
+        "rsa-sha2-256" | "rsa-sha2-256-cert-v01@openssh.com" => SSH_AGENT_RSA_SHA2_256,
+        "rsa-sha2-512" | "rsa-sha2-512-cert-v01@openssh.com" => SSH_AGENT_RSA_SHA2_512,
         _ => 0,
     };
     Ok(SignTarget {

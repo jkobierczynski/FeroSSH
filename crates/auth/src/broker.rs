@@ -10,12 +10,12 @@ use std::sync::Arc;
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::thread;
 
-use russh::keys::PublicKey;
+use russh::keys::{Certificate, PublicKey};
 use zeroize::Zeroizing;
 
 use crate::agent::{self, AgentKind};
 use crate::keyfile::{KeyFile, KeyFileError};
-use crate::userauth::{allowed_algorithms, key_type};
+use crate::userauth::{allowed_algorithms, is_certificate, key_type};
 
 /// The smallest RSA key used for user authentication.
 pub const MIN_RSA_BITS: u32 = 3072;
@@ -91,11 +91,17 @@ pub fn refusal(public: &[u8]) -> Option<String> {
     if allowed_algorithms(kind).is_empty() {
         return Some(format!("{kind} keys are not allowed"));
     }
-    if kind == "ssh-rsa" {
-        let bits = PublicKey::from_bytes(public)
-            .ok()
-            .and_then(|k| k.key_data().rsa().map(|r| r.key_size()))
-            .unwrap_or(0);
+    if kind == "ssh-rsa" || kind == "ssh-rsa-cert-v01@openssh.com" {
+        let bits = if is_certificate(public) {
+            Certificate::from_bytes(public)
+                .ok()
+                .and_then(|c| c.public_key().rsa().map(|r| r.key_size()))
+        } else {
+            PublicKey::from_bytes(public)
+                .ok()
+                .and_then(|k| k.key_data().rsa().map(|r| r.key_size()))
+        }
+        .unwrap_or(0);
         if bits < MIN_RSA_BITS {
             return Some(format!(
                 "{bits}-bit RSA keys are too small (at least {MIN_RSA_BITS} bits)"
@@ -248,7 +254,10 @@ mod tests {
     #[test]
     fn refuses_legacy_and_small_keys() {
         assert!(refusal(&key("ssh-dss")).is_some());
-        assert!(refusal(&key("ecdsa-sha2-nistp521")).is_some());
+        assert!(refusal(&key("ssh-dss-cert-v01@openssh.com")).is_some());
+        assert!(refusal(&key("ssh-rsa-cert-v01@openssh.com")).is_some());
+        assert!(refusal(&key("ecdsa-sha2-nistp521")).is_none());
+        assert!(refusal(&key("ssh-ed25519-cert-v01@openssh.com")).is_none());
         // An RSA blob that does not parse counts as 0 bits.
         assert!(refusal(&key("ssh-rsa")).is_some());
         assert!(refusal(&key("ssh-ed25519")).is_none());

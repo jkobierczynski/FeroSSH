@@ -51,6 +51,7 @@ jobs:
       - run: sudo apt-get update && sudo apt-get install -y openssh-server putty-tools xauth tmux
       - run: sudo mkdir -p /run/sshd
       - run: cargo test --locked -p ferossh-worker --test sshd
+      - run: cargo test --locked -p ferossh-worker --test agent
       - run: cargo test --locked -p ferossh-sftp --test queue
       - run: cargo test --locked -p ferossh ssh_e2e
       - run: cargo test --locked -p ferossh forwards_e2e
