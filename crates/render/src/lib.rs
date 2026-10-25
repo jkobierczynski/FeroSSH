@@ -15,6 +15,7 @@ mod cursor;
 mod d2d;
 mod font;
 mod grid;
+mod image;
 mod theme;
 
 pub use atlas::{AtlasPacker, Slot};
@@ -24,4 +25,5 @@ pub use cursor::{Cursor, CursorShape};
 pub use d2d::{Frame, PaneView, PixelRect, Renderer};
 pub use font::{CellMetrics, DesignMetrics, FontSpec};
 pub use grid::Grid;
+pub use image::{Image, fit};
 pub use theme::Theme;

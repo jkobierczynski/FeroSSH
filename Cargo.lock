@@ -3,6 +3,12 @@
 version = 4
 
 [[package]]
+name = "adler2"
+version = "2.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "320119579fcad9c21884f5c4861d16174d0e06250625266f50fe6898340abefa"
+
+[[package]]
 name = "aead"
 version = "0.6.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -562,6 +568,7 @@ dependencies = [
  "ferossh-sftp",
  "ferossh-term",
  "ferossh-tmuxcc",
+ "ferossh-vnc",
  "ferossh-worker",
  "getrandom 0.4.3",
  "russh",
@@ -631,6 +638,15 @@ dependencies = [
 [[package]]
 name = "ferossh-tmuxcc"
 version = "0.1.0"
+
+[[package]]
+name = "ferossh-vnc"
+version = "0.1.0"
+dependencies = [
+ "des",
+ "miniz_oxide",
+ "zeroize",
+]
 
 [[package]]
 name = "ferossh-worker"
@@ -984,6 +1000,15 @@ name = "memchr"
 version = "2.8.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cf8baf1c55e62ffcace7a9f06f4bd9cd3f0c4beb022d3b367256b91b87513d98"
+
+[[package]]
+name = "miniz_oxide"
+version = "0.8.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1fa76a2c86f704bdb222d66965fb3d63269ce38518b83cb0575fca855ebb6316"
+dependencies = [
+ "adler2",
+]
 
 [[package]]
 name = "mio"

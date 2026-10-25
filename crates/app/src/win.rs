@@ -19,7 +19,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use ferossh_auth::Broker;
-use ferossh_config::settings::DEFAULT_DESKTOP_PORT;
+use ferossh_config::settings::{DEFAULT_DESKTOP_PORT, DEFAULT_VNC_PORT};
 use ferossh_config::{Settings, putty, ssh_config};
 use ferossh_forward::x11::{Display, find_cookie, xauth_entries};
 use ferossh_ipc::{ChannelId, DirEntry, FORWARD_IDS, Message, SftpReply, X11Auth};
@@ -73,16 +73,17 @@ use windows::Win32::UI::WindowsAndMessaging::{
     SetMenu, SetTimer, SetWindowPos, SetWindowTextW, ShowWindow, TPM_NONOTIFY, TPM_RETURNCMD,
     TrackPopupMenu, TranslateMessage, WINDOW_EX_STYLE, WINDOW_STYLE, WM_APP, WM_CHAR, WM_CLOSE,
     WM_COMMAND, WM_DESTROY, WM_DPICHANGED, WM_DROPFILES, WM_ERASEBKGND, WM_GETDPISCALEDSIZE,
-    WM_IME_COMPOSITION, WM_IME_STARTCOMPOSITION, WM_KEYDOWN, WM_KILLFOCUS, WM_LBUTTONDOWN,
-    WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_PAINT,
-    WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SETCURSOR, WM_SETFOCUS, WM_SIZE, WM_SYSCHAR, WM_SYSKEYDOWN,
-    WM_SYSKEYUP, WM_TIMER, WNDCLASSW, WS_EX_APPWINDOW, WS_OVERLAPPEDWINDOW,
+    WM_IME_COMPOSITION, WM_IME_STARTCOMPOSITION, WM_KEYDOWN, WM_KEYUP, WM_KILLFOCUS,
+    WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL,
+    WM_PAINT, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SETCURSOR, WM_SETFOCUS, WM_SIZE, WM_SYSCHAR,
+    WM_SYSKEYDOWN, WM_SYSKEYUP, WM_TIMER, WNDCLASSW, WS_EX_APPWINDOW, WS_OVERLAPPEDWINDOW,
 };
 use windows::core::{HSTRING, PCWSTR, PWSTR, Result, w};
 
 use crate::Launch;
 use crate::clipboard;
 use crate::conpty::{self, Output, Shell};
+use crate::desktop::{Desktop, Update as DesktopUpdate};
 use crate::files::{FilesAction, FilesView};
 use crate::forwards::{ConnView, DesktopEvent, Forwarder, Setup as ForwardSetup, desktop_port_for};
 use crate::fwdview::{ForwardsView, FwdAction};
@@ -143,6 +144,8 @@ const TRANSFER_TICK_MS: u32 = 250;
 const OUTPUT_BUDGET: usize = 1 << 20;
 /// Wheel units (120 per notch) per scrolled line: three lines a notch.
 const WHEEL_PER_LINE: i32 = 40;
+/// One wheel notch, as WM_MOUSEWHEEL counts it.
+const WHEEL_DELTA_NOTCH: i32 = 120;
 /// Characters of host-supplied text shown in a confirmation prompt.
 const PREVIEW_CHARS: usize = 400;
 
@@ -198,6 +201,7 @@ mod cmd {
     pub const TMUX_PICK: u32 = 612;
     pub const TMUX_LAYOUT: u32 = 613;
     pub const DESKTOP: u32 = 614;
+    pub const DESKTOP_TAB: u32 = 615;
     /// Plus the index in the session picker's list; the one past the
     /// last is "New session".
     pub const TMUX_SESSION: u32 = 800;
@@ -236,6 +240,12 @@ enum Host {
     /// mode; `label` names the host.
     Tmux {
         gateway: PaneId,
+        label: String,
+    },
+    /// The built-in viewer's remote desktop (in the pane's `desktop`);
+    /// `label` names the host.
+    #[cfg_attr(not(feature = "desktop-viewer"), allow(dead_code))]
+    Desktop {
         label: String,
     },
 }
@@ -283,6 +293,9 @@ struct Pane {
     /// Where the scroll mark was last drawn, so moving or hiding it can
     /// repaint the rows it covered.
     mark: Option<Rect>,
+    /// A remote desktop shown instead of the terminal, which then only
+    /// carries messages (the `desktop-viewer` feature).
+    desktop: Option<Box<Desktop>>,
 }
 
 impl Pane {
@@ -325,8 +338,13 @@ impl Pane {
             Host::Ssh(s) => s.target.label(),
             Host::Local { .. } => "local".to_owned(),
             Host::Ask(_) => "new tab".to_owned(),
-            Host::Tmux { label, .. } => label.clone(),
+            Host::Tmux { label, .. } | Host::Desktop { label } => label.clone(),
         }
+    }
+
+    /// The remote desktop's picture, while it shows.
+    fn image(&self) -> Option<ferossh_render::Image<'_>> {
+        self.desktop.as_ref()?.image(u64::from(self.id))
     }
 
     fn health(&self) -> Health {
@@ -489,9 +507,18 @@ struct Window {
     /// Commands decided outside a handler that returns them; the next
     /// redraw runs them.
     queued: Vec<Command>,
-    /// Remote desktops asked for and not yet open: the pane that asked, by
-    /// connection.
-    desktops: HashMap<ChannelId, PaneId>,
+    /// Remote desktops asked for and not yet open, by connection and
+    /// server port.
+    desktops: HashMap<(ChannelId, u16), DesktopWant>,
+}
+
+/// A remote desktop asked for in pane `pane`.
+#[derive(Debug, Clone)]
+enum DesktopWant {
+    /// Windows' Remote Desktop Connection, over RDP.
+    Rdp { pane: PaneId },
+    /// The built-in viewer in a new tab, over VNC; `label` names the host.
+    Tab { pane: PaneId, label: String },
 }
 
 thread_local! {
@@ -846,6 +873,7 @@ fn new_pane(
         cwd: None,
         cwd_host: None,
         mark: None,
+        desktop: None,
     }
 }
 
@@ -900,6 +928,13 @@ fn build_menu() -> Result<HMENU> {
         )?;
         separator(session)?;
         item(session, cmd::DESKTOP, "Open remote &desktop\tCtrl+Shift+D")?;
+        if cfg!(feature = "desktop-viewer") {
+            item(
+                session,
+                cmd::DESKTOP_TAB,
+                "Open remote desktop in a &tab (VNC)",
+            )?;
+        }
 
         let edit = CreatePopupMenu()?;
         item(edit, cmd::COPY, "&Copy\tCtrl+Shift+C")?;
@@ -1524,6 +1559,7 @@ impl Window {
         self.stop_log(id);
         if let Some(p) = self.panes.get_mut(&id) {
             p.host = Host::Ask(String::new());
+            p.desktop = None;
             p.title = None;
             p.cwd = None;
             p.cwd_host = None;
@@ -1738,9 +1774,10 @@ impl Window {
     }
 
     /// Session > Open remote desktop: asks the forwarding engine for a
-    /// tunnel to the host's RDP port; [`Self::desktop_events`] opens the
-    /// viewer once it listens.
-    fn open_desktop(&mut self, pane: PaneId) -> Option<Command> {
+    /// tunnel to the host's RDP port (or, for the built-in viewer in a
+    /// tab, its VNC port); [`Self::desktop_events`] opens the viewer once
+    /// it listens.
+    fn open_desktop(&mut self, pane: PaneId, tab: bool) -> Option<Command> {
         let host = self.host_pane(pane);
         let (Some(connection), Some(Host::Ssh(s))) = (
             self.pane_connection(pane),
@@ -1748,15 +1785,21 @@ impl Window {
         ) else {
             return Some(Command::Notice(NO_DESKTOP_HOST.into()));
         };
-        let port = self
-            .settings
-            .profile(&s.target.alias)
-            .and_then(|p| p.desktop_port)
-            .unwrap_or(DEFAULT_DESKTOP_PORT);
-        let local = desktop_port_for(&s.target.label());
+        let profile = self.settings.profile(&s.target.alias);
+        let label = s.target.label();
+        let (port, local, want) = if tab {
+            let port = profile.and_then(|p| p.vnc_port).unwrap_or(DEFAULT_VNC_PORT);
+            // Only the viewer connects; any free port will do.
+            (port, 0, DesktopWant::Tab { pane, label })
+        } else {
+            let port = profile
+                .and_then(|p| p.desktop_port)
+                .unwrap_or(DEFAULT_DESKTOP_PORT);
+            (port, desktop_port_for(&label), DesktopWant::Rdp { pane })
+        };
         let w = self.worker.as_ref()?;
         w.forwarder.open_desktop(connection, port, local);
-        self.desktops.insert(connection, pane);
+        self.desktops.insert((connection, port), want);
         self.show(
             pane,
             &format!(
@@ -1767,8 +1810,8 @@ impl Window {
         None
     }
 
-    /// Opens Remote Desktop Connection on the desktop tunnels that are
-    /// ready, and says why the others failed.
+    /// Opens a viewer on the desktop tunnels that are ready, and says why
+    /// the others failed.
     fn desktop_events(&mut self) {
         let events = match &self.worker {
             Some(w) => w.forwarder.take_desktop_events(),
@@ -1776,28 +1819,273 @@ impl Window {
         };
         for event in events {
             match event {
-                DesktopEvent::Ready { connection, addr } => {
-                    let pane = self.desktops.remove(&connection);
-                    let note = match launch_rdp_client(&addr) {
-                        Ok(()) => format!(
-                            "\x1b[0;90mRemote desktop tunnel at {addr}; Remote Desktop \
-                             Connection opens on it. It closes with this connection.\x1b[0m\r\n"
-                        ),
-                        Err(e) => format!(
-                            "\x1b[0;31mThe remote desktop tunnel listens at {addr}, but Remote \
-                             Desktop Connection (mstsc.exe) did not start: {e}\x1b[0m\r\n"
-                        ),
-                    };
-                    if let Some(pane) = pane {
+                DesktopEvent::Ready {
+                    connection,
+                    port,
+                    addr,
+                } => match self.desktops.remove(&(connection, port)) {
+                    Some(DesktopWant::Rdp { pane }) => {
+                        let note = match launch_rdp_client(&addr) {
+                            Ok(()) => format!(
+                                "\x1b[0;90mRemote desktop tunnel at {addr}; Remote Desktop \
+                                 Connection opens on it. It closes with this connection.\x1b[0m\r\n"
+                            ),
+                            Err(e) => format!(
+                                "\x1b[0;31mThe remote desktop tunnel listens at {addr}, but \
+                                 Remote Desktop Connection (mstsc.exe) did not start: {e}\x1b[0m\r\n"
+                            ),
+                        };
                         self.show(pane, &note);
                         self.refresh(pane);
                     }
-                }
-                DesktopEvent::Failed { connection, why } => {
-                    self.desktops.remove(&connection);
-                    self.queued.push(Command::Notice(why));
+                    Some(DesktopWant::Tab { pane, label }) => self.desktop_tab(pane, label, &addr),
+                    None => {}
+                },
+                DesktopEvent::Failed {
+                    connection,
+                    port,
+                    why,
+                } => {
+                    let advice = match self.desktops.remove(&(connection, port)) {
+                        Some(DesktopWant::Tab { .. }) => {
+                            " Start a VNC server for your desktop there (x11vnc or TigerVNC \
+                             for X11, wayvnc or GNOME's VNC mode for Wayland), or set VncPort \
+                             in this host's profile if it listens elsewhere."
+                        }
+                        _ => {
+                            " Install xrdp (sudo apt install xrdp) or turn on GNOME Remote \
+                             Desktop, or set DesktopPort in this host's profile if it listens \
+                             elsewhere."
+                        }
+                    };
+                    self.queued.push(Command::Notice(format!("{why}{advice}")));
                 }
             }
+        }
+    }
+
+    /// Opens the built-in viewer on the tunnel at `addr` in a new tab.
+    #[cfg(feature = "desktop-viewer")]
+    fn desktop_tab(&mut self, from: PaneId, label: String, addr: &str) {
+        let started = sandbox::spawn_viewer().and_then(|v| {
+            let to = v.to_worker.try_clone().map_err(io_error)?;
+            let from = v.from_worker.try_clone().map_err(io_error)?;
+            Desktop::start(addr, to, from, Box::new(v), self.notifier()).map_err(io_error)
+        });
+        match started {
+            Ok(desktop) => {
+                let id = self.new_tab_pane();
+                if let Some(p) = self.panes.get_mut(&id) {
+                    p.host = Host::Desktop {
+                        label: format!("desktop {label}"),
+                    };
+                    p.desktop = Some(Box::new(desktop));
+                }
+                self.show(
+                    id,
+                    "\x1b[0;90mConnecting to the VNC server through the SSH tunnel...\x1b[0m\r\n",
+                );
+                self.refresh(id);
+                self.update_title();
+            }
+            Err(e) => {
+                self.show(
+                    from,
+                    &format!("\x1b[0;31mThe desktop viewer did not start: {e}\x1b[0m\r\n"),
+                );
+                self.refresh(from);
+            }
+        }
+    }
+
+    #[cfg(not(feature = "desktop-viewer"))]
+    fn desktop_tab(&mut self, _from: PaneId, _label: String, _addr: &str) {}
+
+    /// Applies what the remote desktops sent.
+    fn poll_desktops(&mut self) {
+        let ids: Vec<PaneId> = self
+            .panes
+            .iter()
+            .filter(|(_, p)| p.desktop.is_some())
+            .map(|(id, _)| *id)
+            .collect();
+        for id in ids {
+            let updates = match self.panes.get_mut(&id).and_then(|p| p.desktop.as_mut()) {
+                Some(d) => d.poll(),
+                None => continue,
+            };
+            for update in updates {
+                match update {
+                    DesktopUpdate::Redraw => {
+                        if let Some(p) = self.panes.get_mut(&id) {
+                            p.grid.mark_all_dirty();
+                        }
+                        self.invalidate_dirty(id);
+                    }
+                    DesktopUpdate::Title(name) => {
+                        if let Some(p) = self.panes.get_mut(&id) {
+                            p.title = Some(name).filter(|n| !n.is_empty());
+                        }
+                        self.update_title();
+                        self.refresh_chrome();
+                    }
+                    DesktopUpdate::Bell => {
+                        if !self.is_visible(id)
+                            && let Some(p) = self.panes.get_mut(&id)
+                        {
+                            p.bell = true;
+                            self.refresh_chrome();
+                        }
+                    }
+                    DesktopUpdate::AskPassword => {
+                        self.show(id, "VNC password: ");
+                        self.refresh(id);
+                    }
+                    DesktopUpdate::Ended(why) => {
+                        if let Some(p) = self.panes.get_mut(&id) {
+                            p.desktop = None;
+                            p.grid.mark_all_dirty();
+                        }
+                        let why = crate::ssh::sanitize(&why);
+                        self.show(
+                            id,
+                            &format!("\r\n\x1b[0;31mThe remote desktop ended: {why}\x1b[0m\r\n"),
+                        );
+                        self.request_full_redraw();
+                        self.refresh(id);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Keyboard and mouse messages for a remote desktop pane; `true` when
+    /// the desktop took the message.
+    fn desktop_message(&mut self, msg: u32, wparam: WPARAM, lparam: LPARAM) -> bool {
+        if !self.panes.values().any(|p| p.desktop.is_some()) {
+            return false;
+        }
+        match msg {
+            WM_KEYDOWN | WM_SYSKEYDOWN | WM_KEYUP | WM_SYSKEYUP => {
+                let id = self.focused_id();
+                if self.side.focused {
+                    return false;
+                }
+                let vk = VIRTUAL_KEY(wparam.0 as u16);
+                let down = matches!(msg, WM_KEYDOWN | WM_SYSKEYDOWN);
+                // FeroSSH's own shortcuts still work in the pane.
+                let split = self.ws.tab().is_some_and(|t| t.root.panes().len() > 1);
+                if down && shortcut(vk, key_mods(), self.ws.tabs.len() > 1, split).is_some() {
+                    return false;
+                }
+                let extended = lparam.0 & (1 << 24) != 0;
+                let scan = ((lparam.0 >> 16) & 0xff) as u16;
+                let Some(d) = self.panes.get_mut(&id).and_then(|p| p.desktop.as_mut()) else {
+                    return false;
+                };
+                if !d.running() {
+                    return false;
+                }
+                if d.key(vk.0, extended, scan, down) {
+                    drop_pending_char(self.hwnd);
+                }
+                true
+            }
+            WM_CHAR | WM_SYSCHAR => {
+                if self.side.focused {
+                    return false;
+                }
+                let id = self.focused_id();
+                let Some(d) = self.panes.get_mut(&id).and_then(|p| p.desktop.as_mut()) else {
+                    return false;
+                };
+                let asking = d.asking_password();
+                if !asking && !d.running() {
+                    return false;
+                }
+                let Some(c) = char::from_u32(wparam.0 as u32) else {
+                    return true;
+                };
+                if d.char(c) {
+                    self.show(id, "\r\n");
+                    self.refresh(id);
+                }
+                true
+            }
+            WM_LBUTTONDOWN | WM_LBUTTONUP | WM_RBUTTONDOWN | WM_RBUTTONUP | WM_MBUTTONDOWN
+            | WM_MBUTTONUP | WM_MOUSEMOVE => {
+                if self.drag.is_some() {
+                    return false;
+                }
+                let (x, y) = lparam_point(lparam);
+                let Spot::Pane(id) = self.spot(x, y) else {
+                    return false;
+                };
+                let button = match msg {
+                    WM_LBUTTONDOWN => Some((1, true)),
+                    WM_LBUTTONUP => Some((1, false)),
+                    WM_MBUTTONDOWN => Some((2, true)),
+                    WM_MBUTTONUP => Some((2, false)),
+                    WM_RBUTTONDOWN => Some((4, true)),
+                    WM_RBUTTONUP => Some((4, false)),
+                    _ => None,
+                };
+                let Some(p) = self.panes.get(&id) else {
+                    return false;
+                };
+                if !p.desktop.as_ref().is_some_and(|d| d.running()) {
+                    return false;
+                }
+                let area = (p.rect.x, p.rect.y, p.rect.right(), p.rect.bottom());
+                // Ctrl+Shift+drag still moves panes.
+                let mods = mouse_mods(wparam);
+                if mods.ctrl && mods.shift {
+                    return false;
+                }
+                if matches!(button, Some((_, true))) && self.focused_id() != id {
+                    self.focus_pane(id);
+                }
+                if let Some(d) = self.panes.get_mut(&id).and_then(|p| p.desktop.as_mut()) {
+                    d.mouse(area, x, y, button);
+                }
+                true
+            }
+            WM_MOUSEWHEEL => {
+                let (x, y) = lparam_point(lparam);
+                let mut pt = POINT { x, y };
+                // SAFETY: our window and a local point.
+                let _ = unsafe { ScreenToClient(self.hwnd, &mut pt) };
+                let Spot::Pane(id) = self.spot(pt.x, pt.y) else {
+                    return false;
+                };
+                let delta = ((wparam.0 >> 16) & 0xFFFF) as u16 as i16;
+                let Some(p) = self.panes.get_mut(&id) else {
+                    return false;
+                };
+                let area = (p.rect.x, p.rect.y, p.rect.right(), p.rect.bottom());
+                match p.desktop.as_mut() {
+                    Some(d) if d.running() => {
+                        // Touchpads send part notches: each counts as one.
+                        let notches = i32::from(delta) / WHEEL_DELTA_NOTCH;
+                        let notches = if notches == 0 {
+                            i32::from(delta).signum()
+                        } else {
+                            notches
+                        };
+                        d.wheel(area, pt.x, pt.y, notches);
+                        true
+                    }
+                    _ => false,
+                }
+            }
+            WM_KILLFOCUS => {
+                let id = self.focused_id();
+                if let Some(d) = self.panes.get_mut(&id).and_then(|p| p.desktop.as_mut()) {
+                    d.focus_lost();
+                }
+                false
+            }
+            _ => false,
         }
     }
 
@@ -2175,6 +2463,9 @@ impl Window {
                 }
             }
             Host::Local { .. } => self.send(id, bytes),
+            // Typing reaches the desktop before this; the pane only shows
+            // messages once it ended.
+            Host::Desktop { .. } => {}
             Host::Ask(text) => {
                 if enter {
                     let destination = std::mem::take(text);
@@ -2367,6 +2658,7 @@ impl Window {
             }
         }
         self.desktop_events();
+        self.poll_desktops();
         // The forwards list and the tab badges.
         if self
             .worker
@@ -2927,6 +3219,7 @@ impl Window {
                 origin: p.origin(self.dpi),
                 cursor: p.cursor,
                 full,
+                image: p.image(),
             });
         }
         if let Some(s) = self.areas.strip {
@@ -2938,6 +3231,7 @@ impl Window {
                 origin: (s.x + cpad, s.y + spad),
                 cursor: None,
                 full: true,
+                image: None,
             });
         }
         if let Some(s) = self.areas.side {
@@ -2949,6 +3243,7 @@ impl Window {
                 origin: (s.x + cpad, s.y + cpad),
                 cursor: None,
                 full,
+                image: None,
             });
         }
         let result = self.renderer.draw(&views, &fills, self.dpi);
@@ -2958,6 +3253,9 @@ impl Window {
                 for id in &ids {
                     if let Some(p) = self.panes.get_mut(id) {
                         p.grid.clear_dirty();
+                        if let Some(d) = p.desktop.as_mut() {
+                            d.drawn();
+                        }
                     }
                 }
                 self.strip_grid.clear_dirty();
@@ -3991,7 +4289,8 @@ impl Window {
                 };
                 self.attach_tmux(pane, &name, true);
             }
-            cmd::DESKTOP => return self.open_desktop(pane),
+            cmd::DESKTOP => return self.open_desktop(pane, false),
+            cmd::DESKTOP_TAB => return self.open_desktop(pane, true),
             cmd::TMUX_DETACH | cmd::TMUX_PICK | cmd::TMUX_LAYOUT => {
                 let host = self.host_pane(pane);
                 let Some(t) = self.tmux.get_mut(&host).filter(|t| t.active()) else {
@@ -5390,6 +5689,9 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
     // SAFETY: called by Windows with valid arguments for this window; the
     // pointer casts below follow each message's documented lparam type.
     unsafe {
+        if with_window(|w| w.desktop_message(msg, wparam, lparam)) == Some(true) {
+            return LRESULT(0);
+        }
         match msg {
             WM_PAINT => {
                 let mut ps = PAINTSTRUCT::default();

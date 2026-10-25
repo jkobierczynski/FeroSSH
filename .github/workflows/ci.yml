@@ -21,18 +21,35 @@ jobs:
       - run: rustup show active-toolchain
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      # The optional built-in desktop viewer (Cargo feature, off by default).
+      - run: cargo clippy -p ferossh --all-targets --features desktop-viewer --locked -- -D warnings
       - run: cargo test --workspace --locked
+      - run: cargo test -p ferossh --features desktop-viewer --locked
+      # Two exes: the standard one, with none of the viewer's code, and
+      # ferossh-desktop.exe with the viewer.
       - run: cargo build --release --locked -p ferossh
-      - name: Report exe size
+      - run: |
+          mkdir dist
+          copy target\release\ferossh.exe dist\ferossh.exe
+        shell: cmd
+      - run: cargo build --release --locked -p ferossh --features desktop-viewer
+      - run: copy target\release\ferossh.exe dist\ferossh-desktop.exe
+        shell: cmd
+      - name: Report exe sizes
         shell: pwsh
         run: |
-          $exe = Get-Item target/release/ferossh.exe
-          $kb = [math]::Round($exe.Length / 1KB)
-          "ferossh.exe: $kb KB" | Tee-Object -Append $env:GITHUB_STEP_SUMMARY
+          $std = (Get-Item dist/ferossh.exe).Length
+          $desk = (Get-Item dist/ferossh-desktop.exe).Length
+          "ferossh.exe: $([math]::Round($std / 1KB)) KB" | Tee-Object -Append $env:GITHUB_STEP_SUMMARY
+          "ferossh-desktop.exe (with the desktop viewer): $([math]::Round($desk / 1KB)) KB, +$([math]::Round(($desk - $std) / 1KB)) KB" | Tee-Object -Append $env:GITHUB_STEP_SUMMARY
       - uses: actions/upload-artifact@v4
         with:
           name: ferossh-exe
-          path: target/release/ferossh.exe
+          path: dist/ferossh.exe
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ferossh-desktop-viewer-exe
+          path: dist/ferossh-desktop.exe
 
   sshd:
     name: SSH tests against OpenSSH (Linux)
@@ -127,3 +144,4 @@ jobs:
       - run: cargo +nightly fuzz run --target x86_64-unknown-linux-gnu sftp_decode -- -max_total_time=60
       - run: cargo +nightly fuzz run --target x86_64-unknown-linux-gnu forward_parse -- -max_total_time=60
       - run: cargo +nightly fuzz run --target x86_64-unknown-linux-gnu tmux_feed -- -max_total_time=60
+      - run: cargo +nightly fuzz run --target x86_64-unknown-linux-gnu vnc_decode -- -max_total_time=60

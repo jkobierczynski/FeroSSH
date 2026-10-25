@@ -19,6 +19,7 @@ ferossh-render = { path = "crates/render" }
 ferossh-sftp = { path = "crates/sftp" }
 ferossh-term = { path = "crates/term" }
 ferossh-tmuxcc = { path = "crates/tmuxcc" }
+ferossh-vnc = { path = "crates/vnc" }
 ferossh-worker = { path = "crates/worker" }
 
 # Crypto backend is `ring`: russh has no pure-RustCrypto backend, and ring

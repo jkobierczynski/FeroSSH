@@ -24,6 +24,7 @@
 //!     LegacyAlgorithms yes
 //! Profile desktop-box
 //!     DesktopPort 3390
+//!     VncPort 5901
 //! ```
 //!
 //! FeroSSH rewrites the file when a setting changes. Unknown keywords are
@@ -57,10 +58,15 @@ pub struct Profile {
     /// The server's RDP port for Session > Open remote desktop; 3389 when
     /// unset.
     pub desktop_port: Option<u16>,
+    /// The server's VNC port for the built-in desktop viewer; 5900 when
+    /// unset.
+    pub vnc_port: Option<u16>,
 }
 
 /// The RDP port xrdp and GNOME Remote Desktop listen on by default.
 pub const DEFAULT_DESKTOP_PORT: u16 = 3389;
+/// The VNC port of display :0.
+pub const DEFAULT_VNC_PORT: u16 = 5900;
 
 impl Profile {
     fn is_empty(&self) -> bool {
@@ -72,6 +78,7 @@ impl Profile {
             && self.tmux_layout.is_none()
             && !self.legacy_algorithms
             && self.desktop_port.is_none()
+            && self.vnc_port.is_none()
     }
 }
 
@@ -280,6 +287,11 @@ impl Settings {
                                     .and_then(|v| v.parse::<u16>().ok())
                                     .filter(|&v| v != 0);
                             }
+                            "vncport" => {
+                                p.vnc_port = first
+                                    .and_then(|v| v.parse::<u16>().ok())
+                                    .filter(|&v| v != 0);
+                            }
                             "tmuxlayout" => {
                                 p.tmux_layout = first
                                     .map(|l| l.to_ascii_lowercase())
@@ -389,6 +401,9 @@ impl Settings {
             if let Some(port) = p.desktop_port {
                 let _ = writeln!(out, "    DesktopPort {port}");
             }
+            if let Some(port) = p.vnc_port {
+                let _ = writeln!(out, "    VncPort {port}");
+            }
         }
         out
     }
@@ -478,6 +493,7 @@ Profile web
     TmuxLayout TMUX
     LegacyAlgorithms YES
     DesktopPort 3390
+    VncPort 5901
     Unknown thing
 Profile big
     FontSize 400
@@ -512,6 +528,7 @@ NewKeyword later
         assert_eq!(web.tmux_layout.as_deref(), Some("tmux"));
         assert!(web.legacy_algorithms);
         assert_eq!(web.desktop_port, Some(3390));
+        assert_eq!(web.vnc_port, Some(5901));
         assert_eq!(s.scrollback, Some(50_000));
         assert_eq!(s.download_folder.as_deref(), Some("D:\\My Transfers"));
         assert!(s.verify_transfers);
