@@ -12,15 +12,18 @@ publish.workspace = true
 ferossh-forward.workspace = true
 ferossh-ipc.workspace = true
 getrandom = "0.4"
+ferossh-render.workspace = true
 ferossh-sftp.workspace = true
+ferossh-term.workspace = true
 russh.workspace = true
 tokio = { version = "1.54", features = ["rt", "net", "time", "sync", "macros"] }
 
 
 [dev-dependencies]
 ferossh-auth.workspace = true
-ferossh-term.workspace = true
+ferossh-render.workspace = true
 ferossh-sftp.workspace = true
+ferossh-term.workspace = true
 tokio = { version = "1.54", features = ["rt", "macros", "time"] }
 
 [lints]

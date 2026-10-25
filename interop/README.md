@@ -13,7 +13,9 @@ the tmux matrix in CI. One image per Ubuntu release:
 
 The container argument picks the server: `openssh`, `dropbear`, or `gear`
 (OpenSSH limited to what switches and routers typically offer). The user is
-`fero`; mount a directory holding `authorized_keys` at `/keys`.
+`fero`; mount a directory holding `authorized_keys` at `/keys`. The images
+also carry vttest, less and vim.tiny, which `real_programs_draw_correctly`
+runs through FeroSSH's terminal.
 
 ```sh
 interop/build.sh
