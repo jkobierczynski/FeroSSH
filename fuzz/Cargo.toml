@@ -10,6 +10,7 @@ cargo-fuzz = true
 
 [dependencies]
 libfuzzer-sys = "0.4"
+ferossh-forward = { path = "../crates/forward" }
 ferossh-ipc = { path = "../crates/ipc" }
 ferossh-render = { path = "../crates/render" }
 ferossh-sftp = { path = "../crates/sftp" }
@@ -35,6 +36,13 @@ bench = false
 [[bin]]
 name = "sftp_decode"
 path = "fuzz_targets/sftp_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "forward_parse"
+path = "fuzz_targets/forward_parse.rs"
 test = false
 doc = false
 bench = false

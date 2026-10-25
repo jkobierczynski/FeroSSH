@@ -22,6 +22,12 @@ mod conpty;
 #[cfg_attr(not(windows), allow(dead_code))]
 mod files;
 #[cfg_attr(not(windows), allow(dead_code))]
+mod forwards;
+#[cfg(all(test, unix))]
+mod forwards_e2e;
+#[cfg_attr(not(windows), allow(dead_code))]
+mod fwdview;
+#[cfg_attr(not(windows), allow(dead_code))]
 mod layout;
 #[cfg_attr(not(windows), allow(dead_code))]
 mod link;

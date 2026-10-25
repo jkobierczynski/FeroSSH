@@ -1,10 +1,12 @@
 //! The part of OpenSSH's `ssh_config` that FeroSSH uses: `Host` blocks
-//! with `HostName`, `User`, `Port`, `IdentityFile` and `Tag`, `Include`d
-//! files, and the list of hosts the session manager shows.
+//! with `HostName`, `User`, `Port`, `IdentityFile`, `Tag`, the forwarding
+//! keywords (`LocalForward`, `RemoteForward`, `DynamicForward`,
+//! `ForwardX11`, `GatewayPorts`, `ClearAllForwardings`), `Include`d files,
+//! and the list of hosts the session manager shows.
 //!
 //! The rules follow `ssh_config(5)`: keywords are case-insensitive, the
-//! first value found for a keyword wins (except `IdentityFile`, which
-//! accumulates), and a `Host` line matches when any of its patterns matches
+//! first value found for a keyword wins (except `IdentityFile` and the
+//! forwards, which accumulate), and a `Host` line matches when any of its patterns matches
 //! the name typed and no `!` pattern does. `Match` blocks are skipped.
 //! `Include` reads files through an [`Includes`], so the parser itself
 //! never touches the disk.
@@ -14,6 +16,7 @@
 //! an included file without such a comment go in a folder named after the
 //! file.
 
+use crate::forward::{ForwardKind, ForwardSpec, parse_config};
 use crate::known_hosts::match_pattern_list;
 
 /// Settings for one host after applying the config.
@@ -26,6 +29,35 @@ pub struct HostConfig {
     pub identity_files: Vec<String>,
     /// The `Tag` keyword (OpenSSH 9.4+), which also picks a colour theme.
     pub tag: Option<String>,
+    /// `LocalForward`, `RemoteForward` and `DynamicForward`, in order.
+    /// Lines that do not parse are left out.
+    pub forwards: Vec<ForwardSpec>,
+    pub forward_x11: Option<bool>,
+    /// Local and dynamic forwards without a listening address listen on
+    /// every interface, not only on loopback.
+    pub gateway_ports: Option<bool>,
+    /// `ClearAllForwardings yes`: no forwards at all.
+    pub clear_all_forwardings: Option<bool>,
+}
+
+impl HostConfig {
+    /// The forwards to set up, after `ClearAllForwardings`.
+    pub fn active_forwards(&self) -> &[ForwardSpec] {
+        if self.clear_all_forwardings == Some(true) {
+            &[]
+        } else {
+            &self.forwards
+        }
+    }
+}
+
+/// `yes` or `no` (and `true`/`false`), as ssh_config writes flags.
+fn flag(args: &[String]) -> Option<bool> {
+    match args.first()?.to_ascii_lowercase().as_str() {
+        "yes" | "true" => Some(true),
+        "no" | "false" => Some(false),
+        _ => None,
+    }
 }
 
 /// Include files nest at most this deep, as in OpenSSH.
@@ -302,6 +334,23 @@ pub fn resolve_in(text: &str, name: &str, includes: &dyn Includes) -> HostConfig
             }
             "identityfile" => cfg.identity_files.extend(args.into_iter().take(1)),
             "tag" if cfg.tag.is_none() => cfg.tag = args.into_iter().next(),
+            "localforward" | "remoteforward" | "dynamicforward" => {
+                let kind = match keyword.as_str() {
+                    "localforward" => ForwardKind::Local,
+                    "remoteforward" => ForwardKind::Remote,
+                    _ => ForwardKind::Dynamic,
+                };
+                if let Some(spec) = parse_config(kind, &args)
+                    && !cfg.forwards.contains(&spec)
+                {
+                    cfg.forwards.push(spec);
+                }
+            }
+            "forwardx11" if cfg.forward_x11.is_none() => cfg.forward_x11 = flag(&args),
+            "gatewayports" if cfg.gateway_ports.is_none() => cfg.gateway_ports = flag(&args),
+            "clearallforwardings" if cfg.clear_all_forwardings.is_none() => {
+                cfg.clear_all_forwardings = flag(&args);
+            }
             _ => {}
         }
     }
@@ -424,6 +473,39 @@ Host *
         assert_eq!(web.hostname.as_deref(), Some("10.1.2.3"));
         assert_eq!(web.user.as_deref(), Some("global"));
         assert_eq!(web.identity_files[0], r"C:\Users\me\keys\web key");
+    }
+
+    #[test]
+    fn forwards_accumulate() {
+        let text = "\
+Host db
+    LocalForward 5432 localhost:5432
+    ForwardX11 yes
+    RemoteForward 9000 localhost:3000
+    LocalForward nonsense
+Host *
+    DynamicForward 1080
+    LocalForward 5432 localhost:5432
+    ForwardX11 no
+    GatewayPorts yes
+";
+        let c = resolve(text, "db");
+        let kinds: Vec<_> = c.forwards.iter().map(|f| (f.kind, f.port)).collect();
+        assert_eq!(
+            kinds,
+            [
+                (ForwardKind::Local, 5432),
+                (ForwardKind::Remote, 9000),
+                (ForwardKind::Dynamic, 1080)
+            ]
+        );
+        assert_eq!(c.forward_x11, Some(true));
+        assert_eq!(c.gateway_ports, Some(true));
+        assert_eq!(c.active_forwards().len(), 3);
+        let other = resolve(text, "web");
+        assert_eq!(other.forward_x11, Some(false));
+        let cleared = resolve(&format!("ClearAllForwardings yes\n{text}"), "db");
+        assert!(cleared.active_forwards().is_empty());
     }
 
     #[test]

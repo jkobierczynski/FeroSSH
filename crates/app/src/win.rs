@@ -20,7 +20,8 @@ use std::time::{Duration, Instant};
 
 use ferossh_auth::Broker;
 use ferossh_config::{Settings, putty, ssh_config};
-use ferossh_ipc::{ChannelId, DirEntry, Message, SftpReply};
+use ferossh_forward::x11::{Display, find_cookie, xauth_entries};
+use ferossh_ipc::{ChannelId, DirEntry, FORWARD_IDS, Message, SftpReply, X11Auth};
 use ferossh_render::{
     CellMetrics, Cursor, FontSpec, Frame, Grid, PaneView, PixelRect, Renderer, Rgb, Theme,
 };
@@ -81,6 +82,8 @@ use crate::Launch;
 use crate::clipboard;
 use crate::conpty::{self, Output, Shell};
 use crate::files::{FilesAction, FilesView};
+use crate::forwards::{ConnView, Forwarder, Setup as ForwardSetup};
+use crate::fwdview::{ForwardsView, FwdAction};
 use crate::layout::{self, Axis, Closed, Dir, Drop, PaneId, Rect, Workspace};
 use crate::link::{Link, LinkEvent};
 use crate::look;
@@ -89,7 +92,7 @@ use crate::putty_reg;
 use crate::sandbox;
 use crate::sessions::{HostItem, SessionList, SideAction, SideKey};
 use crate::ssh::{Effect, Env, SshSession, State, Target};
-use crate::tabstrip::{self, Health, Hit, Palette, StripLayout, TabLabel};
+use crate::tabstrip::{self, Forwarding, Health, Hit, Palette, StripLayout, TabLabel};
 
 const DEFAULT_COLS: usize = 80;
 const DEFAULT_ROWS: usize = 24;
@@ -160,6 +163,7 @@ mod cmd {
     pub const SAVE_LOOK: u32 = 208;
     pub const FILES: u32 = 209;
     pub const FOLLOW_CD: u32 = 210;
+    pub const FORWARDS: u32 = 211;
     /// Plus the index into `FONT_CHOICES`.
     pub const FONT: u32 = 300;
     /// Plus the index into `Theme::builtin()`.
@@ -212,9 +216,11 @@ enum Host {
     Ssh(Box<SshSession>),
 }
 
-/// The worker process and the pipes to it.
+/// The worker process, the pipes to it, and the forwarding engine that
+/// shares them.
 struct WorkerConn {
     link: Link,
+    forwarder: Forwarder,
     _process: sandbox::Worker,
 }
 
@@ -339,9 +345,10 @@ enum Drag {
 enum SideView {
     Sessions,
     Files,
+    Forwards,
 }
 
-/// The side pane: the session manager or file transfer.
+/// The side pane: the session manager, file transfer or the forwards.
 struct Side {
     visible: bool,
     view: SideView,
@@ -410,6 +417,7 @@ struct Window {
     /// The host the file view shows: the focused pane's.
     files_key: Option<String>,
     transfer_timer: bool,
+    forwards_view: ForwardsView,
 }
 
 thread_local! {
@@ -670,6 +678,7 @@ fn create_and_run(launch: Launch, theme: Option<String>) -> Result<()> {
                 files: FilesView::default(),
                 files_key: None,
                 transfer_timer: false,
+                forwards_view: ForwardsView::default(),
             });
         });
         // Files dropped from Explorer are uploaded, after a confirmation.
@@ -799,6 +808,7 @@ fn build_menu() -> Result<HMENU> {
         let view = CreatePopupMenu()?;
         item(view, cmd::SESSIONS, "S&ession manager\tCtrl+Shift+S")?;
         item(view, cmd::FILES, "File tra&nsfer\tCtrl+Shift+E")?;
+        item(view, cmd::FORWARDS, "Port &forwards\tCtrl+Shift+P")?;
         item(view, cmd::FOLLOW_CD, "File transfer f&ollows cd")?;
         item(view, cmd::SIDE_RIGHT, "Side pane on the &right")?;
         item(view, cmd::TAB_STRIP, "Ta&b strip")?;
@@ -1087,6 +1097,14 @@ impl Window {
         self.focused && !self.side.focused && id == self.focused_id()
     }
 
+    /// An id for a new shell or SFTP channel, below the forwarding
+    /// engine's range.
+    fn new_channel(&mut self) -> ChannelId {
+        let channel = self.next_channel;
+        self.next_channel = ((self.next_channel + 1) % FORWARD_IDS).max(1);
+        channel
+    }
+
     fn pane_of_channel(&self, channel: ChannelId) -> Option<PaneId> {
         self.panes.values().find_map(|p| match &p.host {
             Host::Ssh(s) if s.channel == channel => Some(p.id),
@@ -1116,6 +1134,7 @@ impl Window {
             p.cwd_host = None;
         }
         self.prune_sftp();
+        self.prune_forwards();
     }
 
     fn start_shell(&mut self, id: PaneId) {
@@ -1169,11 +1188,163 @@ impl Window {
 
     /// The window title follows the focused pane.
     fn update_title(&self) {
-        let label = self.panes.get(&self.focused_id()).map(Pane::label);
+        let focused = self.focused_id();
+        let label = self.panes.get(&focused).map(Pane::label);
+        let badge = self.forwarding(&self.forward_view(), focused).badge();
         match label {
-            Some(l) if l != "new tab" => self.set_title_text(&format!("{l} - {APP_NAME}")),
+            Some(l) if l != "new tab" => {
+                self.set_title_text(&format!("{l}{badge} - {APP_NAME}"));
+            }
             _ => self.set_title_text(APP_NAME),
         }
+    }
+
+    /// Every connection's forwards, from the forwarding engine.
+    fn forward_view(&self) -> Vec<ConnView> {
+        self.worker
+            .as_ref()
+            .map(|w| w.forwarder.view())
+            .unwrap_or_default()
+    }
+
+    /// What the badge of pane `id`'s tab shows.
+    fn forwarding(&self, views: &[ConnView], id: PaneId) -> Forwarding {
+        let Some(Host::Ssh(s)) = self.panes.get(&id).map(|p| &p.host) else {
+            return Forwarding::None;
+        };
+        if s.state() != State::Connected {
+            return Forwarding::None;
+        }
+        match views.iter().find(|v| v.connection == s.connection) {
+            Some(v) if v.inbound() => Forwarding::Inbound,
+            Some(v) if !v.forwards.is_empty() => Forwarding::Outbound,
+            _ => Forwarding::None,
+        }
+    }
+
+    /// The X server forwarded X11 goes to: the X11Display setting, else
+    /// `DISPLAY`, else display 0 on this PC.
+    fn x11_display(&self) -> std::result::Result<Display, String> {
+        let text = self
+            .settings
+            .x11_display
+            .clone()
+            .or_else(|| std::env::var("DISPLAY").ok().filter(|d| !d.is_empty()))
+            .unwrap_or_else(|| "localhost:0".to_owned());
+        Display::parse(&text).ok_or(text)
+    }
+
+    /// X11 forwarding for a new shell in pane `id`: the screen and the
+    /// cookie the X server expects, from `XAUTHORITY` or `~/.Xauthority`
+    /// (none, for an X server without access control).
+    fn x11_auth(&mut self, id: PaneId) -> Option<X11Auth> {
+        let display = match self.x11_display() {
+            Ok(d) => d,
+            Err(text) => {
+                let text = format!(
+                    "\x1b[0;31mX11Display \"{}\" is not a display (try localhost:0); X11 is \
+                     not forwarded.\x1b[0m\r\n",
+                    crate::ssh::sanitize(&text)
+                );
+                self.show(id, &text);
+                return None;
+            }
+        };
+        let file = std::env::var_os("XAUTHORITY")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| home().join(".Xauthority"));
+        let entries = std::fs::read(file)
+            .map(|b| xauth_entries(&b))
+            .unwrap_or_default();
+        let (protocol, cookie) = find_cookie(&entries, &display).unwrap_or_default();
+        Some(X11Auth {
+            screen: display.screen,
+            protocol,
+            cookie,
+        })
+    }
+
+    /// A fresh login in pane `id`: starts the connection's forwards (an
+    /// empty list too, so forwards can be added) and says what runs.
+    fn start_forwards(&mut self, id: PaneId) {
+        let Some(Host::Ssh(s)) = self.panes.get(&id).map(|p| &p.host) else {
+            return;
+        };
+        if s.connection != s.channel {
+            return;
+        }
+        let target = s.target.clone();
+        let connection = s.connection;
+        let x11 = target
+            .forward_x11
+            .then(|| self.x11_display().ok())
+            .flatten();
+        let mut notes: Vec<String> = target.forwards.iter().map(ToString::to_string).collect();
+        if let Some(d) = &x11 {
+            notes.push(format!("X11 to {d}"));
+        }
+        let Some(w) = &self.worker else {
+            return;
+        };
+        w.forwarder.start(
+            connection,
+            target.label(),
+            ForwardSetup {
+                forwards: target.forwards,
+                gateway_ports: target.gateway_ports,
+                x11,
+            },
+        );
+        if !notes.is_empty() {
+            let text = format!(
+                "\x1b[0;90mForwarding {}. Ctrl+Shift+P lists the forwards.\x1b[0m\r\n",
+                notes.join(", ")
+            );
+            self.show(id, &text);
+        }
+    }
+
+    /// Stops the forwards of connections no logged-in pane uses any more.
+    fn prune_forwards(&mut self) {
+        let Some(w) = &self.worker else {
+            return;
+        };
+        for v in w.forwarder.view() {
+            let used = self.panes.values().any(|p| {
+                matches!(&p.host, Host::Ssh(s)
+                    if s.connection == v.connection && s.state() == State::Connected)
+            });
+            if !used {
+                w.forwarder.stop(v.connection);
+            }
+        }
+    }
+
+    /// Carries out what the forwards view asked for.
+    fn forwards_action(&mut self, action: Option<FwdAction>) -> Option<Command> {
+        match action {
+            Some(FwdAction::Add(spec)) => {
+                let connection = match self.panes.get(&self.focused_id()).map(|p| &p.host) {
+                    Some(Host::Ssh(s)) if s.state() == State::Connected => Some(s.connection),
+                    _ => None,
+                };
+                match (connection, &self.worker) {
+                    (Some(c), Some(w)) => w.forwarder.add(c, spec),
+                    _ => self
+                        .forwards_view
+                        .set_message("Connect the focused pane first.".into()),
+                }
+            }
+            Some(FwdAction::Remove { connection, index }) => {
+                if let Some(w) = &self.worker {
+                    w.forwarder.remove(connection, index);
+                }
+            }
+            Some(FwdAction::Leave) => self.focus_terminal(),
+            None => {}
+        }
+        self.refresh_chrome();
+        None
     }
 
     /// Starts the worker if it is not running.
@@ -1184,8 +1355,17 @@ impl Window {
         let result = sandbox::spawn_worker(self.sandbox).and_then(|w| {
             let input = w.from_worker.try_clone().map_err(io_error)?;
             let output = w.to_worker.try_clone().map_err(io_error)?;
-            let link = Link::start(input, output, self.notifier()).map_err(io_error)?;
-            Ok(WorkerConn { link, _process: w })
+            let (forwarder, runner) = Forwarder::new();
+            let link =
+                Link::start(input, output, self.notifier(), forwarder.sink()).map_err(io_error)?;
+            runner
+                .spawn(link.sender(), self.notifier())
+                .map_err(io_error)?;
+            Ok(WorkerConn {
+                link,
+                forwarder,
+                _process: w,
+            })
         });
         match result {
             Ok(conn) => {
@@ -1264,9 +1444,10 @@ impl Window {
             Host::Ssh(s) if p.id != id && s.can_share(&target) => Some(s.connection),
             _ => None,
         });
-        let channel = self.next_channel;
-        self.next_channel = self.next_channel.wrapping_add(1).max(1);
+        let channel = self.new_channel();
+        let x11 = target.forward_x11.then(|| self.x11_auth(id)).flatten();
         let mut session = SshSession::new(channel, target, env.known_hosts());
+        session.x11 = x11;
         let Some(p) = self.panes.get_mut(&id) else {
             return;
         };
@@ -1349,11 +1530,13 @@ impl Window {
                 Effect::Connected => {
                     self.start_log(id);
                     self.sftp_connected(id);
+                    self.start_forwards(id);
                     self.refresh_chrome();
                 }
                 Effect::Ended => {
                     self.stop_log(id);
                     self.prune_sftp();
+                    self.prune_forwards();
                     self.refresh_chrome();
                 }
             }
@@ -1643,6 +1826,9 @@ impl Window {
                     self.apply(id, effects);
                 }
                 LinkEvent::Closed(why) => {
+                    if let Some(w) = &self.worker {
+                        w.forwarder.worker_gone();
+                    }
                     self.worker = None;
                     self.broker_jobs.clear();
                     for remote in self.sftp.values_mut() {
@@ -1676,6 +1862,15 @@ impl Window {
             if self.files_visible() {
                 self.refresh_chrome();
             }
+        }
+        // The forwards list and the tab badges.
+        if self
+            .worker
+            .as_ref()
+            .is_some_and(|w| w.forwarder.take_changed())
+        {
+            self.refresh_chrome();
+            self.update_title();
         }
         if more && !self.output_pending.swap(true, Ordering::AcqRel) {
             // Let the window paint, then carry on.
@@ -1823,6 +2018,7 @@ impl Window {
         if let Some(strip) = self.areas.strip {
             let palette = self.strip_palette();
             let active = self.ws.active;
+            let views = self.forward_view();
             let labels: Vec<TabLabel> = self
                 .ws
                 .tabs
@@ -1839,6 +2035,7 @@ impl Window {
                         title: pane.map(Pane::label).unwrap_or_default(),
                         health: pane.map_or(Health::Idle, Pane::health),
                         bell,
+                        forwarding: self.forwarding(&views, t.focus),
                     }
                 })
                 .collect();
@@ -1855,6 +2052,11 @@ impl Window {
             let focused = self.side.focused && self.focused;
             match self.side.view {
                 SideView::Sessions => self.side.list.draw(&mut self.side.grid, &palette, focused),
+                SideView::Forwards => {
+                    let view = self.forward_view();
+                    self.forwards_view
+                        .draw(&mut self.side.grid, &palette, focused, &view);
+                }
                 SideView::Files => {
                     let remote = self.files_key.as_ref().and_then(|k| self.sftp.get(k));
                     self.files.draw(
@@ -2349,6 +2551,12 @@ impl Window {
 
     /// A key for the side pane; what it picked runs here.
     fn side_key(&mut self, key: SideKey) -> Option<Command> {
+        if self.side.view == SideView::Forwards {
+            let view = self.forward_view();
+            let rows = self.side.grid.rows();
+            let action = self.forwards_view.key(key, &view, rows);
+            return self.forwards_action(action);
+        }
         if self.side.view == SideView::Files {
             if key == SideKey::Refresh {
                 self.ensure_sftp(self.focused_id());
@@ -2424,13 +2632,15 @@ impl Window {
     /// ssh_config, file transfer opens SFTP if it is not open.
     fn show_side(&mut self, view: SideView, focus: bool) {
         self.side.view = view;
-        if view == SideView::Sessions {
-            let env = ssh_env();
-            self.side
-                .list
-                .set_hosts(host_items(&env), self.settings.favourites.clone());
-        } else {
-            self.ensure_sftp(self.focused_id());
+        match view {
+            SideView::Sessions => {
+                let env = ssh_env();
+                self.side
+                    .list
+                    .set_hosts(host_items(&env), self.settings.favourites.clone());
+            }
+            SideView::Files => self.ensure_sftp(self.focused_id()),
+            SideView::Forwards => {}
         }
         self.side.visible = true;
         self.side.focused = focus;
@@ -2694,6 +2904,13 @@ impl Window {
                     .last_click
                     .is_some_and(|(at, r)| r == row && now - at <= limit);
                 self.side.last_click = Some((now, row));
+                if self.side.view == SideView::Forwards {
+                    let view = self.forward_view();
+                    let rows = self.side.grid.rows();
+                    self.forwards_view.click(row, &view, rows);
+                    self.refresh_chrome();
+                    return None;
+                }
                 if self.side.view == SideView::Files {
                     let rows = self.side.grid.rows();
                     let downloads = self.download_dir();
@@ -3014,7 +3231,11 @@ impl Window {
         self.mouse.wheel_rest -= lines * WHEEL_PER_LINE;
         let id = match self.spot(pt.x, pt.y) {
             Spot::Side(..) => {
-                if self.side.view == SideView::Files {
+                if self.side.view == SideView::Forwards {
+                    let view = self.forward_view();
+                    let rows = self.side.grid.rows();
+                    self.forwards_view.scroll_by(lines, &view, rows);
+                } else if self.side.view == SideView::Files {
                     let remote = self.files_key.as_ref().and_then(|k| self.sftp.get(k));
                     self.files.scroll_by(remote, lines, self.side.grid.rows());
                 } else {
@@ -3195,11 +3416,11 @@ impl Window {
                     self.layout();
                 }
             }
-            cmd::SESSIONS | cmd::FILES => {
-                let view = if id == cmd::FILES {
-                    SideView::Files
-                } else {
-                    SideView::Sessions
+            cmd::SESSIONS | cmd::FILES | cmd::FORWARDS => {
+                let view = match id {
+                    cmd::FILES => SideView::Files,
+                    cmd::FORWARDS => SideView::Forwards,
+                    _ => SideView::Sessions,
                 };
                 match (
                     self.side.visible && self.side.view == view,
@@ -3427,6 +3648,10 @@ impl Window {
                     cmd::FILES,
                     self.side.visible && self.side.view == SideView::Files,
                 ),
+                (
+                    cmd::FORWARDS,
+                    self.side.visible && self.side.view == SideView::Forwards,
+                ),
                 (cmd::FOLLOW_CD, s.follow_directory),
                 (cmd::VERIFY, s.verify_transfers),
                 (cmd::SIDE_RIGHT, s.side_pane_right),
@@ -3560,8 +3785,9 @@ impl Window {
         {
             remote.browse(&cwd);
         }
+        // `self.sftp` is borrowed: the same as `new_channel`, inline.
         let channel = self.next_channel;
-        self.next_channel = self.next_channel.wrapping_add(1).max(1);
+        self.next_channel = ((channel + 1) % FORWARD_IDS).max(1);
         remote.attach(channel, connection);
         self.flush_sftp();
     }
@@ -3874,6 +4100,7 @@ fn shortcut(vk: VIRTUAL_KEY, m: Mods, tabs: bool, split: bool) -> Option<u32> {
             v if v == key(b'W') && m.shift => Some(cmd::CLOSE_PANE),
             v if v == key(b'S') && m.shift => Some(cmd::SESSIONS),
             v if v == key(b'E') && m.shift => Some(cmd::FILES),
+            v if v == key(b'P') && m.shift => Some(cmd::FORWARDS),
             v if v == key(b'U') && m.shift => Some(cmd::UPLOAD),
             VK_INSERT if !m.shift => Some(cmd::COPY),
             VK_HOME if m.shift => Some(cmd::SCROLL_TOP),

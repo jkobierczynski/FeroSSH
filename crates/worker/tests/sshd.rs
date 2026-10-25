@@ -168,6 +168,7 @@ async fn run_ui(server: &Server, command: &str, trust: bool) -> Seen {
         cols: 80,
         rows: 24,
         host_key_algs: vec![],
+        x11: None,
     })
     .await;
     let mut seen = Seen::default();
@@ -335,6 +336,7 @@ async fn second_shell_shares_the_connection() {
         cols: 80,
         rows: 24,
         host_key_algs: vec![],
+        x11: None,
     })
     .await;
     let (mut host_keys, mut signed) = (0, 0);
@@ -379,6 +381,7 @@ async fn second_shell_shares_the_connection() {
                     connection: 1,
                     cols: 80,
                     rows: 24,
+                    x11: None,
                 })
                 .await;
             }
@@ -427,6 +430,7 @@ async fn second_shell_shares_the_connection() {
         connection: 1,
         cols: 80,
         rows: 24,
+        x11: None,
     })
     .await;
     loop {
@@ -465,6 +469,7 @@ async fn login(server: &Server) -> (mpsc::Sender<Message>, mpsc::Receiver<Messag
             cols: 80,
             rows: 24,
             host_key_algs: vec![],
+            x11: None,
         })
         .await
         .unwrap();

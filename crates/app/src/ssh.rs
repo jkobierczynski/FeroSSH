@@ -14,8 +14,8 @@ use std::path::PathBuf;
 
 use ferossh_auth::{Identity, Job, KeyFileSpec, Reply, SignError, Source, userauth};
 use ferossh_config::known_hosts::{self, KnownHosts, Status};
-use ferossh_config::{hostkey, ssh_config};
-use ferossh_ipc::{ChannelId, MAX_DATA_CHUNK, Message, PromptField, PromptKind, Secrets};
+use ferossh_config::{ForwardSpec, hostkey, ssh_config};
+use ferossh_ipc::{ChannelId, MAX_DATA_CHUNK, Message, PromptField, PromptKind, Secrets, X11Auth};
 use zeroize::Zeroizing;
 
 /// Wrong passphrases allowed per key before it is skipped.
@@ -37,6 +37,10 @@ pub struct Target {
     pub key_files: Vec<KeyFileSpec>,
     /// ssh_config's `Tag`, which picks a colour theme.
     pub tag: Option<String>,
+    /// Port forwards from ssh_config (after `ClearAllForwardings`).
+    pub forwards: Vec<ForwardSpec>,
+    pub forward_x11: bool,
+    pub gateway_ports: bool,
 }
 
 /// The user's environment the target is resolved in.
@@ -64,6 +68,7 @@ impl Target {
             home: env.home.clone(),
         };
         let cfg = ssh_config::resolve_in(&env.config, &alias, &includes);
+        let forwards = cfg.active_forwards().to_vec();
         let home = env.home.to_string_lossy();
         let user = user.or(cfg.user).unwrap_or_else(|| env.local_user.clone());
         let expand = |s: &str| ssh_config::expand_path(s, &home, &env.local_user, &alias, &user);
@@ -90,6 +95,9 @@ impl Target {
         }
         Some(Self {
             port: port.or(cfg.port).unwrap_or(22),
+            forwards,
+            forward_x11: cfg.forward_x11 == Some(true),
+            gateway_ports: cfg.gateway_ports == Some(true),
             tag: cfg.tag,
             alias,
             hostname,
@@ -175,6 +183,8 @@ pub struct SshSession {
     /// The key that blocked the connection, for "Replace host key".
     changed_key: Option<Vec<u8>>,
     pub exit_code: Option<u32>,
+    /// X11 forwarding for the shell, when the host has it on.
+    pub x11: Option<X11Auth>,
 }
 
 impl std::fmt::Debug for SshSession {
@@ -223,6 +233,7 @@ impl SshSession {
             passphrase_tries: 0,
             changed_key: None,
             exit_code: None,
+            x11: None,
         }
     }
 
@@ -262,6 +273,7 @@ impl SshSession {
                 cols,
                 rows,
                 host_key_algs,
+                x11: self.x11.clone(),
             }),
         ]
     }
@@ -280,6 +292,7 @@ impl SshSession {
                 connection,
                 cols,
                 rows,
+                x11: self.x11.clone(),
             }),
         ]
     }
@@ -856,7 +869,8 @@ mod tests {
                 channel: 2,
                 connection: 1,
                 cols: 100,
-                rows: 30
+                rows: 30,
+                x11: None
             }]
         );
         assert_eq!(second.connection, 1);

@@ -11,11 +11,14 @@ publish.workspace = true
 [dependencies]
 ferossh-auth.workspace = true
 ferossh-config.workspace = true
+ferossh-forward.workspace = true
 ferossh-ipc.workspace = true
 ferossh-render.workspace = true
 ferossh-sftp.workspace = true
 ferossh-term.workspace = true
 ferossh-worker.workspace = true
+# The forwarding engine's sockets; the worker already links tokio.
+tokio = { version = "1.54", features = ["rt", "net", "time", "sync", "macros", "io-util"] }
 unicode-width = "0.2"
 zeroize = "1.9"
 

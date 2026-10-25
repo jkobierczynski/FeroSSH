@@ -165,9 +165,14 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "da7c62ceae207dd37ea5b845da6a0696c799f85e97da1ab5b7910be3c1c80223"
 
 [[package]]
+name = "ferossh-forward"
+version = "0.1.0"
+
+[[package]]
 name = "ferossh-fuzz"
 version = "0.0.0"
 dependencies = [
+ "ferossh-forward",
  "ferossh-ipc",
  "ferossh-render",
  "ferossh-sftp",

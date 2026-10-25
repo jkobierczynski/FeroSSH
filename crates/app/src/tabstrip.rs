@@ -2,8 +2,8 @@
 //! window has two or more tabs.
 //!
 //! Each tab shows a state dot (green: logged in, amber: connecting, grey:
-//! closed or local), its title and a close mark; a `+` at the end opens a
-//! new tab. It is drawn into a [`Grid`] like a terminal row, so it needs
+//! closed or local), its title, a forwarding badge and a close mark; a `+`
+//! at the end opens a new tab. It is drawn into a [`Grid`] like a terminal row, so it needs
 //! nothing from the renderer. On Windows its colours follow the system menu
 //! bar, with the active tab in the window colour.
 
@@ -25,6 +25,28 @@ pub enum Health {
     Idle,
 }
 
+/// What a tab's connection forwards, as its badge shows it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Forwarding {
+    #[default]
+    None,
+    /// Local or dynamic forwards only: `⇄`, dimmed.
+    Outbound,
+    /// Remote forwards or X11, which let the server reach into this
+    /// side: `⇄`, in amber.
+    Inbound,
+}
+
+impl Forwarding {
+    /// The badge after a title, for the window title too.
+    pub fn badge(self) -> &'static str {
+        match self {
+            Forwarding::None => "",
+            Forwarding::Outbound | Forwarding::Inbound => " ⇄",
+        }
+    }
+}
+
 /// What the strip shows for one tab.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TabLabel {
@@ -32,6 +54,7 @@ pub struct TabLabel {
     pub health: Health,
     /// Output or a bell arrived while the tab was in the background.
     pub bell: bool,
+    pub forwarding: Forwarding,
 }
 
 /// What a click on the strip hit.
@@ -214,9 +237,21 @@ pub fn draw(grid: &mut Grid, tabs: &[TabLabel], active: usize, palette: &Palette
         } else {
             Flags::empty()
         };
-        let title = fit(&tab.title, title_max);
-        let shown: usize = title.chars().map(|c| c.width().unwrap_or(0)).sum();
+        let badge = tab.forwarding.badge();
+        let title = fit(
+            &tab.title,
+            title_max.saturating_sub(badge.chars().count()).max(1),
+        );
+        let mut shown: usize = title.chars().map(|c| c.width().unwrap_or(0)).sum();
         row.put(&title, fg, bg, flags);
+        if !badge.is_empty() {
+            let colour = match tab.forwarding {
+                Forwarding::Inbound => Rgb::new(0xe5, 0xb5, 0x3b),
+                _ => palette.dim,
+            };
+            row.put(badge, colour, bg, Flags::empty());
+            shown += badge.chars().count();
+        }
         let pad = MIN_TITLE.min(title_max).saturating_sub(shown);
         row.put(&" ".repeat(pad + 2), fg, bg, Flags::empty());
         let close = row.cells.len();
@@ -252,6 +287,7 @@ mod tests {
             title: title.into(),
             health: Health::Connected,
             bell: false,
+            forwarding: Forwarding::None,
         }
     }
 
@@ -297,6 +333,21 @@ mod tests {
         let cell = grid.cell(23, 0).unwrap();
         assert!(cell.flags.contains(Flags::BOLD));
         assert_eq!(cell.bg, Color::Rgb(Theme::default().background));
+    }
+
+    #[test]
+    fn badges_show_forwarding() {
+        let mut grid = Grid::new(80, 1);
+        let p = Palette::of(&Theme::default());
+        let mut fwd = label("db");
+        fwd.forwarding = Forwarding::Inbound;
+        let l = draw(&mut grid, &[fwd, label("web")], 0, &p);
+        let t = text(&grid);
+        assert!(t.starts_with("  ● db ⇄        ×    ● web"), "{t:?}");
+        assert_eq!(l.hit(16), Some(Hit::Close(0)));
+        let badge = grid.cell(7, 0).unwrap();
+        assert_eq!(badge.ch, '⇄');
+        assert_eq!(badge.fg, Color::Rgb(Rgb::new(0xe5, 0xb5, 0x3b)));
     }
 
     #[test]

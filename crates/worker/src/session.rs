@@ -8,22 +8,34 @@
 //! trusted, which public keys exist, sign this, what is the password) goes
 //! to the UI as a request message; the answer comes back on the session's
 //! inbox and is routed to whoever is waiting for it by [`drive`].
+//!
+//! Connections the server opens back (remote forwards and X11) arrive at
+//! the [`Client`] handler, which checks them against what this connection
+//! asked for and hands them to [`crate::forward`].
 
 use std::collections::HashMap;
 use std::fmt;
 use std::future::Future;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 
-use ferossh_ipc::{ChannelId, MAX_DATA_CHUNK, Message, PromptField, PromptKind, Secrets};
+use ferossh_forward::x11::{MIT_COOKIE, hex};
+use ferossh_ipc::{
+    ChannelId, MAX_DATA_CHUNK, Message, PromptField, PromptKind, Secrets, WORKER_IDS, X11Auth,
+};
 use russh::client::{self, AuthResult, DisconnectReason, Handle, KeyboardInteractiveAuthResponse};
 use russh::keys::agent::AgentIdentity;
 use russh::keys::{Algorithm, HashAlg, PublicKey, PublicKeyOrCertificate};
-use russh::{ChannelMsg, Disconnect, MethodKind, MethodSet, Names, SshId, cipher};
+use russh::{
+    Channel, ChannelMsg, ChannelOpenFailure, Disconnect, MethodKind, MethodSet, Names, SshId,
+    cipher,
+};
 use tokio::net::TcpStream;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, watch};
 
 use crate::crypto_policy::{MIN_RSA_BITS, preferred_for};
+use crate::forward::{self, Incoming};
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
 /// Like `ServerAliveInterval 30` with `ServerAliveCountMax 3`.
@@ -43,6 +55,7 @@ pub struct Params {
     pub cols: u16,
     pub rows: u16,
     pub host_key_algs: Vec<String>,
+    pub x11: Option<X11Auth>,
 }
 
 /// Why a session ended early.
@@ -85,15 +98,141 @@ impl fmt::Display for Failure {
 /// A logged-in connection, shared by the channels (shells) on it.
 pub(crate) type Connection = Handle<Client>;
 
-/// Live connections by the channel that made them, for
-/// [`Message::OpenChannel`]. Weak: each shell holds its connection, and the
-/// last one to close disconnects it.
-/// The negotiated names travel along, for the new shell's
-/// [`Message::Connected`].
-#[derive(Clone, Default)]
-pub(crate) struct Connections(Arc<Mutex<HashMap<ChannelId, Entry>>>);
+/// Where the worker's dispatcher sends a channel's messages from the UI.
+#[derive(Clone)]
+pub(crate) enum Route {
+    /// A shell, SFTP or a remote forward's listener: few messages, and a
+    /// full queue may make the UI wait.
+    Session(mpsc::Sender<Message>),
+    /// A forwarded stream: flow control bounds what the UI sends, and one
+    /// slow stream must never hold up the pipe.
+    Stream(mpsc::UnboundedSender<Message>),
+}
 
-type Entry = (Weak<Connection>, Names3);
+impl Route {
+    fn is_closed(&self) -> bool {
+        match self {
+            Route::Session(tx) => tx.is_closed(),
+            Route::Stream(tx) => tx.is_closed(),
+        }
+    }
+}
+
+/// Every channel the UI can address, by id.
+#[derive(Clone, Default)]
+pub(crate) struct Routes(Arc<Mutex<HashMap<ChannelId, Route>>>);
+
+impl Routes {
+    /// Adds a route; `false` when the id is taken by a live channel.
+    pub(crate) fn insert(&self, channel: ChannelId, route: Route) -> bool {
+        let Ok(mut map) = self.0.lock() else {
+            return false;
+        };
+        map.retain(|_, r| !r.is_closed());
+        if map.contains_key(&channel) {
+            return false;
+        }
+        map.insert(channel, route);
+        true
+    }
+
+    pub(crate) fn get(&self, channel: ChannelId) -> Option<Route> {
+        self.0.lock().ok()?.get(&channel).cloned()
+    }
+
+    pub(crate) fn remove(&self, channel: ChannelId) {
+        if let Ok(mut map) = self.0.lock() {
+            map.remove(&channel);
+        }
+    }
+}
+
+/// What the connection set up for traffic the server opens back to this
+/// side, which [`Client`] checks every such channel against.
+pub(crate) struct ConnForwards {
+    /// The channel that made the connection; X11 streams name it.
+    pub(crate) connection: ChannelId,
+    /// Remote forwards the server listens for: address and port as asked
+    /// (the port the server chose, for port 0), and the UI's listener.
+    remote: Mutex<Vec<(String, u32, ChannelId)>>,
+    /// The fake cookie the server got, and the real authorisation.
+    x11: Mutex<Option<([u8; 16], X11Auth)>>,
+    /// Changes (fails) when the connection's handler is gone.
+    alive: watch::Receiver<()>,
+}
+
+impl ConnForwards {
+    pub(crate) fn alive(&self) -> watch::Receiver<()> {
+        self.alive.clone()
+    }
+
+    pub(crate) fn add_remote(&self, bind: &str, port: u32, listener: ChannelId) {
+        if let Ok(mut r) = self.remote.lock() {
+            r.push((bind.to_owned(), port, listener));
+        }
+    }
+
+    pub(crate) fn remove_remote(&self, listener: ChannelId) {
+        if let Ok(mut r) = self.remote.lock() {
+            r.retain(|(_, _, l)| *l != listener);
+        }
+    }
+
+    /// The listener a `forwarded-tcpip` channel belongs to: the address and
+    /// port as asked, or failing that the only forward on that port (some
+    /// servers report the address they actually bound).
+    fn remote_listener(&self, address: &str, port: u32) -> Option<ChannelId> {
+        let r = self.remote.lock().ok()?;
+        if let Some((_, _, l)) = r.iter().find(|(a, p, _)| a == address && *p == port) {
+            return Some(*l);
+        }
+        let mut on_port = r.iter().filter(|(_, p, _)| *p == port);
+        match (on_port.next(), on_port.next()) {
+            (Some((_, _, l)), None) => Some(*l),
+            _ => None,
+        }
+    }
+
+    /// The fake cookie for an `x11-req`: one per connection, made with the
+    /// first request. The latest real authorisation is kept.
+    fn x11_cookie(&self, real: X11Auth) -> Option<[u8; 16]> {
+        let mut x = self.x11.lock().ok()?;
+        let fake = match x.as_ref() {
+            Some((fake, _)) => *fake,
+            None => {
+                let mut fake = [0u8; 16];
+                getrandom::fill(&mut fake).ok()?;
+                fake
+            }
+        };
+        *x = Some((fake, real));
+        Some(fake)
+    }
+
+    /// The fake cookie and the real authorisation, once X11 was asked for.
+    pub(crate) fn x11(&self) -> Option<([u8; 16], X11Auth)> {
+        self.x11.lock().ok()?.clone()
+    }
+}
+
+/// Live connections by the channel that made them, for
+/// [`Message::OpenChannel`], SFTP and forwards. Weak: each shell holds its
+/// connection, and the last one to close disconnects it.
+/// The negotiated names travel along, for the new shell's
+/// [`Message::Connected`]. Also the dispatcher's routes, and the ids for
+/// streams the server opens.
+#[derive(Clone, Default)]
+pub(crate) struct Connections {
+    map: Arc<Mutex<HashMap<ChannelId, Entry>>>,
+    pub(crate) routes: Routes,
+    next_id: Arc<AtomicU32>,
+}
+
+struct Entry {
+    conn: Weak<Connection>,
+    names: Names3,
+    forwards: Arc<ConnForwards>,
+}
 
 /// Negotiated kex, cipher and host key algorithm.
 type Names3 = Option<(String, String, String)>;
@@ -105,18 +244,40 @@ impl fmt::Debug for Connections {
 }
 
 impl Connections {
-    fn insert(&self, channel: ChannelId, conn: &Arc<Connection>, names: Names3) {
-        if let Ok(mut map) = self.0.lock() {
-            map.retain(|_, (w, _)| w.strong_count() > 0);
-            map.insert(channel, (Arc::downgrade(conn), names));
+    fn insert(
+        &self,
+        channel: ChannelId,
+        conn: &Arc<Connection>,
+        names: Names3,
+        forwards: Arc<ConnForwards>,
+    ) {
+        if let Ok(mut map) = self.map.lock() {
+            map.retain(|_, e| e.conn.strong_count() > 0);
+            map.insert(
+                channel,
+                Entry {
+                    conn: Arc::downgrade(conn),
+                    names,
+                    forwards,
+                },
+            );
         }
     }
 
-    pub(crate) fn get(&self, channel: ChannelId) -> Option<(Arc<Connection>, Names3)> {
-        let map = self.0.lock().ok()?;
-        let (weak, names) = map.get(&channel)?;
-        let conn = weak.upgrade().filter(|c| !c.is_closed())?;
-        Some((conn, names.clone()))
+    pub(crate) fn get(
+        &self,
+        channel: ChannelId,
+    ) -> Option<(Arc<Connection>, Names3, Arc<ConnForwards>)> {
+        let map = self.map.lock().ok()?;
+        let e = map.get(&channel)?;
+        let conn = e.conn.upgrade().filter(|c| !c.is_closed())?;
+        Some((conn, e.names.clone(), e.forwards.clone()))
+    }
+
+    /// An id for a stream the server opened, from the worker's own range.
+    pub(crate) fn new_id(&self) -> ChannelId {
+        let n = self.next_id.fetch_add(1, Ordering::Relaxed);
+        WORKER_IDS | (n & !WORKER_IDS)
     }
 }
 
@@ -143,6 +304,21 @@ pub(crate) struct Client {
     channel: ChannelId,
     out: mpsc::Sender<Message>,
     shared: SharedRef,
+    forwards: Arc<ConnForwards>,
+    connections: Connections,
+    /// Dropped with the handler, when the connection ends.
+    _alive: watch::Sender<()>,
+}
+
+impl Client {
+    fn incoming(&self, channel: Channel<client::Msg>, from: Incoming) {
+        tokio::spawn(forward::incoming(
+            channel,
+            from,
+            self.out.clone(),
+            self.connections.clone(),
+        ));
+    }
 }
 
 impl client::Handler for Client {
@@ -213,6 +389,71 @@ impl client::Handler for Client {
             names.key.as_str().to_owned(),
         );
         with(&self.shared, |s| s.names = Some(found));
+        Ok(())
+    }
+
+    async fn server_channel_open_forwarded_tcpip(
+        &mut self,
+        channel: Channel<client::Msg>,
+        connected_address: &str,
+        connected_port: u32,
+        originator_address: &str,
+        originator_port: u32,
+        reply: client::ChannelOpenHandle,
+        _session: &mut client::Session,
+    ) -> Result<(), Failure> {
+        // Only ports this connection asked the server to listen on.
+        match self
+            .forwards
+            .remote_listener(connected_address, connected_port)
+        {
+            Some(listener) => {
+                reply.accept().await;
+                self.incoming(
+                    channel,
+                    Incoming::Remote {
+                        listener,
+                        origin: (originator_address.to_owned(), originator_port),
+                    },
+                );
+            }
+            None => {
+                reply
+                    .reject(ChannelOpenFailure::AdministrativelyProhibited)
+                    .await
+            }
+        }
+        Ok(())
+    }
+
+    async fn server_channel_open_x11(
+        &mut self,
+        channel: Channel<client::Msg>,
+        originator_address: &str,
+        originator_port: u32,
+        reply: client::ChannelOpenHandle,
+        _session: &mut client::Session,
+    ) -> Result<(), Failure> {
+        // Only after a shell asked for X11 forwarding.
+        match self.forwards.x11() {
+            Some((fake, real)) => {
+                reply.accept().await;
+                self.incoming(
+                    channel,
+                    Incoming::X11 {
+                        connection: self.forwards.connection,
+                        fake,
+                        real,
+                        origin: (originator_address.to_owned(), originator_port),
+                    },
+                );
+            }
+            None => {
+                reply
+                    .reject(ChannelOpenFailure::AdministrativelyProhibited)
+                    .await
+            }
+        }
         Ok(())
     }
 
@@ -304,6 +545,10 @@ struct Ctx {
     shared: SharedRef,
     /// The latest pane size, applied when the pty is requested.
     size: (u16, u16),
+    /// X11 forwarding to ask for with the shell.
+    x11: Option<X11Auth>,
+    /// The connection's forwarding state, once logged in.
+    forwards: Option<Arc<ConnForwards>>,
 }
 
 impl Ctx {
@@ -376,6 +621,8 @@ pub async fn run(
         out: out.clone(),
         shared: shared.clone(),
         size: (params.cols, params.rows),
+        x11: params.x11.clone(),
+        forwards: None,
     };
     let result = session(&params, &mut inbox, &mut ctx, &connections).await;
     let server_said = with(&shared, |s| s.server_said.take()).flatten();
@@ -396,6 +643,7 @@ pub async fn open(
     channel: ChannelId,
     connection: ChannelId,
     size: (u16, u16),
+    x11: Option<X11Auth>,
     mut inbox: mpsc::Receiver<Message>,
     out: mpsc::Sender<Message>,
     connections: Connections,
@@ -405,10 +653,13 @@ pub async fn open(
         out: out.clone(),
         shared: Arc::default(),
         size,
+        x11,
+        forwards: None,
     };
     let result = match connections.get(connection) {
-        Some((conn, names)) => {
+        Some((conn, names, forwards)) => {
             with(&ctx.shared, |s| s.names = names);
+            ctx.forwards = Some(forwards);
             shell(conn, &mut inbox, &mut ctx).await
         }
         None => Err(Failure::Refused(
@@ -459,17 +710,28 @@ async fn session(
     .map_err(|_| Failure::Refused(format!("Timed out connecting to {}.", p.host)))?
     .map_err(|e| Failure::Refused(format!("Could not connect to {}: {e}.", p.host)))?;
     let _ = tcp.set_nodelay(true);
+    let (alive_tx, alive) = watch::channel(());
+    let forwards = Arc::new(ConnForwards {
+        connection: ctx.channel,
+        remote: Mutex::default(),
+        x11: Mutex::default(),
+        alive,
+    });
     let handler = Client {
         channel: ctx.channel,
         out: ctx.out.clone(),
         shared: ctx.shared.clone(),
+        forwards: forwards.clone(),
+        connections: connections.clone(),
+        _alive: alive_tx,
     };
     let mut handle = drive(client::connect_stream(config, tcp, handler), inbox, ctx).await??;
 
     authenticate(&mut handle, p, inbox, ctx).await?;
     let conn = Arc::new(handle);
     let names = with(&ctx.shared, |s| s.names.clone()).flatten();
-    connections.insert(ctx.channel, &conn, names);
+    connections.insert(ctx.channel, &conn, names, forwards.clone());
+    ctx.forwards = Some(forwards);
     shell(conn, inbox, ctx).await
 }
 
@@ -502,6 +764,17 @@ async fn pump(
     ctx: &mut Ctx,
 ) -> Result<(), Failure> {
     let channel = drive(conn.channel_open_session(), inbox, ctx).await??;
+    // X11 first: its reply is then the first one back.
+    let mut x11_reply = false;
+    if let Some(real) = ctx.x11.take() {
+        let screen = real.screen;
+        if let Some(fake) = ctx.forwards.as_ref().and_then(|f| f.x11_cookie(real)) {
+            channel
+                .request_x11(true, false, MIT_COOKIE, hex(&fake), screen)
+                .await?;
+            x11_reply = true;
+        }
+    }
     let (cols, rows) = ctx.size;
     channel
         .request_pty(false, TERM, cols.into(), rows.into(), 0, 0, &[])
@@ -550,6 +823,16 @@ async fn pump(
                 }
                 Some(ChannelMsg::ExitSignal { signal_name, .. }) => {
                     ctx.notice(format!("The remote shell was killed by signal {signal_name:?}.")).await?;
+                }
+                Some(ChannelMsg::Success) if x11_reply => x11_reply = false,
+                Some(ChannelMsg::Failure) if x11_reply => {
+                    x11_reply = false;
+                    ctx.notice(
+                        "The server refused X11 forwarding (its sshd_config may say \
+                         X11Forwarding no, or xauth is not installed there)."
+                            .into(),
+                    )
+                    .await?;
                 }
                 Some(ChannelMsg::Close) | None => break Ok(()),
                 Some(_) => {}
