@@ -72,11 +72,10 @@ jobs:
       # 2025, tmux 2.6 to 3.6. See interop/Dockerfile.
       - run: interop/build.sh
       - run: cargo test --locked -p ferossh-worker --test interop -- --nocapture
-      # tmux below 3.4 is not covered yet: the test expects FeroSSH layout
-      # mode, which needs tmux 3.3.
-      - name: tmux control mode against tmux 3.4 and 3.6
+      # tmux 2.6 (refused), 3.0a and 3.2a (tmux layout only), 3.4, 3.6.
+      - name: tmux control mode against tmux 2.6 to 3.6
         run: |
-          for r in 24.04 26.04; do
+          for r in 18.04 20.04 22.04 24.04 26.04; do
             id=$(docker run -d --entrypoint sleep ferossh-interop:$r infinity)
             echo "::group::$(docker exec "$id" tmux -V)"
             FEROSSH_TMUX_CONTAINER=$id cargo test --locked -p ferossh tmux_e2e

@@ -1,7 +1,7 @@
 # Interop test servers
 
 Throwaway SSH servers of many ages for `crates/worker/tests/interop.rs` and
-the tmux matrix in CI. One image per Ubuntu release:
+the tmux matrix in CI (tmux_e2e). One image per Ubuntu release:
 
 | Image | OpenSSH | Dropbear | tmux |
 |---|---|---|---|

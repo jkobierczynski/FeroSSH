@@ -22,6 +22,7 @@ use std::sync::mpsc::{Receiver, RecvTimeoutError, channel};
 use std::time::{Duration, Instant};
 
 use ferossh_tmuxcc::saved::Look;
+use ferossh_tmuxcc::{MIN_VERSION, Version, WINDOW_SIZES_VERSION};
 
 use crate::layout::{Dir, PaneId as Native, Workspace};
 use crate::tmux::{Action, Mode, Tmux};
@@ -48,6 +49,7 @@ struct Harness {
     panes: BTreeMap<Native, ((u16, u16), Vec<u8>)>,
     gateway_shown: bool,
     pickers: Vec<Vec<String>>,
+    notices: Vec<String>,
 }
 
 impl Drop for Harness {
@@ -126,6 +128,7 @@ impl Harness {
             panes: BTreeMap::new(),
             gateway_shown: false,
             pickers: Vec::new(),
+            notices: Vec::new(),
         };
         // What `tmux -CC` writes before its first line.
         let actions = h.tmux.feed(&mut h.ws, b"\x1bP1000p");
@@ -159,6 +162,7 @@ impl Harness {
                 }
                 Action::ShowGateway => self.gateway_shown = true,
                 Action::Picker(names) => self.pickers.push(names),
+                Action::Notice(text) => self.notices.push(text),
                 _ => {}
             }
         }
@@ -219,9 +223,23 @@ fn tmux_cmd(server: &Server, args: &[&str]) -> String {
     String::from_utf8_lossy(&out.stdout).trim().to_owned()
 }
 
+/// The tmux under test, from `tmux -V` ("tmux 3.2a").
+fn version() -> Version {
+    let out = tmux().arg("-V").output().unwrap();
+    let text = String::from_utf8_lossy(&out.stdout);
+    Version::parse(text.trim().trim_start_matches("tmux ")).unwrap()
+}
+
 #[test]
 fn real_tmux_round_trip() {
     if !tmux_available() {
+        return;
+    }
+    if version() < WINDOW_SIZES_VERSION {
+        eprintln!(
+            "tmux {} has no per-window sizes; see older_tmux_*",
+            version()
+        );
         return;
     }
     let server = Server {
@@ -347,5 +365,96 @@ fn real_tmux_round_trip() {
     a.until("the detach", |h| h.gateway_shown && !h.tmux.active());
     assert_eq!(a.ws.all_panes(), [a.tmux.gateway]);
     assert!(a.panes.is_empty());
+    assert!(tmux_cmd(&server, &["list-sessions", "-F", "#{session_name}"]).contains("e2e"));
+}
+
+/// tmux 3.0 to 3.2 cannot size windows one by one, so FeroSSH layout falls
+/// back to tmux layout, says so, and everything else still works:
+/// typing, tmux splits, reattach with history and mouse modes, detach.
+#[test]
+fn older_tmux_falls_back_to_tmux_layout() {
+    if !tmux_available() {
+        return;
+    }
+    let v = version();
+    if v < MIN_VERSION || v >= WINDOW_SIZES_VERSION {
+        return;
+    }
+    let server = Server {
+        socket: format!("ferossh-e2e-old-{}", std::process::id()),
+    };
+    let mut a = Harness::attach(&server, Mode::Ferossh);
+    a.until("the first pane", |h| h.shown() == 1 && !h.panes.is_empty());
+    assert_eq!(a.tmux.mode(), Mode::Tmux);
+    assert!(
+        a.notices.iter().any(|n| n.contains("older than 3.3")),
+        "{:?}",
+        a.notices
+    );
+    let first = a.ws.all_panes()[0];
+    let actions = a.tmux.input(first, b"echo one-$((40+2))\r");
+    a.apply(actions);
+    a.until("the echo", |h| h.text(first).contains("one-42"));
+
+    let actions = a.tmux.split(first, Dir::Down);
+    a.apply(actions);
+    a.until("the tmux split", |h| h.shown() == 2);
+    assert_eq!(a.ws.tabs.len(), 1);
+    let second = a.ws.focused();
+    let actions = a
+        .tmux
+        .input(second, b"printf '\\033[?1000h\\033[?1006h'; echo two\r");
+    a.apply(actions);
+    a.until("the second echo", |h| h.text(second).contains("two"));
+    a.until("the mouse modes", |_| {
+        tmux_cmd(
+            &server,
+            &["list-panes", "-s", "-t", "e2e", "-F", "#{mouse_sgr_flag}"],
+        )
+        .contains('1')
+    });
+
+    // Another PC attaches: the same split and history, the same mouse
+    // modes and no motion reports.
+    let mut b = Harness::attach(&server, Mode::Ferossh);
+    b.until("the restored panes", |h| {
+        h.shown() == 2 && h.panes.values().all(|p| !p.1.is_empty())
+    });
+    assert_eq!(b.ws.tabs.len(), 1);
+    let texts: Vec<String> = b.ws.all_panes().iter().map(|&n| b.text(n)).collect();
+    assert!(texts.iter().any(|t| t.contains("one-42")), "{texts:?}");
+    let modes = texts.iter().find(|t| t.contains("two")).unwrap();
+    assert!(modes.contains("\x1b[?1000h\x1b[?1006h"), "{modes:?}");
+    assert!(!modes.contains("\x1b[?1003h"), "{modes:?}");
+    drop(b);
+
+    let actions = a.tmux.detach();
+    a.apply(actions);
+    a.until("the detach", |h| h.gateway_shown && !h.tmux.active());
+    assert!(tmux_cmd(&server, &["list-sessions", "-F", "#{session_name}"]).contains("e2e"));
+}
+
+/// tmux before 3.0 is refused with a message and the client detaches;
+/// the session stays. (Over pipes tmux 2.6 then prints no `%exit`, which
+/// it does with `-CC` on a terminal, so the test checks tmux's side.)
+#[test]
+fn too_old_tmux_is_refused() {
+    if !tmux_available() || version() >= MIN_VERSION {
+        return;
+    }
+    let server = Server {
+        socket: format!("ferossh-e2e-ancient-{}", std::process::id()),
+    };
+    let mut a = Harness::attach(&server, Mode::Ferossh);
+    a.until("the refusal", |h| !h.notices.is_empty());
+    assert!(
+        a.notices[0].contains("needs tmux 3.0 or later"),
+        "{:?}",
+        a.notices
+    );
+    assert!(a.panes.is_empty());
+    a.until("the detach", |_| {
+        tmux_cmd(&server, &["list-clients", "-F", "#{client_name}"]).is_empty()
+    });
     assert!(tmux_cmd(&server, &["list-sessions", "-F", "#{session_name}"]).contains("e2e"));
 }
