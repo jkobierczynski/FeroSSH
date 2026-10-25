@@ -262,9 +262,20 @@ impl sspi::network_client::NetworkClient for NoNetwork {
 }
 
 fn connector_failure(e: &ironrdp_connector::ConnectorError) -> Failure {
-    let text = e.to_string();
+    explain(&e.to_string())
+}
+
+/// The window's words for a connection error from IronRDP.
+fn explain(text: &str) -> Failure {
     let lower = text.to_lowercase();
-    if lower.contains("logon") || lower.contains("credssp") || lower.contains("ntlm") {
+    if lower.contains("standard_rdp_security") {
+        // xrdp falls back to it when it cannot read its TLS key.
+        format!(
+            "The RDP server offers only the old RDP security, without TLS, which the viewer \
+             does not speak ({text}). On xrdp this usually means it cannot read its TLS key: \
+             run sudo adduser xrdp ssl-cert and restart xrdp."
+        )
+    } else if lower.contains("logon") || lower.contains("credssp") || lower.contains("ntlm") {
         format!("The RDP server did not accept the user name or password ({text}).")
     } else {
         format!("The RDP connection failed: {text}")
@@ -769,6 +780,15 @@ mod tests {
     use std::net::TcpStream;
     use std::sync::Mutex;
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn an_xrdp_without_tls_says_how_to_fix_it() {
+        let why = explain(
+            "[Initiation] reason: client advertised SSL | HYBRID | HYBRID_EX, but server \
+             selected STANDARD_RDP_SECURITY",
+        );
+        assert!(why.contains("adduser xrdp ssl-cert"), "{why}");
+    }
 
     #[test]
     fn logs_in_to_a_real_server() {

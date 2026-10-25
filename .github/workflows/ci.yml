@@ -115,6 +115,9 @@ jobs:
           sudo chmod +x /home/rdptest/.xsession
           sudo chown rdptest /home/rdptest/.xsession
           sudo sed -i 's/allowed_users=console/allowed_users=anybody/' /etc/X11/Xwrapper.config
+          # xrdp falls back to old RDP security without TLS when it cannot
+          # read its key, which the viewer refuses.
+          sudo adduser xrdp ssl-cert
           sudo systemctl restart xrdp-sesman xrdp
       - run: "cargo test --locked -p ferossh-viewer --features rdp rdp::"
         env:
