@@ -1,7 +1,11 @@
 //! The transfer queue against a fake SFTP server that serves a real
 //! folder: downloads, uploads, resuming, conflicts, folders and links,
 //! verification, and a connection that drops halfway.
+//!
+//! The fake answers with the local file system's semantics, so it stands
+//! in for a POSIX server only on Unix (CI runs these on Linux).
 
+#![cfg(unix)]
 #![allow(
     clippy::unwrap_used,
     clippy::expect_used,

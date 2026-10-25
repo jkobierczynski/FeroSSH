@@ -443,6 +443,7 @@ async fn second_shell_shares_the_connection() {
 
 /// Logs in on channel 1 and returns the worker's channels once the shell
 /// is open.
+#[cfg(unix)]
 async fn login(server: &Server) -> (mpsc::Sender<Message>, mpsc::Receiver<Message>) {
     let (to_worker, worker_in) = mpsc::channel(64);
     let (worker_out, mut from_worker) = mpsc::channel(64);
@@ -494,6 +495,7 @@ async fn login(server: &Server) -> (mpsc::Sender<Message>, mpsc::Receiver<Messag
 }
 
 /// Runs the UI's transfer queue against the worker until `done` holds.
+#[cfg(unix)]
 async fn drive(
     remote: &mut ferossh_sftp::Remote,
     to_worker: &mpsc::Sender<Message>,
@@ -530,6 +532,7 @@ async fn drive(
 /// SFTP on the shell's connection: list, download, upload and a folder
 /// download, each checked with the server's sha256sum, and a link out of
 /// the folder left alone.
+#[cfg(unix)]
 #[tokio::test]
 async fn transfers_files_over_sftp() {
     use ferossh_sftp::{Remote, State};
