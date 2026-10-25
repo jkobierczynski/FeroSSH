@@ -194,15 +194,25 @@ pub fn run() -> Result<()> {
 }
 
 /// The command line after the program name, or the default shell.
-fn shell_command() -> String {
-    let args: Vec<String> = std::env::args_os()
+/// The command line: `[--theme NAME] [command...]`. With no command the
+/// pane runs the default shell; an unknown theme name falls back to Nord.
+fn command_line() -> (Theme, String) {
+    let mut args: Vec<String> = std::env::args_os()
         .skip(1)
         .map(|a| a.to_string_lossy().into_owned())
         .collect();
-    if args.is_empty() {
-        return conpty::default_command();
+    let mut theme = Theme::default();
+    if args.first().is_some_and(|a| a == "--theme") && args.len() >= 2 {
+        let name: Vec<String> = args.drain(..2).collect();
+        if let Some(t) = name.get(1).and_then(|n| Theme::by_name(n)) {
+            theme = t;
+        }
     }
-    args.iter()
+    if args.is_empty() {
+        return (theme, conpty::default_command());
+    }
+    let command = args
+        .iter()
         .map(|a| {
             if a.is_empty() || a.contains([' ', '\t']) {
                 format!("\"{a}\"")
@@ -211,7 +221,8 @@ fn shell_command() -> String {
             }
         })
         .collect::<Vec<_>>()
-        .join(" ")
+        .join(" ");
+    (theme, command)
 }
 
 fn create_and_run() -> Result<()> {
@@ -256,7 +267,7 @@ fn create_and_run() -> Result<()> {
         // opened on.
         let dpi = GetDpiForWindow(hwnd);
         let font = FontSpec::default();
-        let theme = Theme::dark();
+        let (theme, command) = command_line();
         let mut renderer = Renderer::new(hwnd, 1, 1)?;
         let metrics = renderer.metrics(&font, dpi)?;
         let (width, height) = window_size(&metrics, DEFAULT_COLS, DEFAULT_ROWS, dpi, true);
@@ -286,7 +297,7 @@ fn create_and_run() -> Result<()> {
                 high_surrogate: None,
                 mouse: Mouse::default(),
                 options: Options::default(),
-                command: shell_command(),
+                command,
                 output_pending: Arc::new(AtomicBool::new(false)),
             });
         });
@@ -345,6 +356,10 @@ fn build_menu() -> Result<HMENU> {
         }
         let themes = CreatePopupMenu()?;
         for (id, theme) in (cmd::THEME..).zip(Theme::builtin()) {
+            // Group the warning themes and the Windows classics.
+            if matches!(theme.name, "Production" | "Campbell") {
+                separator(themes)?;
+            }
             item(themes, id, theme.name)?;
         }
 
@@ -1033,9 +1048,9 @@ impl Window {
                 }
             }
             id if (cmd::THEME..cmd::THEME + Theme::builtin().len() as u32).contains(&id) => {
-                if let Some(theme) = Theme::builtin().into_iter().nth((id - cmd::THEME) as usize) {
-                    self.pane.term.set_theme(&theme);
-                    self.pane.theme = theme;
+                if let Some(theme) = Theme::builtin().get((id - cmd::THEME) as usize) {
+                    self.pane.term.set_theme(theme);
+                    self.pane.theme = theme.clone();
                     self.update_menu_checks();
                     self.request_full_redraw();
                 }

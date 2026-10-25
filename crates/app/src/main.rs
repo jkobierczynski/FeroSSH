@@ -4,7 +4,8 @@
 //! emulator, keyboard and mouse handling can be used for real before SSH
 //! sessions arrive in milestone 3. `ferossh.exe <command>` runs that
 //! command instead of `cmd.exe`, for example `ferossh.exe wsl` or
-//! `ferossh.exe ssh host`.
+//! `ferossh.exe ssh host`, and `--theme NAME` first picks the pane's
+//! colour theme.
 
 #![cfg_attr(windows, windows_subsystem = "windows")]
 
