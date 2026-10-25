@@ -1,7 +1,8 @@
 # syntax=docker/dockerfile:1
 # Throwaway SSH servers for the interop tests (crates/worker/tests/interop.rs).
 # One image per Ubuntu release gives a spread of OpenSSH, Dropbear and tmux
-# versions; entrypoint.sh picks which server to run.
+# versions; entrypoint.sh picks which server to run. Dropbear looks for
+# sftp-server in /usr/lib, as on OpenWrt-style installs.
 ARG BASE=ubuntu:24.04
 FROM ${BASE}
 # Behind an HTTPS-only proxy, build.sh passes its CA as the secret "ca" and
@@ -17,6 +18,7 @@ RUN --mount=type=secret,id=ca,required=false \
       openssh-server dropbear-bin tmux \
  && rm -rf /var/lib/apt/lists/* /etc/apt/apt.conf.d/99ca /tmp/ca.crt \
  && mkdir -p /run/sshd /etc/dropbear \
+ && ln -sf /usr/lib/openssh/sftp-server /usr/lib/sftp-server \
  && useradd -m -s /bin/bash fero \
  && sed -i 's/^fero:[^:]*:/fero:*:/' /etc/shadow
 COPY entrypoint.sh /entrypoint.sh
