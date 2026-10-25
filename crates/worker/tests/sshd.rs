@@ -224,6 +224,7 @@ async fn run_ui_with(server: &Server, command: &str, trust: bool, known: Vec<Str
         host_key_algs: known,
         x11: None,
         legacy: false,
+        timing: Default::default(),
     })
     .await;
     let mut seen = Seen::default();
@@ -448,6 +449,7 @@ async fn second_shell_shares_the_connection() {
         host_key_algs: vec![],
         x11: None,
         legacy: false,
+        timing: Default::default(),
     })
     .await;
     let (mut host_keys, mut signed) = (0, 0);
@@ -582,6 +584,7 @@ async fn login(server: &Server) -> (mpsc::Sender<Message>, mpsc::Receiver<Messag
             host_key_algs: vec![],
             x11: None,
             legacy: false,
+            timing: Default::default(),
         })
         .await
         .unwrap();

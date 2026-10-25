@@ -15,7 +15,9 @@ use std::path::PathBuf;
 use ferossh_auth::{Identity, Job, KeyFileSpec, Reply, SignError, Source, userauth};
 use ferossh_config::known_hosts::{self, KnownHosts, Status};
 use ferossh_config::{ForwardSpec, hostkey, ssh_config};
-use ferossh_ipc::{ChannelId, MAX_DATA_CHUNK, Message, PromptField, PromptKind, Secrets, X11Auth};
+use ferossh_ipc::{
+    ChannelId, MAX_DATA_CHUNK, Message, PromptField, PromptKind, Secrets, Timing, X11Auth,
+};
 use ferossh_worker::crypto_policy;
 use zeroize::Zeroizing;
 
@@ -55,6 +57,8 @@ pub struct Target {
     pub forwards: Vec<ForwardSpec>,
     pub forward_x11: bool,
     pub gateway_ports: bool,
+    /// ConnectTimeout and ServerAlive*, over FeroSSH's defaults.
+    pub timing: Timing,
 }
 
 /// The user's environment the target is resolved in.
@@ -112,6 +116,14 @@ impl Target {
             forwards,
             forward_x11: cfg.forward_x11 == Some(true),
             gateway_ports: cfg.gateway_ports == Some(true),
+            timing: {
+                let d = Timing::default();
+                Timing {
+                    connect_timeout: cfg.connect_timeout.unwrap_or(d.connect_timeout),
+                    alive_interval: cfg.server_alive_interval.unwrap_or(d.alive_interval),
+                    alive_max: cfg.server_alive_count_max.unwrap_or(d.alive_max),
+                }
+            },
             tag: cfg.tag,
             alias,
             hostname,
@@ -305,6 +317,7 @@ impl SshSession {
                 host_key_algs,
                 x11: self.x11.clone(),
                 legacy: self.legacy,
+                timing: t.timing,
             }),
         ]
     }
