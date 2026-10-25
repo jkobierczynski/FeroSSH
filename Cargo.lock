@@ -558,6 +558,7 @@ dependencies = [
  "ferossh-config",
  "ferossh-ipc",
  "ferossh-render",
+ "ferossh-sftp",
  "ferossh-term",
  "ferossh-worker",
  "russh",

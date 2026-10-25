@@ -343,6 +343,8 @@ pub struct Remote {
     /// `user@host:port`, which names the queue.
     pub label: String,
     link: Link,
+    /// The connection the channel runs on.
+    connection: Option<ChannelId>,
     pub home: Option<Vec<u8>>,
     pub listing: Listing,
     jobs: Vec<Job>,
@@ -422,6 +424,7 @@ impl Remote {
         Self {
             label: label.to_owned(),
             link: Link::Detached,
+            connection: None,
             home: None,
             listing: Listing::default(),
             jobs: Vec::new(),
@@ -448,6 +451,11 @@ impl Remote {
             Link::Opening(c) | Link::Ready(c) => Some(c),
             Link::Detached => None,
         }
+    }
+
+    /// The SSH connection the channel runs on, while attached.
+    pub fn connection(&self) -> Option<ChannelId> {
+        self.connection
     }
 
     pub fn is_ready(&self) -> bool {
@@ -478,6 +486,7 @@ impl Remote {
     pub fn attach(&mut self, channel: ChannelId, connection: ChannelId) {
         self.detach();
         self.link = Link::Opening(channel);
+        self.connection = Some(connection);
         self.outbox.push(Message::SftpOpen {
             channel,
             connection,
@@ -488,6 +497,7 @@ impl Remote {
     /// the next [`Self::attach`].
     pub fn detach(&mut self) {
         self.link = Link::Detached;
+        self.connection = None;
         self.pending.clear();
         self.listing.loading = false;
         for i in 0..self.jobs.len() {
@@ -544,7 +554,12 @@ impl Remote {
                 }
                 self.pump();
             }
-            Message::Disconnected { .. } => self.detach(),
+            Message::Disconnected { reason, .. } => {
+                self.detach();
+                if !reason.is_empty() {
+                    self.notice = Some(names::display(reason.as_bytes()));
+                }
+            }
             _ => {}
         }
     }

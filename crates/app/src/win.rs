@@ -2,8 +2,9 @@
 //!
 //! The window holds tabs, each a tree of split panes (see [`crate::layout`]).
 //! A window opens with one tab and one pane; the tab strip appears with the
-//! second tab, and the side pane (the session manager) only when asked for.
-//! Each pane has its own terminal, host, log, font and colour theme.
+//! second tab, and the side pane (the session manager, or file transfer)
+//! only when asked for. Each pane has its own terminal, host, log, font and
+//! colour theme.
 
 // Win32 calls are FFI; each unsafe block below is a direct, documented API call.
 #![allow(unsafe_code)]
@@ -12,20 +13,21 @@ use std::cell::{Cell as StdCell, RefCell};
 use std::collections::{HashMap, VecDeque};
 use std::ffi::c_void;
 use std::fs::File;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use ferossh_auth::Broker;
 use ferossh_config::{Settings, putty, ssh_config};
-use ferossh_ipc::{ChannelId, Message};
+use ferossh_ipc::{ChannelId, DirEntry, Message, SftpReply};
 use ferossh_render::{
     CellMetrics, Cursor, FontSpec, Frame, Grid, PaneView, PixelRect, Renderer, Rgb, Theme,
 };
+use ferossh_sftp::{Remote, names};
 use ferossh_term::{
     Action, Key, LogWriter, Mods, MouseButton, MouseEvent, SelectionKind, Settings as TermSettings,
-    Terminal, check_link, clipboard_preview, log_file_name,
+    Terminal, WorkingDir, check_link, clipboard_preview, log_file_name,
 };
 use windows::Win32::Foundation::E_FAIL;
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, SIZE, WPARAM};
@@ -34,6 +36,10 @@ use windows::Win32::Graphics::Gdi::{
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::SystemInformation::GetLocalTime;
+use windows::Win32::UI::Controls::Dialogs::{
+    GetOpenFileNameW, OFN_ALLOWMULTISELECT, OFN_EXPLORER, OFN_FILEMUSTEXIST, OFN_NOCHANGEDIR,
+    OFN_PATHMUSTEXIST, OPENFILENAMEW,
+};
 use windows::Win32::UI::HiDpi::{
     AdjustWindowRectExForDpi, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, GetDpiForWindow,
     SetProcessDpiAwarenessContext,
@@ -44,11 +50,13 @@ use windows::Win32::UI::Input::Ime::{
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     GetDoubleClickTime, GetKeyState, ReleaseCapture, SetCapture, VIRTUAL_KEY, VK_ADD, VK_BACK,
-    VK_CONTROL, VK_DELETE, VK_DOWN, VK_END, VK_ESCAPE, VK_F1, VK_F3, VK_F4, VK_F12, VK_HOME,
+    VK_CONTROL, VK_DELETE, VK_DOWN, VK_END, VK_ESCAPE, VK_F1, VK_F3, VK_F4, VK_F5, VK_F12, VK_HOME,
     VK_INSERT, VK_LEFT, VK_MENU, VK_NEXT, VK_NUMPAD0, VK_OEM_2, VK_OEM_MINUS, VK_OEM_PLUS,
     VK_PRIOR, VK_RETURN, VK_RIGHT, VK_SHIFT, VK_SPACE, VK_SUBTRACT, VK_TAB, VK_UP,
 };
-use windows::Win32::UI::Shell::ShellExecuteW;
+use windows::Win32::UI::Shell::{
+    DragAcceptFiles, DragFinish, DragQueryFileW, DragQueryPoint, HDROP, ShellExecuteW,
+};
 use windows::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT, CheckMenuItem, CheckMenuRadioItem,
     CreateMenu, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW,
@@ -60,17 +68,18 @@ use windows::Win32::UI::WindowsAndMessaging::{
     PM_REMOVE, PeekMessageW, PostMessageW, PostQuitMessage, RegisterClassW, SIZE_MINIMIZED,
     SW_SHOW, SW_SHOWNORMAL, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOZORDER, SetCursor, SetMenu, SetTimer,
     SetWindowPos, SetWindowTextW, ShowWindow, TranslateMessage, WINDOW_EX_STYLE, WINDOW_STYLE,
-    WM_APP, WM_CHAR, WM_CLOSE, WM_COMMAND, WM_DESTROY, WM_DPICHANGED, WM_ERASEBKGND,
+    WM_APP, WM_CHAR, WM_CLOSE, WM_COMMAND, WM_DESTROY, WM_DPICHANGED, WM_DROPFILES, WM_ERASEBKGND,
     WM_GETDPISCALEDSIZE, WM_IME_COMPOSITION, WM_IME_STARTCOMPOSITION, WM_KEYDOWN, WM_KILLFOCUS,
     WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL,
     WM_PAINT, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SETCURSOR, WM_SETFOCUS, WM_SIZE, WM_SYSCHAR,
     WM_SYSKEYDOWN, WM_SYSKEYUP, WM_TIMER, WNDCLASSW, WS_EX_APPWINDOW, WS_OVERLAPPEDWINDOW,
 };
-use windows::core::{HSTRING, PCWSTR, Result, w};
+use windows::core::{HSTRING, PCWSTR, PWSTR, Result, w};
 
 use crate::Launch;
 use crate::clipboard;
 use crate::conpty::{self, Output, Shell};
+use crate::files::{FilesAction, FilesView};
 use crate::layout::{self, Axis, Closed, Dir, Drop, PaneId, Rect, Workspace};
 use crate::link::{Link, LinkEvent};
 use crate::look;
@@ -107,6 +116,9 @@ const WM_SHELL_OUTPUT: u32 = WM_APP + 1;
 /// Fires when a synchronized update must be shown even though it has not
 /// ended.
 const TIMER_SYNC: usize = 1;
+/// Updates the transfer queue's progress while files move.
+const TIMER_TRANSFER: usize = 2;
+const TRANSFER_TICK_MS: u32 = 250;
 /// Output processed per message before the window gets a chance to paint.
 const OUTPUT_BUDGET: usize = 1 << 20;
 /// Wheel units (120 per notch) per scrolled line: three lines a notch.
@@ -128,6 +140,8 @@ mod cmd {
     pub const NEW_TAB: u32 = 105;
     pub const CLOSE_PANE: u32 = 106;
     pub const IMPORT_PUTTY: u32 = 107;
+    pub const UPLOAD: u32 = 108;
+    pub const DOWNLOADS: u32 = 109;
     pub const ZOOM_IN: u32 = 200;
     pub const ZOOM_OUT: u32 = 201;
     pub const ZOOM_RESET: u32 = 202;
@@ -137,6 +151,8 @@ mod cmd {
     pub const SIDE_RIGHT: u32 = 206;
     pub const TAB_STRIP: u32 = 207;
     pub const SAVE_LOOK: u32 = 208;
+    pub const FILES: u32 = 209;
+    pub const FOLLOW_CD: u32 = 210;
     /// Plus the index into `FONT_CHOICES`.
     pub const FONT: u32 = 300;
     /// Plus the index into `Theme::builtin()`.
@@ -155,6 +171,7 @@ mod cmd {
     pub const LOG_RAW: u32 = 601;
     pub const LOG_FOLDER: u32 = 602;
     pub const REPLACE_KEY: u32 = 603;
+    pub const VERIFY: u32 = 604;
     pub const SPLIT_RIGHT: u32 = 700;
     pub const SPLIT_DOWN: u32 = 701;
     pub const NEXT_TAB: u32 = 702;
@@ -221,6 +238,11 @@ struct Pane {
     title: Option<String>,
     /// A bell rang while the pane was out of sight.
     bell: bool,
+    /// The remote working directory the shell last reported (OSC 7).
+    cwd: Option<Vec<u8>>,
+    /// The host name in the first report: reports naming another host
+    /// come from a nested `ssh` and are not this connection's.
+    cwd_host: Option<String>,
 }
 
 impl Pane {
@@ -305,9 +327,17 @@ enum Drag {
     },
 }
 
-/// The side pane: the session manager.
+/// What the side pane shows.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SideView {
+    Sessions,
+    Files,
+}
+
+/// The side pane: the session manager or file transfer.
 struct Side {
     visible: bool,
+    view: SideView,
     /// Has the keyboard.
     focused: bool,
     list: SessionList,
@@ -365,6 +395,12 @@ struct Window {
     /// Set while a WM_SHELL_OUTPUT is queued, so the background threads
     /// post one message per batch rather than one per read.
     output_pending: Arc<AtomicBool>,
+    /// SFTP and the transfer queue, per `user@host:port`.
+    sftp: HashMap<String, Remote>,
+    files: FilesView,
+    /// The host the file view shows: the focused pane's.
+    files_key: Option<String>,
+    transfer_timer: bool,
 }
 
 thread_local! {
@@ -589,6 +625,7 @@ fn create_and_run(launch: Launch, theme: Option<String>) -> Result<()> {
                 strip_layout: StripLayout::default(),
                 side: Side {
                     visible: false,
+                    view: SideView::Sessions,
                     focused: false,
                     list: SessionList::default(),
                     grid: Grid::new(1, 1),
@@ -616,8 +653,14 @@ fn create_and_run(launch: Launch, theme: Option<String>) -> Result<()> {
                 broker_jobs: VecDeque::new(),
                 next_channel: 1,
                 output_pending: Arc::new(AtomicBool::new(false)),
+                sftp: HashMap::new(),
+                files: FilesView::default(),
+                files_key: None,
+                transfer_timer: false,
             });
         });
+        // Files dropped from Explorer are uploaded, after a confirmation.
+        DragAcceptFiles(hwnd, true);
         with_window(Window::update_menu_checks);
         // Sends WM_SIZE, which sizes the terminal before the shell starts.
         SetWindowPos(
@@ -671,6 +714,8 @@ fn new_pane(
         rect: Rect::default(),
         title: None,
         bell: false,
+        cwd: None,
+        cwd_host: None,
     }
 }
 
@@ -692,6 +737,9 @@ fn build_menu() -> Result<HMENU> {
         item(file, cmd::DISCONNECT, "&Disconnect")?;
         item(file, cmd::CLOSE_PANE, "Close &pane\tCtrl+Shift+W")?;
         separator(file)?;
+        item(file, cmd::UPLOAD, "&Upload files...\tCtrl+Shift+U")?;
+        item(file, cmd::DOWNLOADS, "Open do&wnload folder")?;
+        separator(file)?;
         item(file, cmd::RESTART_SHELL, "Open &local shell")?;
         item(file, cmd::IMPORT_PUTTY, "&Import PuTTY sessions...")?;
         separator(file)?;
@@ -709,6 +757,8 @@ fn build_menu() -> Result<HMENU> {
         )?;
         separator(session)?;
         item(session, cmd::REPLACE_KEY, "Replace host &key...")?;
+        separator(session)?;
+        item(session, cmd::VERIFY, "&Verify transfers (SHA-256)")?;
 
         let edit = CreatePopupMenu()?;
         item(edit, cmd::COPY, "&Copy\tCtrl+Shift+C")?;
@@ -735,6 +785,8 @@ fn build_menu() -> Result<HMENU> {
 
         let view = CreatePopupMenu()?;
         item(view, cmd::SESSIONS, "S&ession manager\tCtrl+Shift+S")?;
+        item(view, cmd::FILES, "File tra&nsfer\tCtrl+Shift+E")?;
+        item(view, cmd::FOLLOW_CD, "File transfer f&ollows cd")?;
         item(view, cmd::SIDE_RIGHT, "Side pane on the &right")?;
         item(view, cmd::TAB_STRIP, "Ta&b strip")?;
         separator(view)?;
@@ -927,6 +979,9 @@ fn side_key(vk: VIRTUAL_KEY, mods: Mods) -> Option<SideKey> {
         VK_RETURN => SideKey::Enter { split: mods.shift },
         VK_ESCAPE => SideKey::Escape,
         VK_BACK => SideKey::Backspace,
+        VK_DELETE => SideKey::Delete,
+        VK_TAB if !mods.ctrl => SideKey::Tab,
+        VK_F5 => SideKey::Refresh,
         v if mods.ctrl && !mods.alt && v == VIRTUAL_KEY(u16::from(b'D')) => {
             SideKey::ToggleFavourite
         }
@@ -950,7 +1005,8 @@ enum KeyOutcome {
 
 /// Where a point in the client falls.
 enum Spot {
-    Side(usize),
+    /// Column and row in the side pane's grid.
+    Side(usize, usize),
     SideEdge,
     Strip(usize),
     Divider(layout::Divider),
@@ -1027,7 +1083,10 @@ impl Window {
         if let Some(p) = self.panes.get_mut(&id) {
             p.host = Host::Ask(String::new());
             p.title = None;
+            p.cwd = None;
+            p.cwd_host = None;
         }
+        self.prune_sftp();
     }
 
     fn start_shell(&mut self, id: PaneId) {
@@ -1260,10 +1319,12 @@ impl Window {
                 }
                 Effect::Connected => {
                     self.start_log(id);
+                    self.sftp_connected(id);
                     self.refresh_chrome();
                 }
                 Effect::Ended => {
                     self.stop_log(id);
+                    self.prune_sftp();
                     self.refresh_chrome();
                 }
             }
@@ -1519,14 +1580,29 @@ impl Window {
             self.apply(id, effects);
         }
         // The worker.
+        let mut transfers = false;
         while !more {
             let Some(event) = self.worker.as_ref().and_then(|w| w.link.try_recv()) else {
                 break;
             };
             match event {
                 LinkEvent::Message(msg) => {
-                    if let Message::Data { bytes, .. } = &msg {
-                        fed += bytes.len();
+                    match &msg {
+                        Message::Data { bytes, .. } => fed += bytes.len(),
+                        Message::SftpReply {
+                            reply: SftpReply::Data(data),
+                            ..
+                        } => fed += data.len(),
+                        _ => {}
+                    }
+                    if let Some(c) = msg.channel()
+                        && let Some(remote) =
+                            self.sftp.values_mut().find(|r| r.channel() == Some(c))
+                    {
+                        remote.on_message(msg);
+                        transfers = true;
+                        more = fed >= OUTPUT_BUDGET;
+                        continue;
                     }
                     let Some(id) = msg.channel().and_then(|c| self.pane_of_channel(c)) else {
                         continue;
@@ -1540,6 +1616,10 @@ impl Window {
                 LinkEvent::Closed(why) => {
                     self.worker = None;
                     self.broker_jobs.clear();
+                    for remote in self.sftp.values_mut() {
+                        remote.detach();
+                    }
+                    transfers = true;
                     let ids: Vec<PaneId> = self.panes.keys().copied().collect();
                     for id in ids {
                         let effects = match self.panes.get_mut(&id).map(|p| &mut p.host) {
@@ -1561,6 +1641,12 @@ impl Window {
                 }
             }
             more = fed >= OUTPUT_BUDGET;
+        }
+        if transfers {
+            self.flush_sftp();
+            if self.files_visible() {
+                self.refresh_chrome();
+            }
         }
         if more && !self.output_pending.swap(true, Ordering::AcqRel) {
             // Let the window paint, then carry on.
@@ -1608,6 +1694,11 @@ impl Window {
                         }
                         if !self.focused {
                             commands.push(Command::Bell);
+                        }
+                    }
+                    Action::WorkingDirectory(dir) => {
+                        if self.on_working_dir(id, dir) {
+                            chrome = true;
                         }
                     }
                 }
@@ -1712,9 +1803,22 @@ impl Window {
             self.strip_layout = tabstrip::draw(&mut self.strip_grid, &labels, active, &palette);
             self.invalidate_grid(strip, false);
         }
+        self.sync_files();
         if let Some(side) = self.areas.side {
             let focused = self.side.focused && self.focused;
-            self.side.list.draw(&mut self.side.grid, &palette, focused);
+            match self.side.view {
+                SideView::Sessions => self.side.list.draw(&mut self.side.grid, &palette, focused),
+                SideView::Files => {
+                    let remote = self.files_key.as_ref().and_then(|k| self.sftp.get(k));
+                    self.files.draw(
+                        &mut self.side.grid,
+                        &palette,
+                        focused,
+                        remote,
+                        self.settings.follow_directory,
+                    );
+                }
+            }
             self.invalidate_grid(side, true);
         }
     }
@@ -2162,6 +2266,16 @@ impl Window {
 
     /// A key for the side pane; what it picked runs here.
     fn side_key(&mut self, key: SideKey) -> Option<Command> {
+        if self.side.view == SideView::Files {
+            if key == SideKey::Refresh {
+                self.ensure_sftp(self.focused_id());
+            }
+            let rows = self.side.grid.rows();
+            let downloads = self.download_dir();
+            let remote = self.files_key.as_ref().and_then(|k| self.sftp.get_mut(k));
+            let action = self.files.key(remote, key, &downloads, rows);
+            return self.files_action(action);
+        }
         let visible = SessionList::visible(self.side.grid.rows());
         let action = self.side.list.key(key, visible);
         self.side_action(action)
@@ -2223,15 +2337,22 @@ impl Window {
         self.refresh(id);
     }
 
-    /// Shows the session manager, re-reading ssh_config.
-    fn show_side(&mut self, focus: bool) {
-        let env = ssh_env();
-        self.side
-            .list
-            .set_hosts(host_items(&env), self.settings.favourites.clone());
+    /// Shows the side pane in `view`; the session manager re-reads
+    /// ssh_config, file transfer opens SFTP if it is not open.
+    fn show_side(&mut self, view: SideView, focus: bool) {
+        self.side.view = view;
+        if view == SideView::Sessions {
+            let env = ssh_env();
+            self.side
+                .list
+                .set_hosts(host_items(&env), self.settings.favourites.clone());
+        } else {
+            self.ensure_sftp(self.focused_id());
+        }
         self.side.visible = true;
         self.side.focused = focus;
         self.layout();
+        self.update_menu_checks();
     }
 
     fn hide_side(&mut self) {
@@ -2370,8 +2491,9 @@ impl Window {
             && s.contains(x, y)
         {
             let cpad = scale(CHROME_PADDING_DIP, self.dpi);
+            let col = ((x - s.x - cpad).max(0) / self.chrome_metrics.width.max(1) as i32) as usize;
             let row = ((y - s.y - cpad).max(0) / self.chrome_metrics.height.max(1) as i32) as usize;
-            return Spot::Side(row);
+            return Spot::Side(col, row);
         }
         if let Some(s) = self.areas.strip
             && s.contains(x, y)
@@ -2472,7 +2594,7 @@ impl Window {
                 self.drag = Some(Drag::SideEdge);
                 None
             }
-            Spot::Side(row) => {
+            Spot::Side(col, row) => {
                 if !self.side.focused {
                     self.side.focused = true;
                     self.request_full_redraw();
@@ -2489,6 +2611,13 @@ impl Window {
                     .last_click
                     .is_some_and(|(at, r)| r == row && now - at <= limit);
                 self.side.last_click = Some((now, row));
+                if self.side.view == SideView::Files {
+                    let rows = self.side.grid.rows();
+                    let downloads = self.download_dir();
+                    let remote = self.files_key.as_ref().and_then(|k| self.sftp.get_mut(k));
+                    let action = self.files.click(remote, col, row, double, &downloads, rows);
+                    return self.files_action(action);
+                }
                 let visible = SessionList::visible(self.side.grid.rows());
                 let action = self.side.list.click(row, double, visible);
                 self.side_action(action)
@@ -2801,9 +2930,14 @@ impl Window {
         }
         self.mouse.wheel_rest -= lines * WHEEL_PER_LINE;
         let id = match self.spot(pt.x, pt.y) {
-            Spot::Side(_) => {
-                let visible = SessionList::visible(self.side.grid.rows());
-                self.side.list.scroll_by(lines, visible);
+            Spot::Side(..) => {
+                if self.side.view == SideView::Files {
+                    let remote = self.files_key.as_ref().and_then(|k| self.sftp.get(k));
+                    self.files.scroll_by(remote, lines, self.side.grid.rows());
+                } else {
+                    let visible = SessionList::visible(self.side.grid.rows());
+                    self.side.list.scroll_by(lines, visible);
+                }
                 self.refresh_chrome();
                 return None;
             }
@@ -2978,9 +3112,17 @@ impl Window {
                     self.layout();
                 }
             }
-            cmd::SESSIONS => {
-                match (self.side.visible, self.side.focused) {
-                    (false, _) => self.show_side(true),
+            cmd::SESSIONS | cmd::FILES => {
+                let view = if id == cmd::FILES {
+                    SideView::Files
+                } else {
+                    SideView::Sessions
+                };
+                match (
+                    self.side.visible && self.side.view == view,
+                    self.side.focused,
+                ) {
+                    (false, _) => self.show_side(view, true),
                     (true, true) => self.hide_side(),
                     (true, false) => {
                         self.side.focused = true;
@@ -3004,6 +3146,26 @@ impl Window {
                 self.layout();
             }
             cmd::SAVE_LOOK => return Some(Command::SaveLook),
+            cmd::UPLOAD => {
+                self.ensure_sftp(pane);
+                let Some(key) = self.files_target(pane) else {
+                    return Some(Command::Notice(NOT_CONNECTED.into()));
+                };
+                let listed = self.files_visible() && self.files_key.as_deref() == Some(&key);
+                let dir = self.upload_dir(pane, listed);
+                return Some(Command::PickUpload { key, dir });
+            }
+            cmd::DOWNLOADS => return Some(Command::OpenFolder(self.download_dir())),
+            cmd::VERIFY => {
+                self.settings.verify_transfers = !self.settings.verify_transfers;
+                for remote in self.sftp.values_mut() {
+                    remote.verify = self.settings.verify_transfers;
+                }
+                self.save_settings();
+                self.update_menu_checks();
+                self.refresh_chrome();
+            }
+            cmd::FOLLOW_CD => self.toggle_follow(),
             cmd::DISCONNECT => {
                 let effects = match self.panes.get_mut(&pane).map(|p| &mut p.host) {
                     Some(Host::Ssh(session))
@@ -3174,7 +3336,16 @@ impl Window {
                 (cmd::RIGHT_CLICK_PASTE, s.right_click_paste),
                 (cmd::LOG_TOGGLE, log),
                 (cmd::LOG_RAW, raw),
-                (cmd::SESSIONS, self.side.visible),
+                (
+                    cmd::SESSIONS,
+                    self.side.visible && self.side.view == SideView::Sessions,
+                ),
+                (
+                    cmd::FILES,
+                    self.side.visible && self.side.view == SideView::Files,
+                ),
+                (cmd::FOLLOW_CD, s.follow_directory),
+                (cmd::VERIFY, s.verify_transfers),
                 (cmd::SIDE_RIGHT, s.side_pane_right),
                 (cmd::TAB_STRIP, s.tab_strip),
             ] {
@@ -3233,6 +3404,310 @@ impl Window {
             dpi,
             self.menu_visible,
         ))
+    }
+
+    /// Where downloads go: the setting, else the user's Downloads folder.
+    fn download_dir(&self) -> PathBuf {
+        self.settings
+            .download_folder
+            .as_ref()
+            .map_or_else(|| home().join("Downloads"), PathBuf::from)
+    }
+
+    fn files_visible(&self) -> bool {
+        self.side.visible && self.side.view == SideView::Files
+    }
+
+    /// The transfer queue's key for pane `id`, if it is an SSH pane.
+    fn pane_sftp_key(&self, id: PaneId) -> Option<String> {
+        match &self.panes.get(&id)?.host {
+            Host::Ssh(s) => Some(sftp_key(&s.target)),
+            _ => None,
+        }
+    }
+
+    /// The queue key for pane `id` when it is logged in and its host's
+    /// queue exists.
+    fn files_target(&self, id: PaneId) -> Option<String> {
+        let p = self.panes.get(&id)?;
+        if !p.connected() {
+            return None;
+        }
+        let key = self.pane_sftp_key(id)?;
+        self.sftp.contains_key(&key).then_some(key)
+    }
+
+    /// Opens SFTP on pane `id`'s connection, if the pane is logged in and
+    /// its host has no SFTP channel yet. The queue starts in the pane's
+    /// directory when it reported one.
+    fn ensure_sftp(&mut self, id: PaneId) {
+        let Some(p) = self.panes.get(&id) else {
+            return;
+        };
+        let Host::Ssh(s) = &p.host else {
+            return;
+        };
+        if s.state() != State::Connected || self.worker.is_none() {
+            return;
+        }
+        let key = sftp_key(&s.target);
+        let label = s.target.label();
+        let connection = s.connection;
+        let cwd = p.cwd.clone().filter(|_| self.settings.follow_directory);
+        let (verify, parallel) = (
+            self.settings.verify_transfers,
+            self.settings.parallel_transfers,
+        );
+        let remote = self.sftp.entry(key).or_insert_with(|| {
+            let mut r = Remote::new(&label);
+            r.verify = verify;
+            if let Some(n) = parallel {
+                r.parallel = n;
+            }
+            r
+        });
+        if remote.channel().is_some() {
+            return;
+        }
+        if let Some(cwd) = cwd
+            && remote.listing.path.is_empty()
+        {
+            remote.browse(&cwd);
+        }
+        let channel = self.next_channel;
+        self.next_channel = self.next_channel.wrapping_add(1).max(1);
+        remote.attach(channel, connection);
+        self.flush_sftp();
+    }
+
+    /// A pane logged in: transfers waiting for its host carry on, and the
+    /// file view opens SFTP if it shows that host.
+    fn sftp_connected(&mut self, id: PaneId) {
+        let Some(key) = self.pane_sftp_key(id) else {
+            return;
+        };
+        let shown = self.files_visible() && self.files_key.as_deref() == Some(&key);
+        let waiting = self.sftp.get(&key).is_some_and(Remote::wants_connection);
+        if shown || waiting {
+            self.ensure_sftp(id);
+        }
+    }
+
+    /// Closes SFTP channels whose connection no logged-in pane uses any
+    /// more, so they do not keep it open. Their transfers wait.
+    fn prune_sftp(&mut self) {
+        let live: Vec<(String, ChannelId)> = self
+            .panes
+            .values()
+            .filter_map(|p| match &p.host {
+                Host::Ssh(s) if s.state() == State::Connected => {
+                    Some((sftp_key(&s.target), s.connection))
+                }
+                _ => None,
+            })
+            .collect();
+        let mut closed = false;
+        for (key, remote) in &mut self.sftp {
+            if let Some(conn) = remote.connection()
+                && !live.iter().any(|(k, c)| k == key && *c == conn)
+            {
+                remote.close();
+                closed = true;
+            }
+        }
+        if closed {
+            self.flush_sftp();
+        }
+    }
+
+    /// Sends what the queues asked for, and runs the progress timer while
+    /// anything moves.
+    fn flush_sftp(&mut self) {
+        for remote in self.sftp.values_mut() {
+            let out = remote.take_outbox();
+            if let Some(w) = &self.worker {
+                for msg in out {
+                    w.link.send(msg);
+                }
+            }
+        }
+        let busy = self.sftp.values().any(Remote::busy);
+        if busy != self.transfer_timer {
+            self.transfer_timer = busy;
+            // SAFETY: our window and timer.
+            unsafe {
+                if busy {
+                    SetTimer(Some(self.hwnd), TIMER_TRANSFER, TRANSFER_TICK_MS, None);
+                } else {
+                    let _ = KillTimer(Some(self.hwnd), TIMER_TRANSFER);
+                }
+            }
+        }
+    }
+
+    fn on_transfer_timer(&mut self) {
+        for remote in self.sftp.values_mut() {
+            remote.poll();
+        }
+        self.flush_sftp();
+        if self.files_visible() {
+            self.refresh_chrome();
+        }
+    }
+
+    /// Points the file view at the focused pane's host when focus moved
+    /// to a pane on another host.
+    fn sync_files(&mut self) {
+        if !self.files_visible() {
+            return;
+        }
+        let id = self.focused_id();
+        let key = self.pane_sftp_key(id);
+        if key == self.files_key {
+            return;
+        }
+        self.files.reset();
+        self.files_key.clone_from(&key);
+        self.ensure_sftp(id);
+        self.follow_pane(id);
+    }
+
+    /// Lists pane `id`'s reported directory, when following is on.
+    fn follow_pane(&mut self, id: PaneId) {
+        if !self.settings.follow_directory {
+            return;
+        }
+        let Some(cwd) = self.panes.get(&id).and_then(|p| p.cwd.clone()) else {
+            return;
+        };
+        let Some(key) = self.pane_sftp_key(id) else {
+            return;
+        };
+        if let Some(remote) = self.sftp.get_mut(&key)
+            && remote.listing.path != cwd
+        {
+            remote.browse(&cwd);
+            self.flush_sftp();
+        }
+    }
+
+    /// The shell reported its directory (OSC 7). Returns whether the file
+    /// view changed.
+    fn on_working_dir(&mut self, id: PaneId, dir: WorkingDir) -> bool {
+        let Some(p) = self.panes.get_mut(&id) else {
+            return false;
+        };
+        if !matches!(p.host, Host::Ssh(_)) {
+            return false;
+        }
+        let host = dir.host.to_ascii_lowercase();
+        let first = p.cwd_host.get_or_insert_with(|| host.clone());
+        if *first != host {
+            // A nested ssh on another host: its paths are not ours.
+            p.cwd = None;
+            return false;
+        }
+        p.cwd = Some(dir.path);
+        if !self.files_visible() || id != self.focused_id() {
+            return false;
+        }
+        self.follow_pane(id);
+        true
+    }
+
+    fn toggle_follow(&mut self) {
+        self.settings.follow_directory = !self.settings.follow_directory;
+        self.save_settings();
+        self.update_menu_checks();
+        self.follow_pane(self.focused_id());
+        self.refresh_chrome();
+    }
+
+    /// Carries out what the file view picked.
+    fn files_action(&mut self, action: Option<FilesAction>) -> Option<Command> {
+        let command = match action {
+            Some(FilesAction::Leave) => {
+                self.focus_terminal();
+                None
+            }
+            Some(FilesAction::Delete(entry)) => self
+                .files_key
+                .clone()
+                .map(|key| Command::ConfirmDelete { key, entry }),
+            Some(FilesAction::PickUpload(dir)) => self
+                .files_key
+                .clone()
+                .filter(|k| self.sftp.contains_key(k))
+                .map(|key| Command::PickUpload { key, dir }),
+            Some(FilesAction::OpenDownloads) => Some(Command::OpenFolder(self.download_dir())),
+            Some(FilesAction::ToggleFollow) => {
+                self.toggle_follow();
+                None
+            }
+            None => None,
+        };
+        self.flush_sftp();
+        self.refresh_chrome();
+        command
+    }
+
+    /// Where an upload from pane `id` goes: the listed folder when
+    /// `listed`, else the shell's directory, else the home folder, else
+    /// wherever the server starts SFTP.
+    fn upload_dir(&self, id: PaneId, listed: bool) -> Vec<u8> {
+        let remote = self.pane_sftp_key(id).and_then(|k| self.sftp.get(&k));
+        if listed
+            && let Some(r) = remote
+            && !r.listing.path.is_empty()
+        {
+            return r.listing.path.clone();
+        }
+        if let Some(cwd) = self.panes.get(&id).and_then(|p| p.cwd.clone()) {
+            return cwd;
+        }
+        remote
+            .and_then(|r| r.home.clone())
+            .unwrap_or_else(|| b".".to_vec())
+    }
+
+    /// Queues uploads and shows the queue.
+    fn upload_files(&mut self, key: &str, paths: &[PathBuf], dir: &[u8]) {
+        let Some(remote) = self.sftp.get_mut(key) else {
+            return;
+        };
+        for path in paths {
+            if let Err(e) = remote.upload(path, dir) {
+                remote.notice = Some(e);
+            }
+        }
+        self.flush_sftp();
+        if !self.files_visible() {
+            self.show_side(SideView::Files, false);
+        }
+        self.refresh_chrome();
+    }
+
+    /// Where files dropped at client point (`x`, `y`) go: the queue key,
+    /// a label for the prompt, and the remote folder.
+    fn drop_target(&mut self, x: i32, y: i32) -> Option<(String, Vec<u8>)> {
+        let (id, listed) = match self.spot(x, y) {
+            Spot::Pane(id) => (id, false),
+            Spot::Side(..) if self.files_visible() => (self.focused_id(), true),
+            _ => return None,
+        };
+        self.ensure_sftp(id);
+        let key = self.files_target(id)?;
+        let listed = listed && self.files_key.as_deref() == Some(&key);
+        Some((key, self.upload_dir(id, listed)))
+    }
+
+    /// Transfers not yet done, failed, skipped or cancelled.
+    fn unfinished_transfers(&self) -> usize {
+        self.sftp
+            .values()
+            .flat_map(Remote::jobs)
+            .filter(|j| j.parent.is_none() && !j.state.finished())
+            .count()
     }
 
     /// SSH sessions logged in, in all tabs or in one.
@@ -3312,6 +3787,8 @@ fn shortcut(vk: VIRTUAL_KEY, m: Mods, tabs: bool, split: bool) -> Option<u32> {
             v if v == key(b'T') && m.shift => Some(cmd::NEW_TAB),
             v if v == key(b'W') && m.shift => Some(cmd::CLOSE_PANE),
             v if v == key(b'S') && m.shift => Some(cmd::SESSIONS),
+            v if v == key(b'E') && m.shift => Some(cmd::FILES),
+            v if v == key(b'U') && m.shift => Some(cmd::UPLOAD),
             VK_INSERT if !m.shift => Some(cmd::COPY),
             VK_HOME if m.shift => Some(cmd::SCROLL_TOP),
             VK_END if m.shift => Some(cmd::SCROLL_BOTTOM),
@@ -3354,6 +3831,18 @@ enum Command {
     CloseTab(usize),
     ImportPutty,
     SaveLook,
+    /// A message box with this text.
+    Notice(String),
+    /// Ask, then delete `entry` in the listed folder of `key`'s host.
+    ConfirmDelete {
+        key: String,
+        entry: DirEntry,
+    },
+    /// The file picker, then upload into `dir` on `key`'s host.
+    PickUpload {
+        key: String,
+        dir: Vec<u8>,
+    },
 }
 
 /// A modal message box; `None` if another one is already open.
@@ -3375,6 +3864,110 @@ fn run_commands(hwnd: HWND, commands: Vec<Command>) {
     }
 }
 
+/// The message for file transfer without a logged-in pane.
+const NOT_CONNECTED: &str = "Log in to an SSH host in this pane first; files go to and from \
+                             the host of the focused pane.";
+
+/// The key of a host's transfer queue: one per user, host name and port.
+fn sftp_key(t: &Target) -> String {
+    format!("{}@{}:{}", t.user, t.hostname.to_ascii_lowercase(), t.port)
+}
+
+/// The paths of files dropped from Explorer, and where they were dropped.
+fn dropped_files(drop: HDROP) -> (Vec<PathBuf>, POINT) {
+    let mut paths = Vec::new();
+    let mut at = POINT::default();
+    // SAFETY: `drop` is the handle WM_DROPFILES carried; each buffer is
+    // sized from the length the first call reports, and DragFinish frees
+    // the handle once.
+    unsafe {
+        let count = DragQueryFileW(drop, u32::MAX, None);
+        for i in 0..count {
+            let len = DragQueryFileW(drop, i, None) as usize;
+            let mut buf = vec![0u16; len + 1];
+            let got = DragQueryFileW(drop, i, Some(&mut buf)) as usize;
+            if let Some(name) = buf.get(..got) {
+                paths.push(PathBuf::from(String::from_utf16_lossy(name)));
+            }
+        }
+        let _ = DragQueryPoint(drop, &mut at);
+        DragFinish(drop);
+    }
+    (paths, at)
+}
+
+/// Files dropped on the window: asks, then uploads them to the host of
+/// the pane they landed on.
+fn drop_files(hwnd: HWND, drop: HDROP) {
+    let (paths, at) = dropped_files(drop);
+    if paths.is_empty() {
+        return;
+    }
+    let Some((key, dir)) = with_window(|w| w.drop_target(at.x, at.y)).flatten() else {
+        dialog(
+            hwnd,
+            "Drop files on a pane that is logged in to an SSH host to upload them there.",
+            MB_OK | MB_ICONINFORMATION,
+        );
+        return;
+    };
+    let what = match paths.as_slice() {
+        [one] => format!(
+            "\"{}\"",
+            one.file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default()
+        ),
+        many => format!("{} items", many.len()),
+    };
+    let host = key.rsplit_once(':').map_or(key.as_str(), |(h, _)| h);
+    let text = format!("Upload {what} to {} on {host}?", names::display(&dir));
+    if dialog(hwnd, &text, MB_YESNO | MB_ICONQUESTION) == Some(IDYES) {
+        with_window(|w| w.upload_files(&key, &paths, &dir));
+    }
+}
+
+/// File > Upload files: the system file picker, several files at once.
+fn pick_files(hwnd: HWND) -> Vec<PathBuf> {
+    if DIALOG_OPEN.get() {
+        return Vec::new();
+    }
+    let mut buf = vec![0u16; 64 * 1024];
+    let mut ofn = OPENFILENAMEW {
+        lStructSize: std::mem::size_of::<OPENFILENAMEW>() as u32,
+        hwndOwner: hwnd,
+        lpstrFile: PWSTR(buf.as_mut_ptr()),
+        nMaxFile: buf.len() as u32,
+        lpstrTitle: w!("Upload files"),
+        Flags: OFN_ALLOWMULTISELECT
+            | OFN_EXPLORER
+            | OFN_FILEMUSTEXIST
+            | OFN_PATHMUSTEXIST
+            | OFN_NOCHANGEDIR,
+        ..Default::default()
+    };
+    DIALOG_OPEN.set(true);
+    // SAFETY: the struct is filled in as documented and `buf` outlives the
+    // call; the dialog's modal loop holds no state borrow.
+    let ok = unsafe { GetOpenFileNameW(&mut ofn) }.as_bool();
+    DIALOG_OPEN.set(false);
+    if !ok {
+        return Vec::new();
+    }
+    // A folder, then the names, each NUL-terminated; one file comes as its
+    // full path alone.
+    let parts: Vec<String> = buf
+        .split(|&c| c == 0)
+        .take_while(|p| !p.is_empty())
+        .map(String::from_utf16_lossy)
+        .collect();
+    match parts.as_slice() {
+        [] => Vec::new(),
+        [one] => vec![PathBuf::from(one)],
+        [dir, names @ ..] => names.iter().map(|n| Path::new(dir).join(n)).collect(),
+    }
+}
+
 fn plural(n: usize) -> &'static str {
     if n == 1 { "" } else { "s" }
 }
@@ -3387,8 +3980,18 @@ fn run_command(hwnd: HWND, command: Command) {
             }
         }
         Command::Exit => {
+            let moving = with_window(|w| w.unfinished_transfers()).unwrap_or(0);
             let live = with_window(|w| w.live_sessions(None)).unwrap_or(0);
-            if live > 1 {
+            if moving > 0 {
+                let text = format!(
+                    "{moving} file transfer{s} not finished. Exit anyway?\n\n\
+                     Partly downloaded files stay as .part files next to where they were going.",
+                    s = if moving == 1 { " is" } else { "s are" },
+                );
+                if dialog(hwnd, &text, MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2) != Some(IDYES) {
+                    return;
+                }
+            } else if live > 1 {
                 let text = format!("{live} SSH sessions are open. Close them all and exit?");
                 if dialog(hwnd, &text, MB_YESNO | MB_ICONQUESTION | MB_DEFBUTTON2) != Some(IDYES) {
                     return;
@@ -3507,6 +4110,47 @@ fn run_command(hwnd: HWND, command: Command) {
             with_window(|w| w.update_title());
         }
         Command::ReplaceHostKey => replace_host_key(hwnd),
+        Command::Notice(text) => {
+            dialog(hwnd, &text, MB_OK | MB_ICONINFORMATION);
+        }
+        Command::ConfirmDelete { key, entry } => {
+            let what = if entry.attrs.is_dir() {
+                "the folder"
+            } else {
+                "the file"
+            };
+            let path = with_window(|w| {
+                w.sftp
+                    .get(&key)
+                    .map(|r| names::display(&names::join(&r.listing.path, &entry.name)))
+            })
+            .flatten()
+            .unwrap_or_default();
+            let note = if entry.attrs.is_dir() {
+                " Only an empty folder can be deleted."
+            } else {
+                ""
+            };
+            let text = format!(
+                "Delete {what} {path} on {key}?{note}\n\nThis cannot be undone.",
+                key = key.rsplit_once(':').map_or(key.as_str(), |(h, _)| h)
+            );
+            if dialog(hwnd, &text, MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2) == Some(IDYES) {
+                with_window(|w| {
+                    if let Some(r) = w.sftp.get_mut(&key) {
+                        r.delete(&entry);
+                    }
+                    w.flush_sftp();
+                    w.refresh_chrome();
+                });
+            }
+        }
+        Command::PickUpload { key, dir } => {
+            let picked = pick_files(hwnd);
+            if !picked.is_empty() {
+                with_window(|w| w.upload_files(&key, &picked, &dir));
+            }
+        }
         Command::ImportPutty => import_putty(hwnd),
         Command::SaveLook => {
             if let Some(result) = with_window(Window::save_look) {
@@ -3628,7 +4272,7 @@ fn import_putty(hwnd: HWND) {
             }
         }
         w.save_settings();
-        w.show_side(true);
+        w.show_side(SideView::Sessions, true);
         w.update_menu_checks();
     });
 }
@@ -3758,6 +4402,14 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                 if let Some(commands) = with_window(Window::on_output) {
                     run_commands(hwnd, commands);
                 }
+                LRESULT(0)
+            }
+            WM_TIMER if wparam.0 == TIMER_TRANSFER => {
+                with_window(Window::on_transfer_timer);
+                LRESULT(0)
+            }
+            WM_DROPFILES => {
+                drop_files(hwnd, HDROP(wparam.0 as *mut c_void));
                 LRESULT(0)
             }
             WM_TIMER if wparam.0 == TIMER_SYNC => {

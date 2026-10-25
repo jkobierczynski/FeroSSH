@@ -4,7 +4,7 @@
 
 FeroSSH aims to be the smallest, most secure open-source SSH client for Windows: a native PuTTY replacement with tabs, splits, tmux integration and file transfer, shipped as one signed exe with nothing to install.
 
-> **Status:** milestone 4 (tabs, splits and a session manager). FeroSSH connects with russh from a sandboxed worker process, checks host keys against `~/.ssh/known_hosts`, and signs in with the Windows OpenSSH agent, Pageant, key files, keyboard-interactive or a password. File transfer arrives in milestone 5.
+> **Status:** milestone 5 (file transfer over SFTP). FeroSSH connects with russh from a sandboxed worker process, checks host keys against `~/.ssh/known_hosts`, and signs in with the Windows OpenSSH agent, Pageant, key files, keyboard-interactive or a password. Tabs, splits and a session manager came in milestone 4.
 
 ## Trying the build
 
@@ -22,6 +22,9 @@ ferossh.exe --local [command]  # a local shell, as in milestone 2
 - **Tabs and splits.** The window starts with one pane and no tab strip. Ctrl+Shift+T opens a tab, Alt+Shift+= and Alt+Shift+- split the pane; the tab strip appears once there are two tabs. A new tab or pane on a host you are already logged in to opens another channel on the same connection, so there is no second login. Drag a divider to resize, drag a tab to reorder, and Ctrl+Shift+drag a pane onto another pane's edge to move it there (or its middle to swap them). To merge a tab back in as a pane, drag the tab down out of the strip onto a pane of the tab that appears, or use Window > Join tab into the tab before it (Ctrl+Shift+J); dropping a pane on the tab strip makes it a tab again.
 - **Session manager.** Ctrl+Shift+S shows the hosts from `~/.ssh/config` in a side pane, hidden by default. Type to filter, Enter connects in this tab (Shift+Enter in a split), Ctrl+D marks a favourite. A `# folder: Name` comment above a `Host` groups hosts. View > Side pane on right moves it; drag its edge to resize it.
 - **PuTTY import.** File > Import PuTTY sessions reads PuTTY's saved SSH sessions (host, port, user, key file, font) into `%APPDATA%\FeroSSH\putty-sessions.conf` in ssh_config syntax. Your `~/.ssh/config` is never touched, and hosts it already has are skipped. PuTTY `.ppk` key files (v2 and v3) work for Ed25519 and ECDSA P-256; RSA `.ppk` keys work through Pageant.
+- **File transfer.** Ctrl+Shift+E shows the focused pane's host over SFTP in the side pane, on the same connection (no second login). Enter opens a folder or downloads a file, D downloads (folders whole), U or Ctrl+Shift+U uploads, Del deletes after asking, Tab moves to the transfer queue (Space pauses or resumes, R retries, X cancels, C clears finished ones). Drop files or folders from Explorer on a pane to upload them to the shell's current folder, after a confirmation. Downloads go to your Downloads folder (`DownloadFolder` in `ferossh.conf` changes it). Three files move at once; a dropped connection pauses the queue and it carries on, from where each file stopped, when you log in again. Session > Verify transfers compares SHA-256 on both ends after each file (the server needs `sha256sum`).
+- **Safe file names.** An existing file is never overwritten without asking (Overwrite, Skip or Keep both, Shift for all). A folder download does not follow links that lead outside the folder, and server names Windows cannot hold (`CON`, `a:b`, trailing dots, control characters) are made safe or refused. Partial files are `.part` locally and `.filepart` on the server until complete.
+- **Following `cd`.** The file view follows the shell's directory when the shell reports it with OSC 7. fish does by default; for bash, add this to `~/.bashrc` on the server: `PROMPT_COMMAND='printf "\e]7;file://%s%s\e\\" "$HOSTNAME" "$PWD"'`. View > File transfer follows cd (or F in the view) turns it off.
 - **Per-host look.** View > Font and View > Theme change the focused pane; Session > Save font and theme for this host keeps them for the next connection.
 
 - **Host keys.** A new host shows its SHA-256 fingerprint and randomart, and you type `yes` to trust it; the key is saved hashed to `known_hosts`. A changed key fills the window with a warning and cannot be bypassed: if you know why it changed, use Session > Replace host key..., which asks twice.
@@ -38,6 +41,7 @@ ferossh.exe --local [command]  # a local shell, as in milestone 2
 | Ctrl+Tab / Ctrl+Shift+Tab | Next tab, previous tab (Ctrl+Shift+PgUp/PgDn moves it) |
 | Ctrl+Shift+J | Join this tab into the tab before it, as a pane |
 | Ctrl+Shift+S | Session manager |
+| Ctrl+Shift+E / Ctrl+Shift+U | File transfer, upload files |
 | Ctrl+Shift+C / Ctrl+Shift+V | Copy the selection, paste (also Ctrl+Insert / Shift+Insert) |
 | Ctrl+Shift+F | Find in scrollback (Enter: older match, Shift+Enter: newer, Esc: close) |
 | Shift+PgUp / Shift+PgDn | Scroll back a page, forward a page (Ctrl+Shift+Home/End: top, bottom) |
@@ -91,7 +95,7 @@ Profile web1
 | [`worker`](crates/worker) | Sandboxed SSH worker: russh sessions, channels, forwards |
 | [`ipc`](crates/ipc) | UI/worker message types, framing and fuzz targets |
 | [`auth`](crates/auth) | Agent, Pageant, WebAuthn and CNG signing broker |
-| [`sftp`](crates/sftp) | Transfer queue and file-tree model |
+| [`sftp`](crates/sftp) | SFTP codec, transfer queue and file-tree model |
 | [`tmuxcc`](crates/tmuxcc) | tmux control-mode parser and layout mapping |
 | [`config`](crates/config) | `ssh_config` parser, known_hosts and PuTTY import |
 
@@ -105,7 +109,7 @@ cargo build --release -p ferossh
 
 The release profile optimises for size and links the C runtime statically, so `target\release\ferossh.exe` runs on a clean Windows 10 1903+ machine.
 
-Checks run in CI: `cargo fmt`, `cargo clippy`, `cargo test`, `cargo deny`, `cargo audit`, SSH tests against a real OpenSSH server on Linux (`cargo test -p ferossh-worker --test sshd`, skipped where `sshd` is not installed), and fuzz smoke runs of the IPC decoder and the terminal (`cargo +nightly fuzz run --target x86_64-unknown-linux-gnu term_feed`).
+Checks run in CI: `cargo fmt`, `cargo clippy`, `cargo test`, `cargo deny`, `cargo audit`, SSH tests against a real OpenSSH server on Linux (`cargo test -p ferossh-worker --test sshd`, skipped where `sshd` is not installed), and fuzz smoke runs of the IPC decoder, the SFTP decoder and the terminal (`cargo +nightly fuzz run --target x86_64-unknown-linux-gnu term_feed`).
 
 On Linux or macOS, `cargo run -p ferossh-term --example vttest -- 1 2 8` drives [vttest](https://invisible-island.net/vttest/) through the emulator and prints every screen as text.
 
