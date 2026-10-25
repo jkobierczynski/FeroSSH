@@ -9,7 +9,8 @@
 //! Other options: `-p port`, `-l user`, `--no-sandbox` (run the worker
 //! without the AppContainer, for hosts on localhost), and
 //! `--local [command]`, which opens a local shell through ConPTY as
-//! milestone 2 did.
+//! milestone 2 did. `--theme NAME`, before the rest, picks the pane's
+//! colour theme.
 
 #![cfg_attr(windows, windows_subsystem = "windows")]
 
@@ -52,6 +53,15 @@ fn quote(arg: &str) -> String {
         format!("\"{arg}\"")
     } else {
         arg.to_owned()
+    }
+}
+
+/// Takes a leading `--theme NAME` off the command line.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn take_theme(args: &[String]) -> (Option<String>, &[String]) {
+    match args {
+        [flag, name, rest @ ..] if flag == "--theme" => (Some(name.clone()), rest),
+        _ => (None, args),
     }
 }
 
@@ -111,7 +121,8 @@ fn main() -> windows::core::Result<()> {
         .skip(1)
         .map(|a| a.to_string_lossy().into_owned())
         .collect();
-    match parse_args(&args) {
+    let (theme, args) = take_theme(&args);
+    match parse_args(args) {
         Ok(Launch::Worker(input, output)) => {
             // No window and no files: just the network side.
             if let Some((input, output)) = sandbox::worker_pipes(&input, &output) {
@@ -119,7 +130,7 @@ fn main() -> windows::core::Result<()> {
             }
             Ok(())
         }
-        Ok(launch) => win::run(launch),
+        Ok(launch) => win::run(launch, theme),
         Err(e) => win::run_error(&e),
     }
 }
@@ -165,5 +176,17 @@ mod tests {
         assert!(parse(&["-x"]).is_err());
         assert!(parse(&["a", "b"]).is_err());
         assert!(parse(&["-p", "22"]).is_err());
+    }
+
+    #[test]
+    fn theme_comes_first() {
+        let args: Vec<String> = ["--theme", "Dracula", "host"]
+            .iter()
+            .map(|a| (*a).to_owned())
+            .collect();
+        let (theme, rest) = take_theme(&args);
+        assert_eq!(theme.as_deref(), Some("Dracula"));
+        assert_eq!(rest, ["host".to_owned()]);
+        assert_eq!(take_theme(rest).0, None);
     }
 }

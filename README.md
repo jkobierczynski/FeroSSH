@@ -40,6 +40,12 @@ ferossh.exe --local [command]  # a local shell, as in milestone 2
 
 Edit > Copy on select and Edit > Right-click pastes turn on the PuTTY habits; both are off by default.
 
+### Colour themes
+
+Built in: Nord (the default), Dracula, Catppuccin Mocha, Gruvbox Dark, Solarized Dark, Tokyo Night, One Dark, Monokai, Rosé Pine, Everforest, Campbell and One Half Light, plus two warning themes: **Production** (muted red background, red cursor) and **Staging** (amber). `ferossh.exe --theme Production prod-db` opens a session in a given theme, which is handy for desktop shortcuts until session profiles arrive.
+
+From milestone 4, the theme follows the host automatically: a host tagged `production`, `staging` or `development` with ssh_config's `Tag` keyword gets Production, Staging or Nord, and your own rules can match host patterns (`*.prod.example.com !prod-sandbox`) or tags, with an optional red or amber tint over any theme. The palettes are the themes' published terminal colours; all are MIT licensed except Tokyo Night's terminal port (Apache-2.0).
+
 ## Design
 
 - Native Win32 with DirectWrite/Direct2D rendering. No Electron, Qt or Java.

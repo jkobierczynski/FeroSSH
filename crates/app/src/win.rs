@@ -237,8 +237,8 @@ fn with_window<R>(f: impl FnOnce(&mut Window) -> R) -> Option<R> {
     })
 }
 
-pub fn run(launch: Launch) -> Result<()> {
-    let result = create_and_run(launch);
+pub fn run(launch: Launch, theme: Option<String>) -> Result<()> {
+    let result = create_and_run(launch, theme);
     if let Err(e) = &result {
         let text = HSTRING::from(format!("FeroSSH could not start:\n\n{}", e.message()));
         // SAFETY: plain message box with valid strings.
@@ -250,8 +250,8 @@ pub fn run(launch: Launch) -> Result<()> {
 /// A command line FeroSSH does not understand.
 pub fn run_error(problem: &str) -> Result<()> {
     let text = HSTRING::from(format!(
-        "{problem}\n\nUsage:\n  ferossh [-l user] [-p port] [--no-sandbox] [user@]host[:port]\n  \
-         ferossh --local [command]"
+        "{problem}\n\nUsage:\n  ferossh [--theme NAME] [-l user] [-p port] [--no-sandbox] [user@]host[:port]\n  \
+         ferossh [--theme NAME] --local [command]"
     ));
     // SAFETY: plain message box with valid strings.
     unsafe { MessageBoxW(None, &text, w!("FeroSSH"), MB_OK | MB_ICONERROR) };
@@ -297,7 +297,7 @@ fn timestamp() -> String {
     format!("{y:04}-{mo:02}-{d:02} {h:02}:{mi:02}:{s:02}")
 }
 
-fn create_and_run(launch: Launch) -> Result<()> {
+fn create_and_run(launch: Launch, theme: Option<String>) -> Result<()> {
     // SAFETY: plain Win32 calls on this thread with valid arguments; the
     // window procedure below upholds the WNDPROC contract.
     unsafe {
@@ -339,7 +339,8 @@ fn create_and_run(launch: Launch) -> Result<()> {
         // opened on.
         let dpi = GetDpiForWindow(hwnd);
         let font = FontSpec::default();
-        let theme = Theme::dark();
+        // An unknown theme name falls back to the default (Nord).
+        let theme = theme.and_then(|n| Theme::by_name(&n)).unwrap_or_default();
         let mut renderer = Renderer::new(hwnd, 1, 1)?;
         let metrics = renderer.metrics(&font, dpi)?;
         let (width, height) = window_size(&metrics, DEFAULT_COLS, DEFAULT_ROWS, dpi, true);
@@ -453,6 +454,10 @@ fn build_menu() -> Result<HMENU> {
         }
         let themes = CreatePopupMenu()?;
         for (id, theme) in (cmd::THEME..).zip(Theme::builtin()) {
+            // Group the warning themes and the Windows classics.
+            if matches!(theme.name, "Production" | "Campbell") {
+                separator(themes)?;
+            }
             item(themes, id, theme.name)?;
         }
 
@@ -1545,9 +1550,9 @@ impl Window {
                 }
             }
             id if (cmd::THEME..cmd::THEME + Theme::builtin().len() as u32).contains(&id) => {
-                if let Some(theme) = Theme::builtin().into_iter().nth((id - cmd::THEME) as usize) {
-                    self.pane.term.set_theme(&theme);
-                    self.pane.theme = theme;
+                if let Some(theme) = Theme::builtin().get((id - cmd::THEME) as usize) {
+                    self.pane.term.set_theme(theme);
+                    self.pane.theme = theme.clone();
                     self.update_menu_checks();
                     self.request_full_redraw();
                 }
