@@ -42,11 +42,8 @@ pub struct AgentKey {
 async fn list_from<S: AgentStream + Unpin + Send>(
     mut client: AgentClient<S>,
     agent: AgentKind,
-) -> Result<Vec<AgentKey>, String> {
-    let ids = client
-        .request_identities()
-        .await
-        .map_err(|e| e.to_string())?;
+) -> Result<Vec<AgentKey>, russh::keys::Error> {
+    let ids = client.request_identities().await?;
     Ok(ids
         .into_iter()
         .filter_map(|id| match id {
@@ -111,6 +108,10 @@ pub fn list(rt: &Runtime) -> (Vec<AgentKey>, Vec<String>) {
             if let Ok(c) = AgentClient::connect_pageant().await {
                 match list_from(c, AgentKind::Pageant).await {
                     Ok(k) => keys.extend(k),
+                    // Without Pageant's named pipe the client falls back to
+                    // window messages and "connects" even when Pageant is
+                    // not running; the first request then ends the stream.
+                    Err(e) if not_running(&e) => {}
                     Err(e) => notes.push(format!("Pageant: {e}")),
                 }
             }
@@ -130,6 +131,12 @@ pub fn list(rt: &Runtime) -> (Vec<AgentKey>, Vec<String>) {
         new
     });
     (keys, notes)
+}
+
+/// Whether an agent error just means nothing answered.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn not_running(e: &russh::keys::Error) -> bool {
+    matches!(e, russh::keys::Error::IO(io) if io.kind() == std::io::ErrorKind::UnexpectedEof)
 }
 
 /// Asks `agent` to sign `data` (already checked by [`crate::userauth`])
