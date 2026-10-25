@@ -58,6 +58,31 @@ jobs:
       - run: cargo test --locked -p ferossh tmux_e2e
       - run: cargo test --locked -p ferossh-auth keyfile
 
+  interop:
+    name: Interop against older and newer servers (Linux)
+    runs-on: ubuntu-latest
+    env:
+      FEROSSH_REQUIRE_INTEROP: 1
+      FEROSSH_REQUIRE_TMUX: 1
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup show active-toolchain
+      # One image per Ubuntu release: OpenSSH 7.6 to 10.x, Dropbear 2017 to
+      # 2025, tmux 2.6 to 3.6. See interop/Dockerfile.
+      - run: interop/build.sh
+      - run: cargo test --locked -p ferossh-worker --test interop -- --nocapture
+      # tmux below 3.4 is not covered yet: the test expects FeroSSH layout
+      # mode, which needs tmux 3.3.
+      - name: tmux control mode against tmux 3.4 and 3.6
+        run: |
+          for r in 24.04 26.04; do
+            id=$(docker run -d --entrypoint sleep ferossh-interop:$r infinity)
+            echo "::group::$(docker exec "$id" tmux -V)"
+            FEROSSH_TMUX_CONTAINER=$id cargo test --locked -p ferossh tmux_e2e
+            docker rm -f "$id" >/dev/null
+            echo "::endgroup::"
+          done
+
   deny:
     name: cargo deny
     runs-on: ubuntu-latest
