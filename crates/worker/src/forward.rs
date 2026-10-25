@@ -25,7 +25,7 @@ use russh::client::Msg;
 use russh::{Channel, ChannelMsg};
 use tokio::sync::mpsc;
 
-use crate::session::{Connections, Route};
+use crate::session::{Connection, Connections, Route};
 
 /// Data from the server held for a stream whose UI side is slow, before
 /// the worker stops reading it. russh then holds the rest, which in the
@@ -314,20 +314,29 @@ async fn finish(
 
 /// A program connected to a local or dynamic forward's listener: opens the
 /// `direct-tcpip` channel (after the SOCKS request, without a target) and
-/// relays.
+/// relays. A stream that `keep`s its connection holds it until the stream
+/// ends, and disconnects it then if nothing else holds it.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn open(
     channel: ChannelId,
     connection: ChannelId,
     target: Option<(String, u16)>,
     origin: (String, u16),
+    keep: bool,
     inbox: mpsc::UnboundedReceiver<Message>,
     out: mpsc::Sender<Message>,
     connections: Connections,
 ) {
     let mut stream = Stream::new(channel, out.clone(), inbox);
-    let result = open_stream(&mut stream, connection, target, origin, &connections).await;
+    let result = open_stream(&mut stream, connection, target, origin, keep, &connections).await;
     let result = match result {
-        Ok(ch) => stream.relay(ch, Vec::new()).await,
+        Ok((ch, held)) => {
+            let ended = stream.relay(ch, Vec::new()).await;
+            if let Some(conn) = held {
+                crate::sftp::release(conn).await;
+            }
+            ended
+        }
         Err(e) => Err(e),
     };
     finish(channel, result, &out, &connections).await;
@@ -338,8 +347,9 @@ async fn open_stream(
     connection: ChannelId,
     target: Option<(String, u16)>,
     origin: (String, u16),
+    keep: bool,
     connections: &Connections,
-) -> Result<Channel<Msg>, String> {
+) -> Result<(Channel<Msg>, Option<Arc<Connection>>), String> {
     let (host, port, socks) = match target {
         Some((host, port)) => (host, port, None),
         None => {
@@ -362,8 +372,8 @@ async fn open_stream(
         conn.channel_open_direct_tcpip(host.clone(), port.into(), origin.0, origin.1.into()),
     );
     let opened = stream.wait(opening).await;
-    // The stream must not keep the connection open.
-    drop(conn);
+    // Only a stream asked to keep the connection open holds it.
+    let held = keep.then_some(conn);
     let failed = |why: String| format!("{host}:{port}: {why}");
     let ch = match opened? {
         Ok(Ok(ch)) => ch,
@@ -399,7 +409,7 @@ async fn open_stream(
             port,
         })
         .await?;
-    Ok(ch)
+    Ok((ch, held))
 }
 
 /// The server opened a channel for a remote forward or for X11: checks an

@@ -31,7 +31,13 @@ mod encoding {
     pub const ZRLE: i32 = 16;
     /// Pseudo-encoding: the screen changed size.
     pub const DESKTOP_SIZE: i32 = -223;
+    /// Pseudo-encoding: the screen changed size, and the server takes
+    /// SetDesktopSize.
+    pub const EXTENDED_DESKTOP_SIZE: i32 = -308;
 }
+
+/// SetDesktopSize, the client message asking for a new screen size.
+const SET_DESKTOP_SIZE: u8 = 251;
 
 /// The longest reason or desktop name read.
 const MAX_TEXT: u32 = 64 * 1024;
@@ -200,6 +206,17 @@ pub struct Client {
     height: u16,
     zlib: Box<InflateState>,
     password: Option<Zeroizing<Vec<u8>>>,
+    /// The size the pane would like the screen to be.
+    want: Option<(u16, u16)>,
+    /// The server's screen id and flags, once it said it takes
+    /// SetDesktopSize.
+    screen: Option<(u32, u32)>,
+    /// A SetDesktopSize is out and not answered yet.
+    asked: bool,
+    /// The size the server last refused, not asked for again.
+    refused: Option<(u16, u16)>,
+    /// The screen changed size: the next request asks for all of it.
+    full: bool,
 }
 
 impl std::fmt::Debug for Client {
@@ -261,6 +278,11 @@ impl Client {
             height: 0,
             zlib: InflateState::new_boxed(miniz_oxide::DataFormat::Zlib),
             password: None,
+            want: None,
+            screen: None,
+            asked: false,
+            refused: None,
+            full: false,
         }
     }
 
@@ -321,6 +343,62 @@ impl Client {
             self.output.extend(x.to_be_bytes());
             self.output.extend(y.to_be_bytes());
         }
+    }
+
+    /// The pane is `width` x `height`: a server that takes SetDesktopSize
+    /// is asked to make the screen that size; the others keep theirs and
+    /// the window scales the picture.
+    pub fn resize(&mut self, width: u16, height: u16) {
+        let size = (width.clamp(1, MAX_SIDE), height.clamp(1, MAX_SIDE));
+        if usize::from(size.0) * usize::from(size.1) > MAX_PIXELS {
+            return;
+        }
+        self.want = Some(size);
+        self.ask_size();
+    }
+
+    /// Sends SetDesktopSize when the server takes it and the screen is
+    /// not the size wanted.
+    fn ask_size(&mut self) {
+        let (Some((w, h)), Some((id, flags))) = (self.want, self.screen) else {
+            return;
+        };
+        if self.asked
+            || (w, h) == (self.width, self.height)
+            || self.refused == Some((w, h))
+            || !matches!(
+                self.state,
+                State::Normal | State::Update(_) | State::Rect { .. } | State::Hextile { .. }
+            )
+        {
+            return;
+        }
+        self.asked = true;
+        self.output.extend([SET_DESKTOP_SIZE, 0]);
+        self.output.extend(w.to_be_bytes());
+        self.output.extend(h.to_be_bytes());
+        self.output.extend([1, 0]);
+        self.output.extend(id.to_be_bytes());
+        self.output.extend([0, 0, 0, 0]);
+        self.output.extend(w.to_be_bytes());
+        self.output.extend(h.to_be_bytes());
+        self.output.extend(flags.to_be_bytes());
+    }
+
+    /// The screen is now `width` x `height`, blank until drawn.
+    fn new_size(&mut self, width: u16, height: u16) -> Result<(), String> {
+        if !size_ok(width, height) {
+            return Err(format!(
+                "The remote screen is now {width}x{height}, larger than FeroSSH shows."
+            ));
+        }
+        if (width, height) != (self.width, self.height) {
+            self.width = width;
+            self.height = height;
+            self.full = true;
+            self.events.push(Event::Size { width, height });
+        }
+        Ok(())
     }
 
     /// Takes bytes from the server.
@@ -577,8 +655,10 @@ impl Client {
                 Step::Done(r.pos)
             }
             State::Update(0) => {
-                self.request(true);
+                let full = std::mem::take(&mut self.full);
+                self.request(!full);
                 self.state = State::Normal;
+                self.ask_size();
                 Step::Done(0)
             }
             State::Update(left) => {
@@ -594,7 +674,11 @@ impl Client {
                     width,
                     height,
                 };
-                if encoding != encoding::DESKTOP_SIZE && !self.on_screen(rect) {
+                let pseudo = matches!(
+                    encoding,
+                    encoding::DESKTOP_SIZE | encoding::EXTENDED_DESKTOP_SIZE
+                );
+                if !pseudo && !self.on_screen(rect) {
                     return Step::Fail(format!(
                         "The VNC server drew a {width}x{height} rectangle at {x},{y}, off its \
                          {}x{} screen.",
@@ -733,18 +817,33 @@ impl Client {
                 }
             }
             encoding::DESKTOP_SIZE => {
-                if !size_ok(rect.width, rect.height) {
-                    return Step::Fail(format!(
-                        "The remote screen is now {}x{}, larger than FeroSSH shows.",
-                        rect.width, rect.height
-                    ));
+                if let Err(why) = self.new_size(rect.width, rect.height) {
+                    return Step::Fail(why);
                 }
-                self.width = rect.width;
-                self.height = rect.height;
-                self.events.push(Event::Size {
-                    width: rect.width,
-                    height: rect.height,
-                });
+            }
+            encoding::EXTENDED_DESKTOP_SIZE => {
+                // x is why (1: our request), y the status (0: done).
+                let n = need!(r.u8());
+                need!(r.bytes(3));
+                let screens = need!(r.bytes(usize::from(n) * 16));
+                let be32 = |b: &[u8]| b.try_into().map(u32::from_be_bytes).unwrap_or(0);
+                if let Some(first) = screens.get(..16) {
+                    let id = be32(first.get(..4).unwrap_or_default());
+                    let flags = be32(first.get(12..).unwrap_or_default());
+                    self.screen = Some((id, flags));
+                }
+                let (why, status) = (rect.x, rect.y);
+                if why == 1 {
+                    self.asked = false;
+                    if status != 0 {
+                        self.refused = self.want;
+                    }
+                }
+                if status == 0
+                    && let Err(why) = self.new_size(rect.width, rect.height)
+                {
+                    return Step::Fail(why);
+                }
             }
             e => {
                 return Step::Fail(format!(
@@ -792,6 +891,7 @@ impl Client {
             encoding::RRE,
             encoding::COPY_RECT,
             encoding::RAW,
+            encoding::EXTENDED_DESKTOP_SIZE,
             encoding::DESKTOP_SIZE,
         ];
         self.output.extend([2, 0]);
@@ -1144,9 +1244,9 @@ mod tests {
                 },
             ]
         );
-        // The update is over: ask for the next, incrementally.
+        // The update is over and the screen is new: ask for all of it.
         let out = c.take_output();
-        assert_eq!(out, [3, 1, 0, 0, 0, 0, 0, 16, 0, 4]);
+        assert_eq!(out, [3, 0, 0, 0, 0, 0, 0, 16, 0, 4]);
     }
 
     #[test]
@@ -1221,5 +1321,61 @@ mod tests {
         assert_eq!(c.take_events(), [Event::Bell]);
         c.feed(&[0xee]);
         assert!(matches!(&c.take_events()[..], [Event::Failed(_)]));
+    }
+    #[test]
+    fn asks_a_server_that_can_for_the_pane_size() {
+        let mut c = logged_in(8, 8);
+        c.resize(640, 480);
+        assert!(
+            c.take_output().is_empty(),
+            "not before the server says it can"
+        );
+        // The first update says the server takes SetDesktopSize: screen 7.
+        let mut msg = vec![0, 0, 0, 1];
+        msg.extend(rect_header(0, 0, 8, 8, encoding::EXTENDED_DESKTOP_SIZE));
+        msg.extend([1, 0, 0, 0]);
+        msg.extend(7u32.to_be_bytes());
+        msg.extend([0, 0, 0, 0, 0, 8, 0, 8]);
+        msg.extend(0u32.to_be_bytes());
+        c.feed(&msg);
+        assert!(c.take_events().is_empty(), "the same size");
+        let out = c.take_output();
+        assert_eq!(&out[..10], [3, 1, 0, 0, 0, 0, 0, 8, 0, 8]);
+        let mut want = vec![251, 0, 2, 128, 1, 224, 1, 0];
+        want.extend(7u32.to_be_bytes());
+        want.extend([0, 0, 0, 0, 2, 128, 1, 224]);
+        want.extend(0u32.to_be_bytes());
+        assert_eq!(&out[10..], want);
+        // Only one request at a time.
+        c.resize(800, 600);
+        assert!(c.take_output().is_empty());
+        // The server did it: a new screen, drawn in full; then the newer
+        // size goes out.
+        let mut msg = vec![0, 0, 0, 1];
+        msg.extend(rect_header(1, 0, 640, 480, encoding::EXTENDED_DESKTOP_SIZE));
+        msg.extend([1, 0, 0, 0]);
+        msg.extend(7u32.to_be_bytes());
+        msg.extend([0, 0, 0, 0, 2, 128, 1, 224]);
+        msg.extend(0u32.to_be_bytes());
+        c.feed(&msg);
+        assert_eq!(
+            c.take_events(),
+            [Event::Size {
+                width: 640,
+                height: 480
+            }]
+        );
+        let out = c.take_output();
+        assert_eq!(&out[..10], [3, 0, 0, 0, 0, 0, 2, 128, 1, 224]);
+        assert_eq!(&out[10..16], [251, 0, 3, 32, 2, 88]);
+        // Refused: the screen stays, and that size is not asked again.
+        let mut msg = vec![0, 0, 0, 1];
+        msg.extend(rect_header(1, 3, 640, 480, encoding::EXTENDED_DESKTOP_SIZE));
+        msg.extend([0, 0, 0, 0]);
+        c.feed(&msg);
+        assert!(c.take_events().is_empty());
+        assert_eq!(c.take_output(), [3, 1, 0, 0, 0, 0, 2, 128, 1, 224]);
+        c.resize(800, 600);
+        assert!(c.take_output().is_empty());
     }
 }

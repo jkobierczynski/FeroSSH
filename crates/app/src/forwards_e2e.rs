@@ -4,7 +4,8 @@
 //! from this process; a remote forward and X11 from the shell on the
 //! server, with a stand-in X server here that checks it gets the real
 //! cookie. A remote desktop tunnel goes to the echo server as if it were
-//! an RDP server, after one to a closed port is refused. Skipped where
+//! an RDP server, after one to a closed port is refused, and still works
+//! after the shell exited. Skipped where
 //! `sshd` or `ssh-keygen` is missing; the X11 part also needs `xauth`.
 
 #![allow(
@@ -161,8 +162,9 @@ fn desktop_event(forwarder: &Forwarder) -> DesktopEvent {
     }
 }
 
-/// Opens a remote desktop on a closed port, then on the echo server.
-fn desktop_side(forwarder: &Forwarder, connection: ChannelId, echo: u16, closed: u16) {
+/// Opens a remote desktop on a closed port, then on the echo server, and
+/// returns the desktop's open stream.
+fn desktop_side(forwarder: &Forwarder, connection: ChannelId, echo: u16, closed: u16) -> TcpStream {
     forwarder.open_desktop(connection, closed, 0);
     match desktop_event(forwarder) {
         DesktopEvent::Failed { why, .. } => {
@@ -175,7 +177,8 @@ fn desktop_side(forwarder: &Forwarder, connection: ChannelId, echo: u16, closed:
         panic!("the desktop tunnel failed");
     };
     let s = TcpStream::connect(addr.as_str()).unwrap();
-    assert_eq!(echo_through(s, b"rdp"), b"rdp");
+    assert_eq!(echo_through(s.try_clone().unwrap(), b"rdp"), b"rdp");
+    s
 }
 
 #[test]
@@ -254,7 +257,7 @@ fn local_remote_dynamic_and_x11_forwards() {
 
     let mut effects = session.start(80, 24);
     let (mut shown, mut output) = (String::new(), String::new());
-    let mut client: Option<std::thread::JoinHandle<()>> = None;
+    let mut client: Option<std::thread::JoinHandle<TcpStream>> = None;
     let (mut sent_command, mut sent_exit) = (false, false);
     let deadline = Instant::now() + Duration::from_secs(60);
     loop {
@@ -309,7 +312,7 @@ fn local_remote_dynamic_and_x11_forwards() {
                 let (fw, conn) = (forwarder.clone(), session.connection);
                 client = Some(std::thread::spawn(move || {
                     local_side(local, dynamic, echo, closed_target);
-                    desktop_side(&fw, conn, echo, closed_target);
+                    desktop_side(&fw, conn, echo, closed_target)
                 }));
                 effects.extend(session.input(command.as_bytes()));
                 continue;
@@ -344,7 +347,9 @@ fn local_remote_dynamic_and_x11_forwards() {
     if x11 {
         assert!(output.contains("X=XOK"), "{shown}\n{output}");
     }
-    client.expect("forwards never listened").join().unwrap();
+    let desktop = client.expect("forwards never listened").join().unwrap();
+    // The shell is gone, but the remote desktop keeps the connection.
+    assert_eq!(echo_through(desktop, b"still here"), b"still here");
 
     let view = forwarder.view();
     let conn = view.first().expect("the connection's forwards");

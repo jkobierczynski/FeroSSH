@@ -78,6 +78,8 @@ pub struct Desktop {
     dirty: Option<(u32, u32, u32, u32)>,
     phase: Phase,
     buttons: u8,
+    /// The pane size the viewer was last given.
+    size: (u16, u16),
     /// Keeps the viewer process alive; dropping it ends the process.
     _process: Box<dyn Send>,
 }
@@ -209,6 +211,7 @@ impl Desktop {
             dirty: None,
             phase: Phase::Connecting,
             buttons: 0,
+            size: (session.width, session.height),
             _process: process,
         })
     }
@@ -440,6 +443,15 @@ impl Desktop {
         }
     }
 
+    /// The pane is now `width` x `height` pixels: a server that can gives
+    /// the desktop that size; the picture of one that cannot is scaled.
+    pub fn resize(&mut self, width: u16, height: u16) {
+        if (width, height) != self.size && !matches!(self.phase, Phase::Ended) {
+            self.size = (width, height);
+            self.send(ToViewer::Resize { width, height });
+        }
+    }
+
     /// The pane lost the keyboard: let go of held modifiers.
     pub fn focus_lost(&mut self) {
         if self.running() {
@@ -497,8 +509,8 @@ mod tests {
             init.extend(4u32.to_be_bytes());
             init.extend(b"desk");
             out.write_all(&init).unwrap();
-            // SetPixelFormat 20, SetEncodings 4 + 6*4, request 10.
-            read(20 + 4 + 24 + 10);
+            // SetPixelFormat 20, SetEncodings 4 + 7*4, request 10.
+            read(20 + 4 + 28 + 10);
             let mut update = vec![0, 0, 0, 1, 0, 0, 0, 0, 0, 3, 0, 2, 0, 0, 0, 0];
             for p in 0..6u8 {
                 update.extend([p, 0, 0, 0]);
@@ -550,8 +562,8 @@ mod tests {
         assert_eq!(img.dirty, Some((0, 0, 3, 2)));
         d.drawn();
         assert_eq!(d.image(7).unwrap().dirty, None);
-        // Letters come as characters; Enter as a key. A 300x200 area
-        // shows the 3x2 screen unscaled in its middle.
+        // Letters come as characters; Enter as a key. The 3x2 screen
+        // fills a 300x200 area.
         assert!(!d.key(0x41, false, 0x1e, true));
         d.char('a');
         d.mouse((0, 0, 300, 200), 149, 100, Some((1, true)));

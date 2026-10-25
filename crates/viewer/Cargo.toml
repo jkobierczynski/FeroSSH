@@ -17,6 +17,8 @@ rdp = [
     "dep:ironrdp-blocking",
     "dep:ironrdp-connector",
     "dep:ironrdp-core",
+    "dep:ironrdp-displaycontrol",
+    "dep:ironrdp-dvc",
     "dep:ironrdp-graphics",
     "dep:ironrdp-input",
     "dep:ironrdp-pdu",
@@ -38,6 +40,10 @@ zeroize = "1.9"
 ironrdp-blocking = { version = "0.11", optional = true }
 ironrdp-connector = { version = "0.11", optional = true }
 ironrdp-core = { version = "0.3", optional = true }
+# Display Control (MS-RDPEDISP), over the dynamic channels, so the
+# desktop follows the pane's size.
+ironrdp-displaycontrol = { version = "0.9", optional = true }
+ironrdp-dvc = { version = "0.9", optional = true }
 ironrdp-graphics = { version = "0.10", optional = true }
 ironrdp-input = { version = "0.8", optional = true }
 ironrdp-pdu = { version = "0.10", optional = true }

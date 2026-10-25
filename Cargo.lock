@@ -946,6 +946,8 @@ dependencies = [
  "ironrdp-blocking",
  "ironrdp-connector",
  "ironrdp-core",
+ "ironrdp-displaycontrol",
+ "ironrdp-dvc",
  "ironrdp-graphics",
  "ironrdp-input",
  "ironrdp-pdu",
