@@ -19,7 +19,7 @@ ferossh.exe --local [command]  # a local shell, as in milestone 2
 
 `HostName`, `User`, `Port`, `IdentityFile`, `Tag` and `Include` are read from `~/.ssh/config`.
 
-- **Tabs and splits.** The window starts with one pane and no tab strip. Ctrl+Shift+T opens a tab, Alt+Shift+= and Alt+Shift+- split the pane; the tab strip appears once there are two tabs. A new tab or pane on a host you are already logged in to opens another channel on the same connection, so there is no second login. Drag a divider to resize, drag a tab to reorder, and Ctrl+Shift+drag a pane onto another pane's edge to move it there (or its middle to swap them).
+- **Tabs and splits.** The window starts with one pane and no tab strip. Ctrl+Shift+T opens a tab, Alt+Shift+= and Alt+Shift+- split the pane; the tab strip appears once there are two tabs. A new tab or pane on a host you are already logged in to opens another channel on the same connection, so there is no second login. Drag a divider to resize, drag a tab to reorder, and Ctrl+Shift+drag a pane onto another pane's edge to move it there (or its middle to swap them). To merge a tab back in as a pane, drag the tab down out of the strip onto a pane of the tab that appears, or use Window > Join tab into the tab before it (Ctrl+Shift+J); dropping a pane on the tab strip makes it a tab again.
 - **Session manager.** Ctrl+Shift+S shows the hosts from `~/.ssh/config` in a side pane, hidden by default. Type to filter, Enter connects in this tab (Shift+Enter in a split), Ctrl+D marks a favourite. A `# folder: Name` comment above a `Host` groups hosts. View > Side pane on right moves it; drag its edge to resize it.
 - **PuTTY import.** File > Import PuTTY sessions reads PuTTY's saved SSH sessions (host, port, user, key file, font) into `%APPDATA%\FeroSSH\putty-sessions.conf` in ssh_config syntax. Your `~/.ssh/config` is never touched, and hosts it already has are skipped. PuTTY `.ppk` key files (v2 and v3) work for Ed25519 and ECDSA P-256; RSA `.ppk` keys work through Pageant.
 - **Per-host look.** View > Font and View > Theme change the focused pane; Session > Save font and theme for this host keeps them for the next connection.
@@ -36,6 +36,7 @@ ferossh.exe --local [command]  # a local shell, as in milestone 2
 | Alt+Shift+= / Alt+Shift+- | Split right, split down |
 | Alt+arrows / Alt+Shift+arrows | Focus the pane in that direction, grow the pane |
 | Ctrl+Tab / Ctrl+Shift+Tab | Next tab, previous tab (Ctrl+Shift+PgUp/PgDn moves it) |
+| Ctrl+Shift+J | Join this tab into the tab before it, as a pane |
 | Ctrl+Shift+S | Session manager |
 | Ctrl+Shift+C / Ctrl+Shift+V | Copy the selection, paste (also Ctrl+Insert / Shift+Insert) |
 | Ctrl+Shift+F | Find in scrollback (Enter: older match, Shift+Enter: newer, Esc: close) |
