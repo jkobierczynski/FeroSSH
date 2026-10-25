@@ -40,7 +40,7 @@ use std::fmt;
 use zeroize::Zeroize;
 
 /// Protocol version carried in every frame. Bump on any wire change.
-pub const PROTOCOL_VERSION: u8 = 5;
+pub const PROTOCOL_VERSION: u8 = 6;
 
 /// Largest frame body accepted, in bytes. Terminal and SFTP data is chunked
 /// below this, so anything larger is a bug or an attack.
@@ -315,6 +315,8 @@ pub enum Message {
         rows: u16,
         host_key_algs: Vec<String>,
         x11: Option<X11Auth>,
+        /// Also offer the legacy algorithm set (`LegacyAlgorithms yes`).
+        legacy: bool,
     },
     /// Open another shell on the connection that `connection` (a channel
     /// that made it with [`Message::Connect`]) belongs to. No new login:
@@ -776,6 +778,7 @@ pub fn encode(msg: &Message, out: &mut Vec<u8>) -> Result<(), Error> {
             rows,
             host_key_algs,
             x11,
+            legacy,
         } => {
             w.u32(*channel);
             w.str(host);
@@ -785,6 +788,7 @@ pub fn encode(msg: &Message, out: &mut Vec<u8>) -> Result<(), Error> {
             w.u16(*rows);
             w.list(host_key_algs, |w, s| w.str(s));
             w.x11(x11);
+            w.bool(*legacy);
         }
         Message::HostKeyVerdict { channel, accept } => {
             w.u32(*channel);
@@ -1036,6 +1040,7 @@ fn decode_body(body: &[u8]) -> Result<Message, Error> {
             rows: r.u16()?,
             host_key_algs: r.list(Reader::string)?,
             x11: r.x11()?,
+            legacy: r.bool()?,
         },
         5 => Message::HostKeyVerdict {
             channel: r.u32()?,
@@ -1378,6 +1383,7 @@ mod tests {
                 rows: 24,
                 host_key_algs: vec!["ssh-ed25519".into(), "rsa-sha2-512".into()],
                 x11: None,
+                legacy: false,
             },
             Message::Connect {
                 channel: 3,
@@ -1392,6 +1398,7 @@ mod tests {
                     protocol: "MIT-MAGIC-COOKIE-1".into(),
                     cookie: vec![0xab; 16],
                 }),
+                legacy: true,
             },
             Message::HostKeyVerdict {
                 channel: 1,

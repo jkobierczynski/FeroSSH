@@ -20,6 +20,8 @@
 //!     Theme Dracula
 //!     Tmux main
 //!     TmuxLayout ferossh
+//! Profile core-switch
+//!     LegacyAlgorithms yes
 //! ```
 //!
 //! FeroSSH rewrites the file when a setting changes. Unknown keywords are
@@ -46,6 +48,10 @@ pub struct Profile {
     /// The tmux layout for new sessions: `ferossh` (one window per pane)
     /// or `tmux` (tmux's own splits).
     pub tmux_layout: Option<String>,
+    /// Also offer the legacy algorithm set (ECDH NIST curves, DH groups
+    /// 14 to 18 with SHA-2, AES-CTR, plain HMAC-SHA-2) for older switches,
+    /// routers and servers.
+    pub legacy_algorithms: bool,
 }
 
 impl Profile {
@@ -56,6 +62,7 @@ impl Profile {
             && self.scrollback.is_none()
             && self.tmux.is_none()
             && self.tmux_layout.is_none()
+            && !self.legacy_algorithms
     }
 }
 
@@ -255,6 +262,10 @@ impl Settings {
                             "tmux" => {
                                 p.tmux = first.filter(|t| !t.eq_ignore_ascii_case("no"));
                             }
+                            "legacyalgorithms" => {
+                                p.legacy_algorithms =
+                                    first.is_some_and(|v| v.eq_ignore_ascii_case("yes"));
+                            }
                             "tmuxlayout" => {
                                 p.tmux_layout = first
                                     .map(|l| l.to_ascii_lowercase())
@@ -358,6 +369,9 @@ impl Settings {
             if let Some(l) = &p.tmux_layout {
                 let _ = writeln!(out, "    TmuxLayout {l}");
             }
+            if p.legacy_algorithms {
+                let _ = writeln!(out, "    LegacyAlgorithms yes");
+            }
         }
         out
     }
@@ -445,12 +459,14 @@ Profile web
     Scrollback 99999999
     Tmux work
     TmuxLayout TMUX
+    LegacyAlgorithms YES
     Unknown thing
 Profile big
     FontSize 400
     Theme Solarized Dark
     Tmux no
     TmuxLayout split
+    LegacyAlgorithms maybe
 NewKeyword later
 "#;
 
@@ -475,6 +491,7 @@ NewKeyword later
         assert_eq!(web.scrollback, Some(1_000_000));
         assert_eq!(web.tmux.as_deref(), Some("work"));
         assert_eq!(web.tmux_layout.as_deref(), Some("tmux"));
+        assert!(web.legacy_algorithms);
         assert_eq!(s.scrollback, Some(50_000));
         assert_eq!(s.download_folder.as_deref(), Some("D:\\My Transfers"));
         assert!(s.verify_transfers);
@@ -486,6 +503,7 @@ NewKeyword later
         assert_eq!(big.theme.as_deref(), Some("Solarized Dark"));
         assert_eq!(big.tmux, None, "tmux stays off unless a session is named");
         assert_eq!(big.tmux_layout, None);
+        assert!(!big.legacy_algorithms, "only `yes` turns it on");
     }
 
     #[test]

@@ -16,6 +16,7 @@ use ferossh_auth::{Identity, Job, KeyFileSpec, Reply, SignError, Source, useraut
 use ferossh_config::known_hosts::{self, KnownHosts, Status};
 use ferossh_config::{ForwardSpec, hostkey, ssh_config};
 use ferossh_ipc::{ChannelId, MAX_DATA_CHUNK, Message, PromptField, PromptKind, Secrets, X11Auth};
+use ferossh_worker::crypto_policy;
 use zeroize::Zeroizing;
 
 /// Wrong passphrases allowed per key before it is skipped.
@@ -23,6 +24,7 @@ const PASSPHRASE_TRIES: u8 = 3;
 
 const DIM: &str = "\x1b[0;90m";
 const RED: &str = "\x1b[0;31m";
+const AMBER: &str = "\x1b[0;33m";
 const BOLD: &str = "\x1b[1m";
 const RESET: &str = "\x1b[0m";
 
@@ -185,6 +187,10 @@ pub struct SshSession {
     pub exit_code: Option<u32>,
     /// X11 forwarding for the shell, when the host has it on.
     pub x11: Option<X11Auth>,
+    /// Also offer the legacy algorithms (`LegacyAlgorithms yes`).
+    pub legacy: bool,
+    /// The connection negotiated one of the legacy algorithms.
+    legacy_in_use: bool,
 }
 
 impl std::fmt::Debug for SshSession {
@@ -234,7 +240,15 @@ impl SshSession {
             changed_key: None,
             exit_code: None,
             x11: None,
+            legacy: false,
+            legacy_in_use: false,
         }
+    }
+
+    /// Whether the connection uses one of the opt-in legacy algorithms,
+    /// which the tab's badge shows.
+    pub fn legacy_in_use(&self) -> bool {
+        self.legacy_in_use && self.state == State::Connected
     }
 
     pub fn state(&self) -> State {
@@ -274,6 +288,7 @@ impl SshSession {
                 rows,
                 host_key_algs,
                 x11: self.x11.clone(),
+                legacy: self.legacy,
             }),
         ]
     }
@@ -368,7 +383,26 @@ impl SshSession {
             } => {
                 self.state = State::Connected;
                 let text = format!("Connected ({kex}, {cipher}, {host_key} host key).");
-                vec![Effect::Show(dim(&sanitize(&text))), Effect::Connected]
+                let mut effects = vec![Effect::Show(dim(&sanitize(&text)))];
+                let old: Vec<&str> = [&kex, &cipher, &host_key]
+                    .into_iter()
+                    .map(String::as_str)
+                    .filter(|n| crypto_policy::is_legacy(n))
+                    .collect();
+                self.legacy_in_use = !old.is_empty();
+                if self.legacy_in_use {
+                    let text = format!(
+                        "Using legacy algorithms ({}), allowed by LegacyAlgorithms in this \
+                         host's profile.",
+                        old.join(", ")
+                    );
+                    effects.push(Effect::Show(format!(
+                        "{AMBER}{}{RESET}\r\n",
+                        sanitize(&text)
+                    )));
+                }
+                effects.push(Effect::Connected);
+                effects
             }
             Message::Data { bytes, .. } => vec![Effect::Output(bytes)],
             Message::ExitStatus { code, .. } => {
@@ -840,6 +874,42 @@ mod tests {
         let t = Target::resolve("root@other:23", &e).unwrap();
         assert_eq!(t.label(), "root@other:23");
         assert!(Target::resolve("bad host", &e).is_none());
+    }
+
+    #[test]
+    fn legacy_algorithms_are_asked_for_and_flagged() {
+        let dir = temp("legacy");
+        let e = env(&dir);
+        let mut s = SshSession::new(1, Target::resolve("prod", &e).unwrap(), e.known_hosts());
+        let fx = s.start(80, 24);
+        assert!(matches!(
+            sent(&fx)[..],
+            [Message::Connect { legacy: false, .. }]
+        ));
+        s.legacy = true;
+        let fx = s.start(80, 24);
+        assert!(matches!(
+            sent(&fx)[..],
+            [Message::Connect { legacy: true, .. }]
+        ));
+
+        let connected = |kex: &str, cipher: &str| Message::Connected {
+            channel: 1,
+            kex: kex.into(),
+            cipher: cipher.into(),
+            host_key: "ssh-ed25519".into(),
+        };
+        // Offered but not needed: no badge.
+        let fx = s.on_worker(connected("curve25519-sha256", "aes256-gcm@openssh.com"));
+        assert!(!s.legacy_in_use());
+        assert!(!shown(&fx).contains("legacy"));
+        let fx = s.on_worker(connected("ecdh-sha2-nistp256", "aes256-ctr"));
+        assert!(s.legacy_in_use());
+        assert!(
+            shown(&fx).contains("Using legacy algorithms (ecdh-sha2-nistp256, aes256-ctr)"),
+            "{}",
+            shown(&fx)
+        );
     }
 
     #[test]

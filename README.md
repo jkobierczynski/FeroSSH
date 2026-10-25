@@ -100,6 +100,7 @@ Profile web1
 - Native Win32 with DirectWrite/Direct2D rendering. No Electron, Qt or Java.
 - Two processes: a UI process that never parses network data, and an AppContainer-sandboxed SSH worker that never sees private keys or your files.
 - Modern crypto only. Post-quantum `mlkem768x25519-sha256` key exchange first; no SHA-1, CBC, DSA or `ssh-rsa` signatures (see [`crypto_policy.rs`](crates/worker/src/crypto_policy.rs)).
+- Older switches, routers and SSH servers that lack those can be allowed per host with `LegacyAlgorithms yes` in the host's `Profile` in `ferossh.conf`. This adds ECDH on NIST curves, DH groups 14 to 18 with SHA-2, AES-CTR and plain HMAC-SHA-2, still with no SHA-1, CBC or DSA. A tab that uses them shows an amber `⚠`, and when a connection fails for lack of them FeroSSH says so. A server without strict key exchange (Terrapin) gets AES-GCM instead of ChaCha20-Poly1305.
 - Keys stay in the Windows OpenSSH agent, Pageant, a FIDO2 token or the TPM. Passwords are never stored.
 - OpenSSH `ssh_config` is the session format.
 

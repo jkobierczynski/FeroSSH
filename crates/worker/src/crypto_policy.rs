@@ -1,8 +1,10 @@
 //! The only algorithms FeroSSH will negotiate.
 //!
 //! russh compiles legacy algorithms in unconditionally, so this list is the
-//! enforcement point: every client config is built from [`preferred`], and no
-//! per-host setting may add to it. The tests below fail if a banned
+//! enforcement point: every client config is built from [`preferred`], and
+//! the only per-host addition is [`with_legacy`], an opt-in set for older
+//! switches, routers and SSH servers that is still free of SHA-1, CBC, DSA,
+//! small DH groups and compression. The tests below fail if a banned
 //! algorithm ever appears.
 
 use std::borrow::Cow;
@@ -42,6 +44,31 @@ const HOST_KEYS: &[Algorithm] = &[
 ];
 
 const COMPRESSION: &[compression::Name] = &[compression::NONE];
+
+/// The opt-in legacy set (`LegacyAlgorithms yes` in a host's profile),
+/// tried after everything above.
+const LEGACY_KEX: &[kex::Name] = &[
+    kex::ECDH_SHA2_NISTP256,
+    kex::ECDH_SHA2_NISTP384,
+    kex::ECDH_SHA2_NISTP521,
+    kex::DH_G16_SHA512,
+    kex::DH_G18_SHA512,
+    kex::DH_G14_SHA256,
+];
+
+const LEGACY_CIPHERS: &[cipher::Name] = &[cipher::AES_256_CTR, cipher::AES_128_CTR];
+
+/// Plain (encrypt-and-MAC) HMACs: many switches offer no EtM ones.
+const LEGACY_MACS: &[mac::Name] = &[mac::HMAC_SHA512, mac::HMAC_SHA256];
+
+const LEGACY_HOST_KEYS: &[Algorithm] = &[
+    Algorithm::Ecdsa {
+        curve: EcdsaCurve::NistP384,
+    },
+    Algorithm::Ecdsa {
+        curve: EcdsaCurve::NistP521,
+    },
+];
 
 /// Minimum RSA modulus size accepted for host and user keys.
 pub const MIN_RSA_BITS: usize = 3072;
@@ -84,9 +111,10 @@ pub fn preferred_for(known_types: &[String]) -> Preferred {
     }
 }
 
-/// `p` without ChaCha20-Poly1305, for a server that lacks strict key
-/// exchange (Terrapin, CVE-2023-48795). AES-GCM is not affected.
-pub fn without_chacha(p: Preferred) -> Preferred {
+/// `p` without what [`terrapin_prone`] rejects, for a server that lacks
+/// strict key exchange: no ChaCha20-Poly1305, and no EtM MACs (which only
+/// the legacy CTR ciphers use).
+pub fn without_terrapin(p: Preferred) -> Preferred {
     Preferred {
         cipher: Cow::Owned(
             p.cipher
@@ -95,8 +123,57 @@ pub fn without_chacha(p: Preferred) -> Preferred {
                 .cloned()
                 .collect(),
         ),
+        mac: Cow::Owned(
+            p.mac
+                .iter()
+                .filter(|m| !m.as_ref().ends_with("-etm@openssh.com"))
+                .cloned()
+                .collect(),
+        ),
         ..p
     }
+}
+
+/// `p` with the legacy set appended, each list keeping its order.
+pub fn with_legacy(p: Preferred) -> Preferred {
+    fn add<T: Clone>(list: &[T], more: &[T]) -> Vec<T> {
+        list.iter().chain(more).cloned().collect()
+    }
+    // The strict-kex and ext-info markers stay last.
+    let (algs, markers): (Vec<_>, Vec<_>) = p.kex.iter().cloned().partition(|k| {
+        *k != kex::EXTENSION_SUPPORT_AS_CLIENT && *k != kex::EXTENSION_OPENSSH_STRICT_KEX_AS_CLIENT
+    });
+    Preferred {
+        kex: Cow::Owned([algs, LEGACY_KEX.to_vec(), markers].concat()),
+        key: Cow::Owned(add(&p.key, LEGACY_HOST_KEYS)),
+        cipher: Cow::Owned(add(&p.cipher, LEGACY_CIPHERS)),
+        mac: Cow::Owned(add(&p.mac, LEGACY_MACS)),
+        ..p
+    }
+}
+
+/// Whether `name` (a kex, cipher, MAC or host key algorithm) is only in
+/// the legacy set, so a connection that negotiated it gets the warning
+/// badge.
+pub fn is_legacy(name: &str) -> bool {
+    LEGACY_KEX.iter().any(|n| n.as_ref() == name)
+        || LEGACY_CIPHERS.iter().any(|n| n.as_ref() == name)
+        || LEGACY_MACS.iter().any(|n| n.as_ref() == name)
+        || LEGACY_HOST_KEYS.iter().any(|a| a.as_str() == name)
+}
+
+/// Whether the server's offer for one kind of algorithm meets the legacy
+/// set, so turning it on would help.
+pub fn legacy_would_help(theirs: &[String]) -> bool {
+    theirs.iter().any(|n| is_legacy(n))
+}
+
+/// Whether the negotiated cipher and MAC are open to Terrapin
+/// (CVE-2023-48795) without strict key exchange: ChaCha20-Poly1305, or a
+/// CTR cipher with an EtM MAC. AES-GCM, and CTR with a plain MAC, are not.
+pub fn terrapin_prone(cipher: &cipher::Name, mac: &mac::Name) -> bool {
+    *cipher == cipher::CHACHA20_POLY1305
+        || (LEGACY_CIPHERS.contains(cipher) && mac.as_ref().ends_with("-etm@openssh.com"))
 }
 
 #[cfg(test)]
@@ -153,6 +230,68 @@ mod tests {
         got.sort();
         want.sort();
         assert_eq!(got, want);
+    }
+
+    #[test]
+    fn legacy_set_still_bans_the_broken_algorithms() {
+        let banned = |n: &str| {
+            n.contains("sha1")
+                || n.ends_with("-cbc")
+                || n.contains("3des")
+                || n.contains("dss")
+                || n == "ssh-rsa"
+                || n.starts_with("zlib")
+                || n == "diffie-hellman-group1-sha1"
+                || n.starts_with("diffie-hellman-group-exchange")
+        };
+        let p = with_legacy(preferred());
+        assert!(!p.cipher.contains(&cipher::NONE) && !p.mac.contains(&mac::NONE));
+        let offered = names(&p);
+        let bad: Vec<_> = offered.iter().filter(|n| banned(n)).collect();
+        assert!(bad.is_empty(), "banned algorithms offered: {bad:?}");
+        // Modern ones keep priority; the markers stay at the end.
+        assert_eq!(p.kex.first(), Some(&kex::MLKEM768X25519_SHA256));
+        assert_eq!(
+            p.kex.last(),
+            Some(&kex::EXTENSION_OPENSSH_STRICT_KEX_AS_CLIENT)
+        );
+        assert_eq!(p.cipher.first(), Some(&cipher::CHACHA20_POLY1305));
+        assert!(p.kex.contains(&kex::ECDH_SHA2_NISTP256));
+        assert!(p.cipher.contains(&cipher::AES_256_CTR));
+        assert!(p.mac.contains(&mac::HMAC_SHA256));
+    }
+
+    #[test]
+    fn legacy_names_are_recognised() {
+        assert!(is_legacy("ecdh-sha2-nistp256"));
+        assert!(is_legacy("aes128-ctr"));
+        assert!(is_legacy("hmac-sha2-256"));
+        assert!(is_legacy("ecdsa-sha2-nistp521"));
+        assert!(!is_legacy("curve25519-sha256"));
+        assert!(!is_legacy("aes256-cbc"));
+        assert!(legacy_would_help(&[
+            "aes256-cbc".into(),
+            "aes128-ctr".into()
+        ]));
+        assert!(!legacy_would_help(&[
+            "aes256-cbc".into(),
+            "3des-cbc".into()
+        ]));
+    }
+
+    #[test]
+    fn terrapin_rules() {
+        assert!(terrapin_prone(&cipher::CHACHA20_POLY1305, &mac::NONE));
+        assert!(terrapin_prone(&cipher::AES_128_CTR, &mac::HMAC_SHA256_ETM));
+        assert!(!terrapin_prone(&cipher::AES_128_CTR, &mac::HMAC_SHA256));
+        assert!(!terrapin_prone(&cipher::AES_256_GCM, &mac::NONE));
+        let p = without_terrapin(with_legacy(preferred()));
+        assert!(!p.cipher.contains(&cipher::CHACHA20_POLY1305));
+        assert!(
+            p.mac
+                .iter()
+                .all(|m| !m.as_ref().ends_with("-etm@openssh.com"))
+        );
     }
 
     #[test]

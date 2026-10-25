@@ -1515,9 +1515,14 @@ impl Window {
         let focused = self.focused_id();
         let label = self.panes.get(&focused).map(Pane::label);
         let badge = self.forwarding(&self.forward_view(), focused).badge();
+        let legacy = if self.legacy_in_use(focused) {
+            tabstrip::LEGACY_BADGE
+        } else {
+            ""
+        };
         match label {
             Some(l) if l != "new tab" => {
-                self.set_title_text(&format!("{l}{badge} - {APP_NAME}"));
+                self.set_title_text(&format!("{l}{legacy}{badge} - {APP_NAME}"));
             }
             _ => self.set_title_text(APP_NAME),
         }
@@ -1643,6 +1648,16 @@ impl Window {
 
     /// The SSH connection pane `id` is logged in on; a tmux pane's is its
     /// gateway's.
+    /// Whether pane `id`'s connection (its gateway's, for a tmux pane)
+    /// uses the opt-in legacy algorithms.
+    fn legacy_in_use(&self, id: PaneId) -> bool {
+        match self.panes.get(&id).map(|p| &p.host) {
+            Some(Host::Ssh(s)) => s.legacy_in_use(),
+            Some(Host::Tmux { gateway, .. }) => self.legacy_in_use(*gateway),
+            _ => false,
+        }
+    }
+
     fn pane_connection(&self, id: PaneId) -> Option<ChannelId> {
         match self.panes.get(&id).map(|p| &p.host)? {
             Host::Ssh(s) if s.state() == State::Connected => Some(s.connection),
@@ -1787,8 +1802,13 @@ impl Window {
         });
         let channel = self.new_channel();
         let x11 = target.forward_x11.then(|| self.x11_auth(id)).flatten();
+        let legacy = self
+            .settings
+            .profile(&target.alias)
+            .is_some_and(|p| p.legacy_algorithms);
         let mut session = SshSession::new(channel, target, env.known_hosts());
         session.x11 = x11;
+        session.legacy = legacy;
         let Some(p) = self.panes.get_mut(&id) else {
             return;
         };
@@ -2388,6 +2408,7 @@ impl Window {
                         health: pane.map_or(Health::Idle, Pane::health),
                         bell,
                         forwarding: self.forwarding(&views, t.focus),
+                        legacy: self.legacy_in_use(t.focus),
                     }
                 })
                 .collect();

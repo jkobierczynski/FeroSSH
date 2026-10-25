@@ -55,7 +55,12 @@ pub struct TabLabel {
     /// Output or a bell arrived while the tab was in the background.
     pub bell: bool,
     pub forwarding: Forwarding,
+    /// The connection uses the opt-in legacy algorithms: `⚠`, in amber.
+    pub legacy: bool,
 }
+
+/// The legacy-algorithms badge, before the forwarding one.
+pub const LEGACY_BADGE: &str = " ⚠";
 
 /// What a click on the strip hit.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -238,12 +243,19 @@ pub fn draw(grid: &mut Grid, tabs: &[TabLabel], active: usize, palette: &Palette
             Flags::empty()
         };
         let badge = tab.forwarding.badge();
+        let legacy = if tab.legacy { LEGACY_BADGE } else { "" };
         let title = fit(
             &tab.title,
-            title_max.saturating_sub(badge.chars().count()).max(1),
+            title_max
+                .saturating_sub(badge.chars().count() + legacy.chars().count())
+                .max(1),
         );
         let mut shown: usize = title.chars().map(|c| c.width().unwrap_or(0)).sum();
         row.put(&title, fg, bg, flags);
+        if !legacy.is_empty() {
+            row.put(legacy, Rgb::new(0xe5, 0xb5, 0x3b), bg, Flags::empty());
+            shown += legacy.chars().count();
+        }
         if !badge.is_empty() {
             let colour = match tab.forwarding {
                 Forwarding::Inbound => Rgb::new(0xe5, 0xb5, 0x3b),
@@ -288,6 +300,7 @@ mod tests {
             health: Health::Connected,
             bell: false,
             forwarding: Forwarding::None,
+            legacy: false,
         }
     }
 
@@ -347,6 +360,21 @@ mod tests {
         assert_eq!(l.hit(16), Some(Hit::Close(0)));
         let badge = grid.cell(7, 0).unwrap();
         assert_eq!(badge.ch, '⇄');
+        assert_eq!(badge.fg, Color::Rgb(Rgb::new(0xe5, 0xb5, 0x3b)));
+    }
+
+    #[test]
+    fn badge_shows_legacy_algorithms() {
+        let mut grid = Grid::new(80, 1);
+        let p = Palette::of(&Theme::default());
+        let mut old = label("switch");
+        old.legacy = true;
+        old.forwarding = Forwarding::Outbound;
+        draw(&mut grid, &[old], 0, &p);
+        let t = text(&grid);
+        assert!(t.starts_with("  ● switch ⚠ ⇄"), "{t:?}");
+        let badge = grid.cell(11, 0).unwrap();
+        assert_eq!(badge.ch, '⚠');
         assert_eq!(badge.fg, Color::Rgb(Rgb::new(0xe5, 0xb5, 0x3b)));
     }
 
