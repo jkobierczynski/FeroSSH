@@ -162,6 +162,7 @@ mod cmd {
     pub const TAB_LEFT: u32 = 704;
     pub const TAB_RIGHT: u32 = 705;
     pub const PANE_TO_TAB: u32 = 706;
+    pub const JOIN_TAB: u32 = 707;
     /// Plus 0-3: left, right, up, down.
     pub const FOCUS: u32 = 710;
     /// Plus 0-3: left, right, up, down.
@@ -287,8 +288,14 @@ enum Drag {
     },
     /// The side pane's edge.
     SideEdge,
-    /// A tab in the strip; `moved` once it left its place.
-    Tab { index: usize },
+    /// A tab in the strip. Dragged below the strip (`out`), the window
+    /// shows the tab with pane `home` instead, and dropping on one of its
+    /// panes merges the dragged tab in there.
+    Tab {
+        index: usize,
+        home: Option<PaneId>,
+        out: bool,
+    },
     /// A pane (Ctrl+Shift+drag): `start` is where the press was; `active`
     /// once it moved far enough.
     Pane {
@@ -750,6 +757,11 @@ fn build_menu() -> Result<HMENU> {
         item(window, cmd::SPLIT_RIGHT, "Split &right\tAlt+Shift+=")?;
         item(window, cmd::SPLIT_DOWN, "Split &down\tAlt+Shift+-")?;
         item(window, cmd::PANE_TO_TAB, "Move pane to its own &tab")?;
+        item(
+            window,
+            cmd::JOIN_TAB,
+            "&Join tab into the tab before it\tCtrl+Shift+J",
+        )?;
         separator(window)?;
         item(window, cmd::NEXT_TAB, "&Next tab\tCtrl+Tab")?;
         item(window, cmd::PREV_TAB, "&Previous tab\tCtrl+Shift+Tab")?;
@@ -1883,7 +1895,7 @@ impl Window {
         {
             frame(p.rect, g, p.theme.cursor, &mut out);
         }
-        if let Some(Drag::Pane { active: true, .. }) = &self.drag {
+        if let Some(Drag::Pane { active: true, .. } | Drag::Tab { out: true, .. }) = &self.drag {
             let accent = Rgb::new(0xe5, 0xb5, 0x3b);
             if let Some(r) = self.drop_marker() {
                 frame(r, 2 * g, accent, &mut out);
@@ -1892,13 +1904,18 @@ impl Window {
         out
     }
 
-    /// Where a dragged pane would land, outlined while dragging.
+    /// Where a dragged pane or tab would land, outlined while dragging.
     fn drop_marker(&self) -> Option<Rect> {
-        let Some(Drag::Pane { id, .. }) = &self.drag else {
-            return None;
-        };
         let (x, y) = self.mouse.at;
-        if let Some(s) = self.areas.strip
+        let (pane, tab) = match &self.drag {
+            Some(Drag::Pane { id, .. }) => (Some(*id), None),
+            Some(Drag::Tab {
+                index, out: true, ..
+            }) => (None, Some(*index)),
+            _ => return None,
+        };
+        if pane.is_some()
+            && let Some(s) = self.areas.strip
             && s.contains(x, y)
         {
             return Some(s);
@@ -1906,11 +1923,16 @@ impl Window {
         let Spot::Pane(target) = self.spot(x, y) else {
             return None;
         };
-        if target == *id {
+        if Some(target) == pane || tab.is_some_and(|t| self.ws.tab_of(target) == Some(t)) {
             return None;
         }
         let r = self.panes.get(&target)?.rect;
-        Some(match layout::drop_zone(r, x, y) {
+        let zone = if tab.is_some() {
+            Drop::Side(layout::join_side(r, x, y))
+        } else {
+            layout::drop_zone(r, x, y)
+        };
+        Some(match zone {
             Drop::Swap => r,
             Drop::Side(Dir::Left) => Rect::new(r.x, r.y, r.w / 2, r.h),
             Drop::Side(Dir::Right) => Rect::new(r.x + r.w / 2, r.y, r.w - r.w / 2, r.h),
@@ -2392,7 +2414,7 @@ impl Window {
                 Drag::Divider {
                     axis: Axis::Column, ..
                 } => IDC_SIZENS,
-                Drag::Pane { active: true, .. } => IDC_SIZEALL,
+                Drag::Pane { active: true, .. } | Drag::Tab { out: true, .. } => IDC_SIZEALL,
                 Drag::Pane { .. } => IDC_IBEAM,
                 Drag::Tab { .. } => IDC_ARROW,
             };
@@ -2474,9 +2496,24 @@ impl Window {
             Spot::Strip(col) => {
                 match (button, self.strip_layout.hit(col)) {
                     (MouseButton::Left, Some(Hit::Tab(i))) => {
+                        // The tab a drag below the strip shows: the one
+                        // active before, or a neighbour.
+                        let before = self.ws.active;
+                        let home_tab = if before != i {
+                            Some(before)
+                        } else if i > 0 {
+                            Some(i - 1)
+                        } else {
+                            (self.ws.tabs.len() > 1).then_some(1)
+                        };
+                        let home = home_tab.and_then(|t| self.ws.tabs.get(t)).map(|t| t.focus);
                         self.select_tab(i);
                         self.capture(true);
-                        self.drag = Some(Drag::Tab { index: i });
+                        self.drag = Some(Drag::Tab {
+                            index: i,
+                            home,
+                            out: false,
+                        });
                     }
                     (MouseButton::Left, Some(Hit::Close(i))) => {
                         return Some(Command::CloseTab(i));
@@ -2521,6 +2558,25 @@ impl Window {
 
     /// Finishes a drag.
     fn end_drag(&mut self, drag: Drag, (x, y): (i32, i32)) -> Option<Command> {
+        if let Drag::Tab {
+            index, out: true, ..
+        } = drag
+        {
+            let joined = match self.spot(x, y) {
+                Spot::Pane(target) if self.ws.tab_of(target) != Some(index) => {
+                    let r = self.panes.get(&target).map(|p| p.rect).unwrap_or_default();
+                    self.ws.join_tab(index, target, layout::join_side(r, x, y))
+                }
+                _ => false,
+            };
+            if !joined && let Some(focus) = self.ws.tabs.get(index).map(|t| t.focus) {
+                // Dropped elsewhere: back to the dragged tab.
+                self.ws.focus(focus);
+            }
+            self.after_structure_change();
+            self.request_full_redraw();
+            return None;
+        }
         if let Drag::Pane {
             id, active: true, ..
         } = drag
@@ -2567,10 +2623,30 @@ impl Window {
                     };
                     self.layout();
                 }
-                Drag::Tab { index } => {
+                Drag::Tab { index, home, out } => {
                     let Some(s) = self.areas.strip else {
                         return;
                     };
+                    let below = home.is_some() && y >= s.bottom();
+                    if below != *out {
+                        // Show the tab to drop into, or the dragged one again.
+                        *out = below;
+                        let shown = if below {
+                            *home
+                        } else {
+                            self.ws.tabs.get(*index).map(|t| t.focus)
+                        };
+                        if let Some(focus) = shown {
+                            self.ws.focus(focus);
+                        }
+                        self.after_structure_change();
+                        self.request_full_redraw();
+                        return;
+                    }
+                    if *out {
+                        self.request_full_redraw();
+                        return;
+                    }
                     let cpad = scale(CHROME_PADDING_DIP, self.dpi);
                     let col = ((x - s.x - cpad).max(0) / self.chrome_metrics.width.max(1) as i32)
                         as usize;
@@ -2852,6 +2928,11 @@ impl Window {
             cmd::CLOSE_PANE => return self.close_pane(pane),
             cmd::PANE_TO_TAB => {
                 if self.ws.pane_to_tab(pane) {
+                    self.after_structure_change();
+                }
+            }
+            cmd::JOIN_TAB => {
+                if self.ws.join_neighbour() {
                     self.after_structure_change();
                 }
             }
@@ -3217,6 +3298,7 @@ fn shortcut(vk: VIRTUAL_KEY, m: Mods, tabs: bool, split: bool) -> Option<u32> {
             }),
             VK_PRIOR if m.shift && tabs => Some(cmd::TAB_LEFT),
             VK_NEXT if m.shift && tabs => Some(cmd::TAB_RIGHT),
+            v if v == key(b'J') && m.shift && tabs => Some(cmd::JOIN_TAB),
             VK_OEM_PLUS | VK_ADD => Some(cmd::ZOOM_IN),
             VK_OEM_MINUS | VK_SUBTRACT if !m.shift => Some(cmd::ZOOM_OUT),
             VK_NUMPAD0 if !m.shift => Some(cmd::ZOOM_RESET),

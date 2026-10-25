@@ -153,10 +153,16 @@ impl Node {
     /// Splits pane `target`, putting `new` on side `side` of it with half
     /// the space. `false` if `target` is not in the tree.
     pub fn split(&mut self, target: PaneId, new: PaneId, side: Dir) -> bool {
+        self.graft(target, Node::Leaf(new), side)
+    }
+
+    /// Splits pane `target`, putting the whole tree `new` on side `side`
+    /// of it with half the space. `false` if `target` is not in the tree.
+    pub fn graft(&mut self, target: PaneId, new: Node, side: Dir) -> bool {
         match self {
             Node::Leaf(id) if *id == target => {
                 let old = Box::new(Node::Leaf(target));
-                let fresh = Box::new(Node::Leaf(new));
+                let fresh = Box::new(new);
                 let (first, second) = if side.forward() {
                     (old, fresh)
                 } else {
@@ -172,7 +178,11 @@ impl Node {
             }
             Node::Leaf(_) => false,
             Node::Split { first, second, .. } => {
-                first.split(target, new, side) || second.split(target, new, side)
+                if first.contains(target) {
+                    first.graft(target, new, side)
+                } else {
+                    second.graft(target, new, side)
+                }
             }
         }
     }
@@ -388,6 +398,16 @@ pub fn drop_zone(r: Rect, x: i32, y: i32) -> Drop {
     }
 }
 
+/// Which side of the pane under the mouse a dragged tab joins: the drop
+/// zone's side, or for the middle, along the pane's longer side.
+pub fn join_side(r: Rect, x: i32, y: i32) -> Dir {
+    match drop_zone(r, x, y) {
+        Drop::Side(dir) => dir,
+        Drop::Swap if r.w >= r.h => Dir::Right,
+        Drop::Swap => Dir::Down,
+    }
+}
+
 /// One tab: its split tree and which pane has the keyboard.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Tab {
@@ -600,6 +620,39 @@ impl Workspace {
         }
     }
 
+    /// Merges tab `from`, with all its panes and their layout, into the
+    /// tab holding pane `target`, on side `side` of that pane, as a drag of
+    /// a tab onto a pane does. The merged tab's focused pane keeps the
+    /// focus.
+    pub fn join_tab(&mut self, from: usize, target: PaneId, side: Dir) -> bool {
+        let Some(to) = self.tab_of(target) else {
+            return false;
+        };
+        if to == from || from >= self.tabs.len() {
+            return false;
+        }
+        let tab = self.tabs.remove(from);
+        let Some(t) = self.tabs.iter().position(|t| t.root.contains(target)) else {
+            return false;
+        };
+        let Some(dest) = self.tabs.get_mut(t) else {
+            return false;
+        };
+        dest.root.graft(target, tab.root, side);
+        self.focus(tab.focus)
+    }
+
+    /// Merges the active tab into the one before it (the one after, for
+    /// the first tab), to the right of that tab's focused pane.
+    pub fn join_neighbour(&mut self) -> bool {
+        let from = self.active;
+        let to = if from == 0 { 1 } else { from - 1 };
+        let Some(target) = self.tabs.get(to).map(|t| t.focus) else {
+            return false;
+        };
+        self.join_tab(from, target, Dir::Right)
+    }
+
     /// Moves pane `id` into a tab of its own, after its current tab.
     pub fn pane_to_tab(&mut self, id: PaneId) -> bool {
         let Some(i) = self.tab_of(id) else {
@@ -764,5 +817,40 @@ mod tests {
         assert_eq!(ws.focused(), c);
         assert!(!ws.pane_to_tab(c), "already alone");
         assert_eq!(ws.all_panes().len(), 3);
+    }
+
+    #[test]
+    fn tabs_merge_back_as_panes() {
+        let (mut ws, a) = Workspace::new();
+        let b = ws.new_tab();
+        let c = ws.split(Dir::Down).unwrap();
+        assert!(ws.focus(b));
+        // Tab 2 (b over c) joins to the right of a, keeping its own split.
+        assert!(ws.join_tab(1, a, Dir::Right));
+        assert_eq!(ws.tabs.len(), 1);
+        assert_eq!(ws.tabs[0].root.panes(), [a, b, c]);
+        assert_eq!(ws.focused(), b, "the merged tab's focus stays");
+        let l = ws.tabs[0].root.layout(AREA, 1);
+        assert_eq!(l[0], (a, Rect::new(0, 0, 500, 601)));
+        assert_eq!(l[1].1.x, l[2].1.x, "b and c still stacked");
+        assert!(!ws.join_tab(0, a, Dir::Left), "same tab");
+        assert_eq!(join_side(AREA, 500, 300), Dir::Right);
+        assert_eq!(join_side(Rect::new(0, 0, 100, 400), 50, 200), Dir::Down);
+        assert_eq!(join_side(AREA, 500, 5), Dir::Up);
+        // Out and back in by the menu: into the tab before it.
+        assert!(ws.pane_to_tab(c));
+        assert_eq!(ws.active, 1);
+        assert!(ws.join_neighbour());
+        assert_eq!(ws.tabs.len(), 1);
+        assert_eq!(ws.focused(), c);
+        // The first tab joins the one after it.
+        let d = ws.new_tab();
+        ws.move_tab(1, 0);
+        assert_eq!(ws.active, 0);
+        assert!(ws.join_neighbour());
+        assert_eq!(ws.tabs.len(), 1);
+        assert_eq!(ws.focused(), d);
+        assert!(!ws.join_neighbour(), "nothing left to join");
+        assert_eq!(ws.all_panes().len(), 4);
     }
 }
