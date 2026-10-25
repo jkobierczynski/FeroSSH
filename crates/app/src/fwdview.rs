@@ -1,7 +1,7 @@
 //! The side pane's forwards view: every connection's port forwards and
-//! X11 with their state and open connections, a line to add a forward to
-//! the focused pane's connection (`-L 8080:db:5432`, `-R`, `-D`), and
-//! Delete to stop the selected one.
+//! X11 with their state and open connections, a line to add a forward
+//! (`-L 8080:db:5432`, `-R`, `-D`) to the connection picked in the list
+//! or else the focused pane's, and Delete to stop the selected forward.
 //!
 //! Drawn into a [`Grid`] like the session manager; keys come in as
 //! [`SideKey`]s and what the user asked for goes out as a [`FwdAction`].
@@ -21,8 +21,12 @@ const HEADER: usize = 2;
 /// What the window should do.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FwdAction {
-    /// Add to the focused pane's connection.
-    Add(ForwardSpec),
+    /// Add to `connection` when the user picked one in the list, else to
+    /// the focused pane's connection.
+    Add {
+        spec: ForwardSpec,
+        connection: Option<ChannelId>,
+    },
     Remove {
         connection: ChannelId,
         index: usize,
@@ -38,11 +42,14 @@ enum Tone {
     Bad,
 }
 
-/// One line of the list; `forward` when it is a forward that Delete stops.
+/// One line of the list. `connection` is set on the lines that can be
+/// selected (a connection's heading and its forwards), `forward` on a
+/// forward that Delete stops.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Line {
     text: String,
     tone: Tone,
+    connection: Option<ChannelId>,
     forward: Option<(ChannelId, usize)>,
 }
 
@@ -51,8 +58,11 @@ pub struct ForwardsView {
     input: String,
     /// Shown under the add line until the next key: a parse error, say.
     message: Option<String>,
-    /// The selected forward, as an index among the forward lines.
+    /// The selected line, as an index among the selectable lines.
     selected: usize,
+    /// Whether the user moved the selection, which makes its connection
+    /// the one a new forward goes to.
+    picked: bool,
     scroll: usize,
 }
 
@@ -97,10 +107,14 @@ fn lines(view: &[ConnView]) -> Vec<Line> {
     let line = |text: String, tone| Line {
         text,
         tone,
+        connection: None,
         forward: None,
     };
     for c in view {
-        out.push(line(format!(" {}", c.label), Tone::Heading));
+        out.push(Line {
+            connection: Some(c.connection),
+            ..line(format!(" {}", c.label), Tone::Heading)
+        });
         for (i, f) in c.forwards.iter().enumerate() {
             out.push(Line {
                 text: format!("  {}", describe(f)),
@@ -109,6 +123,7 @@ fn lines(view: &[ConnView]) -> Vec<Line> {
                 } else {
                     Tone::Normal
                 },
+                connection: Some(c.connection),
                 forward: Some((c.connection, i)),
             });
             if let FwdState::Failed(why) = &f.state {
@@ -148,22 +163,22 @@ impl ForwardsView {
         rows.saturating_sub(HEADER).max(1)
     }
 
-    fn forward_count(lines: &[Line]) -> usize {
-        lines.iter().filter(|l| l.forward.is_some()).count()
+    fn selectable_count(lines: &[Line]) -> usize {
+        lines.iter().filter(|l| l.connection.is_some()).count()
     }
 
-    /// The line index of the selected forward.
+    /// The line index of the selected line.
     fn selected_line(&self, lines: &[Line]) -> Option<usize> {
         lines
             .iter()
             .enumerate()
-            .filter(|(_, l)| l.forward.is_some())
+            .filter(|(_, l)| l.connection.is_some())
             .nth(self.selected)
             .map(|(i, _)| i)
     }
 
     fn clamp(&mut self, lines: &[Line], visible: usize) {
-        let n = Self::forward_count(lines);
+        let n = Self::selectable_count(lines);
         self.selected = self.selected.min(n.saturating_sub(1));
         if let Some(at) = self.selected_line(lines) {
             if at < self.scroll {
@@ -176,9 +191,11 @@ impl ForwardsView {
         self.scroll = self.scroll.min(lines.len().saturating_sub(1));
     }
 
-    /// Shows `text` under the add line until the next key.
-    pub fn set_message(&mut self, text: String) {
-        self.message = Some(text);
+    /// Puts a forward that could not be added back on the add line, with
+    /// `why` above it, so it can be retried.
+    pub fn refuse(&mut self, spec: &ForwardSpec, why: String) {
+        self.input = spec.to_string();
+        self.message = Some(why);
     }
 
     pub fn key(&mut self, key: SideKey, view: &[ConnView], rows: usize) -> Option<FwdAction> {
@@ -186,10 +203,10 @@ impl ForwardsView {
         let visible = Self::visible(rows);
         self.message = None;
         match key {
-            SideKey::Up => self.selected = self.selected.saturating_sub(1),
-            SideKey::Down => self.selected += 1,
-            SideKey::Home => self.selected = 0,
-            SideKey::End => self.selected = Self::forward_count(&lines).saturating_sub(1),
+            SideKey::Up => self.pick(self.selected.saturating_sub(1)),
+            SideKey::Down => self.pick(self.selected + 1),
+            SideKey::Home => self.pick(0),
+            SideKey::End => self.pick(Self::selectable_count(&lines).saturating_sub(1)),
             SideKey::Enter { .. } => {
                 let typed = self.input.trim();
                 if typed.is_empty() {
@@ -198,7 +215,12 @@ impl ForwardsView {
                 match parse_option(typed) {
                     Some(spec) => {
                         self.input.clear();
-                        return Some(FwdAction::Add(spec));
+                        let connection = self
+                            .picked
+                            .then(|| self.selected_line(&lines))
+                            .flatten()
+                            .and_then(|at| lines.get(at)?.connection);
+                        return Some(FwdAction::Add { spec, connection });
                     }
                     None => {
                         self.message =
@@ -229,14 +251,24 @@ impl ForwardsView {
         None
     }
 
-    /// A click on grid row `y` selects the forward there.
+    fn pick(&mut self, selected: usize) {
+        self.selected = selected;
+        self.picked = true;
+    }
+
+    /// A click on grid row `y` selects the connection or forward there.
     pub fn click(&mut self, y: usize, view: &[ConnView], rows: usize) {
         let lines = lines(view);
         let Some(i) = y.checked_sub(HEADER).map(|i| i + self.scroll) else {
             return;
         };
-        if lines.get(i).is_some_and(|l| l.forward.is_some()) {
-            self.selected = lines.iter().take(i).filter(|l| l.forward.is_some()).count();
+        if lines.get(i).is_some_and(|l| l.connection.is_some()) {
+            let n = lines
+                .iter()
+                .take(i)
+                .filter(|l| l.connection.is_some())
+                .count();
+            self.pick(n);
         }
         self.clamp(&lines, Self::visible(rows));
     }
@@ -391,13 +423,19 @@ mod tests {
         }
         assert_eq!(
             v.key(SideKey::Enter { split: false }, &view, 20),
-            Some(FwdAction::Add(parse_option("-D 1081").unwrap()))
+            Some(FwdAction::Add {
+                spec: parse_option("-D 1081").unwrap(),
+                connection: None
+            })
         );
         v.key(SideKey::Char('x'), &view, 20);
         assert_eq!(v.key(SideKey::Enter { split: false }, &view, 20), None);
         assert!(v.message.is_some());
         v.key(SideKey::Escape, &view, 20);
         assert_eq!(v.key(SideKey::Escape, &view, 20), Some(FwdAction::Leave));
+        // The heading is selected first: Delete leaves it alone.
+        assert_eq!(v.key(SideKey::Delete, &view, 20), None);
+        v.key(SideKey::Down, &view, 20);
         v.key(SideKey::Down, &view, 20);
         assert_eq!(
             v.key(SideKey::Delete, &view, 20),
@@ -423,5 +461,44 @@ mod tests {
                 index: 0
             })
         );
+    }
+
+    #[test]
+    fn picking_a_connection_sends_new_forwards_there() {
+        let mut view = sample();
+        view.push(ConnView {
+            connection: 7,
+            label: "me@web".into(),
+            forwards: Vec::new(),
+            x11: None,
+        });
+        let mut v = ForwardsView::default();
+        let add = |v: &mut ForwardsView, view: &[ConnView]| {
+            for c in "-L 8000:localhost:8000".chars() {
+                v.key(SideKey::Char(c), view, 20);
+            }
+            v.key(SideKey::Enter { split: false }, view, 20)
+        };
+        let spec = parse_option("-L 8000:localhost:8000").unwrap();
+        // Nothing picked: the window uses the focused pane's connection.
+        assert_eq!(
+            add(&mut v, &view),
+            Some(FwdAction::Add {
+                spec: spec.clone(),
+                connection: None
+            })
+        );
+        // The second heading is line 8 of the list, below the header.
+        v.click(HEADER + 8, &view, 20);
+        assert_eq!(
+            add(&mut v, &view),
+            Some(FwdAction::Add {
+                spec: spec.clone(),
+                connection: Some(7)
+            })
+        );
+        v.refuse(&spec, "no".into());
+        assert_eq!(v.input, "-L 8000:localhost:8000");
+        assert_eq!(v.message.as_deref(), Some("no"));
     }
 }

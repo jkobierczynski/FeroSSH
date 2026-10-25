@@ -1533,13 +1533,10 @@ impl Window {
 
     /// What the badge of pane `id`'s tab shows.
     fn forwarding(&self, views: &[ConnView], id: PaneId) -> Forwarding {
-        let Some(Host::Ssh(s)) = self.panes.get(&id).map(|p| &p.host) else {
+        let Some(connection) = self.pane_connection(id) else {
             return Forwarding::None;
         };
-        if s.state() != State::Connected {
-            return Forwarding::None;
-        }
-        match views.iter().find(|v| v.connection == s.connection) {
+        match views.iter().find(|v| v.connection == connection) {
             Some(v) if v.inbound() => Forwarding::Inbound,
             Some(v) if !v.forwards.is_empty() => Forwarding::Outbound,
             _ => Forwarding::None,
@@ -1644,19 +1641,39 @@ impl Window {
         }
     }
 
+    /// The SSH connection pane `id` is logged in on; a tmux pane's is its
+    /// gateway's.
+    fn pane_connection(&self, id: PaneId) -> Option<ChannelId> {
+        match self.panes.get(&id).map(|p| &p.host)? {
+            Host::Ssh(s) if s.state() == State::Connected => Some(s.connection),
+            Host::Tmux { gateway, .. } => self.pane_connection(*gateway),
+            _ => None,
+        }
+    }
+
     /// Carries out what the forwards view asked for.
     fn forwards_action(&mut self, action: Option<FwdAction>) -> Option<Command> {
         match action {
-            Some(FwdAction::Add(spec)) => {
-                let connection = match self.panes.get(&self.focused_id()).map(|p| &p.host) {
-                    Some(Host::Ssh(s)) if s.state() == State::Connected => Some(s.connection),
-                    _ => None,
-                };
+            Some(FwdAction::Add { spec, connection }) => {
+                // The connection picked in the list, else the focused
+                // pane's, else the only one there is.
+                let view = self.forward_view();
+                let known = |c: &ChannelId| view.iter().any(|v| v.connection == *c);
+                let connection = connection
+                    .filter(known)
+                    .or_else(|| self.pane_connection(self.focused_id()).filter(known))
+                    .or_else(|| match &view[..] {
+                        [only] => Some(only.connection),
+                        _ => None,
+                    });
                 match (connection, &self.worker) {
                     (Some(c), Some(w)) => w.forwarder.add(c, spec),
+                    _ if view.is_empty() => self
+                        .forwards_view
+                        .refuse(&spec, "Log in to a host first.".into()),
                     _ => self
                         .forwards_view
-                        .set_message("Connect the focused pane first.".into()),
+                        .refuse(&spec, "Click a connection below, then Enter.".into()),
                 }
             }
             Some(FwdAction::Remove { connection, index }) => {
