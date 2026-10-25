@@ -17,7 +17,7 @@
 //! has a hole; an upload relies on the server applying writes in order,
 //! as SFTP servers do.
 
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -266,6 +266,11 @@ struct Fetch {
     links_skipped: usize,
     names_skipped: usize,
     errors: usize,
+    /// Local paths given out so far, lowercased: two remote names can
+    /// become one Windows name (`a:b` and `a_b`, or `README` and `readme`
+    /// on a case-insensitive disk), and the second must not land on the
+    /// first.
+    claimed: HashSet<String>,
 }
 
 #[derive(Debug)]
@@ -1039,6 +1044,7 @@ impl Remote {
                     links_skipped: 0,
                     names_skipped: 0,
                     errors: 0,
+                    claimed: HashSet::new(),
                 }));
                 self.job_request(i, SftpOp::RealPath { path: remote }, Step::RootPath);
             }
@@ -1702,7 +1708,12 @@ impl Remote {
                 continue;
             };
             let remote = names::join(dir, &e.name);
-            let into = local.join(&name);
+            let Some(into) = self.claim(i, local, &name) else {
+                if let Some(Run::Fetch(f)) = self.jobs.get_mut(i).map(|j| &mut j.run) {
+                    f.names_skipped += 1;
+                }
+                continue;
+            };
             if e.attrs.is_dir() {
                 if std::fs::create_dir_all(&into).is_err() {
                     if let Some(Run::Fetch(f)) = self.jobs.get_mut(i).map(|j| &mut j.run) {
@@ -1731,6 +1742,20 @@ impl Remote {
             }
             self.advance(i);
         }
+    }
+
+    /// `dir/name` for folder job `i`, numbered (`name (2)`) when another
+    /// remote name already became the same local name.
+    fn claim(&mut self, i: usize, dir: &Path, name: &str) -> Option<PathBuf> {
+        let Some(Run::Fetch(f)) = self.jobs.get_mut(i).map(|j| &mut j.run) else {
+            return Some(dir.join(name));
+        };
+        let key = |p: &Path| p.to_string_lossy().to_lowercase();
+        let path = std::iter::once(dir.join(name))
+            .chain((2..=MAX_NUMBERED).map(|n| dir.join(names::numbered(name, n))))
+            .find(|p| !f.claimed.contains(&key(p)))?;
+        f.claimed.insert(key(&path));
+        Some(path)
     }
 
     fn bump_outstanding(&mut self, i: usize) {

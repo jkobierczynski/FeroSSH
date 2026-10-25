@@ -428,3 +428,270 @@ async fn dead_and_restarted_servers() {
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// Logs in and leaves the shell open; returns the worker's channels.
+#[cfg(unix)]
+async fn log_in(port: u16, keys: &[KeyFile]) -> (mpsc::Sender<Message>, mpsc::Receiver<Message>) {
+    let (to_worker, worker_in) = mpsc::channel(64);
+    let (worker_out, mut from_worker) = mpsc::channel(64);
+    tokio::spawn(ferossh_worker::serve(worker_in, worker_out));
+    for msg in [
+        Message::Hello {
+            version: PROTOCOL_VERSION,
+        },
+        Message::Connect {
+            channel: 1,
+            host: "127.0.0.1".into(),
+            port,
+            user: "fero".into(),
+            cols: 80,
+            rows: 24,
+            host_key_algs: vec![],
+            x11: None,
+            legacy: false,
+            timing: Timing::default(),
+        },
+    ] {
+        to_worker.send(msg).await.unwrap();
+    }
+    loop {
+        let msg = tokio::time::timeout(Duration::from_secs(30), from_worker.recv())
+            .await
+            .expect("timed out logging in")
+            .expect("worker hung up");
+        let reply = match msg {
+            Message::HostKey { channel, .. } => Message::HostKeyVerdict {
+                channel,
+                accept: true,
+            },
+            Message::IdentitiesRequest { channel } => Message::Identities {
+                channel,
+                keys: keys.iter().map(|k| k.public.clone()).collect(),
+            },
+            Message::SignRequest {
+                channel, key, data, ..
+            } => {
+                let k = keys.iter().find(|k| k.public == key).unwrap();
+                Message::Signature {
+                    channel,
+                    signature: k.sign(None, &data).unwrap(),
+                }
+            }
+            Message::Connected { .. } => return (to_worker, from_worker),
+            Message::Disconnected { reason, .. } => panic!("login failed: {reason}"),
+            _ => continue,
+        };
+        to_worker.send(reply).await.unwrap();
+    }
+}
+
+/// Runs the transfer queue against the worker until `done` holds.
+#[cfg(unix)]
+async fn drive(
+    remote: &mut ferossh_sftp::Remote,
+    to_worker: &mpsc::Sender<Message>,
+    from_worker: &mut mpsc::Receiver<Message>,
+    done: impl Fn(&ferossh_sftp::Remote) -> bool,
+) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    loop {
+        for msg in remote.take_outbox() {
+            to_worker.send(msg).await.unwrap();
+        }
+        if done(remote) {
+            return;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "timed out: {:?}",
+            remote.jobs()
+        );
+        match tokio::time::timeout(Duration::from_millis(20), from_worker.recv()).await {
+            Ok(Some(msg)) if msg.channel() == Some(2) => {
+                if let Message::Disconnected { reason, .. } = &msg {
+                    panic!("SFTP ended: {reason}");
+                }
+                remote.on_message(msg);
+            }
+            Ok(Some(_)) => {}
+            Ok(None) => panic!("worker hung up"),
+            Err(_) => remote.poll(),
+        }
+    }
+}
+
+/// What the edge-case folder holds on the server, made as `fero`.
+#[cfg(unix)]
+const EDGE_FILES: &str = r#"
+set -e
+mkdir -p ~/edge/sub && cd ~/edge
+printf latin1 > "$(printf 'caf\351.txt')"
+printf colon > 'a:b'
+printf under > 'a_b'
+printf device > CON
+printf dot > 'trailing.'
+printf pipe > 'x|y'
+printf inside > sub/inner.txt
+ln -s sub/inner.txt link-in
+ln -s sub link-dir
+ln -s /etc/passwd link-out
+ln -s loop loop
+ln -s missing dangling
+printf readme > README
+printf lower > readme
+cd ~ && truncate -s 5G big.sparse && printf END >> big.sparse
+"#;
+
+/// SFTP against real sftp-servers (OpenSSH 7.6 and 10.2, and Dropbear,
+/// which runs OpenSSH's): a folder with names Windows cannot hold or that
+/// are not UTF-8, links inside, outside, to themselves and to nothing,
+/// and a file past 4 GiB resumed near its end.
+#[cfg(unix)]
+#[tokio::test]
+async fn sftp_edge_cases() {
+    use ferossh_sftp::{Remote, State};
+    if !available() {
+        return;
+    }
+    let dir = std::env::temp_dir().join(format!("ferossh-interop-sftp-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let keys = user_keys(&dir);
+    for (tag, server) in [
+        ("18.04", "openssh"),
+        ("26.04", "openssh"),
+        ("26.04", "dropbear"),
+    ] {
+        let name = format!("{server} on ubuntu {tag}");
+        let container = Server::start(tag, server, &dir);
+        docker(&["exec", "-u", "fero", &container.id, "sh", "-c", EDGE_FILES])
+            .unwrap_or_else(|| panic!("{name}: making the files failed"));
+        let (to_worker, mut from_worker) = log_in(container.port, &keys).await;
+        let mut remote = Remote::new("interop");
+        remote.attach(2, 1);
+        drive(&mut remote, &to_worker, &mut from_worker, |r| {
+            r.is_ready() && !r.listing.loading
+        })
+        .await;
+        let edge = b"/home/fero/edge".to_vec();
+        remote.browse(&edge);
+        drive(&mut remote, &to_worker, &mut from_worker, |r| {
+            !r.listing.loading && r.listing.path == edge
+        })
+        .await;
+        let entry = |remote: &Remote, n: &[u8]| {
+            remote
+                .listing
+                .entries
+                .iter()
+                .find(|e| e.name == n)
+                .unwrap_or_else(|| panic!("{name}: no {:?}", String::from_utf8_lossy(n)))
+                .clone()
+        };
+        let local = dir.join(format!("{tag}-{server}"));
+        std::fs::create_dir_all(&local).unwrap();
+        let latin1 = entry(&remote, b"caf\xe9.txt");
+        remote.download(&latin1, &local).unwrap();
+        remote.browse(b"/home/fero");
+        drive(&mut remote, &to_worker, &mut from_worker, |r| {
+            !r.listing.loading && r.listing.path == b"/home/fero"
+        })
+        .await;
+        let big = entry(&remote, b"big.sparse");
+        assert_eq!(big.attrs.size, Some(5 * (1 << 30) + 3), "{name}");
+
+        // Resume past 4 GiB: a sparse part file as if all but the end came.
+        std::fs::File::create(local.join("big.sparse.part"))
+            .unwrap()
+            .set_len(5 * (1 << 30))
+            .unwrap();
+        remote.download(&big, &local).unwrap();
+        // A whole folder of awkward names and links.
+        let edge_dir = entry(&remote, b"edge");
+        remote.download(&edge_dir, &local).unwrap();
+        drive(&mut remote, &to_worker, &mut from_worker, |r| {
+            r.jobs().iter().all(|j| j.state.finished())
+        })
+        .await;
+        for job in remote.jobs().iter().filter(|j| j.parent.is_none()) {
+            assert_eq!(
+                job.state,
+                State::Done,
+                "{name}: {} {:?}",
+                job.name,
+                job.note
+            );
+            eprintln!("{name}: {} -> {:?}", job.name, job.note);
+        }
+
+        let big_local = std::fs::metadata(local.join("big.sparse")).unwrap();
+        assert_eq!(big_local.len(), 5 * (1 << 30) + 3, "{name}");
+        let mut tail = [0u8; 3];
+        {
+            use std::io::{Read as _, Seek, SeekFrom};
+            let mut f = std::fs::File::open(local.join("big.sparse")).unwrap();
+            f.seek(SeekFrom::End(-3)).unwrap();
+            f.read_exact(&mut tail).unwrap();
+        }
+        assert_eq!(&tail, b"END", "{name}");
+
+        let got = local.join("edge");
+        let read = |n: &str| std::fs::read_to_string(got.join(n)).ok();
+        let mut names: Vec<String> = std::fs::read_dir(&got)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        eprintln!("{name}: {names:?}");
+        assert_eq!(
+            read("caf_.txt").as_deref(),
+            Some("latin1"),
+            "{name}: {names:?}"
+        );
+        assert_eq!(read("_CON").as_deref(), Some("device"), "{name}: {names:?}");
+        assert_eq!(
+            read("trailing_").as_deref(),
+            Some("dot"),
+            "{name}: {names:?}"
+        );
+        assert_eq!(read("x_y").as_deref(), Some("pipe"), "{name}: {names:?}");
+        assert_eq!(read("sub/inner.txt").as_deref(), Some("inside"), "{name}");
+        // "a:b" and "a_b" both become a_b, and README and readme are one
+        // name to Windows: neither may be lost or asked about. Which of
+        // each pair gets the " (2)" depends on the server's listing order.
+        for (stem, texts) in [("a_b", ["colon", "under"]), ("readme", ["readme", "lower"])] {
+            let pair: Vec<&String> = names
+                .iter()
+                .filter(|n| n.to_lowercase().starts_with(stem))
+                .collect();
+            assert_eq!(pair.len(), 2, "{name}: {names:?}");
+            let mut got: Vec<String> = pair.iter().filter_map(|n| read(n)).collect();
+            got.sort();
+            let mut want = texts.map(str::to_owned).to_vec();
+            want.sort();
+            assert_eq!(got, want, "{name}: {names:?}");
+        }
+        // Links out of the folder, to folders (no loops or second copies),
+        // to themselves and to nothing are left behind.
+        assert!(!got.join("link-out").exists(), "{name}: {names:?}");
+        assert!(!got.join("link-dir").exists(), "{name}: {names:?}");
+        assert!(
+            !got.join("loop").exists() && !got.join("dangling").exists(),
+            "{name}"
+        );
+        assert_eq!(
+            read("link-in").as_deref(),
+            Some("inside"),
+            "{name}: {names:?}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(local.join("caf_.txt"))
+                .ok()
+                .as_deref(),
+            Some("latin1"),
+            "{name}"
+        );
+        let _ = std::fs::remove_dir_all(&local);
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
