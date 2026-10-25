@@ -35,6 +35,8 @@ pub struct Target {
     pub port: u16,
     pub user: String,
     pub key_files: Vec<KeyFileSpec>,
+    /// ssh_config's `Tag`, which picks a colour theme.
+    pub tag: Option<String>,
 }
 
 /// The user's environment the target is resolved in.
@@ -42,7 +44,8 @@ pub struct Target {
 pub struct Env {
     pub home: PathBuf,
     pub local_user: String,
-    /// The text of `~/.ssh/config`, if any.
+    /// The text of `~/.ssh/config`, if any, followed by the hosts
+    /// imported from PuTTY. `Include` lines are read relative to `home`.
     pub config: String,
 }
 
@@ -57,7 +60,10 @@ impl Target {
     /// parse.
     pub fn resolve(typed: &str, env: &Env) -> Option<Self> {
         let (user, alias, port) = ssh_config::parse_destination(typed)?;
-        let cfg = ssh_config::resolve(&env.config, &alias);
+        let includes = ssh_config::DirIncludes {
+            home: env.home.clone(),
+        };
+        let cfg = ssh_config::resolve_in(&env.config, &alias, &includes);
         let home = env.home.to_string_lossy();
         let user = user.or(cfg.user).unwrap_or_else(|| env.local_user.clone());
         let expand = |s: &str| ssh_config::expand_path(s, &home, &env.local_user, &alias, &user);
@@ -84,6 +90,7 @@ impl Target {
         }
         Some(Self {
             port: port.or(cfg.port).unwrap_or(22),
+            tag: cfg.tag,
             alias,
             hostname,
             user,
@@ -154,6 +161,9 @@ struct LocalPrompt {
 /// One connection, from the UI's side.
 pub struct SshSession {
     pub channel: ChannelId,
+    /// The channel that made the SSH connection this shell runs on: its own
+    /// for a fresh login, another tab's for a shell opened on it.
+    pub connection: ChannelId,
     pub target: Target,
     known_hosts: PathBuf,
     state: State,
@@ -203,6 +213,7 @@ impl SshSession {
     pub fn new(channel: ChannelId, target: Target, known_hosts: PathBuf) -> Self {
         Self {
             channel,
+            connection: channel,
             target,
             known_hosts,
             state: State::Connecting,
@@ -253,6 +264,33 @@ impl SshSession {
                 host_key_algs,
             }),
         ]
+    }
+
+    /// Opens a shell on the connection `connection` made, as another
+    /// channel: no new login.
+    pub fn start_on(&mut self, connection: ChannelId, cols: u16, rows: u16) -> Vec<Effect> {
+        self.connection = connection;
+        vec![
+            Effect::Show(dim(&format!(
+                "Opening a new shell on the connection to {}...",
+                self.target.label()
+            ))),
+            Effect::Send(Message::OpenChannel {
+                channel: self.channel,
+                connection,
+                cols,
+                rows,
+            }),
+        ]
+    }
+
+    /// Whether a new tab for `target` can share this session's connection:
+    /// same host, port and user, and logged in.
+    pub fn can_share(&self, target: &Target) -> bool {
+        self.state == State::Connected
+            && self.target.hostname.eq_ignore_ascii_case(&target.hostname)
+            && self.target.port == target.port
+            && self.target.user == target.user
     }
 
     /// Typed or pasted bytes for the host, once connected.
@@ -789,6 +827,40 @@ mod tests {
         let t = Target::resolve("root@other:23", &e).unwrap();
         assert_eq!(t.label(), "root@other:23");
         assert!(Target::resolve("bad host", &e).is_none());
+    }
+
+    #[test]
+    fn second_tab_shares_a_logged_in_connection() {
+        let dir = temp("share");
+        let e = env(&dir);
+        let mut first = SshSession::new(1, Target::resolve("prod", &e).unwrap(), e.known_hosts());
+        first.start(80, 24);
+        // Same host, port and user, under another spelling.
+        let same = Target::resolve("admin@PROD.example.org:2200", &e).unwrap();
+        assert!(!first.can_share(&same), "not logged in yet");
+        first.on_worker(Message::Connected {
+            channel: 1,
+            kex: "k".into(),
+            cipher: "c".into(),
+            host_key: "h".into(),
+        });
+        assert!(first.can_share(&same));
+        assert!(!first.can_share(&Target::resolve("root@prod.example.org:2200", &e).unwrap()));
+        assert!(!first.can_share(&Target::resolve("admin@prod.example.org", &e).unwrap()));
+
+        let mut second = SshSession::new(2, same, e.known_hosts());
+        let fx = second.start_on(first.connection, 100, 30);
+        assert_eq!(
+            sent(&fx),
+            vec![&Message::OpenChannel {
+                channel: 2,
+                connection: 1,
+                cols: 100,
+                rows: 30
+            }]
+        );
+        assert_eq!(second.connection, 1);
+        assert!(shown(&fx).contains("new shell"));
     }
 
     #[test]

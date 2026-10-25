@@ -4,9 +4,9 @@
 
 FeroSSH aims to be the smallest, most secure open-source SSH client for Windows: a native PuTTY replacement with tabs, splits, tmux integration and file transfer, shipped as one signed exe with nothing to install.
 
-> **Status:** milestone 3 (real SSH in one tab). FeroSSH connects with russh from a sandboxed worker process, checks host keys against `~/.ssh/known_hosts`, and signs in with the Windows OpenSSH agent, Pageant, key files, keyboard-interactive or a password. Tabs arrive in milestone 4.
+> **Status:** milestone 4 (tabs, splits and a session manager). FeroSSH connects with russh from a sandboxed worker process, checks host keys against `~/.ssh/known_hosts`, and signs in with the Windows OpenSSH agent, Pageant, key files, keyboard-interactive or a password. File transfer arrives in milestone 5.
 
-## Trying the milestone 3 build
+## Trying the build
 
 Download `ferossh-exe` from the latest CI run and start it with a host, or without one to be asked:
 
@@ -17,7 +17,12 @@ ferossh.exe myalias            # a Host from ~/.ssh/config
 ferossh.exe --local [command]  # a local shell, as in milestone 2
 ```
 
-`HostName`, `User`, `Port` and `IdentityFile` are read from `~/.ssh/config`.
+`HostName`, `User`, `Port`, `IdentityFile`, `Tag` and `Include` are read from `~/.ssh/config`.
+
+- **Tabs and splits.** The window starts with one pane and no tab strip. Ctrl+Shift+T opens a tab, Alt+Shift+= and Alt+Shift+- split the pane; the tab strip appears once there are two tabs. A new tab or pane on a host you are already logged in to opens another channel on the same connection, so there is no second login. Drag a divider to resize, drag a tab to reorder, and Ctrl+Shift+drag a pane onto another pane's edge to move it there (or its middle to swap them).
+- **Session manager.** Ctrl+Shift+S shows the hosts from `~/.ssh/config` in a side pane, hidden by default. Type to filter, Enter connects in this tab (Shift+Enter in a split), Ctrl+D marks a favourite. A `# folder: Name` comment above a `Host` groups hosts. View > Side pane on right moves it; drag its edge to resize it.
+- **PuTTY import.** File > Import PuTTY sessions reads PuTTY's saved SSH sessions (host, port, user, key file, font) into `%APPDATA%\FeroSSH\putty-sessions.conf` in ssh_config syntax. Your `~/.ssh/config` is never touched, and hosts it already has are skipped. PuTTY `.ppk` key files (v2 and v3) work for Ed25519 and ECDSA P-256; RSA `.ppk` keys work through Pageant.
+- **Per-host look.** View > Font and View > Theme change the focused pane; Session > Save font and theme for this host keeps them for the next connection.
 
 - **Host keys.** A new host shows its SHA-256 fingerprint and randomart, and you type `yes` to trust it; the key is saved hashed to `known_hosts`. A changed key fills the window with a warning and cannot be bypassed: if you know why it changed, use Session > Replace host key..., which asks twice.
 - **Sign-in.** Keys are tried from the OpenSSH agent first, then Pageant, then key files (`id_ed25519` and `id_ecdsa` unless the config names others). Key files may be Ed25519 or ECDSA P-256, encrypted or not; the passphrase is asked in the terminal and never kept. RSA keys work only through an agent, need 3072 bits or more, and sign with SHA-2. Then keyboard-interactive (one-time codes) and passwords.
@@ -27,6 +32,11 @@ ferossh.exe --local [command]  # a local shell, as in milestone 2
 | Shortcut | Action |
 | --- | --- |
 | Ctrl+Shift+N / Ctrl+Shift+R | Connect to another host, reconnect |
+| Ctrl+Shift+T / Ctrl+Shift+W | New tab, close the pane |
+| Alt+Shift+= / Alt+Shift+- | Split right, split down |
+| Alt+arrows / Alt+Shift+arrows | Focus the pane in that direction, grow the pane |
+| Ctrl+Tab / Ctrl+Shift+Tab | Next tab, previous tab (Ctrl+Shift+PgUp/PgDn moves it) |
+| Ctrl+Shift+S | Session manager |
 | Ctrl+Shift+C / Ctrl+Shift+V | Copy the selection, paste (also Ctrl+Insert / Shift+Insert) |
 | Ctrl+Shift+F | Find in scrollback (Enter: older match, Shift+Enter: newer, Esc: close) |
 | Shift+PgUp / Shift+PgDn | Scroll back a page, forward a page (Ctrl+Shift+Home/End: top, bottom) |
@@ -42,9 +52,25 @@ Edit > Copy on select and Edit > Right-click pastes turn on the PuTTY habits; bo
 
 ### Colour themes
 
-Built in: Nord (the default), Dracula, Catppuccin Mocha, Gruvbox Dark, Solarized Dark, Tokyo Night, One Dark, Monokai, Rosé Pine, Everforest, Campbell and One Half Light, plus two warning themes: **Production** (muted red background, red cursor) and **Staging** (amber). `ferossh.exe --theme Production prod-db` opens a session in a given theme, which is handy for desktop shortcuts until session profiles arrive.
+Built in: Nord (the default), Dracula, Catppuccin Mocha, Gruvbox Dark, Solarized Dark, Tokyo Night, One Dark, Monokai, Rosé Pine, Everforest, Campbell and One Half Light, plus two warning themes: **Production** (muted red background, red cursor) and **Staging** (amber). `ferossh.exe --theme Production prod-db` opens a session in a given theme, which is handy for desktop shortcuts.
 
-From milestone 4, the theme follows the host automatically: a host tagged `production`, `staging` or `development` with ssh_config's `Tag` keyword gets Production, Staging or Nord, and your own rules can match host patterns (`*.prod.example.com !prod-sandbox`) or tags, with an optional red or amber tint over any theme. The palettes are the themes' published terminal colours; all are MIT licensed except Tokyo Night's terminal port (Apache-2.0).
+The theme follows the host automatically: a host tagged `production`, `staging` or `development` with ssh_config's `Tag` keyword gets Production, Staging or Nord, and your own rules can match host patterns (`*.prod.example.com !prod-sandbox`) or tags, with an optional red or amber tint over any theme. Rules and per-host profiles live in `%APPDATA%\FeroSSH\ferossh.conf`:
+
+```
+ThemeRule
+    Hosts *.prod.example.com !prod-sandbox
+    Theme Production
+ThemeRule
+    Tags staging
+    Theme Nord
+    Tint ffb000 40
+Profile web1
+    Font Cascadia Mono
+    FontSize 12
+    Theme Dracula
+```
+
+`Tint` mixes a colour (hex) into the theme by 0 to 255. A host's profile wins over the rules, and the rules over `--theme`. The palettes are the themes' published terminal colours; all are MIT licensed except Tokyo Night's terminal port (Apache-2.0).
 
 ## Design
 

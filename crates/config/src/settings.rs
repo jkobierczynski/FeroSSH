@@ -1,0 +1,426 @@
+//! FeroSSH's own settings file, `%APPDATA%\FeroSSH\ferossh.conf`: session
+//! profiles (a host's font, text size and colour theme), favourite hosts,
+//! colour theme rules and a few window options.
+//!
+//! It uses ssh_config's syntax, so it reads like the file it sits beside:
+//!
+//! ```text
+//! SidePane right
+//! Favourite web
+//! ThemeRule
+//!     Hosts prod-* *.prod.example.com
+//!     Tags production
+//!     Theme Production
+//!     Tint 800000 60
+//! Profile web
+//!     Font "Cascadia Mono"
+//!     FontSize 12
+//!     Theme Dracula
+//! ```
+//!
+//! FeroSSH rewrites the file when a setting changes. Unknown keywords are
+//! skipped, so an older FeroSSH reads a newer file.
+
+use std::fmt::Write as _;
+
+use crate::host_theme::ThemeRule;
+use crate::ssh_config::split_line;
+
+/// How one host's panes look. Unset fields use the theme rules and
+/// defaults.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Profile {
+    /// The `Host` name from ssh_config, or what was typed.
+    pub host: String,
+    pub font: Option<String>,
+    pub font_size: Option<f32>,
+    pub theme: Option<String>,
+    /// Lines of scrollback for this host's panes.
+    pub scrollback: Option<usize>,
+}
+
+impl Profile {
+    fn is_empty(&self) -> bool {
+        self.font.is_none()
+            && self.font_size.is_none()
+            && self.theme.is_none()
+            && self.scrollback.is_none()
+    }
+}
+
+/// Everything in the settings file.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Settings {
+    pub profiles: Vec<Profile>,
+    pub favourites: Vec<String>,
+    /// User theme rules, tried before the built-in tag rules.
+    pub theme_rules: Vec<ThemeRule>,
+    /// Dock the side pane on the right instead of the left.
+    pub side_pane_right: bool,
+    /// Show the tab strip when there are two or more tabs.
+    pub tab_strip: bool,
+    pub copy_on_select: bool,
+    pub right_click_paste: bool,
+    /// Lines of scrollback for panes without a profile that sets it.
+    pub scrollback: Option<usize>,
+}
+
+/// Scrollback is capped here, as the terminal caps it.
+const MAX_SCROLLBACK: usize = 1_000_000;
+
+fn lines(args: &[String]) -> Option<usize> {
+    args.first()?
+        .parse::<usize>()
+        .ok()
+        .map(|n| n.min(MAX_SCROLLBACK))
+}
+
+impl Default for Settings {
+    fn default() -> Self {
+        Self {
+            profiles: Vec::new(),
+            favourites: Vec::new(),
+            theme_rules: Vec::new(),
+            side_pane_right: false,
+            tab_strip: true,
+            copy_on_select: false,
+            right_click_paste: false,
+            scrollback: None,
+        }
+    }
+}
+
+/// Which block the parser is in.
+enum Block {
+    Top,
+    Profile(usize),
+    Rule(usize),
+}
+
+fn yes(args: &[String]) -> Option<bool> {
+    match args.first()?.to_ascii_lowercase().as_str() {
+        "yes" | "on" | "true" => Some(true),
+        "no" | "off" | "false" => Some(false),
+        _ => None,
+    }
+}
+
+fn hex_rgb(text: &str) -> Option<[u8; 3]> {
+    let text = text.strip_prefix('#').unwrap_or(text);
+    if text.len() != 6 {
+        return None;
+    }
+    let v = u32::from_str_radix(text, 16).ok()?;
+    Some([(v >> 16) as u8, (v >> 8) as u8, v as u8])
+}
+
+/// Quotes an argument that holds spaces; drops characters that would
+/// break the line.
+fn arg(text: &str) -> String {
+    let clean: String = text
+        .chars()
+        .filter(|c| !c.is_control() && *c != '"')
+        .collect();
+    if clean.is_empty() || clean.contains([' ', '\t', '=', '#']) {
+        format!("\"{clean}\"")
+    } else {
+        clean
+    }
+}
+
+impl Settings {
+    pub fn parse(text: &str) -> Self {
+        let mut s = Settings::default();
+        let mut block = Block::Top;
+        for line in text.lines() {
+            let Some((keyword, args)) = split_line(line) else {
+                continue;
+            };
+            let first = args.first().cloned();
+            // Font and theme names may hold spaces, quoted or not.
+            let joined = args.join(" ");
+            match keyword.as_str() {
+                "profile" => {
+                    let Some(host) = first else {
+                        continue;
+                    };
+                    s.profiles.retain(|p| !p.host.eq_ignore_ascii_case(&host));
+                    s.profiles.push(Profile {
+                        host,
+                        ..Profile::default()
+                    });
+                    block = Block::Profile(s.profiles.len() - 1);
+                }
+                "themerule" => {
+                    s.theme_rules.push(ThemeRule::new(""));
+                    block = Block::Rule(s.theme_rules.len() - 1);
+                }
+                "favourite" | "favorite" => {
+                    block = Block::Top;
+                    for host in args {
+                        if !s.favourites.iter().any(|f| f.eq_ignore_ascii_case(&host)) {
+                            s.favourites.push(host);
+                        }
+                    }
+                }
+                "sidepane" => {
+                    block = Block::Top;
+                    s.side_pane_right = first.is_some_and(|a| a.eq_ignore_ascii_case("right"));
+                }
+                "tabstrip" => {
+                    block = Block::Top;
+                    s.tab_strip = yes(&args).unwrap_or(true);
+                }
+                "copyonselect" => {
+                    block = Block::Top;
+                    s.copy_on_select = yes(&args).unwrap_or(false);
+                }
+                "rightclickpaste" => {
+                    block = Block::Top;
+                    s.right_click_paste = yes(&args).unwrap_or(false);
+                }
+                "scrollback" if matches!(block, Block::Profile(_)) => {
+                    if let Block::Profile(i) = block
+                        && let Some(p) = s.profiles.get_mut(i)
+                    {
+                        p.scrollback = lines(&args);
+                    }
+                }
+                "scrollback" => {
+                    block = Block::Top;
+                    s.scrollback = lines(&args);
+                }
+                _ => match block {
+                    Block::Profile(i) => {
+                        let Some(p) = s.profiles.get_mut(i) else {
+                            continue;
+                        };
+                        match keyword.as_str() {
+                            "font" => p.font = Some(joined).filter(|f| !f.is_empty()),
+                            "fontsize" => {
+                                p.font_size = first
+                                    .and_then(|v| v.parse::<f32>().ok())
+                                    .filter(|v| (4.0..=96.0).contains(v));
+                            }
+                            "theme" => p.theme = Some(joined).filter(|t| !t.is_empty()),
+                            _ => {}
+                        }
+                    }
+                    Block::Rule(i) => {
+                        let Some(r) = s.theme_rules.get_mut(i) else {
+                            continue;
+                        };
+                        match keyword.as_str() {
+                            "hosts" => r.hosts.extend(args),
+                            "tags" => r.tags.extend(args),
+                            "theme" => r.theme = joined,
+                            "tint" => {
+                                let rgb = first.as_deref().and_then(hex_rgb);
+                                let amount = args.get(1).and_then(|a| a.parse::<u8>().ok());
+                                r.tint = rgb.zip(amount);
+                            }
+                            _ => {}
+                        }
+                    }
+                    Block::Top => {}
+                },
+            }
+        }
+        s.theme_rules
+            .retain(|r| !r.theme.is_empty() && !(r.hosts.is_empty() && r.tags.is_empty()));
+        s
+    }
+
+    /// The file's text.
+    pub fn to_text(&self) -> String {
+        let mut out = String::from(
+            "# FeroSSH settings. FeroSSH rewrites this file; comments are not kept.\n",
+        );
+        let flag = |b: bool| if b { "yes" } else { "no" };
+        let _ = writeln!(
+            out,
+            "SidePane {}",
+            if self.side_pane_right {
+                "right"
+            } else {
+                "left"
+            }
+        );
+        let _ = writeln!(out, "TabStrip {}", flag(self.tab_strip));
+        let _ = writeln!(out, "CopyOnSelect {}", flag(self.copy_on_select));
+        let _ = writeln!(out, "RightClickPaste {}", flag(self.right_click_paste));
+        if let Some(n) = self.scrollback {
+            let _ = writeln!(out, "Scrollback {n}");
+        }
+        for f in &self.favourites {
+            let _ = writeln!(out, "Favourite {}", arg(f));
+        }
+        for r in &self.theme_rules {
+            out.push_str("ThemeRule\n");
+            if !r.hosts.is_empty() {
+                let hosts: Vec<String> = r.hosts.iter().map(|h| arg(h)).collect();
+                let _ = writeln!(out, "    Hosts {}", hosts.join(" "));
+            }
+            if !r.tags.is_empty() {
+                let tags: Vec<String> = r.tags.iter().map(|t| arg(t)).collect();
+                let _ = writeln!(out, "    Tags {}", tags.join(" "));
+            }
+            let _ = writeln!(out, "    Theme {}", arg(&r.theme));
+            if let Some(([red, green, blue], amount)) = r.tint {
+                let _ = writeln!(out, "    Tint {red:02x}{green:02x}{blue:02x} {amount}");
+            }
+        }
+        for p in self.profiles.iter().filter(|p| !p.is_empty()) {
+            let _ = writeln!(out, "Profile {}", arg(&p.host));
+            if let Some(f) = &p.font {
+                let _ = writeln!(out, "    Font {}", arg(f));
+            }
+            if let Some(size) = p.font_size {
+                let _ = writeln!(out, "    FontSize {size}");
+            }
+            if let Some(t) = &p.theme {
+                let _ = writeln!(out, "    Theme {}", arg(t));
+            }
+            if let Some(n) = p.scrollback {
+                let _ = writeln!(out, "    Scrollback {n}");
+            }
+        }
+        out
+    }
+
+    pub fn profile(&self, host: &str) -> Option<&Profile> {
+        self.profiles
+            .iter()
+            .find(|p| p.host.eq_ignore_ascii_case(host))
+    }
+
+    /// The host's profile, made if missing.
+    pub fn profile_mut(&mut self, host: &str) -> &mut Profile {
+        let i = match self
+            .profiles
+            .iter()
+            .position(|p| p.host.eq_ignore_ascii_case(host))
+        {
+            Some(i) => i,
+            None => {
+                self.profiles.push(Profile {
+                    host: host.to_owned(),
+                    ..Profile::default()
+                });
+                self.profiles.len() - 1
+            }
+        };
+        // `i` is in range: found above or just pushed.
+        #[allow(clippy::indexing_slicing)]
+        &mut self.profiles[i]
+    }
+
+    pub fn is_favourite(&self, host: &str) -> bool {
+        self.favourites.iter().any(|f| f.eq_ignore_ascii_case(host))
+    }
+
+    /// Adds or removes a favourite; returns whether it is one now.
+    pub fn toggle_favourite(&mut self, host: &str) -> bool {
+        if self.is_favourite(host) {
+            self.favourites.retain(|f| !f.eq_ignore_ascii_case(host));
+            false
+        } else {
+            self.favourites.push(host.to_owned());
+            true
+        }
+    }
+
+    /// The theme rules: the user's, then the built-in tag rules.
+    pub fn host_themes(&self) -> crate::HostThemes {
+        let mut themes = crate::HostThemes::new();
+        for r in &self.theme_rules {
+            themes.push(r.clone());
+        }
+        themes
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::indexing_slicing)]
+mod tests {
+    use super::*;
+
+    const TEXT: &str = r#"
+# comment
+SidePane right
+TabStrip no
+Scrollback 50000
+Favourite web "db one"
+Favorite WEB
+ThemeRule
+    Hosts prod-* *.prod.example.com
+    Tags production
+    Theme Production
+    Tint #800000 60
+ThemeRule
+    Theme Nord
+Profile web
+    Font "Cascadia Mono"
+    FontSize 12.5
+    Theme Dracula
+    Scrollback 99999999
+    Unknown thing
+Profile big
+    FontSize 400
+    Theme Solarized Dark
+NewKeyword later
+"#;
+
+    #[test]
+    fn parses() {
+        let s = Settings::parse(TEXT);
+        assert!(s.side_pane_right);
+        assert!(!s.tab_strip);
+        assert_eq!(s.favourites, ["web", "db one"]);
+        assert_eq!(
+            s.theme_rules.len(),
+            1,
+            "a rule without hosts or tags is dropped"
+        );
+        let r = &s.theme_rules[0];
+        assert_eq!(r.hosts, ["prod-*", "*.prod.example.com"]);
+        assert_eq!(r.tint, Some(([0x80, 0, 0], 60)));
+        let web = s.profile("WEB").unwrap();
+        assert_eq!(web.font.as_deref(), Some("Cascadia Mono"));
+        assert_eq!(web.font_size, Some(12.5));
+        assert_eq!(web.theme.as_deref(), Some("Dracula"));
+        assert_eq!(web.scrollback, Some(1_000_000));
+        assert_eq!(s.scrollback, Some(50_000));
+        let big = s.profile("big").unwrap();
+        assert_eq!(big.font_size, None);
+        assert_eq!(big.theme.as_deref(), Some("Solarized Dark"));
+    }
+
+    #[test]
+    fn round_trips() {
+        let s = Settings::parse(TEXT);
+        let again = Settings::parse(&s.to_text());
+        assert_eq!(again, s);
+        assert_eq!(Settings::parse(""), Settings::default());
+    }
+
+    #[test]
+    fn writes_safe_lines() {
+        let mut s = Settings::default();
+        s.profile_mut("evil\nProfile x").theme = Some("a\"b".into());
+        let text = s.to_text();
+        assert!(!text.contains("\nProfile x"));
+        let back = Settings::parse(&text);
+        assert_eq!(back.profiles.len(), 1);
+        assert_eq!(back.profiles[0].theme.as_deref(), Some("ab"));
+    }
+
+    #[test]
+    fn favourites_toggle() {
+        let mut s = Settings::default();
+        assert!(s.toggle_favourite("web"));
+        assert!(s.is_favourite("Web"));
+        assert!(!s.toggle_favourite("WEB"));
+        assert!(s.favourites.is_empty());
+    }
+}

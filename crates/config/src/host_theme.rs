@@ -2,8 +2,8 @@
 //! production red, staging amber, development Nord.
 //!
 //! A rule matches a host by `Host`-style patterns or by a group tag. Tags
-//! come from ssh_config's `Tag` keyword (OpenSSH 9.4+) once session
-//! profiles arrive in milestone 4, so one ssh_config line such as
+//! come from ssh_config's `Tag` keyword (OpenSSH 9.4+), so one ssh_config
+//! line such as
 //! `Tag production` both groups the hosts for OpenSSH's `Match tagged` and
 //! colours FeroSSH's panes. The first matching rule wins, like ssh_config.
 

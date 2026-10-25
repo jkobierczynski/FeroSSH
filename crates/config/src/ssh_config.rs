@@ -1,12 +1,18 @@
-//! The part of OpenSSH's `ssh_config` that milestone 3 needs to reach a
-//! host: `Host` blocks with `HostName`, `User`, `Port` and `IdentityFile`.
+//! The part of OpenSSH's `ssh_config` that FeroSSH uses: `Host` blocks
+//! with `HostName`, `User`, `Port`, `IdentityFile` and `Tag`, `Include`d
+//! files, and the list of hosts the session manager shows.
 //!
 //! The rules follow `ssh_config(5)`: keywords are case-insensitive, the
 //! first value found for a keyword wins (except `IdentityFile`, which
 //! accumulates), and a `Host` line matches when any of its patterns matches
-//! the name typed and no `!` pattern does. `Match` blocks are skipped and
-//! `Include` is not followed yet; the session manager (milestone 4) brings
-//! the full parser.
+//! the name typed and no `!` pattern does. `Match` blocks are skipped.
+//! `Include` reads files through an [`Includes`], so the parser itself
+//! never touches the disk.
+//!
+//! The session manager groups hosts into folders: a comment line
+//! `# folder: Name` puts the hosts after it in that folder, and hosts from
+//! an included file without such a comment go in a folder named after the
+//! file.
 
 use crate::known_hosts::match_pattern_list;
 
@@ -18,11 +24,190 @@ pub struct HostConfig {
     pub port: Option<u16>,
     /// As written, before `~` and `%` expansion; see [`expand_path`].
     pub identity_files: Vec<String>,
+    /// The `Tag` keyword (OpenSSH 9.4+), which also picks a colour theme.
+    pub tag: Option<String>,
+}
+
+/// Include files nest at most this deep, as in OpenSSH.
+const MAX_INCLUDE_DEPTH: usize = 16;
+
+/// Reads the files an `Include` line names.
+pub trait Includes {
+    /// The files `pattern` names, in order, as (file name, text).
+    fn read(&self, pattern: &str) -> Vec<(String, String)>;
+}
+
+/// Ignores `Include` lines.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct NoIncludes;
+
+impl Includes for NoIncludes {
+    fn read(&self, _: &str) -> Vec<(String, String)> {
+        Vec::new()
+    }
+}
+
+/// Reads included files from disk: relative paths are relative to the
+/// `.ssh` folder, `~` is the home folder, and `*` and `?` may appear in
+/// the file name (not in folder names).
+#[derive(Debug, Clone)]
+pub struct DirIncludes {
+    pub home: std::path::PathBuf,
+}
+
+impl Includes for DirIncludes {
+    fn read(&self, pattern: &str) -> Vec<(String, String)> {
+        use std::path::{Path, PathBuf};
+        let path = match pattern.strip_prefix('~') {
+            Some(rest) if rest.starts_with(['/', '\\']) => {
+                self.home.join(rest.trim_start_matches(['/', '\\']))
+            }
+            _ if Path::new(pattern).is_absolute() => PathBuf::from(pattern),
+            _ => self.home.join(".ssh").join(pattern),
+        };
+        let (Some(dir), Some(name)) = (path.parent(), path.file_name()) else {
+            return Vec::new();
+        };
+        let name = name.to_string_lossy();
+        let mut found: Vec<PathBuf> = if name.contains(['*', '?']) {
+            std::fs::read_dir(dir)
+                .map(|entries| {
+                    entries
+                        .filter_map(Result::ok)
+                        .filter(|e| e.file_type().is_ok_and(|t| t.is_file()))
+                        .filter(|e| {
+                            crate::pattern::match_pattern(&e.file_name().to_string_lossy(), &name)
+                        })
+                        .map(|e| e.path())
+                        .collect()
+                })
+                .unwrap_or_default()
+        } else {
+            vec![path.clone()]
+        };
+        // OpenSSH reads glob matches in lexical order.
+        found.sort();
+        found
+            .into_iter()
+            .filter_map(|p| {
+                let text = std::fs::read_to_string(&p).ok()?;
+                let stem = p.file_stem()?.to_string_lossy().into_owned();
+                Some((stem, text))
+            })
+            .collect()
+    }
+}
+
+/// One line of the config with Includes expanded: keyword, arguments, and
+/// the folder it belongs to. Empty keywords mark where an included file
+/// starts (`"{"`) and ends (`"}"`).
+struct Line {
+    keyword: String,
+    args: Vec<String>,
+    folder: Option<String>,
+}
+
+impl Line {
+    fn mark(keyword: &str) -> Self {
+        Self {
+            keyword: keyword.to_owned(),
+            args: Vec::new(),
+            folder: None,
+        }
+    }
+}
+
+/// `# folder: Name` or `#folder Name`, as the session manager's folders.
+fn folder_comment(line: &str) -> Option<String> {
+    let rest = line.trim().strip_prefix('#')?.trim_start();
+    let head = rest.get(..6)?;
+    if !head.eq_ignore_ascii_case("folder") {
+        return None;
+    }
+    let name = rest.get(6..)?.trim_start_matches([':', ' ', '\t']).trim();
+    Some(name.to_owned())
+}
+
+fn flatten(
+    text: &str,
+    folder: Option<String>,
+    includes: &dyn Includes,
+    depth: usize,
+    out: &mut Vec<Line>,
+) {
+    let mut folder = folder;
+    for raw in text.lines() {
+        if let Some(name) = folder_comment(raw) {
+            folder = (!name.is_empty()).then_some(name);
+            continue;
+        }
+        let Some((keyword, args)) = split_line(raw) else {
+            continue;
+        };
+        if keyword == "include" {
+            if depth >= MAX_INCLUDE_DEPTH {
+                continue;
+            }
+            for pattern in &args {
+                for (stem, text) in includes.read(pattern) {
+                    let inner = folder.clone().or(Some(stem));
+                    out.push(Line::mark("{"));
+                    flatten(&text, inner, includes, depth + 1, out);
+                    out.push(Line::mark("}"));
+                }
+            }
+            continue;
+        }
+        out.push(Line {
+            keyword,
+            args,
+            folder: folder.clone(),
+        });
+    }
+}
+
+/// The config's lines with every `Include` read in place.
+fn lines(text: &str, includes: &dyn Includes) -> Vec<Line> {
+    let mut out = Vec::new();
+    flatten(text, None, includes, 0, &mut out);
+    out
+}
+
+/// A host the session manager lists: a `Host` pattern without wildcards.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HostEntry {
+    pub name: String,
+    pub folder: Option<String>,
+}
+
+/// Every host named on a `Host` line, in file order, without duplicates.
+/// Patterns with `*` or `?` and negated ones are not hosts one can pick.
+pub fn hosts(text: &str, includes: &dyn Includes) -> Vec<HostEntry> {
+    let mut out: Vec<HostEntry> = Vec::new();
+    for line in lines(text, includes) {
+        if line.keyword != "host" {
+            continue;
+        }
+        for pattern in line.args.iter().flat_map(|a| a.split(',')) {
+            if pattern.is_empty()
+                || pattern.starts_with('!')
+                || pattern.contains(['*', '?'])
+                || out.iter().any(|h| h.name.eq_ignore_ascii_case(pattern))
+            {
+                continue;
+            }
+            out.push(HostEntry {
+                name: pattern.to_owned(),
+                folder: line.folder.clone(),
+            });
+        }
+    }
+    out
 }
 
 /// Splits a config line into keyword and arguments, honouring `=` and
 /// double quotes.
-fn split_line(line: &str) -> Option<(String, Vec<String>)> {
+pub(crate) fn split_line(line: &str) -> Option<(String, Vec<String>)> {
     let line = line.trim();
     if line.is_empty() || line.starts_with('#') {
         return None;
@@ -75,17 +260,26 @@ fn host_line_matches(patterns: &[String], name: &str) -> bool {
     matched
 }
 
-/// Applies the config text to the name the user typed.
+/// Applies the config text to the name the user typed, ignoring `Include`.
 pub fn resolve(text: &str, name: &str) -> HostConfig {
+    resolve_in(text, name, &NoIncludes)
+}
+
+/// Applies the config text, with its included files, to the name the user
+/// typed.
+pub fn resolve_in(text: &str, name: &str, includes: &dyn Includes) -> HostConfig {
     let mut cfg = HostConfig::default();
     // Lines before the first Host apply to every host.
     let mut active = true;
-    for line in text.lines() {
-        let Some((keyword, args)) = split_line(line) else {
-            continue;
-        };
+    // The state where each open Include started. A Host line inside an
+    // included file does not leak into the file that included it, and an
+    // Include in a block that does not match never matches, as in OpenSSH.
+    let mut outer: Vec<bool> = Vec::new();
+    for Line { keyword, args, .. } in lines(text, includes) {
         match keyword.as_str() {
-            "host" => active = host_line_matches(&args, name),
+            "{" => outer.push(active),
+            "}" => active = outer.pop().unwrap_or(active),
+            "host" => active = outer.iter().all(|&a| a) && host_line_matches(&args, name),
             "match" => active = false,
             _ if !active => {}
             "hostname" => {
@@ -107,6 +301,7 @@ pub fn resolve(text: &str, name: &str) -> HostConfig {
                 }
             }
             "identityfile" => cfg.identity_files.extend(args.into_iter().take(1)),
+            "tag" if cfg.tag.is_none() => cfg.tag = args.into_iter().next(),
             _ => {}
         }
     }
@@ -234,6 +429,105 @@ Host *
     #[test]
     fn match_blocks_are_skipped() {
         assert_eq!(resolve(CONFIG, "other").user.as_deref(), Some("global"));
+    }
+
+    /// Serves included files from a list.
+    struct Files(Vec<(&'static str, &'static str)>);
+
+    impl Includes for Files {
+        fn read(&self, pattern: &str) -> Vec<(String, String)> {
+            self.0
+                .iter()
+                .filter(|(name, _)| crate::pattern::match_pattern(name, pattern))
+                .map(|(n, t)| ((*n).to_owned(), (*t).to_owned()))
+                .collect()
+        }
+    }
+
+    const MAIN: &str = "\
+Include work*
+# folder: Home lab
+Host nas pi, router *.lan
+    Tag dev
+Host !nas *
+    User me
+Host gateway
+    Include conditional
+";
+
+    fn files() -> Files {
+        Files(vec![
+            (
+                "work-eu",
+                "Host db1 db2\n  HostName %h.eu.example\n  Tag production\nHost nas\n  Port 2222\n",
+            ),
+            ("work-us", "# folder: US\nHost web-us\n"),
+            ("conditional", "Port 2200\nHost late\n  User late\n"),
+        ])
+    }
+
+    #[test]
+    fn lists_hosts_with_folders() {
+        let list = hosts(MAIN, &files());
+        let names: Vec<(&str, Option<&str>)> = list
+            .iter()
+            .map(|h| (h.name.as_str(), h.folder.as_deref()))
+            .collect();
+        assert_eq!(
+            names,
+            [
+                ("db1", Some("work-eu")),
+                ("db2", Some("work-eu")),
+                ("nas", Some("work-eu")),
+                ("web-us", Some("US")),
+                ("pi", Some("Home lab")),
+                ("router", Some("Home lab")),
+                ("gateway", Some("Home lab")),
+                ("late", Some("Home lab")),
+            ]
+        );
+    }
+
+    #[test]
+    fn includes_apply_in_place() {
+        let f = files();
+        let db = resolve_in(MAIN, "db2", &f);
+        assert_eq!(db.hostname.as_deref(), Some("%h.eu.example"));
+        assert_eq!(db.tag.as_deref(), Some("production"));
+        assert_eq!(db.user.as_deref(), Some("me"));
+        // The included file's port wins: it comes first.
+        assert_eq!(resolve_in(MAIN, "nas", &f).port, Some(2222));
+        assert_eq!(resolve_in(MAIN, "nas", &f).tag.as_deref(), Some("dev"));
+        // Without includes the same names know less.
+        assert_eq!(resolve(MAIN, "db2").hostname, None);
+        // Included inside `Host gateway`: only gateway gets the port, and
+        // the Host line inside the conditional include never matches.
+        assert_eq!(resolve_in(MAIN, "gateway", &f).port, Some(2200));
+        assert_eq!(resolve_in(MAIN, "web", &f).port, None);
+        assert_eq!(resolve_in(MAIN, "late", &f).user.as_deref(), Some("me"));
+    }
+
+    #[test]
+    fn include_loops_stop() {
+        let looped = Files(vec![("self", "Include self\nHost x\n")]);
+        let list = hosts("Include self", &looped);
+        assert_eq!(list.len(), 1);
+    }
+
+    #[test]
+    fn reads_includes_from_disk() {
+        let home = std::env::temp_dir().join(format!("ferossh-inc-{}", std::process::id()));
+        let ssh = home.join(".ssh").join("conf.d");
+        std::fs::create_dir_all(&ssh).unwrap();
+        std::fs::write(ssh.join("b.conf"), "Host bee\n").unwrap();
+        std::fs::write(ssh.join("a.conf"), "Host ay\n").unwrap();
+        std::fs::write(ssh.join("skip.txt"), "Host no\n").unwrap();
+        let inc = DirIncludes { home: home.clone() };
+        let list = hosts("Include conf.d/*.conf ~/.ssh/conf.d/b.conf", &inc);
+        let names: Vec<&str> = list.iter().map(|h| h.name.as_str()).collect();
+        assert_eq!(names, ["ay", "bee"]);
+        assert_eq!(list[0].folder.as_deref(), Some("a"));
+        let _ = std::fs::remove_dir_all(&home);
     }
 
     #[test]

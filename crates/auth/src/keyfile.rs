@@ -1,4 +1,5 @@
-//! OpenSSH private key files (`~/.ssh/id_ed25519` and friends).
+//! Private key files: OpenSSH's (`~/.ssh/id_ed25519` and friends) and
+//! PuTTY's `.ppk` (versions 2 and 3).
 //!
 //! The file is read in the UI process; its public half is offered to the
 //! server, and the private half is decrypted only when the server accepts
@@ -7,6 +8,10 @@
 //! RSA private-key operation ever runs in FeroSSH (see the `rsa` advisory
 //! exception in `deny.toml`), and FIDO2 key handles need the token
 //! (milestone 6).
+//!
+//! A `.ppk` file keeps its public key in the clear, so FeroSSH reads that
+//! part itself; the private part, its MAC and its encryption are checked
+//! and decrypted by `ssh-key` only when signing.
 
 use std::fmt;
 use std::path::{Path, PathBuf};
@@ -21,9 +26,7 @@ use zeroize::Zeroizing;
 pub enum KeyFileError {
     /// The file is missing or unreadable.
     Unreadable(String),
-    /// A PuTTY key: import arrives in milestone 4; Pageant can load it now.
-    PuttyFormat,
-    /// Not an OpenSSH private key.
+    /// Not an OpenSSH or PuTTY private key.
     Malformed,
     /// A key type FeroSSH does not use from a file.
     Unsupported(String),
@@ -39,16 +42,25 @@ impl fmt::Display for KeyFileError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Unreadable(e) => write!(f, "cannot read it ({e})"),
-            Self::PuttyFormat => f.write_str(
-                "it is a PuTTY key; load it into Pageant for now (import arrives in milestone 4)",
-            ),
-            Self::Malformed => f.write_str("it is not an OpenSSH private key"),
-            Self::Unsupported(kind) => write!(f, "{kind} keys are only used through the agent"),
+            Self::Malformed => f.write_str("it is not an OpenSSH or PuTTY private key"),
+            Self::Unsupported(kind) => {
+                write!(f, "{kind} keys are only used through the agent or Pageant")
+            }
             Self::WrongPassphrase => f.write_str("wrong passphrase"),
             Self::NeedsPassphrase => f.write_str("it needs a passphrase"),
             Self::SignFailed => f.write_str("signing failed"),
         }
     }
+}
+
+/// The private half, as stored.
+enum Secret {
+    OpenSsh(Box<PrivateKey>),
+    /// The whole `.ppk` text; `encrypted` from its `Encryption` header.
+    Ppk {
+        text: Zeroizing<String>,
+        encrypted: bool,
+    },
 }
 
 /// A private key file whose public half is known.
@@ -57,7 +69,48 @@ pub struct KeyFile {
     /// The public key in SSH wire format.
     pub public: Vec<u8>,
     pub comment: String,
-    key: PrivateKey,
+    key: Secret,
+}
+
+/// The clear-text header of a `.ppk` file: algorithm, encryption, comment
+/// and the public key blob.
+fn ppk_public(text: &str) -> Result<(Algorithm, bool, String, Vec<u8>), KeyFileError> {
+    use russh::keys::ssh_encoding::Base64Reader;
+    use russh::keys::ssh_encoding::Reader as _;
+    let mut lines = text.lines();
+    let mut header = |name: &str| -> Result<String, KeyFileError> {
+        let line = lines.next().ok_or(KeyFileError::Malformed)?;
+        let (key, value) = line.split_once(": ").ok_or(KeyFileError::Malformed)?;
+        if !(key == name || (name == "PuTTY" && key.starts_with("PuTTY-User-Key-File-"))) {
+            return Err(KeyFileError::Malformed);
+        }
+        Ok(value.trim().to_owned())
+    };
+    let alg = header("PuTTY")?;
+    let encryption = header("Encryption")?;
+    let comment = header("Comment")?;
+    let count: usize = header("Public-Lines")?
+        .parse()
+        .map_err(|_| KeyFileError::Malformed)?;
+    if count > 64 {
+        return Err(KeyFileError::Malformed);
+    }
+    let b64: String = lines.take(count).map(str::trim).collect();
+    let mut reader = Base64Reader::new(b64.as_bytes()).map_err(|_| KeyFileError::Malformed)?;
+    let mut blob = vec![0u8; reader.remaining_len()];
+    reader
+        .read(&mut blob)
+        .map_err(|_| KeyFileError::Malformed)?;
+    let public = russh::keys::PublicKey::from_bytes(&blob).map_err(|_| KeyFileError::Malformed)?;
+    if public.algorithm().as_str() != alg {
+        return Err(KeyFileError::Malformed);
+    }
+    let encrypted = match encryption.as_str() {
+        "none" => false,
+        "aes256-cbc" => true,
+        _ => return Err(KeyFileError::Malformed),
+    };
+    Ok((public.algorithm(), encrypted, comment, blob))
 }
 
 impl fmt::Debug for KeyFile {
@@ -82,8 +135,18 @@ fn usable(alg: &Algorithm) -> Result<(), KeyFileError> {
 impl KeyFile {
     /// Parses an OpenSSH private key; the private half stays encrypted.
     pub fn parse(path: &Path, text: &str) -> Result<Self, KeyFileError> {
-        if text.trim_start().starts_with("PuTTY-User-Key-File") {
-            return Err(KeyFileError::PuttyFormat);
+        if text.trim_start().starts_with("PuTTY-User-Key-File-") {
+            let (alg, encrypted, comment, public) = ppk_public(text.trim_start())?;
+            usable(&alg)?;
+            return Ok(Self {
+                path: path.to_owned(),
+                public,
+                comment,
+                key: Secret::Ppk {
+                    text: Zeroizing::new(text.trim_start().to_owned()),
+                    encrypted,
+                },
+            });
         }
         let key = PrivateKey::from_openssh(text).map_err(|_| KeyFileError::Malformed)?;
         usable(&key.algorithm())?;
@@ -95,7 +158,7 @@ impl KeyFile {
             path: path.to_owned(),
             public,
             comment: key.comment().as_str_lossy().to_owned(),
-            key,
+            key: Secret::OpenSsh(Box::new(key)),
         })
     }
 
@@ -107,22 +170,45 @@ impl KeyFile {
     }
 
     pub fn is_encrypted(&self) -> bool {
-        self.key.is_encrypted()
+        match &self.key {
+            Secret::OpenSsh(k) => k.is_encrypted(),
+            Secret::Ppk { encrypted, .. } => *encrypted,
+        }
     }
 
     /// Signs `data` and returns the SSH signature blob. The decrypted key
     /// lives only for this call.
     pub fn sign(&self, passphrase: Option<&str>, data: &[u8]) -> Result<Vec<u8>, KeyFileError> {
         let decrypted;
-        let key = if self.key.is_encrypted() {
-            let pass = passphrase.ok_or(KeyFileError::NeedsPassphrase)?;
-            decrypted = self
-                .key
-                .decrypt(pass)
-                .map_err(|_| KeyFileError::WrongPassphrase)?;
-            &decrypted
-        } else {
-            &self.key
+        let key = match &self.key {
+            Secret::OpenSsh(key) if key.is_encrypted() => {
+                let pass = passphrase.ok_or(KeyFileError::NeedsPassphrase)?;
+                decrypted = key
+                    .decrypt(pass)
+                    .map_err(|_| KeyFileError::WrongPassphrase)?;
+                &decrypted
+            }
+            Secret::OpenSsh(key) => key,
+            Secret::Ppk { text, encrypted } => {
+                if *encrypted && passphrase.is_none() {
+                    return Err(KeyFileError::NeedsPassphrase);
+                }
+                // The MAC covers the whole file: a wrong passphrase and a
+                // tampered file look the same.
+                decrypted = PrivateKey::from_ppk(text.as_str(), passphrase.map(str::to_owned))
+                    .map_err(|_| {
+                        if *encrypted {
+                            KeyFileError::WrongPassphrase
+                        } else {
+                            KeyFileError::Malformed
+                        }
+                    })?;
+                // The key that signs must be the one offered.
+                if decrypted.public_key().to_bytes().ok().as_deref() != Some(&self.public[..]) {
+                    return Err(KeyFileError::Malformed);
+                }
+                &decrypted
+            }
         };
         let sig = key.try_sign(data).map_err(|_| KeyFileError::SignFailed)?;
         let mut blob = Vec::new();
@@ -199,11 +285,104 @@ mod tests {
         assert!(KeyFile::parse(Path::new("k"), &key_file(p384, None)).is_err());
         assert_eq!(
             KeyFile::parse(Path::new("k"), "PuTTY-User-Key-File-3: ssh-ed25519\n").err(),
-            Some(KeyFileError::PuttyFormat)
+            Some(KeyFileError::Malformed)
         );
         assert_eq!(
             KeyFile::parse(Path::new("k"), "hello").err(),
             Some(KeyFileError::Malformed)
         );
+    }
+
+    /// Makes a `.ppk` with puttygen, if installed (the Linux CI job has it).
+    fn puttygen(kind: &str, passphrase: Option<&str>) -> Option<String> {
+        use std::process::{Command, Stdio};
+        let dir = std::env::temp_dir().join(format!(
+            "ferossh-ppk-{kind}-{}-{}",
+            passphrase.is_some(),
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).ok()?;
+        let key = dir.join("k.ppk");
+        let mut cmd = Command::new("puttygen");
+        cmd.args(["-t", kind, "-q", "-C", "putty test", "-o"])
+            .arg(&key);
+        if kind == "ecdsa" {
+            cmd.args(["-b", "256"]);
+        }
+        // An empty passphrase file makes an unencrypted key.
+        let pass = dir.join("pass");
+        std::fs::write(&pass, passphrase.unwrap_or_default()).ok()?;
+        cmd.arg("--new-passphrase").arg(pass);
+        let ok = cmd
+            .stdin(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .ok()?
+            .success();
+        let text = std::fs::read_to_string(&key).ok();
+        let _ = std::fs::remove_dir_all(&dir);
+        if !ok {
+            return None;
+        }
+        text
+    }
+
+    fn have_puttygen() -> bool {
+        let found = std::process::Command::new("puttygen")
+            .arg("--version")
+            .output()
+            .is_ok();
+        if !found {
+            assert!(
+                std::env::var_os("FEROSSH_REQUIRE_PUTTYGEN").is_none(),
+                "FEROSSH_REQUIRE_PUTTYGEN is set but puttygen is missing"
+            );
+            eprintln!("puttygen not found; skipping");
+        }
+        found
+    }
+
+    #[test]
+    fn ppk_keys_sign() {
+        if !have_puttygen() {
+            return;
+        }
+        let plain = puttygen("ed25519", None).unwrap();
+        let kf = KeyFile::parse(Path::new("k.ppk"), &plain).unwrap();
+        assert!(!kf.is_encrypted());
+        assert_eq!(kf.comment, "putty test");
+        let blob = kf.sign(None, b"data").unwrap();
+        verify(&kf.public, b"data", &blob);
+
+        let locked = puttygen("ecdsa", Some("pw")).unwrap();
+        let kf = KeyFile::parse(Path::new("k.ppk"), &locked).unwrap();
+        assert!(kf.is_encrypted());
+        assert_eq!(kf.sign(None, b"x"), Err(KeyFileError::NeedsPassphrase));
+        assert_eq!(
+            kf.sign(Some("no"), b"x"),
+            Err(KeyFileError::WrongPassphrase)
+        );
+        let blob = kf.sign(Some("pw"), b"data").unwrap();
+        verify(&kf.public, b"data", &blob);
+    }
+
+    #[test]
+    fn ppk_rsa_and_tampering_are_refused() {
+        if !have_puttygen() {
+            return;
+        }
+        let rsa = puttygen("rsa", None).unwrap();
+        assert!(matches!(
+            KeyFile::parse(Path::new("k.ppk"), &rsa),
+            Err(KeyFileError::Unsupported(_))
+        ));
+        // Swap in another key's public lines: the MAC check catches it.
+        let a = puttygen("ed25519", None).unwrap();
+        let b = puttygen("ed25519", None).unwrap();
+        let public = |t: &str| t.lines().nth(4).unwrap_or_default().to_owned();
+        let forged = a.replace(&public(&a), &public(&b));
+        let kf = KeyFile::parse(Path::new("k.ppk"), &forged).unwrap();
+        assert!(kf.sign(None, b"x").is_err());
     }
 }

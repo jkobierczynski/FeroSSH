@@ -242,10 +242,16 @@ impl Renderer {
         }
     }
 
-    /// Draws the window's panes. Pass every pane: if the render target had
-    /// to be recreated, all of them are redrawn in full.
-    pub fn draw(&mut self, panes: &[PaneView<'_>], dpi: u32) -> Result<Frame> {
-        match self.draw_inner(panes, dpi) {
+    /// Draws the window's panes, then `fills` (split dividers, the focus
+    /// frame) over them. Pass every pane: if the render target had to be
+    /// recreated, all of them are redrawn in full.
+    pub fn draw(
+        &mut self,
+        panes: &[PaneView<'_>],
+        fills: &[(PixelRect, Rgb)],
+        dpi: u32,
+    ) -> Result<Frame> {
+        match self.draw_inner(panes, fills, dpi) {
             Err(e) if e.code() == D2DERR_RECREATE_TARGET => {
                 self.target = None;
                 Ok(Frame::Lost)
@@ -254,7 +260,12 @@ impl Renderer {
         }
     }
 
-    fn draw_inner(&mut self, panes: &[PaneView<'_>], dpi: u32) -> Result<Frame> {
+    fn draw_inner(
+        &mut self,
+        panes: &[PaneView<'_>],
+        fills: &[(PixelRect, Rgb)],
+        dpi: u32,
+    ) -> Result<Frame> {
         for p in panes {
             self.metrics(p.font, dpi)?;
         }
@@ -308,6 +319,14 @@ impl Renderer {
             let key = FontKey::new(p.font, dpi);
             if let (Some(font), Some(atlas)) = (self.fonts.get(&key), target.atlases.get(&key)) {
                 draw_pane(rt, &target.brush, atlas, &font.metrics, p, fresh);
+            }
+        }
+        for (r, c) in fills {
+            let r = rect(r.left as f32, r.top as f32, r.right as f32, r.bottom as f32);
+            // SAFETY: drawing calls between Begin and EndDraw.
+            unsafe {
+                target.brush.SetColor(&color(*c));
+                rt.FillRectangle(&r, &target.brush);
             }
         }
         // SAFETY: closes the BeginDraw above.

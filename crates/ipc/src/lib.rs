@@ -13,14 +13,16 @@
 //! The worker holds the network connection; the UI holds everything else.
 //! So the worker asks the UI to verify the host key, to list public keys, to
 //! sign the user-auth request and to ask the user for passwords, and the UI
-//! answers. One `channel` is one SSH connection with its shell.
+//! answers. One `channel` is one shell; the first channel on a host makes
+//! the SSH connection, and [`Message::OpenChannel`] opens further shells on
+//! that connection for new tabs and panes.
 
 use std::fmt;
 
 use zeroize::Zeroize;
 
 /// Protocol version carried in every frame. Bump on any wire change.
-pub const PROTOCOL_VERSION: u8 = 2;
+pub const PROTOCOL_VERSION: u8 = 3;
 
 /// Largest frame body accepted, in bytes. Terminal and SFTP data is chunked
 /// below this, so anything larger is a bug or an attack.
@@ -99,6 +101,16 @@ pub enum Message {
         cols: u16,
         rows: u16,
         host_key_algs: Vec<String>,
+    },
+    /// Open another shell on the connection that `connection` (a channel
+    /// that made it with [`Message::Connect`]) belongs to. No new login:
+    /// the worker answers with [`Message::Connected`], or with
+    /// [`Message::Disconnected`] when that connection is gone.
+    OpenChannel {
+        channel: ChannelId,
+        connection: ChannelId,
+        cols: u16,
+        rows: u16,
     },
     /// The user (or known_hosts) trusts, or rejects, the key in the last
     /// [`Message::HostKey`].
@@ -179,6 +191,7 @@ impl Message {
             Message::Connected { .. } => 15,
             Message::ExitStatus { .. } => 16,
             Message::Disconnected { .. } => 17,
+            Message::OpenChannel { .. } => 18,
         }
     }
 
@@ -202,7 +215,8 @@ impl Message {
             | Message::Notice { channel, .. }
             | Message::Connected { channel, .. }
             | Message::ExitStatus { channel, .. }
-            | Message::Disconnected { channel, .. } => *channel,
+            | Message::Disconnected { channel, .. }
+            | Message::OpenChannel { channel, .. } => *channel,
         })
     }
 }
@@ -382,6 +396,17 @@ pub fn encode(msg: &Message, out: &mut Vec<u8>) -> Result<(), Error> {
             w.u32(*channel);
             w.u32(*code);
         }
+        Message::OpenChannel {
+            channel,
+            connection,
+            cols,
+            rows,
+        } => {
+            w.u32(*channel);
+            w.u32(*connection);
+            w.u16(*cols);
+            w.u16(*rows);
+        }
     }
     let mut body = w.0;
     let result = (|| {
@@ -535,6 +560,12 @@ fn decode_body(body: &[u8]) -> Result<Message, Error> {
         17 => Message::Disconnected {
             channel: r.u32()?,
             reason: r.string()?,
+        },
+        18 => Message::OpenChannel {
+            channel: r.u32()?,
+            connection: r.u32()?,
+            cols: r.u16()?,
+            rows: r.u16()?,
         },
         tag => return Err(Error::Tag(tag)),
     };
@@ -710,6 +741,12 @@ mod tests {
                 channel: 1,
                 reason: "Connection closed".into(),
             },
+            Message::OpenChannel {
+                channel: 2,
+                connection: 1,
+                cols: 100,
+                rows: 30,
+            },
         ]
     }
 
@@ -730,7 +767,7 @@ mod tests {
         let mut tags: Vec<u8> = samples().iter().map(Message::tag).collect();
         tags.sort_unstable();
         tags.dedup();
-        assert_eq!(tags, (0..=17).collect::<Vec<u8>>());
+        assert_eq!(tags, (0..=18).collect::<Vec<u8>>());
     }
 
     #[test]

@@ -1,15 +1,18 @@
 //! One SSH connection: TCP, key exchange, host key check through the UI,
 //! user authentication with keys the UI holds, a shell on a pty, and the
-//! data pump.
+//! data pump. Further shells for new tabs and panes open as more channels
+//! on the same connection ([`open`]); the connection ends with its last
+//! shell.
 //!
 //! Every question the worker cannot answer itself (is this host key
 //! trusted, which public keys exist, sign this, what is the password) goes
 //! to the UI as a request message; the answer comes back on the session's
 //! inbox and is routed to whoever is waiting for it by [`drive`].
 
+use std::collections::HashMap;
 use std::fmt;
 use std::future::Future;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 
 use ferossh_ipc::{ChannelId, MAX_DATA_CHUNK, Message, PromptField, PromptKind, Secrets};
@@ -76,6 +79,44 @@ impl fmt::Display for Failure {
             Failure::Refused(why) => f.write_str(why),
             Failure::Cancelled => f.write_str("Cancelled."),
         }
+    }
+}
+
+/// A logged-in connection, shared by the channels (shells) on it.
+type Connection = Handle<Client>;
+
+/// Live connections by the channel that made them, for
+/// [`Message::OpenChannel`]. Weak: each shell holds its connection, and the
+/// last one to close disconnects it.
+/// The negotiated names travel along, for the new shell's
+/// [`Message::Connected`].
+#[derive(Clone, Default)]
+pub(crate) struct Connections(Arc<Mutex<HashMap<ChannelId, Entry>>>);
+
+type Entry = (Weak<Connection>, Names3);
+
+/// Negotiated kex, cipher and host key algorithm.
+type Names3 = Option<(String, String, String)>;
+
+impl fmt::Debug for Connections {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Connections").finish_non_exhaustive()
+    }
+}
+
+impl Connections {
+    fn insert(&self, channel: ChannelId, conn: &Arc<Connection>, names: Names3) {
+        if let Ok(mut map) = self.0.lock() {
+            map.retain(|_, (w, _)| w.strong_count() > 0);
+            map.insert(channel, (Arc::downgrade(conn), names));
+        }
+    }
+
+    fn get(&self, channel: ChannelId) -> Option<(Arc<Connection>, Names3)> {
+        let map = self.0.lock().ok()?;
+        let (weak, names) = map.get(&channel)?;
+        let conn = weak.upgrade().filter(|c| !c.is_closed())?;
+        Some((conn, names.clone()))
     }
 }
 
@@ -327,6 +368,7 @@ pub async fn run(
     params: Params,
     mut inbox: mpsc::Receiver<Message>,
     out: mpsc::Sender<Message>,
+    connections: Connections,
 ) {
     let shared: SharedRef = Arc::default();
     let mut ctx = Ctx {
@@ -335,23 +377,70 @@ pub async fn run(
         shared: shared.clone(),
         size: (params.cols, params.rows),
     };
-    let result = session(&params, &mut inbox, &mut ctx).await;
+    let result = session(&params, &mut inbox, &mut ctx, &connections).await;
     let server_said = with(&shared, |s| s.server_said.take()).flatten();
     let reason = match (result, server_said) {
         (_, Some(said)) if !said.trim().is_empty() => {
             format!("The server closed the connection: {}", said.trim())
         }
-        (Ok(()), _) => "Connection closed.".to_owned(),
+        (Ok(Ended::Connection), _) => "Connection closed.".to_owned(),
+        (Ok(Ended::Shell), _) => SHELL_CLOSED.to_owned(),
         (Err(e), _) => e.to_string(),
     };
     let _ = out.send(Message::Disconnected { channel, reason }).await;
 }
 
+/// Opens another shell on the connection `connection` made, for a new tab
+/// or pane: no new login. Reports why it ended, like [`run`].
+pub async fn open(
+    channel: ChannelId,
+    connection: ChannelId,
+    size: (u16, u16),
+    mut inbox: mpsc::Receiver<Message>,
+    out: mpsc::Sender<Message>,
+    connections: Connections,
+) {
+    let mut ctx = Ctx {
+        channel,
+        out: out.clone(),
+        shared: Arc::default(),
+        size,
+    };
+    let result = match connections.get(connection) {
+        Some((conn, names)) => {
+            with(&ctx.shared, |s| s.names = names);
+            shell(conn, &mut inbox, &mut ctx).await
+        }
+        None => Err(Failure::Refused(
+            "That connection is closed; connect again.".into(),
+        )),
+    };
+    let reason = match result {
+        Ok(Ended::Connection) => "Connection closed.".to_owned(),
+        Ok(Ended::Shell) => SHELL_CLOSED.to_owned(),
+        Err(e) => e.to_string(),
+    };
+    let _ = out.send(Message::Disconnected { channel, reason }).await;
+}
+
+/// Why a shell's channel ended without an error.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Ended {
+    /// This was the connection's last channel, so the connection closed too.
+    Connection,
+    /// Other tabs still use the connection.
+    Shell,
+}
+
+/// The reason given when a shell ends while its connection stays open.
+const SHELL_CLOSED: &str = "The shell closed; the connection stays open for the other tabs.";
+
 async fn session(
     p: &Params,
     inbox: &mut mpsc::Receiver<Message>,
     ctx: &mut Ctx,
-) -> Result<(), Failure> {
+    connections: &Connections,
+) -> Result<Ended, Failure> {
     let config = Arc::new(client::Config {
         client_id: SshId::Standard(CLIENT_ID.into()),
         preferred: preferred_for(&p.host_key_algs),
@@ -378,8 +467,41 @@ async fn session(
     let mut handle = drive(client::connect_stream(config, tcp, handler), inbox, ctx).await??;
 
     authenticate(&mut handle, p, inbox, ctx).await?;
+    let conn = Arc::new(handle);
+    let names = with(&ctx.shared, |s| s.names.clone()).flatten();
+    connections.insert(ctx.channel, &conn, names);
+    shell(conn, inbox, ctx).await
+}
 
-    let channel = drive(handle.channel_open_session(), inbox, ctx).await??;
+/// Opens a shell on `conn` and pumps it until it closes. Disconnects the
+/// connection when this was its last shell.
+async fn shell(
+    conn: Arc<Connection>,
+    inbox: &mut mpsc::Receiver<Message>,
+    ctx: &mut Ctx,
+) -> Result<Ended, Failure> {
+    let result = pump(&conn, inbox, ctx).await;
+    // The last shell on the connection closes it.
+    let ended = match Arc::into_inner(conn) {
+        Some(handle) => {
+            let _ = handle.disconnect(Disconnect::ByApplication, "", "en").await;
+            Ended::Connection
+        }
+        None => Ended::Shell,
+    };
+    match result {
+        // The user closed the tab: nothing to report as an error.
+        Ok(()) | Err(Failure::Cancelled) => Ok(ended),
+        Err(e) => Err(e),
+    }
+}
+
+async fn pump(
+    conn: &Connection,
+    inbox: &mut mpsc::Receiver<Message>,
+    ctx: &mut Ctx,
+) -> Result<(), Failure> {
+    let channel = drive(conn.channel_open_session(), inbox, ctx).await??;
     let (cols, rows) = ctx.size;
     channel
         .request_pty(false, TERM, cols.into(), rows.into(), 0, 0, &[])
@@ -444,12 +566,7 @@ async fn session(
         }
     };
     writer.abort();
-    let _ = handle.disconnect(Disconnect::ByApplication, "", "en").await;
-    match result {
-        // The user closed the tab: nothing to report as an error.
-        Err(Failure::Cancelled) => Ok(()),
-        other => other,
-    }
+    result
 }
 
 fn method_names(methods: &MethodSet) -> String {

@@ -7,7 +7,12 @@
 //! Without `sshd` and `ssh-keygen` (Windows CI) the tests pass without
 //! running; the Linux CI job has both.
 
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing
+)]
 
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
@@ -298,4 +303,140 @@ async fn falls_back_to_aes_gcm() {
     let (kex, cipher, _) = seen.connected.unwrap();
     assert_eq!(kex, "curve25519-sha256");
     assert_eq!(cipher, "aes256-gcm@openssh.com");
+}
+
+/// A second shell opened with `OpenChannel` rides on the first one's
+/// connection: no second host key check or login, and the connection
+/// outlives the first shell.
+#[tokio::test]
+async fn second_shell_shares_the_connection() {
+    if !available() {
+        return;
+    }
+    let server = start("mux", "");
+    let (to_worker, worker_in) = mpsc::channel(64);
+    let (worker_out, mut from_worker) = mpsc::channel(64);
+    tokio::spawn(ferossh_worker::serve(worker_in, worker_out));
+    let user = whoami();
+    let key = KeyFile::load(&server.user_key).unwrap();
+    let send = |m| {
+        let tx = to_worker.clone();
+        async move { tx.send(m).await.unwrap() }
+    };
+    send(Message::Hello {
+        version: PROTOCOL_VERSION,
+    })
+    .await;
+    send(Message::Connect {
+        channel: 1,
+        host: "127.0.0.1".into(),
+        port: server.port,
+        user: user.clone(),
+        cols: 80,
+        rows: 24,
+        host_key_algs: vec![],
+    })
+    .await;
+    let (mut host_keys, mut signed) = (0, 0);
+    let mut output: [Vec<u8>; 2] = [Vec::new(), Vec::new()];
+    let mut ended: [Option<String>; 2] = [None, None];
+    let mut connected2: Option<(String, String)> = None;
+    let deadline = tokio::time::sleep(Duration::from_secs(30));
+    tokio::pin!(deadline);
+    while ended[1].is_none() {
+        let msg = tokio::select! {
+            m = from_worker.recv() => m.expect("worker hung up"),
+            () = &mut deadline => panic!("timed out: {output:?} {ended:?}"),
+        };
+        match msg {
+            Message::Hello { .. } => {}
+            Message::HostKey { channel, .. } => {
+                host_keys += 1;
+                send(Message::HostKeyVerdict {
+                    channel,
+                    accept: true,
+                })
+                .await;
+            }
+            Message::IdentitiesRequest { channel } => {
+                send(Message::Identities {
+                    channel,
+                    keys: vec![key.public.clone()],
+                })
+                .await;
+            }
+            Message::SignRequest { channel, data, .. } => {
+                signed += 1;
+                send(Message::Signature {
+                    channel,
+                    signature: key.sign(None, &data).unwrap(),
+                })
+                .await;
+            }
+            Message::Connected { channel: 1, .. } => {
+                send(Message::OpenChannel {
+                    channel: 2,
+                    connection: 1,
+                    cols: 80,
+                    rows: 24,
+                })
+                .await;
+            }
+            Message::Connected {
+                channel: 2,
+                kex,
+                cipher,
+                ..
+            } => {
+                connected2 = Some((kex, cipher));
+                // The first shell exits; the second must keep working.
+                send(Message::Data {
+                    channel: 1,
+                    bytes: b"echo one$((1+1)); exit\n".to_vec(),
+                })
+                .await;
+            }
+            Message::Data { channel, bytes } => {
+                let i = usize::from(channel == 2);
+                output[i].extend_from_slice(&bytes);
+            }
+            Message::ExitStatus { .. } => {}
+            Message::Disconnected { channel: 1, reason } => {
+                assert!(reason.contains("stays open"), "{reason}");
+                ended[0] = Some(reason);
+                send(Message::Data {
+                    channel: 2,
+                    bytes: b"echo two$((1+1)); exit\n".to_vec(),
+                })
+                .await;
+            }
+            Message::Disconnected { channel: 2, reason } => ended[1] = Some(reason),
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+    assert_eq!((host_keys, signed), (1, 1));
+    let (kex, _) = connected2.unwrap();
+    assert!(!kex.is_empty());
+    assert!(String::from_utf8_lossy(&output[0]).contains("one2"));
+    assert!(String::from_utf8_lossy(&output[1]).contains("two2"));
+    assert_eq!(ended[1].as_deref(), Some("Connection closed."));
+
+    // The connection is gone now: opening on it fails cleanly.
+    send(Message::OpenChannel {
+        channel: 3,
+        connection: 1,
+        cols: 80,
+        rows: 24,
+    })
+    .await;
+    loop {
+        match from_worker.recv().await.unwrap() {
+            Message::Disconnected { channel: 3, reason } => {
+                assert!(reason.contains("closed"), "{reason}");
+                break;
+            }
+            Message::Data { .. } | Message::ExitStatus { .. } => {}
+            other => panic!("unexpected {other:?}"),
+        }
+    }
 }

@@ -18,12 +18,14 @@ use std::thread;
 use ferossh_ipc::{ChannelId, Decoder, Message, PROTOCOL_VERSION, encode};
 use tokio::sync::mpsc;
 
+use session::Connections;
 pub use session::Params;
 
 /// Messages queued in each direction before the sender waits.
 const QUEUE: usize = 64;
 
-/// Serves the UI: one task per connection, routed by channel id. Returns
+/// Serves the UI: one task per shell channel, routed by channel id; shells
+/// opened with [`Message::OpenChannel`] share their host's connection. Returns
 /// when the UI closes its end.
 pub async fn serve(mut inbox: mpsc::Receiver<Message>, out: mpsc::Sender<Message>) {
     let hello = Message::Hello {
@@ -37,8 +39,30 @@ pub async fn serve(mut inbox: mpsc::Receiver<Message>, out: mpsc::Sender<Message
         _ => return,
     }
     let mut sessions: HashMap<ChannelId, mpsc::Sender<Message>> = HashMap::new();
+    let connections = Connections::default();
     while let Some(msg) = inbox.recv().await {
         match msg {
+            Message::OpenChannel {
+                channel,
+                connection,
+                cols,
+                rows,
+            } => {
+                sessions.retain(|_, tx| !tx.is_closed());
+                if sessions.contains_key(&channel) {
+                    continue;
+                }
+                let (tx, rx) = mpsc::channel(QUEUE);
+                sessions.insert(channel, tx);
+                tokio::spawn(session::open(
+                    channel,
+                    connection,
+                    (cols, rows),
+                    rx,
+                    out.clone(),
+                    connections.clone(),
+                ));
+            }
             Message::Connect {
                 channel,
                 host,
@@ -62,7 +86,13 @@ pub async fn serve(mut inbox: mpsc::Receiver<Message>, out: mpsc::Sender<Message
                     rows,
                     host_key_algs,
                 };
-                tokio::spawn(session::run(channel, params, rx, out.clone()));
+                tokio::spawn(session::run(
+                    channel,
+                    params,
+                    rx,
+                    out.clone(),
+                    connections.clone(),
+                ));
             }
             other => {
                 let Some(channel) = other.channel() else {

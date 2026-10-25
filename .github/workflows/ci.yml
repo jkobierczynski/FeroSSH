@@ -39,15 +39,18 @@ jobs:
     runs-on: ubuntu-latest
     env:
       FEROSSH_REQUIRE_SSHD: 1
+      FEROSSH_REQUIRE_PUTTYGEN: 1
     steps:
       - uses: actions/checkout@v4
       - run: rustup show active-toolchain
       # The worker and the window's SSH path log in to a throwaway sshd on
-      # 127.0.0.1; without sshd these tests skip, so install it.
-      - run: sudo apt-get update && sudo apt-get install -y openssh-server
+      # 127.0.0.1, and the .ppk tests make keys with puttygen; without them
+      # these tests skip, so install both.
+      - run: sudo apt-get update && sudo apt-get install -y openssh-server putty-tools
       - run: sudo mkdir -p /run/sshd
       - run: cargo test --locked -p ferossh-worker --test sshd
       - run: cargo test --locked -p ferossh ssh_e2e
+      - run: cargo test --locked -p ferossh-auth keyfile
 
   deny:
     name: cargo deny
