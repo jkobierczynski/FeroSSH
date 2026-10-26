@@ -141,6 +141,8 @@ pub async fn log_in(
             x11: None,
             legacy: false,
             timing: Default::default(),
+            tunnel: None,
+            shell: true,
         },
     ] {
         to_worker.send(msg).await.unwrap();

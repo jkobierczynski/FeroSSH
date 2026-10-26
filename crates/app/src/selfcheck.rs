@@ -78,6 +78,8 @@ fn check_worker(w: &mut Worker) -> Result<String, String> {
                 connect_timeout: 5,
                 ..Timing::default()
             },
+            tunnel: None,
+            shell: true,
         },
     )?;
     loop {

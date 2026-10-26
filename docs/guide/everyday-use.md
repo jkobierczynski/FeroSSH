@@ -27,6 +27,12 @@ Files are never overwritten without asking, and file names Windows cannot hold a
 
 `LocalForward`, `RemoteForward` and `DynamicForward` in your ssh_config start when you log in. View > Port forwards (Ctrl+Shift+P) lists them and adds new ones: type `-L 8080:db.internal:5432`, `-R 9000:localhost:3000` or `-D 1080` and press Enter. A dynamic forward is a SOCKS 4, 4a and 5 proxy. A tab whose connection forwards shows `⇄`, in amber when the server can reach back into your PC.
 
+## Jump hosts
+
+To reach a host that is only reachable through another one, give it a jump host: `ProxyJump bastion` in your ssh_config, or the *Jump host* field in the session form (F2). Several go in turn, separated by commas: `admin@gw:2222,inner`. Each jump host logs in as if you connected to it, with its own host key check and its own key or password, in a sandboxed worker of its own; the host behind it is then reached through that login, encrypted end to end. If a jump host cannot reach the next one, the pane says which one and why.
+
+`ProxyCommand` in your ssh_config runs a local program (for example `ncat --proxy proxy.example.org:8080 %h %p`) and sends the connection through it. FeroSSH asks once before it runs a command line it has not run before.
+
 ## tmux
 
 Session > Attach tmux turns tmux windows and panes into native FeroSSH tabs and panes. You get no prefix key and no status bar, and you keep native scrollback, copy and search. Close FeroSSH, or lose the network, and everything keeps running on the server. Attach again, from this PC or another, and the tabs, splits, fonts and themes come back. tmux is never started unless you ask; to attach on every login to a host, set `Tmux` in its profile (see [Settings](settings.md)).

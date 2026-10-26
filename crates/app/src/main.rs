@@ -59,6 +59,8 @@ mod newkey;
 #[cfg_attr(not(windows), allow(dead_code))]
 mod pattern;
 #[cfg_attr(not(windows), allow(dead_code))]
+mod proxycmd;
+#[cfg_attr(not(windows), allow(dead_code))]
 mod pwcommand;
 #[cfg(windows)]
 mod sandbox;

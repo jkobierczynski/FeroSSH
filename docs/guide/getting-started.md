@@ -36,7 +36,7 @@ FeroSSH then signs in with the first method that works:
 
 ## Using your OpenSSH config
 
-If you already use OpenSSH, FeroSSH reads `~/.ssh/config` as it is: `HostName`, `User`, `Port`, `IdentityFile`, `Include`, `Tag` and the forwarding keywords. It never writes to that file. Your hosts show up in the session manager (Ctrl+Shift+S).
+If you already use OpenSSH, FeroSSH reads `~/.ssh/config` as it is: `HostName`, `User`, `Port`, `IdentityFile`, `Include`, `Tag`, `ProxyJump`, `ProxyCommand` and the forwarding keywords. It never writes to that file. Your hosts show up in the session manager (Ctrl+Shift+S).
 
 If you don't have an ssh_config, open the session manager, press Insert ("+ New session") and fill in the form. Saved sessions go to `%APPDATA%\FeroSSH\sessions.conf`.
 

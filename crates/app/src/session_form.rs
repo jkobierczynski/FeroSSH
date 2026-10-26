@@ -53,6 +53,8 @@ pub struct Values {
     pub user: String,
     pub port: String,
     pub key: String,
+    /// Jump hosts, as a `ProxyJump` line: `bastion` or `me@gw:2222,inner`.
+    pub jump: String,
     pub via: String,
     /// Empty: the theme rules decide.
     pub theme: String,
@@ -121,13 +123,15 @@ impl Values {
             user: h.user.clone().unwrap_or_default(),
             port: opt_text(&h.port),
             key: h.identity_file.clone().unwrap_or_default(),
+            jump: h.proxy_jump.clone().unwrap_or_default(),
             forwards: h.forwards.iter().map(forward_text).collect(),
             ..Self::default()
         }
     }
 
     /// Connection settings as ssh_config resolves them, for a host the
-    /// form shows read-only.
+    /// form shows read-only. `jump` lists its jump hosts.
+    #[allow(clippy::too_many_arguments)]
     pub fn from_resolved(
         name: &str,
         folder: Option<&str>,
@@ -135,6 +139,7 @@ impl Values {
         user: &str,
         port: u16,
         key: Option<&str>,
+        jump: &str,
         forwards: &[ferossh_config::ForwardSpec],
     ) -> Self {
         Self {
@@ -148,6 +153,7 @@ impl Values {
                 port.to_string()
             },
             key: key.unwrap_or_default().to_owned(),
+            jump: jump.to_owned(),
             forwards: forwards.iter().map(forward_text).collect(),
             ..Self::default()
         }
@@ -189,6 +195,7 @@ enum Field {
     User,
     Port,
     Key,
+    Jump,
     Via,
     Theme,
     Font,
@@ -218,6 +225,7 @@ impl Field {
             Field::User => "User",
             Field::Port => "Port",
             Field::Key => "Key file",
+            Field::Jump => "Jump host",
             Field::Via => "Via SSH",
             Field::Theme => "Theme",
             Field::Font => "Font",
@@ -361,6 +369,7 @@ impl SessionForm {
                     | Field::User
                     | Field::Port
                     | Field::Key
+                    | Field::Jump
                     | Field::Forward(_)
             )
     }
@@ -416,6 +425,7 @@ impl SessionForm {
                             out.push(Item::Note("%n is the session's name.".into()));
                         }
                     }
+                    out.push(Item::Field(Field::Jump));
                 }
                 SessionKind::Rdp | SessionKind::Vnc => out.push(Item::Field(Field::Via)),
                 SessionKind::Serial => {}
@@ -516,6 +526,7 @@ impl SessionForm {
             Field::User => &v.user,
             Field::Port => &v.port,
             Field::Key => &v.key,
+            Field::Jump => &v.jump,
             Field::Via => &v.via,
             Field::Font => &v.font,
             Field::FontSize => &v.font_size,
@@ -548,6 +559,7 @@ impl SessionForm {
             Field::User => &mut v.user,
             Field::Port => &mut v.port,
             Field::Key => &mut v.key,
+            Field::Jump => &mut v.jump,
             Field::Via => &mut v.via,
             Field::Font => &mut v.font,
             Field::FontSize => &mut v.font_size,
@@ -709,6 +721,7 @@ impl SessionForm {
             },
             Field::Speed => "9600 bits/s".into(),
             Field::Key => "default keys and agent".into(),
+            Field::Jump => "none, or e.g. bastion".into(),
             Field::Via if v.kind == SessionKind::Vnc => "an SSH session (required)".into(),
             Field::Via => "none: connect directly".into(),
             Field::Font => h.font.clone(),
@@ -804,6 +817,17 @@ impl SessionForm {
                 return Err("The user name has a space or @ in it.".into());
             }
             port(&v.port, "The port")?;
+            let jump = v.jump.trim();
+            if v.kind == SessionKind::Ssh && !jump.is_empty() {
+                if !saved::valid_proxy_jump(jump) {
+                    return Err("Jump host: a session name or user@host:port; several go \
+                                in turn, separated by commas."
+                        .into());
+                }
+                if jump.split(',').any(|h| h.trim().eq_ignore_ascii_case(name)) {
+                    return Err("The jump host is another session, not this one.".into());
+                }
+            }
             for (i, f) in v.forwards.iter().enumerate() {
                 if !f.trim().is_empty() && parse_option(f).is_none() {
                     return Err(format!(
@@ -1273,6 +1297,7 @@ impl SessionForm {
                     user: trimmed(&v.user),
                     port: v.port.trim().parse().ok().filter(|&p| p != 0),
                     identity_file: trimmed(&v.key),
+                    proxy_jump: trimmed(&v.jump).filter(|_| v.kind == SessionKind::Ssh),
                     forwards: v.forwards.iter().filter_map(|f| parse_option(f)).fold(
                         Vec::new(),
                         |mut all, f| {
@@ -1530,9 +1555,10 @@ mod tests {
         assert!(t[8].contains("default keys and agent"));
         assert_eq!(t[9].trim(), "Browse…");
         assert!(t[10].contains("ask every time"));
-        assert_eq!(t[11], " ▸ Look");
-        assert_eq!(t[12], " ▸ Extras");
-        assert!(t[13].contains("Save") && t[13].contains("Connect") && !t[13].contains("Delete"));
+        assert!(t[11].contains("Jump host") && t[11].contains("none, or e.g. bastion"));
+        assert_eq!(t[12], " ▸ Look");
+        assert_eq!(t[13], " ▸ Extras");
+        assert!(t[14].contains("Save") && t[14].contains("Connect") && !t[14].contains("Delete"));
 
         assert_eq!(f.key(SideKey::Enter { split: false }, 30), None);
         assert!(
@@ -1553,7 +1579,17 @@ mod tests {
         assert_eq!(f.apply(&mut hosts, &mut settings), "db");
         assert_eq!(hosts[0].hostname.as_deref(), Some("10.0.0.5"));
         assert_eq!(hosts[0].user, None);
+        assert_eq!(hosts[0].proxy_jump, None);
         assert!(settings.profile("db").unwrap().theme.is_none());
+
+        // A jump host is saved as the session's ProxyJump.
+        f.values.jump = " admin@gw:2222,bastion ".into();
+        let mut hosts = Vec::new();
+        f.apply(&mut hosts, &mut settings);
+        assert_eq!(
+            hosts[0].proxy_jump.as_deref(),
+            Some("admin@gw:2222,bastion")
+        );
     }
 
     #[test]
@@ -1568,6 +1604,8 @@ mod tests {
             (Field::Forward(0), "L 8080", "Forward 1"),
             (Field::FontSize, "200", "4 to 96"),
             (Field::Tmux, "a;b", "tmux"),
+            (Field::Jump, "gw host", "Jump host"),
+            (Field::Jump, "gw,ok", "not this one"),
         ] {
             f.values = Values {
                 name: "ok".into(),
@@ -1699,8 +1737,8 @@ mod tests {
         let mut f = new_form();
         typed(&mut f, "web2");
         // Open Extras: Name, Folder, Type, Host, User, Port, Key, Browse,
-        // Password, Look, Extras.
-        down(&mut f, 10);
+        // Password, Jump host, Look, Extras.
+        down(&mut f, 11);
         f.key(SideKey::Enter { split: false }, 30);
         down(&mut f, 3);
         assert_eq!(f.focused_field(), Some(Field::Forward(0)));
@@ -1730,7 +1768,7 @@ mod tests {
     fn login_steps_are_checked_and_saved_in_the_profile() {
         let mut f = new_form();
         typed(&mut f, "sw1");
-        down(&mut f, 10);
+        down(&mut f, 11);
         f.key(SideKey::Enter { split: false }, 30);
         // tmux, tmux panes, Forward 1, RDP port, VNC port, Old crypto.
         down(&mut f, 7);
@@ -1773,6 +1811,7 @@ mod tests {
             "admin",
             2222,
             None,
+            "",
             &[],
         );
         let mut f = SessionForm::new(
@@ -1790,8 +1829,9 @@ mod tests {
         assert_eq!(f.focused_field(), Some(Field::Host));
         typed(&mut f, "x");
         assert_eq!(f.values.host, "web.example.org");
-        // The theme can: past user, port, key and password to Look.
-        down(&mut f, 5);
+        // The theme can: past user, port, key, password and jump host to
+        // Look.
+        down(&mut f, 6);
         f.key(SideKey::Enter { split: false }, 30);
         f.key(SideKey::Down, 30);
         f.key(SideKey::Right, 30);

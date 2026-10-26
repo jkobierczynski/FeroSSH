@@ -244,6 +244,8 @@ async fn session(
         x11: None,
         legacy,
         timing,
+        tunnel: None,
+        shell: true,
     })
     .await;
     let mut seen = Outcome::default();
@@ -575,6 +577,8 @@ async fn log_in(port: u16, keys: &[KeyFile]) -> (mpsc::Sender<Message>, mpsc::Re
             x11: None,
             legacy: false,
             timing: Timing::default(),
+            tunnel: None,
+            shell: true,
         },
     ] {
         to_worker.send(msg).await.unwrap();
@@ -1345,4 +1349,200 @@ async fn real_programs_draw_correctly() {
         );
     }
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// (jump host image, jump host server, target image, target server,
+/// expected cipher on the target). The target's connection runs inside
+/// the jump host's `direct-tcpip` channel, so it cannot be tried again:
+/// it starts with AES-GCM, which an OpenSSH without strict key exchange
+/// takes the first time. Dropbear has no AES-GCM but has strict key
+/// exchange, so ChaCha20 is safe there.
+const JUMP_CASES: &[(&str, &str, &str, &str, &str)] = &[
+    ("24.04", "dropbear", "18.04", "openssh", GCM),
+    ("18.04", "openssh", "24.04", "dropbear", CHACHA),
+    ("24.04", "openssh", "18.04", "openssh", GCM),
+];
+
+/// The container's address on docker's network, where the jump host
+/// reaches it.
+fn address(server: &Server) -> String {
+    docker(&[
+        "inspect",
+        "-f",
+        "{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}",
+        &server.id,
+    ])
+    .filter(|a| !a.is_empty())
+    .expect("container address")
+}
+
+/// Plays the UI for a login to `target` (an address on docker's
+/// network) through the jump host on local port `jump`: two workers, the
+/// jump host's without a shell, the target's SSH connection relayed
+/// between them over the jump host's `direct-tcpip` stream.
+async fn through(jump: u16, target: &str, keys: &[KeyFile], command: &str) -> Outcome {
+    const TUNNEL: u32 = 100;
+    let (events_tx, mut events) = mpsc::channel::<(usize, Message)>(256);
+    let mut to = Vec::new();
+    for i in 0..2 {
+        let (to_worker, worker_in) = mpsc::channel(64);
+        let (worker_out, mut from_worker) = mpsc::channel(64);
+        tokio::spawn(ferossh_worker::serve(worker_in, worker_out));
+        let events_tx = events_tx.clone();
+        tokio::spawn(async move {
+            while let Some(m) = from_worker.recv().await {
+                if events_tx.send((i, m)).await.is_err() {
+                    return;
+                }
+            }
+        });
+        to_worker
+            .send(Message::Hello {
+                version: PROTOCOL_VERSION,
+            })
+            .await
+            .unwrap();
+        to.push(to_worker);
+    }
+    let connect = |i: usize| Message::Connect {
+        channel: 1,
+        host: if i == 0 {
+            "127.0.0.1".into()
+        } else {
+            target.into()
+        },
+        port: if i == 0 { jump } else { 22 },
+        user: "fero".into(),
+        cols: 80,
+        rows: 24,
+        host_key_algs: vec![],
+        x11: None,
+        legacy: false,
+        timing: Timing::default(),
+        tunnel: (i == 1).then_some(TUNNEL),
+        shell: i == 1,
+    };
+    to[0].send(connect(0)).await.unwrap();
+    let mut seen = Outcome::default();
+    let deadline = tokio::time::sleep(Duration::from_secs(60));
+    tokio::pin!(deadline);
+    loop {
+        let (i, msg) = tokio::select! {
+            m = events.recv() => m.expect("workers hung up"),
+            () = &mut deadline => panic!("timed out; so far {seen:?}"),
+        };
+        // The tunnel's bytes go straight to the other worker.
+        if msg.channel() == Some(TUNNEL) {
+            match msg {
+                Message::Data { .. } | Message::Window { .. } | Message::Eof { .. } => {
+                    to[1 - i].send(msg).await.unwrap();
+                }
+                Message::Disconnected { channel, .. } => {
+                    let _ = to[1 - i].send(Message::Close { channel }).await;
+                }
+                _ => {}
+            }
+            continue;
+        }
+        let reply = match msg {
+            Message::HostKey { channel, .. } => {
+                seen.host_key_prompts += 1;
+                Message::HostKeyVerdict {
+                    channel,
+                    accept: true,
+                }
+            }
+            Message::IdentitiesRequest { channel } => Message::Identities {
+                channel,
+                keys: keys.iter().map(|k| k.public.clone()).collect(),
+            },
+            Message::SignRequest {
+                channel,
+                key: k,
+                data,
+            } => {
+                let key = keys.iter().find(|key| key.public == k).expect("ours");
+                Message::Signature {
+                    channel,
+                    signature: key.sign(None, &data).unwrap(),
+                }
+            }
+            Message::Connected { .. } if i == 0 => {
+                to[0]
+                    .send(Message::ForwardOpen {
+                        channel: TUNNEL,
+                        connection: 1,
+                        target: Some((target.into(), 22)),
+                        origin_host: "127.0.0.1".into(),
+                        origin_port: 0,
+                        keep: true,
+                    })
+                    .await
+                    .unwrap();
+                to[1].send(connect(1)).await.unwrap();
+                continue;
+            }
+            Message::Connected {
+                kex,
+                cipher,
+                host_key,
+                ..
+            } => {
+                seen.connected = Some((kex, cipher, host_key));
+                Message::Data {
+                    channel: 1,
+                    bytes: command.as_bytes().to_vec(),
+                }
+            }
+            Message::Data { bytes, .. } if i == 1 => {
+                seen.output.extend_from_slice(&bytes);
+                continue;
+            }
+            Message::Prompt { .. } => panic!("asked for a password; so far {seen:?}"),
+            Message::Disconnected { reason, .. } => {
+                assert_eq!(i, 1, "the jump host ended first: {reason}; so far {seen:?}");
+                seen.disconnected = reason;
+                return seen;
+            }
+            _ => continue,
+        };
+        to[i].send(reply).await.unwrap();
+    }
+}
+
+/// `ProxyJump` through OpenSSH and Dropbear jump hosts of several ages,
+/// to targets of other ages: each hop checks its own host key, and the
+/// target, which cannot be tried again, logs in the first time.
+#[tokio::test]
+async fn jump_hosts_of_every_age() {
+    if !available() {
+        return;
+    }
+    let dir = std::env::temp_dir().join(format!("ferossh-interop-jump-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let keys = user_keys(&dir);
+    let mut failures = Vec::new();
+    for &(jump_tag, jump_server, tag, server, cipher) in JUMP_CASES {
+        let name = format!("{server} on ubuntu {tag} through {jump_server} on ubuntu {jump_tag}");
+        let jump = Server::start(jump_tag, jump_server, &dir);
+        let target = Server::start(tag, server, &dir);
+        let seen = through(
+            jump.port,
+            &address(&target),
+            &keys,
+            "echo fero$((6*7)); exit\n",
+        )
+        .await;
+        let output = String::from_utf8_lossy(&seen.output);
+        eprintln!("{name}: {:?}", seen.connected);
+        let ok = matches!(&seen.connected, Some((_, c, _)) if c == cipher)
+            && output.contains("fero42")
+            && seen.host_key_prompts == 2;
+        if !ok {
+            failures.push(format!("{name}: expected {cipher}, got {seen:?}"));
+        }
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(failures.is_empty(), "\n{}", failures.join("\n"));
 }
