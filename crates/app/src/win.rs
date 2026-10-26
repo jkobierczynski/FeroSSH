@@ -19,8 +19,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use ferossh_auth::Broker;
+use ferossh_config::saved::{self, SavedHost};
 use ferossh_config::settings::{DEFAULT_DESKTOP_PORT, DEFAULT_VNC_PORT};
-use ferossh_config::{Settings, putty, ssh_config};
+use ferossh_config::{SessionKind, Settings, putty, ssh_config};
 use ferossh_forward::x11::{Display, find_cookie, xauth_entries};
 use ferossh_ipc::{ChannelId, DirEntry, FORWARD_IDS, Message, SftpReply, X11Auth};
 use ferossh_render::{
@@ -53,8 +54,8 @@ use windows::Win32::UI::Input::Ime::{
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     GetDoubleClickTime, GetKeyState, ReleaseCapture, SetCapture, VIRTUAL_KEY, VK_ADD, VK_BACK,
-    VK_CONTROL, VK_DELETE, VK_DOWN, VK_END, VK_ESCAPE, VK_F1, VK_F3, VK_F4, VK_F5, VK_F12, VK_HOME,
-    VK_INSERT, VK_LEFT, VK_MENU, VK_NEXT, VK_NUMPAD0, VK_OEM_2, VK_OEM_MINUS, VK_OEM_PLUS,
+    VK_CONTROL, VK_DELETE, VK_DOWN, VK_END, VK_ESCAPE, VK_F1, VK_F2, VK_F3, VK_F4, VK_F5, VK_F12,
+    VK_HOME, VK_INSERT, VK_LEFT, VK_MENU, VK_NEXT, VK_NUMPAD0, VK_OEM_2, VK_OEM_MINUS, VK_OEM_PLUS,
     VK_PRIOR, VK_RETURN, VK_RIGHT, VK_SHIFT, VK_SPACE, VK_SUBTRACT, VK_TAB, VK_UP,
 };
 use windows::Win32::UI::Shell::{
@@ -94,6 +95,7 @@ use crate::pattern;
 use crate::putty_reg;
 use crate::sandbox;
 use crate::scrollmark;
+use crate::session_form::{self, FormAction, Hints, SessionForm, Source, Values};
 use crate::sessions::{HostItem, SessionList, SideAction, SideKey};
 use crate::ssh::{Effect, Env, SshSession, State, Target};
 use crate::tabstrip::{self, Forwarding, Health, Hit, Palette, StripLayout, TabLabel};
@@ -443,6 +445,8 @@ struct Side {
     /// Has the keyboard.
     focused: bool,
     list: SessionList,
+    /// The session form, shown in place of the list while open.
+    form: Option<SessionForm>,
     grid: Grid,
     /// Width in pixels, edge excluded; 0 until first shown.
     width: i32,
@@ -515,8 +519,22 @@ struct Window {
     /// redraw runs them.
     queued: Vec<Command>,
     /// Remote desktops asked for and not yet open, by connection and
-    /// server port.
-    desktops: HashMap<(ChannelId, u16), DesktopWant>,
+    /// desktop server (host as the SSH server sees it, and port).
+    desktops: HashMap<(ChannelId, String, u16), DesktopWant>,
+    /// Desktop sessions waiting for their SSH pane to log in.
+    pending_desktops: HashMap<PaneId, PendingDesktop>,
+}
+
+/// A desktop session whose SSH connection is still logging in.
+#[derive(Debug, Clone)]
+struct PendingDesktop {
+    /// The session's name, for the tab and the tunnel's port.
+    label: String,
+    /// The desktop server as the SSH host sees it.
+    host: String,
+    port: u16,
+    kind: SessionKind,
+    user: Option<String>,
 }
 
 /// A remote desktop asked for.
@@ -622,10 +640,28 @@ fn putty_hosts_path() -> PathBuf {
     app_dir().join("putty-sessions.conf")
 }
 
-/// The user's home folder, account name, ssh_config and imported hosts.
+/// Sessions made in the session form, in ssh_config syntax. FeroSSH reads
+/// it after `~/.ssh/config`; OpenSSH never sees it.
+fn sessions_path() -> PathBuf {
+    app_dir().join("sessions.conf")
+}
+
+fn load_saved() -> Vec<SavedHost> {
+    std::fs::read_to_string(sessions_path())
+        .map(|t| saved::parse(&t))
+        .unwrap_or_default()
+}
+
+/// The user's home folder, account name, ssh_config, saved sessions and
+/// imported hosts.
 fn ssh_env() -> Env {
     let home = home();
     let mut config = std::fs::read_to_string(home.join(".ssh").join("config")).unwrap_or_default();
+    if let Ok(made) = std::fs::read_to_string(sessions_path()) {
+        // A Host line first: the user's last block must not swallow it.
+        config.push_str("\nHost !*\n");
+        config.push_str(&made);
+    }
     if let Ok(imported) = std::fs::read_to_string(putty_hosts_path()) {
         // A Host line first: the user's last block must not swallow it.
         config.push_str("\nHost !*\n");
@@ -789,6 +825,7 @@ fn create_and_run(launch: Launch, theme: Option<String>) -> Result<()> {
                     view: SideView::Sessions,
                     focused: false,
                     list: SessionList::default(),
+                    form: None,
                     grid: Grid::new(1, 1),
                     width: 0,
                     last_click: None,
@@ -825,6 +862,7 @@ fn create_and_run(launch: Launch, theme: Option<String>) -> Result<()> {
                 reattach: HashMap::new(),
                 queued: Vec::new(),
                 desktops: HashMap::new(),
+                pending_desktops: HashMap::new(),
             });
         });
         // Files dropped from Explorer are uploaded, after a confirmation.
@@ -1194,6 +1232,8 @@ fn side_key(vk: VIRTUAL_KEY, mods: Mods) -> Option<SideKey> {
         VK_DELETE => SideKey::Delete,
         VK_TAB if !mods.ctrl => SideKey::Tab,
         VK_F5 => SideKey::Refresh,
+        VK_F2 => SideKey::Edit,
+        VK_INSERT => SideKey::New,
         v if mods.ctrl && !mods.alt && v == VIRTUAL_KEY(u16::from(b'D')) => {
             SideKey::ToggleFavourite
         }
@@ -1838,8 +1878,10 @@ impl Window {
             ),
         };
         let w = self.worker.as_ref()?;
-        w.forwarder.open_desktop(connection, port, local);
-        self.desktops.insert((connection, port), want);
+        w.forwarder
+            .open_desktop(connection, "localhost", port, local);
+        self.desktops
+            .insert((connection, "localhost".to_owned(), port), want);
         self.show(
             pane,
             &format!(
@@ -1861,9 +1903,10 @@ impl Window {
             match event {
                 DesktopEvent::Ready {
                     connection,
+                    host,
                     port,
                     addr,
-                } => match self.desktops.remove(&(connection, port)) {
+                } => match self.desktops.remove(&(connection, host, port)) {
                     Some(DesktopWant::Rdp { pane }) => {
                         let note = match launch_rdp_client(&addr) {
                             Ok(()) => format!(
@@ -1887,10 +1930,11 @@ impl Window {
                 },
                 DesktopEvent::Failed {
                     connection,
+                    host,
                     port,
                     why,
                 } => {
-                    let advice = match self.desktops.remove(&(connection, port)) {
+                    let advice = match self.desktops.remove(&(connection, host, port)) {
                         Some(DesktopWant::Tab {
                             protocol: Protocol::Vnc,
                             ..
@@ -2407,8 +2451,10 @@ impl Window {
                     self.start_forwards(id);
                     self.refresh_chrome();
                     self.tmux_after_login(id);
+                    self.desktop_after_login(id);
                 }
                 Effect::Ended => {
+                    self.pending_desktops.remove(&id);
                     self.tmux_lost(id);
                     self.stop_log(id);
                     self.prune_sftp();
@@ -2963,7 +3009,10 @@ impl Window {
         if let Some(side) = self.areas.side {
             let focused = self.side.focused && self.focused;
             match self.side.view {
-                SideView::Sessions => self.side.list.draw(&mut self.side.grid, &palette, focused),
+                SideView::Sessions => match &mut self.side.form {
+                    Some(form) => form.draw(&mut self.side.grid, &palette, focused),
+                    None => self.side.list.draw(&mut self.side.grid, &palette, focused),
+                },
                 SideView::Forwards => {
                     let view = self.forward_view();
                     self.forwards_view
@@ -3503,12 +3552,17 @@ impl Window {
             let action = self.files.key(remote, key, &downloads, rows);
             return self.files_action(action);
         }
+        if let Some(form) = &mut self.side.form {
+            let action = form.key(key, self.side.grid.rows());
+            return self.form_action(action);
+        }
         let visible = SessionList::visible(self.side.grid.rows());
         let action = self.side.list.key(key, visible);
         self.side_action(action)
     }
 
     fn side_action(&mut self, action: Option<SideAction>) -> Option<Command> {
+        let mut out = None;
         match action {
             Some(SideAction::Open { host, split }) => {
                 self.open_host(&host, split);
@@ -3520,29 +3574,308 @@ impl Window {
                     .set_favourites(self.settings.favourites.clone());
                 self.save_settings();
             }
+            Some(SideAction::New) => self.open_form(None),
+            Some(SideAction::Edit(host)) => self.open_form(Some(host)),
+            Some(SideAction::Delete(host)) => {
+                out = Some(
+                    if load_saved()
+                        .iter()
+                        .any(|h| h.alias.eq_ignore_ascii_case(&host))
+                    {
+                        Command::DeleteSession(host)
+                    } else {
+                        Command::Notice(format!(
+                            "{host} comes from {}, which FeroSSH does not change. Edit or \
+                             remove it there.",
+                            host_file(&host)
+                        ))
+                    },
+                );
+            }
             Some(SideAction::Leave) => self.focus_terminal(),
             None => {}
         }
         self.refresh_chrome();
-        None
+        out
     }
 
-    /// Opens `host` from the session manager: in the focused pane if it is
-    /// waiting at the connect prompt, else in a new tab (or a split).
-    fn open_host(&mut self, host: &str, split: bool) {
+    /// Opens the session form on `host`, or on a new session.
+    fn open_form(&mut self, host: Option<String>) {
+        let env = ssh_env();
+        let items = host_items(&env);
+        let names: Vec<String> = items.iter().map(|h| h.name.clone()).collect();
+        let font = FontSpec::default();
+        let hints = Hints {
+            local_user: env.local_user.clone(),
+            font: font.family,
+            font_size: font.size_pt,
+            scrollback: self
+                .settings
+                .scrollback
+                .unwrap_or(TermSettings::DEFAULT_SCROLLBACK),
+        };
+        let themes: Vec<String> = Theme::builtin().iter().map(|t| t.name.to_owned()).collect();
+        let form = match host {
+            None => SessionForm::new(None, Source::New, Values::default(), hints, names, themes),
+            Some(name) => {
+                let profile = self.settings.profile(&name);
+                let saved = load_saved();
+                match saved.iter().find(|h| h.alias.eq_ignore_ascii_case(&name)) {
+                    Some(h) => SessionForm::new(
+                        Some(h.alias.clone()),
+                        Source::Saved,
+                        Values::from_saved(h).with_profile(profile),
+                        hints,
+                        names,
+                        themes,
+                    ),
+                    None => {
+                        let folder = items
+                            .iter()
+                            .find(|h| h.name == name)
+                            .and_then(|h| h.folder.clone());
+                        let values = match Target::resolve(&name, &env) {
+                            Some(t) => {
+                                let key = t
+                                    .key_files
+                                    .iter()
+                                    .find(|k| k.explicit)
+                                    .map(|k| k.path.display().to_string());
+                                Values::from_resolved(
+                                    &name,
+                                    folder.as_deref(),
+                                    &t.hostname,
+                                    &t.user,
+                                    t.port,
+                                    key.as_deref(),
+                                    &t.forwards,
+                                )
+                            }
+                            None => Values {
+                                name: name.clone(),
+                                ..Values::default()
+                            },
+                        };
+                        let source = Source::ReadOnly(host_file(&name));
+                        SessionForm::new(
+                            Some(name),
+                            source,
+                            values.with_profile(profile),
+                            hints,
+                            names,
+                            themes,
+                        )
+                    }
+                }
+            }
+        };
+        self.side.form = Some(form);
+        self.side.focused = true;
+        self.refresh_chrome();
+    }
+
+    /// Carries out what the session form asked for.
+    fn form_action(&mut self, action: Option<FormAction>) -> Option<Command> {
+        let mut out = None;
+        match action {
+            Some(FormAction::Cancel) => self.side.form = None,
+            Some(FormAction::Save { connect }) => {
+                let form = self.side.form.as_ref()?;
+                let mut hosts = load_saved();
+                let mut settings = self.settings.clone();
+                let name = form.apply(&mut hosts, &mut settings);
+                if let Err(e) = write_app_file(&sessions_path(), &saved::to_text(&hosts)) {
+                    return Some(Command::Notice(format!(
+                        "Could not save the session to {}: {e}",
+                        sessions_path().display()
+                    )));
+                }
+                self.settings = settings;
+                self.save_settings();
+                self.side.form = None;
+                self.reload_sessions(Some(&name));
+                if connect {
+                    self.open_host(&name, false);
+                }
+            }
+            Some(FormAction::Delete) => {
+                out = self
+                    .side
+                    .form
+                    .as_ref()
+                    .and_then(|f| f.original.clone())
+                    .map(Command::DeleteSession);
+            }
+            Some(FormAction::BrowseKey) => out = Some(Command::PickKey),
+            None => {}
+        }
+        self.refresh_chrome();
+        out
+    }
+
+    /// Removes saved session `name` (after the user said yes).
+    fn delete_session(&mut self, name: &str) {
+        let mut hosts = load_saved();
+        session_form::delete(name, &mut hosts, &mut self.settings);
+        if let Err(e) = write_app_file(&sessions_path(), &saved::to_text(&hosts)) {
+            self.queued.push(Command::Notice(format!(
+                "Could not save {}: {e}",
+                sessions_path().display()
+            )));
+            return;
+        }
+        self.save_settings();
+        self.side.form = None;
+        self.reload_sessions(None);
+        self.refresh_chrome();
+    }
+
+    /// Reads the hosts again after a session was saved or deleted.
+    fn reload_sessions(&mut self, select: Option<&str>) {
+        let env = ssh_env();
+        self.side
+            .list
+            .set_hosts(host_items(&env), self.settings.favourites.clone());
+        if let Some(name) = select {
+            self.side.list.select(name);
+        }
+    }
+
+    /// A desktop session: Remote Desktop Connection straight to the
+    /// machine, or a tunnel through the session named in Via once that
+    /// SSH session has logged in.
+    fn open_desktop_session(
+        &mut self,
+        name: &str,
+        kind: SessionKind,
+        via: Option<String>,
+        split: bool,
+    ) {
+        let env = ssh_env();
+        let includes = ssh_config::DirIncludes {
+            home: env.home.clone(),
+        };
+        let cfg = ssh_config::resolve_in(&env.config, name, &includes);
+        let port = cfg.port.unwrap_or(match kind {
+            SessionKind::Vnc => DEFAULT_VNC_PORT,
+            _ => DEFAULT_DESKTOP_PORT,
+        });
+        let Some(via) = via else {
+            if kind != SessionKind::Rdp {
+                self.queued.push(Command::Notice(format!(
+                    "A VNC desktop goes through an SSH session. Choose one under Via SSH in \
+                     the session form (F2 on {name})."
+                )));
+                return;
+            }
+            let host = cfg.hostname.unwrap_or_else(|| name.to_owned());
+            let addr = if host.contains(':') {
+                format!("[{host}]:{port}")
+            } else {
+                format!("{host}:{port}")
+            };
+            if let Err(e) = launch_rdp_client(&addr) {
+                self.queued.push(Command::Notice(format!(
+                    "Remote Desktop Connection (mstsc.exe) did not start: {e}"
+                )));
+            }
+            return;
+        };
+        if kind == SessionKind::Vnc && !cfg!(feature = "vnc-viewer") {
+            self.queued.push(Command::Notice(
+                "This FeroSSH has no built-in VNC viewer. VNC sessions open in the desktop \
+                 build (ferossh-desktop.exe)."
+                    .into(),
+            ));
+            return;
+        }
+        // Without a host of its own, the desktop is on the SSH host.
+        let host = cfg.hostname.unwrap_or_else(|| "localhost".to_owned());
+        let pending = PendingDesktop {
+            label: name.to_owned(),
+            host,
+            port,
+            kind,
+            user: cfg.user,
+        };
+        // The SSH session's terminal shows the login and any problem.
+        let Some(id) = self.host_pane_for(split) else {
+            return;
+        };
+        self.pending_desktops.insert(id, pending);
+        self.focus_terminal();
+        self.connect(id, &via);
+    }
+
+    /// After a login on SSH pane `id`: opens the desktop a desktop session
+    /// waited for.
+    fn desktop_after_login(&mut self, id: PaneId) {
+        let Some(p) = self.pending_desktops.remove(&id) else {
+            return;
+        };
+        let (Some(connection), Some(Host::Ssh(s))) = (
+            self.pane_connection(id),
+            self.panes.get(&id).map(|p| &p.host),
+        ) else {
+            return;
+        };
+        let (local, want) = match p.kind {
+            SessionKind::Vnc => (
+                0,
+                DesktopWant::Tab {
+                    label: p.label.clone(),
+                    user: p.user.clone().unwrap_or_else(|| s.target.user.clone()),
+                    protocol: Protocol::Vnc,
+                },
+            ),
+            _ => (desktop_port_for(&p.label), DesktopWant::Rdp { pane: id }),
+        };
+        let Some(w) = self.worker.as_ref() else {
+            return;
+        };
+        w.forwarder.open_desktop(connection, &p.host, p.port, local);
+        self.desktops
+            .insert((connection, p.host.clone(), p.port), want);
+        self.show(
+            id,
+            &format!(
+                "\x1b[0;90mOpening the desktop {} on {} port {}...\x1b[0m\r\n",
+                crate::ssh::sanitize(&p.label),
+                crate::ssh::sanitize(&p.host),
+                p.port
+            ),
+        );
+        self.refresh(id);
+    }
+
+    /// The pane a session opens in: the focused one if it waits at the
+    /// connect prompt, else a new tab (or, with `split`, a split).
+    fn host_pane_for(&mut self, split: bool) -> Option<PaneId> {
         let focused = self.focused_id();
         let idle = matches!(
             self.panes.get(&focused).map(|p| &p.host),
             Some(Host::Ask(t)) if t.is_empty()
         );
-        let id = if split {
+        if split {
             self.split(Dir::Right)
         } else if idle {
             Some(focused)
         } else {
             Some(self.new_tab_pane())
-        };
-        if let Some(id) = id {
+        }
+    }
+
+    /// Opens `host` from the session manager: in the focused pane if it is
+    /// waiting at the connect prompt, else in a new tab (or a split).
+    fn open_host(&mut self, host: &str, split: bool) {
+        if let Some(p) = self.settings.profile(host)
+            && p.kind != SessionKind::Ssh
+        {
+            let (kind, via) = (p.kind, p.via.clone());
+            self.open_desktop_session(host, kind, via, split);
+            return;
+        }
+        if let Some(id) = self.host_pane_for(split) {
             self.focus_terminal();
             self.connect(id, host);
         }
@@ -3851,6 +4184,15 @@ impl Window {
                     self.side.focused = true;
                     self.request_full_redraw();
                 }
+                if button == MouseButton::Right
+                    && self.side.view == SideView::Sessions
+                    && self.side.form.is_none()
+                {
+                    let visible = SessionList::visible(self.side.grid.rows());
+                    self.side.list.select_at(row, visible);
+                    self.refresh_chrome();
+                    return Some(Command::SessionMenu(self.side.list.selected_host()));
+                }
                 if button != MouseButton::Left {
                     self.refresh_chrome();
                     return None;
@@ -3876,6 +4218,10 @@ impl Window {
                     let remote = self.files_key.as_ref().and_then(|k| self.sftp.get_mut(k));
                     let action = self.files.click(remote, col, row, double, &downloads, rows);
                     return self.files_action(action);
+                }
+                if let Some(form) = &mut self.side.form {
+                    let action = form.click(col, row, self.side.grid.rows());
+                    return self.form_action(action);
                 }
                 let visible = SessionList::visible(self.side.grid.rows());
                 let action = self.side.list.click(row, double, visible);
@@ -4259,6 +4605,8 @@ impl Window {
                 } else if self.side.view == SideView::Files {
                     let remote = self.files_key.as_ref().and_then(|k| self.sftp.get(k));
                     self.files.scroll_by(remote, lines, self.side.grid.rows());
+                } else if let Some(form) = &mut self.side.form {
+                    form.scroll_by(lines, self.side.grid.rows());
                 } else {
                     let visible = SessionList::visible(self.side.grid.rows());
                     self.side.list.scroll_by(lines, visible);
@@ -5272,6 +5620,12 @@ enum Command {
         gateway: PaneId,
         names: Vec<String>,
     },
+    /// The session manager's right-click menu, on this host if any.
+    SessionMenu(Option<String>),
+    /// Ask, then remove this saved session.
+    DeleteSession(String),
+    /// The file picker for the session form's key file.
+    PickKey,
 }
 
 /// A modal message box; `None` if another one is already open.
@@ -5430,6 +5784,110 @@ fn pick_files(hwnd: HWND) -> Vec<PathBuf> {
         [] => Vec::new(),
         [one] => vec![PathBuf::from(one)],
         [dir, names @ ..] => names.iter().map(|n| Path::new(dir).join(n)).collect(),
+    }
+}
+
+/// The session form's Browse: one key file, starting in `~/.ssh`.
+fn pick_key_file(hwnd: HWND) -> Option<PathBuf> {
+    if DIALOG_OPEN.get() {
+        return None;
+    }
+    let mut buf = vec![0u16; 4096];
+    let dir = HSTRING::from(home().join(".ssh").as_os_str());
+    let mut ofn = OPENFILENAMEW {
+        lStructSize: std::mem::size_of::<OPENFILENAMEW>() as u32,
+        hwndOwner: hwnd,
+        lpstrFile: PWSTR(buf.as_mut_ptr()),
+        nMaxFile: buf.len() as u32,
+        lpstrInitialDir: PCWSTR(dir.as_ptr()),
+        lpstrTitle: w!("Key file for this session"),
+        Flags: OFN_EXPLORER | OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR,
+        ..Default::default()
+    };
+    DIALOG_OPEN.set(true);
+    // SAFETY: the struct is filled in as documented; `buf` and `dir`
+    // outlive the call; the dialog's modal loop holds no state borrow.
+    let ok = unsafe { GetOpenFileNameW(&mut ofn) }.as_bool();
+    DIALOG_OPEN.set(false);
+    if !ok {
+        return None;
+    }
+    let len = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
+    buf.get(..len)
+        .map(|name| PathBuf::from(String::from_utf16_lossy(name)))
+}
+
+/// Which file a host the session form cannot change comes from, as the
+/// user knows it.
+fn host_file(host: &str) -> String {
+    let in_putty = std::fs::read_to_string(putty_hosts_path()).is_ok_and(|t| {
+        ssh_config::hosts(&t, &ssh_config::NoIncludes)
+            .iter()
+            .any(|h| h.name.eq_ignore_ascii_case(host))
+    });
+    if in_putty {
+        "the PuTTY import".to_owned()
+    } else {
+        "~/.ssh/config".to_owned()
+    }
+}
+
+/// The session manager's right-click menu.
+fn session_menu(hwnd: HWND, host: Option<String>) {
+    const CONNECT: u32 = 1;
+    const SPLIT: u32 = 2;
+    const EDIT: u32 = 3;
+    const DELETE: u32 = 4;
+    const NEW: u32 = 5;
+    // SAFETY: a popup menu of our own on our window, destroyed after use.
+    // TPM_RETURNCMD returns the picked id, 0 for none.
+    let picked = unsafe {
+        let Ok(menu) = CreatePopupMenu() else {
+            return;
+        };
+        if host.is_some() {
+            let _ = AppendMenuW(menu, MF_STRING, CONNECT as usize, w!("&Connect\tEnter"));
+            let _ = AppendMenuW(
+                menu,
+                MF_STRING,
+                SPLIT as usize,
+                w!("Open in a &split\tShift+Enter"),
+            );
+            let _ = AppendMenuW(menu, MF_SEPARATOR, 0, None);
+            let _ = AppendMenuW(menu, MF_STRING, EDIT as usize, w!("&Edit session...\tF2"));
+            let _ = AppendMenuW(
+                menu,
+                MF_STRING,
+                DELETE as usize,
+                w!("&Delete session...\tDel"),
+            );
+            let _ = AppendMenuW(menu, MF_SEPARATOR, 0, None);
+        }
+        let _ = AppendMenuW(menu, MF_STRING, NEW as usize, w!("&New session...\tIns"));
+        let mut pt = POINT::default();
+        let _ = GetCursorPos(&mut pt);
+        let chosen = TrackPopupMenu(
+            menu,
+            TPM_RETURNCMD | TPM_NONOTIFY,
+            pt.x,
+            pt.y,
+            None,
+            hwnd,
+            None,
+        );
+        let _ = DestroyMenu(menu);
+        u32::try_from(chosen.0).unwrap_or(0)
+    };
+    let action = match (picked, host) {
+        (CONNECT, Some(host)) => SideAction::Open { host, split: false },
+        (SPLIT, Some(host)) => SideAction::Open { host, split: true },
+        (EDIT, Some(host)) => SideAction::Edit(host),
+        (DELETE, Some(host)) => SideAction::Delete(host),
+        (NEW, _) => SideAction::New,
+        _ => return,
+    };
+    if let Some(Some(command)) = with_window(|w| w.side_action(Some(action))) {
+        run_command(hwnd, command);
     }
 }
 
@@ -5657,6 +6115,26 @@ fn run_command(hwnd: HWND, command: Command) {
             }
         }
         Command::ImportPutty => import_putty(hwnd),
+        Command::SessionMenu(host) => session_menu(hwnd, host),
+        Command::DeleteSession(name) => {
+            let text = format!(
+                "Delete the session {name}? Its look and extras in FeroSSH go with it.\n\n\
+                 This cannot be undone."
+            );
+            if dialog(hwnd, &text, MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2) == Some(IDYES) {
+                with_window(|w| w.delete_session(&name));
+            }
+        }
+        Command::PickKey => {
+            if let Some(path) = pick_key_file(hwnd) {
+                with_window(|w| {
+                    if let Some(form) = &mut w.side.form {
+                        form.set_key(&path.display().to_string());
+                    }
+                    w.refresh_chrome();
+                });
+            }
+        }
         Command::SaveLook => {
             if let Some(result) = with_window(Window::save_look) {
                 let (text, icon) = match result {
@@ -5716,10 +6194,16 @@ fn import_putty(hwnd: HWND) {
     let includes = ssh_config::DirIncludes {
         home: env.home.clone(),
     };
-    let taken: Vec<String> = ssh_config::hosts(&env.config, &includes)
+    let mut taken: Vec<String> = ssh_config::hosts(&env.config, &includes)
         .into_iter()
         .map(|h| h.name.to_ascii_lowercase())
         .collect();
+    // So do the sessions made in the session form.
+    taken.extend(
+        load_saved()
+            .into_iter()
+            .map(|h| h.alias.to_ascii_lowercase()),
+    );
     let is_taken = |alias: &str| taken.contains(&alias.to_ascii_lowercase());
     let fresh: Vec<&putty::Session> = sessions.iter().filter(|s| !is_taken(&s.alias)).collect();
     let names: Vec<&str> = fresh.iter().take(12).map(|s| s.name.as_str()).collect();
@@ -5741,7 +6225,7 @@ fn import_putty(hwnd: HWND) {
     let skipped = sessions.len() - fresh.len();
     if skipped > 0 {
         text.push_str(&format!(
-            "\n\n{skipped} session{} named like a host in your ssh_config {} skipped.",
+            "\n\n{skipped} session{} named like a host in your ssh_config or sessions {} skipped.",
             plural(skipped),
             if skipped == 1 { "is" } else { "are" }
         ));
@@ -5749,7 +6233,7 @@ fn import_putty(hwnd: HWND) {
     if fresh.is_empty() {
         dialog(
             hwnd,
-            "Every PuTTY session is already a host in your ssh_config; nothing to import.",
+            "Every PuTTY session is already a host in your ssh_config or sessions; nothing to import.",
             MB_OK | MB_ICONINFORMATION,
         );
         return;

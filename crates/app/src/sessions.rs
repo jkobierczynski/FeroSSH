@@ -26,6 +26,8 @@ pub struct HostItem {
 /// A visible row.
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum Row {
+    /// "+ New session", first when not searching.
+    New,
     Folder {
         name: String,
         open: bool,
@@ -64,6 +66,10 @@ pub enum SideKey {
     Tab,
     /// F5.
     Refresh,
+    /// F2: edit the selected session.
+    Edit,
+    /// Insert: a new session.
+    New,
     Char(char),
 }
 
@@ -75,6 +81,12 @@ pub enum SideAction {
         split: bool,
     },
     ToggleFavourite(String),
+    /// Open the session form for a new session.
+    New,
+    /// Open the session form on this host.
+    Edit(String),
+    /// Remove this saved session (the window asks first).
+    Delete(String),
     /// Give the keyboard back to the terminal.
     Leave,
 }
@@ -129,6 +141,27 @@ impl SessionList {
         }
     }
 
+    /// Selects host `name` if it is listed.
+    pub fn select(&mut self, name: &str) {
+        if let Some(i) = self.rows().iter().position(|r| {
+            self.row_host(r)
+                .is_some_and(|h| h.eq_ignore_ascii_case(name))
+        }) {
+            self.selected = i;
+        }
+    }
+
+    /// Selects the row at grid row `y` without opening anything (for a
+    /// right click).
+    pub fn select_at(&mut self, y: usize, visible: usize) {
+        if let Some(i) = y.checked_sub(HEADER).map(|i| i + self.scroll)
+            && i < self.rows().len()
+        {
+            self.selected = i;
+            self.clamp(visible);
+        }
+    }
+
     fn is_favourite(&self, name: &str) -> bool {
         self.favourites.iter().any(|f| f.eq_ignore_ascii_case(name))
     }
@@ -167,7 +200,7 @@ impl SessionList {
             });
             return hits.into_iter().map(host).collect();
         }
-        let mut rows = Vec::new();
+        let mut rows = vec![Row::New];
         let group = |name: &str, members: Vec<usize>, rows: &mut Vec<Row>| {
             if members.is_empty() {
                 return;
@@ -219,7 +252,7 @@ impl SessionList {
     fn row_host(&self, row: &Row) -> Option<&String> {
         match row {
             Row::Host { index, .. } => self.hosts.get(*index).map(|h| &h.name),
-            Row::Folder { .. } => None,
+            Row::Folder { .. } | Row::New => None,
         }
     }
 
@@ -278,6 +311,7 @@ impl SessionList {
                 }
             }
             SideKey::Enter { split } => match current {
+                Some(Row::New) => return Some(SideAction::New),
                 Some(Row::Folder { name, open, .. }) => {
                     if open {
                         self.collapsed.insert(name);
@@ -312,6 +346,14 @@ impl SessionList {
             SideKey::ToggleFavourite => {
                 return self.selected_host().map(SideAction::ToggleFavourite);
             }
+            SideKey::New => return Some(SideAction::New),
+            SideKey::Edit => {
+                return Some(match self.selected_host() {
+                    Some(host) => SideAction::Edit(host),
+                    None => SideAction::New,
+                });
+            }
+            SideKey::Delete => return self.selected_host().map(SideAction::Delete),
             SideKey::Char(c) if !c.is_control() => {
                 if self.query.chars().count() < 64 {
                     self.query.push(c);
@@ -319,7 +361,7 @@ impl SessionList {
                 self.selected = 0;
                 self.scroll = 0;
             }
-            SideKey::Char(_) | SideKey::Delete | SideKey::Tab | SideKey::Refresh => {}
+            SideKey::Char(_) | SideKey::Tab | SideKey::Refresh => {}
         }
         self.clamp(visible);
         None
@@ -334,7 +376,7 @@ impl SessionList {
         }
         self.selected = i;
         self.clamp(visible);
-        let folder = matches!(self.rows().get(i), Some(Row::Folder { .. }));
+        let folder = matches!(self.rows().get(i), Some(Row::Folder { .. } | Row::New));
         if double || folder {
             return self.key(SideKey::Enter { split: false }, visible);
         }
@@ -411,6 +453,16 @@ impl SessionList {
                 bg
             };
             let cells = match rows.get(i) {
+                Some(Row::New) => line(
+                    " + New session",
+                    if selected && focused {
+                        palette.text
+                    } else {
+                        palette.dim
+                    },
+                    row_bg,
+                    Flags::empty(),
+                ),
                 Some(Row::Folder { name, open, count }) => line(
                     &format!(" {} {name} ({count})", if *open { "▾" } else { "▸" }),
                     palette.dim,
@@ -523,18 +575,24 @@ mod tests {
         let mut l = list();
         let t = texts(&mut l);
         assert_eq!(t[0], " Sessions");
-        assert_eq!(t[2], " ▾ Favourites (1)");
-        assert!(t[3].starts_with("   ★ pi"), "{:?}", t[3]);
-        assert!(t[4].starts_with("   web"), "{:?}", t[4]);
-        assert_eq!(t[5], " ▾ Work (2)");
-        assert!(t[6].contains("db1") && t[6].contains("me@db1.example"));
-        assert_eq!(t[8], " ▾ Home (1)");
+        assert_eq!(t[2], " + New session");
+        assert_eq!(t[3], " ▾ Favourites (1)");
+        assert!(t[4].starts_with("   ★ pi"), "{:?}", t[4]);
+        assert!(t[5].starts_with("   web"), "{:?}", t[5]);
+        assert_eq!(t[6], " ▾ Work (2)");
+        assert!(t[7].contains("db1") && t[7].contains("me@db1.example"));
+        assert_eq!(t[9], " ▾ Home (1)");
     }
 
     #[test]
     fn keys_navigate_and_open() {
         let mut l = list();
-        assert_eq!(l.selected_host(), None, "the favourites folder is first");
+        assert_eq!(
+            l.key(SideKey::Enter { split: false }, 8),
+            Some(SideAction::New)
+        );
+        l.key(SideKey::Down, 8);
+        assert_eq!(l.selected_host(), None, "the favourites folder is next");
         l.key(SideKey::Down, 8);
         assert_eq!(l.selected_host().as_deref(), Some("pi"));
         assert_eq!(
@@ -557,9 +615,23 @@ mod tests {
         assert_eq!(l.selected_host(), None);
         l.key(SideKey::Left, 8);
         let t = texts(&mut l);
-        assert_eq!(t[5], " ▸ Work (2)");
-        assert_eq!(t[6], " ▾ Home (1)");
+        assert_eq!(t[6], " ▸ Work (2)");
+        assert_eq!(t[7], " ▾ Home (1)");
         assert_eq!(l.key(SideKey::Escape, 8), Some(SideAction::Leave));
+    }
+
+    #[test]
+    fn edit_new_and_delete_keys() {
+        let mut l = list();
+        assert_eq!(l.key(SideKey::Edit, 8), Some(SideAction::New));
+        l.key(SideKey::Down, 8);
+        l.key(SideKey::Down, 8);
+        assert_eq!(l.key(SideKey::Edit, 8), Some(SideAction::Edit("pi".into())));
+        assert_eq!(
+            l.key(SideKey::Delete, 8),
+            Some(SideAction::Delete("pi".into()))
+        );
+        assert_eq!(l.key(SideKey::New, 8), Some(SideAction::New));
     }
 
     #[test]
@@ -597,10 +669,11 @@ mod tests {
     fn clicks_and_scrolling() {
         let mut l = list();
         assert_eq!(l.click(0, false, 3), None);
-        assert_eq!(l.click(3, false, 3), None);
+        assert_eq!(l.click(2, false, 3), Some(SideAction::New));
+        assert_eq!(l.click(4, false, 3), None);
         assert_eq!(l.selected_host().as_deref(), Some("pi"));
         assert_eq!(
-            l.click(3, true, 3),
+            l.click(4, true, 3),
             Some(SideAction::Open {
                 host: "pi".into(),
                 split: false
@@ -618,14 +691,15 @@ mod tests {
         let mut l = list();
         l.key(SideKey::Down, 8);
         l.key(SideKey::Down, 8);
+        l.key(SideKey::Down, 8);
         assert_eq!(l.selected_host().as_deref(), Some("web"));
         l.set_favourites(vec!["web".into(), "pi".into()]);
         assert_eq!(l.selected_host().as_deref(), Some("web"));
-        assert_eq!(l.selected, 1);
+        assert_eq!(l.selected, 2);
         let mut hosts = vec![item("new", None)];
         hosts.extend(list().hosts);
         l.set_hosts(hosts, vec![]);
         assert_eq!(l.selected_host().as_deref(), Some("web"));
-        assert_eq!(l.selected, 1);
+        assert_eq!(l.selected, 2);
     }
 }

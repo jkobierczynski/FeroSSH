@@ -25,6 +25,9 @@
 //! Profile desktop-box
 //!     DesktopPort 3390
 //!     VncPort 5901
+//! Profile office-pc
+//!     Type rdp
+//!     Via bastion
 //! ```
 //!
 //! FeroSSH rewrites the file when a setting changes. Unknown keywords are
@@ -61,6 +64,42 @@ pub struct Profile {
     /// The server's VNC port for the built-in desktop viewer; 5900 when
     /// unset.
     pub vnc_port: Option<u16>,
+    /// What the session opens: a shell (the default) or a desktop.
+    pub kind: SessionKind,
+    /// For a desktop session: the SSH host whose connection carries it.
+    /// Unset, an RDP session connects straight to the machine.
+    pub via: Option<String>,
+}
+
+/// What opening a session does.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum SessionKind {
+    /// An SSH login with a shell.
+    #[default]
+    Ssh,
+    /// A Remote Desktop (RDP) connection in Remote Desktop Connection.
+    Rdp,
+    /// A VNC desktop in the built-in viewer, always through SSH.
+    Vnc,
+}
+
+impl SessionKind {
+    pub fn name(self) -> &'static str {
+        match self {
+            SessionKind::Ssh => "ssh",
+            SessionKind::Rdp => "rdp",
+            SessionKind::Vnc => "vnc",
+        }
+    }
+
+    pub fn parse(text: &str) -> Option<Self> {
+        match text.to_ascii_lowercase().as_str() {
+            "ssh" => Some(SessionKind::Ssh),
+            "rdp" => Some(SessionKind::Rdp),
+            "vnc" => Some(SessionKind::Vnc),
+            _ => None,
+        }
+    }
 }
 
 /// The RDP port xrdp and GNOME Remote Desktop listen on by default.
@@ -79,6 +118,8 @@ impl Profile {
             && !self.legacy_algorithms
             && self.desktop_port.is_none()
             && self.vnc_port.is_none()
+            && self.kind == SessionKind::Ssh
+            && self.via.is_none()
     }
 }
 
@@ -292,6 +333,15 @@ impl Settings {
                                     .and_then(|v| v.parse::<u16>().ok())
                                     .filter(|&v| v != 0);
                             }
+                            "type" => {
+                                p.kind = first
+                                    .as_deref()
+                                    .and_then(SessionKind::parse)
+                                    .unwrap_or_default();
+                            }
+                            "via" => {
+                                p.via = first.filter(|v| crate::saved::valid_alias(v));
+                            }
                             "tmuxlayout" => {
                                 p.tmux_layout = first
                                     .map(|l| l.to_ascii_lowercase())
@@ -404,6 +454,12 @@ impl Settings {
             if let Some(port) = p.vnc_port {
                 let _ = writeln!(out, "    VncPort {port}");
             }
+            if p.kind != SessionKind::Ssh {
+                let _ = writeln!(out, "    Type {}", p.kind.name());
+            }
+            if let Some(v) = &p.via {
+                let _ = writeln!(out, "    Via {}", arg(v));
+            }
         }
         out
     }
@@ -494,6 +550,8 @@ Profile web
     LegacyAlgorithms YES
     DesktopPort 3390
     VncPort 5901
+    Type RDP
+    Via jump-1
     Unknown thing
 Profile big
     FontSize 400
@@ -502,6 +560,8 @@ Profile big
     TmuxLayout split
     LegacyAlgorithms maybe
     DesktopPort 0
+    Type telnet
+    Via "a b"
 NewKeyword later
 "#;
 
@@ -529,6 +589,8 @@ NewKeyword later
         assert!(web.legacy_algorithms);
         assert_eq!(web.desktop_port, Some(3390));
         assert_eq!(web.vnc_port, Some(5901));
+        assert_eq!(web.kind, SessionKind::Rdp);
+        assert_eq!(web.via.as_deref(), Some("jump-1"));
         assert_eq!(s.scrollback, Some(50_000));
         assert_eq!(s.download_folder.as_deref(), Some("D:\\My Transfers"));
         assert!(s.verify_transfers);
@@ -542,6 +604,8 @@ NewKeyword later
         assert_eq!(big.tmux_layout, None);
         assert!(!big.legacy_algorithms, "only `yes` turns it on");
         assert_eq!(big.desktop_port, None, "port 0 is no port");
+        assert_eq!(big.kind, SessionKind::Ssh);
+        assert_eq!(big.via, None);
     }
 
     #[test]

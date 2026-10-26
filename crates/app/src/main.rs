@@ -52,6 +52,8 @@ mod sandbox;
 #[cfg_attr(not(windows), allow(dead_code))]
 mod scrollmark;
 #[cfg_attr(not(windows), allow(dead_code))]
+mod session_form;
+#[cfg_attr(not(windows), allow(dead_code))]
 mod sessions;
 #[cfg_attr(not(windows), allow(dead_code))]
 mod ssh;

@@ -165,14 +165,14 @@ fn desktop_event(forwarder: &Forwarder) -> DesktopEvent {
 /// Opens a remote desktop on a closed port, then on the echo server, and
 /// returns the desktop's open stream.
 fn desktop_side(forwarder: &Forwarder, connection: ChannelId, echo: u16, closed: u16) -> TcpStream {
-    forwarder.open_desktop(connection, closed, 0);
+    forwarder.open_desktop(connection, "localhost", closed, 0);
     match desktop_event(forwarder) {
         DesktopEvent::Failed { why, .. } => {
             assert!(why.contains("no remote desktop service"), "{why}");
         }
         e => panic!("a closed port opened a desktop: {e:?}"),
     }
-    forwarder.open_desktop(connection, echo, free_port());
+    forwarder.open_desktop(connection, "localhost", echo, free_port());
     let DesktopEvent::Ready { addr, .. } = desktop_event(forwarder) else {
         panic!("the desktop tunnel failed");
     };

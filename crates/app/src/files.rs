@@ -336,7 +336,7 @@ impl FilesView {
                 }
                 _ => {}
             },
-            SideKey::ToggleFavourite => {}
+            SideKey::ToggleFavourite | SideKey::Edit | SideKey::New => {}
         }
         None
     }

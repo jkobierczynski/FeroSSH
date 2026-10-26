@@ -63,17 +63,19 @@ pub fn desktop_port_for(label: &str) -> u16 {
 /// What became of a request to open a remote desktop.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DesktopEvent {
-    /// The tunnel to the server's `port` listens at `addr`
-    /// (`127.0.0.1:port`); a viewer may connect.
+    /// The tunnel to `host:port` (as the server sees it; `localhost` is
+    /// the server itself) listens at `addr` (`127.0.0.1:port`); a viewer
+    /// may connect.
     Ready {
         connection: ChannelId,
+        host: String,
         port: u16,
         addr: String,
     },
-    /// Nothing answers on the server's `port`, or the tunnel could not
-    /// listen.
+    /// Nothing answers on `host:port`, or the tunnel could not listen.
     Failed {
         connection: ChannelId,
+        host: String,
         port: u16,
         why: String,
     },
@@ -162,6 +164,7 @@ enum Cmd {
     },
     Desktop {
         connection: ChannelId,
+        host: String,
         port: u16,
         local_port: u16,
     },
@@ -247,13 +250,14 @@ impl Forwarder {
         self.cmd(Cmd::Stop { connection });
     }
 
-    /// Opens a tunnel to the RDP server on `port` of the connection's
-    /// host, listening on loopback `local_port` (or, when that is taken,
-    /// on a port the system picks). The answer comes as a
-    /// [`DesktopEvent`].
-    pub fn open_desktop(&self, connection: ChannelId, port: u16, local_port: u16) {
+    /// Opens a tunnel to the desktop server on `host:port` as the
+    /// connection's host sees it (`localhost`: the host itself),
+    /// listening on loopback `local_port` (or, when that is taken, on a
+    /// port the system picks). The answer comes as a [`DesktopEvent`].
+    pub fn open_desktop(&self, connection: ChannelId, host: &str, port: u16, local_port: u16) {
         self.cmd(Cmd::Desktop {
             connection,
+            host: host.to_owned(),
             port,
             local_port,
         });
@@ -378,8 +382,8 @@ struct Fwd {
     remote: Option<ChannelId>,
     total: u64,
     error: Option<String>,
-    /// A remote desktop tunnel: the server's RDP port.
-    desktop: Option<u16>,
+    /// A remote desktop tunnel: the desktop server's host and port.
+    desktop: Option<(String, u16)>,
     /// The window waits to hear where this desktop tunnel listens.
     desktop_waiting: bool,
 }
@@ -441,6 +445,7 @@ type ToWorker = Arc<dyn Fn(Message) + Send + Sync>;
 /// A check that the server's RDP port answers, before a desktop tunnel.
 struct Probe {
     connection: ChannelId,
+    host: String,
     port: u16,
     local_port: u16,
 }
@@ -561,9 +566,10 @@ impl Engine {
             Cmd::Stop { connection } => self.stop(connection),
             Cmd::Desktop {
                 connection,
+                host,
                 port,
                 local_port,
-            } => self.probe_desktop(connection, port, local_port),
+            } => self.probe_desktop(connection, host, port, local_port),
             Cmd::FromWorker(msg) => self.on_worker(msg),
             Cmd::WorkerGone => self.stop_all(),
         }
@@ -627,13 +633,13 @@ impl Engine {
     }
 
     /// Adds a forward; `desktop` marks a remote desktop tunnel to that
-    /// server port. Returns the forward's key, or `None` when the
+    /// host and port. Returns the forward's key, or `None` when the
     /// connection is gone or already has this forward.
     fn add_fwd(
         &mut self,
         connection: ChannelId,
         spec: ForwardSpec,
-        desktop: Option<u16>,
+        desktop: Option<(String, u16)>,
     ) -> Option<u64> {
         let conn = self.conns.get_mut(&connection)?;
         if conn.forwards.iter().any(|f| f.spec == spec) {
@@ -650,8 +656,8 @@ impl Engine {
             remote: None,
             total: 0,
             error: None,
-            desktop,
             desktop_waiting: desktop.is_some(),
+            desktop,
         };
         match spec.kind {
             ForwardKind::Local | ForwardKind::Dynamic => {
@@ -679,10 +685,11 @@ impl Engine {
     /// Checks that something on the server answers on `port` before
     /// opening a desktop tunnel to it: a viewer pointed at a dead port
     /// only says it cannot connect, without saying why.
-    fn probe_desktop(&mut self, connection: ChannelId, port: u16, local_port: u16) {
+    fn probe_desktop(&mut self, connection: ChannelId, host: String, port: u16, local_port: u16) {
         if !self.conns.contains_key(&connection) {
             self.desktop_events.push(DesktopEvent::Failed {
                 connection,
+                host,
                 port,
                 why: "That connection is not logged in.".into(),
             });
@@ -693,6 +700,7 @@ impl Engine {
             id,
             Probe {
                 connection,
+                host: host.clone(),
                 port,
                 local_port,
             },
@@ -700,7 +708,7 @@ impl Engine {
         self.send(Message::ForwardOpen {
             channel: id,
             connection,
-            target: Some(("localhost".into(), port)),
+            target: Some((host, port)),
             origin_host: "127.0.0.1".into(),
             origin_port: 0,
             keep: false,
@@ -711,33 +719,45 @@ impl Engine {
     fn probed(&mut self, probe: Probe, answer: Result<(), String>) {
         let Probe {
             connection,
+            host,
             port,
             local_port,
         } = probe;
         if let Err(why) = answer {
-            let why = format!(
-                "Nothing answers on the server's port {port}, so it has no remote desktop \
-                 service there ({why})."
-            );
+            let why = if host == "localhost" {
+                format!(
+                    "Nothing answers on the server's port {port}, so it has no remote desktop \
+                     service there ({why})."
+                )
+            } else {
+                format!(
+                    "Nothing answers on {host} port {port} from the SSH server, so the \
+                     desktop cannot be reached that way ({why})."
+                )
+            };
             self.desktop_events.push(DesktopEvent::Failed {
                 connection,
+                host,
                 port,
                 why,
             });
             return;
         }
-        // A tunnel already open for this port serves again.
+        let target = (host, port);
+        // A tunnel already open for this desktop serves again.
         let existing = self.conns.get_mut(&connection).and_then(|c| {
-            c.forwards
-                .iter_mut()
-                .find(|f| f.desktop == Some(port) && !matches!(f.state, FwdState::Failed(_)))
+            c.forwards.iter_mut().find(|f| {
+                f.desktop.as_ref() == Some(&target) && !matches!(f.state, FwdState::Failed(_))
+            })
         });
         if let Some(f) = existing {
             match &f.state {
                 FwdState::Listening(addrs) => {
                     let addr = first_addr(addrs);
+                    let (host, port) = target;
                     self.desktop_events.push(DesktopEvent::Ready {
                         connection,
+                        host,
                         port,
                         addr,
                     });
@@ -746,7 +766,7 @@ impl Engine {
             }
             return;
         }
-        self.add_fwd(connection, desktop_spec(local_port, port), Some(port));
+        self.add_fwd(connection, desktop_spec(local_port, &target), Some(target));
     }
 
     /// A desktop tunnel's listener started or failed.
@@ -757,7 +777,7 @@ impl Engine {
         let Some(f) = self.fwd_mut(owner) else {
             return;
         };
-        let (Some(port), true) = (f.desktop, f.desktop_waiting) else {
+        let (Some(target), true) = (f.desktop.clone(), f.desktop_waiting) else {
             return;
         };
         f.desktop_waiting = false;
@@ -765,7 +785,8 @@ impl Engine {
         match result {
             Ok(addrs) => self.desktop_events.push(DesktopEvent::Ready {
                 connection,
-                port,
+                host: target.0,
+                port: target.1,
                 addr: first_addr(&addrs),
             }),
             // The host's own port is taken: any free one will do.
@@ -776,11 +797,12 @@ impl Engine {
                     let fwd = c.forwards.remove(i);
                     self.end_fwd(connection, fwd);
                 }
-                self.add_fwd(connection, desktop_spec(0, port), Some(port));
+                self.add_fwd(connection, desktop_spec(0, &target), Some(target));
             }
             Err(why) => self.desktop_events.push(DesktopEvent::Failed {
                 connection,
-                port,
+                host: target.0,
+                port: target.1,
                 why,
             }),
         }
@@ -1047,14 +1069,14 @@ impl Engine {
     }
 }
 
-/// The forward behind a remote desktop: loopback `local` to the server's
-/// RDP `port`.
-fn desktop_spec(local: u16, port: u16) -> ForwardSpec {
+/// The forward behind a remote desktop: loopback `local` to the desktop
+/// server's host and port.
+fn desktop_spec(local: u16, (host, port): &(String, u16)) -> ForwardSpec {
     ForwardSpec {
         kind: ForwardKind::Local,
         bind: Some("127.0.0.1".into()),
         port: local,
-        target: Some(("localhost".into(), port)),
+        target: Some((host.clone(), *port)),
     }
 }
 
@@ -1338,7 +1360,7 @@ mod tests {
     fn a_desktop_without_a_server_says_so() {
         let (fwd, sent) = engine();
         fwd.start(1, "me@box".into(), Setup::default());
-        fwd.open_desktop(1, 3389, 0);
+        fwd.open_desktop(1, "localhost", 3389, 0);
         let channel = probe(&sent, 3389);
         fwd.sink()(Message::Disconnected {
             channel,
@@ -1354,7 +1376,7 @@ mod tests {
         // No tunnel was left listening.
         assert!(fwd.view()[0].forwards.is_empty());
         // Not logged in: refused at once.
-        fwd.open_desktop(9, 3389, 0);
+        fwd.open_desktop(9, "localhost", 3389, 0);
         assert!(matches!(
             desktop_event(&fwd),
             DesktopEvent::Failed { connection: 9, .. }
@@ -1368,7 +1390,7 @@ mod tests {
         // Someone holds the host's own port: the tunnel takes another.
         let taken = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let busy = taken.local_addr().unwrap().port();
-        fwd.open_desktop(1, 3390, busy);
+        fwd.open_desktop(1, "localhost", 3390, busy);
         let channel = probe(&sent, 3390);
         fwd.sink()(Message::ForwardOpened {
             channel,
@@ -1409,7 +1431,7 @@ mod tests {
         });
         // Asking again probes again and reuses the tunnel.
         sent.lock().unwrap().clear();
-        fwd.open_desktop(1, 3390, busy);
+        fwd.open_desktop(1, "localhost", 3390, busy);
         let again = probe(&sent, 3390);
         fwd.sink()(Message::ForwardOpened {
             channel: again,
@@ -1420,6 +1442,7 @@ mod tests {
             desktop_event(&fwd),
             DesktopEvent::Ready {
                 connection: 1,
+                host: "localhost".into(),
                 port: 3390,
                 addr: at.to_string()
             }
