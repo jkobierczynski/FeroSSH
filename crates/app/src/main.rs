@@ -37,6 +37,10 @@ mod forwards;
 mod forwards_e2e;
 #[cfg_attr(not(windows), allow(dead_code))]
 mod fwdview;
+#[cfg(windows)]
+mod import_reg;
+#[cfg_attr(not(windows), allow(dead_code))]
+mod import_view;
 #[cfg_attr(not(windows), allow(dead_code))]
 mod layout;
 #[cfg_attr(not(windows), allow(dead_code))]
@@ -47,8 +51,6 @@ mod look;
 mod newkey;
 #[cfg_attr(not(windows), allow(dead_code))]
 mod pattern;
-#[cfg(windows)]
-mod putty_reg;
 #[cfg_attr(not(windows), allow(dead_code))]
 mod pwcommand;
 #[cfg(windows)]

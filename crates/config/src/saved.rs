@@ -141,27 +141,40 @@ pub fn to_text(hosts: &[SavedHost]) -> String {
         "# Sessions made in FeroSSH's session manager. FeroSSH rewrites this file;\n\
          # comments are not kept. OpenSSH does not read it.\n",
     );
-    for h in hosts.iter().filter(|h| valid_alias(&h.alias)) {
-        let folder = h.folder.as_deref().map(folder_text).unwrap_or_default();
-        let _ = writeln!(out, "\n# folder: {folder}");
-        let _ = writeln!(out, "Host {}", h.alias);
-        if let Some(name) = h.hostname.as_deref().filter(|n| valid_hostname(n)) {
-            let _ = writeln!(out, "    HostName {name}");
-        }
-        if let Some(user) = &h.user {
-            let _ = writeln!(out, "    User {}", quoted(user));
-        }
-        if let Some(port) = h.port {
-            let _ = writeln!(out, "    Port {port}");
-        }
-        if let Some(key) = &h.identity_file {
-            let _ = writeln!(out, "    IdentityFile {}", quoted(key));
-        }
-        for f in &h.forwards {
-            let _ = writeln!(out, "    {}", f.config_line());
-        }
+    for h in hosts {
+        write_host(&mut out, h, None);
     }
     out
+}
+
+/// Appends one host's block, after its `# folder:` line, and `comment`
+/// as a comment line before the block when given. A host whose name
+/// FeroSSH would not write is left out.
+pub(crate) fn write_host(out: &mut String, h: &SavedHost, comment: Option<&str>) {
+    if !valid_alias(&h.alias) {
+        return;
+    }
+    let folder = h.folder.as_deref().map(folder_text).unwrap_or_default();
+    let _ = writeln!(out, "\n# folder: {folder}");
+    if let Some(c) = comment {
+        let _ = writeln!(out, "# {}", folder_text(c));
+    }
+    let _ = writeln!(out, "Host {}", h.alias);
+    if let Some(name) = h.hostname.as_deref().filter(|n| valid_hostname(n)) {
+        let _ = writeln!(out, "    HostName {name}");
+    }
+    if let Some(user) = &h.user {
+        let _ = writeln!(out, "    User {}", quoted(user));
+    }
+    if let Some(port) = h.port {
+        let _ = writeln!(out, "    Port {port}");
+    }
+    if let Some(key) = &h.identity_file {
+        let _ = writeln!(out, "    IdentityFile {}", quoted(key));
+    }
+    for f in &h.forwards {
+        let _ = writeln!(out, "    {}", f.config_line());
+    }
 }
 
 #[cfg(test)]
