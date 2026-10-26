@@ -769,14 +769,22 @@ pub async fn run(
     let result = session(&params, &mut inbox, tunnel, &mut ctx, &connections).await;
     let server_said = with(&shared, |s| s.server_said.take()).flatten();
     let lost = with(&shared, |s| s.lost.take()).flatten();
+    let mut dropped = false;
     let reason = match (result, server_said) {
         (_, Some(said)) if !said.trim().is_empty() => {
             format!("The server closed the connection: {}", said.trim())
+        }
+        (Ok(Ended::Lost), _) => {
+            dropped = true;
+            lost.unwrap_or_else(|| LOST.to_owned())
         }
         (Ok(Ended::Connection), _) => lost.unwrap_or_else(|| "Connection closed.".to_owned()),
         (Ok(Ended::Shell), _) => SHELL_CLOSED.to_owned(),
         (Err(e), _) => e.to_string(),
     };
+    if dropped {
+        let _ = out.send(Message::Lost { channel }).await;
+    }
     let _ = out.send(Message::Disconnected { channel, reason }).await;
 }
 
@@ -810,6 +818,10 @@ pub async fn open(
         )),
     };
     let reason = match result {
+        Ok(Ended::Lost) => {
+            let _ = out.send(Message::Lost { channel }).await;
+            LOST.to_owned()
+        }
         Ok(Ended::Connection) => "Connection closed.".to_owned(),
         Ok(Ended::Shell) => SHELL_CLOSED.to_owned(),
         Err(e) => e.to_string(),
@@ -824,10 +836,26 @@ enum Ended {
     Connection,
     /// Other tabs still use the connection.
     Shell,
+    /// The connection broke under the open shell (a network drop, a
+    /// keepalive timeout, the server going away) rather than the shell
+    /// closing its channel.
+    Lost,
 }
 
 /// The reason given when a shell ends while its connection stays open.
 const SHELL_CLOSED: &str = "The shell closed; the connection stays open for the other tabs.";
+
+/// The reason given when the connection broke and nothing says why.
+const LOST: &str = "The connection was lost.";
+
+/// How a shell's channel ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Closed {
+    /// The server closed the channel: the shell exited.
+    Channel,
+    /// The channel went away without being closed: the connection broke.
+    Lost,
+}
 
 async fn session(
     p: &Params,
@@ -1031,8 +1059,9 @@ async fn shell(
         None => Ended::Shell,
     };
     match result {
+        Ok(Closed::Lost) => Ok(Ended::Lost),
         // The user closed the tab: nothing to report as an error.
-        Ok(()) | Err(Failure::Cancelled) => Ok(ended),
+        Ok(Closed::Channel) | Err(Failure::Cancelled) => Ok(ended),
         Err(e) => Err(e),
     }
 }
@@ -1041,7 +1070,7 @@ async fn pump(
     conn: &Connection,
     inbox: &mut mpsc::Receiver<Message>,
     ctx: &mut Ctx,
-) -> Result<(), Failure> {
+) -> Result<Closed, Failure> {
     let channel = drive(conn.channel_open_session(), inbox, ctx).await??;
     // X11 first: its reply is then the first one back.
     let mut x11_reply = false;
@@ -1118,7 +1147,9 @@ async fn pump(
                     .await?;
                     continue;
                 }
-                Some(ChannelMsg::Close) | None => break Ok(()),
+                Some(ChannelMsg::Close) => break Ok(Closed::Channel),
+                // The connection's task ended with the channel still open.
+                None => break Ok(Closed::Lost),
                 Some(_) => continue,
             },
             msg = inbox.recv() => match msg {
@@ -1129,9 +1160,9 @@ async fn pump(
                         step
                     }
                     None if matches!(m, Message::Data { .. } | Message::Resize { .. }) => {
-                        if input.send(m).await.is_err() {
-                            break Ok(());
-                        }
+                        // The writer stops when a write fails; how the
+                        // channel ended is then read above.
+                        let _ = input.send(m).await;
                         continue;
                     }
                     None => continue,
@@ -1142,22 +1173,20 @@ async fn pump(
                 zm.timeout()
             }
         };
-        if !run_step(step, ctx, &input).await? {
-            break Ok(());
-        }
+        run_step(step, ctx, &input).await?;
     };
     writer.abort();
     result
 }
 
 /// Carries out a ZMODEM step: messages (terminal output among them) to the
-/// UI, and bytes for the server to the writer. Returns false when the writer
-/// has gone.
+/// UI, and bytes for the server to the writer. A writer that has gone is
+/// left to the channel's end, read in the pump.
 async fn run_step(
     step: zmodem::Step,
     ctx: &Ctx,
     input: &mpsc::Sender<Message>,
-) -> Result<bool, Failure> {
+) -> Result<(), Failure> {
     for msg in step.ui {
         ctx.send(msg).await?;
     }
@@ -1167,10 +1196,10 @@ async fn run_step(
             bytes: chunk.to_vec(),
         };
         if input.send(msg).await.is_err() {
-            return Ok(false);
+            break;
         }
     }
-    Ok(true)
+    Ok(())
 }
 
 fn method_names(methods: &MethodSet) -> String {

@@ -5,7 +5,9 @@
 //! server, with a stand-in X server here that checks it gets the real
 //! cookie. A remote desktop tunnel goes to the echo server as if it were
 //! an RDP server, after one to a closed port is refused, and still works
-//! after the shell exited. Skipped where
+//! after the shell exited. A second login starts with no forwards, then
+//! adds, moves and stops a local and a remote one without reconnecting,
+//! checking that the old ports close on both sides. Skipped where
 //! `sshd` or `ssh-keygen` is missing; the X11 part also needs `xauth`.
 
 #![allow(
@@ -270,7 +272,7 @@ fn local_remote_dynamic_and_x11_forwards() {
                 Effect::Connected => {
                     forwarder.start(session.connection, target.label(), setup.clone());
                 }
-                Effect::Ended => {}
+                Effect::Ended | Effect::Reconnect => {}
                 // No password source in these tests.
                 Effect::FetchPassword | Effect::StorePassword { .. } => {}
                 Effect::Tunnel { .. } | Effect::ProxyCommand { .. } => {}
@@ -365,4 +367,243 @@ fn local_remote_dynamic_and_x11_forwards() {
         assert_eq!(conn.x11.as_ref().unwrap().total, 1);
     }
     forwarder.stop(session.connection);
+}
+
+/// A logged-in shell on the test sshd, driven a step at a time.
+struct Shell {
+    session: SshSession,
+    link: Link,
+    broker: Broker,
+    forwarder: Forwarder,
+    effects: Vec<crate::ssh::Effect>,
+    shown: String,
+    output: String,
+}
+
+impl Shell {
+    /// Runs the session until `done` holds, answering the host key and
+    /// passphrase prompts; the forwards start, empty, on login.
+    fn until(&mut self, what: &str, mut done: impl FnMut(&Self) -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            for effect in std::mem::take(&mut self.effects) {
+                match effect {
+                    Effect::Send(m) => self.link.send(m),
+                    Effect::Show(s) => self.shown.push_str(&s),
+                    Effect::Output(b) => self.output.push_str(&String::from_utf8_lossy(&b)),
+                    Effect::Broker(job) => self.broker.submit(job),
+                    Effect::Connected => {
+                        let label = self.session.target.label();
+                        self.forwarder
+                            .start(self.session.connection, label, Setup::default());
+                    }
+                    Effect::Ended
+                    | Effect::Reconnect
+                    | Effect::FetchPassword
+                    | Effect::StorePassword { .. } => {}
+                    Effect::Tunnel { .. } | Effect::ProxyCommand { .. } => {}
+                }
+            }
+            if done(self) {
+                return;
+            }
+            assert_ne!(
+                self.session.state(),
+                State::Ended,
+                "the shell ended:\n{}",
+                self.shown
+            );
+            if self.session.prompt_active() {
+                let last = self.shown.rsplit("\r\n").next().unwrap_or_default();
+                let answer = if last.contains("to trust this key") {
+                    "yes"
+                } else if last.contains("Passphrase") {
+                    "secret"
+                } else {
+                    panic!("unexpected prompt {last:?}")
+                };
+                let mut e = self.session.prompt_input(answer.as_bytes());
+                e.extend(self.session.prompt_input(b"\r"));
+                self.effects.extend(e);
+                continue;
+            }
+            if let Some(reply) = self.broker.try_recv() {
+                let e = self.session.on_broker(reply);
+                self.effects.extend(e);
+                continue;
+            }
+            match self.link.try_recv() {
+                Some(LinkEvent::Message(m)) => {
+                    let e = self.session.on_worker(m);
+                    self.effects.extend(e);
+                }
+                Some(LinkEvent::Closed(why)) => panic!("worker closed: {why}"),
+                None => {
+                    assert!(
+                        Instant::now() < deadline,
+                        "timed out waiting for {what}:\n{}\n{}\n{:?}",
+                        self.shown,
+                        self.output,
+                        self.forwarder.view()
+                    );
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+            }
+        }
+    }
+
+    /// Runs `command` in the shell and waits for it to print
+    /// `marker=...`, which it writes as `marker''=` so that the echo of
+    /// the command line does not count.
+    fn run(&mut self, command: &str, marker: &str) -> String {
+        let e = self.session.input(format!("{command}\n").as_bytes());
+        self.effects.extend(e);
+        let key = format!("{marker}=");
+        let find = |s: &Self| {
+            s.output
+                .lines()
+                .filter_map(|l| Some(l.get(l.find(&key)?..)?.trim_end().to_owned()))
+                .next_back()
+        };
+        self.until(marker, |s| find(s).is_some());
+        let line = find(self).unwrap_or_default();
+        self.output.clear();
+        line
+    }
+
+    /// The forwards once each is listening or has stopped.
+    fn settled(&mut self, count: usize) -> Vec<crate::forwards::FwdView> {
+        self.until("the forwards to settle", |s| {
+            let view = s.forwarder.view();
+            view.first().is_some_and(|c| {
+                c.forwards.len() == count
+                    && c.forwards
+                        .iter()
+                        .all(|f| !matches!(f.state, FwdState::Starting))
+            })
+        });
+        self.forwarder.view().remove(0).forwards
+    }
+}
+
+/// Whether the server still listens on `port`, asked from the shell: a
+/// cancelled remote forward may take a moment to close there.
+fn server_listens(shell: &mut Shell, port: u16, marker: &str) -> String {
+    shell.run(
+        &format!(
+            "for i in $(seq 100); do (exec 3<>/dev/tcp/127.0.0.1/{port}) 2>/dev/null || \
+             break; sleep 0.05; done; (exec 3<>/dev/tcp/127.0.0.1/{port}) 2>/dev/null && \
+             echo {marker}''=open || echo {marker}''=closed"
+        ),
+        marker,
+    )
+}
+
+#[test]
+fn forwards_change_on_a_live_connection() {
+    let Some(server) = start_sshd("forwards-live", "") else {
+        return;
+    };
+    let user = local_user();
+    let echo = echo_server();
+    let env = Env {
+        home: server.dir.clone(),
+        local_user: user.clone(),
+        config: format!(
+            "Host testhost\n  HostName 127.0.0.1\n  Port {}\n  User {user}\n  \
+             IdentityFile ~/.ssh/id_ed25519\n",
+            server.port
+        ),
+    };
+    let target = Target::resolve("testhost", &env).unwrap();
+    assert!(target.forwards.is_empty());
+
+    let (ui_read, worker_write) = std::io::pipe().unwrap();
+    let (worker_read, ui_write) = std::io::pipe().unwrap();
+    std::thread::spawn(move || ferossh_worker::run_blocking(worker_read, worker_write));
+    let (forwarder, runner) = Forwarder::new();
+    let link = Link::start(ui_read, ui_write, || {}, forwarder.sink()).unwrap();
+    runner.spawn(link.sender(), || {}).unwrap();
+    let mut session = SshSession::new(1, target, env.known_hosts());
+    let effects = session.start(80, 24);
+    let mut shell = Shell {
+        session,
+        link,
+        broker: Broker::spawn(|| {}).unwrap(),
+        forwarder: forwarder.clone(),
+        effects,
+        shown: String::new(),
+        output: String::new(),
+    };
+    shell.until("the login", |s| {
+        s.session.state() == State::Connected && !s.forwarder.view().is_empty()
+    });
+    let conn = shell.session.connection;
+    let spec = |t: String| ferossh_config::forward::parse_option(&t).unwrap();
+
+    // Added after login, no reconnect.
+    let (l1, r1) = (free_port(), free_port());
+    let local = spec(format!("-L 127.0.0.1:{l1}:127.0.0.1:{echo}"));
+    let remote = spec(format!("-R {r1}:127.0.0.1:{echo}"));
+    forwarder.add(conn, local.clone());
+    forwarder.add(conn, remote.clone());
+    let fwds = shell.settled(2);
+    assert!(
+        fwds.iter()
+            .all(|f| matches!(f.state, FwdState::Listening(_))),
+        "{fwds:?}"
+    );
+    let s = TcpStream::connect(("127.0.0.1", l1)).unwrap();
+    assert_eq!(echo_through(s, b"one"), b"one");
+    let got = shell.run(
+        &format!(
+            "exec 3<>/dev/tcp/127.0.0.1/{r1}; printf hello >&3; echo R1''=$(head -c5 <&3); \
+             exec 3>&-"
+        ),
+        "R1",
+    );
+    assert_eq!(got, "R1=hello");
+
+    // Moved to other ports: the old ones close, on both sides.
+    let (l2, r2) = (free_port(), free_port());
+    let local2 = spec(format!("-L 127.0.0.1:{l2}:127.0.0.1:{echo}"));
+    let remote2 = spec(format!("-R {r2}:127.0.0.1:{echo}"));
+    forwarder.replace(conn, local, local2.clone());
+    forwarder.replace(conn, remote, remote2.clone());
+    shell.until("the new forwards", |s| {
+        s.forwarder.view().first().is_some_and(|c| {
+            c.forwards.iter().map(|f| &f.spec).eq([&local2, &remote2])
+                && c.forwards
+                    .iter()
+                    .all(|f| matches!(f.state, FwdState::Listening(_)))
+        })
+    });
+    let s = TcpStream::connect(("127.0.0.1", l2)).unwrap();
+    assert_eq!(echo_through(s, b"two"), b"two");
+    assert!(
+        TcpListener::bind(("127.0.0.1", l1)).is_ok(),
+        "the old port stayed bound"
+    );
+    assert_eq!(server_listens(&mut shell, r1, "OLD"), "OLD=closed");
+    let got = shell.run(
+        &format!(
+            "exec 3<>/dev/tcp/127.0.0.1/{r2}; printf again >&3; echo R2''=$(head -c5 <&3); \
+             exec 3>&-"
+        ),
+        "R2",
+    );
+    assert_eq!(got, "R2=again");
+
+    // Stopped: nothing listens any more, and the shell is still there.
+    forwarder.remove(conn, 1);
+    forwarder.remove(conn, 0);
+    shell.until("the forwards to stop", |s| {
+        s.forwarder
+            .view()
+            .first()
+            .is_some_and(|c| c.forwards.is_empty())
+    });
+    assert_eq!(server_listens(&mut shell, r2, "GONE"), "GONE=closed");
+    assert_eq!(shell.run("echo ALIVE''=yes", "ALIVE"), "ALIVE=yes");
+    forwarder.stop(conn);
 }

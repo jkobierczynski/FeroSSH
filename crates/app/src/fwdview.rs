@@ -2,11 +2,14 @@
 //! X11 with their state and open connections, a line to add a forward
 //! (`-L 8080:db:5432`, `-R`, `-D`) to the connection picked in the list
 //! or else the focused pane's, and Delete to stop the selected forward.
+//! Enter or F2 on a forward puts it on that line to change it (or, sent
+//! back unchanged, to retry it), and `-KL 8080`, `-KR`, `-KD` stop one by
+//! its port as `ssh`'s `~C` does. All of it works on a live connection.
 //!
 //! Drawn into a [`Grid`] like the session manager; keys come in as
 //! [`SideKey`]s and what the user asked for goes out as a [`FwdAction`].
 
-use ferossh_config::forward::parse_option;
+use ferossh_config::forward::{CancelSpec, parse_cancel, parse_option};
 use ferossh_config::{ForwardKind, ForwardSpec};
 use ferossh_ipc::ChannelId;
 use ferossh_render::{Cell, Color, Flags, Grid, Rgb};
@@ -30,6 +33,18 @@ pub enum FwdAction {
     Remove {
         connection: ChannelId,
         index: usize,
+    },
+    /// Change the connection's forward `old` into `new`.
+    Replace {
+        connection: ChannelId,
+        old: ForwardSpec,
+        new: ForwardSpec,
+    },
+    /// Stop the forward `-KL`/`-KR`/`-KD` named, on the connection picked
+    /// in the list, else the focused pane's.
+    Cancel {
+        cancel: CancelSpec,
+        connection: Option<ChannelId>,
     },
     Leave,
 }
@@ -64,6 +79,8 @@ pub struct ForwardsView {
     /// the one a new forward goes to.
     picked: bool,
     scroll: usize,
+    /// The forward on the add line to be changed, and its connection.
+    editing: Option<(ChannelId, ForwardSpec)>,
 }
 
 fn host_port(host: &str, port: u16) -> String {
@@ -201,6 +218,44 @@ impl ForwardsView {
         self.message = Some(why);
     }
 
+    /// Shows `why` on the add line until the next key.
+    pub fn say(&mut self, why: String) {
+        self.message = Some(why);
+    }
+
+    /// The selected forward, if a forward is selected.
+    fn selected_forward<'a>(
+        &self,
+        lines: &[Line],
+        view: &'a [ConnView],
+    ) -> Option<(ChannelId, &'a FwdView)> {
+        let (connection, index) = lines.get(self.selected_line(lines)?)?.forward?;
+        let c = view.iter().find(|c| c.connection == connection)?;
+        Some((connection, c.forwards.get(index)?))
+    }
+
+    /// Puts the selected forward on the add line to be changed.
+    fn edit(&mut self, lines: &[Line], view: &[ConnView]) {
+        let Some((connection, f)) = self.selected_forward(lines, view) else {
+            return;
+        };
+        if f.desktop {
+            self.message = Some("A remote desktop's tunnel ends with its tab.".into());
+            return;
+        }
+        self.input = f.spec.to_string();
+        self.editing = Some((connection, f.spec.clone()));
+    }
+
+    /// The connection a new forward or a cancel goes to: the one picked
+    /// in the list, else `None` for the window to choose.
+    fn picked_connection(&self, lines: &[Line]) -> Option<ChannelId> {
+        self.picked
+            .then(|| self.selected_line(lines))
+            .flatten()
+            .and_then(|at| lines.get(at)?.connection)
+    }
+
     pub fn key(&mut self, key: SideKey, view: &[ConnView], rows: usize) -> Option<FwdAction> {
         let lines = lines(view);
         let visible = Self::visible(rows);
@@ -213,17 +268,33 @@ impl ForwardsView {
             SideKey::Enter { .. } => {
                 let typed = self.input.trim();
                 if typed.is_empty() {
+                    if self.editing.take().is_none() {
+                        self.edit(&lines, view);
+                    }
                     return None;
                 }
+                if self.editing.is_none()
+                    && let Some(cancel) = parse_cancel(typed)
+                {
+                    self.input.clear();
+                    let connection = self.picked_connection(&lines);
+                    return Some(FwdAction::Cancel { cancel, connection });
+                }
                 match parse_option(typed) {
-                    Some(spec) => {
+                    Some(new) => {
                         self.input.clear();
-                        let connection = self
-                            .picked
-                            .then(|| self.selected_line(&lines))
-                            .flatten()
-                            .and_then(|at| lines.get(at)?.connection);
-                        return Some(FwdAction::Add { spec, connection });
+                        if let Some((connection, old)) = self.editing.take() {
+                            return Some(FwdAction::Replace {
+                                connection,
+                                old,
+                                new,
+                            });
+                        }
+                        let connection = self.picked_connection(&lines);
+                        return Some(FwdAction::Add {
+                            spec: new,
+                            connection,
+                        });
                     }
                     None => {
                         self.message =
@@ -231,16 +302,18 @@ impl ForwardsView {
                     }
                 }
             }
+            SideKey::Edit => self.edit(&lines, view),
             SideKey::Delete => {
                 let at = self.selected_line(&lines)?;
                 let (connection, index) = lines.get(at)?.forward?;
                 return Some(FwdAction::Remove { connection, index });
             }
             SideKey::Escape => {
-                if self.input.is_empty() {
+                if self.input.is_empty() && self.editing.is_none() {
                     return Some(FwdAction::Leave);
                 }
                 self.input.clear();
+                self.editing = None;
             }
             SideKey::Backspace => {
                 self.input.pop();
@@ -309,18 +382,28 @@ impl ForwardsView {
             0,
             row(" Forwards", palette.text, palette.strip, Flags::BOLD),
         );
+        let on_forward = self.selected_forward(&lines, view).is_some();
+        let verb = if self.editing.is_some() {
+            "Edit"
+        } else {
+            "Add"
+        };
         let (add, fg) = match (&self.message, self.input.is_empty(), focused) {
             (Some(m), ..) => (format!(" {m}"), bad),
             (None, true, false) => (
                 " Ctrl+Shift+P, then -L/-R/-D to add".to_owned(),
                 palette.dim,
             ),
+            (None, true, true) if on_forward && self.editing.is_none() => (
+                " Enter edits, Del stops, or type -L/-R/-D▏".to_owned(),
+                palette.dim,
+            ),
             (None, true, true) => (
-                " Add: -L 8080:host:80, -R, -D 1080▏".to_owned(),
+                format!(" {verb}: -L 8080:host:80, -R, -D 1080▏"),
                 palette.dim,
             ),
             (None, false, _) => (
-                format!(" Add: {}{}", self.input, if focused { "▏" } else { "" }),
+                format!(" {verb}: {}{}", self.input, if focused { "▏" } else { "" }),
                 palette.text,
             ),
         };
@@ -465,6 +548,80 @@ mod tests {
             Some(FwdAction::Remove {
                 connection: 1,
                 index: 0
+            })
+        );
+    }
+
+    fn typed(v: &mut ForwardsView, text: &str, view: &[ConnView]) -> Option<FwdAction> {
+        for c in text.chars() {
+            v.key(SideKey::Char(c), view, 20);
+        }
+        v.key(SideKey::Enter { split: false }, view, 20)
+    }
+
+    #[test]
+    fn edits_a_forward_in_place() {
+        let mut view = sample();
+        let mut v = ForwardsView::default();
+        // Enter on the heading, or with nothing selected, edits nothing.
+        assert_eq!(v.key(SideKey::Enter { split: false }, &view, 20), None);
+        assert!(v.input.is_empty() && v.editing.is_none());
+        v.key(SideKey::Down, &view, 20);
+        assert_eq!(v.key(SideKey::Enter { split: false }, &view, 20), None);
+        assert_eq!(v.input, "-L 8080:db:5432");
+        for _ in 0.."db:5432".len() {
+            v.key(SideKey::Backspace, &view, 20);
+        }
+        assert_eq!(
+            typed(&mut v, "db:6432", &view),
+            Some(FwdAction::Replace {
+                connection: 1,
+                old: parse_option("-L 8080:db:5432").unwrap(),
+                new: parse_option("-L 8080:db:6432").unwrap(),
+            })
+        );
+        assert!(v.editing.is_none() && v.input.is_empty());
+        // F2 on the stopped remote forward, sent back as it is: a retry.
+        v.key(SideKey::Down, &view, 20);
+        v.key(SideKey::Edit, &view, 20);
+        let r = parse_option("-R 9000:localhost:3000").unwrap();
+        assert_eq!(
+            v.key(SideKey::Enter { split: false }, &view, 20),
+            Some(FwdAction::Replace {
+                connection: 1,
+                old: r.clone(),
+                new: r,
+            })
+        );
+        // Esc drops the edit; a second Esc leaves.
+        v.key(SideKey::Edit, &view, 20);
+        assert_eq!(v.key(SideKey::Escape, &view, 20), None);
+        assert!(v.editing.is_none() && v.input.is_empty());
+        assert_eq!(v.key(SideKey::Escape, &view, 20), Some(FwdAction::Leave));
+        // A remote desktop's tunnel is not edited.
+        view[0].forwards[1].desktop = true;
+        v.key(SideKey::Edit, &view, 20);
+        assert!(v.editing.is_none() && v.input.is_empty());
+        assert!(v.message.is_some());
+    }
+
+    #[test]
+    fn cancels_by_port_like_ssh() {
+        let view = sample();
+        let mut v = ForwardsView::default();
+        assert_eq!(
+            typed(&mut v, "-KL 8080", &view),
+            Some(FwdAction::Cancel {
+                cancel: parse_cancel("-KL 8080").unwrap(),
+                connection: None,
+            })
+        );
+        v.click(HEADER, &view, 20);
+        assert_eq!(
+            typed(&mut v, "-KD 1080", &view),
+            Some(FwdAction::Cancel {
+                cancel: parse_cancel("-KD 1080").unwrap(),
+                connection: Some(1),
             })
         );
     }

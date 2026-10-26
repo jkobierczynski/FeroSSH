@@ -9,6 +9,7 @@
 //! DownloadFolder "D:\Transfers"
 //! VerifyTransfers yes
 //! ZModem yes
+//! AutoReconnect yes
 //! Favourite web
 //! ThemeRule
 //!     Hosts prod-* *.prod.example.com
@@ -23,6 +24,7 @@
 //!     TmuxLayout ferossh
 //! Profile core-switch
 //!     LegacyAlgorithms yes
+//!     AutoReconnect no
 //! Profile desktop-box
 //!     DesktopPort 3390
 //!     VncPort 5901
@@ -99,6 +101,9 @@ pub struct Profile {
     /// What to answer after the login: prompts to wait for, lines and
     /// passwords to type.
     pub login_script: Vec<Step>,
+    /// Connect again on its own when the connection drops; the global
+    /// setting when unset.
+    pub auto_reconnect: Option<bool>,
 }
 
 /// What opening a session does.
@@ -164,6 +169,7 @@ impl Profile {
             && self.password == PasswordSource::Ask
             && self.serial.is_none()
             && self.login_script.is_empty()
+            && self.auto_reconnect.is_none()
     }
 }
 
@@ -188,6 +194,9 @@ pub struct Settings {
     pub download_folder: Option<String>,
     /// Compare SHA-256 on both sides after each transfer.
     pub verify_transfers: bool,
+    /// Connect again on its own when an SSH connection drops, keeping the
+    /// tab, its panes and tmux layout. On unless turned off.
+    pub auto_reconnect: bool,
     /// Files transferred at once.
     pub parallel_transfers: Option<usize>,
     /// Answer `rz` and `sz` in the terminal with ZMODEM; off unless turned
@@ -232,6 +241,7 @@ impl Default for Settings {
             scrollback: None,
             download_folder: None,
             verify_transfers: false,
+            auto_reconnect: true,
             parallel_transfers: None,
             zmodem: false,
             follow_directory: true,
@@ -422,6 +432,17 @@ impl Settings {
                     block = Block::Top;
                     s.scrollback = lines(&args);
                 }
+                "autoreconnect" if matches!(block, Block::Profile(_)) => {
+                    if let Block::Profile(i) = block
+                        && let Some(p) = s.profiles.get_mut(i)
+                    {
+                        p.auto_reconnect = yes(&args);
+                    }
+                }
+                "autoreconnect" => {
+                    block = Block::Top;
+                    s.auto_reconnect = yes(&args).unwrap_or(true);
+                }
                 _ => match block {
                     Block::Profile(i) => {
                         let Some(p) = s.profiles.get_mut(i) else {
@@ -561,6 +582,7 @@ impl Settings {
             let _ = writeln!(out, "DownloadFolder {}", arg(d));
         }
         let _ = writeln!(out, "VerifyTransfers {}", flag(self.verify_transfers));
+        let _ = writeln!(out, "AutoReconnect {}", flag(self.auto_reconnect));
         let _ = writeln!(
             out,
             "UpdateCheck {}",
@@ -636,6 +658,9 @@ impl Settings {
             }
             for step in &p.login_script {
                 let _ = writeln!(out, "    LoginScript {}", clean(&step.to_string()));
+            }
+            if let Some(on) = p.auto_reconnect {
+                let _ = writeln!(out, "    AutoReconnect {}", if on { "yes" } else { "no" });
             }
             match &p.password {
                 PasswordSource::Ask => {}
@@ -728,6 +753,7 @@ Scrollback 50000
 DownloadFolder "D:\My Transfers"
 VerifyTransfers yes
 ZModem yes
+AutoReconnect no
 ParallelTransfers 20
 FollowDirectory no
 X11Display 192.168.1.5:0.0
@@ -748,6 +774,7 @@ Profile web
     Tmux work
     TmuxLayout TMUX
     LegacyAlgorithms YES
+    AutoReconnect yes
     DesktopPort 3390
     VncPort 5901
     Type RDP
@@ -823,6 +850,9 @@ NewKeyword later
         assert!(s.zmodem);
         assert!(!Settings::default().zmodem);
         assert!(s.verify_transfers);
+        assert!(!s.auto_reconnect);
+        assert_eq!(web.auto_reconnect, Some(true));
+        assert!(Settings::default().auto_reconnect, "on unless turned off");
         assert_eq!(s.parallel_transfers, Some(8));
         assert!(!s.follow_directory);
         assert_eq!(s.x11_display.as_deref(), Some("192.168.1.5:0.0"));
@@ -836,6 +866,7 @@ NewKeyword later
         assert_eq!(big.kind, SessionKind::Ssh);
         assert_eq!(big.via, None);
         assert_eq!(big.password, PasswordSource::Windows);
+        assert_eq!(big.auto_reconnect, None);
         let console = s.profile("console").unwrap();
         assert_eq!(console.kind, SessionKind::Serial);
         assert_eq!(
