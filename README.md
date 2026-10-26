@@ -6,6 +6,8 @@ FeroSSH aims to be the smallest, most secure open-source SSH client for Windows:
 
 > **Status:** milestone 6 (tmux integration). FeroSSH connects with russh from a sandboxed worker process, checks host keys against `~/.ssh/known_hosts`, and signs in with the Windows OpenSSH agent, Pageant, key files, keyboard-interactive or a password. Tabs, splits and a session manager came in milestone 4, file transfer over SFTP in milestone 5.
 
+The [user guide](docs/guide/README.md) covers getting started, everyday use, every setting, the security model, verifying a download and troubleshooting.
+
 ## Trying the build
 
 Download `ferossh-exe` from the latest CI run and start it with a host, or without one to be asked:
