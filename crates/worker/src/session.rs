@@ -261,7 +261,8 @@ impl ConnForwards {
 
 /// Live connections by the channel that made them, for
 /// [`Message::OpenChannel`], SFTP and forwards. Weak: each shell holds its
-/// connection, and the last one to close disconnects it.
+/// connection (as do SFTP and the streams that keep it, a remote
+/// desktop's), and the last one to close disconnects it.
 /// The negotiated names travel along, for the new shell's
 /// [`Message::Connected`]. Also the dispatcher's routes, and the ids for
 /// streams the server opens.

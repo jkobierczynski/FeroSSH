@@ -34,18 +34,25 @@ fuzz_target!(|data: &[u8]| {
             input.extend_from_slice(rest);
             let chunk = usize::from(mode >> 2 & 0x1f).max(1) * 7;
             for part in input.chunks(chunk) {
+                // Events come in order: a rectangle must fit the screen as
+                // it was when the rectangle came, before any later resize.
+                let (mut w, mut h) = c.size();
                 c.feed(part);
                 if mode & 0x40 != 0 {
                     c.password(b"pw");
                     c.key(true, 0x61);
                     c.pointer(1, 9999, 9999);
+                    c.resize(640, 480);
                 }
-                let (w, h) = c.size();
                 for e in c.take_events() {
-                    if let Event::Pixels { x, y, width, height, data } = e {
-                        assert!(u32::from(x) + u32::from(width) <= u32::from(w));
-                        assert!(u32::from(y) + u32::from(height) <= u32::from(h));
-                        assert_eq!(data.len(), usize::from(width) * usize::from(height));
+                    match e {
+                        Event::Size { width, height } => (w, h) = (width, height),
+                        Event::Pixels { x, y, width, height, data } => {
+                            assert!(u32::from(x) + u32::from(width) <= u32::from(w));
+                            assert!(u32::from(y) + u32::from(height) <= u32::from(h));
+                            assert_eq!(data.len(), usize::from(width) * usize::from(height));
+                        }
+                        _ => {}
                     }
                 }
                 c.take_output();

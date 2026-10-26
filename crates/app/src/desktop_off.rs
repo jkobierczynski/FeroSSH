@@ -73,4 +73,8 @@ impl Desktop {
     pub fn focus_lost(&mut self) {
         match *self {}
     }
+
+    pub fn resize(&mut self, _width: u16, _height: u16) {
+        match *self {}
+    }
 }

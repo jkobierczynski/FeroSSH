@@ -100,7 +100,7 @@ jobs:
       - run: cargo test --locked -p ferossh-auth keyfile
 
   rdp:
-    name: RDP viewer against xrdp (Linux)
+    name: Desktop viewers against xrdp and Xvnc (Linux)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -122,6 +122,15 @@ jobs:
       - run: "cargo test --locked -p ferossh-viewer --features rdp rdp::"
         env:
           FEROSSH_TEST_RDP: "127.0.0.1:3389 rdptest Secret-pw1"
+      # A throwaway TigerVNC Xvnc, which takes SetDesktopSize, for the VNC
+      # viewer's resize.
+      - run: |
+          sudo apt-get install -y tigervnc-standalone-server
+          Xvnc :5 -SecurityTypes None -geometry 800x600 -rfbport 5905 -localhost yes &
+          sleep 2
+      - run: "cargo test --locked -p ferossh-viewer --features vnc resizes_a_real_server"
+        env:
+          FEROSSH_TEST_VNC: "127.0.0.1:5905"
 
   interop:
     name: Interop against older and newer servers (Linux)

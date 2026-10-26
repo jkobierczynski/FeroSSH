@@ -711,6 +711,7 @@ impl Engine {
             target: Some((host, port)),
             origin_host: "127.0.0.1".into(),
             origin_port: 0,
+            keep: false,
         });
     }
 
@@ -859,6 +860,9 @@ impl Engine {
         };
         fwd.total += 1;
         let target = fwd.spec.target.clone();
+        // A remote desktop keeps its connection open after the terminal
+        // closed; the window ends it with the desktop.
+        let keep = fwd.desktop.is_some();
         let label = match &target {
             Some((h, p)) => format!("{peer} → {}", host_port(h, *p)),
             None => format!("{peer} → SOCKS"),
@@ -872,6 +876,7 @@ impl Engine {
             target,
             origin_host: peer.ip().to_string(),
             origin_port: peer.port(),
+            keep,
         });
         tokio::spawn(relay(
             id,
