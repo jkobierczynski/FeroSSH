@@ -4140,6 +4140,30 @@ impl Window {
         self.update_menu_checks();
     }
 
+    /// View > Session manager, File transfer or Port forwards (`id`). The
+    /// shortcut first moves the focus to a pane that is open but not
+    /// focused, then hides it; a menu click (`from_menu`) hides it at once,
+    /// since its checkmark says the pane is open.
+    fn toggle_side(&mut self, id: u32, from_menu: bool) {
+        let view = match id {
+            cmd::FILES => SideView::Files,
+            cmd::FORWARDS => SideView::Forwards,
+            _ => SideView::Sessions,
+        };
+        let open = self.side.visible && self.side.view == view;
+        match side_toggle(open, self.side.focused, from_menu) {
+            SideToggle::Show => self.show_side(view, true),
+            SideToggle::Hide => self.hide_side(),
+            SideToggle::Focus => {
+                self.side.focused = true;
+                self.refresh_chrome();
+                self.request_full_redraw();
+                self.refresh(self.focused_id());
+            }
+        }
+        self.update_menu_checks();
+    }
+
     fn hide_side(&mut self) {
         self.side.visible = false;
         self.side.focused = false;
@@ -5071,27 +5095,7 @@ impl Window {
                     self.layout();
                 }
             }
-            cmd::SESSIONS | cmd::FILES | cmd::FORWARDS => {
-                let view = match id {
-                    cmd::FILES => SideView::Files,
-                    cmd::FORWARDS => SideView::Forwards,
-                    _ => SideView::Sessions,
-                };
-                match (
-                    self.side.visible && self.side.view == view,
-                    self.side.focused,
-                ) {
-                    (false, _) => self.show_side(view, true),
-                    (true, true) => self.hide_side(),
-                    (true, false) => {
-                        self.side.focused = true;
-                        self.refresh_chrome();
-                        self.request_full_redraw();
-                        self.refresh(pane);
-                    }
-                }
-                self.update_menu_checks();
-            }
+            cmd::SESSIONS | cmd::FILES | cmd::FORWARDS => self.toggle_side(id, false),
             cmd::SIDE_RIGHT => {
                 self.settings.side_pane_right = !self.settings.side_pane_right;
                 self.save_settings();
@@ -6106,6 +6110,23 @@ fn session_menu(hwnd: HWND, host: Option<String>) {
     }
 }
 
+/// What a side pane command does.
+#[derive(Debug, PartialEq)]
+enum SideToggle {
+    Show,
+    Hide,
+    Focus,
+}
+
+/// `open`: the pane shows this view; `focused`: it has the keyboard.
+fn side_toggle(open: bool, focused: bool, from_menu: bool) -> SideToggle {
+    match (open, focused || from_menu) {
+        (false, _) => SideToggle::Show,
+        (true, true) => SideToggle::Hide,
+        (true, false) => SideToggle::Focus,
+    }
+}
+
 fn plural(n: usize) -> &'static str {
     if n == 1 { "" } else { "s" }
 }
@@ -6725,7 +6746,12 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                 DefWindowProcW(hwnd, msg, wparam, lparam)
             }
             WM_COMMAND => {
-                run_command(hwnd, Command::Id(loword(wparam.0)));
+                let id = loword(wparam.0);
+                if matches!(id, cmd::SESSIONS | cmd::FILES | cmd::FORWARDS) {
+                    with_window(|w| w.toggle_side(id, true));
+                } else {
+                    run_command(hwnd, Command::Id(id));
+                }
                 LRESULT(0)
             }
             WM_CLOSE => {
@@ -6780,5 +6806,24 @@ fn capture(hwnd: HWND, on: bool) {
         } else {
             let _ = ReleaseCapture();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn menu_click_hides_an_open_side_pane_at_once() {
+        assert_eq!(side_toggle(true, false, true), SideToggle::Hide);
+        assert_eq!(side_toggle(true, true, true), SideToggle::Hide);
+        assert_eq!(side_toggle(false, false, true), SideToggle::Show);
+    }
+
+    #[test]
+    fn shortcut_focuses_an_open_side_pane_before_hiding_it() {
+        assert_eq!(side_toggle(true, false, false), SideToggle::Focus);
+        assert_eq!(side_toggle(true, true, false), SideToggle::Hide);
+        assert_eq!(side_toggle(false, true, false), SideToggle::Show);
     }
 }
