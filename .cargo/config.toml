@@ -2,4 +2,10 @@
 [target.'cfg(all(windows, target_env = "msvc"))']
 # /Brepro: no timestamps in the exe, so the same source gives the same bytes
 # (see scripts/build-release.ps1).
-rustflags = ["-C", "target-feature=+crt-static", "-C", "link-arg=/Brepro"]
+# Control Flow Guard: indirect calls may only reach real function starts
+# (the sandboxed processes also enforce it, see crates/app/src/sandbox.rs).
+rustflags = [
+    "-C", "target-feature=+crt-static",
+    "-C", "link-arg=/Brepro",
+    "-C", "control-flow-guard",
+]

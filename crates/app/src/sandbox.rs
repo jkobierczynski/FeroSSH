@@ -15,7 +15,12 @@
 //! [`MITIGATIONS`]): no dynamic code, no legacy extension points (AppInit
 //! DLLs, hooks, Winsock LSPs), no non-system fonts, mandatory ASLR, strict
 //! handle checks, DLLs from System32 before the exe's folder, and no child
-//! processes. A Windows that refuses the set starts them without it.
+//! processes. Where Windows allows it they also lose Win32k (the kernel's
+//! window and graphics system calls, a large attack surface they never
+//! need: the exe delay-loads every DLL that uses it, see build.rs), and run
+//! with Control Flow Guard and CET shadow stacks enforced ([`STRICT`],
+//! [`STRICT2`]). Each step down ([`Hardening`]) is tried when Windows
+//! refuses one; `--check-sandbox` reports what a process really got.
 //! `--no-sandbox` runs the worker without mitigations too, so it stays a
 //! full escape hatch.
 //!
@@ -36,10 +41,11 @@
 use std::ffi::c_void;
 use std::fs::File;
 use std::os::windows::io::FromRawHandle;
+use std::sync::atomic::{AtomicU8, Ordering};
 
 use windows::Win32::Foundation::{
     CloseHandle, ERROR_ALREADY_EXISTS, ERROR_SUCCESS, HANDLE, HANDLE_FLAG_INHERIT, HANDLE_FLAGS,
-    HLOCAL, LocalFree, SetHandleInformation,
+    HLOCAL, LocalFree, SetHandleInformation, WAIT_OBJECT_0,
 };
 use windows::Win32::Security::Authorization::{
     EXPLICIT_ACCESS_W, GRANT_ACCESS, GetNamedSecurityInfoW, SE_FILE_OBJECT, SetEntriesInAclW,
@@ -68,10 +74,13 @@ use windows::Win32::System::JobObjects::{
 use windows::Win32::System::Pipes::CreatePipe;
 use windows::Win32::System::Threading::{
     CREATE_NO_WINDOW, CREATE_SUSPENDED, CreateProcessW, DeleteProcThreadAttributeList,
-    EXTENDED_STARTUPINFO_PRESENT, InitializeProcThreadAttributeList, LPPROC_THREAD_ATTRIBUTE_LIST,
-    PROC_THREAD_ATTRIBUTE_CHILD_PROCESS_POLICY, PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
-    PROC_THREAD_ATTRIBUTE_MITIGATION_POLICY, PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES,
-    PROCESS_INFORMATION, ResumeThread, STARTUPINFOEXW, TerminateProcess, UpdateProcThreadAttribute,
+    EXTENDED_STARTUPINFO_PRESENT, GetProcessMitigationPolicy, InitializeProcThreadAttributeList,
+    LPPROC_THREAD_ATTRIBUTE_LIST, PROC_THREAD_ATTRIBUTE_CHILD_PROCESS_POLICY,
+    PROC_THREAD_ATTRIBUTE_HANDLE_LIST, PROC_THREAD_ATTRIBUTE_MITIGATION_POLICY,
+    PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES, PROCESS_INFORMATION, PROCESS_MITIGATION_POLICY,
+    ProcessControlFlowGuardPolicy, ProcessDynamicCodePolicy, ProcessSystemCallDisablePolicy,
+    ProcessUserShadowStackPolicy, ResumeThread, STARTUPINFOEXW, TerminateProcess,
+    UpdateProcThreadAttribute, WaitForSingleObject,
 };
 use windows::core::{HSTRING, PWSTR, Result, w};
 
@@ -120,10 +129,9 @@ impl Kind {
 }
 /// The process mitigations both sandboxed processes start with, as
 /// `PROCESS_CREATION_MITIGATION_POLICY_*_ALWAYS_ON` bits (winbase.h; the
-/// windows crate does not carry them). Left out on purpose: Win32k
-/// lockdown (the exe imports user32), Control Flow Guard (the exe is not
-/// built with it), Microsoft-signed images only (FeroSSH is not), and no
-/// remote images (FeroSSH may run from a network share).
+/// windows crate does not carry them). Left out on purpose:
+/// Microsoft-signed images only (FeroSSH is not), and no remote images
+/// (FeroSSH may run from a network share).
 const MITIGATIONS: u64 = (1 << 8) // force relocate images (mandatory ASLR)
     | (1 << 12) // terminate on heap corruption
     | (1 << 16) // bottom-up ASLR
@@ -134,6 +142,66 @@ const MITIGATIONS: u64 = (1 << 8) // force relocate images (mandatory ASLR)
     | (1 << 48) // no non-system fonts
     | (1 << 56) // no low-integrity images
     | (1 << 60); // DLLs from System32 first
+
+/// Added to [`MITIGATIONS`] where Windows allows it.
+const STRICT: u64 = (1 << 28) // no Win32k system calls
+    | (1 << 40); // Control Flow Guard
+
+/// The second word of the policy (Windows 10 2004 and later): CET shadow
+/// stacks, which return addresses an overflow cannot rewrite. CPUs without
+/// CET ignore it.
+const STRICT2: u64 = 1 << 28;
+
+/// How far a sandboxed process is locked down, from most to least.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Hardening {
+    /// [`MITIGATIONS`], [`STRICT`] and [`STRICT2`].
+    Full,
+    /// [`MITIGATIONS`] and [`STRICT`]: a Windows before 10 2004.
+    NoShadowStacks,
+    /// [`MITIGATIONS`] only: a Windows that refuses the strict set, or a
+    /// worker that could not start with it.
+    Base,
+    /// No mitigations: `--no-sandbox`, or a Windows that refuses them all.
+    None,
+}
+
+impl Hardening {
+    const LADDER: [Hardening; 4] = [
+        Hardening::Full,
+        Hardening::NoShadowStacks,
+        Hardening::Base,
+        Hardening::None,
+    ];
+
+    /// The policy words for the mitigation attribute, if any.
+    fn policy(self) -> Option<[u64; 2]> {
+        match self {
+            Hardening::Full => Some([MITIGATIONS | STRICT, STRICT2]),
+            Hardening::NoShadowStacks => Some([MITIGATIONS | STRICT, 0]),
+            Hardening::Base => Some([MITIGATIONS, 0]),
+            Hardening::None => None,
+        }
+    }
+
+    fn index(self) -> u8 {
+        Self::LADDER.iter().position(|h| *h == self).unwrap_or(3) as u8
+    }
+}
+
+/// The highest [`Hardening`] step a process of each kind is known to start
+/// with, as an index into [`Hardening::LADDER`]; `PROBE` until the first
+/// one has started. Win32k lockdown fails as the process loads, not in
+/// CreateProcess (a DLL injected into every process that needs user32,
+/// for example), so the first process is watched for a moment.
+static WORKER_STEP: AtomicU8 = AtomicU8::new(PROBE);
+#[cfg(feature = "viewer")]
+static VIEWER_STEP: AtomicU8 = AtomicU8::new(PROBE);
+const PROBE: u8 = u8::MAX;
+
+/// How long the first strict process is watched. Loading fails within
+/// milliseconds; a healthy process waits on its pipe and stays.
+const PROBE_MS: u32 = 500;
 
 /// PROCESS_CREATION_CHILD_PROCESS_RESTRICTED: no child processes, on top
 /// of the job's one-process limit.
@@ -172,16 +240,51 @@ pub struct Worker {
     _process: Owned,
     /// Whether the worker runs in the AppContainer.
     pub sandboxed: bool,
-    /// Whether it started with [`MITIGATIONS`].
-    pub mitigated: bool,
+    /// The mitigations it was started with.
+    pub hardening: Hardening,
+}
+
+/// The mitigations Windows reports for a running process.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Active {
+    pub no_dynamic_code: bool,
+    pub no_win32k: bool,
+    pub cfg: bool,
+    pub shadow_stacks: bool,
 }
 
 impl std::fmt::Debug for Worker {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Worker")
             .field("sandboxed", &self.sandboxed)
-            .field("mitigated", &self.mitigated)
+            .field("hardening", &self.hardening)
             .finish_non_exhaustive()
+    }
+}
+
+impl Worker {
+    /// Asks Windows which mitigations the process runs with.
+    pub fn active(&self) -> Active {
+        let on = |policy: PROCESS_MITIGATION_POLICY| {
+            let mut flags = 0u32;
+            // SAFETY: our process handle; each of these policies is one
+            // 32-bit flags word, the first bit saying it is on.
+            let got = unsafe {
+                GetProcessMitigationPolicy(
+                    self._process.0,
+                    policy,
+                    (&raw mut flags).cast(),
+                    std::mem::size_of::<u32>(),
+                )
+            };
+            got.is_ok() && flags & 1 != 0
+        };
+        Active {
+            no_dynamic_code: on(ProcessDynamicCodePolicy),
+            no_win32k: on(ProcessSystemCallDisablePolicy),
+            cfg: on(ProcessControlFlowGuardPolicy),
+            shadow_stacks: on(ProcessUserShadowStackPolicy),
+        }
     }
 }
 
@@ -332,6 +435,16 @@ fn kill_on_close_job() -> Result<Owned> {
     }
 }
 
+/// Makes every DLL this process loads later, the delay-loaded ones
+/// included (see build.rs), come from System32 only, in every role.
+pub fn system32_dlls_only() {
+    use windows::Win32::System::LibraryLoader::{
+        LOAD_LIBRARY_SEARCH_SYSTEM32, SetDefaultDllDirectories,
+    };
+    // SAFETY: a process-wide flag, set first thing in main.
+    let _ = unsafe { SetDefaultDllDirectories(LOAD_LIBRARY_SEARCH_SYSTEM32) };
+}
+
 /// Starts the worker; `sandbox` false runs it as a plain child process
 /// (the `--no-sandbox` escape hatch).
 pub fn spawn_worker(sandbox: bool) -> Result<Worker> {
@@ -392,19 +505,13 @@ fn spawn(kind: Kind, sandbox: bool) -> Result<Worker> {
     });
 
     // Mitigations come with the sandbox; a Windows that does not know one
-    // of them refuses the process, which then starts without them.
-    let started = if sid.is_some() {
-        create(kind, &exe, &exe_w, security.as_ref(), &inherit, true)
-            .map(|(job, process)| (job, process, true))
-            .or_else(|_| {
-                create(kind, &exe, &exe_w, security.as_ref(), &inherit, false)
-                    .map(|(job, process)| (job, process, false))
-            })
+    // of them refuses the process, which then starts one step down.
+    let (job, process, hardening) = if sid.is_some() {
+        start_hardened(kind, &exe, &exe_w, security.as_ref(), &inherit)?
     } else {
-        create(kind, &exe, &exe_w, None, &inherit, false)
-            .map(|(job, process)| (job, process, false))
+        let (job, process) = create(kind, &exe, &exe_w, None, &inherit, Hardening::None)?;
+        (job, process, Hardening::None)
     };
-    let (job, process, mitigated) = started?;
     // The child has its copies; ours would keep the pipes open forever.
     drop((child_in, child_out));
 
@@ -420,8 +527,56 @@ fn spawn(kind: Kind, sandbox: bool) -> Result<Worker> {
         _job: job,
         _process: process,
         sandboxed: sid.is_some(),
-        mitigated,
+        hardening,
     })
+}
+
+/// Starts the process with the most hardening this Windows allows. The
+/// first process of a kind with Win32k lockdown is watched for
+/// [`PROBE_MS`]; if it dies, it and every later one start a step down.
+fn start_hardened(
+    kind: Kind,
+    exe: &std::path::Path,
+    exe_w: &HSTRING,
+    security: Option<&SECURITY_CAPABILITIES>,
+    inherit: &[HANDLE; 2],
+) -> Result<(Owned, Owned, Hardening)> {
+    let step = match kind {
+        Kind::Worker => &WORKER_STEP,
+        #[cfg(feature = "viewer")]
+        Kind::Viewer => &VIEWER_STEP,
+    };
+    let known = step.load(Ordering::Relaxed);
+    let first = if known == PROBE {
+        0
+    } else {
+        usize::from(known)
+    };
+    let mut last = None;
+    for &hardening in Hardening::LADDER.iter().skip(first) {
+        let (job, process) = match create(kind, exe, exe_w, security, inherit, hardening) {
+            Ok(started) => started,
+            Err(e) => {
+                last = Some(e);
+                continue;
+            }
+        };
+        if step.load(Ordering::Relaxed) == PROBE && hardening <= Hardening::NoShadowStacks {
+            // SAFETY: our process handle.
+            let died = unsafe { WaitForSingleObject(process.0, PROBE_MS) } == WAIT_OBJECT_0;
+            if died {
+                continue;
+            }
+        }
+        step.store(hardening.index(), Ordering::Relaxed);
+        return Ok((job, process, hardening));
+    }
+    Err(last.unwrap_or_else(|| {
+        windows::core::Error::new(
+            windows::core::HRESULT(-1),
+            "the sandboxed process exits as it starts",
+        )
+    }))
 }
 
 /// Starts the process suspended, puts it in a fresh job and lets it run.
@@ -431,11 +586,11 @@ fn create(
     exe_w: &HSTRING,
     security: Option<&SECURITY_CAPABILITIES>,
     inherit: &[HANDLE; 2],
-    mitigate: bool,
+    hardening: Hardening,
 ) -> Result<(Owned, Owned)> {
-    let mitigations = MITIGATIONS;
+    let policy = hardening.policy();
     let child_policy = CHILD_PROCESS_RESTRICTED;
-    let attr_count = 1 + u32::from(security.is_some()) + if mitigate { 2 } else { 0 };
+    let attr_count = 1 + u32::from(security.is_some()) + if policy.is_some() { 2 } else { 0 };
     let mut size = 0usize;
     // SAFETY: the first call only reports the size and is expected to fail.
     let _ = unsafe { InitializeProcThreadAttributeList(None, attr_count, None, &mut size) };
@@ -469,13 +624,16 @@ fn create(
                     None,
                 )?;
             }
-            if mitigate {
+            if let Some(words) = &policy {
+                // One word unless the second has bits: older Windows only
+                // takes one.
+                let size = if words[1] == 0 { 1 } else { 2 };
                 UpdateProcThreadAttribute(
                     list,
                     0,
                     PROC_THREAD_ATTRIBUTE_MITIGATION_POLICY as usize,
-                    Some((&raw const mitigations).cast()),
-                    std::mem::size_of::<u64>(),
+                    Some(words.as_ptr().cast()),
+                    size * std::mem::size_of::<u64>(),
                     None,
                     None,
                 )?;
