@@ -274,7 +274,8 @@ fn local_remote_dynamic_and_x11_forwards() {
                 }
                 Effect::Ended => {}
                 // No password source in these tests.
-                Effect::FetchPassword | Effect::StorePassword(_) => {}
+                Effect::FetchPassword | Effect::StorePassword { .. } => {}
+                Effect::Tunnel { .. } | Effect::ProxyCommand { .. } => {}
             }
         }
         if session.state() == State::Ended {
