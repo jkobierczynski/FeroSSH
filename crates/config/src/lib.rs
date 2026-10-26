@@ -10,6 +10,7 @@ mod host_theme;
 pub mod hostkey;
 pub mod import;
 pub mod known_hosts;
+pub mod login;
 pub mod mobaxterm;
 pub mod mremoteng;
 pub mod password;
