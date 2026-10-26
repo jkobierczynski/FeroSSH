@@ -1,3 +1,5 @@
 # Statically link the C runtime so the exe needs no VC++ redistributable.
 [target.'cfg(all(windows, target_env = "msvc"))']
-rustflags = ["-C", "target-feature=+crt-static"]
+# /Brepro: no timestamps in the exe, so the same source gives the same bytes
+# (see scripts/build-release.ps1).
+rustflags = ["-C", "target-feature=+crt-static", "-C", "link-arg=/Brepro"]
