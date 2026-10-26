@@ -44,3 +44,7 @@ Session > Log to file writes what a tab receives to `%LOCALAPPDATA%\FeroSSH\logs
 ## Colour themes
 
 There are twelve themes (Nord by default) and two warning themes, Production (red) and Staging (amber). Rules can pick the theme by host pattern or by ssh_config `Tag`, so production servers always look like production. See `ThemeRule` in [Settings](settings.md).
+
+## Updates
+
+Help > Check for updates says whether a newer release exists and offers to open its page; Help > Check for updates weekly does it once a week, quietly unless there is one. FeroSSH never downloads or installs anything by itself, and without either it never contacts anything but your servers. If you installed FeroSSH with winget, `winget upgrade jkobierczynski.FeroSSH` updates it.

@@ -212,6 +212,26 @@ jobs:
           name: release-dry-run
           path: dist
 
+      # The signed update file that Help > Check for updates reads from the
+      # latest release (crates/update). It needs the UPDATE_SIGNING_KEY
+      # secret, made once with
+      # `cargo run -p ferossh-update --example keygen`; without it the
+      # release has no update file and checks say so. Pre-releases never
+      # become "latest", so they are not offered as updates.
+      - name: Update file
+        shell: pwsh
+        env:
+          UPDATE_SIGNING_KEY: ${{ secrets.UPDATE_SIGNING_KEY }}
+          TAG: ${{ github.event_name == 'push' && github.ref_name || 'v0.0.0-dry-run' }}
+        run: |
+          if (-not $env:UPDATE_SIGNING_KEY) {
+            "No UPDATE_SIGNING_KEY secret: the release has no update file." | Tee-Object -Append $env:GITHUB_STEP_SUMMARY
+            exit 0
+          }
+          $released = (Get-Date).ToUniversalTime().ToString("yyyy-MM-dd")
+          cargo run --locked -q -p ferossh-update --example sign -- $env:TAG.TrimStart("v") $released dist
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+
       - name: Create the GitHub Release
         if: github.event_name == 'push'
         shell: pwsh
@@ -220,7 +240,8 @@ jobs:
           TAG: ${{ github.ref_name }}
         run: |
           $pre = if ($env:TAG.Contains("-")) { @("--prerelease") } else { @() }
+          $files = @("dist/ferossh.exe", "dist/ferossh-desktop.exe", "dist/SHA256SUMS.txt", "dist/BUILD-MANIFEST.json")
+          if (Test-Path dist/update.txt.sig) { $files += @("dist/update.txt", "dist/update.txt.sig") }
           gh release create $env:TAG --verify-tag --title "FeroSSH $env:TAG" `
-            --notes-file "docs/releases/$env:TAG.md" @pre `
-            dist/ferossh.exe dist/ferossh-desktop.exe dist/SHA256SUMS.txt dist/BUILD-MANIFEST.json
+            --notes-file "docs/releases/$env:TAG.md" @pre @files
           if ($LASTEXITCODE) { exit $LASTEXITCODE }

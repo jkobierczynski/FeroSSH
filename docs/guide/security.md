@@ -32,7 +32,11 @@ X11 forwarding is off unless a host turns it on, because X programs on the serve
 
 ## No telemetry
 
-FeroSSH sends nothing anywhere except to the servers you connect to.
+FeroSSH sends nothing anywhere except to the servers you connect to, and to GitHub when you check for updates.
+
+## Update checks
+
+Help > Check for updates, and the weekly check if you turn it on, fetch two small files from the latest GitHub release: `update.txt` and its Ed25519 signature. FeroSSH checks the signature against the public key built into the exe before it reads anything in the file, and the file can only point to a page on the project's Releases. Nothing is downloaded or installed for you: a newer release is opened in your browser, and you download and check it as described in [Verifying a download](verifying-downloads.md). The request carries no identifier, only the usual `User-Agent: FeroSSH/<version>`.
 
 ## Reporting a vulnerability
 

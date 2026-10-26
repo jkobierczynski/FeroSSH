@@ -165,6 +165,9 @@ pub struct Settings {
     /// The X server forwarded X11 goes to (`DISPLAY` syntax); the `DISPLAY`
     /// environment variable, or `localhost:0`, when unset.
     pub x11_display: Option<String>,
+    /// Look for a new FeroSSH release once a week (Help menu); off unless
+    /// turned on.
+    pub update_check_weekly: bool,
 }
 
 /// Scrollback is capped here, as the terminal caps it.
@@ -193,6 +196,7 @@ impl Default for Settings {
             parallel_transfers: None,
             follow_directory: true,
             x11_display: None,
+            update_check_weekly: false,
         }
     }
 }
@@ -315,6 +319,10 @@ impl Settings {
                 "followdirectory" => {
                     block = Block::Top;
                     s.follow_directory = yes(&args).unwrap_or(true);
+                }
+                "updatecheck" => {
+                    block = Block::Top;
+                    s.update_check_weekly = first.is_some_and(|a| a.eq_ignore_ascii_case("weekly"));
                 }
                 "x11display" => {
                     block = Block::Top;
@@ -447,6 +455,15 @@ impl Settings {
             let _ = writeln!(out, "DownloadFolder {}", arg(d));
         }
         let _ = writeln!(out, "VerifyTransfers {}", flag(self.verify_transfers));
+        let _ = writeln!(
+            out,
+            "UpdateCheck {}",
+            if self.update_check_weekly {
+                "weekly"
+            } else {
+                "off"
+            }
+        );
         if let Some(n) = self.parallel_transfers {
             let _ = writeln!(out, "ParallelTransfers {n}");
         }
@@ -688,6 +705,19 @@ NewKeyword later
         let again = Settings::parse(&s.to_text());
         assert_eq!(again, s);
         assert_eq!(Settings::parse(""), Settings::default());
+    }
+
+    #[test]
+    fn update_checks_are_off_unless_weekly() {
+        assert!(!Settings::default().update_check_weekly);
+        assert!(Settings::parse("UpdateCheck weekly\n").update_check_weekly);
+        assert!(!Settings::parse("UpdateCheck off\n").update_check_weekly);
+        assert!(!Settings::parse("UpdateCheck daily\n").update_check_weekly);
+        let s = Settings {
+            update_check_weekly: true,
+            ..Settings::default()
+        };
+        assert!(Settings::parse(&s.to_text()).update_check_weekly);
     }
 
     #[test]

@@ -80,6 +80,8 @@ mod tmux;
 #[cfg(all(test, unix))]
 mod tmux_e2e;
 #[cfg(windows)]
+mod update;
+#[cfg(windows)]
 mod win;
 
 /// What the command line asks for.

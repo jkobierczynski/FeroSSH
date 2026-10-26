@@ -240,6 +240,9 @@ mod cmd {
     pub const BROADCAST_TAB: u32 = 730;
     pub const BROADCAST_ALL: u32 = 731;
     pub const BROADCAST_SKIP: u32 = 732;
+    pub const UPDATE_CHECK: u32 = 900;
+    pub const UPDATE_WEEKLY: u32 = 901;
+    pub const ABOUT: u32 = 902;
 }
 
 const DIRS: [Dir; 4] = [Dir::Left, Dir::Right, Dir::Up, Dir::Down];
@@ -566,6 +569,10 @@ struct Window {
     pending_desktops: HashMap<PaneId, PendingDesktop>,
     /// Window > Broadcast input: which panes also get what is typed.
     broadcast: broadcast::Scope,
+    /// The update check running in the background, if any, and whether
+    /// the user asked for it (an automatic one only speaks up about a new
+    /// release).
+    update: Option<(std::sync::mpsc::Receiver<crate::update::Outcome>, bool)>,
 }
 
 /// What a password manager command gave for a pane's login.
@@ -992,6 +999,7 @@ fn create_and_run(launch: Launch, theme: Option<String>) -> Result<()> {
                 passwords: Arc::default(),
                 pending_desktops: HashMap::new(),
                 broadcast: broadcast::Scope::Off,
+                update: None,
             });
         });
         // Files dropped from Explorer are uploaded, after a confirmation.
@@ -1016,6 +1024,13 @@ fn create_and_run(launch: Launch, theme: Option<String>) -> Result<()> {
             _ => with_window(|w| w.ask_destination(first)),
         };
         let _ = ShowWindow(hwnd, SW_SHOW);
+        // Help > Check for updates weekly, when it is on and a week has
+        // passed.
+        with_window(|w| {
+            if w.settings.update_check_weekly && crate::update::due() {
+                w.start_update_check(false);
+            }
+        });
 
         let mut msg = MSG::default();
         while GetMessageW(&mut msg, None, 0, 0).as_bool() {
@@ -1217,12 +1232,19 @@ fn build_menu() -> Result<HMENU> {
             )?;
         }
 
+        let help = CreatePopupMenu()?;
+        item(help, cmd::UPDATE_CHECK, "Check for &updates...")?;
+        item(help, cmd::UPDATE_WEEKLY, "Check for updates &weekly")?;
+        separator(help)?;
+        item(help, cmd::ABOUT, "&About FeroSSH")?;
+
         let bar = CreateMenu()?;
         AppendMenuW(bar, MF_POPUP, file.0 as usize, w!("&File"))?;
         AppendMenuW(bar, MF_POPUP, edit.0 as usize, w!("&Edit"))?;
         AppendMenuW(bar, MF_POPUP, view.0 as usize, w!("&View"))?;
         AppendMenuW(bar, MF_POPUP, window.0 as usize, w!("&Window"))?;
         AppendMenuW(bar, MF_POPUP, session.0 as usize, w!("&Session"))?;
+        AppendMenuW(bar, MF_POPUP, help.0 as usize, w!("&Help"))?;
         Ok(bar)
     }
 }
@@ -3368,8 +3390,48 @@ impl Window {
             self.refresh_chrome();
         }
         self.refresh_visible();
+        if let Some(found) = self.poll_update_check() {
+            commands.push(found);
+        }
         commands.append(&mut self.queued);
         commands
+    }
+
+    /// Starts Help > Check for updates in the background, unless one is
+    /// already running; its answer wakes the window like shell output.
+    fn start_update_check(&mut self, asked: bool) {
+        if self.update.is_some() {
+            return;
+        }
+        let (tx, rx) = std::sync::mpsc::channel();
+        let wake = self.notifier();
+        let spawned = std::thread::Builder::new()
+            .name("update-check".into())
+            .spawn(move || {
+                let _ = tx.send(crate::update::check());
+                wake();
+            });
+        if spawned.is_ok() {
+            self.update = Some((rx, asked));
+        }
+    }
+
+    /// The finished update check's answer, as a command that shows it.
+    fn poll_update_check(&mut self) -> Option<Command> {
+        let (rx, asked) = self.update.as_ref()?;
+        let asked = *asked;
+        let outcome = match rx.try_recv() {
+            Ok(outcome) => outcome,
+            Err(std::sync::mpsc::TryRecvError::Empty) => return None,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                crate::update::Outcome::Failed("the check stopped".into())
+            }
+        };
+        self.update = None;
+        if !matches!(outcome, crate::update::Outcome::Failed(_)) {
+            crate::update::checked();
+        }
+        Some(Command::UpdateFound { outcome, asked })
     }
 
     fn on_sync_timer(&mut self) -> Vec<Command> {
@@ -5672,6 +5734,30 @@ impl Window {
                 self.panes.get_mut(&pane)?.term.clear_scrollback();
                 self.refresh(pane);
             }
+            cmd::UPDATE_CHECK => {
+                if ferossh_update::public_key().is_none() {
+                    return Some(Command::Message(
+                        "This build of FeroSSH cannot check for updates: it was built without \
+                         the project's update key. Releases are listed at \
+                         https://github.com/jkobierczynski/FeroSSH/releases."
+                            .into(),
+                    ));
+                }
+                self.start_update_check(true);
+            }
+            cmd::UPDATE_WEEKLY => {
+                self.settings.update_check_weekly = !self.settings.update_check_weekly;
+                self.save_settings();
+                self.update_menu_checks();
+            }
+            cmd::ABOUT => {
+                return Some(Command::Message(format!(
+                    "FeroSSH {}\n\nSecure connections. Forged in Rust.\n\n\
+                     https://github.com/jkobierczynski/FeroSSH\n\n\
+                     Dual licensed under MIT or Apache-2.0.",
+                    env!("CARGO_PKG_VERSION")
+                )));
+            }
             cmd::COPY_ON_SELECT => {
                 self.settings.copy_on_select = !self.settings.copy_on_select;
                 self.save_settings();
@@ -5781,6 +5867,7 @@ impl Window {
             let _ = CheckMenuRadioItem(self.menu, cmd::THEME, last_theme, theme, MF_BYCOMMAND.0);
             for (id, on) in [
                 (cmd::COPY_ON_SELECT, s.copy_on_select),
+                (cmd::UPDATE_WEEKLY, s.update_check_weekly),
                 (cmd::RIGHT_CLICK_PASTE, s.right_click_paste),
                 (cmd::LOG_TOGGLE, log),
                 (cmd::LOG_RAW, raw),
@@ -6280,6 +6367,14 @@ fn shortcut(vk: VIRTUAL_KEY, m: Mods, tabs: bool, split: bool) -> Option<u32> {
 /// released.
 enum Command {
     Id(u32),
+    /// An information box.
+    Message(String),
+    /// Help > Check for updates found its answer; `asked` is false for
+    /// the weekly check, which only speaks up about a new release.
+    UpdateFound {
+        outcome: crate::update::Outcome,
+        asked: bool,
+    },
     /// File > Exit or the close box: asks first when sessions are open.
     Exit,
     /// The last pane closed: the window goes.
@@ -6933,6 +7028,48 @@ fn run_command(hwnd: HWND, command: Command) {
                 if !text.is_empty() {
                     dialog(hwnd, &text, MB_OK | icon);
                 }
+            }
+        }
+        Command::Message(text) => {
+            dialog(hwnd, &text, MB_OK | MB_ICONINFORMATION);
+        }
+        Command::UpdateFound { outcome, asked } => {
+            use crate::update::Outcome;
+            let current = env!("CARGO_PKG_VERSION");
+            match outcome {
+                Outcome::Newer(update) => {
+                    let text = format!(
+                        "FeroSSH {} is available (released {}). You have {current}.\n\n\
+                         Open its release page to download it?",
+                        update.version, update.released,
+                    );
+                    if dialog(hwnd, &text, MB_YESNO | MB_ICONINFORMATION) == Some(IDYES) {
+                        // SAFETY: a signed, checked https URL on the
+                        // project's Releases, handed to the browser.
+                        unsafe {
+                            ShellExecuteW(
+                                Some(hwnd),
+                                w!("open"),
+                                &HSTRING::from(update.url.as_str()),
+                                None,
+                                None,
+                                SW_SHOWNORMAL,
+                            );
+                        }
+                    }
+                }
+                Outcome::Current(update) if asked => {
+                    let text = format!(
+                        "FeroSSH {current} is up to date. The latest release is {}.",
+                        update.version
+                    );
+                    dialog(hwnd, &text, MB_OK | MB_ICONINFORMATION);
+                }
+                Outcome::Failed(why) if asked => {
+                    let text = format!("Could not check for updates: {why}.");
+                    dialog(hwnd, &text, MB_OK | MB_ICONWARNING);
+                }
+                Outcome::Current(_) | Outcome::Failed(_) => {}
             }
         }
         Command::OpenFolder(dir) => {
