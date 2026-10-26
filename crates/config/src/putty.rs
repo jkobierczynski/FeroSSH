@@ -5,12 +5,14 @@
 //! `HKCU\Software\9bis.com\KiTTY\Sessions` or, portable, as one file per
 //! session in a `Sessions` folder, with `Key\Value\` lines. Names are
 //! `%XX`-escaped. The window reads the values; this module makes them
-//! [`Session`]s. Only SSH sessions are imported: telnet, serial and raw
-//! sessions have no SSH equivalent. Passwords (KiTTY can store one) are
-//! never read, only noticed.
+//! [`Session`]s. SSH and Telnet sessions are imported; serial and raw
+//! ones are not. Passwords (KiTTY can store one) are never read, only
+//! noticed.
 
 use crate::forward::{ForwardKind, parse_config};
+use crate::import::port;
 pub use crate::import::{Session, Value, decode as decode_name};
+use crate::settings::SessionKind;
 use crate::ssh_config::parse_destination;
 
 /// The values FeroSSH reads from each session. `Password` is only
@@ -62,7 +64,8 @@ fn forwards(text: &str) -> (Vec<crate::ForwardSpec>, usize) {
     (out, dropped)
 }
 
-/// Builds a session from its values; `None` for non-SSH sessions, the
+/// Builds a session from its values; `None` for sessions other than SSH
+/// and Telnet, the
 /// "Default Settings" entry and sessions without a usable host.
 pub fn session(raw_name: &str, get: impl Fn(&str) -> Option<Value>) -> Option<Session> {
     let name = decode_name(raw_name);
@@ -71,9 +74,12 @@ pub fn session(raw_name: &str, get: impl Fn(&str) -> Option<Value>) -> Option<Se
     }
     let text = |key: &str| get(key).and_then(|v| v.text().map(str::to_owned));
     let number = |key: &str| get(key).and_then(|v| v.number());
-    if text("Protocol").is_some_and(|p| !p.eq_ignore_ascii_case("ssh")) {
-        return None;
-    }
+    let kind = match text("Protocol") {
+        None => SessionKind::Ssh,
+        Some(p) if p.eq_ignore_ascii_case("ssh") => SessionKind::Ssh,
+        Some(p) if p.eq_ignore_ascii_case("telnet") => SessionKind::Telnet,
+        Some(_) => return None,
+    };
     // HostName may be `user@host`; the destination parser also rejects
     // anything that is not a host name.
     let (user_in_host, hostname, _) = parse_destination(&text("HostName")?)?;
@@ -87,9 +93,17 @@ pub fn session(raw_name: &str, get: impl Fn(&str) -> Option<Value>) -> Option<Se
     if s.host.alias.is_empty() {
         return None;
     }
-    s.host.port = number("PortNumber")
-        .and_then(|p| u16::try_from(p).ok())
-        .filter(|&p| p != 0 && p != 22);
+    s.kind = kind;
+    s.host.port = port(kind, number("PortNumber"));
+    s.font = text("Font");
+    s.font_size = number("FontHeight")
+        .map(|h| h as f32)
+        .filter(|h| (4.0..=96.0).contains(h));
+    if kind == SessionKind::Telnet {
+        // Telnet logs in at the host's own prompt: no user, key or
+        // forwards to bring.
+        return Some(s);
+    }
     s.host.user = text("UserName").or(user_in_host);
     s.host.identity_file = text("PublicKeyFile");
     if let Some(f) = text("PortForwardings") {
@@ -103,10 +117,6 @@ pub fn session(raw_name: &str, get: impl Fn(&str) -> Option<Value>) -> Option<Se
         }
     }
     s.had_password = get("Password").is_some();
-    s.font = text("Font");
-    s.font_size = number("FontHeight")
-        .map(|h| h as f32)
-        .filter(|h| (4.0..=96.0).contains(h));
     Some(s)
 }
 
@@ -235,12 +245,34 @@ mod tests {
     }
 
     #[test]
-    fn skips_what_is_not_ssh() {
+    fn imports_telnet_sessions() {
         let telnet = [
             ("Protocol", Value::Text("telnet".into())),
             ("HostName", Value::Text("router".into())),
+            ("PortNumber", Value::Number(23)),
+            ("UserName", Value::Text("admin".into())),
         ];
-        assert_eq!(session("r", values(&telnet)), None);
+        let s = session("r", values(&telnet)).unwrap();
+        assert_eq!(s.kind, SessionKind::Telnet);
+        assert_eq!((s.host.port, s.host.user.as_deref()), (None, None));
+        let console = [
+            ("Protocol", Value::Text("telnet".into())),
+            ("HostName", Value::Text("console-server".into())),
+            ("PortNumber", Value::Number(2003)),
+        ];
+        let c = session("c", values(&console)).unwrap();
+        assert_eq!(c.host.port, Some(2003));
+        let p = profile(&c).unwrap();
+        assert_eq!(p.kind, SessionKind::Telnet);
+    }
+
+    #[test]
+    fn skips_what_is_not_ssh() {
+        let raw = [
+            ("Protocol", Value::Text("raw".into())),
+            ("HostName", Value::Text("router".into())),
+        ];
+        assert_eq!(session("r", values(&raw)), None);
         let bad = [("HostName", Value::Text("-oProxyCommand=calc".into()))];
         assert_eq!(session("x", values(&bad)), None);
         let empty = [("HostName", Value::Text(String::new()))];

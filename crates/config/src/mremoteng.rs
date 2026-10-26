@@ -232,6 +232,7 @@ fn connection(t: &Tag, folders: &[&str], user: Option<String>) -> Option<Session
         "SSH1" | "SSH2" => SessionKind::Ssh,
         "RDP" => SessionKind::Rdp,
         "VNC" => SessionKind::Vnc,
+        "Telnet" => SessionKind::Telnet,
         _ => return None,
     };
     let leaf = t.get("Name")?.trim().replace('/', "-");
@@ -248,7 +249,11 @@ fn connection(t: &Tag, folders: &[&str], user: Option<String>) -> Option<Session
     }
     s.kind = kind;
     s.host.port = port(kind, t.get("Port").and_then(|p| p.trim().parse().ok()));
-    s.host.user = user.or(user_in_host);
+    s.host.user = if kind == SessionKind::Telnet {
+        None
+    } else {
+        user.or(user_in_host)
+    };
     s.had_password = t.get("Password").is_some_and(|p| !p.is_empty());
     if kind == SessionKind::Ssh
         && let Some(p) = t
@@ -300,9 +305,13 @@ mod tests {
                 "Work & Lab/web",
                 "Work & Lab/win > srv",
                 "Work & Lab/Inner/desk",
+                "telnet box",
                 "old"
             ]
         );
+        assert_eq!(s[3].kind, SessionKind::Telnet);
+        assert_eq!(s[3].host.alias, "telnet-box");
+        assert_eq!(s[3].host.port, None);
         assert_eq!(s[0].kind, SessionKind::Ssh);
         assert_eq!(s[0].host.user.as_deref(), Some("admin"));
         assert_eq!(s[0].host.port, Some(2222));
@@ -315,7 +324,7 @@ mod tests {
         assert_eq!(s[2].host.port, Some(5901));
         assert_eq!(s[2].host.user.as_deref(), None);
         // No protocol: mRemoteNG's default, RDP.
-        assert_eq!(s[3].kind, SessionKind::Rdp);
+        assert_eq!(s[4].kind, SessionKind::Rdp);
         let all: Vec<&Session> = s.iter().collect();
         let text = to_config(Client::MRemoteNg, &all);
         let hosts = ssh_config::hosts(&text, &ssh_config::NoIncludes);
@@ -323,7 +332,7 @@ mod tests {
             hosts[2].folder.as_deref(),
             Some("mRemoteNG/Work & Lab/Inner")
         );
-        assert_eq!(saved::parse(&text).len(), 4);
+        assert_eq!(saved::parse(&text).len(), 5);
         assert!(!text.contains("9fZ1"));
         let p = profile(&s[1]).unwrap();
         assert_eq!((p.host.as_str(), p.kind), ("win-srv", SessionKind::Rdp));

@@ -11,8 +11,9 @@
 //! S:"Password V2"=02:...
 //! ```
 //!
-//! `D:` numbers are hexadecimal. Only SSH sessions are imported. Saved
-//! passwords are never read, only noticed.
+//! `D:` numbers are hexadecimal. SSH and Telnet sessions are imported (a
+//! Telnet session's port is `D:"Port"`). Saved passwords are never read,
+//! only noticed.
 
 use crate::import::{Session, clean, port};
 use crate::settings::SessionKind;
@@ -55,19 +56,30 @@ pub fn session(name: &str, text: &str) -> Option<Session> {
             .filter(|v| !v.is_empty())
     };
     let protocol = get("Protocol Name").unwrap_or("SSH2");
-    if !protocol.eq_ignore_ascii_case("SSH2") && !protocol.eq_ignore_ascii_case("SSH1") {
+    let kind = if protocol.eq_ignore_ascii_case("SSH2") || protocol.eq_ignore_ascii_case("SSH1") {
+        SessionKind::Ssh
+    } else if protocol.eq_ignore_ascii_case("Telnet") {
+        SessionKind::Telnet
+    } else {
         return None;
-    }
+    };
     let (user_in_host, hostname, _) = parse_destination(get("Hostname")?)?;
     let mut s = Session::new(name.trim_matches('/').to_owned(), None, hostname);
     if s.host.alias.is_empty() {
         return None;
     }
-    let port_key = format!("[{}] Port", protocol.to_ascii_uppercase());
+    let port_key = match kind {
+        SessionKind::Telnet => "Port".to_owned(),
+        _ => format!("[{}] Port", protocol.to_ascii_uppercase()),
+    };
+    s.kind = kind;
     s.host.port = port(
-        SessionKind::Ssh,
+        kind,
         get(&port_key).and_then(|p| u32::from_str_radix(p, 16).ok()),
     );
+    if kind == SessionKind::Telnet {
+        return Some(s);
+    }
     s.host.user = get("Username").map(str::to_owned).or(user_in_host);
     if let Some(key) = get("Identity Filename V2").or_else(|| get("Identity Filename")) {
         // `path::rawkey` names the key file; a `.pub` beside it is fine.
@@ -120,8 +132,11 @@ mod tests {
 
     #[test]
     fn skips_what_is_not_ssh() {
-        let telnet = "S:\"Protocol Name\"=Telnet\nS:\"Hostname\"=router\n";
-        assert_eq!(session("r", telnet), None);
+        let telnet = "S:\"Protocol Name\"=Telnet\nS:\"Hostname\"=router\nD:\"Port\"=000007d1\n";
+        let t = session("r", telnet).unwrap();
+        assert_eq!((t.kind, t.host.port), (SessionKind::Telnet, Some(2001)));
+        let rlogin = "S:\"Protocol Name\"=RLogin\nS:\"Hostname\"=router\n";
+        assert_eq!(session("r", rlogin), None);
         assert_eq!(session("x", "S:\"Hostname\"=-oProxyCommand=calc\n"), None);
         let plain = session("box", "S:\"Hostname\"=box\nD:\"[SSH2] Port\"=00000016\n").unwrap();
         assert_eq!(plain.host.port, None);

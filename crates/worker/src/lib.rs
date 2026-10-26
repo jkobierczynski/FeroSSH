@@ -1,4 +1,5 @@
-//! The sandboxed SSH worker: russh sessions, channels and forwards.
+//! The sandboxed SSH worker: russh sessions, channels and forwards, and
+//! Telnet sessions ([`telnet`]).
 //!
 //! `ferossh.exe` starts a copy of itself in an AppContainer that may only
 //! use the network, and talks to it over two inherited pipes. The worker
@@ -14,6 +15,7 @@ pub mod crypto_policy;
 mod forward;
 mod session;
 mod sftp;
+pub mod telnet;
 
 use std::io::{Read, Write};
 use std::thread;
@@ -113,6 +115,24 @@ pub async fn serve(mut inbox: mpsc::Receiver<Message>, out: mpsc::Sender<Message
                     out.clone(),
                     connections.clone(),
                 ));
+            }
+            Message::TelnetConnect {
+                channel,
+                host,
+                port,
+                cols,
+                rows,
+                connect_timeout,
+            } => {
+                let Some(rx) = session(channel) else { continue };
+                let params = telnet::Params {
+                    host,
+                    port,
+                    cols,
+                    rows,
+                    connect_timeout,
+                };
+                tokio::spawn(telnet::run(channel, params, rx, out.clone()));
             }
             Message::RemoteForward {
                 channel,

@@ -39,6 +39,8 @@
 //!     LoginScript send enable
 //!     LoginScript expect Password:
 //!     LoginScript secret enable
+//! Profile old-router
+//!     Type telnet
 //! Secret enable
 //!     PasswordCommand op read "op://Network/%n/password"
 //! Snippet "Show interfaces"
@@ -110,6 +112,9 @@ pub enum SessionKind {
     Vnc,
     /// A serial console on a COM port of this PC.
     Serial,
+    /// A Telnet terminal, for old network gear and console servers:
+    /// unencrypted, and shown as such.
+    Telnet,
 }
 
 impl SessionKind {
@@ -119,6 +124,7 @@ impl SessionKind {
             SessionKind::Rdp => "rdp",
             SessionKind::Vnc => "vnc",
             SessionKind::Serial => "serial",
+            SessionKind::Telnet => "telnet",
         }
     }
 
@@ -128,6 +134,7 @@ impl SessionKind {
             "rdp" => Some(SessionKind::Rdp),
             "vnc" => Some(SessionKind::Vnc),
             "serial" => Some(SessionKind::Serial),
+            "telnet" => Some(SessionKind::Telnet),
             _ => None,
         }
     }
@@ -137,6 +144,8 @@ impl SessionKind {
 pub const DEFAULT_DESKTOP_PORT: u16 = 3389;
 /// The VNC port of display :0.
 pub const DEFAULT_VNC_PORT: u16 = 5900;
+/// The Telnet port.
+pub const DEFAULT_TELNET_PORT: u16 = 23;
 
 impl Profile {
     fn is_empty(&self) -> bool {
@@ -733,7 +742,7 @@ Profile big
     TmuxLayout split
     LegacyAlgorithms maybe
     DesktopPort 0
-    Type telnet
+    Type gopher
     Via "a b"
     PasswordSource Windows
 Profile console
@@ -755,6 +764,8 @@ Snippet Show interfaces
     Line show ip int brief | include up
 Snippet
     Line lost
+Profile router
+    Type Telnet
 NewKeyword later
 "#;
 
@@ -810,6 +821,7 @@ NewKeyword later
             console.serial.map(|l| l.to_string()).as_deref(),
             Some("115200,7E1,rtscts")
         );
+        assert_eq!(s.profile("router").unwrap().kind, SessionKind::Telnet);
         assert_eq!(
             console.login_script,
             [
