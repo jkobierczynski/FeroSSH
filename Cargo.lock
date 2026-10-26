@@ -867,6 +867,7 @@ dependencies = [
  "ferossh-sftp",
  "ferossh-term",
  "ferossh-tmuxcc",
+ "ferossh-update",
  "ferossh-viewer",
  "ferossh-worker",
  "getrandom 0.4.3",
@@ -938,6 +939,14 @@ dependencies = [
 [[package]]
 name = "ferossh-tmuxcc"
 version = "0.1.0"
+
+[[package]]
+name = "ferossh-update"
+version = "0.1.0"
+dependencies = [
+ "base64ct",
+ "ring",
+]
 
 [[package]]
 name = "ferossh-viewer"

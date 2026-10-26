@@ -26,6 +26,7 @@ ferossh-render.workspace = true
 ferossh-sftp.workspace = true
 ferossh-term.workspace = true
 ferossh-tmuxcc.workspace = true
+ferossh-update.workspace = true
 ferossh-viewer = { workspace = true, optional = true }
 ferossh-worker.workspace = true
 # The forwarding engine's sockets; the worker already links tokio.
@@ -40,6 +41,7 @@ windows = { version = "0.62", features = [
     "Win32_Foundation",
     "Win32_Globalization",
     "Win32_Graphics_Gdi",
+    "Win32_Networking_WinHttp",
     "Win32_Security",
     "Win32_Security_Authorization",
     "Win32_Security_Credentials",

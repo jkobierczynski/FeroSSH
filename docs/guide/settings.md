@@ -21,6 +21,7 @@ FeroSSH reads `~/.ssh/config` and `~/.ssh/known_hosts` too, and writes only to `
 | `RightClickPaste yes` | no | Pastes on a right click, as PuTTY does. |
 | `Scrollback 50000` | 10000 | Lines of scrollback per pane, up to 1,000,000. |
 | `Favourite web db1` | | Hosts marked as favourites in the session manager. |
+| `UpdateCheck weekly` | off | Looks for a new release once a week (Help > Check for updates weekly). |
 
 ## File transfer
 
