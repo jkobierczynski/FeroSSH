@@ -129,7 +129,7 @@ const GRAB_DIP: i32 = 3;
 /// The side pane's width when first shown, in chrome cells.
 const SIDE_COLS: i32 = 34;
 /// The side pane font size.
-const CHROME_PT: f32 = 9.5;
+const CHROME_PT: f32 = 10.5;
 /// The tab strip font size.
 const STRIP_PT: f32 = 10.5;
 /// Space above and below the tab titles, in DIPs.
@@ -769,7 +769,7 @@ fn write_app_file(path: &std::path::Path, text: &str) -> std::io::Result<()> {
 }
 
 /// The hosts the session manager lists.
-fn host_items(env: &Env) -> Vec<HostItem> {
+fn host_items(env: &Env, settings: &Settings) -> Vec<HostItem> {
     let includes = ssh_config::DirIncludes {
         home: env.home.clone(),
     };
@@ -785,10 +785,15 @@ fn host_items(env: &Env) -> Vec<HostItem> {
                     d
                 })
                 .unwrap_or_default();
+            let kind = settings
+                .profile(&h.name)
+                .map(|p| p.kind)
+                .unwrap_or_default();
             HostItem {
                 name: h.name,
                 folder: h.folder,
                 detail,
+                kind,
             }
         })
         .collect()
@@ -4379,7 +4384,7 @@ impl Window {
     /// Opens the session form on `host`, or on a new session.
     fn open_form(&mut self, host: Option<String>) {
         let env = ssh_env();
-        let items = host_items(&env);
+        let items = host_items(&env, &self.settings);
         let names: Vec<String> = items.iter().map(|h| h.name.clone()).collect();
         let font = FontSpec::default();
         let hints = Hints {
@@ -4535,9 +4540,10 @@ impl Window {
     /// Reads the hosts again after a session was saved or deleted.
     fn reload_sessions(&mut self, select: Option<&str>) {
         let env = ssh_env();
-        self.side
-            .list
-            .set_hosts(host_items(&env), self.settings.favourites.clone());
+        self.side.list.set_hosts(
+            host_items(&env, &self.settings),
+            self.settings.favourites.clone(),
+        );
         if let Some(name) = select {
             self.side.list.select(name);
         }
@@ -4742,9 +4748,10 @@ impl Window {
         match view {
             SideView::Sessions => {
                 let env = ssh_env();
-                self.side
-                    .list
-                    .set_hosts(host_items(&env), self.settings.favourites.clone());
+                self.side.list.set_hosts(
+                    host_items(&env, &self.settings),
+                    self.settings.favourites.clone(),
+                );
             }
             SideView::Files => self.ensure_sftp(self.focused_id()),
             SideView::Forwards => {}
