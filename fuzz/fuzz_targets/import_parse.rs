@@ -1,17 +1,22 @@
 //! Feeds arbitrary text to the parsers for other clients' saved sessions
-//! (a `WinSCP.ini`, a KiTTY portable session file), which read files the
-//! user picks. None may panic, and what an import writes must read back
+//! (`WinSCP.ini`, `MobaXterm.ini`, mRemoteNG's `confCons.xml`, SecureCRT
+//! and KiTTY session files), which read files the user picks. None may panic, and what an import writes must read back
 //! as the same hosts: no name or value can add a line of its own.
 
 #![no_main]
 
 use ferossh_config::import::{self, Client};
-use ferossh_config::{putty, saved, winscp};
+use ferossh_config::{mobaxterm, mremoteng, putty, saved, securecrt, winscp};
 use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|data: &[u8]| {
     let text = String::from_utf8_lossy(data);
     let mut sessions = winscp::from_ini(&text);
+    sessions.extend(mobaxterm::from_ini(&text));
+    sessions.extend(mremoteng::from_xml(&text).unwrap_or_default());
+    if let Some(s) = securecrt::session(&text, &text) {
+        sessions.push(s);
+    }
     if let Some(s) = putty::file_session(&text, &text) {
         sessions.push(s);
     }

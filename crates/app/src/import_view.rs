@@ -5,6 +5,7 @@
 //! Keys come in as [`SideKey`]s; what the user chose comes out as an
 //! [`ImportAction`]. The window reads the clients and writes the import.
 
+use ferossh_config::SessionKind;
 use ferossh_config::import::{Client, Session};
 use ferossh_render::{Flags, Grid};
 
@@ -63,6 +64,8 @@ const BACK: usize = 1;
 
 pub struct ImportView {
     found: Vec<Found>,
+    /// Files that were found but could not be read, said on the first page.
+    problems: Vec<String>,
     /// The source being previewed; `None` on the list of sources.
     open: Option<usize>,
     checked: Vec<bool>,
@@ -73,9 +76,10 @@ pub struct ImportView {
 }
 
 impl ImportView {
-    pub fn new(found: Vec<Found>) -> Self {
+    pub fn new(found: Vec<Found>, problems: Vec<String>) -> Self {
         let mut v = Self {
             found,
+            problems,
             open: None,
             checked: Vec::new(),
             focus: 0,
@@ -132,13 +136,15 @@ impl ImportView {
         let Some(f) = self.current() else {
             let mut r: Vec<Row> = (0..self.found.len()).map(Row::Source).collect();
             if self.found.is_empty() {
-                r.push(Row::Note(
-                    "No PuTTY, KiTTY or WinSCP sessions on this account.".into(),
-                ));
+                r.push(Row::Note("No other SSH client has sessions here.".into()));
+            }
+            r.extend(self.problems.iter().cloned().map(Row::Note));
+            if self.found.is_empty() || !self.problems.is_empty() {
                 r.push(Row::Blank);
             }
             r.push(Row::FromFile);
-            r.push(Row::Note("A WinSCP.ini or a KiTTY session file".into()));
+            r.push(Row::Note("WinSCP.ini, MobaXterm.ini, confCons.xml,".into()));
+            r.push(Row::Note("or a SecureCRT or KiTTY session file".into()));
             r.push(Row::Blank);
             r.push(Row::Note("Passwords are never imported.".into()));
             return r;
@@ -154,7 +160,7 @@ impl ImportView {
                 r.push(Row::Note("its saved password stays behind".into()));
             }
             for n in &s.notes {
-                r.push(Row::Note(format!("not brought over: {n}")));
+                r.push(Row::Note(n.clone()));
             }
         }
         r.push(Row::Blank);
@@ -415,6 +421,11 @@ impl ImportView {
                             if let Some(p) = s.host.port {
                                 to.push_str(&format!(":{p}"));
                             }
+                            match s.kind {
+                                SessionKind::Ssh => {}
+                                SessionKind::Rdp => to.push_str(" RDP"),
+                                SessionKind::Vnc => to.push_str(" VNC"),
+                            }
                             let room = width.saturating_sub(line.col + 2);
                             if room > 4 {
                                 line.put(
@@ -477,16 +488,19 @@ mod tests {
     }
 
     fn view() -> ImportView {
-        ImportView::new(vec![Found {
-            client: Client::WinScp,
-            origin: "registry".into(),
-            sessions: vec![
-                site("Work/web", "web.lan", true),
-                site("db", "db.lan", false),
-                site("files", "files.lan", false),
-            ],
-            taken: vec![false, true, false],
-        }])
+        ImportView::new(
+            vec![Found {
+                client: Client::WinScp,
+                origin: "registry".into(),
+                sessions: vec![
+                    site("Work/web", "web.lan", true),
+                    site("db", "db.lan", false),
+                    site("files", "files.lan", false),
+                ],
+                taken: vec![false, true, false],
+            }],
+            Vec::new(),
+        )
     }
 
     fn texts(v: &mut ImportView) -> Vec<String> {
@@ -565,28 +579,35 @@ mod tests {
 
     #[test]
     fn a_file_opens_its_preview_and_clicks_work() {
-        let mut v = ImportView::new(Vec::new());
-        assert!(texts(&mut v)[1].starts_with("     No PuTTY, KiTTY or WinSCP"));
+        let mut v = ImportView::new(Vec::new(), vec!["confCons.xml is encrypted".into()]);
+        let t = texts(&mut v);
+        assert_eq!(t[1], "     No other SSH client has sessions here.");
+        assert_eq!(t[2], "     confCons.xml is encrypted");
+        assert_eq!(t[4], "   From a file…");
+        let mut desk = site("desk", "desk.lan", false);
+        desk.kind = SessionKind::Vnc;
+        desk.host.port = Some(5901);
         v.add(Found {
             client: Client::Kitty,
             origin: r"D:\kitty\Sessions".into(),
-            sessions: vec![site("box", "box.lan", false)],
-            taken: vec![false],
+            sessions: vec![site("box", "box.lan", false), desk],
+            taken: vec![false, false],
         });
         let t = texts(&mut v);
         assert_eq!(t[0], " Import from KiTTY");
+        assert_eq!(t[3], " [x] desk  me@desk.lan:5901 VNC");
         // Click the box, then Import.
         v.click(2, 2, 16);
         assert_eq!(texts(&mut v)[2], " [ ] box  me@box.lan");
         v.click(2, 2, 16);
         let t = texts(&mut v);
-        let y = t.iter().position(|l| l.contains("Import 1")).unwrap();
+        let y = t.iter().position(|l| l.contains("Import 2")).unwrap();
         assert!(matches!(
             v.click(3, y, 16),
             Some(ImportAction::Import { .. })
         ));
         let back = t[y].find("Back").unwrap();
         v.click(back, y, 16);
-        assert_eq!(texts(&mut v)[1], r" ▸ KiTTY  1 session, D:\kitty\Sessions");
+        assert_eq!(texts(&mut v)[1], r" ▸ KiTTY  2 sessions, D:\kitty\Sessions");
     }
 }
