@@ -1216,6 +1216,10 @@ fn build_menu() -> Result<HMENU> {
                 &format!("Grow pane {name}\tAlt+Shift+{key}"),
             )?;
         }
+        separator(window)?;
+        item(window, cmd::CLOSE_PANE, "&Close pane\tCtrl+Shift+W")?;
+        // The same as File > Exit: asks first when sessions are open.
+        item(window, cmd::EXIT, "Close &window\tAlt+F4")?;
 
         let bar = CreateMenu()?;
         AppendMenuW(bar, MF_POPUP, file.0 as usize, w!("&File"))?;
