@@ -84,6 +84,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 use windows::core::{HSTRING, PCWSTR, PWSTR, Result, w};
 
 use crate::Launch;
+use crate::broadcast;
 use crate::clipboard;
 use crate::conpty::{self, Output, Shell};
 use crate::credman;
@@ -231,9 +232,24 @@ mod cmd {
     pub const FOCUS: u32 = 710;
     /// Plus 0-3: left, right, up, down.
     pub const RESIZE: u32 = 720;
+    pub const BROADCAST_TAB: u32 = 730;
+    pub const BROADCAST_ALL: u32 = 731;
+    pub const BROADCAST_SKIP: u32 = 732;
 }
 
 const DIRS: [Dir; 4] = [Dir::Left, Dir::Right, Dir::Up, Dir::Down];
+
+/// The frame around every pane that broadcast input reaches.
+const BROADCAST_FRAME: Rgb = Rgb::new(0xe5, 0x8e, 0x26);
+
+/// Something typed in the focused pane, for the panes broadcast reaches.
+#[derive(Debug)]
+enum Typed {
+    Char(char, bool),
+    Key(Key, Mods),
+    Bytes(Vec<u8>),
+    Paste(String),
+}
 
 /// The prompt shown when no host was given.
 const CONNECT_PROMPT: &str =
@@ -312,6 +328,8 @@ struct Pane {
     /// A remote desktop shown instead of the terminal, which then only
     /// carries messages (the `desktop-viewer` feature).
     desktop: Option<Box<Desktop>>,
+    /// Window > Leave this pane out of broadcast input.
+    no_broadcast: bool,
 }
 
 impl Pane {
@@ -535,6 +553,8 @@ struct Window {
     passwords: Arc<std::sync::Mutex<Vec<PasswordAnswer>>>,
     /// Desktop sessions waiting for their SSH pane to log in.
     pending_desktops: HashMap<PaneId, PendingDesktop>,
+    /// Window > Broadcast input: which panes also get what is typed.
+    broadcast: broadcast::Scope,
 }
 
 /// What a password manager command gave for a pane's login.
@@ -960,6 +980,7 @@ fn create_and_run(launch: Launch, theme: Option<String>) -> Result<()> {
                 desktops: HashMap::new(),
                 passwords: Arc::default(),
                 pending_desktops: HashMap::new(),
+                broadcast: broadcast::Scope::Off,
             });
         });
         // Files dropped from Explorer are uploaded, after a confirmation.
@@ -1021,6 +1042,7 @@ fn new_pane(
         cwd_host: None,
         mark: None,
         desktop: None,
+        no_broadcast: false,
     }
 }
 
@@ -1145,6 +1167,18 @@ fn build_menu() -> Result<HMENU> {
             window,
             cmd::JOIN_TAB,
             "&Join tab into the tab before it\tCtrl+Shift+J",
+        )?;
+        separator(window)?;
+        item(
+            window,
+            cmd::BROADCAST_TAB,
+            "&Broadcast input to this tab's panes\tCtrl+Shift+B",
+        )?;
+        item(window, cmd::BROADCAST_ALL, "Broadcast input to &all tabs")?;
+        item(
+            window,
+            cmd::BROADCAST_SKIP,
+            "Leave this pane &out of broadcast",
         )?;
         separator(window)?;
         item(window, cmd::NEXT_TAB, "&Next tab\tCtrl+Tab")?;
@@ -1784,9 +1818,14 @@ impl Window {
         } else {
             ""
         };
+        let broadcast = match self.broadcast {
+            broadcast::Scope::Off => "",
+            broadcast::Scope::Tab => " (broadcast to tab)",
+            broadcast::Scope::All => " (broadcast to all tabs)",
+        };
         match label {
             Some(l) if l != "new tab" => {
-                self.set_title_text(&format!("{l}{legacy}{badge} - {APP_NAME}"));
+                self.set_title_text(&format!("{l}{legacy}{badge}{broadcast} - {APP_NAME}"));
             }
             _ => self.set_title_text(APP_NAME),
         }
@@ -2908,6 +2947,61 @@ impl Window {
         }
     }
 
+    /// Whether pane `id` passes typing straight to its host, so it may
+    /// send or receive broadcast input. Prompts and ended sessions do not.
+    fn takes_broadcast(&self, id: PaneId) -> bool {
+        let Some(p) = self.panes.get(&id) else {
+            return false;
+        };
+        if p.desktop.is_some() {
+            return false;
+        }
+        match &p.host {
+            Host::Local {
+                shell: Some(_),
+                exited: false,
+            }
+            | Host::Tmux { .. } => true,
+            Host::Ssh(s) => s.state() == State::Connected && !s.prompt_active(),
+            _ => false,
+        }
+    }
+
+    /// The other panes that get what is typed in pane `id`.
+    fn broadcast_targets(&self, id: PaneId) -> Vec<PaneId> {
+        if self.broadcast == broadcast::Scope::Off {
+            return Vec::new();
+        }
+        broadcast::targets(
+            self.broadcast,
+            id,
+            &self.visible_ids(),
+            &self.ws.all_panes(),
+            |p| self.panes.get(&p).is_none_or(|p| p.no_broadcast),
+            |p| self.takes_broadcast(p),
+        )
+    }
+
+    /// Sends a key, character or paste to each of `targets`, encoded by
+    /// that pane's own terminal: its cursor-key mode, bracketed paste and
+    /// keypad mode can differ from the focused pane's.
+    fn send_typed(&mut self, targets: &[PaneId], typed: &Typed) {
+        for &id in targets {
+            let Some(p) = self.panes.get_mut(&id) else {
+                continue;
+            };
+            let bytes = match typed {
+                Typed::Char(ch, alt) => Some(p.term.text(*ch, *alt)),
+                Typed::Key(key, mods) => p.term.key(*key, *mods),
+                Typed::Bytes(b) => Some(b.clone()),
+                Typed::Paste(text) => Some(p.term.paste(text).bytes),
+            };
+            if let Some(bytes) = bytes {
+                self.input(id, bytes);
+            }
+        }
+    }
+
     /// Pastes into a local prompt; `false` if no prompt is open and the
     /// paste goes to the host.
     fn paste_local(&mut self, id: PaneId, text: &str) -> bool {
@@ -3480,7 +3574,18 @@ impl Window {
             out.push((pixel(d.rect), line));
         }
         let split = tab.root.panes().len() > 1;
-        if split
+        let receivers = self.broadcast_targets(tab.focus);
+        if !receivers.is_empty() {
+            // Every pane that gets the typing, the focused one too, is
+            // framed in amber while broadcast is on.
+            for id in std::iter::once(tab.focus).chain(receivers) {
+                if let Some(p) = self.panes.get(&id)
+                    && self.is_visible(id)
+                {
+                    frame(p.rect, g, BROADCAST_FRAME, &mut out);
+                }
+            }
+        } else if split
             && !self.side.focused
             && let Some(p) = self.panes.get(&tab.focus)
         {
@@ -3719,7 +3824,10 @@ impl Window {
             return;
         }
         let bytes = p.term.text(ch, alt);
+        // Who else gets it is decided first: the key may end a prompt.
+        let targets = self.broadcast_targets(id);
         self.input(id, bytes);
+        self.send_typed(&targets, &Typed::Char(ch, alt));
     }
 
     /// Handles a key-down: window shortcuts first, then the side pane or
@@ -3755,9 +3863,14 @@ impl Window {
         }
         if let Some(key) = terminal_key(vk) {
             drop_pending_char(self.hwnd);
+            let targets = self.broadcast_targets(id);
+            let Some(p) = self.panes.get_mut(&id) else {
+                return KeyOutcome::Handled;
+            };
             if let Some(bytes) = p.term.key(key, mods) {
                 self.input(id, bytes);
             }
+            self.send_typed(&targets, &Typed::Key(key, mods));
             return KeyOutcome::Handled;
         }
         // Control codes that have no character on most layouts. AltGr
@@ -3772,7 +3885,9 @@ impl Window {
             };
             if let Some(code) = code {
                 drop_pending_char(self.hwnd);
+                let targets = self.broadcast_targets(id);
                 self.input(id, vec![code]);
+                self.send_typed(&targets, &Typed::Bytes(vec![code]));
                 return KeyOutcome::Handled;
             }
         }
@@ -5340,6 +5455,25 @@ impl Window {
             }
             cmd::LOG_FOLDER => return Some(Command::OpenFolder(log_dir())),
             cmd::LOG_VERIFY => return Some(Command::VerifyLog),
+            cmd::BROADCAST_TAB | cmd::BROADCAST_ALL => {
+                let wanted = if id == cmd::BROADCAST_TAB {
+                    broadcast::Scope::Tab
+                } else {
+                    broadcast::Scope::All
+                };
+                self.broadcast = self.broadcast.toggle(wanted);
+                self.update_menu_checks();
+                self.update_title();
+                self.refresh_chrome();
+            }
+            cmd::BROADCAST_SKIP => {
+                let pane = self.focused_id();
+                if let Some(p) = self.panes.get_mut(&pane) {
+                    p.no_broadcast = !p.no_broadcast;
+                }
+                self.update_menu_checks();
+                self.refresh_chrome();
+            }
             cmd::ZOOM_IN | cmd::ZOOM_OUT | cmd::ZOOM_RESET => {
                 let font = self.panes.get(&pane)?.font.clone();
                 let font = match id {
@@ -5493,6 +5627,9 @@ impl Window {
                 (cmd::SIDE_RIGHT, s.side_pane_right),
                 (cmd::TAB_STRIP, s.tab_strip),
                 (cmd::TMUX_LAYOUT, own_layout),
+                (cmd::BROADCAST_TAB, self.broadcast == broadcast::Scope::Tab),
+                (cmd::BROADCAST_ALL, self.broadcast == broadcast::Scope::All),
+                (cmd::BROADCAST_SKIP, p.is_some_and(|p| p.no_broadcast)),
             ] {
                 CheckMenuItem(self.menu, id, (MF_BYCOMMAND | check(on)).0);
             }
@@ -5943,6 +6080,7 @@ fn shortcut(vk: VIRTUAL_KEY, m: Mods, tabs: bool, split: bool) -> Option<u32> {
             v if v == key(b'P') && m.shift => Some(cmd::FORWARDS),
             v if v == key(b'D') && m.shift => Some(cmd::DESKTOP),
             v if v == key(b'U') && m.shift => Some(cmd::UPLOAD),
+            v if v == key(b'B') && m.shift => Some(cmd::BROADCAST_TAB),
             VK_INSERT if !m.shift => Some(cmd::COPY),
             VK_HOME if m.shift => Some(cmd::SCROLL_TOP),
             VK_END if m.shift => Some(cmd::SCROLL_BOTTOM),
@@ -6391,11 +6529,22 @@ fn run_command(hwnd: HWND, command: Command) {
             else {
                 return;
             };
-            if paste.needs_confirmation() {
+            let targets = with_window(|w| w.broadcast_targets(id)).unwrap_or_default();
+            let others = if targets.is_empty() {
+                String::new()
+            } else {
+                format!(
+                    "\n\nBroadcast input is on: it goes to {} other pane{} too.",
+                    targets.len(),
+                    plural(targets.len())
+                )
+            };
+            if paste.needs_confirmation() || (!targets.is_empty() && paste.line_breaks > 0) {
                 let lines = paste.line_breaks;
                 let text = format!(
                     "The text you are pasting contains {lines} line break{s}. Each one acts as \
-                     Enter, so a shell runs every line as soon as it arrives.\n\n{}\n\nPaste it?",
+                     Enter, so a shell runs every line as soon as it arrives.{others}\n\n{}\n\n\
+                     Paste it?",
                     clipboard_preview(&text, PREVIEW_CHARS),
                     s = plural(lines),
                 );
@@ -6404,7 +6553,10 @@ fn run_command(hwnd: HWND, command: Command) {
                     return;
                 }
             }
-            with_window(|w| w.input(id, paste.bytes));
+            with_window(|w| {
+                w.input(id, paste.bytes);
+                w.send_typed(&targets, &Typed::Paste(text));
+            });
         }
         Command::ClipboardWrite(text) => {
             let prompt = format!(
@@ -6564,7 +6716,11 @@ fn run_command(hwnd: HWND, command: Command) {
         Command::VerifyLog => {
             if let Some(path) = pick_file(hwnd, w!("Check a log for changes"), &log_dir()) {
                 let (text, ok) = check_log(&path);
-                let icon = if ok { MB_ICONINFORMATION } else { MB_ICONWARNING };
+                let icon = if ok {
+                    MB_ICONINFORMATION
+                } else {
+                    MB_ICONWARNING
+                };
                 dialog(hwnd, &text, MB_OK | icon);
             }
         }

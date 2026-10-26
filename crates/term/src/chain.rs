@@ -121,8 +121,7 @@ impl<W: Write> Chained<W> {
     pub(crate) fn maybe_seal(&mut self) -> io::Result<()> {
         let unsealed = self.written - self.sealed;
         if unsealed > 0
-            && (unsealed >= SEAL_BYTES
-                || self.last_seal.elapsed().as_secs() >= SEAL_INTERVAL_SECS)
+            && (unsealed >= SEAL_BYTES || self.last_seal.elapsed().as_secs() >= SEAL_INTERVAL_SECS)
         {
             self.record("seal")?;
         }
@@ -497,7 +496,10 @@ mod tests {
         let (log, chain, head) = chained(&[b"hello\r\n"], false);
         let index = index_line("", "a.log", log.len() as u64, &head);
         let ok = report("a.log", &log, Some(&chain), Some(&index));
-        assert!(ok.contains("is intact") && ok.contains("index agrees"), "{ok}");
+        assert!(
+            ok.contains("is intact") && ok.contains("index agrees"),
+            "{ok}"
+        );
         // A rewritten log with a fresh chain still disagrees with the index.
         let (log2, chain2, _) = chained(&[b"HELLO\r\n"], false);
         let bad = report("a.log", &log2, Some(&chain2), Some(&index));
