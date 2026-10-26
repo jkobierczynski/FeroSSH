@@ -5,14 +5,15 @@
 //! Site names and text values are `%XX`-escaped, folders are separated by
 //! `/`. Only SFTP and SCP sites are imported: FTP, WebDAV and S3 have no
 //! SSH login. Workspaces and site shortcuts are skipped. Passwords are
-//! never read, only noticed.
+//! never read, only noticed. A site's SSH tunnel becomes its jump host
+//! (`ProxyJump`).
 
-use crate::import::{Session, Value, decode};
+use crate::import::{Session, Value, clean, decode};
 use crate::ssh_config::parse_destination;
 
 /// The values FeroSSH reads from each site. The password values are only
 /// checked for being there.
-pub const VALUES: [&str; 12] = [
+pub const VALUES: [&str; 14] = [
     "HostName",
     "UserName",
     "PortNumber",
@@ -21,6 +22,8 @@ pub const VALUES: [&str; 12] = [
     "Tunnel",
     "TunnelHostName",
     "TunnelPortNumber",
+    "TunnelUserName",
+    "TunnelPublicKeyFile",
     "IsWorkspace",
     "Link",
     "Password",
@@ -65,9 +68,28 @@ pub fn session(raw_name: &str, get: impl Fn(&str) -> Option<Value>) -> Option<Se
     if number("Tunnel").is_some_and(|t| t != 0)
         && let Some(via) = text("TunnelHostName")
     {
-        let via: String = via.chars().filter(|c| !c.is_control()).take(100).collect();
-        s.notes
-            .push(format!("its tunnel through {via} is not imported"));
+        let mut jump = via.trim().to_owned();
+        if let Some(user) = text("TunnelUserName") {
+            jump = format!("{}@{jump}", user.trim());
+        }
+        if let Some(port) = number("TunnelPortNumber").filter(|&p| p != 0 && p != 22) {
+            jump = format!("{jump}:{port}");
+        }
+        if crate::saved::valid_proxy_jump(&jump) {
+            s.host.proxy_jump = Some(jump);
+            if let Some(key) = text("TunnelPublicKeyFile") {
+                s.notes.push(format!(
+                    "its tunnel's key file {} is not imported; the jump host uses its own \
+                     settings or the default keys",
+                    clean(&key)
+                ));
+            }
+        } else {
+            s.notes.push(format!(
+                "its tunnel through {} is not imported",
+                clean(&via)
+            ));
+        }
     }
     Some(s)
 }
@@ -143,6 +165,8 @@ PublicKeyFile=C:%5CKeys%5Cweb%20key.ppk\r
 Password=A35C755E6D\r
 Tunnel=1\r
 TunnelHostName=bastion.example.org\r
+TunnelUserName=jump\r
+TunnelPortNumber=2222\r
 \r
 [Sessions\\ftp]\r
 HostName=ftp.example.org\r
@@ -175,9 +199,10 @@ HostName=-oProxyCommand=calc\r
             Some(r"C:\Keys\web key.ppk")
         );
         assert!(web.had_password);
+        assert!(web.notes.is_empty(), "{:?}", web.notes);
         assert_eq!(
-            web.notes,
-            ["its tunnel through bastion.example.org is not imported"]
+            web.host.proxy_jump.as_deref(),
+            Some("jump@bastion.example.org:2222")
         );
         assert_eq!(s[1].host.user.as_deref(), Some("root"));
         assert!(!s[1].had_password);
@@ -190,6 +215,28 @@ HostName=-oProxyCommand=calc\r
         assert_eq!(
             back[0].identity_file.as_deref(),
             Some(r"C:\Keys\web key.ppk")
+        );
+        assert_eq!(
+            ssh_config::resolve(&text, "Prod-web").proxy,
+            Some(ssh_config::Proxy::Jump(vec![
+                "jump@bastion.example.org:2222".into()
+            ]))
+        );
+    }
+
+    #[test]
+    fn a_tunnel_that_is_no_host_stays_a_note() {
+        let get = |k: &str| match k {
+            "HostName" => Some(Value::Text("files.lan".into())),
+            "Tunnel" => Some(Value::Number(1)),
+            "TunnelHostName" => Some(Value::Text("-oProxyCommand=calc".into())),
+            _ => None,
+        };
+        let s = session("files", get).unwrap();
+        assert_eq!(s.host.proxy_jump, None);
+        assert_eq!(
+            s.notes,
+            ["its tunnel through -oProxyCommand=calc is not imported"]
         );
     }
 

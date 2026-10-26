@@ -101,13 +101,14 @@ use crate::layout::{self, Axis, Closed, Dir, Drop, PaneId, Rect, Workspace};
 use crate::link::{Link, LinkEvent};
 use crate::look;
 use crate::pattern;
+use crate::proxycmd::ProxyRun;
 use crate::pwcommand;
 use crate::sandbox;
 use crate::scrollmark;
 use crate::serial_port::{Output as SerialOutput, SerialPort};
 use crate::session_form::{self, FormAction, Hints, SessionForm, Source, Values};
 use crate::sessions::{HostItem, SessionList, SideAction, SideKey};
-use crate::ssh::{Effect, Env, SshSession, State, Target};
+use crate::ssh::{Effect, Env, ProxyCommand, SshSession, State, Target};
 use crate::tabstrip::{self, Forwarding, Health, Hit, Palette, StripLayout, TabLabel};
 use crate::tmux::{self, Mode as TmuxMode, Tmux};
 use ferossh_tmuxcc::saved as tmux_saved;
@@ -548,6 +549,11 @@ struct Window {
     /// Workers whose connection nothing uses any more, with when that was;
     /// they end after [`RETIRE_GRACE`].
     retiring: Vec<(WorkerConn, Instant)>,
+    /// The jump hosts' connections each connection goes through: their
+    /// workers run as long as it is in use.
+    via: HashMap<ChannelId, Vec<ChannelId>>,
+    /// The `ProxyCommand` each connection runs over, by the connection.
+    proxies: HashMap<ChannelId, ProxyRun>,
     broker: Option<Broker>,
     /// The channel of each job handed to the broker, oldest first. The
     /// broker answers in order, so each reply goes to the front one.
@@ -782,6 +788,10 @@ fn host_items(env: &Env, settings: &Settings) -> Vec<HostItem> {
                     if t.port != 22 {
                         d.push_str(&format!(":{}", t.port));
                     }
+                    // The last jump host is the one that reaches it.
+                    if let Some(j) = t.jumps.last() {
+                        d.push_str(&format!(" via {}", j.alias));
+                    }
                     d
                 })
                 .unwrap_or_default();
@@ -817,6 +827,31 @@ fn command_approved(line: &str) -> bool {
 
 fn approve_command(line: &str) {
     let path = approved_commands_path();
+    let mut text = std::fs::read_to_string(&path).unwrap_or_default();
+    if !text.is_empty() && !text.ends_with('\n') {
+        text.push('\n');
+    }
+    text.push_str(line.trim());
+    text.push('\n');
+    let _ = write_app_file(&path, &text);
+}
+
+/// The `ProxyCommand` lines the user allowed, one per line, beside the
+/// password commands: on this PC only.
+fn approved_proxies_path() -> PathBuf {
+    std::env::var_os("LOCALAPPDATA")
+        .map_or_else(|| PathBuf::from("."), PathBuf::from)
+        .join("FeroSSH")
+        .join("approved-proxy-commands.txt")
+}
+
+fn proxy_approved(line: &str) -> bool {
+    std::fs::read_to_string(approved_proxies_path())
+        .is_ok_and(|t| t.lines().any(|l| l == line.trim()))
+}
+
+fn approve_proxy(line: &str) {
+    let path = approved_proxies_path();
     let mut text = std::fs::read_to_string(&path).unwrap_or_default();
     if !text.is_empty() && !text.ends_with('\n') {
         text.push('\n');
@@ -1006,6 +1041,8 @@ fn create_and_run(launch: Launch, theme: Option<String>) -> Result<()> {
                 sandbox: !matches!(launch, Launch::Ssh { sandbox: false, .. }),
                 workers: HashMap::new(),
                 retiring: Vec::new(),
+                via: HashMap::new(),
+                proxies: HashMap::new(),
                 broker: None,
                 broker_jobs: VecDeque::new(),
                 next_channel: 1,
@@ -1509,9 +1546,11 @@ impl Window {
         channel
     }
 
+    /// The pane whose SSH session has `channel`: its shell, or a jump
+    /// host's login or stream on the way.
     fn pane_of_channel(&self, channel: ChannelId) -> Option<PaneId> {
         self.panes.values().find_map(|p| match &p.host {
-            Host::Ssh(s) if s.channel == channel => Some(p.id),
+            Host::Ssh(s) if s.owns(channel) => Some(p.id),
             _ => None,
         })
     }
@@ -2033,9 +2072,11 @@ impl Window {
             if let Some(w) = self.workers.remove(&c) {
                 self.retiring.push((w, now));
             }
+            self.proxies.remove(&c);
         }
         let workers = &self.workers;
         self.sftp_routes.retain(|_, c| workers.contains_key(c));
+        self.via.retain(|c, _| workers.contains_key(c));
         // SAFETY: our window and timer.
         unsafe {
             SetTimer(
@@ -2047,8 +2088,17 @@ impl Window {
         }
     }
 
-    /// Whether anything still needs the SSH connection `connection`.
+    /// Whether anything still needs the SSH connection `connection`, or a
+    /// connection that goes through it.
     fn connection_in_use(&self, connection: ChannelId) -> bool {
+        self.used_directly(connection)
+            || self
+                .via
+                .iter()
+                .any(|(c, hops)| hops.contains(&connection) && self.used_directly(*c))
+    }
+
+    fn used_directly(&self, connection: ChannelId) -> bool {
         self.panes.values().any(|p| match &p.host {
             Host::Ssh(s) => {
                 s.connection == connection
@@ -2591,15 +2641,14 @@ impl Window {
             return;
         }
         let env = ssh_env();
-        let Some(target) = Target::resolve(destination, &env) else {
-            let text = format!(
-                "\x1b[0;31m\"{}\" is not a host name.\x1b[0m\r\n",
-                crate::ssh::sanitize(destination)
-            );
-            self.end_host(id);
-            self.show(id, &text);
-            self.ask_destination(id);
-            return;
+        let target = match Target::resolve_route(destination, &env) {
+            Ok(t) => t,
+            Err(why) => {
+                self.end_host(id);
+                self.show(id, &format!("\x1b[0;31m{why}\x1b[0m\r\n"));
+                self.ask_destination(id);
+                return;
+            }
         };
         self.connect_to(id, target, &env);
     }
@@ -2691,6 +2740,27 @@ impl Window {
             .map(|p| p.password.clone())
             .unwrap_or_default();
         let mut session = SshSession::new(channel, target, env.known_hosts());
+        if shared.is_none() {
+            // Each jump host logs in in a worker of its own.
+            session = session.with_route(&mut || self.new_channel());
+            let hops = session.hop_connections();
+            for &hop in &hops {
+                if !self.ensure_worker(id, hop) {
+                    self.refresh(id);
+                    return;
+                }
+            }
+            if !hops.is_empty() {
+                self.via.insert(channel, hops);
+            }
+            for hop in session.hops_mut() {
+                let profile = self.settings.profile(&hop.target.alias);
+                let source = profile.map(|p| p.password.clone()).unwrap_or_default();
+                hop.legacy = profile.is_some_and(|p| p.legacy_algorithms);
+                hop.password_source = source != PasswordSource::Ask;
+                hop.remember_password = source == PasswordSource::Windows;
+            }
+        }
         session.x11 = x11;
         session.legacy = legacy;
         session.password_source = source != PasswordSource::Ask;
@@ -2758,11 +2828,41 @@ impl Window {
         for effect in effects {
             match effect {
                 Effect::Send(msg) => {
-                    // Only to the worker of the pane's own connection.
+                    // Only to the worker of the login the channel is on.
                     if let Some(Host::Ssh(s)) = self.panes.get(&id).map(|p| &p.host)
-                        && let Some(w) = self.workers.get(&s.connection)
+                        && let Some(w) = s
+                            .worker_for(msg.channel())
+                            .and_then(|c| self.workers.get(&c))
                     {
                         w.link.send(msg);
+                    }
+                }
+                Effect::Tunnel { from, to, channel } => {
+                    if let (Some(a), Some(b)) = (self.workers.get(&from), self.workers.get(&to)) {
+                        a.link.relay_with(&b.link, channel);
+                    }
+                }
+                Effect::ProxyCommand {
+                    connection,
+                    tunnel,
+                    command,
+                } => {
+                    // The worker's first bytes wait for the command, which
+                    // may start only once the user allowed it.
+                    let (sink, input) = crate::proxycmd::input();
+                    if let Some(w) = self.workers.get(&connection) {
+                        w.link.relays().insert(tunnel, sink);
+                    }
+                    if proxy_approved(&command.line) {
+                        self.run_proxy(id, connection, tunnel, &command, input);
+                    } else {
+                        self.queued.push(Command::ApproveProxy {
+                            pane: id,
+                            connection,
+                            tunnel,
+                            command,
+                            input,
+                        });
                     }
                 }
                 Effect::Show(text) => self.show(id, &text),
@@ -2778,7 +2878,12 @@ impl Window {
                     }
                 }
                 Effect::FetchPassword => self.fetch_password(id),
-                Effect::StorePassword(password) => self.store_password(id, &password),
+                Effect::StorePassword {
+                    user,
+                    host,
+                    port,
+                    password,
+                } => self.store_password(id, (&user, &host, port), &password),
                 Effect::Connected => {
                     self.start_log(id);
                     self.sftp_connected(id);
@@ -2788,6 +2893,7 @@ impl Window {
                     self.desktop_after_login(id);
                 }
                 Effect::Ended => {
+                    self.proxy_errors(id);
                     self.pending_desktops.remove(&id);
                     self.tmux_lost(id);
                     self.stop_log(id);
@@ -2799,12 +2905,84 @@ impl Window {
         }
     }
 
+    /// Starts `command` for the login of connection `connection` (in pane
+    /// `id`), whose SSH connection runs over stream `tunnel`; `input` is
+    /// what the worker sends on it.
+    fn run_proxy(
+        &mut self,
+        id: PaneId,
+        connection: ChannelId,
+        tunnel: ChannelId,
+        command: &ProxyCommand,
+        input: std::sync::mpsc::Receiver<Message>,
+    ) {
+        let Some(w) = self.workers.get(&connection) else {
+            return;
+        };
+        match ProxyRun::spawn(
+            &command.program,
+            &command.args,
+            tunnel,
+            input,
+            w.link.sender(),
+        ) {
+            Ok(run) => {
+                self.proxies.insert(connection, run);
+            }
+            Err(e) => {
+                let why = format!(
+                    "The ProxyCommand {} did not start ({e}). Is it installed and on PATH?",
+                    command.program
+                );
+                self.proxy_refused(id, connection, tunnel, &why);
+            }
+        }
+    }
+
+    /// No `ProxyCommand` for stream `tunnel`: says why, and closes the
+    /// stream, which ends the login waiting on it.
+    fn proxy_refused(&mut self, id: PaneId, connection: ChannelId, tunnel: ChannelId, why: &str) {
+        self.show(
+            id,
+            &format!("\x1b[0;31m{}\x1b[0m\r\n", crate::ssh::sanitize(why)),
+        );
+        if let Some(w) = self.workers.get(&connection) {
+            w.link.relays().remove(tunnel);
+            w.link.send(Message::Close { channel: tunnel });
+        }
+        self.refresh(id);
+    }
+
+    /// What the `ProxyCommand` of pane `id`'s connection printed on its
+    /// error output, once the login ended.
+    fn proxy_errors(&mut self, id: PaneId) {
+        let Some(Host::Ssh(s)) = self.panes.get(&id).map(|p| &p.host) else {
+            return;
+        };
+        let connections: Vec<ChannelId> = std::iter::once(s.connection)
+            .chain(s.hop_connections())
+            .collect();
+        let said: Vec<String> = connections
+            .iter()
+            .filter_map(|c| self.proxies.get(c))
+            .map(ProxyRun::errors)
+            .filter(|e| !e.is_empty())
+            .collect();
+        for text in said {
+            self.show(
+                id,
+                &format!("\x1b[0;90mThe ProxyCommand said: {text}\x1b[0m\r\n"),
+            );
+        }
+    }
+
     /// Gets the login password of SSH pane `id` from its password source.
     fn fetch_password(&mut self, id: PaneId) {
         let Some(Host::Ssh(s)) = self.panes.get(&id).map(|p| &p.host) else {
             return;
         };
-        let t = &s.target;
+        // The login asking: a jump host's, or the pane's host's.
+        let t = s.login_target();
         let source = self
             .settings
             .profile(&t.alias)
@@ -2843,7 +3021,7 @@ impl Window {
         let Some(Host::Ssh(s)) = self.panes.get(&id).map(|p| &p.host) else {
             return;
         };
-        let t = &s.target;
+        let t = s.login_target();
         let tokens = pw_source::Tokens {
             name: &t.alias,
             host: &t.hostname,
@@ -2911,20 +3089,19 @@ impl Window {
         self.refresh(id);
     }
 
-    /// Keeps the password that just worked for pane `id` in the Windows
+    /// Keeps the password that just worked for `user` at `host`:`port`
+    /// (pane `id`'s host, or a jump host on the way) in the Windows
     /// Credential Manager.
-    fn store_password(&mut self, id: PaneId, password: &ferossh_ipc::Secrets) {
-        let (Some(Host::Ssh(s)), Some(password)) =
-            (self.panes.get(&id).map(|p| &p.host), password.0.first())
-        else {
+    fn store_password(
+        &mut self,
+        id: PaneId,
+        (user, host, port): (&str, &str, u16),
+        password: &ferossh_ipc::Secrets,
+    ) {
+        let Some(password) = password.0.first() else {
             return;
         };
-        let t = &s.target;
-        let note = match credman::write(
-            &credman::target(&t.user, &t.hostname, t.port),
-            &t.user,
-            password,
-        ) {
+        let note = match credman::write(&credman::target(user, host, port), user, password) {
             Ok(()) => "Saved the password in the Windows Credential Manager.".to_owned(),
             Err(e) => e,
         };
@@ -3419,7 +3596,7 @@ impl Window {
                     return false;
                 };
                 let effects = match self.panes.get_mut(&id).map(|p| &mut p.host) {
-                    Some(Host::Ssh(session)) if session.connection == connection => {
+                    Some(Host::Ssh(session)) if session.worker_for(Some(c)) == Some(connection) => {
                         session.on_worker(msg)
                     }
                     _ => Vec::new(),
@@ -3431,6 +3608,7 @@ impl Window {
                 if let Some(w) = self.workers.remove(&connection) {
                     w.forwarder.worker_gone();
                 }
+                self.proxies.remove(&connection);
                 for remote in self.sftp.values_mut() {
                     if remote.connection() == Some(connection) {
                         remote.detach();
@@ -3440,16 +3618,17 @@ impl Window {
                 for id in ids {
                     let effects = match self.panes.get_mut(&id).map(|p| &mut p.host) {
                         Some(Host::Ssh(session))
-                            if session.connection == connection
-                                && matches!(
-                                    session.state(),
-                                    State::Connecting | State::Connected
-                                ) =>
+                            if matches!(session.state(), State::Connecting | State::Connected) =>
                         {
-                            session.on_worker(Message::Disconnected {
-                                channel: session.channel,
-                                reason: why.clone(),
-                            })
+                            // The login in that worker: the pane's own, or
+                            // a jump host's on the way.
+                            match session.login_on(connection) {
+                                Some(channel) => session.on_worker(Message::Disconnected {
+                                    channel,
+                                    reason: why.clone(),
+                                }),
+                                None => Vec::new(),
+                            }
                         }
                         _ => Vec::new(),
                     };
@@ -4430,6 +4609,11 @@ impl Window {
                                     &t.user,
                                     t.port,
                                     key.as_deref(),
+                                    &t.jumps
+                                        .iter()
+                                        .map(|j| j.alias.as_str())
+                                        .collect::<Vec<_>>()
+                                        .join(","),
                                     &t.forwards,
                                 )
                             }
@@ -4828,19 +5012,19 @@ impl Window {
     /// connection, a local shell, or the connect prompt.
     fn fill_like(&mut self, id: PaneId, from: PaneId) {
         enum Like {
-            Ssh(Target),
+            Ssh(Box<Target>),
             Local,
             Ask,
         }
         let from = self.host_pane(from);
         // A COM port opens once, so a split of a serial console asks.
         let like = match self.panes.get(&from).map(|p| &p.host) {
-            Some(Host::Ssh(s)) => Like::Ssh(s.target.clone()),
+            Some(Host::Ssh(s)) => Like::Ssh(Box::new(s.target.clone())),
             Some(Host::Local { .. }) => Like::Local,
             _ => Like::Ask,
         };
         match like {
-            Like::Ssh(target) => self.connect_to(id, target, &ssh_env()),
+            Like::Ssh(target) => self.connect_to(id, *target, &ssh_env()),
             Like::Local => self.start_shell(id),
             Like::Ask => self.ask_destination(id),
         }
@@ -6564,6 +6748,14 @@ enum Command {
         pane: PaneId,
         line: String,
     },
+    /// Ask before running a host's `ProxyCommand` for the first time.
+    ApproveProxy {
+        pane: PaneId,
+        connection: ChannelId,
+        tunnel: ChannelId,
+        command: ProxyCommand,
+        input: std::sync::mpsc::Receiver<Message>,
+    },
 }
 
 /// A modal message box; `None` if another one is already open.
@@ -7145,6 +7337,31 @@ fn run_command(hwnd: HWND, command: Command) {
                 }
             });
         }
+        Command::ApproveProxy {
+            pane,
+            connection,
+            tunnel,
+            command,
+            input,
+        } => {
+            let line: String = command.line.chars().filter(|c| !c.is_control()).collect();
+            let text = format!(
+                "The SSH config says to reach this host through a program (ProxyCommand):\n\n\
+                 {line}\n\nFeroSSH runs it with your rights, outside the sandbox, without a \
+                 shell or a window, and sends the connection through its input and output. \
+                 Only allow a program you know. Run it now and from now on?"
+            );
+            let yes =
+                dialog(hwnd, &text, MB_YESNO | MB_ICONQUESTION | MB_DEFBUTTON2) == Some(IDYES);
+            with_window(|w| {
+                if yes {
+                    approve_proxy(&command.line);
+                    w.run_proxy(pane, connection, tunnel, &command, input);
+                } else {
+                    w.proxy_refused(pane, connection, tunnel, "The ProxyCommand was not run.");
+                }
+            });
+        }
         Command::PickKey => {
             if let Some(path) = pick_key_file(hwnd) {
                 with_window(|w| {
@@ -7468,7 +7685,7 @@ fn replace_host_key(hwnd: HWND) {
                 let desc = ferossh_config::hostkey::describe(k)
                     .map(|d| format!("{} {}", d.kind, d.fingerprint))
                     .unwrap_or_default();
-                (id, s.target.hostname.clone(), desc)
+                (id, s.blocked_host().to_owned(), desc)
             }),
             _ => None,
         }

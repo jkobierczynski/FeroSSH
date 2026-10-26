@@ -7,9 +7,21 @@
 //! terminal pane itself, as OpenSSH does in a console, and typed into a
 //! local line editor that never reaches the host or the log.
 //!
+//! A host reached through jump hosts (`ProxyJump`) is a chain of logins,
+//! each in a worker of its own: every jump host logs in without a shell
+//! and its worker opens a `direct-tcpip` stream to the next hop, over
+//! which the next hop's worker runs its own SSH connection. The window
+//! only relays that stream's bytes ([`Effect::Tunnel`]), which are the
+//! next hop's encrypted connection: a jump host that took over its worker
+//! sees no more of the target than the jump host itself does. Each hop
+//! checks its own host key against known_hosts and signs its own login.
+//! A `ProxyCommand` is a local program whose input and output the window
+//! relays the same way ([`Effect::ProxyCommand`]).
+//!
 //! It only returns [`Effect`]s; the window carries them out. That keeps
 //! this logic platform-neutral and tested on any host.
 
+use std::cell::Cell;
 use std::path::PathBuf;
 
 use ferossh_auth::{Identity, Job, KeyFileSpec, Reply, SignError, Source, userauth};
@@ -59,6 +71,22 @@ pub struct Target {
     pub gateway_ports: bool,
     /// ConnectTimeout and ServerAlive*, over FeroSSH's defaults.
     pub timing: Timing,
+    /// The jump hosts to go through (`ProxyJump`), first first, nested
+    /// ones included; each without jumps of its own.
+    pub jumps: Vec<Target>,
+    /// The program that carries the connection to the first hop
+    /// (`ProxyCommand`): the first jump host, or this host without jumps.
+    pub proxy_command: Option<ProxyCommand>,
+}
+
+/// A `ProxyCommand` to run: never through a shell.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProxyCommand {
+    /// The line as the config has it, before the tokens are filled in:
+    /// what the user approves once.
+    pub line: String,
+    pub program: String,
+    pub args: Vec<String>,
 }
 
 /// The user's environment the target is resolved in.
@@ -81,6 +109,69 @@ impl Target {
     /// Resolves `[user@]host[:port]` with the config; `None` if it does not
     /// parse.
     pub fn resolve(typed: &str, env: &Env) -> Option<Self> {
+        Self::resolve_route(typed, env).ok()
+    }
+
+    /// Like [`Self::resolve`], and says what is wrong: a name that does
+    /// not parse, or jump hosts that loop or nest too deep.
+    pub fn resolve_route(typed: &str, env: &Env) -> Result<Self, String> {
+        Self::resolve_at(typed, env, 0)
+    }
+
+    /// `depth` counts the jump hosts already on the way here.
+    fn resolve_at(typed: &str, env: &Env, depth: usize) -> Result<Self, String> {
+        let mut target = Self::resolve_host(typed, env)
+            .ok_or_else(|| format!("\"{}\" is not a host name.", sanitize(typed)))?;
+        let includes = ssh_config::DirIncludes {
+            home: env.home.clone(),
+        };
+        let proxy = ssh_config::resolve_in(&env.config, &target.alias, &includes).proxy;
+        match proxy {
+            Some(ssh_config::Proxy::Jump(hops)) => {
+                for (i, hop) in hops.iter().enumerate() {
+                    if depth + target.jumps.len() >= ssh_config::MAX_HOPS {
+                        return Err(format!(
+                            "The jump hosts on the way to {} go more than {} deep; do they \
+                             loop through each other?",
+                            sanitize(typed),
+                            ssh_config::MAX_HOPS
+                        ));
+                    }
+                    // As in OpenSSH, only the first jump host's own
+                    // ProxyJump or ProxyCommand applies: it is reached as
+                    // a host of its own, the others through the one before.
+                    let mut hop = if i == 0 {
+                        Self::resolve_at(hop, env, depth + 1)?
+                    } else {
+                        Self::resolve_host(hop, env).ok_or_else(|| {
+                            format!("The jump host \"{}\" is not a host name.", sanitize(hop))
+                        })?
+                    };
+                    if i == 0 {
+                        target.proxy_command = hop.proxy_command.take();
+                        target.jumps.append(&mut hop.jumps);
+                    }
+                    target.jumps.push(hop);
+                }
+            }
+            Some(ssh_config::Proxy::Command(argv)) => {
+                let t = &target;
+                target.proxy_command =
+                    ssh_config::proxy_command(&argv, &t.hostname, t.port, &t.user, &t.alias).map(
+                        |(program, args)| ProxyCommand {
+                            line: argv.join(" "),
+                            program,
+                            args,
+                        },
+                    );
+            }
+            Some(ssh_config::Proxy::Direct) | None => {}
+        }
+        Ok(target)
+    }
+
+    /// The host itself, without the way there.
+    fn resolve_host(typed: &str, env: &Env) -> Option<Self> {
         let (user, alias, port) = ssh_config::parse_destination(typed)?;
         let includes = ssh_config::DirIncludes {
             home: env.home.clone(),
@@ -129,7 +220,21 @@ impl Target {
             hostname,
             user,
             key_files,
+            jumps: Vec::new(),
+            proxy_command: None,
         })
+    }
+
+    /// The way there, for the log and for telling routes apart: the jump
+    /// hosts' labels, or the command.
+    pub fn route(&self) -> Vec<String> {
+        let mut out: Vec<String> = self
+            .proxy_command
+            .iter()
+            .map(|c| format!("command {}", c.line))
+            .collect();
+        out.extend(self.jumps.iter().map(Target::label));
+        out
     }
 
     /// `user@host` or `user@host:port`, for titles and the log.
@@ -155,12 +260,36 @@ pub enum Effect {
     Broker(Job),
     /// Logged in: the shell is open.
     Connected,
-    /// Get the login password from the session's password source, then
-    /// call [`SshSession::password_fetched`].
+    /// Get the login password from the password source of the host
+    /// [`SshSession::login_target`] names, then call
+    /// [`SshSession::password_fetched`].
     FetchPassword,
     /// The password typed for this login worked: keep it in the Windows
-    /// Credential Manager. One string; `Secrets` keeps it out of `Debug`.
-    StorePassword(Secrets),
+    /// Credential Manager for `user` at `host`:`port`. One string;
+    /// `Secrets` keeps it out of `Debug`.
+    StorePassword {
+        user: String,
+        host: String,
+        port: u16,
+        password: Secrets,
+    },
+    /// Relay stream `channel` between the worker of connection `from`
+    /// (a jump host's, which opens it) and that of `to` (the next hop's,
+    /// whose SSH connection runs over it), before the messages that open
+    /// it are sent.
+    Tunnel {
+        from: ChannelId,
+        to: ChannelId,
+        channel: ChannelId,
+    },
+    /// Run `command` and relay its input and output as stream `tunnel` of
+    /// the worker of connection `connection`, whose SSH connection runs
+    /// over it. Without that, close the stream: the login then ends.
+    ProxyCommand {
+        connection: ChannelId,
+        tunnel: ChannelId,
+        command: ProxyCommand,
+    },
     /// The connection is gone.
     Ended,
 }
@@ -239,6 +368,31 @@ pub struct SshSession {
     typed_password: Option<Zeroizing<String>>,
     /// Where this login is, for checking that the worker asks in turn.
     login: Login,
+    /// The jump hosts on the way, first first, each logging in with a
+    /// session and a worker of its own.
+    hops: Vec<Hop>,
+    /// The stream this login's connection runs over, instead of TCP: the
+    /// previous hop's, or a `ProxyCommand`'s.
+    tunnel: Option<ChannelId>,
+    /// The `ProxyCommand` this login's stream comes from.
+    proxy: Option<ProxyCommand>,
+    /// A jump host's login: no shell, only the next hop's stream.
+    jump: bool,
+    /// The pane's size, for a login that starts after its jump hosts'.
+    size: Cell<(u16, u16)>,
+    /// The end of a login whose stream the jump host before it has not
+    /// yet said is gone: held until it says why, so the reason shows
+    /// first. The two workers' messages come in any order.
+    held: Option<Message>,
+}
+
+/// A jump host on the way to the target: its login, and the stream its
+/// worker opens to the next hop once logged in.
+struct Hop {
+    session: SshSession,
+    tunnel: ChannelId,
+    /// The jump host's worker said the stream ended.
+    tunnel_ended: bool,
 }
 
 /// How far a login has come. The worker may only ask for what the honest
@@ -256,6 +410,8 @@ struct Login {
     host_trusted: bool,
     /// Signatures asked for so far.
     signatures: u32,
+    /// The login worked.
+    done: bool,
 }
 
 /// Signatures one login may ask for: one per key tried, with room for
@@ -337,7 +493,118 @@ impl SshSession {
             fetching: None,
             typed_password: None,
             login: Login::default(),
+            hops: Vec::new(),
+            tunnel: None,
+            proxy: None,
+            jump: false,
+            size: Cell::new((80, 24)),
+            held: None,
         }
+    }
+
+    /// Sets up the logins on the way to the target from its jump hosts
+    /// and `ProxyCommand`, with channel ids from `next`: each jump host
+    /// logs in on a channel (and so in a worker) of its own.
+    pub fn with_route(mut self, next: &mut dyn FnMut() -> ChannelId) -> Self {
+        for target in self.target.jumps.clone() {
+            let mut session = SshSession::new(next(), target, self.known_hosts.clone());
+            session.jump = true;
+            session.tunnel = self.hops.last().map(|h| h.tunnel);
+            self.hops.push(Hop {
+                session,
+                tunnel: next(),
+                tunnel_ended: false,
+            });
+        }
+        self.tunnel = self.hops.last().map(|h| h.tunnel);
+        if let Some(command) = self.target.proxy_command.clone() {
+            let tunnel = Some(next());
+            let first = match self.hops.first_mut() {
+                Some(h) => &mut h.session,
+                None => &mut self,
+            };
+            first.proxy = Some(command);
+            first.tunnel = tunnel;
+        }
+        self
+    }
+
+    /// The jump hosts' logins, to give them their profiles' settings.
+    pub fn hops_mut(&mut self) -> impl Iterator<Item = &mut SshSession> {
+        self.hops.iter_mut().map(|h| &mut h.session)
+    }
+
+    /// The connections of the jump hosts' logins, each needing a worker.
+    pub fn hop_connections(&self) -> Vec<ChannelId> {
+        self.hops.iter().map(|h| h.session.channel).collect()
+    }
+
+    /// Whether `channel` is this session's: its shell, a jump host's
+    /// login, or a jump host's stream to the next hop.
+    pub fn owns(&self, channel: ChannelId) -> bool {
+        channel == self.channel
+            || self
+                .hops
+                .iter()
+                .any(|h| h.session.channel == channel || h.tunnel == channel)
+    }
+
+    /// The connection whose worker sends and receives the messages of
+    /// `channel`; `None` for a channel not this session's.
+    pub fn worker_for(&self, channel: Option<ChannelId>) -> Option<ChannelId> {
+        let channel = channel?;
+        if channel == self.channel {
+            return Some(self.connection);
+        }
+        self.hops
+            .iter()
+            .find(|h| h.session.channel == channel || h.tunnel == channel)
+            .map(|h| h.session.channel)
+    }
+
+    /// The login that runs in the worker of `connection`, if one does.
+    pub fn login_on(&self, connection: ChannelId) -> Option<ChannelId> {
+        if connection == self.connection {
+            return Some(self.channel);
+        }
+        self.hops
+            .iter()
+            .find(|h| h.session.channel == connection)
+            .map(|h| h.session.channel)
+    }
+
+    /// The jump host logging in now, while one is.
+    fn active_hop(&self) -> Option<usize> {
+        if self.state != State::Connecting {
+            return None;
+        }
+        self.hops
+            .iter()
+            .position(|h| h.session.state != State::Connected)
+    }
+
+    /// The host whose login asks the questions now: a jump host's, or
+    /// this one's. Its profile picks the password source.
+    pub fn login_target(&self) -> &Target {
+        match self.active_hop().and_then(|i| self.hops.get(i)) {
+            Some(h) => &h.session.target,
+            None => &self.target,
+        }
+    }
+
+    /// The jump host whose changed host key stopped the login, else this
+    /// session.
+    fn blocked(&self) -> &SshSession {
+        self.hops
+            .iter()
+            .map(|h| &h.session)
+            .find(|s| s.state == State::Blocked)
+            .unwrap_or(self)
+    }
+
+    /// The host whose changed host key blocked the connection.
+    pub fn blocked_host(&self) -> &str {
+        &self.blocked().target.hostname
     }
 
     /// Whether the connection uses one of the opt-in legacy algorithms,
@@ -351,50 +618,234 @@ impl SshSession {
     }
 
     pub fn prompt_active(&self) -> bool {
-        self.prompt.is_some()
+        match self.active_hop().and_then(|i| self.hops.get(i)) {
+            Some(h) => h.session.prompt_active(),
+            None => self.prompt.is_some(),
+        }
     }
 
-    /// The host key that blocked the connection, if one did.
+    /// The host key that blocked the connection, if one did: this host's
+    /// or a jump host's.
     pub fn changed_key(&self) -> Option<&[u8]> {
-        self.changed_key.as_deref()
+        self.blocked().changed_key.as_deref()
     }
 
     fn known(&self) -> KnownHosts {
         KnownHosts::load(&self.known_hosts).unwrap_or_default()
     }
 
-    /// Starts connecting with a pane of `cols` x `rows`.
+    /// Starts connecting with a pane of `cols` x `rows`: the first jump
+    /// host's login, or this one.
     pub fn start(&mut self, cols: u16, rows: u16) -> Vec<Effect> {
+        self.size.set((cols, rows));
+        let Some(first) = self.hops.first_mut() else {
+            return self.begin(None);
+        };
+        let route: Vec<String> = self.target.jumps.iter().map(Target::label).collect();
+        let mut effects = vec![Effect::Show(dim(&sanitize(&format!(
+            "Connecting to {} through {}...",
+            self.target.label(),
+            route.join(", then ")
+        ))))];
+        effects.extend(first.session.begin(None));
+        effects
+    }
+
+    /// Starts this login; `via` names the jump host its stream comes from.
+    fn begin(&mut self, via: Option<&str>) -> Vec<Effect> {
         let t = &self.target;
         let known = self.known();
         let mut host_key_algs = known.key_types(&t.hostname, t.port);
         if known.has_authority(&t.hostname, t.port) {
             host_key_algs.push(crypto_policy::CERT_AUTHORITY.to_owned());
         }
-        let mut text = format!("Connecting to {}", t.label());
+        let mut text = format!(
+            "Connecting to {}{}",
+            if self.jump { "jump host " } else { "" },
+            t.label()
+        );
         if t.hostname != t.alias {
             text.push_str(&format!(" ({})", t.hostname));
+        }
+        match (via, &self.proxy) {
+            (Some(hop), _) => text.push_str(&format!(" through {hop}")),
+            (None, Some(c)) => text.push_str(&format!(" through the command {}", c.program)),
+            (None, None) => {}
         }
         text.push_str("...");
         self.login = Login {
             started: true,
             ..Login::default()
         };
-        vec![
-            Effect::Show(dim(&text)),
-            Effect::Send(Message::Connect {
+        let (cols, rows) = self.size.get();
+        let mut effects = vec![Effect::Show(dim(&sanitize(&text)))];
+        if let (Some(command), Some(tunnel)) = (&self.proxy, self.tunnel) {
+            effects.push(Effect::ProxyCommand {
+                connection: self.channel,
+                tunnel,
+                command: command.clone(),
+            });
+        }
+        effects.push(Effect::Send(Message::Connect {
+            channel: self.channel,
+            host: t.hostname.clone(),
+            port: t.port,
+            user: t.user.clone(),
+            cols,
+            rows,
+            host_key_algs,
+            x11: if self.jump { None } else { self.x11.clone() },
+            legacy: self.legacy,
+            timing: t.timing,
+            tunnel: self.tunnel,
+            shell: !self.jump,
+        }));
+        effects
+    }
+
+    /// What became of jump host `i`'s login: once in, its worker opens
+    /// the stream to the next hop and the next hop logs in over it; if it
+    /// fails, the whole connection does.
+    fn after_hop(&mut self, i: usize, effects: Vec<Effect>) -> Vec<Effect> {
+        let mut out = Vec::new();
+        for effect in effects {
+            match effect {
+                Effect::Connected => out.extend(self.next_hop(i)),
+                Effect::Ended => {
+                    // No word on its stream is coming any more.
+                    if let Some(h) = self.hops.get_mut(i) {
+                        h.tunnel_ended = true;
+                    }
+                    out.extend(self.hop_ended(i));
+                    out.extend(self.release());
+                }
+                other => out.push(other),
+            }
+        }
+        out
+    }
+
+    /// Jump host `i` is logged in: opens its stream to the next hop and
+    /// starts that hop's login over it.
+    fn next_hop(&mut self, i: usize) -> Vec<Effect> {
+        let Some(hop) = self.hops.get(i) else {
+            return Vec::new();
+        };
+        let (from, tunnel) = (hop.session.channel, hop.tunnel);
+        let via = hop.session.target.label();
+        let next = match self.hops.get_mut(i + 1) {
+            Some(h) => &mut h.session,
+            None => &mut *self,
+        };
+        let open = Message::ForwardOpen {
+            channel: tunnel,
+            connection: from,
+            target: Some((next.target.hostname.clone(), next.target.port)),
+            origin_host: "127.0.0.1".into(),
+            origin_port: 0,
+            // The stream holds the jump host's connection for as long as
+            // the next hop uses it.
+            keep: true,
+        };
+        let mut effects = vec![
+            Effect::Tunnel {
+                from,
+                to: next.channel,
+                channel: tunnel,
+            },
+            Effect::Send(open),
+        ];
+        effects.extend(next.begin(Some(&via)));
+        effects
+    }
+
+    /// Jump host `i`'s login ended: before the target is in, that ends
+    /// the connection.
+    fn hop_ended(&mut self, i: usize) -> Vec<Effect> {
+        if self.state != State::Connecting {
+            return Vec::new();
+        }
+        let blocked = self
+            .hops
+            .get(i)
+            .is_some_and(|h| h.session.state == State::Blocked);
+        let mut effects = Vec::new();
+        // The blocked one stays so, for Replace host key.
+        for h in &mut self.hops {
+            if matches!(h.session.state, State::Connecting | State::Connected) {
+                effects.extend(h.session.close());
+            }
+        }
+        if self.login.started {
+            effects.push(Effect::Send(Message::Close {
                 channel: self.channel,
-                host: t.hostname.clone(),
-                port: t.port,
-                user: t.user.clone(),
-                cols,
-                rows,
-                host_key_algs,
-                x11: self.x11.clone(),
-                legacy: self.legacy,
-                timing: t.timing,
-            }),
-        ]
+            }));
+        }
+        self.prompt = None;
+        self.state = if blocked {
+            State::Blocked
+        } else {
+            State::Ended
+        };
+        effects.push(Effect::Ended);
+        effects
+    }
+
+    /// A message about jump host `i`'s stream to the next hop.
+    fn on_tunnel(&mut self, i: usize, msg: Message) -> Vec<Effect> {
+        let Message::Disconnected { reason, .. } = msg else {
+            return Vec::new();
+        };
+        if let Some(h) = self.hops.get_mut(i) {
+            h.tunnel_ended = true;
+        }
+        let mut effects = self.tunnel_failed(i, &reason);
+        effects.extend(self.release());
+        effects
+    }
+
+    /// The end [`Self::held`], now that its reason has shown.
+    fn release(&mut self) -> Vec<Effect> {
+        match self.held.take() {
+            Some(msg) => self.on_worker(msg),
+            None => Vec::new(),
+        }
+    }
+
+    /// Whether `msg` ends the login of hop `n` (the target after the
+    /// jump hosts) before it got in, while the jump host before it has
+    /// not yet said why its stream ended.
+    fn holds(&self, n: usize, msg: &Message) -> bool {
+        let login = match self.hops.get(n) {
+            Some(h) => h.session.login,
+            None => self.login,
+        };
+        matches!(msg, Message::Disconnected { .. })
+            && login.started
+            && !login.done
+            && n.checked_sub(1)
+                .and_then(|i| self.hops.get(i))
+                .is_some_and(|h| !h.tunnel_ended)
+    }
+
+    fn tunnel_failed(&self, i: usize, reason: &str) -> Vec<Effect> {
+        let Some(hop) = self.hops.get(i) else {
+            return Vec::new();
+        };
+        let next_in = match self.hops.get(i + 1) {
+            Some(h) => h.session.login.done,
+            None => self.login.done,
+        };
+        if reason.is_empty() || next_in || self.state != State::Connecting {
+            return Vec::new();
+        }
+        vec![Effect::Show(format!(
+            "{RED}{}{RESET}\r\n",
+            sanitize(&format!(
+                "The jump host {} could not reach {reason}",
+                hop.session.target.label()
+            ))
+        ))]
     }
 
     /// Opens a shell on the connection `connection` made, as another
@@ -423,6 +874,8 @@ impl SshSession {
             && self.target.hostname.eq_ignore_ascii_case(&target.hostname)
             && self.target.port == target.port
             && self.target.user == target.user
+            // The same name through other jump hosts can be another host.
+            && self.target.route() == target.route()
     }
 
     /// Typed or pasted bytes for the host, once connected.
@@ -442,6 +895,7 @@ impl SshSession {
     }
 
     pub fn resize(&self, cols: u16, rows: u16) -> Option<Effect> {
+        self.size.set((cols, rows));
         matches!(self.state, State::Connecting | State::Connected).then(|| {
             Effect::Send(Message::Resize {
                 channel: self.channel,
@@ -451,16 +905,24 @@ impl SshSession {
         })
     }
 
-    /// Ends the connection from this side.
+    /// Ends the connection from this side. The jump hosts' logins close
+    /// too; their streams to the next hop keep their connections for as
+    /// long as another tab still uses this one.
     pub fn close(&mut self) -> Vec<Effect> {
         self.prompt = None;
+        self.held = None;
+        let mut effects = Vec::new();
+        for h in &mut self.hops {
+            effects.extend(h.session.close());
+        }
         if self.state == State::Ended {
-            return Vec::new();
+            return effects;
         }
         self.state = State::Ended;
-        vec![Effect::Send(Message::Close {
+        effects.push(Effect::Send(Message::Close {
             channel: self.channel,
-        })]
+        }));
+        effects
     }
 
     /// Why `msg` is not something the worker may send now, if it is not.
@@ -500,7 +962,37 @@ impl SshSession {
         }
     }
 
+    /// A message from a worker: this login's, a jump host's login's, or
+    /// about a jump host's stream to the next hop. The caller checks that
+    /// it came from [`Self::worker_for`] its channel.
     pub fn on_worker(&mut self, msg: Message) -> Vec<Effect> {
+        let channel = msg.channel();
+        if let Some(i) = self
+            .hops
+            .iter()
+            .position(|h| Some(h.session.channel) == channel)
+        {
+            if self.holds(i, &msg) {
+                self.held = Some(msg);
+                return Vec::new();
+            }
+            let effects = self.hops.get_mut(i).map(|h| h.session.on_worker(msg));
+            return self.after_hop(i, effects.unwrap_or_default());
+        }
+        if let Some(i) = self.hops.iter().position(|h| Some(h.tunnel) == channel) {
+            return self.on_tunnel(i, msg);
+        }
+        if channel != Some(self.channel) {
+            return Vec::new();
+        }
+        if self.holds(self.hops.len(), &msg) {
+            self.held = Some(msg);
+            return Vec::new();
+        }
+        self.on_own(msg)
+    }
+
+    fn on_own(&mut self, msg: Message) -> Vec<Effect> {
         if let Some(what) = self.out_of_turn(&msg) {
             let mut effects = vec![Effect::Show(format!(
                 "\r\n{RED}The SSH worker asked for {what}. That is not how a login goes, so \
@@ -562,7 +1054,15 @@ impl SshSession {
                 ..
             } => {
                 self.state = State::Connected;
-                let text = format!("Connected ({kex}, {cipher}, {host_key} host key).");
+                self.login.done = true;
+                let text = if self.jump {
+                    format!(
+                        "Logged in to jump host {} ({kex}, {cipher}, {host_key} host key).",
+                        self.target.label()
+                    )
+                } else {
+                    format!("Connected ({kex}, {cipher}, {host_key} host key).")
+                };
                 let mut effects = vec![Effect::Show(dim(&sanitize(&text)))];
                 let old: Vec<&str> = [&kex, &cipher, &host_key]
                     .into_iter()
@@ -582,7 +1082,12 @@ impl SshSession {
                     )));
                 }
                 if let Some(password) = self.typed_password.take() {
-                    effects.push(Effect::StorePassword(Secrets(vec![password.to_string()])));
+                    effects.push(Effect::StorePassword {
+                        user: self.target.user.clone(),
+                        host: self.target.hostname.clone(),
+                        port: self.target.port,
+                        password: Secrets(vec![password.to_string()]),
+                    });
                 }
                 effects.push(Effect::Connected);
                 effects
@@ -605,6 +1110,9 @@ impl SshSession {
                     return vec![Effect::Ended];
                 }
                 let mut text = sanitize(&reason);
+                if self.jump {
+                    text = format!("Jump host {}: {text}", sanitize(&self.target.label()));
+                }
                 if let Some(code) = self.exit_code {
                     text = format!("{text} The shell exited with code {code}.");
                 }
@@ -766,8 +1274,16 @@ impl SshSession {
     }
 
     /// After the user confirmed twice: store the key that blocked the
-    /// connection. The caller then reconnects.
+    /// connection, this host's or a jump host's. The caller then
+    /// reconnects.
     pub fn replace_host_key(&mut self) -> std::io::Result<()> {
+        if let Some(h) = self
+            .hops
+            .iter_mut()
+            .find(|h| h.session.state == State::Blocked)
+        {
+            return h.session.replace_host_key();
+        }
         let Some(key) = self.changed_key.take() else {
             return Ok(());
         };
@@ -782,6 +1298,10 @@ impl SshSession {
     pub fn on_broker(&mut self, reply: Reply) -> Vec<Effect> {
         if self.state == State::Ended {
             return Vec::new();
+        }
+        if let Some(i) = self.active_hop() {
+            let effects = self.hops.get_mut(i).map(|h| h.session.on_broker(reply));
+            return self.after_hop(i, effects.unwrap_or_default());
         }
         match reply {
             Reply::Identities { keys, notes } => {
@@ -942,7 +1462,10 @@ impl SshSession {
 
     /// Whether the session waits for its password source.
     pub fn fetching_password(&self) -> bool {
-        self.fetching.is_some()
+        match self.active_hop().and_then(|i| self.hops.get(i)) {
+            Some(h) => h.session.fetching_password(),
+            None => self.fetching.is_some(),
+        }
     }
 
     /// The password source answered: `Ok` sends the password, `Err` says
@@ -953,6 +1476,13 @@ impl SshSession {
         result: Result<Zeroizing<String>, String>,
         from: &str,
     ) -> Vec<Effect> {
+        if let Some(i) = self.active_hop() {
+            let effects = self
+                .hops
+                .get_mut(i)
+                .map(|h| h.session.password_fetched(result, from));
+            return self.after_hop(i, effects.unwrap_or_default());
+        }
         let Some((field, rest)) = self.fetching.take() else {
             return Vec::new();
         };
@@ -1007,6 +1537,10 @@ impl SshSession {
     /// Text pasted while a prompt is open: line breaks and control
     /// characters are dropped.
     pub fn prompt_paste(&mut self, text: &str) -> Vec<Effect> {
+        if let Some(i) = self.active_hop() {
+            let effects = self.hops.get_mut(i).map(|h| h.session.prompt_paste(text));
+            return self.after_hop(i, effects.unwrap_or_default());
+        }
         let Some(p) = &mut self.prompt else {
             return Vec::new();
         };
@@ -1021,6 +1555,10 @@ impl SshSession {
 
     /// Keys typed while a prompt is open, as the terminal encoded them.
     pub fn prompt_input(&mut self, bytes: &[u8]) -> Vec<Effect> {
+        if let Some(i) = self.active_hop() {
+            let effects = self.hops.get_mut(i).map(|h| h.session.prompt_input(bytes));
+            return self.after_hop(i, effects.unwrap_or_default());
+        }
         let Some(p) = &mut self.prompt else {
             return Vec::new();
         };
@@ -1474,6 +2012,317 @@ mod tests {
         ));
     }
 
+    /// A session to "inner" through "bastion", then "edge" (as
+    /// `ProxyJump bastion,edge`), with channel ids 2 to 5 for the hops.
+    fn chain(e: &Env) -> SshSession {
+        let mut next = 1;
+        SshSession::new(
+            1,
+            Target::resolve_route("inner", e).unwrap(),
+            e.known_hosts(),
+        )
+        .with_route(&mut || {
+            next += 1;
+            next
+        })
+    }
+
+    fn jump_env(dir: &std::path::Path) -> Env {
+        Env {
+            config: "Host inner\n  HostName 10.0.0.5\n  ProxyJump bastion,edge\n\
+                     Host bastion\n  HostName bastion.example.org\n  User jump\n  Port 2222\n\
+                     Host edge\n  ProxyJump nested\n"
+                .into(),
+            ..env(dir)
+        }
+    }
+
+    /// Lets hop login `channel` in: host key trusted, logged in.
+    fn hop_in(s: &mut SshSession, channel: ChannelId) -> Vec<Effect> {
+        s.on_worker(Message::HostKey {
+            channel,
+            key: ed25519_blob(),
+        });
+        s.prompt_input(b"yes");
+        let fx = s.prompt_input(b"\r");
+        assert!(
+            sent(&fx).contains(&&Message::HostKeyVerdict {
+                channel,
+                accept: true
+            }),
+            "{fx:?}"
+        );
+        s.on_worker(Message::Connected {
+            channel,
+            kex: "k".into(),
+            cipher: "c".into(),
+            host_key: "ssh-ed25519".into(),
+        })
+    }
+
+    #[test]
+    fn resolves_jump_hosts_in_order_without_their_later_ones_own() {
+        let dir = temp("route");
+        let e = jump_env(&dir);
+        let t = Target::resolve_route("inner", &e).unwrap();
+        let hops: Vec<String> = t.jumps.iter().map(Target::label).collect();
+        // Only the first jump host's own ProxyJump applies, as in OpenSSH.
+        assert_eq!(hops, ["jump@bastion:2222", "me@edge"]);
+        assert!(t.jumps.iter().all(|j| j.jumps.is_empty()));
+        assert_eq!(t.jumps[0].hostname, "bastion.example.org");
+
+        let e = Env {
+            config: "Host a\n  ProxyJump b\nHost b\n  ProxyJump a\n".into(),
+            ..env(&dir)
+        };
+        let err = Target::resolve_route("a", &e).unwrap_err();
+        assert!(err.contains("loop"), "{err}");
+        let e = Env {
+            config: "Host a\n  ProxyCommand nc -X connect -x proxy:3128 %h %p\n".into(),
+            ..env(&dir)
+        };
+        let t = Target::resolve_route("a", &e).unwrap();
+        let c = t.proxy_command.unwrap();
+        assert_eq!(c.program, "nc");
+        assert_eq!(c.args, ["-X", "connect", "-x", "proxy:3128", "a", "22"]);
+        assert_eq!(c.line, "nc -X connect -x proxy:3128 %h %p");
+    }
+
+    #[test]
+    fn jump_hosts_log_in_one_after_another_each_in_its_own_worker() {
+        let dir = temp("chain");
+        let e = jump_env(&dir);
+        let mut s = chain(&e);
+        assert_eq!(s.hop_connections(), [2, 4]);
+        let fx = s.start(100, 30);
+        // The first jump host first: no shell, no tunnel, its own worker.
+        let [
+            Message::Connect {
+                channel: 2,
+                host,
+                tunnel: None,
+                shell: false,
+                ..
+            },
+        ] = &sent(&fx)[..]
+        else {
+            panic!("{fx:?}");
+        };
+        assert_eq!(host, "bastion.example.org");
+        assert_eq!(s.worker_for(Some(2)), Some(2));
+        assert_eq!(s.worker_for(Some(1)), Some(1));
+        assert_eq!(s.worker_for(Some(99)), None);
+        assert!(s.owns(3) && !s.owns(6));
+
+        // Bastion in: its worker opens a stream to edge, which logs in
+        // over it in a worker of its own.
+        let fx = hop_in(&mut s, 2);
+        assert!(shown(&fx).contains("Logged in to jump host jump@bastion:2222"));
+        assert!(
+            fx.iter().any(|f| matches!(
+                f,
+                Effect::Tunnel {
+                    from: 2,
+                    to: 4,
+                    channel: 3
+                }
+            )),
+            "{fx:?}"
+        );
+        let msgs = sent(&fx);
+        assert!(
+            matches!(
+                msgs[..],
+                [
+                    Message::ForwardOpen {
+                        channel: 3,
+                        connection: 2,
+                        target: Some((h, 22)),
+                        keep: true,
+                        ..
+                    },
+                    Message::Connect {
+                        channel: 4,
+                        tunnel: Some(3),
+                        shell: false,
+                        ..
+                    }
+                ] if h == "edge"
+            ),
+            "{msgs:?}"
+        );
+        assert_eq!(s.worker_for(Some(3)), Some(2));
+
+        // Edge in: the target logs in over edge's stream, with a shell
+        // of the pane's size.
+        let fx = hop_in(&mut s, 4);
+        let msgs = sent(&fx);
+        assert!(
+            matches!(
+                msgs[..],
+                [
+                    Message::ForwardOpen { channel: 5, connection: 4, target: Some((h, 22)), .. },
+                    Message::Connect { channel: 1, tunnel: Some(5), shell: true, cols: 100, rows: 30, .. }
+                ] if h == "10.0.0.5"
+            ),
+            "{msgs:?}"
+        );
+        assert_eq!(s.state(), State::Connecting);
+        assert!(!fx.iter().any(|f| matches!(f, Effect::Connected)));
+
+        // The target's own login, then the shell.
+        hop_in(&mut s, 1);
+        assert_eq!(s.state(), State::Connected);
+        // Closing closes every login on the way.
+        let closes: Vec<ChannelId> = sent(&s.close())
+            .iter()
+            .filter_map(|m| match m {
+                Message::Close { channel } => Some(*channel),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(closes, [2, 4, 1]);
+    }
+
+    #[test]
+    fn a_failed_jump_host_ends_the_connection_and_says_why() {
+        let dir = temp("chain-fail");
+        let e = jump_env(&dir);
+        let mut s = chain(&e);
+        s.start(80, 24);
+        hop_in(&mut s, 2);
+        // Bastion cannot reach edge.
+        let fx = s.on_worker(Message::Disconnected {
+            channel: 3,
+            reason: "edge:22: the server could not connect (ConnectFailed).".into(),
+        });
+        assert!(
+            shown(&fx).contains("The jump host jump@bastion:2222 could not reach edge:22"),
+            "{fx:?}"
+        );
+        assert_eq!(s.state(), State::Connecting);
+        // Edge's login then fails, and with it the connection.
+        let fx = s.on_worker(Message::Disconnected {
+            channel: 4,
+            reason: "The server closed the connection without saying why.".into(),
+        });
+        assert!(shown(&fx).contains("Jump host me@edge:"), "{fx:?}");
+        assert!(matches!(fx.last(), Some(Effect::Ended)));
+        assert!(sent(&fx).contains(&&Message::Close { channel: 2 }));
+        assert_eq!(s.state(), State::Ended);
+
+        // The two workers may say it the other way round: the reason
+        // still shows first.
+        let dir = temp("chain-fail-order");
+        let e = jump_env(&dir);
+        let mut s = chain(&e);
+        s.start(80, 24);
+        hop_in(&mut s, 2);
+        let fx = s.on_worker(Message::Disconnected {
+            channel: 4,
+            reason: String::new(),
+        });
+        assert!(fx.is_empty(), "{fx:?}");
+        assert_eq!(s.state(), State::Connecting);
+        let fx = s.on_worker(Message::Disconnected {
+            channel: 3,
+            reason: "edge:22: the server could not connect (ConnectFailed).".into(),
+        });
+        let text = shown(&fx);
+        let why = text.find("could not reach edge:22").expect("the reason");
+        assert!(
+            why < text.find("Jump host me@edge").expect("the end"),
+            "{text}"
+        );
+        assert!(matches!(fx.last(), Some(Effect::Ended)));
+        assert_eq!(s.state(), State::Ended);
+    }
+
+    #[test]
+    fn a_changed_jump_host_key_blocks_and_can_be_replaced() {
+        let dir = temp("chain-changed");
+        let e = jump_env(&dir);
+        let mut other = vec![0, 0, 0, 11];
+        other.extend_from_slice(b"ssh-ed25519");
+        other.extend_from_slice(&[0, 0, 0, 32]);
+        other.extend_from_slice(&[7; 32]);
+        known_hosts::add(&e.known_hosts(), "bastion.example.org", 2222, &other).unwrap();
+        let mut s = chain(&e);
+        s.start(80, 24);
+        let fx = s.on_worker(Message::HostKey {
+            channel: 2,
+            key: ed25519_blob(),
+        });
+        assert!(shown(&fx).contains("HOST KEY CHANGED"));
+        let fx = s.on_worker(Message::Disconnected {
+            channel: 2,
+            reason: "Host key not accepted.".into(),
+        });
+        assert!(matches!(fx.last(), Some(Effect::Ended)));
+        assert_eq!(s.state(), State::Blocked);
+        assert_eq!(s.blocked_host(), "bastion.example.org");
+        assert_eq!(s.changed_key(), Some(&ed25519_blob()[..]));
+        s.replace_host_key().unwrap();
+        let kh = KnownHosts::load(&e.known_hosts()).unwrap();
+        assert_eq!(
+            kh.check("bastion.example.org", 2222, &ed25519_blob()),
+            Status::Trusted
+        );
+    }
+
+    #[test]
+    fn the_target_may_not_speak_before_its_jump_hosts_are_in() {
+        let dir = temp("chain-turns");
+        let e = jump_env(&dir);
+        let mut s = chain(&e);
+        s.start(80, 24);
+        let fx = s.on_worker(Message::HostKey {
+            channel: 1,
+            key: ed25519_blob(),
+        });
+        assert!(shown(&fx).contains("not how a login goes"), "{fx:?}");
+        assert!(sent(&fx).contains(&&Message::Close { channel: 2 }));
+        assert_eq!(s.state(), State::Ended);
+    }
+
+    #[test]
+    fn the_same_name_through_other_jump_hosts_is_another_connection() {
+        let dir = temp("chain-share");
+        let e = jump_env(&dir);
+        let mut s = chain(&e);
+        s.start(80, 24);
+        hop_in(&mut s, 2);
+        hop_in(&mut s, 4);
+        hop_in(&mut s, 1);
+        let same = Target::resolve_route("inner", &e).unwrap();
+        assert!(s.can_share(&same));
+        let direct = Target::resolve("10.0.0.5", &e).unwrap();
+        assert!(!s.can_share(&direct));
+    }
+
+    #[test]
+    fn a_proxy_command_carries_the_first_login() {
+        let dir = temp("chain-command");
+        let e = Env {
+            config: "Host inner\n  ProxyJump bastion\nHost bastion\n  ProxyCommand nc %h %p\n"
+                .into(),
+            ..env(&dir)
+        };
+        let mut s = chain(&e);
+        let fx = s.start(80, 24);
+        let Some(Effect::ProxyCommand {
+            connection: 2,
+            tunnel,
+            command,
+        }) = fx.iter().find(|f| matches!(f, Effect::ProxyCommand { .. }))
+        else {
+            panic!("{fx:?}");
+        };
+        assert_eq!(command.args, ["bastion", "22"]);
+        assert!(sent(&fx).iter().any(|m| matches!(m,
+            Message::Connect { channel: 2, tunnel: Some(t), .. } if t == tunnel)));
+    }
+
     #[test]
     fn prompts_collect_answers_in_order_without_echoing_secrets() {
         let dir = temp("prompt");
@@ -1613,7 +2462,7 @@ mod tests {
         let stored: Vec<&str> = fx
             .iter()
             .filter_map(|e| match e {
-                Effect::StorePassword(p) => p.0.first().map(String::as_str),
+                Effect::StorePassword { password, .. } => password.0.first().map(String::as_str),
                 _ => None,
             })
             .collect();
