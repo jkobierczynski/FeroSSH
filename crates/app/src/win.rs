@@ -22,6 +22,7 @@ use ferossh_auth::Broker;
 use ferossh_config::import::{self, Client};
 use ferossh_config::password::{self as pw_source, PasswordSource};
 use ferossh_config::saved::{self, SavedHost};
+use ferossh_config::serial::{self, SerialTarget};
 use ferossh_config::settings::{DEFAULT_DESKTOP_PORT, DEFAULT_VNC_PORT};
 use ferossh_config::{SessionKind, Settings, putty, ssh_config, winscp};
 use ferossh_forward::x11::{Display, find_cookie, xauth_entries};
@@ -101,6 +102,7 @@ use crate::pattern;
 use crate::pwcommand;
 use crate::sandbox;
 use crate::scrollmark;
+use crate::serial_port::{Output as SerialOutput, SerialPort};
 use crate::session_form::{self, FormAction, Hints, SessionForm, Source, Values};
 use crate::sessions::{HostItem, SessionList, SideAction, SideKey};
 use crate::ssh::{Effect, Env, SshSession, State, Target};
@@ -208,6 +210,7 @@ mod cmd {
     pub const LOG_RAW: u32 = 601;
     pub const LOG_FOLDER: u32 = 602;
     pub const LOG_VERIFY: u32 = 605;
+    pub const SERIAL_BREAK: u32 = 606;
     pub const REPLACE_KEY: u32 = 603;
     pub const VERIFY: u32 = 604;
     pub const TMUX_ATTACH: u32 = 610;
@@ -252,8 +255,7 @@ enum Typed {
 }
 
 /// The prompt shown when no host was given.
-const CONNECT_PROMPT: &str =
-    "\x1b[0mConnect to (user@host[:port], or a Host from ~/.ssh/config; Ctrl+Shift+S lists them): ";
+const CONNECT_PROMPT: &str = "\x1b[0mConnect to (user@host[:port], a Host from ~/.ssh/config, or a COM port such as COM3:115200; Ctrl+Shift+S lists them): ";
 
 /// What a pane is connected to.
 enum Host {
@@ -279,6 +281,12 @@ enum Host {
     Desktop {
         label: String,
         connection: ChannelId,
+    },
+    /// A serial console; `port` is `None` once it closed, when Enter
+    /// opens it again.
+    Serial {
+        port: Option<Box<SerialPort>>,
+        target: SerialTarget,
     },
 }
 
@@ -373,6 +381,7 @@ impl Pane {
             Host::Local { .. } => "local".to_owned(),
             Host::Ask(_) => "new tab".to_owned(),
             Host::Tmux { label, .. } | Host::Desktop { label, .. } => label.clone(),
+            Host::Serial { target, .. } => target.label(),
         }
     }
 
@@ -389,7 +398,7 @@ impl Pane {
                 State::Blocked | State::Ended => Health::Idle,
             },
             // tmux panes exist only while the gateway is logged in.
-            Host::Tmux { .. } => Health::Connected,
+            Host::Tmux { .. } | Host::Serial { port: Some(_), .. } => Health::Connected,
             _ => Health::Idle,
         }
     }
@@ -1096,6 +1105,8 @@ fn build_menu() -> Result<HMENU> {
             cmd::TMUX_LAYOUT,
             "tmux: one &window per pane (own fonts)",
         )?;
+        separator(session)?;
+        item(session, cmd::SERIAL_BREAK, "Send &break (serial)")?;
         separator(session)?;
         item(session, cmd::DESKTOP, "Open remote &desktop\tCtrl+Shift+D")?;
         if cfg!(feature = "rdp-viewer") {
@@ -2462,6 +2473,10 @@ impl Window {
     /// Connects pane `id` to `destination` (`[user@]host[:port]` or a
     /// Host from ssh_config).
     fn connect(&mut self, id: PaneId, destination: &str) {
+        if let Some(target) = serial::parse_target(destination) {
+            self.open_serial(id, target, None);
+            return;
+        }
         let env = ssh_env();
         let Some(target) = Target::resolve(destination, &env) else {
             let text = format!(
@@ -2474,6 +2489,56 @@ impl Window {
             return;
         };
         self.connect_to(id, target, &env);
+    }
+
+    /// Opens serial console `target` in pane `id`, with the look of saved
+    /// session `session` (or the port's, by theme rules).
+    fn open_serial(&mut self, id: PaneId, target: SerialTarget, session: Option<&str>) {
+        self.end_host(id);
+        let alias = session.unwrap_or(&target.port).to_owned();
+        let (font, theme) = look::for_host(
+            &self.settings,
+            &alias,
+            &target.port,
+            None,
+            &FontSpec::default(),
+            &self.default_theme,
+        );
+        let scrollback = self
+            .settings
+            .profile(&alias)
+            .and_then(|p| p.scrollback)
+            .or(self.settings.scrollback);
+        if let Some(p) = self.panes.get_mut(&id) {
+            p.term.set_settings(&term_settings(scrollback));
+            p.term.scroll_to_bottom();
+        }
+        self.set_theme(id, theme);
+        self.set_font(id, font);
+        let notify = self.notifier();
+        let opened = SerialPort::open(&target, notify);
+        let text = match &opened {
+            Ok(_) => format!(
+                "\x1b[0;90mOpened {} at {} bits/s, {}, flow control {}. \
+                 Session > Send break sends a break.\x1b[0m\r\n",
+                target.port,
+                target.settings.speed,
+                target.settings.framing(),
+                target.settings.flow.label()
+            ),
+            Err(e) => format!("\x1b[0;31m{e}\x1b[0m\r\nPress Enter to try again.\r\n"),
+        };
+        if let Some(p) = self.panes.get_mut(&id) {
+            p.host = Host::Serial {
+                port: opened.ok().map(Box::new),
+                target,
+            };
+        }
+        self.show(id, &text);
+        self.start_log(id);
+        self.update_title();
+        self.refresh_chrome();
+        self.refresh(id);
     }
 
     /// Connects pane `id` to `target`. When another pane is logged in to
@@ -2559,6 +2624,11 @@ impl Window {
             Some(Host::Ssh(s)) => Some(s.target.clone()),
             Some(Host::Local { .. }) => {
                 self.start_shell(id);
+                return;
+            }
+            Some(Host::Serial { target, .. }) => {
+                let target = target.clone();
+                self.open_serial(id, target, None);
                 return;
             }
             _ => None,
@@ -2755,6 +2825,10 @@ impl Window {
             Host::Ssh(s) if s.state() == State::Connected => s.target.label(),
             Host::Local { exited: false, .. } => "local".to_owned(),
             Host::Tmux { label, .. } => label.clone(),
+            Host::Serial {
+                port: Some(_),
+                target,
+            } => target.port.clone(),
             _ => return,
         };
         let raw = p.log.raw;
@@ -2880,6 +2954,12 @@ impl Window {
                 return;
             }
             Some(Host::Ssh(session)) if !session.prompt_active() => session.input(&bytes),
+            Some(Host::Serial {
+                port: Some(port), ..
+            }) => {
+                port.write(bytes);
+                return;
+            }
             _ => return,
         };
         self.apply(id, effects);
@@ -2943,7 +3023,13 @@ impl Window {
                     self.reconnect(id);
                 }
             }
-            Host::Ssh(_) | Host::Tmux { .. } => self.send(id, bytes),
+            Host::Serial { port: None, target } => {
+                if enter {
+                    let target = target.clone();
+                    self.open_serial(id, target, None);
+                }
+            }
+            Host::Ssh(_) | Host::Tmux { .. } | Host::Serial { .. } => self.send(id, bytes),
         }
     }
 
@@ -2961,7 +3047,8 @@ impl Window {
                 shell: Some(_),
                 exited: false,
             }
-            | Host::Tmux { .. } => true,
+            | Host::Tmux { .. }
+            | Host::Serial { port: Some(_), .. } => true,
             Host::Ssh(s) => s.state() == State::Connected && !s.prompt_active(),
             _ => false,
         }
@@ -3064,6 +3151,48 @@ impl Window {
                             "\r\n\x1b[0;90m[Process exited with code {code}. Press Enter to start a new one.]\x1b[0m\r\n"
                         );
                         self.show(id, &text);
+                    }
+                }
+                if fed >= OUTPUT_BUDGET {
+                    more = true;
+                    break;
+                }
+            }
+        }
+        // The serial consoles.
+        let ids: Vec<PaneId> = self.panes.keys().copied().collect();
+        for id in ids {
+            while let Some(Pane {
+                host: Host::Serial {
+                    port: Some(port), ..
+                },
+                ..
+            }) = self.panes.get_mut(&id)
+            {
+                let Some(out) = port.try_read() else {
+                    break;
+                };
+                match out {
+                    SerialOutput::Data(data) => {
+                        fed += data.len();
+                        if let Some(p) = self.panes.get_mut(&id) {
+                            p.term.feed(&data);
+                        }
+                        self.log(id, &data);
+                    }
+                    SerialOutput::Closed(why) => {
+                        self.stop_log(id);
+                        if let Some(Host::Serial { port, .. }) =
+                            self.panes.get_mut(&id).map(|p| &mut p.host)
+                        {
+                            *port = None;
+                        }
+                        let text = format!(
+                            "\r\n\x1b[0;31m[The serial port stopped: {}. Press Enter to open it again.]\x1b[0m\r\n",
+                            why.trim()
+                        );
+                        self.show(id, &text);
+                        self.refresh_chrome();
                     }
                 }
                 if fed >= OUTPUT_BUDGET {
@@ -4354,6 +4483,29 @@ impl Window {
     /// waiting at the connect prompt, else in a new tab (or a split).
     fn open_host(&mut self, host: &str, split: bool) {
         if let Some(p) = self.settings.profile(host)
+            && p.kind == SessionKind::Serial
+        {
+            let line = p.serial.unwrap_or_default();
+            let hostname = Target::resolve(host, &ssh_env()).map(|t| t.hostname);
+            let port = hostname.as_deref().and_then(serial::port_name);
+            match port.or_else(|| serial::port_name(host)) {
+                Some(port) => {
+                    if let Some(id) = self.host_pane_for(split) {
+                        self.focus_terminal();
+                        let target = SerialTarget {
+                            port,
+                            settings: line,
+                        };
+                        self.open_serial(id, target, Some(host));
+                    }
+                }
+                None => self.queued.push(Command::Notice(format!(
+                    "The session {host} has no COM port: press F2 on it and fill one in."
+                ))),
+            }
+            return;
+        }
+        if let Some(p) = self.settings.profile(host)
             && p.kind != SessionKind::Ssh
         {
             let (kind, via) = (p.kind, p.via.clone());
@@ -4486,6 +4638,7 @@ impl Window {
             Ask,
         }
         let from = self.host_pane(from);
+        // A COM port opens once, so a split of a serial console asks.
         let like = match self.panes.get(&from).map(|p| &p.host) {
             Some(Host::Ssh(s)) => Like::Ssh(s.target.clone()),
             Some(Host::Local { .. }) => Like::Local,
@@ -5455,6 +5608,25 @@ impl Window {
             }
             cmd::LOG_FOLDER => return Some(Command::OpenFolder(log_dir())),
             cmd::LOG_VERIFY => return Some(Command::VerifyLog),
+            cmd::SERIAL_BREAK => {
+                let pane = self.focused_id();
+                match self.panes.get(&pane).map(|p| &p.host) {
+                    Some(Host::Serial {
+                        port: Some(port), ..
+                    }) => {
+                        port.send_break();
+                        self.show(pane, "\x1b[0;90m[break]\x1b[0m");
+                    }
+                    _ => {
+                        return Some(Command::Notice(
+                            "Send break is for serial consoles: open a COM port first \
+                             (type COM3 at the connect prompt, or make a Serial console \
+                             session)."
+                                .into(),
+                        ));
+                    }
+                }
+            }
             cmd::BROADCAST_TAB | cmd::BROADCAST_ALL => {
                 let wanted = if id == cmd::BROADCAST_TAB {
                     broadcast::Scope::Tab
@@ -6011,7 +6183,10 @@ impl Window {
         // tmux windows.
         ids.iter()
             .filter_map(|id| self.panes.get(id))
-            .filter(|p| p.connected() && (tab.is_some() || p.gateway().is_none()))
+            .filter(|p| {
+                let open = p.connected() || matches!(p.host, Host::Serial { port: Some(_), .. });
+                open && (tab.is_some() || p.gateway().is_none())
+            })
             .count()
     }
 
