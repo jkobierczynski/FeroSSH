@@ -4,7 +4,7 @@
 
 FeroSSH aims to be the smallest, most secure open-source SSH client for Windows: a native PuTTY replacement with tabs, splits, tmux integration and file transfer, shipped as one signed exe with nothing to install.
 
-> **Status:** milestone 6 (tmux integration). FeroSSH connects with russh from a sandboxed worker process, checks host keys against `~/.ssh/known_hosts`, and signs in with the Windows OpenSSH agent, Pageant, key files, keyboard-interactive or a password. Tabs, splits and a session manager came in milestone 4, file transfer over SFTP in milestone 5.
+> **Status:** working toward 1.0 ([v0.1.0](https://github.com/jkobierczynski/FeroSSH/releases/tag/v0.1.0) is out). FeroSSH connects with russh from one sandboxed worker process per connection, checks host keys against `~/.ssh/known_hosts`, and signs in with the Windows OpenSSH agent, Pageant, key files, FIDO2 security keys, keyboard-interactive or a password. It has tabs and splits, saved sessions with imports from PuTTY, KiTTY, WinSCP, MobaXterm, mRemoteNG and SecureCRT, password sources, SFTP file transfer, port and X11 forwarding, tmux integration, serial consoles, broadcast input, remote desktops through SSH, and sealed session logs.
 
 The [user guide](docs/guide/README.md) covers getting started, everyday use, every setting, the security model, verifying a download and troubleshooting.
 
@@ -16,7 +16,9 @@ Download `ferossh.exe` from the [latest release](https://github.com/jkobierczyns
 ferossh.exe [user@]host[:port]
 ferossh.exe -l user -p 2222 host
 ferossh.exe myalias            # a Host from ~/.ssh/config
-ferossh.exe --local [command]  # a local shell, as in milestone 2
+ferossh.exe COM3:115200       # a serial console
+ferossh.exe --local [command]  # a local shell
+ferossh.exe --check-sandbox    # report what the sandbox can do on this PC
 ```
 
 `HostName`, `User`, `Port`, `IdentityFile`, `Tag`, `Include` and the forwarding keywords (`LocalForward`, `RemoteForward`, `DynamicForward`, `ForwardX11`, `GatewayPorts`, `ClearAllForwardings`) are read from `~/.ssh/config`.
@@ -61,7 +63,7 @@ ferossh.exe --local [command]  # a local shell, as in milestone 2
 - **Host keys.** A new host shows its SHA-256 fingerprint and randomart, and you type `yes` to trust it; the key is saved hashed to `known_hosts`. A changed key fills the window with a warning and cannot be bypassed: if you know why it changed, use Session > Replace host key..., which asks twice. Host certificates work as in OpenSSH: with an `@cert-authority` line for the host in `known_hosts`, FeroSSH asks the server for a certificate and accepts it without a prompt when that CA signed it, the hostname is one of its principals and it is in date. `@revoked` CA or host keys are refused.
 - **Sign-in.** Keys are tried from the OpenSSH agent first, then Pageant, then key files (`id_ed25519` and `id_ecdsa` unless the config names others). Key files may be Ed25519 or ECDSA P-256, encrypted or not; the passphrase is asked in the terminal and never kept. RSA keys work only through an agent, need 3072 bits or more, and sign with SHA-2. Agents may also hold ECDSA P-384 and P-521 keys (smart cards often do) and user certificates (`ssh-add` adds `id_*-cert.pub` with its key). Then keyboard-interactive (one-time codes) and passwords.
 - **Security keys.** FIDO2 keys (`sk-ssh-ed25519@openssh.com`, `sk-ecdsa-sha2-nistp256@openssh.com`) work from key files (`id_ecdsa_sk`, `id_ed25519_sk`, or any `IdentityFile`) through Windows' own WebAuthn dialog, as Windows OpenSSH does: touch a USB or NFC key, or confirm with Windows Hello. Keys held by the OpenSSH agent work too. `ferossh.exe --new-security-key [--hello] [--ed25519] FILE` makes a new key file, like `ssh-keygen -t ecdsa-sk`; `--hello` makes it with Windows Hello, so no hardware key is needed.
-- **Sandbox.** The worker that talks to the network runs in an AppContainer with network access only: it cannot read your files or keys, and asks the window for every signature. Windows does not let AppContainers reach 127.0.0.1, so use `--no-sandbox` for SSH servers on the same machine. Forwards to and from localhost work in the sandbox: the window holds those sockets, and the worker parses what arrives (SOCKS requests, X11 setups).
+- **Sandbox.** Each SSH connection gets its own worker process, which talks to the network in an AppContainer with network access only: it cannot read your files or keys, and asks the window for every signature. Tabs that share a login share its worker; another host or user gets a worker of its own, so a worker taken over by one server cannot see your other connections. Every sandboxed process runs in a job object (killed with the window, no child processes, memory capped at 1 GiB, no clipboard or other windows) and starts with process mitigations (no dynamic code, no non-system fonts, mandatory ASLR, strict handle checks, DLLs from System32 first). The window checks everything a worker sends: frame sizes, the order of a real login, and that a sign request is a well-formed login for that user and key. `ferossh.exe --check-sandbox | more` shows what your Windows allows. Windows does not let AppContainers reach 127.0.0.1, so use `--no-sandbox` for SSH servers on the same machine. Forwards to and from localhost work in the sandbox: the window holds those sockets, and the worker parses what arrives (SOCKS requests, X11 setups). [SECURITY.md](SECURITY.md) describes the whole model and its limits.
 - **Updates.** FeroSSH never contacts anything but your servers unless you ask. Help > Check for updates asks GitHub for the latest release's update file and its Ed25519 signature, checks the signature against the key built into the exe before reading anything in the file, and says whether a newer release exists; Yes opens its release page. Help > Check for updates weekly does the same once a week, quietly unless there is a new release (off by default; `UpdateCheck weekly` in `ferossh.conf`). Nothing is downloaded or installed for you.
 - **Logs.** Session > Log to file writes what the host sends to `%LOCALAPPDATA%\FeroSSH\logs`, one file per tab named by host, tab and time (`host_tab1_2026-10-24_2215.log`). Plain logs keep the readable text; Session > Log raw output keeps every byte. Passwords and passphrases never reach the log. Every log is sealed as it is written: `host_tab1_….log.chain` beside it holds a SHA-256 hash chain over the log's bytes (a seal at least every 10 seconds while output comes), and when the log ends its last seal goes into `log-index.chain`, where each line also hashes the one before. Session > Check a log for changes says whether a log is intact, or where it was changed, cut short or added to. This makes edits visible, not impossible: someone using your Windows account could rewrite a log, its chain and the index together, so copy `log-index.chain` somewhere else when a log has to hold up later.
 
@@ -77,6 +79,7 @@ ferossh.exe --local [command]  # a local shell, as in milestone 2
 | Ctrl+Shift+E / Ctrl+Shift+U | File transfer, upload files |
 | Ctrl+Shift+P | Port forwards |
 | Ctrl+Shift+D | Open remote desktop |
+| Ctrl+Shift+B | Broadcast input to this tab's panes |
 | Ctrl+Shift+C / Ctrl+Shift+V | Copy the selection, paste (also Ctrl+Insert / Shift+Insert) |
 | Ctrl+Shift+F | Find in scrollback (Enter: older match, Shift+Enter: newer, Esc: close) |
 | Shift+PgUp / Shift+PgDn | Scroll back a page, forward a page (Ctrl+Shift+Home/End: top, bottom) |
@@ -115,10 +118,11 @@ Profile web1
 ## Design
 
 - Native Win32 with DirectWrite/Direct2D rendering. No Electron, Qt or Java.
-- Two processes: a UI process that never parses network data, and an AppContainer-sandboxed SSH worker that never sees private keys or your files.
+- Separate processes: a UI process that never speaks SSH, and one AppContainer-sandboxed SSH worker per connection that never sees private keys or your files. The built-in desktop viewer decodes remote screens in a second AppContainer with no capabilities at all.
 - Modern crypto only. Post-quantum `mlkem768x25519-sha256` key exchange first; no SHA-1, CBC, DSA or `ssh-rsa` signatures (see [`crypto_policy.rs`](crates/worker/src/crypto_policy.rs)).
 - Older switches, routers and SSH servers that lack those can be allowed per host with `LegacyAlgorithms yes` in the host's `Profile` in `ferossh.conf`. This adds ECDH on NIST curves, DH groups 14 to 18 with SHA-2, AES-CTR and plain HMAC-SHA-2, still with no SHA-1, CBC or DSA. A tab that uses them shows an amber `⚠`, and when a connection fails for lack of them FeroSSH says so. A server without strict key exchange (Terrapin) gets AES-GCM instead of ChaCha20-Poly1305.
-- Keys stay in the Windows OpenSSH agent, Pageant, a FIDO2 token or the TPM. Passwords are never stored.
+- Keys stay in the Windows OpenSSH agent, Pageant, a FIDO2 token or the TPM. FeroSSH keeps no passwords of its own: a password is saved only if you choose Windows Credential Manager as its source, and never imported from other clients.
+- Every parser of untrusted input (IPC, terminal, SFTP, SOCKS and X11, tmux control mode, VNC and RDP, key files, sign requests, `ssh_config`, `known_hosts` and session imports) is fuzz-tested on every change and in a weekly campaign.
 - OpenSSH `ssh_config` is the session format.
 
 ## Workspace
@@ -135,6 +139,7 @@ Profile web1
 | [`forward`](crates/forward) | SOCKS 4/4a/5 handshake, X11 display, `.Xauthority` and cookie swap |
 | [`tmuxcc`](crates/tmuxcc) | tmux control-mode parser and layout mapping |
 | [`config`](crates/config) | `ssh_config` parser, known_hosts and imports from other SSH clients |
+| [`update`](crates/update) | Signed update file format and its Ed25519 check (Help > Check for updates) |
 | [`viewer`](crates/viewer) | VNC and RDP clients, viewer process and its pipe protocol (only with the `vnc-viewer` or `rdp-viewer` feature) |
 
 ## Building
@@ -149,11 +154,15 @@ The release profile optimises for size and links the C runtime statically, so `t
 
 With the built-in desktop viewer: `cargo build --release -p ferossh --features desktop-viewer` (RDP and VNC), or `--features rdp-viewer` or `--features vnc-viewer` for one. CI builds the standard exe, the VNC-only one and the full one, uploads them as `ferossh.exe`, `ferossh-vnc.exe` and `ferossh-desktop.exe`, and reports their sizes.
 
-Checks run in CI: `cargo fmt`, `cargo clippy`, `cargo test`, `cargo deny`, `cargo audit`, SSH tests against a real OpenSSH server on Linux (`cargo test -p ferossh-worker --test sshd`, skipped where `sshd` is not installed), the tmux integration against a real tmux (`cargo test -p ferossh tmux_e2e`, skipped without tmux), the RDP viewer against a real xrdp (`FEROSSH_TEST_RDP="127.0.0.1:3389 user password" cargo test -p ferossh-viewer --features rdp rdp::`), the VNC viewer's resize against a real Xvnc (`FEROSSH_TEST_VNC=127.0.0.1:5905 cargo test -p ferossh-viewer --features vnc resizes_a_real_server`), and fuzz smoke runs of the IPC decoder, the SFTP decoder, the tmux control-mode client, the SOCKS and X11 parsers, the VNC client, the RDP session's decoders and the terminal (`cargo +nightly fuzz run --target x86_64-unknown-linux-gnu term_feed`).
+Checks run in CI: `cargo fmt`, `cargo clippy`, `cargo test`, `cargo deny`, `cargo audit`, SSH tests against a real OpenSSH server on Linux (`cargo test -p ferossh-worker --test sshd`, skipped where `sshd` is not installed), the tmux integration against a real tmux (`cargo test -p ferossh tmux_e2e`, skipped without tmux), the RDP viewer against a real xrdp (`FEROSSH_TEST_RDP="127.0.0.1:3389 user password" cargo test -p ferossh-viewer --features rdp rdp::`), the VNC viewer's resize against a real Xvnc (`FEROSSH_TEST_VNC=127.0.0.1:5905 cargo test -p ferossh-viewer --features vnc resizes_a_real_server`), `ferossh.exe --check-sandbox` on the release exe, a reproducible-build check, and a one-minute fuzz run of each of the eleven fuzz targets (`cargo +nightly fuzz run --target x86_64-unknown-linux-gnu term_feed`). The [fuzz campaign](.github/workflows/fuzz.yml) runs every target for longer each week, keeping its corpus between runs.
 
 Releases: pushing a version tag (`git tag v0.1.0 && git push origin v0.1.0`) runs [`release.yml`](.github/workflows/release.yml). It checks that the tag matches the version in `Cargo.toml` and that `docs/releases/<tag>.md` exists, runs every CI job, and publishes a GitHub Release with `ferossh.exe`, `ferossh-desktop.exe`, `SHA256SUMS.txt`, a release manifest (`BUILD-MANIFEST.json`: tag, commit, toolchain, and each exe's size and SHA-256 before and after signing) and those notes. The exes, sums and manifest get build provenance attestations signed with the workflow's identity, so `gh attestation verify ferossh.exe -R jkobierczynski/FeroSSH` checks a download. Builds are reproducible: `pwsh scripts/build-release.ps1` on a release's tag gives the same bytes as the manifest's unsigned hashes, and CI checks that on every change. With the `UPDATE_SIGNING_KEY` secret set, each release also gets `update.txt` and `update.txt.sig`, the signed file Help > Check for updates reads; `cargo run -p ferossh-update --example keygen` makes that key once, writing the public half to `crates/update/update-key.pub` (commit it) and printing the private half for the secret. Run the workflow by hand from the Actions tab for a dry run: everything but the attestation and the release, with the files uploaded as the `release-dry-run` artifact. Each run also uploads `winget-manifests`, the winget manifests for `ferossh.exe` (package `jkobierczynski.FeroSSH`, a portable app) ready to submit to [winget-pkgs](https://github.com/microsoft/winget-pkgs), for example with `wingetcreate submit`. The exes are signed through SignPath (see the code signing policy below) once the `SIGNPATH_API_TOKEN` secret and the `SIGNPATH_ORGANIZATION_ID` variable are set, and go out unsigned otherwise; the release waits until an approver approves the signing request on signpath.io.
 
 On Linux or macOS, `cargo run -p ferossh-term --example vttest -- 1 2 8` drives [vttest](https://invisible-island.net/vttest/) through the emulator and prints every screen as text.
+
+## Reporting a vulnerability
+
+Please report security problems privately through **Report a vulnerability** on the repository's [Security tab](https://github.com/jkobierczynski/FeroSSH/security), not in a public issue. [SECURITY.md](SECURITY.md) says what to include and what to expect.
 
 ## Code signing policy
 
