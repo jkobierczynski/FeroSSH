@@ -50,6 +50,8 @@ mod layout;
 #[cfg_attr(not(windows), allow(dead_code))]
 mod link;
 #[cfg_attr(not(windows), allow(dead_code))]
+mod login_script;
+#[cfg_attr(not(windows), allow(dead_code))]
 mod look;
 #[cfg_attr(not(windows), allow(dead_code))]
 mod newkey;
@@ -71,6 +73,8 @@ mod serial_port;
 mod session_form;
 #[cfg_attr(not(windows), allow(dead_code))]
 mod sessions;
+#[cfg_attr(not(windows), allow(dead_code))]
+mod snippets_view;
 #[cfg_attr(not(windows), allow(dead_code))]
 mod ssh;
 #[cfg(all(test, unix))]

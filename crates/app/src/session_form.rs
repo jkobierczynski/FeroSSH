@@ -12,6 +12,7 @@
 //! the session a new name saves an editable copy.
 
 use ferossh_config::forward::parse_option;
+use ferossh_config::login::Step;
 use ferossh_config::password::{PasswordSource, TEMPLATES};
 use ferossh_config::saved::{self, SavedHost};
 use ferossh_config::serial::{self, FRAMINGS, Flow, LineSettings};
@@ -77,6 +78,8 @@ pub struct Values {
     /// A serial session's framing, such as `8N1`; empty is 8N1.
     pub framing: String,
     pub flow: Flow,
+    /// The login script, one step per entry, as `expect Password:`.
+    pub login_script: Vec<String>,
 }
 
 /// Asking, Windows, the password manager templates, then a command of
@@ -173,6 +176,7 @@ impl Values {
         self.vnc_port = opt_text(&p.vnc_port);
         self.legacy = p.legacy_algorithms;
         (self.password, self.password_command) = password_choice(&p.password);
+        self.login_script = p.login_script.iter().map(ToString::to_string).collect();
         if let Some(line) = &p.serial {
             self.speed = line.speed.to_string();
             self.framing = line.framing();
@@ -208,6 +212,7 @@ enum Field {
     Speed,
     Framing,
     Flow,
+    LoginStep(usize),
 }
 
 impl Field {
@@ -237,6 +242,7 @@ impl Field {
             Field::Speed => "Speed",
             Field::Framing => "Framing",
             Field::Flow => "Flow ctrl",
+            Field::LoginStep(_) => "Login",
         }
     }
 
@@ -337,6 +343,7 @@ impl SessionForm {
             width: 34,
         };
         f.values.forwards.retain(|t| !t.trim().is_empty());
+        f.values.login_script.retain(|t| !t.trim().is_empty());
         f.tidy_forwards();
         f.focus = f.first_field();
         f.cursor = f.text(Field::Name).map_or(0, |t| t.chars().count());
@@ -368,10 +375,13 @@ impl SessionForm {
     }
 
     /// Keeps one empty forward line at the end to type a new one in.
+    /// Keeps one empty forward line and one empty login step at the end
+    /// to type a new one in.
     fn tidy_forwards(&mut self) {
-        let fw = &mut self.values.forwards;
-        if fw.last().is_none_or(|t| !t.trim().is_empty()) {
-            fw.push(String::new());
+        for list in [&mut self.values.forwards, &mut self.values.login_script] {
+            if list.last().is_none_or(|t| !t.trim().is_empty()) {
+                list.push(String::new());
+            }
         }
     }
 
@@ -448,6 +458,16 @@ impl SessionForm {
                 out.extend([Field::DesktopPort, Field::VncPort, Field::Legacy].map(Item::Field));
             }
         }
+        if matches!(kind, SessionKind::Ssh | SessionKind::Serial) {
+            if kind == SessionKind::Serial {
+                out.push(Item::Section(2));
+            }
+            if self.open[2] {
+                let n = self.values.login_script.len();
+                out.extend((0..n).map(|i| Item::Field(Field::LoginStep(i))));
+                out.push(Item::Note("expect, send, password, secret, pause".into()));
+            }
+        }
         if let Some(e) = &self.error {
             out.extend(
                 wrap(e, self.width.saturating_sub(2))
@@ -500,6 +520,7 @@ impl SessionForm {
             Field::Scrollback => &v.scrollback,
             Field::Tmux => &v.tmux,
             Field::Forward(i) => return v.forwards.get(i),
+            Field::LoginStep(i) => return v.login_script.get(i),
             Field::DesktopPort => &v.desktop_port,
             Field::VncPort => &v.vnc_port,
             Field::PasswordCommand => &v.password_command,
@@ -532,6 +553,7 @@ impl SessionForm {
             Field::Scrollback => &mut v.scrollback,
             Field::Tmux => &mut v.tmux,
             Field::Forward(i) => return v.forwards.get_mut(i),
+            Field::LoginStep(i) => return v.login_script.get_mut(i),
             Field::DesktopPort => &mut v.desktop_port,
             Field::VncPort => &mut v.vnc_port,
             Field::PasswordCommand => &mut v.password_command,
@@ -688,6 +710,8 @@ impl SessionForm {
             Field::Scrollback => h.scrollback.to_string(),
             Field::Tmux => "off".into(),
             Field::Forward(_) => "e.g. L 8080 web:80".into(),
+            Field::LoginStep(0) => "e.g. expect Password:".into(),
+            Field::LoginStep(_) => "next step".into(),
             Field::DesktopPort => "3389".into(),
             Field::VncPort => "5900".into(),
             Field::PasswordCommand => "program and arguments".into(),
@@ -837,6 +861,13 @@ impl SessionForm {
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.'))
         {
             return Err("tmux session names use letters, digits, . _ and - only.".into());
+        }
+        if matches!(v.kind, SessionKind::Ssh | SessionKind::Serial) {
+            for (i, step) in v.login_script.iter().enumerate() {
+                if !step.trim().is_empty() {
+                    Step::parse(step).map_err(|e| format!("Login step {}: {e}", i + 1))?;
+                }
+            }
         }
         port(&v.desktop_port, "The RDP port")?;
         port(&v.vnc_port, "The VNC port")?;
@@ -1161,7 +1192,7 @@ impl SessionForm {
 
     fn draw_field(&self, line: &mut Line, f: Field, here: bool, palette: &Palette) {
         let label = match f {
-            Field::Forward(i) => format!("{} {}", f.label(), i + 1),
+            Field::Forward(i) | Field::LoginStep(i) => format!("{} {}", f.label(), i + 1),
             Field::Host if self.values.kind == SessionKind::Serial => "COM port".to_owned(),
             _ => f.label().to_owned(),
         };
@@ -1289,6 +1320,14 @@ impl SessionForm {
             }
             _ => PasswordSource::Ask,
         };
+        p.login_script = if matches!(v.kind, SessionKind::Ssh | SessionKind::Serial) {
+            v.login_script
+                .iter()
+                .filter_map(|t| Step::parse(t).ok())
+                .collect()
+        } else {
+            Vec::new()
+        };
         p.serial = is_serial.then(|| {
             let mut line = LineSettings {
                 flow: v.flow,
@@ -1358,7 +1397,7 @@ fn port(text: &str, what: &str) -> Result<(), String> {
 /// A row being filled from the left.
 pub(crate) struct Line {
     cells: Vec<Cell>,
-    width: usize,
+    pub(crate) width: usize,
     pub(crate) col: usize,
     bg: Rgb,
 }
@@ -1586,7 +1625,14 @@ mod tests {
         );
         assert!(t[6].contains("Speed") && t[6].contains("9600"));
         assert!(t[7].contains("8N1") && t[8].contains("none"));
-        assert!(!t.iter().any(|l| l.contains("User") || l.contains("Extras")));
+        assert!(
+            !t.iter()
+                .any(|l| l.contains("User") || l.contains("Forward"))
+        );
+        assert!(
+            t.iter().any(|l| l.contains("Extras")),
+            "for the login script"
+        );
         assert!(t.iter().any(|l| l.contains("Look")));
         assert!(f.check().unwrap_err().contains("COM port"));
         f.values.host = "com3".into();
@@ -1642,6 +1688,44 @@ mod tests {
         let mut hosts = Vec::new();
         f.apply(&mut hosts, &mut Settings::default());
         assert_eq!(hosts[0].forwards[0].to_string(), "-D 1080");
+    }
+
+    #[test]
+    fn login_steps_are_checked_and_saved_in_the_profile() {
+        let mut f = new_form();
+        typed(&mut f, "sw1");
+        down(&mut f, 11);
+        f.key(SideKey::Enter { split: false }, 30);
+        // tmux, tmux panes, Forward 1, RDP port, VNC port, Old crypto.
+        down(&mut f, 7);
+        assert_eq!(f.focused_field(), Some(Field::LoginStep(0)));
+        let t = texts(&mut f);
+        assert!(
+            t.iter().any(|l| l.contains("e.g. expect Password:")),
+            "{t:#?}"
+        );
+        typed(&mut f, "expect >");
+        f.key(SideKey::Down, 30);
+        typed(&mut f, "secret en able");
+        let err = f.check().unwrap_err();
+        assert!(err.starts_with("Login step 2:"), "{err}");
+        f.key(SideKey::Backspace, 30);
+        f.key(SideKey::Backspace, 30);
+        f.key(SideKey::Backspace, 30);
+        f.key(SideKey::Backspace, 30);
+        f.key(SideKey::Backspace, 30);
+        typed(&mut f, "able");
+        assert_eq!(f.check(), Ok(()));
+        assert_eq!(f.values.login_script, ["expect >", "secret enable", ""]);
+        let (mut hosts, mut settings) = (Vec::new(), Settings::default());
+        f.apply(&mut hosts, &mut settings);
+        let p = settings.profile("sw1").unwrap();
+        assert_eq!(
+            p.login_script,
+            [Step::Expect(">".into()), Step::Secret("enable".into())]
+        );
+        let v = Values::from_saved(&hosts[0]).with_profile(Some(p));
+        assert_eq!(v.login_script, ["expect >", "secret enable"]);
     }
 
     #[test]
