@@ -155,6 +155,12 @@ pub enum Effect {
     Broker(Job),
     /// Logged in: the shell is open.
     Connected,
+    /// Get the login password from the session's password source, then
+    /// call [`SshSession::password_fetched`].
+    FetchPassword,
+    /// The password typed for this login worked: keep it in the Windows
+    /// Credential Manager. One string; `Secrets` keeps it out of `Debug`.
+    StorePassword(Secrets),
     /// The connection is gone.
     Ended,
 }
@@ -175,9 +181,11 @@ enum Purpose {
         key: Vec<u8>,
     },
     /// One field of a server prompt; earlier answers are kept.
+    /// `password` marks the login password.
     Answer {
         fields: Vec<PromptField>,
         answers: Secrets,
+        password: bool,
     },
     Passphrase {
         identity: Identity,
@@ -215,6 +223,20 @@ pub struct SshSession {
     pub legacy: bool,
     /// The connection negotiated one of the legacy algorithms.
     legacy_in_use: bool,
+    /// The host's profile names a password source to try first.
+    pub password_source: bool,
+    /// Keep a typed password that worked (the Windows Credential Manager).
+    pub remember_password: bool,
+    /// The kind of the server prompt being answered.
+    prompt_kind: Option<PromptKind>,
+    /// The source was asked once; a second password prompt is typed.
+    source_tried: bool,
+    /// The source gave the password just sent.
+    source_used: bool,
+    /// The password prompt waiting for the source, and the fields after it.
+    fetching: Option<(PromptField, Vec<PromptField>)>,
+    /// The password typed for this login, to keep once it worked.
+    typed_password: Option<Zeroizing<String>>,
 }
 
 impl std::fmt::Debug for SshSession {
@@ -224,6 +246,19 @@ impl std::fmt::Debug for SshSession {
             .field("target", &self.target)
             .field("state", &self.state)
             .finish_non_exhaustive()
+    }
+}
+
+/// A prompt that asks for the login password: the `password` method, or
+/// a keyboard-interactive round whose only question is a hidden
+/// "Password:" (PAM's way).
+fn is_password_prompt(kind: PromptKind, fields: &[PromptField]) -> bool {
+    match (kind, fields) {
+        (PromptKind::Password, [_]) => true,
+        (PromptKind::KeyboardInteractive, [f]) => {
+            !f.echo && f.text.to_ascii_lowercase().contains("password")
+        }
+        _ => false,
     }
 }
 
@@ -266,6 +301,13 @@ impl SshSession {
             x11: None,
             legacy: false,
             legacy_in_use: false,
+            password_source: false,
+            remember_password: false,
+            prompt_kind: None,
+            source_tried: false,
+            source_used: false,
+            fetching: None,
+            typed_password: None,
         }
     }
 
@@ -452,6 +494,9 @@ impl SshSession {
                         "{AMBER}{}{RESET}\r\n",
                         sanitize(&text)
                     )));
+                }
+                if let Some(password) = self.typed_password.take() {
+                    effects.push(Effect::StorePassword(Secrets(vec![password.to_string()])));
                 }
                 effects.push(Effect::Connected);
                 effects
@@ -780,6 +825,14 @@ impl SshSession {
         fields: Vec<PromptField>,
     ) -> Vec<Effect> {
         let mut effects = Vec::new();
+        self.prompt_kind = Some(kind);
+        let asks_password = is_password_prompt(kind, &fields);
+        if asks_password && self.source_used {
+            self.source_used = false;
+            effects.push(Effect::Show(dim(
+                "The password from the password source did not work; type it.",
+            )));
+        }
         if kind == PromptKind::KeyboardInteractive {
             for text in [name, instructions] {
                 let text = sanitize(text.trim_end());
@@ -788,8 +841,53 @@ impl SshSession {
                 }
             }
         }
+        if asks_password && self.password_source && !self.source_tried {
+            self.source_tried = true;
+            let mut fields = fields;
+            let field = fields.remove(0);
+            self.fetching = Some((field, fields));
+            effects.push(Effect::FetchPassword);
+            return effects;
+        }
         effects.extend(self.next_field(fields, Secrets::default()));
         effects
+    }
+
+    /// Whether the session waits for its password source.
+    pub fn fetching_password(&self) -> bool {
+        self.fetching.is_some()
+    }
+
+    /// The password source answered: `Ok` sends the password, `Err` says
+    /// why not and asks for it at the prompt instead. `from` names the
+    /// source for the note.
+    pub fn password_fetched(
+        &mut self,
+        result: Result<Zeroizing<String>, String>,
+        from: &str,
+    ) -> Vec<Effect> {
+        let Some((field, rest)) = self.fetching.take() else {
+            return Vec::new();
+        };
+        match result {
+            Ok(password) => {
+                self.source_used = true;
+                let mut effects = vec![Effect::Show(dim(&format!(
+                    "Password from {}.",
+                    sanitize(from)
+                )))];
+                let answers = Secrets(vec![password.to_string()]);
+                effects.extend(self.next_field(rest, answers));
+                effects
+            }
+            Err(why) => {
+                let mut effects = vec![Effect::Show(dim(&sanitize(&why)))];
+                let mut fields = vec![field];
+                fields.extend(rest);
+                effects.extend(self.next_field(fields, Secrets::default()));
+                effects
+            }
+        }
     }
 
     /// Asks the next server question, or sends the answers when none is
@@ -801,12 +899,20 @@ impl SshSession {
                 answers,
             })];
         }
+        let password = answers.0.is_empty()
+            && self
+                .prompt_kind
+                .is_some_and(|k| is_password_prompt(k, &fields));
         let field = fields.remove(0);
         let echo = field.echo;
         self.prompt = Some(LocalPrompt {
             echo,
             text: Zeroizing::new(String::new()),
-            purpose: Purpose::Answer { fields, answers },
+            purpose: Purpose::Answer {
+                fields,
+                answers,
+                password,
+            },
         });
         vec![Effect::Show(sanitize(&field.text))]
     }
@@ -911,7 +1017,11 @@ impl SshSession {
             Purpose::Answer {
                 fields,
                 mut answers,
+                password,
             } => {
+                if password && self.remember_password && !text.is_empty() {
+                    self.typed_password = Some(text.clone());
+                }
                 answers.0.push(text.to_string());
                 self.next_field(fields, answers)
             }
@@ -1290,6 +1400,110 @@ mod tests {
             }
             ref other => panic!("{other:?}"),
         }
+    }
+
+    fn password_prompt(channel: ChannelId) -> Message {
+        Message::Prompt {
+            channel,
+            kind: PromptKind::Password,
+            name: String::new(),
+            instructions: String::new(),
+            fields: vec![PromptField {
+                text: "Password: ".into(),
+                echo: false,
+            }],
+        }
+    }
+
+    fn answers(fx: &[Effect]) -> Vec<String> {
+        match sent(fx)[..] {
+            [Message::Answers { answers, .. }] => answers.0.clone(),
+            ref other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_password_source_answers_once_then_the_user_types() {
+        let dir = temp("source");
+        let e = env(&dir);
+        let mut s = SshSession::new(1, Target::resolve("host", &e).unwrap(), e.known_hosts());
+        s.password_source = true;
+        let fx = s.on_worker(password_prompt(1));
+        assert!(matches!(fx[..], [Effect::FetchPassword]), "{fx:?}");
+        assert!(s.fetching_password() && !s.prompt_active());
+        let fx = s.password_fetched(Ok(Zeroizing::new("s3cret".into())), "1Password");
+        assert!(shown(&fx).contains("Password from 1Password."));
+        assert!(!shown(&fx).contains("s3cret"));
+        assert_eq!(answers(&fx), ["s3cret"]);
+        // Refused: the server asks again, and now the user types.
+        let fx = s.on_worker(password_prompt(1));
+        assert!(shown(&fx).contains("did not work"));
+        assert!(s.prompt_active());
+        s.prompt_input(b"typed");
+        assert_eq!(answers(&s.prompt_input(b"\r")), ["typed"]);
+    }
+
+    #[test]
+    fn a_failed_source_falls_back_to_the_prompt() {
+        let dir = temp("source-fail");
+        let e = env(&dir);
+        let mut s = SshSession::new(1, Target::resolve("host", &e).unwrap(), e.known_hosts());
+        s.password_source = true;
+        // PAM's keyboard-interactive password counts too.
+        let fx = s.on_worker(Message::Prompt {
+            channel: 1,
+            kind: PromptKind::KeyboardInteractive,
+            name: String::new(),
+            instructions: String::new(),
+            fields: vec![PromptField {
+                text: "(admin@host) Password: ".into(),
+                echo: false,
+            }],
+        });
+        assert!(matches!(fx[..], [Effect::FetchPassword]), "{fx:?}");
+        let fx = s.password_fetched(Err("bw ended with code 1: locked".into()), "Bitwarden");
+        assert!(shown(&fx).contains("locked") && shown(&fx).contains("Password:"));
+        s.prompt_input(b"pw");
+        assert_eq!(answers(&s.prompt_input(b"\r")), ["pw"]);
+        // A one-time code is never taken from the source.
+        let fx = s.on_worker(Message::Prompt {
+            channel: 1,
+            kind: PromptKind::KeyboardInteractive,
+            name: String::new(),
+            instructions: String::new(),
+            fields: vec![PromptField {
+                text: "Verification code: ".into(),
+                echo: false,
+            }],
+        });
+        assert!(!fx.iter().any(|e| matches!(e, Effect::FetchPassword)));
+    }
+
+    #[test]
+    fn a_typed_password_is_kept_only_after_it_worked() {
+        let dir = temp("remember");
+        let e = env(&dir);
+        let mut s = SshSession::new(1, Target::resolve("host", &e).unwrap(), e.known_hosts());
+        s.password_source = true;
+        s.remember_password = true;
+        s.on_worker(password_prompt(1));
+        s.password_fetched(Err("No saved password yet.".into()), "Windows");
+        s.prompt_input(b"hunter2");
+        s.prompt_input(b"\r");
+        let fx = s.on_worker(Message::Connected {
+            channel: 1,
+            kex: "curve25519-sha256".into(),
+            cipher: "chacha20-poly1305@openssh.com".into(),
+            host_key: "ssh-ed25519".into(),
+        });
+        let stored: Vec<&str> = fx
+            .iter()
+            .filter_map(|e| match e {
+                Effect::StorePassword(p) => p.0.first().map(String::as_str),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(stored, ["hunter2"]);
     }
 
     #[test]

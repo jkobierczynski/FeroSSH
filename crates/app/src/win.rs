@@ -19,6 +19,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use ferossh_auth::Broker;
+use ferossh_config::password::{self as pw_source, PasswordSource};
 use ferossh_config::saved::{self, SavedHost};
 use ferossh_config::settings::{DEFAULT_DESKTOP_PORT, DEFAULT_VNC_PORT};
 use ferossh_config::{SessionKind, Settings, putty, ssh_config};
@@ -84,6 +85,7 @@ use windows::core::{HSTRING, PCWSTR, PWSTR, Result, w};
 use crate::Launch;
 use crate::clipboard;
 use crate::conpty::{self, Output, Shell};
+use crate::credman;
 use crate::desktop::{Desktop, Protocol, Update as DesktopUpdate};
 use crate::files::{FilesAction, FilesView};
 use crate::forwards::{ConnView, DesktopEvent, Forwarder, Setup as ForwardSetup, desktop_port_for};
@@ -93,6 +95,7 @@ use crate::link::{Link, LinkEvent};
 use crate::look;
 use crate::pattern;
 use crate::putty_reg;
+use crate::pwcommand;
 use crate::sandbox;
 use crate::scrollmark;
 use crate::session_form::{self, FormAction, Hints, SessionForm, Source, Values};
@@ -101,6 +104,7 @@ use crate::ssh::{Effect, Env, SshSession, State, Target};
 use crate::tabstrip::{self, Forwarding, Health, Hit, Palette, StripLayout, TabLabel};
 use crate::tmux::{self, Mode as TmuxMode, Tmux};
 use ferossh_tmuxcc::saved as tmux_saved;
+use zeroize::Zeroizing;
 
 const DEFAULT_COLS: usize = 80;
 const DEFAULT_ROWS: usize = 24;
@@ -521,9 +525,20 @@ struct Window {
     /// Remote desktops asked for and not yet open, by connection and
     /// desktop server (host as the SSH server sees it, and port).
     desktops: HashMap<(ChannelId, String, u16), DesktopWant>,
+    /// Passwords from password manager commands, as they finish: the pane,
+    /// its session's channel, the program and the result.
+    passwords: Arc<std::sync::Mutex<Vec<PasswordAnswer>>>,
     /// Desktop sessions waiting for their SSH pane to log in.
     pending_desktops: HashMap<PaneId, PendingDesktop>,
 }
+
+/// What a password manager command gave for a pane's login.
+type PasswordAnswer = (
+    PaneId,
+    ChannelId,
+    String,
+    std::result::Result<Zeroizing<String>, String>,
+);
 
 /// A desktop session whose SSH connection is still logging in.
 #[derive(Debug, Clone)]
@@ -717,6 +732,33 @@ fn host_items(env: &Env) -> Vec<HostItem> {
         .collect()
 }
 
+/// The password manager commands the user allowed, one per line, in
+/// `%LOCALAPPDATA%\FeroSSH`: on this PC only, not beside the settings
+/// that may be copied or shared, so a settings file from elsewhere cannot
+/// run a command without asking.
+fn approved_commands_path() -> PathBuf {
+    std::env::var_os("LOCALAPPDATA")
+        .map_or_else(|| PathBuf::from("."), PathBuf::from)
+        .join("FeroSSH")
+        .join("approved-password-commands.txt")
+}
+
+fn command_approved(line: &str) -> bool {
+    std::fs::read_to_string(approved_commands_path())
+        .is_ok_and(|t| t.lines().any(|l| l == line.trim()))
+}
+
+fn approve_command(line: &str) {
+    let path = approved_commands_path();
+    let mut text = std::fs::read_to_string(&path).unwrap_or_default();
+    if !text.is_empty() && !text.ends_with('\n') {
+        text.push('\n');
+    }
+    text.push_str(line.trim());
+    text.push('\n');
+    let _ = write_app_file(&path, &text);
+}
+
 /// Where tab logs go: `%LOCALAPPDATA%\FeroSSH\logs`.
 fn log_dir() -> PathBuf {
     std::env::var_os("LOCALAPPDATA")
@@ -862,6 +904,7 @@ fn create_and_run(launch: Launch, theme: Option<String>) -> Result<()> {
                 reattach: HashMap::new(),
                 queued: Vec::new(),
                 desktops: HashMap::new(),
+                passwords: Arc::default(),
                 pending_desktops: HashMap::new(),
             });
         });
@@ -2368,9 +2411,16 @@ impl Window {
             .settings
             .profile(&target.alias)
             .is_some_and(|p| p.legacy_algorithms);
+        let source = self
+            .settings
+            .profile(&target.alias)
+            .map(|p| p.password.clone())
+            .unwrap_or_default();
         let mut session = SshSession::new(channel, target, env.known_hosts());
         session.x11 = x11;
         session.legacy = legacy;
+        session.password_source = source != PasswordSource::Ask;
+        session.remember_password = source == PasswordSource::Windows;
         let Some(p) = self.panes.get_mut(&id) else {
             return;
         };
@@ -2445,6 +2495,8 @@ impl Window {
                         b.submit(job);
                     }
                 }
+                Effect::FetchPassword => self.fetch_password(id),
+                Effect::StorePassword(password) => self.store_password(id, &password),
                 Effect::Connected => {
                     self.start_log(id);
                     self.sftp_connected(id);
@@ -2463,6 +2515,138 @@ impl Window {
                 }
             }
         }
+    }
+
+    /// Gets the login password of SSH pane `id` from its password source.
+    fn fetch_password(&mut self, id: PaneId) {
+        let Some(Host::Ssh(s)) = self.panes.get(&id).map(|p| &p.host) else {
+            return;
+        };
+        let t = &s.target;
+        let source = self
+            .settings
+            .profile(&t.alias)
+            .map(|p| p.password.clone())
+            .unwrap_or_default();
+        match source {
+            PasswordSource::Ask => {
+                self.password_result(id, Err(String::new()), "");
+            }
+            PasswordSource::Windows => {
+                let result = match credman::read(&credman::target(&t.user, &t.hostname, t.port)) {
+                    Ok(Some(password)) => Ok(password),
+                    Ok(None) => Err(
+                        "No password saved in the Windows Credential Manager yet; type it \
+                         and FeroSSH saves it once the login works."
+                            .into(),
+                    ),
+                    Err(e) => Err(e),
+                };
+                self.password_result(id, result, "the Windows Credential Manager");
+            }
+            PasswordSource::Command(line) => {
+                if command_approved(&line) {
+                    self.run_password_command(id, &line);
+                } else {
+                    self.queued
+                        .push(Command::ConfirmPasswordTool { pane: id, line });
+                }
+            }
+        }
+    }
+
+    /// Runs the password manager command `line` for pane `id`'s login on
+    /// a thread of its own; [`Self::poll_passwords`] takes the answer.
+    fn run_password_command(&mut self, id: PaneId, line: &str) {
+        let Some(Host::Ssh(s)) = self.panes.get(&id).map(|p| &p.host) else {
+            return;
+        };
+        let t = &s.target;
+        let tokens = pw_source::Tokens {
+            name: &t.alias,
+            host: &t.hostname,
+            user: &t.user,
+            port: t.port,
+        };
+        let Some((program, args)) = pw_source::command(line, &tokens) else {
+            self.password_result(id, Err("The password command is empty.".into()), "");
+            return;
+        };
+        let channel = s.channel;
+        let name = Path::new(&program)
+            .file_stem()
+            .map_or_else(|| program.clone(), |n| n.to_string_lossy().into_owned());
+        self.show(
+            id,
+            &format!(
+                "\x1b[0;90mGetting the password from {}...\x1b[0m\r\n",
+                crate::ssh::sanitize(&name)
+            ),
+        );
+        self.refresh(id);
+        let answers = self.passwords.clone();
+        let notify = self.notifier();
+        std::thread::spawn(move || {
+            let result = pwcommand::run(&program, &args, pwcommand::TIMEOUT);
+            if let Ok(mut a) = answers.lock() {
+                a.push((id, channel, name, result));
+            }
+            notify();
+        });
+    }
+
+    /// Hands finished password commands to their panes, if those still
+    /// wait for them.
+    fn poll_passwords(&mut self) {
+        let done = match self.passwords.lock() {
+            Ok(mut a) => std::mem::take(&mut *a),
+            Err(_) => return,
+        };
+        for (id, channel, name, result) in done {
+            let waiting = matches!(
+                self.panes.get(&id).map(|p| &p.host),
+                Some(Host::Ssh(s)) if s.channel == channel && s.fetching_password()
+            );
+            if waiting {
+                self.password_result(id, result, &name);
+            }
+        }
+    }
+
+    /// Gives pane `id`'s session the password its source found, or why
+    /// there is none (it then asks at the prompt).
+    fn password_result(
+        &mut self,
+        id: PaneId,
+        result: std::result::Result<Zeroizing<String>, String>,
+        from: &str,
+    ) {
+        let Some(Host::Ssh(s)) = self.panes.get_mut(&id).map(|p| &mut p.host) else {
+            return;
+        };
+        let effects = s.password_fetched(result, from);
+        self.apply(id, effects);
+        self.refresh(id);
+    }
+
+    /// Keeps the password that just worked for pane `id` in the Windows
+    /// Credential Manager.
+    fn store_password(&mut self, id: PaneId, password: &ferossh_ipc::Secrets) {
+        let (Some(Host::Ssh(s)), Some(password)) =
+            (self.panes.get(&id).map(|p| &p.host), password.0.first())
+        else {
+            return;
+        };
+        let t = &s.target;
+        let note = match credman::write(
+            &credman::target(&t.user, &t.hostname, t.port),
+            &t.user,
+            password,
+        ) {
+            Ok(()) => "Saved the password in the Windows Credential Manager.".to_owned(),
+            Err(e) => e,
+        };
+        self.show(id, &format!("\x1b[0;90m{note}\x1b[0m\r\n"));
     }
 
     /// Opens the pane's log if logging is on and the pane has a host.
@@ -2800,6 +2984,7 @@ impl Window {
         }
         self.desktop_events();
         self.poll_desktops();
+        self.poll_passwords();
         // The forwards list and the tab badges.
         if self
             .worker
@@ -3684,11 +3869,28 @@ impl Window {
                 let mut hosts = load_saved();
                 let mut settings = self.settings.clone();
                 let name = form.apply(&mut hosts, &mut settings);
+                // Off the Windows Credential Manager: the saved password goes. Its
+                // name is resolved before the session's settings change.
+                let was_windows = form.original.as_deref().is_some_and(|o| {
+                    self.settings
+                        .profile(o)
+                        .is_some_and(|p| p.password == PasswordSource::Windows)
+                });
+                let still_windows = settings
+                    .profile(&name)
+                    .is_some_and(|p| p.password == PasswordSource::Windows);
+                let forget = (was_windows && !still_windows)
+                    .then(|| form.original.clone())
+                    .flatten()
+                    .and_then(|o| Target::resolve(&o, &ssh_env()));
                 if let Err(e) = write_app_file(&sessions_path(), &saved::to_text(&hosts)) {
                     return Some(Command::Notice(format!(
                         "Could not save the session to {}: {e}",
                         sessions_path().display()
                     )));
+                }
+                if let Some(t) = forget {
+                    credman::delete(&credman::target(&t.user, &t.hostname, t.port));
                 }
                 self.settings = settings;
                 self.save_settings();
@@ -3715,6 +3917,14 @@ impl Window {
 
     /// Removes saved session `name` (after the user said yes).
     fn delete_session(&mut self, name: &str) {
+        if self
+            .settings
+            .profile(name)
+            .is_some_and(|p| p.password == PasswordSource::Windows)
+            && let Some(t) = Target::resolve(name, &ssh_env())
+        {
+            credman::delete(&credman::target(&t.user, &t.hostname, t.port));
+        }
         let mut hosts = load_saved();
         session_form::delete(name, &mut hosts, &mut self.settings);
         if let Err(e) = write_app_file(&sessions_path(), &saved::to_text(&hosts)) {
@@ -5626,6 +5836,11 @@ enum Command {
     DeleteSession(String),
     /// The file picker for the session form's key file.
     PickKey,
+    /// Ask before a password manager command runs the first time.
+    ConfirmPasswordTool {
+        pane: PaneId,
+        line: String,
+    },
 }
 
 /// A modal message box; `None` if another one is already open.
@@ -6124,6 +6339,24 @@ fn run_command(hwnd: HWND, command: Command) {
             if dialog(hwnd, &text, MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2) == Some(IDYES) {
                 with_window(|w| w.delete_session(&name));
             }
+        }
+        Command::ConfirmPasswordTool { pane, line } => {
+            let text = format!(
+                "FeroSSH will run this command to get the login password, and type the first \
+                 line it prints as the password:\n\n{}\n\nIt runs without a shell, a window \
+                 or any input. Run it now and from now on?",
+                line.chars().filter(|c| !c.is_control()).collect::<String>()
+            );
+            let yes =
+                dialog(hwnd, &text, MB_YESNO | MB_ICONQUESTION | MB_DEFBUTTON2) == Some(IDYES);
+            with_window(|w| {
+                if yes {
+                    approve_command(&line);
+                    w.run_password_command(pane, &line);
+                } else {
+                    w.password_result(pane, Err("The password command was not run.".into()), "");
+                }
+            });
         }
         Command::PickKey => {
             if let Some(path) = pick_key_file(hwnd) {
