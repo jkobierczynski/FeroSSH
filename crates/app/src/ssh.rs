@@ -2045,13 +2045,10 @@ mod tests {
         });
         s.prompt_input(b"yes");
         let fx = s.prompt_input(b"\r");
-        assert!(
-            sent(&fx).contains(&&Message::HostKeyVerdict {
-                channel,
-                accept: true
-            }),
-            "{fx:?}"
-        );
+        assert!(sent(&fx).contains(&&Message::HostKeyVerdict {
+            channel,
+            accept: true
+        }));
         s.on_worker(Message::Connected {
             channel,
             kex: "k".into(),
@@ -2106,7 +2103,7 @@ mod tests {
             },
         ] = &sent(&fx)[..]
         else {
-            panic!("{fx:?}");
+            panic!("not what the login does next");
         };
         assert_eq!(host, "bastion.example.org");
         assert_eq!(s.worker_for(Some(2)), Some(2));
@@ -2118,17 +2115,14 @@ mod tests {
         // over it in a worker of its own.
         let fx = hop_in(&mut s, 2);
         assert!(shown(&fx).contains("Logged in to jump host jump@bastion:2222"));
-        assert!(
-            fx.iter().any(|f| matches!(
-                f,
-                Effect::Tunnel {
-                    from: 2,
-                    to: 4,
-                    channel: 3
-                }
-            )),
-            "{fx:?}"
-        );
+        assert!(fx.iter().any(|f| matches!(
+            f,
+            Effect::Tunnel {
+                from: 2,
+                to: 4,
+                channel: 3
+            }
+        )));
         let msgs = sent(&fx);
         assert!(
             matches!(
@@ -2196,17 +2190,14 @@ mod tests {
             channel: 3,
             reason: "edge:22: the server could not connect (ConnectFailed).".into(),
         });
-        assert!(
-            shown(&fx).contains("The jump host jump@bastion:2222 could not reach edge:22"),
-            "{fx:?}"
-        );
+        assert!(shown(&fx).contains("The jump host jump@bastion:2222 could not reach edge:22"));
         assert_eq!(s.state(), State::Connecting);
         // Edge's login then fails, and with it the connection.
         let fx = s.on_worker(Message::Disconnected {
             channel: 4,
             reason: "The server closed the connection without saying why.".into(),
         });
-        assert!(shown(&fx).contains("Jump host me@edge:"), "{fx:?}");
+        assert!(shown(&fx).contains("Jump host me@edge:"));
         assert!(matches!(fx.last(), Some(Effect::Ended)));
         assert!(sent(&fx).contains(&&Message::Close { channel: 2 }));
         assert_eq!(s.state(), State::Ended);
@@ -2222,7 +2213,7 @@ mod tests {
             channel: 4,
             reason: String::new(),
         });
-        assert!(fx.is_empty(), "{fx:?}");
+        assert!(fx.is_empty());
         assert_eq!(s.state(), State::Connecting);
         let fx = s.on_worker(Message::Disconnected {
             channel: 3,
@@ -2277,7 +2268,7 @@ mod tests {
             channel: 1,
             key: ed25519_blob(),
         });
-        assert!(shown(&fx).contains("not how a login goes"), "{fx:?}");
+        assert!(shown(&fx).contains("not how a login goes"));
         assert!(sent(&fx).contains(&&Message::Close { channel: 2 }));
         assert_eq!(s.state(), State::Ended);
     }
@@ -2313,7 +2304,7 @@ mod tests {
             command,
         }) = fx.iter().find(|f| matches!(f, Effect::ProxyCommand { .. }))
         else {
-            panic!("{fx:?}");
+            panic!("not what the login does next");
         };
         assert_eq!(command.args, ["bastion", "22"]);
         assert!(sent(&fx).iter().any(|m| matches!(m,
