@@ -34,6 +34,19 @@ jobs:
       # ferossh-vnc.exe with the VNC viewer; ferossh-desktop.exe with the
       # VNC and RDP viewers. The script is the reproducible release build.
       - run: pwsh scripts/build-release.ps1
+      # Each exe starts its sandboxed processes as the window does
+      # (AppContainer, job limits, process mitigations) and checks that
+      # they run; exit code 2 means the mitigations were refused.
+      - name: Check the sandbox
+        shell: pwsh
+        run: |
+          foreach ($exe in 'ferossh', 'ferossh-vnc', 'ferossh-desktop') {
+            $p = Start-Process -FilePath "dist/$exe.exe" -ArgumentList '--check-sandbox' `
+              -Wait -PassThru -NoNewWindow -RedirectStandardOutput "check-$exe.txt"
+            "${exe}.exe --check-sandbox (exit $($p.ExitCode)):" | Tee-Object -Append $env:GITHUB_STEP_SUMMARY
+            Get-Content "check-$exe.txt" | Tee-Object -Append $env:GITHUB_STEP_SUMMARY
+            if ($p.ExitCode -ne 0) { throw "$exe.exe --check-sandbox exited with $($p.ExitCode)" }
+          }
       - name: Report exe sizes
         shell: pwsh
         run: |

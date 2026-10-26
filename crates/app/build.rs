@@ -1,4 +1,6 @@
-//! Embeds the application manifest (per-monitor DPI v2, Windows 10+).
+//! Embeds the application manifest (per-monitor DPI v2, Windows 10+), and
+//! makes Windows load the DLLs the exe imports from System32 only, so a
+//! DLL planted next to a downloaded ferossh.exe is never picked up.
 
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
@@ -13,5 +15,8 @@ fn main() {
             "cargo:rustc-link-arg-bins=/MANIFESTINPUT:{}",
             manifest.display()
         );
+        // LOAD_LIBRARY_SEARCH_SYSTEM32, for the import table (Windows 10
+        // 1607 and later; older versions ignore it).
+        println!("cargo:rustc-link-arg-bins=/DEPENDENTLOADFLAG:0x800");
     }
 }

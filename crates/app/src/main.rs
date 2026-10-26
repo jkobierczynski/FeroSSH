@@ -12,7 +12,8 @@
 //! `--local [command]`, which opens a local shell through ConPTY as
 //! milestone 2 did. `--theme NAME`, before the rest, picks the pane's
 //! colour theme. `--new-security-key [--hello] [--ed25519] FILE` makes a
-//! FIDO2 security key file (see `newkey`).
+//! FIDO2 security key file (see `newkey`). `--check-sandbox` starts the
+//! sandboxed processes and reports whether they run (see `selfcheck`).
 
 #![cfg_attr(windows, windows_subsystem = "windows")]
 
@@ -60,6 +61,8 @@ mod pwcommand;
 mod sandbox;
 #[cfg_attr(not(windows), allow(dead_code))]
 mod scrollmark;
+#[cfg(windows)]
+mod selfcheck;
 #[cfg_attr(not(windows), allow(dead_code))]
 mod serial_port;
 #[cfg_attr(not(windows), allow(dead_code))]
@@ -96,6 +99,8 @@ enum Launch {
     Local(String),
     /// Make a security key file.
     NewSecurityKey(newkey::NewKey),
+    /// Start the sandboxed processes, check that they run, and report.
+    CheckSandbox,
 }
 
 #[cfg_attr(not(windows), allow(dead_code))]
@@ -145,6 +150,7 @@ fn parse_args(args: &[String]) -> Result<Launch, String> {
                 let rest: Vec<String> = iter.cloned().collect();
                 return newkey::parse(&rest).map(Launch::NewSecurityKey);
             }
+            "--check-sandbox" => return Ok(Launch::CheckSandbox),
             "--no-sandbox" => sandbox = false,
             "-p" => port = Some(iter.next().ok_or("-p needs a port")?.clone()),
             "-l" => user = Some(iter.next().ok_or("-l needs a user name")?.clone()),
@@ -192,6 +198,7 @@ fn main() -> windows::core::Result<()> {
             Ok(())
         }
         Ok(Launch::NewSecurityKey(key)) => win::new_security_key(&key),
+        Ok(Launch::CheckSandbox) => std::process::exit(selfcheck::run()),
         #[cfg(feature = "viewer")]
         Ok(Launch::Viewer(input, output)) => {
             // Decoding only: no window, no network, no files.
@@ -250,6 +257,7 @@ mod tests {
             parse(&["--new-security-key", "--hello", "id_ecdsa_sk"]),
             Ok(Launch::NewSecurityKey(k)) if k.hello
         ));
+        assert_eq!(parse(&["--check-sandbox"]), Ok(Launch::CheckSandbox));
         assert!(parse(&["-x"]).is_err());
         assert!(parse(&["a", "b"]).is_err());
         assert!(parse(&["-p", "22"]).is_err());
