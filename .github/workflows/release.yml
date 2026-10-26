@@ -1,8 +1,8 @@
 name: Release
 
 # Pushing a version tag such as v0.1.0 runs every CI check, builds the
-# release exes, signs them when a certificate is configured, and publishes a
-# GitHub Release with the exes, their SHA-256 sums, a release manifest
+# release exes, signs them through SignPath when that is set up, and publishes
+# a GitHub Release with the exes, their SHA-256 sums, a release manifest
 # (BUILD-MANIFEST.json) and the notes from docs/releases/<tag>.md. The exes,
 # sums and manifest get signed build provenance attestations. A tag with a
 # hyphen (v0.2.0-rc1) makes a pre-release.
@@ -80,33 +80,56 @@ jobs:
             "$((Get-FileHash $_.FullName -Algorithm SHA256).Hash.ToLower())  $($_.Name)"
           } | Set-Content -Encoding ascii "$env:RUNNER_TEMP\unsigned.txt"
 
-      # Signing hook. It runs only when the WINDOWS_SIGNING_CERT secret is
-      # set (a base64 .pfx with its password in
-      # WINDOWS_SIGNING_CERT_PASSWORD); until then the exes go out unsigned.
-      # For Azure Trusted Signing, replace this step with
-      # azure/trusted-signing-action.
-      - name: Sign the exes
+      # Code signing through SignPath (free code signing for open source
+      # by SignPath.io, certificate by SignPath Foundation). It runs when
+      # the SIGNPATH_API_TOKEN secret and the SIGNPATH_ORGANIZATION_ID
+      # variable are set; until then the exes go out unsigned. SignPath
+      # signs only after a project approver approves the request on
+      # signpath.io, so this step waits up to six hours for that. The
+      # artifact configuration to paste into SignPath is in .signpath/.
+      - name: Check for SignPath
+        id: signpath
         shell: pwsh
         env:
-          CERT: ${{ secrets.WINDOWS_SIGNING_CERT }}
-          CERT_PASSWORD: ${{ secrets.WINDOWS_SIGNING_CERT_PASSWORD }}
+          TOKEN: ${{ secrets.SIGNPATH_API_TOKEN }}
+          ORG: ${{ vars.SIGNPATH_ORGANIZATION_ID }}
         run: |
-          if (-not $env:CERT) {
-            "No signing certificate configured: the exes are not signed." | Tee-Object -Append $env:GITHUB_STEP_SUMMARY
-            exit 0
+          if ($env:TOKEN -and $env:ORG) {
+            "enabled=true" >> $env:GITHUB_OUTPUT
+          } else {
+            "SignPath is not configured: the exes are not signed." | Tee-Object -Append $env:GITHUB_STEP_SUMMARY
           }
-          $pfx = Join-Path $env:RUNNER_TEMP "signing.pfx"
-          [IO.File]::WriteAllBytes($pfx, [Convert]::FromBase64String($env:CERT))
-          try {
-            $signtool = Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\bin\*\x64\signtool.exe" |
-              Sort-Object FullName -Descending | Select-Object -First 1
-            & $signtool.FullName sign /fd SHA256 /td SHA256 /tr http://timestamp.digicert.com `
-              /f $pfx /p $env:CERT_PASSWORD dist\ferossh.exe dist\ferossh-desktop.exe
-            if ($LASTEXITCODE) { exit $LASTEXITCODE }
-            & $signtool.FullName verify /pa dist\ferossh.exe dist\ferossh-desktop.exe
-            if ($LASTEXITCODE) { exit $LASTEXITCODE }
-          } finally {
-            Remove-Item $pfx -Force
+      - uses: actions/upload-artifact@v4
+        id: unsigned
+        if: steps.signpath.outputs.enabled == 'true'
+        with:
+          name: unsigned-exes
+          path: |
+            dist/ferossh.exe
+            dist/ferossh-desktop.exe
+      - uses: signpath/github-action-submit-signing-request@v3
+        if: steps.signpath.outputs.enabled == 'true'
+        with:
+          api-token: ${{ secrets.SIGNPATH_API_TOKEN }}
+          organization-id: ${{ vars.SIGNPATH_ORGANIZATION_ID }}
+          project-slug: ${{ vars.SIGNPATH_PROJECT_SLUG || 'FeroSSH' }}
+          signing-policy-slug: ${{ github.event_name == 'push' && 'release-signing' || 'test-signing' }}
+          github-artifact-id: ${{ steps.unsigned.outputs.artifact-id }}
+          wait-for-completion: true
+          wait-for-completion-timeout-in-seconds: 21600
+          output-artifact-directory: signed
+      - name: Use the signed exes
+        if: steps.signpath.outputs.enabled == 'true'
+        shell: pwsh
+        run: |
+          Copy-Item signed\ferossh.exe, signed\ferossh-desktop.exe dist\ -Force
+          foreach ($exe in Get-ChildItem dist\*.exe) {
+            $sig = Get-AuthenticodeSignature $exe.FullName
+            if ($sig.Status -ne "Valid") {
+              "::error::$($exe.Name) is not validly signed: $($sig.Status)"
+              exit 1
+            }
+            "$($exe.Name): signed by $($sig.SignerCertificate.Subject)" | Tee-Object -Append $env:GITHUB_STEP_SUMMARY
           }
 
       # The sums are taken after signing, so they match what is downloaded.
