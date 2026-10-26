@@ -1117,8 +1117,11 @@ async fn transfers_files_with_zmodem() {
     let mut received = Vec::new();
     let mut ends = 0;
     let mut shown = Vec::new();
+    // What to type at the next prompt once a transfer ended: lrzsz drops
+    // what arrives while it puts the terminal back.
+    let mut next: Option<(&str, usize)> = None;
     let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
-    while ends < 2 {
+    loop {
         let msg = tokio::time::timeout_at(deadline, from_worker.recv())
             .await
             .expect("timed out")
@@ -1126,6 +1129,16 @@ async fn transfers_files_with_zmodem() {
         let reply = match msg {
             Message::Data { bytes, .. } => {
                 shown.extend(bytes);
+                if let Some((text, from)) = next
+                    && String::from_utf8_lossy(&shown[from..]).contains("$ ")
+                        | String::from_utf8_lossy(&shown[from..]).contains("# ")
+                {
+                    next = None;
+                    send(text.into()).await;
+                    if ends == 2 {
+                        break;
+                    }
+                }
                 continue;
             }
             Message::ZmodemStart { channel, upload } => Message::ZmodemAnswer {
@@ -1180,8 +1193,14 @@ async fn transfers_files_with_zmodem() {
                 ends += 1;
                 if ends == 1 {
                     assert!(received == data, "received {} bytes", received.len());
-                    send("rz\n".into()).await;
                 }
+                // rz writes the file when it exits, after the transfer.
+                let text = if ends == 1 {
+                    "rz\n"
+                } else {
+                    "echo zm$((40+2)); exit\n"
+                };
+                next = Some((text, shown.len()));
                 continue;
             }
             Message::Disconnected { reason, .. } => panic!("shell ended: {reason}"),
@@ -1189,8 +1208,6 @@ async fn transfers_files_with_zmodem() {
         };
         to_worker.send(reply).await.unwrap();
     }
-    // rz writes the file when it exits, after the transfer is over.
-    send("echo zm$((40+2)); exit\n".into()).await;
     loop {
         match from_worker.recv().await.unwrap() {
             Message::Data { channel: 1, bytes } => shown.extend(bytes),

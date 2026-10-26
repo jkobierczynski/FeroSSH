@@ -27,7 +27,7 @@
 
 use std::time::Duration;
 
-use ferossh_ipc::{ChannelId, MAX_DATA_CHUNK, Message};
+use ferossh_ipc::{ChannelId, Message};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
@@ -482,15 +482,6 @@ async fn session(
                 zm.timeout()
             }
         };
-        for chunk in step.terminal.chunks(MAX_DATA_CHUNK) {
-            let msg = Message::Data {
-                channel,
-                bytes: chunk.to_vec(),
-            };
-            if out.send(msg).await.is_err() {
-                return String::new();
-            }
-        }
         for msg in step.ui {
             if out.send(msg).await.is_err() {
                 return String::new();

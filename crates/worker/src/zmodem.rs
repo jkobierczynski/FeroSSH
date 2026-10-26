@@ -29,12 +29,30 @@ pub(crate) async fn sleep_until(at: Option<tokio::time::Instant>) {
 /// How long a possible start's first bytes wait for the rest.
 const SHOW_HELD: Duration = Duration::from_millis(50);
 
-/// What the pump does next: show, tell the UI, send to the server.
+/// What the pump does next: messages for the UI (terminal output among
+/// them, in the order it came), and bytes for the server.
 #[derive(Debug, Default, PartialEq, Eq)]
 pub(crate) struct Step {
-    pub terminal: Vec<u8>,
     pub ui: Vec<Message>,
     pub server: Vec<u8>,
+}
+
+impl Step {
+    /// Output for the terminal, after what the UI was told so far.
+    pub fn show(&mut self, channel: ChannelId, mut bytes: &[u8]) {
+        if let Some(Message::Data { bytes: last, .. }) = self.ui.last_mut() {
+            let n = MAX_DATA_CHUNK.saturating_sub(last.len()).min(bytes.len());
+            let (head, rest) = bytes.split_at(n);
+            last.extend_from_slice(head);
+            bytes = rest;
+        }
+        for chunk in bytes.chunks(MAX_DATA_CHUNK) {
+            self.ui.push(Message::Data {
+                channel,
+                bytes: chunk.to_vec(),
+            });
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -133,7 +151,7 @@ impl Zmodem {
             Mode::Receiving(rx) => rx.timeout(),
             Mode::Sending(tx) => tx.timeout(),
             // What looked like it might start a transfer did not.
-            Mode::Watching => step.terminal = self.detector.flush(),
+            Mode::Watching => step.show(self.channel, &self.detector.flush()),
             Mode::Asking { .. } => {}
         }
         self.drain(&mut step);
@@ -145,7 +163,7 @@ impl Zmodem {
             let used = match &mut self.mode {
                 Mode::Watching => {
                     let (shown, found) = self.detector.scan(bytes);
-                    step.terminal.extend(shown);
+                    step.show(self.channel, &shown);
                     if let Some(found) = found {
                         step.ui.push(Message::ZmodemStart {
                             channel: self.channel,
@@ -185,7 +203,7 @@ impl Zmodem {
                 // Shown as it came; the detector only looks past the
                 // start, or it would find it again.
                 let (head, rest) = held.split_at(held.len().min(6));
-                step.terminal.extend_from_slice(head);
+                step.show(self.channel, head);
                 self.server_bytes(rest, step);
             }
             (Start::Receive, ZmodemAnswer::Receive) => {
@@ -309,6 +327,44 @@ mod tests {
     use super::*;
     use ferossh_ipc::ZmodemUpload;
 
+    impl Step {
+        /// The terminal output, joined.
+        fn terminal(&self) -> Vec<u8> {
+            self.ui
+                .iter()
+                .filter_map(|m| match m {
+                    Message::Data { bytes, .. } => Some(bytes.as_slice()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+                .concat()
+        }
+
+        /// The messages other than terminal output.
+        fn others(&self) -> Vec<Message> {
+            self.ui
+                .iter()
+                .filter(|m| !matches!(m, Message::Data { .. }))
+                .cloned()
+                .collect()
+        }
+    }
+
+    #[test]
+    fn output_and_messages_keep_their_order() {
+        let mut z = Zmodem::new(4);
+        let step = z.on_server(SZ_START);
+        assert!(matches!(
+            step.ui[..],
+            [Message::Data { .. }, Message::ZmodemStart { .. }]
+        ));
+        let mut step = Step::default();
+        step.show(4, &vec![b'a'; MAX_DATA_CHUNK + 1]);
+        step.show(4, b"b");
+        assert_eq!(step.ui.len(), 2);
+        assert_eq!(step.terminal().len(), MAX_DATA_CHUNK + 2);
+    }
+
     const SZ_START: &[u8] = b"rz\r**\x18B00000000000000\r\x8a\x11";
     const RZ_START: &[u8] = b"rz waiting to receive.**\x18B0100000023be50\r\x8a\x11";
 
@@ -320,9 +376,9 @@ mod tests {
     fn asks_before_anything_happens() {
         let mut z = Zmodem::new(4);
         let step = z.on_server(SZ_START);
-        assert_eq!(step.terminal, b"rz\r");
+        assert_eq!(step.terminal(), b"rz\r");
         assert_eq!(
-            step.ui,
+            step.others(),
             [Message::ZmodemStart {
                 channel: 4,
                 upload: false
@@ -330,7 +386,7 @@ mod tests {
         );
         assert!(step.server.is_empty());
         // Output waits meanwhile.
-        assert_eq!(z.on_server(b"more").terminal, b"");
+        assert_eq!(z.on_server(b"more").terminal(), b"");
         let step = z.on_ui(&answer(ZmodemAnswer::Receive)).unwrap();
         // ZRINIT goes out.
         assert!(step.server.starts_with(b"**\x18B01"));
@@ -343,11 +399,11 @@ mod tests {
         let _ = z.on_server(b" and after");
         let step = z.on_ui(&answer(ZmodemAnswer::Off)).unwrap();
         assert_eq!(
-            step.terminal,
+            step.terminal(),
             b"**\x18B00000000000000\r\x8a\x11 and after".to_vec()
         );
-        assert!(step.ui.is_empty() && step.server.is_empty());
-        assert_eq!(z.on_server(b"x").terminal, b"x");
+        assert!(step.others().is_empty() && step.server.is_empty());
+        assert_eq!(z.on_server(b"x").terminal(), b"x");
     }
 
     #[test]
@@ -356,7 +412,7 @@ mod tests {
         let _ = z.on_server(RZ_START);
         let step = z.on_ui(&answer(ZmodemAnswer::Decline)).unwrap();
         assert_eq!(step.server, CANCEL);
-        assert!(matches!(step.ui[..], [Message::ZmodemEnd { .. }]));
+        assert!(matches!(step.others()[..], [Message::ZmodemEnd { .. }]));
         // A receive answer to rz is not one either.
         let _ = z.on_server(RZ_START);
         let step = z.on_ui(&answer(ZmodemAnswer::Receive)).unwrap();
@@ -388,7 +444,7 @@ mod tests {
         };
         let step = z.on_ui(&ctrl_c).unwrap();
         assert!(step.server.starts_with(&CANCEL));
-        assert!(matches!(step.ui[..], [Message::ZmodemEnd { .. }]));
+        assert!(matches!(step.others()[..], [Message::ZmodemEnd { .. }]));
         // Back to normal.
         assert_eq!(z.on_ui(&typed), None);
     }

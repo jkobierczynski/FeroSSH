@@ -1091,10 +1091,11 @@ async fn pump(
                     zm.on_server(&data)
                 }
                 // stderr is never part of a transfer.
-                Some(ChannelMsg::ExtendedData { data, .. }) => zmodem::Step {
-                    terminal: data.to_vec(),
-                    ..zmodem::Step::default()
-                },
+                Some(ChannelMsg::ExtendedData { data, .. }) => {
+                    let mut step = zmodem::Step::default();
+                    step.show(ctx.channel, &data);
+                    step
+                }
                 Some(ChannelMsg::ExitStatus { exit_status }) => {
                     ctx.send(Message::ExitStatus { channel: ctx.channel, code: exit_status }).await?;
                     continue;
@@ -1149,21 +1150,14 @@ async fn pump(
     result
 }
 
-/// Carries out a ZMODEM step: output to the terminal, messages to the UI,
-/// and bytes for the server to the writer. Returns false when the writer
+/// Carries out a ZMODEM step: messages (terminal output among them) to the
+/// UI, and bytes for the server to the writer. Returns false when the writer
 /// has gone.
 async fn run_step(
     step: zmodem::Step,
     ctx: &Ctx,
     input: &mpsc::Sender<Message>,
 ) -> Result<bool, Failure> {
-    for chunk in step.terminal.chunks(MAX_DATA_CHUNK) {
-        ctx.send(Message::Data {
-            channel: ctx.channel,
-            bytes: chunk.to_vec(),
-        })
-        .await?;
-    }
     for msg in step.ui {
         ctx.send(msg).await?;
     }

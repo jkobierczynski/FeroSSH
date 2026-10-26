@@ -44,7 +44,8 @@ pub enum RxEvent {
     Data(Vec<u8>),
     /// The accepted file is complete.
     FileDone,
-    /// The sender has no more files.
+    /// The sender has no more files, and the transfer is over: what
+    /// follows is terminal output.
     Done,
     /// The transfer stopped; why, for the user.
     Failed(String),
@@ -111,11 +112,19 @@ impl Receiver {
             match self.state {
                 Rx::Ended => return i,
                 Rx::Fin { o } => {
-                    if b == b'O' && o < 2 {
-                        self.state = if o == 1 { Rx::Ended } else { Rx::Fin { o: 1 } };
+                    // The rest of the sender's ZFIN header.
+                    if o == 0 && matches!(b, 0x0d | 0x8d | 0x0a | 0x8a | 0x11) {
                         continue;
                     }
-                    self.state = Rx::Ended;
+                    if b == b'O' && o < 2 {
+                        if o == 1 {
+                            self.finished();
+                        } else {
+                            self.state = Rx::Fin { o: 1 };
+                        }
+                        continue;
+                    }
+                    self.finished();
                     return i;
                 }
                 _ => {}
@@ -165,7 +174,7 @@ impl Receiver {
     /// The sender said nothing for [`Receiver::patience`].
     pub fn timeout(&mut self) {
         match self.state {
-            Rx::Fin { .. } => self.state = Rx::Ended,
+            Rx::Fin { .. } => self.finished(),
             Rx::Asking | Rx::Ended => {}
             _ if self.retries >= MAX_RETRIES => {
                 self.cancel("The sender stopped answering.");
@@ -207,6 +216,12 @@ impl Receiver {
 
     fn ack(&mut self) {
         hex_header(&Header::pos(ZACK, self.pos as u32), &mut self.out);
+    }
+
+    /// Done after the sender's "OO", or the wait for it.
+    fn finished(&mut self) {
+        self.events.push_back(RxEvent::Done);
+        self.state = Rx::Ended;
     }
 
     fn fail(&mut self, why: &str) {
@@ -300,7 +315,6 @@ impl Receiver {
             }
             ZFIN if state == Rx::Init => {
                 hex_header(&Header::pos(ZFIN, 0), &mut self.out);
-                self.events.push_back(RxEvent::Done);
                 self.state = Rx::Fin { o: 0 };
             }
             ZCOMMAND => self.cancel(
@@ -367,6 +381,19 @@ mod tests {
             })
         );
         assert_eq!(parse_info(b"\x00123"), None);
+    }
+
+    #[test]
+    fn done_only_once_over_and_out() {
+        let mut r = Receiver::new();
+        let mut fin = Vec::new();
+        hex_header(&Header::pos(ZFIN, 0), &mut fin);
+        r.feed(&fin);
+        assert_eq!(r.next_event(), None);
+        assert!(!r.ended());
+        assert_eq!(r.feed(b"OO$ "), 2);
+        assert_eq!(r.next_event(), Some(RxEvent::Done));
+        assert!(r.ended());
     }
 
     #[test]
