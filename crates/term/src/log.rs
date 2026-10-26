@@ -4,11 +4,14 @@
 //! parsed and dropped, carriage returns and backspaces overwrite as on
 //! screen (so progress bars end up as their last state), and lines end in
 //! CRLF for Notepad. Raw logs keep every byte, for replaying with `cat`.
-//! The UI process writes the file; the worker never sees it.
+//! The UI process writes the file; the worker never sees it. A log opened
+//! with a chain file is also sealed against later edits (see `chain`).
 
 use std::io::{self, Write};
 
 use alacritty_terminal::vte::{Params, Parser, Perform};
+
+use crate::chain::Chained;
 
 /// Tab stops in plain logs, as on a terminal.
 const TAB: usize = 8;
@@ -83,9 +86,38 @@ impl Perform for Line {
     }
 }
 
+/// Where a log's bytes go: the file alone, or the file and its chain.
+enum Sink<W: Write> {
+    Plain(W),
+    Chained(Box<Chained<W>>),
+}
+
+impl<W: Write> Write for Sink<W> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        match self {
+            Self::Plain(w) => w.write(buf),
+            Self::Chained(c) => c.write(buf),
+        }
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        match self {
+            Self::Plain(w) => w.flush(),
+            Self::Chained(c) => c.flush(),
+        }
+    }
+}
+
+/// How a sealed log ended: its length and last seal, for the index.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Sealed {
+    pub bytes: u64,
+    pub head: String,
+}
+
 /// Writes one tab's log.
 pub struct LogWriter<W: Write> {
-    out: W,
+    out: Sink<W>,
     raw: bool,
     parser: Parser,
     line: Line,
@@ -101,7 +133,18 @@ impl<W: Write> std::fmt::Debug for LogWriter<W> {
 
 impl<W: Write> LogWriter<W> {
     /// `header` (for example the host and start time) opens the log.
-    pub fn new(mut out: W, raw: bool, header: &str) -> io::Result<Self> {
+    pub fn new(out: W, raw: bool, header: &str) -> io::Result<Self> {
+        Self::open(Sink::Plain(out), raw, header)
+    }
+
+    /// A log sealed in `chain` as it is written; `file_name` is the log's
+    /// own file name, which the chain starts from.
+    pub fn sealed(out: W, chain: W, file_name: &str, raw: bool, header: &str) -> io::Result<Self> {
+        let chained = Chained::new(out, chain, file_name)?;
+        Self::open(Sink::Chained(Box::new(chained)), raw, header)
+    }
+
+    fn open(mut out: Sink<W>, raw: bool, header: &str) -> io::Result<Self> {
         write!(out, "{header}\r\n")?;
         out.flush()?;
         Ok(Self {
@@ -127,11 +170,33 @@ impl<W: Write> LogWriter<W> {
                 write!(self.out, "{line}\r\n")?;
             }
         }
-        self.out.flush()
+        self.out.flush()?;
+        if let Sink::Chained(c) = &mut self.out {
+            c.maybe_seal()?;
+        }
+        Ok(())
     }
 
     /// Writes the unfinished last line and a closing note.
-    pub fn finish(mut self, footer: &str) -> io::Result<W> {
+    pub fn finish(self, footer: &str) -> io::Result<W> {
+        match self.close(footer)? {
+            Sink::Plain(w) => Ok(w),
+            Sink::Chained(c) => c.end().map(|(w, ..)| w),
+        }
+    }
+
+    /// Like `finish`, and seals the end; `None` for a log without a chain.
+    pub fn finish_sealed(self, footer: &str) -> io::Result<Option<Sealed>> {
+        match self.close(footer)? {
+            Sink::Plain(_) => Ok(None),
+            Sink::Chained(c) => {
+                let (_, _, bytes, head) = c.end()?;
+                Ok(Some(Sealed { bytes, head }))
+            }
+        }
+    }
+
+    fn close(mut self, footer: &str) -> io::Result<Sink<W>> {
         if !self.raw && !self.line.chars.is_empty() {
             self.line.end();
             for line in self.line.done.drain(..) {
@@ -218,6 +283,23 @@ mod tests {
         let mut w = LogWriter::new(Vec::new(), true, "s").unwrap();
         w.write(b"\x1b[31mx").unwrap();
         assert_eq!(w.finish("e").unwrap(), b"s\r\n\x1b[31mx\r\ne\r\n");
+    }
+
+    #[test]
+    fn sealed_logs_verify_including_header_and_footer() {
+        let mut w = LogWriter::sealed(Vec::new(), Vec::new(), "x.log", false, "start").unwrap();
+        w.write(b"\x1b[1mhello\x1b[0m\r\nworld").unwrap();
+        let (out, chain) = match w.close("end").unwrap() {
+            Sink::Chained(c) => {
+                let (log, chain, ..) = c.end().unwrap();
+                (log, String::from_utf8(chain).unwrap())
+            }
+            Sink::Plain(_) => unreachable!(),
+        };
+        assert_eq!(out, b"start\r\nhello\r\nworld\r\nend\r\n");
+        let got = crate::chain::verify("x.log", &out, &chain).unwrap();
+        assert!(got.ended);
+        assert_eq!(got.sealed, out.len() as u64);
     }
 
     #[test]

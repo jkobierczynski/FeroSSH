@@ -32,7 +32,7 @@ use ferossh_render::{
 use ferossh_sftp::{Remote, names};
 use ferossh_term::{
     Action, Key, LogWriter, Mods, MouseButton, MouseEvent, SelectionKind, Settings as TermSettings,
-    Terminal, WorkingDir, check_link, clipboard_preview, log_file_name,
+    Terminal, WorkingDir, chain, check_link, clipboard_preview, log_file_name,
 };
 use windows::Win32::Foundation::E_FAIL;
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, SIZE, WPARAM};
@@ -206,6 +206,7 @@ mod cmd {
     pub const LOG_TOGGLE: u32 = 600;
     pub const LOG_RAW: u32 = 601;
     pub const LOG_FOLDER: u32 = 602;
+    pub const LOG_VERIFY: u32 = 605;
     pub const REPLACE_KEY: u32 = 603;
     pub const VERIFY: u32 = 604;
     pub const TMUX_ATTACH: u32 = 610;
@@ -765,6 +766,52 @@ fn approve_command(line: &str) {
     let _ = write_app_file(&path, &text);
 }
 
+/// The chain file that seals log `path`: the same name plus `.chain`.
+fn chain_path(path: &Path) -> PathBuf {
+    let mut name = path.as_os_str().to_owned();
+    name.push(".chain");
+    PathBuf::from(name)
+}
+
+/// Appends a log that ended to the log index, linked to the line before.
+fn add_to_log_index(name: &str, sealed: &ferossh_term::Sealed) -> std::io::Result<()> {
+    use std::io::Write as _;
+    let path = log_dir().join(chain::INDEX_FILE);
+    let index = match std::fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(e) => return Err(e),
+    };
+    let line = chain::index_line(&index, name, sealed.bytes, &sealed.head);
+    std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)?
+        .write_all(line.as_bytes())
+}
+
+/// Session > Check a log: the log against its chain and the log index.
+/// `true` when nothing was found wrong.
+fn check_log(path: &Path) -> (String, bool) {
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let log = match std::fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(e) => return (format!("Could not read {}: {e}", path.display()), false),
+    };
+    let chain = std::fs::read_to_string(chain_path(path)).ok();
+    let index_path = path.with_file_name(chain::INDEX_FILE);
+    let index = std::fs::read_to_string(index_path).ok();
+    let text = chain::report(&name, &log, chain.as_deref(), index.as_deref());
+    let ok = chain
+        .as_deref()
+        .is_some_and(|c| chain::verify(&name, &log, c).is_ok())
+        && !text.contains("WARNING");
+    (text, ok)
+}
+
 /// Where tab logs go: `%LOCALAPPDATA%\FeroSSH\logs`.
 fn log_dir() -> PathBuf {
     std::env::var_os("LOCALAPPDATA")
@@ -1007,6 +1054,7 @@ fn build_menu() -> Result<HMENU> {
         item(session, cmd::LOG_TOGGLE, "&Log to file")?;
         item(session, cmd::LOG_RAW, "Log &raw output (keep escape codes)")?;
         item(session, cmd::LOG_FOLDER, "Open log &folder")?;
+        item(session, cmd::LOG_VERIFY, "C&heck a log for changes...")?;
         separator(session)?;
         item(
             session,
@@ -2683,20 +2731,29 @@ impl Window {
                 } else {
                     base.replace(".log", &format!("-{n}.log"))
                 };
-                let path = dir.join(name);
-                match std::fs::OpenOptions::new()
-                    .write(true)
-                    .create_new(true)
-                    .open(&path)
-                {
-                    Ok(f) => return Ok((f, path)),
+                let path = dir.join(&name);
+                let new = |path: &Path| {
+                    std::fs::OpenOptions::new()
+                        .write(true)
+                        .create_new(true)
+                        .open(path)
+                };
+                match new(&path) {
+                    Ok(f) => {
+                        // The chain beside it seals the log against edits.
+                        let chain = new(&chain_path(&path))?;
+                        return Ok((f, chain, path, name));
+                    }
                     Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists && n < 100 => n += 1,
                     Err(e) => return Err(e),
                 }
             }
         });
         let header = format!("FeroSSH log of {label}, started {}", timestamp());
-        match opened.and_then(|(f, path)| Ok((LogWriter::new(f, raw, &header)?, path))) {
+        let writer = opened.and_then(|(f, chain, path, name)| {
+            Ok((LogWriter::sealed(f, chain, &name, raw, &header)?, path))
+        });
+        match writer {
             Ok((writer, path)) => {
                 self.show(
                     id,
@@ -2724,8 +2781,24 @@ impl Window {
     }
 
     fn stop_log(&mut self, id: PaneId) {
-        if let Some(writer) = self.panes.get_mut(&id).and_then(|p| p.log.writer.take()) {
-            let _ = writer.finish(&format!("Log ended {}", timestamp()));
+        let Some(p) = self.panes.get_mut(&id) else {
+            return;
+        };
+        let Some(writer) = p.log.writer.take() else {
+            return;
+        };
+        let footer = format!("Log ended {}", timestamp());
+        if let (Ok(Some(sealed)), Some(name)) = (
+            writer.finish_sealed(&footer),
+            p.log.path.as_deref().and_then(Path::file_name),
+        ) {
+            let name = name.to_string_lossy();
+            if let Err(e) = add_to_log_index(&name, &sealed) {
+                self.show(
+                    id,
+                    &format!("\x1b[0;31mCould not add the log to the log index: {e}\x1b[0m\r\n"),
+                );
+            }
         }
     }
 
@@ -5266,6 +5339,7 @@ impl Window {
                 self.update_menu_checks();
             }
             cmd::LOG_FOLDER => return Some(Command::OpenFolder(log_dir())),
+            cmd::LOG_VERIFY => return Some(Command::VerifyLog),
             cmd::ZOOM_IN | cmd::ZOOM_OUT | cmd::ZOOM_RESET => {
                 let font = self.panes.get(&pane)?.font.clone();
                 let font = match id {
@@ -5911,6 +5985,8 @@ enum Command {
     CloseTab(usize),
     /// File > Import sessions: the side pane's import page.
     ImportSessions,
+    /// Session > Check a log: the file picker, then the chain check.
+    VerifyLog,
     /// The import page's file picker.
     PickImportFile,
     SaveLook,
@@ -6485,6 +6561,13 @@ fn run_command(hwnd: HWND, command: Command) {
             }
         }
         Command::SessionMenu(host) => session_menu(hwnd, host),
+        Command::VerifyLog => {
+            if let Some(path) = pick_file(hwnd, w!("Check a log for changes"), &log_dir()) {
+                let (text, ok) = check_log(&path);
+                let icon = if ok { MB_ICONINFORMATION } else { MB_ICONWARNING };
+                dialog(hwnd, &text, MB_OK | icon);
+            }
+        }
         Command::DeleteSession(name) => {
             let text = format!(
                 "Delete the session {name}? Its look and extras in FeroSSH go with it.\n\n\
