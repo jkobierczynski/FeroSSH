@@ -159,6 +159,11 @@ enum Cmd {
         connection: ChannelId,
         index: usize,
     },
+    Replace {
+        connection: ChannelId,
+        old: ForwardSpec,
+        new: ForwardSpec,
+    },
     Stop {
         connection: ChannelId,
     },
@@ -243,6 +248,18 @@ impl Forwarder {
     /// Stops the connection's `index`th forward and its connections.
     pub fn remove(&self, connection: ChannelId, index: usize) {
         self.cmd(Cmd::Remove { connection, index });
+    }
+
+    /// Changes the connection's forward `old` into `new` without
+    /// reconnecting. A new target on the same listening port keeps the
+    /// listener and its open connections; anything else restarts the
+    /// forward, which also retries one that stopped.
+    pub fn replace(&self, connection: ChannelId, old: ForwardSpec, new: ForwardSpec) {
+        self.cmd(Cmd::Replace {
+            connection,
+            old,
+            new,
+        });
     }
 
     /// Stops everything the connection forwards.
@@ -568,6 +585,11 @@ impl Engine {
                     self.end_fwd(connection, fwd);
                 }
             }
+            Cmd::Replace {
+                connection,
+                old,
+                new,
+            } => self.replace(connection, &old, new),
             Cmd::Stop { connection } => self.stop(connection),
             Cmd::Desktop {
                 connection,
@@ -646,10 +668,72 @@ impl Engine {
         spec: ForwardSpec,
         desktop: Option<(String, u16)>,
     ) -> Option<u64> {
-        let conn = self.conns.get_mut(&connection)?;
+        let conn = self.conns.get(&connection)?;
         if conn.forwards.iter().any(|f| f.spec == spec) {
             return None;
         }
+        let fwd = self.new_fwd(connection, spec, desktop, false)?;
+        let key = fwd.key;
+        self.conns.get_mut(&connection)?.forwards.push(fwd);
+        Some(key)
+    }
+
+    /// Changes forward `old` into `new` in its place in the list; see
+    /// [`Forwarder::replace`]. Remote desktop tunnels belong to their
+    /// desktop and are left alone.
+    fn replace(&mut self, connection: ChannelId, old: &ForwardSpec, new: ForwardSpec) {
+        let Some(conn) = self.conns.get_mut(&connection) else {
+            return;
+        };
+        let Some(index) = conn
+            .forwards
+            .iter()
+            .position(|f| f.desktop.is_none() && f.spec == *old)
+        else {
+            return;
+        };
+        if conn
+            .forwards
+            .iter()
+            .enumerate()
+            .any(|(i, f)| i != index && f.spec == new)
+        {
+            return;
+        }
+        let Some(f) = conn.forwards.get_mut(index) else {
+            return;
+        };
+        let same_listener =
+            f.spec.kind == new.kind && f.spec.bind == new.bind && f.spec.port == new.port;
+        let running = !matches!(f.state, FwdState::Failed(_));
+        if same_listener && running {
+            // Only where connections go changes, which this side decides
+            // per connection: the listener stays, and so do open ones.
+            f.spec = new;
+            return;
+        }
+        let fwd = conn.forwards.remove(index);
+        self.end_fwd(connection, fwd);
+        // The old listener lets go of its port only once its task sees
+        // the abort, so the new one waits for a port that is still busy.
+        if let Some(fwd) = self.new_fwd(connection, new, None, true)
+            && let Some(conn) = self.conns.get_mut(&connection)
+        {
+            let at = index.min(conn.forwards.len());
+            conn.forwards.insert(at, fwd);
+        }
+    }
+
+    /// Starts a forward without listing it. `patient` keeps trying a
+    /// local port that is busy for a moment, as one just given up is.
+    fn new_fwd(
+        &mut self,
+        connection: ChannelId,
+        spec: ForwardSpec,
+        desktop: Option<(String, u16)>,
+        patient: bool,
+    ) -> Option<Fwd> {
+        let conn = self.conns.get_mut(&connection)?;
         let key = conn.next_key;
         conn.next_key += 1;
         let owner = Owner::Fwd(connection, key);
@@ -667,7 +751,13 @@ impl Engine {
         match spec.kind {
             ForwardKind::Local | ForwardKind::Dynamic => {
                 let hosts = bind_hosts(spec.bind.as_deref(), conn.gateway_ports);
-                let task = tokio::spawn(listen(hosts, spec.port, owner, self.internal.clone()));
+                let task = tokio::spawn(listen(
+                    hosts,
+                    spec.port,
+                    owner,
+                    patient,
+                    self.internal.clone(),
+                ));
                 fwd.listeners.push(task.abort_handle());
             }
             ForwardKind::Remote => {
@@ -681,10 +771,7 @@ impl Engine {
                 });
             }
         }
-        if let Some(conn) = self.conns.get_mut(&connection) {
-            conn.forwards.push(fwd);
-        }
-        Some(key)
+        Some(fwd)
     }
 
     /// Checks that something on the server answers on `port` before
@@ -1138,11 +1225,13 @@ impl Drop for AbortOnDrop {
     }
 }
 
-/// Binds every address and accepts connections until aborted.
-async fn listen(hosts: Vec<String>, port: u16, owner: Owner, events: UnboundedSender<Internal>) {
+/// Binds `port` on every address of `hosts`: the listeners, what failed,
+/// and whether a port was in use.
+async fn bind_all(hosts: &[String], port: u16) -> (Vec<TcpListener>, Vec<String>, bool) {
     let mut listeners = Vec::new();
     let mut errors = Vec::new();
-    for host in &hosts {
+    let mut busy = false;
+    for host in hosts {
         let addrs: Vec<SocketAddr> = match tokio::net::lookup_host((host.as_str(), port)).await {
             Ok(a) => a.collect(),
             Err(e) => {
@@ -1153,10 +1242,36 @@ async fn listen(hosts: Vec<String>, port: u16, owner: Owner, events: UnboundedSe
         for addr in addrs {
             match TcpListener::bind(addr).await {
                 Ok(l) => listeners.push(l),
-                Err(e) => errors.push(format!("{}: {e}", host_port(host, port))),
+                Err(e) => {
+                    busy |= e.kind() == std::io::ErrorKind::AddrInUse;
+                    errors.push(format!("{}: {e}", host_port(host, port)));
+                }
             }
         }
     }
+    (listeners, errors, busy)
+}
+
+/// How long a patient listener waits for its port to come free.
+const REBIND_WAIT: Duration = Duration::from_secs(2);
+
+/// Binds every address and accepts connections until aborted. A patient
+/// one tries a busy port again for up to [`REBIND_WAIT`].
+async fn listen(
+    hosts: Vec<String>,
+    port: u16,
+    owner: Owner,
+    patient: bool,
+    events: UnboundedSender<Internal>,
+) {
+    let give_up = tokio::time::Instant::now() + REBIND_WAIT;
+    let (listeners, errors) = loop {
+        let (listeners, errors, busy) = bind_all(&hosts, port).await;
+        if !(patient && busy) || tokio::time::Instant::now() >= give_up {
+            break (listeners, errors);
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    };
     if listeners.is_empty() {
         let why = format!("Could not listen: {}.", errors.join("; "));
         let _ = events.send(Internal::ListenFailed { owner, why });
@@ -1379,6 +1494,146 @@ mod tests {
             std::thread::sleep(Duration::from_millis(10));
         }
         panic!("never got there");
+    }
+
+    fn free_port() -> u16 {
+        std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port()
+    }
+
+    fn spec(text: &str) -> ForwardSpec {
+        ferossh_config::forward::parse_option(text).unwrap()
+    }
+
+    /// The connection's only forward once `want` holds for it.
+    fn forward_when(fwd: &Forwarder, want: impl Fn(&FwdView) -> bool) -> FwdView {
+        wait_for(|| {
+            let view = fwd.view();
+            let f = view.first()?.forwards.first()?.clone();
+            want(&f).then_some(f)
+        })
+    }
+
+    fn listening(f: &FwdView) -> bool {
+        matches!(f.state, FwdState::Listening(_))
+    }
+
+    #[test]
+    fn a_new_target_keeps_the_listener_and_open_connections() {
+        let port = free_port();
+        let (fwd, sent) = engine();
+        let old = spec(&format!("-L 127.0.0.1:{port}:db:5432"));
+        let setup = Setup {
+            forwards: vec![old.clone()],
+            ..Setup::default()
+        };
+        fwd.start(1, "me@db".into(), setup);
+        forward_when(&fwd, listening);
+        let _open = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+        forward_when(&fwd, |f| f.open == 1);
+        let new = spec(&format!("-L 127.0.0.1:{port}:db:6432"));
+        fwd.replace(1, old, new.clone());
+        let f = forward_when(&fwd, |f| f.spec == new);
+        assert!(listening(&f));
+        assert_eq!(f.open, 1, "the open connection was dropped");
+        // New connections go to the new target.
+        let _c = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+        wait_for(|| {
+            sent.lock()
+                .unwrap()
+                .iter()
+                .any(|m| {
+                    matches!(m, Message::ForwardOpen { target: Some((h, 6432)), .. } if h == "db")
+                })
+                .then_some(())
+        });
+    }
+
+    #[test]
+    fn a_new_port_moves_the_listener() {
+        let (a, b) = (free_port(), free_port());
+        let (fwd, _) = engine();
+        let old = spec(&format!("-D 127.0.0.1:{a}"));
+        let setup = Setup {
+            forwards: vec![old.clone(), spec("-R 9000:localhost:80")],
+            ..Setup::default()
+        };
+        fwd.start(1, "me@db".into(), setup);
+        forward_when(&fwd, listening);
+        let new = spec(&format!("-D 127.0.0.1:{b}"));
+        fwd.replace(1, old, new.clone());
+        // It keeps its place in the list.
+        let f = forward_when(&fwd, |f| f.spec == new && listening(f));
+        assert_eq!(f.total, 0);
+        assert_eq!(fwd.view()[0].forwards.len(), 2);
+        assert!(std::net::TcpListener::bind(("127.0.0.1", b)).is_err());
+        wait_for(|| std::net::TcpListener::bind(("127.0.0.1", a)).ok());
+    }
+
+    #[test]
+    fn a_new_address_on_the_same_port_waits_for_the_old_one() {
+        let port = free_port();
+        let (fwd, _) = engine();
+        // Loopback, as both 127.0.0.1 and ::1 where there is IPv6.
+        let old = spec(&format!("-L {port}:db:5432"));
+        let setup = Setup {
+            forwards: vec![old.clone()],
+            ..Setup::default()
+        };
+        fwd.start(1, "me@db".into(), setup);
+        forward_when(&fwd, listening);
+        let new = spec(&format!("-L 127.0.0.1:{port}:db:5432"));
+        fwd.replace(1, old, new.clone());
+        let f = forward_when(&fwd, |f| {
+            f.spec == new && !matches!(f.state, FwdState::Starting)
+        });
+        assert!(listening(&f), "{:?}", f.state);
+    }
+
+    #[test]
+    fn the_same_forward_again_retries_a_stopped_one() {
+        let port = free_port();
+        let taken = std::net::TcpListener::bind(("127.0.0.1", port)).unwrap();
+        let (fwd, _) = engine();
+        let s = spec(&format!("-L 127.0.0.1:{port}:db:5432"));
+        let setup = Setup {
+            forwards: vec![s.clone()],
+            ..Setup::default()
+        };
+        fwd.start(1, "me@db".into(), setup);
+        forward_when(&fwd, |f| matches!(f.state, FwdState::Failed(_)));
+        drop(taken);
+        fwd.replace(1, s.clone(), s);
+        forward_when(&fwd, listening);
+    }
+
+    #[test]
+    fn a_replacement_that_duplicates_another_forward_is_ignored() {
+        let (a, b) = (free_port(), free_port());
+        let (fwd, _) = engine();
+        let (x, y) = (
+            spec(&format!("-D 127.0.0.1:{a}")),
+            spec(&format!("-D 127.0.0.1:{b}")),
+        );
+        let setup = Setup {
+            forwards: vec![x.clone(), y.clone()],
+            ..Setup::default()
+        };
+        fwd.start(1, "me@db".into(), setup);
+        forward_when(&fwd, listening);
+        fwd.replace(1, x.clone(), y.clone());
+        // A command after it has run once this one shows.
+        fwd.add(1, spec(&format!("-D 127.0.0.1:{}", free_port())));
+        wait_for(|| (fwd.view()[0].forwards.len() == 3).then_some(()));
+        let specs: Vec<ForwardSpec> = fwd.view()[0]
+            .forwards
+            .iter()
+            .map(|f| f.spec.clone())
+            .collect();
+        assert_eq!(specs[..2], [x, y]);
     }
 
     /// The probe the engine sent for a desktop on `port`.

@@ -25,7 +25,7 @@ use ferossh_config::saved::{self, SavedHost};
 use ferossh_config::serial::{self, SerialTarget};
 use ferossh_config::settings::{DEFAULT_DESKTOP_PORT, DEFAULT_VNC_PORT};
 use ferossh_config::{
-    SessionKind, Settings, mobaxterm, mremoteng, putty, securecrt, ssh_config, winscp,
+    ForwardSpec, SessionKind, Settings, mobaxterm, mremoteng, putty, securecrt, ssh_config, winscp,
 };
 use ferossh_forward::x11::{Display, find_cookie, xauth_entries};
 use ferossh_ipc::{ChannelId, DirEntry, FORWARD_IDS, Message, SftpReply, X11Auth};
@@ -95,7 +95,9 @@ use crate::conpty::{self, Output, Shell};
 use crate::credman;
 use crate::desktop::{Desktop, Protocol, Update as DesktopUpdate};
 use crate::files::{FilesAction, FilesView};
-use crate::forwards::{ConnView, DesktopEvent, Forwarder, Setup as ForwardSetup, desktop_port_for};
+use crate::forwards::{
+    ConnView, DesktopEvent, Forwarder, FwdView, Setup as ForwardSetup, desktop_port_for,
+};
 use crate::fwdview::{ForwardsView, FwdAction};
 use crate::import_reg;
 use crate::import_view::{Found, ImportAction, ImportView};
@@ -2644,34 +2646,81 @@ impl Window {
         }
     }
 
-    /// Carries out what the forwards view asked for.
+    /// Carries out what the forwards view asked for. Changes also go into
+    /// the hosts of the connection's panes, so a reconnect keeps them.
     fn forwards_action(&mut self, action: Option<FwdAction>) -> Option<Command> {
+        let view = self.forward_view();
         match action {
             Some(FwdAction::Add { spec, connection }) => {
-                // The connection picked in the list, else the focused
-                // pane's, else the only one there is.
-                let view = self.forward_view();
-                let known = |c: &ChannelId| view.iter().any(|v| v.connection == *c);
-                let connection = connection
-                    .filter(known)
-                    .or_else(|| self.pane_connection(self.focused_id()).filter(known))
-                    .or_else(|| match &view[..] {
-                        [only] => Some(only.connection),
-                        _ => None,
-                    });
-                match connection.and_then(|c| Some((c, self.workers.get(&c)?))) {
-                    Some((c, w)) => w.forwarder.add(c, spec),
-                    _ if view.is_empty() => self
-                        .forwards_view
-                        .refuse(&spec, "Log in to a host first.".into()),
-                    _ => self
-                        .forwards_view
-                        .refuse(&spec, "Click a connection below, then Enter.".into()),
+                match self.forward_connection(connection, &view) {
+                    Err(why) => self.forwards_view.refuse(&spec, why),
+                    Ok(c) if forwards_of(&view, c).any(|f| f.spec == spec) => {
+                        self.forwards_view
+                            .refuse(&spec, "That forward is already there.".into());
+                    }
+                    Ok(c) => {
+                        if let Some(w) = self.workers.get(&c) {
+                            w.forwarder.add(c, spec.clone());
+                        }
+                        self.keep_forwards(c, |list| {
+                            if !list.contains(&spec) {
+                                list.push(spec.clone());
+                            }
+                        });
+                    }
                 }
             }
             Some(FwdAction::Remove { connection, index }) => {
                 if let Some(w) = self.workers.get(&connection) {
                     w.forwarder.remove(connection, index);
+                }
+                if let Some(f) = forwards_of(&view, connection).nth(index) {
+                    let spec = f.spec.clone();
+                    self.keep_forwards(connection, |list| list.retain(|s| *s != spec));
+                }
+            }
+            Some(FwdAction::Replace {
+                connection,
+                old,
+                new,
+            }) => {
+                if old != new && forwards_of(&view, connection).any(|f| f.spec == new) {
+                    self.forwards_view
+                        .refuse(&new, "That forward is already there.".into());
+                } else if let Some(w) = self.workers.get(&connection) {
+                    w.forwarder.replace(connection, old.clone(), new.clone());
+                    self.keep_forwards(connection, |list| {
+                        if let Some(s) = list.iter_mut().find(|s| **s == old) {
+                            *s = new.clone();
+                        } else if !list.contains(&new) {
+                            list.push(new.clone());
+                        }
+                    });
+                }
+            }
+            Some(FwdAction::Cancel { cancel, connection }) => {
+                let found = self.forward_connection(connection, &view).and_then(|c| {
+                    let matching: Vec<(usize, &ForwardSpec)> = forwards_of(&view, c)
+                        .enumerate()
+                        .filter(|(_, f)| !f.desktop && cancel.cancels(&f.spec))
+                        .map(|(i, f)| (i, &f.spec))
+                        .collect();
+                    match &matching[..] {
+                        [(i, spec)] => Ok((c, *i, (*spec).clone())),
+                        [] => Err("No forward listens there.".to_owned()),
+                        _ => {
+                            Err("More than one forward listens there: add the address.".to_owned())
+                        }
+                    }
+                });
+                match found {
+                    Ok((c, index, spec)) => {
+                        if let Some(w) = self.workers.get(&c) {
+                            w.forwarder.remove(c, index);
+                        }
+                        self.keep_forwards(c, |list| list.retain(|s| *s != spec));
+                    }
+                    Err(why) => self.forwards_view.say(why),
                 }
             }
             Some(FwdAction::Leave) => self.focus_terminal(),
@@ -2679,6 +2728,46 @@ impl Window {
         }
         self.refresh_chrome();
         None
+    }
+
+    /// The connection a forward goes to: the one picked in the list, else
+    /// the focused pane's, else the only one there is.
+    fn forward_connection(
+        &self,
+        picked: Option<ChannelId>,
+        view: &[ConnView],
+    ) -> std::result::Result<ChannelId, String> {
+        let known =
+            |c: &ChannelId| view.iter().any(|v| v.connection == *c) && self.workers.contains_key(c);
+        picked
+            .filter(known)
+            .or_else(|| self.pane_connection(self.focused_id()).filter(known))
+            .or_else(|| match view {
+                [only] => Some(only.connection).filter(known),
+                _ => None,
+            })
+            .ok_or_else(|| {
+                if view.is_empty() {
+                    "Log in to a host first.".to_owned()
+                } else {
+                    "Click a connection below, then Enter.".to_owned()
+                }
+            })
+    }
+
+    /// Changes the forwards a reconnect of `connection`'s panes starts.
+    fn keep_forwards(
+        &mut self,
+        connection: ChannelId,
+        mut change: impl FnMut(&mut Vec<ForwardSpec>),
+    ) {
+        for p in self.panes.values_mut() {
+            if let Host::Ssh(s) = &mut p.host
+                && s.connection == connection
+            {
+                change(&mut s.target.forwards);
+            }
+        }
     }
 
     /// Starts the worker of the connection `connection` if it is not
@@ -8485,6 +8574,13 @@ fn replace_host_key(hwnd: HWND) {
             }
         }
     });
+}
+
+/// The forwards of `connection` in the forwards view.
+fn forwards_of(view: &[ConnView], connection: ChannelId) -> impl Iterator<Item = &FwdView> {
+    view.iter()
+        .filter(move |v| v.connection == connection)
+        .flat_map(|v| &v.forwards)
 }
 
 fn loword(v: usize) -> u32 {
