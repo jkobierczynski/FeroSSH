@@ -97,7 +97,7 @@ pub fn session(raw_name: &str, get: impl Fn(&str) -> Option<Value>) -> Option<Se
         s.host.forwards = specs;
         if dropped > 0 {
             s.notes.push(format!(
-                "{dropped} port forward{} FeroSSH cannot use",
+                "{dropped} port forward{} FeroSSH cannot use, left out",
                 if dropped == 1 { "" } else { "s" }
             ));
         }
@@ -193,7 +193,7 @@ mod tests {
                 "LocalForward 127.0.0.1:5433 db:5432",
             ]
         );
-        assert_eq!(s.notes, ["1 port forward FeroSSH cannot use"]);
+        assert_eq!(s.notes, ["1 port forward FeroSSH cannot use, left out"]);
         let text = to_config(Client::Putty, &[&s]);
         let cfg = ssh_config::resolve(&text, "Prod-DB-main");
         assert_eq!(cfg.hostname.as_deref(), Some("db.example.org"));

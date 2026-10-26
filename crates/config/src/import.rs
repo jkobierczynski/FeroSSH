@@ -1,9 +1,11 @@
 //! Saved sessions brought over from other SSH clients: PuTTY and KiTTY
-//! (registry, or KiTTY's portable `Sessions` folder) and WinSCP (registry
-//! or `WinSCP.ini`).
+//! (registry, or KiTTY's portable `Sessions` folder), WinSCP (registry or
+//! `WinSCP.ini`), MobaXterm (`MobaXterm.ini`), mRemoteNG (`confCons.xml`)
+//! and SecureCRT (its session files).
 //!
-//! The window reads what the client stored; [`crate::putty`] and
-//! [`crate::winscp`] turn it into [`Session`]s, and [`to_config`] writes
+//! The window reads what the client stored; [`crate::putty`],
+//! [`crate::winscp`], [`crate::mobaxterm`], [`crate::mremoteng`] and
+//! [`crate::securecrt`] turn it into [`Session`]s, and [`to_config`] writes
 //! the ones the user ticked to that client's own file in FeroSSH's folder,
 //! in ssh_config syntax. Each client has one file, so importing again
 //! replaces the last import cleanly; `~/.ssh/config` is never written.
@@ -12,7 +14,7 @@
 //! flagged, so the user can set up a password source for it.
 
 use crate::saved::{SavedHost, valid_alias, write_host};
-use crate::settings::Profile;
+use crate::settings::{DEFAULT_DESKTOP_PORT, DEFAULT_VNC_PORT, Profile, SessionKind};
 
 /// A client FeroSSH imports from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -20,10 +22,20 @@ pub enum Client {
     Putty,
     Kitty,
     WinScp,
+    MobaXterm,
+    MRemoteNg,
+    SecureCrt,
 }
 
 impl Client {
-    pub const ALL: [Client; 3] = [Client::Putty, Client::Kitty, Client::WinScp];
+    pub const ALL: [Client; 6] = [
+        Client::Putty,
+        Client::Kitty,
+        Client::WinScp,
+        Client::MobaXterm,
+        Client::MRemoteNg,
+        Client::SecureCrt,
+    ];
 
     /// The name the user knows it by.
     pub fn name(self) -> &'static str {
@@ -31,6 +43,9 @@ impl Client {
             Client::Putty => "PuTTY",
             Client::Kitty => "KiTTY",
             Client::WinScp => "WinSCP",
+            Client::MobaXterm => "MobaXterm",
+            Client::MRemoteNg => "mRemoteNG",
+            Client::SecureCrt => "SecureCRT",
         }
     }
 
@@ -41,6 +56,9 @@ impl Client {
             Client::Putty => "putty-sessions.conf",
             Client::Kitty => "imported-kitty.conf",
             Client::WinScp => "imported-winscp.conf",
+            Client::MobaXterm => "imported-mobaxterm.conf",
+            Client::MRemoteNg => "imported-mremoteng.conf",
+            Client::SecureCrt => "imported-securecrt.conf",
         }
     }
 }
@@ -75,8 +93,11 @@ impl Value {
 pub struct Session {
     /// The name the client shows, with its folders (`Work/web`).
     pub name: String,
-    /// What goes to the file; the folder is set by [`to_config`].
+    /// What goes to the file; the folder is set by [`to_config`]. For a
+    /// desktop session the port is the desktop's.
     pub host: SavedHost,
+    /// SSH, or a Remote Desktop or VNC desktop.
+    pub kind: SessionKind,
     /// The client had a password stored for it (not read).
     pub had_password: bool,
     /// What the client had that does not come over.
@@ -95,6 +116,7 @@ impl Session {
                 hostname: Some(hostname),
                 ..SavedHost::default()
             },
+            kind: SessionKind::Ssh,
             name,
             had_password: false,
             notes: Vec::new(),
@@ -102,6 +124,25 @@ impl Session {
             font_size: None,
         }
     }
+}
+
+/// The port to write: none for the kind's usual one.
+pub(crate) fn port(kind: SessionKind, port: Option<u32>) -> Option<u16> {
+    let usual = match kind {
+        SessionKind::Ssh => 22,
+        SessionKind::Rdp => DEFAULT_DESKTOP_PORT,
+        SessionKind::Vnc => DEFAULT_VNC_PORT,
+        // Imports bring no serial sessions; a COM port has no port number.
+        SessionKind::Serial => return None,
+    };
+    port.and_then(|p| u16::try_from(p).ok())
+        .filter(|&p| p != 0 && p != usual)
+}
+
+/// One line of what a client had, for a note: no control characters, not
+/// too long.
+pub(crate) fn clean(text: &str) -> String {
+    text.chars().filter(|c| !c.is_control()).take(100).collect()
 }
 
 /// Decodes `%XX` escapes, as PuTTY and WinSCP write names (and WinSCP its
@@ -194,12 +235,13 @@ pub fn to_config(client: Client, sessions: &[&Session]) -> String {
     out
 }
 
-/// The font profile a session brings, if it set a font.
+/// The profile a session brings: its font, or that it is a desktop.
 pub fn profile(s: &Session) -> Option<Profile> {
-    (s.font.is_some() || s.font_size.is_some()).then(|| Profile {
+    (s.font.is_some() || s.font_size.is_some() || s.kind != SessionKind::Ssh).then(|| Profile {
         host: s.host.alias.clone(),
         font: s.font.clone(),
         font_size: s.font_size,
+        kind: s.kind,
         ..Profile::default()
     })
 }

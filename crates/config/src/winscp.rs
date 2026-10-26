@@ -66,9 +66,8 @@ pub fn session(raw_name: &str, get: impl Fn(&str) -> Option<Value>) -> Option<Se
         && let Some(via) = text("TunnelHostName")
     {
         let via: String = via.chars().filter(|c| !c.is_control()).take(100).collect();
-        s.notes.push(format!(
-            "its tunnel through {via} (add it as a jump host by hand)"
-        ));
+        s.notes
+            .push(format!("its tunnel through {via} is not imported"));
     }
     Some(s)
 }
@@ -178,7 +177,7 @@ HostName=-oProxyCommand=calc\r
         assert!(web.had_password);
         assert_eq!(
             web.notes,
-            ["its tunnel through bastion.example.org (add it as a jump host by hand)"]
+            ["its tunnel through bastion.example.org is not imported"]
         );
         assert_eq!(s[1].host.user.as_deref(), Some("root"));
         assert!(!s[1].had_password);
