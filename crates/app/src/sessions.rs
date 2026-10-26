@@ -8,6 +8,7 @@
 
 use std::collections::HashSet;
 
+use ferossh_config::settings::SessionKind;
 use ferossh_render::{Cell, Color, Flags, Grid, Rgb};
 
 use crate::tabstrip::{Palette, fit};
@@ -21,6 +22,8 @@ pub struct HostItem {
     /// `user@hostname:port` as ssh_config resolves it, for the second
     /// column and the search.
     pub detail: String,
+    /// What opening it does; anything but SSH is tagged in the list.
+    pub kind: SessionKind,
 }
 
 /// A visible row.
@@ -463,12 +466,13 @@ impl SessionList {
                     row_bg,
                     Flags::empty(),
                 ),
-                Some(Row::Folder { name, open, count }) => line(
-                    &format!(" {} {name} ({count})", if *open { "▾" } else { "▸" }),
-                    palette.dim,
-                    row_bg,
-                    Flags::BOLD,
-                ),
+                Some(Row::Folder { name, open, count }) => {
+                    let label = format!(" {} {name}", if *open { "▾" } else { "▸" });
+                    let mut cells = line(&label, palette.text, row_bg, Flags::BOLD);
+                    let used = label.chars().count() + 1;
+                    put_right(&mut cells, &count.to_string(), used, palette.dim, row_bg);
+                    cells
+                }
                 Some(Row::Host { index, favourite }) => {
                     let Some(h) = self.hosts.get(*index) else {
                         continue;
@@ -496,21 +500,15 @@ impl SessionList {
                             c.fg = Color::Rgb(accent);
                         }
                     }
-                    // The detail, dimmed, where there is room.
+                    // The kind and detail, dimmed and to the right, where
+                    // there is room after the name.
                     let used = 3 + indent.len() + h.name.chars().count() + 2;
-                    if used + 4 < width {
-                        let detail = fit(&h.detail, width - used - 1);
-                        for (k, c) in detail.chars().enumerate() {
-                            if let Some(cell) = cells.get_mut(used + k) {
-                                *cell = Cell::new(
-                                    c,
-                                    Color::Rgb(palette.dim),
-                                    Color::Rgb(row_bg),
-                                    Flags::empty(),
-                                );
-                            }
-                        }
-                    }
+                    let detail = match h.kind {
+                        SessionKind::Ssh => h.detail.clone(),
+                        kind if h.detail.is_empty() => kind.name().to_owned(),
+                        kind => format!("{} · {}", kind.name(), h.detail),
+                    };
+                    put_right(&mut cells, &detail, used, palette.dim, row_bg);
                     cells
                 }
                 None if i == 0 && rows.is_empty() => {
@@ -528,6 +526,41 @@ impl SessionList {
     }
 }
 
+/// Writes `text` right-aligned into `cells`, one cell short of the edge
+/// and starting no further left than `from`; shortened with an ellipsis
+/// when it does not fit, left out when even that would not read.
+fn put_right(cells: &mut [Cell], text: &str, from: usize, fg: Rgb, bg: Rgb) {
+    let end = cells.len().saturating_sub(1);
+    let room = end.saturating_sub(from);
+    if text.is_empty() || room < 4 {
+        return;
+    }
+    let text = fit(text, room);
+    let width: usize = text
+        .chars()
+        .map(|c| unicode_width::UnicodeWidthChar::width(c).unwrap_or(0))
+        .sum();
+    let mut x = end - width;
+    for c in text.chars() {
+        let w = unicode_width::UnicodeWidthChar::width(c).unwrap_or(0);
+        if w == 0 {
+            continue;
+        }
+        if let Some(cell) = cells.get_mut(x) {
+            *cell = Cell::new(c, Color::Rgb(fg), Color::Rgb(bg), Flags::empty());
+            if w == 2 {
+                cell.flags.insert(Flags::WIDE);
+            }
+        }
+        if w == 2
+            && let Some(cell) = cells.get_mut(x + 1)
+        {
+            *cell = Cell::new(' ', Color::Rgb(fg), Color::Rgb(bg), Flags::WIDE_SPACER);
+        }
+        x += w;
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::indexing_slicing)]
 mod tests {
@@ -539,6 +572,7 @@ mod tests {
             name: name.into(),
             folder: folder.map(Into::into),
             detail: format!("me@{name}.example"),
+            kind: SessionKind::Ssh,
         }
     }
 
@@ -570,18 +604,47 @@ mod tests {
             .collect()
     }
 
+    /// A folder row as `texts` shows it in 40 columns: the count
+    /// right-aligned, one cell from the edge.
+    fn folder(label: &str, count: usize) -> String {
+        format!(" {label:<37}{count}")
+    }
+
+    #[test]
+    fn details_sit_right_and_tag_desktops() {
+        let mut desk = item("desk", None);
+        desk.kind = SessionKind::Rdp;
+        let mut l = SessionList::new(vec![item("web", None), desk], Vec::new());
+        let t = texts(&mut l);
+        // Right-aligned: ending one cell before the 40th column.
+        let row = |name: &str, detail: &str| {
+            format!("{name:<w$}{detail}", w = 39 - detail.chars().count())
+        };
+        assert_eq!(t[3], row("   web", "me@web.example"));
+        assert_eq!(t[4], row("   desk", "rdp · me@desk.example"));
+        // Too narrow for the detail: shortened, then left out.
+        let mut grid = Grid::new(16, 6);
+        l.draw(&mut grid, &Palette::of(&Theme::default()), true);
+        let row: String = grid.row(HEADER + 1).unwrap().iter().map(|c| c.ch).collect();
+        assert_eq!(row, "   web  me@web… ");
+        let mut grid = Grid::new(10, 6);
+        l.draw(&mut grid, &Palette::of(&Theme::default()), true);
+        let row: String = grid.row(HEADER + 1).unwrap().iter().map(|c| c.ch).collect();
+        assert_eq!(row.trim_end(), "   web");
+    }
+
     #[test]
     fn groups_favourites_and_folders() {
         let mut l = list();
         let t = texts(&mut l);
         assert_eq!(t[0], " Sessions");
         assert_eq!(t[2], " + New session");
-        assert_eq!(t[3], " ▾ Favourites (1)");
+        assert_eq!(t[3], folder("▾ Favourites", 1));
         assert!(t[4].starts_with("   ★ pi"), "{:?}", t[4]);
         assert!(t[5].starts_with("   web"), "{:?}", t[5]);
-        assert_eq!(t[6], " ▾ Work (2)");
+        assert_eq!(t[6], folder("▾ Work", 2));
         assert!(t[7].contains("db1") && t[7].contains("me@db1.example"));
-        assert_eq!(t[9], " ▾ Home (1)");
+        assert_eq!(t[9], folder("▾ Home", 1));
     }
 
     #[test]
@@ -615,8 +678,8 @@ mod tests {
         assert_eq!(l.selected_host(), None);
         l.key(SideKey::Left, 8);
         let t = texts(&mut l);
-        assert_eq!(t[6], " ▸ Work (2)");
-        assert_eq!(t[7], " ▾ Home (1)");
+        assert_eq!(t[6], folder("▸ Work", 2));
+        assert_eq!(t[7], folder("▾ Home", 1));
         assert_eq!(l.key(SideKey::Escape, 8), Some(SideAction::Leave));
     }
 
