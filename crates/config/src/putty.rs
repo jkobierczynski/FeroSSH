@@ -1,76 +1,65 @@
-//! One-time import of PuTTY's saved sessions.
+//! Saved sessions of PuTTY and KiTTY, which store them the same way.
 //!
 //! PuTTY keeps them in the registry under
-//! `HKCU\Software\SimonTatham\PuTTY\Sessions`, one key per session with a
-//! URL-encoded name. The window reads the values; this module turns them
-//! into ssh_config `Host` blocks (written to FeroSSH's own hosts file, never
-//! to `~/.ssh/config`) and profiles for the font. Only SSH sessions are
-//! imported: telnet, serial and raw sessions have no SSH equivalent.
+//! `HKCU\Software\SimonTatham\PuTTY\Sessions`, KiTTY under
+//! `HKCU\Software\9bis.com\KiTTY\Sessions` or, portable, as one file per
+//! session in a `Sessions` folder, with `Key\Value\` lines. Names are
+//! `%XX`-escaped. The window reads the values; this module makes them
+//! [`Session`]s. Only SSH sessions are imported: telnet, serial and raw
+//! sessions have no SSH equivalent. Passwords (KiTTY can store one) are
+//! never read, only noticed.
 
-use std::fmt::Write as _;
-
-use crate::settings::Profile;
+use crate::forward::{ForwardKind, parse_config};
+pub use crate::import::{Session, Value, decode as decode_name};
 use crate::ssh_config::parse_destination;
 
-/// A registry value of a session.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Value {
-    Text(String),
-    Number(u32),
-}
+/// The values FeroSSH reads from each session. `Password` is only
+/// checked for being there.
+pub const VALUES: [&str; 10] = [
+    "Protocol",
+    "HostName",
+    "PortNumber",
+    "UserName",
+    "PublicKeyFile",
+    "Font",
+    "FontHeight",
+    "PortForwardings",
+    "Folder",
+    "Password",
+];
 
-/// What FeroSSH takes from one PuTTY session.
-#[derive(Debug, Clone, PartialEq)]
-pub struct Session {
-    /// The session's name as PuTTY shows it.
-    pub name: String,
-    /// The `Host` name it gets: the name with spaces and odd characters
-    /// replaced.
-    pub alias: String,
-    pub hostname: String,
-    pub port: Option<u16>,
-    pub user: Option<String>,
-    /// A `.ppk` or OpenSSH key file.
-    pub key_file: Option<String>,
-    pub font: Option<String>,
-    pub font_size: Option<f32>,
-}
-
-/// Decodes PuTTY's session-name escaping: `%XX` is a byte.
-pub fn decode_name(raw: &str) -> String {
-    let bytes = raw.as_bytes();
-    let mut out = Vec::with_capacity(bytes.len());
-    let mut i = 0;
-    while let Some(&b) = bytes.get(i) {
-        let hex = bytes
-            .get(i + 1..i + 3)
-            .and_then(|h| std::str::from_utf8(h).ok())
-            .and_then(|h| u8::from_str_radix(h, 16).ok());
-        match (b, hex) {
-            (b'%', Some(v)) => {
-                out.push(v);
-                i += 3;
-            }
+/// PuTTY's forwards: `L8080=db:5432,R2222=localhost:22,D1080`, each
+/// optionally led by `4` or `6`, and the listening side optionally with
+/// an address (`L127.0.0.1:8080=...`). Forwards FeroSSH cannot take are
+/// left out.
+fn forwards(text: &str) -> (Vec<crate::ForwardSpec>, usize) {
+    let mut out = Vec::new();
+    let mut dropped = 0;
+    for entry in text.split(',').map(str::trim).filter(|e| !e.is_empty()) {
+        let entry = entry.trim_start_matches(['4', '6']);
+        let mut chars = entry.chars();
+        let kind = match chars.next() {
+            Some('L') => ForwardKind::Local,
+            Some('R') => ForwardKind::Remote,
+            Some('D') => ForwardKind::Dynamic,
             _ => {
-                out.push(b);
-                i += 1;
+                dropped += 1;
+                continue;
             }
+        };
+        let rest = chars.as_str();
+        let (listen, target) = rest.split_once('=').unwrap_or((rest, ""));
+        let mut args = vec![listen.to_owned()];
+        if !target.is_empty() {
+            args.push(target.to_owned());
+        }
+        match parse_config(kind, &args) {
+            Some(spec) if !out.contains(&spec) => out.push(spec),
+            Some(_) => {}
+            None => dropped += 1,
         }
     }
-    String::from_utf8_lossy(&out).into_owned()
-}
-
-/// A name usable on a `Host` line: letters, digits, `.`, `_` and `-`.
-fn alias(name: &str) -> String {
-    let mut out = String::new();
-    for c in name.trim().chars() {
-        if c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-') {
-            out.push(c);
-        } else if !out.ends_with('-') {
-            out.push('-');
-        }
-    }
-    out.trim_matches('-').to_owned()
+    (out, dropped)
 }
 
 /// Builds a session from its values; `None` for non-SSH sessions, the
@@ -80,85 +69,79 @@ pub fn session(raw_name: &str, get: impl Fn(&str) -> Option<Value>) -> Option<Se
     if name == "Default Settings" {
         return None;
     }
-    let text = |key: &str| match get(key) {
-        Some(Value::Text(t)) if !t.trim().is_empty() => Some(t.trim().to_owned()),
-        _ => None,
-    };
-    let number = |key: &str| match get(key) {
-        Some(Value::Number(n)) => Some(n),
-        _ => None,
-    };
+    let text = |key: &str| get(key).and_then(|v| v.text().map(str::to_owned));
+    let number = |key: &str| get(key).and_then(|v| v.number());
     if text("Protocol").is_some_and(|p| !p.eq_ignore_ascii_case("ssh")) {
         return None;
     }
     // HostName may be `user@host`; the destination parser also rejects
     // anything that is not a host name.
     let (user_in_host, hostname, _) = parse_destination(&text("HostName")?)?;
-    let alias = alias(&name);
-    if alias.is_empty() {
+    // KiTTY's folders; "Default" is where sessions without one are.
+    let folder = text("Folder").filter(|f| f != "Default");
+    let name = match folder {
+        Some(f) => format!("{}/{name}", f.trim_matches(['/', '\\'])),
+        None => name,
+    };
+    let mut s = Session::new(name, None, hostname);
+    if s.host.alias.is_empty() {
         return None;
     }
-    Some(Session {
-        alias,
-        hostname,
-        port: number("PortNumber")
-            .and_then(|p| u16::try_from(p).ok())
-            .filter(|&p| p != 0 && p != 22),
-        user: text("UserName").or(user_in_host),
-        key_file: text("PublicKeyFile"),
-        font: text("Font"),
-        font_size: number("FontHeight")
-            .map(|h| h as f32)
-            .filter(|h| (4.0..=96.0).contains(h)),
-        name,
-    })
-}
-
-/// Quotes a value for ssh_config if it has spaces.
-fn quoted(text: &str) -> String {
-    let clean: String = text
-        .chars()
-        .filter(|c| !c.is_control() && *c != '"')
-        .collect();
-    if clean.contains([' ', '\t']) {
-        format!("\"{clean}\"")
-    } else {
-        clean
+    s.host.port = number("PortNumber")
+        .and_then(|p| u16::try_from(p).ok())
+        .filter(|&p| p != 0 && p != 22);
+    s.host.user = text("UserName").or(user_in_host);
+    s.host.identity_file = text("PublicKeyFile");
+    if let Some(f) = text("PortForwardings") {
+        let (specs, dropped) = forwards(&f);
+        s.host.forwards = specs;
+        if dropped > 0 {
+            s.notes.push(format!(
+                "{dropped} port forward{} FeroSSH cannot use",
+                if dropped == 1 { "" } else { "s" }
+            ));
+        }
     }
+    s.had_password = get("Password").is_some();
+    s.font = text("Font");
+    s.font_size = number("FontHeight")
+        .map(|h| h as f32)
+        .filter(|h| (4.0..=96.0).contains(h));
+    Some(s)
 }
 
-/// The hosts file for imported sessions, in ssh_config syntax, under the
-/// folder "PuTTY". Sessions whose alias `taken` already names (in the
-/// user's ssh_config) are left out, so an import never shadows a host.
-pub fn to_config(sessions: &[Session], taken: impl Fn(&str) -> bool) -> String {
-    let mut out = String::from(
-        "# Imported from PuTTY by FeroSSH. Edit freely; FeroSSH only rewrites it on\n\
-         # the next import.\n# folder: PuTTY\n",
-    );
-    for s in sessions.iter().filter(|s| !taken(&s.alias)) {
-        let _ = writeln!(out, "\n# PuTTY session \"{}\"", quoted(&s.name));
-        let _ = writeln!(out, "Host {}", s.alias);
-        let _ = writeln!(out, "    HostName {}", s.hostname);
-        if let Some(port) = s.port {
-            let _ = writeln!(out, "    Port {port}");
+/// The values in one of KiTTY's portable session files: `Key\Value\`
+/// lines. Values may be `%XX`-escaped. `Password` is kept only as being
+/// there.
+pub fn file_values(text: &str) -> Vec<(String, Value)> {
+    let mut out = Vec::new();
+    for line in text.lines().take(4096) {
+        let line = line.trim_end_matches(['\r', '\n']);
+        let line = line.strip_suffix('\\').unwrap_or(line);
+        let Some((key, value)) = line.split_once('\\') else {
+            continue;
+        };
+        if !VALUES.contains(&key) {
+            continue;
         }
-        if let Some(user) = &s.user {
-            let _ = writeln!(out, "    User {}", quoted(user));
-        }
-        if let Some(key) = &s.key_file {
-            let _ = writeln!(out, "    IdentityFile {}", quoted(key));
-        }
+        let value = if key == "Password" {
+            Value::Number(1)
+        } else {
+            Value::Text(decode_name(value))
+        };
+        out.push((key.to_owned(), value));
     }
     out
 }
 
-/// The font profile a session brings, if it set a font.
-pub fn profile(s: &Session) -> Option<Profile> {
-    (s.font.is_some() || s.font_size.is_some()).then(|| Profile {
-        host: s.alias.clone(),
-        font: s.font.clone(),
-        font_size: s.font_size,
-        ..Profile::default()
+/// A session from one of KiTTY's portable files, named by its file name.
+pub fn file_session(file_name: &str, text: &str) -> Option<Session> {
+    let values = file_values(text);
+    session(file_name, |k| {
+        values
+            .iter()
+            .find(|(key, _)| key == k)
+            .map(|(_, v)| v.clone())
     })
 }
 
@@ -166,6 +149,7 @@ pub fn profile(s: &Session) -> Option<Profile> {
 #[allow(clippy::unwrap_used, clippy::indexing_slicing)]
 mod tests {
     use super::*;
+    use crate::import::{Client, profile, to_config};
     use crate::ssh_config;
 
     fn values<'a>(pairs: &'a [(&'a str, Value)]) -> impl Fn(&str) -> Option<Value> + 'a {
@@ -178,14 +162,6 @@ mod tests {
     }
 
     #[test]
-    fn decodes_names() {
-        assert_eq!(decode_name("Prod%20web%2Fdb"), "Prod web/db");
-        assert_eq!(decode_name("100%"), "100%");
-        assert_eq!(decode_name("%zz"), "%zz");
-        assert_eq!(decode_name("%C3%BC"), "ü");
-    }
-
-    #[test]
     fn imports_ssh_sessions() {
         let v = [
             ("Protocol", Value::Text("ssh".into())),
@@ -194,16 +170,36 @@ mod tests {
             ("PublicKeyFile", Value::Text(r"C:\Keys\my key.ppk".into())),
             ("Font", Value::Text("Consolas".into())),
             ("FontHeight", Value::Number(11)),
+            (
+                "PortForwardings",
+                Value::Text(
+                    "L8080=localhost:80,4R2222=localhost:22,D1080,Lx=y,L127.0.0.1:5433=db:5432"
+                        .into(),
+                ),
+            ),
         ];
         let s = session("Prod%20DB%20(main)", values(&v)).unwrap();
-        assert_eq!(s.alias, "Prod-DB-main");
-        assert_eq!(s.user.as_deref(), Some("admin"));
-        assert_eq!(s.port, Some(2222));
-        let text = to_config(std::slice::from_ref(&s), |_| false);
+        assert_eq!(s.host.alias, "Prod-DB-main");
+        assert_eq!(s.host.user.as_deref(), Some("admin"));
+        assert_eq!(s.host.port, Some(2222));
+        assert!(!s.had_password);
+        let lines: Vec<String> = s.host.forwards.iter().map(|f| f.config_line()).collect();
+        assert_eq!(
+            lines,
+            [
+                "LocalForward 8080 localhost:80",
+                "RemoteForward 2222 localhost:22",
+                "DynamicForward 1080",
+                "LocalForward 127.0.0.1:5433 db:5432",
+            ]
+        );
+        assert_eq!(s.notes, ["1 port forward FeroSSH cannot use"]);
+        let text = to_config(Client::Putty, &[&s]);
         let cfg = ssh_config::resolve(&text, "Prod-DB-main");
         assert_eq!(cfg.hostname.as_deref(), Some("db.example.org"));
         assert_eq!(cfg.port, Some(2222));
         assert_eq!(cfg.identity_files, [r"C:\Keys\my key.ppk"]);
+        assert_eq!(cfg.forwards.len(), 4);
         let hosts = ssh_config::hosts(&text, &ssh_config::NoIncludes);
         assert_eq!(hosts[0].folder.as_deref(), Some("PuTTY"));
         let p = profile(&s).unwrap();
@@ -211,7 +207,31 @@ mod tests {
             (p.font.as_deref(), p.font_size),
             (Some("Consolas"), Some(11.0))
         );
-        assert!(!to_config(&[s], |a| a == "Prod-DB-main").contains("Host "));
+    }
+
+    #[test]
+    fn reads_kitty_portable_files() {
+        let text = "HostName\\web.example.org\\\r\nPortNumber\\2200\\\r\nUserName\\me\\\r\n\
+                    PublicKeyFile\\C:%5CKeys%5Cid.ppk\\\r\nFolder\\Work\\\r\nPassword\\0a1b2c\\\r\n\
+                    Protocol\\ssh\\\r\n";
+        let s = file_session("my%20web", text).unwrap();
+        assert_eq!(s.name, "Work/my web");
+        assert_eq!(s.host.alias, "my-web");
+        assert_eq!(s.host.port, Some(2200));
+        assert_eq!(s.host.identity_file.as_deref(), Some(r"C:\Keys\id.ppk"));
+        assert!(s.had_password);
+        // The stored password is never kept.
+        assert!(
+            file_values(text)
+                .iter()
+                .all(|(_, v)| *v != Value::Text("0a1b2c".into()))
+        );
+        let raw =
+            file_session("box", "HostName\\box\\\nPublicKeyFile\\C:\\Keys\\a.ppk\\\n").unwrap();
+        assert_eq!(raw.host.identity_file.as_deref(), Some(r"C:\Keys\a.ppk"));
+        let folder = to_config(Client::Kitty, &[&s]);
+        let hosts = ssh_config::hosts(&folder, &ssh_config::NoIncludes);
+        assert_eq!(hosts[0].folder.as_deref(), Some("KiTTY/Work"));
     }
 
     #[test]

@@ -7,7 +7,7 @@
 //! default in grey. Keys come in as [`SideKey`]s; what the user chose
 //! comes out as a [`FormAction`].
 //!
-//! The connection settings of a host from `~/.ssh/config` or the PuTTY
+//! The connection settings of a host from `~/.ssh/config` or an
 //! import are shown read-only: FeroSSH never writes those files. Giving
 //! the session a new name saves an editable copy.
 
@@ -1217,15 +1217,15 @@ fn port(text: &str, what: &str) -> Result<(), String> {
 }
 
 /// A row being filled from the left.
-struct Line {
+pub(crate) struct Line {
     cells: Vec<Cell>,
     width: usize,
-    col: usize,
+    pub(crate) col: usize,
     bg: Rgb,
 }
 
 impl Line {
-    fn new(width: usize, bg: Rgb) -> Self {
+    pub(crate) fn new(width: usize, bg: Rgb) -> Self {
         Self {
             cells: Vec::with_capacity(width),
             width,
@@ -1234,7 +1234,7 @@ impl Line {
         }
     }
 
-    fn put(&mut self, text: &str, fg: Rgb, flags: Flags) -> &mut Self {
+    pub(crate) fn put(&mut self, text: &str, fg: Rgb, flags: Flags) -> &mut Self {
         for c in text.chars().filter(|c| !c.is_control()) {
             let w = c.width().unwrap_or(0);
             if w == 0 || self.col + w > self.width {
@@ -1259,7 +1259,7 @@ impl Line {
         self
     }
 
-    fn cells(&mut self, bg: Rgb) -> Vec<Cell> {
+    pub(crate) fn cells(&mut self, bg: Rgb) -> Vec<Cell> {
         let mut cells = std::mem::take(&mut self.cells);
         cells.resize(
             self.width,

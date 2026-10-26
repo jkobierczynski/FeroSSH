@@ -1,6 +1,6 @@
 [package]
 name = "ferossh-config"
-description = "FeroSSH: ssh_config parser, known_hosts and PuTTY import"
+description = "FeroSSH: ssh_config parser, known_hosts and session imports"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

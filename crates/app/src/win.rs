@@ -19,10 +19,11 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use ferossh_auth::Broker;
+use ferossh_config::import::{self, Client};
 use ferossh_config::password::{self as pw_source, PasswordSource};
 use ferossh_config::saved::{self, SavedHost};
 use ferossh_config::settings::{DEFAULT_DESKTOP_PORT, DEFAULT_VNC_PORT};
-use ferossh_config::{SessionKind, Settings, putty, ssh_config};
+use ferossh_config::{SessionKind, Settings, putty, ssh_config, winscp};
 use ferossh_forward::x11::{Display, find_cookie, xauth_entries};
 use ferossh_ipc::{ChannelId, DirEntry, FORWARD_IDS, Message, SftpReply, X11Auth};
 use ferossh_render::{
@@ -90,11 +91,12 @@ use crate::desktop::{Desktop, Protocol, Update as DesktopUpdate};
 use crate::files::{FilesAction, FilesView};
 use crate::forwards::{ConnView, DesktopEvent, Forwarder, Setup as ForwardSetup, desktop_port_for};
 use crate::fwdview::{ForwardsView, FwdAction};
+use crate::import_reg;
+use crate::import_view::{Found, ImportAction, ImportView};
 use crate::layout::{self, Axis, Closed, Dir, Drop, PaneId, Rect, Workspace};
 use crate::link::{Link, LinkEvent};
 use crate::look;
 use crate::pattern;
-use crate::putty_reg;
 use crate::pwcommand;
 use crate::sandbox;
 use crate::scrollmark;
@@ -172,7 +174,7 @@ mod cmd {
     pub const DISCONNECT: u32 = 104;
     pub const NEW_TAB: u32 = 105;
     pub const CLOSE_PANE: u32 = 106;
-    pub const IMPORT_PUTTY: u32 = 107;
+    pub const IMPORT: u32 = 107;
     pub const UPLOAD: u32 = 108;
     pub const DOWNLOADS: u32 = 109;
     pub const ZOOM_IN: u32 = 200;
@@ -451,6 +453,8 @@ struct Side {
     list: SessionList,
     /// The session form, shown in place of the list while open.
     form: Option<SessionForm>,
+    /// The import page, likewise.
+    import: Option<ImportView>,
     grid: Grid,
     /// Width in pixels, edge excluded; 0 until first shown.
     width: i32,
@@ -649,10 +653,10 @@ fn settings_path() -> PathBuf {
     app_dir().join("ferossh.conf")
 }
 
-/// Where imported PuTTY sessions go, in ssh_config syntax. FeroSSH reads it
-/// after `~/.ssh/config`; OpenSSH never sees it.
-fn putty_hosts_path() -> PathBuf {
-    app_dir().join("putty-sessions.conf")
+/// Where sessions imported from `client` go, in ssh_config syntax.
+/// FeroSSH reads it after `~/.ssh/config`; OpenSSH never sees it.
+fn imported_path(client: Client) -> PathBuf {
+    app_dir().join(client.file_name())
 }
 
 /// Sessions made in the session form, in ssh_config syntax. FeroSSH reads
@@ -677,10 +681,12 @@ fn ssh_env() -> Env {
         config.push_str("\nHost !*\n");
         config.push_str(&made);
     }
-    if let Ok(imported) = std::fs::read_to_string(putty_hosts_path()) {
-        // A Host line first: the user's last block must not swallow it.
-        config.push_str("\nHost !*\n");
-        config.push_str(&imported);
+    for client in Client::ALL {
+        if let Ok(imported) = std::fs::read_to_string(imported_path(client)) {
+            // A Host line first: the user's last block must not swallow it.
+            config.push_str("\nHost !*\n");
+            config.push_str(&imported);
+        }
     }
     Env {
         local_user: std::env::var("USERNAME").unwrap_or_default(),
@@ -868,6 +874,7 @@ fn create_and_run(launch: Launch, theme: Option<String>) -> Result<()> {
                     focused: false,
                     list: SessionList::default(),
                     form: None,
+                    import: None,
                     grid: Grid::new(1, 1),
                     width: 0,
                     last_click: None,
@@ -992,7 +999,7 @@ fn build_menu() -> Result<HMENU> {
         item(file, cmd::DOWNLOADS, "Open do&wnload folder")?;
         separator(file)?;
         item(file, cmd::RESTART_SHELL, "Open &local shell")?;
-        item(file, cmd::IMPORT_PUTTY, "&Import PuTTY sessions...")?;
+        item(file, cmd::IMPORT, "&Import sessions...")?;
         separator(file)?;
         item(file, cmd::EXIT, "E&xit\tAlt+F4")?;
 
@@ -3194,9 +3201,10 @@ impl Window {
         if let Some(side) = self.areas.side {
             let focused = self.side.focused && self.focused;
             match self.side.view {
-                SideView::Sessions => match &mut self.side.form {
-                    Some(form) => form.draw(&mut self.side.grid, &palette, focused),
-                    None => self.side.list.draw(&mut self.side.grid, &palette, focused),
+                SideView::Sessions => match (&mut self.side.form, &mut self.side.import) {
+                    (Some(form), _) => form.draw(&mut self.side.grid, &palette, focused),
+                    (None, Some(view)) => view.draw(&mut self.side.grid, &palette, focused),
+                    (None, None) => self.side.list.draw(&mut self.side.grid, &palette, focused),
                 },
                 SideView::Forwards => {
                     let view = self.forward_view();
@@ -3741,6 +3749,10 @@ impl Window {
             let action = form.key(key, self.side.grid.rows());
             return self.form_action(action);
         }
+        if let Some(view) = &mut self.side.import {
+            let action = view.key(key, self.side.grid.rows());
+            return self.import_action(action);
+        }
         let visible = SessionList::visible(self.side.grid.rows());
         let action = self.side.list.key(key, visible);
         self.side_action(action)
@@ -3782,6 +3794,81 @@ impl Window {
         }
         self.refresh_chrome();
         out
+    }
+
+    /// File > Import sessions: the import page, on what the clients
+    /// on this account have saved.
+    fn open_import(&mut self, sessions: Vec<(Client, String, Vec<import::Session>)>) {
+        let list = sessions
+            .into_iter()
+            .map(|(c, origin, s)| found(c, origin, s))
+            .collect();
+        self.side.form = None;
+        self.side.import = Some(ImportView::new(list));
+        self.show_side(SideView::Sessions, true);
+        self.refresh_chrome();
+    }
+
+    /// Sessions read from a file the user picked on the import page.
+    fn add_import(&mut self, (client, origin, sessions): (Client, String, Vec<import::Session>)) {
+        if let Some(view) = &mut self.side.import {
+            view.add(found(client, origin, sessions));
+        }
+        self.refresh_chrome();
+    }
+
+    /// Carries out what the import page asked for.
+    fn import_action(&mut self, action: Option<ImportAction>) -> Option<Command> {
+        let mut out = None;
+        match action {
+            Some(ImportAction::Close) => self.side.import = None,
+            Some(ImportAction::FromFile) => out = Some(Command::PickImportFile),
+            Some(ImportAction::Import { client, sessions }) => {
+                out = Some(Command::Notice(self.write_import(client, &sessions)));
+            }
+            None => {}
+        }
+        self.refresh_chrome();
+        out
+    }
+
+    /// Writes `client`'s import file (replacing an earlier import from
+    /// it) and the fonts the sessions bring; says what happened.
+    fn write_import(&mut self, client: Client, sessions: &[import::Session]) -> String {
+        let path = imported_path(client);
+        let all: Vec<&import::Session> = sessions.iter().collect();
+        if let Err(e) = write_app_file(&path, &import::to_config(client, &all)) {
+            return format!("Could not write {}: {e}", path.display());
+        }
+        // Fonts become profiles, unless the host already has one.
+        for s in sessions {
+            if let Some(p) = import::profile(s)
+                && self.settings.profile(&p.host).is_none()
+            {
+                let host = p.host.clone();
+                *self.settings.profile_mut(&host) = p;
+            }
+        }
+        self.save_settings();
+        self.side.import = None;
+        self.show_side(SideView::Sessions, true);
+        self.update_menu_checks();
+        let n = sessions.len();
+        let mut text = format!(
+            "Imported {n} session{} from {} into the {} folder of the session manager.",
+            plural(n),
+            client.name(),
+            client.name(),
+        );
+        let saved = sessions.iter().filter(|s| s.had_password).count();
+        if saved > 0 {
+            text.push_str(&format!(
+                "\n\n{saved} of them had a password saved in {}, which FeroSSH does not import. \
+                 To log in without typing it, pick a password source with F2 on the session.",
+                client.name()
+            ));
+        }
+        text
     }
 
     /// Opens the session form on `host`, or on a new session.
@@ -4421,6 +4508,7 @@ impl Window {
                 if button == MouseButton::Right
                     && self.side.view == SideView::Sessions
                     && self.side.form.is_none()
+                    && self.side.import.is_none()
                 {
                     let visible = SessionList::visible(self.side.grid.rows());
                     self.side.list.select_at(row, visible);
@@ -4456,6 +4544,10 @@ impl Window {
                 if let Some(form) = &mut self.side.form {
                     let action = form.click(col, row, self.side.grid.rows());
                     return self.form_action(action);
+                }
+                if let Some(view) = &mut self.side.import {
+                    let action = view.click(col, row, self.side.grid.rows());
+                    return self.import_action(action);
                 }
                 let visible = SessionList::visible(self.side.grid.rows());
                 let action = self.side.list.click(row, double, visible);
@@ -4841,6 +4933,8 @@ impl Window {
                     self.files.scroll_by(remote, lines, self.side.grid.rows());
                 } else if let Some(form) = &mut self.side.form {
                     form.scroll_by(lines, self.side.grid.rows());
+                } else if let Some(view) = &mut self.side.import {
+                    view.scroll_by(lines, self.side.grid.rows());
                 } else {
                     let visible = SessionList::visible(self.side.grid.rows());
                     self.side.list.scroll_by(lines, visible);
@@ -4948,7 +5042,7 @@ impl Window {
             cmd::COPY => return Some(Command::Copy),
             cmd::PASTE => return Some(Command::Paste),
             cmd::REPLACE_KEY => return Some(Command::ReplaceHostKey),
-            cmd::IMPORT_PUTTY => return Some(Command::ImportPutty),
+            cmd::IMPORT => return Some(Command::ImportSessions),
             cmd::RESTART_SHELL => self.start_shell(pane),
             cmd::CONNECT => self.connect_in_new_tab(pane),
             cmd::RECONNECT => self.reconnect(self.host_pane(pane)),
@@ -5815,7 +5909,10 @@ enum Command {
     OpenFolder(PathBuf),
     /// The tab strip's close mark: asks first when sessions are open.
     CloseTab(usize),
-    ImportPutty,
+    /// File > Import sessions: the side pane's import page.
+    ImportSessions,
+    /// The import page's file picker.
+    PickImportFile,
     SaveLook,
     /// A message box with this text.
     Notice(String),
@@ -6008,18 +6105,23 @@ fn pick_files(hwnd: HWND) -> Vec<PathBuf> {
 
 /// The session form's Browse: one key file, starting in `~/.ssh`.
 fn pick_key_file(hwnd: HWND) -> Option<PathBuf> {
+    pick_file(hwnd, w!("Key file for this session"), &home().join(".ssh"))
+}
+
+/// The open-file dialog, starting in `dir`.
+fn pick_file(hwnd: HWND, title: PCWSTR, dir: &std::path::Path) -> Option<PathBuf> {
     if DIALOG_OPEN.get() {
         return None;
     }
     let mut buf = vec![0u16; 4096];
-    let dir = HSTRING::from(home().join(".ssh").as_os_str());
+    let dir = HSTRING::from(dir.as_os_str());
     let mut ofn = OPENFILENAMEW {
         lStructSize: std::mem::size_of::<OPENFILENAMEW>() as u32,
         hwndOwner: hwnd,
         lpstrFile: PWSTR(buf.as_mut_ptr()),
         nMaxFile: buf.len() as u32,
         lpstrInitialDir: PCWSTR(dir.as_ptr()),
-        lpstrTitle: w!("Key file for this session"),
+        lpstrTitle: title,
         Flags: OFN_EXPLORER | OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR,
         ..Default::default()
     };
@@ -6039,15 +6141,16 @@ fn pick_key_file(hwnd: HWND) -> Option<PathBuf> {
 /// Which file a host the session form cannot change comes from, as the
 /// user knows it.
 fn host_file(host: &str) -> String {
-    let in_putty = std::fs::read_to_string(putty_hosts_path()).is_ok_and(|t| {
-        ssh_config::hosts(&t, &ssh_config::NoIncludes)
-            .iter()
-            .any(|h| h.name.eq_ignore_ascii_case(host))
+    let imported = Client::ALL.into_iter().find(|&c| {
+        std::fs::read_to_string(imported_path(c)).is_ok_and(|t| {
+            ssh_config::hosts(&t, &ssh_config::NoIncludes)
+                .iter()
+                .any(|h| h.name.eq_ignore_ascii_case(host))
+        })
     });
-    if in_putty {
-        "the PuTTY import".to_owned()
-    } else {
-        "~/.ssh/config".to_owned()
+    match imported {
+        Some(c) => format!("the {} import", c.name()),
+        None => "~/.ssh/config".to_owned(),
     }
 }
 
@@ -6350,7 +6453,37 @@ fn run_command(hwnd: HWND, command: Command) {
                 with_window(|w| w.upload_files(&key, &picked, &dir));
             }
         }
-        Command::ImportPutty => import_putty(hwnd),
+        Command::ImportSessions => {
+            let mut found: Vec<_> = Client::ALL
+                .into_iter()
+                .map(|c| (c, "registry".to_owned(), import_reg::sessions(c)))
+                .filter(|(_, _, s)| !s.is_empty())
+                .collect();
+            // WinSCP keeps its sites here instead when set to use an INI
+            // file.
+            if let Some(ini) =
+                std::env::var_os("APPDATA").map(|a| PathBuf::from(a).join("WinSCP.ini"))
+                && ini.is_file()
+                && let Ok(f) = read_import_file(&ini)
+            {
+                found.push(f);
+            }
+            with_window(|w| w.open_import(found));
+        }
+        Command::PickImportFile => {
+            let start = std::env::var_os("APPDATA").map_or_else(home, PathBuf::from);
+            if let Some(path) = pick_file(hwnd, w!("A WinSCP.ini or a KiTTY session file"), &start)
+            {
+                match read_import_file(&path) {
+                    Ok(found) => {
+                        with_window(|w| w.add_import(found));
+                    }
+                    Err(e) => {
+                        dialog(hwnd, &e, MB_OK | MB_ICONWARNING);
+                    }
+                }
+            }
+        }
         Command::SessionMenu(host) => session_menu(hwnd, host),
         Command::DeleteSession(name) => {
             let text = format!(
@@ -6428,96 +6561,109 @@ fn run_command(hwnd: HWND, command: Command) {
     }
 }
 
-/// File > Import PuTTY sessions: reads PuTTY's saved SSH sessions, writes
-/// them to FeroSSH's own hosts file (never to `~/.ssh/config`) and their
-/// fonts to profiles, after a confirmation.
-fn import_putty(hwnd: HWND) {
-    let sessions = putty_reg::sessions();
-    if sessions.is_empty() {
-        dialog(
-            hwnd,
-            "PuTTY has no saved SSH sessions on this account.",
-            MB_OK | MB_ICONINFORMATION,
-        );
-        return;
-    }
-    // Hosts the user's own ssh_config already names win: they are not
-    // imported again.
-    let mut env = ssh_env();
-    env.config = std::fs::read_to_string(home().join(".ssh").join("config")).unwrap_or_default();
-    let includes = ssh_config::DirIncludes {
-        home: env.home.clone(),
-    };
-    let mut taken: Vec<String> = ssh_config::hosts(&env.config, &includes)
+/// Host names already taken outside `client`'s own import: in the user's
+/// ssh_config, the saved sessions and the other imports. Lowercase.
+fn taken_aliases(client: Client) -> Vec<String> {
+    let home = home();
+    let config = std::fs::read_to_string(home.join(".ssh").join("config")).unwrap_or_default();
+    let includes = ssh_config::DirIncludes { home };
+    let mut taken: Vec<String> = ssh_config::hosts(&config, &includes)
         .into_iter()
         .map(|h| h.name.to_ascii_lowercase())
         .collect();
-    // So do the sessions made in the session form.
     taken.extend(
         load_saved()
             .into_iter()
             .map(|h| h.alias.to_ascii_lowercase()),
     );
-    let is_taken = |alias: &str| taken.contains(&alias.to_ascii_lowercase());
-    let fresh: Vec<&putty::Session> = sessions.iter().filter(|s| !is_taken(&s.alias)).collect();
-    let names: Vec<&str> = fresh.iter().take(12).map(|s| s.name.as_str()).collect();
-    let more = fresh.len().saturating_sub(names.len());
-    let mut text = format!(
-        "Import {n} PuTTY session{s}?\n\n{}{}\n\nThey go to {} in ssh_config form, which FeroSSH \
-         reads after your ~/.ssh/config. Your ssh_config and PuTTY are not changed. A new import \
-         replaces that file.",
-        names.join("\n"),
-        if more > 0 {
-            format!("\n... and {more} more")
-        } else {
-            String::new()
-        },
-        putty_hosts_path().display(),
-        n = fresh.len(),
-        s = plural(fresh.len()),
-    );
-    let skipped = sessions.len() - fresh.len();
-    if skipped > 0 {
-        text.push_str(&format!(
-            "\n\n{skipped} session{} named like a host in your ssh_config or sessions {} skipped.",
-            plural(skipped),
-            if skipped == 1 { "is" } else { "are" }
-        ));
-    }
-    if fresh.is_empty() {
-        dialog(
-            hwnd,
-            "Every PuTTY session is already a host in your ssh_config or sessions; nothing to import.",
-            MB_OK | MB_ICONINFORMATION,
-        );
-        return;
-    }
-    if dialog(hwnd, &text, MB_YESNO | MB_ICONQUESTION) != Some(IDYES) {
-        return;
-    }
-    let config = putty::to_config(&sessions, is_taken);
-    if let Err(e) = write_app_file(&putty_hosts_path(), &config) {
-        dialog(
-            hwnd,
-            &format!("Could not write {}: {e}", putty_hosts_path().display()),
-            MB_OK | MB_ICONERROR,
-        );
-        return;
-    }
-    with_window(|w| {
-        // Fonts become profiles, unless the host already has one.
-        for s in &fresh {
-            if let Some(p) = putty::profile(s)
-                && w.settings.profile(&p.host).is_none()
-            {
-                let host = p.host.clone();
-                *w.settings.profile_mut(&host) = p;
-            }
+    for other in Client::ALL.into_iter().filter(|&c| c != client) {
+        if let Ok(text) = std::fs::read_to_string(imported_path(other)) {
+            taken.extend(
+                ssh_config::hosts(&text, &ssh_config::NoIncludes)
+                    .into_iter()
+                    .map(|h| h.name.to_ascii_lowercase()),
+            );
         }
-        w.save_settings();
-        w.show_side(SideView::Sessions, true);
-        w.update_menu_checks();
-    });
+    }
+    taken
+}
+
+/// What the import page shows for sessions read from `origin`: distinct
+/// names, and the ones a host elsewhere already has marked.
+fn found(client: Client, origin: String, mut sessions: Vec<import::Session>) -> Found {
+    import::distinct(&mut sessions);
+    let taken = taken_aliases(client);
+    let taken = sessions
+        .iter()
+        .map(|s| taken.contains(&s.host.alias.to_ascii_lowercase()))
+        .collect();
+    Found {
+        client,
+        origin,
+        sessions,
+        taken,
+    }
+}
+
+/// Reads a file the user picked for an import: a `WinSCP.ini`, or one of
+/// KiTTY's portable session files, which brings the whole `Sessions`
+/// folder it is in.
+fn read_import_file(
+    path: &std::path::Path,
+) -> std::result::Result<(Client, String, Vec<import::Session>), String> {
+    let read = |p: &std::path::Path, max: u64| -> std::result::Result<String, String> {
+        let meta =
+            std::fs::metadata(p).map_err(|e| format!("Could not read {}: {e}", p.display()))?;
+        if meta.len() > max {
+            return Err(format!("{} is too big to be a session file.", p.display()));
+        }
+        std::fs::read(p)
+            .map(|b| {
+                String::from_utf8_lossy(&b)
+                    .trim_start_matches('\u{feff}')
+                    .to_owned()
+            })
+            .map_err(|e| format!("Could not read {}: {e}", p.display()))
+    };
+    let text = read(path, 16 << 20)?;
+    if text
+        .lines()
+        .any(|l| l.trim_start().starts_with("[Sessions\\"))
+    {
+        let sessions = winscp::from_ini(&text);
+        if sessions.is_empty() {
+            return Err(format!("{} has no SFTP or SCP sites.", path.display()));
+        }
+        return Ok((Client::WinScp, path.display().to_string(), sessions));
+    }
+    let file_name = |p: &std::path::Path| p.file_name().map(|n| n.to_string_lossy().into_owned());
+    let not_kitty = || {
+        format!(
+            "{} is neither a WinSCP.ini nor a session file of a portable KiTTY.",
+            path.display()
+        )
+    };
+    let name = file_name(path).ok_or_else(not_kitty)?;
+    if text.len() > 1 << 20 || putty::file_session(&name, &text).is_none() {
+        return Err(not_kitty());
+    }
+    let dir = path.parent().ok_or_else(not_kitty)?;
+    let mut sessions = Vec::new();
+    let entries =
+        std::fs::read_dir(dir).map_err(|e| format!("Could not read {}: {e}", dir.display()))?;
+    for entry in entries.flatten().take(10_000) {
+        let p = entry.path();
+        if !entry.file_type().is_ok_and(|t| t.is_file()) {
+            continue;
+        }
+        if let (Some(name), Ok(text)) = (file_name(&p), read(&p, 1 << 20))
+            && let Some(s) = putty::file_session(&name, &text)
+        {
+            sessions.push(s);
+        }
+    }
+    sessions.sort_by_key(|a| a.name.to_lowercase());
+    Ok((Client::Kitty, dir.display().to_string(), sessions))
 }
 
 /// The changed-key screen's only way forward: replace the stored key,

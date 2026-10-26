@@ -1,4 +1,4 @@
-//! `ssh_config` parser, known_hosts and PuTTY import.
+//! `ssh_config` parser, known_hosts and imports from other SSH clients.
 //!
 //! Everything here runs in the UI process, which owns the user's files; the
 //! sandboxed worker never reads them. Per-host colour themes build on the
@@ -8,6 +8,7 @@
 pub mod forward;
 mod host_theme;
 pub mod hostkey;
+pub mod import;
 pub mod known_hosts;
 pub mod password;
 mod pattern;
@@ -15,6 +16,7 @@ pub mod putty;
 pub mod saved;
 pub mod settings;
 pub mod ssh_config;
+pub mod winscp;
 
 pub use forward::{ForwardKind, ForwardSpec};
 pub use host_theme::{HostThemes, ThemeRule};
