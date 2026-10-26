@@ -1,0 +1,113 @@
+name: Release
+
+# Pushing a version tag such as v0.1.0 runs every CI check, builds the
+# release exes, signs them when a certificate is configured, and publishes a
+# GitHub Release with the exes, their SHA-256 sums and the notes from
+# docs/releases/<tag>.md. A tag with a hyphen (v0.2.0-rc1) makes a
+# pre-release.
+
+on:
+  push:
+    tags: ["v*.*.*"]
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  version:
+    name: Tag matches Cargo.toml
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Compare the tag with the workspace version and look for notes
+        run: |
+          tag="${GITHUB_REF_NAME}"
+          version=$(sed -n '/^\[workspace.package\]/,/^\[/s/^version = "\(.*\)"/\1/p' Cargo.toml)
+          if [ "v$version" != "${tag%%-*}" ]; then
+            echo "::error::Tag $tag does not match the workspace version $version in Cargo.toml"
+            exit 1
+          fi
+          if [ ! -f "docs/releases/$tag.md" ]; then
+            echo "::error::docs/releases/$tag.md is missing; the release notes come from there"
+            exit 1
+          fi
+
+  # The same jobs as on a pull request: Windows build and tests, the Linux
+  # SSH, tmux, desktop viewer and interop tests, cargo deny, cargo audit and
+  # the fuzz smoke runs. Its Windows job uploads the release exes.
+  ci:
+    name: CI
+    needs: version
+    uses: ./.github/workflows/ci.yml
+
+  publish:
+    name: Publish the release
+    needs: ci
+    runs-on: windows-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: ferossh-exe
+          path: dist
+      - uses: actions/download-artifact@v4
+        with:
+          name: ferossh-desktop-viewer-exe
+          path: dist
+
+      # Signing hook. It runs only when the WINDOWS_SIGNING_CERT secret is
+      # set (a base64 .pfx with its password in
+      # WINDOWS_SIGNING_CERT_PASSWORD); until then the exes go out unsigned.
+      # For Azure Trusted Signing, replace this step with
+      # azure/trusted-signing-action.
+      - name: Sign the exes
+        shell: pwsh
+        env:
+          CERT: ${{ secrets.WINDOWS_SIGNING_CERT }}
+          CERT_PASSWORD: ${{ secrets.WINDOWS_SIGNING_CERT_PASSWORD }}
+        run: |
+          if (-not $env:CERT) {
+            "No signing certificate configured: the exes are not signed." | Tee-Object -Append $env:GITHUB_STEP_SUMMARY
+            exit 0
+          }
+          $pfx = Join-Path $env:RUNNER_TEMP "signing.pfx"
+          [IO.File]::WriteAllBytes($pfx, [Convert]::FromBase64String($env:CERT))
+          try {
+            $signtool = Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\bin\*\x64\signtool.exe" |
+              Sort-Object FullName -Descending | Select-Object -First 1
+            & $signtool.FullName sign /fd SHA256 /td SHA256 /tr http://timestamp.digicert.com `
+              /f $pfx /p $env:CERT_PASSWORD dist\ferossh.exe dist\ferossh-desktop.exe
+            if ($LASTEXITCODE) { exit $LASTEXITCODE }
+            & $signtool.FullName verify /pa dist\ferossh.exe dist\ferossh-desktop.exe
+            if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          } finally {
+            Remove-Item $pfx -Force
+          }
+
+      # The sums are taken after signing, so they match what is downloaded.
+      - name: SHA-256 sums
+        shell: pwsh
+        run: |
+          Push-Location dist
+          Get-ChildItem *.exe | Sort-Object Name | ForEach-Object {
+            "$((Get-FileHash $_.Name -Algorithm SHA256).Hash.ToLower())  $($_.Name)"
+          } | Set-Content -Encoding ascii SHA256SUMS.txt
+          Get-Content SHA256SUMS.txt | Tee-Object -Append $env:GITHUB_STEP_SUMMARY
+          Pop-Location
+
+      - name: Create the GitHub Release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          $pre = if ($env:TAG.Contains("-")) { @("--prerelease") } else { @() }
+          gh release create $env:TAG --verify-tag --title "FeroSSH $env:TAG" `
+            --notes-file "docs/releases/$env:TAG.md" @pre `
+            dist/ferossh.exe dist/ferossh-desktop.exe dist/SHA256SUMS.txt
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }

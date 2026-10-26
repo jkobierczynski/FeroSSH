@@ -140,6 +140,8 @@ With the built-in desktop viewer: `cargo build --release -p ferossh --features d
 
 Checks run in CI: `cargo fmt`, `cargo clippy`, `cargo test`, `cargo deny`, `cargo audit`, SSH tests against a real OpenSSH server on Linux (`cargo test -p ferossh-worker --test sshd`, skipped where `sshd` is not installed), the tmux integration against a real tmux (`cargo test -p ferossh tmux_e2e`, skipped without tmux), the RDP viewer against a real xrdp (`FEROSSH_TEST_RDP="127.0.0.1:3389 user password" cargo test -p ferossh-viewer --features rdp rdp::`), the VNC viewer's resize against a real Xvnc (`FEROSSH_TEST_VNC=127.0.0.1:5905 cargo test -p ferossh-viewer --features vnc resizes_a_real_server`), and fuzz smoke runs of the IPC decoder, the SFTP decoder, the tmux control-mode client, the SOCKS and X11 parsers, the VNC client, the RDP session's decoders and the terminal (`cargo +nightly fuzz run --target x86_64-unknown-linux-gnu term_feed`).
 
+Releases: pushing a version tag (`git tag v0.1.0 && git push origin v0.1.0`) runs [`release.yml`](.github/workflows/release.yml). It checks that the tag matches the version in `Cargo.toml` and that `docs/releases/<tag>.md` exists, runs every CI job, and publishes a GitHub Release with `ferossh.exe`, `ferossh-desktop.exe`, `SHA256SUMS.txt` and those notes. The exes are signed when the `WINDOWS_SIGNING_CERT` (a base64 `.pfx`) and `WINDOWS_SIGNING_CERT_PASSWORD` secrets are set, and go out unsigned otherwise.
+
 On Linux or macOS, `cargo run -p ferossh-term --example vttest -- 1 2 8` drives [vttest](https://invisible-island.net/vttest/) through the emulator and prints every screen as text.
 
 ## Licence
