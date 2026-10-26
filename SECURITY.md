@@ -36,9 +36,9 @@ little as possible. One exe runs as three kinds of process:
   viewer, decodes remote screens in an AppContainer with no capabilities
   at all: no network, files or registry.
 
-Every sandboxed process runs in a job object that kills them with the
-window, lets them start no other process, caps their memory at 1 GiB and
-keeps them away from the clipboard, the desktop and other processes'
+Every sandboxed process runs in a job object that kills it with the
+window, lets it start no other process, caps its memory at 1 GiB and
+keeps it away from the clipboard, the desktop and other processes'
 windows. They also start with process mitigations: no dynamic code, no
 legacy extension points, no non-system fonts, mandatory ASLR, strict
 handle checks and DLLs from System32 first. `ferossh.exe --check-sandbox`
