@@ -225,6 +225,30 @@ impl Renderer {
         Ok(metrics)
     }
 
+    /// Whether `family` is installed, so a menu can grey out the rest.
+    /// A pane asking for a missing family gets the first fallback instead.
+    pub fn has_family(&self, family: &str) -> bool {
+        // SAFETY: DirectWrite queries with valid out-pointers to locals.
+        unsafe {
+            let mut collection: Option<IDWriteFontCollection> = None;
+            if self
+                .dwrite
+                .GetSystemFontCollection(&mut collection, false)
+                .is_err()
+            {
+                return false;
+            }
+            let Some(collection) = collection else {
+                return false;
+            };
+            let (mut index, mut exists) = (0, BOOL(0));
+            collection
+                .FindFamilyName(&HSTRING::from(family), &mut index, &mut exists)
+                .is_ok()
+                && exists.as_bool()
+        }
+    }
+
     /// Drops every cached font and atlas, e.g. after a DPI change.
     pub fn clear_font_cache(&mut self) {
         self.fonts.clear();

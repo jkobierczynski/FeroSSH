@@ -33,6 +33,6 @@ mod terminal;
 
 pub use cwd::WorkingDir;
 pub use input::{Key, Mods, MouseButton, MouseEvent};
-pub use log::{LogWriter, Sealed, log_file_name};
+pub use log::{Clock, LogWriter, Sealed, log_file_name};
 pub use sanitize::{Paste, check_link, clipboard_preview, prepare_paste, sanitize_title};
 pub use terminal::{Action, SelectionKind, Settings, Terminal};

@@ -8,6 +8,7 @@
 //!     User admin
 //!     Port 2222
 //!     IdentityFile "C:\Keys\web key"
+//!     ProxyJump bastion
 //!     LocalForward 8080 localhost:80
 //! ```
 //!
@@ -19,7 +20,7 @@
 use std::fmt::Write as _;
 
 use crate::forward::{ForwardKind, ForwardSpec, parse_config};
-use crate::ssh_config::{folder_comment, parse_destination, split_line};
+use crate::ssh_config::{Proxy, folder_comment, parse_destination, parse_proxy_jump, split_line};
 
 /// One saved session's connection settings.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -32,7 +33,17 @@ pub struct SavedHost {
     pub user: Option<String>,
     pub port: Option<u16>,
     pub identity_file: Option<String>,
+    /// The jump hosts to go through, as a `ProxyJump` line has them:
+    /// session names or `[user@]host[:port]`, comma-separated.
+    pub proxy_jump: Option<String>,
     pub forwards: Vec<ForwardSpec>,
+}
+
+/// Whether `text` can go on a `ProxyJump` line: hosts that parse, and
+/// nothing else.
+pub fn valid_proxy_jump(text: &str) -> bool {
+    !text.contains(|c: char| c.is_whitespace() || c.is_control() || c == '"' || c == '#')
+        && matches!(parse_proxy_jump(text), Some(Proxy::Jump(_)))
 }
 
 /// Whether `name` can be a session's `Host` name: letters, digits, `.`,
@@ -117,6 +128,7 @@ pub fn parse(text: &str) -> Vec<SavedHost> {
                     .filter(|&p| p != 0);
             }
             "identityfile" => h.identity_file = first.filter(|f| !f.is_empty()),
+            "proxyjump" => h.proxy_jump = first.filter(|j| valid_proxy_jump(j)),
             "localforward" | "remoteforward" | "dynamicforward" => {
                 let kind = match keyword.as_str() {
                     "localforward" => ForwardKind::Local,
@@ -172,6 +184,9 @@ pub(crate) fn write_host(out: &mut String, h: &SavedHost, comment: Option<&str>)
     if let Some(key) = &h.identity_file {
         let _ = writeln!(out, "    IdentityFile {}", quoted(key));
     }
+    if let Some(jump) = h.proxy_jump.as_deref().filter(|j| valid_proxy_jump(j)) {
+        let _ = writeln!(out, "    ProxyJump {jump}");
+    }
     for f in &h.forwards {
         let _ = writeln!(out, "    {}", f.config_line());
     }
@@ -193,6 +208,7 @@ mod tests {
                 user: Some("admin".into()),
                 port: Some(2222),
                 identity_file: Some(r"C:\Keys\web key".into()),
+                proxy_jump: Some("admin@bastion:2222,edge".into()),
                 forwards: vec![
                     parse_option("L 8080 localhost:80").unwrap(),
                     parse_option("-D 1080").unwrap(),
@@ -213,6 +229,13 @@ mod tests {
         assert_eq!(cfg.hostname.as_deref(), Some("web.example.org"));
         assert_eq!(cfg.port, Some(2222));
         assert_eq!(cfg.identity_files, [r"C:\Keys\web key"]);
+        assert_eq!(
+            cfg.proxy,
+            Some(Proxy::Jump(vec![
+                "admin@bastion:2222".into(),
+                "edge".into()
+            ]))
+        );
         assert_eq!(cfg.forwards, sample()[0].forwards);
         let hosts = ssh_config::hosts(&text, &ssh_config::NoIncludes);
         assert_eq!(hosts[0].folder.as_deref(), Some("Work"));
@@ -232,6 +255,7 @@ mod tests {
             hostname: Some("-oProxyCommand=calc".into()),
             user: Some("me\"\nProxyCommand calc".into()),
             identity_file: Some("k\r\nProxyCommand x".into()),
+            proxy_jump: Some("a\nProxyCommand calc".into()),
             ..SavedHost::default()
         };
         let text = to_text(&[h]);
@@ -240,6 +264,11 @@ mod tests {
             text.lines()
                 .all(|l| !l.trim_start().starts_with("ProxyCommand"))
         );
+        assert!(!text.contains("ProxyJump"));
+        assert!(!valid_proxy_jump("-oProxyCommand=calc"));
+        assert!(!valid_proxy_jump("a b"));
+        assert!(!valid_proxy_jump("none"));
+        assert!(valid_proxy_jump("me@gw:2222,inner"));
         let back = parse(&text);
         assert_eq!(back.len(), 1);
         assert_eq!(back[0].folder.as_deref(), Some("aHost evil"));

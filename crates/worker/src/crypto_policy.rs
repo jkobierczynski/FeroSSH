@@ -145,6 +145,23 @@ pub fn without_terrapin(p: Preferred) -> Preferred {
     }
 }
 
+/// `p` with what [`terrapin_prone`] rejects moved to the back instead of
+/// left out: AES-GCM before ChaCha20-Poly1305, plain MACs before EtM ones.
+/// For a connection that cannot be tried a second time (one through a
+/// tunnel), so a server without strict key exchange picks something safe
+/// the first time, and a server with only those still connects.
+pub fn aes_gcm_first(p: Preferred) -> Preferred {
+    let mut ciphers = p.cipher.to_vec();
+    ciphers.sort_by_key(|c| *c == cipher::CHACHA20_POLY1305);
+    let mut macs = p.mac.to_vec();
+    macs.sort_by_key(|m| m.as_ref().ends_with("-etm@openssh.com"));
+    Preferred {
+        cipher: Cow::Owned(ciphers),
+        mac: Cow::Owned(macs),
+        ..p
+    }
+}
+
 /// `p` with the legacy set appended, each list keeping its order.
 pub fn with_legacy(p: Preferred) -> Preferred {
     fn add<T: Clone>(list: &[T], more: &[T]) -> Vec<T> {
@@ -309,6 +326,18 @@ mod tests {
                 .iter()
                 .all(|m| !m.as_ref().ends_with("-etm@openssh.com"))
         );
+    }
+
+    #[test]
+    fn tunnels_put_terrapin_prone_choices_last_but_keep_them() {
+        let all = with_legacy(preferred());
+        let p = aes_gcm_first(all.clone());
+        assert_eq!(p.cipher.first(), Some(&cipher::AES_256_GCM));
+        assert_eq!(p.cipher.len(), all.cipher.len());
+        assert!(p.cipher.contains(&cipher::CHACHA20_POLY1305));
+        assert_eq!(p.mac.first(), Some(&mac::HMAC_SHA512));
+        assert_eq!(p.mac.last(), Some(&mac::HMAC_SHA256_ETM));
+        assert_eq!(p.kex, all.kex);
     }
 
     #[test]

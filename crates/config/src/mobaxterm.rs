@@ -10,8 +10,10 @@
 //!
 //! After the icon number comes a `%`-separated group whose first field is
 //! the session type: 0 SSH, 1 Telnet, 4 RDP, 5 VNC, 7 SFTP. Host, port
-//! and user follow; an SSH session's key file is field 14. SSH, SFTP,
-//! Telnet, RDP and VNC sessions are imported. MobaXterm keeps passwords elsewhere; they are
+//! and user follow; an SSH session's key file is field 14, and its SSH
+//! gateways (jump hosts, `|`-separated) are fields 8 to 10: hosts, ports,
+//! users. They become its `ProxyJump`. SSH, SFTP, Telnet, RDP and VNC
+//! sessions are imported. MobaXterm keeps passwords elsewhere; they are
 //! never read.
 
 use crate::import::{Session, clean, port};
@@ -74,16 +76,50 @@ fn bookmark(folder: &str, name: &str, value: &str) -> Option<Session> {
         }
     }
     if let Some(via) = field(gateway) {
+        let jump = (kind == SessionKind::Ssh)
+            .then(|| gateways(via, field(gateway + 1), field(gateway + 2)))
+            .filter(|j| crate::saved::valid_proxy_jump(j));
         let via = clean(&via.replace('|', ", "));
-        s.notes.push(match kind {
-            SessionKind::Ssh => format!("its jump host {via} is not imported"),
-            _ => format!("it went through {via}: pick Via SSH with F2"),
-        });
+        match (kind, jump) {
+            (SessionKind::Ssh, Some(jump)) => s.host.proxy_jump = Some(jump),
+            (SessionKind::Ssh, None) => {
+                s.notes.push(format!("its jump host {via} is not imported"))
+            }
+            _ => s
+                .notes
+                .push(format!("it went through {via}: pick Via SSH with F2")),
+        }
     } else if kind == SessionKind::Vnc {
         s.notes
             .push("VNC goes through SSH: pick Via SSH with F2".into());
     }
     Some(s)
+}
+
+/// The gateways as a `ProxyJump` line: each host with its user and port
+/// at the same place in theirs.
+fn gateways(hosts: &str, ports: Option<&str>, users: Option<&str>) -> String {
+    let ports: Vec<&str> = ports.unwrap_or_default().split('|').collect();
+    let users: Vec<&str> = users.unwrap_or_default().split('|').collect();
+    hosts
+        .split('|')
+        .enumerate()
+        .map(|(i, host)| {
+            let mut hop = host.trim().to_owned();
+            if let Some(user) = users.get(i).map(|u| u.trim()).filter(|u| !u.is_empty()) {
+                hop = format!("{user}@{hop}");
+            }
+            if let Some(port) = ports
+                .get(i)
+                .and_then(|p| p.trim().parse::<u16>().ok())
+                .filter(|&p| p != 0 && p != 22)
+            {
+                hop = format!("{hop}:{port}");
+            }
+            hop
+        })
+        .collect::<Vec<_>>()
+        .join(",")
 }
 
 /// The SSH, SFTP, Telnet, RDP and VNC sessions in a `MobaXterm.ini`.
@@ -146,7 +182,8 @@ SubRep=Work\\Prod\r
 ImgNum=41\r
 win srv=#91#4%10.0.0.5%3389%Administrator%0%-1%-1%-1%-1%0%0%-1%%%%%%%%%%#MobaFont%10#0# #-1\r
 desk=#128#5%desk.lan%5901%-1%0%bastion.lan%22%me%%0%#MobaFont#0# #-1\r
-inner=#109#0%inner.lan%22%%%-1%-1%%jump1.lan__PIPE__jump2.lan%22__PIPE__22%%%0%0%%#MobaFont#0# #-1\r
+inner=#109#0%inner.lan%22%%%-1%-1%%jump1.lan__PIPE__jump2.lan%22__PIPE__2222%me__PIPE__%%0%0%%#MobaFont#0# #-1\r
+odd=#109#0%odd.lan%22%%%-1%-1%%-oProxyCommand=calc%22%%%%0%0%%#MobaFont#0# #-1\r
 tel=#98#1%router%23%%%2%%#MobaFont#0# #-1\r
 bad=#109#0%-oProxyCommand=calc%22%%#x#0#\r
 ";
@@ -162,12 +199,13 @@ bad=#109#0%-oProxyCommand=calc%22%%#x#0#\r
                 "Work/Prod/win srv",
                 "Work/Prod/desk",
                 "Work/Prod/inner",
+                "Work/Prod/odd",
                 "Work/Prod/tel"
             ]
         );
-        assert_eq!(s[4].kind, SessionKind::Telnet);
-        assert_eq!((s[4].host.port, s[4].host.user.as_deref()), (None, None));
-        assert!(s[4].notes.is_empty());
+        assert_eq!(s[5].kind, SessionKind::Telnet);
+        assert_eq!((s[5].host.port, s[5].host.user.as_deref()), (None, None));
+        assert!(s[5].notes.is_empty());
         assert_eq!(s[0].kind, SessionKind::Ssh);
         assert_eq!(s[0].host.port, Some(2222));
         assert_eq!(s[0].host.user.as_deref(), Some("admin"));
@@ -185,14 +223,21 @@ bad=#109#0%-oProxyCommand=calc%22%%#x#0#\r
             s[2].notes,
             ["it went through bastion.lan: pick Via SSH with F2"]
         );
+        assert!(s[3].notes.is_empty(), "{:?}", s[3].notes);
         assert_eq!(
-            s[3].notes,
-            ["its jump host jump1.lan, jump2.lan is not imported"]
+            s[3].host.proxy_jump.as_deref(),
+            Some("me@jump1.lan,jump2.lan:2222")
+        );
+        assert_eq!(s[4].host.proxy_jump, None);
+        assert_eq!(
+            s[4].notes,
+            ["its jump host -oProxyCommand=calc is not imported"]
         );
         let all: Vec<&Session> = s.iter().collect();
         let text = to_config(Client::MobaXterm, &all);
         let hosts = ssh_config::hosts(&text, &ssh_config::NoIncludes);
         assert_eq!(hosts[1].folder.as_deref(), Some("MobaXterm/Work/Prod"));
-        assert_eq!(saved::parse(&text).len(), 5);
+        assert_eq!(saved::parse(&text).len(), 6);
+        assert!(text.contains("ProxyJump me@jump1.lan,jump2.lan:2222\n"));
     }
 }

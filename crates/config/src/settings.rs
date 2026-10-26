@@ -185,6 +185,8 @@ pub struct Settings {
     pub tab_strip: bool,
     pub copy_on_select: bool,
     pub right_click_paste: bool,
+    /// Put the time in front of each line of plain session logs.
+    pub log_timestamps: bool,
     /// Lines of scrollback for panes without a profile that sets it.
     pub scrollback: Option<usize>,
     /// Where downloads go; the user's Downloads folder when unset.
@@ -231,6 +233,7 @@ impl Default for Settings {
             tab_strip: true,
             copy_on_select: false,
             right_click_paste: false,
+            log_timestamps: false,
             scrollback: None,
             download_folder: None,
             verify_transfers: false,
@@ -378,6 +381,10 @@ impl Settings {
                 "rightclickpaste" => {
                     block = Block::Top;
                     s.right_click_paste = yes(&args).unwrap_or(false);
+                }
+                "logtimestamps" => {
+                    block = Block::Top;
+                    s.log_timestamps = yes(&args).unwrap_or(false);
                 }
                 "downloadfolder" => {
                     block = Block::Top;
@@ -558,6 +565,7 @@ impl Settings {
         let _ = writeln!(out, "TabStrip {}", flag(self.tab_strip));
         let _ = writeln!(out, "CopyOnSelect {}", flag(self.copy_on_select));
         let _ = writeln!(out, "RightClickPaste {}", flag(self.right_click_paste));
+        let _ = writeln!(out, "LogTimestamps {}", flag(self.log_timestamps));
         if let Some(n) = self.scrollback {
             let _ = writeln!(out, "Scrollback {n}");
         }
@@ -902,6 +910,17 @@ NewKeyword later
             ..Settings::default()
         };
         assert!(Settings::parse(&s.to_text()).update_check_weekly);
+    }
+
+    #[test]
+    fn log_timestamps_are_off_unless_turned_on() {
+        assert!(!Settings::default().log_timestamps);
+        assert!(Settings::parse("LogTimestamps yes\n").log_timestamps);
+        let s = Settings {
+            log_timestamps: true,
+            ..Settings::default()
+        };
+        assert!(Settings::parse(&s.to_text()).log_timestamps);
     }
 
     #[test]
