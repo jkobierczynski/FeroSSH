@@ -75,6 +75,12 @@ fn flag(args: &[String]) -> Option<bool> {
 /// Include files nest at most this deep, as in OpenSSH.
 const MAX_INCLUDE_DEPTH: usize = 16;
 
+/// About the most lines a config may grow to with its Includes read. A file
+/// that includes itself twice (or `Include *` in `~/.ssh`, which matches
+/// `config` itself) would otherwise expand to n^16 copies before the
+/// depth limit stops it, and FeroSSH would hang reading its config.
+const MAX_LINES: usize = 1 << 16;
+
 /// Reads the files an `Include` line names.
 pub trait Includes {
     /// The files `pattern` names, in order, as (file name, text).
@@ -188,12 +194,18 @@ fn flatten(
         let Some((keyword, args)) = split_line(raw) else {
             continue;
         };
+        if out.len() >= MAX_LINES {
+            return;
+        }
         if keyword == "include" {
             if depth >= MAX_INCLUDE_DEPTH {
                 continue;
             }
             for pattern in &args {
                 for (stem, text) in includes.read(pattern) {
+                    if out.len() >= MAX_LINES {
+                        return;
+                    }
                     let inner = folder.clone().or(Some(stem));
                     out.push(Line::mark("{"));
                     flatten(&text, inner, includes, depth + 1, out);
@@ -570,6 +582,19 @@ Host *
                 .map(|(n, t)| ((*n).to_owned(), (*t).to_owned()))
                 .collect()
         }
+    }
+
+    #[test]
+    fn self_including_configs_stay_small() {
+        // `Include *` in ~/.ssh/config matches config itself: three files
+        // that each include all three would be 3^16 copies.
+        let text = "Include *\nHost h\n  User u\n";
+        let all = Files(vec![("config", text), ("a", text), ("b", text)]);
+        let started = std::time::Instant::now();
+        assert_eq!(resolve_in(text, "h", &all).user.as_deref(), Some("u"));
+        // Plus the closing marks of the includes still open at the cap.
+        assert!(lines(text, &all).len() <= MAX_LINES + MAX_INCLUDE_DEPTH);
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
     }
 
     const MAIN: &str = "\

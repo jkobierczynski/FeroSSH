@@ -10,6 +10,7 @@ cargo-fuzz = true
 
 [dependencies]
 libfuzzer-sys = "0.4"
+ferossh-auth = { path = "../crates/auth" }
 ferossh-config = { path = "../crates/config" }
 ferossh-forward = { path = "../crates/forward" }
 ferossh-ipc = { path = "../crates/ipc" }
@@ -74,6 +75,27 @@ bench = false
 [[bin]]
 name = "import_parse"
 path = "fuzz_targets/import_parse.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "userauth_check"
+path = "fuzz_targets/userauth_check.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "key_files"
+path = "fuzz_targets/key_files.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "host_config"
+path = "fuzz_targets/host_config.rs"
 test = false
 doc = false
 bench = false
