@@ -29,14 +29,14 @@ foreach ($line in Get-Content $Sums) {
 if (-not $sha) { throw "ferossh.exe is not listed in $Sums" }
 
 $repoUrl = "https://github.com/$Repository"
-$dir = Join-Path $OutDir "manifests/j/jkobierczynski/FeroSSH/$Version"
+$dir = [IO.Path]::Combine((Get-Location).Path, $OutDir, "manifests", "j", "jkobierczynski", "FeroSSH", $Version)
 New-Item -ItemType Directory -Force $dir | Out-Null
 
 function Write-Manifest($file, $type, $body) {
     $text = "# yaml-language-server: `$schema=https://aka.ms/winget-manifest.$type.$schema.schema.json`n`n" +
         "PackageIdentifier: $id`nPackageVersion: $Version`n" + $body +
         "ManifestType: $type`nManifestVersion: $schema`n"
-    Set-Content -Encoding utf8NoBOM -NoNewline (Join-Path $dir $file) $text
+    [IO.File]::WriteAllText((Join-Path $dir $file), $text, [Text.UTF8Encoding]::new($false))
 }
 
 Write-Manifest "$id.yaml" "version" @"
