@@ -931,6 +931,7 @@ version = "0.1.0"
 dependencies = [
  "alacritty_terminal",
  "ferossh-render",
+ "sha2",
 ]
 
 [[package]]
