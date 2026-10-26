@@ -251,7 +251,10 @@ impl Desktop {
                     }
                     drawn = true;
                 }
-                Ok(Applied::Other(FromViewer::Name(n))) => out.push(Update::Title(n)),
+                // A taken-over viewer must not spoof the tab with bidi tricks.
+                Ok(Applied::Other(FromViewer::Name(n))) => {
+                    out.push(Update::Title(ferossh_term::sanitize_title(&n)));
+                }
                 Ok(Applied::Other(FromViewer::Bell)) => out.push(Update::Bell),
                 Ok(Applied::Other(FromViewer::NeedPassword)) => match self.protocol {
                     Protocol::Vnc => {

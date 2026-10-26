@@ -544,6 +544,45 @@ impl Message {
         }
     }
 
+    /// Which side may send the message. Each side drops the pipe when the
+    /// other sends one that only it sends: an honest peer never does, so
+    /// that is a compromised or confused one.
+    pub fn sent_by(&self) -> Side {
+        match self {
+            Message::Hello { .. }
+            | Message::Data { .. }
+            | Message::Close { .. }
+            | Message::Window { .. }
+            | Message::Eof { .. } => Side::Either,
+            Message::Resize { .. }
+            | Message::Connect { .. }
+            | Message::OpenChannel { .. }
+            | Message::HostKeyVerdict { .. }
+            | Message::Identities { .. }
+            | Message::Signature { .. }
+            | Message::Answers { .. }
+            | Message::SftpOpen { .. }
+            | Message::SftpRequest { .. }
+            | Message::ForwardOpen { .. }
+            | Message::RemoteForward { .. } => Side::Ui,
+            Message::HostKey { .. }
+            | Message::HostCert { .. }
+            | Message::Banner { .. }
+            | Message::IdentitiesRequest { .. }
+            | Message::SignRequest { .. }
+            | Message::Prompt { .. }
+            | Message::Notice { .. }
+            | Message::Connected { .. }
+            | Message::ExitStatus { .. }
+            | Message::Disconnected { .. }
+            | Message::SftpReady { .. }
+            | Message::SftpReply { .. }
+            | Message::ForwardOpened { .. }
+            | Message::ForwardListening { .. }
+            | Message::ForwardIncoming { .. } => Side::Worker,
+        }
+    }
+
     /// The channel the message belongs to; `None` for [`Message::Hello`].
     pub fn channel(&self) -> Option<ChannelId> {
         Some(match self {
@@ -580,6 +619,14 @@ impl Message {
             | Message::Eof { channel } => *channel,
         })
     }
+}
+
+/// Who sends a [`Message`]: see [`Message::sent_by`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Side {
+    Ui,
+    Worker,
+    Either,
 }
 
 /// Why a frame was rejected.
@@ -1733,6 +1780,27 @@ mod tests {
             dec.feed(&wire);
             assert_eq!(dec.next_message().unwrap(), Some(msg));
             assert_eq!(dec.next_message().unwrap(), None);
+        }
+    }
+
+    #[test]
+    fn worker_streams_are_sent_by_the_worker() {
+        // The ones a compromised worker could abuse most if the UI took
+        // them from it; and what the UI must never take from the worker.
+        for msg in samples() {
+            let side = msg.sent_by();
+            match msg {
+                Message::SignRequest { .. } | Message::Prompt { .. } | Message::HostKey { .. } => {
+                    assert_eq!(side, Side::Worker);
+                }
+                Message::Connect { .. } | Message::Answers { .. } | Message::Signature { .. } => {
+                    assert_eq!(side, Side::Ui);
+                }
+                Message::Hello { .. } | Message::Data { .. } | Message::Close { .. } => {
+                    assert_eq!(side, Side::Either);
+                }
+                _ => {}
+            }
         }
     }
 
