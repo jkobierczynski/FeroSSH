@@ -24,6 +24,8 @@ use zeroize::Zeroizing;
 
 use crate::sk::{Authenticator, SkKey, Unavailable};
 
+mod short_scalar;
+
 /// Why a key file cannot be used, or a signature failed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum KeyFileError {
@@ -155,7 +157,10 @@ impl KeyFile {
                 },
             });
         }
-        let key = PrivateKey::from_openssh(text).map_err(|_| KeyFileError::Malformed)?;
+        let key = match PrivateKey::from_openssh(text) {
+            Ok(key) => key,
+            Err(_) => short_scalar::parse(text)?.ok_or(KeyFileError::Malformed)?,
+        };
         usable(&key.algorithm())?;
         let public = key
             .public_key()
@@ -206,9 +211,12 @@ impl KeyFile {
         let key = match &self.key {
             Secret::OpenSsh(key) if key.is_encrypted() => {
                 let pass = passphrase.ok_or(KeyFileError::NeedsPassphrase)?;
-                decrypted = key
-                    .decrypt(pass)
-                    .map_err(|_| KeyFileError::WrongPassphrase)?;
+                decrypted = match key.decrypt(pass) {
+                    Ok(key) => key,
+                    Err(_) => {
+                        short_scalar::decrypt(key, pass)?.ok_or(KeyFileError::WrongPassphrase)?
+                    }
+                };
                 &decrypted
             }
             Secret::OpenSsh(key) => key,
