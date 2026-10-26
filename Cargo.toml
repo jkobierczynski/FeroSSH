@@ -22,6 +22,7 @@ ferossh-tmuxcc = { path = "crates/tmuxcc" }
 ferossh-update = { path = "crates/update" }
 ferossh-viewer = { path = "crates/viewer" }
 ferossh-worker = { path = "crates/worker" }
+ferossh-zmodem = { path = "crates/zmodem" }
 
 # Crypto backend is `ring`: russh has no pure-RustCrypto backend, and ring
 # builds with the MSVC toolchain alone (no CMake or NASM).

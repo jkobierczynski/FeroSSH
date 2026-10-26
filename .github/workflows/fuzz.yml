@@ -37,6 +37,7 @@ jobs:
           - key_files
           - host_config
           - telnet_feed
+          - zmodem_feed
     steps:
       - uses: actions/checkout@v4
       - run: rustup toolchain install nightly --profile minimal

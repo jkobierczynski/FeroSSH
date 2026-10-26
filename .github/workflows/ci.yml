@@ -115,6 +115,7 @@ jobs:
       FEROSSH_REQUIRE_PUTTYGEN: 1
       FEROSSH_REQUIRE_TMUX: 1
       FEROSSH_REQUIRE_TELNETD: 1
+      FEROSSH_REQUIRE_LRZSZ: 1
     steps:
       - uses: actions/checkout@v4
       - run: rustup show active-toolchain
@@ -125,14 +126,16 @@ jobs:
       # test builds OpenSSH's software security key from the installed
       # OpenSSH's source (interop/sk-dummy.sh), so it needs deb-src. The
       # Telnet test talks to BusyBox's telnetd (only the static build has it).
+      # The ZMODEM tests run lrzsz's sz and rz, over pipes and in the shell.
       - run: |
           sudo sed -i 's/^Types: deb$/Types: deb deb-src/' /etc/apt/sources.list.d/ubuntu.sources
           sudo apt-get update
-          sudo apt-get install -y openssh-server putty-tools xauth tmux dpkg-dev autoconf libssl-dev zlib1g-dev busybox-static
+          sudo apt-get install -y openssh-server putty-tools xauth tmux dpkg-dev autoconf libssl-dev zlib1g-dev busybox-static lrzsz
       - run: sudo mkdir -p /run/sshd
       - run: cargo test --locked -p ferossh-worker --test sshd
       - run: cargo test --locked -p ferossh-worker --test agent
       - run: cargo test --locked -p ferossh-worker --test telnetd
+      - run: cargo test --locked -p ferossh-zmodem --test lrzsz
       - run: interop/sk-dummy.sh "$RUNNER_TEMP/sk-dummy.so"
       - run: cargo test --locked -p ferossh-worker --test security_keys
         env:
@@ -243,3 +246,4 @@ jobs:
       - run: cargo +nightly fuzz run --target x86_64-unknown-linux-gnu key_files -- -max_total_time=60
       - run: cargo +nightly fuzz run --target x86_64-unknown-linux-gnu host_config -- -max_total_time=60
       - run: cargo +nightly fuzz run --target x86_64-unknown-linux-gnu telnet_feed -- -max_total_time=60
+      - run: cargo +nightly fuzz run --target x86_64-unknown-linux-gnu zmodem_feed -- -max_total_time=60

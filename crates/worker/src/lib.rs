@@ -1,5 +1,5 @@
-//! The sandboxed SSH worker: russh sessions, channels and forwards, and
-//! Telnet sessions ([`telnet`]).
+//! The sandboxed SSH worker: russh sessions, channels and forwards,
+//! Telnet sessions ([`telnet`]), and ZMODEM in either's shell.
 //!
 //! `ferossh.exe` starts a copy of itself in an AppContainer that may only
 //! use the network, and talks to it over two inherited pipes. The worker
@@ -17,6 +17,7 @@ mod session;
 mod sftp;
 pub mod telnet;
 mod tunnel;
+mod zmodem;
 
 use std::io::{Read, Write};
 use std::thread;

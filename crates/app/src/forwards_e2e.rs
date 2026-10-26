@@ -397,7 +397,10 @@ impl Shell {
                         self.forwarder
                             .start(self.session.connection, label, Setup::default());
                     }
-                    Effect::Ended | Effect::FetchPassword | Effect::StorePassword { .. } => {}
+                    Effect::Ended
+                    | Effect::Reconnect
+                    | Effect::FetchPassword
+                    | Effect::StorePassword { .. } => {}
                     Effect::Tunnel { .. } | Effect::ProxyCommand { .. } => {}
                 }
             }

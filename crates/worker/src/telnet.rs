@@ -20,6 +20,10 @@
 //! RFC 1143: a request is answered only when it changes an option, so two
 //! sides can never loop, and a server repeating itself gets nothing back.
 //! Subnegotiations are capped in length; a longer one is skipped whole.
+//!
+//! ZMODEM runs in a Telnet shell as in an SSH one ([`crate::zmodem`]); its
+//! bytes go out with [`Telnet::escape`], which changes nothing but IAC
+//! and, outside BINARY, a bare CR.
 
 use std::time::Duration;
 
@@ -27,6 +31,9 @@ use ferossh_ipc::{ChannelId, Message};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
+use tokio::time::Instant;
+
+use crate::zmodem::{Zmodem, sleep_until};
 
 /// Interpret As Command: starts every Telnet command.
 pub const IAC: u8 = 255;
@@ -320,6 +327,22 @@ impl Telnet {
         out
     }
 
+    /// Bytes of a file transfer, made safe for the wire without changing
+    /// them: IAC doubled, and outside BINARY a carriage return sent as
+    /// CR NUL, which the other side reads back as a bare CR.
+    pub fn escape(&self, bytes: &[u8]) -> Vec<u8> {
+        let binary = self.binary_out();
+        let mut out = Vec::with_capacity(bytes.len() + 8);
+        for &b in bytes {
+            match b {
+                IAC => out.extend_from_slice(&[IAC, IAC]),
+                b'\r' if !binary => out.extend_from_slice(&[b'\r', 0]),
+                _ => out.push(b),
+            }
+        }
+        out
+    }
+
     /// Typed bytes, made safe for the wire: IAC doubled, and outside
     /// BINARY a carriage return sent as the Telnet newline CR LF (as
     /// PuTTY does), or as CR NUL when the terminal already sent CR LF.
@@ -412,41 +435,62 @@ async fn session(
         return String::new();
     }
     let mut buf = vec![0u8; READ_CHUNK];
+    let mut zm = Zmodem::new(channel);
+    let mut heard = Instant::now();
     loop {
-        tokio::select! {
+        let wake = zm.patience().map(|p| heard + p);
+        let step = tokio::select! {
             n = stream.read(&mut buf) => {
                 let n = match n {
                     Ok(0) => return "The host closed the connection.".to_owned(),
                     Ok(n) => n,
                     Err(e) => return format!("The connection failed: {e}."),
                 };
+                heard = Instant::now();
                 let fed = telnet.feed(buf.get(..n).unwrap_or_default());
                 if !fed.reply.is_empty()
                     && let Err(e) = stream.write_all(&fed.reply).await
                 {
                     return format!("The connection failed: {e}.");
                 }
-                if !fed.data.is_empty() {
-                    let msg = Message::Data { channel, bytes: fed.data };
-                    if out.send(msg).await.is_err() {
-                        return String::new();
-                    }
-                }
+                zm.on_server(&fed.data)
             }
             msg = inbox.recv() => {
-                let wire = match msg {
-                    Some(Message::Data { bytes, .. }) => telnet.encode(&bytes),
-                    Some(Message::Resize { cols, rows, .. }) => telnet.resize(cols, rows),
-                    Some(Message::Close { .. }) | None => return "Closed.".to_owned(),
-                    // Nothing else belongs to a Telnet session.
-                    Some(_) => continue,
-                };
-                if !wire.is_empty()
-                    && let Err(e) = stream.write_all(&wire).await
+                if let Some(m) = &msg
+                    && let Some(step) = zm.on_ui(m)
                 {
-                    return format!("The connection failed: {e}.");
+                    heard = Instant::now();
+                    step
+                } else {
+                    let wire = match msg {
+                        Some(Message::Data { bytes, .. }) => telnet.encode(&bytes),
+                        Some(Message::Resize { cols, rows, .. }) => telnet.resize(cols, rows),
+                        Some(Message::Close { .. }) | None => return "Closed.".to_owned(),
+                        // Nothing else belongs to a Telnet session.
+                        Some(_) => continue,
+                    };
+                    if !wire.is_empty()
+                        && let Err(e) = stream.write_all(&wire).await
+                    {
+                        return format!("The connection failed: {e}.");
+                    }
+                    continue;
                 }
             }
+            () = sleep_until(wake) => {
+                heard = Instant::now();
+                zm.timeout()
+            }
+        };
+        for msg in step.ui {
+            if out.send(msg).await.is_err() {
+                return String::new();
+            }
+        }
+        if !step.server.is_empty()
+            && let Err(e) = stream.write_all(&telnet.escape(&step.server)).await
+        {
+            return format!("The connection failed: {e}.");
         }
     }
 }
