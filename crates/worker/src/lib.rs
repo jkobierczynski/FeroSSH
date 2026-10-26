@@ -16,6 +16,7 @@ mod forward;
 mod session;
 mod sftp;
 pub mod telnet;
+mod tunnel;
 mod zmodem;
 
 use std::io::{Read, Write};
@@ -33,7 +34,9 @@ const QUEUE: usize = 64;
 /// Serves the UI: one task per shell, SFTP channel, remote forward
 /// listener and forwarded stream, routed by channel id; shells opened with
 /// [`Message::OpenChannel`], SFTP and forwards share their host's
-/// connection. Returns when the UI closes its end.
+/// connection. A connection through a jump host or a `ProxyCommand` runs
+/// over a stream channel of its own ([`tunnel`]). Returns when the UI
+/// closes its end.
 pub async fn serve(mut inbox: mpsc::Receiver<Message>, out: mpsc::Sender<Message>) {
     let hello = Message::Hello {
         version: PROTOCOL_VERSION,
@@ -96,8 +99,27 @@ pub async fn serve(mut inbox: mpsc::Receiver<Message>, out: mpsc::Sender<Message
                 x11,
                 legacy,
                 timing,
+                tunnel,
+                shell,
             } => {
-                let Some(rx) = session(channel) else { continue };
+                // The tunnel's stream first: the UI may send its bytes
+                // right behind this message.
+                let tunnel_rx = match tunnel {
+                    Some(id) => {
+                        let (tx, rx) = mpsc::unbounded_channel();
+                        if !routes.insert(id, Route::Stream(tx)) {
+                            continue;
+                        }
+                        Some(rx)
+                    }
+                    None => None,
+                };
+                let Some(rx) = session(channel) else {
+                    if let Some(id) = tunnel {
+                        routes.remove(id);
+                    }
+                    continue;
+                };
                 let params = Params {
                     host,
                     port,
@@ -108,11 +130,14 @@ pub async fn serve(mut inbox: mpsc::Receiver<Message>, out: mpsc::Sender<Message
                     x11,
                     legacy,
                     timing,
+                    tunnel,
+                    shell,
                 };
                 tokio::spawn(session::run(
                     channel,
                     params,
                     rx,
+                    tunnel_rx,
                     out.clone(),
                     connections.clone(),
                 ));

@@ -1,13 +1,19 @@
 //! The UI's end of the worker pipes: a reader thread that decodes frames
 //! and a writer thread that encodes them, so a slow or stuck worker never
 //! blocks the window. Messages for forward channels go straight to the
-//! forwarding engine and never queue behind terminal output.
+//! forwarding engine and never queue behind terminal output, and the
+//! bytes of a relayed stream (a jump host's stream to the next hop, or a
+//! `ProxyCommand`'s) go straight on to the other end ([`Relays`]).
 
+use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::sync::mpsc::{Receiver, Sender, SyncSender, channel, sync_channel};
+use std::sync::{Arc, Mutex};
 use std::thread;
 
-use ferossh_ipc::{Decoder, Message, PROTOCOL_VERSION, Side, encode, is_forward_channel};
+use ferossh_ipc::{
+    ChannelId, Decoder, Message, PROTOCOL_VERSION, Side, encode, is_forward_channel,
+};
 
 /// Messages buffered from the worker; a flooding host is slowed down to
 /// what the window can show.
@@ -24,6 +30,62 @@ pub enum LinkEvent {
 pub struct Link {
     tx: Sender<Message>,
     rx: Receiver<LinkEvent>,
+    relays: Relays,
+}
+
+type Sink = Arc<dyn Fn(Message) + Send + Sync>;
+
+/// The streams of a worker whose messages go to another end instead of
+/// the window: a jump host's stream to the next hop goes to the next
+/// hop's worker and back, a `ProxyCommand`'s stream to the command. The
+/// window never looks at those bytes; they are the next hop's encrypted
+/// SSH connection.
+#[derive(Clone, Default)]
+pub struct Relays(Arc<Mutex<HashMap<ChannelId, Sink>>>);
+
+impl std::fmt::Debug for Relays {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Relays").finish_non_exhaustive()
+    }
+}
+
+impl Relays {
+    /// Sends what the worker says on stream `channel` to `to`.
+    pub fn insert(&self, channel: ChannelId, to: impl Fn(Message) + Send + Sync + 'static) {
+        if let Ok(mut map) = self.0.lock() {
+            map.insert(channel, Arc::new(to));
+        }
+    }
+
+    pub fn remove(&self, channel: ChannelId) {
+        if let Ok(mut map) = self.0.lock() {
+            map.remove(&channel);
+        }
+    }
+
+    /// Hands `msg` on if its stream is relayed: data, credit and end of
+    /// data go across as they are. When the worker ends the stream, the
+    /// other end is closed and the window still hears why. Gives back
+    /// what is not relayed.
+    fn relay(&self, msg: Message) -> Option<Message> {
+        let channel = msg.channel()?;
+        let sink = self.0.lock().ok()?.get(&channel).cloned();
+        let Some(sink) = sink else {
+            return Some(msg);
+        };
+        match msg {
+            Message::Data { .. } | Message::Window { .. } | Message::Eof { .. } => {
+                sink(msg);
+                None
+            }
+            Message::Disconnected { .. } | Message::Close { .. } => {
+                self.remove(channel);
+                sink(Message::Close { channel });
+                Some(msg)
+            }
+            other => Some(other),
+        }
+    }
 }
 
 fn reader(
@@ -31,6 +93,7 @@ fn reader(
     tx: &SyncSender<LinkEvent>,
     notify: &(impl Fn() + Send),
     divert: &(impl Fn(Message) + Send),
+    relays: &Relays,
 ) -> String {
     let mut decoder = Decoder::new();
     let mut buf = vec![0u8; 64 * 1024];
@@ -61,6 +124,9 @@ fn reader(
                 return "The SSH worker sent a message only the window sends; it was stopped."
                     .into();
             }
+            let Some(msg) = relays.relay(msg) else {
+                continue;
+            };
             if msg.channel().is_some_and(is_forward_channel) {
                 divert(msg);
                 continue;
@@ -85,10 +151,21 @@ impl Link {
     ) -> std::io::Result<Self> {
         let (event_tx, rx) = sync_channel(BACKLOG);
         let (tx, msg_rx) = channel::<Message>();
+        let relays = Relays::default();
+        let reader_relays = relays.clone();
         thread::Builder::new()
             .name("worker reader".into())
             .spawn(move || {
-                let why = reader(input, &event_tx, &notify, &divert);
+                let why = reader(input, &event_tx, &notify, &divert, &reader_relays);
+                // The other ends of its relayed streams hear it is gone.
+                let ends: Vec<(ChannelId, Sink)> = reader_relays
+                    .0
+                    .lock()
+                    .map(|mut m| m.drain().collect())
+                    .unwrap_or_default();
+                for (channel, sink) in ends {
+                    sink(Message::Close { channel });
+                }
                 if event_tx.send(LinkEvent::Closed(why)).is_ok() {
                     notify();
                 }
@@ -109,7 +186,7 @@ impl Link {
                     }
                 }
             })?;
-        let link = Self { tx, rx };
+        let link = Self { tx, rx, relays };
         link.send(Message::Hello {
             version: PROTOCOL_VERSION,
         });
@@ -133,10 +210,22 @@ impl Link {
     pub fn try_recv(&self) -> Option<LinkEvent> {
         self.rx.try_recv().ok()
     }
+
+    /// The streams relayed past the window.
+    pub fn relays(&self) -> &Relays {
+        &self.relays
+    }
+
+    /// Relays stream `channel` between this link's worker and `other`'s,
+    /// both ways.
+    pub fn relay_with(&self, other: &Link, channel: ChannelId) {
+        self.relays.insert(channel, other.sender());
+        other.relays.insert(channel, self.sender());
+    }
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::panic)]
+#[allow(clippy::unwrap_used, clippy::panic, clippy::indexing_slicing)]
 mod tests {
     use super::*;
 
@@ -150,7 +239,7 @@ mod tests {
 
     fn run(msgs: &[Message]) -> (String, Vec<Message>) {
         let (tx, rx) = sync_channel(BACKLOG);
-        let why = reader(frames(msgs), &tx, &|| {}, &|_| {});
+        let why = reader(frames(msgs), &tx, &|| {}, &|_| {}, &Relays::default());
         let got = rx
             .try_iter()
             .map(|e| match e {
@@ -181,6 +270,46 @@ mod tests {
         let (why, got) = run(&[hello, answers, notice]);
         assert!(why.contains("only the window sends"), "{why}");
         assert!(got.is_empty());
+    }
+
+    #[test]
+    fn relayed_streams_skip_the_window() {
+        let hello = Message::Hello {
+            version: PROTOCOL_VERSION,
+        };
+        let data = Message::Data {
+            channel: 5,
+            bytes: b"ssh bytes".to_vec(),
+        };
+        let other = Message::Data {
+            channel: 6,
+            bytes: b"shell".to_vec(),
+        };
+        let gone = Message::Disconnected {
+            channel: 5,
+            reason: "x".into(),
+        };
+        let relays = Relays::default();
+        let across = Arc::new(Mutex::new(Vec::new()));
+        let seen = across.clone();
+        relays.insert(5, move |m| seen.lock().unwrap().push(m));
+        let (tx, rx) = sync_channel(BACKLOG);
+        let msgs = [hello, data.clone(), other.clone(), gone.clone(), data];
+        reader(frames(&msgs), &tx, &|| {}, &|_| {}, &relays);
+        let got: Vec<Message> = rx
+            .try_iter()
+            .map(|e| match e {
+                LinkEvent::Message(m) => m,
+                LinkEvent::Closed(why) => panic!("{why}"),
+            })
+            .collect();
+        // The window hears of the end, and of data after it, but never
+        // sees the stream's bytes while it is relayed.
+        assert_eq!(got[..2], [other, gone]);
+        let across = across.lock().unwrap();
+        assert!(matches!(across[0], Message::Data { channel: 5, .. }));
+        assert_eq!(across[1], Message::Close { channel: 5 });
+        assert_eq!(across.len(), 2);
     }
 
     #[test]

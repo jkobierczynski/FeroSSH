@@ -35,12 +35,14 @@ use russh::{
     AlgorithmKind, Channel, ChannelMsg, ChannelOpenFailure, Disconnect, MethodKind, MethodSet,
     Names, Preferred, SshId,
 };
+use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpStream;
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio::time::Instant;
 
 use crate::crypto_policy::{
-    MIN_RSA_BITS, legacy_would_help, preferred_for, terrapin_prone, with_legacy, without_terrapin,
+    MIN_RSA_BITS, aes_gcm_first, legacy_would_help, preferred_for, terrapin_prone, with_legacy,
+    without_terrapin,
 };
 use crate::forward::{self, Incoming};
 use crate::zmodem::{self, Zmodem, sleep_until};
@@ -69,6 +71,11 @@ pub struct Params {
     /// Also offer the legacy algorithm set.
     pub legacy: bool,
     pub timing: Timing,
+    /// Run the connection over this stream channel instead of TCP: the
+    /// hop after a jump host, or a `ProxyCommand` (see [`crate::tunnel`]).
+    pub tunnel: Option<ChannelId>,
+    /// Open a shell once logged in; a jump host's login opens none.
+    pub shell: bool,
 }
 
 /// Why a session ended early.
@@ -740,11 +747,13 @@ async fn drive<T>(
     }
 }
 
-/// Ends a session: reports why to the UI.
+/// Ends a session: reports why to the UI. `tunnel` is the inbox of the
+/// stream [`Params::tunnel`] names.
 pub async fn run(
     channel: ChannelId,
     params: Params,
     mut inbox: mpsc::Receiver<Message>,
+    tunnel: Option<mpsc::UnboundedReceiver<Message>>,
     out: mpsc::Sender<Message>,
     connections: Connections,
 ) {
@@ -757,7 +766,7 @@ pub async fn run(
         x11: params.x11.clone(),
         forwards: None,
     };
-    let result = session(&params, &mut inbox, &mut ctx, &connections).await;
+    let result = session(&params, &mut inbox, tunnel, &mut ctx, &connections).await;
     let server_said = with(&shared, |s| s.server_said.take()).flatten();
     let lost = with(&shared, |s| s.lost.take()).flatten();
     let reason = match (result, server_said) {
@@ -823,17 +832,55 @@ const SHELL_CLOSED: &str = "The shell closed; the connection stays open for the 
 async fn session(
     p: &Params,
     inbox: &mut mpsc::Receiver<Message>,
+    tunnel: Option<mpsc::UnboundedReceiver<Message>>,
     ctx: &mut Ctx,
     connections: &Connections,
 ) -> Result<Ended, Failure> {
-    // A server without strict key exchange may not use ChaCha20, but that
-    // only shows once it has chosen it: connect again without it.
     let mut preferred = preferred_for(&p.host_key_algs);
     if p.legacy {
         preferred = with_legacy(preferred);
     }
+    let (mut handle, forwards) = match (p.tunnel, tunnel) {
+        (Some(id), Some(rx)) => {
+            // A tunnel carries one connection, so there is no second try
+            // without ChaCha20: AES-GCM goes first instead, which any
+            // server without strict key exchange has.
+            let stream = crate::tunnel::open(id, rx, ctx.out.clone(), connections.routes.clone());
+            match handshake(p, aes_gcm_first(preferred), stream, inbox, ctx, connections).await {
+                Err(Failure::Ssh(e @ russh::Error::NoCommonAlgo { .. })) if !p.legacy => {
+                    return Err(suggest_legacy(e));
+                }
+                other => other?,
+            }
+        }
+        (Some(_), None) => return Err(Failure::Refused("The tunnel is already in use.".into())),
+        (None, _) => direct(p, preferred, inbox, ctx, connections).await?,
+    };
+
+    authenticate(&mut handle, p, inbox, ctx).await?;
+    let conn = Arc::new(handle);
+    let names = with(&ctx.shared, |s| s.names.clone()).flatten();
+    connections.insert(ctx.channel, &conn, names, forwards.clone());
+    ctx.forwards = Some(forwards.clone());
+    if p.shell {
+        shell(conn, inbox, ctx).await
+    } else {
+        carry(conn, &forwards, inbox, ctx).await
+    }
+}
+
+/// Logs in over TCP. A server without strict key exchange may not use
+/// ChaCha20, but that only shows once it has chosen it: connect again
+/// without it.
+async fn direct(
+    p: &Params,
+    preferred: Preferred,
+    inbox: &mut mpsc::Receiver<Message>,
+    ctx: &mut Ctx,
+    connections: &Connections,
+) -> Result<(Connection, Arc<ConnForwards>), Failure> {
     let first = connect(p, preferred.clone(), inbox, ctx, connections).await;
-    let (mut handle, forwards) = match first {
+    Ok(match first {
         Err(Failure::NoStrictKex) => {
             match connect(p, without_terrapin(preferred), inbox, ctx, connections).await {
                 Err(Failure::Ssh(russh::Error::NoCommonAlgo { .. })) => {
@@ -846,14 +893,51 @@ async fn session(
             return Err(suggest_legacy(e));
         }
         other => other?,
-    };
+    })
+}
 
-    authenticate(&mut handle, p, inbox, ctx).await?;
-    let conn = Arc::new(handle);
-    let names = with(&ctx.shared, |s| s.names.clone()).flatten();
-    connections.insert(ctx.channel, &conn, names, forwards.clone());
-    ctx.forwards = Some(forwards);
-    shell(conn, inbox, ctx).await
+/// A jump host's login: no shell, only the streams the UI opens on the
+/// connection for the next hop. Holds the connection until the UI closes
+/// the channel or the server goes away; the streams hold it after that.
+async fn carry(
+    conn: Arc<Connection>,
+    forwards: &ConnForwards,
+    inbox: &mut mpsc::Receiver<Message>,
+    ctx: &mut Ctx,
+) -> Result<Ended, Failure> {
+    ctx.send(connected(ctx)).await?;
+    let mut alive = forwards.alive();
+    loop {
+        tokio::select! {
+            msg = inbox.recv() => match msg {
+                None | Some(Message::Close { .. }) => break,
+                Some(_) => {}
+            },
+            gone = alive.changed() => if gone.is_err() {
+                break;
+            },
+        }
+    }
+    Ok(match Arc::into_inner(conn) {
+        Some(handle) => {
+            let _ = handle.disconnect(Disconnect::ByApplication, "", "en").await;
+            Ended::Connection
+        }
+        None => Ended::Shell,
+    })
+}
+
+/// [`Message::Connected`] with the negotiated algorithms.
+fn connected(ctx: &Ctx) -> Message {
+    let (kex, cipher, host_key) = with(&ctx.shared, |s| s.names.clone())
+        .flatten()
+        .unwrap_or_default();
+    Message::Connected {
+        channel: ctx.channel,
+        kex,
+        cipher,
+        host_key,
+    }
 }
 
 /// A negotiation failure, with the hint to turn on the legacy set when the
@@ -877,15 +961,6 @@ async fn connect(
     ctx: &mut Ctx,
     connections: &Connections,
 ) -> Result<(Connection, Arc<ConnForwards>), Failure> {
-    let config = Arc::new(client::Config {
-        client_id: SshId::Standard(CLIENT_ID.into()),
-        preferred,
-        keepalive_interval: (p.timing.alive_interval > 0)
-            .then(|| Duration::from_secs(p.timing.alive_interval.into())),
-        keepalive_max: p.timing.alive_max.max(1) as usize,
-        nodelay: true,
-        ..Default::default()
-    });
     let addr = (p.host.as_str(), p.port);
     let tcp = drive(
         tokio::time::timeout(
@@ -899,6 +974,27 @@ async fn connect(
     .map_err(|_| Failure::Refused(format!("Timed out connecting to {}.", p.host)))?
     .map_err(|e| Failure::Refused(format!("Could not connect to {}: {e}.", p.host)))?;
     let _ = tcp.set_nodelay(true);
+    handshake(p, preferred, tcp, inbox, ctx, connections).await
+}
+
+/// Runs key exchange with `preferred` over `stream`.
+async fn handshake(
+    p: &Params,
+    preferred: Preferred,
+    stream: impl AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    inbox: &mut mpsc::Receiver<Message>,
+    ctx: &mut Ctx,
+    connections: &Connections,
+) -> Result<(Connection, Arc<ConnForwards>), Failure> {
+    let config = Arc::new(client::Config {
+        client_id: SshId::Standard(CLIENT_ID.into()),
+        preferred,
+        keepalive_interval: (p.timing.alive_interval > 0)
+            .then(|| Duration::from_secs(p.timing.alive_interval.into())),
+        keepalive_max: p.timing.alive_max.max(1) as usize,
+        nodelay: true,
+        ..Default::default()
+    });
     let (alive_tx, alive) = watch::channel(());
     let forwards = Arc::new(ConnForwards {
         connection: ctx.channel,
@@ -914,7 +1010,7 @@ async fn connect(
         connections: connections.clone(),
         _alive: alive_tx,
     };
-    let handle = drive(client::connect_stream(config, tcp, handler), inbox, ctx).await??;
+    let handle = drive(client::connect_stream(config, stream, handler), inbox, ctx).await??;
     Ok((handle, forwards))
 }
 
@@ -963,16 +1059,7 @@ async fn pump(
         .request_pty(false, TERM, cols.into(), rows.into(), 0, 0, &[])
         .await?;
     channel.request_shell(true).await?;
-    let (kex, cipher, host_key) = with(&ctx.shared, |s| s.names.clone())
-        .flatten()
-        .unwrap_or_default();
-    ctx.send(Message::Connected {
-        channel: ctx.channel,
-        kex,
-        cipher,
-        host_key,
-    })
-    .await?;
+    ctx.send(connected(ctx)).await?;
 
     let (mut read, write) = channel.split();
     // Writes can wait for the server's window; they run in their own task

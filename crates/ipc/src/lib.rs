@@ -46,7 +46,7 @@ use std::fmt;
 use zeroize::Zeroize;
 
 /// Protocol version carried in every frame. Bump on any wire change.
-pub const PROTOCOL_VERSION: u8 = 10;
+pub const PROTOCOL_VERSION: u8 = 11;
 
 /// Largest frame body accepted, in bytes. Terminal and SFTP data is chunked
 /// below this, so anything larger is a bug or an attack.
@@ -359,6 +359,14 @@ pub enum Message {
     /// of `cols` x `rows`. `host_key_algs` are the key types known_hosts
     /// already holds for this host; the worker asks for those first. With
     /// `x11`, the shell asks the server for X11 forwarding.
+    ///
+    /// With a `tunnel`, the worker does not open a TCP connection: the SSH
+    /// connection runs over that stream channel instead, whose other end
+    /// the UI connects to a jump host's `direct-tcpip` channel in another
+    /// worker, or to a local `ProxyCommand`. A login without `shell` is a
+    /// jump host's: the worker logs in, answers [`Message::Connected`] and
+    /// keeps the connection for the streams opened on it until
+    /// [`Message::Close`].
     Connect {
         channel: ChannelId,
         host: String,
@@ -371,6 +379,8 @@ pub enum Message {
         /// Also offer the legacy algorithm set (`LegacyAlgorithms yes`).
         legacy: bool,
         timing: Timing,
+        tunnel: Option<ChannelId>,
+        shell: bool,
     },
     /// Open another shell on the connection that `connection` (a channel
     /// that made it with [`Message::Connect`]) belongs to. No new login:
@@ -999,6 +1009,8 @@ pub fn encode(msg: &Message, out: &mut Vec<u8>) -> Result<(), Error> {
             x11,
             legacy,
             timing,
+            tunnel,
+            shell,
         } => {
             w.u32(*channel);
             w.str(host);
@@ -1012,6 +1024,8 @@ pub fn encode(msg: &Message, out: &mut Vec<u8>) -> Result<(), Error> {
             w.u32(timing.connect_timeout);
             w.u32(timing.alive_interval);
             w.u32(timing.alive_max);
+            w.opt(*tunnel, Writer::u32);
+            w.bool(*shell);
         }
         Message::TelnetConnect {
             channel,
@@ -1373,6 +1387,8 @@ fn decode_body(body: &[u8]) -> Result<Message, Error> {
                 alive_interval: r.u32()?,
                 alive_max: r.u32()?,
             },
+            tunnel: r.opt(Reader::u32)?,
+            shell: r.bool()?,
         },
         5 => Message::HostKeyVerdict {
             channel: r.u32()?,
@@ -1789,6 +1805,8 @@ mod tests {
                 x11: None,
                 legacy: false,
                 timing: Timing::default(),
+                tunnel: None,
+                shell: true,
             },
             Message::Connect {
                 channel: 3,
@@ -1809,6 +1827,8 @@ mod tests {
                     alive_interval: 0,
                     alive_max: 1,
                 },
+                tunnel: Some(0x1234),
+                shell: false,
             },
             Message::HostKeyVerdict {
                 channel: 1,
@@ -2192,7 +2212,7 @@ mod tests {
     fn rejects_malformed_bodies() {
         let v = PROTOCOL_VERSION;
         let cases: [(&[u8], Error); 11] = [
-            (&[99, 0, 1], Error::Version(99)),
+            (&[v + 1, 0, 1], Error::Version(v + 1)),
             (&[v, 200], Error::Tag(200)),
             (&[v, 2, 1, 0], Error::Truncated),
             (&[v, 0, 1, 0xff], Error::Trailing(1)),

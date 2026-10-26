@@ -29,7 +29,13 @@ little as possible. One exe runs as three kinds of process:
 - **The SSH workers** hold the network connections and run the SSH
   protocol (russh), one worker process for each SSH connection: tabs
   that share a login share its worker, but another host or user gets a
-  worker of its own. Each runs in an AppContainer that may use the
+  worker of its own. Each jump host on the way to a host (`ProxyJump`)
+  is a connection of its own too: its worker opens a TCP stream to the
+  next hop, and the next hop's worker runs its SSH connection inside
+  that stream, end to end encrypted. The window passes the stream's
+  bytes between the two workers without reading them, so neither worker
+  sees the other's keys or data, and each hop's host key is checked
+  as for a direct connection. Each runs in an AppContainer that may use the
   network and nothing else: none of your files, registry or other
   processes. It asks the window for everything else over a pipe.
 - **The desktop viewer**, only in the builds with the built-in VNC or RDP
@@ -79,4 +85,12 @@ every pull request, and for longer every week.
   server sends back, and it can relay a login it was given to another
   server it can reach. The checks above stop it from doing more with
   your keys, files or passwords than the connection you opened needs.
+- A `ProxyCommand` runs a program of your choosing with your rights,
+  outside the sandbox, as it must reach what the sandbox cannot. FeroSSH
+  runs it without a shell or a window, and only after you allowed that
+  exact command line once (kept in
+  `%LOCALAPPDATA%\FeroSSH\approved-proxy-commands.txt`). The program
+  only ever sees the connection's encrypted bytes.
+- A jump host sees which host and port you connect to through it, and
+  can refuse or cut that stream, as with OpenSSH.
 - Release exes are not code-signed yet.

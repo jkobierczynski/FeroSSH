@@ -9,7 +9,7 @@ The window starts as one pane, with no tab strip. Ctrl+Shift+T opens a tab and t
 - Alt+arrows moves the focus, Alt+Shift+arrows grows the focused pane, and dragging a divider resizes.
 - Drag a tab to reorder it. Ctrl+Shift+drag a pane onto another pane's edge to move it there, or onto its middle to swap the two.
 - Ctrl+Shift+J joins a tab into the tab before it, as a pane. Dropping a pane on the tab strip makes it a tab again.
-- View > Font and View > Theme change only the focused pane. Session > Save font and theme for this host keeps them for next time.
+- View > Font and View > Theme change only the focused pane. The font menu lists eight monospace fonts; the ones not installed on this PC are greyed out. Session > Save font and theme for this host keeps them for next time.
 
 ## The session manager
 
@@ -29,6 +29,12 @@ On a host without SFTP, such as a console server or a Telnet device, you can use
 
 `LocalForward`, `RemoteForward` and `DynamicForward` in your ssh_config start when you log in. View > Port forwards (Ctrl+Shift+P) lists them and adds new ones: type `-L 8080:db.internal:5432`, `-R 9000:localhost:3000` or `-D 1080` and press Enter. A dynamic forward is a SOCKS 4, 4a and 5 proxy. A tab whose connection forwards shows `⇄`, in amber when the server can reach back into your PC.
 
+## Jump hosts
+
+To reach a host that is only reachable through another one, give it a jump host: `ProxyJump bastion` in your ssh_config, or the *Jump host* field in the session form (F2). Several go in turn, separated by commas: `admin@gw:2222,inner`. Each jump host logs in as if you connected to it, with its own host key check and its own key or password, in a sandboxed worker of its own; the host behind it is then reached through that login, encrypted end to end. If a jump host cannot reach the next one, the pane says which one and why.
+
+`ProxyCommand` in your ssh_config runs a local program (for example `ncat --proxy proxy.example.org:8080 %h %p`) and sends the connection through it. FeroSSH asks once before it runs a command line it has not run before.
+
 ## tmux
 
 Session > Attach tmux turns tmux windows and panes into native FeroSSH tabs and panes. You get no prefix key and no status bar, and you keep native scrollback, copy and search. Close FeroSSH, or lose the network, and everything keeps running on the server. Attach again, from this PC or another, and the tabs, splits, fonts and themes come back. tmux is never started unless you ask; to attach on every login to a host, set `Tmux` in its profile (see [Settings](settings.md)).
@@ -41,7 +47,7 @@ Session > Open remote desktop (Ctrl+Shift+D) shows the Linux desktop of the host
 
 ## Logs and scrollback
 
-Session > Log to file writes what a tab receives to `%LOCALAPPDATA%\FeroSSH\logs`, one file per tab. Passwords and passphrases never reach the log. Scrollback is 10,000 lines unless you change it (`Scrollback` in [Settings](settings.md)), and Shift+PgUp scrolls back.
+Session > Log to file writes what a tab receives to `%LOCALAPPDATA%\FeroSSH\logs`, one file per tab. Passwords and passphrases never reach the log. Session > Timestamp each log line puts the local time each line started in front of it, to the millisecond (`[2026-10-26 19:24:49.123] $ uptime`); it applies to open logs from their next line and stays on for new ones. Raw logs are never stamped, so they still replay with `cat`. Scrollback is 10,000 lines unless you change it (`Scrollback` in [Settings](settings.md)), and Shift+PgUp scrolls back.
 
 ## Colour themes
 

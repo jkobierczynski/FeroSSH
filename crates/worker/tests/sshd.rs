@@ -225,6 +225,8 @@ async fn run_ui_with(server: &Server, command: &str, trust: bool, known: Vec<Str
         x11: None,
         legacy: false,
         timing: Default::default(),
+        tunnel: None,
+        shell: true,
     })
     .await;
     let mut seen = Seen::default();
@@ -450,6 +452,8 @@ async fn second_shell_shares_the_connection() {
         x11: None,
         legacy: false,
         timing: Default::default(),
+        tunnel: None,
+        shell: true,
     })
     .await;
     let (mut host_keys, mut signed) = (0, 0);
@@ -585,6 +589,8 @@ async fn login(server: &Server) -> (mpsc::Sender<Message>, mpsc::Receiver<Messag
             x11: None,
             legacy: false,
             timing: Default::default(),
+            tunnel: None,
+            shell: true,
         })
         .await
         .unwrap();
@@ -761,6 +767,294 @@ async fn transfers_files_over_sftp() {
         }
     }
     assert!(String::from_utf8_lossy(&out).contains("still42"));
+}
+
+/// What [`through`] saw.
+#[derive(Debug, Default)]
+struct Chain {
+    output: Vec<u8>,
+    /// Why the target's session ended.
+    disconnected: String,
+    /// Host key checks and signatures, per worker.
+    host_keys: Vec<usize>,
+    signed: Vec<usize>,
+    /// Why each tunnel ended, as its jump host's worker said.
+    tunnel_ends: Vec<String>,
+    connected: Option<(String, String, String)>,
+}
+
+/// Plays the UI for a login to `target` through `hops` jump hosts (all
+/// the same sshd here), one worker each, the way the window does: each
+/// jump host logs in without a shell, its worker opens a `direct-tcpip`
+/// stream to the next hop, and the next hop's worker runs its SSH
+/// connection over that stream, which this side only relays.
+async fn through(
+    jump: &Server,
+    target_port: u16,
+    target_key: &Server,
+    hops: usize,
+    command: &str,
+) -> Chain {
+    let user = whoami();
+    let keys = [
+        KeyFile::load(&jump.user_key).unwrap(),
+        KeyFile::load(&target_key.user_key).unwrap(),
+    ];
+    let (events_tx, mut events) = mpsc::channel::<(usize, Message)>(256);
+    let mut to: Vec<mpsc::Sender<Message>> = Vec::new();
+    for i in 0..=hops {
+        let (to_worker, worker_in) = mpsc::channel(64);
+        let (worker_out, mut from_worker) = mpsc::channel(64);
+        tokio::spawn(ferossh_worker::serve(worker_in, worker_out));
+        let events_tx = events_tx.clone();
+        tokio::spawn(async move {
+            while let Some(m) = from_worker.recv().await {
+                if events_tx.send((i, m)).await.is_err() {
+                    return;
+                }
+            }
+        });
+        to_worker
+            .send(Message::Hello {
+                version: PROTOCOL_VERSION,
+            })
+            .await
+            .unwrap();
+        to.push(to_worker);
+    }
+    // Worker i's tunnel to worker i + 1.
+    let tunnel = |i: usize| 100 + u32::try_from(i).unwrap();
+    let connect = |i: usize| Message::Connect {
+        channel: 1,
+        host: "127.0.0.1".into(),
+        port: if i == hops { target_port } else { jump.port },
+        user: user.clone(),
+        cols: 80,
+        rows: 24,
+        host_key_algs: vec![],
+        x11: None,
+        legacy: false,
+        timing: Default::default(),
+        tunnel: i.checked_sub(1).map(tunnel),
+        shell: i == hops,
+    };
+    to[0].send(connect(0)).await.unwrap();
+    let mut seen = Chain {
+        host_keys: vec![0; hops + 1],
+        signed: vec![0; hops + 1],
+        ..Chain::default()
+    };
+    let deadline = tokio::time::sleep(Duration::from_secs(60));
+    tokio::pin!(deadline);
+    loop {
+        let (i, msg) = tokio::select! {
+            m = events.recv() => m.expect("workers hung up"),
+            () = &mut deadline => panic!("timed out; so far {seen:?}"),
+        };
+        let key = if i == hops { &keys[1] } else { &keys[0] };
+        let channel = msg.channel();
+        // Tunnel bytes go straight across, untouched.
+        let peer = match channel {
+            Some(c) if i < hops && c == tunnel(i) => Some(i + 1),
+            Some(c) if i > 0 && c == tunnel(i - 1) => Some(i - 1),
+            _ => None,
+        };
+        if let Some(peer) = peer {
+            match msg {
+                Message::Data { .. } | Message::Window { .. } | Message::Eof { .. } => {
+                    to[peer].send(msg).await.unwrap();
+                }
+                Message::Disconnected { channel, reason } => {
+                    if peer > i {
+                        seen.tunnel_ends.push(reason);
+                    }
+                    let _ = to[peer].send(Message::Close { channel }).await;
+                }
+                Message::ForwardOpened { .. } => {}
+                other => panic!("unexpected on a tunnel: {other:?}"),
+            }
+            continue;
+        }
+        let reply = match msg {
+            Message::HostKey { channel, .. } => {
+                seen.host_keys[i] += 1;
+                Message::HostKeyVerdict {
+                    channel,
+                    accept: true,
+                }
+            }
+            Message::IdentitiesRequest { channel } => Message::Identities {
+                channel,
+                keys: vec![key.public.clone()],
+            },
+            Message::SignRequest {
+                channel,
+                data,
+                key: k,
+            } => {
+                assert_eq!(k, key.public, "worker {i} asked for another hop's key");
+                userauth::check(&data, &user, &k).expect("a user-auth request");
+                seen.signed[i] += 1;
+                Message::Signature {
+                    channel,
+                    signature: key.sign(None, &data).unwrap(),
+                }
+            }
+            Message::Connected {
+                kex,
+                cipher,
+                host_key,
+                ..
+            } if i == hops => {
+                seen.connected = Some((kex, cipher, host_key));
+                Message::Data {
+                    channel: 1,
+                    bytes: command.as_bytes().to_vec(),
+                }
+            }
+            Message::Connected { .. } => {
+                to[i]
+                    .send(Message::ForwardOpen {
+                        channel: tunnel(i),
+                        connection: 1,
+                        target: Some((
+                            "127.0.0.1".into(),
+                            if i + 1 == hops {
+                                target_port
+                            } else {
+                                jump.port
+                            },
+                        )),
+                        origin_host: "127.0.0.1".into(),
+                        origin_port: 0,
+                        keep: true,
+                    })
+                    .await
+                    .unwrap();
+                connect(i + 1)
+            }
+            Message::Data { bytes, .. } if i == hops => {
+                seen.output.extend_from_slice(&bytes);
+                continue;
+            }
+            Message::Disconnected { reason, .. } if i == hops => {
+                seen.disconnected = reason;
+                return seen;
+            }
+            Message::Disconnected { reason, .. } => {
+                panic!("jump host {i} ended early: {reason}; so far {seen:?}")
+            }
+            _ => continue,
+        };
+        let target = if matches!(reply, Message::Connect { .. }) {
+            i + 1
+        } else {
+            i
+        };
+        to[target].send(reply).await.unwrap();
+    }
+}
+
+/// `ProxyJump`: the target's login runs in its own worker, over a stream
+/// the jump host's worker opened, through one jump host and through
+/// two. Each hop checks its own host key and signs its own login.
+#[tokio::test]
+async fn logs_in_through_jump_hosts() {
+    if !available() {
+        return;
+    }
+    let jump = start("jump", "");
+    let target = start("jump-target", "");
+    for hops in [1, 2] {
+        let seen = through(
+            &jump,
+            target.port,
+            &target,
+            hops,
+            "echo fero$((6*7)); exit 3\n",
+        )
+        .await;
+        let output = String::from_utf8_lossy(&seen.output);
+        assert!(output.contains("fero42"), "{hops} hops: {seen:?}");
+        assert_eq!(seen.host_keys, vec![1; hops + 1], "{seen:?}");
+        assert_eq!(seen.signed, vec![1; hops + 1], "{seen:?}");
+        // A connection that cannot be tried again starts with AES-GCM.
+        let (_, cipher, _) = seen.connected.clone().unwrap();
+        assert_eq!(cipher, "aes256-gcm@openssh.com");
+    }
+}
+
+/// A big transfer through the tunnel: the flow control holds on both
+/// hops and nothing is lost or reordered.
+#[tokio::test]
+async fn bulk_data_survives_the_tunnel() {
+    if !available() {
+        return;
+    }
+    let jump = start("jump-bulk", "");
+    let target = start("jump-bulk-target", "");
+    let seen = through(
+        &jump,
+        target.port,
+        &target,
+        1,
+        "head -c 3000000 /dev/zero | tr '\\0' x | sha256sum; exit\n",
+    )
+    .await;
+    let output = String::from_utf8_lossy(&seen.output);
+    let expected = {
+        let out = Command::new("sh")
+            .args(["-c", "head -c 3000000 /dev/zero | tr '\\0' x | sha256sum"])
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&out.stdout)
+            .split_whitespace()
+            .next()
+            .unwrap()
+            .to_owned()
+    };
+    assert!(output.contains(&expected), "{seen:?}");
+}
+
+/// A jump host that cannot reach the target says why, and the target's
+/// login ends instead of hanging.
+#[tokio::test]
+async fn a_jump_host_that_cannot_reach_the_target_says_so() {
+    if !available() {
+        return;
+    }
+    let jump = start("jump-nowhere", "");
+    let closed = TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
+    let seen = through(&jump, closed, &jump, 1, "").await;
+    assert!(seen.connected.is_none(), "{seen:?}");
+    assert!(
+        seen.tunnel_ends
+            .iter()
+            .any(|r| r.contains(&closed.to_string())),
+        "{seen:?}"
+    );
+}
+
+/// A jump host whose sshd forbids forwarding: the tunnel is refused.
+#[tokio::test]
+async fn a_jump_host_without_forwarding_refuses_the_tunnel() {
+    if !available() {
+        return;
+    }
+    let jump = start("jump-noforward", "AllowTcpForwarding no");
+    let target = start("jump-noforward-target", "");
+    let seen = through(&jump, target.port, &target, 1, "").await;
+    assert!(seen.connected.is_none(), "{seen:?}");
+    assert!(
+        seen.tunnel_ends
+            .iter()
+            .any(|r| r.contains("could not connect")),
+        "{seen:?}"
+    );
 }
 
 /// Whether `lrzsz` is installed, for the ZMODEM test.

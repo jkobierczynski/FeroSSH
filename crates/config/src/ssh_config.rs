@@ -1,8 +1,9 @@
 //! The part of OpenSSH's `ssh_config` that FeroSSH uses: `Host` blocks
 //! with `HostName`, `User`, `Port`, `IdentityFile`, `Tag`, the forwarding
 //! keywords (`LocalForward`, `RemoteForward`, `DynamicForward`,
-//! `ForwardX11`, `GatewayPorts`, `ClearAllForwardings`), `Include`d files,
-//! and the list of hosts the session manager shows.
+//! `ForwardX11`, `GatewayPorts`, `ClearAllForwardings`), how to get there
+//! (`ProxyJump`, `ProxyCommand`), `Include`d files, and the list of hosts
+//! the session manager shows.
 //!
 //! The rules follow `ssh_config(5)`: keywords are case-insensitive, the
 //! first value found for a keyword wins (except `IdentityFile` and the
@@ -45,6 +46,84 @@ pub struct HostConfig {
     pub server_alive_count_max: Option<u32>,
     /// Seconds to wait for the TCP connection and the server's banner.
     pub connect_timeout: Option<u32>,
+    /// `ProxyJump` or `ProxyCommand`, whichever came first, as OpenSSH
+    /// takes them.
+    pub proxy: Option<Proxy>,
+}
+
+/// How a host is reached when not directly.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Proxy {
+    /// `ProxyJump none` or `ProxyCommand none`: directly, whatever later
+    /// lines say.
+    Direct,
+    /// `ProxyJump`: through these hosts in turn, each `[user@]host[:port]`
+    /// (or a `Host` alias) as written.
+    Jump(Vec<String>),
+    /// `ProxyCommand`: a program whose standard input and output carry
+    /// the connection, split into the program and its arguments, tokens
+    /// not yet filled in (see [`proxy_command`]).
+    Command(Vec<String>),
+}
+
+/// The hosts on a `ProxyJump` line (or `-J`): comma-separated
+/// `[user@]host[:port]`, each optionally as `ssh://[user@]host[:port]`.
+/// `None` when one of them does not parse; `none` is [`Proxy::Direct`].
+pub fn parse_proxy_jump(text: &str) -> Option<Proxy> {
+    let text = text.trim();
+    if text.eq_ignore_ascii_case("none") {
+        return Some(Proxy::Direct);
+    }
+    let mut hops = Vec::new();
+    for hop in text.split(',') {
+        let hop = hop.trim();
+        let hop = hop.strip_prefix("ssh://").unwrap_or(hop);
+        let hop = hop.strip_suffix('/').unwrap_or(hop);
+        parse_destination(hop)?;
+        hops.push(hop.to_owned());
+    }
+    (!hops.is_empty()).then_some(Proxy::Jump(hops))
+}
+
+/// Most hops one connection goes through, nested `ProxyJump`s included.
+pub const MAX_HOPS: usize = 8;
+
+/// A `ProxyCommand`'s program and arguments with OpenSSH's tokens filled
+/// into the arguments: `%h` the host name, `%p` the port, `%r` the remote
+/// user, `%n` the name as typed, `%%` a `%`. The program itself is never
+/// expanded, so no host name can pick what runs.
+pub fn proxy_command(
+    argv: &[String],
+    host: &str,
+    port: u16,
+    user: &str,
+    alias: &str,
+) -> Option<(String, Vec<String>)> {
+    let (program, args) = argv.split_first()?;
+    let expand = |arg: &String| {
+        let mut out = String::with_capacity(arg.len());
+        let mut chars = arg.chars();
+        while let Some(c) = chars.next() {
+            if c != '%' {
+                out.push(c);
+                continue;
+            }
+            match chars.next() {
+                Some('h') => out.push_str(host),
+                Some('p') => out.push_str(&port.to_string()),
+                Some('r') => out.push_str(user),
+                Some('n') => out.push_str(alias),
+                Some('%') => out.push('%'),
+                Some(other) => {
+                    out.push('%');
+                    out.push(other);
+                }
+                None => out.push('%'),
+            }
+        }
+        out
+    };
+    (!program.is_empty()).then(|| (program.clone(), args.iter().map(expand).collect()))
 }
 
 impl HostConfig {
@@ -384,6 +463,16 @@ pub fn resolve_in(text: &str, name: &str, includes: &dyn Includes) -> HostConfig
             "connecttimeout" if cfg.connect_timeout.is_none() => {
                 cfg.connect_timeout = seconds(&args).filter(|&n| n > 0);
             }
+            "proxyjump" if cfg.proxy.is_none() => {
+                cfg.proxy = args.first().and_then(|a| parse_proxy_jump(a));
+            }
+            "proxycommand" if cfg.proxy.is_none() => {
+                cfg.proxy = match args.as_slice() {
+                    [] => None,
+                    [one] if one.eq_ignore_ascii_case("none") => Some(Proxy::Direct),
+                    argv => Some(Proxy::Command(argv.to_vec())),
+                };
+            }
             _ => {}
         }
     }
@@ -460,7 +549,7 @@ pub fn parse_destination(text: &str) -> Option<(Option<String>, String, Option<u
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::indexing_slicing)]
+#[allow(clippy::unwrap_used, clippy::indexing_slicing, clippy::panic)]
 mod tests {
     use super::*;
 
@@ -495,6 +584,60 @@ Host *
             c.identity_files,
             vec!["~/.ssh/net_ed25519", "~/.ssh/id_ed25519"]
         );
+    }
+
+    #[test]
+    fn proxy_jump_and_proxy_command_whichever_comes_first() {
+        let text = "\
+Host inner
+    ProxyJump admin@bastion:2222,ssh://edge
+Host inner
+    ProxyCommand nc %h %p
+Host piped
+    ProxyCommand \"C:\\Program Files\\ncat.exe\" --proxy %r@proxy %h:%p
+    ProxyJump bastion
+Host direct
+    ProxyJump none
+Host *
+    ProxyJump bastion
+Host bad
+    ProxyJump -oProxyCommand=calc
+";
+        assert_eq!(
+            resolve(text, "inner").proxy,
+            Some(Proxy::Jump(vec![
+                "admin@bastion:2222".into(),
+                "edge".into()
+            ]))
+        );
+        let Some(Proxy::Command(argv)) = resolve(text, "piped").proxy else {
+            panic!("no command");
+        };
+        assert_eq!(argv[0], r"C:\Program Files\ncat.exe");
+        let (program, args) = proxy_command(&argv, "db.lan", 2200, "me", "piped").unwrap();
+        assert_eq!(program, r"C:\Program Files\ncat.exe");
+        assert_eq!(args, ["--proxy", "me@proxy", "db.lan:2200"]);
+        assert_eq!(resolve(text, "direct").proxy, Some(Proxy::Direct));
+        assert_eq!(
+            resolve(text, "other").proxy,
+            Some(Proxy::Jump(vec!["bastion".into()]))
+        );
+        // A line that does not parse is ignored, so the next one counts.
+        assert_eq!(
+            resolve(text, "bad").proxy,
+            Some(Proxy::Jump(vec!["bastion".into()]))
+        );
+        assert_eq!(parse_proxy_jump("a,,b"), None);
+        assert_eq!(parse_proxy_jump("NONE"), Some(Proxy::Direct));
+    }
+
+    #[test]
+    fn proxy_command_tokens_never_pick_the_program() {
+        let argv = vec!["%h".to_owned(), "%h%%p".to_owned(), "x%".to_owned()];
+        let (program, args) = proxy_command(&argv, "evil", 22, "u", "n").unwrap();
+        assert_eq!(program, "%h");
+        assert_eq!(args, ["evil%p", "x%"]);
+        assert_eq!(proxy_command(&[], "h", 22, "u", "n"), None);
     }
 
     #[test]
