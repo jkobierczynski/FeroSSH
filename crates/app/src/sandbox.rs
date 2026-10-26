@@ -7,7 +7,17 @@
 //! registry or other processes. The worker talks to the UI over two
 //! anonymous pipes it inherits, passed by handle value on its command line;
 //! only those two handles are inherited. A job object kills the worker
-//! when the UI exits and stops it from starting processes of its own.
+//! when the UI exits, stops it from starting processes of its own, caps
+//! its memory, and keeps it away from the clipboard, the desktop, global
+//! atoms and other processes' windows.
+//!
+//! Both sandboxed processes also start with process mitigations (see
+//! [`MITIGATIONS`]): no dynamic code, no legacy extension points (AppInit
+//! DLLs, hooks, Winsock LSPs), no non-system fonts, mandatory ASLR, strict
+//! handle checks, DLLs from System32 before the exe's folder, and no child
+//! processes. A Windows that refuses the set starts them without it.
+//! `--no-sandbox` runs the worker without mitigations too, so it stays a
+//! full escape hatch.
 //!
 //! AppContainers cannot connect to loopback addresses, so `localhost`
 //! (and WSL through localhost) is unreachable from the sandbox; such hosts
@@ -48,14 +58,19 @@ use windows::Win32::Storage::FileSystem::{FILE_GENERIC_EXECUTE, FILE_GENERIC_REA
 use windows::Win32::System::JobObjects::{
     AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_ACTIVE_PROCESS,
     JOB_OBJECT_LIMIT_DIE_ON_UNHANDLED_EXCEPTION, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
-    JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation,
-    SetInformationJobObject,
+    JOB_OBJECT_LIMIT_PROCESS_MEMORY, JOB_OBJECT_UILIMIT_DESKTOP,
+    JOB_OBJECT_UILIMIT_DISPLAYSETTINGS, JOB_OBJECT_UILIMIT_EXITWINDOWS,
+    JOB_OBJECT_UILIMIT_GLOBALATOMS, JOB_OBJECT_UILIMIT_HANDLES, JOB_OBJECT_UILIMIT_READCLIPBOARD,
+    JOB_OBJECT_UILIMIT_SYSTEMPARAMETERS, JOB_OBJECT_UILIMIT_WRITECLIPBOARD,
+    JOBOBJECT_BASIC_UI_RESTRICTIONS, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+    JobObjectBasicUIRestrictions, JobObjectExtendedLimitInformation, SetInformationJobObject,
 };
 use windows::Win32::System::Pipes::CreatePipe;
 use windows::Win32::System::Threading::{
     CREATE_NO_WINDOW, CREATE_SUSPENDED, CreateProcessW, DeleteProcThreadAttributeList,
     EXTENDED_STARTUPINFO_PRESENT, InitializeProcThreadAttributeList, LPPROC_THREAD_ATTRIBUTE_LIST,
-    PROC_THREAD_ATTRIBUTE_HANDLE_LIST, PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES,
+    PROC_THREAD_ATTRIBUTE_CHILD_PROCESS_POLICY, PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
+    PROC_THREAD_ATTRIBUTE_MITIGATION_POLICY, PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES,
     PROCESS_INFORMATION, ResumeThread, STARTUPINFOEXW, TerminateProcess, UpdateProcThreadAttribute,
 };
 use windows::core::{HSTRING, PWSTR, Result, w};
@@ -103,6 +118,32 @@ impl Kind {
         }
     }
 }
+/// The process mitigations both sandboxed processes start with, as
+/// `PROCESS_CREATION_MITIGATION_POLICY_*_ALWAYS_ON` bits (winbase.h; the
+/// windows crate does not carry them). Left out on purpose: Win32k
+/// lockdown (the exe imports user32), Control Flow Guard (the exe is not
+/// built with it), Microsoft-signed images only (FeroSSH is not), and no
+/// remote images (FeroSSH may run from a network share).
+const MITIGATIONS: u64 = (1 << 8) // force relocate images (mandatory ASLR)
+    | (1 << 12) // terminate on heap corruption
+    | (1 << 16) // bottom-up ASLR
+    | (1 << 20) // high-entropy ASLR
+    | (1 << 24) // strict handle checks
+    | (1 << 32) // no legacy extension points
+    | (1 << 36) // no dynamic code
+    | (1 << 48) // no non-system fonts
+    | (1 << 56) // no low-integrity images
+    | (1 << 60); // DLLs from System32 first
+
+/// PROCESS_CREATION_CHILD_PROCESS_RESTRICTED: no child processes, on top
+/// of the job's one-process limit.
+const CHILD_PROCESS_RESTRICTED: u32 = 1;
+
+/// The most memory one sandboxed process may commit. Frames are at most
+/// 1 MiB (worker) or 16 MiB (viewer) and an 8K screen is 130 MiB, so this
+/// only stops a runaway or taken-over process from starving the PC.
+const MEMORY_LIMIT: usize = 1 << 30;
+
 /// SE_GROUP_ENABLED: the capability is in force.
 const SE_GROUP_ENABLED: u32 = 4;
 /// Largest SID, in bytes (SECURITY_MAX_SID_SIZE).
@@ -131,12 +172,15 @@ pub struct Worker {
     _process: Owned,
     /// Whether the worker runs in the AppContainer.
     pub sandboxed: bool,
+    /// Whether it started with [`MITIGATIONS`].
+    pub mitigated: bool,
 }
 
 impl std::fmt::Debug for Worker {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Worker")
             .field("sandboxed", &self.sandboxed)
+            .field("mitigated", &self.mitigated)
             .finish_non_exhaustive()
     }
 }
@@ -248,20 +292,41 @@ fn pipe(child_reads: bool) -> Result<(Owned, Owned)> {
 }
 
 fn kill_on_close_job() -> Result<Owned> {
-    // SAFETY: a new unnamed job, wrapped right away; the limit struct is a
-    // valid local of the size passed.
+    // SAFETY: a new unnamed job, wrapped right away; the limit structs are
+    // valid locals of the sizes passed.
     unsafe {
         let job = Owned(CreateJobObjectW(None, None)?);
         let mut limits = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
         limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
             | JOB_OBJECT_LIMIT_ACTIVE_PROCESS
-            | JOB_OBJECT_LIMIT_DIE_ON_UNHANDLED_EXCEPTION;
+            | JOB_OBJECT_LIMIT_DIE_ON_UNHANDLED_EXCEPTION
+            | JOB_OBJECT_LIMIT_PROCESS_MEMORY;
         limits.BasicLimitInformation.ActiveProcessLimit = 1;
+        limits.ProcessMemoryLimit = MEMORY_LIMIT;
         SetInformationJobObject(
             job.0,
             JobObjectExtendedLimitInformation,
             (&raw const limits).cast::<c_void>(),
             std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+        )?;
+        // Neither process has a window: no clipboard, no desktop switching,
+        // no global atoms, no handles to other processes' windows, no
+        // system settings and no logging off.
+        let ui = JOBOBJECT_BASIC_UI_RESTRICTIONS {
+            UIRestrictionsClass: JOB_OBJECT_UILIMIT_DESKTOP
+                | JOB_OBJECT_UILIMIT_DISPLAYSETTINGS
+                | JOB_OBJECT_UILIMIT_EXITWINDOWS
+                | JOB_OBJECT_UILIMIT_GLOBALATOMS
+                | JOB_OBJECT_UILIMIT_HANDLES
+                | JOB_OBJECT_UILIMIT_READCLIPBOARD
+                | JOB_OBJECT_UILIMIT_SYSTEMPARAMETERS
+                | JOB_OBJECT_UILIMIT_WRITECLIPBOARD,
+        };
+        SetInformationJobObject(
+            job.0,
+            JobObjectBasicUIRestrictions,
+            (&raw const ui).cast::<c_void>(),
+            std::mem::size_of::<JOBOBJECT_BASIC_UI_RESTRICTIONS>() as u32,
         )?;
         Ok(job)
     }
@@ -326,7 +391,51 @@ fn spawn(kind: Kind, sandbox: bool) -> Result<Worker> {
         Reserved: 0,
     });
 
-    let attr_count = if security.is_some() { 2 } else { 1 };
+    // Mitigations come with the sandbox; a Windows that does not know one
+    // of them refuses the process, which then starts without them.
+    let started = if sid.is_some() {
+        create(kind, &exe, &exe_w, security.as_ref(), &inherit, true)
+            .map(|(job, process)| (job, process, true))
+            .or_else(|_| {
+                create(kind, &exe, &exe_w, security.as_ref(), &inherit, false)
+                    .map(|(job, process)| (job, process, false))
+            })
+    } else {
+        create(kind, &exe, &exe_w, None, &inherit, false)
+            .map(|(job, process)| (job, process, false))
+    };
+    let (job, process, mitigated) = started?;
+    // The child has its copies; ours would keep the pipes open forever.
+    drop((child_in, child_out));
+
+    let into_file = |h: Owned| {
+        let raw = h.0.0;
+        std::mem::forget(h);
+        // SAFETY: we own the handle and hand it to the File, which closes it.
+        unsafe { File::from_raw_handle(raw) }
+    };
+    Ok(Worker {
+        to_worker: into_file(to_worker),
+        from_worker: into_file(from_worker),
+        _job: job,
+        _process: process,
+        sandboxed: sid.is_some(),
+        mitigated,
+    })
+}
+
+/// Starts the process suspended, puts it in a fresh job and lets it run.
+fn create(
+    kind: Kind,
+    exe: &std::path::Path,
+    exe_w: &HSTRING,
+    security: Option<&SECURITY_CAPABILITIES>,
+    inherit: &[HANDLE; 2],
+    mitigate: bool,
+) -> Result<(Owned, Owned)> {
+    let mitigations = MITIGATIONS;
+    let child_policy = CHILD_PROCESS_RESTRICTED;
+    let attr_count = 1 + u32::from(security.is_some()) + if mitigate { 2 } else { 0 };
     let mut size = 0usize;
     // SAFETY: the first call only reports the size and is expected to fail.
     let _ = unsafe { InitializeProcThreadAttributeList(None, attr_count, None, &mut size) };
@@ -337,25 +446,45 @@ fn spawn(kind: Kind, sandbox: bool) -> Result<Worker> {
 
     let job = kill_on_close_job();
     let result = job.and_then(|job| {
-        // SAFETY: each attribute value points at a local that lives until
-        // CreateProcessW returns; the list is initialised.
+        // SAFETY: each attribute value points at a local or argument that
+        // lives until CreateProcessW returns; the list is initialised.
         unsafe {
             UpdateProcThreadAttribute(
                 list,
                 0,
                 PROC_THREAD_ATTRIBUTE_HANDLE_LIST as usize,
                 Some(inherit.as_ptr().cast()),
-                std::mem::size_of_val(&inherit),
+                std::mem::size_of_val(inherit),
                 None,
                 None,
             )?;
-            if let Some(security) = &security {
+            if let Some(security) = security {
                 UpdateProcThreadAttribute(
                     list,
                     0,
                     PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES as usize,
                     Some((security as *const SECURITY_CAPABILITIES).cast()),
                     std::mem::size_of::<SECURITY_CAPABILITIES>(),
+                    None,
+                    None,
+                )?;
+            }
+            if mitigate {
+                UpdateProcThreadAttribute(
+                    list,
+                    0,
+                    PROC_THREAD_ATTRIBUTE_MITIGATION_POLICY as usize,
+                    Some((&raw const mitigations).cast()),
+                    std::mem::size_of::<u64>(),
+                    None,
+                    None,
+                )?;
+                UpdateProcThreadAttribute(
+                    list,
+                    0,
+                    PROC_THREAD_ATTRIBUTE_CHILD_PROCESS_POLICY as usize,
+                    Some((&raw const child_policy).cast()),
+                    std::mem::size_of::<u32>(),
                     None,
                     None,
                 )?;
@@ -368,8 +497,8 @@ fn spawn(kind: Kind, sandbox: bool) -> Result<Worker> {
             "\"{}\" {} {} {}",
             exe.display(),
             kind.flag(),
-            child_in.0.0 as usize,
-            child_out.0.0 as usize
+            inherit[0].0 as usize,
+            inherit[1].0 as usize
         );
         let mut cmdline: Vec<u16> = cmdline.encode_utf16().chain([0]).collect();
         let mut pi = PROCESS_INFORMATION::default();
@@ -378,7 +507,7 @@ fn spawn(kind: Kind, sandbox: bool) -> Result<Worker> {
         // two listed handles are inherited.
         unsafe {
             CreateProcessW(
-                &exe_w,
+                exe_w,
                 Some(PWSTR(cmdline.as_mut_ptr())),
                 None,
                 None,
@@ -404,23 +533,7 @@ fn spawn(kind: Kind, sandbox: bool) -> Result<Worker> {
     });
     // SAFETY: the list initialised above, deleted once.
     unsafe { DeleteProcThreadAttributeList(list) };
-    let (job, process) = result?;
-    // The child has its copies; ours would keep the pipes open forever.
-    drop((child_in, child_out));
-
-    let into_file = |h: Owned| {
-        let raw = h.0.0;
-        std::mem::forget(h);
-        // SAFETY: we own the handle and hand it to the File, which closes it.
-        unsafe { File::from_raw_handle(raw) }
-    };
-    Ok(Worker {
-        to_worker: into_file(to_worker),
-        from_worker: into_file(from_worker),
-        _job: job,
-        _process: process,
-        sandboxed: sid.is_some(),
-    })
+    result
 }
 
 /// The worker side: turns the handle values on the command line back into
