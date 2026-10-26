@@ -108,6 +108,7 @@ use crate::look;
 use crate::pattern;
 use crate::proxycmd::ProxyRun;
 use crate::pwcommand;
+use crate::reconnect::{self, Next, Retry};
 use crate::sandbox;
 use crate::scrollmark;
 use crate::serial_port::{Output as SerialOutput, SerialPort};
@@ -170,6 +171,9 @@ const TIMER_RETIRE: usize = 4;
 /// Wakes the login scripts: an `expect` that waited too long, or a pause
 /// that ended.
 const TIMER_SCRIPT: usize = 5;
+/// Checks for SSH panes due to reconnect after a dropped connection.
+const TIMER_RECONNECT: usize = 6;
+const RECONNECT_TICK_MS: u32 = 500;
 /// How long a worker whose connection nothing uses keeps running, so its
 /// last shell's close reaches the server as a clean disconnect.
 const RETIRE_GRACE: Duration = Duration::from_secs(2);
@@ -210,6 +214,7 @@ mod cmd {
     pub const IMPORT: u32 = 107;
     pub const UPLOAD: u32 = 108;
     pub const DOWNLOADS: u32 = 109;
+    pub const AUTO_RECONNECT: u32 = 110;
     pub const ZOOM_IN: u32 = 200;
     pub const ZOOM_OUT: u32 = 201;
     pub const ZOOM_RESET: u32 = 202;
@@ -616,6 +621,8 @@ struct Window {
     /// SSH panes whose connection dropped while tmux ran: the host's
     /// queue key and the session to attach again after the next login.
     reattach: HashMap<PaneId, (String, String)>,
+    /// SSH panes reconnecting after their connection dropped.
+    retries: HashMap<PaneId, Retry>,
     /// Commands decided outside a handler that returns them; the next
     /// redraw runs them.
     queued: Vec<Command>,
@@ -1138,6 +1145,7 @@ fn create_and_run(launch: Launch, theme: Option<String>) -> Result<()> {
                 forwards_view: ForwardsView::default(),
                 tmux: HashMap::new(),
                 reattach: HashMap::new(),
+                retries: HashMap::new(),
                 queued: Vec::new(),
                 desktops: HashMap::new(),
                 passwords: Arc::default(),
@@ -1237,6 +1245,7 @@ fn build_menu() -> Result<HMENU> {
         item(file, cmd::CONNECT, "&Connect to...\tCtrl+Shift+N")?;
         item(file, cmd::RECONNECT, "&Reconnect\tCtrl+Shift+R")?;
         item(file, cmd::DISCONNECT, "&Disconnect")?;
+        item(file, cmd::AUTO_RECONNECT, "Reconnect &automatically")?;
         item(file, cmd::CLOSE_PANE, "Close &pane\tCtrl+Shift+W")?;
         separator(file)?;
         item(file, cmd::UPLOAD, "&Upload files...\tCtrl+Shift+U")?;
@@ -1930,6 +1939,7 @@ impl Window {
     /// Ends whatever the pane is connected to.
     fn end_host(&mut self, id: PaneId) {
         self.scripts.remove(&id);
+        self.retries.remove(&id);
         // tmux on it is over too; a reattach after a dropped connection
         // stays wanted.
         if let Some(mut t) = self.tmux.remove(&id) {
@@ -2953,7 +2963,13 @@ impl Window {
             .profile(&target.alias)
             .map(|p| p.password.clone())
             .unwrap_or_default();
+        let auto_reconnect = self
+            .settings
+            .profile(&target.alias)
+            .and_then(|p| p.auto_reconnect)
+            .unwrap_or(self.settings.auto_reconnect);
         let mut session = SshSession::new(channel, target, env.known_hosts());
+        session.auto_reconnect = auto_reconnect;
         if shared.is_none() {
             // Each jump host logs in in a worker of its own.
             session = session.with_route(&mut || self.new_channel());
@@ -3075,6 +3091,132 @@ impl Window {
         }
     }
 
+    /// SSH pane `id`'s connection dropped, or a reconnect did not get
+    /// through: wait, then try again, or give up after a while.
+    fn schedule_reconnect(&mut self, id: PaneId) {
+        let now = Instant::now();
+        let retry = self.retries.entry(id).or_insert_with(|| Retry::new(now));
+        let text = match retry.schedule(now) {
+            Next::In(wait) => reconnect::waiting_text(wait, retry.attempts()),
+            Next::GiveUp => {
+                let text = reconnect::gave_up_text(retry.down_for(now));
+                self.retries.remove(&id);
+                text
+            }
+        };
+        self.show(id, &text);
+        self.arm_reconnect_timer();
+        self.refresh_chrome();
+    }
+
+    /// Starts SSH pane `id`'s next reconnect attempt now, keeping its log
+    /// file open across it.
+    fn retry_now(&mut self, id: PaneId) {
+        let Some(mut retry) = self.retries.remove(&id) else {
+            return;
+        };
+        retry.begin();
+        let log = self.panes.get_mut(&id).and_then(|p| p.log.writer.take());
+        self.reconnect(id);
+        let Some(p) = self.panes.get_mut(&id) else {
+            return;
+        };
+        if p.log.writer.is_none() {
+            p.log.writer = log;
+        }
+        match &mut p.host {
+            Host::Ssh(s) => {
+                s.set_retrying();
+                self.retries.insert(id, retry);
+            }
+            _ => self.stop_log(id),
+        }
+        self.arm_reconnect_timer();
+        self.refresh_chrome();
+        self.refresh(id);
+    }
+
+    /// The user stopped pane `id` reconnecting (Esc, or Disconnect).
+    fn stop_reconnecting(&mut self, id: PaneId) {
+        if self.retries.remove(&id).is_none() {
+            return;
+        }
+        let effects = match self.panes.get_mut(&id).map(|p| &mut p.host) {
+            Some(Host::Ssh(s)) if s.state() == State::Connecting => s.close(),
+            _ => Vec::new(),
+        };
+        self.apply(id, effects);
+        self.scripts.remove(&id);
+        self.stop_log(id);
+        self.show(
+            id,
+            "\r\n\x1b[0;90m[Stopped reconnecting. Press Enter to reconnect.]\x1b[0m\r\n",
+        );
+        self.arm_reconnect_timer();
+        self.refresh_chrome();
+        self.refresh(id);
+    }
+
+    /// Ticks while a pane waits to reconnect.
+    fn arm_reconnect_timer(&mut self) {
+        let waiting = self.retries.values().any(Retry::waiting);
+        // SAFETY: our window; replaces any earlier timer with this id.
+        unsafe {
+            if waiting {
+                SetTimer(Some(self.hwnd), TIMER_RECONNECT, RECONNECT_TICK_MS, None);
+            } else {
+                let _ = KillTimer(Some(self.hwnd), TIMER_RECONNECT);
+            }
+        }
+    }
+
+    /// Starts the reconnects that are due. Tabs that shared a connection
+    /// go one at a time: the first logs in again and the others then open
+    /// their shells on its new connection.
+    fn on_reconnect_timer(&mut self) {
+        let now = Instant::now();
+        let mut due: Vec<PaneId> = self
+            .retries
+            .iter()
+            .filter(|(_, r)| r.is_due(now))
+            .map(|(id, _)| *id)
+            .collect();
+        due.sort_unstable();
+        for id in due {
+            let Some(Host::Ssh(s)) = self.panes.get(&id).map(|p| &p.host) else {
+                self.retries.remove(&id);
+                continue;
+            };
+            let busy = self.panes.values().any(|o| {
+                o.id != id
+                    && matches!(&o.host, Host::Ssh(t)
+                        if t.state() == State::Connecting && t.target.same_login(&s.target))
+            });
+            if !busy {
+                self.retry_now(id);
+            }
+        }
+        self.arm_reconnect_timer();
+    }
+
+    /// Turns automatic reconnect on or off, for the open sessions too
+    /// (a host's profile can still say otherwise).
+    fn toggle_auto_reconnect(&mut self) {
+        self.settings.auto_reconnect = !self.settings.auto_reconnect;
+        self.save_settings();
+        let global = self.settings.auto_reconnect;
+        for p in self.panes.values_mut() {
+            if let Host::Ssh(s) = &mut p.host {
+                s.auto_reconnect = self
+                    .settings
+                    .profile(&s.target.alias)
+                    .and_then(|p| p.auto_reconnect)
+                    .unwrap_or(global);
+            }
+        }
+        self.update_menu_checks();
+    }
+
     /// Carries out what a pane's SSH session decided.
     fn apply(&mut self, id: PaneId, effects: Vec<Effect>) {
         for effect in effects {
@@ -3152,6 +3294,8 @@ impl Window {
                     self.start_script(id, &alias, false);
                 }
                 Effect::Connected => {
+                    self.retries.remove(&id);
+                    self.arm_reconnect_timer();
                     self.start_log(id);
                     self.sftp_connected(id);
                     self.start_forwards(id);
@@ -3166,12 +3310,17 @@ impl Window {
                     }
                     self.desktop_after_login(id);
                 }
+                Effect::Reconnect => self.schedule_reconnect(id),
                 Effect::Ended => {
                     self.proxy_errors(id);
                     self.scripts.remove(&id);
                     self.pending_desktops.remove(&id);
                     self.tmux_lost(id);
-                    self.stop_log(id);
+                    // A pane that reconnects keeps writing the same log.
+                    if !self.retries.get(&id).is_some_and(Retry::waiting) {
+                        self.retries.remove(&id);
+                        self.stop_log(id);
+                    }
                     self.prune_sftp();
                     self.prune_forwards();
                     self.refresh_chrome();
@@ -3923,8 +4072,21 @@ impl Window {
                 self.apply(id, effects);
                 self.refresh(id);
             }
+            Host::Ssh(session)
+                if session.state() == State::Connecting
+                    && bytes == b"\x1b"
+                    && self.retries.contains_key(&id) =>
+            {
+                self.stop_reconnecting(id);
+            }
             Host::Ssh(session) if session.state() == State::Ended => {
-                if enter {
+                if self.retries.contains_key(&id) {
+                    if enter {
+                        self.retry_now(id);
+                    } else if bytes == b"\x1b" {
+                        self.stop_reconnecting(id);
+                    }
+                } else if enter {
                     self.reconnect(id);
                 }
             }
@@ -4496,7 +4658,12 @@ impl Window {
                             .any(|id| self.panes.get(id).is_some_and(|p| p.bell));
                     TabLabel {
                         title: pane.map(Pane::label).unwrap_or_default(),
-                        health: pane.map_or(Health::Idle, Pane::health),
+                        // A pane waiting to reconnect shows as connecting.
+                        health: if self.retries.contains_key(&t.focus) {
+                            Health::Connecting
+                        } else {
+                            pane.map_or(Health::Idle, Pane::health)
+                        },
                         bell,
                         forwarding: self.forwarding(&views, t.focus),
                         legacy: self.legacy_in_use(t.focus),
@@ -6531,7 +6698,15 @@ impl Window {
             cmd::IMPORT => return Some(Command::ImportSessions),
             cmd::RESTART_SHELL => self.start_shell(pane),
             cmd::CONNECT => self.connect_in_new_tab(pane),
-            cmd::RECONNECT => self.reconnect(self.host_pane(pane)),
+            cmd::RECONNECT => {
+                let pane = self.host_pane(pane);
+                if self.retries.get(&pane).is_some_and(Retry::waiting) {
+                    self.retry_now(pane);
+                } else {
+                    self.reconnect(pane);
+                }
+            }
+            cmd::AUTO_RECONNECT => self.toggle_auto_reconnect(),
             cmd::NEW_TAB => {
                 // A tmux pane's new tab is a new tmux window.
                 if let Some(gateway) = self.panes.get(&pane).and_then(Pane::gateway) {
@@ -6714,6 +6889,10 @@ impl Window {
             cmd::FOLLOW_CD => self.toggle_follow(),
             cmd::DISCONNECT => {
                 let pane = self.host_pane(pane);
+                if self.retries.contains_key(&pane) {
+                    self.stop_reconnecting(pane);
+                    return None;
+                }
                 self.tmux_lost(pane);
                 let effects = match self.panes.get_mut(&pane).map(|p| &mut p.host) {
                     Some(Host::Ssh(session))
@@ -6994,6 +7173,7 @@ impl Window {
                 ),
                 (cmd::FOLLOW_CD, s.follow_directory),
                 (cmd::VERIFY, s.verify_transfers),
+                (cmd::AUTO_RECONNECT, s.auto_reconnect),
                 (cmd::SIDE_RIGHT, s.side_pane_right),
                 (cmd::TAB_STRIP, s.tab_strip),
                 (cmd::TMUX_LAYOUT, own_layout),
@@ -8660,6 +8840,10 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
             }
             WM_TIMER if wparam.0 == TIMER_SCRIPT => {
                 with_window(Window::on_script_timer);
+                LRESULT(0)
+            }
+            WM_TIMER if wparam.0 == TIMER_RECONNECT => {
+                with_window(Window::on_reconnect_timer);
                 LRESULT(0)
             }
             WM_TIMER if wparam.0 == TIMER_RETIRE => {

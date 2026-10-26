@@ -23,6 +23,7 @@ FeroSSH reads `~/.ssh/config` and `~/.ssh/known_hosts` too, and writes only to `
 | `Scrollback 50000` | 10000 | Lines of scrollback per pane, up to 1,000,000. |
 | `Favourite web db1` | | Hosts marked as favourites in the session manager. |
 | `UpdateCheck weekly` | off | Looks for a new release once a week (Help > Check for updates weekly). |
+| `AutoReconnect no` | yes | Whether a dropped SSH connection reconnects on its own (File > Reconnect automatically). |
 
 ## File transfer
 
@@ -61,6 +62,7 @@ Profile web1
 | `Scrollback N` | Lines of scrollback for this host's panes. |
 | `Tmux SESSION` | Attaches to this tmux session after every login. |
 | `TmuxLayout ferossh` or `tmux` | `ferossh` (the default) makes each native pane its own tmux window, so each can have its own font; `tmux` uses tmux's own splits. |
+| `AutoReconnect no` or `yes` | Overrides the global `AutoReconnect` for this host, for example to keep a production host from logging in again by itself. |
 | `LegacyAlgorithms yes` | Also offers older crypto (ECDH on NIST curves, DH groups 14 to 18 with SHA-2, AES-CTR, plain HMAC-SHA-2) for old switches and routers. Still no SHA-1, CBC or DSA. The tab shows an amber ⚠. |
 | `DesktopPort N` | The server's RDP port for Open remote desktop (3389). |
 | `VncPort N` | The server's VNC port (5900). |

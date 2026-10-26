@@ -225,6 +225,15 @@ impl Target {
         })
     }
 
+    /// Whether `other` logs in to the same host, port and user, the same
+    /// way.
+    pub fn same_login(&self, other: &Target) -> bool {
+        self.hostname.eq_ignore_ascii_case(&other.hostname)
+            && self.port == other.port
+            && self.user == other.user
+            && self.route() == other.route()
+    }
+
     /// The way there, for the log and for telling routes apart: the jump
     /// hosts' labels, or the command.
     pub fn route(&self) -> Vec<String> {
@@ -292,6 +301,9 @@ pub enum Effect {
     },
     /// The connection is gone.
     Ended,
+    /// The connection dropped (or a reconnect could not reach the host):
+    /// try again after a pause. [`Effect::Ended`] follows.
+    Reconnect,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -368,6 +380,13 @@ pub struct SshSession {
     typed_password: Option<Zeroizing<String>>,
     /// Where this login is, for checking that the worker asks in turn.
     login: Login,
+    /// Connect again on its own when the connection drops.
+    pub auto_reconnect: bool,
+    /// This session is a reconnect after a drop: failing to reach the
+    /// host tries again too.
+    pub retrying: bool,
+    /// The worker said the connection broke under the open shell.
+    lost: bool,
     /// The jump hosts on the way, first first, each logging in with a
     /// session and a worker of its own.
     hops: Vec<Hop>,
@@ -493,6 +512,9 @@ impl SshSession {
             fetching: None,
             typed_password: None,
             login: Login::default(),
+            auto_reconnect: false,
+            retrying: false,
+            lost: false,
             hops: Vec::new(),
             tunnel: None,
             proxy: None,
@@ -607,6 +629,15 @@ impl SshSession {
         &self.blocked().target.hostname
     }
 
+    /// Marks this login, and its jump hosts', as a reconnect after a
+    /// drop.
+    pub fn set_retrying(&mut self) {
+        self.retrying = true;
+        for h in &mut self.hops {
+            h.session.retrying = true;
+        }
+    }
+
     /// Whether the connection uses one of the opt-in legacy algorithms,
     /// which the tab's badge shows.
     pub fn legacy_in_use(&self) -> bool {
@@ -711,6 +742,8 @@ impl SshSession {
         for effect in effects {
             match effect {
                 Effect::Connected => out.extend(self.next_hop(i)),
+                // Whether to try again is the whole route's call.
+                Effect::Reconnect => {}
                 Effect::Ended => {
                     // No word on its stream is coming any more.
                     if let Some(h) = self.hops.get_mut(i) {
@@ -769,6 +802,13 @@ impl SshSession {
             .hops
             .get(i)
             .is_some_and(|h| h.session.state == State::Blocked);
+        // A reconnect whose jump host is not reachable yet tries again.
+        let unreachable = self.retrying
+            && !blocked
+            && self
+                .hops
+                .get(i)
+                .is_some_and(|h| !h.session.login.host_asked);
         let mut effects = Vec::new();
         // The blocked one stays so, for Replace host key.
         for h in &mut self.hops {
@@ -787,6 +827,9 @@ impl SshSession {
         } else {
             State::Ended
         };
+        if unreachable {
+            effects.push(Effect::Reconnect);
+        }
         effects.push(Effect::Ended);
         effects
     }
@@ -1097,8 +1140,13 @@ impl SshSession {
                 self.exit_code = Some(code);
                 Vec::new()
             }
+            Message::Lost { .. } => {
+                self.lost = self.state == State::Connected;
+                Vec::new()
+            }
             Message::Disconnected { reason, .. } => {
                 self.prompt = None;
+                let was = self.state;
                 let was_blocked = self.state == State::Blocked;
                 self.state = if was_blocked {
                     State::Blocked
@@ -1112,6 +1160,20 @@ impl SshSession {
                 let mut text = sanitize(&reason);
                 if self.jump {
                     text = format!("Jump host {}: {text}", sanitize(&self.target.label()));
+                }
+                // A drop under an open shell, or a reconnect that did not
+                // get as far as the host key (the network or the host is
+                // still down): try again. A login that failed, a host key
+                // that changed or a shell that exited stays ended.
+                let dropped = self.lost && was == State::Connected && self.auto_reconnect;
+                let unreachable =
+                    self.retrying && was == State::Connecting && !self.login.host_asked;
+                if dropped || unreachable {
+                    return vec![
+                        Effect::Show(format!("\r\n{DIM}[{text}]{RESET}\r\n")),
+                        Effect::Reconnect,
+                        Effect::Ended,
+                    ];
                 }
                 if let Some(code) = self.exit_code {
                     text = format!("{text} The shell exited with code {code}.");
@@ -1739,6 +1801,106 @@ mod tests {
         );
     }
 
+    fn connected(s: &mut SshSession) {
+        trusted(s);
+        s.on_worker(Message::Connected {
+            channel: s.channel,
+            kex: "mlkem768x25519-sha256".into(),
+            cipher: "aes256-gcm@openssh.com".into(),
+            host_key: "ssh-ed25519".into(),
+        });
+        assert_eq!(s.state(), State::Connected);
+    }
+
+    fn reconnects(fx: &[Effect]) -> bool {
+        fx.iter().any(|e| matches!(e, Effect::Reconnect))
+    }
+
+    fn gone(s: &mut SshSession, reason: &str) -> Vec<Effect> {
+        s.on_worker(Message::Disconnected {
+            channel: s.channel,
+            reason: reason.into(),
+        })
+    }
+
+    #[test]
+    fn a_dropped_connection_reconnects_and_an_exit_does_not() {
+        let dir = temp("reconnect");
+        let e = env(&dir);
+        let session = |auto: bool| {
+            let mut s = SshSession::new(1, Target::resolve("host", &e).unwrap(), e.known_hosts());
+            s.auto_reconnect = auto;
+            s
+        };
+
+        // Lost under the open shell: reconnect, and say nothing of Enter.
+        let mut s = session(true);
+        connected(&mut s);
+        s.on_worker(Message::Lost { channel: 1 });
+        let fx = gone(&mut s, "Keepalive timeout.");
+        assert!(reconnects(&fx));
+        assert!(matches!(fx[..], [_, Effect::Reconnect, Effect::Ended]));
+        assert!(!shown(&fx).contains("Press Enter"));
+
+        // Turned off: the old "Press Enter".
+        let mut s = session(false);
+        connected(&mut s);
+        s.on_worker(Message::Lost { channel: 1 });
+        let fx = gone(&mut s, "Keepalive timeout.");
+        assert!(!reconnects(&fx));
+        assert!(shown(&fx).contains("Press Enter to reconnect"));
+
+        // The shell exited (exit, logout): no Lost from the worker.
+        let mut s = session(true);
+        connected(&mut s);
+        s.on_worker(Message::ExitStatus {
+            channel: 1,
+            code: 0,
+        });
+        let fx = gone(&mut s, "Connection closed.");
+        assert!(!reconnects(&fx));
+        assert!(shown(&fx).contains("exited with code 0"));
+
+        // A Lost before the shell opened counts for nothing.
+        let mut s = session(true);
+        trusted(&mut s);
+        s.on_worker(Message::Lost { channel: 1 });
+        assert!(!reconnects(&gone(&mut s, "Authentication failed.")));
+
+        // Closed from this side (Disconnect, closing the tab).
+        let mut s = session(true);
+        connected(&mut s);
+        s.close();
+        s.on_worker(Message::Lost { channel: 1 });
+        assert!(!reconnects(&gone(&mut s, "Cancelled.")));
+    }
+
+    #[test]
+    fn a_reconnect_retries_only_while_the_host_is_unreachable() {
+        let dir = temp("retry");
+        let e = env(&dir);
+        let session = || {
+            let mut s = SshSession::new(2, Target::resolve("host", &e).unwrap(), e.known_hosts());
+            s.auto_reconnect = true;
+            s.retrying = true;
+            s
+        };
+        // Refused or timed out before the host key: try again.
+        let mut s = session();
+        s.start(80, 24);
+        let fx = gone(&mut s, "Could not connect to host: refused.");
+        assert!(reconnects(&fx));
+        // The host answered, but the login failed: stop.
+        let mut s = session();
+        trusted(&mut s);
+        assert!(!reconnects(&gone(&mut s, "Permission denied.")));
+        // A first connect (not a reconnect) that fails: stop.
+        let mut s = session();
+        s.retrying = false;
+        s.start(80, 24);
+        assert!(!reconnects(&gone(&mut s, "Timed out connecting to host.")));
+    }
+
     #[test]
     fn resolves_targets() {
         let dir = temp("resolve");
@@ -2271,6 +2433,52 @@ mod tests {
         assert!(shown(&fx).contains("not how a login goes"));
         assert!(sent(&fx).contains(&&Message::Close { channel: 2 }));
         assert_eq!(s.state(), State::Ended);
+    }
+
+    #[test]
+    fn a_route_reconnects_after_a_drop_and_while_a_jump_host_is_down() {
+        let dir = temp("chain-reconnect");
+        let e = jump_env(&dir);
+        // Logged in through both jump hosts, then the route breaks.
+        let mut s = chain(&e);
+        s.auto_reconnect = true;
+        s.start(80, 24);
+        hop_in(&mut s, 2);
+        hop_in(&mut s, 4);
+        hop_in(&mut s, 1);
+        assert_eq!(s.state(), State::Connected);
+        s.on_worker(Message::Lost { channel: 1 });
+        let fx = gone(&mut s, "The connection was lost.");
+        assert!(reconnects(&fx));
+
+        // The reconnect cannot reach the first jump host yet: try again,
+        // once, without "Press Enter".
+        let mut s = chain(&e);
+        s.auto_reconnect = true;
+        s.start(80, 24);
+        s.set_retrying();
+        let fx = s.on_worker(Message::Disconnected {
+            channel: 2,
+            reason: "Timed out connecting to bastion.example.org.".into(),
+        });
+        let n = fx.iter().filter(|f| matches!(f, Effect::Reconnect)).count();
+        assert_eq!(n, 1);
+        assert!(!shown(&fx).contains("Press Enter"));
+        assert_eq!(s.state(), State::Ended);
+
+        // A jump host that refuses the login stops it.
+        let mut s = chain(&e);
+        s.start(80, 24);
+        s.set_retrying();
+        s.on_worker(Message::HostKey {
+            channel: 2,
+            key: ed25519_blob(),
+        });
+        let fx = s.on_worker(Message::Disconnected {
+            channel: 2,
+            reason: "Permission denied.".into(),
+        });
+        assert!(!reconnects(&fx));
     }
 
     #[test]

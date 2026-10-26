@@ -40,7 +40,7 @@ use std::fmt;
 use zeroize::Zeroize;
 
 /// Protocol version carried in every frame. Bump on any wire change.
-pub const PROTOCOL_VERSION: u8 = 10;
+pub const PROTOCOL_VERSION: u8 = 11;
 
 /// Largest frame body accepted, in bytes. Terminal and SFTP data is chunked
 /// below this, so anything larger is a bug or an attack.
@@ -450,6 +450,11 @@ pub enum Message {
     },
     /// The remote command exited.
     ExitStatus { channel: ChannelId, code: u32 },
+    /// The connection broke under this channel's open shell (a network
+    /// drop, a keepalive timeout), rather than the shell exiting or the
+    /// server ending the session: the UI may connect again on its own.
+    /// [`Message::Disconnected`] follows.
+    Lost { channel: ChannelId },
     /// The connection is gone; no more messages for this channel follow.
     Disconnected { channel: ChannelId, reason: String },
 
@@ -566,6 +571,7 @@ impl Message {
             Message::Eof { .. } => 29,
             Message::HostCert { .. } => 30,
             Message::TelnetConnect { .. } => 31,
+            Message::Lost { .. } => 32,
         }
     }
 
@@ -600,6 +606,7 @@ impl Message {
             | Message::Notice { .. }
             | Message::Connected { .. }
             | Message::ExitStatus { .. }
+            | Message::Lost { .. }
             | Message::Disconnected { .. }
             | Message::SftpReady { .. }
             | Message::SftpReply { .. }
@@ -631,6 +638,7 @@ impl Message {
             | Message::Notice { channel, .. }
             | Message::Connected { channel, .. }
             | Message::ExitStatus { channel, .. }
+            | Message::Lost { channel }
             | Message::Disconnected { channel, .. }
             | Message::OpenChannel { channel, .. }
             | Message::SftpOpen { channel, .. }
@@ -890,6 +898,7 @@ pub fn encode(msg: &Message, out: &mut Vec<u8>) -> Result<(), Error> {
         }
         Message::Close { channel }
         | Message::IdentitiesRequest { channel }
+        | Message::Lost { channel }
         | Message::Eof { channel } => w.u32(*channel),
         Message::Connect {
             channel,
@@ -1357,6 +1366,7 @@ fn decode_body(body: &[u8]) -> Result<Message, Error> {
             rows: r.u16()?,
             connect_timeout: r.u32()?,
         },
+        32 => Message::Lost { channel: r.u32()? },
         tag => return Err(Error::Tag(tag)),
     };
     match r.0.len() {
@@ -1680,6 +1690,7 @@ mod tests {
                 channel: 1,
                 code: 130,
             },
+            Message::Lost { channel: 1 },
             Message::Disconnected {
                 channel: 1,
                 reason: "Connection closed".into(),
@@ -1877,7 +1888,7 @@ mod tests {
         let mut tags: Vec<u8> = samples().iter().map(Message::tag).collect();
         tags.sort_unstable();
         tags.dedup();
-        assert_eq!(tags, (0..=31).collect::<Vec<u8>>());
+        assert_eq!(tags, (0..=32).collect::<Vec<u8>>());
     }
 
     #[test]
