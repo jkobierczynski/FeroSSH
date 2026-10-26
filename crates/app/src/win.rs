@@ -34,8 +34,9 @@ use ferossh_render::{
 };
 use ferossh_sftp::{Remote, names};
 use ferossh_term::{
-    Action, Key, LogWriter, Mods, MouseButton, MouseEvent, SelectionKind, Settings as TermSettings,
-    Terminal, WorkingDir, chain, check_link, clipboard_preview, log_file_name,
+    Action, Clock, Key, LogWriter, Mods, MouseButton, MouseEvent, SelectionKind,
+    Settings as TermSettings, Terminal, WorkingDir, chain, check_link, clipboard_preview,
+    log_file_name,
 };
 use windows::Win32::Foundation::E_FAIL;
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, SIZE, WPARAM};
@@ -227,6 +228,7 @@ mod cmd {
     pub const LOG_FOLDER: u32 = 602;
     pub const LOG_VERIFY: u32 = 605;
     pub const SERIAL_BREAK: u32 = 606;
+    pub const LOG_TIMESTAMPS: u32 = 607;
     pub const REPLACE_KEY: u32 = 603;
     pub const VERIFY: u32 = 604;
     pub const TMUX_ATTACH: u32 = 610;
@@ -986,6 +988,16 @@ fn timestamp() -> String {
     format!("{y:04}-{mo:02}-{d:02} {h:02}:{mi:02}:{s:02}")
 }
 
+/// The time for a log line, to the millisecond: `2026-10-26 19:24:49.123`.
+fn log_line_time() -> String {
+    // SAFETY: plain query.
+    let t = unsafe { GetLocalTime() };
+    format!(
+        "{:04}-{:02}-{:02} {:02}:{:02}:{:02}.{:03}",
+        t.wYear, t.wMonth, t.wDay, t.wHour, t.wMinute, t.wSecond, t.wMilliseconds
+    )
+}
+
 fn term_settings(lines: Option<usize>) -> TermSettings {
     lines.map_or_else(TermSettings::default, TermSettings::new)
 }
@@ -1218,6 +1230,7 @@ fn build_menu() -> Result<HMENU> {
         let session = CreatePopupMenu()?;
         item(session, cmd::LOG_TOGGLE, "&Log to file")?;
         item(session, cmd::LOG_RAW, "Log &raw output (keep escape codes)")?;
+        item(session, cmd::LOG_TIMESTAMPS, "&Timestamp each log line")?;
         item(session, cmd::LOG_FOLDER, "Open log &folder")?;
         item(session, cmd::LOG_VERIFY, "C&heck a log for changes...")?;
         separator(session)?;
@@ -3627,8 +3640,14 @@ impl Window {
             }
         });
         let header = format!("FeroSSH log of {label}, started {}", timestamp());
+        let stamps = self
+            .settings
+            .log_timestamps
+            .then_some(log_line_time as Clock);
         let writer = opened.and_then(|(f, chain, path, name)| {
-            Ok((LogWriter::sealed(f, chain, &name, raw, &header)?, path))
+            let mut writer = LogWriter::sealed(f, chain, &name, raw, &header)?;
+            writer.set_timestamps(stamps);
+            Ok((writer, path))
         });
         match writer {
             Ok((writer, path)) => {
@@ -6633,6 +6652,21 @@ impl Window {
                 p.log.raw = !p.log.raw;
                 self.update_menu_checks();
             }
+            cmd::LOG_TIMESTAMPS => {
+                // For every plain log, the open ones too, from the next line.
+                self.settings.log_timestamps = !self.settings.log_timestamps;
+                let stamps = self
+                    .settings
+                    .log_timestamps
+                    .then_some(log_line_time as Clock);
+                for p in self.panes.values_mut() {
+                    if let Some(w) = &mut p.log.writer {
+                        w.set_timestamps(stamps);
+                    }
+                }
+                self.save_settings();
+                self.update_menu_checks();
+            }
             cmd::LOG_FOLDER => return Some(Command::OpenFolder(log_dir())),
             cmd::LOG_VERIFY => return Some(Command::VerifyLog),
             cmd::SERIAL_BREAK => {
@@ -6834,6 +6868,7 @@ impl Window {
                 (cmd::RIGHT_CLICK_PASTE, s.right_click_paste),
                 (cmd::LOG_TOGGLE, log),
                 (cmd::LOG_RAW, raw),
+                (cmd::LOG_TIMESTAMPS, s.log_timestamps),
                 (
                     cmd::SESSIONS,
                     self.side.visible && self.side.view == SideView::Sessions,
