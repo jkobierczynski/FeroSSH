@@ -171,6 +171,18 @@ jobs:
             dist/SHA256SUMS.txt
             dist/BUILD-MANIFEST.json
 
+      # winget manifests for ferossh.exe, to submit to microsoft/winget-pkgs
+      # by hand (see scripts/winget-manifest.ps1). Not part of the release.
+      - name: winget manifests
+        shell: pwsh
+        env:
+          TAG: ${{ github.event_name == 'push' && github.ref_name || 'v0.0.0-dry-run' }}
+        run: pwsh scripts/winget-manifest.ps1 -Version $env:TAG.TrimStart("v") -Sums dist/SHA256SUMS.txt -OutDir winget
+      - uses: actions/upload-artifact@v4
+        with:
+          name: winget-manifests
+          path: winget
+
       - uses: actions/upload-artifact@v4
         if: github.event_name != 'push'
         with:
