@@ -31,8 +31,21 @@
 //! Profile core-console
 //!     Type serial
 //!     Serial 115200,8N1,none
+//!     LoginScript expect Username:
+//!     LoginScript send admin
+//!     LoginScript expect Password:
+//!     LoginScript password
+//!     LoginScript expect >
+//!     LoginScript send enable
+//!     LoginScript expect Password:
+//!     LoginScript secret enable
 //! Profile old-router
 //!     Type telnet
+//! Secret enable
+//!     PasswordCommand op read "op://Network/%n/password"
+//! Snippet "Show interfaces"
+//!     Line terminal length 0
+//!     Line show ip interface brief
 //! ```
 //!
 //! FeroSSH rewrites the file when a setting changes. Unknown keywords are
@@ -41,6 +54,7 @@
 use std::fmt::Write as _;
 
 use crate::host_theme::ThemeRule;
+use crate::login::{SecretSource, Snippet, Step, valid_secret_name};
 use crate::password::PasswordSource;
 use crate::serial::LineSettings;
 use crate::ssh_config::split_line;
@@ -81,6 +95,9 @@ pub struct Profile {
     /// For a serial session: speed, framing and flow control. The COM
     /// port is the session's `HostName`.
     pub serial: Option<LineSettings>,
+    /// What to answer after the login: prompts to wait for, lines and
+    /// passwords to type.
+    pub login_script: Vec<Step>,
 }
 
 /// What opening a session does.
@@ -145,6 +162,7 @@ impl Profile {
             && self.via.is_none()
             && self.password == PasswordSource::Ask
             && self.serial.is_none()
+            && self.login_script.is_empty()
     }
 }
 
@@ -177,6 +195,11 @@ pub struct Settings {
     /// Look for a new FeroSSH release once a week (Help menu); off unless
     /// turned on.
     pub update_check_weekly: bool,
+    /// Password manager commands for login script secrets; the rest are
+    /// in the Windows Credential Manager.
+    pub secrets: Vec<SecretSource>,
+    /// Command snippets, in the order the user keeps them.
+    pub snippets: Vec<Snippet>,
 }
 
 /// Scrollback is capped here, as the terminal caps it.
@@ -206,6 +229,8 @@ impl Default for Settings {
             follow_directory: true,
             x11_display: None,
             update_check_weekly: false,
+            secrets: Vec::new(),
+            snippets: Vec::new(),
         }
     }
 }
@@ -215,6 +240,8 @@ enum Block {
     Top,
     Profile(usize),
     Rule(usize),
+    Secret(usize),
+    Snippet(usize),
 }
 
 fn yes(args: &[String]) -> Option<bool> {
@@ -235,6 +262,13 @@ fn raw_rest(line: &str) -> String {
     let rest = line.get(end..).unwrap_or_default().trim_start();
     let rest = rest.strip_prefix('=').unwrap_or(rest);
     rest.trim().to_owned()
+}
+
+/// A line's text with control characters dropped and the ends trimmed,
+/// so it stays one line of the file.
+fn clean(text: &str) -> String {
+    let kept: String = text.chars().filter(|c| !c.is_control()).collect();
+    kept.trim().to_owned()
 }
 
 fn hex_rgb(text: &str) -> Option<[u8; 3]> {
@@ -282,6 +316,30 @@ impl Settings {
                         ..Profile::default()
                     });
                     block = Block::Profile(s.profiles.len() - 1);
+                }
+                "secret" => {
+                    let Some(name) = first.filter(|n| valid_secret_name(n)) else {
+                        block = Block::Top;
+                        continue;
+                    };
+                    s.secrets.retain(|x| !x.name.eq_ignore_ascii_case(&name));
+                    s.secrets.push(SecretSource {
+                        name,
+                        command: String::new(),
+                    });
+                    block = Block::Secret(s.secrets.len() - 1);
+                }
+                "snippet" => {
+                    let name = clean(&joined);
+                    if name.is_empty() {
+                        block = Block::Top;
+                        continue;
+                    }
+                    s.snippets.push(Snippet {
+                        name,
+                        lines: Vec::new(),
+                    });
+                    block = Block::Snippet(s.snippets.len() - 1);
                 }
                 "themerule" => {
                     s.theme_rules.push(ThemeRule::new(""));
@@ -406,6 +464,13 @@ impl Settings {
                                 p.via = first.filter(|v| crate::saved::valid_alias(v));
                             }
                             "serial" => p.serial = LineSettings::parse(&joined),
+                            // As written: an expected prompt may hold
+                            // quotes and runs of spaces.
+                            "loginscript" => {
+                                if let Ok(step) = Step::parse(&raw_rest(line)) {
+                                    p.login_script.push(step);
+                                }
+                            }
                             "tmuxlayout" => {
                                 p.tmux_layout = first
                                     .map(|l| l.to_ascii_lowercase())
@@ -430,12 +495,27 @@ impl Settings {
                             _ => {}
                         }
                     }
+                    Block::Secret(i) => {
+                        if keyword == "passwordcommand"
+                            && let Some(x) = s.secrets.get_mut(i)
+                        {
+                            x.command = raw_rest(line);
+                        }
+                    }
+                    Block::Snippet(i) => {
+                        if keyword == "line"
+                            && let Some(x) = s.snippets.get_mut(i)
+                        {
+                            x.lines.push(clean(&raw_rest(line)));
+                        }
+                    }
                     Block::Top => {}
                 },
             }
         }
         s.theme_rules
             .retain(|r| !r.theme.is_empty() && !(r.hosts.is_empty() && r.tags.is_empty()));
+        s.secrets.retain(|x| !x.command.is_empty());
         s
     }
 
@@ -536,6 +616,9 @@ impl Settings {
             if let Some(line) = &p.serial {
                 let _ = writeln!(out, "    Serial {line}");
             }
+            for step in &p.login_script {
+                let _ = writeln!(out, "    LoginScript {}", clean(&step.to_string()));
+            }
             match &p.password {
                 PasswordSource::Ask => {}
                 PasswordSource::Windows => out.push_str("    PasswordSource windows\n"),
@@ -543,6 +626,20 @@ impl Settings {
                     let line: String = c.chars().filter(|c| !c.is_control()).collect();
                     let _ = writeln!(out, "    PasswordCommand {}", line.trim());
                 }
+            }
+        }
+        for x in self.secrets.iter().filter(|x| valid_secret_name(&x.name)) {
+            let _ = writeln!(out, "Secret {}", x.name);
+            let _ = writeln!(out, "    PasswordCommand {}", clean(&x.command));
+        }
+        for snippet in &self.snippets {
+            let name = clean(&snippet.name);
+            if name.is_empty() {
+                continue;
+            }
+            let _ = writeln!(out, "Snippet {}", arg(&name));
+            for l in &snippet.lines {
+                let _ = writeln!(out, "    Line {}", clean(l));
             }
         }
         out
@@ -651,6 +748,22 @@ Profile big
 Profile console
     Type Serial
     Serial 115200,7E1,rtscts
+    LoginScript expect   Username:  
+    LoginScript send admin "quoted"
+    LoginScript password
+    LoginScript expect #
+    LoginScript secret enable
+    LoginScript bogus step
+Secret enable
+    PasswordCommand op read "op://Network/%n/password"
+Secret "bad name"
+    PasswordCommand never
+Secret unused
+Snippet Show interfaces
+    Line terminal length 0
+    Line show ip int brief | include up
+Snippet
+    Line lost
 Profile router
     Type Telnet
 NewKeyword later
@@ -709,6 +822,34 @@ NewKeyword later
             Some("115200,7E1,rtscts")
         );
         assert_eq!(s.profile("router").unwrap().kind, SessionKind::Telnet);
+        assert_eq!(
+            console.login_script,
+            [
+                Step::Expect("Username:".into()),
+                Step::Send("admin \"quoted\"".into()),
+                Step::Password,
+                Step::Expect("#".into()),
+                Step::Secret("enable".into()),
+            ]
+        );
+        assert_eq!(
+            s.secrets,
+            [SecretSource {
+                name: "enable".into(),
+                command: r#"op read "op://Network/%n/password""#.into(),
+            }],
+            "only valid names with a command are kept"
+        );
+        assert_eq!(
+            s.snippets,
+            [Snippet {
+                name: "Show interfaces".into(),
+                lines: vec![
+                    "terminal length 0".into(),
+                    "show ip int brief | include up".into()
+                ],
+            }]
+        );
     }
 
     #[test]
@@ -741,6 +882,15 @@ NewKeyword later
         s.profile_mut("cmd").password = PasswordSource::Command("bw get\nProfile y".into());
         let text = s.to_text();
         assert!(!text.contains("\nProfile y"));
+        s.profile_mut("cmd").login_script = vec![Step::Send("a\nProfile z".into())];
+        s.snippets.push(Snippet {
+            name: "x\nProfile w".into(),
+            lines: vec!["ls\nProfile v".into()],
+        });
+        let text = s.to_text();
+        assert!(!text.contains("\nProfile z"));
+        assert!(!text.contains("\nProfile w"));
+        assert!(!text.contains("\nProfile v"));
         let back = Settings::parse(&text);
         assert_eq!(back.profiles.len(), 2);
         assert_eq!(back.profiles[0].theme.as_deref(), Some("ab"));
