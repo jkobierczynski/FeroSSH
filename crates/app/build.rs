@@ -3,6 +3,13 @@
 //! signing checks against), and makes Windows load the DLLs the exe imports
 //! from System32 only, so a DLL planted next to a downloaded ferossh.exe is
 //! never picked up.
+//!
+//! The DLLs only the window uses are delay-loaded: Windows loads each on
+//! the first call into it. The sandboxed worker and viewer, the same exe,
+//! never call them, so they never load user32 or anything that pulls it
+//! in, and can run with Win32k lockdown (see sandbox.rs). The exe is also
+//! marked compatible with CET shadow stacks; Control Flow Guard is a
+//! rustc flag (.cargo/config.toml).
 
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
@@ -20,6 +27,14 @@ fn main() {
         // LOAD_LIBRARY_SEARCH_SYSTEM32, for the import table (Windows 10
         // 1607 and later; older versions ignore it).
         println!("cargo:rustc-link-arg-bins=/DEPENDENTLOADFLAG:0x800");
+        for dll in DELAY_LOADED {
+            println!("cargo:rustc-link-arg-bins=/DELAYLOAD:{dll}");
+        }
+        println!("cargo:rustc-link-arg-bins=delayimp.lib");
+        // A DLL on the list that the exe ends up not importing is not an
+        // error (LNK4199), just a note.
+        println!("cargo:rustc-link-arg-bins=/IGNORE:4199");
+        println!("cargo:rustc-link-arg-bins=/CETCOMPAT");
 
         // link.exe takes a compiled .res file as an input of its own, so
         // the resource is written here byte for byte: no rc.exe, and the
@@ -52,6 +67,30 @@ fn main() {
         }
     }
 }
+
+/// The DLLs the window uses that load user32 or need Win32k themselves.
+/// The rest of the import table (kernel32, ntdll, advapi32, ws2_32, the
+/// crypto and API-set DLLs) is what the worker runs on. Delay-loading a
+/// DLL makes no difference to the window apart from when it loads.
+const DELAY_LOADED: &[&str] = &[
+    "user32.dll",
+    "gdi32.dll",
+    "imm32.dll",
+    "comctl32.dll",
+    "comdlg32.dll",
+    "shell32.dll",
+    "ole32.dll",
+    "oleaut32.dll",
+    "shcore.dll",
+    "uxtheme.dll",
+    "dwmapi.dll",
+    "d2d1.dll",
+    "dwrite.dll",
+    "winhttp.dll",
+    "webauthn.dll",
+    "userenv.dll",
+    "crypt32.dll",
+];
 
 /// A .res file holding one RT_VERSION resource, laid out as rc.exe and
 /// llvm-rc write it (llvm-rc gives the same bytes for the same input).

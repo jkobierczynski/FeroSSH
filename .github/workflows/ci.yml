@@ -47,6 +47,26 @@ jobs:
             Get-Content "check-$exe.txt" | Tee-Object -Append $env:GITHUB_STEP_SUMMARY
             if ($p.ExitCode -ne 0) { throw "$exe.exe --check-sandbox exited with $($p.ExitCode)" }
           }
+      - name: Check the exe's imports, CFG and CET marks
+        shell: pwsh
+        run: |
+          # The sandboxed processes run with Win32k lockdown, so nothing
+          # that needs it may be in the static import table (build.rs
+          # delay-loads it).
+          $dumpbin = & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" `
+            -latest -find 'VC\Tools\MSVC\**\bin\Hostx64\x64\dumpbin.exe' | Select-Object -First 1
+          $ui = 'user32|gdi32|imm32|comctl32|comdlg32|shell32|ole32|oleaut32|shcore|uxtheme|dwmapi|d2d1|dwrite|winhttp|webauthn|userenv|crypt32'
+          foreach ($exe in 'ferossh', 'ferossh-vnc', 'ferossh-desktop') {
+            $deps = & $dumpbin /nologo /dependents "dist/$exe.exe"
+            $static = ($deps -join "`n") -split 'delay load dependencies' | Select-Object -First 1
+            $loaded = $static -split "`n" | Where-Object { $_ -match '^\s+\S+\.dll\s*$' } | ForEach-Object { $_.Trim() }
+            "${exe}.exe loads at start: $($loaded -join ', ')" | Tee-Object -Append $env:GITHUB_STEP_SUMMARY
+            $bad = $loaded | Where-Object { $_ -match "^($ui)\.dll$" }
+            if ($bad) { throw "$exe.exe imports $($bad -join ', ') directly" }
+            $headers = (& $dumpbin /nologo /headers "dist/$exe.exe") -join "`n"
+            if ($headers -notmatch 'Control Flow Guard') { throw "$exe.exe is not built with CFG" }
+            if ($headers -notmatch 'CET compatible') { throw "$exe.exe is not marked CET compatible" }
+          }
       - name: Report exe sizes
         shell: pwsh
         run: |

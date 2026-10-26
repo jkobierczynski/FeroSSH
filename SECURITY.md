@@ -47,8 +47,11 @@ window, lets it start no other process, caps its memory at 1 GiB and
 keeps it away from the clipboard, the desktop and other processes'
 windows. They also start with process mitigations: no dynamic code, no
 legacy extension points, no non-system fonts, mandatory ASLR, strict
-handle checks and DLLs from System32 first. `ferossh.exe --check-sandbox`
-reports what your Windows allows.
+handle checks and DLLs from System32 first. Where Windows allows it they
+also run without Win32k (the kernel's window and graphics calls, a large
+attack surface they never use), with Control Flow Guard enforced, and
+with CET shadow stacks on CPUs that have them. `ferossh.exe
+--check-sandbox` reports what each process really got on your PC.
 
 The window treats both as if an attacker had taken them over:
 

@@ -30,7 +30,8 @@ $cargoHome = [IO.Path]::GetFullPath($cargoHome)
 
 # TOML literal strings, so the backslashes in Windows paths stay as they are.
 $remap = "target.x86_64-pc-windows-msvc.rustflags=['--remap-path-prefix=$root=/ferossh', '--remap-path-prefix=$cargoHome=/cargo']"
-$env:CFLAGS = "/Brepro"
+# /guard:cf: Control Flow Guard for the C code too.
+$env:CFLAGS = "/Brepro /guard:cf"
 
 Push-Location $root
 try {

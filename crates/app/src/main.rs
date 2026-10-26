@@ -201,6 +201,7 @@ fn parse_args(args: &[String]) -> Result<Launch, String> {
 
 #[cfg(windows)]
 fn main() -> windows::core::Result<()> {
+    sandbox::system32_dlls_only();
     let args: Vec<String> = std::env::args_os()
         .skip(1)
         .map(|a| a.to_string_lossy().into_owned())

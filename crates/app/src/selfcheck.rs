@@ -4,13 +4,17 @@
 //! allows (`ferossh.exe --check-sandbox | more`; the exe has no console of
 //! its own).
 //!
-//! The worker must answer the greeting and fail a connection to
-//! 127.0.0.1, which an AppContainer cannot reach, with a reason: that runs
-//! its tokio runtime and sockets under the job and the mitigations. A
-//! VNC viewer must answer a server's version line.
+//! A worker must answer the greeting and fail a connection to 127.0.0.1,
+//! which an AppContainer cannot reach, with a reason: that runs its tokio
+//! runtime and sockets under the job and the mitigations. A second one
+//! looks up a name that does not exist, which runs Windows' name
+//! resolution in the sandbox. A VNC viewer must answer a server's version
+//! line. Each process's mitigations are as Windows reports them.
 //!
-//! Exit code 0: everything ran sandboxed with mitigations; 2: it ran, but
-//! without the mitigations (an older Windows); 1: something failed.
+//! Exit code 0: everything ran sandboxed, with Win32k lockdown, Control
+//! Flow Guard and no dynamic code (CET shadow stacks depend on the CPU, so
+//! they are reported but not required); 2: it ran with less (an older
+//! Windows); 1: something failed.
 
 use std::io::{Read, Write};
 use std::sync::mpsc;
@@ -18,7 +22,7 @@ use std::time::Duration;
 
 use ferossh_ipc::{Decoder, Message, PROTOCOL_VERSION, Timing, encode};
 
-use crate::sandbox::{self, Worker};
+use crate::sandbox::{self, Hardening, Worker};
 
 const WAIT: Duration = Duration::from_secs(30);
 
@@ -49,7 +53,7 @@ fn send(output: &mut std::fs::File, msg: &Message) -> Result<(), String> {
         .map_err(|e| format!("cannot write to the worker: {e}"))
 }
 
-fn check_worker(w: &mut Worker) -> Result<String, String> {
+fn check_worker(w: &mut Worker, host: &str) -> Result<String, String> {
     let rx = messages(w.from_worker.try_clone().map_err(|e| e.to_string())?);
     send(
         &mut w.to_worker,
@@ -66,7 +70,7 @@ fn check_worker(w: &mut Worker) -> Result<String, String> {
         &mut w.to_worker,
         &Message::Connect {
             channel: 1,
-            host: "127.0.0.1".into(),
+            host: host.into(),
             port: 9,
             user: "check".into(),
             cols: 80,
@@ -126,49 +130,81 @@ fn check_viewer(_: &mut Worker) -> Result<(), String> {
     Ok(())
 }
 
-fn describe(w: &Worker) -> &'static str {
-    match (w.sandboxed, w.mitigated) {
-        (true, true) => "AppContainer, job limits and process mitigations",
-        (true, false) => "AppContainer and job limits, WITHOUT process mitigations",
-        _ => "not sandboxed",
+/// What the process runs in, and whether that is everything this check
+/// asks for.
+fn describe(w: &Worker) -> (String, bool) {
+    if !w.sandboxed {
+        return ("not sandboxed".into(), false);
     }
+    let active = w.active();
+    let mut on = Vec::new();
+    let mut off = Vec::new();
+    for (yes, name) in [
+        (active.no_win32k, "Win32k lockdown"),
+        (active.cfg, "Control Flow Guard"),
+        (active.no_dynamic_code, "no dynamic code"),
+    ] {
+        if yes { on.push(name) } else { off.push(name) }
+    }
+    if w.hardening != Hardening::None {
+        on.push("the other process mitigations");
+    }
+    let mut text = format!("AppContainer and job limits, with {}", on.join(", "));
+    if !off.is_empty() {
+        text.push_str(&format!("; WITHOUT {}", off.join(", ")));
+    }
+    text.push_str(if active.shadow_stacks {
+        "; CET shadow stacks on"
+    } else {
+        "; CET shadow stacks off (this CPU or Windows lacks them)"
+    });
+    let strong = w.hardening <= Hardening::NoShadowStacks && off.is_empty();
+    (text, strong)
 }
 
 /// Runs the check, prints what it found and returns the exit code.
 pub fn run() -> i32 {
     let mut report = Vec::new();
     let mut failed = false;
-    let mut mitigated = true;
-    match sandbox::spawn_worker(true) {
-        Ok(mut w) => {
-            mitigated &= w.mitigated;
-            match check_worker(&mut w) {
-                Ok(reason) => report.push(format!(
-                    "SSH worker: runs, in {}. Loopback is blocked as it should be: {reason}",
-                    describe(&w)
-                )),
-                Err(e) => {
-                    report.push(format!("SSH worker: FAILED ({e}), in {}.", describe(&w)));
-                    failed = true;
+    let mut strong = true;
+    let probes = [
+        ("127.0.0.1", "a connection to 127.0.0.1 fails as it should"),
+        (
+            "ferossh-check.invalid",
+            "looking up a name that does not exist fails as it should",
+        ),
+    ];
+    for (i, (host, expected)) in probes.into_iter().enumerate() {
+        match sandbox::spawn_worker(true) {
+            Ok(mut w) => {
+                let (what, full) = describe(&w);
+                strong &= full;
+                match check_worker(&mut w, host) {
+                    Ok(reason) if i == 0 => report.push(format!(
+                        "SSH worker: runs, in {what}.\n  Network: {expected}: {reason}"
+                    )),
+                    Ok(reason) => report.push(format!("  Network: {expected}: {reason}")),
+                    Err(e) => {
+                        report.push(format!("SSH worker: FAILED ({e}), in {what}."));
+                        failed = true;
+                    }
                 }
             }
-        }
-        Err(e) => {
-            report.push(format!("SSH worker: could not start ({})", e.message()));
-            failed = true;
+            Err(e) => {
+                report.push(format!("SSH worker: could not start ({})", e.message()));
+                failed = true;
+            }
         }
     }
     #[cfg(feature = "viewer")]
     match sandbox::spawn_viewer() {
         Ok(mut v) => {
-            mitigated &= v.mitigated;
+            let (what, full) = describe(&v);
+            strong &= full;
             match check_viewer(&mut v) {
-                Ok(()) => report.push(format!("Desktop viewer: runs, in {}.", describe(&v))),
+                Ok(()) => report.push(format!("Desktop viewer: runs, in {what}.")),
                 Err(e) => {
-                    report.push(format!(
-                        "Desktop viewer: FAILED ({e}), in {}.",
-                        describe(&v)
-                    ));
+                    report.push(format!("Desktop viewer: FAILED ({e}), in {what}."));
                     failed = true;
                 }
             }
@@ -185,7 +221,7 @@ pub fn run() -> i32 {
     let _ = out.flush();
     if failed {
         1
-    } else if mitigated {
+    } else if strong {
         0
     } else {
         2
