@@ -254,6 +254,7 @@ mod cmd {
     pub const BROADCAST_TAB: u32 = 730;
     pub const BROADCAST_ALL: u32 = 731;
     pub const BROADCAST_SKIP: u32 = 732;
+    pub const CLOSE_TAB: u32 = 733;
     pub const UPDATE_CHECK: u32 = 900;
     pub const UPDATE_WEEKLY: u32 = 901;
     pub const ABOUT: u32 = 902;
@@ -1314,8 +1315,7 @@ fn build_menu() -> Result<HMENU> {
         }
         separator(window)?;
         item(window, cmd::CLOSE_PANE, "&Close pane\tCtrl+Shift+W")?;
-        // The same as File > Exit: asks first when sessions are open.
-        item(window, cmd::EXIT, "Close &window\tAlt+F4")?;
+        item(window, cmd::CLOSE_TAB, "Clos&e tab\tCtrl+F4")?;
 
         let help = CreatePopupMenu()?;
         item(help, cmd::UPDATE_CHECK, "Check for &updates...")?;
@@ -6215,6 +6215,7 @@ impl Window {
         let pane = self.focused_id();
         match id {
             cmd::EXIT => return Some(Command::Exit),
+            cmd::CLOSE_TAB => return Some(Command::CloseTab(self.ws.active)),
             cmd::HIDE_MENU => return Some(Command::SetMenuVisible(!self.menu_visible)),
             cmd::COPY => return Some(Command::Copy),
             cmd::PASTE => return Some(Command::Paste),
@@ -7130,6 +7131,7 @@ fn shortcut(vk: VIRTUAL_KEY, m: Mods, tabs: bool, split: bool) -> Option<u32> {
             v if v == key(b'R') && m.shift => Some(cmd::RECONNECT),
             v if v == key(b'T') && m.shift => Some(cmd::NEW_TAB),
             v if v == key(b'W') && m.shift => Some(cmd::CLOSE_PANE),
+            VK_F4 if !m.shift => Some(cmd::CLOSE_TAB),
             v if v == key(b'S') && m.shift => Some(cmd::SESSIONS),
             v if v == key(b'E') && m.shift => Some(cmd::FILES),
             v if v == key(b'P') && m.shift => Some(cmd::FORWARDS),
@@ -8474,5 +8476,19 @@ mod tests {
         assert_eq!(side_toggle(true, false, false), SideToggle::Focus);
         assert_eq!(side_toggle(true, true, false), SideToggle::Hide);
         assert_eq!(side_toggle(false, true, false), SideToggle::Show);
+    }
+
+    #[test]
+    fn ctrl_f4_closes_the_tab_even_when_it_is_the_only_one() {
+        let ctrl = Mods {
+            ctrl: true,
+            ..Mods::NONE
+        };
+        assert_eq!(shortcut(VK_F4, ctrl, false, false), Some(cmd::CLOSE_TAB));
+        let alt = Mods {
+            alt: true,
+            ..Mods::NONE
+        };
+        assert_eq!(shortcut(VK_F4, alt, true, true), None);
     }
 }
