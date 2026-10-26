@@ -271,6 +271,8 @@ fn local_remote_dynamic_and_x11_forwards() {
                     forwarder.start(session.connection, target.label(), setup.clone());
                 }
                 Effect::Ended => {}
+                // No password source in these tests.
+                Effect::FetchPassword | Effect::StorePassword(_) => {}
             }
         }
         if session.state() == State::Ended {

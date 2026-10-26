@@ -36,6 +36,7 @@
 use std::fmt::Write as _;
 
 use crate::host_theme::ThemeRule;
+use crate::password::PasswordSource;
 use crate::ssh_config::split_line;
 
 /// How one host's panes look. Unset fields use the theme rules and
@@ -69,6 +70,8 @@ pub struct Profile {
     /// For a desktop session: the SSH host whose connection carries it.
     /// Unset, an RDP session connects straight to the machine.
     pub via: Option<String>,
+    /// Where the login password comes from.
+    pub password: PasswordSource,
 }
 
 /// What opening a session does.
@@ -120,6 +123,7 @@ impl Profile {
             && self.vnc_port.is_none()
             && self.kind == SessionKind::Ssh
             && self.via.is_none()
+            && self.password == PasswordSource::Ask
     }
 }
 
@@ -194,6 +198,18 @@ fn yes(args: &[String]) -> Option<bool> {
         "no" | "off" | "false" => Some(false),
         _ => None,
     }
+}
+
+/// What follows a line's keyword, as written (for a command line, whose
+/// quotes mean something later).
+fn raw_rest(line: &str) -> String {
+    let line = line.trim();
+    let end = line
+        .find(|c: char| c.is_ascii_whitespace() || c == '=')
+        .unwrap_or(line.len());
+    let rest = line.get(end..).unwrap_or_default().trim_start();
+    let rest = rest.strip_prefix('=').unwrap_or(rest);
+    rest.trim().to_owned()
 }
 
 fn hex_rgb(text: &str) -> Option<[u8; 3]> {
@@ -339,6 +355,24 @@ impl Settings {
                                     .and_then(SessionKind::parse)
                                     .unwrap_or_default();
                             }
+                            "passwordsource" => {
+                                p.password = match first.as_deref() {
+                                    Some(v) if v.eq_ignore_ascii_case("windows") => {
+                                        PasswordSource::Windows
+                                    }
+                                    _ => PasswordSource::Ask,
+                                };
+                            }
+                            // The rest of the line as written: quotes group
+                            // the command's arguments.
+                            "passwordcommand" => {
+                                let raw = raw_rest(line);
+                                p.password = if raw.is_empty() {
+                                    PasswordSource::Ask
+                                } else {
+                                    PasswordSource::Command(raw)
+                                };
+                            }
                             "via" => {
                                 p.via = first.filter(|v| crate::saved::valid_alias(v));
                             }
@@ -460,6 +494,14 @@ impl Settings {
             if let Some(v) = &p.via {
                 let _ = writeln!(out, "    Via {}", arg(v));
             }
+            match &p.password {
+                PasswordSource::Ask => {}
+                PasswordSource::Windows => out.push_str("    PasswordSource windows\n"),
+                PasswordSource::Command(c) => {
+                    let line: String = c.chars().filter(|c| !c.is_control()).collect();
+                    let _ = writeln!(out, "    PasswordCommand {}", line.trim());
+                }
+            }
         }
         out
     }
@@ -552,6 +594,7 @@ Profile web
     VncPort 5901
     Type RDP
     Via jump-1
+    PasswordCommand op read "op://Private/web 1/password"
     Unknown thing
 Profile big
     FontSize 400
@@ -562,6 +605,7 @@ Profile big
     DesktopPort 0
     Type telnet
     Via "a b"
+    PasswordSource Windows
 NewKeyword later
 "#;
 
@@ -591,6 +635,10 @@ NewKeyword later
         assert_eq!(web.vnc_port, Some(5901));
         assert_eq!(web.kind, SessionKind::Rdp);
         assert_eq!(web.via.as_deref(), Some("jump-1"));
+        assert_eq!(
+            web.password,
+            PasswordSource::Command(r#"op read "op://Private/web 1/password""#.into())
+        );
         assert_eq!(s.scrollback, Some(50_000));
         assert_eq!(s.download_folder.as_deref(), Some("D:\\My Transfers"));
         assert!(s.verify_transfers);
@@ -606,6 +654,7 @@ NewKeyword later
         assert_eq!(big.desktop_port, None, "port 0 is no port");
         assert_eq!(big.kind, SessionKind::Ssh);
         assert_eq!(big.via, None);
+        assert_eq!(big.password, PasswordSource::Windows);
     }
 
     #[test]
@@ -622,8 +671,11 @@ NewKeyword later
         s.profile_mut("evil\nProfile x").theme = Some("a\"b".into());
         let text = s.to_text();
         assert!(!text.contains("\nProfile x"));
+        s.profile_mut("cmd").password = PasswordSource::Command("bw get\nProfile y".into());
+        let text = s.to_text();
+        assert!(!text.contains("\nProfile y"));
         let back = Settings::parse(&text);
-        assert_eq!(back.profiles.len(), 1);
+        assert_eq!(back.profiles.len(), 2);
         assert_eq!(back.profiles[0].theme.as_deref(), Some("ab"));
     }
 

@@ -19,6 +19,8 @@
 mod clipboard;
 #[cfg(windows)]
 mod conpty;
+#[cfg(windows)]
+mod credman;
 #[cfg(feature = "viewer")]
 #[cfg_attr(not(windows), allow(dead_code))]
 mod desktop;
@@ -47,6 +49,8 @@ mod newkey;
 mod pattern;
 #[cfg(windows)]
 mod putty_reg;
+#[cfg_attr(not(windows), allow(dead_code))]
+mod pwcommand;
 #[cfg(windows)]
 mod sandbox;
 #[cfg_attr(not(windows), allow(dead_code))]

@@ -12,6 +12,7 @@
 //! the session a new name saves an editable copy.
 
 use ferossh_config::forward::parse_option;
+use ferossh_config::password::{PasswordSource, TEMPLATES};
 use ferossh_config::saved::{self, SavedHost};
 use ferossh_config::{Profile, SessionKind, Settings};
 use ferossh_render::{Cell, Color, Flags, Grid, Rgb};
@@ -64,6 +65,31 @@ pub struct Values {
     pub desktop_port: String,
     pub vnc_port: String,
     pub legacy: bool,
+    /// Where the password comes from: see [`PASSWORD_CHOICES`].
+    pub password: usize,
+    /// The password manager command, for a template or a custom one.
+    pub password_command: String,
+}
+
+/// Asking, Windows, the password manager templates, then a command of
+/// one's own.
+const PASSWORD_ASK: usize = 0;
+const PASSWORD_WINDOWS: usize = 1;
+const PASSWORD_CUSTOM: usize = 2 + TEMPLATES.len();
+
+/// The choice for a profile's password source.
+fn password_choice(source: &PasswordSource) -> (usize, String) {
+    match source {
+        PasswordSource::Ask => (PASSWORD_ASK, String::new()),
+        PasswordSource::Windows => (PASSWORD_WINDOWS, String::new()),
+        PasswordSource::Command(c) => {
+            let i = TEMPLATES
+                .iter()
+                .position(|t| t.command == c)
+                .map_or(PASSWORD_CUSTOM, |i| i + 2);
+            (i, c.clone())
+        }
+    }
 }
 
 fn opt_text(v: &Option<impl ToString>) -> String {
@@ -134,6 +160,7 @@ impl Values {
         self.desktop_port = opt_text(&p.desktop_port);
         self.vnc_port = opt_text(&p.vnc_port);
         self.legacy = p.legacy_algorithms;
+        (self.password, self.password_command) = password_choice(&p.password);
         self
     }
 }
@@ -158,6 +185,8 @@ enum Field {
     DesktopPort,
     VncPort,
     Legacy,
+    Password,
+    PasswordCommand,
 }
 
 impl Field {
@@ -181,6 +210,8 @@ impl Field {
             Field::DesktopPort => "RDP port",
             Field::VncPort => "VNC port",
             Field::Legacy => "Old crypto",
+            Field::Password => "Password",
+            Field::PasswordCommand => "Command",
         }
     }
 
@@ -188,7 +219,7 @@ impl Field {
     fn is_choice(self) -> bool {
         matches!(
             self,
-            Field::Type | Field::Theme | Field::TmuxLayout | Field::Legacy
+            Field::Type | Field::Theme | Field::TmuxLayout | Field::Legacy | Field::Password
         )
     }
 }
@@ -342,6 +373,17 @@ impl SessionForm {
                     if !self.field_locked(Field::Key) {
                         out.push(Item::Browse);
                     }
+                    out.push(Item::Field(Field::Password));
+                    match self.values.password {
+                        PASSWORD_ASK => {}
+                        PASSWORD_WINDOWS => {
+                            out.push(Item::Note("Saved after a login that works.".into()));
+                        }
+                        _ => {
+                            out.push(Item::Field(Field::PasswordCommand));
+                            out.push(Item::Note("%n is the session's name.".into()));
+                        }
+                    }
                 }
                 SessionKind::Rdp | SessionKind::Vnc => out.push(Item::Field(Field::Via)),
             }
@@ -427,7 +469,10 @@ impl SessionForm {
             Field::Forward(i) => return v.forwards.get(i),
             Field::DesktopPort => &v.desktop_port,
             Field::VncPort => &v.vnc_port,
-            Field::Type | Field::Theme | Field::TmuxLayout | Field::Legacy => return None,
+            Field::PasswordCommand => &v.password_command,
+            Field::Type | Field::Theme | Field::TmuxLayout | Field::Legacy | Field::Password => {
+                return None;
+            }
         })
     }
 
@@ -448,7 +493,10 @@ impl SessionForm {
             Field::Forward(i) => return v.forwards.get_mut(i),
             Field::DesktopPort => &mut v.desktop_port,
             Field::VncPort => &mut v.vnc_port,
-            Field::Type | Field::Theme | Field::TmuxLayout | Field::Legacy => return None,
+            Field::PasswordCommand => &mut v.password_command,
+            Field::Type | Field::Theme | Field::TmuxLayout | Field::Legacy | Field::Password => {
+                return None;
+            }
         })
     }
 
@@ -470,6 +518,14 @@ impl SessionForm {
             }
             .to_owned(),
             Field::Legacy => if v.legacy { "allowed" } else { "off" }.to_owned(),
+            Field::Password => match v.password {
+                PASSWORD_ASK => "ask every time".to_owned(),
+                PASSWORD_WINDOWS => "Windows Credential Manager".to_owned(),
+                PASSWORD_CUSTOM => "a command of my own".to_owned(),
+                i => TEMPLATES
+                    .get(i - 2)
+                    .map_or_else(String::new, |t| t.name.to_owned()),
+            },
             _ => String::new(),
         }
     }
@@ -507,6 +563,16 @@ impl SessionForm {
                 };
             }
             Field::Legacy => v.legacy = !v.legacy,
+            Field::Password => {
+                v.password = step(v.password, PASSWORD_CUSTOM + 1);
+                // A template fills in its command; a command of one's own
+                // keeps what was typed unless it was a template's.
+                if let Some(t) = v.password.checked_sub(2).and_then(|i| TEMPLATES.get(i)) {
+                    v.password_command = t.command.to_owned();
+                } else if TEMPLATES.iter().any(|t| t.command == v.password_command) {
+                    v.password_command.clear();
+                }
+            }
             _ => {}
         }
     }
@@ -543,7 +609,10 @@ impl SessionForm {
             Field::Forward(_) => "e.g. L 8080 web:80".into(),
             Field::DesktopPort => "3389".into(),
             Field::VncPort => "5900".into(),
-            Field::Type | Field::Theme | Field::TmuxLayout | Field::Legacy => String::new(),
+            Field::PasswordCommand => "program and arguments".into(),
+            Field::Type | Field::Theme | Field::TmuxLayout | Field::Legacy | Field::Password => {
+                String::new()
+            }
         }
     }
 
@@ -658,6 +727,12 @@ impl SessionForm {
         }
         port(&v.desktop_port, "The RDP port")?;
         port(&v.vnc_port, "The VNC port")?;
+        if v.kind == SessionKind::Ssh
+            && v.password > PASSWORD_WINDOWS
+            && v.password_command.trim().is_empty()
+        {
+            return Err("Fill in the password manager's command, or pick another source.".into());
+        }
         Ok(())
     }
 
@@ -1081,6 +1156,13 @@ impl SessionForm {
         p.desktop_port = v.desktop_port.trim().parse().ok().filter(|&p| p != 0);
         p.vnc_port = v.vnc_port.trim().parse().ok().filter(|&p| p != 0);
         p.legacy_algorithms = v.legacy;
+        p.password = match (v.kind, v.password) {
+            (SessionKind::Ssh, PASSWORD_WINDOWS) => PasswordSource::Windows,
+            (SessionKind::Ssh, i) if i > PASSWORD_WINDOWS => {
+                PasswordSource::Command(v.password_command.trim().to_owned())
+            }
+            _ => PasswordSource::Ask,
+        };
         name
     }
 }
@@ -1257,9 +1339,10 @@ mod tests {
         assert!(t[7].contains("22"));
         assert!(t[8].contains("default keys and agent"));
         assert_eq!(t[9].trim(), "Browse…");
-        assert_eq!(t[10], " ▸ Look");
-        assert_eq!(t[11], " ▸ Extras");
-        assert!(t[12].contains("Save") && t[12].contains("Connect") && !t[12].contains("Delete"));
+        assert!(t[10].contains("ask every time"));
+        assert_eq!(t[11], " ▸ Look");
+        assert_eq!(t[12], " ▸ Extras");
+        assert!(t[13].contains("Save") && t[13].contains("Connect") && !t[13].contains("Delete"));
 
         assert_eq!(f.key(SideKey::Enter { split: false }, 30), None);
         assert!(
@@ -1340,8 +1423,8 @@ mod tests {
         let mut f = new_form();
         typed(&mut f, "web2");
         // Open Extras: Name, Folder, Type, Host, User, Port, Key, Browse,
-        // Look, Extras.
-        down(&mut f, 9);
+        // Password, Look, Extras.
+        down(&mut f, 10);
         f.key(SideKey::Enter { split: false }, 30);
         down(&mut f, 3);
         assert_eq!(f.focused_field(), Some(Field::Forward(0)));
@@ -1393,8 +1476,8 @@ mod tests {
         assert_eq!(f.focused_field(), Some(Field::Host));
         typed(&mut f, "x");
         assert_eq!(f.values.host, "web.example.org");
-        // The theme can.
-        down(&mut f, 4);
+        // The theme can: past user, port, key and password to Look.
+        down(&mut f, 5);
         f.key(SideKey::Enter { split: false }, 30);
         f.key(SideKey::Down, 30);
         f.key(SideKey::Right, 30);
@@ -1464,6 +1547,54 @@ mod tests {
         assert!(settings.profile("old").is_none());
         delete("new", &mut hosts, &mut settings);
         assert!(hosts.is_empty() && settings.favourites.is_empty());
+    }
+
+    #[test]
+    fn password_sources_offer_templates() {
+        let mut f = new_form();
+        typed(&mut f, "web3");
+        // Name, Folder, Type, Host, User, Port, Key, Browse, Password.
+        down(&mut f, 8);
+        assert_eq!(f.focused_field(), Some(Field::Password));
+        assert!(texts(&mut f)[10].contains("‹ ask every time ›"));
+        f.key(SideKey::Right, 30);
+        let t = texts(&mut f);
+        assert!(t[10].contains("Windows Credential Manager"));
+        assert!(t[11].contains("Saved after a login that works."));
+        f.key(SideKey::Right, 30);
+        assert!(texts(&mut f)[10].contains("1Password"));
+        assert_eq!(f.values.password_command, TEMPLATES[0].command);
+        let mut settings = Settings::default();
+        assert_eq!(f.check(), Ok(()));
+        f.apply(&mut Vec::new(), &mut settings);
+        assert_eq!(
+            settings.profile("web3").unwrap().password,
+            PasswordSource::Command(TEMPLATES[0].command.into())
+        );
+        // Back to the form: the template is recognised.
+        let v = Values::default().with_profile(settings.profile("web3"));
+        assert_eq!(v.password, 2);
+        // A command of one's own starts empty and must be filled in.
+        for _ in 0..TEMPLATES.len() {
+            f.key(SideKey::Right, 30);
+        }
+        assert_eq!(f.values.password, PASSWORD_CUSTOM);
+        assert!(f.values.password_command.is_empty());
+        assert!(f.check().unwrap_err().contains("command"));
+        f.key(SideKey::Down, 30);
+        typed(&mut f, "pass show ssh/%n");
+        f.apply(&mut Vec::new(), &mut settings);
+        assert_eq!(
+            settings.profile("web3").unwrap().password,
+            PasswordSource::Command("pass show ssh/%n".into())
+        );
+        f.key(SideKey::Up, 30);
+        f.key(SideKey::Right, 30);
+        f.apply(&mut Vec::new(), &mut settings);
+        assert_eq!(
+            settings.profile("web3").unwrap().password,
+            PasswordSource::Ask
+        );
     }
 
     #[test]

@@ -9,6 +9,7 @@ pub mod forward;
 mod host_theme;
 pub mod hostkey;
 pub mod known_hosts;
+pub mod password;
 mod pattern;
 pub mod putty;
 pub mod saved;
@@ -17,5 +18,6 @@ pub mod ssh_config;
 
 pub use forward::{ForwardKind, ForwardSpec};
 pub use host_theme::{HostThemes, ThemeRule};
+pub use password::PasswordSource;
 pub use pattern::{match_host, match_pattern};
 pub use settings::{Profile, SessionKind, Settings};
