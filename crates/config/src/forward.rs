@@ -207,6 +207,66 @@ pub fn parse_option(text: &str) -> Option<ForwardSpec> {
     parse_config(kind, &args)
 }
 
+/// What `-KL [bind:]port` and its `-KR`, `-KD` forms name, as `ssh`'s
+/// `~C` command line takes them to cancel a forward: the kind, the
+/// listening address if given, and the port.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CancelSpec {
+    pub kind: ForwardKind,
+    pub bind: Option<String>,
+    pub port: u16,
+}
+
+impl CancelSpec {
+    /// Whether this names `spec`. Without an address it names the
+    /// forward on that port whatever it listens on; `*` and an empty
+    /// address are the same.
+    pub fn cancels(&self, spec: &ForwardSpec) -> bool {
+        let every = |b: &str| {
+            if b == "*" {
+                String::new()
+            } else {
+                b.to_ascii_lowercase()
+            }
+        };
+        spec.kind == self.kind
+            && spec.port == self.port
+            && match (&self.bind, &spec.bind) {
+                (None, _) => true,
+                (Some(want), Some(have)) => every(want) == every(have),
+                (Some(_), None) => false,
+            }
+    }
+}
+
+/// Parses `-KL 8080`, `-KR 127.0.0.1:9000` or `-KD 1080` (the dash and the
+/// space are optional).
+pub fn parse_cancel(text: &str) -> Option<CancelSpec> {
+    let text = text.trim();
+    let text = text.strip_prefix('-').unwrap_or(text);
+    let mut chars = text.chars();
+    if !chars.next()?.eq_ignore_ascii_case(&'K') {
+        return None;
+    }
+    let kind = match chars.next()?.to_ascii_uppercase() {
+        'L' => ForwardKind::Local,
+        'R' => ForwardKind::Remote,
+        'D' => ForwardKind::Dynamic,
+        _ => return None,
+    };
+    let f = fields(chars.as_str().trim())?;
+    let (bind, listen) = match &f[..] {
+        [p] => (None, p),
+        [b, p] => (Some(bind_field(b)?), p),
+        _ => return None,
+    };
+    Some(CancelSpec {
+        kind,
+        bind,
+        port: port(listen)?,
+    })
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
@@ -254,6 +314,39 @@ mod tests {
         ] {
             assert_eq!(parse_config(kind, &args(text)), None, "{text}");
         }
+    }
+
+    #[test]
+    fn parses_cancels_and_matches_forwards() {
+        let c = parse_cancel("-KL 8080").unwrap();
+        assert_eq!(
+            (c.kind, c.bind.as_deref(), c.port),
+            (ForwardKind::Local, None, 8080)
+        );
+        let c = parse_cancel("KR127.0.0.1:9000").unwrap();
+        assert_eq!(c.bind.as_deref(), Some("127.0.0.1"));
+        assert_eq!(
+            parse_cancel("-kd [::1]:1080").unwrap().bind.as_deref(),
+            Some("::1")
+        );
+        for bad in [
+            "-K",
+            "-KX 80",
+            "-KL",
+            "-KL x",
+            "-KL 8080:h:80",
+            "-L 8080:h:80",
+        ] {
+            assert_eq!(parse_cancel(bad), None, "{bad}");
+        }
+        let l = parse_option("-L 8080:db:5432").unwrap();
+        let star = parse_option("-L *:8080:db:5432").unwrap();
+        assert!(parse_cancel("-KL 8080").unwrap().cancels(&l));
+        assert!(parse_cancel("-KL 8080").unwrap().cancels(&star));
+        assert!(parse_cancel("-KL :8080").unwrap().cancels(&star));
+        assert!(!parse_cancel("-KL 127.0.0.1:8080").unwrap().cancels(&l));
+        assert!(!parse_cancel("-KR 8080").unwrap().cancels(&l));
+        assert!(!parse_cancel("-KL 8081").unwrap().cancels(&l));
     }
 
     #[test]
