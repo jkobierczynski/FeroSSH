@@ -762,3 +762,151 @@ async fn transfers_files_over_sftp() {
     }
     assert!(String::from_utf8_lossy(&out).contains("still42"));
 }
+
+/// Whether `lrzsz` is installed, for the ZMODEM test.
+#[cfg(unix)]
+fn have_lrzsz() -> bool {
+    let found = Command::new("sz")
+        .arg("--version")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok();
+    if !found {
+        assert!(
+            std::env::var_os("FEROSSH_REQUIRE_LRZSZ").is_none(),
+            "FEROSSH_REQUIRE_LRZSZ is set but sz is missing"
+        );
+        eprintln!("lrzsz not found; skipping");
+    }
+    found
+}
+
+/// ZMODEM in the shell: `sz` sends a file to the UI, `rz` takes one from
+/// it, and the shell carries on after both.
+#[cfg(unix)]
+#[tokio::test]
+async fn transfers_files_with_zmodem() {
+    use ferossh_ipc::{ZmodemAnswer, ZmodemUpload};
+    if !available() || !have_lrzsz() {
+        return;
+    }
+    let server = start("zmodem", "");
+    let (to_worker, mut from_worker) = login(&server).await;
+    let dir = server.dir.join("zm");
+    std::fs::create_dir_all(&dir).unwrap();
+    // Every byte value, ZDLE runs, CR after @.
+    let data: Vec<u8> = (0..500_000u32)
+        .map(|i| match i % 1000 {
+            0..=3 => 0x18,
+            4 => b'@',
+            5 => b'\r',
+            _ => (i.wrapping_mul(2_654_435_761) >> 13) as u8,
+        })
+        .collect();
+    std::fs::write(dir.join("down.bin"), &data).unwrap();
+    let send = |text: String| {
+        let to_worker = to_worker.clone();
+        async move {
+            to_worker
+                .send(Message::Data {
+                    channel: 1,
+                    bytes: text.into_bytes(),
+                })
+                .await
+                .unwrap();
+        }
+    };
+    send(format!("cd '{}' && sz down.bin\n", dir.display())).await;
+
+    let up: Vec<u8> = data.iter().rev().copied().collect();
+    let mut received = Vec::new();
+    let mut ends = 0;
+    let mut shown = Vec::new();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    while ends < 2 {
+        let msg = tokio::time::timeout_at(deadline, from_worker.recv())
+            .await
+            .expect("timed out")
+            .expect("worker hung up");
+        let reply = match msg {
+            Message::Data { bytes, .. } => {
+                shown.extend(bytes);
+                continue;
+            }
+            Message::ZmodemStart { channel, upload } => Message::ZmodemAnswer {
+                channel,
+                answer: if upload {
+                    ZmodemAnswer::Send(vec![ZmodemUpload {
+                        name: b"up.bin".to_vec(),
+                        size: up.len() as u64,
+                        mtime: 1_700_000_000,
+                    }])
+                } else {
+                    ZmodemAnswer::Receive
+                },
+            },
+            Message::ZmodemFile {
+                channel,
+                name,
+                size,
+            } => {
+                assert_eq!(name, b"down.bin");
+                assert_eq!(size, Some(data.len() as u64));
+                Message::ZmodemFileAnswer {
+                    channel,
+                    accept: true,
+                }
+            }
+            Message::ZmodemData { bytes, .. } => {
+                received.extend(bytes);
+                continue;
+            }
+            Message::ZmodemRead {
+                channel,
+                file,
+                offset,
+                len,
+            } => {
+                assert_eq!(file, 0);
+                let start = offset as usize;
+                let end = (start + len as usize).min(up.len());
+                Message::ZmodemChunk {
+                    channel,
+                    offset,
+                    bytes: up[start..end].to_vec(),
+                }
+            }
+            Message::ZmodemFileDone { skipped, .. } => {
+                assert!(!skipped);
+                continue;
+            }
+            Message::ZmodemEnd { error, .. } => {
+                assert_eq!(error, "", "transfer failed");
+                ends += 1;
+                if ends == 1 {
+                    assert!(received == data, "received {} bytes", received.len());
+                    send("rz\n".into()).await;
+                }
+                continue;
+            }
+            Message::Disconnected { reason, .. } => panic!("shell ended: {reason}"),
+            _ => continue,
+        };
+        to_worker.send(reply).await.unwrap();
+    }
+    // rz writes the file when it exits, after the transfer is over.
+    send("echo zm$((40+2)); exit\n".into()).await;
+    loop {
+        match from_worker.recv().await.unwrap() {
+            Message::Data { channel: 1, bytes } => shown.extend(bytes),
+            Message::Disconnected { channel: 1, .. } => break,
+            _ => {}
+        }
+    }
+    let shown = String::from_utf8_lossy(&shown);
+    assert!(shown.contains("zm42"), "{shown}");
+    // None of the transfer reached the terminal.
+    assert!(!shown.contains("B0100"), "{shown}");
+    assert!(std::fs::read(dir.join("up.bin")).unwrap() == up);
+}

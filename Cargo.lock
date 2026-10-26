@@ -979,10 +979,15 @@ dependencies = [
  "ferossh-render",
  "ferossh-sftp",
  "ferossh-term",
+ "ferossh-zmodem",
  "getrandom 0.4.3",
  "russh",
  "tokio",
 ]
+
+[[package]]
+name = "ferossh-zmodem"
+version = "0.1.0"
 
 [[package]]
 name = "ff"

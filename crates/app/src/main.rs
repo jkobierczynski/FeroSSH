@@ -90,6 +90,8 @@ mod tmux_e2e;
 mod update;
 #[cfg(windows)]
 mod win;
+#[cfg_attr(not(windows), allow(dead_code))]
+mod zmodem;
 
 /// What the command line asks for.
 #[cfg_attr(not(windows), allow(dead_code))]

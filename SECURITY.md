@@ -66,7 +66,7 @@ The window treats both as if an attacker had taken them over:
   shown.
 
 The parsers for untrusted input (the IPC decoders, the terminal, SFTP,
-SOCKS and X11, tmux control mode, VNC and RDP, key files, sign requests,
+ZMODEM, SOCKS and X11, tmux control mode, VNC and RDP, key files, sign requests,
 `ssh_config`, `known_hosts` and session imports) are fuzzed: briefly on
 every pull request, and for longer every week.
 

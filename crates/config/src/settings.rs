@@ -8,6 +8,7 @@
 //! SidePane right
 //! DownloadFolder "D:\Transfers"
 //! VerifyTransfers yes
+//! ZModem yes
 //! Favourite web
 //! ThemeRule
 //!     Hosts prod-* *.prod.example.com
@@ -187,6 +188,9 @@ pub struct Settings {
     pub verify_transfers: bool,
     /// Files transferred at once.
     pub parallel_transfers: Option<usize>,
+    /// Answer `rz` and `sz` in the terminal with ZMODEM; off unless turned
+    /// on, so their output shows as it is.
+    pub zmodem: bool,
     /// The file view follows the shell's working directory (OSC 7).
     pub follow_directory: bool,
     /// The X server forwarded X11 goes to (`DISPLAY` syntax); the `DISPLAY`
@@ -226,6 +230,7 @@ impl Default for Settings {
             download_folder: None,
             verify_transfers: false,
             parallel_transfers: None,
+            zmodem: false,
             follow_directory: true,
             x11_display: None,
             update_check_weekly: false,
@@ -382,6 +387,10 @@ impl Settings {
                     s.parallel_transfers = first
                         .and_then(|v| v.parse::<usize>().ok())
                         .map(|n| n.clamp(1, 8));
+                }
+                "zmodem" => {
+                    block = Block::Top;
+                    s.zmodem = yes(&args).unwrap_or(false);
                 }
                 "followdirectory" => {
                     block = Block::Top;
@@ -556,6 +565,7 @@ impl Settings {
         if let Some(n) = self.parallel_transfers {
             let _ = writeln!(out, "ParallelTransfers {n}");
         }
+        let _ = writeln!(out, "ZModem {}", flag(self.zmodem));
         let _ = writeln!(out, "FollowDirectory {}", flag(self.follow_directory));
         if let Some(d) = &self.x11_display {
             let _ = writeln!(out, "X11Display {}", arg(d));
@@ -709,6 +719,7 @@ TabStrip no
 Scrollback 50000
 DownloadFolder "D:\My Transfers"
 VerifyTransfers yes
+ZModem yes
 ParallelTransfers 20
 FollowDirectory no
 X11Display 192.168.1.5:0.0
@@ -801,6 +812,8 @@ NewKeyword later
         );
         assert_eq!(s.scrollback, Some(50_000));
         assert_eq!(s.download_folder.as_deref(), Some("D:\\My Transfers"));
+        assert!(s.zmodem);
+        assert!(!Settings::default().zmodem);
         assert!(s.verify_transfers);
         assert_eq!(s.parallel_transfers, Some(8));
         assert!(!s.follow_directory);

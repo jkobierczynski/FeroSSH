@@ -15,6 +15,7 @@ getrandom = "0.4"
 ferossh-render.workspace = true
 ferossh-sftp.workspace = true
 ferossh-term.workspace = true
+ferossh-zmodem.workspace = true
 russh.workspace = true
 tokio = { version = "1.54", features = ["rt", "net", "time", "sync", "macros"] }
 

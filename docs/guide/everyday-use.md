@@ -23,6 +23,8 @@ Ctrl+Shift+E shows the focused pane's host over SFTP in the side pane, on the sa
 
 Files are never overwritten without asking, and file names Windows cannot hold are made safe or refused. Session > Verify transfers compares SHA-256 sums on both ends after each file.
 
+On a host without SFTP, such as a console server or a Telnet device, you can use ZMODEM instead. Turn on Session > ZMODEM: answer rz and sz once. Then run `sz file` on the server to receive a file into your download folder, or `rz` to pick files to send. Progress shows in the pane, and Ctrl+C cancels.
+
 ## Port forwards
 
 `LocalForward`, `RemoteForward` and `DynamicForward` in your ssh_config start when you log in. View > Port forwards (Ctrl+Shift+P) lists them and adds new ones: type `-L 8080:db.internal:5432`, `-R 9000:localhost:3000` or `-D 1080` and press Enter. A dynamic forward is a SOCKS 4, 4a and 5 proxy. A tab whose connection forwards shows `⇄`, in amber when the server can reach back into your PC.

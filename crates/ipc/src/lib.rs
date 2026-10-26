@@ -24,6 +24,12 @@
 //! their replies, because the worker cannot open files. Paths and names are
 //! bytes, as the server sends them: a name need not be UTF-8.
 //!
+//! ZMODEM (`rz` and `sz` on the server) runs inside a shell's channel: the
+//! worker spots a transfer's start in the output, holds the output back
+//! and asks the UI ([`Message::ZmodemStart`]), which turns it down, or
+//! names the files to send, or takes the files the server sends. As with
+//! SFTP, file contents cross the pipe; the worker opens no file.
+//!
 //! Port forwards are streams: one channel per forwarded TCP connection,
 //! carrying [`Message::Data`], [`Message::Eof`] and [`Message::Close`]. The
 //! UI holds the sockets (the AppContainer cannot use loopback), the worker
@@ -40,7 +46,7 @@ use std::fmt;
 use zeroize::Zeroize;
 
 /// Protocol version carried in every frame. Bump on any wire change.
-pub const PROTOCOL_VERSION: u8 = 9;
+pub const PROTOCOL_VERSION: u8 = 10;
 
 /// Largest frame body accepted, in bytes. Terminal and SFTP data is chunked
 /// below this, so anything larger is a bug or an attack.
@@ -309,6 +315,29 @@ pub mod sftp_code {
     pub const GONE: u32 = 1002;
 }
 
+/// The UI's answer to [`Message::ZmodemStart`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ZmodemAnswer {
+    /// ZMODEM is turned off: show the output as it came.
+    Off,
+    /// Stop the server's `rz` or `sz`.
+    Decline,
+    /// Take the files the server's `sz` sends.
+    Receive,
+    /// Send these files to the server's `rz`, in this order.
+    Send(Vec<ZmodemUpload>),
+}
+
+/// A file the UI sends with ZMODEM.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ZmodemUpload {
+    /// The name the server sees, without a folder.
+    pub name: Vec<u8>,
+    pub size: u64,
+    /// Seconds since the Unix epoch.
+    pub mtime: u64,
+}
+
 /// A message on the UI/worker pipe.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Message {
@@ -519,6 +548,53 @@ pub enum Message {
     Window { channel: ChannelId, bytes: u32 },
     /// Either side: no more data in this direction on the stream.
     Eof { channel: ChannelId },
+
+    // ZMODEM, inside a shell's channel.
+    /// Worker to UI: the server started `rz` (`upload`: it waits for
+    /// files) or `sz`. Output stops until the UI's
+    /// [`Message::ZmodemAnswer`], and after that until the transfer ends.
+    ZmodemStart { channel: ChannelId, upload: bool },
+    /// Worker to UI: the server's `sz` offers a file; the UI answers with
+    /// [`Message::ZmodemFileAnswer`]. `name` is the server's and may hold
+    /// a path.
+    ZmodemFile {
+        channel: ChannelId,
+        name: Vec<u8>,
+        size: Option<u64>,
+    },
+    /// Worker to UI: the next bytes of the file being received.
+    ZmodemData { channel: ChannelId, bytes: Vec<u8> },
+    /// Worker to UI: up to `len` bytes of upload `file` (an index into the
+    /// answer's list) from `offset`, for [`Message::ZmodemChunk`].
+    ZmodemRead {
+        channel: ChannelId,
+        file: u32,
+        offset: u64,
+        len: u32,
+    },
+    /// Worker to UI: the current file is done; `skipped` when the server's
+    /// `rz` did not want it.
+    ZmodemFileDone { channel: ChannelId, skipped: bool },
+    /// Worker to UI: the transfer is over and output flows again; `error`
+    /// says why it failed, empty when it did not.
+    ZmodemEnd { channel: ChannelId, error: String },
+    /// UI to worker: what to do about the [`Message::ZmodemStart`].
+    ZmodemAnswer {
+        channel: ChannelId,
+        answer: ZmodemAnswer,
+    },
+    /// UI to worker: take, or skip, the file in the last
+    /// [`Message::ZmodemFile`].
+    ZmodemFileAnswer { channel: ChannelId, accept: bool },
+    /// UI to worker: the bytes a [`Message::ZmodemRead`] asked for; empty
+    /// when the file could not be read.
+    ZmodemChunk {
+        channel: ChannelId,
+        offset: u64,
+        bytes: Vec<u8>,
+    },
+    /// UI to worker: the user stopped the transfer.
+    ZmodemCancel { channel: ChannelId },
 }
 
 impl Message {
@@ -556,6 +632,16 @@ impl Message {
             Message::Eof { .. } => 29,
             Message::HostCert { .. } => 30,
             Message::TelnetConnect { .. } => 31,
+            Message::ZmodemStart { .. } => 40,
+            Message::ZmodemFile { .. } => 41,
+            Message::ZmodemData { .. } => 42,
+            Message::ZmodemRead { .. } => 43,
+            Message::ZmodemFileDone { .. } => 44,
+            Message::ZmodemEnd { .. } => 45,
+            Message::ZmodemAnswer { .. } => 46,
+            Message::ZmodemFileAnswer { .. } => 47,
+            Message::ZmodemChunk { .. } => 48,
+            Message::ZmodemCancel { .. } => 49,
         }
     }
 
@@ -580,7 +666,11 @@ impl Message {
             | Message::SftpOpen { .. }
             | Message::SftpRequest { .. }
             | Message::ForwardOpen { .. }
-            | Message::RemoteForward { .. } => Side::Ui,
+            | Message::RemoteForward { .. }
+            | Message::ZmodemAnswer { .. }
+            | Message::ZmodemFileAnswer { .. }
+            | Message::ZmodemChunk { .. }
+            | Message::ZmodemCancel { .. } => Side::Ui,
             Message::HostKey { .. }
             | Message::HostCert { .. }
             | Message::Banner { .. }
@@ -595,7 +685,13 @@ impl Message {
             | Message::SftpReply { .. }
             | Message::ForwardOpened { .. }
             | Message::ForwardListening { .. }
-            | Message::ForwardIncoming { .. } => Side::Worker,
+            | Message::ForwardIncoming { .. }
+            | Message::ZmodemStart { .. }
+            | Message::ZmodemFile { .. }
+            | Message::ZmodemData { .. }
+            | Message::ZmodemRead { .. }
+            | Message::ZmodemFileDone { .. }
+            | Message::ZmodemEnd { .. } => Side::Worker,
         }
     }
 
@@ -633,7 +729,17 @@ impl Message {
             | Message::ForwardListening { channel, .. }
             | Message::ForwardIncoming { channel, .. }
             | Message::Window { channel, .. }
-            | Message::Eof { channel } => *channel,
+            | Message::Eof { channel }
+            | Message::ZmodemStart { channel, .. }
+            | Message::ZmodemFile { channel, .. }
+            | Message::ZmodemData { channel, .. }
+            | Message::ZmodemRead { channel, .. }
+            | Message::ZmodemFileDone { channel, .. }
+            | Message::ZmodemEnd { channel, .. }
+            | Message::ZmodemAnswer { channel, .. }
+            | Message::ZmodemFileAnswer { channel, .. }
+            | Message::ZmodemChunk { channel, .. }
+            | Message::ZmodemCancel { channel } => *channel,
         })
     }
 }
@@ -880,7 +986,8 @@ pub fn encode(msg: &Message, out: &mut Vec<u8>) -> Result<(), Error> {
         }
         Message::Close { channel }
         | Message::IdentitiesRequest { channel }
-        | Message::Eof { channel } => w.u32(*channel),
+        | Message::Eof { channel }
+        | Message::ZmodemCancel { channel } => w.u32(*channel),
         Message::Connect {
             channel,
             host,
@@ -1101,6 +1208,74 @@ pub fn encode(msg: &Message, out: &mut Vec<u8>) -> Result<(), Error> {
         Message::Window { channel, bytes } => {
             w.u32(*channel);
             w.u32(*bytes);
+        }
+        Message::ZmodemStart {
+            channel,
+            upload: flag,
+        }
+        | Message::ZmodemFileDone {
+            channel,
+            skipped: flag,
+        }
+        | Message::ZmodemFileAnswer {
+            channel,
+            accept: flag,
+        } => {
+            w.u32(*channel);
+            w.bool(*flag);
+        }
+        Message::ZmodemFile {
+            channel,
+            name,
+            size,
+        } => {
+            w.u32(*channel);
+            w.bytes(name);
+            w.opt(*size, Writer::u64);
+        }
+        Message::ZmodemData { channel, bytes } => {
+            w.u32(*channel);
+            w.bytes(bytes);
+        }
+        Message::ZmodemRead {
+            channel,
+            file,
+            offset,
+            len,
+        } => {
+            w.u32(*channel);
+            w.u32(*file);
+            w.u64(*offset);
+            w.u32(*len);
+        }
+        Message::ZmodemEnd { channel, error } => {
+            w.u32(*channel);
+            w.str(error);
+        }
+        Message::ZmodemAnswer { channel, answer } => {
+            w.u32(*channel);
+            match answer {
+                ZmodemAnswer::Off => w.u8(0),
+                ZmodemAnswer::Decline => w.u8(1),
+                ZmodemAnswer::Receive => w.u8(2),
+                ZmodemAnswer::Send(files) => {
+                    w.u8(3);
+                    w.list(files, |w, f| {
+                        w.bytes(&f.name);
+                        w.u64(f.size);
+                        w.u64(f.mtime);
+                    });
+                }
+            }
+        }
+        Message::ZmodemChunk {
+            channel,
+            offset,
+            bytes,
+        } => {
+            w.u32(*channel);
+            w.u64(*offset);
+            w.bytes(bytes);
         }
     }
     let mut body = w.0;
@@ -1341,6 +1516,59 @@ fn decode_body(body: &[u8]) -> Result<Message, Error> {
             rows: r.u16()?,
             connect_timeout: r.u32()?,
         },
+        40 => Message::ZmodemStart {
+            channel: r.u32()?,
+            upload: r.bool()?,
+        },
+        41 => Message::ZmodemFile {
+            channel: r.u32()?,
+            name: r.bytes()?.to_vec(),
+            size: r.opt(Reader::u64)?,
+        },
+        42 => Message::ZmodemData {
+            channel: r.u32()?,
+            bytes: r.bytes()?.to_vec(),
+        },
+        43 => Message::ZmodemRead {
+            channel: r.u32()?,
+            file: r.u32()?,
+            offset: r.u64()?,
+            len: r.u32()?,
+        },
+        44 => Message::ZmodemFileDone {
+            channel: r.u32()?,
+            skipped: r.bool()?,
+        },
+        45 => Message::ZmodemEnd {
+            channel: r.u32()?,
+            error: r.string()?,
+        },
+        46 => Message::ZmodemAnswer {
+            channel: r.u32()?,
+            answer: match r.u8()? {
+                0 => ZmodemAnswer::Off,
+                1 => ZmodemAnswer::Decline,
+                2 => ZmodemAnswer::Receive,
+                3 => ZmodemAnswer::Send(r.list(|r| {
+                    Ok(ZmodemUpload {
+                        name: r.bytes()?.to_vec(),
+                        size: r.u64()?,
+                        mtime: r.u64()?,
+                    })
+                })?),
+                _ => return Err(Error::Invalid),
+            },
+        },
+        47 => Message::ZmodemFileAnswer {
+            channel: r.u32()?,
+            accept: r.bool()?,
+        },
+        48 => Message::ZmodemChunk {
+            channel: r.u32()?,
+            offset: r.u64()?,
+            bytes: r.bytes()?.to_vec(),
+        },
+        49 => Message::ZmodemCancel { channel: r.u32()? },
         tag => return Err(Error::Tag(tag)),
     };
     match r.0.len() {
@@ -1724,6 +1952,68 @@ mod tests {
                 channel: 5,
                 home: b"/home/j\xfcrgen".to_vec(),
             },
+            Message::ZmodemStart {
+                channel: 3,
+                upload: true,
+            },
+            Message::ZmodemFile {
+                channel: 3,
+                name: b"dir/r\xe9sum\xe9.pdf".to_vec(),
+                size: Some(1 << 33),
+            },
+            Message::ZmodemFile {
+                channel: 3,
+                name: b"x".to_vec(),
+                size: None,
+            },
+            Message::ZmodemData {
+                channel: 3,
+                bytes: vec![0x18; 9],
+            },
+            Message::ZmodemRead {
+                channel: 3,
+                file: 2,
+                offset: 1 << 31,
+                len: 32768,
+            },
+            Message::ZmodemFileDone {
+                channel: 3,
+                skipped: false,
+            },
+            Message::ZmodemEnd {
+                channel: 3,
+                error: String::new(),
+            },
+            Message::ZmodemAnswer {
+                channel: 3,
+                answer: ZmodemAnswer::Off,
+            },
+            Message::ZmodemAnswer {
+                channel: 3,
+                answer: ZmodemAnswer::Decline,
+            },
+            Message::ZmodemAnswer {
+                channel: 3,
+                answer: ZmodemAnswer::Receive,
+            },
+            Message::ZmodemAnswer {
+                channel: 3,
+                answer: ZmodemAnswer::Send(vec![ZmodemUpload {
+                    name: b"notes.txt".to_vec(),
+                    size: 12,
+                    mtime: 1_700_000_000,
+                }]),
+            },
+            Message::ZmodemFileAnswer {
+                channel: 3,
+                accept: true,
+            },
+            Message::ZmodemChunk {
+                channel: 3,
+                offset: 7,
+                bytes: b"chunk".to_vec(),
+            },
+            Message::ZmodemCancel { channel: 3 },
         ];
         let ops = [
             SftpOp::RealPath {
@@ -1857,7 +2147,9 @@ mod tests {
         let mut tags: Vec<u8> = samples().iter().map(Message::tag).collect();
         tags.sort_unstable();
         tags.dedup();
-        assert_eq!(tags, (0..=31).collect::<Vec<u8>>());
+        // ZMODEM starts at 40, leaving room below.
+        let want: Vec<u8> = (0..=31).chain(40..=49).collect();
+        assert_eq!(tags, want);
     }
 
     #[test]

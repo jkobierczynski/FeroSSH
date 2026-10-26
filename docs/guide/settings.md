@@ -31,6 +31,7 @@ FeroSSH reads `~/.ssh/config` and `~/.ssh/known_hosts` too, and writes only to `
 | `VerifyTransfers yes` | no | Compares SHA-256 on both ends after each file (the server needs `sha256sum`). |
 | `ParallelTransfers 4` | 3 | Files that move at once, 1 to 8. |
 | `FollowDirectory no` | yes | Whether the file view follows the shell's `cd` (OSC 7). |
+| `ZModem yes` | no | Answers `rz` and `sz` in the terminal with ZMODEM (Session > ZMODEM: answer rz and sz). |
 
 ## X11
 

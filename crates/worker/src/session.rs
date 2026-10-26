@@ -37,11 +37,13 @@ use russh::{
 };
 use tokio::net::TcpStream;
 use tokio::sync::{mpsc, oneshot, watch};
+use tokio::time::Instant;
 
 use crate::crypto_policy::{
     MIN_RSA_BITS, legacy_would_help, preferred_for, terrapin_prone, with_legacy, without_terrapin,
 };
 use crate::forward::{self, Incoming};
+use crate::zmodem::{self, Zmodem, sleep_until};
 
 /// Password and keyboard-interactive rounds, like `NumberOfPasswordPrompts`.
 const MAX_ATTEMPTS: usize = 3;
@@ -991,21 +993,33 @@ async fn pump(
         }
     });
 
+    let mut zm = Zmodem::new(ctx.channel);
+    let mut heard = Instant::now();
     let result = loop {
-        tokio::select! {
+        let wake = zm.patience().map(|p| heard + p);
+        let step = tokio::select! {
             msg = read.wait() => match msg {
-                Some(ChannelMsg::Data { data }) | Some(ChannelMsg::ExtendedData { data, .. }) => {
-                    for chunk in data.chunks(MAX_DATA_CHUNK) {
-                        ctx.send(Message::Data { channel: ctx.channel, bytes: chunk.to_vec() }).await?;
-                    }
+                Some(ChannelMsg::Data { data }) => {
+                    heard = Instant::now();
+                    zm.on_server(&data)
                 }
+                // stderr is never part of a transfer.
+                Some(ChannelMsg::ExtendedData { data, .. }) => zmodem::Step {
+                    terminal: data.to_vec(),
+                    ..zmodem::Step::default()
+                },
                 Some(ChannelMsg::ExitStatus { exit_status }) => {
                     ctx.send(Message::ExitStatus { channel: ctx.channel, code: exit_status }).await?;
+                    continue;
                 }
                 Some(ChannelMsg::ExitSignal { signal_name, .. }) => {
                     ctx.notice(format!("The remote shell was killed by signal {signal_name:?}.")).await?;
+                    continue;
                 }
-                Some(ChannelMsg::Success) if x11_reply => x11_reply = false,
+                Some(ChannelMsg::Success) if x11_reply => {
+                    x11_reply = false;
+                    continue;
+                }
                 Some(ChannelMsg::Failure) if x11_reply => {
                     x11_reply = false;
                     ctx.notice(
@@ -1014,23 +1028,68 @@ async fn pump(
                             .into(),
                     )
                     .await?;
+                    continue;
                 }
                 Some(ChannelMsg::Close) | None => break Ok(()),
-                Some(_) => {}
+                Some(_) => continue,
             },
             msg = inbox.recv() => match msg {
                 None | Some(Message::Close { .. }) => break Err(Failure::Cancelled),
-                Some(m @ (Message::Data { .. } | Message::Resize { .. })) => {
-                    if input.send(m).await.is_err() {
-                        break Ok(());
+                Some(m) => match zm.on_ui(&m) {
+                    Some(step) => {
+                        heard = Instant::now();
+                        step
                     }
-                }
-                Some(_) => {}
+                    None if matches!(m, Message::Data { .. } | Message::Resize { .. }) => {
+                        if input.send(m).await.is_err() {
+                            break Ok(());
+                        }
+                        continue;
+                    }
+                    None => continue,
+                },
             },
+            () = sleep_until(wake) => {
+                heard = Instant::now();
+                zm.timeout()
+            }
+        };
+        if !run_step(step, ctx, &input).await? {
+            break Ok(());
         }
     };
     writer.abort();
     result
+}
+
+/// Carries out a ZMODEM step: output to the terminal, messages to the UI,
+/// and bytes for the server to the writer. Returns false when the writer
+/// has gone.
+async fn run_step(
+    step: zmodem::Step,
+    ctx: &Ctx,
+    input: &mpsc::Sender<Message>,
+) -> Result<bool, Failure> {
+    for chunk in step.terminal.chunks(MAX_DATA_CHUNK) {
+        ctx.send(Message::Data {
+            channel: ctx.channel,
+            bytes: chunk.to_vec(),
+        })
+        .await?;
+    }
+    for msg in step.ui {
+        ctx.send(msg).await?;
+    }
+    for chunk in step.server.chunks(MAX_DATA_CHUNK) {
+        let msg = Message::Data {
+            channel: ctx.channel,
+            bytes: chunk.to_vec(),
+        };
+        if input.send(msg).await.is_err() {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 
 fn method_names(methods: &MethodSet) -> String {

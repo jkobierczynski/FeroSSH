@@ -20,6 +20,7 @@ ferossh-term = { path = "../crates/term" }
 ferossh-tmuxcc = { path = "../crates/tmuxcc" }
 ferossh-viewer = { path = "../crates/viewer", features = ["vnc", "rdp"] }
 ferossh-worker = { path = "../crates/worker" }
+ferossh-zmodem = { path = "../crates/zmodem" }
 
 # Kept out of the main workspace: fuzzing needs nightly and libFuzzer.
 [workspace]
@@ -104,6 +105,13 @@ bench = false
 [[bin]]
 name = "telnet_feed"
 path = "fuzz_targets/telnet_feed.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "zmodem_feed"
+path = "fuzz_targets/zmodem_feed.rs"
 test = false
 doc = false
 bench = false

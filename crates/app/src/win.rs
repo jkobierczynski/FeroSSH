@@ -113,6 +113,7 @@ use crate::ssh::{Effect, Env, SshSession, State, Target};
 use crate::tabstrip::{self, Forwarding, Health, Hit, Palette, StripLayout, TabLabel};
 use crate::telnet::{TelnetSession, TelnetTarget};
 use crate::tmux::{self, Mode as TmuxMode, Tmux};
+use crate::zmodem;
 use ferossh_tmuxcc::saved as tmux_saved;
 use zeroize::Zeroizing;
 
@@ -228,6 +229,7 @@ mod cmd {
     pub const SERIAL_BREAK: u32 = 606;
     pub const REPLACE_KEY: u32 = 603;
     pub const VERIFY: u32 = 604;
+    pub const ZMODEM: u32 = 607;
     pub const TMUX_ATTACH: u32 = 610;
     pub const TMUX_DETACH: u32 = 611;
     pub const TMUX_PICK: u32 = 612;
@@ -613,6 +615,8 @@ struct Window {
     update: Option<(std::sync::mpsc::Receiver<crate::update::Outcome>, bool)>,
     /// Login scripts running, by pane.
     scripts: HashMap<PaneId, ScriptRun>,
+    /// ZMODEM transfers running, by pane.
+    zmodem: HashMap<PaneId, zmodem::Transfer>,
     /// Secrets for login scripts from password manager commands, as they
     /// finish.
     script_secrets: Arc<std::sync::Mutex<Vec<ScriptSecret>>>,
@@ -1076,6 +1080,7 @@ fn create_and_run(launch: Launch, theme: Option<String>) -> Result<()> {
                 broadcast: broadcast::Scope::Off,
                 update: None,
                 scripts: HashMap::new(),
+                zmodem: HashMap::new(),
                 script_secrets: Arc::default(),
                 script_runs: 0,
                 snippets_view: SnippetsView::default(),
@@ -1193,6 +1198,7 @@ fn build_menu() -> Result<HMENU> {
         item(session, cmd::REPLACE_KEY, "Replace host &key...")?;
         separator(session)?;
         item(session, cmd::VERIFY, "&Verify transfers (SHA-256)")?;
+        item(session, cmd::ZMODEM, "&ZMODEM: answer rz and sz")?;
         separator(session)?;
         item(session, cmd::TMUX_ATTACH, "&Attach tmux")?;
         item(session, cmd::TMUX_PICK, "S&witch tmux session...")?;
@@ -1858,6 +1864,7 @@ impl Window {
     /// Ends whatever the pane is connected to.
     fn end_host(&mut self, id: PaneId) {
         self.scripts.remove(&id);
+        self.zmodem.remove(&id);
         // tmux on it is over too; a reattach after a dropped connection
         // stays wanted.
         if let Some(mut t) = self.tmux.remove(&id) {
@@ -2945,6 +2952,7 @@ impl Window {
                 }
                 Effect::Ended => {
                     self.scripts.remove(&id);
+                    self.zmodem.remove(&id);
                     self.pending_desktops.remove(&id);
                     self.tmux_lost(id);
                     self.stop_log(id);
@@ -2954,6 +2962,56 @@ impl Window {
                 }
             }
         }
+    }
+
+    /// What the worker said about a ZMODEM transfer in pane `id`, whose
+    /// shell is `channel`.
+    fn on_zmodem(&mut self, id: PaneId, channel: ChannelId, msg: Message) {
+        if let Message::ZmodemStart { upload, .. } = msg {
+            let effects = if !self.settings.zmodem {
+                vec![zmodem::refuse(channel, true)]
+            } else if self.zmodem.contains_key(&id) || self.scripts.contains_key(&id) {
+                // One at a time; and a login script owns the pane's
+                // output until it ends.
+                vec![zmodem::refuse(channel, false)]
+            } else if upload {
+                self.queued.push(Command::PickZmodem { pane: id, channel });
+                Vec::new()
+            } else {
+                let (transfer, effects) = zmodem::Transfer::receive(channel, self.download_dir());
+                self.zmodem.insert(id, transfer);
+                effects
+            };
+            self.apply(id, effects);
+            return;
+        }
+        let Some(transfer) = self.zmodem.get_mut(&id) else {
+            return;
+        };
+        let (effects, over) = transfer.on_worker(msg);
+        if over {
+            self.zmodem.remove(&id);
+        }
+        self.apply(id, effects);
+    }
+
+    /// The user picked `paths` (or nothing) for the server's `rz` in pane
+    /// `pane`.
+    fn zmodem_send(&mut self, pane: PaneId, channel: ChannelId, paths: &[PathBuf]) {
+        let alive = match self.panes.get(&pane).map(|p| &p.host) {
+            Some(Host::Ssh(s)) => s.channel == channel,
+            Some(Host::Telnet(s)) => s.channel == channel,
+            _ => false,
+        };
+        if !alive {
+            return;
+        }
+        let (transfer, effects) = zmodem::Transfer::send(channel, paths);
+        if let Some(t) = transfer {
+            self.zmodem.insert(pane, t);
+        }
+        self.apply(pane, effects);
+        self.refresh_visible();
     }
 
     /// Gets the login password of SSH pane `id` from its password source.
@@ -3904,7 +3962,9 @@ impl Window {
         match event {
             LinkEvent::Message(msg) => {
                 match &msg {
-                    Message::Data { bytes, .. } => *fed += bytes.len(),
+                    Message::Data { bytes, .. } | Message::ZmodemData { bytes, .. } => {
+                        *fed += bytes.len();
+                    }
                     Message::SftpReply {
                         reply: SftpReply::Data(data),
                         ..
@@ -3925,6 +3985,17 @@ impl Window {
                 let Some(id) = self.pane_of_channel(c) else {
                     return false;
                 };
+                if zmodem::is_zmodem(&msg) {
+                    let own = match self.panes.get(&id).map(|p| &p.host) {
+                        Some(Host::Ssh(s)) => s.connection == connection,
+                        Some(Host::Telnet(s)) => s.connection() == connection,
+                        _ => false,
+                    };
+                    if own {
+                        self.on_zmodem(id, c, msg);
+                    }
+                    return false;
+                }
                 let effects = match self.panes.get_mut(&id).map(|p| &mut p.host) {
                     Some(Host::Ssh(session)) if session.connection == connection => {
                         session.on_worker(msg)
@@ -6394,6 +6465,11 @@ impl Window {
                 return Some(Command::PickUpload { key, dir });
             }
             cmd::DOWNLOADS => return Some(Command::OpenFolder(self.download_dir())),
+            cmd::ZMODEM => {
+                self.settings.zmodem = !self.settings.zmodem;
+                self.save_settings();
+                self.update_menu_checks();
+            }
             cmd::VERIFY => {
                 self.settings.verify_transfers = !self.settings.verify_transfers;
                 for remote in self.sftp.values_mut() {
@@ -6670,6 +6746,7 @@ impl Window {
                 ),
                 (cmd::FOLLOW_CD, s.follow_directory),
                 (cmd::VERIFY, s.verify_transfers),
+                (cmd::ZMODEM, s.zmodem),
                 (cmd::SIDE_RIGHT, s.side_pane_right),
                 (cmd::TAB_STRIP, s.tab_strip),
                 (cmd::TMUX_LAYOUT, own_layout),
@@ -7206,6 +7283,11 @@ enum Command {
         key: String,
         dir: Vec<u8>,
     },
+    /// The file picker, for the server's `rz` in pane `pane`.
+    PickZmodem {
+        pane: PaneId,
+        channel: ChannelId,
+    },
     /// A menu of tmux sessions to switch gateway `gateway`'s client to.
     TmuxPicker {
         gateway: PaneId,
@@ -7351,8 +7433,9 @@ fn drop_files(hwnd: HWND, drop: HDROP) {
     }
 }
 
-/// File > Upload files: the system file picker, several files at once.
-fn pick_files(hwnd: HWND) -> Vec<PathBuf> {
+/// File > Upload files (and ZMODEM): the system file picker, several
+/// files at once.
+fn pick_files(hwnd: HWND, title: PCWSTR) -> Vec<PathBuf> {
     if DIALOG_OPEN.get() {
         return Vec::new();
     }
@@ -7362,7 +7445,7 @@ fn pick_files(hwnd: HWND) -> Vec<PathBuf> {
         hwndOwner: hwnd,
         lpstrFile: PWSTR(buf.as_mut_ptr()),
         nMaxFile: buf.len() as u32,
-        lpstrTitle: w!("Upload files"),
+        lpstrTitle: title,
         Flags: OFN_ALLOWMULTISELECT
             | OFN_EXPLORER
             | OFN_FILEMUSTEXIST
@@ -7751,10 +7834,14 @@ fn run_command(hwnd: HWND, command: Command) {
             }
         }
         Command::PickUpload { key, dir } => {
-            let picked = pick_files(hwnd);
+            let picked = pick_files(hwnd, w!("Upload files"));
             if !picked.is_empty() {
                 with_window(|w| w.upload_files(&key, &picked, &dir));
             }
+        }
+        Command::PickZmodem { pane, channel } => {
+            let picked = pick_files(hwnd, w!("Send files to the server's rz"));
+            with_window(|w| w.zmodem_send(pane, channel, &picked));
         }
         Command::ImportSessions => {
             let (found, problems) = known_imports();
