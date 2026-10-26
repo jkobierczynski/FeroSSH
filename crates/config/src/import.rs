@@ -14,7 +14,9 @@
 //! flagged, so the user can set up a password source for it.
 
 use crate::saved::{SavedHost, valid_alias, write_host};
-use crate::settings::{DEFAULT_DESKTOP_PORT, DEFAULT_VNC_PORT, Profile, SessionKind};
+use crate::settings::{
+    DEFAULT_DESKTOP_PORT, DEFAULT_TELNET_PORT, DEFAULT_VNC_PORT, Profile, SessionKind,
+};
 
 /// A client FeroSSH imports from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -96,7 +98,7 @@ pub struct Session {
     /// What goes to the file; the folder is set by [`to_config`]. For a
     /// desktop session the port is the desktop's.
     pub host: SavedHost,
-    /// SSH, or a Remote Desktop or VNC desktop.
+    /// SSH, Telnet, or a Remote Desktop or VNC desktop.
     pub kind: SessionKind,
     /// The client had a password stored for it (not read).
     pub had_password: bool,
@@ -132,6 +134,7 @@ pub(crate) fn port(kind: SessionKind, port: Option<u32>) -> Option<u16> {
         SessionKind::Ssh => 22,
         SessionKind::Rdp => DEFAULT_DESKTOP_PORT,
         SessionKind::Vnc => DEFAULT_VNC_PORT,
+        SessionKind::Telnet => DEFAULT_TELNET_PORT,
         // Imports bring no serial sessions; a COM port has no port number.
         SessionKind::Serial => return None,
     };
@@ -235,7 +238,8 @@ pub fn to_config(client: Client, sessions: &[&Session]) -> String {
     out
 }
 
-/// The profile a session brings: its font, or that it is a desktop.
+/// The profile a session brings: its font, or that it is a desktop or
+/// Telnet.
 pub fn profile(s: &Session) -> Option<Profile> {
     (s.font.is_some() || s.font_size.is_some() || s.kind != SessionKind::Ssh).then(|| Profile {
         host: s.host.alias.clone(),

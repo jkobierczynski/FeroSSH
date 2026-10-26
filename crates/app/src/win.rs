@@ -112,6 +112,7 @@ use crate::sessions::{HostItem, SessionList, SideAction, SideKey};
 use crate::snippets_view::{SnipAction, SnippetsView};
 use crate::ssh::{Effect, Env, ProxyCommand, SshSession, State, Target};
 use crate::tabstrip::{self, Forwarding, Health, Hit, Palette, StripLayout, TabLabel};
+use crate::telnet::{TelnetSession, TelnetTarget};
 use crate::tmux::{self, Mode as TmuxMode, Tmux};
 use ferossh_tmuxcc::saved as tmux_saved;
 use zeroize::Zeroizing;
@@ -254,6 +255,7 @@ mod cmd {
     pub const BROADCAST_TAB: u32 = 730;
     pub const BROADCAST_ALL: u32 = 731;
     pub const BROADCAST_SKIP: u32 = 732;
+    pub const CLOSE_TAB: u32 = 733;
     pub const UPDATE_CHECK: u32 = 900;
     pub const UPDATE_WEEKLY: u32 = 901;
     pub const ABOUT: u32 = 902;
@@ -274,7 +276,7 @@ enum Typed {
 }
 
 /// The prompt shown when no host was given.
-const CONNECT_PROMPT: &str = "\x1b[0mConnect to (user@host[:port], a Host from ~/.ssh/config, or a COM port such as COM3:115200; Ctrl+Shift+S lists them): ";
+const CONNECT_PROMPT: &str = "\x1b[0mConnect to (user@host[:port], a Host from ~/.ssh/config, telnet://host[:port], or a COM port such as COM3:115200; Ctrl+Shift+S lists them): ";
 
 /// What a pane is connected to.
 enum Host {
@@ -310,6 +312,8 @@ enum Host {
         /// script.
         session: Option<String>,
     },
+    /// An unencrypted Telnet session, run by a worker of its own.
+    Telnet(Box<TelnetSession>),
 }
 
 /// A worker process, the pipes to it, and the forwarding engine that
@@ -406,6 +410,7 @@ impl Pane {
             Host::Ask(_) => "new tab".to_owned(),
             Host::Tmux { label, .. } | Host::Desktop { label, .. } => label.clone(),
             Host::Serial { target, .. } => target.label(),
+            Host::Telnet(s) => s.target.label(),
         }
     }
 
@@ -417,6 +422,11 @@ impl Pane {
     fn health(&self) -> Health {
         match &self.host {
             Host::Ssh(s) => match s.state() {
+                State::Connected => Health::Connected,
+                State::Connecting => Health::Connecting,
+                State::Blocked | State::Ended => Health::Idle,
+            },
+            Host::Telnet(s) => match s.state() {
                 State::Connected => Health::Connected,
                 State::Connecting => Health::Connecting,
                 State::Blocked | State::Ended => Health::Idle,
@@ -1340,6 +1350,9 @@ fn build_menu() -> Result<HMENU> {
                 &format!("Grow pane {name}\tAlt+Shift+{key}"),
             )?;
         }
+        separator(window)?;
+        item(window, cmd::CLOSE_PANE, "&Close pane\tCtrl+Shift+W")?;
+        item(window, cmd::CLOSE_TAB, "Clos&e tab\tCtrl+F4")?;
 
         let help = CreatePopupMenu()?;
         item(help, cmd::UPDATE_CHECK, "Check for &updates...")?;
@@ -1599,6 +1612,7 @@ impl Window {
     fn pane_of_channel(&self, channel: ChannelId) -> Option<PaneId> {
         self.panes.values().find_map(|p| match &p.host {
             Host::Ssh(s) if s.owns(channel) => Some(p.id),
+            Host::Telnet(s) if s.channel == channel => Some(p.id),
             _ => None,
         })
     }
@@ -1891,6 +1905,7 @@ impl Window {
         }
         let effects = match self.panes.get_mut(&id).map(|p| &mut p.host) {
             Some(Host::Ssh(session)) => session.close(),
+            Some(Host::Telnet(session)) => session.close(),
             _ => Vec::new(),
         };
         self.apply(id, effects);
@@ -1960,7 +1975,9 @@ impl Window {
         let focused = self.focused_id();
         let label = self.panes.get(&focused).map(Pane::label);
         let badge = self.forwarding(&self.forward_view(), focused).badge();
-        let legacy = if self.legacy_in_use(focused) {
+        let legacy = if self.unencrypted(focused) {
+            " ⚠ (Telnet, unencrypted)"
+        } else if self.legacy_in_use(focused) {
             tabstrip::LEGACY_BADGE
         } else {
             ""
@@ -2153,6 +2170,10 @@ impl Window {
                 s.connection == connection
                     && matches!(s.state(), State::Connecting | State::Connected)
             }
+            Host::Telnet(s) => {
+                s.connection() == connection
+                    && matches!(s.state(), State::Connecting | State::Connected)
+            }
             Host::Desktop { connection: c, .. } => *c == connection && p.desktop.is_some(),
             _ => false,
         }) || self.desktops.keys().any(|(c, ..)| *c == connection)
@@ -2184,6 +2205,11 @@ impl Window {
             Some(Host::Tmux { gateway, .. }) => self.legacy_in_use(*gateway),
             _ => false,
         }
+    }
+
+    /// Whether pane `id` is a Telnet session, which nothing encrypts.
+    fn unencrypted(&self, id: PaneId) -> bool {
+        matches!(self.panes.get(&id).map(|p| &p.host), Some(Host::Telnet(_)))
     }
 
     fn pane_connection(&self, id: PaneId) -> Option<ChannelId> {
@@ -2690,6 +2716,19 @@ impl Window {
             return;
         }
         let env = ssh_env();
+        let telnet = if self
+            .settings
+            .profile(destination)
+            .is_some_and(|p| p.kind == SessionKind::Telnet)
+        {
+            TelnetTarget::resolve(destination, &env)
+        } else {
+            TelnetTarget::typed(destination)
+        };
+        if let Some(target) = telnet {
+            self.connect_telnet(id, target);
+            return;
+        }
         let target = match Target::resolve_route(destination, &env) {
             Ok(t) => t,
             Err(why) => {
@@ -2783,7 +2822,7 @@ impl Window {
                 "\x1b[0;31mThe SSH worker runs without its sandbox (--no-sandbox).\x1b[0m\r\n",
             );
         }
-        self.apply_look(id, &target);
+        self.apply_look(id, &target.alias, &target.hostname, target.tag.as_deref());
         let x11 = target.forward_x11.then(|| self.x11_auth(id)).flatten();
         let legacy = self
             .settings
@@ -2835,20 +2874,51 @@ impl Window {
         self.refresh(id);
     }
 
+    /// Opens Telnet session `target` in pane `id`, in a worker of its
+    /// own: Telnet is parsed in the sandbox too.
+    fn connect_telnet(&mut self, id: PaneId, target: TelnetTarget) {
+        self.end_host(id);
+        if let Some(p) = self.panes.get_mut(&id) {
+            p.term.scroll_to_bottom();
+        }
+        let channel = self.new_channel();
+        if !self.ensure_worker(id, channel) {
+            self.refresh(id);
+            return;
+        }
+        if !self.sandbox {
+            self.show(
+                id,
+                "\x1b[0;31mThe Telnet worker runs without its sandbox (--no-sandbox).\x1b[0m\r\n",
+            );
+        }
+        self.apply_look(id, &target.alias, &target.hostname, target.tag.as_deref());
+        let mut session = TelnetSession::new(channel, target);
+        let Some(p) = self.panes.get_mut(&id) else {
+            return;
+        };
+        let effects = session.start(clamp16(p.term.cols()), clamp16(p.term.rows()));
+        p.host = Host::Telnet(Box::new(session));
+        self.apply(id, effects);
+        self.update_title();
+        self.refresh_chrome();
+        self.refresh(id);
+    }
+
     /// Gives a pane the font, size, theme and scrollback its host's
     /// profile and the theme rules pick.
-    fn apply_look(&mut self, id: PaneId, target: &Target) {
+    fn apply_look(&mut self, id: PaneId, alias: &str, hostname: &str, tag: Option<&str>) {
         let (font, theme) = look::for_host(
             &self.settings,
-            &target.alias,
-            &target.hostname,
-            target.tag.as_deref(),
+            alias,
+            hostname,
+            tag,
             &FontSpec::default(),
             &self.default_theme,
         );
         let scrollback = self
             .settings
-            .profile(&target.alias)
+            .profile(alias)
             .and_then(|p| p.scrollback)
             .or(self.settings.scrollback);
         if let Some(p) = self.panes.get_mut(&id) {
@@ -2873,6 +2943,11 @@ impl Window {
                 self.open_serial(id, target, session.as_deref());
                 return;
             }
+            Some(Host::Telnet(s)) => {
+                let target = s.target.clone();
+                self.connect_telnet(id, target);
+                return;
+            }
             _ => None,
         };
         if let Some(target) = target {
@@ -2886,11 +2961,12 @@ impl Window {
             match effect {
                 Effect::Send(msg) => {
                     // Only to the worker of the login the channel is on.
-                    if let Some(Host::Ssh(s)) = self.panes.get(&id).map(|p| &p.host)
-                        && let Some(w) = s
-                            .worker_for(msg.channel())
-                            .and_then(|c| self.workers.get(&c))
-                    {
+                    let connection = match self.panes.get(&id).map(|p| &p.host) {
+                        Some(Host::Ssh(s)) => s.worker_for(msg.channel()),
+                        Some(Host::Telnet(s)) => Some(s.connection()),
+                        _ => None,
+                    };
+                    if let Some(w) = connection.and_then(|c| self.workers.get(&c)) {
                         w.link.send(msg);
                     }
                 }
@@ -2944,6 +3020,17 @@ impl Window {
                     port,
                     password,
                 } => self.store_password(id, (&user, &host, port), &password),
+                Effect::Connected if self.unencrypted(id) => {
+                    // Nothing of SSH (SFTP, forwards, tmux, desktops)
+                    // runs over Telnet; a login script does.
+                    self.start_log(id);
+                    self.refresh_chrome();
+                    let alias = match self.panes.get(&id).map(|p| &p.host) {
+                        Some(Host::Telnet(s)) => s.target.alias.clone(),
+                        _ => String::new(),
+                    };
+                    self.start_script(id, &alias, false);
+                }
                 Effect::Connected => {
                     self.start_log(id);
                     self.sftp_connected(id);
@@ -3212,12 +3299,13 @@ impl Window {
                 target,
                 session,
             }) => Some(session.clone().unwrap_or_else(|| target.port.clone())),
+            Some(Host::Telnet(s)) if s.state() == State::Connected => Some(s.target.alias.clone()),
             _ => None,
         };
         let Some(alias) = alias else {
             return Some(Command::Notice(
-                "The login script runs in a pane logged in to an SSH host or open on a \
-                 serial port."
+                "The login script runs in a pane logged in to an SSH or Telnet host or open \
+                 on a serial port."
                     .into(),
             ));
         };
@@ -3327,6 +3415,7 @@ impl Window {
                 false,
                 String::new(),
             ),
+            Some(Host::Telnet(s)) => (s.target.alias.clone(), false, String::new()),
             _ => return,
         };
         let now = Instant::now();
@@ -3496,6 +3585,7 @@ impl Window {
         }
         let label = match &p.host {
             Host::Ssh(s) if s.state() == State::Connected => s.target.label(),
+            Host::Telnet(s) if s.state() == State::Connected => s.target.label(),
             Host::Local { exited: false, .. } => "local".to_owned(),
             Host::Tmux { label, .. } => label.clone(),
             Host::Serial {
@@ -3628,6 +3718,7 @@ impl Window {
                 return;
             }
             Some(Host::Ssh(session)) if !session.prompt_active() => session.input(&bytes),
+            Some(Host::Telnet(session)) => session.input(&bytes),
             Some(Host::Serial {
                 port: Some(port), ..
             }) => {
@@ -3721,7 +3812,14 @@ impl Window {
                     self.open_serial(id, target, session.as_deref());
                 }
             }
-            Host::Ssh(_) | Host::Tmux { .. } | Host::Serial { .. } => self.send(id, bytes),
+            Host::Telnet(session) if session.state() == State::Ended => {
+                if enter {
+                    self.reconnect(id);
+                }
+            }
+            Host::Ssh(_) | Host::Tmux { .. } | Host::Serial { .. } | Host::Telnet(_) => {
+                self.send(id, bytes);
+            }
         }
     }
 
@@ -3742,6 +3840,7 @@ impl Window {
             | Host::Tmux { .. }
             | Host::Serial { port: Some(_), .. } => true,
             Host::Ssh(s) => s.state() == State::Connected && !s.prompt_active(),
+            Host::Telnet(s) => s.state() == State::Connected,
             _ => false,
         }
     }
@@ -4005,6 +4104,9 @@ impl Window {
                     Some(Host::Ssh(session)) if session.worker_for(Some(c)) == Some(connection) => {
                         session.on_worker(msg)
                     }
+                    Some(Host::Telnet(session)) if session.connection() == connection => {
+                        session.on_worker(msg)
+                    }
                     _ => Vec::new(),
                 };
                 self.apply(id, effects);
@@ -4035,6 +4137,18 @@ impl Window {
                                 }),
                                 None => Vec::new(),
                             }
+                        }
+                        Some(Host::Telnet(session))
+                            if session.connection() == connection
+                                && matches!(
+                                    session.state(),
+                                    State::Connecting | State::Connected
+                                ) =>
+                        {
+                            session.on_worker(Message::Disconnected {
+                                channel: session.channel,
+                                reason: why.clone(),
+                            })
                         }
                         _ => Vec::new(),
                     };
@@ -4260,6 +4374,7 @@ impl Window {
                         bell,
                         forwarding: self.forwarding(&views, t.focus),
                         legacy: self.legacy_in_use(t.focus),
+                        unencrypted: self.unencrypted(t.focus),
                     }
                 })
                 .collect();
@@ -4424,6 +4539,7 @@ impl Window {
                     None
                 }
                 Host::Ssh(session) => session.resize(clamp16(cols), clamp16(rows)),
+                Host::Telnet(session) => session.resize(clamp16(cols), clamp16(rows)),
                 _ => None,
             };
             if let Some(e) = effect {
@@ -5376,7 +5492,7 @@ impl Window {
             return;
         }
         if let Some(p) = self.settings.profile(host)
-            && p.kind != SessionKind::Ssh
+            && !matches!(p.kind, SessionKind::Ssh | SessionKind::Telnet)
         {
             let (kind, via) = (p.kind, p.via.clone());
             self.open_desktop_session(host, kind, via, split);
@@ -5515,6 +5631,7 @@ impl Window {
     fn fill_like(&mut self, id: PaneId, from: PaneId) {
         enum Like {
             Ssh(Box<Target>),
+            Telnet(TelnetTarget),
             Local,
             Ask,
         }
@@ -5522,11 +5639,13 @@ impl Window {
         // A COM port opens once, so a split of a serial console asks.
         let like = match self.panes.get(&from).map(|p| &p.host) {
             Some(Host::Ssh(s)) => Like::Ssh(Box::new(s.target.clone())),
+            Some(Host::Telnet(s)) => Like::Telnet(s.target.clone()),
             Some(Host::Local { .. }) => Like::Local,
             _ => Like::Ask,
         };
         match like {
             Like::Ssh(target) => self.connect_to(id, *target, &ssh_env()),
+            Like::Telnet(target) => self.connect_telnet(id, target),
             Like::Local => self.start_shell(id),
             Like::Ask => self.ask_destination(id),
         }
@@ -6278,6 +6397,7 @@ impl Window {
         let pane = self.focused_id();
         match id {
             cmd::EXIT => return Some(Command::Exit),
+            cmd::CLOSE_TAB => return Some(Command::CloseTab(self.ws.active)),
             cmd::HIDE_MENU => return Some(Command::SetMenuVisible(!self.menu_visible)),
             cmd::COPY => return Some(Command::Copy),
             cmd::PASTE => return Some(Command::Paste),
@@ -6471,6 +6591,11 @@ impl Window {
                 self.tmux_lost(pane);
                 let effects = match self.panes.get_mut(&pane).map(|p| &mut p.host) {
                     Some(Host::Ssh(session))
+                        if matches!(session.state(), State::Connecting | State::Connected) =>
+                    {
+                        session.close()
+                    }
+                    Some(Host::Telnet(session))
                         if matches!(session.state(), State::Connecting | State::Connected) =>
                     {
                         session.close()
@@ -7120,7 +7245,9 @@ impl Window {
         ids.iter()
             .filter_map(|id| self.panes.get(id))
             .filter(|p| {
-                let open = p.connected() || matches!(p.host, Host::Serial { port: Some(_), .. });
+                let open = p.connected()
+                    || matches!(p.host, Host::Serial { port: Some(_), .. })
+                    || matches!(&p.host, Host::Telnet(s) if s.state() == State::Connected);
                 open && (tab.is_some() || p.gateway().is_none())
             })
             .count()
@@ -7186,6 +7313,7 @@ fn shortcut(vk: VIRTUAL_KEY, m: Mods, tabs: bool, split: bool) -> Option<u32> {
             v if v == key(b'R') && m.shift => Some(cmd::RECONNECT),
             v if v == key(b'T') && m.shift => Some(cmd::NEW_TAB),
             v if v == key(b'W') && m.shift => Some(cmd::CLOSE_PANE),
+            VK_F4 if !m.shift => Some(cmd::CLOSE_TAB),
             v if v == key(b'S') && m.shift => Some(cmd::SESSIONS),
             v if v == key(b'E') && m.shift => Some(cmd::FILES),
             v if v == key(b'P') && m.shift => Some(cmd::FORWARDS),
@@ -8563,5 +8691,19 @@ mod tests {
         assert_eq!(side_toggle(true, false, false), SideToggle::Focus);
         assert_eq!(side_toggle(true, true, false), SideToggle::Hide);
         assert_eq!(side_toggle(false, true, false), SideToggle::Show);
+    }
+
+    #[test]
+    fn ctrl_f4_closes_the_tab_even_when_it_is_the_only_one() {
+        let ctrl = Mods {
+            ctrl: true,
+            ..Mods::NONE
+        };
+        assert_eq!(shortcut(VK_F4, ctrl, false, false), Some(cmd::CLOSE_TAB));
+        let alt = Mods {
+            alt: true,
+            ..Mods::NONE
+        };
+        assert_eq!(shortcut(VK_F4, alt, true, true), None);
     }
 }

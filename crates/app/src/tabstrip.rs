@@ -57,10 +57,17 @@ pub struct TabLabel {
     pub forwarding: Forwarding,
     /// The connection uses the opt-in legacy algorithms: `⚠`, in amber.
     pub legacy: bool,
+    /// The connection is not encrypted (Telnet): `⚠ telnet`, in red.
+    pub unencrypted: bool,
 }
 
 /// The legacy-algorithms badge, before the forwarding one.
 pub const LEGACY_BADGE: &str = " ⚠";
+/// The badge of an unencrypted (Telnet) connection, in its place.
+pub const UNENCRYPTED_BADGE: &str = " ⚠ telnet";
+
+const AMBER: Rgb = Rgb::new(0xe5, 0xb5, 0x3b);
+const RED: Rgb = Rgb::new(0xe0, 0x5c, 0x5c);
 
 /// What a click on the strip hit.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -278,7 +285,13 @@ pub fn draw(grid: &mut Grid, tabs: &[TabLabel], active: usize, palette: &Palette
             Flags::empty()
         };
         let badge = tab.forwarding.badge();
-        let legacy = if tab.legacy { LEGACY_BADGE } else { "" };
+        let (legacy, warn) = if tab.unencrypted {
+            (UNENCRYPTED_BADGE, RED)
+        } else if tab.legacy {
+            (LEGACY_BADGE, AMBER)
+        } else {
+            ("", AMBER)
+        };
         let title = fit(
             &tab.title,
             title_max
@@ -288,7 +301,7 @@ pub fn draw(grid: &mut Grid, tabs: &[TabLabel], active: usize, palette: &Palette
         let mut shown: usize = title.chars().map(|c| c.width().unwrap_or(0)).sum();
         row.put(&title, fg, bg, flags);
         if !legacy.is_empty() {
-            row.put(legacy, Rgb::new(0xe5, 0xb5, 0x3b), bg, Flags::empty());
+            row.put(legacy, warn, bg, Flags::empty());
             shown += legacy.chars().count();
         }
         if !badge.is_empty() {
@@ -336,6 +349,7 @@ mod tests {
             bell: false,
             forwarding: Forwarding::None,
             legacy: false,
+            unencrypted: false,
         }
     }
 
@@ -423,6 +437,20 @@ mod tests {
         let badge = grid.cell(11, 0).unwrap();
         assert_eq!(badge.ch, '⚠');
         assert_eq!(badge.fg, Color::Rgb(Rgb::new(0xe5, 0xb5, 0x3b)));
+    }
+
+    #[test]
+    fn badge_shows_unencrypted_telnet() {
+        let mut grid = Grid::new(80, 1);
+        let p = Palette::of(&Theme::default());
+        let mut plain = label("router");
+        plain.unencrypted = true;
+        draw(&mut grid, &[plain], 0, &p);
+        let t = text(&grid);
+        assert!(t.starts_with("  ● router ⚠ telnet"), "{t:?}");
+        let badge = grid.cell(11, 0).unwrap();
+        assert_eq!(badge.ch, '⚠');
+        assert_eq!(badge.fg, Color::Rgb(RED));
     }
 
     #[test]

@@ -426,6 +426,7 @@ impl ImportView {
                                 SessionKind::Rdp => to.push_str(" RDP"),
                                 SessionKind::Vnc => to.push_str(" VNC"),
                                 SessionKind::Serial => to.push_str(" serial"),
+                                SessionKind::Telnet => to.push_str(" Telnet"),
                             }
                             let room = width.saturating_sub(line.col + 2);
                             if room > 4 {
