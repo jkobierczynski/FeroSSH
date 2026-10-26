@@ -8,9 +8,9 @@ FeroSSH aims to be the smallest, most secure open-source SSH client for Windows:
 
 The [user guide](docs/guide/README.md) covers getting started, everyday use, every setting, the security model, verifying a download and troubleshooting.
 
-## Trying the build
+## Download
 
-Download `ferossh-exe` from the latest CI run and start it with a host, or without one to be asked:
+Download `ferossh.exe` from the [latest release](https://github.com/jkobierczynski/FeroSSH/releases/latest) (or `ferossh-exe` from the latest CI run for the newest changes) and start it with a host, or without one to be asked. Release exes are code signed with a certificate from the [SignPath Foundation](https://signpath.org), free code signing for open source provided by [SignPath.io](https://about.signpath.io); see the [code signing policy](#code-signing-policy).
 
 ```
 ferossh.exe [user@]host[:port]

@@ -242,6 +242,14 @@ jobs:
           $pre = if ($env:TAG.Contains("-")) { @("--prerelease") } else { @() }
           $files = @("dist/ferossh.exe", "dist/ferossh-desktop.exe", "dist/SHA256SUMS.txt", "dist/BUILD-MANIFEST.json")
           if (Test-Path dist/update.txt.sig) { $files += @("dist/update.txt", "dist/update.txt.sig") }
+          # Every release page says how its exes are signed (SignPath
+          # Foundation asks for this on the download page).
+          $notes = (Get-Content -Raw "docs/releases/$env:TAG.md").TrimEnd() + "`n`n" + @"
+          ---
+
+          **Code signing.** Free code signing provided by [SignPath.io](https://about.signpath.io), certificate by [SignPath Foundation](https://signpath.org). See the [code signing policy](https://github.com/jkobierczynski/FeroSSH#code-signing-policy).
+          "@
+          [IO.File]::WriteAllText("$env:RUNNER_TEMP/notes.md", $notes, [Text.UTF8Encoding]::new($false))
           gh release create $env:TAG --verify-tag --title "FeroSSH $env:TAG" `
-            --notes-file "docs/releases/$env:TAG.md" @pre @files
+            --notes-file "$env:RUNNER_TEMP/notes.md" @pre @files
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
