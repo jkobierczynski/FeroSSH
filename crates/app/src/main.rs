@@ -2,7 +2,8 @@
 //!
 //! `ferossh.exe [user@]host[:port]` connects to a host (names from
 //! `~/.ssh/config` work too); without a host it asks for one.
-//! `ferossh.exe COM3:115200,8N1` opens a serial console instead. The same exe
+//! `ferossh.exe COM3:115200,8N1` opens a serial console instead, and
+//! `ferossh.exe telnet://host[:port]` an (unencrypted) Telnet session. The same exe
 //! is also the SSH worker: the window starts it again as
 //! `ferossh.exe --worker <in> <out>` inside an AppContainer, where it runs
 //! the network side over two inherited pipes.
@@ -75,6 +76,8 @@ mod ssh;
 mod ssh_e2e;
 #[cfg_attr(not(windows), allow(dead_code))]
 mod tabstrip;
+#[cfg_attr(not(windows), allow(dead_code))]
+mod telnet;
 #[cfg_attr(not(windows), allow(dead_code))]
 mod tmux;
 #[cfg(all(test, unix))]

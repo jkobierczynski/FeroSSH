@@ -40,7 +40,7 @@ use std::fmt;
 use zeroize::Zeroize;
 
 /// Protocol version carried in every frame. Bump on any wire change.
-pub const PROTOCOL_VERSION: u8 = 8;
+pub const PROTOCOL_VERSION: u8 = 9;
 
 /// Largest frame body accepted, in bytes. Terminal and SFTP data is chunked
 /// below this, so anything larger is a bug or an attack.
@@ -354,6 +354,20 @@ pub enum Message {
         rows: u16,
         x11: Option<X11Auth>,
     },
+    /// Open a Telnet session to `host`:`port` on a terminal of `cols` x
+    /// `rows`. No login, no encryption: the worker opens the TCP
+    /// connection, speaks Telnet option negotiation and answers with
+    /// [`Message::Connected`], terminal [`Message::Data`] and finally
+    /// [`Message::Disconnected`]; it never asks for keys or passwords.
+    TelnetConnect {
+        channel: ChannelId,
+        host: String,
+        port: u16,
+        cols: u16,
+        rows: u16,
+        /// Seconds for the TCP connection.
+        connect_timeout: u32,
+    },
     /// The user (or known_hosts) trusts, or rejects, the key in the last
     /// [`Message::HostKey`].
     HostKeyVerdict { channel: ChannelId, accept: bool },
@@ -541,6 +555,7 @@ impl Message {
             Message::Window { .. } => 28,
             Message::Eof { .. } => 29,
             Message::HostCert { .. } => 30,
+            Message::TelnetConnect { .. } => 31,
         }
     }
 
@@ -556,6 +571,7 @@ impl Message {
             | Message::Eof { .. } => Side::Either,
             Message::Resize { .. }
             | Message::Connect { .. }
+            | Message::TelnetConnect { .. }
             | Message::OpenChannel { .. }
             | Message::HostKeyVerdict { .. }
             | Message::Identities { .. }
@@ -591,6 +607,7 @@ impl Message {
             | Message::Resize { channel, .. }
             | Message::Close { channel }
             | Message::Connect { channel, .. }
+            | Message::TelnetConnect { channel, .. }
             | Message::HostKeyVerdict { channel, .. }
             | Message::Identities { channel, .. }
             | Message::Signature { channel, .. }
@@ -888,6 +905,21 @@ pub fn encode(msg: &Message, out: &mut Vec<u8>) -> Result<(), Error> {
             w.u32(timing.connect_timeout);
             w.u32(timing.alive_interval);
             w.u32(timing.alive_max);
+        }
+        Message::TelnetConnect {
+            channel,
+            host,
+            port,
+            cols,
+            rows,
+            connect_timeout,
+        } => {
+            w.u32(*channel);
+            w.str(host);
+            w.u16(*port);
+            w.u16(*cols);
+            w.u16(*rows);
+            w.u32(*connect_timeout);
         }
         Message::HostKeyVerdict { channel, accept } => {
             w.u32(*channel);
@@ -1301,6 +1333,14 @@ fn decode_body(body: &[u8]) -> Result<Message, Error> {
             key_id: r.string()?,
             serial: r.u64()?,
         },
+        31 => Message::TelnetConnect {
+            channel: r.u32()?,
+            host: r.string()?,
+            port: r.u16()?,
+            cols: r.u16()?,
+            rows: r.u16()?,
+            connect_timeout: r.u32()?,
+        },
         tag => return Err(Error::Tag(tag)),
     };
     match r.0.len() {
@@ -1576,6 +1616,14 @@ mod tests {
                 channel: 1,
                 text: "Authorised users only\n".into(),
             },
+            Message::TelnetConnect {
+                channel: 4,
+                host: "console-server.lan".into(),
+                port: 23,
+                cols: 80,
+                rows: 24,
+                connect_timeout: 20,
+            },
             Message::IdentitiesRequest { channel: 1 },
             Message::SignRequest {
                 channel: 1,
@@ -1809,7 +1857,7 @@ mod tests {
         let mut tags: Vec<u8> = samples().iter().map(Message::tag).collect();
         tags.sort_unstable();
         tags.dedup();
-        assert_eq!(tags, (0..=30).collect::<Vec<u8>>());
+        assert_eq!(tags, (0..=31).collect::<Vec<u8>>());
     }
 
     #[test]
@@ -1852,7 +1900,7 @@ mod tests {
     fn rejects_malformed_bodies() {
         let v = PROTOCOL_VERSION;
         let cases: [(&[u8], Error); 11] = [
-            (&[9, 0, 1], Error::Version(9)),
+            (&[99, 0, 1], Error::Version(99)),
             (&[v, 200], Error::Tag(200)),
             (&[v, 2, 1, 0], Error::Truncated),
             (&[v, 0, 1, 0xff], Error::Trailing(1)),

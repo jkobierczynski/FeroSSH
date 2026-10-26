@@ -381,10 +381,13 @@ impl SessionForm {
                 }
             }
             out.extend([Field::Folder, Field::Type, Field::Host].map(Item::Field));
-            if kind == SessionKind::Serial {
-                out.extend([Field::Speed, Field::Framing, Field::Flow].map(Item::Field));
-            } else {
-                out.extend([Field::User, Field::Port].map(Item::Field));
+            match kind {
+                SessionKind::Serial => {
+                    out.extend([Field::Speed, Field::Framing, Field::Flow].map(Item::Field));
+                }
+                // Telnet logs in at the host's own prompt.
+                SessionKind::Telnet => out.push(Item::Field(Field::Port)),
+                _ => out.extend([Field::User, Field::Port].map(Item::Field)),
             }
             match kind {
                 SessionKind::Ssh => {
@@ -406,9 +409,16 @@ impl SessionForm {
                 }
                 SessionKind::Rdp | SessionKind::Vnc => out.push(Item::Field(Field::Via)),
                 SessionKind::Serial => {}
+                SessionKind::Telnet => {
+                    out.push(Item::Note("Unencrypted: anyone on the way".into()));
+                    out.push(Item::Note("can read it, passwords too.".into()));
+                }
             }
         }
-        if matches!(kind, SessionKind::Ssh | SessionKind::Serial) {
+        if matches!(
+            kind,
+            SessionKind::Ssh | SessionKind::Serial | SessionKind::Telnet
+        ) {
             out.push(Item::Section(1));
             if self.open[1] {
                 out.extend(
@@ -545,6 +555,7 @@ impl SessionForm {
                 SessionKind::Rdp => "Remote desktop (RDP)",
                 SessionKind::Vnc => "VNC desktop",
                 SessionKind::Serial => "Serial console",
+                SessionKind::Telnet => "Telnet (unencrypted)",
             }
             .to_owned(),
             Field::Framing if v.framing.is_empty() => "8N1".to_owned(),
@@ -586,6 +597,7 @@ impl SessionForm {
                     SessionKind::Ssh,
                     SessionKind::Rdp,
                     SessionKind::Vnc,
+                    SessionKind::Telnet,
                     SessionKind::Serial,
                 ];
                 let i = kinds.iter().position(|k| *k == v.kind).unwrap_or(0);
@@ -650,7 +662,10 @@ impl SessionForm {
             Field::Name => "required, e.g. web-prod".into(),
             Field::Folder => "none".into(),
             Field::Host if v.kind == SessionKind::Serial => "COM port, e.g. COM3".into(),
-            Field::Host if v.kind != SessionKind::Ssh && !v.via.trim().is_empty() => {
+            Field::Host
+                if !matches!(v.kind, SessionKind::Ssh | SessionKind::Telnet)
+                    && !v.via.trim().is_empty() =>
+            {
                 "the Via SSH host itself".into()
             }
             Field::Host if v.name.trim().is_empty() => "host name or IP address".into(),
@@ -664,6 +679,7 @@ impl SessionForm {
                 SessionKind::Ssh => "22".into(),
                 SessionKind::Rdp => "3389".into(),
                 SessionKind::Vnc => "5900".into(),
+                SessionKind::Telnet => "23".into(),
                 SessionKind::Serial => String::new(),
             },
             Field::Speed => "9600 bits/s".into(),
@@ -751,9 +767,12 @@ impl SessionForm {
             if !host.is_empty() && !saved::valid_hostname(host) {
                 return Err("The host is not a host name or IP address.".into());
             }
-            if v.user
-                .trim()
-                .contains(|c: char| c.is_whitespace() || c.is_control() || c == '@')
+            // Telnet has no user field: whatever an SSH session left there
+            // is not saved.
+            if v.kind != SessionKind::Telnet
+                && v.user
+                    .trim()
+                    .contains(|c: char| c.is_whitespace() || c.is_control() || c == '@')
             {
                 return Err("The user name has a space or @ in it.".into());
             }
@@ -787,7 +806,7 @@ impl SessionForm {
         }
         let via = v.via.trim();
         match v.kind {
-            SessionKind::Ssh | SessionKind::Serial => {}
+            SessionKind::Ssh | SessionKind::Serial | SessionKind::Telnet => {}
             SessionKind::Vnc if via.is_empty() => {
                 return Err("A VNC desktop goes through an SSH session: fill in Via SSH.".into());
             }
@@ -1200,6 +1219,15 @@ impl SessionForm {
                     hostname: serial::port_name(&v.host).filter(|h| *h != name),
                     ..SavedHost::default()
                 }
+            } else if v.kind == SessionKind::Telnet {
+                // A host and a port; no user, keys or forwards.
+                SavedHost {
+                    alias: name.clone(),
+                    folder: trimmed(&v.folder),
+                    hostname: trimmed(&v.host).filter(|h| *h != name),
+                    port: v.port.trim().parse().ok().filter(|&p| p != 0),
+                    ..SavedHost::default()
+                }
             } else {
                 SavedHost {
                     alias: name.clone(),
@@ -1247,7 +1275,7 @@ impl SessionForm {
         }
         let p = settings.profile_mut(&name);
         p.kind = v.kind;
-        p.via = trimmed(&v.via).filter(|_| v.kind != SessionKind::Ssh);
+        p.via = trimmed(&v.via).filter(|_| matches!(v.kind, SessionKind::Rdp | SessionKind::Vnc));
         p.theme = trimmed(&v.theme);
         p.font = trimmed(&v.font);
         p.font_size = v.font_size.trim().parse().ok();
@@ -1537,7 +1565,7 @@ mod tests {
         let mut f = new_form();
         typed(&mut f, "core");
         down(&mut f, 2);
-        // Type: SSH -> RDP -> VNC -> Serial.
+        // Type: SSH -> RDP -> VNC -> Telnet -> Serial.
         f.key(SideKey::Left, 30);
         let t = texts(&mut f);
         assert!(t[4].contains("‹ Serial console ›"), "{:?}", t[4]);
@@ -1572,6 +1600,36 @@ mod tests {
         let v = Values::from_saved(&hosts[0]).with_profile(Some(p));
         assert_eq!((v.speed.as_str(), v.framing.as_str()), ("115200", "8E1"));
         assert_eq!(v.flow, Flow::DsrDtr);
+    }
+
+    #[test]
+    fn telnet_sessions_save_a_host_and_port_and_warn() {
+        let mut f = new_form();
+        typed(&mut f, "router");
+        down(&mut f, 2);
+        // Type: SSH -> Serial -> Telnet, going back.
+        f.key(SideKey::Left, 30);
+        f.key(SideKey::Left, 30);
+        let t = texts(&mut f);
+        assert!(t[4].contains("‹ Telnet (unencrypted) ›"), "{:?}", t[4]);
+        assert!(t[6].contains("Port") && t[6].contains("23"), "{:?}", t[6]);
+        assert!(t.iter().any(|l| l.contains("Unencrypted")));
+        assert!(!t.iter().any(|l| l.contains("User") || l.contains("Extras")));
+        assert!(t.iter().any(|l| l.contains("Look")));
+        f.values.host = "10.0.0.1".into();
+        f.values.port = "2003".into();
+        // A user typed before switching to Telnet is not checked or kept.
+        f.values.user = "left over".into();
+        assert_eq!(f.check(), Ok(()));
+        let (mut hosts, mut settings) = (Vec::new(), Settings::default());
+        f.apply(&mut hosts, &mut settings);
+        assert_eq!(hosts[0].hostname.as_deref(), Some("10.0.0.1"));
+        assert_eq!(
+            (hosts[0].port, hosts[0].user.as_deref()),
+            (Some(2003), None)
+        );
+        let p = settings.profile("router").unwrap();
+        assert_eq!((p.kind, p.via.as_deref()), (SessionKind::Telnet, None));
     }
 
     #[test]
