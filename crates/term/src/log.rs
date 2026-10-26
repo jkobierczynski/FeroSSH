@@ -6,6 +6,8 @@
 //! CRLF for Notepad. Raw logs keep every byte, for replaying with `cat`.
 //! The UI process writes the file; the worker never sees it. A log opened
 //! with a chain file is also sealed against later edits (see `chain`).
+//! Plain logs can put the time each line started in front of it; raw logs
+//! never do, so they still replay.
 
 use std::io::{self, Write};
 
@@ -115,18 +117,26 @@ pub struct Sealed {
     pub head: String,
 }
 
+/// Gives the time for a line's timestamp, such as `2026-10-26 19:24:49.123`.
+pub type Clock = fn() -> String;
+
 /// Writes one tab's log.
 pub struct LogWriter<W: Write> {
     out: Sink<W>,
     raw: bool,
     parser: Parser,
     line: Line,
+    /// Stamps each plain line with the time when set.
+    clock: Option<Clock>,
+    /// When the unfinished line started, while stamping.
+    started: Option<String>,
 }
 
 impl<W: Write> std::fmt::Debug for LogWriter<W> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("LogWriter")
             .field("raw", &self.raw)
+            .field("timestamps", &self.clock.is_some())
             .finish_non_exhaustive()
     }
 }
@@ -152,11 +162,44 @@ impl<W: Write> LogWriter<W> {
             raw,
             parser: Parser::new(),
             line: Line::default(),
+            clock: None,
+            started: None,
         })
     }
 
     pub fn is_raw(&self) -> bool {
         self.raw
+    }
+
+    /// Puts `clock`'s time in front of each line from now on, or stops
+    /// with `None`. Raw logs ignore it.
+    pub fn set_timestamps(&mut self, clock: Option<Clock>) {
+        self.clock = clock;
+        if clock.is_none() {
+            self.started = None;
+        }
+    }
+
+    /// Writes the lines the parser finished. A line is stamped with the
+    /// time its first bytes came, which for all but the first finished
+    /// line is now.
+    fn write_lines(&mut self) -> io::Result<()> {
+        let Some(clock) = self.clock else {
+            for line in self.line.done.drain(..) {
+                write!(self.out, "{line}\r\n")?;
+            }
+            return Ok(());
+        };
+        let now = clock();
+        let mut first = self.started.take();
+        for line in self.line.done.drain(..) {
+            let at = first.take().unwrap_or_else(|| now.clone());
+            write!(self.out, "[{at}] {line}\r\n")?;
+        }
+        if !self.line.chars.is_empty() {
+            self.started = Some(first.unwrap_or(now));
+        }
+        Ok(())
     }
 
     /// Logs bytes the host sent. The file is flushed every time, so a
@@ -166,9 +209,7 @@ impl<W: Write> LogWriter<W> {
             self.out.write_all(bytes)?;
         } else {
             self.parser.advance(&mut self.line, bytes);
-            for line in self.line.done.drain(..) {
-                write!(self.out, "{line}\r\n")?;
-            }
+            self.write_lines()?;
         }
         self.out.flush()?;
         if let Sink::Chained(c) = &mut self.out {
@@ -199,9 +240,7 @@ impl<W: Write> LogWriter<W> {
     fn close(mut self, footer: &str) -> io::Result<Sink<W>> {
         if !self.raw && !self.line.chars.is_empty() {
             self.line.end();
-            for line in self.line.done.drain(..) {
-                write!(self.out, "{line}\r\n")?;
-            }
+            self.write_lines()?;
         }
         if self.raw {
             write!(self.out, "\r\n")?;
@@ -300,6 +339,47 @@ mod tests {
         let got = crate::chain::verify("x.log", &out, &chain).unwrap();
         assert!(got.ended);
         assert_eq!(got.sealed, out.len() as u64);
+    }
+
+    fn tick() -> String {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static N: AtomicU32 = AtomicU32::new(0);
+        format!("t{}", N.fetch_add(1, Ordering::Relaxed))
+    }
+
+    #[test]
+    fn timestamps_mark_when_each_line_started() {
+        let mut w = LogWriter::new(Vec::new(), false, "start").unwrap();
+        w.write(b"before\r\n").unwrap();
+        w.set_timestamps(Some(tick));
+        // The second write finishes a line the first one started.
+        w.write(b"one\r\ntw").unwrap();
+        w.write(b"o\r\nthree\r\n").unwrap();
+        // A write that ends no line keeps the line's first time.
+        w.write(b"fo").unwrap();
+        w.write(b"ur").unwrap();
+        w.write(b"\x1b[31m").unwrap();
+        let got = String::from_utf8(w.finish("end").unwrap()).unwrap();
+        assert_eq!(
+            got,
+            "start\r\nbefore\r\n[t0] one\r\n[t0] two\r\n[t1] three\r\n[t2] four\r\nend\r\n"
+        );
+    }
+
+    #[test]
+    fn timestamps_can_stop_and_raw_logs_ignore_them() {
+        let mut w = LogWriter::new(Vec::new(), false, "s").unwrap();
+        w.set_timestamps(Some(|| "x".to_owned()));
+        w.write(b"a\r\nb").unwrap();
+        w.set_timestamps(None);
+        w.write(b"\r\nc\r\n").unwrap();
+        let got = String::from_utf8(w.finish("e").unwrap()).unwrap();
+        assert_eq!(got, "s\r\n[x] a\r\nb\r\nc\r\ne\r\n");
+
+        let mut w = LogWriter::new(Vec::new(), true, "s").unwrap();
+        w.set_timestamps(Some(|| "x".to_owned()));
+        w.write(b"a\r\n").unwrap();
+        assert_eq!(w.finish("e").unwrap(), b"s\r\na\r\n\r\ne\r\n");
     }
 
     #[test]

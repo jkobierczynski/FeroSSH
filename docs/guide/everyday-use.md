@@ -39,7 +39,7 @@ Session > Open remote desktop (Ctrl+Shift+D) shows the Linux desktop of the host
 
 ## Logs and scrollback
 
-Session > Log to file writes what a tab receives to `%LOCALAPPDATA%\FeroSSH\logs`, one file per tab. Passwords and passphrases never reach the log. Scrollback is 10,000 lines unless you change it (`Scrollback` in [Settings](settings.md)), and Shift+PgUp scrolls back.
+Session > Log to file writes what a tab receives to `%LOCALAPPDATA%\FeroSSH\logs`, one file per tab. Passwords and passphrases never reach the log. Session > Timestamp each log line puts the local time each line started in front of it, to the millisecond (`[2026-10-26 19:24:49.123] $ uptime`); it applies to open logs from their next line and stays on for new ones. Raw logs are never stamped, so they still replay with `cat`. Scrollback is 10,000 lines unless you change it (`Scrollback` in [Settings](settings.md)), and Shift+PgUp scrolls back.
 
 ## Colour themes
 
