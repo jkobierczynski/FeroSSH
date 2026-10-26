@@ -460,12 +460,15 @@ pub enum Message {
     /// target the stream speaks SOCKS 4, 4a or 5 first and the worker
     /// opens the channel the client asks for. The worker answers with
     /// [`Message::ForwardOpened`], or with [`Message::Disconnected`].
+    /// A stream that `keep`s its connection holds it open after the last
+    /// shell on it closed, as a remote desktop's does.
     ForwardOpen {
         channel: ChannelId,
         connection: ChannelId,
         target: Option<(String, u16)>,
         origin_host: String,
         origin_port: u16,
+        keep: bool,
     },
     /// Worker to UI: the stream is open to `host`:`port`.
     ForwardOpened {
@@ -966,6 +969,7 @@ pub fn encode(msg: &Message, out: &mut Vec<u8>) -> Result<(), Error> {
             target,
             origin_host,
             origin_port,
+            keep,
         } => {
             w.u32(*channel);
             w.u32(*connection);
@@ -976,6 +980,7 @@ pub fn encode(msg: &Message, out: &mut Vec<u8>) -> Result<(), Error> {
             }
             w.str(origin_host);
             w.u16(*origin_port);
+            w.bool(*keep);
         }
         Message::ForwardOpened {
             channel,
@@ -1210,6 +1215,7 @@ fn decode_body(body: &[u8]) -> Result<Message, Error> {
             target: r.opt(|r| Ok((r.string()?, r.u16()?)))?,
             origin_host: r.string()?,
             origin_port: r.u16()?,
+            keep: r.bool()?,
         },
         24 => Message::ForwardOpened {
             channel: r.u32()?,
@@ -1576,6 +1582,7 @@ mod tests {
                 target: Some(("db.internal".into(), 5432)),
                 origin_host: "127.0.0.1".into(),
                 origin_port: 50123,
+                keep: false,
             },
             Message::ForwardOpen {
                 channel: FORWARD_IDS + 1,
@@ -1583,6 +1590,7 @@ mod tests {
                 target: None,
                 origin_host: "::1".into(),
                 origin_port: 1,
+                keep: true,
             },
             Message::ForwardOpened {
                 channel: FORWARD_IDS,

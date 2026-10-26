@@ -82,7 +82,7 @@ pub fn run(mut input: impl Read + Send + 'static, mut output: impl Write) -> io:
     let _ = (width, height, layout, &user);
     match protocol {
         #[cfg(feature = "vnc")]
-        Protocol::Vnc => vnc_session(input, output),
+        Protocol::Vnc => vnc_session(input, output, (width, height)),
         #[cfg(feature = "rdp")]
         Protocol::Rdp => crate::rdp::session(input, output, (width, height), layout, user),
         #[allow(unreachable_patterns)]
@@ -138,8 +138,15 @@ fn flush(client: &mut crate::vnc::Client, out: &mut impl Write) -> io::Result<()
 }
 
 #[cfg(feature = "vnc")]
-fn vnc_session(mut input: impl Read, mut output: impl Write) -> io::Result<()> {
+fn vnc_session(
+    mut input: impl Read,
+    mut output: impl Write,
+    (width, height): (u16, u16),
+) -> io::Result<()> {
     let mut client = crate::vnc::Client::new();
+    if width > 0 && height > 0 {
+        client.resize(width, height);
+    }
     let mut keyboard = crate::keysym::Keyboard::default();
     while let Some(msg) = next(&mut input, &mut output)? {
         match msg {
@@ -177,6 +184,7 @@ fn vnc_session(mut input: impl Read, mut output: impl Write) -> io::Result<()> {
                     client.key(down, keysym);
                 }
             }
+            ToViewer::Resize { width, height } => client.resize(width, height),
             ToViewer::Start { .. } | ToViewer::User(_) => {}
         }
         flush(&mut client, &mut output)?;
@@ -272,5 +280,79 @@ mod tests {
         let mut out = Vec::new();
         assert!(run(std::io::Cursor::new(input), &mut out).is_err());
         assert!(matches!(&replies(&out)[..], [FromViewer::Failed(_)]));
+    }
+    /// A real VNC server, when `FEROSSH_TEST_VNC` names one as "host:port"
+    /// without a password (CI runs TigerVNC's Xvnc): the viewer is asked
+    /// for a new size and the server's screen follows.
+    #[test]
+    fn resizes_a_real_server() {
+        use std::net::TcpStream;
+        use std::sync::{Arc, Mutex};
+        use std::time::{Duration, Instant};
+        let Ok(addr) = std::env::var("FEROSSH_TEST_VNC") else {
+            eprintln!("FEROSSH_TEST_VNC not set; skipped");
+            return;
+        };
+        let tcp = TcpStream::connect(addr.trim()).unwrap();
+        let (viewer_in, window_out) = std::io::pipe().unwrap();
+        let (mut window_in, viewer_out) = std::io::pipe().unwrap();
+        std::thread::spawn(move || run(viewer_in, viewer_out));
+        let to_viewer = Arc::new(Mutex::new(window_out));
+        let tell = |m: ToViewer| write_frame(&mut *to_viewer.lock().unwrap(), &m.encode()).unwrap();
+        tell(ToViewer::Start {
+            protocol: Protocol::Vnc,
+            width: 1000,
+            height: 700,
+            layout: 0,
+            user: String::new(),
+        });
+        let mut net = tcp.try_clone().unwrap();
+        let pump = to_viewer.clone();
+        std::thread::spawn(move || {
+            let mut buf = vec![0u8; 65536];
+            loop {
+                let n = net.read(&mut buf).unwrap_or(0);
+                let msg = if n == 0 {
+                    ToViewer::Closed
+                } else {
+                    ToViewer::Net(buf[..n].to_vec())
+                };
+                if write_frame(&mut *pump.lock().unwrap(), &msg.encode()).is_err() || n == 0 {
+                    return;
+                }
+            }
+        });
+        let mut tcp_out = tcp;
+        let mut fb = Framebuffer::default();
+        let mut resized = false;
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            assert!(
+                Instant::now() < deadline,
+                "the screen stayed {}x{}",
+                fb.width(),
+                fb.height()
+            );
+            let Some(frame) = read_frame(&mut window_in).unwrap() else {
+                panic!("the viewer stopped");
+            };
+            match fb.apply(FromViewer::decode(&frame).unwrap()).unwrap() {
+                Applied::Other(FromViewer::Net(b)) => tcp_out.write_all(&b).unwrap(),
+                Applied::Other(FromViewer::Failed(why)) => panic!("{why}"),
+                _ => {}
+            }
+            // The size the window started with, then a new one.
+            if (fb.width(), fb.height()) == (1000, 700) && !resized {
+                resized = true;
+                tell(ToViewer::Resize {
+                    width: 640,
+                    height: 480,
+                });
+            }
+            if (fb.width(), fb.height()) == (640, 480) {
+                break;
+            }
+        }
+        tell(ToViewer::Closed);
     }
 }

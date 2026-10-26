@@ -26,6 +26,8 @@ use ironrdp_connector::{
     ServerName,
 };
 use ironrdp_core::WriteBuf;
+use ironrdp_displaycontrol::client::DisplayControlClient;
+use ironrdp_dvc::DrdynvcClient;
 use ironrdp_graphics::image_processing::PixelFormat;
 use ironrdp_input::{Database, MouseButton, MousePosition, Operation, Scancode, WheelRotations};
 use ironrdp_pdu::gcc::{ConnectionType, KeyboardType};
@@ -141,10 +143,15 @@ pub(crate) fn session(
         })?;
 
     send(&mut output, &FromViewer::NeedPassword)?;
-    let mut user = user;
+    let (mut user, mut width, mut height) = (user, width, height);
     let password = loop {
         match from.recv() {
             Ok(Item::Msg(ToViewer::User(u))) => user = u,
+            // The pane changed size during the login.
+            Ok(Item::Msg(ToViewer::Resize {
+                width: w,
+                height: h,
+            })) => (width, height) = (w, h),
             Ok(Item::Msg(ToViewer::Password(p))) => {
                 let p = Zeroizing::new(p);
                 break Zeroizing::new(String::from_utf8_lossy(&p).into_owned());
@@ -171,10 +178,8 @@ pub(crate) fn session(
         closed: false,
         bad: false,
     };
-    let size = DesktopSize {
-        width: width.clamp(200, MAX_SIDE) & !1,
-        height: height.clamp(200, MAX_SIDE),
-    };
+    let (width, height) = desktop_size(width, height);
+    let size = DesktopSize { width, height };
     let result = run(&mut pipe, config(user, password, size, layout));
     let bad = pipe.bad;
     drop(pipe);
@@ -183,6 +188,12 @@ pub(crate) fn session(
         Ok(()) => Ok(()),
         Err(why) => send(&mut output, &FromViewer::Failed(why)),
     }
+}
+
+/// A screen size RDP takes: 200 to [`MAX_SIDE`] pixels each way, the
+/// width even.
+fn desktop_size(width: u16, height: u16) -> (u16, u16) {
+    (width.clamp(200, MAX_SIDE) & !1, height.clamp(200, MAX_SIDE))
 }
 
 fn nonsense(output: &mut impl Write) -> io::Result<()> {
@@ -215,7 +226,9 @@ fn config(
             password: password.to_string(),
         },
         domain: None,
-        client_build: 0,
+        // xrdp resizes only clients that say they are newer than build
+        // 419; any build will do.
+        client_build: 2600,
         client_name: "FeroSSH".into(),
         keyboard_type: KeyboardType::IBM_ENHANCED,
         keyboard_subtype: 0,
@@ -298,7 +311,10 @@ fn pipe<'f, 'a, W: Write>(framed: &'f mut Framed<Tls<'_, 'a, W>>) -> &'f mut Pip
 /// Connects, then runs the session.
 fn run<W: Write>(pipe: &mut Pipe<'_, W>, config: ironrdp_connector::Config) -> Result<(), Failure> {
     let client_addr = std::net::SocketAddr::from(([127, 0, 0, 1], 0));
-    let mut connector = ClientConnector::new(config, client_addr);
+    // Display Control lets the desktop follow the pane's size.
+    let drdynvc =
+        DrdynvcClient::new().with_dynamic_channel(DisplayControlClient::new(|_| Ok(Vec::new())));
+    let mut connector = ClientConnector::new(config, client_addr).with_static_channel(drdynvc);
     let mut framed = Framed::new(&mut *pipe);
     let mut buf = WriteBuf::new();
     while !connector.should_perform_security_upgrade() {
@@ -342,6 +358,33 @@ fn run<W: Write>(pipe: &mut Pipe<'_, W>, config: ironrdp_connector::Config) -> R
                 .into(),
         ),
     }
+}
+
+/// Whether a PDU that came while the display is being reset belongs to
+/// the reset's finalization. A server still drawing at the old size (xrdp
+/// after a resize) can send updates and channel data in between, which
+/// IronRDP's finalization takes for an error; they are dropped, and the
+/// server draws everything again at the new size. Anything that does not
+/// decode goes to the finalization, which says what is wrong with it.
+fn finalization_pdu(pdu: &[u8], io_channel: u16) -> bool {
+    use ironrdp_pdu::rdp::headers::{ShareDataPdu, decode_share_data};
+    let Ok(ctx) = ironrdp_pdu::mcs::decode_send_data_indication(pdu) else {
+        return true;
+    };
+    if ctx.channel_id != io_channel {
+        return false;
+    }
+    let Ok(share) = decode_share_data(ctx) else {
+        return true;
+    };
+    matches!(
+        share.pdu,
+        ShareDataPdu::Synchronize(_)
+            | ShareDataPdu::Control(_)
+            | ShareDataPdu::ServerSetErrorInfo(_)
+            | ShareDataPdu::MonitorLayout(_)
+            | ShareDataPdu::FontMap(_)
+    )
 }
 
 /// TLS on ring, accepting the server's certificate as it is (see the
@@ -441,6 +484,10 @@ struct Active {
     buttons: u8,
     /// The size the window was last told.
     told: Option<(u16, u16)>,
+    /// The pane's size, which the desktop should take.
+    want: Option<(u16, u16)>,
+    /// The size last asked of the server, not asked again.
+    asked: Option<(u16, u16)>,
 }
 
 /// Wheel up and down in [`ToViewer::Pointer`], as VNC has them.
@@ -478,12 +525,21 @@ impl Active {
             activation: r.activation_factory,
             buttons: 0,
             told: None,
+            want: None,
+            asked: Some((w, h)),
         })
     }
 
     fn run<W: Write>(mut self, framed: &mut Framed<Tls<'_, '_, W>>) -> Result<(), Failure> {
-        // Input from before the desktop showed is stale.
-        pipe(framed).pending.clear();
+        // Input from before the desktop showed is stale; the pane's
+        // newest size is not.
+        let early = std::mem::take(&mut pipe(framed).pending);
+        self.input_events(
+            early
+                .into_iter()
+                .filter(|m| matches!(m, ToViewer::Resize { .. }))
+                .collect(),
+        );
         loop {
             self.tell_size(framed)?;
             pipe(framed).interruptible = true;
@@ -505,6 +561,7 @@ impl Active {
             }
             let pending = std::mem::take(&mut pipe(framed).pending);
             let events = self.input_events(pending);
+            self.ask_size(framed)?;
             if !events.is_empty() {
                 let outputs = self
                     .stage
@@ -514,6 +571,28 @@ impl Active {
                     return Ok(());
                 }
             }
+        }
+    }
+
+    /// Asks the server for the pane's size, over Display Control, once
+    /// the server has it open. A server without it keeps its size, and
+    /// the window scales the picture.
+    fn ask_size<W: Write>(&mut self, framed: &mut Framed<Tls<'_, '_, W>>) -> Result<(), Failure> {
+        let Some(want) = self.want else {
+            return Ok(());
+        };
+        if self.asked == Some(want) || self.stage.display_control_ready() != Some(true) {
+            return Ok(());
+        }
+        self.asked = Some(want);
+        let (w, h) = want;
+        match self
+            .stage
+            .encode_resize(u32::from(w), u32::from(h), None, None)
+        {
+            Some(Ok(frame)) => framed.write_all(&frame).map_err(|e| io_failure(&e)),
+            Some(Err(e)) => Err(format!("The RDP session failed: {e}")),
+            None => Ok(()),
         }
     }
 
@@ -572,6 +651,13 @@ impl Active {
             let written = match seq.next_pdu_hint() {
                 Some(hint) => {
                     let pdu = framed.read_by_hint(hint).map_err(|e| io_failure(&e))?;
+                    let finalizing = matches!(
+                        seq.connection_activation_state(),
+                        ConnectionActivationState::ConnectionFinalization { .. }
+                    );
+                    if finalizing && !finalization_pdu(&pdu, seq.io_channel_id()) {
+                        continue;
+                    }
                     seq.step(&pdu, framed.last_read_at(), &mut buf)
                 }
                 None => seq.step_no_input(&mut buf),
@@ -692,6 +778,9 @@ impl Active {
                     self.buttons = 0;
                     events.extend(self.input.release_all());
                 }
+                ToViewer::Resize { width, height } => {
+                    self.want = Some(desktop_size(width, height));
+                }
                 // Characters are typed through their keys' scan codes.
                 _ => {}
             }
@@ -734,6 +823,8 @@ pub fn fuzz_server_pdus(data: &[u8]) {
         ),
         buttons: 0,
         told: None,
+        want: None,
+        asked: None,
     };
     let mut fb = Framebuffer::default();
     let _ = fb.apply(FromViewer::Size {
@@ -857,6 +948,28 @@ mod tests {
         }
         assert_eq!((fb.width(), fb.height()), (800, 600));
         assert!(fb.pixels().contains(&0x336699), "the desktop never showed");
+
+        // The pane grows: the desktop follows, over Display Control, and
+        // is drawn again at the new size.
+        tell(ToViewer::Resize {
+            width: 1025,
+            height: 700,
+        });
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            assert!(Instant::now() < deadline, "the desktop kept its size");
+            let Some(frame) = read_frame(&mut window_in).unwrap() else {
+                panic!("the viewer stopped");
+            };
+            match fb.apply(FromViewer::decode(&frame).unwrap()).unwrap() {
+                Applied::Other(FromViewer::Net(b)) => tcp_out.write_all(&b).unwrap(),
+                Applied::Other(FromViewer::Failed(why)) => panic!("{why}"),
+                _ => {}
+            }
+            if (fb.width(), fb.height()) == (1024, 700) && fb.pixels().contains(&0x336699) {
+                break;
+            }
+        }
 
         // Pointer over the xterm (no window manager: focus follows it),
         // then type a command by scan code. On this machine, its file

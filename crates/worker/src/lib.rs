@@ -137,6 +137,7 @@ pub async fn serve(mut inbox: mpsc::Receiver<Message>, out: mpsc::Sender<Message
                 target,
                 origin_host,
                 origin_port,
+                keep,
             } => {
                 let (tx, rx) = mpsc::unbounded_channel();
                 if !routes.insert(channel, Route::Stream(tx)) {
@@ -147,6 +148,7 @@ pub async fn serve(mut inbox: mpsc::Receiver<Message>, out: mpsc::Sender<Message
                     connection,
                     target,
                     (origin_host, origin_port),
+                    keep,
                     rx,
                     out.clone(),
                     connections.clone(),

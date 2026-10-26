@@ -32,9 +32,9 @@ pub enum Protocol {
 /// Window to viewer.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ToViewer {
-    /// The first message: the protocol, the screen size an RDP server
-    /// should give (VNC servers choose their own), the Windows keyboard
-    /// layout id and the user name to offer.
+    /// The first message: the protocol, the pane's size (which an RDP
+    /// server gives the desktop, and a VNC server that can is asked
+    /// for), the Windows keyboard layout id and the user name to offer.
     Start {
         protocol: Protocol,
         width: u16,
@@ -66,6 +66,12 @@ pub enum ToViewer {
     Password(Vec<u8>),
     /// The pane lost the keyboard: let go of every key held down.
     Release,
+    /// The pane is now this size: a server that can should give the
+    /// desktop that size.
+    Resize {
+        width: u16,
+        height: u16,
+    },
 }
 
 /// Viewer to window.
@@ -259,6 +265,11 @@ impl ToViewer {
                 put_string(&mut v, u);
             }
             ToViewer::Release => v.push(9),
+            ToViewer::Resize { width, height } => {
+                v.push(10);
+                v.extend(width.to_le_bytes());
+                v.extend(height.to_le_bytes());
+            }
         }
         v
     }
@@ -301,6 +312,13 @@ impl ToViewer {
             7 => ToViewer::Char(char::from_u32(f.u32()?)?),
             8 => ToViewer::User(f.string(MAX_USER)?),
             9 => ToViewer::Release,
+            10 => {
+                let (width, height) = (f.u16()?, f.u16()?);
+                if width > MAX_SIDE || height > MAX_SIDE {
+                    return None;
+                }
+                ToViewer::Resize { width, height }
+            }
             _ => return None,
         };
         f.end()?;
@@ -439,6 +457,10 @@ mod tests {
             ToViewer::Char('é'),
             ToViewer::User("jurgen".into()),
             ToViewer::Release,
+            ToViewer::Resize {
+                width: 1920,
+                height: 1080,
+            },
             ToViewer::Start {
                 protocol: Protocol::Rdp,
                 width: 1280,

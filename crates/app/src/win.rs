@@ -140,6 +140,10 @@ const TIMER_SYNC: usize = 1;
 /// Updates the transfer queue's progress while files move.
 const TIMER_TRANSFER: usize = 2;
 const TRANSFER_TICK_MS: u32 = 250;
+/// Gives remote desktops their pane's new size once it stops changing,
+/// so dragging a divider does not resize the desktop at every step.
+const TIMER_DESKTOP_SIZE: usize = 3;
+const DESKTOP_SIZE_MS: u32 = 300;
 /// Output processed per message before the window gets a chance to paint.
 const OUTPUT_BUDGET: usize = 1 << 20;
 /// Wheel units (120 per notch) per scrolled line: three lines a notch.
@@ -244,10 +248,12 @@ enum Host {
         label: String,
     },
     /// The built-in viewer's remote desktop (in the pane's `desktop`);
-    /// `label` names the host.
+    /// `label` names the host, and `connection` is the SSH connection the
+    /// tunnel runs on, which stays open while the desktop shows.
     #[cfg_attr(not(feature = "viewer"), allow(dead_code))]
     Desktop {
         label: String,
+        connection: ChannelId,
     },
 }
 
@@ -339,7 +345,7 @@ impl Pane {
             Host::Ssh(s) => s.target.label(),
             Host::Local { .. } => "local".to_owned(),
             Host::Ask(_) => "new tab".to_owned(),
-            Host::Tmux { label, .. } | Host::Desktop { label } => label.clone(),
+            Host::Tmux { label, .. } | Host::Desktop { label, .. } => label.clone(),
         }
     }
 
@@ -1750,15 +1756,19 @@ impl Window {
         }
     }
 
-    /// Stops the forwards of connections no logged-in pane uses any more.
+    /// Stops the forwards of connections no logged-in pane and no remote
+    /// desktop uses any more.
     fn prune_forwards(&mut self) {
         let Some(w) = &self.worker else {
             return;
         };
         for v in w.forwarder.view() {
-            let used = self.panes.values().any(|p| {
-                matches!(&p.host, Host::Ssh(s)
-                    if s.connection == v.connection && s.state() == State::Connected)
+            let used = self.panes.values().any(|p| match &p.host {
+                Host::Ssh(s) => s.connection == v.connection && s.state() == State::Connected,
+                Host::Desktop { connection, .. } => {
+                    *connection == v.connection && p.desktop.is_some()
+                }
+                _ => false,
             });
             if !used {
                 w.forwarder.stop(v.connection);
@@ -1872,7 +1882,7 @@ impl Window {
                         label,
                         user,
                         protocol,
-                    }) => self.desktop_tab(label, user, protocol, &addr),
+                    }) => self.desktop_tab(connection, label, user, protocol, &addr),
                     None => {}
                 },
                 DesktopEvent::Failed {
@@ -1903,18 +1913,25 @@ impl Window {
 
     /// Opens the built-in viewer on the tunnel at `addr` in a new tab.
     #[cfg(feature = "viewer")]
-    fn desktop_tab(&mut self, label: String, user: String, protocol: Protocol, addr: &str) {
+    fn desktop_tab(
+        &mut self,
+        connection: ChannelId,
+        label: String,
+        user: String,
+        protocol: Protocol,
+        addr: &str,
+    ) {
         let id = self.new_tab_pane();
-        // An RDP server draws the desktop at the size of the tab.
+        // The server draws the desktop at the size of the tab, when it can.
         let (width, height) = self
             .panes
             .get(&id)
-            .map(|p| (p.rect.w, p.rect.h))
+            .map(|p| desktop_size(p.rect))
             .unwrap_or((1024, 768));
         let session = crate::desktop::Session {
             protocol,
-            width: u16::try_from(width.clamp(200, 8192)).unwrap_or(1024),
-            height: u16::try_from(height.clamp(200, 8192)).unwrap_or(768),
+            width,
+            height,
             layout: keyboard_layout(),
             user,
         };
@@ -1928,6 +1945,7 @@ impl Window {
                 if let Some(p) = self.panes.get_mut(&id) {
                     p.host = Host::Desktop {
                         label: format!("desktop {label}"),
+                        connection,
                     };
                     p.desktop = Some(Box::new(desktop));
                 }
@@ -1947,7 +1965,30 @@ impl Window {
     }
 
     #[cfg(not(feature = "viewer"))]
-    fn desktop_tab(&mut self, _label: String, _user: String, _protocol: Protocol, _addr: &str) {}
+    fn desktop_tab(
+        &mut self,
+        _connection: ChannelId,
+        _label: String,
+        _user: String,
+        _protocol: Protocol,
+        _addr: &str,
+    ) {
+    }
+
+    /// Gives each remote desktop its pane's size, after the layout
+    /// settled.
+    fn on_desktop_size_timer(&mut self) {
+        // SAFETY: our window and timer.
+        unsafe {
+            let _ = KillTimer(Some(self.hwnd), TIMER_DESKTOP_SIZE);
+        }
+        for p in self.panes.values_mut() {
+            let (w, h) = desktop_size(p.rect);
+            if let Some(d) = p.desktop.as_mut() {
+                d.resize(w, h);
+            }
+        }
+    }
 
     /// Applies what the remote desktops sent.
     fn poll_desktops(&mut self) {
@@ -1994,6 +2035,8 @@ impl Window {
                             p.desktop = None;
                             p.grid.mark_all_dirty();
                         }
+                        // The connection may have stayed open only for it.
+                        self.prune_forwards();
                         let why = crate::ssh::sanitize(&why);
                         self.show(
                             id,
@@ -3063,6 +3106,10 @@ impl Window {
                 self.apply(id, vec![e]);
             }
         }
+        if self.panes.values().any(|p| p.desktop.is_some()) {
+            // SAFETY: our window; replaces any earlier timer with this id.
+            unsafe { SetTimer(Some(self.hwnd), TIMER_DESKTOP_SIZE, DESKTOP_SIZE_MS, None) };
+        }
         self.sync_tmux();
         self.refresh_chrome();
         self.refresh_visible();
@@ -3938,14 +3985,32 @@ impl Window {
             if moved {
                 self.after_structure_change();
             } else {
+                // Back to the pane's own tab, if the drag showed another.
+                let shown = self.ws.active;
+                self.ws.focus(id);
+                if self.ws.active != shown {
+                    self.after_structure_change();
+                }
                 self.request_full_redraw();
             }
         }
         None
     }
 
+    /// The tab under client x in the strip, if any.
+    fn strip_tab_at(&self, x: i32) -> Option<usize> {
+        let s = self.areas.strip?;
+        let cpad = scale(CHROME_PADDING_DIP, self.dpi);
+        let col = ((x - s.x - cpad).max(0) / self.strip_metrics.width.max(1) as i32) as usize;
+        match self.strip_layout.hit(col)? {
+            Hit::Tab(i) | Hit::Close(i) => Some(i),
+            Hit::NewTab => None,
+        }
+    }
+
     fn on_mouse_move(&mut self, (x, y): (i32, i32), mods: Mods) {
         self.mouse.at = (x, y);
+        let hover = self.strip_tab_at(x);
         if let Some(drag) = &mut self.drag {
             match drag {
                 Drag::Divider { path, axis, span } => {
@@ -3973,7 +4038,34 @@ impl Window {
                     let Some(s) = self.areas.strip else {
                         return;
                     };
-                    let below = home.is_some() && y >= s.bottom();
+                    let in_strip = y < s.bottom();
+                    if *out && in_strip {
+                        // Back over the strip: another tab shows that tab
+                        // to drop into; the dragged one goes back to
+                        // moving it along the strip.
+                        match hover {
+                            Some(i) if i != *index => {
+                                let focus = self.ws.tabs.get(i).map(|t| t.focus);
+                                if focus.is_some() && focus != *home {
+                                    *home = focus;
+                                    if let Some(f) = focus {
+                                        self.ws.focus(f);
+                                    }
+                                    self.after_structure_change();
+                                }
+                            }
+                            _ => {
+                                *out = false;
+                                if let Some(f) = self.ws.tabs.get(*index).map(|t| t.focus) {
+                                    self.ws.focus(f);
+                                }
+                                self.after_structure_change();
+                            }
+                        }
+                        self.request_full_redraw();
+                        return;
+                    }
+                    let below = home.is_some() && !in_strip;
                     if below != *out {
                         // Show the tab to drop into, or the dragged one again.
                         *out = below;
@@ -4005,7 +4097,7 @@ impl Window {
                         self.update_menu_checks();
                     }
                 }
-                Drag::Pane { start, active, .. } => {
+                Drag::Pane { id, start, active } => {
                     if !*active
                         && ((x - start.0).abs() > DRAG_START_PX
                             || (y - start.1).abs() > DRAG_START_PX)
@@ -4013,6 +4105,18 @@ impl Window {
                         *active = true;
                     }
                     if *active {
+                        // Over a tab in the strip: show it, to drop the
+                        // pane into one of its panes.
+                        let id = *id;
+                        let over_strip = self.areas.strip.is_some_and(|s| s.contains(x, y));
+                        if let Some(i) = hover.filter(|_| over_strip)
+                            && i != self.ws.active
+                            && let Some(f) = self.ws.tabs.get(i).map(|t| t.focus)
+                        {
+                            let f = if self.ws.tab_of(id) == Some(i) { id } else { f };
+                            self.ws.focus(f);
+                            self.after_structure_change();
+                        }
                         self.request_full_redraw();
                     }
                 }
@@ -5194,6 +5298,12 @@ const NOT_IN_SHELL: &str = "Log in to an SSH host in this pane first; Attach tmu
                             `tmux -CC new-session -A -s main` at its shell (the session name \
                             comes from the host's Tmux setting in ferossh.conf).";
 
+/// The size, in pixels, a remote desktop in a pane at `rect` should have.
+fn desktop_size(rect: Rect) -> (u16, u16) {
+    let side = |v: i32| u16::try_from(v.clamp(200, 8192)).unwrap_or(1024);
+    (side(rect.w), side(rect.h))
+}
+
 /// Session > Open remote desktop on a pane that is not logged in.
 const NO_DESKTOP_HOST: &str = "Log in to an SSH host in this pane first. Open remote desktop \
                                tunnels the host's Remote Desktop (RDP) port over that \
@@ -5804,6 +5914,10 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
             }
             WM_TIMER if wparam.0 == TIMER_TRANSFER => {
                 with_window(Window::on_transfer_timer);
+                LRESULT(0)
+            }
+            WM_TIMER if wparam.0 == TIMER_DESKTOP_SIZE => {
+                with_window(Window::on_desktop_size_timer);
                 LRESULT(0)
             }
             WM_DROPFILES => {

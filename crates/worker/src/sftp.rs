@@ -504,7 +504,7 @@ pub async fn run(
 }
 
 /// Drops a hold on the connection; the last one disconnects it.
-async fn release(conn: Arc<Connection>) {
+pub(crate) async fn release(conn: Arc<Connection>) {
     if let Some(handle) = Arc::into_inner(conn) {
         let _ = handle.disconnect(Disconnect::ByApplication, "", "en").await;
     }
