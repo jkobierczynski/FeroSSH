@@ -2229,11 +2229,8 @@ mod tests {
             reason: "edge:22: the server could not connect (ConnectFailed).".into(),
         });
         let text = shown(&fx);
-        let why = text.find("could not reach edge:22").expect("the reason");
-        assert!(
-            why < text.find("Jump host me@edge").expect("the end"),
-            "{text}"
-        );
+        let why = text.find("could not reach edge:22").unwrap();
+        assert!(why < text.find("Jump host me@edge").unwrap(), "{text}");
         assert!(matches!(fx.last(), Some(Effect::Ended)));
         assert_eq!(s.state(), State::Ended);
     }
