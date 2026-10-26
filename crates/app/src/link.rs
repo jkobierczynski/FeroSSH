@@ -7,7 +7,7 @@ use std::io::{Read, Write};
 use std::sync::mpsc::{Receiver, Sender, SyncSender, channel, sync_channel};
 use std::thread;
 
-use ferossh_ipc::{Decoder, Message, PROTOCOL_VERSION, encode, is_forward_channel};
+use ferossh_ipc::{Decoder, Message, PROTOCOL_VERSION, Side, encode, is_forward_channel};
 
 /// Messages buffered from the worker; a flooding host is slowed down to
 /// what the window can show.
@@ -56,6 +56,10 @@ fn reader(
                     }
                     _ => return "The SSH worker speaks another protocol version.".into(),
                 }
+            }
+            if msg.sent_by() == Side::Ui {
+                return "The SSH worker sent a message only the window sends; it was stopped."
+                    .into();
             }
             if msg.channel().is_some_and(is_forward_channel) {
                 divert(msg);
@@ -128,5 +132,60 @@ impl Link {
 
     pub fn try_recv(&self) -> Option<LinkEvent> {
         self.rx.try_recv().ok()
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::panic)]
+mod tests {
+    use super::*;
+
+    fn frames(msgs: &[Message]) -> std::io::Cursor<Vec<u8>> {
+        let mut out = Vec::new();
+        for m in msgs {
+            encode(m, &mut out).unwrap();
+        }
+        std::io::Cursor::new(out)
+    }
+
+    fn run(msgs: &[Message]) -> (String, Vec<Message>) {
+        let (tx, rx) = sync_channel(BACKLOG);
+        let why = reader(frames(msgs), &tx, &|| {}, &|_| {});
+        let got = rx
+            .try_iter()
+            .map(|e| match e {
+                LinkEvent::Message(m) => m,
+                LinkEvent::Closed(why) => panic!("{why}"),
+            })
+            .collect();
+        (why, got)
+    }
+
+    #[test]
+    fn a_worker_sending_ui_messages_is_stopped() {
+        let hello = Message::Hello {
+            version: PROTOCOL_VERSION,
+        };
+        let notice = Message::Notice {
+            channel: 1,
+            text: "hi".into(),
+        };
+        let (why, got) = run(&[hello.clone(), notice.clone()]);
+        assert_eq!(why, "The SSH worker exited.");
+        assert_eq!(got, vec![notice.clone()]);
+
+        let answers = Message::Answers {
+            channel: 1,
+            answers: ferossh_ipc::Secrets(vec!["pw".into()]),
+        };
+        let (why, got) = run(&[hello, answers, notice]);
+        assert!(why.contains("only the window sends"), "{why}");
+        assert!(got.is_empty());
+    }
+
+    #[test]
+    fn the_worker_must_greet_first() {
+        let (why, _) = run(&[Message::Close { channel: 1 }]);
+        assert!(why.contains("another protocol version"));
     }
 }

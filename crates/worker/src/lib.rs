@@ -18,7 +18,7 @@ mod sftp;
 use std::io::{Read, Write};
 use std::thread;
 
-use ferossh_ipc::{ChannelId, Decoder, Message, PROTOCOL_VERSION, encode};
+use ferossh_ipc::{ChannelId, Decoder, Message, PROTOCOL_VERSION, Side, encode};
 use tokio::sync::mpsc;
 
 pub use session::Params;
@@ -194,6 +194,8 @@ pub fn run_blocking(
                 decoder.feed(buf.get(..n).unwrap_or_default());
                 loop {
                     match decoder.next_message() {
+                        // Only the worker sends these: the UI is confused.
+                        Ok(Some(msg)) if msg.sent_by() == Side::Worker => return,
                         Ok(Some(msg)) => {
                             if in_tx.blocking_send(msg).is_err() {
                                 return;

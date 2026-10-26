@@ -237,7 +237,35 @@ pub struct SshSession {
     fetching: Option<(PromptField, Vec<PromptField>)>,
     /// The password typed for this login, to keep once it worked.
     typed_password: Option<Zeroizing<String>>,
+    /// Where this login is, for checking that the worker asks in turn.
+    login: Login,
 }
+
+/// How far a login has come. The worker may only ask for what the honest
+/// order needs: one host key verdict, then keys, signatures and prompts,
+/// and nothing of the kind once the shell is open or on a shell opened on
+/// an existing connection. A worker that asks out of turn is treated as
+/// compromised and the connection is closed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+struct Login {
+    /// This session sent [`Message::Connect`]: it logs in itself.
+    started: bool,
+    /// The worker asked about the host key (or certificate).
+    host_asked: bool,
+    /// The host key was trusted.
+    host_trusted: bool,
+    /// Signatures asked for so far.
+    signatures: u32,
+}
+
+/// Signatures one login may ask for: one per key tried, with room for
+/// partial-success logins that need several. OpenSSH tries at most a few
+/// dozen keys before the server's MaxAuthTries ends it anyway.
+const MAX_SIGNATURES: u32 = 32;
+
+/// Questions in one prompt. OpenSSH's sshd sends one or two; PAM stacks a
+/// few more.
+const MAX_PROMPT_FIELDS: usize = 16;
 
 impl std::fmt::Debug for SshSession {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -308,6 +336,7 @@ impl SshSession {
             source_used: false,
             fetching: None,
             typed_password: None,
+            login: Login::default(),
         }
     }
 
@@ -347,6 +376,10 @@ impl SshSession {
             text.push_str(&format!(" ({})", t.hostname));
         }
         text.push_str("...");
+        self.login = Login {
+            started: true,
+            ..Login::default()
+        };
         vec![
             Effect::Show(dim(&text)),
             Effect::Send(Message::Connect {
@@ -430,9 +463,58 @@ impl SshSession {
         })]
     }
 
-    pub fn on_worker(&mut self, msg: Message) -> Vec<Effect> {
+    /// Why `msg` is not something the worker may send now, if it is not.
+    fn out_of_turn(&self, msg: &Message) -> Option<&'static str> {
+        let login = self.login;
+        let logging_in = login.started && self.state == State::Connecting;
         match msg {
-            Message::HostKey { key, .. } => self.on_host_key(key),
+            Message::HostKey { .. } | Message::HostCert { .. } => {
+                if !logging_in {
+                    Some("a host key check outside a login")
+                } else if login.host_asked {
+                    Some("a second host key check")
+                } else {
+                    None
+                }
+            }
+            Message::Banner { .. }
+            | Message::IdentitiesRequest { .. }
+            | Message::SignRequest { .. }
+            | Message::Prompt { .. } => {
+                if !logging_in {
+                    Some("a login step outside a login")
+                } else if !login.host_trusted {
+                    Some("a login step before the host key was trusted")
+                } else if matches!(msg, Message::SignRequest { .. })
+                    && login.signatures >= MAX_SIGNATURES
+                {
+                    Some("too many signatures")
+                } else if matches!(msg, Message::Prompt { fields, .. } if fields.len() > MAX_PROMPT_FIELDS)
+                {
+                    Some("a prompt with too many questions")
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        }
+    }
+
+    pub fn on_worker(&mut self, msg: Message) -> Vec<Effect> {
+        if let Some(what) = self.out_of_turn(&msg) {
+            let mut effects = vec![Effect::Show(format!(
+                "\r\n{RED}The SSH worker asked for {what}. That is not how a login goes, so \
+                 FeroSSH closed the connection.{RESET}\r\n"
+            ))];
+            effects.extend(self.close());
+            effects.push(Effect::Ended);
+            return effects;
+        }
+        match msg {
+            Message::HostKey { key, .. } => {
+                self.login.host_asked = true;
+                self.on_host_key(key)
+            }
             Message::HostCert {
                 ca,
                 key,
@@ -443,6 +525,7 @@ impl SshSession {
                 serial,
                 ..
             } => {
+                self.login.host_asked = true;
                 let cert = HostCert {
                     ca,
                     key,
@@ -461,7 +544,10 @@ impl SshSession {
             Message::IdentitiesRequest { .. } => vec![Effect::Broker(Job::Identities {
                 files: self.target.key_files.clone(),
             })],
-            Message::SignRequest { key, data, .. } => self.on_sign_request(&key, data),
+            Message::SignRequest { key, data, .. } => {
+                self.login.signatures += 1;
+                self.on_sign_request(&key, data)
+            }
             Message::Prompt {
                 kind,
                 name,
@@ -534,7 +620,8 @@ impl SshSession {
         }
     }
 
-    fn verdict(&self, accept: bool) -> Effect {
+    fn verdict(&mut self, accept: bool) -> Effect {
+        self.login.host_trusted = accept;
         Effect::Send(Message::HostKeyVerdict {
             channel: self.channel,
             accept,
@@ -1094,6 +1181,26 @@ mod tests {
             .collect()
     }
 
+    /// Starts `s` and trusts the host key, as a login does first.
+    fn trusted(s: &mut SshSession) {
+        s.start(80, 24);
+        let mut fx = s.on_worker(Message::HostKey {
+            channel: s.channel,
+            key: ed25519_blob(),
+        });
+        if s.prompt_active() {
+            s.prompt_input(b"yes");
+            fx = s.prompt_input(b"\r");
+        }
+        assert!(
+            matches!(
+                sent(&fx)[..],
+                [Message::HostKeyVerdict { accept: true, .. }]
+            ),
+            "{fx:?}"
+        );
+    }
+
     #[test]
     fn resolves_targets() {
         let dir = temp("resolve");
@@ -1294,6 +1401,7 @@ mod tests {
 
         // The next connection trusts it without asking.
         let mut s2 = SshSession::new(2, Target::resolve("host", &e).unwrap(), e.known_hosts());
+        s2.start(80, 24);
         let fx = s2.on_worker(Message::HostKey {
             channel: 2,
             key: ed25519_blob(),
@@ -1312,6 +1420,7 @@ mod tests {
         let dir = temp("no");
         let e = env(&dir);
         let mut s = SshSession::new(1, Target::resolve("host", &e).unwrap(), e.known_hosts());
+        s.start(80, 24);
         s.on_worker(Message::HostKey {
             channel: 1,
             key: ed25519_blob(),
@@ -1339,6 +1448,7 @@ mod tests {
         known_hosts::add(&e.known_hosts(), "host", 22, &other).unwrap();
 
         let mut s = SshSession::new(1, Target::resolve("host", &e).unwrap(), e.known_hosts());
+        s.start(80, 24);
         let fx = s.on_worker(Message::HostKey {
             channel: 1,
             key: ed25519_blob(),
@@ -1369,6 +1479,7 @@ mod tests {
         let dir = temp("prompt");
         let e = env(&dir);
         let mut s = SshSession::new(1, Target::resolve("host", &e).unwrap(), e.known_hosts());
+        trusted(&mut s);
         let fx = s.on_worker(Message::Prompt {
             channel: 1,
             kind: PromptKind::KeyboardInteractive,
@@ -1427,6 +1538,7 @@ mod tests {
         let dir = temp("source");
         let e = env(&dir);
         let mut s = SshSession::new(1, Target::resolve("host", &e).unwrap(), e.known_hosts());
+        trusted(&mut s);
         s.password_source = true;
         let fx = s.on_worker(password_prompt(1));
         assert!(matches!(fx[..], [Effect::FetchPassword]), "{fx:?}");
@@ -1448,6 +1560,7 @@ mod tests {
         let dir = temp("source-fail");
         let e = env(&dir);
         let mut s = SshSession::new(1, Target::resolve("host", &e).unwrap(), e.known_hosts());
+        trusted(&mut s);
         s.password_source = true;
         // PAM's keyboard-interactive password counts too.
         let fx = s.on_worker(Message::Prompt {
@@ -1484,6 +1597,7 @@ mod tests {
         let dir = temp("remember");
         let e = env(&dir);
         let mut s = SshSession::new(1, Target::resolve("host", &e).unwrap(), e.known_hosts());
+        trusted(&mut s);
         s.password_source = true;
         s.remember_password = true;
         s.on_worker(password_prompt(1));
@@ -1511,6 +1625,7 @@ mod tests {
         let dir = temp("cancel");
         let e = env(&dir);
         let mut s = SshSession::new(1, Target::resolve("host", &e).unwrap(), e.known_hosts());
+        trusted(&mut s);
         s.on_worker(Message::Prompt {
             channel: 1,
             kind: PromptKind::Password,
@@ -1531,6 +1646,7 @@ mod tests {
         let dir = temp("sign");
         let e = env(&dir);
         let mut s = SshSession::new(1, Target::resolve("host", &e).unwrap(), e.known_hosts());
+        trusted(&mut s);
         let key = ed25519_blob();
         // Unknown key: refused without asking the broker.
         let fx = s.on_worker(Message::SignRequest {
@@ -1558,6 +1674,87 @@ mod tests {
             sent(&fx)[..],
             [Message::Signature { signature, .. }] if signature.is_empty()
         ));
+    }
+
+    #[test]
+    fn a_worker_that_asks_out_of_turn_is_cut_off() {
+        let dir = temp("turns");
+        let e = env(&dir);
+        let target = || Target::resolve("host", &e).unwrap();
+        let closed = |fx: &[Effect]| {
+            shown(fx).contains("not how a login goes")
+                && sent(fx).contains(&&Message::Close { channel: 1 })
+        };
+        let sign = Message::SignRequest {
+            channel: 1,
+            key: ed25519_blob(),
+            data: b"x".to_vec(),
+        };
+
+        // Before the host key: no prompts, keys or signatures.
+        for msg in [
+            password_prompt(1),
+            sign.clone(),
+            Message::IdentitiesRequest { channel: 1 },
+        ] {
+            let mut s = SshSession::new(1, target(), e.known_hosts());
+            s.start(80, 24);
+            let fx = s.on_worker(msg);
+            assert!(closed(&fx), "{fx:?}");
+            assert_eq!(s.state(), State::Ended);
+        }
+
+        // One host key per login.
+        let mut s = SshSession::new(1, target(), e.known_hosts());
+        trusted(&mut s);
+        let fx = s.on_worker(Message::HostKey {
+            channel: 1,
+            key: ed25519_blob(),
+        });
+        assert!(closed(&fx));
+
+        // Nothing of the kind once logged in.
+        let mut s = SshSession::new(1, target(), e.known_hosts());
+        trusted(&mut s);
+        s.on_worker(Message::Connected {
+            channel: 1,
+            kex: "k".into(),
+            cipher: "c".into(),
+            host_key: "h".into(),
+        });
+        assert!(closed(&s.on_worker(password_prompt(1))));
+
+        // A shell on an existing connection never logs in.
+        let mut s = SshSession::new(1, target(), e.known_hosts());
+        s.start_on(7, 80, 24);
+        assert!(closed(&s.on_worker(Message::HostKey {
+            channel: 1,
+            key: ed25519_blob(),
+        })));
+
+        // Too many questions, or too many signatures.
+        let mut s = SshSession::new(1, target(), e.known_hosts());
+        trusted(&mut s);
+        let fields = vec![
+            PromptField {
+                text: "?".into(),
+                echo: true,
+            };
+            MAX_PROMPT_FIELDS + 1
+        ];
+        assert!(closed(&s.on_worker(Message::Prompt {
+            channel: 1,
+            kind: PromptKind::KeyboardInteractive,
+            name: String::new(),
+            instructions: String::new(),
+            fields,
+        })));
+        let mut s = SshSession::new(1, target(), e.known_hosts());
+        trusted(&mut s);
+        for _ in 0..MAX_SIGNATURES {
+            assert!(!closed(&s.on_worker(sign.clone())));
+        }
+        assert!(closed(&s.on_worker(sign)));
     }
 
     #[test]

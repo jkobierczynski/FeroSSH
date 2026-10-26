@@ -24,7 +24,7 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -416,6 +416,11 @@ struct StreamRef {
     tx: UnboundedSender<ToSocket>,
     /// `from → to`, for the view.
     label: String,
+    /// Bytes from the worker not yet written to the socket. The worker may
+    /// have at most [`STREAM_WINDOW`] of them in flight; one that sends
+    /// more would make this side buffer without bound, so the stream is
+    /// closed instead.
+    unwritten: Arc<AtomicU32>,
 }
 
 /// Events from the engine's own tasks.
@@ -869,7 +874,16 @@ impl Engine {
         };
         let id = self.new_id();
         let (tx, rx) = mpsc::unbounded_channel();
-        self.streams.insert(id, StreamRef { owner, tx, label });
+        let unwritten = Arc::new(AtomicU32::new(0));
+        self.streams.insert(
+            id,
+            StreamRef {
+                owner,
+                tx,
+                label,
+                unwritten: unwritten.clone(),
+            },
+        );
         self.send(Message::ForwardOpen {
             channel: id,
             connection: owner.connection(),
@@ -881,7 +895,7 @@ impl Engine {
         tokio::spawn(relay(
             id,
             Ok(socket),
-            rx,
+            (rx, unwritten),
             self.to_worker.clone(),
             self.internal.clone(),
         ));
@@ -908,7 +922,24 @@ impl Engine {
         }
         if let Some(s) = self.streams.get_mut(&channel) {
             let to_socket = match msg {
-                Message::Data { bytes, .. } => ToSocket::Data(bytes),
+                Message::Data { bytes, .. } => {
+                    let n = u32::try_from(bytes.len()).unwrap_or(u32::MAX);
+                    let before = s.unwritten.fetch_add(n, Ordering::SeqCst);
+                    if before.saturating_add(n) > STREAM_WINDOW {
+                        let owner = s.owner;
+                        let _ = s.tx.send(ToSocket::Close);
+                        self.streams.remove(&channel);
+                        self.send(Message::Close { channel });
+                        self.note_error(
+                            owner,
+                            "The SSH worker sent more than the stream window allows; the \
+                             connection was closed."
+                                .to_owned(),
+                        );
+                        return;
+                    }
+                    ToSocket::Data(bytes)
+                }
                 Message::Eof { .. } => ToSocket::Eof,
                 Message::Window { bytes, .. } => ToSocket::Window(bytes),
                 Message::ForwardOpened { host, port, .. } => {
@@ -953,7 +984,9 @@ impl Engine {
                 origin_host,
                 origin_port,
                 ..
-            } => self.incoming(channel, listener, x11, &origin_host, origin_port),
+            } if channel >= WORKER_IDS => {
+                self.incoming(channel, listener, x11, &origin_host, origin_port);
+            }
             // A stream this side already closed.
             _ => {}
         }
@@ -997,12 +1030,21 @@ impl Engine {
             return;
         };
         let (tx, rx) = mpsc::unbounded_channel();
+        let unwritten = Arc::new(AtomicU32::new(0));
         let label = format!(
             "{} → {}",
             host_port(origin_host, origin_port),
             host_port(&host, port)
         );
-        self.streams.insert(channel, StreamRef { owner, tx, label });
+        self.streams.insert(
+            channel,
+            StreamRef {
+                owner,
+                tx,
+                label,
+                unwritten: unwritten.clone(),
+            },
+        );
         let connect = async move {
             let what = host_port(&host, port);
             match tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect((host.as_str(), port)))
@@ -1016,7 +1058,7 @@ impl Engine {
         let (to_worker, internal) = (self.to_worker.clone(), self.internal.clone());
         tokio::spawn(async move {
             let socket = connect.await;
-            relay(channel, socket, rx, to_worker, internal).await;
+            relay(channel, socket, (rx, unwritten), to_worker, internal).await;
         });
     }
 
@@ -1172,7 +1214,7 @@ async fn listen(hosts: Vec<String>, port: u16, owner: Owner, events: UnboundedSe
 async fn relay(
     channel: ChannelId,
     socket: Result<TcpStream, String>,
-    mut from_worker: UnboundedReceiver<ToSocket>,
+    (mut from_worker, unwritten): (UnboundedReceiver<ToSocket>, Arc<AtomicU32>),
     to_worker: ToWorker,
     events: UnboundedSender<Internal>,
 ) {
@@ -1200,6 +1242,7 @@ async fn relay(
                         return false;
                     }
                     let n = u32::try_from(bytes.len()).unwrap_or(u32::MAX);
+                    unwritten.fetch_sub(n.min(unwritten.load(Ordering::SeqCst)), Ordering::SeqCst);
                     tw(Message::Window { channel, bytes: n });
                 }
                 None => {
@@ -1354,6 +1397,87 @@ mod tests {
 
     fn desktop_event(fwd: &Forwarder) -> DesktopEvent {
         wait_for(|| fwd.take_desktop_events().into_iter().next())
+    }
+
+    #[test]
+    fn a_worker_that_overruns_the_window_loses_the_stream() {
+        let port = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let (fwd, sent) = engine();
+        let spec =
+            ferossh_config::forward::parse_option(&format!("-L 127.0.0.1:{port}:db:5432")).unwrap();
+        fwd.start(
+            1,
+            "me@db".into(),
+            Setup {
+                forwards: vec![spec],
+                ..Setup::default()
+            },
+        );
+        let _client = wait_for(|| std::net::TcpStream::connect(("127.0.0.1", port)).ok());
+        let channel = wait_for(|| {
+            sent.lock().unwrap().iter().find_map(|m| match m {
+                Message::ForwardOpen { channel, .. } => Some(*channel),
+                _ => None,
+            })
+        });
+        // An honest worker sends at most MAX_DATA_CHUNK at a time, and never
+        // more than the window before credit comes back.
+        fwd.sink()(Message::Data {
+            channel,
+            bytes: vec![0; STREAM_WINDOW as usize + 1],
+        });
+        wait_for(|| {
+            sent.lock()
+                .unwrap()
+                .iter()
+                .any(|m| *m == Message::Close { channel })
+                .then_some(())
+        });
+        let view = fwd.view();
+        let error = view[0].forwards[0].error.clone().unwrap_or_default();
+        assert!(error.contains("stream window"), "{view:?}");
+        assert_eq!(view[0].forwards[0].open, 0);
+    }
+
+    #[test]
+    fn incoming_streams_must_use_worker_ids() {
+        let (fwd, sent) = engine();
+        fwd.start(1, "me@box".into(), Setup::default());
+        // An id from this side's range is ignored, not adopted.
+        fwd.sink()(Message::ForwardIncoming {
+            channel: FORWARD_IDS,
+            listener: 1,
+            x11: true,
+            origin_host: "h".into(),
+            origin_port: 1,
+        });
+        // A real worker id for a connection without X11 is closed.
+        fwd.sink()(Message::ForwardIncoming {
+            channel: WORKER_IDS,
+            listener: 1,
+            x11: true,
+            origin_host: "h".into(),
+            origin_port: 1,
+        });
+        wait_for(|| {
+            sent.lock()
+                .unwrap()
+                .iter()
+                .any(|m| {
+                    *m == Message::Close {
+                        channel: WORKER_IDS,
+                    }
+                })
+                .then_some(())
+        });
+        assert!(!sent.lock().unwrap().iter().any(|m| *m
+            == Message::Close {
+                channel: FORWARD_IDS
+            }));
     }
 
     #[test]
