@@ -1,5 +1,5 @@
 //! Reads the saved sessions of PuTTY, KiTTY and WinSCP from the registry
-//! for an import; [`ferossh_config::putty`] and [`ferossh_config::winscp`]
+//! for an import, and where SecureCRT keeps its configuration; [`ferossh_config::putty`] and [`ferossh_config::winscp`]
 //! turn them into sessions. Stored passwords are only checked for being
 //! there, never read.
 
@@ -71,7 +71,19 @@ fn exists(key: HKEY, session: &str, name: &str) -> bool {
     status == ERROR_SUCCESS
 }
 
-/// A client's SSH sessions in the registry; empty if it saved none.
+/// SecureCRT's configuration folder, when it is not the usual one.
+pub fn securecrt_config() -> Option<String> {
+    match read_value(
+        HKEY_CURRENT_USER,
+        "Software\\VanDyke\\SecureCRT",
+        "Config Path",
+    )? {
+        Value::Text(t) if !t.trim().is_empty() => Some(t.trim().to_owned()),
+        _ => None,
+    }
+}
+
+/// A client's SSH sessions in the registry; empty if it saved none there.
 pub fn sessions(client: Client) -> Vec<Session> {
     let (path, values, build): (PCWSTR, &[&str], Builder) = match client {
         Client::Putty => (
@@ -89,6 +101,8 @@ pub fn sessions(client: Client) -> Vec<Session> {
             &winscp::VALUES,
             winscp_session,
         ),
+        // These keep their sessions in files.
+        Client::MobaXterm | Client::MRemoteNg | Client::SecureCrt => return Vec::new(),
     };
     read(path, values, build)
 }

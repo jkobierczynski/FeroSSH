@@ -23,7 +23,9 @@ use ferossh_config::import::{self, Client};
 use ferossh_config::password::{self as pw_source, PasswordSource};
 use ferossh_config::saved::{self, SavedHost};
 use ferossh_config::settings::{DEFAULT_DESKTOP_PORT, DEFAULT_VNC_PORT};
-use ferossh_config::{SessionKind, Settings, putty, ssh_config, winscp};
+use ferossh_config::{
+    SessionKind, Settings, mobaxterm, mremoteng, putty, securecrt, ssh_config, winscp,
+};
 use ferossh_forward::x11::{Display, find_cookie, xauth_entries};
 use ferossh_ipc::{ChannelId, DirEntry, FORWARD_IDS, Message, SftpReply, X11Auth};
 use ferossh_render::{
@@ -3798,19 +3800,19 @@ impl Window {
 
     /// File > Import sessions: the import page, on what the clients
     /// on this account have saved.
-    fn open_import(&mut self, sessions: Vec<(Client, String, Vec<import::Session>)>) {
+    fn open_import(&mut self, sessions: Vec<ImportSource>, problems: Vec<String>) {
         let list = sessions
             .into_iter()
             .map(|(c, origin, s)| found(c, origin, s))
             .collect();
         self.side.form = None;
-        self.side.import = Some(ImportView::new(list));
+        self.side.import = Some(ImportView::new(list, problems));
         self.show_side(SideView::Sessions, true);
         self.refresh_chrome();
     }
 
     /// Sessions read from a file the user picked on the import page.
-    fn add_import(&mut self, (client, origin, sessions): (Client, String, Vec<import::Session>)) {
+    fn add_import(&mut self, (client, origin, sessions): ImportSource) {
         if let Some(view) = &mut self.side.import {
             view.add(found(client, origin, sessions));
         }
@@ -6454,26 +6456,12 @@ fn run_command(hwnd: HWND, command: Command) {
             }
         }
         Command::ImportSessions => {
-            let mut found: Vec<_> = Client::ALL
-                .into_iter()
-                .map(|c| (c, "registry".to_owned(), import_reg::sessions(c)))
-                .filter(|(_, _, s)| !s.is_empty())
-                .collect();
-            // WinSCP keeps its sites here instead when set to use an INI
-            // file.
-            if let Some(ini) =
-                std::env::var_os("APPDATA").map(|a| PathBuf::from(a).join("WinSCP.ini"))
-                && ini.is_file()
-                && let Ok(f) = read_import_file(&ini)
-            {
-                found.push(f);
-            }
-            with_window(|w| w.open_import(found));
+            let (found, problems) = known_imports();
+            with_window(|w| w.open_import(found, problems));
         }
         Command::PickImportFile => {
             let start = std::env::var_os("APPDATA").map_or_else(home, PathBuf::from);
-            if let Some(path) = pick_file(hwnd, w!("A WinSCP.ini or a KiTTY session file"), &start)
-            {
+            if let Some(path) = pick_file(hwnd, w!("Sessions file of another SSH client"), &start) {
                 match read_import_file(&path) {
                     Ok(found) => {
                         with_window(|w| w.add_import(found));
@@ -6605,49 +6593,166 @@ fn found(client: Client, origin: String, mut sessions: Vec<import::Session>) -> 
     }
 }
 
-/// Reads a file the user picked for an import: a `WinSCP.ini`, or one of
-/// KiTTY's portable session files, which brings the whole `Sessions`
-/// folder it is in.
-fn read_import_file(
-    path: &std::path::Path,
-) -> std::result::Result<(Client, String, Vec<import::Session>), String> {
-    let read = |p: &std::path::Path, max: u64| -> std::result::Result<String, String> {
-        let meta =
-            std::fs::metadata(p).map_err(|e| format!("Could not read {}: {e}", p.display()))?;
-        if meta.len() > max {
-            return Err(format!("{} is too big to be a session file.", p.display()));
+/// Sessions of one client, with where they were read: "registry" or a
+/// path.
+type ImportSource = (Client, String, Vec<import::Session>);
+
+/// The sessions of other clients on this account: PuTTY, KiTTY and WinSCP
+/// in the registry, and the files where WinSCP, MobaXterm, mRemoteNG and
+/// SecureCRT keep theirs. Files that could not be read come back as
+/// problems, for the import page to show.
+fn known_imports() -> (Vec<ImportSource>, Vec<String>) {
+    let mut found: Vec<_> = Client::ALL
+        .into_iter()
+        .map(|c| (c, "registry".to_owned(), import_reg::sessions(c)))
+        .filter(|(_, _, s)| !s.is_empty())
+        .collect();
+    let mut problems = Vec::new();
+    let appdata = std::env::var_os("APPDATA").map(PathBuf::from);
+    let home = home();
+    let mut files: Vec<PathBuf> = Vec::new();
+    if let Some(a) = &appdata {
+        // WinSCP's sites when it is set to keep them in an INI file.
+        files.push(a.join("WinSCP.ini"));
+        files.push(a.join("MobaXterm").join("MobaXterm.ini"));
+        files.push(a.join("mRemoteNG").join("confCons.xml"));
+    }
+    files.push(
+        home.join("Documents")
+            .join("MobaXterm")
+            .join("MobaXterm.ini"),
+    );
+    for file in files.into_iter().filter(|f| f.is_file()) {
+        match read_import_file(&file) {
+            Ok(f) if !f.2.is_empty() => found.push(f),
+            Ok(_) => {}
+            Err(e) => problems.push(e),
         }
-        std::fs::read(p)
-            .map(|b| {
-                String::from_utf8_lossy(&b)
-                    .trim_start_matches('\u{feff}')
-                    .to_owned()
-            })
-            .map_err(|e| format!("Could not read {}: {e}", p.display()))
-    };
-    let text = read(path, 16 << 20)?;
-    if text
-        .lines()
-        .any(|l| l.trim_start().starts_with("[Sessions\\"))
-    {
+    }
+    let crt = import_reg::securecrt_config()
+        .map(PathBuf::from)
+        .or_else(|| appdata.map(|a| a.join("VanDyke").join("Config")))
+        .map(|c| c.join("Sessions"));
+    if let Some(dir) = crt.filter(|d| d.is_dir()) {
+        let sessions = securecrt_sessions(&dir);
+        if !sessions.is_empty() {
+            found.push((Client::SecureCrt, dir.display().to_string(), sessions));
+        }
+    }
+    (found, problems)
+}
+
+/// Reads a file for an import, up to `max` bytes.
+fn read_text(p: &std::path::Path, max: u64) -> std::result::Result<String, String> {
+    let meta = std::fs::metadata(p).map_err(|e| format!("Could not read {}: {e}", p.display()))?;
+    if meta.len() > max {
+        return Err(format!("{} is too big to be a session file.", p.display()));
+    }
+    std::fs::read(p)
+        .map(|b| {
+            String::from_utf8_lossy(&b)
+                .trim_start_matches('\u{feff}')
+                .to_owned()
+        })
+        .map_err(|e| format!("Could not read {}: {e}", p.display()))
+}
+
+/// SecureCRT's sessions in its `Sessions` folder and the folders in it.
+fn securecrt_sessions(root: &std::path::Path) -> Vec<import::Session> {
+    let mut out = Vec::new();
+    let mut dirs = vec![(root.to_path_buf(), String::new(), 0)];
+    let mut seen = 0;
+    while let Some((dir, prefix, depth)) = dirs.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            seen += 1;
+            if seen > 20_000 {
+                return out;
+            }
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let Ok(kind) = entry.file_type() else {
+                continue;
+            };
+            if kind.is_dir() && depth < 8 {
+                dirs.push((entry.path(), format!("{prefix}{name}/"), depth + 1));
+            } else if kind.is_file()
+                && securecrt::is_session_file(&name)
+                && let Ok(text) = read_text(&entry.path(), 1 << 20)
+                && let Some(stem) = name.get(..name.len() - 4)
+                && let Some(s) = securecrt::session(&format!("{prefix}{stem}"), &text)
+            {
+                out.push(s);
+            }
+        }
+    }
+    out.sort_by_key(|a| a.name.to_lowercase());
+    out
+}
+
+/// Reads a file the user picked for an import: a `WinSCP.ini`, a
+/// `MobaXterm.ini` (or `.mxtsessions`), mRemoteNG's `confCons.xml`, one
+/// of SecureCRT's session files (which brings the `Sessions` folder it is
+/// in), or one of a portable KiTTY's session files (which brings the
+/// folder it is in).
+fn read_import_file(path: &std::path::Path) -> std::result::Result<ImportSource, String> {
+    let text = read_text(path, 16 << 20)?;
+    let origin = path.display().to_string();
+    let none = |what: &str| format!("{} has no {what}.", path.display());
+    let line_starts = |prefix: &str| text.lines().any(|l| l.trim_start().starts_with(prefix));
+    if line_starts("[Sessions\\") {
         let sessions = winscp::from_ini(&text);
         if sessions.is_empty() {
-            return Err(format!("{} has no SFTP or SCP sites.", path.display()));
+            return Err(none("SFTP or SCP sites"));
         }
-        return Ok((Client::WinScp, path.display().to_string(), sessions));
+        return Ok((Client::WinScp, origin, sessions));
+    }
+    if line_starts("[Bookmarks") {
+        let sessions = mobaxterm::from_ini(&text);
+        if sessions.is_empty() {
+            return Err(none("SSH, SFTP, RDP or VNC sessions"));
+        }
+        return Ok((Client::MobaXterm, origin, sessions));
+    }
+    if text.contains("Connections") && text.trim_start().starts_with('<') {
+        let sessions = mremoteng::from_xml(&text)?;
+        if sessions.is_empty() {
+            return Err(none("SSH, RDP or VNC connections"));
+        }
+        return Ok((Client::MRemoteNg, origin, sessions));
     }
     let file_name = |p: &std::path::Path| p.file_name().map(|n| n.to_string_lossy().into_owned());
-    let not_kitty = || {
+    let name = file_name(path).unwrap_or_default();
+    if line_starts("S:\"Hostname\"=") || line_starts("S:\"Protocol Name\"=") {
+        // The whole Sessions folder: the nearest one up, else this folder.
+        let root = path
+            .ancestors()
+            .skip(1)
+            .find(|a| {
+                a.file_name()
+                    .is_some_and(|n| n.eq_ignore_ascii_case("Sessions"))
+            })
+            .or_else(|| path.parent())
+            .ok_or_else(|| none("sessions"))?;
+        let sessions = securecrt_sessions(root);
+        if sessions.is_empty() {
+            return Err(format!("{} has no SSH sessions.", root.display()));
+        }
+        return Ok((Client::SecureCrt, root.display().to_string(), sessions));
+    }
+    let unknown = || {
         format!(
-            "{} is neither a WinSCP.ini nor a session file of a portable KiTTY.",
+            "{} is not a sessions file FeroSSH knows. It reads WinSCP.ini, MobaXterm.ini, \
+             mRemoteNG's confCons.xml, and the session files of SecureCRT and of a portable \
+             KiTTY.",
             path.display()
         )
     };
-    let name = file_name(path).ok_or_else(not_kitty)?;
     if text.len() > 1 << 20 || putty::file_session(&name, &text).is_none() {
-        return Err(not_kitty());
+        return Err(unknown());
     }
-    let dir = path.parent().ok_or_else(not_kitty)?;
+    let dir = path.parent().ok_or_else(unknown)?;
     let mut sessions = Vec::new();
     let entries =
         std::fs::read_dir(dir).map_err(|e| format!("Could not read {}: {e}", dir.display()))?;
@@ -6656,7 +6761,7 @@ fn read_import_file(
         if !entry.file_type().is_ok_and(|t| t.is_file()) {
             continue;
         }
-        if let (Some(name), Ok(text)) = (file_name(&p), read(&p, 1 << 20))
+        if let (Some(name), Ok(text)) = (file_name(&p), read_text(&p, 1 << 20))
             && let Some(s) = putty::file_session(&name, &text)
         {
             sessions.push(s);
