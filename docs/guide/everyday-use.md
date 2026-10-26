@@ -9,7 +9,7 @@ The window starts as one pane, with no tab strip. Ctrl+Shift+T opens a tab and t
 - Alt+arrows moves the focus, Alt+Shift+arrows grows the focused pane, and dragging a divider resizes.
 - Drag a tab to reorder it. Ctrl+Shift+drag a pane onto another pane's edge to move it there, or onto its middle to swap the two.
 - Ctrl+Shift+J joins a tab into the tab before it, as a pane. Dropping a pane on the tab strip makes it a tab again.
-- View > Font and View > Theme change only the focused pane. Session > Save font and theme for this host keeps them for next time.
+- View > Font and View > Theme change only the focused pane. The font menu lists eight monospace fonts; the ones not installed on this PC are greyed out. Session > Save font and theme for this host keeps them for next time.
 
 ## The session manager
 

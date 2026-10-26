@@ -69,20 +69,21 @@ use windows::Win32::UI::Shell::{
 use windows::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT, CheckMenuItem, CheckMenuRadioItem,
     CreateMenu, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyMenu, DestroyWindow,
-    DispatchMessageW, FLASHW_TIMERNOFG, FLASHW_TRAY, FLASHWINFO, FlashWindowEx, GetClientRect,
-    GetCursorPos, GetMessageW, HCURSOR, HMENU, HTCLIENT, IDC_ARROW, IDC_IBEAM, IDC_SIZEALL,
-    IDC_SIZENS, IDC_SIZEWE, IDYES, KillTimer, LoadCursorW, MB_DEFBUTTON2, MB_ICONERROR,
-    MB_ICONINFORMATION, MB_ICONQUESTION, MB_ICONWARNING, MB_OK, MB_YESNO, MESSAGEBOX_RESULT,
-    MESSAGEBOX_STYLE, MF_BYCOMMAND, MF_CHECKED, MF_POPUP, MF_SEPARATOR, MF_STRING, MF_UNCHECKED,
-    MSG, MessageBoxW, PM_REMOVE, PeekMessageW, PostMessageW, PostQuitMessage, RegisterClassW,
-    SIZE_MINIMIZED, SW_SHOW, SW_SHOWNORMAL, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOZORDER, SetCursor,
-    SetMenu, SetTimer, SetWindowPos, SetWindowTextW, ShowWindow, TPM_NONOTIFY, TPM_RETURNCMD,
-    TrackPopupMenu, TranslateMessage, WINDOW_EX_STYLE, WINDOW_STYLE, WM_APP, WM_CHAR, WM_CLOSE,
-    WM_COMMAND, WM_DESTROY, WM_DPICHANGED, WM_DROPFILES, WM_ERASEBKGND, WM_GETDPISCALEDSIZE,
-    WM_IME_COMPOSITION, WM_IME_STARTCOMPOSITION, WM_KEYDOWN, WM_KEYUP, WM_KILLFOCUS,
-    WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL,
-    WM_PAINT, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SETCURSOR, WM_SETFOCUS, WM_SIZE, WM_SYSCHAR,
-    WM_SYSKEYDOWN, WM_SYSKEYUP, WM_TIMER, WNDCLASSW, WS_EX_APPWINDOW, WS_OVERLAPPEDWINDOW,
+    DispatchMessageW, EnableMenuItem, FLASHW_TIMERNOFG, FLASHW_TRAY, FLASHWINFO, FlashWindowEx,
+    GetClientRect, GetCursorPos, GetMessageW, HCURSOR, HMENU, HTCLIENT, IDC_ARROW, IDC_IBEAM,
+    IDC_SIZEALL, IDC_SIZENS, IDC_SIZEWE, IDYES, KillTimer, LoadCursorW, MB_DEFBUTTON2,
+    MB_ICONERROR, MB_ICONINFORMATION, MB_ICONQUESTION, MB_ICONWARNING, MB_OK, MB_YESNO,
+    MESSAGEBOX_RESULT, MESSAGEBOX_STYLE, MF_BYCOMMAND, MF_CHECKED, MF_GRAYED, MF_POPUP,
+    MF_SEPARATOR, MF_STRING, MF_UNCHECKED, MSG, MessageBoxW, PM_REMOVE, PeekMessageW, PostMessageW,
+    PostQuitMessage, RegisterClassW, SIZE_MINIMIZED, SW_SHOW, SW_SHOWNORMAL, SWP_NOACTIVATE,
+    SWP_NOMOVE, SWP_NOZORDER, SetCursor, SetMenu, SetTimer, SetWindowPos, SetWindowTextW,
+    ShowWindow, TPM_NONOTIFY, TPM_RETURNCMD, TrackPopupMenu, TranslateMessage, WINDOW_EX_STYLE,
+    WINDOW_STYLE, WM_APP, WM_CHAR, WM_CLOSE, WM_COMMAND, WM_DESTROY, WM_DPICHANGED, WM_DROPFILES,
+    WM_ERASEBKGND, WM_GETDPISCALEDSIZE, WM_IME_COMPOSITION, WM_IME_STARTCOMPOSITION, WM_KEYDOWN,
+    WM_KEYUP, WM_KILLFOCUS, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP,
+    WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_PAINT, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SETCURSOR, WM_SETFOCUS,
+    WM_SIZE, WM_SYSCHAR, WM_SYSKEYDOWN, WM_SYSKEYUP, WM_TIMER, WNDCLASSW, WS_EX_APPWINDOW,
+    WS_OVERLAPPEDWINDOW,
 };
 use windows::core::{HSTRING, PCWSTR, PWSTR, Result, w};
 
@@ -179,8 +180,19 @@ const WHEEL_DELTA_NOTCH: i32 = 120;
 const PREVIEW_CHARS: usize = 400;
 
 /// Font families offered in View > Font. A pane's font can be any
-/// installed family; this list is only the menu.
-const FONT_CHOICES: [&str; 3] = ["Cascadia Mono", "Consolas", "Courier New"];
+/// installed family; this list is only the menu. The first five ship with
+/// Windows (the Cascadias with Windows 11 and Windows Terminal); the last
+/// three are popular free downloads. Missing ones are greyed out.
+const FONT_CHOICES: [&str; 8] = [
+    "Cascadia Mono",
+    "Cascadia Code",
+    "Consolas",
+    "Lucida Console",
+    "Courier New",
+    "JetBrains Mono",
+    "Fira Code",
+    "Source Code Pro",
+];
 
 /// Menu command ids. Shortcuts map to the same ids.
 mod cmd {
@@ -1001,6 +1013,12 @@ fn create_and_run(launch: Launch, theme: Option<String>) -> Result<()> {
         // An unknown theme name falls back to the default (Nord).
         let default_theme = theme.and_then(|n| Theme::by_name(&n)).unwrap_or_default();
         let mut renderer = Renderer::new(hwnd, 1, 1)?;
+        for (id, family) in (cmd::FONT..).zip(FONT_CHOICES) {
+            if !renderer.has_family(family) {
+                // SAFETY: valid menu handle; the id is ours.
+                let _ = EnableMenuItem(menu, id, MF_BYCOMMAND | MF_GRAYED);
+            }
+        }
         let metrics = renderer.metrics(&font, dpi)?;
         let chrome_font = FontSpec::new(&font.family, CHROME_PT);
         let chrome_metrics = renderer.metrics(&chrome_font, dpi)?;
