@@ -2,13 +2,18 @@ name: Release
 
 # Pushing a version tag such as v0.1.0 runs every CI check, builds the
 # release exes, signs them when a certificate is configured, and publishes a
-# GitHub Release with the exes, their SHA-256 sums and the notes from
-# docs/releases/<tag>.md. A tag with a hyphen (v0.2.0-rc1) makes a
-# pre-release.
+# GitHub Release with the exes, their SHA-256 sums, a release manifest
+# (BUILD-MANIFEST.json) and the notes from docs/releases/<tag>.md. The exes,
+# sums and manifest get signed build provenance attestations. A tag with a
+# hyphen (v0.2.0-rc1) makes a pre-release.
 
 on:
   push:
     tags: ["v*.*.*"]
+  # A dry run from the Actions tab: every step except the attestation and
+  # the GitHub Release, whose files are uploaded as a workflow artifact
+  # instead.
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -23,6 +28,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Compare the tag with the workspace version and look for notes
+        if: github.event_name == 'push'
         run: |
           tag="${GITHUB_REF_NAME}"
           version=$(sed -n '/^\[workspace.package\]/,/^\[/s/^version = "\(.*\)"/\1/p' Cargo.toml)
@@ -49,6 +55,10 @@ jobs:
     runs-on: windows-latest
     permissions:
       contents: write
+      # Build provenance attestations, signed through GitHub's Sigstore
+      # instance with this workflow's identity.
+      id-token: write
+      attestations: write
     steps:
       - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
@@ -59,6 +69,16 @@ jobs:
         with:
           name: ferossh-desktop-viewer-exe
           path: dist
+
+      # Taken before signing: these are the hashes a rebuild with
+      # scripts/build-release.ps1 reproduces (CI's reproducible build job
+      # has already checked that it does).
+      - name: Unsigned SHA-256 sums
+        shell: pwsh
+        run: |
+          Get-ChildItem dist\*.exe | Sort-Object Name | ForEach-Object {
+            "$((Get-FileHash $_.FullName -Algorithm SHA256).Hash.ToLower())  $($_.Name)"
+          } | Set-Content -Encoding ascii "$env:RUNNER_TEMP\unsigned.txt"
 
       # Signing hook. It runs only when the WINDOWS_SIGNING_CERT secret is
       # set (a base64 .pfx with its password in
@@ -100,7 +120,65 @@ jobs:
           Get-Content SHA256SUMS.txt | Tee-Object -Append $env:GITHUB_STEP_SUMMARY
           Pop-Location
 
+      # BUILD-MANIFEST.json says what was built from what: the tag, commit,
+      # toolchain and, per exe, its size, its SHA-256 as downloaded and its
+      # SHA-256 before signing. The attestation below signs it.
+      - name: Release manifest
+        shell: pwsh
+        env:
+          TAG: ${{ github.event_name == 'push' && github.ref_name || 'v0.0.0-dry-run' }}
+          COMMIT: ${{ github.sha }}
+          REPO: ${{ github.repository }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          $unsigned = @{}
+          foreach ($line in Get-Content "$env:RUNNER_TEMP\unsigned.txt") {
+            $hash, $name = $line -split "  ", 2
+            $unsigned[$name] = $hash
+          }
+          $toolchain = (Select-String -Path rust-toolchain.toml -Pattern '^channel = "(.*)"').Matches[0].Groups[1].Value
+          $files = Get-ChildItem dist\*.exe | Sort-Object Name | ForEach-Object {
+            $sig = Get-AuthenticodeSignature $_.FullName
+            [ordered]@{
+              name            = $_.Name
+              size            = $_.Length
+              sha256          = (Get-FileHash $_.FullName -Algorithm SHA256).Hash.ToLower()
+              sha256_unsigned = $unsigned[$_.Name]
+              authenticode    = "$($sig.Status)"
+            }
+          }
+          [ordered]@{
+            schema     = 1
+            name       = "FeroSSH"
+            version    = $env:TAG.TrimStart("v")
+            tag        = $env:TAG
+            repository = "https://github.com/$env:REPO"
+            commit     = $env:COMMIT
+            toolchain  = $toolchain
+            build      = "pwsh scripts/build-release.ps1"
+            workflow   = $env:RUN_URL
+            files      = @($files)
+          } | ConvertTo-Json -Depth 4 | Set-Content -Encoding utf8NoBOM dist\BUILD-MANIFEST.json
+          Get-Content dist\BUILD-MANIFEST.json
+
+      # Verify with: gh attestation verify ferossh.exe -R jkobierczynski/FeroSSH
+      - uses: actions/attest-build-provenance@v2
+        if: github.event_name == 'push'
+        with:
+          subject-path: |
+            dist/ferossh.exe
+            dist/ferossh-desktop.exe
+            dist/SHA256SUMS.txt
+            dist/BUILD-MANIFEST.json
+
+      - uses: actions/upload-artifact@v4
+        if: github.event_name != 'push'
+        with:
+          name: release-dry-run
+          path: dist
+
       - name: Create the GitHub Release
+        if: github.event_name == 'push'
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
@@ -109,5 +187,5 @@ jobs:
           $pre = if ($env:TAG.Contains("-")) { @("--prerelease") } else { @() }
           gh release create $env:TAG --verify-tag --title "FeroSSH $env:TAG" `
             --notes-file "docs/releases/$env:TAG.md" @pre `
-            dist/ferossh.exe dist/ferossh-desktop.exe dist/SHA256SUMS.txt
+            dist/ferossh.exe dist/ferossh-desktop.exe dist/SHA256SUMS.txt dist/BUILD-MANIFEST.json
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
