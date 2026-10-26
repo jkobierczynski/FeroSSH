@@ -19,6 +19,7 @@ ferossh-sftp = { path = "../crates/sftp" }
 ferossh-term = { path = "../crates/term" }
 ferossh-tmuxcc = { path = "../crates/tmuxcc" }
 ferossh-viewer = { path = "../crates/viewer", features = ["vnc", "rdp"] }
+ferossh-worker = { path = "../crates/worker" }
 
 # Kept out of the main workspace: fuzzing needs nightly and libFuzzer.
 [workspace]
@@ -96,6 +97,13 @@ bench = false
 [[bin]]
 name = "host_config"
 path = "fuzz_targets/host_config.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "telnet_feed"
+path = "fuzz_targets/telnet_feed.rs"
 test = false
 doc = false
 bench = false

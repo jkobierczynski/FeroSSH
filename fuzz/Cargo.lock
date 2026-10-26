@@ -900,6 +900,7 @@ dependencies = [
  "ferossh-term",
  "ferossh-tmuxcc",
  "ferossh-viewer",
+ "ferossh-worker",
  "libfuzzer-sys",
 ]
 
@@ -957,6 +958,20 @@ dependencies = [
  "rustls",
  "x509-cert",
  "zeroize",
+]
+
+[[package]]
+name = "ferossh-worker"
+version = "0.1.0"
+dependencies = [
+ "ferossh-forward",
+ "ferossh-ipc",
+ "ferossh-render",
+ "ferossh-sftp",
+ "ferossh-term",
+ "getrandom 0.4.3",
+ "russh",
+ "tokio",
 ]
 
 [[package]]

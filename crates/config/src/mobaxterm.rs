@@ -9,9 +9,9 @@
 //! ```
 //!
 //! After the icon number comes a `%`-separated group whose first field is
-//! the session type: 0 SSH, 4 RDP, 5 VNC, 7 SFTP. Host, port and user
-//! follow; an SSH session's key file is field 14. SSH, SFTP, RDP and VNC
-//! sessions are imported. MobaXterm keeps passwords elsewhere; they are
+//! the session type: 0 SSH, 1 Telnet, 4 RDP, 5 VNC, 7 SFTP. Host, port
+//! and user follow; an SSH session's key file is field 14. SSH, SFTP,
+//! Telnet, RDP and VNC sessions are imported. MobaXterm keeps passwords elsewhere; they are
 //! never read.
 
 use crate::import::{Session, clean, port};
@@ -36,6 +36,8 @@ fn bookmark(folder: &str, name: &str, value: &str) -> Option<Session> {
     let field = |i: usize| fields.get(i).map(|f| f.trim()).filter(|f| !f.is_empty());
     let (kind, gateway) = match field(0)? {
         "0" | "7" => (SessionKind::Ssh, 8),
+        // A Telnet bookmark has no gateway field FeroSSH knows of.
+        "1" => (SessionKind::Telnet, usize::MAX),
         "4" => (SessionKind::Rdp, 13),
         "5" => (SessionKind::Vnc, 5),
         _ => return None,
@@ -53,7 +55,7 @@ fn bookmark(folder: &str, name: &str, value: &str) -> Option<Session> {
     }
     s.kind = kind;
     s.host.port = port(kind, field(2).and_then(|p| p.parse().ok()));
-    s.host.user = if kind == SessionKind::Vnc {
+    s.host.user = if matches!(kind, SessionKind::Vnc | SessionKind::Telnet) {
         None
     } else {
         field(3).map(str::to_owned).or(user_in_host)
@@ -84,7 +86,7 @@ fn bookmark(folder: &str, name: &str, value: &str) -> Option<Session> {
     Some(s)
 }
 
-/// The SSH, SFTP, RDP and VNC sessions in a `MobaXterm.ini`.
+/// The SSH, SFTP, Telnet, RDP and VNC sessions in a `MobaXterm.ini`.
 pub fn from_ini(text: &str) -> Vec<Session> {
     let mut out = Vec::new();
     let mut in_bookmarks = false;
@@ -159,9 +161,13 @@ bad=#109#0%-oProxyCommand=calc%22%%#x#0#\r
                 "web",
                 "Work/Prod/win srv",
                 "Work/Prod/desk",
-                "Work/Prod/inner"
+                "Work/Prod/inner",
+                "Work/Prod/tel"
             ]
         );
+        assert_eq!(s[4].kind, SessionKind::Telnet);
+        assert_eq!((s[4].host.port, s[4].host.user.as_deref()), (None, None));
+        assert!(s[4].notes.is_empty());
         assert_eq!(s[0].kind, SessionKind::Ssh);
         assert_eq!(s[0].host.port, Some(2222));
         assert_eq!(s[0].host.user.as_deref(), Some("admin"));
@@ -187,6 +193,6 @@ bad=#109#0%-oProxyCommand=calc%22%%#x#0#\r
         let text = to_config(Client::MobaXterm, &all);
         let hosts = ssh_config::hosts(&text, &ssh_config::NoIncludes);
         assert_eq!(hosts[1].folder.as_deref(), Some("MobaXterm/Work/Prod"));
-        assert_eq!(saved::parse(&text).len(), 4);
+        assert_eq!(saved::parse(&text).len(), 5);
     }
 }
