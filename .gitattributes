@@ -1,2 +1,6 @@
 # Auto detect text files and perform LF normalization
 * text=auto
+
+# The manifest is embedded in the exe byte for byte; fixed line endings keep
+# release builds reproducible whatever core.autocrlf says.
+*.manifest text eol=lf

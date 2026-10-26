@@ -32,18 +32,8 @@ jobs:
       - run: cargo test -p ferossh --features desktop-viewer --locked
       # Three exes: the standard one, with none of the viewer's code;
       # ferossh-vnc.exe with the VNC viewer; ferossh-desktop.exe with the
-      # VNC and RDP viewers.
-      - run: cargo build --release --locked -p ferossh
-      - run: |
-          mkdir dist
-          copy target\release\ferossh.exe dist\ferossh.exe
-        shell: cmd
-      - run: cargo build --release --locked -p ferossh --features vnc-viewer
-      - run: copy target\release\ferossh.exe dist\ferossh-vnc.exe
-        shell: cmd
-      - run: cargo build --release --locked -p ferossh --features desktop-viewer
-      - run: copy target\release\ferossh.exe dist\ferossh-desktop.exe
-        shell: cmd
+      # VNC and RDP viewers. The script is the reproducible release build.
+      - run: pwsh scripts/build-release.ps1
       - name: Report exe sizes
         shell: pwsh
         run: |
@@ -65,6 +55,44 @@ jobs:
         with:
           name: ferossh-desktop-viewer-exe
           path: dist/ferossh-desktop.exe
+
+  # Rebuilds the exes on a fresh runner, in another folder and with another
+  # CARGO_HOME, and fails unless the bytes match the Windows job's exes.
+  reproducible:
+    name: Reproducible build (Windows)
+    needs: windows
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: elsewhere/ferossh
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: ferossh-*exe
+          path: first
+          merge-multiple: true
+      - name: Rebuild
+        shell: pwsh
+        env:
+          CARGO_HOME: ${{ runner.temp }}\cargo-home
+        working-directory: elsewhere/ferossh
+        run: |
+          rustup show active-toolchain
+          pwsh scripts/build-release.ps1
+      - name: Compare with the Windows job's exes
+        shell: pwsh
+        run: |
+          $failed = $false
+          foreach ($exe in Get-ChildItem first\*.exe | Sort-Object Name) {
+            $a = (Get-FileHash $exe.FullName -Algorithm SHA256).Hash.ToLower()
+            $b = (Get-FileHash "elsewhere\ferossh\dist\$($exe.Name)" -Algorithm SHA256).Hash.ToLower()
+            $line = if ($a -eq $b) { "same    $a  $($exe.Name)" } else { $failed = $true; "DIFFERS $a / $b  $($exe.Name)" }
+            $line | Tee-Object -Append $env:GITHUB_STEP_SUMMARY
+          }
+          if ($failed) {
+            "::error::The rebuilt exes differ from the Windows job's exes"
+            exit 1
+          }
 
   sshd:
     name: SSH tests against OpenSSH (Linux)
