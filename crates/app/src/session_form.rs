@@ -14,6 +14,7 @@
 use ferossh_config::forward::parse_option;
 use ferossh_config::password::{PasswordSource, TEMPLATES};
 use ferossh_config::saved::{self, SavedHost};
+use ferossh_config::serial::{self, FRAMINGS, Flow, LineSettings};
 use ferossh_config::{Profile, SessionKind, Settings};
 use ferossh_render::{Cell, Color, Flags, Grid, Rgb};
 use unicode_width::UnicodeWidthChar;
@@ -69,6 +70,11 @@ pub struct Values {
     pub password: usize,
     /// The password manager command, for a template or a custom one.
     pub password_command: String,
+    /// A serial session's speed, as typed.
+    pub speed: String,
+    /// A serial session's framing, such as `8N1`; empty is 8N1.
+    pub framing: String,
+    pub flow: Flow,
 }
 
 /// Asking, Windows, the password manager templates, then a command of
@@ -161,6 +167,11 @@ impl Values {
         self.vnc_port = opt_text(&p.vnc_port);
         self.legacy = p.legacy_algorithms;
         (self.password, self.password_command) = password_choice(&p.password);
+        if let Some(line) = &p.serial {
+            self.speed = line.speed.to_string();
+            self.framing = line.framing();
+            self.flow = line.flow;
+        }
         self
     }
 }
@@ -187,6 +198,9 @@ enum Field {
     Legacy,
     Password,
     PasswordCommand,
+    Speed,
+    Framing,
+    Flow,
 }
 
 impl Field {
@@ -212,6 +226,9 @@ impl Field {
             Field::Legacy => "Old crypto",
             Field::Password => "Password",
             Field::PasswordCommand => "Command",
+            Field::Speed => "Speed",
+            Field::Framing => "Framing",
+            Field::Flow => "Flow ctrl",
         }
     }
 
@@ -219,7 +236,13 @@ impl Field {
     fn is_choice(self) -> bool {
         matches!(
             self,
-            Field::Type | Field::Theme | Field::TmuxLayout | Field::Legacy | Field::Password
+            Field::Type
+                | Field::Theme
+                | Field::TmuxLayout
+                | Field::Legacy
+                | Field::Password
+                | Field::Framing
+                | Field::Flow
         )
     }
 }
@@ -357,16 +380,12 @@ impl SessionForm {
                     out.push(Item::Note(format!("Saves a copy; {file} stays.")));
                 }
             }
-            out.extend(
-                [
-                    Field::Folder,
-                    Field::Type,
-                    Field::Host,
-                    Field::User,
-                    Field::Port,
-                ]
-                .map(Item::Field),
-            );
+            out.extend([Field::Folder, Field::Type, Field::Host].map(Item::Field));
+            if kind == SessionKind::Serial {
+                out.extend([Field::Speed, Field::Framing, Field::Flow].map(Item::Field));
+            } else {
+                out.extend([Field::User, Field::Port].map(Item::Field));
+            }
             match kind {
                 SessionKind::Ssh => {
                     out.push(Item::Field(Field::Key));
@@ -386,9 +405,10 @@ impl SessionForm {
                     }
                 }
                 SessionKind::Rdp | SessionKind::Vnc => out.push(Item::Field(Field::Via)),
+                SessionKind::Serial => {}
             }
         }
-        if kind == SessionKind::Ssh {
+        if matches!(kind, SessionKind::Ssh | SessionKind::Serial) {
             out.push(Item::Section(1));
             if self.open[1] {
                 out.extend(
@@ -401,6 +421,8 @@ impl SessionForm {
                     .map(Item::Field),
                 );
             }
+        }
+        if kind == SessionKind::Ssh {
             out.push(Item::Section(2));
             if self.open[2] {
                 out.push(Item::Field(Field::Tmux));
@@ -470,7 +492,14 @@ impl SessionForm {
             Field::DesktopPort => &v.desktop_port,
             Field::VncPort => &v.vnc_port,
             Field::PasswordCommand => &v.password_command,
-            Field::Type | Field::Theme | Field::TmuxLayout | Field::Legacy | Field::Password => {
+            Field::Speed => &v.speed,
+            Field::Type
+            | Field::Theme
+            | Field::TmuxLayout
+            | Field::Legacy
+            | Field::Password
+            | Field::Framing
+            | Field::Flow => {
                 return None;
             }
         })
@@ -494,7 +523,14 @@ impl SessionForm {
             Field::DesktopPort => &mut v.desktop_port,
             Field::VncPort => &mut v.vnc_port,
             Field::PasswordCommand => &mut v.password_command,
-            Field::Type | Field::Theme | Field::TmuxLayout | Field::Legacy | Field::Password => {
+            Field::Speed => &mut v.speed,
+            Field::Type
+            | Field::Theme
+            | Field::TmuxLayout
+            | Field::Legacy
+            | Field::Password
+            | Field::Framing
+            | Field::Flow => {
                 return None;
             }
         })
@@ -508,8 +544,12 @@ impl SessionForm {
                 SessionKind::Ssh => "SSH terminal",
                 SessionKind::Rdp => "Remote desktop (RDP)",
                 SessionKind::Vnc => "VNC desktop",
+                SessionKind::Serial => "Serial console",
             }
             .to_owned(),
+            Field::Framing if v.framing.is_empty() => "8N1".to_owned(),
+            Field::Framing => v.framing.clone(),
+            Field::Flow => v.flow.label().to_owned(),
             Field::Theme if v.theme.is_empty() => "by theme rules".to_owned(),
             Field::Theme => v.theme.clone(),
             Field::TmuxLayout => match v.tmux_layout.as_str() {
@@ -542,9 +582,34 @@ impl SessionForm {
         let v = &mut self.values;
         match f {
             Field::Type => {
-                let kinds = [SessionKind::Ssh, SessionKind::Rdp, SessionKind::Vnc];
+                let kinds = [
+                    SessionKind::Ssh,
+                    SessionKind::Rdp,
+                    SessionKind::Vnc,
+                    SessionKind::Serial,
+                ];
                 let i = kinds.iter().position(|k| *k == v.kind).unwrap_or(0);
-                v.kind = kinds.get(step(i, 3)).copied().unwrap_or_default();
+                v.kind = kinds.get(step(i, kinds.len())).copied().unwrap_or_default();
+            }
+            Field::Framing => {
+                let current = if v.framing.is_empty() {
+                    "8N1"
+                } else {
+                    &v.framing
+                };
+                let i = FRAMINGS.iter().position(|f| *f == current).unwrap_or(0);
+                v.framing = FRAMINGS
+                    .get(step(i, FRAMINGS.len()))
+                    .copied()
+                    .unwrap_or_default()
+                    .to_owned();
+            }
+            Field::Flow => {
+                let i = Flow::ALL.iter().position(|f| *f == v.flow).unwrap_or(0);
+                v.flow = Flow::ALL
+                    .get(step(i, Flow::ALL.len()))
+                    .copied()
+                    .unwrap_or_default();
             }
             Field::Theme => {
                 let mut all = vec![String::new()];
@@ -584,6 +649,7 @@ impl SessionForm {
         match f {
             Field::Name => "required, e.g. web-prod".into(),
             Field::Folder => "none".into(),
+            Field::Host if v.kind == SessionKind::Serial => "COM port, e.g. COM3".into(),
             Field::Host if v.kind != SessionKind::Ssh && !v.via.trim().is_empty() => {
                 "the Via SSH host itself".into()
             }
@@ -598,7 +664,9 @@ impl SessionForm {
                 SessionKind::Ssh => "22".into(),
                 SessionKind::Rdp => "3389".into(),
                 SessionKind::Vnc => "5900".into(),
+                SessionKind::Serial => String::new(),
             },
+            Field::Speed => "9600 bits/s".into(),
             Field::Key => "default keys and agent".into(),
             Field::Via if v.kind == SessionKind::Vnc => "an SSH session (required)".into(),
             Field::Via => "none: connect directly".into(),
@@ -610,9 +678,13 @@ impl SessionForm {
             Field::DesktopPort => "3389".into(),
             Field::VncPort => "5900".into(),
             Field::PasswordCommand => "program and arguments".into(),
-            Field::Type | Field::Theme | Field::TmuxLayout | Field::Legacy | Field::Password => {
-                String::new()
-            }
+            Field::Type
+            | Field::Theme
+            | Field::TmuxLayout
+            | Field::Legacy
+            | Field::Password
+            | Field::Framing
+            | Field::Flow => String::new(),
         }
     }
 
@@ -696,9 +768,26 @@ impl SessionForm {
                 }
             }
         }
+        if v.kind == SessionKind::Serial && !self.locked() {
+            if serial::port_name(&v.host).is_none() {
+                return Err(
+                    "Fill in the COM port, such as COM3 (Device Manager lists them \
+                            under Ports)."
+                        .into(),
+                );
+            }
+            if let Some(speed) = number::<u32>(&v.speed, "The speed")?
+                && !(50..=serial::MAX_SPEED).contains(&speed)
+            {
+                return Err(format!(
+                    "The speed goes from 50 to {} bits/s.",
+                    serial::MAX_SPEED
+                ));
+            }
+        }
         let via = v.via.trim();
         match v.kind {
-            SessionKind::Ssh => {}
+            SessionKind::Ssh | SessionKind::Serial => {}
             SessionKind::Vnc if via.is_empty() => {
                 return Err("A VNC desktop goes through an SSH session: fill in Via SSH.".into());
             }
@@ -1049,6 +1138,7 @@ impl SessionForm {
     fn draw_field(&self, line: &mut Line, f: Field, here: bool, palette: &Palette) {
         let label = match f {
             Field::Forward(i) => format!("{} {}", f.label(), i + 1),
+            Field::Host if self.values.kind == SessionKind::Serial => "COM port".to_owned(),
             _ => f.label().to_owned(),
         };
         line.put(&format!(" {label:LABEL$} "), palette.dim, Flags::empty());
@@ -1100,23 +1190,34 @@ impl SessionForm {
             .original
             .clone()
             .filter(|o| !o.eq_ignore_ascii_case(&name));
+        let is_serial = v.kind == SessionKind::Serial;
         if !self.locked() {
-            let host = SavedHost {
-                alias: name.clone(),
-                folder: trimmed(&v.folder),
-                hostname: trimmed(&v.host).filter(|h| *h != name),
-                user: trimmed(&v.user),
-                port: v.port.trim().parse().ok().filter(|&p| p != 0),
-                identity_file: trimmed(&v.key),
-                forwards: v.forwards.iter().filter_map(|f| parse_option(f)).fold(
-                    Vec::new(),
-                    |mut all, f| {
-                        if !all.contains(&f) {
-                            all.push(f);
-                        }
-                        all
-                    },
-                ),
+            let host = if is_serial {
+                // The port is the host name; nothing of SSH applies.
+                SavedHost {
+                    alias: name.clone(),
+                    folder: trimmed(&v.folder),
+                    hostname: serial::port_name(&v.host).filter(|h| *h != name),
+                    ..SavedHost::default()
+                }
+            } else {
+                SavedHost {
+                    alias: name.clone(),
+                    folder: trimmed(&v.folder),
+                    hostname: trimmed(&v.host).filter(|h| *h != name),
+                    user: trimmed(&v.user),
+                    port: v.port.trim().parse().ok().filter(|&p| p != 0),
+                    identity_file: trimmed(&v.key),
+                    forwards: v.forwards.iter().filter_map(|f| parse_option(f)).fold(
+                        Vec::new(),
+                        |mut all, f| {
+                            if !all.contains(&f) {
+                                all.push(f);
+                            }
+                            all
+                        },
+                    ),
+                }
             };
             let at = match (&self.source, &self.original) {
                 (Source::Saved, Some(o)) => {
@@ -1163,6 +1264,19 @@ impl SessionForm {
             }
             _ => PasswordSource::Ask,
         };
+        p.serial = is_serial.then(|| {
+            let mut line = LineSettings {
+                flow: v.flow,
+                ..LineSettings::default()
+            };
+            if let Ok(speed) = v.speed.trim().parse() {
+                line.speed = speed;
+            }
+            if !v.framing.is_empty() {
+                line.set_framing(&v.framing);
+            }
+            line
+        });
         name
     }
 }
@@ -1416,6 +1530,48 @@ mod tests {
         assert!(!t.iter().any(|l| l.contains("Look") || l.contains("Extras")));
         f.key(SideKey::Char(' '), 30);
         assert!(texts(&mut f)[6].contains("asked by the server"));
+    }
+
+    #[test]
+    fn serial_sessions_save_the_port_and_line() {
+        let mut f = new_form();
+        typed(&mut f, "core");
+        down(&mut f, 2);
+        // Type: SSH -> RDP -> VNC -> Serial.
+        f.key(SideKey::Left, 30);
+        let t = texts(&mut f);
+        assert!(t[4].contains("‹ Serial console ›"), "{:?}", t[4]);
+        assert!(
+            t[5].contains("COM port") && t[5].contains("e.g. COM3"),
+            "{:?}",
+            t[5]
+        );
+        assert!(t[6].contains("Speed") && t[6].contains("9600"));
+        assert!(t[7].contains("8N1") && t[8].contains("none"));
+        assert!(!t.iter().any(|l| l.contains("User") || l.contains("Extras")));
+        assert!(t.iter().any(|l| l.contains("Look")));
+        assert!(f.check().unwrap_err().contains("COM port"));
+        f.values.host = "com3".into();
+        f.values.speed = "9".into();
+        assert!(f.check().unwrap_err().contains("speed"));
+        f.values.speed = "115200".into();
+        f.cycle(Field::Framing, true);
+        f.cycle(Field::Flow, false);
+        assert_eq!(f.check(), Ok(()));
+        let (mut hosts, mut settings) = (Vec::new(), Settings::default());
+        f.apply(&mut hosts, &mut settings);
+        assert_eq!(hosts[0].hostname.as_deref(), Some("COM3"));
+        assert_eq!(hosts[0].user, None);
+        let p = settings.profile("core").unwrap();
+        assert_eq!(p.kind, SessionKind::Serial);
+        assert_eq!(
+            p.serial.map(|l| l.to_string()).as_deref(),
+            Some("115200,8E1,dsrdtr")
+        );
+        // And back into the form.
+        let v = Values::from_saved(&hosts[0]).with_profile(Some(p));
+        assert_eq!((v.speed.as_str(), v.framing.as_str()), ("115200", "8E1"));
+        assert_eq!(v.flow, Flow::DsrDtr);
     }
 
     #[test]

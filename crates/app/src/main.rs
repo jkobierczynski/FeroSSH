@@ -1,7 +1,8 @@
 //! FeroSSH entry point.
 //!
 //! `ferossh.exe [user@]host[:port]` connects to a host (names from
-//! `~/.ssh/config` work too); without a host it asks for one. The same exe
+//! `~/.ssh/config` work too); without a host it asks for one.
+//! `ferossh.exe COM3:115200,8N1` opens a serial console instead. The same exe
 //! is also the SSH worker: the window starts it again as
 //! `ferossh.exe --worker <in> <out>` inside an AppContainer, where it runs
 //! the network side over two inherited pipes.
@@ -15,6 +16,8 @@
 
 #![cfg_attr(windows, windows_subsystem = "windows")]
 
+#[cfg_attr(not(windows), allow(dead_code))]
+mod broadcast;
 #[cfg(windows)]
 mod clipboard;
 #[cfg(windows)]
@@ -57,6 +60,8 @@ mod pwcommand;
 mod sandbox;
 #[cfg_attr(not(windows), allow(dead_code))]
 mod scrollmark;
+#[cfg_attr(not(windows), allow(dead_code))]
+mod serial_port;
 #[cfg_attr(not(windows), allow(dead_code))]
 mod session_form;
 #[cfg_attr(not(windows), allow(dead_code))]

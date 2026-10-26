@@ -28,6 +28,9 @@
 //! Profile office-pc
 //!     Type rdp
 //!     Via bastion
+//! Profile core-console
+//!     Type serial
+//!     Serial 115200,8N1,none
 //! ```
 //!
 //! FeroSSH rewrites the file when a setting changes. Unknown keywords are
@@ -37,6 +40,7 @@ use std::fmt::Write as _;
 
 use crate::host_theme::ThemeRule;
 use crate::password::PasswordSource;
+use crate::serial::LineSettings;
 use crate::ssh_config::split_line;
 
 /// How one host's panes look. Unset fields use the theme rules and
@@ -72,6 +76,9 @@ pub struct Profile {
     pub via: Option<String>,
     /// Where the login password comes from.
     pub password: PasswordSource,
+    /// For a serial session: speed, framing and flow control. The COM
+    /// port is the session's `HostName`.
+    pub serial: Option<LineSettings>,
 }
 
 /// What opening a session does.
@@ -84,6 +91,8 @@ pub enum SessionKind {
     Rdp,
     /// A VNC desktop in the built-in viewer, always through SSH.
     Vnc,
+    /// A serial console on a COM port of this PC.
+    Serial,
 }
 
 impl SessionKind {
@@ -92,6 +101,7 @@ impl SessionKind {
             SessionKind::Ssh => "ssh",
             SessionKind::Rdp => "rdp",
             SessionKind::Vnc => "vnc",
+            SessionKind::Serial => "serial",
         }
     }
 
@@ -100,6 +110,7 @@ impl SessionKind {
             "ssh" => Some(SessionKind::Ssh),
             "rdp" => Some(SessionKind::Rdp),
             "vnc" => Some(SessionKind::Vnc),
+            "serial" => Some(SessionKind::Serial),
             _ => None,
         }
     }
@@ -124,6 +135,7 @@ impl Profile {
             && self.kind == SessionKind::Ssh
             && self.via.is_none()
             && self.password == PasswordSource::Ask
+            && self.serial.is_none()
     }
 }
 
@@ -376,6 +388,7 @@ impl Settings {
                             "via" => {
                                 p.via = first.filter(|v| crate::saved::valid_alias(v));
                             }
+                            "serial" => p.serial = LineSettings::parse(&joined),
                             "tmuxlayout" => {
                                 p.tmux_layout = first
                                     .map(|l| l.to_ascii_lowercase())
@@ -494,6 +507,9 @@ impl Settings {
             if let Some(v) = &p.via {
                 let _ = writeln!(out, "    Via {}", arg(v));
             }
+            if let Some(line) = &p.serial {
+                let _ = writeln!(out, "    Serial {line}");
+            }
             match &p.password {
                 PasswordSource::Ask => {}
                 PasswordSource::Windows => out.push_str("    PasswordSource windows\n"),
@@ -606,6 +622,9 @@ Profile big
     Type telnet
     Via "a b"
     PasswordSource Windows
+Profile console
+    Type Serial
+    Serial 115200,7E1,rtscts
 NewKeyword later
 "#;
 
@@ -655,6 +674,12 @@ NewKeyword later
         assert_eq!(big.kind, SessionKind::Ssh);
         assert_eq!(big.via, None);
         assert_eq!(big.password, PasswordSource::Windows);
+        let console = s.profile("console").unwrap();
+        assert_eq!(console.kind, SessionKind::Serial);
+        assert_eq!(
+            console.serial.map(|l| l.to_string()).as_deref(),
+            Some("115200,7E1,rtscts")
+        );
     }
 
     #[test]

@@ -22,6 +22,7 @@ use ferossh_auth::Broker;
 use ferossh_config::import::{self, Client};
 use ferossh_config::password::{self as pw_source, PasswordSource};
 use ferossh_config::saved::{self, SavedHost};
+use ferossh_config::serial::{self, SerialTarget};
 use ferossh_config::settings::{DEFAULT_DESKTOP_PORT, DEFAULT_VNC_PORT};
 use ferossh_config::{
     SessionKind, Settings, mobaxterm, mremoteng, putty, securecrt, ssh_config, winscp,
@@ -34,7 +35,7 @@ use ferossh_render::{
 use ferossh_sftp::{Remote, names};
 use ferossh_term::{
     Action, Key, LogWriter, Mods, MouseButton, MouseEvent, SelectionKind, Settings as TermSettings,
-    Terminal, WorkingDir, check_link, clipboard_preview, log_file_name,
+    Terminal, WorkingDir, chain, check_link, clipboard_preview, log_file_name,
 };
 use windows::Win32::Foundation::E_FAIL;
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, SIZE, WPARAM};
@@ -86,6 +87,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 use windows::core::{HSTRING, PCWSTR, PWSTR, Result, w};
 
 use crate::Launch;
+use crate::broadcast;
 use crate::clipboard;
 use crate::conpty::{self, Output, Shell};
 use crate::credman;
@@ -102,6 +104,7 @@ use crate::pattern;
 use crate::pwcommand;
 use crate::sandbox;
 use crate::scrollmark;
+use crate::serial_port::{Output as SerialOutput, SerialPort};
 use crate::session_form::{self, FormAction, Hints, SessionForm, Source, Values};
 use crate::sessions::{HostItem, SessionList, SideAction, SideKey};
 use crate::ssh::{Effect, Env, SshSession, State, Target};
@@ -208,6 +211,8 @@ mod cmd {
     pub const LOG_TOGGLE: u32 = 600;
     pub const LOG_RAW: u32 = 601;
     pub const LOG_FOLDER: u32 = 602;
+    pub const LOG_VERIFY: u32 = 605;
+    pub const SERIAL_BREAK: u32 = 606;
     pub const REPLACE_KEY: u32 = 603;
     pub const VERIFY: u32 = 604;
     pub const TMUX_ATTACH: u32 = 610;
@@ -232,13 +237,27 @@ mod cmd {
     pub const FOCUS: u32 = 710;
     /// Plus 0-3: left, right, up, down.
     pub const RESIZE: u32 = 720;
+    pub const BROADCAST_TAB: u32 = 730;
+    pub const BROADCAST_ALL: u32 = 731;
+    pub const BROADCAST_SKIP: u32 = 732;
 }
 
 const DIRS: [Dir; 4] = [Dir::Left, Dir::Right, Dir::Up, Dir::Down];
 
+/// The frame around every pane that broadcast input reaches.
+const BROADCAST_FRAME: Rgb = Rgb::new(0xe5, 0x8e, 0x26);
+
+/// Something typed in the focused pane, for the panes broadcast reaches.
+#[derive(Debug)]
+enum Typed {
+    Char(char, bool),
+    Key(Key, Mods),
+    Bytes(Vec<u8>),
+    Paste(String),
+}
+
 /// The prompt shown when no host was given.
-const CONNECT_PROMPT: &str =
-    "\x1b[0mConnect to (user@host[:port], or a Host from ~/.ssh/config; Ctrl+Shift+S lists them): ";
+const CONNECT_PROMPT: &str = "\x1b[0mConnect to (user@host[:port], a Host from ~/.ssh/config, or a COM port such as COM3:115200; Ctrl+Shift+S lists them): ";
 
 /// What a pane is connected to.
 enum Host {
@@ -264,6 +283,12 @@ enum Host {
     Desktop {
         label: String,
         connection: ChannelId,
+    },
+    /// A serial console; `port` is `None` once it closed, when Enter
+    /// opens it again.
+    Serial {
+        port: Option<Box<SerialPort>>,
+        target: SerialTarget,
     },
 }
 
@@ -313,6 +338,8 @@ struct Pane {
     /// A remote desktop shown instead of the terminal, which then only
     /// carries messages (the `desktop-viewer` feature).
     desktop: Option<Box<Desktop>>,
+    /// Window > Leave this pane out of broadcast input.
+    no_broadcast: bool,
 }
 
 impl Pane {
@@ -356,6 +383,7 @@ impl Pane {
             Host::Local { .. } => "local".to_owned(),
             Host::Ask(_) => "new tab".to_owned(),
             Host::Tmux { label, .. } | Host::Desktop { label, .. } => label.clone(),
+            Host::Serial { target, .. } => target.label(),
         }
     }
 
@@ -372,7 +400,7 @@ impl Pane {
                 State::Blocked | State::Ended => Health::Idle,
             },
             // tmux panes exist only while the gateway is logged in.
-            Host::Tmux { .. } => Health::Connected,
+            Host::Tmux { .. } | Host::Serial { port: Some(_), .. } => Health::Connected,
             _ => Health::Idle,
         }
     }
@@ -536,6 +564,8 @@ struct Window {
     passwords: Arc<std::sync::Mutex<Vec<PasswordAnswer>>>,
     /// Desktop sessions waiting for their SSH pane to log in.
     pending_desktops: HashMap<PaneId, PendingDesktop>,
+    /// Window > Broadcast input: which panes also get what is typed.
+    broadcast: broadcast::Scope,
 }
 
 /// What a password manager command gave for a pane's login.
@@ -767,6 +797,52 @@ fn approve_command(line: &str) {
     let _ = write_app_file(&path, &text);
 }
 
+/// The chain file that seals log `path`: the same name plus `.chain`.
+fn chain_path(path: &Path) -> PathBuf {
+    let mut name = path.as_os_str().to_owned();
+    name.push(".chain");
+    PathBuf::from(name)
+}
+
+/// Appends a log that ended to the log index, linked to the line before.
+fn add_to_log_index(name: &str, sealed: &ferossh_term::Sealed) -> std::io::Result<()> {
+    use std::io::Write as _;
+    let path = log_dir().join(chain::INDEX_FILE);
+    let index = match std::fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(e) => return Err(e),
+    };
+    let line = chain::index_line(&index, name, sealed.bytes, &sealed.head);
+    std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)?
+        .write_all(line.as_bytes())
+}
+
+/// Session > Check a log: the log against its chain and the log index.
+/// `true` when nothing was found wrong.
+fn check_log(path: &Path) -> (String, bool) {
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let log = match std::fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(e) => return (format!("Could not read {}: {e}", path.display()), false),
+    };
+    let chain = std::fs::read_to_string(chain_path(path)).ok();
+    let index_path = path.with_file_name(chain::INDEX_FILE);
+    let index = std::fs::read_to_string(index_path).ok();
+    let text = chain::report(&name, &log, chain.as_deref(), index.as_deref());
+    let ok = chain
+        .as_deref()
+        .is_some_and(|c| chain::verify(&name, &log, c).is_ok())
+        && !text.contains("WARNING");
+    (text, ok)
+}
+
 /// Where tab logs go: `%LOCALAPPDATA%\FeroSSH\logs`.
 fn log_dir() -> PathBuf {
     std::env::var_os("LOCALAPPDATA")
@@ -915,6 +991,7 @@ fn create_and_run(launch: Launch, theme: Option<String>) -> Result<()> {
                 desktops: HashMap::new(),
                 passwords: Arc::default(),
                 pending_desktops: HashMap::new(),
+                broadcast: broadcast::Scope::Off,
             });
         });
         // Files dropped from Explorer are uploaded, after a confirmation.
@@ -976,6 +1053,7 @@ fn new_pane(
         cwd_host: None,
         mark: None,
         desktop: None,
+        no_broadcast: false,
     }
 }
 
@@ -1009,6 +1087,7 @@ fn build_menu() -> Result<HMENU> {
         item(session, cmd::LOG_TOGGLE, "&Log to file")?;
         item(session, cmd::LOG_RAW, "Log &raw output (keep escape codes)")?;
         item(session, cmd::LOG_FOLDER, "Open log &folder")?;
+        item(session, cmd::LOG_VERIFY, "C&heck a log for changes...")?;
         separator(session)?;
         item(
             session,
@@ -1028,6 +1107,8 @@ fn build_menu() -> Result<HMENU> {
             cmd::TMUX_LAYOUT,
             "tmux: one &window per pane (own fonts)",
         )?;
+        separator(session)?;
+        item(session, cmd::SERIAL_BREAK, "Send &break (serial)")?;
         separator(session)?;
         item(session, cmd::DESKTOP, "Open remote &desktop\tCtrl+Shift+D")?;
         if cfg!(feature = "rdp-viewer") {
@@ -1099,6 +1180,18 @@ fn build_menu() -> Result<HMENU> {
             window,
             cmd::JOIN_TAB,
             "&Join tab into the tab before it\tCtrl+Shift+J",
+        )?;
+        separator(window)?;
+        item(
+            window,
+            cmd::BROADCAST_TAB,
+            "&Broadcast input to this tab's panes\tCtrl+Shift+B",
+        )?;
+        item(window, cmd::BROADCAST_ALL, "Broadcast input to &all tabs")?;
+        item(
+            window,
+            cmd::BROADCAST_SKIP,
+            "Leave this pane &out of broadcast",
         )?;
         separator(window)?;
         item(window, cmd::NEXT_TAB, "&Next tab\tCtrl+Tab")?;
@@ -1738,9 +1831,14 @@ impl Window {
         } else {
             ""
         };
+        let broadcast = match self.broadcast {
+            broadcast::Scope::Off => "",
+            broadcast::Scope::Tab => " (broadcast to tab)",
+            broadcast::Scope::All => " (broadcast to all tabs)",
+        };
         match label {
             Some(l) if l != "new tab" => {
-                self.set_title_text(&format!("{l}{legacy}{badge} - {APP_NAME}"));
+                self.set_title_text(&format!("{l}{legacy}{badge}{broadcast} - {APP_NAME}"));
             }
             _ => self.set_title_text(APP_NAME),
         }
@@ -2377,6 +2475,10 @@ impl Window {
     /// Connects pane `id` to `destination` (`[user@]host[:port]` or a
     /// Host from ssh_config).
     fn connect(&mut self, id: PaneId, destination: &str) {
+        if let Some(target) = serial::parse_target(destination) {
+            self.open_serial(id, target, None);
+            return;
+        }
         let env = ssh_env();
         let Some(target) = Target::resolve(destination, &env) else {
             let text = format!(
@@ -2389,6 +2491,56 @@ impl Window {
             return;
         };
         self.connect_to(id, target, &env);
+    }
+
+    /// Opens serial console `target` in pane `id`, with the look of saved
+    /// session `session` (or the port's, by theme rules).
+    fn open_serial(&mut self, id: PaneId, target: SerialTarget, session: Option<&str>) {
+        self.end_host(id);
+        let alias = session.unwrap_or(&target.port).to_owned();
+        let (font, theme) = look::for_host(
+            &self.settings,
+            &alias,
+            &target.port,
+            None,
+            &FontSpec::default(),
+            &self.default_theme,
+        );
+        let scrollback = self
+            .settings
+            .profile(&alias)
+            .and_then(|p| p.scrollback)
+            .or(self.settings.scrollback);
+        if let Some(p) = self.panes.get_mut(&id) {
+            p.term.set_settings(&term_settings(scrollback));
+            p.term.scroll_to_bottom();
+        }
+        self.set_theme(id, theme);
+        self.set_font(id, font);
+        let notify = self.notifier();
+        let opened = SerialPort::open(&target, notify);
+        let text = match &opened {
+            Ok(_) => format!(
+                "\x1b[0;90mOpened {} at {} bits/s, {}, flow control {}. \
+                 Session > Send break sends a break.\x1b[0m\r\n",
+                target.port,
+                target.settings.speed,
+                target.settings.framing(),
+                target.settings.flow.label()
+            ),
+            Err(e) => format!("\x1b[0;31m{e}\x1b[0m\r\nPress Enter to try again.\r\n"),
+        };
+        if let Some(p) = self.panes.get_mut(&id) {
+            p.host = Host::Serial {
+                port: opened.ok().map(Box::new),
+                target,
+            };
+        }
+        self.show(id, &text);
+        self.start_log(id);
+        self.update_title();
+        self.refresh_chrome();
+        self.refresh(id);
     }
 
     /// Connects pane `id` to `target`. When another pane is logged in to
@@ -2474,6 +2626,11 @@ impl Window {
             Some(Host::Ssh(s)) => Some(s.target.clone()),
             Some(Host::Local { .. }) => {
                 self.start_shell(id);
+                return;
+            }
+            Some(Host::Serial { target, .. }) => {
+                let target = target.clone();
+                self.open_serial(id, target, None);
                 return;
             }
             _ => None,
@@ -2670,6 +2827,10 @@ impl Window {
             Host::Ssh(s) if s.state() == State::Connected => s.target.label(),
             Host::Local { exited: false, .. } => "local".to_owned(),
             Host::Tmux { label, .. } => label.clone(),
+            Host::Serial {
+                port: Some(_),
+                target,
+            } => target.port.clone(),
             _ => return,
         };
         let raw = p.log.raw;
@@ -2685,20 +2846,29 @@ impl Window {
                 } else {
                     base.replace(".log", &format!("-{n}.log"))
                 };
-                let path = dir.join(name);
-                match std::fs::OpenOptions::new()
-                    .write(true)
-                    .create_new(true)
-                    .open(&path)
-                {
-                    Ok(f) => return Ok((f, path)),
+                let path = dir.join(&name);
+                let new = |path: &Path| {
+                    std::fs::OpenOptions::new()
+                        .write(true)
+                        .create_new(true)
+                        .open(path)
+                };
+                match new(&path) {
+                    Ok(f) => {
+                        // The chain beside it seals the log against edits.
+                        let chain = new(&chain_path(&path))?;
+                        return Ok((f, chain, path, name));
+                    }
                     Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists && n < 100 => n += 1,
                     Err(e) => return Err(e),
                 }
             }
         });
         let header = format!("FeroSSH log of {label}, started {}", timestamp());
-        match opened.and_then(|(f, path)| Ok((LogWriter::new(f, raw, &header)?, path))) {
+        let writer = opened.and_then(|(f, chain, path, name)| {
+            Ok((LogWriter::sealed(f, chain, &name, raw, &header)?, path))
+        });
+        match writer {
             Ok((writer, path)) => {
                 self.show(
                     id,
@@ -2726,8 +2896,24 @@ impl Window {
     }
 
     fn stop_log(&mut self, id: PaneId) {
-        if let Some(writer) = self.panes.get_mut(&id).and_then(|p| p.log.writer.take()) {
-            let _ = writer.finish(&format!("Log ended {}", timestamp()));
+        let Some(p) = self.panes.get_mut(&id) else {
+            return;
+        };
+        let Some(writer) = p.log.writer.take() else {
+            return;
+        };
+        let footer = format!("Log ended {}", timestamp());
+        if let (Ok(Some(sealed)), Some(name)) = (
+            writer.finish_sealed(&footer),
+            p.log.path.as_deref().and_then(Path::file_name),
+        ) {
+            let name = name.to_string_lossy();
+            if let Err(e) = add_to_log_index(&name, &sealed) {
+                self.show(
+                    id,
+                    &format!("\x1b[0;31mCould not add the log to the log index: {e}\x1b[0m\r\n"),
+                );
+            }
         }
     }
 
@@ -2770,6 +2956,12 @@ impl Window {
                 return;
             }
             Some(Host::Ssh(session)) if !session.prompt_active() => session.input(&bytes),
+            Some(Host::Serial {
+                port: Some(port), ..
+            }) => {
+                port.write(bytes);
+                return;
+            }
             _ => return,
         };
         self.apply(id, effects);
@@ -2833,7 +3025,69 @@ impl Window {
                     self.reconnect(id);
                 }
             }
-            Host::Ssh(_) | Host::Tmux { .. } => self.send(id, bytes),
+            Host::Serial { port: None, target } => {
+                if enter {
+                    let target = target.clone();
+                    self.open_serial(id, target, None);
+                }
+            }
+            Host::Ssh(_) | Host::Tmux { .. } | Host::Serial { .. } => self.send(id, bytes),
+        }
+    }
+
+    /// Whether pane `id` passes typing straight to its host, so it may
+    /// send or receive broadcast input. Prompts and ended sessions do not.
+    fn takes_broadcast(&self, id: PaneId) -> bool {
+        let Some(p) = self.panes.get(&id) else {
+            return false;
+        };
+        if p.desktop.is_some() {
+            return false;
+        }
+        match &p.host {
+            Host::Local {
+                shell: Some(_),
+                exited: false,
+            }
+            | Host::Tmux { .. }
+            | Host::Serial { port: Some(_), .. } => true,
+            Host::Ssh(s) => s.state() == State::Connected && !s.prompt_active(),
+            _ => false,
+        }
+    }
+
+    /// The other panes that get what is typed in pane `id`.
+    fn broadcast_targets(&self, id: PaneId) -> Vec<PaneId> {
+        if self.broadcast == broadcast::Scope::Off {
+            return Vec::new();
+        }
+        broadcast::targets(
+            self.broadcast,
+            id,
+            &self.visible_ids(),
+            &self.ws.all_panes(),
+            |p| self.panes.get(&p).is_none_or(|p| p.no_broadcast),
+            |p| self.takes_broadcast(p),
+        )
+    }
+
+    /// Sends a key, character or paste to each of `targets`, encoded by
+    /// that pane's own terminal: its cursor-key mode, bracketed paste and
+    /// keypad mode can differ from the focused pane's.
+    fn send_typed(&mut self, targets: &[PaneId], typed: &Typed) {
+        for &id in targets {
+            let Some(p) = self.panes.get_mut(&id) else {
+                continue;
+            };
+            let bytes = match typed {
+                Typed::Char(ch, alt) => Some(p.term.text(*ch, *alt)),
+                Typed::Key(key, mods) => p.term.key(*key, *mods),
+                Typed::Bytes(b) => Some(b.clone()),
+                Typed::Paste(text) => Some(p.term.paste(text).bytes),
+            };
+            if let Some(bytes) = bytes {
+                self.input(id, bytes);
+            }
         }
     }
 
@@ -2899,6 +3153,48 @@ impl Window {
                             "\r\n\x1b[0;90m[Process exited with code {code}. Press Enter to start a new one.]\x1b[0m\r\n"
                         );
                         self.show(id, &text);
+                    }
+                }
+                if fed >= OUTPUT_BUDGET {
+                    more = true;
+                    break;
+                }
+            }
+        }
+        // The serial consoles.
+        let ids: Vec<PaneId> = self.panes.keys().copied().collect();
+        for id in ids {
+            while let Some(Pane {
+                host: Host::Serial {
+                    port: Some(port), ..
+                },
+                ..
+            }) = self.panes.get_mut(&id)
+            {
+                let Some(out) = port.try_read() else {
+                    break;
+                };
+                match out {
+                    SerialOutput::Data(data) => {
+                        fed += data.len();
+                        if let Some(p) = self.panes.get_mut(&id) {
+                            p.term.feed(&data);
+                        }
+                        self.log(id, &data);
+                    }
+                    SerialOutput::Closed(why) => {
+                        self.stop_log(id);
+                        if let Some(Host::Serial { port, .. }) =
+                            self.panes.get_mut(&id).map(|p| &mut p.host)
+                        {
+                            *port = None;
+                        }
+                        let text = format!(
+                            "\r\n\x1b[0;31m[The serial port stopped: {}. Press Enter to open it again.]\x1b[0m\r\n",
+                            why.trim()
+                        );
+                        self.show(id, &text);
+                        self.refresh_chrome();
                     }
                 }
                 if fed >= OUTPUT_BUDGET {
@@ -3409,7 +3705,18 @@ impl Window {
             out.push((pixel(d.rect), line));
         }
         let split = tab.root.panes().len() > 1;
-        if split
+        let receivers = self.broadcast_targets(tab.focus);
+        if !receivers.is_empty() {
+            // Every pane that gets the typing, the focused one too, is
+            // framed in amber while broadcast is on.
+            for id in std::iter::once(tab.focus).chain(receivers) {
+                if let Some(p) = self.panes.get(&id)
+                    && self.is_visible(id)
+                {
+                    frame(p.rect, g, BROADCAST_FRAME, &mut out);
+                }
+            }
+        } else if split
             && !self.side.focused
             && let Some(p) = self.panes.get(&tab.focus)
         {
@@ -3648,7 +3955,10 @@ impl Window {
             return;
         }
         let bytes = p.term.text(ch, alt);
+        // Who else gets it is decided first: the key may end a prompt.
+        let targets = self.broadcast_targets(id);
         self.input(id, bytes);
+        self.send_typed(&targets, &Typed::Char(ch, alt));
     }
 
     /// Handles a key-down: window shortcuts first, then the side pane or
@@ -3684,9 +3994,14 @@ impl Window {
         }
         if let Some(key) = terminal_key(vk) {
             drop_pending_char(self.hwnd);
+            let targets = self.broadcast_targets(id);
+            let Some(p) = self.panes.get_mut(&id) else {
+                return KeyOutcome::Handled;
+            };
             if let Some(bytes) = p.term.key(key, mods) {
                 self.input(id, bytes);
             }
+            self.send_typed(&targets, &Typed::Key(key, mods));
             return KeyOutcome::Handled;
         }
         // Control codes that have no character on most layouts. AltGr
@@ -3701,7 +4016,9 @@ impl Window {
             };
             if let Some(code) = code {
                 drop_pending_char(self.hwnd);
+                let targets = self.broadcast_targets(id);
                 self.input(id, vec![code]);
+                self.send_typed(&targets, &Typed::Bytes(vec![code]));
                 return KeyOutcome::Handled;
             }
         }
@@ -4168,6 +4485,29 @@ impl Window {
     /// waiting at the connect prompt, else in a new tab (or a split).
     fn open_host(&mut self, host: &str, split: bool) {
         if let Some(p) = self.settings.profile(host)
+            && p.kind == SessionKind::Serial
+        {
+            let line = p.serial.unwrap_or_default();
+            let hostname = Target::resolve(host, &ssh_env()).map(|t| t.hostname);
+            let port = hostname.as_deref().and_then(serial::port_name);
+            match port.or_else(|| serial::port_name(host)) {
+                Some(port) => {
+                    if let Some(id) = self.host_pane_for(split) {
+                        self.focus_terminal();
+                        let target = SerialTarget {
+                            port,
+                            settings: line,
+                        };
+                        self.open_serial(id, target, Some(host));
+                    }
+                }
+                None => self.queued.push(Command::Notice(format!(
+                    "The session {host} has no COM port: press F2 on it and fill one in."
+                ))),
+            }
+            return;
+        }
+        if let Some(p) = self.settings.profile(host)
             && p.kind != SessionKind::Ssh
         {
             let (kind, via) = (p.kind, p.via.clone());
@@ -4300,6 +4640,7 @@ impl Window {
             Ask,
         }
         let from = self.host_pane(from);
+        // A COM port opens once, so a split of a serial console asks.
         let like = match self.panes.get(&from).map(|p| &p.host) {
             Some(Host::Ssh(s)) => Like::Ssh(s.target.clone()),
             Some(Host::Local { .. }) => Like::Local,
@@ -5268,6 +5609,45 @@ impl Window {
                 self.update_menu_checks();
             }
             cmd::LOG_FOLDER => return Some(Command::OpenFolder(log_dir())),
+            cmd::LOG_VERIFY => return Some(Command::VerifyLog),
+            cmd::SERIAL_BREAK => {
+                let pane = self.focused_id();
+                match self.panes.get(&pane).map(|p| &p.host) {
+                    Some(Host::Serial {
+                        port: Some(port), ..
+                    }) => {
+                        port.send_break();
+                        self.show(pane, "\x1b[0;90m[break]\x1b[0m");
+                    }
+                    _ => {
+                        return Some(Command::Notice(
+                            "Send break is for serial consoles: open a COM port first \
+                             (type COM3 at the connect prompt, or make a Serial console \
+                             session)."
+                                .into(),
+                        ));
+                    }
+                }
+            }
+            cmd::BROADCAST_TAB | cmd::BROADCAST_ALL => {
+                let wanted = if id == cmd::BROADCAST_TAB {
+                    broadcast::Scope::Tab
+                } else {
+                    broadcast::Scope::All
+                };
+                self.broadcast = self.broadcast.toggle(wanted);
+                self.update_menu_checks();
+                self.update_title();
+                self.refresh_chrome();
+            }
+            cmd::BROADCAST_SKIP => {
+                let pane = self.focused_id();
+                if let Some(p) = self.panes.get_mut(&pane) {
+                    p.no_broadcast = !p.no_broadcast;
+                }
+                self.update_menu_checks();
+                self.refresh_chrome();
+            }
             cmd::ZOOM_IN | cmd::ZOOM_OUT | cmd::ZOOM_RESET => {
                 let font = self.panes.get(&pane)?.font.clone();
                 let font = match id {
@@ -5421,6 +5801,9 @@ impl Window {
                 (cmd::SIDE_RIGHT, s.side_pane_right),
                 (cmd::TAB_STRIP, s.tab_strip),
                 (cmd::TMUX_LAYOUT, own_layout),
+                (cmd::BROADCAST_TAB, self.broadcast == broadcast::Scope::Tab),
+                (cmd::BROADCAST_ALL, self.broadcast == broadcast::Scope::All),
+                (cmd::BROADCAST_SKIP, p.is_some_and(|p| p.no_broadcast)),
             ] {
                 CheckMenuItem(self.menu, id, (MF_BYCOMMAND | check(on)).0);
             }
@@ -5802,7 +6185,10 @@ impl Window {
         // tmux windows.
         ids.iter()
             .filter_map(|id| self.panes.get(id))
-            .filter(|p| p.connected() && (tab.is_some() || p.gateway().is_none()))
+            .filter(|p| {
+                let open = p.connected() || matches!(p.host, Host::Serial { port: Some(_), .. });
+                open && (tab.is_some() || p.gateway().is_none())
+            })
             .count()
     }
 
@@ -5871,6 +6257,7 @@ fn shortcut(vk: VIRTUAL_KEY, m: Mods, tabs: bool, split: bool) -> Option<u32> {
             v if v == key(b'P') && m.shift => Some(cmd::FORWARDS),
             v if v == key(b'D') && m.shift => Some(cmd::DESKTOP),
             v if v == key(b'U') && m.shift => Some(cmd::UPLOAD),
+            v if v == key(b'B') && m.shift => Some(cmd::BROADCAST_TAB),
             VK_INSERT if !m.shift => Some(cmd::COPY),
             VK_HOME if m.shift => Some(cmd::SCROLL_TOP),
             VK_END if m.shift => Some(cmd::SCROLL_BOTTOM),
@@ -5913,6 +6300,8 @@ enum Command {
     CloseTab(usize),
     /// File > Import sessions: the side pane's import page.
     ImportSessions,
+    /// Session > Check a log: the file picker, then the chain check.
+    VerifyLog,
     /// The import page's file picker.
     PickImportFile,
     SaveLook,
@@ -6317,11 +6706,22 @@ fn run_command(hwnd: HWND, command: Command) {
             else {
                 return;
             };
-            if paste.needs_confirmation() {
+            let targets = with_window(|w| w.broadcast_targets(id)).unwrap_or_default();
+            let others = if targets.is_empty() {
+                String::new()
+            } else {
+                format!(
+                    "\n\nBroadcast input is on: it goes to {} other pane{} too.",
+                    targets.len(),
+                    plural(targets.len())
+                )
+            };
+            if paste.needs_confirmation() || (!targets.is_empty() && paste.line_breaks > 0) {
                 let lines = paste.line_breaks;
                 let text = format!(
                     "The text you are pasting contains {lines} line break{s}. Each one acts as \
-                     Enter, so a shell runs every line as soon as it arrives.\n\n{}\n\nPaste it?",
+                     Enter, so a shell runs every line as soon as it arrives.{others}\n\n{}\n\n\
+                     Paste it?",
                     clipboard_preview(&text, PREVIEW_CHARS),
                     s = plural(lines),
                 );
@@ -6330,7 +6730,10 @@ fn run_command(hwnd: HWND, command: Command) {
                     return;
                 }
             }
-            with_window(|w| w.input(id, paste.bytes));
+            with_window(|w| {
+                w.input(id, paste.bytes);
+                w.send_typed(&targets, &Typed::Paste(text));
+            });
         }
         Command::ClipboardWrite(text) => {
             let prompt = format!(
@@ -6473,6 +6876,17 @@ fn run_command(hwnd: HWND, command: Command) {
             }
         }
         Command::SessionMenu(host) => session_menu(hwnd, host),
+        Command::VerifyLog => {
+            if let Some(path) = pick_file(hwnd, w!("Check a log for changes"), &log_dir()) {
+                let (text, ok) = check_log(&path);
+                let icon = if ok {
+                    MB_ICONINFORMATION
+                } else {
+                    MB_ICONWARNING
+                };
+                dialog(hwnd, &text, MB_OK | icon);
+            }
+        }
         Command::DeleteSession(name) => {
             let text = format!(
                 "Delete the session {name}? Its look and extras in FeroSSH go with it.\n\n\

@@ -17,6 +17,7 @@ mod pattern;
 pub mod putty;
 pub mod saved;
 pub mod securecrt;
+pub mod serial;
 pub mod settings;
 pub mod ssh_config;
 pub mod winscp;
