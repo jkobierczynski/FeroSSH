@@ -1277,7 +1277,7 @@ mod tests {
         connected(&mut s);
         s.on_worker(Message::Lost { channel: 1 });
         let fx = gone(&mut s, "Keepalive timeout.");
-        assert!(reconnects(&fx), "{fx:?}");
+        assert!(reconnects(&fx));
         assert!(matches!(fx[..], [_, Effect::Reconnect, Effect::Ended]));
         assert!(!shown(&fx).contains("Press Enter"));
 
