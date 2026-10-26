@@ -156,6 +156,12 @@ const TRANSFER_TICK_MS: u32 = 250;
 /// Gives remote desktops their pane's new size once it stops changing,
 /// so dragging a divider does not resize the desktop at every step.
 const TIMER_DESKTOP_SIZE: usize = 3;
+/// Ends the workers of connections nothing uses any more, once they had
+/// time to close them.
+const TIMER_RETIRE: usize = 4;
+/// How long a worker whose connection nothing uses keeps running, so its
+/// last shell's close reaches the server as a clean disconnect.
+const RETIRE_GRACE: Duration = Duration::from_secs(2);
 const DESKTOP_SIZE_MS: u32 = 300;
 /// Output processed per message before the window gets a chance to paint.
 const OUTPUT_BUDGET: usize = 1 << 20;
@@ -295,8 +301,10 @@ enum Host {
     },
 }
 
-/// The worker process, the pipes to it, and the forwarding engine that
-/// shares them.
+/// A worker process, the pipes to it, and the forwarding engine that
+/// shares them. Each SSH connection has its own, so a server that took
+/// over one worker reaches only its own connection: the shells, SFTP and
+/// forwards on it, never another host's.
 struct WorkerConn {
     link: Link,
     forwarder: Forwarder,
@@ -534,7 +542,12 @@ struct Window {
     command: String,
     /// Run the worker in the AppContainer (off only with `--no-sandbox`).
     sandbox: bool,
-    worker: Option<WorkerConn>,
+    /// The worker of each SSH connection, by the connection's id (the
+    /// channel of the shell that logged in).
+    workers: HashMap<ChannelId, WorkerConn>,
+    /// Workers whose connection nothing uses any more, with when that was;
+    /// they end after [`RETIRE_GRACE`].
+    retiring: Vec<(WorkerConn, Instant)>,
     broker: Option<Broker>,
     /// The channel of each job handed to the broker, oldest first. The
     /// broker answers in order, so each reply goes to the front one.
@@ -546,6 +559,10 @@ struct Window {
     output_pending: Arc<AtomicBool>,
     /// SFTP and the transfer queue, per `user@host:port`.
     sftp: HashMap<String, Remote>,
+    /// The connection each SFTP channel was opened on, so that what the
+    /// queues send goes to that connection's worker (a closing channel's
+    /// queue has already let go of it).
+    sftp_routes: HashMap<ChannelId, ChannelId>,
     files: FilesView,
     /// The host the file view shows: the focused pane's.
     files_key: Option<String>,
@@ -982,12 +999,14 @@ fn create_and_run(launch: Launch, theme: Option<String>) -> Result<()> {
                     _ => conpty::default_command(),
                 },
                 sandbox: !matches!(launch, Launch::Ssh { sandbox: false, .. }),
-                worker: None,
+                workers: HashMap::new(),
+                retiring: Vec::new(),
                 broker: None,
                 broker_jobs: VecDeque::new(),
                 next_channel: 1,
                 output_pending: Arc::new(AtomicBool::new(false)),
                 sftp: HashMap::new(),
+                sftp_routes: HashMap::new(),
                 files: FilesView::default(),
                 files_key: None,
                 transfer_timer: false,
@@ -1868,10 +1887,13 @@ impl Window {
 
     /// Every connection's forwards, from the forwarding engine.
     fn forward_view(&self) -> Vec<ConnView> {
-        self.worker
-            .as_ref()
-            .map(|w| w.forwarder.view())
-            .unwrap_or_default()
+        let mut views: Vec<ConnView> = self
+            .workers
+            .values()
+            .flat_map(|w| w.forwarder.view())
+            .collect();
+        views.sort_by_key(|v| v.connection);
+        views
     }
 
     /// What the badge of pane `id`'s tab shows.
@@ -1947,7 +1969,7 @@ impl Window {
         if let Some(d) = &x11 {
             notes.push(format!("X11 to {d}"));
         }
-        let Some(w) = &self.worker else {
+        let Some(w) = self.workers.get(&connection) else {
             return;
         };
         w.forwarder.start(
@@ -1971,19 +1993,79 @@ impl Window {
     /// Stops the forwards of connections no logged-in pane and no remote
     /// desktop uses any more.
     fn prune_forwards(&mut self) {
-        let Some(w) = &self.worker else {
-            return;
-        };
-        for v in w.forwarder.view() {
-            let used = self.panes.values().any(|p| match &p.host {
-                Host::Ssh(s) => s.connection == v.connection && s.state() == State::Connected,
-                Host::Desktop { connection, .. } => {
-                    *connection == v.connection && p.desktop.is_some()
+        for w in self.workers.values() {
+            for v in w.forwarder.view() {
+                let used = self.panes.values().any(|p| match &p.host {
+                    Host::Ssh(s) => s.connection == v.connection && s.state() == State::Connected,
+                    Host::Desktop { connection, .. } => {
+                        *connection == v.connection && p.desktop.is_some()
+                    }
+                    _ => false,
+                });
+                if !used {
+                    w.forwarder.stop(v.connection);
                 }
-                _ => false,
-            });
-            if !used {
-                w.forwarder.stop(v.connection);
+            }
+        }
+        self.prune_workers();
+    }
+
+    /// Retires the workers of connections that no pane logs in on or is
+    /// logged in on, no remote desktop and no SFTP channel uses: each ends
+    /// [`RETIRE_GRACE`] later.
+    fn prune_workers(&mut self) {
+        let unused: Vec<ChannelId> = self
+            .workers
+            .keys()
+            .copied()
+            .filter(|&c| !self.connection_in_use(c))
+            .collect();
+        if unused.is_empty() {
+            return;
+        }
+        let now = Instant::now();
+        for c in unused {
+            if let Some(w) = self.workers.remove(&c) {
+                self.retiring.push((w, now));
+            }
+        }
+        let workers = &self.workers;
+        self.sftp_routes.retain(|_, c| workers.contains_key(c));
+        // SAFETY: our window and timer.
+        unsafe {
+            SetTimer(
+                Some(self.hwnd),
+                TIMER_RETIRE,
+                u32::try_from(RETIRE_GRACE.as_millis()).unwrap_or(u32::MAX),
+                None,
+            );
+        }
+    }
+
+    /// Whether anything still needs the SSH connection `connection`.
+    fn connection_in_use(&self, connection: ChannelId) -> bool {
+        self.panes.values().any(|p| match &p.host {
+            Host::Ssh(s) => {
+                s.connection == connection
+                    && matches!(s.state(), State::Connecting | State::Connected)
+            }
+            Host::Desktop { connection: c, .. } => *c == connection && p.desktop.is_some(),
+            _ => false,
+        }) || self.desktops.keys().any(|(c, ..)| *c == connection)
+            || self
+                .sftp
+                .values()
+                .any(|r| r.connection() == Some(connection))
+    }
+
+    /// Ends the workers that retired long enough ago.
+    fn on_retire_timer(&mut self) {
+        self.retiring
+            .retain(|(_, since)| since.elapsed() < RETIRE_GRACE);
+        if self.retiring.is_empty() {
+            // SAFETY: our window and timer.
+            unsafe {
+                let _ = KillTimer(Some(self.hwnd), TIMER_RETIRE);
             }
         }
     }
@@ -2049,7 +2131,7 @@ impl Window {
                 DesktopWant::Rdp { pane },
             ),
         };
-        let w = self.worker.as_ref()?;
+        let w = self.workers.get(&connection)?;
         w.forwarder
             .open_desktop(connection, "localhost", port, local);
         self.desktops
@@ -2067,10 +2149,11 @@ impl Window {
     /// Opens a viewer on the desktop tunnels that are ready, and says why
     /// the others failed.
     fn desktop_events(&mut self) {
-        let events = match &self.worker {
-            Some(w) => w.forwarder.take_desktop_events(),
-            None => return,
-        };
+        let events: Vec<DesktopEvent> = self
+            .workers
+            .values()
+            .flat_map(|w| w.forwarder.take_desktop_events())
+            .collect();
         for event in events {
             match event {
                 DesktopEvent::Ready {
@@ -2415,8 +2498,8 @@ impl Window {
                         [only] => Some(only.connection),
                         _ => None,
                     });
-                match (connection, &self.worker) {
-                    (Some(c), Some(w)) => w.forwarder.add(c, spec),
+                match connection.and_then(|c| Some((c, self.workers.get(&c)?))) {
+                    Some((c, w)) => w.forwarder.add(c, spec),
                     _ if view.is_empty() => self
                         .forwards_view
                         .refuse(&spec, "Log in to a host first.".into()),
@@ -2426,7 +2509,7 @@ impl Window {
                 }
             }
             Some(FwdAction::Remove { connection, index }) => {
-                if let Some(w) = &self.worker {
+                if let Some(w) = self.workers.get(&connection) {
                     w.forwarder.remove(connection, index);
                 }
             }
@@ -2437,9 +2520,10 @@ impl Window {
         None
     }
 
-    /// Starts the worker if it is not running.
-    fn ensure_worker(&mut self, id: PaneId) -> bool {
-        if self.worker.is_some() {
+    /// Starts the worker of the connection `connection` if it is not
+    /// running: a new login gets a worker of its own.
+    fn ensure_worker(&mut self, id: PaneId, connection: ChannelId) -> bool {
+        if self.workers.contains_key(&connection) {
             return true;
         }
         let result = sandbox::spawn_worker(self.sandbox).and_then(|w| {
@@ -2459,7 +2543,7 @@ impl Window {
         });
         match result {
             Ok(conn) => {
-                self.worker = Some(conn);
+                self.workers.insert(connection, conn);
                 true
             }
             Err(e) => {
@@ -2573,7 +2657,14 @@ impl Window {
         if let Some(p) = self.panes.get_mut(&id) {
             p.term.scroll_to_bottom();
         }
-        if !self.ensure_worker(id) || !self.ensure_broker(id) {
+        let shared = self.panes.values().find_map(|p| match &p.host {
+            Host::Ssh(s) if p.id != id && s.can_share(&target) => Some(s.connection),
+            _ => None,
+        });
+        let channel = self.new_channel();
+        // A new login runs in a worker of its own; a shared connection's
+        // shell in that connection's.
+        if !self.ensure_worker(id, shared.unwrap_or(channel)) || !self.ensure_broker(id) {
             self.refresh(id);
             return;
         }
@@ -2584,11 +2675,6 @@ impl Window {
             );
         }
         self.apply_look(id, &target);
-        let shared = self.panes.values().find_map(|p| match &p.host {
-            Host::Ssh(s) if p.id != id && s.can_share(&target) => Some(s.connection),
-            _ => None,
-        });
-        let channel = self.new_channel();
         let x11 = target.forward_x11.then(|| self.x11_auth(id)).flatten();
         let legacy = self
             .settings
@@ -2667,7 +2753,10 @@ impl Window {
         for effect in effects {
             match effect {
                 Effect::Send(msg) => {
-                    if let Some(w) = &self.worker {
+                    // Only to the worker of the pane's own connection.
+                    if let Some(Host::Ssh(s)) = self.panes.get(&id).map(|p| &p.host)
+                        && let Some(w) = self.workers.get(&s.connection)
+                    {
                         w.link.send(msg);
                     }
                 }
@@ -3237,71 +3326,30 @@ impl Window {
             };
             self.apply(id, effects);
         }
-        // The worker.
+        // The workers, a message from each in turn so that a flooding
+        // host does not hold up the others.
         let mut transfers = false;
+        let connections: Vec<ChannelId> = self.workers.keys().copied().collect();
         while !more {
-            let Some(event) = self.worker.as_ref().and_then(|w| w.link.try_recv()) else {
-                break;
-            };
-            match event {
-                LinkEvent::Message(msg) => {
-                    match &msg {
-                        Message::Data { bytes, .. } => fed += bytes.len(),
-                        Message::SftpReply {
-                            reply: SftpReply::Data(data),
-                            ..
-                        } => fed += data.len(),
-                        _ => {}
-                    }
-                    if let Some(c) = msg.channel()
-                        && let Some(remote) =
-                            self.sftp.values_mut().find(|r| r.channel() == Some(c))
-                    {
-                        remote.on_message(msg);
-                        transfers = true;
-                        more = fed >= OUTPUT_BUDGET;
-                        continue;
-                    }
-                    let Some(id) = msg.channel().and_then(|c| self.pane_of_channel(c)) else {
-                        continue;
-                    };
-                    let effects = match self.panes.get_mut(&id).map(|p| &mut p.host) {
-                        Some(Host::Ssh(session)) => session.on_worker(msg),
-                        _ => Vec::new(),
-                    };
-                    self.apply(id, effects);
-                }
-                LinkEvent::Closed(why) => {
-                    if let Some(w) = &self.worker {
-                        w.forwarder.worker_gone();
-                    }
-                    self.worker = None;
-                    self.broker_jobs.clear();
-                    for remote in self.sftp.values_mut() {
-                        remote.detach();
-                    }
-                    transfers = true;
-                    let ids: Vec<PaneId> = self.panes.keys().copied().collect();
-                    for id in ids {
-                        let effects = match self.panes.get_mut(&id).map(|p| &mut p.host) {
-                            Some(Host::Ssh(session))
-                                if matches!(
-                                    session.state(),
-                                    State::Connecting | State::Connected
-                                ) =>
-                            {
-                                session.on_worker(Message::Disconnected {
-                                    channel: session.channel,
-                                    reason: why.clone(),
-                                })
-                            }
-                            _ => Vec::new(),
-                        };
-                        self.apply(id, effects);
-                    }
+            let mut idle = true;
+            for &connection in &connections {
+                let Some(event) = self
+                    .workers
+                    .get(&connection)
+                    .and_then(|w| w.link.try_recv())
+                else {
+                    continue;
+                };
+                idle = false;
+                transfers |= self.on_worker_event(connection, event, &mut fed);
+                more = fed >= OUTPUT_BUDGET;
+                if more {
+                    break;
                 }
             }
-            more = fed >= OUTPUT_BUDGET;
+            if idle {
+                break;
+            }
         }
         if transfers {
             self.flush_sftp();
@@ -3314,9 +3362,9 @@ impl Window {
         self.poll_passwords();
         // The forwards list and the tab badges.
         if self
-            .worker
-            .as_ref()
-            .is_some_and(|w| w.forwarder.take_changed())
+            .workers
+            .values()
+            .fold(false, |changed, w| w.forwarder.take_changed() | changed)
         {
             self.refresh_chrome();
             self.update_title();
@@ -3329,6 +3377,82 @@ impl Window {
             }
         }
         self.after_feed()
+    }
+
+    /// Handles what the worker of the connection `connection` sent, and
+    /// returns whether it was for a file transfer. A worker only reaches
+    /// the shells and SFTP channels on its own connection: anything it
+    /// says about another one's is dropped.
+    fn on_worker_event(
+        &mut self,
+        connection: ChannelId,
+        event: LinkEvent,
+        fed: &mut usize,
+    ) -> bool {
+        match event {
+            LinkEvent::Message(msg) => {
+                match &msg {
+                    Message::Data { bytes, .. } => *fed += bytes.len(),
+                    Message::SftpReply {
+                        reply: SftpReply::Data(data),
+                        ..
+                    } => *fed += data.len(),
+                    _ => {}
+                }
+                let Some(c) = msg.channel() else {
+                    return false;
+                };
+                if let Some(remote) = self
+                    .sftp
+                    .values_mut()
+                    .find(|r| r.channel() == Some(c) && r.connection() == Some(connection))
+                {
+                    remote.on_message(msg);
+                    return true;
+                }
+                let Some(id) = self.pane_of_channel(c) else {
+                    return false;
+                };
+                let effects = match self.panes.get_mut(&id).map(|p| &mut p.host) {
+                    Some(Host::Ssh(session)) if session.connection == connection => {
+                        session.on_worker(msg)
+                    }
+                    _ => Vec::new(),
+                };
+                self.apply(id, effects);
+                false
+            }
+            LinkEvent::Closed(why) => {
+                if let Some(w) = self.workers.remove(&connection) {
+                    w.forwarder.worker_gone();
+                }
+                for remote in self.sftp.values_mut() {
+                    if remote.connection() == Some(connection) {
+                        remote.detach();
+                    }
+                }
+                let ids: Vec<PaneId> = self.panes.keys().copied().collect();
+                for id in ids {
+                    let effects = match self.panes.get_mut(&id).map(|p| &mut p.host) {
+                        Some(Host::Ssh(session))
+                            if session.connection == connection
+                                && matches!(
+                                    session.state(),
+                                    State::Connecting | State::Connected
+                                ) =>
+                        {
+                            session.on_worker(Message::Disconnected {
+                                channel: session.channel,
+                                reason: why.clone(),
+                            })
+                        }
+                        _ => Vec::new(),
+                    };
+                    self.apply(id, effects);
+                }
+                true
+            }
+        }
     }
 
     /// Acts on what the terminals asked for and redraws.
@@ -4508,7 +4632,7 @@ impl Window {
             ),
             _ => (desktop_port_for(&p.label), DesktopWant::Rdp { pane: id }),
         };
-        let Some(w) = self.worker.as_ref() else {
+        let Some(w) = self.workers.get(&connection) else {
             return;
         };
         w.forwarder.open_desktop(connection, &p.host, p.port, local);
@@ -5993,7 +6117,7 @@ impl Window {
         let Some(Host::Ssh(s)) = self.panes.get(&self.host_pane(id)).map(|g| &g.host) else {
             return;
         };
-        if s.state() != State::Connected || self.worker.is_none() {
+        if s.state() != State::Connected || !self.workers.contains_key(&s.connection) {
             return;
         }
         let key = sftp_key(&s.target);
@@ -6024,6 +6148,7 @@ impl Window {
         let channel = self.next_channel;
         self.next_channel = ((channel + 1) % FORWARD_IDS).max(1);
         remote.attach(channel, connection);
+        self.sftp_routes.insert(channel, connection);
         self.flush_sftp();
     }
 
@@ -6071,9 +6196,13 @@ impl Window {
     /// anything moves.
     fn flush_sftp(&mut self) {
         for remote in self.sftp.values_mut() {
-            let out = remote.take_outbox();
-            if let Some(w) = &self.worker {
-                for msg in out {
+            // Each to the worker of the connection its channel runs on.
+            for msg in remote.take_outbox() {
+                if let Some(w) = msg
+                    .channel()
+                    .and_then(|c| self.sftp_routes.get(&c))
+                    .and_then(|c| self.workers.get(c))
+                {
                     w.link.send(msg);
                 }
             }
@@ -7454,6 +7583,10 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
             }
             WM_TIMER if wparam.0 == TIMER_TRANSFER => {
                 with_window(Window::on_transfer_timer);
+                LRESULT(0)
+            }
+            WM_TIMER if wparam.0 == TIMER_RETIRE => {
+                with_window(Window::on_retire_timer);
                 LRESULT(0)
             }
             WM_TIMER if wparam.0 == TIMER_DESKTOP_SIZE => {

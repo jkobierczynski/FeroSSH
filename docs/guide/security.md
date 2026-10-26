@@ -2,12 +2,12 @@
 
 FeroSSH is built so that a bug in the code that reads network data cannot reach your files or your keys. This page explains how, and what you still need to do yourself.
 
-## Two processes
+## Separate processes
 
 - **The window** draws the terminal, reads your keyboard, holds your settings and talks to the key agents. It never parses data from the network.
-- **The SSH worker** speaks SSH to the server. It runs in a Windows AppContainer that allows network access and nothing else: it cannot read your files, your registry or your private keys. When the server wants a signature, the worker asks the window, and the window asks your agent, Pageant, the key file or your security key.
+- **The SSH worker** speaks SSH to the server. It runs in a Windows AppContainer that allows network access and nothing else: it cannot read your files, your registry or your private keys. When the server wants a signature, the worker asks the window, and the window asks your agent, Pageant, the key file or your security key. Each SSH connection has a worker process of its own (tabs that share a login share it too), so a server that took over its worker still cannot see your sessions on other servers.
 
-The two talk over a pipe with a small, fuzz-tested message format. The desktop viewer in `ferossh-desktop.exe` runs in a third process, in an AppContainer with no capabilities at all, not even the network: it only sees what comes through the SSH tunnel.
+The window and each worker talk over a pipe with a small, fuzz-tested message format. The desktop viewer in `ferossh-desktop.exe` runs in a third process, in an AppContainer with no capabilities at all, not even the network: it only sees what comes through the SSH tunnel.
 
 Windows does not let AppContainers connect to 127.0.0.1, so for an SSH server on the same PC you start FeroSSH with `--no-sandbox`. Port forwards to and from localhost work in the sandbox, because the window holds those sockets.
 
