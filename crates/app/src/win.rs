@@ -71,10 +71,11 @@ use windows::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT, CheckMenuItem, CheckMenuRadioItem,
     CreateMenu, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyMenu, DestroyWindow,
     DispatchMessageW, EnableMenuItem, FLASHW_TIMERNOFG, FLASHW_TRAY, FLASHWINFO, FlashWindowEx,
-    GetClientRect, GetCursorPos, GetMessageW, HCURSOR, HMENU, HTCLIENT, IDC_ARROW, IDC_IBEAM,
-    IDC_SIZEALL, IDC_SIZENS, IDC_SIZEWE, IDYES, KillTimer, LoadCursorW, MB_DEFBUTTON2,
-    MB_ICONERROR, MB_ICONINFORMATION, MB_ICONQUESTION, MB_ICONWARNING, MB_OK, MB_YESNO,
-    MESSAGEBOX_RESULT, MESSAGEBOX_STYLE, MF_BYCOMMAND, MF_CHECKED, MF_GRAYED, MF_POPUP,
+    GetClientRect, GetCursorPos, GetMenuItemCount, GetMenuItemID, GetMenuState, GetMenuStringW,
+    GetMessageW, GetSubMenu, HCURSOR, HMENU, HTCLIENT, IDC_ARROW, IDC_IBEAM, IDC_SIZEALL,
+    IDC_SIZENS, IDC_SIZEWE, IDYES, KillTimer, LoadCursorW, MB_DEFBUTTON2, MB_ICONERROR,
+    MB_ICONINFORMATION, MB_ICONQUESTION, MB_ICONWARNING, MB_OK, MB_YESNO, MESSAGEBOX_RESULT,
+    MESSAGEBOX_STYLE, MF_BYCOMMAND, MF_BYPOSITION, MF_CHECKED, MF_DISABLED, MF_GRAYED, MF_POPUP,
     MF_SEPARATOR, MF_STRING, MF_UNCHECKED, MSG, MessageBoxW, PM_REMOVE, PeekMessageW, PostMessageW,
     PostQuitMessage, RegisterClassW, SIZE_MINIMIZED, SW_SHOW, SW_SHOWNORMAL, SWP_NOACTIVATE,
     SWP_NOMOVE, SWP_NOZORDER, SetCursor, SetMenu, SetTimer, SetWindowPos, SetWindowTextW,
@@ -105,6 +106,7 @@ use crate::layout::{self, Axis, Closed, Dir, Drop, PaneId, Rect, Workspace};
 use crate::link::{Link, LinkEvent};
 use crate::login_script::{self, Need, Runner};
 use crate::look;
+use crate::palette::{self, CommandPalette, PalAction};
 use crate::pattern;
 use crate::proxycmd::ProxyRun;
 use crate::pwcommand;
@@ -229,6 +231,7 @@ mod cmd {
     pub const FOLLOW_CD: u32 = 210;
     pub const FORWARDS: u32 = 211;
     pub const SNIPPETS: u32 = 212;
+    pub const PALETTE: u32 = 213;
     /// Plus the index into `FONT_CHOICES`.
     pub const FONT: u32 = 300;
     /// Plus the index into `Theme::builtin()`.
@@ -528,6 +531,8 @@ enum SideView {
     Files,
     Forwards,
     Snippets,
+    /// The command palette, shown over whatever the side pane showed.
+    Palette,
 }
 
 /// The side pane: the session manager, file transfer or the forwards.
@@ -655,6 +660,10 @@ struct Window {
     /// Ctrl+Shift+Space showed the snippets on a hidden side pane, so
     /// typing one hides it again.
     snippets_peek: bool,
+    palette: CommandPalette,
+    /// What the side pane showed before the command palette, which comes
+    /// back when the palette closes; `None` if it was hidden.
+    palette_return: Option<SideView>,
 }
 
 /// A login script running in a pane.
@@ -1162,6 +1171,8 @@ fn create_and_run(launch: Launch, theme: Option<String>) -> Result<()> {
                 script_runs: 0,
                 snippets_view: SnippetsView::default(),
                 snippets_peek: false,
+                palette: CommandPalette::default(),
+                palette_return: None,
             });
         });
         // Files dropped from Explorer are uploaded, after a confirmation.
@@ -1331,6 +1342,8 @@ fn build_menu() -> Result<HMENU> {
         }
 
         let view = CreatePopupMenu()?;
+        item(view, cmd::PALETTE, "Comm&and palette\tCtrl+Shift+A")?;
+        separator(view)?;
         item(view, cmd::SESSIONS, "S&ession manager\tCtrl+Shift+S")?;
         item(view, cmd::FILES, "File tra&nsfer\tCtrl+Shift+E")?;
         item(view, cmd::FORWARDS, "Port &forwards\tCtrl+Shift+P")?;
@@ -4764,6 +4777,9 @@ impl Window {
                     self.forwards_view
                         .draw(&mut self.side.grid, &palette, focused, &view);
                 }
+                SideView::Palette => {
+                    self.palette.draw(&mut self.side.grid, &palette, focused);
+                }
                 SideView::Snippets => {
                     self.snippets_view.draw(
                         &mut self.side.grid,
@@ -5312,6 +5328,10 @@ impl Window {
 
     /// A key for the side pane; what it picked runs here.
     fn side_key(&mut self, key: SideKey) -> Option<Command> {
+        if self.side.view == SideView::Palette {
+            let action = self.palette.key(key, self.side.grid.rows());
+            return self.palette_action(action);
+        }
         if self.side.view == SideView::Snippets {
             let rows = self.side.grid.rows();
             let action = self.snippets_view.key(key, &self.settings.snippets, rows);
@@ -5412,6 +5432,82 @@ impl Window {
         }
         self.refresh_chrome();
         out
+    }
+
+    /// Ctrl+Shift+A: the command palette, on every menu action, session
+    /// and snippet; again, back to the terminal. A palette that lost the
+    /// keyboard to a click in a pane gets it back first.
+    fn toggle_palette(&mut self) {
+        if self.side.visible && self.side.view == SideView::Palette {
+            if self.side.focused {
+                self.leave_palette();
+            } else {
+                self.side.focused = true;
+                self.refresh_chrome();
+                self.request_full_redraw();
+                self.refresh(self.focused_id());
+            }
+            return;
+        }
+        // The menu's check marks are brought up to date first, since the
+        // palette shows them.
+        self.update_menu_checks();
+        let mut entries = menu_entries(self.menu);
+        entries.retain(|e| e.kind != palette::Kind::Action(cmd::PALETTE));
+        let env = ssh_env();
+        entries.extend(
+            host_items(&env, &self.settings)
+                .iter()
+                .map(|h| palette::Entry::session(&h.name, &h.detail, h.kind)),
+        );
+        entries.extend(
+            self.settings
+                .snippets
+                .iter()
+                .enumerate()
+                .map(|(i, s)| palette::Entry::snippet(i, &s.name, &s.lines)),
+        );
+        self.palette.open(entries);
+        // Snippets that only peeked go with the palette.
+        self.palette_return = (self.side.visible && !self.snippets_peek).then_some(self.side.view);
+        self.snippets_peek = false;
+        self.show_side(SideView::Palette, true);
+    }
+
+    /// Closes the palette: the side pane shows what it showed before, or
+    /// hides again, and the keyboard goes back to the terminal.
+    fn leave_palette(&mut self) {
+        match self.palette_return.take() {
+            Some(view) => {
+                self.side.view = view;
+                self.side.focused = false;
+                self.refresh_chrome();
+                self.request_full_redraw();
+                self.refresh(self.focused_id());
+            }
+            None => self.hide_side(),
+        }
+        self.update_menu_checks();
+    }
+
+    /// Carries out what the palette picked, once it is closed, so what
+    /// runs sees the side pane as it was.
+    fn palette_action(&mut self, action: Option<PalAction>) -> Option<Command> {
+        let Some(action) = action else {
+            self.refresh_chrome();
+            return None;
+        };
+        self.leave_palette();
+        match action {
+            PalAction::Run(id) => return Some(Command::Id(id)),
+            PalAction::Open { host, split } => self.open_host(&host, split),
+            PalAction::Send { index, enter } => {
+                let lines = self.settings.snippets.get(index)?.lines.clone();
+                return self.send_snippet(&lines, enter);
+            }
+            PalAction::Leave => {}
+        }
+        None
     }
 
     /// Back to the terminal from the snippets: the side pane hides again
@@ -5910,7 +6006,7 @@ impl Window {
                 );
             }
             SideView::Files => self.ensure_sftp(self.focused_id()),
-            SideView::Forwards => {}
+            SideView::Forwards | SideView::Palette => {}
             SideView::Snippets => {
                 if !self.snippets_view.editing() {
                     self.snippets_view.reset();
@@ -5953,6 +6049,7 @@ impl Window {
 
     fn hide_side(&mut self) {
         self.snippets_peek = false;
+        self.palette_return = None;
         self.side.visible = false;
         self.side.focused = false;
         self.layout();
@@ -6238,6 +6335,10 @@ impl Window {
                     self.forwards_view.click(row, &view, rows);
                     self.refresh_chrome();
                     return None;
+                }
+                if self.side.view == SideView::Palette {
+                    let action = self.palette.click(row, double, self.side.grid.rows());
+                    return self.palette_action(action);
                 }
                 if self.side.view == SideView::Snippets {
                     let rows = self.side.grid.rows();
@@ -6647,6 +6748,8 @@ impl Window {
                     let view = self.forward_view();
                     let rows = self.side.grid.rows();
                     self.forwards_view.scroll_by(lines, &view, rows);
+                } else if self.side.view == SideView::Palette {
+                    self.palette.scroll_by(lines, self.side.grid.rows());
                 } else if self.side.view == SideView::Snippets {
                     let rows = self.side.grid.rows();
                     self.snippets_view
@@ -6924,6 +7027,7 @@ impl Window {
             cmd::SESSIONS | cmd::FILES | cmd::FORWARDS | cmd::SNIPPETS => {
                 self.toggle_side(id, false);
             }
+            cmd::PALETTE => self.toggle_palette(),
             cmd::RUN_SCRIPT => return self.rerun_script(self.focused_id()),
             cmd::SIDE_RIGHT => {
                 self.settings.side_pane_right = !self.settings.side_pane_right;
@@ -7663,6 +7767,48 @@ impl Window {
     }
 }
 
+/// The command palette's actions: every item of `menu` and its submenus
+/// that is not greyed out, with the menus it is in.
+fn menu_entries(menu: HMENU) -> Vec<palette::Entry> {
+    fn walk(menu: HMENU, path: &mut Vec<String>, out: &mut Vec<palette::Entry>) {
+        // SAFETY: a menu handle of ours.
+        let count = unsafe { GetMenuItemCount(Some(menu)) };
+        for pos in 0..count.max(0) {
+            let at = pos as u32;
+            let mut buf = [0u16; 256];
+            // SAFETY: our menu, a position in it and a local buffer.
+            let (len, state, sub) = unsafe {
+                (
+                    GetMenuStringW(menu, at, Some(&mut buf), MF_BYPOSITION),
+                    GetMenuState(menu, at, MF_BYPOSITION),
+                    GetSubMenu(menu, pos),
+                )
+            };
+            if state & MF_SEPARATOR.0 != 0 {
+                continue;
+            }
+            let len = usize::try_from(len).unwrap_or(0).min(buf.len());
+            let text = String::from_utf16_lossy(buf.get(..len).unwrap_or_default());
+            if !sub.is_invalid() {
+                path.push(text);
+                walk(sub, path, out);
+                path.pop();
+                continue;
+            }
+            if state & (MF_GRAYED.0 | MF_DISABLED.0) != 0 {
+                continue;
+            }
+            // SAFETY: as above.
+            let id = unsafe { GetMenuItemID(menu, pos) };
+            let on = state & MF_CHECKED.0 != 0;
+            out.push(palette::Entry::action(path, &text, id, on));
+        }
+    }
+    let mut out = Vec::new();
+    walk(menu, &mut Vec::new(), &mut out);
+    out
+}
+
 /// The window shortcut for a key, as a command id. Tab and pane keys only
 /// apply when there is more than one tab or pane, so that otherwise the
 /// keys reach the terminal.
@@ -7716,6 +7862,7 @@ fn shortcut(vk: VIRTUAL_KEY, m: Mods, tabs: bool, split: bool) -> Option<u32> {
             v if v == key(b'S') && m.shift => Some(cmd::SESSIONS),
             v if v == key(b'E') && m.shift => Some(cmd::FILES),
             v if v == key(b'P') && m.shift => Some(cmd::FORWARDS),
+            v if v == key(b'A') && m.shift => Some(cmd::PALETTE),
             VK_SPACE if m.shift => Some(cmd::SNIPPETS),
             v if v == key(b'D') && m.shift => Some(cmd::DESKTOP),
             v if v == key(b'U') && m.shift => Some(cmd::UPLOAD),
@@ -9125,5 +9272,20 @@ mod tests {
             ..Mods::NONE
         };
         assert_eq!(shortcut(VK_F4, alt, true, true), None);
+    }
+
+    #[test]
+    fn ctrl_shift_a_opens_the_palette_and_ctrl_a_stays_the_hosts() {
+        let a = VIRTUAL_KEY(u16::from(b'A'));
+        let ctrl = Mods {
+            ctrl: true,
+            ..Mods::NONE
+        };
+        let ctrl_shift = Mods {
+            shift: true,
+            ..ctrl
+        };
+        assert_eq!(shortcut(a, ctrl_shift, false, false), Some(cmd::PALETTE));
+        assert_eq!(shortcut(a, ctrl, true, true), None);
     }
 }

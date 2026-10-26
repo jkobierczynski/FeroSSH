@@ -57,6 +57,8 @@ mod look;
 #[cfg_attr(not(windows), allow(dead_code))]
 mod newkey;
 #[cfg_attr(not(windows), allow(dead_code))]
+mod palette;
+#[cfg_attr(not(windows), allow(dead_code))]
 mod pattern;
 #[cfg_attr(not(windows), allow(dead_code))]
 mod proxycmd;
