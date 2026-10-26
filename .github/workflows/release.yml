@@ -212,15 +212,45 @@ jobs:
           name: release-dry-run
           path: dist
 
+      # The signed update file that Help > Check for updates reads from the
+      # latest release (crates/update). It needs the UPDATE_SIGNING_KEY
+      # secret, made once with
+      # `cargo run -p ferossh-update --example keygen`; without it the
+      # release has no update file and checks say so. Pre-releases never
+      # become "latest", so they are not offered as updates.
+      - name: Update file
+        shell: pwsh
+        env:
+          UPDATE_SIGNING_KEY: ${{ secrets.UPDATE_SIGNING_KEY }}
+          TAG: ${{ github.event_name == 'push' && github.ref_name || 'v0.0.0-dry-run' }}
+        run: |
+          if (-not $env:UPDATE_SIGNING_KEY) {
+            "No UPDATE_SIGNING_KEY secret: the release has no update file." | Tee-Object -Append $env:GITHUB_STEP_SUMMARY
+            exit 0
+          }
+          $released = (Get-Date).ToUniversalTime().ToString("yyyy-MM-dd")
+          cargo run --locked -q -p ferossh-update --example sign -- $env:TAG.TrimStart("v") $released dist
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+
       - name: Create the GitHub Release
         if: github.event_name == 'push'
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ github.ref_name }}
+          SIGNED: ${{ steps.signpath.outputs.enabled }}
         run: |
           $pre = if ($env:TAG.Contains("-")) { @("--prerelease") } else { @() }
+          $files = @("dist/ferossh.exe", "dist/ferossh-desktop.exe", "dist/SHA256SUMS.txt", "dist/BUILD-MANIFEST.json")
+          if (Test-Path dist/update.txt.sig) { $files += @("dist/update.txt", "dist/update.txt.sig") }
+          # Every release page says whether its exes are signed, and by whom.
+          $signing = if ($env:SIGNED -eq "true") {
+            "**Code signing.** Free code signing provided by [SignPath.io](https://about.signpath.io), certificate by [SignPath Foundation](https://signpath.org). See [Code signing](https://github.com/jkobierczynski/FeroSSH#code-signing)."
+          } else {
+            "**Code signing.** These exes are not code signed yet. Check a download against ``SHA256SUMS.txt`` or with ``gh attestation verify ferossh.exe -R jkobierczynski/FeroSSH``; see [Verifying a download](https://github.com/jkobierczynski/FeroSSH/blob/main/docs/guide/verifying-downloads.md)."
+          }
+          $notes = (Get-Content -Raw "docs/releases/$env:TAG.md").TrimEnd() + "`n`n---`n`n" + $signing + "`n"
+          [IO.File]::WriteAllText("$env:RUNNER_TEMP/notes.md", $notes, [Text.UTF8Encoding]::new($false))
           gh release create $env:TAG --verify-tag --title "FeroSSH $env:TAG" `
-            --notes-file "docs/releases/$env:TAG.md" @pre `
-            dist/ferossh.exe dist/ferossh-desktop.exe dist/SHA256SUMS.txt dist/BUILD-MANIFEST.json
+            --notes-file "$env:RUNNER_TEMP/notes.md" @pre @files
           if ($LASTEXITCODE) { exit $LASTEXITCODE }

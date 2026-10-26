@@ -99,6 +99,7 @@ use crate::import_reg;
 use crate::import_view::{Found, ImportAction, ImportView};
 use crate::layout::{self, Axis, Closed, Dir, Drop, PaneId, Rect, Workspace};
 use crate::link::{Link, LinkEvent};
+use crate::login_script::{self, Need, Runner};
 use crate::look;
 use crate::pattern;
 use crate::pwcommand;
@@ -107,6 +108,7 @@ use crate::scrollmark;
 use crate::serial_port::{Output as SerialOutput, SerialPort};
 use crate::session_form::{self, FormAction, Hints, SessionForm, Source, Values};
 use crate::sessions::{HostItem, SessionList, SideAction, SideKey};
+use crate::snippets_view::{SnipAction, SnippetsView};
 use crate::ssh::{Effect, Env, SshSession, State, Target};
 use crate::tabstrip::{self, Forwarding, Health, Hit, Palette, StripLayout, TabLabel};
 use crate::tmux::{self, Mode as TmuxMode, Tmux};
@@ -129,7 +131,7 @@ const GRAB_DIP: i32 = 3;
 /// The side pane's width when first shown, in chrome cells.
 const SIDE_COLS: i32 = 34;
 /// The side pane font size.
-const CHROME_PT: f32 = 9.5;
+const CHROME_PT: f32 = 10.5;
 /// The tab strip font size.
 const STRIP_PT: f32 = 10.5;
 /// Space above and below the tab titles, in DIPs.
@@ -156,6 +158,15 @@ const TRANSFER_TICK_MS: u32 = 250;
 /// Gives remote desktops their pane's new size once it stops changing,
 /// so dragging a divider does not resize the desktop at every step.
 const TIMER_DESKTOP_SIZE: usize = 3;
+/// Ends the workers of connections nothing uses any more, once they had
+/// time to close them.
+const TIMER_RETIRE: usize = 4;
+/// Wakes the login scripts: an `expect` that waited too long, or a pause
+/// that ended.
+const TIMER_SCRIPT: usize = 5;
+/// How long a worker whose connection nothing uses keeps running, so its
+/// last shell's close reaches the server as a clean disconnect.
+const RETIRE_GRACE: Duration = Duration::from_secs(2);
 const DESKTOP_SIZE_MS: u32 = 300;
 /// Output processed per message before the window gets a chance to paint.
 const OUTPUT_BUDGET: usize = 1 << 20;
@@ -194,6 +205,7 @@ mod cmd {
     pub const FILES: u32 = 209;
     pub const FOLLOW_CD: u32 = 210;
     pub const FORWARDS: u32 = 211;
+    pub const SNIPPETS: u32 = 212;
     /// Plus the index into `FONT_CHOICES`.
     pub const FONT: u32 = 300;
     /// Plus the index into `Theme::builtin()`.
@@ -222,6 +234,7 @@ mod cmd {
     pub const DESKTOP: u32 = 614;
     pub const DESKTOP_TAB: u32 = 615;
     pub const DESKTOP_TAB_RDP: u32 = 616;
+    pub const RUN_SCRIPT: u32 = 617;
     /// Plus the index in the session picker's list; the one past the
     /// last is "New session".
     pub const TMUX_SESSION: u32 = 800;
@@ -240,6 +253,9 @@ mod cmd {
     pub const BROADCAST_TAB: u32 = 730;
     pub const BROADCAST_ALL: u32 = 731;
     pub const BROADCAST_SKIP: u32 = 732;
+    pub const UPDATE_CHECK: u32 = 900;
+    pub const UPDATE_WEEKLY: u32 = 901;
+    pub const ABOUT: u32 = 902;
 }
 
 const DIRS: [Dir; 4] = [Dir::Left, Dir::Right, Dir::Up, Dir::Down];
@@ -289,11 +305,16 @@ enum Host {
     Serial {
         port: Option<Box<SerialPort>>,
         target: SerialTarget,
+        /// The saved session it was opened from, for its look and login
+        /// script.
+        session: Option<String>,
     },
 }
 
-/// The worker process, the pipes to it, and the forwarding engine that
-/// shares them.
+/// A worker process, the pipes to it, and the forwarding engine that
+/// shares them. Each SSH connection has its own, so a server that took
+/// over one worker reaches only its own connection: the shells, SFTP and
+/// forwards on it, never another host's.
 struct WorkerConn {
     link: Link,
     forwarder: Forwarder,
@@ -472,6 +493,7 @@ enum SideView {
     Sessions,
     Files,
     Forwards,
+    Snippets,
 }
 
 /// The side pane: the session manager, file transfer or the forwards.
@@ -531,7 +553,12 @@ struct Window {
     command: String,
     /// Run the worker in the AppContainer (off only with `--no-sandbox`).
     sandbox: bool,
-    worker: Option<WorkerConn>,
+    /// The worker of each SSH connection, by the connection's id (the
+    /// channel of the shell that logged in).
+    workers: HashMap<ChannelId, WorkerConn>,
+    /// Workers whose connection nothing uses any more, with when that was;
+    /// they end after [`RETIRE_GRACE`].
+    retiring: Vec<(WorkerConn, Instant)>,
     broker: Option<Broker>,
     /// The channel of each job handed to the broker, oldest first. The
     /// broker answers in order, so each reply goes to the front one.
@@ -543,6 +570,10 @@ struct Window {
     output_pending: Arc<AtomicBool>,
     /// SFTP and the transfer queue, per `user@host:port`.
     sftp: HashMap<String, Remote>,
+    /// The connection each SFTP channel was opened on, so that what the
+    /// queues send goes to that connection's worker (a closing channel's
+    /// queue has already let go of it).
+    sftp_routes: HashMap<ChannelId, ChannelId>,
     files: FilesView,
     /// The host the file view shows: the focused pane's.
     files_key: Option<String>,
@@ -566,6 +597,40 @@ struct Window {
     pending_desktops: HashMap<PaneId, PendingDesktop>,
     /// Window > Broadcast input: which panes also get what is typed.
     broadcast: broadcast::Scope,
+    /// The update check running in the background, if any, and whether
+    /// the user asked for it (an automatic one only speaks up about a new
+    /// release).
+    update: Option<(std::sync::mpsc::Receiver<crate::update::Outcome>, bool)>,
+    /// Login scripts running, by pane.
+    scripts: HashMap<PaneId, ScriptRun>,
+    /// Secrets for login scripts from password manager commands, as they
+    /// finish.
+    script_secrets: Arc<std::sync::Mutex<Vec<ScriptSecret>>>,
+    /// Login scripts started so far, which numbers each run.
+    script_runs: u64,
+    snippets_view: SnippetsView,
+    /// Ctrl+Shift+Space showed the snippets on a hidden side pane, so
+    /// typing one hides it again.
+    snippets_peek: bool,
+}
+
+/// A login script running in a pane.
+struct ScriptRun {
+    runner: Runner,
+    /// Which run it is, so a secret that arrives late finds only its own.
+    run: u64,
+    /// Attach tmux once it is over, if the host's profile asks for that.
+    tmux: bool,
+}
+
+/// What a password manager command gave a login script: the pane, the
+/// run and the result.
+type ScriptSecret = (PaneId, u64, std::result::Result<Zeroizing<String>, String>);
+
+/// Where a login script's named secret is kept in the Windows Credential
+/// Manager.
+fn secret_target(name: &str) -> String {
+    format!("FeroSSH secret:{name}")
 }
 
 /// What a password manager command gave for a pane's login.
@@ -745,7 +810,7 @@ fn write_app_file(path: &std::path::Path, text: &str) -> std::io::Result<()> {
 }
 
 /// The hosts the session manager lists.
-fn host_items(env: &Env) -> Vec<HostItem> {
+fn host_items(env: &Env, settings: &Settings) -> Vec<HostItem> {
     let includes = ssh_config::DirIncludes {
         home: env.home.clone(),
     };
@@ -761,10 +826,15 @@ fn host_items(env: &Env) -> Vec<HostItem> {
                     d
                 })
                 .unwrap_or_default();
+            let kind = settings
+                .profile(&h.name)
+                .map(|p| p.kind)
+                .unwrap_or_default();
             HostItem {
                 name: h.name,
                 folder: h.folder,
                 detail,
+                kind,
             }
         })
         .collect()
@@ -975,12 +1045,14 @@ fn create_and_run(launch: Launch, theme: Option<String>) -> Result<()> {
                     _ => conpty::default_command(),
                 },
                 sandbox: !matches!(launch, Launch::Ssh { sandbox: false, .. }),
-                worker: None,
+                workers: HashMap::new(),
+                retiring: Vec::new(),
                 broker: None,
                 broker_jobs: VecDeque::new(),
                 next_channel: 1,
                 output_pending: Arc::new(AtomicBool::new(false)),
                 sftp: HashMap::new(),
+                sftp_routes: HashMap::new(),
                 files: FilesView::default(),
                 files_key: None,
                 transfer_timer: false,
@@ -992,6 +1064,12 @@ fn create_and_run(launch: Launch, theme: Option<String>) -> Result<()> {
                 passwords: Arc::default(),
                 pending_desktops: HashMap::new(),
                 broadcast: broadcast::Scope::Off,
+                update: None,
+                scripts: HashMap::new(),
+                script_secrets: Arc::default(),
+                script_runs: 0,
+                snippets_view: SnippetsView::default(),
+                snippets_peek: false,
             });
         });
         // Files dropped from Explorer are uploaded, after a confirmation.
@@ -1016,6 +1094,13 @@ fn create_and_run(launch: Launch, theme: Option<String>) -> Result<()> {
             _ => with_window(|w| w.ask_destination(first)),
         };
         let _ = ShowWindow(hwnd, SW_SHOW);
+        // Help > Check for updates weekly, when it is on and a week has
+        // passed.
+        with_window(|w| {
+            if w.settings.update_check_weekly && crate::update::due() {
+                w.start_update_check(false);
+            }
+        });
 
         let mut msg = MSG::default();
         while GetMessageW(&mut msg, None, 0, 0).as_bool() {
@@ -1109,6 +1194,7 @@ fn build_menu() -> Result<HMENU> {
         )?;
         separator(session)?;
         item(session, cmd::SERIAL_BREAK, "Send &break (serial)")?;
+        item(session, cmd::RUN_SCRIPT, "Run &login script again")?;
         separator(session)?;
         item(session, cmd::DESKTOP, "Open remote &desktop\tCtrl+Shift+D")?;
         if cfg!(feature = "rdp-viewer") {
@@ -1153,6 +1239,7 @@ fn build_menu() -> Result<HMENU> {
         item(view, cmd::SESSIONS, "S&ession manager\tCtrl+Shift+S")?;
         item(view, cmd::FILES, "File tra&nsfer\tCtrl+Shift+E")?;
         item(view, cmd::FORWARDS, "Port &forwards\tCtrl+Shift+P")?;
+        item(view, cmd::SNIPPETS, "Command sn&ippets\tCtrl+Shift+Space")?;
         item(view, cmd::FOLLOW_CD, "File transfer f&ollows cd")?;
         item(view, cmd::SIDE_RIGHT, "Side pane on the &right")?;
         item(view, cmd::TAB_STRIP, "Ta&b strip")?;
@@ -1221,12 +1308,19 @@ fn build_menu() -> Result<HMENU> {
         // The same as File > Exit: asks first when sessions are open.
         item(window, cmd::EXIT, "Close &window\tAlt+F4")?;
 
+        let help = CreatePopupMenu()?;
+        item(help, cmd::UPDATE_CHECK, "Check for &updates...")?;
+        item(help, cmd::UPDATE_WEEKLY, "Check for updates &weekly")?;
+        separator(help)?;
+        item(help, cmd::ABOUT, "&About FeroSSH")?;
+
         let bar = CreateMenu()?;
         AppendMenuW(bar, MF_POPUP, file.0 as usize, w!("&File"))?;
         AppendMenuW(bar, MF_POPUP, edit.0 as usize, w!("&Edit"))?;
         AppendMenuW(bar, MF_POPUP, view.0 as usize, w!("&View"))?;
         AppendMenuW(bar, MF_POPUP, window.0 as usize, w!("&Window"))?;
         AppendMenuW(bar, MF_POPUP, session.0 as usize, w!("&Session"))?;
+        AppendMenuW(bar, MF_POPUP, help.0 as usize, w!("&Help"))?;
         Ok(bar)
     }
 }
@@ -1753,6 +1847,7 @@ impl Window {
 
     /// Ends whatever the pane is connected to.
     fn end_host(&mut self, id: PaneId) {
+        self.scripts.remove(&id);
         // tmux on it is over too; a reattach after a dropped connection
         // stays wanted.
         if let Some(mut t) = self.tmux.remove(&id) {
@@ -1850,10 +1945,13 @@ impl Window {
 
     /// Every connection's forwards, from the forwarding engine.
     fn forward_view(&self) -> Vec<ConnView> {
-        self.worker
-            .as_ref()
-            .map(|w| w.forwarder.view())
-            .unwrap_or_default()
+        let mut views: Vec<ConnView> = self
+            .workers
+            .values()
+            .flat_map(|w| w.forwarder.view())
+            .collect();
+        views.sort_by_key(|v| v.connection);
+        views
     }
 
     /// What the badge of pane `id`'s tab shows.
@@ -1929,7 +2027,7 @@ impl Window {
         if let Some(d) = &x11 {
             notes.push(format!("X11 to {d}"));
         }
-        let Some(w) = &self.worker else {
+        let Some(w) = self.workers.get(&connection) else {
             return;
         };
         w.forwarder.start(
@@ -1953,19 +2051,79 @@ impl Window {
     /// Stops the forwards of connections no logged-in pane and no remote
     /// desktop uses any more.
     fn prune_forwards(&mut self) {
-        let Some(w) = &self.worker else {
-            return;
-        };
-        for v in w.forwarder.view() {
-            let used = self.panes.values().any(|p| match &p.host {
-                Host::Ssh(s) => s.connection == v.connection && s.state() == State::Connected,
-                Host::Desktop { connection, .. } => {
-                    *connection == v.connection && p.desktop.is_some()
+        for w in self.workers.values() {
+            for v in w.forwarder.view() {
+                let used = self.panes.values().any(|p| match &p.host {
+                    Host::Ssh(s) => s.connection == v.connection && s.state() == State::Connected,
+                    Host::Desktop { connection, .. } => {
+                        *connection == v.connection && p.desktop.is_some()
+                    }
+                    _ => false,
+                });
+                if !used {
+                    w.forwarder.stop(v.connection);
                 }
-                _ => false,
-            });
-            if !used {
-                w.forwarder.stop(v.connection);
+            }
+        }
+        self.prune_workers();
+    }
+
+    /// Retires the workers of connections that no pane logs in on or is
+    /// logged in on, no remote desktop and no SFTP channel uses: each ends
+    /// [`RETIRE_GRACE`] later.
+    fn prune_workers(&mut self) {
+        let unused: Vec<ChannelId> = self
+            .workers
+            .keys()
+            .copied()
+            .filter(|&c| !self.connection_in_use(c))
+            .collect();
+        if unused.is_empty() {
+            return;
+        }
+        let now = Instant::now();
+        for c in unused {
+            if let Some(w) = self.workers.remove(&c) {
+                self.retiring.push((w, now));
+            }
+        }
+        let workers = &self.workers;
+        self.sftp_routes.retain(|_, c| workers.contains_key(c));
+        // SAFETY: our window and timer.
+        unsafe {
+            SetTimer(
+                Some(self.hwnd),
+                TIMER_RETIRE,
+                u32::try_from(RETIRE_GRACE.as_millis()).unwrap_or(u32::MAX),
+                None,
+            );
+        }
+    }
+
+    /// Whether anything still needs the SSH connection `connection`.
+    fn connection_in_use(&self, connection: ChannelId) -> bool {
+        self.panes.values().any(|p| match &p.host {
+            Host::Ssh(s) => {
+                s.connection == connection
+                    && matches!(s.state(), State::Connecting | State::Connected)
+            }
+            Host::Desktop { connection: c, .. } => *c == connection && p.desktop.is_some(),
+            _ => false,
+        }) || self.desktops.keys().any(|(c, ..)| *c == connection)
+            || self
+                .sftp
+                .values()
+                .any(|r| r.connection() == Some(connection))
+    }
+
+    /// Ends the workers that retired long enough ago.
+    fn on_retire_timer(&mut self) {
+        self.retiring
+            .retain(|(_, since)| since.elapsed() < RETIRE_GRACE);
+        if self.retiring.is_empty() {
+            // SAFETY: our window and timer.
+            unsafe {
+                let _ = KillTimer(Some(self.hwnd), TIMER_RETIRE);
             }
         }
     }
@@ -2031,7 +2189,7 @@ impl Window {
                 DesktopWant::Rdp { pane },
             ),
         };
-        let w = self.worker.as_ref()?;
+        let w = self.workers.get(&connection)?;
         w.forwarder
             .open_desktop(connection, "localhost", port, local);
         self.desktops
@@ -2049,10 +2207,11 @@ impl Window {
     /// Opens a viewer on the desktop tunnels that are ready, and says why
     /// the others failed.
     fn desktop_events(&mut self) {
-        let events = match &self.worker {
-            Some(w) => w.forwarder.take_desktop_events(),
-            None => return,
-        };
+        let events: Vec<DesktopEvent> = self
+            .workers
+            .values()
+            .flat_map(|w| w.forwarder.take_desktop_events())
+            .collect();
         for event in events {
             match event {
                 DesktopEvent::Ready {
@@ -2397,8 +2556,8 @@ impl Window {
                         [only] => Some(only.connection),
                         _ => None,
                     });
-                match (connection, &self.worker) {
-                    (Some(c), Some(w)) => w.forwarder.add(c, spec),
+                match connection.and_then(|c| Some((c, self.workers.get(&c)?))) {
+                    Some((c, w)) => w.forwarder.add(c, spec),
                     _ if view.is_empty() => self
                         .forwards_view
                         .refuse(&spec, "Log in to a host first.".into()),
@@ -2408,7 +2567,7 @@ impl Window {
                 }
             }
             Some(FwdAction::Remove { connection, index }) => {
-                if let Some(w) = &self.worker {
+                if let Some(w) = self.workers.get(&connection) {
                     w.forwarder.remove(connection, index);
                 }
             }
@@ -2419,9 +2578,10 @@ impl Window {
         None
     }
 
-    /// Starts the worker if it is not running.
-    fn ensure_worker(&mut self, id: PaneId) -> bool {
-        if self.worker.is_some() {
+    /// Starts the worker of the connection `connection` if it is not
+    /// running: a new login gets a worker of its own.
+    fn ensure_worker(&mut self, id: PaneId, connection: ChannelId) -> bool {
+        if self.workers.contains_key(&connection) {
             return true;
         }
         let result = sandbox::spawn_worker(self.sandbox).and_then(|w| {
@@ -2441,7 +2601,7 @@ impl Window {
         });
         match result {
             Ok(conn) => {
-                self.worker = Some(conn);
+                self.workers.insert(connection, conn);
                 true
             }
             Err(e) => {
@@ -2534,14 +2694,20 @@ impl Window {
             ),
             Err(e) => format!("\x1b[0;31m{e}\x1b[0m\r\nPress Enter to try again.\r\n"),
         };
+        let opened = opened.ok();
+        let is_open = opened.is_some();
         if let Some(p) = self.panes.get_mut(&id) {
             p.host = Host::Serial {
-                port: opened.ok().map(Box::new),
+                port: opened.map(Box::new),
                 target,
+                session: session.map(str::to_owned),
             };
         }
         self.show(id, &text);
         self.start_log(id);
+        if is_open {
+            self.start_script(id, &alias, false);
+        }
         self.update_title();
         self.refresh_chrome();
         self.refresh(id);
@@ -2555,7 +2721,14 @@ impl Window {
         if let Some(p) = self.panes.get_mut(&id) {
             p.term.scroll_to_bottom();
         }
-        if !self.ensure_worker(id) || !self.ensure_broker(id) {
+        let shared = self.panes.values().find_map(|p| match &p.host {
+            Host::Ssh(s) if p.id != id && s.can_share(&target) => Some(s.connection),
+            _ => None,
+        });
+        let channel = self.new_channel();
+        // A new login runs in a worker of its own; a shared connection's
+        // shell in that connection's.
+        if !self.ensure_worker(id, shared.unwrap_or(channel)) || !self.ensure_broker(id) {
             self.refresh(id);
             return;
         }
@@ -2566,11 +2739,6 @@ impl Window {
             );
         }
         self.apply_look(id, &target);
-        let shared = self.panes.values().find_map(|p| match &p.host {
-            Host::Ssh(s) if p.id != id && s.can_share(&target) => Some(s.connection),
-            _ => None,
-        });
-        let channel = self.new_channel();
         let x11 = target.forward_x11.then(|| self.x11_auth(id)).flatten();
         let legacy = self
             .settings
@@ -2632,9 +2800,11 @@ impl Window {
                 self.start_shell(id);
                 return;
             }
-            Some(Host::Serial { target, .. }) => {
-                let target = target.clone();
-                self.open_serial(id, target, None);
+            Some(Host::Serial {
+                target, session, ..
+            }) => {
+                let (target, session) = (target.clone(), session.clone());
+                self.open_serial(id, target, session.as_deref());
                 return;
             }
             _ => None,
@@ -2649,12 +2819,18 @@ impl Window {
         for effect in effects {
             match effect {
                 Effect::Send(msg) => {
-                    if let Some(w) = &self.worker {
+                    // Only to the worker of the pane's own connection.
+                    if let Some(Host::Ssh(s)) = self.panes.get(&id).map(|p| &p.host)
+                        && let Some(w) = self.workers.get(&s.connection)
+                    {
                         w.link.send(msg);
                     }
                 }
                 Effect::Show(text) => self.show(id, &text),
-                Effect::Output(bytes) => self.host_output(id, &bytes),
+                Effect::Output(bytes) => {
+                    self.host_output(id, &bytes);
+                    self.script_output(id, &bytes);
+                }
                 Effect::Broker(job) => {
                     let channel = match self.panes.get(&id).map(|p| &p.host) {
                         Some(Host::Ssh(s)) => s.channel,
@@ -2672,10 +2848,18 @@ impl Window {
                     self.sftp_connected(id);
                     self.start_forwards(id);
                     self.refresh_chrome();
-                    self.tmux_after_login(id);
+                    // A login script runs first; tmux attaches after it.
+                    let alias = match self.panes.get(&id).map(|p| &p.host) {
+                        Some(Host::Ssh(s)) => s.target.alias.clone(),
+                        _ => String::new(),
+                    };
+                    if !self.start_script(id, &alias, true) {
+                        self.tmux_after_login(id);
+                    }
                     self.desktop_after_login(id);
                 }
                 Effect::Ended => {
+                    self.scripts.remove(&id);
                     self.pending_desktops.remove(&id);
                     self.tmux_lost(id);
                     self.stop_log(id);
@@ -2819,6 +3003,316 @@ impl Window {
         self.show(id, &format!("\x1b[0;90m{note}\x1b[0m\r\n"));
     }
 
+    /// Starts the login script of session `alias` in pane `id`, if its
+    /// profile has one; `tmux` attaches tmux after it as the profile asks.
+    /// Returns whether a script started.
+    fn start_script(&mut self, id: PaneId, alias: &str, tmux: bool) -> bool {
+        let steps = self
+            .settings
+            .profile(alias)
+            .map(|p| p.login_script.clone())
+            .unwrap_or_default();
+        if steps.is_empty() {
+            return false;
+        }
+        self.script_runs += 1;
+        let mut runner = Runner::new(steps);
+        let actions = runner.start(Instant::now());
+        self.scripts.insert(
+            id,
+            ScriptRun {
+                runner,
+                run: self.script_runs,
+                tmux,
+            },
+        );
+        self.script_actions(id, actions);
+        true
+    }
+
+    /// Session > Run login script again, in the focused pane.
+    fn rerun_script(&mut self, id: PaneId) -> Option<Command> {
+        let alias = match self.panes.get(&id).map(|p| &p.host) {
+            Some(Host::Ssh(s)) if s.state() == State::Connected => Some(s.target.alias.clone()),
+            Some(Host::Serial {
+                port: Some(_),
+                target,
+                session,
+            }) => Some(session.clone().unwrap_or_else(|| target.port.clone())),
+            _ => None,
+        };
+        let Some(alias) = alias else {
+            return Some(Command::Notice(
+                "The login script runs in a pane logged in to an SSH host or open on a \
+                 serial port."
+                    .into(),
+            ));
+        };
+        self.scripts.remove(&id);
+        if self.start_script(id, &alias, false) {
+            self.refresh(id);
+            None
+        } else {
+            Some(Command::Notice(format!(
+                "{alias} has no login script. Add one under Extras in its session (F2 in \
+                 the session manager)."
+            )))
+        }
+    }
+
+    /// Hands pane `id`'s login script to `f` and carries out what it
+    /// decided.
+    fn with_script(
+        &mut self,
+        id: PaneId,
+        f: impl FnOnce(&mut Runner) -> Vec<login_script::Action>,
+    ) {
+        let Some(run) = self.scripts.get_mut(&id) else {
+            return;
+        };
+        let actions = f(&mut run.runner);
+        self.script_actions(id, actions);
+    }
+
+    /// What pane `id`'s host printed, for its login script.
+    fn script_output(&mut self, id: PaneId, bytes: &[u8]) {
+        if self.scripts.contains_key(&id) {
+            self.with_script(id, |r| r.feed(bytes, Instant::now()));
+        }
+    }
+
+    /// Carries out what pane `id`'s login script decided.
+    fn script_actions(&mut self, id: PaneId, actions: Vec<login_script::Action>) {
+        if actions.is_empty() {
+            return;
+        }
+        for action in actions {
+            match action {
+                login_script::Action::Send(bytes) => self.send(id, bytes.to_vec()),
+                login_script::Action::Show(text) => self.show(id, &text),
+                login_script::Action::Fetch(need) => self.fetch_secret(id, need),
+                login_script::Action::Save(name, secret) => self.save_secret(id, &name, &secret),
+                login_script::Action::Done => {
+                    if let Some(run) = self.scripts.remove(&id)
+                        && run.tmux
+                    {
+                        self.tmux_after_login(id);
+                    }
+                }
+            }
+        }
+        self.arm_script_timer();
+        self.refresh(id);
+    }
+
+    /// Sets the timer for the first login script deadline.
+    fn arm_script_timer(&mut self) {
+        let next = self
+            .scripts
+            .values()
+            .filter_map(|r| r.runner.deadline())
+            .min();
+        // SAFETY: our window; replaces any earlier timer with this id.
+        unsafe {
+            match next {
+                Some(at) => {
+                    let wait = at.saturating_duration_since(Instant::now());
+                    let ms = u32::try_from(wait.as_millis()).unwrap_or(u32::MAX).max(1);
+                    SetTimer(Some(self.hwnd), TIMER_SCRIPT, ms, None);
+                }
+                None => {
+                    let _ = KillTimer(Some(self.hwnd), TIMER_SCRIPT);
+                }
+            }
+        }
+    }
+
+    fn on_script_timer(&mut self) {
+        let now = Instant::now();
+        let ids: Vec<PaneId> = self.scripts.keys().copied().collect();
+        for id in ids {
+            self.with_script(id, |r| r.tick(now));
+        }
+        self.arm_script_timer();
+    }
+
+    /// Finds the secret pane `id`'s login script needs: the login
+    /// password from the session's password source, or a named secret
+    /// from its password manager command or the Windows Credential
+    /// Manager. One that none has is asked for in the pane.
+    fn fetch_secret(&mut self, id: PaneId, need: Need) {
+        let (alias, is_ssh, login_target) = match self.panes.get(&id).map(|p| &p.host) {
+            Some(Host::Ssh(s)) => (
+                s.target.alias.clone(),
+                true,
+                credman::target(&s.target.user, &s.target.hostname, s.target.port),
+            ),
+            Some(Host::Serial {
+                target, session, ..
+            }) => (
+                session.clone().unwrap_or_else(|| target.port.clone()),
+                false,
+                String::new(),
+            ),
+            _ => return,
+        };
+        let now = Instant::now();
+        match need {
+            Need::Password => {
+                let source = if is_ssh {
+                    self.settings
+                        .profile(&alias)
+                        .map(|p| p.password.clone())
+                        .unwrap_or_default()
+                } else {
+                    PasswordSource::Ask
+                };
+                let ask = "\r\nLogin password, for the login script: ";
+                match source {
+                    PasswordSource::Ask => self.with_script(id, |r| r.ask(ask, None)),
+                    PasswordSource::Windows => match credman::read(&login_target) {
+                        Ok(Some(pw)) => self.with_script(id, |r| r.secret(&pw, now)),
+                        Ok(None) => self.with_script(id, |r| r.ask(ask, None)),
+                        Err(e) => self.with_script(id, |r| r.secret_failed(&e)),
+                    },
+                    PasswordSource::Command(line) => self.script_command(id, line, None),
+                }
+            }
+            Need::Secret(name) => {
+                let command = self
+                    .settings
+                    .secrets
+                    .iter()
+                    .find(|x| x.name.eq_ignore_ascii_case(&name))
+                    .map(|x| x.command.clone());
+                if let Some(line) = command {
+                    self.script_command(id, line, Some(name));
+                    return;
+                }
+                match credman::read(&secret_target(&name)) {
+                    Ok(Some(secret)) => self.with_script(id, |r| r.secret(&secret, now)),
+                    Ok(None) => {
+                        let text = format!(
+                            "\r\n\x1b[0;90mThe login script needs the secret {name}. FeroSSH \
+                             keeps it in the Windows Credential Manager as {}.\x1b[0m\r\n\
+                             Secret {name}: ",
+                            secret_target(&name)
+                        );
+                        self.with_script(id, |r| r.ask(&text, Some(name.clone())));
+                    }
+                    Err(e) => self.with_script(id, |r| r.secret_failed(&e)),
+                }
+            }
+        }
+    }
+
+    /// Gets a login script's secret from password manager command `line`,
+    /// once the user allowed it; `name` is the secret's (`None` for the
+    /// login password).
+    fn script_command(&mut self, id: PaneId, line: String, name: Option<String>) {
+        if command_approved(&line) {
+            self.run_script_command(id, &line, name.as_deref());
+        } else {
+            self.queued.push(Command::ConfirmSecretTool {
+                pane: id,
+                line,
+                name,
+            });
+        }
+    }
+
+    /// Runs password manager command `line` for pane `id`'s login script
+    /// on a thread of its own; [`Self::poll_script_secrets`] takes the
+    /// answer. `%n` is the secret's name, or the session's for the login
+    /// password.
+    fn run_script_command(&mut self, id: PaneId, line: &str, name: Option<&str>) {
+        let Some(run) = self.scripts.get(&id).map(|r| r.run) else {
+            return;
+        };
+        let (alias, host, user, port) = match self.panes.get(&id).map(|p| &p.host) {
+            Some(Host::Ssh(s)) => (
+                s.target.alias.clone(),
+                s.target.hostname.clone(),
+                s.target.user.clone(),
+                s.target.port,
+            ),
+            Some(Host::Serial {
+                target, session, ..
+            }) => (
+                session.clone().unwrap_or_else(|| target.port.clone()),
+                target.port.clone(),
+                String::new(),
+                0,
+            ),
+            _ => return,
+        };
+        let tokens = pw_source::Tokens {
+            name: name.unwrap_or(&alias),
+            host: &host,
+            user: &user,
+            port,
+        };
+        let Some((program, args)) = pw_source::command(line, &tokens) else {
+            self.with_script(id, |r| r.secret_failed("the password command is empty."));
+            return;
+        };
+        let what = match name {
+            Some(n) => format!("the secret {n}"),
+            None => "the password".to_owned(),
+        };
+        let from = Path::new(&program)
+            .file_stem()
+            .map_or_else(|| program.clone(), |n| n.to_string_lossy().into_owned());
+        self.show(
+            id,
+            &format!(
+                "\x1b[0;90mGetting {what} from {}...\x1b[0m\r\n",
+                crate::ssh::sanitize(&from)
+            ),
+        );
+        self.refresh(id);
+        let answers = self.script_secrets.clone();
+        let notify = self.notifier();
+        std::thread::spawn(move || {
+            let result = pwcommand::run(&program, &args, pwcommand::TIMEOUT);
+            if let Ok(mut a) = answers.lock() {
+                a.push((id, run, result));
+            }
+            notify();
+        });
+    }
+
+    /// Hands finished password manager commands to the login scripts
+    /// still waiting for them.
+    fn poll_script_secrets(&mut self) {
+        let done = match self.script_secrets.lock() {
+            Ok(mut a) => std::mem::take(&mut *a),
+            Err(_) => return,
+        };
+        for (id, run, result) in done {
+            if self.scripts.get(&id).is_none_or(|r| r.run != run) {
+                continue;
+            }
+            match result {
+                Ok(secret) => self.with_script(id, |r| r.secret(&secret, Instant::now())),
+                Err(e) => self.with_script(id, |r| r.secret_failed(&e)),
+            }
+        }
+    }
+
+    /// Keeps a secret typed at a login script's prompt in the Windows
+    /// Credential Manager.
+    fn save_secret(&mut self, id: PaneId, name: &str, secret: &str) {
+        let note = match credman::write(&secret_target(name), name, secret) {
+            Ok(()) => format!(
+                "Saved the secret {name} in the Windows Credential Manager; remove it \
+                 there to type a new one."
+            ),
+            Err(e) => e,
+        };
+        self.show(id, &format!("\x1b[0;90m{note}\x1b[0m\r\n"));
+    }
+
     /// Opens the pane's log if logging is on and the pane has a host.
     fn start_log(&mut self, id: PaneId) {
         let Some(p) = self.panes.get(&id) else {
@@ -2834,6 +3328,7 @@ impl Window {
             Host::Serial {
                 port: Some(_),
                 target,
+                ..
             } => target.port.clone(),
             _ => return,
         };
@@ -2982,6 +3477,20 @@ impl Window {
             p.term.scroll_to_bottom();
             self.refresh(id);
         }
+        // A login script's secret prompt takes the typing; other typing
+        // stops the script and goes on to the host.
+        if let Some(run) = self.scripts.get_mut(&id) {
+            let prompt = run.runner.prompting();
+            let actions = if prompt {
+                run.runner.prompt_input(&bytes, Instant::now())
+            } else {
+                run.runner.cancel()
+            };
+            self.script_actions(id, actions);
+            if prompt {
+                return;
+            }
+        }
         let enter = matches!(bytes.as_slice(), b"\r" | b"\r\n" | b"\n");
         let Some(p) = self.panes.get_mut(&id) else {
             return;
@@ -3029,10 +3538,14 @@ impl Window {
                     self.reconnect(id);
                 }
             }
-            Host::Serial { port: None, target } => {
+            Host::Serial {
+                port: None,
+                target,
+                session,
+            } => {
                 if enter {
-                    let target = target.clone();
-                    self.open_serial(id, target, None);
+                    let (target, session) = (target.clone(), session.clone());
+                    self.open_serial(id, target, session.as_deref());
                 }
             }
             Host::Ssh(_) | Host::Tmux { .. } | Host::Serial { .. } => self.send(id, bytes),
@@ -3045,7 +3558,7 @@ impl Window {
         let Some(p) = self.panes.get(&id) else {
             return false;
         };
-        if p.desktop.is_some() {
+        if p.desktop.is_some() || self.scripts.get(&id).is_some_and(|r| r.runner.prompting()) {
             return false;
         }
         match &p.host {
@@ -3098,6 +3611,12 @@ impl Window {
     /// Pastes into a local prompt; `false` if no prompt is open and the
     /// paste goes to the host.
     fn paste_local(&mut self, id: PaneId, text: &str) -> bool {
+        if let Some(run) = self.scripts.get_mut(&id)
+            && run.runner.prompting()
+        {
+            run.runner.prompt_paste(text);
+            return true;
+        }
         let Some(p) = self.panes.get_mut(&id) else {
             return true;
         };
@@ -3185,9 +3704,11 @@ impl Window {
                             p.term.feed(&data);
                         }
                         self.log(id, &data);
+                        self.script_output(id, &data);
                     }
                     SerialOutput::Closed(why) => {
                         self.stop_log(id);
+                        self.scripts.remove(&id);
                         if let Some(Host::Serial { port, .. }) =
                             self.panes.get_mut(&id).map(|p| &mut p.host)
                         {
@@ -3219,71 +3740,30 @@ impl Window {
             };
             self.apply(id, effects);
         }
-        // The worker.
+        // The workers, a message from each in turn so that a flooding
+        // host does not hold up the others.
         let mut transfers = false;
+        let connections: Vec<ChannelId> = self.workers.keys().copied().collect();
         while !more {
-            let Some(event) = self.worker.as_ref().and_then(|w| w.link.try_recv()) else {
-                break;
-            };
-            match event {
-                LinkEvent::Message(msg) => {
-                    match &msg {
-                        Message::Data { bytes, .. } => fed += bytes.len(),
-                        Message::SftpReply {
-                            reply: SftpReply::Data(data),
-                            ..
-                        } => fed += data.len(),
-                        _ => {}
-                    }
-                    if let Some(c) = msg.channel()
-                        && let Some(remote) =
-                            self.sftp.values_mut().find(|r| r.channel() == Some(c))
-                    {
-                        remote.on_message(msg);
-                        transfers = true;
-                        more = fed >= OUTPUT_BUDGET;
-                        continue;
-                    }
-                    let Some(id) = msg.channel().and_then(|c| self.pane_of_channel(c)) else {
-                        continue;
-                    };
-                    let effects = match self.panes.get_mut(&id).map(|p| &mut p.host) {
-                        Some(Host::Ssh(session)) => session.on_worker(msg),
-                        _ => Vec::new(),
-                    };
-                    self.apply(id, effects);
-                }
-                LinkEvent::Closed(why) => {
-                    if let Some(w) = &self.worker {
-                        w.forwarder.worker_gone();
-                    }
-                    self.worker = None;
-                    self.broker_jobs.clear();
-                    for remote in self.sftp.values_mut() {
-                        remote.detach();
-                    }
-                    transfers = true;
-                    let ids: Vec<PaneId> = self.panes.keys().copied().collect();
-                    for id in ids {
-                        let effects = match self.panes.get_mut(&id).map(|p| &mut p.host) {
-                            Some(Host::Ssh(session))
-                                if matches!(
-                                    session.state(),
-                                    State::Connecting | State::Connected
-                                ) =>
-                            {
-                                session.on_worker(Message::Disconnected {
-                                    channel: session.channel,
-                                    reason: why.clone(),
-                                })
-                            }
-                            _ => Vec::new(),
-                        };
-                        self.apply(id, effects);
-                    }
+            let mut idle = true;
+            for &connection in &connections {
+                let Some(event) = self
+                    .workers
+                    .get(&connection)
+                    .and_then(|w| w.link.try_recv())
+                else {
+                    continue;
+                };
+                idle = false;
+                transfers |= self.on_worker_event(connection, event, &mut fed);
+                more = fed >= OUTPUT_BUDGET;
+                if more {
+                    break;
                 }
             }
-            more = fed >= OUTPUT_BUDGET;
+            if idle {
+                break;
+            }
         }
         if transfers {
             self.flush_sftp();
@@ -3294,11 +3774,12 @@ impl Window {
         self.desktop_events();
         self.poll_desktops();
         self.poll_passwords();
+        self.poll_script_secrets();
         // The forwards list and the tab badges.
         if self
-            .worker
-            .as_ref()
-            .is_some_and(|w| w.forwarder.take_changed())
+            .workers
+            .values()
+            .fold(false, |changed, w| w.forwarder.take_changed() | changed)
         {
             self.refresh_chrome();
             self.update_title();
@@ -3311,6 +3792,82 @@ impl Window {
             }
         }
         self.after_feed()
+    }
+
+    /// Handles what the worker of the connection `connection` sent, and
+    /// returns whether it was for a file transfer. A worker only reaches
+    /// the shells and SFTP channels on its own connection: anything it
+    /// says about another one's is dropped.
+    fn on_worker_event(
+        &mut self,
+        connection: ChannelId,
+        event: LinkEvent,
+        fed: &mut usize,
+    ) -> bool {
+        match event {
+            LinkEvent::Message(msg) => {
+                match &msg {
+                    Message::Data { bytes, .. } => *fed += bytes.len(),
+                    Message::SftpReply {
+                        reply: SftpReply::Data(data),
+                        ..
+                    } => *fed += data.len(),
+                    _ => {}
+                }
+                let Some(c) = msg.channel() else {
+                    return false;
+                };
+                if let Some(remote) = self
+                    .sftp
+                    .values_mut()
+                    .find(|r| r.channel() == Some(c) && r.connection() == Some(connection))
+                {
+                    remote.on_message(msg);
+                    return true;
+                }
+                let Some(id) = self.pane_of_channel(c) else {
+                    return false;
+                };
+                let effects = match self.panes.get_mut(&id).map(|p| &mut p.host) {
+                    Some(Host::Ssh(session)) if session.connection == connection => {
+                        session.on_worker(msg)
+                    }
+                    _ => Vec::new(),
+                };
+                self.apply(id, effects);
+                false
+            }
+            LinkEvent::Closed(why) => {
+                if let Some(w) = self.workers.remove(&connection) {
+                    w.forwarder.worker_gone();
+                }
+                for remote in self.sftp.values_mut() {
+                    if remote.connection() == Some(connection) {
+                        remote.detach();
+                    }
+                }
+                let ids: Vec<PaneId> = self.panes.keys().copied().collect();
+                for id in ids {
+                    let effects = match self.panes.get_mut(&id).map(|p| &mut p.host) {
+                        Some(Host::Ssh(session))
+                            if session.connection == connection
+                                && matches!(
+                                    session.state(),
+                                    State::Connecting | State::Connected
+                                ) =>
+                        {
+                            session.on_worker(Message::Disconnected {
+                                channel: session.channel,
+                                reason: why.clone(),
+                            })
+                        }
+                        _ => Vec::new(),
+                    };
+                    self.apply(id, effects);
+                }
+                true
+            }
+        }
     }
 
     /// Acts on what the terminals asked for and redraws.
@@ -3372,8 +3929,48 @@ impl Window {
             self.refresh_chrome();
         }
         self.refresh_visible();
+        if let Some(found) = self.poll_update_check() {
+            commands.push(found);
+        }
         commands.append(&mut self.queued);
         commands
+    }
+
+    /// Starts Help > Check for updates in the background, unless one is
+    /// already running; its answer wakes the window like shell output.
+    fn start_update_check(&mut self, asked: bool) {
+        if self.update.is_some() {
+            return;
+        }
+        let (tx, rx) = std::sync::mpsc::channel();
+        let wake = self.notifier();
+        let spawned = std::thread::Builder::new()
+            .name("update-check".into())
+            .spawn(move || {
+                let _ = tx.send(crate::update::check());
+                wake();
+            });
+        if spawned.is_ok() {
+            self.update = Some((rx, asked));
+        }
+    }
+
+    /// The finished update check's answer, as a command that shows it.
+    fn poll_update_check(&mut self) -> Option<Command> {
+        let (rx, asked) = self.update.as_ref()?;
+        let asked = *asked;
+        let outcome = match rx.try_recv() {
+            Ok(outcome) => outcome,
+            Err(std::sync::mpsc::TryRecvError::Empty) => return None,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                crate::update::Outcome::Failed("the check stopped".into())
+            }
+        };
+        self.update = None;
+        if !matches!(outcome, crate::update::Outcome::Failed(_)) {
+            crate::update::checked();
+        }
+        Some(Command::UpdateFound { outcome, asked })
     }
 
     fn on_sync_timer(&mut self) -> Vec<Command> {
@@ -3512,6 +4109,14 @@ impl Window {
                     let view = self.forward_view();
                     self.forwards_view
                         .draw(&mut self.side.grid, &palette, focused, &view);
+                }
+                SideView::Snippets => {
+                    self.snippets_view.draw(
+                        &mut self.side.grid,
+                        &palette,
+                        focused,
+                        &self.settings.snippets,
+                    );
                 }
                 SideView::Files => {
                     let remote = self.files_key.as_ref().and_then(|k| self.sftp.get(k));
@@ -4052,6 +4657,11 @@ impl Window {
 
     /// A key for the side pane; what it picked runs here.
     fn side_key(&mut self, key: SideKey) -> Option<Command> {
+        if self.side.view == SideView::Snippets {
+            let rows = self.side.grid.rows();
+            let action = self.snippets_view.key(key, &self.settings.snippets, rows);
+            return self.snippets_action(action);
+        }
         if self.side.view == SideView::Forwards {
             let view = self.forward_view();
             let rows = self.side.grid.rows();
@@ -4117,6 +4727,79 @@ impl Window {
         }
         self.refresh_chrome();
         out
+    }
+
+    /// Carries out what the snippets view decided.
+    fn snippets_action(&mut self, action: Option<SnipAction>) -> Option<Command> {
+        let mut out = None;
+        match action {
+            Some(SnipAction::Send { lines, enter }) => out = self.send_snippet(&lines, enter),
+            Some(SnipAction::Save { index, snippet }) => {
+                let all = &mut self.settings.snippets;
+                let at = match index.filter(|&i| i < all.len()) {
+                    Some(i) => {
+                        if let Some(slot) = all.get_mut(i) {
+                            *slot = snippet;
+                        }
+                        i
+                    }
+                    None => {
+                        all.push(snippet);
+                        all.len() - 1
+                    }
+                };
+                self.save_settings();
+                self.snippets_view.saved(&self.settings.snippets, Some(at));
+            }
+            Some(SnipAction::Delete(i)) => out = Some(Command::DeleteSnippet(i)),
+            Some(SnipAction::Leave) => self.leave_snippets(),
+            None => {}
+        }
+        self.refresh_chrome();
+        out
+    }
+
+    /// Back to the terminal from the snippets: the side pane hides again
+    /// when Ctrl+Shift+Space showed it.
+    fn leave_snippets(&mut self) {
+        if self.snippets_peek {
+            self.hide_side();
+        } else {
+            self.focus_terminal();
+        }
+    }
+
+    /// Types a snippet's lines into the focused pane and the panes
+    /// broadcast input reaches, each line ending with Enter (the last one
+    /// only with `enter`).
+    fn send_snippet(&mut self, lines: &[String], enter: bool) -> Option<Command> {
+        let id = self.focused_id();
+        if !self.takes_broadcast(id) {
+            return Some(Command::Notice(
+                "Snippets are typed into a pane with a running shell or console; this \
+                 pane has none, or is at a prompt."
+                    .into(),
+            ));
+        }
+        self.leave_snippets();
+        let mut text = lines.join("\r");
+        if enter {
+            text.push('\r');
+        }
+        let bytes = text.into_bytes();
+        let targets = self.broadcast_targets(id);
+        self.input(id, bytes.clone());
+        self.send_typed(&targets, &Typed::Bytes(bytes));
+        None
+    }
+
+    fn delete_snippet(&mut self, index: usize) {
+        if index < self.settings.snippets.len() {
+            self.settings.snippets.remove(index);
+            self.save_settings();
+        }
+        self.snippets_view.saved(&self.settings.snippets, None);
+        self.refresh_chrome();
     }
 
     /// File > Import sessions: the import page, on what the clients
@@ -4197,7 +4880,7 @@ impl Window {
     /// Opens the session form on `host`, or on a new session.
     fn open_form(&mut self, host: Option<String>) {
         let env = ssh_env();
-        let items = host_items(&env);
+        let items = host_items(&env, &self.settings);
         let names: Vec<String> = items.iter().map(|h| h.name.clone()).collect();
         let font = FontSpec::default();
         let hints = Hints {
@@ -4353,9 +5036,10 @@ impl Window {
     /// Reads the hosts again after a session was saved or deleted.
     fn reload_sessions(&mut self, select: Option<&str>) {
         let env = ssh_env();
-        self.side
-            .list
-            .set_hosts(host_items(&env), self.settings.favourites.clone());
+        self.side.list.set_hosts(
+            host_items(&env, &self.settings),
+            self.settings.favourites.clone(),
+        );
         if let Some(name) = select {
             self.side.list.select(name);
         }
@@ -4450,7 +5134,7 @@ impl Window {
             ),
             _ => (desktop_port_for(&p.label), DesktopWant::Rdp { pane: id }),
         };
-        let Some(w) = self.worker.as_ref() else {
+        let Some(w) = self.workers.get(&connection) else {
             return;
         };
         w.forwarder.open_desktop(connection, &p.host, p.port, local);
@@ -4560,12 +5244,18 @@ impl Window {
         match view {
             SideView::Sessions => {
                 let env = ssh_env();
-                self.side
-                    .list
-                    .set_hosts(host_items(&env), self.settings.favourites.clone());
+                self.side.list.set_hosts(
+                    host_items(&env, &self.settings),
+                    self.settings.favourites.clone(),
+                );
             }
             SideView::Files => self.ensure_sftp(self.focused_id()),
             SideView::Forwards => {}
+            SideView::Snippets => {
+                if !self.snippets_view.editing() {
+                    self.snippets_view.reset();
+                }
+            }
         }
         self.side.visible = true;
         self.side.focused = focus;
@@ -4581,11 +5271,15 @@ impl Window {
         let view = match id {
             cmd::FILES => SideView::Files,
             cmd::FORWARDS => SideView::Forwards,
+            cmd::SNIPPETS => SideView::Snippets,
             _ => SideView::Sessions,
         };
         let open = self.side.visible && self.side.view == view;
         match side_toggle(open, self.side.focused, from_menu) {
-            SideToggle::Show => self.show_side(view, true),
+            SideToggle::Show => {
+                self.snippets_peek = view == SideView::Snippets && !self.side.visible;
+                self.show_side(view, true);
+            }
             SideToggle::Hide => self.hide_side(),
             SideToggle::Focus => {
                 self.side.focused = true;
@@ -4598,6 +5292,7 @@ impl Window {
     }
 
     fn hide_side(&mut self) {
+        self.snippets_peek = false;
         self.side.visible = false;
         self.side.focused = false;
         self.layout();
@@ -4878,6 +5573,20 @@ impl Window {
                     let view = self.forward_view();
                     let rows = self.side.grid.rows();
                     self.forwards_view.click(row, &view, rows);
+                    self.refresh_chrome();
+                    return None;
+                }
+                if self.side.view == SideView::Snippets {
+                    let rows = self.side.grid.rows();
+                    self.snippets_view.click(row, &self.settings.snippets, rows);
+                    if double && !self.snippets_view.editing() {
+                        let action = self.snippets_view.key(
+                            SideKey::Enter { split: false },
+                            &self.settings.snippets,
+                            rows,
+                        );
+                        return self.snippets_action(action);
+                    }
                     self.refresh_chrome();
                     return None;
                 }
@@ -5275,6 +5984,10 @@ impl Window {
                     let view = self.forward_view();
                     let rows = self.side.grid.rows();
                     self.forwards_view.scroll_by(lines, &view, rows);
+                } else if self.side.view == SideView::Snippets {
+                    let rows = self.side.grid.rows();
+                    self.snippets_view
+                        .scroll_by(lines, &self.settings.snippets, rows);
                 } else if self.side.view == SideView::Files {
                     let remote = self.files_key.as_ref().and_then(|k| self.sftp.get(k));
                     self.files.scroll_by(remote, lines, self.side.grid.rows());
@@ -5536,7 +6249,10 @@ impl Window {
                     self.layout();
                 }
             }
-            cmd::SESSIONS | cmd::FILES | cmd::FORWARDS => self.toggle_side(id, false),
+            cmd::SESSIONS | cmd::FILES | cmd::FORWARDS | cmd::SNIPPETS => {
+                self.toggle_side(id, false);
+            }
+            cmd::RUN_SCRIPT => return self.rerun_script(self.focused_id()),
             cmd::SIDE_RIGHT => {
                 self.settings.side_pane_right = !self.settings.side_pane_right;
                 self.save_settings();
@@ -5676,6 +6392,30 @@ impl Window {
                 self.panes.get_mut(&pane)?.term.clear_scrollback();
                 self.refresh(pane);
             }
+            cmd::UPDATE_CHECK => {
+                if ferossh_update::public_key().is_none() {
+                    return Some(Command::Message(
+                        "This build of FeroSSH cannot check for updates: it was built without \
+                         the project's update key. Releases are listed at \
+                         https://github.com/jkobierczynski/FeroSSH/releases."
+                            .into(),
+                    ));
+                }
+                self.start_update_check(true);
+            }
+            cmd::UPDATE_WEEKLY => {
+                self.settings.update_check_weekly = !self.settings.update_check_weekly;
+                self.save_settings();
+                self.update_menu_checks();
+            }
+            cmd::ABOUT => {
+                return Some(Command::Message(format!(
+                    "FeroSSH {}\n\nSecure connections. Forged in Rust.\n\n\
+                     https://github.com/jkobierczynski/FeroSSH\n\n\
+                     Dual licensed under MIT or Apache-2.0.",
+                    env!("CARGO_PKG_VERSION")
+                )));
+            }
             cmd::COPY_ON_SELECT => {
                 self.settings.copy_on_select = !self.settings.copy_on_select;
                 self.save_settings();
@@ -5785,6 +6525,7 @@ impl Window {
             let _ = CheckMenuRadioItem(self.menu, cmd::THEME, last_theme, theme, MF_BYCOMMAND.0);
             for (id, on) in [
                 (cmd::COPY_ON_SELECT, s.copy_on_select),
+                (cmd::UPDATE_WEEKLY, s.update_check_weekly),
                 (cmd::RIGHT_CLICK_PASTE, s.right_click_paste),
                 (cmd::LOG_TOGGLE, log),
                 (cmd::LOG_RAW, raw),
@@ -5799,6 +6540,10 @@ impl Window {
                 (
                     cmd::FORWARDS,
                     self.side.visible && self.side.view == SideView::Forwards,
+                ),
+                (
+                    cmd::SNIPPETS,
+                    self.side.visible && self.side.view == SideView::Snippets,
                 ),
                 (cmd::FOLLOW_CD, s.follow_directory),
                 (cmd::VERIFY, s.verify_transfers),
@@ -5910,7 +6655,7 @@ impl Window {
         let Some(Host::Ssh(s)) = self.panes.get(&self.host_pane(id)).map(|g| &g.host) else {
             return;
         };
-        if s.state() != State::Connected || self.worker.is_none() {
+        if s.state() != State::Connected || !self.workers.contains_key(&s.connection) {
             return;
         }
         let key = sftp_key(&s.target);
@@ -5941,6 +6686,7 @@ impl Window {
         let channel = self.next_channel;
         self.next_channel = ((channel + 1) % FORWARD_IDS).max(1);
         remote.attach(channel, connection);
+        self.sftp_routes.insert(channel, connection);
         self.flush_sftp();
     }
 
@@ -5988,9 +6734,13 @@ impl Window {
     /// anything moves.
     fn flush_sftp(&mut self) {
         for remote in self.sftp.values_mut() {
-            let out = remote.take_outbox();
-            if let Some(w) = &self.worker {
-                for msg in out {
+            // Each to the worker of the connection its channel runs on.
+            for msg in remote.take_outbox() {
+                if let Some(w) = msg
+                    .channel()
+                    .and_then(|c| self.sftp_routes.get(&c))
+                    .and_then(|c| self.workers.get(c))
+                {
                     w.link.send(msg);
                 }
             }
@@ -6259,6 +7009,7 @@ fn shortcut(vk: VIRTUAL_KEY, m: Mods, tabs: bool, split: bool) -> Option<u32> {
             v if v == key(b'S') && m.shift => Some(cmd::SESSIONS),
             v if v == key(b'E') && m.shift => Some(cmd::FILES),
             v if v == key(b'P') && m.shift => Some(cmd::FORWARDS),
+            VK_SPACE if m.shift => Some(cmd::SNIPPETS),
             v if v == key(b'D') && m.shift => Some(cmd::DESKTOP),
             v if v == key(b'U') && m.shift => Some(cmd::UPLOAD),
             v if v == key(b'B') && m.shift => Some(cmd::BROADCAST_TAB),
@@ -6284,6 +7035,14 @@ fn shortcut(vk: VIRTUAL_KEY, m: Mods, tabs: bool, split: bool) -> Option<u32> {
 /// released.
 enum Command {
     Id(u32),
+    /// An information box.
+    Message(String),
+    /// Help > Check for updates found its answer; `asked` is false for
+    /// the weekly check, which only speaks up about a new release.
+    UpdateFound {
+        outcome: crate::update::Outcome,
+        asked: bool,
+    },
     /// File > Exit or the close box: asks first when sessions are open.
     Exit,
     /// The last pane closed: the window goes.
@@ -6330,6 +7089,15 @@ enum Command {
     SessionMenu(Option<String>),
     /// Ask, then remove this saved session.
     DeleteSession(String),
+    /// Ask, then remove the snippet at this index.
+    DeleteSnippet(usize),
+    /// Ask before a password manager command gets a login script's
+    /// secret the first time (`name`; `None` is the login password).
+    ConfirmSecretTool {
+        pane: PaneId,
+        line: String,
+        name: Option<String>,
+    },
     /// The file picker for the session form's key file.
     PickKey,
     /// Ask before a password manager command runs the first time.
@@ -6891,6 +7659,41 @@ fn run_command(hwnd: HWND, command: Command) {
                 dialog(hwnd, &text, MB_OK | icon);
             }
         }
+        Command::DeleteSnippet(index) => {
+            let Some(name) =
+                with_window(|w| w.settings.snippets.get(index).map(|s| s.name.clone())).flatten()
+            else {
+                return;
+            };
+            let text = format!("Delete the snippet {name}?");
+            if dialog(hwnd, &text, MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2) == Some(IDYES) {
+                with_window(|w| w.delete_snippet(index));
+            }
+        }
+        Command::ConfirmSecretTool { pane, line, name } => {
+            let what = match &name {
+                Some(n) => format!("the secret {n} for the login script"),
+                None => "the login password for the login script".to_owned(),
+            };
+            let text = format!(
+                "FeroSSH will run this command to get {what}, and type the first line it \
+                 prints:\n\n{}\n\nIt runs without a shell, a window or any input. Run it now \
+                 and from now on?",
+                line.chars().filter(|c| !c.is_control()).collect::<String>()
+            );
+            let yes =
+                dialog(hwnd, &text, MB_YESNO | MB_ICONQUESTION | MB_DEFBUTTON2) == Some(IDYES);
+            with_window(|w| {
+                if yes {
+                    approve_command(&line);
+                    w.run_script_command(pane, &line, name.as_deref());
+                } else {
+                    w.with_script(pane, |r| {
+                        r.secret_failed("the password command was not run.")
+                    });
+                }
+            });
+        }
         Command::DeleteSession(name) => {
             let text = format!(
                 "Delete the session {name}? Its look and extras in FeroSSH go with it.\n\n\
@@ -6937,6 +7740,48 @@ fn run_command(hwnd: HWND, command: Command) {
                 if !text.is_empty() {
                     dialog(hwnd, &text, MB_OK | icon);
                 }
+            }
+        }
+        Command::Message(text) => {
+            dialog(hwnd, &text, MB_OK | MB_ICONINFORMATION);
+        }
+        Command::UpdateFound { outcome, asked } => {
+            use crate::update::Outcome;
+            let current = env!("CARGO_PKG_VERSION");
+            match outcome {
+                Outcome::Newer(update) => {
+                    let text = format!(
+                        "FeroSSH {} is available (released {}). You have {current}.\n\n\
+                         Open its release page to download it?",
+                        update.version, update.released,
+                    );
+                    if dialog(hwnd, &text, MB_YESNO | MB_ICONINFORMATION) == Some(IDYES) {
+                        // SAFETY: a signed, checked https URL on the
+                        // project's Releases, handed to the browser.
+                        unsafe {
+                            ShellExecuteW(
+                                Some(hwnd),
+                                w!("open"),
+                                &HSTRING::from(update.url.as_str()),
+                                None,
+                                None,
+                                SW_SHOWNORMAL,
+                            );
+                        }
+                    }
+                }
+                Outcome::Current(update) if asked => {
+                    let text = format!(
+                        "FeroSSH {current} is up to date. The latest release is {}.",
+                        update.version
+                    );
+                    dialog(hwnd, &text, MB_OK | MB_ICONINFORMATION);
+                }
+                Outcome::Failed(why) if asked => {
+                    let text = format!("Could not check for updates: {why}.");
+                    dialog(hwnd, &text, MB_OK | MB_ICONWARNING);
+                }
+                Outcome::Current(_) | Outcome::Failed(_) => {}
             }
         }
         Command::OpenFolder(dir) => {
@@ -7323,6 +8168,14 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                 with_window(Window::on_transfer_timer);
                 LRESULT(0)
             }
+            WM_TIMER if wparam.0 == TIMER_SCRIPT => {
+                with_window(Window::on_script_timer);
+                LRESULT(0)
+            }
+            WM_TIMER if wparam.0 == TIMER_RETIRE => {
+                with_window(Window::on_retire_timer);
+                LRESULT(0)
+            }
             WM_TIMER if wparam.0 == TIMER_DESKTOP_SIZE => {
                 with_window(Window::on_desktop_size_timer);
                 LRESULT(0)
@@ -7416,7 +8269,10 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
             }
             WM_COMMAND => {
                 let id = loword(wparam.0);
-                if matches!(id, cmd::SESSIONS | cmd::FILES | cmd::FORWARDS) {
+                if matches!(
+                    id,
+                    cmd::SESSIONS | cmd::FILES | cmd::FORWARDS | cmd::SNIPPETS
+                ) {
                     with_window(|w| w.toggle_side(id, true));
                 } else {
                     run_command(hwnd, Command::Id(id));

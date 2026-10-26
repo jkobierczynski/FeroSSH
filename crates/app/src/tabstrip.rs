@@ -114,6 +114,29 @@ pub fn mix(a: Rgb, b: Rgb, amount: f32) -> Rgb {
     Rgb::new(m(a.r, b.r), m(a.g, b.g), m(a.b, b.b))
 }
 
+/// Relative luminance, as WCAG defines it.
+fn luminance(c: Rgb) -> f32 {
+    let lin = |v: u8| {
+        let v = f32::from(v) / 255.0;
+        if v <= 0.039_28 {
+            v / 12.92
+        } else {
+            ((v + 0.055) / 1.055).powf(2.4)
+        }
+    };
+    0.2126 * lin(c.r) + 0.7152 * lin(c.g) + 0.0722 * lin(c.b)
+}
+
+/// The WCAG contrast ratio of two colours, from 1 to 21.
+pub fn contrast(a: Rgb, b: Rgb) -> f32 {
+    let (x, y) = (luminance(a), luminance(b));
+    (x.max(y) + 0.05) / (x.min(y) + 0.05)
+}
+
+/// Secondary text contrast the side pane keeps on both its backgrounds,
+/// where the theme's own text allows: WCAG AA for normal text.
+pub const DIM_CONTRAST: f32 = 4.5;
+
 /// The strip's (and side pane's) colours.
 #[derive(Clone, Copy, Debug)]
 pub struct Palette {
@@ -128,11 +151,23 @@ pub struct Palette {
 impl Palette {
     /// From a pane theme.
     pub fn of(theme: &Theme) -> Self {
+        let strip = mix(theme.background, theme.foreground, 0.08);
+        let active = theme.background;
+        // Grey, but no fainter than reads well on either background: from
+        // a 40% fade toward the background, step back to the foreground.
+        let mut fade = 0.40;
+        let mut dim = mix(theme.foreground, theme.background, fade);
+        while fade > 0.0
+            && (contrast(dim, strip) < DIM_CONTRAST || contrast(dim, active) < DIM_CONTRAST)
+        {
+            fade = (fade - 0.02_f32).max(0.0);
+            dim = mix(theme.foreground, theme.background, fade);
+        }
         Self {
-            strip: mix(theme.background, theme.foreground, 0.08),
-            active: theme.background,
+            strip,
+            active,
             text: theme.foreground,
-            dim: mix(theme.foreground, theme.background, 0.45),
+            dim,
             accent: theme.cursor,
         }
     }
@@ -311,6 +346,18 @@ mod tests {
             .filter(|c| !c.flags.contains(Flags::WIDE_SPACER))
             .map(|c| c.ch)
             .collect()
+    }
+
+    #[test]
+    fn dim_text_reads_on_every_theme() {
+        for theme in Theme::builtin() {
+            let p = Palette::of(theme);
+            let floor = DIM_CONTRAST.min(contrast(p.text, p.strip));
+            for bg in [p.strip, p.active] {
+                let c = contrast(p.dim, bg);
+                assert!(c >= floor - 0.01, "{}: {c:.2}", theme.name);
+            }
+        }
     }
 
     #[test]

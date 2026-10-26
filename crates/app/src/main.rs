@@ -50,6 +50,8 @@ mod layout;
 #[cfg_attr(not(windows), allow(dead_code))]
 mod link;
 #[cfg_attr(not(windows), allow(dead_code))]
+mod login_script;
+#[cfg_attr(not(windows), allow(dead_code))]
 mod look;
 #[cfg_attr(not(windows), allow(dead_code))]
 mod newkey;
@@ -70,6 +72,8 @@ mod session_form;
 #[cfg_attr(not(windows), allow(dead_code))]
 mod sessions;
 #[cfg_attr(not(windows), allow(dead_code))]
+mod snippets_view;
+#[cfg_attr(not(windows), allow(dead_code))]
 mod ssh;
 #[cfg(all(test, unix))]
 mod ssh_e2e;
@@ -79,6 +83,8 @@ mod tabstrip;
 mod tmux;
 #[cfg(all(test, unix))]
 mod tmux_e2e;
+#[cfg(windows)]
+mod update;
 #[cfg(windows)]
 mod win;
 

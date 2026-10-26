@@ -26,17 +26,19 @@ little as possible. One exe runs as three kinds of process:
 - **The window** (the UI process) holds everything worth having: your
   files, keys and agents, `known_hosts`, saved passwords, the clipboard,
   logs and local sockets. It never speaks SSH itself.
-- **The SSH worker** holds the network connections and runs the SSH
-  protocol (russh). It runs in an AppContainer that may use the network
-  and nothing else: none of your files, registry or other processes. It
-  asks the window for everything else over a pipe.
+- **The SSH workers** hold the network connections and run the SSH
+  protocol (russh), one worker process for each SSH connection: tabs
+  that share a login share its worker, but another host or user gets a
+  worker of its own. Each runs in an AppContainer that may use the
+  network and nothing else: none of your files, registry or other
+  processes. It asks the window for everything else over a pipe.
 - **The desktop viewer**, only in the builds with the built-in VNC or RDP
   viewer, decodes remote screens in an AppContainer with no capabilities
   at all: no network, files or registry.
 
-Both sandboxed processes run in a job object that kills them with the
-window, lets them start no other process, caps their memory at 1 GiB and
-keeps them away from the clipboard, the desktop and other processes'
+Every sandboxed process runs in a job object that kills it with the
+window, lets it start no other process, caps its memory at 1 GiB and
+keeps it away from the clipboard, the desktop and other processes'
 windows. They also start with process mitigations: no dynamic code, no
 legacy extension points, no non-system fonts, mandatory ASLR, strict
 handle checks and DLLs from System32 first. `ferossh.exe --check-sandbox`
@@ -44,6 +46,9 @@ reports what your Windows allows.
 
 The window treats both as if an attacker had taken them over:
 
+- A worker only reaches the shells, file transfers and forwards of its
+  own connection; anything it sends about another connection's is
+  dropped.
 - Every frame on the pipes is checked strictly: sizes are capped, unknown
   messages are errors, and a message only the window sends ends the
   worker's pipe.
