@@ -11,6 +11,10 @@ The window starts as one pane, with no tab strip. Ctrl+Shift+T opens a tab and t
 - Ctrl+Shift+J joins a tab into the tab before it, as a pane. Dropping a pane on the tab strip makes it a tab again.
 - View > Font and View > Theme change only the focused pane. Session > Save font and theme for this host keeps them for next time.
 
+## When the connection drops
+
+If the network drops, the laptop sleeps or the server reboots, the tab stays where it is and FeroSSH logs in again on its own: after 1 second, then 2, 4, 8, 15 and every 30 seconds, for up to 15 minutes. Enter tries at once and Esc stops. The tab keeps its splits, font, theme, scrollback and log file, port forwards and the login script run again, tmux reattaches, and file transfers carry on. Tabs that shared the connection share the new one. A shell you exit, a login that fails or a changed host key never reconnects. File > Reconnect automatically turns it off, for all hosts or (`AutoReconnect no` in a profile) for one.
+
 ## The session manager
 
 Ctrl+Shift+S shows a side pane with your hosts from `~/.ssh/config`, your saved sessions and your imports. Type to filter, Enter connects in this tab, Shift+Enter in a split, and Ctrl+D marks a favourite. A `# folder: Name` comment above a `Host` line groups hosts in your ssh_config.

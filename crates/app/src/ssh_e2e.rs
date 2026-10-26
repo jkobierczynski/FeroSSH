@@ -132,6 +132,7 @@ fn connect(env: &Env, command: &str, answers: &[(&str, &str)]) -> (Run, SshSessi
                 Effect::Broker(job) => broker.submit(job),
                 Effect::Connected => effects.extend(session.input(command.as_bytes())),
                 Effect::Ended => return (run, session),
+                Effect::Reconnect => {}
                 // No password source in these tests.
                 Effect::FetchPassword | Effect::StorePassword(_) => {}
             }

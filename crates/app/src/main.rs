@@ -60,6 +60,8 @@ mod newkey;
 mod pattern;
 #[cfg_attr(not(windows), allow(dead_code))]
 mod pwcommand;
+#[cfg_attr(not(windows), allow(dead_code))]
+mod reconnect;
 #[cfg(windows)]
 mod sandbox;
 #[cfg_attr(not(windows), allow(dead_code))]

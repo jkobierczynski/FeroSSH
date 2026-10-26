@@ -562,6 +562,12 @@ async fn second_shell_shares_the_connection() {
 /// is open.
 #[cfg(unix)]
 async fn login(server: &Server) -> (mpsc::Sender<Message>, mpsc::Receiver<Message>) {
+    login_at(server, server.port).await
+}
+
+/// Like [`login`], connecting to `port` (a relay in front of the server).
+#[cfg(unix)]
+async fn login_at(server: &Server, port: u16) -> (mpsc::Sender<Message>, mpsc::Receiver<Message>) {
     let (to_worker, worker_in) = mpsc::channel(64);
     let (worker_out, mut from_worker) = mpsc::channel(64);
     tokio::spawn(ferossh_worker::serve(worker_in, worker_out));
@@ -577,7 +583,7 @@ async fn login(server: &Server) -> (mpsc::Sender<Message>, mpsc::Receiver<Messag
         .send(Message::Connect {
             channel: 1,
             host: "127.0.0.1".into(),
-            port: server.port,
+            port,
             user,
             cols: 80,
             rows: 24,
@@ -611,6 +617,64 @@ async fn login(server: &Server) -> (mpsc::Sender<Message>, mpsc::Receiver<Messag
             _ => continue,
         };
         to_worker.send(reply).await.unwrap();
+    }
+}
+
+/// A TCP relay to `port` for one connection; the returned stream is its
+/// client side, which a test shuts down to cut the network.
+#[cfg(unix)]
+fn relay(port: u16) -> (u16, std::sync::mpsc::Receiver<std::net::TcpStream>) {
+    use std::net::TcpStream;
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let local = listener.local_addr().unwrap().port();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let (client, _) = listener.accept().unwrap();
+        let server = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        tx.send(client.try_clone().unwrap()).unwrap();
+        let pipe = |mut from: TcpStream, mut to: TcpStream| {
+            std::thread::spawn(move || {
+                let _ = std::io::copy(&mut from, &mut to);
+                let _ = to.shutdown(std::net::Shutdown::Both);
+                let _ = from.shutdown(std::net::Shutdown::Both);
+            })
+        };
+        pipe(client.try_clone().unwrap(), server.try_clone().unwrap());
+        pipe(server, client);
+    });
+    (local, rx)
+}
+
+/// A connection that breaks under the open shell is reported as lost, so
+/// the UI can reconnect; a shell that exits is not (see
+/// [`second_shell_shares_the_connection`], which fails on any `Lost`).
+#[cfg(unix)]
+#[tokio::test]
+async fn a_broken_connection_is_reported_as_lost() {
+    if !available() {
+        return;
+    }
+    let server = start("lost", "");
+    let (port, cut) = relay(server.port);
+    let (_to_worker, mut from_worker) = login_at(&server, port).await;
+    let client = cut.recv().unwrap();
+    client.shutdown(std::net::Shutdown::Both).unwrap();
+    let mut lost = false;
+    loop {
+        let msg = tokio::time::timeout(Duration::from_secs(30), from_worker.recv())
+            .await
+            .expect("timed out")
+            .expect("worker hung up");
+        match msg {
+            Message::Lost { channel: 1 } => lost = true,
+            Message::Disconnected { channel: 1, reason } => {
+                assert!(lost, "no Lost before: {reason}");
+                assert!(!reason.contains("stays open"), "{reason}");
+                break;
+            }
+            Message::Data { .. } => {}
+            other => panic!("unexpected {other:?}"),
+        }
     }
 }
 
