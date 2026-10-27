@@ -7,7 +7,7 @@ use std::time::Instant;
 use alacritty_terminal::event::{Event, EventListener, WindowSize};
 use alacritty_terminal::grid::{Dimensions, Scroll};
 use alacritty_terminal::index::{Boundary, Column, Direction, Line, Point, Side};
-use alacritty_terminal::selection::{Selection, SelectionType};
+use alacritty_terminal::selection::{Selection, SelectionRange, SelectionType};
 use alacritty_terminal::term::cell::Flags as TermFlags;
 use alacritty_terminal::term::color::{COUNT as COLOR_COUNT, Colors};
 use alacritty_terminal::term::search::{Match, RegexSearch};
@@ -500,16 +500,65 @@ impl Terminal {
         self.term.selection.as_ref().is_some_and(|s| !s.is_empty())
     }
 
+    /// The selected text, built the way alacritty_terminal 0.26 builds it
+    /// in `selection_to_string`, around two of its bugs that panic.
     pub fn selection_text(&self) -> Option<String> {
-        // A block selection that starts on the right half of a cell drops
-        // that cell, so one started on the right half of the last column
-        // and ended left of it covers no cell. alacritty_terminal 0.26
-        // still reads that cell, one past the end of the row, and panics.
-        let range = self.term.selection.as_ref()?.to_range(&self.term)?;
-        if range.is_block && range.start.column > range.end.column {
-            return None;
+        let selection = self.term.selection.as_ref()?;
+        let SelectionRange { start, end, .. } = selection.to_range(&self.term)?;
+        let text = match selection.ty {
+            SelectionType::Block => {
+                // A block selection that starts on the right half of a cell
+                // drops that cell, so one started on the right half of the
+                // last column and ended left of it covers no cell; upstream
+                // still reads that cell, one past the end of the row.
+                if start.column > end.column {
+                    return None;
+                }
+                (start.line.0..=end.line.0)
+                    .map(|line| {
+                        let wide = line == end.line.0 || start.column.0 != 0;
+                        let (from, to) = (
+                            Point::new(Line(line), start.column),
+                            Point::new(Line(line), end.column),
+                        );
+                        self.bounds_text(from, to, wide).trim_end().to_owned()
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            }
+            SelectionType::Lines => self.bounds_text(start, end, true) + "\n",
+            _ => self.bounds_text(start, end, true),
+        };
+        Some(text).filter(|s| !s.is_empty())
+    }
+
+    /// `Term::bounds_to_string`, except where the selection ends on the
+    /// spacer left at the end of a line by a wide character that did not
+    /// fit there. Upstream then adds the first character of the line above
+    /// instead of the line below, and panics on the oldest line of history,
+    /// which has none above it. Here that spacer is left out and, with
+    /// `wide`, the wide character from the line below is added.
+    fn bounds_text(&self, start: Point, end: Point, wide: bool) -> String {
+        let grid = self.term.grid();
+        let last = grid.last_column();
+        let spacer = end.column == last
+            && last.0 >= 1
+            && grid[end.line][last]
+                .flags
+                .contains(TermFlags::LEADING_WIDE_CHAR_SPACER);
+        if !spacer {
+            return self.term.bounds_to_string(start, end);
         }
-        self.term.selection_to_string().filter(|s| !s.is_empty())
+        let before = Point::new(end.line, last - 1);
+        let mut text = if start <= before {
+            self.term.bounds_to_string(start, before)
+        } else {
+            String::new()
+        };
+        if wide && end.line < grid.bottommost_line() {
+            text.push(grid[end.line + 1i32][Column(0)].c);
+        }
+        text
     }
 
     /// The raw OSC 8 link target of a viewport cell, if it has one. Check

@@ -521,10 +521,15 @@ fn deleting_lines_while_scrolled_back_keeps_the_view_in_history() {
 /// them. Their files are in `fuzz/regressions/term_feed`.
 #[test]
 fn fuzz_regressions_do_not_panic() {
-    let inputs: [&[u8]; 1] = [
+    let inputs: [&[u8]; 2] = [
         // crash-4e843404021a197da920428c087b4ed1c597ca5f: a resize, a
         // scroll back, then CSI M with the view past the history.
         b"\x832[\xff[%&)\x1b[\xffM",
+        // crash-3501ad54109bbfb7046339fa23c251f8201447bd: a narrower
+        // resize wraps a wide character on the oldest line of history,
+        // then a word on that line is copied.
+        b"@\xc8$\xff  \x01\xff\xff\xff\xff\xff\xfb\xffM\xa5\xe4\xa2\x95\x00\x08\x1b\xff\xff\xff\xff\
+          M\x1b0P\xa2\x95@\xa5\xe4\xa2\x95\x00\x08MB",
     ];
     for data in inputs {
         let (&split, stream) = data.split_first().unwrap();
@@ -536,6 +541,10 @@ fn fuzz_regressions_do_not_panic() {
             match (split as usize + i) % 11 {
                 0 => t.resize(usize::from(chunk[0] % 30), usize::from(split % 9)),
                 1 => t.scroll_lines(i32::from(chunk[0] as i8)),
+                2 => {
+                    t.select_start(usize::from(chunk[0]), 1, true, SelectionKind::Word);
+                    let _ = t.selection_text();
+                }
                 _ => {}
             }
             let _ = t.draw_into(&mut g, i % 2 == 0);
@@ -559,4 +568,31 @@ fn block_selection_from_the_right_half_of_the_last_column_is_empty() {
     t.select_start(19, 0, false, SelectionKind::Block);
     t.select_update(19, 1, true);
     assert_eq!(t.selection_text().as_deref(), Some("t\nt"));
+}
+
+#[test]
+fn copying_a_line_that_wraps_a_wide_character_takes_it_from_the_next_line() {
+    // "中" does not fit in the last column, so it wraps and leaves a
+    // spacer there.
+    let mut t = Terminal::new(10, 3, &Settings::new(100));
+    t.feed("123456789中x\r\nb\r\nc\r\nd\r\ne".as_bytes());
+    // The wrapped line is now the oldest line of history.
+    t.scroll_to_top();
+    assert_eq!(line(&t, 0), "123456789");
+    t.select_start(0, 0, false, SelectionKind::Simple);
+    t.select_update(9, 0, true);
+    assert_eq!(t.selection_text().as_deref(), Some("123456789中"));
+    t.select_start(0, 0, false, SelectionKind::Block);
+    t.select_update(9, 0, true);
+    assert_eq!(t.selection_text().as_deref(), Some("123456789中"));
+    t.select_start(3, 0, false, SelectionKind::Line);
+    assert_eq!(t.selection_text().as_deref(), Some("123456789中x\n"));
+
+    // With a line above it, upstream would have added that line's first
+    // character.
+    let mut t = Terminal::new(10, 3, &Settings::new(100));
+    t.feed("a\r\n123456789中x".as_bytes());
+    t.select_start(0, 1, false, SelectionKind::Simple);
+    t.select_update(9, 1, true);
+    assert_eq!(t.selection_text().as_deref(), Some("123456789中"));
 }
