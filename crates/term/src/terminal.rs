@@ -501,6 +501,14 @@ impl Terminal {
     }
 
     pub fn selection_text(&self) -> Option<String> {
+        // A block selection that starts on the right half of a cell drops
+        // that cell, so one started on the right half of the last column
+        // and ended left of it covers no cell. alacritty_terminal 0.26
+        // still reads that cell, one past the end of the row, and panics.
+        let range = self.term.selection.as_ref()?.to_range(&self.term)?;
+        if range.is_block && range.start.column > range.end.column {
+            return None;
+        }
         self.term.selection_to_string().filter(|s| !s.is_empty())
     }
 

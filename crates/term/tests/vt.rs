@@ -542,3 +542,21 @@ fn fuzz_regressions_do_not_panic() {
         }
     }
 }
+
+#[test]
+fn block_selection_from_the_right_half_of_the_last_column_is_empty() {
+    let mut t = term(20, 6);
+    t.feed(b"abcdefghijklmnopqrst\r\nabcdefghijklmnopqrst");
+    // Alt+drag from the right half of the last cell, down and to its
+    // left half: no whole cell is covered.
+    t.select_start(19, 0, true, SelectionKind::Block);
+    t.select_update(19, 1, false);
+    assert_eq!(t.selection_text(), None);
+    t.select_update(19, 1, true);
+    assert_eq!(t.selection_text(), None);
+    let _ = screen(&t);
+    // From the left half it covers the last column.
+    t.select_start(19, 0, false, SelectionKind::Block);
+    t.select_update(19, 1, true);
+    assert_eq!(t.selection_text().as_deref(), Some("t\nt"));
+}

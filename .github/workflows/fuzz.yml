@@ -1,18 +1,18 @@
 name: Fuzz campaign
 
 # The pull request job only runs each target for a minute. This runs them
-# for longer once a week (and on demand), keeping each target's corpus
+# for longer every night (and on demand), keeping each target's corpus
 # between runs so the campaign builds on the last one. A crash fails the
 # job and its input is uploaded as an artifact.
 
 on:
   schedule:
-    - cron: "17 3 * * 0"
+    - cron: "17 3 * * *"
   workflow_dispatch:
     inputs:
       minutes:
         description: Minutes per target
-        default: "15"
+        default: "30"
 
 permissions:
   contents: read
@@ -58,7 +58,7 @@ jobs:
           fi
       - name: Fuzz
         env:
-          MINUTES: ${{ inputs.minutes || '15' }}
+          MINUTES: ${{ inputs.minutes || '30' }}
         run: |
           cargo +nightly fuzz run --target x86_64-unknown-linux-gnu ${{ matrix.target }} -- \
             -max_total_time=$((MINUTES * 60)) -timeout=10 -rss_limit_mb=2048
