@@ -903,6 +903,9 @@ dependencies = [
  "ferossh-worker",
  "ferossh-zmodem",
  "libfuzzer-sys",
+ "russh",
+ "tokio",
+ "zeroize",
 ]
 
 [[package]]

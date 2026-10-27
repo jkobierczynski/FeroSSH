@@ -74,10 +74,12 @@ The window treats both as if an attacker had taken them over:
   stripped of control and bidirectional-override characters before it is
   shown.
 
-The parsers for untrusted input (the IPC decoders, the terminal, SFTP,
-ZMODEM, SOCKS and X11, tmux control mode, VNC and RDP, key files, sign requests,
-`ssh_config`, `known_hosts` and session imports) are fuzzed: briefly on
-every pull request, and for longer every week.
+The parsers for untrusted input (the SSH handshake up to the host key
+check, the IPC decoders, the terminal and its link, paste and title
+checks, login scripts, log chains, SFTP, ZMODEM, Telnet, SOCKS and X11,
+tmux control mode, VNC and RDP, key files, sign requests, `ssh_config`,
+`known_hosts` and session imports) are fuzzed: briefly on every pull
+request, and for half an hour per parser every night.
 
 ## Known limits
 
