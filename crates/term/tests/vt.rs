@@ -600,3 +600,15 @@ fn copying_a_line_that_wraps_a_wide_character_takes_it_from_the_next_line() {
     t.select_update(9, 1, true);
     assert_eq!(t.selection_text().as_deref(), Some("123456789中"));
 }
+
+#[test]
+fn deleting_a_wide_character_leaves_no_spacer_under_the_cursor() {
+    // CSI P on "中" at the start of the line moves its spacer to column 0,
+    // where the cursor is.
+    let mut t = term(10, 2);
+    t.feed("中x\r\x1b[P".as_bytes());
+    let (_, cursor) = screen(&t);
+    assert_eq!(cursor.map(|c| (c.x, c.y)), Some((0, 0)));
+    // The left-over spacer shows as a blank cell.
+    assert_eq!(line(&t, 0), " x");
+}

@@ -209,6 +209,7 @@ impl Terminal {
         };
         if size.cols != self.cols() || size.rows != self.rows() {
             self.term.resize(size);
+            self.drop_lone_spacers();
             if let Some(s) = &mut self.search {
                 s.found = None;
             }
@@ -231,6 +232,7 @@ impl Terminal {
                 let queued = self.events.0.borrow().len();
                 self.parser.advance(&mut self.term, piece);
                 self.clamp_view();
+                self.drop_lone_spacers();
                 self.follow_title(queued);
             }
             start = end;
@@ -248,6 +250,20 @@ impl Terminal {
         let grid = self.term.grid();
         if grid.display_offset() > grid.history_size() {
             self.term.scroll_display(Scroll::Delta(0));
+        }
+    }
+
+    /// Clears wide-character spacers left at the start of a screen line.
+    /// alacritty_terminal 0.26 can leave one there (deleting characters
+    /// with CSI P moves the spacer of a wide character without the
+    /// character), and with the cursor on it, finding the cursor's cell
+    /// subtracts one from column 0. A spacer with nothing before it is
+    /// a blank cell anyway.
+    fn drop_lone_spacers(&mut self) {
+        let grid = self.term.grid_mut();
+        for line in 0..grid.screen_lines() {
+            let cell = &mut grid[Line(line as i32)][Column(0)];
+            cell.flags.remove(TermFlags::WIDE_CHAR_SPACER);
         }
     }
 
