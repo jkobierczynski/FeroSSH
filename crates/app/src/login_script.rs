@@ -1,6 +1,7 @@
-//! Runs a session's login script: waits for each `expect` text in what
-//! the host prints, types each `send` line, and types passwords and named
-//! secrets that the window fetches (see [`ferossh_config::login`]).
+//! Runs a session's login script, or a snippet with steps that wait:
+//! waits for each `expect` text in what the host prints, types each `send`
+//! line, and types passwords and named secrets that the window fetches
+//! (see [`ferossh_config::login`]).
 //!
 //! [`Runner`] only returns [`Action`]s and keeps no clock of its own, so
 //! it is tested on any host. A secret that no source has is asked for in
@@ -10,7 +11,8 @@
 
 use std::time::{Duration, Instant};
 
-use ferossh_config::login::{EXPECT_TIMEOUT_SECS, Step};
+use ferossh_config::login::{self, EXPECT_TIMEOUT_SECS, Step};
+use ferossh_config::trigger::OutputText;
 use zeroize::Zeroizing;
 
 const DIM: &str = "\x1b[0;90m";
@@ -41,8 +43,19 @@ pub enum Action {
     Fetch(Need),
     /// Keep what was typed at the prompt for named secret `0`.
     Save(String, Zeroizing<String>),
+    /// A `capture` step kept this value.
+    Captured(String),
     /// The script is over (finished, stopped or failed).
     Done,
+}
+
+/// How a run ended, for the snippet report.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Outcome {
+    Finished,
+    Failed(String),
+    /// The user typed into the pane.
+    Stopped,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -63,51 +76,47 @@ struct Prompt {
     save: Option<String>,
 }
 
-/// Escape sequence state, so a sequence split across reads is still
-/// dropped.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Lex {
-    Text,
-    Esc,
-    /// CSI: up to a final byte.
-    Csi,
-    /// OSC, DCS and the like: up to BEL or ST.
-    Str,
-    StrEsc,
-}
-
 #[derive(Debug)]
 pub struct Runner {
+    /// What runs, for the messages: "the login script" or a snippet.
+    what: String,
     steps: Vec<Step>,
     next: usize,
     wait: Wait,
     deadline: Option<Instant>,
     /// The host's text since the last `expect` matched.
     seen: String,
-    esc: Lex,
-    /// Bytes of an unfinished UTF-8 character.
-    partial: Vec<u8>,
+    text: OutputText,
     prompt: Option<Prompt>,
+    outcome: Option<Outcome>,
 }
 
 impl Runner {
+    /// A session's login script.
     pub fn new(steps: Vec<Step>) -> Self {
+        Self::named("the login script", steps)
+    }
+
+    /// A run of `steps` called `what` ("the snippet Backup").
+    pub fn named(what: &str, steps: Vec<Step>) -> Self {
         Self {
+            what: what.to_owned(),
             steps,
             next: 0,
             wait: Wait::Ready,
             deadline: None,
             seen: String::new(),
-            esc: Lex::Text,
-            partial: Vec::new(),
+            text: OutputText::default(),
             prompt: None,
+            outcome: None,
         }
     }
 
     /// Starts the script.
     pub fn start(&mut self, now: Instant) -> Vec<Action> {
         let mut out = vec![Action::Show(format!(
-            "{DIM}Running the login script; any key stops it.{RESET}\r\n"
+            "{DIM}Running {}; any key stops it.{RESET}\r\n",
+            crate::ssh::sanitize(&self.what)
         ))];
         self.advance(now, &mut out);
         out
@@ -121,6 +130,23 @@ impl Runner {
     /// When [`Self::tick`] has something to do.
     pub fn deadline(&self) -> Option<Instant> {
         self.deadline
+    }
+
+    /// How it ended, once it is over.
+    pub fn outcome(&self) -> Option<&Outcome> {
+        self.outcome.as_ref()
+    }
+
+    /// What it waits for now, for the snippet report.
+    pub fn waiting_for(&self) -> Option<String> {
+        match (self.wait, self.steps.get(self.next)) {
+            (Wait::Expect, Some(Step::Expect(t) | Step::Capture(t))) => {
+                Some(crate::ssh::sanitize(t))
+            }
+            (Wait::Pause, _) => Some("a pause".into()),
+            (Wait::Secret, _) => Some("a secret".into()),
+            _ => None,
+        }
     }
 
     /// Whether a secret is being typed in the pane.
@@ -142,10 +168,19 @@ impl Runner {
                     };
                     self.seen.drain(..at + text.len());
                 }
-                Step::Send(text) => {
-                    let mut bytes = Zeroizing::new(text.as_bytes().to_vec());
-                    bytes.push(b'\r');
-                    out.push(Action::Send(bytes));
+                Step::Capture(pattern) => {
+                    let Some((end, value)) = login::capture(&self.seen, pattern) else {
+                        self.wait = Wait::Expect;
+                        self.deadline = Some(now + Duration::from_secs(EXPECT_TIMEOUT_SECS));
+                        return;
+                    };
+                    self.seen.drain(..end);
+                    out.push(Action::Captured(value));
+                }
+                Step::Send(_) | Step::Type(_) | Step::Key(_) => {
+                    if let Some(bytes) = step.bytes() {
+                        out.push(Action::Send(Zeroizing::new(bytes)));
+                    }
                 }
                 Step::Pause(secs) => {
                     self.next += 1;
@@ -170,6 +205,9 @@ impl Runner {
     }
 
     fn finish(&mut self, out: &mut Vec<Action>) {
+        if self.outcome.is_none() {
+            self.outcome = Some(Outcome::Finished);
+        }
         self.wait = Wait::Over;
         self.deadline = None;
         self.prompt = None;
@@ -178,9 +216,12 @@ impl Runner {
 
     /// Stops with `why` shown in the pane.
     fn fail(&mut self, why: &str, out: &mut Vec<Action>) {
+        let what = crate::ssh::sanitize(&self.what);
+        let what = what.strip_prefix("the ").unwrap_or(&what);
         out.push(Action::Show(format!(
-            "\r\n{RED}The login script stopped: {why}{RESET}\r\n"
+            "\r\n{RED}The {what} stopped: {why}{RESET}\r\n"
         )));
+        self.outcome = Some(Outcome::Failed(why.to_owned()));
         self.finish(out);
     }
 
@@ -189,32 +230,7 @@ impl Runner {
         if self.wait == Wait::Over {
             return Vec::new();
         }
-        for &b in bytes {
-            self.esc = match (self.esc, b) {
-                (Lex::Text, 0x1b) => Lex::Esc,
-                (Lex::Text, b) if b >= 0x20 || matches!(b, b'\r' | b'\n' | b'\t') => {
-                    self.partial.push(b);
-                    if b < 0x80 || std::str::from_utf8(&self.partial).is_ok() {
-                        self.seen.push_str(&String::from_utf8_lossy(&self.partial));
-                        self.partial.clear();
-                    } else if self.partial.len() >= 4 {
-                        self.partial.clear();
-                    }
-                    Lex::Text
-                }
-                (Lex::Text, _) => Lex::Text,
-                (Lex::Esc, b'[') => Lex::Csi,
-                (Lex::Esc, b']' | b'P' | b'X' | b'^' | b'_') => Lex::Str,
-                (Lex::Esc, _) => Lex::Text,
-                (Lex::Csi, 0x40..=0x7e) => Lex::Text,
-                (Lex::Csi, _) => Lex::Csi,
-                (Lex::Str, 0x07) => Lex::Text,
-                (Lex::Str, 0x1b) => Lex::StrEsc,
-                (Lex::Str, _) => Lex::Str,
-                (Lex::StrEsc, b'\\') => Lex::Text,
-                (Lex::StrEsc, _) => Lex::Str,
-            };
-        }
+        self.text.feed(bytes, &mut self.seen);
         if self.seen.len() > SEEN_MAX {
             let mut cut = self.seen.len() - SEEN_MAX / 2;
             while !self.seen.is_char_boundary(cut) {
@@ -239,7 +255,7 @@ impl Runner {
         match self.wait {
             Wait::Expect => {
                 let text = match self.steps.get(self.next) {
-                    Some(Step::Expect(t)) => crate::ssh::sanitize(t),
+                    Some(Step::Expect(t) | Step::Capture(t)) => crate::ssh::sanitize(t),
                     _ => String::new(),
                 };
                 self.fail(
@@ -342,9 +358,14 @@ impl Runner {
     pub fn cancel(&mut self) -> Vec<Action> {
         let mut out = Vec::new();
         if self.wait != Wait::Over {
-            out.push(Action::Show(format!(
-                "{DIM}[Login script stopped]{RESET}\r\n"
-            )));
+            let what = crate::ssh::sanitize(&self.what);
+            let what = what.strip_prefix("the ").unwrap_or(&what);
+            let mut what = what.to_owned();
+            if let Some(first) = what.get(..1) {
+                what.replace_range(..1, &first.to_uppercase());
+            }
+            out.push(Action::Show(format!("{DIM}[{what} stopped]{RESET}\r\n")));
+            self.outcome = Some(Outcome::Stopped);
             self.finish(&mut out);
         }
         out
@@ -482,8 +503,54 @@ mod tests {
         let mut r = Runner::new(steps(&["password", "send x"]));
         r.start(now);
         let a = r.secret_failed("the command failed.");
-        assert!(matches!(&a[0], Action::Show(t) if t.contains("the command failed.")));
+        assert!(
+            matches!(&a[0], Action::Show(t) if t.contains("login script stopped: the command failed."))
+        );
         assert!(r.is_over());
         assert!(r.secret("late", now).is_empty());
+    }
+
+    #[test]
+    fn snippets_type_keys_and_say_their_name() {
+        let now = Instant::now();
+        let mut r = Runner::named(
+            "the snippet Save",
+            steps(&["send copy run start", "expect ]?", "key enter", "type y"]),
+        );
+        let a = r.start(now);
+        assert!(matches!(&a[0], Action::Show(t) if t.contains("Running the snippet Save")));
+        assert_eq!(sent(&a), ["copy run start\r"]);
+        let a = r.feed(b"Destination filename [startup-config]?", now);
+        assert_eq!(sent(&a), ["\r", "y"]);
+        assert_eq!(a.last(), Some(&Action::Done));
+        let mut r = Runner::named("the snippet Save", steps(&["expect #"]));
+        r.start(now);
+        assert!(matches!(&r.cancel()[0], Action::Show(t) if t.contains("[Snippet Save stopped]")));
+    }
+
+    #[test]
+    fn captures_report_values_and_outcomes() {
+        let now = Instant::now();
+        let mut r = Runner::named(
+            "the snippet Version",
+            steps(&["send show version", "capture Version *,", "expect #"]),
+        );
+        r.start(now);
+        assert_eq!(r.waiting_for().as_deref(), Some("Version *,"));
+        let a = r.feed(
+            b"Cisco IOS Software, Version 15.2(4)E10, RELEASE\r\nsw1#",
+            now,
+        );
+        assert!(a.contains(&Action::Captured("15.2(4)E10".into())));
+        assert_eq!(r.outcome(), Some(&Outcome::Finished));
+
+        let mut r = Runner::named("the snippet V", steps(&["capture Version *,"]));
+        r.start(now);
+        r.tick(now + Duration::from_secs(EXPECT_TIMEOUT_SECS));
+        assert!(matches!(r.outcome(), Some(Outcome::Failed(w)) if w.contains("Version *,")));
+        let mut r = Runner::named("the snippet V", steps(&["expect x"]));
+        r.start(now);
+        r.cancel();
+        assert_eq!(r.outcome(), Some(&Outcome::Stopped));
     }
 }

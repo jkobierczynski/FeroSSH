@@ -16,11 +16,13 @@ pub mod mremoteng;
 pub mod password;
 mod pattern;
 pub mod putty;
+pub mod record;
 pub mod saved;
 pub mod securecrt;
 pub mod serial;
 pub mod settings;
 pub mod ssh_config;
+pub mod trigger;
 pub mod winscp;
 
 pub use forward::{ForwardKind, ForwardSpec};

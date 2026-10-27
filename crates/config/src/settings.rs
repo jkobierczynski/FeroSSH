@@ -49,6 +49,17 @@
 //! Snippet "Show interfaces"
 //!     Line terminal length 0
 //!     Line show ip interface brief
+//! Snippet "Back up the config"
+//!     Hosts sw-* core-*
+//!     Folder Network
+//!     Hotkey F2
+//!     Line copy running-config tftp://10.0.0.5/${host}-${stamp}.cfg
+//!     Line @expect ]?
+//!     Line @key enter
+//! Snippet "Next page"
+//!     Hosts sw-*
+//!     When --More--
+//!     Line @key space
 //! ```
 //!
 //! FeroSSH rewrites the file when a setting changes. Unknown keywords are
@@ -57,7 +68,7 @@
 use std::fmt::Write as _;
 
 use crate::host_theme::ThemeRule;
-use crate::login::{SecretSource, Snippet, Step, valid_secret_name};
+use crate::login::{SecretSource, Snippet, Step, parse_hotkey, valid_secret_name};
 use crate::password::PasswordSource;
 use crate::serial::LineSettings;
 use crate::ssh_config::split_line;
@@ -215,6 +226,12 @@ pub struct Settings {
     pub secrets: Vec<SecretSource>,
     /// Command snippets, in the order the user keeps them.
     pub snippets: Vec<Snippet>,
+    /// Ask before a snippet is typed into a pane with the Production
+    /// theme. On unless turned off.
+    pub confirm_production: bool,
+    /// Snippets with a `When` text answer the host by themselves. On
+    /// unless turned off.
+    pub auto_responses: bool,
 }
 
 /// Scrollback is capped here, as the terminal caps it.
@@ -249,6 +266,8 @@ impl Default for Settings {
             update_check_weekly: false,
             secrets: Vec::new(),
             snippets: Vec::new(),
+            confirm_production: true,
+            auto_responses: true,
         }
     }
 }
@@ -355,7 +374,7 @@ impl Settings {
                     }
                     s.snippets.push(Snippet {
                         name,
-                        lines: Vec::new(),
+                        ..Snippet::default()
                     });
                     block = Block::Snippet(s.snippets.len() - 1);
                 }
@@ -416,6 +435,14 @@ impl Settings {
                 "updatecheck" => {
                     block = Block::Top;
                     s.update_check_weekly = first.is_some_and(|a| a.eq_ignore_ascii_case("weekly"));
+                }
+                "confirmproduction" => {
+                    block = Block::Top;
+                    s.confirm_production = yes(&args).unwrap_or(true);
+                }
+                "autoresponses" => {
+                    block = Block::Top;
+                    s.auto_responses = yes(&args).unwrap_or(true);
                 }
                 "x11display" => {
                     block = Block::Top;
@@ -540,10 +567,16 @@ impl Settings {
                         }
                     }
                     Block::Snippet(i) => {
-                        if keyword == "line"
-                            && let Some(x) = s.snippets.get_mut(i)
-                        {
-                            x.lines.push(clean(&raw_rest(line)));
+                        let Some(x) = s.snippets.get_mut(i) else {
+                            continue;
+                        };
+                        match keyword.as_str() {
+                            "line" => x.lines.push(clean(&raw_rest(line))),
+                            "hosts" => x.hosts.extend(args),
+                            "folder" if !joined.is_empty() => x.folders.push(clean(&joined)),
+                            "hotkey" => x.hotkey = parse_hotkey(&joined).ok().flatten(),
+                            "when" => x.when = clean(&raw_rest(line)),
+                            _ => {}
                         }
                     }
                     Block::Top => {}
@@ -597,6 +630,8 @@ impl Settings {
         }
         let _ = writeln!(out, "ZModem {}", flag(self.zmodem));
         let _ = writeln!(out, "FollowDirectory {}", flag(self.follow_directory));
+        let _ = writeln!(out, "ConfirmProduction {}", flag(self.confirm_production));
+        let _ = writeln!(out, "AutoResponses {}", flag(self.auto_responses));
         if let Some(d) = &self.x11_display {
             let _ = writeln!(out, "X11Display {}", arg(d));
         }
@@ -681,6 +716,28 @@ impl Settings {
                 continue;
             }
             let _ = writeln!(out, "Snippet {}", arg(&name));
+            let hosts: Vec<String> = snippet
+                .hosts
+                .iter()
+                .map(|h| arg(h))
+                .filter(|h| !h.starts_with('"'))
+                .collect();
+            if !hosts.is_empty() {
+                let _ = writeln!(out, "    Hosts {}", hosts.join(" "));
+            }
+            for f in &snippet.folders {
+                let f = clean(f);
+                if !f.is_empty() {
+                    let _ = writeln!(out, "    Folder {f}");
+                }
+            }
+            if let Some(n) = snippet.hotkey {
+                let _ = writeln!(out, "    Hotkey F{n}");
+            }
+            let when = clean(&snippet.when);
+            if !when.is_empty() {
+                let _ = writeln!(out, "    When {when}");
+            }
             for l in &snippet.lines {
                 let _ = writeln!(out, "    Line {}", clean(l));
             }
@@ -810,6 +867,16 @@ Snippet Show interfaces
     Line show ip int brief | include up
 Snippet
     Line lost
+Snippet "Next page"
+    Hosts sw-* core-?
+    Folder Lab gear
+    Hotkey f3
+    When  --More-- 
+    Line @key space
+Snippet "Bad key"
+    Hotkey F13
+    Line x
+AutoResponses no
 Profile router
     Type Telnet
 NewKeyword later
@@ -894,14 +961,33 @@ NewKeyword later
         );
         assert_eq!(
             s.snippets,
-            [Snippet {
-                name: "Show interfaces".into(),
-                lines: vec![
-                    "terminal length 0".into(),
-                    "show ip int brief | include up".into()
-                ],
-            }]
+            [
+                Snippet {
+                    name: "Show interfaces".into(),
+                    lines: vec![
+                        "terminal length 0".into(),
+                        "show ip int brief | include up".into()
+                    ],
+                    ..Snippet::default()
+                },
+                Snippet {
+                    name: "Next page".into(),
+                    lines: vec!["@key space".into()],
+                    hosts: vec!["sw-*".into(), "core-?".into()],
+                    folders: vec!["Lab gear".into()],
+                    hotkey: Some(3),
+                    when: "--More--".into(),
+                },
+                Snippet {
+                    name: "Bad key".into(),
+                    lines: vec!["x".into()],
+                    ..Snippet::default()
+                },
+            ]
         );
+        assert!(!s.auto_responses);
+        assert!(s.confirm_production, "on unless turned off");
+        assert!(Settings::default().auto_responses);
     }
 
     #[test]
@@ -949,11 +1035,18 @@ NewKeyword later
         s.snippets.push(Snippet {
             name: "x\nProfile w".into(),
             lines: vec!["ls\nProfile v".into()],
+            hosts: vec!["a\nProfile u".into()],
+            folders: vec!["b\nProfile t".into()],
+            when: "c\nProfile s".into(),
+            ..Snippet::default()
         });
         let text = s.to_text();
         assert!(!text.contains("\nProfile z"));
         assert!(!text.contains("\nProfile w"));
         assert!(!text.contains("\nProfile v"));
+        for p in ["u", "t", "s"] {
+            assert!(!text.contains(&format!("\nProfile {p}")));
+        }
         let back = Settings::parse(&text);
         assert_eq!(back.profiles.len(), 2);
         assert_eq!(back.profiles[0].theme.as_deref(), Some("ab"));
