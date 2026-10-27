@@ -478,7 +478,9 @@ impl SessionForm {
             if self.open[2] {
                 let n = self.values.login_script.len();
                 out.extend((0..n).map(|i| Item::Field(Field::LoginStep(i))));
-                out.push(Item::Note("expect, send, password, secret, pause".into()));
+                out.push(Item::Note(
+                    "expect, send, type, key, password, secret, pause".into(),
+                ));
             }
         }
         if let Some(e) = &self.error {

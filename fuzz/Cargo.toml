@@ -152,3 +152,10 @@ path = "fuzz_targets/sanitize.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "trigger_feed"
+path = "fuzz_targets/trigger_feed.rs"
+test = false
+doc = false
+bench = false

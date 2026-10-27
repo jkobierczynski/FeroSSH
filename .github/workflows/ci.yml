@@ -302,3 +302,4 @@ jobs:
       - run: cargo +nightly fuzz run --target x86_64-unknown-linux-gnu ssh_transport -- -max_total_time=60 -dict=fuzz/dicts/ssh_transport.dict
       - run: cargo +nightly fuzz run --target x86_64-unknown-linux-gnu login_script -- -max_total_time=60
       - run: cargo +nightly fuzz run --target x86_64-unknown-linux-gnu sanitize -- -max_total_time=60
+      - run: cargo +nightly fuzz run --target x86_64-unknown-linux-gnu trigger_feed -- -max_total_time=60

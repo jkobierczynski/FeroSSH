@@ -41,6 +41,7 @@ jobs:
           - ssh_transport
           - login_script
           - sanitize
+          - trigger_feed
     steps:
       - uses: actions/checkout@v4
       - run: rustup toolchain install nightly --profile minimal

@@ -40,9 +40,9 @@ fuzz_target!(|data: &[u8]| {
         .take(16)
         .collect();
     let mut expected = steps.iter().filter_map(|s| match s {
-        Step::Send(text) => Some(format!("{text}\r")),
-        Step::Password | Step::Secret(_) => Some(format!("{SECRET}\r")),
-        Step::Expect(_) | Step::Pause(_) => None,
+        Step::Send(_) | Step::Type(_) | Step::Key(_) => s.bytes(),
+        Step::Password | Step::Secret(_) => Some(format!("{SECRET}\r").into_bytes()),
+        Step::Expect(_) | Step::Capture(_) | Step::Pause(_) => None,
     });
 
     let start = Instant::now();
@@ -58,11 +58,7 @@ fuzz_target!(|data: &[u8]| {
             match action {
                 Action::Send(bytes) => {
                     let want = expected.next();
-                    assert_eq!(
-                        want.as_deref().map(str::as_bytes),
-                        Some(&bytes[..]),
-                        "typed out of turn"
-                    );
+                    assert_eq!(want.as_deref(), Some(&bytes[..]), "typed out of turn");
                 }
                 // Half the secrets come from a store, half are typed at
                 // the pane's prompt.
@@ -71,6 +67,11 @@ fuzz_target!(|data: &[u8]| {
                     pending.extend(runner.ask("Secret: ", None));
                     pending.extend(runner.prompt_input(SECRET.as_bytes(), now));
                     pending.extend(runner.prompt_input(b"\r", now));
+                }
+                // A captured value is one short line.
+                Action::Captured(value) => {
+                    assert!(value.chars().count() <= ferossh_config::login::MAX_VALUE);
+                    assert!(!value.chars().any(char::is_control));
                 }
                 Action::Show(_) | Action::Save(..) | Action::Done => {}
             }

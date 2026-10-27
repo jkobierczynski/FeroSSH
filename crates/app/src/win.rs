@@ -20,10 +20,13 @@ use std::time::{Duration, Instant};
 
 use ferossh_auth::Broker;
 use ferossh_config::import::{self, Client};
+use ferossh_config::login::{self, Place, Step};
 use ferossh_config::password::{self as pw_source, PasswordSource};
+use ferossh_config::record::Recorder;
 use ferossh_config::saved::{self, SavedHost};
 use ferossh_config::serial::{self, SerialTarget};
 use ferossh_config::settings::{DEFAULT_DESKTOP_PORT, DEFAULT_VNC_PORT};
+use ferossh_config::trigger::{Fire, Watch};
 use ferossh_config::{
     ForwardSpec, SessionKind, Settings, mobaxterm, mremoteng, putty, securecrt, ssh_config, winscp,
 };
@@ -104,7 +107,7 @@ use crate::import_reg;
 use crate::import_view::{Found, ImportAction, ImportView};
 use crate::layout::{self, Axis, Closed, Dir, Drop, PaneId, Rect, Workspace};
 use crate::link::{Link, LinkEvent};
-use crate::login_script::{self, Need, Runner};
+use crate::login_script::{self, Need, Outcome, Runner};
 use crate::look;
 use crate::palette::{self, CommandPalette, PalAction};
 use crate::pattern;
@@ -116,7 +119,7 @@ use crate::scrollmark;
 use crate::serial_port::{Output as SerialOutput, SerialPort};
 use crate::session_form::{self, FormAction, Hints, SessionForm, Source, Values};
 use crate::sessions::{HostItem, SessionList, SideAction, SideKey};
-use crate::snippets_view::{SnipAction, SnippetsView};
+use crate::snippets_view::{Report, ReportRow, RowState, SnipAction, SnippetsView, Vars};
 use crate::ssh::{Effect, Env, ProxyCommand, SshSession, State, Target};
 use crate::tabstrip::{self, Forwarding, Health, Hit, Palette, StripLayout, TabLabel};
 use crate::telnet::{TelnetSession, TelnetTarget};
@@ -243,6 +246,7 @@ mod cmd {
     pub const COPY_ON_SELECT: u32 = 504;
     pub const RIGHT_CLICK_PASTE: u32 = 505;
     pub const SAVE_SNIPPET: u32 = 506;
+    pub const RECORD_SNIPPET: u32 = 507;
     pub const SCROLL_PAGE_UP: u32 = 510;
     pub const SCROLL_PAGE_DOWN: u32 = 511;
     pub const SCROLL_TOP: u32 = 512;
@@ -264,6 +268,8 @@ mod cmd {
     pub const DESKTOP_TAB: u32 = 615;
     pub const DESKTOP_TAB_RDP: u32 = 616;
     pub const RUN_SCRIPT: u32 = 617;
+    pub const AUTO_RESPONSES: u32 = 618;
+    pub const CONFIRM_PRODUCTION: u32 = 619;
     /// Plus the index in the session picker's list; the one past the
     /// last is "New session".
     pub const TMUX_SESSION: u32 = 800;
@@ -665,6 +671,13 @@ struct Window {
     /// What the side pane showed before the command palette, which comes
     /// back when the palette closes; `None` if it was hidden.
     palette_return: Option<SideView>,
+    /// Auto-response watches, by pane.
+    watches: HashMap<PaneId, Watch>,
+    /// Edit > Record keystrokes as snippet: the pane and what it typed.
+    recording: Option<(PaneId, Recorder)>,
+    /// Session folders by session name, for snippets kept to folders,
+    /// and when they were read.
+    folders: Option<(Instant, HashMap<String, String>)>,
 }
 
 /// A login script running in a pane.
@@ -674,6 +687,8 @@ struct ScriptRun {
     run: u64,
     /// Attach tmux once it is over, if the host's profile asks for that.
     tmux: bool,
+    /// A snippet run with a row in the snippets view's report.
+    report: bool,
 }
 
 /// What a password manager command gave a login script: the pane, the
@@ -1177,6 +1192,9 @@ fn create_and_run(launch: Launch, theme: Option<String>) -> Result<()> {
                 snippets_peek: false,
                 palette: CommandPalette::default(),
                 palette_return: None,
+                watches: HashMap::new(),
+                recording: None,
+                folders: None,
             });
         });
         // Files dropped from Explorer are uploaded, after a confirmation.
@@ -1305,6 +1323,16 @@ fn build_menu() -> Result<HMENU> {
         separator(session)?;
         item(session, cmd::SERIAL_BREAK, "Send &break (serial)")?;
         item(session, cmd::RUN_SCRIPT, "Run &login script again")?;
+        item(
+            session,
+            cmd::AUTO_RESPONSES,
+            "A&uto-responses from snippets",
+        )?;
+        item(
+            session,
+            cmd::CONFIRM_PRODUCTION,
+            "Confirm snippets on &Production hosts",
+        )?;
         separator(session)?;
         item(session, cmd::DESKTOP, "Open remote &desktop\tCtrl+Shift+D")?;
         if cfg!(feature = "rdp-viewer") {
@@ -1329,6 +1357,7 @@ fn build_menu() -> Result<HMENU> {
         item(edit, cmd::FIND, "&Find in scrollback\tCtrl+Shift+F")?;
         item(edit, cmd::CLEAR_SCROLLBACK, "C&lear scrollback")?;
         item(edit, cmd::SAVE_SNIPPET, "Sa&ve selection as snippet...")?;
+        item(edit, cmd::RECORD_SNIPPET, "Rec&ord keystrokes as snippet")?;
         separator(edit)?;
         item(edit, cmd::COPY_ON_SELECT, "Copy on &select")?;
         item(edit, cmd::RIGHT_CLICK_PASTE, "&Right-click pastes")?;
@@ -1769,6 +1798,7 @@ impl Window {
                         p.term.feed(&bytes);
                     }
                     self.log(gateway, &bytes);
+                    self.watch_output(gateway, &bytes);
                 }
                 tmux::Action::Create {
                     native,
@@ -1782,6 +1812,7 @@ impl Window {
                         p.term.feed(&bytes);
                     }
                     self.log(native, &bytes);
+                    self.watch_output(native, &bytes);
                 }
                 tmux::Action::Resize { native, cols, rows } => {
                     if let Some(p) = self.panes.get_mut(&native) {
@@ -3629,6 +3660,7 @@ impl Window {
                 runner,
                 run: self.script_runs,
                 tmux,
+                report: false,
             },
         );
         self.script_actions(id, actions);
@@ -3698,14 +3730,38 @@ impl Window {
                 login_script::Action::Show(text) => self.show(id, &text),
                 login_script::Action::Fetch(need) => self.fetch_secret(id, need),
                 login_script::Action::Save(name, secret) => self.save_secret(id, &name, &secret),
+                login_script::Action::Captured(value) => {
+                    if let Some(row) = self.snippets_view.report_mut().and_then(|r| r.row_mut(id)) {
+                        row.values.push(value);
+                    }
+                }
                 login_script::Action::Done => {
-                    if let Some(run) = self.scripts.remove(&id)
-                        && run.tmux
-                    {
-                        self.tmux_after_login(id);
+                    if let Some(run) = self.scripts.remove(&id) {
+                        if run.report
+                            && let Some(row) =
+                                self.snippets_view.report_mut().and_then(|r| r.row_mut(id))
+                        {
+                            row.state = match run.runner.outcome() {
+                                Some(Outcome::Failed(why)) => RowState::Failed(why.clone()),
+                                Some(Outcome::Stopped) => RowState::Stopped,
+                                _ => RowState::Done,
+                            };
+                        }
+                        if run.tmux {
+                            self.tmux_after_login(id);
+                        }
                     }
                 }
             }
+        }
+        if let Some(run) = self.scripts.get(&id)
+            && run.report
+            && let Some(row) = self.snippets_view.report_mut().and_then(|r| r.row_mut(id))
+        {
+            row.state = RowState::Running(run.runner.waiting_for());
+        }
+        if self.snippets_view.reporting() {
+            self.refresh_chrome();
         }
         self.arm_script_timer();
         self.refresh(id);
@@ -4106,6 +4162,15 @@ impl Window {
                 return;
             }
         }
+        // Typing starts paused auto-responses again, and is recorded.
+        if let Some(w) = self.watches.get_mut(&id) {
+            w.resume();
+        }
+        if let Some((pane, rec)) = &mut self.recording
+            && *pane == id
+        {
+            rec.input(&bytes);
+        }
         let enter = matches!(bytes.as_slice(), b"\r" | b"\r\n" | b"\n");
         let Some(p) = self.panes.get_mut(&id) else {
             return;
@@ -4341,6 +4406,7 @@ impl Window {
                         }
                         self.log(id, &data);
                         self.script_output(id, &data);
+                        self.watch_output(id, &data);
                     }
                     SerialOutput::Closed(why) => {
                         self.stop_log(id);
@@ -5255,6 +5321,21 @@ impl Window {
         if mods.alt && vk == VK_F4 {
             return KeyOutcome::Default;
         }
+        // Ctrl+Shift+F1 to F12: the snippet with that hotkey, if there is
+        // one for this host; otherwise the key goes on.
+        if mods.ctrl
+            && mods.shift
+            && !mods.alt
+            && (0x70..0x70 + u16::from(login::MAX_HOTKEY)).contains(&vk.0)
+            && let Ok(n) = u8::try_from(vk.0 - 0x6f)
+            && let Some(command) = self.snippet_hotkey(n)
+        {
+            drop_pending_char(self.hwnd);
+            return match command {
+                Some(c) => KeyOutcome::Run(c),
+                None => KeyOutcome::Handled,
+            };
+        }
         let split = self.ws.tab().is_some_and(|t| t.root.panes().len() > 1);
         if let Some(id) = shortcut(vk, mods, self.ws.tabs.len() > 1, split) {
             drop_pending_char(self.hwnd);
@@ -5416,7 +5497,10 @@ impl Window {
             Some(SnipAction::Send { name, lines, enter }) => {
                 out = self.send_snippet(&name, &lines, enter);
             }
-            Some(SnipAction::Type { lines, enter }) => out = self.type_snippet(&lines, enter),
+            Some(SnipAction::Type { name, steps }) => out = self.type_snippet(&name, steps),
+            Some(SnipAction::Copy(text)) => {
+                clipboard::set_text(self.hwnd, &text);
+            }
             Some(SnipAction::Save { index, snippet }) => {
                 let all = &mut self.settings.snippets;
                 let at = match index.filter(|&i| i < all.len()) {
@@ -5468,11 +5552,13 @@ impl Window {
                 .iter()
                 .map(|h| palette::Entry::session(&h.name, &h.detail, h.kind)),
         );
+        let place = self.place(self.focused_id()).map(|p| p.0);
         entries.extend(
             self.settings
                 .snippets
                 .iter()
                 .enumerate()
+                .filter(|(_, s)| s.applies(place.as_ref()))
                 .map(|(i, s)| palette::Entry::snippet(i, &s.name, &s.lines)),
         );
         self.palette.open(entries);
@@ -5542,16 +5628,19 @@ impl Window {
     /// Types snippet `name` (see [`Self::type_snippet`]); one with
     /// arguments first asks for them in the snippets view.
     fn send_snippet(&mut self, name: &str, lines: &[String], enter: bool) -> Option<Command> {
-        if !self.takes_broadcast(self.focused_id()) {
+        let id = self.focused_id();
+        if !self.takes_broadcast(id) {
             return Some(Command::Notice(
                 "Snippets are typed into a pane with a running shell or console; this \
                  pane has none, or is at a prompt."
                     .into(),
             ));
         }
-        if let Some(SnipAction::Type { lines, enter }) = self.snippets_view.send(name, lines, enter)
+        let vars = self.vars(id, lines, true);
+        if let Some(SnipAction::Type { name, steps }) =
+            self.snippets_view.send(name, lines, enter, vars)
         {
-            return self.type_snippet(&lines, enter);
+            return self.type_snippet(&name, steps);
         }
         if self.side.visible && self.side.view == SideView::Snippets {
             self.side.focused = true;
@@ -5565,10 +5654,10 @@ impl Window {
         None
     }
 
-    /// Types a snippet's lines, arguments filled in, into the focused
-    /// pane and the panes broadcast input reaches, each line ending with
-    /// Enter (the last one only with `enter`).
-    fn type_snippet(&mut self, lines: &[String], enter: bool) -> Option<Command> {
+    /// Types a snippet's steps, arguments and variables filled in, into
+    /// the focused pane and the panes broadcast input reaches; asks first
+    /// when one of them has the Production theme.
+    fn type_snippet(&mut self, name: &str, steps: Vec<Step>) -> Option<Command> {
         let id = self.focused_id();
         if !self.takes_broadcast(id) {
             return Some(Command::Notice(
@@ -5577,15 +5666,303 @@ impl Window {
                     .into(),
             ));
         }
-        self.leave_snippets();
-        let mut text = lines.join("\r");
-        if enter {
-            text.push('\r');
+        let mut panes = vec![id];
+        panes.extend(self.broadcast_targets(id));
+        let red: Vec<PaneId> = panes
+            .iter()
+            .copied()
+            .filter(|p| {
+                self.panes
+                    .get(p)
+                    .is_some_and(|p| p.theme.name == "Production")
+            })
+            .collect();
+        let production: Vec<String> = red.into_iter().map(|p| self.pane_label(p)).collect();
+        if self.settings.confirm_production && !production.is_empty() {
+            return Some(Command::ConfirmSnippet {
+                name: name.to_owned(),
+                steps,
+                panes,
+                production,
+            });
         }
-        let bytes = text.into_bytes();
-        let targets = self.broadcast_targets(id);
-        self.input(id, bytes.clone());
-        self.send_typed(&targets, &Typed::Bytes(bytes));
+        self.run_snippet(name, steps, &panes)
+    }
+
+    /// Types `steps` into `panes`: at once when none waits, else as a run
+    /// in each pane, with a live report when it runs in several or
+    /// captures values.
+    fn run_snippet(&mut self, name: &str, steps: Vec<Step>, panes: &[PaneId]) -> Option<Command> {
+        self.leave_snippets();
+        let capture = steps.iter().any(|s| matches!(s, Step::Capture(_)));
+        if !capture && let Some(bytes) = login::steps_bytes(&steps) {
+            for &p in panes {
+                self.input(p, bytes.clone());
+            }
+            return None;
+        }
+        let report = capture || panes.len() > 1;
+        let mut rows = Vec::new();
+        for &p in panes {
+            let label = self.pane_label(p);
+            if self.scripts.contains_key(&p) {
+                rows.push(ReportRow {
+                    pane: p,
+                    label,
+                    state: RowState::Failed("a login script or snippet runs there".into()),
+                    values: Vec::new(),
+                });
+                continue;
+            }
+            rows.push(ReportRow {
+                pane: p,
+                label,
+                state: RowState::Running(None),
+                values: Vec::new(),
+            });
+        }
+        if report {
+            if !(self.side.visible && self.side.view == SideView::Snippets) {
+                let peek = !self.side.visible;
+                self.show_side(SideView::Snippets, true);
+                self.snippets_peek = peek;
+            } else {
+                self.side.focused = true;
+            }
+            self.snippets_view.show_report(Report {
+                name: name.to_owned(),
+                rows,
+            });
+        }
+        let what = format!("the snippet {name}");
+        for &p in panes {
+            if self.scripts.contains_key(&p) {
+                continue;
+            }
+            if let Some(w) = self.watches.get_mut(&p) {
+                w.resume();
+            }
+            self.script_runs += 1;
+            let mut runner = Runner::named(&what, steps.clone());
+            let actions = runner.start(Instant::now());
+            self.scripts.insert(
+                p,
+                ScriptRun {
+                    runner,
+                    run: self.script_runs,
+                    tmux: false,
+                    report,
+                },
+            );
+            self.script_actions(p, actions);
+        }
+        self.refresh_chrome();
+        None
+    }
+
+    /// Ctrl+Shift+F`n`: the first snippet with that hotkey for the
+    /// focused pane's host; `None` when there is none.
+    fn snippet_hotkey(&mut self, n: u8) -> Option<Option<Command>> {
+        let place = self.place(self.focused_id()).map(|p| p.0);
+        let s = self
+            .settings
+            .snippets
+            .iter()
+            .find(|s| s.hotkey == Some(n) && s.applies(place.as_ref()))?
+            .clone();
+        Some(self.send_snippet(&s.name, &s.lines, true))
+    }
+
+    /// A short name for pane `id`'s host, for the report.
+    fn pane_label(&mut self, id: PaneId) -> String {
+        match self.place(id) {
+            Some((place, ..)) if !place.session.is_empty() => place.session,
+            _ => format!("pane {id}"),
+        }
+    }
+
+    /// Where pane `id` is connected, with its user and port.
+    fn place(&mut self, id: PaneId) -> Option<(Place, String, u16)> {
+        let (session, host, user, port) = match &self.panes.get(&id)?.host {
+            Host::Ssh(s) => (
+                s.target.alias.clone(),
+                s.target.hostname.clone(),
+                s.target.user.clone(),
+                s.target.port,
+            ),
+            Host::Telnet(s) => (
+                s.target.alias.clone(),
+                s.target.hostname.clone(),
+                String::new(),
+                s.target.port,
+            ),
+            Host::Serial {
+                target, session, ..
+            } => (
+                session.clone().unwrap_or_else(|| target.port.clone()),
+                target.port.clone(),
+                String::new(),
+                0,
+            ),
+            Host::Tmux { gateway, .. } => {
+                let gateway = *gateway;
+                return self.place(gateway);
+            }
+            _ => return None,
+        };
+        let folder = self.folder_of(&session);
+        Some((
+            Place {
+                session,
+                host,
+                folder,
+            },
+            user,
+            port,
+        ))
+    }
+
+    /// Session `name`'s folder in the session manager, read again from
+    /// ssh_config at most every half minute.
+    fn folder_of(&mut self, name: &str) -> Option<String> {
+        if self
+            .folders
+            .as_ref()
+            .is_none_or(|(at, _)| at.elapsed() > Duration::from_secs(30))
+        {
+            let env = ssh_env();
+            let map = host_items(&env, &self.settings)
+                .into_iter()
+                .filter_map(|h| Some((h.name, h.folder?)))
+                .collect();
+            self.folders = Some((Instant::now(), map));
+        }
+        self.folders.as_ref()?.1.get(name).cloned()
+    }
+
+    /// The variables' values in pane `id`; the clipboard is read only
+    /// when `lines` use it and `clipboard` allows it.
+    fn vars(&mut self, id: PaneId, lines: &[String], clipboard: bool) -> Vars {
+        let (y, mo, d, h, mi, sec) = local_time();
+        let mut vars: Vars = vec![
+            ("date", format!("{y:04}-{mo:02}-{d:02}")),
+            ("time", format!("{h:02}:{mi:02}:{sec:02}")),
+            (
+                "stamp",
+                format!("{y:04}{mo:02}{d:02}-{h:02}{mi:02}{sec:02}"),
+            ),
+        ];
+        if let Some((place, user, port)) = self.place(id) {
+            vars.push(("session", place.session));
+            vars.push(("host", place.host));
+            vars.push(("user", user));
+            if port != 0 {
+                vars.push(("port", port.to_string()));
+            }
+        }
+        if clipboard && login::uses_var(lines, "clipboard") {
+            vars.push((
+                "clipboard",
+                clipboard::get_text(self.hwnd).unwrap_or_default(),
+            ));
+        }
+        vars
+    }
+
+    /// What pane `id`'s host printed, for auto-responses and a recording.
+    fn watch_output(&mut self, id: PaneId, bytes: &[u8]) {
+        if let Some((pane, rec)) = &mut self.recording
+            && *pane == id
+        {
+            rec.output(bytes);
+        }
+        // A running script or snippet owns the pane's answers.
+        if !self.settings.auto_responses
+            || self.scripts.contains_key(&id)
+            || !self.settings.snippets.iter().any(|s| !s.when.is_empty())
+        {
+            self.watches.remove(&id);
+            return;
+        }
+        let place = self.place(id).map(|p| p.0);
+        let whens: Vec<(usize, &str)> = self
+            .settings
+            .snippets
+            .iter()
+            .enumerate()
+            .filter(|(_, s)| {
+                !s.when.is_empty() && s.auto_problem().is_none() && s.applies(place.as_ref())
+            })
+            .map(|(i, s)| (i, s.when.as_str()))
+            .collect();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX));
+        let fires = self.watches.entry(id).or_default().feed(bytes, &whens, now);
+        for fire in fires {
+            match fire {
+                Fire::Snippet(i) => {
+                    let Some(s) = self.settings.snippets.get(i).cloned() else {
+                        continue;
+                    };
+                    // No clipboard: the host decides when this types.
+                    let vars = self.vars(id, &s.lines, false);
+                    let steps = login::expand(
+                        &s.lines,
+                        true,
+                        |_| String::new(),
+                        |n| {
+                            vars.iter()
+                                .find(|(k, _)| *k == n)
+                                .map(|(_, v)| v.clone())
+                                .unwrap_or_default()
+                        },
+                    );
+                    if let Some(bytes) = login::steps_bytes(&steps) {
+                        self.send(id, bytes);
+                    }
+                }
+                Fire::Paused => self.show(
+                    id,
+                    "\r\n\x1b[0;90m[Auto-responses paused: the host asked too often. They \
+                     start again when you type.]\x1b[0m\r\n",
+                ),
+            }
+        }
+    }
+
+    /// Edit > Record keystrokes as snippet: starts recording the focused
+    /// pane's typing, or stops and opens the recording in the snippets
+    /// view to name and check.
+    fn toggle_recording(&mut self) -> Option<Command> {
+        if let Some((pane, rec)) = self.recording.take() {
+            self.show(pane, "\x1b[0;90m[Recording stopped]\x1b[0m\r\n");
+            self.refresh(pane);
+            self.update_menu_checks();
+            let rec = rec.finish();
+            if rec.lines.is_empty() {
+                return Some(Command::Notice("Nothing was typed while recording.".into()));
+            }
+            self.snippets_view.new_recorded(rec);
+            self.show_side(SideView::Snippets, true);
+            self.snippets_peek = false;
+            self.refresh_chrome();
+            return None;
+        }
+        let id = self.focused_id();
+        if !self.takes_broadcast(id) {
+            return Some(Command::Notice(
+                "Recording takes typing in a pane with a running shell or console.".into(),
+            ));
+        }
+        self.recording = Some((id, Recorder::default()));
+        self.show(
+            id,
+            "\x1b[0;90m[Recording keystrokes as a snippet. Edit > Record keystrokes as snippet \
+             again stops it.]\x1b[0m\r\n",
+        );
+        self.refresh(id);
+        self.update_menu_checks();
         None
     }
 
@@ -6053,7 +6430,12 @@ impl Window {
             SideView::Files => self.ensure_sftp(self.focused_id()),
             SideView::Forwards | SideView::Palette => {}
             SideView::Snippets => {
-                if !self.snippets_view.editing() && !self.snippets_view.asking() {
+                let place = self.place(self.focused_id()).map(|p| p.0);
+                self.snippets_view.set_place(place);
+                if !self.snippets_view.editing()
+                    && !self.snippets_view.asking()
+                    && !self.snippets_view.reporting()
+                {
                     self.snippets_view.reset();
                 }
             }
@@ -6913,6 +7295,18 @@ impl Window {
             cmd::HIDE_MENU => return Some(Command::SetMenuVisible(!self.menu_visible)),
             cmd::COPY => return Some(Command::Copy),
             cmd::PASTE => return Some(Command::Paste),
+            cmd::RECORD_SNIPPET => return self.toggle_recording(),
+            cmd::AUTO_RESPONSES => {
+                self.settings.auto_responses = !self.settings.auto_responses;
+                self.watches.clear();
+                self.save_settings();
+                self.update_menu_checks();
+            }
+            cmd::CONFIRM_PRODUCTION => {
+                self.settings.confirm_production = !self.settings.confirm_production;
+                self.save_settings();
+                self.update_menu_checks();
+            }
             cmd::SAVE_SNIPPET => {
                 let text = self
                     .panes
@@ -7398,6 +7792,9 @@ impl Window {
                 (cmd::LOG_TOGGLE, log),
                 (cmd::LOG_RAW, raw),
                 (cmd::LOG_TIMESTAMPS, s.log_timestamps),
+                (cmd::AUTO_RESPONSES, s.auto_responses),
+                (cmd::CONFIRM_PRODUCTION, s.confirm_production),
+                (cmd::RECORD_SNIPPET, self.recording.is_some()),
                 (
                     cmd::SESSIONS,
                     self.side.visible && self.side.view == SideView::Sessions,
@@ -8013,6 +8410,15 @@ enum Command {
     DeleteSession(String),
     /// Ask, then remove the snippet at this index.
     DeleteSnippet(usize),
+    /// A snippet is about to go to a pane with the Production theme: asks
+    /// first.
+    ConfirmSnippet {
+        name: String,
+        steps: Vec<Step>,
+        panes: Vec<PaneId>,
+        /// The Production panes' hosts.
+        production: Vec<String>,
+    },
     /// Ask before a password manager command gets a login script's
     /// secret the first time (`name`; `None` is the login password).
     ConfirmSecretTool {
@@ -8595,6 +9001,34 @@ fn run_command(hwnd: HWND, command: Command) {
                     MB_ICONWARNING
                 };
                 dialog(hwnd, &text, MB_OK | icon);
+            }
+        }
+        Command::ConfirmSnippet {
+            name,
+            steps,
+            panes,
+            production,
+        } => {
+            let shown: Vec<String> = steps
+                .iter()
+                .take(8)
+                .map(|s| match s {
+                    Step::Send(t) | Step::Type(t) => t.clone(),
+                    other => format!("@{other}"),
+                })
+                .map(|l| l.chars().filter(|c| !c.is_control()).take(100).collect())
+                .collect();
+            let more = if steps.len() > 8 { "\n..." } else { "" };
+            let text = format!(
+                "Type the snippet {name} into {}, which {} the Production theme?\n\n{}{more}",
+                production.join(", "),
+                if production.len() == 1 { "has" } else { "have" },
+                shown.join("\n"),
+            );
+            if dialog(hwnd, &text, MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2) == Some(IDYES)
+                && let Some(next) = with_window(|w| w.run_snippet(&name, steps, &panes)).flatten()
+            {
+                run_command(hwnd, next);
             }
         }
         Command::DeleteSnippet(index) => {
