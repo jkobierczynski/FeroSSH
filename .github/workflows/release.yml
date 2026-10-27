@@ -40,6 +40,21 @@ jobs:
             echo "::error::docs/releases/$tag.md is missing; the release notes come from there"
             exit 1
           fi
+      # Signs a throwaway update file, so a secret that does not match
+      # crates/update/update-key.pub (or a missing public key) fails here,
+      # not after the half-hour build.
+      - name: Check the update signing key
+        env:
+          UPDATE_SIGNING_KEY: ${{ secrets.UPDATE_SIGNING_KEY }}
+        run: |
+          if [ -z "$UPDATE_SIGNING_KEY" ]; then
+            echo "No UPDATE_SIGNING_KEY secret: the release will have no update file."
+            exit 0
+          fi
+          if ! cargo run --locked -q -p ferossh-update --example sign -- 0.0.0 2000-01-01 "$RUNNER_TEMP" > /dev/null; then
+            echo "::error::UPDATE_SIGNING_KEY and crates/update/update-key.pub do not go together; commit the public key from keygen, or fix the secret"
+            exit 1
+          fi
 
   # The same jobs as on a pull request: Windows build and tests, the Linux
   # SSH, tmux, desktop viewer and interop tests, cargo deny, cargo audit and
