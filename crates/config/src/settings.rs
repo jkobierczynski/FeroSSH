@@ -232,6 +232,9 @@ pub struct Settings {
     /// Snippets with a `When` text answer the host by themselves. On
     /// unless turned off.
     pub auto_responses: bool,
+    /// Hosts a snippet run on picked hosts logs in to at once (1 to 16);
+    /// `None` is the default, 4. The last number picked is kept.
+    pub run_parallel: Option<usize>,
 }
 
 /// Scrollback is capped here, as the terminal caps it.
@@ -268,6 +271,7 @@ impl Default for Settings {
             snippets: Vec::new(),
             confirm_production: true,
             auto_responses: true,
+            run_parallel: None,
         }
     }
 }
@@ -443,6 +447,12 @@ impl Settings {
                 "autoresponses" => {
                     block = Block::Top;
                     s.auto_responses = yes(&args).unwrap_or(true);
+                }
+                "runparallel" => {
+                    block = Block::Top;
+                    s.run_parallel = first
+                        .and_then(|v| v.parse::<usize>().ok())
+                        .map(|n| n.clamp(1, 16));
                 }
                 "x11display" => {
                     block = Block::Top;
@@ -632,6 +642,9 @@ impl Settings {
         let _ = writeln!(out, "FollowDirectory {}", flag(self.follow_directory));
         let _ = writeln!(out, "ConfirmProduction {}", flag(self.confirm_production));
         let _ = writeln!(out, "AutoResponses {}", flag(self.auto_responses));
+        if let Some(n) = self.run_parallel {
+            let _ = writeln!(out, "RunParallel {n}");
+        }
         if let Some(d) = &self.x11_display {
             let _ = writeln!(out, "X11Display {}", arg(d));
         }
@@ -877,6 +890,7 @@ Snippet "Bad key"
     Hotkey F13
     Line x
 AutoResponses no
+RunParallel 40
 Profile router
     Type Telnet
 NewKeyword later
@@ -988,6 +1002,8 @@ NewKeyword later
         assert!(!s.auto_responses);
         assert!(s.confirm_production, "on unless turned off");
         assert!(Settings::default().auto_responses);
+        assert_eq!(s.run_parallel, Some(16), "at most 16");
+        assert_eq!(Settings::default().run_parallel, None);
     }
 
     #[test]

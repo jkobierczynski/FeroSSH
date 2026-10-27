@@ -655,6 +655,20 @@ impl SshSession {
         }
     }
 
+    /// What the open prompt asks for, in a few words ("a password"), as
+    /// a snippet run on picked hosts reports it.
+    pub fn prompt_asks(&self) -> Option<&'static str> {
+        if let Some(h) = self.active_hop().and_then(|i| self.hops.get(i)) {
+            return h.session.prompt_asks();
+        }
+        Some(match &self.prompt.as_ref()?.purpose {
+            Purpose::TrustHostKey { .. } => "an unknown host key",
+            Purpose::Answer { password: true, .. } => "a password",
+            Purpose::Answer { .. } => "an answer",
+            Purpose::Passphrase { .. } => "a key passphrase",
+        })
+    }
+
     /// The host key that blocked the connection, if one did: this host's
     /// or a jump host's.
     pub fn changed_key(&self) -> Option<&[u8]> {
@@ -2085,6 +2099,7 @@ mod tests {
         assert!(sent(&fx).is_empty());
         assert!(shown(&fx).contains("SHA256:vWYvpuNm8Qqc7Z0RA0GFQtnBKGWwNkzadS6MX5uwbZ4"));
         assert!(s.prompt_active());
+        assert_eq!(s.prompt_asks(), Some("an unknown host key"));
         s.prompt_input(b"y");
         s.prompt_input(b"e");
         s.prompt_input(b"s");
@@ -2588,6 +2603,7 @@ mod tests {
         let fx = s.on_worker(password_prompt(1));
         assert!(matches!(fx[..], [Effect::FetchPassword]), "{fx:?}");
         assert!(s.fetching_password() && !s.prompt_active());
+        assert_eq!(s.prompt_asks(), None);
         let fx = s.password_fetched(Ok(Zeroizing::new("s3cret".into())), "1Password");
         assert!(shown(&fx).contains("Password from 1Password."));
         assert!(!shown(&fx).contains("s3cret"));
@@ -2596,6 +2612,7 @@ mod tests {
         let fx = s.on_worker(password_prompt(1));
         assert!(shown(&fx).contains("did not work"));
         assert!(s.prompt_active());
+        assert_eq!(s.prompt_asks(), Some("a password"));
         s.prompt_input(b"typed");
         assert_eq!(answers(&s.prompt_input(b"\r")), ["typed"]);
     }

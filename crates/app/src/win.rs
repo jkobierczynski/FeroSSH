@@ -10,7 +10,7 @@
 #![allow(unsafe_code)]
 
 use std::cell::{Cell as StdCell, RefCell};
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::ffi::c_void;
 use std::fs::File;
 use std::path::{Path, PathBuf};
@@ -93,6 +93,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 use windows::core::{HSTRING, PCWSTR, PWSTR, Result, w};
 
 use crate::Launch;
+use crate::batch::{self, PickHost, Picker, Report, ReportRow, RowState, Run};
 use crate::broadcast;
 use crate::clipboard;
 use crate::conpty::{self, Output, Shell};
@@ -119,7 +120,7 @@ use crate::scrollmark;
 use crate::serial_port::{Output as SerialOutput, SerialPort};
 use crate::session_form::{self, FormAction, Hints, SessionForm, Source, Values};
 use crate::sessions::{HostItem, SessionList, SideAction, SideKey};
-use crate::snippets_view::{Report, ReportRow, RowState, SnipAction, SnippetsView, Vars};
+use crate::snippets_view::{self, SnipAction, SnippetsView, Vars};
 use crate::ssh::{Effect, Env, ProxyCommand, SshSession, State, Target};
 use crate::tabstrip::{self, Forwarding, Health, Hit, Palette, StripLayout, TabLabel};
 use crate::telnet::{TelnetSession, TelnetTarget};
@@ -179,6 +180,8 @@ const TIMER_RETIRE: usize = 4;
 const TIMER_SCRIPT: usize = 5;
 /// Checks for SSH panes due to reconnect after a dropped connection.
 const TIMER_RECONNECT: usize = 6;
+/// Fails the hosts of a snippet run that took too long.
+const TIMER_RUN: usize = 7;
 const RECONNECT_TICK_MS: u32 = 500;
 /// How long a worker whose connection nothing uses keeps running, so its
 /// last shell's close reaches the server as a clean disconnect.
@@ -678,6 +681,11 @@ struct Window {
     /// Session folders by session name, for snippets kept to folders,
     /// and when they were read.
     folders: Option<(Instant, HashMap<String, String>)>,
+    /// Sessions of a snippet run on picked hosts that no tab shows.
+    run_hidden: HashSet<PaneId>,
+    /// Sessions of a run still logging in: the snippet starts once they
+    /// are in.
+    run_login: HashSet<PaneId>,
 }
 
 /// A login script running in a pane.
@@ -1195,6 +1203,8 @@ fn create_and_run(launch: Launch, theme: Option<String>) -> Result<()> {
                 watches: HashMap::new(),
                 recording: None,
                 folders: None,
+                run_hidden: HashSet::new(),
+                run_login: HashSet::new(),
             });
         });
         // Files dropped from Explorer are uploaded, after a confirmation.
@@ -3051,6 +3061,17 @@ impl Window {
         session.legacy = legacy;
         session.password_source = source != PasswordSource::Ask;
         session.remember_password = source == PasswordSource::Windows;
+        if self.run_login.contains(&id) {
+            // A run never reconnects by itself, and the password typed
+            // for it answers the logins that have none saved.
+            session.auto_reconnect = false;
+            if self.run_password().is_some() {
+                session.password_source = true;
+                for hop in session.hops_mut() {
+                    hop.password_source = true;
+                }
+            }
+        }
         let Some(p) = self.panes.get_mut(&id) else {
             return;
         };
@@ -3275,6 +3296,8 @@ impl Window {
 
     /// Carries out what a pane's SSH session decided.
     fn apply(&mut self, id: PaneId, effects: Vec<Effect>) {
+        // A run's row that ended: the next host may start.
+        let mut pump = false;
         for effect in effects {
             match effect {
                 Effect::Send(msg) => {
@@ -3338,6 +3361,24 @@ impl Window {
                     port,
                     password,
                 } => self.store_password(id, (&user, &host, port), &password),
+                Effect::Connected
+                    if self.run_login.contains(&id) || self.run_hidden.contains(&id) =>
+                {
+                    // Only the login script and the snippet run: no
+                    // forwards, tmux or desktops for a run's sessions.
+                    self.retries.remove(&id);
+                    self.start_log(id);
+                    if self.run_login.contains(&id) {
+                        let alias = match self.panes.get(&id).map(|p| &p.host) {
+                            Some(Host::Ssh(s)) => s.target.alias.clone(),
+                            Some(Host::Telnet(s)) => s.target.alias.clone(),
+                            _ => String::new(),
+                        };
+                        if !self.start_script(id, &alias, false) {
+                            self.begin_run_snippet(id);
+                        }
+                    }
+                }
                 Effect::Connected if self.unencrypted(id) => {
                     // Nothing of SSH (SFTP, forwards, tmux, desktops)
                     // runs over Telnet; a login script does.
@@ -3368,6 +3409,14 @@ impl Window {
                 }
                 Effect::Reconnect => self.schedule_reconnect(id),
                 Effect::Ended => {
+                    if !self.run_login.contains(&id)
+                        && let Some(row) =
+                            self.snippets_view.report_mut().and_then(|r| r.row_mut(id))
+                        && !row.state.over()
+                    {
+                        row.state = RowState::Failed("the connection ended".into());
+                        pump = true;
+                    }
                     self.proxy_errors(id);
                     self.scripts.remove(&id);
                     self.zmodem.remove(&id);
@@ -3383,6 +3432,12 @@ impl Window {
                     self.refresh_chrome();
                 }
             }
+        }
+        if self.run_login.contains(&id) {
+            self.check_run_login(id);
+        }
+        if pump {
+            self.pump_run();
         }
     }
 
@@ -3519,6 +3574,13 @@ impl Window {
             .profile(&t.alias)
             .map(|p| p.password.clone())
             .unwrap_or_default();
+        if source == PasswordSource::Ask
+            && self.run_login.contains(&id)
+            && let Some(password) = self.run_password()
+        {
+            self.password_result(id, Ok(password), "the run");
+            return;
+        }
         match source {
             PasswordSource::Ask => {
                 self.password_result(id, Err(String::new()), "");
@@ -3749,6 +3811,20 @@ impl Window {
                         }
                         if run.tmux {
                             self.tmux_after_login(id);
+                        }
+                        if run.report {
+                            self.pump_run();
+                        } else if self.run_login.contains(&id) {
+                            // The login script of a run's host is over.
+                            match run.runner.outcome() {
+                                Some(Outcome::Failed(why)) => {
+                                    self.fail_run_row(id, format!("login script: {why}"));
+                                }
+                                Some(Outcome::Stopped) => {
+                                    self.fail_run_row(id, "the login script stopped".into());
+                                }
+                                _ => self.begin_run_snippet(id),
+                            }
                         }
                     }
                 }
@@ -5519,11 +5595,49 @@ impl Window {
                 self.snippets_view.saved(&self.settings.snippets, Some(at));
             }
             Some(SnipAction::Delete(i)) => out = Some(Command::DeleteSnippet(i)),
+            Some(SnipAction::PickHosts { name, lines }) => out = self.pick_hosts(&name, &lines),
+            Some(SnipAction::RunOn { name, hosts, run }) => out = self.run_on(name, hosts, run),
+            Some(SnipAction::ShowRow(id)) => out = self.show_run_pane(id),
+            Some(SnipAction::SaveCsv(text)) => {
+                let name = self
+                    .snippets_view
+                    .report()
+                    .map(|r| r.name.clone())
+                    .unwrap_or_default();
+                out = Some(Command::Notice(self.save_report(&name, &text)));
+            }
+            Some(SnipAction::Retry) => self.retry_run(),
+            Some(SnipAction::Cancel) => self.cancel_run(),
+            Some(SnipAction::CloseReport(report)) => self.close_report(&report),
             Some(SnipAction::Leave) => self.leave_snippets(),
             None => {}
         }
         self.refresh_chrome();
         out
+    }
+
+    /// Saves a report as CSV in the download folder; what happened.
+    fn save_report(&self, name: &str, text: &str) -> String {
+        let (y, mo, d, h, mi, sec) = local_time();
+        let name: String = name
+            .chars()
+            .map(|c| {
+                if c.is_alphanumeric() || c == '-' {
+                    c
+                } else {
+                    '_'
+                }
+            })
+            .take(60)
+            .collect();
+        let dir = self.download_dir();
+        let path = dir.join(format!(
+            "{name}-{y:04}{mo:02}{d:02}-{h:02}{mi:02}{sec:02}.csv"
+        ));
+        match std::fs::create_dir_all(&dir).and_then(|()| std::fs::write(&path, text)) {
+            Ok(()) => format!("Saved the report as {}.", path.display()),
+            Err(e) => format!("Could not save the report as {}: {e}", path.display()),
+        }
     }
 
     /// Ctrl+Shift+A: the command palette, on every menu action, session
@@ -5693,8 +5807,13 @@ impl Window {
     /// in each pane, with a live report when it runs in several or
     /// captures values.
     fn run_snippet(&mut self, name: &str, steps: Vec<Step>, panes: &[PaneId]) -> Option<Command> {
-        self.leave_snippets();
         let capture = steps.iter().any(|s| matches!(s, Step::Capture(_)));
+        if (capture || panes.len() > 1)
+            && let Some(notice) = self.run_still_open()
+        {
+            return Some(notice);
+        }
+        self.leave_snippets();
         if !capture && let Some(bytes) = login::steps_bytes(&steps) {
             for &p in panes {
                 self.input(p, bytes.clone());
@@ -5705,34 +5824,15 @@ impl Window {
         let mut rows = Vec::new();
         for &p in panes {
             let label = self.pane_label(p);
-            if self.scripts.contains_key(&p) {
-                rows.push(ReportRow {
-                    pane: p,
-                    label,
-                    state: RowState::Failed("a login script or snippet runs there".into()),
-                    values: Vec::new(),
-                });
-                continue;
-            }
-            rows.push(ReportRow {
-                pane: p,
-                label,
-                state: RowState::Running(None),
-                values: Vec::new(),
-            });
+            let state = if self.scripts.contains_key(&p) {
+                RowState::Failed("a login script or snippet runs there".into())
+            } else {
+                RowState::Running(None)
+            };
+            rows.push(ReportRow::new(&label, Some(p), state));
         }
         if report {
-            if !(self.side.visible && self.side.view == SideView::Snippets) {
-                let peek = !self.side.visible;
-                self.show_side(SideView::Snippets, true);
-                self.snippets_peek = peek;
-            } else {
-                self.side.focused = true;
-            }
-            self.snippets_view.show_report(Report {
-                name: name.to_owned(),
-                rows,
-            });
+            self.show_report(Report::new(name, rows, None));
         }
         let what = format!("the snippet {name}");
         for &p in panes {
@@ -5758,6 +5858,349 @@ impl Window {
         }
         self.refresh_chrome();
         None
+    }
+
+    /// Shows `report` in the snippets view, which takes the keyboard.
+    fn show_report(&mut self, report: Report) {
+        if !(self.side.visible && self.side.view == SideView::Snippets) {
+            let peek = !self.side.visible;
+            self.show_side(SideView::Snippets, true);
+            self.snippets_peek = peek;
+        } else {
+            self.side.focused = true;
+        }
+        self.snippets_view.show_report(report);
+    }
+
+    /// A notice when the report of a run on picked hosts is still open:
+    /// its sessions go only when it closes, so a new report waits.
+    fn run_still_open(&self) -> Option<Command> {
+        let r = self.snippets_view.report().filter(|r| r.run.is_some())?;
+        Some(Command::Notice(format!(
+            "The report of the run of {} is still open. Close it first: Escape in the \
+             snippets view (Ctrl+Shift+Space).",
+            r.name
+        )))
+    }
+
+    /// The password typed for the run on picked hosts, if one was.
+    fn run_password(&self) -> Option<Zeroizing<String>> {
+        let run = self.snippets_view.report()?.run.as_ref()?;
+        run.password.as_ref().map(|p| p.0.clone())
+    }
+
+    /// F5 in the snippets view: the page that picks the hosts to run
+    /// snippet `name` on. The hosts the snippet is kept to come picked.
+    fn pick_hosts(&mut self, name: &str, lines: &[String]) -> Option<Command> {
+        if let Some(notice) = self.run_still_open() {
+            return Some(notice);
+        }
+        let snippet = self
+            .settings
+            .snippets
+            .iter()
+            .find(|s| s.name == name)
+            .cloned()
+            .unwrap_or_default();
+        let env = ssh_env();
+        let hosts: Vec<PickHost> = host_items(&env, &self.settings)
+            .into_iter()
+            .filter(|h| h.kind == SessionKind::Ssh)
+            .map(|h| {
+                let host = Target::resolve(&h.name, &env)
+                    .map(|t| t.hostname)
+                    .unwrap_or_default();
+                let place = Place {
+                    session: h.name,
+                    host,
+                    folder: h.folder,
+                };
+                let picked = !snippet.everywhere() && snippet.applies(Some(&place));
+                PickHost {
+                    place,
+                    detail: h.detail,
+                    picked,
+                }
+            })
+            .collect();
+        if hosts.is_empty() {
+            return Some(Command::Notice(
+                "There are no saved SSH sessions to run the snippet on. Save the hosts in \
+                 the session manager first."
+                    .into(),
+            ));
+        }
+        let parallel = self
+            .settings
+            .run_parallel
+            .unwrap_or(batch::DEFAULT_PARALLEL);
+        self.snippets_view
+            .show_picker(Picker::new(name, lines, hosts, parallel));
+        None
+    }
+
+    /// Runs snippet `name` on `hosts`; asks first when one of them has
+    /// the Production theme.
+    fn run_on(&mut self, name: String, hosts: Vec<Place>, run: Run) -> Option<Command> {
+        if let Some(notice) = self.run_still_open() {
+            return Some(notice);
+        }
+        if self
+            .settings
+            .run_parallel
+            .unwrap_or(batch::DEFAULT_PARALLEL)
+            != run.parallel
+        {
+            self.settings.run_parallel = Some(run.parallel);
+            self.save_settings();
+        }
+        let env = ssh_env();
+        let production: Vec<String> = hosts
+            .iter()
+            .filter(|h| {
+                let tag = Target::resolve(&h.session, &env).and_then(|t| t.tag);
+                let (_, theme) = look::for_host(
+                    &self.settings,
+                    &h.session,
+                    &h.host,
+                    tag.as_deref(),
+                    &FontSpec::default(),
+                    &self.default_theme,
+                );
+                theme.name == "Production"
+            })
+            .map(|h| h.session.clone())
+            .collect();
+        if self.settings.confirm_production && !production.is_empty() {
+            return Some(Command::ConfirmRun {
+                name,
+                hosts,
+                run,
+                production,
+            });
+        }
+        self.start_run(&name, &hosts, run);
+        None
+    }
+
+    /// Starts the run of snippet `name` on `hosts`: its report opens and
+    /// the first hosts log in.
+    fn start_run(&mut self, name: &str, hosts: &[Place], run: Run) {
+        let rows = hosts
+            .iter()
+            .map(|h| ReportRow::new(&h.session, None, RowState::Queued))
+            .collect();
+        self.show_report(Report::new(name, rows, Some(run)));
+        self.pump_run();
+    }
+
+    /// Starts the queued hosts of the run there is room for, each in a
+    /// session of its own that no tab shows (a new channel on a
+    /// connection another pane already has to it).
+    fn pump_run(&mut self) {
+        let starts: Vec<(usize, String)> = match self.snippets_view.report_mut() {
+            Some(r) => r
+                .starting(Instant::now())
+                .into_iter()
+                .filter_map(|i| r.rows.get(i).map(|row| (i, row.label.clone())))
+                .collect(),
+            None => Vec::new(),
+        };
+        for (i, session) in starts {
+            let id = self.ws.alloc_id();
+            self.add_pane(id);
+            self.run_hidden.insert(id);
+            self.run_login.insert(id);
+            if let Some(row) = self
+                .snippets_view
+                .report_mut()
+                .and_then(|r| r.rows.get_mut(i))
+            {
+                row.pane = Some(id);
+            }
+            self.connect(id, &session);
+            self.check_run_login(id);
+        }
+        self.arm_run_timer();
+        self.refresh_chrome();
+    }
+
+    /// A run's host that is logging in: its row fails when the login
+    /// asks for anything (a host key, a password, a code) or ends. The
+    /// session stays, so it can be shown and answered by hand.
+    fn check_run_login(&mut self, id: PaneId) {
+        if !self.run_login.contains(&id) {
+            return;
+        }
+        let why = match self.panes.get(&id).map(|p| &p.host) {
+            Some(Host::Ssh(s)) => match s.state() {
+                State::Blocked => Some("the host key changed".to_owned()),
+                State::Ended => Some("could not connect or log in".to_owned()),
+                _ => s.prompt_asks().map(|what| format!("asked for {what}")),
+            },
+            Some(Host::Telnet(s)) if s.state() != State::Ended => None,
+            _ => Some("could not connect".to_owned()),
+        };
+        if let Some(why) = why {
+            self.fail_run_row(id, why);
+        }
+    }
+
+    /// Fails the row of a run's pane `id`; the next host may start.
+    fn fail_run_row(&mut self, id: PaneId, why: String) {
+        self.run_login.remove(&id);
+        self.scripts.remove(&id);
+        if let Some(row) = self.snippets_view.report_mut().and_then(|r| r.row_mut(id))
+            && !row.state.over()
+        {
+            row.state = RowState::Failed(why);
+        }
+        self.pump_run();
+    }
+
+    /// A run's host is logged in (its login script over): the snippet
+    /// starts there, its arguments and that host's variables filled in.
+    fn begin_run_snippet(&mut self, id: PaneId) {
+        self.run_login.remove(&id);
+        let Some((name, lines, args)) = self.snippets_view.report().and_then(|r| {
+            let run = r.run.as_ref()?;
+            Some((r.name.clone(), run.lines.clone(), run.args.clone()))
+        }) else {
+            return;
+        };
+        let vars = self.vars(id, &lines, true);
+        let steps = login::expand(
+            &lines,
+            true,
+            |n| {
+                args.iter()
+                    .find(|(k, _)| *k == n)
+                    .map(|(_, v)| v.clone())
+                    .unwrap_or_default()
+            },
+            |v| {
+                vars.iter()
+                    .find(|(k, _)| *k == v)
+                    .map(|(_, x)| x.clone())
+                    .unwrap_or_default()
+            },
+        );
+        if let Some(row) = self.snippets_view.report_mut().and_then(|r| r.row_mut(id)) {
+            row.state = RowState::Running(None);
+        }
+        self.script_runs += 1;
+        let mut runner = Runner::named(&format!("the snippet {name}"), steps);
+        let actions = runner.start(Instant::now());
+        self.scripts.insert(
+            id,
+            ScriptRun {
+                runner,
+                run: self.script_runs,
+                tmux: false,
+                report: true,
+            },
+        );
+        self.script_actions(id, actions);
+    }
+
+    /// Ends a run's session that no tab shows.
+    fn drop_run_pane(&mut self, id: PaneId) {
+        self.run_login.remove(&id);
+        self.scripts.remove(&id);
+        if self.run_hidden.remove(&id) {
+            self.end_host(id);
+            self.panes.remove(&id);
+            self.watches.remove(&id);
+        }
+    }
+
+    /// Escape while the run goes: the queued hosts never start, and the
+    /// running ones stop. Sessions still logging in end.
+    fn cancel_run(&mut self) {
+        let panes = self
+            .snippets_view
+            .report_mut()
+            .map(Report::cancel)
+            .unwrap_or_default();
+        for p in panes {
+            self.scripts.remove(&p);
+            if self.run_login.remove(&p) && self.run_hidden.contains(&p) {
+                self.end_host(p);
+            }
+        }
+        self.arm_run_timer();
+    }
+
+    /// R in the report: the failed and stopped hosts run again, in new
+    /// sessions.
+    fn retry_run(&mut self) {
+        let panes = self
+            .snippets_view
+            .report_mut()
+            .map(Report::retry)
+            .unwrap_or_default();
+        for p in panes {
+            self.drop_run_pane(p);
+        }
+        self.pump_run();
+    }
+
+    /// The report closed: the sessions of a run that no tab shows end.
+    fn close_report(&mut self, report: &Report) {
+        if report.run.is_some() {
+            for p in report.rows.iter().filter_map(|r| r.pane) {
+                self.drop_run_pane(p);
+            }
+        }
+        self.arm_run_timer();
+        self.leave_snippets();
+    }
+
+    /// Enter on a report row: that host's session in a tab of its own,
+    /// live, or its tab when it has one.
+    fn show_run_pane(&mut self, id: PaneId) -> Option<Command> {
+        if !self.panes.contains_key(&id) {
+            return Some(Command::Notice("That session was closed.".into()));
+        }
+        if self.run_hidden.remove(&id) {
+            let at = self.ws.tabs.len();
+            self.ws.insert_tab(at, layout::Node::Leaf(id), id);
+        }
+        self.focus_pane(id);
+        self.after_structure_change();
+        self.focus_terminal();
+        None
+    }
+
+    /// Sets the timer for the next host of the run to take too long.
+    fn arm_run_timer(&mut self) {
+        let next = self.snippets_view.report().and_then(Report::deadline);
+        // SAFETY: our window; replaces any earlier timer with this id.
+        unsafe {
+            match next {
+                Some(at) => {
+                    let wait = at.saturating_duration_since(Instant::now());
+                    let ms = u32::try_from(wait.as_millis()).unwrap_or(u32::MAX).max(1);
+                    SetTimer(Some(self.hwnd), TIMER_RUN, ms, None);
+                }
+                None => {
+                    let _ = KillTimer(Some(self.hwnd), TIMER_RUN);
+                }
+            }
+        }
+    }
+
+    fn on_run_timer(&mut self) {
+        let late = self
+            .snippets_view
+            .report_mut()
+            .map(|r| r.timed_out(Instant::now()))
+            .unwrap_or_default();
+        for p in late {
+            self.scripts.remove(&p);
+            self.run_login.remove(&p);
+        }
+        self.pump_run();
     }
 
     /// Ctrl+Shift+F`n`: the first snippet with that hotkey for the
@@ -6771,11 +7214,18 @@ impl Window {
                     let rows = self.side.grid.rows();
                     self.snippets_view.click(row, &self.settings.snippets, rows);
                     if double && !self.snippets_view.editing() {
-                        let action = self.snippets_view.key(
-                            SideKey::Enter { split: false },
-                            &self.settings.snippets,
-                            rows,
-                        );
+                        // A double-click picks a host, or runs a snippet
+                        // or shows a report row's session.
+                        let key = if self.snippets_view.picking() {
+                            if row < snippets_view::PICK_HEAD {
+                                self.refresh_chrome();
+                                return None;
+                            }
+                            SideKey::Char(' ')
+                        } else {
+                            SideKey::Enter { split: false }
+                        };
+                        let action = self.snippets_view.key(key, &self.settings.snippets, rows);
                         return self.snippets_action(action);
                     }
                     self.refresh_chrome();
@@ -8419,6 +8869,15 @@ enum Command {
         /// The Production panes' hosts.
         production: Vec<String>,
     },
+    /// A run on picked hosts includes hosts with the Production theme:
+    /// asks first.
+    ConfirmRun {
+        name: String,
+        hosts: Vec<Place>,
+        run: Run,
+        /// The Production hosts.
+        production: Vec<String>,
+    },
     /// Ask before a password manager command gets a login script's
     /// secret the first time (`name`; `None` is the login password).
     ConfirmSecretTool {
@@ -9042,6 +9501,22 @@ fn run_command(hwnd: HWND, command: Command) {
                 with_window(|w| w.delete_snippet(index));
             }
         }
+        Command::ConfirmRun {
+            name,
+            hosts,
+            run,
+            production,
+        } => {
+            let text = format!(
+                "Run the snippet {name} on {} hosts? {} {} the Production theme.",
+                hosts.len(),
+                production.join(", "),
+                if production.len() == 1 { "has" } else { "have" },
+            );
+            if dialog(hwnd, &text, MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2) == Some(IDYES) {
+                with_window(|w| w.start_run(&name, &hosts, run));
+            }
+        }
         Command::ConfirmSecretTool { pane, line, name } => {
             let what = match &name {
                 Some(n) => format!("the secret {n} for the login script"),
@@ -9578,6 +10053,10 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
             }
             WM_TIMER if wparam.0 == TIMER_RECONNECT => {
                 with_window(Window::on_reconnect_timer);
+                LRESULT(0)
+            }
+            WM_TIMER if wparam.0 == TIMER_RUN => {
+                with_window(Window::on_run_timer);
                 LRESULT(0)
             }
             WM_TIMER if wparam.0 == TIMER_RETIRE => {
