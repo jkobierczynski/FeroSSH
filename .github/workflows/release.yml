@@ -247,25 +247,49 @@ jobs:
           cargo run --locked -q -p ferossh-update --example sign -- $env:TAG.TrimStart("v") $released dist
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
 
-      - name: Create the GitHub Release
-        if: github.event_name == 'push'
+      # The gh arguments are built on every run, so a dry run shows exactly
+      # what a tag would publish. They go one per line into a file and are
+      # passed as a plain array: splatting (@pre) a lone "--prerelease"
+      # made gh see a stray "-" asset on v1.0.0-rc1.
+      - name: Release arguments
         shell: pwsh
         env:
-          GH_TOKEN: ${{ github.token }}
-          TAG: ${{ github.ref_name }}
+          TAG: ${{ github.event_name == 'push' && github.ref_name || 'v0.0.0-dry-run' }}
           SIGNED: ${{ steps.signpath.outputs.enabled }}
         run: |
-          $pre = if ($env:TAG.Contains("-")) { @("--prerelease") } else { @() }
-          $files = @("dist/ferossh.exe", "dist/ferossh-desktop.exe", "dist/SHA256SUMS.txt", "dist/BUILD-MANIFEST.json")
-          if (Test-Path dist/update.txt.sig) { $files += @("dist/update.txt", "dist/update.txt.sig") }
+          # A dry run has no notes of its own; any release's notes will do.
+          $source = "docs/releases/$env:TAG.md"
+          if (-not (Test-Path $source)) { $source = (Get-ChildItem docs/releases/*.md | Select-Object -Last 1).FullName }
           # Every release page says whether its exes are signed, and by whom.
           $signing = if ($env:SIGNED -eq "true") {
             "**Code signing.** Free code signing provided by [SignPath.io](https://about.signpath.io), certificate by [SignPath Foundation](https://signpath.org). See [Code signing](https://github.com/jkobierczynski/FeroSSH#code-signing)."
           } else {
             "**Code signing.** These exes are not code signed yet. Check a download against ``SHA256SUMS.txt`` or with ``gh attestation verify ferossh.exe -R jkobierczynski/FeroSSH``; see [Verifying a download](https://github.com/jkobierczynski/FeroSSH/blob/main/docs/guide/verifying-downloads.md)."
           }
-          $notes = (Get-Content -Raw "docs/releases/$env:TAG.md").TrimEnd() + "`n`n---`n`n" + $signing + "`n"
+          $notes = (Get-Content -Raw $source).TrimEnd() + "`n`n---`n`n" + $signing + "`n"
           [IO.File]::WriteAllText("$env:RUNNER_TEMP/notes.md", $notes, [Text.UTF8Encoding]::new($false))
-          gh release create $env:TAG --verify-tag --title "FeroSSH $env:TAG" `
-            --notes-file "$env:RUNNER_TEMP/notes.md" @pre @files
+
+          $ghArgs = [Collections.Generic.List[string]]::new()
+          $ghArgs.AddRange([string[]]@("release", "create", $env:TAG, "--verify-tag", "--title", "FeroSSH $env:TAG", "--notes-file", "$env:RUNNER_TEMP/notes.md"))
+          if ($env:TAG.Contains("-")) { $ghArgs.Add("--prerelease") }
+          foreach ($file in "ferossh.exe", "ferossh-desktop.exe", "SHA256SUMS.txt", "BUILD-MANIFEST.json", "update.txt", "update.txt.sig") {
+            if (Test-Path "dist/$file") { $ghArgs.Add("dist/$file") }
+            elseif ($file -notlike "update.txt*") { "::error::dist/$file is missing"; exit 1 }
+          }
+          [IO.File]::WriteAllLines("$env:RUNNER_TEMP/gh-args.txt", $ghArgs)
+          "gh arguments:"
+          foreach ($arg in $ghArgs) { "  [$arg]" }
+          # Temporary check: what a native program receives.
+          node -e "console.log(JSON.stringify(process.argv.slice(1)))" $ghArgs.ToArray()
+          $pre = if ($env:TAG.Contains("-")) { @("--prerelease") } else { @() }
+          node -e "console.log(JSON.stringify(process.argv.slice(1)))" a @pre b
+
+      - name: Create the GitHub Release
+        if: github.event_name == 'push'
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          [string[]]$ghArgs = Get-Content "$env:RUNNER_TEMP/gh-args.txt"
+          gh $ghArgs
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
