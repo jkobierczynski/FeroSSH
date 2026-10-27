@@ -66,5 +66,8 @@ fuzz_target!(|data: &[u8]| {
     }
     let rec = r.finish();
     assert!(rec.lines.len() <= ferossh_config::record::MAX_LINES);
-    assert_eq!(rec.hidden, rec.lines.iter().filter(|l| *l == "@password").count());
+    assert_eq!(
+        rec.hidden,
+        rec.lines.iter().filter(|l| *l == "@password").count()
+    );
 });

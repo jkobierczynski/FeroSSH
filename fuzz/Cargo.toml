@@ -21,6 +21,22 @@ ferossh-tmuxcc = { path = "../crates/tmuxcc" }
 ferossh-viewer = { path = "../crates/viewer", features = ["vnc", "rdp"] }
 ferossh-worker = { path = "../crates/worker" }
 ferossh-zmodem = { path = "../crates/zmodem" }
+# ssh_transport drives russh as the worker does, on a paused clock.
+russh = { version = "0.64", default-features = false, features = ["ring", "rsa"] }
+tokio = { version = "1.54", features = ["rt", "time", "io-util", "test-util"] }
+# login_script compiles the app's runner from its source file.
+zeroize = "1.9"
+
+# Release exes wrap on integer overflow; the fuzz build checks for it.
+# IronRDP's fast-path code turns an empty surface-bits rectangle into
+# right = left - 1 by subtracting with overflow (ironrdp-session 0.12,
+# fast_path.rs), and then skips the wrapped rectangle as outside the
+# image. Build that crate the way it ships, so the fuzzer goes on to
+# what would fail there. (Cargo passes the overflow flag only when it
+# differs from debug-assertions, which cargo-fuzz turns on.)
+[profile.release.package.ironrdp-session]
+debug-assertions = true
+overflow-checks = false
 
 # Kept out of the main workspace: fuzzing needs nightly and libFuzzer.
 [workspace]
@@ -112,6 +128,27 @@ bench = false
 [[bin]]
 name = "zmodem_feed"
 path = "fuzz_targets/zmodem_feed.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "ssh_transport"
+path = "fuzz_targets/ssh_transport.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "login_script"
+path = "fuzz_targets/login_script.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "sanitize"
+path = "fuzz_targets/sanitize.rs"
 test = false
 doc = false
 bench = false

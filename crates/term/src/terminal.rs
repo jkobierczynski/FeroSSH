@@ -7,7 +7,7 @@ use std::time::Instant;
 use alacritty_terminal::event::{Event, EventListener, WindowSize};
 use alacritty_terminal::grid::{Dimensions, Scroll};
 use alacritty_terminal::index::{Boundary, Column, Direction, Line, Point, Side};
-use alacritty_terminal::selection::{Selection, SelectionType};
+use alacritty_terminal::selection::{Selection, SelectionRange, SelectionType};
 use alacritty_terminal::term::cell::Flags as TermFlags;
 use alacritty_terminal::term::color::{COUNT as COLOR_COUNT, Colors};
 use alacritty_terminal::term::search::{Match, RegexSearch};
@@ -209,6 +209,7 @@ impl Terminal {
         };
         if size.cols != self.cols() || size.rows != self.rows() {
             self.term.resize(size);
+            self.drop_lone_spacers();
             if let Some(s) = &mut self.search {
                 s.found = None;
             }
@@ -230,11 +231,20 @@ impl Terminal {
             if let Some(piece) = bytes.get(start..end).filter(|p| !p.is_empty()) {
                 let queued = self.events.0.borrow().len();
                 self.parser.advance(&mut self.term, piece);
-                self.clamp_view();
+                self.repair();
                 self.follow_title(queued);
             }
             start = end;
         }
+    }
+
+    /// Puts right what alacritty_terminal 0.26 can leave wrong after
+    /// processing output, before anything draws or reads the grid. Every
+    /// path that hands it bytes calls this: [`Self::feed`], and
+    /// [`Self::flush_sync`] for a synchronized update's buffered bytes.
+    fn repair(&mut self) {
+        self.clamp_view();
+        self.drop_lone_spacers();
     }
 
     /// Keeps a scrolled-back view inside the history. alacritty_terminal
@@ -248,6 +258,43 @@ impl Terminal {
         let grid = self.term.grid();
         if grid.display_offset() > grid.history_size() {
             self.term.scroll_display(Scroll::Delta(0));
+        }
+    }
+
+    /// Clears wide-character spacers left at the start of a screen line.
+    /// alacritty_terminal 0.26 can leave one there (deleting characters
+    /// with CSI P moves the spacer of a wide character without the
+    /// character), and with the cursor on it, finding the cursor's cell
+    /// subtracts one from column 0. A spacer with nothing before it is
+    /// a blank cell anyway.
+    fn drop_lone_spacers(&mut self) {
+        let grid = self.term.grid_mut();
+        for line in 0..grid.screen_lines() {
+            let cell = &mut grid[Line(line as i32)][Column(0)];
+            cell.flags.remove(TermFlags::WIDE_CHAR_SPACER);
+        }
+    }
+
+    /// Clears the spacer at the end of a line that says a wide character
+    /// went on to the next line, where the next line does not start with
+    /// one (it was overwritten or erased since, or there is no next line).
+    /// alacritty_terminal 0.26's search skips such a spacer towards the
+    /// wide character and, starting there, never comes back to where it
+    /// started: it loops for ever. Run before each search, over the whole
+    /// scrollback; searching is rare and the check is two cells a line.
+    fn drop_lost_wide_spacers(&mut self) {
+        let (top, bottom) = (self.term.topmost_line(), self.term.bottommost_line());
+        let grid = self.term.grid_mut();
+        let last = grid.last_column();
+        for line in top.0..=bottom.0 {
+            let continued = line < bottom.0
+                && grid[Line(line + 1)][Column(0)]
+                    .flags
+                    .contains(TermFlags::WIDE_CHAR);
+            let cell = &mut grid[Line(line)][last];
+            if !continued && cell.flags.contains(TermFlags::LEADING_WIDE_CHAR_SPACER) {
+                cell.flags.remove(TermFlags::LEADING_WIDE_CHAR_SPACER);
+            }
         }
     }
 
@@ -292,6 +339,7 @@ impl Terminal {
     /// Ends a pending synchronized update and shows what it buffered.
     pub fn flush_sync(&mut self) {
         self.parser.stop_sync(&mut self.term);
+        self.repair();
     }
 
     /// What the host's output asked the UI to do, in order.
@@ -500,8 +548,65 @@ impl Terminal {
         self.term.selection.as_ref().is_some_and(|s| !s.is_empty())
     }
 
+    /// The selected text, built the way alacritty_terminal 0.26 builds it
+    /// in `selection_to_string`, around two of its bugs that panic.
     pub fn selection_text(&self) -> Option<String> {
-        self.term.selection_to_string().filter(|s| !s.is_empty())
+        let selection = self.term.selection.as_ref()?;
+        let SelectionRange { start, end, .. } = selection.to_range(&self.term)?;
+        let text = match selection.ty {
+            SelectionType::Block => {
+                // A block selection that starts on the right half of a cell
+                // drops that cell, so one started on the right half of the
+                // last column and ended left of it covers no cell; upstream
+                // still reads that cell, one past the end of the row.
+                if start.column > end.column {
+                    return None;
+                }
+                (start.line.0..=end.line.0)
+                    .map(|line| {
+                        let wide = line == end.line.0 || start.column.0 != 0;
+                        let (from, to) = (
+                            Point::new(Line(line), start.column),
+                            Point::new(Line(line), end.column),
+                        );
+                        self.bounds_text(from, to, wide).trim_end().to_owned()
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            }
+            SelectionType::Lines => self.bounds_text(start, end, true) + "\n",
+            _ => self.bounds_text(start, end, true),
+        };
+        Some(text).filter(|s| !s.is_empty())
+    }
+
+    /// `Term::bounds_to_string`, except where the selection ends on the
+    /// spacer left at the end of a line by a wide character that did not
+    /// fit there. Upstream then adds the first character of the line above
+    /// instead of the line below, and panics on the oldest line of history,
+    /// which has none above it. Here that spacer is left out and, with
+    /// `wide`, the wide character from the line below is added.
+    fn bounds_text(&self, start: Point, end: Point, wide: bool) -> String {
+        let grid = self.term.grid();
+        let last = grid.last_column();
+        let spacer = end.column == last
+            && last.0 >= 1
+            && grid[end.line][last]
+                .flags
+                .contains(TermFlags::LEADING_WIDE_CHAR_SPACER);
+        if !spacer {
+            return self.term.bounds_to_string(start, end);
+        }
+        let before = Point::new(end.line, last - 1);
+        let mut text = if start <= before {
+            self.term.bounds_to_string(start, before)
+        } else {
+            String::new()
+        };
+        if wide && end.line < grid.bottommost_line() {
+            text.push(grid[end.line + 1i32][Column(0)].c);
+        }
+        text
     }
 
     /// The raw OSC 8 link target of a viewport cell, if it has one. Check
@@ -575,6 +680,10 @@ impl Terminal {
     }
 
     fn search_from(&mut self, origin: Point, direction: Direction, side: Side) {
+        if self.search.is_none() {
+            return;
+        }
+        self.drop_lost_wide_spacers();
         let Some(search) = &mut self.search else {
             return;
         };

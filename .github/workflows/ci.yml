@@ -290,7 +290,7 @@ jobs:
       - run: cargo +nightly fuzz run --target x86_64-unknown-linux-gnu term_feed -- -max_total_time=60
       - run: cargo +nightly fuzz run --target x86_64-unknown-linux-gnu sftp_decode -- -max_total_time=60
       - run: cargo +nightly fuzz run --target x86_64-unknown-linux-gnu forward_parse -- -max_total_time=60
-      - run: cargo +nightly fuzz run --target x86_64-unknown-linux-gnu tmux_feed -- -max_total_time=60
+      - run: cargo +nightly fuzz run --target x86_64-unknown-linux-gnu tmux_feed -- -max_total_time=60 -dict=fuzz/dicts/tmux_feed.dict
       - run: cargo +nightly fuzz run --target x86_64-unknown-linux-gnu vnc_decode -- -max_total_time=60
       - run: cargo +nightly fuzz run --target x86_64-unknown-linux-gnu rdp_decode -- -max_total_time=60
       - run: cargo +nightly fuzz run --target x86_64-unknown-linux-gnu import_parse -- -max_total_time=60
@@ -299,4 +299,7 @@ jobs:
       - run: cargo +nightly fuzz run --target x86_64-unknown-linux-gnu host_config -- -max_total_time=60
       - run: cargo +nightly fuzz run --target x86_64-unknown-linux-gnu telnet_feed -- -max_total_time=60
       - run: cargo +nightly fuzz run --target x86_64-unknown-linux-gnu zmodem_feed -- -max_total_time=60
+      - run: cargo +nightly fuzz run --target x86_64-unknown-linux-gnu ssh_transport -- -max_total_time=60 -dict=fuzz/dicts/ssh_transport.dict
+      - run: cargo +nightly fuzz run --target x86_64-unknown-linux-gnu login_script -- -max_total_time=60
+      - run: cargo +nightly fuzz run --target x86_64-unknown-linux-gnu sanitize -- -max_total_time=60
       - run: cargo +nightly fuzz run --target x86_64-unknown-linux-gnu trigger_feed -- -max_total_time=60

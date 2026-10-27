@@ -13,6 +13,11 @@ fuzz_target!(|data: &[u8]| {
         return;
     };
     let mut client: Client<u32> = Client::new();
+    // Random bytes almost never spell the greeting, so half the inputs
+    // start in control mode.
+    if split & 1 != 0 {
+        let _ = client.feed(b"\x1bP1000p");
+    }
     let mut n = 0;
     for chunk in stream.chunks(usize::from(split).max(1)) {
         if client.is_control() && client.pending() < 8 {
