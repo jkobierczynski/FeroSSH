@@ -201,6 +201,9 @@ struct Outcome {
     output: Vec<u8>,
     disconnected: String,
     host_key_prompts: usize,
+    /// The worker reported the connection as lost (a reconnect would
+    /// follow), not ended.
+    lost: bool,
     /// From logging in to the worker reporting the connection gone.
     lasted: Option<Duration>,
 }
@@ -307,6 +310,7 @@ async fn session(
             Message::Data { bytes, .. } => seen.output.extend_from_slice(&bytes),
             // The keys were refused and the server fell back to a password.
             Message::Prompt { .. } => panic!("asked for a password; so far {seen:?}"),
+            Message::Lost { .. } => seen.lost = true,
             Message::Disconnected { reason, .. } => {
                 seen.disconnected = reason;
                 seen.lasted = since.map(|t| t.elapsed());
@@ -342,7 +346,13 @@ async fn servers_of_every_age() {
                 // Older OpenSSH and Dropbear name curve25519 the libssh way.
                 let kex_ok = k == kex || (kex == C25519 && k == C25519_LIBSSH);
                 // A retry without ChaCha20 must not ask about the key again.
-                kex_ok && c == cipher && output.contains("fero42") && seen.host_key_prompts == 1
+                // A shell that exits is not a lost connection, or the UI
+                // would log in again.
+                kex_ok
+                    && c == cipher
+                    && output.contains("fero42")
+                    && seen.host_key_prompts == 1
+                    && !seen.lost
             }
             (Refused(why), None) => seen.disconnected.contains(why),
             _ => false,
@@ -466,6 +476,7 @@ async fn dead_and_restarted_servers() {
     let lasted = seen.lasted.expect("logged in");
     assert!(lasted < Duration::from_secs(10), "{seen:?}");
     assert!(seen.disconnected.contains("stopped responding"), "{seen:?}");
+    assert!(seen.lost, "a frozen server must count as lost: {seen:?}");
 
     // Silent keepalives keep an idle session open.
     let seen = session(
@@ -481,6 +492,7 @@ async fn dead_and_restarted_servers() {
         seen.lasted.expect("logged in") >= Duration::from_secs(4),
         "{seen:?}"
     );
+    assert!(!seen.lost, "{seen:?}");
 
     let seen = session(container.port, &keys, false, timing, "", || {
         docker(&["restart", "-t", "0", &container.id]).expect("docker restart");
@@ -494,6 +506,7 @@ async fn dead_and_restarted_servers() {
         seen.disconnected.contains("closed the connection") || seen.disconnected.contains("reset"),
         "{seen:?}"
     );
+    assert!(seen.lost, "a killed server must count as lost: {seen:?}");
 
     // The published port can change on restart.
     let port = docker(&["port", &container.id, "22/tcp"])
@@ -559,6 +572,15 @@ async fn full_screen_apps_give_the_title_back() {
 
 /// Logs in and leaves the shell open; returns the worker's channels.
 async fn log_in(port: u16, keys: &[KeyFile]) -> (mpsc::Sender<Message>, mpsc::Receiver<Message>) {
+    log_in_with(port, keys, false).await
+}
+
+/// [`log_in`] with the legacy algorithm set on or off.
+async fn log_in_with(
+    port: u16,
+    keys: &[KeyFile],
+    legacy: bool,
+) -> (mpsc::Sender<Message>, mpsc::Receiver<Message>) {
     let (to_worker, worker_in) = mpsc::channel(64);
     let (worker_out, mut from_worker) = mpsc::channel(64);
     tokio::spawn(ferossh_worker::serve(worker_in, worker_out));
@@ -575,7 +597,7 @@ async fn log_in(port: u16, keys: &[KeyFile]) -> (mpsc::Sender<Message>, mpsc::Re
             rows: 24,
             host_key_algs: vec![],
             x11: None,
-            legacy: false,
+            legacy,
             timing: Timing::default(),
             tunnel: None,
             shell: true,
@@ -1499,6 +1521,10 @@ async fn through(jump: u16, target: &str, keys: &[KeyFile], command: &str) -> Ou
                 continue;
             }
             Message::Prompt { .. } => panic!("asked for a password; so far {seen:?}"),
+            Message::Lost { .. } => {
+                seen.lost = true;
+                continue;
+            }
             Message::Disconnected { reason, .. } => {
                 assert_eq!(i, 1, "the jump host ended first: {reason}; so far {seen:?}");
                 seen.disconnected = reason;
@@ -1538,11 +1564,303 @@ async fn jump_hosts_of_every_age() {
         eprintln!("{name}: {:?}", seen.connected);
         let ok = matches!(&seen.connected, Some((_, c, _)) if c == cipher)
             && output.contains("fero42")
-            && seen.host_key_prompts == 2;
+            && seen.host_key_prompts == 2
+            && !seen.lost;
         if !ok {
             failures.push(format!("{name}: expected {cipher}, got {seen:?}"));
         }
     }
     let _ = std::fs::remove_dir_all(&dir);
     assert!(failures.is_empty(), "\n{}", failures.join("\n"));
+}
+
+/// Every OpenSSH and Dropbear, with the legacy set where the server needs
+/// it: (image tag, server, legacy).
+const EVERY_SERVER: &[(&str, &str, bool)] = &[
+    ("18.04", "openssh", false),
+    ("20.04", "openssh", false),
+    ("22.04", "openssh", false),
+    ("24.04", "openssh", false),
+    ("26.04", "openssh", false),
+    ("18.04", "dropbear", true),
+    ("20.04", "dropbear", true),
+    ("22.04", "dropbear", false),
+    ("24.04", "dropbear", false),
+    ("26.04", "dropbear", false),
+];
+
+/// Remote forwards (`-R`) on every OpenSSH and Dropbear: the server
+/// listens, a program on it connects, and bytes go both ways.
+#[tokio::test]
+async fn remote_forwards_on_servers_of_every_age() {
+    const LISTENER: u32 = 10;
+    if !available() {
+        return;
+    }
+    let dir = std::env::temp_dir().join(format!("ferossh-interop-rfwd-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let keys = user_keys(&dir);
+    let mut failures = Vec::new();
+    for &(tag, server, legacy) in EVERY_SERVER {
+        let name = format!("{server} on ubuntu {tag}");
+        let container = Server::start(tag, server, &dir);
+        let (to_worker, mut from_worker) = log_in_with(container.port, &keys, legacy).await;
+        to_worker
+            .send(Message::RemoteForward {
+                channel: LISTENER,
+                connection: 1,
+                bind: "127.0.0.1".into(),
+                port: 4242,
+            })
+            .await
+            .unwrap();
+        let mut client: Option<tokio::task::JoinHandle<Option<String>>> = None;
+        let mut incoming = 0;
+        let deadline = tokio::time::sleep(Duration::from_secs(30));
+        tokio::pin!(deadline);
+        let outcome = loop {
+            let msg = tokio::select! {
+                m = from_worker.recv() => m.expect("worker hung up"),
+                r = async { client.as_mut().unwrap().await }, if client.is_some() => {
+                    break r.unwrap();
+                }
+                () = &mut deadline => break Some(format!("timed out, {incoming} streams")),
+            };
+            match msg {
+                Message::ForwardListening { port, .. } => {
+                    assert_eq!(port, 4242, "{name}");
+                    let id = container.id.clone();
+                    client = Some(tokio::task::spawn_blocking(move || {
+                        docker(&[
+                            "exec",
+                            "-u",
+                            "fero",
+                            &id,
+                            "timeout",
+                            "10",
+                            "bash",
+                            "-c",
+                            "exec 3<>/dev/tcp/127.0.0.1/4242; printf ping >&3; head -c 4 <&3",
+                        ])
+                    }));
+                }
+                Message::ForwardIncoming { listener, .. } => {
+                    assert_eq!(listener, LISTENER, "{name}");
+                    incoming += 1;
+                }
+                // Echo the stream back in capitals.
+                Message::Data { channel, bytes } if channel != 1 => {
+                    let n = u32::try_from(bytes.len()).unwrap();
+                    for reply in [
+                        Message::Data {
+                            channel,
+                            bytes: bytes.to_ascii_uppercase(),
+                        },
+                        Message::Window { channel, bytes: n },
+                    ] {
+                        to_worker.send(reply).await.unwrap();
+                    }
+                }
+                Message::Disconnected { channel, reason }
+                    if channel == LISTENER || channel == 1 =>
+                {
+                    break Some(format!("ended: {reason}"));
+                }
+                _ => {}
+            }
+        };
+        eprintln!("{name}: {outcome:?}");
+        if outcome.as_deref() != Some("PING") || incoming != 1 {
+            failures.push(format!("{name}: got {outcome:?} over {incoming} streams"));
+        }
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(failures.is_empty(), "\n{}", failures.join("\n"));
+}
+
+/// ZMODEM through the pty of old and new OpenSSH and Dropbear (as on
+/// routers): `sz` sends a file to the UI, `rz` takes one from it, and the
+/// shell carries on after both.
+#[cfg(unix)]
+#[tokio::test]
+async fn zmodem_on_servers_of_every_age() {
+    if !available() {
+        return;
+    }
+    let dir = std::env::temp_dir().join(format!("ferossh-interop-zm-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let keys = user_keys(&dir);
+    // Every byte value, ZDLE runs, CR after @.
+    let data: Vec<u8> = (0..300_000u32)
+        .map(|i| match i % 1000 {
+            0..=3 => 0x18,
+            4 => b'@',
+            5 => b'\r',
+            _ => (i.wrapping_mul(2_654_435_761) >> 13) as u8,
+        })
+        .collect();
+    let up: Vec<u8> = data.iter().rev().copied().collect();
+    std::fs::write(dir.join("down.bin"), &data).unwrap();
+    std::fs::write(dir.join("up.expected"), &up).unwrap();
+    for (tag, server, legacy) in [
+        ("18.04", "openssh", false),
+        ("26.04", "openssh", false),
+        ("18.04", "dropbear", true),
+        ("26.04", "dropbear", false),
+    ] {
+        let name = format!("{server} on ubuntu {tag}");
+        let container = Server::start(tag, server, &dir);
+        let (to_worker, from_worker) = log_in_with(container.port, &keys, legacy).await;
+        let shown = zmodem_round_trip(&name, &to_worker, from_worker, &data, &up).await;
+        assert!(shown.contains("zm42"), "{name}: {shown}");
+        // None of the transfer reached the terminal.
+        assert!(!shown.contains("B0100"), "{name}: {shown}");
+        assert!(
+            docker(&[
+                "exec",
+                &container.id,
+                "cmp",
+                "/keys/up.expected",
+                "/home/fero/up.bin"
+            ])
+            .is_some(),
+            "{name}: rz wrote something else"
+        );
+        eprintln!("{name}: sz and rz ok");
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Plays the UI for `sz /keys/down.bin` (expecting `data`) and then `rz`
+/// (sending `up` as up.bin); returns what the terminal showed.
+#[cfg(unix)]
+async fn zmodem_round_trip(
+    name: &str,
+    to_worker: &mpsc::Sender<Message>,
+    mut from_worker: mpsc::Receiver<Message>,
+    data: &[u8],
+    up: &[u8],
+) -> String {
+    use ferossh_ipc::{ZmodemAnswer, ZmodemUpload};
+    let send = |text: &str| Message::Data {
+        channel: 1,
+        bytes: text.as_bytes().to_vec(),
+    };
+    to_worker.send(send("sz /keys/down.bin\n")).await.unwrap();
+    let mut received = Vec::new();
+    let mut ends = 0;
+    let mut shown = Vec::new();
+    // What to type at the next prompt once a transfer ended: lrzsz drops
+    // what arrives while it puts the terminal back.
+    let mut next: Option<(&str, usize)> = None;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    loop {
+        let msg = tokio::time::timeout_at(deadline, from_worker.recv())
+            .await
+            .unwrap_or_else(|_| {
+                panic!(
+                    "{name}: timed out after {ends} transfers: {}",
+                    String::from_utf8_lossy(&shown)
+                )
+            })
+            .expect("worker hung up");
+        let reply = match msg {
+            Message::Data { bytes, .. } => {
+                shown.extend(bytes);
+                if let Some((text, from)) = next
+                    && String::from_utf8_lossy(&shown[from..]).contains("$ ")
+                {
+                    next = None;
+                    to_worker.send(send(text)).await.unwrap();
+                    if ends == 2 {
+                        break;
+                    }
+                }
+                continue;
+            }
+            Message::ZmodemStart { channel, upload } => Message::ZmodemAnswer {
+                channel,
+                answer: if upload {
+                    ZmodemAnswer::Send(vec![ZmodemUpload {
+                        name: b"up.bin".to_vec(),
+                        size: up.len() as u64,
+                        mtime: 1_700_000_000,
+                    }])
+                } else {
+                    ZmodemAnswer::Receive
+                },
+            },
+            Message::ZmodemFile {
+                channel,
+                name: file,
+                size,
+            } => {
+                assert_eq!(file, b"down.bin", "{name}");
+                assert_eq!(size, Some(data.len() as u64), "{name}");
+                Message::ZmodemFileAnswer {
+                    channel,
+                    accept: true,
+                }
+            }
+            Message::ZmodemData { bytes, .. } => {
+                received.extend(bytes);
+                continue;
+            }
+            Message::ZmodemRead {
+                channel,
+                file,
+                offset,
+                len,
+            } => {
+                assert_eq!(file, 0, "{name}");
+                let start = usize::try_from(offset).unwrap();
+                let end = (start + len as usize).min(up.len());
+                Message::ZmodemChunk {
+                    channel,
+                    offset,
+                    bytes: up[start..end].to_vec(),
+                }
+            }
+            Message::ZmodemFileDone { skipped, .. } => {
+                assert!(!skipped, "{name}");
+                continue;
+            }
+            Message::ZmodemEnd { error, .. } => {
+                assert_eq!(error, "", "{name}: transfer failed");
+                ends += 1;
+                if ends == 1 {
+                    assert!(
+                        received == data,
+                        "{name}: received {} bytes",
+                        received.len()
+                    );
+                }
+                // rz writes the file when it exits, after the transfer.
+                let text = if ends == 1 {
+                    "rz\n"
+                } else {
+                    "echo zm$((40+2)); exit\n"
+                };
+                next = Some((text, shown.len()));
+                continue;
+            }
+            Message::Disconnected { reason, .. } => panic!("{name}: shell ended: {reason}"),
+            _ => continue,
+        };
+        to_worker.send(reply).await.unwrap();
+    }
+    loop {
+        let msg = tokio::time::timeout_at(deadline, from_worker.recv())
+            .await
+            .unwrap_or_else(|_| panic!("{name}: the shell did not exit"))
+            .expect("worker hung up");
+        match msg {
+            Message::Data { channel: 1, bytes } => shown.extend(bytes),
+            Message::Disconnected { channel: 1, .. } => break,
+            _ => {}
+        }
+    }
+    String::from_utf8_lossy(&shown).into_owned()
 }

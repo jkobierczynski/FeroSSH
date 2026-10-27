@@ -17,6 +17,7 @@ jobs:
   windows:
     name: Build and test (Windows)
     runs-on: windows-latest
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
       # rustup reads rust-toolchain.toml and installs the pinned toolchain.
@@ -95,6 +96,7 @@ jobs:
     name: Reproducible build (Windows)
     needs: windows
     runs-on: windows-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
         with:
@@ -130,6 +132,7 @@ jobs:
   sshd:
     name: SSH tests against OpenSSH (Linux)
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     env:
       FEROSSH_REQUIRE_SSHD: 1
       FEROSSH_REQUIRE_PUTTYGEN: 1
@@ -171,6 +174,7 @@ jobs:
   rdp:
     name: Desktop viewers against xrdp and Xvnc (Linux)
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
       - run: rustup show active-toolchain
@@ -201,9 +205,13 @@ jobs:
         env:
           FEROSSH_TEST_VNC: "127.0.0.1:5905"
 
+  # A required check on main, so it must not hang or depend on Docker Hub:
+  # every job and long step has a timeout, and the images come from the
+  # cache unless interop/ changed.
   interop:
     name: Interop against older and newer servers (Linux)
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     env:
       FEROSSH_REQUIRE_INTEROP: 1
       FEROSSH_REQUIRE_TMUX: 1
@@ -212,10 +220,28 @@ jobs:
       - run: rustup show active-toolchain
       # One image per Ubuntu release: OpenSSH 7.6 to 10.x, Dropbear 2017 to
       # 2025, tmux 2.6 to 3.6. See interop/Dockerfile.
-      - run: interop/build.sh
+      - id: images
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ runner.temp }}/interop-images.tar
+          key: interop-images-${{ hashFiles('interop/Dockerfile', 'interop/entrypoint.sh', 'interop/build.sh') }}
+      - if: steps.images.outputs.cache-hit == 'true'
+        run: docker load -q -i "$RUNNER_TEMP/interop-images.tar"
+      - if: steps.images.outputs.cache-hit != 'true'
+        timeout-minutes: 15
+        run: |
+          images=$(interop/build.sh)
+          docker save -o "$RUNNER_TEMP/interop-images.tar" $images
+      - if: steps.images.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ runner.temp }}/interop-images.tar
+          key: ${{ steps.images.outputs.cache-primary-key }}
       - run: cargo test --locked -p ferossh-worker --test interop -- --nocapture
+        timeout-minutes: 15
       # tmux 2.6 (refused), 3.0a and 3.2a (tmux layout only), 3.4, 3.6.
       - name: tmux control mode against tmux 2.6 to 3.6
+        timeout-minutes: 10
         run: |
           for r in 18.04 20.04 22.04 24.04 26.04; do
             id=$(docker run -d --entrypoint sleep ferossh-interop:$r infinity)
@@ -228,6 +254,7 @@ jobs:
   deny:
     name: cargo deny
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
       - uses: EmbarkStudios/cargo-deny-action@v2
@@ -235,6 +262,7 @@ jobs:
   audit:
     name: cargo audit
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
       - uses: taiki-e/install-action@v2
@@ -246,6 +274,7 @@ jobs:
   fuzz:
     name: Fuzz smoke run
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
       - run: rustup toolchain install nightly --profile minimal
