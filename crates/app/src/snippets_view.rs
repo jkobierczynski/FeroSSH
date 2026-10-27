@@ -2,12 +2,18 @@
 //! focused pane (and every pane broadcast input reaches) without typing
 //! them out. Ctrl+Shift+Space opens it; typing filters the list, Enter
 //! types the snippet with Enter, Shift+Enter without the last Enter.
-//! Insert adds a snippet, F2 edits the selected one, Delete removes it.
+//! Insert adds a snippet, F2 edits the selected one, Delete removes it;
+//! Edit > Save selection as snippet starts one from text in a pane, and
+//! Paste works in the editor, a multi-line paste giving several lines.
+//!
+//! A snippet may take arguments, `$1` to `$9` or `${1:default}` (see
+//! [`ferossh_config::login::args`]); typing one first asks for their
+//! values here, prefilled with the defaults.
 //!
 //! Drawn into a [`Grid`] like the session manager; keys come in as
 //! [`SideKey`]s and what the user chose goes out as a [`SnipAction`].
 
-use ferossh_config::login::Snippet;
+use ferossh_config::login::{self, Arg, Snippet};
 use ferossh_render::{Flags, Grid, Rgb};
 
 use crate::session_form::Line;
@@ -26,9 +32,15 @@ const MAX_LINES: usize = 50;
 /// What the window should do.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SnipAction {
-    /// Type `lines` into the focused pane; `enter` presses Enter after the
-    /// last one too.
-    Send { lines: Vec<String>, enter: bool },
+    /// Type snippet `name`'s `lines` into the focused pane, asking for
+    /// its arguments first; `enter` presses Enter after the last one too.
+    Send {
+        name: String,
+        lines: Vec<String>,
+        enter: bool,
+    },
+    /// Type `lines` as they are: the arguments are filled in.
+    Type { lines: Vec<String>, enter: bool },
     /// Store `snippet` in place of snippet `index`, or as a new one.
     Save {
         index: Option<usize>,
@@ -123,6 +135,117 @@ impl Draft {
     }
 }
 
+/// A snippet waiting for its arguments.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Asking {
+    name: String,
+    lines: Vec<String>,
+    enter: bool,
+    args: Vec<Arg>,
+    /// As typed, one per argument; they start as the defaults.
+    values: Vec<String>,
+    focus: usize,
+    cursor: usize,
+}
+
+impl Asking {
+    fn set_focus(&mut self, i: usize) {
+        self.focus = i.min(self.values.len().saturating_sub(1));
+        self.cursor = self.values.get(self.focus).map_or(0, |v| v.chars().count());
+    }
+
+    /// The lines with the values filled in.
+    fn filled(&self) -> Vec<String> {
+        login::fill(&self.lines, |n| {
+            self.args
+                .iter()
+                .position(|a| a.number == n)
+                .and_then(|i| self.values.get(i))
+                .cloned()
+                .unwrap_or_default()
+        })
+    }
+
+    fn done(&self) -> SnipAction {
+        SnipAction::Type {
+            lines: self.filled(),
+            enter: self.enter,
+        }
+    }
+}
+
+/// Inserts `c` into `text` at character `at`; returns whether it fit.
+fn insert(text: &mut String, at: usize, c: char) -> bool {
+    if text.chars().count() >= MAX_TEXT {
+        return false;
+    }
+    let byte = text.char_indices().nth(at).map_or(text.len(), |(b, _)| b);
+    text.insert(byte, c);
+    true
+}
+
+/// Removes the character before (`back`) or at character `at`; returns
+/// whether one went.
+fn remove(text: &mut String, at: usize, back: bool) -> bool {
+    let gone = if back { at.checked_sub(1) } else { Some(at) };
+    if let Some(i) = gone
+        && let Some((b, _)) = text.char_indices().nth(i)
+    {
+        text.remove(b);
+        return true;
+    }
+    false
+}
+
+/// Moves a text cursor for an editing key; `false` if the key is not one.
+fn edit_key(key: SideKey, text: &mut String, cursor: &mut usize) -> bool {
+    let len = text.chars().count();
+    match key {
+        SideKey::Home => *cursor = 0,
+        SideKey::End => *cursor = len,
+        SideKey::Left => *cursor = cursor.saturating_sub(1),
+        SideKey::Right => *cursor = (*cursor + 1).min(len),
+        SideKey::Char(c) if !c.is_control() => {
+            if insert(text, *cursor, c) {
+                *cursor += 1;
+            }
+        }
+        SideKey::Backspace => {
+            if remove(text, *cursor, true) {
+                *cursor -= 1;
+            }
+        }
+        SideKey::Delete => {
+            remove(text, *cursor, false);
+        }
+        _ => return false,
+    }
+    true
+}
+
+/// Pasted text as lines: control characters dropped, trailing spaces and
+/// empty lines at the ends trimmed.
+fn paste_lines(text: &str) -> Vec<String> {
+    let mut lines: Vec<String> = text
+        .lines()
+        .map(|l| {
+            l.chars()
+                .map(|c| if c == '\t' { ' ' } else { c })
+                .filter(|c| !c.is_control())
+                .collect::<String>()
+                .trim_end()
+                .to_owned()
+        })
+        .collect();
+    while lines.first().is_some_and(String::is_empty) {
+        lines.remove(0);
+    }
+    while lines.last().is_some_and(String::is_empty) {
+        lines.pop();
+    }
+    lines
+}
+
 #[derive(Debug, Default)]
 pub struct SnippetsView {
     filter: String,
@@ -130,6 +253,7 @@ pub struct SnippetsView {
     selected: usize,
     scroll: usize,
     draft: Option<Draft>,
+    asking: Option<Asking>,
 }
 
 impl SnippetsView {
@@ -151,12 +275,128 @@ impl SnippetsView {
         self.draft.is_some()
     }
 
+    /// Whether a snippet's arguments are being asked for.
+    pub fn asking(&self) -> bool {
+        self.asking.is_some()
+    }
+
     /// Starts afresh with an empty filter (when the view is opened).
     pub fn reset(&mut self) {
         self.filter.clear();
         self.selected = 0;
         self.scroll = 0;
         self.draft = None;
+        self.asking = None;
+    }
+
+    /// What typing snippet `name` does: [`SnipAction::Type`] at once when
+    /// it takes no arguments, else `None` while the view asks for them.
+    pub fn send(&mut self, name: &str, lines: &[String], enter: bool) -> Option<SnipAction> {
+        let args = login::args(lines);
+        if args.is_empty() {
+            return Some(SnipAction::Type {
+                lines: login::fill(lines, |_| String::new()),
+                enter,
+            });
+        }
+        let mut a = Asking {
+            name: name.to_owned(),
+            lines: lines.to_vec(),
+            enter,
+            values: args.iter().map(|a| a.default.clone()).collect(),
+            args,
+            focus: 0,
+            cursor: 0,
+        };
+        a.set_focus(0);
+        self.draft = None;
+        self.asking = Some(a);
+        None
+    }
+
+    /// A new snippet made of `text`, such as the selection in a pane.
+    pub fn new_from(&mut self, text: &str) {
+        self.asking = None;
+        let mut d = Draft::new(
+            None,
+            &Snippet {
+                name: String::new(),
+                lines: paste_lines(text).into_iter().take(MAX_LINES).collect(),
+            },
+        );
+        d.set_focus(0);
+        self.draft = Some(d);
+    }
+
+    /// Pastes `text` at the cursor: into an argument, the snippet being
+    /// edited (one line after another), or the filter.
+    pub fn paste(&mut self, text: &str) {
+        let lines = paste_lines(text);
+        if let Some(a) = &mut self.asking {
+            let at = a.focus;
+            if let Some(v) = a.values.get_mut(at) {
+                for c in lines.join(" ").chars() {
+                    if insert(v, a.cursor, c) {
+                        a.cursor += 1;
+                    }
+                }
+            }
+            return;
+        }
+        let Some(d) = &mut self.draft else {
+            for c in lines.join(" ").chars() {
+                if self.filter.chars().count() < 60 {
+                    self.filter.push(c);
+                }
+            }
+            self.selected = 0;
+            return;
+        };
+        if d.focus == 0 || d.focus > d.lines.len() {
+            let mut at = d.cursor;
+            if let Some(t) = d.text_mut() {
+                for c in lines.join(" ").chars() {
+                    if insert(t, at, c) {
+                        at += 1;
+                    }
+                }
+                d.cursor = at;
+            }
+            return;
+        }
+        // The first pasted line goes in at the cursor, the rest become
+        // lines of their own, with what followed the cursor after them.
+        let i = d.focus - 1;
+        let Some(current) = d.lines.get(i).cloned() else {
+            return;
+        };
+        let split = current
+            .char_indices()
+            .nth(d.cursor)
+            .map_or(current.len(), |(b, _)| b);
+        let (head, tail) = current.split_at(split);
+        let mut new: Vec<String> = lines;
+        if new.is_empty() {
+            return;
+        }
+        if let Some(first) = new.first_mut() {
+            first.insert_str(0, head);
+        }
+        let last = new.len() - 1;
+        let cursor = new.get(last).map_or(0, |l| l.chars().count());
+        if let Some(l) = new.get_mut(last) {
+            l.push_str(tail);
+        }
+        let room = MAX_LINES.saturating_sub(d.lines.len() - 1);
+        new.truncate(room.max(1));
+        let added = new.len();
+        d.lines.splice(i..=i, new);
+        d.error = None;
+        d.tidy();
+        d.set_focus(i + added);
+        if added == last + 1 {
+            d.cursor = cursor;
+        }
     }
 
     /// The edit is over: saved, or the snippet is gone.
@@ -180,6 +420,9 @@ impl SnippetsView {
     }
 
     pub fn key(&mut self, key: SideKey, all: &[Snippet], rows: usize) -> Option<SnipAction> {
+        if self.asking.is_some() {
+            return self.ask_key(key);
+        }
         if self.draft.is_some() {
             return self.draft_key(key);
         }
@@ -196,6 +439,7 @@ impl SnippetsView {
             SideKey::Enter { split } => {
                 let s = all.get(here?)?;
                 return Some(SnipAction::Send {
+                    name: s.name.clone(),
                     lines: s.lines.clone(),
                     enter: !split,
                 });
@@ -231,6 +475,34 @@ impl SnippetsView {
             _ => {}
         }
         self.clamp(self.shown(all).len(), visible);
+        None
+    }
+
+    fn ask_key(&mut self, key: SideKey) -> Option<SnipAction> {
+        let a = self.asking.as_mut()?;
+        let n = a.values.len();
+        match key {
+            SideKey::Escape => {
+                self.asking = None;
+                return Some(SnipAction::Leave);
+            }
+            SideKey::Up => a.set_focus(a.focus.saturating_sub(1)),
+            SideKey::Down | SideKey::Tab => a.set_focus((a.focus + 1) % n),
+            // Enter goes to the next argument; on the last, or with Shift
+            // on any, the snippet is typed.
+            SideKey::Enter { split } if split || a.focus + 1 >= n => {
+                let done = a.done();
+                self.asking = None;
+                return Some(done);
+            }
+            SideKey::Enter { .. } => a.set_focus(a.focus + 1),
+            key => {
+                let at = a.focus;
+                if let Some(v) = a.values.get_mut(at) {
+                    edit_key(key, v, &mut a.cursor);
+                }
+            }
+        }
         None
     }
 
@@ -301,6 +573,12 @@ impl SnippetsView {
 
     /// A click on grid row `y` selects the snippet or field there.
     pub fn click(&mut self, y: usize, all: &[Snippet], rows: usize) {
+        if let Some(a) = &mut self.asking {
+            if let Some(i) = y.checked_sub(HEADER + 1) {
+                a.set_focus(i);
+            }
+            return;
+        }
         if let Some(d) = &mut self.draft {
             if let Some(i) = y.checked_sub(HEADER)
                 && i < d.count()
@@ -336,6 +614,73 @@ impl SnippetsView {
         let row = |grid: &mut Grid, y: usize, line: &mut Line, bg: Rgb| {
             grid.set_row(y, line.cells(bg));
         };
+        if let Some(a) = &self.asking {
+            let mut line = Line::new(width, bg);
+            line.put(
+                &fit(&format!(" Run {}", a.name), width),
+                palette.text,
+                Flags::BOLD,
+            );
+            row(grid, 0, &mut line, bg);
+            let mut line = Line::new(width, bg);
+            let help = if a.enter {
+                " Enter: next, types on the last · Esc: cancel"
+            } else {
+                " Enter: next, inserts on the last · Esc: cancel"
+            };
+            line.put(&fit(help, width), palette.dim, Flags::ITALIC);
+            row(grid, 1, &mut line, bg);
+            let mut y = HEADER;
+            for (i, (arg, value)) in a.args.iter().zip(&a.values).enumerate() {
+                if y >= rows {
+                    break;
+                }
+                let here = focused && i == a.focus;
+                let row_bg = if here { palette.active } else { bg };
+                let mut line = Line::new(width, row_bg);
+                line.put(
+                    &format!(" ${:<3} ", arg.number),
+                    palette.dim,
+                    Flags::empty(),
+                );
+                let room = width.saturating_sub(line.col + 1);
+                if here {
+                    let chars: Vec<char> = value.chars().collect();
+                    let at = a.cursor.min(chars.len());
+                    let start = at.saturating_sub(room.saturating_sub(2));
+                    let before: String = chars.get(start..at).unwrap_or_default().iter().collect();
+                    let after: String = chars.get(at..).unwrap_or_default().iter().collect();
+                    line.put(&before, palette.text, Flags::empty());
+                    line.put("▏", palette.accent, Flags::empty());
+                    let left = width.saturating_sub(line.col);
+                    line.put(&fit(&after, left), palette.text, Flags::empty());
+                } else if value.is_empty() {
+                    line.put(&fit("empty", room), palette.dim, Flags::ITALIC);
+                } else {
+                    line.put(&fit(value, room), palette.text, Flags::empty());
+                }
+                row(grid, y, &mut line, row_bg);
+                y += 1;
+            }
+            // What will be typed.
+            if y < rows {
+                row(grid, y, &mut Line::new(width, bg), bg);
+                y += 1;
+            }
+            for l in a.filled() {
+                if y >= rows {
+                    break;
+                }
+                let mut line = Line::new(width, bg);
+                line.put(&fit(&format!(" › {l}"), width), palette.dim, Flags::empty());
+                row(grid, y, &mut line, bg);
+                y += 1;
+            }
+            for y in y..rows {
+                row(grid, y, &mut Line::new(width, bg), bg);
+            }
+            return;
+        }
         let title = if self.draft.as_ref().is_some_and(|d| d.index.is_some()) {
             " Edit snippet"
         } else if self.draft.is_some() {
@@ -557,6 +902,7 @@ mod tests {
         assert_eq!(
             v.key(SideKey::Enter { split: true }, &all, 20),
             Some(SnipAction::Send {
+                name: "Save config".into(),
                 lines: all[1].lines.clone(),
                 enter: false
             })
@@ -567,6 +913,7 @@ mod tests {
         assert_eq!(
             v.key(SideKey::Enter { split: false }, &all, 20),
             Some(SnipAction::Send {
+                name: "Save config".into(),
                 lines: all[1].lines.clone(),
                 enter: true
             }),
@@ -643,5 +990,90 @@ mod tests {
         );
         v.key(SideKey::Escape, &all, 20);
         assert!(!v.editing());
+    }
+
+    #[test]
+    fn arguments_are_asked_for_then_typed() {
+        let all = snippets();
+        let mut v = SnippetsView::default();
+        let lines: Vec<String> = vec![
+            "interface $1".into(),
+            "description ${2:uplink}".into(),
+            "awk '{print $$1}'".into(),
+        ];
+        assert_eq!(
+            v.send("plain", &["echo $$HOME".into()], true),
+            Some(SnipAction::Type {
+                lines: vec!["echo $HOME".into()],
+                enter: true
+            })
+        );
+        assert_eq!(v.send("Port", &lines, false), None);
+        assert!(v.asking());
+        typed(&mut v, &all, "Gi0/2");
+        let t = texts(&mut v, &all);
+        assert!(t[0].contains("Run Port"), "{t:#?}");
+        assert!(t[2].contains("$1") && t[2].contains("Gi0/2"), "{t:#?}");
+        assert!(t[3].contains("$2") && t[3].contains("uplink"), "{t:#?}");
+        assert!(t.iter().any(|l| l.contains("› interface Gi0/2")), "{t:#?}");
+        assert_eq!(v.key(SideKey::Enter { split: false }, &all, 20), None);
+        v.key(SideKey::Backspace, &all, 20);
+        v.key(SideKey::Backspace, &all, 20);
+        v.paste("nk to core\n");
+        assert_eq!(
+            v.key(SideKey::Enter { split: false }, &all, 20),
+            Some(SnipAction::Type {
+                lines: vec![
+                    "interface Gi0/2".into(),
+                    "description uplink to core".into(),
+                    "awk '{print $1}'".into(),
+                ],
+                enter: false
+            })
+        );
+        assert!(!v.asking());
+        // Esc gives up; Shift+Enter types at once.
+        v.send("Port", &lines, true);
+        assert_eq!(v.key(SideKey::Escape, &all, 20), Some(SnipAction::Leave));
+        v.send("Port", &lines, true);
+        assert!(matches!(
+            v.key(SideKey::Enter { split: true }, &all, 20),
+            Some(SnipAction::Type { enter: true, .. })
+        ));
+    }
+
+    #[test]
+    fn selections_and_pastes_become_lines() {
+        let all = snippets();
+        let mut v = SnippetsView::default();
+        v.new_from("\n  show version\t \r\nshow clock\n\n");
+        assert!(v.editing());
+        typed(&mut v, &all, "Basics");
+        v.key(SideKey::Down, &all, 20);
+        v.key(SideKey::End, &all, 20);
+        // Into the middle of line 1: what followed the cursor moves down.
+        v.key(SideKey::Left, &all, 20);
+        v.paste("x\ny\nz");
+        typed(&mut v, &all, "!");
+        // Line 3, line 4, the empty line, Save.
+        for _ in 0..3 {
+            v.key(SideKey::Down, &all, 20);
+        }
+        assert_eq!(
+            v.key(SideKey::Enter { split: false }, &all, 20),
+            Some(SnipAction::Save {
+                index: None,
+                snippet: Snippet {
+                    name: "Basics".into(),
+                    // Leading spaces stay, trailing ones go.
+                    lines: vec![
+                        "  show versiox".into(),
+                        "y".into(),
+                        "z!n".into(),
+                        "show clock".into()
+                    ],
+                }
+            })
+        );
     }
 }

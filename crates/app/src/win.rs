@@ -242,6 +242,7 @@ mod cmd {
     pub const CLEAR_SCROLLBACK: u32 = 503;
     pub const COPY_ON_SELECT: u32 = 504;
     pub const RIGHT_CLICK_PASTE: u32 = 505;
+    pub const SAVE_SNIPPET: u32 = 506;
     pub const SCROLL_PAGE_UP: u32 = 510;
     pub const SCROLL_PAGE_DOWN: u32 = 511;
     pub const SCROLL_TOP: u32 = 512;
@@ -1327,6 +1328,7 @@ fn build_menu() -> Result<HMENU> {
         separator(edit)?;
         item(edit, cmd::FIND, "&Find in scrollback\tCtrl+Shift+F")?;
         item(edit, cmd::CLEAR_SCROLLBACK, "C&lear scrollback")?;
+        item(edit, cmd::SAVE_SNIPPET, "Sa&ve selection as snippet...")?;
         separator(edit)?;
         item(edit, cmd::COPY_ON_SELECT, "Copy on &select")?;
         item(edit, cmd::RIGHT_CLICK_PASTE, "&Right-click pastes")?;
@@ -5411,7 +5413,10 @@ impl Window {
     fn snippets_action(&mut self, action: Option<SnipAction>) -> Option<Command> {
         let mut out = None;
         match action {
-            Some(SnipAction::Send { lines, enter }) => out = self.send_snippet(&lines, enter),
+            Some(SnipAction::Send { name, lines, enter }) => {
+                out = self.send_snippet(&name, &lines, enter);
+            }
+            Some(SnipAction::Type { lines, enter }) => out = self.type_snippet(&lines, enter),
             Some(SnipAction::Save { index, snippet }) => {
                 let all = &mut self.settings.snippets;
                 let at = match index.filter(|&i| i < all.len()) {
@@ -5505,12 +5510,23 @@ impl Window {
             PalAction::Run(id) => return Some(Command::Id(id)),
             PalAction::Open { host, split } => self.open_host(&host, split),
             PalAction::Send { index, enter } => {
-                let lines = self.settings.snippets.get(index)?.lines.clone();
-                return self.send_snippet(&lines, enter);
+                let s = self.settings.snippets.get(index)?.clone();
+                return self.send_snippet(&s.name, &s.lines, enter);
             }
             PalAction::Leave => {}
         }
         None
+    }
+
+    /// Pastes into the snippets view when it has the keyboard; `false`
+    /// when the paste is for the terminal.
+    fn paste_side(&mut self, text: &str) -> bool {
+        if !(self.side.visible && self.side.focused && self.side.view == SideView::Snippets) {
+            return false;
+        }
+        self.snippets_view.paste(text);
+        self.refresh_chrome();
+        true
     }
 
     /// Back to the terminal from the snippets: the side pane hides again
@@ -5523,10 +5539,36 @@ impl Window {
         }
     }
 
-    /// Types a snippet's lines into the focused pane and the panes
-    /// broadcast input reaches, each line ending with Enter (the last one
-    /// only with `enter`).
-    fn send_snippet(&mut self, lines: &[String], enter: bool) -> Option<Command> {
+    /// Types snippet `name` (see [`Self::type_snippet`]); one with
+    /// arguments first asks for them in the snippets view.
+    fn send_snippet(&mut self, name: &str, lines: &[String], enter: bool) -> Option<Command> {
+        if !self.takes_broadcast(self.focused_id()) {
+            return Some(Command::Notice(
+                "Snippets are typed into a pane with a running shell or console; this \
+                 pane has none, or is at a prompt."
+                    .into(),
+            ));
+        }
+        if let Some(SnipAction::Type { lines, enter }) = self.snippets_view.send(name, lines, enter)
+        {
+            return self.type_snippet(&lines, enter);
+        }
+        if self.side.visible && self.side.view == SideView::Snippets {
+            self.side.focused = true;
+            self.request_full_redraw();
+        } else {
+            let peek = !self.side.visible;
+            self.show_side(SideView::Snippets, true);
+            self.snippets_peek = peek;
+        }
+        self.refresh_chrome();
+        None
+    }
+
+    /// Types a snippet's lines, arguments filled in, into the focused
+    /// pane and the panes broadcast input reaches, each line ending with
+    /// Enter (the last one only with `enter`).
+    fn type_snippet(&mut self, lines: &[String], enter: bool) -> Option<Command> {
         let id = self.focused_id();
         if !self.takes_broadcast(id) {
             return Some(Command::Notice(
@@ -6011,7 +6053,7 @@ impl Window {
             SideView::Files => self.ensure_sftp(self.focused_id()),
             SideView::Forwards | SideView::Palette => {}
             SideView::Snippets => {
-                if !self.snippets_view.editing() {
+                if !self.snippets_view.editing() && !self.snippets_view.asking() {
                     self.snippets_view.reset();
                 }
             }
@@ -6871,6 +6913,24 @@ impl Window {
             cmd::HIDE_MENU => return Some(Command::SetMenuVisible(!self.menu_visible)),
             cmd::COPY => return Some(Command::Copy),
             cmd::PASTE => return Some(Command::Paste),
+            cmd::SAVE_SNIPPET => {
+                let text = self
+                    .panes
+                    .get(&pane)
+                    .and_then(|p| p.term.selection_text())
+                    .filter(|t| !t.trim().is_empty());
+                let Some(text) = text else {
+                    return Some(Command::Notice(
+                        "Select the text for the snippet in a pane first, then use Edit > Save \
+                         selection as snippet."
+                            .into(),
+                    ));
+                };
+                self.snippets_view.new_from(&text);
+                self.show_side(SideView::Snippets, true);
+                self.snippets_peek = false;
+                self.refresh_chrome();
+            }
             cmd::REPLACE_KEY => return Some(Command::ReplaceHostKey),
             cmd::IMPORT => return Some(Command::ImportSessions),
             cmd::RESTART_SHELL => self.start_shell(pane),
@@ -8338,6 +8398,9 @@ fn run_command(hwnd: HWND, command: Command) {
             let Some(text) = clipboard::get_text(hwnd) else {
                 return;
             };
+            if with_window(|w| w.paste_side(&text)) == Some(true) {
+                return;
+            }
             let Some(id) = with_window(|w| w.focused_id()) else {
                 return;
             };

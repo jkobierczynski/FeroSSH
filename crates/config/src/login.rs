@@ -116,10 +116,170 @@ impl Snippet {
     }
 }
 
+/// A snippet argument: `$1` to `$9` in a line, or `${1:default}` with
+/// the text it stands for when nothing else is typed. `$$` is a plain `$`,
+/// so `awk '{print $$1}'` types `awk '{print $1}'`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Arg {
+    pub number: u8,
+    /// The first default the lines give it, or empty.
+    pub default: String,
+}
+
+/// One piece of a snippet line.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Piece {
+    Text(String),
+    Arg(u8, Option<String>),
+}
+
+fn pieces(line: &str) -> Vec<Piece> {
+    let mut out = Vec::new();
+    let mut text = String::new();
+    let mut rest = line;
+    while let Some(at) = rest.find('$') {
+        text.push_str(rest.get(..at).unwrap_or_default());
+        let after = rest.get(at + 1..).unwrap_or_default();
+        let mut chars = after.chars();
+        match chars.next() {
+            Some('$') => {
+                text.push('$');
+                rest = chars.as_str();
+            }
+            Some(d @ '1'..='9') => {
+                out.push(Piece::Text(std::mem::take(&mut text)));
+                out.push(Piece::Arg(d as u8 - b'0', None));
+                rest = chars.as_str();
+            }
+            Some('{') => {
+                let inner = chars.as_str();
+                let parsed = inner.find('}').and_then(|end| {
+                    let body = inner.get(..end)?;
+                    let (num, default) = match body.split_once(':') {
+                        Some((n, d)) => (n, Some(d.to_owned())),
+                        None => (body, None),
+                    };
+                    let n = num.parse::<u8>().ok().filter(|n| (1..=9).contains(n))?;
+                    Some((n, default, inner.get(end + 1..)?))
+                });
+                match parsed {
+                    Some((n, default, after)) => {
+                        out.push(Piece::Text(std::mem::take(&mut text)));
+                        out.push(Piece::Arg(n, default));
+                        rest = after;
+                    }
+                    None => {
+                        text.push('$');
+                        rest = after;
+                    }
+                }
+            }
+            _ => {
+                text.push('$');
+                rest = after;
+            }
+        }
+    }
+    text.push_str(rest);
+    out.push(Piece::Text(text));
+    out.retain(|p| *p != Piece::Text(String::new()));
+    out
+}
+
+/// The arguments `lines` use, by number.
+pub fn args(lines: &[String]) -> Vec<Arg> {
+    let mut out: Vec<Arg> = Vec::new();
+    for piece in lines.iter().flat_map(|l| pieces(l)) {
+        if let Piece::Arg(number, default) = piece {
+            match out.iter_mut().find(|a| a.number == number) {
+                Some(a) if a.default.is_empty() => a.default = default.unwrap_or_default(),
+                Some(_) => {}
+                None => out.push(Arg {
+                    number,
+                    default: default.unwrap_or_default(),
+                }),
+            }
+        }
+    }
+    out.sort_by_key(|a| a.number);
+    out
+}
+
+/// `lines` with each argument replaced by `value(number)` and `$$` by `$`.
+/// What a value holds is typed as it is: a `$1` in it stays `$1`.
+pub fn fill(lines: &[String], value: impl Fn(u8) -> String) -> Vec<String> {
+    lines
+        .iter()
+        .map(|l| {
+            pieces(l)
+                .into_iter()
+                .map(|p| match p {
+                    Piece::Text(t) => t,
+                    Piece::Arg(n, _) => value(n),
+                })
+                .collect()
+        })
+        .collect()
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+
+    fn owned(lines: &[&str]) -> Vec<String> {
+        lines.iter().map(|l| (*l).to_owned()).collect()
+    }
+
+    #[test]
+    fn arguments_are_found_with_their_defaults() {
+        let lines = owned(&[
+            "interface $1",
+            "description ${2:uplink to core}",
+            "show int ${1:Gi0/1} | include $2",
+            "echo $HOME $$1 ${x} ${10} $",
+        ]);
+        assert_eq!(
+            args(&lines),
+            [
+                Arg {
+                    number: 1,
+                    default: "Gi0/1".into()
+                },
+                Arg {
+                    number: 2,
+                    default: "uplink to core".into()
+                },
+            ]
+        );
+        assert!(args(&owned(&["ls -l $HOME", "echo $$5"])).is_empty());
+    }
+
+    #[test]
+    fn filling_replaces_arguments_once() {
+        let lines = owned(&[
+            "interface $1",
+            "description ${2:uplink}",
+            "awk '{print $$1}' ${3:x}$",
+        ]);
+        let got = fill(&lines, |n| match n {
+            1 => "Gi0/2".into(),
+            2 => "$1 stays".into(),
+            _ => String::new(),
+        });
+        assert_eq!(
+            got,
+            owned(&[
+                "interface Gi0/2",
+                "description $1 stays",
+                "awk '{print $1}' $"
+            ])
+        );
+        assert_eq!(
+            fill(&owned(&["${1:unclosed"]), |_| "v".into()),
+            ["${1:unclosed"]
+        );
+    }
 
     #[test]
     fn steps_parse_and_print() {
