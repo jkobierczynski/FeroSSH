@@ -521,7 +521,7 @@ fn deleting_lines_while_scrolled_back_keeps_the_view_in_history() {
 /// them. Their files are in `fuzz/regressions/term_feed`.
 #[test]
 fn fuzz_regressions_do_not_panic() {
-    let inputs: [&[u8]; 2] = [
+    let inputs: [&[u8]; 3] = [
         // crash-4e843404021a197da920428c087b4ed1c597ca5f: a resize, a
         // scroll back, then CSI M with the view past the history.
         b"\x832[\xff[%&)\x1b[\xffM",
@@ -530,6 +530,10 @@ fn fuzz_regressions_do_not_panic() {
         // then a word on that line is copied.
         b"@\xc8$\xff  \x01\xff\xff\xff\xff\xff\xfb\xffM\xa5\xe4\xa2\x95\x00\x08\x1b\xff\xff\xff\xff\
           M\x1b0P\xa2\x95@\xa5\xe4\xa2\x95\x00\x08MB",
+        // crash-be28eab91438fb7504906e3dfe70958e4efc318d: the same, by
+        // way of the alternate screen.
+        b"@MzU\xe4\xa2\x95\xa5\xe4\xa2\x95\x00\x08\x00\x00\x1bMM1049'\x00\x00\x00\x00\x00\x06\
+          \x00\x00\x00\x00\x00\x00\x00\x07\x00\x00",
     ];
     for data in inputs {
         let (&split, stream) = data.split_first().unwrap();
