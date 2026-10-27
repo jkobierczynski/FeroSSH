@@ -249,8 +249,9 @@ jobs:
 
       # The gh arguments are built on every run, so a dry run shows exactly
       # what a tag would publish. They go one per line into a file and are
-      # passed as a plain array: splatting (@pre) a lone "--prerelease"
-      # made gh see a stray "-" asset on v1.0.0-rc1.
+      # passed as a plain array. (The if expression unrolled a one-item
+      # array to the string "--prerelease", and splatting that string as
+      # @pre passed it one character at a time, so gh saw a "-" asset.)
       - name: Release arguments
         shell: pwsh
         env:
@@ -279,10 +280,6 @@ jobs:
           [IO.File]::WriteAllLines("$env:RUNNER_TEMP/gh-args.txt", $ghArgs)
           "gh arguments:"
           foreach ($arg in $ghArgs) { "  [$arg]" }
-          # Temporary check: what a native program receives.
-          node -e "console.log(JSON.stringify(process.argv.slice(1)))" $ghArgs.ToArray()
-          $pre = if ($env:TAG.Contains("-")) { @("--prerelease") } else { @() }
-          node -e "console.log(JSON.stringify(process.argv.slice(1)))" a @pre b
 
       - name: Create the GitHub Release
         if: github.event_name == 'push'
