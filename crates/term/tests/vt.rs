@@ -517,17 +517,22 @@ fn deleting_lines_while_scrolled_back_keeps_the_view_in_history() {
     assert_eq!(line(&t, 0), "line 0");
 }
 
-/// Inputs the `term_feed` fuzz target once crashed on, run the way it runs
-/// them. Their files are in `fuzz/regressions/term_feed`.
+/// Inputs the `term_feed` fuzz target once crashed or hung on, run the way
+/// it runs them (without its user actions). They are the files in
+/// `fuzz/regressions/term_feed`.
 #[test]
 fn fuzz_regressions_do_not_panic() {
-    let inputs: [&[u8]; 1] = [
-        // crash-4e843404021a197da920428c087b4ed1c597ca5f: a resize, a
-        // scroll back, then CSI M with the view past the history.
-        b"\x832[\xff[%&)\x1b[\xffM",
-    ];
-    for data in inputs {
-        let (&split, stream) = data.split_first().unwrap();
+    let dir = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../fuzz/regressions/term_feed"
+    );
+    let mut count = 0;
+    for entry in std::fs::read_dir(dir).unwrap() {
+        let data = std::fs::read(entry.unwrap().path()).unwrap();
+        let Some((&split, stream)) = data.split_first() else {
+            continue;
+        };
+        count += 1;
         let mut t = Terminal::new(20, 6, &Settings::new(50));
         let mut g = Grid::new(1, 1);
         for (i, chunk) in stream.chunks(usize::from(split % 64).max(1)).enumerate() {
@@ -536,9 +541,114 @@ fn fuzz_regressions_do_not_panic() {
             match (split as usize + i) % 11 {
                 0 => t.resize(usize::from(chunk[0] % 30), usize::from(split % 9)),
                 1 => t.scroll_lines(i32::from(chunk[0] as i8)),
+                2 => {
+                    t.select_start(usize::from(chunk[0]), 1, true, SelectionKind::Word);
+                    let _ = t.selection_text();
+                }
+                3 => {
+                    t.search_open();
+                    t.search_set(&String::from_utf8_lossy(&chunk[..chunk.len().min(4)]));
+                }
+                4 => t.flush_sync(),
                 _ => {}
             }
             let _ = t.draw_into(&mut g, i % 2 == 0);
         }
     }
+    assert!(count >= 10, "only {count} regression inputs found");
+}
+
+#[test]
+fn block_selection_from_the_right_half_of_the_last_column_is_empty() {
+    let mut t = term(20, 6);
+    t.feed(b"abcdefghijklmnopqrst\r\nabcdefghijklmnopqrst");
+    // Alt+drag from the right half of the last cell, down and to its
+    // left half: no whole cell is covered.
+    t.select_start(19, 0, true, SelectionKind::Block);
+    t.select_update(19, 1, false);
+    assert_eq!(t.selection_text(), None);
+    t.select_update(19, 1, true);
+    assert_eq!(t.selection_text(), None);
+    let _ = screen(&t);
+    // From the left half it covers the last column.
+    t.select_start(19, 0, false, SelectionKind::Block);
+    t.select_update(19, 1, true);
+    assert_eq!(t.selection_text().as_deref(), Some("t\nt"));
+}
+
+#[test]
+fn copying_a_line_that_wraps_a_wide_character_takes_it_from_the_next_line() {
+    // "中" does not fit in the last column, so it wraps and leaves a
+    // spacer there.
+    let mut t = Terminal::new(10, 3, &Settings::new(100));
+    t.feed("123456789中x\r\nb\r\nc\r\nd\r\ne".as_bytes());
+    // The wrapped line is now the oldest line of history.
+    t.scroll_to_top();
+    assert_eq!(line(&t, 0), "123456789");
+    t.select_start(0, 0, false, SelectionKind::Simple);
+    t.select_update(9, 0, true);
+    assert_eq!(t.selection_text().as_deref(), Some("123456789中"));
+    t.select_start(0, 0, false, SelectionKind::Block);
+    t.select_update(9, 0, true);
+    assert_eq!(t.selection_text().as_deref(), Some("123456789中"));
+    t.select_start(3, 0, false, SelectionKind::Line);
+    assert_eq!(t.selection_text().as_deref(), Some("123456789中x\n"));
+
+    // With a line above it, upstream would have added that line's first
+    // character.
+    let mut t = Terminal::new(10, 3, &Settings::new(100));
+    t.feed("a\r\n123456789中x".as_bytes());
+    t.select_start(0, 1, false, SelectionKind::Simple);
+    t.select_update(9, 1, true);
+    assert_eq!(t.selection_text().as_deref(), Some("123456789中"));
+}
+
+#[test]
+fn deleting_a_wide_character_leaves_no_spacer_under_the_cursor() {
+    // CSI P on "中" at the start of the line moves its spacer to column 0,
+    // where the cursor is.
+    let mut t = term(10, 2);
+    t.feed("中x\r\x1b[P".as_bytes());
+    let (_, cursor) = screen(&t);
+    assert_eq!(cursor.map(|c| (c.x, c.y)), Some((0, 0)));
+    // The left-over spacer shows as a blank cell.
+    assert_eq!(line(&t, 0), " x");
+}
+
+#[test]
+fn a_synchronized_update_keeps_the_view_in_history() {
+    let mut t = Terminal::new(10, 5, &Settings::new(100));
+    for i in 0..8 {
+        t.feed(format!("line {i}\r\n").as_bytes());
+    }
+    t.scroll_lines(1);
+    // The same deletes as above, held back by a synchronized update and
+    // applied when it ends.
+    t.feed(b"\x1b[?2026h");
+    for _ in 0..10 {
+        t.feed(b"\x1b[3H\x1b[2M");
+    }
+    t.flush_sync();
+    let _ = screen(&t);
+    assert_eq!(line(&t, 0), "line 0");
+}
+
+#[test]
+fn searching_past_a_wide_character_that_was_overwritten_ends() {
+    // From a fuzzer find: narrowing the terminal leaves a line ending in
+    // a spacer that says a wide character goes on at the start of the
+    // next line, and "M" then overwrites that character. Upstream's
+    // search loops forever on such a line.
+    let mut t = Terminal::new(20, 6, &Settings::new(50));
+    t.feed(b"M\xa5\xe4");
+    t.resize(18, 1);
+    t.feed(b"\xa2\x95\x00\xff\xff\xe4\xa2\x95\x00\x08\xcd");
+    t.resize(25, 1);
+    t.feed(b"\xa5\xe4\xa2\x95\x00\x00\x1b\x00\x08\xa2\x08");
+    t.resize(8, 1);
+    t.feed(b"M");
+    t.scroll_lines(1);
+    t.search_open();
+    t.search_set(" ");
+    let _ = screen(&t);
 }

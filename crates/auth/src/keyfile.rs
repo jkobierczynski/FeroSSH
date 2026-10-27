@@ -332,10 +332,16 @@ mod tests {
     /// Makes a `.ppk` with puttygen, if installed (the Linux CI job has it).
     fn puttygen(kind: &str, passphrase: Option<&str>) -> Option<String> {
         use std::process::{Command, Stdio};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        // Tests run in parallel and several make the same kind of key: each
+        // call gets its own folder, or one test reads another's half-written
+        // file.
+        static CALLS: AtomicUsize = AtomicUsize::new(0);
         let dir = std::env::temp_dir().join(format!(
-            "ferossh-ppk-{kind}-{}-{}",
+            "ferossh-ppk-{kind}-{}-{}-{}",
             passphrase.is_some(),
-            std::process::id()
+            std::process::id(),
+            CALLS.fetch_add(1, Ordering::Relaxed)
         ));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).ok()?;
