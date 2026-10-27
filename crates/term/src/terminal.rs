@@ -230,9 +230,24 @@ impl Terminal {
             if let Some(piece) = bytes.get(start..end).filter(|p| !p.is_empty()) {
                 let queued = self.events.0.borrow().len();
                 self.parser.advance(&mut self.term, piece);
+                self.clamp_view();
                 self.follow_title(queued);
             }
             start = end;
+        }
+    }
+
+    /// Keeps a scrolled-back view inside the history. alacritty_terminal
+    /// 0.26 moves the view back a line for every line scrolled out of a
+    /// region that does not start at the top of the screen (delete lines
+    /// below the cursor, a scroll region under a status line), although
+    /// none of those lines go into history. The view then reaches past
+    /// the oldest line and drawing it panics. Scrolling by nothing clamps
+    /// the view to the history there is.
+    fn clamp_view(&mut self) {
+        let grid = self.term.grid();
+        if grid.display_offset() > grid.history_size() {
+            self.term.scroll_display(Scroll::Delta(0));
         }
     }
 

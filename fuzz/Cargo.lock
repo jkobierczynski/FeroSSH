@@ -863,7 +863,7 @@ checksum = "da7c62ceae207dd37ea5b845da6a0696c799f85e97da1ab5b7910be3c1c80223"
 
 [[package]]
 name = "ferossh-auth"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "getrandom 0.4.3",
  "russh",
@@ -874,7 +874,7 @@ dependencies = [
 
 [[package]]
 name = "ferossh-config"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "base64ct",
  "getrandom 0.4.3",
@@ -885,7 +885,7 @@ dependencies = [
 
 [[package]]
 name = "ferossh-forward"
-version = "0.1.0"
+version = "1.0.0"
 
 [[package]]
 name = "ferossh-fuzz"
@@ -907,21 +907,21 @@ dependencies = [
 
 [[package]]
 name = "ferossh-ipc"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "zeroize",
 ]
 
 [[package]]
 name = "ferossh-render"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "windows",
 ]
 
 [[package]]
 name = "ferossh-sftp"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "ferossh-ipc",
  "sha2",
@@ -929,7 +929,7 @@ dependencies = [
 
 [[package]]
 name = "ferossh-term"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "alacritty_terminal",
  "ferossh-render",
@@ -938,11 +938,11 @@ dependencies = [
 
 [[package]]
 name = "ferossh-tmuxcc"
-version = "0.1.0"
+version = "1.0.0"
 
 [[package]]
 name = "ferossh-viewer"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "des",
  "ironrdp-blocking",
@@ -963,7 +963,7 @@ dependencies = [
 
 [[package]]
 name = "ferossh-worker"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "ferossh-forward",
  "ferossh-ipc",
@@ -978,7 +978,7 @@ dependencies = [
 
 [[package]]
 name = "ferossh-zmodem"
-version = "0.1.0"
+version = "1.0.0"
 
 [[package]]
 name = "ff"
