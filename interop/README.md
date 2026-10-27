@@ -15,7 +15,17 @@ The container argument picks the server: `openssh`, `dropbear`, or `gear`
 (OpenSSH limited to what switches and routers typically offer). The user is
 `fero`; mount a directory holding `authorized_keys` at `/keys`. The images
 also carry vttest, less and vim.tiny, which `real_programs_draw_correctly`
-runs through FeroSSH's terminal.
+runs through FeroSSH's terminal, and lrzsz for `zmodem_on_servers_of_every_age`.
+
+Besides logins and algorithms, the tests cover SFTP, jump hosts, remote
+forwards (`-R`), ZMODEM through OpenSSH's and Dropbear's ptys, and that a
+frozen or killed server is reported as lost (so the window reconnects) while
+a shell that exits is not.
+
+In CI this is a required check on `main`. The job caches the built images,
+keyed by the hash of this folder's files, so a run pulls nothing from Docker
+Hub unless they changed; `build.sh` retries pulls and falls back to Google's
+Docker Hub mirror.
 
 ```sh
 interop/build.sh
