@@ -5498,7 +5498,9 @@ impl Window {
                 out = self.send_snippet(&name, &lines, enter);
             }
             Some(SnipAction::Type { name, steps }) => out = self.type_snippet(&name, steps),
-            Some(SnipAction::Copy(text)) => clipboard::set_text(self.hwnd, &text),
+            Some(SnipAction::Copy(text)) => {
+                clipboard::set_text(self.hwnd, &text);
+            }
             Some(SnipAction::Save { index, snippet }) => {
                 let all = &mut self.settings.snippets;
                 let at = match index.filter(|&i| i < all.len()) {
