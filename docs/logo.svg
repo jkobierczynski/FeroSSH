@@ -1,0 +1,11 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" width="1024" height="1024">
+  <title>FeroSSH</title>
+  <defs>
+    <linearGradient id="forge" x1="242" y1="0" x2="782" y2="0" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#EB5016"/>
+      <stop offset="1" stop-color="#F7921C"/>
+    </linearGradient>
+  </defs>
+  <rect width="1024" height="1024" rx="112" fill="#252525"/>
+  <path fill="url(#forge)" d="M242 242H782L650 374H374V446H579L447 578H374V650L242 782Z"/>
+</svg>

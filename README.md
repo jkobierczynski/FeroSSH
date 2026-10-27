@@ -1,3 +1,5 @@
+<p align="center"><img src="docs/logo.svg" alt="FeroSSH logo" width="128"></p>
+
 # FeroSSH
 
 *Secure connections. Forged in Rust.*
