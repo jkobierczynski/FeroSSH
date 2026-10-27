@@ -517,26 +517,22 @@ fn deleting_lines_while_scrolled_back_keeps_the_view_in_history() {
     assert_eq!(line(&t, 0), "line 0");
 }
 
-/// Inputs the `term_feed` fuzz target once crashed on, run the way it runs
-/// them. Their files are in `fuzz/regressions/term_feed`.
+/// Inputs the `term_feed` fuzz target once crashed or hung on, run the way
+/// it runs them (without its user actions). They are the files in
+/// `fuzz/regressions/term_feed`.
 #[test]
 fn fuzz_regressions_do_not_panic() {
-    let inputs: [&[u8]; 3] = [
-        // crash-4e843404021a197da920428c087b4ed1c597ca5f: a resize, a
-        // scroll back, then CSI M with the view past the history.
-        b"\x832[\xff[%&)\x1b[\xffM",
-        // crash-3501ad54109bbfb7046339fa23c251f8201447bd: a narrower
-        // resize wraps a wide character on the oldest line of history,
-        // then a word on that line is copied.
-        b"@\xc8$\xff  \x01\xff\xff\xff\xff\xff\xfb\xffM\xa5\xe4\xa2\x95\x00\x08\x1b\xff\xff\xff\xff\
-          M\x1b0P\xa2\x95@\xa5\xe4\xa2\x95\x00\x08MB",
-        // crash-be28eab91438fb7504906e3dfe70958e4efc318d: the same bug,
-        // another way there.
-        b"@MzU\xe4\xa2\x95\xa5\xe4\xa2\x95\x00\x08\x00\x00\x1bMM1049'\x00\x00\x00\x00\x00\x06\
-          \x00\x00\x00\x00\x00\x00\x00\x07\x00\x00",
-    ];
-    for data in inputs {
-        let (&split, stream) = data.split_first().unwrap();
+    let dir = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../fuzz/regressions/term_feed"
+    );
+    let mut count = 0;
+    for entry in std::fs::read_dir(dir).unwrap() {
+        let data = std::fs::read(entry.unwrap().path()).unwrap();
+        let Some((&split, stream)) = data.split_first() else {
+            continue;
+        };
+        count += 1;
         let mut t = Terminal::new(20, 6, &Settings::new(50));
         let mut g = Grid::new(1, 1);
         for (i, chunk) in stream.chunks(usize::from(split % 64).max(1)).enumerate() {
@@ -549,11 +545,17 @@ fn fuzz_regressions_do_not_panic() {
                     t.select_start(usize::from(chunk[0]), 1, true, SelectionKind::Word);
                     let _ = t.selection_text();
                 }
+                3 => {
+                    t.search_open();
+                    t.search_set(&String::from_utf8_lossy(&chunk[..chunk.len().min(4)]));
+                }
+                4 => t.flush_sync(),
                 _ => {}
             }
             let _ = t.draw_into(&mut g, i % 2 == 0);
         }
     }
+    assert!(count >= 10, "only {count} regression inputs found");
 }
 
 #[test]
@@ -611,4 +613,42 @@ fn deleting_a_wide_character_leaves_no_spacer_under_the_cursor() {
     assert_eq!(cursor.map(|c| (c.x, c.y)), Some((0, 0)));
     // The left-over spacer shows as a blank cell.
     assert_eq!(line(&t, 0), " x");
+}
+
+#[test]
+fn a_synchronized_update_keeps_the_view_in_history() {
+    let mut t = Terminal::new(10, 5, &Settings::new(100));
+    for i in 0..8 {
+        t.feed(format!("line {i}\r\n").as_bytes());
+    }
+    t.scroll_lines(1);
+    // The same deletes as above, held back by a synchronized update and
+    // applied when it ends.
+    t.feed(b"\x1b[?2026h");
+    for _ in 0..10 {
+        t.feed(b"\x1b[3H\x1b[2M");
+    }
+    t.flush_sync();
+    let _ = screen(&t);
+    assert_eq!(line(&t, 0), "line 0");
+}
+
+#[test]
+fn searching_past_a_wide_character_that_was_overwritten_ends() {
+    // From a fuzzer find: narrowing the terminal leaves a line ending in
+    // a spacer that says a wide character goes on at the start of the
+    // next line, and "M" then overwrites that character. Upstream's
+    // search loops forever on such a line.
+    let mut t = Terminal::new(20, 6, &Settings::new(50));
+    t.feed(b"M\xa5\xe4");
+    t.resize(18, 1);
+    t.feed(b"\xa2\x95\x00\xff\xff\xe4\xa2\x95\x00\x08\xcd");
+    t.resize(25, 1);
+    t.feed(b"\xa5\xe4\xa2\x95\x00\x00\x1b\x00\x08\xa2\x08");
+    t.resize(8, 1);
+    t.feed(b"M");
+    t.scroll_lines(1);
+    t.search_open();
+    t.search_set(" ");
+    let _ = screen(&t);
 }

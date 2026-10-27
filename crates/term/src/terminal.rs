@@ -231,12 +231,20 @@ impl Terminal {
             if let Some(piece) = bytes.get(start..end).filter(|p| !p.is_empty()) {
                 let queued = self.events.0.borrow().len();
                 self.parser.advance(&mut self.term, piece);
-                self.clamp_view();
-                self.drop_lone_spacers();
+                self.repair();
                 self.follow_title(queued);
             }
             start = end;
         }
+    }
+
+    /// Puts right what alacritty_terminal 0.26 can leave wrong after
+    /// processing output, before anything draws or reads the grid. Every
+    /// path that hands it bytes calls this: [`Self::feed`], and
+    /// [`Self::flush_sync`] for a synchronized update's buffered bytes.
+    fn repair(&mut self) {
+        self.clamp_view();
+        self.drop_lone_spacers();
     }
 
     /// Keeps a scrolled-back view inside the history. alacritty_terminal
@@ -264,6 +272,29 @@ impl Terminal {
         for line in 0..grid.screen_lines() {
             let cell = &mut grid[Line(line as i32)][Column(0)];
             cell.flags.remove(TermFlags::WIDE_CHAR_SPACER);
+        }
+    }
+
+    /// Clears the spacer at the end of a line that says a wide character
+    /// went on to the next line, where the next line does not start with
+    /// one (it was overwritten or erased since, or there is no next line).
+    /// alacritty_terminal 0.26's search skips such a spacer towards the
+    /// wide character and, starting there, never comes back to where it
+    /// started: it loops for ever. Run before each search, over the whole
+    /// scrollback; searching is rare and the check is two cells a line.
+    fn drop_lost_wide_spacers(&mut self) {
+        let (top, bottom) = (self.term.topmost_line(), self.term.bottommost_line());
+        let grid = self.term.grid_mut();
+        let last = grid.last_column();
+        for line in top.0..=bottom.0 {
+            let continued = line < bottom.0
+                && grid[Line(line + 1)][Column(0)]
+                    .flags
+                    .contains(TermFlags::WIDE_CHAR);
+            let cell = &mut grid[Line(line)][last];
+            if !continued && cell.flags.contains(TermFlags::LEADING_WIDE_CHAR_SPACER) {
+                cell.flags.remove(TermFlags::LEADING_WIDE_CHAR_SPACER);
+            }
         }
     }
 
@@ -308,6 +339,7 @@ impl Terminal {
     /// Ends a pending synchronized update and shows what it buffered.
     pub fn flush_sync(&mut self) {
         self.parser.stop_sync(&mut self.term);
+        self.repair();
     }
 
     /// What the host's output asked the UI to do, in order.
@@ -648,6 +680,10 @@ impl Terminal {
     }
 
     fn search_from(&mut self, origin: Point, direction: Direction, side: Side) {
+        if self.search.is_none() {
+            return;
+        }
+        self.drop_lost_wide_spacers();
         let Some(search) = &mut self.search else {
             return;
         };
