@@ -22,6 +22,17 @@ ferossh-viewer = { path = "../crates/viewer", features = ["vnc", "rdp"] }
 ferossh-worker = { path = "../crates/worker" }
 ferossh-zmodem = { path = "../crates/zmodem" }
 
+# Release exes wrap on integer overflow; the fuzz build checks for it.
+# IronRDP's fast-path code turns an empty surface-bits rectangle into
+# right = left - 1 by subtracting with overflow (ironrdp-session 0.12,
+# fast_path.rs), and then skips the wrapped rectangle as outside the
+# image. Build that crate the way it ships, so the fuzzer goes on to
+# what would fail there. (Cargo passes the overflow flag only when it
+# differs from debug-assertions, which cargo-fuzz turns on.)
+[profile.release.package.ironrdp-session]
+debug-assertions = true
+overflow-checks = false
+
 # Kept out of the main workspace: fuzzing needs nightly and libFuzzer.
 [workspace]
 
