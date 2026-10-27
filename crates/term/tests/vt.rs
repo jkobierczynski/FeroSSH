@@ -530,8 +530,8 @@ fn fuzz_regressions_do_not_panic() {
         // then a word on that line is copied.
         b"@\xc8$\xff  \x01\xff\xff\xff\xff\xff\xfb\xffM\xa5\xe4\xa2\x95\x00\x08\x1b\xff\xff\xff\xff\
           M\x1b0P\xa2\x95@\xa5\xe4\xa2\x95\x00\x08MB",
-        // crash-be28eab91438fb7504906e3dfe70958e4efc318d: the same, by
-        // way of the alternate screen.
+        // crash-be28eab91438fb7504906e3dfe70958e4efc318d: the same bug,
+        // another way there.
         b"@MzU\xe4\xa2\x95\xa5\xe4\xa2\x95\x00\x08\x00\x00\x1bMM1049'\x00\x00\x00\x00\x00\x06\
           \x00\x00\x00\x00\x00\x00\x00\x07\x00\x00",
     ];
