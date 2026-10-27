@@ -281,6 +281,9 @@ jobs:
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-fuzz
+      # Inputs that once crashed a target start its corpus, so every run
+      # tries them again first.
+      - run: mkdir -p fuzz/corpus && cp -r fuzz/regressions/. fuzz/corpus/
       # The prebuilt cargo-fuzz is a musl binary and would default to the musl
       # target, which AddressSanitizer does not support.
       - run: cargo +nightly fuzz run --target x86_64-unknown-linux-gnu ipc_decode -- -max_total_time=60

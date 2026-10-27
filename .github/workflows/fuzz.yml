@@ -49,6 +49,13 @@ jobs:
           path: fuzz/corpus/${{ matrix.target }}
           key: fuzz-corpus-${{ matrix.target }}-${{ github.run_id }}
           restore-keys: fuzz-corpus-${{ matrix.target }}-
+      # Inputs that once crashed the target join the corpus kept between runs.
+      - name: Add past crashes
+        run: |
+          if [ -d fuzz/regressions/${{ matrix.target }} ]; then
+            mkdir -p fuzz/corpus/${{ matrix.target }}
+            cp fuzz/regressions/${{ matrix.target }}/* fuzz/corpus/${{ matrix.target }}/
+          fi
       - name: Fuzz
         env:
           MINUTES: ${{ inputs.minutes || '15' }}

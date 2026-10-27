@@ -490,3 +490,55 @@ fn garbage_does_not_panic() {
     t.feed(&bytes[..1000]);
     let _ = screen(&t);
 }
+
+#[test]
+fn deleting_lines_while_scrolled_back_keeps_the_view_in_history() {
+    // Three lines of history, viewed one line back.
+    let mut t = Terminal::new(10, 5, &Settings::new(100));
+    for i in 0..8 {
+        t.feed(format!("line {i}\r\n").as_bytes());
+    }
+    t.scroll_lines(1);
+    // Delete lines from the middle of the screen, again and again. None
+    // of them goes into history, but alacritty_terminal moves the view
+    // back for each one.
+    for _ in 0..10 {
+        t.feed(b"\x1b[3H\x1b[2M");
+        let _ = screen(&t);
+    }
+    // The view stops at the oldest line instead of reaching past it.
+    assert_eq!(line(&t, 0), "line 0");
+    // A scroll region under a status line does the same.
+    t.feed(b"\x1b[2;5r\x1b[5H");
+    for _ in 0..10 {
+        t.feed(b"\n");
+        let _ = screen(&t);
+    }
+    assert_eq!(line(&t, 0), "line 0");
+}
+
+/// Inputs the `term_feed` fuzz target once crashed on, run the way it runs
+/// them. Their files are in `fuzz/regressions/term_feed`.
+#[test]
+fn fuzz_regressions_do_not_panic() {
+    let inputs: [&[u8]; 1] = [
+        // crash-4e843404021a197da920428c087b4ed1c597ca5f: a resize, a
+        // scroll back, then CSI M with the view past the history.
+        b"\x832[\xff[%&)\x1b[\xffM",
+    ];
+    for data in inputs {
+        let (&split, stream) = data.split_first().unwrap();
+        let mut t = Terminal::new(20, 6, &Settings::new(50));
+        let mut g = Grid::new(1, 1);
+        for (i, chunk) in stream.chunks(usize::from(split % 64).max(1)).enumerate() {
+            t.feed(chunk);
+            let _ = t.take_actions();
+            match (split as usize + i) % 11 {
+                0 => t.resize(usize::from(chunk[0] % 30), usize::from(split % 9)),
+                1 => t.scroll_lines(i32::from(chunk[0] as i8)),
+                _ => {}
+            }
+            let _ = t.draw_into(&mut g, i % 2 == 0);
+        }
+    }
+}
