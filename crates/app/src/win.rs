@@ -73,7 +73,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     DispatchMessageW, EnableMenuItem, FLASHW_TIMERNOFG, FLASHW_TRAY, FLASHWINFO, FlashWindowEx,
     GetClientRect, GetCursorPos, GetMenuItemCount, GetMenuItemID, GetMenuState, GetMenuStringW,
     GetMessageW, GetSubMenu, HCURSOR, HMENU, HTCLIENT, IDC_ARROW, IDC_IBEAM, IDC_SIZEALL,
-    IDC_SIZENS, IDC_SIZEWE, IDYES, KillTimer, LoadCursorW, MB_DEFBUTTON2, MB_ICONERROR,
+    IDC_SIZENS, IDC_SIZEWE, IDYES, KillTimer, LoadCursorW, LoadIconW, MB_DEFBUTTON2, MB_ICONERROR,
     MB_ICONINFORMATION, MB_ICONQUESTION, MB_ICONWARNING, MB_OK, MB_YESNO, MESSAGEBOX_RESULT,
     MESSAGEBOX_STYLE, MF_BYCOMMAND, MF_BYPOSITION, MF_CHECKED, MF_DISABLED, MF_GRAYED, MF_POPUP,
     MF_SEPARATOR, MF_STRING, MF_UNCHECKED, MSG, MessageBoxW, PM_REMOVE, PeekMessageW, PostMessageW,
@@ -1050,6 +1050,9 @@ fn create_and_run(launch: Launch, theme: Option<String>) -> Result<()> {
             lpfnWndProc: Some(wndproc),
             hInstance: instance,
             hCursor: LoadCursorW(None, IDC_IBEAM)?,
+            // The FeroSSH logo, icon group 1 (build.rs); Windows picks the
+            // size the title bar and taskbar need from the same group.
+            hIcon: LoadIconW(Some(instance), PCWSTR(1 as _)).unwrap_or_default(),
             // No background brush: the renderer paints every pixel.
             lpszClassName: class,
             ..Default::default()
