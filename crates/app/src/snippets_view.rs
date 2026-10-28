@@ -17,6 +17,10 @@
 //! have a hotkey (Ctrl+Shift+F1 to F12), and a `When` text that makes it
 //! an auto-response, typed by itself when the host prints that text.
 //!
+//! F5 runs the selected snippet on saved hosts picked on a page of its
+//! own (see [`crate::batch`]); the report of a run stays until Escape
+//! closes it, and Enter on a row shows that host's session in a tab.
+//!
 //! Drawn into a [`Grid`] like the session manager; keys come in as
 //! [`SideKey`]s and what the user chose goes out as a [`SnipAction`].
 
@@ -24,6 +28,7 @@ use ferossh_config::login::{self, Arg, Place, Snippet, Step};
 use ferossh_config::record::Recording;
 use ferossh_render::{Flags, Grid, Rgb};
 
+use crate::batch::{Password, PickField, PickLine, Picker, Report, RowState, Run};
 use crate::layout::PaneId;
 use crate::session_form::Line;
 use crate::sessions::SideKey;
@@ -60,67 +65,6 @@ fn var(vars: &Vars, name: &str) -> String {
         .unwrap_or_default()
 }
 
-/// Where one pane's run of a snippet is, in the report.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum RowState {
-    /// Running; waiting for this, if anything.
-    Running(Option<String>),
-    Done,
-    Failed(String),
-    Stopped,
-}
-
-/// One pane's row in the report.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ReportRow {
-    pub pane: PaneId,
-    /// The pane's host.
-    pub label: String,
-    pub state: RowState,
-    /// What its `@capture` steps kept, in order.
-    pub values: Vec<String>,
-}
-
-/// A live report of a snippet run on several panes, or one with
-/// `@capture` steps: a row per pane, updated as each runs.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Report {
-    pub name: String,
-    pub rows: Vec<ReportRow>,
-}
-
-impl Report {
-    pub fn row_mut(&mut self, pane: PaneId) -> Option<&mut ReportRow> {
-        self.rows.iter_mut().find(|r| r.pane == pane)
-    }
-
-    /// The report as tab-separated text, for a spreadsheet.
-    pub fn table(&self) -> String {
-        let width = self.rows.iter().map(|r| r.values.len()).max().unwrap_or(0);
-        let mut out = String::from("Host\tStatus");
-        for i in 1..=width {
-            out.push_str(&format!("\tValue {i}"));
-        }
-        out.push_str("\r\n");
-        let cell = |t: &str| t.replace(['\t', '\r', '\n'], " ");
-        for r in &self.rows {
-            let status = match &r.state {
-                RowState::Running(_) => "running".to_owned(),
-                RowState::Done => "done".to_owned(),
-                RowState::Failed(why) => format!("failed: {why}"),
-                RowState::Stopped => "stopped".to_owned(),
-            };
-            out.push_str(&format!("{}\t{}", cell(&r.label), cell(&status)));
-            for v in &r.values {
-                out.push('\t');
-                out.push_str(&cell(v));
-            }
-            out.push_str("\r\n");
-        }
-        out
-    }
-}
-
 /// How a step shows in the "what will be typed" preview.
 fn preview(step: &Step) -> String {
     match step {
@@ -152,6 +96,24 @@ pub enum SnipAction {
     Delete(usize),
     /// Put this text (the report, tab-separated) on the clipboard.
     Copy(String),
+    /// Pick the hosts to run snippet `name` on (F5).
+    PickHosts { name: String, lines: Vec<String> },
+    /// Run snippet `name` on `hosts`, each in a session of its own.
+    RunOn {
+        name: String,
+        hosts: Vec<Place>,
+        run: Run,
+    },
+    /// Show this row's session in a tab.
+    ShowRow(PaneId),
+    /// Save the report as CSV.
+    SaveCsv(String),
+    /// Run the failed and stopped hosts again.
+    Retry,
+    /// Stop the run: queued hosts never start.
+    Cancel,
+    /// The report closed: its sessions that no tab shows can go.
+    CloseReport(Report),
     /// Back to the terminal.
     Leave,
 }
@@ -301,6 +263,9 @@ struct Asking {
     values: Vec<String>,
     focus: usize,
     cursor: usize,
+    /// For a run on picked hosts: the hosts, how many at once and the
+    /// run's password.
+    on: Option<(Vec<Place>, usize, Option<Password>)>,
 }
 
 impl Asking {
@@ -326,7 +291,24 @@ impl Asking {
         )
     }
 
-    fn done(&self) -> SnipAction {
+    fn done(&mut self) -> SnipAction {
+        if let Some((hosts, parallel, password)) = self.on.take() {
+            return SnipAction::RunOn {
+                name: self.name.clone(),
+                hosts,
+                run: Run {
+                    lines: self.lines.clone(),
+                    args: self
+                        .args
+                        .iter()
+                        .map(|a| a.number)
+                        .zip(self.values.iter().cloned())
+                        .collect(),
+                    parallel,
+                    password,
+                },
+            };
+        }
         SnipAction::Type {
             name: self.name.clone(),
             steps: self.filled(),
@@ -417,7 +399,14 @@ pub struct SnippetsView {
     draft: Option<Draft>,
     asking: Option<Asking>,
     report: Option<Report>,
+    /// The first report row shown.
+    report_scroll: usize,
+    picker: Option<Picker>,
 }
+
+/// Lines of the picker above its list: title, help, filter, at once,
+/// password and a gap.
+pub const PICK_HEAD: usize = 6;
 
 impl SnippetsView {
     /// The indexes of the snippets the filter keeps: the ones for the
@@ -451,7 +440,26 @@ impl SnippetsView {
     pub fn show_report(&mut self, report: Report) {
         self.draft = None;
         self.asking = None;
+        self.picker = None;
         self.report = Some(report);
+        self.report_scroll = 0;
+    }
+
+    /// Shows the page that picks the hosts to run a snippet on.
+    pub fn show_picker(&mut self, picker: Picker) {
+        self.draft = None;
+        self.asking = None;
+        self.picker = Some(picker);
+    }
+
+    /// Whether the host picker is shown.
+    pub fn picking(&self) -> bool {
+        self.picker.is_some()
+    }
+
+    /// The report shown.
+    pub fn report(&self) -> Option<&Report> {
+        self.report.as_ref()
     }
 
     /// The report shown, to update as the runs go.
@@ -476,7 +484,11 @@ impl SnippetsView {
         self.scroll = 0;
         self.draft = None;
         self.asking = None;
-        self.report = None;
+        self.picker = None;
+        // A run on picked hosts stays until its report is closed.
+        if self.report.as_ref().is_some_and(|r| r.run.is_none()) {
+            self.report = None;
+        }
     }
 
     /// What typing snippet `name` does: [`SnipAction::Type`] at once when
@@ -505,6 +517,7 @@ impl SnippetsView {
             args,
             focus: 0,
             cursor: 0,
+            on: None,
         };
         a.set_focus(0);
         self.draft = None;
@@ -640,17 +653,11 @@ impl SnippetsView {
     }
 
     pub fn key(&mut self, key: SideKey, all: &[Snippet], rows: usize) -> Option<SnipAction> {
-        if let Some(r) = &self.report {
-            return match key {
-                SideKey::Escape => {
-                    self.report = None;
-                    Some(SnipAction::Leave)
-                }
-                SideKey::Char('c' | 'C') | SideKey::Enter { .. } => {
-                    Some(SnipAction::Copy(r.table()))
-                }
-                _ => None,
-            };
+        if self.report.is_some() {
+            return self.report_key(key, rows);
+        }
+        if self.picker.is_some() {
+            return self.pick_key(key, rows);
         }
         if self.asking.is_some() {
             return self.ask_key(key);
@@ -704,9 +711,159 @@ impl SnippetsView {
                 self.draft = Some(Draft::new(Some(i), all.get(i)?));
             }
             SideKey::Delete => return Some(SnipAction::Delete(here?)),
+            SideKey::Refresh => {
+                let s = all.get(here?)?;
+                return Some(SnipAction::PickHosts {
+                    name: s.name.clone(),
+                    lines: s.lines.clone(),
+                });
+            }
             _ => {}
         }
         self.clamp(self.shown(all).len(), visible);
+        None
+    }
+
+    fn report_key(&mut self, key: SideKey, rows: usize) -> Option<SnipAction> {
+        let r = self.report.as_mut()?;
+        let n = r.rows.len();
+        let visible = rows.saturating_sub(HEADER).max(1);
+        match key {
+            SideKey::Escape if r.run.is_some() && !r.over() => return Some(SnipAction::Cancel),
+            SideKey::Escape => return self.report.take().map(SnipAction::CloseReport),
+            SideKey::Up => r.selected = r.selected.saturating_sub(1),
+            SideKey::Down => r.selected += 1,
+            SideKey::PageUp => r.selected = r.selected.saturating_sub(visible),
+            SideKey::PageDown => r.selected += visible,
+            SideKey::Home => r.selected = 0,
+            SideKey::End => r.selected = n.saturating_sub(1),
+            SideKey::Enter { .. } => {
+                return r.rows.get(r.selected)?.pane.map(SnipAction::ShowRow);
+            }
+            SideKey::Char('c' | 'C') => return Some(SnipAction::Copy(r.table())),
+            SideKey::Char('s' | 'S') => return Some(SnipAction::SaveCsv(r.csv())),
+            SideKey::Char('r' | 'R')
+                if r.run.is_some()
+                    && r.rows
+                        .iter()
+                        .any(|r| matches!(r.state, RowState::Failed(_) | RowState::Stopped)) =>
+            {
+                return Some(SnipAction::Retry);
+            }
+            _ => {}
+        }
+        r.selected = r.selected.min(n.saturating_sub(1));
+        if r.selected < self.report_scroll {
+            self.report_scroll = r.selected;
+        }
+        if r.selected >= self.report_scroll + visible {
+            self.report_scroll = r.selected + 1 - visible;
+        }
+        None
+    }
+
+    fn pick_key(&mut self, key: SideKey, rows: usize) -> Option<SnipAction> {
+        let p = self.picker.as_mut()?;
+        let n = p.lines().len();
+        let visible = rows.saturating_sub(PICK_HEAD).max(1);
+        let next = |f: PickField| match f {
+            PickField::List => PickField::Parallel,
+            PickField::Parallel => PickField::Password,
+            PickField::Password => PickField::List,
+        };
+        match (p.field, key) {
+            (_, SideKey::Escape) => {
+                self.picker = None;
+                return None;
+            }
+            (f, SideKey::Tab) => p.field = next(f),
+            (_, SideKey::Enter { .. }) => {
+                let (hosts, parallel) = p.start()?;
+                let password = (!p.password.0.is_empty()).then(|| p.password.clone());
+                let p = self.picker.take()?;
+                let args = login::args(&p.lines);
+                if args.is_empty() {
+                    return Some(SnipAction::RunOn {
+                        name: p.name,
+                        hosts,
+                        run: Run {
+                            lines: p.lines,
+                            args: Vec::new(),
+                            parallel,
+                            password,
+                        },
+                    });
+                }
+                // The variables differ per host: shown by name.
+                let vars = login::VARIABLES
+                    .iter()
+                    .map(|v| (*v, format!("${{{v}}}")))
+                    .collect();
+                let mut a = Asking {
+                    name: p.name,
+                    lines: p.lines,
+                    enter: true,
+                    vars,
+                    values: args.iter().map(|a| a.default.clone()).collect(),
+                    args,
+                    focus: 0,
+                    cursor: 0,
+                    on: Some((hosts, parallel, password)),
+                };
+                a.set_focus(0);
+                self.asking = Some(a);
+                return None;
+            }
+            (PickField::List, SideKey::Up) => p.selected = p.selected.saturating_sub(1),
+            (PickField::List, SideKey::Down) => p.selected += 1,
+            (PickField::List, SideKey::PageUp) => {
+                p.selected = p.selected.saturating_sub(visible);
+            }
+            (PickField::List, SideKey::PageDown) => p.selected += visible,
+            (PickField::List, SideKey::Home) => p.selected = 0,
+            (PickField::List, SideKey::End) => p.selected = n.saturating_sub(1),
+            (PickField::List, SideKey::Char(' ')) => p.toggle(),
+            (PickField::List, SideKey::Char(c))
+                if !c.is_control() && p.filter.chars().count() < 60 =>
+            {
+                p.filter.push(c);
+                p.selected = 0;
+            }
+            (PickField::List, SideKey::Backspace) => {
+                p.filter.pop();
+                p.selected = 0;
+            }
+            (_, SideKey::Up) => {
+                p.field = next(next(p.field));
+            }
+            (_, SideKey::Down) => p.field = next(p.field),
+            (PickField::Parallel, SideKey::Char(c))
+                if c.is_ascii_digit() && p.parallel.len() < 2 =>
+            {
+                p.parallel.push(c);
+                p.error = None;
+            }
+            (PickField::Parallel, SideKey::Backspace) => {
+                p.parallel.pop();
+            }
+            (PickField::Password, SideKey::Char(c))
+                if !c.is_control() && p.password.0.chars().count() < MAX_TEXT =>
+            {
+                p.password.0.push(c);
+            }
+            (PickField::Password, SideKey::Backspace) => {
+                p.password.0.pop();
+            }
+            _ => {}
+        }
+        let n = p.lines().len();
+        p.selected = p.selected.min(n.saturating_sub(1));
+        if p.selected < p.scroll {
+            p.scroll = p.selected;
+        }
+        if p.selected >= p.scroll + visible {
+            p.scroll = p.selected + 1 - visible;
+        }
         None
     }
 
@@ -805,6 +962,25 @@ impl SnippetsView {
 
     /// A click on grid row `y` selects the snippet or field there.
     pub fn click(&mut self, y: usize, all: &[Snippet], rows: usize) {
+        if let Some(r) = &mut self.report {
+            if let Some(i) = y.checked_sub(HEADER) {
+                r.selected = (self.report_scroll + i).min(r.rows.len().saturating_sub(1));
+            }
+            return;
+        }
+        if let Some(p) = &mut self.picker {
+            match y {
+                2 => p.field = PickField::List,
+                3 => p.field = PickField::Parallel,
+                4 => p.field = PickField::Password,
+                y if y >= PICK_HEAD => {
+                    p.field = PickField::List;
+                    p.selected = (p.scroll + y - PICK_HEAD).min(p.lines().len().saturating_sub(1));
+                }
+                _ => {}
+            }
+            return;
+        }
         if let Some(a) = &mut self.asking {
             if let Some(i) = y.checked_sub(HEADER + 1) {
                 a.set_focus(i);
@@ -827,6 +1003,21 @@ impl SnippetsView {
 
     /// Wheel scrolling by `lines` (positive: up).
     pub fn scroll_by(&mut self, by: i32, all: &[Snippet], rows: usize) {
+        if self.report.is_some() || self.picker.is_some() {
+            let key = if by > 0 { SideKey::Up } else { SideKey::Down };
+            for _ in 0..by.unsigned_abs() {
+                if self.report.is_some() {
+                    self.report_key(key, rows);
+                } else if self
+                    .picker
+                    .as_ref()
+                    .is_some_and(|p| p.field == PickField::List)
+                {
+                    self.pick_key(key, rows);
+                }
+            }
+            return;
+        }
         if self.draft.is_some() {
             return;
         }
@@ -847,11 +1038,7 @@ impl SnippetsView {
             grid.set_row(y, line.cells(bg));
         };
         if let Some(r) = &self.report {
-            let done = r
-                .rows
-                .iter()
-                .filter(|r| !matches!(r.state, RowState::Running(_)))
-                .count();
+            let done = r.rows.iter().filter(|r| r.state.over()).count();
             let mut line = Line::new(width, bg);
             line.put(
                 &fit(
@@ -863,11 +1050,12 @@ impl SnippetsView {
             );
             row(grid, 0, &mut line, bg);
             let mut line = Line::new(width, bg);
-            line.put(
-                &fit(" Enter or C copies it as a table · Esc closes", width),
-                palette.dim,
-                Flags::ITALIC,
-            );
+            let help = match (&r.run, r.over()) {
+                (Some(_), false) => " Enter shows · C copies · S saves CSV · Esc stops the run",
+                (Some(_), true) => " Enter shows · C copies · S saves CSV · R retries · Esc closes",
+                (None, _) => " Enter shows · C copies as a table · S saves CSV · Esc closes",
+            };
+            line.put(&fit(help, width), palette.dim, Flags::ITALIC);
             row(grid, 1, &mut line, bg);
             let label_w = r
                 .rows
@@ -877,13 +1065,19 @@ impl SnippetsView {
                 .unwrap_or(0)
                 .min(width / 3);
             let mut y = HEADER;
-            for item in &r.rows {
+            for (i, item) in r.rows.iter().enumerate().skip(self.report_scroll) {
                 if y >= rows {
                     break;
                 }
-                let mut line = Line::new(width, bg);
+                let row_bg = if focused && i == r.selected {
+                    palette.active
+                } else {
+                    bg
+                };
+                let mut line = Line::new(width, row_bg);
                 let (mark, colour) = match &item.state {
-                    RowState::Running(_) => ("…", palette.dim),
+                    RowState::Queued => ("·", palette.dim),
+                    RowState::Connecting | RowState::Running(_) => ("…", palette.dim),
                     RowState::Done => ("✓", palette.accent),
                     RowState::Failed(_) => ("✗", red),
                     RowState::Stopped => ("–", palette.dim),
@@ -901,9 +1095,138 @@ impl SnippetsView {
                     RowState::Running(Some(w)) if item.values.is_empty() => {
                         (format!("waiting for {w}"), palette.dim)
                     }
+                    RowState::Queued => ("queued".to_owned(), palette.dim),
+                    RowState::Connecting => ("logging in".to_owned(), palette.dim),
                     _ => (item.values.join(" · "), palette.text),
                 };
                 line.put(&fit(&text, left), colour, Flags::empty());
+                row(grid, y, &mut line, row_bg);
+                y += 1;
+            }
+            for y in y..rows {
+                row(grid, y, &mut Line::new(width, bg), bg);
+            }
+            return;
+        }
+        if let Some(p) = &self.picker {
+            let mut line = Line::new(width, bg);
+            line.put(
+                &fit(&format!(" Run {} on: {} picked", p.name, p.picked()), width),
+                palette.text,
+                Flags::BOLD,
+            );
+            row(grid, 0, &mut line, bg);
+            let mut line = Line::new(width, bg);
+            match &p.error {
+                Some(e) => line.put(&fit(&format!(" {e}"), width), red, Flags::empty()),
+                None => line.put(
+                    &fit(
+                        " Space picks · Tab: next field · Enter runs · Esc: back",
+                        width,
+                    ),
+                    palette.dim,
+                    Flags::ITALIC,
+                ),
+            };
+            row(grid, 1, &mut line, bg);
+            let password = "•".repeat(p.password.0.chars().count());
+            let fields = [
+                (
+                    PickField::List,
+                    "Filter  ",
+                    p.filter.as_str(),
+                    "type to filter",
+                ),
+                (
+                    PickField::Parallel,
+                    "At once ",
+                    p.parallel.as_str(),
+                    "1 to 16",
+                ),
+                (
+                    PickField::Password,
+                    "Password",
+                    password.as_str(),
+                    "for hosts with none saved; never stored",
+                ),
+            ];
+            for (y, (field, label, value, hint)) in fields.into_iter().enumerate() {
+                let here = focused && p.field == field && field != PickField::List;
+                let row_bg = if here { palette.active } else { bg };
+                let mut line = Line::new(width, row_bg);
+                line.put(&format!(" {label} "), palette.dim, Flags::empty());
+                let room = width.saturating_sub(line.col);
+                if value.is_empty() {
+                    line.put(&fit(hint, room), palette.dim, Flags::ITALIC);
+                } else {
+                    line.put(&fit(value, room), palette.text, Flags::empty());
+                }
+                if here || (field == PickField::List && focused && p.field == field) {
+                    line.put("▏", palette.accent, Flags::empty());
+                }
+                row(grid, y + HEADER, &mut line, row_bg);
+            }
+            row(grid, PICK_HEAD - 1, &mut Line::new(width, bg), bg);
+            let lines = p.lines();
+            let mut y = PICK_HEAD;
+            for (i, l) in lines.iter().enumerate().skip(p.scroll) {
+                if y >= rows {
+                    break;
+                }
+                let row_bg = if focused && p.field == PickField::List && i == p.selected {
+                    palette.active
+                } else {
+                    bg
+                };
+                let mut line = Line::new(width, row_bg);
+                match *l {
+                    PickLine::Folder(f) => {
+                        let folder = p.folders.get(f).cloned().flatten().unwrap_or_default();
+                        let (all, picked) = p
+                            .hosts
+                            .iter()
+                            .filter(|h| h.place.folder.as_deref() == Some(folder.as_str()))
+                            .fold((0, 0), |(a, k), h| (a + 1, k + usize::from(h.picked)));
+                        line.put(
+                            &fit(&format!(" {folder}  {picked}/{all}"), width),
+                            palette.text,
+                            Flags::BOLD,
+                        );
+                    }
+                    PickLine::Host(h) => {
+                        let Some(h) = p.hosts.get(h) else { continue };
+                        let mark = if h.picked { "[x]" } else { "[ ]" };
+                        line.put(
+                            &format!("  {mark} "),
+                            if h.picked {
+                                palette.accent
+                            } else {
+                                palette.dim
+                            },
+                            Flags::BOLD,
+                        );
+                        let room = width.saturating_sub(line.col);
+                        line.put(&fit(&h.place.session, room), palette.text, Flags::empty());
+                        let room = width.saturating_sub(line.col + 2);
+                        if room > 4 {
+                            line.put(
+                                &fit(&format!("  {}", h.detail), room + 2),
+                                palette.dim,
+                                Flags::empty(),
+                            );
+                        }
+                    }
+                }
+                row(grid, y, &mut line, row_bg);
+                y += 1;
+            }
+            if lines.is_empty() && y < rows {
+                let mut line = Line::new(width, bg);
+                line.put(
+                    &fit(" No saved session matches.", width),
+                    palette.dim,
+                    Flags::ITALIC,
+                );
                 row(grid, y, &mut line, bg);
                 y += 1;
             }
@@ -1148,7 +1471,7 @@ impl SnippetsView {
             let mut line = Line::new(width, bg);
             line.put(
                 &fit(
-                    " Enter types · Shift+Enter: no Enter · Ins new · F2 edit · Del",
+                    " Enter types · Shift+Enter: no Enter · F5 on hosts · Ins new · F2 edit · Del",
                     width,
                 ),
                 palette.dim,
@@ -1160,9 +1483,10 @@ impl SnippetsView {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::indexing_slicing)]
+#[allow(clippy::unwrap_used, clippy::indexing_slicing, clippy::panic)]
 mod tests {
     use super::*;
+    use crate::batch::{PickHost, ReportRow};
     use ferossh_render::Theme;
 
     fn snippets() -> Vec<Snippet> {
@@ -1521,23 +1845,13 @@ mod tests {
     fn reports_show_each_pane_and_copy_as_a_table() {
         let all = snippets();
         let mut v = SnippetsView::default();
-        v.show_report(Report {
-            name: "Version".into(),
-            rows: vec![
-                ReportRow {
-                    pane: 1,
-                    label: "sw1".into(),
-                    state: RowState::Running(Some("Version *,".into())),
-                    values: vec![],
-                },
-                ReportRow {
-                    pane: 2,
-                    label: "sw2".into(),
-                    state: RowState::Failed("\"#\" did not show up".into()),
-                    values: vec![],
-                },
-            ],
-        });
+        let sw1 = ReportRow::new("sw1", Some(1), RowState::Running(Some("Version *,".into())));
+        let sw2 = ReportRow::new(
+            "sw2",
+            Some(2),
+            RowState::Failed("\"#\" did not show up".into()),
+        );
+        v.show_report(Report::new("Version", vec![sw1, sw2], None));
         let t = texts(&mut v, &all);
         assert!(t[0].contains("Version · 1 of 2 over"), "{t:#?}");
         assert!(
@@ -1563,7 +1877,158 @@ mod tests {
                     .into()
             ))
         );
-        assert_eq!(v.key(SideKey::Escape, &all, 20), Some(SnipAction::Leave));
+        assert_eq!(
+            v.key(SideKey::Enter { split: false }, &all, 20),
+            Some(SnipAction::ShowRow(1))
+        );
+        v.key(SideKey::Down, &all, 20);
+        assert_eq!(
+            v.key(SideKey::Enter { split: false }, &all, 20),
+            Some(SnipAction::ShowRow(2))
+        );
+        assert!(
+            matches!(v.key(SideKey::Char('s'), &all, 20), Some(SnipAction::SaveCsv(c)) if c.starts_with("Host,Status"))
+        );
+        assert_eq!(
+            v.key(SideKey::Char('r'), &all, 20),
+            None,
+            "panes that were open never retry"
+        );
+        assert!(matches!(
+            v.key(SideKey::Escape, &all, 20),
+            Some(SnipAction::CloseReport(_))
+        ));
         assert!(!v.reporting());
+    }
+
+    fn picker() -> Picker {
+        let host = |name: &str, folder: Option<&str>| PickHost {
+            place: Place {
+                session: name.into(),
+                host: format!("{name}.lab"),
+                folder: folder.map(str::to_owned),
+            },
+            detail: format!("admin@{name}.lab"),
+            picked: false,
+        };
+        Picker::new(
+            "Version",
+            &[
+                "show version | i ${1:Version}".into(),
+                "@capture Version *,".into(),
+            ],
+            vec![
+                host("sw1", Some("Network")),
+                host("sw2", Some("Network")),
+                host("web", None),
+            ],
+            4,
+        )
+    }
+
+    #[test]
+    fn hosts_are_picked_then_arguments_asked_then_run() {
+        let all = snippets();
+        let mut v = SnippetsView::default();
+        assert_eq!(
+            v.key(SideKey::Refresh, &all, 20),
+            Some(SnipAction::PickHosts {
+                name: all[0].name.clone(),
+                lines: all[0].lines.clone()
+            })
+        );
+        v.show_picker(picker());
+        let t = texts(&mut v, &all);
+        assert!(t[0].contains("Run Version on: 0 picked"), "{t:#?}");
+        assert!(
+            t[6].contains("Network  0/2") && t[7].contains("[ ] sw1"),
+            "{t:#?}"
+        );
+        // Enter with nothing picked says so.
+        assert_eq!(v.key(SideKey::Enter { split: false }, &all, 20), None);
+        assert!(texts(&mut v, &all)[1].contains("Pick at least one"));
+        v.key(SideKey::Char(' '), &all, 20);
+        let t = texts(&mut v, &all);
+        assert!(
+            t[6].contains("2/2") && t[8].contains("[x] sw2") && t[9].contains("[ ] web"),
+            "{t:#?}"
+        );
+        v.key(SideKey::Tab, &all, 20);
+        v.key(SideKey::Backspace, &all, 20);
+        v.key(SideKey::Char('2'), &all, 20);
+        v.key(SideKey::Tab, &all, 20);
+        for c in "s3cret".chars() {
+            v.key(SideKey::Char(c), &all, 20);
+        }
+        let t = texts(&mut v, &all);
+        assert!(
+            t[3].contains("At once  2") && t[4].contains("••••••"),
+            "{t:#?}"
+        );
+        assert!(!t.iter().any(|l| l.contains("s3cret")));
+        assert_eq!(
+            v.key(SideKey::Enter { split: false }, &all, 20),
+            None,
+            "asks for $1"
+        );
+        assert!(v.asking() && !v.picking());
+        let t = texts(&mut v, &all);
+        assert!(
+            t.iter().any(|l| l.contains("show version | i Version")),
+            "{t:#?}"
+        );
+        let Some(SnipAction::RunOn { name, hosts, run }) =
+            v.key(SideKey::Enter { split: false }, &all, 20)
+        else {
+            panic!("no run")
+        };
+        assert_eq!(name, "Version");
+        assert_eq!(
+            hosts.iter().map(|h| h.session.as_str()).collect::<Vec<_>>(),
+            ["sw1", "sw2"]
+        );
+        assert_eq!(run.parallel, 2);
+        assert_eq!(run.args, [(1, "Version".to_owned())]);
+        assert_eq!(
+            run.password.map(|p| p.0.to_string()).as_deref(),
+            Some("s3cret")
+        );
+        assert!(!format!("{:?}", v).contains("s3cret"));
+    }
+
+    #[test]
+    fn a_run_report_stops_then_retries_and_outlives_reopening() {
+        let all = snippets();
+        let mut v = SnippetsView::default();
+        let rows = vec![
+            ReportRow::new("sw1", Some(5), RowState::Running(None)),
+            ReportRow::new("sw2", None, RowState::Queued),
+        ];
+        let run = Run {
+            lines: vec!["show clock".into()],
+            args: Vec::new(),
+            parallel: 1,
+            password: None,
+        };
+        v.show_report(Report::new("Clock", rows, Some(run)));
+        let t = texts(&mut v, &all);
+        assert!(
+            t[1].contains("Esc stops the run") && t[3].contains("queued"),
+            "{t:#?}"
+        );
+        assert_eq!(v.key(SideKey::Escape, &all, 20), Some(SnipAction::Cancel));
+        v.reset();
+        assert!(v.reporting(), "a run's report stays until closed");
+        v.report_mut().unwrap().cancel();
+        assert_eq!(v.key(SideKey::Char('r'), &all, 20), Some(SnipAction::Retry));
+        v.key(SideKey::Down, &all, 20);
+        assert_eq!(
+            v.key(SideKey::Enter { split: false }, &all, 20),
+            None,
+            "no session yet"
+        );
+        assert!(
+            matches!(v.key(SideKey::Escape, &all, 20), Some(SnipAction::CloseReport(r)) if r.name == "Clock")
+        );
     }
 }
