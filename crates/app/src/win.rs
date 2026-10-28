@@ -213,7 +213,7 @@ const FONT_CHOICES: [&str; 8] = [
 
 /// Menu command ids. Shortcuts map to the same ids.
 mod cmd {
-    pub const RESTART_SHELL: u32 = 100;
+    pub const LOCAL_SHELL: u32 = 100;
     pub const EXIT: u32 = 101;
     pub const CONNECT: u32 = 102;
     pub const RECONNECT: u32 = 103;
@@ -1302,7 +1302,7 @@ fn build_menu() -> Result<HMENU> {
         item(file, cmd::UPLOAD, "&Upload files...\tCtrl+Shift+U")?;
         item(file, cmd::DOWNLOADS, "Open do&wnload folder")?;
         separator(file)?;
-        item(file, cmd::RESTART_SHELL, "Open &local shell")?;
+        item(file, cmd::LOCAL_SHELL, "Open &local shell")?;
         item(file, cmd::IMPORT, "&Import sessions...")?;
         separator(file)?;
         item(file, cmd::EXIT, "E&xit\tAlt+F4")?;
@@ -6901,6 +6901,20 @@ impl Window {
         self.ask_destination(id);
     }
 
+    /// Open local shell: starts it in `pane` if that waits at the connect
+    /// prompt or holds a local shell that ended, else in a new tab, so a
+    /// running SSH, Telnet, serial or tmux session is never ended.
+    fn local_shell_in_new_tab(&mut self, pane: PaneId) {
+        let idle = match self.panes.get(&pane).map(|p| &p.host) {
+            Some(Host::Ask(t)) => t.is_empty(),
+            Some(Host::Local { exited, .. }) => *exited,
+            _ => false,
+        };
+        let id = if idle { pane } else { self.new_tab_pane() };
+        self.focus_terminal();
+        self.start_shell(id);
+    }
+
     /// Gives the keyboard back to the focused pane.
     fn focus_terminal(&mut self) {
         if self.side.focused {
@@ -7836,7 +7850,7 @@ impl Window {
             }
             cmd::REPLACE_KEY => return Some(Command::ReplaceHostKey),
             cmd::IMPORT => return Some(Command::ImportSessions),
-            cmd::RESTART_SHELL => self.start_shell(pane),
+            cmd::LOCAL_SHELL => self.local_shell_in_new_tab(pane),
             cmd::CONNECT => self.connect_in_new_tab(pane),
             cmd::RECONNECT => {
                 let pane = self.host_pane(pane);

@@ -349,7 +349,8 @@ mod tests {
     }
 
     /// Real `ssh-keygen` files: generates P-256 keys until one has a short
-    /// scalar (one in 256), then encrypts a copy with `ssh-keygen -p`.
+    /// scalar that `ssh-key` refuses (about one in 800 here, so 4096 tries
+    /// missed now and then), then encrypts a copy with `ssh-keygen -p`.
     #[test]
     fn ssh_keygen_short_scalar_keys_load() {
         use std::process::{Command, Stdio};
@@ -376,7 +377,7 @@ mod tests {
         let file = dir.join("k");
         let path = file.to_str().unwrap();
         let mut found = None;
-        for _ in 0..4096 {
+        for _ in 0..32_768 {
             let _ = std::fs::remove_file(&file);
             let _ = std::fs::remove_file(dir.join("k.pub"));
             assert!(keygen(&[
