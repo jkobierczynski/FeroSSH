@@ -16,6 +16,7 @@
 use std::time::{Duration, Instant};
 
 use ferossh_config::login::Place;
+use ferossh_config::trigger::OutputText;
 use zeroize::Zeroizing;
 
 use crate::layout::PaneId;
@@ -86,6 +87,27 @@ impl ReportRow {
             started: None,
         }
     }
+}
+
+/// The last line of text a run's session showed, without colours, cut
+/// short: why its login failed, for the report.
+pub fn last_line(text: &str) -> Option<String> {
+    let mut plain = String::new();
+    OutputText::default().feed(text.as_bytes(), &mut plain);
+    let line = plain
+        .split(['\r', '\n'])
+        .map(|l| {
+            l.trim()
+                .trim_start_matches('[')
+                .trim_end_matches(']')
+                .trim()
+        })
+        .rfind(|l| !l.is_empty())?;
+    let mut out: String = line.chars().take(100).collect();
+    if line.chars().count() > 100 {
+        out.push('…');
+    }
+    Some(out)
 }
 
 /// A password typed for a run: kept in memory only, wiped when dropped,
@@ -529,6 +551,24 @@ mod tests {
             r.csv(),
             "Host,Status,Value 1,Value 2\r\nsw0,done,15.2(4)E10,\"a,b\"\r\n\
              \"=cmd|' /C calc'!A0\",failed: asked for a password\r\n"
+        );
+    }
+
+    #[test]
+    fn the_last_line_says_why() {
+        assert_eq!(
+            last_line("\x1b[0;31mConnecting...\r\nConnection refused\x1b[0m\r\n\r\n").as_deref(),
+            Some("Connection refused")
+        );
+        assert_eq!(
+            last_line("\x1b[0;90m[Disconnected: too many authentication failures]\x1b[0m\r\n")
+                .as_deref(),
+            Some("Disconnected: too many authentication failures")
+        );
+        assert_eq!(last_line("\r\n \x1b[0m"), None);
+        assert_eq!(
+            last_line(&"x".repeat(300)).map(|l| l.chars().count()),
+            Some(101)
         );
     }
 

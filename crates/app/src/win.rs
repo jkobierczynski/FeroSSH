@@ -686,6 +686,8 @@ struct Window {
     /// Sessions of a run still logging in: the snippet starts once they
     /// are in.
     run_login: HashSet<PaneId>,
+    /// The last line each of those showed: why a login failed.
+    run_notes: HashMap<PaneId, String>,
 }
 
 /// A login script running in a pane.
@@ -1205,6 +1207,7 @@ fn create_and_run(launch: Launch, theme: Option<String>) -> Result<()> {
                 folders: None,
                 run_hidden: HashSet::new(),
                 run_login: HashSet::new(),
+                run_notes: HashMap::new(),
             });
         });
         // Files dropped from Explorer are uploaded, after a confirmation.
@@ -1996,6 +1999,11 @@ impl Window {
 
     /// Feeds local text (not from the host) to a pane's terminal.
     fn show(&mut self, id: PaneId, text: &str) {
+        if self.run_login.contains(&id)
+            && let Some(line) = batch::last_line(text)
+        {
+            self.run_notes.insert(id, line);
+        }
         if let Some(p) = self.panes.get_mut(&id) {
             p.term.feed(text.as_bytes());
         }
@@ -3064,12 +3072,15 @@ impl Window {
         if self.run_login.contains(&id) {
             // A run never reconnects by itself, and the password typed
             // for it answers the logins that have none saved.
+            // A password a run used is never saved: not the one typed for
+            // it, and one already in the Credential Manager stays as it is.
             session.auto_reconnect = false;
-            if self.run_password().is_some() {
-                session.password_source = true;
-                for hop in session.hops_mut() {
-                    hop.password_source = true;
-                }
+            session.remember_password = false;
+            let typed = self.run_password().is_some();
+            session.password_source |= typed;
+            for hop in session.hops_mut() {
+                hop.password_source |= typed;
+                hop.remember_password = false;
             }
         }
         let Some(p) = self.panes.get_mut(&id) else {
@@ -3574,12 +3585,28 @@ impl Window {
             .profile(&t.alias)
             .map(|p| p.password.clone())
             .unwrap_or_default();
-        if source == PasswordSource::Ask
-            && self.run_login.contains(&id)
+        if self.run_login.contains(&id)
             && let Some(password) = self.run_password()
         {
-            self.password_result(id, Ok(password), "the run");
-            return;
+            // A run's password answers the logins with none saved; one
+            // in the Credential Manager comes first.
+            let saved = match &source {
+                PasswordSource::Windows => {
+                    credman::read(&credman::target(&t.user, &t.hostname, t.port))
+                        .ok()
+                        .flatten()
+                }
+                _ => None,
+            };
+            if !matches!(source, PasswordSource::Command(_)) {
+                match saved {
+                    Some(saved) => {
+                        self.password_result(id, Ok(saved), "the Windows Credential Manager");
+                    }
+                    None => self.password_result(id, Ok(password), "the run"),
+                }
+                return;
+            }
         }
         match source {
             PasswordSource::Ask => {
@@ -6019,7 +6046,16 @@ impl Window {
                 row.pane = Some(id);
             }
             self.connect(id, &session);
-            self.check_run_login(id);
+            if self
+                .panes
+                .get(&id)
+                .is_some_and(|p| matches!(p.host, Host::Ask(_)))
+            {
+                let why = self.run_notes.get(&id).cloned();
+                self.fail_run_row(id, why.unwrap_or_else(|| "could not connect".into()));
+            } else {
+                self.check_run_login(id);
+            }
         }
         self.arm_run_timer();
         self.refresh_chrome();
@@ -6032,14 +6068,32 @@ impl Window {
         if !self.run_login.contains(&id) {
             return;
         }
+        // A key whose passphrase is not in the agent is skipped, as an
+        // empty passphrase does by hand: the login goes on with the next
+        // key or the password.
+        if let Some(Host::Ssh(s)) = self.panes.get_mut(&id).map(|p| &mut p.host)
+            && s.prompt_asks() == Some("a key passphrase")
+        {
+            let effects = s.prompt_input(b"\r");
+            self.apply(id, effects);
+            return;
+        }
+        let said = || self.run_notes.get(&id).cloned();
+        // A pane with no host yet is still being set up: `pump_run` checks
+        // that the connection started.
         let why = match self.panes.get(&id).map(|p| &p.host) {
             Some(Host::Ssh(s)) => match s.state() {
                 State::Blocked => Some("the host key changed".to_owned()),
-                State::Ended => Some("could not connect or log in".to_owned()),
+                State::Ended => {
+                    Some(said().unwrap_or_else(|| "could not connect or log in".into()))
+                }
                 _ => s.prompt_asks().map(|what| format!("asked for {what}")),
             },
-            Some(Host::Telnet(s)) if s.state() != State::Ended => None,
-            _ => Some("could not connect".to_owned()),
+            Some(Host::Telnet(s)) if s.state() == State::Ended => {
+                Some(said().unwrap_or_else(|| "could not connect".into()))
+            }
+            Some(_) => None,
+            None => Some("the session was closed".to_owned()),
         };
         if let Some(why) = why {
             self.fail_run_row(id, why);
@@ -6049,6 +6103,7 @@ impl Window {
     /// Fails the row of a run's pane `id`; the next host may start.
     fn fail_run_row(&mut self, id: PaneId, why: String) {
         self.run_login.remove(&id);
+        self.run_notes.remove(&id);
         self.scripts.remove(&id);
         if let Some(row) = self.snippets_view.report_mut().and_then(|r| r.row_mut(id))
             && !row.state.over()
@@ -6062,6 +6117,7 @@ impl Window {
     /// starts there, its arguments and that host's variables filled in.
     fn begin_run_snippet(&mut self, id: PaneId) {
         self.run_login.remove(&id);
+        self.run_notes.remove(&id);
         let Some((name, lines, args)) = self.snippets_view.report().and_then(|r| {
             let run = r.run.as_ref()?;
             Some((r.name.clone(), run.lines.clone(), run.args.clone()))
@@ -6106,6 +6162,7 @@ impl Window {
     /// Ends a run's session that no tab shows.
     fn drop_run_pane(&mut self, id: PaneId) {
         self.run_login.remove(&id);
+        self.run_notes.remove(&id);
         self.scripts.remove(&id);
         if self.run_hidden.remove(&id) {
             self.end_host(id);
@@ -6124,6 +6181,7 @@ impl Window {
             .unwrap_or_default();
         for p in panes {
             self.scripts.remove(&p);
+            self.run_notes.remove(&p);
             if self.run_login.remove(&p) && self.run_hidden.contains(&p) {
                 self.end_host(p);
             }
@@ -6199,6 +6257,7 @@ impl Window {
         for p in late {
             self.scripts.remove(&p);
             self.run_login.remove(&p);
+            self.run_notes.remove(&p);
         }
         self.pump_run();
     }
