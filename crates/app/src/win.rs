@@ -1292,7 +1292,6 @@ fn build_menu() -> Result<HMENU> {
     // SAFETY: menu construction with valid handles.
     unsafe {
         let file = CreatePopupMenu()?;
-        item(file, cmd::NEW_TAB, "&New tab\tCtrl+Shift+T")?;
         item(file, cmd::CONNECT, "&Connect to...\tCtrl+Shift+N")?;
         item(file, cmd::RECONNECT, "&Reconnect\tCtrl+Shift+R")?;
         item(file, cmd::DISCONNECT, "&Disconnect")?;
@@ -1415,6 +1414,8 @@ fn build_menu() -> Result<HMENU> {
         )?;
 
         let window = CreatePopupMenu()?;
+        item(window, cmd::NEW_TAB, "Ne&w tab\tCtrl+Shift+T")?;
+        separator(window)?;
         item(window, cmd::SPLIT_RIGHT, "Split &right\tAlt+Shift+=")?;
         item(window, cmd::SPLIT_DOWN, "Split &down\tAlt+Shift+-")?;
         item(window, cmd::PANE_TO_TAB, "Move pane to its own &tab")?;
