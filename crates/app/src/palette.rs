@@ -467,7 +467,7 @@ mod tests {
 
     fn entries() -> Vec<Entry> {
         vec![
-            Entry::action(&path(&["&File"]), "&New tab\tCtrl+Shift+T", 105, false),
+            Entry::action(&path(&["&Window"]), "Ne&w tab\tCtrl+Shift+T", 105, false),
             Entry::action(
                 &path(&["&File"]),
                 "&Connect to...\tCtrl+Shift+N",
@@ -519,7 +519,7 @@ mod tests {
         let e = &entries();
         assert_eq!(e[0].label, "New tab");
         assert_eq!(e[0].hint, "Ctrl+Shift+T");
-        assert_eq!(e[0].extra, "File");
+        assert_eq!(e[0].extra, "Window");
         assert_eq!(e[1].label, "Connect to", "the dots go");
         assert_eq!(e[5].label, "Theme: Nord");
         assert_eq!(e[5].extra, "View Theme (this pane)");
