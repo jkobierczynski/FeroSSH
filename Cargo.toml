@@ -44,3 +44,10 @@ lto = "fat"
 codegen-units = 1
 panic = "abort"
 strip = true
+
+# vte 0.15 shifts by 64 bits or more on an OSC colour of `#` and more than
+# 50 hex digits (parse_legacy_color). Release builds mask the shift; build
+# vte that way in debug and test builds too, so such output from a host
+# cannot stop a debug build or the fuzz regression test.
+[profile.dev.package.vte]
+overflow-checks = false
