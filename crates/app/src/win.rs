@@ -7833,7 +7833,7 @@ impl Window {
             cmd::SAVE_SNIPPET => {
                 let text = self
                     .panes
-                    .get(&pane)
+                    .get_mut(&pane)
                     .and_then(|p| p.term.selection_text())
                     .filter(|t| !t.trim().is_empty());
                 let Some(text) = text else {
@@ -9323,8 +9323,9 @@ fn run_command(hwnd: HWND, command: Command) {
         }
         Command::Copy => {
             let text = with_window(|w| {
+                let focused = w.focused_id();
                 w.panes
-                    .get(&w.focused_id())
+                    .get_mut(&focused)
                     .and_then(|p| p.term.selection_text())
             })
             .flatten();

@@ -275,25 +275,36 @@ impl Terminal {
         }
     }
 
-    /// Clears the spacer at the end of a line that says a wide character
-    /// went on to the next line, where the next line does not start with
-    /// one (it was overwritten or erased since, or there is no next line).
-    /// alacritty_terminal 0.26's search skips such a spacer towards the
-    /// wide character and, starting there, never comes back to where it
-    /// started: it loops for ever. Run before each search, over the whole
-    /// scrollback; searching is rare and the check is two cells a line.
-    fn drop_lost_wide_spacers(&mut self) {
+    /// Clears wide-character spacers that no longer go with a wide
+    /// character, over the whole scrollback. A spacer at the start of a
+    /// line (see [`Self::drop_lone_spacers`]) can reach history before
+    /// `feed` clears it, and copying text from it steps back to column -1
+    /// and panics. A spacer saying a wide character goes on at the start
+    /// of the next line is only right at the end of a line whose next line
+    /// starts with one; a resize can leave one mid-line, and the character
+    /// can be overwritten or erased since. alacritty_terminal 0.26's search
+    /// skips such a spacer towards the wide character and, starting there,
+    /// never comes back to where it started: it loops for ever. Run before
+    /// each copy and search, which are rare.
+    fn drop_stray_spacers(&mut self) {
         let (top, bottom) = (self.term.topmost_line(), self.term.bottommost_line());
         let grid = self.term.grid_mut();
         let last = grid.last_column();
         for line in top.0..=bottom.0 {
+            grid[Line(line)][Column(0)]
+                .flags
+                .remove(TermFlags::WIDE_CHAR_SPACER);
             let continued = line < bottom.0
                 && grid[Line(line + 1)][Column(0)]
                     .flags
                     .contains(TermFlags::WIDE_CHAR);
-            let cell = &mut grid[Line(line)][last];
-            if !continued && cell.flags.contains(TermFlags::LEADING_WIDE_CHAR_SPACER) {
-                cell.flags.remove(TermFlags::LEADING_WIDE_CHAR_SPACER);
+            let row = &mut grid[Line(line)];
+            for col in 0..=last.0 {
+                if col < last.0 || !continued {
+                    row[Column(col)]
+                        .flags
+                        .remove(TermFlags::LEADING_WIDE_CHAR_SPACER);
+                }
             }
         }
     }
@@ -549,8 +560,10 @@ impl Terminal {
     }
 
     /// The selected text, built the way alacritty_terminal 0.26 builds it
-    /// in `selection_to_string`, around two of its bugs that panic.
-    pub fn selection_text(&self) -> Option<String> {
+    /// in `selection_to_string`, around three of its bugs that panic.
+    pub fn selection_text(&mut self) -> Option<String> {
+        self.term.selection.as_ref()?;
+        self.drop_stray_spacers();
         let selection = self.term.selection.as_ref()?;
         let SelectionRange { start, end, .. } = selection.to_range(&self.term)?;
         let text = match selection.ty {
@@ -683,7 +696,7 @@ impl Terminal {
         if self.search.is_none() {
             return;
         }
-        self.drop_lost_wide_spacers();
+        self.drop_stray_spacers();
         let Some(search) = &mut self.search else {
             return;
         };
