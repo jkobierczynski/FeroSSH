@@ -1,0 +1,46 @@
+name: Attest a signed release
+
+# scripts/sign-release.ps1 runs this after it has uploaded the exes it
+# signed on the maintainer's PC to a draft release. It signs build
+# provenance attestations for the release's files as they now are, so
+# `gh attestation verify ferossh.exe -R jkobierczynski/FeroSSH` works on the
+# signed downloads too. (The release workflow already attested the
+# unsigned exes it built; BUILD-MANIFEST.json links the two by hash.)
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag, such as v1.0.0-rc2
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  attest:
+    name: Attest the release files
+    runs-on: ubuntu-latest
+    permissions:
+      # A draft release is only visible with write access.
+      contents: write
+      id-token: write
+      attestations: write
+    steps:
+      - name: Download the release files
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.tag }}
+        run: |
+          gh release download "$TAG" -R "$GITHUB_REPOSITORY" -D files \
+            -p ferossh.exe -p ferossh-desktop.exe -p SHA256SUMS.txt -p BUILD-MANIFEST.json
+          cd files
+          # The sums must describe the exes that are there now.
+          tr -d '\r' < SHA256SUMS.txt | sha256sum -c -
+      - uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: |
+            files/ferossh.exe
+            files/ferossh-desktop.exe
+            files/SHA256SUMS.txt
+            files/BUILD-MANIFEST.json

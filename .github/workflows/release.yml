@@ -102,15 +102,25 @@ jobs:
       # signs only after a project approver approves the request on
       # signpath.io, so this step waits up to six hours for that. The
       # artifact configuration to paste into SignPath is in .signpath/.
+      #
+      # Without SignPath, the LOCAL_SIGNING repository variable set to true
+      # makes the release a draft with the unsigned exes: the maintainer
+      # signs them on their own PC (a Certum certificate on a card or in
+      # SimplySign) with scripts/sign-release.ps1, which uploads them,
+      # attests them and publishes the release.
       - name: Check for SignPath
         id: signpath
         shell: pwsh
         env:
           TOKEN: ${{ secrets.SIGNPATH_API_TOKEN }}
           ORG: ${{ vars.SIGNPATH_ORGANIZATION_ID }}
+          LOCAL_SIGNING: ${{ vars.LOCAL_SIGNING }}
         run: |
           if ($env:TOKEN -and $env:ORG) {
             "enabled=true" >> $env:GITHUB_OUTPUT
+          } elseif ($env:LOCAL_SIGNING -eq "true") {
+            "local=true" >> $env:GITHUB_OUTPUT
+            "The release is a draft until scripts/sign-release.ps1 signs and publishes it." | Tee-Object -Append $env:GITHUB_STEP_SUMMARY
           } else {
             "SignPath is not configured: the exes are not signed." | Tee-Object -Append $env:GITHUB_STEP_SUMMARY
           }
@@ -257,12 +267,17 @@ jobs:
         env:
           TAG: ${{ github.event_name == 'push' && github.ref_name || 'v0.0.0-dry-run' }}
           SIGNED: ${{ steps.signpath.outputs.enabled }}
+          LOCAL: ${{ steps.signpath.outputs.local }}
         run: |
           # A dry run has no notes of its own; any release's notes will do.
           $source = "docs/releases/$env:TAG.md"
           if (-not (Test-Path $source)) { $source = (Get-ChildItem docs/releases/*.md | Select-Object -Last 1).FullName }
           # Every release page says whether its exes are signed, and by whom.
-          $signing = if ($env:SIGNED -eq "true") {
+          # scripts/sign-release.ps1 puts the certificate's subject in place
+          # of <!-- signer --> once it has signed the exes.
+          $signing = if ($env:LOCAL -eq "true") {
+            "**Code signing.** ``ferossh.exe`` and ``ferossh-desktop.exe`` are signed with a Certum Open Source code signing certificate (<!-- signer -->); check Properties > Digital Signatures, or ``Get-AuthenticodeSignature .\ferossh.exe``. ``SHA256SUMS.txt`` lists the signed files, and ``BUILD-MANIFEST.json`` also gives each exe's SHA-256 before signing, which a rebuild from this tag reproduces; see [Verifying a download](https://github.com/jkobierczynski/FeroSSH/blob/main/docs/guide/verifying-downloads.md)."
+          } elseif ($env:SIGNED -eq "true") {
             "**Code signing.** Free code signing provided by [SignPath.io](https://about.signpath.io), certificate by [SignPath Foundation](https://signpath.org). See [Code signing](https://github.com/jkobierczynski/FeroSSH#code-signing)."
           } else {
             "**Code signing.** These exes are not code signed yet. Check a download against ``SHA256SUMS.txt`` or with ``gh attestation verify ferossh.exe -R jkobierczynski/FeroSSH``; see [Verifying a download](https://github.com/jkobierczynski/FeroSSH/blob/main/docs/guide/verifying-downloads.md)."
@@ -273,6 +288,7 @@ jobs:
           $ghArgs = [Collections.Generic.List[string]]::new()
           $ghArgs.AddRange([string[]]@("release", "create", $env:TAG, "--verify-tag", "--title", "FeroSSH $env:TAG", "--notes-file", "$env:RUNNER_TEMP/notes.md"))
           if ($env:TAG.Contains("-")) { $ghArgs.Add("--prerelease") }
+          if ($env:LOCAL -eq "true") { $ghArgs.Add("--draft") }
           foreach ($file in "ferossh.exe", "ferossh-desktop.exe", "SHA256SUMS.txt", "BUILD-MANIFEST.json", "update.txt", "update.txt.sig") {
             if (Test-Path "dist/$file") { $ghArgs.Add("dist/$file") }
             elseif ($file -notlike "update.txt*") { "::error::dist/$file is missing"; exit 1 }
