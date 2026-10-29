@@ -38,6 +38,14 @@ zeroize = "1.9"
 debug-assertions = true
 overflow-checks = false
 
+# The same for vte 0.15: an OSC colour of `#` and more than 50
+# hex digits with leading zeros shifts right by 64 bits or more
+# (parse_legacy_color in ansi.rs). Release exes mask the shift and get
+# some colour.
+[profile.release.package.vte]
+debug-assertions = true
+overflow-checks = false
+
 # Kept out of the main workspace: fuzzing needs nightly and libFuzzer.
 [workspace]
 

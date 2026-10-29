@@ -275,35 +275,46 @@ impl Terminal {
         }
     }
 
-    /// Clears wide-character spacers that no longer go with a wide
-    /// character, over the whole scrollback. A spacer at the start of a
-    /// line (see [`Self::drop_lone_spacers`]) can reach history before
-    /// `feed` clears it, and copying text from it steps back to column -1
-    /// and panics. A spacer saying a wide character goes on at the start
-    /// of the next line is only right at the end of a line whose next line
-    /// starts with one; a resize can leave one mid-line, and the character
-    /// can be overwritten or erased since. alacritty_terminal 0.26's search
-    /// skips such a spacer towards the wide character and, starting there,
-    /// never comes back to where it started: it loops for ever. Run before
-    /// each copy and search, which are rare.
+    /// Makes wide characters and their spacers agree again, over the whole
+    /// scrollback: a wide character must have its spacer in the next cell,
+    /// a spacer must follow a wide character, and a spacer saying a wide
+    /// character goes on at the start of the next line belongs only at the
+    /// end of a line whose next line starts with one. alacritty_terminal
+    /// 0.26 breaks these: deleting characters can move a spacer without
+    /// its character (to column 0 too, and a line can reach history before
+    /// `feed` clears that, see [`Self::drop_lone_spacers`]), a resize can
+    /// leave the end-of-line spacer mid-line or a wide character without
+    /// its spacer, and a character can be overwritten since. Copying text
+    /// from a spacer in column 0 steps back to column -1 and panics, and
+    /// search loops for ever on the others. Run before each copy and
+    /// search, which are rare.
     fn drop_stray_spacers(&mut self) {
         let (top, bottom) = (self.term.topmost_line(), self.term.bottommost_line());
         let grid = self.term.grid_mut();
-        let last = grid.last_column();
-        for line in top.0..=bottom.0 {
-            grid[Line(line)][Column(0)]
-                .flags
-                .remove(TermFlags::WIDE_CHAR_SPACER);
+        let last = grid.last_column().0;
+        // From the bottom up, so each line's next line is already fixed.
+        for line in (top.0..=bottom.0).rev() {
             let continued = line < bottom.0
                 && grid[Line(line + 1)][Column(0)]
                     .flags
                     .contains(TermFlags::WIDE_CHAR);
             let row = &mut grid[Line(line)];
-            for col in 0..=last.0 {
-                if col < last.0 || !continued {
-                    row[Column(col)]
+            for col in 0..=last {
+                let spacer_next = col < last
+                    && row[Column(col + 1)]
                         .flags
-                        .remove(TermFlags::LEADING_WIDE_CHAR_SPACER);
+                        .contains(TermFlags::WIDE_CHAR_SPACER);
+                if !spacer_next {
+                    row[Column(col)].flags.remove(TermFlags::WIDE_CHAR);
+                }
+                let wide_before =
+                    col > 0 && row[Column(col - 1)].flags.contains(TermFlags::WIDE_CHAR);
+                let flags = &mut row[Column(col)].flags;
+                if !wide_before {
+                    flags.remove(TermFlags::WIDE_CHAR_SPACER);
+                }
+                if col < last || !continued {
+                    flags.remove(TermFlags::LEADING_WIDE_CHAR_SPACER);
                 }
             }
         }
