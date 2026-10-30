@@ -79,16 +79,16 @@ use windows::Win32::UI::WindowsAndMessaging::{
     IDC_SIZENS, IDC_SIZEWE, IDYES, KillTimer, LoadCursorW, LoadIconW, MB_DEFBUTTON2, MB_ICONERROR,
     MB_ICONINFORMATION, MB_ICONQUESTION, MB_ICONWARNING, MB_OK, MB_YESNO, MESSAGEBOX_RESULT,
     MESSAGEBOX_STYLE, MF_BYCOMMAND, MF_BYPOSITION, MF_CHECKED, MF_DISABLED, MF_GRAYED, MF_POPUP,
-    MF_SEPARATOR, MF_STRING, MF_UNCHECKED, MSG, MessageBoxW, PM_REMOVE, PeekMessageW, PostMessageW,
-    PostQuitMessage, RegisterClassW, SIZE_MINIMIZED, SW_SHOW, SW_SHOWNORMAL, SWP_NOACTIVATE,
-    SWP_NOMOVE, SWP_NOZORDER, SetCursor, SetMenu, SetTimer, SetWindowPos, SetWindowTextW,
-    ShowWindow, TPM_NONOTIFY, TPM_RETURNCMD, TrackPopupMenu, TranslateMessage, WINDOW_EX_STYLE,
-    WINDOW_STYLE, WM_APP, WM_CHAR, WM_CLOSE, WM_COMMAND, WM_DESTROY, WM_DPICHANGED, WM_DROPFILES,
-    WM_ERASEBKGND, WM_GETDPISCALEDSIZE, WM_IME_COMPOSITION, WM_IME_STARTCOMPOSITION, WM_KEYDOWN,
-    WM_KEYUP, WM_KILLFOCUS, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP,
-    WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_PAINT, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SETCURSOR, WM_SETFOCUS,
-    WM_SIZE, WM_SYSCHAR, WM_SYSKEYDOWN, WM_SYSKEYUP, WM_TIMER, WNDCLASSW, WS_EX_APPWINDOW,
-    WS_OVERLAPPEDWINDOW,
+    MF_SEPARATOR, MF_STRING, MF_UNCHECKED, MSG, MessageBoxW, ModifyMenuW, PM_REMOVE, PeekMessageW,
+    PostMessageW, PostQuitMessage, RegisterClassW, SIZE_MINIMIZED, SW_SHOW, SW_SHOWNORMAL,
+    SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOZORDER, SetCursor, SetMenu, SetTimer, SetWindowPos,
+    SetWindowTextW, ShowWindow, TPM_NONOTIFY, TPM_RETURNCMD, TrackPopupMenu, TranslateMessage,
+    WINDOW_EX_STYLE, WINDOW_STYLE, WM_APP, WM_CHAR, WM_CLOSE, WM_COMMAND, WM_DESTROY,
+    WM_DPICHANGED, WM_DROPFILES, WM_ERASEBKGND, WM_GETDPISCALEDSIZE, WM_IME_COMPOSITION,
+    WM_IME_STARTCOMPOSITION, WM_KEYDOWN, WM_KEYUP, WM_KILLFOCUS, WM_LBUTTONDOWN, WM_LBUTTONUP,
+    WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_PAINT, WM_RBUTTONDOWN,
+    WM_RBUTTONUP, WM_SETCURSOR, WM_SETFOCUS, WM_SIZE, WM_SYSCHAR, WM_SYSKEYDOWN, WM_SYSKEYUP,
+    WM_TIMER, WNDCLASSW, WS_EX_APPWINDOW, WS_OVERLAPPEDWINDOW,
 };
 use windows::core::{HSTRING, PCWSTR, PWSTR, Result, w};
 
@@ -202,7 +202,8 @@ const PREVIEW_CHARS: usize = 400;
 /// `WINDOWS_FONTS` ship with Windows (the Cascadias with Windows 11 and
 /// Windows Terminal); the rest are free downloads under permissive
 /// licences (OFL, Apache, MIT/Bitstream Vera). None are bundled, so the
-/// list costs the exe nothing. Missing ones are greyed out.
+/// list costs the exe nothing. A missing one reads "(download)" and
+/// opens its page from `FONT_PAGES`; a missing Windows font is greyed out.
 const FONT_CHOICES: [&str; 18] = [
     "Cascadia Mono",
     "Cascadia Code",
@@ -225,6 +226,60 @@ const FONT_CHOICES: [&str; 18] = [
 ];
 /// How many of `FONT_CHOICES` come with Windows; a separator follows them.
 const WINDOWS_FONTS: usize = 5;
+/// Official download page of each free font in `FONT_CHOICES`.
+const FONT_PAGES: [(&str, &str); 13] = [
+    ("DejaVu Sans Mono", "https://dejavu-fonts.github.io/"),
+    (
+        "Fira Code",
+        "https://github.com/tonsky/FiraCode/releases/latest",
+    ),
+    (
+        "Geist Mono",
+        "https://github.com/vercel/geist-font/releases/latest",
+    ),
+    (
+        "Hack",
+        "https://github.com/source-foundry/Hack/releases/latest",
+    ),
+    (
+        "IBM Plex Mono",
+        "https://fonts.google.com/specimen/IBM+Plex+Mono",
+    ),
+    (
+        "Inconsolata",
+        "https://fonts.google.com/specimen/Inconsolata",
+    ),
+    (
+        "Iosevka",
+        "https://github.com/be5invis/Iosevka/releases/latest",
+    ),
+    ("JetBrains Mono", "https://www.jetbrains.com/lp/mono/"),
+    (
+        "Monaspace Neon",
+        "https://github.com/githubnext/monaspace/releases/latest",
+    ),
+    (
+        "Noto Sans Mono",
+        "https://fonts.google.com/noto/specimen/Noto+Sans+Mono",
+    ),
+    (
+        "Roboto Mono",
+        "https://fonts.google.com/specimen/Roboto+Mono",
+    ),
+    (
+        "Source Code Pro",
+        "https://github.com/adobe-fonts/source-code-pro/releases/latest",
+    ),
+    ("Victor Mono", "https://rubjo.github.io/victor-mono/"),
+];
+
+/// Where to download `family`, when it is one of the free fonts.
+fn font_page(family: &str) -> Option<&'static str> {
+    FONT_PAGES
+        .iter()
+        .find(|(f, _)| *f == family)
+        .map(|(_, url)| *url)
+}
 
 /// Menu command ids. Shortcuts map to the same ids.
 mod cmd {
@@ -1131,7 +1186,14 @@ fn create_and_run(launch: Launch, theme: Option<String>) -> Result<()> {
         let default_theme = theme.and_then(|n| Theme::by_name(&n)).unwrap_or_default();
         let mut renderer = Renderer::new(hwnd, 1, 1)?;
         for (id, family) in (cmd::FONT..).zip(FONT_CHOICES) {
-            if !renderer.has_family(family) {
+            if renderer.has_family(family) {
+                continue;
+            }
+            if font_page(family).is_some() {
+                let text = HSTRING::from(format!("{family} (download)"));
+                // SAFETY: valid menu handle; the id is ours.
+                let _ = ModifyMenuW(menu, id, MF_BYCOMMAND | MF_STRING, id as usize, &text);
+            } else {
                 // SAFETY: valid menu handle; the id is ours.
                 let _ = EnableMenuItem(menu, id, MF_BYCOMMAND | MF_GRAYED);
             }
@@ -8407,6 +8469,11 @@ impl Window {
             }
             id if (cmd::FONT..cmd::FONT + FONT_CHOICES.len() as u32).contains(&id) => {
                 if let Some(family) = FONT_CHOICES.get((id - cmd::FONT) as usize) {
+                    if !self.renderer.has_family(family)
+                        && let Some(url) = font_page(family)
+                    {
+                        return Some(Command::FontPage { family, url });
+                    }
                     let size = self.panes.get(&pane)?.font.size_pt;
                     self.set_font(pane, FontSpec::new(family, size));
                 }
@@ -9085,6 +9152,11 @@ enum Command {
     /// Session > Replace host key: two confirmations, then replace.
     ReplaceHostKey,
     OpenFolder(PathBuf),
+    /// Settings > Font on a free font that is not installed.
+    FontPage {
+        family: &'static str,
+        url: &'static str,
+    },
     /// The tab strip's close mark: asks first when sessions are open.
     CloseTab(usize),
     /// File > Import sessions: the side pane's import page.
@@ -9949,6 +10021,26 @@ fn run_command(hwnd: HWND, command: Command) {
                 Outcome::Current(_) | Outcome::Failed(_) => {}
             }
         }
+        Command::FontPage { family, url } => {
+            let text = format!(
+                "{family} is not installed. Open its download page?\n\n{url}\n\n\
+                 Install the font, then restart FeroSSH to use it."
+            );
+            if dialog(hwnd, &text, MB_YESNO | MB_ICONQUESTION) == Some(IDYES) {
+                // SAFETY: a fixed https URL from FONT_PAGES handed to the
+                // browser.
+                unsafe {
+                    ShellExecuteW(
+                        Some(hwnd),
+                        w!("open"),
+                        &HSTRING::from(url),
+                        None,
+                        None,
+                        SW_SHOWNORMAL,
+                    );
+                }
+            }
+        }
         Command::OpenFolder(dir) => {
             let _ = std::fs::create_dir_all(&dir);
             // SAFETY: our own log folder handed to Explorer.
@@ -10517,6 +10609,17 @@ fn capture(hwnd: HWND, on: bool) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn every_free_font_has_an_https_download_page() {
+        for family in &FONT_CHOICES[WINDOWS_FONTS..] {
+            let page = font_page(family);
+            assert!(page.is_some_and(|u| u.starts_with("https://")), "{family}");
+        }
+        for family in &FONT_CHOICES[..WINDOWS_FONTS] {
+            assert_eq!(font_page(family), None);
+        }
+    }
 
     #[test]
     fn menu_click_hides_an_open_side_pane_at_once() {
