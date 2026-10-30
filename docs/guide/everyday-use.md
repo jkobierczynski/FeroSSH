@@ -17,9 +17,9 @@ If the network drops, the laptop sleeps or the server reboots, the tab stays whe
 
 ## The connection manager
 
-Ctrl+Shift+S shows a side pane with your hosts from `~/.ssh/config`, your saved sessions and your imports. Type to filter, Enter connects in this tab, Shift+Enter in a split, and Ctrl+D marks a favourite. A `# folder: Name` comment above a `Host` line groups hosts in your ssh_config.
+Ctrl+Shift+S shows a side pane with your hosts from `~/.ssh/config`, your saved connections and your imports. Type to filter, Enter connects in this tab, Shift+Enter in a split, and Ctrl+D marks a favourite. A `# folder: Name` comment above a `Host` line groups hosts in your ssh_config.
 
-Insert (or "+ New session") opens the session form, and F2 edits the selected session. A session can be an SSH terminal, a Remote desktop (RDP) or a VNC desktop. The Password field picks where a password comes from: Windows Credential Manager, 1Password, Bitwarden, KeePassXC or a command of your own. FeroSSH itself never stores a password.
+Insert (or "+ New connection") opens the connection form, and F2 edits the selected connection. A connection can be an SSH terminal, a Remote desktop (RDP) or a VNC desktop. The Password field picks where a password comes from: Windows Credential Manager, 1Password, Bitwarden, KeePassXC or a command of your own. FeroSSH itself never stores a password.
 
 ## The session manager
 
@@ -39,7 +39,7 @@ On a host without SFTP, such as a console server or a Telnet device, you can use
 
 ## Jump hosts
 
-To reach a host that is only reachable through another one, give it a jump host: `ProxyJump bastion` in your ssh_config, or the *Jump host* field in the session form (F2). Several go in turn, separated by commas: `admin@gw:2222,inner`. Each jump host logs in as if you connected to it, with its own host key check and its own key or password, in a sandboxed worker of its own; the host behind it is then reached through that login, encrypted end to end. If a jump host cannot reach the next one, the pane says which one and why.
+To reach a host that is only reachable through another one, give it a jump host: `ProxyJump bastion` in your ssh_config, or the *Jump host* field in the connection form (F2). Several go in turn, separated by commas: `admin@gw:2222,inner`. Each jump host logs in as if you connected to it, with its own host key check and its own key or password, in a sandboxed worker of its own; the host behind it is then reached through that login, encrypted end to end. If a jump host cannot reach the next one, the pane says which one and why.
 
 `ProxyCommand` in your ssh_config runs a local program (for example `ncat --proxy proxy.example.org:8080 %h %p`) and sends the connection through it. FeroSSH asks once before it runs a command line it has not run before.
 

@@ -38,9 +38,9 @@ FeroSSH then signs in with the first method that works:
 
 If you already use OpenSSH, FeroSSH reads `~/.ssh/config` as it is: `HostName`, `User`, `Port`, `IdentityFile`, `Include`, `Tag`, `ProxyJump`, `ProxyCommand` and the forwarding keywords. It never writes to that file. Your hosts show up in the connection manager (Ctrl+Shift+S).
 
-If you don't have an ssh_config, open the connection manager, press Insert ("+ New session") and fill in the form. Saved sessions go to `%APPDATA%\FeroSSH\sessions.conf`.
+If you don't have an ssh_config, open the connection manager, press Insert ("+ New connection") and fill in the form. Saved connections go to `%APPDATA%\FeroSSH\sessions.conf`.
 
-Coming from PuTTY, KiTTY, WinSCP or another client? File > Import sessions brings your saved sessions over, without their passwords.
+Coming from PuTTY, KiTTY, WinSCP or another client? File > Import connections brings your saved sessions over, without their passwords.
 
 ## Command line
 

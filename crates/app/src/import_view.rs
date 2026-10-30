@@ -343,7 +343,7 @@ impl ImportView {
         let bg = palette.strip;
         let title = match self.current() {
             Some(f) => format!(" Import from {}", f.client.name()),
-            None => " Import sessions".to_owned(),
+            None => " Import connections".to_owned(),
         };
         grid.set_row(
             0,
@@ -525,7 +525,7 @@ mod tests {
     fn lists_sources_then_previews_with_boxes() {
         let mut v = view();
         let t = texts(&mut v);
-        assert_eq!(t[0], " Import sessions");
+        assert_eq!(t[0], " Import connections");
         assert_eq!(t[1], " ▸ WinSCP  3 sessions");
         assert_eq!(t[2], "   From a file…");
         assert_eq!(v.key(SideKey::Enter { split: false }, 16), None);
@@ -567,10 +567,10 @@ mod tests {
         assert_eq!(v.key(SideKey::Enter { split: false }, 16), None);
         v.key(SideKey::Right, 16);
         v.key(SideKey::Enter { split: false }, 16);
-        assert_eq!(texts(&mut v)[0], " Import sessions");
+        assert_eq!(texts(&mut v)[0], " Import connections");
         v.key(SideKey::Enter { split: false }, 16);
         v.key(SideKey::Escape, 16);
-        assert_eq!(texts(&mut v)[0], " Import sessions");
+        assert_eq!(texts(&mut v)[0], " Import connections");
         assert_eq!(v.key(SideKey::Escape, 16), Some(ImportAction::Close));
         v.key(SideKey::Down, 16);
         assert_eq!(

@@ -6,8 +6,8 @@ Other files in the same folder:
 
 | File | What it holds |
 | --- | --- |
-| `sessions.conf` | Sessions saved with the session form, in ssh_config syntax. |
-| `imported-<client>.conf`, `putty-sessions.conf` | Sessions imported from other clients. Importing again replaces the file. |
+| `sessions.conf` | Connections saved with the connection form, in ssh_config syntax. |
+| `imported-<client>.conf`, `putty-sessions.conf` | Connections imported from other clients. Importing again replaces the file. |
 
 FeroSSH reads `~/.ssh/config` and `~/.ssh/known_hosts` too, and writes only to `known_hosts` (when you trust a new host).
 
@@ -43,7 +43,7 @@ FeroSSH reads `~/.ssh/config` and `~/.ssh/known_hosts` too, and writes only to `
 
 ## Profiles
 
-A `Profile` holds the settings for one host, named as in your ssh_config or saved sessions.
+A `Profile` holds the settings for one host, named as in your ssh_config or saved connections.
 
 ```
 Profile web1
@@ -67,10 +67,10 @@ Profile web1
 | `LegacyAlgorithms yes` | Also offers older crypto (ECDH on NIST curves, DH groups 14 to 18 with SHA-2, AES-CTR, plain HMAC-SHA-2) for old switches and routers. Still no SHA-1, CBC or DSA. The tab shows an amber ⚠. |
 | `DesktopPort N` | The server's RDP port for Open remote desktop (3389). |
 | `VncPort N` | The server's VNC port (5900). |
-| `Type ssh`, `rdp` or `vnc` | The kind of session. |
-| `Via SESSION` | For RDP and VNC: log in to this SSH session first and tunnel the desktop through it. |
+| `Type ssh`, `rdp` or `vnc` | The kind of connection. |
+| `Via SESSION` | For RDP and VNC: log in to this saved SSH connection first and tunnel the desktop through it. |
 | `PasswordSource windows` | Takes the password from Windows Credential Manager, after the first login that works. |
-| `PasswordCommand ...` | Runs this command (no shell, no window, 60 seconds at most) and uses the first line it prints as the password. `%n` is the session's name, `%h` the host, `%u` the user, `%p` the port. FeroSSH asks before running a command the first time. |
+| `PasswordCommand ...` | Runs this command (no shell, no window, 60 seconds at most) and uses the first line it prints as the password. `%n` is the connection's name, `%h` the host, `%u` the user, `%p` the port. FeroSSH asks before running a command the first time. |
 
 ## Theme rules
 
