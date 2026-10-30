@@ -198,19 +198,33 @@ const WHEEL_DELTA_NOTCH: i32 = 120;
 const PREVIEW_CHARS: usize = 400;
 
 /// Font families offered in Settings > Font. A pane's font can be any
-/// installed family; this list is only the menu. The first five ship with
-/// Windows (the Cascadias with Windows 11 and Windows Terminal); the last
-/// three are popular free downloads. Missing ones are greyed out.
-const FONT_CHOICES: [&str; 8] = [
+/// installed family; this list is only the menu. The first
+/// `WINDOWS_FONTS` ship with Windows (the Cascadias with Windows 11 and
+/// Windows Terminal); the rest are free downloads under permissive
+/// licences (OFL, Apache, MIT/Bitstream Vera). None are bundled, so the
+/// list costs the exe nothing. Missing ones are greyed out.
+const FONT_CHOICES: [&str; 18] = [
     "Cascadia Mono",
     "Cascadia Code",
     "Consolas",
     "Lucida Console",
     "Courier New",
-    "JetBrains Mono",
+    "DejaVu Sans Mono",
     "Fira Code",
+    "Geist Mono",
+    "Hack",
+    "IBM Plex Mono",
+    "Inconsolata",
+    "Iosevka",
+    "JetBrains Mono",
+    "Monaspace Neon",
+    "Noto Sans Mono",
+    "Roboto Mono",
     "Source Code Pro",
+    "Victor Mono",
 ];
+/// How many of `FONT_CHOICES` come with Windows; a separator follows them.
+const WINDOWS_FONTS: usize = 5;
 
 /// Menu command ids. Shortcuts map to the same ids.
 mod cmd {
@@ -1381,7 +1395,10 @@ fn build_menu() -> Result<HMENU> {
         item(edit, cmd::RIGHT_CLICK_PASTE, "&Right-click pastes")?;
 
         let fonts = CreatePopupMenu()?;
-        for (id, name) in (cmd::FONT..).zip(FONT_CHOICES) {
+        for (i, (id, name)) in (cmd::FONT..).zip(FONT_CHOICES).enumerate() {
+            if i == WINDOWS_FONTS {
+                separator(fonts)?;
+            }
             item(fonts, id, name)?;
         }
         let themes = CreatePopupMenu()?;
