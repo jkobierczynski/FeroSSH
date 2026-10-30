@@ -1,0 +1,7 @@
+name: FeroSSH CodeQL config
+
+# The fuzz targets feed fixed dummy inputs (passwords, keys) to the
+# decoders on purpose, which CodeQL reports as hard-coded credentials.
+# They are test harnesses and never ship, so they are not scanned.
+paths-ignore:
+  - fuzz
