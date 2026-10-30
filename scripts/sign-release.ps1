@@ -31,6 +31,9 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
+# gh writes UTF-8; without this PowerShell reads its output in the console's
+# code page and the notes come back with "⚠" turned into "ΓÜá".
+[Console]::OutputEncoding = [Text.UTF8Encoding]::new($false)
 $exes = "ferossh.exe", "ferossh-desktop.exe"
 
 function Invoke-Native {
