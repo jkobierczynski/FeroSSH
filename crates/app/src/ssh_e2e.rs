@@ -14,6 +14,7 @@
 )]
 
 use std::collections::HashMap;
+use std::io::{BufRead, BufReader};
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -78,33 +79,48 @@ pub(crate) fn start_sshd(name: &str, extra: &str) -> Option<Server> {
     let user = dir.join(".ssh").join("id_ed25519");
     keygen(&user, "secret");
     std::fs::copy(user.with_extension("pub"), dir.join("authorized_keys")).unwrap();
-    let port = TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port();
-    let config = format!(
-        "ListenAddress 127.0.0.1\nPort {port}\nHostKey {}\nAuthorizedKeysFile {}\nPidFile none\n\
-         StrictModes no\nUsePAM no\nPermitRootLogin yes\nPasswordAuthentication no\n\
-         KbdInteractiveAuthentication no\n{extra}\n",
-        host.display(),
-        dir.join("authorized_keys").display()
-    );
-    std::fs::write(dir.join("sshd_config"), config).unwrap();
     let _ = std::fs::create_dir_all("/run/sshd");
-    let child = Command::new(SSHD)
-        .args(["-D", "-e", "-f"])
-        .arg(dir.join("sshd_config"))
-        .stderr(Stdio::null())
-        .spawn()
-        .unwrap();
-    for _ in 0..100 {
-        if std::net::TcpStream::connect(("127.0.0.1", port)).is_ok() {
-            break;
+    // A free port can be taken again before sshd binds it (tests run in
+    // parallel), and a connect can reach another test's listener, so wait
+    // for sshd's own "listening" line and try a fresh port if it exits.
+    for _ in 0..10 {
+        let port = TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let config = format!(
+            "ListenAddress 127.0.0.1\nPort {port}\nHostKey {}\nAuthorizedKeysFile {}\nPidFile none\n\
+             StrictModes no\nUsePAM no\nPermitRootLogin yes\nPasswordAuthentication no\n\
+             KbdInteractiveAuthentication no\n{extra}\n",
+            host.display(),
+            dir.join("authorized_keys").display()
+        );
+        std::fs::write(dir.join("sshd_config"), config).unwrap();
+        let mut child = Command::new(SSHD)
+            .args(["-D", "-e", "-f"])
+            .arg(dir.join("sshd_config"))
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let stderr = child.stderr.take().unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            // Keeps reading after the line, so sshd never blocks on a full
+            // pipe; ends when sshd exits.
+            for line in BufReader::new(stderr).lines().map_while(|l| l.ok()) {
+                if line.contains("Server listening on") {
+                    let _ = tx.send(());
+                }
+            }
+        });
+        if rx.recv_timeout(Duration::from_secs(10)).is_ok() {
+            return Some(Server { dir, child, port });
         }
-        std::thread::sleep(Duration::from_millis(50));
+        let _ = child.kill();
+        let _ = child.wait();
     }
-    Some(Server { dir, child, port })
+    panic!("sshd did not start");
 }
 
 pub(crate) fn local_user() -> String {
@@ -335,11 +351,9 @@ fn a_jump_host_that_cannot_reach_the_target_says_so() {
     let Some(jump) = start_sshd("unreachable", "") else {
         return;
     };
-    let gone = TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port();
+    // Not a freed ephemeral port: another test's sshd could take that one.
+    // These tests run unprivileged, so nothing listens on 1023.
+    let gone: u16 = 1023;
     let env = jump_env(&jump, gone, "ProxyJump jump");
     let trust = [("to trust this key", "yes"), ("Passphrase", "secret")];
     let (run, session) = connect_to(&env, "inner", "", &trust);

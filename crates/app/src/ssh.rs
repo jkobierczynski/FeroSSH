@@ -857,6 +857,18 @@ impl SshSession {
             h.tunnel_ended = true;
         }
         let mut effects = self.tunnel_failed(i, &reason);
+        // The relay closes the next hop's end of the stream too, but that
+        // Close can reach its worker ahead of the Connect that opens the
+        // end, which then waits for bytes for ever. Ending that login by
+        // its own channel, sent after the Connect, cannot be overtaken.
+        let next = match self.hops.get(i + 1) {
+            Some(h) => (h.session.channel, h.session.login),
+            None => (self.channel, self.login),
+        };
+        if self.held.is_none() && self.state == State::Connecting && next.1.started && !next.1.done
+        {
+            effects.push(Effect::Send(Message::Close { channel: next.0 }));
+        }
         effects.extend(self.release());
         effects
     }
@@ -2368,6 +2380,8 @@ mod tests {
             reason: "edge:22: the server could not connect (ConnectFailed).".into(),
         });
         assert!(shown(&fx).contains("The jump host jump@bastion:2222 could not reach edge:22"));
+        // Edge's login is ended by its own channel, not only by the relay.
+        assert!(sent(&fx).contains(&&Message::Close { channel: 4 }));
         assert_eq!(s.state(), State::Connecting);
         // Edge's login then fails, and with it the connection.
         let fx = s.on_worker(Message::Disconnected {
