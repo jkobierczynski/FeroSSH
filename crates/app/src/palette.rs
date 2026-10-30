@@ -32,7 +32,7 @@ const RECENT: usize = 5;
 pub enum Kind {
     /// A menu command, by its id.
     Action(u32),
-    /// Open a session from the session manager's list.
+    /// Open a session from the connection manager's list.
     Session(String),
     /// Type the snippet at this index.
     Snippet(usize),
@@ -477,7 +477,12 @@ mod tests {
             Entry::action(&path(&["&Edit"]), "Copy on &select", 504, true),
             Entry::action(&path(&["&Window"]), "Split &right\tAlt+Shift+=", 700, false),
             Entry::action(&path(&["&Window"]), "Split &down\tAlt+Shift+-", 701, false),
-            Entry::action(&path(&["&View", "&Theme (this pane)"]), "Nord", 400, true),
+            Entry::action(
+                &path(&["&Settings", "&Theme (this pane)"]),
+                "Nord",
+                400,
+                true,
+            ),
             Entry::session("core-sw1", "admin@10.0.0.1", SessionKind::Ssh),
             Entry::session("lab-desktop", "me@lab", SessionKind::Rdp),
             Entry::snippet(0, "Show interfaces", &["show ip interface brief".into()]),
@@ -522,7 +527,7 @@ mod tests {
         assert_eq!(e[0].extra, "Window");
         assert_eq!(e[1].label, "Connect to", "the dots go");
         assert_eq!(e[5].label, "Theme: Nord");
-        assert_eq!(e[5].extra, "View Theme (this pane)");
+        assert_eq!(e[5].extra, "Settings Theme (this pane)");
         assert_eq!(plain("Fish && &chips"), "Fish & chips");
     }
 

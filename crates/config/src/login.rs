@@ -244,7 +244,7 @@ pub struct Snippet {
     /// session's name and its host name. Empty, with `folders`, is every
     /// host.
     pub hosts: Vec<String>,
-    /// Only for the sessions in these folders of the session manager.
+    /// Only for the sessions in these folders of the connection manager.
     pub folders: Vec<String>,
     /// Ctrl+Shift+F`n` types it.
     pub hotkey: Option<u8>,
@@ -260,7 +260,7 @@ pub struct Place {
     pub session: String,
     /// The host name it really goes to.
     pub host: String,
-    /// Its folder in the session manager.
+    /// Its folder in the connection manager.
     pub folder: Option<String>,
 }
 

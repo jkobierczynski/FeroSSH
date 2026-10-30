@@ -15,13 +15,13 @@ FeroSSH reads `~/.ssh/config` and `~/.ssh/known_hosts` too, and writes only to `
 
 | Keyword | Default | Meaning |
 | --- | --- | --- |
-| `SidePane right` | left | Shows the session manager and file view on the right. |
+| `SidePane right` | left | Shows the connection manager and file view on the right. |
 | `TabStrip no` | yes | Hides the tab strip. |
 | `CopyOnSelect yes` | no | Copies a selection as soon as you make it, as PuTTY does. |
 | `RightClickPaste yes` | no | Pastes on a right click, as PuTTY does. |
 | `LogTimestamps yes` | no | Puts the time in front of each line of plain session logs (Session > Timestamp each log line). |
 | `Scrollback 50000` | 10000 | Lines of scrollback per pane, up to 1,000,000. |
-| `Favourite web db1` | | Hosts marked as favourites in the session manager. |
+| `Favourite web db1` | | Hosts marked as favourites in the connection manager. |
 | `UpdateCheck weekly` | off | Looks for a new release once a week (Help > Check for updates weekly). |
 | `AutoReconnect no` | yes | Whether a dropped SSH connection reconnects on its own (File > Reconnect automatically). |
 

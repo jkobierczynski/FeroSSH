@@ -68,7 +68,7 @@ License: MIT OR Apache-2.0
 LicenseUrl: $repoUrl#licence
 ShortDescription: A small, sandboxed SSH client for Windows with tabs, splits, tmux integration and file transfer.
 Description: |-
-  FeroSSH is a native, open-source SSH client for Windows, written in Rust. It replaces PuTTY with tabs, splits, a session manager, tmux control mode, SFTP file transfer, port forwarding, FIDO2 security keys and remote desktops over SSH, in one small exe. The SSH worker runs in an AppContainer sandbox that cannot read your files or keys.
+  FeroSSH is a native, open-source SSH client for Windows, written in Rust. It replaces PuTTY with tabs, splits, a connection manager, tmux control mode, SFTP file transfer, port forwarding, FIDO2 security keys and remote desktops over SSH, in one small exe. The SSH worker runs in an AppContainer sandbox that cannot read your files or keys.
 Moniker: ferossh
 Tags:
 - ssh
