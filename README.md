@@ -6,13 +6,13 @@
 
 FeroSSH is the native, open-source SSH client for Windows that locks every connection in its own AppContainer sandbox, away from your keys and files: sensibly minimalistic and native, with tabs, splits, tmux integration, port forwarding, snippets and file transfer, in one signed exe with nothing to install.
 
-> **Status:** working toward 1.0 ([v0.1.0](https://github.com/jkobierczynski/FeroSSH/releases/tag/v0.1.0) is out). FeroSSH connects with russh from one sandboxed worker process per connection, checks host keys against `~/.ssh/known_hosts`, and signs in with the Windows OpenSSH agent, Pageant, key files, FIDO2 security keys, keyboard-interactive or a password. It has tabs and splits, saved sessions with imports from PuTTY, KiTTY, WinSCP, MobaXterm, mRemoteNG and SecureCRT, password sources, jump hosts (`ProxyJump`, `ProxyCommand`), SFTP and ZMODEM file transfer, port and X11 forwarding, tmux integration, serial consoles, Telnet for old gear, broadcast input, login scripts and command snippets, remote desktops through SSH, and sealed session logs.
+> **Status:** [1.0 is out](https://github.com/jkobierczynski/FeroSSH/releases/tag/v1.0.0), the first stable release. FeroSSH connects with russh from one sandboxed worker process per connection, checks host keys against `~/.ssh/known_hosts`, and signs in with the Windows OpenSSH agent, Pageant, key files, FIDO2 security keys, keyboard-interactive or a password. It has tabs and splits, saved sessions with imports from PuTTY, KiTTY, WinSCP, MobaXterm, mRemoteNG and SecureCRT, password sources, jump hosts (`ProxyJump`, `ProxyCommand`), SFTP and ZMODEM file transfer, port and X11 forwarding, tmux integration, serial consoles, Telnet for old gear, broadcast input, login scripts and command snippets, remote desktops through SSH, and sealed session logs.
 
 The [user guide](docs/guide/README.md) covers getting started, everyday use, every setting, the security model, verifying a download and troubleshooting.
 
 ## Download
 
-Download `ferossh.exe` from the [latest release](https://github.com/jkobierczynski/FeroSSH/releases/latest) (or `ferossh-exe` from the latest CI run for the newest changes) and start it with a host, or without one to be asked. Release exes are not code signed yet, so Windows SmartScreen may warn the first time you run one; [Verifying a download](docs/guide/verifying-downloads.md) shows how to check it against `SHA256SUMS.txt` and its build provenance attestation instead (see [Code signing](#code-signing)).
+Download `ferossh.exe` from the [latest release](https://github.com/jkobierczynski/FeroSSH/releases/latest) (or `ferossh-exe` from the latest CI run for the newest changes) and start it with a host, or without one to be asked. Release exes are code signed. The certificate is new, so Windows SmartScreen may still warn the first time you run one until it has built up a reputation; [Verifying a download](docs/guide/verifying-downloads.md) shows how to check the signature, `SHA256SUMS.txt` and the build provenance attestation (see [Code signing](#code-signing)).
 
 ```
 ferossh.exe [user@]host[:port]
@@ -188,7 +188,7 @@ Please report security problems privately through **Report a vulnerability** on 
 
 ## Code signing
 
-Release exes are not code signed yet. Each release is built from this repository by the [release workflow](.github/workflows/release.yml) on GitHub's runners, reproducibly, and its exes, `SHA256SUMS.txt` and `BUILD-MANIFEST.json` carry build provenance attestations, so a download can be checked against this source (see [Verifying a download](docs/guide/verifying-downloads.md)). Once signing is set up, only `ferossh.exe` and `ferossh-desktop.exe`, built by that workflow from this project's own source, will be signed, each after the [owner](https://github.com/jkobierczynski) approves the request.
+Since v1.0.0-rc2, `ferossh.exe` and `ferossh-desktop.exe` are signed with a Certum Open Source code signing certificate issued to "Open Source Developer Jurgen Kobierczynski", with a timestamp. Each release is built from this repository by the [release workflow](.github/workflows/release.yml) on GitHub's runners, reproducibly, and its exes, `SHA256SUMS.txt` and `BUILD-MANIFEST.json` carry build provenance attestations, so a download can be checked against this source (see [Verifying a download](docs/guide/verifying-downloads.md)). Only exes built by that workflow from this project's own source are signed, on the [owner](https://github.com/jkobierczynski)'s PC; `BUILD-MANIFEST.json` gives each exe's SHA-256 before and after signing.
 
 **Privacy policy:** This program will not transfer any information to other networked systems unless specifically requested by the user or the person installing or operating it. FeroSSH connects only to the servers you tell it to and sends no telemetry.
 
