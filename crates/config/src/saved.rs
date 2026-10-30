@@ -25,7 +25,7 @@ use crate::ssh_config::{Proxy, folder_comment, parse_destination, parse_proxy_ju
 /// One saved session's connection settings.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SavedHost {
-    /// The `Host` name, which the session manager lists.
+    /// The `Host` name, which the connection manager lists.
     pub alias: String,
     pub folder: Option<String>,
     /// The machine to reach; the alias when unset.
@@ -150,7 +150,7 @@ pub fn parse(text: &str) -> Vec<SavedHost> {
 /// The file's text.
 pub fn to_text(hosts: &[SavedHost]) -> String {
     let mut out = String::from(
-        "# Sessions made in FeroSSH's session manager. FeroSSH rewrites this file;\n\
+        "# Sessions made in FeroSSH's connection manager. FeroSSH rewrites this file;\n\
          # comments are not kept. OpenSSH does not read it.\n",
     );
     for h in hosts {

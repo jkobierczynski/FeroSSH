@@ -2,7 +2,7 @@
 //!
 //! The window holds tabs, each a tree of split panes (see [`crate::layout`]).
 //! A window opens with one tab and one pane; the tab strip appears with the
-//! second tab, and the side pane (the session manager, or file transfer)
+//! second tab, and the side pane (the connection manager, or file transfer)
 //! only when asked for. Each pane has its own terminal, host, log, font and
 //! colour theme.
 
@@ -108,6 +108,7 @@ use crate::import_reg;
 use crate::import_view::{Found, ImportAction, ImportView};
 use crate::layout::{self, Axis, Closed, Dir, Drop, PaneId, Rect, Workspace};
 use crate::link::{Link, LinkEvent};
+use crate::live::{self, LiveAction, LiveSession, LiveState, LiveView};
 use crate::login_script::{self, Need, Outcome, Runner};
 use crate::look;
 use crate::palette::{self, CommandPalette, PalAction};
@@ -196,7 +197,7 @@ const WHEEL_DELTA_NOTCH: i32 = 120;
 /// Characters of host-supplied text shown in a confirmation prompt.
 const PREVIEW_CHARS: usize = 400;
 
-/// Font families offered in View > Font. A pane's font can be any
+/// Font families offered in Settings > Font. A pane's font can be any
 /// installed family; this list is only the menu. The first five ship with
 /// Windows (the Cascadias with Windows 11 and Windows Terminal); the last
 /// three are popular free downloads. Missing ones are greyed out.
@@ -238,6 +239,7 @@ mod cmd {
     pub const FORWARDS: u32 = 211;
     pub const SNIPPETS: u32 = 212;
     pub const PALETTE: u32 = 213;
+    pub const LIVE: u32 = 214;
     /// Plus the index into `FONT_CHOICES`.
     pub const FONT: u32 = 300;
     /// Plus the index into `Theme::builtin()`.
@@ -541,11 +543,13 @@ enum SideView {
     Files,
     Forwards,
     Snippets,
+    /// The session manager: the sessions open now.
+    Live,
     /// The command palette, shown over whatever the side pane showed.
     Palette,
 }
 
-/// The side pane: the session manager, file transfer or the forwards.
+/// The side pane: the connection manager, file transfer or the forwards.
 struct Side {
     visible: bool,
     view: SideView,
@@ -633,6 +637,7 @@ struct Window {
     files_key: Option<String>,
     transfer_timer: bool,
     forwards_view: ForwardsView,
+    live_view: LiveView,
     /// tmux control mode, per SSH pane that has run `tmux -CC`.
     tmux: HashMap<PaneId, Tmux>,
     /// SSH panes whose connection dropped while tmux ran: the host's
@@ -887,7 +892,7 @@ fn write_app_file(path: &std::path::Path, text: &str) -> std::io::Result<()> {
     std::fs::rename(&tmp, path)
 }
 
-/// The hosts the session manager lists.
+/// The hosts the connection manager lists.
 fn host_items(env: &Env, settings: &Settings) -> Vec<HostItem> {
     let includes = ssh_config::DirIncludes {
         home: env.home.clone(),
@@ -1185,6 +1190,7 @@ fn create_and_run(launch: Launch, theme: Option<String>) -> Result<()> {
                 files_key: None,
                 transfer_timer: false,
                 forwards_view: ForwardsView::default(),
+                live_view: LiveView::default(),
                 tmux: HashMap::new(),
                 reattach: HashMap::new(),
                 retries: HashMap::new(),
@@ -1388,12 +1394,12 @@ fn build_menu() -> Result<HMENU> {
         }
 
         let view = CreatePopupMenu()?;
-        item(view, cmd::PALETTE, "Comm&and palette\tCtrl+Shift+A")?;
-        separator(view)?;
-        item(view, cmd::SESSIONS, "S&ession manager\tCtrl+Shift+S")?;
+        item(view, cmd::SESSIONS, "&Connection manager\tCtrl+Shift+S")?;
+        item(view, cmd::LIVE, "S&ession manager\tCtrl+Shift+L")?;
         item(view, cmd::FILES, "File tra&nsfer\tCtrl+Shift+E")?;
         item(view, cmd::FORWARDS, "Port &forwards\tCtrl+Shift+P")?;
         item(view, cmd::SNIPPETS, "Command sn&ippets\tCtrl+Shift+Space")?;
+        item(view, cmd::PALETTE, "Comm&and palette\tCtrl+Shift+A")?;
         item(view, cmd::FOLLOW_CD, "File transfer f&ollows cd")?;
         item(view, cmd::SIDE_RIGHT, "Side pane on the &right")?;
         item(view, cmd::TAB_STRIP, "Ta&b strip")?;
@@ -1472,7 +1478,7 @@ fn build_menu() -> Result<HMENU> {
         let bar = CreateMenu()?;
         AppendMenuW(bar, MF_POPUP, file.0 as usize, w!("&File"))?;
         AppendMenuW(bar, MF_POPUP, edit.0 as usize, w!("&Edit"))?;
-        AppendMenuW(bar, MF_POPUP, view.0 as usize, w!("&View"))?;
+        AppendMenuW(bar, MF_POPUP, view.0 as usize, w!("&Settings"))?;
         AppendMenuW(bar, MF_POPUP, window.0 as usize, w!("&Window"))?;
         AppendMenuW(bar, MF_POPUP, session.0 as usize, w!("&Session"))?;
         AppendMenuW(bar, MF_POPUP, help.0 as usize, w!("&Help"))?;
@@ -2134,6 +2140,139 @@ impl Window {
             Some(v) if !v.forwards.is_empty() => Forwarding::Outbound,
             _ => Forwarding::None,
         }
+    }
+
+    /// What the session manager lists: each tab's sessions in tab order,
+    /// then a snippet run's sessions that no tab shows. Empty connect
+    /// prompts are left out.
+    fn open_sessions(&self) -> Vec<LiveSession> {
+        let views = self.forward_view();
+        let focused = self.focused_id();
+        let mut hidden: Vec<PaneId> = self.run_hidden.iter().copied().collect();
+        hidden.sort_unstable();
+        let panes = self
+            .ws
+            .tabs
+            .iter()
+            .enumerate()
+            .flat_map(|(i, t)| t.root.panes().into_iter().map(move |id| (Some(i), id)))
+            .chain(hidden.into_iter().map(|id| (None, id)));
+        let state = |s: State| match s {
+            State::Connected => LiveState::Connected,
+            State::Connecting => LiveState::Connecting,
+            State::Blocked | State::Ended => LiveState::Ended,
+        };
+        let mut out = Vec::new();
+        for (tab, id) in panes {
+            let Some(p) = self.panes.get(&id) else {
+                continue;
+            };
+            let mut notes = Vec::new();
+            let (kind, target, mut st) = match &p.host {
+                Host::Ask(_) => continue,
+                Host::Ssh(s) => {
+                    if self.via.get(&s.connection).is_some_and(|v| !v.is_empty())
+                        || self.proxies.contains_key(&s.connection)
+                    {
+                        notes.push("via jump host");
+                    }
+                    (live::Kind::Ssh, s.target.label(), state(s.state()))
+                }
+                Host::Telnet(s) => {
+                    notes.push("unencrypted");
+                    (live::Kind::Telnet, s.target.label(), state(s.state()))
+                }
+                Host::Serial { port, target, .. } => (
+                    live::Kind::Serial,
+                    target.label(),
+                    if port.is_some() {
+                        LiveState::Connected
+                    } else {
+                        LiveState::Ended
+                    },
+                ),
+                Host::Tmux { label, .. } => (live::Kind::Tmux, label.clone(), LiveState::Connected),
+                Host::Desktop { label, .. } => {
+                    (live::Kind::Desktop, label.clone(), LiveState::Connected)
+                }
+                Host::Local { exited, .. } => (
+                    live::Kind::Local,
+                    "local shell".to_owned(),
+                    if *exited {
+                        LiveState::Ended
+                    } else {
+                        LiveState::Connected
+                    },
+                ),
+            };
+            if self.retries.contains_key(&id) {
+                st = LiveState::Reconnecting;
+            }
+            if self.tmux.get(&id).is_some_and(|t| t.active()) {
+                notes.push("tmux");
+            }
+            if self.forwarding(&views, id) != Forwarding::None {
+                notes.push("forwards");
+            }
+            if self.legacy_in_use(id) {
+                notes.push("older crypto");
+            }
+            if p.log.enabled {
+                notes.push("logging");
+            }
+            if tab.is_none() {
+                notes.push("snippet run");
+            }
+            out.push(LiveSession {
+                pane: id,
+                tab,
+                kind,
+                target,
+                title: p.title.clone().filter(|t| !t.is_empty()),
+                state: st,
+                notes,
+                focused: tab.is_some() && id == focused,
+            });
+        }
+        out
+    }
+
+    fn live_action(&mut self, action: Option<LiveAction>) -> Option<Command> {
+        match action? {
+            LiveAction::Show(id) => {
+                if self.run_hidden.contains(&id) {
+                    return self.show_run_pane(id);
+                }
+                self.focus_pane(id);
+                self.focus_terminal();
+                None
+            }
+            LiveAction::Close(id) => {
+                let s = self.open_sessions().into_iter().find(|s| s.pane == id)?;
+                let in_tabs: usize = self.ws.tabs.iter().map(|t| t.root.panes().len()).sum();
+                Some(Command::CloseSession {
+                    pane: id,
+                    label: s.target,
+                    live: s.state != LiveState::Ended,
+                    last: s.tab.is_some() && in_tabs == 1,
+                })
+            }
+            LiveAction::Leave => {
+                self.focus_terminal();
+                None
+            }
+        }
+    }
+
+    /// The session manager's Delete, once the user said yes: closes the
+    /// session's pane, or ends a snippet run's session that no tab shows.
+    fn close_session(&mut self, id: PaneId) -> Option<Command> {
+        if self.run_hidden.contains(&id) {
+            self.drop_run_pane(id);
+            self.refresh_chrome();
+            return None;
+        }
+        self.close_pane(id)
     }
 
     /// The X server forwarded X11 goes to: the X11Display setting, else
@@ -3783,7 +3922,7 @@ impl Window {
         } else {
             Some(Command::Notice(format!(
                 "{alias} has no login script. Add one under Extras in its session (F2 in \
-                 the session manager)."
+                 the connection manager)."
             )))
         }
     }
@@ -4955,6 +5094,11 @@ impl Window {
                 SideView::Palette => {
                     self.palette.draw(&mut self.side.grid, &palette, focused);
                 }
+                SideView::Live => {
+                    let all = self.open_sessions();
+                    self.live_view
+                        .draw(&mut self.side.grid, &palette, focused, &all);
+                }
                 SideView::Snippets => {
                     self.snippets_view.draw(
                         &mut self.side.grid,
@@ -5533,6 +5677,11 @@ impl Window {
             let action = self.forwards_view.key(key, &view, rows);
             return self.forwards_action(action);
         }
+        if self.side.view == SideView::Live {
+            let all = self.open_sessions();
+            let action = self.live_view.key(key, &all, self.side.grid.rows());
+            return self.live_action(action);
+        }
         if self.side.view == SideView::Files {
             if key == SideKey::Refresh {
                 self.ensure_sftp(self.focused_id());
@@ -5954,7 +6103,7 @@ impl Window {
         if hosts.is_empty() {
             return Some(Command::Notice(
                 "There are no saved SSH sessions to run the snippet on. Save the hosts in \
-                 the session manager first."
+                 the connection manager first."
                     .into(),
             ));
         }
@@ -6325,7 +6474,7 @@ impl Window {
         ))
     }
 
-    /// Session `name`'s folder in the session manager, read again from
+    /// Session `name`'s folder in the connection manager, read again from
     /// ssh_config at most every half minute.
     fn folder_of(&mut self, name: &str) -> Option<String> {
         if self
@@ -6537,7 +6686,7 @@ impl Window {
         self.update_menu_checks();
         let n = sessions.len();
         let mut text = format!(
-            "Imported {n} session{} from {} into the {} folder of the session manager.",
+            "Imported {n} session{} from {} into the {} folder of the connection manager.",
             plural(n),
             client.name(),
             client.name(),
@@ -6850,7 +6999,7 @@ impl Window {
         }
     }
 
-    /// Opens `host` from the session manager: in the focused pane if it is
+    /// Opens `host` from the connection manager: in the focused pane if it is
     /// waiting at the connect prompt, else in a new tab (or a split).
     fn open_host(&mut self, host: &str, split: bool) {
         if let Some(p) = self.settings.profile(host)
@@ -6932,7 +7081,7 @@ impl Window {
         self.refresh(id);
     }
 
-    /// Shows the side pane in `view`; the session manager re-reads
+    /// Shows the side pane in `view`; the connection manager re-reads
     /// ssh_config, file transfer opens SFTP if it is not open.
     fn show_side(&mut self, view: SideView, focus: bool) {
         self.side.view = view;
@@ -6946,6 +7095,10 @@ impl Window {
             }
             SideView::Files => self.ensure_sftp(self.focused_id()),
             SideView::Forwards | SideView::Palette => {}
+            SideView::Live => {
+                let all = self.open_sessions();
+                self.live_view.reset(&all);
+            }
             SideView::Snippets => {
                 let place = self.place(self.focused_id()).map(|p| p.0);
                 self.snippets_view.set_place(place);
@@ -6963,15 +7116,17 @@ impl Window {
         self.update_menu_checks();
     }
 
-    /// View > Session manager, File transfer or Port forwards (`id`). The
-    /// shortcut first moves the focus to a pane that is open but not
-    /// focused, then hides it; a menu click (`from_menu`) hides it at once,
-    /// since its checkmark says the pane is open.
+    /// Settings > Connection manager, Session manager, File transfer,
+    /// Port forwards or Command snippets (`id`). The shortcut first moves
+    /// the focus to a pane that is open but not focused, then hides it; a
+    /// menu click (`from_menu`) hides it at once, since its checkmark says
+    /// the pane is open.
     fn toggle_side(&mut self, id: u32, from_menu: bool) {
         let view = match id {
             cmd::FILES => SideView::Files,
             cmd::FORWARDS => SideView::Forwards,
             cmd::SNIPPETS => SideView::Snippets,
+            cmd::LIVE => SideView::Live,
             _ => SideView::Sessions,
         };
         let open = self.side.visible && self.side.view == view;
@@ -7279,6 +7434,13 @@ impl Window {
                     self.forwards_view.click(row, &view, rows);
                     self.refresh_chrome();
                     return None;
+                }
+                if self.side.view == SideView::Live {
+                    let all = self.open_sessions();
+                    let rows = self.side.grid.rows();
+                    let action = self.live_view.click(row, double, &all, rows);
+                    self.refresh_chrome();
+                    return self.live_action(action);
                 }
                 if self.side.view == SideView::Palette {
                     let action = self.palette.click(row, double, self.side.grid.rows());
@@ -7699,6 +7861,10 @@ impl Window {
                     let view = self.forward_view();
                     let rows = self.side.grid.rows();
                     self.forwards_view.scroll_by(lines, &view, rows);
+                } else if self.side.view == SideView::Live {
+                    let all = self.open_sessions();
+                    let rows = self.side.grid.rows();
+                    self.live_view.scroll_by(lines, &all, rows);
                 } else if self.side.view == SideView::Palette {
                     self.palette.scroll_by(lines, self.side.grid.rows());
                 } else if self.side.view == SideView::Snippets {
@@ -8005,7 +8171,7 @@ impl Window {
                     self.layout();
                 }
             }
-            cmd::SESSIONS | cmd::FILES | cmd::FORWARDS | cmd::SNIPPETS => {
+            cmd::SESSIONS | cmd::FILES | cmd::FORWARDS | cmd::SNIPPETS | cmd::LIVE => {
                 self.toggle_side(id, false);
             }
             cmd::PALETTE => self.toggle_palette(),
@@ -8322,6 +8488,10 @@ impl Window {
                 (
                     cmd::SESSIONS,
                     self.side.visible && self.side.view == SideView::Sessions,
+                ),
+                (
+                    cmd::LIVE,
+                    self.side.visible && self.side.view == SideView::Live,
                 ),
                 (
                     cmd::FILES,
@@ -8844,6 +9014,7 @@ fn shortcut(vk: VIRTUAL_KEY, m: Mods, tabs: bool, split: bool) -> Option<u32> {
             v if v == key(b'W') && m.shift => Some(cmd::CLOSE_PANE),
             VK_F4 if !m.shift => Some(cmd::CLOSE_TAB),
             v if v == key(b'S') && m.shift => Some(cmd::SESSIONS),
+            v if v == key(b'L') && m.shift => Some(cmd::LIVE),
             v if v == key(b'E') && m.shift => Some(cmd::FILES),
             v if v == key(b'P') && m.shift => Some(cmd::FORWARDS),
             v if v == key(b'A') && m.shift => Some(cmd::PALETTE),
@@ -8928,10 +9099,18 @@ enum Command {
         gateway: PaneId,
         names: Vec<String>,
     },
-    /// The session manager's right-click menu, on this host if any.
+    /// The connection manager's right-click menu, on this host if any.
     SessionMenu(Option<String>),
     /// Ask, then remove this saved session.
     DeleteSession(String),
+    /// The session manager's Delete: ask (when it is still open, or the
+    /// last pane), then close the session's pane.
+    CloseSession {
+        pane: PaneId,
+        label: String,
+        live: bool,
+        last: bool,
+    },
     /// Ask, then remove the snippet at this index.
     DeleteSnippet(usize),
     /// A snippet is about to go to a pane with the Production theme: asks
@@ -9187,7 +9366,7 @@ fn host_file(host: &str) -> String {
     }
 }
 
-/// The session manager's right-click menu.
+/// The connection manager's right-click menu.
 fn session_menu(hwnd: HWND, host: Option<String>) {
     const CONNECT: u32 = 1;
     const SPLIT: u32 = 2;
@@ -9298,6 +9477,28 @@ fn run_command(hwnd: HWND, command: Command) {
         Command::Destroy => {
             // SAFETY: our own window.
             let _ = unsafe { DestroyWindow(hwnd) };
+        }
+        Command::CloseSession {
+            pane,
+            label,
+            live,
+            last,
+        } => {
+            if live || last {
+                let mut text = format!("Close {label}?");
+                if live {
+                    text.push_str(" Its session ends.");
+                }
+                if last {
+                    text.push_str(" It is the last pane, so FeroSSH closes too.");
+                }
+                if dialog(hwnd, &text, MB_YESNO | MB_ICONQUESTION | MB_DEFBUTTON2) != Some(IDYES) {
+                    return;
+                }
+            }
+            if let Some(next) = with_window(|w| w.close_session(pane)).flatten() {
+                run_command(hwnd, next);
+            }
         }
         Command::CloseTab(i) => {
             let live = with_window(|w| w.live_sessions(Some(i))).unwrap_or(0);

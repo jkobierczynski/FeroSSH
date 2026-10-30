@@ -1,7 +1,7 @@
 //! The renderer test pattern as terminal output: palettes, truecolour,
 //! styles, box drawing, wide and combining characters, all through escape
 //! sequences, so it exercises the emulator and the renderer together.
-//! View > Test pattern prints it.
+//! Settings > Test pattern prints it.
 
 use std::fmt::Write;
 

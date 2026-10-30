@@ -36,9 +36,9 @@ FeroSSH then signs in with the first method that works:
 
 ## Using your OpenSSH config
 
-If you already use OpenSSH, FeroSSH reads `~/.ssh/config` as it is: `HostName`, `User`, `Port`, `IdentityFile`, `Include`, `Tag`, `ProxyJump`, `ProxyCommand` and the forwarding keywords. It never writes to that file. Your hosts show up in the session manager (Ctrl+Shift+S).
+If you already use OpenSSH, FeroSSH reads `~/.ssh/config` as it is: `HostName`, `User`, `Port`, `IdentityFile`, `Include`, `Tag`, `ProxyJump`, `ProxyCommand` and the forwarding keywords. It never writes to that file. Your hosts show up in the connection manager (Ctrl+Shift+S).
 
-If you don't have an ssh_config, open the session manager, press Insert ("+ New session") and fill in the form. Saved sessions go to `%APPDATA%\FeroSSH\sessions.conf`.
+If you don't have an ssh_config, open the connection manager, press Insert ("+ New session") and fill in the form. Saved sessions go to `%APPDATA%\FeroSSH\sessions.conf`.
 
 Coming from PuTTY, KiTTY, WinSCP or another client? File > Import sessions brings your saved sessions over, without their passwords.
 
@@ -58,7 +58,8 @@ Coming from PuTTY, KiTTY, WinSCP or another client? File > Import sessions bring
 
 | Shortcut | Action |
 | --- | --- |
-| Ctrl+Shift+S | Session manager |
+| Ctrl+Shift+S | Connection manager |
+| Ctrl+Shift+L | Session manager (open sessions) |
 | Ctrl+Shift+N | Connect to another host in a new tab |
 | Ctrl+Shift+T | New tab on the same host, with no second login |
 | Alt+Shift+= / Alt+Shift+- | Split the pane right or down |

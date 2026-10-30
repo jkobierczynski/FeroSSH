@@ -1,4 +1,4 @@
-//! The session manager: the side pane's list of hosts from ssh_config (and
+//! The connection manager: the side pane's list of hosts from ssh_config (and
 //! sessions imported from PuTTY), in folders, with favourites first and a
 //! search line that filters as one types.
 //!
@@ -432,7 +432,7 @@ impl SessionList {
             cells.truncate(width);
             cells
         };
-        grid.set_row(0, line(" Sessions", palette.text, bg, Flags::BOLD));
+        grid.set_row(0, line(" Connections", palette.text, bg, Flags::BOLD));
         let search = if self.query.is_empty() && !focused {
             " Ctrl+Shift+S to search".to_owned()
         } else if self.query.is_empty() {
@@ -529,7 +529,7 @@ impl SessionList {
 /// Writes `text` right-aligned into `cells`, one cell short of the edge
 /// and starting no further left than `from`; shortened with an ellipsis
 /// when it does not fit, left out when even that would not read.
-fn put_right(cells: &mut [Cell], text: &str, from: usize, fg: Rgb, bg: Rgb) {
+pub(crate) fn put_right(cells: &mut [Cell], text: &str, from: usize, fg: Rgb, bg: Rgb) {
     let end = cells.len().saturating_sub(1);
     let room = end.saturating_sub(from);
     if text.is_empty() || room < 4 {
@@ -637,7 +637,7 @@ mod tests {
     fn groups_favourites_and_folders() {
         let mut l = list();
         let t = texts(&mut l);
-        assert_eq!(t[0], " Sessions");
+        assert_eq!(t[0], " Connections");
         assert_eq!(t[2], " + New session");
         assert_eq!(t[3], folder("▾ Favourites", 1));
         assert!(t[4].starts_with("   ★ pi"), "{:?}", t[4]);

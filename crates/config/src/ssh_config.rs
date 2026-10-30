@@ -3,7 +3,7 @@
 //! keywords (`LocalForward`, `RemoteForward`, `DynamicForward`,
 //! `ForwardX11`, `GatewayPorts`, `ClearAllForwardings`), how to get there
 //! (`ProxyJump`, `ProxyCommand`), `Include`d files, and the list of hosts
-//! the session manager shows.
+//! the connection manager shows.
 //!
 //! The rules follow `ssh_config(5)`: keywords are case-insensitive, the
 //! first value found for a keyword wins (except `IdentityFile` and the
@@ -12,7 +12,7 @@
 //! `Include` reads files through an [`Includes`], so the parser itself
 //! never touches the disk.
 //!
-//! The session manager groups hosts into folders: a comment line
+//! The connection manager groups hosts into folders: a comment line
 //! `# folder: Name` puts the hosts after it in that folder, and hosts from
 //! an included file without such a comment go in a folder named after the
 //! file.
@@ -246,7 +246,7 @@ impl Line {
     }
 }
 
-/// `# folder: Name` or `#folder Name`, as the session manager's folders.
+/// `# folder: Name` or `#folder Name`, as the connection manager's folders.
 pub(crate) fn folder_comment(line: &str) -> Option<String> {
     let rest = line.trim().strip_prefix('#')?.trim_start();
     let head = rest.get(..6)?;
@@ -308,7 +308,7 @@ fn lines(text: &str, includes: &dyn Includes) -> Vec<Line> {
     out
 }
 
-/// A host the session manager lists: a `Host` pattern without wildcards.
+/// A host the connection manager lists: a `Host` pattern without wildcards.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HostEntry {
     pub name: String,

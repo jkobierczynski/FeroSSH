@@ -6,7 +6,7 @@
 //! back unchanged, to retry it), and `-KL 8080`, `-KR`, `-KD` stop one by
 //! its port as `ssh`'s `~C` does. All of it works on a live connection.
 //!
-//! Drawn into a [`Grid`] like the session manager; keys come in as
+//! Drawn into a [`Grid`] like the connection manager; keys come in as
 //! [`SideKey`]s and what the user asked for goes out as a [`FwdAction`].
 
 use ferossh_config::forward::{CancelSpec, parse_cancel, parse_option};

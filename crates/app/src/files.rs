@@ -1,7 +1,7 @@
 //! The file transfer view: the side pane's listing of the focused pane's
 //! remote directory, with the transfer queue under it.
 //!
-//! Drawn into a [`Grid`] like the session manager. The listing and the
+//! Drawn into a [`Grid`] like the connection manager. The listing and the
 //! queue live in the host's [`Remote`]; this view only keeps the
 //! selection and turns keys and clicks into calls on it. What needs the
 //! window (a confirm box, the file picker) comes out as a [`FilesAction`].

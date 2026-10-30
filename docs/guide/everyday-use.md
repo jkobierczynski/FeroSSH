@@ -9,17 +9,21 @@ The window starts as one pane, with no tab strip. Ctrl+Shift+T opens a tab and t
 - Alt+arrows moves the focus, Alt+Shift+arrows grows the focused pane, and dragging a divider resizes.
 - Drag a tab to reorder it. Ctrl+Shift+drag a pane onto another pane's edge to move it there, or onto its middle to swap the two.
 - Ctrl+Shift+J joins a tab into the tab before it, as a pane. Dropping a pane on the tab strip makes it a tab again.
-- View > Font and View > Theme change only the focused pane. The font menu lists eight monospace fonts; the ones not installed on this PC are greyed out. Session > Save font and theme for this host keeps them for next time.
+- Settings > Font and Settings > Theme change only the focused pane. The font menu lists eight monospace fonts; the ones not installed on this PC are greyed out. Session > Save font and theme for this host keeps them for next time.
 
 ## When the connection drops
 
 If the network drops, the laptop sleeps or the server reboots, the tab stays where it is and FeroSSH logs in again on its own: after 1 second, then 2, 4, 8, 15 and every 30 seconds, for up to 15 minutes. Enter tries at once and Esc stops. The tab keeps its splits, font, theme, scrollback and log file, port forwards and the login script run again, tmux reattaches, and file transfers carry on. Tabs that shared the connection share the new one. A shell you exit, a login that fails or a changed host key never reconnects. File > Reconnect automatically turns it off, for all hosts or (`AutoReconnect no` in a profile) for one.
 
-## The session manager
+## The connection manager
 
 Ctrl+Shift+S shows a side pane with your hosts from `~/.ssh/config`, your saved sessions and your imports. Type to filter, Enter connects in this tab, Shift+Enter in a split, and Ctrl+D marks a favourite. A `# folder: Name` comment above a `Host` line groups hosts in your ssh_config.
 
 Insert (or "+ New session") opens the session form, and F2 edits the selected session. A session can be an SSH terminal, a Remote desktop (RDP) or a VNC desktop. The Password field picks where a password comes from: Windows Credential Manager, 1Password, Bitwarden, KeePassXC or a command of your own. FeroSSH itself never stores a password.
+
+## The session manager
+
+Ctrl+Shift+L lists the sessions that are open right now, in every tab, with their host, kind, tab and state (connected, connecting, reconnecting or ended). Type to filter, Enter goes to a session's tab and pane, and Del closes it after asking. The saved hosts are in the connection manager above.
 
 ## File transfer
 
@@ -31,7 +35,7 @@ On a host without SFTP, such as a console server or a Telnet device, you can use
 
 ## Port forwards
 
-`LocalForward`, `RemoteForward` and `DynamicForward` in your ssh_config start when you log in. View > Port forwards (Ctrl+Shift+P) lists them and adds new ones: type `-L 8080:db.internal:5432`, `-R 9000:localhost:3000` or `-D 1080` and press Enter. A dynamic forward is a SOCKS 4, 4a and 5 proxy. A tab whose connection forwards shows `⇄`, in amber when the server can reach back into your PC.
+`LocalForward`, `RemoteForward` and `DynamicForward` in your ssh_config start when you log in. Settings > Port forwards (Ctrl+Shift+P) lists them and adds new ones: type `-L 8080:db.internal:5432`, `-R 9000:localhost:3000` or `-D 1080` and press Enter. A dynamic forward is a SOCKS 4, 4a and 5 proxy. A tab whose connection forwards shows `⇄`, in amber when the server can reach back into your PC.
 
 ## Jump hosts
 

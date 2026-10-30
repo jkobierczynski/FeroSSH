@@ -21,7 +21,7 @@
 //! own (see [`crate::batch`]); the report of a run stays until Escape
 //! closes it, and Enter on a row shows that host's session in a tab.
 //!
-//! Drawn into a [`Grid`] like the session manager; keys come in as
+//! Drawn into a [`Grid`] like the connection manager; keys come in as
 //! [`SideKey`]s and what the user chose goes out as a [`SnipAction`].
 
 use ferossh_config::login::{self, Arg, Place, Snippet, Step};
