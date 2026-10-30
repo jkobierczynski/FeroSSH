@@ -22,9 +22,9 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # Both languages are extracted from source without a build, so
+        # All three are extracted from source without a build, so
         # paths-ignore in the config file applies to them.
-        language: [rust, actions]
+        language: [rust, python, actions]
     steps:
       - uses: actions/checkout@v4
       - uses: github/codeql-action/init@v4
