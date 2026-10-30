@@ -1223,7 +1223,7 @@ impl SnippetsView {
             if lines.is_empty() && y < rows {
                 let mut line = Line::new(width, bg);
                 line.put(
-                    &fit(" No saved session matches.", width),
+                    &fit(" No saved connection matches.", width),
                     palette.dim,
                     Flags::ITALIC,
                 );

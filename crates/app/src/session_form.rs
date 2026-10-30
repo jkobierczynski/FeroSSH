@@ -422,7 +422,7 @@ impl SessionForm {
                         }
                         _ => {
                             out.push(Item::Field(Field::PasswordCommand));
-                            out.push(Item::Note("%n is the session's name.".into()));
+                            out.push(Item::Note("%n is the connection's name.".into()));
                         }
                     }
                     out.push(Item::Field(Field::Jump));
@@ -724,7 +724,7 @@ impl SessionForm {
             Field::Speed => "9600 bits/s".into(),
             Field::Key => "default keys and agent".into(),
             Field::Jump => "none, or e.g. bastion".into(),
-            Field::Via if v.kind == SessionKind::Vnc => "an SSH session (required)".into(),
+            Field::Via if v.kind == SessionKind::Vnc => "an SSH connection (required)".into(),
             Field::Via => "none: connect directly".into(),
             Field::Font => h.font.clone(),
             Field::FontSize => format!("{}", h.font_size),
@@ -790,7 +790,7 @@ impl SessionForm {
         let v = &self.values;
         let name = v.name.trim();
         if name.is_empty() {
-            return Err("Give the session a name.".into());
+            return Err("Give the connection a name.".into());
         }
         if !saved::valid_alias(name) {
             return Err("Names use letters, digits, . _ and - only.".into());
@@ -800,7 +800,7 @@ impl SessionForm {
             .as_deref()
             .is_none_or(|o| !o.eq_ignore_ascii_case(name));
         if renamed && self.names.iter().any(|n| n.eq_ignore_ascii_case(name)) {
-            return Err(format!("A session named {name} already exists."));
+            return Err(format!("A connection named {name} already exists."));
         }
         if self.locked() {
             // Only the profile is written.
@@ -822,12 +822,14 @@ impl SessionForm {
             let jump = v.jump.trim();
             if v.kind == SessionKind::Ssh && !jump.is_empty() {
                 if !saved::valid_proxy_jump(jump) {
-                    return Err("Jump host: a session name or user@host:port; several go \
+                    return Err(
+                        "Jump host: a connection name or user@host:port; several go \
                                 in turn, separated by commas."
-                        .into());
+                            .into(),
+                    );
                 }
                 if jump.split(',').any(|h| h.trim().eq_ignore_ascii_case(name)) {
-                    return Err("The jump host is another session, not this one.".into());
+                    return Err("The jump host is another connection, not this one.".into());
                 }
             }
             for (i, f) in v.forwards.iter().enumerate() {
@@ -861,14 +863,16 @@ impl SessionForm {
         match v.kind {
             SessionKind::Ssh | SessionKind::Serial | SessionKind::Telnet => {}
             SessionKind::Vnc if via.is_empty() => {
-                return Err("A VNC desktop goes through an SSH session: fill in Via SSH.".into());
+                return Err(
+                    "A VNC desktop goes through an SSH connection: fill in Via SSH.".into(),
+                );
             }
             _ if via.is_empty() => {}
             _ if via.eq_ignore_ascii_case(name) => {
-                return Err("Via SSH names another session, not this one.".into());
+                return Err("Via SSH names another connection, not this one.".into());
             }
             _ if !self.names.iter().any(|n| n.eq_ignore_ascii_case(via)) => {
-                return Err(format!("There is no session named {via} to go through."));
+                return Err(format!("There is no connection named {via} to go through."));
             }
             _ => {}
         }
@@ -1153,8 +1157,8 @@ impl SessionForm {
         let bg = palette.strip;
         let red = Rgb::new(0xd0, 0x6a, 0x6a);
         let title = match (&self.original, &self.source) {
-            (None, _) => " New session".to_owned(),
-            (Some(n), _) => format!(" Session {n}"),
+            (None, _) => " New connection".to_owned(),
+            (Some(n), _) => format!(" Connection {n}"),
         };
         grid.set_row(
             0,
@@ -1545,7 +1549,7 @@ mod tests {
     fn new_session_shows_defaults_and_saves() {
         let mut f = new_form();
         let t = texts(&mut f);
-        assert_eq!(t[0], " New session");
+        assert_eq!(t[0], " New connection");
         assert_eq!(t[1], " ▾ Connection");
         assert!(t[2].starts_with(" Name        ▏required"), "{:?}", t[2]);
         assert!(
@@ -1566,7 +1570,7 @@ mod tests {
         assert!(
             texts(&mut f)
                 .iter()
-                .any(|l| l.contains("Give the session a name"))
+                .any(|l| l.contains("Give the connection a name"))
         );
         typed(&mut f, "db");
         down(&mut f, 3);
@@ -1625,7 +1629,11 @@ mod tests {
         };
         assert!(f.check().unwrap_err().contains("Via SSH"));
         f.values.via = "nowhere".into();
-        assert!(f.check().unwrap_err().contains("no session named nowhere"));
+        assert!(
+            f.check()
+                .unwrap_err()
+                .contains("no connection named nowhere")
+        );
         f.values.via = "bastion".into();
         assert_eq!(f.check(), Ok(()));
         f.values.kind = SessionKind::Rdp;

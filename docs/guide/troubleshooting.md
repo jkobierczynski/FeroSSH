@@ -35,7 +35,7 @@ Check `TERM` on the server (`echo $TERM`); FeroSSH sets `xterm-256color`. Some m
 
 | What | Where |
 | --- | --- |
-| Settings, saved and imported sessions | `%APPDATA%\FeroSSH` |
+| Settings, saved and imported connections | `%APPDATA%\FeroSSH` |
 | Logs, password-command approvals | `%LOCALAPPDATA%\FeroSSH` |
 | Known hosts, ssh_config, key files | `%USERPROFILE%\.ssh` |
 
