@@ -95,7 +95,7 @@ impl Entry {
             prefix,
             label: name.to_owned(),
             hint: detail.to_owned(),
-            extra: format!("{prefix} session {tag}"),
+            extra: format!("{prefix} connection {tag}"),
             on: false,
             kind: Kind::Session(name.to_owned()),
         }
@@ -380,7 +380,7 @@ impl CommandPalette {
         let mut line = Line::new(width, bg);
         if self.filter.is_empty() {
             let hint = if focused {
-                " Type an action, session or snippet▏"
+                " Type an action, connection or snippet▏"
             } else {
                 " Ctrl+Shift+A to search"
             };

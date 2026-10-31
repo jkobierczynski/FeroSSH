@@ -29,7 +29,7 @@ pub struct HostItem {
 /// A visible row.
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum Row {
-    /// "+ New session", first when not searching.
+    /// "+ New connection", first when not searching.
     New,
     Folder {
         name: String,
@@ -457,7 +457,7 @@ impl SessionList {
             };
             let cells = match rows.get(i) {
                 Some(Row::New) => line(
-                    " + New session",
+                    " + New connection",
                     if selected && focused {
                         palette.text
                     } else {
@@ -638,7 +638,7 @@ mod tests {
         let mut l = list();
         let t = texts(&mut l);
         assert_eq!(t[0], " Connections");
-        assert_eq!(t[2], " + New session");
+        assert_eq!(t[2], " + New connection");
         assert_eq!(t[3], folder("▾ Favourites", 1));
         assert!(t[4].starts_with("   ★ pi"), "{:?}", t[4]);
         assert!(t[5].starts_with("   web"), "{:?}", t[5]);

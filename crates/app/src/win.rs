@@ -345,7 +345,7 @@ mod cmd {
     pub const AUTO_RESPONSES: u32 = 618;
     pub const CONFIRM_PRODUCTION: u32 = 619;
     /// Plus the index in the session picker's list; the one past the
-    /// last is "New session".
+    /// last is "New connection".
     pub const TMUX_SESSION: u32 = 800;
     pub const SPLIT_RIGHT: u32 = 700;
     pub const SPLIT_DOWN: u32 = 701;
@@ -1384,7 +1384,7 @@ fn build_menu() -> Result<HMENU> {
         item(file, cmd::DOWNLOADS, "Open do&wnload folder")?;
         separator(file)?;
         item(file, cmd::LOCAL_SHELL, "Open &local shell")?;
-        item(file, cmd::IMPORT, "&Import sessions...")?;
+        item(file, cmd::IMPORT, "&Import connections...")?;
         separator(file)?;
         item(file, cmd::EXIT, "E&xit\tAlt+F4")?;
 
@@ -6706,7 +6706,7 @@ impl Window {
         self.refresh_chrome();
     }
 
-    /// File > Import sessions: the import page, on what the clients
+    /// File > Import connections: the import page, on what the clients
     /// on this account have saved.
     fn open_import(&mut self, sessions: Vec<ImportSource>, problems: Vec<String>) {
         let list = sessions
@@ -6765,7 +6765,7 @@ impl Window {
         self.update_menu_checks();
         let n = sessions.len();
         let mut text = format!(
-            "Imported {n} session{} from {} into the {} folder of the connection manager.",
+            "Imported {n} connection{} from {} into the {} folder of the connection manager.",
             plural(n),
             client.name(),
             client.name(),
@@ -6887,7 +6887,7 @@ impl Window {
                     .and_then(|o| Target::resolve(&o, &ssh_env()));
                 if let Err(e) = write_app_file(&sessions_path(), &saved::to_text(&hosts)) {
                     return Some(Command::Notice(format!(
-                        "Could not save the session to {}: {e}",
+                        "Could not save the connection to {}: {e}",
                         sessions_path().display()
                     )));
                 }
@@ -7099,7 +7099,7 @@ impl Window {
                     }
                 }
                 None => self.queued.push(Command::Notice(format!(
-                    "The session {host} has no COM port: press F2 on it and fill one in."
+                    "The connection {host} has no COM port: press F2 on it and fill one in."
                 ))),
             }
             return;
@@ -9159,7 +9159,7 @@ enum Command {
     },
     /// The tab strip's close mark: asks first when sessions are open.
     CloseTab(usize),
-    /// File > Import sessions: the side pane's import page.
+    /// File > Import connections: the side pane's import page.
     ImportSessions,
     /// Session > Check a log: the file picker, then the chain check.
     VerifyLog,
@@ -9406,7 +9406,11 @@ fn pick_files(hwnd: HWND, title: PCWSTR) -> Vec<PathBuf> {
 
 /// The session form's Browse: one key file, starting in `~/.ssh`.
 fn pick_key_file(hwnd: HWND) -> Option<PathBuf> {
-    pick_file(hwnd, w!("Key file for this session"), &home().join(".ssh"))
+    pick_file(
+        hwnd,
+        w!("Key file for this connection"),
+        &home().join(".ssh"),
+    )
 }
 
 /// The open-file dialog, starting in `dir`.
@@ -9477,16 +9481,21 @@ fn session_menu(hwnd: HWND, host: Option<String>) {
                 w!("Open in a &split\tShift+Enter"),
             );
             let _ = AppendMenuW(menu, MF_SEPARATOR, 0, None);
-            let _ = AppendMenuW(menu, MF_STRING, EDIT as usize, w!("&Edit session...\tF2"));
+            let _ = AppendMenuW(
+                menu,
+                MF_STRING,
+                EDIT as usize,
+                w!("&Edit connection...\tF2"),
+            );
             let _ = AppendMenuW(
                 menu,
                 MF_STRING,
                 DELETE as usize,
-                w!("&Delete session...\tDel"),
+                w!("&Delete connection...\tDel"),
             );
             let _ = AppendMenuW(menu, MF_SEPARATOR, 0, None);
         }
-        let _ = AppendMenuW(menu, MF_STRING, NEW as usize, w!("&New session...\tIns"));
+        let _ = AppendMenuW(menu, MF_STRING, NEW as usize, w!("&New connection...\tIns"));
         let mut pt = POINT::default();
         let _ = GetCursorPos(&mut pt);
         let chosen = TrackPopupMenu(
@@ -9908,7 +9917,7 @@ fn run_command(hwnd: HWND, command: Command) {
         }
         Command::DeleteSession(name) => {
             let text = format!(
-                "Delete the session {name}? Its look and extras in FeroSSH go with it.\n\n\
+                "Delete the connection {name}? Its look and extras in FeroSSH go with it.\n\n\
                  This cannot be undone."
             );
             if dialog(hwnd, &text, MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2) == Some(IDYES) {
