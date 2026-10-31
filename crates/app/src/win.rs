@@ -39,7 +39,7 @@ use ferossh_sftp::{Remote, names};
 use ferossh_term::{
     Action, Clock, Key, LogWriter, Mods, MouseButton, MouseEvent, SelectionKind,
     Settings as TermSettings, Terminal, WorkingDir, chain, check_link, clipboard_preview,
-    log_file_name,
+    log_file_name, prompt_dir,
 };
 use windows::Win32::Foundation::E_FAIL;
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, SIZE, WPARAM};
@@ -99,7 +99,7 @@ use crate::clipboard;
 use crate::conpty::{self, Output, Shell};
 use crate::credman;
 use crate::desktop::{Desktop, Protocol, Update as DesktopUpdate};
-use crate::files::{FilesAction, FilesView};
+use crate::files::{FilesAction, FilesView, Follow};
 use crate::forwards::{
     ConnView, DesktopEvent, Forwarder, FwdView, Setup as ForwardSetup, desktop_port_for,
 };
@@ -460,11 +460,16 @@ struct Pane {
     title: Option<String>,
     /// A bell rang while the pane was out of sight.
     bell: bool,
-    /// The remote working directory the shell last reported (OSC 7).
+    /// The remote working directory the shell last reported (OSC 7), or
+    /// showed in its prompt when it does not report it.
     cwd: Option<Vec<u8>>,
     /// The host name in the first report: reports naming another host
     /// come from a nested `ssh` and are not this connection's.
     cwd_host: Option<String>,
+    /// The shell reports its directory with OSC 7: prompts are not read.
+    cwd_reported: bool,
+    /// The host name in the first prompt read, as for `cwd_host`.
+    prompt_host: Option<String>,
     /// Where the scroll mark was last drawn, so moving or hiding it can
     /// repaint the rows it covered.
     mark: Option<Rect>,
@@ -704,6 +709,10 @@ struct Window {
     files: FilesView,
     /// The host the file view shows: the focused pane's.
     files_key: Option<String>,
+    /// The pane whose directory the file view last followed, so that
+    /// focusing another pane (even on the same host) or reopening the
+    /// view lists that pane's directory.
+    files_pane: Option<PaneId>,
     transfer_timer: bool,
     forwards_view: ForwardsView,
     live_view: LiveView,
@@ -1264,6 +1273,7 @@ fn create_and_run(launch: Launch, theme: Option<String>) -> Result<()> {
                 sftp_routes: HashMap::new(),
                 files: FilesView::default(),
                 files_key: None,
+                files_pane: None,
                 transfer_timer: false,
                 forwards_view: ForwardsView::default(),
                 live_view: LiveView::default(),
@@ -1356,6 +1366,8 @@ fn new_pane(
         bell: false,
         cwd: None,
         cwd_host: None,
+        cwd_reported: false,
+        prompt_host: None,
         mark: None,
         desktop: None,
         no_broadcast: false,
@@ -2119,6 +2131,8 @@ impl Window {
             p.title = None;
             p.cwd = None;
             p.cwd_host = None;
+            p.cwd_reported = false;
+            p.prompt_host = None;
         }
         self.prune_sftp();
         self.prune_forwards();
@@ -4972,6 +4986,9 @@ impl Window {
                     }
                 }
             }
+            if self.read_prompt(id) {
+                chrome = true;
+            }
         }
         if let Some(deadline) = deadline {
             let wait = deadline.saturating_duration_since(Instant::now());
@@ -5188,13 +5205,19 @@ impl Window {
                 }
                 SideView::Files => {
                     let remote = self.files_key.as_ref().and_then(|k| self.sftp.get(k));
-                    self.files.draw(
-                        &mut self.side.grid,
-                        &palette,
-                        focused,
-                        remote,
-                        self.settings.follow_directory,
-                    );
+                    let follow = if !self.settings.follow_directory {
+                        Follow::Off
+                    } else if self
+                        .panes
+                        .get(&self.focused_id())
+                        .is_some_and(|p| p.cwd.is_some())
+                    {
+                        Follow::On
+                    } else {
+                        Follow::Unreported
+                    };
+                    self.files
+                        .draw(&mut self.side.grid, &palette, focused, remote, follow);
                 }
             }
             self.invalidate_grid(side);
@@ -7172,7 +7195,11 @@ impl Window {
                     self.settings.favourites.clone(),
                 );
             }
-            SideView::Files => self.ensure_sftp(self.focused_id()),
+            SideView::Files => {
+                // Opening the view lists the focused pane's directory.
+                self.files_pane = None;
+                self.ensure_sftp(self.focused_id());
+            }
             SideView::Forwards | SideView::Palette => {}
             SideView::Live => {
                 let all = self.open_sessions();
@@ -8816,20 +8843,25 @@ impl Window {
     }
 
     /// Points the file view at the focused pane's host when focus moved
-    /// to a pane on another host.
+    /// to a pane on another host, and at the focused pane's directory
+    /// when focus moved to another pane (on any host).
     fn sync_files(&mut self) {
         if !self.files_visible() {
+            self.files_pane = None;
             return;
         }
         let id = self.focused_id();
         let key = self.pane_sftp_key(id);
-        if key == self.files_key {
-            return;
+        let host_changed = key != self.files_key;
+        if host_changed {
+            self.files.reset();
+            self.files_key.clone_from(&key);
+            self.ensure_sftp(id);
         }
-        self.files.reset();
-        self.files_key.clone_from(&key);
-        self.ensure_sftp(id);
-        self.follow_pane(id);
+        if host_changed || self.files_pane != Some(id) {
+            self.files_pane = Some(id);
+            self.follow_pane(id);
+        }
     }
 
     /// Lists pane `id`'s reported directory, when following is on.
@@ -8868,6 +8900,65 @@ impl Window {
             return false;
         }
         p.cwd = Some(dir.path);
+        p.cwd_reported = true;
+        if !self.files_visible() || id != self.focused_id() {
+            return false;
+        }
+        self.follow_pane(id);
+        true
+    }
+
+    /// For shells that do not report their directory (OSC 7, which stock
+    /// bash does not send): reads it from a `user@host:dir$ ` prompt at
+    /// the cursor. Returns whether the file view changed.
+    fn read_prompt(&mut self, id: PaneId) -> bool {
+        let Some(p) = self.panes.get(&id) else {
+            return false;
+        };
+        if p.cwd_reported || !matches!(p.host, Host::Ssh(_) | Host::Tmux { .. }) {
+            return false;
+        }
+        let Some(dir) = p.term.prompt_line().as_deref().and_then(prompt_dir) else {
+            return false;
+        };
+        // `~` is the home folder; before SFTP has told us where that is,
+        // a path relative to where SFTP starts (the home folder) does.
+        let home = self
+            .pane_sftp_key(id)
+            .and_then(|k| self.sftp.get(&k))
+            .and_then(|r| r.home.clone());
+        let path = match dir.path.strip_prefix(b"~") {
+            None => dir.path,
+            Some(rest) => {
+                let rest = rest.strip_prefix(b"/").unwrap_or(rest);
+                match (home, rest.is_empty()) {
+                    (Some(home), true) => home,
+                    (Some(mut home), false) => {
+                        if !home.ends_with(b"/") {
+                            home.push(b'/');
+                        }
+                        home.extend_from_slice(rest);
+                        home
+                    }
+                    (None, true) => b".".to_vec(),
+                    (None, false) => rest.to_vec(),
+                }
+            }
+        };
+        let Some(p) = self.panes.get_mut(&id) else {
+            return false;
+        };
+        let host = dir.host.to_ascii_lowercase();
+        let first = p.prompt_host.get_or_insert_with(|| host.clone());
+        if *first != host {
+            // A nested ssh on another host: its paths are not ours.
+            let had = p.cwd.take().is_some();
+            return had && id == self.focused_id() && self.files_visible();
+        }
+        if p.cwd.as_deref() == Some(path.as_slice()) {
+            return false;
+        }
+        p.cwd = Some(path);
         if !self.files_visible() || id != self.focused_id() {
             return false;
         }

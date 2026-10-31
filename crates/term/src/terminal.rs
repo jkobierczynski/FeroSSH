@@ -633,6 +633,32 @@ impl Terminal {
         text
     }
 
+    /// The text before the cursor on its line, when the main screen is
+    /// shown (full-screen programs draw no prompt). Shells that do not
+    /// report their directory with OSC 7 often show it in the prompt;
+    /// [`crate::prompt_dir`] reads it from this.
+    pub fn prompt_line(&self) -> Option<String> {
+        if self.term.mode().contains(TermMode::ALT_SCREEN) {
+            return None;
+        }
+        let grid = self.term.grid();
+        let at = grid.cursor.point;
+        let row = &grid[at.line];
+        let cols = at.column.0.min(grid.columns());
+        let mut text = String::with_capacity(cols);
+        for c in 0..cols {
+            let cell = &row[Column(c)];
+            if cell
+                .flags
+                .intersects(TermFlags::WIDE_CHAR_SPACER | TermFlags::LEADING_WIDE_CHAR_SPACER)
+            {
+                continue;
+            }
+            text.push(cell.c);
+        }
+        Some(text)
+    }
+
     /// The raw OSC 8 link target of a viewport cell, if it has one. Check
     /// it with [`crate::check_link`] before opening it.
     pub fn link_at(&self, col: usize, row: usize) -> Option<String> {
