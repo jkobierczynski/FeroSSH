@@ -537,8 +537,11 @@ pub fn parse_destination(text: &str) -> Option<(Option<String>, String, Option<u
     } else {
         (rest, None)
     };
+    // A host with one colon reads back as `host:port`, so only an IPv6
+    // address (two or more colons) may carry one, even inside brackets.
     let valid = !host.is_empty()
         && !host.starts_with('-')
+        && host.matches(':').count() != 1
         && host
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_' | ':' | '%'));
@@ -851,6 +854,9 @@ Host gateway
         assert_eq!(d("fe80::1"), Some((None, "fe80::1".into(), None)));
         assert_eq!(d("host:0"), None);
         assert_eq!(d("host:x"), None);
+        assert_eq!(d("[box]:22"), Some((None, "box".into(), Some(22))));
+        assert_eq!(d("[Book:s_]"), None);
+        assert_eq!(d("[a:b]:22"), None);
         assert_eq!(d("@host"), None);
         assert_eq!(d("ho st"), None);
         assert_eq!(d("-oProxyCommand=x"), None);

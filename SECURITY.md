@@ -98,4 +98,6 @@ request, and for half an hour per parser every night.
   only ever sees the connection's encrypted bytes.
 - A jump host sees which host and port you connect to through it, and
   can refuse or cut that stream, as with OpenSSH.
-- Release exes are not code-signed yet.
+- Release exes are signed on the maintainer's PC, so the signature says who
+  released a file, not that it was built by CI; the build provenance
+  attestations and reproducible builds show that.
