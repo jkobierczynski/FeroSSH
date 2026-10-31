@@ -657,7 +657,10 @@ fn searching_past_a_wide_character_that_was_overwritten_ends() {
 fn prompt_line_is_the_text_before_the_cursor() {
     let mut t = term(40, 5);
     t.feed(b"total 0\r\nuser@Debian:~/Downloads$ ");
-    assert_eq!(t.prompt_line().as_deref(), Some("user@Debian:~/Downloads$ "));
+    assert_eq!(
+        t.prompt_line().as_deref(),
+        Some("user@Debian:~/Downloads$ ")
+    );
     assert_eq!(
         t.prompt_line()
             .as_deref()
@@ -666,7 +669,10 @@ fn prompt_line_is_the_text_before_the_cursor() {
         Some(b"~/Downloads".to_vec())
     );
     t.feed(b"ls");
-    assert_eq!(t.prompt_line().as_deref(), Some("user@Debian:~/Downloads$ ls"));
+    assert_eq!(
+        t.prompt_line().as_deref(),
+        Some("user@Debian:~/Downloads$ ls")
+    );
     // Full-screen programs draw no prompt.
     t.feed(b"\x1b[?1049h");
     assert_eq!(t.prompt_line(), None);
