@@ -274,10 +274,17 @@ jobs:
   fuzz:
     name: Fuzz smoke run
     runs-on: ubuntu-latest
+    # Fuzzing needs nightly, pinned to a known-good date so a nightly
+    # regression cannot turn this check red overnight: nightly-2026-11-01
+    # fails to compile ssh-key 0.7.0-rc.11 (E0391, a query cycle computing
+    # whether KeyData needs async drop). ci.yml and fuzz.yml use the same
+    # date; before moving it on, check `cargo +nightly-YYYY-MM-DD fuzz build`.
+    env:
+      FUZZ_TOOLCHAIN: nightly-2026-10-31
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
-      - run: rustup toolchain install nightly --profile minimal
+      - run: rustup toolchain install "$FUZZ_TOOLCHAIN" --profile minimal
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-fuzz
@@ -286,20 +293,20 @@ jobs:
       - run: mkdir -p fuzz/corpus && cp -r fuzz/regressions/. fuzz/corpus/
       # The prebuilt cargo-fuzz is a musl binary and would default to the musl
       # target, which AddressSanitizer does not support.
-      - run: cargo +nightly fuzz run --target x86_64-unknown-linux-gnu ipc_decode -- -max_total_time=60
-      - run: cargo +nightly fuzz run --target x86_64-unknown-linux-gnu term_feed -- -max_total_time=60
-      - run: cargo +nightly fuzz run --target x86_64-unknown-linux-gnu sftp_decode -- -max_total_time=60
-      - run: cargo +nightly fuzz run --target x86_64-unknown-linux-gnu forward_parse -- -max_total_time=60
-      - run: cargo +nightly fuzz run --target x86_64-unknown-linux-gnu tmux_feed -- -max_total_time=60 -dict=fuzz/dicts/tmux_feed.dict
-      - run: cargo +nightly fuzz run --target x86_64-unknown-linux-gnu vnc_decode -- -max_total_time=60
-      - run: cargo +nightly fuzz run --target x86_64-unknown-linux-gnu rdp_decode -- -max_total_time=60
-      - run: cargo +nightly fuzz run --target x86_64-unknown-linux-gnu import_parse -- -max_total_time=60
-      - run: cargo +nightly fuzz run --target x86_64-unknown-linux-gnu userauth_check -- -max_total_time=60
-      - run: cargo +nightly fuzz run --target x86_64-unknown-linux-gnu key_files -- -max_total_time=60
-      - run: cargo +nightly fuzz run --target x86_64-unknown-linux-gnu host_config -- -max_total_time=60
-      - run: cargo +nightly fuzz run --target x86_64-unknown-linux-gnu telnet_feed -- -max_total_time=60
-      - run: cargo +nightly fuzz run --target x86_64-unknown-linux-gnu zmodem_feed -- -max_total_time=60
-      - run: cargo +nightly fuzz run --target x86_64-unknown-linux-gnu ssh_transport -- -max_total_time=60 -dict=fuzz/dicts/ssh_transport.dict
-      - run: cargo +nightly fuzz run --target x86_64-unknown-linux-gnu login_script -- -max_total_time=60
-      - run: cargo +nightly fuzz run --target x86_64-unknown-linux-gnu sanitize -- -max_total_time=60
-      - run: cargo +nightly fuzz run --target x86_64-unknown-linux-gnu trigger_feed -- -max_total_time=60
+      - run: cargo "+$FUZZ_TOOLCHAIN" fuzz run --target x86_64-unknown-linux-gnu ipc_decode -- -max_total_time=60
+      - run: cargo "+$FUZZ_TOOLCHAIN" fuzz run --target x86_64-unknown-linux-gnu term_feed -- -max_total_time=60
+      - run: cargo "+$FUZZ_TOOLCHAIN" fuzz run --target x86_64-unknown-linux-gnu sftp_decode -- -max_total_time=60
+      - run: cargo "+$FUZZ_TOOLCHAIN" fuzz run --target x86_64-unknown-linux-gnu forward_parse -- -max_total_time=60
+      - run: cargo "+$FUZZ_TOOLCHAIN" fuzz run --target x86_64-unknown-linux-gnu tmux_feed -- -max_total_time=60 -dict=fuzz/dicts/tmux_feed.dict
+      - run: cargo "+$FUZZ_TOOLCHAIN" fuzz run --target x86_64-unknown-linux-gnu vnc_decode -- -max_total_time=60
+      - run: cargo "+$FUZZ_TOOLCHAIN" fuzz run --target x86_64-unknown-linux-gnu rdp_decode -- -max_total_time=60
+      - run: cargo "+$FUZZ_TOOLCHAIN" fuzz run --target x86_64-unknown-linux-gnu import_parse -- -max_total_time=60
+      - run: cargo "+$FUZZ_TOOLCHAIN" fuzz run --target x86_64-unknown-linux-gnu userauth_check -- -max_total_time=60
+      - run: cargo "+$FUZZ_TOOLCHAIN" fuzz run --target x86_64-unknown-linux-gnu key_files -- -max_total_time=60
+      - run: cargo "+$FUZZ_TOOLCHAIN" fuzz run --target x86_64-unknown-linux-gnu host_config -- -max_total_time=60
+      - run: cargo "+$FUZZ_TOOLCHAIN" fuzz run --target x86_64-unknown-linux-gnu telnet_feed -- -max_total_time=60
+      - run: cargo "+$FUZZ_TOOLCHAIN" fuzz run --target x86_64-unknown-linux-gnu zmodem_feed -- -max_total_time=60
+      - run: cargo "+$FUZZ_TOOLCHAIN" fuzz run --target x86_64-unknown-linux-gnu ssh_transport -- -max_total_time=60 -dict=fuzz/dicts/ssh_transport.dict
+      - run: cargo "+$FUZZ_TOOLCHAIN" fuzz run --target x86_64-unknown-linux-gnu login_script -- -max_total_time=60
+      - run: cargo "+$FUZZ_TOOLCHAIN" fuzz run --target x86_64-unknown-linux-gnu sanitize -- -max_total_time=60
+      - run: cargo "+$FUZZ_TOOLCHAIN" fuzz run --target x86_64-unknown-linux-gnu trigger_feed -- -max_total_time=60

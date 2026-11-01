@@ -21,6 +21,13 @@ jobs:
   fuzz:
     name: Fuzz ${{ matrix.target }}
     runs-on: ubuntu-latest
+    # Fuzzing needs nightly, pinned to a known-good date so a nightly
+    # regression cannot turn this check red overnight: nightly-2026-11-01
+    # fails to compile ssh-key 0.7.0-rc.11 (E0391, a query cycle computing
+    # whether KeyData needs async drop). ci.yml and fuzz.yml use the same
+    # date; before moving it on, check `cargo +nightly-YYYY-MM-DD fuzz build`.
+    env:
+      FUZZ_TOOLCHAIN: nightly-2026-10-31
     strategy:
       fail-fast: false
       matrix:
@@ -44,7 +51,7 @@ jobs:
           - trigger_feed
     steps:
       - uses: actions/checkout@v4
-      - run: rustup toolchain install nightly --profile minimal
+      - run: rustup toolchain install "$FUZZ_TOOLCHAIN" --profile minimal
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-fuzz
@@ -65,12 +72,12 @@ jobs:
           MINUTES: ${{ inputs.minutes || '30' }}
         run: |
           dict=fuzz/dicts/${{ matrix.target }}.dict
-          cargo +nightly fuzz run --target x86_64-unknown-linux-gnu ${{ matrix.target }} -- \
+          cargo "+$FUZZ_TOOLCHAIN" fuzz run --target x86_64-unknown-linux-gnu ${{ matrix.target }} -- \
             -max_total_time=$((MINUTES * 60)) -timeout=10 -rss_limit_mb=2048 \
             $([ -f "$dict" ] && echo "-dict=$dict")
       - name: Shrink the corpus
         if: success()
-        run: cargo +nightly fuzz cmin --target x86_64-unknown-linux-gnu ${{ matrix.target }}
+        run: cargo "+$FUZZ_TOOLCHAIN" fuzz cmin --target x86_64-unknown-linux-gnu ${{ matrix.target }}
       - uses: actions/upload-artifact@v4
         if: failure()
         with:
