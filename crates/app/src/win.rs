@@ -5216,8 +5216,15 @@ impl Window {
                     } else {
                         Follow::Unreported
                     };
-                    self.files
-                        .draw(&mut self.side.grid, &palette, focused, remote, follow);
+                    let downloads = self.download_dir();
+                    self.files.draw(
+                        &mut self.side.grid,
+                        &palette,
+                        focused,
+                        remote,
+                        follow,
+                        &downloads,
+                    );
                 }
             }
             self.invalidate_grid(side);
@@ -7978,8 +7985,10 @@ impl Window {
                     self.snippets_view
                         .scroll_by(lines, &self.settings.snippets, rows);
                 } else if self.side.view == SideView::Files {
+                    let downloads = self.download_dir();
                     let remote = self.files_key.as_ref().and_then(|k| self.sftp.get(k));
-                    self.files.scroll_by(remote, lines, self.side.grid.rows());
+                    let rows = self.side.grid.rows();
+                    self.files.scroll_by(remote, lines, &downloads, rows);
                 } else if let Some(form) = &mut self.side.form {
                     form.scroll_by(lines, self.side.grid.rows());
                 } else if let Some(view) = &mut self.side.import {
@@ -8695,6 +8704,20 @@ impl Window {
             .map_or_else(|| home().join("Downloads"), PathBuf::from)
     }
 
+    /// The file view's Local PC folder moved: downloads go there from now
+    /// on, and it is remembered (`DownloadFolder`; unset for Downloads).
+    fn set_download_dir(&mut self, dir: &Path) {
+        let Some(text) = dir.to_str() else {
+            return;
+        };
+        let folder = (dir != home().join("Downloads")).then(|| text.to_owned());
+        if self.settings.download_folder != folder {
+            self.settings.download_folder = folder;
+            self.save_settings();
+        }
+        self.refresh_chrome();
+    }
+
     fn files_visible(&self) -> bool {
         self.side.visible && self.side.view == SideView::Files
     }
@@ -8995,6 +9018,17 @@ impl Window {
                 self.toggle_follow();
                 None
             }
+            Some(FilesAction::SetLocal(dir)) => {
+                self.set_download_dir(&dir);
+                None
+            }
+            Some(FilesAction::PickLocal) => Some(Command::PickLocalFolder(self.download_dir())),
+            Some(FilesAction::Upload { paths, dir }) => {
+                if let Some(key) = self.files_key.clone() {
+                    self.upload_files(&key, &paths, &dir);
+                }
+                None
+            }
             None => None,
         };
         self.flush_sftp();
@@ -9264,6 +9298,9 @@ enum Command {
         key: String,
         entry: DirEntry,
     },
+    /// The folder picker for the file view's Local PC section, starting
+    /// in this folder.
+    PickLocalFolder(PathBuf),
     /// The file picker, then upload into `dir` on `key`'s host.
     PickUpload {
         key: String,
@@ -9492,6 +9529,54 @@ fn pick_files(hwnd: HWND, title: PCWSTR) -> Vec<PathBuf> {
         [] => Vec::new(),
         [one] => vec![PathBuf::from(one)],
         [dir, names @ ..] => names.iter().map(|n| Path::new(dir).join(n)).collect(),
+    }
+}
+
+/// The folder picker (the Vista-style one Explorer users know), starting
+/// in `start`.
+fn pick_folder(hwnd: HWND, title: PCWSTR, start: &Path) -> Option<PathBuf> {
+    use windows::Win32::System::Com::{
+        CLSCTX_INPROC_SERVER, COINIT_APARTMENTTHREADED, CoCreateInstance, CoInitializeEx,
+        CoTaskMemFree, CoUninitialize,
+    };
+    use windows::Win32::UI::Shell::{
+        FOS_FORCEFILESYSTEM, FOS_PATHMUSTEXIST, FOS_PICKFOLDERS, FileOpenDialog, IFileOpenDialog,
+        IShellItem, SHCreateItemFromParsingName, SIGDN_FILESYSPATH,
+    };
+    if DIALOG_OPEN.get() {
+        return None;
+    }
+    // SAFETY: COM on this (the UI) thread, balanced below when it took;
+    // the dialog and its items are released when they drop; the path
+    // string is freed with CoTaskMemFree after it is copied.
+    unsafe {
+        let com = CoInitializeEx(None, COINIT_APARTMENTTHREADED).is_ok();
+        let picked = (|| -> Result<PathBuf> {
+            let dialog: IFileOpenDialog =
+                CoCreateInstance(&FileOpenDialog, None, CLSCTX_INPROC_SERVER)?;
+            let options = dialog.GetOptions()?;
+            dialog
+                .SetOptions(options | FOS_PICKFOLDERS | FOS_FORCEFILESYSTEM | FOS_PATHMUSTEXIST)?;
+            dialog.SetTitle(title)?;
+            let start = HSTRING::from(start.as_os_str());
+            if let Ok(folder) = SHCreateItemFromParsingName::<_, _, IShellItem>(&start, None) {
+                let _ = dialog.SetFolder(&folder);
+            }
+            DIALOG_OPEN.set(true);
+            let shown = dialog.Show(Some(hwnd));
+            DIALOG_OPEN.set(false);
+            shown?;
+            let name = dialog.GetResult()?.GetDisplayName(SIGDN_FILESYSPATH)?;
+            let path = name
+                .to_string()
+                .map_err(|e| windows::core::Error::new(E_FAIL, e.to_string()));
+            CoTaskMemFree(Some(name.0 as *const _));
+            Ok(PathBuf::from(path?))
+        })();
+        if com {
+            CoUninitialize();
+        }
+        picked.ok()
     }
 }
 
@@ -9892,6 +9977,11 @@ fn run_command(hwnd: HWND, command: Command) {
             let picked = pick_files(hwnd, w!("Upload files"));
             if !picked.is_empty() {
                 with_window(|w| w.upload_files(&key, &picked, &dir));
+            }
+        }
+        Command::PickLocalFolder(start) => {
+            if let Some(dir) = pick_folder(hwnd, w!("Local PC folder for file transfers"), &start) {
+                with_window(|w| w.set_download_dir(&dir));
             }
         }
         Command::PickZmodem { pane, channel } => {
