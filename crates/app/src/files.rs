@@ -32,6 +32,18 @@ pub enum FilesAction {
     ToggleFollow,
 }
 
+/// Whether the listing follows the terminal's directory, as the title
+/// shows it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Follow {
+    Off,
+    /// Following, and the focused pane's shell has reported its directory.
+    On,
+    /// Following is on, but the focused pane's shell has not reported its
+    /// directory (OSC 7), so there is nothing to follow.
+    Unreported,
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 enum Focus {
     #[default]
@@ -460,7 +472,7 @@ impl FilesView {
         palette: &Palette,
         focused: bool,
         remote: Option<&Remote>,
-        follow: bool,
+        follow: Follow,
     ) {
         let width = grid.cols();
         let rows = grid.rows();
@@ -507,7 +519,11 @@ impl FilesView {
             return;
         };
         let g = self.sync(remote, rows);
-        let follows = if follow { "follows cd " } else { "" };
+        let follows = match follow {
+            Follow::Off => "",
+            Follow::On => "follows cd ",
+            Follow::Unreported => "cd not reported ",
+        };
         let title = spread(&format!(" Files  {}", remote.label), follows, width);
         let mut cells = line(&title, palette.text, bg, Flags::empty());
         for c in cells.iter_mut().take(6) {
@@ -731,7 +747,13 @@ mod tests {
 
     fn texts(v: &mut FilesView, r: Option<&Remote>, rows: usize) -> Vec<String> {
         let mut grid = Grid::new(60, rows);
-        v.draw(&mut grid, &Palette::of(&Theme::default()), true, r, true);
+        v.draw(
+            &mut grid,
+            &Palette::of(&Theme::default()),
+            true,
+            r,
+            Follow::On,
+        );
         (0..rows)
             .map(|y| {
                 grid.row(y)

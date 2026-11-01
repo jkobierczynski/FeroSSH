@@ -31,7 +31,7 @@ mod log;
 mod sanitize;
 mod terminal;
 
-pub use cwd::WorkingDir;
+pub use cwd::{WorkingDir, prompt_dir};
 pub use input::{Key, Mods, MouseButton, MouseEvent};
 pub use log::{Clock, LogWriter, Sealed, log_file_name};
 pub use sanitize::{Paste, check_link, clipboard_preview, prepare_paste, sanitize_title};

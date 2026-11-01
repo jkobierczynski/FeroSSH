@@ -123,10 +123,67 @@ fn parse(osc: &[u8]) -> Option<WorkingDir> {
     })
 }
 
+/// Reads the directory from a `user@host:dir$ ` prompt (bash's default
+/// on Debian and Ubuntu, `\u@\h:\w\$ `), for shells that do not report it
+/// with OSC 7. `line` is the text before the cursor, so a prompt with a
+/// command being typed after it, or a line of output, gives `None`. The
+/// prompt may start with a `(chroot)` or `(venv)` tag. `~` and `~/…` come
+/// back as they are, for the caller to resolve against the home folder.
+pub fn prompt_dir(line: &str) -> Option<WorkingDir> {
+    let body = line
+        .strip_suffix("$ ")
+        .or_else(|| line.strip_suffix("# "))?;
+    // Tags like `(venv) ` or Debian's `(chroot)` before the user name.
+    let mut body = body;
+    while let Some(tag) = body.strip_prefix('(') {
+        body = tag.split_once(')')?.1.trim_start();
+    }
+    let (user, rest) = body.split_once('@')?;
+    let (host, path) = rest.split_once(':')?;
+    let name = |s: &str| {
+        !s.is_empty()
+            && s.chars()
+                .all(|c| c.is_alphanumeric() || matches!(c, '-' | '_' | '.'))
+    };
+    if !name(user) || !name(host) {
+        return None;
+    }
+    let tilde = path == "~" || path.starts_with("~/");
+    if !(tilde || path.starts_with('/')) || path.chars().any(char::is_control) {
+        return None;
+    }
+    // Trailing slashes of `~/dir/` are not bash's, but harmless.
+    Some(WorkingDir {
+        host: host.to_owned(),
+        path: path.as_bytes().to_vec(),
+    })
+}
+
 #[cfg(test)]
 #[allow(clippy::indexing_slicing)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reads_debian_prompts() {
+        let d = |line: &str| prompt_dir(line).map(|w| (w.host, w.path));
+        let got = |host: &str, path: &str| Some((host.to_owned(), path.as_bytes().to_vec()));
+        assert_eq!(
+            d("user@Debian:~/Downloads/routershift$ "),
+            got("Debian", "~/Downloads/routershift")
+        );
+        assert_eq!(d("user@Debian:~$ "), got("Debian", "~"));
+        assert_eq!(d("root@web-1:/etc/nginx# "), got("web-1", "/etc/nginx"));
+        assert_eq!(d("(venv) me@box:/srv/my dir$ "), got("box", "/srv/my dir"));
+        assert_eq!(d("(chroot)me@box:/$ "), got("box", "/"));
+        // A command being typed, output, other prompt styles.
+        assert_eq!(d("user@Debian:~$ ls"), None);
+        assert_eq!(d("total 12"), None);
+        assert_eq!(d("[user@rhel ~]$ "), None);
+        assert_eq!(d("user@Debian:relative$ "), None);
+        assert_eq!(d("a b@host:/x$ "), None);
+        assert_eq!(d(""), None);
+    }
 
     fn dir(host: &str, path: &[u8]) -> WorkingDir {
         WorkingDir {
