@@ -165,9 +165,18 @@ mod tests {
     }
 
     #[test]
-    fn root_has_no_up_without_drives() {
+    fn above_the_root_come_the_drives() {
         let l = LocalDir::read(Path::new("/"));
-        assert_eq!(l.up, None);
+        // Windows has drives to list; elsewhere the root is the top.
+        let want = if cfg!(windows) {
+            Some(Up::Drives)
+        } else {
+            None
+        };
+        assert_eq!(l.up, want);
+        if cfg!(windows) {
+            assert!(LocalDir::drives().entries.iter().any(|e| e.dir));
+        }
         assert_eq!(LocalDir::drives().label(), "This PC");
     }
 }

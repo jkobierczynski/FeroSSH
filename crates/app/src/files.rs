@@ -1306,7 +1306,7 @@ mod tests {
         let transfers = t.iter().position(|l| l.starts_with(" Transfers")).unwrap();
         assert!(files < local && local < transfers, "{t:?}");
         assert!(
-            t[local].ends_with(&format!("{}", dir.display())),
+            t[local].ends_with(&*dir.file_name().unwrap().to_string_lossy()),
             "{:?}",
             t[local]
         );
