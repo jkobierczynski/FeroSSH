@@ -116,6 +116,7 @@ use crate::pattern;
 use crate::proxycmd::ProxyRun;
 use crate::pwcommand;
 use crate::reconnect::{self, Next, Retry};
+use crate::same_dir;
 use crate::sandbox;
 use crate::scrollmark;
 use crate::serial_port::{Output as SerialOutput, SerialPort};
@@ -355,6 +356,9 @@ mod cmd {
     pub const TAB_RIGHT: u32 = 705;
     pub const PANE_TO_TAB: u32 = 706;
     pub const JOIN_TAB: u32 = 707;
+    /// Split right/down with the new shell in the pane's directory.
+    pub const SPLIT_RIGHT_HERE: u32 = 708;
+    pub const SPLIT_DOWN_HERE: u32 = 709;
     /// Plus 0-3: left, right, up, down.
     pub const FOCUS: u32 = 710;
     /// Plus 0-3: left, right, up, down.
@@ -478,6 +482,9 @@ struct Pane {
     desktop: Option<Box<Desktop>>,
     /// Window > Leave this pane out of broadcast input.
     no_broadcast: bool,
+    /// Window > Split … in same directory: where the new shell goes once
+    /// logged in (after the login script, before tmux attaches).
+    start_dir: Option<Vec<u8>>,
 }
 
 impl Pane {
@@ -1371,6 +1378,7 @@ fn new_pane(
         mark: None,
         desktop: None,
         no_broadcast: false,
+        start_dir: None,
     }
 }
 
@@ -1515,6 +1523,16 @@ fn build_menu() -> Result<HMENU> {
         separator(window)?;
         item(window, cmd::SPLIT_RIGHT, "Split &right\tAlt+Shift+=")?;
         item(window, cmd::SPLIT_DOWN, "Split &down\tAlt+Shift+-")?;
+        item(
+            window,
+            cmd::SPLIT_RIGHT_HERE,
+            "Split right in &same directory",
+        )?;
+        item(
+            window,
+            cmd::SPLIT_DOWN_HERE,
+            "Split down in same d&irectory",
+        )?;
         item(window, cmd::PANE_TO_TAB, "Move pane to its own &tab")?;
         item(
             window,
@@ -2081,6 +2099,48 @@ impl Window {
         }
     }
 
+    /// Window > Split … in same directory, for new pane `id` opened like
+    /// the original: an SSH shell changes to `cwd` once logged in. A
+    /// directory not known (a shell that reports none and has a prompt
+    /// FeroSSH does not read, a local shell, Telnet) is said so.
+    fn start_in(&mut self, id: PaneId, cwd: Option<Vec<u8>>) {
+        let ssh = matches!(self.panes.get(&id).map(|p| &p.host), Some(Host::Ssh(_)));
+        match cwd.filter(|_| ssh) {
+            Some(dir) => {
+                if let Some(p) = self.panes.get_mut(&id) {
+                    p.start_dir = Some(dir);
+                }
+            }
+            None => {
+                let why = if ssh {
+                    "its shell did not report it"
+                } else {
+                    "FeroSSH follows directories on SSH shells only"
+                };
+                self.show(
+                    id,
+                    &format!(
+                        "\x1b[0;90mThe original pane's directory is not known ({why}), so \
+                         this shell starts in the usual place.\x1b[0m\r\n"
+                    ),
+                );
+                self.refresh(id);
+            }
+        }
+    }
+
+    /// Types the `cd` that Window > Split … in same directory asked for
+    /// at pane `id`'s freshly logged-in shell. Once: a reconnect starts
+    /// where the server starts it.
+    fn cd_after_login(&mut self, id: PaneId) {
+        let Some(dir) = self.panes.get_mut(&id).and_then(|p| p.start_dir.take()) else {
+            return;
+        };
+        if let Some(line) = same_dir::cd_line(&dir) {
+            self.send_host(id, &line);
+        }
+    }
+
     /// Types the line that starts tmux in control mode at pane `id`'s
     /// shell.
     fn attach_tmux(&mut self, id: PaneId, name: &str, pick: bool) {
@@ -2133,6 +2193,7 @@ impl Window {
             p.cwd_host = None;
             p.cwd_reported = false;
             p.prompt_host = None;
+            p.start_dir = None;
         }
         self.prune_sftp();
         self.prune_forwards();
@@ -3647,6 +3708,7 @@ impl Window {
                         _ => String::new(),
                     };
                     if !self.start_script(id, &alias, true) {
+                        self.cd_after_login(id);
                         self.tmux_after_login(id);
                     }
                     self.desktop_after_login(id);
@@ -4070,6 +4132,7 @@ impl Window {
                             };
                         }
                         if run.tmux {
+                            self.cd_after_login(id);
                             self.tmux_after_login(id);
                         }
                         if run.report {
@@ -8157,23 +8220,31 @@ impl Window {
                 let id = self.new_tab_pane();
                 self.fill_like(id, pane);
             }
-            cmd::SPLIT_RIGHT | cmd::SPLIT_DOWN => {
-                let dir = if id == cmd::SPLIT_RIGHT {
+            cmd::SPLIT_RIGHT | cmd::SPLIT_DOWN | cmd::SPLIT_RIGHT_HERE | cmd::SPLIT_DOWN_HERE => {
+                let dir = if matches!(id, cmd::SPLIT_RIGHT | cmd::SPLIT_RIGHT_HERE) {
                     Dir::Right
                 } else {
                     Dir::Down
                 };
+                let here = matches!(id, cmd::SPLIT_RIGHT_HERE | cmd::SPLIT_DOWN_HERE);
                 if let Some(gateway) = self.panes.get(&pane).and_then(Pane::gateway) {
+                    // tmux knows each pane's directory itself.
                     let actions = self
                         .tmux
                         .get_mut(&gateway)
-                        .map(|t| t.split(pane, dir))
+                        .map(|t| t.split(pane, dir, here))
                         .unwrap_or_default();
                     self.run_tmux(gateway, actions);
                     return None;
                 }
+                let cwd = here
+                    .then(|| self.panes.get(&pane).and_then(|p| p.cwd.clone()))
+                    .flatten();
                 if let Some(new) = self.split(dir) {
                     self.fill_like(new, pane);
+                    if here {
+                        self.start_in(new, cwd);
+                    }
                 }
             }
             cmd::CLOSE_PANE => return self.close_pane(pane),

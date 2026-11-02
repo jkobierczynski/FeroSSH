@@ -29,6 +29,7 @@ use ferossh_tmuxcc::{
 };
 
 use crate::layout::{Axis, Dir, Node, PaneId as Native, Workspace};
+use crate::same_dir;
 
 /// Output kept for a pane until its screen is restored.
 const MAX_BUFFER: usize = 4 << 20;
@@ -118,6 +119,15 @@ enum Placement {
     Tab { after: Native },
 }
 
+/// A split waiting for its pane's directory.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Split {
+    /// A window placed next to a native pane (FeroSSH layout).
+    Window(Placement),
+    /// A tmux split of `pane` (tmux layout).
+    Pane { pane: PaneId, flags: &'static str },
+}
+
 #[derive(Debug, Clone)]
 enum Tag {
     Version,
@@ -131,6 +141,8 @@ enum Tag {
     CaptureAlternate(PaneId),
     NewWindow(Placement),
     SplitPane,
+    /// A pane's directory, to open a split there.
+    SplitHere(Split),
     Sessions,
     NewSession,
     /// The reply does not matter.
@@ -691,6 +703,16 @@ impl Tmux {
                     }
                 }
             }
+            Tag::SplitHere(split) => {
+                // A pane that went meanwhile, or a path tmux cannot take:
+                // the split opens where tmux starts shells.
+                let cwd = if ok {
+                    same_dir::tmux_cwd(&first())
+                } else {
+                    String::new()
+                };
+                self.open_split(split, &cwd, out);
+            }
             Tag::SplitPane => {
                 self.focus_next = std::str::from_utf8(lines.first().map_or(&[][..], |l| l))
                     .ok()
@@ -1129,36 +1151,56 @@ impl Tmux {
     }
 
     /// Splits native pane `native`: a new window beside it in FeroSSH
-    /// layout, a tmux split in tmux layout.
-    pub fn split(&mut self, native: Native, dir: Dir) -> Vec<Action> {
+    /// layout, a tmux split in tmux layout. `here` starts the new shell
+    /// in the pane's directory, which tmux is asked for first: tmux
+    /// expands `#{pane_current_path}` in `-c` for the client's current
+    /// pane, not the target.
+    pub fn split(&mut self, native: Native, dir: Dir, here: bool) -> Vec<Action> {
         let mut out = Vec::new();
         let Some(p) = self.pane_of(native) else {
             return out;
         };
-        match self.mode {
-            Mode::Ferossh => self.send(
-                "new-window -d -P -F '#{window_id}'",
-                Tag::NewWindow(Placement::Split {
-                    next_to: native,
-                    dir,
-                }),
-                &mut out,
-            ),
-            Mode::Tmux => {
-                let flags = match dir {
+        let split = match self.mode {
+            Mode::Ferossh => Split::Window(Placement::Split {
+                next_to: native,
+                dir,
+            }),
+            Mode::Tmux => Split::Pane {
+                pane: p,
+                flags: match dir {
                     Dir::Right => "-h",
                     Dir::Left => "-hb",
                     Dir::Down => "-v",
                     Dir::Up => "-vb",
-                };
-                self.send(
-                    &format!("split-window {flags} -t %{p} -P -F '#{{pane_id}}'"),
-                    Tag::SplitPane,
-                    &mut out,
-                );
-            }
+                },
+            },
+        };
+        if here {
+            self.send(
+                &format!("display-message -p -t %{p} '#{{pane_current_path}}'"),
+                Tag::SplitHere(split),
+                &mut out,
+            );
+        } else {
+            self.open_split(split, "", &mut out);
         }
         out
+    }
+
+    /// Opens `split`; `cwd` is its `-c` option or empty.
+    fn open_split(&mut self, split: Split, cwd: &str, out: &mut Vec<Action>) {
+        match split {
+            Split::Window(placement) => self.send(
+                &format!("new-window -d{cwd} -P -F '#{{window_id}}'"),
+                Tag::NewWindow(placement),
+                out,
+            ),
+            Split::Pane { pane, flags } => self.send(
+                &format!("split-window {flags}{cwd} -t %{pane} -P -F '#{{pane_id}}'"),
+                Tag::SplitPane,
+                out,
+            ),
+        }
     }
 
     /// A new tmux window as a tab after `native`'s.
@@ -1586,7 +1628,7 @@ mod tests {
         let panes = [pane_line(0, 0, 80, 24, "b25f,80x24,0,0,0")];
         let (mut t, mut ws, _) = attached(Some("ferossh"), None, &panes);
         let a0 = t.native_of(0).unwrap();
-        let w = writes(&t.split(a0, Dir::Down));
+        let w = writes(&t.split(a0, Dir::Down, false));
         assert_eq!(w, ["new-window -d -P -F '#{window_id}'"]);
         // Replies 5 and 6 were the captures; 7 is the new window.
         let mut input = reply(5, &[]);
@@ -1646,12 +1688,66 @@ mod tests {
     }
 
     #[test]
+    fn splits_in_the_same_directory_ask_tmux_first() {
+        let panes = [pane_line(0, 0, 80, 24, "b25f,80x24,0,0,0")];
+        let (mut t, mut ws, _) = attached(Some("ferossh"), None, &panes);
+        let a0 = t.native_of(0).unwrap();
+        assert_eq!(
+            writes(&t.split(a0, Dir::Right, true)),
+            ["display-message -p -t %0 '#{pane_current_path}'"]
+        );
+        // Replies 5 and 6 were the captures; 7 is the directory.
+        let mut input = reply(5, &[]);
+        input.extend(reply(6, &[]));
+        input.extend(reply(7, &["/srv/my #1".into()]));
+        assert_eq!(
+            writes(&t.feed(&mut ws, &input)),
+            ["new-window -d -c '/srv/my ##1' -P -F '#{window_id}'"]
+        );
+        // The new window lands next to the pane, as a plain split's does.
+        let mut input = reply(8, &["@4".into()]);
+        input.extend(b"%window-add @4\n");
+        t.feed(&mut ws, &input);
+        t.feed(
+            &mut ws,
+            &reply(9, &[pane_line(9, 4, 80, 24, "b25f,80x24,0,0,9")]),
+        );
+        let n9 = t.native_of(9).unwrap();
+        assert_eq!(ws.tabs[0].root.panes(), [a0, n9]);
+        // A path tmux cannot take, or a failed query: a plain split.
+        // Replies 10 and 11 are the new pane's captures.
+        assert_eq!(writes(&t.split(a0, Dir::Down, true)).len(), 1);
+        let mut input = reply(10, &[]);
+        input.extend(reply(11, &[]));
+        input.extend(reply(12, &["/tmp/it's".into()]));
+        assert_eq!(
+            writes(&t.feed(&mut ws, &input)),
+            ["new-window -d -P -F '#{window_id}'"]
+        );
+    }
+
+    #[test]
+    fn tmux_layout_splits_in_the_same_directory() {
+        let panes = [pane_line(0, 0, 80, 24, "b25f,80x24,0,0,0")];
+        let (mut t, mut ws, _) = attached(Some("tmux"), None, &panes);
+        let a0 = t.native_of(0).unwrap();
+        assert_eq!(writes(&t.split(a0, Dir::Down, true)).len(), 1);
+        let mut input = reply(5, &[]);
+        input.extend(reply(6, &[]));
+        input.extend(reply(7, &["/home/me/src".into()]));
+        assert_eq!(
+            writes(&t.feed(&mut ws, &input)),
+            ["split-window -v -c '/home/me/src' -t %0 -P -F '#{pane_id}'"]
+        );
+    }
+
+    #[test]
     fn tmux_layout_follows_tmux_splits() {
         let panes = [pane_line(0, 0, 80, 24, "b25f,80x24,0,0,0")];
         let (mut t, mut ws, _) = attached(Some("tmux"), None, &panes);
         let a0 = t.native_of(0).unwrap();
         assert_eq!(
-            writes(&t.split(a0, Dir::Right)),
+            writes(&t.split(a0, Dir::Right, false)),
             ["split-window -h -t %0 -P -F '#{pane_id}'"]
         );
         let mut input = reply(5, &[]);

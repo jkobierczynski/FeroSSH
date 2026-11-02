@@ -72,6 +72,8 @@ mod proxycmd;
 mod pwcommand;
 #[cfg_attr(not(windows), allow(dead_code))]
 mod reconnect;
+#[cfg_attr(not(windows), allow(dead_code))]
+mod same_dir;
 #[cfg(windows)]
 mod sandbox;
 #[cfg_attr(not(windows), allow(dead_code))]

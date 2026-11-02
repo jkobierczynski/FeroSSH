@@ -268,7 +268,7 @@ fn real_tmux_round_trip() {
     a.until("the echo", |h| h.text(first).contains("one-42"));
 
     // A native split is a new tmux window beside the pane.
-    let actions = a.tmux.split(first, Dir::Right);
+    let actions = a.tmux.split(first, Dir::Right, false);
     a.apply(actions);
     a.until("the split", |h| h.shown() == 2);
     let second = a.ws.focused();
@@ -341,7 +341,7 @@ fn real_tmux_round_trip() {
     });
     assert_eq!(a.tmux.mode(), Mode::Tmux);
     let pane = a.ws.focused();
-    let actions = a.tmux.split(pane, Dir::Down);
+    let actions = a.tmux.split(pane, Dir::Down, false);
     a.apply(actions);
     a.until("the tmux split", |h| h.shown() == 3);
     let tab = a.ws.tab_of(a.ws.focused()).unwrap();
@@ -408,7 +408,7 @@ fn older_tmux_falls_back_to_tmux_layout() {
     a.apply(actions);
     a.until("the echo", |h| h.text(first).contains("one-42"));
 
-    let actions = a.tmux.split(first, Dir::Down);
+    let actions = a.tmux.split(first, Dir::Down, false);
     a.apply(actions);
     a.until("the tmux split", |h| h.shown() == 2);
     assert_eq!(a.ws.tabs.len(), 1);
@@ -469,4 +469,37 @@ fn too_old_tmux_is_refused() {
         tmux_cmd(&server, &["list-clients", "-F", "#{client_name}"]).is_empty()
     });
     assert!(tmux_cmd(&server, &["list-sessions", "-F", "#{session_name}"]).contains("e2e"));
+}
+
+#[test]
+fn real_tmux_split_in_the_same_directory() {
+    if !tmux_available() {
+        return;
+    }
+    let server = Server {
+        socket: format!("ferossh-e2e-here-{}", std::process::id()),
+    };
+    let mut a = Harness::attach(&server, Mode::Ferossh);
+    a.until("the first pane", |h| h.shown() == 1 && !h.panes.is_empty());
+    let first = a.ws.all_panes()[0];
+    // A space and a `#`, which tmux would read as a format.
+    let dir = format!("/tmp/ferossh here #{}", std::process::id());
+    let line = format!("mkdir -p '{dir}' && cd '{dir}' && echo in-$((40+2))\r");
+    let actions = a.tmux.input(first, line.as_bytes());
+    a.apply(actions);
+    a.until("the cd", |h| h.text(first).contains("in-42"));
+
+    // Older tmux falls back to tmux layout: a tmux split; both start
+    // there.
+    let actions = a.tmux.split(first, Dir::Right, true);
+    a.apply(actions);
+    a.until("the split", |h| h.shown() == 2);
+    let second = a.ws.focused();
+    assert_ne!(second, first);
+    let actions = a.tmux.input(second, b"echo \"at:$(pwd):\"\r");
+    a.apply(actions);
+    a.until("the new pane's directory", |h| {
+        h.text(second).contains(&format!("at:{dir}:"))
+    });
+    let _ = tmux_cmd(&server, &["run-shell", &format!("rmdir '{dir}'")]);
 }
