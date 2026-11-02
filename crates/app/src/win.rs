@@ -6490,6 +6490,9 @@ impl Window {
         };
         self.leave_palette();
         match action {
+            // Picked by name like a menu item: a side pane that is open
+            // hides at once instead of first taking the keyboard.
+            PalAction::Run(id) if is_side_pane(id) => self.toggle_side(id, true),
             PalAction::Run(id) => return Some(Command::Id(id)),
             PalAction::Open { host, split } => self.open_host(&host, split),
             PalAction::Send { index, enter } => {
@@ -8857,9 +8860,7 @@ impl Window {
                     self.layout();
                 }
             }
-            cmd::SESSIONS | cmd::FILES | cmd::FORWARDS | cmd::SNIPPETS | cmd::LIVE => {
-                self.toggle_side(id, false);
-            }
+            id if is_side_pane(id) => self.toggle_side(id, false),
             cmd::PALETTE => self.toggle_palette(),
             cmd::RUN_SCRIPT => return self.rerun_script(self.focused_id()),
             cmd::SIDE_RIGHT => {
@@ -10325,6 +10326,16 @@ fn session_menu(hwnd: HWND, host: Option<String>) {
     }
 }
 
+/// The Tools menu commands that show or hide a side pane. Menu clicks
+/// and the shortcuts both go through [`Window::toggle_side`]; keep this
+/// the one list, so a new pane cannot miss the menu path.
+fn is_side_pane(id: u32) -> bool {
+    matches!(
+        id,
+        cmd::SESSIONS | cmd::LIVE | cmd::FILES | cmd::FORWARDS | cmd::SNIPPETS
+    )
+}
+
 /// What a side pane command does.
 #[derive(Debug, PartialEq)]
 enum SideToggle {
@@ -11375,10 +11386,7 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
             }
             WM_COMMAND => {
                 let id = loword(wparam.0);
-                if matches!(
-                    id,
-                    cmd::SESSIONS | cmd::FILES | cmd::FORWARDS | cmd::SNIPPETS
-                ) {
+                if is_side_pane(id) {
                     with_window(|w| w.toggle_side(id, true));
                 } else {
                     run_command(hwnd, Command::Id(id));
@@ -11457,6 +11465,16 @@ mod tests {
 
     #[test]
     fn menu_click_hides_an_open_side_pane_at_once() {
+        for id in [
+            cmd::SESSIONS,
+            cmd::LIVE,
+            cmd::FILES,
+            cmd::FORWARDS,
+            cmd::SNIPPETS,
+        ] {
+            assert!(is_side_pane(id), "{id}");
+        }
+        assert!(!is_side_pane(cmd::PALETTE));
         assert_eq!(side_toggle(true, false, true), SideToggle::Hide);
         assert_eq!(side_toggle(true, true, true), SideToggle::Hide);
         assert_eq!(side_toggle(false, false, true), SideToggle::Show);
