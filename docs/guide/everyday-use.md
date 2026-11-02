@@ -108,7 +108,7 @@ Secrets are never written to a FeroSSH file. The first time, the pane asks for t
 
 ## Command snippets
 
-Ctrl+Shift+Space (Settings > Command snippets) lists named command lines. Type to filter, then Enter types the snippet with Enter after each line, or Shift+Enter leaves the last line for you to finish. With broadcast input on, it goes to every broadcast pane.
+Ctrl+Shift+Space (Tools > Command snippets) lists named command lines. Type to filter, then Enter types the snippet with Enter after each line, or Shift+Enter leaves the last line for you to finish. With broadcast input on, it goes to every broadcast pane.
 
 Insert adds a snippet (what you typed as a filter becomes its name), F2 edits one, Del removes one. Edit > Save selection as snippet starts one from text selected in a pane. Snippets are kept in `ferossh.conf`.
 
@@ -153,7 +153,7 @@ Edit > Record keystrokes as snippet records what you type in the focused pane un
 
 ## The command palette
 
-Ctrl+Shift+A (Settings > Command palette) is one search box over every menu item, every saved connection and every command snippet. Type a few letters in any order: `splr` finds Split right, `core` your core switch, `ctrl+shift+n` the item on that key. Enter runs the item, connects or types the snippet; Shift+Enter connects in a split or types a snippet without its last Enter. Each item shows its shortcut and check mark, greyed-out items are left out, and your last few picks come first.
+Ctrl+Shift+A (Tools > Command palette) is one search box over every menu item, every saved connection and every command snippet. Type a few letters in any order: `splr` finds Split right, `core` your core switch, `ctrl+shift+n` the item on that key. Enter runs the item, connects or types the snippet; Shift+Enter connects in a split or types a snippet without its last Enter. Each item shows its shortcut and check mark, greyed-out items are left out, and your last few picks come first.
 
 ## Broadcast input
 
@@ -187,7 +187,7 @@ On a host without SFTP, such as a console server or a Telnet device, you can use
 
 ## Port forwards
 
-`LocalForward`, `RemoteForward` and `DynamicForward` in your ssh_config, or forwards in a saved connection's Extras, start when you log in. Settings > Port forwards (Ctrl+Shift+P) lists every connection's forwards with their state and open connections. Everything there works on a live connection, without reconnecting:
+`LocalForward`, `RemoteForward` and `DynamicForward` in your ssh_config, or forwards in a saved connection's Extras, start when you log in. Tools > Port forwards (Ctrl+Shift+P) lists every connection's forwards with their state and open connections. Everything there works on a live connection, without reconnecting:
 
 - **Add**: type `-L 8080:db.internal:5432`, `-R 9000:localhost:3000` or `-D 1080` and press Enter. It goes to the connection you clicked in the list, or else the focused pane's.
 - **Change**: Enter or F2 on a forward puts it on the add line, to change its port or target. A new target on the same port keeps the open connections, and sending a stopped forward back unchanged retries it.

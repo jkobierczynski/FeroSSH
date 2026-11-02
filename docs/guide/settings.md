@@ -110,7 +110,7 @@ Secret enable
 
 ## Snippets
 
-Command snippets are kept here too. The snippet editor (Settings > Command snippets, then Insert or F2) writes them, but you can also write them by hand:
+Command snippets are kept here too. The snippet editor (Tools > Command snippets, then Insert or F2) writes them, but you can also write them by hand:
 
 ```
 Snippet "Back up the config"

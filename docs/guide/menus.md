@@ -1,6 +1,6 @@
 # Menu reference
 
-Every item in FeroSSH's menus, in the order they appear, with its shortcut and what it does. The menu bar has six menus: File, Edit, Settings, Window, Session and Help. Ctrl+Shift+M hides the menu bar; Alt shows it again. Every item here is also in the command palette (Ctrl+Shift+A), so you can type part of its name instead.
+Every item in FeroSSH's menus, in the order they appear, with its shortcut and what it does. The menu bar has seven menus: File, Edit, Settings, Tools, Window, Session and Help. Ctrl+Shift+M hides the menu bar; Alt shows it again. Every item here is also in the command palette (Ctrl+Shift+A), so you can type part of its name instead.
 
 Items with a check mark are switches: picking them turns the setting on or off, and FeroSSH remembers it in `ferossh.conf` (see [Settings](settings.md)).
 
@@ -36,12 +36,6 @@ Items with a check mark are switches: picking them turns the setting on or off, 
 
 | Item | Shortcut | What it does |
 | --- | --- | --- |
-| Connection manager | Ctrl+Shift+S | Shows or hides the side pane with your saved hosts (see [The connection manager](everyday-use.md#the-connection-manager)). |
-| Session manager | Ctrl+Shift+L | Shows the sessions open right now, in every tab (see [The session manager](everyday-use.md#the-session-manager)). |
-| File transfer | Ctrl+Shift+E | Shows the focused pane's host over SFTP in the side pane (see [File transfer](everyday-use.md#file-transfer)). |
-| Port forwards | Ctrl+Shift+P | Lists, adds, changes and stops port forwards on live connections (see [Port forwards](everyday-use.md#port-forwards)). |
-| Command snippets | Ctrl+Shift+Space | Lists your snippets, to type one into the pane or edit them (see [Snippets](everyday-use.md#command-snippets)). |
-| Command palette | Ctrl+Shift+A | One search box over every menu item, connection and snippet (see [Command palette](everyday-use.md#the-command-palette)). |
 | File transfer follows cd | ✓ on | The file view, and files dropped on a pane, follow the shell's current directory. `FollowDirectory`. |
 | Side pane on the right | ✓ off | Moves the side pane from the left to the right. `SidePane`. |
 | Tab strip | ✓ on | Shows the tab strip once there are two tabs. `TabStrip`. |
@@ -54,6 +48,17 @@ Items with a check mark are switches: picking them turns the setting on or off, 
 | Hide menu bar (Alt shows it) | Ctrl+Shift+M | Hides the menu bar. Pressing Alt shows it again. |
 
 Font, theme and text size apply to the focused pane only. Session > Save font and theme for this host keeps them for that host.
+
+## Tools
+
+| Item | Shortcut | What it does |
+| --- | --- | --- |
+| Connection manager | Ctrl+Shift+S | Shows or hides the side pane with your saved hosts (see [The connection manager](everyday-use.md#the-connection-manager)). |
+| Session manager | Ctrl+Shift+L | Shows the sessions open right now, in every tab (see [The session manager](everyday-use.md#the-session-manager)). |
+| File transfer | Ctrl+Shift+E | Shows the focused pane's host over SFTP in the side pane (see [File transfer](everyday-use.md#file-transfer)). |
+| Port forwards | Ctrl+Shift+P | Lists, adds, changes and stops port forwards on live connections (see [Port forwards](everyday-use.md#port-forwards)). |
+| Command snippets | Ctrl+Shift+Space | Lists your snippets, to type one into the pane or edit them (see [Snippets](everyday-use.md#command-snippets)). |
+| Command palette | Ctrl+Shift+A | One search box over every menu item, connection and snippet (see [Command palette](everyday-use.md#the-command-palette)). |
 
 ## Window
 
