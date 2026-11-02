@@ -64,6 +64,7 @@ ferossh.exe --check-sandbox    # report what the sandbox can do on this PC
   - *One window per pane* (the default; tmux 3.3 or later): every native pane is its own tmux window, so each pane can have its own font, text size and theme. FeroSSH keeps the splits and looks in the session (`@ferossh-layout`). A plain tmux client shows the panes as separate windows.
   - *tmux's own splits* (untick Session > tmux: one window per pane, or older tmux): each tmux window is a tab and tmux's splits are the panes, one font per window; resizing a pane resizes it in tmux.
 
+  Session > Use tmux keybindings for tabs and panes (off unless you turn it on) brings tmux's window and pane keys back: in a pane of a tmux session, your tmux prefix (read from the server, Ctrl+B by default) then `c` opens a tab, `%` and `"` split, `n`, `p`, `l` and `0`-`9` pick a tab, `o`, `;` and the arrows move between panes, Ctrl or Alt+arrows resize, `x` and `&` close a pane or tab after asking, `!` moves the pane to its own tab, `d` detaches and `s` switches session. The prefix twice sends it to the program; prefix `?` lists the keys.
   To attach on every login to a host, name the session in its profile. GNU screen has no control mode and runs as an ordinary terminal.
 
   ```

@@ -47,6 +47,8 @@ To reach a host that is only reachable through another one, give it a jump host:
 
 Session > Attach tmux turns tmux windows and panes into native FeroSSH tabs and panes. You get no prefix key and no status bar, and you keep native scrollback, copy and search. Close FeroSSH, or lose the network, and everything keeps running on the server. Attach again, from this PC or another, and the tabs, splits, fonts and themes come back. tmux is never started unless you ask; to attach on every login to a host, set `Tmux` in its profile (see [Settings](settings.md)).
 
+If your fingers know tmux's keys, tick Session > Use tmux keybindings for tabs and panes. In a pane of a tmux session, your tmux prefix (Ctrl+B unless your tmux config sets another; FeroSSH asks tmux) followed by `c`, `%`, `"`, `n`, `p`, `0`-`9`, `o`, an arrow, `x`, `&`, `!`, `d` or `s` works the native tabs and panes, which are tmux windows and panes. Press the prefix twice to send it to the program, and the prefix then `?` for the full list. It is off unless you turn it on.
+
 ## Remote desktops
 
 Session > Open remote desktop (Ctrl+Shift+D) shows the Linux desktop of the host you are logged in to. The server needs xrdp or GNOME Remote Desktop. FeroSSH tunnels the RDP port through SSH and opens Windows' Remote Desktop Connection on it, so the server's RDP port can stay closed on its firewall.
