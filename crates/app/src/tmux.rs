@@ -111,6 +111,9 @@ pub enum Action {
     Picker(Vec<String>),
     /// Tell the user, in the gateway pane.
     Notice(String),
+    /// The directory a pane is in, asked for by [`Tmux::ask_dir`]: save it
+    /// as the host's start directory.
+    StartDir(String),
 }
 
 /// Where a window made from a native action goes.
@@ -144,6 +147,8 @@ enum Tag {
     SplitPane,
     /// A pane's directory, to open a split there.
     SplitHere(Split),
+    /// A pane's directory, to start new windows and panes in.
+    StartDirHere,
     Sessions,
     NewSession,
     /// The prefix keys and base index, for tmux keybindings.
@@ -355,6 +360,9 @@ pub struct Tmux {
     keys_wanted: bool,
     /// tmux's answer to [`tmux_keys::FORMAT`].
     keys: Option<String>,
+    /// Where new windows and panes start unless a split asks for its
+    /// pane's directory: the host's start directory, from its profile.
+    pub start_dir: Option<String>,
 }
 
 fn win_of(text: &[u8]) -> Option<WindowId> {
@@ -429,6 +437,7 @@ impl Tmux {
             reattach: None,
             keys_wanted: false,
             keys: None,
+            start_dir: None,
         }
     }
 
@@ -654,7 +663,10 @@ impl Tmux {
                 &mut out,
             ),
             None => self.send(
-                "new-session -d -P -F '#{session_name}'",
+                &format!(
+                    "new-session -d{} -P -F '#{{session_name}}'",
+                    self.start_cwd()
+                ),
                 Tag::NewSession,
                 &mut out,
             ),
@@ -742,12 +754,22 @@ impl Tmux {
             Tag::SplitHere(split) => {
                 // A pane that went meanwhile, or a path tmux cannot take:
                 // the split opens where tmux starts shells.
-                let cwd = if ok {
+                let mut cwd = if ok {
                     same_dir::tmux_cwd(&first())
                 } else {
                     String::new()
                 };
+                if cwd.is_empty() {
+                    cwd = self.start_cwd();
+                }
                 self.open_split(split, &cwd, out);
+            }
+            Tag::StartDirHere => {
+                let dir = first();
+                let dir = dir.trim_end_matches(['\r', '\n']);
+                if ok && !dir.is_empty() {
+                    out.push(Action::StartDir(dir.to_owned()));
+                }
             }
             Tag::SplitPane => {
                 self.focus_next = std::str::from_utf8(lines.first().map_or(&[][..], |l| l))
@@ -1219,7 +1241,31 @@ impl Tmux {
                 &mut out,
             );
         } else {
-            self.open_split(split, "", &mut out);
+            let cwd = self.start_cwd();
+            self.open_split(split, &cwd, &mut out);
+        }
+        out
+    }
+
+    /// The `-c` option for new windows and panes: the start directory,
+    /// or empty for tmux's own choice.
+    fn start_cwd(&self) -> String {
+        self.start_dir
+            .as_deref()
+            .map(same_dir::tmux_cwd)
+            .unwrap_or_default()
+    }
+
+    /// Asks tmux which directory native pane `native` is in; the answer
+    /// comes back as [`Action::StartDir`].
+    pub fn ask_dir(&mut self, native: Native) -> Vec<Action> {
+        let mut out = Vec::new();
+        if let Some(p) = self.pane_of(native) {
+            self.send(
+                &format!("display-message -p -t %{p} '#{{pane_current_path}}'"),
+                Tag::StartDirHere,
+                &mut out,
+            );
         }
         out
     }
@@ -1244,7 +1290,7 @@ impl Tmux {
     pub fn new_tab(&mut self, native: Native) -> Vec<Action> {
         let mut out = Vec::new();
         self.send(
-            "new-window -d -P -F '#{window_id}'",
+            &format!("new-window -d{} -P -F '#{{window_id}}'", self.start_cwd()),
             Tag::NewWindow(Placement::Tab { after: native }),
             &mut out,
         );
@@ -1786,6 +1832,44 @@ mod tests {
         let a = t.feed(&mut ws, b"%window-close @4\n");
         assert!(a.contains(&Action::Remove { native: n9 }));
         assert_eq!(ws.all_panes(), [a0]);
+    }
+
+    #[test]
+    fn new_windows_and_panes_start_in_the_start_directory() {
+        let panes = [pane_line(0, 0, 80, 24, "b25f,80x24,0,0,0")];
+        let (mut t, mut ws, _) = attached(Some("ferossh"), None, &panes);
+        let a0 = t.native_of(0).unwrap();
+        t.start_dir = Some("/srv/my #1".into());
+        assert_eq!(
+            writes(&t.split(a0, Dir::Right, false)),
+            ["new-window -d -c '/srv/my ##1' -P -F '#{window_id}'"]
+        );
+        assert_eq!(
+            writes(&t.new_tab(a0)),
+            ["new-window -d -c '/srv/my ##1' -P -F '#{window_id}'"]
+        );
+        assert_eq!(
+            writes(&t.switch_session(None)),
+            ["new-session -d -c '/srv/my ##1' -P -F '#{session_name}'"]
+        );
+        // Session > Set start directory here asks tmux for the pane's.
+        assert_eq!(
+            writes(&t.ask_dir(a0)),
+            ["display-message -p -t %0 '#{pane_current_path}'"]
+        );
+        // Replies 5 and 6 were the captures; 7 to 9 the commands above.
+        let mut input = reply(5, &[]);
+        input.extend(reply(6, &[]));
+        input.extend(reply(7, &[]));
+        input.extend(reply(8, &[]));
+        input.extend(reply(9, &[]));
+        input.extend(reply(10, &["/home/me/src".into()]));
+        let a = t.feed(&mut ws, &input);
+        assert!(
+            a.contains(&Action::StartDir("/home/me/src".into())),
+            "{a:?}"
+        );
+        assert!(t.ask_dir(999).is_empty());
     }
 
     #[test]

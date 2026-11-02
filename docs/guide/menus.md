@@ -95,6 +95,7 @@ Font, theme and text size apply to the focused pane only. Session > Save font an
 | Open log folder | Opens `%LOCALAPPDATA%\FeroSSH\logs` in Explorer. |
 | Check a log for changes... | Picks a log and says whether it is intact, or where it was changed, cut short or added to. |
 | Save font and theme for this host | Keeps the focused pane's font, text size and theme in the host's profile. |
+| Start new tabs and panes in this directory | Keeps the focused pane's directory as the host's start directory (Start dir in the connection form): new tabs, panes and tmux windows on that host start there, also after a restart. Window > Split … in same directory still follows its pane. |
 | Replace host key... | After a host key change you know the reason for, trusts the new key. It asks twice. |
 | Verify transfers (SHA-256) | Compares SHA-256 sums on both ends after each SFTP transfer (the server needs `sha256sum`). ✓ `VerifyTransfers`. |
 | ZMODEM: answer rz and sz | Answers `rz` and `sz` in the terminal (see [ZMODEM](everyday-use.md#zmodem)). ✓ `ZModem`. |
