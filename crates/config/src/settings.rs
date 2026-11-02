@@ -235,6 +235,9 @@ pub struct Settings {
     /// Hosts a snippet run on picked hosts logs in to at once (1 to 16);
     /// `None` is the default, 4. The last number picked is kept.
     pub run_parallel: Option<usize>,
+    /// In panes of a tmux session, the tmux prefix and a window or pane
+    /// key work FeroSSH's tabs and panes. Off unless turned on.
+    pub tmux_keys: bool,
 }
 
 /// Scrollback is capped here, as the terminal caps it.
@@ -272,6 +275,7 @@ impl Default for Settings {
             confirm_production: true,
             auto_responses: true,
             run_parallel: None,
+            tmux_keys: false,
         }
     }
 }
@@ -447,6 +451,10 @@ impl Settings {
                 "autoresponses" => {
                     block = Block::Top;
                     s.auto_responses = yes(&args).unwrap_or(true);
+                }
+                "tmuxkeybindings" => {
+                    block = Block::Top;
+                    s.tmux_keys = yes(&args).unwrap_or(false);
                 }
                 "runparallel" => {
                     block = Block::Top;
@@ -642,6 +650,7 @@ impl Settings {
         let _ = writeln!(out, "FollowDirectory {}", flag(self.follow_directory));
         let _ = writeln!(out, "ConfirmProduction {}", flag(self.confirm_production));
         let _ = writeln!(out, "AutoResponses {}", flag(self.auto_responses));
+        let _ = writeln!(out, "TmuxKeybindings {}", flag(self.tmux_keys));
         if let Some(n) = self.run_parallel {
             let _ = writeln!(out, "RunParallel {n}");
         }
@@ -1036,6 +1045,18 @@ NewKeyword later
             ..Settings::default()
         };
         assert!(Settings::parse(&s.to_text()).log_timestamps);
+    }
+
+    #[test]
+    fn tmux_keybindings_are_off_unless_turned_on() {
+        assert!(!Settings::default().tmux_keys);
+        assert!(Settings::parse("TmuxKeybindings yes\n").tmux_keys);
+        assert!(!Settings::parse("TmuxKeybindings maybe\n").tmux_keys);
+        let s = Settings {
+            tmux_keys: true,
+            ..Settings::default()
+        };
+        assert!(Settings::parse(&s.to_text()).tmux_keys);
     }
 
     #[test]

@@ -100,6 +100,8 @@ mod telnet;
 mod tmux;
 #[cfg(all(test, unix))]
 mod tmux_e2e;
+#[cfg_attr(not(windows), allow(dead_code))]
+mod tmux_keys;
 #[cfg(windows)]
 mod update;
 #[cfg(windows)]
