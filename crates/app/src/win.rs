@@ -372,6 +372,7 @@ mod cmd {
     pub const BROADCAST_ALL: u32 = 731;
     pub const BROADCAST_SKIP: u32 = 732;
     pub const CLOSE_TAB: u32 = 733;
+    pub const RENAME: u32 = 734;
     pub const UPDATE_CHECK: u32 = 900;
     pub const UPDATE_WEEKLY: u32 = 901;
     pub const ABOUT: u32 = 902;
@@ -467,6 +468,9 @@ struct Pane {
     rect: Rect,
     /// The title the host set (OSC 0/2).
     title: Option<String>,
+    /// The name the user gave the session (Window > Rename session), shown
+    /// instead of the title and host until cleared.
+    name: Option<String>,
     /// A bell rang while the pane was out of sight.
     bell: bool,
     /// The remote working directory the shell last reported (OSC 7), or
@@ -523,8 +527,12 @@ impl Pane {
         mix(self.theme.background, self.theme.foreground, 0.4)
     }
 
-    /// What the tab strip and window title call this pane.
+    /// What the tab strip and window title call this pane: the name the
+    /// user gave it, else the title the host set, else the host.
     fn label(&self) -> String {
+        if let Some(n) = &self.name {
+            return n.clone();
+        }
         if let Some(t) = self.title.as_deref().filter(|t| !t.is_empty()) {
             return t.to_owned();
         }
@@ -697,6 +705,11 @@ struct Window {
     last_pane: Option<PaneId>,
     mouse: Mouse,
     drag: Option<Drag>,
+    /// The last left click on a tab: when, and which, for double-clicks.
+    tab_click: Option<(Instant, usize)>,
+    /// What the side pane showed before a rename opened the session
+    /// manager (`None` inside: hidden), to go back to once it is done.
+    rename_return: Option<Option<SideView>>,
     settings: Settings,
     /// The theme panes start with (`--theme`, or Nord).
     default_theme: Theme,
@@ -1342,6 +1355,8 @@ fn create_and_run(launch: Launch, theme: Option<String>) -> Result<()> {
                 last_pane: None,
                 mouse: Mouse::default(),
                 drag: None,
+                tab_click: None,
+                rename_return: None,
                 settings,
                 default_theme,
                 command: match &launch {
@@ -1451,6 +1466,7 @@ fn new_pane(
         metrics,
         rect: Rect::default(),
         title: None,
+        name: None,
         bell: false,
         cwd: None,
         cwd_host: None,
@@ -1610,6 +1626,7 @@ fn build_menu() -> Result<HMENU> {
 
         let window = CreatePopupMenu()?;
         item(window, cmd::NEW_TAB, "Ne&w tab\tCtrl+Shift+T")?;
+        item(window, cmd::RENAME, "Rena&me session...")?;
         separator(window)?;
         item(window, cmd::SPLIT_RIGHT, "Split &right\tAlt+Shift+=")?;
         item(window, cmd::SPLIT_DOWN, "Split &down\tAlt+Shift+-")?;
@@ -2105,6 +2122,7 @@ impl Window {
         let mut pane = new_pane(native, font, theme, metrics, scrollback);
         pane.term.resize(usize::from(cols), usize::from(rows));
         pane.host = Host::Tmux { gateway, label };
+        pane.name = look.name.as_deref().and_then(live::clean_name);
         pane.log.enabled = self.panes.get(&gateway).is_some_and(|g| g.log.enabled);
         pane.log.raw = self.panes.get(&gateway).is_some_and(|g| g.log.raw);
         self.panes.insert(native, pane);
@@ -2140,6 +2158,7 @@ impl Window {
                         font: Some(p.font.family.clone()),
                         size: Some(p.font.size_pt),
                         theme: Some(p.theme.name.to_owned()),
+                        name: p.name.clone(),
                     })
                     .unwrap_or_default()
             };
@@ -2476,6 +2495,7 @@ impl Window {
                 tab,
                 kind,
                 target,
+                name: p.name.clone(),
                 title: p.title.clone().filter(|t| !t.is_empty()),
                 state: st,
                 notes,
@@ -2505,11 +2525,78 @@ impl Window {
                     last: s.tab.is_some() && in_tabs == 1,
                 })
             }
+            LiveAction::Rename(id, name) => {
+                self.rename_session(id, name);
+                self.end_rename();
+                None
+            }
             LiveAction::Leave => {
                 self.focus_terminal();
                 None
             }
         }
+    }
+
+    /// Window > Rename session, a double-click on a tab, or its right-click
+    /// menu: the session manager opens with pane `id`'s name to type.
+    fn start_rename(&mut self, id: PaneId) {
+        if !self.open_sessions().iter().any(|s| s.pane == id) {
+            return;
+        }
+        let back = self.rename_return.take();
+        let before = match (self.side.visible, self.side.view) {
+            (true, SideView::Palette) => {
+                self.palette_return = None;
+                None
+            }
+            (visible, view) => visible.then_some(view),
+        };
+        if !(self.side.visible && self.side.view == SideView::Live) {
+            self.show_side(SideView::Live, true);
+        }
+        // A rename started during another keeps where the first goes back.
+        self.rename_return = Some(back.unwrap_or(before));
+        self.side.focused = true;
+        let all = self.open_sessions();
+        let rows = self.side.grid.rows();
+        self.live_view.start_rename(id, &all, rows);
+        self.refresh_chrome();
+        self.request_full_redraw();
+        self.refresh(self.focused_id());
+    }
+
+    /// After a rename that opened the session manager: the side pane goes
+    /// back to what it showed, and the keyboard to the terminal.
+    fn end_rename(&mut self) {
+        match self.rename_return.take() {
+            None => {}
+            Some(None) => self.hide_side(),
+            Some(Some(SideView::Live)) => self.focus_terminal(),
+            Some(Some(view)) => {
+                self.show_side(view, false);
+                self.focus_terminal();
+            }
+        }
+        self.update_menu_checks();
+    }
+
+    /// Gives pane `id`'s session the name (`None` clears it). A tmux pane's
+    /// window takes it too, and the session saves it with the layout.
+    fn rename_session(&mut self, id: PaneId, name: Option<String>) {
+        let name = name.as_deref().and_then(live::clean_name);
+        let Some(p) = self.panes.get_mut(&id) else {
+            return;
+        };
+        p.name = name.clone();
+        if let Some(gateway) = p.gateway()
+            && let Some(t) = self.tmux.get_mut(&gateway).filter(|t| t.active())
+        {
+            let actions = t.rename(id, name.as_deref());
+            self.run_tmux(gateway, actions);
+            self.sync_tmux();
+        }
+        self.update_title();
+        self.refresh_chrome();
     }
 
     /// The session manager's Delete, once the user said yes: closes the
@@ -6148,6 +6235,11 @@ impl Window {
         if self.side.view == SideView::Live {
             let all = self.open_sessions();
             let action = self.live_view.key(key, &all, self.side.grid.rows());
+            if action.is_none() && !self.live_view.renaming() && self.rename_return.is_some() {
+                // Escape ended the rename.
+                self.end_rename();
+                return None;
+            }
             return self.live_action(action);
         }
         if self.side.view == SideView::Files {
@@ -6366,6 +6458,15 @@ impl Window {
     /// Pastes into the snippets view when it has the keyboard; `false`
     /// when the paste is for the terminal.
     fn paste_side(&mut self, text: &str) -> bool {
+        if self.side.visible
+            && self.side.focused
+            && self.side.view == SideView::Live
+            && self.live_view.renaming()
+        {
+            self.live_view.paste(text);
+            self.refresh_chrome();
+            return true;
+        }
         if !(self.side.visible && self.side.focused && self.side.view == SideView::Snippets) {
             return false;
         }
@@ -7553,6 +7654,7 @@ impl Window {
     /// ssh_config, file transfer opens SFTP if it is not open.
     fn show_side(&mut self, view: SideView, focus: bool) {
         self.side.view = view;
+        self.rename_return = None;
         match view {
             SideView::Sessions => {
                 let env = ssh_env();
@@ -7619,6 +7721,7 @@ impl Window {
     }
 
     fn hide_side(&mut self) {
+        self.rename_return = None;
         self.snippets_peek = false;
         self.palette_return = None;
         self.side.visible = false;
@@ -7917,6 +8020,8 @@ impl Window {
                 if self.side.view == SideView::Live {
                     let all = self.open_sessions();
                     let rows = self.side.grid.rows();
+                    // A click ends a rename; the pane stays as it is now.
+                    self.rename_return = None;
                     let action = self.live_view.click(row, double, &all, rows);
                     self.refresh_chrome();
                     return self.live_action(action);
@@ -7968,6 +8073,23 @@ impl Window {
             Spot::Strip(col) => {
                 match (button, self.strip_layout.hit(col)) {
                     (MouseButton::Left, Some(Hit::Tab(i))) => {
+                        // SAFETY: plain query.
+                        let limit =
+                            Duration::from_millis(u64::from(unsafe { GetDoubleClickTime() }));
+                        let now = Instant::now();
+                        let double = self
+                            .tab_click
+                            .is_some_and(|(at, t)| t == i && now - at <= limit);
+                        if double {
+                            // A double-click renames the tab's session.
+                            self.tab_click = None;
+                            self.select_tab(i);
+                            if let Some(focus) = self.ws.tabs.get(i).map(|t| t.focus) {
+                                self.start_rename(focus);
+                            }
+                            return None;
+                        }
+                        self.tab_click = Some((now, i));
                         // The tab a drag below the strip shows: the one
                         // active before, or a neighbour.
                         let before = self.ws.active;
@@ -7996,6 +8118,10 @@ impl Window {
                     // Middle-click closes a tab, as in browsers.
                     (MouseButton::Middle, Some(Hit::Tab(i) | Hit::Close(i))) => {
                         return Some(Command::CloseTab(i));
+                    }
+                    (MouseButton::Right, Some(Hit::Tab(i) | Hit::Close(i))) => {
+                        self.select_tab(i);
+                        return Some(Command::TabMenu(i));
                     }
                     _ => {}
                 }
@@ -8463,6 +8589,7 @@ impl Window {
         match id {
             cmd::EXIT => return Some(Command::Exit),
             cmd::CLOSE_TAB => return Some(Command::CloseTab(self.ws.active)),
+            cmd::RENAME => self.start_rename(pane),
             cmd::HIDE_MENU => return Some(Command::SetMenuVisible(!self.menu_visible)),
             cmd::COPY => return Some(Command::Copy),
             cmd::PASTE => return Some(Command::Paste),
@@ -9721,6 +9848,8 @@ enum Command {
     },
     /// The connection manager's right-click menu, on this host if any.
     SessionMenu(Option<String>),
+    /// A tab's right-click menu.
+    TabMenu(usize),
     /// Ask, then remove this saved session.
     DeleteSession(String),
     /// The session manager's Delete: ask (when it is still open, or the
@@ -10042,6 +10171,46 @@ fn host_file(host: &str) -> String {
     match imported {
         Some(c) => format!("the {} import", c.name()),
         None => "~/.ssh/config".to_owned(),
+    }
+}
+
+/// A tab's right-click menu: rename its session, or close it.
+fn tab_menu(hwnd: HWND, tab: usize) {
+    const RENAME: u32 = 1;
+    const CLOSE: u32 = 2;
+    // SAFETY: a popup menu of our own on our window, destroyed after use.
+    // TPM_RETURNCMD returns the picked id, 0 for none.
+    let picked = unsafe {
+        let Ok(menu) = CreatePopupMenu() else {
+            return;
+        };
+        let _ = AppendMenuW(menu, MF_STRING, RENAME as usize, w!("Rena&me session..."));
+        let _ = AppendMenuW(menu, MF_SEPARATOR, 0, None);
+        let _ = AppendMenuW(menu, MF_STRING, CLOSE as usize, w!("&Close tab\tCtrl+F4"));
+        let mut pt = POINT::default();
+        let _ = GetCursorPos(&mut pt);
+        let chosen = TrackPopupMenu(
+            menu,
+            TPM_RETURNCMD | TPM_NONOTIFY,
+            pt.x,
+            pt.y,
+            None,
+            hwnd,
+            None,
+        );
+        let _ = DestroyMenu(menu);
+        u32::try_from(chosen.0).unwrap_or(0)
+    };
+    match picked {
+        RENAME => {
+            with_window(|w| {
+                if let Some(focus) = w.ws.tabs.get(tab).map(|t| t.focus) {
+                    w.start_rename(focus);
+                }
+            });
+        }
+        CLOSE => run_command(hwnd, Command::CloseTab(tab)),
+        _ => {}
     }
 }
 
@@ -10426,6 +10595,7 @@ fn run_command(hwnd: HWND, command: Command) {
             }
         }
         Command::SessionMenu(host) => session_menu(hwnd, host),
+        Command::TabMenu(tab) => tab_menu(hwnd, tab),
         Command::VerifyLog => {
             if let Some(path) = pick_file(hwnd, w!("Check a log for changes"), &log_dir()) {
                 let (text, ok) = check_log(&path);

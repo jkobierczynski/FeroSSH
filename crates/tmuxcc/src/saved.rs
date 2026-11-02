@@ -11,7 +11,8 @@
 //! A tab is a split tree of tmux windows (`r` side by side, `c` one above
 //! the other, with the first child's share in thousandths) and its
 //! focused window. A look is a window's font, text size and colour theme,
-//! each percent-encoded and empty when unset. The text is only ever ASCII
+//! each percent-encoded and empty when unset, and the name the user gave
+//! it, when there is one (`look=@1,,,Nord,prod%20db`). The text is only ever ASCII
 //! letters, digits and `%(),./=@`, so it needs no escaping inside tmux's
 //! single quotes. The session's other clients may have written it, so it
 //! is read as untrusted input.
@@ -114,12 +115,14 @@ pub struct Tab {
     pub focus: WindowId,
 }
 
-/// A window's font, text size and colour theme.
+/// A window's font, text size and colour theme, and its session name.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Look {
     pub font: Option<String>,
     pub size: Option<f32>,
     pub theme: Option<String>,
+    /// The name the user gave the session it shows.
+    pub name: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -180,6 +183,11 @@ impl Saved {
             if let Some(t) = &look.theme {
                 encode(t, &mut out);
             }
+            // Only when named, so older text stays the same.
+            if let Some(n) = &look.name {
+                out.push(',');
+                encode(n, &mut out);
+            }
         }
         out
     }
@@ -221,6 +229,8 @@ impl Saved {
                     let font = parts.next()?;
                     let size = parts.next()?;
                     let theme = parts.next()?;
+                    // Older FeroSSH writes no name.
+                    let name = parts.next().unwrap_or_default();
                     let look = Look {
                         font: (!font.is_empty()).then(|| decode(font)).flatten(),
                         size: size
@@ -228,6 +238,11 @@ impl Saved {
                             .ok()
                             .filter(|s| (4.0..=96.0).contains(s)),
                         theme: (!theme.is_empty()).then(|| decode(theme)).flatten(),
+                        name: (!name.is_empty())
+                            .then(|| decode(name))
+                            .flatten()
+                            .map(|n| n.trim().to_owned())
+                            .filter(|n| !n.is_empty()),
                     };
                     saved.looks.insert(w, look);
                 }
@@ -310,6 +325,7 @@ mod tests {
                 font: Some("Cascadia Mono".into()),
                 size: Some(12.5),
                 theme: Some("Rosé Pine".into()),
+                name: None,
             },
         );
         looks.insert(4, Look::default());
@@ -386,6 +402,29 @@ mod tests {
         assert_eq!(s.looks[&2], Look::default());
         let s = Saved::parse("ferossh1 tab=r5000(@1,@2)/@9").unwrap();
         assert!(matches!(s.tabs[0].root, Node::Split { ratio: 900, .. }));
+    }
+
+    #[test]
+    fn keeps_session_names() {
+        let mut s = sample();
+        s.looks.insert(
+            2,
+            Look {
+                theme: Some("Nord".into()),
+                name: Some("prod db, 1".into()),
+                ..Look::default()
+            },
+        );
+        let text = s.to_text();
+        assert!(text.contains(" look=@2,,,Nord,prod%20db%2C%201"), "{text}");
+        assert_eq!(Saved::parse(&text), Some(s));
+        // Text from an older FeroSSH has no name; a damaged or blank one
+        // is left out.
+        let s = Saved::parse("ferossh1 look=@1,,,Nord look=@2,,,,%0A look=@3,,,,%20").unwrap();
+        assert_eq!(s.looks[&1].name, None);
+        assert_eq!(s.looks[&1].theme.as_deref(), Some("Nord"));
+        assert_eq!(s.looks[&2].name, None);
+        assert_eq!(s.looks[&3].name, None);
     }
 
     #[test]
