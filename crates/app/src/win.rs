@@ -335,6 +335,8 @@ mod cmd {
     pub const REPLACE_KEY: u32 = 603;
     pub const VERIFY: u32 = 604;
     pub const ZMODEM: u32 = 608;
+    pub const SAVE_PANE: u32 = 609;
+    pub const SAVE_ALL: u32 = 620;
     pub const TMUX_ATTACH: u32 = 610;
     pub const TMUX_DETACH: u32 = 611;
     pub const TMUX_PICK: u32 = 612;
@@ -523,6 +525,11 @@ impl Pane {
         if let Some(t) = self.title.as_deref().filter(|t| !t.is_empty()) {
             return t.to_owned();
         }
+        self.host_label()
+    }
+
+    /// The host this pane is (or was) connected to, whatever title it set.
+    fn host_label(&self) -> String {
         match &self.host {
             Host::Ssh(s) => s.target.label(),
             Host::Local { .. } => "local".to_owned(),
@@ -1071,6 +1078,67 @@ fn chain_path(path: &Path) -> PathBuf {
     PathBuf::from(name)
 }
 
+/// Creates a new log file and the chain beside it in the log folder, named
+/// from the host in `label`, the pane and the time, plus `suffix` before
+/// `.log`. Never overwrites: a second log in the same minute gets a
+/// number.
+fn new_log_file(
+    label: &str,
+    id: PaneId,
+    suffix: &str,
+) -> std::io::Result<(File, File, PathBuf, String)> {
+    let host = label.rsplit('@').next().unwrap_or(label);
+    let dir = log_dir();
+    let name = log_file_name(host, id as usize, local_time());
+    // Only the ending: a host such as `web.logs.example` keeps its name.
+    let stem = name.strip_suffix(".log").unwrap_or(&name);
+    std::fs::create_dir_all(&dir)?;
+    let mut n = 1;
+    loop {
+        let name = if n == 1 {
+            format!("{stem}{suffix}.log")
+        } else {
+            format!("{stem}{suffix}-{n}.log")
+        };
+        let path = dir.join(&name);
+        let new = |path: &Path| {
+            std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(path)
+        };
+        match new(&path) {
+            Ok(f) => {
+                // The chain beside it seals the log against edits.
+                let chain = new(&chain_path(&path))?;
+                return Ok((f, chain, path, name));
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists && n < 100 => n += 1,
+            Err(e) => return Err(e),
+        }
+    }
+}
+
+/// Writes `lines` (a pane's scrollback and screen) to a new sealed log in
+/// the log folder and adds it to the log index; returns its path.
+fn save_text_log(label: &str, id: PaneId, lines: &[String]) -> std::io::Result<PathBuf> {
+    let (f, chain, path, name) = new_log_file(label, id, "_saved")?;
+    let header = format!(
+        "FeroSSH saved output of {label} ({} lines of scrollback and screen), saved {}",
+        lines.len(),
+        timestamp()
+    );
+    let mut writer = LogWriter::sealed(f, chain, &name, false, &header)?;
+    for line in lines {
+        writer.write(line.as_bytes())?;
+        writer.write(b"\r\n")?;
+    }
+    if let Some(sealed) = writer.finish_sealed("End of saved output")? {
+        add_to_log_index(&name, &sealed)?;
+    }
+    Ok(path)
+}
+
 /// Appends a log that ended to the log index, linked to the line before.
 fn add_to_log_index(name: &str, sealed: &ferossh_term::Sealed) -> std::io::Result<()> {
     use std::io::Write as _;
@@ -1412,6 +1480,8 @@ fn build_menu() -> Result<HMENU> {
         item(session, cmd::LOG_TOGGLE, "&Log to file")?;
         item(session, cmd::LOG_RAW, "Log &raw output (keep escape codes)")?;
         item(session, cmd::LOG_TIMESTAMPS, "&Timestamp each log line")?;
+        item(session, cmd::SAVE_PANE, "Save this pane's &output to a log")?;
+        item(session, cmd::SAVE_ALL, "Save output of all pa&nes to logs")?;
         item(session, cmd::LOG_FOLDER, "Open log &folder")?;
         item(session, cmd::LOG_VERIFY, "C&heck a log for changes...")?;
         separator(session)?;
@@ -4396,36 +4466,8 @@ impl Window {
             _ => return,
         };
         let raw = p.log.raw;
-        let host = label.rsplit('@').next().unwrap_or(&label).to_owned();
         let dir = log_dir();
-        let base = log_file_name(&host, id as usize, local_time());
-        let opened = std::fs::create_dir_all(&dir).and_then(|()| {
-            // Never overwrite: a second log in the same minute gets a number.
-            let mut n = 1;
-            loop {
-                let name = if n == 1 {
-                    base.clone()
-                } else {
-                    base.replace(".log", &format!("-{n}.log"))
-                };
-                let path = dir.join(&name);
-                let new = |path: &Path| {
-                    std::fs::OpenOptions::new()
-                        .write(true)
-                        .create_new(true)
-                        .open(path)
-                };
-                match new(&path) {
-                    Ok(f) => {
-                        // The chain beside it seals the log against edits.
-                        let chain = new(&chain_path(&path))?;
-                        return Ok((f, chain, path, name));
-                    }
-                    Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists && n < 100 => n += 1,
-                    Err(e) => return Err(e),
-                }
-            }
-        });
+        let opened = new_log_file(&label, id, "");
         let header = format!("FeroSSH log of {label}, started {}", timestamp());
         let stamps = self
             .settings
@@ -4461,6 +4503,46 @@ impl Window {
                 self.update_menu_checks();
             }
         }
+    }
+
+    /// Session > Save output: each pane's scrollback and screen, as plain
+    /// text, to a log file of its own. Returns what to tell the user.
+    fn save_output(&self, panes: &[PaneId]) -> String {
+        let mut saved = Vec::new();
+        let mut failed = Vec::new();
+        for id in panes {
+            let Some(p) = self.panes.get(id) else {
+                continue;
+            };
+            if matches!(p.host, Host::Desktop { .. }) {
+                continue;
+            }
+            let lines = p.term.all_text();
+            if lines.is_empty() {
+                continue;
+            }
+            match save_text_log(&p.host_label(), *id, &lines) {
+                Ok(path) => saved.push(format!("{} ({} lines)", path.display(), lines.len())),
+                Err(e) => failed.push(format!("{}: {e}", p.label())),
+            }
+        }
+        let mut text = match saved.len() {
+            0 if failed.is_empty() => "There was no output to save.".to_owned(),
+            0 => String::new(),
+            1 => format!("Saved the output to\n\n{}", saved.join("")),
+            n => format!("Saved the output of {n} panes to\n\n{}", saved.join("\n")),
+        };
+        if !failed.is_empty() {
+            if !text.is_empty() {
+                text.push_str("\n\n");
+            }
+            text.push_str(&format!(
+                "Could not save to {}:\n\n{}",
+                log_dir().display(),
+                failed.join("\n")
+            ));
+        }
+        text
     }
 
     fn stop_log(&mut self, id: PaneId) {
@@ -8465,6 +8547,11 @@ impl Window {
                 }
                 self.save_settings();
                 self.update_menu_checks();
+            }
+            cmd::SAVE_PANE => return Some(Command::Message(self.save_output(&[pane]))),
+            cmd::SAVE_ALL => {
+                let panes: Vec<PaneId> = self.ws.tabs.iter().flat_map(|t| t.root.panes()).collect();
+                return Some(Command::Message(self.save_output(&panes)));
             }
             cmd::LOG_FOLDER => return Some(Command::OpenFolder(log_dir())),
             cmd::LOG_VERIFY => return Some(Command::VerifyLog),
