@@ -34,6 +34,7 @@ use ferossh_forward::x11::{Display, find_cookie, xauth_entries};
 use ferossh_ipc::{ChannelId, DirEntry, FORWARD_IDS, Message, SftpReply, X11Auth};
 use ferossh_render::{
     CellMetrics, Cursor, FontSpec, Frame, Grid, PaneView, PixelRect, Renderer, Rgb, Theme,
+    ThemeGroup,
 };
 use ferossh_sftp::{Remote, names};
 use ferossh_term::{
@@ -79,17 +80,17 @@ use windows::Win32::UI::WindowsAndMessaging::{
     GetMessageW, GetSubMenu, HCURSOR, HMENU, HTCLIENT, IDC_ARROW, IDC_IBEAM, IDC_SIZEALL,
     IDC_SIZENS, IDC_SIZEWE, IDYES, KillTimer, LoadCursorW, LoadIconW, MB_DEFBUTTON2, MB_ICONERROR,
     MB_ICONINFORMATION, MB_ICONQUESTION, MB_ICONWARNING, MB_OK, MB_YESNO, MESSAGEBOX_RESULT,
-    MESSAGEBOX_STYLE, MF_BYCOMMAND, MF_BYPOSITION, MF_CHECKED, MF_DISABLED, MF_GRAYED, MF_POPUP,
-    MF_SEPARATOR, MF_STRING, MF_UNCHECKED, MSG, MessageBoxW, ModifyMenuW, PM_REMOVE, PeekMessageW,
-    PostMessageW, PostQuitMessage, RegisterClassW, SIZE_MINIMIZED, SW_SHOW, SW_SHOWNORMAL,
-    SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOZORDER, SetCursor, SetMenu, SetTimer, SetWindowPos,
-    SetWindowTextW, ShowWindow, TPM_NONOTIFY, TPM_RETURNCMD, TrackPopupMenu, TranslateMessage,
-    WINDOW_EX_STYLE, WINDOW_STYLE, WM_APP, WM_CHAR, WM_CLOSE, WM_COMMAND, WM_DESTROY,
-    WM_DPICHANGED, WM_DROPFILES, WM_ERASEBKGND, WM_GETDPISCALEDSIZE, WM_IME_COMPOSITION,
-    WM_IME_STARTCOMPOSITION, WM_KEYDOWN, WM_KEYUP, WM_KILLFOCUS, WM_LBUTTONDOWN, WM_LBUTTONUP,
-    WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_PAINT, WM_RBUTTONDOWN,
-    WM_RBUTTONUP, WM_SETCURSOR, WM_SETFOCUS, WM_SIZE, WM_SYSCHAR, WM_SYSKEYDOWN, WM_SYSKEYUP,
-    WM_TIMER, WNDCLASSW, WS_EX_APPWINDOW, WS_OVERLAPPEDWINDOW,
+    MESSAGEBOX_STYLE, MF_BYCOMMAND, MF_BYPOSITION, MF_CHECKED, MF_DISABLED, MF_GRAYED,
+    MF_MENUBARBREAK, MF_POPUP, MF_SEPARATOR, MF_STRING, MF_UNCHECKED, MSG, MessageBoxW,
+    ModifyMenuW, PM_REMOVE, PeekMessageW, PostMessageW, PostQuitMessage, RegisterClassW,
+    SIZE_MINIMIZED, SW_SHOW, SW_SHOWNORMAL, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOZORDER, SetCursor,
+    SetMenu, SetTimer, SetWindowPos, SetWindowTextW, ShowWindow, TPM_NONOTIFY, TPM_RETURNCMD,
+    TrackPopupMenu, TranslateMessage, WINDOW_EX_STYLE, WINDOW_STYLE, WM_APP, WM_CHAR, WM_CLOSE,
+    WM_COMMAND, WM_DESTROY, WM_DPICHANGED, WM_DROPFILES, WM_ERASEBKGND, WM_GETDPISCALEDSIZE,
+    WM_IME_COMPOSITION, WM_IME_STARTCOMPOSITION, WM_KEYDOWN, WM_KEYUP, WM_KILLFOCUS,
+    WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL,
+    WM_PAINT, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SETCURSOR, WM_SETFOCUS, WM_SIZE, WM_SYSCHAR,
+    WM_SYSKEYDOWN, WM_SYSKEYUP, WM_TIMER, WNDCLASSW, WS_EX_APPWINDOW, WS_OVERLAPPEDWINDOW,
 };
 use windows::core::{HSTRING, PCWSTR, PWSTR, Result, w};
 
@@ -1587,13 +1588,28 @@ fn build_menu() -> Result<HMENU> {
             }
             item(fonts, id, name)?;
         }
+        // Three columns: dark themes, light themes, then the warning
+        // themes over the classics.
         let themes = CreatePopupMenu()?;
+        let mut last = None;
         for (id, theme) in (cmd::THEME..).zip(Theme::builtin()) {
-            // Group the warning themes and the Windows classics.
-            if matches!(theme.name, "Production" | "Campbell") {
-                separator(themes)?;
+            let group = theme.group();
+            match (last, group) {
+                (Some(prev), ThemeGroup::Light | ThemeGroup::Warning) if prev != group => {
+                    AppendMenuW(
+                        themes,
+                        MF_STRING | MF_MENUBARBREAK,
+                        id as usize,
+                        &HSTRING::from(theme.name),
+                    )?;
+                }
+                (Some(prev), ThemeGroup::Classic) if prev != group => {
+                    separator(themes)?;
+                    item(themes, id, theme.name)?;
+                }
+                _ => item(themes, id, theme.name)?,
             }
-            item(themes, id, theme.name)?;
+            last = Some(group);
         }
 
         let tools = CreatePopupMenu()?;

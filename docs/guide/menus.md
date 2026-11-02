@@ -43,7 +43,7 @@ Items with a check mark are switches: picking them turns the setting on or off, 
 | Smaller text | Ctrl+- (or Ctrl+wheel down) | Makes it smaller. |
 | Reset text size | Ctrl+0 | Back to the pane's normal size. |
 | Font (this pane) | | Eighteen monospace fonts for the focused pane. The five that come with Windows are listed first. A free font that is not installed reads "(download)" and opens its official download page; FeroSSH picks it up after a restart. |
-| Theme (this pane) | | The colour theme for the focused pane: Nord and nine other dark themes, the Production and Staging warning themes, and Campbell and One Half Light from Windows Terminal. |
+| Theme (this pane) | | The colour theme for the focused pane, in three columns: Nord and 24 other dark themes, 11 light themes, then the Production and Staging warning themes over the classics (Campbell, One Half Dark and Light, Tango Dark and Light from Windows Terminal, and PuTTY's colours). The list is in [Everyday use](everyday-use.md). |
 | Show test pattern | | Prints colours, text styles, box drawing, wide and combining characters in the pane, to check a font. |
 | Hide menu bar (Alt shows it) | Ctrl+Shift+M | Hides the menu bar. Pressing Alt shows it again. |
 

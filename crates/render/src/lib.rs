@@ -26,4 +26,4 @@ pub use d2d::{Frame, PaneView, PixelRect, Renderer};
 pub use font::{CellMetrics, DesignMetrics, FontSpec};
 pub use grid::Grid;
 pub use image::{Image, fit};
-pub use theme::Theme;
+pub use theme::{Group as ThemeGroup, Theme};
