@@ -35,7 +35,7 @@ On a host without SFTP, such as a console server or a Telnet device, you can use
 
 ## Port forwards
 
-`LocalForward`, `RemoteForward` and `DynamicForward` in your ssh_config start when you log in. Settings > Port forwards (Ctrl+Shift+P) lists them and adds new ones: type `-L 8080:db.internal:5432`, `-R 9000:localhost:3000` or `-D 1080` and press Enter. A dynamic forward is a SOCKS 4, 4a and 5 proxy. A tab whose connection forwards shows `⇄`, in amber when the server can reach back into your PC.
+`LocalForward`, `RemoteForward` and `DynamicForward` in your ssh_config start when you log in. Tools > Port forwards (Ctrl+Shift+P) lists them and adds new ones: type `-L 8080:db.internal:5432`, `-R 9000:localhost:3000` or `-D 1080` and press Enter. A dynamic forward is a SOCKS 4, 4a and 5 proxy. A tab whose connection forwards shows `⇄`, in amber when the server can reach back into your PC.
 
 ## Jump hosts
 

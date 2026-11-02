@@ -1562,13 +1562,15 @@ fn build_menu() -> Result<HMENU> {
             item(themes, id, theme.name)?;
         }
 
+        let tools = CreatePopupMenu()?;
+        item(tools, cmd::SESSIONS, "&Connection manager\tCtrl+Shift+S")?;
+        item(tools, cmd::LIVE, "&Session manager\tCtrl+Shift+L")?;
+        item(tools, cmd::FILES, "&File transfer\tCtrl+Shift+E")?;
+        item(tools, cmd::FORWARDS, "&Port forwards\tCtrl+Shift+P")?;
+        item(tools, cmd::SNIPPETS, "Command s&nippets\tCtrl+Shift+Space")?;
+        item(tools, cmd::PALETTE, "Command p&alette\tCtrl+Shift+A")?;
+
         let view = CreatePopupMenu()?;
-        item(view, cmd::SESSIONS, "&Connection manager\tCtrl+Shift+S")?;
-        item(view, cmd::LIVE, "S&ession manager\tCtrl+Shift+L")?;
-        item(view, cmd::FILES, "File tra&nsfer\tCtrl+Shift+E")?;
-        item(view, cmd::FORWARDS, "Port &forwards\tCtrl+Shift+P")?;
-        item(view, cmd::SNIPPETS, "Command sn&ippets\tCtrl+Shift+Space")?;
-        item(view, cmd::PALETTE, "Comm&and palette\tCtrl+Shift+A")?;
         item(view, cmd::FOLLOW_CD, "File transfer f&ollows cd")?;
         item(view, cmd::SIDE_RIGHT, "Side pane on the &right")?;
         item(view, cmd::TAB_STRIP, "Ta&b strip")?;
@@ -1658,6 +1660,7 @@ fn build_menu() -> Result<HMENU> {
         AppendMenuW(bar, MF_POPUP, file.0 as usize, w!("&File"))?;
         AppendMenuW(bar, MF_POPUP, edit.0 as usize, w!("&Edit"))?;
         AppendMenuW(bar, MF_POPUP, view.0 as usize, w!("&Settings"))?;
+        AppendMenuW(bar, MF_POPUP, tools.0 as usize, w!("&Tools"))?;
         AppendMenuW(bar, MF_POPUP, window.0 as usize, w!("&Window"))?;
         AppendMenuW(bar, MF_POPUP, session.0 as usize, w!("&Session"))?;
         AppendMenuW(bar, MF_POPUP, help.0 as usize, w!("&Help"))?;
@@ -7374,7 +7377,7 @@ impl Window {
         self.update_menu_checks();
     }
 
-    /// Settings > Connection manager, Session manager, File transfer,
+    /// Tools > Connection manager, Session manager, File transfer,
     /// Port forwards or Command snippets (`id`). The shortcut first moves
     /// the focus to a pane that is open but not focused, then hides it; a
     /// menu click (`from_menu`) hides it at once, since its checkmark says
