@@ -677,3 +677,36 @@ fn prompt_line_is_the_text_before_the_cursor() {
     t.feed(b"\x1b[?1049h");
     assert_eq!(t.prompt_line(), None);
 }
+
+#[test]
+fn all_text_holds_scrollback_and_screen() {
+    let mut t = Terminal::new(10, 5, &Settings::new(20));
+    for i in 0..30 {
+        t.feed(format!("line {i}\r\n").as_bytes());
+    }
+    t.feed(b"$ ");
+    let all = t.all_text();
+    // 20 lines of history plus the screen, oldest first.
+    assert_eq!(all.first().unwrap(), "line 6");
+    assert_eq!(all[all.len() - 2], "line 29");
+    assert_eq!(all.last().unwrap(), "$");
+    assert_eq!(all.len(), 25);
+    // Scrolling back does not change what is saved.
+    t.scroll_to_top();
+    assert_eq!(t.all_text(), all);
+}
+
+#[test]
+fn all_text_joins_wrapped_lines_and_keeps_wide_characters() {
+    let mut t = term(5, 4);
+    t.feed("abcdefgh\r\n漢字x\r\n".as_bytes());
+    assert_eq!(t.all_text(), vec!["abcdefgh", "漢字x"]);
+    let mut t = term(20, 4);
+    t.feed(b"a\tb\r\n");
+    assert_eq!(t.all_text(), vec!["a       b"]);
+    // Blank lines in the middle stay; the empty screen below the text goes.
+    let mut t = term(10, 6);
+    t.feed(b"one\r\n\r\ntwo\r\n");
+    assert_eq!(t.all_text(), vec!["one", "", "two"]);
+    assert!(term(10, 4).all_text().is_empty());
+}

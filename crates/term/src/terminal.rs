@@ -633,6 +633,46 @@ impl Terminal {
         text
     }
 
+    /// Everything the pane holds as plain text, oldest line first: the
+    /// scrollback and the screen. Lines the terminal wrapped are joined
+    /// again, trailing blanks are dropped from each line, and the empty
+    /// lines under the last one with text are left out. While a full-screen
+    /// program shows the alternate screen, that screen is what is saved.
+    /// Read cell by cell, so none of the upstream copy bugs can panic.
+    pub fn all_text(&self) -> Vec<String> {
+        let grid = self.term.grid();
+        let (top, bottom) = (self.term.topmost_line(), self.term.bottommost_line());
+        let last = grid.last_column();
+        let mut lines = Vec::new();
+        let mut text = String::new();
+        for line in top.0..=bottom.0 {
+            let row = &grid[Line(line)];
+            for col in 0..=last.0 {
+                let cell = &row[Column(col)];
+                if cell
+                    .flags
+                    .intersects(TermFlags::WIDE_CHAR_SPACER | TermFlags::LEADING_WIDE_CHAR_SPACER)
+                {
+                    continue;
+                }
+                text.push(if cell.c == '\t' { ' ' } else { cell.c });
+                if let Some(extra) = cell.zerowidth() {
+                    text.extend(extra);
+                }
+            }
+            if !row[last].flags.contains(TermFlags::WRAPLINE) {
+                lines.push(std::mem::take(&mut text).trim_end().to_owned());
+            }
+        }
+        if !text.is_empty() {
+            lines.push(text.trim_end().to_owned());
+        }
+        while lines.last().is_some_and(String::is_empty) {
+            lines.pop();
+        }
+        lines
+    }
+
     /// The text before the cursor on its line, when the main screen is
     /// shown (full-screen programs draw no prompt). Shells that do not
     /// report their directory with OSC 7 often show it in the prompt;
