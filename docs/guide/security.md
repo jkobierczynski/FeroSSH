@@ -7,6 +7,8 @@ FeroSSH is built so that a bug in the code that reads network data cannot reach 
 - **The window** draws the terminal, reads your keyboard, holds your settings and talks to the key agents. It never parses data from the network.
 - **The SSH worker** speaks SSH to the server. It runs in a Windows AppContainer that allows network access and nothing else: it cannot read your files, your registry or your private keys. When the server wants a signature, the worker asks the window, and the window asks your agent, Pageant, the key file or your security key. Each SSH connection has a worker process of its own (tabs that share a login share it too), so a server that took over its worker still cannot see your sessions on other servers.
 
+Every sandboxed process also runs in a job object (it dies with the window, cannot start other programs, is capped at 1 GiB of memory and cannot touch the clipboard or other windows) and starts with Windows' exploit mitigations turned on: no Win32k system calls, Control Flow Guard, CET shadow stacks where the CPU has them, no dynamic code and mandatory ASLR. `ferossh.exe --check-sandbox | more` shows what your Windows allows.
+
 The window and each worker talk over a pipe with a small, fuzz-tested message format. The desktop viewer in `ferossh-desktop.exe` runs in a third process, in an AppContainer with no capabilities at all, not even the network: it only sees what comes through the SSH tunnel.
 
 Windows does not let AppContainers connect to 127.0.0.1, so for an SSH server on the same PC you start FeroSSH with `--no-sandbox`. Port forwards to and from localhost work in the sandbox, because the window holds those sockets.
@@ -29,6 +31,14 @@ Only modern algorithms are offered: post-quantum hybrid `mlkem768x25519-sha256` 
 ## X11 and forwarding
 
 X11 forwarding is off unless a host turns it on, because X programs on the server can see and type into your other X windows. The server only ever gets a fake X cookie. A tab shows `⇄` when its connection forwards ports, in amber when the server can connect back into your PC.
+
+## Telnet
+
+Telnet sends everything in the clear, passwords included. FeroSSH offers it only for old gear that has nothing better: the pane says so when it connects and the tab carries a red **⚠ telnet** badge. The Telnet connection runs in a sandboxed worker like SSH, agrees to only a handful of options, and never sends your user name or environment.
+
+## Logs
+
+Logs never contain what you type at a password prompt. Each log is sealed with a SHA-256 hash chain, so a later change to it shows; see [Logs](logs.md) for what that does and does not protect against.
 
 ## No telemetry
 

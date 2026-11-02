@@ -2,7 +2,7 @@
 
 ## Windows or my browser warns about the download
 
-Until releases are code-signed, Windows SmartScreen shows "Windows protected your PC" the first time you run the exe: choose More info > Run anyway. Firefox and Chrome can block the download itself because few people have downloaded it yet; in Firefox, open the Downloads panel, right-click the file and choose Allow download. Check the file first, as described in [Verifying a download](verifying-downloads.md).
+Release exes are code signed (by "Open Source Developer Jurgen Kobierczynski"), but the certificate is new, so Windows SmartScreen may still show "Windows protected your PC" the first time you run one until it has built up a reputation: check that More info shows that publisher, then choose Run anyway. Exes from CI runs are not signed. Firefox and Chrome can block the download itself because few people have downloaded it yet; in Firefox, open the Downloads panel, right-click the file and choose Allow download. Check the file first, as described in [Verifying a download](verifying-downloads.md).
 
 ## I can't connect to an SSH server on my own PC
 
@@ -30,6 +30,18 @@ FeroSSH refuses to connect and does not offer a way around the warning, because 
 ## Keys on a remote system don't work in vim or another program
 
 Check `TERM` on the server (`echo $TERM`); FeroSSH sets `xterm-256color`. Some minimal vi builds, such as Debian's `vim.tiny`, start in vi-compatible mode and show letters like `A` and `B` for the arrow keys in insert mode. Install the full `vim` package, or put `set nocompatible` in `~/.vimrc`.
+
+## My antivirus flags FeroSSH
+
+Some antivirus products flag new exes that few people have run yet, by file reputation rather than by anything the exe does (Bitdefender, for example, calls this `Gen:Suspicious.Cloud`). Check the download as described in [Verifying a download](verifying-downloads.md), then report a false positive to the vendor. `--check-sandbox` starting sandboxed test processes can also draw attention; that is expected.
+
+## Snippets or login scripts type at the wrong moment
+
+`expect` and `@expect` wait for text exactly as the host prints it, up to 15 seconds for a login script step. Look at what the host really prints (a prompt may end in a space) and expect less of it, for example `assword:`. Pressing any key stops a login script; Session > Run login script again restarts it.
+
+## A log says it was changed
+
+See [Checking a log](logs.md#checking-a-log). A log whose last seconds are "not sealed yet" was still open, or FeroSSH was closed before the log ended; that is not a change.
 
 ## Where are my settings and logs?
 

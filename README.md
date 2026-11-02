@@ -8,7 +8,7 @@ FeroSSH is the native, open-source SSH client for Windows that locks every conne
 
 > **Status:** [1.0 is out](https://github.com/jkobierczynski/FeroSSH/releases/tag/v1.0.0), the first stable release. FeroSSH connects with russh from one sandboxed worker process per connection, checks host keys against `~/.ssh/known_hosts`, and signs in with the Windows OpenSSH agent, Pageant, key files, FIDO2 security keys, keyboard-interactive or a password. It has tabs and splits, saved connections with imports from PuTTY, KiTTY, WinSCP, MobaXterm, mRemoteNG and SecureCRT, password sources, jump hosts (`ProxyJump`, `ProxyCommand`), SFTP and ZMODEM file transfer, port and X11 forwarding, tmux integration, serial consoles, Telnet for old gear, broadcast input, login scripts and command snippets, remote desktops through SSH, and sealed session logs.
 
-The [user guide](docs/guide/README.md) covers getting started, everyday use, every setting, the security model, verifying a download and troubleshooting.
+The [user guide](docs/guide/README.md) covers getting started, every feature, every menu item and shortcut ([menu reference](docs/guide/menus.md)), logs and their seals, every setting, the security model, verifying a download and troubleshooting.
 
 ## Download
 
