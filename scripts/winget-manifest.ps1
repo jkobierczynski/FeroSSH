@@ -59,9 +59,10 @@ Installers:
 
 Write-Manifest "$id.locale.en-US.yaml" "defaultLocale" @"
 PackageLocale: en-US
-Publisher: jkobierczynski
+Publisher: Jurgen Kobierczynski
 PublisherUrl: https://github.com/jkobierczynski
 PublisherSupportUrl: $repoUrl/issues
+Author: Jurgen Kobierczynski
 PackageName: FeroSSH
 PackageUrl: $repoUrl
 License: MIT OR Apache-2.0
