@@ -59,7 +59,7 @@ Session > Log to file writes what a tab receives to `%LOCALAPPDATA%\FeroSSH\logs
 
 ## Colour themes
 
-There are twelve themes (Nord by default) and two warning themes, Production (red) and Staging (amber). Rules can pick the theme by host pattern or by ssh_config `Tag`, so production servers always look like production. See `ThemeRule` in [Settings](settings.md).
+There are forty-two themes (Nord by default), in three columns of Settings > Theme: dark ones (Catppuccin, Dracula, Gruvbox, Kanagawa, Rosé Pine, Solarized, Tokyo Night and more), light ones (Catppuccin Latte, GitHub Light, Solarized Light, Tokyo Night Day and more), and the classics (Windows Terminal's Campbell, One Half and Tango, and PuTTY's own colours). Below them sit two warning themes, Production (red) and Staging (amber). The full list is in the [README](../../README.md#colour-themes). Rules can pick the theme by host pattern or by ssh_config `Tag`, so production servers always look like production. See `ThemeRule` in [Settings](settings.md).
 
 ## Updates
 

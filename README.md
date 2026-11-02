@@ -116,7 +116,13 @@ Edit > Copy on select and Edit > Right-click pastes turn on the PuTTY habits; bo
 
 ### Colour themes
 
-Built in: Nord (the default), Dracula, Catppuccin Mocha, Gruvbox Dark, Solarized Dark, Tokyo Night, One Dark, Monokai, Rosé Pine, Everforest, Campbell and One Half Light, plus two warning themes: **Production** (muted red background, red cursor) and **Staging** (amber). `ferossh.exe --theme Production prod-db` opens a session in a given theme, which is handy for desktop shortcuts.
+Forty-two built in, shown in three columns of Settings > Theme (each one is a few dozen bytes of colour values, so the exe barely grows):
+
+- **Dark:** Nord (the default), Ayu Mirage, Carbonfox, Catppuccin Frappé, Catppuccin Macchiato, Catppuccin Mocha, Dracula, Everforest, GitHub Dark, Gruvbox Dark, Gruvbox Material, Kanagawa Dragon, Kanagawa Wave, Monokai, Night Owl, Nightfox, One Dark, Rosé Pine, Rosé Pine Moon, Snazzy, Solarized Dark, Tokyo Night, Tokyo Night Storm, Tomorrow Night and Tomorrow Night Eighties.
+- **Light:** Ayu Light, Catppuccin Latte, Dawnfox, Everforest Light, GitHub Light, Gruvbox Light, Kanagawa Lotus, Rosé Pine Dawn, Solarized Light, Tokyo Night Day and Tomorrow.
+- **Classics:** Campbell, One Half Dark, One Half Light, Tango Dark and Tango Light from Windows Terminal, and PuTTY's own colours for anyone who misses them.
+
+Every theme's text reads at 4.5:1 contrast or better (a test checks it). There are also two warning themes: **Production** (muted red background, red cursor) and **Staging** (amber). `ferossh.exe --theme Production prod-db` opens a session in a given theme, which is handy for desktop shortcuts.
 
 The theme follows the host automatically: a host tagged `production`, `staging` or `development` with ssh_config's `Tag` keyword gets Production, Staging or Nord, and your own rules can match host patterns (`*.prod.example.com !prod-sandbox`) or tags, with an optional red or amber tint over any theme. Rules and per-host profiles live in `%APPDATA%\FeroSSH\ferossh.conf`:
 
