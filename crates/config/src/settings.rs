@@ -22,6 +22,7 @@
 //!     Theme Dracula
 //!     Tmux main
 //!     TmuxLayout ferossh
+//!     StartDir /srv/www
 //! Profile core-switch
 //!     LegacyAlgorithms yes
 //!     AutoReconnect no
@@ -89,6 +90,10 @@ pub struct Profile {
     /// The tmux layout for new sessions: `ferossh` (one window per pane)
     /// or `tmux` (tmux's own splits).
     pub tmux_layout: Option<String>,
+    /// The server directory new shells and tmux windows and panes of
+    /// this host start in; the server's choice (the home folder) when
+    /// unset.
+    pub start_dir: Option<String>,
     /// Also offer the legacy algorithm set (ECDH NIST curves, DH groups
     /// 14 to 18 with SHA-2, AES-CTR, plain HMAC-SHA-2) for older switches,
     /// routers and servers.
@@ -157,6 +162,21 @@ impl SessionKind {
     }
 }
 
+/// A `Tmux` value that means no tmux at all, not a session of that
+/// name: what the connection form shows when the field is empty.
+pub fn tmux_off(name: &str) -> bool {
+    ["", "off", "no", "none", "false"]
+        .iter()
+        .any(|w| name.trim().eq_ignore_ascii_case(w))
+}
+
+/// A `StartDir` value as kept: trimmed, `None` when empty or holding
+/// control characters, which must never be typed at a shell.
+pub fn start_dir(dir: &str) -> Option<String> {
+    let dir = dir.trim().trim_matches('"').trim();
+    (!dir.is_empty() && !dir.chars().any(|c| c.is_control() || c == '"')).then(|| dir.to_owned())
+}
+
 /// The RDP port xrdp and GNOME Remote Desktop listen on by default.
 pub const DEFAULT_DESKTOP_PORT: u16 = 3389;
 /// The VNC port of display :0.
@@ -172,6 +192,7 @@ impl Profile {
             && self.scrollback.is_none()
             && self.tmux.is_none()
             && self.tmux_layout.is_none()
+            && self.start_dir.is_none()
             && !self.legacy_algorithms
             && self.desktop_port.is_none()
             && self.vnc_port.is_none()
@@ -502,7 +523,7 @@ impl Settings {
                             }
                             "theme" => p.theme = Some(joined).filter(|t| !t.is_empty()),
                             "tmux" => {
-                                p.tmux = first.filter(|t| !t.eq_ignore_ascii_case("no"));
+                                p.tmux = first.filter(|t| !tmux_off(t));
                             }
                             "legacyalgorithms" => {
                                 p.legacy_algorithms =
@@ -553,6 +574,7 @@ impl Settings {
                                     p.login_script.push(step);
                                 }
                             }
+                            "startdir" => p.start_dir = start_dir(&raw_rest(line)),
                             "tmuxlayout" => {
                                 p.tmux_layout = first
                                     .map(|l| l.to_ascii_lowercase())
@@ -694,6 +716,9 @@ impl Settings {
             }
             if let Some(l) = &p.tmux_layout {
                 let _ = writeln!(out, "    TmuxLayout {l}");
+            }
+            if let Some(d) = &p.start_dir {
+                let _ = writeln!(out, "    StartDir {}", arg(d));
             }
             if p.legacy_algorithms {
                 let _ = writeln!(out, "    LegacyAlgorithms yes");
@@ -852,6 +877,7 @@ Profile web
     Scrollback 99999999
     Tmux work
     TmuxLayout TMUX
+    StartDir "/srv/my site"
     LegacyAlgorithms YES
     AutoReconnect yes
     DesktopPort 3390
@@ -902,6 +928,10 @@ AutoResponses no
 RunParallel 40
 Profile router
     Type Telnet
+Profile debian2
+    Tmux OFF
+    Theme Monokai
+    StartDir
 NewKeyword later
 "#;
 
@@ -951,6 +981,11 @@ NewKeyword later
         assert_eq!(big.theme.as_deref(), Some("Solarized Dark"));
         assert_eq!(big.tmux, None, "tmux stays off unless a session is named");
         assert_eq!(big.tmux_layout, None);
+        assert_eq!(big.start_dir, None);
+        assert_eq!(web.start_dir.as_deref(), Some("/srv/my site"));
+        let debian = s.profile("debian2").unwrap();
+        assert_eq!(debian.tmux, None, "off is no tmux, not a session named off");
+        assert_eq!(debian.start_dir, None);
         assert!(!big.legacy_algorithms, "only `yes` turns it on");
         assert_eq!(big.desktop_port, None, "port 0 is no port");
         assert_eq!(big.kind, SessionKind::Ssh);

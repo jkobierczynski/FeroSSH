@@ -64,6 +64,8 @@ pub struct Values {
     pub tmux: String,
     /// Empty, `ferossh` or `tmux`.
     pub tmux_layout: String,
+    /// The server directory new shells and tmux panes start in.
+    pub start_dir: String,
     /// One forward per entry, as `L 8080 localhost:80`.
     pub forwards: Vec<String>,
     pub desktop_port: String,
@@ -172,6 +174,7 @@ impl Values {
         self.scrollback = opt_text(&p.scrollback);
         self.tmux = p.tmux.clone().unwrap_or_default();
         self.tmux_layout = p.tmux_layout.clone().unwrap_or_default();
+        self.start_dir = p.start_dir.clone().unwrap_or_default();
         self.desktop_port = opt_text(&p.desktop_port);
         self.vnc_port = opt_text(&p.vnc_port);
         self.legacy = p.legacy_algorithms;
@@ -203,6 +206,7 @@ enum Field {
     Scrollback,
     Tmux,
     TmuxLayout,
+    StartDir,
     Forward(usize),
     DesktopPort,
     VncPort,
@@ -233,6 +237,7 @@ impl Field {
             Field::Scrollback => "Scrollback",
             Field::Tmux => "tmux",
             Field::TmuxLayout => "tmux panes",
+            Field::StartDir => "Start dir",
             Field::Forward(_) => "Forward",
             Field::DesktopPort => "RDP port",
             Field::VncPort => "VNC port",
@@ -457,6 +462,7 @@ impl SessionForm {
             if self.open[2] {
                 out.push(Item::Field(Field::Tmux));
                 out.push(Item::Field(Field::TmuxLayout));
+                out.push(Item::Field(Field::StartDir));
                 let n = self.values.forwards.len();
                 let locked = self.field_locked(Field::Forward(0));
                 for i in 0..n {
@@ -534,6 +540,7 @@ impl SessionForm {
             Field::FontSize => &v.font_size,
             Field::Scrollback => &v.scrollback,
             Field::Tmux => &v.tmux,
+            Field::StartDir => &v.start_dir,
             Field::Forward(i) => return v.forwards.get(i),
             Field::LoginStep(i) => return v.login_script.get(i),
             Field::DesktopPort => &v.desktop_port,
@@ -567,6 +574,7 @@ impl SessionForm {
             Field::FontSize => &mut v.font_size,
             Field::Scrollback => &mut v.scrollback,
             Field::Tmux => &mut v.tmux,
+            Field::StartDir => &mut v.start_dir,
             Field::Forward(i) => return v.forwards.get_mut(i),
             Field::LoginStep(i) => return v.login_script.get_mut(i),
             Field::DesktopPort => &mut v.desktop_port,
@@ -729,7 +737,8 @@ impl SessionForm {
             Field::Font => h.font.clone(),
             Field::FontSize => format!("{}", h.font_size),
             Field::Scrollback => h.scrollback.to_string(),
-            Field::Tmux => "off".into(),
+            Field::Tmux => "off, or a session name".into(),
+            Field::StartDir => "home folder, or e.g. /srv/www".into(),
             Field::Forward(_) => "e.g. L 8080 web:80".into(),
             Field::LoginStep(0) => "e.g. expect Password:".into(),
             Field::LoginStep(_) => "next step".into(),
@@ -889,6 +898,9 @@ impl SessionForm {
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.'))
         {
             return Err("tmux session names use letters, digits, . _ and - only.".into());
+        }
+        if v.start_dir.contains('"') || v.start_dir.chars().any(char::is_control) {
+            return Err("The start directory cannot hold \" or control characters.".into());
         }
         if matches!(
             v.kind,
@@ -1348,7 +1360,8 @@ impl SessionForm {
         p.font = trimmed(&v.font);
         p.font_size = v.font_size.trim().parse().ok();
         p.scrollback = v.scrollback.trim().parse().ok();
-        p.tmux = trimmed(&v.tmux);
+        p.tmux = trimmed(&v.tmux).filter(|t| !ferossh_config::settings::tmux_off(t));
+        p.start_dir = ferossh_config::settings::start_dir(&v.start_dir);
         p.tmux_layout = trimmed(&v.tmux_layout);
         p.desktop_port = v.desktop_port.trim().parse().ok().filter(|&p| p != 0);
         p.vnc_port = v.vnc_port.trim().parse().ok().filter(|&p| p != 0);
@@ -1610,6 +1623,7 @@ mod tests {
             (Field::Forward(0), "L 8080", "Forward 1"),
             (Field::FontSize, "200", "4 to 96"),
             (Field::Tmux, "a;b", "tmux"),
+            (Field::StartDir, "/srv/\"x\"", "start directory"),
             (Field::Jump, "gw host", "Jump host"),
             (Field::Jump, "gw,ok", "not this one"),
         ] {
@@ -1750,7 +1764,8 @@ mod tests {
         // Password, Jump host, Look, Extras.
         down(&mut f, 11);
         f.key(SideKey::Enter { split: false }, 30);
-        down(&mut f, 3);
+        // tmux, tmux panes, Start dir.
+        down(&mut f, 4);
         assert_eq!(f.focused_field(), Some(Field::Forward(0)));
         typed(&mut f, "L 8080 localhost:80");
         let t = texts(&mut f);
@@ -1780,8 +1795,9 @@ mod tests {
         typed(&mut f, "sw1");
         down(&mut f, 11);
         f.key(SideKey::Enter { split: false }, 30);
-        // tmux, tmux panes, Forward 1, RDP port, VNC port, Old crypto.
-        down(&mut f, 7);
+        // tmux, tmux panes, Start dir, Forward 1, RDP port, VNC port,
+        // Old crypto.
+        down(&mut f, 8);
         assert_eq!(f.focused_field(), Some(Field::LoginStep(0)));
         let t = texts(&mut f);
         assert!(
@@ -1810,6 +1826,30 @@ mod tests {
         );
         let v = Values::from_saved(&hosts[0]).with_profile(Some(p));
         assert_eq!(v.login_script, ["expect >", "secret enable"]);
+    }
+
+    #[test]
+    fn tmux_off_is_no_tmux_and_the_start_dir_is_kept() {
+        let mut f = new_form();
+        f.values = Values {
+            name: "debian2".into(),
+            host: "192.168.1.159".into(),
+            tmux: " Off ".into(),
+            start_dir: " /srv/my site ".into(),
+            forwards: vec![String::new()],
+            ..Values::default()
+        };
+        assert_eq!(f.check(), Ok(()));
+        let mut hosts = Vec::new();
+        let mut settings = Settings::default();
+        f.apply(&mut hosts, &mut settings);
+        let p = settings.profile("debian2").unwrap();
+        assert_eq!(p.tmux, None, "typing off turns tmux off");
+        assert_eq!(p.start_dir.as_deref(), Some("/srv/my site"));
+        let again = Settings::parse(&settings.to_text());
+        let back = Values::default().with_profile(again.profile("debian2"));
+        assert_eq!(back.tmux, "");
+        assert_eq!(back.start_dir, "/srv/my site");
     }
 
     #[test]

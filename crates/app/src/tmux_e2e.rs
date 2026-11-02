@@ -531,3 +531,34 @@ fn real_tmux_split_in_the_same_directory() {
     });
     let _ = tmux_cmd(&server, &["run-shell", &format!("rmdir '{dir}'")]);
 }
+
+#[test]
+fn real_tmux_new_tab_in_the_start_directory() {
+    if !tmux_available() || version() < MIN_VERSION {
+        return;
+    }
+    let server = Server {
+        socket: format!("ferossh-e2e-start-{}", std::process::id()),
+    };
+    let mut a = Harness::attach(&server, Mode::Ferossh);
+    a.until("the first pane", |h| h.shown() == 1 && !h.panes.is_empty());
+    let first = a.ws.all_panes()[0];
+    let dir = format!("/tmp/ferossh start #{}", std::process::id());
+    let line = format!("mkdir -p '{dir}' && echo made-$((40+2))\r");
+    let actions = a.tmux.input(first, line.as_bytes());
+    a.apply(actions);
+    a.until("the mkdir", |h| h.text(first).contains("made-42"));
+
+    // Session > Start new tabs and panes in this directory sets it.
+    a.tmux.start_dir = Some(dir.clone());
+    let actions = a.tmux.new_tab(first);
+    a.apply(actions);
+    a.until("the new tab", |h| h.ws.all_panes().len() == 2);
+    let second = *a.ws.all_panes().iter().find(|&&p| p != first).unwrap();
+    let actions = a.tmux.input(second, b"echo \"at:$(pwd):\"\r");
+    a.apply(actions);
+    a.until("the new tab's directory", |h| {
+        h.text(second).contains(&format!("at:{dir}:"))
+    });
+    let _ = tmux_cmd(&server, &["run-shell", &format!("rmdir '{dir}'")]);
+}

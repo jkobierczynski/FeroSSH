@@ -341,6 +341,8 @@ mod cmd {
     pub const SAVE_PANE: u32 = 609;
     pub const SAVE_ALL: u32 = 620;
     pub const TMUX_KEYS: u32 = 621;
+    /// Session > Start new tabs and panes in this directory.
+    pub const START_DIR: u32 = 622;
     pub const TMUX_ATTACH: u32 = 610;
     pub const TMUX_DETACH: u32 = 611;
     pub const TMUX_PICK: u32 = 612;
@@ -1525,6 +1527,11 @@ fn build_menu() -> Result<HMENU> {
             cmd::SAVE_LOOK,
             "&Save font and theme for this host",
         )?;
+        item(
+            session,
+            cmd::START_DIR,
+            "Start new tabs and panes in this director&y",
+        )?;
         separator(session)?;
         item(session, cmd::REPLACE_KEY, "Replace host &key...")?;
         separator(session)?;
@@ -2021,7 +2028,83 @@ impl Window {
         );
         // Not attached yet, so nothing to send.
         let _ = t.want_keys(self.settings.tmux_keys);
+        t.start_dir = self.profile_start_dir(id);
         t
+    }
+
+    /// The start directory in the profile of SSH pane `id`'s host.
+    fn profile_start_dir(&self, id: PaneId) -> Option<String> {
+        match self.panes.get(&id).map(|p| &p.host) {
+            Some(Host::Ssh(s)) => self
+                .settings
+                .profile(&s.target.alias)
+                .and_then(|p| p.start_dir.clone()),
+            _ => None,
+        }
+    }
+
+    /// Session > Start new tabs and panes in this directory, from pane
+    /// `pane`: tmux is asked for a tmux pane's directory (the answer
+    /// comes back as an action); an SSH shell's is the one it reported.
+    fn start_dir_here(&mut self, pane: PaneId) -> Option<Command> {
+        let host = self.host_pane(pane);
+        if host != pane {
+            let actions = self
+                .tmux
+                .get_mut(&host)
+                .filter(|t| t.active())
+                .map(|t| t.ask_dir(pane))
+                .unwrap_or_default();
+            self.run_tmux(host, actions);
+            return None;
+        }
+        let p = self.panes.get(&pane)?;
+        if !matches!(p.host, Host::Ssh(_)) {
+            return Some(Command::Notice(
+                "Only a pane connected to an SSH host has a start directory to save.".into(),
+            ));
+        }
+        let Some(dir) = p.cwd.clone() else {
+            return Some(Command::Notice(
+                "FeroSSH does not know this shell's directory: it reports none and has a \
+                 prompt FeroSSH does not read. Type the directory in Settings > Connection \
+                 manager, Edit connection, Start dir."
+                    .into(),
+            ));
+        };
+        self.save_start_dir(pane, &String::from_utf8_lossy(&dir))
+    }
+
+    /// Keeps `dir` as the start directory of SSH pane `gateway`'s host:
+    /// in its profile, and for the tmux sessions on that host now.
+    fn save_start_dir(&mut self, gateway: PaneId, dir: &str) -> Option<Command> {
+        let Some(Host::Ssh(s)) = self.panes.get(&gateway).map(|p| &p.host) else {
+            return None;
+        };
+        let alias = s.target.alias.clone();
+        let Some(dir) = ferossh_config::settings::start_dir(dir) else {
+            return Some(Command::Notice(
+                "This directory's name cannot be typed safely at a shell, so it is not saved."
+                    .into(),
+            ));
+        };
+        self.settings.profile_mut(&alias).start_dir = Some(dir.clone());
+        self.save_settings();
+        let gateways: Vec<PaneId> = self.tmux.keys().copied().collect();
+        for g in gateways {
+            let same = matches!(
+                self.panes.get(&g).map(|p| &p.host),
+                Some(Host::Ssh(o)) if o.target.alias.eq_ignore_ascii_case(&alias)
+            );
+            if same && let Some(t) = self.tmux.get_mut(&g) {
+                t.start_dir = Some(dir.clone());
+            }
+        }
+        Some(Command::Notice(format!(
+            "New tabs and panes on {alias} start in {dir} now, also after FeroSSH restarts. \
+             Window > Split … in same directory still follows the pane. Change or clear it \
+             in Edit connection, Start dir."
+        )))
     }
 
     /// Writes to the host of SSH pane `id`, past any local prompt: tmux
@@ -2098,6 +2181,11 @@ impl Window {
                 tmux::Action::Notice(text) => {
                     let text = crate::ssh::sanitize(&text);
                     self.show(gateway, &format!("\x1b[0;90m{text}\x1b[0m\r\n"));
+                }
+                tmux::Action::StartDir(dir) => {
+                    if let Some(command) = self.save_start_dir(gateway, &dir) {
+                        self.queued.push(command);
+                    }
                 }
             }
         }
@@ -2266,8 +2354,11 @@ impl Window {
     /// Types the `cd` that Window > Split … in same directory asked for
     /// at pane `id`'s freshly logged-in shell. Once: a reconnect starts
     /// where the server starts it.
+    /// Otherwise the host's start directory, after every login.
     fn cd_after_login(&mut self, id: PaneId) {
-        let Some(dir) = self.panes.get_mut(&id).and_then(|p| p.start_dir.take()) else {
+        let split_dir = self.panes.get_mut(&id).and_then(|p| p.start_dir.take());
+        let Some(dir) = split_dir.or_else(|| self.profile_start_dir(id).map(String::into_bytes))
+        else {
             return;
         };
         if let Some(line) = same_dir::cd_line(&dir) {
@@ -8876,6 +8967,7 @@ impl Window {
                 self.layout();
             }
             cmd::SAVE_LOOK => return Some(Command::SaveLook),
+            cmd::START_DIR => return self.start_dir_here(pane),
             cmd::UPLOAD => {
                 self.ensure_sftp(pane);
                 let Some(key) = self.files_target(pane) else {
