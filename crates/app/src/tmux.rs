@@ -1630,15 +1630,15 @@ mod tests {
         assert_eq!(w.len(), 5);
         assert_eq!(
             w[4],
-            "display-message -p '#{prefix} #{prefix2} #{base-index}'"
+            "display-message -p '#{prefix} #{prefix2} #{base-index} #{repeat-time}'"
         );
         let mut input = reply(1, &["3.4".into()]);
         input.extend(reply(2, &[]));
         input.extend(reply(3, &[]));
         input.extend(reply(4, &[pane_line(0, 0, 80, 24, "b25f,80x24,0,0,0")]));
-        input.extend(reply(5, &["C-a None 1".into()]));
+        input.extend(reply(5, &["C-a None 1 500".into()]));
         t.feed(&mut ws, &input);
-        assert_eq!(t.keys(), Some("C-a None 1"));
+        assert_eq!(t.keys(), Some("C-a None 1 500"));
         // Turned on while attached: asked at once.
         let w = writes(&t.want_keys(true));
         assert_eq!(w.len(), 1);
