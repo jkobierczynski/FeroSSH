@@ -473,7 +473,8 @@ fn too_old_tmux_is_refused() {
 
 #[test]
 fn real_tmux_split_in_the_same_directory() {
-    if !tmux_available() {
+    // Older tmux is refused before any pane appears.
+    if !tmux_available() || version() < MIN_VERSION {
         return;
     }
     let server = Server {
