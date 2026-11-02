@@ -1,7 +1,8 @@
 //! The side pane's session manager: every session open right now, in
 //! every tab (and a snippet run's sessions that no tab shows), with its
-//! kind, tab and state. Enter or a double-click shows a session, Delete
-//! closes it (the window asks first), and typing filters the list. The
+//! kind, tab and state. Enter or a double-click shows a session, F2
+//! renames it, Delete closes it (the window asks first), and typing
+//! filters the list. The
 //! saved hosts are the connection manager's (see [`crate::sessions`]).
 //!
 //! The window builds the [`LiveSession`]s on each draw, so the list is
@@ -21,6 +22,22 @@ pub const HEADER: usize = 2;
 
 /// Lines each session takes: its target, then its tab, state and notes.
 const LINES: usize = 2;
+
+/// The longest name a session may be given, in characters.
+pub const MAX_NAME: usize = 64;
+
+/// A name as typed, made fit to show and to save: control characters
+/// dropped, spaces trimmed, at most [`MAX_NAME`] characters. `None` when
+/// nothing is left, which clears the name.
+pub fn clean_name(text: &str) -> Option<String> {
+    let name: String = text
+        .chars()
+        .filter(|c| !c.is_control())
+        .take(MAX_NAME)
+        .collect();
+    let name = name.trim();
+    (!name.is_empty()).then(|| name.to_owned())
+}
 
 /// What a session runs over.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -77,6 +94,8 @@ pub struct LiveSession {
     pub kind: Kind,
     /// `user@host[:port]`, the COM port, or the tmux pane's host.
     pub target: String,
+    /// The name the user gave the session, shown instead of the target.
+    pub name: Option<String>,
     /// The title the host set, when there is one.
     pub title: Option<String>,
     pub state: LiveState,
@@ -92,6 +111,10 @@ impl LiveSession {
         q.is_empty()
             || self.target.to_lowercase().contains(&q)
             || self
+                .name
+                .as_deref()
+                .is_some_and(|n| n.to_lowercase().contains(&q))
+            || self
                 .title
                 .as_deref()
                 .is_some_and(|t| t.to_lowercase().contains(&q))
@@ -105,6 +128,9 @@ impl LiveSession {
             None => "no tab".to_owned(),
         }];
         parts.push(self.state.name().to_owned());
+        if self.name.is_some() {
+            parts.push(self.target.clone());
+        }
         parts.extend(self.notes.iter().map(|n| (*n).to_owned()));
         if let Some(t) = self.title.as_deref().filter(|t| *t != self.target) {
             parts.push(t.to_owned());
@@ -114,13 +140,24 @@ impl LiveSession {
 }
 
 /// What the window should do.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LiveAction {
     /// Show the session: its tab and pane, with the keyboard.
     Show(PaneId),
     /// Close the session's pane, after asking.
     Close(PaneId),
+    /// Give the session this name; `None` clears it.
+    Rename(PaneId, Option<String>),
     Leave,
+}
+
+/// A name being typed for a session.
+#[derive(Debug)]
+struct Renaming {
+    pane: PaneId,
+    text: String,
+    /// What the field started with: Enter on it unchanged changes nothing.
+    was: String,
 }
 
 #[derive(Debug, Default)]
@@ -132,6 +169,7 @@ pub struct LiveView {
     at: usize,
     /// The first session shown.
     scroll: usize,
+    rename: Option<Renaming>,
 }
 
 impl LiveView {
@@ -175,13 +213,100 @@ impl LiveView {
         self.scroll = 0;
         self.pane = all.iter().find(|s| s.focused).map(|s| s.pane);
         self.at = 0;
+        self.rename = None;
+    }
+
+    /// Selects `pane`'s session and opens its name for typing, starting
+    /// with the name it has, or what it shows now.
+    pub fn start_rename(&mut self, pane: PaneId, all: &[LiveSession], rows: usize) {
+        let Some(s) = all.iter().find(|s| s.pane == pane) else {
+            return;
+        };
+        let was = s
+            .name
+            .clone()
+            .or_else(|| s.title.clone())
+            .unwrap_or_else(|| s.target.clone());
+        if !s.matches(&self.query) {
+            self.query.clear();
+        }
+        self.pane = Some(pane);
+        self.rename = Some(Renaming {
+            pane,
+            text: was.clone(),
+            was,
+        });
+        let shown = self.shown(all);
+        self.clamp(&shown, Self::visible(rows), true);
+    }
+
+    /// A name is being typed.
+    pub fn renaming(&self) -> bool {
+        self.rename.is_some()
+    }
+
+    /// Pasted text goes into the name being typed, on one line.
+    pub fn paste(&mut self, text: &str) {
+        if let Some(r) = &mut self.rename {
+            let room = MAX_NAME.saturating_sub(r.text.chars().count());
+            r.text.extend(
+                text.chars()
+                    .map(|c| if c.is_control() { ' ' } else { c })
+                    .take(room),
+            );
+        }
+    }
+
+    /// Keys while a name is typed: Enter keeps it, Escape drops it.
+    fn rename_key(&mut self, key: SideKey, all: &[LiveSession]) -> Option<LiveAction> {
+        let r = self.rename.as_mut()?;
+        match key {
+            SideKey::Enter { .. } => {
+                let r = self.rename.take()?;
+                let named = all.iter().find(|s| s.pane == r.pane)?.name.is_some();
+                // Enter on the text it started with: nothing changes,
+                // unless the field was emptied first.
+                if r.text == r.was && !named {
+                    return None;
+                }
+                return Some(LiveAction::Rename(r.pane, clean_name(&r.text)));
+            }
+            SideKey::Escape => self.rename = None,
+            SideKey::Backspace => {
+                r.text.pop();
+            }
+            // Delete empties the field, for clearing the name.
+            SideKey::Delete => r.text.clear(),
+            SideKey::Char(c) if !c.is_control() && r.text.chars().count() < MAX_NAME => {
+                r.text.push(c);
+            }
+            _ => {}
+        }
+        None
     }
 
     pub fn key(&mut self, key: SideKey, all: &[LiveSession], rows: usize) -> Option<LiveAction> {
         let visible = Self::visible(rows);
         let mut shown = self.shown(all);
+        // The session being named went away.
+        if self
+            .rename
+            .as_ref()
+            .is_some_and(|r| !shown.iter().any(|s| s.pane == r.pane))
+        {
+            self.rename = None;
+        }
+        if self.rename.is_some() {
+            return self.rename_key(key, all);
+        }
         self.clamp(&shown, visible, false);
         match key {
+            SideKey::Edit => {
+                if let Some(p) = self.pane {
+                    self.start_rename(p, all, rows);
+                }
+                return None;
+            }
             SideKey::Up => self.pick(self.at.saturating_sub(1), &shown),
             SideKey::Down => self.pick(self.at + 1, &shown),
             SideKey::PageUp => self.pick(self.at.saturating_sub(visible), &shown),
@@ -221,6 +346,8 @@ impl LiveView {
         all: &[LiveSession],
         rows: usize,
     ) -> Option<LiveAction> {
+        // A click ends the typing of a name, as Escape does.
+        self.rename = None;
         let shown = self.shown(all);
         let i = y.checked_sub(HEADER)? / LINES + self.scroll;
         let pane = shown.get(i)?.pane;
@@ -246,6 +373,13 @@ impl LiveView {
         let width = grid.cols();
         let visible = Self::visible(grid.rows());
         let shown = self.shown(all);
+        if self
+            .rename
+            .as_ref()
+            .is_some_and(|r| !shown.iter().any(|s| s.pane == r.pane))
+        {
+            self.rename = None;
+        }
         self.clamp(&shown, visible, false);
         let line = |text: &str, fg: Rgb, bg: Rgb, flags: Flags| -> Vec<Cell> {
             let mut cells: Vec<Cell> = fit(text, width)
@@ -260,23 +394,34 @@ impl LiveView {
             cells
         };
         let bg = palette.strip;
-        let mut title = line(" Sessions", palette.text, bg, Flags::BOLD);
-        if !all.is_empty() {
-            put_right(&mut title, &all.len().to_string(), 10, palette.dim, bg);
+        if let Some(r) = &self.rename {
+            let mut title = line(" Rename session", palette.text, bg, Flags::BOLD);
+            put_right(&mut title, "Esc cancels", 16, palette.dim, bg);
+            grid.set_row(0, title);
+            let field = format!(" Name: {}{}", r.text, if focused { "▏" } else { "" });
+            grid.set_row(
+                1,
+                line(&field, palette.text, palette.active, Flags::empty()),
+            );
+        } else {
+            let mut title = line(" Sessions", palette.text, bg, Flags::BOLD);
+            if !all.is_empty() {
+                put_right(&mut title, &all.len().to_string(), 10, palette.dim, bg);
+            }
+            grid.set_row(0, title);
+            let (filter, fg) = match (self.query.is_empty(), focused) {
+                (true, false) => (" Ctrl+Shift+L to pick one".to_owned(), palette.dim),
+                (true, true) => (
+                    " Enter shows, F2 renames, Del closes, type to filter".to_owned(),
+                    palette.dim,
+                ),
+                (false, _) => (
+                    format!(" / {}{}", self.query, if focused { "▏" } else { "" }),
+                    palette.text,
+                ),
+            };
+            grid.set_row(1, line(&filter, fg, palette.active, Flags::empty()));
         }
-        grid.set_row(0, title);
-        let (filter, fg) = match (self.query.is_empty(), focused) {
-            (true, false) => (" Ctrl+Shift+L to pick one".to_owned(), palette.dim),
-            (true, true) => (
-                " Enter shows, Del closes, type to filter".to_owned(),
-                palette.dim,
-            ),
-            (false, _) => (
-                format!(" / {}{}", self.query, if focused { "▏" } else { "" }),
-                palette.text,
-            ),
-        };
-        grid.set_row(1, line(&filter, fg, palette.active, Flags::empty()));
         let green = Rgb::new(0x98, 0xc3, 0x79);
         let amber = Rgb::new(0xe5, 0xb5, 0x3b);
         for y in 0..visible * LINES {
@@ -291,7 +436,8 @@ impl LiveView {
                 grid.set_row(row, line(text, palette.dim, bg, Flags::empty()));
                 continue;
             };
-            let chosen = focused && i == self.at;
+            let naming = self.rename.as_ref().is_some_and(|r| r.pane == s.pane);
+            let chosen = (focused && i == self.at) || naming;
             let row_bg = if chosen { palette.active } else { bg };
             if y % LINES == 1 {
                 let detail = format!("   {}", s.detail());
@@ -303,7 +449,7 @@ impl LiveView {
             } else {
                 Flags::empty()
             };
-            let text = format!(" ● {}", s.target);
+            let text = format!(" ● {}", s.name.as_deref().unwrap_or(&s.target));
             let mut cells = line(&text, palette.text, row_bg, flags);
             if let Some(dot) = cells.get_mut(1) {
                 dot.fg = Color::Rgb(match s.state {
@@ -332,6 +478,7 @@ mod tests {
             tab,
             kind: Kind::Ssh,
             target: target.into(),
+            name: None,
             title: None,
             state,
             notes: Vec::new(),
@@ -473,5 +620,90 @@ mod tests {
         assert!(texts(&mut v, &all, 6)[2].starts_with(" ● COM3"));
         v.scroll_by(1, &all, 6);
         assert!(texts(&mut v, &all, 6)[2].starts_with(" ● me@db"));
+    }
+
+    #[test]
+    fn f2_renames_the_selected_session() {
+        let mut all = sample();
+        let mut v = LiveView::default();
+        v.reset(&all);
+        v.key(SideKey::Up, &all, 12);
+        assert_eq!(v.key(SideKey::Edit, &all, 12), None);
+        assert!(v.renaming());
+        // It starts with what the session shows: the host's title.
+        let t = texts(&mut v, &all, 12);
+        assert!(t[0].starts_with(" Rename session"), "{:?}", t[0]);
+        assert_eq!(t[1], " Name: vim▏");
+        // Enter on it unchanged keeps the title as it is, unnamed.
+        assert_eq!(v.key(SideKey::Enter { split: false }, &all, 12), None);
+        assert!(!v.renaming());
+        v.key(SideKey::Edit, &all, 12);
+        for _ in 0..3 {
+            v.key(SideKey::Backspace, &all, 12);
+        }
+        for c in " prod db ".chars() {
+            v.key(SideKey::Char(c), &all, 12);
+        }
+        assert_eq!(
+            v.key(SideKey::Enter { split: false }, &all, 12),
+            Some(LiveAction::Rename(2, Some("prod db".into())))
+        );
+        // Named, it shows the name, with the target on the detail line.
+        all[1].name = Some("prod db".into());
+        let t = texts(&mut v, &all, 12);
+        assert!(t[4].starts_with(" ● prod db"), "{:?}", t[4]);
+        assert!(
+            t[5].starts_with("   tab 1 · connecting · me@db · tmux"),
+            "{:?}",
+            t[5]
+        );
+        // The name filters too.
+        for c in "prod".chars() {
+            v.key(SideKey::Char(c), &all, 12);
+        }
+        assert!(texts(&mut v, &all, 12)[2].starts_with(" ● prod db"));
+        // Delete empties the field; Enter then clears the name.
+        v.start_rename(2, &all, 12);
+        assert_eq!(texts(&mut v, &all, 12)[1], " Name: prod db▏");
+        v.key(SideKey::Delete, &all, 12);
+        assert_eq!(
+            v.key(SideKey::Enter { split: false }, &all, 12),
+            Some(LiveAction::Rename(2, None))
+        );
+    }
+
+    #[test]
+    fn escape_and_clicks_cancel_a_rename() {
+        let all = sample();
+        let mut v = LiveView::default();
+        v.start_rename(4, &all, 12);
+        v.key(SideKey::Char('x'), &all, 12);
+        // Keys that would act on the list only type.
+        assert_eq!(v.key(SideKey::Delete, &all, 12), None);
+        assert_eq!(v.key(SideKey::Escape, &all, 12), None);
+        assert!(!v.renaming());
+        // The selection stayed on the session.
+        assert_eq!(
+            v.key(SideKey::Enter { split: false }, &all, 12),
+            Some(LiveAction::Show(4))
+        );
+        v.start_rename(1, &all, 12);
+        v.click(HEADER, false, &all, 12);
+        assert!(!v.renaming());
+        // A session that went away ends its rename.
+        v.start_rename(3, &all, 12);
+        let fewer: Vec<_> = all.iter().filter(|s| s.pane != 3).cloned().collect();
+        assert_eq!(v.key(SideKey::Char('a'), &fewer, 12), None);
+        assert!(!v.renaming());
+    }
+
+    #[test]
+    fn names_are_cleaned() {
+        assert_eq!(clean_name("  web \u{7}1 "), Some("web 1".into()));
+        assert_eq!(clean_name(" \t "), None);
+        assert_eq!(
+            clean_name(&"x".repeat(100)).map(|n| n.len()),
+            Some(MAX_NAME)
+        );
     }
 }

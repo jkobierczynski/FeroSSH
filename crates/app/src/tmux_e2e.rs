@@ -48,6 +48,8 @@ struct Harness {
     /// Each native pane's size and everything fed to it.
     panes: BTreeMap<Native, ((u16, u16), Vec<u8>)>,
     gateway_shown: bool,
+    /// The session names the saved looks gave new panes.
+    names: BTreeMap<Native, String>,
     pickers: Vec<Vec<String>>,
     notices: Vec<String>,
 }
@@ -127,6 +129,7 @@ impl Harness {
             ws,
             panes: BTreeMap::new(),
             gateway_shown: false,
+            names: BTreeMap::new(),
             pickers: Vec::new(),
             notices: Vec::new(),
         };
@@ -143,9 +146,16 @@ impl Harness {
                     let _ = self.stdin.write_all(&bytes);
                 }
                 Action::Create {
-                    native, cols, rows, ..
+                    native,
+                    cols,
+                    rows,
+                    look,
+                    ..
                 } => {
                     self.panes.insert(native, ((cols, rows), Vec::new()));
+                    if let Some(name) = look.name {
+                        self.names.insert(native, name);
+                    }
                 }
                 Action::Feed { native, bytes } => {
                     if let Some(p) = self.panes.get_mut(&native) {
@@ -295,10 +305,22 @@ fn real_tmux_round_trip() {
         )
         .contains('1')
     });
+    // The second session gets a name: its window takes it in tmux.
+    let actions = a.tmux.rename(second, Some("db one"));
+    a.apply(actions);
+    a.until("the window name", |_| {
+        tmux_cmd(
+            &server,
+            &["list-windows", "-t", "e2e", "-F", "#{window_name}"],
+        )
+        .lines()
+        .any(|l| l == "db one")
+    });
     a.save(|n| Look {
         font: Some("Consolas".into()),
         size: Some(if n == first { 10.0 } else { 18.0 }),
         theme: Some("Nord".into()),
+        name: (n == second).then(|| "db one".to_owned()),
     });
     a.until("the saved layout", |_| {
         tmux_cmd(
@@ -317,6 +339,11 @@ fn real_tmux_round_trip() {
     let restored = b.ws.all_panes();
     assert!(b.text(restored[0]).contains("one-42"));
     assert!(b.text(restored[1]).contains("two"));
+    // The name comes back with the pane, and only there.
+    assert_eq!(
+        b.names.iter().collect::<Vec<_>>(),
+        [(&restored[1], &"db one".to_owned())]
+    );
     // The same mouse modes come back, and no motion reports (1003),
     // which would type garbage at the shell once htop is gone.
     let modes = b.text(restored[1]);
