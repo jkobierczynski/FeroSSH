@@ -30,6 +30,7 @@ use ferossh_tmuxcc::{
 
 use crate::layout::{Axis, Dir, Node, PaneId as Native, Workspace};
 use crate::same_dir;
+use crate::tmux_keys;
 
 /// Output kept for a pane until its screen is restored.
 const MAX_BUFFER: usize = 4 << 20;
@@ -145,6 +146,8 @@ enum Tag {
     SplitHere(Split),
     Sessions,
     NewSession,
+    /// The prefix keys and base index, for tmux keybindings.
+    Keys,
     /// The reply does not matter.
     Ignore,
 }
@@ -348,6 +351,10 @@ pub struct Tmux {
     saved_text: Option<String>,
     /// The session to attach again after a reconnect.
     pub reattach: Option<String>,
+    /// Read the prefix keys on attach (Session > Use tmux keybindings).
+    keys_wanted: bool,
+    /// tmux's answer to [`tmux_keys::FORMAT`].
+    keys: Option<String>,
 }
 
 fn win_of(text: &[u8]) -> Option<WindowId> {
@@ -420,6 +427,8 @@ impl Tmux {
             sent_layouts: BTreeMap::new(),
             saved_text: None,
             reattach: None,
+            keys_wanted: false,
+            keys: None,
         }
     }
 
@@ -590,6 +599,33 @@ impl Tmux {
         if std::mem::take(&mut self.pick_after_attach) {
             self.list_sessions(out);
         }
+        if self.keys_wanted {
+            self.send_keys_query(out);
+        }
+    }
+
+    fn send_keys_query(&mut self, out: &mut Vec<Action>) {
+        self.send(
+            &format!("display-message -p {}", command::quote(tmux_keys::FORMAT)),
+            Tag::Keys,
+            out,
+        );
+    }
+
+    /// Session > Use tmux keybindings: read the prefix keys on each attach
+    /// while on, and now if attached already.
+    pub fn want_keys(&mut self, on: bool) -> Vec<Action> {
+        let mut out = Vec::new();
+        self.keys_wanted = on;
+        if on && self.client.is_control() {
+            self.send_keys_query(&mut out);
+        }
+        out
+    }
+
+    /// The prefix keys and base index tmux gave, as it wrote them.
+    pub fn keys(&self) -> Option<&str> {
+        self.keys.as_deref()
     }
 
     fn list_sessions(&mut self, out: &mut Vec<Action>) {
@@ -740,6 +776,7 @@ impl Tmux {
                     out.append(&mut more);
                 }
             }
+            Tag::Keys => self.keys = ok.then(first).filter(|k| !k.is_empty()),
             Tag::Ignore => {}
         }
     }
@@ -1557,6 +1594,32 @@ mod tests {
         };
         let text = String::from_utf8(restore_bytes(&state, &[], &[])).unwrap();
         assert!(text.ends_with("\x1b[6;21r\x1b[?6h\x1b[3;1H"), "{text:?}");
+    }
+
+    #[test]
+    fn reads_the_prefix_keys_when_asked() {
+        let (mut ws, gateway) = Workspace::new();
+        let mut t = Tmux::new(gateway, Mode::Ferossh, 100);
+        // Off: nothing is asked.
+        assert!(t.want_keys(false).is_empty());
+        assert!(t.want_keys(true).is_empty(), "not attached yet");
+        let a = t.feed(&mut ws, START);
+        let w = writes(&a);
+        assert_eq!(w.len(), 5);
+        assert_eq!(
+            w[4],
+            "display-message -p '#{prefix} #{prefix2} #{base-index}'"
+        );
+        let mut input = reply(1, &["3.4".into()]);
+        input.extend(reply(2, &[]));
+        input.extend(reply(3, &[]));
+        input.extend(reply(4, &[pane_line(0, 0, 80, 24, "b25f,80x24,0,0,0")]));
+        input.extend(reply(5, &["C-a None 1".into()]));
+        t.feed(&mut ws, &input);
+        assert_eq!(t.keys(), Some("C-a None 1"));
+        // Turned on while attached: asked at once.
+        let w = writes(&t.want_keys(true));
+        assert_eq!(w.len(), 1);
     }
 
     #[test]

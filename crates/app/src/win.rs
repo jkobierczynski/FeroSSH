@@ -63,9 +63,10 @@ use windows::Win32::UI::Input::Ime::{
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     GetDoubleClickTime, GetKeyState, ReleaseCapture, SetCapture, VIRTUAL_KEY, VK_ADD, VK_BACK,
-    VK_CONTROL, VK_DELETE, VK_DOWN, VK_END, VK_ESCAPE, VK_F1, VK_F2, VK_F3, VK_F4, VK_F5, VK_F12,
-    VK_HOME, VK_INSERT, VK_LEFT, VK_MENU, VK_NEXT, VK_NUMPAD0, VK_OEM_2, VK_OEM_MINUS, VK_OEM_PLUS,
-    VK_PRIOR, VK_RETURN, VK_RIGHT, VK_SHIFT, VK_SPACE, VK_SUBTRACT, VK_TAB, VK_UP,
+    VK_CAPITAL, VK_CONTROL, VK_DELETE, VK_DOWN, VK_END, VK_ESCAPE, VK_F1, VK_F2, VK_F3, VK_F4,
+    VK_F5, VK_F12, VK_HOME, VK_INSERT, VK_LEFT, VK_LWIN, VK_MENU, VK_NEXT, VK_NUMPAD0, VK_OEM_2,
+    VK_OEM_MINUS, VK_OEM_PLUS, VK_PRIOR, VK_RETURN, VK_RIGHT, VK_RWIN, VK_SHIFT, VK_SPACE,
+    VK_SUBTRACT, VK_TAB, VK_UP,
 };
 use windows::Win32::UI::Shell::{
     DragAcceptFiles, DragFinish, DragQueryFileW, DragQueryPoint, HDROP, ShellExecuteW,
@@ -127,6 +128,7 @@ use crate::ssh::{Effect, Env, ProxyCommand, SshSession, State, Target};
 use crate::tabstrip::{self, Forwarding, Health, Hit, Palette, StripLayout, TabLabel};
 use crate::telnet::{TelnetSession, TelnetTarget};
 use crate::tmux::{self, Mode as TmuxMode, Tmux};
+use crate::tmux_keys::{self, Action as TmuxKey};
 use crate::zmodem;
 use ferossh_tmuxcc::saved as tmux_saved;
 use zeroize::Zeroizing;
@@ -337,6 +339,7 @@ mod cmd {
     pub const ZMODEM: u32 = 608;
     pub const SAVE_PANE: u32 = 609;
     pub const SAVE_ALL: u32 = 620;
+    pub const TMUX_KEYS: u32 = 621;
     pub const TMUX_ATTACH: u32 = 610;
     pub const TMUX_DETACH: u32 = 611;
     pub const TMUX_PICK: u32 = 612;
@@ -685,6 +688,13 @@ struct Window {
     /// Repaint everything on the next WM_PAINT, not only dirty rows.
     full_redraw: bool,
     high_surrogate: Option<u16>,
+    /// The tmux prefix was typed in this pane: the next key is a tmux
+    /// window or pane key (Session > Use tmux keybindings).
+    tmux_armed: Option<PaneId>,
+    /// The pane focused before, in another tab and in the same tab, for
+    /// tmux's `l` and `;`.
+    last_tab_pane: Option<PaneId>,
+    last_pane: Option<PaneId>,
     mouse: Mouse,
     drag: Option<Drag>,
     settings: Settings,
@@ -1327,6 +1337,9 @@ fn create_and_run(launch: Launch, theme: Option<String>) -> Result<()> {
                 focused: false,
                 full_redraw: true,
                 high_surrogate: None,
+                tmux_armed: None,
+                last_tab_pane: None,
+                last_pane: None,
                 mouse: Mouse::default(),
                 drag: None,
                 settings,
@@ -1503,6 +1516,11 @@ fn build_menu() -> Result<HMENU> {
             session,
             cmd::TMUX_LAYOUT,
             "tmux: one &window per pane (own fonts)",
+        )?;
+        item(
+            session,
+            cmd::TMUX_KEYS,
+            "Use tmux ke&ybindings for tabs and panes",
         )?;
         separator(session)?;
         item(session, cmd::SERIAL_BREAK, "Send &break (serial)")?;
@@ -1955,11 +1973,14 @@ impl Window {
             ),
             _ => (TmuxMode::Ferossh, None),
         };
-        Tmux::new(
+        let mut t = Tmux::new(
             id,
             mode,
             history.unwrap_or(TermSettings::DEFAULT_SCROLLBACK),
-        )
+        );
+        // Not attached yet, so nothing to send.
+        let _ = t.want_keys(self.settings.tmux_keys);
+        t
     }
 
     /// Writes to the host of SSH pane `id`, past any local prompt: tmux
@@ -5771,33 +5792,29 @@ impl Window {
         }
     }
 
-    fn on_char(&mut self, unit: u16, alt: bool) {
+    /// A character from WM_CHAR or WM_SYSCHAR; what a tmux key asked
+    /// for comes back.
+    fn on_char(&mut self, unit: u16, alt: bool) -> Option<Command> {
         let ch = match unit {
             0xD800..=0xDBFF => {
                 self.high_surrogate = Some(unit);
-                return;
+                return None;
             }
             0xDC00..=0xDFFF => {
-                let Some(high) = self.high_surrogate.take() else {
-                    return;
-                };
+                let high = self.high_surrogate.take()?;
                 char::decode_utf16([high, unit]).next().and_then(|r| r.ok())
             }
             _ => char::from_u32(u32::from(unit)),
         };
-        let Some(ch) = ch else {
-            return;
-        };
+        let ch = ch?;
         if self.side.focused {
             if !ch.is_control() {
                 self.side_key(SideKey::Char(ch));
             }
-            return;
+            return None;
         }
         let id = self.focused_id();
-        let Some(p) = self.panes.get_mut(&id) else {
-            return;
-        };
+        let p = self.panes.get_mut(&id)?;
         if p.term.search_active() {
             if !ch.is_control() {
                 let mut query = p.term.search_query().unwrap_or_default().to_owned();
@@ -5805,13 +5822,198 @@ impl Window {
                 p.term.search_set(&query);
                 self.refresh(id);
             }
-            return;
+            return None;
         }
+        if let Some(command) = self.tmux_char(id, ch, alt) {
+            return command;
+        }
+        let p = self.panes.get_mut(&id)?;
         let bytes = p.term.text(ch, alt);
         // Who else gets it is decided first: the key may end a prompt.
         let targets = self.broadcast_targets(id);
         self.input(id, bytes);
         self.send_typed(&targets, &Typed::Char(ch, alt));
+        None
+    }
+
+    /// The prefix keys of the tmux session pane `id` shows, when tmux
+    /// keybindings are on and it is a pane of a tmux session.
+    fn tmux_keys_of(&self, id: PaneId) -> Option<tmux_keys::Keys> {
+        if !self.settings.tmux_keys {
+            return None;
+        }
+        let gateway = self.panes.get(&id).and_then(Pane::gateway)?;
+        let t = self.tmux.get(&gateway).filter(|t| t.active())?;
+        // Until tmux answers, its default.
+        Some(
+            t.keys()
+                .and_then(tmux_keys::Keys::parse)
+                .unwrap_or_default(),
+        )
+    }
+
+    /// A character typed in pane `id`, for the tmux keybindings: the
+    /// prefix arms them, and the next key is a window or pane key.
+    /// `Some` when they took it, with what to run.
+    fn tmux_char(&mut self, id: PaneId, ch: char, alt: bool) -> Option<Option<Command>> {
+        let keys = self.tmux_keys_of(id)?;
+        if self.tmux_armed.take() == Some(id) {
+            return Some(self.tmux_key(id, &keys, tmux_keys::Key::Char(ch, alt)));
+        }
+        if keys.is_prefix(tmux_keys::Prefix { ch, alt }) {
+            self.tmux_armed = Some(id);
+            return Some(None);
+        }
+        None
+    }
+
+    /// Carries out a tmux window or pane key typed after the prefix in
+    /// pane `id`.
+    fn tmux_key(
+        &mut self,
+        id: PaneId,
+        keys: &tmux_keys::Keys,
+        key: tmux_keys::Key,
+    ) -> Option<Command> {
+        let dir_index = |d: Dir| DIRS.iter().position(|x| *x == d).unwrap_or(0) as u32;
+        let run = |c: u32| Some(Command::Id(c));
+        match tmux_keys::action(keys, key) {
+            TmuxKey::SendPrefix(p) => {
+                self.input(id, p.bytes());
+                None
+            }
+            TmuxKey::NewTab => run(cmd::NEW_TAB),
+            TmuxKey::SplitRight => run(cmd::SPLIT_RIGHT),
+            TmuxKey::SplitDown => run(cmd::SPLIT_DOWN),
+            TmuxKey::NextTab => run(cmd::NEXT_TAB),
+            TmuxKey::PrevTab => run(cmd::PREV_TAB),
+            TmuxKey::LastTab => {
+                if let Some(p) = self.last_tab_pane.filter(|p| self.ws.tab_of(*p).is_some()) {
+                    self.focus_pane(p);
+                }
+                None
+            }
+            TmuxKey::Tab(n) => {
+                if n < self.ws.tabs.len() {
+                    self.select_tab(n);
+                }
+                None
+            }
+            TmuxKey::NextPane => {
+                let panes = self.ws.tab().map(|t| t.root.panes()).unwrap_or_default();
+                let at = panes.iter().position(|p| *p == id).unwrap_or(0);
+                if let Some(next) = panes.get((at + 1) % panes.len().max(1)).copied() {
+                    self.focus_pane(next);
+                }
+                None
+            }
+            TmuxKey::LastPane => {
+                let same_tab = self.last_pane.filter(|p| {
+                    self.ws.tab_of(*p).is_some() && self.ws.tab_of(*p) == self.ws.tab_of(id)
+                });
+                if let Some(p) = same_tab {
+                    self.focus_pane(p);
+                }
+                None
+            }
+            TmuxKey::Focus(d) => run(cmd::FOCUS + dir_index(d)),
+            TmuxKey::Resize(d) => run(cmd::RESIZE + dir_index(d)),
+            TmuxKey::ClosePane => Some(Command::Confirm {
+                text: "Close this tmux pane? tmux ends the program in it (kill-pane).".into(),
+                then: Box::new(Command::Id(cmd::CLOSE_PANE)),
+            }),
+            TmuxKey::CloseTab => {
+                let n = self.ws.tab().map_or(0, |t| t.root.panes().len());
+                let panes = if n == 1 {
+                    "its pane".to_owned()
+                } else {
+                    format!("its {n} panes")
+                };
+                Some(Command::Confirm {
+                    text: format!(
+                        "Close this tab and {panes}? tmux ends the programs in them \
+                         (kill-window)."
+                    ),
+                    then: Box::new(Command::CloseTabNow(self.ws.active)),
+                })
+            }
+            TmuxKey::BreakPane => run(cmd::PANE_TO_TAB),
+            TmuxKey::Detach => run(cmd::TMUX_DETACH),
+            TmuxKey::ChooseSession => run(cmd::TMUX_PICK),
+            TmuxKey::ScrollBack => run(cmd::SCROLL_PAGE_UP),
+            TmuxKey::Palette => run(cmd::PALETTE),
+            TmuxKey::Find => run(cmd::FIND),
+            TmuxKey::Help => {
+                let prefix = keys
+                    .prefixes
+                    .first()
+                    .map_or_else(|| "the prefix".to_owned(), |p| tmux_keys::name(*p));
+                Some(Command::Message(tmux_keys::help(&prefix)))
+            }
+            TmuxKey::Nothing => None,
+        }
+    }
+
+    /// A key-down while the tmux prefix is armed in pane `id`: arrows,
+    /// PageUp and Escape are tmux keys; any other key that types no text
+    /// ends the wait, as tmux ignores an unbound key. Text keys wait for
+    /// their WM_CHAR.
+    fn tmux_key_down(&mut self, vk: VIRTUAL_KEY, mods: Mods) -> Option<KeyOutcome> {
+        let id = self.focused_id();
+        if self.side.focused || self.tmux_armed != Some(id) {
+            return None;
+        }
+        if matches!(
+            vk,
+            VK_SHIFT | VK_CONTROL | VK_MENU | VK_CAPITAL | VK_LWIN | VK_RWIN
+        ) {
+            return None;
+        }
+        let Some(keys) = self.tmux_keys_of(id) else {
+            self.tmux_armed = None;
+            return None;
+        };
+        let key = match vk {
+            VK_LEFT => tmux_keys::Key::Arrow {
+                dir: Dir::Left,
+                ctrl: mods.ctrl,
+                alt: mods.alt,
+            },
+            VK_RIGHT => tmux_keys::Key::Arrow {
+                dir: Dir::Right,
+                ctrl: mods.ctrl,
+                alt: mods.alt,
+            },
+            VK_UP => tmux_keys::Key::Arrow {
+                dir: Dir::Up,
+                ctrl: mods.ctrl,
+                alt: mods.alt,
+            },
+            VK_DOWN => tmux_keys::Key::Arrow {
+                dir: Dir::Down,
+                ctrl: mods.ctrl,
+                alt: mods.alt,
+            },
+            VK_PRIOR => tmux_keys::Key::PageUp,
+            VK_ESCAPE => tmux_keys::Key::Escape,
+            // Enter, Backspace, Tab, F-keys and the like: no binding.
+            _ if terminal_key(vk).is_some() => tmux_keys::Key::Escape,
+            // A text key, or Ctrl with one: its WM_CHAR follows, unless
+            // it is a FeroSSH shortcut, which also ends the wait.
+            _ => {
+                let split = self.ws.tab().is_some_and(|t| t.root.panes().len() > 1);
+                if shortcut(vk, mods, self.ws.tabs.len() > 1, split).is_some() {
+                    self.tmux_armed = None;
+                }
+                return None;
+            }
+        };
+        self.tmux_armed = None;
+        drop_pending_char(self.hwnd);
+        Some(match self.tmux_key(id, &keys, key) {
+            Some(c) => KeyOutcome::Run(c),
+            None => KeyOutcome::Handled,
+        })
     }
 
     /// Handles a key-down: window shortcuts first, then the side pane or
@@ -5822,6 +6024,11 @@ impl Window {
         let mods = key_mods();
         if mods.alt && vk == VK_F4 {
             return KeyOutcome::Default;
+        }
+        // The key after the tmux prefix, before FeroSSH's own shortcuts:
+        // Alt+arrow there resizes, as in tmux.
+        if let Some(outcome) = self.tmux_key_down(vk, mods) {
+            return outcome;
         }
         // Ctrl+Shift+F1 to F12: the snippet with that hotkey, if there is
         // one for this host; otherwise the key goes on.
@@ -5884,6 +6091,10 @@ impl Window {
             };
             if let Some(code) = code {
                 drop_pending_char(self.hwnd);
+                // Ctrl+Space can be the tmux prefix (C-Space).
+                if let Some(command) = self.tmux_char(id, char::from(code), false) {
+                    return command.map_or(KeyOutcome::Handled, KeyOutcome::Run);
+                }
                 let targets = self.broadcast_targets(id);
                 self.input(id, vec![code]);
                 self.send_typed(&targets, &Typed::Bytes(vec![code]));
@@ -7511,6 +7722,13 @@ impl Window {
         if !self.ws.focus(id) {
             return;
         }
+        if before != id {
+            if tab_before == self.ws.active {
+                self.last_pane = Some(before);
+            } else {
+                self.last_tab_pane = Some(before);
+            }
+        }
         let was_side = std::mem::take(&mut self.side.focused);
         if before == id && tab_before == self.ws.active && !was_side {
             return;
@@ -8257,6 +8475,29 @@ impl Window {
                 self.save_settings();
                 self.update_menu_checks();
             }
+            cmd::TMUX_KEYS => {
+                let on = !self.settings.tmux_keys;
+                self.settings.tmux_keys = on;
+                self.tmux_armed = None;
+                self.save_settings();
+                self.update_menu_checks();
+                let gateways: Vec<PaneId> = self.tmux.keys().copied().collect();
+                for g in gateways {
+                    if let Some(t) = self.tmux.get_mut(&g) {
+                        let actions = t.want_keys(on);
+                        self.run_tmux(g, actions);
+                    }
+                }
+                if on && !self.tmux.values().any(Tmux::active) {
+                    return Some(Command::Notice(
+                        "tmux keybindings work in panes of a tmux session: Session > Attach \
+                         tmux starts one. Then press the tmux prefix (Ctrl+B unless tmux is set \
+                         up with another) and c, %, \", n, p, o, x, d or another window or pane \
+                         key; the prefix and ? lists them."
+                            .into(),
+                    ));
+                }
+            }
             cmd::SAVE_SNIPPET => {
                 let text = self
                     .panes
@@ -8762,6 +9003,7 @@ impl Window {
                 (cmd::LOG_TIMESTAMPS, s.log_timestamps),
                 (cmd::AUTO_RESPONSES, s.auto_responses),
                 (cmd::CONFIRM_PRODUCTION, s.confirm_production),
+                (cmd::TMUX_KEYS, s.tmux_keys),
                 (cmd::RECORD_SNIPPET, self.recording.is_some()),
                 (
                     cmd::SESSIONS,
@@ -9486,6 +9728,13 @@ enum Command {
         live: bool,
         last: bool,
     },
+    /// Ask this; on yes, run the command.
+    Confirm {
+        text: String,
+        then: Box<Command>,
+    },
+    /// Close tab `i` without asking (it was asked already).
+    CloseTabNow(usize),
     /// Ask, then remove the snippet at this index.
     DeleteSnippet(usize),
     /// A snippet is about to go to a pane with the Production theme: asks
@@ -9929,6 +10178,16 @@ fn run_command(hwnd: HWND, command: Command) {
                 }
             }
             if let Some(next) = with_window(|w| w.close_session(pane)).flatten() {
+                run_command(hwnd, next);
+            }
+        }
+        Command::Confirm { text, then } => {
+            if dialog(hwnd, &text, MB_YESNO | MB_ICONQUESTION | MB_DEFBUTTON2) == Some(IDYES) {
+                run_command(hwnd, *then);
+            }
+        }
+        Command::CloseTabNow(i) => {
+            if let Some(next) = with_window(|w| w.close_tab(i)).flatten() {
                 run_command(hwnd, next);
             }
         }
@@ -10811,12 +11070,17 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                 LRESULT(0)
             }
             WM_CHAR => {
-                with_window(|w| w.on_char(wparam.0 as u16, false));
+                if let Some(command) = with_window(|w| w.on_char(wparam.0 as u16, false)).flatten()
+                {
+                    run_command(hwnd, command);
+                }
                 LRESULT(0)
             }
             // Alt+Space opens the system menu as usual.
             WM_SYSCHAR if wparam.0 != usize::from(b' ') => {
-                with_window(|w| w.on_char(wparam.0 as u16, true));
+                if let Some(command) = with_window(|w| w.on_char(wparam.0 as u16, true)).flatten() {
+                    run_command(hwnd, command);
+                }
                 LRESULT(0)
             }
             WM_KEYDOWN | WM_SYSKEYDOWN => {
