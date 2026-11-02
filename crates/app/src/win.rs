@@ -6251,6 +6251,9 @@ impl Window {
         if self.side.view == SideView::Live {
             let all = self.open_sessions();
             let action = self.live_view.key(key, &all, self.side.grid.rows());
+            // Every key changes what the view shows: the filter, the
+            // selection or the name being typed.
+            self.refresh_chrome();
             if action.is_none() && !self.live_view.renaming() && self.rename_return.is_some() {
                 // Escape ended the rename.
                 self.end_rename();
