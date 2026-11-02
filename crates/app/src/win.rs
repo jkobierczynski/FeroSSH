@@ -700,6 +700,10 @@ struct Window {
     /// The tmux prefix was typed in this pane: the next key is a tmux
     /// window or pane key (Session > Use tmux keybindings).
     tmux_armed: Option<PaneId>,
+    /// A repeatable tmux key (an arrow, PageUp) was just used: until this
+    /// time, more of them work without the prefix, as with tmux's `bind
+    /// -r` and `repeat-time`.
+    tmux_repeat: Option<Instant>,
     /// The pane focused before, in another tab and in the same tab, for
     /// tmux's `l` and `;`.
     last_tab_pane: Option<PaneId>,
@@ -1352,6 +1356,7 @@ fn create_and_run(launch: Launch, theme: Option<String>) -> Result<()> {
                 full_redraw: true,
                 high_surrogate: None,
                 tmux_armed: None,
+                tmux_repeat: None,
                 last_tab_pane: None,
                 last_pane: None,
                 mouse: Mouse::default(),
@@ -5966,6 +5971,15 @@ impl Window {
         if self.tmux_armed.take() == Some(id) {
             return Some(self.tmux_key(id, &keys, tmux_keys::Key::Char(ch, alt)));
         }
+        // Repeating: another repeatable key needs no prefix; any other key
+        // ends the repeat and is typed (or arms the prefix) as usual.
+        if self.tmux_repeating(false) {
+            let key = tmux_keys::Key::Char(ch, alt);
+            if tmux_keys::repeatable(tmux_keys::action(&keys, key)) {
+                return Some(self.tmux_key(id, &keys, key));
+            }
+        }
+        self.tmux_repeat = None;
         if keys.is_prefix(tmux_keys::Prefix { ch, alt }) {
             self.tmux_armed = Some(id);
             return Some(None);
@@ -5983,7 +5997,10 @@ impl Window {
     ) -> Option<Command> {
         let dir_index = |d: Dir| DIRS.iter().position(|x| *x == d).unwrap_or(0) as u32;
         let run = |c: u32| Some(Command::Id(c));
-        match tmux_keys::action(keys, key) {
+        let action = tmux_keys::action(keys, key);
+        self.tmux_repeat = tmux_keys::repeatable(action)
+            .then(|| Instant::now() + Duration::from_millis(keys.repeat_ms));
+        match action {
             TmuxKey::SendPrefix(p) => {
                 self.input(id, p.bytes());
                 None
@@ -6047,6 +6064,7 @@ impl Window {
             TmuxKey::Detach => run(cmd::TMUX_DETACH),
             TmuxKey::ChooseSession => run(cmd::TMUX_PICK),
             TmuxKey::ScrollBack => run(cmd::SCROLL_PAGE_UP),
+            TmuxKey::ScrollForward => run(cmd::SCROLL_PAGE_DOWN),
             TmuxKey::Palette => run(cmd::PALETTE),
             TmuxKey::Find => run(cmd::FIND),
             TmuxKey::Help => {
@@ -6054,19 +6072,31 @@ impl Window {
                     .prefixes
                     .first()
                     .map_or_else(|| "the prefix".to_owned(), |p| tmux_keys::name(*p));
-                Some(Command::Message(tmux_keys::help(&prefix)))
+                Some(Command::Message(tmux_keys::help(&prefix, keys.repeat_ms)))
             }
             TmuxKey::Nothing => None,
         }
     }
 
-    /// A key-down while the tmux prefix is armed in pane `id`: arrows,
-    /// PageUp and Escape are tmux keys; any other key that types no text
-    /// ends the wait, as tmux ignores an unbound key. Text keys wait for
-    /// their WM_CHAR.
-    fn tmux_key_down(&mut self, vk: VIRTUAL_KEY, mods: Mods) -> Option<KeyOutcome> {
+    /// Whether a repeatable tmux key still needs no prefix: within
+    /// `repeat-time` of the last one, or while that key is held down and
+    /// Windows repeats it (its first repeat can come later than 500 ms).
+    fn tmux_repeating(&self, held: bool) -> bool {
+        self.tmux_repeat
+            .is_some_and(|until| held || Instant::now() < until)
+    }
+
+    /// A key-down while the tmux prefix is armed in the focused pane, or
+    /// while repeatable keys work without it. Armed: arrows, PageUp,
+    /// PageDown and Escape are tmux keys, and any other key that types no
+    /// text ends the wait, as tmux ignores an unbound key. Repeating: a
+    /// repeatable key runs again, and any other key ends the repeat and
+    /// goes on as usual. Text keys wait for their WM_CHAR. `held` is set
+    /// for Windows' auto-repeat of a key held down.
+    fn tmux_key_down(&mut self, vk: VIRTUAL_KEY, mods: Mods, held: bool) -> Option<KeyOutcome> {
         let id = self.focused_id();
-        if self.side.focused || self.tmux_armed != Some(id) {
+        let armed = self.tmux_armed == Some(id);
+        if self.side.focused || (!armed && !self.tmux_repeating(held)) {
             return None;
         }
         if matches!(
@@ -6077,30 +6107,21 @@ impl Window {
         }
         let Some(keys) = self.tmux_keys_of(id) else {
             self.tmux_armed = None;
+            self.tmux_repeat = None;
             return None;
         };
+        let arrow = |dir| tmux_keys::Key::Arrow {
+            dir,
+            ctrl: mods.ctrl,
+            alt: mods.alt,
+        };
         let key = match vk {
-            VK_LEFT => tmux_keys::Key::Arrow {
-                dir: Dir::Left,
-                ctrl: mods.ctrl,
-                alt: mods.alt,
-            },
-            VK_RIGHT => tmux_keys::Key::Arrow {
-                dir: Dir::Right,
-                ctrl: mods.ctrl,
-                alt: mods.alt,
-            },
-            VK_UP => tmux_keys::Key::Arrow {
-                dir: Dir::Up,
-                ctrl: mods.ctrl,
-                alt: mods.alt,
-            },
-            VK_DOWN => tmux_keys::Key::Arrow {
-                dir: Dir::Down,
-                ctrl: mods.ctrl,
-                alt: mods.alt,
-            },
+            VK_LEFT => arrow(Dir::Left),
+            VK_RIGHT => arrow(Dir::Right),
+            VK_UP => arrow(Dir::Up),
+            VK_DOWN => arrow(Dir::Down),
             VK_PRIOR => tmux_keys::Key::PageUp,
+            VK_NEXT => tmux_keys::Key::PageDown,
             VK_ESCAPE => tmux_keys::Key::Escape,
             // Enter, Backspace, Tab, F-keys and the like: no binding.
             _ if terminal_key(vk).is_some() => tmux_keys::Key::Escape,
@@ -6110,10 +6131,16 @@ impl Window {
                 let split = self.ws.tab().is_some_and(|t| t.root.panes().len() > 1);
                 if shortcut(vk, mods, self.ws.tabs.len() > 1, split).is_some() {
                     self.tmux_armed = None;
+                    self.tmux_repeat = None;
                 }
                 return None;
             }
         };
+        if !armed && !tmux_keys::repeatable(tmux_keys::action(&keys, key)) {
+            // Not a repeat: the key goes to the pane as usual.
+            self.tmux_repeat = None;
+            return None;
+        }
         self.tmux_armed = None;
         drop_pending_char(self.hwnd);
         Some(match self.tmux_key(id, &keys, key) {
@@ -6126,14 +6153,14 @@ impl Window {
     /// the search bar, then keys that do not type text. Text keys are left
     /// to the WM_CHAR that TranslateMessage made from the keyboard layout,
     /// which is what gets AltGr, dead keys and IME input right.
-    fn on_key_down(&mut self, vk: VIRTUAL_KEY) -> KeyOutcome {
+    fn on_key_down(&mut self, vk: VIRTUAL_KEY, held: bool) -> KeyOutcome {
         let mods = key_mods();
         if mods.alt && vk == VK_F4 {
             return KeyOutcome::Default;
         }
         // The key after the tmux prefix, before FeroSSH's own shortcuts:
         // Alt+arrow there resizes, as in tmux.
-        if let Some(outcome) = self.tmux_key_down(vk, mods) {
+        if let Some(outcome) = self.tmux_key_down(vk, mods, held) {
             return outcome;
         }
         // Ctrl+Shift+F1 to F12: the snippet with that hotkey, if there is
@@ -8628,6 +8655,7 @@ impl Window {
                 let on = !self.settings.tmux_keys;
                 self.settings.tmux_keys = on;
                 self.tmux_armed = None;
+                self.tmux_repeat = None;
                 self.save_settings();
                 self.update_menu_checks();
                 let gateways: Vec<PaneId> = self.tmux.keys().copied().collect();
@@ -11277,7 +11305,9 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
             }
             WM_KEYDOWN | WM_SYSKEYDOWN => {
                 let vk = VIRTUAL_KEY(wparam.0 as u16);
-                match with_window(|w| w.on_key_down(vk)) {
+                // Bit 30: the key was down already (Windows' auto-repeat).
+                let held = lparam.0 & (1 << 30) != 0;
+                match with_window(|w| w.on_key_down(vk, held)) {
                     Some(KeyOutcome::Handled) => LRESULT(0),
                     Some(KeyOutcome::Run(command)) => {
                         run_command(hwnd, command);

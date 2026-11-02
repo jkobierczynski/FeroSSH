@@ -84,36 +84,50 @@ fn control(c: char) -> Option<char> {
     char::from_u32(code)
 }
 
-/// What the server said: `prefix`, `prefix2` and `base-index`.
+/// What the server said: `prefix`, `prefix2`, `base-index` and
+/// `repeat-time`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Keys {
     pub prefixes: Vec<Prefix>,
     /// The number of the first window (tab), for the digit keys.
     pub base_index: usize,
+    /// How long, in milliseconds, a repeatable key (an arrow, PageUp)
+    /// goes on working without the prefix, counted from the last one.
+    pub repeat_ms: u64,
 }
+
+/// tmux's default `repeat-time`.
+pub const DEFAULT_REPEAT_MS: u64 = 500;
 
 impl Default for Keys {
     fn default() -> Self {
         Self {
             prefixes: vec![Prefix::DEFAULT],
             base_index: 0,
+            repeat_ms: DEFAULT_REPEAT_MS,
         }
     }
 }
 
 /// The format FeroSSH asks tmux to expand; [`Keys::parse`] reads it.
-pub const FORMAT: &str = "#{prefix} #{prefix2} #{base-index}";
+pub const FORMAT: &str = "#{prefix} #{prefix2} #{base-index} #{repeat-time}";
 
 impl Keys {
-    /// The answer to [`FORMAT`], such as `C-b None 0`. A prefix FeroSSH
-    /// cannot take (a function key) leaves just the other one; with
-    /// neither, the keybindings have no prefix and do nothing.
+    /// The answer to [`FORMAT`], such as `C-b None 0 500`. A prefix
+    /// FeroSSH cannot take (a function key) leaves just the other one;
+    /// with neither, the keybindings have no prefix and do nothing.
     pub fn parse(reply: &str) -> Option<Keys> {
         let words: Vec<&str> = reply.split_whitespace().collect();
-        let [prefix, prefix2, base] = words.as_slice() else {
-            return None;
+        let (prefix, prefix2, base, repeat) = match words.as_slice() {
+            [p, p2, b] => (p, p2, b, None),
+            [p, p2, b, r] => (p, p2, b, Some(r)),
+            _ => return None,
         };
         let base_index = base.parse().ok()?;
+        let repeat_ms = match repeat {
+            Some(r) => r.parse().ok()?,
+            None => DEFAULT_REPEAT_MS,
+        };
         let prefixes = [prefix, prefix2]
             .into_iter()
             .filter_map(|p| Prefix::parse(p))
@@ -121,6 +135,7 @@ impl Keys {
         Some(Keys {
             prefixes,
             base_index,
+            repeat_ms,
         })
     }
 
@@ -140,6 +155,7 @@ pub enum Key {
         alt: bool,
     },
     PageUp,
+    PageDown,
     Escape,
 }
 
@@ -181,6 +197,8 @@ pub enum Action {
     ChooseSession,
     /// `[` and PageUp: scroll back a page.
     ScrollBack,
+    /// PageDown: scroll forward a page (useful while repeating).
+    ScrollForward,
     /// `:`: the command palette.
     Palette,
     /// `f`: find in scrollback.
@@ -196,6 +214,7 @@ pub fn action(keys: &Keys, key: Key) -> Action {
     match key {
         Key::Escape => Action::Nothing,
         Key::PageUp => Action::ScrollBack,
+        Key::PageDown => Action::ScrollForward,
         Key::Arrow { dir, ctrl, alt } => {
             if ctrl || alt {
                 Action::Resize(dir)
@@ -240,8 +259,19 @@ pub fn action(keys: &Keys, key: Key) -> Action {
     }
 }
 
+/// Whether `action` is repeatable, as tmux binds it with `bind -r`: once
+/// done, more of these keys work without the prefix until `repeat-time`
+/// has passed since the last one. Moving between panes and resizing are
+/// `-r` in tmux's defaults; scrolling is here too, as in copy mode.
+pub fn repeatable(action: Action) -> bool {
+    matches!(
+        action,
+        Action::Focus(_) | Action::Resize(_) | Action::ScrollBack | Action::ScrollForward
+    )
+}
+
 /// Shown for prefix `?`, with the prefix as tmux names it.
-pub fn help(prefix: &str) -> String {
+pub fn help(prefix: &str, repeat_ms: u64) -> String {
     format!(
         "tmux keybindings: press {prefix}, then\n\n\
          c\tnew tab (tmux window)\n\
@@ -259,10 +289,13 @@ pub fn help(prefix: &str) -> String {
          !\tmove the pane to its own tab\n\
          d\tdetach tmux\n\
          s / w\tswitch tmux session\n\
-         [ / PageUp\tscroll back a page\n\
+         [ / PageUp\tscroll back a page (PageDown forward)\n\
          :\tcommand palette\n\
          f\tfind in scrollback\n\
          {prefix} again\tsend {prefix} to the pane\n\n\
+         Arrows, Ctrl or Alt+arrows, [, PageUp and PageDown repeat: \
+         press them again without {prefix} while they keep coming \
+         (tmux's repeat-time, {repeat_ms} ms).\n\n\
          Session > Use tmux keybindings turns them off."
     )
 }
@@ -328,6 +361,9 @@ mod tests {
     fn reads_the_server_reply() {
         // As tmux 3.4 expands FORMAT.
         assert_eq!(Keys::parse("C-b None 0"), Some(Keys::default()));
+        assert_eq!(Keys::parse("C-b None 0 500"), Some(Keys::default()));
+        assert_eq!(Keys::parse("C-b None 0 1200").unwrap().repeat_ms, 1200);
+        assert_eq!(Keys::parse("C-b None 0 x"), None);
         let k = Keys::parse("C-a M-x 1").unwrap();
         assert_eq!(k.prefixes, vec![p('\x01', false), p('x', true)]);
         assert_eq!(k.base_index, 1);
@@ -403,8 +439,41 @@ mod tests {
     }
 
     #[test]
+    fn moving_resizing_and_scrolling_repeat() {
+        let k = Keys::default();
+        for key in [
+            Key::Arrow {
+                dir: Dir::Up,
+                ctrl: false,
+                alt: false,
+            },
+            Key::Arrow {
+                dir: Dir::Left,
+                ctrl: true,
+                alt: false,
+            },
+            Key::Arrow {
+                dir: Dir::Right,
+                ctrl: false,
+                alt: true,
+            },
+            Key::PageUp,
+            Key::PageDown,
+            Key::Char('[', false),
+        ] {
+            assert!(repeatable(action(&k, key)), "{key:?}");
+        }
+        for ch in ['c', '%', 'n', 'o', 'x', 'd', '\x02'] {
+            assert!(!repeatable(action(&k, Key::Char(ch, false))), "{ch:?}");
+        }
+        assert!(!repeatable(action(&k, Key::Escape)));
+        assert_eq!(action(&k, Key::PageDown), Action::ScrollForward);
+    }
+
+    #[test]
     fn help_names_the_prefix() {
-        let text = help(&name(Prefix::DEFAULT));
+        let text = help(&name(Prefix::DEFAULT), 500);
+        assert!(text.contains("repeat-time, 500 ms"));
         assert!(text.starts_with("tmux keybindings: press C-b, then"));
         assert!(text.contains("C-b again\tsend C-b to the pane"));
     }

@@ -102,6 +102,7 @@ Font, theme and text size apply to the focused pane only. Session > Save font an
 | Switch tmux session... | Lists the other tmux sessions on the server and switches to one. |
 | Detach tmux | Leaves tmux, and everything running in it, on the server. Attach again later from this PC or another. |
 | tmux: one window per pane (own fonts) | ✓ on: each native pane is its own tmux window, so each can have its own font. Off: tmux's own splits are the panes. |
+| Use tmux keybindings for tabs and panes | ✓ on: in a pane of a tmux session, your tmux prefix then `c`, `%`, `"`, `n`, `p`, an arrow and the other window and pane keys work the tabs and panes; the prefix then `?` lists them (see [tmux](everyday-use.md#tmux)). Off by default. |
 | Send break (serial) | Holds a serial line in break for 300 ms (Cisco ROM monitor, Linux SysRq). |
 | Run login script again | Runs the connection's login script from the start. |
 | Auto-responses from snippets | ✓ on: snippets with a *When* text answer by themselves. Off turns all of them off. `AutoResponses`. |
