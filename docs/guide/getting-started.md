@@ -49,9 +49,12 @@ Coming from PuTTY, KiTTY, WinSCP or another client? File > Import connections br
 | `ferossh.exe` | Asks for a host. |
 | `ferossh.exe [user@]host[:port]` | Connects to a host. |
 | `ferossh.exe -l user -p port host` | The same, OpenSSH style. |
+| `ferossh.exe COM3:115200` | Opens a serial console, optionally with speed, framing and flow control (`COM3:9600,7E1,xonxoff`). |
+| `ferossh.exe telnet://host[:port]` | Opens a Telnet session (unencrypted; port 23 unless given). |
 | `ferossh.exe --theme NAME host` | Connects with a colour theme, for example `--theme Production`. Handy for desktop shortcuts. |
 | `ferossh.exe --no-sandbox host` | Runs the SSH worker without its sandbox. Needed only for an SSH server on the same PC (see [Troubleshooting](troubleshooting.md)). |
 | `ferossh.exe --local [command]` | Opens a local shell or command instead of SSH, for example `--local wsl -d Ubuntu`. |
+| `ferossh.exe --check-sandbox` | Reports what the sandbox can do on this PC. Pipe it through `more` to read it all. |
 | `ferossh.exe --new-security-key [--hello] [--ed25519] FILE` | Makes a new FIDO2 key file, like `ssh-keygen -t ecdsa-sk`. `--hello` uses Windows Hello, so no hardware key is needed. |
 
 ## The first shortcuts to learn
@@ -66,5 +69,6 @@ Coming from PuTTY, KiTTY, WinSCP or another client? File > Import connections br
 | Ctrl+Shift+E | File transfer for this pane's host |
 | Ctrl+Shift+C / Ctrl+Shift+V | Copy and paste |
 | Ctrl+Shift+F | Find in scrollback |
+| Ctrl+Shift+A | Command palette: every menu item, connection and snippet |
 
-The rest are in [Everyday use](everyday-use.md) and the README.
+Every other menu item and key is in the [Menu reference](menus.md).

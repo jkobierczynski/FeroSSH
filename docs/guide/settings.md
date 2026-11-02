@@ -36,6 +36,14 @@ FeroSSH reads `~/.ssh/config` and `~/.ssh/known_hosts` too, and writes only to `
 | `ZModem yes` | no | Answers `rz` and `sz` in the terminal with ZMODEM (Session > ZMODEM: answer rz and sz). |
 | `TmuxKeybindings yes` | no | In panes of a tmux session, the tmux prefix and a window or pane key work the tabs and panes (Session > Use tmux keybindings for tabs and panes). |
 
+## Snippets
+
+| Keyword | Default | Meaning |
+| --- | --- | --- |
+| `ConfirmProduction no` | yes | Whether a snippet typed into a pane with the Production theme asks first (Session > Confirm snippets on Production hosts). |
+| `AutoResponses no` | yes | Whether snippets with a `When` text answer by themselves (Session > Auto-responses from snippets). |
+| `RunParallel 8` | 4 | How many hosts a multi-host snippet run logs in to at once, 1 to 16. |
+
 ## X11
 
 | Keyword | Default | Meaning |
@@ -68,10 +76,64 @@ Profile web1
 | `LegacyAlgorithms yes` | Also offers older crypto (ECDH on NIST curves, DH groups 14 to 18 with SHA-2, AES-CTR, plain HMAC-SHA-2) for old switches and routers. Still no SHA-1, CBC or DSA. The tab shows an amber ⚠. |
 | `DesktopPort N` | The server's RDP port for Open remote desktop (3389). |
 | `VncPort N` | The server's VNC port (5900). |
-| `Type ssh`, `rdp` or `vnc` | The kind of connection. |
+| `Type ssh`, `telnet`, `serial`, `rdp` or `vnc` | The kind of connection. |
+| `Serial 115200,8N1,rtscts` | For a serial console: speed, framing (8N1, 8E1, 8O1, 7E1, 7O1, 8N2) and flow control (`none`, `xonxoff`, `rtscts`, `dsrdtr`), in any order. Left out: 9600, 8N1, none. |
+| `LoginScript STEP` | One step of the login script, one line per step: `expect TEXT`, `send TEXT`, `password`, `secret NAME`, `pause SECONDS`. See [Login scripts](everyday-use.md#login-scripts). |
 | `Via SESSION` | For RDP and VNC: log in to this saved SSH connection first and tunnel the desktop through it. |
 | `PasswordSource windows` | Takes the password from Windows Credential Manager, after the first login that works. |
 | `PasswordCommand ...` | Runs this command (no shell, no window, 60 seconds at most) and uses the first line it prints as the password. `%n` is the connection's name, `%h` the host, `%u` the user, `%p` the port. FeroSSH asks before running a command the first time. |
+
+A login script for a console server could look like this:
+
+```
+Profile core-console
+    Type serial
+    Serial 115200,8N1,none
+    LoginScript expect Username:
+    LoginScript send admin
+    LoginScript expect Password:
+    LoginScript password
+    LoginScript expect >
+    LoginScript send enable
+    LoginScript expect Password:
+    LoginScript secret enable
+```
+
+## Secrets
+
+A login script's `secret NAME` step, or a snippet's `@secret NAME`, types a named secret. Unless a `Secret` block names a command for it, FeroSSH asks for it once and keeps it in Windows Credential Manager as `FeroSSH secret:NAME`. With a block, the command's first line of output is the secret; `%n` is the secret's name. FeroSSH asks before it runs a command the first time.
+
+```
+Secret enable
+    PasswordCommand op read "op://Network/%n/password"
+```
+
+## Snippets
+
+Command snippets are kept here too. The snippet editor (Settings > Command snippets, then Insert or F2) writes them, but you can also write them by hand:
+
+```
+Snippet "Back up the config"
+    Hosts sw-* core-*
+    Folder Network
+    Hotkey F2
+    Line copy running-config tftp://10.0.0.5/${host}-${stamp}.cfg
+    Line @expect ]?
+    Line @key enter
+Snippet "Next page"
+    Hosts sw-*
+    When --More--
+    Line @key space
+```
+
+| Keyword | Meaning |
+| --- | --- |
+| `Snippet NAME` | Starts a snippet. |
+| `Line TEXT` | One line to type, or an `@` step. See [Command snippets](everyday-use.md#command-snippets). |
+| `Hosts PATTERN...` | Keeps the snippet to these hosts. |
+| `Folder NAME` | Keeps it to the hosts in this connection-manager folder. |
+| `Hotkey F1` to `F12` | Runs it with Ctrl+Shift and that key. |
+| `When TEXT` | Makes it an auto-response: it runs whenever the host prints this text. |
 
 ## Theme rules
 

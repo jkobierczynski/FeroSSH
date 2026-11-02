@@ -1269,6 +1269,28 @@ impl Tmux {
         out
     }
 
+    /// The user named native pane `native`'s session (or cleared its
+    /// name): its tmux window takes the name, so tmux's own status line and
+    /// other clients show it. A cleared name gives the window back to
+    /// tmux's automatic naming. The name is also saved with the window's
+    /// look by [`Tmux::sync_saved`], which brings it back on attach.
+    pub fn rename(&mut self, native: Native, name: Option<&str>) -> Vec<Action> {
+        let mut out = Vec::new();
+        let Some(w) = self
+            .pane_of(native)
+            .and_then(|p| self.panes.get(&p))
+            .map(|p| p.window)
+        else {
+            return out;
+        };
+        let line = match name.map(command::quote).filter(|q| q != "''") {
+            Some(q) => format!("rename-window -t @{w} {q}"),
+            None => format!("set-option -w -t @{w} automatic-rename on"),
+        };
+        self.send(&line, Tag::Ignore, &mut out);
+        out
+    }
+
     /// Leaves tmux running and the gateway at its shell.
     pub fn detach(&mut self) -> Vec<Action> {
         let mut out = Vec::new();
@@ -1730,6 +1752,7 @@ mod tests {
             font: Some("Consolas".into()),
             size: Some(if n == n9 { 16.0 } else { 10.0 }),
             theme: None,
+            name: None,
         };
         let w = writes(&t.sync_saved(&ws, &look));
         assert_eq!(
@@ -1743,6 +1766,21 @@ mod tests {
             t.sync_saved(&ws, &look).is_empty(),
             "unchanged: not sent again"
         );
+        // A named session renames its window and is saved with its look.
+        assert_eq!(
+            writes(&t.rename(n9, Some("it's db"))),
+            ["rename-window -t @4 'its db'"]
+        );
+        let named = |n: Native| Look {
+            name: (n == n9).then(|| "db".to_owned()),
+            ..look(n)
+        };
+        assert!(writes(&t.sync_saved(&ws, &named))[0].ends_with("look=@4,Consolas,16,,db'"));
+        assert_eq!(
+            writes(&t.rename(n9, None)),
+            ["set-option -w -t @4 automatic-rename on"]
+        );
+        assert!(t.rename(999, Some("x")).is_empty());
         // Closing a pane kills its window; tmux then says so.
         assert_eq!(writes(&t.close(n9)), ["kill-window -t @4"]);
         let a = t.feed(&mut ws, b"%window-close @4\n");
