@@ -101,7 +101,7 @@ use crate::clipboard;
 use crate::conpty::{self, Output, Shell};
 use crate::credman;
 use crate::desktop::{Desktop, Protocol, Update as DesktopUpdate};
-use crate::files::{FilesAction, FilesView, Follow};
+use crate::files::{Divider, FilesAction, FilesView, Follow};
 use crate::forwards::{
     ConnView, DesktopEvent, Forwarder, FwdView, Setup as ForwardSetup, desktop_port_for,
 };
@@ -621,6 +621,14 @@ enum Drag {
     },
     /// The side pane's edge.
     SideEdge,
+    /// A section's title bar in the file transfer view, pressed at grid
+    /// cell `at`. Released where it was pressed, it is a click.
+    FilesBar {
+        which: Divider,
+        at: (usize, usize),
+        double: bool,
+        moved: bool,
+    },
     /// A tab in the strip. Dragged below the strip (`out`), the window
     /// shows the tab with pane `home` instead, and dropping on one of its
     /// panes merges the dragged tab in there.
@@ -8064,7 +8072,8 @@ impl Window {
                 | Drag::SideEdge => IDC_SIZEWE,
                 Drag::Divider {
                     axis: Axis::Column, ..
-                } => IDC_SIZENS,
+                }
+                | Drag::FilesBar { .. } => IDC_SIZENS,
                 Drag::Pane { active: true, .. } | Drag::Tab { out: true, .. } => IDC_SIZEALL,
                 Drag::Pane { .. } => IDC_IBEAM,
                 Drag::Tab { .. } => IDC_ARROW,
@@ -8072,11 +8081,32 @@ impl Window {
         }
         match self.spot(x, y) {
             Spot::SideEdge => IDC_SIZEWE,
+            Spot::Side(_, row) if self.files_bar_at(row).is_some() => IDC_SIZENS,
             Spot::Divider(d) if d.axis == Axis::Row => IDC_SIZEWE,
             Spot::Divider(_) => IDC_SIZENS,
             Spot::Pane(_) => IDC_IBEAM,
             _ => IDC_ARROW,
         }
+    }
+
+    /// The section title bar of the file transfer view on side pane grid
+    /// row `row`, if the side pane shows that view and one is there.
+    fn files_bar_at(&self, row: usize) -> Option<Divider> {
+        if !self.side.visible || self.side.view != SideView::Files {
+            return None;
+        }
+        let remote = self.files_key.as_ref().and_then(|k| self.sftp.get(k));
+        self.files.divider_at(remote, row, self.side.grid.rows())
+    }
+
+    /// The side pane grid row at client y, above or below the pane
+    /// included (clamped to its first row, or past its last).
+    fn side_row(&self, y: i32) -> usize {
+        let Some(s) = self.areas.side else {
+            return 0;
+        };
+        let cpad = scale(CHROME_PADDING_DIP, self.dpi);
+        ((y - s.y - cpad).max(0) / self.chrome_metrics.height.max(1) as i32) as usize
     }
 
     /// The viewport cell under a client-area point in pane `id`, and
@@ -8192,6 +8222,18 @@ impl Window {
                     return None;
                 }
                 if self.side.view == SideView::Files {
+                    if let Some(which) = self.files_bar_at(row) {
+                        // A title bar: a drag moves it, a click is a click.
+                        self.capture(true);
+                        self.drag = Some(Drag::FilesBar {
+                            which,
+                            at: (col, row),
+                            double,
+                            moved: false,
+                        });
+                        self.refresh_chrome();
+                        return None;
+                    }
                     let rows = self.side.grid.rows();
                     let downloads = self.download_dir();
                     let remote = self.files_key.as_ref().and_then(|k| self.sftp.get_mut(k));
@@ -8296,6 +8338,24 @@ impl Window {
 
     /// Finishes a drag.
     fn end_drag(&mut self, drag: Drag, (x, y): (i32, i32)) -> Option<Command> {
+        if let Drag::FilesBar {
+            at: (col, row),
+            double,
+            moved,
+            ..
+        } = drag
+        {
+            if moved || self.side.view != SideView::Files {
+                self.refresh_chrome();
+                return None;
+            }
+            // Not moved: a click on the title (Local PC's picks a folder).
+            let rows = self.side.grid.rows();
+            let downloads = self.download_dir();
+            let remote = self.files_key.as_ref().and_then(|k| self.sftp.get_mut(k));
+            let action = self.files.click(remote, col, row, double, &downloads, rows);
+            return self.files_action(action);
+        }
         if let Drag::Tab {
             index, out: true, ..
         } = drag
@@ -8361,6 +8421,23 @@ impl Window {
     fn on_mouse_move(&mut self, (x, y): (i32, i32), mods: Mods) {
         self.mouse.at = (x, y);
         let hover = self.strip_tab_at(x);
+        let side_row = self.side_row(y);
+        if let Some(Drag::FilesBar {
+            which, at, moved, ..
+        }) = &mut self.drag
+        {
+            // Moved once it leaves the row it was pressed on.
+            *moved |= side_row != at.1;
+            if !*moved {
+                return;
+            }
+            let which = *which;
+            let rows = self.side.grid.rows();
+            let remote = self.files_key.as_ref().and_then(|k| self.sftp.get(k));
+            self.files.drag_divider(remote, which, side_row, rows);
+            self.refresh_chrome();
+            return;
+        }
         if let Some(drag) = &mut self.drag {
             match drag {
                 Drag::Divider { path, axis, span } => {
@@ -8375,6 +8452,7 @@ impl Window {
                     }
                     self.layout();
                 }
+                Drag::FilesBar { .. } => {}
                 Drag::SideEdge => {
                     let (w, _) = self.client;
                     self.side.width = if self.settings.side_pane_right {
