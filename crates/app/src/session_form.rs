@@ -61,6 +61,9 @@ pub struct Values {
     pub font: String,
     pub font_size: String,
     pub scrollback: String,
+    /// Attach tmux after each login.
+    pub tmux_on: bool,
+    /// The tmux session to attach to; empty is `main`.
     pub tmux: String,
     /// Empty, `ferossh` or `tmux`.
     pub tmux_layout: String,
@@ -172,7 +175,12 @@ impl Values {
         self.font = p.font.clone().unwrap_or_default();
         self.font_size = opt_text(&p.font_size);
         self.scrollback = opt_text(&p.scrollback);
-        self.tmux = p.tmux.clone().unwrap_or_default();
+        self.tmux_on = p.tmux.is_some();
+        self.tmux = p
+            .tmux
+            .clone()
+            .filter(|t| t != DEFAULT_TMUX)
+            .unwrap_or_default();
         self.tmux_layout = p.tmux_layout.clone().unwrap_or_default();
         self.start_dir = p.start_dir.clone().unwrap_or_default();
         self.desktop_port = opt_text(&p.desktop_port);
@@ -205,6 +213,7 @@ enum Field {
     FontSize,
     Scrollback,
     Tmux,
+    TmuxSession,
     TmuxLayout,
     StartDir,
     Forward(usize),
@@ -236,6 +245,7 @@ impl Field {
             Field::FontSize => "Font size",
             Field::Scrollback => "Scrollback",
             Field::Tmux => "tmux",
+            Field::TmuxSession => "tmux name",
             Field::TmuxLayout => "tmux panes",
             Field::StartDir => "Start dir",
             Field::Forward(_) => "Forward",
@@ -257,6 +267,7 @@ impl Field {
             self,
             Field::Type
                 | Field::Theme
+                | Field::Tmux
                 | Field::TmuxLayout
                 | Field::Legacy
                 | Field::Password
@@ -265,6 +276,10 @@ impl Field {
         )
     }
 }
+
+/// The tmux session attached to when none is named, as Session > Attach
+/// tmux does.
+const DEFAULT_TMUX: &str = "main";
 
 const SECTIONS: [&str; 3] = ["Connection", "Look", "Extras"];
 const BUTTONS: [&str; 4] = ["Save", "Connect", "Cancel", "Delete"];
@@ -461,6 +476,9 @@ impl SessionForm {
             out.push(Item::Section(2));
             if self.open[2] {
                 out.push(Item::Field(Field::Tmux));
+                if self.values.tmux_on {
+                    out.push(Item::Field(Field::TmuxSession));
+                }
                 out.push(Item::Field(Field::TmuxLayout));
                 out.push(Item::Field(Field::StartDir));
                 let n = self.values.forwards.len();
@@ -539,7 +557,7 @@ impl SessionForm {
             Field::Font => &v.font,
             Field::FontSize => &v.font_size,
             Field::Scrollback => &v.scrollback,
-            Field::Tmux => &v.tmux,
+            Field::TmuxSession => &v.tmux,
             Field::StartDir => &v.start_dir,
             Field::Forward(i) => return v.forwards.get(i),
             Field::LoginStep(i) => return v.login_script.get(i),
@@ -549,6 +567,7 @@ impl SessionForm {
             Field::Speed => &v.speed,
             Field::Type
             | Field::Theme
+            | Field::Tmux
             | Field::TmuxLayout
             | Field::Legacy
             | Field::Password
@@ -573,7 +592,7 @@ impl SessionForm {
             Field::Font => &mut v.font,
             Field::FontSize => &mut v.font_size,
             Field::Scrollback => &mut v.scrollback,
-            Field::Tmux => &mut v.tmux,
+            Field::TmuxSession => &mut v.tmux,
             Field::StartDir => &mut v.start_dir,
             Field::Forward(i) => return v.forwards.get_mut(i),
             Field::LoginStep(i) => return v.login_script.get_mut(i),
@@ -583,6 +602,7 @@ impl SessionForm {
             Field::Speed => &mut v.speed,
             Field::Type
             | Field::Theme
+            | Field::Tmux
             | Field::TmuxLayout
             | Field::Legacy
             | Field::Password
@@ -610,6 +630,12 @@ impl SessionForm {
             Field::Flow => v.flow.label().to_owned(),
             Field::Theme if v.theme.is_empty() => "by theme rules".to_owned(),
             Field::Theme => v.theme.clone(),
+            Field::Tmux => if v.tmux_on {
+                "on: attach after login"
+            } else {
+                "off"
+            }
+            .to_owned(),
             Field::TmuxLayout => match v.tmux_layout.as_str() {
                 "tmux" => "tmux's own splits",
                 _ => "one window per pane",
@@ -687,6 +713,7 @@ impl SessionForm {
                 };
             }
             Field::Legacy => v.legacy = !v.legacy,
+            Field::Tmux => v.tmux_on = !v.tmux_on,
             Field::Password => {
                 v.password = step(v.password, PASSWORD_CUSTOM + 1);
                 // A template fills in its command; a command of one's own
@@ -737,7 +764,7 @@ impl SessionForm {
             Field::Font => h.font.clone(),
             Field::FontSize => format!("{}", h.font_size),
             Field::Scrollback => h.scrollback.to_string(),
-            Field::Tmux => "off, or a session name".into(),
+            Field::TmuxSession => DEFAULT_TMUX.into(),
             Field::StartDir => "home folder, or e.g. /srv/www".into(),
             Field::Forward(_) => "e.g. L 8080 web:80".into(),
             Field::LoginStep(0) => "e.g. expect Password:".into(),
@@ -747,6 +774,7 @@ impl SessionForm {
             Field::PasswordCommand => "program and arguments".into(),
             Field::Type
             | Field::Theme
+            | Field::Tmux
             | Field::TmuxLayout
             | Field::Legacy
             | Field::Password
@@ -891,11 +919,12 @@ impl SessionForm {
             return Err("The font size goes from 4 to 96.".into());
         }
         number::<usize>(&v.scrollback, "Scrollback")?;
-        if !v
-            .tmux
-            .trim()
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.'))
+        if v.tmux_on
+            && !v
+                .tmux
+                .trim()
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.'))
         {
             return Err("tmux session names use letters, digits, . _ and - only.".into());
         }
@@ -1360,7 +1389,13 @@ impl SessionForm {
         p.font = trimmed(&v.font);
         p.font_size = v.font_size.trim().parse().ok();
         p.scrollback = v.scrollback.trim().parse().ok();
-        p.tmux = trimmed(&v.tmux).filter(|t| !ferossh_config::settings::tmux_off(t));
+        p.tmux = v.tmux_on.then(|| {
+            trimmed(&v.tmux)
+                .filter(|t| {
+                    !ferossh_config::settings::tmux_off(t) && !ferossh_config::settings::tmux_on(t)
+                })
+                .unwrap_or_else(|| DEFAULT_TMUX.to_owned())
+        });
         p.start_dir = ferossh_config::settings::start_dir(&v.start_dir);
         p.tmux_layout = trimmed(&v.tmux_layout);
         p.desktop_port = v.desktop_port.trim().parse().ok().filter(|&p| p != 0);
@@ -1622,7 +1657,7 @@ mod tests {
             (Field::Port, "0", "1 to 65535"),
             (Field::Forward(0), "L 8080", "Forward 1"),
             (Field::FontSize, "200", "4 to 96"),
-            (Field::Tmux, "a;b", "tmux"),
+            (Field::TmuxSession, "a;b", "tmux"),
             (Field::StartDir, "/srv/\"x\"", "start directory"),
             (Field::Jump, "gw host", "Jump host"),
             (Field::Jump, "gw,ok", "not this one"),
@@ -1630,6 +1665,7 @@ mod tests {
             f.values = Values {
                 name: "ok".into(),
                 forwards: vec![String::new()],
+                tmux_on: true,
                 ..Values::default()
             };
             *f.text_mut(field).unwrap() = value.into();
@@ -1848,8 +1884,68 @@ mod tests {
         assert_eq!(p.start_dir.as_deref(), Some("/srv/my site"));
         let again = Settings::parse(&settings.to_text());
         let back = Values::default().with_profile(again.profile("debian2"));
+        assert!(!back.tmux_on);
         assert_eq!(back.tmux, "");
         assert_eq!(back.start_dir, "/srv/my site");
+
+        // On with no name, or a name of on or off, is session main.
+        for name in ["", "on", "off", " ON "] {
+            f.values.tmux_on = true;
+            f.values.tmux = name.into();
+            assert_eq!(f.check(), Ok(()), "{name}");
+            f.apply(&mut hosts, &mut settings);
+            let p = settings.profile("debian2").unwrap();
+            assert_eq!(p.tmux.as_deref(), Some("main"), "{name:?}");
+        }
+        f.values.tmux = "work".into();
+        f.apply(&mut hosts, &mut settings);
+        assert_eq!(
+            settings.profile("debian2").unwrap().tmux.as_deref(),
+            Some("work")
+        );
+        let back = Values::default().with_profile(settings.profile("debian2"));
+        assert!(back.tmux_on);
+        assert_eq!(back.tmux, "work");
+        // Turned off, the name goes.
+        f.values.tmux_on = false;
+        f.apply(&mut hosts, &mut settings);
+        assert_eq!(settings.profile("debian2").unwrap().tmux, None);
+    }
+
+    #[test]
+    fn tmux_is_switched_on_and_off_not_typed() {
+        let mut f = new_form();
+        typed(&mut f, "web2");
+        // Open Extras: Name, Folder, Type, Host, User, Port, Key, Browse,
+        // Password, Jump host, Look, Extras.
+        down(&mut f, 11);
+        f.key(SideKey::Enter { split: false }, 30);
+        f.key(SideKey::Down, 30);
+        assert_eq!(f.focused_field(), Some(Field::Tmux));
+        typed(&mut f, "off");
+        assert!(!f.values.tmux_on, "typing does not change a switch");
+        assert!(f.values.tmux.is_empty());
+        f.key(SideKey::Right, 30);
+        assert!(f.values.tmux_on);
+        let t = texts(&mut f);
+        assert!(
+            t.iter().any(|l| l.contains("on: attach after login")),
+            "{t:#?}"
+        );
+        assert!(
+            t.iter()
+                .any(|l| l.contains("tmux name") && l.contains("main")),
+            "{t:#?}"
+        );
+        f.key(SideKey::Down, 30);
+        assert_eq!(f.focused_field(), Some(Field::TmuxSession));
+        typed(&mut f, "work");
+        assert_eq!(f.values.tmux, "work");
+        f.key(SideKey::Up, 30);
+        f.key(SideKey::Left, 30);
+        assert!(!f.values.tmux_on);
+        let t = texts(&mut f);
+        assert!(!t.iter().any(|l| l.contains("tmux name")), "{t:#?}");
     }
 
     #[test]
