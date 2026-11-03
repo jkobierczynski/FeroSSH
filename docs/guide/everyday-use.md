@@ -167,6 +167,10 @@ Ctrl+Shift+E shows the focused pane's host over SFTP in the side pane, on the sa
 
 **Local PC.** Tab moves to the Local PC section under the listing: the folder on your PC that downloads go to. Enter opens a folder (above a drive comes the list of drives) or uploads a file, U uploads the selected file or folder, and B, or a click on the section's title, picks another folder. FeroSSH remembers it (`DownloadFolder`); until you pick one it is your Downloads folder. File > Open download folder opens it in Explorer.
 
+**Search.** / searches the listing, or the Local PC section, by name: type part of a name (any case) or a pattern such as `*.log`, and only matching files and folders are listed. Enter stops typing and keeps the search, Escape clears it, and opening another folder ends it.
+
+**Section heights.** Drag the title bar of the Local PC section or of the transfer queue up or down to make that section taller or shorter.
+
 **Queue.** Tab again moves to the transfer queue: Space pauses or resumes, R retries, X cancels and C clears finished transfers. Three files move at once (`ParallelTransfers`). A dropped connection pauses the queue, and it carries on from where each file stopped when you log in again.
 
 **Safe file names.** An existing file is never overwritten without asking (Overwrite, Skip or Keep both, Shift for all). Server names Windows cannot hold (`CON`, `a:b`, trailing dots) are made safe or refused, and a folder download does not follow links out of the folder. Partial files are `.part` locally and `.filepart` on the server until complete. Session > Verify transfers compares SHA-256 sums on both ends after each file.
