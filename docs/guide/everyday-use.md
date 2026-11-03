@@ -47,7 +47,7 @@ Insert, or "+ New connection" at the top, opens the connection form in the side 
 - **Name, Folder, Type**: the type is an SSH terminal, Telnet (unencrypted), Serial console, Remote desktop (RDP) or VNC desktop.
 - **Host, User, Port, Key file** (with Browse...), the **Password** source (below) and the **Jump host** (see [Jump hosts](#jump-hosts)). A serial console has the port, speed, framing and flow control instead.
 - **Look**: theme, font, font size and scrollback.
-- **Extras**: the tmux session to attach and its layout, port forwards (such as `L 8080 localhost:80`), RDP and VNC ports, older crypto, and the login script (see [Login scripts](#login-scripts)).
+- **Extras**: tmux on or off, the tmux session to attach and its layout, the start directory, port forwards (such as `L 8080 localhost:80`), RDP and VNC ports, older crypto, and the login script (see [Login scripts](#login-scripts)).
 
 Empty fields show their default in grey. Enter saves, Shift+Enter saves and connects, Esc cancels. Connections go to `%APPDATA%\FeroSSH\sessions.conf` in ssh_config syntax and their look to `ferossh.conf`. Hosts from `~/.ssh/config` and imports show their connection settings read-only, because FeroSSH never writes those files; their look and extras can still change, and giving one a new name saves an editable copy.
 
@@ -214,7 +214,7 @@ There are two layouts, kept per session:
 - **One window per pane** (the default; tmux 3.3 or later): every native pane is its own tmux window, so each pane can have its own font, text size and theme. FeroSSH keeps the splits and looks in the session. A plain tmux client shows the panes as separate windows.
 - **tmux's own splits** (untick Session > tmux: one window per pane, or older tmux): each tmux window is a tab and tmux's splits are its panes, one font per window.
 
-tmux is never started unless you ask. To attach on every login to a host, set `Tmux` (and optionally `TmuxLayout`) in its profile or in the connection form's Extras; leave the field empty, or type `off`, for no tmux. GNU screen has no control mode and runs as an ordinary terminal.
+tmux is never started unless you ask. To attach on every login to a host, set `Tmux` (and optionally `TmuxLayout`) in its profile, or switch tmux on in the connection form's Extras (click it, or press Left or Right) and optionally give a tmux name (`main` when left empty). GNU screen has no control mode and runs as an ordinary terminal.
 
 To have new tabs and panes on a host start in one server directory, `cd` there and use Session > Start new tabs and panes in this directory (or fill in Start dir in the connection form's Extras). It applies to new tmux windows and panes, to new plain SSH tabs and panes (FeroSSH types the `cd` after login) and to the first window of a new tmux session. Clear Start dir in the form to go back to the home folder.
 

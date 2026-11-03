@@ -71,7 +71,7 @@ Profile web1
 | `FontSize N` | Text size in points. |
 | `Theme NAME` | Colour theme, for example `Nord`, `Dracula` or `Production`. |
 | `Scrollback N` | Lines of scrollback for this host's panes. |
-| `Tmux SESSION` | Attaches to this tmux session after every login. `off`, `no` or `none` (or leaving it out) means no tmux. |
+| `Tmux SESSION` | Attaches to this tmux session after every login. `off`, `no` or `none` (or leaving it out) means no tmux; `on`, `yes` or `true` attaches to `main`. |
 | `StartDir PATH` | The server directory new shells, tabs and panes on this host start in: FeroSSH types `cd` after each login (before tmux attaches) and gives new tmux windows and panes `-c`. Session > Start new tabs and panes in this directory sets it from the focused pane. |
 | `TmuxLayout ferossh` or `tmux` | `ferossh` (the default) makes each native pane its own tmux window, so each can have its own font; `tmux` uses tmux's own splits. |
 | `AutoReconnect no` or `yes` | Overrides the global `AutoReconnect` for this host, for example to keep a production host from logging in again by itself. |
