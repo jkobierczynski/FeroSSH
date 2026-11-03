@@ -178,9 +178,15 @@ In the remote listing:
 | F | Turns following the shell's `cd` off or on. |
 | O | Opens the download folder in Explorer. |
 | B | Picks another local folder for downloads. |
+| / | Searches the listing by name (see below). |
+| Escape | Clears the search; with none, gives the keyboard back to the terminal. |
 | Tab | Moves to the Local PC section. |
 
-In the Local PC section, Enter opens a folder or uploads a file, Left or Backspace goes up (above a drive comes the list of drives), U uploads the selected file or folder, B picks another folder and F5 refreshes. Tab moves on to the transfer queue, where Space or P pauses and resumes, R retries a failed or cancelled transfer, X cancels and C clears the finished ones. When a file already exists, O overwrites, S skips and K keeps both (Shift for all).
+While typing a search, letters go into it and the listing shows only the names that contain them, in any case; with `*` or `?` the whole name must match the pattern (`*.log`). Up and Down still move the selection, Enter stops typing and keeps the search, Backspace deletes a letter and Escape clears it. Opening another folder ends the search.
+
+In the Local PC section, Enter opens a folder or uploads a file, Left or Backspace goes up (above a drive comes the list of drives), U uploads the selected file or folder, / searches it by name as above, B picks another folder and F5 refreshes. Tab moves on to the transfer queue, where Space or P pauses and resumes, R retries a failed or cancelled transfer, X cancels and C clears the finished ones. When a file already exists, O overwrites, S skips and K keeps both (Shift for all).
+
+Drag the title bar of the Local PC section or of the transfer queue up or down to give that section more or fewer rows. The heights stay for every host until FeroSSH closes.
 
 ### Port forwards (Ctrl+Shift+P)
 

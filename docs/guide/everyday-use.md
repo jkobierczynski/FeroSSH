@@ -47,7 +47,7 @@ Insert, or "+ New connection" at the top, opens the connection form in the side 
 - **Name, Folder, Type**: the type is an SSH terminal, Telnet (unencrypted), Serial console, Remote desktop (RDP) or VNC desktop.
 - **Host, User, Port, Key file** (with Browse...), the **Password** source (below) and the **Jump host** (see [Jump hosts](#jump-hosts)). A serial console has the port, speed, framing and flow control instead.
 - **Look**: theme, font, font size and scrollback.
-- **Extras**: the tmux session to attach and its layout, port forwards (such as `L 8080 localhost:80`), RDP and VNC ports, older crypto, and the login script (see [Login scripts](#login-scripts)).
+- **Extras**: tmux on or off, the tmux session to attach and its layout, the start directory, port forwards (such as `L 8080 localhost:80`), RDP and VNC ports, older crypto, and the login script (see [Login scripts](#login-scripts)).
 
 Empty fields show their default in grey. Enter saves, Shift+Enter saves and connects, Esc cancels. Connections go to `%APPDATA%\FeroSSH\sessions.conf` in ssh_config syntax and their look to `ferossh.conf`. Hosts from `~/.ssh/config` and imports show their connection settings read-only, because FeroSSH never writes those files; their look and extras can still change, and giving one a new name saves an editable copy.
 
@@ -167,6 +167,10 @@ Ctrl+Shift+E shows the focused pane's host over SFTP in the side pane, on the sa
 
 **Local PC.** Tab moves to the Local PC section under the listing: the folder on your PC that downloads go to. Enter opens a folder (above a drive comes the list of drives) or uploads a file, U uploads the selected file or folder, and B, or a click on the section's title, picks another folder. FeroSSH remembers it (`DownloadFolder`); until you pick one it is your Downloads folder. File > Open download folder opens it in Explorer.
 
+**Search.** / searches the listing, or the Local PC section, by name: type part of a name (any case) or a pattern such as `*.log`, and only matching files and folders are listed. Enter stops typing and keeps the search, Escape clears it, and opening another folder ends it.
+
+**Section heights.** Drag the title bar of the Local PC section or of the transfer queue up or down to make that section taller or shorter.
+
 **Queue.** Tab again moves to the transfer queue: Space pauses or resumes, R retries, X cancels and C clears finished transfers. Three files move at once (`ParallelTransfers`). A dropped connection pauses the queue, and it carries on from where each file stopped when you log in again.
 
 **Safe file names.** An existing file is never overwritten without asking (Overwrite, Skip or Keep both, Shift for all). Server names Windows cannot hold (`CON`, `a:b`, trailing dots) are made safe or refused, and a folder download does not follow links out of the folder. Partial files are `.part` locally and `.filepart` on the server until complete. Session > Verify transfers compares SHA-256 sums on both ends after each file.
@@ -210,7 +214,7 @@ There are two layouts, kept per session:
 - **One window per pane** (the default; tmux 3.3 or later): every native pane is its own tmux window, so each pane can have its own font, text size and theme. FeroSSH keeps the splits and looks in the session. A plain tmux client shows the panes as separate windows.
 - **tmux's own splits** (untick Session > tmux: one window per pane, or older tmux): each tmux window is a tab and tmux's splits are its panes, one font per window.
 
-tmux is never started unless you ask. To attach on every login to a host, set `Tmux` (and optionally `TmuxLayout`) in its profile or in the connection form's Extras; leave the field empty, or type `off`, for no tmux. GNU screen has no control mode and runs as an ordinary terminal.
+tmux is never started unless you ask. To attach on every login to a host, set `Tmux` (and optionally `TmuxLayout`) in its profile, or switch tmux on in the connection form's Extras (click it, or press Left or Right) and optionally give a tmux name (`main` when left empty). GNU screen has no control mode and runs as an ordinary terminal.
 
 To have new tabs and panes on a host start in one server directory, `cd` there and use Session > Start new tabs and panes in this directory (or fill in Start dir in the connection form's Extras). It applies to new tmux windows and panes, to new plain SSH tabs and panes (FeroSSH types the `cd` after login) and to the first window of a new tmux session. Clear Start dir in the form to go back to the home folder.
 

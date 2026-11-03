@@ -170,6 +170,14 @@ pub fn tmux_off(name: &str) -> bool {
         .any(|w| name.trim().eq_ignore_ascii_case(w))
 }
 
+/// A `Tmux` value that means tmux on, attached to `main` (what Session >
+/// Attach tmux uses), not a session of that name.
+pub fn tmux_on(name: &str) -> bool {
+    ["on", "yes", "true"]
+        .iter()
+        .any(|w| name.trim().eq_ignore_ascii_case(w))
+}
+
 /// A `StartDir` value as kept: trimmed, `None` when empty or holding
 /// control characters, which must never be typed at a shell.
 pub fn start_dir(dir: &str) -> Option<String> {
@@ -523,7 +531,9 @@ impl Settings {
                             }
                             "theme" => p.theme = Some(joined).filter(|t| !t.is_empty()),
                             "tmux" => {
-                                p.tmux = first.filter(|t| !tmux_off(t));
+                                p.tmux = first
+                                    .filter(|t| !tmux_off(t))
+                                    .map(|t| if tmux_on(&t) { "main".to_owned() } else { t });
                             }
                             "legacyalgorithms" => {
                                 p.legacy_algorithms =
@@ -928,6 +938,7 @@ AutoResponses no
 RunParallel 40
 Profile router
     Type Telnet
+    Tmux On
 Profile debian2
     Tmux OFF
     Theme Monokai
@@ -983,6 +994,11 @@ NewKeyword later
         assert_eq!(big.tmux_layout, None);
         assert_eq!(big.start_dir, None);
         assert_eq!(web.start_dir.as_deref(), Some("/srv/my site"));
+        assert_eq!(
+            s.profile("router").unwrap().tmux.as_deref(),
+            Some("main"),
+            "on is tmux on, not a session named on"
+        );
         let debian = s.profile("debian2").unwrap();
         assert_eq!(debian.tmux, None, "off is no tmux, not a session named off");
         assert_eq!(debian.start_dir, None);
