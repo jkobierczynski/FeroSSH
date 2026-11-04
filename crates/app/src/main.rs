@@ -104,6 +104,8 @@ mod tmux_e2e;
 mod tmux_keys;
 #[cfg(windows)]
 mod update;
+#[cfg_attr(not(windows), allow(dead_code))]
+mod vdesk;
 #[cfg(windows)]
 mod win;
 #[cfg_attr(not(windows), allow(dead_code))]

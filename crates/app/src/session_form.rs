@@ -73,6 +73,8 @@ pub struct Values {
     pub forwards: Vec<String>,
     pub desktop_port: String,
     pub vnc_port: String,
+    /// What Open virtual desktop runs; empty picks a desktop session.
+    pub virtual_desktop: String,
     pub legacy: bool,
     /// Where the password comes from: see [`PASSWORD_CHOICES`].
     pub password: usize,
@@ -185,6 +187,7 @@ impl Values {
         self.start_dir = p.start_dir.clone().unwrap_or_default();
         self.desktop_port = opt_text(&p.desktop_port);
         self.vnc_port = opt_text(&p.vnc_port);
+        self.virtual_desktop = p.virtual_desktop.clone().unwrap_or_default();
         self.legacy = p.legacy_algorithms;
         (self.password, self.password_command) = password_choice(&p.password);
         self.login_script = p.login_script.iter().map(ToString::to_string).collect();
@@ -219,6 +222,7 @@ enum Field {
     Forward(usize),
     DesktopPort,
     VncPort,
+    VirtualDesktop,
     Legacy,
     Password,
     PasswordCommand,
@@ -251,6 +255,7 @@ impl Field {
             Field::Forward(_) => "Forward",
             Field::DesktopPort => "RDP port",
             Field::VncPort => "VNC port",
+            Field::VirtualDesktop => "Virtual desk",
             Field::Legacy => "Old crypto",
             Field::Password => "Password",
             Field::PasswordCommand => "Command",
@@ -489,7 +494,15 @@ impl SessionForm {
                         out.push(Item::Field(Field::Forward(i)));
                     }
                 }
-                out.extend([Field::DesktopPort, Field::VncPort, Field::Legacy].map(Item::Field));
+                out.extend(
+                    [
+                        Field::DesktopPort,
+                        Field::VncPort,
+                        Field::VirtualDesktop,
+                        Field::Legacy,
+                    ]
+                    .map(Item::Field),
+                );
             }
         }
         if matches!(
@@ -563,6 +576,7 @@ impl SessionForm {
             Field::LoginStep(i) => return v.login_script.get(i),
             Field::DesktopPort => &v.desktop_port,
             Field::VncPort => &v.vnc_port,
+            Field::VirtualDesktop => &v.virtual_desktop,
             Field::PasswordCommand => &v.password_command,
             Field::Speed => &v.speed,
             Field::Type
@@ -598,6 +612,7 @@ impl SessionForm {
             Field::LoginStep(i) => return v.login_script.get_mut(i),
             Field::DesktopPort => &mut v.desktop_port,
             Field::VncPort => &mut v.vnc_port,
+            Field::VirtualDesktop => &mut v.virtual_desktop,
             Field::PasswordCommand => &mut v.password_command,
             Field::Speed => &mut v.speed,
             Field::Type
@@ -771,6 +786,7 @@ impl SessionForm {
             Field::LoginStep(_) => "next step".into(),
             Field::DesktopPort => "3389".into(),
             Field::VncPort => "5900".into(),
+            Field::VirtualDesktop => "a desktop session, or e.g. firefox".into(),
             Field::PasswordCommand => "program and arguments".into(),
             Field::Type
             | Field::Theme
@@ -943,6 +959,9 @@ impl SessionForm {
         }
         port(&v.desktop_port, "The RDP port")?;
         port(&v.vnc_port, "The VNC port")?;
+        if v.virtual_desktop.chars().any(char::is_control) {
+            return Err("The virtual desktop program cannot hold control characters.".into());
+        }
         if v.kind == SessionKind::Ssh
             && v.password > PASSWORD_WINDOWS
             && v.password_command.trim().is_empty()
@@ -1400,6 +1419,7 @@ impl SessionForm {
         p.tmux_layout = trimmed(&v.tmux_layout);
         p.desktop_port = v.desktop_port.trim().parse().ok().filter(|&p| p != 0);
         p.vnc_port = v.vnc_port.trim().parse().ok().filter(|&p| p != 0);
+        p.virtual_desktop = ferossh_config::settings::virtual_desktop(&v.virtual_desktop);
         p.legacy_algorithms = v.legacy;
         p.password = match (v.kind, v.password) {
             (SessionKind::Ssh, PASSWORD_WINDOWS) => PasswordSource::Windows,
@@ -1659,6 +1679,7 @@ mod tests {
             (Field::FontSize, "200", "4 to 96"),
             (Field::TmuxSession, "a;b", "tmux"),
             (Field::StartDir, "/srv/\"x\"", "start directory"),
+            (Field::VirtualDesktop, "xterm\u{7}", "virtual desktop"),
             (Field::Jump, "gw host", "Jump host"),
             (Field::Jump, "gw,ok", "not this one"),
         ] {
@@ -1832,8 +1853,8 @@ mod tests {
         down(&mut f, 11);
         f.key(SideKey::Enter { split: false }, 30);
         // tmux, tmux panes, Start dir, Forward 1, RDP port, VNC port,
-        // Old crypto.
-        down(&mut f, 8);
+        // Virtual desk, Old crypto.
+        down(&mut f, 9);
         assert_eq!(f.focused_field(), Some(Field::LoginStep(0)));
         let t = texts(&mut f);
         assert!(

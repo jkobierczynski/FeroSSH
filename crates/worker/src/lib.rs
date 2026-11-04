@@ -12,6 +12,7 @@
 //! server on Linux.
 
 pub mod crypto_policy;
+mod exec;
 mod forward;
 mod session;
 mod sftp;
@@ -83,6 +84,21 @@ pub async fn serve(mut inbox: mpsc::Receiver<Message>, out: mpsc::Sender<Message
                 tokio::spawn(sftp::run(
                     channel,
                     connection,
+                    rx,
+                    out.clone(),
+                    connections.clone(),
+                ));
+            }
+            Message::Exec {
+                channel,
+                connection,
+                command,
+            } => {
+                let Some(rx) = session(channel) else { continue };
+                tokio::spawn(exec::run(
+                    channel,
+                    connection,
+                    command,
                     rx,
                     out.clone(),
                     connections.clone(),
