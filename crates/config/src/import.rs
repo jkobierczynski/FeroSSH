@@ -136,7 +136,7 @@ pub(crate) fn port(kind: SessionKind, port: Option<u32>) -> Option<u16> {
         SessionKind::Vnc => DEFAULT_VNC_PORT,
         SessionKind::Telnet => DEFAULT_TELNET_PORT,
         // Imports bring no serial sessions; a COM port has no port number.
-        SessionKind::Serial => return None,
+        SessionKind::Serial | SessionKind::Xvfb => return None,
     };
     port.and_then(|p| u16::try_from(p).ok())
         .filter(|&p| p != 0 && p != usual)

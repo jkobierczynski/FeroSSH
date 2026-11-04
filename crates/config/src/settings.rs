@@ -30,6 +30,7 @@
 //!     DesktopPort 3390
 //!     VncPort 5901
 //!     VirtualDesktop startxfce4
+//!     DesktopSize 1920x1080
 //! Profile office-pc
 //!     Type rdp
 //!     Via bastion
@@ -109,6 +110,9 @@ pub struct Profile {
     /// desktop session or a single program, as a shell command. Unset,
     /// it picks a desktop session the server has.
     pub virtual_desktop: Option<String>,
+    /// The size of this host's remote and virtual desktops: following
+    /// the pane (the default, when unset) or fixed.
+    pub desktop_size: Option<DesktopSize>,
     /// What the session opens: a shell (the default) or a desktop.
     pub kind: SessionKind,
     /// For a desktop session: the SSH host whose connection carries it.
@@ -142,6 +146,48 @@ pub enum SessionKind {
     /// A Telnet terminal, for old network gear and console servers:
     /// unencrypted, and shown as such.
     Telnet,
+    /// A virtual desktop (Xvfb or Xvnc) started on the `Via` SSH host.
+    Xvfb,
+}
+
+/// How big a desktop is: as big as its pane, following it as it changes
+/// where the server can, or a fixed size.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DesktopSize {
+    Follow,
+    Fixed(u16, u16),
+}
+
+impl DesktopSize {
+    /// `follow` (or `auto`, `window`) or `WIDTHxHEIGHT`, 320x200 to
+    /// 8192x8192.
+    pub fn parse(text: &str) -> Option<Self> {
+        let t = text.trim().to_ascii_lowercase();
+        if ["follow", "auto", "window", "pane"].contains(&t.as_str()) {
+            return Some(DesktopSize::Follow);
+        }
+        let (w, h) = t.split_once(['x', '*'])?;
+        let w: u16 = w.trim().parse().ok()?;
+        let h: u16 = h.trim().parse().ok()?;
+        ((320..=8192).contains(&w) && (200..=8192).contains(&h)).then_some(DesktopSize::Fixed(w, h))
+    }
+
+    /// The fixed size, `None` when it follows the pane.
+    pub fn fixed(self) -> Option<(u16, u16)> {
+        match self {
+            DesktopSize::Follow => None,
+            DesktopSize::Fixed(w, h) => Some((w, h)),
+        }
+    }
+}
+
+impl std::fmt::Display for DesktopSize {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            DesktopSize::Follow => f.write_str("follow"),
+            DesktopSize::Fixed(w, h) => write!(f, "{w}x{h}"),
+        }
+    }
 }
 
 impl SessionKind {
@@ -152,6 +198,7 @@ impl SessionKind {
             SessionKind::Vnc => "vnc",
             SessionKind::Serial => "serial",
             SessionKind::Telnet => "telnet",
+            SessionKind::Xvfb => "xvfb",
         }
     }
 
@@ -162,6 +209,7 @@ impl SessionKind {
             "vnc" => Some(SessionKind::Vnc),
             "serial" => Some(SessionKind::Serial),
             "telnet" => Some(SessionKind::Telnet),
+            "xvfb" | "virtual" => Some(SessionKind::Xvfb),
             _ => None,
         }
     }
@@ -218,6 +266,7 @@ impl Profile {
             && self.desktop_port.is_none()
             && self.vnc_port.is_none()
             && self.virtual_desktop.is_none()
+            && self.desktop_size.is_none()
             && self.kind == SessionKind::Ssh
             && self.via.is_none()
             && self.password == PasswordSource::Ask
@@ -599,6 +648,9 @@ impl Settings {
                                 }
                             }
                             "startdir" => p.start_dir = start_dir(&raw_rest(line)),
+                            "desktopsize" => {
+                                p.desktop_size = first.as_deref().and_then(DesktopSize::parse);
+                            }
                             "virtualdesktop" => {
                                 p.virtual_desktop = virtual_desktop(&raw_rest(line));
                             }
@@ -759,6 +811,9 @@ impl Settings {
             if let Some(c) = &p.virtual_desktop {
                 let _ = writeln!(out, "    VirtualDesktop {c}");
             }
+            if let Some(size) = p.desktop_size {
+                let _ = writeln!(out, "    DesktopSize {size}");
+            }
             if p.kind != SessionKind::Ssh {
                 let _ = writeln!(out, "    Type {}", p.kind.name());
             }
@@ -913,6 +968,7 @@ Profile web
     DesktopPort 3390
     VncPort 5901
     VirtualDesktop dbus-run-session  "startxfce4"  
+    DesktopSize 1280X720
     Type RDP
     Via jump-1
     PasswordCommand op read "op://Private/web 1/password"
@@ -994,6 +1050,13 @@ NewKeyword later
         assert_eq!(
             web.virtual_desktop.as_deref(),
             Some(r#"dbus-run-session  "startxfce4""#)
+        );
+        assert_eq!(web.desktop_size, Some(DesktopSize::Fixed(1280, 720)));
+        assert_eq!(DesktopSize::parse("Follow"), Some(DesktopSize::Follow));
+        assert_eq!(DesktopSize::parse("100x100"), None);
+        assert_eq!(
+            DesktopSize::parse("1920 x 1080"),
+            Some(DesktopSize::Fixed(1920, 1080))
         );
         assert_eq!(web.kind, SessionKind::Rdp);
         assert_eq!(web.via.as_deref(), Some("jump-1"));

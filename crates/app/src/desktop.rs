@@ -66,6 +66,8 @@ pub struct Session {
     /// The VNC password, when FeroSSH chose it (a virtual desktop's):
     /// given when the server asks, without a prompt.
     pub password: Option<Zeroizing<String>>,
+    /// Keep `width` x `height` rather than follow the pane's size.
+    pub fixed: bool,
 }
 
 /// One remote desktop session.
@@ -75,6 +77,8 @@ pub struct Desktop {
     user: String,
     /// The password to answer the server's first ask with.
     preset: Option<Zeroizing<String>>,
+    /// The size stays as asked for: pane changes only scale the picture.
+    fixed: bool,
     to_viewer: Sender<ToViewer>,
     from: Receiver<FromThreads>,
     tunnel: TcpStream,
@@ -210,6 +214,7 @@ impl Desktop {
             protocol: session.protocol,
             user: session.user,
             preset: session.password,
+            fixed: session.fixed,
             to_viewer: tx,
             from,
             tunnel,
@@ -460,7 +465,7 @@ impl Desktop {
     /// The pane is now `width` x `height` pixels: a server that can gives
     /// the desktop that size; the picture of one that cannot is scaled.
     pub fn resize(&mut self, width: u16, height: u16) {
-        if (width, height) != self.size && !matches!(self.phase, Phase::Ended) {
+        if !self.fixed && (width, height) != self.size && !matches!(self.phase, Phase::Ended) {
             self.size = (width, height);
             self.send(ToViewer::Resize { width, height });
         }
@@ -552,6 +557,7 @@ mod tests {
             layout: 0,
             user: String::new(),
             password: None,
+            fixed: false,
         };
         let mut d =
             Desktop::start(&addr, session, window_out, window_in, Box::new(()), || {}).unwrap();
@@ -612,6 +618,7 @@ mod tests {
             layout: 0,
             user: String::new(),
             password: Some(Zeroizing::new("pw".into())),
+            fixed: true,
         };
         let mut d =
             Desktop::start(&addr, session, window_out, window_in, Box::new(()), || {}).unwrap();

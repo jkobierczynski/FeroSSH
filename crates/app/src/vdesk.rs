@@ -27,50 +27,66 @@ const MARK: &str = "FEROSSH-VD ";
 /// joins the lines. Each line ends where a newline could be a space.
 const SCRIPT: &str = r#"umask 077;
 exec 3<&0;
-m=;
-for c in Xvfb x11vnc xauth; do command -v $c >/dev/null 2>&1 || m="$m $c"; done;
-if [ -n "$m" ]; then echo "FEROSSH-VD missing$m"; exit 3; fi;
 IFS= read -r pw || exit 4;
 IFS= read -r prog || exit 4;
 IFS= read -r size || exit 4;
+IFS= read -r mode || exit 4;
 case "$size" in *[0-9]x*[0-9]) ;; *) size=1600x900;; esac;
+have() { command -v $1 >/dev/null 2>&1; };
+b=;
+if [ "$mode" = follow ] && have Xvnc && have vncpasswd; then b=xvnc; elif have Xvfb && have x11vnc; then b=xvfb; elif have Xvnc && have vncpasswd; then b=xvnc; fi;
+m=;
+if [ -z "$b" ]; then for c in Xvfb x11vnc; do have $c || m="$m $c"; done; fi;
+have xauth || m="$m xauth";
+if [ -n "$m" ]; then echo "FEROSSH-VD missing$m"; exit 3; fi;
 d=$(mktemp -d "${TMPDIR:-/tmp}/ferossh-vd.XXXXXX") || { echo "FEROSSH-VD error mktemp failed"; exit 5; };
 x=; v=; a=; w=;
 stop() { [ -z "$w" ] || kill $w 2>/dev/null; [ -z "$v" ] || kill $v 2>/dev/null; if [ -n "$a" ]; then kill -s TERM -- -$a 2>/dev/null || kill $a 2>/dev/null; fi; [ -z "$x" ] || kill $x 2>/dev/null; rm -rf "$d"; };
 trap stop EXIT;
 trap "exit 1" HUP INT TERM PIPE;
+if [ "$b" = xvnc ]; then echo "$pw" | vncpasswd -f >"$d/vncpw" 2>/dev/null || { echo "FEROSSH-VD error vncpasswd failed"; exit 5; }; fi;
+r=0; [ "$mode" = follow ] && r=1;
 n=20;
 while [ $n -lt 100 ]; do
 if [ -e /tmp/.X$n-lock ] || [ -e /tmp/.X11-unix/X$n ]; then n=$((n+1)); continue; fi;
 k=$(od -An -N16 -tx1 /dev/urandom | tr -dc 0-9a-f);
 xauth -q -f "$d/auth" add :$n . $k >/dev/null 2>&1;
+if [ "$b" = xvnc ]; then
+Xvnc :$n -auth "$d/auth" -nolisten tcp -localhost -interface 127.0.0.1 -rfbport $((5900+n)) -SecurityTypes VncAuth -PasswordFile "$d/vncpw" -AcceptSetDesktopSize=$r -AlwaysShared -geometry $size -depth 24 </dev/null >"$d/xvfb.log" 2>&1 3<&- &
+else
 Xvfb :$n -auth "$d/auth" -nolisten tcp -screen 0 ${size}x24 </dev/null >"$d/xvfb.log" 2>&1 3<&- &
+fi;
 x=$!;
 i=0;
-while [ $i -lt 50 ]; do [ -e /tmp/.X11-unix/X$n ] && break; kill -0 $x 2>/dev/null || break; sleep 0.2; i=$((i+1)); done;
-if [ -e /tmp/.X11-unix/X$n ] && kill -0 $x 2>/dev/null; then break; fi;
+o() { [ -e /tmp/.X11-unix/X$n ] && [ "$(tr -dc 0-9 </tmp/.X$n-lock 2>/dev/null)" = "$x" ]; };
+while [ $i -lt 50 ]; do o && break; kill -0 $x 2>/dev/null || break; sleep 0.2; i=$((i+1)); done;
+if o && kill -0 $x 2>/dev/null; then break; fi;
 kill $x 2>/dev/null; x=; n=$((n+1));
 done;
-[ -n "$x" ] || { echo "FEROSSH-VD error Xvfb did not start: $(tail -n 2 "$d/xvfb.log" | tr -s "[:space:]" " ")"; exit 6; };
+[ -n "$x" ] || { echo "FEROSSH-VD error the X server did not start: $(tail -n 2 "$d/xvfb.log" | tr -s "[:space:]" " ")"; exit 6; };
 DISPLAY=:$n; XAUTHORITY="$d/auth"; export DISPLAY XAUTHORITY;
 unset WAYLAND_DISPLAY SESSION_MANAGER DBUS_SESSION_BUS_ADDRESS;
 if [ -z "$prog" ]; then
 if [ -f "$HOME/.xsession" ]; then prog="sh $HOME/.xsession";
-else for c in startxfce4 mate-session startlxqt startlxde startplasma-x11 x-session-manager xterm; do if command -v $c >/dev/null 2>&1; then prog=$c; break; fi; done;
+else for c in startxfce4 mate-session startlxqt startlxde startplasma-x11 x-session-manager xterm; do if have $c; then prog=$c; break; fi; done;
 fi;
 fi;
 [ -n "$prog" ] || { echo "FEROSSH-VD error no desktop session found"; exit 7; };
-r=; command -v dbus-run-session >/dev/null 2>&1 && r=dbus-run-session;
-s=; command -v setsid >/dev/null 2>&1 && s=setsid;
+r=; have dbus-run-session && r=dbus-run-session;
+s=; have setsid && s=setsid;
 $s $r sh -c "$prog" </dev/null >"$d/app.log" 2>&1 3<&- &
 a=$!;
+q=;
+if [ "$b" = xvnc ]; then q=$((5900+n));
+else
 echo "$pw" >"$d/pw";
 x11vnc -display :$n -auth "$d/auth" -localhost -forever -shared -norc -passwdfile "rm:$d/pw" </dev/null >"$d/vnc.out" 2>"$d/vnc.log" 3<&- &
 v=$!;
-i=0; q=;
+i=0;
 while [ $i -lt 150 ]; do q=$(sed -n "s/^PORT=//p" "$d/vnc.out"); [ -n "$q" ] && break; kill -0 $v 2>/dev/null || break; sleep 0.2; i=$((i+1)); done;
 [ -n "$q" ] || { echo "FEROSSH-VD error x11vnc did not start: $(tail -n 2 "$d/vnc.log" | tr -s "[:space:]" " ")"; exit 8; };
-echo "FEROSSH-VD ready $q :$n";
+fi;
+echo "FEROSSH-VD ready $q :$n $b";
 { cat; kill -s HUP $$; } <&3 >/dev/null 2>&1 &
 w=$!;
 exec 3<&-;
@@ -90,13 +106,15 @@ pub fn command() -> Vec<u8> {
 }
 
 /// What the script reads on its standard input before it starts: the
-/// VNC password, the program to run (empty: a desktop session) and the
-/// screen size. `None` when the program cannot travel as one line.
+/// VNC password, the program to run (empty: a desktop session), the
+/// screen size, and whether it should `follow` the viewer's size (the
+/// script then prefers Xvnc, which can). `None` when the program cannot travel as one line.
 pub fn input(
     password: &str,
     program: Option<&str>,
     width: u16,
     height: u16,
+    follow: bool,
 ) -> Option<Zeroizing<Vec<u8>>> {
     let program = program.unwrap_or_default();
     if [password, program]
@@ -106,8 +124,9 @@ pub fn input(
         return None;
     }
     let (width, height) = (width.clamp(320, 8192), height.clamp(200, 8192));
+    let mode = if follow { "follow" } else { "fixed" };
     Some(Zeroizing::new(
-        format!("{password}\n{program}\n{width}x{height}\n").into_bytes(),
+        format!("{password}\n{program}\n{width}x{height}\n{mode}\n").into_bytes(),
     ))
 }
 
@@ -140,9 +159,14 @@ pub enum Event {
     Missing(Vec<String>),
     /// It could not start; why, in the script's words.
     Error(String),
-    /// x11vnc listens on this port of the server's loopback, showing
-    /// this display.
-    Ready { port: u16, display: String },
+    /// The VNC server listens on this port of the server's loopback,
+    /// showing this display; `resizes` when it is Xvnc, which takes the
+    /// viewer's size changes (x11vnc on Xvfb keeps its size).
+    Ready {
+        port: u16,
+        display: String,
+        resizes: bool,
+    },
     /// The program in the display ended, with its last words.
     Ended(String),
 }
@@ -196,7 +220,12 @@ fn parse(line: &str) -> Option<Event> {
             let mut parts = text.split_whitespace();
             let port = parts.next()?.parse().ok().filter(|&p| p != 0)?;
             let display = parts.next().unwrap_or_default().to_owned();
-            Event::Ready { port, display }
+            let resizes = parts.next() == Some("xvnc");
+            Event::Ready {
+                port,
+                display,
+                resizes,
+            }
         }
         _ => return None,
     })
@@ -216,7 +245,9 @@ pub fn install_advice(missing: &[String]) -> String {
     format!(
         "The server needs {} for a virtual desktop. Install {} there: \
          Debian or Ubuntu: sudo apt install {}; Fedora or RHEL (EPEL for x11vnc): \
-         sudo dnf install {}; Arch: sudo pacman -S {}.",
+         sudo dnf install {}; Arch: sudo pacman -S {}. For a desktop that follows the \
+         window's size, install TigerVNC's Xvnc too (tigervnc-standalone-server, \
+         tigervnc-server or tigervnc).",
         missing.join(", "),
         if missing.len() == 1 { "it" } else { "them" },
         pick(["xvfb", "x11vnc", "xauth"]).join(" "),
@@ -252,16 +283,16 @@ mod tests {
     }
 
     #[test]
-    fn input_is_three_lines() {
+    fn input_is_four_lines() {
         let pw = password();
-        let i = input(&pw, Some("xterm -fa Mono"), 1280, 720).unwrap();
+        let i = input(&pw, Some("xterm -fa Mono"), 1280, 720, true).unwrap();
         assert_eq!(
             &i[..],
-            format!("{}\nxterm -fa Mono\n1280x720\n", *pw).as_bytes()
+            format!("{}\nxterm -fa Mono\n1280x720\nfollow\n", *pw).as_bytes()
         );
-        let i = input(&pw, None, 10, 60000).unwrap();
-        assert_eq!(&i[..], format!("{}\n\n320x8192\n", *pw).as_bytes());
-        assert!(input(&pw, Some("evil\nrm -rf ~"), 800, 600).is_none());
+        let i = input(&pw, None, 10, 60000, false).unwrap();
+        assert_eq!(&i[..], format!("{}\n\n320x8192\nfixed\n", *pw).as_bytes());
+        assert!(input(&pw, Some("evil\nrm -rf ~"), 800, 600, true).is_none());
     }
 
     #[test]
@@ -277,7 +308,8 @@ mod tests {
     fn reads_the_marked_lines() {
         let mut o = Output::default();
         let mut events = o.feed(b"noise\nFEROSSH-VD missing Xvfb x11");
-        events.extend(o.feed(b"vnc\nFEROSSH-VD ready 5901 :20\r\nFEROSSH-VD ready 0\n"));
+        events.extend(o.feed(b"vnc\nFEROSSH-VD ready 5901 :20 xvfb\r\nFEROSSH-VD ready 0\n"));
+        events.extend(o.feed(b"FEROSSH-VD ready 5921 :21 xvnc\n"));
         events.extend(o.feed(b"FEROSSH-VD error Xvfb did not start: \x1b[31mno\n"));
         events.extend(o.feed(b"FEROSSH-VD ended\n"));
         assert_eq!(
@@ -286,7 +318,13 @@ mod tests {
                 Event::Missing(vec!["Xvfb".into(), "x11vnc".into()]),
                 Event::Ready {
                     port: 5901,
-                    display: ":20".into()
+                    display: ":20".into(),
+                    resizes: false,
+                },
+                Event::Ready {
+                    port: 5921,
+                    display: ":21".into(),
+                    resizes: true,
                 },
                 Event::Error("Xvfb did not start: [31mno".into()),
                 Event::Ended(String::new()),

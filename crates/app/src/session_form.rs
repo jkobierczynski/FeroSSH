@@ -75,6 +75,8 @@ pub struct Values {
     pub vnc_port: String,
     /// What Open virtual desktop runs; empty picks a desktop session.
     pub virtual_desktop: String,
+    /// `follow`, empty (the same) or `WIDTHxHEIGHT`.
+    pub desktop_size: String,
     pub legacy: bool,
     /// Where the password comes from: see [`PASSWORD_CHOICES`].
     pub password: usize,
@@ -188,6 +190,11 @@ impl Values {
         self.desktop_port = opt_text(&p.desktop_port);
         self.vnc_port = opt_text(&p.vnc_port);
         self.virtual_desktop = p.virtual_desktop.clone().unwrap_or_default();
+        self.desktop_size = p
+            .desktop_size
+            .and_then(|d| d.fixed())
+            .map(|(w, h)| format!("{w}x{h}"))
+            .unwrap_or_default();
         self.legacy = p.legacy_algorithms;
         (self.password, self.password_command) = password_choice(&p.password);
         self.login_script = p.login_script.iter().map(ToString::to_string).collect();
@@ -223,6 +230,7 @@ enum Field {
     DesktopPort,
     VncPort,
     VirtualDesktop,
+    DesktopSize,
     Legacy,
     Password,
     PasswordCommand,
@@ -256,6 +264,7 @@ impl Field {
             Field::DesktopPort => "RDP port",
             Field::VncPort => "VNC port",
             Field::VirtualDesktop => "Virtual desk",
+            Field::DesktopSize => "Desk size",
             Field::Legacy => "Old crypto",
             Field::Password => "Password",
             Field::PasswordCommand => "Command",
@@ -424,8 +433,13 @@ impl SessionForm {
                     out.push(Item::Note(format!("Saves a copy; {file} stays.")));
                 }
             }
-            out.extend([Field::Folder, Field::Type, Field::Host].map(Item::Field));
+            out.extend([Field::Folder, Field::Type].map(Item::Field));
+            // A virtual desktop runs on its Via SSH host: no address.
+            if kind != SessionKind::Xvfb {
+                out.push(Item::Field(Field::Host));
+            }
             match kind {
+                SessionKind::Xvfb => {}
                 SessionKind::Serial => {
                     out.extend([Field::Speed, Field::Framing, Field::Flow].map(Item::Field));
                 }
@@ -452,7 +466,12 @@ impl SessionForm {
                     }
                     out.push(Item::Field(Field::Jump));
                 }
-                SessionKind::Rdp | SessionKind::Vnc => out.push(Item::Field(Field::Via)),
+                SessionKind::Rdp | SessionKind::Vnc => {
+                    out.extend([Field::Via, Field::DesktopSize].map(Item::Field));
+                }
+                SessionKind::Xvfb => out.extend(
+                    [Field::Via, Field::VirtualDesktop, Field::DesktopSize].map(Item::Field),
+                ),
                 SessionKind::Serial => {}
                 SessionKind::Telnet => {
                     out.push(Item::Note("Unencrypted: anyone on the way".into()));
@@ -499,6 +518,7 @@ impl SessionForm {
                         Field::DesktopPort,
                         Field::VncPort,
                         Field::VirtualDesktop,
+                        Field::DesktopSize,
                         Field::Legacy,
                     ]
                     .map(Item::Field),
@@ -577,6 +597,7 @@ impl SessionForm {
             Field::DesktopPort => &v.desktop_port,
             Field::VncPort => &v.vnc_port,
             Field::VirtualDesktop => &v.virtual_desktop,
+            Field::DesktopSize => &v.desktop_size,
             Field::PasswordCommand => &v.password_command,
             Field::Speed => &v.speed,
             Field::Type
@@ -613,6 +634,7 @@ impl SessionForm {
             Field::DesktopPort => &mut v.desktop_port,
             Field::VncPort => &mut v.vnc_port,
             Field::VirtualDesktop => &mut v.virtual_desktop,
+            Field::DesktopSize => &mut v.desktop_size,
             Field::PasswordCommand => &mut v.password_command,
             Field::Speed => &mut v.speed,
             Field::Type
@@ -638,6 +660,7 @@ impl SessionForm {
                 SessionKind::Vnc => "VNC desktop",
                 SessionKind::Serial => "Serial console",
                 SessionKind::Telnet => "Telnet (unencrypted)",
+                SessionKind::Xvfb => "Virtual desktop (Xvfb)",
             }
             .to_owned(),
             Field::Framing if v.framing.is_empty() => "8N1".to_owned(),
@@ -685,6 +708,7 @@ impl SessionForm {
                     SessionKind::Ssh,
                     SessionKind::Rdp,
                     SessionKind::Vnc,
+                    SessionKind::Xvfb,
                     SessionKind::Telnet,
                     SessionKind::Serial,
                 ];
@@ -769,12 +793,14 @@ impl SessionForm {
                 SessionKind::Rdp => "3389".into(),
                 SessionKind::Vnc => "5900".into(),
                 SessionKind::Telnet => "23".into(),
-                SessionKind::Serial => String::new(),
+                SessionKind::Serial | SessionKind::Xvfb => String::new(),
             },
             Field::Speed => "9600 bits/s".into(),
             Field::Key => "default keys and agent".into(),
             Field::Jump => "none, or e.g. bastion".into(),
-            Field::Via if v.kind == SessionKind::Vnc => "an SSH connection (required)".into(),
+            Field::Via if matches!(v.kind, SessionKind::Vnc | SessionKind::Xvfb) => {
+                "an SSH connection (required)".into()
+            }
             Field::Via => "none: connect directly".into(),
             Field::Font => h.font.clone(),
             Field::FontSize => format!("{}", h.font_size),
@@ -787,6 +813,7 @@ impl SessionForm {
             Field::DesktopPort => "3389".into(),
             Field::VncPort => "5900".into(),
             Field::VirtualDesktop => "a desktop session, or e.g. firefox".into(),
+            Field::DesktopSize => "follows the window, or e.g. 1920x1080".into(),
             Field::PasswordCommand => "program and arguments".into(),
             Field::Type
             | Field::Theme
@@ -920,6 +947,9 @@ impl SessionForm {
                     "A VNC desktop goes through an SSH connection: fill in Via SSH.".into(),
                 );
             }
+            SessionKind::Xvfb if via.is_empty() => {
+                return Err("A virtual desktop runs on an SSH connection: fill in Via SSH.".into());
+            }
             _ if via.is_empty() => {}
             _ if via.eq_ignore_ascii_case(name) => {
                 return Err("Via SSH names another connection, not this one.".into());
@@ -959,6 +989,14 @@ impl SessionForm {
         }
         port(&v.desktop_port, "The RDP port")?;
         port(&v.vnc_port, "The VNC port")?;
+        let size = v.desktop_size.trim();
+        if !size.is_empty() && ferossh_config::settings::DesktopSize::parse(size).is_none() {
+            return Err(
+                "The desktop size is follow, or a width and height such as 1920x1080 \
+                 (320x200 to 8192x8192)."
+                    .into(),
+            );
+        }
         if v.virtual_desktop.chars().any(char::is_control) {
             return Err("The virtual desktop program cannot hold control characters.".into());
         }
@@ -1403,7 +1441,12 @@ impl SessionForm {
         }
         let p = settings.profile_mut(&name);
         p.kind = v.kind;
-        p.via = trimmed(&v.via).filter(|_| matches!(v.kind, SessionKind::Rdp | SessionKind::Vnc));
+        p.via = trimmed(&v.via).filter(|_| {
+            matches!(
+                v.kind,
+                SessionKind::Rdp | SessionKind::Vnc | SessionKind::Xvfb
+            )
+        });
         p.theme = trimmed(&v.theme);
         p.font = trimmed(&v.font);
         p.font_size = v.font_size.trim().parse().ok();
@@ -1420,6 +1463,8 @@ impl SessionForm {
         p.desktop_port = v.desktop_port.trim().parse().ok().filter(|&p| p != 0);
         p.vnc_port = v.vnc_port.trim().parse().ok().filter(|&p| p != 0);
         p.virtual_desktop = ferossh_config::settings::virtual_desktop(&v.virtual_desktop);
+        p.desktop_size = ferossh_config::settings::DesktopSize::parse(&v.desktop_size)
+            .filter(|d| *d != ferossh_config::settings::DesktopSize::Follow);
         p.legacy_algorithms = v.legacy;
         p.password = match (v.kind, v.password) {
             (SessionKind::Ssh, PASSWORD_WINDOWS) => PasswordSource::Windows,
@@ -1680,6 +1725,7 @@ mod tests {
             (Field::TmuxSession, "a;b", "tmux"),
             (Field::StartDir, "/srv/\"x\"", "start directory"),
             (Field::VirtualDesktop, "xterm\u{7}", "virtual desktop"),
+            (Field::DesktopSize, "100x100", "desktop size"),
             (Field::Jump, "gw host", "Jump host"),
             (Field::Jump, "gw,ok", "not this one"),
         ] {
@@ -1710,6 +1756,37 @@ mod tests {
         f.values.kind = SessionKind::Rdp;
         f.values.via.clear();
         assert_eq!(f.check(), Ok(()), "RDP may go straight to the machine");
+    }
+
+    #[test]
+    fn a_virtual_desktop_connection_needs_via_and_keeps_its_size() {
+        let mut f = new_form();
+        f.values = Values {
+            name: "lab-desk".into(),
+            kind: SessionKind::Xvfb,
+            ..Values::default()
+        };
+        assert!(f.check().unwrap_err().contains("Via SSH"));
+        f.values.via = "bastion".into();
+        f.values.desktop_size = "1920x1080".into();
+        f.values.virtual_desktop = "firefox".into();
+        assert_eq!(f.check(), Ok(()));
+        let items = f.items();
+        for field in [Field::Via, Field::VirtualDesktop, Field::DesktopSize] {
+            assert!(items.contains(&Item::Field(field)), "{field:?}");
+        }
+        assert!(!items.contains(&Item::Field(Field::Host)));
+        let mut hosts = Vec::new();
+        let mut settings = Settings::default();
+        f.apply(&mut hosts, &mut settings);
+        let p = settings.profile("lab-desk").unwrap();
+        assert_eq!(p.kind, SessionKind::Xvfb);
+        assert_eq!(p.via.as_deref(), Some("bastion"));
+        assert_eq!(p.virtual_desktop.as_deref(), Some("firefox"));
+        assert_eq!(
+            p.desktop_size,
+            Some(ferossh_config::settings::DesktopSize::Fixed(1920, 1080))
+        );
     }
 
     #[test]
@@ -1853,8 +1930,8 @@ mod tests {
         down(&mut f, 11);
         f.key(SideKey::Enter { split: false }, 30);
         // tmux, tmux panes, Start dir, Forward 1, RDP port, VNC port,
-        // Virtual desk, Old crypto.
-        down(&mut f, 9);
+        // Virtual desk, Desk size, Old crypto.
+        down(&mut f, 10);
         assert_eq!(f.focused_field(), Some(Field::LoginStep(0)));
         let t = texts(&mut f);
         assert!(
