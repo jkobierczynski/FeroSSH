@@ -253,11 +253,15 @@ mod tests {
 
     #[test]
     fn input_is_three_lines() {
-        let i = input("abcdEFGH", Some("xterm -fa Mono"), 1280, 720).unwrap();
-        assert_eq!(&i[..], b"abcdEFGH\nxterm -fa Mono\n1280x720\n");
-        let i = input("abcdEFGH", None, 10, 60000).unwrap();
-        assert_eq!(&i[..], b"abcdEFGH\n\n320x8192\n");
-        assert!(input("pw", Some("evil\nrm -rf ~"), 800, 600).is_none());
+        let pw = password();
+        let i = input(&pw, Some("xterm -fa Mono"), 1280, 720).unwrap();
+        assert_eq!(
+            &i[..],
+            format!("{}\nxterm -fa Mono\n1280x720\n", *pw).as_bytes()
+        );
+        let i = input(&pw, None, 10, 60000).unwrap();
+        assert_eq!(&i[..], format!("{}\n\n320x8192\n", *pw).as_bytes());
+        assert!(input(&pw, Some("evil\nrm -rf ~"), 800, 600).is_none());
     }
 
     #[test]
