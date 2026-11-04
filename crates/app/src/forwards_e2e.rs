@@ -607,3 +607,147 @@ fn forwards_change_on_a_live_connection() {
     assert_eq!(shell.run("echo ALIVE''=yes", "ALIVE"), "ALIVE=yes");
     forwarder.stop(conn);
 }
+
+/// Whether `program` is on the PATH.
+fn on_path(program: &str) -> bool {
+    std::env::var_os("PATH")
+        .is_some_and(|p| std::env::split_paths(&p).any(|d| d.join(program).is_file()))
+}
+
+/// Session > Open virtual desktop end to end: the script runs on an exec
+/// channel of a real login, starts Xvfb and x11vnc there, and says where
+/// x11vnc listens; a desktop tunnel to that port reaches a VNC server that
+/// asks for a password and listens on loopback only. Closing the channel
+/// stops it all on the server. Skipped where Xvfb, x11vnc or xauth is
+/// missing, unless FEROSSH_REQUIRE_XVFB is set.
+#[test]
+fn virtual_desktop_starts_and_stops_on_the_server() {
+    use crate::vdesk::{self, Event};
+    use ferossh_ipc::Message;
+
+    let have = ["Xvfb", "x11vnc", "xauth"].iter().all(|p| on_path(p));
+    assert!(
+        have || std::env::var_os("FEROSSH_REQUIRE_XVFB").is_none(),
+        "FEROSSH_REQUIRE_XVFB is set but Xvfb, x11vnc or xauth is missing"
+    );
+    if !have {
+        return;
+    }
+    let Some(server) = start_sshd("vdesk", "") else {
+        return;
+    };
+    let user = local_user();
+    let env = Env {
+        home: server.dir.clone(),
+        local_user: user.clone(),
+        config: format!(
+            "Host testhost\n  HostName 127.0.0.1\n  Port {}\n  User {user}\n  \
+             IdentityFile ~/.ssh/id_ed25519\n",
+            server.port
+        ),
+    };
+    let target = Target::resolve("testhost", &env).unwrap();
+    let (ui_read, worker_write) = std::io::pipe().unwrap();
+    let (worker_read, ui_write) = std::io::pipe().unwrap();
+    std::thread::spawn(move || ferossh_worker::run_blocking(worker_read, worker_write));
+    let (forwarder, runner) = Forwarder::new();
+    let link = Link::start(ui_read, ui_write, || {}, forwarder.sink()).unwrap();
+    runner.spawn(link.sender(), || {}).unwrap();
+    let mut session = SshSession::new(1, target, env.known_hosts());
+    let effects = session.start(80, 24);
+    let mut shell = Shell {
+        session,
+        link,
+        broker: Broker::spawn(|| {}).unwrap(),
+        forwarder: forwarder.clone(),
+        effects,
+        shown: String::new(),
+        output: String::new(),
+    };
+    shell.until("the login", |s| {
+        s.session.state() == State::Connected && !s.forwarder.view().is_empty()
+    });
+    let conn = shell.session.connection;
+
+    const EXEC: ChannelId = 77;
+    shell.link.send(Message::Exec {
+        channel: EXEC,
+        connection: conn,
+        command: vdesk::command(),
+    });
+    let password = vdesk::password();
+    let input = vdesk::input(&password, Some("sleep 600"), 800, 600).unwrap();
+    shell.link.send(Message::Data {
+        channel: EXEC,
+        bytes: input.to_vec(),
+    });
+    let mut out = vdesk::Output::default();
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let (port, display) = loop {
+        assert!(Instant::now() < deadline, "no answer: {:?}", out.other);
+        match shell.link.try_recv() {
+            Some(LinkEvent::Message(Message::Data {
+                channel: EXEC,
+                bytes,
+            })) => match out.feed(&bytes).into_iter().next() {
+                Some(Event::Ready { port, display }) => break (port, display),
+                Some(e) => panic!("the virtual desktop did not start: {e:?}"),
+                None => {}
+            },
+            Some(LinkEvent::Message(Message::Disconnected {
+                channel: EXEC,
+                reason,
+            })) => panic!("the script ended: {reason} {:?}", out.other),
+            Some(LinkEvent::Message(m)) => {
+                let e = shell.session.on_worker(m);
+                shell.effects.extend(e);
+            }
+            Some(LinkEvent::Closed(why)) => panic!("worker closed: {why}"),
+            None => std::thread::sleep(Duration::from_millis(5)),
+        }
+    };
+    let number = display.trim_start_matches(':').to_owned();
+    let lock = format!("/tmp/.X{number}-lock");
+    assert!(Path::new(&lock).exists(), "{lock}");
+
+    // x11vnc listens on the server's loopback only.
+    let tcp = std::fs::read_to_string("/proc/net/tcp").unwrap_or_default();
+    let hex = format!(":{port:04X} ");
+    let binds: Vec<&str> = tcp
+        .lines()
+        .filter(|l| l.contains(&hex) && l.split_whitespace().nth(3) == Some("0A"))
+        .filter_map(|l| l.split_whitespace().nth(1))
+        .collect();
+    assert!(
+        !binds.is_empty() && binds.iter().all(|b| b.starts_with("0100007F:")),
+        "{binds:?}"
+    );
+
+    forwarder.open_desktop(conn, "127.0.0.1", port, 0);
+    let DesktopEvent::Ready { addr, .. } = desktop_event(&forwarder) else {
+        panic!("the desktop tunnel failed");
+    };
+    let mut s = TcpStream::connect(addr.as_str()).unwrap();
+    s.set_read_timeout(Some(Duration::from_secs(20))).unwrap();
+    let mut version = [0u8; 12];
+    s.read_exact(&mut version).unwrap();
+    assert_eq!(&version, b"RFB 003.008\n");
+    s.write_all(b"RFB 003.008\n").unwrap();
+    let mut count = [0u8; 1];
+    s.read_exact(&mut count).unwrap();
+    let mut types = vec![0u8; usize::from(count[0])];
+    s.read_exact(&mut types).unwrap();
+    // VNC Authentication, never None.
+    assert_eq!(types, [2]);
+    drop(s);
+
+    // Closing the channel stops Xvfb, x11vnc and the program.
+    shell.link.send(Message::Close { channel: EXEC });
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while Path::new(&lock).exists() {
+        assert!(Instant::now() < deadline, "Xvfb still runs: {lock}");
+        let _ = shell.link.try_recv();
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    forwarder.stop(conn);
+}

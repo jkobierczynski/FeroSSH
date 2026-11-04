@@ -130,6 +130,7 @@ use crate::tabstrip::{self, Forwarding, Health, Hit, Palette, StripLayout, TabLa
 use crate::telnet::{TelnetSession, TelnetTarget};
 use crate::tmux::{self, Mode as TmuxMode, Tmux};
 use crate::tmux_keys::{self, Action as TmuxKey};
+use crate::vdesk;
 use crate::zmodem;
 use ferossh_tmuxcc::saved as tmux_saved;
 use zeroize::Zeroizing;
@@ -343,6 +344,9 @@ mod cmd {
     pub const TMUX_KEYS: u32 = 621;
     /// Session > Start new tabs and panes in this directory.
     pub const START_DIR: u32 = 622;
+    /// Session > Open virtual desktop (Xvfb and x11vnc on the server).
+    pub const VDESK: u32 = 623;
+    pub const VDESK_STOP: u32 = 624;
     pub const TMUX_ATTACH: u32 = 610;
     pub const TMUX_DETACH: u32 = 611;
     pub const TMUX_PICK: u32 = 612;
@@ -422,6 +426,9 @@ enum Host {
     Desktop {
         label: String,
         connection: ChannelId,
+        /// The virtual desktop's script channel, when it shows one: it
+        /// stops with the tab.
+        vdesk: Option<ChannelId>,
     },
     /// A serial console; `port` is `None` once it closed, when Enter
     /// opens it again.
@@ -781,6 +788,8 @@ struct Window {
     /// Remote desktops asked for and not yet open, by connection and
     /// desktop server (host as the SSH server sees it, and port).
     desktops: HashMap<(ChannelId, String, u16), DesktopWant>,
+    /// Virtual desktops by their script's exec channel.
+    vdesks: HashMap<ChannelId, VirtualDesk>,
     /// Passwords from password manager commands, as they finish: the pane,
     /// its session's channel, the program and the result.
     passwords: Arc<std::sync::Mutex<Vec<PasswordAnswer>>>,
@@ -877,7 +886,35 @@ enum DesktopWant {
         label: String,
         user: String,
         protocol: Protocol,
+        /// A virtual desktop's: its password and script channel.
+        vdesk: Option<(Zeroizing<String>, ChannelId)>,
     },
+    /// A VNC viewer installed on this PC, for a virtual desktop without
+    /// the built-in viewer; notes go to `pane`.
+    Vnc {
+        pane: PaneId,
+        password: Zeroizing<String>,
+    },
+}
+
+/// Session > Open virtual desktop: Xvfb and x11vnc on the server, run by
+/// [`vdesk::command`] on an exec channel of `connection`.
+struct VirtualDesk {
+    connection: ChannelId,
+    /// The terminal it was opened from, for notes.
+    pane: PaneId,
+    label: String,
+    user: String,
+    password: Zeroizing<String>,
+    out: vdesk::Output,
+    /// x11vnc's port on the server, once it listens.
+    port: Option<u16>,
+    /// In a tab of the built-in viewer, rather than a viewer on this PC.
+    tab: bool,
+    /// Its tab opened; closing that tab now stops it.
+    shown: bool,
+    /// The user heard why it failed.
+    reported: bool,
 }
 
 thread_local! {
@@ -1401,6 +1438,7 @@ fn create_and_run(launch: Launch, theme: Option<String>) -> Result<()> {
                 retries: HashMap::new(),
                 queued: Vec::new(),
                 desktops: HashMap::new(),
+                vdesks: HashMap::new(),
                 passwords: Arc::default(),
                 pending_desktops: HashMap::new(),
                 broadcast: broadcast::Scope::Off,
@@ -1588,6 +1626,8 @@ fn build_menu() -> Result<HMENU> {
                 "Open remote desktop in a tab (&VNC)",
             )?;
         }
+        item(session, cmd::VDESK, "Open virtual d&esktop (Xvfb)")?;
+        item(session, cmd::VDESK_STOP, "Stop v&irtual desktop")?;
 
         let edit = CreatePopupMenu()?;
         item(edit, cmd::COPY, "&Copy\tCtrl+Shift+C")?;
@@ -2815,6 +2855,7 @@ impl Window {
     /// Stops the forwards of connections no logged-in pane and no remote
     /// desktop uses any more.
     fn prune_forwards(&mut self) {
+        self.prune_vdesks();
         for w in self.workers.values() {
             for v in w.forwarder.view() {
                 let used = self.panes.values().any(|p| match &p.host {
@@ -2889,6 +2930,11 @@ impl Window {
             Host::Desktop { connection: c, .. } => *c == connection && p.desktop.is_some(),
             _ => false,
         }) || self.desktops.keys().any(|(c, ..)| *c == connection)
+            // A virtual desktop on its way to a tab.
+            || self
+                .vdesks
+                .values()
+                .any(|v| v.connection == connection && v.tab && !v.shown)
             || self
                 .sftp
                 .values()
@@ -2964,6 +3010,7 @@ impl Window {
                         label,
                         user,
                         protocol,
+                        vdesk: None,
                     },
                 )
             }
@@ -3022,7 +3069,26 @@ impl Window {
                         label,
                         user,
                         protocol,
-                    }) => self.desktop_tab(connection, label, user, protocol, &addr),
+                        vdesk,
+                    }) => self.desktop_tab(connection, label, user, protocol, vdesk, &addr),
+                    Some(DesktopWant::Vnc { pane, password }) => {
+                        let note = match launch_vnc_viewer(&addr) {
+                            Some(viewer) => format!(
+                                "\x1b[0;90mVirtual desktop tunnel at {addr}; {viewer} opens on \
+                                 it. VNC password: {}\x1b[0m\r\n",
+                                password.as_str()
+                            ),
+                            None => format!(
+                                "\x1b[0;33mThe virtual desktop listens at {addr} (VNC password: \
+                                 {}). No VNC viewer was found on this PC: install one (TigerVNC, \
+                                 TightVNC, RealVNC or UltraVNC) and point it there, or use \
+                                 ferossh-desktop.exe, which shows it in a tab.\x1b[0m\r\n",
+                                password.as_str()
+                            ),
+                        };
+                        self.show(pane, &note);
+                        self.refresh(pane);
+                    }
                     None => {}
                 },
                 DesktopEvent::Failed {
@@ -3032,6 +3098,9 @@ impl Window {
                     why,
                 } => {
                     let advice = match self.desktops.remove(&(connection, host, port)) {
+                        // The script started that server: nothing to advise.
+                        Some(DesktopWant::Vnc { .. })
+                        | Some(DesktopWant::Tab { vdesk: Some(_), .. }) => "",
                         Some(DesktopWant::Tab {
                             protocol: Protocol::Vnc,
                             ..
@@ -3052,6 +3121,279 @@ impl Window {
         }
     }
 
+    /// Session > Open virtual desktop: runs [`vdesk::command`] on an exec
+    /// channel of the pane's connection; [`Self::on_vdesk`] opens a viewer
+    /// once x11vnc listens. A second ask on the same connection opens
+    /// another viewer on the running one.
+    fn open_virtual_desktop(&mut self, pane: PaneId) -> Option<Command> {
+        let host = self.host_pane(pane);
+        let (Some(connection), Some(Host::Ssh(s))) = (
+            self.pane_connection(pane),
+            self.panes.get(&host).map(|p| &p.host),
+        ) else {
+            return Some(Command::Notice(NO_VDESK_HOST.into()));
+        };
+        let running = self
+            .vdesks
+            .iter()
+            .find(|(_, v)| v.connection == connection)
+            .map(|(&c, v)| (c, v.port));
+        match running {
+            Some((channel, Some(_))) => {
+                self.vdesk_viewer(channel);
+                return None;
+            }
+            Some((_, None)) => {
+                return Some(Command::Notice(
+                    "The virtual desktop on this connection is still starting.".into(),
+                ));
+            }
+            None => {}
+        }
+        let program = self
+            .settings
+            .profile(&s.target.alias)
+            .and_then(|p| p.virtual_desktop.clone());
+        let label = s.target.label();
+        let user = s.target.user.clone();
+        let (width, height) = self
+            .panes
+            .get(&pane)
+            .map(|p| desktop_size(p.rect))
+            .unwrap_or((1600, 900));
+        let password = vdesk::password();
+        let Some(input) = vdesk::input(&password, program.as_deref(), width, height) else {
+            return Some(Command::Notice(
+                "This host's VirtualDesktop command must be one line.".into(),
+            ));
+        };
+        let channel = self.new_channel();
+        let w = self.workers.get(&connection)?;
+        w.link.send(Message::Exec {
+            channel,
+            connection,
+            command: vdesk::command(),
+        });
+        w.link.send(Message::Data {
+            channel,
+            bytes: input.to_vec(),
+        });
+        self.vdesks.insert(
+            channel,
+            VirtualDesk {
+                connection,
+                pane,
+                label,
+                user,
+                password,
+                out: vdesk::Output::default(),
+                port: None,
+                tab: cfg!(feature = "vnc-viewer"),
+                shown: false,
+                reported: false,
+            },
+        );
+        let what = match &program {
+            Some(p) => format!(" running {}", crate::ssh::sanitize(p)),
+            None => String::new(),
+        };
+        self.show(
+            pane,
+            &format!(
+                "\x1b[0;90mStarting a virtual desktop{what} on the server (Xvfb and \
+                 x11vnc)...\x1b[0m\r\n"
+            ),
+        );
+        self.refresh(pane);
+        None
+    }
+
+    /// Session > Stop virtual desktop: ends the virtual desktops on the
+    /// pane's connection, which stops Xvfb, x11vnc and the program there.
+    fn stop_virtual_desktop(&mut self, pane: PaneId) -> Option<Command> {
+        let connection = self.pane_connection(pane);
+        let channels: Vec<ChannelId> = self
+            .vdesks
+            .iter()
+            .filter(|(_, v)| Some(v.connection) == connection)
+            .map(|(&c, _)| c)
+            .collect();
+        if channels.is_empty() {
+            return Some(Command::Notice(
+                "No virtual desktop runs on this pane's connection.".into(),
+            ));
+        }
+        for channel in channels {
+            self.close_vdesk(channel);
+        }
+        self.show(pane, "\x1b[0;90mVirtual desktop stopped.\x1b[0m\r\n");
+        self.refresh(pane);
+        self.prune_forwards();
+        None
+    }
+
+    /// Closes a virtual desktop's script channel: the end of its input
+    /// tells the script to stop everything it started.
+    fn close_vdesk(&mut self, channel: ChannelId) {
+        if let Some(v) = self.vdesks.remove(&channel)
+            && let Some(w) = self.workers.get(&v.connection)
+        {
+            w.link.send(Message::Close { channel });
+        }
+    }
+
+    /// Stops the virtual desktops nothing shows any more: the tab closed
+    /// (or its viewer ended), or, for a viewer on this PC, no terminal is
+    /// logged in on the connection.
+    fn prune_vdesks(&mut self) {
+        let unused: Vec<ChannelId> = self
+            .vdesks
+            .iter()
+            .filter(|&(&c, v)| {
+                if v.tab {
+                    v.shown
+                        && !self.panes.values().any(|p| {
+                            matches!(p.host, Host::Desktop { vdesk: Some(d), .. } if d == c)
+                                && p.desktop.is_some()
+                        })
+                } else {
+                    !self.panes.values().any(|p| {
+                        matches!(&p.host, Host::Ssh(s)
+                            if s.connection == v.connection && s.state() == State::Connected)
+                    })
+                }
+            })
+            .map(|(&c, _)| c)
+            .collect();
+        for channel in unused {
+            self.close_vdesk(channel);
+        }
+    }
+
+    /// Opens a viewer on the running virtual desktop of script `channel`.
+    fn vdesk_viewer(&mut self, channel: ChannelId) {
+        let Some(v) = self.vdesks.get(&channel) else {
+            return;
+        };
+        let Some(port) = v.port else {
+            return;
+        };
+        let (local, want) = if v.tab {
+            (
+                0,
+                DesktopWant::Tab {
+                    label: v.label.clone(),
+                    user: v.user.clone(),
+                    protocol: Protocol::Vnc,
+                    vdesk: Some((v.password.clone(), channel)),
+                },
+            )
+        } else {
+            (
+                desktop_port_for(&format!("virtual {}", v.label)),
+                DesktopWant::Vnc {
+                    pane: v.pane,
+                    password: v.password.clone(),
+                },
+            )
+        };
+        let connection = v.connection;
+        let Some(w) = self.workers.get(&connection) else {
+            return;
+        };
+        // x11vnc listens on the server's IPv4 loopback only.
+        w.forwarder
+            .open_desktop(connection, VDESK_HOST, port, local);
+        self.desktops
+            .insert((connection, VDESK_HOST.to_owned(), port), want);
+    }
+
+    /// What a virtual desktop's script said, or that it ended.
+    fn on_vdesk(&mut self, channel: ChannelId, msg: Message) {
+        let Some(v) = self.vdesks.get_mut(&channel) else {
+            return;
+        };
+        let pane = v.pane;
+        match msg {
+            Message::Data { bytes, .. } => {
+                for event in v.out.feed(&bytes) {
+                    self.vdesk_event(channel, pane, event);
+                }
+            }
+            Message::Disconnected { reason, .. } => {
+                let Some(v) = self.vdesks.remove(&channel) else {
+                    return;
+                };
+                if v.port.is_none() && !v.reported {
+                    let said = match v.out.other.is_empty() {
+                        true => String::new(),
+                        false => format!(
+                            " The server said: {}",
+                            crate::ssh::sanitize(&v.out.other.join(" / "))
+                        ),
+                    };
+                    self.queued.push(Command::Notice(format!(
+                        "The virtual desktop did not start ({}).{said}",
+                        crate::ssh::sanitize(&reason)
+                    )));
+                }
+                self.prune_forwards();
+            }
+            _ => {}
+        }
+    }
+
+    fn vdesk_event(&mut self, channel: ChannelId, pane: PaneId, event: vdesk::Event) {
+        match event {
+            vdesk::Event::Missing(missing) => {
+                if let Some(v) = self.vdesks.get_mut(&channel) {
+                    v.reported = true;
+                }
+                self.queued
+                    .push(Command::Notice(vdesk::install_advice(&missing)));
+            }
+            vdesk::Event::Error(why) => {
+                if let Some(v) = self.vdesks.get_mut(&channel) {
+                    v.reported = true;
+                }
+                self.queued.push(Command::Notice(format!(
+                    "The virtual desktop did not start: {why}. Set VirtualDesktop in this \
+                     host's connection settings to the desktop or program to run."
+                )));
+            }
+            vdesk::Event::Ready { port, display } => {
+                if let Some(v) = self.vdesks.get_mut(&channel) {
+                    v.port = Some(port);
+                }
+                self.show(
+                    pane,
+                    &format!(
+                        "\x1b[0;90mVirtual desktop {display} runs on the server; opening it \
+                         through the SSH tunnel. It stops when its viewer tab closes, with \
+                         Session > Stop virtual desktop, or with this connection.\x1b[0m\r\n"
+                    ),
+                );
+                self.refresh(pane);
+                self.vdesk_viewer(channel);
+            }
+            vdesk::Event::Ended(said) => {
+                let said = if said.is_empty() {
+                    String::new()
+                } else {
+                    format!(": {said}")
+                };
+                self.show(
+                    pane,
+                    &format!(
+                        "\x1b[0;90mThe program in the virtual desktop ended, so the virtual \
+                         desktop stopped{said}\x1b[0m\r\n"
+                    ),
+                );
+                self.refresh(pane);
+            }
+        }
+    }
+
     /// Opens the built-in viewer on the tunnel at `addr` in a new tab.
     #[cfg(feature = "viewer")]
     fn desktop_tab(
@@ -3060,6 +3402,7 @@ impl Window {
         label: String,
         user: String,
         protocol: Protocol,
+        vdesk: Option<(Zeroizing<String>, ChannelId)>,
         addr: &str,
     ) {
         let id = self.new_tab_pane();
@@ -3075,7 +3418,14 @@ impl Window {
             height,
             layout: keyboard_layout(),
             user,
+            password: vdesk.as_ref().map(|(pw, _)| pw.clone()),
         };
+        let script = vdesk.map(|(_, channel)| channel);
+        // From here its tab decides: closing it, or a viewer that never
+        // started, stops the virtual desktop.
+        if let Some(v) = script.and_then(|c| self.vdesks.get_mut(&c)) {
+            v.shown = true;
+        }
         let started = sandbox::spawn_viewer().and_then(|v| {
             let to = v.to_worker.try_clone().map_err(io_error)?;
             let from = v.from_worker.try_clone().map_err(io_error)?;
@@ -3085,8 +3435,12 @@ impl Window {
             Ok(desktop) => {
                 if let Some(p) = self.panes.get_mut(&id) {
                     p.host = Host::Desktop {
-                        label: format!("desktop {label}"),
+                        label: match script {
+                            Some(_) => format!("virtual desktop {label}"),
+                            None => format!("desktop {label}"),
+                        },
                         connection,
+                        vdesk: script,
                     };
                     p.desktop = Some(Box::new(desktop));
                 }
@@ -3112,6 +3466,7 @@ impl Window {
         _label: String,
         _user: String,
         _protocol: Protocol,
+        _vdesk: Option<(Zeroizing<String>, ChannelId)>,
         _addr: &str,
     ) {
     }
@@ -5233,6 +5588,14 @@ impl Window {
                 let Some(c) = msg.channel() else {
                     return false;
                 };
+                if self
+                    .vdesks
+                    .get(&c)
+                    .is_some_and(|v| v.connection == connection)
+                {
+                    self.on_vdesk(c, msg);
+                    return false;
+                }
                 if let Some(remote) = self
                     .sftp
                     .values_mut()
@@ -5272,6 +5635,7 @@ impl Window {
                     w.forwarder.worker_gone();
                 }
                 self.proxies.remove(&connection);
+                self.vdesks.retain(|_, v| v.connection != connection);
                 for remote in self.sftp.values_mut() {
                     if remote.connection() == Some(connection) {
                         remote.detach();
@@ -7677,6 +8041,7 @@ impl Window {
                     label: p.label.clone(),
                     user: p.user.clone().unwrap_or_else(|| s.target.user.clone()),
                     protocol: Protocol::Vnc,
+                    vdesk: None,
                 },
             ),
             _ => (desktop_port_for(&p.label), DesktopWant::Rdp { pane: id }),
@@ -8964,6 +9329,8 @@ impl Window {
             cmd::DESKTOP => return self.open_desktop(pane, None),
             cmd::DESKTOP_TAB => return self.open_desktop(pane, Some(Protocol::Vnc)),
             cmd::DESKTOP_TAB_RDP => return self.open_desktop(pane, Some(Protocol::Rdp)),
+            cmd::VDESK => return self.open_virtual_desktop(pane),
+            cmd::VDESK_STOP => return self.stop_virtual_desktop(pane),
             cmd::TMUX_DETACH | cmd::TMUX_PICK | cmd::TMUX_LAYOUT => {
                 let host = self.host_pane(pane);
                 let Some(t) = self.tmux.get_mut(&host).filter(|t| t.active()) else {
@@ -10159,6 +10526,14 @@ fn desktop_size(rect: Rect) -> (u16, u16) {
     (side(rect.w), side(rect.h))
 }
 
+/// Session > Open virtual desktop on a pane that is not logged in.
+const NO_VDESK_HOST: &str = "Log in to an SSH host in this pane first. Open virtual desktop \
+                             starts Xvfb and x11vnc on that host and shows the desktop through \
+                             the connection.";
+
+/// Where a virtual desktop's x11vnc listens, as the server sees it.
+const VDESK_HOST: &str = "127.0.0.1";
+
 /// Session > Open remote desktop on a pane that is not logged in.
 const NO_DESKTOP_HOST: &str = "Log in to an SSH host in this pane first. Open remote desktop \
                                tunnels the host's Remote Desktop (RDP) port over that \
@@ -10177,6 +10552,55 @@ fn keyboard_layout() -> u32 {
     // SAFETY: no arguments to get wrong; 0 is this thread.
     let hkl = unsafe { windows::Win32::UI::Input::KeyboardAndMouse::GetKeyboardLayout(0) };
     (hkl.0 as usize & 0xffff) as u32
+}
+
+/// Starts a VNC viewer installed on this PC on `addr` (`host:port`), and
+/// names it; `None` when none was found. TigerVNC, TightVNC, RealVNC and
+/// UltraVNC all take `host::port`.
+fn launch_vnc_viewer(addr: &str) -> Option<&'static str> {
+    const KNOWN: [(&str, &str); 5] = [
+        ("TigerVNC\\vncviewer.exe", "TigerVNC Viewer"),
+        ("TightVNC\\tvnviewer.exe", "TightVNC Viewer"),
+        ("RealVNC\\VNC Viewer\\vncviewer.exe", "RealVNC Viewer"),
+        ("uvnc bvba\\UltraVNC\\vncviewer.exe", "UltraVNC Viewer"),
+        ("UltraVNC\\vncviewer.exe", "UltraVNC Viewer"),
+    ];
+    let target = match addr.rsplit_once(':') {
+        Some((host, port)) => format!("{host}::{port}"),
+        None => addr.to_owned(),
+    };
+    let roots: Vec<PathBuf> = ["ProgramFiles", "ProgramFiles(x86)", "ProgramW6432"]
+        .iter()
+        .filter_map(std::env::var_os)
+        .map(PathBuf::from)
+        .chain(std::env::var_os("LOCALAPPDATA").map(|d| PathBuf::from(d).join("Programs")))
+        .collect();
+    let installed = KNOWN.iter().find_map(|(path, name)| {
+        roots
+            .iter()
+            .map(|r| r.join(path))
+            .find(|p| p.is_file())
+            .map(|p| (p, *name))
+    });
+    // Then the PATH, looked up here so no current folder is searched.
+    let found = installed.or_else(|| {
+        let path = std::env::var_os("PATH")?;
+        std::env::split_paths(&path).find_map(|dir| {
+            [
+                ("vncviewer.exe", "the VNC viewer"),
+                ("tvnviewer.exe", "TightVNC Viewer"),
+            ]
+            .iter()
+            .map(|(exe, name)| (dir.join(exe), *name))
+            .find(|(p, _)| p.is_absolute() && p.is_file())
+        })
+    });
+    let (exe, name) = found?;
+    std::process::Command::new(exe)
+        .arg(target)
+        .spawn()
+        .ok()
+        .map(|_| name)
 }
 
 fn launch_rdp_client(addr: &str) -> std::io::Result<()> {

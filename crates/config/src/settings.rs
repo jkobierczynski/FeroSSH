@@ -29,6 +29,7 @@
 //! Profile desktop-box
 //!     DesktopPort 3390
 //!     VncPort 5901
+//!     VirtualDesktop startxfce4
 //! Profile office-pc
 //!     Type rdp
 //!     Via bastion
@@ -104,6 +105,10 @@ pub struct Profile {
     /// The server's VNC port for the built-in desktop viewer; 5900 when
     /// unset.
     pub vnc_port: Option<u16>,
+    /// What Session > Open virtual desktop runs in its Xvfb display: a
+    /// desktop session or a single program, as a shell command. Unset,
+    /// it picks a desktop session the server has.
+    pub virtual_desktop: Option<String>,
     /// What the session opens: a shell (the default) or a desktop.
     pub kind: SessionKind,
     /// For a desktop session: the SSH host whose connection carries it.
@@ -185,6 +190,14 @@ pub fn start_dir(dir: &str) -> Option<String> {
     (!dir.is_empty() && !dir.chars().any(|c| c.is_control() || c == '"')).then(|| dir.to_owned())
 }
 
+/// A `VirtualDesktop` command as kept: trimmed, `None` when empty or
+/// holding control characters (it travels as one line). Written back as
+/// is, so quotes in it stay the shell's.
+pub fn virtual_desktop(command: &str) -> Option<String> {
+    let command = command.trim();
+    (!command.is_empty() && !command.chars().any(char::is_control)).then(|| command.to_owned())
+}
+
 /// The RDP port xrdp and GNOME Remote Desktop listen on by default.
 pub const DEFAULT_DESKTOP_PORT: u16 = 3389;
 /// The VNC port of display :0.
@@ -204,6 +217,7 @@ impl Profile {
             && !self.legacy_algorithms
             && self.desktop_port.is_none()
             && self.vnc_port.is_none()
+            && self.virtual_desktop.is_none()
             && self.kind == SessionKind::Ssh
             && self.via.is_none()
             && self.password == PasswordSource::Ask
@@ -585,6 +599,9 @@ impl Settings {
                                 }
                             }
                             "startdir" => p.start_dir = start_dir(&raw_rest(line)),
+                            "virtualdesktop" => {
+                                p.virtual_desktop = virtual_desktop(&raw_rest(line));
+                            }
                             "tmuxlayout" => {
                                 p.tmux_layout = first
                                     .map(|l| l.to_ascii_lowercase())
@@ -739,6 +756,9 @@ impl Settings {
             if let Some(port) = p.vnc_port {
                 let _ = writeln!(out, "    VncPort {port}");
             }
+            if let Some(c) = &p.virtual_desktop {
+                let _ = writeln!(out, "    VirtualDesktop {c}");
+            }
             if p.kind != SessionKind::Ssh {
                 let _ = writeln!(out, "    Type {}", p.kind.name());
             }
@@ -892,6 +912,7 @@ Profile web
     AutoReconnect yes
     DesktopPort 3390
     VncPort 5901
+    VirtualDesktop dbus-run-session  "startxfce4"  
     Type RDP
     Via jump-1
     PasswordCommand op read "op://Private/web 1/password"
@@ -970,6 +991,10 @@ NewKeyword later
         assert!(web.legacy_algorithms);
         assert_eq!(web.desktop_port, Some(3390));
         assert_eq!(web.vnc_port, Some(5901));
+        assert_eq!(
+            web.virtual_desktop.as_deref(),
+            Some(r#"dbus-run-session  "startxfce4""#)
+        );
         assert_eq!(web.kind, SessionKind::Rdp);
         assert_eq!(web.via.as_deref(), Some("jump-1"));
         assert_eq!(

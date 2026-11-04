@@ -63,6 +63,9 @@ pub struct Session {
     pub height: u16,
     pub layout: u32,
     pub user: String,
+    /// The VNC password, when FeroSSH chose it (a virtual desktop's):
+    /// given when the server asks, without a prompt.
+    pub password: Option<Zeroizing<String>>,
 }
 
 /// One remote desktop session.
@@ -70,6 +73,8 @@ pub struct Desktop {
     protocol: Protocol,
     /// The user name offered when the prompt is left empty.
     user: String,
+    /// The password to answer the server's first ask with.
+    preset: Option<Zeroizing<String>>,
     to_viewer: Sender<ToViewer>,
     from: Receiver<FromThreads>,
     tunnel: TcpStream,
@@ -204,6 +209,7 @@ impl Desktop {
         Ok(Self {
             protocol: session.protocol,
             user: session.user,
+            preset: session.password,
             to_viewer: tx,
             from,
             tunnel,
@@ -257,6 +263,11 @@ impl Desktop {
                 }
                 Ok(Applied::Other(FromViewer::Bell)) => out.push(Update::Bell),
                 Ok(Applied::Other(FromViewer::NeedPassword)) => match self.protocol {
+                    Protocol::Vnc if self.preset.is_some() => {
+                        if let Some(pw) = self.preset.take() {
+                            self.send(ToViewer::Password(pw.as_bytes().to_vec()));
+                        }
+                    }
                     Protocol::Vnc => {
                         self.phase = Phase::Password(Zeroizing::new(String::new()));
                         out.push(Update::Ask("VNC password: ".into()));
@@ -540,6 +551,7 @@ mod tests {
             height: 0,
             layout: 0,
             user: String::new(),
+            password: None,
         };
         let mut d =
             Desktop::start(&addr, session, window_out, window_in, Box::new(()), || {}).unwrap();
@@ -584,5 +596,37 @@ mod tests {
             std::thread::sleep(Duration::from_millis(5));
         }
         assert!(!d.running());
+    }
+
+    /// A virtual desktop's password goes to the server without a prompt.
+    #[test]
+    fn a_chosen_password_needs_no_prompt() {
+        let (addr, srv) = server();
+        let (viewer_in, window_out) = std::io::pipe().unwrap();
+        let (window_in, viewer_out) = std::io::pipe().unwrap();
+        std::thread::spawn(move || ferossh_viewer::viewer::run(viewer_in, viewer_out));
+        let session = Session {
+            protocol: Protocol::Vnc,
+            width: 0,
+            height: 0,
+            layout: 0,
+            user: String::new(),
+            password: Some(Zeroizing::new("pw".into())),
+        };
+        let mut d =
+            Desktop::start(&addr, session, window_out, window_in, Box::new(()), || {}).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !d.running() {
+            assert!(Instant::now() < deadline);
+            for u in d.poll() {
+                assert!(!matches!(u, Update::Ask(_) | Update::Ended(_)), "{u:?}");
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(!d.asking());
+        d.char('a');
+        d.mouse((0, 0, 300, 200), 149, 100, Some((1, true)));
+        let got = srv.join().unwrap();
+        assert_eq!(&got[16..], [5, 1, 0, 1, 0, 1]);
     }
 }
