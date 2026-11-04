@@ -614,26 +614,44 @@ fn on_path(program: &str) -> bool {
         .is_some_and(|p| std::env::split_paths(&p).any(|d| d.join(program).is_file()))
 }
 
-/// Session > Open virtual desktop end to end: the script runs on an exec
-/// channel of a real login, starts Xvfb and x11vnc there, and says where
-/// x11vnc listens; a desktop tunnel to that port reaches a VNC server that
-/// asks for a password and listens on loopback only. Closing the channel
-/// stops it all on the server. Skipped where Xvfb, x11vnc or xauth is
-/// missing, unless FEROSSH_REQUIRE_XVFB is set.
+/// Session > Open virtual desktop end to end, at a fixed size: the
+/// script runs on an exec channel of a real login, starts Xvfb and x11vnc
+/// there, and says where x11vnc listens; a desktop tunnel to that port
+/// reaches a VNC server that asks for a password and listens on loopback
+/// only. Closing the channel stops it all on the server. Skipped where
+/// Xvfb, x11vnc or xauth is missing, unless FEROSSH_REQUIRE_XVFB is set.
 #[test]
 fn virtual_desktop_starts_and_stops_on_the_server() {
-    use crate::vdesk::{self, Event};
-    use ferossh_ipc::Message;
-
     let have = ["Xvfb", "x11vnc", "xauth"].iter().all(|p| on_path(p));
     assert!(
         have || std::env::var_os("FEROSSH_REQUIRE_XVFB").is_none(),
         "FEROSSH_REQUIRE_XVFB is set but Xvfb, x11vnc or xauth is missing"
     );
-    if !have {
-        return;
+    if have {
+        virtual_desktop(false);
     }
-    let Some(server) = start_sshd("vdesk", "") else {
+}
+
+/// The same, following the window: the script picks TigerVNC's Xvnc,
+/// which takes the viewer's size changes. Skipped without Xvnc, unless
+/// FEROSSH_REQUIRE_XVNC is set.
+#[test]
+fn a_following_virtual_desktop_runs_xvnc() {
+    let have = ["Xvnc", "vncpasswd", "xauth"].iter().all(|p| on_path(p));
+    assert!(
+        have || std::env::var_os("FEROSSH_REQUIRE_XVNC").is_none(),
+        "FEROSSH_REQUIRE_XVNC is set but Xvnc, vncpasswd or xauth is missing"
+    );
+    if have {
+        virtual_desktop(true);
+    }
+}
+
+fn virtual_desktop(follow: bool) {
+    use crate::vdesk::{self, Event};
+    use ferossh_ipc::Message;
+
+    let Some(server) = start_sshd(if follow { "vdesk-xvnc" } else { "vdesk" }, "") else {
         return;
     };
     let user = local_user();
@@ -676,7 +694,7 @@ fn virtual_desktop_starts_and_stops_on_the_server() {
         command: vdesk::command(),
     });
     let password = vdesk::password();
-    let input = vdesk::input(&password, Some("sleep 600"), 800, 600).unwrap();
+    let input = vdesk::input(&password, Some("sleep 600"), 800, 600, follow).unwrap();
     shell.link.send(Message::Data {
         channel: EXEC,
         bytes: input.to_vec(),
@@ -690,7 +708,14 @@ fn virtual_desktop_starts_and_stops_on_the_server() {
                 channel: EXEC,
                 bytes,
             })) => match out.feed(&bytes).into_iter().next() {
-                Some(Event::Ready { port, display }) => break (port, display),
+                Some(Event::Ready {
+                    port,
+                    display,
+                    resizes,
+                }) => {
+                    assert_eq!(resizes, follow, "the wrong X server");
+                    break (port, display);
+                }
                 Some(e) => panic!("the virtual desktop did not start: {e:?}"),
                 None => {}
             },
@@ -739,6 +764,18 @@ fn virtual_desktop_starts_and_stops_on_the_server() {
     s.read_exact(&mut types).unwrap();
     // VNC Authentication, never None.
     assert_eq!(types, [2]);
+    // The password FeroSSH chose opens it.
+    #[cfg(feature = "vnc-viewer")]
+    {
+        s.write_all(&[2]).unwrap();
+        let mut challenge = [0u8; 16];
+        s.read_exact(&mut challenge).unwrap();
+        let answer = ferossh_viewer::vnc::vnc_response(password.as_bytes(), &challenge);
+        s.write_all(&answer).unwrap();
+        let mut result = [0u8; 4];
+        s.read_exact(&mut result).unwrap();
+        assert_eq!(result, [0, 0, 0, 0], "the password was refused");
+    }
     drop(s);
 
     // Closing the channel stops Xvfb, x11vnc and the program.

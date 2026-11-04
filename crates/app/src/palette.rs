@@ -81,7 +81,7 @@ impl Entry {
 
     pub fn session(name: &str, detail: &str, kind: SessionKind) -> Self {
         let prefix = match kind {
-            SessionKind::Rdp | SessionKind::Vnc => "Open",
+            SessionKind::Rdp | SessionKind::Vnc | SessionKind::Xvfb => "Open",
             _ => "Connect",
         };
         let tag = match kind {
@@ -90,6 +90,7 @@ impl Entry {
             SessionKind::Vnc => "vnc",
             SessionKind::Serial => "serial",
             SessionKind::Telnet => "telnet",
+            SessionKind::Xvfb => "xvfb virtual desktop",
         };
         Self {
             prefix,

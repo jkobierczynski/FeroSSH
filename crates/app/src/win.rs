@@ -879,22 +879,33 @@ struct PendingDesktop {
 #[derive(Debug, Clone)]
 enum DesktopWant {
     /// Windows' Remote Desktop Connection, over RDP.
-    Rdp { pane: PaneId },
-    /// The built-in viewer in a new tab; `label` names the host and
-    /// `user` is the SSH user, offered for RDP.
-    Tab {
-        label: String,
-        user: String,
-        protocol: Protocol,
-        /// A virtual desktop's: its password and script channel.
-        vdesk: Option<(Zeroizing<String>, ChannelId)>,
+    /// `size` is the window's fixed size, if one was set.
+    Rdp {
+        pane: PaneId,
+        size: Option<(u16, u16)>,
     },
+    /// The built-in viewer in a new tab.
+    Tab(TabWant),
     /// A VNC viewer installed on this PC, for a virtual desktop without
     /// the built-in viewer; notes go to `pane`.
     Vnc {
         pane: PaneId,
         password: Zeroizing<String>,
     },
+}
+
+/// A desktop for the built-in viewer's tab: `label` names the host and
+/// `user` is the SSH user, offered for RDP.
+#[derive(Debug, Clone)]
+#[cfg_attr(not(feature = "viewer"), allow(dead_code))]
+struct TabWant {
+    label: String,
+    user: String,
+    protocol: Protocol,
+    /// A virtual desktop's: its password and script channel.
+    vdesk: Option<(Zeroizing<String>, ChannelId)>,
+    /// A fixed size; `None` follows the pane.
+    size: Option<(u16, u16)>,
 }
 
 /// Session > Open virtual desktop: Xvfb and x11vnc on the server, run by
@@ -909,6 +920,12 @@ struct VirtualDesk {
     out: vdesk::Output,
     /// x11vnc's port on the server, once it listens.
     port: Option<u16>,
+    /// The size it was started at, and whether it should follow its
+    /// viewer (which takes Xvnc on the server).
+    size: (u16, u16),
+    follow: bool,
+    /// Its server takes the viewer's size changes (Xvnc).
+    resizes: bool,
     /// In a tab of the built-in viewer, rather than a viewer on this PC.
     tab: bool,
     /// Its tab opened; closing that tab now stops it.
@@ -2992,6 +3009,7 @@ impl Window {
         };
         let profile = self.settings.profile(&s.target.alias);
         let label = s.target.label();
+        let size = self.fixed_desktop_size(&s.target.alias);
         let rdp_port = profile
             .and_then(|p| p.desktop_port)
             .unwrap_or(DEFAULT_DESKTOP_PORT);
@@ -3006,18 +3024,19 @@ impl Window {
                 (
                     port,
                     0,
-                    DesktopWant::Tab {
+                    DesktopWant::Tab(TabWant {
                         label,
                         user,
                         protocol,
                         vdesk: None,
-                    },
+                        size,
+                    }),
                 )
             }
             None => (
                 rdp_port,
                 desktop_port_for(&label),
-                DesktopWant::Rdp { pane },
+                DesktopWant::Rdp { pane, size },
             ),
         };
         let w = self.workers.get(&connection)?;
@@ -3051,8 +3070,8 @@ impl Window {
                     port,
                     addr,
                 } => match self.desktops.remove(&(connection, host, port)) {
-                    Some(DesktopWant::Rdp { pane }) => {
-                        let note = match launch_rdp_client(&addr) {
+                    Some(DesktopWant::Rdp { pane, size }) => {
+                        let note = match launch_rdp_client(&addr, size) {
                             Ok(()) => format!(
                                 "\x1b[0;90mRemote desktop tunnel at {addr}; Remote Desktop \
                                  Connection opens on it. It closes with this connection.\x1b[0m\r\n"
@@ -3065,12 +3084,7 @@ impl Window {
                         self.show(pane, &note);
                         self.refresh(pane);
                     }
-                    Some(DesktopWant::Tab {
-                        label,
-                        user,
-                        protocol,
-                        vdesk,
-                    }) => self.desktop_tab(connection, label, user, protocol, vdesk, &addr),
+                    Some(DesktopWant::Tab(want)) => self.desktop_tab(connection, want, &addr),
                     Some(DesktopWant::Vnc { pane, password }) => {
                         let note = match launch_vnc_viewer(&addr) {
                             Some(viewer) => format!(
@@ -3100,11 +3114,11 @@ impl Window {
                     let advice = match self.desktops.remove(&(connection, host, port)) {
                         // The script started that server: nothing to advise.
                         Some(DesktopWant::Vnc { .. })
-                        | Some(DesktopWant::Tab { vdesk: Some(_), .. }) => "",
-                        Some(DesktopWant::Tab {
+                        | Some(DesktopWant::Tab(TabWant { vdesk: Some(_), .. })) => "",
+                        Some(DesktopWant::Tab(TabWant {
                             protocol: Protocol::Vnc,
                             ..
-                        }) => {
+                        })) => {
                             " Start a VNC server for your desktop there (x11vnc or TigerVNC \
                              for X11, wayvnc or GNOME's VNC mode for Wayland), or set VncPort \
                              in this host's profile if it listens elsewhere."
@@ -3121,11 +3135,22 @@ impl Window {
         }
     }
 
+    /// The fixed desktop size set for connection `alias`; `None` when its
+    /// desktops follow their pane.
+    fn fixed_desktop_size(&self, alias: &str) -> Option<(u16, u16)> {
+        self.settings
+            .profile(alias)
+            .and_then(|p| p.desktop_size)
+            .and_then(|d| d.fixed())
+    }
+
     /// Session > Open virtual desktop: runs [`vdesk::command`] on an exec
     /// channel of the pane's connection; [`Self::on_vdesk`] opens a viewer
     /// once x11vnc listens. A second ask on the same connection opens
     /// another viewer on the running one.
-    fn open_virtual_desktop(&mut self, pane: PaneId) -> Option<Command> {
+    /// `from` names a saved virtual desktop connection whose program and
+    /// size to use; else the SSH host's own.
+    fn open_virtual_desktop(&mut self, pane: PaneId, from: Option<&str>) -> Option<Command> {
         let host = self.host_pane(pane);
         let (Some(connection), Some(Host::Ssh(s))) = (
             self.pane_connection(pane),
@@ -3150,19 +3175,23 @@ impl Window {
             }
             None => {}
         }
+        let alias = from.unwrap_or(&s.target.alias).to_owned();
         let program = self
             .settings
-            .profile(&s.target.alias)
+            .profile(&alias)
             .and_then(|p| p.virtual_desktop.clone());
-        let label = s.target.label();
+        let label = from.map_or_else(|| s.target.label(), str::to_owned);
         let user = s.target.user.clone();
-        let (width, height) = self
-            .panes
-            .get(&pane)
-            .map(|p| desktop_size(p.rect))
-            .unwrap_or((1600, 900));
+        let fixed = self.fixed_desktop_size(&alias);
+        let (width, height) = fixed.unwrap_or_else(|| {
+            self.panes
+                .get(&pane)
+                .map(|p| desktop_size(p.rect))
+                .unwrap_or((1600, 900))
+        });
+        let follow = fixed.is_none();
         let password = vdesk::password();
-        let Some(input) = vdesk::input(&password, program.as_deref(), width, height) else {
+        let Some(input) = vdesk::input(&password, program.as_deref(), width, height, follow) else {
             return Some(Command::Notice(
                 "This host's VirtualDesktop command must be one line.".into(),
             ));
@@ -3188,6 +3217,9 @@ impl Window {
                 password,
                 out: vdesk::Output::default(),
                 port: None,
+                size: (width, height),
+                follow,
+                resizes: false,
                 tab: cfg!(feature = "vnc-viewer"),
                 shown: false,
                 reported: false,
@@ -3200,8 +3232,8 @@ impl Window {
         self.show(
             pane,
             &format!(
-                "\x1b[0;90mStarting a virtual desktop{what} on the server (Xvfb and \
-                 x11vnc)...\x1b[0m\r\n"
+                "\x1b[0;90mStarting a virtual desktop{what} on the server (Xvfb or \
+                 Xvnc)...\x1b[0m\r\n"
             ),
         );
         self.refresh(pane);
@@ -3281,12 +3313,14 @@ impl Window {
         let (local, want) = if v.tab {
             (
                 0,
-                DesktopWant::Tab {
+                DesktopWant::Tab(TabWant {
                     label: v.label.clone(),
                     user: v.user.clone(),
                     protocol: Protocol::Vnc,
                     vdesk: Some((v.password.clone(), channel)),
-                },
+                    // Xvnc follows the tab; Xvfb keeps its size.
+                    size: (!(v.follow && v.resizes)).then_some(v.size),
+                }),
             )
         } else {
             (
@@ -3361,16 +3395,29 @@ impl Window {
                      host's connection settings to the desktop or program to run."
                 )));
             }
-            vdesk::Event::Ready { port, display } => {
+            vdesk::Event::Ready {
+                port,
+                display,
+                resizes,
+            } => {
+                let mut fixed_note = String::new();
                 if let Some(v) = self.vdesks.get_mut(&channel) {
                     v.port = Some(port);
+                    v.resizes = resizes;
+                    if v.follow && !resizes {
+                        fixed_note = format!(
+                            " It stays {}x{}: to follow the window's size, install TigerVNC's \
+                             Xvnc on the server (tigervnc-standalone-server).",
+                            v.size.0, v.size.1
+                        );
+                    }
                 }
                 self.show(
                     pane,
                     &format!(
                         "\x1b[0;90mVirtual desktop {display} runs on the server; opening it \
                          through the SSH tunnel. It stops when its viewer tab closes, with \
-                         Session > Stop virtual desktop, or with this connection.\x1b[0m\r\n"
+                         Session > Stop virtual desktop, or with this connection.{fixed_note}\x1b[0m\r\n"
                     ),
                 );
                 self.refresh(pane);
@@ -3396,22 +3443,23 @@ impl Window {
 
     /// Opens the built-in viewer on the tunnel at `addr` in a new tab.
     #[cfg(feature = "viewer")]
-    fn desktop_tab(
-        &mut self,
-        connection: ChannelId,
-        label: String,
-        user: String,
-        protocol: Protocol,
-        vdesk: Option<(Zeroizing<String>, ChannelId)>,
-        addr: &str,
-    ) {
+    fn desktop_tab(&mut self, connection: ChannelId, want: TabWant, addr: &str) {
+        let TabWant {
+            label,
+            user,
+            protocol,
+            vdesk,
+            size,
+        } = want;
         let id = self.new_tab_pane();
-        // The server draws the desktop at the size of the tab, when it can.
-        let (width, height) = self
-            .panes
-            .get(&id)
-            .map(|p| desktop_size(p.rect))
-            .unwrap_or((1024, 768));
+        // The server draws the desktop at the size of the tab, when it
+        // can, unless a size was set.
+        let (width, height) = size.unwrap_or_else(|| {
+            self.panes
+                .get(&id)
+                .map(|p| desktop_size(p.rect))
+                .unwrap_or((1024, 768))
+        });
         let session = crate::desktop::Session {
             protocol,
             width,
@@ -3419,6 +3467,7 @@ impl Window {
             layout: keyboard_layout(),
             user,
             password: vdesk.as_ref().map(|(pw, _)| pw.clone()),
+            fixed: size.is_some(),
         };
         let script = vdesk.map(|(_, channel)| channel);
         // From here its tab decides: closing it, or a viewer that never
@@ -3460,16 +3509,7 @@ impl Window {
     }
 
     #[cfg(not(feature = "viewer"))]
-    fn desktop_tab(
-        &mut self,
-        _connection: ChannelId,
-        _label: String,
-        _user: String,
-        _protocol: Protocol,
-        _vdesk: Option<(Zeroizing<String>, ChannelId)>,
-        _addr: &str,
-    ) {
-    }
+    fn desktop_tab(&mut self, _connection: ChannelId, _want: TabWant, _addr: &str) {}
 
     /// Gives each remote desktop its pane's size, after the layout
     /// settled.
@@ -7978,8 +8018,8 @@ impl Window {
         let Some(via) = via else {
             if kind != SessionKind::Rdp {
                 self.queued.push(Command::Notice(format!(
-                    "A VNC desktop goes through an SSH session. Choose one under Via SSH in \
-                     the session form (F2 on {name})."
+                    "A VNC or virtual desktop goes through an SSH connection. Choose one under \
+                     Via SSH in the connection form (F2 on {name})."
                 )));
                 return;
             }
@@ -7989,7 +8029,7 @@ impl Window {
             } else {
                 format!("{host}:{port}")
             };
-            if let Err(e) = launch_rdp_client(&addr) {
+            if let Err(e) = launch_rdp_client(&addr, self.fixed_desktop_size(name)) {
                 self.queued.push(Command::Notice(format!(
                     "Remote Desktop Connection (mstsc.exe) did not start: {e}"
                 )));
@@ -8034,17 +8074,28 @@ impl Window {
         ) else {
             return;
         };
+        if p.kind == SessionKind::Xvfb {
+            if let Some(c) = self.open_virtual_desktop(id, Some(&p.label)) {
+                self.queued.push(c);
+            }
+            return;
+        }
+        let size = self.fixed_desktop_size(&p.label);
         let (local, want) = match p.kind {
             SessionKind::Vnc => (
                 0,
-                DesktopWant::Tab {
+                DesktopWant::Tab(TabWant {
                     label: p.label.clone(),
                     user: p.user.clone().unwrap_or_else(|| s.target.user.clone()),
                     protocol: Protocol::Vnc,
                     vdesk: None,
-                },
+                    size,
+                }),
             ),
-            _ => (desktop_port_for(&p.label), DesktopWant::Rdp { pane: id }),
+            _ => (
+                desktop_port_for(&p.label),
+                DesktopWant::Rdp { pane: id, size },
+            ),
         };
         let Some(w) = self.workers.get(&connection) else {
             return;
@@ -9329,7 +9380,7 @@ impl Window {
             cmd::DESKTOP => return self.open_desktop(pane, None),
             cmd::DESKTOP_TAB => return self.open_desktop(pane, Some(Protocol::Vnc)),
             cmd::DESKTOP_TAB_RDP => return self.open_desktop(pane, Some(Protocol::Rdp)),
-            cmd::VDESK => return self.open_virtual_desktop(pane),
+            cmd::VDESK => return self.open_virtual_desktop(pane, None),
             cmd::VDESK_STOP => return self.stop_virtual_desktop(pane),
             cmd::TMUX_DETACH | cmd::TMUX_PICK | cmd::TMUX_LAYOUT => {
                 let host = self.host_pane(pane);
@@ -10603,13 +10654,17 @@ fn launch_vnc_viewer(addr: &str) -> Option<&'static str> {
         .map(|_| name)
 }
 
-fn launch_rdp_client(addr: &str) -> std::io::Result<()> {
+/// Opens Remote Desktop Connection on `addr`, at `size` when one is set
+/// (else at its own default).
+fn launch_rdp_client(addr: &str, size: Option<(u16, u16)>) -> std::io::Result<()> {
     let root = std::env::var_os("SystemRoot").unwrap_or_else(|| "C:\\Windows".into());
     let mstsc = PathBuf::from(root).join("System32").join("mstsc.exe");
-    std::process::Command::new(mstsc)
-        .arg(format!("/v:{addr}"))
-        .spawn()
-        .map(drop)
+    let mut c = std::process::Command::new(mstsc);
+    c.arg(format!("/v:{addr}"));
+    if let Some((w, h)) = size {
+        c.arg(format!("/w:{w}")).arg(format!("/h:{h}"));
+    }
+    c.spawn().map(drop)
 }
 
 /// The key of a host's transfer queue: one per user, host name and port.
