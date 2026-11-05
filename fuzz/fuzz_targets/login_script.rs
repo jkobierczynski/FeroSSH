@@ -42,7 +42,7 @@ fuzz_target!(|data: &[u8]| {
     let mut expected = steps.iter().filter_map(|s| match s {
         Step::Send(_) | Step::Type(_) | Step::Key(_) => s.bytes(),
         Step::Password | Step::Secret(_) => Some(format!("{SECRET}\r").into_bytes()),
-        Step::Expect(_) | Step::Capture(_) | Step::Pause(_) => None,
+        Step::Expect(_) | Step::Capture(_) | Step::Pause(_) | Step::Delay(_) => None,
     });
 
     let start = Instant::now();

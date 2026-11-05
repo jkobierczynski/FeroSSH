@@ -49,6 +49,12 @@
 //!     Type telnet
 //! Secret enable
 //!     PasswordCommand op read "op://Network/%n/password"
+//! ```
+//!
+//! Command snippets have a file each in the `snippets` folder beside it
+//! (see [`crate::snippet_store`]), in the same syntax:
+//!
+//! ```text
 //! Snippet "Show interfaces"
 //!     Line terminal length 0
 //!     Line show ip interface brief
@@ -59,11 +65,16 @@
 //!     Line copy running-config tftp://10.0.0.5/${host}-${stamp}.cfg
 //!     Line @expect ]?
 //!     Line @key enter
+//! Snippet "Find in logs"
+//!     Line @type grep -i error /var/log/syslog
 //! Snippet "Next page"
 //!     Hosts sw-*
 //!     When --More--
 //!     Line @key space
 //! ```
+//!
+//! Older versions kept those `Snippet` blocks in this file; they are
+//! read so they can move to the folder.
 //!
 //! FeroSSH rewrites the file when a setting changes. Unknown keywords are
 //! skipped, so an older FeroSSH reads a newer file.
@@ -317,7 +328,11 @@ pub struct Settings {
     /// Password manager commands for login script secrets; the rest are
     /// in the Windows Credential Manager.
     pub secrets: Vec<SecretSource>,
-    /// Command snippets, in the order the user keeps them.
+    /// Command snippets. They live in the snippets folder, a file each
+    /// (see [`crate::snippet_store`]); `Snippet` blocks read from this
+    /// file are from an older FeroSSH, to be moved there. Until they are
+    /// (their `file` is unset), the file keeps writing them, so none is
+    /// lost when the folder cannot be written.
     pub snippets: Vec<Snippet>,
     /// Ask before a snippet is typed into a pane with the Production
     /// theme. On unless turned off.
@@ -447,6 +462,44 @@ fn arg(text: &str) -> String {
     } else {
         clean
     }
+}
+
+/// A snippet as a `Snippet` block of the settings syntax: what a file in
+/// the snippets folder holds (see [`crate::snippet_store`]). Empty for a
+/// snippet without a name.
+pub fn snippet_block(snippet: &Snippet) -> String {
+    let mut out = String::new();
+    let name = clean(&snippet.name);
+    if name.is_empty() {
+        return out;
+    }
+    let _ = writeln!(out, "Snippet {}", arg(&name));
+    let hosts: Vec<String> = snippet
+        .hosts
+        .iter()
+        .map(|h| arg(h))
+        .filter(|h| !h.starts_with('"'))
+        .collect();
+    if !hosts.is_empty() {
+        let _ = writeln!(out, "    Hosts {}", hosts.join(" "));
+    }
+    for f in &snippet.folders {
+        let f = clean(f);
+        if !f.is_empty() {
+            let _ = writeln!(out, "    Folder {f}");
+        }
+    }
+    if let Some(n) = snippet.hotkey {
+        let _ = writeln!(out, "    Hotkey F{n}");
+    }
+    let when = clean(&snippet.when);
+    if !when.is_empty() {
+        let _ = writeln!(out, "    When {when}");
+    }
+    for l in &snippet.lines {
+        let _ = writeln!(out, "    Line {}", clean(l));
+    }
+    out
 }
 
 impl Settings {
@@ -886,37 +939,8 @@ impl Settings {
             let _ = writeln!(out, "Secret {}", x.name);
             let _ = writeln!(out, "    PasswordCommand {}", clean(&x.command));
         }
-        for snippet in &self.snippets {
-            let name = clean(&snippet.name);
-            if name.is_empty() {
-                continue;
-            }
-            let _ = writeln!(out, "Snippet {}", arg(&name));
-            let hosts: Vec<String> = snippet
-                .hosts
-                .iter()
-                .map(|h| arg(h))
-                .filter(|h| !h.starts_with('"'))
-                .collect();
-            if !hosts.is_empty() {
-                let _ = writeln!(out, "    Hosts {}", hosts.join(" "));
-            }
-            for f in &snippet.folders {
-                let f = clean(f);
-                if !f.is_empty() {
-                    let _ = writeln!(out, "    Folder {f}");
-                }
-            }
-            if let Some(n) = snippet.hotkey {
-                let _ = writeln!(out, "    Hotkey F{n}");
-            }
-            let when = clean(&snippet.when);
-            if !when.is_empty() {
-                let _ = writeln!(out, "    When {when}");
-            }
-            for l in &snippet.lines {
-                let _ = writeln!(out, "    Line {}", clean(l));
-            }
+        for snippet in self.snippets.iter().filter(|x| x.file.is_none()) {
+            out.push_str(&snippet_block(snippet));
         }
         out
     }
@@ -1183,6 +1207,7 @@ NewKeyword later
                     folders: vec!["Lab gear".into()],
                     hotkey: Some(3),
                     when: "--More--".into(),
+                    ..Snippet::default()
                 },
                 Snippet {
                     name: "Bad key".into(),
@@ -1203,6 +1228,12 @@ NewKeyword later
         let s = Settings::parse(TEXT);
         let again = Settings::parse(&s.to_text());
         assert_eq!(again, s);
+        // Snippets in the snippets folder stay out of the file.
+        let mut moved = s.clone();
+        for x in &mut moved.snippets {
+            x.file = Some(format!("{}.snippet", x.name));
+        }
+        assert!(Settings::parse(&moved.to_text()).snippets.is_empty());
         assert_eq!(Settings::parse(""), Settings::default());
     }
 

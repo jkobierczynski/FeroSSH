@@ -188,6 +188,12 @@ impl Runner {
                     self.deadline = Some(now + Duration::from_secs(u64::from(*secs)));
                     return;
                 }
+                Step::Delay(ms) => {
+                    self.next += 1;
+                    self.wait = Wait::Pause;
+                    self.deadline = Some(now + Duration::from_millis(u64::from(*ms)));
+                    return;
+                }
                 Step::Password => {
                     self.wait = Wait::Secret;
                     out.push(Action::Fetch(Need::Password));

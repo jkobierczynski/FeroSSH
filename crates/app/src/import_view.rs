@@ -1,27 +1,36 @@
 //! The side pane's import page: which other SSH clients have saved
-//! sessions on this account, then a preview with a box per session, so
-//! nothing is written until the user has said which ones.
+//! sessions (or, for File > Import snippets, command snippets) on this
+//! account, then a preview with a box per item, so nothing is written
+//! until the user has said which ones.
 //!
 //! Keys come in as [`SideKey`]s; what the user chose comes out as an
 //! [`ImportAction`]. The window reads the clients and writes the import.
 
 use ferossh_config::SessionKind;
 use ferossh_config::import::{Client, Session};
+use ferossh_config::login::Snippet;
+use ferossh_config::snippet_import::SnippetClient;
 use ferossh_render::{Flags, Grid};
 
 use crate::session_form::Line;
 use crate::sessions::SideKey;
 use crate::tabstrip::{Palette, fit};
 
-/// Sessions found in one place.
+/// What was found in one place.
+#[derive(Clone, Debug)]
+pub enum Items {
+    Sessions(Client, Vec<Session>),
+    Snippets(SnippetClient, Vec<Snippet>),
+}
+
+/// Sessions or snippets found in one place.
 #[derive(Clone, Debug)]
 pub struct Found {
-    pub client: Client,
     /// Where they were read, for the user: "registry" or a file's path.
     pub origin: String,
-    pub sessions: Vec<Session>,
-    /// Per session: its name is already a host elsewhere, so it is left
-    /// out.
+    pub items: Items,
+    /// Per item: a host elsewhere has its name, or a snippet with its
+    /// name is in its category already, so it is left out.
     pub taken: Vec<bool>,
 }
 
@@ -30,8 +39,119 @@ impl Found {
         self.taken.get(i).copied().unwrap_or(false)
     }
 
+    fn len(&self) -> usize {
+        match &self.items {
+            Items::Sessions(_, s) => s.len(),
+            Items::Snippets(_, s) => s.len(),
+        }
+    }
+
     fn importable(&self) -> usize {
-        (0..self.sessions.len()).filter(|&i| !self.taken(i)).count()
+        (0..self.len()).filter(|&i| !self.taken(i)).count()
+    }
+
+    /// The program's name.
+    fn name(&self) -> &'static str {
+        match &self.items {
+            Items::Sessions(c, _) => c.name(),
+            Items::Snippets(c, _) => c.name(),
+        }
+    }
+
+    /// How many of what, for the list of sources.
+    fn what(&self) -> String {
+        let n = self.len();
+        let s = if n == 1 { "" } else { "s" };
+        match &self.items {
+            Items::Sessions(..) => format!("{n} session{s}"),
+            Items::Snippets(..) => format!("{n} snippet{s}"),
+        }
+    }
+
+    /// Item `i`'s name.
+    fn label(&self, i: usize) -> String {
+        match &self.items {
+            Items::Sessions(_, s) => s.get(i).map(|s| s.name.clone()),
+            Items::Snippets(_, s) => s.get(i).map(|s| s.name.clone()),
+        }
+        .unwrap_or_default()
+    }
+
+    /// What follows item `i`'s name, dimmed.
+    fn detail(&self, i: usize) -> String {
+        match &self.items {
+            Items::Sessions(_, all) => {
+                let Some(s) = all.get(i) else {
+                    return String::new();
+                };
+                let mut to = s.host.hostname.clone().unwrap_or_default();
+                if let Some(u) = &s.host.user {
+                    to = format!("{u}@{to}");
+                }
+                if let Some(p) = s.host.port {
+                    to.push_str(&format!(":{p}"));
+                }
+                match s.kind {
+                    SessionKind::Ssh => {}
+                    SessionKind::Rdp => to.push_str(" RDP"),
+                    SessionKind::Vnc => to.push_str(" VNC"),
+                    SessionKind::Serial => to.push_str(" serial"),
+                    SessionKind::Telnet => to.push_str(" Telnet"),
+                    SessionKind::Xvfb => to.push_str(" virtual desktop"),
+                }
+                to
+            }
+            Items::Snippets(_, all) => all.get(i).map(|s| s.category.clone()).unwrap_or_default(),
+        }
+    }
+
+    /// The notes under item `i`.
+    fn notes(&self, i: usize) -> Vec<String> {
+        if self.taken(i) {
+            return vec![match &self.items {
+                Items::Sessions(_, s) => s
+                    .get(i)
+                    .map(|s| format!("{} is already a host", s.host.alias))
+                    .unwrap_or_default(),
+                Items::Snippets(..) => "already a snippet in this category".to_owned(),
+            }];
+        }
+        match &self.items {
+            Items::Sessions(_, all) => {
+                let Some(s) = all.get(i) else {
+                    return Vec::new();
+                };
+                let mut out = Vec::new();
+                if s.had_password {
+                    out.push("its saved password stays behind".into());
+                }
+                out.extend(s.notes.iter().cloned());
+                out
+            }
+            // The lines, so a guess at another program's format can be
+            // checked before it is written.
+            Items::Snippets(_, all) => {
+                let Some(s) = all.get(i) else {
+                    return Vec::new();
+                };
+                let mut out: Vec<String> =
+                    s.lines.iter().take(3).map(|l| format!("› {l}")).collect();
+                if s.lines.len() > 3 {
+                    let n = s.lines.len() - 3;
+                    out.push(format!("… {n} more line{}", if n == 1 { "" } else { "s" }));
+                }
+                out
+            }
+        }
+    }
+
+    fn same_source(&self, other: &Found) -> bool {
+        let kind = match (&self.items, &other.items) {
+            (Items::Sessions(a, _), Items::Sessions(b, _)) => a == b,
+            (Items::Snippets(a, _), Items::Snippets(b, _)) => a == b,
+            _ => false,
+        };
+        kind && self.origin == other.origin
     }
 }
 
@@ -45,6 +165,8 @@ pub enum ImportAction {
         client: Client,
         sessions: Vec<Session>,
     },
+    /// Add these snippets to the snippets folder.
+    ImportSnippets(Vec<Snippet>),
     Close,
 }
 
@@ -63,6 +185,8 @@ const IMPORT: usize = 0;
 const BACK: usize = 1;
 
 pub struct ImportView {
+    /// Snippets are imported, not connections.
+    snippets: bool,
     found: Vec<Found>,
     /// Files that were found but could not be read, said on the first page.
     problems: Vec<String>,
@@ -77,7 +201,22 @@ pub struct ImportView {
 
 impl ImportView {
     pub fn new(found: Vec<Found>, problems: Vec<String>) -> Self {
+        Self::with(false, found, problems)
+    }
+
+    /// The page for File > Import snippets.
+    pub fn snippets(found: Vec<Found>, problems: Vec<String>) -> Self {
+        Self::with(true, found, problems)
+    }
+
+    /// Whether it imports snippets.
+    pub fn is_snippets(&self) -> bool {
+        self.snippets
+    }
+
+    fn with(snippets: bool, found: Vec<Found>, problems: Vec<String>) -> Self {
         let mut v = Self {
+            snippets,
             found,
             problems,
             open: None,
@@ -94,8 +233,7 @@ impl ImportView {
     /// Adds sessions read from a file and opens their preview. They
     /// replace what an earlier pick of the same file found.
     pub fn add(&mut self, found: Found) {
-        self.found
-            .retain(|f| !(f.client == found.client && f.origin == found.origin));
+        self.found.retain(|f| !f.same_source(&found));
         self.found.push(found);
         self.open_source(self.found.len() - 1);
     }
@@ -104,7 +242,7 @@ impl ImportView {
         let Some(f) = self.found.get(i) else {
             return;
         };
-        self.checked = (0..f.sessions.len()).map(|s| !f.taken(s)).collect();
+        self.checked = (0..f.len()).map(|s| !f.taken(s)).collect();
         self.open = Some(i);
         self.scroll = 0;
         self.button = IMPORT;
@@ -136,40 +274,55 @@ impl ImportView {
         let Some(f) = self.current() else {
             let mut r: Vec<Row> = (0..self.found.len()).map(Row::Source).collect();
             if self.found.is_empty() {
-                r.push(Row::Note("No other SSH client has sessions here.".into()));
+                r.push(Row::Note(
+                    if self.snippets {
+                        "No other program has snippets here."
+                    } else {
+                        "No other SSH client has sessions here."
+                    }
+                    .into(),
+                ));
             }
             r.extend(self.problems.iter().cloned().map(Row::Note));
             if self.found.is_empty() || !self.problems.is_empty() {
                 r.push(Row::Blank);
             }
             r.push(Row::FromFile);
-            r.push(Row::Note("WinSCP.ini, MobaXterm.ini, confCons.xml,".into()));
-            r.push(Row::Note("or a SecureCRT or KiTTY session file".into()));
-            r.push(Row::Blank);
-            r.push(Row::Note("Passwords are never imported.".into()));
+            if self.snippets {
+                r.push(Row::Note(
+                    "Windows Terminal settings.json or .wt.json,".into(),
+                ));
+                r.push(Row::Note(
+                    "SecureCRT ButtonBarV5.ini, MobaXterm.ini,".into(),
+                ));
+                r.push(Row::Note("a .snippet file, or a text file as one".into()));
+                r.push(Row::Blank);
+                r.push(Row::Note(
+                    "Each becomes a file in the snippets folder.".into(),
+                ));
+            } else {
+                r.push(Row::Note("WinSCP.ini, MobaXterm.ini, confCons.xml,".into()));
+                r.push(Row::Note("or a SecureCRT or KiTTY session file".into()));
+                r.push(Row::Blank);
+                r.push(Row::Note("Passwords are never imported.".into()));
+            }
             return r;
         };
         let mut r = vec![Row::All];
-        for (i, s) in f.sessions.iter().enumerate() {
+        for i in 0..f.len() {
             r.push(Row::Session(i));
-            if f.taken(i) {
-                r.push(Row::Note(format!("{} is already a host", s.host.alias)));
-                continue;
-            }
-            if s.had_password {
-                r.push(Row::Note("its saved password stays behind".into()));
-            }
-            for n in &s.notes {
-                r.push(Row::Note(n.clone()));
-            }
+            r.extend(f.notes(i).into_iter().map(Row::Note));
         }
         r.push(Row::Blank);
         r.push(Row::Buttons);
-        r.push(Row::Note(format!(
-            "Saved to {}, replacing an earlier {} import.",
-            f.client.file_name(),
-            f.client.name()
-        )));
+        r.push(Row::Note(match &f.items {
+            Items::Sessions(client, _) => format!(
+                "Saved to {}, replacing an earlier {} import.",
+                client.file_name(),
+                client.name()
+            ),
+            Items::Snippets(..) => "Added to the snippets folder, by category.".to_owned(),
+        }));
         r
     }
 
@@ -255,7 +408,7 @@ impl ImportView {
             Row::All => {
                 let f = self.current()?;
                 let on = self.chosen() < f.importable();
-                let taken: Vec<bool> = (0..f.sessions.len()).map(|i| f.taken(i)).collect();
+                let taken: Vec<bool> = (0..f.len()).map(|i| f.taken(i)).collect();
                 for (c, t) in self.checked.iter_mut().zip(taken) {
                     *c = on && !t;
                 }
@@ -273,15 +426,29 @@ impl ImportView {
             }
             Row::Buttons => {
                 let f = self.current()?;
-                let sessions: Vec<Session> = f
-                    .sessions
-                    .iter()
-                    .zip(&self.checked)
-                    .filter(|(_, c)| **c)
-                    .map(|(s, _)| s.clone())
-                    .collect();
-                let client = f.client;
-                (!sessions.is_empty()).then_some(ImportAction::Import { client, sessions })
+                match &f.items {
+                    Items::Sessions(client, all) => {
+                        let sessions: Vec<Session> = all
+                            .iter()
+                            .zip(&self.checked)
+                            .filter(|(_, c)| **c)
+                            .map(|(s, _)| s.clone())
+                            .collect();
+                        (!sessions.is_empty()).then_some(ImportAction::Import {
+                            client: *client,
+                            sessions,
+                        })
+                    }
+                    Items::Snippets(_, all) => {
+                        let snippets: Vec<Snippet> = all
+                            .iter()
+                            .zip(&self.checked)
+                            .filter(|(_, c)| **c)
+                            .map(|(s, _)| s.clone())
+                            .collect();
+                        (!snippets.is_empty()).then_some(ImportAction::ImportSnippets(snippets))
+                    }
+                }
             }
             Row::Note(_) | Row::Blank => None,
         }
@@ -342,7 +509,8 @@ impl ImportView {
         self.clamp(rows);
         let bg = palette.strip;
         let title = match self.current() {
-            Some(f) => format!(" Import from {}", f.client.name()),
+            Some(f) => format!(" Import from {}", f.name()),
+            None if self.snippets => " Import snippets".to_owned(),
             None => " Import connections".to_owned(),
         };
         grid.set_row(
@@ -361,14 +529,13 @@ impl ImportView {
             match all.get(i) {
                 Some(Row::Source(s)) => {
                     if let Some(f) = self.found.get(*s) {
-                        let n = f.sessions.len();
-                        let what = format!("{n} session{}", if n == 1 { "" } else { "s" });
+                        let what = f.what();
                         let origin = if f.origin == "registry" {
                             String::new()
                         } else {
                             format!(", {}", f.origin)
                         };
-                        let name = format!(" ▸ {}", f.client.name());
+                        let name = format!(" ▸ {}", f.name());
                         line.put(&name, palette.text, Flags::BOLD);
                         let rest = width.saturating_sub(line.col + 2);
                         line.put(
@@ -398,7 +565,6 @@ impl ImportView {
                 }
                 Some(Row::Session(s)) => {
                     if let Some(f) = self.current() {
-                        let session = f.sessions.get(*s);
                         let taken = f.taken(*s);
                         let on = self.checked.get(*s).copied().unwrap_or(false);
                         let mark = if taken {
@@ -409,34 +575,17 @@ impl ImportView {
                             "[ ]"
                         };
                         let fg = if taken { palette.dim } else { palette.text };
-                        let name = session.map(|s| s.name.as_str()).unwrap_or_default();
                         line.put(&format!(" {mark} "), fg, Flags::empty());
                         let room = width.saturating_sub(line.col + 1);
-                        line.put(&fit(name, room), fg, Flags::empty());
-                        if let Some(s) = session {
-                            let mut to = s.host.hostname.clone().unwrap_or_default();
-                            if let Some(u) = &s.host.user {
-                                to = format!("{u}@{to}");
-                            }
-                            if let Some(p) = s.host.port {
-                                to.push_str(&format!(":{p}"));
-                            }
-                            match s.kind {
-                                SessionKind::Ssh => {}
-                                SessionKind::Rdp => to.push_str(" RDP"),
-                                SessionKind::Vnc => to.push_str(" VNC"),
-                                SessionKind::Serial => to.push_str(" serial"),
-                                SessionKind::Telnet => to.push_str(" Telnet"),
-                                SessionKind::Xvfb => to.push_str(" virtual desktop"),
-                            }
-                            let room = width.saturating_sub(line.col + 2);
-                            if room > 4 {
-                                line.put(
-                                    &format!("  {}", fit(&to, room)),
-                                    palette.dim,
-                                    Flags::empty(),
-                                );
-                            }
+                        line.put(&fit(&f.label(*s), room), fg, Flags::empty());
+                        let detail = f.detail(*s);
+                        let room = width.saturating_sub(line.col + 2);
+                        if room > 4 && !detail.is_empty() {
+                            line.put(
+                                &format!("  {}", fit(&detail, room)),
+                                palette.dim,
+                                Flags::empty(),
+                            );
                         }
                     }
                 }
@@ -493,13 +642,15 @@ mod tests {
     fn view() -> ImportView {
         ImportView::new(
             vec![Found {
-                client: Client::WinScp,
                 origin: "registry".into(),
-                sessions: vec![
-                    site("Work/web", "web.lan", true),
-                    site("db", "db.lan", false),
-                    site("files", "files.lan", false),
-                ],
+                items: Items::Sessions(
+                    Client::WinScp,
+                    vec![
+                        site("Work/web", "web.lan", true),
+                        site("db", "db.lan", false),
+                        site("files", "files.lan", false),
+                    ],
+                ),
                 taken: vec![false, true, false],
             }],
             Vec::new(),
@@ -591,9 +742,8 @@ mod tests {
         desk.kind = SessionKind::Vnc;
         desk.host.port = Some(5901);
         v.add(Found {
-            client: Client::Kitty,
             origin: r"D:\kitty\Sessions".into(),
-            sessions: vec![site("box", "box.lan", false), desk],
+            items: Items::Sessions(Client::Kitty, vec![site("box", "box.lan", false), desk]),
             taken: vec![false, false],
         });
         let t = texts(&mut v);
@@ -612,5 +762,44 @@ mod tests {
         let back = t[y].find("Back").unwrap();
         v.click(back, y, 16);
         assert_eq!(texts(&mut v)[1], r" ▸ KiTTY  2 sessions, D:\kitty\Sessions");
+    }
+
+    #[test]
+    fn snippets_preview_their_lines() {
+        let snip = |name: &str, lines: &[&str]| Snippet {
+            name: name.into(),
+            category: "Docker".into(),
+            lines: lines.iter().map(|l| (*l).to_owned()).collect(),
+            ..Snippet::default()
+        };
+        let mut v = ImportView::snippets(
+            vec![Found {
+                origin: "settings.json".into(),
+                items: Items::Snippets(
+                    SnippetClient::WindowsTerminal,
+                    vec![
+                        snip("ps", &["docker ps"]),
+                        snip("up", &["a", "b", "c", "d"]),
+                    ],
+                ),
+                taken: vec![true, false],
+            }],
+            Vec::new(),
+        );
+        let t = texts(&mut v);
+        assert_eq!(t[0], " Import snippets");
+        assert_eq!(t[1], " ▸ Windows Terminal  2 snippets, settings.json");
+        v.key(SideKey::Enter { split: false }, 16);
+        let t = texts(&mut v);
+        assert_eq!(t[2], "     ps  Docker");
+        assert_eq!(t[3], "     already a snippet in this category");
+        assert_eq!(t[4], " [x] up  Docker");
+        assert_eq!(t[5], "     › a");
+        assert_eq!(t[8], "     … 1 more line");
+        v.key(SideKey::End, 16);
+        match v.key(SideKey::Enter { split: false }, 16) {
+            Some(ImportAction::ImportSnippets(s)) => assert_eq!(s.len(), 1),
+            other => panic!("{other:?}"),
+        }
     }
 }
