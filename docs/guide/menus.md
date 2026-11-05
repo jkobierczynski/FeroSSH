@@ -65,6 +65,10 @@ Font, theme and text size apply to the focused pane only. Session > Save font an
 | Item | Shortcut | What it does |
 | --- | --- | --- |
 | New tab | Ctrl+Shift+T | A new tab on the focused pane's host, as a new channel on the same connection, so there is no second login. |
+| Standby window (hotkey) > Status | | Says whether the standby hotkey is active for this window: on, off, or turned on but taken by another program. Click it for the details. See [Standby window](everyday-use.md#standby-window). |
+| Standby window (hotkey) > Use this window as the standby window | | Turns the standby hotkey on for this window, or off. ✓ while this window holds the hotkey. `Standby`. Off by default. |
+| Standby window (hotkey) > Press a new hotkey... | | After OK, the next key you press with Ctrl, Alt or Win becomes the hotkey, and standby turns on. Esc cancels. `StandbyHotkey`. |
+| Standby window (hotkey) > Win+` … Pause | | Picks one of five hotkeys and turns standby on: Win or Ctrl with the key below Esc (shown as your keyboard prints it), Ctrl+Alt+Space, Scroll Lock or Pause. The one in use is marked. |
 | Split right | Alt+Shift+= | Splits the focused pane, the new one on the right, on the same connection. |
 | Split down | Alt+Shift+- | The same, the new pane below. |
 | Split right in same directory | | Splits and starts the new shell in the directory the focused pane's shell is in (see [Splits in the same directory](everyday-use.md#splits-in-the-same-directory)). |

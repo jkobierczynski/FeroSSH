@@ -71,6 +71,7 @@
 use std::fmt::Write as _;
 
 use crate::host_theme::ThemeRule;
+use crate::hotkey::Hotkey;
 use crate::login::{SecretSource, Snippet, Step, parse_hotkey, valid_secret_name};
 use crate::password::PasswordSource;
 use crate::serial::LineSettings;
@@ -330,6 +331,12 @@ pub struct Settings {
     /// In panes of a tmux session, the tmux prefix and a window or pane
     /// key work FeroSSH's tabs and panes. Off unless turned on.
     pub tmux_keys: bool,
+    /// A global hotkey hides and shows the FeroSSH window (Window >
+    /// Standby window). Off unless turned on; the first window that opens
+    /// takes the hotkey.
+    pub standby: bool,
+    /// The standby window's hotkey; [`Hotkey::DEFAULT`] when unset.
+    pub standby_hotkey: Option<Hotkey>,
 }
 
 /// Scrollback is capped here, as the terminal caps it.
@@ -368,6 +375,8 @@ impl Default for Settings {
             auto_responses: true,
             run_parallel: None,
             tmux_keys: false,
+            standby: false,
+            standby_hotkey: None,
         }
     }
 }
@@ -547,6 +556,14 @@ impl Settings {
                 "tmuxkeybindings" => {
                     block = Block::Top;
                     s.tmux_keys = yes(&args).unwrap_or(false);
+                }
+                "standby" => {
+                    block = Block::Top;
+                    s.standby = yes(&args).unwrap_or(false);
+                }
+                "standbyhotkey" => {
+                    block = Block::Top;
+                    s.standby_hotkey = first.and_then(|k| Hotkey::parse(&k).ok());
                 }
                 "runparallel" => {
                     block = Block::Top;
@@ -752,6 +769,10 @@ impl Settings {
         let _ = writeln!(out, "ConfirmProduction {}", flag(self.confirm_production));
         let _ = writeln!(out, "AutoResponses {}", flag(self.auto_responses));
         let _ = writeln!(out, "TmuxKeybindings {}", flag(self.tmux_keys));
+        let _ = writeln!(out, "Standby {}", flag(self.standby));
+        if let Some(k) = self.standby_hotkey {
+            let _ = writeln!(out, "StandbyHotkey {k}");
+        }
         if let Some(n) = self.run_parallel {
             let _ = writeln!(out, "RunParallel {n}");
         }
@@ -1184,6 +1205,23 @@ NewKeyword later
             ..Settings::default()
         };
         assert!(Settings::parse(&s.to_text()).log_timestamps);
+    }
+
+    #[test]
+    fn standby_is_off_unless_turned_on_and_keeps_its_hotkey() {
+        let d = Settings::default();
+        assert!(!d.standby);
+        assert_eq!(d.standby_hotkey, None);
+        let s = Settings::parse("Standby yes\nStandbyHotkey ctrl+alt+space\n");
+        assert!(s.standby);
+        let key = Hotkey::parse("Ctrl+Alt+Space").ok();
+        assert_eq!(s.standby_hotkey, key);
+        let back = Settings::parse(&s.to_text());
+        assert!(back.standby);
+        assert_eq!(back.standby_hotkey, key);
+        // A hotkey FeroSSH refuses is dropped, so the default applies.
+        assert_eq!(Settings::parse("StandbyHotkey A\n").standby_hotkey, None);
+        assert!(!Settings::parse("Standby maybe\n").standby);
     }
 
     #[test]

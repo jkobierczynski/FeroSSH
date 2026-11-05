@@ -19,6 +19,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use ferossh_auth::Broker;
+use ferossh_config::hotkey::Hotkey;
 use ferossh_config::import::{self, Client};
 use ferossh_config::login::{self, Place, Step};
 use ferossh_config::password::{self as pw_source, PasswordSource};
@@ -63,11 +64,12 @@ use windows::Win32::UI::Input::Ime::{
     ImmSetCandidateWindow, ImmSetCompositionFontW, ImmSetCompositionWindow,
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    GetDoubleClickTime, GetKeyState, ReleaseCapture, SetCapture, VIRTUAL_KEY, VK_ADD, VK_BACK,
-    VK_CAPITAL, VK_CONTROL, VK_DELETE, VK_DOWN, VK_END, VK_ESCAPE, VK_F1, VK_F2, VK_F3, VK_F4,
-    VK_F5, VK_F12, VK_HOME, VK_INSERT, VK_LEFT, VK_LWIN, VK_MENU, VK_NEXT, VK_NUMPAD0, VK_OEM_2,
-    VK_OEM_MINUS, VK_OEM_PLUS, VK_PRIOR, VK_RETURN, VK_RIGHT, VK_RWIN, VK_SHIFT, VK_SPACE,
-    VK_SUBTRACT, VK_TAB, VK_UP,
+    GetDoubleClickTime, GetKeyState, HOT_KEY_MODIFIERS, MAPVK_VK_TO_CHAR, MAPVK_VSC_TO_VK,
+    MOD_NOREPEAT, MapVirtualKeyW, RegisterHotKey, ReleaseCapture, SetCapture, UnregisterHotKey,
+    VIRTUAL_KEY, VK_ADD, VK_BACK, VK_CAPITAL, VK_CONTROL, VK_DELETE, VK_DOWN, VK_END, VK_ESCAPE,
+    VK_F1, VK_F2, VK_F3, VK_F4, VK_F5, VK_F12, VK_HOME, VK_INSERT, VK_LEFT, VK_LWIN, VK_MENU,
+    VK_NEXT, VK_NUMPAD0, VK_OEM_2, VK_OEM_MINUS, VK_OEM_PLUS, VK_PRIOR, VK_RETURN, VK_RIGHT,
+    VK_RWIN, VK_SHIFT, VK_SPACE, VK_SUBTRACT, VK_TAB, VK_UP,
 };
 use windows::Win32::UI::Shell::{
     DragAcceptFiles, DragFinish, DragQueryFileW, DragQueryPoint, HDROP, ShellExecuteW,
@@ -76,21 +78,23 @@ use windows::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT, CheckMenuItem, CheckMenuRadioItem,
     CreateMenu, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyMenu, DestroyWindow,
     DispatchMessageW, EnableMenuItem, FLASHW_TIMERNOFG, FLASHW_TRAY, FLASHWINFO, FlashWindowEx,
-    GetClientRect, GetCursorPos, GetMenuItemCount, GetMenuItemID, GetMenuState, GetMenuStringW,
-    GetMessageW, GetSubMenu, HCURSOR, HMENU, HTCLIENT, IDC_ARROW, IDC_IBEAM, IDC_SIZEALL,
-    IDC_SIZENS, IDC_SIZEWE, IDYES, KillTimer, LoadCursorW, LoadIconW, MB_DEFBUTTON2, MB_ICONERROR,
-    MB_ICONINFORMATION, MB_ICONQUESTION, MB_ICONWARNING, MB_OK, MB_YESNO, MESSAGEBOX_RESULT,
+    GetClientRect, GetCursorPos, GetForegroundWindow, GetMenuItemCount, GetMenuItemID,
+    GetMenuState, GetMenuStringW, GetMessageW, GetSubMenu, HCURSOR, HMENU, HTCLIENT, IDC_ARROW,
+    IDC_IBEAM, IDC_SIZEALL, IDC_SIZENS, IDC_SIZEWE, IDOK, IDYES, IsIconic, IsWindowVisible,
+    KillTimer, LoadCursorW, LoadIconW, MB_DEFBUTTON2, MB_ICONERROR, MB_ICONINFORMATION,
+    MB_ICONQUESTION, MB_ICONWARNING, MB_OK, MB_OKCANCEL, MB_YESNO, MESSAGEBOX_RESULT,
     MESSAGEBOX_STYLE, MF_BYCOMMAND, MF_BYPOSITION, MF_CHECKED, MF_DISABLED, MF_GRAYED,
     MF_MENUBARBREAK, MF_POPUP, MF_SEPARATOR, MF_STRING, MF_UNCHECKED, MSG, MessageBoxW,
     ModifyMenuW, PM_REMOVE, PeekMessageW, PostMessageW, PostQuitMessage, RegisterClassW,
-    SIZE_MINIMIZED, SW_SHOW, SW_SHOWNORMAL, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOZORDER, SetCursor,
-    SetMenu, SetTimer, SetWindowPos, SetWindowTextW, ShowWindow, TPM_NONOTIFY, TPM_RETURNCMD,
-    TrackPopupMenu, TranslateMessage, WINDOW_EX_STYLE, WINDOW_STYLE, WM_APP, WM_CHAR, WM_CLOSE,
-    WM_COMMAND, WM_DESTROY, WM_DPICHANGED, WM_DROPFILES, WM_ERASEBKGND, WM_GETDPISCALEDSIZE,
-    WM_IME_COMPOSITION, WM_IME_STARTCOMPOSITION, WM_KEYDOWN, WM_KEYUP, WM_KILLFOCUS,
-    WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL,
-    WM_PAINT, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SETCURSOR, WM_SETFOCUS, WM_SIZE, WM_SYSCHAR,
-    WM_SYSKEYDOWN, WM_SYSKEYUP, WM_TIMER, WNDCLASSW, WS_EX_APPWINDOW, WS_OVERLAPPEDWINDOW,
+    SIZE_MINIMIZED, SW_HIDE, SW_RESTORE, SW_SHOW, SW_SHOWNORMAL, SWP_NOACTIVATE, SWP_NOMOVE,
+    SWP_NOZORDER, SetCursor, SetForegroundWindow, SetMenu, SetTimer, SetWindowPos, SetWindowTextW,
+    ShowWindow, TPM_NONOTIFY, TPM_RETURNCMD, TrackPopupMenu, TranslateMessage, WINDOW_EX_STYLE,
+    WINDOW_STYLE, WM_APP, WM_CHAR, WM_CLOSE, WM_COMMAND, WM_DEADCHAR, WM_DESTROY, WM_DPICHANGED,
+    WM_DROPFILES, WM_ERASEBKGND, WM_GETDPISCALEDSIZE, WM_HOTKEY, WM_IME_COMPOSITION,
+    WM_IME_STARTCOMPOSITION, WM_KEYDOWN, WM_KEYUP, WM_KILLFOCUS, WM_LBUTTONDOWN, WM_LBUTTONUP,
+    WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_PAINT, WM_RBUTTONDOWN,
+    WM_RBUTTONUP, WM_SETCURSOR, WM_SETFOCUS, WM_SIZE, WM_SYSCHAR, WM_SYSDEADCHAR, WM_SYSKEYDOWN,
+    WM_SYSKEYUP, WM_TIMER, WNDCLASSW, WS_EX_APPWINDOW, WS_OVERLAPPEDWINDOW,
 };
 use windows::core::{HSTRING, PCWSTR, PWSTR, Result, w};
 
@@ -126,6 +130,7 @@ use crate::session_form::{self, FormAction, Hints, SessionForm, Source, Values};
 use crate::sessions::{HostItem, SessionList, SideAction, SideKey};
 use crate::snippets_view::{self, SnipAction, SnippetsView, Vars};
 use crate::ssh::{Effect, Env, ProxyCommand, SshSession, State, Target};
+use crate::standby::{self, Capture, Picked, Standby, Toggle};
 use crate::tabstrip::{self, Forwarding, Health, Hit, Palette, StripLayout, TabLabel};
 use crate::telnet::{TelnetSession, TelnetTarget};
 use crate::tmux::{self, Mode as TmuxMode, Tmux};
@@ -380,6 +385,12 @@ mod cmd {
     pub const BROADCAST_SKIP: u32 = 732;
     pub const CLOSE_TAB: u32 = 733;
     pub const RENAME: u32 = 734;
+    /// Window > Standby window: the status line, on/off, pick by pressing.
+    pub const STANDBY_STATUS: u32 = 740;
+    pub const STANDBY_TOGGLE: u32 = 741;
+    pub const STANDBY_PICK: u32 = 742;
+    /// Plus the index into `standby_presets()`.
+    pub const STANDBY_PRESET: u32 = 743;
     pub const UPDATE_CHECK: u32 = 900;
     pub const UPDATE_WEEKLY: u32 = 901;
     pub const ABOUT: u32 = 902;
@@ -695,6 +706,8 @@ struct Areas {
 
 struct Window {
     hwnd: HWND,
+    /// Window > Standby window: the global hotkey this window holds.
+    standby: Standby,
     renderer: Renderer,
     dpi: u32,
     client: (i32, i32),
@@ -1474,10 +1487,14 @@ fn create_and_run(launch: Launch, theme: Option<String>) -> Result<()> {
                 run_hidden: HashSet::new(),
                 run_login: HashSet::new(),
                 run_notes: HashMap::new(),
+                standby: Standby::new(),
             });
         });
         // Files dropped from Explorer are uploaded, after a confirmation.
         DragAcceptFiles(hwnd, true);
+        // Window > Standby window, when it was left on: the first window
+        // takes the hotkey; for a later one the status says it is taken.
+        with_window(|w| w.apply_standby());
         with_window(Window::update_menu_checks);
         // Sends WM_SIZE, which sizes the terminal before the shell starts.
         SetWindowPos(
@@ -1720,6 +1737,29 @@ fn build_menu() -> Result<HMENU> {
         let window = CreatePopupMenu()?;
         item(window, cmd::NEW_TAB, "Ne&w tab\tCtrl+Shift+T")?;
         item(window, cmd::RENAME, "Rena&me session...")?;
+        let standby = CreatePopupMenu()?;
+        item(
+            standby,
+            cmd::STANDBY_STATUS,
+            &Standby::new().status(&hotkey_label(Hotkey::DEFAULT)),
+        )?;
+        separator(standby)?;
+        item(
+            standby,
+            cmd::STANDBY_TOGGLE,
+            "&Use this window as the standby window",
+        )?;
+        separator(standby)?;
+        item(standby, cmd::STANDBY_PICK, "&Press a new hotkey...")?;
+        for (id, key) in (cmd::STANDBY_PRESET..).zip(standby_presets()) {
+            item(standby, id, &hotkey_label(key))?;
+        }
+        AppendMenuW(
+            window,
+            MF_POPUP,
+            standby.0 as usize,
+            w!("Standb&y window (hotkey)"),
+        )?;
         separator(window)?;
         item(window, cmd::SPLIT_RIGHT, "Split &right\tAlt+Shift+=")?;
         item(window, cmd::SPLIT_DOWN, "Split &down\tAlt+Shift+-")?;
@@ -2540,6 +2580,12 @@ impl Window {
 
     /// The window title follows the focused pane.
     fn update_title(&self) {
+        if self.standby.capture == Capture::Waiting {
+            self.set_title_text(&format!(
+                "Press the new standby hotkey, or Esc to cancel - {APP_NAME}"
+            ));
+            return;
+        }
         let focused = self.focused_id();
         let label = self.panes.get(&focused).map(Pane::label);
         let badge = self.forwarding(&self.forward_view(), focused).badge();
@@ -9224,6 +9270,29 @@ impl Window {
             cmd::EXIT => return Some(Command::Exit),
             cmd::CLOSE_TAB => return Some(Command::CloseTab(self.ws.active)),
             cmd::RENAME => self.start_rename(pane),
+            cmd::STANDBY_STATUS => {
+                return Some(Command::Notice(
+                    self.standby.details(&hotkey_label(self.standby_key())),
+                ));
+            }
+            cmd::STANDBY_TOGGLE => {
+                if self.standby.held.is_some() {
+                    self.settings.standby = false;
+                    self.save_settings();
+                    self.apply_standby();
+                } else {
+                    return Some(self.standby_on(None));
+                }
+            }
+            cmd::STANDBY_PICK => return Some(Command::PickStandbyHotkey),
+            id if (cmd::STANDBY_PRESET..cmd::STANDBY_PRESET + STANDBY_PRESETS as u32)
+                .contains(&id) =>
+            {
+                let key = standby_presets()
+                    .get((id - cmd::STANDBY_PRESET) as usize)
+                    .copied();
+                return Some(self.standby_on(key));
+            }
             cmd::HIDE_MENU => return Some(Command::SetMenuVisible(!self.menu_visible)),
             cmd::COPY => return Some(Command::Copy),
             cmd::PASTE => return Some(Command::Paste),
@@ -9801,10 +9870,105 @@ impl Window {
                 (cmd::BROADCAST_TAB, self.broadcast == broadcast::Scope::Tab),
                 (cmd::BROADCAST_ALL, self.broadcast == broadcast::Scope::All),
                 (cmd::BROADCAST_SKIP, p.is_some_and(|p| p.no_broadcast)),
+                (cmd::STANDBY_TOGGLE, self.standby.held.is_some()),
             ] {
                 CheckMenuItem(self.menu, id, (MF_BYCOMMAND | check(on)).0);
             }
         }
+        self.update_standby_menu();
+    }
+
+    /// The hotkey the standby window uses (or would use).
+    fn standby_key(&self) -> Hotkey {
+        self.settings.standby_hotkey.unwrap_or(Hotkey::DEFAULT)
+    }
+
+    /// Window > Standby window's status line and the checked hotkey.
+    fn update_standby_menu(&self) {
+        let key = self.standby_key();
+        let status = self.standby.status(&hotkey_label(key));
+        let presets = standby_presets();
+        let last = cmd::STANDBY_PRESET + presets.len() as u32 - 1;
+        let picked = presets
+            .iter()
+            .position(|p| *p == key)
+            .map_or(u32::MAX, |i| cmd::STANDBY_PRESET + i as u32);
+        // SAFETY: valid menu handle; ids are ours.
+        unsafe {
+            let _ = ModifyMenuW(
+                self.menu,
+                cmd::STANDBY_STATUS,
+                MF_BYCOMMAND | MF_STRING,
+                cmd::STANDBY_STATUS as usize,
+                &HSTRING::from(status),
+            );
+            // A hotkey that is none of these leaves them all unchecked.
+            let _ =
+                CheckMenuRadioItem(self.menu, cmd::STANDBY_PRESET, last, picked, MF_BYCOMMAND.0);
+        }
+    }
+
+    /// Takes or lets go of the standby hotkey to match the settings: held
+    /// when Standby is on and Windows gives it, else noted as taken.
+    /// Returns whether the window now holds it. `RegisterHotKey` sends no
+    /// messages, so this is safe inside `with_window`.
+    fn apply_standby(&mut self) -> bool {
+        if self.standby.held.take().is_some() {
+            // SAFETY: our window and the id it registered.
+            let _ = unsafe { UnregisterHotKey(Some(self.hwnd), standby::HOTKEY_ID) };
+        }
+        self.standby.taken = None;
+        if self.settings.standby {
+            let key = self.standby_key();
+            let mods = HOT_KEY_MODIFIERS(key.modifiers()) | MOD_NOREPEAT;
+            // SAFETY: our window; Windows checks the key and modifiers.
+            let ok = unsafe {
+                RegisterHotKey(Some(self.hwnd), standby::HOTKEY_ID, mods, u32::from(key.vk))
+            }
+            .is_ok();
+            if ok {
+                self.standby.held = Some(key);
+            } else {
+                self.standby.taken = Some(key);
+            }
+        }
+        self.update_menu_checks();
+        self.standby.held.is_some()
+    }
+
+    /// Turns Standby on with `key` (the current one when `None`), and
+    /// says how that went.
+    fn standby_on(&mut self, key: Option<Hotkey>) -> Command {
+        if let Some(k) = key {
+            self.settings.standby_hotkey = Some(k);
+        }
+        self.settings.standby = true;
+        self.save_settings();
+        let label = hotkey_label(self.standby_key());
+        if self.apply_standby() {
+            Command::Notice(format!(
+                "{label} now hides this FeroSSH window and brings it back.\n\nWhile hidden it \
+                 has no taskbar button; only {label} brings it back. Window > Standby window \
+                 shows whether it is active, and turns it off."
+            ))
+        } else {
+            Command::Notice(self.standby.details(&label))
+        }
+    }
+
+    /// Picking a hotkey by pressing it ended: with the key pressed, or
+    /// cancelled (`None`).
+    fn end_capture(&mut self, key: Option<Hotkey>) -> Option<Command> {
+        if self.standby.capture != Capture::Waiting {
+            return None;
+        }
+        self.standby.capture = if key.is_some() {
+            Capture::Finishing
+        } else {
+            Capture::Off
+        };
+        self.update_title();
+        key.map(|k| self.standby_on(Some(k)))
     }
 
     fn set_focus(&mut self, focused: bool) {
@@ -10419,6 +10583,9 @@ fn shortcut(vk: VIRTUAL_KEY, m: Mods, tabs: bool, split: bool) -> Option<u32> {
 /// released.
 enum Command {
     Id(u32),
+    /// Window > Standby window > Press a new hotkey: says what to do,
+    /// then the next key pressed becomes the hotkey.
+    PickStandbyHotkey,
     /// An information box.
     Message(String),
     /// Help > Check for updates found its answer; `asked` is false for
@@ -11197,6 +11364,18 @@ fn run_command(hwnd: HWND, command: Command) {
         Command::Notice(text) => {
             dialog(hwnd, &text, MB_OK | MB_ICONINFORMATION);
         }
+        Command::PickStandbyHotkey => {
+            let text = "After OK, press the hotkey you want for the standby window, such as \
+                        Win+` or Ctrl+Alt+Space. Esc cancels.\n\nIt needs Ctrl, Alt or Win \
+                        (Pause, Scroll Lock and F13 to F24 work alone). If nothing happens \
+                        when you press it, another program already uses it.";
+            if dialog(hwnd, text, MB_OKCANCEL | MB_ICONINFORMATION) == Some(IDOK) {
+                with_window(|w| {
+                    w.standby.capture = Capture::Waiting;
+                    w.update_title();
+                });
+            }
+        }
         Command::ConfirmDelete { key, entry } => {
             let what = if entry.attrs.is_dir() {
                 "the folder"
@@ -11860,10 +12039,148 @@ fn mouse_mods(wparam: WPARAM) -> Mods {
     }
 }
 
+/// How many hotkeys Window > Standby window offers to pick from.
+const STANDBY_PRESETS: usize = 5;
+
+/// The hotkeys Window > Standby window offers: Win or Ctrl with the key
+/// below Esc (whatever this keyboard prints on it), Ctrl+Alt+Space,
+/// Scroll Lock and Pause.
+fn standby_presets() -> [Hotkey; STANDBY_PRESETS] {
+    // SAFETY: a plain keyboard layout query.
+    let below = unsafe { MapVirtualKeyW(standby::BELOW_ESC_SCAN, MAPVK_VSC_TO_VK) };
+    let vk = u16::try_from(below)
+        .ok()
+        .filter(|&vk| {
+            Hotkey {
+                vk,
+                ..Hotkey::DEFAULT
+            }
+            .check()
+            .is_ok()
+        })
+        .unwrap_or(Hotkey::DEFAULT.vk);
+    let key = |ctrl, alt, win, vk| Hotkey {
+        ctrl,
+        alt,
+        shift: false,
+        win,
+        vk,
+    };
+    [
+        key(false, false, true, vk),
+        key(true, false, false, vk),
+        key(true, true, false, 0x20),
+        key(false, false, false, 0x91),
+        key(false, false, false, 0x13),
+    ]
+}
+
+/// A hotkey as this keyboard shows it: a punctuation key as the
+/// character the layout puts on it.
+fn hotkey_label(key: Hotkey) -> String {
+    key.label(|vk| {
+        // SAFETY: a plain keyboard layout query. Bit 31 marks a dead key;
+        // the low word is still its character.
+        let c = unsafe { MapVirtualKeyW(u32::from(vk), MAPVK_VK_TO_CHAR) } & 0xFFFF;
+        char::from_u32(c).filter(|&c| c != '\0')
+    })
+}
+
+/// The standby hotkey was pressed: hide the window when it is in front,
+/// otherwise bring it to the front. Outside `with_window`, as ShowWindow
+/// sends WM_SIZE, WM_ACTIVATE and the focus messages straight back.
+fn standby_toggle(hwnd: HWND) {
+    if with_window(|w| w.standby.capture == Capture::Waiting) == Some(true) {
+        // The hotkey itself pressed while picking one: keep it.
+        let key = with_window(|w| w.standby_key());
+        if let Some(command) = key.and_then(|k| with_window(|w| w.end_capture(Some(k))).flatten()) {
+            run_command(hwnd, command);
+        }
+        return;
+    }
+    // SAFETY: our window; plain state queries and show calls. Windows
+    // lets the process that got the hotkey take the foreground.
+    unsafe {
+        let visible = IsWindowVisible(hwnd).as_bool();
+        let minimised = IsIconic(hwnd).as_bool();
+        let front = GetForegroundWindow() == hwnd;
+        match standby::toggle(visible, minimised, front) {
+            Toggle::Hide => {
+                let _ = ShowWindow(hwnd, SW_HIDE);
+            }
+            Toggle::Show => {
+                let _ = ShowWindow(hwnd, if minimised { SW_RESTORE } else { SW_SHOW });
+                let _ = SetForegroundWindow(hwnd);
+            }
+        }
+    }
+}
+
+/// While a standby hotkey is being picked: the keys go here and nowhere
+/// else (the terminal, shortcuts, the menu bar's Alt). `None` lets the
+/// message go on as usual.
+fn standby_capture(hwnd: HWND, msg: u32, wparam: WPARAM) -> Option<LRESULT> {
+    let state = with_window(|w| w.standby.capture)?;
+    if state == Capture::Off {
+        return None;
+    }
+    // SAFETY: plain key-state queries.
+    let down = |vk: VIRTUAL_KEY| unsafe { GetKeyState(i32::from(vk.0)) } < 0;
+    match msg {
+        WM_KEYDOWN | WM_SYSKEYDOWN if state == Capture::Finishing => {
+            // Typing again: the hotkey's key-ups are over.
+            with_window(|w| w.standby.capture = Capture::Off);
+            None
+        }
+        WM_KEYDOWN | WM_SYSKEYDOWN => {
+            drop_pending_char(hwnd);
+            let vk = wparam.0 as u16;
+            let mods = key_mods();
+            let win = down(VK_LWIN) || down(VK_RWIN);
+            let command = match standby::pick(vk, mods.ctrl, mods.alt, mods.shift, win) {
+                Picked::Wait => None,
+                Picked::Cancel => with_window(|w| w.end_capture(None)).flatten(),
+                Picked::Key(key) => with_window(|w| w.end_capture(Some(key))).flatten(),
+                Picked::Refused(why) => {
+                    with_window(|w| w.end_capture(None));
+                    Some(Command::Notice(format!(
+                        "{why}\n\nChoose Press a new hotkey again to pick another."
+                    )))
+                }
+            };
+            if let Some(command) = command {
+                run_command(hwnd, command);
+            }
+            Some(LRESULT(0))
+        }
+        WM_KEYUP | WM_SYSKEYUP => {
+            let held = [VK_SHIFT, VK_CONTROL, VK_MENU, VK_LWIN, VK_RWIN]
+                .into_iter()
+                .any(down);
+            if state == Capture::Finishing && !held {
+                with_window(|w| w.standby.capture = Capture::Off);
+            }
+            Some(LRESULT(0))
+        }
+        WM_CHAR | WM_SYSCHAR | WM_DEADCHAR | WM_SYSDEADCHAR => Some(LRESULT(0)),
+        WM_KILLFOCUS if state == Capture::Waiting => {
+            // Clicked away: stop picking, so later typing is not taken.
+            with_window(|w| w.end_capture(None));
+            None
+        }
+        _ => None,
+    }
+}
+
 extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     // SAFETY: called by Windows with valid arguments for this window; the
     // pointer casts below follow each message's documented lparam type.
     unsafe {
+        // Picking the standby hotkey takes the keys before anything else,
+        // the remote desktop viewer included.
+        if let Some(result) = standby_capture(hwnd, msg, wparam) {
+            return result;
+        }
         if with_window(|w| w.desktop_message(msg, wparam, lparam)) == Some(true) {
             return LRESULT(0);
         }
@@ -12040,6 +12357,10 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                 } else {
                     run_command(hwnd, Command::Id(id));
                 }
+                LRESULT(0)
+            }
+            WM_HOTKEY if wparam.0 == standby::HOTKEY_ID as usize => {
+                standby_toggle(hwnd);
                 LRESULT(0)
             }
             WM_CLOSE => {

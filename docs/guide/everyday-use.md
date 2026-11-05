@@ -151,6 +151,16 @@ A snippet about to be typed into a pane with the red Production theme asks first
 
 Edit > Record keystrokes as snippet records what you type in the focused pane until you pick it again, then opens it in the snippet editor to name and check. Backspace, Ctrl+U and Ctrl+W edit lines as a shell does, Tab and Ctrl+ keys are kept as `@key` steps so tab completion replays, and a line the host did not echo (a password) is recorded as `@password`, never as its text.
 
+## Standby window
+
+A hotkey can hide the FeroSSH window and bring it back, so a terminal is one key away without taking a taskbar button. It is off until you turn it on, under Window > Standby window (hotkey):
+
+- **Pick the window and the hotkey.** Open the menu in the FeroSSH window you want on standby, then pick one of the hotkeys listed (Win or Ctrl with the key below Esc, Ctrl+Alt+Space, Scroll Lock, Pause) or choose Press a new hotkey... and press the one you want. Picking a hotkey turns standby on for that window. A hotkey needs Ctrl, Alt or Win, except Pause, Scroll Lock and F13 to F24; FeroSSH refuses Ctrl+Alt with a letter, because that is AltGr on many keyboards.
+- **See whether it is active.** The first line of the menu says *on*, *off*, or *not active, … is taken* when another program (or another FeroSSH window) already has that hotkey. Click it for the details. Use this window as the standby window is ticked while this window holds the hotkey.
+- **Turn it off.** Click Use this window as the standby window again; the hotkey is released at once.
+
+Pressing the hotkey hides the window when it is in front, and brings it to the front when it is hidden, minimised or behind another window. While hidden it has no taskbar button and only the hotkey brings it back; its sessions keep running. FeroSSH remembers the setting, and the first window that opens takes the hotkey again.
+
 ## The command palette
 
 Ctrl+Shift+A (Tools > Command palette) is one search box over every menu item, every saved connection and every command snippet. Type a few letters in any order: `splr` finds Split right, `core` your core switch, `ctrl+shift+n` the item on that key. Enter runs the item, connects or types the snippet; Shift+Enter connects in a split or types a snippet without its last Enter. Each item shows its shortcut and check mark, greyed-out items are left out, and your last few picks come first.
