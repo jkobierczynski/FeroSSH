@@ -70,10 +70,8 @@ Font, theme and text size apply to the focused pane only. Session > Save font an
 | Standby window (hotkey) > Window to show and hide | | This FeroSSH window, or one of the open windows of other programs (listed with their program, such as `notepad.exe`). Picking one turns standby on. FeroSSH remembers the program, so after a restart it uses that program's front window. `StandbyWindow`. |
 | Standby window (hotkey) > Press a new hotkey... | | After OK, the next key you press with Ctrl, Alt or Win becomes the hotkey, and standby turns on. Esc cancels. `StandbyHotkey`. |
 | Standby window (hotkey) > Win+` … Pause | | Picks one of five hotkeys and turns standby on: Win or Ctrl with the key below Esc (shown as your keyboard prints it), Ctrl+Alt+Space, Scroll Lock or Pause. The one in use is marked. |
-| Split right | Alt+Shift+= | Splits the focused pane, the new one on the right, on the same connection. |
+| Split right | Alt+Shift+= | Splits the focused pane, the new one on the right, on the same connection and in the same directory (see [New tabs and panes start in the same directory](everyday-use.md#new-tabs-and-panes-start-in-the-same-directory)). |
 | Split down | Alt+Shift+- | The same, the new pane below. |
-| Split right in same directory | | Splits and starts the new shell in the directory the focused pane's shell is in (see [Splits in the same directory](everyday-use.md#splits-in-the-same-directory)). |
-| Split down in same directory | | The same, below. |
 | Move pane to its own tab | | Takes the focused pane out of its tab into a new one. |
 | Join tab into the tab before it | Ctrl+Shift+J | Puts this tab's panes into the tab to its left. |
 | Broadcast input to this tab's panes | Ctrl+Shift+B | What you type and paste goes to every pane of the tab (see [Broadcast input](everyday-use.md#broadcast-input)). |
@@ -100,7 +98,7 @@ Font, theme and text size apply to the focused pane only. Session > Save font an
 | Open log folder | Opens `%LOCALAPPDATA%\FeroSSH\logs` in Explorer. |
 | Check a log for changes... | Picks a log and says whether it is intact, or where it was changed, cut short or added to. |
 | Save font and theme for this host | Keeps the focused pane's font, text size and theme in the host's profile. |
-| Start new tabs and panes in this directory | Keeps the focused pane's directory as the host's start directory (Start dir in the connection form): new tabs, panes and tmux windows on that host start there, also after a restart. Window > Split … in same directory still follows its pane. |
+| Start new tabs and panes in this directory | Keeps the focused pane's directory as the host's start directory (Start dir in the connection form): new tabs, panes and tmux windows on that host start there when the directory of the pane they come from is not known, also after a restart. |
 | Replace host key... | After a host key change you know the reason for, trusts the new key. It asks twice. |
 | Verify transfers (SHA-256) | Compares SHA-256 sums on both ends after each SFTP transfer (the server needs `sha256sum`). ✓ `VerifyTransfers`. |
 | ZMODEM: answer rz and sz | Answers `rz` and `sz` in the terminal (see [ZMODEM](everyday-use.md#zmodem)). ✓ `ZModem`. |

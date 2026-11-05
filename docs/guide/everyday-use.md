@@ -12,13 +12,14 @@ The window starts as one pane, with no tab strip. Ctrl+Shift+T opens a tab and t
 - To merge a tab back in as a pane, drag the tab down out of the strip onto a pane of the tab that appears, or use Window > Join tab into the tab before it (Ctrl+Shift+J). Window > Move pane to its own tab, or dropping a pane on the tab strip, makes it a tab again.
 - Ctrl+Shift+W closes the pane, Ctrl+F4 the tab.
 
-### Splits in the same directory
+### New tabs and panes start in the same directory
 
-Window > Split right in same directory and Split down in same directory start the new pane's shell in the directory the focused pane's shell is in.
+A split (Window > Split right or Split down) and a new tab (Ctrl+Shift+T) start their shell in the directory the focused pane's shell is in.
 
-- In a tmux session, FeroSSH asks tmux where the pane is and opens the new tmux pane there.
+- In a tmux session, FeroSSH asks tmux where the pane is and opens the new tmux window or pane there.
 - In a plain SSH pane, FeroSSH uses the directory the shell reported (see [Following cd](#following-cd)) and types `cd` to it once, right after the new pane logs in.
-- In a local shell or a Telnet pane, or when the directory is unknown, you get an ordinary split, with a short note in grey.
+- A local shell starts in the folder its cmd (`C:\Users\me>`) or PowerShell (`PS C:\Users\me>`) prompt showed last; File > Open local shell does the same from a local pane.
+- When the directory is not known (a prompt FeroSSH does not read, a Telnet pane), the new shell starts in the host's start directory if it has one (below), else where it always starts.
 
 ## Connecting
 
@@ -227,7 +228,7 @@ There are two layouts, kept per session:
 
 tmux is never started unless you ask. To attach on every login to a host, set `Tmux` (and optionally `TmuxLayout`) in its profile, or switch tmux on in the connection form's Extras (click it, or press Left or Right) and optionally give a tmux name (`main` when left empty). GNU screen has no control mode and runs as an ordinary terminal.
 
-To have new tabs and panes on a host start in one server directory, `cd` there and use Session > Start new tabs and panes in this directory (or fill in Start dir in the connection form's Extras). It applies to new tmux windows and panes, to new plain SSH tabs and panes (FeroSSH types the `cd` after login) and to the first window of a new tmux session. Clear Start dir in the form to go back to the home folder.
+To have a host's shells start in one server directory, `cd` there and use Session > Start new tabs and panes in this directory (or fill in Start dir in the connection form's Extras). FeroSSH types the `cd` after every login and uses it for the first window of a new tmux session. New tabs and panes opened from a pane follow that pane's directory instead, and use the start directory only when that one is not known. Clear Start dir in the form to go back to the home folder.
 
 If your fingers know tmux's keys, tick Session > Use tmux keybindings for tabs and panes. In a pane of a tmux session, your tmux prefix (Ctrl+B unless your tmux config sets another; FeroSSH asks tmux) followed by `c`, `%`, `"`, `n`, `p`, `0`-`9`, `o`, an arrow, `x`, `&`, `!`, `d` or `s` works the native tabs and panes, which are tmux windows and panes. Arrows, Ctrl or Alt+arrows (resize), `[`, PageUp and PageDown repeat as in tmux: after the first one, press them again without the prefix within tmux's `repeat-time` (half a second unless your tmux config sets another), or hold the key down. Press the prefix twice to send it to the program, and the prefix then `?` for the full list. It is off unless you turn it on.
 

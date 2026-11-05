@@ -88,11 +88,13 @@ fn coord(cols: usize, rows: usize) -> COORD {
 }
 
 impl Shell {
-    /// Starts `command` on a new pseudo console of `cols` x `rows`.
+    /// Starts `command` on a new pseudo console of `cols` x `rows`, in
+    /// folder `dir` when it is one, else in the user's profile folder.
     pub fn spawn(
         command: &str,
         cols: usize,
         rows: usize,
+        dir: Option<&str>,
         notify: impl Fn() + Send + Clone + 'static,
     ) -> Result<Self> {
         let (mut in_read, mut in_write) = (HANDLE::default(), HANDLE::default());
@@ -109,7 +111,7 @@ impl Shell {
         let console = unsafe { CreatePseudoConsole(coord(cols, rows), in_read.0, out_write.0, 0)? };
         drop((in_read, out_write));
 
-        let process = match start_process(command, console) {
+        let process = match start_process(command, dir, console) {
             Ok(p) => p,
             Err(e) => {
                 // SAFETY: the console we just created.
@@ -163,7 +165,7 @@ impl Drop for Shell {
     }
 }
 
-fn start_process(command: &str, console: HPCON) -> Result<OwnedHandle> {
+fn start_process(command: &str, dir: Option<&str>, console: HPCON) -> Result<OwnedHandle> {
     let mut size = 0usize;
     // SAFETY: the first call only reports the size the list needs and is
     // expected to fail.
@@ -196,7 +198,11 @@ fn start_process(command: &str, console: HPCON) -> Result<OwnedHandle> {
         si.lpAttributeList = list;
 
         let mut cmdline: Vec<u16> = command.encode_utf16().chain([0]).collect();
-        let home = std::env::var("USERPROFILE").ok().map(HSTRING::from);
+        let home = dir
+            .filter(|d| std::path::Path::new(d).is_dir())
+            .map(str::to_owned)
+            .or_else(|| std::env::var("USERPROFILE").ok())
+            .map(HSTRING::from);
         let cwd = home.as_ref().map_or(PCWSTR::null(), |h| PCWSTR(h.as_ptr()));
         let mut pi = PROCESS_INFORMATION::default();
         // SAFETY: valid, NUL-terminated mutable command line; the startup

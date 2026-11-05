@@ -76,7 +76,7 @@ Profile web1
 | `Theme NAME` | Colour theme, for example `Nord`, `Dracula` or `Production`. |
 | `Scrollback N` | Lines of scrollback for this host's panes. |
 | `Tmux SESSION` | Attaches to this tmux session after every login. `off`, `no` or `none` (or leaving it out) means no tmux; `on`, `yes` or `true` attaches to `main`. |
-| `StartDir PATH` | The server directory new shells, tabs and panes on this host start in: FeroSSH types `cd` after each login (before tmux attaches) and gives new tmux windows and panes `-c`. Session > Start new tabs and panes in this directory sets it from the focused pane. |
+| `StartDir PATH` | The server directory shells on this host start in: FeroSSH types `cd` after each login (before tmux attaches) and gives a new tmux session `-c`. New tabs and panes follow the pane they came from and use it only when that pane's directory is not known. Session > Start new tabs and panes in this directory sets it from the focused pane. |
 | `TmuxLayout ferossh` or `tmux` | `ferossh` (the default) makes each native pane its own tmux window, so each can have its own font; `tmux` uses tmux's own splits. |
 | `AutoReconnect no` or `yes` | Overrides the global `AutoReconnect` for this host, for example to keep a production host from logging in again by itself. |
 | `LegacyAlgorithms yes` | Also offers older crypto (ECDH on NIST curves, DH groups 14 to 18 with SHA-2, AES-CTR, plain HMAC-SHA-2) for old switches and routers. Still no SHA-1, CBC or DSA. The tab shows an amber ⚠. |
