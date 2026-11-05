@@ -96,6 +96,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     WM_RBUTTONUP, WM_SETCURSOR, WM_SETFOCUS, WM_SIZE, WM_SYSCHAR, WM_SYSDEADCHAR, WM_SYSKEYDOWN,
     WM_SYSKEYUP, WM_TIMER, WNDCLASSW, WS_EX_APPWINDOW, WS_OVERLAPPEDWINDOW,
 };
+use windows::Win32::UI::WindowsAndMessaging::{DeleteMenu, ShowWindowAsync, WM_INITMENUPOPUP};
 use windows::core::{HSTRING, PCWSTR, PWSTR, Result, w};
 
 use crate::Launch;
@@ -391,6 +392,10 @@ mod cmd {
     pub const STANDBY_PICK: u32 = 742;
     /// Plus the index into `standby_presets()`.
     pub const STANDBY_PRESET: u32 = 743;
+    /// Window to show and hide: this FeroSSH window, or plus the index
+    /// into the windows listed when the menu opened.
+    pub const STANDBY_OWN: u32 = 750;
+    pub const STANDBY_TARGET: u32 = 751;
     pub const UPDATE_CHECK: u32 = 900;
     pub const UPDATE_WEEKLY: u32 = 901;
     pub const ABOUT: u32 = 902;
@@ -1494,7 +1499,14 @@ fn create_and_run(launch: Launch, theme: Option<String>) -> Result<()> {
         DragAcceptFiles(hwnd, true);
         // Window > Standby window, when it was left on: the first window
         // takes the hotkey; for a later one the status says it is taken.
-        with_window(|w| w.apply_standby());
+        with_window(|w| {
+            // A window another program's standby left hidden (FeroSSH
+            // ended without showing it) comes back, unless the hotkey is
+            // taken, likely by a FeroSSH window that still has it hidden.
+            if w.apply_standby() || !w.settings.standby {
+                w.restore_hidden();
+            }
+        });
         with_window(Window::update_menu_checks);
         // Sends WM_SIZE, which sizes the terminal before the shell starts.
         SetWindowPos(
@@ -1741,13 +1753,18 @@ fn build_menu() -> Result<HMENU> {
         item(
             standby,
             cmd::STANDBY_STATUS,
-            &Standby::new().status(&hotkey_label(Hotkey::DEFAULT)),
+            &Standby::new().status(&hotkey_label(Hotkey::DEFAULT), "this window"),
         )?;
         separator(standby)?;
-        item(
+        item(standby, cmd::STANDBY_TOGGLE, "Standby hotkey &on")?;
+        // Filled with the open windows each time it opens.
+        let targets = CreatePopupMenu()?;
+        item(targets, cmd::STANDBY_OWN, "This &FeroSSH window")?;
+        AppendMenuW(
             standby,
-            cmd::STANDBY_TOGGLE,
-            "&Use this window as the standby window",
+            MF_POPUP,
+            targets.0 as usize,
+            w!("&Window to show and hide"),
         )?;
         separator(standby)?;
         item(standby, cmd::STANDBY_PICK, "&Press a new hotkey...")?;
@@ -9271,13 +9288,16 @@ impl Window {
             cmd::CLOSE_TAB => return Some(Command::CloseTab(self.ws.active)),
             cmd::RENAME => self.start_rename(pane),
             cmd::STANDBY_STATUS => {
+                let what = self.standby_what();
                 return Some(Command::Notice(
-                    self.standby.details(&hotkey_label(self.standby_key())),
+                    self.standby
+                        .details(&hotkey_label(self.standby_key()), &what),
                 ));
             }
             cmd::STANDBY_TOGGLE => {
                 if self.standby.held.is_some() {
                     self.settings.standby = false;
+                    self.restore_hidden();
                     self.save_settings();
                     self.apply_standby();
                 } else {
@@ -9285,6 +9305,25 @@ impl Window {
                 }
             }
             cmd::STANDBY_PICK => return Some(Command::PickStandbyHotkey),
+            cmd::STANDBY_OWN => {
+                self.restore_hidden();
+                self.settings.standby_target = None;
+                self.standby.target = None;
+                return Some(self.standby_on(None));
+            }
+            id if (cmd::STANDBY_TARGET..cmd::STANDBY_TARGET + standby::MAX_CANDIDATES as u32)
+                .contains(&id) =>
+            {
+                let picked = self
+                    .standby
+                    .candidates
+                    .get((id - cmd::STANDBY_TARGET) as usize)
+                    .cloned()?;
+                self.restore_hidden();
+                self.settings.standby_target = Some(picked.exe);
+                self.standby.target = Some(picked.hwnd);
+                return Some(self.standby_on(None));
+            }
             id if (cmd::STANDBY_PRESET..cmd::STANDBY_PRESET + STANDBY_PRESETS as u32)
                 .contains(&id) =>
             {
@@ -9883,10 +9922,124 @@ impl Window {
         self.settings.standby_hotkey.unwrap_or(Hotkey::DEFAULT)
     }
 
+    /// The window the standby hotkey works, for people to read.
+    fn standby_what(&self) -> String {
+        self.settings
+            .standby_target
+            .clone()
+            .unwrap_or_else(|| "this window".to_owned())
+    }
+
+    /// Window > Standby window > Window to show and hide, as it opens:
+    /// this FeroSSH window, then the open windows of other programs, the
+    /// one in use marked.
+    fn fill_standby_targets(&mut self, menu: HMENU) {
+        self.standby.candidates = standby::sys::windows(self.hwnd);
+        let exe = self.settings.standby_target.clone();
+        let current = exe.as_deref().and_then(|e| {
+            standby::find(
+                &self.standby.candidates,
+                e,
+                self.standby.target.or(self.standby.hidden),
+            )
+        });
+        // SAFETY: our popup menu; it is being opened, when changing it is
+        // allowed. Only the window items after the first are replaced.
+        unsafe {
+            while GetMenuItemCount(Some(menu)) > 1 {
+                let _ = DeleteMenu(menu, 1, MF_BYPOSITION);
+            }
+            if !self.standby.candidates.is_empty() {
+                let _ = AppendMenuW(menu, MF_SEPARATOR, 0, None);
+            }
+            for (id, c) in (cmd::STANDBY_TARGET..).zip(&self.standby.candidates) {
+                let _ = AppendMenuW(
+                    menu,
+                    MF_STRING,
+                    id as usize,
+                    &HSTRING::from(standby::menu_label(c)),
+                );
+            }
+            let last = cmd::STANDBY_TARGET + standby::MAX_CANDIDATES as u32;
+            let checked = match (&exe, current) {
+                (None, _) => Some(cmd::STANDBY_OWN),
+                (Some(_), Some(h)) => self
+                    .standby
+                    .candidates
+                    .iter()
+                    .position(|c| c.hwnd == h)
+                    .map(|i| cmd::STANDBY_TARGET + i as u32),
+                // Its program has no window open (or it is hidden).
+                (Some(_), None) => None,
+            };
+            let _ = CheckMenuRadioItem(
+                menu,
+                cmd::STANDBY_OWN,
+                last,
+                checked.unwrap_or(u32::MAX),
+                MF_BYCOMMAND.0,
+            );
+        }
+    }
+
+    /// Shows another program's window that the standby hotkey hid, and
+    /// forgets it.
+    fn restore_hidden(&mut self) {
+        let hidden = self.standby.hidden.take();
+        let saved = self.settings.standby_hidden.take();
+        // A handle from the settings may be a reused one after a restart:
+        // it is shown only while it is still a window of the picked
+        // program.
+        let from_file = saved.and_then(|v| isize::try_from(v).ok()).filter(|&h| {
+            self.settings
+                .standby_target
+                .as_deref()
+                .is_some_and(|exe| standby::sys::alive_with_exe(h, exe))
+        });
+        if let Some(h) = hidden.or(from_file) {
+            standby::sys::show_async(h);
+        }
+        if hidden.is_some() || saved.is_some() {
+            self.save_settings();
+        }
+    }
+
+    /// Notes another program's window as hidden by the hotkey (`Some`) or
+    /// shown again (`None`), also in the settings, so that a FeroSSH that
+    /// ends without showing it shows it at its next start.
+    fn note_hidden(&mut self, h: Option<isize>) {
+        self.standby.hidden = h;
+        let saved = h.and_then(|v| u64::try_from(v).ok());
+        if self.settings.standby_hidden != saved {
+            self.settings.standby_hidden = saved;
+            self.save_settings();
+        }
+    }
+
+    /// The window a press of the hotkey works on now.
+    fn standby_target(&mut self) -> StandbyTarget {
+        let Some(exe) = self.settings.standby_target.clone() else {
+            return StandbyTarget::Own;
+        };
+        for h in [self.standby.hidden, self.standby.target]
+            .into_iter()
+            .flatten()
+        {
+            if standby::sys::alive_with_exe(h, &exe) {
+                return StandbyTarget::Other(h);
+            }
+        }
+        let found = standby::find(&standby::sys::windows(self.hwnd), &exe, None);
+        self.standby.target = found;
+        found.map_or(StandbyTarget::Missing(exe), StandbyTarget::Other)
+    }
+
     /// Window > Standby window's status line and the checked hotkey.
     fn update_standby_menu(&self) {
         let key = self.standby_key();
-        let status = self.standby.status(&hotkey_label(key));
+        let status = self
+            .standby
+            .status(&hotkey_label(key), &self.standby_what());
         let presets = standby_presets();
         let last = cmd::STANDBY_PRESET + presets.len() as u32 - 1;
         let picked = presets
@@ -9945,14 +10098,19 @@ impl Window {
         self.settings.standby = true;
         self.save_settings();
         let label = hotkey_label(self.standby_key());
+        let what = match &self.settings.standby_target {
+            Some(exe) => format!("the window of {exe}"),
+            None => "this FeroSSH window".to_owned(),
+        };
         if self.apply_standby() {
             Command::Notice(format!(
-                "{label} now hides this FeroSSH window and brings it back.\n\nWhile hidden it \
-                 has no taskbar button; only {label} brings it back. Window > Standby window \
-                 shows whether it is active, and turns it off."
+                "{label} now hides {what} and brings it back.\n\nWhile hidden it has no \
+                 taskbar button; only {label} brings it back, and FeroSSH shows it again when \
+                 standby goes off or FeroSSH closes. Window > Standby window shows whether it \
+                 is active, picks the window, and turns it off."
             ))
         } else {
-            Command::Notice(self.standby.details(&label))
+            Command::Notice(self.standby.details(&label, &self.standby_what()))
         }
     }
 
@@ -12098,22 +12256,78 @@ fn standby_toggle(hwnd: HWND) {
         }
         return;
     }
-    // SAFETY: our window; plain state queries and show calls. Windows
-    // lets the process that got the hotkey take the foreground.
+    let (target, own) = match with_window(Window::standby_target) {
+        None => return,
+        Some(StandbyTarget::Own) => (hwnd, true),
+        Some(StandbyTarget::Other(h)) => (standby::sys::hwnd(h), false),
+        Some(StandbyTarget::Missing(exe)) => {
+            run_command(
+                hwnd,
+                Command::Notice(format!(
+                    "{exe} has no window open for the standby hotkey to show. Start it, or \
+                     pick another window under Window > Standby window > Window to show and \
+                     hide."
+                )),
+            );
+            return;
+        }
+    };
+    // Another program that does not answer would hang a waiting call.
+    let hung = !own && standby::sys::hung(target);
+    // SAFETY: plain state queries and show calls on a window Windows
+    // checks. Windows lets the process that got the hotkey take the
+    // foreground, also for another program's window.
     unsafe {
-        let visible = IsWindowVisible(hwnd).as_bool();
-        let minimised = IsIconic(hwnd).as_bool();
-        let front = GetForegroundWindow() == hwnd;
+        let show = |cmd| {
+            if hung {
+                let _ = ShowWindowAsync(target, cmd);
+            } else {
+                let _ = ShowWindow(target, cmd);
+            }
+        };
+        let visible = IsWindowVisible(target).as_bool();
+        let minimised = IsIconic(target).as_bool();
+        let front = GetForegroundWindow() == target;
         match standby::toggle(visible, minimised, front) {
             Toggle::Hide => {
-                let _ = ShowWindow(hwnd, SW_HIDE);
+                show(SW_HIDE);
+                if !own {
+                    if IsWindowVisible(target).as_bool() && !hung {
+                        // Windows refuses this for a program run as
+                        // administrator when FeroSSH is not.
+                        run_command(
+                            hwnd,
+                            Command::Notice(
+                                "Windows did not let FeroSSH hide that window. A program run \
+                                 as administrator can only be hidden by a FeroSSH run as \
+                                 administrator."
+                                    .to_owned(),
+                            ),
+                        );
+                    } else {
+                        with_window(|w| w.note_hidden(Some(target.0 as isize)));
+                    }
+                }
             }
             Toggle::Show => {
-                let _ = ShowWindow(hwnd, if minimised { SW_RESTORE } else { SW_SHOW });
-                let _ = SetForegroundWindow(hwnd);
+                show(if minimised { SW_RESTORE } else { SW_SHOW });
+                let _ = SetForegroundWindow(target);
+                if !own {
+                    with_window(|w| w.note_hidden(None));
+                }
             }
         }
     }
+}
+
+/// The window a press of the standby hotkey works on.
+enum StandbyTarget {
+    /// This FeroSSH window.
+    Own,
+    /// Another program's window.
+    Other(isize),
+    /// The picked program has no window open.
+    Missing(String),
 }
 
 /// While a standby hotkey is being picked: the keys go here and nowhere
@@ -12359,6 +12573,14 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                 }
                 LRESULT(0)
             }
+            WM_INITMENUPOPUP => {
+                let popup = HMENU(wparam.0 as *mut c_void);
+                // SAFETY: the menu Windows is opening.
+                if GetMenuItemID(popup, 0) == cmd::STANDBY_OWN {
+                    with_window(|w| w.fill_standby_targets(popup));
+                }
+                DefWindowProcW(hwnd, msg, wparam, lparam)
+            }
             WM_HOTKEY if wparam.0 == standby::HOTKEY_ID as usize => {
                 standby_toggle(hwnd);
                 LRESULT(0)
@@ -12379,6 +12601,9 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                 // Dropping the window closes the shells' consoles, finishes
                 // the logs and closes the worker's job, which ends it.
                 with_window(|w| {
+                    // Another program's window the standby hotkey hid
+                    // comes back with FeroSSH gone.
+                    w.restore_hidden();
                     // tmux keeps its sessions; leave them detached.
                     let gateways: Vec<PaneId> = w.tmux.keys().copied().collect();
                     for g in gateways {

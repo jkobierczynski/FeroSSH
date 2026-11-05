@@ -337,6 +337,13 @@ pub struct Settings {
     pub standby: bool,
     /// The standby window's hotkey; [`Hotkey::DEFAULT`] when unset.
     pub standby_hotkey: Option<Hotkey>,
+    /// The program whose window the standby hotkey shows and hides, by
+    /// file name (`notepad.exe`); the FeroSSH window itself when unset.
+    pub standby_target: Option<String>,
+    /// Another program's window the standby hotkey hid, as a window
+    /// handle, so that a FeroSSH that ended without showing it again
+    /// shows it at its next start.
+    pub standby_hidden: Option<u64>,
 }
 
 /// Scrollback is capped here, as the terminal caps it.
@@ -377,6 +384,8 @@ impl Default for Settings {
             tmux_keys: false,
             standby: false,
             standby_hotkey: None,
+            standby_target: None,
+            standby_hidden: None,
         }
     }
 }
@@ -564,6 +573,14 @@ impl Settings {
                 "standbyhotkey" => {
                     block = Block::Top;
                     s.standby_hotkey = first.and_then(|k| Hotkey::parse(&k).ok());
+                }
+                "standbywindow" => {
+                    block = Block::Top;
+                    s.standby_target = first.filter(|p| !p.is_empty());
+                }
+                "standbyhidden" => {
+                    block = Block::Top;
+                    s.standby_hidden = first.and_then(|v| v.parse::<u64>().ok());
                 }
                 "runparallel" => {
                     block = Block::Top;
@@ -772,6 +789,12 @@ impl Settings {
         let _ = writeln!(out, "Standby {}", flag(self.standby));
         if let Some(k) = self.standby_hotkey {
             let _ = writeln!(out, "StandbyHotkey {k}");
+        }
+        if let Some(p) = &self.standby_target {
+            let _ = writeln!(out, "StandbyWindow {}", arg(p));
+        }
+        if let Some(h) = self.standby_hidden {
+            let _ = writeln!(out, "StandbyHidden {h}");
         }
         if let Some(n) = self.run_parallel {
             let _ = writeln!(out, "RunParallel {n}");
@@ -1222,6 +1245,13 @@ NewKeyword later
         // A hotkey FeroSSH refuses is dropped, so the default applies.
         assert_eq!(Settings::parse("StandbyHotkey A\n").standby_hotkey, None);
         assert!(!Settings::parse("Standby maybe\n").standby);
+        let s = Settings::parse("StandbyWindow \"my app.exe\"\nStandbyHidden 132456\n");
+        assert_eq!(s.standby_target.as_deref(), Some("my app.exe"));
+        assert_eq!(s.standby_hidden, Some(132_456));
+        let back = Settings::parse(&s.to_text());
+        assert_eq!(back.standby_target, s.standby_target);
+        assert_eq!(back.standby_hidden, s.standby_hidden);
+        assert_eq!(d.standby_target, None);
     }
 
     #[test]
