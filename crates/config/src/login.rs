@@ -67,6 +67,12 @@ pub enum Step {
     /// Waits this many milliseconds: a `delay`, for timing between keys
     /// and lines finer than a `pause`.
     Delay(u32),
+    /// In a snippet: moves FeroSSH's focus to the pane `left`, `right`,
+    /// `up` or `down` of this one; the steps after it go to that pane.
+    Pane(String),
+    /// In a snippet: moves to the `next` or `prev` tab; the steps after
+    /// it go to that tab's focused pane.
+    Tab(String),
     /// Types the text without Enter.
     Type(String),
     /// Presses a key, by its name (see [`key_bytes`]).
@@ -316,7 +322,14 @@ impl Step {
                 | Step::Delay(_)
                 | Step::Password
                 | Step::Secret(_)
+                | Step::Pane(_)
+                | Step::Tab(_)
         )
+    }
+
+    /// Whether it moves to another pane or tab.
+    pub fn moves(&self) -> bool {
+        matches!(self, Step::Pane(_) | Step::Tab(_))
     }
 
     /// What a step that does not wait types.
@@ -370,6 +383,15 @@ impl Step {
                     "pause takes seconds (1 to {MAX_PAUSE_SECS}) or a time such as 500ms or 1.5s."
                 )),
             },
+            "pane" => match rest.to_ascii_lowercase().as_str() {
+                d @ ("left" | "right" | "up" | "down") => Ok(Step::Pane(d.to_owned())),
+                _ => Err("pane takes left, right, up or down.".into()),
+            },
+            "tab" => match rest.to_ascii_lowercase().as_str() {
+                "next" => Ok(Step::Tab("next".into())),
+                "prev" | "previous" => Ok(Step::Tab("prev".into())),
+                _ => Err("tab takes next or prev.".into()),
+            },
             "delay" => delay_ms(rest).map(Step::Delay).ok_or_else(|| {
                 format!(
                     "delay takes milliseconds or seconds, from {MIN_DELAY_MS}ms to \
@@ -391,7 +413,8 @@ impl Step {
                     .into())
             }
             _ => Err(
-                "Start a step with expect, capture, send, type, key, password, secret, pause or delay."
+                "Start a step with expect, capture, send, type, key, password, secret, pause, delay, \
+                 pane or tab."
                     .into(),
             ),
         }
@@ -408,6 +431,8 @@ impl fmt::Display for Step {
             Step::Secret(n) => write!(f, "secret {n}"),
             Step::Pause(n) => write!(f, "pause {n}"),
             Step::Delay(ms) => write!(f, "delay {ms}ms"),
+            Step::Pane(d) => write!(f, "pane {d}"),
+            Step::Tab(d) => write!(f, "tab {d}"),
             Step::Type(t) => write!(f, "type {t}"),
             Step::Key(k) => write!(f, "key {k}"),
             Step::Capture(p) => write!(f, "capture {p}"),
@@ -869,6 +894,8 @@ mod tests {
             ("delay 300ms", Step::Delay(300)),
             ("delay 250", Step::Delay(250)),
             ("delay 1.5s", Step::Delay(1500)),
+            ("pane Right", Step::Pane("right".into())),
+            ("tab previous", Step::Tab("prev".into())),
         ] {
             let got = Step::parse(text).unwrap();
             assert_eq!(got, step, "{text}");

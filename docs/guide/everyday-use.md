@@ -132,8 +132,21 @@ Insert adds a snippet (what you typed as a search becomes its name), F2 edits on
 | `@key enter` | Presses keys: `enter`, `space`, `tab`, `escape`, `backspace`, `up`, `down`, `left`, `right`, `home`, `end`, `insert`, `delete`, `pageup`, `pagedown`, `f1` to `f12`, `ctrl+z`, `alt+x`, or a single character. `ctrl+`, `alt+` and `shift+` combine with the arrows, Home, End, Insert, Delete, Page Up/Down and F-keys (`alt+right`, `ctrl+left`, `ctrl+shift+f5`), and `shift+tab` works too. Several keys go in one step, and a number repeats the key before it: `@key down 3 enter`, or `@key ctrl+b d` for tmux. |
 | `@type y` | Types text without Enter. |
 | `@password`, `@secret enable` | Types the login password or a named secret. |
+| `@pane right` | Moves to the pane `left`, `right`, `up` or `down` of this one, like Alt+arrow; the rest of the snippet is typed there. `@key alt+right` instead sends Alt+Right to the host. |
+| `@tab next` | Moves to the `next` or `prev` tab; the rest of the snippet is typed in its focused pane. |
 
 `@@` types a plain `@`.
+
+For example, to start a capture on one host and a ping from the host beside it:
+
+```
+tcpdump -ni eth0 icmp
+@delay 1s
+@pane right
+ping -c 3 10.0.0.1
+```
+
+A snippet with `@pane` or `@tab` runs from one pane: with broadcast input on it says so instead, and a run on picked hosts (F5) skips those steps.
 
 **Hosts, folders and hotkeys.** In the editor a snippet can be kept to some hosts (`sw-* core-?`) or connection-manager folders. Snippets for the focused pane's host are listed first and the others dimmed; the command palette shows only the ones that apply. A snippet can have a hotkey, Ctrl+Shift+F1 to F12.
 

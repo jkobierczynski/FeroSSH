@@ -826,6 +826,10 @@ struct Window {
     update: Option<(std::sync::mpsc::Receiver<crate::update::Outcome>, bool)>,
     /// Login scripts running, by pane.
     scripts: HashMap<PaneId, ScriptRun>,
+    /// Snippets with an `@pane` or `@tab` step, by the pane their first
+    /// part runs in: that run's number, the snippet's name and the steps
+    /// from the move on, which follow when the run finishes.
+    snippet_next: HashMap<PaneId, (u64, String, Vec<Step>)>,
     /// ZMODEM transfers running, by pane.
     zmodem: HashMap<PaneId, zmodem::Transfer>,
     /// Secrets for login scripts from password manager commands, as they
@@ -1513,6 +1517,7 @@ fn create_and_run(launch: Launch, theme: Option<String>) -> Result<()> {
                 broadcast: broadcast::Scope::Off,
                 update: None,
                 scripts: HashMap::new(),
+                snippet_next: HashMap::new(),
                 zmodem: HashMap::new(),
                 script_secrets: Arc::default(),
                 script_runs: 0,
@@ -4883,7 +4888,16 @@ impl Window {
                     }
                 }
                 login_script::Action::Done => {
+                    let mut next = self.snippet_next.remove(&id);
                     if let Some(run) = self.scripts.remove(&id) {
+                        if next.as_ref().is_some_and(|n| n.0 != run.run)
+                            || matches!(
+                                run.runner.outcome(),
+                                Some(Outcome::Failed(_) | Outcome::Stopped)
+                            )
+                        {
+                            next = None;
+                        }
                         if run.report
                             && let Some(row) =
                                 self.snippets_view.report_mut().and_then(|r| r.row_mut(id))
@@ -4912,6 +4926,11 @@ impl Window {
                                 _ => self.begin_run_snippet(id),
                             }
                         }
+                    } else {
+                        next = None;
+                    }
+                    if let Some((_, name, rest)) = next {
+                        self.snippet_move(id, &name, rest);
                     }
                 }
             }
@@ -7185,10 +7204,27 @@ impl Window {
         {
             return Some(notice);
         }
+        // The steps from the first `@pane` or `@tab` on follow in the
+        // pane it moves to, once the steps before it are done.
+        let mut steps = steps;
+        let after = steps
+            .iter()
+            .position(Step::moves)
+            .map(|at| steps.split_off(at));
+        if after.is_some() && panes.len() > 1 {
+            return Some(Command::Notice(format!(
+                "The snippet {name} moves to another pane or tab (@pane, @tab), so it runs \
+                 in one pane only, not in {} at once.",
+                panes.len()
+            )));
+        }
         self.leave_snippets();
         if !capture && let Some(bytes) = login::steps_bytes(&steps) {
             for &p in panes {
                 self.input(p, bytes.clone());
+            }
+            if let (Some(after), Some(&p)) = (after, panes.first()) {
+                self.snippet_move(p, name, after);
             }
             return None;
         }
@@ -7216,6 +7252,10 @@ impl Window {
             }
             self.script_runs += 1;
             let mut runner = Runner::named(&what, steps.clone());
+            if let Some(after) = &after {
+                self.snippet_next
+                    .insert(p, (self.script_runs, name.to_owned(), after.clone()));
+            }
             let actions = runner.start(Instant::now());
             self.scripts.insert(
                 p,
@@ -7230,6 +7270,59 @@ impl Window {
         }
         self.refresh_chrome();
         None
+    }
+
+    /// The rest of snippet `name` after the part that ran in pane `from`:
+    /// `rest` starts with an `@pane` or `@tab` step, which focuses the
+    /// pane it names; the steps after it run there.
+    fn snippet_move(&mut self, from: PaneId, name: &str, mut rest: Vec<Step>) {
+        if rest.is_empty() {
+            return;
+        }
+        let step = rest.remove(0);
+        let Some(t) = self.ws.tab_of(from) else {
+            return;
+        };
+        let (to, missing) = match &step {
+            Step::Pane(d) => {
+                let dir = match d.as_str() {
+                    "left" => Dir::Left,
+                    "right" => Dir::Right,
+                    "up" => Dir::Up,
+                    _ => Dir::Down,
+                };
+                let g = gap(self.dpi);
+                let to = self.ws.tabs.get(t).and_then(|tab| {
+                    layout::neighbour(&tab.root.layout(self.areas.panes, g), from, dir)
+                });
+                (to, format!("there is no pane {d} of this one"))
+            }
+            Step::Tab(w) => {
+                let n = self.ws.tabs.len();
+                let i = if w == "next" {
+                    (t + 1) % n.max(1)
+                } else {
+                    (t + n - 1) % n.max(1)
+                };
+                let to = Some(i)
+                    .filter(|&i| i != t)
+                    .and_then(|i| self.ws.tabs.get(i))
+                    .map(|tab| tab.focus);
+                (to, "there is no other tab".to_owned())
+            }
+            _ => return,
+        };
+        let Some(to) = to else {
+            self.show(
+                from,
+                &format!("\x1b[0;31m[the snippet {name} stopped: {missing}]\x1b[0m\r\n"),
+            );
+            return;
+        };
+        self.focus_pane(to);
+        if let Some(Command::Notice(text)) = self.run_snippet(name, rest, &[to]) {
+            self.show(to, &format!("\x1b[0;31m{text}\x1b[0m\r\n"));
+        }
     }
 
     /// Shows `report` in the snippets view, which takes the keyboard.
