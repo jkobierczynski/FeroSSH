@@ -492,12 +492,16 @@ pub fn snippet_block(snippet: &Snippet) -> String {
     if let Some(n) = snippet.hotkey {
         let _ = writeln!(out, "    Hotkey F{n}");
     }
+    // A text that starts with `=` gets one of its own after the keyword,
+    // since the reader takes one `=` there as the separator.
+    let sep = |t: &str| if t.starts_with('=') { " = " } else { " " };
     let when = clean(&snippet.when);
     if !when.is_empty() {
-        let _ = writeln!(out, "    When {when}");
+        let _ = writeln!(out, "    When{}{when}", sep(&when));
     }
     for l in &snippet.lines {
-        let _ = writeln!(out, "    Line {}", clean(l));
+        let l = clean(l);
+        let _ = writeln!(out, "    Line{}{l}", sep(&l));
     }
     out
 }

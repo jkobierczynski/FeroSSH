@@ -177,7 +177,12 @@ pub fn keystrokes(input: &str) -> Vec<String> {
 fn short_name(text: &str) -> String {
     let one: String = text
         .chars()
-        .map(|c| if c.is_control() { ' ' } else { c })
+        .map(|c| match c {
+            c if c.is_control() => ' ',
+            // A name is written in quotes in its file.
+            '"' => '\'',
+            c => c,
+        })
         .collect();
     let one = one.split_whitespace().collect::<Vec<_>>().join(" ");
     if one.chars().count() > MAX_NAME {

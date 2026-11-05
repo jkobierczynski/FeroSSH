@@ -4,7 +4,32 @@
 #![allow(clippy::unwrap_used)]
 
 use ferossh_config::import::{self, Client};
-use ferossh_config::{mobaxterm, mremoteng, putty, saved, securecrt, winscp};
+use ferossh_config::login::line_step;
+use ferossh_config::{
+    mobaxterm, mremoteng, putty, saved, securecrt, snippet_import, snippet_store, winscp,
+};
+
+/// What a snippet import makes is valid lines that read back the same.
+fn snippets_read_back(data: &[u8]) {
+    let text = String::from_utf8_lossy(data);
+    let mut snippets = snippet_import::windows_terminal(&text).unwrap_or_default();
+    snippets.extend(snippet_import::securecrt_buttons(&text));
+    snippets.extend(snippet_import::mobaxterm_macros(&text));
+    snippets.extend(snippet_import::text_file(&text, &text));
+    for s in &snippets {
+        for l in &s.lines {
+            assert!(!matches!(line_step(l), Some(Err(_))), "{l:?}");
+        }
+        let file = snippet_store::file_for(s);
+        assert!(
+            !file.split('/').any(|p| p.is_empty() || p == ".."),
+            "{file}"
+        );
+        let back = snippet_store::parse_file(&snippet_store::file_text(s), &s.category).unwrap();
+        let trimmed: Vec<&str> = s.lines.iter().map(|l| l.trim()).collect();
+        assert_eq!(back.lines, trimmed);
+    }
+}
 
 /// What an import writes reads back as the same hosts.
 fn round_trips(data: &[u8]) {
@@ -41,7 +66,9 @@ fn fuzz_regressions_round_trip() {
     );
     let mut count = 0;
     for entry in std::fs::read_dir(dir).unwrap() {
-        round_trips(&std::fs::read(entry.unwrap().path()).unwrap());
+        let data = std::fs::read(entry.unwrap().path()).unwrap();
+        round_trips(&data);
+        snippets_read_back(&data);
         count += 1;
     }
     assert!(count > 0);

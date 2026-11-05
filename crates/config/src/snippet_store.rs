@@ -498,6 +498,16 @@ mod tests {
     }
 
     #[test]
+    fn lines_starting_with_equals_keep_them() {
+        let mut s = snip("eq", "");
+        s.lines = vec!["==S".into(), "=x".into(), "a=b".into()];
+        s.when = "=More=".into();
+        let back = parse_file(&file_text(&s), "").unwrap();
+        assert_eq!(back.lines, s.lines);
+        assert_eq!(back.when, s.when);
+    }
+
+    #[test]
     fn lines_cannot_escape_the_block() {
         let mut s = snip("x\nSnippet y", "");
         s.lines = vec!["ls\nSnippet z".into()];
