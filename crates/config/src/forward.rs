@@ -37,8 +37,9 @@ impl ForwardKind {
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct ForwardSpec {
     pub kind: ForwardKind,
-    /// The listening address as written: `None` when left out, `Some("")`
-    /// or `Some("*")` for every interface.
+    /// The listening address as written: `None` when left out, `Some("*")`
+    /// for every interface (an empty address, as in `:8080`, reads as `*`,
+    /// so a spec reads back as written).
     pub bind: Option<String>,
     /// The listening port; 0 lets the listening side choose.
     pub port: u16,
@@ -132,8 +133,13 @@ fn valid_host(host: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_' | ':' | '%' | '*'))
 }
 
+/// The listening address; empty means every interface, as `*` does, and
+/// reads as `*` so that writing the spec out and reading it back gives the
+/// same spec.
 fn bind_field(text: &str) -> Option<String> {
-    if text.is_empty() || text == "*" || valid_host(text) {
+    if text.is_empty() {
+        Some("*".to_owned())
+    } else if text == "*" || valid_host(text) {
         Some(text.to_owned())
     } else {
         None
@@ -347,6 +353,22 @@ mod tests {
         assert!(!parse_cancel("-KL 127.0.0.1:8080").unwrap().cancels(&l));
         assert!(!parse_cancel("-KR 8080").unwrap().cancels(&l));
         assert!(!parse_cancel("-KL 8081").unwrap().cancels(&l));
+    }
+
+    #[test]
+    fn empty_bind_reads_as_every_interface() {
+        // An empty address means `*`; it must read back the same once
+        // written out (found by the import_parse fuzz target).
+        for text in ["-D :1080", "-L :8080:db:5432", "-R :9000:localhost:3000"] {
+            let spec = parse_option(text).unwrap();
+            assert_eq!(spec.bind.as_deref(), Some("*"), "{text}");
+            let line = spec.config_line();
+            let (_, rest) = line.split_once(' ').unwrap();
+            assert_eq!(parse_config(spec.kind, &args(rest)), Some(spec), "{line}");
+        }
+        // PuTTY's `D=2`: an empty listening side and a port.
+        let d = parse_config(ForwardKind::Dynamic, &[String::new(), "2".into()]).unwrap();
+        assert_eq!(d.bind.as_deref(), Some("*"));
     }
 
     #[test]
