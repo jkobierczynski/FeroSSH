@@ -127,9 +127,9 @@ Insert adds a snippet (what you typed as a search becomes its name), F2 edits on
 | --- | --- |
 | `@expect (config)#` | Waits for the host to print that. |
 | `@capture Version *,` | Keeps the value where the `*` is from the reply, for the report. |
-| `@pause 2` | Waits 2 seconds. |
+| `@pause 2` | Waits 2 seconds (`@pause 500ms` is a delay). |
 | `@delay 300ms` | Waits 300 milliseconds (`@delay 1.5s` works too; 10 ms to 60 s), for timing between keys and panes. |
-| `@key enter` | Presses keys: `enter`, `space`, `tab`, `escape`, `backspace`, `up`, `down`, `left`, `right`, `home`, `end`, `insert`, `delete`, `pageup`, `pagedown`, `f1` to `f12`, `ctrl+z`, `alt+x`, or a single character. Several keys go in one step, and a number repeats the key before it: `@key down 3 enter`, or `@key ctrl+b d` for tmux. |
+| `@key enter` | Presses keys: `enter`, `space`, `tab`, `escape`, `backspace`, `up`, `down`, `left`, `right`, `home`, `end`, `insert`, `delete`, `pageup`, `pagedown`, `f1` to `f12`, `ctrl+z`, `alt+x`, or a single character. `ctrl+`, `alt+` and `shift+` combine with the arrows, Home, End, Insert, Delete, Page Up/Down and F-keys (`alt+right`, `ctrl+left`, `ctrl+shift+f5`), and `shift+tab` works too. Several keys go in one step, and a number repeats the key before it: `@key down 3 enter`, or `@key ctrl+b d` for tmux. |
 | `@type y` | Types text without Enter. |
 | `@password`, `@secret enable` | Types the login password or a named secret. |
 

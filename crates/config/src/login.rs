@@ -126,67 +126,138 @@ pub fn capture(seen: &str, pattern: &str) -> Option<(usize, String)> {
 /// The most times one key in a `key` step is pressed.
 pub const MAX_KEY_REPEAT: usize = 50;
 
-/// What one key `name` types, if FeroSSH knows it: Enter, Space, Tab,
-/// Escape, Backspace, the arrows, Home, End, Insert, Delete, Page Up and
-/// Down, F1 to F12, Ctrl+ a letter (or `@[\]^_`) and Alt+ a character.
-/// Keys that send escape sequences send what xterm does in its normal
-/// modes.
-fn one_key(name: &str) -> Option<Vec<u8>> {
-    let seq = |s: &str| Some(s.as_bytes().to_vec());
-    let byte = match name {
+/// A key that sends an escape sequence, which carries Shift, Alt and
+/// Ctrl as xterm's modifier number.
+enum Special {
+    /// `ESC [ final`, or `ESC [ 1 ; m final` with modifiers.
+    Csi(char),
+    /// `ESC O final` alone (F1 to F4), `ESC [ 1 ; m final` with modifiers.
+    Ss3(char),
+    /// `ESC [ n ~`, or `ESC [ n ; m ~` with modifiers.
+    Tilde(u8),
+}
+
+fn special(name: &str) -> Option<Special> {
+    Some(match name {
+        "up" => Special::Csi('A'),
+        "down" => Special::Csi('B'),
+        "right" => Special::Csi('C'),
+        "left" => Special::Csi('D'),
+        "home" => Special::Csi('H'),
+        "end" => Special::Csi('F'),
+        "insert" | "ins" => Special::Tilde(2),
+        "delete" | "del" => Special::Tilde(3),
+        "pageup" | "pgup" => Special::Tilde(5),
+        "pagedown" | "pgdn" => Special::Tilde(6),
+        "f1" => Special::Ss3('P'),
+        "f2" => Special::Ss3('Q'),
+        "f3" => Special::Ss3('R'),
+        "f4" => Special::Ss3('S'),
+        "f5" => Special::Tilde(15),
+        "f6" => Special::Tilde(17),
+        "f7" => Special::Tilde(18),
+        "f8" => Special::Tilde(19),
+        "f9" => Special::Tilde(20),
+        "f10" => Special::Tilde(21),
+        "f11" => Special::Tilde(23),
+        "f12" => Special::Tilde(24),
+        _ => return None,
+    })
+}
+
+/// The byte a plain key sends.
+fn plain_byte(name: &str) -> Option<u8> {
+    Some(match name {
         "enter" | "return" => b'\r',
         "space" => b' ',
         "tab" => b'\t',
         "escape" | "esc" => 0x1b,
         "backspace" => 0x7f,
-        "up" => return seq("\x1b[A"),
-        "down" => return seq("\x1b[B"),
-        "right" => return seq("\x1b[C"),
-        "left" => return seq("\x1b[D"),
-        "home" => return seq("\x1b[H"),
-        "end" => return seq("\x1b[F"),
-        "insert" | "ins" => return seq("\x1b[2~"),
-        "delete" | "del" => return seq("\x1b[3~"),
-        "pageup" | "pgup" => return seq("\x1b[5~"),
-        "pagedown" | "pgdn" => return seq("\x1b[6~"),
-        "f1" => return seq("\x1bOP"),
-        "f2" => return seq("\x1bOQ"),
-        "f3" => return seq("\x1bOR"),
-        "f4" => return seq("\x1bOS"),
-        "f5" => return seq("\x1b[15~"),
-        "f6" => return seq("\x1b[17~"),
-        "f7" => return seq("\x1b[18~"),
-        "f8" => return seq("\x1b[19~"),
-        "f9" => return seq("\x1b[20~"),
-        "f10" => return seq("\x1b[21~"),
-        "f11" => return seq("\x1b[23~"),
-        "f12" => return seq("\x1b[24~"),
-        _ => {
-            if let Some(rest) = name.strip_prefix("alt+") {
-                // Alt+ a key FeroSSH knows by name, or one character.
-                let mut out = vec![0x1b];
-                let mut chars = rest.chars();
-                match (chars.next(), chars.next()) {
-                    (Some(c), None) if !c.is_control() => {
-                        let mut buf = [0; 4];
-                        out.extend_from_slice(c.encode_utf8(&mut buf).as_bytes());
-                    }
-                    _ => out.extend(one_key(rest).filter(|k| k.first() != Some(&0x1b))?),
-                }
-                return Some(out);
+        _ => return None,
+    })
+}
+
+const SHIFT: u8 = 1;
+const ALT: u8 = 2;
+const CTRL: u8 = 4;
+
+/// What one key `name` types, if FeroSSH knows it: Enter, Space, Tab,
+/// Escape, Backspace, the arrows, Home, End, Insert, Delete, Page Up and
+/// Down and F1 to F12, each with any of `ctrl+`, `alt+` and `shift+` in
+/// front (`alt+right`, `ctrl+shift+f5`), and Ctrl+ a letter (or
+/// `@[\]^_`) or Alt+ a character. Keys that send escape sequences send
+/// what xterm does in its normal modes.
+fn one_key(name: &str) -> Option<Vec<u8>> {
+    let mut mods = 0;
+    let mut rest = name;
+    loop {
+        if let Some(r) = rest.strip_prefix("ctrl+").filter(|r| !r.is_empty()) {
+            mods |= CTRL;
+            rest = r;
+        } else if let Some(r) = rest.strip_prefix("alt+").filter(|r| !r.is_empty()) {
+            mods |= ALT;
+            rest = r;
+        } else if let Some(r) = rest.strip_prefix("shift+").filter(|r| !r.is_empty()) {
+            mods |= SHIFT;
+            rest = r;
+        } else {
+            break;
+        }
+    }
+    if let Some(key) = special(rest) {
+        let m = 1 + mods;
+        return Some(
+            match (key, mods) {
+                (Special::Csi(f), 0) => format!("\x1b[{f}"),
+                (Special::Ss3(f), 0) => format!("\x1bO{f}"),
+                (Special::Csi(f) | Special::Ss3(f), _) => format!("\x1b[1;{m}{f}"),
+                (Special::Tilde(n), 0) => format!("\x1b[{n}~"),
+                (Special::Tilde(n), _) => format!("\x1b[{n};{m}~"),
             }
-            let rest = name.strip_prefix("ctrl+")?;
-            let mut chars = rest.chars();
-            let c = chars.next()?;
-            if chars.next().is_some()
-                || !(c.is_ascii_lowercase() || matches!(c, '@' | '[' | '\\' | ']' | '^' | '_'))
-            {
-                return None;
+            .into_bytes(),
+        );
+    }
+    if mods == SHIFT && rest == "tab" {
+        return Some(b"\x1b[Z".to_vec());
+    }
+    // Ctrl+ a letter is one control byte.
+    let ctrl_byte = |text: &str| {
+        let mut chars = text.chars();
+        let c = chars.next()?;
+        if chars.next().is_some()
+            || !(c.is_ascii_lowercase() || matches!(c, '@' | '[' | '\\' | ']' | '^' | '_'))
+        {
+            return None;
+        }
+        Some(c.to_ascii_uppercase() as u8 & 0x1f)
+    };
+    let one_char = |text: &str| {
+        let mut chars = text.chars();
+        match (chars.next(), chars.next()) {
+            (Some(c), None) if !c.is_control() => {
+                let mut buf = [0; 4];
+                Some(c.encode_utf8(&mut buf).as_bytes().to_vec())
             }
-            c.to_ascii_uppercase() as u8 & 0x1f
+            _ => None,
         }
     };
-    Some(vec![byte])
+    let base = match mods & !ALT {
+        0 => match plain_byte(rest) {
+            Some(b) => vec![b],
+            // A lone character is not a key name, but Alt+ one is.
+            None if mods == ALT => one_char(rest)?,
+            None => return None,
+        },
+        CTRL => vec![ctrl_byte(rest)?],
+        _ => return None,
+    };
+    // Alt sends Escape first.
+    let mut out = Vec::new();
+    if mods & ALT != 0 {
+        out.push(0x1b);
+    }
+    out.extend(base);
+    Some(out)
 }
 
 /// What a `key` step's text types, if FeroSSH knows every key in it:
@@ -286,7 +357,18 @@ impl Step {
             "secret" => Err("secret needs a name of letters, digits, . _ and -.".into()),
             "pause" => match rest.parse::<u32>() {
                 Ok(n) if (1..=MAX_PAUSE_SECS).contains(&n) => Ok(Step::Pause(n)),
-                _ => Err(format!("pause takes seconds, from 1 to {MAX_PAUSE_SECS}.")),
+                // With a unit (500ms, 1.5s) it is a delay.
+                _ if rest.trim().ends_with(['s', 'S']) => {
+                    delay_ms(rest).map(Step::Delay).ok_or_else(|| {
+                        format!(
+                            "pause takes seconds (1 to {MAX_PAUSE_SECS}) or a time such as \
+                             500ms or 1.5s, from {MIN_DELAY_MS}ms."
+                        )
+                    })
+                }
+                _ => Err(format!(
+                    "pause takes seconds (1 to {MAX_PAUSE_SECS}) or a time such as 500ms or 1.5s."
+                )),
             },
             "delay" => delay_ms(rest).map(Step::Delay).ok_or_else(|| {
                 format!(
@@ -304,7 +386,7 @@ impl Step {
             ),
             "key" if key_bytes(rest).is_some() => Ok(Step::Key(rest.to_ascii_lowercase())),
             "key" => {
-                Err("key takes key names such as enter, tab, escape, up, down, f5, ctrl+c or alt+x, \
+                Err("key takes key names such as enter, tab, up, f5, ctrl+c, alt+right or shift+tab, \
                      each one optionally followed by a count: down 3."
                     .into())
             }
@@ -912,7 +994,19 @@ mod tests {
             assert_eq!(key_bytes(name), Some(vec![byte]), "{name}");
         }
         for name in [
-            "", "ctrl+", "ctrl+ab", "ctrl+1", "f13", "upp", "3", "up 0", "up 51", "alt+", "alt+up",
+            "",
+            "ctrl+",
+            "ctrl+ab",
+            "ctrl+1",
+            "f13",
+            "upp",
+            "3",
+            "up 0",
+            "up 51",
+            "alt+",
+            "shift+a",
+            "ctrl+enter",
+            "shift+x",
         ] {
             assert_eq!(key_bytes(name), None, "{name}");
         }
@@ -923,6 +1017,19 @@ mod tests {
         assert_eq!(key_bytes("f5").unwrap(), b"\x1b[15~");
         assert_eq!(key_bytes("alt+x").unwrap(), b"\x1bx");
         assert_eq!(key_bytes("alt+enter").unwrap(), b"\x1b\r");
+        assert_eq!(key_bytes("alt+right").unwrap(), b"\x1b[1;3C");
+        assert_eq!(key_bytes("ctrl+left").unwrap(), b"\x1b[1;5D");
+        assert_eq!(key_bytes("shift+up").unwrap(), b"\x1b[1;2A");
+        assert_eq!(key_bytes("ctrl+shift+f5").unwrap(), b"\x1b[15;6~");
+        assert_eq!(key_bytes("alt+f1").unwrap(), b"\x1b[1;3P");
+        assert_eq!(key_bytes("Shift+Tab").unwrap(), b"\x1b[Z");
+        assert_eq!(key_bytes("ctrl+alt+d").unwrap(), b"\x1b\x04");
+        assert_eq!(key_bytes("alt+ctrl+x").unwrap(), b"\x1b\x18");
+        assert_eq!(key_bytes("f1").unwrap(), b"\x1bOP");
+        assert_eq!(Step::parse("pause 500ms").unwrap(), Step::Delay(500));
+        assert_eq!(Step::parse("pause 1.5s").unwrap(), Step::Delay(1500));
+        assert!(Step::parse("pause 5ms").is_err());
+        assert!(Step::parse("pause 0").is_err());
         assert_eq!(Step::parse("key f1").unwrap(), Step::Key("f1".into()));
         assert_eq!(Step::parse("key Enter").unwrap(), Step::Key("enter".into()));
         assert_eq!(Step::parse("type  y ").unwrap(), Step::Type("y".into()));
