@@ -368,9 +368,6 @@ mod cmd {
     pub const TAB_RIGHT: u32 = 705;
     pub const PANE_TO_TAB: u32 = 706;
     pub const JOIN_TAB: u32 = 707;
-    /// Split right/down with the new shell in the pane's directory.
-    pub const SPLIT_RIGHT_HERE: u32 = 708;
-    pub const SPLIT_DOWN_HERE: u32 = 709;
     /// Plus 0-3: left, right, up, down.
     pub const FOCUS: u32 = 710;
     /// Plus 0-3: left, right, up, down.
@@ -501,9 +498,13 @@ struct Pane {
     desktop: Option<Box<Desktop>>,
     /// Window > Leave this pane out of broadcast input.
     no_broadcast: bool,
-    /// Window > Split … in same directory: where the new shell goes once
-    /// logged in (after the login script, before tmux attaches).
+    /// A new tab or pane opened from another: the directory its shell
+    /// goes to once logged in (after the login script, before tmux
+    /// attaches).
     start_dir: Option<Vec<u8>>,
+    /// The folder a local shell's cmd or PowerShell prompt shows, for
+    /// new tabs and panes opened from it.
+    local_cwd: Option<String>,
 }
 
 impl Pane {
@@ -1547,6 +1548,7 @@ fn new_pane(
         desktop: None,
         no_broadcast: false,
         start_dir: None,
+        local_cwd: None,
     }
 }
 
@@ -1723,16 +1725,6 @@ fn build_menu() -> Result<HMENU> {
         separator(window)?;
         item(window, cmd::SPLIT_RIGHT, "Split &right\tAlt+Shift+=")?;
         item(window, cmd::SPLIT_DOWN, "Split &down\tAlt+Shift+-")?;
-        item(
-            window,
-            cmd::SPLIT_RIGHT_HERE,
-            "Split right in &same directory",
-        )?;
-        item(
-            window,
-            cmd::SPLIT_DOWN_HERE,
-            "Split down in same d&irectory",
-        )?;
         item(window, cmd::PANE_TO_TAB, "Move pane to its own &tab")?;
         item(
             window,
@@ -2167,8 +2159,8 @@ impl Window {
         }
         Some(Command::Notice(format!(
             "New tabs and panes on {alias} start in {dir} now, also after FeroSSH restarts. \
-             Window > Split … in same directory still follows the pane. Change or clear it \
-             in Edit connection, Start dir."
+             New tabs and panes opened from a pane whose directory FeroSSH knows still \
+             follow that pane. Change or clear it in Edit connection, Start dir."
         )))
     }
 
@@ -2386,40 +2378,11 @@ impl Window {
         }
     }
 
-    /// Window > Split … in same directory, for new pane `id` opened like
-    /// the original: an SSH shell changes to `cwd` once logged in. A
-    /// directory not known (a shell that reports none and has a prompt
-    /// FeroSSH does not read, a local shell, Telnet) is said so.
-    fn start_in(&mut self, id: PaneId, cwd: Option<Vec<u8>>) {
-        let ssh = matches!(self.panes.get(&id).map(|p| &p.host), Some(Host::Ssh(_)));
-        match cwd.filter(|_| ssh) {
-            Some(dir) => {
-                if let Some(p) = self.panes.get_mut(&id) {
-                    p.start_dir = Some(dir);
-                }
-            }
-            None => {
-                let why = if ssh {
-                    "its shell did not report it"
-                } else {
-                    "FeroSSH follows directories on SSH shells only"
-                };
-                self.show(
-                    id,
-                    &format!(
-                        "\x1b[0;90mThe original pane's directory is not known ({why}), so \
-                         this shell starts in the usual place.\x1b[0m\r\n"
-                    ),
-                );
-                self.refresh(id);
-            }
-        }
-    }
-
-    /// Types the `cd` that Window > Split … in same directory asked for
-    /// at pane `id`'s freshly logged-in shell. Once: a reconnect starts
-    /// where the server starts it.
-    /// Otherwise the host's start directory, after every login.
+    /// Types the `cd` to the directory of the pane a new tab or pane was
+    /// opened from at pane `id`'s freshly logged-in shell. Once: a
+    /// reconnect starts where the server starts it. Otherwise (the
+    /// directory was not known, or later logins) the host's start
+    /// directory, after every login.
     fn cd_after_login(&mut self, id: PaneId) {
         let split_dir = self.panes.get_mut(&id).and_then(|p| p.start_dir.take());
         let Some(dir) = split_dir.or_else(|| self.profile_start_dir(id).map(String::into_bytes))
@@ -2484,19 +2447,25 @@ impl Window {
             p.cwd_reported = false;
             p.prompt_host = None;
             p.start_dir = None;
+            p.local_cwd = None;
         }
         self.prune_sftp();
         self.prune_forwards();
     }
 
     fn start_shell(&mut self, id: PaneId) {
+        self.start_shell_in(id, None);
+    }
+
+    /// Starts the local shell in folder `dir`, or in the profile folder.
+    fn start_shell_in(&mut self, id: PaneId, dir: Option<&str>) {
         self.end_host(id);
         let notify = self.notifier();
         let Some(p) = self.panes.get_mut(&id) else {
             return;
         };
         let (cols, rows) = (p.term.cols(), p.term.rows());
-        match Shell::spawn(&self.command, cols, rows, notify) {
+        match Shell::spawn(&self.command, cols, rows, dir, notify) {
             Ok(shell) => {
                 p.host = Host::Local {
                     shell: Some(shell),
@@ -5769,6 +5738,7 @@ impl Window {
             if self.read_prompt(id) {
                 chrome = true;
             }
+            self.read_local_prompt(id);
         }
         if let Some(deadline) = deadline {
             let wait = deadline.saturating_duration_since(Instant::now());
@@ -8193,9 +8163,14 @@ impl Window {
             Some(Host::Local { exited, .. }) => *exited,
             _ => false,
         };
+        // From a live local shell, in its folder.
+        let dir = self.panes.get(&pane).and_then(|p| match p.host {
+            Host::Local { exited: false, .. } => p.local_cwd.clone(),
+            _ => None,
+        });
         let id = if idle { pane } else { self.new_tab_pane() };
         self.focus_terminal();
-        self.start_shell(id);
+        self.start_shell_in(id, dir.as_deref());
     }
 
     /// Gives the keyboard back to the focused pane.
@@ -8326,7 +8301,10 @@ impl Window {
     }
 
     /// Opens a new pane like `from`: the same host as a new channel on its
-    /// connection, a local shell, or the connect prompt.
+    /// connection, a local shell, or the connect prompt, in the directory
+    /// `from`'s shell is in where FeroSSH knows it (SSH: OSC 7 or the
+    /// prompt; local: the cmd or PowerShell prompt). Telnet has no login
+    /// FeroSSH can tell, so it starts where it starts.
     fn fill_like(&mut self, id: PaneId, from: PaneId) {
         enum Like {
             Ssh(Box<Target>),
@@ -8335,6 +8313,11 @@ impl Window {
             Ask,
         }
         let from = self.host_pane(from);
+        let (cwd, local_cwd) = self
+            .panes
+            .get(&from)
+            .map(|p| (p.cwd.clone(), p.local_cwd.clone()))
+            .unwrap_or_default();
         // A COM port opens once, so a split of a serial console asks.
         let like = match self.panes.get(&from).map(|p| &p.host) {
             Some(Host::Ssh(s)) => Like::Ssh(Box::new(s.target.clone())),
@@ -8343,9 +8326,14 @@ impl Window {
             _ => Like::Ask,
         };
         match like {
-            Like::Ssh(target) => self.connect_to(id, *target, &ssh_env()),
+            Like::Ssh(target) => {
+                self.connect_to(id, *target, &ssh_env());
+                if let Some(p) = self.panes.get_mut(&id) {
+                    p.start_dir = cwd;
+                }
+            }
             Like::Telnet(target) => self.connect_telnet(id, target),
-            Like::Local => self.start_shell(id),
+            Like::Local => self.start_shell_in(id, local_cwd.as_deref()),
             Like::Ask => self.ask_destination(id),
         }
     }
@@ -9308,31 +9296,24 @@ impl Window {
                 let id = self.new_tab_pane();
                 self.fill_like(id, pane);
             }
-            cmd::SPLIT_RIGHT | cmd::SPLIT_DOWN | cmd::SPLIT_RIGHT_HERE | cmd::SPLIT_DOWN_HERE => {
-                let dir = if matches!(id, cmd::SPLIT_RIGHT | cmd::SPLIT_RIGHT_HERE) {
+            cmd::SPLIT_RIGHT | cmd::SPLIT_DOWN => {
+                let dir = if id == cmd::SPLIT_RIGHT {
                     Dir::Right
                 } else {
                     Dir::Down
                 };
-                let here = matches!(id, cmd::SPLIT_RIGHT_HERE | cmd::SPLIT_DOWN_HERE);
                 if let Some(gateway) = self.panes.get(&pane).and_then(Pane::gateway) {
                     // tmux knows each pane's directory itself.
                     let actions = self
                         .tmux
                         .get_mut(&gateway)
-                        .map(|t| t.split(pane, dir, here))
+                        .map(|t| t.split(pane, dir))
                         .unwrap_or_default();
                     self.run_tmux(gateway, actions);
                     return None;
                 }
-                let cwd = here
-                    .then(|| self.panes.get(&pane).and_then(|p| p.cwd.clone()))
-                    .flatten();
                 if let Some(new) = self.split(dir) {
                     self.fill_like(new, pane);
-                    if here {
-                        self.start_in(new, cwd);
-                    }
                 }
             }
             cmd::CLOSE_PANE => return self.close_pane(pane),
@@ -10153,6 +10134,25 @@ impl Window {
         }
         self.follow_pane(id);
         true
+    }
+
+    /// Notes the folder a local shell's prompt shows, for new tabs and
+    /// panes opened from it.
+    fn read_local_prompt(&mut self, id: PaneId) {
+        let Some(p) = self.panes.get_mut(&id) else {
+            return;
+        };
+        if !matches!(p.host, Host::Local { exited: false, .. }) {
+            return;
+        }
+        if let Some(dir) = p
+            .term
+            .prompt_line()
+            .as_deref()
+            .and_then(same_dir::local_prompt_dir)
+        {
+            p.local_cwd = Some(dir);
+        }
     }
 
     fn toggle_follow(&mut self) {

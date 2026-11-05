@@ -278,7 +278,7 @@ fn real_tmux_round_trip() {
     a.until("the echo", |h| h.text(first).contains("one-42"));
 
     // A native split is a new tmux window beside the pane.
-    let actions = a.tmux.split(first, Dir::Right, false);
+    let actions = a.tmux.split(first, Dir::Right);
     a.apply(actions);
     a.until("the split", |h| h.shown() == 2);
     let second = a.ws.focused();
@@ -368,7 +368,7 @@ fn real_tmux_round_trip() {
     });
     assert_eq!(a.tmux.mode(), Mode::Tmux);
     let pane = a.ws.focused();
-    let actions = a.tmux.split(pane, Dir::Down, false);
+    let actions = a.tmux.split(pane, Dir::Down);
     a.apply(actions);
     a.until("the tmux split", |h| h.shown() == 3);
     let tab = a.ws.tab_of(a.ws.focused()).unwrap();
@@ -435,7 +435,7 @@ fn older_tmux_falls_back_to_tmux_layout() {
     a.apply(actions);
     a.until("the echo", |h| h.text(first).contains("one-42"));
 
-    let actions = a.tmux.split(first, Dir::Down, false);
+    let actions = a.tmux.split(first, Dir::Down);
     a.apply(actions);
     a.until("the tmux split", |h| h.shown() == 2);
     assert_eq!(a.ws.tabs.len(), 1);
@@ -519,7 +519,7 @@ fn real_tmux_split_in_the_same_directory() {
 
     // Older tmux falls back to tmux layout: a tmux split; both start
     // there.
-    let actions = a.tmux.split(first, Dir::Right, true);
+    let actions = a.tmux.split(first, Dir::Right);
     a.apply(actions);
     a.until("the split", |h| h.shown() == 2);
     let second = a.ws.focused();
@@ -533,7 +533,7 @@ fn real_tmux_split_in_the_same_directory() {
 }
 
 #[test]
-fn real_tmux_new_tab_in_the_start_directory() {
+fn real_tmux_new_tab_follows_the_pane_not_the_start_directory() {
     if !tmux_available() || version() < MIN_VERSION {
         return;
     }
@@ -544,13 +544,14 @@ fn real_tmux_new_tab_in_the_start_directory() {
     a.until("the first pane", |h| h.shown() == 1 && !h.panes.is_empty());
     let first = a.ws.all_panes()[0];
     let dir = format!("/tmp/ferossh start #{}", std::process::id());
-    let line = format!("mkdir -p '{dir}' && echo made-$((40+2))\r");
+    let line = format!("mkdir -p '{dir}' && cd '{dir}' && echo made-$((40+2))\r");
     let actions = a.tmux.input(first, line.as_bytes());
     a.apply(actions);
     a.until("the mkdir", |h| h.text(first).contains("made-42"));
 
-    // Session > Start new tabs and panes in this directory sets it.
-    a.tmux.start_dir = Some(dir.clone());
+    // The host's start directory is only for when the pane's is not
+    // known; tmux always knows it.
+    a.tmux.start_dir = Some("/".into());
     let actions = a.tmux.new_tab(first);
     a.apply(actions);
     a.until("the new tab", |h| h.ws.all_panes().len() == 2);
