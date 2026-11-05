@@ -42,12 +42,19 @@ const FOOTER: usize = 1;
 const MAX_TEXT: usize = 400;
 /// Lines in one snippet.
 const MAX_LINES: usize = 50;
-/// The fields above a snippet's lines: name, hosts, folders, hotkey and
-/// auto-response text.
-const HEAD: usize = 5;
-const HEAD_LABELS: [&str; HEAD] = ["Name", "Hosts", "Folders", "Hotkey", "When"];
+/// The fields above a snippet's lines: name, category, hosts, folders,
+/// hotkey and auto-response text.
+const HEAD: usize = 6;
+const NAME: usize = 0;
+const CATEGORY: usize = 1;
+const HOSTS: usize = 2;
+const FOLDERS: usize = 3;
+const HOTKEY: usize = 4;
+const WHEN: usize = 5;
+const HEAD_LABELS: [&str; HEAD] = ["Name", "Category", "Hosts", "Folders", "Hotkey", "When"];
 const HEAD_HINTS: [&str; HEAD] = [
     "e.g. Show interfaces",
+    "none, or e.g. Network/Cisco",
     "every host, or patterns: sw-* core-?",
     "every folder, or names: Network, Lab",
     "none, or F1 to F12 (Ctrl+Shift+F...)",
@@ -141,6 +148,7 @@ impl Draft {
             index,
             head: [
                 snippet.name.clone(),
+                snippet.category.clone(),
                 snippet.hosts.join(" "),
                 snippet.folders.join(", "),
                 snippet.hotkey.map(|n| format!("F{n}")).unwrap_or_default(),
@@ -157,7 +165,7 @@ impl Draft {
     }
 
     fn name(&self) -> &str {
-        &self.head[0]
+        &self.head[NAME]
     }
 
     fn tidy(&mut self) {
@@ -215,34 +223,36 @@ impl Draft {
             lines.push(l.to_owned());
         }
         if name.is_empty() {
-            return self.fail("Give the snippet a name.".into(), 0);
+            return self.fail("Give the snippet a name.".into(), NAME);
         }
         if lines.is_empty() {
             return self.fail("Type at least one command line.".into(), HEAD);
         }
-        let hotkey = match login::parse_hotkey(&self.head[3]) {
+        let hotkey = match login::parse_hotkey(&self.head[HOTKEY]) {
             Ok(k) => k,
-            Err(e) => return self.fail(e, 3),
+            Err(e) => return self.fail(e, HOTKEY),
         };
         let snippet = Snippet {
             name,
+            category: ferossh_config::snippet_store::clean_category(&self.head[CATEGORY]),
             lines,
-            hosts: self.head[1]
+            hosts: self.head[HOSTS]
                 .split([' ', ','])
                 .filter(|h| !h.is_empty())
                 .map(str::to_owned)
                 .collect(),
-            folders: self.head[2]
+            folders: self.head[FOLDERS]
                 .split(',')
                 .map(str::trim)
                 .filter(|f| !f.is_empty())
                 .map(str::to_owned)
                 .collect(),
             hotkey,
-            when: self.head[4].trim().to_owned(),
+            when: self.head[WHEN].trim().to_owned(),
+            ..Snippet::default()
         };
         if let Some(why) = snippet.auto_problem() {
-            return self.fail(why, 4);
+            return self.fail(why, WHEN);
         }
         Some(SnipAction::Save {
             index: self.index,
@@ -317,6 +327,30 @@ impl Asking {
 }
 
 /// Inserts `c` into `text` at character `at`; returns whether it fit.
+/// A snippet line made to end with Enter (a plain line) or without (an
+/// `@type` step). Steps other than `@type`, and empty lines, stay as
+/// they are.
+fn with_enter(line: &str, enter: bool) -> String {
+    let trimmed = line.trim_start();
+    if trimmed.is_empty() {
+        return line.to_owned();
+    }
+    let typed = trimmed
+        .strip_prefix("@type ")
+        .or_else(|| trimmed.strip_prefix("@TYPE "));
+    match (typed, enter) {
+        // `@type x` to a line: a leading @ is written @@.
+        (Some(text), true) if text.trim_start().starts_with('@') => format!("@{}", text.trim()),
+        (Some(text), true) => text.trim().to_owned(),
+        (Some(_), false) => line.to_owned(),
+        (None, false) if trimmed.starts_with("@@") => format!("@type {}", &trimmed[1..]),
+        // Other steps cannot be typed without Enter.
+        (None, false) if trimmed.starts_with('@') => line.to_owned(),
+        (None, false) => format!("@type {}", trimmed.trim_end()),
+        (None, true) => line.to_owned(),
+    }
+}
+
 fn insert(text: &mut String, at: usize, c: char) -> bool {
     if text.chars().count() >= MAX_TEXT {
         return false;
@@ -388,6 +422,15 @@ fn paste_lines(text: &str) -> Vec<String> {
     lines
 }
 
+/// A row of the list.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ListRow {
+    /// A category's heading, with how many of its snippets are shown.
+    Category(String, usize),
+    /// The snippet at this place in [`SnippetsView::shown`].
+    Snippet(usize),
+}
+
 #[derive(Debug, Default)]
 pub struct SnippetsView {
     /// Where the focused pane is connected: its snippets come first.
@@ -409,7 +452,8 @@ pub struct SnippetsView {
 pub const PICK_HEAD: usize = 6;
 
 impl SnippetsView {
-    /// The indexes of the snippets the filter keeps: the ones for the
+    /// The indexes of the snippets the filter keeps, by category
+    /// (snippets without one first); in a category, the ones for the
     /// focused pane's host first.
     fn shown(&self, all: &[Snippet]) -> Vec<usize> {
         let mut out: Vec<usize> = all
@@ -418,8 +462,47 @@ impl SnippetsView {
             .filter(|(_, s)| s.matches(&self.filter))
             .map(|(i, _)| i)
             .collect();
-        out.sort_by_key(|&i| all.get(i).is_some_and(|s| !s.applies(self.place.as_ref())));
+        out.sort_by_cached_key(|&i| {
+            all.get(i).map(|s| {
+                (
+                    !s.category.is_empty(),
+                    s.category.to_lowercase(),
+                    !s.applies(self.place.as_ref()),
+                )
+            })
+        });
         out
+    }
+
+    /// The list's rows: a heading before each category's snippets, then
+    /// the snippets by their place in [`Self::shown`].
+    fn list_rows(all: &[Snippet], shown: &[usize]) -> Vec<ListRow> {
+        let mut rows = Vec::new();
+        let mut category: Option<&str> = None;
+        for (k, s) in shown.iter().enumerate() {
+            let Some(snippet) = all.get(*s) else {
+                continue;
+            };
+            let c = snippet.category.as_str();
+            if !c.is_empty() && category.is_none_or(|was| !was.eq_ignore_ascii_case(c)) {
+                let count = shown
+                    .iter()
+                    .filter_map(|i| all.get(*i))
+                    .filter(|o| o.category.eq_ignore_ascii_case(c))
+                    .count();
+                rows.push(ListRow::Category(c.to_owned(), count));
+            }
+            category = Some(c);
+            rows.push(ListRow::Snippet(k));
+        }
+        rows
+    }
+
+    /// The row the selected snippet is on.
+    fn selected_row(rows: &[ListRow], selected: usize) -> usize {
+        rows.iter()
+            .position(|r| *r == ListRow::Snippet(selected))
+            .unwrap_or(0)
     }
 
     /// Where the focused pane is connected (`None`: no host).
@@ -633,6 +716,13 @@ impl SnippetsView {
     }
 
     /// The edit is over: saved, or the snippet is gone.
+    /// The snippet being edited could not be saved: say why, keep it open.
+    pub fn fail(&mut self, why: String) {
+        if let Some(d) = &mut self.draft {
+            d.error = Some(why);
+        }
+    }
+
     pub fn saved(&mut self, all: &[Snippet], select: Option<usize>) {
         self.draft = None;
         if let Some(i) = select {
@@ -642,13 +732,52 @@ impl SnippetsView {
         self.selected = self.selected.min(all.len().saturating_sub(1));
     }
 
-    fn clamp(&mut self, n: usize, visible: usize) {
-        self.selected = self.selected.min(n.saturating_sub(1));
-        if self.selected < self.scroll {
-            self.scroll = self.selected;
+    fn clamp(&mut self, all: &[Snippet], visible: usize) {
+        let shown = self.shown(all);
+        self.selected = self.selected.min(shown.len().saturating_sub(1));
+        let rows = Self::list_rows(all, &shown);
+        let mut at = Self::selected_row(&rows, self.selected);
+        // The first snippet of a category brings its heading into view.
+        if at > 0 && matches!(rows.get(at - 1), Some(ListRow::Category(..))) {
+            at -= 1;
         }
-        if self.selected >= self.scroll + visible {
-            self.scroll = self.selected + 1 - visible;
+        if at < self.scroll {
+            self.scroll = at;
+        }
+        let at = Self::selected_row(&rows, self.selected);
+        if at >= self.scroll + visible {
+            self.scroll = at + 1 - visible;
+        }
+        self.scroll = self.scroll.min(rows.len().saturating_sub(1));
+    }
+
+    /// Selects the first snippet of the next category (or the one before,
+    /// `back`), for Right and Left.
+    fn jump_category(&mut self, all: &[Snippet], back: bool) {
+        let shown = self.shown(all);
+        let category = |k: usize| {
+            shown
+                .get(k)
+                .and_then(|&i| all.get(i))
+                .map(|s| s.category.to_lowercase())
+        };
+        let here = category(self.selected);
+        if back {
+            // The start of this category, or of the one before.
+            let mut k = self.selected;
+            while k > 0 && category(k - 1) == here {
+                k -= 1;
+            }
+            if k == self.selected && k > 0 {
+                let before = category(k - 1);
+                k -= 1;
+                while k > 0 && category(k - 1) == before {
+                    k -= 1;
+                }
+            }
+            self.selected = k;
+        } else if let Some(k) = (self.selected..shown.len()).find(|&k| category(k) != here) {
+            self.selected = k;
         }
     }
 
@@ -675,6 +804,8 @@ impl SnippetsView {
             SideKey::PageDown => self.selected += visible,
             SideKey::Home => self.selected = 0,
             SideKey::End => self.selected = shown.len().saturating_sub(1),
+            SideKey::Left => self.jump_category(all, true),
+            SideKey::Right => self.jump_category(all, false),
             SideKey::Enter { split } => {
                 let s = all.get(here?)?;
                 return Some(SnipAction::Send {
@@ -693,12 +824,18 @@ impl SnippetsView {
                 self.selected = 0;
             }
             SideKey::New => {
-                // What was typed as a filter names the new snippet.
+                // What was typed as a filter names the new snippet; it
+                // goes in the selected snippet's category.
+                let category = here
+                    .and_then(|i| all.get(i))
+                    .map(|s| s.category.clone())
+                    .unwrap_or_default();
                 let name = std::mem::take(&mut self.filter);
                 self.draft = Some(Draft::new(
                     None,
                     &Snippet {
                         name,
+                        category,
                         ..Snippet::default()
                     },
                 ));
@@ -720,7 +857,7 @@ impl SnippetsView {
             }
             _ => {}
         }
-        self.clamp(self.shown(all).len(), visible);
+        self.clamp(all, visible);
         None
     }
 
@@ -923,8 +1060,19 @@ impl SnippetsView {
                 return None;
             }
             SideKey::Enter { .. } if d.focus == save => return d.save(),
-            // Enter on a line goes to the next, where a new one waits.
-            SideKey::Enter { .. } => d.set_focus(d.focus + 1),
+            // Enter on a line ends it with Enter; Shift+Enter ends it
+            // without, as an `@type` step. Either goes to the next line,
+            // where a new one waits.
+            SideKey::Enter { split } => {
+                if d.is_line(d.focus)
+                    && let Some(t) = d.text_mut()
+                {
+                    *t = with_enter(t, !split);
+                }
+                d.error = None;
+                d.tidy();
+                d.set_focus(d.focus + 1);
+            }
             SideKey::Char(' ') if on_button => {
                 return self.draft_key(SideKey::Enter { split: false });
             }
@@ -996,9 +1144,17 @@ impl SnippetsView {
             return;
         }
         if let Some(i) = y.checked_sub(HEADER) {
-            self.selected = self.scroll + i;
+            let list = Self::list_rows(all, &self.shown(all));
+            // A heading selects its first snippet.
+            let picked = list.iter().skip(self.scroll + i).find_map(|r| match r {
+                ListRow::Snippet(k) => Some(*k),
+                ListRow::Category(..) => None,
+            });
+            if let Some(k) = picked {
+                self.selected = k;
+            }
         }
-        self.clamp(self.shown(all).len(), Self::visible(rows));
+        self.clamp(all, Self::visible(rows));
     }
 
     /// Wheel scrolling by `lines` (positive: up).
@@ -1021,7 +1177,9 @@ impl SnippetsView {
         if self.draft.is_some() {
             return;
         }
-        let max = self.shown(all).len().saturating_sub(Self::visible(rows));
+        let max = Self::list_rows(all, &self.shown(all))
+            .len()
+            .saturating_sub(Self::visible(rows));
         self.scroll = if by > 0 {
             self.scroll.saturating_sub(by as usize)
         } else {
@@ -1328,7 +1486,7 @@ impl SnippetsView {
                 ),
                 (None, None) => line.put(
                     &fit(
-                        " Enter: next line · @expect, @pause, @key lines · Esc: cancel",
+                        " Enter: line with Enter · Shift+Enter: without · @key, @expect, @pause · Esc",
                         width,
                     ),
                     palette.dim,
@@ -1365,6 +1523,11 @@ impl SnippetsView {
                 } else if value.is_empty() {
                     let hint = HEAD_HINTS.get(i).copied().unwrap_or("command line");
                     line.put(&fit(hint, room), palette.dim, Flags::ITALIC);
+                } else if let Some(text) = value.strip_prefix("@type ").filter(|_| d.is_line(i)) {
+                    // Typed without Enter (Shift+Enter made it).
+                    line.put(&fit(text, room), palette.text, Flags::empty());
+                    let left = width.saturating_sub(line.col);
+                    line.put(&fit("  no Enter", left), palette.accent, Flags::ITALIC);
                 } else {
                     line.put(&fit(&value, room), palette.text, Flags::empty());
                 }
@@ -1394,23 +1557,31 @@ impl SnippetsView {
             }
             return;
         }
-        let shown = self.shown(all);
         let visible = Self::visible(rows);
-        self.clamp(shown.len(), visible);
+        self.clamp(all, visible);
+        let shown = self.shown(all);
+        let list = Self::list_rows(all, &shown);
         let mut line = Line::new(width, bg);
         if self.filter.is_empty() {
             let hint = if focused {
-                " Type to filter▏"
+                " Type to search names, categories and lines▏"
             } else {
                 " Ctrl+Shift+Space to pick"
             };
-            line.put(hint, palette.dim, Flags::ITALIC);
+            line.put(&fit(hint, width), palette.dim, Flags::ITALIC);
         } else {
-            line.put(" Filter ", palette.dim, Flags::empty());
+            line.put(" Search ", palette.dim, Flags::empty());
             line.put(&self.filter, palette.text, Flags::empty());
             if focused {
                 line.put("▏", palette.accent, Flags::empty());
             }
+            let n = shown.len();
+            let left = width.saturating_sub(line.col);
+            line.put(
+                &fit(&format!("  {n} found"), left),
+                palette.dim,
+                Flags::empty(),
+            );
         }
         row(grid, 1, &mut line, bg);
         for y in 0..visible {
@@ -1419,15 +1590,34 @@ impl SnippetsView {
                 break;
             }
             let i = self.scroll + y;
-            let here = focused && i == self.selected;
+            let entry = list.get(i);
+            let here = focused && entry == Some(&ListRow::Snippet(self.selected));
             let row_bg = if here { palette.active } else { bg };
             let mut line = Line::new(width, row_bg);
-            match shown.get(i).and_then(|&n| all.get(n)) {
-                Some(s) => {
+            let snippet = match entry {
+                Some(ListRow::Snippet(k)) => shown.get(*k).and_then(|&n| all.get(n)),
+                _ => None,
+            };
+            match (entry, snippet) {
+                (Some(ListRow::Category(name, count)), _) => {
+                    line.put(
+                        &fit(&format!(" ▾ {name}"), width),
+                        palette.text,
+                        Flags::BOLD,
+                    );
+                    let left = width.saturating_sub(line.col);
+                    line.put(
+                        &fit(&format!("  {count}"), left),
+                        palette.dim,
+                        Flags::empty(),
+                    );
+                }
+                (_, Some(s)) => {
                     // Snippets for other hosts are dimmed.
                     let here_host = s.applies(self.place.as_ref());
+                    let indent = if s.category.is_empty() { " " } else { "   " };
                     line.put(
-                        &fit(&format!(" {}", s.name), width),
+                        &fit(&format!("{indent}{}", s.name), width),
                         if here_host { palette.text } else { palette.dim },
                         Flags::empty(),
                     );
@@ -1453,17 +1643,17 @@ impl SnippetsView {
                         Flags::empty(),
                     );
                 }
-                None if i == 0 && all.is_empty() => {
+                _ if i == 0 && all.is_empty() => {
                     line.put(
                         " No snippets yet. Insert adds one.",
                         palette.dim,
                         Flags::ITALIC,
                     );
                 }
-                None if i == 0 => {
+                _ if i == 0 => {
                     line.put(" Nothing matches.", palette.dim, Flags::ITALIC);
                 }
-                None => {}
+                _ => {}
             }
             row(grid, at, &mut line, row_bg);
         }
@@ -1471,7 +1661,7 @@ impl SnippetsView {
             let mut line = Line::new(width, bg);
             line.put(
                 &fit(
-                    " Enter types · Shift+Enter: no Enter · F5 on hosts · Ins new · F2 edit · Del",
+                    " Enter types · Shift+Enter: no last Enter · ←→ category · F5 on hosts · Ins new · F2 edit · Del",
                     width,
                 ),
                 palette.dim,
@@ -1527,6 +1717,101 @@ mod tests {
     }
 
     #[test]
+    fn categories_head_their_snippets_and_are_searched() {
+        let mut all = snippets();
+        let cat = |name: &str, category: &str| Snippet {
+            name: name.into(),
+            category: category.into(),
+            lines: vec!["x".into()],
+            ..Snippet::default()
+        };
+        all.push(cat("Uptime", "Linux"));
+        all.push(cat("Disk", "Linux"));
+        all.push(cat("Vlans", "Network/Cisco"));
+        let mut v = SnippetsView::default();
+        let t = texts(&mut v, &all);
+        assert!(t[2].contains("Show interfaces"), "{t:#?}");
+        assert!(t[4].contains("▾ Linux") && t[4].ends_with('2'), "{t:#?}");
+        assert!(t[5].starts_with("   Uptime"), "{t:#?}");
+        assert!(t[7].contains("▾ Network/Cisco"), "{t:#?}");
+        // Right goes to the next category's first snippet, Left back.
+        v.key(SideKey::Right, &all, 20);
+        assert_eq!(
+            v.key(SideKey::Enter { split: false }, &all, 20),
+            Some(SnipAction::Send {
+                name: "Uptime".into(),
+                lines: vec!["x".into()],
+                enter: true
+            })
+        );
+        v.key(SideKey::Right, &all, 20);
+        v.key(SideKey::Left, &all, 20);
+        v.key(SideKey::Left, &all, 20);
+        assert!(matches!(
+            v.key(SideKey::Enter { split: false }, &all, 20),
+            Some(SnipAction::Send { name, .. }) if name == "Show interfaces"
+        ));
+        // A click on a heading picks its first snippet.
+        v.click(7, &all, 12);
+        assert!(matches!(
+            v.key(SideKey::Enter { split: false }, &all, 20),
+            Some(SnipAction::Send { name, .. }) if name == "Vlans"
+        ));
+        // Search finds by category too.
+        typed(&mut v, &all, "cisco");
+        let t = texts(&mut v, &all);
+        assert!(
+            t[1].contains("Search cisco") && t[1].contains("1 found"),
+            "{t:#?}"
+        );
+        assert!(t[3].contains("Vlans"), "{t:#?}");
+        // A new snippet starts in the selected one's category.
+        v.key(SideKey::Escape, &all, 20);
+        v.key(SideKey::End, &all, 20);
+        v.key(SideKey::New, &all, 20);
+        assert!(texts(&mut v, &all)[3].contains("Network/Cisco"));
+    }
+
+    #[test]
+    fn shift_enter_ends_a_line_without_enter() {
+        assert_eq!(with_enter("ls -l", false), "@type ls -l");
+        assert_eq!(with_enter("@type ls -l", true), "ls -l");
+        assert_eq!(with_enter("@type ls -l", false), "@type ls -l");
+        assert_eq!(with_enter("@@home", false), "@type @home");
+        assert_eq!(with_enter("@type @home", true), "@@home");
+        assert_eq!(with_enter("@key tab", false), "@key tab");
+        assert_eq!(with_enter("", false), "");
+        let all = snippets();
+        let mut v = SnippetsView::default();
+        typed(&mut v, &all, "Find");
+        v.key(SideKey::New, &all, 20);
+        typed(&mut v, &all, "grep -i error /var/log/syslog");
+        v.key(SideKey::Enter { split: true }, &all, 20);
+        let t = texts(&mut v, &all);
+        assert!(
+            t[8].contains("grep") && t[8].ends_with("no Enter"),
+            "{t:#?}"
+        );
+        typed(&mut v, &all, "@key enter");
+        v.key(SideKey::Enter { split: false }, &all, 20);
+        v.key(SideKey::Down, &all, 20);
+        assert_eq!(
+            v.key(SideKey::Enter { split: false }, &all, 20),
+            Some(SnipAction::Save {
+                index: None,
+                snippet: Snippet {
+                    name: "Find".into(),
+                    lines: vec![
+                        "@type grep -i error /var/log/syslog".into(),
+                        "@key enter".into()
+                    ],
+                    ..Snippet::default()
+                }
+            })
+        );
+    }
+
+    #[test]
     fn filter_and_send() {
         let all = snippets();
         let mut v = SnippetsView::default();
@@ -1538,7 +1823,7 @@ mod tests {
         );
         typed(&mut v, &all, "save");
         let t = texts(&mut v, &all);
-        assert!(t[1].contains("Filter save"));
+        assert!(t[1].contains("Search save"));
         assert!(t[2].contains("Save config"));
         assert!(!t.iter().any(|l| l.contains("Show interfaces")));
         assert_eq!(
@@ -1584,7 +1869,7 @@ mod tests {
         let t = texts(&mut v, &all);
         assert!(t[0].contains("New snippet"));
         assert!(t[2].contains("Name Show vlans"), "{t:#?}");
-        assert!(t[9].contains("command line"), "a new line waits: {t:#?}");
+        assert!(t[10].contains("command line"), "a new line waits: {t:#?}");
         // Down past the empty line to Save.
         v.key(SideKey::Down, &all, 20);
         v.key(SideKey::Down, &all, 20);
@@ -1611,15 +1896,15 @@ mod tests {
         for _ in 0..20 {
             v.key(SideKey::Backspace, &all, 20);
         }
-        // Name, hosts, folders, hotkey, when, line 1, the empty line,
-        // then Save.
-        for _ in 0..7 {
+        // Name, category, hosts, folders, hotkey, when, line 1, the empty
+        // line, then Save.
+        for _ in 0..8 {
             v.key(SideKey::Tab, &all, 20);
         }
         assert_eq!(v.key(SideKey::Enter { split: false }, &all, 20), None);
         assert!(texts(&mut v, &all)[1].contains("Give the snippet a name."));
         typed(&mut v, &all, "Brief");
-        for _ in 0..7 {
+        for _ in 0..8 {
             v.key(SideKey::Tab, &all, 20);
         }
         assert_eq!(
@@ -1763,6 +2048,8 @@ mod tests {
         v.key(SideKey::New, &all, 20);
         typed(&mut v, &all, "Pager");
         v.key(SideKey::Down, &all, 20);
+        typed(&mut v, &all, " Network / Cisco ");
+        v.key(SideKey::Down, &all, 20);
         typed(&mut v, &all, "sw-*, core-?");
         v.key(SideKey::Down, &all, 20);
         typed(&mut v, &all, "Network , Lab");
@@ -1802,11 +2089,13 @@ mod tests {
                 index: None,
                 snippet: Snippet {
                     name: "Pager".into(),
+                    category: "Network/Cisco".into(),
                     lines: vec!["@key space".into()],
                     hosts: vec!["sw-*".into(), "core-?".into()],
                     folders: vec!["Network".into(), "Lab".into()],
                     hotkey: Some(3),
                     when: "--More--".into(),
+                    ..Snippet::default()
                 }
             })
         );
@@ -1814,7 +2103,7 @@ mod tests {
         let mut v = SnippetsView::default();
         v.key(SideKey::New, &all, 20);
         typed(&mut v, &all, "Fish");
-        for _ in 0..4 {
+        for _ in 0..5 {
             v.key(SideKey::Down, &all, 20);
         }
         typed(&mut v, &all, "Password:");
@@ -1836,7 +2125,7 @@ mod tests {
         let t = texts(&mut v, &all);
         assert!(t[1].contains("Recorded"), "{t:#?}");
         assert!(
-            t[7].contains("enable") && t[8].contains("@password"),
+            t[8].contains("enable") && t[9].contains("@password"),
             "{t:#?}"
         );
     }

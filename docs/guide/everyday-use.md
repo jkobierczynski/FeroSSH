@@ -109,9 +109,13 @@ Secrets are never written to a FeroSSH file. The first time, the pane asks for t
 
 ## Command snippets
 
-Ctrl+Shift+Space (Tools > Command snippets) lists named command lines. Type to filter, then Enter types the snippet with Enter after each line, or Shift+Enter leaves the last line for you to finish. With broadcast input on, it goes to every broadcast pane.
+Ctrl+Shift+Space (Tools > Command snippets) lists named command lines, grouped under their categories. Type to search names, categories and lines, then Enter types the snippet with Enter after each line, or Shift+Enter leaves the last line for you to finish. Left and Right jump between categories. With broadcast input on, it goes to every broadcast pane, so one snippet works several terminals at once.
 
-Insert adds a snippet (what you typed as a filter becomes its name), F2 edits one, Del removes one. Edit > Save selection as snippet starts one from text selected in a pane. Snippets are kept in `ferossh.conf`.
+Insert adds a snippet (what you typed as a search becomes its name), F2 edits one, Del removes one. Edit > Save selection as snippet starts one from text selected in a pane.
+
+**Categories.** The editor's *Category* field files a snippet under a category, such as `Linux` or `Network/Cisco` (a `/` makes a category within a category, up to four deep). A new snippet starts in the category of the one selected.
+
+**Enter or not, per line.** In the editor, Enter ends a line, and that line is typed with Enter after it. Shift+Enter ends a line that is typed without Enter: it becomes an `@type` line and shows *no Enter*, so a snippet can fill in a command and leave it for you to check, or type a password prompt's answer only after a `@key`.
 
 **Arguments.** `$1` to `$9`, or `${1:Gi0/1}` with a default, are asked for in the side pane before the snippet is typed, prefilled with the defaults, with a preview of what will be typed. `$$` types a plain `$`; other `$` text such as `$HOME` is left alone.
 
@@ -123,12 +127,26 @@ Insert adds a snippet (what you typed as a filter becomes its name), F2 edits on
 | --- | --- |
 | `@expect (config)#` | Waits for the host to print that. |
 | `@capture Version *,` | Keeps the value where the `*` is from the reply, for the report. |
-| `@pause 2` | Waits 2 seconds. |
-| `@key enter` | Presses a key: `enter`, `space`, `tab`, `escape`, `ctrl+z` and the like. |
+| `@pause 2` | Waits 2 seconds (`@pause 500ms` is a delay). |
+| `@delay 300ms` | Waits 300 milliseconds (`@delay 1.5s` works too; 10 ms to 60 s), for timing between keys and panes. |
+| `@key enter` | Presses keys: `enter`, `space`, `tab`, `escape`, `backspace`, `up`, `down`, `left`, `right`, `home`, `end`, `insert`, `delete`, `pageup`, `pagedown`, `f1` to `f12`, `ctrl+z`, `alt+x`, or a single character. `ctrl+`, `alt+` and `shift+` combine with the arrows, Home, End, Insert, Delete, Page Up/Down and F-keys (`alt+right`, `ctrl+left`, `ctrl+shift+f5`), and `shift+tab` works too. Several keys go in one step, and a number repeats the key before it: `@key down 3 enter`, or `@key ctrl+b d` for tmux. |
 | `@type y` | Types text without Enter. |
 | `@password`, `@secret enable` | Types the login password or a named secret. |
+| `@pane right` | Moves to the pane `left`, `right`, `up` or `down` of this one, like Alt+arrow; the rest of the snippet is typed there. `@key alt+right` instead sends Alt+Right to the host. |
+| `@tab next` | Moves to the `next` or `prev` tab; the rest of the snippet is typed in its focused pane. |
 
 `@@` types a plain `@`.
+
+For example, to start a capture on one host and a ping from the host beside it:
+
+```
+tcpdump -ni eth0 icmp
+@delay 1s
+@pane right
+ping -c 3 10.0.0.1
+```
+
+A snippet with `@pane` or `@tab` runs from one pane: with broadcast input on it says so instead, and a run on picked hosts (F5) skips those steps.
 
 **Hosts, folders and hotkeys.** In the editor a snippet can be kept to some hosts (`sw-* core-?`) or connection-manager folders. Snippets for the focused pane's host are listed first and the others dimmed; the command palette shows only the ones that apply. A snippet can have a hotkey, Ctrl+Shift+F1 to F12.
 
@@ -147,6 +165,34 @@ A snippet's *When* text makes it answer by itself whenever the host prints that 
 ### Production guard
 
 A snippet about to be typed into a pane with the red Production theme asks first, listing the hosts and the lines. Session > Confirm snippets on Production hosts turns that off.
+
+### The snippets folder
+
+Each snippet is a file of its own in `%APPDATA%\FeroSSH\snippets` (Tools > Open snippets folder), named after the snippet and ending in `.snippet`, and the folder it is in is its category:
+
+```
+snippets\
+    Disk use.snippet
+    Network\
+        Show interfaces.snippet
+        Cisco\
+            Save config.snippet
+```
+
+To take snippets to another PC, copy the files or folders into that PC's snippets folder; FeroSSH reads the folder again each time the snippets pane opens. The files are plain text (see [Settings](settings.md#snippets)), so they can go in git or be shared with a team. Snippets an older FeroSSH kept in `ferossh.conf` move to the folder by themselves at the first start, and a copy of the old file stays as `ferossh.conf.before-snippets-folder`.
+
+### Importing snippets
+
+File > Import snippets lists what other programs on this PC have, with a box per snippet and its first lines, so you can check them before anything is written. Imported snippets get a file each in the snippets folder; one whose name is already taken in its category is left out.
+
+| From | What comes over |
+| --- | --- |
+| Windows Terminal | `sendInput` actions in `settings.json` (named ones, with nested command menus as categories), and the `snippets` of a `.wt.json` file. |
+| SecureCRT | The Send String buttons of its button bars (`ButtonBarV5.ini` or `ButtonBarV4.ini`), a category per bar. `\r` becomes a line, `\p` a one-second `@pause`. |
+| MobaXterm | The macros in `MobaXterm.ini`. MobaXterm does not document how it stores them, so check the lines on the import page. |
+| A file | Another FeroSSH's `.snippet` file, or any text file as one snippet, a line per line. |
+
+Keystrokes come over as steps: text without an Enter becomes `@type`, Tab, Escape and Ctrl+ keys become `@key`, and a `$` or a leading `@` is written so that it types as it is.
 
 ### Recording a snippet
 

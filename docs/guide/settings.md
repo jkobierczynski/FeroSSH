@@ -118,7 +118,7 @@ Secret enable
 
 ## Snippets
 
-Command snippets are kept here too. The snippet editor (Tools > Command snippets, then Insert or F2) writes them, but you can also write them by hand:
+Command snippets are not kept in `ferossh.conf` but in a file each in `%APPDATA%\FeroSSH\snippets`, in the same syntax, with the folder a file is in as its category (see [The snippets folder](everyday-use.md#the-snippets-folder)). The snippet editor (Tools > Command snippets, then Insert or F2) writes them, but you can also write a `.snippet` file by hand, one snippet per file:
 
 ```
 Snippet "Back up the config"
@@ -128,6 +128,11 @@ Snippet "Back up the config"
     Line copy running-config tftp://10.0.0.5/${host}-${stamp}.cfg
     Line @expect ]?
     Line @key enter
+```
+
+and in another file:
+
+```
 Snippet "Next page"
     Hosts sw-*
     When --More--

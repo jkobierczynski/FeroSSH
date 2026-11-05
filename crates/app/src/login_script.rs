@@ -188,6 +188,15 @@ impl Runner {
                     self.deadline = Some(now + Duration::from_secs(u64::from(*secs)));
                     return;
                 }
+                // Moves are carried out by the window, between the parts
+                // of a snippet; a runner that meets one goes on.
+                Step::Pane(_) | Step::Tab(_) => {}
+                Step::Delay(ms) => {
+                    self.next += 1;
+                    self.wait = Wait::Pause;
+                    self.deadline = Some(now + Duration::from_millis(u64::from(*ms)));
+                    return;
+                }
                 Step::Password => {
                     self.wait = Wait::Secret;
                     out.push(Action::Fetch(Need::Password));

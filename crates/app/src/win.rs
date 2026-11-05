@@ -21,12 +21,14 @@ use std::time::{Duration, Instant};
 use ferossh_auth::Broker;
 use ferossh_config::hotkey::Hotkey;
 use ferossh_config::import::{self, Client};
-use ferossh_config::login::{self, Place, Step};
+use ferossh_config::login::{self, Place, Snippet, Step};
 use ferossh_config::password::{self as pw_source, PasswordSource};
 use ferossh_config::record::Recorder;
 use ferossh_config::saved::{self, SavedHost};
 use ferossh_config::serial::{self, SerialTarget};
 use ferossh_config::settings::{DEFAULT_DESKTOP_PORT, DEFAULT_VNC_PORT};
+use ferossh_config::snippet_import::{self, SnippetClient};
+use ferossh_config::snippet_store;
 use ferossh_config::trigger::{Fire, Watch};
 use ferossh_config::{
     ForwardSpec, SessionKind, Settings, mobaxterm, mremoteng, putty, securecrt, ssh_config, winscp,
@@ -112,7 +114,7 @@ use crate::forwards::{
 };
 use crate::fwdview::{ForwardsView, FwdAction};
 use crate::import_reg;
-use crate::import_view::{Found, ImportAction, ImportView};
+use crate::import_view::{Found, ImportAction, ImportView, Items};
 use crate::layout::{self, Axis, Closed, Dir, Drop, PaneId, Rect, Workspace};
 use crate::link::{Link, LinkEvent};
 use crate::live::{self, LiveAction, LiveSession, LiveState, LiveView};
@@ -305,6 +307,7 @@ mod cmd {
     pub const UPLOAD: u32 = 108;
     pub const DOWNLOADS: u32 = 109;
     pub const AUTO_RECONNECT: u32 = 110;
+    pub const IMPORT_SNIPPETS: u32 = 111;
     pub const ZOOM_IN: u32 = 200;
     pub const ZOOM_OUT: u32 = 201;
     pub const ZOOM_RESET: u32 = 202;
@@ -320,6 +323,7 @@ mod cmd {
     pub const SNIPPETS: u32 = 212;
     pub const PALETTE: u32 = 213;
     pub const LIVE: u32 = 214;
+    pub const SNIPPET_FOLDER: u32 = 215;
     /// Plus the index into `FONT_CHOICES`.
     pub const FONT: u32 = 300;
     /// Plus the index into `Theme::builtin()`.
@@ -822,6 +826,10 @@ struct Window {
     update: Option<(std::sync::mpsc::Receiver<crate::update::Outcome>, bool)>,
     /// Login scripts running, by pane.
     scripts: HashMap<PaneId, ScriptRun>,
+    /// Snippets with an `@pane` or `@tab` step, by the pane their first
+    /// part runs in: that run's number, the snippet's name and the steps
+    /// from the move on, which follow when the run finishes.
+    snippet_next: HashMap<PaneId, (u64, String, Vec<Step>)>,
     /// ZMODEM transfers running, by pane.
     zmodem: HashMap<PaneId, zmodem::Transfer>,
     /// Secrets for login scripts from password manager commands, as they
@@ -1082,6 +1090,34 @@ fn load_settings() -> Settings {
     std::fs::read_to_string(settings_path())
         .map(|t| Settings::parse(&t))
         .unwrap_or_default()
+}
+
+/// The snippets folder: a file per command snippet, a folder per
+/// category (see [`snippet_store`]).
+fn snippets_dir() -> PathBuf {
+    app_dir().join("snippets")
+}
+
+/// Reads the snippets folder into `settings`. Snippets an older FeroSSH
+/// kept in `ferossh.conf` move to the folder first, with a copy of the
+/// old file kept beside it; if the folder cannot be written they stay in
+/// `ferossh.conf` and are used from there.
+fn load_snippets(settings: &mut Settings) {
+    let dir = snippets_dir();
+    if !settings.snippets.is_empty() {
+        let _ = std::fs::copy(
+            settings_path(),
+            app_dir().join("ferossh.conf.before-snippets-folder"),
+        );
+        if snippet_store::migrate(&dir, &settings.snippets).is_err() {
+            return;
+        }
+        settings.snippets = snippet_store::load(&dir).0;
+        // The file no longer needs the moved blocks.
+        let _ = write_app_file(&settings_path(), &settings.to_text());
+        return;
+    }
+    settings.snippets = snippet_store::load(&dir).0;
 }
 
 /// Writes a file in FeroSSH's folder through a temporary file, so a crash
@@ -1375,7 +1411,8 @@ fn create_and_run(launch: Launch, theme: Option<String>) -> Result<()> {
         // Size the window for 80x24 cells at the DPI of the monitor it
         // opened on.
         let dpi = GetDpiForWindow(hwnd);
-        let settings = load_settings();
+        let mut settings = load_settings();
+        load_snippets(&mut settings);
         let font = FontSpec::default();
         // An unknown theme name falls back to the default (Nord).
         let default_theme = theme.and_then(|n| Theme::by_name(&n)).unwrap_or_default();
@@ -1480,6 +1517,7 @@ fn create_and_run(launch: Launch, theme: Option<String>) -> Result<()> {
                 broadcast: broadcast::Scope::Off,
                 update: None,
                 scripts: HashMap::new(),
+                snippet_next: HashMap::new(),
                 zmodem: HashMap::new(),
                 script_secrets: Arc::default(),
                 script_runs: 0,
@@ -1604,6 +1642,7 @@ fn build_menu() -> Result<HMENU> {
         separator(file)?;
         item(file, cmd::LOCAL_SHELL, "Open &local shell")?;
         item(file, cmd::IMPORT, "&Import connections...")?;
+        item(file, cmd::IMPORT_SNIPPETS, "Import s&nippets...")?;
         separator(file)?;
         item(file, cmd::EXIT, "E&xit\tAlt+F4")?;
 
@@ -1726,6 +1765,7 @@ fn build_menu() -> Result<HMENU> {
         item(tools, cmd::FILES, "&File transfer\tCtrl+Shift+E")?;
         item(tools, cmd::FORWARDS, "&Port forwards\tCtrl+Shift+P")?;
         item(tools, cmd::SNIPPETS, "Command s&nippets\tCtrl+Shift+Space")?;
+        item(tools, cmd::SNIPPET_FOLDER, "Open snippets f&older")?;
         item(tools, cmd::PALETTE, "Command p&alette\tCtrl+Shift+A")?;
 
         let view = CreatePopupMenu()?;
@@ -4848,7 +4888,16 @@ impl Window {
                     }
                 }
                 login_script::Action::Done => {
+                    let mut next = self.snippet_next.remove(&id);
                     if let Some(run) = self.scripts.remove(&id) {
+                        if next.as_ref().is_some_and(|n| n.0 != run.run)
+                            || matches!(
+                                run.runner.outcome(),
+                                Some(Outcome::Failed(_) | Outcome::Stopped)
+                            )
+                        {
+                            next = None;
+                        }
                         if run.report
                             && let Some(row) =
                                 self.snippets_view.report_mut().and_then(|r| r.row_mut(id))
@@ -4877,6 +4926,11 @@ impl Window {
                                 _ => self.begin_run_snippet(id),
                             }
                         }
+                    } else {
+                        next = None;
+                    }
+                    if let Some((_, name, rest)) = next {
+                        self.snippet_move(id, &name, rest);
                     }
                 }
             }
@@ -6896,22 +6950,28 @@ impl Window {
             Some(SnipAction::Copy(text)) => {
                 clipboard::set_text(self.hwnd, &text);
             }
-            Some(SnipAction::Save { index, snippet }) => {
+            Some(SnipAction::Save { index, mut snippet }) => {
                 let all = &mut self.settings.snippets;
-                let at = match index.filter(|&i| i < all.len()) {
+                let index = index.filter(|&i| i < all.len());
+                // An edit keeps the snippet's file, so a new name or
+                // category moves it.
+                snippet.file = index.and_then(|i| all.get(i)).and_then(|s| s.file.clone());
+                if let Err(e) = snippet_store::save(&snippets_dir(), &mut snippet) {
+                    self.snippets_view.fail(e);
+                    self.refresh_chrome();
+                    return None;
+                }
+                match index {
                     Some(i) => {
                         if let Some(slot) = all.get_mut(i) {
-                            *slot = snippet;
+                            *slot = snippet.clone();
                         }
-                        i
                     }
-                    None => {
-                        all.push(snippet);
-                        all.len() - 1
-                    }
-                };
-                self.save_settings();
-                self.snippets_view.saved(&self.settings.snippets, Some(at));
+                    None => all.push(snippet.clone()),
+                }
+                snippet_store::sort(all);
+                let at = all.iter().position(|s| s.file == snippet.file);
+                self.snippets_view.saved(&self.settings.snippets, at);
             }
             Some(SnipAction::Delete(i)) => out = Some(Command::DeleteSnippet(i)),
             Some(SnipAction::PickHosts { name, lines }) => out = self.pick_hosts(&name, &lines),
@@ -7144,10 +7204,27 @@ impl Window {
         {
             return Some(notice);
         }
+        // The steps from the first `@pane` or `@tab` on follow in the
+        // pane it moves to, once the steps before it are done.
+        let mut steps = steps;
+        let after = steps
+            .iter()
+            .position(Step::moves)
+            .map(|at| steps.split_off(at));
+        if after.is_some() && panes.len() > 1 {
+            return Some(Command::Notice(format!(
+                "The snippet {name} moves to another pane or tab (@pane, @tab), so it runs \
+                 in one pane only, not in {} at once.",
+                panes.len()
+            )));
+        }
         self.leave_snippets();
         if !capture && let Some(bytes) = login::steps_bytes(&steps) {
             for &p in panes {
                 self.input(p, bytes.clone());
+            }
+            if let (Some(after), Some(&p)) = (after, panes.first()) {
+                self.snippet_move(p, name, after);
             }
             return None;
         }
@@ -7175,6 +7252,10 @@ impl Window {
             }
             self.script_runs += 1;
             let mut runner = Runner::named(&what, steps.clone());
+            if let Some(after) = &after {
+                self.snippet_next
+                    .insert(p, (self.script_runs, name.to_owned(), after.clone()));
+            }
             let actions = runner.start(Instant::now());
             self.scripts.insert(
                 p,
@@ -7189,6 +7270,59 @@ impl Window {
         }
         self.refresh_chrome();
         None
+    }
+
+    /// The rest of snippet `name` after the part that ran in pane `from`:
+    /// `rest` starts with an `@pane` or `@tab` step, which focuses the
+    /// pane it names; the steps after it run there.
+    fn snippet_move(&mut self, from: PaneId, name: &str, mut rest: Vec<Step>) {
+        if rest.is_empty() {
+            return;
+        }
+        let step = rest.remove(0);
+        let Some(t) = self.ws.tab_of(from) else {
+            return;
+        };
+        let (to, missing) = match &step {
+            Step::Pane(d) => {
+                let dir = match d.as_str() {
+                    "left" => Dir::Left,
+                    "right" => Dir::Right,
+                    "up" => Dir::Up,
+                    _ => Dir::Down,
+                };
+                let g = gap(self.dpi);
+                let to = self.ws.tabs.get(t).and_then(|tab| {
+                    layout::neighbour(&tab.root.layout(self.areas.panes, g), from, dir)
+                });
+                (to, format!("there is no pane {d} of this one"))
+            }
+            Step::Tab(w) => {
+                let n = self.ws.tabs.len();
+                let i = if w == "next" {
+                    (t + 1) % n.max(1)
+                } else {
+                    (t + n - 1) % n.max(1)
+                };
+                let to = Some(i)
+                    .filter(|&i| i != t)
+                    .and_then(|i| self.ws.tabs.get(i))
+                    .map(|tab| tab.focus);
+                (to, "there is no other tab".to_owned())
+            }
+            _ => return,
+        };
+        let Some(to) = to else {
+            self.show(
+                from,
+                &format!("\x1b[0;31m[the snippet {name} stopped: {missing}]\x1b[0m\r\n"),
+            );
+            return;
+        };
+        self.focus_pane(to);
+        if let Some(Command::Notice(text)) = self.run_snippet(name, rest, &[to]) {
+            self.show(to, &format!("\x1b[0;31m{text}\x1b[0m\r\n"));
+        }
     }
 
     /// Shows `report` in the snippets view, which takes the keyboard.
@@ -7772,13 +7906,88 @@ impl Window {
         None
     }
 
-    fn delete_snippet(&mut self, index: usize) {
+    fn delete_snippet(&mut self, index: usize) -> Option<Command> {
+        let mut out = None;
         if index < self.settings.snippets.len() {
-            self.settings.snippets.remove(index);
-            self.save_settings();
+            let s = self.settings.snippets.remove(index);
+            if s.file.is_none() {
+                // One still kept in ferossh.conf.
+                self.save_settings();
+            } else if let Err(e) = snippet_store::remove(&snippets_dir(), &s) {
+                out = Some(Command::Notice(format!(
+                    "Could not remove the snippet's file: {e}"
+                )));
+            }
         }
         self.snippets_view.saved(&self.settings.snippets, None);
         self.refresh_chrome();
+        out
+    }
+
+    /// Reads the snippets folder again, so snippet files copied into it
+    /// show up. Snippets still kept in `ferossh.conf` (the folder could
+    /// not be written) stay.
+    fn reload_snippets(&mut self) {
+        let dir = snippets_dir();
+        if self.settings.snippets.iter().any(|s| s.file.is_none()) {
+            if snippet_store::migrate(&dir, &self.settings.snippets).is_err() {
+                return;
+            }
+            self.settings.snippets = snippet_store::load(&dir).0;
+            self.save_settings();
+            return;
+        }
+        self.settings.snippets = snippet_store::load(&dir).0;
+    }
+
+    /// File > Import snippets: the import page, on what other programs
+    /// on this account have.
+    fn open_snippet_import(&mut self, found: Vec<SnippetSource>, problems: Vec<String>) {
+        let list = found
+            .into_iter()
+            .map(|(c, origin, s)| found_snippets(c, origin, s))
+            .collect();
+        self.side.form = None;
+        self.side.import = Some(ImportView::snippets(list, problems));
+        self.show_side(SideView::Sessions, true);
+        self.refresh_chrome();
+    }
+
+    /// Snippets read from a file the user picked on the import page.
+    fn add_snippet_import(&mut self, (client, origin, snippets): SnippetSource) {
+        if let Some(view) = &mut self.side.import {
+            view.add(found_snippets(client, origin, snippets));
+        }
+        self.refresh_chrome();
+    }
+
+    /// Adds imported snippets to the snippets folder; says what happened.
+    fn write_snippet_import(&mut self, snippets: Vec<Snippet>) -> String {
+        let dir = snippets_dir();
+        let mut done = 0;
+        let mut failed = None;
+        for mut s in snippets {
+            match snippet_store::add(&dir, &mut s) {
+                Ok(()) => done += 1,
+                Err(e) => {
+                    failed = Some(e);
+                    break;
+                }
+            }
+        }
+        self.reload_snippets();
+        self.side.import = None;
+        self.show_side(SideView::Snippets, true);
+        let mut text = format!(
+            "Imported {done} snippet{} into {}. Each has a file there, in a folder named \
+             after its category.",
+            plural(done),
+            dir.display()
+        );
+        if let Some(e) = failed {
+            text.push_str(&format!("\n\nThe rest were not imported: {e}"));
+        }
+        text
     }
 
     /// File > Import connections: the import page, on what the clients
@@ -7810,6 +8019,9 @@ impl Window {
             Some(ImportAction::FromFile) => out = Some(Command::PickImportFile),
             Some(ImportAction::Import { client, sessions }) => {
                 out = Some(Command::Notice(self.write_import(client, &sessions)));
+            }
+            Some(ImportAction::ImportSnippets(snippets)) => {
+                out = Some(Command::Notice(self.write_snippet_import(snippets)));
             }
             None => {}
         }
@@ -8282,6 +8494,7 @@ impl Window {
                     && !self.snippets_view.asking()
                     && !self.snippets_view.reporting()
                 {
+                    self.reload_snippets();
                     self.snippets_view.reset();
                 }
             }
@@ -9379,6 +9592,8 @@ impl Window {
             }
             cmd::REPLACE_KEY => return Some(Command::ReplaceHostKey),
             cmd::IMPORT => return Some(Command::ImportSessions),
+            cmd::IMPORT_SNIPPETS => return Some(Command::ImportSnippets),
+            cmd::SNIPPET_FOLDER => return Some(Command::OpenFolder(snippets_dir())),
             cmd::LOCAL_SHELL => self.local_shell_in_new_tab(pane),
             cmd::CONNECT => self.connect_in_new_tab(pane),
             cmd::RECONNECT => {
@@ -10777,6 +10992,8 @@ enum Command {
     CloseTab(usize),
     /// File > Import connections: the side pane's import page.
     ImportSessions,
+    /// File > Import snippets: the side pane's import page for snippets.
+    ImportSnippets,
     /// Session > Check a log: the file picker, then the chain check.
     VerifyLog,
     /// The import page's file picker.
@@ -11625,6 +11842,27 @@ fn run_command(hwnd: HWND, command: Command) {
             let (found, problems) = known_imports();
             with_window(|w| w.open_import(found, problems));
         }
+        Command::ImportSnippets => {
+            let (found, problems) = known_snippet_imports();
+            with_window(|w| w.open_snippet_import(found, problems));
+        }
+        Command::PickImportFile
+            if with_window(|w| w.side.import.as_ref().is_some_and(ImportView::is_snippets))
+                .unwrap_or(false) =>
+        {
+            let start = std::env::var_os("LOCALAPPDATA").map_or_else(home, PathBuf::from);
+            if let Some(path) = pick_file(hwnd, w!("Snippets or macros of another program"), &start)
+            {
+                match read_snippet_file(&path) {
+                    Ok(found) => {
+                        with_window(|w| w.add_snippet_import(found));
+                    }
+                    Err(e) => {
+                        dialog(hwnd, &e, MB_OK | MB_ICONWARNING);
+                    }
+                }
+            }
+        }
         Command::PickImportFile => {
             let start = std::env::var_os("APPDATA").map_or_else(home, PathBuf::from);
             if let Some(path) = pick_file(hwnd, w!("Sessions file of another SSH client"), &start) {
@@ -11686,8 +11924,10 @@ fn run_command(hwnd: HWND, command: Command) {
                 return;
             };
             let text = format!("Delete the snippet {name}?");
-            if dialog(hwnd, &text, MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2) == Some(IDYES) {
-                with_window(|w| w.delete_snippet(index));
+            if dialog(hwnd, &text, MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2) == Some(IDYES)
+                && let Some(Some(command)) = with_window(|w| w.delete_snippet(index))
+            {
+                run_command(hwnd, command);
             }
         }
         Command::ConfirmRun {
@@ -11930,11 +12170,140 @@ fn found(client: Client, origin: String, mut sessions: Vec<import::Session>) -> 
         .map(|s| taken.contains(&s.host.alias.to_ascii_lowercase()))
         .collect();
     Found {
-        client,
         origin,
-        sessions,
+        items: Items::Sessions(client, sessions),
         taken,
     }
+}
+
+/// What the snippet import page shows for snippets read from `origin`:
+/// the ones a snippet in the same category already has the name of are
+/// marked (by what is in the snippets folder now).
+fn found_snippets(client: SnippetClient, origin: String, snippets: Vec<Snippet>) -> Found {
+    let (have, _) = snippet_store::load(&snippets_dir());
+    let taken = snippets
+        .iter()
+        .map(|s| snippet_store::has(&have, s))
+        .collect();
+    Found {
+        origin,
+        items: Items::Snippets(client, snippets),
+        taken,
+    }
+}
+
+/// Snippets of one program, with where they were read.
+type SnippetSource = (SnippetClient, String, Vec<Snippet>);
+
+/// The snippets of other programs on this account: Windows Terminal's
+/// `settings.json` (the Store, Preview and unpackaged ones), SecureCRT's
+/// button bars and MobaXterm's macros. Files that could not be read come
+/// back as problems.
+fn known_snippet_imports() -> (Vec<SnippetSource>, Vec<String>) {
+    let mut files: Vec<PathBuf> = Vec::new();
+    if let Some(local) = std::env::var_os("LOCALAPPDATA").map(PathBuf::from) {
+        for package in [
+            "Microsoft.WindowsTerminal_8wekyb3d8bbwe",
+            "Microsoft.WindowsTerminalPreview_8wekyb3d8bbwe",
+        ] {
+            files.push(
+                local
+                    .join("Packages")
+                    .join(package)
+                    .join("LocalState")
+                    .join("settings.json"),
+            );
+        }
+        files.push(
+            local
+                .join("Microsoft")
+                .join("Windows Terminal")
+                .join("settings.json"),
+        );
+    }
+    let appdata = std::env::var_os("APPDATA").map(PathBuf::from);
+    let crt = import_reg::securecrt_config()
+        .map(PathBuf::from)
+        .or_else(|| appdata.as_ref().map(|a| a.join("VanDyke").join("Config")));
+    if let Some(c) = crt {
+        files.push(c.join("ButtonBarV5.ini"));
+        files.push(c.join("ButtonBarV4.ini"));
+    }
+    if let Some(a) = &appdata {
+        files.push(a.join("MobaXterm").join("MobaXterm.ini"));
+    }
+    files.push(
+        home()
+            .join("Documents")
+            .join("MobaXterm")
+            .join("MobaXterm.ini"),
+    );
+    let mut found = Vec::new();
+    let mut problems = Vec::new();
+    for file in files.into_iter().filter(|f| f.is_file()) {
+        match read_snippet_file(&file) {
+            Ok(f) if !f.2.is_empty() => found.push(f),
+            // A MobaXterm.ini or settings.json without snippets.
+            Ok(_) => {}
+            Err(_)
+                if file
+                    .extension()
+                    .is_some_and(|e| e.eq_ignore_ascii_case("ini")) => {}
+            Err(e) => problems.push(e),
+        }
+    }
+    (found, problems)
+}
+
+/// Reads a file the user picked for a snippet import: Windows Terminal's
+/// `settings.json` or a `.wt.json`, SecureCRT's button bars, a
+/// `MobaXterm.ini`, a FeroSSH `.snippet` file, or any other text file as
+/// one snippet.
+fn read_snippet_file(path: &std::path::Path) -> std::result::Result<SnippetSource, String> {
+    let text = read_text(path, 16 << 20)?;
+    let origin = path.display().to_string();
+    let file = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let lower = file.to_ascii_lowercase();
+    let none = |what: &str| format!("{} has no {what}.", path.display());
+    if lower.ends_with(".json") || text.trim_start().starts_with('{') {
+        let s = snippet_import::windows_terminal(&text)
+            .map_err(|e| format!("Could not read {}. {e}", path.display()))?;
+        return Ok((SnippetClient::WindowsTerminal, origin, s));
+    }
+    if text.lines().any(|l| l.starts_with("Z:\"")) {
+        let s = snippet_import::securecrt_buttons(&text);
+        if s.is_empty() {
+            return Err(none("Send String buttons"));
+        }
+        return Ok((SnippetClient::SecureCrt, origin, s));
+    }
+    if text
+        .lines()
+        .any(|l| l.trim().eq_ignore_ascii_case("[Macros]"))
+    {
+        return Ok((
+            SnippetClient::MobaXterm,
+            origin,
+            snippet_import::mobaxterm_macros(&text),
+        ));
+    }
+    if lower.ends_with(".ini") && text.contains("[Bookmarks") {
+        return Err(none("macros"));
+    }
+    if text.len() > 1 << 20 {
+        return Err(format!("{} is too big for one snippet.", path.display()));
+    }
+    let stem = path
+        .file_stem()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let snippet = snippet_store::parse_file(&text, SnippetClient::TextFile.category())
+        .or_else(|| snippet_import::text_file(&stem, &text))
+        .ok_or_else(|| none("lines"))?;
+    Ok((SnippetClient::TextFile, origin, vec![snippet]))
 }
 
 /// Sessions of one client, with where they were read: "registry" or a

@@ -17,6 +17,7 @@ Items with a check mark are switches: picking them turns the setting on or off, 
 | Open download folder | | Opens the folder downloads go to in Explorer. |
 | Open local shell | | Opens a Windows command prompt (`%COMSPEC%`, usually `cmd.exe`) in a new tab. To start another program, use `ferossh.exe --local wsl -d Ubuntu` and the like. |
 | Import connections... | | Brings saved sessions over from PuTTY, KiTTY, WinSCP, MobaXterm, mRemoteNG and SecureCRT (see [Imports](everyday-use.md#importing-from-other-clients)). |
+| Import snippets... | | Brings command snippets over from Windows Terminal (`sendInput` actions and `.wt.json` snippets), SecureCRT button bars and MobaXterm macros, or makes one from a text file (see [Importing snippets](everyday-use.md#importing-snippets)). |
 | Exit | Alt+F4 | Closes FeroSSH. tmux sessions keep running on their servers. |
 
 ## Edit
@@ -57,7 +58,8 @@ Font, theme and text size apply to the focused pane only. Session > Save font an
 | Session manager | Ctrl+Shift+L | Shows the sessions open right now, in every tab (see [The session manager](everyday-use.md#the-session-manager)). |
 | File transfer | Ctrl+Shift+E | Shows the focused pane's host over SFTP in the side pane (see [File transfer](everyday-use.md#file-transfer)). |
 | Port forwards | Ctrl+Shift+P | Lists, adds, changes and stops port forwards on live connections (see [Port forwards](everyday-use.md#port-forwards)). |
-| Command snippets | Ctrl+Shift+Space | Lists your snippets, to type one into the pane or edit them (see [Snippets](everyday-use.md#command-snippets)). |
+| Command snippets | Ctrl+Shift+Space | Lists your snippets by category, to type one into the pane or edit them (see [Snippets](everyday-use.md#command-snippets)). |
+| Open snippets folder | | Opens `%APPDATA%\FeroSSH\snippets` in Explorer: one file per snippet, a folder per category, to copy to another PC or back up (see [The snippets folder](everyday-use.md#the-snippets-folder)). |
 | Command palette | Ctrl+Shift+A | One search box over every menu item, connection and snippet (see [Command palette](everyday-use.md#the-command-palette)). |
 
 ## Window
@@ -207,14 +209,17 @@ Drag the title bar of the Local PC section or of the transfer queue up or down t
 
 | Key | Action |
 | --- | --- |
-| Typing | Filters. |
+| Typing | Searches names, categories and lines. |
 | Enter | Types the snippet, with Enter after each line. |
 | Shift+Enter | Types it but leaves the last line for you to finish. |
-| Insert | New snippet (the filter text becomes its name). |
+| Left / Right | Jumps to the previous or next category. |
+| Insert | New snippet (the search text becomes its name; it goes in the selected snippet's category). |
 | F2 | Edits the snippet. |
 | Del | Deletes it, after asking. |
 | F5 | Runs it on several saved hosts (see [Runs on many hosts](everyday-use.md#runs-on-many-hosts)). |
 | Ctrl+Shift+F1 to F12 | From anywhere: runs the snippet with that hotkey for the focused pane's host. |
+
+In the snippet editor, Enter ends a line, which is typed with Enter after it; Shift+Enter ends a line that is typed without Enter (it becomes an `@type` line, shown as *no Enter*).
 
 In a run's report, Enter shows that host's pane, C copies the report as a table, S saves it as CSV in the download folder, R runs the failed hosts again and Esc stops the run (or closes the report when it is over).
 
