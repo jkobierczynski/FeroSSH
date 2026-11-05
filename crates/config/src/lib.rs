@@ -8,6 +8,7 @@
 pub mod forward;
 mod host_theme;
 pub mod hostkey;
+pub mod hotkey;
 pub mod import;
 pub mod known_hosts;
 pub mod login;

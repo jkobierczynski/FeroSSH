@@ -93,6 +93,8 @@ mod ssh;
 #[cfg(all(test, unix))]
 mod ssh_e2e;
 #[cfg_attr(not(windows), allow(dead_code))]
+mod standby;
+#[cfg_attr(not(windows), allow(dead_code))]
 mod tabstrip;
 #[cfg_attr(not(windows), allow(dead_code))]
 mod telnet;
