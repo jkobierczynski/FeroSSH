@@ -84,6 +84,13 @@ jobs:
         with:
           name: ferossh-desktop-viewer-exe
           path: dist
+      # The Linux agents Run remote app copies to hosts: they go next to
+      # ferossh.exe. Not code signed (Authenticode is for Windows files);
+      # SHA256SUMS.txt and the attestation cover them.
+      - uses: actions/download-artifact@v4
+        with:
+          name: ferostream-agents
+          path: dist
 
       # Taken before signing: these are the hashes a rebuild with
       # scripts/build-release.ps1 reproduces (CI's reproducible build job
@@ -91,7 +98,7 @@ jobs:
       - name: Unsigned SHA-256 sums
         shell: pwsh
         run: |
-          Get-ChildItem dist\*.exe | Sort-Object Name | ForEach-Object {
+          Get-ChildItem dist\*.exe, dist\ferostream-agent* | Sort-Object Name | ForEach-Object {
             "$((Get-FileHash $_.FullName -Algorithm SHA256).Hash.ToLower())  $($_.Name)"
           } | Set-Content -Encoding ascii "$env:RUNNER_TEMP\unsigned.txt"
 
@@ -162,7 +169,7 @@ jobs:
         shell: pwsh
         run: |
           Push-Location dist
-          Get-ChildItem *.exe | Sort-Object Name | ForEach-Object {
+          Get-ChildItem *.exe, ferostream-agent* | Sort-Object Name | ForEach-Object {
             "$((Get-FileHash $_.Name -Algorithm SHA256).Hash.ToLower())  $($_.Name)"
           } | Set-Content -Encoding ascii SHA256SUMS.txt
           Get-Content SHA256SUMS.txt | Tee-Object -Append $env:GITHUB_STEP_SUMMARY
@@ -185,8 +192,8 @@ jobs:
             $unsigned[$name] = $hash
           }
           $toolchain = (Select-String -Path rust-toolchain.toml -Pattern '^channel = "(.*)"').Matches[0].Groups[1].Value
-          $files = Get-ChildItem dist\*.exe | Sort-Object Name | ForEach-Object {
-            $sig = Get-AuthenticodeSignature $_.FullName
+          $files = Get-ChildItem dist\*.exe, dist\ferostream-agent* | Sort-Object Name | ForEach-Object {
+            $sig = if ($_.Extension -eq ".exe") { Get-AuthenticodeSignature $_.FullName } else { @{ Status = "NotApplicable" } }
             [ordered]@{
               name            = $_.Name
               size            = $_.Length
@@ -216,6 +223,8 @@ jobs:
           subject-path: |
             dist/ferossh.exe
             dist/ferossh-desktop.exe
+            dist/ferostream-agent
+            dist/ferostream-agent-aarch64
             dist/SHA256SUMS.txt
             dist/BUILD-MANIFEST.json
 
@@ -289,7 +298,7 @@ jobs:
           $ghArgs.AddRange([string[]]@("release", "create", $env:TAG, "--verify-tag", "--title", "FeroSSH $env:TAG", "--notes-file", "$env:RUNNER_TEMP/notes.md"))
           if ($env:TAG.Contains("-")) { $ghArgs.Add("--prerelease") }
           if ($env:LOCAL -eq "true") { $ghArgs.Add("--draft") }
-          foreach ($file in "ferossh.exe", "ferossh-desktop.exe", "SHA256SUMS.txt", "BUILD-MANIFEST.json", "update.txt", "update.txt.sig") {
+          foreach ($file in "ferossh.exe", "ferossh-desktop.exe", "ferostream-agent", "ferostream-agent-aarch64", "SHA256SUMS.txt", "BUILD-MANIFEST.json", "update.txt", "update.txt.sig") {
             if (Test-Path "dist/$file") { $ghArgs.Add("dist/$file") }
             elseif ($file -notlike "update.txt*") { "::error::dist/$file is missing"; exit 1 }
           }
