@@ -4,7 +4,8 @@
 //!
 //! The UI's [`Message::Data`] goes to the command's standard input and its
 //! [`Message::Eof`] ends that input; the command's output (standard error
-//! as well) comes back as [`Message::Data`]. Closing the channel, or the
+//! as well, unless asked to keep it apart as [`Message::ExecStderr`])
+//! comes back as [`Message::Data`]. Closing the channel, or the
 //! connection breaking, ends the input too, which is how the script knows
 //! to clean up.
 
@@ -23,13 +24,14 @@ pub async fn run(
     channel: ChannelId,
     connection: ChannelId,
     command: Vec<u8>,
+    split_stderr: bool,
     mut inbox: mpsc::Receiver<Message>,
     out: mpsc::Sender<Message>,
     connections: Connections,
 ) {
     let reason = match connections.get(connection) {
         Some((conn, ..)) => {
-            let reason = serve(channel, &conn, command, &mut inbox, &out).await;
+            let reason = serve(channel, &conn, command, split_stderr, &mut inbox, &out).await;
             release(conn).await;
             reason
         }
@@ -42,6 +44,7 @@ async fn serve(
     channel: ChannelId,
     conn: &Arc<Connection>,
     command: Vec<u8>,
+    split_stderr: bool,
     inbox: &mut mpsc::Receiver<Message>,
     out: &mpsc::Sender<Message>,
 ) -> String {
@@ -52,12 +55,21 @@ async fn serve(
         return "The server would not run the command.".into();
     }
     let (mut read, write) = ch.split();
-    let send = |bytes: &[u8]| {
+    let send = |bytes: &[u8], stderr: bool| {
         let msgs: Vec<Message> = bytes
             .chunks(MAX_DATA_CHUNK)
-            .map(|c| Message::Data {
-                channel,
-                bytes: c.to_vec(),
+            .map(|c| {
+                if stderr {
+                    Message::ExecStderr {
+                        channel,
+                        bytes: c.to_vec(),
+                    }
+                } else {
+                    Message::Data {
+                        channel,
+                        bytes: c.to_vec(),
+                    }
+                }
             })
             .collect();
         async move {
@@ -72,8 +84,13 @@ async fn serve(
     loop {
         tokio::select! {
             msg = read.wait() => match msg {
-                Some(ChannelMsg::Data { data } | ChannelMsg::ExtendedData { data, .. }) => {
-                    if !send(&data).await {
+                Some(ChannelMsg::Data { data }) => {
+                    if !send(&data, false).await {
+                        break;
+                    }
+                }
+                Some(ChannelMsg::ExtendedData { data, .. }) => {
+                    if !send(&data, split_stderr).await {
                         break;
                     }
                 }

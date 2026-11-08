@@ -9,7 +9,8 @@
 //! runtime and sockets under the job and the mitigations. A second one
 //! looks up a name that does not exist, which runs Windows' name
 //! resolution in the sandbox. A VNC viewer must answer a server's version
-//! line. Each process's mitigations are as Windows reports them.
+//! line. A remote app's decoder must unpack a tile. Each process's
+//! mitigations are as Windows reports them.
 //!
 //! Exit code 0: everything ran sandboxed, with Win32k lockdown, Control
 //! Flow Guard and no dynamic code (CET shadow stacks depend on the CPU, so
@@ -130,6 +131,34 @@ fn check_viewer(_: &mut Worker) -> Result<(), String> {
     Ok(())
 }
 
+/// Sends a remote app's decoder the start of a host's stream with a packed
+/// tile; it must answer with the tile unpacked.
+fn check_stream(d: &mut Worker) -> Result<(), String> {
+    use crate::stream::{FromDecoder, MAX_OUT, read_frame, write_frame};
+    use ferostream_proto::tile::{Encoding, Tile};
+    let mut host = ferostream_proto::PREAMBLE.to_vec();
+    host.extend(ferostream_proto::Message::Tile(Tile::lz4(1, 0, 0, 8, 8, &[7; 256])).encode());
+    write_frame(&mut d.to_worker, &host).map_err(|e| e.to_string())?;
+    let mut input = d.from_worker.try_clone().map_err(|e| e.to_string())?;
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(read_frame(&mut input, MAX_OUT));
+    });
+    match rx.recv_timeout(WAIT) {
+        Ok(Ok(Some(frame))) => match FromDecoder::decode(&frame) {
+            Ok(FromDecoder::Message(ferostream_proto::Message::Tile(t)))
+                if t.encoding == Encoding::Raw && t.data == [7; 256] =>
+            {
+                Ok(())
+            }
+            other => Err(format!("answered {other:?}")),
+        },
+        Ok(Ok(None)) => Err("the decoder exited".into()),
+        Ok(Err(e)) => Err(format!("the decoder's pipe failed: {e}")),
+        Err(_) => Err("no answer: the decoder did not start".into()),
+    }
+}
+
 /// What the process runs in, and whether that is everything this check
 /// asks for.
 fn describe(w: &Worker) -> (String, bool) {
@@ -211,6 +240,26 @@ pub fn run() -> i32 {
         }
         Err(e) => {
             report.push(format!("Desktop viewer: could not start ({})", e.message()));
+            failed = true;
+        }
+    }
+    match sandbox::spawn_stream() {
+        Ok(mut d) => {
+            let (what, full) = describe(&d);
+            strong &= full;
+            match check_stream(&mut d) {
+                Ok(()) => report.push(format!("Remote app decoder: runs, in {what}.")),
+                Err(e) => {
+                    report.push(format!("Remote app decoder: FAILED ({e}), in {what}."));
+                    failed = true;
+                }
+            }
+        }
+        Err(e) => {
+            report.push(format!(
+                "Remote app decoder: could not start ({})",
+                e.message()
+            ));
             failed = true;
         }
     }

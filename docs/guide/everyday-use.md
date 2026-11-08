@@ -300,6 +300,18 @@ It is locked down on the server too: the display has its own random cookie, so o
 
 The virtual desktop stops, and Xvfb, x11vnc and everything started in the display end, when you close its tab, choose Session > Stop virtual desktop, close the connection, or end the desktop session (log out, or close the one program). Choosing Open virtual desktop again while one runs opens another viewer on the same desktop.
 
+### Remote apps (native windows)
+
+Session > Remote apps > Run remote app... starts one Linux program on the host you are logged in to and shows its windows as ordinary windows on your Windows desktop, not as a desktop in a tab: each has its own taskbar button, moves and resizes like a local window, and copy and paste work both ways. It uses [FeroStream](https://github.com/jkobierczynski/FeroStream). The command palette opens with this connection's program, the ones you ran lately and `xterm`; type any other command line (`gimp ~/a.png`, `xterm -T 'my term'`) and press Enter. Only quotes are understood, no other shell syntax: the program runs directly.
+
+There is no second login. The FeroStream agent runs on the same SSH connection as the pane, as one more channel of it, and runs the program in an Xvfb display on the host (`sudo apt install xvfb`; Fedora: `xorg-x11-server-Xvfb`). When the connection drops while the program still runs, its windows stay and fill again once FeroSSH has reconnected; when you close the pane or its connection, the program keeps running on the host, and Session > Remote apps > Reattach remote app brings its windows back, from this PC or another.
+
+The host needs the agent. When it has none, or another version, and Session > Remote apps > Copy the agent to hosts is ticked (the default), FeroSSH copies its own over the same channel to `~/.local/bin/ferostream-agent` (`RemoteAppAgentPath`), checked by size and checksum, readable only by you. For hosts that are not x86_64, put `ferostream-agent-<arch>` (as `uname -m` names it, such as `ferostream-agent-aarch64`) next to `ferossh.exe`. Turn copying off to use only an agent installed on the host. With Session > Remote apps > Remove the agent when done ticked (off by default), the agent deletes itself when its last program has ended, so nothing is left on the host. Both choices can be set per connection too (*Copy agent* and *Clean up* under Extras in the connection form).
+
+A remote app can also be a saved connection: in the Connection manager, make a new connection of type *Remote app*, pick the SSH connection it runs on under *Via SSH*, and the program under *Remote app*. Opening it logs in there and starts the program.
+
+The host's stream is never read by FeroSSH's window: it is unpacked in a separate decoder process with no rights at all (see [Security](security.md)), and the window checks what comes back again before it draws it.
+
 ### Desktop size
 
 Each connection's *Desk size* (F2 in the Connection manager; `DesktopSize` in [Settings](settings.md)) chooses how big its desktops are:

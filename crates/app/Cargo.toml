@@ -29,6 +29,8 @@ ferossh-tmuxcc.workspace = true
 ferossh-update.workspace = true
 ferossh-viewer = { workspace = true, optional = true }
 ferossh-worker.workspace = true
+ferostream-client.workspace = true
+ferostream-proto.workspace = true
 # The forwarding engine's sockets; the worker already links tokio.
 tokio = { version = "1.54", features = ["rt", "net", "time", "sync", "macros", "io-util"] }
 getrandom = "0.4"

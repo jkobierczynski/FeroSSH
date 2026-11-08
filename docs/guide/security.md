@@ -11,6 +11,8 @@ Every sandboxed process also runs in a job object (it dies with the window, cann
 
 The window and each worker talk over a pipe with a small, fuzz-tested message format. The desktop viewer in `ferossh-desktop.exe` runs in a third process, in an AppContainer with no capabilities at all, not even the network: it only sees what comes through the SSH tunnel.
 
+Remote apps (Session > Remote apps) add a decoder process of the same kind: an AppContainer with no capabilities, one per remote app. Everything the host's FeroStream agent sends goes from the worker straight to it; it unpacks the pictures and hands back plain pixels and messages, which the window checks again before it opens or draws a window. A decoder that tried to send anything else (a packed picture, an odd machine name, too long a text) ends the remote app. The agent runs on the host as your user, on the SSH connection you already have; copying it to the host and removing it afterwards are both settings (`RemoteAppCopyAgent`, `RemoteAppRemoveAgent`), and a copied agent is checked by size and checksum before it runs.
+
 Windows does not let AppContainers connect to 127.0.0.1, so for an SSH server on the same PC you start FeroSSH with `--no-sandbox`. Port forwards to and from localhost work in the sandbox, because the window holds those sockets.
 
 ## Host keys

@@ -74,7 +74,10 @@ impl Relays {
             return Some(msg);
         };
         match msg {
-            Message::Data { .. } | Message::Window { .. } | Message::Eof { .. } => {
+            Message::Data { .. }
+            | Message::ExecStderr { .. }
+            | Message::Window { .. }
+            | Message::Eof { .. } => {
                 sink(msg);
                 None
             }

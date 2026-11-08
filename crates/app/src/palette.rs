@@ -36,6 +36,8 @@ pub enum Kind {
     Session(String),
     /// Type the snippet at this index.
     Snippet(usize),
+    /// Run this program as a remote app (Session > Remote apps).
+    RemoteApp(String),
 }
 
 /// One line of the palette.
@@ -82,6 +84,7 @@ impl Entry {
     pub fn session(name: &str, detail: &str, kind: SessionKind) -> Self {
         let prefix = match kind {
             SessionKind::Rdp | SessionKind::Vnc | SessionKind::Xvfb => "Open",
+            SessionKind::RemoteApp => "Run",
             _ => "Connect",
         };
         let tag = match kind {
@@ -91,6 +94,7 @@ impl Entry {
             SessionKind::Serial => "serial",
             SessionKind::Telnet => "telnet",
             SessionKind::Xvfb => "xvfb virtual desktop",
+            SessionKind::RemoteApp => "remote app ferostream",
         };
         Self {
             prefix,
@@ -114,12 +118,25 @@ impl Entry {
         }
     }
 
+    /// A program to run as a remote app; `hint` says where it came from.
+    pub fn remote_app(program: &str, hint: &str) -> Self {
+        Self {
+            prefix: "Run",
+            label: program.to_owned(),
+            hint: hint.to_owned(),
+            extra: "remote app".into(),
+            on: false,
+            kind: Kind::RemoteApp(program.to_owned()),
+        }
+    }
+
     /// What remembers it among the recent entries.
     fn key(&self) -> String {
         match &self.kind {
             Kind::Action(id) => format!("a{id}"),
             Kind::Session(name) => format!("s{name}"),
             Kind::Snippet(_) => format!("n{}", self.label),
+            Kind::RemoteApp(p) => format!("r{p}"),
         }
     }
 
@@ -219,6 +236,8 @@ pub enum PalAction {
     Open { host: String, split: bool },
     /// Type snippet `index`; `enter` presses Enter after its last line.
     Send { index: usize, enter: bool },
+    /// Run this program (and arguments) as a remote app.
+    RunApp(String),
     /// Back to the terminal.
     Leave,
 }
@@ -233,6 +252,11 @@ pub struct CommandPalette {
     scroll: usize,
     /// Keys of the entries run lately, latest first.
     recent: Vec<String>,
+    /// Picking a program to run as a remote app: what is typed is itself
+    /// an entry ([`CommandPalette::open_apps`]).
+    apps: bool,
+    /// The entry made from what is typed, at the end of `entries`.
+    typed: bool,
 }
 
 impl CommandPalette {
@@ -243,14 +267,37 @@ impl CommandPalette {
     /// Starts afresh on `entries` with an empty search.
     pub fn open(&mut self, entries: Vec<Entry>) {
         self.entries = entries;
+        self.apps = false;
+        self.typed = false;
         self.filter.clear();
         self.selected = 0;
         self.scroll = 0;
         self.update();
     }
 
+    /// Starts on programs to run as a remote app: `entries` are the ones
+    /// offered, and whatever is typed can be run as it is.
+    pub fn open_apps(&mut self, entries: Vec<Entry>) {
+        self.open(entries);
+        self.apps = true;
+        self.update();
+    }
+
     /// Works out which entries show, and in what order.
     fn update(&mut self) {
+        if std::mem::take(&mut self.typed) {
+            self.entries.pop();
+        }
+        self.rank();
+        let typed = self.filter.trim();
+        if self.apps && !typed.is_empty() && !self.entries.iter().any(|e| e.label == typed) {
+            self.entries.push(Entry::remote_app(typed, "as typed"));
+            self.typed = true;
+            self.shown.insert(0, self.entries.len() - 1);
+        }
+    }
+
+    fn rank(&mut self) {
         let terms: Vec<String> = self
             .filter
             .split_whitespace()
@@ -310,6 +357,7 @@ impl CommandPalette {
                 index: *index,
                 enter: !split,
             },
+            Kind::RemoteApp(program) => PalAction::RunApp(program.clone()),
         };
         self.recent.retain(|k| *k != key);
         self.recent.insert(0, key);
@@ -376,11 +424,18 @@ impl CommandPalette {
         let visible = Self::visible(rows);
         self.clamp(visible);
         let mut line = Line::new(width, bg);
-        line.put(" Command palette", palette.text, Flags::BOLD);
+        let title = if self.apps {
+            " Run a remote app on this tab's host"
+        } else {
+            " Command palette"
+        };
+        line.put(title, palette.text, Flags::BOLD);
         grid.set_row(0, line.cells(bg));
         let mut line = Line::new(width, bg);
         if self.filter.is_empty() {
-            let hint = if focused {
+            let hint = if focused && self.apps {
+                " Type a program and its arguments▏"
+            } else if focused {
                 " Type an action, connection or snippet▏"
             } else {
                 " Ctrl+Shift+A to search"
@@ -422,11 +477,12 @@ impl CommandPalette {
         }
         if rows > HEADER {
             let mut line = Line::new(width, bg);
-            line.put(
-                &fit(" Enter runs · Shift+Enter: split / no Enter · Esc", width),
-                palette.dim,
-                Flags::empty(),
-            );
+            let help = if self.apps {
+                " Enter runs it there · Esc"
+            } else {
+                " Enter runs · Shift+Enter: split / no Enter · Esc"
+            };
+            line.put(&fit(help, width), palette.dim, Flags::empty());
             grid.set_row(rows - 1, line.cells(bg));
         }
     }
@@ -453,6 +509,42 @@ fn draw_entry(line: &mut Line, e: &Entry, width: usize, palette: &Palette) {
         let pad = width.saturating_sub(line.col + hint.width() + 1);
         line.put(&" ".repeat(pad), palette.dim, Flags::empty());
         line.put(&hint, palette.dim, Flags::empty());
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::indexing_slicing)]
+mod app_tests {
+    use super::*;
+
+    #[test]
+    fn typed_program_runs_as_typed_and_offered_ones_match() {
+        let mut p = CommandPalette::default();
+        p.open_apps(vec![
+            Entry::remote_app("xterm", "default"),
+            Entry::remote_app("gimp", "this host"),
+        ]);
+        for c in "gimp ~/a.png".chars() {
+            p.key(SideKey::Char(c), 20);
+        }
+        assert_eq!(
+            p.key(SideKey::Enter { split: false }, 20),
+            Some(PalAction::RunApp("gimp ~/a.png".into()))
+        );
+        p.open_apps(vec![Entry::remote_app("xterm", "default")]);
+        for c in "xterm".chars() {
+            p.key(SideKey::Char(c), 20);
+        }
+        // The offered entry, not a second typed one.
+        assert_eq!(p.entries.len(), 1);
+        assert_eq!(
+            p.key(SideKey::Enter { split: false }, 20),
+            Some(PalAction::RunApp("xterm".into()))
+        );
+        // The plain palette never runs what is typed.
+        p.open(vec![]);
+        p.key(SideKey::Char('x'), 20);
+        assert_eq!(p.key(SideKey::Enter { split: false }, 20), None);
     }
 }
 

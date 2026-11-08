@@ -46,7 +46,7 @@ use std::fmt;
 use zeroize::Zeroize;
 
 /// Protocol version carried in every frame. Bump on any wire change.
-pub const PROTOCOL_VERSION: u8 = 13;
+pub const PROTOCOL_VERSION: u8 = 14;
 
 /// Largest frame body accepted, in bytes. Terminal and SFTP data is chunked
 /// below this, so anything larger is a bug or an attack.
@@ -503,12 +503,18 @@ pub enum Message {
     /// [`Message::Data`], then [`Message::ExitStatus`] and
     /// [`Message::Disconnected`]. [`Message::Close`] closes the channel.
     /// The UI runs only commands of its own (Open virtual desktop's
-    /// script), never ones the server suggested.
+    /// script, a remote app's agent), never ones the server suggested.
+    /// With `split_stderr`, standard error comes apart as
+    /// [`Message::ExecStderr`], so the output stays a clean byte stream.
     Exec {
         channel: ChannelId,
         connection: ChannelId,
         command: Vec<u8>,
+        split_stderr: bool,
     },
+    /// Worker to UI: standard error of an [`Message::Exec`] command run
+    /// with `split_stderr`.
+    ExecStderr { channel: ChannelId, bytes: Vec<u8> },
     /// Worker to UI: SFTP is up; `home` is the server's starting directory
     /// (usually the user's home).
     SftpReady { channel: ChannelId, home: Vec<u8> },
@@ -662,6 +668,7 @@ impl Message {
             Message::TelnetConnect { .. } => 31,
             Message::Lost { .. } => 32,
             Message::Exec { .. } => 33,
+            Message::ExecStderr { .. } => 34,
             Message::ZmodemStart { .. } => 40,
             Message::ZmodemFile { .. } => 41,
             Message::ZmodemData { .. } => 42,
@@ -711,6 +718,7 @@ impl Message {
             | Message::Notice { .. }
             | Message::Connected { .. }
             | Message::ExitStatus { .. }
+            | Message::ExecStderr { .. }
             | Message::Lost { .. }
             | Message::Disconnected { .. }
             | Message::SftpReady { .. }
@@ -754,6 +762,7 @@ impl Message {
             | Message::OpenChannel { channel, .. }
             | Message::SftpOpen { channel, .. }
             | Message::Exec { channel, .. }
+            | Message::ExecStderr { channel, .. }
             | Message::SftpReady { channel, .. }
             | Message::SftpRequest { channel, .. }
             | Message::SftpReply { channel, .. }
@@ -1178,10 +1187,16 @@ pub fn encode(msg: &Message, out: &mut Vec<u8>) -> Result<(), Error> {
             channel,
             connection,
             command,
+            split_stderr,
         } => {
             w.u32(*channel);
             w.u32(*connection);
             w.bytes(command);
+            w.bool(*split_stderr);
+        }
+        Message::ExecStderr { channel, bytes } => {
+            w.u32(*channel);
+            w.bytes(bytes);
         }
         Message::SftpReady { channel, home } => {
             w.u32(*channel);
@@ -1503,6 +1518,11 @@ fn decode_body(body: &[u8]) -> Result<Message, Error> {
             channel: r.u32()?,
             connection: r.u32()?,
             command: r.bytes()?.to_vec(),
+            split_stderr: r.bool()?,
+        },
+        34 => Message::ExecStderr {
+            channel: r.u32()?,
+            bytes: r.bytes()?.to_vec(),
         },
         20 => Message::SftpReady {
             channel: r.u32()?,
@@ -2017,6 +2037,11 @@ mod tests {
                 channel: 6,
                 connection: 1,
                 command: b"sh -c 'echo hi'".to_vec(),
+                split_stderr: true,
+            },
+            Message::ExecStderr {
+                channel: 6,
+                bytes: b"oops\n".to_vec(),
             },
             Message::ZmodemStart {
                 channel: 3,
@@ -2214,7 +2239,7 @@ mod tests {
         tags.sort_unstable();
         tags.dedup();
         // ZMODEM starts at 40, leaving room below.
-        let want: Vec<u8> = (0..=33).chain(40..=49).collect();
+        let want: Vec<u8> = (0..=34).chain(40..=49).collect();
         assert_eq!(tags, want);
     }
 

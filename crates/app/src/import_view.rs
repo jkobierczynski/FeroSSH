@@ -98,6 +98,7 @@ impl Found {
                     SessionKind::Serial => to.push_str(" serial"),
                     SessionKind::Telnet => to.push_str(" Telnet"),
                     SessionKind::Xvfb => to.push_str(" virtual desktop"),
+                    SessionKind::RemoteApp => to.push_str(" remote app"),
                 }
                 to
             }

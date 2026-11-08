@@ -357,6 +357,10 @@ mod cmd {
     /// Session > Open virtual desktop (Xvfb and x11vnc on the server).
     pub const VDESK: u32 = 623;
     pub const VDESK_STOP: u32 = 624;
+    pub const REMOTE_APP: u32 = 625;
+    pub const REMOTE_APP_ATTACH: u32 = 626;
+    pub const REMOTE_APP_COPY: u32 = 627;
+    pub const REMOTE_APP_REMOVE: u32 = 628;
     pub const TMUX_ATTACH: u32 = 610;
     pub const TMUX_DETACH: u32 = 611;
     pub const TMUX_PICK: u32 = 612;
@@ -813,6 +817,10 @@ struct Window {
     desktops: HashMap<(ChannelId, String, u16), DesktopWant>,
     /// Virtual desktops by their script's exec channel.
     vdesks: HashMap<ChannelId, VirtualDesk>,
+    /// The pane whose host the remote app picker (the palette) runs on.
+    app_pane: Option<PaneId>,
+    /// Programs run as remote apps lately, latest first.
+    recent_apps: Vec<String>,
     /// Passwords from password manager commands, as they finish: the pane,
     /// its session's channel, the program and the result.
     passwords: Arc<std::sync::Mutex<Vec<PasswordAnswer>>>,
@@ -1512,6 +1520,8 @@ fn create_and_run(launch: Launch, theme: Option<String>) -> Result<()> {
                 queued: Vec::new(),
                 desktops: HashMap::new(),
                 vdesks: HashMap::new(),
+                app_pane: None,
+                recent_apps: Vec::new(),
                 passwords: Arc::default(),
                 pending_desktops: HashMap::new(),
                 broadcast: broadcast::Scope::Off,
@@ -1715,6 +1725,18 @@ fn build_menu() -> Result<HMENU> {
         }
         item(session, cmd::VDESK, "Open virtual d&esktop (Xvfb)")?;
         item(session, cmd::VDESK_STOP, "Stop v&irtual desktop")?;
+        let apps = CreatePopupMenu()?;
+        item(apps, cmd::REMOTE_APP, "&Run remote app...")?;
+        item(apps, cmd::REMOTE_APP_ATTACH, "Re&attach remote app")?;
+        separator(apps)?;
+        item(apps, cmd::REMOTE_APP_COPY, "&Copy the agent to hosts")?;
+        item(apps, cmd::REMOTE_APP_REMOVE, "Re&move the agent when done")?;
+        AppendMenuW(
+            session,
+            MF_POPUP,
+            apps.0 as usize,
+            w!("Remote a&pps (native windows)"),
+        )?;
 
         let edit = CreatePopupMenu()?;
         item(edit, cmd::COPY, "&Copy\tCtrl+Shift+C")?;
@@ -2117,7 +2139,7 @@ impl Window {
     /// engine's range.
     fn new_channel(&mut self) -> ChannelId {
         let channel = self.next_channel;
-        self.next_channel = ((self.next_channel + 1) % FORWARD_IDS).max(1);
+        self.next_channel = ((self.next_channel + 1) % crate::remote_app::FIRST_ID).max(1);
         channel
     }
 
@@ -3028,6 +3050,7 @@ impl Window {
                 .sftp
                 .values()
                 .any(|r| r.connection() == Some(connection))
+            || crate::remote_app::connections_in_use().contains(&connection)
     }
 
     /// Ends the workers that retired long enough ago.
@@ -3274,6 +3297,7 @@ impl Window {
             channel,
             connection,
             command: vdesk::command(),
+            split_stderr: false,
         });
         w.link.send(Message::Data {
             channel,
@@ -3310,6 +3334,194 @@ impl Window {
         );
         self.refresh(pane);
         None
+    }
+
+    /// Session > Remote apps > Run remote app: the palette offers programs
+    /// (this connection's, the recent ones, xterm) and runs what is
+    /// picked or typed, on the pane's host.
+    fn pick_remote_app(&mut self, pane: PaneId) -> Option<Command> {
+        let host = self.host_pane(pane);
+        let (Some(_), Some(Host::Ssh(s))) = (
+            self.pane_connection(pane),
+            self.panes.get(&host).map(|p| &p.host),
+        ) else {
+            return Some(Command::Notice(NO_APP_HOST.into()));
+        };
+        let mut entries = Vec::new();
+        if let Some(p) = self
+            .settings
+            .profile(&s.target.alias)
+            .and_then(|p| p.remote_app.clone())
+        {
+            entries.push(palette::Entry::remote_app(&p, "this connection's"));
+        }
+        for p in &self.recent_apps {
+            if !entries.iter().any(|e| e.label == *p) {
+                entries.push(palette::Entry::remote_app(p, "recent"));
+            }
+        }
+        if !entries.iter().any(|e| e.label == "xterm") {
+            entries.push(palette::Entry::remote_app("xterm", "a terminal"));
+        }
+        if self.side.visible && self.side.view == SideView::Palette {
+            self.leave_palette();
+        }
+        self.app_pane = Some(pane);
+        self.palette.open_apps(entries);
+        self.palette_return = (self.side.visible && !self.snippets_peek).then_some(self.side.view);
+        self.snippets_peek = false;
+        self.show_side(SideView::Palette, true);
+        None
+    }
+
+    /// Runs `program` (a command line; `None` when attaching) on the
+    /// pane's SSH connection as a remote app: no new login, the agent on
+    /// an exec channel, the host's bytes decoded in a sandboxed process,
+    /// the windows native ([`crate::remote_app`]). `from` names a saved
+    /// remote app connection whose agent settings apply; else the SSH
+    /// host's own.
+    fn run_remote_app(
+        &mut self,
+        pane: PaneId,
+        program: Option<&str>,
+        from: Option<&str>,
+        attach: ferostream_client::transport::AttachTo,
+    ) -> Option<Command> {
+        use ferostream_client::transport::{Clipboard, DEFAULT_AGENT_PATH, Place as AgentPlace};
+        let host = self.host_pane(pane);
+        let (Some(connection), Some(Host::Ssh(s))) = (
+            self.pane_connection(pane),
+            self.panes.get(&host).map(|p| &p.host),
+        ) else {
+            return Some(Command::Notice(NO_APP_HOST.into()));
+        };
+        let alias = s.target.alias.clone();
+        let label = from.map_or_else(|| s.target.label(), str::to_owned);
+        let argv = match program {
+            Some(line) => match crate::stream::words(line) {
+                Some(argv) => argv,
+                None => {
+                    return Some(Command::Notice(
+                        "Type a program and its arguments; quotes must be closed.".into(),
+                    ));
+                }
+            },
+            None => Vec::new(),
+        };
+        let own = from
+            .and_then(|f| self.settings.profile(f))
+            .or_else(|| self.settings.profile(&alias));
+        let copy = own
+            .and_then(|p| p.remote_app_copy_agent)
+            .unwrap_or(self.settings.remote_app_copy_agent);
+        let remove = own
+            .and_then(|p| p.remote_app_remove_agent)
+            .unwrap_or(self.settings.remote_app_remove_agent);
+        let path = self
+            .settings
+            .remote_app_agent_path
+            .clone()
+            .unwrap_or_else(|| DEFAULT_AGENT_PATH.to_owned());
+        let place = match AgentPlace::new(&path, remove) {
+            Ok(p) => p,
+            Err(e) => {
+                return Some(Command::Notice(format!(
+                    "RemoteAppAgentPath in ferossh.conf: {e}"
+                )));
+            }
+        };
+        let clipboard = match self.settings.remote_app_clipboard.as_deref() {
+            Some("to-host") => Clipboard {
+                to_host: true,
+                from_host: false,
+            },
+            Some("from-host") => Clipboard {
+                to_host: false,
+                from_host: true,
+            },
+            Some("off") => Clipboard {
+                to_host: false,
+                from_host: false,
+            },
+            _ => Clipboard {
+                to_host: true,
+                from_host: true,
+            },
+        };
+        let files = if copy {
+            crate::remote_app::agent_files()
+        } else {
+            Vec::new()
+        };
+        let w = self.workers.get(&connection)?;
+        let route = crate::remote_app::Route {
+            connection,
+            send: Arc::new(w.link.sender()),
+            relays: w.link.relays().clone(),
+        };
+        let lookup = Box::new(|c: ChannelId| with_window(|w| w.remote_route(c)).flatten());
+        let what = match program {
+            Some(line) => crate::ssh::sanitize(line),
+            None => "The remote app".into(),
+        };
+        let on_end = {
+            let label = label.clone();
+            let what = what.clone();
+            Box::new(move |end: ferostream_client::win32::End| {
+                let note = remote_app_note(&what, &label, &end);
+                let Some(note) = note else { return };
+                let hwnd = with_window(|w| {
+                    w.queued.push(Command::Notice(note));
+                    w.hwnd
+                });
+                // The notice shows when the window next takes its queue.
+                if let Some(hwnd) = hwnd {
+                    // SAFETY: posting to our own window.
+                    unsafe {
+                        let _ = PostMessageW(Some(hwnd), WM_SHELL_OUTPUT, WPARAM(0), LPARAM(0));
+                    }
+                }
+            })
+        };
+        let app_host = crate::remote_app::AppHost::new(route, lookup, files.clone(), place, on_end);
+        let settings = ferostream_client::win32::Settings {
+            program: argv,
+            clipboard,
+            attach,
+            raw_only: true,
+        };
+        if let Err(e) = ferostream_client::win32::start(settings, Box::new(app_host)) {
+            return Some(Command::Notice(format!(
+                "The remote app did not start: {e}"
+            )));
+        }
+        if let Some(line) = program {
+            let line = line.trim().to_owned();
+            self.recent_apps.retain(|p| *p != line);
+            self.recent_apps.insert(0, line);
+            self.recent_apps.truncate(8);
+        }
+        let mut note = format!("\x1b[0;90mStarting {what} on the host; its windows open here");
+        if copy && files.is_empty() {
+            note.push_str(
+                " (no ferostream-agent next to ferossh.exe: the host's own agent is used)",
+            );
+        }
+        note.push_str("...\x1b[0m\r\n");
+        self.show(pane, &note);
+        self.refresh(pane);
+        None
+    }
+
+    /// How a remote app reaches connection `connection`'s worker, while
+    /// that worker runs.
+    fn remote_route(&self, connection: ChannelId) -> Option<crate::remote_app::Route> {
+        let w = self.workers.get(&connection)?;
+        Some(crate::remote_app::Route {
+            connection,
+            send: Arc::new(w.link.sender()),
+            relays: w.link.relays().clone(),
+        })
     }
 
     /// Session > Stop virtual desktop: ends the virtual desktops on the
@@ -5760,6 +5972,7 @@ impl Window {
                 if let Some(w) = self.workers.remove(&connection) {
                     w.forwarder.worker_gone();
                 }
+                crate::remote_app::connection_gone(connection);
                 self.proxies.remove(&connection);
                 self.vdesks.retain(|_, v| v.connection != connection);
                 for remote in self.sftp.values_mut() {
@@ -7095,6 +7308,15 @@ impl Window {
                 let s = self.settings.snippets.get(index)?.clone();
                 return self.send_snippet(&s.name, &s.lines, enter);
             }
+            PalAction::RunApp(program) => {
+                let pane = self.app_pane.take().unwrap_or_else(|| self.focused_id());
+                return self.run_remote_app(
+                    pane,
+                    Some(&program),
+                    None,
+                    ferostream_client::transport::AttachTo::New,
+                );
+            }
             PalAction::Leave => {}
         }
         None
@@ -8321,6 +8543,22 @@ impl Window {
         };
         if p.kind == SessionKind::Xvfb {
             if let Some(c) = self.open_virtual_desktop(id, Some(&p.label)) {
+                self.queued.push(c);
+            }
+            return;
+        }
+        if p.kind == SessionKind::RemoteApp {
+            let program = self
+                .settings
+                .profile(&p.label)
+                .and_then(|pr| pr.remote_app.clone())
+                .unwrap_or_else(|| "xterm".into());
+            if let Some(c) = self.run_remote_app(
+                id,
+                Some(&program),
+                Some(&p.label),
+                ferostream_client::transport::AttachTo::New,
+            ) {
                 self.queued.push(c);
             }
             return;
@@ -9686,6 +9924,25 @@ impl Window {
             cmd::DESKTOP_TAB_RDP => return self.open_desktop(pane, Some(Protocol::Rdp)),
             cmd::VDESK => return self.open_virtual_desktop(pane, None),
             cmd::VDESK_STOP => return self.stop_virtual_desktop(pane),
+            cmd::REMOTE_APP => return self.pick_remote_app(pane),
+            cmd::REMOTE_APP_ATTACH => {
+                return self.run_remote_app(
+                    pane,
+                    None,
+                    None,
+                    ferostream_client::transport::AttachTo::Newest,
+                );
+            }
+            cmd::REMOTE_APP_COPY => {
+                self.settings.remote_app_copy_agent = !self.settings.remote_app_copy_agent;
+                self.save_settings();
+                self.update_menu_checks();
+            }
+            cmd::REMOTE_APP_REMOVE => {
+                self.settings.remote_app_remove_agent = !self.settings.remote_app_remove_agent;
+                self.save_settings();
+                self.update_menu_checks();
+            }
             cmd::TMUX_DETACH | cmd::TMUX_PICK | cmd::TMUX_LAYOUT => {
                 let host = self.host_pane(pane);
                 let Some(t) = self.tmux.get_mut(&host).filter(|t| t.active()) else {
@@ -10072,6 +10329,8 @@ impl Window {
                 (cmd::LOG_RAW, raw),
                 (cmd::LOG_TIMESTAMPS, s.log_timestamps),
                 (cmd::AUTO_RESPONSES, s.auto_responses),
+                (cmd::REMOTE_APP_COPY, s.remote_app_copy_agent),
+                (cmd::REMOTE_APP_REMOVE, s.remote_app_remove_agent),
                 (cmd::CONFIRM_PRODUCTION, s.confirm_production),
                 (cmd::TMUX_KEYS, s.tmux_keys),
                 (cmd::RECORD_SNIPPET, self.recording.is_some()),
@@ -11126,6 +11385,33 @@ const NO_VDESK_HOST: &str = "Log in to an SSH host in this pane first. Open virt
 
 /// Where a virtual desktop's x11vnc listens, as the server sees it.
 const VDESK_HOST: &str = "127.0.0.1";
+const NO_APP_HOST: &str = "Log in to an SSH host in this pane first. Run remote app starts the \
+                           program on that host and shows its windows here.";
+
+/// What to tell the user when a remote app ended: nothing when its
+/// program simply exited.
+fn remote_app_note(what: &str, label: &str, end: &ferostream_client::win32::End) -> Option<String> {
+    if let Some(id) = &end.left_running {
+        return Some(format!(
+            "{what} still runs on {label} (session {id}). Session > Remote apps > Reattach \
+             remote app brings its windows back."
+        ));
+    }
+    let problem = end.problem.as_deref()?;
+    let mut text = format!("{what} on {label} stopped.\n\n{problem}");
+    if problem.contains("ferostream-agent") && problem.contains("not found") {
+        text.push_str(
+            "\n\nThe host has no FeroStream agent. Turn on Session > Remote apps > Copy the \
+             agent to hosts, and keep ferostream-agent next to ferossh.exe.",
+        );
+    }
+    if problem.contains("Xvfb") {
+        text.push_str(
+            "\n\nThe host needs Xvfb: sudo apt install xvfb (Fedora: xorg-x11-server-Xvfb).",
+        );
+    }
+    Some(text)
+}
 
 /// Session > Open remote desktop on a pane that is not logged in.
 const NO_DESKTOP_HOST: &str = "Log in to an SSH host in this pane first. Open remote desktop \

@@ -20,6 +20,7 @@
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::Path;
+use std::process::Command;
 use std::time::{Duration, Instant};
 
 use ferossh_auth::Broker;
@@ -692,6 +693,7 @@ fn virtual_desktop(follow: bool) {
         channel: EXEC,
         connection: conn,
         command: vdesk::command(),
+        split_stderr: false,
     });
     let password = vdesk::password();
     let input = vdesk::input(&password, Some("sleep 600"), 800, 600, follow).unwrap();
@@ -786,5 +788,178 @@ fn virtual_desktop(follow: bool) {
         let _ = shell.link.try_recv();
         std::thread::sleep(Duration::from_millis(20));
     }
+    forwarder.stop(conn);
+}
+
+/// Run remote app's plumbing end to end, with a stand-in agent: the remote
+/// command runs on an exec channel of a real login with its error output
+/// kept apart; the host asks for the agent and gets it over the same
+/// channel; what the "agent" sends comes out of the decoder unpacked, and
+/// its error output never mixes into the stream.
+#[test]
+fn remote_app_agent_is_copied_and_streams_through_the_decoder() {
+    use crate::stream::{FromDecoder, MAX_OUT, read_frame, run, write_frame};
+    use ferossh_ipc::Message;
+    use ferostream_client::transport::{AgentFile, AttachTo, Place, cksum, remote_command};
+    use ferostream_proto::Message as Fs;
+    use ferostream_proto::tile::{Encoding, Tile};
+
+    let Some(server) = start_sshd("rapp", "") else {
+        return;
+    };
+    let user = local_user();
+    let env = Env {
+        home: server.dir.clone(),
+        local_user: user.clone(),
+        config: format!(
+            "Host testhost\n  HostName 127.0.0.1\n  Port {}\n  User {user}\n  \
+             IdentityFile ~/.ssh/id_ed25519\n",
+            server.port
+        ),
+    };
+    let target = Target::resolve("testhost", &env).unwrap();
+    let (ui_read, worker_write) = std::io::pipe().unwrap();
+    let (worker_read, ui_write) = std::io::pipe().unwrap();
+    std::thread::spawn(move || ferossh_worker::run_blocking(worker_read, worker_write));
+    let (forwarder, runner) = Forwarder::new();
+    let link = Link::start(ui_read, ui_write, || {}, forwarder.sink()).unwrap();
+    runner.spawn(link.sender(), || {}).unwrap();
+    let mut session = SshSession::new(1, target, env.known_hosts());
+    let effects = session.start(80, 24);
+    let mut shell = Shell {
+        session,
+        link,
+        broker: Broker::spawn(|| {}).unwrap(),
+        forwarder: forwarder.clone(),
+        effects,
+        shown: String::new(),
+        output: String::new(),
+    };
+    shell.until("the login", |s| {
+        s.session.state() == State::Connected && !s.forwarder.view().is_empty()
+    });
+    let conn = shell.session.connection;
+
+    // The stand-in agent: the preamble, a Hello and a packed tile, a line
+    // of error output, then it waits for its input to end.
+    let px: Vec<u8> = (0..16 * 16 * 4).map(|i| (i % 13) as u8).collect();
+    let mut frames = ferostream_proto::PREAMBLE.to_vec();
+    frames.extend(
+        Fs::Hello {
+            version: ferostream_proto::VERSION,
+            software: "stand-in".into(),
+        }
+        .encode(),
+    );
+    frames.extend(Fs::Tile(Tile::lz4(1, 0, 0, 16, 16, &px)).encode());
+    let octal: String = frames.iter().map(|b| format!("\\{b:03o}")).collect();
+    let script = format!("#!/bin/sh\nprintf '{octal}'\necho \"agent: $*\" >&2\ncat >/dev/null\n")
+        .into_bytes();
+    let local = server.dir.join("agent-here");
+    std::fs::write(&local, &script).unwrap();
+    let arch = String::from_utf8(Command::new("uname").arg("-m").output().unwrap().stdout)
+        .unwrap()
+        .trim()
+        .to_string();
+    let file = AgentFile {
+        arch,
+        path: local,
+        crc: cksum(&script),
+        size: script.len() as u64,
+    };
+    let installed = server.dir.join("bin").join("ferostream-agent");
+    let place = Place::new(installed.to_str().unwrap(), true).unwrap();
+
+    const EXEC: ChannelId = 78;
+    shell.link.send(Message::Exec {
+        channel: EXEC,
+        connection: conn,
+        command: remote_command(&[file], &AttachTo::New, &place).into_bytes(),
+        split_stderr: true,
+    });
+
+    let mut decoder_in = Vec::new();
+    let mut stderr = Vec::new();
+    let mut uploaded = false;
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        assert!(
+            Instant::now() < deadline,
+            "no answer; stderr: {}",
+            String::from_utf8_lossy(&stderr)
+        );
+        match shell.link.try_recv() {
+            Some(LinkEvent::Message(Message::Data {
+                channel: EXEC,
+                bytes,
+            })) => {
+                if !uploaded && bytes.windows(19).any(|w| w == b"\0FEROSTREAM-UPLOAD ") {
+                    uploaded = true;
+                    shell.link.send(Message::Data {
+                        channel: EXEC,
+                        bytes: script.clone(),
+                    });
+                }
+                write_frame(&mut decoder_in, &bytes).unwrap();
+            }
+            Some(LinkEvent::Message(Message::ExecStderr {
+                channel: EXEC,
+                bytes,
+            })) => {
+                stderr.extend_from_slice(&bytes);
+                if stderr.ends_with(b"\n") {
+                    break;
+                }
+            }
+            Some(LinkEvent::Message(Message::Disconnected {
+                channel: EXEC,
+                reason,
+            })) => panic!("the command ended: {reason}"),
+            Some(LinkEvent::Message(m)) => {
+                let e = shell.session.on_worker(m);
+                shell.effects.extend(e);
+            }
+            Some(LinkEvent::Closed(why)) => panic!("worker closed: {why}"),
+            None => std::thread::sleep(Duration::from_millis(5)),
+        }
+    }
+    assert!(uploaded, "the host never asked for the agent");
+    assert_eq!(
+        String::from_utf8_lossy(&stderr),
+        "agent: --stdio --remove-when-done\n"
+    );
+    assert_eq!(std::fs::read(&installed).unwrap(), script);
+    // Give the rest of the frames a moment, then decode it all.
+    std::thread::sleep(Duration::from_millis(300));
+    while let Some(LinkEvent::Message(Message::Data {
+        channel: EXEC,
+        bytes,
+    })) = shell.link.try_recv()
+    {
+        write_frame(&mut decoder_in, &bytes).unwrap();
+    }
+    let mut out = Vec::new();
+    assert_eq!(run(&decoder_in[..], &mut out), 0);
+    let mut got = Vec::new();
+    let mut r = &out[..];
+    while let Some(f) = read_frame(&mut r, MAX_OUT).unwrap() {
+        got.push(FromDecoder::decode(&f).unwrap());
+    }
+    assert!(
+        matches!(got.first(), Some(FromDecoder::Upload(_))),
+        "{got:?}"
+    );
+    assert!(matches!(
+        got.get(1),
+        Some(FromDecoder::Message(Fs::Hello { .. }))
+    ));
+    match got.get(2) {
+        Some(FromDecoder::Message(Fs::Tile(t))) => {
+            assert_eq!(t.encoding, Encoding::Raw);
+            assert_eq!(t.data, px);
+        }
+        other => panic!("{other:?}"),
+    }
+    shell.link.send(Message::Close { channel: EXEC });
     forwarder.stop(conn);
 }
