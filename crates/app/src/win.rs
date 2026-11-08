@@ -3488,6 +3488,12 @@ impl Window {
             program: argv,
             clipboard,
             attach,
+            packing: self
+                .settings
+                .remote_app_packing
+                .as_deref()
+                .and_then(ferostream_proto::Packing::parse)
+                .unwrap_or_default(),
             raw_only: true,
         };
         if let Err(e) = ferostream_client::win32::start(settings, Box::new(app_host)) {
