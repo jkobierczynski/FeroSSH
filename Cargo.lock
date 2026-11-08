@@ -994,7 +994,7 @@ version = "1.2.0"
 [[package]]
 name = "ferostream-client"
 version = "0.1.0"
-source = "git+https://github.com/jkobierczynski/FeroStream?rev=223731dc9fbf9cc19650b022952b464f45dcfe04#223731dc9fbf9cc19650b022952b464f45dcfe04"
+source = "git+https://github.com/jkobierczynski/FeroStream?rev=5df3f0c9407c94d39aa13065a801353de5896f31#5df3f0c9407c94d39aa13065a801353de5896f31"
 dependencies = [
  "ferostream-proto",
  "windows",
@@ -1003,7 +1003,7 @@ dependencies = [
 [[package]]
 name = "ferostream-proto"
 version = "0.1.0"
-source = "git+https://github.com/jkobierczynski/FeroStream?rev=223731dc9fbf9cc19650b022952b464f45dcfe04#223731dc9fbf9cc19650b022952b464f45dcfe04"
+source = "git+https://github.com/jkobierczynski/FeroStream?rev=5df3f0c9407c94d39aa13065a801353de5896f31#5df3f0c9407c94d39aa13065a801353de5896f31"
 dependencies = [
  "lz4_flex",
 ]
