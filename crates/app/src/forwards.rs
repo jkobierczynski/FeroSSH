@@ -60,6 +60,19 @@ pub fn on_ssh_host(host: &str) -> bool {
             .is_ok_and(|ip| ip.is_loopback())
 }
 
+/// What an approval to open a desktop unencrypted past its SSH server
+/// holds for: the connection and where it really goes, so that editing
+/// the connection's host, port or SSH server while FeroSSH runs asks
+/// again.
+pub fn plain_desktop_key(name: &str, host: &str, port: u16, via: &str) -> String {
+    format!(
+        "{}\n{}\n{port}\n{}",
+        name.to_ascii_lowercase(),
+        host.to_ascii_lowercase(),
+        via.to_ascii_lowercase()
+    )
+}
+
 /// The loopback port a remote desktop tunnel for `label` tries first.
 pub fn desktop_port_for(label: &str) -> u16 {
     // FNV-1a: stable across runs and builds, unlike std's hasher.
@@ -1447,6 +1460,20 @@ mod tests {
             "0.0.0.0",
         ] {
             assert!(!on_ssh_host(host), "{host}");
+        }
+    }
+
+    #[test]
+    fn plain_desktop_approvals_follow_the_endpoint() {
+        let key = plain_desktop_key("Lab", "vnc.lan", 5900, "bastion");
+        assert_eq!(key, plain_desktop_key("lab", "VNC.lan", 5900, "Bastion"));
+        for other in [
+            plain_desktop_key("lab", "other.lan", 5900, "bastion"),
+            plain_desktop_key("lab", "vnc.lan", 5901, "bastion"),
+            plain_desktop_key("lab", "vnc.lan", 5900, "jump"),
+            plain_desktop_key("lab2", "vnc.lan", 5900, "bastion"),
+        ] {
+            assert_ne!(key, other);
         }
     }
 

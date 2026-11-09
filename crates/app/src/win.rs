@@ -864,7 +864,9 @@ struct Window {
     /// Desktop sessions waiting for their SSH pane to log in.
     pending_desktops: HashMap<PaneId, PendingDesktop>,
     /// VNC connections on another machine than their SSH server that the
-    /// user agreed to open unencrypted past it, until FeroSSH quits.
+    /// user agreed to open unencrypted past it, until FeroSSH quits, by
+    /// [`crate::forwards::plain_desktop_key`]: connection, host, port and
+    /// SSH server, so a changed connection asks again.
     plain_vnc_ok: HashSet<String>,
     /// Window > Broadcast input: which panes also get what is typed.
     broadcast: broadcast::Scope,
@@ -8790,11 +8792,13 @@ impl Window {
         // Without a host of its own, the desktop is on the SSH host.
         let host = cfg.hostname.unwrap_or_else(|| "localhost".to_owned());
         // VNC to another machine is plain past the SSH server: ask first.
+        let plain_key = crate::forwards::plain_desktop_key(name, &host, port, &via);
         if kind == SessionKind::Vnc
             && !crate::forwards::on_ssh_host(&host)
-            && !self.plain_vnc_ok.contains(&name.to_ascii_lowercase())
+            && !self.plain_vnc_ok.contains(&plain_key)
         {
             self.queued.push(Command::ApprovePlainVnc {
+                key: plain_key,
                 name: name.to_owned(),
                 target: host,
                 via,
@@ -11851,6 +11855,8 @@ enum Command {
     /// Ask before opening VNC connection `name`, whose desktop `target`
     /// is another machine than its SSH server `via`.
     ApprovePlainVnc {
+        /// What the approval is kept under in `plain_vnc_ok`.
+        key: String,
         name: String,
         target: String,
         via: String,
@@ -12828,12 +12834,15 @@ fn run_command(hwnd: HWND, command: Command) {
             });
         }
         Command::ApprovePlainVnc {
+            key,
             name,
             target,
             via,
             split,
         } => {
             let clean = |s: &str| -> String { s.chars().filter(|c| !c.is_control()).collect() };
+            // Shown cleaned; the session opens under its own name and SSH server.
+            let (raw_name, raw_via) = (name.clone(), via.clone());
             let (name, target, via) = (clean(&name), clean(&target), clean(&via));
             let text = format!(
                 "The VNC desktop {name} is on {target}, another machine than its SSH server \
@@ -12846,8 +12855,8 @@ fn run_command(hwnd: HWND, command: Command) {
             let yes = dialog(hwnd, &text, MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2) == Some(IDYES);
             if yes {
                 with_window(|w| {
-                    w.plain_vnc_ok.insert(name.to_ascii_lowercase());
-                    w.open_desktop_session(&name, SessionKind::Vnc, Some(via), split);
+                    w.plain_vnc_ok.insert(key);
+                    w.open_desktop_session(&raw_name, SessionKind::Vnc, Some(raw_via), split);
                 });
             }
         }
