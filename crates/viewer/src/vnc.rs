@@ -78,6 +78,9 @@ pub enum Event {
     NeedPassword,
     /// The session is over.
     Failed(String),
+    /// Text copied on the remote desktop (ServerCutText), when the rules
+    /// let it come here.
+    Clipboard(String),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -217,6 +220,10 @@ pub struct Client {
     refused: Option<(u16, u16)>,
     /// The screen changed size: the next request asks for all of it.
     full: bool,
+    /// Copied text may go to the server ([`Client::cut_text`]).
+    clip_to_host: bool,
+    /// Text copied on the server comes out as [`Event::Clipboard`].
+    clip_from_host: bool,
 }
 
 impl std::fmt::Debug for Client {
@@ -283,7 +290,43 @@ impl Client {
             asked: false,
             refused: None,
             full: false,
+            clip_to_host: false,
+            clip_from_host: false,
         }
+    }
+
+    /// Which ways copied text may travel; nothing does until this says so.
+    pub fn clipboard_rules(&mut self, to_host: bool, from_host: bool) {
+        self.clip_to_host = to_host;
+        self.clip_from_host = from_host;
+    }
+
+    /// Gives the server this PC's clipboard text (ClientCutText), once
+    /// the session runs and if the rules allow it. RFB carries Latin-1:
+    /// other characters go as `?`, and line ends as the X `\n`.
+    pub fn cut_text(&mut self, text: &str) {
+        if !self.clip_to_host
+            || !matches!(
+                self.state,
+                State::Normal | State::Update(_) | State::Rect { .. } | State::Hextile { .. }
+            )
+        {
+            return;
+        }
+        let text = text.replace("\r\n", "\n");
+        let bytes: Vec<u8> = text
+            .chars()
+            .take_while(|c| *c != '\0')
+            .map(|c| u8::try_from(u32::from(c)).unwrap_or(b'?'))
+            .take(crate::pipe::MAX_CLIP)
+            .collect();
+        if bytes.is_empty() {
+            return;
+        }
+        self.output.extend([6, 0, 0, 0]);
+        self.output
+            .extend(u32::try_from(bytes.len()).unwrap_or(0).to_be_bytes());
+        self.output.extend(bytes);
     }
 
     /// The screen size, once known.
@@ -642,9 +685,19 @@ impl Client {
                                 "The VNC server sent too much clipboard text.".into(),
                             );
                         }
-                        // Not used: the remote clipboard never reaches
-                        // this PC's.
-                        need!(r.bytes(len as usize));
+                        let text = need!(r.bytes(len as usize));
+                        // Latin-1, as RFB has it; a copy over the limit
+                        // stays on the server.
+                        if self.clip_from_host && text.len() <= crate::pipe::MAX_CLIP {
+                            let text: String = text
+                                .iter()
+                                .take_while(|b| **b != 0)
+                                .map(|b| char::from(*b))
+                                .collect();
+                            if let Some(t) = crate::pipe::clip_text(&text) {
+                                self.events.push(Event::Clipboard(t));
+                            }
+                        }
                     }
                     k => {
                         return Step::Fail(format!(
@@ -1310,6 +1363,33 @@ mod tests {
             c.take_output(),
             [4, 1, 0, 0, 0, 0, 0xff, 0x0d, 5, 1, 0, 99, 0, 7]
         );
+    }
+
+    #[test]
+    fn clipboard_text_follows_the_rules() {
+        let mut c = logged_in(4, 4);
+        c.take_output();
+        // Nothing either way until the rules come.
+        c.cut_text("pc");
+        assert!(c.take_output().is_empty());
+        c.feed(&[3, 0, 0, 0, 0, 0, 0, 2, b'h', b'i']);
+        assert!(c.take_events().is_empty());
+        c.clipboard_rules(true, true);
+        c.cut_text("a\r\nb€é");
+        assert_eq!(
+            c.take_output(),
+            [6, 0, 0, 0, 0, 0, 0, 5, b'a', b'\n', b'b', b'?', 0xe9]
+        );
+        c.feed(&[3, 0, 0, 0, 0, 0, 0, 3, b'c', 0xe9, b'\n']);
+        assert_eq!(c.take_events(), [Event::Clipboard("c\u{e9}\n".into())]);
+        // One way only.
+        c.clipboard_rules(false, true);
+        c.cut_text("x");
+        assert!(c.take_output().is_empty());
+        c.clipboard_rules(true, false);
+        c.feed(&[3, 0, 0, 0, 0, 0, 0, 1, b'z']);
+        assert!(c.take_events().is_empty());
+        assert!(!c.failed());
     }
 
     #[test]

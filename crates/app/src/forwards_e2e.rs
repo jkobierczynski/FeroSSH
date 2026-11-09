@@ -696,7 +696,14 @@ fn virtual_desktop(follow: bool) {
         split_stderr: false,
     });
     let password = vdesk::password();
-    let input = vdesk::input(&password, Some("sleep 600"), 800, 600, follow).unwrap();
+    // One way each, so the clipboard switches must be ones the server
+    // takes: x11vnc and Xvnc refuse to start on an unknown option.
+    let clip = vdesk::Clip {
+        to_host: !follow,
+        from_host: follow,
+        selection: follow,
+    };
+    let input = vdesk::input(&password, Some("sleep 600"), 800, 600, follow, clip).unwrap();
     shell.link.send(Message::Data {
         channel: EXEC,
         bytes: input.to_vec(),

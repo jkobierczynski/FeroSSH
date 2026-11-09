@@ -132,6 +132,7 @@ fn flush(client: &mut crate::vnc::Client, out: &mut impl Write) -> io::Result<()
             Event::Bell => send(out, &FromViewer::Bell)?,
             Event::NeedPassword => send(out, &FromViewer::NeedPassword)?,
             Event::Failed(why) => send(out, &FromViewer::Failed(why))?,
+            Event::Clipboard(text) => send(out, &FromViewer::Clipboard(text))?,
         }
     }
     Ok(())
@@ -185,6 +186,10 @@ fn vnc_session(
                 }
             }
             ToViewer::Resize { width, height } => client.resize(width, height),
+            ToViewer::Clipboard(text) => client.cut_text(&text),
+            ToViewer::ClipboardRules { to_host, from_host } => {
+                client.clipboard_rules(to_host, from_host);
+            }
             ToViewer::Start { .. } | ToViewer::User(_) => {}
         }
         flush(&mut client, &mut output)?;
@@ -353,6 +358,108 @@ mod tests {
                 break;
             }
         }
+        tell(ToViewer::Closed);
+    }
+
+    /// Copied text both ways with a real VNC server, when
+    /// `FEROSSH_TEST_VNC` names one and `FEROSSH_TEST_VNC_DISPLAY` its X
+    /// display (CI runs TigerVNC's Xvnc, and xclip to read and set the
+    /// X clipboard).
+    #[test]
+    fn copies_text_with_a_real_server() {
+        use std::net::TcpStream;
+        use std::process::{Command, Stdio};
+        use std::sync::{Arc, Mutex};
+        use std::time::{Duration, Instant};
+        let (Ok(addr), Ok(display)) = (
+            std::env::var("FEROSSH_TEST_VNC"),
+            std::env::var("FEROSSH_TEST_VNC_DISPLAY"),
+        ) else {
+            eprintln!("FEROSSH_TEST_VNC or FEROSSH_TEST_VNC_DISPLAY not set; skipped");
+            return;
+        };
+        let tcp = TcpStream::connect(addr.trim()).unwrap();
+        let (viewer_in, window_out) = std::io::pipe().unwrap();
+        let (mut window_in, viewer_out) = std::io::pipe().unwrap();
+        std::thread::spawn(move || run(viewer_in, viewer_out));
+        let to_viewer = Arc::new(Mutex::new(window_out));
+        let tell = {
+            let to_viewer = to_viewer.clone();
+            move |m: ToViewer| write_frame(&mut *to_viewer.lock().unwrap(), &m.encode()).unwrap()
+        };
+        tell(vnc_start());
+        tell(ToViewer::ClipboardRules {
+            to_host: true,
+            from_host: true,
+        });
+        let mut net = tcp.try_clone().unwrap();
+        let pump = to_viewer.clone();
+        std::thread::spawn(move || {
+            let mut buf = vec![0u8; 65536];
+            loop {
+                let n = net.read(&mut buf).unwrap_or(0);
+                let msg = if n == 0 {
+                    ToViewer::Closed
+                } else {
+                    ToViewer::Net(buf[..n].to_vec())
+                };
+                if write_frame(&mut *pump.lock().unwrap(), &msg.encode()).is_err() || n == 0 {
+                    return;
+                }
+            }
+        });
+        let xclip = move |args: &[&str]| {
+            let mut c = Command::new("xclip");
+            c.args(args).env("DISPLAY", display.trim());
+            c
+        };
+        let mut tcp_out = tcp;
+        let mut fb = Framebuffer::default();
+        let mut sent = false;
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let copied = loop {
+            assert!(Instant::now() < deadline, "no text came from the server");
+            let Some(frame) = read_frame(&mut window_in).unwrap() else {
+                panic!("the viewer stopped");
+            };
+            match fb.apply(FromViewer::decode(&frame).unwrap()).unwrap() {
+                Applied::Other(FromViewer::Net(b)) => tcp_out.write_all(&b).unwrap(),
+                Applied::Other(FromViewer::Failed(why)) => panic!("{why}"),
+                Applied::Other(FromViewer::Clipboard(text)) if sent => break text,
+                _ => {}
+            }
+            if fb.width() > 0 && !sent {
+                sent = true;
+                // Ours reaches the server's clipboard; then the server's
+                // own copy comes back.
+                tell(ToViewer::Clipboard("from Windows, caf\u{e9}".into()));
+                let xclip = xclip.clone();
+                std::thread::spawn(move || {
+                    let wait = Instant::now() + Duration::from_secs(10);
+                    loop {
+                        let out = xclip(&["-o", "-selection", "clipboard"])
+                            .output()
+                            .unwrap();
+                        if out.stdout == "from Windows, caf\u{e9}".as_bytes() {
+                            break;
+                        }
+                        assert!(Instant::now() < wait, "the server never got the text");
+                        std::thread::sleep(Duration::from_millis(100));
+                    }
+                    // xclip stays behind to serve the text: it must not
+                    // hold the test's output open.
+                    let mut set = xclip(&["-i", "-selection", "clipboard"])
+                        .stdin(Stdio::piped())
+                        .stdout(Stdio::null())
+                        .stderr(Stdio::null())
+                        .spawn()
+                        .unwrap();
+                    set.stdin.take().unwrap().write_all(b"from the host").unwrap();
+                    let _ = set.wait();
+                });
+            }
+        };
+        assert_eq!(copied, "from the host");
         tell(ToViewer::Closed);
     }
 }

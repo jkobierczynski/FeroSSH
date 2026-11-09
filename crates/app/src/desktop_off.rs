@@ -25,6 +25,7 @@ pub enum Update {
     Bell,
     Ask(String),
     Ended(String),
+    Clipboard(String),
 }
 
 impl Desktop {
@@ -71,6 +72,26 @@ impl Desktop {
     }
 
     pub fn focus_lost(&mut self) {
+        match *self {}
+    }
+
+    pub fn clipboard_limit(&self) -> (bool, bool) {
+        match *self {}
+    }
+
+    pub fn takes_clipboard(&self) -> bool {
+        match *self {}
+    }
+
+    pub fn set_clipboard(&mut self, _to_host: bool, _from_host: bool) {
+        match *self {}
+    }
+
+    pub fn offer_clipboard(&mut self, _text: &str) {
+        match *self {}
+    }
+
+    pub fn take_fresh(&mut self) -> bool {
         match *self {}
     }
 

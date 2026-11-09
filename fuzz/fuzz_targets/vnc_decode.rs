@@ -2,8 +2,9 @@
 //! client (as a server would send them, in arbitrary chunks, often after a
 //! valid login so the rectangle decoders get the bytes), the frames the
 //! window reads from the viewer process into its framebuffer, and the
-//! frames the viewer reads from the window. None may panic, and the
-//! client's rectangles must always fit its screen.
+//! frames the viewer reads from the window. None may panic, the
+//! client's rectangles must always fit its screen, and copied text it
+//! passes on must be text the window takes.
 
 #![no_main]
 
@@ -30,6 +31,7 @@ fuzz_target!(|data: &[u8]| {
     match mode % 3 {
         0 => {
             let mut c = Client::new();
+            c.clipboard_rules(true, true);
             let mut input = if mode & 0x80 != 0 { login() } else { Vec::new() };
             input.extend_from_slice(rest);
             let chunk = usize::from(mode >> 2 & 0x1f).max(1) * 7;
@@ -43,10 +45,16 @@ fuzz_target!(|data: &[u8]| {
                     c.key(true, 0x61);
                     c.pointer(1, 9999, 9999);
                     c.resize(640, 480);
+                    c.cut_text("from the PC \u{e9}\u{20ac}");
                 }
                 for e in c.take_events() {
                     match e {
                         Event::Size { width, height } => (w, h) = (width, height),
+                        // What the window takes, and nothing it refuses.
+                        Event::Clipboard(text) => {
+                            let frame = FromViewer::Clipboard(text.clone()).encode();
+                            assert_eq!(FromViewer::decode(&frame), Some(FromViewer::Clipboard(text)));
+                        }
                         Event::Pixels { x, y, width, height, data } => {
                             assert!(u32::from(x) + u32::from(width) <= u32::from(w));
                             assert!(u32::from(y) + u32::from(height) <= u32::from(h));

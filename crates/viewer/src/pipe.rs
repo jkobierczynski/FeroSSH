@@ -21,6 +21,9 @@ pub const MAX_NET: usize = 1024 * 1024;
 const MAX_TEXT: usize = 4096;
 /// The longest VNC password; VNC uses only eight bytes.
 const MAX_PASSWORD: usize = 256;
+/// The most clipboard text either way, in UTF-8 bytes: a copy that is
+/// longer stays where it was copied.
+pub const MAX_CLIP: usize = 1024 * 1024;
 
 /// Which protocol a viewer session speaks.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -72,6 +75,15 @@ pub enum ToViewer {
         width: u16,
         height: u16,
     },
+    /// The text on this PC's clipboard, for the server's.
+    Clipboard(String),
+    /// Which ways copied text may travel: `to_host` lets the viewer offer
+    /// [`ToViewer::Clipboard`] to the server, `from_host` lets it fetch
+    /// and pass on what was copied there. Both are off until this comes.
+    ClipboardRules {
+        to_host: bool,
+        from_host: bool,
+    },
 }
 
 /// Viewer to window.
@@ -102,6 +114,8 @@ pub enum FromViewer {
     Bell,
     NeedPassword,
     Failed(String),
+    /// Text copied on the remote desktop.
+    Clipboard(String),
 }
 
 /// Writes one frame.
@@ -192,6 +206,13 @@ impl<'a> Fields<'a> {
         (!s.chars().any(char::is_control)).then(|| s.to_owned())
     }
 
+    /// The rest as clipboard text: UTF-8, at most [`MAX_CLIP`] bytes, no
+    /// NUL (which would cut it short on Windows).
+    fn clip(&mut self) -> Option<String> {
+        let s = std::str::from_utf8(self.rest(MAX_CLIP)?).ok()?;
+        (!s.contains('\0')).then(|| s.to_owned())
+    }
+
     fn end(&self) -> Option<()> {
         self.data.is_empty().then_some(())
     }
@@ -208,6 +229,24 @@ fn put_string(v: &mut Vec<u8>, text: &str) {
     let part = text.get(..end).unwrap_or_default();
     v.extend(u16::try_from(part.len()).unwrap_or(0).to_le_bytes());
     v.extend(part.as_bytes());
+}
+
+/// Clipboard text as sent: up to the first NUL, at most [`MAX_CLIP`]
+/// bytes (cut at a character boundary).
+fn clip_bytes(text: &str) -> &[u8] {
+    let text = text.split('\0').next().unwrap_or_default();
+    let mut end = text.len().min(MAX_CLIP);
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    text.as_bytes().get(..end).unwrap_or_default()
+}
+
+/// Clipboard text in the form both sides send: up to the first NUL and
+/// at most [`MAX_CLIP`] bytes, or `None` when that leaves nothing.
+pub fn clip_text(text: &str) -> Option<String> {
+    let b = clip_bytes(text);
+    (!b.is_empty()).then(|| String::from_utf8_lossy(b).into_owned())
 }
 
 impl ToViewer {
@@ -270,6 +309,13 @@ impl ToViewer {
                 v.extend(width.to_le_bytes());
                 v.extend(height.to_le_bytes());
             }
+            ToViewer::Clipboard(text) => {
+                v.push(11);
+                v.extend(clip_bytes(text));
+            }
+            ToViewer::ClipboardRules { to_host, from_host } => {
+                v.extend([12, u8::from(*to_host), u8::from(*from_host)]);
+            }
         }
         v
     }
@@ -319,6 +365,11 @@ impl ToViewer {
                 }
                 ToViewer::Resize { width, height }
             }
+            11 => ToViewer::Clipboard(f.clip()?),
+            12 => ToViewer::ClipboardRules {
+                to_host: f.flag()?,
+                from_host: f.flag()?,
+            },
             _ => return None,
         };
         f.end()?;
@@ -382,6 +433,10 @@ impl FromViewer {
                 }
                 v.extend(why.as_bytes().get(..end).unwrap_or_default());
             }
+            FromViewer::Clipboard(text) => {
+                v.push(9);
+                v.extend(clip_bytes(text));
+            }
         }
         v
     }
@@ -431,6 +486,7 @@ impl FromViewer {
             6 => FromViewer::Bell,
             7 => FromViewer::NeedPassword,
             8 => FromViewer::Failed(f.text()?),
+            9 => FromViewer::Clipboard(f.clip()?),
             _ => return None,
         };
         f.end()?;
@@ -439,7 +495,7 @@ impl FromViewer {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used)]
+#[allow(clippy::unwrap_used, clippy::panic)]
 mod tests {
     use super::*;
 
@@ -474,6 +530,11 @@ mod tests {
                 y: 2,
             },
             ToViewer::Password(b"pw".to_vec()),
+            ToViewer::Clipboard("a\r\nb\té".into()),
+            ToViewer::ClipboardRules {
+                to_host: true,
+                from_host: false,
+            },
         ] {
             assert_eq!(ToViewer::decode(&m.encode()), Some(m));
         }
@@ -502,6 +563,7 @@ mod tests {
             FromViewer::Bell,
             FromViewer::NeedPassword,
             FromViewer::Failed("no".into()),
+            FromViewer::Clipboard("line\nnext".into()),
         ] {
             assert_eq!(FromViewer::decode(&m.encode()), Some(m));
         }
@@ -540,6 +602,27 @@ mod tests {
             "control characters"
         );
         assert_eq!(FromViewer::decode(&[3, 0xff]), None, "not UTF-8");
+        // Clipboard text: no NUL, UTF-8, within the limit.
+        assert_eq!(FromViewer::decode(&[9, b'a', 0, b'b']), None);
+        assert_eq!(FromViewer::decode(&[9, 0xc3]), None);
+        let mut big = vec![9];
+        big.resize(MAX_CLIP + 2, b'x');
+        assert_eq!(FromViewer::decode(&big), None);
+        assert_eq!(ToViewer::decode(&[12, 1, 2]), None);
+        // Encoding cuts at a NUL and at the limit, on a character.
+        let m = FromViewer::Clipboard("ab\0cd".into()).encode();
+        assert_eq!(
+            FromViewer::decode(&m),
+            Some(FromViewer::Clipboard("ab".into()))
+        );
+        let long = "é".repeat(MAX_CLIP);
+        let Some(FromViewer::Clipboard(t)) =
+            FromViewer::decode(&FromViewer::Clipboard(long).encode())
+        else {
+            panic!("a long copy did not decode");
+        };
+        assert_eq!(t.len(), MAX_CLIP);
+        assert_eq!(clip_text("\0x"), None);
     }
 
     #[test]

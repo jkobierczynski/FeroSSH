@@ -13,12 +13,24 @@
 //!
 //! Keys go to the server as scan codes, read with the keyboard layout the
 //! window reports, so the server types what the PC's keyboard shows.
+//!
+//! Copied text travels over the clipboard channel (MS-RDPECLIP), as plain
+//! Unicode text only, and only the ways the window's
+//! [`ToViewer::ClipboardRules`] allow. When the rules allow neither way
+//! as the session starts, the channel is not opened at all.
 
 use std::collections::VecDeque;
 use std::io::{self, Read, Write};
 use std::sync::{Arc, mpsc};
 
 use ironrdp_blocking::Framed;
+use ironrdp_cliprdr::CliprdrClient;
+use ironrdp_cliprdr::backend::CliprdrBackend;
+use ironrdp_cliprdr::pdu::{
+    ClipboardFormat, ClipboardFormatId, ClipboardGeneralCapabilityFlags, FileContentsRequest,
+    FileContentsResponse, FormatDataRequest, FormatDataResponse, LockDataId,
+    OwnedFormatDataResponse,
+};
 use ironrdp_connector::connection_activation::ConnectionActivationState;
 use ironrdp_connector::sspi;
 use ironrdp_connector::{
@@ -39,7 +51,7 @@ use ironrdp_session::{ActiveStage, ActiveStageBuilder, ActiveStageOutput};
 use rustls::pki_types;
 use zeroize::Zeroizing;
 
-use crate::pipe::{FromViewer, MAX_NET, ToViewer, read_frame};
+use crate::pipe::{FromViewer, MAX_CLIP, MAX_NET, ToViewer, clip_text, read_frame};
 use crate::viewer::{send, send_pixels};
 use crate::{MAX_PIXELS, MAX_SIDE};
 
@@ -144,9 +156,14 @@ pub(crate) fn session(
 
     send(&mut output, &FromViewer::NeedPassword)?;
     let (mut user, mut width, mut height) = (user, width, height);
+    let mut clip = Clip::default();
     let password = loop {
         match from.recv() {
             Ok(Item::Msg(ToViewer::User(u))) => user = u,
+            Ok(Item::Msg(ToViewer::ClipboardRules { to_host, from_host })) => {
+                (clip.to_host, clip.from_host) = (to_host, from_host);
+            }
+            Ok(Item::Msg(ToViewer::Clipboard(text))) => clip.local = Some(text),
             // The pane changed size during the login.
             Ok(Item::Msg(ToViewer::Resize {
                 width: w,
@@ -180,7 +197,7 @@ pub(crate) fn session(
     };
     let (width, height) = desktop_size(width, height);
     let size = DesktopSize { width, height };
-    let result = run(&mut pipe, config(user, password, size, layout));
+    let result = run(&mut pipe, config(user, password, size, layout), clip);
     let bad = pipe.bad;
     drop(pipe);
     match result {
@@ -309,12 +326,20 @@ fn pipe<'f, 'a, W: Write>(framed: &'f mut Framed<Tls<'_, 'a, W>>) -> &'f mut Pip
 }
 
 /// Connects, then runs the session.
-fn run<W: Write>(pipe: &mut Pipe<'_, W>, config: ironrdp_connector::Config) -> Result<(), Failure> {
+fn run<W: Write>(
+    pipe: &mut Pipe<'_, W>,
+    config: ironrdp_connector::Config,
+    clip: Clip,
+) -> Result<(), Failure> {
     let client_addr = std::net::SocketAddr::from(([127, 0, 0, 1], 0));
     // Display Control lets the desktop follow the pane's size.
     let drdynvc =
         DrdynvcClient::new().with_dynamic_channel(DisplayControlClient::new(|_| Ok(Vec::new())));
     let mut connector = ClientConnector::new(config, client_addr).with_static_channel(drdynvc);
+    if clip.to_host || clip.from_host {
+        connector =
+            connector.with_static_channel(CliprdrClient::new(Box::new(ClipBackend::default())));
+    }
     let mut framed = Framed::new(&mut *pipe);
     let mut buf = WriteBuf::new();
     while !connector.should_perform_security_upgrade() {
@@ -352,7 +377,7 @@ fn run<W: Write>(pipe: &mut Pipe<'_, W>, config: ironrdp_connector::Config) -> R
     )
     .map_err(|e| connector_failure(&e))?;
     match outcome {
-        ConnectionOutcome::Connected(r) => Active::new(r)?.run(&mut framed),
+        ConnectionOutcome::Connected(r) => Active::new(r, clip)?.run(&mut framed),
         ConnectionOutcome::Redirected(_) => Err(
             "The RDP server redirected to another machine, which the viewer does not follow."
                 .into(),
@@ -488,6 +513,89 @@ struct Active {
     want: Option<(u16, u16)>,
     /// The size last asked of the server, not asked again.
     asked: Option<(u16, u16)>,
+    clip: Clip,
+}
+
+/// The clipboard as the window allows it.
+#[derive(Debug, Default)]
+struct Clip {
+    /// This PC's text may be offered to the server.
+    to_host: bool,
+    /// Text copied on the server is fetched and passed to the window.
+    from_host: bool,
+    /// This PC's clipboard text, as the window last sent it.
+    local: Option<String>,
+}
+
+/// What the clipboard channel asked of the session, collected while
+/// IronRDP processes a PDU and acted on after.
+#[derive(Debug)]
+enum ClipEvent {
+    /// The server wants our format list (at the start, or again).
+    FormatListWanted,
+    /// Something was copied on the server; whether it has text.
+    RemoteCopy(bool),
+    /// The server pastes: it wants our data in this format.
+    DataWanted(ClipboardFormatId),
+    /// The server's text, which we asked for (`None`: it had none, or it
+    /// was over the limit).
+    Data(Option<String>),
+}
+
+/// The clipboard channel's backend: it only writes down what happened.
+#[derive(Debug, Default)]
+struct ClipBackend {
+    events: Vec<ClipEvent>,
+}
+
+ironrdp_core::impl_as_any!(ClipBackend);
+
+impl CliprdrBackend for ClipBackend {
+    fn temporary_directory(&self) -> &str {
+        // No files travel; the server is told of no folder of ours.
+        ".cliprdr"
+    }
+
+    fn client_capabilities(&self) -> ClipboardGeneralCapabilityFlags {
+        ClipboardGeneralCapabilityFlags::empty()
+    }
+
+    fn on_ready(&mut self) {}
+
+    fn on_request_format_list(&mut self) {
+        self.events.push(ClipEvent::FormatListWanted);
+    }
+
+    fn on_process_negotiated_capabilities(&mut self, _: ClipboardGeneralCapabilityFlags) {}
+
+    fn on_remote_copy(&mut self, available_formats: &[ClipboardFormat]) {
+        let text = available_formats
+            .iter()
+            .any(|f| f.id == ClipboardFormatId::CF_UNICODETEXT);
+        self.events.push(ClipEvent::RemoteCopy(text));
+    }
+
+    fn on_format_data_request(&mut self, request: FormatDataRequest) {
+        self.events.push(ClipEvent::DataWanted(request.format));
+    }
+
+    fn on_format_data_response(&mut self, response: FormatDataResponse<'_>) {
+        // UTF-16 with its NUL: two bytes a unit, at most one unit per
+        // UTF-8 byte of the limit.
+        let text = (!response.is_error() && response.data().len() <= MAX_CLIP * 2 + 2)
+            .then(|| response.to_unicode_string().ok())
+            .flatten()
+            .and_then(|t| clip_text(&t));
+        self.events.push(ClipEvent::Data(text));
+    }
+
+    fn on_file_contents_request(&mut self, _: FileContentsRequest) {}
+
+    fn on_file_contents_response(&mut self, _: FileContentsResponse<'_>) {}
+
+    fn on_lock(&mut self, _: LockDataId) {}
+
+    fn on_unlock(&mut self, _: LockDataId) {}
 }
 
 /// Wheel up and down in [`ToViewer::Pointer`], as VNC has them.
@@ -497,7 +605,7 @@ const WHEEL_DOWN: u8 = 1 << 4;
 const NOTCH: i16 = 120;
 
 impl Active {
-    fn new(r: ConnectionResult) -> Result<Self, Failure> {
+    fn new(r: ConnectionResult, clip: Clip) -> Result<Self, Failure> {
         if !r
             .input_flags
             .intersects(InputFlags::FASTPATH_INPUT | InputFlags::FASTPATH_INPUT_2)
@@ -527,6 +635,7 @@ impl Active {
             told: None,
             want: None,
             asked: Some((w, h)),
+            clip,
         })
     }
 
@@ -555,11 +664,16 @@ impl Active {
                     if self.outputs(framed, outputs)? {
                         return Ok(());
                     }
+                    self.clip_events(framed)?;
                 }
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => {}
                 Err(e) => return Err(io_failure(&e)),
             }
             let pending = std::mem::take(&mut pipe(framed).pending);
+            let (clipboard, pending): (Vec<_>, Vec<_>) = pending.into_iter().partition(|m| {
+                matches!(m, ToViewer::Clipboard(_) | ToViewer::ClipboardRules { .. })
+            });
+            self.clip_input(framed, clipboard)?;
             let events = self.input_events(pending);
             self.ask_size(framed)?;
             if !events.is_empty() {
@@ -571,6 +685,153 @@ impl Active {
                     return Ok(());
                 }
             }
+        }
+    }
+
+    /// Sends what the clipboard channel made for the server.
+    fn clip_send<W: Write>(
+        &mut self,
+        framed: &mut Framed<Tls<'_, '_, W>>,
+        make: impl FnOnce(
+            &mut CliprdrClient,
+            &Clip,
+        ) -> Option<
+            ironrdp_pdu::PduResult<ironrdp_cliprdr::CliprdrSvcMessages<ironrdp_cliprdr::Client>>,
+        >,
+    ) -> Result<(), Failure> {
+        let clip = &self.clip;
+        let Some(made) = self
+            .stage
+            .get_svc_processor_mut::<CliprdrClient>()
+            .and_then(|c| make(c, clip))
+        else {
+            return Ok(());
+        };
+        let messages = made.map_err(|e| format!("The RDP clipboard failed: {e}"))?;
+        let frame = self
+            .stage
+            .process_svc_processor_messages(messages)
+            .map_err(|e| format!("The RDP clipboard failed: {e}"))?;
+        framed.write_all(&frame).map_err(|e| io_failure(&e))
+    }
+
+    /// Offers the server our text when there is some it may have, or
+    /// takes the offer back.
+    fn clip_offer<W: Write>(&mut self, framed: &mut Framed<Tls<'_, '_, W>>) -> Result<(), Failure> {
+        self.clip_send(framed, |c, clip| {
+            let formats: &[ClipboardFormat] = if clip.to_host && clip.local.is_some() {
+                &[ClipboardFormat::new(ClipboardFormatId::CF_UNICODETEXT)]
+            } else {
+                &[]
+            };
+            // Before the channel is ready, only its first list goes out.
+            c.is_ready().then(|| c.initiate_copy(formats))
+        })
+    }
+
+    /// The window's clipboard text and rules.
+    fn clip_input<W: Write>(
+        &mut self,
+        framed: &mut Framed<Tls<'_, '_, W>>,
+        msgs: Vec<ToViewer>,
+    ) -> Result<(), Failure> {
+        if msgs.is_empty() {
+            return Ok(());
+        }
+        for m in msgs {
+            match m {
+                ToViewer::Clipboard(text) => self.clip.local = Some(text),
+                ToViewer::ClipboardRules { to_host, from_host } => {
+                    (self.clip.to_host, self.clip.from_host) = (to_host, from_host);
+                }
+                _ => {}
+            }
+        }
+        self.clip_offer(framed)
+    }
+
+    /// Acts on what the clipboard channel asked for while a PDU was
+    /// processed.
+    fn clip_events<W: Write>(
+        &mut self,
+        framed: &mut Framed<Tls<'_, '_, W>>,
+    ) -> Result<(), Failure> {
+        let events = self
+            .stage
+            .get_svc_processor_mut::<CliprdrClient>()
+            .and_then(|c| c.downcast_backend_mut::<ClipBackend>())
+            .map(|b| std::mem::take(&mut b.events))
+            .unwrap_or_default();
+        for event in events {
+            match event {
+                ClipEvent::FormatListWanted => self.clip_send(framed, |c, clip| {
+                    let formats: &[ClipboardFormat] = if clip.to_host && clip.local.is_some() {
+                        &[ClipboardFormat::new(ClipboardFormatId::CF_UNICODETEXT)]
+                    } else {
+                        &[]
+                    };
+                    Some(c.initiate_copy(formats))
+                })?,
+                ClipEvent::RemoteCopy(true) if self.clip.from_host => {
+                    self.clip_send(framed, |c, _| {
+                        Some(c.initiate_paste(ClipboardFormatId::CF_UNICODETEXT))
+                    })?;
+                }
+                ClipEvent::RemoteCopy(_) => {}
+                ClipEvent::DataWanted(format) => self.clip_send(framed, |c, clip| {
+                    let text = clip
+                        .local
+                        .as_deref()
+                        .filter(|_| clip.to_host && format == ClipboardFormatId::CF_UNICODETEXT);
+                    Some(c.submit_format_data(match text {
+                        Some(t) => OwnedFormatDataResponse::new_unicode_string(t),
+                        None => OwnedFormatDataResponse::new_error(),
+                    }))
+                })?,
+                ClipEvent::Data(Some(text)) if self.clip.from_host => {
+                    send(pipe(framed).out, &FromViewer::Clipboard(text))
+                        .map_err(|e| io_failure(&e))?;
+                }
+                ClipEvent::Data(_) => {}
+            }
+        }
+        Ok(())
+    }
+
+    /// [`Self::clip_events`] without a server to write to, for the fuzzer:
+    /// the replies are made and dropped, the text checked.
+    #[doc(hidden)]
+    fn fuzz_clip_events(&mut self) {
+        let Some(c) = self.stage.get_svc_processor_mut::<CliprdrClient>() else {
+            return;
+        };
+        let events = c
+            .downcast_backend_mut::<ClipBackend>()
+            .map(|b| std::mem::take(&mut b.events))
+            .unwrap_or_default();
+        for event in events {
+            let made = match event {
+                ClipEvent::FormatListWanted => {
+                    c.initiate_copy(&[ClipboardFormat::new(ClipboardFormatId::CF_UNICODETEXT)])
+                }
+                ClipEvent::RemoteCopy(true) => c.initiate_paste(ClipboardFormatId::CF_UNICODETEXT),
+                ClipEvent::RemoteCopy(false) => continue,
+                ClipEvent::DataWanted(_) => {
+                    c.submit_format_data(OwnedFormatDataResponse::new_unicode_string("x"))
+                }
+                ClipEvent::Data(text) => {
+                    if let Some(text) = text {
+                        let frame = FromViewer::Clipboard(text.clone()).encode();
+                        assert_eq!(
+                            FromViewer::decode(&frame),
+                            Some(FromViewer::Clipboard(text)),
+                            "clipboard text the window would refuse"
+                        );
+                    }
+                    continue;
+                }
+            };
+            let _ = made;
         }
     }
 
@@ -790,8 +1051,10 @@ impl Active {
 }
 
 /// Feeds `data` to the session as server PDUs after the login, the way
-/// the fuzzer does: every update must decode or fail cleanly, and every
-/// rectangle sent to the window must fit its framebuffer.
+/// the fuzzer does: every update must decode or fail cleanly, every
+/// rectangle sent to the window must fit its framebuffer, and clipboard
+/// channel PDUs (channel 1004) drive the clipboard the way a session
+/// would, any text that comes out within the window's limits.
 #[doc(hidden)]
 pub fn fuzz_server_pdus(data: &[u8]) {
     use crate::framebuffer::Framebuffer;
@@ -803,8 +1066,11 @@ pub fn fuzz_server_pdus(data: &[u8]) {
         height: 48,
     };
     let config = config(String::new(), Zeroizing::new(String::new()), size, 0x409);
+    let mut channels = ironrdp_svc::StaticChannelSet::new();
+    channels.insert(CliprdrClient::new(Box::new(ClipBackend::default())));
+    channels.attach_channel_id(std::any::TypeId::of::<CliprdrClient>(), 1004);
     let stage = ActiveStageBuilder {
-        static_channels: ironrdp_svc::StaticChannelSet::new(),
+        static_channels: channels,
         user_channel_id: user,
         io_channel_id: io,
         message_channel_id: None,
@@ -825,6 +1091,11 @@ pub fn fuzz_server_pdus(data: &[u8]) {
         told: None,
         want: None,
         asked: None,
+        clip: Clip {
+            to_host: true,
+            from_host: true,
+            local: Some("text from the PC".into()),
+        },
     };
     let mut fb = Framebuffer::default();
     let _ = fb.apply(FromViewer::Size {
@@ -843,6 +1114,7 @@ pub fn fuzz_server_pdus(data: &[u8]) {
         else {
             continue;
         };
+        active.fuzz_clip_events();
         for out in outputs {
             if let ActiveStageOutput::GraphicsUpdate(rect) = out {
                 let mut sent = Vec::new();
@@ -905,6 +1177,10 @@ mod tests {
             height: 600,
             layout: 0x409,
             user: "nobody".into(),
+        });
+        tell(ToViewer::ClipboardRules {
+            to_host: true,
+            from_host: true,
         });
         let mut net = tcp.try_clone().unwrap();
         let pump = to_viewer.clone();
@@ -1000,12 +1276,19 @@ mod tests {
             }
         }
         let deadline = Instant::now() + Duration::from_secs(20);
+        let (copies, copied) = std::sync::mpsc::channel();
         let pump = std::thread::spawn(move || {
             while let Ok(Some(frame)) = read_frame(&mut window_in) {
-                if let Some(FromViewer::Net(b)) = FromViewer::decode(&frame)
-                    && tcp_out.write_all(&b).is_err()
-                {
-                    return;
+                match FromViewer::decode(&frame) {
+                    Some(FromViewer::Net(b)) => {
+                        if tcp_out.write_all(&b).is_err() {
+                            return;
+                        }
+                    }
+                    Some(FromViewer::Clipboard(text)) => {
+                        let _ = copies.send(text);
+                    }
+                    _ => {}
                 }
             }
         });
@@ -1013,7 +1296,78 @@ mod tests {
             assert!(Instant::now() < deadline, "the typed command never ran");
             std::thread::sleep(Duration::from_millis(50));
         }
+
+        // The clipboard, when the session has xclip: text copied there
+        // arrives here, and ours is pasted there.
+        if std::process::Command::new("xclip")
+            .arg("-version")
+            .output()
+            .is_ok()
+        {
+            let typed = |line: &str| {
+                for c in line.chars().chain(['\n']) {
+                    let (shift, scan) = us_scan(c);
+                    let mut keys = vec![(scan, true), (scan, false)];
+                    if shift {
+                        keys.insert(0, (0x2a, true));
+                        keys.push((0x2a, false));
+                    }
+                    for (scan, down) in keys {
+                        tell(ToViewer::Key {
+                            vk: 0,
+                            scan,
+                            extended: false,
+                            down,
+                        });
+                    }
+                }
+            };
+            typed("printf from-xrdp | xclip -selection clipboard");
+            let got = copied.recv_timeout(Duration::from_secs(20)).unwrap();
+            assert_eq!(got, "from-xrdp");
+            let pasted = "/tmp/frdp-clip";
+            let _ = std::fs::remove_file(pasted);
+            tell(ToViewer::Clipboard("from-windows".into()));
+            std::thread::sleep(Duration::from_millis(500));
+            typed("xclip -o -selection clipboard >/tmp/frdp-clip.part; mv /tmp/frdp-clip.part /tmp/frdp-clip");
+            let deadline = Instant::now() + Duration::from_secs(20);
+            while !std::path::Path::new(pasted).exists() {
+                assert!(Instant::now() < deadline, "the text never reached xrdp");
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            assert_eq!(std::fs::read_to_string(pasted).unwrap(), "from-windows");
+        }
         tell(ToViewer::Closed);
         let _ = pump.join();
+    }
+
+    /// The US layout's scan code for `c`, and whether it takes Shift.
+    fn us_scan(c: char) -> (bool, u16) {
+        const ROWS: [(&str, u16); 4] = [
+            ("1234567890-=", 0x02),
+            ("qwertyuiop[]", 0x10),
+            ("asdfghjkl;'", 0x1e),
+            ("zxcvbnm,./", 0x2c),
+        ];
+        const SHIFTED: [(&str, u16); 4] = [
+            ("!@#$%^&*()_+", 0x02),
+            ("QWERTYUIOP{}", 0x10),
+            ("ASDFGHJKL:\"", 0x1e),
+            ("ZXCVBNM<>?", 0x2c),
+        ];
+        match c {
+            ' ' => return (false, 0x39),
+            '\n' => return (false, 0x1c),
+            '|' => return (true, 0x2b),
+            _ => {}
+        }
+        for (shift, rows) in [(false, ROWS), (true, SHIFTED)] {
+            for (row, first) in rows {
+                if let Some(i) = row.chars().position(|r| r == c) {
+                    return (shift, first + i as u16);
+                }
+            }
+        }
+        panic!("no key for {c:?}");
     }
 }

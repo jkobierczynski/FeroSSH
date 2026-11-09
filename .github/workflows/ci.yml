@@ -183,7 +183,7 @@ jobs:
       - run: rustup show active-toolchain
       # A throwaway xrdp with an Xorg session running one xterm, whose
       # background colour the test waits for; then it types a command.
-      - run: sudo apt-get update && sudo apt-get install -y xrdp xorgxrdp xterm
+      - run: sudo apt-get update && sudo apt-get install -y xrdp xorgxrdp xterm xclip
       - run: |
           sudo useradd -m -s /bin/bash rdptest
           echo 'rdptest:Secret-pw1' | sudo chpasswd
@@ -204,9 +204,10 @@ jobs:
           sudo apt-get install -y tigervnc-standalone-server
           Xvnc :5 -SecurityTypes None -geometry 800x600 -rfbport 5905 -localhost yes &
           sleep 2
-      - run: "cargo test --locked -p ferossh-viewer --features vnc resizes_a_real_server"
+      - run: "cargo test --locked -p ferossh-viewer --features vnc real_server"
         env:
           FEROSSH_TEST_VNC: "127.0.0.1:5905"
+          FEROSSH_TEST_VNC_DISPLAY: ":5"
 
   # A required check on main, so it must not hang or depend on Docker Hub:
   # every job and long step has a timeout, and the images come from the
