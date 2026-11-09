@@ -37,9 +37,17 @@ Only a real drop counts. A shell you exit, a server that ends the session, a log
 
 File > Reconnect automatically turns this off for all hosts; `AutoReconnect no` in a host's profile turns it off for that host only.
 
+## The tools pane
+
+The connection manager, session manager, file transfer, port forwards and command snippets open in the tools pane at the side of the window. The tools rail along the window's edge has an icon for each, plus the command palette and a pin at the bottom; hover an icon for its name and shortcut. A click opens that tool, and a click on the open tool's icon closes it again.
+
+The terminal slides over the tools pane rather than squeezing it. Drag the terminal's edge to cover part of the tool, or all of it so only the rail is left; the tool keeps its width underneath, so nothing in it rewraps. Drag the edge out from the rail to uncover the last tool again, or past the tool's width to make it wider. A tool you open again shows as much as it did last time.
+
+With the pin off (Settings > Keep tools open), an opened tool is a peek: clicking in the terminal, Esc or connecting somewhere covers it again. Settings > Tools rail hides the rail; the tools then open and close from the Tools menu and their shortcuts only, as before.
+
 ## The connection manager
 
-Ctrl+Shift+S shows a side pane with your hosts: those from `~/.ssh/config`, your saved connections and your imports. Type to filter, Enter connects in this tab, Shift+Enter in a split, and Ctrl+D marks a favourite. Left and Right close and open folders. A `# folder: Name` comment above a `Host` line groups hosts in your ssh_config. Settings > Side pane on the right moves the pane; drag its edge to resize it.
+Ctrl+Shift+S shows a side pane with your hosts: those from `~/.ssh/config`, your saved connections and your imports. Type to filter, Enter connects in this tab, Shift+Enter in a split, and Ctrl+D marks a favourite. Left and Right close and open folders. A `# folder: Name` comment above a `Host` line groups hosts in your ssh_config. Settings > Side pane on the right moves the pane.
 
 ### Saved connections
 

@@ -372,6 +372,11 @@ pub struct Settings {
     pub theme_rules: Vec<ThemeRule>,
     /// Dock the side pane on the right instead of the left.
     pub side_pane_right: bool,
+    /// Show the tools rail (an icon per tool) on the window's edge.
+    pub tools_rail: bool,
+    /// Keep an opened tool open; off, the terminal covers it again once
+    /// the terminal is used (a peek).
+    pub tools_pinned: bool,
     /// Show the tab strip when there are two or more tabs.
     pub tab_strip: bool,
     pub copy_on_select: bool,
@@ -478,6 +483,8 @@ impl Default for Settings {
             favourites: Vec::new(),
             theme_rules: Vec::new(),
             side_pane_right: false,
+            tools_rail: true,
+            tools_pinned: true,
             tab_strip: true,
             copy_on_select: false,
             right_click_paste: false,
@@ -676,6 +683,14 @@ impl Settings {
                 "sidepane" => {
                     block = Block::Top;
                     s.side_pane_right = first.is_some_and(|a| a.eq_ignore_ascii_case("right"));
+                }
+                "toolsrail" => {
+                    block = Block::Top;
+                    s.tools_rail = yes(&args).unwrap_or(true);
+                }
+                "toolspinned" => {
+                    block = Block::Top;
+                    s.tools_pinned = yes(&args).unwrap_or(true);
                 }
                 "tabstrip" => {
                     block = Block::Top;
@@ -994,6 +1009,8 @@ impl Settings {
                 "left"
             }
         );
+        let _ = writeln!(out, "ToolsRail {}", flag(self.tools_rail));
+        let _ = writeln!(out, "ToolsPinned {}", flag(self.tools_pinned));
         let _ = writeln!(out, "TabStrip {}", flag(self.tab_strip));
         let _ = writeln!(out, "CopyOnSelect {}", flag(self.copy_on_select));
         let _ = writeln!(out, "RightClickPaste {}", flag(self.right_click_paste));
@@ -1590,6 +1607,18 @@ DesktopShareSelection yes
             ..Settings::default()
         };
         assert!(Settings::parse(&s.to_text()).update_check_weekly);
+    }
+
+    #[test]
+    fn tools_rail_and_pin_are_on_unless_turned_off() {
+        let d = Settings::default();
+        assert!(d.tools_rail && d.tools_pinned);
+        // An older settings file without them keeps both on.
+        let old = Settings::parse("SidePane left\n");
+        assert!(old.tools_rail && old.tools_pinned);
+        let s = Settings::parse("ToolsRail no\nToolsPinned no\n");
+        assert!(!s.tools_rail && !s.tools_pinned);
+        assert_eq!(Settings::parse(&s.to_text()), s);
     }
 
     #[test]

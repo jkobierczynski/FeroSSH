@@ -39,6 +39,8 @@ Items with a check mark are switches: picking them turns the setting on or off, 
 | --- | --- | --- |
 | File transfer follows cd | ✓ on | The file view, and files dropped on a pane, follow the shell's current directory. `FollowDirectory`. |
 | Side pane on the right | ✓ off | Moves the side pane from the left to the right. `SidePane`. |
+| Tools rail | ✓ on | Shows a narrow bar of tool icons on the window's edge. A click opens or closes that tool; hover for its name. `ToolsRail`. |
+| Keep tools open | ✓ on | Off, an opened tool is a peek: clicking in the terminal, Esc, or connecting covers it again. Also the pin at the bottom of the rail. `ToolsPinned`. |
 | Tab strip | ✓ on | Shows the tab strip once there are two tabs. `TabStrip`. |
 | Larger text | Ctrl+= (or Ctrl+wheel up) | Makes the focused pane's text bigger. |
 | Smaller text | Ctrl+- (or Ctrl+wheel down) | Makes it smaller. |
