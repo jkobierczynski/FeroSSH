@@ -12840,7 +12840,7 @@ fn run_command(hwnd: HWND, command: Command) {
             via,
             split,
         } => {
-            let clean = |s: &str| -> String { s.chars().filter(|c| !c.is_control()).collect() };
+            let clean = crate::ssh::sanitize_line;
             // Shown cleaned; the session opens under its own name and SSH server.
             let (raw_name, raw_via) = (name.clone(), via.clone());
             let (name, target, via) = (clean(&name), clean(&target), clean(&via));
