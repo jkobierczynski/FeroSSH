@@ -56,6 +56,7 @@ use rustls::pki_types;
 use zeroize::Zeroizing;
 
 use crate::pipe::{FromViewer, MAX_CLIP, MAX_NET, ToViewer, clip_text, read_frame};
+use crate::rdp_guard::ChannelGuard;
 use crate::viewer::{send, send_pixels};
 use crate::{MAX_PIXELS, MAX_SIDE};
 
@@ -518,6 +519,8 @@ struct Active {
     /// The size last asked of the server, not asked again.
     asked: Option<(u16, u16)>,
     clip: Clip,
+    /// Caps what the server's channel data may make IronRDP hold.
+    guard: ChannelGuard,
 }
 
 /// The clipboard as the window allows it.
@@ -619,6 +622,10 @@ impl Active {
             );
         }
         let (w, h) = checked_size(r.desktop_size)?;
+        let guard = ChannelGuard::new(
+            r.io_channel_id,
+            r.static_channels.get_channel_id_by_type::<DrdynvcClient>(),
+        );
         let stage = ActiveStageBuilder {
             static_channels: r.static_channels,
             user_channel_id: r.user_channel_id,
@@ -640,6 +647,7 @@ impl Active {
             want: None,
             asked: Some((w, h)),
             clip,
+            guard,
         })
     }
 
@@ -660,6 +668,9 @@ impl Active {
             pipe(framed).interruptible = false;
             match read {
                 Ok((action, payload)) => {
+                    if action == ironrdp_pdu::Action::X224 {
+                        self.guard.check(&payload)?;
+                    }
                     let at = framed.last_read_at();
                     let outputs = self
                         .stage
@@ -1100,6 +1111,7 @@ pub fn fuzz_server_pdus(data: &[u8]) {
             from_host: true,
             local: Some("text from the PC".into()),
         },
+        guard: ChannelGuard::new(io, None),
     };
     let mut fb = Framebuffer::default();
     let _ = fb.apply(FromViewer::Size {
@@ -1112,6 +1124,9 @@ pub fn fuzz_server_pdus(data: &[u8]) {
             return;
         };
         rest = next;
+        if info.action == ironrdp_pdu::Action::X224 && active.guard.check(pdu).is_err() {
+            continue;
+        }
         let Ok(outputs) = active
             .stage
             .process(&mut active.image, info.action, pdu, None)
