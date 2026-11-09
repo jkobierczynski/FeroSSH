@@ -173,8 +173,10 @@ pub struct Profile {
 }
 
 /// The ways copied text can travel, as the clipboard settings spell
-/// them: `both` (the same as unset), `to-host` (only from Windows to the
-/// host), `from-host` (only from the host to Windows) and `off`.
+/// them: `both`, `to-host` (only from Windows to the host), `from-host`
+/// (only from the host to Windows) and `off`. Unset means `off` for the
+/// global settings (see [`global_clipboard_ways`]) and no limit (`both`)
+/// on a connection.
 pub const CLIPBOARD_WAYS: [&str; 4] = ["both", "to-host", "from-host", "off"];
 
 /// The clipboard way `name` (one of [`CLIPBOARD_WAYS`], any case), or
@@ -184,14 +186,25 @@ pub fn clipboard_way(name: &str) -> Option<String> {
     CLIPBOARD_WAYS.contains(&w.as_str()).then_some(w)
 }
 
-/// Which ways a clipboard way lets text travel: (to the host, from the
-/// host). Unset or unknown is both.
+/// Which ways a connection's clipboard limit lets text travel: (to the
+/// host, from the host). Unset or unknown limits nothing: both.
 pub fn clipboard_ways(way: Option<&str>) -> (bool, bool) {
     match way.map(str::to_ascii_lowercase).as_deref() {
         Some("to-host") => (true, false),
         Some("from-host") => (false, true),
         Some("off") => (false, false),
         _ => (true, true),
+    }
+}
+
+/// Which ways the global clipboard setting (`DesktopClipboard`,
+/// `RemoteAppClipboard`) lets text travel: (to the host, from the host).
+/// Unset or unknown is off, so copied text only crosses to or from a host
+/// after the user chose that.
+pub fn global_clipboard_ways(way: Option<&str>) -> (bool, bool) {
+    match way.and_then(clipboard_way) {
+        Some(w) => clipboard_ways(Some(&w)),
+        None => (false, false),
     }
 }
 
@@ -1511,9 +1524,14 @@ NewKeyword later
     #[test]
     fn desktop_clipboard_global_and_per_connection() {
         let d = Settings::default();
-        assert_eq!(d.desktop_clipboard, None, "both ways unless changed");
+        assert_eq!(d.desktop_clipboard, None, "off unless changed");
         assert!(!d.desktop_share_selection);
-        assert_eq!(clipboard_ways(d.desktop_clipboard.as_deref()), (true, true));
+        assert_eq!(
+            global_clipboard_ways(d.desktop_clipboard.as_deref()),
+            (false, false)
+        );
+        // A connection without a limit does not narrow it.
+        assert_eq!(clipboard_ways(None), (true, true));
         let s = Settings::parse(
             "DesktopClipboard Off
 DesktopShareSelection yes
@@ -1552,6 +1570,13 @@ DesktopShareSelection yes
         assert_eq!(clipboard_ways(Some("from-host")), (false, true));
         assert_eq!(clipboard_ways(Some("off")), (false, false));
         assert_eq!(clipboard_ways(Some("nonsense")), (true, true));
+        assert_eq!(global_clipboard_ways(Some("Both")), (true, true));
+        assert_eq!(global_clipboard_ways(Some("to-host")), (true, false));
+        assert_eq!(global_clipboard_ways(Some("nonsense")), (false, false));
+        // Chosen "both" is kept globally, so it survives a save.
+        let both = Settings::parse("DesktopClipboard both\nRemoteAppClipboard both\n");
+        assert_eq!(both.desktop_clipboard.as_deref(), Some("both"));
+        assert_eq!(Settings::parse(&both.to_text()), both);
     }
 
     #[test]
