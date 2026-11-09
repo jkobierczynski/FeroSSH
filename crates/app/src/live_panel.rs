@@ -719,13 +719,16 @@ fn context_menu(h: Handles, lparam: LPARAM) {
                 ..Default::default()
             };
             at = POINT::default();
-            if let Some(i) = i {
-                SendMessageW(
+            // Below the row's name; at the list's corner if that fails.
+            if let Some(i) = i
+                && SendMessageW(
                     h.list,
                     LVM_GETITEMRECT,
                     Some(WPARAM(i as usize)),
                     Some(LPARAM(&raw mut rc as isize)),
-                );
+                )
+                .0 != 0
+            {
                 at = POINT {
                     x: rc.left,
                     y: rc.bottom,
