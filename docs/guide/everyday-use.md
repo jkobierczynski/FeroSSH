@@ -51,12 +51,12 @@ Ctrl+Shift+S shows your hosts in the tools pane: those from `~/.ssh/config`, you
 
 ### Saved connections
 
-Insert or the New button opens the connection form in the side pane; F2, the Edit button or a right click edits the selected connection. The form has:
+Insert or the New button opens the connection form in the tools pane; F2, the Edit button or a right click edits the selected connection. It is a Windows form of text boxes and drop-down lists, with a tab per section:
 
-- **Name, Folder, Type**: the type is an SSH terminal, Telnet (unencrypted), Serial console, Remote desktop (RDP) or VNC desktop.
+- **Connection**: **Name, Folder, Type**; the type is an SSH terminal, Telnet (unencrypted), Serial console, Remote desktop (RDP) or VNC desktop.
 - **Host, User, Port, Key file** (with Browse...), the **Password** source (below) and the **Jump host** (see [Jump hosts](#jump-hosts)). A serial console has the port, speed, framing and flow control instead.
-- **Look**: theme, font, font size and scrollback.
-- **Extras**: tmux on or off, the tmux session to attach and its layout, the start directory, port forwards (such as `L 8080 localhost:80`), RDP and VNC ports, older crypto, and the login script (see [Login scripts](#login-scripts)).
+- **Look** (a terminal's tab): theme, font, font size and scrollback.
+- **Extras** (a terminal's tab): tmux on or off, the tmux session to attach and its layout, the start directory, port forwards (such as `L 8080 localhost:80`), RDP and VNC ports, older crypto, and the login script (see [Login scripts](#login-scripts)).
 
 Empty fields show their default in grey. Enter saves, Shift+Enter saves and connects, Esc cancels. Connections go to `%APPDATA%\FeroSSH\sessions.conf` in ssh_config syntax and their look to `ferossh.conf`. Hosts from `~/.ssh/config` and imports show their connection settings read-only, because FeroSSH never writes those files; their look and extras can still change, and giving one a new name saves an editable copy.
 
