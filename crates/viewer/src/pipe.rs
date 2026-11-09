@@ -8,7 +8,30 @@
 
 use std::io::{self, Read, Write};
 
+use zeroize::{Zeroize, Zeroizing};
+
 use crate::{MAX_PIXELS, MAX_SIDE};
+
+/// A password on its way to the viewer: wiped from memory when dropped,
+/// and never shown by `Debug`.
+#[derive(Clone, Default, PartialEq, Eq)]
+pub struct Secret(Zeroizing<Vec<u8>>);
+
+impl Secret {
+    pub fn new(bytes: Vec<u8>) -> Self {
+        Self(Zeroizing::new(bytes))
+    }
+
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.0
+    }
+}
+
+impl std::fmt::Debug for Secret {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Secret(..)")
+    }
+}
 
 /// The largest frame either side sends: big pixel rectangles go in
 /// stripes below this.
@@ -66,7 +89,7 @@ pub enum ToViewer {
     },
     /// The user name to sign in as, sent before [`ToViewer::Password`].
     User(String),
-    Password(Vec<u8>),
+    Password(Secret),
     /// The pane lost the keyboard: let go of every key held down.
     Release,
     /// The pane is now this size: a server that can should give the
@@ -120,14 +143,32 @@ pub enum FromViewer {
     NoPassword,
 }
 
-/// Writes one frame.
+/// Writes one frame. The body is not copied, so a password in it leaves
+/// no copy behind.
 pub fn write_frame(w: &mut impl Write, body: &[u8]) -> io::Result<()> {
     let len = u32::try_from(body.len()).map_err(|_| io::Error::other("frame too large"))?;
-    let mut frame = Vec::with_capacity(4 + body.len());
-    frame.extend(len.to_le_bytes());
-    frame.extend_from_slice(body);
-    w.write_all(&frame)?;
+    w.write_all(&len.to_le_bytes())?;
+    w.write_all(body)?;
     w.flush()
+}
+
+/// The encoded [`ToViewer::Password`] tag.
+const PASSWORD_TAG: u8 = 5;
+
+/// Encodes `msg` for [`write_frame`]; the bytes are wiped when dropped,
+/// which matters for a [`ToViewer::Password`].
+pub fn encode_wiped(msg: &ToViewer) -> Zeroizing<Vec<u8>> {
+    Zeroizing::new(msg.encode())
+}
+
+/// Decodes a frame from the window and, when it held a password, wipes
+/// the frame.
+pub fn decode_wiped(mut frame: Vec<u8>) -> Option<ToViewer> {
+    let msg = ToViewer::decode(&frame);
+    if frame.first() == Some(&PASSWORD_TAG) {
+        frame.zeroize();
+    }
+    msg
 }
 
 /// Reads one frame; `None` at a clean end of the pipe.
@@ -278,7 +319,7 @@ impl ToViewer {
             }
             ToViewer::Password(p) => {
                 v.push(5);
-                v.extend(p);
+                v.extend(p.as_bytes());
             }
             ToViewer::Start {
                 protocol,
@@ -338,7 +379,7 @@ impl ToViewer {
                 x: f.u16()?,
                 y: f.u16()?,
             },
-            5 => ToViewer::Password(f.rest(MAX_PASSWORD)?.to_vec()),
+            5 => ToViewer::Password(Secret::new(f.rest(MAX_PASSWORD)?.to_vec())),
             6 => {
                 let protocol = match f.u8()? {
                     0 => Protocol::Vnc,
@@ -504,6 +545,19 @@ mod tests {
     use super::*;
 
     #[test]
+    fn passwords_are_never_shown_and_frames_are_wiped() {
+        let msg = ToViewer::Password(Secret::new(b"hunter2".to_vec()));
+        let shown = format!("{msg:?}");
+        assert!(!shown.contains("hunter2"), "{shown}");
+        let frame = encode_wiped(&msg);
+        assert_eq!(decode_wiped(frame.to_vec()), Some(msg));
+        // Other messages decode as before.
+        let other = ToViewer::User("me".into());
+        assert_eq!(decode_wiped(other.encode()), Some(other));
+        assert_eq!(decode_wiped(vec![5; MAX_PASSWORD + 2]), None);
+    }
+
+    #[test]
     fn messages_round_trip() {
         for m in [
             ToViewer::Net(vec![1, 2, 3]),
@@ -533,7 +587,7 @@ mod tests {
                 x: 1000,
                 y: 2,
             },
-            ToViewer::Password(b"pw".to_vec()),
+            ToViewer::Password(Secret::new(b"pw".to_vec())),
             ToViewer::Clipboard("a\r\nb\té".into()),
             ToViewer::ClipboardRules {
                 to_host: true,

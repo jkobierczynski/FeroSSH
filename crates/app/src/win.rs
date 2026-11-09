@@ -951,7 +951,8 @@ struct PendingDesktop {
 }
 
 /// A remote desktop asked for.
-#[derive(Debug, Clone)]
+// No Debug: it holds passwords.
+#[derive(Clone)]
 enum DesktopWant {
     /// Windows' Remote Desktop Connection, over RDP.
     /// `size` is the window's fixed size, if one was set.
@@ -976,7 +977,8 @@ enum DesktopWant {
 
 /// A desktop for the built-in viewer's tab: `label` names the host and
 /// `user` is the SSH user, offered for RDP.
-#[derive(Debug, Clone)]
+// No Debug: it holds passwords.
+#[derive(Clone)]
 #[cfg_attr(not(feature = "viewer"), allow(dead_code))]
 struct TabWant {
     label: String,
