@@ -46,7 +46,7 @@ pub(crate) fn next(input: &mut impl Read, output: &mut impl Write) -> io::Result
     let Some(frame) = read_frame(input)? else {
         return Ok(None);
     };
-    match ToViewer::decode(&frame) {
+    match crate::pipe::decode_wiped(frame) {
         Some(m) => Ok(Some(m)),
         None => {
             send(
@@ -177,10 +177,7 @@ fn vnc_session(
                 }
             }
             ToViewer::Pointer { buttons, x, y } => client.pointer(buttons, x, y),
-            ToViewer::Password(p) => {
-                let p = zeroize::Zeroizing::new(p);
-                client.password(&p);
-            }
+            ToViewer::Password(p) => client.password(p.as_bytes()),
             ToViewer::Release => {
                 for (down, keysym) in keyboard.release_all() {
                     client.key(down, keysym);

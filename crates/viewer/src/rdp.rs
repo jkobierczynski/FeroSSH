@@ -155,7 +155,7 @@ pub(crate) fn session(
         .spawn(move || {
             loop {
                 let item = match read_frame(&mut input) {
-                    Ok(Some(f)) => ToViewer::decode(&f).map_or(Item::Bad, Item::Msg),
+                    Ok(Some(f)) => crate::pipe::decode_wiped(f).map_or(Item::Bad, Item::Msg),
                     Ok(None) | Err(_) => Item::End,
                 };
                 let last = !matches!(item, Item::Msg(_));
@@ -181,8 +181,7 @@ pub(crate) fn session(
                 height: h,
             })) => (width, height) = (w, h),
             Ok(Item::Msg(ToViewer::Password(p))) => {
-                let p = Zeroizing::new(p);
-                break Zeroizing::new(String::from_utf8_lossy(&p).into_owned());
+                break Zeroizing::new(String::from_utf8_lossy(p.as_bytes()).into_owned());
             }
             Ok(Item::Msg(ToViewer::Closed)) => {
                 return send(
@@ -1237,7 +1236,9 @@ mod tests {
                 Applied::Other(FromViewer::Net(b)) => tcp_out.write_all(&b).unwrap(),
                 Applied::Other(FromViewer::NeedPassword) => {
                     tell(ToViewer::User(user.clone()));
-                    tell(ToViewer::Password(password.clone().into_bytes()));
+                    tell(ToViewer::Password(crate::pipe::Secret::new(
+                        password.clone().into_bytes(),
+                    )));
                 }
                 Applied::Other(FromViewer::Failed(why)) => panic!("{why}"),
                 Applied::Other(_) => {}

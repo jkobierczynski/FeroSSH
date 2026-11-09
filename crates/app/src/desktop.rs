@@ -25,7 +25,9 @@ use ferossh_render::{Image, fit};
 use ferossh_viewer::framebuffer::{Applied, Framebuffer};
 use ferossh_viewer::keysym;
 pub use ferossh_viewer::pipe::Protocol;
-use ferossh_viewer::pipe::{FromViewer, MAX_NET, ToViewer, read_frame, write_frame};
+use ferossh_viewer::pipe::{
+    FromViewer, MAX_NET, Secret, ToViewer, encode_wiped, read_frame, write_frame,
+};
 use zeroize::Zeroizing;
 
 /// The most bytes from the server queued for the viewer at once.
@@ -103,7 +105,6 @@ pub enum Update {
 }
 
 /// Where the session stands.
-#[derive(Debug)]
 enum Phase {
     Connecting,
     /// Asking for the user name (RDP), with what was typed so far.
@@ -113,6 +114,19 @@ enum Phase {
     Ended,
 }
 
+/// Names the phase only: never what was typed at a prompt.
+impl std::fmt::Debug for Phase {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Phase::Connecting => "Connecting",
+            Phase::User(_) => "User",
+            Phase::Password(_) => "Password",
+            Phase::Running => "Running",
+            Phase::Ended => "Ended",
+        })
+    }
+}
+
 enum FromThreads {
     Viewer(FromViewer),
     Ended(String),
@@ -120,7 +134,7 @@ enum FromThreads {
 
 /// What to open: the protocol, the screen size to ask an RDP server
 /// for, the Windows keyboard layout id, and the user name to offer.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct Session {
     pub protocol: Protocol,
     pub width: u16,
@@ -137,6 +151,22 @@ pub struct Session {
     /// The most the connection allows, which later changes of the global
     /// setting stay within.
     pub clipboard_limit: (bool, bool),
+}
+
+/// Everything but the password.
+impl std::fmt::Debug for Session {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Session")
+            .field("protocol", &self.protocol)
+            .field("size", &(self.width, self.height))
+            .field("layout", &self.layout)
+            .field("user", &self.user)
+            .field("password", &self.password.as_ref().map(|_| ".."))
+            .field("fixed", &self.fixed)
+            .field("clipboard", &self.clipboard)
+            .field("clipboard_limit", &self.clipboard_limit)
+            .finish()
+    }
 }
 
 /// One remote desktop session.
@@ -228,7 +258,7 @@ impl Desktop {
                         ToViewer::Net(b) => b.len(),
                         _ => 0,
                     };
-                    let failed = write_frame(&mut pipe, &msg.encode()).is_err();
+                    let failed = write_frame(&mut pipe, &encode_wiped(&msg)).is_err();
                     written.give(net);
                     if failed {
                         let _ =
@@ -382,7 +412,7 @@ impl Desktop {
                 Ok(Applied::Other(FromViewer::NeedPassword)) => match self.protocol {
                     Protocol::Vnc if self.preset.is_some() => {
                         if let Some(pw) = self.preset.take() {
-                            self.send(ToViewer::Password(pw.as_bytes().to_vec()));
+                            self.send(ToViewer::Password(Secret::new(pw.as_bytes().to_vec())));
                         }
                     }
                     Protocol::Vnc => {
@@ -491,9 +521,9 @@ impl Desktop {
             Phase::Password(typed) => {
                 match c {
                     _ if enter => {
-                        let password = Zeroizing::new(typed.as_bytes().to_vec());
+                        let password = Secret::new(typed.as_bytes().to_vec());
                         self.phase = Phase::Connecting;
-                        self.send(ToViewer::Password(password.to_vec()));
+                        self.send(ToViewer::Password(password));
                         return Some("\r\n".into());
                     }
                     '\u{8}' => {
