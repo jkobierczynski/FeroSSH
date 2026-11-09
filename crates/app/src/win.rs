@@ -863,6 +863,9 @@ struct Window {
     passwords: Arc<std::sync::Mutex<Vec<PasswordAnswer>>>,
     /// Desktop sessions waiting for their SSH pane to log in.
     pending_desktops: HashMap<PaneId, PendingDesktop>,
+    /// VNC connections on another machine than their SSH server that the
+    /// user agreed to open unencrypted past it, until FeroSSH quits.
+    plain_vnc_ok: HashSet<String>,
     /// Window > Broadcast input: which panes also get what is typed.
     broadcast: broadcast::Scope,
     /// The update check running in the background, if any, and whether
@@ -1575,6 +1578,7 @@ fn create_and_run(launch: Launch, theme: Option<String>) -> Result<()> {
                 mstsc: Vec::new(),
                 passwords: Arc::default(),
                 pending_desktops: HashMap::new(),
+                plain_vnc_ok: HashSet::new(),
                 broadcast: broadcast::Scope::Off,
                 update: None,
                 scripts: HashMap::new(),
@@ -4090,6 +4094,10 @@ impl Window {
                     }
                     DesktopUpdate::Ask(prompt) => {
                         self.show(id, &prompt);
+                        self.refresh(id);
+                    }
+                    DesktopUpdate::Note(note) => {
+                        self.show(id, &format!("\x1b[0;33m{note}\x1b[0m\r\n"));
                         self.refresh(id);
                     }
                     DesktopUpdate::Clipboard(text) => {
@@ -8779,6 +8787,19 @@ impl Window {
         }
         // Without a host of its own, the desktop is on the SSH host.
         let host = cfg.hostname.unwrap_or_else(|| "localhost".to_owned());
+        // VNC to another machine is plain past the SSH server: ask first.
+        if kind == SessionKind::Vnc
+            && !crate::forwards::on_ssh_host(&host)
+            && !self.plain_vnc_ok.contains(&name.to_ascii_lowercase())
+        {
+            self.queued.push(Command::ApprovePlainVnc {
+                name: name.to_owned(),
+                target: host,
+                via,
+                split,
+            });
+            return;
+        }
         let pending = PendingDesktop {
             label: name.to_owned(),
             host,
@@ -11825,6 +11846,14 @@ enum Command {
         pane: PaneId,
         line: String,
     },
+    /// Ask before opening VNC connection `name`, whose desktop `target`
+    /// is another machine than its SSH server `via`.
+    ApprovePlainVnc {
+        name: String,
+        target: String,
+        via: String,
+        split: bool,
+    },
     /// Ask before running a host's `ProxyCommand` for the first time.
     ApproveProxy {
         pane: PaneId,
@@ -12795,6 +12824,30 @@ fn run_command(hwnd: HWND, command: Command) {
                     w.password_result(pane, Err("The password command was not run.".into()), "");
                 }
             });
+        }
+        Command::ApprovePlainVnc {
+            name,
+            target,
+            via,
+            split,
+        } => {
+            let clean = |s: &str| -> String { s.chars().filter(|c| !c.is_control()).collect() };
+            let (name, target, via) = (clean(&name), clean(&target), clean(&via));
+            let text = format!(
+                "The VNC desktop {name} is on {target}, another machine than its SSH server \
+                 {via}.\n\nSSH encrypts only the way to {via}. From there to {target}, VNC \
+                 travels unencrypted: anyone on that network can watch the screen and what you \
+                 type, and VNC's own password is weak. Only open it on a network you trust; \
+                 with SSH on {target}, make that machine the SSH server instead.\n\nOpen it \
+                 anyway? FeroSSH asks again after it restarts."
+            );
+            let yes = dialog(hwnd, &text, MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2) == Some(IDYES);
+            if yes {
+                with_window(|w| {
+                    w.plain_vnc_ok.insert(name.to_ascii_lowercase());
+                    w.open_desktop_session(&name, SessionKind::Vnc, Some(via), split);
+                });
+            }
         }
         Command::ApproveProxy {
             pane,

@@ -131,6 +131,7 @@ fn flush(client: &mut crate::vnc::Client, out: &mut impl Write) -> io::Result<()
             )?,
             Event::Bell => send(out, &FromViewer::Bell)?,
             Event::NeedPassword => send(out, &FromViewer::NeedPassword)?,
+            Event::NoPassword => send(out, &FromViewer::NoPassword)?,
             Event::Failed(why) => send(out, &FromViewer::Failed(why))?,
             Event::Clipboard(text) => send(out, &FromViewer::Clipboard(text))?,
         }
@@ -268,7 +269,10 @@ mod tests {
                 Applied::Drawn => {}
                 Applied::Other(FromViewer::Net(b)) => sent.extend(b),
                 Applied::Other(FromViewer::Failed(why)) => ended = Some(why),
-                Applied::Other(o) => assert!(matches!(o, FromViewer::Name(_)), "{o:?}"),
+                Applied::Other(o) => assert!(
+                    matches!(o, FromViewer::Name(_) | FromViewer::NoPassword),
+                    "{o:?}"
+                ),
             }
         }
         assert!(stripes > 1);

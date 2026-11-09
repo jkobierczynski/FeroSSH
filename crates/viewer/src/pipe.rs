@@ -116,6 +116,8 @@ pub enum FromViewer {
     Failed(String),
     /// Text copied on the remote desktop.
     Clipboard(String),
+    /// The VNC server let the viewer in without a password.
+    NoPassword,
 }
 
 /// Writes one frame.
@@ -437,6 +439,7 @@ impl FromViewer {
                 v.push(9);
                 v.extend(clip_bytes(text));
             }
+            FromViewer::NoPassword => v.push(10),
         }
         v
     }
@@ -487,6 +490,7 @@ impl FromViewer {
             7 => FromViewer::NeedPassword,
             8 => FromViewer::Failed(f.text()?),
             9 => FromViewer::Clipboard(f.clip()?),
+            10 => FromViewer::NoPassword,
             _ => return None,
         };
         f.end()?;
@@ -562,6 +566,7 @@ mod tests {
             },
             FromViewer::Bell,
             FromViewer::NeedPassword,
+            FromViewer::NoPassword,
             FromViewer::Failed("no".into()),
             FromViewer::Clipboard("line\nnext".into()),
         ] {

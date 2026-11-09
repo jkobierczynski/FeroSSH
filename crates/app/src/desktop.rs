@@ -38,6 +38,8 @@ pub enum Update {
     Ended(String),
     /// Text copied on the remote desktop, for this PC's clipboard.
     Clipboard(String),
+    /// Something the user should know about the session, for the pane.
+    Note(String),
 }
 
 /// Where the session stands.
@@ -292,6 +294,11 @@ impl Desktop {
                     out.push(Update::Title(ferossh_term::sanitize_title(&n)));
                 }
                 Ok(Applied::Other(FromViewer::Bell)) => out.push(Update::Bell),
+                Ok(Applied::Other(FromViewer::NoPassword)) => out.push(Update::Note(
+                    "This VNC server asks for no password: anyone who can reach its port \
+                     can see and control this desktop."
+                        .into(),
+                )),
                 // The window decides, whatever the viewer does.
                 Ok(Applied::Other(FromViewer::Clipboard(text))) if self.clip.1 => {
                     let plain = text.replace("\r\n", "\n");

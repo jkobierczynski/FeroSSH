@@ -52,7 +52,6 @@ const DESKTOP_PORTS: std::ops::RangeInclusive<u16> = 33900..=33999;
 /// then does the SSH host key, already checked, also identify the
 /// desktop server. Any other host is reached unencrypted from the SSH
 /// server, as whoever answers there.
-#[cfg_attr(not(feature = "viewer"), allow(dead_code))]
 pub fn on_ssh_host(host: &str) -> bool {
     let host = host.trim_start_matches('[').trim_end_matches(']');
     host.eq_ignore_ascii_case("localhost")
