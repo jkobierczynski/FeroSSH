@@ -547,10 +547,10 @@ mod tests {
     #[test]
     fn passwords_are_never_shown_and_frames_are_wiped() {
         let msg = ToViewer::Password(Secret::new(b"hunter2".to_vec()));
-        let shown = format!("{msg:?}");
-        assert!(!shown.contains("hunter2"), "{shown}");
+        // Neither assert prints the message: a failure must not show it.
+        assert!(!format!("{msg:?}").contains("hunter2"));
         let frame = encode_wiped(&msg);
-        assert_eq!(decode_wiped(frame.to_vec()), Some(msg));
+        assert!(decode_wiped(frame.to_vec()) == Some(msg));
         // Other messages decode as before.
         let other = ToViewer::User("me".into());
         assert_eq!(decode_wiped(other.encode()), Some(other));
