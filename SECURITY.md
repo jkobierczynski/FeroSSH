@@ -81,6 +81,12 @@ tmux control mode, VNC and RDP, key files, sign requests, `ssh_config`,
 `known_hosts` and session imports) are fuzzed: briefly on every pull
 request, and for half an hour per parser every night.
 
+## Past reviews
+
+- [9 November 2026](docs/security/2026-11-09-triage.md): an AI-generated
+  review of the RDP and VNC viewer, desktop IPC and password handling.
+  What we found, and the fixes (PRs #126 to #131).
+
 ## Known limits
 
 - `--no-sandbox` runs the worker as a normal process, without the
