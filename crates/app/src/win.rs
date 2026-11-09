@@ -161,6 +161,9 @@ const MARK_MIN_DIP: i32 = 12;
 const CHROME_PADDING_DIP: i32 = 3;
 /// Extra pixels either side of a divider that still grab it, in DIPs.
 const GRAB_DIP: i32 = 3;
+/// How far either side of the tools pane's edge a drag can start; wider
+/// than a divider's, as the edge is a long target used often.
+const EDGE_GRAB_DIP: i32 = 8;
 /// The side pane's width when first shown, in chrome cells.
 const SIDE_COLS: i32 = 34;
 /// The side pane font size.
@@ -2111,10 +2114,6 @@ fn pixel(r: Rect) -> PixelRect {
 }
 
 /// `r` grown by `by` pixels on every side.
-fn inflate(r: Rect, by: i32) -> Rect {
-    Rect::new(r.x - by, r.y - by, r.w + 2 * by, r.h + 2 * by)
-}
-
 fn mix(a: Rgb, b: Rgb, amount: f32) -> Rgb {
     let m = |x: u8, y: u8| (f32::from(x) * (1.0 - amount) + f32::from(y) * amount).round() as u8;
     Rgb::new(m(a.r, b.r), m(a.g, b.g), m(a.b, b.b))
@@ -6799,6 +6798,8 @@ impl Window {
         self.client = (w, h);
         self.renderer.resize(w.max(1) as u32, h.max(1) as u32);
         self.areas = self.compute_areas();
+        // The panels let the mouse through to the edge's strip.
+        crate::native::set_edge_grab(self.hwnd, self.edge_grab());
         let cpad = scale(CHROME_PADDING_DIP, self.dpi);
         let cm = self.chrome_metrics;
         let cells = |r: Rect| {
@@ -9535,11 +9536,18 @@ impl Window {
         }
     }
 
+    /// The strip around the tools pane's edge where a drag starts.
+    fn edge_grab(&self) -> Option<Rect> {
+        let e = self.areas.side_edge?;
+        let by = scale(EDGE_GRAB_DIP, self.dpi);
+        Some(Rect::new(e.x - by, e.y, e.w + 2 * by, e.h))
+    }
+
     /// Where a client point falls.
     fn spot(&self, x: i32, y: i32) -> Spot {
         let grab = scale(GRAB_DIP, self.dpi);
-        if let Some(e) = self.areas.side_edge
-            && inflate(e, grab).contains(x, y)
+        if let Some(e) = self.edge_grab()
+            && e.contains(x, y)
         {
             return Spot::SideEdge;
         }
