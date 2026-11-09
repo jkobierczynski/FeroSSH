@@ -39,6 +39,10 @@ pub(crate) struct ChannelGuard {
     drdynvc: Option<u16>,
     /// Static channels in the middle of a chunked message.
     open: HashSet<u16>,
+    /// The start of the DRDYNVC message being reassembled, while it is
+    /// still too short to tell whether it is a DataFirst and what length
+    /// it announces: a server may split even that header over chunks.
+    dyn_head: Option<Vec<u8>>,
 }
 
 impl ChannelGuard {
@@ -47,6 +51,7 @@ impl ChannelGuard {
             io_channel,
             drdynvc,
             open: HashSet::new(),
+            dyn_head: None,
         }
     }
 
@@ -72,6 +77,7 @@ impl ChannelGuard {
         };
         if flags & PACKET_COMPRESSED != 0 {
             self.open.remove(&channel);
+            self.dyn_head = None;
             return Err(
                 "The RDP server sent compressed channel data, which the viewer did not ask for."
                     .into(),
@@ -79,6 +85,7 @@ impl ChannelGuard {
         }
         if length > MAX_STATIC_MESSAGE {
             self.open.remove(&channel);
+            self.dyn_head = None;
             return Err(format!(
                 "The RDP server announced a {length}-byte channel message; the viewer takes at \
                  most {MAX_STATIC_MESSAGE}."
@@ -86,29 +93,64 @@ impl ChannelGuard {
         }
         let first = flags & FLAG_FIRST != 0;
         let last = flags & FLAG_LAST != 0;
-        // A message starts here: with FLAG_FIRST, or (as IronRDP takes
-        // it) a chunk with neither flag outside a chunked message.
-        let starts = first || (!last && !self.open.contains(&channel));
+        // A chunk with neither flag outside a chunked message is, as
+        // IronRDP takes it, a whole message.
+        let whole = !first && !last && !self.open.contains(&channel);
+        let starts = first || whole;
+        let ends = last || whole;
         if first && !last {
             self.open.insert(channel);
         } else if last {
             self.open.remove(&channel);
         }
-        if starts && Some(channel) == self.drdynvc {
-            check_dynamic(data.get(8..).unwrap_or_default())?;
+        if Some(channel) == self.drdynvc {
+            let body = data.get(8..).unwrap_or_default();
+            if starts {
+                self.dyn_head = Some(Vec::new());
+            }
+            if let Some(head) = &mut self.dyn_head {
+                let room = MAX_DYNAMIC_HEADER.saturating_sub(head.len());
+                head.extend_from_slice(body.get(..room.min(body.len())).unwrap_or_default());
+                match check_dynamic(head) {
+                    Header::Partial if !ends => {}
+                    // A message that ends inside its header is IronRDP's
+                    // to reject.
+                    Header::Partial | Header::Fine => self.dyn_head = None,
+                    Header::TooLong(why) => {
+                        self.dyn_head = None;
+                        return Err(why);
+                    }
+                }
+            }
         }
         Ok(())
     }
 }
 
-/// Checks the length a DRDYNVC DataFirst PDU announces.
-fn check_dynamic(pdu: &[u8]) -> Result<(), String> {
+/// The most bytes a DRDYNVC header takes: the command byte, then a
+/// ChannelId and a Length of up to four bytes each.
+const MAX_DYNAMIC_HEADER: usize = 9;
+
+/// What the start of a DRDYNVC message says so far.
+#[derive(Debug, PartialEq, Eq)]
+enum Header {
+    /// Too short to tell yet.
+    Partial,
+    /// Not a DataFirst, or one within the cap.
+    Fine,
+    /// A DataFirst announcing more than the cap.
+    TooLong(String),
+}
+
+/// Checks the length a DRDYNVC DataFirst PDU announces, from as much of
+/// its start as has arrived.
+fn check_dynamic(pdu: &[u8]) -> Header {
     let Some(&head) = pdu.first() else {
-        return Ok(());
+        return Header::Partial;
     };
     let cmd = head >> 4;
     if cmd != DATA_FIRST && cmd != DATA_FIRST_COMPRESSED {
-        return Ok(());
+        return Header::Fine;
     }
     let id_len = field_len(head & 0b11);
     let len_len = field_len((head >> 2) & 0b11);
@@ -116,16 +158,15 @@ fn check_dynamic(pdu: &[u8]) -> Result<(), String> {
         .get(1 + id_len..1 + id_len + len_len)
         .map(|b| b.iter().rev().fold(0u32, |n, &x| n << 8 | u32::from(x)))
     else {
-        // Too short: IronRDP rejects it.
-        return Ok(());
+        return Header::Partial;
     };
     if length > MAX_DYNAMIC_MESSAGE {
-        return Err(format!(
+        return Header::TooLong(format!(
             "The RDP server announced a {length}-byte dynamic channel message; the viewer takes \
              at most {MAX_DYNAMIC_MESSAGE}."
         ));
     }
-    Ok(())
+    Header::Fine
 }
 
 /// The size of a DRDYNVC ChannelId or Length field from its two bits.
@@ -231,5 +272,104 @@ mod tests {
         g.check_chunk(CLIP, &[1, 2]).unwrap();
         g.check_chunk(DRDYNVC, &chunk(1, FLAG_FIRST | FLAG_LAST, &[]))
             .unwrap();
+    }
+
+    #[test]
+    fn dynamic_headers_split_over_chunks_are_checked() {
+        // DataFirst, 4-byte id, 4-byte length: a 9-byte header.
+        let mut df = vec![0x2a, 1, 0, 0, 0];
+        df.extend((MAX_DYNAMIC_MESSAGE + 1).to_le_bytes());
+        df.extend([0; 7]);
+        let total = u32::try_from(df.len()).unwrap();
+        // Split the message after every byte of the header.
+        for cut in 0..=MAX_DYNAMIC_HEADER {
+            let mut g = guard();
+            let first = g.check_chunk(DRDYNVC, &chunk(total, FLAG_FIRST, &df[..cut]));
+            let rest =
+                first.and_then(|()| g.check_chunk(DRDYNVC, &chunk(total, FLAG_LAST, &df[cut..])));
+            assert!(rest.is_err(), "cut at {cut}");
+        }
+        // One byte a chunk, with flagless chunks in the middle.
+        let mut g = guard();
+        let mut res = Ok(());
+        for (i, b) in df.iter().enumerate() {
+            let flags = match i {
+                0 => FLAG_FIRST,
+                i if i == df.len() - 1 => FLAG_LAST,
+                _ => 0,
+            };
+            res = g.check_chunk(DRDYNVC, &chunk(total, flags, &[*b]));
+            if res.is_err() {
+                break;
+            }
+        }
+        assert!(res.is_err());
+        // A small DataFirst split the same way passes, and so does the
+        // next message.
+        let mut ok = vec![0x2a, 1, 0, 0, 0];
+        ok.extend(16u32.to_le_bytes());
+        let mut g = guard();
+        g.check_chunk(DRDYNVC, &chunk(9, FLAG_FIRST, &ok[..3]))
+            .unwrap();
+        g.check_chunk(DRDYNVC, &chunk(9, FLAG_LAST, &ok[3..]))
+            .unwrap();
+        g.check_chunk(DRDYNVC, &chunk(3, FLAG_FIRST | FLAG_LAST, &[0x30, 7, 9]))
+            .unwrap();
+        // A header cut short by the end of its message is left to IronRDP,
+        // and does not carry over into the next message.
+        let mut g = guard();
+        g.check_chunk(DRDYNVC, &chunk(2, FLAG_FIRST | FLAG_LAST, &[0x2a, 1]))
+            .unwrap();
+        g.check_chunk(DRDYNVC, &chunk(3, 0, &[0x30, 7, 9])).unwrap();
+        g.check_chunk(DRDYNVC, &chunk(3, 0, &[0, 0, 0])).unwrap();
+    }
+
+    /// The chunks of a split DataFirst, as IronRDP itself reassembles
+    /// them: the guard must stop what IronRDP would accept.
+    #[test]
+    fn split_headers_ironrdp_would_reassemble_are_stopped() {
+        use ironrdp_pdu::gcc::ChannelName;
+        use ironrdp_svc::{StaticVirtualChannel, SvcMessage, SvcProcessor};
+
+        /// Keeps the message IronRDP hands to the channel.
+        #[derive(Debug, Default)]
+        struct Seen(Option<Vec<u8>>);
+        ironrdp_svc::impl_as_any!(Seen);
+        impl SvcProcessor for Seen {
+            fn channel_name(&self) -> ChannelName {
+                ChannelName::from_static(b"drdynvc\0")
+            }
+            fn process(&mut self, payload: &[u8]) -> ironrdp_pdu::PduResult<Vec<SvcMessage>> {
+                self.0 = Some(payload.to_vec());
+                Ok(Vec::new())
+            }
+        }
+
+        let mut df = vec![0x2a, 1, 0, 0, 0];
+        df.extend(u32::MAX.to_le_bytes());
+        df.extend([0; 3]);
+        let total = u32::try_from(df.len()).unwrap();
+        let pieces = [
+            chunk(total, FLAG_FIRST, &df[..1]),
+            chunk(total, 0, &df[1..6]),
+            chunk(total, FLAG_LAST, &df[6..]),
+        ];
+        let mut ironrdp = StaticVirtualChannel::new(Seen::default());
+        for p in &pieces {
+            ironrdp.process(p).unwrap();
+        }
+        let seen = ironrdp.channel_processor_downcast_ref::<Seen>().unwrap();
+        assert_eq!(
+            seen.0.as_deref(),
+            Some(&df[..]),
+            "IronRDP takes the split header"
+        );
+        let mut g = guard();
+        assert!(
+            pieces
+                .iter()
+                .try_for_each(|p| g.check_chunk(DRDYNVC, p))
+                .is_err()
+        );
     }
 }
