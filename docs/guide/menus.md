@@ -177,10 +177,15 @@ The buttons at the bottom do the same, and a saved connection has a Delete butto
 
 | Key | Action |
 | --- | --- |
-| Typing | Filters by host, title or kind (SSH, Telnet, serial, tmux, desktop, local). |
-| Enter or double-click | Goes to the session's tab and pane. A hidden snippet-run session, or the login of a desktop or remote app connection, is shown in a tab. |
+| Typing | Goes to the search box and filters by host, name, title or kind (SSH, Telnet, serial, tmux, desktop, local). |
+| Down (in the search box) | Moves into the list. |
+| Tab | Moves between the search box, the list and the buttons. |
+| Enter or double-click | Goes to the session's tab and pane (from the search box, the first one listed). A hidden snippet-run session, or the login of a desktop or remote app connection, is shown in a tab. |
+| F2 | Renames the session in place: Enter keeps the name, Esc drops it, an empty name clears it. |
 | Del | Closes the session, after asking when it is live. |
-| Esc | Clears the filter, then leaves. |
+| Esc | Clears the search, then leaves. |
+
+The Show, Rename and Close buttons below the list do the same.
 
 ### File transfer (Ctrl+Shift+E)
 

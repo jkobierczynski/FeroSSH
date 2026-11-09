@@ -466,6 +466,75 @@ impl LiveView {
     }
 }
 
+/// A session as the native list view shows it: one row, in columns.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LiveRow {
+    pub pane: PaneId,
+    /// The name, or the target.
+    pub label: String,
+    pub kind: &'static str,
+    pub tab: String,
+    pub state: &'static str,
+    /// The target when the session has a name, the notes and the title.
+    pub details: String,
+    /// The window's focused pane.
+    pub focused: bool,
+}
+
+impl LiveView {
+    /// Sets the filter (from the native search box), at most 60
+    /// characters.
+    pub fn set_query(&mut self, query: &str) {
+        let query: String = query.chars().take(60).collect();
+        if query != self.query {
+            self.query = query;
+            self.pane = None;
+            self.at = 0;
+            self.scroll = 0;
+        }
+    }
+
+    /// Ends the typing of a name without changing it.
+    pub fn cancel_rename(&mut self) {
+        self.rename = None;
+    }
+
+    /// The session whose name is being typed (to start the native list's
+    /// in-place edit on it).
+    pub fn renaming_pane(&self) -> Option<PaneId> {
+        self.rename.as_ref().map(|r| r.pane)
+    }
+
+    /// The sessions that match the filter, as native list rows.
+    pub fn rows(&self, all: &[LiveSession]) -> Vec<LiveRow> {
+        self.shown(all)
+            .into_iter()
+            .map(|s| {
+                let mut details: Vec<String> = Vec::new();
+                if s.name.is_some() {
+                    details.push(s.target.clone());
+                }
+                details.extend(s.notes.iter().map(|n| (*n).to_owned()));
+                if let Some(t) = s.title.as_deref().filter(|t| *t != s.target) {
+                    details.push(t.to_owned());
+                }
+                LiveRow {
+                    pane: s.pane,
+                    label: s.name.clone().unwrap_or_else(|| s.target.clone()),
+                    kind: s.kind.name(),
+                    tab: match s.tab {
+                        Some(i) => (i + 1).to_string(),
+                        None => "-".to_owned(),
+                    },
+                    state: s.state.name(),
+                    details: details.join(" \u{b7} "),
+                    focused: s.focused,
+                }
+            })
+            .collect()
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::indexing_slicing)]
 mod tests {
@@ -499,6 +568,36 @@ mod tests {
             com,
             session(4, None, "me@core", LiveState::Ended),
         ]
+    }
+
+    #[test]
+    fn native_rows_follow_the_filter_and_show_names() {
+        let mut all = sample();
+        all[0].name = Some("Web front".into());
+        let mut v = LiveView::default();
+        let rows = v.rows(&all);
+        assert_eq!(rows.len(), all.len());
+        assert_eq!(rows[0].label, "Web front");
+        assert_eq!(rows[0].details, "me@web");
+        assert_eq!(rows[0].tab, "1");
+        assert_eq!(rows[1].details, "tmux \u{b7} vim");
+        assert_eq!(rows[1].state, "connecting");
+        assert_eq!(rows[3].tab, "-");
+        assert!(rows[2].focused);
+        v.set_query("db");
+        let rows = v.rows(&all);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].pane, 2);
+    }
+
+    #[test]
+    fn native_rename_can_be_cancelled() {
+        let all = sample();
+        let mut v = LiveView::default();
+        v.start_rename(2, &all, 20);
+        assert_eq!(v.renaming_pane(), Some(2));
+        v.cancel_rename();
+        assert!(!v.renaming());
     }
 
     fn texts(v: &mut LiveView, all: &[LiveSession], rows: usize) -> Vec<String> {
