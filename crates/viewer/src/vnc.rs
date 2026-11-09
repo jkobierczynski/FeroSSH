@@ -76,6 +76,8 @@ pub enum Event {
     Bell,
     /// The server wants the VNC password: call [`Client::password`].
     NeedPassword,
+    /// The server lets anyone in without a password (security type None).
+    NoPassword,
     /// The session is over.
     Failed(String),
     /// Text copied on the remote desktop (ServerCutText), when the rules
@@ -541,7 +543,10 @@ impl Client {
                 };
                 self.state = match kind {
                     0 => State::Reason("The VNC server refused the connection"),
-                    1 => self.client_init(),
+                    1 => {
+                        self.events.push(Event::NoPassword);
+                        self.client_init()
+                    }
                     2 => State::Challenge(Version::V3),
                     k => {
                         return Step::Fail(format!(
@@ -565,16 +570,19 @@ impl Client {
                     self.state = state;
                     return Step::More;
                 };
-                if types.contains(&1) {
+                // A password where the server takes one, even if it would
+                // also let us in without.
+                if types.contains(&2) {
+                    self.output.push(2);
+                    self.state = State::Challenge(v);
+                } else if types.contains(&1) {
                     self.output.push(1);
+                    self.events.push(Event::NoPassword);
                     self.state = if v == Version::V8 {
                         State::SecurityResult(v)
                     } else {
                         self.client_init()
                     };
-                } else if types.contains(&2) {
-                    self.output.push(2);
-                    self.state = State::Challenge(v);
                 } else {
                     let list: Vec<String> = types.iter().map(|t| security_name(*t)).collect();
                     return Step::Fail(format!(
@@ -1131,8 +1139,9 @@ mod tests {
         let mut c = Client::new();
         c.feed(b"RFB 003.008\n");
         assert_eq!(c.take_output(), b"RFB 003.008\n");
-        c.feed(&[2, 2, 1]);
+        c.feed(&[1, 1]);
         assert_eq!(c.take_output(), [1]);
+        assert_eq!(c.take_events(), [Event::NoPassword]);
         c.feed(&0u32.to_be_bytes());
         assert_eq!(c.take_output(), [1], "ClientInit, shared");
         c.feed(&server_init(w, h));
@@ -1207,6 +1216,27 @@ mod tests {
         assert_eq!(c.take_output(), [1]);
         c.feed(&server_init(4, 4));
         assert_eq!(c.size(), (4, 4));
+    }
+
+    #[test]
+    fn a_password_is_preferred_and_none_is_reported() {
+        // Both offered, in either order: VNC authentication.
+        for types in [[1u8, 2], [2, 1]] {
+            let mut c = Client::new();
+            c.feed(b"RFB 003.008\n");
+            c.take_output();
+            c.feed(&[2]);
+            c.feed(&types);
+            assert_eq!(c.take_output(), [2], "{types:?}");
+            assert!(c.take_events().is_empty());
+        }
+        // Only None: taken, and said.
+        let mut c = Client::new();
+        c.feed(b"RFB 003.008\n");
+        c.take_output();
+        c.feed(&[1, 1]);
+        assert_eq!(c.take_output(), [1]);
+        assert_eq!(c.take_events(), [Event::NoPassword]);
     }
 
     #[test]

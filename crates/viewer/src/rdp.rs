@@ -9,7 +9,11 @@
 //! tunnel ends on the server itself, whose SSH host key FeroSSH already
 //! checked, and xrdp and Windows use self-signed certificates anyway. TLS
 //! still verifies that the server holds the certificate's key, and NLA
-//! binds the login to that key.
+//! binds the login to that key. That holds only for a desktop on the SSH
+//! server (`localhost` or a loopback address there), so the window opens
+//! this viewer for no other RDP host (`forwards::on_ssh_host`); a desktop
+//! on another machine behind the SSH server goes to Remote Desktop
+//! Connection, which checks and remembers its certificate.
 //!
 //! Keys go to the server as scan codes, read with the keyboard layout the
 //! window reports, so the server types what the PC's keyboard shows.
@@ -52,8 +56,13 @@ use rustls::pki_types;
 use zeroize::Zeroizing;
 
 use crate::pipe::{FromViewer, MAX_CLIP, MAX_NET, ToViewer, clip_text, read_frame};
+use crate::rdp_guard::ChannelGuard;
 use crate::viewer::{send, send_pixels};
 use crate::{MAX_PIXELS, MAX_SIDE};
+
+/// Messages from the window read ahead of the session: each `Net` is at
+/// most [`MAX_NET`], so at most 64 MiB.
+const INPUT_BACKLOG: usize = 64;
 
 /// What the window's reader thread passes on.
 enum Item {
@@ -138,13 +147,15 @@ pub(crate) fn session(
     layout: u32,
     user: String,
 ) -> io::Result<()> {
-    let (tx, from) = mpsc::channel();
+    // Bounded, so a session that falls behind stops reading the pipe and
+    // the window holds the server back (its queue has a byte budget).
+    let (tx, from) = mpsc::sync_channel(INPUT_BACKLOG);
     std::thread::Builder::new()
         .name("viewer-input".into())
         .spawn(move || {
             loop {
                 let item = match read_frame(&mut input) {
-                    Ok(Some(f)) => ToViewer::decode(&f).map_or(Item::Bad, Item::Msg),
+                    Ok(Some(f)) => crate::pipe::decode_wiped(f).map_or(Item::Bad, Item::Msg),
                     Ok(None) | Err(_) => Item::End,
                 };
                 let last = !matches!(item, Item::Msg(_));
@@ -170,8 +181,7 @@ pub(crate) fn session(
                 height: h,
             })) => (width, height) = (w, h),
             Ok(Item::Msg(ToViewer::Password(p))) => {
-                let p = Zeroizing::new(p);
-                break Zeroizing::new(String::from_utf8_lossy(&p).into_owned());
+                break Zeroizing::new(String::from_utf8_lossy(p.as_bytes()).into_owned());
             }
             Ok(Item::Msg(ToViewer::Closed)) => {
                 return send(
@@ -514,6 +524,8 @@ struct Active {
     /// The size last asked of the server, not asked again.
     asked: Option<(u16, u16)>,
     clip: Clip,
+    /// Caps what the server's channel data may make IronRDP hold.
+    guard: ChannelGuard,
 }
 
 /// The clipboard as the window allows it.
@@ -615,6 +627,10 @@ impl Active {
             );
         }
         let (w, h) = checked_size(r.desktop_size)?;
+        let guard = ChannelGuard::new(
+            r.io_channel_id,
+            r.static_channels.get_channel_id_by_type::<DrdynvcClient>(),
+        );
         let stage = ActiveStageBuilder {
             static_channels: r.static_channels,
             user_channel_id: r.user_channel_id,
@@ -636,6 +652,7 @@ impl Active {
             want: None,
             asked: Some((w, h)),
             clip,
+            guard,
         })
     }
 
@@ -656,6 +673,9 @@ impl Active {
             pipe(framed).interruptible = false;
             match read {
                 Ok((action, payload)) => {
+                    if action == ironrdp_pdu::Action::X224 {
+                        self.guard.check(&payload)?;
+                    }
                     let at = framed.last_read_at();
                     let outputs = self
                         .stage
@@ -1096,6 +1116,7 @@ pub fn fuzz_server_pdus(data: &[u8]) {
             from_host: true,
             local: Some("text from the PC".into()),
         },
+        guard: ChannelGuard::new(io, None),
     };
     let mut fb = Framebuffer::default();
     let _ = fb.apply(FromViewer::Size {
@@ -1108,6 +1129,9 @@ pub fn fuzz_server_pdus(data: &[u8]) {
             return;
         };
         rest = next;
+        if info.action == ironrdp_pdu::Action::X224 && active.guard.check(pdu).is_err() {
+            continue;
+        }
         let Ok(outputs) = active
             .stage
             .process(&mut active.image, info.action, pdu, None)
@@ -1212,7 +1236,9 @@ mod tests {
                 Applied::Other(FromViewer::Net(b)) => tcp_out.write_all(&b).unwrap(),
                 Applied::Other(FromViewer::NeedPassword) => {
                     tell(ToViewer::User(user.clone()));
-                    tell(ToViewer::Password(password.clone().into_bytes()));
+                    tell(ToViewer::Password(crate::pipe::Secret::new(
+                        password.clone().into_bytes(),
+                    )));
                 }
                 Applied::Other(FromViewer::Failed(why)) => panic!("{why}"),
                 Applied::Other(_) => {}

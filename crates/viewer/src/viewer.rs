@@ -46,7 +46,7 @@ pub(crate) fn next(input: &mut impl Read, output: &mut impl Write) -> io::Result
     let Some(frame) = read_frame(input)? else {
         return Ok(None);
     };
-    match ToViewer::decode(&frame) {
+    match crate::pipe::decode_wiped(frame) {
         Some(m) => Ok(Some(m)),
         None => {
             send(
@@ -131,6 +131,7 @@ fn flush(client: &mut crate::vnc::Client, out: &mut impl Write) -> io::Result<()
             )?,
             Event::Bell => send(out, &FromViewer::Bell)?,
             Event::NeedPassword => send(out, &FromViewer::NeedPassword)?,
+            Event::NoPassword => send(out, &FromViewer::NoPassword)?,
             Event::Failed(why) => send(out, &FromViewer::Failed(why))?,
             Event::Clipboard(text) => send(out, &FromViewer::Clipboard(text))?,
         }
@@ -176,10 +177,7 @@ fn vnc_session(
                 }
             }
             ToViewer::Pointer { buttons, x, y } => client.pointer(buttons, x, y),
-            ToViewer::Password(p) => {
-                let p = zeroize::Zeroizing::new(p);
-                client.password(&p);
-            }
+            ToViewer::Password(p) => client.password(p.as_bytes()),
             ToViewer::Release => {
                 for (down, keysym) in keyboard.release_all() {
                     client.key(down, keysym);
@@ -268,7 +266,10 @@ mod tests {
                 Applied::Drawn => {}
                 Applied::Other(FromViewer::Net(b)) => sent.extend(b),
                 Applied::Other(FromViewer::Failed(why)) => ended = Some(why),
-                Applied::Other(o) => assert!(matches!(o, FromViewer::Name(_)), "{o:?}"),
+                Applied::Other(o) => assert!(
+                    matches!(o, FromViewer::Name(_) | FromViewer::NoPassword),
+                    "{o:?}"
+                ),
             }
         }
         assert!(stripes > 1);

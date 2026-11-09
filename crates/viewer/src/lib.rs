@@ -32,6 +32,8 @@ pub mod keysym;
 pub mod pipe;
 #[cfg(feature = "rdp")]
 pub mod rdp;
+#[cfg(feature = "rdp")]
+mod rdp_guard;
 pub mod viewer;
 #[cfg(feature = "vnc")]
 pub mod vnc;

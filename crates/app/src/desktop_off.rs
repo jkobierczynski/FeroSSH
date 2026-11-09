@@ -26,6 +26,7 @@ pub enum Update {
     Ask(String),
     Ended(String),
     Clipboard(String),
+    Note(String),
 }
 
 impl Desktop {

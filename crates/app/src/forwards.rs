@@ -47,6 +47,19 @@ const LISTED_STREAMS: usize = 8;
 /// port in use falls back to one the system picks.
 const DESKTOP_PORTS: std::ops::RangeInclusive<u16> = 33900..=33999;
 
+/// Whether a desktop tunnel to `host`, as the SSH server sees it, ends
+/// on the SSH server itself: `localhost` or a loopback address. Only
+/// then does the SSH host key, already checked, also identify the
+/// desktop server. Any other host is reached unencrypted from the SSH
+/// server, as whoever answers there.
+pub fn on_ssh_host(host: &str) -> bool {
+    let host = host.trim_start_matches('[').trim_end_matches(']');
+    host.eq_ignore_ascii_case("localhost")
+        || host
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|ip| ip.is_loopback())
+}
+
 /// The loopback port a remote desktop tunnel for `label` tries first.
 pub fn desktop_port_for(label: &str) -> u16 {
     // FNV-1a: stable across runs and builds, unlike std's hasher.
@@ -1412,6 +1425,30 @@ async fn relay(
 #[allow(clippy::unwrap_used, clippy::indexing_slicing, clippy::panic)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_loopback_desktops_are_on_the_ssh_host() {
+        for host in [
+            "localhost",
+            "LocalHost",
+            "127.0.0.1",
+            "127.1.2.3",
+            "::1",
+            "[::1]",
+        ] {
+            assert!(on_ssh_host(host), "{host}");
+        }
+        for host in [
+            "",
+            "rdp.example",
+            "10.0.0.5",
+            "::ffff:10.0.0.5",
+            "localhost.evil",
+            "0.0.0.0",
+        ] {
+            assert!(!on_ssh_host(host), "{host}");
+        }
+    }
 
     #[test]
     fn removing_a_forward_frees_its_port() {
