@@ -474,13 +474,24 @@ pub fn sanitize(text: &str) -> String {
         match c {
             '\n' => out.push_str("\r\n"),
             '\t' => out.push(c),
-            c if c.is_control() => {}
-            // Bidirectional overrides could disguise the text.
-            '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}' => {}
-            c => out.push(c),
+            c if shown(c) => out.push(c),
+            _ => {}
         }
     }
     out
+}
+
+/// Whether [`sanitize`] keeps a character within a line: no control
+/// characters, and no bidirectional overrides, which could disguise the
+/// text.
+fn shown(c: char) -> bool {
+    !c.is_control() && !matches!(c, '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}')
+}
+
+/// One line of text made safe to show, as [`sanitize`] does but with no
+/// line breaks or tabs: for names put into a dialog.
+pub fn sanitize_line(text: &str) -> String {
+    text.chars().filter(|&c| shown(c)).collect()
 }
 
 fn dim(text: &str) -> String {
@@ -2831,6 +2842,15 @@ mod tests {
             assert!(!closed(&s.on_worker(sign.clone())));
         }
         assert!(closed(&s.on_worker(sign)));
+    }
+
+    #[test]
+    fn sanitizes_one_line() {
+        assert_eq!(
+            sanitize_line("lab\u{202E}cnv\u{2066}\n\t\x1b[1mx\u{2069}"),
+            "labcnv[1mx"
+        );
+        assert_eq!(sanitize_line("vnc.lan"), "vnc.lan");
     }
 
     #[test]
