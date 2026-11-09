@@ -84,6 +84,9 @@ pub struct Values {
     pub copy_agent: Option<bool>,
     /// Remove the copied agent when done: the global setting when unset.
     pub remove_agent: Option<bool>,
+    /// Narrows the remote apps' clipboard: empty, `to-host`, `from-host`
+    /// or `off`.
+    pub clipboard: String,
     pub legacy: bool,
     /// Where the password comes from: see [`PASSWORD_CHOICES`].
     pub password: usize,
@@ -200,6 +203,7 @@ impl Values {
         self.remote_app = p.remote_app.clone().unwrap_or_default();
         self.copy_agent = p.remote_app_copy_agent;
         self.remove_agent = p.remote_app_remove_agent;
+        self.clipboard = p.remote_app_clipboard.clone().unwrap_or_default();
         self.desktop_size = p
             .desktop_size
             .and_then(|d| d.fixed())
@@ -244,6 +248,7 @@ enum Field {
     RemoteApp,
     CopyAgent,
     RemoveAgent,
+    Clipboard,
     Legacy,
     Password,
     PasswordCommand,
@@ -281,6 +286,7 @@ impl Field {
             Field::RemoteApp => "Remote app",
             Field::CopyAgent => "Copy agent",
             Field::RemoveAgent => "Clean up",
+            Field::Clipboard => "Clipboard",
             Field::Legacy => "Old crypto",
             Field::Password => "Password",
             Field::PasswordCommand => "Command",
@@ -302,6 +308,7 @@ impl Field {
                 | Field::Legacy
                 | Field::CopyAgent
                 | Field::RemoveAgent
+                | Field::Clipboard
                 | Field::Password
                 | Field::Framing
                 | Field::Flow
@@ -507,6 +514,7 @@ impl SessionForm {
                             Field::RemoteApp,
                             Field::CopyAgent,
                             Field::RemoveAgent,
+                            Field::Clipboard,
                         ]
                         .map(Item::Field),
                     );
@@ -562,6 +570,7 @@ impl SessionForm {
                         Field::RemoteApp,
                         Field::CopyAgent,
                         Field::RemoveAgent,
+                        Field::Clipboard,
                         Field::Legacy,
                     ]
                     .map(Item::Field),
@@ -651,6 +660,7 @@ impl SessionForm {
             | Field::Legacy
             | Field::CopyAgent
             | Field::RemoveAgent
+            | Field::Clipboard
             | Field::Password
             | Field::Framing
             | Field::Flow => {
@@ -691,6 +701,7 @@ impl SessionForm {
             | Field::Legacy
             | Field::CopyAgent
             | Field::RemoveAgent
+            | Field::Clipboard
             | Field::Password
             | Field::Framing
             | Field::Flow => {
@@ -723,6 +734,13 @@ impl SessionForm {
                 None => "as in Session > Remote apps",
                 Some(true) => "remove the agent when done",
                 Some(false) => "keep the agent",
+            }
+            .to_owned(),
+            Field::Clipboard => match v.clipboard.as_str() {
+                "to-host" => "only Windows to host",
+                "from-host" => "only host to Windows",
+                "off" => "off for this host",
+                _ => "as in Session > Remote apps",
             }
             .to_owned(),
             Field::Framing if v.framing.is_empty() => "8N1".to_owned(),
@@ -817,6 +835,15 @@ impl SessionForm {
             Field::Legacy => v.legacy = !v.legacy,
             Field::CopyAgent => v.copy_agent = tri(v.copy_agent, forward),
             Field::RemoveAgent => v.remove_agent = tri(v.remove_agent, forward),
+            Field::Clipboard => {
+                let all = ["", "to-host", "from-host", "off"];
+                let i = all.iter().position(|c| *c == v.clipboard).unwrap_or(0);
+                v.clipboard = all
+                    .get(step(i, all.len()))
+                    .copied()
+                    .unwrap_or("")
+                    .to_owned();
+            }
             Field::Tmux => v.tmux_on = !v.tmux_on,
             Field::Password => {
                 v.password = step(v.password, PASSWORD_CUSTOM + 1);
@@ -893,6 +920,7 @@ impl SessionForm {
             | Field::Legacy
             | Field::CopyAgent
             | Field::RemoveAgent
+            | Field::Clipboard
             | Field::Password
             | Field::Framing
             | Field::Flow => String::new(),
@@ -1545,6 +1573,7 @@ impl SessionForm {
         p.remote_app = ferossh_config::settings::virtual_desktop(&v.remote_app);
         p.remote_app_copy_agent = v.copy_agent;
         p.remote_app_remove_agent = v.remove_agent;
+        p.remote_app_clipboard = Some(v.clipboard.clone()).filter(|c| !c.is_empty());
         p.desktop_size = ferossh_config::settings::DesktopSize::parse(&v.desktop_size)
             .filter(|d| *d != ferossh_config::settings::DesktopSize::Follow);
         p.legacy_algorithms = v.legacy;
@@ -1889,6 +1918,7 @@ mod tests {
             Field::RemoteApp,
             Field::CopyAgent,
             Field::RemoveAgent,
+            Field::Clipboard,
         ] {
             assert!(items.contains(&Item::Field(field)), "{field:?}");
         }
@@ -1910,6 +1940,14 @@ mod tests {
         assert_eq!(p.remote_app.as_deref(), Some("gimp ~/a.png"));
         assert_eq!(p.remote_app_copy_agent, Some(false));
         assert_eq!(p.remote_app_remove_agent, Some(true));
+        assert_eq!(p.remote_app_clipboard, None);
+        // The clipboard only narrows: unset, to-host, from-host, off.
+        assert_eq!(f.choice(Field::Clipboard), "as in Session > Remote apps");
+        f.cycle(Field::Clipboard, false);
+        assert_eq!(f.choice(Field::Clipboard), "off for this host");
+        f.apply(&mut hosts, &mut settings);
+        let p = settings.profile("gimp-box").unwrap();
+        assert_eq!(p.remote_app_clipboard.as_deref(), Some("off"));
         f.values.remote_app = "a\u{7}".into();
         assert!(f.check().is_err());
     }
@@ -2055,9 +2093,9 @@ mod tests {
         down(&mut f, 11);
         f.key(SideKey::Enter { split: false }, 30);
         // tmux, tmux panes, Start dir, Forward 1, RDP port, VNC port,
-        // Virtual desk, Desk size, Remote app, Copy agent, Clean up, Old
-        // crypto.
-        down(&mut f, 13);
+        // Virtual desk, Desk size, Remote app, Copy agent, Clean up,
+        // Clipboard, Old crypto.
+        down(&mut f, 14);
         assert_eq!(f.focused_field(), Some(Field::LoginStep(0)));
         let t = texts(&mut f);
         assert!(

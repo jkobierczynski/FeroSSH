@@ -361,6 +361,12 @@ mod cmd {
     pub const REMOTE_APP_ATTACH: u32 = 626;
     pub const REMOTE_APP_COPY: u32 = 627;
     pub const REMOTE_APP_REMOVE: u32 = 628;
+    /// Session > Remote apps > Clipboard: both ways, to the host, from
+    /// the host, off (a radio group, in [`crate::stream::CLIPBOARD_WAYS`] order).
+    pub const REMOTE_APP_CLIP: u32 = 629;
+    pub const REMOTE_APP_CLIP_LAST: u32 = 632;
+    /// ... > Share mouse selections from the host.
+    pub const REMOTE_APP_SELECTION: u32 = 633;
     pub const TMUX_ATTACH: u32 = 610;
     pub const TMUX_DETACH: u32 = 611;
     pub const TMUX_PICK: u32 = 612;
@@ -821,6 +827,9 @@ struct Window {
     app_pane: Option<PaneId>,
     /// Programs run as remote apps lately, latest first.
     recent_apps: Vec<String>,
+    /// Running remote app sessions and the clipboard limit of the
+    /// connection each came from (`RemoteAppClipboard` in its profile).
+    app_clip_limits: HashMap<u32, Option<String>>,
     /// Passwords from password manager commands, as they finish: the pane,
     /// its session's channel, the program and the result.
     passwords: Arc<std::sync::Mutex<Vec<PasswordAnswer>>>,
@@ -1522,6 +1531,7 @@ fn create_and_run(launch: Launch, theme: Option<String>) -> Result<()> {
                 vdesks: HashMap::new(),
                 app_pane: None,
                 recent_apps: Vec::new(),
+                app_clip_limits: HashMap::new(),
                 passwords: Arc::default(),
                 pending_desktops: HashMap::new(),
                 broadcast: broadcast::Scope::Off,
@@ -1731,6 +1741,18 @@ fn build_menu() -> Result<HMENU> {
         separator(apps)?;
         item(apps, cmd::REMOTE_APP_COPY, "&Copy the agent to hosts")?;
         item(apps, cmd::REMOTE_APP_REMOVE, "Re&move the agent when done")?;
+        let clip = CreatePopupMenu()?;
+        item(clip, cmd::REMOTE_APP_CLIP, "&Both ways")?;
+        item(clip, cmd::REMOTE_APP_CLIP + 1, "Only &Windows to host")?;
+        item(clip, cmd::REMOTE_APP_CLIP + 2, "Only &host to Windows")?;
+        item(clip, cmd::REMOTE_APP_CLIP + 3, "&Off")?;
+        separator(clip)?;
+        item(
+            clip,
+            cmd::REMOTE_APP_SELECTION,
+            "Also share &mouse selections from the host",
+        )?;
+        AppendMenuW(apps, MF_POPUP, clip.0 as usize, w!("Clip&board"))?;
         AppendMenuW(
             session,
             MF_POPUP,
@@ -3387,7 +3409,7 @@ impl Window {
         from: Option<&str>,
         attach: ferostream_client::transport::AttachTo,
     ) -> Option<Command> {
-        use ferostream_client::transport::{Clipboard, DEFAULT_AGENT_PATH, Place as AgentPlace};
+        use ferostream_client::transport::{DEFAULT_AGENT_PATH, Place as AgentPlace};
         let host = self.host_pane(pane);
         let (Some(connection), Some(Host::Ssh(s))) = (
             self.pane_connection(pane),
@@ -3430,24 +3452,8 @@ impl Window {
                 )));
             }
         };
-        let clipboard = match self.settings.remote_app_clipboard.as_deref() {
-            Some("to-host") => Clipboard {
-                to_host: true,
-                from_host: false,
-            },
-            Some("from-host") => Clipboard {
-                to_host: false,
-                from_host: true,
-            },
-            Some("off") => Clipboard {
-                to_host: false,
-                from_host: false,
-            },
-            _ => Clipboard {
-                to_host: true,
-                from_host: true,
-            },
-        };
+        let clip_limit = own.and_then(|p| p.remote_app_clipboard.clone());
+        let clipboard = crate::stream::app_clipboard(&self.settings, clip_limit.as_deref());
         let files = if copy {
             crate::remote_app::agent_files()
         } else {
@@ -3496,10 +3502,15 @@ impl Window {
                 .unwrap_or_default(),
             raw_only: true,
         };
-        if let Err(e) = ferostream_client::win32::start(settings, Box::new(app_host)) {
-            return Some(Command::Notice(format!(
-                "The remote app did not start: {e}"
-            )));
+        match ferostream_client::win32::start(settings, Box::new(app_host)) {
+            Ok(id) => {
+                self.app_clip_limits.insert(id, clip_limit);
+            }
+            Err(e) => {
+                return Some(Command::Notice(format!(
+                    "The remote app did not start: {e}"
+                )));
+            }
         }
         if let Some(line) = program {
             let line = line.trim().to_owned();
@@ -9725,6 +9736,22 @@ impl Window {
         }
     }
 
+    /// Saves a changed remote app clipboard setting and applies it at once
+    /// to every remote app running (each still within its connection's
+    /// limit).
+    fn apply_app_clipboard(&mut self) {
+        self.save_settings();
+        self.update_menu_checks();
+        let running = ferostream_client::win32::sessions();
+        self.app_clip_limits.retain(|id, _| running.contains(id));
+        for (&id, limit) in &self.app_clip_limits {
+            ferostream_client::win32::set_clipboard(
+                id,
+                crate::stream::app_clipboard(&self.settings, limit.as_deref()),
+            );
+        }
+    }
+
     /// Runs a menu command that needs no call back into the window.
     fn command(&mut self, id: u32) -> Option<Command> {
         let pane = self.focused_id();
@@ -9948,6 +9975,22 @@ impl Window {
                 self.settings.remote_app_remove_agent = !self.settings.remote_app_remove_agent;
                 self.save_settings();
                 self.update_menu_checks();
+            }
+            cmd::REMOTE_APP_CLIP..=cmd::REMOTE_APP_CLIP_LAST => {
+                let way = crate::stream::CLIPBOARD_WAYS
+                    .get((id - cmd::REMOTE_APP_CLIP) as usize)
+                    .copied()
+                    .unwrap_or("both");
+                // Unset means both ways; keep the file as it was then.
+                self.settings.remote_app_clipboard = (way != "both"
+                    || self.settings.remote_app_clipboard.is_some())
+                .then(|| way.to_owned());
+                self.apply_app_clipboard();
+            }
+            cmd::REMOTE_APP_SELECTION => {
+                self.settings.remote_app_share_selection =
+                    !self.settings.remote_app_share_selection;
+                self.apply_app_clipboard();
             }
             cmd::TMUX_DETACH | cmd::TMUX_PICK | cmd::TMUX_LAYOUT => {
                 let host = self.host_pane(pane);
@@ -10327,6 +10370,18 @@ impl Window {
         unsafe {
             let _ = CheckMenuRadioItem(self.menu, cmd::FONT, last_font, font, MF_BYCOMMAND.0);
             let _ = CheckMenuRadioItem(self.menu, cmd::THEME, last_theme, theme, MF_BYCOMMAND.0);
+            let way = s.remote_app_clipboard.as_deref().unwrap_or("both");
+            let way = crate::stream::CLIPBOARD_WAYS
+                .iter()
+                .position(|w| *w == way)
+                .unwrap_or(0) as u32;
+            let _ = CheckMenuRadioItem(
+                self.menu,
+                cmd::REMOTE_APP_CLIP,
+                cmd::REMOTE_APP_CLIP_LAST,
+                cmd::REMOTE_APP_CLIP + way,
+                MF_BYCOMMAND.0,
+            );
             for (id, on) in [
                 (cmd::COPY_ON_SELECT, s.copy_on_select),
                 (cmd::UPDATE_WEEKLY, s.update_check_weekly),
@@ -10337,6 +10392,7 @@ impl Window {
                 (cmd::AUTO_RESPONSES, s.auto_responses),
                 (cmd::REMOTE_APP_COPY, s.remote_app_copy_agent),
                 (cmd::REMOTE_APP_REMOVE, s.remote_app_remove_agent),
+                (cmd::REMOTE_APP_SELECTION, s.remote_app_share_selection),
                 (cmd::CONFIRM_PRODUCTION, s.confirm_production),
                 (cmd::TMUX_KEYS, s.tmux_keys),
                 (cmd::RECORD_SNIPPET, self.recording.is_some()),

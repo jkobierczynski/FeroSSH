@@ -122,6 +122,8 @@ Font, theme and text size apply to the focused pane only. Session > Save font an
 | Remote apps > Reattach remote app | Brings back the windows of the newest remote app still running on the host. |
 | Remote apps > Copy the agent to hosts | ✓ on (the default): copies the FeroStream agent to a host that lacks it. `RemoteAppCopyAgent`. |
 | Remote apps > Remove the agent when done | ✓ on: the agent deletes itself from the host when its last program ends. Off by default. `RemoteAppRemoveAgent`. |
+| Remote apps > Clipboard > Both ways, Only Windows to host, Only host to Windows, Off | Which way copied text goes between remote apps and Windows; changes the remote apps already running at once. Both ways by default. `RemoteAppClipboard`. |
+| Remote apps > Clipboard > Also share mouse selections from the host | ✓ on: text you only select with the mouse in a remote app (how xterm copies) also goes to the Windows clipboard. Off by default, so a selection does not replace what you copied on Windows. `RemoteAppShareSelection`. |
 
 ## Help
 

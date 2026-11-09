@@ -12,6 +12,7 @@
 //! AutoReconnect yes
 //! RemoteAppCopyAgent yes
 //! RemoteAppRemoveAgent no
+//! RemoteAppShareSelection no
 //! Favourite web
 //! ThemeRule
 //!     Hosts prod-* *.prod.example.com
@@ -54,6 +55,7 @@
 //!     Via build-box
 //!     RemoteApp gimp
 //!     RemoteAppRemoveAgent yes
+//!     RemoteAppClipboard to-host
 //! Secret enable
 //!     PasswordCommand op read "op://Network/%n/password"
 //! ```
@@ -157,6 +159,10 @@ pub struct Profile {
     /// Remove the copied agent from this host when its last remote app
     /// ends; the global setting when unset.
     pub remote_app_remove_agent: Option<bool>,
+    /// Limits which way copied text travels between this host's remote
+    /// apps and Windows: `to-host`, `from-host` or `off`. It only narrows
+    /// the global setting (Session > Remote apps), never widens it.
+    pub remote_app_clipboard: Option<String>,
 }
 
 /// What opening a session does.
@@ -309,6 +315,7 @@ impl Profile {
             && self.remote_app.is_none()
             && self.remote_app_copy_agent.is_none()
             && self.remote_app_remove_agent.is_none()
+            && self.remote_app_clipboard.is_none()
     }
 }
 
@@ -395,6 +402,9 @@ pub struct Settings {
     /// Which way copied text travels between remote apps and Windows:
     /// `both` (when unset), `to-host`, `from-host` or `off`.
     pub remote_app_clipboard: Option<String>,
+    /// Remote apps: text selected with the mouse on the host (X PRIMARY,
+    /// xterm's way of copying) goes to Windows too. Off unless turned on.
+    pub remote_app_share_selection: bool,
     /// How hard the agent packs window pictures: `auto` (when unset: from
     /// the link speed it measures), `fast` (LZ4) or `strong` (Deflate).
     pub remote_app_packing: Option<String>,
@@ -444,6 +454,7 @@ impl Default for Settings {
             remote_app_remove_agent: false,
             remote_app_agent_path: None,
             remote_app_clipboard: None,
+            remote_app_share_selection: false,
             remote_app_packing: None,
         }
     }
@@ -741,6 +752,20 @@ impl Settings {
                     block = Block::Top;
                     s.remote_app_agent_path = Some(joined).filter(|p| !p.is_empty());
                 }
+                "remoteappclipboard" if matches!(block, Block::Profile(_)) => {
+                    if let Block::Profile(i) = block
+                        && let Some(p) = s.profiles.get_mut(i)
+                    {
+                        // "both" restricts nothing: the same as unset.
+                        p.remote_app_clipboard = first
+                            .map(|w| w.to_ascii_lowercase())
+                            .filter(|w| ["to-host", "from-host", "off"].contains(&w.as_str()));
+                    }
+                }
+                "remoteappshareselection" => {
+                    block = Block::Top;
+                    s.remote_app_share_selection = yes(&args).unwrap_or(false);
+                }
                 "remoteappclipboard" => {
                     block = Block::Top;
                     s.remote_app_clipboard = first
@@ -938,6 +963,11 @@ impl Settings {
         if let Some(c) = &self.remote_app_clipboard {
             let _ = writeln!(out, "RemoteAppClipboard {c}");
         }
+        let _ = writeln!(
+            out,
+            "RemoteAppShareSelection {}",
+            flag(self.remote_app_share_selection)
+        );
         if let Some(p) = &self.remote_app_packing {
             let _ = writeln!(out, "RemoteAppPacking {p}");
         }
@@ -1048,6 +1078,9 @@ impl Settings {
                     "    RemoteAppRemoveAgent {}",
                     if on { "yes" } else { "no" }
                 );
+            }
+            if let Some(c) = &p.remote_app_clipboard {
+                let _ = writeln!(out, "    RemoteAppClipboard {c}");
             }
             match &p.password {
                 PasswordSource::Ask => {}
@@ -1371,10 +1404,13 @@ NewKeyword later
         let s = Settings::parse(
             "RemoteAppCopyAgent no\nRemoteAppRemoveAgent yes\n\
              RemoteAppAgentPath ~/apps/ferostream-agent\nRemoteAppClipboard to-host\n\
-             RemoteAppPacking Strong\n\
+             RemoteAppPacking Strong\nRemoteAppShareSelection yes\n\
              Profile gimp-box\n    Type app\n    Via build\n    RemoteApp gimp \"a b.png\"\n\
-             \x20   RemoteAppCopyAgent yes\n    RemoteAppRemoveAgent no\n",
+             \x20   RemoteAppCopyAgent yes\n    RemoteAppRemoveAgent no\n\
+             \x20   RemoteAppClipboard Off\n",
         );
+        assert!(s.remote_app_share_selection);
+        assert!(!d.remote_app_share_selection, "selections stay on the host");
         assert!(!s.remote_app_copy_agent);
         assert!(s.remote_app_remove_agent);
         assert_eq!(
@@ -1393,6 +1429,8 @@ NewKeyword later
         assert_eq!(p.remote_app.as_deref(), Some("gimp \"a b.png\""));
         assert_eq!(p.remote_app_copy_agent, Some(true));
         assert_eq!(p.remote_app_remove_agent, Some(false));
+        assert_eq!(p.remote_app_clipboard.as_deref(), Some("off"));
+        assert_eq!(s.remote_app_clipboard.as_deref(), Some("to-host"));
         assert_eq!(Settings::parse(&s.to_text()), s);
         assert_eq!(
             Settings::parse("RemoteAppClipboard sideways\n").remote_app_clipboard,
