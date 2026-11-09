@@ -863,7 +863,7 @@ checksum = "da7c62ceae207dd37ea5b845da6a0696c799f85e97da1ab5b7910be3c1c80223"
 
 [[package]]
 name = "ferossh-auth"
-version = "1.0.0"
+version = "1.2.0"
 dependencies = [
  "getrandom 0.4.3",
  "russh",
@@ -874,7 +874,7 @@ dependencies = [
 
 [[package]]
 name = "ferossh-config"
-version = "1.0.0"
+version = "1.2.0"
 dependencies = [
  "base64ct",
  "getrandom 0.4.3",
@@ -885,7 +885,7 @@ dependencies = [
 
 [[package]]
 name = "ferossh-forward"
-version = "1.0.0"
+version = "1.2.0"
 
 [[package]]
 name = "ferossh-fuzz"
@@ -910,21 +910,21 @@ dependencies = [
 
 [[package]]
 name = "ferossh-ipc"
-version = "1.0.0"
+version = "1.2.0"
 dependencies = [
  "zeroize",
 ]
 
 [[package]]
 name = "ferossh-render"
-version = "1.0.0"
+version = "1.2.0"
 dependencies = [
  "windows",
 ]
 
 [[package]]
 name = "ferossh-sftp"
-version = "1.0.0"
+version = "1.2.0"
 dependencies = [
  "ferossh-ipc",
  "sha2",
@@ -932,7 +932,7 @@ dependencies = [
 
 [[package]]
 name = "ferossh-term"
-version = "1.0.0"
+version = "1.2.0"
 dependencies = [
  "alacritty_terminal",
  "ferossh-render",
@@ -941,11 +941,11 @@ dependencies = [
 
 [[package]]
 name = "ferossh-tmuxcc"
-version = "1.0.0"
+version = "1.2.0"
 
 [[package]]
 name = "ferossh-viewer"
-version = "1.0.0"
+version = "1.2.0"
 dependencies = [
  "des",
  "ironrdp-blocking",
@@ -966,7 +966,7 @@ dependencies = [
 
 [[package]]
 name = "ferossh-worker"
-version = "1.0.0"
+version = "1.2.0"
 dependencies = [
  "ferossh-forward",
  "ferossh-ipc",
@@ -981,7 +981,7 @@ dependencies = [
 
 [[package]]
 name = "ferossh-zmodem"
-version = "1.0.0"
+version = "1.2.0"
 
 [[package]]
 name = "ff"
@@ -1147,7 +1147,6 @@ version = "1.4.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "337d46834ee672ab3e48caca2cb0c78cc174fb12b3a68d0d88f99a0519a5e36e"
 dependencies = [
- "generic-array 0.14.7",
  "rustversion",
  "typenum",
 ]
@@ -2553,9 +2552,9 @@ dependencies = [
 
 [[package]]
 name = "russh"
-version = "0.64.1"
+version = "0.65.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ba61e87b9ec9a39a59a6bbed4c0b8ff7fb07073405b24a767a1f2c8560ac8f58"
+checksum = "94be3d86c71b9ed220a675c405e35c7a02565a009bf8da2e9cc13a700320a5c5"
 dependencies = [
  "aes",
  "bitflags 2.13.2",

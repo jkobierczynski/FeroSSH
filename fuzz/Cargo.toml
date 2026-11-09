@@ -22,7 +22,7 @@ ferossh-viewer = { path = "../crates/viewer", features = ["vnc", "rdp"] }
 ferossh-worker = { path = "../crates/worker" }
 ferossh-zmodem = { path = "../crates/zmodem" }
 # ssh_transport drives russh as the worker does, on a paused clock.
-russh = { version = "0.64", default-features = false, features = ["ring", "rsa"] }
+russh = { version = "0.65.1", default-features = false, features = ["ring", "rsa"] }
 tokio = { version = "1.54", features = ["rt", "time", "io-util", "test-util"] }
 # login_script compiles the app's runner from its source file.
 zeroize = "1.9"
