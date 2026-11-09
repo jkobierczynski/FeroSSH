@@ -188,7 +188,7 @@ The buttons at the bottom do the same, and a saved connection has a Delete butto
 | Del | Closes the session, after asking when it is live. |
 | Esc | Clears the search, then leaves. |
 
-The Show, Rename and Close buttons below the list, and the right-click menu on a session (or Shift+F10 on the session selected in the list), do the same.
+The Show, Rename and Close buttons below the list, and the right-click menu on a session (or Shift+F10 with the list focused, for example after Down from the search box), do the same.
 
 ### File transfer (Ctrl+Shift+E)
 
