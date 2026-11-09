@@ -140,24 +140,22 @@ pub fn words(line: &str) -> Option<Vec<String>> {
 /// lists them and `RemoteAppClipboard` spells them.
 pub const CLIPBOARD_WAYS: [&str; 4] = ["both", "to-host", "from-host", "off"];
 
-/// Which ways copied text travels for a remote app: the global setting,
-/// narrowed (never widened) by its connection's `limit`.
+/// Which ways copied text travels for a remote app: the global setting
+/// (off until the user chooses a way), narrowed (never widened) by its
+/// connection's `limit`.
 pub fn app_clipboard(
     settings: &ferossh_config::settings::Settings,
     limit: Option<&str>,
 ) -> ferostream_client::transport::Clipboard {
     use ferostream_client::transport::Clipboard;
-    let global = settings
-        .remote_app_clipboard
-        .as_deref()
-        .and_then(Clipboard::from_name)
-        .unwrap_or(Clipboard::BOTH);
+    let (to_host, from_host) =
+        ferossh_config::settings::global_clipboard_ways(settings.remote_app_clipboard.as_deref());
     let limit = limit
         .and_then(Clipboard::from_name)
         .unwrap_or(Clipboard::BOTH);
     Clipboard {
-        to_host: global.to_host && limit.to_host,
-        from_host: global.from_host && limit.from_host,
+        to_host: to_host && limit.to_host,
+        from_host: from_host && limit.from_host,
         selection: settings.remote_app_share_selection,
     }
 }
@@ -237,6 +235,10 @@ mod tests {
     fn a_connection_only_narrows_the_clipboard() {
         use ferossh_config::settings::Settings;
         let mut s = Settings::default();
+        // Off until the user chooses a way.
+        let c = app_clipboard(&s, None);
+        assert!(!c.to_host && !c.from_host && !c.selection);
+        s.remote_app_clipboard = Some("both".into());
         let c = app_clipboard(&s, None);
         assert!(c.to_host && c.from_host && !c.selection);
         let c = app_clipboard(&s, Some("to-host"));

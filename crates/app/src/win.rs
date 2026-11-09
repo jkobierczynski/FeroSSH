@@ -3383,8 +3383,9 @@ impl Window {
     /// Which ways copied text travels for a desktop: the global
     /// `DesktopClipboard` within the connection's `limit`.
     fn desktop_clip(&self, limit: (bool, bool)) -> (bool, bool) {
-        let (a, b) =
-            ferossh_config::settings::clipboard_ways(self.settings.desktop_clipboard.as_deref());
+        let (a, b) = ferossh_config::settings::global_clipboard_ways(
+            self.settings.desktop_clipboard.as_deref(),
+        );
         (a && limit.0, b && limit.1)
     }
 
@@ -4020,8 +4021,9 @@ impl Window {
     fn apply_desktop_clipboard(&mut self) {
         self.save_settings();
         self.update_menu_checks();
-        let ways =
-            ferossh_config::settings::clipboard_ways(self.settings.desktop_clipboard.as_deref());
+        let ways = ferossh_config::settings::global_clipboard_ways(
+            self.settings.desktop_clipboard.as_deref(),
+        );
         for p in self.panes.values_mut() {
             if let Some(d) = p.desktop.as_mut() {
                 let limit = d.clipboard_limit();
@@ -10361,22 +10363,18 @@ impl Window {
                 let way = crate::stream::CLIPBOARD_WAYS
                     .get((id - cmd::REMOTE_APP_CLIP) as usize)
                     .copied()
-                    .unwrap_or("both");
-                // Unset means both ways; keep the file as it was then.
-                self.settings.remote_app_clipboard = (way != "both"
-                    || self.settings.remote_app_clipboard.is_some())
-                .then(|| way.to_owned());
+                    .unwrap_or("off");
+                // Unset means off, so every choice is written down.
+                self.settings.remote_app_clipboard = Some(way.to_owned());
                 self.apply_app_clipboard();
             }
             cmd::DESKTOP_CLIP..=cmd::DESKTOP_CLIP_LAST => {
                 let way = ferossh_config::settings::CLIPBOARD_WAYS
                     .get((id - cmd::DESKTOP_CLIP) as usize)
                     .copied()
-                    .unwrap_or("both");
-                // Unset means both ways; keep the file as it was then.
-                self.settings.desktop_clipboard = (way != "both"
-                    || self.settings.desktop_clipboard.is_some())
-                .then(|| way.to_owned());
+                    .unwrap_or("off");
+                // Unset means off, so every choice is written down.
+                self.settings.desktop_clipboard = Some(way.to_owned());
                 self.apply_desktop_clipboard();
             }
             cmd::DESKTOP_SELECTION => {
@@ -10768,7 +10766,7 @@ impl Window {
         unsafe {
             let _ = CheckMenuRadioItem(self.menu, cmd::FONT, last_font, font, MF_BYCOMMAND.0);
             let _ = CheckMenuRadioItem(self.menu, cmd::THEME, last_theme, theme, MF_BYCOMMAND.0);
-            let way = s.remote_app_clipboard.as_deref().unwrap_or("both");
+            let way = s.remote_app_clipboard.as_deref().unwrap_or("off");
             let way = crate::stream::CLIPBOARD_WAYS
                 .iter()
                 .position(|w| *w == way)
@@ -10780,7 +10778,7 @@ impl Window {
                 cmd::REMOTE_APP_CLIP + way,
                 MF_BYCOMMAND.0,
             );
-            let way = s.desktop_clipboard.as_deref().unwrap_or("both");
+            let way = s.desktop_clipboard.as_deref().unwrap_or("off");
             let way = ferossh_config::settings::CLIPBOARD_WAYS
                 .iter()
                 .position(|w| *w == way)

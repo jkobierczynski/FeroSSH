@@ -118,13 +118,13 @@ Font, theme and text size apply to the focused pane only. Session > Save font an
 | Open remote desktop in a tab (VNC) | Only in `ferossh-desktop.exe`: a VNC desktop in a FeroSSH tab. |
 | Open virtual desktop (Xvfb) | Starts Xvfb and x11vnc on the server and shows that headless desktop through SSH: in a tab in `ferossh-desktop.exe`, else in the VNC viewer on this PC (see [Virtual desktops](everyday-use.md#virtual-desktops-xvfb)). Again while one runs: another viewer on it. |
 | Stop virtual desktop | Stops the virtual desktop on this connection, and everything running in it. |
-| Desktop clipboard > Both ways, Only Windows to host, Only host to Windows, Off | Which way copied text goes between remote and virtual desktops and Windows; changes the desktops already open at once. Remote Desktop Connection can only share both ways or none. Both ways by default. `DesktopClipboard` (see [Desktop clipboard](everyday-use.md#desktop-clipboard)). |
+| Desktop clipboard > Both ways, Only Windows to host, Only host to Windows, Off | Which way copied text goes between remote and virtual desktops and Windows; changes the desktops already open at once. Remote Desktop Connection can only share both ways or none. Off by default. `DesktopClipboard` (see [Desktop clipboard](everyday-use.md#desktop-clipboard)). |
 | Desktop clipboard > Also share mouse selections from virtual desktops | ✓ on: text you only select with the mouse in a virtual desktop also goes to the Windows clipboard; for virtual desktops started after the change. Off by default. `DesktopShareSelection`. |
 | Remote apps > Run remote app... | Runs a Linux program on the pane's host and shows its windows as native windows here, over the same SSH connection (see [Remote apps](everyday-use.md#remote-apps-native-windows)). |
 | Remote apps > Reattach remote app | Brings back the windows of the newest remote app still running on the host. |
 | Remote apps > Copy the agent to hosts | ✓ on (the default): copies the FeroStream agent to a host that lacks it. `RemoteAppCopyAgent`. |
 | Remote apps > Remove the agent when done | ✓ on: the agent deletes itself from the host when its last program ends. Off by default. `RemoteAppRemoveAgent`. |
-| Remote apps > Clipboard > Both ways, Only Windows to host, Only host to Windows, Off | Which way copied text goes between remote apps and Windows; changes the remote apps already running at once. Both ways by default. `RemoteAppClipboard`. |
+| Remote apps > Clipboard > Both ways, Only Windows to host, Only host to Windows, Off | Which way copied text goes between remote apps and Windows; changes the remote apps already running at once. Off by default. `RemoteAppClipboard`. |
 | Remote apps > Clipboard > Also share mouse selections from the host | ✓ on: text you only select with the mouse in a remote app (how xterm copies) also goes to the Windows clipboard. Off by default, so a selection does not replace what you copied on Windows. `RemoteAppShareSelection`. |
 
 ## Help
