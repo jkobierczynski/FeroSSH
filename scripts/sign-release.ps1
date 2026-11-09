@@ -73,20 +73,29 @@ Invoke-Native gh @("release", "download", $Tag, "-R", $Repository, "-D", $work,
     "-p", "ferostream-agent*")
 
 # Sign only what CI built: the manifest has each exe's SHA-256 before
-# signing, the hash a rebuild from the tag reproduces.
+# signing, the hash a rebuild from the tag reproduces. When an earlier run
+# of this script already signed and uploaded them (and failed later, for
+# example while attesting), the draft holds that run's manifest and signed
+# exes: those are checked against the manifest and not signed again.
 $manifest = Get-Content -Raw (Join-Path $work "BUILD-MANIFEST.json") | ConvertFrom-Json
+$signed = 0
 foreach ($exe in $exes) {
     $entry = $manifest.files | Where-Object name -eq $exe
     $hash = (Get-FileHash (Join-Path $work $exe) -Algorithm SHA256).Hash.ToLower()
-    if (-not $entry -or $hash -ne $entry.sha256_unsigned) {
-        throw "$exe does not match the SHA-256 the release workflow built ($($entry.sha256_unsigned)); not signing it"
-    }
+    if ($entry -and $hash -eq $entry.sha256_unsigned) { continue }
+    if ($entry -and $hash -eq $entry.sha256 -and $entry.authenticode -eq "Valid") { $signed++; continue }
+    throw "$exe does not match the SHA-256 the release workflow built ($($entry.sha256_unsigned)); not signing it"
 }
+if ($signed -ne 0 -and $signed -ne $exes.Count) { throw "the draft has some exes signed and some not; delete the draft and run the release again" }
 
-Write-Host "Signing with the certificate for '$Subject' (SimplySign or the card may ask for your PIN or a code)"
-foreach ($exe in $exes) {
-    Invoke-Native $signtool @("sign", "/n", $Subject, "/fd", "sha256", "/tr", $Timestamp, "/td", "sha256",
-        "/d", "FeroSSH", "/du", "https://github.com/$Repository", (Join-Path $work $exe))
+if ($signed) {
+    Write-Host "The draft's exes are already signed by an earlier run; going on from there"
+} else {
+    Write-Host "Signing with the certificate for '$Subject' (SimplySign or the card may ask for your PIN or a code)"
+    foreach ($exe in $exes) {
+        Invoke-Native $signtool @("sign", "/n", $Subject, "/fd", "sha256", "/tr", $Timestamp, "/td", "sha256",
+            "/d", "FeroSSH", "/du", "https://github.com/$Repository", (Join-Path $work $exe))
+    }
 }
 $signer = $null
 foreach ($exe in $exes) {
