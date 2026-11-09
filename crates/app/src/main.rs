@@ -70,6 +70,8 @@ mod pattern;
 mod proxycmd;
 #[cfg_attr(not(windows), allow(dead_code))]
 mod pwcommand;
+#[cfg(windows)]
+mod rail;
 #[cfg_attr(not(windows), allow(dead_code))]
 mod reconnect;
 #[cfg(windows)]
@@ -108,6 +110,8 @@ mod tmux;
 mod tmux_e2e;
 #[cfg_attr(not(windows), allow(dead_code))]
 mod tmux_keys;
+#[cfg_attr(not(windows), allow(dead_code))]
+mod toolpane;
 #[cfg(windows)]
 mod update;
 #[cfg_attr(not(windows), allow(dead_code))]

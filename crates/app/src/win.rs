@@ -96,8 +96,8 @@ use windows::Win32::UI::WindowsAndMessaging::{
     WM_IME_COMPOSITION, WM_IME_STARTCOMPOSITION, WM_KEYDOWN, WM_KEYUP, WM_KILLFOCUS,
     WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL,
     WM_PAINT, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SETCURSOR, WM_SETFOCUS, WM_SIZE, WM_SYSCHAR,
-    WM_SYSDEADCHAR, WM_SYSKEYDOWN, WM_SYSKEYUP, WM_TIMER, WNDCLASSW, WS_EX_APPWINDOW,
-    WS_OVERLAPPEDWINDOW,
+    WM_SYSDEADCHAR, WM_SYSKEYDOWN, WM_SYSKEYUP, WM_TIMER, WNDCLASSW, WS_CLIPCHILDREN,
+    WS_EX_APPWINDOW, WS_OVERLAPPEDWINDOW,
 };
 use windows::Win32::UI::WindowsAndMessaging::{DeleteMenu, ShowWindowAsync, WM_INITMENUPOPUP};
 use windows::core::{HSTRING, PCWSTR, PWSTR, Result, w};
@@ -125,6 +125,7 @@ use crate::palette::{self, CommandPalette, PalAction};
 use crate::pattern;
 use crate::proxycmd::ProxyRun;
 use crate::pwcommand;
+use crate::rail;
 use crate::reconnect::{self, Next, Retry};
 use crate::same_dir;
 use crate::sandbox;
@@ -139,6 +140,7 @@ use crate::tabstrip::{self, Forwarding, Health, Hit, Palette, StripLayout, TabLa
 use crate::telnet::{TelnetSession, TelnetTarget};
 use crate::tmux::{self, Mode as TmuxMode, Tmux};
 use crate::tmux_keys::{self, Action as TmuxKey};
+use crate::toolpane::{self, RailItem};
 use crate::vdesk;
 use crate::zmodem;
 use ferossh_tmuxcc::saved as tmux_saved;
@@ -171,7 +173,8 @@ const ACCENT_DIP: i32 = 2;
 const RESIZE_STEP: f32 = 0.05;
 /// Pixels the mouse moves before a press becomes a drag.
 const DRAG_START_PX: i32 = 6;
-const STYLE: WINDOW_STYLE = WS_OVERLAPPEDWINDOW;
+// Clip children: the renderer must not paint over the tools rail.
+const STYLE: WINDOW_STYLE = WINDOW_STYLE(WS_OVERLAPPEDWINDOW.0 | WS_CLIPCHILDREN.0);
 const EX_STYLE: WINDOW_EX_STYLE = WS_EX_APPWINDOW;
 const APP_NAME: &str = "FeroSSH";
 
@@ -333,6 +336,8 @@ mod cmd {
     pub const PALETTE: u32 = 213;
     pub const LIVE: u32 = 214;
     pub const SNIPPET_FOLDER: u32 = 215;
+    pub const TOOLS_PIN: u32 = 216;
+    pub const TOOLS_RAIL: u32 = 217;
     /// Plus the index into `FONT_CHOICES`.
     pub const FONT: u32 = 300;
     /// Plus the index into `Theme::builtin()`.
@@ -726,6 +731,8 @@ struct Side {
     grid: Grid,
     /// Width in pixels, edge excluded; 0 until first shown.
     width: i32,
+    /// How much of it shows (pixels): the terminal covers the rest.
+    shown: i32,
     /// Last click time and row, for double clicks.
     last_click: Option<(Instant, usize)>,
 }
@@ -733,7 +740,12 @@ struct Side {
 /// The parts of the client area.
 #[derive(Clone, Copy, Debug, Default)]
 struct Areas {
+    /// The tools rail (a child window of its own).
+    rail: Option<Rect>,
+    /// The part of the side pane the terminal leaves uncovered; its grid
+    /// starts at its left and is `side_width` wide.
     side: Option<Rect>,
+    side_width: i32,
     side_edge: Option<Rect>,
     strip: Option<Rect>,
     panes: Rect,
@@ -1496,7 +1508,11 @@ fn create_and_run(launch: Launch, theme: Option<String>) -> Result<()> {
         let chrome_metrics = renderer.metrics(&chrome_font, dpi)?;
         let strip_font = FontSpec::new(&font.family, STRIP_PT);
         let strip_metrics = renderer.metrics(&strip_font, dpi)?;
-        let (width, height) = window_size(&metrics, DEFAULT_COLS, DEFAULT_ROWS, dpi, true);
+        let (mut width, height) = window_size(&metrics, DEFAULT_COLS, DEFAULT_ROWS, dpi, true);
+        if settings.tools_rail {
+            // The terminal still gets its 80 columns beside the rail.
+            width += scale(toolpane::RAIL_DIP, dpi) + gap(dpi);
+        }
         let (ws, first) = Workspace::new();
         let pane = new_pane(
             first,
@@ -1525,6 +1541,7 @@ fn create_and_run(launch: Launch, theme: Option<String>) -> Result<()> {
                     import: None,
                     grid: Grid::new(1, 1),
                     width: 0,
+                    shown: 0,
                     last_click: None,
                 },
                 chrome_font,
@@ -1603,6 +1620,20 @@ fn create_and_run(launch: Launch, theme: Option<String>) -> Result<()> {
                 standby: Standby::new(),
             });
         });
+        // The tools rail, a native child window; placed by layout().
+        if let Some(look) = with_window(|w| w.rail_look()) {
+            let commands = RailItem::ALL.map(|i| match i {
+                RailItem::Connections => cmd::SESSIONS,
+                RailItem::Sessions => cmd::LIVE,
+                RailItem::Files => cmd::FILES,
+                RailItem::Forwards => cmd::FORWARDS,
+                RailItem::Snippets => cmd::SNIPPETS,
+                RailItem::Palette => cmd::PALETTE,
+                RailItem::Pin => cmd::TOOLS_PIN,
+            });
+            // Without it (it never fails in practice) the menus still work.
+            let _ = rail::create(hwnd, commands, look);
+        }
         // Files dropped from Explorer are uploaded, after a confirmation.
         DragAcceptFiles(hwnd, true);
         // Clipboard changes reach a remote desktop being worked in.
@@ -1883,6 +1914,8 @@ fn build_menu() -> Result<HMENU> {
         let view = CreatePopupMenu()?;
         item(view, cmd::FOLLOW_CD, "File transfer f&ollows cd")?;
         item(view, cmd::SIDE_RIGHT, "Side pane on the &right")?;
+        item(view, cmd::TOOLS_RAIL, "Tools ra&il")?;
+        item(view, cmd::TOOLS_PIN, "&Keep tools open")?;
         item(view, cmd::TAB_STRIP, "Ta&b strip")?;
         separator(view)?;
         item(view, cmd::ZOOM_IN, "&Larger text\tCtrl+=")?;
@@ -6478,6 +6511,29 @@ impl Window {
         )
     }
 
+    /// What the tools rail shows: the open tool, the pin, and the tab
+    /// strip's (system menu bar) colours.
+    fn rail_look(&self) -> rail::Look {
+        let p = self.strip_palette();
+        let active = self.side.visible.then_some(match self.side.view {
+            SideView::Sessions => RailItem::Connections,
+            SideView::Live => RailItem::Sessions,
+            SideView::Files => RailItem::Files,
+            SideView::Forwards => RailItem::Forwards,
+            SideView::Snippets => RailItem::Snippets,
+            SideView::Palette => RailItem::Palette,
+        });
+        rail::Look {
+            active,
+            pinned: self.settings.tools_pinned,
+            background: p.strip,
+            selected: p.active,
+            text: p.text,
+            accent: p.accent,
+            dpi: self.dpi,
+        }
+    }
+
     /// A theme whose background is the chrome's, for drawing its padding.
     fn chrome_theme(&self) -> Theme {
         let mut t = self
@@ -6490,6 +6546,7 @@ impl Window {
 
     /// Redraws the tab strip and side pane grids.
     fn refresh_chrome(&mut self) {
+        rail::set_look(self.rail_look());
         let palette = self.chrome_palette();
         if let Some(strip) = self.areas.strip {
             let palette = self.strip_palette();
@@ -6608,30 +6665,26 @@ impl Window {
         }
     }
 
-    /// Splits the client area into side pane, tab strip and panes.
+    /// Splits the client area into tools rail, side pane, tab strip and
+    /// panes. The side pane keeps its width; the terminal covers what of
+    /// it does not show (see `toolpane`).
     fn compute_areas(&mut self) -> Areas {
-        let (w, h) = self.client;
-        let g = gap(self.dpi);
         let cpad = scale(CHROME_PADDING_DIP, self.dpi);
         let cm = self.chrome_metrics;
-        let mut main = Rect::new(0, 0, w, h);
         let mut areas = Areas::default();
-        if self.side.visible {
-            if self.side.width <= 0 {
-                self.side.width = SIDE_COLS * cm.width as i32 + 2 * cpad;
-            }
-            let width = self.side.width.clamp(80, (w / 2).max(80)).min(w - g);
-            self.side.width = width;
-            if self.settings.side_pane_right {
-                areas.side = Some(Rect::new(w - width, 0, width, h));
-                areas.side_edge = Some(Rect::new(w - width - g, 0, g, h));
-                main = Rect::new(0, 0, (w - width - g).max(0), h);
-            } else {
-                areas.side = Some(Rect::new(0, 0, width, h));
-                areas.side_edge = Some(Rect::new(width, 0, g, h));
-                main = Rect::new(width + g, 0, (w - width - g).max(0), h);
-            }
+        if self.side.width <= 0 {
+            self.side.width = SIDE_COLS * cm.width as i32 + 2 * cpad;
         }
+        let parts = toolpane::split(&self.tools_input());
+        if self.side.visible {
+            self.side.width = parts.width;
+            self.side.shown = parts.shown.map_or(0, |r| r.w);
+        }
+        areas.rail = parts.rail;
+        areas.side = parts.shown;
+        areas.side_width = parts.width;
+        areas.side_edge = parts.edge.filter(|e| e.w > 0);
+        let mut main = parts.main;
         if self.settings.tab_strip && self.ws.tabs.len() >= 2 {
             let sh = self.strip_metrics.height as i32 + 2 * scale(STRIP_PAD_DIP, self.dpi);
             areas.strip = Some(Rect::new(main.x, main.y, main.w, sh));
@@ -6639,6 +6692,23 @@ impl Window {
         }
         areas.panes = main;
         areas
+    }
+
+    /// What the tools pane's geometry depends on.
+    fn tools_input(&self) -> toolpane::Input {
+        toolpane::Input {
+            client: self.client,
+            rail: if self.settings.tools_rail {
+                scale(toolpane::RAIL_DIP, self.dpi)
+            } else {
+                0
+            },
+            width: self.side.width,
+            shown: self.side.shown,
+            open: self.side.visible,
+            right: self.settings.side_pane_right,
+            gap: gap(self.dpi),
+        }
     }
 
     /// Fits every pane, and the chrome, to the client area.
@@ -6666,10 +6736,13 @@ impl Window {
             self.strip_grid.mark_all_dirty();
         }
         if let Some(s) = self.areas.side {
-            let (c, rows) = cells(s);
+            // Laid out for its whole width, covered or not, so covering
+            // it does not rewrap it.
+            let (c, rows) = cells(Rect::new(s.x, s.y, self.areas.side_width, s.h));
             self.side.grid.resize(c, rows);
             self.side.grid.mark_all_dirty();
         }
+        rail::place(self.areas.rail);
         // Every tab, so background shells know their size too.
         let pad = padding(self.dpi);
         let g = gap(self.dpi);
@@ -9127,8 +9200,12 @@ impl Window {
         self.start_shell_in(id, dir.as_deref());
     }
 
-    /// Gives the keyboard back to the focused pane.
+    /// Gives the keyboard back to the focused pane. Unless Settings >
+    /// Keep tools open is on, the terminal covers the tool again.
     fn focus_terminal(&mut self) {
+        if self.side.visible && !self.settings.tools_pinned {
+            self.hide_side();
+        }
         if self.side.focused {
             self.side.focused = false;
             self.refresh_chrome();
@@ -9178,6 +9255,10 @@ impl Window {
                 }
             }
         }
+        if !self.side.visible {
+            let min = scale(toolpane::MIN_SHOWN_DIP, self.dpi);
+            self.side.shown = toolpane::reopen(self.side.shown, self.side.width, min);
+        }
         self.side.visible = true;
         self.side.focused = focus;
         self.layout();
@@ -9221,6 +9302,7 @@ impl Window {
         self.side.visible = false;
         self.side.focused = false;
         self.layout();
+        self.update_menu_checks();
     }
 
     /// A pane for a new tab, with the default look.
@@ -9678,6 +9760,13 @@ impl Window {
                 None
             }
             Spot::Pane(id) => {
+                if self.side.visible && !self.settings.tools_pinned {
+                    // A peek ends: the terminal covers the tool again.
+                    // The click only does that, since the panes move.
+                    self.hide_side();
+                    self.focus_pane(id);
+                    return None;
+                }
                 self.focus_pane(id);
                 if button == MouseButton::Left && mods.ctrl && mods.shift {
                     self.capture(true);
@@ -9813,13 +9902,31 @@ impl Window {
                 }
                 Drag::FilesBar { .. } => {}
                 Drag::SideEdge => {
-                    let (w, _) = self.client;
-                    self.side.width = if self.settings.side_pane_right {
-                        w - x
-                    } else {
-                        x
-                    };
-                    self.layout();
+                    let min = scale(toolpane::MIN_SHOWN_DIP, self.dpi);
+                    let to = toolpane::drag(x, &self.tools_input(), min);
+                    self.side.width = to.width;
+                    match (self.side.visible, to.open) {
+                        (true, false) => {
+                            // Opened again later, it shows whole.
+                            self.side.shown = 0;
+                            self.hide_side();
+                        }
+                        (false, true) => {
+                            // Uncovering from the rail: the tool shown last
+                            // (not the command palette, which opens alone).
+                            self.side.shown = to.shown;
+                            let view = match self.side.view {
+                                SideView::Palette => SideView::Sessions,
+                                v => v,
+                            };
+                            self.show_side(view, false);
+                        }
+                        _ => {
+                            self.side.shown = to.shown;
+                            self.layout();
+                        }
+                    }
+                    self.update_menu_checks();
                 }
                 Drag::Tab { index, home, out } => {
                     let Some(s) = self.areas.strip else {
@@ -10503,6 +10610,18 @@ impl Window {
                 self.update_menu_checks();
                 self.layout();
             }
+            cmd::TOOLS_RAIL => {
+                self.settings.tools_rail = !self.settings.tools_rail;
+                self.save_settings();
+                self.update_menu_checks();
+                self.layout();
+            }
+            cmd::TOOLS_PIN => {
+                self.settings.tools_pinned = !self.settings.tools_pinned;
+                self.save_settings();
+                self.update_menu_checks();
+                self.refresh_chrome();
+            }
             cmd::TAB_STRIP => {
                 self.settings.tab_strip = !self.settings.tab_strip;
                 self.save_settings();
@@ -10871,6 +10990,8 @@ impl Window {
                 (cmd::ZMODEM, s.zmodem),
                 (cmd::AUTO_RECONNECT, s.auto_reconnect),
                 (cmd::SIDE_RIGHT, s.side_pane_right),
+                (cmd::TOOLS_RAIL, s.tools_rail),
+                (cmd::TOOLS_PIN, s.tools_pinned),
                 (cmd::TAB_STRIP, s.tab_strip),
                 (cmd::TMUX_LAYOUT, own_layout),
                 (cmd::BROADCAST_TAB, self.broadcast == broadcast::Scope::Tab),
