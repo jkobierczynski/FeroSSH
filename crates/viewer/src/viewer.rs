@@ -437,9 +437,7 @@ mod tests {
                 std::thread::spawn(move || {
                     let wait = Instant::now() + Duration::from_secs(10);
                     loop {
-                        let out = xclip(&["-o", "-selection", "clipboard"])
-                            .output()
-                            .unwrap();
+                        let out = xclip(&["-o", "-selection", "clipboard"]).output().unwrap();
                         if out.stdout == "from Windows, caf\u{e9}".as_bytes() {
                             break;
                         }
@@ -454,7 +452,11 @@ mod tests {
                         .stderr(Stdio::null())
                         .spawn()
                         .unwrap();
-                    set.stdin.take().unwrap().write_all(b"from the host").unwrap();
+                    set.stdin
+                        .take()
+                        .unwrap()
+                        .write_all(b"from the host")
+                        .unwrap();
                     let _ = set.wait();
                 });
             }

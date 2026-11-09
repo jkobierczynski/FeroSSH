@@ -1329,7 +1329,9 @@ mod tests {
             let _ = std::fs::remove_file(pasted);
             tell(ToViewer::Clipboard("from-windows".into()));
             std::thread::sleep(Duration::from_millis(500));
-            typed("xclip -o -selection clipboard >/tmp/frdp-clip.part; mv /tmp/frdp-clip.part /tmp/frdp-clip");
+            typed(
+                "xclip -o -selection clipboard >/tmp/frdp-clip.part; mv /tmp/frdp-clip.part /tmp/frdp-clip",
+            );
             let deadline = Instant::now() + Duration::from_secs(20);
             while !std::path::Path::new(pasted).exists() {
                 assert!(Instant::now() < deadline, "the text never reached xrdp");
