@@ -12,9 +12,11 @@
 //! Threads: one reads the tunnel and queues the bytes for the viewer, one
 //! writes the queue to the viewer, and one reads the viewer, sending its
 //! bytes for the server down the tunnel and the rest to the window. The
-//! server's bytes in the queue are held to [`MAX_QUEUED_NET`]: past it the
-//! tunnel is not read until the viewer catches up, so a slow (or stuck)
-//! viewer slows the server down instead of filling the window's memory.
+//! server's bytes in the queue, plus [`MESSAGE_COST`] for each message
+//! holding them, are held to [`MAX_QUEUED_NET`]: past it the tunnel is not
+//! read until the viewer catches up, so a slow (or stuck) viewer slows the
+//! server down instead of filling the window's memory, however small the
+//! pieces the server sends.
 
 use std::io::{Read, Write};
 use std::net::{Shutdown, TcpStream};
@@ -30,8 +32,38 @@ use ferossh_viewer::pipe::{
 };
 use zeroize::Zeroizing;
 
-/// The most bytes from the server queued for the viewer at once.
+/// The longest password typed at a prompt, in bytes. Its buffer is this
+/// big from the start and never grows, as a growing `String` would leave
+/// copies of the first characters in freed memory, out of reach of
+/// `Zeroizing`.
+const MAX_TYPED_PASSWORD: usize = 256;
+
+/// An empty buffer for a password typed at a prompt.
+fn password_buffer() -> Zeroizing<String> {
+    Zeroizing::new(String::with_capacity(MAX_TYPED_PASSWORD))
+}
+
+/// Adds a typed character to a password, unless the buffer would have to
+/// move: past [`MAX_TYPED_PASSWORD`] the rest is dropped.
+fn type_into(typed: &mut Zeroizing<String>, c: char) {
+    if typed.len() + c.len_utf8() <= MAX_TYPED_PASSWORD {
+        typed.push(c);
+    }
+}
+
+/// The most bytes from the server queued for the viewer at once,
+/// counting [`MESSAGE_COST`] for each message.
 const MAX_QUEUED_NET: usize = 4 * 1024 * 1024;
+/// What one queued message costs beyond its bytes: more than its `Vec`,
+/// its slot in the channel and the allocator's share take, so that a
+/// server sending its bytes one at a time fills the budget no less than
+/// one sending them in big reads.
+const MESSAGE_COST: usize = 256;
+
+/// What a message of `n` of the server's bytes counts in the budget.
+fn cost(n: usize) -> usize {
+    n.saturating_add(MESSAGE_COST)
+}
 
 /// How many of the server's bytes wait in the queue for the viewer.
 #[derive(Debug, Default)]
@@ -42,18 +74,21 @@ struct Budget {
 }
 
 impl Budget {
-    /// Waits until `n` more bytes fit, or the queue is empty (a chunk is
-    /// never larger than [`MAX_NET`]), and counts them in. `false` once
-    /// the writer stopped: nobody will take them.
+    /// Waits until a message of `n` bytes fits, and counts it in.
+    /// `false` once the writer stopped, as nobody will take it, and for
+    /// more than [`MAX_NET`] bytes, which no message holds.
     fn take(&self, n: usize) -> bool {
+        if n > MAX_NET {
+            return false;
+        }
         let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
         loop {
             let (queued, closed) = *state;
             if closed {
                 return false;
             }
-            if queued == 0 || queued + n <= MAX_QUEUED_NET {
-                state.0 = queued + n;
+            if queued + cost(n) <= MAX_QUEUED_NET {
+                state.0 = queued + cost(n);
                 return true;
             }
             state = self
@@ -63,10 +98,10 @@ impl Budget {
         }
     }
 
-    /// `n` bytes went to the viewer.
+    /// A message of `n` bytes went to the viewer.
     fn give(&self, n: usize) {
         let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
-        state.0 = state.0.saturating_sub(n);
+        state.0 = state.0.saturating_sub(cost(n));
         self.changed.notify_all();
     }
 
@@ -255,11 +290,13 @@ impl Desktop {
                 for msg in queue {
                     let last = msg == ToViewer::Closed;
                     let net = match &msg {
-                        ToViewer::Net(b) => b.len(),
-                        _ => 0,
+                        ToViewer::Net(b) => Some(b.len()),
+                        _ => None,
                     };
                     let failed = write_frame(&mut pipe, &encode_wiped(&msg)).is_err();
-                    written.give(net);
+                    if let Some(n) = net {
+                        written.give(n);
+                    }
                     if failed {
                         let _ =
                             ended.send(FromThreads::Ended("The desktop viewer stopped.".into()));
@@ -397,6 +434,16 @@ impl Desktop {
                     out.push(Update::Title(ferossh_term::sanitize_title(&n)));
                 }
                 Ok(Applied::Other(FromViewer::Bell)) => out.push(Update::Bell),
+                // FeroSSH started this server with a password: one that
+                // now lets anyone in was swapped, or had the password
+                // option taken out of its offer on the way.
+                Ok(Applied::Other(FromViewer::NoPassword)) if self.preset.is_some() => self.end(
+                    "This VNC server asked for no password, though FeroSSH started it with \
+                     one. Something between may have removed the password from its offer, \
+                     so FeroSSH did not open the desktop."
+                        .into(),
+                    &mut out,
+                ),
                 Ok(Applied::Other(FromViewer::NoPassword)) => out.push(Update::Note(
                     "This VNC server asks for no password: anyone who can reach its port \
                      can see and control this desktop."
@@ -416,7 +463,7 @@ impl Desktop {
                         }
                     }
                     Protocol::Vnc => {
-                        self.phase = Phase::Password(Zeroizing::new(String::new()));
+                        self.phase = Phase::Password(password_buffer());
                         out.push(Update::Ask("VNC password: ".into()));
                     }
                     Protocol::Rdp => {
@@ -508,7 +555,7 @@ impl Desktop {
                         typed.clone()
                     };
                     self.send(ToViewer::User(user));
-                    self.phase = Phase::Password(Zeroizing::new(String::new()));
+                    self.phase = Phase::Password(password_buffer());
                     Some("\r\nPassword: ".into())
                 }
                 '\u{8}' => typed.pop().map(|_| "\u{8} \u{8}".into()),
@@ -529,7 +576,7 @@ impl Desktop {
                     '\u{8}' => {
                         typed.pop();
                     }
-                    c if !c.is_control() => typed.push(c),
+                    c if !c.is_control() => type_into(typed, c),
                     _ => {}
                 }
                 None
@@ -791,6 +838,70 @@ mod tests {
         assert!(!d.running());
     }
 
+    #[test]
+    fn a_typed_password_never_moves() {
+        let mut typed = password_buffer();
+        let start = typed.as_ptr();
+        for c in std::iter::repeat_n('é', 200) {
+            type_into(&mut typed, c);
+        }
+        assert_eq!(typed.len(), MAX_TYPED_PASSWORD);
+        assert_eq!(typed.as_ptr(), start);
+        assert_eq!(typed.capacity(), MAX_TYPED_PASSWORD);
+    }
+
+    /// A server FeroSSH started with a password that then offers none.
+    #[test]
+    fn a_chosen_password_refuses_a_server_without_one() {
+        let l = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = l.local_addr().unwrap().to_string();
+        let srv = std::thread::spawn(move || {
+            let (mut s, _) = l.accept().unwrap();
+            s.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+            s.write_all(b"RFB 003.008\n").unwrap();
+            let mut b = [0u8; 12];
+            s.read_exact(&mut b).unwrap();
+            assert_eq!(&b, b"RFB 003.008\n");
+            s.write_all(&[1, 1]).unwrap();
+            let mut chose = [0u8; 1];
+            s.read_exact(&mut chose).unwrap();
+            assert_eq!(chose, [1]);
+            // SecurityResult OK, then wait for the client to go.
+            s.write_all(&0u32.to_be_bytes()).unwrap();
+            let mut rest = Vec::new();
+            let _ = s.read_to_end(&mut rest);
+        });
+        let (viewer_in, window_out) = std::io::pipe().unwrap();
+        let (window_in, viewer_out) = std::io::pipe().unwrap();
+        std::thread::spawn(move || ferossh_viewer::viewer::run(viewer_in, viewer_out));
+        let session = Session {
+            protocol: Protocol::Vnc,
+            width: 0,
+            height: 0,
+            layout: 0,
+            user: String::new(),
+            password: Some(Zeroizing::new("pw".into())),
+            fixed: true,
+            clipboard: (false, false),
+            clipboard_limit: (true, true),
+        };
+        let mut d =
+            Desktop::start(&addr, session, window_out, window_in, Box::new(()), || {}).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let why = 'ended: loop {
+            assert!(Instant::now() < deadline);
+            for u in d.poll() {
+                if let Update::Ended(why) = u {
+                    break 'ended why;
+                }
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        };
+        assert!(why.contains("no password"), "{why}");
+        assert!(!d.running());
+        srv.join().unwrap();
+    }
+
     /// A virtual desktop's password goes to the server without a prompt.
     #[test]
     fn a_chosen_password_needs_no_prompt() {
@@ -913,9 +1024,10 @@ mod budget_tests {
     #[test]
     fn a_slow_viewer_holds_the_tunnel_back() {
         let budget = Arc::new(Budget::default());
-        // A full queue's worth goes in at once.
-        assert!(budget.take(MAX_NET));
-        assert!(budget.take(MAX_QUEUED_NET - MAX_NET));
+        // Three full reads fit, a fourth does not.
+        for _ in 0..3 {
+            assert!(budget.take(MAX_NET));
+        }
         let reader = Arc::clone(&budget);
         let (done, waited) = mpsc::channel();
         let t = std::thread::spawn(move || {
@@ -927,15 +1039,38 @@ mod budget_tests {
         budget.give(MAX_NET);
         assert_eq!(waited.recv_timeout(Duration::from_secs(5)), Ok(true));
         t.join().unwrap();
-        assert_eq!(budget.state.lock().unwrap().0, MAX_QUEUED_NET);
+        assert_eq!(budget.state.lock().unwrap().0, 3 * cost(MAX_NET));
+    }
+
+    #[test]
+    fn tiny_reads_are_held_back_too() {
+        let budget = Budget::default();
+        let mut queued = 0;
+        while queued < 1_000_000 {
+            let full = budget.state.lock().unwrap().0 + cost(1) > MAX_QUEUED_NET;
+            if full {
+                break;
+            }
+            assert!(budget.take(1));
+            queued += 1;
+        }
+        // One-byte messages stop at a few thousand, not millions.
+        assert_eq!(queued, MAX_QUEUED_NET / cost(1));
+        assert!(budget.state.lock().unwrap().0 <= MAX_QUEUED_NET);
+        for _ in 0..queued {
+            budget.give(1);
+        }
+        assert_eq!(budget.state.lock().unwrap().0, 0);
     }
 
     #[test]
     fn a_stopped_viewer_stops_the_reader() {
         let budget = Arc::new(Budget::default());
-        assert!(budget.take(MAX_QUEUED_NET));
+        for _ in 0..3 {
+            assert!(budget.take(MAX_NET));
+        }
         let reader = Arc::clone(&budget);
-        let t = std::thread::spawn(move || reader.take(1));
+        let t = std::thread::spawn(move || reader.take(MAX_NET));
         std::thread::sleep(Duration::from_millis(50));
         drop(CloseOnDrop(Arc::clone(&budget)));
         assert!(!t.join().unwrap());
@@ -943,10 +1078,10 @@ mod budget_tests {
     }
 
     #[test]
-    fn an_empty_queue_takes_any_chunk() {
+    fn no_message_is_larger_than_max_net() {
         let budget = Budget::default();
-        assert!(budget.take(MAX_QUEUED_NET + 1));
-        budget.give(MAX_QUEUED_NET + 1);
-        assert_eq!(budget.state.lock().unwrap().0, 0);
+        assert!(!budget.take(MAX_NET + 1));
+        assert!(budget.take(MAX_NET));
+        assert_eq!(budget.state.lock().unwrap().0, cost(MAX_NET));
     }
 }
