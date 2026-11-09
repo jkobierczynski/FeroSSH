@@ -995,7 +995,7 @@ version = "1.2.0"
 [[package]]
 name = "ferostream-client"
 version = "0.1.0"
-source = "git+https://github.com/jkobierczynski/FeroStream?rev=6e308659023f8b0cdb747939b44982f381463c11#6e308659023f8b0cdb747939b44982f381463c11"
+source = "git+https://github.com/jkobierczynski/FeroStream?rev=91d1da1e8d298b8894ced6793946fefc675bd28d#91d1da1e8d298b8894ced6793946fefc675bd28d"
 dependencies = [
  "ferostream-proto",
  "windows",
@@ -1004,7 +1004,7 @@ dependencies = [
 [[package]]
 name = "ferostream-proto"
 version = "0.1.0"
-source = "git+https://github.com/jkobierczynski/FeroStream?rev=6e308659023f8b0cdb747939b44982f381463c11#6e308659023f8b0cdb747939b44982f381463c11"
+source = "git+https://github.com/jkobierczynski/FeroStream?rev=91d1da1e8d298b8894ced6793946fefc675bd28d#91d1da1e8d298b8894ced6793946fefc675bd28d"
 dependencies = [
  "lz4_flex",
  "miniz_oxide 0.9.1",
