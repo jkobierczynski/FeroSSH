@@ -120,6 +120,7 @@ use crate::import_view::{Found, ImportAction, ImportView, Items};
 use crate::layout::{self, Axis, Closed, Dir, Drop, PaneId, Rect, Workspace};
 use crate::link::{Link, LinkEvent};
 use crate::live::{self, LiveAction, LiveSession, LiveState, LiveView};
+use crate::live_panel;
 use crate::login_script::{self, Need, Outcome, Runner};
 use crate::look;
 use crate::palette::{self, CommandPalette, PalAction};
@@ -1640,6 +1641,8 @@ fn create_and_run(launch: Launch, theme: Option<String>) -> Result<()> {
         }
         // The connection manager's native controls; placed by layout().
         let _ = conn_view::create(hwnd, conn_event, cmd::IMPORT, dpi);
+        // The session manager's, likewise.
+        let _ = live_panel::create(hwnd, live_event, dpi);
         // Files dropped from Explorer are uploaded, after a confirmation.
         DragAcceptFiles(hwnd, true);
         // Clipboard changes reach a remote desktop being worked in.
@@ -1685,8 +1688,8 @@ fn create_and_run(launch: Launch, theme: Option<String>) -> Result<()> {
         let mut msg = MSG::default();
         while GetMessageW(&mut msg, None, 0, 0).as_bool() {
             // Tab, Enter, Escape and the shortcuts in the connection
-            // manager's controls.
-            if conn_view::pre_translate(&msg) {
+            // and session managers' controls.
+            if conn_view::pre_translate(&msg) || live_panel::pre_translate(&msg) {
                 continue;
             }
             let _ = TranslateMessage(&msg);
@@ -6554,10 +6557,15 @@ impl Window {
             && self.side.import.is_none()
     }
 
-    /// Shows, fills and places the connection manager's controls, and
-    /// moves the keyboard to them or back as the side pane's focus says.
-    /// Focus changes are posted: they send messages that need this
-    /// window's state, which is borrowed here.
+    /// Whether the session manager shows as native controls.
+    fn live_native(&self) -> bool {
+        self.side.visible && self.side.view == SideView::Live
+    }
+
+    /// Shows, fills and places the native tools' controls, and moves the
+    /// keyboard to them or back as the side pane's focus says. Focus
+    /// changes are posted: they send messages that need this window's
+    /// state, which is borrowed here.
     fn sync_conn_view(&mut self) {
         if self.conn_native() {
             conn_view::set_nodes(self.side.list.tree());
@@ -6565,10 +6573,21 @@ impl Window {
         } else {
             conn_view::place(None, 0, self.dpi);
         }
-        let want = self.conn_native() && self.side.focused;
-        let to = if want && self.focused && !conn_view::has_focus() {
+        if self.live_native() {
+            let all = self.open_sessions();
+            live_panel::set_search(self.live_view.query());
+            live_panel::set_rows(self.live_view.rows(&all), all.len());
+            live_panel::place(self.areas.side, self.areas.side_width, self.dpi);
+        } else {
+            live_panel::place(None, 0, self.dpi);
+        }
+        let want = self.wants_tools_focus();
+        let has = tools_have_focus();
+        let to = if want && self.focused && self.live_native() && self.wants_name_edit() {
+            Some(2)
+        } else if want && self.focused && !has {
             Some(1)
-        } else if !want && conn_view::has_focus() {
+        } else if !want && has {
             Some(0)
         } else {
             None
@@ -6581,9 +6600,14 @@ impl Window {
         }
     }
 
-    /// The connection manager's controls should have the keyboard.
-    fn wants_conn_focus(&self) -> bool {
-        self.conn_native() && self.side.focused
+    /// A rename waits for the session manager's list to start its edit.
+    fn wants_name_edit(&self) -> bool {
+        self.live_native() && self.live_view.renaming_pane().is_some() && !live_panel::editing()
+    }
+
+    /// A native tool's controls should have the keyboard.
+    fn wants_tools_focus(&self) -> bool {
+        (self.conn_native() || self.live_native()) && self.side.focused
     }
 
     /// A theme whose background is the chrome's, for drawing its padding.
@@ -12503,6 +12527,69 @@ fn conn_event(hwnd: HWND, event: conn_view::Event) {
     }
 }
 
+/// One of the native tools' controls has the keyboard.
+fn tools_have_focus() -> bool {
+    conn_view::has_focus() || live_panel::has_focus()
+}
+
+/// Carries out what the user did in the session manager's controls.
+fn live_event(hwnd: HWND, event: live_panel::Event) {
+    use live_panel::Event;
+    let command = match event {
+        Event::Show(pane) => with_window(|w| w.live_action(Some(LiveAction::Show(pane)))).flatten(),
+        Event::Close(pane) => {
+            with_window(|w| w.live_action(Some(LiveAction::Close(pane)))).flatten()
+        }
+        Event::Rename(pane, text) => {
+            with_window(|w| {
+                w.live_view.cancel_rename();
+                let session = w.open_sessions().into_iter().find(|s| s.pane == pane);
+                // An unnamed session's row shows its target: left as it
+                // was, it stays unnamed.
+                let unchanged = session.is_some_and(|s| {
+                    s.name.is_none() && live::clean_name(&text).is_none_or(|n| n == s.target)
+                });
+                if !unchanged {
+                    w.rename_session(pane, Some(text));
+                }
+                w.end_rename();
+                w.refresh_chrome();
+            });
+            None
+        }
+        Event::RenameCancelled => {
+            with_window(|w| {
+                w.live_view.cancel_rename();
+                if w.rename_return.is_some() {
+                    w.end_rename();
+                }
+                w.refresh_chrome();
+            });
+            None
+        }
+        Event::Query(query) => {
+            with_window(|w| {
+                w.live_view.set_query(&query);
+                w.refresh_chrome();
+            });
+            None
+        }
+        Event::Focused => {
+            with_window(|w| {
+                if !w.side.focused {
+                    w.side.focused = true;
+                    w.refresh_chrome();
+                }
+            });
+            None
+        }
+        Event::Leave => with_window(|w| w.live_action(Some(LiveAction::Leave))).flatten(),
+    };
+    if let Some(command) = command {
+        run_command(hwnd, command);
+    }
+}
+
 fn session_menu(hwnd: HWND, host: Option<String>) {
     const CONNECT: u32 = 1;
     const SPLIT: u32 = 2;
@@ -14048,11 +14135,31 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
             }
             WM_TOOLS_FOCUS => {
                 // Checked again now: a click may have moved the focus since.
-                let want = with_window(|w| w.wants_conn_focus()).unwrap_or(false);
-                if wparam.0 == 1 && want {
-                    conn_view::focus_tree();
-                } else if wparam.0 == 0 && !want && conn_view::has_focus() {
-                    let _ = SetFocus(Some(hwnd));
+                let (want, conn, live, rename) = with_window(|w| {
+                    (
+                        w.wants_tools_focus(),
+                        w.conn_native(),
+                        w.live_native(),
+                        w.wants_name_edit()
+                            .then(|| w.live_view.renaming_pane())
+                            .flatten(),
+                    )
+                })
+                .unwrap_or_default();
+                match wparam.0 {
+                    2 if want => match rename {
+                        Some(pane) => live_panel::edit_name(pane),
+                        // A second post while the name is edited: the
+                        // edit keeps the keyboard.
+                        None if live_panel::editing() => {}
+                        None => live_panel::focus_list(),
+                    },
+                    1 if want && conn => conn_view::focus_tree(),
+                    1 if want && live => live_panel::focus_list(),
+                    0 if !want && tools_have_focus() => {
+                        let _ = SetFocus(Some(hwnd));
+                    }
+                    _ => {}
                 }
                 LRESULT(0)
             }

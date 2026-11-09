@@ -22,10 +22,9 @@ use std::collections::HashSet;
 
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
-    BeginPaint, COLOR_WINDOW, COLOR_WINDOWTEXT, CreateFontIndirectW, DT_LEFT, DT_NOPREFIX,
-    DT_SINGLELINE, DT_VCENTER, DeleteObject, DrawTextW, EndPaint, FillRect, GetSysColor,
-    GetSysColorBrush, HFONT, HGDIOBJ, LOGFONTW, PAINTSTRUCT, ScreenToClient, SelectObject,
-    SetBkMode, SetTextColor, TRANSPARENT,
+    BeginPaint, COLOR_WINDOW, COLOR_WINDOWTEXT, DT_LEFT, DT_NOPREFIX, DT_SINGLELINE, DT_VCENTER,
+    DeleteObject, DrawTextW, EndPaint, FillRect, GetSysColor, GetSysColorBrush, HFONT, HGDIOBJ,
+    PAINTSTRUCT, ScreenToClient, SelectObject, SetBkMode, SetTextColor, TRANSPARENT,
 };
 use windows::Win32::UI::Controls::{
     EM_SETCUEBANNER, EM_SETSEL, HTREEITEM, NM_DBLCLK, NM_RCLICK, NM_SETFOCUS, NMHDR, NMTREEVIEWW,
@@ -36,24 +35,22 @@ use windows::Win32::UI::Controls::{
     TVN_KEYDOWN, TVS_EX_DOUBLEBUFFER, TVS_EX_FADEINOUTEXPANDOS, TVS_FULLROWSELECT, TVS_HASBUTTONS,
     TVS_INFOTIP, TVS_LINESATROOT, TVS_SHOWSELALWAYS, WC_BUTTONW, WC_EDITW, WC_TREEVIEWW,
 };
-use windows::Win32::UI::HiDpi::SystemParametersInfoForDpi;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    GetFocus, GetKeyState, SetFocus, VK_CONTROL, VK_DELETE, VK_DOWN, VK_F2, VK_F5, VK_INSERT,
-    VK_SHIFT,
+    GetFocus, SetFocus, VK_CONTROL, VK_DELETE, VK_DOWN, VK_F2, VK_F5, VK_INSERT, VK_SHIFT,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     BN_CLICKED, BS_DEFPUSHBUTTON, BS_PUSHBUTTON, CreateWindowExW, DefWindowProcW, EN_CHANGE,
-    EN_SETFOCUS, ES_AUTOHSCROLL, GetClientRect, GetMessagePos, GetWindowTextLengthW,
-    GetWindowTextW, HMENU, IDC_ARROW, IDCANCEL, IDOK, IsChild, IsDialogMessageW, IsWindowVisible,
-    LoadCursorW, MSG, MoveWindow, NONCLIENTMETRICSW, RegisterClassW, SPI_GETNONCLIENTMETRICS,
-    SW_HIDE, SW_SHOWNA, SendMessageW, SetWindowTextW, ShowWindow, WINDOW_EX_STYLE, WINDOW_STYLE,
-    WM_CHAR, WM_COMMAND, WM_ERASEBKGND, WM_KEYDOWN, WM_NOTIFY, WM_PAINT, WM_SETFONT, WNDCLASSW,
-    WS_BORDER, WS_CHILD, WS_CLIPCHILDREN, WS_CLIPSIBLINGS, WS_EX_CONTROLPARENT, WS_TABSTOP,
-    WS_VISIBLE,
+    EN_SETFOCUS, ES_AUTOHSCROLL, GetClientRect, GetMessagePos, GetWindowTextLengthW, HMENU,
+    IDC_ARROW, IDCANCEL, IDOK, IsChild, IsDialogMessageW, IsWindowVisible, LoadCursorW, MSG,
+    MoveWindow, RegisterClassW, SW_HIDE, SW_SHOWNA, SendMessageW, SetWindowTextW, ShowWindow,
+    WINDOW_EX_STYLE, WINDOW_STYLE, WM_CHAR, WM_COMMAND, WM_ERASEBKGND, WM_KEYDOWN, WM_NOTIFY,
+    WM_PAINT, WNDCLASSW, WS_BORDER, WS_CHILD, WS_CLIPCHILDREN, WS_CLIPSIBLINGS,
+    WS_EX_CONTROLPARENT, WS_TABSTOP, WS_VISIBLE,
 };
 use windows::core::{PCWSTR, PWSTR, w};
 
 use crate::layout::Rect;
+use crate::native::{fonts, key_down, scale, search_text, set_font, wide};
 use crate::sessions::{SideAction, TreeHost, TreeNode};
 
 /// What the user did in the panel.
@@ -123,66 +120,6 @@ thread_local! {
 
 fn handles() -> Option<Handles> {
     STATE.with(|s| s.try_borrow().ok()?.as_ref().map(|s| s.h))
-}
-
-fn wide(s: &str) -> Vec<u16> {
-    s.encode_utf16().chain(std::iter::once(0)).collect()
-}
-
-fn scale(dip: i32, dpi: u32) -> i32 {
-    dip * dpi as i32 / 96
-}
-
-/// The system message font at `dpi`, and a larger, semi-bold one for the
-/// title.
-fn fonts(dpi: u32) -> (HFONT, HFONT) {
-    let mut m = NONCLIENTMETRICSW {
-        cbSize: size_of::<NONCLIENTMETRICSW>() as u32,
-        ..Default::default()
-    };
-    // SAFETY: a correctly sized struct for the call to fill.
-    let ok = unsafe {
-        SystemParametersInfoForDpi(
-            SPI_GETNONCLIENTMETRICS.0,
-            m.cbSize,
-            Some((&raw mut m).cast()),
-            0,
-            dpi,
-        )
-    }
-    .is_ok();
-    let mut lf = if ok {
-        m.lfMessageFont
-    } else {
-        let mut lf = LOGFONTW {
-            lfHeight: -scale(12, dpi),
-            lfWeight: 400,
-            ..Default::default()
-        };
-        for (d, s) in lf.lfFaceName.iter_mut().zip("Segoe UI".encode_utf16()) {
-            *d = s;
-        }
-        lf
-    };
-    let mut title = lf;
-    title.lfHeight = lf.lfHeight * 4 / 3;
-    title.lfWeight = 600;
-    lf.lfQuality = windows::Win32::Graphics::Gdi::CLEARTYPE_QUALITY;
-    title.lfQuality = lf.lfQuality;
-    // SAFETY: valid LOGFONTs; the fonts are deleted when replaced.
-    unsafe { (CreateFontIndirectW(&lf), CreateFontIndirectW(&title)) }
-}
-
-fn set_font(hwnd: HWND, font: HFONT) {
-    // SAFETY: plain message to our own control.
-    unsafe {
-        SendMessageW(
-            hwnd,
-            WM_SETFONT,
-            Some(WPARAM(font.0 as usize)),
-            Some(LPARAM(1)),
-        );
-    }
 }
 
 /// Creates the panel, hidden, as a child of `main`. `import` is the menu
@@ -571,21 +508,6 @@ fn emit(e: Event) {
         return;
     };
     handler(main, e);
-}
-
-fn key_down(vk: u16) -> bool {
-    // SAFETY: plain query.
-    unsafe { GetKeyState(i32::from(vk)) < 0 }
-}
-
-fn search_text(search: HWND) -> String {
-    // SAFETY: a buffer sized from the control's own length.
-    unsafe {
-        let n = GetWindowTextLengthW(search).max(0) as usize;
-        let mut buf = vec![0u16; n + 1];
-        let got = GetWindowTextW(search, &mut buf).max(0) as usize;
-        String::from_utf16_lossy(buf.get(..got).unwrap_or_default())
-    }
 }
 
 /// Runs in the message loop before a message is translated and sent;

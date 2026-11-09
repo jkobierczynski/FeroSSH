@@ -37,6 +37,10 @@ mod desktop;
 #[cfg_attr(not(windows), allow(dead_code))]
 #[path = "desktop_off.rs"]
 mod desktop;
+#[cfg(windows)]
+mod live_panel;
+#[cfg(windows)]
+mod native;
 // Platform-neutral, tested everywhere; only the Windows build uses them.
 #[cfg_attr(not(windows), allow(dead_code))]
 mod files;
