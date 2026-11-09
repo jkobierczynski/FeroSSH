@@ -3267,7 +3267,7 @@ impl Window {
                     host,
                     port,
                     addr,
-                } => match self.desktops.remove(&(connection, host, port)) {
+                } => match self.desktops.remove(&(connection, host.clone(), port)) {
                     Some(DesktopWant::Rdp {
                         pane,
                         size,
@@ -3301,7 +3301,9 @@ impl Window {
                         self.show(pane, &note);
                         self.refresh(pane);
                     }
-                    Some(DesktopWant::Tab(want)) => self.desktop_tab(connection, want, &addr),
+                    Some(DesktopWant::Tab(want)) => {
+                        self.desktop_tab(connection, want, &host, &addr);
+                    }
                     Some(DesktopWant::Vnc {
                         pane,
                         password,
@@ -3899,9 +3901,10 @@ impl Window {
         }
     }
 
-    /// Opens the built-in viewer on the tunnel at `addr` in a new tab.
+    /// Opens the built-in viewer on the tunnel at `addr` in a new tab;
+    /// `host` is the desktop server as the SSH server reaches it.
     #[cfg(feature = "viewer")]
-    fn desktop_tab(&mut self, connection: ChannelId, want: TabWant, addr: &str) {
+    fn desktop_tab(&mut self, connection: ChannelId, want: TabWant, host: &str, addr: &str) {
         let TabWant {
             label,
             user,
@@ -3910,6 +3913,17 @@ impl Window {
             size,
             clip_limit,
         } = want;
+        // The RDP viewer takes the server's certificate as it is, which is
+        // safe only where the SSH host key already identified the server.
+        if protocol == Protocol::Rdp && !crate::forwards::on_ssh_host(host) {
+            self.queued.push(Command::Notice(format!(
+                "The built-in RDP viewer only opens desktops on the SSH server itself; {} is \
+                 another machine, whose certificate it cannot check. Open it with Remote \
+                 Desktop Connection instead.",
+                crate::ssh::sanitize(host)
+            )));
+            return;
+        }
         let id = self.new_tab_pane();
         // The server draws the desktop at the size of the tab, when it
         // can, unless a size was set.
@@ -3970,7 +3984,7 @@ impl Window {
     }
 
     #[cfg(not(feature = "viewer"))]
-    fn desktop_tab(&mut self, _connection: ChannelId, _want: TabWant, _addr: &str) {}
+    fn desktop_tab(&mut self, _connection: ChannelId, _want: TabWant, _host: &str, _addr: &str) {}
 
     /// Gives each remote desktop its pane's size, after the layout
     /// settled.

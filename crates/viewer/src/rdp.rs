@@ -9,7 +9,11 @@
 //! tunnel ends on the server itself, whose SSH host key FeroSSH already
 //! checked, and xrdp and Windows use self-signed certificates anyway. TLS
 //! still verifies that the server holds the certificate's key, and NLA
-//! binds the login to that key.
+//! binds the login to that key. That holds only for a desktop on the SSH
+//! server (`localhost` or a loopback address there), so the window opens
+//! this viewer for no other RDP host (`forwards::on_ssh_host`); a desktop
+//! on another machine behind the SSH server goes to Remote Desktop
+//! Connection, which checks and remembers its certificate.
 //!
 //! Keys go to the server as scan codes, read with the keyboard layout the
 //! window reports, so the server types what the PC's keyboard shows.
