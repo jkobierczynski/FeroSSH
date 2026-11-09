@@ -239,7 +239,7 @@ Ctrl+Shift+E shows the focused pane's host over SFTP in the side pane, on the sa
 
 **Queue.** Tab again moves to the transfer queue: Space pauses or resumes, R retries, X cancels and C clears finished transfers. Three files move at once (`ParallelTransfers`). A dropped connection pauses the queue, and it carries on from where each file stopped when you log in again.
 
-**Safe file names.** An existing file is never overwritten without asking (Overwrite, Skip or Keep both, Shift for all). Server names Windows cannot hold (`CON`, `a:b`, trailing dots) are made safe or refused, and a folder download does not follow links out of the folder. Partial files are `.part` locally and `.filepart` on the server until complete. Session > Verify transfers compares SHA-256 sums on both ends after each file.
+**Safe file names.** An existing file is never overwritten without asking (Overwrite, Skip or Keep both, Shift for all). Server names Windows cannot hold (`CON`, `a:b`, trailing dots) are made safe or refused, and a folder download does not follow links out of the folder. Partial files are `.part` locally and `.filepart` on the server until complete. Session > Verify transfers compares SHA-256 sums on both ends after each file. Resumed transfers always require a matching SHA-256 check before the partial file becomes the destination, even when that setting is off. A mismatch fails the transfer and discards the partial file; if the checksum cannot be obtained (the server needs `sha256sum`), the transfer fails and retains the partial file. Remove the partial file to restart from scratch.
 
 ### Following cd
 

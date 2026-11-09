@@ -536,10 +536,16 @@ fn check_key_size(key: &KeyData, what: &str) -> Result<(), Failure> {
 }
 
 /// What makes a host certificate unusable before the UI sees it: the wrong
-/// type, a bad CA signature, or a CA key or signature outside the policy.
+/// type, unsupported critical options, a bad CA signature, or a CA key
+/// or signature outside the policy.
 fn cert_problem(cert: &Certificate) -> Option<String> {
     if cert.cert_type() != CertType::Host {
         return Some("is a user certificate, not a host certificate".into());
+    }
+    // Critical options constrain validity and must never be ignored. No
+    // host-certificate critical options are currently supported.
+    if !cert.critical_options().is_empty() {
+        return Some("contains unsupported critical options".into());
     }
     let ca = cert.signature_key();
     match ca.algorithm() {
@@ -1447,6 +1453,41 @@ async fn password(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn host_certificates_reject_critical_options_but_allow_extensions()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use russh::keys::ssh_key::{PrivateKey, certificate::Builder, private::Ed25519Keypair};
+
+        let ca = PrivateKey::from(Ed25519Keypair::from_seed(&[1; 32]));
+        let host = PrivateKey::from(Ed25519Keypair::from_seed(&[2; 32]));
+        for (critical, extension) in [(false, false), (false, true), (true, false)] {
+            let mut builder = Builder::new(
+                vec![3; 32],
+                host.public_key().key_data().clone(),
+                0,
+                u64::MAX,
+            )?;
+            builder.cert_type(CertType::Host)?;
+            builder.valid_principal("host.example")?;
+            if critical {
+                builder.critical_option("unknown@example", "required")?;
+            }
+            if extension {
+                builder.extension("unknown@example", "optional")?;
+            }
+            let cert = builder.sign(&ca)?;
+            let cert = Certificate::from_bytes(&cert.to_bytes()?)?;
+            // The rejection must be due to the critical option, not a bad
+            // signature or malformed certificate.
+            cert.verify_signature()?;
+            assert_eq!(
+                cert_problem(&cert).as_deref(),
+                critical.then_some("contains unsupported critical options")
+            );
+        }
+        Ok(())
+    }
 
     #[test]
     fn signatures_are_ssh_strings() {

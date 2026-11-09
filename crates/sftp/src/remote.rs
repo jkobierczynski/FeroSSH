@@ -211,6 +211,8 @@ struct Down {
     /// Chunks that arrived ahead of `written`.
     ahead: BTreeMap<u64, Vec<u8>>,
     check: Check,
+    /// Reused bytes must be verified before promoting the partial file.
+    resumed: bool,
 }
 
 #[derive(Debug)]
@@ -229,6 +231,8 @@ struct Up {
     /// The numbered name being probed for "keep both"; 0 for none.
     numbered: u32,
     check: Check,
+    /// Reused bytes must be verified before promoting the partial file.
+    resumed: bool,
 }
 
 /// Verification after a transfer: both sides' SHA-256.
@@ -241,6 +245,10 @@ struct Check {
 impl Check {
     fn complete(&self) -> bool {
         self.local.is_some() && self.remote.is_some()
+    }
+
+    fn verified(&self) -> bool {
+        matches!((&self.local, &self.remote), (Some(Ok(a)), Some(Ok(b))) if a.eq_ignore_ascii_case(b))
     }
 
     fn mismatch(&self) -> bool {
@@ -1022,6 +1030,7 @@ impl Remote {
                     read_all: false,
                     numbered: 0,
                     check: Check::default(),
+                    resumed: false,
                 }));
                 self.job_request(
                     i,
@@ -1064,9 +1073,11 @@ impl Remote {
                 let Some(handle) = d.handle else {
                     return;
                 };
-                while d.inflight < WINDOW && d.next < d.end {
-                    let len =
-                        u32::try_from((d.end - d.next).min(u64::from(CHUNK))).unwrap_or(CHUNK);
+                // Completed replies still occupy the window until the gap is filled.
+                let limit = d.written.saturating_add(WINDOW as u64 * u64::from(CHUNK));
+                while d.inflight < WINDOW && d.next < d.end.min(limit) {
+                    let len = u32::try_from((d.end.min(limit) - d.next).min(u64::from(CHUNK)))
+                        .unwrap_or(CHUNK);
                     ops.push((
                         SftpOp::Read {
                             handle,
@@ -1380,6 +1391,7 @@ impl Remote {
             inflight: 0,
             ahead: BTreeMap::new(),
             check: Check::default(),
+            resumed: resume > 0,
         }));
         self.job_request(
             i,
@@ -1543,6 +1555,7 @@ impl Remote {
         u.file = Some(file);
         u.next = resume;
         u.acked = resume;
+        u.resumed = resume > 0;
         let path = u.part.clone();
         self.job_request(
             i,
@@ -1604,7 +1617,7 @@ impl Remote {
                         return self.fail(i, why);
                     }
                     job.size = Some(d.written);
-                    if verify {
+                    if verify || d.resumed {
                         d.phase = Phase::Checking;
                         let (part, remote) = (d.part.clone(), job.remote.clone());
                         return self.start_check(i, part, remote);
@@ -1627,6 +1640,9 @@ impl Remote {
                         let path = u.part.clone();
                         self.request(SftpOp::Remove { path }, Purpose::Ignore);
                         return self.fail(i, MISMATCH.into());
+                    }
+                    if u.resumed && !u.check.verified() {
+                        return self.fail(i, "Cannot verify resumed upload; partial file retained. Restart the transfer from scratch.".into());
                     }
                     self.rename_upload(i);
                 }
@@ -1651,6 +1667,9 @@ impl Remote {
             let _ = std::fs::remove_file(&d.part);
             return self.fail(i, MISMATCH.into());
         }
+        if d.resumed && !d.check.verified() {
+            return self.fail(i, "Cannot verify resumed download; partial file retained. Restart the transfer from scratch.".into());
+        }
         let note = d.check.note();
         if let Err(e) = std::fs::rename(&d.part, &d.target) {
             let why = format!("{}: {e}", d.target.display());
@@ -1667,7 +1686,7 @@ impl Remote {
         let Run::Up(u) = &mut job.run else {
             return;
         };
-        if verify {
+        if verify || u.resumed {
             u.phase = Phase::Checking;
             let (local, part) = (job.local.clone(), u.part.clone());
             return self.start_check(i, local, part);

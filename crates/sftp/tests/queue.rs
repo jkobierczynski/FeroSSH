@@ -65,6 +65,7 @@ struct Fake {
     answered: usize,
     /// Return this instead of the real checksum.
     fake_sum: Option<String>,
+    checksum_unavailable: bool,
     /// Answer reads with half of what was asked.
     short_reads: bool,
 }
@@ -96,6 +97,7 @@ impl Fake {
             drop_after: None,
             answered: 0,
             fake_sum: None,
+            checksum_unavailable: false,
             short_reads: false,
         }
     }
@@ -263,6 +265,9 @@ impl Fake {
                 }
             }
             SftpOp::Checksum { path } => {
+                if self.checksum_unavailable {
+                    return one(failed(sftp_code::UNSUPPORTED));
+                }
                 if let Some(sum) = &self.fake_sum {
                     return one(SftpReply::Checksum(sum.clone()));
                 }
@@ -674,4 +679,116 @@ fn refuses_names_windows_cannot_hold() {
         attrs: FileAttrs::default(),
     };
     assert!(remote.download(&bad, &s.local()).is_err());
+}
+
+#[test]
+fn a_missing_first_block_bounds_read_ahead_and_recovers() {
+    for short in [false, true] {
+        let s = Scratch::new(if short { "gap-short" } else { "gap" });
+        let data = pattern(3 * 1024 * 1024 + 17);
+        fs::write(s.remote().join("gap.bin"), &data).unwrap();
+        let (mut remote, mut fake) = connected(&s.remote());
+        fake.short_reads = short;
+        remote
+            .download(&entry(&remote, "gap.bin"), &s.local())
+            .unwrap();
+        let mut held = None;
+        let mut buffered = 0;
+        let mut turns = 0;
+        loop {
+            let out = remote.take_outbox();
+            if out.is_empty() {
+                break;
+            }
+            turns += 1;
+            assert!(
+                turns < 100,
+                "reading never stopped behind the missing block"
+            );
+            for msg in out {
+                let Message::SftpRequest { channel, id, op } = msg else {
+                    panic!("unexpected message {msg:?}");
+                };
+                if let SftpOp::Read { offset, len, .. } = &op {
+                    assert!(
+                        offset + u64::from(*len) <= 1024 * 1024,
+                        "read escaped the bounded window: {offset} + {len}"
+                    );
+                    if *offset == 0 {
+                        assert!(held.is_none());
+                        held = Some((channel, id, op));
+                        continue;
+                    }
+                }
+                for reply in fake.serve(op) {
+                    if let SftpReply::Data(bytes) = &reply {
+                        buffered += bytes.len();
+                    }
+                    remote.on_message(Message::SftpReply { channel, id, reply });
+                }
+            }
+        }
+        assert!(buffered > 0 && buffered <= 1024 * 1024);
+        assert_eq!(remote.jobs()[0].done, 0);
+        assert_eq!(remote.jobs()[0].state, State::Running);
+        let (channel, id, op) = held.expect("first read was held");
+        for reply in fake.serve(op) {
+            remote.on_message(Message::SftpReply { channel, id, reply });
+        }
+        assert!(run(&mut remote, &mut fake));
+        assert_eq!(remote.jobs()[0].state, State::Done);
+        assert_eq!(fs::read(s.local().join("gap.bin")).unwrap(), data);
+    }
+}
+
+#[test]
+fn stale_partial_downloads_are_never_promoted_without_verification_enabled() {
+    for partial in [b"OLD!".as_slice(), b"OLD!tail".as_slice()] {
+        let s = Scratch::new("stale-down");
+        fs::write(s.remote().join("f"), b"NEW!tail").unwrap();
+        fs::write(s.local().join("f.part"), partial).unwrap();
+        let (mut remote, mut fake) = connected(&s.remote());
+        assert!(!remote.verify);
+        remote.download(&entry(&remote, "f"), &s.local()).unwrap();
+        assert!(run(&mut remote, &mut fake));
+        assert_eq!(remote.jobs()[0].state, State::Failed);
+        assert!(!s.local().join("f").exists());
+    }
+}
+
+#[test]
+fn stale_partial_uploads_are_never_promoted_without_verification_enabled() {
+    for partial in [b"OLD!".as_slice(), b"OLD!tail".as_slice()] {
+        let s = Scratch::new("stale-up");
+        let local = s.local().join("f");
+        fs::write(&local, b"NEW!tail").unwrap();
+        fs::write(s.remote().join("f.filepart"), partial).unwrap();
+        let (mut remote, mut fake) = connected(&s.remote());
+        assert!(!remote.verify);
+        remote.upload(&local, b"/").unwrap();
+        assert!(run(&mut remote, &mut fake));
+        assert_eq!(remote.jobs()[0].state, State::Failed);
+        assert!(!s.remote().join("f").exists());
+    }
+}
+
+#[test]
+fn resumed_transfers_fail_closed_when_checksums_are_unavailable() {
+    let s = Scratch::new("resume-no-checksum");
+    fs::write(s.remote().join("down"), b"correct content").unwrap();
+    fs::write(s.local().join("down.part"), b"correct").unwrap();
+    let up = s.local().join("up");
+    fs::write(&up, b"correct content").unwrap();
+    fs::write(s.remote().join("up.filepart"), b"correct").unwrap();
+    let (mut remote, mut fake) = connected(&s.remote());
+    assert!(!remote.verify);
+    fake.checksum_unavailable = true;
+    remote
+        .download(&entry(&remote, "down"), &s.local())
+        .unwrap();
+    remote.upload(&up, b"/").unwrap();
+    assert!(run(&mut remote, &mut fake));
+    assert!(remote.jobs().iter().all(|j| j.state == State::Failed));
+    assert!(!s.local().join("down").exists());
+    assert!(!s.remote().join("up").exists());
 }
