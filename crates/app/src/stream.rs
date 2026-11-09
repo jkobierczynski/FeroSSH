@@ -136,6 +136,32 @@ pub fn words(line: &str) -> Option<Vec<String>> {
     (!out.is_empty() && out.len() <= ferostream_proto::MAX_ARGS).then_some(out)
 }
 
+/// The remote app clipboard's ways, as Session > Remote apps > Clipboard
+/// lists them and `RemoteAppClipboard` spells them.
+pub const CLIPBOARD_WAYS: [&str; 4] = ["both", "to-host", "from-host", "off"];
+
+/// Which ways copied text travels for a remote app: the global setting,
+/// narrowed (never widened) by its connection's `limit`.
+pub fn app_clipboard(
+    settings: &ferossh_config::settings::Settings,
+    limit: Option<&str>,
+) -> ferostream_client::transport::Clipboard {
+    use ferostream_client::transport::Clipboard;
+    let global = settings
+        .remote_app_clipboard
+        .as_deref()
+        .and_then(Clipboard::from_name)
+        .unwrap_or(Clipboard::BOTH);
+    let limit = limit
+        .and_then(Clipboard::from_name)
+        .unwrap_or(Clipboard::BOTH);
+    Clipboard {
+        to_host: global.to_host && limit.to_host,
+        from_host: global.from_host && limit.from_host,
+        selection: settings.remote_app_share_selection,
+    }
+}
+
 /// Writes one frame.
 pub fn write_frame(w: &mut impl Write, body: &[u8]) -> io::Result<()> {
     let len = u32::try_from(body.len()).map_err(|_| io::Error::other("frame too large"))?;
@@ -206,6 +232,44 @@ mod tests {
     use super::*;
     use ferostream_proto::PREAMBLE;
     use ferostream_proto::tile::Tile;
+
+    #[test]
+    fn a_connection_only_narrows_the_clipboard() {
+        use ferossh_config::settings::Settings;
+        let mut s = Settings::default();
+        let c = app_clipboard(&s, None);
+        assert!(c.to_host && c.from_host && !c.selection);
+        let c = app_clipboard(&s, Some("to-host"));
+        assert!(c.to_host && !c.from_host);
+        s.remote_app_clipboard = Some("from-host".into());
+        s.remote_app_share_selection = true;
+        // Global from-host, connection to-host: nothing either way.
+        let c = app_clipboard(&s, Some("to-host"));
+        assert!(!c.to_host && !c.from_host);
+        // A connection cannot widen it ("both" is no limit).
+        let c = app_clipboard(&s, Some("both"));
+        assert!(!c.to_host && c.from_host && c.selection);
+        assert_eq!(
+            c.rules(),
+            ferostream_proto::Message::ClipboardRules {
+                send: true,
+                selection: true
+            }
+        );
+        s.remote_app_clipboard = Some("off".into());
+        let c = app_clipboard(&s, None);
+        assert!(!c.to_host && !c.from_host);
+        assert_eq!(
+            c.rules(),
+            ferostream_proto::Message::ClipboardRules {
+                send: false,
+                selection: false
+            }
+        );
+        for way in CLIPBOARD_WAYS {
+            assert!(ferostream_client::transport::Clipboard::from_name(way).is_some());
+        }
+    }
 
     fn decode_all(mut bytes: &[u8]) -> Vec<FromDecoder> {
         let mut out = Vec::new();
