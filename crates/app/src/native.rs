@@ -30,9 +30,9 @@ pub fn set_edge_grab(main: HWND, grab: Option<crate::layout::Rect>) {
     EDGE.with(|e| e.set(grab.map(|g| (main, g))));
 }
 
-/// Lets the mouse through `panel` and every control in it (a list's
-/// header too) where it is over the edge's strip. Called once the
-/// controls are made.
+/// Lets the mouse through `panel` and every control in it at the time of
+/// the call (a list's header too) where it is over the edge's strip.
+/// Called again when controls are added later; a repeat is harmless.
 pub fn pass_edge(panel: HWND) {
     unsafe extern "system" fn each(hwnd: HWND, _: LPARAM) -> windows::core::BOOL {
         // SAFETY: subclassing our own window with a procedure that lives

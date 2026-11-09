@@ -295,21 +295,12 @@ fn page_rows(form: &Form, section: usize) -> Vec<NativeRow> {
 
 /// Whether two rows need the same controls (only their values differ).
 fn same_shape(a: &NativeRow, b: &NativeRow) -> bool {
+    // A hint is only a cue banner: it changes in place (the Host hint
+    // follows the Name as it is typed).
     a.field == b.field
         && a.label == b.label
         && match (&a.kind, &b.kind) {
-            (
-                NativeKind::Text {
-                    hint: h1,
-                    locked: l1,
-                    ..
-                },
-                NativeKind::Text {
-                    hint: h2,
-                    locked: l2,
-                    ..
-                },
-            ) => h1 == h2 && l1 == l2,
+            (NativeKind::Text { locked: l1, .. }, NativeKind::Text { locked: l2, .. }) => l1 == l2,
             (NativeKind::Choice { options: o1, .. }, NativeKind::Choice { options: o2, .. }) => {
                 o1 == o2
             }
@@ -424,7 +415,14 @@ unsafe fn set_value(p: Placed, row: &NativeRow) {
     // SAFETY: our own controls; the text lives through each call.
     unsafe {
         match &row.kind {
-            NativeKind::Text { value, .. } => {
+            NativeKind::Text { value, hint, .. } => {
+                let cue = wide(hint);
+                SendMessageW(
+                    p.control,
+                    EM_SETCUEBANNER,
+                    Some(WPARAM(1)),
+                    Some(LPARAM(cue.as_ptr() as isize)),
+                );
                 if search_text(p.control) != *value {
                     let text = wide(value);
                     let _ = SetWindowTextW(p.control, PCWSTR(text.as_ptr()));
@@ -576,6 +574,8 @@ fn rebuild() {
             });
         }
         with_state(|s| s.placed = placed);
+        // The new controls let the mouse through at the tools pane's edge.
+        pass_edge(h.page);
         layout(h);
         if let Some(c) = focus_to {
             let _ = SetFocus(Some(c));
