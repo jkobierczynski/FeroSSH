@@ -87,6 +87,9 @@ pub struct Values {
     /// Narrows the remote apps' clipboard: empty, `to-host`, `from-host`
     /// or `off`.
     pub clipboard: String,
+    /// Narrows the desktops' clipboard: empty, `to-host`, `from-host` or
+    /// `off`.
+    pub desk_clipboard: String,
     pub legacy: bool,
     /// Where the password comes from: see [`PASSWORD_CHOICES`].
     pub password: usize,
@@ -204,6 +207,7 @@ impl Values {
         self.copy_agent = p.remote_app_copy_agent;
         self.remove_agent = p.remote_app_remove_agent;
         self.clipboard = p.remote_app_clipboard.clone().unwrap_or_default();
+        self.desk_clipboard = p.desktop_clipboard.clone().unwrap_or_default();
         self.desktop_size = p
             .desktop_size
             .and_then(|d| d.fixed())
@@ -249,6 +253,7 @@ enum Field {
     CopyAgent,
     RemoveAgent,
     Clipboard,
+    DeskClipboard,
     Legacy,
     Password,
     PasswordCommand,
@@ -286,7 +291,8 @@ impl Field {
             Field::RemoteApp => "Remote app",
             Field::CopyAgent => "Copy agent",
             Field::RemoveAgent => "Clean up",
-            Field::Clipboard => "Clipboard",
+            Field::Clipboard => "App clip",
+            Field::DeskClipboard => "Desk clip",
             Field::Legacy => "Old crypto",
             Field::Password => "Password",
             Field::PasswordCommand => "Command",
@@ -309,6 +315,7 @@ impl Field {
                 | Field::CopyAgent
                 | Field::RemoveAgent
                 | Field::Clipboard
+                | Field::DeskClipboard
                 | Field::Password
                 | Field::Framing
                 | Field::Flow
@@ -502,10 +509,18 @@ impl SessionForm {
                     out.push(Item::Field(Field::Jump));
                 }
                 SessionKind::Rdp | SessionKind::Vnc => {
-                    out.extend([Field::Via, Field::DesktopSize].map(Item::Field));
+                    out.extend(
+                        [Field::Via, Field::DesktopSize, Field::DeskClipboard].map(Item::Field),
+                    );
                 }
                 SessionKind::Xvfb => out.extend(
-                    [Field::Via, Field::VirtualDesktop, Field::DesktopSize].map(Item::Field),
+                    [
+                        Field::Via,
+                        Field::VirtualDesktop,
+                        Field::DesktopSize,
+                        Field::DeskClipboard,
+                    ]
+                    .map(Item::Field),
                 ),
                 SessionKind::RemoteApp => {
                     out.extend(
@@ -567,6 +582,7 @@ impl SessionForm {
                         Field::VncPort,
                         Field::VirtualDesktop,
                         Field::DesktopSize,
+                        Field::DeskClipboard,
                         Field::RemoteApp,
                         Field::CopyAgent,
                         Field::RemoveAgent,
@@ -661,6 +677,7 @@ impl SessionForm {
             | Field::CopyAgent
             | Field::RemoveAgent
             | Field::Clipboard
+            | Field::DeskClipboard
             | Field::Password
             | Field::Framing
             | Field::Flow => {
@@ -702,6 +719,7 @@ impl SessionForm {
             | Field::CopyAgent
             | Field::RemoveAgent
             | Field::Clipboard
+            | Field::DeskClipboard
             | Field::Password
             | Field::Framing
             | Field::Flow => {
@@ -741,6 +759,13 @@ impl SessionForm {
                 "from-host" => "only host to Windows",
                 "off" => "off for this host",
                 _ => "as in Session > Remote apps",
+            }
+            .to_owned(),
+            Field::DeskClipboard => match v.desk_clipboard.as_str() {
+                "to-host" => "only Windows to host",
+                "from-host" => "only host to Windows",
+                "off" => "off for this host",
+                _ => "as in Session > Desktop clipboard",
             }
             .to_owned(),
             Field::Framing if v.framing.is_empty() => "8N1".to_owned(),
@@ -835,10 +860,15 @@ impl SessionForm {
             Field::Legacy => v.legacy = !v.legacy,
             Field::CopyAgent => v.copy_agent = tri(v.copy_agent, forward),
             Field::RemoveAgent => v.remove_agent = tri(v.remove_agent, forward),
-            Field::Clipboard => {
+            Field::Clipboard | Field::DeskClipboard => {
                 let all = ["", "to-host", "from-host", "off"];
-                let i = all.iter().position(|c| *c == v.clipboard).unwrap_or(0);
-                v.clipboard = all
+                let way = if f == Field::Clipboard {
+                    &mut v.clipboard
+                } else {
+                    &mut v.desk_clipboard
+                };
+                let i = all.iter().position(|c| *c == way.as_str()).unwrap_or(0);
+                *way = all
                     .get(step(i, all.len()))
                     .copied()
                     .unwrap_or("")
@@ -921,6 +951,7 @@ impl SessionForm {
             | Field::CopyAgent
             | Field::RemoveAgent
             | Field::Clipboard
+            | Field::DeskClipboard
             | Field::Password
             | Field::Framing
             | Field::Flow => String::new(),
@@ -1574,6 +1605,7 @@ impl SessionForm {
         p.remote_app_copy_agent = v.copy_agent;
         p.remote_app_remove_agent = v.remove_agent;
         p.remote_app_clipboard = Some(v.clipboard.clone()).filter(|c| !c.is_empty());
+        p.desktop_clipboard = Some(v.desk_clipboard.clone()).filter(|c| !c.is_empty());
         p.desktop_size = ferossh_config::settings::DesktopSize::parse(&v.desktop_size)
             .filter(|d| *d != ferossh_config::settings::DesktopSize::Follow);
         p.legacy_algorithms = v.legacy;
@@ -1883,14 +1915,29 @@ mod tests {
         f.values.virtual_desktop = "firefox".into();
         assert_eq!(f.check(), Ok(()));
         let items = f.items();
-        for field in [Field::Via, Field::VirtualDesktop, Field::DesktopSize] {
+        for field in [
+            Field::Via,
+            Field::VirtualDesktop,
+            Field::DesktopSize,
+            Field::DeskClipboard,
+        ] {
             assert!(items.contains(&Item::Field(field)), "{field:?}");
         }
         assert!(!items.contains(&Item::Field(Field::Host)));
+        // The clipboard only narrows: unset, to-host, from-host, off.
+        assert_eq!(
+            f.choice(Field::DeskClipboard),
+            "as in Session > Desktop clipboard"
+        );
+        f.cycle(Field::DeskClipboard, true);
+        f.cycle(Field::DeskClipboard, true);
+        assert_eq!(f.choice(Field::DeskClipboard), "only host to Windows");
+        assert_eq!(f.values.clipboard, "", "the remote apps' stays");
         let mut hosts = Vec::new();
         let mut settings = Settings::default();
         f.apply(&mut hosts, &mut settings);
         let p = settings.profile("lab-desk").unwrap();
+        assert_eq!(p.desktop_clipboard.as_deref(), Some("from-host"));
         assert_eq!(p.kind, SessionKind::Xvfb);
         assert_eq!(p.via.as_deref(), Some("bastion"));
         assert_eq!(p.virtual_desktop.as_deref(), Some("firefox"));
@@ -2093,9 +2140,9 @@ mod tests {
         down(&mut f, 11);
         f.key(SideKey::Enter { split: false }, 30);
         // tmux, tmux panes, Start dir, Forward 1, RDP port, VNC port,
-        // Virtual desk, Desk size, Remote app, Copy agent, Clean up,
-        // Clipboard, Old crypto.
-        down(&mut f, 14);
+        // Virtual desk, Desk size, Desk clip, Remote app, Copy agent,
+        // Clean up, App clip, Old crypto.
+        down(&mut f, 15);
         assert_eq!(f.focused_field(), Some(Field::LoginStep(0)));
         let t = texts(&mut f);
         assert!(

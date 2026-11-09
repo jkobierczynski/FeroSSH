@@ -13,6 +13,8 @@
 //! RemoteAppCopyAgent yes
 //! RemoteAppRemoveAgent no
 //! RemoteAppShareSelection no
+//! DesktopClipboard both
+//! DesktopShareSelection no
 //! Favourite web
 //! ThemeRule
 //!     Hosts prod-* *.prod.example.com
@@ -34,6 +36,7 @@
 //!     VncPort 5901
 //!     VirtualDesktop startxfce4
 //!     DesktopSize 1920x1080
+//!     DesktopClipboard from-host
 //! Profile office-pc
 //!     Type rdp
 //!     Via bastion
@@ -163,6 +166,33 @@ pub struct Profile {
     /// apps and Windows: `to-host`, `from-host` or `off`. It only narrows
     /// the global setting (Session > Remote apps), never widens it.
     pub remote_app_clipboard: Option<String>,
+    /// Limits which way copied text travels between this host's remote
+    /// and virtual desktops and Windows: `to-host`, `from-host` or `off`.
+    /// It only narrows the global `DesktopClipboard`, never widens it.
+    pub desktop_clipboard: Option<String>,
+}
+
+/// The ways copied text can travel, as the clipboard settings spell
+/// them: `both` (the same as unset), `to-host` (only from Windows to the
+/// host), `from-host` (only from the host to Windows) and `off`.
+pub const CLIPBOARD_WAYS: [&str; 4] = ["both", "to-host", "from-host", "off"];
+
+/// The clipboard way `name` (one of [`CLIPBOARD_WAYS`], any case), or
+/// `None`.
+pub fn clipboard_way(name: &str) -> Option<String> {
+    let w = name.to_ascii_lowercase();
+    CLIPBOARD_WAYS.contains(&w.as_str()).then_some(w)
+}
+
+/// Which ways a clipboard way lets text travel: (to the host, from the
+/// host). Unset or unknown is both.
+pub fn clipboard_ways(way: Option<&str>) -> (bool, bool) {
+    match way.map(str::to_ascii_lowercase).as_deref() {
+        Some("to-host") => (true, false),
+        Some("from-host") => (false, true),
+        Some("off") => (false, false),
+        _ => (true, true),
+    }
 }
 
 /// What opening a session does.
@@ -316,6 +346,7 @@ impl Profile {
             && self.remote_app_copy_agent.is_none()
             && self.remote_app_remove_agent.is_none()
             && self.remote_app_clipboard.is_none()
+            && self.desktop_clipboard.is_none()
     }
 }
 
@@ -405,6 +436,13 @@ pub struct Settings {
     /// Remote apps: text selected with the mouse on the host (X PRIMARY,
     /// xterm's way of copying) goes to Windows too. Off unless turned on.
     pub remote_app_share_selection: bool,
+    /// Which way copied text travels between remote desktops (RDP, VNC,
+    /// virtual desktops) and Windows: `both` (when unset), `to-host`,
+    /// `from-host` or `off`.
+    pub desktop_clipboard: Option<String>,
+    /// Virtual desktops: text selected with the mouse there (X PRIMARY)
+    /// goes to Windows too. Off unless turned on.
+    pub desktop_share_selection: bool,
     /// How hard the agent packs window pictures: `auto` (when unset: from
     /// the link speed it measures), `fast` (LZ4) or `strong` (Deflate).
     pub remote_app_packing: Option<String>,
@@ -455,6 +493,8 @@ impl Default for Settings {
             remote_app_agent_path: None,
             remote_app_clipboard: None,
             remote_app_share_selection: false,
+            desktop_clipboard: None,
+            desktop_share_selection: false,
             remote_app_packing: None,
         }
     }
@@ -762,6 +802,25 @@ impl Settings {
                             .filter(|w| ["to-host", "from-host", "off"].contains(&w.as_str()));
                     }
                 }
+                "desktopclipboard" if matches!(block, Block::Profile(_)) => {
+                    if let Block::Profile(i) = block
+                        && let Some(p) = s.profiles.get_mut(i)
+                    {
+                        // "both" restricts nothing: the same as unset.
+                        p.desktop_clipboard = first
+                            .as_deref()
+                            .and_then(clipboard_way)
+                            .filter(|w| w != "both");
+                    }
+                }
+                "desktopclipboard" => {
+                    block = Block::Top;
+                    s.desktop_clipboard = first.as_deref().and_then(clipboard_way);
+                }
+                "desktopshareselection" => {
+                    block = Block::Top;
+                    s.desktop_share_selection = yes(&args).unwrap_or(false);
+                }
                 "remoteappshareselection" => {
                     block = Block::Top;
                     s.remote_app_share_selection = yes(&args).unwrap_or(false);
@@ -971,6 +1030,14 @@ impl Settings {
         if let Some(p) = &self.remote_app_packing {
             let _ = writeln!(out, "RemoteAppPacking {p}");
         }
+        if let Some(c) = &self.desktop_clipboard {
+            let _ = writeln!(out, "DesktopClipboard {c}");
+        }
+        let _ = writeln!(
+            out,
+            "DesktopShareSelection {}",
+            flag(self.desktop_share_selection)
+        );
         let _ = writeln!(out, "FollowDirectory {}", flag(self.follow_directory));
         let _ = writeln!(out, "ConfirmProduction {}", flag(self.confirm_production));
         let _ = writeln!(out, "AutoResponses {}", flag(self.auto_responses));
@@ -1046,6 +1113,9 @@ impl Settings {
             }
             if let Some(size) = p.desktop_size {
                 let _ = writeln!(out, "    DesktopSize {size}");
+            }
+            if let Some(c) = &p.desktop_clipboard {
+                let _ = writeln!(out, "    DesktopClipboard {c}");
             }
             if p.kind != SessionKind::Ssh {
                 let _ = writeln!(out, "    Type {}", p.kind.name());
@@ -1436,6 +1506,52 @@ NewKeyword later
             Settings::parse("RemoteAppClipboard sideways\n").remote_app_clipboard,
             None
         );
+    }
+
+    #[test]
+    fn desktop_clipboard_global_and_per_connection() {
+        let d = Settings::default();
+        assert_eq!(d.desktop_clipboard, None, "both ways unless changed");
+        assert!(!d.desktop_share_selection);
+        assert_eq!(clipboard_ways(d.desktop_clipboard.as_deref()), (true, true));
+        let s = Settings::parse(
+            "DesktopClipboard Off
+DesktopShareSelection yes
+             Profile lab
+    Type xvfb
+    Via build
+    DesktopClipboard TO-HOST
+             Profile other
+    DesktopClipboard both
+",
+        );
+        assert_eq!(s.desktop_clipboard.as_deref(), Some("off"));
+        assert!(s.desktop_share_selection);
+        assert_eq!(
+            s.profile("lab").unwrap().desktop_clipboard.as_deref(),
+            Some("to-host")
+        );
+        // "both" limits nothing: not kept on a connection.
+        assert!(
+            s.profile("other")
+                .is_none_or(|p| p.desktop_clipboard.is_none())
+        );
+        let again = Settings::parse(&s.to_text());
+        assert_eq!(again.desktop_clipboard, s.desktop_clipboard);
+        assert_eq!(again.profile("lab"), s.profile("lab"));
+        assert!(again.desktop_share_selection);
+        assert_eq!(
+            Settings::parse(
+                "DesktopClipboard sideways
+"
+            )
+            .desktop_clipboard,
+            None
+        );
+        assert_eq!(clipboard_ways(Some("to-host")), (true, false));
+        assert_eq!(clipboard_ways(Some("from-host")), (false, true));
+        assert_eq!(clipboard_ways(Some("off")), (false, false));
+        assert_eq!(clipboard_ways(Some("nonsense")), (true, true));
     }
 
     #[test]

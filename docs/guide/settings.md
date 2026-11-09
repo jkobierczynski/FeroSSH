@@ -57,6 +57,8 @@ FeroSSH reads `~/.ssh/config` and `~/.ssh/known_hosts` too, and writes only to `
 | `RemoteAppAgentPath ~/bin/ferostream-agent` | `~/.local/bin/ferostream-agent` | Where on the host the agent is copied to: under `~/` or an absolute path, letters, digits and `._-+/` only. |
 | `RemoteAppClipboard to-host` | both | Which way copied text goes between remote apps and Windows: `both`, `to-host`, `from-host` or `off` (Session > Remote apps > Clipboard). |
 | `RemoteAppShareSelection yes` | no | Text selected with the mouse in a remote app (X PRIMARY, how xterm copies) goes to the Windows clipboard too, not only copied text. |
+| `DesktopClipboard to-host` | both | Which way copied text goes between remote and virtual desktops and Windows: `both`, `to-host`, `from-host` or `off` (Session > Desktop clipboard). |
+| `DesktopShareSelection yes` | no | Text selected with the mouse in a virtual desktop goes to the Windows clipboard too, not only copied text. |
 | `RemoteAppPacking strong` | auto | How hard the host packs remote app pictures: `auto` picks from the measured link speed, `fast` uses LZ4 (least CPU), `strong` uses Deflate (fewest bytes, for slow links). Unchanged pixels are never sent and scrolls go as copies either way. |
 
 ## X11
@@ -98,7 +100,8 @@ Profile web1
 | `RemoteApp COMMAND` | The program a remote app connection runs, and the first one Run remote app offers on this host, such as `gimp` or `xterm -T 'my term'`. |
 | `RemoteAppCopyAgent yes` or `no` | Overrides `RemoteAppCopyAgent` for this connection. |
 | `RemoteAppRemoveAgent yes` or `no` | Overrides `RemoteAppRemoveAgent` for this connection. |
-| `RemoteAppClipboard to-host`, `from-host` or `off` | Narrows the clipboard for this connection's remote apps; it never widens the global setting. |
+| `RemoteAppClipboard to-host`, `from-host` or `off` | Narrows the clipboard for this connection's remote apps (*App clip*); it never widens the global setting. |
+| `DesktopClipboard to-host`, `from-host` or `off` | Narrows the clipboard for this connection's remote and virtual desktops (*Desk clip*); it never widens the global setting. A desktop opened through another connection is held to both connections' limits. |
 | `Type ssh`, `telnet`, `serial`, `rdp`, `vnc`, `xvfb` or `remoteapp` | The kind of connection; `xvfb` is a virtual desktop and `remoteapp` a remote app, both on the `Via` host. |
 | `Serial 115200,8N1,rtscts` | For a serial console: speed, framing (8N1, 8E1, 8O1, 7E1, 7O1, 8N2) and flow control (`none`, `xonxoff`, `rtscts`, `dsrdtr`), in any order. Left out: 9600, 8N1, none. |
 | `LoginScript STEP` | One step of the login script, one line per step: `expect TEXT`, `send TEXT`, `password`, `secret NAME`, `pause SECONDS`. See [Login scripts](everyday-use.md#login-scripts). |

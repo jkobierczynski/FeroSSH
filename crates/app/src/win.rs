@@ -91,12 +91,13 @@ use windows::Win32::UI::WindowsAndMessaging::{
     SIZE_MINIMIZED, SW_HIDE, SW_RESTORE, SW_SHOW, SW_SHOWNORMAL, SWP_NOACTIVATE, SWP_NOMOVE,
     SWP_NOZORDER, SetCursor, SetForegroundWindow, SetMenu, SetTimer, SetWindowPos, SetWindowTextW,
     ShowWindow, TPM_NONOTIFY, TPM_RETURNCMD, TrackPopupMenu, TranslateMessage, WINDOW_EX_STYLE,
-    WINDOW_STYLE, WM_APP, WM_CHAR, WM_CLOSE, WM_COMMAND, WM_DEADCHAR, WM_DESTROY, WM_DPICHANGED,
-    WM_DROPFILES, WM_ERASEBKGND, WM_GETDPISCALEDSIZE, WM_HOTKEY, WM_IME_COMPOSITION,
-    WM_IME_STARTCOMPOSITION, WM_KEYDOWN, WM_KEYUP, WM_KILLFOCUS, WM_LBUTTONDOWN, WM_LBUTTONUP,
-    WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_PAINT, WM_RBUTTONDOWN,
-    WM_RBUTTONUP, WM_SETCURSOR, WM_SETFOCUS, WM_SIZE, WM_SYSCHAR, WM_SYSDEADCHAR, WM_SYSKEYDOWN,
-    WM_SYSKEYUP, WM_TIMER, WNDCLASSW, WS_EX_APPWINDOW, WS_OVERLAPPEDWINDOW,
+    WINDOW_STYLE, WM_APP, WM_CHAR, WM_CLIPBOARDUPDATE, WM_CLOSE, WM_COMMAND, WM_DEADCHAR,
+    WM_DESTROY, WM_DPICHANGED, WM_DROPFILES, WM_ERASEBKGND, WM_GETDPISCALEDSIZE, WM_HOTKEY,
+    WM_IME_COMPOSITION, WM_IME_STARTCOMPOSITION, WM_KEYDOWN, WM_KEYUP, WM_KILLFOCUS,
+    WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL,
+    WM_PAINT, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SETCURSOR, WM_SETFOCUS, WM_SIZE, WM_SYSCHAR,
+    WM_SYSDEADCHAR, WM_SYSKEYDOWN, WM_SYSKEYUP, WM_TIMER, WNDCLASSW, WS_EX_APPWINDOW,
+    WS_OVERLAPPEDWINDOW,
 };
 use windows::Win32::UI::WindowsAndMessaging::{DeleteMenu, ShowWindowAsync, WM_INITMENUPOPUP};
 use windows::core::{HSTRING, PCWSTR, PWSTR, Result, w};
@@ -196,6 +197,14 @@ const TIMER_SCRIPT: usize = 5;
 const TIMER_RECONNECT: usize = 6;
 /// Fails the hosts of a snippet run that took too long.
 const TIMER_RUN: usize = 7;
+/// Checks on saved desktop and remote app connections that open on their
+/// own (their login session goes once the desktop or app holds the
+/// connection), and on Remote Desktop Connections run through a tunnel.
+const TIMER_LAUNCH: usize = 8;
+const LAUNCH_TICK_MS: u32 = 1000;
+/// How long a launch's login session may stay hidden with nothing
+/// holding its connection before it is shown.
+const LAUNCH_WAIT: Duration = Duration::from_secs(90);
 const RECONNECT_TICK_MS: u32 = 500;
 /// How long a worker whose connection nothing uses keeps running, so its
 /// last shell's close reaches the server as a clean disconnect.
@@ -367,6 +376,12 @@ mod cmd {
     pub const REMOTE_APP_CLIP_LAST: u32 = 632;
     /// ... > Share mouse selections from the host.
     pub const REMOTE_APP_SELECTION: u32 = 633;
+    /// Session > Desktop clipboard: the same four ways, for remote and
+    /// virtual desktops.
+    pub const DESKTOP_CLIP: u32 = 634;
+    pub const DESKTOP_CLIP_LAST: u32 = 637;
+    /// ... > Share mouse selections from virtual desktops.
+    pub const DESKTOP_SELECTION: u32 = 638;
     pub const TMUX_ATTACH: u32 = 610;
     pub const TMUX_DETACH: u32 = 611;
     pub const TMUX_PICK: u32 = 612;
@@ -830,6 +845,19 @@ struct Window {
     /// Running remote app sessions and the clipboard limit of the
     /// connection each came from (`RemoteAppClipboard` in its profile).
     app_clip_limits: HashMap<u32, Option<String>>,
+    /// The desktop pane given this PC's clipboard since it last changed
+    /// or the window last had the keyboard.
+    clip_pane: Option<PaneId>,
+    /// Login sessions of saved desktop and remote app connections that
+    /// open on their own, and when each started: once the desktop or app
+    /// holds the connection, the session goes.
+    launches: HashMap<PaneId, Instant>,
+    /// Those of them no tab shows: they show only when the login needs
+    /// an answer or fails.
+    launch_hidden: HashSet<PaneId>,
+    /// Remote Desktop Connections running on a connection's tunnel: the
+    /// connection stays while they run.
+    mstsc: Vec<(std::process::Child, ChannelId)>,
     /// Passwords from password manager commands, as they finish: the pane,
     /// its session's channel, the program and the result.
     passwords: Arc<std::sync::Mutex<Vec<PasswordAnswer>>>,
@@ -927,6 +955,9 @@ enum DesktopWant {
     Rdp {
         pane: PaneId,
         size: Option<(u16, u16)>,
+        /// Share the clipboard (Remote Desktop Connection has no way to
+        /// share it one way only).
+        clipboard: bool,
     },
     /// The built-in viewer in a new tab.
     Tab(TabWant),
@@ -935,6 +966,8 @@ enum DesktopWant {
     Vnc {
         pane: PaneId,
         password: Zeroizing<String>,
+        /// Which ways copied text may travel (to and from the host).
+        clipboard: (bool, bool),
     },
 }
 
@@ -950,6 +983,8 @@ struct TabWant {
     vdesk: Option<(Zeroizing<String>, ChannelId)>,
     /// A fixed size; `None` follows the pane.
     size: Option<(u16, u16)>,
+    /// The connection's limit on the clipboard: to and from the host.
+    clip_limit: (bool, bool),
 }
 
 /// Session > Open virtual desktop: Xvfb and x11vnc on the server, run by
@@ -976,6 +1011,8 @@ struct VirtualDesk {
     shown: bool,
     /// The user heard why it failed.
     reported: bool,
+    /// The connection's limit on the clipboard: to and from the host.
+    clip_limit: (bool, bool),
 }
 
 thread_local! {
@@ -1532,6 +1569,10 @@ fn create_and_run(launch: Launch, theme: Option<String>) -> Result<()> {
                 app_pane: None,
                 recent_apps: Vec::new(),
                 app_clip_limits: HashMap::new(),
+                clip_pane: None,
+                launches: HashMap::new(),
+                launch_hidden: HashSet::new(),
+                mstsc: Vec::new(),
                 passwords: Arc::default(),
                 pending_desktops: HashMap::new(),
                 broadcast: broadcast::Scope::Off,
@@ -1556,6 +1597,8 @@ fn create_and_run(launch: Launch, theme: Option<String>) -> Result<()> {
         });
         // Files dropped from Explorer are uploaded, after a confirmation.
         DragAcceptFiles(hwnd, true);
+        // Clipboard changes reach a remote desktop being worked in.
+        let _ = windows::Win32::System::DataExchange::AddClipboardFormatListener(hwnd);
         // Window > Standby window, when it was left on: the first window
         // takes the hotkey; for a later one the status says it is taken.
         with_window(|w| {
@@ -1735,6 +1778,23 @@ fn build_menu() -> Result<HMENU> {
         }
         item(session, cmd::VDESK, "Open virtual d&esktop (Xvfb)")?;
         item(session, cmd::VDESK_STOP, "Stop v&irtual desktop")?;
+        let desk_clip = CreatePopupMenu()?;
+        item(desk_clip, cmd::DESKTOP_CLIP, "&Both ways")?;
+        item(desk_clip, cmd::DESKTOP_CLIP + 1, "Only &Windows to host")?;
+        item(desk_clip, cmd::DESKTOP_CLIP + 2, "Only &host to Windows")?;
+        item(desk_clip, cmd::DESKTOP_CLIP + 3, "&Off")?;
+        separator(desk_clip)?;
+        item(
+            desk_clip,
+            cmd::DESKTOP_SELECTION,
+            "Also share &mouse selections from virtual desktops",
+        )?;
+        AppendMenuW(
+            session,
+            MF_POPUP,
+            desk_clip.0 as usize,
+            w!("Desktop c&lipboard"),
+        )?;
         let apps = CreatePopupMenu()?;
         item(apps, cmd::REMOTE_APP, "&Run remote app...")?;
         item(apps, cmd::REMOTE_APP_ATTACH, "Re&attach remote app")?;
@@ -2708,7 +2768,12 @@ impl Window {
     fn open_sessions(&self) -> Vec<LiveSession> {
         let views = self.forward_view();
         let focused = self.focused_id();
-        let mut hidden: Vec<PaneId> = self.run_hidden.iter().copied().collect();
+        let mut hidden: Vec<PaneId> = self
+            .run_hidden
+            .iter()
+            .chain(&self.launch_hidden)
+            .copied()
+            .collect();
         hidden.sort_unstable();
         let panes = self
             .ws
@@ -2803,6 +2868,10 @@ impl Window {
             LiveAction::Show(id) => {
                 if self.run_hidden.contains(&id) {
                     return self.show_run_pane(id);
+                }
+                if self.launch_hidden.contains(&id) {
+                    self.reveal_launch(id);
+                    return None;
                 }
                 self.focus_pane(id);
                 self.focus_terminal();
@@ -2900,6 +2969,11 @@ impl Window {
             self.refresh_chrome();
             return None;
         }
+        if self.launch_hidden.contains(&id) {
+            self.abandon_launch(id);
+            return None;
+        }
+        self.launches.remove(&id);
         self.close_pane(id)
     }
 
@@ -2997,7 +3071,7 @@ impl Window {
                         *connection == v.connection && p.desktop.is_some()
                     }
                     _ => false,
-                });
+                }) || self.mstsc.iter().any(|(_, c)| *c == v.connection);
                 if !used {
                     w.forwarder.stop(v.connection);
                 }
@@ -3073,6 +3147,7 @@ impl Window {
                 .values()
                 .any(|r| r.connection() == Some(connection))
             || crate::remote_app::connections_in_use().contains(&connection)
+            || self.mstsc.iter().any(|(_, c)| *c == connection)
     }
 
     /// Ends the workers that retired long enough ago.
@@ -3127,6 +3202,7 @@ impl Window {
         let profile = self.settings.profile(&s.target.alias);
         let label = s.target.label();
         let size = self.fixed_desktop_size(&s.target.alias);
+        let clip_limit = self.desktop_clip_limit(&[&s.target.alias]);
         let rdp_port = profile
             .and_then(|p| p.desktop_port)
             .unwrap_or(DEFAULT_DESKTOP_PORT);
@@ -3147,13 +3223,18 @@ impl Window {
                         protocol,
                         vdesk: None,
                         size,
+                        clip_limit,
                     }),
                 )
             }
             None => (
                 rdp_port,
                 desktop_port_for(&label),
-                DesktopWant::Rdp { pane, size },
+                DesktopWant::Rdp {
+                    pane,
+                    size,
+                    clipboard: self.desktop_clip(clip_limit) == (true, true),
+                },
             ),
         };
         let w = self.workers.get(&connection)?;
@@ -3187,23 +3268,46 @@ impl Window {
                     port,
                     addr,
                 } => match self.desktops.remove(&(connection, host, port)) {
-                    Some(DesktopWant::Rdp { pane, size }) => {
-                        let note = match launch_rdp_client(&addr, size) {
-                            Ok(()) => format!(
-                                "\x1b[0;90mRemote desktop tunnel at {addr}; Remote Desktop \
-                                 Connection opens on it. It closes with this connection.\x1b[0m\r\n"
-                            ),
-                            Err(e) => format!(
-                                "\x1b[0;31mThe remote desktop tunnel listens at {addr}, but \
-                                 Remote Desktop Connection (mstsc.exe) did not start: {e}\x1b[0m\r\n"
-                            ),
+                    Some(DesktopWant::Rdp {
+                        pane,
+                        size,
+                        clipboard,
+                    }) => {
+                        let note = match launch_rdp_client(&addr, size, clipboard) {
+                            Ok(child) => {
+                                // The tunnel's connection stays while it runs.
+                                self.mstsc.push((child, connection));
+                                self.arm_launch_timer();
+                                format!(
+                                    "\x1b[0;90mRemote desktop tunnel at {addr}; Remote Desktop \
+                                     Connection opens on it{}. The connection stays while it \
+                                     runs.\x1b[0m\r\n",
+                                    if clipboard {
+                                        ""
+                                    } else {
+                                        ", without the clipboard"
+                                    }
+                                )
+                            }
+                            Err(e) => {
+                                self.reveal_launch(pane);
+                                format!(
+                                    "\x1b[0;31mThe remote desktop tunnel listens at {addr}, but \
+                                     Remote Desktop Connection (mstsc.exe) did not start: \
+                                     {e}\x1b[0m\r\n"
+                                )
+                            }
                         };
                         self.show(pane, &note);
                         self.refresh(pane);
                     }
                     Some(DesktopWant::Tab(want)) => self.desktop_tab(connection, want, &addr),
-                    Some(DesktopWant::Vnc { pane, password }) => {
-                        let note = match launch_vnc_viewer(&addr) {
+                    Some(DesktopWant::Vnc {
+                        pane,
+                        password,
+                        clipboard,
+                    }) => {
+                        let note = match launch_vnc_viewer(&addr, clipboard) {
                             Some(viewer) => format!(
                                 "\x1b[0;90mVirtual desktop tunnel at {addr}; {viewer} opens on \
                                  it. VNC password: {}\x1b[0m\r\n",
@@ -3228,6 +3332,19 @@ impl Window {
                     port,
                     why,
                 } => {
+                    // A launch that waited for this desktop is over.
+                    let waiting: Vec<PaneId> = self
+                        .launches
+                        .keys()
+                        .copied()
+                        .filter(|id| {
+                            matches!(self.panes.get(id).map(|p| &p.host),
+                                Some(Host::Ssh(s)) if s.connection == connection)
+                        })
+                        .collect();
+                    for id in waiting {
+                        self.abandon_launch(id);
+                    }
                     let advice = match self.desktops.remove(&(connection, host, port)) {
                         // The script started that server: nothing to advise.
                         Some(DesktopWant::Vnc { .. })
@@ -3250,6 +3367,25 @@ impl Window {
                 }
             }
         }
+    }
+
+    /// The most the connections `names` let copied text travel to and
+    /// from their desktops: each connection's `DesktopClipboard` only
+    /// narrows it.
+    fn desktop_clip_limit(&self, names: &[&str]) -> (bool, bool) {
+        names
+            .iter()
+            .filter_map(|n| self.settings.profile(n))
+            .map(|p| ferossh_config::settings::clipboard_ways(p.desktop_clipboard.as_deref()))
+            .fold((true, true), |(a, b), (x, y)| (a && x, b && y))
+    }
+
+    /// Which ways copied text travels for a desktop: the global
+    /// `DesktopClipboard` within the connection's `limit`.
+    fn desktop_clip(&self, limit: (bool, bool)) -> (bool, bool) {
+        let (a, b) =
+            ferossh_config::settings::clipboard_ways(self.settings.desktop_clipboard.as_deref());
+        (a && limit.0, b && limit.1)
     }
 
     /// The fixed desktop size set for connection `alias`; `None` when its
@@ -3308,7 +3444,15 @@ impl Window {
         });
         let follow = fixed.is_none();
         let password = vdesk::password();
-        let Some(input) = vdesk::input(&password, program.as_deref(), width, height, follow) else {
+        let clip_limit = self.desktop_clip_limit(&[&alias, &s.target.alias]);
+        let (to_host, from_host) = self.desktop_clip(clip_limit);
+        let clip = vdesk::Clip {
+            to_host,
+            from_host,
+            selection: self.settings.desktop_share_selection,
+        };
+        let Some(input) = vdesk::input(&password, program.as_deref(), width, height, follow, clip)
+        else {
             return Some(Command::Notice(
                 "This host's VirtualDesktop command must be one line.".into(),
             ));
@@ -3341,6 +3485,7 @@ impl Window {
                 tab: cfg!(feature = "vnc-viewer"),
                 shown: false,
                 reported: false,
+                clip_limit,
             },
         );
         let what = match &program {
@@ -3605,6 +3750,10 @@ impl Window {
 
     /// Opens a viewer on the running virtual desktop of script `channel`.
     fn vdesk_viewer(&mut self, channel: ChannelId) {
+        // A viewer on this PC needs the password its pane shows.
+        if let Some(pane) = self.vdesks.get(&channel).filter(|v| !v.tab).map(|v| v.pane) {
+            self.reveal_launch(pane);
+        }
         let Some(v) = self.vdesks.get(&channel) else {
             return;
         };
@@ -3621,6 +3770,7 @@ impl Window {
                     vdesk: Some((v.password.clone(), channel)),
                     // Xvnc follows the tab; Xvfb keeps its size.
                     size: (!(v.follow && v.resizes)).then_some(v.size),
+                    clip_limit: v.clip_limit,
                 }),
             )
         } else {
@@ -3629,6 +3779,7 @@ impl Window {
                 DesktopWant::Vnc {
                     pane: v.pane,
                     password: v.password.clone(),
+                    clipboard: self.desktop_clip(v.clip_limit),
                 },
             )
         };
@@ -3672,6 +3823,9 @@ impl Window {
                         crate::ssh::sanitize(&reason)
                     )));
                 }
+                if v.port.is_none() {
+                    self.abandon_launch(v.pane);
+                }
                 self.prune_forwards();
             }
             _ => {}
@@ -3684,6 +3838,7 @@ impl Window {
                 if let Some(v) = self.vdesks.get_mut(&channel) {
                     v.reported = true;
                 }
+                self.abandon_launch(pane);
                 self.queued
                     .push(Command::Notice(vdesk::install_advice(&missing)));
             }
@@ -3691,6 +3846,7 @@ impl Window {
                 if let Some(v) = self.vdesks.get_mut(&channel) {
                     v.reported = true;
                 }
+                self.abandon_launch(pane);
                 self.queued.push(Command::Notice(format!(
                     "The virtual desktop did not start: {why}. Set VirtualDesktop in this \
                      host's connection settings to the desktop or program to run."
@@ -3751,6 +3907,7 @@ impl Window {
             protocol,
             vdesk,
             size,
+            clip_limit,
         } = want;
         let id = self.new_tab_pane();
         // The server draws the desktop at the size of the tab, when it
@@ -3769,6 +3926,8 @@ impl Window {
             user,
             password: vdesk.as_ref().map(|(pw, _)| pw.clone()),
             fixed: size.is_some(),
+            clipboard: self.desktop_clip(clip_limit),
+            clipboard_limit: clip_limit,
         };
         let script = vdesk.map(|(_, channel)| channel);
         // From here its tab decides: closing it, or a viewer that never
@@ -3827,6 +3986,51 @@ impl Window {
         }
     }
 
+    /// Gives desktop pane `id` this PC's clipboard text, once per change
+    /// of either: only the desktop being worked in sees it.
+    fn desktop_clip_touch(&mut self, id: PaneId) {
+        if self.clip_pane == Some(id) {
+            return;
+        }
+        let hwnd = self.hwnd;
+        let Some(d) = self.panes.get_mut(&id).and_then(|p| p.desktop.as_mut()) else {
+            return;
+        };
+        if !d.takes_clipboard() {
+            return;
+        }
+        self.clip_pane = Some(id);
+        if let Some(text) = crate::clipboard::get_text(hwnd) {
+            d.offer_clipboard(&text);
+        }
+    }
+
+    /// WM_CLIPBOARDUPDATE: this PC's clipboard changed. A desktop being
+    /// worked in gets it at once; the others when next used.
+    fn clipboard_changed(&mut self) {
+        self.clip_pane = None;
+        let id = self.focused_id();
+        if self.focused && !self.side.focused {
+            self.desktop_clip_touch(id);
+        }
+    }
+
+    /// Saves a changed desktop clipboard setting and applies it at once to
+    /// the open desktops, each within its connection's limit.
+    fn apply_desktop_clipboard(&mut self) {
+        self.save_settings();
+        self.update_menu_checks();
+        let ways =
+            ferossh_config::settings::clipboard_ways(self.settings.desktop_clipboard.as_deref());
+        for p in self.panes.values_mut() {
+            if let Some(d) = p.desktop.as_mut() {
+                let limit = d.clipboard_limit();
+                d.set_clipboard(ways.0 && limit.0, ways.1 && limit.1);
+            }
+        }
+        self.clip_pane = None;
+    }
+
     /// Applies what the remote desktops sent.
     fn poll_desktops(&mut self) {
         let ids: Vec<PaneId> = self
@@ -3836,10 +4040,15 @@ impl Window {
             .map(|(id, _)| *id)
             .collect();
         for id in ids {
-            let updates = match self.panes.get_mut(&id).and_then(|p| p.desktop.as_mut()) {
-                Some(d) => d.poll(),
+            let (updates, fresh) = match self.panes.get_mut(&id).and_then(|p| p.desktop.as_mut()) {
+                Some(d) => (d.poll(), d.take_fresh()),
                 None => continue,
             };
+            // The picture came up in the pane being worked in.
+            if fresh && self.focused && !self.side.focused && self.focused_id() == id {
+                self.clip_pane = None;
+                self.desktop_clip_touch(id);
+            }
             for update in updates {
                 match update {
                     DesktopUpdate::Redraw => {
@@ -3866,6 +4075,11 @@ impl Window {
                     DesktopUpdate::Ask(prompt) => {
                         self.show(id, &prompt);
                         self.refresh(id);
+                    }
+                    DesktopUpdate::Clipboard(text) => {
+                        // Windows keeps line ends as CR LF.
+                        let text = text.replace("\r\n", "\n").replace('\n', "\r\n");
+                        crate::clipboard::set_text(self.hwnd, &text);
                     }
                     DesktopUpdate::Ended(why) => {
                         if let Some(p) = self.panes.get_mut(&id) {
@@ -3919,6 +4133,12 @@ impl Window {
                 if !d.running() {
                     return false;
                 }
+                if down {
+                    self.desktop_clip_touch(id);
+                }
+                let Some(d) = self.panes.get_mut(&id).and_then(|p| p.desktop.as_mut()) else {
+                    return true;
+                };
                 if d.key(vk.0, extended, scan, down) {
                     drop_pending_char(self.hwnd);
                 }
@@ -3974,8 +4194,11 @@ impl Window {
                 if mods.ctrl && mods.shift {
                     return false;
                 }
-                if matches!(button, Some((_, true))) && self.focused_id() != id {
-                    self.focus_pane(id);
+                if matches!(button, Some((_, true))) {
+                    if self.focused_id() != id {
+                        self.focus_pane(id);
+                    }
+                    self.desktop_clip_touch(id);
                 }
                 if let Some(d) = self.panes.get_mut(&id).and_then(|p| p.desktop.as_mut()) {
                     d.mouse(area, x, y, button);
@@ -4738,6 +4961,9 @@ impl Window {
         }
         if self.run_login.contains(&id) {
             self.check_run_login(id);
+        }
+        if self.launch_hidden.contains(&id) {
+            self.check_launch(id);
         }
         if pump {
             self.pump_run();
@@ -5897,6 +6123,12 @@ impl Window {
         }
         self.desktop_events();
         self.poll_desktops();
+        // A launch's desktop may have just taken over its connection.
+        if self.launches.values().next().is_some()
+            && self.panes.values().any(|p| p.desktop.is_some())
+        {
+            self.retire_launches();
+        }
         self.poll_passwords();
         self.poll_script_secrets();
         // The forwards list and the tab badges.
@@ -8513,7 +8745,8 @@ impl Window {
             } else {
                 format!("{host}:{port}")
             };
-            if let Err(e) = launch_rdp_client(&addr, self.fixed_desktop_size(name)) {
+            let clipboard = self.desktop_clip(self.desktop_clip_limit(&[name])) == (true, true);
+            if let Err(e) = launch_rdp_client(&addr, self.fixed_desktop_size(name), clipboard) {
                 self.queued.push(Command::Notice(format!(
                     "Remote Desktop Connection (mstsc.exe) did not start: {e}"
                 )));
@@ -8537,13 +8770,152 @@ impl Window {
             kind,
             user: cfg.user,
         };
-        // The SSH session's terminal shows the login and any problem.
-        let Some(id) = self.host_pane_for(split) else {
-            return;
-        };
+        // Only the desktop or app shows: the SSH login runs in a session
+        // no tab shows, which shows when the login asks for something or
+        // fails, and goes once the desktop or app holds the connection.
+        let _ = split;
+        let id = self.ws.alloc_id();
+        self.add_pane(id);
+        self.launches.insert(id, Instant::now());
+        self.launch_hidden.insert(id);
         self.pending_desktops.insert(id, pending);
-        self.focus_terminal();
         self.connect(id, &via);
+        self.check_launch(id);
+        self.arm_launch_timer();
+        self.refresh_chrome();
+    }
+
+    /// A launch's hidden login session shows in a tab of its own when it
+    /// needs the user: a prompt, a changed host key, or a failure.
+    fn check_launch(&mut self, id: PaneId) {
+        if !self.launch_hidden.contains(&id) {
+            return;
+        }
+        let needs_user = match self.panes.get(&id).map(|p| &p.host) {
+            Some(Host::Ssh(s)) => {
+                s.prompt_asks().is_some() || matches!(s.state(), State::Blocked | State::Ended)
+            }
+            Some(Host::Ask(_)) => true,
+            Some(_) => false,
+            None => {
+                self.launches.remove(&id);
+                self.launch_hidden.remove(&id);
+                return;
+            }
+        };
+        if needs_user {
+            self.reveal_launch(id);
+        }
+    }
+
+    /// Shows a launch's hidden login session in a tab of its own.
+    fn reveal_launch(&mut self, id: PaneId) {
+        if self.launch_hidden.remove(&id) && self.panes.contains_key(&id) {
+            let at = self.ws.tabs.len();
+            self.ws.insert_tab(at, layout::Node::Leaf(id), id);
+            self.focus_pane(id);
+            self.after_structure_change();
+            self.focus_terminal();
+        }
+    }
+
+    /// A launch failed (the reason was told): its hidden login session
+    /// ends; one in a tab stays for the user.
+    fn abandon_launch(&mut self, id: PaneId) {
+        if !self.launches.contains_key(&id) {
+            return;
+        }
+        self.launches.remove(&id);
+        if self.launch_hidden.remove(&id) {
+            self.end_host(id);
+            self.panes.remove(&id);
+            self.watches.remove(&id);
+            self.refresh_chrome();
+        }
+    }
+
+    /// The launches whose desktop or app now holds the connection: their
+    /// login sessions go. A session still hidden after [`LAUNCH_WAIT`]
+    /// with nothing holding it shows instead.
+    fn retire_launches(&mut self) {
+        let before = self.mstsc.len();
+        self.mstsc
+            .retain_mut(|(child, _)| matches!(child.try_wait(), Ok(None)));
+        let apps = crate::remote_app::connections_in_use();
+        let mut held = Vec::new();
+        let mut late = Vec::new();
+        for (&id, &since) in &self.launches {
+            let Some(Host::Ssh(s)) = self.panes.get(&id).map(|p| &p.host) else {
+                continue;
+            };
+            if s.state() != State::Connected || self.pending_desktops.contains_key(&id) {
+                continue;
+            }
+            let c = s.connection;
+            let holds = self.panes.iter().any(|(&o, p)| {
+                o != id
+                    && matches!(p.host, Host::Desktop { connection, .. } if connection == c)
+                    && p.desktop.is_some()
+            }) || apps.contains(&c)
+                || self.mstsc.iter().any(|(_, m)| *m == c);
+            if holds {
+                held.push(id);
+            } else if since.elapsed() > LAUNCH_WAIT {
+                late.push(id);
+            }
+        }
+        let changed = !late.is_empty() || !held.is_empty();
+        for id in late {
+            self.launches.remove(&id);
+            self.reveal_launch(id);
+        }
+        for id in held {
+            self.launches.remove(&id);
+            if self.launch_hidden.remove(&id) {
+                self.end_host(id);
+                self.panes.remove(&id);
+                self.watches.remove(&id);
+            } else if self.ws.tabs.len() > 1
+                || self.ws.tab().is_some_and(|t| t.root.panes().len() > 1)
+            {
+                if let Some(c) = self.close_pane(id) {
+                    self.queued.push(c);
+                }
+            } else {
+                // The window's only tab: it stays, free for another
+                // connection.
+                self.end_host(id);
+                self.show(
+                    id,
+                    "\r\n\x1b[0;90mThe login is done; the connection stays while its desktop \
+                     or app runs.\x1b[0m\r\n",
+                );
+                self.refresh(id);
+            }
+        }
+        let panes = &self.panes;
+        self.launches.retain(|id, _| panes.contains_key(id));
+        self.launch_hidden.retain(|id| panes.contains_key(id));
+        if self.mstsc.len() != before {
+            self.prune_forwards();
+        }
+        self.arm_launch_timer();
+        if changed {
+            self.refresh_chrome();
+        }
+    }
+
+    /// Keeps [`TIMER_LAUNCH`] running while launches or tunnelled Remote
+    /// Desktop Connections need watching.
+    fn arm_launch_timer(&mut self) {
+        // SAFETY: our window and timer.
+        unsafe {
+            if self.launches.is_empty() && self.mstsc.is_empty() {
+                let _ = KillTimer(Some(self.hwnd), TIMER_LAUNCH);
+            } else {
+                SetTimer(Some(self.hwnd), TIMER_LAUNCH, LAUNCH_TICK_MS, None);
+            }
+        }
     }
 
     /// After a login on SSH pane `id`: opens the desktop a desktop session
@@ -8561,6 +8933,7 @@ impl Window {
         if p.kind == SessionKind::Xvfb {
             if let Some(c) = self.open_virtual_desktop(id, Some(&p.label)) {
                 self.queued.push(c);
+                self.abandon_launch(id);
             }
             return;
         }
@@ -8577,10 +8950,13 @@ impl Window {
                 ferostream_client::transport::AttachTo::New,
             ) {
                 self.queued.push(c);
+                self.abandon_launch(id);
             }
+            self.retire_launches();
             return;
         }
         let size = self.fixed_desktop_size(&p.label);
+        let clip_limit = self.desktop_clip_limit(&[&p.label, &s.target.alias]);
         let (local, want) = match p.kind {
             SessionKind::Vnc => (
                 0,
@@ -8590,11 +8966,16 @@ impl Window {
                     protocol: Protocol::Vnc,
                     vdesk: None,
                     size,
+                    clip_limit,
                 }),
             ),
             _ => (
                 desktop_port_for(&p.label),
-                DesktopWant::Rdp { pane: id, size },
+                DesktopWant::Rdp {
+                    pane: id,
+                    size,
+                    clipboard: self.desktop_clip(clip_limit) == (true, true),
+                },
             ),
         };
         let Some(w) = self.workers.get(&connection) else {
@@ -9987,6 +10368,23 @@ impl Window {
                 .then(|| way.to_owned());
                 self.apply_app_clipboard();
             }
+            cmd::DESKTOP_CLIP..=cmd::DESKTOP_CLIP_LAST => {
+                let way = ferossh_config::settings::CLIPBOARD_WAYS
+                    .get((id - cmd::DESKTOP_CLIP) as usize)
+                    .copied()
+                    .unwrap_or("both");
+                // Unset means both ways; keep the file as it was then.
+                self.settings.desktop_clipboard = (way != "both"
+                    || self.settings.desktop_clipboard.is_some())
+                .then(|| way.to_owned());
+                self.apply_desktop_clipboard();
+            }
+            cmd::DESKTOP_SELECTION => {
+                // Read when a virtual desktop starts.
+                self.settings.desktop_share_selection = !self.settings.desktop_share_selection;
+                self.save_settings();
+                self.update_menu_checks();
+            }
             cmd::REMOTE_APP_SELECTION => {
                 self.settings.remote_app_share_selection =
                     !self.settings.remote_app_share_selection;
@@ -10382,6 +10780,18 @@ impl Window {
                 cmd::REMOTE_APP_CLIP + way,
                 MF_BYCOMMAND.0,
             );
+            let way = s.desktop_clipboard.as_deref().unwrap_or("both");
+            let way = ferossh_config::settings::CLIPBOARD_WAYS
+                .iter()
+                .position(|w| *w == way)
+                .unwrap_or(0) as u32;
+            let _ = CheckMenuRadioItem(
+                self.menu,
+                cmd::DESKTOP_CLIP,
+                cmd::DESKTOP_CLIP_LAST,
+                cmd::DESKTOP_CLIP + way,
+                MF_BYCOMMAND.0,
+            );
             for (id, on) in [
                 (cmd::COPY_ON_SELECT, s.copy_on_select),
                 (cmd::UPDATE_WEEKLY, s.update_check_weekly),
@@ -10393,6 +10803,7 @@ impl Window {
                 (cmd::REMOTE_APP_COPY, s.remote_app_copy_agent),
                 (cmd::REMOTE_APP_REMOVE, s.remote_app_remove_agent),
                 (cmd::REMOTE_APP_SELECTION, s.remote_app_share_selection),
+                (cmd::DESKTOP_SELECTION, s.desktop_share_selection),
                 (cmd::CONFIRM_PRODUCTION, s.confirm_production),
                 (cmd::TMUX_KEYS, s.tmux_keys),
                 (cmd::RECORD_SNIPPET, self.recording.is_some()),
@@ -10648,6 +11059,8 @@ impl Window {
 
     fn set_focus(&mut self, focused: bool) {
         self.focused = focused;
+        // The clipboard may change while away: a desktop gets it again.
+        self.clip_pane = None;
         let id = self.focused_id();
         let reply = self.panes.get_mut(&id).and_then(|p| p.term.focus(focused));
         if let Some(bytes) = reply {
@@ -11498,7 +11911,7 @@ fn keyboard_layout() -> u32 {
 /// Starts a VNC viewer installed on this PC on `addr` (`host:port`), and
 /// names it; `None` when none was found. TigerVNC, TightVNC, RealVNC and
 /// UltraVNC all take `host::port`.
-fn launch_vnc_viewer(addr: &str) -> Option<&'static str> {
+fn launch_vnc_viewer(addr: &str, (to_host, from_host): (bool, bool)) -> Option<&'static str> {
     const KNOWN: [(&str, &str); 5] = [
         ("TigerVNC\\vncviewer.exe", "TigerVNC Viewer"),
         ("TightVNC\\tvnviewer.exe", "TightVNC Viewer"),
@@ -11537,24 +11950,50 @@ fn launch_vnc_viewer(addr: &str) -> Option<&'static str> {
         })
     });
     let (exe, name) = found?;
-    std::process::Command::new(exe)
-        .arg(target)
-        .spawn()
-        .ok()
-        .map(|_| name)
+    let mut c = std::process::Command::new(exe);
+    // TigerVNC's viewer takes the clipboard's ways; for the others the
+    // virtual desktop's server enforces them.
+    if name == "TigerVNC Viewer" {
+        c.arg(format!("-SendClipboard={}", u8::from(to_host)))
+            .arg(format!("-AcceptClipboard={}", u8::from(from_host)));
+    }
+    c.arg(target).spawn().ok().map(|_| name)
 }
 
 /// Opens Remote Desktop Connection on `addr`, at `size` when one is set
-/// (else at its own default).
-fn launch_rdp_client(addr: &str, size: Option<(u16, u16)>) -> std::io::Result<()> {
+/// (else at its own default). Its own settings share the clipboard; with
+/// `clipboard` false it opens a connection file that turns that off
+/// (mstsc has no switch for it on its command line).
+fn launch_rdp_client(
+    addr: &str,
+    size: Option<(u16, u16)>,
+    clipboard: bool,
+) -> std::io::Result<std::process::Child> {
     let root = std::env::var_os("SystemRoot").unwrap_or_else(|| "C:\\Windows".into());
     let mstsc = PathBuf::from(root).join("System32").join("mstsc.exe");
     let mut c = std::process::Command::new(mstsc);
+    if !clipboard {
+        let file = app_dir().join("rdp").join("no-clipboard.rdp");
+        write_app_file(&file, &rdp_file(addr, size))?;
+        c.arg(file);
+    }
     c.arg(format!("/v:{addr}"));
     if let Some((w, h)) = size {
         c.arg(format!("/w:{w}")).arg(format!("/h:{h}"));
     }
-    c.spawn().map(drop)
+    c.spawn()
+}
+
+/// A Remote Desktop Connection file for `addr` without the clipboard.
+fn rdp_file(addr: &str, size: Option<(u16, u16)>) -> String {
+    let addr: String = addr.chars().filter(|c| !c.is_control()).collect();
+    let mut text = format!("full address:s:{addr}\r\nredirectclipboard:i:0\r\n");
+    if let Some((w, h)) = size {
+        text.push_str(&format!(
+            "screen mode id:i:1\r\ndesktopwidth:i:{w}\r\ndesktopheight:i:{h}\r\n"
+        ));
+    }
+    text
 }
 
 /// The key of a host's transfer queue: one per user, host name and port.
@@ -13179,6 +13618,10 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                 with_window(Window::on_run_timer);
                 LRESULT(0)
             }
+            WM_TIMER if wparam.0 == TIMER_LAUNCH => {
+                with_window(Window::retire_launches);
+                LRESULT(0)
+            }
             WM_TIMER if wparam.0 == TIMER_RETIRE => {
                 with_window(Window::on_retire_timer);
                 LRESULT(0)
@@ -13308,6 +13751,10 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
             }
             WM_SETFOCUS => {
                 with_window(|w| w.set_focus(true));
+                LRESULT(0)
+            }
+            WM_CLIPBOARDUPDATE => {
+                with_window(Window::clipboard_changed);
                 LRESULT(0)
             }
             WM_KILLFOCUS => {

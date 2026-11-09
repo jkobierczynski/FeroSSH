@@ -12,8 +12,13 @@
 //! connection dropped) or the program in the display ends, the script
 //! stops x11vnc, the program and Xvfb and removes its files.
 //!
+//! Copied text crosses only the ways the clipboard settings allow, and
+//! the server enforces that too: x11vnc gets `-seldir` or `-nosel`,
+//! Xvnc `-AcceptCutText` and `-SendCutText`; mouse selections (X
+//! PRIMARY) go out only when DesktopShareSelection says so.
+//!
 //! The script is a constant: what varies (password, program, screen
-//! size) arrives on its standard input, never in the command line, so
+//! size, clipboard) arrives on its standard input, never in the command line, so
 //! nothing is quoted into it and `ps` on the server shows no secret. It
 //! is one line of POSIX sh without quotes inside, so the login shell
 //! (bash, dash, zsh, fish, tcsh) passes it to `sh` unchanged.
@@ -31,6 +36,9 @@ IFS= read -r pw || exit 4;
 IFS= read -r prog || exit 4;
 IFS= read -r size || exit 4;
 IFS= read -r mode || exit 4;
+read -r ca cs cp || exit 4;
+[ "$ca" = 1 ] || ca=0; [ "$cs" = 1 ] || cs=0; [ "$cp" = 1 ] || cp=0;
+xs=; [ $ca = 1 ] || xs="-seldir send"; [ $cs = 1 ] || xs="-seldir recv"; [ $ca$cs = 00 ] && xs=-nosel; [ $cp = 1 ] || xs="$xs -noprimary";
 case "$size" in *[0-9]x*[0-9]) ;; *) size=1600x900;; esac;
 have() { command -v $1 >/dev/null 2>&1; };
 b=;
@@ -52,7 +60,7 @@ if [ -e /tmp/.X$n-lock ] || [ -e /tmp/.X11-unix/X$n ]; then n=$((n+1)); continue
 k=$(od -An -N16 -tx1 /dev/urandom | tr -dc 0-9a-f);
 xauth -q -f "$d/auth" add :$n . $k >/dev/null 2>&1;
 if [ "$b" = xvnc ]; then
-Xvnc :$n -auth "$d/auth" -nolisten tcp -localhost -interface 127.0.0.1 -rfbport $((5900+n)) -SecurityTypes VncAuth -PasswordFile "$d/vncpw" -AcceptSetDesktopSize=$r -AlwaysShared -geometry $size -depth 24 </dev/null >"$d/xvfb.log" 2>&1 3<&- &
+Xvnc :$n -auth "$d/auth" -nolisten tcp -localhost -interface 127.0.0.1 -rfbport $((5900+n)) -SecurityTypes VncAuth -PasswordFile "$d/vncpw" -AcceptSetDesktopSize=$r -AcceptCutText=$ca -SendCutText=$cs -SendPrimary=$cp -AlwaysShared -geometry $size -depth 24 </dev/null >"$d/xvfb.log" 2>&1 3<&- &
 else
 Xvfb :$n -auth "$d/auth" -nolisten tcp -screen 0 ${size}x24 </dev/null >"$d/xvfb.log" 2>&1 3<&- &
 fi;
@@ -80,7 +88,7 @@ q=;
 if [ "$b" = xvnc ]; then q=$((5900+n));
 else
 echo "$pw" >"$d/pw";
-x11vnc -display :$n -auth "$d/auth" -localhost -forever -shared -norc -passwdfile "rm:$d/pw" </dev/null >"$d/vnc.out" 2>"$d/vnc.log" 3<&- &
+x11vnc -display :$n -auth "$d/auth" -localhost -forever -shared -norc $xs -passwdfile "rm:$d/pw" </dev/null >"$d/vnc.out" 2>"$d/vnc.log" 3<&- &
 v=$!;
 i=0;
 while [ $i -lt 150 ]; do q=$(sed -n "s/^PORT=//p" "$d/vnc.out"); [ -n "$q" ] && break; kill -0 $v 2>/dev/null || break; sleep 0.2; i=$((i+1)); done;
@@ -105,16 +113,30 @@ pub fn command() -> Vec<u8> {
     format!("sh -c '{}'", joined.join(" ")).into_bytes()
 }
 
+/// Which ways the virtual desktop's server lets copied text travel.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Clip {
+    /// From the viewer (Windows) into the desktop.
+    pub to_host: bool,
+    /// From the desktop to the viewer.
+    pub from_host: bool,
+    /// Mouse selections (X PRIMARY) go to the viewer too, not only
+    /// copies (CLIPBOARD).
+    pub selection: bool,
+}
+
 /// What the script reads on its standard input before it starts: the
 /// VNC password, the program to run (empty: a desktop session), the
-/// screen size, and whether it should `follow` the viewer's size (the
-/// script then prefers Xvnc, which can). `None` when the program cannot travel as one line.
+/// screen size, whether it should `follow` the viewer's size (the
+/// script then prefers Xvnc, which can) and the clipboard's ways. `None`
+/// when the program cannot travel as one line.
 pub fn input(
     password: &str,
     program: Option<&str>,
     width: u16,
     height: u16,
     follow: bool,
+    clip: Clip,
 ) -> Option<Zeroizing<Vec<u8>>> {
     let program = program.unwrap_or_default();
     if [password, program]
@@ -125,8 +147,15 @@ pub fn input(
     }
     let (width, height) = (width.clamp(320, 8192), height.clamp(200, 8192));
     let mode = if follow { "follow" } else { "fixed" };
+    let bit = u8::from;
+    let clip = format!(
+        "{} {} {}",
+        bit(clip.to_host),
+        bit(clip.from_host),
+        bit(clip.from_host && clip.selection)
+    );
     Some(Zeroizing::new(
-        format!("{password}\n{program}\n{width}x{height}\n{mode}\n").into_bytes(),
+        format!("{password}\n{program}\n{width}x{height}\n{mode}\n{clip}\n").into_bytes(),
     ))
 }
 
@@ -283,16 +312,30 @@ mod tests {
     }
 
     #[test]
-    fn input_is_four_lines() {
+    fn input_is_five_lines() {
         let pw = password();
-        let i = input(&pw, Some("xterm -fa Mono"), 1280, 720, true).unwrap();
+        let both = Clip {
+            to_host: true,
+            from_host: true,
+            selection: false,
+        };
+        let i = input(&pw, Some("xterm -fa Mono"), 1280, 720, true, both).unwrap();
         assert_eq!(
             &i[..],
-            format!("{}\nxterm -fa Mono\n1280x720\nfollow\n", *pw).as_bytes()
+            format!("{}\nxterm -fa Mono\n1280x720\nfollow\n1 1 0\n", *pw).as_bytes()
         );
-        let i = input(&pw, None, 10, 60000, false).unwrap();
-        assert_eq!(&i[..], format!("{}\n\n320x8192\nfixed\n", *pw).as_bytes());
-        assert!(input(&pw, Some("evil\nrm -rf ~"), 800, 600, true).is_none());
+        // Selections need the way from the host.
+        let only_to = Clip {
+            to_host: true,
+            from_host: false,
+            selection: true,
+        };
+        let i = input(&pw, None, 10, 60000, false, only_to).unwrap();
+        assert_eq!(
+            &i[..],
+            format!("{}\n\n320x8192\nfixed\n1 0 0\n", *pw).as_bytes()
+        );
+        assert!(input(&pw, Some("evil\nrm -rf ~"), 800, 600, true, both).is_none());
     }
 
     #[test]

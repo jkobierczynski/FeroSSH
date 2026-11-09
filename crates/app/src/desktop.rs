@@ -36,6 +36,8 @@ pub enum Update {
     Ask(String),
     /// The session is over, and why.
     Ended(String),
+    /// Text copied on the remote desktop, for this PC's clipboard.
+    Clipboard(String),
 }
 
 /// Where the session stands.
@@ -68,6 +70,11 @@ pub struct Session {
     pub password: Option<Zeroizing<String>>,
     /// Keep `width` x `height` rather than follow the pane's size.
     pub fixed: bool,
+    /// Which ways copied text may travel: to the host, from the host.
+    pub clipboard: (bool, bool),
+    /// The most the connection allows, which later changes of the global
+    /// setting stay within.
+    pub clipboard_limit: (bool, bool),
 }
 
 /// One remote desktop session.
@@ -89,6 +96,16 @@ pub struct Desktop {
     buttons: u8,
     /// The pane size the viewer was last given.
     size: (u16, u16),
+    /// Which ways copied text may travel: to the host, from the host.
+    clip: (bool, bool),
+    /// The connection's limit on [`Self::clip`].
+    clip_limit: (bool, bool),
+    /// The last text the desktop copied here, and the last sent to it
+    /// (line ends as `\n`): neither is sent to it again.
+    clip_in: Option<String>,
+    clip_out: Option<String>,
+    /// The picture just came up: this PC's clipboard may go to it now.
+    fresh: bool,
     /// Keeps the viewer process alive; dropping it ends the process.
     _process: Box<dyn Send>,
 }
@@ -130,6 +147,8 @@ impl Desktop {
             layout: session.layout,
             user: session.user.clone(),
         });
+        let (to_host, from_host) = session.clipboard;
+        let _ = tx.send(ToViewer::ClipboardRules { to_host, from_host });
 
         // Window and tunnel to viewer.
         let ended = events.clone();
@@ -223,6 +242,11 @@ impl Desktop {
             phase: Phase::Connecting,
             buttons: 0,
             size: (session.width, session.height),
+            clip: session.clipboard,
+            clip_limit: session.clipboard_limit,
+            clip_in: None,
+            clip_out: None,
+            fresh: false,
             _process: process,
         })
     }
@@ -259,6 +283,7 @@ impl Desktop {
                 Ok(Applied::Drawn) => {
                     if matches!(self.phase, Phase::Connecting) {
                         self.phase = Phase::Running;
+                        self.fresh = true;
                     }
                     drawn = true;
                 }
@@ -267,6 +292,13 @@ impl Desktop {
                     out.push(Update::Title(ferossh_term::sanitize_title(&n)));
                 }
                 Ok(Applied::Other(FromViewer::Bell)) => out.push(Update::Bell),
+                // The window decides, whatever the viewer does.
+                Ok(Applied::Other(FromViewer::Clipboard(text))) if self.clip.1 => {
+                    let plain = text.replace("\r\n", "\n");
+                    self.clip_out = None;
+                    self.clip_in = Some(plain);
+                    out.push(Update::Clipboard(text));
+                }
                 Ok(Applied::Other(FromViewer::NeedPassword)) => match self.protocol {
                     Protocol::Vnc if self.preset.is_some() => {
                         if let Some(pw) = self.preset.take() {
@@ -471,6 +503,49 @@ impl Desktop {
         }
     }
 
+    /// The connection's limit on the clipboard.
+    pub fn clipboard_limit(&self) -> (bool, bool) {
+        self.clip_limit
+    }
+
+    /// Whether this PC's clipboard text may go to the desktop.
+    pub fn takes_clipboard(&self) -> bool {
+        self.clip.0 && self.running()
+    }
+
+    /// New clipboard rules (to the host, from the host), at once.
+    pub fn set_clipboard(&mut self, to_host: bool, from_host: bool) {
+        if (to_host, from_host) == self.clip || matches!(self.phase, Phase::Ended) {
+            return;
+        }
+        self.clip = (to_host, from_host);
+        // Turned back on: the clipboard goes again.
+        self.clip_out = None;
+        self.send(ToViewer::ClipboardRules { to_host, from_host });
+    }
+
+    /// Offers this PC's clipboard text to the desktop, unless it is what
+    /// the desktop itself copied or was already given.
+    pub fn offer_clipboard(&mut self, text: &str) {
+        if !self.takes_clipboard() {
+            return;
+        }
+        let Some(text) = ferossh_viewer::pipe::clip_text(text) else {
+            return;
+        };
+        let plain = text.replace("\r\n", "\n");
+        if self.clip_in.as_ref() == Some(&plain) || self.clip_out.as_ref() == Some(&plain) {
+            return;
+        }
+        self.clip_out = Some(plain);
+        self.send(ToViewer::Clipboard(text));
+    }
+
+    /// Whether the picture just came up (once).
+    pub fn take_fresh(&mut self) -> bool {
+        std::mem::take(&mut self.fresh)
+    }
+
     /// The pane lost the keyboard: let go of held modifiers.
     pub fn focus_lost(&mut self) {
         if self.running() {
@@ -558,6 +633,8 @@ mod tests {
             user: String::new(),
             password: None,
             fixed: false,
+            clipboard: (true, true),
+            clipboard_limit: (true, true),
         };
         let mut d =
             Desktop::start(&addr, session, window_out, window_in, Box::new(()), || {}).unwrap();
@@ -619,6 +696,8 @@ mod tests {
             user: String::new(),
             password: Some(Zeroizing::new("pw".into())),
             fixed: true,
+            clipboard: (false, false),
+            clipboard_limit: (true, true),
         };
         let mut d =
             Desktop::start(&addr, session, window_out, window_in, Box::new(()), || {}).unwrap();
@@ -635,5 +714,81 @@ mod tests {
         d.mouse((0, 0, 300, 200), 149, 100, Some((1, true)));
         let got = srv.join().unwrap();
         assert_eq!(&got[16..], [5, 1, 0, 1, 0, 1]);
+    }
+
+    /// Copied text both ways, without echoes: the server's copy reaches
+    /// this PC, this PC's copy reaches the server, and the server's own
+    /// text is not sent back to it.
+    #[test]
+    fn clipboard_text_both_ways() {
+        let l = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = l.local_addr().unwrap().to_string();
+        let srv = std::thread::spawn(move || {
+            let (mut s, _) = l.accept().unwrap();
+            s.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+            let mut out = s.try_clone().unwrap();
+            let mut read = |n: usize| {
+                let mut b = vec![0u8; n];
+                s.read_exact(&mut b).unwrap();
+                b
+            };
+            out.write_all(b"RFB 003.008\n").unwrap();
+            read(12);
+            out.write_all(&[1, 1]).unwrap();
+            assert_eq!(read(1), [1]);
+            out.write_all(&0u32.to_be_bytes()).unwrap();
+            read(1);
+            let mut init = vec![0, 1, 0, 1];
+            init.extend([32, 24, 0, 1, 0, 255, 0, 255, 0, 255, 16, 8, 0, 0, 0, 0]);
+            init.extend(0u32.to_be_bytes());
+            out.write_all(&init).unwrap();
+            read(20 + 4 + 28 + 10);
+            let mut update = vec![0, 0, 0, 1, 0, 0, 0, 0, 0, 1, 0, 1, 0, 0, 0, 0];
+            update.extend([1, 2, 3, 0]);
+            out.write_all(&update).unwrap();
+            read(10);
+            out.write_all(&[3, 0, 0, 0, 0, 0, 0, 4, b'h', b'i', b'\n', 0xe9])
+                .unwrap();
+            let head = read(8);
+            assert_eq!(&head[..4], [6, 0, 0, 0]);
+            let len = u32::from_be_bytes(head[4..8].try_into().unwrap()) as usize;
+            read(len)
+        });
+        let (viewer_in, window_out) = std::io::pipe().unwrap();
+        let (window_in, viewer_out) = std::io::pipe().unwrap();
+        std::thread::spawn(move || ferossh_viewer::viewer::run(viewer_in, viewer_out));
+        let session = Session {
+            protocol: Protocol::Vnc,
+            width: 0,
+            height: 0,
+            layout: 0,
+            user: String::new(),
+            password: None,
+            fixed: true,
+            clipboard: (true, true),
+            clipboard_limit: (true, true),
+        };
+        let mut d =
+            Desktop::start(&addr, session, window_out, window_in, Box::new(()), || {}).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut copied = None;
+        while copied.is_none() {
+            assert!(Instant::now() < deadline);
+            for u in d.poll() {
+                assert!(!matches!(u, Update::Ended(_)), "{u:?}");
+                if let Update::Clipboard(t) = u {
+                    copied = Some(t);
+                }
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(copied.as_deref(), Some("hi\n\u{e9}"));
+        assert!(d.take_fresh(), "the picture came up");
+        assert!(!d.take_fresh());
+        // Its own copy, as Windows has it, does not go back; ours does.
+        d.offer_clipboard("hi\r\n\u{e9}");
+        d.offer_clipboard("from the PC");
+        d.offer_clipboard("from the PC");
+        assert_eq!(srv.join().unwrap(), b"from the PC");
     }
 }
