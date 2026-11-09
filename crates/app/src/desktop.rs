@@ -12,9 +12,11 @@
 //! Threads: one reads the tunnel and queues the bytes for the viewer, one
 //! writes the queue to the viewer, and one reads the viewer, sending its
 //! bytes for the server down the tunnel and the rest to the window. The
-//! server's bytes in the queue are held to [`MAX_QUEUED_NET`]: past it the
-//! tunnel is not read until the viewer catches up, so a slow (or stuck)
-//! viewer slows the server down instead of filling the window's memory.
+//! server's bytes in the queue, plus [`MESSAGE_COST`] for each message
+//! holding them, are held to [`MAX_QUEUED_NET`]: past it the tunnel is not
+//! read until the viewer catches up, so a slow (or stuck) viewer slows the
+//! server down instead of filling the window's memory, however small the
+//! pieces the server sends.
 
 use std::io::{Read, Write};
 use std::net::{Shutdown, TcpStream};
@@ -30,8 +32,19 @@ use ferossh_viewer::pipe::{
 };
 use zeroize::Zeroizing;
 
-/// The most bytes from the server queued for the viewer at once.
+/// The most bytes from the server queued for the viewer at once,
+/// counting [`MESSAGE_COST`] for each message.
 const MAX_QUEUED_NET: usize = 4 * 1024 * 1024;
+/// What one queued message costs beyond its bytes: more than its `Vec`,
+/// its slot in the channel and the allocator's share take, so that a
+/// server sending its bytes one at a time fills the budget no less than
+/// one sending them in big reads.
+const MESSAGE_COST: usize = 256;
+
+/// What a message of `n` of the server's bytes counts in the budget.
+fn cost(n: usize) -> usize {
+    n.saturating_add(MESSAGE_COST)
+}
 
 /// How many of the server's bytes wait in the queue for the viewer.
 #[derive(Debug, Default)]
@@ -42,18 +55,21 @@ struct Budget {
 }
 
 impl Budget {
-    /// Waits until `n` more bytes fit, or the queue is empty (a chunk is
-    /// never larger than [`MAX_NET`]), and counts them in. `false` once
-    /// the writer stopped: nobody will take them.
+    /// Waits until a message of `n` bytes fits, and counts it in.
+    /// `false` once the writer stopped, as nobody will take it, and for
+    /// more than [`MAX_NET`] bytes, which no message holds.
     fn take(&self, n: usize) -> bool {
+        if n > MAX_NET {
+            return false;
+        }
         let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
         loop {
             let (queued, closed) = *state;
             if closed {
                 return false;
             }
-            if queued == 0 || queued + n <= MAX_QUEUED_NET {
-                state.0 = queued + n;
+            if queued + cost(n) <= MAX_QUEUED_NET {
+                state.0 = queued + cost(n);
                 return true;
             }
             state = self
@@ -63,10 +79,10 @@ impl Budget {
         }
     }
 
-    /// `n` bytes went to the viewer.
+    /// A message of `n` bytes went to the viewer.
     fn give(&self, n: usize) {
         let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
-        state.0 = state.0.saturating_sub(n);
+        state.0 = state.0.saturating_sub(cost(n));
         self.changed.notify_all();
     }
 
@@ -255,11 +271,13 @@ impl Desktop {
                 for msg in queue {
                     let last = msg == ToViewer::Closed;
                     let net = match &msg {
-                        ToViewer::Net(b) => b.len(),
-                        _ => 0,
+                        ToViewer::Net(b) => Some(b.len()),
+                        _ => None,
                     };
                     let failed = write_frame(&mut pipe, &encode_wiped(&msg)).is_err();
-                    written.give(net);
+                    if let Some(n) = net {
+                        written.give(n);
+                    }
                     if failed {
                         let _ =
                             ended.send(FromThreads::Ended("The desktop viewer stopped.".into()));
@@ -913,9 +931,10 @@ mod budget_tests {
     #[test]
     fn a_slow_viewer_holds_the_tunnel_back() {
         let budget = Arc::new(Budget::default());
-        // A full queue's worth goes in at once.
-        assert!(budget.take(MAX_NET));
-        assert!(budget.take(MAX_QUEUED_NET - MAX_NET));
+        // Three full reads fit, a fourth does not.
+        for _ in 0..3 {
+            assert!(budget.take(MAX_NET));
+        }
         let reader = Arc::clone(&budget);
         let (done, waited) = mpsc::channel();
         let t = std::thread::spawn(move || {
@@ -927,15 +946,38 @@ mod budget_tests {
         budget.give(MAX_NET);
         assert_eq!(waited.recv_timeout(Duration::from_secs(5)), Ok(true));
         t.join().unwrap();
-        assert_eq!(budget.state.lock().unwrap().0, MAX_QUEUED_NET);
+        assert_eq!(budget.state.lock().unwrap().0, 3 * cost(MAX_NET));
+    }
+
+    #[test]
+    fn tiny_reads_are_held_back_too() {
+        let budget = Budget::default();
+        let mut queued = 0;
+        while queued < 1_000_000 {
+            let full = budget.state.lock().unwrap().0 + cost(1) > MAX_QUEUED_NET;
+            if full {
+                break;
+            }
+            assert!(budget.take(1));
+            queued += 1;
+        }
+        // One-byte messages stop at a few thousand, not millions.
+        assert_eq!(queued, MAX_QUEUED_NET / cost(1));
+        assert!(budget.state.lock().unwrap().0 <= MAX_QUEUED_NET);
+        for _ in 0..queued {
+            budget.give(1);
+        }
+        assert_eq!(budget.state.lock().unwrap().0, 0);
     }
 
     #[test]
     fn a_stopped_viewer_stops_the_reader() {
         let budget = Arc::new(Budget::default());
-        assert!(budget.take(MAX_QUEUED_NET));
+        for _ in 0..3 {
+            assert!(budget.take(MAX_NET));
+        }
         let reader = Arc::clone(&budget);
-        let t = std::thread::spawn(move || reader.take(1));
+        let t = std::thread::spawn(move || reader.take(MAX_NET));
         std::thread::sleep(Duration::from_millis(50));
         drop(CloseOnDrop(Arc::clone(&budget)));
         assert!(!t.join().unwrap());
@@ -943,10 +985,10 @@ mod budget_tests {
     }
 
     #[test]
-    fn an_empty_queue_takes_any_chunk() {
+    fn no_message_is_larger_than_max_net() {
         let budget = Budget::default();
-        assert!(budget.take(MAX_QUEUED_NET + 1));
-        budget.give(MAX_QUEUED_NET + 1);
-        assert_eq!(budget.state.lock().unwrap().0, 0);
+        assert!(!budget.take(MAX_NET + 1));
+        assert!(budget.take(MAX_NET));
+        assert_eq!(budget.state.lock().unwrap().0, cost(MAX_NET));
     }
 }
