@@ -60,6 +60,10 @@ use crate::rdp_guard::ChannelGuard;
 use crate::viewer::{send, send_pixels};
 use crate::{MAX_PIXELS, MAX_SIDE};
 
+/// Messages from the window read ahead of the session: each `Net` is at
+/// most [`MAX_NET`], so at most 64 MiB.
+const INPUT_BACKLOG: usize = 64;
+
 /// What the window's reader thread passes on.
 enum Item {
     Msg(ToViewer),
@@ -143,7 +147,9 @@ pub(crate) fn session(
     layout: u32,
     user: String,
 ) -> io::Result<()> {
-    let (tx, from) = mpsc::channel();
+    // Bounded, so a session that falls behind stops reading the pipe and
+    // the window holds the server back (its queue has a byte budget).
+    let (tx, from) = mpsc::sync_channel(INPUT_BACKLOG);
     std::thread::Builder::new()
         .name("viewer-input".into())
         .spawn(move || {

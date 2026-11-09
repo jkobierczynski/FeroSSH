@@ -11,11 +11,15 @@
 //!
 //! Threads: one reads the tunnel and queues the bytes for the viewer, one
 //! writes the queue to the viewer, and one reads the viewer, sending its
-//! bytes for the server down the tunnel and the rest to the window.
+//! bytes for the server down the tunnel and the rest to the window. The
+//! server's bytes in the queue are held to [`MAX_QUEUED_NET`]: past it the
+//! tunnel is not read until the viewer catches up, so a slow (or stuck)
+//! viewer slows the server down instead of filling the window's memory.
 
 use std::io::{Read, Write};
 use std::net::{Shutdown, TcpStream};
 use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::{Arc, Condvar, Mutex, PoisonError};
 
 use ferossh_render::{Image, fit};
 use ferossh_viewer::framebuffer::{Applied, Framebuffer};
@@ -23,6 +27,62 @@ use ferossh_viewer::keysym;
 pub use ferossh_viewer::pipe::Protocol;
 use ferossh_viewer::pipe::{FromViewer, MAX_NET, ToViewer, read_frame, write_frame};
 use zeroize::Zeroizing;
+
+/// The most bytes from the server queued for the viewer at once.
+const MAX_QUEUED_NET: usize = 4 * 1024 * 1024;
+
+/// How many of the server's bytes wait in the queue for the viewer.
+#[derive(Debug, Default)]
+struct Budget {
+    /// Bytes queued, and whether the viewer's writer stopped.
+    state: Mutex<(usize, bool)>,
+    changed: Condvar,
+}
+
+impl Budget {
+    /// Waits until `n` more bytes fit, or the queue is empty (a chunk is
+    /// never larger than [`MAX_NET`]), and counts them in. `false` once
+    /// the writer stopped: nobody will take them.
+    fn take(&self, n: usize) -> bool {
+        let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        loop {
+            let (queued, closed) = *state;
+            if closed {
+                return false;
+            }
+            if queued == 0 || queued + n <= MAX_QUEUED_NET {
+                state.0 = queued + n;
+                return true;
+            }
+            state = self
+                .changed
+                .wait(state)
+                .unwrap_or_else(PoisonError::into_inner);
+        }
+    }
+
+    /// `n` bytes went to the viewer.
+    fn give(&self, n: usize) {
+        let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        state.0 = state.0.saturating_sub(n);
+        self.changed.notify_all();
+    }
+
+    /// The writer stopped.
+    fn close(&self) {
+        self.state.lock().unwrap_or_else(PoisonError::into_inner).1 = true;
+        self.changed.notify_all();
+    }
+}
+
+/// Closes the budget when the writer thread ends, however it ends.
+struct CloseOnDrop(Arc<Budget>);
+
+impl Drop for CloseOnDrop {
+    fn drop(&mut self) {
+        self.0.close();
+    }
+}
 
 /// What the window should do after [`Desktop::poll`].
 #[derive(Debug, PartialEq, Eq)]
@@ -156,12 +216,21 @@ impl Desktop {
         let ended = events.clone();
         let wake = notify.clone();
         let mut pipe = to_viewer;
+        let budget = Arc::new(Budget::default());
+        let written = Arc::clone(&budget);
         std::thread::Builder::new()
             .name("desktop-to-viewer".into())
             .spawn(move || {
+                let _closer = CloseOnDrop(Arc::clone(&written));
                 for msg in queue {
                     let last = msg == ToViewer::Closed;
-                    if write_frame(&mut pipe, &msg.encode()).is_err() {
+                    let net = match &msg {
+                        ToViewer::Net(b) => b.len(),
+                        _ => 0,
+                    };
+                    let failed = write_frame(&mut pipe, &msg.encode()).is_err();
+                    written.give(net);
+                    if failed {
                         let _ =
                             ended.send(FromThreads::Ended("The desktop viewer stopped.".into()));
                         wake();
@@ -187,6 +256,10 @@ impl Desktop {
                             return;
                         }
                         Ok(n) => {
+                            // Waits while the viewer is behind.
+                            if !budget.take(n) {
+                                return;
+                            }
                             let bytes = buf.get(..n).unwrap_or_default().to_vec();
                             if to.send(ToViewer::Net(bytes)).is_err() {
                                 return;
@@ -797,5 +870,53 @@ mod tests {
         d.offer_clipboard("from the PC");
         d.offer_clipboard("from the PC");
         assert_eq!(srv.join().unwrap(), b"from the PC");
+    }
+}
+
+#[cfg(test)]
+mod budget_tests {
+    #![allow(clippy::unwrap_used)]
+
+    use super::*;
+    use std::time::Duration;
+
+    #[test]
+    fn a_slow_viewer_holds_the_tunnel_back() {
+        let budget = Arc::new(Budget::default());
+        // A full queue's worth goes in at once.
+        assert!(budget.take(MAX_NET));
+        assert!(budget.take(MAX_QUEUED_NET - MAX_NET));
+        let reader = Arc::clone(&budget);
+        let (done, waited) = mpsc::channel();
+        let t = std::thread::spawn(move || {
+            let ok = reader.take(MAX_NET);
+            done.send(ok).unwrap();
+        });
+        // The reader waits while nothing is written to the viewer.
+        assert!(waited.recv_timeout(Duration::from_millis(200)).is_err());
+        budget.give(MAX_NET);
+        assert_eq!(waited.recv_timeout(Duration::from_secs(5)), Ok(true));
+        t.join().unwrap();
+        assert_eq!(budget.state.lock().unwrap().0, MAX_QUEUED_NET);
+    }
+
+    #[test]
+    fn a_stopped_viewer_stops_the_reader() {
+        let budget = Arc::new(Budget::default());
+        assert!(budget.take(MAX_QUEUED_NET));
+        let reader = Arc::clone(&budget);
+        let t = std::thread::spawn(move || reader.take(1));
+        std::thread::sleep(Duration::from_millis(50));
+        drop(CloseOnDrop(Arc::clone(&budget)));
+        assert!(!t.join().unwrap());
+        assert!(!budget.take(1));
+    }
+
+    #[test]
+    fn an_empty_queue_takes_any_chunk() {
+        let budget = Budget::default();
+        assert!(budget.take(MAX_QUEUED_NET + 1));
+        budget.give(MAX_QUEUED_NET + 1);
+        assert_eq!(budget.state.lock().unwrap().0, 0);
     }
 }
