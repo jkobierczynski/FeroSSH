@@ -6575,6 +6575,7 @@ impl Window {
         }
         if self.live_native() {
             let all = self.open_sessions();
+            live_panel::set_search(self.live_view.query());
             live_panel::set_rows(self.live_view.rows(&all), all.len());
             live_panel::place(self.areas.side, self.areas.side_width, self.dpi);
         } else {
@@ -14148,6 +14149,9 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                 match wparam.0 {
                     2 if want => match rename {
                         Some(pane) => live_panel::edit_name(pane),
+                        // A second post while the name is edited: the
+                        // edit keeps the keyboard.
+                        None if live_panel::editing() => {}
                         None => live_panel::focus_list(),
                     },
                     1 if want && conn => conn_view::focus_tree(),

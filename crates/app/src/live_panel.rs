@@ -484,6 +484,24 @@ pub fn set_rows(rows: Vec<LiveRow>, total: usize) {
     }
 }
 
+/// Shows `query` in the search box when the view changed it (a reset or a
+/// rename of a session the filter hid). The box's change event then
+/// carries the same text.
+pub fn set_search(query: &str) {
+    let Some(h) = handles() else {
+        return;
+    };
+    // The view keeps 60 characters; longer typing is left alone.
+    let shown: String = search_text(h.search).chars().take(60).collect();
+    if shown != query {
+        let text = wide(query);
+        // SAFETY: our own control; the text lives through the call.
+        unsafe {
+            let _ = SetWindowTextW(h.search, PCWSTR(text.as_ptr()));
+        }
+    }
+}
+
 /// Gives the list the keyboard.
 pub fn focus_list() {
     if let Some(h) = handles() {
@@ -577,8 +595,12 @@ pub fn pre_translate(msg: &MSG) -> bool {
 
 /// Enter or Show: the selected session, or from the search box the
 /// first one listed.
-fn show(h: Handles) {
-    let pane = selected_pane().or_else(|| pane_at(h.list, 0));
+fn show(h: Handles, from_search: bool) {
+    let pane = if from_search {
+        pane_at(h.list, 0)
+    } else {
+        selected_pane().or_else(|| pane_at(h.list, 0))
+    };
     if let Some(p) = pane {
         emit(Event::Show(p));
     }
@@ -588,7 +610,11 @@ fn command(h: Handles, id: usize, code: u32) {
     match (id, code) {
         (ID_SEARCH, EN_CHANGE) => emit(Event::Query(search_text(h.search))),
         (ID_SEARCH, EN_SETFOCUS) => emit(Event::Focused),
-        (id, _) if id == IDOK.0 as usize => show(h),
+        (id, _) if id == IDOK.0 as usize => {
+            // SAFETY: a plain query.
+            let from_search = unsafe { GetFocus() } == h.search;
+            show(h, from_search);
+        }
         (id, _) if id == IDCANCEL.0 as usize => {
             if search_text(h.search).is_empty() {
                 emit(Event::Leave);
@@ -599,7 +625,7 @@ fn command(h: Handles, id: usize, code: u32) {
                 }
             }
         }
-        (ID_SHOW, BN_CLICKED) => show(h),
+        (ID_SHOW, BN_CLICKED) => show(h, false),
         (ID_RENAME, BN_CLICKED) => {
             if let Some(p) = selected_pane() {
                 edit_name(p);
@@ -624,7 +650,7 @@ fn notify(h: Handles, lparam: LPARAM) -> LRESULT {
         }
         match hdr.code {
             NM_SETFOCUS => emit(Event::Focused),
-            NM_DBLCLK => show(h),
+            NM_DBLCLK => show(h, false),
             LVN_KEYDOWN => {
                 let key = &*(lparam.0 as *const NMLVKEYDOWN);
                 if key.wVKey == VK_F2.0 {

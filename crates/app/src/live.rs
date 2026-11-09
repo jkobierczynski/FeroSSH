@@ -482,6 +482,11 @@ pub struct LiveRow {
 }
 
 impl LiveView {
+    /// The filter (for the native search box).
+    pub fn query(&self) -> &str {
+        &self.query
+    }
+
     /// Sets the filter (from the native search box), at most 60
     /// characters.
     pub fn set_query(&mut self, query: &str) {
