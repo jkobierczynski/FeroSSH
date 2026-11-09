@@ -27,8 +27,8 @@ ferossh-zmodem = { path = "crates/zmodem" }
 # FeroStream (remote Linux apps as native windows): its protocol, and its
 # client as a library (the windows and the decoder). Its own repository,
 # pinned to a commit; deny.toml allows that one git source.
-ferostream-client = { git = "https://github.com/jkobierczynski/FeroStream", rev = "5df3f0c9407c94d39aa13065a801353de5896f31" }
-ferostream-proto = { git = "https://github.com/jkobierczynski/FeroStream", rev = "5df3f0c9407c94d39aa13065a801353de5896f31" }
+ferostream-client = { git = "https://github.com/jkobierczynski/FeroStream", rev = "129835a96342ccdf61b74c785245fd70f7c86e13" }
+ferostream-proto = { git = "https://github.com/jkobierczynski/FeroStream", rev = "129835a96342ccdf61b74c785245fd70f7c86e13" }
 
 # Crypto backend is `ring`: russh has no pure-RustCrypto backend, and ring
 # builds with the MSVC toolchain alone (no CMake or NASM).

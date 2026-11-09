@@ -242,6 +242,56 @@ mod tests {
     }
 
     #[test]
+    fn packed_tiles_unpack_and_copies_pass_through() {
+        use ferostream_proto::tile::Effort;
+        // Few colours (a palette) and a gradient (colour rows), both ways
+        // of compressing, and a scroll.
+        let text: Vec<u8> = (0..64 * 32)
+            .flat_map(|i: u32| [(i % 3) as u8 * 80, 0, 0, 0])
+            .collect();
+        let ramp: Vec<u8> = (0..64 * 32)
+            .flat_map(|i: u32| [(i % 251) as u8, (i / 64) as u8, (i * 7 % 256) as u8, 0])
+            .collect();
+        let copy = Message::TileCopy {
+            window: 3,
+            x: 0,
+            y: 16,
+            width: 64,
+            height: 16,
+            to_x: 0,
+            to_y: 0,
+        };
+        let mut host = PREAMBLE.to_vec();
+        let mut want = Vec::new();
+        for (px, effort) in [
+            (&text, Effort::Fast),
+            (&text, Effort::Strong),
+            (&ramp, Effort::Fast),
+            (&ramp, Effort::Strong),
+        ] {
+            host.extend(Message::Tile(Tile::pack(3, 0, 0, 64, 32, px, effort)).encode());
+            want.push(px.clone());
+        }
+        host.extend(copy.encode());
+        let mut input = Vec::new();
+        write_frame(&mut input, &host).unwrap();
+        let mut output = Vec::new();
+        assert_eq!(run(&input[..], &mut output), 0);
+        let got = decode_all(&output);
+        assert_eq!(got.len(), 5);
+        for (g, px) in got.iter().zip(&want) {
+            match g {
+                FromDecoder::Message(Message::Tile(t)) => {
+                    assert_eq!(t.encoding, Encoding::Raw);
+                    assert_eq!(&t.data, px);
+                }
+                other => panic!("{other:?}"),
+            }
+        }
+        assert_eq!(got[4], FromDecoder::Message(copy));
+    }
+
+    #[test]
     fn command_lines_split_like_a_shell_would_simply() {
         let w = |s: &str| words(s).map(|v| v.join("|"));
         assert_eq!(w("gimp ~/a.png"), Some("gimp|~/a.png".into()));

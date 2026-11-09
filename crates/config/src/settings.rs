@@ -395,6 +395,9 @@ pub struct Settings {
     /// Which way copied text travels between remote apps and Windows:
     /// `both` (when unset), `to-host`, `from-host` or `off`.
     pub remote_app_clipboard: Option<String>,
+    /// How hard the agent packs window pictures: `auto` (when unset: from
+    /// the link speed it measures), `fast` (LZ4) or `strong` (Deflate).
+    pub remote_app_packing: Option<String>,
 }
 
 /// Scrollback is capped here, as the terminal caps it.
@@ -441,6 +444,7 @@ impl Default for Settings {
             remote_app_remove_agent: false,
             remote_app_agent_path: None,
             remote_app_clipboard: None,
+            remote_app_packing: None,
         }
     }
 }
@@ -743,6 +747,12 @@ impl Settings {
                         .map(|w| w.to_ascii_lowercase())
                         .filter(|w| ["both", "to-host", "from-host", "off"].contains(&w.as_str()));
                 }
+                "remoteapppacking" => {
+                    block = Block::Top;
+                    s.remote_app_packing = first
+                        .map(|w| w.to_ascii_lowercase())
+                        .filter(|w| ["auto", "fast", "strong"].contains(&w.as_str()));
+                }
                 _ => match block {
                     Block::Profile(i) => {
                         let Some(p) = s.profiles.get_mut(i) else {
@@ -927,6 +937,9 @@ impl Settings {
         }
         if let Some(c) = &self.remote_app_clipboard {
             let _ = writeln!(out, "RemoteAppClipboard {c}");
+        }
+        if let Some(p) = &self.remote_app_packing {
+            let _ = writeln!(out, "RemoteAppPacking {p}");
         }
         let _ = writeln!(out, "FollowDirectory {}", flag(self.follow_directory));
         let _ = writeln!(out, "ConfirmProduction {}", flag(self.confirm_production));
@@ -1358,6 +1371,7 @@ NewKeyword later
         let s = Settings::parse(
             "RemoteAppCopyAgent no\nRemoteAppRemoveAgent yes\n\
              RemoteAppAgentPath ~/apps/ferostream-agent\nRemoteAppClipboard to-host\n\
+             RemoteAppPacking Strong\n\
              Profile gimp-box\n    Type app\n    Via build\n    RemoteApp gimp \"a b.png\"\n\
              \x20   RemoteAppCopyAgent yes\n    RemoteAppRemoveAgent no\n",
         );
@@ -1368,6 +1382,11 @@ NewKeyword later
             Some("~/apps/ferostream-agent")
         );
         assert_eq!(s.remote_app_clipboard.as_deref(), Some("to-host"));
+        assert_eq!(s.remote_app_packing.as_deref(), Some("strong"));
+        assert_eq!(
+            Settings::parse("RemoteAppPacking hard\n").remote_app_packing,
+            None
+        );
         let p = s.profile("gimp-box").unwrap();
         assert_eq!(p.kind, SessionKind::RemoteApp);
         assert_eq!(p.via.as_deref(), Some("build"));
