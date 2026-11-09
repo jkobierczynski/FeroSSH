@@ -47,11 +47,11 @@ With the pin off (Settings > Keep tools open), an opened tool is a peek: clickin
 
 ## The connection manager
 
-Ctrl+Shift+S shows a side pane with your hosts: those from `~/.ssh/config`, your saved connections and your imports. Type to filter, Enter connects in this tab, Shift+Enter in a split, and Ctrl+D marks a favourite. Left and Right close and open folders. A `# folder: Name` comment above a `Host` line groups hosts in your ssh_config. Settings > Side pane on the right moves the pane.
+Ctrl+Shift+S shows your hosts in the tools pane: those from `~/.ssh/config`, your saved connections and your imports. They are in a Windows tree view, under a search box, with Connect, New, Edit and Import buttons below. Type to search (typing in the tree jumps to the search box; Down goes back to the tree), Enter or a double click connects in this tab, Shift+Enter in a split, and Ctrl+D marks a favourite. Left and Right close and open folders, and hovering a host shows its `user@host:port`. Tab moves between the search box, the tree and the buttons. A `# folder: Name` comment above a `Host` line groups hosts in your ssh_config. Settings > Side pane on the right moves the pane.
 
 ### Saved connections
 
-Insert, or "+ New connection" at the top, opens the connection form in the side pane; F2 or a right click edits the selected connection. The form has:
+Insert or the New button opens the connection form in the side pane; F2, the Edit button or a right click edits the selected connection. The form has:
 
 - **Name, Folder, Type**: the type is an SSH terminal, Telnet (unencrypted), Serial console, Remote desktop (RDP) or VNC desktop.
 - **Host, User, Port, Key file** (with Browse...), the **Password** source (below) and the **Jump host** (see [Jump hosts](#jump-hosts)). A serial console has the port, speed, framing and flow control instead.

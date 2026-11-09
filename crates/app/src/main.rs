@@ -25,6 +25,8 @@ mod broadcast;
 #[cfg(windows)]
 mod clipboard;
 #[cfg(windows)]
+mod conn_view;
+#[cfg(windows)]
 mod conpty;
 #[cfg(windows)]
 mod credman;

@@ -526,6 +526,143 @@ impl SessionList {
     }
 }
 
+/// A host in the native connection tree.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TreeHost {
+    /// The `Host` name, which connecting uses.
+    pub name: String,
+    /// What the tree shows: a star for a favourite, the name, and the kind
+    /// when it is not SSH.
+    pub label: String,
+    /// The tooltip: `user@hostname:port`, and the kind.
+    pub tip: String,
+}
+
+/// A top-level entry of the native connection tree.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum TreeNode {
+    Folder { name: String, hosts: Vec<TreeHost> },
+    Host(TreeHost),
+}
+
+impl TreeNode {
+    pub fn hosts(&self) -> &[TreeHost] {
+        match self {
+            TreeNode::Folder { hosts, .. } => hosts,
+            TreeNode::Host(h) => std::slice::from_ref(h),
+        }
+    }
+}
+
+impl SessionList {
+    /// Sets the search text (from the native search box), at most 64
+    /// characters.
+    pub fn set_query(&mut self, query: &str) {
+        let query: String = query.chars().take(64).collect();
+        if query != self.query {
+            self.query = query;
+            self.selected = 0;
+            self.scroll = 0;
+        }
+    }
+
+    fn tree_host(&self, index: usize) -> Option<TreeHost> {
+        let h = self.hosts.get(index)?;
+        let star = if self.is_favourite(&h.name) {
+            "\u{2605} "
+        } else {
+            ""
+        };
+        let label = match h.kind {
+            SessionKind::Ssh => format!("{star}{}", h.name),
+            kind => format!("{star}{} ({})", h.name, kind.name()),
+        };
+        let tip = match h.kind {
+            SessionKind::Ssh => h.detail.clone(),
+            kind if h.detail.is_empty() => kind.name().to_owned(),
+            kind => format!("{} \u{b7} {}", kind.name(), h.detail),
+        };
+        Some(TreeHost {
+            name: h.name.clone(),
+            label,
+            tip,
+        })
+    }
+
+    /// The hosts as the native tree shows them: the same order and folders
+    /// as the drawn list (favourites, hosts without a folder, then the
+    /// folders), or the matches alone, flat, while searching.
+    pub fn tree(&self) -> Vec<TreeNode> {
+        let host = |i: usize| self.tree_host(i);
+        if !self.query.trim().is_empty() {
+            // The drawn list's search rows: matches only, favourites first.
+            return self
+                .rows()
+                .into_iter()
+                .filter_map(|r| match r {
+                    Row::Host { index, .. } => host(index).map(TreeNode::Host),
+                    Row::Folder { .. } | Row::New => None,
+                })
+                .collect();
+        }
+        let mut out = Vec::new();
+        let favs: Vec<TreeHost> = (0..self.hosts.len())
+            .filter(|&i| {
+                self.hosts
+                    .get(i)
+                    .is_some_and(|h| self.is_favourite(&h.name))
+            })
+            .filter_map(host)
+            .collect();
+        if !favs.is_empty() {
+            out.push(TreeNode::Folder {
+                name: FAVOURITES.to_owned(),
+                hosts: favs,
+            });
+        }
+        out.extend(
+            (0..self.hosts.len())
+                .filter(|&i| self.hosts.get(i).is_some_and(|h| h.folder.is_none()))
+                .filter_map(host)
+                .map(TreeNode::Host),
+        );
+        let mut folders: Vec<&str> = Vec::new();
+        for h in &self.hosts {
+            if let Some(f) = h.folder.as_deref()
+                && !folders.contains(&f)
+            {
+                folders.push(f);
+            }
+        }
+        for f in folders {
+            let hosts = (0..self.hosts.len())
+                .filter(|&i| {
+                    self.hosts
+                        .get(i)
+                        .is_some_and(|h| h.folder.as_deref() == Some(f))
+                })
+                .filter_map(host)
+                .collect();
+            out.push(TreeNode::Folder {
+                name: f.to_owned(),
+                hosts,
+            });
+        }
+        out
+    }
+
+    /// What Enter in the search box opens: the first match, or what was
+    /// typed when nothing matches.
+    pub fn first_match(&self) -> Option<String> {
+        let tree = self.tree();
+        if let Some(h) = tree.iter().flat_map(TreeNode::hosts).next() {
+            return Some(h.name.clone());
+        }
+        let typed = self.query.trim();
+        (!typed.is_empty()).then(|| typed.to_owned())
+    }
+}
+
 /// Writes `text` right-aligned into `cells`, one cell short of the edge
 /// and starting no further left than `from`; shortened with an ellipsis
 /// when it does not fit, left out when even that would not read.
@@ -608,6 +745,57 @@ mod tests {
     /// right-aligned, one cell from the edge.
     fn folder(label: &str, count: usize) -> String {
         format!(" {label:<37}{count}")
+    }
+
+    #[test]
+    fn tree_groups_like_the_list() {
+        let l = list();
+        let tree = l.tree();
+        let names = |n: &TreeNode| n.hosts().iter().map(|h| h.name.clone()).collect::<Vec<_>>();
+        assert_eq!(tree.len(), 4);
+        assert!(matches!(&tree[0], TreeNode::Folder { name, .. } if name == "Favourites"));
+        assert_eq!(names(&tree[0]), ["pi"]);
+        assert!(matches!(&tree[1], TreeNode::Host(h) if h.name == "web"));
+        assert!(matches!(&tree[2], TreeNode::Folder { name, .. } if name == "Work"));
+        assert_eq!(names(&tree[2]), ["db1", "db2"]);
+        assert!(matches!(&tree[3], TreeNode::Folder { name, .. } if name == "Home"));
+        // A favourite carries a star wherever it is listed.
+        assert_eq!(tree[3].hosts()[0].label, "\u{2605} pi");
+        assert_eq!(tree[1].hosts()[0].tip, "me@web.example");
+    }
+
+    #[test]
+    fn tree_ignores_folds_of_the_drawn_list() {
+        let mut l = list();
+        l.collapsed.insert("Work".into());
+        assert_eq!(l.tree()[2].hosts().len(), 2);
+    }
+
+    #[test]
+    fn tree_search_is_flat_and_enter_opens_the_first_match() {
+        let mut l = list();
+        l.set_query("db");
+        let tree = l.tree();
+        assert_eq!(tree.len(), 2);
+        assert!(tree.iter().all(|n| matches!(n, TreeNode::Host(_))));
+        assert_eq!(l.first_match().as_deref(), Some("db1"));
+        l.set_query("new.example.org");
+        assert!(l.tree().is_empty());
+        assert_eq!(l.first_match().as_deref(), Some("new.example.org"));
+        l.set_query("");
+        assert_eq!(l.first_match().as_deref(), Some("pi"));
+    }
+
+    #[test]
+    fn tree_tags_other_kinds() {
+        let mut desk = item("desk", None);
+        desk.kind = SessionKind::Rdp;
+        let l = SessionList::new(vec![desk], Vec::new());
+        let tree = l.tree();
+        let h = &tree[0].hosts()[0];
+        assert!(matches!(tree[0], TreeNode::Host(_)));
+        assert!(h.label.starts_with("desk ("), "{}", h.label);
+        assert!(h.tip.contains("me@desk.example"));
     }
 
     #[test]
