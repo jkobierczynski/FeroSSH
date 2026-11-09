@@ -67,11 +67,11 @@ use windows::Win32::UI::Input::Ime::{
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     GetDoubleClickTime, GetKeyState, HOT_KEY_MODIFIERS, MAPVK_VK_TO_CHAR, MAPVK_VSC_TO_VK,
-    MOD_NOREPEAT, MapVirtualKeyW, RegisterHotKey, ReleaseCapture, SetCapture, UnregisterHotKey,
-    VIRTUAL_KEY, VK_ADD, VK_BACK, VK_CAPITAL, VK_CONTROL, VK_DELETE, VK_DOWN, VK_END, VK_ESCAPE,
-    VK_F1, VK_F2, VK_F3, VK_F4, VK_F5, VK_F12, VK_HOME, VK_INSERT, VK_LEFT, VK_LWIN, VK_MENU,
-    VK_NEXT, VK_NUMPAD0, VK_OEM_2, VK_OEM_MINUS, VK_OEM_PLUS, VK_PRIOR, VK_RETURN, VK_RIGHT,
-    VK_RWIN, VK_SHIFT, VK_SPACE, VK_SUBTRACT, VK_TAB, VK_UP,
+    MOD_NOREPEAT, MapVirtualKeyW, RegisterHotKey, ReleaseCapture, SetCapture, SetFocus,
+    UnregisterHotKey, VIRTUAL_KEY, VK_ADD, VK_BACK, VK_CAPITAL, VK_CONTROL, VK_DELETE, VK_DOWN,
+    VK_END, VK_ESCAPE, VK_F1, VK_F2, VK_F3, VK_F4, VK_F5, VK_F12, VK_HOME, VK_INSERT, VK_LEFT,
+    VK_LWIN, VK_MENU, VK_NEXT, VK_NUMPAD0, VK_OEM_2, VK_OEM_MINUS, VK_OEM_PLUS, VK_PRIOR,
+    VK_RETURN, VK_RIGHT, VK_RWIN, VK_SHIFT, VK_SPACE, VK_SUBTRACT, VK_TAB, VK_UP,
 };
 use windows::Win32::UI::Shell::{
     DragAcceptFiles, DragFinish, DragQueryFileW, DragQueryPoint, HDROP, ShellExecuteW,
@@ -106,6 +106,7 @@ use crate::Launch;
 use crate::batch::{self, PickHost, Picker, Report, ReportRow, RowState, Run};
 use crate::broadcast;
 use crate::clipboard;
+use crate::conn_view;
 use crate::conpty::{self, Output, Shell};
 use crate::credman;
 use crate::desktop::{Desktop, Protocol, Update as DesktopUpdate};
@@ -181,6 +182,9 @@ const APP_NAME: &str = "FeroSSH";
 /// Posted by the shell's, worker link's and broker's threads when
 /// something is waiting.
 const WM_SHELL_OUTPUT: u32 = WM_APP + 1;
+/// Moves the keyboard to the connection manager's controls (wParam 1) or
+/// back to the window (0), outside any borrow of the window's state.
+const WM_TOOLS_FOCUS: u32 = WM_APP + 40;
 /// Fires when a synchronized update must be shown even though it has not
 /// ended.
 const TIMER_SYNC: usize = 1;
@@ -1634,6 +1638,8 @@ fn create_and_run(launch: Launch, theme: Option<String>) -> Result<()> {
             // Without it (it never fails in practice) the menus still work.
             let _ = rail::create(hwnd, commands, look);
         }
+        // The connection manager's native controls; placed by layout().
+        let _ = conn_view::create(hwnd, conn_event, cmd::IMPORT, dpi);
         // Files dropped from Explorer are uploaded, after a confirmation.
         DragAcceptFiles(hwnd, true);
         // Clipboard changes reach a remote desktop being worked in.
@@ -1678,6 +1684,11 @@ fn create_and_run(launch: Launch, theme: Option<String>) -> Result<()> {
 
         let mut msg = MSG::default();
         while GetMessageW(&mut msg, None, 0, 0).as_bool() {
+            // Tab, Enter, Escape and the shortcuts in the connection
+            // manager's controls.
+            if conn_view::pre_translate(&msg) {
+                continue;
+            }
             let _ = TranslateMessage(&msg);
             DispatchMessageW(&msg);
         }
@@ -6534,6 +6545,47 @@ impl Window {
         }
     }
 
+    /// Whether the connection manager shows as native controls: its list
+    /// is open (not the session form or the import page, still drawn).
+    fn conn_native(&self) -> bool {
+        self.side.visible
+            && self.side.view == SideView::Sessions
+            && self.side.form.is_none()
+            && self.side.import.is_none()
+    }
+
+    /// Shows, fills and places the connection manager's controls, and
+    /// moves the keyboard to them or back as the side pane's focus says.
+    /// Focus changes are posted: they send messages that need this
+    /// window's state, which is borrowed here.
+    fn sync_conn_view(&mut self) {
+        if self.conn_native() {
+            conn_view::set_nodes(self.side.list.tree());
+            conn_view::place(self.areas.side, self.areas.side_width, self.dpi);
+        } else {
+            conn_view::place(None, 0, self.dpi);
+        }
+        let want = self.conn_native() && self.side.focused;
+        let to = if want && self.focused && !conn_view::has_focus() {
+            Some(1)
+        } else if !want && conn_view::has_focus() {
+            Some(0)
+        } else {
+            None
+        };
+        if let Some(to) = to {
+            // SAFETY: posting to our own window.
+            unsafe {
+                let _ = PostMessageW(Some(self.hwnd), WM_TOOLS_FOCUS, WPARAM(to), LPARAM(0));
+            }
+        }
+    }
+
+    /// The connection manager's controls should have the keyboard.
+    fn wants_conn_focus(&self) -> bool {
+        self.conn_native() && self.side.focused
+    }
+
     /// A theme whose background is the chrome's, for drawing its padding.
     fn chrome_theme(&self) -> Theme {
         let mut t = self
@@ -6547,6 +6599,7 @@ impl Window {
     /// Redraws the tab strip and side pane grids.
     fn refresh_chrome(&mut self) {
         rail::set_look(self.rail_look());
+        self.sync_conn_view();
         let palette = self.chrome_palette();
         if let Some(strip) = self.areas.strip {
             let palette = self.strip_palette();
@@ -6743,6 +6796,7 @@ impl Window {
             self.side.grid.mark_all_dirty();
         }
         rail::place(self.areas.rail);
+        self.sync_conn_view();
         // Every tab, so background shells know their size too.
         let pad = padding(self.dpi);
         let g = gap(self.dpi);
@@ -12411,6 +12465,44 @@ fn tab_menu(hwnd: HWND, tab: usize) {
 }
 
 /// The connection manager's right-click menu.
+/// Carries out what the user did in the connection manager's controls.
+fn conn_event(hwnd: HWND, event: conn_view::Event) {
+    use conn_view::Event;
+    let command = match event {
+        Event::Action(action) => with_window(|w| w.side_action(Some(action))).flatten(),
+        Event::OpenFirst { split } => with_window(|w| {
+            let host = w.side.list.first_match()?;
+            w.side_action(Some(SideAction::Open { host, split }))
+        })
+        .flatten(),
+        Event::Menu(host) => Some(Command::SessionMenu(host)),
+        Event::Command(id) => Some(Command::Id(id)),
+        Event::Query(query) => {
+            with_window(|w| {
+                w.side.list.set_query(&query);
+                w.refresh_chrome();
+            });
+            None
+        }
+        Event::Focused => {
+            with_window(|w| {
+                if !w.side.focused {
+                    w.side.focused = true;
+                    w.refresh_chrome();
+                }
+            });
+            None
+        }
+        Event::Refresh => {
+            with_window(|w| w.show_side(SideView::Sessions, true));
+            None
+        }
+    };
+    if let Some(command) = command {
+        run_command(hwnd, command);
+    }
+}
+
 fn session_menu(hwnd: HWND, host: Option<String>) {
     const CONNECT: u32 = 1;
     const SPLIT: u32 = 2;
@@ -13952,6 +14044,16 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
             }
             WM_CLIPBOARDUPDATE => {
                 with_window(Window::clipboard_changed);
+                LRESULT(0)
+            }
+            WM_TOOLS_FOCUS => {
+                // Checked again now: a click may have moved the focus since.
+                let want = with_window(|w| w.wants_conn_focus()).unwrap_or(false);
+                if wparam.0 == 1 && want {
+                    conn_view::focus_tree();
+                } else if wparam.0 == 0 && !want && conn_view::has_focus() {
+                    let _ = SetFocus(Some(hwnd));
+                }
                 LRESULT(0)
             }
             WM_KILLFOCUS => {

@@ -149,14 +149,17 @@ The side pane shows one view at a time. Esc goes back to the terminal; the short
 
 | Key | Action |
 | --- | --- |
-| Typing | Filters the list. With nothing left, Enter connects to what you typed. |
+| Typing | Searches (in the search box above the tree). With nothing left, Enter connects to what you typed. |
+| Down (in the search box) | Goes to the tree. |
+| Tab | Moves between the search box, the tree and the Connect, New, Edit and Import buttons. |
 | Enter / Shift+Enter | Connects in this tab / in a split. On a folder heading, opens or closes it. |
 | Left / Right | Closes / opens a folder. Left on a host goes to its folder. |
 | Ctrl+D | Marks or unmarks a favourite. |
 | Insert | New connection. |
 | F2 | Edits the selected connection. |
 | Del | Deletes the selected saved connection, after asking. |
-| Backspace / Esc | Edits the filter / clears it, then leaves. |
+| Esc | Clears the search, then leaves. |
+| F5 | Reads the hosts again. |
 
 ### Connection form
 
