@@ -93,12 +93,14 @@ pub async fn serve(mut inbox: mpsc::Receiver<Message>, out: mpsc::Sender<Message
                 channel,
                 connection,
                 command,
+                split_stderr,
             } => {
                 let Some(rx) = session(channel) else { continue };
                 tokio::spawn(exec::run(
                     channel,
                     connection,
                     command,
+                    split_stderr,
                     rx,
                     out.clone(),
                     connections.clone(),

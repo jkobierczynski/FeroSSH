@@ -254,6 +254,43 @@ jobs:
             echo "::endgroup::"
           done
 
+  # The FeroStream agent that Run remote app copies to Linux hosts, built
+  # from the FeroStream commit Cargo.lock pins (so it speaks the same
+  # protocol as the client in ferossh.exe): static musl binaries for
+  # x86-64 and 64-bit ARM. Releases put them next to ferossh.exe.
+  agent:
+    name: FeroStream agent (Linux)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: FeroStream at the pinned commit
+        run: |
+          rev=$(grep -m1 -o 'git+https://github.com/jkobierczynski/FeroStream?rev=[0-9a-f]*#[0-9a-f]*' Cargo.lock | sed 's/.*#//')
+          test -n "$rev"
+          echo "FeroStream $rev" | tee -a "$GITHUB_STEP_SUMMARY"
+          git init -q ferostream
+          git -C ferostream fetch -q --depth 1 https://github.com/jkobierczynski/FeroStream "$rev"
+          git -C ferostream checkout -q FETCH_HEAD
+      - name: Build
+        working-directory: ferostream
+        env:
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER: rust-lld
+        run: |
+          rustup target add x86_64-unknown-linux-musl aarch64-unknown-linux-musl
+          cargo build --release --locked -p ferostream-agent --target x86_64-unknown-linux-musl
+          cargo build --release --locked -p ferostream-agent --target aarch64-unknown-linux-musl
+          mkdir -p ../agents
+          cp target/x86_64-unknown-linux-musl/release/ferostream-agent ../agents/ferostream-agent
+          cp target/aarch64-unknown-linux-musl/release/ferostream-agent ../agents/ferostream-agent-aarch64
+          for f in ../agents/*; do
+            echo "$(basename "$f"): $(( $(stat -c %s "$f") / 1024 )) KB" | tee -a "$GITHUB_STEP_SUMMARY"
+          done
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ferostream-agents
+          path: agents
+
   deny:
     name: cargo deny
     runs-on: ubuntu-latest

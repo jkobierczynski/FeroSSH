@@ -12,7 +12,8 @@
 #      subject contains -Subject (a Certum card, or SimplySign Desktop
 #      logged in), with an RFC 3161 timestamp from Certum;
 #   3. writes SHA256SUMS.txt and BUILD-MANIFEST.json for the signed exes
-#      and uploads all four files to the draft;
+#      (and the Linux agents, which are not signed) and uploads the exes,
+#      the sums and the manifest to the draft;
 #   4. runs the "Attest a signed release" workflow on them and waits;
 #   5. names the signer in the release notes, publishes the release and
 #      writes the winget manifests for the signed ferossh.exe.
@@ -35,6 +36,8 @@ $ErrorActionPreference = "Stop"
 # code page and the notes come back with "⚠" turned into "ΓÜá".
 [Console]::OutputEncoding = [Text.UTF8Encoding]::new($false)
 $exes = "ferossh.exe", "ferossh-desktop.exe"
+# Linux agents for Run remote app: listed in the sums, never signed.
+$agents = "ferostream-agent", "ferostream-agent-aarch64"
 
 function Invoke-Native {
     param([string]$Program, [string[]]$Arguments)
@@ -66,7 +69,8 @@ Remove-Item $work -Recurse -Force -ErrorAction SilentlyContinue
 New-Item -ItemType Directory $work | Out-Null
 Write-Host "Downloading the draft's files to $work"
 Invoke-Native gh @("release", "download", $Tag, "-R", $Repository, "-D", $work,
-    "-p", "ferossh.exe", "-p", "ferossh-desktop.exe", "-p", "BUILD-MANIFEST.json")
+    "-p", "ferossh.exe", "-p", "ferossh-desktop.exe", "-p", "BUILD-MANIFEST.json",
+    "-p", "ferostream-agent*")
 
 # Sign only what CI built: the manifest has each exe's SHA-256 before
 # signing, the hash a rebuild from the tag reproduces.
@@ -96,10 +100,10 @@ foreach ($exe in $exes) {
 # The same sums and manifest the release workflow writes, now for the
 # signed exes.
 $sums = Join-Path $work "SHA256SUMS.txt"
-$exes | Sort-Object | ForEach-Object {
+($exes + ($agents | Where-Object { Test-Path (Join-Path $work $_) })) | Sort-Object | ForEach-Object {
     "$((Get-FileHash (Join-Path $work $_) -Algorithm SHA256).Hash.ToLower())  $_"
 } | Set-Content -Encoding ascii $sums
-foreach ($entry in $manifest.files) {
+foreach ($entry in $manifest.files | Where-Object name -in $exes) {
     $path = Join-Path $work $entry.name
     $entry.size = (Get-Item $path).Length
     $entry.sha256 = (Get-FileHash $path -Algorithm SHA256).Hash.ToLower()

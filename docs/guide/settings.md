@@ -48,6 +48,15 @@ FeroSSH reads `~/.ssh/config` and `~/.ssh/known_hosts` too, and writes only to `
 | `AutoResponses no` | yes | Whether snippets with a `When` text answer by themselves (Session > Auto-responses from snippets). |
 | `RunParallel 8` | 4 | How many hosts a multi-host snippet run logs in to at once, 1 to 16. |
 
+## Remote apps
+
+| Keyword | Default | Meaning |
+| --- | --- | --- |
+| `RemoteAppCopyAgent no` | yes | Whether FeroSSH copies the FeroStream agent to a host that lacks it (Session > Remote apps > Copy the agent to hosts). |
+| `RemoteAppRemoveAgent yes` | no | Whether a copied agent deletes itself when its last program ends (Session > Remote apps > Remove the agent when done). |
+| `RemoteAppAgentPath ~/bin/ferostream-agent` | `~/.local/bin/ferostream-agent` | Where on the host the agent is copied to: under `~/` or an absolute path, letters, digits and `._-+/` only. |
+| `RemoteAppClipboard to-host` | both | Which way copied text goes between remote apps and Windows: `both`, `to-host`, `from-host` or `off`. |
+
 ## X11
 
 | Keyword | Default | Meaning |
@@ -84,10 +93,13 @@ Profile web1
 | `VncPort N` | The server's VNC port (5900). |
 | `DesktopSize follow` or `WxH` | The size of this connection's remote and virtual desktops: following the pane (the default) or fixed, such as `1920x1080`. See [Desktop size](everyday-use.md#desktop-size). |
 | `VirtualDesktop COMMAND` | What Session > Open virtual desktop runs in its Xvfb display: a desktop session or one program, as a shell command, such as `startxfce4` or `firefox`. Unset, it runs `~/.xsession` or the first desktop session the server has. |
-| `Type ssh`, `telnet`, `serial`, `rdp`, `vnc` or `xvfb` | The kind of connection; `xvfb` is a virtual desktop on the `Via` host. |
+| `RemoteApp COMMAND` | The program a remote app connection runs, and the first one Run remote app offers on this host, such as `gimp` or `xterm -T 'my term'`. |
+| `RemoteAppCopyAgent yes` or `no` | Overrides `RemoteAppCopyAgent` for this connection. |
+| `RemoteAppRemoveAgent yes` or `no` | Overrides `RemoteAppRemoveAgent` for this connection. |
+| `Type ssh`, `telnet`, `serial`, `rdp`, `vnc`, `xvfb` or `remoteapp` | The kind of connection; `xvfb` is a virtual desktop and `remoteapp` a remote app, both on the `Via` host. |
 | `Serial 115200,8N1,rtscts` | For a serial console: speed, framing (8N1, 8E1, 8O1, 7E1, 7O1, 8N2) and flow control (`none`, `xonxoff`, `rtscts`, `dsrdtr`), in any order. Left out: 9600, 8N1, none. |
 | `LoginScript STEP` | One step of the login script, one line per step: `expect TEXT`, `send TEXT`, `password`, `secret NAME`, `pause SECONDS`. See [Login scripts](everyday-use.md#login-scripts). |
-| `Via SESSION` | For RDP and VNC: log in to this saved SSH connection first and tunnel the desktop through it. |
+| `Via SESSION` | For RDP, VNC, virtual desktops and remote apps: log in to this saved SSH connection first and tunnel the desktop through it. |
 | `PasswordSource windows` | Takes the password from Windows Credential Manager, after the first login that works. |
 | `PasswordCommand ...` | Runs this command (no shell, no window, 60 seconds at most) and uses the first line it prints as the password. `%n` is the connection's name, `%h` the host, `%u` the user, `%p` the port. FeroSSH asks before running a command the first time. |
 

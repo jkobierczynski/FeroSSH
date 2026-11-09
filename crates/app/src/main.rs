@@ -72,6 +72,8 @@ mod proxycmd;
 mod pwcommand;
 #[cfg_attr(not(windows), allow(dead_code))]
 mod reconnect;
+#[cfg(windows)]
+mod remote_app;
 #[cfg_attr(not(windows), allow(dead_code))]
 mod same_dir;
 #[cfg(windows)]
@@ -94,6 +96,8 @@ mod ssh;
 mod ssh_e2e;
 #[cfg_attr(not(windows), allow(dead_code))]
 mod standby;
+#[cfg_attr(not(windows), allow(dead_code))]
+mod stream;
 #[cfg_attr(not(windows), allow(dead_code))]
 mod tabstrip;
 #[cfg_attr(not(windows), allow(dead_code))]
@@ -121,6 +125,8 @@ enum Launch {
     Worker(String, String),
     /// Run as the remote desktop viewer on these inherited handles.
     Viewer(String, String),
+    /// Run as a remote app's decoder on these inherited handles.
+    Stream(String, String),
     /// Connect to a host, or ask for one.
     Ssh {
         destination: Option<String>,
@@ -172,6 +178,12 @@ fn parse_args(args: &[String]) -> Result<Launch, String> {
                     return Err("--viewer needs two handles".into());
                 };
                 return Ok(Launch::Viewer(i.clone(), o.clone()));
+            }
+            "--stream" => {
+                let (Some(i), Some(o)) = (iter.next(), iter.next()) else {
+                    return Err("--stream needs two handles".into());
+                };
+                return Ok(Launch::Stream(i.clone(), o.clone()));
             }
             "--local" => {
                 let command: Vec<String> = iter.map(|a| quote(a)).collect();
@@ -226,6 +238,16 @@ fn main() -> windows::core::Result<()> {
             // No window and no files: just the network side.
             if let Some((input, output)) = sandbox::worker_pipes(&input, &output) {
                 let _ = ferossh_worker::run_blocking(input, output);
+            }
+            Ok(())
+        }
+        Ok(Launch::Stream(input, output)) => {
+            // A remote app's decoder: no window, no network, no files.
+            if let Some((input, output)) = sandbox::worker_pipes(&input, &output) {
+                std::process::exit(stream::run(
+                    std::io::BufReader::new(input),
+                    std::io::BufWriter::new(output),
+                ));
             }
             Ok(())
         }

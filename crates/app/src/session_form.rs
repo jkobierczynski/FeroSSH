@@ -77,6 +77,13 @@ pub struct Values {
     pub virtual_desktop: String,
     /// `follow`, empty (the same) or `WIDTHxHEIGHT`.
     pub desktop_size: String,
+    /// What Run remote app offers first, or a remote app session runs.
+    pub remote_app: String,
+    /// Copy the FeroStream agent to the host: the global setting when
+    /// unset.
+    pub copy_agent: Option<bool>,
+    /// Remove the copied agent when done: the global setting when unset.
+    pub remove_agent: Option<bool>,
     pub legacy: bool,
     /// Where the password comes from: see [`PASSWORD_CHOICES`].
     pub password: usize,
@@ -190,6 +197,9 @@ impl Values {
         self.desktop_port = opt_text(&p.desktop_port);
         self.vnc_port = opt_text(&p.vnc_port);
         self.virtual_desktop = p.virtual_desktop.clone().unwrap_or_default();
+        self.remote_app = p.remote_app.clone().unwrap_or_default();
+        self.copy_agent = p.remote_app_copy_agent;
+        self.remove_agent = p.remote_app_remove_agent;
         self.desktop_size = p
             .desktop_size
             .and_then(|d| d.fixed())
@@ -231,6 +241,9 @@ enum Field {
     VncPort,
     VirtualDesktop,
     DesktopSize,
+    RemoteApp,
+    CopyAgent,
+    RemoveAgent,
     Legacy,
     Password,
     PasswordCommand,
@@ -265,6 +278,9 @@ impl Field {
             Field::VncPort => "VNC port",
             Field::VirtualDesktop => "Virtual desk",
             Field::DesktopSize => "Desk size",
+            Field::RemoteApp => "Remote app",
+            Field::CopyAgent => "Copy agent",
+            Field::RemoveAgent => "Clean up",
             Field::Legacy => "Old crypto",
             Field::Password => "Password",
             Field::PasswordCommand => "Command",
@@ -284,10 +300,21 @@ impl Field {
                 | Field::Tmux
                 | Field::TmuxLayout
                 | Field::Legacy
+                | Field::CopyAgent
+                | Field::RemoveAgent
                 | Field::Password
                 | Field::Framing
                 | Field::Flow
         )
+    }
+}
+
+/// Steps an unset / yes / no choice.
+fn tri(v: Option<bool>, forward: bool) -> Option<bool> {
+    match (v, forward) {
+        (None, true) | (Some(true), false) => Some(true),
+        (Some(true), true) | (None, false) => Some(false),
+        (Some(false), _) => None,
     }
 }
 
@@ -434,12 +461,13 @@ impl SessionForm {
                 }
             }
             out.extend([Field::Folder, Field::Type].map(Item::Field));
-            // A virtual desktop runs on its Via SSH host: no address.
-            if kind != SessionKind::Xvfb {
+            // A virtual desktop or remote app runs on its Via SSH host:
+            // no address.
+            if !matches!(kind, SessionKind::Xvfb | SessionKind::RemoteApp) {
                 out.push(Item::Field(Field::Host));
             }
             match kind {
-                SessionKind::Xvfb => {}
+                SessionKind::Xvfb | SessionKind::RemoteApp => {}
                 SessionKind::Serial => {
                     out.extend([Field::Speed, Field::Framing, Field::Flow].map(Item::Field));
                 }
@@ -472,6 +500,18 @@ impl SessionForm {
                 SessionKind::Xvfb => out.extend(
                     [Field::Via, Field::VirtualDesktop, Field::DesktopSize].map(Item::Field),
                 ),
+                SessionKind::RemoteApp => {
+                    out.extend(
+                        [
+                            Field::Via,
+                            Field::RemoteApp,
+                            Field::CopyAgent,
+                            Field::RemoveAgent,
+                        ]
+                        .map(Item::Field),
+                    );
+                    out.push(Item::Note("Its windows open as Windows windows.".into()));
+                }
                 SessionKind::Serial => {}
                 SessionKind::Telnet => {
                     out.push(Item::Note("Unencrypted: anyone on the way".into()));
@@ -519,6 +559,9 @@ impl SessionForm {
                         Field::VncPort,
                         Field::VirtualDesktop,
                         Field::DesktopSize,
+                        Field::RemoteApp,
+                        Field::CopyAgent,
+                        Field::RemoveAgent,
                         Field::Legacy,
                     ]
                     .map(Item::Field),
@@ -598,6 +641,7 @@ impl SessionForm {
             Field::VncPort => &v.vnc_port,
             Field::VirtualDesktop => &v.virtual_desktop,
             Field::DesktopSize => &v.desktop_size,
+            Field::RemoteApp => &v.remote_app,
             Field::PasswordCommand => &v.password_command,
             Field::Speed => &v.speed,
             Field::Type
@@ -605,6 +649,8 @@ impl SessionForm {
             | Field::Tmux
             | Field::TmuxLayout
             | Field::Legacy
+            | Field::CopyAgent
+            | Field::RemoveAgent
             | Field::Password
             | Field::Framing
             | Field::Flow => {
@@ -634,6 +680,7 @@ impl SessionForm {
             Field::DesktopPort => &mut v.desktop_port,
             Field::VncPort => &mut v.vnc_port,
             Field::VirtualDesktop => &mut v.virtual_desktop,
+            Field::RemoteApp => &mut v.remote_app,
             Field::DesktopSize => &mut v.desktop_size,
             Field::PasswordCommand => &mut v.password_command,
             Field::Speed => &mut v.speed,
@@ -642,6 +689,8 @@ impl SessionForm {
             | Field::Tmux
             | Field::TmuxLayout
             | Field::Legacy
+            | Field::CopyAgent
+            | Field::RemoveAgent
             | Field::Password
             | Field::Framing
             | Field::Flow => {
@@ -661,6 +710,19 @@ impl SessionForm {
                 SessionKind::Serial => "Serial console",
                 SessionKind::Telnet => "Telnet (unencrypted)",
                 SessionKind::Xvfb => "Virtual desktop (Xvfb)",
+                SessionKind::RemoteApp => "Remote app (FeroStream)",
+            }
+            .to_owned(),
+            Field::CopyAgent => match v.copy_agent {
+                None => "as in Session > Remote apps",
+                Some(true) => "yes, when missing or old",
+                Some(false) => "no: the host has one",
+            }
+            .to_owned(),
+            Field::RemoveAgent => match v.remove_agent {
+                None => "as in Session > Remote apps",
+                Some(true) => "remove the agent when done",
+                Some(false) => "keep the agent",
             }
             .to_owned(),
             Field::Framing if v.framing.is_empty() => "8N1".to_owned(),
@@ -709,6 +771,7 @@ impl SessionForm {
                     SessionKind::Rdp,
                     SessionKind::Vnc,
                     SessionKind::Xvfb,
+                    SessionKind::RemoteApp,
                     SessionKind::Telnet,
                     SessionKind::Serial,
                 ];
@@ -752,6 +815,8 @@ impl SessionForm {
                 };
             }
             Field::Legacy => v.legacy = !v.legacy,
+            Field::CopyAgent => v.copy_agent = tri(v.copy_agent, forward),
+            Field::RemoveAgent => v.remove_agent = tri(v.remove_agent, forward),
             Field::Tmux => v.tmux_on = !v.tmux_on,
             Field::Password => {
                 v.password = step(v.password, PASSWORD_CUSTOM + 1);
@@ -793,12 +858,17 @@ impl SessionForm {
                 SessionKind::Rdp => "3389".into(),
                 SessionKind::Vnc => "5900".into(),
                 SessionKind::Telnet => "23".into(),
-                SessionKind::Serial | SessionKind::Xvfb => String::new(),
+                SessionKind::Serial | SessionKind::Xvfb | SessionKind::RemoteApp => String::new(),
             },
             Field::Speed => "9600 bits/s".into(),
             Field::Key => "default keys and agent".into(),
             Field::Jump => "none, or e.g. bastion".into(),
-            Field::Via if matches!(v.kind, SessionKind::Vnc | SessionKind::Xvfb) => {
+            Field::Via
+                if matches!(
+                    v.kind,
+                    SessionKind::Vnc | SessionKind::Xvfb | SessionKind::RemoteApp
+                ) =>
+            {
                 "an SSH connection (required)".into()
             }
             Field::Via => "none: connect directly".into(),
@@ -814,12 +884,15 @@ impl SessionForm {
             Field::VncPort => "5900".into(),
             Field::VirtualDesktop => "a desktop session, or e.g. firefox".into(),
             Field::DesktopSize => "follows the window, or e.g. 1920x1080".into(),
+            Field::RemoteApp => "xterm, or e.g. gimp ~/photo.png".into(),
             Field::PasswordCommand => "program and arguments".into(),
             Field::Type
             | Field::Theme
             | Field::Tmux
             | Field::TmuxLayout
             | Field::Legacy
+            | Field::CopyAgent
+            | Field::RemoveAgent
             | Field::Password
             | Field::Framing
             | Field::Flow => String::new(),
@@ -950,6 +1023,9 @@ impl SessionForm {
             SessionKind::Xvfb if via.is_empty() => {
                 return Err("A virtual desktop runs on an SSH connection: fill in Via SSH.".into());
             }
+            SessionKind::RemoteApp if via.is_empty() => {
+                return Err("A remote app runs on an SSH connection: fill in Via SSH.".into());
+            }
             _ if via.is_empty() => {}
             _ if via.eq_ignore_ascii_case(name) => {
                 return Err("Via SSH names another connection, not this one.".into());
@@ -999,6 +1075,9 @@ impl SessionForm {
         }
         if v.virtual_desktop.chars().any(char::is_control) {
             return Err("The virtual desktop program cannot hold control characters.".into());
+        }
+        if v.remote_app.chars().any(char::is_control) {
+            return Err("The remote app cannot hold control characters.".into());
         }
         if v.kind == SessionKind::Ssh
             && v.password > PASSWORD_WINDOWS
@@ -1444,7 +1523,7 @@ impl SessionForm {
         p.via = trimmed(&v.via).filter(|_| {
             matches!(
                 v.kind,
-                SessionKind::Rdp | SessionKind::Vnc | SessionKind::Xvfb
+                SessionKind::Rdp | SessionKind::Vnc | SessionKind::Xvfb | SessionKind::RemoteApp
             )
         });
         p.theme = trimmed(&v.theme);
@@ -1463,6 +1542,9 @@ impl SessionForm {
         p.desktop_port = v.desktop_port.trim().parse().ok().filter(|&p| p != 0);
         p.vnc_port = v.vnc_port.trim().parse().ok().filter(|&p| p != 0);
         p.virtual_desktop = ferossh_config::settings::virtual_desktop(&v.virtual_desktop);
+        p.remote_app = ferossh_config::settings::virtual_desktop(&v.remote_app);
+        p.remote_app_copy_agent = v.copy_agent;
+        p.remote_app_remove_agent = v.remove_agent;
         p.desktop_size = ferossh_config::settings::DesktopSize::parse(&v.desktop_size)
             .filter(|d| *d != ferossh_config::settings::DesktopSize::Follow);
         p.legacy_algorithms = v.legacy;
@@ -1790,6 +1872,49 @@ mod tests {
     }
 
     #[test]
+    fn a_remote_app_connection_needs_via_and_keeps_its_agent_choices() {
+        let mut f = new_form();
+        f.values = Values {
+            name: "gimp-box".into(),
+            kind: SessionKind::RemoteApp,
+            ..Values::default()
+        };
+        assert!(f.check().unwrap_err().contains("Via SSH"));
+        f.values.via = "bastion".into();
+        f.values.remote_app = "gimp ~/a.png".into();
+        assert_eq!(f.check(), Ok(()));
+        let items = f.items();
+        for field in [
+            Field::Via,
+            Field::RemoteApp,
+            Field::CopyAgent,
+            Field::RemoveAgent,
+        ] {
+            assert!(items.contains(&Item::Field(field)), "{field:?}");
+        }
+        assert!(!items.contains(&Item::Field(Field::Host)));
+        assert!(!items.contains(&Item::Field(Field::User)));
+        // Unset, yes, no, and round again.
+        assert_eq!(f.choice(Field::RemoveAgent), "as in Session > Remote apps");
+        f.cycle(Field::RemoveAgent, true);
+        assert_eq!(f.values.remove_agent, Some(true));
+        f.cycle(Field::CopyAgent, true);
+        f.cycle(Field::CopyAgent, true);
+        assert_eq!(f.values.copy_agent, Some(false));
+        let mut hosts = Vec::new();
+        let mut settings = Settings::default();
+        f.apply(&mut hosts, &mut settings);
+        let p = settings.profile("gimp-box").unwrap();
+        assert_eq!(p.kind, SessionKind::RemoteApp);
+        assert_eq!(p.via.as_deref(), Some("bastion"));
+        assert_eq!(p.remote_app.as_deref(), Some("gimp ~/a.png"));
+        assert_eq!(p.remote_app_copy_agent, Some(false));
+        assert_eq!(p.remote_app_remove_agent, Some(true));
+        f.values.remote_app = "a\u{7}".into();
+        assert!(f.check().is_err());
+    }
+
+    #[test]
     fn desktop_sessions_have_no_terminal_sections() {
         let mut f = new_form();
         typed(&mut f, "office");
@@ -1930,8 +2055,9 @@ mod tests {
         down(&mut f, 11);
         f.key(SideKey::Enter { split: false }, 30);
         // tmux, tmux panes, Start dir, Forward 1, RDP port, VNC port,
-        // Virtual desk, Desk size, Old crypto.
-        down(&mut f, 10);
+        // Virtual desk, Desk size, Remote app, Copy agent, Clean up, Old
+        // crypto.
+        down(&mut f, 13);
         assert_eq!(f.focused_field(), Some(Field::LoginStep(0)));
         let t = texts(&mut f);
         assert!(

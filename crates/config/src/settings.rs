@@ -10,6 +10,8 @@
 //! VerifyTransfers yes
 //! ZModem yes
 //! AutoReconnect yes
+//! RemoteAppCopyAgent yes
+//! RemoteAppRemoveAgent no
 //! Favourite web
 //! ThemeRule
 //!     Hosts prod-* *.prod.example.com
@@ -47,6 +49,11 @@
 //!     LoginScript secret enable
 //! Profile old-router
 //!     Type telnet
+//! Profile gimp-on-build
+//!     Type remoteapp
+//!     Via build-box
+//!     RemoteApp gimp
+//!     RemoteAppRemoveAgent yes
 //! Secret enable
 //!     PasswordCommand op read "op://Network/%n/password"
 //! ```
@@ -141,6 +148,15 @@ pub struct Profile {
     /// Connect again on its own when the connection drops; the global
     /// setting when unset.
     pub auto_reconnect: Option<bool>,
+    /// The program Session > Run remote app offers first (and what a
+    /// remote app session runs), as a shell-like command line.
+    pub remote_app: Option<String>,
+    /// Copy the FeroStream agent to this host when it lacks it; the
+    /// global setting when unset.
+    pub remote_app_copy_agent: Option<bool>,
+    /// Remove the copied agent from this host when its last remote app
+    /// ends; the global setting when unset.
+    pub remote_app_remove_agent: Option<bool>,
 }
 
 /// What opening a session does.
@@ -160,6 +176,9 @@ pub enum SessionKind {
     Telnet,
     /// A virtual desktop (Xvfb or Xvnc) started on the `Via` SSH host.
     Xvfb,
+    /// A program on the `Via` SSH host whose windows show as native
+    /// windows here (FeroStream).
+    RemoteApp,
 }
 
 /// How big a desktop is: as big as its pane, following it as it changes
@@ -211,6 +230,7 @@ impl SessionKind {
             SessionKind::Serial => "serial",
             SessionKind::Telnet => "telnet",
             SessionKind::Xvfb => "xvfb",
+            SessionKind::RemoteApp => "remoteapp",
         }
     }
 
@@ -222,6 +242,7 @@ impl SessionKind {
             "serial" => Some(SessionKind::Serial),
             "telnet" => Some(SessionKind::Telnet),
             "xvfb" | "virtual" => Some(SessionKind::Xvfb),
+            "remoteapp" | "app" | "ferostream" => Some(SessionKind::RemoteApp),
             _ => None,
         }
     }
@@ -285,6 +306,9 @@ impl Profile {
             && self.serial.is_none()
             && self.login_script.is_empty()
             && self.auto_reconnect.is_none()
+            && self.remote_app.is_none()
+            && self.remote_app_copy_agent.is_none()
+            && self.remote_app_remove_agent.is_none()
     }
 }
 
@@ -359,6 +383,18 @@ pub struct Settings {
     /// handle, so that a FeroSSH that ended without showing it again
     /// shows it at its next start.
     pub standby_hidden: Option<u64>,
+    /// Remote apps: copy the FeroStream agent to a host that lacks it (or
+    /// has another version). On unless turned off.
+    pub remote_app_copy_agent: bool,
+    /// Remote apps: the copied agent deletes itself once the last remote
+    /// app on that host ends. Off unless turned on.
+    pub remote_app_remove_agent: bool,
+    /// Where the agent is copied to on hosts (`~/...` or absolute);
+    /// `~/.local/bin/ferostream-agent` when unset.
+    pub remote_app_agent_path: Option<String>,
+    /// Which way copied text travels between remote apps and Windows:
+    /// `both` (when unset), `to-host`, `from-host` or `off`.
+    pub remote_app_clipboard: Option<String>,
 }
 
 /// Scrollback is capped here, as the terminal caps it.
@@ -401,6 +437,10 @@ impl Default for Settings {
             standby_hotkey: None,
             standby_target: None,
             standby_hidden: None,
+            remote_app_copy_agent: true,
+            remote_app_remove_agent: false,
+            remote_app_agent_path: None,
+            remote_app_clipboard: None,
         }
     }
 }
@@ -671,6 +711,38 @@ impl Settings {
                     block = Block::Top;
                     s.auto_reconnect = yes(&args).unwrap_or(true);
                 }
+                "remoteappcopyagent" if matches!(block, Block::Profile(_)) => {
+                    if let Block::Profile(i) = block
+                        && let Some(p) = s.profiles.get_mut(i)
+                    {
+                        p.remote_app_copy_agent = yes(&args);
+                    }
+                }
+                "remoteappcopyagent" => {
+                    block = Block::Top;
+                    s.remote_app_copy_agent = yes(&args).unwrap_or(true);
+                }
+                "remoteappremoveagent" if matches!(block, Block::Profile(_)) => {
+                    if let Block::Profile(i) = block
+                        && let Some(p) = s.profiles.get_mut(i)
+                    {
+                        p.remote_app_remove_agent = yes(&args);
+                    }
+                }
+                "remoteappremoveagent" => {
+                    block = Block::Top;
+                    s.remote_app_remove_agent = yes(&args).unwrap_or(false);
+                }
+                "remoteappagentpath" => {
+                    block = Block::Top;
+                    s.remote_app_agent_path = Some(joined).filter(|p| !p.is_empty());
+                }
+                "remoteappclipboard" => {
+                    block = Block::Top;
+                    s.remote_app_clipboard = first
+                        .map(|w| w.to_ascii_lowercase())
+                        .filter(|w| ["both", "to-host", "from-host", "off"].contains(&w.as_str()));
+                }
                 _ => match block {
                     Block::Profile(i) => {
                         let Some(p) = s.profiles.get_mut(i) else {
@@ -745,6 +817,7 @@ impl Settings {
                             "virtualdesktop" => {
                                 p.virtual_desktop = virtual_desktop(&raw_rest(line));
                             }
+                            "remoteapp" => p.remote_app = virtual_desktop(&raw_rest(line)),
                             "tmuxlayout" => {
                                 p.tmux_layout = first
                                     .map(|l| l.to_ascii_lowercase())
@@ -839,6 +912,22 @@ impl Settings {
             let _ = writeln!(out, "ParallelTransfers {n}");
         }
         let _ = writeln!(out, "ZModem {}", flag(self.zmodem));
+        let _ = writeln!(
+            out,
+            "RemoteAppCopyAgent {}",
+            flag(self.remote_app_copy_agent)
+        );
+        let _ = writeln!(
+            out,
+            "RemoteAppRemoveAgent {}",
+            flag(self.remote_app_remove_agent)
+        );
+        if let Some(p) = &self.remote_app_agent_path {
+            let _ = writeln!(out, "RemoteAppAgentPath {}", arg(p));
+        }
+        if let Some(c) = &self.remote_app_clipboard {
+            let _ = writeln!(out, "RemoteAppClipboard {c}");
+        }
         let _ = writeln!(out, "FollowDirectory {}", flag(self.follow_directory));
         let _ = writeln!(out, "ConfirmProduction {}", flag(self.confirm_production));
         let _ = writeln!(out, "AutoResponses {}", flag(self.auto_responses));
@@ -929,6 +1018,23 @@ impl Settings {
             }
             if let Some(on) = p.auto_reconnect {
                 let _ = writeln!(out, "    AutoReconnect {}", if on { "yes" } else { "no" });
+            }
+            if let Some(c) = &p.remote_app {
+                let _ = writeln!(out, "    RemoteApp {c}");
+            }
+            if let Some(on) = p.remote_app_copy_agent {
+                let _ = writeln!(
+                    out,
+                    "    RemoteAppCopyAgent {}",
+                    if on { "yes" } else { "no" }
+                );
+            }
+            if let Some(on) = p.remote_app_remove_agent {
+                let _ = writeln!(
+                    out,
+                    "    RemoteAppRemoveAgent {}",
+                    if on { "yes" } else { "no" }
+                );
             }
             match &p.password {
                 PasswordSource::Ask => {}
@@ -1239,6 +1345,40 @@ NewKeyword later
         }
         assert!(Settings::parse(&moved.to_text()).snippets.is_empty());
         assert_eq!(Settings::parse(""), Settings::default());
+    }
+
+    #[test]
+    fn remote_app_settings_global_and_per_connection() {
+        let d = Settings::default();
+        assert!(d.remote_app_copy_agent, "copying is on unless turned off");
+        assert!(
+            !d.remote_app_remove_agent,
+            "removal is off unless turned on"
+        );
+        let s = Settings::parse(
+            "RemoteAppCopyAgent no\nRemoteAppRemoveAgent yes\n\
+             RemoteAppAgentPath ~/apps/ferostream-agent\nRemoteAppClipboard to-host\n\
+             Profile gimp-box\n    Type app\n    Via build\n    RemoteApp gimp \"a b.png\"\n\
+             \x20   RemoteAppCopyAgent yes\n    RemoteAppRemoveAgent no\n",
+        );
+        assert!(!s.remote_app_copy_agent);
+        assert!(s.remote_app_remove_agent);
+        assert_eq!(
+            s.remote_app_agent_path.as_deref(),
+            Some("~/apps/ferostream-agent")
+        );
+        assert_eq!(s.remote_app_clipboard.as_deref(), Some("to-host"));
+        let p = s.profile("gimp-box").unwrap();
+        assert_eq!(p.kind, SessionKind::RemoteApp);
+        assert_eq!(p.via.as_deref(), Some("build"));
+        assert_eq!(p.remote_app.as_deref(), Some("gimp \"a b.png\""));
+        assert_eq!(p.remote_app_copy_agent, Some(true));
+        assert_eq!(p.remote_app_remove_agent, Some(false));
+        assert_eq!(Settings::parse(&s.to_text()), s);
+        assert_eq!(
+            Settings::parse("RemoteAppClipboard sideways\n").remote_app_clipboard,
+            None
+        );
     }
 
     #[test]

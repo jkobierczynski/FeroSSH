@@ -33,6 +33,10 @@
 //! ("FeroSSH.Viewer") with no capabilities at all: no network, and, like
 //! the worker, none of the user's files or registry. It is always
 //! sandboxed; `--no-sandbox` only concerns the worker.
+//!
+//! A remote app's decoder (`--stream`, see `stream`) gets the same: its
+//! own AppContainer ("FeroSSH.Stream"), no capabilities, always
+//! sandboxed. It takes apart everything a remote app's host sends.
 
 // AppContainer, pipe, job and process calls are Win32 FFI; each unsafe block
 // is a direct call with handles and buffers this module owns.
@@ -90,6 +94,7 @@ enum Kind {
     Worker,
     #[cfg(feature = "viewer")]
     Viewer,
+    Stream,
 }
 
 impl Kind {
@@ -116,6 +121,13 @@ impl Kind {
                     "Decodes remote desktop pictures for FeroSSH, with no network, file or registry access."
                 ),
             ),
+            Kind::Stream => (
+                w!("FeroSSH.Stream"),
+                w!("FeroSSH remote app decoder"),
+                w!(
+                    "Decodes what remote apps' hosts send for FeroSSH, with no network, file or registry access."
+                ),
+            ),
         }
     }
 
@@ -124,6 +136,7 @@ impl Kind {
             Kind::Worker => "--worker",
             #[cfg(feature = "viewer")]
             Kind::Viewer => "--viewer",
+            Kind::Stream => "--stream",
         }
     }
 }
@@ -197,6 +210,7 @@ impl Hardening {
 static WORKER_STEP: AtomicU8 = AtomicU8::new(PROBE);
 #[cfg(feature = "viewer")]
 static VIEWER_STEP: AtomicU8 = AtomicU8::new(PROBE);
+static STREAM_STEP: AtomicU8 = AtomicU8::new(PROBE);
 const PROBE: u8 = u8::MAX;
 
 /// How long the first strict process is watched. Loading fails within
@@ -262,7 +276,32 @@ impl std::fmt::Debug for Worker {
     }
 }
 
+/// What keeps a sandboxed process alive once its pipes went elsewhere
+/// ([`Worker::split`]): dropping it ends the process.
+pub struct Guard {
+    _job: Owned,
+    _process: Owned,
+}
+
+impl std::fmt::Debug for Guard {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Guard").finish_non_exhaustive()
+    }
+}
+
 impl Worker {
+    /// The pipes to and from the process, and what keeps it running.
+    pub fn split(self) -> (File, File, Guard) {
+        (
+            self.to_worker,
+            self.from_worker,
+            Guard {
+                _job: self._job,
+                _process: self._process,
+            },
+        )
+    }
+
     /// Asks Windows which mitigations the process runs with.
     pub fn active(&self) -> Active {
         let on = |policy: PROCESS_MITIGATION_POLICY| {
@@ -457,6 +496,11 @@ pub fn spawn_viewer() -> Result<Worker> {
     spawn(Kind::Viewer, true)
 }
 
+/// Starts a remote app's decoder, always in its AppContainer.
+pub fn spawn_stream() -> Result<Worker> {
+    spawn(Kind::Stream, true)
+}
+
 fn spawn(kind: Kind, sandbox: bool) -> Result<Worker> {
     let exe = std::env::current_exe()
         .map_err(|e| windows::core::Error::new(windows::core::HRESULT(-1), e.to_string()))?;
@@ -487,7 +531,7 @@ fn spawn(kind: Kind, sandbox: bool) -> Result<Worker> {
             Attributes: SE_GROUP_ENABLED,
         },
     ];
-    // The viewer gets no capabilities at all.
+    // The viewer and the decoder get no capabilities at all.
     let caps: &mut [SID_AND_ATTRIBUTES] = if kind == Kind::Worker {
         &mut caps
     } else {
@@ -545,6 +589,7 @@ fn start_hardened(
         Kind::Worker => &WORKER_STEP,
         #[cfg(feature = "viewer")]
         Kind::Viewer => &VIEWER_STEP,
+        Kind::Stream => &STREAM_STEP,
     };
     let known = step.load(Ordering::Relaxed);
     let first = if known == PROBE {

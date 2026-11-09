@@ -118,6 +118,10 @@ Font, theme and text size apply to the focused pane only. Session > Save font an
 | Open remote desktop in a tab (VNC) | Only in `ferossh-desktop.exe`: a VNC desktop in a FeroSSH tab. |
 | Open virtual desktop (Xvfb) | Starts Xvfb and x11vnc on the server and shows that headless desktop through SSH: in a tab in `ferossh-desktop.exe`, else in the VNC viewer on this PC (see [Virtual desktops](everyday-use.md#virtual-desktops-xvfb)). Again while one runs: another viewer on it. |
 | Stop virtual desktop | Stops the virtual desktop on this connection, and everything running in it. |
+| Remote apps > Run remote app... | Runs a Linux program on the pane's host and shows its windows as native windows here, over the same SSH connection (see [Remote apps](everyday-use.md#remote-apps-native-windows)). |
+| Remote apps > Reattach remote app | Brings back the windows of the newest remote app still running on the host. |
+| Remote apps > Copy the agent to hosts | ✓ on (the default): copies the FeroStream agent to a host that lacks it. `RemoteAppCopyAgent`. |
+| Remote apps > Remove the agent when done | ✓ on: the agent deletes itself from the host when its last program ends. Off by default. `RemoteAppRemoveAgent`. |
 
 ## Help
 
