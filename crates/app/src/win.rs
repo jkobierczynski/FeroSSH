@@ -11742,6 +11742,8 @@ impl Window {
         use files_panel::{Event, JobOp};
         let key = self.files_key.clone().filter(|k| self.sftp.contains_key(k));
         let command = match event {
+            // Handled before the window is borrowed: it asks first.
+            Event::DropOut { .. } => None,
             Event::Browse(path) => {
                 if let Some(r) = key.as_ref().and_then(|k| self.sftp.get_mut(k)) {
                     r.notice = None;
@@ -12456,6 +12458,13 @@ fn dropped_files(drop: HDROP) -> (Vec<PathBuf>, POINT) {
 /// the pane they landed on.
 fn drop_files(hwnd: HWND, drop: HDROP) {
     let (paths, at) = dropped_files(drop);
+    upload_dropped(hwnd, &paths, at);
+}
+
+/// Local files let go at client point `at`, from Explorer or dragged out
+/// of File transfer's Local list: asks, then uploads them to the host of
+/// the pane they landed on.
+fn upload_dropped(hwnd: HWND, paths: &[PathBuf], at: POINT) {
     if paths.is_empty() {
         return;
     }
@@ -12468,7 +12477,7 @@ fn drop_files(hwnd: HWND, drop: HDROP) {
             return;
         }
     };
-    let what = match paths.as_slice() {
+    let what = match paths {
         [one] => format!(
             "\"{}\"",
             one.file_name()
@@ -12480,7 +12489,7 @@ fn drop_files(hwnd: HWND, drop: HDROP) {
     let host = key.rsplit_once(':').map_or(key.as_str(), |(h, _)| h);
     let text = format!("Upload {what} to {} on {host}?", names::display(&dir));
     if dialog(hwnd, &text, MB_YESNO | MB_ICONQUESTION) == Some(IDYES) {
-        with_window(|w| w.upload_files(&key, &paths, &dir));
+        with_window(|w| w.upload_files(&key, paths, &dir));
     }
 }
 
@@ -12718,6 +12727,11 @@ fn tools_have_focus() -> bool {
 
 /// Carries out what the user did in the file transfer pane.
 fn files_event(hwnd: HWND, event: files_panel::Event) {
+    // Asks first, with no window state borrowed.
+    if let files_panel::Event::DropOut { paths, at } = &event {
+        upload_dropped(hwnd, paths, *at);
+        return;
+    }
     if let Some(command) = with_window(|w| w.files_event(event)).flatten() {
         run_command(hwnd, command);
     }

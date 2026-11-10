@@ -131,6 +131,13 @@ pub enum Event {
         paths: Vec<PathBuf>,
         dir: Vec<u8>,
     },
+    /// Local files and folders dragged out of the pane and let go at
+    /// `at` (main window client coordinates), on a terminal pane say:
+    /// handled like files dropped from Explorer.
+    DropOut {
+        paths: Vec<PathBuf>,
+        at: POINT,
+    },
     /// Ask, then delete these entries of the listed remote folder.
     Delete(Vec<Vec<u8>>),
     /// The Local list moved here: downloads go here from now on.
@@ -2656,12 +2663,40 @@ fn drag_move(h: &Handles, drag: Drag, x: i32, y: i32) {
                 let target = target_at(h, pt).filter(|t| t.0 != remote);
                 let list = if remote { h.local.list } else { h.remote.list };
                 light(target.and_then(|t| t.1).map(|i| (list, i as i32)));
-                let cursor = if target.is_some() { IDC_HAND } else { IDC_NO };
+                // Local files can also go out onto a terminal pane.
+                let out = !remote && outside(h, pt).is_some();
+                let cursor = if target.is_some() || out {
+                    IDC_HAND
+                } else {
+                    IDC_NO
+                };
                 if let Ok(c) = LoadCursorW(None, cursor) {
                     SetCursor(Some(c));
                 }
             }
         }
+    }
+}
+
+/// Screen point `pt` in the main window but off this pane: where, in the
+/// main window's client coordinates.
+fn outside(h: &Handles, pt: POINT) -> Option<POINT> {
+    use windows::Win32::Graphics::Gdi::ScreenToClient;
+    use windows::Win32::UI::WindowsAndMessaging::GetWindowRect;
+    let mut panel = RECT::default();
+    let mut main = RECT::default();
+    // SAFETY: plain queries on our own windows.
+    unsafe {
+        GetWindowRect(h.panel, &mut panel).ok()?;
+        GetWindowRect(h.main, &mut main).ok()?;
+        let inside =
+            |r: &RECT| pt.x >= r.left && pt.x < r.right && pt.y >= r.top && pt.y < r.bottom;
+        if inside(&panel) || !inside(&main) {
+            return None;
+        }
+        let mut at = pt;
+        let _ = ScreenToClient(h.main, &mut at);
+        Some(at)
     }
 }
 
@@ -2679,6 +2714,15 @@ fn drag_end(h: &Handles, drag: Drag, x: i32, y: i32) {
                 let _ = ClientToScreen(h.panel, &mut pt);
             }
             let Some((to_remote, folder)) = target_at(h, pt) else {
+                if let Some(at) = outside(h, pt).filter(|_| !remote) {
+                    let paths: Vec<PathBuf> = picked(h, false)
+                        .into_iter()
+                        .filter_map(|r| r.local)
+                        .collect();
+                    if !paths.is_empty() {
+                        emit(Event::DropOut { paths, at });
+                    }
+                }
                 return;
             };
             if to_remote == remote {
