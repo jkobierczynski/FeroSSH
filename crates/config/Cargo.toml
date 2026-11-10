@@ -1,0 +1,21 @@
+[package]
+name = "ferossh-config"
+description = "FeroSSH: ssh_config parser, known_hosts and session imports"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+base64ct = { version = "1.8", features = ["alloc"] }
+getrandom = "0.4"
+# HMAC-SHA1 is what OpenSSH's hashed known_hosts names use; it is not an
+# SSH algorithm and never reaches the wire.
+hmac = "0.13"
+russh.workspace = true
+sha1 = "0.11"
+
+[lints]
+workspace = true
