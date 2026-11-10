@@ -1168,8 +1168,10 @@ pub fn set_view(view: View) {
         }
         // A Sync move: the Local list follows once the remote folder has
         // listed, and stays if it did not.
+        // On another queue or connection it is dropped: neither moves.
+        let alias_changed = old.is_some_and(|v| v.alias != view.alias);
         let synced = match s.sync_pending.take() {
-            Some(p) if p.key != view.key => Some(Err(p)),
+            Some(p) if p.key != view.key || alias_changed => None,
             Some(p) if view.remote_loading => {
                 s.sync_pending = Some(p);
                 None
@@ -1189,11 +1191,23 @@ pub fn set_view(view: View) {
             s.arrange = view.arrange;
         }
         // The pane turned to another host, or another connection to the
-        // same host: its connection's Local folder.
+        // same host: its connection's Local folder, else the download
+        // folder (not the last connection's Local folder).
         let shown = (view.host.clone(), view.alias.clone());
-        let start = (s.shown_host.as_ref() != Some(&shown))
-            .then(|| view.local_start.clone())
-            .flatten();
+        let turned = s.shown_host.is_some() && s.shown_host.as_ref() != Some(&shown);
+        let first = s.shown_host.is_none();
+        let start = if turned {
+            Some(
+                view.local_start
+                    .clone()
+                    .unwrap_or_else(|| view.base.clone()),
+            )
+            .filter(|d| s.local.dir() != Some(d.as_path()))
+        } else if first {
+            view.local_start.clone()
+        } else {
+            None
+        };
         s.shown_host = Some(shown);
         let local_changed = s.local.sync(&view.base, view.landed);
         if local_changed {

@@ -833,9 +833,10 @@ struct Window {
     /// focusing another pane (even on the same host) or reopening the
     /// view lists that pane's directory.
     files_pane: Option<PaneId>,
-    /// Transfer queues that started in their connection's Remote folder:
-    /// the pane showing them does not follow the shell until its next cd.
-    started_in_folder: HashSet<String>,
+    /// Transfer queues that started in their connection's Remote folder,
+    /// and the pane they did for: the view does not follow that pane's
+    /// shell until its next cd.
+    started_in_folder: HashMap<String, PaneId>,
     /// The connection the file view last followed a pane of: another
     /// connection to the same host can name another Remote folder.
     files_alias_shown: Option<String>,
@@ -1587,7 +1588,7 @@ fn create_and_run(launch: Launch, theme: Option<String>) -> Result<()> {
                 sftp_routes: HashMap::new(),
                 files_key: None,
                 files_pane: None,
-                started_in_folder: HashSet::new(),
+                started_in_folder: HashMap::new(),
                 files_alias_shown: None,
                 transfer_timer: false,
                 forwards_view: ForwardsView::default(),
@@ -11372,7 +11373,7 @@ impl Window {
         // The connection's Remote folder, else the shell's directory.
         let folder = self.remote_folder(id).map(String::into_bytes);
         if folder.is_some() && !self.sftp.contains_key(&key) {
-            self.started_in_folder.insert(key.clone());
+            self.started_in_folder.insert(key.clone(), id);
         }
         let cwd = folder.or_else(|| p.cwd.clone().filter(|_| self.settings.follow_directory));
         let (verify, parallel) = (
@@ -11512,7 +11513,9 @@ impl Window {
             {
                 r.notice = None;
                 r.browse(folder.as_bytes());
-                self.started_in_folder.insert(k);
+                self.started_in_folder.insert(k, id);
+                // Sent now: with nothing transferring, no timer would.
+                self.flush_sftp();
                 return;
             }
             if !host_changed
@@ -11525,7 +11528,7 @@ impl Window {
             }
             if key
                 .as_ref()
-                .is_some_and(|k| self.started_in_folder.contains(k))
+                .is_some_and(|k| self.started_in_folder.get(k) == Some(&id))
             {
                 // It stays in the connection's Remote folder; following
                 // picks up from the shell's next cd.
@@ -11667,7 +11670,9 @@ impl Window {
     /// Pane `id`'s shell went to another folder: from now on its file
     /// view follows the shell, even if it started in the Remote folder.
     fn shell_moved(&mut self, id: PaneId) {
-        if let Some(key) = self.pane_sftp_key(id) {
+        if let Some(key) = self.pane_sftp_key(id)
+            && self.started_in_folder.get(&key) == Some(&id)
+        {
             self.started_in_folder.remove(&key);
         }
     }
