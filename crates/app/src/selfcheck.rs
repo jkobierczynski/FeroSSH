@@ -87,6 +87,7 @@ fn check_worker(w: &mut Worker, host: &str) -> Result<String, String> {
             shell: true,
             options: Default::default(),
             family: Default::default(),
+            gssapi: false,
         },
     )?;
     loop {

@@ -46,7 +46,7 @@ use std::fmt;
 use zeroize::Zeroize;
 
 /// Protocol version carried in every frame. Bump on any wire change.
-pub const PROTOCOL_VERSION: u8 = 15;
+pub const PROTOCOL_VERSION: u8 = 16;
 
 /// Largest frame body accepted, in bytes. Terminal and SFTP data is chunked
 /// below this, so anything larger is a bug or an attack.
@@ -154,6 +154,21 @@ pub enum Family {
     Any,
     V4,
     V6,
+}
+
+/// The UI's answer to a [`Message::GssapiStep`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GssReply {
+    /// The security context needs another round: send `token` to the
+    /// server.
+    Continue(Vec<u8>),
+    /// The context is established (with mutual authentication): `token`
+    /// is the last one for the server, if not empty, and `mic` the MIC
+    /// over the step's `mic_data`.
+    Complete { token: Vec<u8>, mic: Vec<u8> },
+    /// No Kerberos login: no ticket, unknown host, or the user is not
+    /// in a domain. The worker goes on with the other methods.
+    Failed,
 }
 
 /// How long the worker waits for a server, from ssh_config's
@@ -425,6 +440,9 @@ pub enum Message {
         shell: bool,
         options: ShellOptions,
         family: Family,
+        /// Try a Kerberos login (`gssapi-with-mic`) first, when the server
+        /// offers it (`GSSAPIAuthentication yes`).
+        gssapi: bool,
     },
     /// Open another shell on the connection that `connection` (a channel
     /// that made it with [`Message::Connect`]) belongs to. No new login:
@@ -472,6 +490,8 @@ pub enum Message {
         channel: ChannelId,
         answers: Secrets,
     },
+    /// The answer to the last [`Message::GssapiStep`].
+    GssapiReply { channel: ChannelId, reply: GssReply },
 
     // Worker to UI.
     /// The server's host key (SSH wire format), for the UI to check against
@@ -504,6 +524,18 @@ pub enum Message {
         channel: ChannelId,
         key: Vec<u8>,
         data: Vec<u8>,
+    },
+    /// A Kerberos login step (`gssapi-with-mic`, RFC 4462): the server
+    /// chose Kerberos 5 (`first`, no `token`) or sent `token`. The UI,
+    /// which holds the user's tickets, advances its security context for
+    /// the host it connected to and answers with [`Message::GssapiReply`];
+    /// once the context is established it signs `mic_data`, the user-auth
+    /// fields the server checks.
+    GssapiStep {
+        channel: ChannelId,
+        first: bool,
+        token: Vec<u8>,
+        mic_data: Vec<u8>,
     },
     /// Ask the user something; the worker waits for [`Message::Answers`].
     Prompt {
@@ -753,6 +785,8 @@ impl Message {
             Message::AgentSign { .. } => 36,
             Message::AgentKeys { .. } => 37,
             Message::AgentSigned { .. } => 38,
+            Message::GssapiStep { .. } => 50,
+            Message::GssapiReply { .. } => 51,
             Message::ZmodemStart { .. } => 40,
             Message::ZmodemFile { .. } => 41,
             Message::ZmodemData { .. } => 42,
@@ -794,7 +828,8 @@ impl Message {
             | Message::ZmodemChunk { .. }
             | Message::ZmodemCancel { .. }
             | Message::AgentKeys { .. }
-            | Message::AgentSigned { .. } => Side::Ui,
+            | Message::AgentSigned { .. }
+            | Message::GssapiReply { .. } => Side::Ui,
             Message::HostKey { .. }
             | Message::HostCert { .. }
             | Message::Banner { .. }
@@ -819,7 +854,8 @@ impl Message {
             | Message::ZmodemFileDone { .. }
             | Message::ZmodemEnd { .. }
             | Message::AgentList { .. }
-            | Message::AgentSign { .. } => Side::Worker,
+            | Message::AgentSign { .. }
+            | Message::GssapiStep { .. } => Side::Worker,
         }
     }
 
@@ -874,7 +910,9 @@ impl Message {
             | Message::AgentList { channel, .. }
             | Message::AgentSign { channel, .. }
             | Message::AgentKeys { channel, .. }
-            | Message::AgentSigned { channel, .. } => *channel,
+            | Message::AgentSigned { channel, .. }
+            | Message::GssapiStep { channel, .. }
+            | Message::GssapiReply { channel, .. } => *channel,
         })
     }
 }
@@ -1157,6 +1195,7 @@ pub fn encode(msg: &Message, out: &mut Vec<u8>) -> Result<(), Error> {
             shell,
             options,
             family,
+            gssapi,
         } => {
             w.u32(*channel);
             w.str(host);
@@ -1178,6 +1217,7 @@ pub fn encode(msg: &Message, out: &mut Vec<u8>) -> Result<(), Error> {
                 Family::V4 => 4,
                 Family::V6 => 6,
             });
+            w.bool(*gssapi);
         }
         Message::TelnetConnect {
             channel,
@@ -1333,6 +1373,32 @@ pub fn encode(msg: &Message, out: &mut Vec<u8>) -> Result<(), Error> {
             w.u32(*channel);
             w.u32(*agent);
             w.bytes(signature);
+        }
+        Message::GssapiStep {
+            channel,
+            first,
+            token,
+            mic_data,
+        } => {
+            w.u32(*channel);
+            w.bool(*first);
+            w.bytes(token);
+            w.bytes(mic_data);
+        }
+        Message::GssapiReply { channel, reply } => {
+            w.u32(*channel);
+            match reply {
+                GssReply::Continue(token) => {
+                    w.u8(0);
+                    w.bytes(token);
+                }
+                GssReply::Complete { token, mic } => {
+                    w.u8(1);
+                    w.bytes(token);
+                    w.bytes(mic);
+                }
+                GssReply::Failed => w.u8(2),
+            }
         }
         Message::SftpOpen {
             channel,
@@ -1603,6 +1669,7 @@ fn decode_body(body: &[u8]) -> Result<Message, Error> {
                 6 => Family::V6,
                 _ => return Err(Error::Invalid),
             },
+            gssapi: r.bool()?,
         },
         5 => Message::HostKeyVerdict {
             channel: r.u32()?,
@@ -1696,6 +1763,24 @@ fn decode_body(body: &[u8]) -> Result<Message, Error> {
             channel: r.u32()?,
             agent: r.u32()?,
             signature: r.path()?,
+        },
+        50 => Message::GssapiStep {
+            channel: r.u32()?,
+            first: r.bool()?,
+            token: r.bytes()?.to_vec(),
+            mic_data: r.bytes()?.to_vec(),
+        },
+        51 => Message::GssapiReply {
+            channel: r.u32()?,
+            reply: match r.u8()? {
+                0 => GssReply::Continue(r.bytes()?.to_vec()),
+                1 => GssReply::Complete {
+                    token: r.bytes()?.to_vec(),
+                    mic: r.bytes()?.to_vec(),
+                },
+                2 => GssReply::Failed,
+                _ => return Err(Error::Invalid),
+            },
         },
         19 => Message::SftpOpen {
             channel: r.u32()?,
@@ -2069,6 +2154,7 @@ mod tests {
                 shell: true,
                 options: ShellOptions::default(),
                 family: Family::Any,
+                gssapi: false,
             },
             Message::Connect {
                 channel: 3,
@@ -2098,6 +2184,7 @@ mod tests {
                     agent: true,
                 },
                 family: Family::V6,
+                gssapi: true,
             },
             Message::HostKeyVerdict {
                 channel: 1,
@@ -2210,6 +2297,33 @@ mod tests {
                 channel: 1,
                 agent: WORKER_IDS + 1,
                 signature: Vec::new(),
+            },
+            Message::GssapiStep {
+                channel: 1,
+                first: true,
+                token: Vec::new(),
+                mic_data: vec![7; 90],
+            },
+            Message::GssapiStep {
+                channel: 1,
+                first: false,
+                token: vec![0x60; 300],
+                mic_data: vec![7; 90],
+            },
+            Message::GssapiReply {
+                channel: 1,
+                reply: GssReply::Continue(vec![0x60; 1200]),
+            },
+            Message::GssapiReply {
+                channel: 1,
+                reply: GssReply::Complete {
+                    token: Vec::new(),
+                    mic: vec![4; 28],
+                },
+            },
+            Message::GssapiReply {
+                channel: 1,
+                reply: GssReply::Failed,
             },
             Message::ForwardOpen {
                 channel: FORWARD_IDS,
@@ -2454,10 +2568,16 @@ mod tests {
         for msg in samples() {
             let side = msg.sent_by();
             match msg {
-                Message::SignRequest { .. } | Message::Prompt { .. } | Message::HostKey { .. } => {
+                Message::SignRequest { .. }
+                | Message::Prompt { .. }
+                | Message::HostKey { .. }
+                | Message::GssapiStep { .. } => {
                     assert_eq!(side, Side::Worker);
                 }
-                Message::Connect { .. } | Message::Answers { .. } | Message::Signature { .. } => {
+                Message::Connect { .. }
+                | Message::Answers { .. }
+                | Message::Signature { .. }
+                | Message::GssapiReply { .. } => {
                     assert_eq!(side, Side::Ui);
                 }
                 Message::Hello { .. } | Message::Data { .. } | Message::Close { .. } => {
@@ -2473,8 +2593,8 @@ mod tests {
         let mut tags: Vec<u8> = samples().iter().map(Message::tag).collect();
         tags.sort_unstable();
         tags.dedup();
-        // ZMODEM starts at 40, leaving room below.
-        let want: Vec<u8> = (0..=38).chain(40..=49).collect();
+        // ZMODEM starts at 40, leaving room below; Kerberos at 50.
+        let want: Vec<u8> = (0..=38).chain(40..=51).collect();
         assert_eq!(tags, want);
     }
 

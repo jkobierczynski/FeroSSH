@@ -6,8 +6,9 @@
 //! `ClearAllForwardings`), the session (`RemoteCommand`, `RequestTTY`,
 //! `SendEnv`, `SetEnv`), host keys (`StrictHostKeyChecking`,
 //! `UserKnownHostsFile`, `HostKeyAlias`), how to get there (`ProxyJump`,
-//! `ProxyCommand`, `AddressFamily`), `Include`d files, and the list of
-//! hosts the connection manager shows.
+//! `ProxyCommand`, `AddressFamily`), Kerberos (`GSSAPIAuthentication`,
+//! `GSSAPIDelegateCredentials`, `GSSAPIServerIdentity`), `Include`d
+//! files, and the list of hosts the connection manager shows.
 //!
 //! The rules follow `ssh_config(5)`: keywords are case-insensitive, the
 //! first value found for a keyword wins (except `IdentityFile`,
@@ -81,6 +82,15 @@ pub struct HostConfig {
     /// `HostKeyAlias`: the name to look the host key up under.
     pub host_key_alias: Option<String>,
     pub address_family: Option<AddressFamily>,
+    /// `GSSAPIAuthentication`: log in with Kerberos tickets. Unset means
+    /// FeroSSH's own choice (when Windows logged on to a domain).
+    pub gssapi_authentication: Option<bool>,
+    /// `GSSAPIDelegateCredentials yes`: hand the server a ticket of the
+    /// user's own, for onward logins from there.
+    pub gssapi_delegate_credentials: Option<bool>,
+    /// `GSSAPIServerIdentity`: the host name in the server's Kerberos
+    /// service principal, when not the one connected to.
+    pub gssapi_server_identity: Option<String>,
 }
 
 /// `RequestTTY`: whether the session gets a terminal.
@@ -583,6 +593,15 @@ fn apply(
                 cfg.identity_agent = args.into_iter().next();
             }
             "forwardagent" if cfg.forward_agent.is_none() => cfg.forward_agent = flag(&args),
+            "gssapiauthentication" if cfg.gssapi_authentication.is_none() => {
+                cfg.gssapi_authentication = flag(&args);
+            }
+            "gssapidelegatecredentials" if cfg.gssapi_delegate_credentials.is_none() => {
+                cfg.gssapi_delegate_credentials = flag(&args);
+            }
+            "gssapiserveridentity" if cfg.gssapi_server_identity.is_none() => {
+                cfg.gssapi_server_identity = args.into_iter().next().filter(|h| valid_gss_host(h));
+            }
             "tag" if cfg.tag.is_none() => cfg.tag = args.into_iter().next(),
             "localforward" | "remoteforward" | "dynamicforward" => {
                 let kind = match keyword.as_str() {
@@ -700,6 +719,16 @@ pub fn valid_env_name(name: &str) -> bool {
         && name.len() <= 255
         && !name.starts_with(|c: char| c.is_ascii_digit())
         && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+/// A host name `GSSAPIServerIdentity` may give: a DNS name or address,
+/// nothing that changes the service principal's form (`/`, `@`).
+pub fn valid_gss_host(host: &str) -> bool {
+    !host.is_empty()
+        && host.len() <= 253
+        && host
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_' | ':'))
 }
 
 /// Whether a `Match` line matches, and whether it names `canonical` or
@@ -1099,6 +1128,32 @@ Host *
             resolve("Match !final\n User first\n", "x").user.as_deref(),
             Some("first")
         );
+    }
+
+    #[test]
+    fn kerberos_keywords() {
+        let text = "\
+Host ad
+    GSSAPIAuthentication yes
+    GSSAPIDelegateCredentials yes
+    GSSAPIServerIdentity sshgw.corp.example
+Host bad
+    GSSAPIServerIdentity evil/x@REALM
+Host *
+    GSSAPIAuthentication no
+    GSSAPIDelegateCredentials no
+";
+        let c = resolve(text, "ad");
+        assert_eq!(c.gssapi_authentication, Some(true));
+        assert_eq!(c.gssapi_delegate_credentials, Some(true));
+        assert_eq!(
+            c.gssapi_server_identity.as_deref(),
+            Some("sshgw.corp.example")
+        );
+        let c = resolve(text, "bad");
+        assert_eq!(c.gssapi_authentication, Some(false));
+        assert_eq!(c.gssapi_server_identity, None);
+        assert_eq!(resolve("", "x").gssapi_authentication, None);
     }
 
     #[test]

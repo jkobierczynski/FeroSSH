@@ -97,6 +97,11 @@ pub struct Values {
     pub legacy: bool,
     /// Let the server use the agent's keys (`ForwardAgent yes`).
     pub forward_agent: bool,
+    /// Kerberos login (`GSSAPIAuthentication`): FeroSSH's choice when
+    /// unset.
+    pub kerberos: Option<bool>,
+    /// Hand the server a Kerberos ticket (`GSSAPIDelegateCredentials`).
+    pub kerberos_delegate: bool,
     /// Where the password comes from: see [`PASSWORD_CHOICES`].
     pub password: usize,
     /// The password manager command, for a template or a custom one.
@@ -154,6 +159,8 @@ impl Values {
             jump: h.proxy_jump.clone().unwrap_or_default(),
             forwards: h.forwards.iter().map(forward_text).collect(),
             forward_agent: h.forward_agent,
+            kerberos: h.gssapi,
+            kerberos_delegate: h.gssapi_delegate,
             ..Self::default()
         }
     }
@@ -267,6 +274,8 @@ enum Field {
     DeskClipboard,
     Legacy,
     ForwardAgent,
+    Kerberos,
+    KerberosDelegate,
     Password,
     PasswordCommand,
     Speed,
@@ -309,6 +318,8 @@ impl Field {
             Field::DeskClipboard => "Desk clip",
             Field::Legacy => "Old crypto",
             Field::ForwardAgent => "Fwd agent",
+            Field::Kerberos => "Kerberos",
+            Field::KerberosDelegate => "Fwd ticket",
             Field::Password => "Password",
             Field::PasswordCommand => "Command",
             Field::Speed => "Speed",
@@ -328,6 +339,8 @@ impl Field {
                 | Field::TmuxLayout
                 | Field::Legacy
                 | Field::ForwardAgent
+                | Field::Kerberos
+                | Field::KerberosDelegate
                 | Field::CopyAgent
                 | Field::RemoveAgent
                 | Field::Clipboard
@@ -498,6 +511,8 @@ impl SessionForm {
                     // Kept with the connection, which a read-only host
                     // cannot save.
                     | Field::ForwardAgent
+                    | Field::Kerberos
+                    | Field::KerberosDelegate
             )
     }
 
@@ -647,6 +662,8 @@ impl SessionForm {
                         Field::RemoveAgent,
                         Field::Clipboard,
                         Field::ForwardAgent,
+                        Field::Kerberos,
+                        Field::KerberosDelegate,
                         Field::Legacy,
                     ]
                     .map(Item::Field),
@@ -737,6 +754,8 @@ impl SessionForm {
             | Field::TmuxLayout
             | Field::Legacy
             | Field::ForwardAgent
+            | Field::Kerberos
+            | Field::KerberosDelegate
             | Field::CopyAgent
             | Field::RemoveAgent
             | Field::Clipboard
@@ -782,6 +801,8 @@ impl SessionForm {
             | Field::TmuxLayout
             | Field::Legacy
             | Field::ForwardAgent
+            | Field::Kerberos
+            | Field::KerberosDelegate
             | Field::CopyAgent
             | Field::RemoveAgent
             | Field::Clipboard
@@ -853,6 +874,18 @@ impl SessionForm {
             Field::Legacy => if v.legacy { "allowed" } else { "off" }.to_owned(),
             Field::ForwardAgent => if v.forward_agent {
                 "on, asking before each use"
+            } else {
+                "off"
+            }
+            .to_owned(),
+            Field::Kerberos => match v.kerberos {
+                None => "auto: when Windows is in a domain",
+                Some(true) => "on",
+                Some(false) => "off",
+            }
+            .to_owned(),
+            Field::KerberosDelegate => if v.kerberos_delegate {
+                "on: the server gets a ticket of yours"
             } else {
                 "off"
             }
@@ -934,6 +967,8 @@ impl SessionForm {
             }
             Field::Legacy => v.legacy = !v.legacy,
             Field::ForwardAgent => v.forward_agent = !v.forward_agent,
+            Field::Kerberos => v.kerberos = tri(v.kerberos, forward),
+            Field::KerberosDelegate => v.kerberos_delegate = !v.kerberos_delegate,
             Field::CopyAgent => v.copy_agent = tri(v.copy_agent, forward),
             Field::RemoveAgent => v.remove_agent = tri(v.remove_agent, forward),
             Field::Clipboard | Field::DeskClipboard => {
@@ -1027,6 +1062,8 @@ impl SessionForm {
             | Field::TmuxLayout
             | Field::Legacy
             | Field::ForwardAgent
+            | Field::Kerberos
+            | Field::KerberosDelegate
             | Field::CopyAgent
             | Field::RemoveAgent
             | Field::Clipboard
@@ -1768,6 +1805,8 @@ impl SessionForm {
                     identity_file: trimmed(&v.key),
                     proxy_jump: trimmed(&v.jump).filter(|_| v.kind == SessionKind::Ssh),
                     forward_agent: v.forward_agent && v.kind == SessionKind::Ssh,
+                    gssapi: v.kerberos.filter(|_| v.kind == SessionKind::Ssh),
+                    gssapi_delegate: v.kerberos_delegate && v.kind == SessionKind::Ssh,
                     forwards: v.forwards.iter().filter_map(|f| parse_option(f)).fold(
                         Vec::new(),
                         |mut all, f| {
@@ -2101,6 +2140,35 @@ mod tests {
     }
 
     #[test]
+    fn kerberos_is_auto_on_or_off_and_saved() {
+        let mut f = new_form();
+        typed(&mut f, "ad");
+        f.values.host = "srv.corp.example".into();
+        assert_eq!(
+            f.options(Field::Kerberos),
+            ["auto: when Windows is in a domain", "on", "off"]
+        );
+        let mut hosts = Vec::new();
+        let mut settings = Settings::default();
+        f.apply(&mut hosts, &mut settings);
+        assert_eq!((hosts[0].gssapi, hosts[0].gssapi_delegate), (None, false));
+        f.cycle(Field::Kerberos, true);
+        f.cycle(Field::KerberosDelegate, true);
+        let mut hosts = Vec::new();
+        f.apply(&mut hosts, &mut settings);
+        assert_eq!(
+            (hosts[0].gssapi, hosts[0].gssapi_delegate),
+            (Some(true), true)
+        );
+        f.cycle(Field::Kerberos, true);
+        let mut hosts = Vec::new();
+        f.apply(&mut hosts, &mut settings);
+        assert_eq!(hosts[0].gssapi, Some(false));
+        let v = Values::from_saved(&hosts[0]);
+        assert_eq!((v.kerberos, v.kerberos_delegate), (Some(false), true));
+    }
+
+    #[test]
     fn refuses_bad_values() {
         let mut f = new_form();
         for (field, value, problem) in [
@@ -2388,8 +2456,8 @@ mod tests {
         // tmux, tmux panes, Start dir, Local folder, Remote folder,
         // Forward 1, RDP port, VNC port, Virtual desk, Desk size, Desk
         // clip, Remote app, Copy agent, Clean up, App clip, Fwd agent,
-        // Old crypto.
-        down(&mut f, 18);
+        // Kerberos, Fwd ticket, Old crypto.
+        down(&mut f, 20);
         assert_eq!(f.focused_field(), Some(Field::LoginStep(0)));
         let t = texts(&mut f);
         assert!(

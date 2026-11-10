@@ -25,6 +25,7 @@ A new host shows its SHA-256 fingerprint; check it before you type `yes`. A chan
 - FeroSSH never stores a password itself. A saved connection can take its password from Windows Credential Manager, a password manager's command line tool or a command of your own, and FeroSSH asks before running such a command the first time.
 - Imports from other clients never bring passwords over.
 - Agent forwarding is off unless a host turns it on (`ForwardAgent yes` or *Fwd agent*). Then the sandboxed worker reads the agent protocol and passes on only two requests, the list of keys and a signature, and FeroSSH asks you before every signature, naming the host a login is for. Signatures that are not an SSH login or an SSH signature (`ssh-keygen -Y`, git) are refused, and so is SHA-1 RSA. Only the agent's keys are offered, never your key files.
+- Kerberos logins use the tickets of your Windows logon through Windows itself (SSPI); FeroSSH never sees a password or key for them. The window asks Windows for a ticket only for the `host/` service of the host you connected to, requires the server to prove it holds that service's key, and signs only a Kerberos login request for your own user name. The sandboxed worker passes on the opaque exchange and never holds a ticket. Your ticket is passed on to the server only when a host asks for it (`GSSAPIDelegateCredentials yes` or *Fwd ticket*).
 - Logs never contain passwords or passphrases.
 
 ## Crypto

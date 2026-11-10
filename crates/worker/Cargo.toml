@@ -22,7 +22,7 @@ zeroize = "1.9"
 
 
 [dev-dependencies]
-ferossh-auth = { workspace = true, features = ["soft-authenticator"] }
+ferossh-auth = { workspace = true, features = ["soft-authenticator", "mit-gssapi"] }
 ferossh-render.workspace = true
 ferossh-sftp.workspace = true
 ferossh-term.workspace = true

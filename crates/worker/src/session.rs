@@ -22,8 +22,8 @@ use std::time::Duration;
 
 use ferossh_forward::x11::{MIT_COOKIE, hex};
 use ferossh_ipc::{
-    ChannelId, Family, MAX_DATA_CHUNK, Message, PromptField, PromptKind, Secrets, ShellOptions,
-    Timing, WORKER_IDS, X11Auth,
+    ChannelId, Family, GssReply, MAX_DATA_CHUNK, Message, PromptField, PromptKind, Secrets,
+    ShellOptions, Timing, WORKER_IDS, X11Auth,
 };
 use russh::client::{self, AuthResult, DisconnectReason, Handle, KeyboardInteractiveAuthResponse};
 use russh::keys::agent::AgentIdentity;
@@ -80,6 +80,8 @@ pub struct Params {
     pub options: ShellOptions,
     /// Which IP versions to connect over.
     pub family: Family,
+    /// Try Kerberos (`gssapi-with-mic`) first when the server offers it.
+    pub gssapi: bool,
 }
 
 /// Why a session ended early.
@@ -406,6 +408,7 @@ struct Shared {
     signature: Option<oneshot::Sender<Vec<u8>>>,
     identities: Option<oneshot::Sender<Vec<Vec<u8>>>>,
     answers: Option<oneshot::Sender<Secrets>>,
+    gssapi: Option<oneshot::Sender<GssReply>>,
     /// Negotiated kex, cipher and host key algorithm.
     names: Option<(String, String, String)>,
     /// The server's disconnect message.
@@ -826,6 +829,11 @@ async fn drive<T>(
                     Some(Message::Identities { keys, .. }) => {
                         if let Some(tx) = with(s, |s| s.identities.take()).flatten() {
                             let _ = tx.send(keys);
+                        }
+                    }
+                    Some(Message::GssapiReply { reply, .. }) => {
+                        if let Some(tx) = with(s, |s| s.gssapi.take()).flatten() {
+                            let _ = tx.send(reply);
                         }
                     }
                     Some(Message::Answers { answers, .. }) => {
@@ -1389,9 +1397,14 @@ async fn authenticate(
         Step::Continue(m) => m,
     };
     let mut keys_tried = false;
+    // OpenSSH's order: Kerberos before keys, once.
+    let mut gss_tried = !p.gssapi;
     let (mut kbd_tries, mut pw_tries) = (0, 0);
     loop {
-        let next = if !keys_tried && methods.contains(&MethodKind::PublicKey) {
+        let next = if !gss_tried && methods.contains(&MethodKind::GssapiWithMic) {
+            gss_tried = true;
+            kerberos(handle, p, inbox, ctx, &methods).await?
+        } else if !keys_tried && methods.contains(&MethodKind::PublicKey) {
             keys_tried = true;
             public_keys(handle, p, inbox, ctx).await?
         } else if kbd_tries < MAX_ATTEMPTS && methods.contains(&MethodKind::KeyboardInteractive) {
@@ -1499,6 +1512,113 @@ async fn public_keys(
         }
     }
     Ok(Step::Continue(remaining))
+}
+
+/// The DER encoding of Kerberos 5's GSS-API mechanism OID,
+/// 1.2.840.113554.1.2.2: the only mechanism FeroSSH offers.
+pub const KRB5_OID: &[u8] = &[
+    0x06, 0x09, 0x2a, 0x86, 0x48, 0x86, 0xf7, 0x12, 0x01, 0x02, 0x02,
+];
+
+/// Most security context rounds before the worker gives up: Kerberos
+/// takes one, or two with mutual authentication.
+const MAX_GSS_STEPS: u32 = 8;
+
+/// Runs a Kerberos login's GSS-API steps in the UI, which holds the
+/// user's tickets: the worker never sees a ticket or a session key, only
+/// the opaque tokens the server sees too.
+struct IpcGssapi {
+    channel: ChannelId,
+    out: mpsc::Sender<Message>,
+    shared: SharedRef,
+    steps: u32,
+}
+
+/// Why a Kerberos login stopped without an answer from the server.
+#[derive(Debug)]
+enum GssStop {
+    /// No Kerberos login on this PC for this host; try other methods.
+    Declined,
+    Failed(Failure),
+}
+
+impl From<russh::SendError> for GssStop {
+    fn from(e: russh::SendError) -> Self {
+        GssStop::Failed(e.into())
+    }
+}
+
+impl russh::GssapiAuthenticator for IpcGssapi {
+    type Error = GssStop;
+
+    fn gssapi_step(
+        &mut self,
+        selected_mechanism: Option<Vec<u8>>,
+        input_token: Option<Vec<u8>>,
+        mic_data: Vec<u8>,
+    ) -> impl Future<Output = Result<russh::GssapiStep, GssStop>> + Send {
+        self.steps += 1;
+        let first = selected_mechanism.is_some();
+        // RFC 4462 3.3: the server must pick a mechanism the client offered.
+        let wrong = selected_mechanism.is_some_and(|m| m != KRB5_OID);
+        let too_many = self.steps > MAX_GSS_STEPS;
+        async move {
+            if wrong || too_many {
+                return Err(GssStop::Declined);
+            }
+            let (tx, rx) = oneshot::channel();
+            with(&self.shared, |s| s.gssapi = Some(tx));
+            let msg = Message::GssapiStep {
+                channel: self.channel,
+                first,
+                token: input_token.unwrap_or_default(),
+                mic_data,
+            };
+            self.out
+                .send(msg)
+                .await
+                .map_err(|_| GssStop::Failed(Failure::Cancelled))?;
+            match rx.await.map_err(|_| GssStop::Failed(Failure::Cancelled))? {
+                GssReply::Continue(token) => Ok(russh::GssapiStep::Continue { token }),
+                GssReply::Complete { token, mic } => Ok(russh::GssapiStep::Complete {
+                    token: (!token.is_empty()).then_some(token),
+                    mic: Some(mic),
+                }),
+                GssReply::Failed => Err(GssStop::Declined),
+            }
+        }
+    }
+}
+
+/// A Kerberos login through the UI's tickets. When the UI has none for
+/// this host, the other methods follow; a token the server rejects ends
+/// the method as any refused login does.
+async fn kerberos(
+    handle: &mut Handle<Client>,
+    p: &Params,
+    inbox: &mut mpsc::Receiver<Message>,
+    ctx: &mut Ctx,
+    methods: &MethodSet,
+) -> Result<Step, Failure> {
+    let mut gss = IpcGssapi {
+        channel: ctx.channel,
+        out: ctx.out.clone(),
+        shared: ctx.shared.clone(),
+        steps: 0,
+    };
+    let result = drive(
+        handle.authenticate_gssapi_with_mic(&p.user, vec![KRB5_OID.to_vec()], &mut gss),
+        inbox,
+        ctx,
+    )
+    .await?;
+    match result {
+        Ok(result) => Ok(step(result)),
+        Err(GssStop::Failed(e)) => Err(e),
+        // The server still waits in the GSS-API exchange; the next
+        // method's request starts over, as OpenSSH's client does.
+        Err(GssStop::Declined) => Ok(Step::Continue(methods.clone())),
+    }
 }
 
 /// Asks the user through the UI and waits for the answers.

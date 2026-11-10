@@ -15,6 +15,7 @@ use russh::keys::{Certificate, PublicKey};
 use zeroize::Zeroizing;
 
 use crate::agent::{self, AgentChoice, AgentKind};
+use crate::gss::{Contexts, GssOutput, GssProvider, GssStepJob};
 use crate::keyfile::{KeyFile, KeyFileError};
 use crate::sk::Authenticator;
 use crate::userauth::{allowed_algorithms, is_certificate, key_type};
@@ -81,6 +82,9 @@ pub enum Job {
         passphrase: Option<Zeroizing<String>>,
         agent: AgentChoice,
     },
+    /// One step of a Kerberos login, checked by the caller with
+    /// [`crate::gss::check_mic_data`].
+    Gssapi(GssStepJob),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -99,6 +103,8 @@ pub enum Reply {
         notes: Vec<String>,
     },
     Signed(Result<Vec<u8>, SignError>),
+    /// A [`Job::Gssapi`] step's tokens, or why there is no Kerberos login.
+    Gssapi(Result<GssOutput, String>),
 }
 
 /// Why FeroSSH will not use a key, if it will not.
@@ -328,6 +334,15 @@ impl Broker {
         notify: impl Fn() + Send + 'static,
         authenticator: Box<dyn Authenticator>,
     ) -> std::io::Result<Self> {
+        Self::spawn_full(notify, authenticator, crate::gss::platform_provider())
+    }
+
+    /// [`Broker::spawn_with`] with another source of Kerberos tickets.
+    pub fn spawn_full(
+        notify: impl Fn() + Send + 'static,
+        authenticator: Box<dyn Authenticator>,
+        gss: Box<dyn GssProvider>,
+    ) -> std::io::Result<Self> {
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()?;
@@ -336,9 +351,11 @@ impl Broker {
         thread::Builder::new()
             .name("signing broker".into())
             .spawn(move || {
+                let mut contexts = Contexts::default();
                 while let Ok(job) = job_rx.recv() {
                     let reply = match job {
                         Job::Identities(choice) => Some(identities(&rt, choice)),
+                        Job::Gssapi(step) => Some(Reply::Gssapi(contexts.step(gss.as_ref(), step))),
                         sign_job @ Job::Sign { .. } => sign(&rt, authenticator.as_ref(), sign_job),
                     };
                     if let Some(reply) = reply {

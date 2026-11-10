@@ -39,6 +39,7 @@ Besides `HostName`, `User`, `Port`, `IdentityFile`, `Tag`, `ProxyJump`, `ProxyCo
 | `IdentitiesOnly yes` | Offers only the `IdentityFile` keys, even from the agent. |
 | `IdentityAgent` | Another agent: `none`, a named pipe such as `\\.\pipe\my-agent`, or `SSH_AUTH_SOCK`. |
 | `ForwardAgent yes` | Forwards your agent to the server (see [Agent forwarding](#agent-forwarding)). |
+| `GSSAPIAuthentication`, `GSSAPIDelegateCredentials`, `GSSAPIServerIdentity` | Kerberos login (see [Kerberos login](#kerberos-login)). |
 | `SendEnv`, `SetEnv` | Sends environment variables (the server's `AcceptEnv` must take them). |
 | `RemoteCommand`, `RequestTTY` | Runs a command instead of the login shell; `RequestTTY no` asks for no terminal. |
 | `StrictHostKeyChecking` | `yes` refuses unknown hosts; `accept-new` (or `no`) trusts a new host without asking. A changed key is always refused. |
@@ -49,6 +50,16 @@ Besides `HostName`, `User`, `Port`, `IdentityFile`, `Tag`, `ProxyJump`, `ProxyCo
 ### Agent forwarding
 
 `ForwardAgent yes` in your ssh_config, or *Fwd agent* in a saved connection's Extras, lets programs on the server (`ssh`, `git`) use the keys in your agent. FeroSSH asks every time one wants a signature, and says what for: a login to a host (with that host's key fingerprint), a `git` commit signature, or another SSH signature. Yes signs once, No refuses, and Cancel refuses everything else from that connection. Only your agent's keys are offered, never key files, and FeroSSH refuses anything else the server asks of the agent (adding, removing or locking keys), and any signature that is not a login or an SSH signature.
+
+### Kerberos login
+
+On a PC that is a member of a Windows domain (Active Directory), FeroSSH logs you in to servers that take Kerberos with the tickets Windows got when you signed in: no password, no key. The server needs `GSSAPIAuthentication yes` in its `sshd_config` and a keytab for its `host/` principal, as for any Kerberos SSH login. FeroSSH tries Kerberos first, before keys and passwords; when there is no ticket for the server, it says so in one line and carries on with keys and passwords.
+
+- **When it is tried.** By default, when Windows signed you in with a domain account. `GSSAPIAuthentication yes` or `no` in your ssh_config, or *Kerberos* (auto, on, off) in a saved connection's Extras, sets it per host.
+- **Which service.** The ticket is for `host/` and the host name you connect to (`HostName`). For a server known by another name, such as one behind a load balancer, set `GSSAPIServerIdentity` to the name in its principal.
+- **Passing a ticket on.** `GSSAPIDelegateCredentials yes`, or *Fwd ticket* in Extras, gives the server a ticket of yours, so `ssh` and Kerberos file shares work onward from there without signing in again. Only turn it on for servers you trust: whoever runs the server can use that ticket while it is valid.
+
+The server must prove that it holds its own Kerberos key (mutual authentication) before FeroSSH signs anything. Your tickets stay in the window, which talks to Windows; the sandboxed worker only passes the opaque Kerberos messages between the two.
 
 ### When the connection drops
 
@@ -78,7 +89,7 @@ Insert or the New button opens the connection form in the tools pane; F2, the Ed
 
 - **Connection**: **Name, Folder, Type**; the type is an SSH terminal, Telnet (unencrypted), Serial console, Remote desktop (RDP) or VNC desktop. Then **Host, User, Port, Key file** (with Browse...), the **Password** source (below) and the **Jump host** (see [Jump hosts](#jump-hosts)). A serial console has the port, speed, framing and flow control instead.
 - **Look** (a terminal's tab): theme, font, font size and scrollback.
-- **Extras** (a terminal's tab): tmux on or off, the tmux session to attach and its layout, the start directory, File transfer's Local and Remote folders, port forwards (such as `L 8080 localhost:80`), RDP and VNC ports, agent forwarding, older crypto, and the login script (see [Login scripts](#login-scripts)).
+- **Extras** (a terminal's tab): tmux on or off, the tmux session to attach and its layout, the start directory, File transfer's Local and Remote folders, port forwards (such as `L 8080 localhost:80`), RDP and VNC ports, agent forwarding, Kerberos and passing a ticket on, older crypto, and the login script (see [Login scripts](#login-scripts)).
 
 Empty fields show their default in grey. Enter saves, Shift+Enter saves and connects, Esc cancels. Connections go to `%APPDATA%\FeroSSH\sessions.conf` in ssh_config syntax and their look to `ferossh.conf`. Hosts from `~/.ssh/config` and imports show their connection settings read-only, because FeroSSH never writes those files; their look and extras can still change, and giving one a new name saves an editable copy.
 
