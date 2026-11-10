@@ -1417,6 +1417,7 @@ async fn transfers_files_with_zmodem() {
 }
 
 /// Whether `mosh-server` is installed (CI sets FEROSSH_REQUIRE_MOSH).
+#[cfg(unix)]
 fn mosh_available() -> bool {
     let found = Command::new("mosh-server")
         .arg("--version")
