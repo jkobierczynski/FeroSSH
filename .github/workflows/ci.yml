@@ -10,18 +10,67 @@ on:
 permissions:
   contents: read
 
+# A new push to a pull request cancels the run still going for the one
+# before, so only the latest commit is built. Runs on main and release runs
+# are never cancelled.
+concurrency:
+  group: ci-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 env:
   CARGO_TERM_COLOR: always
+  # Pull requests and main keep the compiled dependencies between runs
+  # (Swatinem/rust-cache: ~/.cargo and target/, minus the workspace's own
+  # crates), so a new push only rebuilds what changed. A release builds
+  # from nothing: its exes never come from a cache.
+  USE_CACHE: ${{ github.event_name == 'pull_request' || github.ref == 'refs/heads/main' }}
 
 jobs:
+  # Whether the pull request changes anything but documentation (docs/ and
+  # Markdown files). When it does not, every job below is skipped, and a
+  # skipped job counts as passed for main's required checks. Pushes to main
+  # and releases always run everything.
+  changes:
+    name: Changed files
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      code: ${{ steps.diff.outputs.code }}
+    steps:
+      - if: github.event_name == 'pull_request'
+        uses: actions/checkout@v4
+        with:
+          # The merge commit and its first parent, the base branch.
+          fetch-depth: 2
+      - id: diff
+        run: |
+          if [ "$GITHUB_EVENT_NAME" != pull_request ]; then
+            echo "code=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          git diff --name-only HEAD^1 HEAD > changed.txt
+          cat changed.txt
+          if grep -qvE '^docs/|\.md$' changed.txt; then
+            echo "code=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "Only documentation changed; skipping the build and tests." | tee -a "$GITHUB_STEP_SUMMARY"
+            echo "code=false" >> "$GITHUB_OUTPUT"
+          fi
+
   windows:
     name: Build and test (Windows)
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
     runs-on: windows-latest
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
       # rustup reads rust-toolchain.toml and installs the pinned toolchain.
       - run: rustup show active-toolchain
+      - if: env.USE_CACHE == 'true'
+        uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
       # The optional built-in desktop viewer (Cargo features, off by
@@ -95,6 +144,11 @@ jobs:
   reproducible:
     name: Reproducible build (Windows)
     needs: windows
+    # Not a required check, and it waits for the Windows job and then
+    # builds all three exes again from nothing (~9 minutes), so pull
+    # requests skip it. It runs on every push to main and before every
+    # release.
+    if: github.event_name != 'pull_request'
     runs-on: windows-latest
     timeout-minutes: 30
     steps:
@@ -131,6 +185,8 @@ jobs:
 
   sshd:
     name: SSH tests against OpenSSH (Linux)
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 20
     env:
@@ -144,6 +200,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - run: rustup show active-toolchain
+      - if: env.USE_CACHE == 'true'
+        uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
       # The worker and the window's SSH path log in to a throwaway sshd on
       # 127.0.0.1, and the .ppk tests make keys with puttygen; without them
       # these tests skip, so install both. sshd needs xauth for X11
@@ -176,11 +236,17 @@ jobs:
 
   rdp:
     name: Desktop viewers against xrdp and Xvnc (Linux)
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
       - run: rustup show active-toolchain
+      - if: env.USE_CACHE == 'true'
+        uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
       # A throwaway xrdp with an Xorg session running one xterm, whose
       # background colour the test waits for; then it types a command.
       - run: sudo apt-get update && sudo apt-get install -y xrdp xorgxrdp xterm xclip
@@ -214,6 +280,8 @@ jobs:
   # cache unless interop/ changed.
   interop:
     name: Interop against older and newer servers (Linux)
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 30
     env:
@@ -222,6 +290,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - run: rustup show active-toolchain
+      - if: env.USE_CACHE == 'true'
+        uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
       # One image per Ubuntu release: OpenSSH 7.6 to 10.x, Dropbear 2017 to
       # 2025, tmux 2.6 to 3.6. See interop/Dockerfile.
       - id: images
@@ -261,6 +333,8 @@ jobs:
   # x86-64 and 64-bit ARM. Releases put them next to ferossh.exe.
   agent:
     name: FeroStream agent (Linux)
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
@@ -273,6 +347,11 @@ jobs:
           git init -q ferostream
           git -C ferostream fetch -q --depth 1 https://github.com/jkobierczynski/FeroStream "$rev"
           git -C ferostream checkout -q FETCH_HEAD
+      - if: env.USE_CACHE == 'true'
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ferostream -> target
+          cache-on-failure: true
       - name: Build
         working-directory: ferostream
         env:
@@ -294,6 +373,8 @@ jobs:
 
   deny:
     name: cargo deny
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -302,6 +383,8 @@ jobs:
 
   audit:
     name: cargo audit
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -314,6 +397,8 @@ jobs:
 
   fuzz:
     name: Fuzz smoke run
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
     runs-on: ubuntu-latest
     # Fuzzing needs nightly, pinned to a known-good date so a nightly
     # regression cannot turn this check red overnight: nightly-2026-11-01
@@ -329,25 +414,16 @@ jobs:
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-fuzz
+      # The fuzz workspace's own target/, keyed on the nightly it was built with.
+      - if: env.USE_CACHE == 'true'
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: fuzz -> target
+          key: ${{ env.FUZZ_TOOLCHAIN }}
+          cache-on-failure: true
       # Inputs that once crashed a target start its corpus, so every run
       # tries them again first.
       - run: mkdir -p fuzz/corpus && cp -r fuzz/regressions/. fuzz/corpus/
-      # The prebuilt cargo-fuzz is a musl binary and would default to the musl
-      # target, which AddressSanitizer does not support.
-      - run: cargo "+$FUZZ_TOOLCHAIN" fuzz run --target x86_64-unknown-linux-gnu ipc_decode -- -max_total_time=60
-      - run: cargo "+$FUZZ_TOOLCHAIN" fuzz run --target x86_64-unknown-linux-gnu term_feed -- -max_total_time=60
-      - run: cargo "+$FUZZ_TOOLCHAIN" fuzz run --target x86_64-unknown-linux-gnu sftp_decode -- -max_total_time=60
-      - run: cargo "+$FUZZ_TOOLCHAIN" fuzz run --target x86_64-unknown-linux-gnu forward_parse -- -max_total_time=60
-      - run: cargo "+$FUZZ_TOOLCHAIN" fuzz run --target x86_64-unknown-linux-gnu tmux_feed -- -max_total_time=60 -dict=fuzz/dicts/tmux_feed.dict
-      - run: cargo "+$FUZZ_TOOLCHAIN" fuzz run --target x86_64-unknown-linux-gnu vnc_decode -- -max_total_time=60
-      - run: cargo "+$FUZZ_TOOLCHAIN" fuzz run --target x86_64-unknown-linux-gnu rdp_decode -- -max_total_time=60
-      - run: cargo "+$FUZZ_TOOLCHAIN" fuzz run --target x86_64-unknown-linux-gnu import_parse -- -max_total_time=60
-      - run: cargo "+$FUZZ_TOOLCHAIN" fuzz run --target x86_64-unknown-linux-gnu userauth_check -- -max_total_time=60
-      - run: cargo "+$FUZZ_TOOLCHAIN" fuzz run --target x86_64-unknown-linux-gnu key_files -- -max_total_time=60
-      - run: cargo "+$FUZZ_TOOLCHAIN" fuzz run --target x86_64-unknown-linux-gnu host_config -- -max_total_time=60
-      - run: cargo "+$FUZZ_TOOLCHAIN" fuzz run --target x86_64-unknown-linux-gnu telnet_feed -- -max_total_time=60
-      - run: cargo "+$FUZZ_TOOLCHAIN" fuzz run --target x86_64-unknown-linux-gnu zmodem_feed -- -max_total_time=60
-      - run: cargo "+$FUZZ_TOOLCHAIN" fuzz run --target x86_64-unknown-linux-gnu ssh_transport -- -max_total_time=60 -dict=fuzz/dicts/ssh_transport.dict
-      - run: cargo "+$FUZZ_TOOLCHAIN" fuzz run --target x86_64-unknown-linux-gnu login_script -- -max_total_time=60
-      - run: cargo "+$FUZZ_TOOLCHAIN" fuzz run --target x86_64-unknown-linux-gnu sanitize -- -max_total_time=60
-      - run: cargo "+$FUZZ_TOOLCHAIN" fuzz run --target x86_64-unknown-linux-gnu trigger_feed -- -max_total_time=60
+      # Builds every target once, then runs each for a minute, one per CPU
+      # at a time (all of `cargo fuzz list`, with fuzz/dicts/<target>.dict).
+      - run: fuzz/smoke.sh 60
