@@ -323,6 +323,9 @@ enum Step {
     StatPart,
     Write { len: u64 },
     CloseWritten,
+    // Gives the part file the edited file's mode; the rename waits
+    // for it so a failure never replaces the original.
+    ChmodPart,
     Rename,
     Checksum,
     RootPath,
@@ -1364,6 +1367,7 @@ impl Remote {
             }
             (Step::CloseWritten, SftpReply::Done) => self.upload_closed(i),
             (Step::Checksum, SftpReply::Checksum(hex)) => self.set_remote_sum(i, Ok(hex)),
+            (Step::ChmodPart, SftpReply::Done) => self.rename_part(i),
             (Step::Rename, SftpReply::Done) => {
                 let note = match self.jobs.get(i).map(|j| &j.run) {
                     Some(Run::Up(u)) => u.check.note(),
@@ -1815,11 +1819,13 @@ impl Remote {
         };
         u.phase = Phase::Renaming;
         if let Some(mode) = mode {
-            // Before the rename, on the same channel: the server takes
-            // requests in order, so the copy appears with its old mode.
             let path = u.part.clone();
-            self.request(SftpOp::Chmod { path, mode }, Purpose::Ignore);
+            return self.job_request(i, SftpOp::Chmod { path, mode }, Step::ChmodPart);
         }
+        self.rename_part(i);
+    }
+
+    fn rename_part(&mut self, i: usize) {
         let Some(Run::Up(u)) = self.jobs.get_mut(i).map(|j| &mut j.run) else {
             return;
         };

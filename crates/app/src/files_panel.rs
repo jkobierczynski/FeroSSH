@@ -1061,9 +1061,11 @@ fn layout(h: &Handles) {
         let marks_x = sync_x - gap6 - marks_w;
         with(|s| s.title_buttons_x = marks_x);
         let _ = MoveWindow(h.bookmarks, marks_x, (title - row) / 2, marks_w, row, true);
-        let check_w = px(160);
+        // Only bookmarks have the host check box.
+        let check_w = if marks { px(160) } else { 0 };
         let b = px(70);
-        let name_w = (inner - check_w - 2 * b - 3 * gap6).max(0);
+        let gaps = if marks { 3 } else { 2 };
+        let name_w = (inner - check_w - 2 * b - gaps * gap6).max(0);
         let mut x = pad;
         for (c, w) in h.name.iter().zip([name_w, b, b, check_w]) {
             let _ = MoveWindow(*c, x, name_y, w, row, true);

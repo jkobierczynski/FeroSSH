@@ -68,6 +68,8 @@ struct Fake {
     checksum_unavailable: bool,
     /// Answer reads with half of what was asked.
     short_reads: bool,
+    /// Refuse every chmod.
+    chmod_fails: bool,
 }
 
 fn attrs_of(meta: &fs::Metadata) -> FileAttrs {
@@ -99,6 +101,7 @@ impl Fake {
             fake_sum: None,
             checksum_unavailable: false,
             short_reads: false,
+            chmod_fails: false,
         }
     }
 
@@ -265,6 +268,9 @@ impl Fake {
                 }
             }
             SftpOp::Chmod { path, mode } => {
+                if self.chmod_fails {
+                    return one(failed(sftp_code::PERMISSION_DENIED));
+                }
                 use std::os::unix::fs::PermissionsExt;
                 match fs::set_permissions(self.path(&path), fs::Permissions::from_mode(mode)) {
                     Ok(()) => one(SftpReply::Done),
@@ -887,4 +893,21 @@ fn puts_an_edited_file_back_without_asking_and_keeps_its_mode() {
     let mode = fs::metadata(&script).unwrap().permissions().mode();
     assert_eq!(mode & 0o7777, 0o755);
     assert!(remote.put_back(&s.local(), b"/x", None).is_err());
+}
+
+#[test]
+fn a_failed_chmod_leaves_the_original_in_place() {
+    let s = Scratch::new("putback-chmod");
+    let script = s.remote().join("run.sh");
+    fs::write(&script, "echo old\n").unwrap();
+    let local = s.local().join("run.sh");
+    fs::write(&local, "echo new\n").unwrap();
+    let (mut remote, mut fake) = connected(&s.remote());
+    fake.chmod_fails = true;
+    let id = remote
+        .put_back(&local, b"/run.sh", Some(0o100_755))
+        .unwrap();
+    run(&mut remote, &mut fake);
+    assert_eq!(remote.job_state(id), Some(State::Failed));
+    assert_eq!(fs::read_to_string(&script).unwrap(), "echo old\n");
 }
