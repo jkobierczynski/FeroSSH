@@ -185,6 +185,7 @@ const ID_LAYOUT: usize = 301;
 const ID_FILTER: usize = 302;
 const ID_BOOKMARKS: usize = 303;
 const ID_SYNC: usize = 304;
+const ID_REFRESH: usize = 305;
 const ID_NAME: usize = 370;
 const ID_NAME_SAVE: usize = 371;
 const ID_NAME_CANCEL: usize = 372;
@@ -231,6 +232,8 @@ struct Handles {
     layout: HWND,
     bookmarks: HWND,
     sync: HWND,
+    /// Reads both lists again.
+    refresh: HWND,
     filter: HWND,
     /// The bookmark name row: the name, Save, Cancel, only this host.
     name: [HWND; 4],
@@ -561,6 +564,7 @@ pub fn create(main: HWND, handler: Handler, dpi: u32) -> windows::core::Result<(
         )?;
         let layout = button(w!("Layout ▾"), ID_LAYOUT)?;
         let bookmarks = button(w!("★ Bookmarks ▾"), ID_BOOKMARKS)?;
+        let refresh = button(w!("↻ Refresh"), ID_REFRESH)?;
         let sync = child(
             WC_BUTTONW,
             w!("⇆ Sync"),
@@ -653,6 +657,7 @@ pub fn create(main: HWND, handler: Handler, dpi: u32) -> windows::core::Result<(
             layout,
             bookmarks,
             sync,
+            refresh,
             filter,
             name,
             local,
@@ -712,7 +717,7 @@ pub fn create(main: HWND, handler: Handler, dpi: u32) -> windows::core::Result<(
 }
 
 fn controls(h: &Handles) -> Vec<HWND> {
-    let mut v = vec![h.follow, h.layout, h.bookmarks, h.sync, h.filter];
+    let mut v = vec![h.follow, h.layout, h.bookmarks, h.sync, h.refresh, h.filter];
     v.extend(h.name);
     for s in [h.local, h.remote] {
         v.extend([s.up, s.path, s.extra, s.list]);
@@ -935,8 +940,18 @@ fn layout(h: &Handles) {
         let _ = MoveWindow(h.sync, sync_x, (title - row) / 2, sync_w, row, true);
         let marks_w = px(108);
         let marks_x = sync_x - gap6 - marks_w;
-        with(|s| s.title_buttons_x = marks_x);
         let _ = MoveWindow(h.bookmarks, marks_x, (title - row) / 2, marks_w, row, true);
+        let refresh_w = px(76);
+        let refresh_x = marks_x - gap6 - refresh_w;
+        with(|s| s.title_buttons_x = refresh_x);
+        let _ = MoveWindow(
+            h.refresh,
+            refresh_x,
+            (title - row) / 2,
+            refresh_w,
+            row,
+            true,
+        );
         let check_w = px(160);
         let b = px(70);
         let name_w = (inner - check_w - 2 * b - 3 * gap6).max(0);
@@ -1565,6 +1580,15 @@ pub fn pre_translate(msg: &MSG) -> bool {
                 windows::Win32::UI::WindowsAndMessaging::DispatchMessageW(&m);
                 return true;
             }
+            // F5 outside the lists (they refresh only themselves): both.
+            WM_KEYDOWN
+                if msg.wParam.0 == usize::from(VK_F5.0)
+                    && msg.hwnd != h.local.list
+                    && msg.hwnd != h.remote.list =>
+            {
+                refresh_both(&h);
+                return true;
+            }
             WM_SYSKEYDOWN | WM_SYSKEYUP | WM_SYSCHAR => return false,
             _ => {}
         }
@@ -1920,6 +1944,7 @@ fn command(h: &Handles, id: usize, code: u32) {
         (ID_FOLLOW, BN_CLICKED) => emit(Event::ToggleFollow),
         (ID_LAYOUT, BN_CLICKED) => layout_menu(h),
         (ID_BOOKMARKS, BN_CLICKED) => bookmarks_menu(h),
+        (ID_REFRESH, BN_CLICKED) => refresh_both(h),
         (ID_SYNC, BN_CLICKED) => {
             let on = with(|s| {
                 s.sync = !s.sync;
@@ -2037,6 +2062,14 @@ fn layout_menu(h: &Handles) {
             }
         }
         _ => {}
+    }
+}
+
+/// Reads the Local folder from disk again and asks for the Remote one.
+fn refresh_both(h: &Handles) {
+    refresh_local(h, true);
+    if with(|s| s.view.as_ref().is_some_and(|v| v.host.is_some())).unwrap_or(false) {
+        emit(Event::Refresh);
     }
 }
 

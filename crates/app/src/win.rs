@@ -1663,6 +1663,8 @@ fn create_and_run(launch: Launch, theme: Option<String>) -> Result<()> {
         let _ = files_panel::create(hwnd, files_event, dpi);
         // The port forwards pane's, likewise.
         let _ = fwd_panel::create(hwnd, fwd_event, dpi);
+        // A click on any of their controls hands the keyboard to the tools.
+        crate::native::on_control_focus(tools_focused);
         // Files dropped from Explorer are uploaded, after a confirmation.
         DragAcceptFiles(hwnd, true);
         // Clipboard changes reach a remote desktop being worked in.
@@ -12930,6 +12932,17 @@ fn fwd_event(hwnd: HWND, event: fwd_panel::Event) {
 }
 
 /// Carries out what the user did in the file transfer pane.
+/// A control in a tools panel took the keyboard: the tools have it now,
+/// so nothing hands it back to the terminal mid-click.
+fn tools_focused() {
+    with_window(|w| {
+        if !w.side.focused {
+            w.side.focused = true;
+            w.refresh_chrome();
+        }
+    });
+}
+
 fn files_event(hwnd: HWND, event: files_panel::Event) {
     // Asks first, with no window state borrowed.
     if let files_panel::Event::DropOut { paths, at } = &event {
