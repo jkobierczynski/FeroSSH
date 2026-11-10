@@ -297,7 +297,7 @@ struct State {
     naming: Option<Option<usize>>,
     /// The host the pane showed, to open its connection's Local folder
     /// when it turns to another.
-    shown_host: Option<Option<String>>,
+    shown_host: Option<(Option<String>, Option<String>)>,
     /// A Sync browsing move waiting for its remote folder to list.
     sync_pending: Option<SyncPending>,
     /// Where the title row's buttons start: the host label ends before.
@@ -1188,11 +1188,13 @@ pub fn set_view(view: View) {
         if old.is_none() {
             s.arrange = view.arrange;
         }
-        // The pane turned to another host: its connection's Local folder.
-        let start = (s.shown_host.as_ref() != Some(&view.host))
+        // The pane turned to another host, or another connection to the
+        // same host: its connection's Local folder.
+        let shown = (view.host.clone(), view.alias.clone());
+        let start = (s.shown_host.as_ref() != Some(&shown))
             .then(|| view.local_start.clone())
             .flatten();
-        s.shown_host = Some(view.host.clone());
+        s.shown_host = Some(shown);
         let local_changed = s.local.sync(&view.base, view.landed);
         if local_changed {
             s.local_error = None;

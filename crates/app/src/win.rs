@@ -836,6 +836,9 @@ struct Window {
     /// Transfer queues that started in their connection's Remote folder:
     /// the pane showing them does not follow the shell until its next cd.
     started_in_folder: HashSet<String>,
+    /// The connection the file view last followed a pane of: another
+    /// connection to the same host can name another Remote folder.
+    files_alias_shown: Option<String>,
     transfer_timer: bool,
     forwards_view: ForwardsView,
     live_view: LiveView,
@@ -1585,6 +1588,7 @@ fn create_and_run(launch: Launch, theme: Option<String>) -> Result<()> {
                 files_key: None,
                 files_pane: None,
                 started_in_folder: HashSet::new(),
+                files_alias_shown: None,
                 transfer_timer: false,
                 forwards_view: ForwardsView::default(),
                 live_view: LiveView::default(),
@@ -11495,15 +11499,47 @@ impl Window {
         }
         if host_changed || self.files_pane != Some(id) {
             self.files_pane = Some(id);
+            let alias = self.pane_alias(id);
+            let alias_changed = alias != self.files_alias_shown;
+            self.files_alias_shown = alias;
+            // Another connection to a host already listed: its own Remote
+            // folder, if it names one.
+            if !host_changed
+                && alias_changed
+                && let Some(k) = key.clone()
+                && let Some(folder) = self.remote_folder(id)
+                && let Some(r) = self.sftp.get_mut(&k)
+            {
+                r.notice = None;
+                r.browse(folder.as_bytes());
+                self.started_in_folder.insert(k);
+                return;
+            }
+            if !host_changed
+                && alias_changed
+                && let Some(k) = &key
+            {
+                // A connection with no Remote folder of its own follows
+                // its shell.
+                self.started_in_folder.remove(k);
+            }
             if key
                 .as_ref()
-                .is_some_and(|k| self.started_in_folder.remove(k))
+                .is_some_and(|k| self.started_in_folder.contains(k))
             {
-                // It starts in the connection's Remote folder; following
+                // It stays in the connection's Remote folder; following
                 // picks up from the shell's next cd.
                 return;
             }
             self.follow_pane(id);
+        }
+    }
+
+    /// The connection name of pane `id`'s SSH host.
+    fn pane_alias(&self, id: PaneId) -> Option<String> {
+        match &self.panes.get(&self.host_pane(id))?.host {
+            Host::Ssh(s) => Some(s.target.alias.clone()),
+            _ => None,
         }
     }
 
@@ -11557,9 +11593,11 @@ impl Window {
         let moved = p.cwd.as_ref() != Some(&dir.path);
         p.cwd = Some(dir.path);
         p.cwd_reported = true;
-        if moved {
-            self.shell_moved(id);
+        if !moved {
+            // The same folder again (a new prompt): nothing to follow.
+            return false;
         }
+        self.shell_moved(id);
         if !self.files_visible() || id != self.focused_id() {
             return false;
         }
