@@ -1763,6 +1763,15 @@ impl SessionForm {
                     settings.toggle_favourite(&name);
                 }
             }
+            // File transfer bookmarks for this connection follow it.
+            for b in &mut settings.bookmarks {
+                if b.host
+                    .as_deref()
+                    .is_some_and(|h| h.eq_ignore_ascii_case(old))
+                {
+                    b.host = Some(name.clone());
+                }
+            }
         }
         let p = settings.profile_mut(&name);
         p.kind = v.kind;
@@ -1842,6 +1851,13 @@ pub fn delete(name: &str, hosts: &mut Vec<SavedHost>, settings: &mut Settings) {
     if settings.is_favourite(name) {
         settings.toggle_favourite(name);
     }
+    // Its File transfer bookmarks go with it: no other connection shows
+    // them, and their server folders are its server's.
+    settings.bookmarks.retain(|b| {
+        !b.host
+            .as_deref()
+            .is_some_and(|h| h.eq_ignore_ascii_case(name))
+    });
 }
 
 /// Breaks `text` into lines of at most `width` characters at spaces.
@@ -2526,6 +2542,17 @@ mod tests {
         let mut settings = Settings::default();
         settings.toggle_favourite("old");
         settings.profile_mut("old").theme = Some("Nord".into());
+        let mark = |name: &str, host: Option<&str>| ferossh_config::settings::Bookmark {
+            name: name.into(),
+            local: None,
+            remote: Some("/srv".into()),
+            host: host.map(Into::into),
+        };
+        settings.bookmarks = vec![
+            mark("logs", Some("OLD")),
+            mark("everywhere", None),
+            mark("other", Some("other")),
+        ];
         let values = Values::from_saved(&saved_host).with_profile(settings.profile("old"));
         let mut f = SessionForm::new(
             Some("old".into()),
@@ -2547,8 +2574,18 @@ mod tests {
             Some("Nord")
         );
         assert!(settings.profile("old").is_none());
+        // Its bookmarks follow the new name; the others stay as they were.
+        let hosts_of = |s: &Settings| -> Vec<Option<String>> {
+            s.bookmarks.iter().map(|b| b.host.clone()).collect()
+        };
+        assert_eq!(
+            hosts_of(&settings),
+            [Some("new".into()), None, Some("other".into())]
+        );
         delete("new", &mut hosts, &mut settings);
         assert!(hosts.is_empty() && settings.favourites.is_empty());
+        // And go with it when it is deleted.
+        assert_eq!(hosts_of(&settings), [None, Some("other".into())]);
     }
 
     /// A choice row's options and selection; none for another row.
