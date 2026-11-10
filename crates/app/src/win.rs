@@ -6619,6 +6619,9 @@ impl Window {
         } else {
             live_panel::place(None, 0, self.dpi);
         }
+        // The focused pane's host first, so the view never shows the
+        // host the pane had before.
+        self.sync_files();
         if self.files_visible() {
             files_panel::set_view(self.files_view());
             files_panel::place(self.areas.side, self.areas.side_width, self.dpi);
@@ -6714,7 +6717,6 @@ impl Window {
                 let _ = InvalidateRect(Some(self.hwnd), Some(&win_rect(strip)), false);
             }
         }
-        self.sync_files();
         if let Some(side) = self.areas.side {
             let focused = self.side.focused && self.focused;
             match self.side.view {
@@ -11767,7 +11769,11 @@ impl Window {
                 None
             }
             Event::Answer(id, choice, all) => {
-                if let Some(r) = key.as_ref().and_then(|k| self.sftp.get_mut(k)) {
+                // Only the question the pane shows: not one that came up
+                // on another host since.
+                if let Some(r) = key.as_ref().and_then(|k| self.sftp.get_mut(k))
+                    && r.question().is_some_and(|q| q.0 == id)
+                {
                     r.answer(id, choice, all);
                 }
                 None
