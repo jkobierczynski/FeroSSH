@@ -212,6 +212,8 @@ impl Draft {
     fn save(&mut self) -> Option<SnipAction> {
         let name = self.name().trim().to_owned();
         let mut lines = Vec::new();
+        // Where each kept line is in the editor.
+        let mut at = Vec::new();
         for (i, l) in self.lines.iter().enumerate() {
             let l = l.trim_end();
             if l.trim().is_empty() {
@@ -221,9 +223,14 @@ impl Draft {
                 return self.fail(format!("Line {}: {e}", i + 1), HEAD + i);
             }
             lines.push(l.to_owned());
+            at.push(i);
+        }
+        if let Err((i, why)) = login::check_lines(&lines) {
+            let line = at.get(i).copied().unwrap_or(0);
+            return self.fail(format!("Line {}: {why}", line + 1), HEAD + line);
         }
         if name.is_empty() {
-            return self.fail("Give the snippet a name.".into(), NAME);
+            return self.fail("Give the script a name.".into(), NAME);
         }
         if lines.is_empty() {
             return self.fail("Type at least one command line.".into(), HEAD);
@@ -1465,11 +1472,11 @@ impl SnippetsView {
             return;
         }
         let title = if self.draft.as_ref().is_some_and(|d| d.index.is_some()) {
-            " Edit snippet"
+            " Edit script"
         } else if self.draft.is_some() {
-            " New snippet"
+            " New script"
         } else {
-            " Snippets"
+            " Scripts"
         };
         let mut line = Line::new(width, bg);
         line.put(title, palette.text, Flags::BOLD);
@@ -1486,7 +1493,7 @@ impl SnippetsView {
                 ),
                 (None, None) => line.put(
                     &fit(
-                        " Enter: line with Enter · Shift+Enter: without · @key, @expect, @pause · Esc",
+                        " Enter: line with Enter · Shift+Enter: without · @expect, @on, @if, @goto, @key · Esc",
                         width,
                     ),
                     palette.dim,
@@ -1645,7 +1652,7 @@ impl SnippetsView {
                 }
                 _ if i == 0 && all.is_empty() => {
                     line.put(
-                        " No snippets yet. Insert adds one.",
+                        " No scripts yet. Insert adds one.",
                         palette.dim,
                         Flags::ITALIC,
                     );
@@ -1867,7 +1874,7 @@ mod tests {
         v.key(SideKey::Enter { split: false }, &all, 20);
         typed(&mut v, &all, "show vlan brief");
         let t = texts(&mut v, &all);
-        assert!(t[0].contains("New snippet"));
+        assert!(t[0].contains("New script"));
         assert!(t[2].contains("Name Show vlans"), "{t:#?}");
         assert!(t[10].contains("command line"), "a new line waits: {t:#?}");
         // Down past the empty line to Save.
@@ -1892,7 +1899,7 @@ mod tests {
         let mut v = SnippetsView::default();
         v.key(SideKey::Edit, &all, 20);
         let t = texts(&mut v, &all);
-        assert!(t[0].contains("Edit snippet"));
+        assert!(t[0].contains("Edit script"));
         for _ in 0..20 {
             v.key(SideKey::Backspace, &all, 20);
         }
@@ -1902,7 +1909,7 @@ mod tests {
             v.key(SideKey::Tab, &all, 20);
         }
         assert_eq!(v.key(SideKey::Enter { split: false }, &all, 20), None);
-        assert!(texts(&mut v, &all)[1].contains("Give the snippet a name."));
+        assert!(texts(&mut v, &all)[1].contains("Give the script a name."));
         typed(&mut v, &all, "Brief");
         for _ in 0..8 {
             v.key(SideKey::Tab, &all, 20);

@@ -80,6 +80,180 @@ pub enum Step {
     /// Waits for text that fits the pattern and keeps the part its `*`
     /// stands for (see [`capture`]).
     Capture(String),
+    /// A place a `goto` jumps to; does nothing itself.
+    Label(String),
+    /// Goes on at the label.
+    Goto(String),
+    /// One of several texts to wait for: the `on` steps in a row wait
+    /// together, and the first text that shows up goes to its label (or
+    /// on after the last of them, without one).
+    On(String, Option<String>),
+    /// How many seconds the `expect`, `capture` and `on` steps after it
+    /// wait, and the label to go to when one times out (else the script
+    /// fails).
+    Timeout(u32, Option<String>),
+    /// Sets a variable, used as `${name}`, to the text.
+    Set(String, String),
+    /// Adds a whole number to a variable (an unset one is 0).
+    Add(String, i64),
+    /// Goes to the label when the condition holds.
+    If(Cond),
+    /// Shows a line in the pane, not typed at the host.
+    Show(String),
+    /// Ends the script, as finished.
+    Stop,
+    /// Ends the script as failed, with this reason.
+    Fail(String),
+}
+
+/// How an `if` compares.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Op {
+    Eq,
+    Ne,
+    Lt,
+    Le,
+    Gt,
+    Ge,
+    Contains,
+}
+
+impl Op {
+    /// The operators, as written, longest first so `<=` is not read as
+    /// `<`.
+    const ALL: [(&'static str, Op); 7] = [
+        ("contains", Op::Contains),
+        ("==", Op::Eq),
+        ("!=", Op::Ne),
+        ("<=", Op::Le),
+        (">=", Op::Ge),
+        ("<", Op::Lt),
+        (">", Op::Gt),
+    ];
+
+    /// How it is written.
+    pub fn text(self) -> &'static str {
+        Op::ALL
+            .iter()
+            .find(|(_, o)| *o == self)
+            .map_or("==", |(t, _)| t)
+    }
+}
+
+/// An `if` step: `if LEFT OP RIGHT goto LABEL`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Cond {
+    pub left: String,
+    pub op: Op,
+    pub right: String,
+    pub label: String,
+}
+
+impl Cond {
+    /// Whether `op` holds for these (filled in) sides: `<`, `<=`, `>`
+    /// and `>=` compare whole numbers, `==` and `!=` numbers when both
+    /// sides are, else text; `contains` looks for the right side in the
+    /// left. `Err` when a number comparison has a side that is not one.
+    pub fn holds(op: Op, left: &str, right: &str) -> Result<bool, String> {
+        let nums = (left.trim().parse::<i64>(), right.trim().parse::<i64>());
+        Ok(match (op, nums) {
+            (Op::Contains, _) => left.contains(right),
+            (Op::Eq, (Ok(a), Ok(b))) => a == b,
+            (Op::Ne, (Ok(a), Ok(b))) => a != b,
+            (Op::Eq, _) => left == right,
+            (Op::Ne, _) => left != right,
+            (Op::Lt, (Ok(a), Ok(b))) => a < b,
+            (Op::Le, (Ok(a), Ok(b))) => a <= b,
+            (Op::Gt, (Ok(a), Ok(b))) => a > b,
+            (Op::Ge, (Ok(a), Ok(b))) => a >= b,
+            (op, _) => {
+                return Err(format!(
+                    "{} compares whole numbers, not \"{left}\" and \"{right}\".",
+                    op.text()
+                ));
+            }
+        })
+    }
+}
+
+/// The longest label or variable name.
+pub const MAX_NAME: usize = 32;
+/// The longest `timeout`, in seconds.
+pub const MAX_TIMEOUT_SECS: u32 = 3600;
+
+/// Whether `name` can name a label or a variable: letters, digits, `_`
+/// and `-`, starting with a letter or `_`, at most [`MAX_NAME`] long.
+pub fn valid_name(name: &str) -> bool {
+    let mut chars = name.chars();
+    chars
+        .next()
+        .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+        && name.len() <= MAX_NAME
+        && chars.all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-'))
+}
+
+fn name_error(what: &str) -> String {
+    format!("{what} needs a label of letters, digits, _ and - (at most {MAX_NAME}).")
+}
+
+/// A text with `goto LABEL` at its end split off: `("text", Some("x"))`.
+fn split_goto(text: &str) -> Result<(&str, Option<String>), String> {
+    let lower = text.to_ascii_lowercase();
+    let at = if lower.starts_with("goto ") {
+        Some(0)
+    } else {
+        lower.rfind(" goto ").map(|i| i + 1)
+    };
+    let Some(at) = at else {
+        return Ok((text, None));
+    };
+    let label = text.get(at + 5..).unwrap_or_default().trim();
+    if !valid_name(label) {
+        return Err(name_error("goto"));
+    }
+    Ok((
+        text.get(..at).unwrap_or_default().trim_end(),
+        Some(label.to_owned()),
+    ))
+}
+
+/// A side of an `if` or a `set` value: `"..."` around it keeps spaces
+/// and allows an empty one.
+fn operand(text: &str) -> String {
+    let t = text.trim();
+    t.strip_prefix('"')
+        .and_then(|t| t.strip_suffix('"'))
+        .unwrap_or(t)
+        .to_owned()
+}
+
+/// Puts `"` around a side that needs them to read back the same.
+fn quote(text: &str) -> String {
+    if text.is_empty() || text != text.trim() || text.starts_with('"') {
+        format!("\"{text}\"")
+    } else {
+        text.to_owned()
+    }
+}
+
+fn parse_if(rest: &str) -> Result<Cond, String> {
+    const HOW: &str = "if needs a comparison and a label: if ${count} < 5 goto again, \
+                       if ${model} contains 9300 goto new.";
+    let (cond, label) = split_goto(rest)?;
+    let label = label.ok_or(HOW)?;
+    let lower = cond.to_ascii_lowercase();
+    for (text, op) in Op::ALL {
+        let spaced = format!(" {text} ");
+        if let Some(at) = lower.find(&spaced) {
+            return Ok(Cond {
+                left: operand(cond.get(..at).unwrap_or_default()),
+                op,
+                right: operand(cond.get(at + spaced.len()..).unwrap_or_default()),
+                label,
+            });
+        }
+    }
+    Err(HOW.into())
 }
 
 /// The longest value a `capture` keeps, in characters.
@@ -324,7 +498,56 @@ impl Step {
                 | Step::Secret(_)
                 | Step::Pane(_)
                 | Step::Tab(_)
+        ) || self.is_flow()
+    }
+
+    /// Whether it is script logic (labels, jumps, waits for one of
+    /// several texts, timeouts, variables, messages, stop and fail),
+    /// which only a script runner carries out.
+    pub fn is_flow(&self) -> bool {
+        matches!(
+            self,
+            Step::Label(_)
+                | Step::Goto(_)
+                | Step::On(..)
+                | Step::Timeout(..)
+                | Step::Set(..)
+                | Step::Add(..)
+                | Step::If(_)
+                | Step::Show(_)
+                | Step::Stop
+                | Step::Fail(_)
         )
+    }
+
+    /// The label it may go to.
+    pub fn target(&self) -> Option<&str> {
+        match self {
+            Step::Goto(l) | Step::On(_, Some(l)) | Step::Timeout(_, Some(l)) => Some(l),
+            Step::If(c) => Some(&c.label),
+            _ => None,
+        }
+    }
+
+    /// The step with `f` applied to each text it types, waits for,
+    /// compares, sets or shows (not to names or labels).
+    pub fn map_text(self, f: impl Fn(&str) -> String) -> Step {
+        match self {
+            Step::Expect(t) => Step::Expect(f(&t)),
+            Step::Capture(t) => Step::Capture(f(&t)),
+            Step::Send(t) => Step::Send(f(&t)),
+            Step::Type(t) => Step::Type(f(&t)),
+            Step::On(t, l) => Step::On(f(&t), l),
+            Step::Set(n, v) => Step::Set(n, f(&v)),
+            Step::If(c) => Step::If(Cond {
+                left: f(&c.left),
+                right: f(&c.right),
+                ..c
+            }),
+            Step::Show(t) => Step::Show(f(&t)),
+            Step::Fail(t) => Step::Fail(f(&t)),
+            other => other,
+        }
     }
 
     /// Whether it moves to another pane or tab.
@@ -407,14 +630,70 @@ impl Step {
                 "capture needs text, then one * for the value, as in: capture Version *,".into(),
             ),
             "key" if key_bytes(rest).is_some() => Ok(Step::Key(rest.to_ascii_lowercase())),
-            "key" => {
-                Err("key takes key names such as enter, tab, up, f5, ctrl+c, alt+right or shift+tab, \
-                     each one optionally followed by a count: down 3."
-                    .into())
+            "label" if valid_name(rest) => Ok(Step::Label(rest.to_owned())),
+            "label" => Err(name_error("label")),
+            "goto" => match split_goto(line) {
+                Ok((_, Some(l))) => Ok(Step::Goto(l)),
+                _ => Err(name_error("goto")),
+            },
+            "on" => {
+                let (text, label) = split_goto(rest)?;
+                if text.is_empty() {
+                    Err("on needs the text to wait for: on (yes/no)? goto hostkey.".into())
+                } else {
+                    Ok(Step::On(text.to_owned(), label))
+                }
             }
+            "timeout" => {
+                let (secs, label) = split_goto(rest)?;
+                match secs.trim().parse::<u32>() {
+                    Ok(n) if (1..=MAX_TIMEOUT_SECS).contains(&n) => Ok(Step::Timeout(n, label)),
+                    _ => Err(format!(
+                        "timeout takes seconds (1 to {MAX_TIMEOUT_SECS}), optionally followed by \
+                         goto and a label: timeout 60 goto slow."
+                    )),
+                }
+            }
+            v @ ("set" | "add") => {
+                let (name, value) = rest.split_once(char::is_whitespace).unwrap_or((rest, ""));
+                let name = name
+                    .strip_prefix("${")
+                    .and_then(|n| n.strip_suffix('}'))
+                    .unwrap_or(name);
+                if !valid_name(name) {
+                    return Err(format!(
+                        "{v} needs a variable name of letters, digits, _ and - first."
+                    ));
+                }
+                if VARIABLES.contains(&name) || name == "captured" && v == "add" {
+                    return Err(format!(
+                        "${{{name}}} is filled in by FeroSSH; pick another name."
+                    ));
+                }
+                let value = value.trim();
+                if v == "set" {
+                    Ok(Step::Set(name.to_owned(), operand(value)))
+                } else {
+                    match value.parse::<i64>() {
+                        Ok(n) if n.unsigned_abs() <= 1_000_000 => Ok(Step::Add(name.to_owned(), n)),
+                        _ => Err("add takes a variable and a whole number: add tries 1.".into()),
+                    }
+                }
+            }
+            "if" => parse_if(rest).map(Step::If),
+            "show" => Ok(Step::Show(rest.to_owned())),
+            "stop" if rest.is_empty() => Ok(Step::Stop),
+            "stop" => Err("stop takes nothing after it; fail takes a reason.".into()),
+            "fail" if rest.is_empty() => Ok(Step::Fail("the script said so.".into())),
+            "fail" => Ok(Step::Fail(rest.to_owned())),
+            "key" => Err(
+                "key takes key names such as enter, tab, up, f5, ctrl+c, alt+right or shift+tab, \
+                     each one optionally followed by a count: down 3."
+                    .into(),
+            ),
             _ => Err(
-                "Start a step with expect, capture, send, type, key, password, secret, pause, delay, \
-                 pane or tab."
+                "Start a step with expect, on, capture, send, type, key, password, secret, pause, \
+                 delay, timeout, label, goto, if, set, add, show, stop, fail, pane or tab."
                     .into(),
             ),
         }
@@ -436,6 +715,25 @@ impl fmt::Display for Step {
             Step::Type(t) => write!(f, "type {t}"),
             Step::Key(k) => write!(f, "key {k}"),
             Step::Capture(p) => write!(f, "capture {p}"),
+            Step::Label(l) => write!(f, "label {l}"),
+            Step::Goto(l) => write!(f, "goto {l}"),
+            Step::On(t, None) => write!(f, "on {t}"),
+            Step::On(t, Some(l)) => write!(f, "on {t} goto {l}"),
+            Step::Timeout(n, None) => write!(f, "timeout {n}"),
+            Step::Timeout(n, Some(l)) => write!(f, "timeout {n} goto {l}"),
+            Step::Set(n, v) => write!(f, "set {n} {}", quote(v)),
+            Step::Add(n, v) => write!(f, "add {n} {v}"),
+            Step::If(c) => write!(
+                f,
+                "if {} {} {} goto {}",
+                quote(&c.left),
+                c.op.text(),
+                quote(&c.right),
+                c.label
+            ),
+            Step::Show(t) => write!(f, "show {t}"),
+            Step::Stop => f.write_str("stop"),
+            Step::Fail(t) => write!(f, "fail {t}"),
         }
     }
 }
@@ -561,8 +859,8 @@ impl Snippet {
                 && step.waits()
             {
                 return Some(
-                    "An auto-response types lines and keys only: no expect, pause, password \
-                     or secret."
+                    "An auto-response types lines and keys only: no expect, pause, password, \
+                     secret or script logic (on, goto, if, set...)."
                         .into(),
                 );
             }
@@ -785,13 +1083,7 @@ pub fn expand(
     let mut out: Vec<Step> = lines
         .iter()
         .map(|l| match line_step(l) {
-            Some(Ok(step)) => match step {
-                Step::Expect(t) => Step::Expect(fill_text(&t, &value, &var)),
-                Step::Capture(t) => Step::Capture(fill_text(&t, &value, &var)),
-                Step::Send(t) => Step::Send(fill_text(&t, &value, &var)),
-                Step::Type(t) => Step::Type(fill_text(&t, &value, &var)),
-                other => other,
-            },
+            Some(Ok(step)) => step.map_text(|t| fill_text(t, &value, &var)),
             // A line that is not a step after all is typed as written.
             Some(Err(_)) => Step::Send(fill_text(l, &value, &var)),
             None => Step::Send(fill_text(&line_text(l), &value, &var)),
@@ -804,6 +1096,52 @@ pub fn expand(
         *last = Step::Type(std::mem::take(t));
     }
     out
+}
+
+/// Whether `steps` hang together as a script: every label is named
+/// once, every `goto`, `on`, `timeout` and `if` goes to one of them, and
+/// no `pane` or `tab` move mixes with jumps. `Err` holds the index of the
+/// step at fault and why.
+pub fn check_flow(steps: &[Step]) -> Result<(), (usize, String)> {
+    let mut labels: Vec<&str> = Vec::new();
+    for (i, s) in steps.iter().enumerate() {
+        if let Step::Label(l) = s {
+            if labels.iter().any(|x| x.eq_ignore_ascii_case(l)) {
+                return Err((i, format!("The label {l} is used twice.")));
+            }
+            labels.push(l);
+        }
+    }
+    let jumps = steps.iter().any(|s| s.target().is_some());
+    for (i, s) in steps.iter().enumerate() {
+        if let Some(t) = s.target()
+            && !labels.iter().any(|x| x.eq_ignore_ascii_case(t))
+        {
+            return Err((i, format!("There is no label {t} to go to.")));
+        }
+        if jumps && s.moves() {
+            return Err((
+                i,
+                "A script that jumps (goto, on, if, timeout) cannot also move to another pane \
+                 or tab."
+                    .into(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// [`check_flow`] for a script's lines: `Err` holds the line's index.
+pub fn check_lines(lines: &[String]) -> Result<(), (usize, String)> {
+    let mut at = Vec::new();
+    let mut steps = Vec::new();
+    for (i, l) in lines.iter().enumerate() {
+        if let Some(Ok(step)) = line_step(l) {
+            at.push(i);
+            steps.push(step);
+        }
+    }
+    check_flow(&steps).map_err(|(i, why)| (at.get(i).copied().unwrap_or(0), why))
 }
 
 /// The bytes `steps` type when none of them waits; `None` when one does.
@@ -1151,5 +1489,133 @@ mod tests {
             assert!(Step::parse(bad).is_err(), "{bad}");
         }
         assert!(Step::Capture("a*".into()).waits());
+    }
+
+    #[test]
+    fn script_steps_parse_and_print_back() {
+        for (text, step) in [
+            ("label again", Step::Label("again".into())),
+            ("goto again", Step::Goto("again".into())),
+            (
+                "on (yes/no)? goto hostkey",
+                Step::On("(yes/no)?".into(), Some("hostkey".into())),
+            ),
+            ("on #", Step::On("#".into(), None)),
+            ("timeout 60", Step::Timeout(60, None)),
+            ("timeout 5 goto slow", Step::Timeout(5, Some("slow".into()))),
+            (
+                "set model ${captured}",
+                Step::Set("model".into(), "${captured}".into()),
+            ),
+            ("set empty \"\"", Step::Set("empty".into(), String::new())),
+            ("add tries -1", Step::Add("tries".into(), -1)),
+            ("show Done: ${n}", Step::Show("Done: ${n}".into())),
+            ("stop", Step::Stop),
+            ("fail no route", Step::Fail("no route".into())),
+            (
+                "if ${model} contains 9300 goto new",
+                Step::If(Cond {
+                    left: "${model}".into(),
+                    op: Op::Contains,
+                    right: "9300".into(),
+                    label: "new".into(),
+                }),
+            ),
+            (
+                "if \"\" != ${x} goto set",
+                Step::If(Cond {
+                    left: String::new(),
+                    op: Op::Ne,
+                    right: "${x}".into(),
+                    label: "set".into(),
+                }),
+            ),
+            (
+                "if ${n} <= 5 goto again",
+                Step::If(Cond {
+                    left: "${n}".into(),
+                    op: Op::Le,
+                    right: "5".into(),
+                    label: "again".into(),
+                }),
+            ),
+        ] {
+            let got = Step::parse(text).unwrap();
+            assert_eq!(got, step, "{text}");
+            assert_eq!(Step::parse(&got.to_string()).unwrap(), step, "{text}");
+            assert!(got.waits() && got.is_flow(), "{text}");
+        }
+        for bad in [
+            "label 9x",
+            "label",
+            "goto",
+            "goto a b",
+            "on goto x",
+            "timeout 0",
+            "timeout 99999",
+            "timeout 5 goto",
+            "set host x",
+            "set 1 x",
+            "add n x",
+            "if ${n} goto x",
+            "if a == b",
+            "stop now",
+        ] {
+            assert!(Step::parse(bad).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn conditions_compare_numbers_and_text() {
+        assert!(Cond::holds(Op::Lt, "9", "10").unwrap());
+        assert!(Cond::holds(Op::Eq, "07", "7").unwrap());
+        assert!(Cond::holds(Op::Eq, "up", "up").unwrap());
+        assert!(Cond::holds(Op::Ne, "up", "down").unwrap());
+        assert!(Cond::holds(Op::Contains, "C9300-48P", "9300").unwrap());
+        assert!(Cond::holds(Op::Gt, "x", "1").is_err());
+    }
+
+    #[test]
+    fn flow_checks_labels_and_moves() {
+        let check = |lines: &[&str]| check_lines(&owned(lines));
+        assert!(check(&["@label a", "x", "@goto a"]).is_ok());
+        assert!(
+            check(&["@on # goto A", "@label a"]).is_ok(),
+            "labels ignore case"
+        );
+        assert_eq!(check(&["x", "@goto b"]).unwrap_err().0, 1);
+        assert!(
+            check(&["@label a", "@label A"])
+                .unwrap_err()
+                .1
+                .contains("twice")
+        );
+        assert!(check(&["@label a", "@goto a", "@pane left"]).is_err());
+        assert!(check(&["@label a", "@pane left"]).is_ok());
+        // A snippet with script steps needs a runner, and is no
+        // auto-response.
+        let steps = expand(
+            &owned(&["@set a 1", "x"]),
+            true,
+            |_| String::new(),
+            |_| String::new(),
+        );
+        assert!(steps_bytes(&steps).is_none());
+    }
+
+    #[test]
+    fn arguments_fill_script_steps_too() {
+        let steps = expand(
+            &owned(&[
+                "@if $1 == ${host} goto a",
+                "@label a",
+                "@show ${1:x} on ${host}",
+            ]),
+            true,
+            |_| "sw1".into(),
+            |_| "sw1".into(),
+        );
+        assert_eq!(steps.first().unwrap().to_string(), "if sw1 == sw1 goto a");
+        assert_eq!(steps.get(2), Some(&Step::Show("sw1 on sw1".into())));
     }
 }

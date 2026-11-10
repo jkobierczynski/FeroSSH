@@ -1,27 +1,30 @@
-//! The snippets folder, `%APPDATA%\FeroSSH\snippets`: one file per command
-//! snippet, so snippets can be copied to another PC, shared, kept in git
-//! or backed up one by one.
+//! The scripts folder, `%APPDATA%\FeroSSH\scripts`: one file per script
+//! (a command snippet, which may wait, branch and loop, see
+//! [`crate::login`]), so scripts can be copied to another PC, shared,
+//! kept in git or backed up one by one.
 //!
 //! A file holds one `Snippet` block of the settings syntax (see
-//! [`crate::settings`]) and ends in `.snippet`. The folder a file is in,
-//! below the snippets folder, is the snippet's category:
+//! [`crate::settings`]) and ends in `.script`; files ending in `.snippet`,
+//! from before scripts had their name, are read the same way, and one is
+//! saved as `.script` when it is next edited. The folder a file is in,
+//! below the scripts folder, is the script's category:
 //!
 //! ```text
-//! snippets\
-//!     Show disk use.snippet           no category
+//! scripts\
+//!     Show disk use.script            no category
 //!     Network\
-//!         Show interfaces.snippet     category Network
+//!         Show interfaces.script      category Network
 //!         Cisco\
 //!             Save config.snippet     category Network/Cisco
 //! ```
 //!
-//! A file is named after its snippet, with the characters Windows does not
+//! A file is named after its script, with the characters Windows does not
 //! allow in a file name made `_`. Dropping a file or a folder of files
-//! into the snippets folder adds those snippets; FeroSSH reads the folder
-//! again each time the snippets view opens.
+//! into the scripts folder adds those scripts; FeroSSH reads the folder
+//! again each time the scripts view opens.
 //!
-//! Older versions kept snippets in `ferossh.conf`; [`migrate`] moves them
-//! here.
+//! Older versions kept snippets in `ferossh.conf`, and then in a
+//! `snippets` folder; [`migrate`] and [`move_old_folder`] move them here.
 
 use std::fmt::Write as _;
 use std::io;
@@ -30,8 +33,10 @@ use std::path::{Path, PathBuf};
 use crate::login::Snippet;
 use crate::settings::{Settings, snippet_block};
 
-/// What a snippet file's name ends in.
-pub const EXTENSION: &str = "snippet";
+/// What a script file's name ends in.
+pub const EXTENSION: &str = "script";
+/// What it ended in before snippets were called scripts; still read.
+pub const OLD_EXTENSION: &str = "snippet";
 /// Levels of categories within categories.
 pub const MAX_DEPTH: usize = 4;
 /// Snippet files read at most, so a wrong folder never stalls the window.
@@ -92,7 +97,7 @@ pub fn clean_category(text: &str) -> String {
 pub fn file_for(snippet: &Snippet) -> String {
     let mut name = file_part(&snippet.name);
     if name.is_empty() {
-        name = "snippet".into();
+        name = "script".into();
     }
     let category = clean_category(&snippet.category);
     if category.is_empty() {
@@ -118,8 +123,8 @@ fn under(dir: &Path, rel: &str) -> Option<PathBuf> {
 /// What a snippet's file holds.
 pub fn file_text(snippet: &Snippet) -> String {
     let mut out = String::from(
-        "# A FeroSSH command snippet. Copy this file into another FeroSSH's snippets\n\
-         # folder to bring the snippet along; the folder it is in is its category.\n",
+        "# A FeroSSH script. Copy this file into another FeroSSH's scripts folder\n\
+         # to bring the script along; the folder it is in is its category.\n",
     );
     out.push_str(&snippet_block(snippet));
     out
@@ -180,7 +185,9 @@ pub fn load(dir: &Path) -> (Vec<Snippet>, Vec<String>) {
             }
             let Some(stem) = name
                 .rsplit_once('.')
-                .filter(|(_, ext)| ext.eq_ignore_ascii_case(EXTENSION))
+                .filter(|(_, ext)| {
+                    ext.eq_ignore_ascii_case(EXTENSION) || ext.eq_ignore_ascii_case(OLD_EXTENSION)
+                })
                 .map(|(stem, _)| stem.to_owned())
             else {
                 continue;
@@ -191,7 +198,7 @@ pub fn load(dir: &Path) -> (Vec<Snippet>, Vec<String>) {
             let path = entry.path();
             let text = match std::fs::metadata(&path) {
                 Ok(m) if m.len() > MAX_FILE_BYTES => {
-                    problems.push(format!("{} is too big for a snippet.", path.display()));
+                    problems.push(format!("{} is too big for a script.", path.display()));
                     continue;
                 }
                 Ok(_) => match std::fs::read(&path) {
@@ -216,7 +223,7 @@ pub fn load(dir: &Path) -> (Vec<Snippet>, Vec<String>) {
                     out.push(s);
                 }
                 None => problems.push(format!(
-                    "{} has no snippet: it needs a Snippet line and at least one Line.",
+                    "{} has no script: it needs a Snippet line and at least one Line.",
                     path.display()
                 )),
             }
@@ -232,7 +239,7 @@ fn write_file(path: &Path, text: &str) -> io::Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    let tmp = path.with_extension("snippet-tmp");
+    let tmp = path.with_extension("script-tmp");
     std::fs::write(&tmp, text)?;
     std::fs::rename(&tmp, path)
 }
@@ -264,7 +271,7 @@ pub fn save(dir: &Path, snippet: &mut Snippet) -> Result<(), String> {
         .as_ref()
         .is_some_and(|(f, _)| f.eq_ignore_ascii_case(&rel));
     if !same && path.exists() {
-        let mut why = format!("There is already a snippet called {}", snippet.name);
+        let mut why = format!("There is already a script called {}", snippet.name);
         if !snippet.category.is_empty() {
             let _ = write!(why, " in {}", snippet.category);
         }
@@ -330,7 +337,21 @@ pub fn add(dir: &Path, snippet: &mut Snippet) -> Result<(), String> {
         snippet.file = Some(rel);
         return Ok(());
     }
-    Err(format!("Too many snippets are called {}.", snippet.name))
+    Err(format!("Too many scripts are called {}.", snippet.name))
+}
+
+/// Renames the `snippets` folder an older FeroSSH kept beside `dir` to
+/// `dir` (the scripts folder), when there is no scripts folder yet.
+/// Returns the folder to use: `dir`, or the old one when it could not be
+/// renamed (in use by another program, say), so nothing goes missing.
+pub fn move_old_folder(dir: &Path, old: &Path) -> PathBuf {
+    if dir.exists() || !old.is_dir() {
+        return dir.to_path_buf();
+    }
+    match std::fs::rename(old, dir) {
+        Ok(()) => dir.to_path_buf(),
+        Err(_) => old.to_path_buf(),
+    }
 }
 
 /// Moves the snippets an older FeroSSH kept in `ferossh.conf` into the
@@ -402,9 +423,9 @@ mod tests {
         assert_eq!(clean_category("//"), "");
         assert_eq!(
             file_for(&snip("Save: all", "Net/Lab")),
-            "Net/Lab/Save_ all.snippet"
+            "Net/Lab/Save_ all.script"
         );
-        assert_eq!(file_for(&snip("..", "")), "snippet.snippet");
+        assert_eq!(file_for(&snip("..", "")), "script.script");
         assert!(under(Path::new("x"), "../y").is_none());
         assert!(under(Path::new("x"), "a/../y").is_none());
     }
@@ -419,12 +440,12 @@ mod tests {
         save(&dir, &mut b).unwrap();
         assert_eq!(
             a.file.as_deref(),
-            Some("Network/Cisco/Show interfaces.snippet")
+            Some("Network/Cisco/Show interfaces.script")
         );
         assert!(
             dir.join("Network")
                 .join("Cisco")
-                .join("Show interfaces.snippet")
+                .join("Show interfaces.script")
                 .is_file()
         );
         let (all, problems) = load(&dir);
@@ -444,7 +465,7 @@ mod tests {
         assert!(save(&dir, &mut clash).unwrap_err().contains("already"));
         // Adding finds a free file name instead.
         add(&dir, &mut clash).unwrap();
-        assert_eq!(clash.file.as_deref(), Some("Disk use (2).snippet"));
+        assert_eq!(clash.file.as_deref(), Some("Disk use (2).script"));
         remove(&dir, &moved).unwrap();
         assert!(!dir.join("Lab").exists());
         let (all, _) = load(&dir);
@@ -474,9 +495,32 @@ mod tests {
         // would be called.
         let mut s = all[0].clone();
         save(&dir, &mut s).unwrap();
-        assert!(dir.join("Ops").join("Restart web.snippet").is_file());
+        assert!(dir.join("Ops").join("Restart web.script").is_file());
+        assert!(!dir.join("Ops").join("whatever.SNIPPET").exists());
         assert_eq!(load(&dir).0.len(), 1);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_old_snippets_folder_becomes_the_scripts_folder() {
+        let base = temp("rename");
+        let old = base.join("snippets");
+        let dir = base.join("scripts");
+        std::fs::create_dir_all(old.join("Ops")).unwrap();
+        std::fs::write(
+            old.join("Ops").join("Up.snippet"),
+            "Snippet \"Up\"\n  Line uptime\n",
+        )
+        .unwrap();
+        assert_eq!(move_old_folder(&dir, &old), dir);
+        assert!(!old.exists());
+        let (all, _) = load(&dir);
+        assert_eq!(all[0].file.as_deref(), Some("Ops/Up.snippet"));
+        // With a scripts folder there already, nothing moves.
+        std::fs::create_dir_all(&old).unwrap();
+        assert_eq!(move_old_folder(&dir, &old), dir);
+        assert!(old.exists());
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]
