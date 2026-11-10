@@ -24,7 +24,7 @@ use std::io::{Read, Write};
 use std::sync::Arc;
 use std::thread;
 
-use ferossh_ipc::{ChannelId, Decoder, Message, PROTOCOL_VERSION, Side, encode};
+use ferossh_ipc::{ChannelId, Decoder, Message, PROTOCOL_VERSION, SftpOp, Side, encode};
 use tokio::sync::{mpsc, oneshot};
 
 pub use session::Params;
@@ -36,6 +36,54 @@ const QUEUE: usize = 64;
 /// them (its server stopped reading). Past this the session is closed
 /// rather than let what the user types or pastes fill the worker's memory.
 const FRONT_QUEUE: usize = 4096;
+/// Bytes the dispatcher queues for one such session, so a big paste into
+/// a stalled session is capped too, not only many small messages. Far
+/// more than anyone pastes into a terminal; file transfers are paced by
+/// their own requests and never come near it.
+const FRONT_BYTES: usize = 32 << 20;
+
+/// About what a queued message holds in memory: its data, if it carries
+/// any, plus a little for the rest.
+fn weight(msg: &Message) -> usize {
+    let data = match msg {
+        Message::Data { bytes, .. }
+        | Message::ZmodemData { bytes, .. }
+        | Message::ZmodemChunk { bytes, .. } => bytes.len(),
+        Message::SftpRequest {
+            op: SftpOp::Write { data, .. },
+            ..
+        } => data.len(),
+        _ => 0,
+    };
+    data.saturating_add(64)
+}
+
+/// What became of a message handed to a session's front queue.
+enum Queued {
+    Yes,
+    /// The queue holds [`FRONT_QUEUE`] messages or [`FRONT_BYTES`] bytes.
+    Full,
+    /// The session has ended.
+    Closed,
+}
+
+/// Hands `msg` to a session's front queue without waiting.
+fn queue(tx: &mpsc::Sender<Message>, guard: &SessionGuard, msg: Message) -> Queued {
+    let n = weight(&msg);
+    if !guard.reserve(n, FRONT_BYTES) {
+        return Queued::Full;
+    }
+    match tx.try_send(msg) {
+        Ok(()) => Queued::Yes,
+        Err(e) => {
+            guard.release(n);
+            match e {
+                mpsc::error::TrySendError::Full(_) => Queued::Full,
+                mpsc::error::TrySendError::Closed(_) => Queued::Closed,
+            }
+        }
+    }
+}
 
 /// Serves the UI: one task per shell, SFTP channel, remote forward
 /// listener and forwarded stream, routed by channel id; shells opened with
@@ -68,6 +116,7 @@ pub async fn serve(mut inbox: mpsc::Receiver<Message>, out: mpsc::Sender<Message
         let (front, mut queued) = mpsc::channel::<Message>(FRONT_QUEUE);
         let (alive, mut gone) = oneshot::channel::<()>();
         let guard = Arc::new(SessionGuard::new(alive));
+        let taken = guard.clone();
         if !routes.insert(channel, Route::Session(front, guard.clone())) {
             return None;
         }
@@ -78,13 +127,17 @@ pub async fn serve(mut inbox: mpsc::Receiver<Message>, out: mpsc::Sender<Message
                     _ = &mut gone => break,
                     () = tx.closed() => break,
                     msg = queued.recv() => match msg {
-                        Some(msg) => tokio::select! {
-                            biased;
-                            _ = &mut gone => break,
-                            sent = tx.send(msg) => if sent.is_err() {
-                                break;
-                            },
-                        },
+                        Some(msg) => {
+                            let n = weight(&msg);
+                            tokio::select! {
+                                biased;
+                                _ = &mut gone => break,
+                                sent = tx.send(msg) => if sent.is_err() {
+                                    break;
+                                },
+                            }
+                            taken.release(n);
+                        }
                         None => break,
                     },
                 }
@@ -269,9 +322,9 @@ pub async fn serve(mut inbox: mpsc::Receiver<Message>, out: mpsc::Sender<Message
                     continue;
                 };
                 let delivered = match routes.get(channel) {
-                    Some(Route::Session(tx, guard)) => match tx.try_send(other) {
-                        Ok(()) => true,
-                        Err(mpsc::error::TrySendError::Full(_)) => {
+                    Some(Route::Session(tx, guard)) => match queue(&tx, &guard, other) {
+                        Queued::Yes => true,
+                        Queued::Full => {
                             // Its server has stopped taking what the user
                             // types or pastes. End the session even if it
                             // is stuck in a write, and say why: the input
@@ -292,7 +345,7 @@ pub async fn serve(mut inbox: mpsc::Receiver<Message>, out: mpsc::Sender<Message
                             });
                             continue;
                         }
-                        Err(mpsc::error::TrySendError::Closed(_)) => false,
+                        Queued::Closed => false,
                     },
                     Some(Route::Stream(tx)) => tx.send(other).is_ok(),
                     None => true,
@@ -365,4 +418,31 @@ pub fn run_blocking(
         .build()?;
     rt.block_on(serve(in_rx, out_tx));
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A paste far past the byte budget fills the front queue long before
+    /// its message count does, and room comes back as the session reads.
+    #[tokio::test]
+    async fn the_front_queue_is_capped_by_bytes() {
+        let (tx, mut rx) = mpsc::channel(FRONT_QUEUE);
+        let (alive, _gone) = oneshot::channel();
+        let guard = SessionGuard::new(alive);
+        let chunk = || Message::Data {
+            channel: 1,
+            bytes: vec![b'x'; ferossh_ipc::MAX_DATA_CHUNK],
+        };
+        let mut queued = 0;
+        while matches!(queue(&tx, &guard, chunk()), Queued::Yes) {
+            queued += 1;
+        }
+        assert!(queued < FRONT_QUEUE);
+        assert!(queued * ferossh_ipc::MAX_DATA_CHUNK <= FRONT_BYTES);
+        let taken = rx.recv().await.map(|m| weight(&m)).unwrap_or_default();
+        guard.release(taken);
+        assert!(matches!(queue(&tx, &guard, chunk()), Queued::Yes));
+    }
 }

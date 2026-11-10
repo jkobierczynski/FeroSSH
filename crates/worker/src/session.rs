@@ -16,7 +16,7 @@
 use std::collections::HashMap;
 use std::fmt;
 use std::future::Future;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 
@@ -170,6 +170,8 @@ pub(crate) enum Route {
 pub(crate) struct SessionGuard {
     _feed: oneshot::Sender<()>,
     task: Mutex<Option<tokio::task::AbortHandle>>,
+    /// Bytes the dispatcher has queued that the session has not taken.
+    queued: AtomicUsize,
 }
 
 impl SessionGuard {
@@ -177,7 +179,27 @@ impl SessionGuard {
         Self {
             _feed: feed,
             task: Mutex::new(None),
+            queued: AtomicUsize::new(0),
         }
+    }
+
+    /// Counts `n` more queued bytes, or refuses when that would pass
+    /// `limit`.
+    pub(crate) fn reserve(&self, n: usize, limit: usize) -> bool {
+        self.queued
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |q| {
+                q.checked_add(n).filter(|total| *total <= limit)
+            })
+            .is_ok()
+    }
+
+    /// Counts `n` queued bytes as taken by the session.
+    pub(crate) fn release(&self, n: usize) {
+        let _ = self
+            .queued
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |q| {
+                Some(q.saturating_sub(n))
+            });
     }
 
     /// The session's own task, for [`SessionGuard::abort`].
