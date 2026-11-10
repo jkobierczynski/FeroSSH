@@ -57,3 +57,9 @@ strip = true
 # cannot stop a debug build or the fuzz regression test.
 [profile.dev.package.vte]
 overflow-checks = false
+
+# A resumed download is hashed before it is kept. Unoptimised SHA-256
+# takes about 27 s per GiB, so the interop test's 5 GiB resume would
+# outlast its deadline; build sha2 optimised in debug and test builds.
+[profile.dev.package.sha2]
+opt-level = 3
