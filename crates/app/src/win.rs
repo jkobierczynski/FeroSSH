@@ -14551,6 +14551,13 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                 with_window(Window::clipboard_changed);
                 LRESULT(0)
             }
+            files_panel::WM_FILES_DEFERRED => {
+                // What the file pane emitted while the view was being set.
+                for event in files_panel::take_deferred() {
+                    files_event(hwnd, event);
+                }
+                LRESULT(0)
+            }
             WM_TOOLS_FOCUS => {
                 // Checked again now: a click may have moved the focus since.
                 let (want, conn, live, form, files, rename) = with_window(|w| {

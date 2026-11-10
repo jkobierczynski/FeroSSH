@@ -305,6 +305,43 @@ struct State {
     sync_pending: Option<SyncPending>,
     /// Where the title row's buttons start: the host label ends before.
     title_buttons_x: i32,
+    /// Inside `set_view`: the main window's state is borrowed, so events
+    /// wait in `deferred` and go out from a posted message.
+    in_view: bool,
+    deferred: Vec<Event>,
+}
+
+/// Posted to the main window when events wait in `deferred`: it hands
+/// them to [`take_deferred`].
+pub const WM_FILES_DEFERRED: u32 = windows::Win32::UI::WindowsAndMessaging::WM_APP + 41;
+
+/// The events that waited while the view was being set.
+pub fn take_deferred() -> Vec<Event> {
+    with(|s| std::mem::take(&mut s.deferred)).unwrap_or_default()
+}
+
+/// Ends `set_view`'s deferral, posting for any waiting events.
+struct ViewGuard;
+
+impl Drop for ViewGuard {
+    fn drop(&mut self) {
+        let post = with(|s| {
+            s.in_view = false;
+            (!s.deferred.is_empty()).then_some(s.h.main)
+        })
+        .flatten();
+        if let Some(main) = post {
+            // SAFETY: posting to our own main window.
+            unsafe {
+                let _ = windows::Win32::UI::WindowsAndMessaging::PostMessageW(
+                    Some(main),
+                    WM_FILES_DEFERRED,
+                    WPARAM(0),
+                    LPARAM(0),
+                );
+            }
+        }
+    }
 }
 
 thread_local! {
@@ -658,6 +695,8 @@ pub fn create(main: HWND, handler: Handler, dpi: u32) -> windows::core::Result<(
                 naming: None,
                 sync_pending: None,
                 title_buttons_x: i32::MAX,
+                in_view: false,
+                deferred: Vec::new(),
                 shown_host: None,
             });
         });
@@ -1144,6 +1183,10 @@ pub fn set_view(view: View) {
     let Some(h) = handles() else {
         return;
     };
+    // Called with the main window's state borrowed: what this emits is
+    // carried out once that is released.
+    with(|s| s.in_view = true);
+    let _guard = ViewGuard;
     let changes = with(|s| {
         let old = s.view.as_ref();
         let host = old.map(|v| &v.host) != Some(&view.host);
@@ -1231,7 +1274,7 @@ pub fn set_view(view: View) {
                 // Both or neither: the Remote list goes back.
                 emit(Event::Browse(p.back));
                 local_problem(
-                    "Sync browsing: the Local folder did not open, so Remote went back too.".into(),
+                    "Sync browsing: the Local folder did not open, so Remote is going back to where it was.".into(),
                 );
             }
         }
@@ -1451,10 +1494,21 @@ fn refresh_queue(h: &Handles, view: &View) {
 }
 
 fn emit(e: Event) {
-    let Some((main, handler)) = with(|s| (s.h.main, s.handler)) else {
+    let mut e = Some(e);
+    let Some((main, handler)) = with(|s| {
+        if s.in_view {
+            s.deferred.extend(e.take());
+            None
+        } else {
+            Some((s.h.main, s.handler))
+        }
+    })
+    .flatten() else {
         return;
     };
-    handler(main, e);
+    if let Some(e) = e {
+        handler(main, e);
+    }
 }
 
 /// Runs in the message loop before a message is translated and sent;
