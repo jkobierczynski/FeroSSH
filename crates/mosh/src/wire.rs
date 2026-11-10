@@ -83,13 +83,17 @@ impl Packet {
         })
     }
 
-    /// The nonce and plaintext of a packet to the server.
+    /// The nonce and plaintext of a packet to the server. The nonce is
+    /// `seq` as it is: the client counts from 0, and the session's block
+    /// limit (2^47) ends it long before the direction bit, 2^63.
+    /// (Masking the bit off here would put a constant into every nonce,
+    /// which CodeQL reports as a hard-coded nonce.)
     pub fn to_server(&self) -> (u64, Vec<u8>) {
         let mut text = Vec::with_capacity(4 + self.payload.len());
         text.extend_from_slice(&self.timestamp.to_be_bytes());
         text.extend_from_slice(&self.timestamp_reply.to_be_bytes());
         text.extend_from_slice(&self.payload);
-        (self.seq & !TO_CLIENT, text)
+        (self.seq, text)
     }
 }
 
