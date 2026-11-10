@@ -19,15 +19,20 @@ pub fn command() -> Vec<u8> {
         "mkdir -p \"$d\" || exit 4; ",
         "[ -f \"$f\" ] || : >> \"$f\" || exit 5; ",
         // The type and the key itself, as the entry's key fields: the
-        // first two, or the two after the options (one field unless a
-        // quoted value holds spaces). A comment never counts, nor does a
-        // comment line. `\$` keeps sh from expanding awk's fields.
+        // first two, or the two after the options, which end at the first
+        // blank outside double quotes (a quote escaped with a backslash
+        // does not count). A comment never counts, nor does a comment
+        // line. `\$` keeps sh from expanding awk's fields; `d` is a
+        // double quote and `b` a backslash.
         "t=${k%% *}; r=${k#* }; y=${r%% *}; ",
-        "if awk -v t=\"$t\" -v y=\"$y\" -v d=\\\" ",
-        "\"BEGIN { r = 1 } /^[ \t]*#/ { next } { k = 1; ",
-        "if (\\$1 ~ /^(ssh-|ecdsa-|sk-)/) k = 1; else { q = 0; k = 0; ",
-        "for (i = 1; i <= NF; i++) { q = (q + gsub(d, d, \\$i)) % 2; if (q == 0) { k = i + 1; break } } } ",
-        "if (k > 0 && \\$k == t && \\$(k + 1) == y) r = 0 } END { exit r }\" ",
+        r#"if awk -v t="$t" -v y="$y" -v d=\" -v b=\\\\ "#,
+        r#""BEGIN { r = 1 } /^[ \t]*#/ { next } "#,
+        r#"{ if (\$1 ~ /^(ssh-|ecdsa-|sk-)/) { a = \$1; c = \$2 } else { "#,
+        r#"s = \$0; sub(/^[ \t]+/, e, s); q = 0; n = length(s); "#,
+        r#"for (i = 1; i <= n; i++) { h = substr(s, i, 1); "#,
+        r#"if (h == b) { i++; continue } if (h == d) q = 1 - q; else if (q == 0 && h ~ /[ \t]/) break } "#,
+        r#"a = e; c = e; if (split(substr(s, i + 1), f) >= 2) { a = f[1]; c = f[2] } } "#,
+        r#"if (a == t && c == y) r = 0 } END { exit r }" "#,
         "\"$f\"; then echo FEROSSH-KEY-PRESENT; exit 0; fi; ",
         // A last line without its newline would run into the new one.
         "if [ -s \"$f\" ] && [ -n \"$(tail -c 1 \"$f\")\" ]; then echo >> \"$f\" || exit 5; fi; ",
@@ -152,6 +157,10 @@ mod tests {
         assert_eq!(run(&home, c), Outcome::Added);
         assert_eq!(run(&home, c), Outcome::Present);
         std::fs::write(&file, format!("{text}no-pty,command=\"a b\" {c}\n")).unwrap();
+        assert_eq!(run(&home, c), Outcome::Present);
+        // Escaped quotes and key-like text inside an option value.
+        let opts = r#"command="echo \"x ssh-ed25519 y\" done",no-pty "#;
+        std::fs::write(&file, format!("{text}{opts}{c}\n")).unwrap();
         assert_eq!(run(&home, c), Outcome::Present);
         // Another key whose comment holds this one is not this one.
         std::fs::write(&file, format!("{text}{a} note {c}\n")).unwrap();
