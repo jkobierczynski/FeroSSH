@@ -131,6 +131,8 @@ struct State {
     /// The categories folded away, in lower case ("" for no category);
     /// kept while FeroSSH runs.
     collapsed: HashSet<String>,
+    /// The list was last filled for a search.
+    searching: bool,
 }
 
 thread_local! {
@@ -273,6 +275,7 @@ pub fn create(main: HWND, handler: Handler, dpi: u32) -> windows::core::Result<(
                 groups: Vec::new(),
                 group_keys: Vec::new(),
                 collapsed: HashSet::new(),
+                searching: false,
             });
         });
         enable_buttons(&h);
@@ -404,10 +407,14 @@ pub fn set_view(rows: Vec<NativeScript>, selected: usize, filter: &str, total: u
         return;
     };
     let typed = search_text(h.search);
+    // A search shows every match, folded category or not: starting or
+    // clearing one refills the list even when the rows stay the same.
+    let searching = !filter.is_empty();
     let rebuild = with(|s| {
         s.filling = true;
         s.total = total;
-        if s.rows.as_ref() == Some(&rows) {
+        let search_changed = std::mem::replace(&mut s.searching, searching) != searching;
+        if s.rows.as_ref() == Some(&rows) && !search_changed {
             return false;
         }
         s.rows = Some(rows.clone());
@@ -430,7 +437,7 @@ pub fn set_view(rows: Vec<NativeScript>, selected: usize, filter: &str, total: u
             );
         }
         if rebuild {
-            fill_list(&h, &rows);
+            fill_list(&h, &rows, searching);
         }
         let current = selected_index(h.list)
             .and_then(|i| row_at(h.list, i))
@@ -448,7 +455,7 @@ pub fn set_view(rows: Vec<NativeScript>, selected: usize, filter: &str, total: u
             .flatten();
             if let Some(id) = id
                 && !rebuild
-                && search_text(h.search).is_empty()
+                && !searching
             {
                 set_folded(&h, id, false);
             }
@@ -462,7 +469,7 @@ pub fn set_view(rows: Vec<NativeScript>, selected: usize, filter: &str, total: u
 
 /// Fills the list with `rows`, under a heading per category when any
 /// has one.
-fn fill_list(h: &Handles, rows: &[NativeScript]) {
+fn fill_list(h: &Handles, rows: &[NativeScript], searching: bool) {
     let grouped = rows.iter().any(|r| !r.category.is_empty());
     // The groups, in the rows' order: those without a category first.
     let mut groups: Vec<&str> = Vec::new();
@@ -483,8 +490,6 @@ fn fill_list(h: &Handles, rows: &[NativeScript]) {
         })
         .collect();
     let keys: Vec<String> = groups.iter().map(|g| g.to_lowercase()).collect();
-    // A search shows every match, folded category or not.
-    let searching = !search_text(h.search).is_empty();
     let folded: Vec<bool> = with(|s| {
         s.groups = headings;
         s.group_keys = keys.clone();
