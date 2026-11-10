@@ -340,17 +340,48 @@ pub fn add(dir: &Path, snippet: &mut Snippet) -> Result<(), String> {
     Err(format!("Too many scripts are called {}.", snippet.name))
 }
 
-/// Renames the `snippets` folder an older FeroSSH kept beside `dir` to
-/// `dir` (the scripts folder), when there is no scripts folder yet.
-/// Returns the folder to use: `dir`, or the old one when it could not be
-/// renamed (in use by another program, say), so nothing goes missing.
+/// Moves the `snippets` folder an older FeroSSH kept beside `dir` to
+/// `dir` (the scripts folder): renamed when there is no scripts folder
+/// yet, else its files are moved in one by one, keeping their folders,
+/// with a file already in the scripts folder never overwritten (the old
+/// one then stays where it was). Returns the folder to use: `dir`, or
+/// the old one when it could not be renamed (in use by another program,
+/// say), so nothing goes missing.
 pub fn move_old_folder(dir: &Path, old: &Path) -> PathBuf {
-    if dir.exists() || !old.is_dir() {
+    if !old.is_dir() {
         return dir.to_path_buf();
     }
-    match std::fs::rename(old, dir) {
-        Ok(()) => dir.to_path_buf(),
-        Err(_) => old.to_path_buf(),
+    if !dir.exists() {
+        return match std::fs::rename(old, dir) {
+            Ok(()) => dir.to_path_buf(),
+            Err(_) => old.to_path_buf(),
+        };
+    }
+    merge_into(old, dir, 0);
+    // Gone when everything moved; kept, with what could not, otherwise.
+    let _ = std::fs::remove_dir(old);
+    dir.to_path_buf()
+}
+
+/// Moves `from`'s files into `to`, folder by folder, without
+/// overwriting; removes the folders it empties.
+fn merge_into(from: &Path, to: &Path, depth: usize) {
+    let Ok(entries) = std::fs::read_dir(from) else {
+        return;
+    };
+    for entry in entries.flatten().take(MAX_FILES) {
+        let Ok(kind) = entry.file_type() else {
+            continue;
+        };
+        let target = to.join(entry.file_name());
+        if kind.is_dir() && depth < MAX_DEPTH {
+            if std::fs::create_dir_all(&target).is_ok() {
+                merge_into(&entry.path(), &target, depth + 1);
+                let _ = std::fs::remove_dir(entry.path());
+            }
+        } else if kind.is_file() && !target.exists() {
+            let _ = std::fs::rename(entry.path(), &target);
+        }
     }
 }
 
@@ -516,10 +547,25 @@ mod tests {
         assert!(!old.exists());
         let (all, _) = load(&dir);
         assert_eq!(all[0].file.as_deref(), Some("Ops/Up.snippet"));
-        // With a scripts folder there already, nothing moves.
-        std::fs::create_dir_all(&old).unwrap();
+        // With a scripts folder there already, the files move in, and a
+        // name taken there keeps the old file where it was.
+        std::fs::create_dir_all(old.join("Ops")).unwrap();
+        std::fs::write(
+            old.join("Ops").join("New.snippet"),
+            "Snippet \"New\"\n  Line w\n",
+        )
+        .unwrap();
+        std::fs::write(
+            old.join("Ops").join("Up.snippet"),
+            "Snippet \"Old\"\n  Line x\n",
+        )
+        .unwrap();
         assert_eq!(move_old_folder(&dir, &old), dir);
-        assert!(old.exists());
+        assert!(dir.join("Ops").join("New.snippet").is_file());
+        assert!(old.join("Ops").join("Up.snippet").is_file());
+        let (all, _) = load(&dir);
+        assert_eq!(all.len(), 2);
+        assert!(all.iter().any(|s| s.name == "Up"));
         let _ = std::fs::remove_dir_all(&base);
     }
 

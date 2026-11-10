@@ -5424,6 +5424,15 @@ impl Window {
                         {
                             next = None;
                         }
+                        // The part after a move types what was captured
+                        // before it.
+                        next = next.map(|(r, name, rest)| {
+                            (
+                                r,
+                                name,
+                                rest.into_iter().map(|s| run.runner.fill(s)).collect(),
+                            )
+                        });
                         if run.report
                             && let Some(row) =
                                 self.snippets_view.report_mut().and_then(|r| r.row_mut(id))

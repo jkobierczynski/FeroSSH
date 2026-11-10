@@ -639,7 +639,7 @@ impl Step {
             "on" => {
                 let (text, label) = split_goto(rest)?;
                 if text.is_empty() {
-                    Err("on needs the text to wait for: on (yes/no)? goto hostkey.".into())
+                    Err("on needs the text to wait for: on [confirm] goto confirm.".into())
                 } else {
                     Ok(Step::On(text.to_owned(), label))
                 }
@@ -1100,7 +1100,9 @@ pub fn expand(
 
 /// Whether `steps` hang together as a script: every label is named
 /// once, every `goto`, `on`, `timeout` and `if` goes to one of them, and
-/// no `pane` or `tab` move mixes with jumps. `Err` holds the index of the
+/// no `pane` or `tab` move mixes with logic, whose jumps, variables and
+/// timeouts would not carry over to the pane it moves to (a `capture`
+/// does: its value is filled in there). `Err` holds the index of the
 /// step at fault and why.
 pub fn check_flow(steps: &[Step]) -> Result<(), (usize, String)> {
     let mut labels: Vec<&str> = Vec::new();
@@ -1112,18 +1114,18 @@ pub fn check_flow(steps: &[Step]) -> Result<(), (usize, String)> {
             labels.push(l);
         }
     }
-    let jumps = steps.iter().any(|s| s.target().is_some());
+    let logic = steps.iter().any(Step::is_flow);
     for (i, s) in steps.iter().enumerate() {
         if let Some(t) = s.target()
             && !labels.iter().any(|x| x.eq_ignore_ascii_case(t))
         {
             return Err((i, format!("There is no label {t} to go to.")));
         }
-        if jumps && s.moves() {
+        if logic && s.moves() {
             return Err((
                 i,
-                "A script that jumps (goto, on, if, timeout) cannot also move to another pane \
-                 or tab."
+                "A script with logic (on, goto, if, set, stop...) cannot also move to another \
+                 pane or tab."
                     .into(),
             ));
         }
@@ -1591,7 +1593,8 @@ mod tests {
                 .contains("twice")
         );
         assert!(check(&["@label a", "@goto a", "@pane left"]).is_err());
-        assert!(check(&["@label a", "@pane left"]).is_ok());
+        assert!(check(&["@stop", "@pane left", "x"]).is_err());
+        assert!(check(&["@capture v=*;", "@pane left", "x"]).is_ok());
         // A snippet with script steps needs a runner, and is no
         // auto-response.
         let steps = expand(

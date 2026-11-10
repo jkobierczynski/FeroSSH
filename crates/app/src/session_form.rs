@@ -1286,6 +1286,13 @@ impl SessionForm {
                     at.push(i);
                 }
             }
+            if let Some(i) = steps.iter().position(Step::moves) {
+                return Err(format!(
+                    "Login step {}: a login script types into its own pane; pane and tab \
+                     moves are for scripts.",
+                    at.get(i).copied().unwrap_or(0) + 1
+                ));
+            }
             ferossh_config::login::check_flow(&steps).map_err(|(i, e)| {
                 format!("Login step {}: {e}", at.get(i).copied().unwrap_or(0) + 1)
             })?;
