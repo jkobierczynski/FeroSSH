@@ -1,0 +1,123 @@
+name: Attest a signed release
+
+# scripts/sign-release.ps1 runs this after it has uploaded the exes it
+# signed on the maintainer's PC to a draft release. It signs build
+# provenance attestations for the release's files as they now are, so
+# `gh attestation verify ferossh.exe -R jkobierczynski/FeroSSH` works on the
+# signed downloads too. (The release workflow already attested the
+# unsigned exes it built; BUILD-MANIFEST.json links the two by hash.)
+#
+# It attests nothing it has not checked against the original build first:
+# the draft's files could have been replaced by anyone with release write
+# access, together with BUILD-MANIFEST.json. So it takes the unsigned exes
+# and the manifest from the release run's artifacts, checks their
+# attestations from release.yml for the tag's commit
+# (scripts/release-provenance.ps1), and requires each signed exe in the
+# draft to be that unsigned exe plus a valid, timestamped Authenticode
+# signature, the agents to be the attested ones, and the draft's manifest
+# and sums to describe exactly those files.
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag, such as v1.0.0-rc2
+        required: true
+      request:
+        description: Any text; sign-release.ps1 puts a fresh id here to find its own run
+        required: false
+        default: ""
+
+# sign-release.ps1 finds its run by this name.
+run-name: Attest ${{ inputs.tag }} (${{ inputs.request }})
+
+permissions:
+  contents: read
+
+jobs:
+  attest:
+    name: Attest the release files
+    # Windows, to check the exes' Authenticode signatures.
+    runs-on: windows-latest
+    permissions:
+      # A draft release is only visible with write access.
+      contents: write
+      # The release run's artifacts: CI's unsigned exes and manifest.
+      actions: read
+      id-token: write
+      attestations: write
+    steps:
+      # The workflow's own ref (main): the checks come from there, not from
+      # anything in the release.
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Check the release files against CI's build
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.tag }}
+          # Part of the signing certificate's subject, as in sign-release.ps1.
+          SIGNER: ${{ vars.SIGNER_SUBJECT || 'Open Source Developer' }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          . scripts/release-provenance.ps1
+          Assert-GhAttestationSupport
+          $repo = $env:GITHUB_REPOSITORY
+          $tag = $env:TAG
+          if ($tag -notmatch '^v\d+\.\d+\.\d+(-[0-9A-Za-z.]+)?$') { throw "$tag is not a release tag" }
+
+          gh release download $tag -R $repo -D files `
+            -p ferossh.exe -p ferossh-desktop.exe -p SHA256SUMS.txt -p BUILD-MANIFEST.json `
+            -p 'ferostream-agent*'
+          if ($LASTEXITCODE) { throw "could not download release $tag" }
+          $files = (Resolve-Path files).Path
+
+          $build = Get-VerifiedReleaseBuild -Repository $repo -Tag $tag -OutDir "$env:RUNNER_TEMP\ci"
+          Assert-ReleaseAgents -Dir $files -Build $build -Repository $repo -Tag $tag
+
+          foreach ($exe in $ReleaseExeArtifacts.Keys) {
+            $path = Join-Path $files $exe
+            $sig = Get-AuthenticodeSignature $path
+            if ($sig.Status -ne "Valid") { throw "$exe is not validly signed: $($sig.Status) $($sig.StatusMessage)" }
+            if (-not $sig.TimeStamperCertificate) { throw "$exe has no timestamp" }
+            if ($sig.SignerCertificate.Subject -notlike "*$env:SIGNER*") { throw "$exe is signed by $($sig.SignerCertificate.Subject), not '$env:SIGNER'" }
+            if (-not (Test-SignedFromUnsigned -Signed $path -Unsigned $build.Exes[$exe])) {
+              throw "$exe differs from CI's attested unsigned exe in more than its signature"
+            }
+            "$exe = CI's build $(Get-Sha256 $build.Exes[$exe]) + signature by $($sig.SignerCertificate.Subject)" |
+              Tee-Object -Append $env:GITHUB_STEP_SUMMARY
+          }
+
+          # The draft's manifest: CI's, with the signed exes' hashes.
+          $manifest = Get-Content -Raw (Join-Path $files "BUILD-MANIFEST.json") | ConvertFrom-Json
+          if ($manifest.tag -ne $tag -or $manifest.commit -ne $build.Commit) { throw "BUILD-MANIFEST.json names $($manifest.tag) at $($manifest.commit)" }
+          if ($manifest.signing.verified_build.manifest_sha256 -ne $build.ManifestHash) { throw "BUILD-MANIFEST.json does not name CI's manifest" }
+          $expected = @($ReleaseExeArtifacts.Keys) + @($build.Manifest.files | Where-Object name -like "ferostream-agent*" | ForEach-Object name)
+          if (@($manifest.files).Count -ne $expected.Count) { throw "BUILD-MANIFEST.json lists other files than CI built" }
+          foreach ($name in $expected) {
+            $entry = @($manifest.files | Where-Object name -eq $name)
+            $ci = @($build.Manifest.files | Where-Object name -eq $name)
+            if ($entry.Count -ne 1 -or $entry[0].sha256_unsigned -ne $ci[0].sha256_unsigned -or $entry[0].sha256 -ne (Get-Sha256 (Join-Path $files $name))) {
+              throw "BUILD-MANIFEST.json's entry for $name does not match CI's build and the draft"
+            }
+          }
+
+          # The sums: one line per file, each matching the file.
+          $sums = @{}
+          foreach ($line in Get-Content (Join-Path $files "SHA256SUMS.txt")) {
+            $hash, $name = $line.TrimEnd() -split "  ", 2
+            $sums[$name] = $hash
+          }
+          if ($sums.Count -ne $expected.Count) { throw "SHA256SUMS.txt lists other files than CI built" }
+          foreach ($name in $expected) {
+            if ($sums[$name] -ne (Get-Sha256 (Join-Path $files $name))) { throw "SHA256SUMS.txt does not match $name" }
+          }
+      - uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: |
+            files/ferossh.exe
+            files/ferossh-desktop.exe
+            files/ferostream-agent*
+            files/SHA256SUMS.txt
+            files/BUILD-MANIFEST.json

@@ -1,0 +1,328 @@
+name: Release
+
+# Pushing a version tag such as v0.1.0 runs every CI check, builds the
+# release exes, signs them through SignPath when that is set up, and publishes
+# a GitHub Release with the exes, their SHA-256 sums, a release manifest
+# (BUILD-MANIFEST.json) and the notes from docs/releases/<tag>.md. The exes,
+# sums and manifest get signed build provenance attestations. A tag with a
+# hyphen (v0.2.0-rc1) makes a pre-release.
+
+on:
+  push:
+    tags: ["v*.*.*"]
+  # A dry run from the Actions tab: every step except the attestation and
+  # the GitHub Release, whose files are uploaded as a workflow artifact
+  # instead.
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  version:
+    name: Tag matches Cargo.toml
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Compare the tag with the workspace version and look for notes
+        if: github.event_name == 'push'
+        run: |
+          tag="${GITHUB_REF_NAME}"
+          version=$(sed -n '/^\[workspace.package\]/,/^\[/s/^version = "\(.*\)"/\1/p' Cargo.toml)
+          if [ "v$version" != "${tag%%-*}" ]; then
+            echo "::error::Tag $tag does not match the workspace version $version in Cargo.toml"
+            exit 1
+          fi
+          if [ ! -f "docs/releases/$tag.md" ]; then
+            echo "::error::docs/releases/$tag.md is missing; the release notes come from there"
+            exit 1
+          fi
+      # Signs a throwaway update file, so a secret that does not match
+      # crates/update/update-key.pub (or a missing public key) fails here,
+      # not after the half-hour build.
+      - name: Check the update signing key
+        env:
+          UPDATE_SIGNING_KEY: ${{ secrets.UPDATE_SIGNING_KEY }}
+        run: |
+          if [ -z "$UPDATE_SIGNING_KEY" ]; then
+            echo "No UPDATE_SIGNING_KEY secret: the release will have no update file."
+            exit 0
+          fi
+          if ! cargo run --locked -q -p ferossh-update --example sign -- 0.0.0 2000-01-01 "$RUNNER_TEMP" > /dev/null; then
+            echo "::error::UPDATE_SIGNING_KEY and crates/update/update-key.pub do not go together; commit the public key from keygen, or fix the secret"
+            exit 1
+          fi
+
+  # The same jobs as on a pull request: Windows build and tests, the Linux
+  # SSH, tmux, desktop viewer and interop tests, cargo deny, cargo audit and
+  # the fuzz smoke runs. Its Windows job uploads the release exes.
+  ci:
+    name: CI
+    needs: version
+    uses: ./.github/workflows/ci.yml
+
+  publish:
+    name: Publish the release
+    needs: ci
+    runs-on: windows-latest
+    permissions:
+      contents: write
+      # Build provenance attestations, signed through GitHub's Sigstore
+      # instance with this workflow's identity.
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: ferossh-exe
+          path: dist
+      - uses: actions/download-artifact@v4
+        with:
+          name: ferossh-desktop-viewer-exe
+          path: dist
+      # The Linux agents Run remote app copies to hosts: they go next to
+      # ferossh.exe. Not code signed (Authenticode is for Windows files);
+      # SHA256SUMS.txt and the attestation cover them.
+      - uses: actions/download-artifact@v4
+        with:
+          name: ferostream-agents
+          path: dist
+
+      # Taken before signing: these are the hashes a rebuild with
+      # scripts/build-release.ps1 reproduces (CI's reproducible build job
+      # has already checked that it does).
+      - name: Unsigned SHA-256 sums
+        shell: pwsh
+        run: |
+          Get-ChildItem dist\*.exe, dist\ferostream-agent* | Sort-Object Name | ForEach-Object {
+            "$((Get-FileHash $_.FullName -Algorithm SHA256).Hash.ToLower())  $($_.Name)"
+          } | Set-Content -Encoding ascii "$env:RUNNER_TEMP\unsigned.txt"
+
+      # Code signing through SignPath (free code signing for open source
+      # by SignPath.io, certificate by SignPath Foundation). It runs when
+      # the SIGNPATH_API_TOKEN secret and the SIGNPATH_ORGANIZATION_ID
+      # variable are set; until then the exes go out unsigned. SignPath
+      # signs only after a project approver approves the request on
+      # signpath.io, so this step waits up to six hours for that. The
+      # artifact configuration to paste into SignPath is in .signpath/.
+      #
+      # Without SignPath, the LOCAL_SIGNING repository variable set to true
+      # makes the release a draft with the unsigned exes: the maintainer
+      # signs them on their own PC (a Certum certificate on a card or in
+      # SimplySign) with scripts/sign-release.ps1, which checks them against
+      # this run's attestations, uploads them, attests them and publishes
+      # the release.
+      - name: Check for SignPath
+        id: signpath
+        shell: pwsh
+        env:
+          TOKEN: ${{ secrets.SIGNPATH_API_TOKEN }}
+          ORG: ${{ vars.SIGNPATH_ORGANIZATION_ID }}
+          LOCAL_SIGNING: ${{ vars.LOCAL_SIGNING }}
+        run: |
+          if ($env:TOKEN -and $env:ORG) {
+            "enabled=true" >> $env:GITHUB_OUTPUT
+          } elseif ($env:LOCAL_SIGNING -eq "true") {
+            "local=true" >> $env:GITHUB_OUTPUT
+            "The release is a draft until scripts/sign-release.ps1 signs and publishes it." | Tee-Object -Append $env:GITHUB_STEP_SUMMARY
+          } else {
+            "SignPath is not configured: the exes are not signed." | Tee-Object -Append $env:GITHUB_STEP_SUMMARY
+          }
+      - uses: actions/upload-artifact@v4
+        id: unsigned
+        if: steps.signpath.outputs.enabled == 'true'
+        with:
+          name: unsigned-exes
+          path: |
+            dist/ferossh.exe
+            dist/ferossh-desktop.exe
+      - uses: signpath/github-action-submit-signing-request@v3
+        if: steps.signpath.outputs.enabled == 'true'
+        with:
+          api-token: ${{ secrets.SIGNPATH_API_TOKEN }}
+          organization-id: ${{ vars.SIGNPATH_ORGANIZATION_ID }}
+          project-slug: ${{ vars.SIGNPATH_PROJECT_SLUG || 'FeroSSH' }}
+          signing-policy-slug: ${{ github.event_name == 'push' && 'release-signing' || 'test-signing' }}
+          github-artifact-id: ${{ steps.unsigned.outputs.artifact-id }}
+          wait-for-completion: true
+          wait-for-completion-timeout-in-seconds: 21600
+          output-artifact-directory: signed
+      - name: Use the signed exes
+        if: steps.signpath.outputs.enabled == 'true'
+        shell: pwsh
+        run: |
+          Copy-Item signed\ferossh.exe, signed\ferossh-desktop.exe dist\ -Force
+          foreach ($exe in Get-ChildItem dist\*.exe) {
+            $sig = Get-AuthenticodeSignature $exe.FullName
+            if ($sig.Status -ne "Valid") {
+              "::error::$($exe.Name) is not validly signed: $($sig.Status)"
+              exit 1
+            }
+            "$($exe.Name): signed by $($sig.SignerCertificate.Subject)" | Tee-Object -Append $env:GITHUB_STEP_SUMMARY
+          }
+
+      # The sums are taken after signing, so they match what is downloaded.
+      - name: SHA-256 sums
+        shell: pwsh
+        run: |
+          Push-Location dist
+          Get-ChildItem *.exe, ferostream-agent* | Sort-Object Name | ForEach-Object {
+            "$((Get-FileHash $_.Name -Algorithm SHA256).Hash.ToLower())  $($_.Name)"
+          } | Set-Content -Encoding ascii SHA256SUMS.txt
+          Get-Content SHA256SUMS.txt | Tee-Object -Append $env:GITHUB_STEP_SUMMARY
+          Pop-Location
+
+      # BUILD-MANIFEST.json says what was built from what: the tag, commit,
+      # toolchain and, per exe, its size, its SHA-256 as downloaded and its
+      # SHA-256 before signing. The attestation below signs it.
+      - name: Release manifest
+        shell: pwsh
+        env:
+          TAG: ${{ github.event_name == 'push' && github.ref_name || 'v0.0.0-dry-run' }}
+          COMMIT: ${{ github.sha }}
+          REPO: ${{ github.repository }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          $unsigned = @{}
+          foreach ($line in Get-Content "$env:RUNNER_TEMP\unsigned.txt") {
+            $hash, $name = $line -split "  ", 2
+            $unsigned[$name] = $hash
+          }
+          $toolchain = (Select-String -Path rust-toolchain.toml -Pattern '^channel = "(.*)"').Matches[0].Groups[1].Value
+          $files = Get-ChildItem dist\*.exe, dist\ferostream-agent* | Sort-Object Name | ForEach-Object {
+            $sig = if ($_.Extension -eq ".exe") { Get-AuthenticodeSignature $_.FullName } else { @{ Status = "NotApplicable" } }
+            [ordered]@{
+              name            = $_.Name
+              size            = $_.Length
+              sha256          = (Get-FileHash $_.FullName -Algorithm SHA256).Hash.ToLower()
+              sha256_unsigned = $unsigned[$_.Name]
+              authenticode    = "$($sig.Status)"
+            }
+          }
+          [ordered]@{
+            schema     = 1
+            name       = "FeroSSH"
+            version    = $env:TAG.TrimStart("v")
+            tag        = $env:TAG
+            repository = "https://github.com/$env:REPO"
+            commit     = $env:COMMIT
+            toolchain  = $toolchain
+            build      = "pwsh scripts/build-release.ps1"
+            workflow   = $env:RUN_URL
+            files      = @($files)
+          } | ConvertTo-Json -Depth 4 | Set-Content -Encoding utf8NoBOM dist\BUILD-MANIFEST.json
+          Get-Content dist\BUILD-MANIFEST.json
+
+      # Kept with the run, like the exes CI built: when the maintainer signs
+      # the exes (LOCAL_SIGNING), scripts/sign-release.ps1 and the "Attest a
+      # signed release" workflow take this manifest and the unsigned exes
+      # from the run's artifacts, not from the draft release, and check them
+      # against the attestation below before signing or attesting anything.
+      - uses: actions/upload-artifact@v4
+        with:
+          name: build-manifest
+          path: dist/BUILD-MANIFEST.json
+
+      # Verify with: gh attestation verify ferossh.exe -R jkobierczynski/FeroSSH
+      - uses: actions/attest-build-provenance@v2
+        if: github.event_name == 'push'
+        with:
+          subject-path: |
+            dist/ferossh.exe
+            dist/ferossh-desktop.exe
+            dist/ferostream-agent
+            dist/ferostream-agent-aarch64
+            dist/SHA256SUMS.txt
+            dist/BUILD-MANIFEST.json
+
+      # winget manifests for ferossh.exe, to submit to microsoft/winget-pkgs
+      # by hand (see scripts/winget-manifest.ps1). Not part of the release.
+      - name: winget manifests
+        shell: pwsh
+        env:
+          TAG: ${{ github.event_name == 'push' && github.ref_name || 'v0.0.0-dry-run' }}
+        run: pwsh scripts/winget-manifest.ps1 -Version $env:TAG.TrimStart("v") -Sums dist/SHA256SUMS.txt -OutDir winget
+      - uses: actions/upload-artifact@v4
+        with:
+          name: winget-manifests
+          path: winget
+
+      - uses: actions/upload-artifact@v4
+        if: github.event_name != 'push'
+        with:
+          name: release-dry-run
+          path: dist
+
+      # The signed update file that Help > Check for updates reads from the
+      # latest release (crates/update). It needs the UPDATE_SIGNING_KEY
+      # secret, made once with
+      # `cargo run -p ferossh-update --example keygen`; without it the
+      # release has no update file and checks say so. Pre-releases never
+      # become "latest", so they are not offered as updates.
+      - name: Update file
+        shell: pwsh
+        env:
+          UPDATE_SIGNING_KEY: ${{ secrets.UPDATE_SIGNING_KEY }}
+          TAG: ${{ github.event_name == 'push' && github.ref_name || 'v0.0.0-dry-run' }}
+        run: |
+          if (-not $env:UPDATE_SIGNING_KEY) {
+            "No UPDATE_SIGNING_KEY secret: the release has no update file." | Tee-Object -Append $env:GITHUB_STEP_SUMMARY
+            exit 0
+          }
+          $released = (Get-Date).ToUniversalTime().ToString("yyyy-MM-dd")
+          cargo run --locked -q -p ferossh-update --example sign -- $env:TAG.TrimStart("v") $released dist
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+
+      # The gh arguments are built on every run, so a dry run shows exactly
+      # what a tag would publish. They go one per line into a file and are
+      # passed as a plain array. (The if expression unrolled a one-item
+      # array to the string "--prerelease", and splatting that string as
+      # @pre passed it one character at a time, so gh saw a "-" asset.)
+      - name: Release arguments
+        shell: pwsh
+        env:
+          TAG: ${{ github.event_name == 'push' && github.ref_name || 'v0.0.0-dry-run' }}
+          SIGNED: ${{ steps.signpath.outputs.enabled }}
+          LOCAL: ${{ steps.signpath.outputs.local }}
+        run: |
+          # A dry run has no notes of its own; any release's notes will do.
+          $source = "docs/releases/$env:TAG.md"
+          if (-not (Test-Path $source)) { $source = (Get-ChildItem docs/releases/*.md | Select-Object -Last 1).FullName }
+          # Every release page says whether its exes are signed, and by whom.
+          # scripts/sign-release.ps1 puts the certificate's subject in place
+          # of <!-- signer --> once it has signed the exes.
+          $signing = if ($env:LOCAL -eq "true") {
+            "**Code signing.** ``ferossh.exe`` and ``ferossh-desktop.exe`` are signed with a Certum Open Source code signing certificate (<!-- signer -->); check Properties > Digital Signatures, or ``Get-AuthenticodeSignature .\ferossh.exe``. ``SHA256SUMS.txt`` lists the signed files, and ``BUILD-MANIFEST.json`` also gives each exe's SHA-256 before signing, which a rebuild from this tag reproduces; see [Verifying a download](https://github.com/jkobierczynski/FeroSSH/blob/main/docs/guide/verifying-downloads.md)."
+          } elseif ($env:SIGNED -eq "true") {
+            "**Code signing.** Free code signing provided by [SignPath.io](https://about.signpath.io), certificate by [SignPath Foundation](https://signpath.org). See [Code signing](https://github.com/jkobierczynski/FeroSSH#code-signing)."
+          } else {
+            "**Code signing.** These exes are not code signed yet. Check a download against ``SHA256SUMS.txt`` or with ``gh attestation verify ferossh.exe -R jkobierczynski/FeroSSH``; see [Verifying a download](https://github.com/jkobierczynski/FeroSSH/blob/main/docs/guide/verifying-downloads.md)."
+          }
+          $notes = (Get-Content -Raw $source).TrimEnd() + "`n`n---`n`n" + $signing + "`n"
+          [IO.File]::WriteAllText("$env:RUNNER_TEMP/notes.md", $notes, [Text.UTF8Encoding]::new($false))
+
+          $ghArgs = [Collections.Generic.List[string]]::new()
+          $ghArgs.AddRange([string[]]@("release", "create", $env:TAG, "--verify-tag", "--title", "FeroSSH $env:TAG", "--notes-file", "$env:RUNNER_TEMP/notes.md"))
+          if ($env:TAG.Contains("-")) { $ghArgs.Add("--prerelease") }
+          if ($env:LOCAL -eq "true") { $ghArgs.Add("--draft") }
+          foreach ($file in "ferossh.exe", "ferossh-desktop.exe", "ferostream-agent", "ferostream-agent-aarch64", "SHA256SUMS.txt", "BUILD-MANIFEST.json", "update.txt", "update.txt.sig") {
+            if (Test-Path "dist/$file") { $ghArgs.Add("dist/$file") }
+            elseif ($file -notlike "update.txt*") { "::error::dist/$file is missing"; exit 1 }
+          }
+          [IO.File]::WriteAllLines("$env:RUNNER_TEMP/gh-args.txt", $ghArgs)
+          "gh arguments:"
+          foreach ($arg in $ghArgs) { "  [$arg]" }
+
+      - name: Create the GitHub Release
+        if: github.event_name == 'push'
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          [string[]]$ghArgs = Get-Content "$env:RUNNER_TEMP/gh-args.txt"
+          gh $ghArgs
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }

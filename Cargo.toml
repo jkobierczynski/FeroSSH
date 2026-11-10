@@ -1,0 +1,65 @@
+[workspace]
+resolver = "3"
+members = ["crates/*"]
+
+[workspace.package]
+version = "1.3.0"
+edition = "2024"
+rust-version = "1.97"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/jkobierczynski/FeroSSH"
+publish = false
+
+[workspace.dependencies]
+ferossh-auth = { path = "crates/auth" }
+ferossh-config = { path = "crates/config" }
+ferossh-forward = { path = "crates/forward" }
+ferossh-ipc = { path = "crates/ipc" }
+ferossh-render = { path = "crates/render" }
+ferossh-sftp = { path = "crates/sftp" }
+ferossh-term = { path = "crates/term" }
+ferossh-tmuxcc = { path = "crates/tmuxcc" }
+ferossh-update = { path = "crates/update" }
+ferossh-viewer = { path = "crates/viewer" }
+ferossh-worker = { path = "crates/worker" }
+ferossh-zmodem = { path = "crates/zmodem" }
+
+# FeroStream (remote Linux apps as native windows): its protocol, and its
+# client as a library (the windows and the decoder). Its own repository,
+# pinned to a commit; deny.toml allows that one git source.
+ferostream-client = { git = "https://github.com/jkobierczynski/FeroStream", rev = "91d1da1e8d298b8894ced6793946fefc675bd28d" }
+ferostream-proto = { git = "https://github.com/jkobierczynski/FeroStream", rev = "91d1da1e8d298b8894ced6793946fefc675bd28d" }
+
+# Crypto backend is `ring`: russh has no pure-RustCrypto backend, and ring
+# builds with the MSVC toolchain alone (no CMake or NASM).
+russh = { version = "0.65.1", default-features = false, features = ["ring", "rsa"] }
+
+[workspace.lints.rust]
+unsafe_code = "deny"
+missing_debug_implementations = "warn"
+
+[workspace.lints.clippy]
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+indexing_slicing = "deny"
+
+[profile.release]
+opt-level = "z"
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = true
+
+# vte 0.15 shifts by 64 bits or more on an OSC colour of `#` and more than
+# 50 hex digits (parse_legacy_color). Release builds mask the shift; build
+# vte that way in debug and test builds too, so such output from a host
+# cannot stop a debug build or the fuzz regression test.
+[profile.dev.package.vte]
+overflow-checks = false
+
+# A resumed download is hashed before it is kept. Unoptimised SHA-256
+# takes about 27 s per GiB, so the interop test's 5 GiB resume would
+# outlast its deadline; build sha2 optimised in debug and test builds.
+[profile.dev.package.sha2]
+opt-level = 3

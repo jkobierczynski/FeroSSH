@@ -1,0 +1,432 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  # release.yml runs every check here before it publishes a release.
+  workflow_call:
+
+permissions:
+  contents: read
+
+# A new push to a pull request cancels the run still going for the one
+# before, so only the latest commit is built. Runs on main and release runs
+# are never cancelled.
+concurrency:
+  group: ci-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  CARGO_TERM_COLOR: always
+  # Pull requests and main keep the compiled dependencies between runs
+  # (Swatinem/rust-cache: ~/.cargo and target/, minus the workspace's own
+  # crates), so a new push only rebuilds what changed. A release builds
+  # from nothing: its exes never come from a cache.
+  USE_CACHE: ${{ github.event_name == 'pull_request' || github.ref == 'refs/heads/main' }}
+
+jobs:
+  # Whether the pull request changes anything but documentation (docs/ and
+  # Markdown files). When it does not, every job below is skipped, and a
+  # skipped job counts as passed for main's required checks. Pushes to main
+  # and releases always run everything.
+  # The jobs below run unless this job says code=false, so if this job
+  # itself fails they still run rather than being skipped (which would
+  # count as passed).
+  changes:
+    name: Changed files
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      code: ${{ steps.diff.outputs.code }}
+    steps:
+      - if: github.event_name == 'pull_request'
+        uses: actions/checkout@v4
+        with:
+          # The merge commit and its first parent, the base branch.
+          fetch-depth: 2
+      - id: diff
+        run: |
+          if [ "$GITHUB_EVENT_NAME" != pull_request ]; then
+            echo "code=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          git diff --name-only --no-renames HEAD^1 HEAD > changed.txt
+          cat changed.txt
+          if grep -qvE '^docs/|\.md$' changed.txt; then
+            echo "code=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "Only documentation changed; skipping the build and tests." | tee -a "$GITHUB_STEP_SUMMARY"
+            echo "code=false" >> "$GITHUB_OUTPUT"
+          fi
+
+  windows:
+    name: Build and test (Windows)
+    needs: changes
+    if: ${{ !cancelled() && needs.changes.outputs.code != 'false' }}
+    runs-on: windows-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      # rustup reads rust-toolchain.toml and installs the pinned toolchain.
+      - run: rustup show active-toolchain
+      - if: env.USE_CACHE == 'true'
+        uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+      - run: cargo fmt --all --check
+      - run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      # The optional built-in desktop viewer (Cargo features, off by
+      # default): VNC only, RDP only, and both.
+      - run: cargo clippy -p ferossh --all-targets --features vnc-viewer --locked -- -D warnings
+      - run: cargo clippy -p ferossh --all-targets --features rdp-viewer --locked -- -D warnings
+      - run: cargo clippy -p ferossh --all-targets --features desktop-viewer --locked -- -D warnings
+      - run: cargo test --workspace --locked
+      - run: cargo test -p ferossh --features desktop-viewer --locked
+      # Three exes: the standard one, with none of the viewer's code;
+      # ferossh-vnc.exe with the VNC viewer; ferossh-desktop.exe with the
+      # VNC and RDP viewers. The script is the reproducible release build.
+      - run: pwsh scripts/build-release.ps1
+      # Each exe starts its sandboxed processes as the window does
+      # (AppContainer, job limits, process mitigations) and checks that
+      # they run; exit code 2 means the mitigations were refused.
+      - name: Check the sandbox
+        shell: pwsh
+        run: |
+          foreach ($exe in 'ferossh', 'ferossh-vnc', 'ferossh-desktop') {
+            $p = Start-Process -FilePath "dist/$exe.exe" -ArgumentList '--check-sandbox' `
+              -Wait -PassThru -NoNewWindow -RedirectStandardOutput "check-$exe.txt"
+            "${exe}.exe --check-sandbox (exit $($p.ExitCode)):" | Tee-Object -Append $env:GITHUB_STEP_SUMMARY
+            Get-Content "check-$exe.txt" | Tee-Object -Append $env:GITHUB_STEP_SUMMARY
+            if ($p.ExitCode -ne 0) { throw "$exe.exe --check-sandbox exited with $($p.ExitCode)" }
+          }
+      - name: Check the exe's imports, CFG and CET marks
+        shell: pwsh
+        run: |
+          # The sandboxed processes run with Win32k lockdown, so nothing
+          # that needs it may be in the static import table (build.rs
+          # delay-loads it).
+          $dumpbin = & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" `
+            -latest -find 'VC\Tools\MSVC\**\bin\Hostx64\x64\dumpbin.exe' | Select-Object -First 1
+          $ui = 'user32|gdi32|imm32|comctl32|comdlg32|shell32|ole32|oleaut32|shcore|uxtheme|dwmapi|d2d1|dwrite|winhttp|webauthn|userenv|crypt32'
+          foreach ($exe in 'ferossh', 'ferossh-vnc', 'ferossh-desktop') {
+            $deps = & $dumpbin /nologo /dependents "dist/$exe.exe"
+            $static = ($deps -join "`n") -split 'delay load dependencies' | Select-Object -First 1
+            $loaded = $static -split "`n" | Where-Object { $_ -match '^\s+\S+\.dll\s*$' } | ForEach-Object { $_.Trim() }
+            "${exe}.exe loads at start: $($loaded -join ', ')" | Tee-Object -Append $env:GITHUB_STEP_SUMMARY
+            $bad = $loaded | Where-Object { $_ -match "^($ui)\.dll$" }
+            if ($bad) { throw "$exe.exe imports $($bad -join ', ') directly" }
+            $headers = (& $dumpbin /nologo /headers "dist/$exe.exe") -join "`n"
+            if ($headers -notmatch 'Control Flow Guard') { throw "$exe.exe is not built with CFG" }
+            if ($headers -notmatch 'CET compatible') { throw "$exe.exe is not marked CET compatible" }
+          }
+      - name: Report exe sizes
+        shell: pwsh
+        run: |
+          $std = (Get-Item dist/ferossh.exe).Length
+          $vnc = (Get-Item dist/ferossh-vnc.exe).Length
+          $desk = (Get-Item dist/ferossh-desktop.exe).Length
+          "ferossh.exe: $([math]::Round($std / 1KB)) KB" | Tee-Object -Append $env:GITHUB_STEP_SUMMARY
+          "ferossh-vnc.exe (VNC viewer): $([math]::Round($vnc / 1KB)) KB, +$([math]::Round(($vnc - $std) / 1KB)) KB" | Tee-Object -Append $env:GITHUB_STEP_SUMMARY
+          "ferossh-desktop.exe (VNC and RDP viewers): $([math]::Round($desk / 1KB)) KB, +$([math]::Round(($desk - $std) / 1KB)) KB (RDP: +$([math]::Round(($desk - $vnc) / 1KB)) KB)" | Tee-Object -Append $env:GITHUB_STEP_SUMMARY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ferossh-exe
+          path: dist/ferossh.exe
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ferossh-vnc-viewer-exe
+          path: dist/ferossh-vnc.exe
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ferossh-desktop-viewer-exe
+          path: dist/ferossh-desktop.exe
+
+  # Rebuilds the exes on a fresh runner, in another folder and with another
+  # CARGO_HOME, and fails unless the bytes match the Windows job's exes.
+  reproducible:
+    name: Reproducible build (Windows)
+    needs: windows
+    # Not a required check, and it waits for the Windows job and then
+    # builds all three exes again from nothing (~9 minutes), so pull
+    # requests skip it. It runs on every push to main and before every
+    # release.
+    if: github.event_name != 'pull_request'
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: elsewhere/ferossh
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: ferossh-*exe
+          path: first
+          merge-multiple: true
+      - name: Rebuild
+        shell: pwsh
+        env:
+          CARGO_HOME: ${{ runner.temp }}\cargo-home
+        working-directory: elsewhere/ferossh
+        run: |
+          rustup show active-toolchain
+          pwsh scripts/build-release.ps1
+      - name: Compare with the Windows job's exes
+        shell: pwsh
+        run: |
+          $failed = $false
+          foreach ($exe in Get-ChildItem first\*.exe | Sort-Object Name) {
+            $a = (Get-FileHash $exe.FullName -Algorithm SHA256).Hash.ToLower()
+            $b = (Get-FileHash "elsewhere\ferossh\dist\$($exe.Name)" -Algorithm SHA256).Hash.ToLower()
+            $line = if ($a -eq $b) { "same    $a  $($exe.Name)" } else { $failed = $true; "DIFFERS $a / $b  $($exe.Name)" }
+            $line | Tee-Object -Append $env:GITHUB_STEP_SUMMARY
+          }
+          if ($failed) {
+            "::error::The rebuilt exes differ from the Windows job's exes"
+            exit 1
+          }
+
+  sshd:
+    name: SSH tests against OpenSSH (Linux)
+    needs: changes
+    if: ${{ !cancelled() && needs.changes.outputs.code != 'false' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      FEROSSH_REQUIRE_SSHD: 1
+      FEROSSH_REQUIRE_PUTTYGEN: 1
+      FEROSSH_REQUIRE_TMUX: 1
+      FEROSSH_REQUIRE_TELNETD: 1
+      FEROSSH_REQUIRE_LRZSZ: 1
+      FEROSSH_REQUIRE_XVFB: 1
+      FEROSSH_REQUIRE_XVNC: 1
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup show active-toolchain
+      - if: env.USE_CACHE == 'true'
+        uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+      # The worker and the window's SSH path log in to a throwaway sshd on
+      # 127.0.0.1, and the .ppk tests make keys with puttygen; without them
+      # these tests skip, so install both. sshd needs xauth for X11
+      # forwarding, and the tmux test drives a real tmux. The security key
+      # test builds OpenSSH's software security key from the installed
+      # OpenSSH's source (interop/sk-dummy.sh), so it needs deb-src. The
+      # Telnet test talks to BusyBox's telnetd (only the static build has it).
+      # The ZMODEM tests run lrzsz's sz and rz, over pipes and in the shell.
+      # Open virtual desktop's tests start Xvfb and x11vnc, and Xvnc, through sshd.
+      - run: |
+          sudo sed -i 's/^Types: deb$/Types: deb deb-src/' /etc/apt/sources.list.d/ubuntu.sources
+          sudo apt-get update
+          sudo apt-get install -y openssh-server putty-tools xauth tmux dpkg-dev autoconf libssl-dev zlib1g-dev busybox-static lrzsz xvfb x11vnc tigervnc-standalone-server
+      - run: sudo mkdir -p /run/sshd
+      - run: cargo test --locked -p ferossh-worker --test sshd
+      - run: cargo test --locked -p ferossh-worker --test agent
+      - run: cargo test --locked -p ferossh-worker --test telnetd
+      - run: cargo test --locked -p ferossh-zmodem --test lrzsz
+      - run: interop/sk-dummy.sh "$RUNNER_TEMP/sk-dummy.so"
+      - run: cargo test --locked -p ferossh-worker --test security_keys
+        env:
+          FEROSSH_SK_DUMMY: ${{ runner.temp }}/sk-dummy.so
+          FEROSSH_REQUIRE_SK_DUMMY: 1
+      - run: cargo test --locked -p ferossh-sftp --test queue
+      - run: cargo test --locked -p ferossh ssh_e2e
+      - run: cargo test --locked -p ferossh forwards_e2e
+      - run: tmux -V
+      - run: cargo test --locked -p ferossh tmux_e2e
+      - run: cargo test --locked -p ferossh-auth keyfile
+
+  rdp:
+    name: Desktop viewers against xrdp and Xvnc (Linux)
+    needs: changes
+    if: ${{ !cancelled() && needs.changes.outputs.code != 'false' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup show active-toolchain
+      - if: env.USE_CACHE == 'true'
+        uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+      # A throwaway xrdp with an Xorg session running one xterm, whose
+      # background colour the test waits for; then it types a command.
+      - run: sudo apt-get update && sudo apt-get install -y xrdp xorgxrdp xterm xclip
+      - run: |
+          sudo useradd -m -s /bin/bash rdptest
+          echo 'rdptest:Secret-pw1' | sudo chpasswd
+          printf '#!/bin/sh\nexec xterm -geometry 80x24+10+10 -bg "#336699"\n' | sudo tee /home/rdptest/.xsession
+          sudo chmod +x /home/rdptest/.xsession
+          sudo chown rdptest /home/rdptest/.xsession
+          sudo sed -i 's/allowed_users=console/allowed_users=anybody/' /etc/X11/Xwrapper.config
+          # xrdp falls back to old RDP security without TLS when it cannot
+          # read its key, which the viewer refuses.
+          sudo adduser xrdp ssl-cert
+          sudo systemctl restart xrdp-sesman xrdp
+      - run: "cargo test --locked -p ferossh-viewer --features rdp rdp::"
+        env:
+          FEROSSH_TEST_RDP: "127.0.0.1:3389 rdptest Secret-pw1"
+      # A throwaway TigerVNC Xvnc, which takes SetDesktopSize, for the VNC
+      # viewer's resize.
+      - run: |
+          sudo apt-get install -y tigervnc-standalone-server
+          Xvnc :5 -SecurityTypes None -geometry 800x600 -rfbport 5905 -localhost yes &
+          sleep 2
+      - run: "cargo test --locked -p ferossh-viewer --features vnc real_server"
+        env:
+          FEROSSH_TEST_VNC: "127.0.0.1:5905"
+          FEROSSH_TEST_VNC_DISPLAY: ":5"
+
+  # A required check on main, so it must not hang or depend on Docker Hub:
+  # every job and long step has a timeout, and the images come from the
+  # cache unless interop/ changed.
+  interop:
+    name: Interop against older and newer servers (Linux)
+    needs: changes
+    if: ${{ !cancelled() && needs.changes.outputs.code != 'false' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      FEROSSH_REQUIRE_INTEROP: 1
+      FEROSSH_REQUIRE_TMUX: 1
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup show active-toolchain
+      - if: env.USE_CACHE == 'true'
+        uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+      # One image per Ubuntu release: OpenSSH 7.6 to 10.x, Dropbear 2017 to
+      # 2025, tmux 2.6 to 3.6. See interop/Dockerfile.
+      - id: images
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ runner.temp }}/interop-images.tar
+          key: interop-images-${{ hashFiles('interop/Dockerfile', 'interop/entrypoint.sh', 'interop/build.sh') }}
+      - if: steps.images.outputs.cache-hit == 'true'
+        run: docker load -q -i "$RUNNER_TEMP/interop-images.tar"
+      - if: steps.images.outputs.cache-hit != 'true'
+        timeout-minutes: 15
+        run: |
+          images=$(interop/build.sh)
+          docker save -o "$RUNNER_TEMP/interop-images.tar" $images
+      - if: steps.images.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ runner.temp }}/interop-images.tar
+          key: ${{ steps.images.outputs.cache-primary-key }}
+      - run: cargo test --locked -p ferossh-worker --test interop -- --nocapture
+        timeout-minutes: 15
+      # tmux 2.6 (refused), 3.0a and 3.2a (tmux layout only), 3.4, 3.6.
+      - name: tmux control mode against tmux 2.6 to 3.6
+        timeout-minutes: 10
+        run: |
+          for r in 18.04 20.04 22.04 24.04 26.04; do
+            id=$(docker run -d --entrypoint sleep ferossh-interop:$r infinity)
+            echo "::group::$(docker exec "$id" tmux -V)"
+            FEROSSH_TMUX_CONTAINER=$id cargo test --locked -p ferossh tmux_e2e
+            docker rm -f "$id" >/dev/null
+            echo "::endgroup::"
+          done
+
+  # The FeroStream agent that Run remote app copies to Linux hosts, built
+  # from the FeroStream commit Cargo.lock pins (so it speaks the same
+  # protocol as the client in ferossh.exe): static musl binaries for
+  # x86-64 and 64-bit ARM. Releases put them next to ferossh.exe.
+  agent:
+    name: FeroStream agent (Linux)
+    needs: changes
+    if: ${{ !cancelled() && needs.changes.outputs.code != 'false' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: FeroStream at the pinned commit
+        run: |
+          rev=$(grep -m1 -o 'git+https://github.com/jkobierczynski/FeroStream?rev=[0-9a-f]*#[0-9a-f]*' Cargo.lock | sed 's/.*#//')
+          test -n "$rev"
+          echo "FeroStream $rev" | tee -a "$GITHUB_STEP_SUMMARY"
+          git init -q ferostream
+          git -C ferostream fetch -q --depth 1 https://github.com/jkobierczynski/FeroStream "$rev"
+          git -C ferostream checkout -q FETCH_HEAD
+      - if: env.USE_CACHE == 'true'
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ferostream -> target
+          cache-on-failure: true
+      - name: Build
+        working-directory: ferostream
+        env:
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER: rust-lld
+        run: |
+          rustup target add x86_64-unknown-linux-musl aarch64-unknown-linux-musl
+          cargo build --release --locked -p ferostream-agent --target x86_64-unknown-linux-musl
+          cargo build --release --locked -p ferostream-agent --target aarch64-unknown-linux-musl
+          mkdir -p ../agents
+          cp target/x86_64-unknown-linux-musl/release/ferostream-agent ../agents/ferostream-agent
+          cp target/aarch64-unknown-linux-musl/release/ferostream-agent ../agents/ferostream-agent-aarch64
+          for f in ../agents/*; do
+            echo "$(basename "$f"): $(( $(stat -c %s "$f") / 1024 )) KB" | tee -a "$GITHUB_STEP_SUMMARY"
+          done
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ferostream-agents
+          path: agents
+
+  deny:
+    name: cargo deny
+    needs: changes
+    if: ${{ !cancelled() && needs.changes.outputs.code != 'false' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: EmbarkStudios/cargo-deny-action@v2
+
+  audit:
+    name: cargo audit
+    needs: changes
+    if: ${{ !cancelled() && needs.changes.outputs.code != 'false' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-audit
+      # Same exception as deny.toml; see the reason there.
+      - run: cargo audit --ignore RUSTSEC-2023-0071
+
+  fuzz:
+    name: Fuzz smoke run
+    needs: changes
+    if: ${{ !cancelled() && needs.changes.outputs.code != 'false' }}
+    runs-on: ubuntu-latest
+    # Fuzzing needs nightly, pinned to a known-good date so a nightly
+    # regression cannot turn this check red overnight: nightly-2026-11-01
+    # fails to compile ssh-key 0.7.0-rc.11 (E0391, a query cycle computing
+    # whether KeyData needs async drop). ci.yml and fuzz.yml use the same
+    # date; before moving it on, check `cargo +nightly-YYYY-MM-DD fuzz build`.
+    env:
+      FUZZ_TOOLCHAIN: nightly-2026-10-31
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup toolchain install "$FUZZ_TOOLCHAIN" --profile minimal
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-fuzz
+      # The fuzz workspace's own target/, keyed on the nightly it was built with.
+      - if: env.USE_CACHE == 'true'
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: fuzz -> target
+          key: ${{ env.FUZZ_TOOLCHAIN }}
+          cache-on-failure: true
+      # Inputs that once crashed a target start its corpus, so every run
+      # tries them again first.
+      - run: mkdir -p fuzz/corpus && cp -r fuzz/regressions/. fuzz/corpus/
+      # Builds every target once, then runs each for a minute, one per CPU
+      # at a time (all of `cargo fuzz list`, with fuzz/dicts/<target>.dict).
+      - run: fuzz/smoke.sh 60

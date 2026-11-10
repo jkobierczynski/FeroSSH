@@ -1,0 +1,68 @@
+# Sends each new FeroSSH release to winget (microsoft/winget-pkgs) as a
+# pull request, so `winget upgrade jkobierczynski.FeroSSH` finds it.
+#
+# It runs when a release is published as a full release (pre-releases are
+# skipped), which is the last step of scripts/sign-release.ps1, so winget
+# only ever gets the signed ferossh.exe. It can also be run by hand for a
+# tag.
+#
+# Needs the WINGET_TOKEN secret: a classic personal access token with the
+# public_repo scope. wingetcreate uses it to fork microsoft/winget-pkgs
+# under your account and open the pull request from that fork. Without the
+# secret the job does nothing.
+#
+# This only updates a package winget already has: the very first version
+# (1.0.1) is submitted by hand (see the README, "Releases").
+
+name: winget
+
+on:
+  release:
+    types: [released]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag to submit, for example v1.0.2
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  submit:
+    runs-on: windows-latest
+    timeout-minutes: 15
+    env:
+      WINGET_TOKEN: ${{ secrets.WINGET_TOKEN }}
+      TAG: ${{ github.event_name == 'release' && github.event.release.tag_name || inputs.tag }}
+    steps:
+      - name: Submit to winget
+        if: env.WINGET_TOKEN != ''
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          if ($env:TAG -notmatch '^v(\d+\.\d+\.\d+)$') { throw "not a release tag: $env:TAG" }
+          $version = $Matches[1]
+          $url = "https://github.com/${{ github.repository }}/releases/download/$env:TAG/ferossh.exe"
+
+          # Microsoft's own tool; refuse it unless Microsoft signed it.
+          $exe = Join-Path $env:RUNNER_TEMP "wingetcreate.exe"
+          Invoke-WebRequest https://aka.ms/wingetcreate/latest -OutFile $exe
+          $sig = Get-AuthenticodeSignature $exe
+          if ($sig.Status -ne "Valid" -or $sig.SignerCertificate.Subject -notmatch "O=Microsoft Corporation") {
+            throw "wingetcreate.exe is not signed by Microsoft: $($sig.Status) $($sig.SignerCertificate.Subject)"
+          }
+
+          # Only the signed exe goes to winget.
+          $bin = Join-Path $env:RUNNER_TEMP "ferossh.exe"
+          Invoke-WebRequest $url -OutFile $bin
+          $own = Get-AuthenticodeSignature $bin
+          if ($own.Status -ne "Valid") { throw "ferossh.exe in $env:TAG is not signed: $($own.Status)" }
+
+          & $exe update jkobierczynski.FeroSSH --version $version --urls $url `
+            --release-notes-url "https://github.com/${{ github.repository }}/releases/tag/$env:TAG" `
+            --token $env:WINGET_TOKEN --submit
+          if ($LASTEXITCODE -ne 0) { throw "wingetcreate failed ($LASTEXITCODE)" }
+      - name: No token
+        if: env.WINGET_TOKEN == ''
+        run: echo "WINGET_TOKEN is not set; nothing sent to winget."

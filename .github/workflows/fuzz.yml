@@ -1,0 +1,85 @@
+name: Fuzz campaign
+
+# The pull request job only runs each target for a minute. This runs them
+# for longer every night (and on demand), keeping each target's corpus
+# between runs so the campaign builds on the last one. A crash fails the
+# job and its input is uploaded as an artifact.
+
+on:
+  schedule:
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+    inputs:
+      minutes:
+        description: Minutes per target
+        default: "30"
+
+permissions:
+  contents: read
+
+jobs:
+  fuzz:
+    name: Fuzz ${{ matrix.target }}
+    runs-on: ubuntu-latest
+    # Fuzzing needs nightly, pinned to a known-good date so a nightly
+    # regression cannot turn this check red overnight: nightly-2026-11-01
+    # fails to compile ssh-key 0.7.0-rc.11 (E0391, a query cycle computing
+    # whether KeyData needs async drop). ci.yml and fuzz.yml use the same
+    # date; before moving it on, check `cargo +nightly-YYYY-MM-DD fuzz build`.
+    env:
+      FUZZ_TOOLCHAIN: nightly-2026-10-31
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - ipc_decode
+          - term_feed
+          - sftp_decode
+          - forward_parse
+          - tmux_feed
+          - vnc_decode
+          - rdp_decode
+          - import_parse
+          - userauth_check
+          - key_files
+          - host_config
+          - telnet_feed
+          - zmodem_feed
+          - ssh_transport
+          - login_script
+          - sanitize
+          - trigger_feed
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup toolchain install "$FUZZ_TOOLCHAIN" --profile minimal
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-fuzz
+      - uses: actions/cache@v4
+        with:
+          path: fuzz/corpus/${{ matrix.target }}
+          key: fuzz-corpus-${{ matrix.target }}-${{ github.run_id }}
+          restore-keys: fuzz-corpus-${{ matrix.target }}-
+      # Inputs that once crashed the target join the corpus kept between runs.
+      - name: Add past crashes
+        run: |
+          if [ -d fuzz/regressions/${{ matrix.target }} ]; then
+            mkdir -p fuzz/corpus/${{ matrix.target }}
+            cp fuzz/regressions/${{ matrix.target }}/* fuzz/corpus/${{ matrix.target }}/
+          fi
+      - name: Fuzz
+        env:
+          MINUTES: ${{ inputs.minutes || '30' }}
+        run: |
+          dict=fuzz/dicts/${{ matrix.target }}.dict
+          cargo "+$FUZZ_TOOLCHAIN" fuzz run --target x86_64-unknown-linux-gnu ${{ matrix.target }} -- \
+            -max_total_time=$((MINUTES * 60)) -timeout=10 -rss_limit_mb=2048 \
+            $([ -f "$dict" ] && echo "-dict=$dict")
+      - name: Shrink the corpus
+        if: success()
+        run: cargo "+$FUZZ_TOOLCHAIN" fuzz cmin --target x86_64-unknown-linux-gnu ${{ matrix.target }}
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: crash-${{ matrix.target }}
+          path: fuzz/artifacts/${{ matrix.target }}

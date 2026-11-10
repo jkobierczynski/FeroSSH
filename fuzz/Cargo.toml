@@ -1,0 +1,169 @@
+[package]
+name = "ferossh-fuzz"
+version = "0.0.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+ferossh-auth = { path = "../crates/auth" }
+ferossh-config = { path = "../crates/config" }
+ferossh-forward = { path = "../crates/forward" }
+ferossh-ipc = { path = "../crates/ipc" }
+ferossh-render = { path = "../crates/render" }
+ferossh-sftp = { path = "../crates/sftp" }
+ferossh-term = { path = "../crates/term" }
+ferossh-tmuxcc = { path = "../crates/tmuxcc" }
+ferossh-viewer = { path = "../crates/viewer", features = ["vnc", "rdp"] }
+ferossh-worker = { path = "../crates/worker" }
+ferossh-zmodem = { path = "../crates/zmodem" }
+# ssh_transport drives russh as the worker does, on a paused clock.
+russh = { version = "0.65.1", default-features = false, features = ["ring", "rsa"] }
+tokio = { version = "1.54", features = ["rt", "time", "io-util", "test-util"] }
+# login_script compiles the app's runner from its source file.
+zeroize = "1.9"
+
+# Release exes wrap on integer overflow; the fuzz build checks for it.
+# IronRDP's fast-path code turns an empty surface-bits rectangle into
+# right = left - 1 by subtracting with overflow (ironrdp-session 0.12,
+# fast_path.rs), and then skips the wrapped rectangle as outside the
+# image. Build that crate the way it ships, so the fuzzer goes on to
+# what would fail there. (Cargo passes the overflow flag only when it
+# differs from debug-assertions, which cargo-fuzz turns on.)
+[profile.release.package.ironrdp-session]
+debug-assertions = true
+overflow-checks = false
+
+# The same for vte 0.15: an OSC colour of `#` and more than 50
+# hex digits with leading zeros shifts right by 64 bits or more
+# (parse_legacy_color in ansi.rs). Release exes mask the shift and get
+# some colour.
+[profile.release.package.vte]
+debug-assertions = true
+overflow-checks = false
+
+# Kept out of the main workspace: fuzzing needs nightly and libFuzzer.
+[workspace]
+
+[[bin]]
+name = "ipc_decode"
+path = "fuzz_targets/ipc_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "term_feed"
+path = "fuzz_targets/term_feed.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "sftp_decode"
+path = "fuzz_targets/sftp_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "forward_parse"
+path = "fuzz_targets/forward_parse.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "tmux_feed"
+path = "fuzz_targets/tmux_feed.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "vnc_decode"
+path = "fuzz_targets/vnc_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "rdp_decode"
+path = "fuzz_targets/rdp_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "import_parse"
+path = "fuzz_targets/import_parse.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "userauth_check"
+path = "fuzz_targets/userauth_check.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "key_files"
+path = "fuzz_targets/key_files.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "host_config"
+path = "fuzz_targets/host_config.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "telnet_feed"
+path = "fuzz_targets/telnet_feed.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "zmodem_feed"
+path = "fuzz_targets/zmodem_feed.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "ssh_transport"
+path = "fuzz_targets/ssh_transport.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "login_script"
+path = "fuzz_targets/login_script.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "sanitize"
+path = "fuzz_targets/sanitize.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "trigger_feed"
+path = "fuzz_targets/trigger_feed.rs"
+test = false
+doc = false
+bench = false
