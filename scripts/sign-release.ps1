@@ -150,13 +150,15 @@ Invoke-Native gh @("release", "upload", $Tag, "-R", $Repository, "--clobber",
     (Join-Path $out "ferossh.exe"), (Join-Path $out "ferossh-desktop.exe"), $sums, $manifestPath)
 
 Write-Host "Attesting the signed files"
-$started = (Get-Date).ToUniversalTime()
-Invoke-Native gh @("workflow", "run", "attest-release.yml", "-R", $Repository, "-f", "tag=$Tag")
+# A fresh id in the run's name, so this waits for the run it started and
+# not for another dispatch of the workflow that happens to overlap.
+$request = [guid]::NewGuid().ToString("N")
+Invoke-Native gh @("workflow", "run", "attest-release.yml", "-R", $Repository, "-f", "tag=$Tag", "-f", "request=$request")
 $run = $null
 for ($i = 0; $i -lt 30 -and -not $run; $i++) {
     Start-Sleep -Seconds 5
-    $run = gh run list -R $Repository --workflow attest-release.yml --event workflow_dispatch --limit 5 --json databaseId,createdAt |
-        ConvertFrom-Json | Where-Object { ([datetime]$_.createdAt).ToUniversalTime() -ge $started.AddSeconds(-30) } |
+    $run = gh run list -R $Repository --workflow attest-release.yml --event workflow_dispatch --limit 20 --json databaseId,displayTitle |
+        ConvertFrom-Json | Where-Object displayTitle -eq "Attest $Tag ($request)" |
         Select-Object -First 1
 }
 if (-not $run) { throw "the attest workflow did not start; run it from the Actions tab with tag $Tag, then publish the draft" }

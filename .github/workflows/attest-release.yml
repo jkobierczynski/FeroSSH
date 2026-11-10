@@ -23,6 +23,13 @@ on:
       tag:
         description: Release tag, such as v1.0.0-rc2
         required: true
+      request:
+        description: Any text; sign-release.ps1 puts a fresh id here to find its own run
+        required: false
+        default: ""
+
+# sign-release.ps1 finds its run by this name.
+run-name: Attest ${{ inputs.tag }} (${{ inputs.request }})
 
 permissions:
   contents: read
