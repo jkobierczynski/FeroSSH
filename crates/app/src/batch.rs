@@ -156,7 +156,11 @@ fn neutral(text: &str) -> String {
     let t = text.trim();
     // A plain signed number (`-42`, `+3.5`) stays a number.
     let number = t.parse::<f64>().is_ok_and(f64::is_finite);
-    if !number && t.starts_with(['=', '+', '-', '@']) {
+    // Full-width forms too: some locales' spreadsheets read them alike.
+    let formula = [
+        '=', '+', '-', '@', '\u{ff1d}', '\u{ff0b}', '\u{ff0d}', '\u{ff20}',
+    ];
+    if !number && t.starts_with(formula) {
         format!("'{text}")
     } else {
         text.to_owned()
@@ -555,6 +559,7 @@ mod tests {
         assert_eq!(neutral(" +3.5"), " +3.5");
         assert_eq!(neutral("-2+3"), "'-2+3");
         assert_eq!(neutral("@SUM(A1)"), "'@SUM(A1)");
+        assert_eq!(neutral("\u{ff1d}1+1"), "'\u{ff1d}1+1");
     }
 
     #[test]
