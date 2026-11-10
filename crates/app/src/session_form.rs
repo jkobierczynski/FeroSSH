@@ -69,6 +69,10 @@ pub struct Values {
     pub tmux_layout: String,
     /// The server directory new shells and tmux panes start in.
     pub start_dir: String,
+    /// The folders File transfer opens for this host: on this PC, and on
+    /// the server.
+    pub local_folder: String,
+    pub remote_folder: String,
     /// One forward per entry, as `L 8080 localhost:80`.
     pub forwards: Vec<String>,
     pub desktop_port: String,
@@ -200,6 +204,8 @@ impl Values {
             .unwrap_or_default();
         self.tmux_layout = p.tmux_layout.clone().unwrap_or_default();
         self.start_dir = p.start_dir.clone().unwrap_or_default();
+        self.local_folder = p.local_folder.clone().unwrap_or_default();
+        self.remote_folder = p.remote_folder.clone().unwrap_or_default();
         self.desktop_port = opt_text(&p.desktop_port);
         self.vnc_port = opt_text(&p.vnc_port);
         self.virtual_desktop = p.virtual_desktop.clone().unwrap_or_default();
@@ -244,6 +250,8 @@ enum Field {
     TmuxSession,
     TmuxLayout,
     StartDir,
+    LocalFolder,
+    RemoteFolder,
     Forward(usize),
     DesktopPort,
     VncPort,
@@ -283,6 +291,8 @@ impl Field {
             Field::TmuxSession => "tmux name",
             Field::TmuxLayout => "tmux panes",
             Field::StartDir => "Start dir",
+            Field::LocalFolder => "Local folder",
+            Field::RemoteFolder => "Remote folder",
             Field::Forward(_) => "Forward",
             Field::DesktopPort => "RDP port",
             Field::VncPort => "VNC port",
@@ -606,6 +616,8 @@ impl SessionForm {
                 }
                 out.push(Item::Field(Field::TmuxLayout));
                 out.push(Item::Field(Field::StartDir));
+                out.push(Item::Field(Field::LocalFolder));
+                out.push(Item::Field(Field::RemoteFolder));
                 let n = self.values.forwards.len();
                 let locked = self.field_locked(Field::Forward(0));
                 for i in 0..n {
@@ -698,6 +710,8 @@ impl SessionForm {
             Field::Scrollback => &v.scrollback,
             Field::TmuxSession => &v.tmux,
             Field::StartDir => &v.start_dir,
+            Field::LocalFolder => &v.local_folder,
+            Field::RemoteFolder => &v.remote_folder,
             Field::Forward(i) => return v.forwards.get(i),
             Field::LoginStep(i) => return v.login_script.get(i),
             Field::DesktopPort => &v.desktop_port,
@@ -740,6 +754,8 @@ impl SessionForm {
             Field::Scrollback => &mut v.scrollback,
             Field::TmuxSession => &mut v.tmux,
             Field::StartDir => &mut v.start_dir,
+            Field::LocalFolder => &mut v.local_folder,
+            Field::RemoteFolder => &mut v.remote_folder,
             Field::Forward(i) => return v.forwards.get_mut(i),
             Field::LoginStep(i) => return v.login_script.get_mut(i),
             Field::DesktopPort => &mut v.desktop_port,
@@ -972,6 +988,8 @@ impl SessionForm {
             Field::Scrollback => h.scrollback.to_string(),
             Field::TmuxSession => DEFAULT_TMUX.into(),
             Field::StartDir => "home folder, or e.g. /srv/www".into(),
+            Field::LocalFolder => "File transfer, e.g. D:\\Sites".into(),
+            Field::RemoteFolder => "File transfer, e.g. /var/www".into(),
             Field::Forward(_) => "e.g. L 8080 web:80".into(),
             Field::LoginStep(0) => "e.g. expect Password:".into(),
             Field::LoginStep(_) => "next step".into(),
@@ -1272,6 +1290,14 @@ impl SessionForm {
         }
         if v.start_dir.contains('"') || v.start_dir.chars().any(char::is_control) {
             return Err("The start directory cannot hold \" or control characters.".into());
+        }
+        for (text, what) in [
+            (&v.local_folder, "local folder"),
+            (&v.remote_folder, "remote folder"),
+        ] {
+            if text.contains('"') || text.chars().any(char::is_control) {
+                return Err(format!("The {what} cannot hold \" or control characters."));
+            }
         }
         if matches!(
             v.kind,
@@ -1751,6 +1777,15 @@ impl SessionForm {
                     settings.toggle_favourite(&name);
                 }
             }
+            // File transfer bookmarks for this connection follow it.
+            for b in &mut settings.bookmarks {
+                if b.host
+                    .as_deref()
+                    .is_some_and(|h| h.eq_ignore_ascii_case(old))
+                {
+                    b.host = Some(name.clone());
+                }
+            }
         }
         let p = settings.profile_mut(&name);
         p.kind = v.kind;
@@ -1772,6 +1807,8 @@ impl SessionForm {
                 .unwrap_or_else(|| DEFAULT_TMUX.to_owned())
         });
         p.start_dir = ferossh_config::settings::start_dir(&v.start_dir);
+        p.local_folder = ferossh_config::settings::start_dir(&v.local_folder);
+        p.remote_folder = ferossh_config::settings::start_dir(&v.remote_folder);
         p.tmux_layout = trimmed(&v.tmux_layout);
         p.desktop_port = v.desktop_port.trim().parse().ok().filter(|&p| p != 0);
         p.vnc_port = v.vnc_port.trim().parse().ok().filter(|&p| p != 0);
@@ -1828,6 +1865,13 @@ pub fn delete(name: &str, hosts: &mut Vec<SavedHost>, settings: &mut Settings) {
     if settings.is_favourite(name) {
         settings.toggle_favourite(name);
     }
+    // Its File transfer bookmarks go with it: no other connection shows
+    // them, and their server folders are its server's.
+    settings.bookmarks.retain(|b| {
+        !b.host
+            .as_deref()
+            .is_some_and(|h| h.eq_ignore_ascii_case(name))
+    });
 }
 
 /// Breaks `text` into lines of at most `width` characters at spaces.
@@ -2283,8 +2327,8 @@ mod tests {
         // Password, Jump host, Look, Extras.
         down(&mut f, 11);
         f.key(SideKey::Enter { split: false }, 30);
-        // tmux, tmux panes, Start dir.
-        down(&mut f, 4);
+        // tmux, tmux panes, Start dir, Local folder, Remote folder.
+        down(&mut f, 6);
         assert_eq!(f.focused_field(), Some(Field::Forward(0)));
         typed(&mut f, "L 8080 localhost:80");
         let t = texts(&mut f);
@@ -2314,10 +2358,10 @@ mod tests {
         typed(&mut f, "sw1");
         down(&mut f, 11);
         f.key(SideKey::Enter { split: false }, 30);
-        // tmux, tmux panes, Start dir, Forward 1, RDP port, VNC port,
-        // Virtual desk, Desk size, Desk clip, Remote app, Copy agent,
-        // Clean up, App clip, Old crypto.
-        down(&mut f, 15);
+        // tmux, tmux panes, Start dir, Local folder, Remote folder,
+        // Forward 1, RDP port, VNC port, Virtual desk, Desk size, Desk
+        // clip, Remote app, Copy agent, Clean up, App clip, Old crypto.
+        down(&mut f, 17);
         assert_eq!(f.focused_field(), Some(Field::LoginStep(0)));
         let t = texts(&mut f);
         assert!(
@@ -2356,6 +2400,8 @@ mod tests {
             host: "192.168.1.159".into(),
             tmux: " Off ".into(),
             start_dir: " /srv/my site ".into(),
+            local_folder: r"D:\Sites\debian".into(),
+            remote_folder: "/var/www ".into(),
             forwards: vec![String::new()],
             ..Values::default()
         };
@@ -2371,6 +2417,8 @@ mod tests {
         assert!(!back.tmux_on);
         assert_eq!(back.tmux, "");
         assert_eq!(back.start_dir, "/srv/my site");
+        assert_eq!(back.local_folder, r"D:\Sites\debian");
+        assert_eq!(back.remote_folder, "/var/www");
 
         // On with no name, or a name of on or off, is session main.
         for name in ["", "on", "off", " ON "] {
@@ -2508,6 +2556,17 @@ mod tests {
         let mut settings = Settings::default();
         settings.toggle_favourite("old");
         settings.profile_mut("old").theme = Some("Nord".into());
+        let mark = |name: &str, host: Option<&str>| ferossh_config::settings::Bookmark {
+            name: name.into(),
+            local: None,
+            remote: Some("/srv".into()),
+            host: host.map(Into::into),
+        };
+        settings.bookmarks = vec![
+            mark("logs", Some("OLD")),
+            mark("everywhere", None),
+            mark("other", Some("other")),
+        ];
         let values = Values::from_saved(&saved_host).with_profile(settings.profile("old"));
         let mut f = SessionForm::new(
             Some("old".into()),
@@ -2529,8 +2588,18 @@ mod tests {
             Some("Nord")
         );
         assert!(settings.profile("old").is_none());
+        // Its bookmarks follow the new name; the others stay as they were.
+        let hosts_of = |s: &Settings| -> Vec<Option<String>> {
+            s.bookmarks.iter().map(|b| b.host.clone()).collect()
+        };
+        assert_eq!(
+            hosts_of(&settings),
+            [Some("new".into()), None, Some("other".into())]
+        );
         delete("new", &mut hosts, &mut settings);
         assert!(hosts.is_empty() && settings.favourites.is_empty());
+        // And go with it when it is deleted.
+        assert_eq!(hosts_of(&settings), [None, Some("other".into())]);
     }
 
     /// A choice row's options and selection; none for another row.

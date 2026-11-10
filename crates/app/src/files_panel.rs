@@ -31,7 +31,7 @@ use windows::Win32::Storage::FileSystem::{FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBU
 use windows::Win32::System::Time::{FileTimeToSystemTime, SystemTimeToTzSpecificLocalTime};
 use windows::Win32::UI::Controls::{
     BST_CHECKED, BST_UNCHECKED, CDDS_ITEMPREPAINT, CDDS_PREPAINT, CDDS_SUBITEM, CDRF_DODEFAULT,
-    CDRF_NOTIFYITEMDRAW, CDRF_NOTIFYSUBITEMDRAW, CDRF_SKIPDEFAULT, EM_SETCUEBANNER,
+    CDRF_NOTIFYITEMDRAW, CDRF_NOTIFYSUBITEMDRAW, CDRF_SKIPDEFAULT, EM_SETCUEBANNER, EM_SETSEL,
     LIST_VIEW_ITEM_STATE_FLAGS, LVCF_FMT, LVCF_TEXT, LVCF_WIDTH, LVCFMT_LEFT, LVCFMT_RIGHT,
     LVCOLUMNW, LVHITTESTINFO, LVIF_IMAGE, LVIF_PARAM, LVIF_TEXT, LVIR_BOUNDS, LVIS_DROPHILITED,
     LVIS_FOCUSED, LVIS_SELECTED, LVITEMW, LVM_DELETEALLITEMS, LVM_ENSUREVISIBLE, LVM_GETITEMCOUNT,
@@ -55,19 +55,23 @@ use windows::Win32::UI::WindowsAndMessaging::{
     BS_PUSHLIKE, CS_HREDRAW, CS_VREDRAW, CreatePopupMenu, CreateWindowExW, DefWindowProcW,
     DestroyMenu, EN_CHANGE, EN_SETFOCUS, ES_AUTOHSCROLL, GetClientRect, GetCursorPos, HMENU,
     IDC_ARROW, IDC_HAND, IDC_NO, IDC_SIZENS, IDC_SIZEWE, IDCANCEL, IDOK, IsChild, IsDialogMessageW,
-    IsWindowVisible, LoadCursorW, MF_CHECKED, MF_GRAYED, MF_SEPARATOR, MF_STRING, MSG, MoveWindow,
-    RegisterClassW, SW_HIDE, SW_SHOWNA, SendMessageW, SetCursor, SetWindowTextW, ShowWindow,
-    TPM_NONOTIFY, TPM_RETURNCMD, TrackPopupMenu, WINDOW_EX_STYLE, WINDOW_STYLE, WM_CAPTURECHANGED,
-    WM_COMMAND, WM_CONTEXTMENU, WM_ERASEBKGND, WM_KEYDOWN, WM_LBUTTONDOWN, WM_LBUTTONUP,
-    WM_MOUSEMOVE, WM_NOTIFY, WM_PAINT, WM_SETCURSOR, WM_SYSCHAR, WM_SYSKEYDOWN, WM_SYSKEYUP,
-    WNDCLASSW, WS_BORDER, WS_CHILD, WS_CLIPCHILDREN, WS_CLIPSIBLINGS, WS_EX_CONTROLPARENT,
-    WS_EX_TOPMOST, WS_POPUP, WS_TABSTOP, WS_VISIBLE, WindowFromPoint,
+    IsWindowVisible, LoadCursorW, MF_CHECKED, MF_GRAYED, MF_POPUP, MF_SEPARATOR, MF_STRING, MSG,
+    MoveWindow, RegisterClassW, SW_HIDE, SW_SHOWNA, SendMessageW, SetCursor, SetWindowTextW,
+    ShowWindow, TPM_NONOTIFY, TPM_RETURNCMD, TrackPopupMenu, WINDOW_EX_STYLE, WINDOW_STYLE,
+    WM_CAPTURECHANGED, WM_COMMAND, WM_CONTEXTMENU, WM_ERASEBKGND, WM_KEYDOWN, WM_LBUTTONDOWN,
+    WM_LBUTTONUP, WM_MOUSEMOVE, WM_NOTIFY, WM_PAINT, WM_SETCURSOR, WM_SYSCHAR, WM_SYSKEYDOWN,
+    WM_SYSKEYUP, WNDCLASSW, WS_BORDER, WS_CHILD, WS_CLIPCHILDREN, WS_CLIPSIBLINGS,
+    WS_EX_CONTROLPARENT, WS_EX_TOPMOST, WS_POPUP, WS_TABSTOP, WS_VISIBLE, WindowFromPoint,
 };
 use windows::core::{PCWSTR, PWSTR, w};
 
-use crate::files::{Arrange, FileRow, Follow, LocalPane, QueueRow, filtered, local_rows};
+use crate::files::{
+    self, Arrange, BackStep, FileRow, Follow, LocalPane, QueueRow, SyncLocal, SyncPending,
+    SyncStep, filtered, local_rows,
+};
 use crate::layout::Rect;
 use crate::native::{fonts, key_down, pass_edge, scale, search_text, set_font, wide};
+use ferossh_config::Bookmark;
 
 /// What the main window shows in the pane.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -80,6 +84,8 @@ pub struct View {
     pub key: Option<String>,
     /// The listed remote folder; empty until one is listed.
     pub remote_dir: Vec<u8>,
+    /// A remote folder is being listed.
+    pub remote_loading: bool,
     /// All of its rows, unfiltered.
     pub remote_rows: Vec<FileRow>,
     /// A line under the lists, and whether it is a problem.
@@ -93,6 +99,13 @@ pub struct View {
     /// Downloads finished so far, to read the Local list again.
     pub landed: usize,
     pub arrange: Arrange,
+    /// Every bookmark; the menu leaves out those for other hosts.
+    pub bookmarks: Vec<Bookmark>,
+    /// The connection the Remote list shows, to match bookmarks to.
+    pub alias: Option<String>,
+    /// The Local folder the host's connection names, opened when the
+    /// pane turns to that host.
+    pub local_start: Option<PathBuf>,
 }
 
 /// What a queued transfer should do.
@@ -109,6 +122,9 @@ pub enum JobOp {
 pub enum Event {
     /// List this remote folder.
     Browse(Vec<u8>),
+    /// Sync's go-back: list its remote folder, but only while the view
+    /// still shows its queue and connection.
+    SyncBack(files::SyncBack),
     Home,
     Refresh,
     /// Download these entries of the listed remote folder into `into`.
@@ -121,6 +137,13 @@ pub enum Event {
         paths: Vec<PathBuf>,
         dir: Vec<u8>,
     },
+    /// Local files and folders dragged out of the pane and let go at
+    /// `at` (main window client coordinates), on a terminal pane say:
+    /// handled like files dropped from Explorer.
+    DropOut {
+        paths: Vec<PathBuf>,
+        at: POINT,
+    },
     /// Ask, then delete these entries of the listed remote folder.
     Delete(Vec<Vec<u8>>),
     /// The Local list moved here: downloads go here from now on.
@@ -131,6 +154,8 @@ pub enum Event {
     OpenLocal(PathBuf),
     ToggleFollow,
     Arrange(Arrange),
+    /// The bookmarks as they are now (one was added, renamed or deleted).
+    Bookmarks(Vec<Bookmark>),
     Job(JobId, JobOp),
     ClearFinished,
     Answer(JobId, Choice, bool),
@@ -158,6 +183,12 @@ pub enum DropAt {
 const ID_FOLLOW: usize = 300;
 const ID_LAYOUT: usize = 301;
 const ID_FILTER: usize = 302;
+const ID_BOOKMARKS: usize = 303;
+const ID_SYNC: usize = 304;
+const ID_NAME: usize = 370;
+const ID_NAME_SAVE: usize = 371;
+const ID_NAME_CANCEL: usize = 372;
+const ID_NAME_HOST: usize = 373;
 const ID_LOCAL_UP: usize = 310;
 const ID_LOCAL_PATH: usize = 311;
 const ID_LOCAL_PICK: usize = 312;
@@ -198,7 +229,11 @@ struct Handles {
     panel: HWND,
     follow: HWND,
     layout: HWND,
+    bookmarks: HWND,
+    sync: HWND,
     filter: HWND,
+    /// The bookmark name row: the name, Save, Cancel, only this host.
+    name: [HWND; 4],
     local: Side,
     remote: Side,
     upload: HWND,
@@ -260,6 +295,58 @@ struct State {
     /// A problem with the Local list (a folder that cannot be read).
     local_error: Option<String>,
     icons: HashMap<String, i32>,
+    /// Sync browsing: opening a folder, or going up, in one list does the
+    /// same in the other.
+    sync: bool,
+    /// A bookmark name being typed: for a new bookmark, or for renaming
+    /// bookmark `Some(i)`.
+    naming: Option<Option<usize>>,
+    /// The host the pane showed, to open its connection's Local folder
+    /// when it turns to another.
+    shown_host: Option<(Option<String>, Option<String>)>,
+    /// A Sync browsing move waiting for its remote folder to list.
+    sync_pending: Option<SyncPending>,
+    /// Where the title row's buttons start: the host label ends before.
+    title_buttons_x: i32,
+    /// Inside `set_view`: the main window's state is borrowed, so events
+    /// wait in `deferred` and go out from a posted message.
+    in_view: bool,
+    deferred: Vec<Event>,
+    /// A Sync go-back waiting for the Remote list to settle.
+    going_back: Option<files::SyncBack>,
+}
+
+/// Posted to the main window when events wait in `deferred`: it hands
+/// them to [`take_deferred`].
+pub const WM_FILES_DEFERRED: u32 = windows::Win32::UI::WindowsAndMessaging::WM_APP + 41;
+
+/// The events that waited while the view was being set.
+pub fn take_deferred() -> Vec<Event> {
+    with(|s| std::mem::take(&mut s.deferred)).unwrap_or_default()
+}
+
+/// Ends `set_view`'s deferral, posting for any waiting events.
+struct ViewGuard;
+
+impl Drop for ViewGuard {
+    fn drop(&mut self) {
+        let post = with(|s| {
+            s.in_view = false;
+            (!s.deferred.is_empty()).then_some(s.h.main)
+        })
+        .flatten();
+        if let Some(main) = post {
+            // SAFETY: posting to our own main window.
+            unsafe {
+                let _ = windows::Win32::UI::WindowsAndMessaging::PostMessageW(
+                    Some(main),
+                    WM_FILES_DEFERRED,
+                    WPARAM(0),
+                    LPARAM(0),
+                );
+            }
+        }
+    }
 }
 
 thread_local! {
@@ -473,7 +560,35 @@ pub fn create(main: HWND, handler: Handler, dpi: u32) -> windows::core::Result<(
             ID_FOLLOW,
         )?;
         let layout = button(w!("Layout ▾"), ID_LAYOUT)?;
+        let bookmarks = button(w!("★ Bookmarks ▾"), ID_BOOKMARKS)?;
+        let sync = child(
+            WC_BUTTONW,
+            w!("⇆ Sync"),
+            tab | (BS_CHECKBOX | BS_PUSHLIKE) as u32,
+            ID_SYNC,
+        )?;
         let filter = edit(ID_FILTER)?;
+        let name = [
+            edit(ID_NAME)?,
+            button(w!("Save"), ID_NAME_SAVE)?,
+            button(w!("Cancel"), ID_NAME_CANCEL)?,
+            child(
+                WC_BUTTONW,
+                w!("Only for this host"),
+                tab | BS_AUTOCHECKBOX as u32,
+                ID_NAME_HOST,
+            )?,
+        ];
+        let name_cue = wide("Bookmark name");
+        SendMessageW(
+            name[0],
+            EM_SETCUEBANNER,
+            Some(WPARAM(1)),
+            Some(LPARAM(name_cue.as_ptr() as isize)),
+        );
+        for c in name {
+            let _ = ShowWindow(c, SW_HIDE);
+        }
         let cue = wide("Filter by name (both lists)");
         SendMessageW(
             filter,
@@ -536,7 +651,10 @@ pub fn create(main: HWND, handler: Handler, dpi: u32) -> windows::core::Result<(
             panel,
             follow,
             layout,
+            bookmarks,
+            sync,
             filter,
+            name,
             local,
             remote,
             upload,
@@ -578,6 +696,14 @@ pub fn create(main: HWND, handler: Handler, dpi: u32) -> windows::core::Result<(
                 lit: None,
                 local_error: None,
                 icons: HashMap::new(),
+                sync: false,
+                naming: None,
+                sync_pending: None,
+                title_buttons_x: i32::MAX,
+                in_view: false,
+                deferred: Vec::new(),
+                going_back: None,
+                shown_host: None,
             });
         });
         pass_edge(panel);
@@ -586,7 +712,8 @@ pub fn create(main: HWND, handler: Handler, dpi: u32) -> windows::core::Result<(
 }
 
 fn controls(h: &Handles) -> Vec<HWND> {
-    let mut v = vec![h.follow, h.layout, h.filter];
+    let mut v = vec![h.follow, h.layout, h.bookmarks, h.sync, h.filter];
+    v.extend(h.name);
     for s in [h.local, h.remote] {
         v.extend([s.up, s.path, s.extra, s.list]);
     }
@@ -630,6 +757,10 @@ fn add_tips(panel: HWND, instance: windows::Win32::Foundation::HINSTANCE, h: &Ha
             (h.local.extra, "Choose the Local folder"),
             (h.remote.extra, "The home folder"),
             (h.follow, "The Remote list follows the terminal's folder"),
+            (
+                h.sync,
+                "Sync browsing: opening a folder or going up in one list does the same in the other",
+            ),
         ] {
             let mut text = wide(text);
             let info = TTTOOLINFOW {
@@ -708,7 +839,7 @@ pub fn place(at: Option<Rect>, width: i32, dpi: u32) {
 /// Places every control for the panel's size, arrangement, queue and
 /// question.
 fn layout(h: &Handles) {
-    let Some((dpi, (width, height), arrange, queued, asking, status)) = with(|s| {
+    let Some((dpi, (width, height), arrange, queued, asking, status, naming)) = with(|s| {
         (
             s.dpi,
             s.size,
@@ -716,6 +847,7 @@ fn layout(h: &Handles) {
             s.queue_shown.len() as i32,
             s.view.as_ref().is_some_and(|v| v.question.is_some()),
             s.local_error.is_some() || s.view.as_ref().is_some_and(|v| v.status.is_some()),
+            s.naming.is_some(),
         )
     }) else {
         return;
@@ -750,7 +882,12 @@ fn layout(h: &Handles) {
     if status {
         bottom = status_y - px(2);
     }
-    let lists_y = filter_y + row + gap6;
+    let name_y = filter_y + row + gap6;
+    let lists_y = if naming {
+        name_y + row + gap6
+    } else {
+        filter_y + row + gap6
+    };
     let lists = Rect::new(pad, lists_y, inner, (bottom - lists_y).max(0));
     let gap_size = if arrange.stacked { px(38) } else { px(44) };
     let (local, gap, remote) = crate::files::arrange(arrange, lists, gap_size);
@@ -791,14 +928,24 @@ fn layout(h: &Handles) {
             row,
             true,
         );
-        let _ = MoveWindow(
-            h.follow,
-            pad + inner - layout_w - gap6 - follow_w,
-            (title - row) / 2,
-            follow_w,
-            row,
-            true,
-        );
+        let follow_x = pad + inner - layout_w - gap6 - follow_w;
+        let _ = MoveWindow(h.follow, follow_x, (title - row) / 2, follow_w, row, true);
+        let sync_w = px(66);
+        let sync_x = follow_x - gap6 - sync_w;
+        let _ = MoveWindow(h.sync, sync_x, (title - row) / 2, sync_w, row, true);
+        let marks_w = px(108);
+        let marks_x = sync_x - gap6 - marks_w;
+        with(|s| s.title_buttons_x = marks_x);
+        let _ = MoveWindow(h.bookmarks, marks_x, (title - row) / 2, marks_w, row, true);
+        let check_w = px(160);
+        let b = px(70);
+        let name_w = (inner - check_w - 2 * b - 3 * gap6).max(0);
+        let mut x = pad;
+        for (c, w) in h.name.iter().zip([name_w, b, b, check_w]) {
+            let _ = MoveWindow(*c, x, name_y, w, row, true);
+            let _ = ShowWindow(*c, if naming { SW_SHOWNA } else { SW_HIDE });
+            x += w + gap6;
+        }
         let _ = MoveWindow(h.filter, pad, filter_y, inner, row, true);
         let (u, d) = if arrange.stacked {
             let cx = gap.x + gap.w / 2;
@@ -1042,9 +1189,57 @@ pub fn set_view(view: View) {
     let Some(h) = handles() else {
         return;
     };
+    // Called with the main window's state borrowed: what this emits is
+    // carried out once that is released.
+    with(|s| s.in_view = true);
+    let _guard = ViewGuard;
     let changes = with(|s| {
         let old = s.view.as_ref();
         let host = old.map(|v| &v.host) != Some(&view.host);
+        // A bookmark name being typed belongs to the connection it was
+        // started on: another connection cancels it.
+        let renaming_lost =
+            s.naming.is_some() && old.is_some_and(|v| v.alias != view.alias || v.key != view.key);
+        if renaming_lost {
+            s.naming = None;
+        }
+        // A Sync move: the Local list follows once the remote folder has
+        // listed, and stays if it did not.
+        // On another queue or connection it is dropped: neither moves.
+        let alias_changed = old.is_some_and(|v| v.alias != view.alias);
+        let synced = match files::sync_step(
+            s.sync_pending.take(),
+            view.key.as_deref(),
+            alias_changed,
+            view.remote_loading,
+            &view.remote_dir,
+        ) {
+            SyncStep::Wait(p) => {
+                s.sync_pending = Some(p);
+                SyncStep::None
+            }
+            step => step,
+        };
+        // A go-back settles: say how it went.
+        if let Some(back) = s.going_back.take() {
+            let remote_error = view
+                .status
+                .as_ref()
+                .filter(|st| st.1)
+                .map(|st| st.0.as_str());
+            match files::back_step(
+                &back,
+                view.key.as_deref(),
+                alias_changed,
+                view.remote_loading,
+                &view.remote_dir,
+                remote_error,
+            ) {
+                BackStep::Wait => s.going_back = Some(back),
+                BackStep::Dropped => s.local_error = None,
+                BackStep::Done(line) => s.local_error = Some(line),
+            }
+        }
         let queue = s.queue_shown != view.queue;
         let before = (
             s.queue_shown.len(),
@@ -1055,6 +1250,25 @@ pub fn set_view(view: View) {
         if old.is_none() {
             s.arrange = view.arrange;
         }
+        // The pane turned to another host, or another connection to the
+        // same host: its connection's Local folder, else the download
+        // folder (not the last connection's Local folder).
+        let shown = (view.host.clone(), view.alias.clone());
+        let turned = s.shown_host.is_some() && s.shown_host.as_ref() != Some(&shown);
+        let first = s.shown_host.is_none();
+        let start = if turned {
+            Some(
+                view.local_start
+                    .clone()
+                    .unwrap_or_else(|| view.base.clone()),
+            )
+            .filter(|d| s.local.dir() != Some(d.as_path()))
+        } else if first {
+            view.local_start.clone()
+        } else {
+            None
+        };
+        s.shown_host = Some(shown);
         let local_changed = s.local.sync(&view.base, view.landed);
         if local_changed {
             s.local_error = None;
@@ -1067,11 +1281,41 @@ pub fn set_view(view: View) {
             view.status.is_some(),
             s.arrange,
         );
-        (before != after, host, queue)
+        (before != after || renaming_lost, host, queue, start, synced)
     });
-    let Some((relayout, host_changed, queue_changed)) = changes else {
+    let Some((relayout, host_changed, queue_changed, start, synced)) = changes else {
         return;
     };
+    if let Some(dir) = start {
+        // It does not become the download folder.
+        local_go(&h, dir, None, false);
+    }
+    match synced {
+        SyncStep::Move(p) => {
+            let moved = match p.local {
+                SyncLocal::Enter(dir) => local_go(&h, dir, None, true),
+                SyncLocal::Up => local_up(&h),
+            };
+            if !moved {
+                // Both or neither: the Remote list goes back, on the same
+                // queue; the line says how that went once it has.
+                let back = files::SyncBack {
+                    key: p.key,
+                    alias: view.alias.clone(),
+                    path: p.back,
+                };
+                with(|s| s.going_back = Some(back.clone()));
+                emit(Event::SyncBack(back));
+                local_problem(
+                    "Sync browsing: the Local folder did not open, so Remote is going back to where it was.".into(),
+                );
+            }
+        }
+        SyncStep::Failed => local_problem(
+            "Sync browsing: the Remote folder did not open, so Local stayed where it was.".into(),
+        ),
+        SyncStep::None | SyncStep::Wait(_) => {}
+    }
     refresh_local(&h, false);
     refresh_remote(&h);
     if queue_changed {
@@ -1283,10 +1527,21 @@ fn refresh_queue(h: &Handles, view: &View) {
 }
 
 fn emit(e: Event) {
-    let Some((main, handler)) = with(|s| (s.h.main, s.handler)) else {
+    let mut e = Some(e);
+    let Some((main, handler)) = with(|s| {
+        if s.in_view {
+            s.deferred.extend(e.take());
+            None
+        } else {
+            Some((s.h.main, s.handler))
+        }
+    })
+    .flatten() else {
         return;
     };
-    handler(main, e);
+    if let Some(e) = e {
+        handler(main, e);
+    }
 }
 
 /// Runs in the message loop before a message is translated and sent;
@@ -1392,6 +1647,12 @@ fn download(h: &Handles, into: Option<PathBuf>) {
 }
 
 fn local_enter(h: &Handles, dir: PathBuf, select_name: Option<Vec<u8>>) {
+    local_go(h, dir, select_name, true);
+}
+
+/// Lists local folder `dir`; `remember` makes it the download folder.
+/// Returns whether the Local list moved.
+fn local_go(h: &Handles, dir: PathBuf, select_name: Option<Vec<u8>>, remember: bool) -> bool {
     let done = with(|s| {
         let r = s.local.enter(&dir);
         if r.is_ok() {
@@ -1404,14 +1665,21 @@ fn local_enter(h: &Handles, dir: PathBuf, select_name: Option<Vec<u8>>) {
         Some(Ok(())) => {
             refresh_local(h, false);
             refresh_status(h);
-            emit(Event::SetLocal(dir));
+            if remember {
+                emit(Event::SetLocal(dir));
+            }
+            true
         }
-        Some(Err(e)) => local_problem(e),
-        None => {}
+        Some(Err(e)) => {
+            local_problem(e);
+            false
+        }
+        None => false,
     }
 }
 
-fn local_up(h: &Handles) {
+/// Returns whether the Local list moved.
+fn local_up(h: &Handles) -> bool {
     let done = with(|s| s.local.up());
     match done {
         Some(Ok(left)) => {
@@ -1428,9 +1696,13 @@ fn local_up(h: &Handles) {
             if let Some(dir) = with(|s| s.local.dir().map(PathBuf::from)).flatten() {
                 emit(Event::SetLocal(dir));
             }
+            true
         }
-        Some(Err(e)) => local_problem(e),
-        None => {}
+        Some(Err(e)) => {
+            local_problem(e);
+            false
+        }
+        None => false,
     }
 }
 
@@ -1461,22 +1733,110 @@ fn open(h: &Handles, remote: bool, index: Option<usize>) {
     let Some(row) = row else {
         return;
     };
-    match (remote, row.up, row.dir) {
-        (false, true, _) => local_up(h),
-        (true, true, _) => remote_up(),
-        (false, false, true) => {
-            if let Some(p) = row.local {
-                local_enter(h, p, None);
-            }
-        }
-        (true, false, true) => {
-            if let Some(dir) = remote_dir() {
-                emit(Event::Browse(names::join(&dir, &row.key)));
-            }
-        }
-        (false, false, false) => upload(h, None),
-        (true, false, false) => download(h, None),
+    match (row.up, row.dir) {
+        (true, _) => go_up(h, remote),
+        (false, true) => go_into(h, remote, &row),
+        (false, false) if remote => download(h, None),
+        (false, false) => upload(h, None),
     }
+}
+
+/// Whether Sync browsing is on.
+fn synced() -> bool {
+    with(|s| s.sync).unwrap_or(false)
+}
+
+/// One folder up in the Remote (`remote`) or Local list, and in the
+/// other one too with Sync browsing on: both move, or neither.
+fn go_up(h: &Handles, remote: bool) {
+    if !synced() {
+        if remote {
+            remote_up();
+        } else {
+            local_up(h);
+        }
+        return;
+    }
+    let Some(dir) = remote_dir() else {
+        // No Remote list to keep in step.
+        if !remote {
+            local_up(h);
+        }
+        return;
+    };
+    if dir.as_slice() == b"/" {
+        local_problem("Sync browsing: Remote is at / already.".into());
+        return;
+    }
+    if with(|s| s.local.dir().is_none()).unwrap_or(true) {
+        remote_up();
+        return;
+    }
+    sync_browse(names::parent(&dir), SyncLocal::Up);
+    with(|s| s.select_remote = Some(names::file_name(&dir).to_vec()));
+}
+
+/// Opens folder `row` of the Remote (`remote`) or Local list, and the
+/// folder of the same name in the other list with Sync browsing on: both
+/// open, or neither.
+fn go_into(h: &Handles, remote: bool, row: &FileRow) {
+    let open_remote = || {
+        if let Some(dir) = remote_dir() {
+            emit(Event::Browse(names::join(&dir, &row.key)));
+        }
+    };
+    if !synced() {
+        if remote {
+            open_remote();
+        } else if let Some(p) = &row.local {
+            local_enter(h, p.clone(), None);
+        }
+        return;
+    }
+    let Some(dir) = remote_dir() else {
+        if let Some(p) = row.local.as_ref().filter(|_| !remote) {
+            local_enter(h, p.clone(), None);
+        }
+        return;
+    };
+    let target = names::join(&dir, &row.key);
+    if !remote {
+        if let Some(p) = &row.local {
+            sync_browse(target, SyncLocal::Enter(p.clone()));
+        }
+        return;
+    }
+    let Some(here) = with(|s| s.local.dir().map(PathBuf::from)).flatten() else {
+        open_remote();
+        return;
+    };
+    // The server picks the name: map it to one plain local name before
+    // anything touches the file system (no `\\host\share`, drive or `..`).
+    match files::sync_local(&here, &row.key) {
+        Some(there) if there.is_dir() => sync_browse(target, SyncLocal::Enter(there)),
+        _ => local_problem(format!(
+            "Sync browsing: {} has no folder {}, so neither list moved.",
+            here.display(),
+            crate::ssh::sanitize_line(&String::from_utf8_lossy(&row.key))
+        )),
+    }
+}
+
+/// Asks for remote folder `target`; the Local list does `local` once it
+/// has listed.
+fn sync_browse(target: Vec<u8>, local: SyncLocal) {
+    let Some(back) = remote_dir() else {
+        return;
+    };
+    with(|s| {
+        s.sync_pending = Some(SyncPending {
+            key: s.view.as_ref().and_then(|v| v.key.clone()),
+            target: target.clone(),
+            back,
+            local,
+        });
+    });
+    emit(Event::Browse(target));
 }
 
 fn focused_index(list: HWND) -> Option<usize> {
@@ -1504,9 +1864,11 @@ fn command(h: &Handles, id: usize, code: u32) {
             refresh_local(h, false);
             refresh_remote(h);
         }
-        (ID_FILTER | ID_LOCAL_PATH | ID_REMOTE_PATH, EN_SETFOCUS) => emit(Event::Focused),
+        (ID_FILTER | ID_LOCAL_PATH | ID_REMOTE_PATH | ID_NAME, EN_SETFOCUS) => emit(Event::Focused),
         (id, _) if id == IDOK.0 as usize => {
-            if focus == h.local.list || focus == h.remote.list {
+            if focus == h.name[0] {
+                save_name(h);
+            } else if focus == h.local.list || focus == h.remote.list {
                 let remote = focus == h.remote.list;
                 if key_down(VK_CONTROL.0) {
                     if remote {
@@ -1539,7 +1901,9 @@ fn command(h: &Handles, id: usize, code: u32) {
             }
         }
         (id, _) if id == IDCANCEL.0 as usize => {
-            if with(|s| s.drag.is_some()).unwrap_or(false) {
+            if with(|s| s.naming.is_some()).unwrap_or(false) && h.name.contains(&focus) {
+                end_naming(h);
+            } else if with(|s| s.drag.is_some()).unwrap_or(false) {
                 // SAFETY: we hold the capture.
                 unsafe {
                     let _ = ReleaseCapture();
@@ -1555,9 +1919,33 @@ fn command(h: &Handles, id: usize, code: u32) {
         }
         (ID_FOLLOW, BN_CLICKED) => emit(Event::ToggleFollow),
         (ID_LAYOUT, BN_CLICKED) => layout_menu(h),
-        (ID_LOCAL_UP, BN_CLICKED) => local_up(h),
+        (ID_BOOKMARKS, BN_CLICKED) => bookmarks_menu(h),
+        (ID_SYNC, BN_CLICKED) => {
+            let on = with(|s| {
+                s.sync = !s.sync;
+                s.sync_pending = None;
+                s.sync
+            })
+            .unwrap_or(false);
+            // SAFETY: our own control.
+            unsafe {
+                SendMessageW(
+                    h.sync,
+                    BM_SETCHECK,
+                    Some(WPARAM(if on {
+                        BST_CHECKED.0 as usize
+                    } else {
+                        BST_UNCHECKED.0 as usize
+                    })),
+                    None,
+                );
+            }
+        }
+        (ID_NAME_SAVE, BN_CLICKED) => save_name(h),
+        (ID_NAME_CANCEL, BN_CLICKED) => end_naming(h),
+        (ID_LOCAL_UP, BN_CLICKED) => go_up(h, false),
         (ID_LOCAL_PICK, BN_CLICKED) => emit(Event::PickLocal),
-        (ID_REMOTE_UP, BN_CLICKED) => remote_up(),
+        (ID_REMOTE_UP, BN_CLICKED) => go_up(h, true),
         (ID_REMOTE_HOME, BN_CLICKED) => emit(Event::Home),
         (ID_UPLOAD, BN_CLICKED) => upload(h, None),
         (ID_DOWNLOAD, BN_CLICKED) => download(h, None),
@@ -1650,6 +2038,256 @@ fn layout_menu(h: &Handles) {
         }
         _ => {}
     }
+}
+
+/// The Bookmarks button's menu: open one, add one for the folders shown,
+/// rename or delete one.
+fn bookmarks_menu(h: &Handles) {
+    const ADD: u32 = 1;
+    const OPEN: u32 = 1000;
+    const RENAME: u32 = 2000;
+    const DELETE: u32 = 3000;
+    let Some((all, alias, can_add)) = with(|s| {
+        let v = s.view.as_ref();
+        let remote = v.is_some_and(|v| v.host.is_some() && !v.remote_dir.is_empty());
+        (
+            v.map(|v| v.bookmarks.clone()).unwrap_or_default(),
+            v.and_then(|v| v.alias.clone()),
+            remote || s.local.dir().is_some(),
+        )
+    }) else {
+        return;
+    };
+    let shown = files::bookmarks_for(&all, alias.as_deref());
+    let item = |b: &Bookmark| {
+        let place = b
+            .remote
+            .as_deref()
+            .or(b.local.as_deref())
+            .map(|p| short_path(p, 40).replace('&', "&&"))
+            .unwrap_or_default();
+        windows::core::HSTRING::from(format!("{}\t{place}", b.name.replace('&', "&&")))
+    };
+    let named = |b: &Bookmark| windows::core::HSTRING::from(b.name.replace('&', "&&"));
+    // SAFETY: popup menus of our own, destroyed (with their submenus)
+    // after use; the texts live through each call.
+    let chosen = unsafe {
+        let Ok(menu) = CreatePopupMenu() else {
+            return;
+        };
+        if shown.is_empty() {
+            let _ = AppendMenuW(menu, MF_STRING | MF_GRAYED, 0, w!("No bookmarks yet"));
+        }
+        for (n, (_, b)) in shown.iter().enumerate() {
+            let _ = AppendMenuW(menu, MF_STRING, (OPEN as usize) + n, &item(b));
+        }
+        let _ = AppendMenuW(menu, MF_SEPARATOR, 0, None);
+        let add = if can_add {
+            MF_STRING
+        } else {
+            MF_STRING | MF_GRAYED
+        };
+        let _ = AppendMenuW(menu, add, ADD as usize, w!("&Add bookmark here..."));
+        if !shown.is_empty()
+            && let (Ok(rename), Ok(delete)) = (CreatePopupMenu(), CreatePopupMenu())
+        {
+            for (n, (_, b)) in shown.iter().enumerate() {
+                let _ = AppendMenuW(rename, MF_STRING, (RENAME as usize) + n, &named(b));
+                let _ = AppendMenuW(delete, MF_STRING, (DELETE as usize) + n, &named(b));
+            }
+            let _ = AppendMenuW(menu, MF_STRING | MF_POPUP, rename.0 as usize, w!("&Rename"));
+            let _ = AppendMenuW(menu, MF_STRING | MF_POPUP, delete.0 as usize, w!("&Delete"));
+        }
+        let mut rc = RECT::default();
+        let _ = windows::Win32::UI::WindowsAndMessaging::GetWindowRect(h.bookmarks, &mut rc);
+        let chosen = TrackPopupMenu(
+            menu,
+            TPM_RETURNCMD | TPM_NONOTIFY,
+            rc.left,
+            rc.bottom,
+            None,
+            h.bookmarks,
+            None,
+        );
+        let _ = DestroyMenu(menu);
+        u32::try_from(chosen.0).unwrap_or(0)
+    };
+    let pick = |base: u32| {
+        chosen
+            .checked_sub(base)
+            .and_then(|n| shown.get(n as usize))
+            .map(|(i, b)| (*i, (*b).clone()))
+    };
+    if chosen == ADD {
+        start_naming(h, None);
+    } else if let Some((i, _)) = (chosen >= DELETE).then(|| pick(DELETE)).flatten() {
+        let out = all
+            .iter()
+            .enumerate()
+            .filter(|(n, _)| *n != i)
+            .map(|(_, b)| b.clone())
+            .collect();
+        set_bookmarks(out);
+    } else if let Some((i, _)) = (chosen >= RENAME).then(|| pick(RENAME)).flatten() {
+        start_naming(h, Some(i));
+    } else if let Some((_, b)) = (chosen >= OPEN).then(|| pick(OPEN)).flatten() {
+        open_bookmark(h, &b);
+    }
+}
+
+/// `path` cut to its last `max` characters.
+fn short_path(path: &str, max: usize) -> String {
+    let n = path.chars().count();
+    if n <= max {
+        return path.to_owned();
+    }
+    let tail: String = path.chars().skip(n - (max - 1)).collect();
+    format!("…{tail}")
+}
+
+/// Keeps `all` as the bookmarks, here and in the settings.
+fn set_bookmarks(all: Vec<Bookmark>) {
+    with(|s| {
+        if let Some(v) = s.view.as_mut() {
+            v.bookmarks.clone_from(&all);
+        }
+    });
+    emit(Event::Bookmarks(all));
+}
+
+/// Opens bookmark `b`'s folders: the local one in the Local list, the
+/// remote one in the Remote list.
+fn open_bookmark(h: &Handles, b: &Bookmark) {
+    let host = with(|s| s.view.as_ref().is_some_and(|v| v.host.is_some())).unwrap_or(false);
+    if let Some(local) = &b.local {
+        local_enter(h, PathBuf::from(local), None);
+    }
+    if let Some(remote) = &b.remote {
+        if host {
+            emit(Event::Browse(remote.as_bytes().to_vec()));
+        } else if b.local.is_none() {
+            local_problem(format!("Connect to a host to open {remote}."));
+        }
+    }
+}
+
+/// Shows the name row, to name a new bookmark (`which` `None`) for the
+/// folders shown, or to rename bookmark `which`.
+fn start_naming(h: &Handles, which: Option<usize>) {
+    let Some((name, only_host, has_alias)) = with(|s| {
+        let v = s.view.as_ref()?;
+        let remote = v
+            .host
+            .is_some()
+            .then_some(v.remote_dir.as_slice())
+            .filter(|d| !d.is_empty());
+        let (name, only_host) = match which {
+            Some(i) => {
+                let b = v.bookmarks.get(i)?;
+                (b.name.clone(), b.host.is_some())
+            }
+            // Remote folders are the host's own.
+            None => (
+                files::bookmark_suggestion(s.local.dir(), remote),
+                remote.is_some(),
+            ),
+        };
+        let has_alias = v.alias.is_some();
+        s.naming = Some(which);
+        Some((name, only_host && has_alias, has_alias))
+    })
+    .flatten() else {
+        return;
+    };
+    layout(h);
+    let text = wide(&name);
+    // SAFETY: our own controls; the text lives through the call.
+    unsafe {
+        let _ = SetWindowTextW(h.name[0], PCWSTR(text.as_ptr()));
+        let _ = SetWindowTextW(
+            h.name[1],
+            if which.is_some() {
+                w!("Rename")
+            } else {
+                w!("Add")
+            },
+        );
+        SendMessageW(
+            h.name[3],
+            BM_SETCHECK,
+            Some(WPARAM(if only_host {
+                BST_CHECKED.0 as usize
+            } else {
+                BST_UNCHECKED.0 as usize
+            })),
+            None,
+        );
+        let _ = windows::Win32::UI::Input::KeyboardAndMouse::EnableWindow(h.name[3], has_alias);
+        let _ = SetFocus(Some(h.name[0]));
+        SendMessageW(h.name[0], EM_SETSEL, Some(WPARAM(0)), Some(LPARAM(-1)));
+    }
+}
+
+/// Hides the name row.
+fn end_naming(h: &Handles) {
+    with(|s| s.naming = None);
+    layout(h);
+    // SAFETY: our own control.
+    unsafe {
+        let _ = SetFocus(Some(h.bookmarks));
+    }
+}
+
+/// Saves the bookmark named in the name row.
+fn save_name(h: &Handles) {
+    let Some(name) = files::bookmark_name(&search_text(h.name[0])) else {
+        local_problem("Type a name for the bookmark.".into());
+        return;
+    };
+    // SAFETY: our own control.
+    let only_host =
+        unsafe { SendMessageW(h.name[3], BM_GETCHECK, None, None) }.0 == BST_CHECKED.0 as isize;
+    let Some(Some((all, which, new))) = with(|s| {
+        let which = s.naming?;
+        let v = s.view.as_ref()?;
+        let host = |old: Option<&String>| {
+            only_host
+                .then(|| v.alias.clone().or_else(|| old.cloned()))
+                .flatten()
+        };
+        let new = match which {
+            Some(i) => {
+                let old = v.bookmarks.get(i)?;
+                Bookmark {
+                    name,
+                    host: host(old.host.as_ref()),
+                    ..old.clone()
+                }
+            }
+            None => Bookmark {
+                name,
+                local: s.local.dir().map(|d| d.display().to_string()),
+                remote: v
+                    .host
+                    .is_some()
+                    .then(|| String::from_utf8(v.remote_dir.clone()).ok())
+                    .flatten()
+                    .filter(|r| {
+                        !r.is_empty() && !r.contains('"') && !r.chars().any(char::is_control)
+                    }),
+                host: host(None),
+            },
+        };
+        Some((v.bookmarks.clone(), which, new))
+    }) else {
+        return;
+    };
+    if new.local.is_none() && new.remote.is_none() {
+        local_problem("Open a folder to bookmark first.".into());
+        return;
+    }
+    end_naming(h);
+    set_bookmarks(files::put_bookmark(&all, new, which));
 }
 
 /// A popup menu of `items` (id, text, checked; id 0 is a line, `u32::MAX`
@@ -2029,11 +2667,7 @@ fn notify(h: &Handles, lparam: LPARAM) -> LRESULT {
                         emit(Event::Job(id, JobOp::Cancel));
                     }
                 } else if vk == VK_BACK.0 {
-                    if remote {
-                        remote_up();
-                    } else {
-                        local_up(h);
-                    }
+                    go_up(h, remote);
                 } else if vk == VK_DELETE.0 && remote {
                     delete(h);
                 } else if vk == VK_F5.0 {
@@ -2148,12 +2782,40 @@ fn drag_move(h: &Handles, drag: Drag, x: i32, y: i32) {
                 let target = target_at(h, pt).filter(|t| t.0 != remote);
                 let list = if remote { h.local.list } else { h.remote.list };
                 light(target.and_then(|t| t.1).map(|i| (list, i as i32)));
-                let cursor = if target.is_some() { IDC_HAND } else { IDC_NO };
+                // Local files can also go out onto a terminal pane.
+                let out = !remote && outside(h, pt).is_some();
+                let cursor = if target.is_some() || out {
+                    IDC_HAND
+                } else {
+                    IDC_NO
+                };
                 if let Ok(c) = LoadCursorW(None, cursor) {
                     SetCursor(Some(c));
                 }
             }
         }
+    }
+}
+
+/// Screen point `pt` in the main window but off this pane: where, in the
+/// main window's client coordinates.
+fn outside(h: &Handles, pt: POINT) -> Option<POINT> {
+    use windows::Win32::Graphics::Gdi::ScreenToClient;
+    use windows::Win32::UI::WindowsAndMessaging::GetWindowRect;
+    let mut panel = RECT::default();
+    let mut main = RECT::default();
+    // SAFETY: plain queries on our own windows.
+    unsafe {
+        GetWindowRect(h.panel, &mut panel).ok()?;
+        GetWindowRect(h.main, &mut main).ok()?;
+        let inside =
+            |r: &RECT| pt.x >= r.left && pt.x < r.right && pt.y >= r.top && pt.y < r.bottom;
+        if inside(&panel) || !inside(&main) {
+            return None;
+        }
+        let mut at = pt;
+        let _ = ScreenToClient(h.main, &mut at);
+        Some(at)
     }
 }
 
@@ -2171,6 +2833,15 @@ fn drag_end(h: &Handles, drag: Drag, x: i32, y: i32) {
                 let _ = ClientToScreen(h.panel, &mut pt);
             }
             let Some((to_remote, folder)) = target_at(h, pt) else {
+                if let Some(at) = outside(h, pt).filter(|_| !remote) {
+                    let paths: Vec<PathBuf> = picked(h, false)
+                        .into_iter()
+                        .filter_map(|r| r.local)
+                        .collect();
+                    if !paths.is_empty() {
+                        emit(Event::DropOut { paths, at });
+                    }
+                }
                 return;
             };
             if to_remote == remote {
@@ -2195,13 +2866,14 @@ fn drag_end(h: &Handles, drag: Drag, x: i32, y: i32) {
 }
 
 fn paint(h: &Handles) {
-    let Some((title_font, font, dpi, host, labels)) = with(|s| {
+    let Some((title_font, font, dpi, host, labels, title_buttons_x)) = with(|s| {
         (
             s.title_font,
             s.font,
             s.dpi,
             s.view.as_ref().and_then(|v| v.host.clone()),
             s.labels,
+            s.title_buttons_x,
         )
     }) else {
         return;
@@ -2244,7 +2916,7 @@ fn paint(h: &Handles) {
             left: measure.right + scale(10, dpi),
             ..tr
         };
-        hr.right = hr.right.min(rc.right - scale(210, dpi));
+        hr.right = hr.right.min(title_buttons_x - scale(6, dpi));
         DrawTextW(
             dc,
             &mut host,

@@ -837,6 +837,16 @@ struct Window {
     /// focusing another pane (even on the same host) or reopening the
     /// view lists that pane's directory.
     files_pane: Option<PaneId>,
+    /// Transfer queues that started in their connection's Remote folder,
+    /// and the pane they did for: the view does not follow that pane's
+    /// shell until its next cd.
+    started_in_folder: HashMap<String, PaneId>,
+    /// Of those, the queues whose listing another pane's shell has since
+    /// moved: going back to the owner lists its Remote folder again.
+    folder_left: HashSet<String>,
+    /// The connection the file view last followed a pane of: another
+    /// connection to the same host can name another Remote folder.
+    files_alias_shown: Option<String>,
     transfer_timer: bool,
     forwards_view: ForwardsView,
     live_view: LiveView,
@@ -1586,6 +1596,9 @@ fn create_and_run(launch: Launch, theme: Option<String>) -> Result<()> {
                 sftp_routes: HashMap::new(),
                 files_key: None,
                 files_pane: None,
+                started_in_folder: HashMap::new(),
+                folder_left: HashSet::new(),
+                files_alias_shown: None,
                 transfer_timer: false,
                 forwards_view: ForwardsView::default(),
                 live_view: LiveView::default(),
@@ -4282,6 +4295,13 @@ impl Window {
                     return false;
                 }
                 if matches!(button, Some((_, true))) {
+                    if self.side.visible && !self.settings.tools_pinned {
+                        // Pin off: a click on a remote desktop ends the
+                        // peek too; the desktop does not get it.
+                        self.hide_side();
+                        self.focus_pane(id);
+                        return true;
+                    }
                     if self.focused_id() != id {
                         self.focus_pane(id);
                     }
@@ -9718,7 +9738,18 @@ impl Window {
             let id = self.mouse.pane.take()?;
             return self.pane_button(id, button, false, (x, y), mods);
         }
-        match self.spot(x, y) {
+        let spot = self.spot(x, y);
+        if self.side.visible
+            && !self.settings.tools_pinned
+            && matches!(spot, Spot::Strip(_) | Spot::Divider(_) | Spot::Nothing)
+        {
+            // Pin off: a click anywhere outside the tools (the tab strip,
+            // a divider, a pane's margin) ends the peek, as one on a pane
+            // does. The click only does that, since everything moves.
+            self.hide_side();
+            return None;
+        }
+        match spot {
             Spot::SideEdge if button == MouseButton::Left => {
                 self.capture(true);
                 self.drag = Some(Drag::SideEdge);
@@ -11427,7 +11458,13 @@ impl Window {
         let key = sftp_key(&s.target);
         let label = s.target.label();
         let connection = s.connection;
-        let cwd = p.cwd.clone().filter(|_| self.settings.follow_directory);
+        // The connection's Remote folder, else the shell's directory.
+        let folder = self.remote_folder(id).map(String::into_bytes);
+        if folder.is_some() && !self.sftp.contains_key(&key) {
+            self.folder_left.remove(&key);
+            self.started_in_folder.insert(key.clone(), id);
+        }
+        let cwd = folder.or_else(|| p.cwd.clone().filter(|_| self.settings.follow_directory));
         let (verify, parallel) = (
             self.settings.verify_transfers,
             self.settings.parallel_transfers,
@@ -11552,7 +11589,72 @@ impl Window {
         }
         if host_changed || self.files_pane != Some(id) {
             self.files_pane = Some(id);
+            let alias = self.pane_alias(id);
+            let alias_changed = alias != self.files_alias_shown;
+            self.files_alias_shown = alias;
+            // Another connection to a host already listed: its own Remote
+            // folder, if it names one.
+            if !host_changed
+                && alias_changed
+                && let Some(k) = key.clone()
+                && let Some(folder) = self.remote_folder(id)
+                && let Some(r) = self.sftp.get_mut(&k)
+            {
+                r.notice = None;
+                r.browse(folder.as_bytes());
+                self.folder_left.remove(&k);
+                self.started_in_folder.insert(k, id);
+                // Sent now: with nothing transferring, no timer would.
+                self.flush_sftp();
+                return;
+            }
+            if !host_changed
+                && alias_changed
+                && let Some(k) = &key
+            {
+                // A connection with no Remote folder of its own follows
+                // its shell.
+                self.started_in_folder.remove(k);
+                self.folder_left.remove(k);
+            }
+            if let Some(k) = &key
+                && self.started_in_folder.get(k) == Some(&id)
+            {
+                // It stays in the connection's Remote folder; following
+                // picks up from the shell's next cd. If another pane's
+                // shell moved the shared listing meanwhile, list the
+                // folder again.
+                if self.folder_left.remove(k)
+                    && let Some(folder) = self.remote_folder(id)
+                    && let Some(r) = self.sftp.get_mut(k)
+                {
+                    r.notice = None;
+                    r.browse(folder.as_bytes());
+                    self.flush_sftp();
+                }
+                return;
+            }
             self.follow_pane(id);
+        }
+    }
+
+    /// The connection name of pane `id`'s SSH host.
+    fn pane_alias(&self, id: PaneId) -> Option<String> {
+        match &self.panes.get(&self.host_pane(id))?.host {
+            Host::Ssh(s) => Some(s.target.alias.clone()),
+            _ => None,
+        }
+    }
+
+    /// The Remote folder pane `id`'s connection names for file transfer.
+    fn remote_folder(&self, id: PaneId) -> Option<String> {
+        match &self.panes.get(&self.host_pane(id))?.host {
+            Host::Ssh(s) => self
+                .settings
+                .profile(&s.target.alias)?
+                .remote_folder
+                .clone(),
+            _ => None,
         }
     }
 
@@ -11571,6 +11673,9 @@ impl Window {
             && remote.listing.path != cwd
         {
             remote.browse(&cwd);
+            if self.started_in_folder.get(&key).is_some_and(|o| *o != id) {
+                self.folder_left.insert(key);
+            }
             self.flush_sftp();
         }
     }
@@ -11591,8 +11696,14 @@ impl Window {
             p.cwd = None;
             return false;
         }
+        let moved = p.cwd.as_ref() != Some(&dir.path);
         p.cwd = Some(dir.path);
         p.cwd_reported = true;
+        if !moved {
+            // The same folder again (a new prompt): nothing to follow.
+            return false;
+        }
+        self.shell_moved(id);
         if !self.files_visible() || id != self.focused_id() {
             return false;
         }
@@ -11651,11 +11762,23 @@ impl Window {
             return false;
         }
         p.cwd = Some(path);
+        self.shell_moved(id);
         if !self.files_visible() || id != self.focused_id() {
             return false;
         }
         self.follow_pane(id);
         true
+    }
+
+    /// Pane `id`'s shell went to another folder: from now on its file
+    /// view follows the shell, even if it started in the Remote folder.
+    fn shell_moved(&mut self, id: PaneId) {
+        if let Some(key) = self.pane_sftp_key(id)
+            && self.started_in_folder.get(&key) == Some(&id)
+        {
+            self.started_in_folder.remove(&key);
+            self.folder_left.remove(&key);
+        }
     }
 
     /// Notes the folder a local shell's prompt shows, for new tabs and
@@ -11716,10 +11839,12 @@ impl Window {
                     })
                 }),
         };
+        let alias = remote.and(self.files_alias());
         files_panel::View {
             host: remote.map(|r| r.label.clone()),
             key: remote.and(self.files_key.clone()),
             remote_dir: remote.map(|r| r.listing.path.clone()).unwrap_or_default(),
+            remote_loading: remote.is_some_and(|r| r.listing.loading),
             remote_rows: remote
                 .map(|r| files::remote_rows(&r.listing, ""))
                 .unwrap_or_default(),
@@ -11730,6 +11855,23 @@ impl Window {
             base: self.download_dir(),
             landed: remote.map_or(0, files::landed),
             arrange: self.arrange(),
+            bookmarks: self.settings.bookmarks.clone(),
+            local_start: alias
+                .as_deref()
+                .and_then(|a| self.settings.profile(a))
+                .and_then(|p| p.local_folder.as_deref())
+                .map(PathBuf::from),
+            alias,
+        }
+    }
+
+    /// The connection name of the host the file transfer pane shows.
+    fn files_alias(&self) -> Option<String> {
+        self.files_key.as_ref()?;
+        let id = self.files_pane?;
+        match &self.panes.get(&self.host_pane(id))?.host {
+            Host::Ssh(s) => Some(s.target.alias.clone()),
+            _ => None,
         }
     }
 
@@ -11747,10 +11889,23 @@ impl Window {
         use files_panel::{Event, JobOp};
         let key = self.files_key.clone().filter(|k| self.sftp.contains_key(k));
         let command = match event {
+            // Handled before the window is borrowed: it asks first.
+            Event::DropOut { .. } => None,
             Event::Browse(path) => {
                 if let Some(r) = key.as_ref().and_then(|k| self.sftp.get_mut(k)) {
                     r.notice = None;
                     r.browse(&path);
+                }
+                None
+            }
+            Event::SyncBack(back) => {
+                // Only for the queue and connection it left: the view may
+                // have moved on, even to another connection on the queue.
+                if back.applies(key.as_deref(), self.files_alias().as_deref())
+                    && let Some(r) = key.as_ref().and_then(|k| self.sftp.get_mut(k))
+                {
+                    r.notice = None;
+                    r.browse(&back.path);
                 }
                 None
             }
@@ -11810,6 +11965,13 @@ impl Window {
             Event::OpenLocal(dir) => Some(Command::OpenFolder(dir)),
             Event::ToggleFollow => {
                 self.toggle_follow();
+                None
+            }
+            Event::Bookmarks(all) => {
+                if self.settings.bookmarks != all {
+                    self.settings.bookmarks = all;
+                    self.save_settings();
+                }
                 None
             }
             Event::Arrange(a) => {
@@ -12454,6 +12616,13 @@ fn dropped_files(drop: HDROP) -> (Vec<PathBuf>, POINT) {
 /// the pane they landed on.
 fn drop_files(hwnd: HWND, drop: HDROP) {
     let (paths, at) = dropped_files(drop);
+    upload_dropped(hwnd, &paths, at);
+}
+
+/// Local files let go at client point `at`, from Explorer or dragged out
+/// of File transfer's Local list: asks, then uploads them to the host of
+/// the pane they landed on.
+fn upload_dropped(hwnd: HWND, paths: &[PathBuf], at: POINT) {
     if paths.is_empty() {
         return;
     }
@@ -12466,7 +12635,7 @@ fn drop_files(hwnd: HWND, drop: HDROP) {
             return;
         }
     };
-    let what = match paths.as_slice() {
+    let what = match paths {
         [one] => format!(
             "\"{}\"",
             one.file_name()
@@ -12478,7 +12647,7 @@ fn drop_files(hwnd: HWND, drop: HDROP) {
     let host = key.rsplit_once(':').map_or(key.as_str(), |(h, _)| h);
     let text = format!("Upload {what} to {} on {host}?", names::display(&dir));
     if dialog(hwnd, &text, MB_YESNO | MB_ICONQUESTION) == Some(IDYES) {
-        with_window(|w| w.upload_files(&key, &paths, &dir));
+        with_window(|w| w.upload_files(&key, paths, &dir));
     }
 }
 
@@ -12716,6 +12885,11 @@ fn tools_have_focus() -> bool {
 
 /// Carries out what the user did in the file transfer pane.
 fn files_event(hwnd: HWND, event: files_panel::Event) {
+    // Asks first, with no window state borrowed.
+    if let files_panel::Event::DropOut { paths, at } = &event {
+        upload_dropped(hwnd, paths, *at);
+        return;
+    }
     if let Some(command) = with_window(|w| w.files_event(event)).flatten() {
         run_command(hwnd, command);
     }
@@ -14386,6 +14560,13 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
             }
             WM_CLIPBOARDUPDATE => {
                 with_window(Window::clipboard_changed);
+                LRESULT(0)
+            }
+            files_panel::WM_FILES_DEFERRED => {
+                // What the file pane emitted while the view was being set.
+                for event in files_panel::take_deferred() {
+                    files_event(hwnd, event);
+                }
                 LRESULT(0)
             }
             WM_TOOLS_FOCUS => {

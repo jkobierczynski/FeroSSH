@@ -9,6 +9,7 @@
 
 use std::path::{Path, PathBuf};
 
+use ferossh_config::Bookmark;
 use ferossh_ipc::DirEntry;
 use ferossh_sftp::{JobId, Kind, Listing, Remote, State, names};
 
@@ -448,11 +449,268 @@ pub fn split_at(a: Arrange, area: Rect, gap: i32, pos: i32) -> u8 {
     pct.clamp(MIN_SPLIT, 100 - MIN_SPLIT)
 }
 
+/// The bookmarks that go with connection `alias` (those for any host, and
+/// those for this one), with their indexes in `all`, sorted by name.
+pub fn bookmarks_for<'a>(all: &'a [Bookmark], alias: Option<&str>) -> Vec<(usize, &'a Bookmark)> {
+    let mut shown: Vec<(usize, &Bookmark)> = all
+        .iter()
+        .enumerate()
+        .filter(|(_, b)| match (&b.host, alias) {
+            (None, _) => true,
+            (Some(h), Some(a)) => h.eq_ignore_ascii_case(a),
+            (Some(_), None) => false,
+        })
+        .collect();
+    shown.sort_by_key(|(_, b)| b.name.to_lowercase());
+    shown
+}
+
+/// A bookmark name as kept: trimmed, without quotes or control
+/// characters (it is written quoted on one line); `None` when empty.
+pub fn bookmark_name(text: &str) -> Option<String> {
+    let name: String = text
+        .chars()
+        .filter(|c| *c != '"' && !c.is_control())
+        .take(60)
+        .collect();
+    let name = name.trim();
+    (!name.is_empty()).then(|| name.to_owned())
+}
+
+/// `all` with `new` added, or put in place of bookmark `replacing`; one
+/// with the same name for the same host goes.
+pub fn put_bookmark(all: &[Bookmark], new: Bookmark, replacing: Option<usize>) -> Vec<Bookmark> {
+    let mut out: Vec<Bookmark> = all
+        .iter()
+        .enumerate()
+        .filter(|(i, b)| Some(*i) != replacing && !b.same_name(&new))
+        .map(|(_, b)| b.clone())
+        .collect();
+    out.push(new);
+    out
+}
+
+/// A name for a new bookmark: the last part of the remote folder, else
+/// of the local one.
+pub fn bookmark_suggestion(local: Option<&Path>, remote: Option<&[u8]>) -> String {
+    let remote = remote
+        .map(names::file_name)
+        .filter(|n| !n.is_empty() && *n != b"/")
+        .map(|n| String::from_utf8_lossy(n).into_owned());
+    let local = local.and_then(|p| {
+        p.file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .or_else(|| Some(p.display().to_string()))
+    });
+    remote.or(local).unwrap_or_else(|| "Bookmark".to_owned())
+}
+
+/// The local folder Sync browsing opens for remote folder `remote` inside
+/// `here`: the remote name mapped the way a download names it, so it is
+/// always one plain name below `here`. `None` for a name that must not
+/// reach the local file system at all, so a server-chosen name such as
+/// `\\host\share`, `C:\` or `..` is never probed.
+pub fn sync_local(here: &Path, remote: &[u8]) -> Option<PathBuf> {
+    use std::path::Component;
+    let name = names::local_name(remote)?;
+    let mut parts = Path::new(&name).components();
+    match (parts.next(), parts.next()) {
+        (Some(Component::Normal(one)), None) if one == name.as_str() => Some(here.join(one)),
+        _ => None,
+    }
+}
+
+/// Sync browsing moves both lists or neither: the remote folder is asked
+/// for first, and the Local list moves only once it has listed. If the
+/// Local list then cannot move, the Remote list goes back.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SyncPending {
+    /// The transfer queue it was asked on.
+    pub key: Option<String>,
+    /// The remote folder asked for.
+    pub target: Vec<u8>,
+    /// The remote folder it left, to go back to.
+    pub back: Vec<u8>,
+    pub local: SyncLocal,
+}
+
+/// What the Local list does once the remote folder has listed.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SyncLocal {
+    Enter(PathBuf),
+    Up,
+}
+
+/// Where a pending Sync move stands after a new view of the Remote list.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SyncStep {
+    /// Nothing pending, or dropped: another queue or connection.
+    None,
+    /// Still listing: keep waiting.
+    Wait(SyncPending),
+    /// The remote folder listed: move the Local list (and if that fails,
+    /// browse `back`).
+    Move(SyncPending),
+    /// The remote folder did not open: the Local list stays.
+    Failed,
+}
+
+/// Resolves `pending` against the Remote list now shown: queue `key`,
+/// `alias_changed` since the last view, still `loading`, at `remote_dir`.
+pub fn sync_step(
+    pending: Option<SyncPending>,
+    key: Option<&str>,
+    alias_changed: bool,
+    loading: bool,
+    remote_dir: &[u8],
+) -> SyncStep {
+    match pending {
+        None => SyncStep::None,
+        Some(p) if p.key.as_deref() != key || alias_changed => SyncStep::None,
+        Some(p) if loading => SyncStep::Wait(p),
+        Some(p) if remote_dir == p.target.as_slice() => SyncStep::Move(p),
+        Some(_) => SyncStep::Failed,
+    }
+}
+
+/// A Sync move whose Local half failed: the Remote list is going back to
+/// `path` on queue `key`, for connection `alias`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SyncBack {
+    pub key: Option<String>,
+    pub alias: Option<String>,
+    pub path: Vec<u8>,
+}
+
+impl SyncBack {
+    /// Whether the go-back still belongs to the Remote list showing queue
+    /// `key` for connection `alias`: another connection on the same queue
+    /// has its own folder.
+    pub fn applies(&self, key: Option<&str>, alias: Option<&str>) -> bool {
+        self.key.as_deref() == key && self.alias.as_deref() == alias
+    }
+}
+
+/// Where a Remote go-back stands after a new view of the Remote list.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum BackStep {
+    /// Still listing: keep waiting.
+    Wait,
+    /// Another queue or connection now: nothing more to say.
+    Dropped,
+    /// Settled: the line to show under the lists.
+    Done(String),
+}
+
+/// Resolves go-back `back` against the Remote list now shown (see
+/// [`sync_step`]); `remote_error` is the Remote list's own problem line.
+pub fn back_step(
+    back: &SyncBack,
+    key: Option<&str>,
+    alias_changed: bool,
+    loading: bool,
+    remote_dir: &[u8],
+    remote_error: Option<&str>,
+) -> BackStep {
+    if back.key.as_deref() != key || alias_changed {
+        return BackStep::Dropped;
+    }
+    if loading {
+        return BackStep::Wait;
+    }
+    if remote_dir == back.path.as_slice() {
+        return BackStep::Done(
+            "Sync browsing: the Local folder did not open, so Remote went back to where it was."
+                .into(),
+        );
+    }
+    BackStep::Done(match remote_error {
+        Some(e) => format!(
+            "Sync browsing: the Local folder did not open, and Remote could not go back: {e}"
+        ),
+        None => {
+            "Sync browsing: the Local folder did not open, and Remote could not go back.".into()
+        }
+    })
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::indexing_slicing)]
 mod tests {
     use super::*;
     use ferossh_ipc::FileAttrs;
+
+    #[test]
+    fn sync_go_back_reports_how_it_went() {
+        let back = SyncBack {
+            key: Some("k".into()),
+            alias: Some("a".into()),
+            path: b"/srv".to_vec(),
+        };
+        assert!(back.applies(Some("k"), Some("a")));
+        assert!(
+            !back.applies(Some("k"), Some("b")),
+            "another connection on the queue"
+        );
+        assert!(!back.applies(Some("other"), Some("a")));
+        let step =
+            |key, alias, loading, dir: &[u8], err| back_step(&back, key, alias, loading, dir, err);
+        assert_eq!(
+            step(Some("k"), false, true, b"/srv/a", None),
+            BackStep::Wait
+        );
+        assert!(matches!(
+            step(Some("k"), false, false, b"/srv", None),
+            BackStep::Done(t) if t.contains("went back")
+        ));
+        assert!(matches!(
+            step(Some("k"), false, false, b"/srv/a", Some("Permission denied")),
+            BackStep::Done(t) if t.contains("could not go back: Permission denied")
+        ));
+        assert!(matches!(
+            step(Some("k"), false, false, b"/srv/a", None),
+            BackStep::Done(t) if t.contains("could not go back")
+        ));
+        assert_eq!(
+            step(Some("other"), false, false, b"/srv", None),
+            BackStep::Dropped
+        );
+        assert_eq!(
+            step(Some("k"), true, false, b"/srv", None),
+            BackStep::Dropped
+        );
+    }
+
+    #[test]
+    fn sync_moves_local_only_once_remote_listed() {
+        let p = SyncPending {
+            key: Some("k".into()),
+            target: b"/srv/a".to_vec(),
+            back: b"/srv".to_vec(),
+            local: SyncLocal::Up,
+        };
+        let step =
+            |key, alias, loading, dir: &[u8]| sync_step(Some(p.clone()), key, alias, loading, dir);
+        assert_eq!(
+            step(Some("k"), false, true, b"/srv"),
+            SyncStep::Wait(p.clone())
+        );
+        assert_eq!(
+            step(Some("k"), false, false, b"/srv/a"),
+            SyncStep::Move(p.clone())
+        );
+        // The move carries the folder to go back to if Local cannot move.
+        if let SyncStep::Move(m) = step(Some("k"), false, false, b"/srv/a") {
+            assert_eq!(m.back, b"/srv".to_vec());
+        }
+        assert_eq!(step(Some("k"), false, false, b"/srv"), SyncStep::Failed);
+        assert_eq!(step(Some("other"), false, false, b"/srv/a"), SyncStep::None);
+        assert_eq!(step(Some("k"), true, false, b"/srv/a"), SyncStep::None);
+        assert_eq!(
+            sync_step(None, Some("k"), false, false, b"/"),
+            SyncStep::None
+        );
+    }
 
     fn entry(name: &str, mode: u32, size: u64) -> DirEntry {
         DirEntry {
@@ -606,5 +864,77 @@ mod tests {
     fn rights_read_like_ls() {
         assert_eq!(rights(Some(0o100_755)), "-rwxr-xr-x");
         assert_eq!(rights(None), "");
+    }
+    fn mark(name: &str, host: Option<&str>) -> Bookmark {
+        Bookmark {
+            name: name.into(),
+            local: None,
+            remote: Some("/srv".into()),
+            host: host.map(Into::into),
+        }
+    }
+
+    #[test]
+    fn bookmarks_show_for_any_host_or_this_one() {
+        let all = [
+            mark("web", Some("prod")),
+            mark("Logs", None),
+            mark("db", Some("other")),
+        ];
+        let at = |alias| -> Vec<usize> { bookmarks_for(&all, alias).iter().map(|b| b.0).collect() };
+        assert_eq!(at(Some("PROD")), vec![1, 0]);
+        assert_eq!(at(None), vec![1]);
+    }
+
+    #[test]
+    fn a_bookmark_replaces_one_with_its_name() {
+        let all = [mark("web", Some("prod")), mark("web", None)];
+        let out = put_bookmark(&all, mark("WEB", Some("prod")), None);
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[1].name, "WEB");
+        // Renaming bookmark 1 drops the old one.
+        let out = put_bookmark(&all, mark("site", None), Some(1));
+        assert_eq!(
+            out.iter().map(|b| b.name.as_str()).collect::<Vec<_>>(),
+            ["web", "site"]
+        );
+        assert_eq!(bookmark_name("  \"my\" site\n "), Some("my site".into()));
+        assert_eq!(bookmark_name(" \" "), None);
+    }
+
+    #[test]
+    fn a_new_bookmark_is_named_after_its_folder() {
+        assert_eq!(bookmark_suggestion(None, Some(b"/var/www/")), "www");
+        assert_eq!(
+            bookmark_suggestion(Some(Path::new("/home/me/Sites")), Some(b"/")),
+            "Sites"
+        );
+        assert_eq!(bookmark_suggestion(None, None), "Bookmark");
+    }
+
+    #[test]
+    fn sync_browsing_never_leaves_the_local_folder() {
+        let here = Path::new("base");
+        assert_eq!(sync_local(here, b"logs"), Some(here.join("logs")));
+        // Mapped like a download, so the folder it would have landed in.
+        assert_eq!(sync_local(here, b"a:b"), Some(here.join("a_b")));
+        for bad in [
+            &b"\\\\host\\share"[..],
+            b"C:\\",
+            b"C:",
+            b"\\x",
+            b"..",
+            b".",
+            b"",
+            b"a/b",
+        ] {
+            let got = sync_local(here, bad);
+            assert!(
+                got.as_ref().is_none_or(|p| p.parent() == Some(here)),
+                "{bad:?} -> {got:?}"
+            );
+        }
+        assert_eq!(sync_local(here, b".."), None);
+        assert_eq!(sync_local(here, b"a/b"), None);
     }
 }
