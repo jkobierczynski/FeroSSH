@@ -42,6 +42,8 @@ mod files_panel;
 #[cfg(windows)]
 mod form_view;
 #[cfg(windows)]
+mod fwd_panel;
+#[cfg(windows)]
 mod live_panel;
 #[cfg(windows)]
 mod native;

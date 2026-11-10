@@ -116,6 +116,7 @@ use crate::form_view;
 use crate::forwards::{
     ConnView, DesktopEvent, Forwarder, FwdView, Setup as ForwardSetup, desktop_port_for,
 };
+use crate::fwd_panel;
 use crate::fwdview::{ForwardsView, FwdAction};
 use crate::import_reg;
 use crate::import_view::{Found, ImportAction, ImportView, Items};
@@ -1660,6 +1661,8 @@ fn create_and_run(launch: Launch, theme: Option<String>) -> Result<()> {
         let _ = form_view::create(hwnd, form_event, dpi);
         // The file transfer pane's, likewise.
         let _ = files_panel::create(hwnd, files_event, dpi);
+        // The port forwards pane's, likewise.
+        let _ = fwd_panel::create(hwnd, fwd_event, dpi);
         // Files dropped from Explorer are uploaded, after a confirmation.
         DragAcceptFiles(hwnd, true);
         // Clipboard changes reach a remote desktop being worked in.
@@ -1710,6 +1713,7 @@ fn create_and_run(launch: Launch, theme: Option<String>) -> Result<()> {
                 || live_panel::pre_translate(&msg)
                 || form_view::pre_translate(&msg)
                 || files_panel::pre_translate(&msg)
+                || fwd_panel::pre_translate(&msg)
             {
                 continue;
             }
@@ -4455,7 +4459,7 @@ impl Window {
                 if view.is_empty() {
                     "Log in to a host first.".to_owned()
                 } else {
-                    "Click a connection below, then Enter.".to_owned()
+                    "Choose the connection in the On box.".to_owned()
                 }
             })
     }
@@ -6623,6 +6627,11 @@ impl Window {
         self.side.visible && self.side.view == SideView::Live
     }
 
+    /// Whether port forwards show as native controls.
+    fn fwd_native(&self) -> bool {
+        self.side.visible && self.side.view == SideView::Forwards
+    }
+
     /// Whether the connection form shows as native controls (the import
     /// page is still drawn).
     fn form_native(&self) -> bool {
@@ -6657,6 +6666,8 @@ impl Window {
             live_panel::has_focus()
         } else if self.files_visible() {
             files_panel::has_focus()
+        } else if self.fwd_native() {
+            fwd_panel::has_focus()
         } else {
             false
         }
@@ -6690,6 +6701,15 @@ impl Window {
         } else {
             files_panel::place(None, 0, self.dpi);
         }
+        if self.fwd_native() {
+            fwd_panel::set_view(&self.forward_view());
+            if let Some((spec, why)) = self.forwards_view.take_notice() {
+                fwd_panel::notice(spec, why);
+            }
+            fwd_panel::place(self.areas.side, self.areas.side_width, self.dpi);
+        } else {
+            fwd_panel::place(None, 0, self.dpi);
+        }
         if let Some(form) = self.native_form().filter(|_| self.form_native()) {
             form_view::set_form(form);
             form_view::place(self.areas.side, self.areas.side_width, self.dpi);
@@ -6721,7 +6741,11 @@ impl Window {
 
     /// A native tool's controls should have the keyboard.
     fn wants_tools_focus(&self) -> bool {
-        (self.conn_native() || self.live_native() || self.form_native() || self.files_visible())
+        (self.conn_native()
+            || self.live_native()
+            || self.form_native()
+            || self.files_visible()
+            || self.fwd_native())
             && self.side.focused
     }
 
@@ -12881,6 +12905,28 @@ fn tools_have_focus() -> bool {
         || live_panel::has_focus()
         || form_view::has_focus()
         || files_panel::has_focus()
+        || fwd_panel::has_focus()
+}
+
+/// Carries out what the user did in the port forwards pane.
+fn fwd_event(hwnd: HWND, event: fwd_panel::Event) {
+    let command = match event {
+        fwd_panel::Event::Action(action) => {
+            with_window(|w| w.forwards_action(Some(action))).flatten()
+        }
+        fwd_panel::Event::Focused => {
+            with_window(|w| {
+                if !w.side.focused {
+                    w.side.focused = true;
+                    w.refresh_chrome();
+                }
+            });
+            None
+        }
+    };
+    if let Some(command) = command {
+        run_command(hwnd, command);
+    }
 }
 
 /// Carries out what the user did in the file transfer pane.
@@ -14571,13 +14617,14 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
             }
             WM_TOOLS_FOCUS => {
                 // Checked again now: a click may have moved the focus since.
-                let (want, conn, live, form, files, rename) = with_window(|w| {
+                let (want, conn, live, form, files, fwd, rename) = with_window(|w| {
                     (
                         w.wants_tools_focus(),
                         w.conn_native(),
                         w.live_native(),
                         w.form_native(),
                         w.files_visible(),
+                        w.fwd_native(),
                         w.wants_name_edit()
                             .then(|| w.live_view.renaming_pane())
                             .flatten(),
@@ -14596,6 +14643,7 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                     1 if want && conn => conn_view::focus_tree(),
                     1 if want && live => live_panel::focus_list(),
                     1 if want && files => files_panel::focus_first(),
+                    1 if want && fwd => fwd_panel::focus_first(),
                     0 if !want && tools_have_focus() => {
                         let _ = SetFocus(Some(hwnd));
                     }

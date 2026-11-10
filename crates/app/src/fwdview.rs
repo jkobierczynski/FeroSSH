@@ -81,6 +81,9 @@ pub struct ForwardsView {
     scroll: usize,
     /// The forward on the add line to be changed, and its connection.
     editing: Option<(ChannelId, ForwardSpec)>,
+    /// For the native pane: a refused forward to put back in its boxes,
+    /// and why.
+    notice: Option<(Option<ForwardSpec>, String)>,
 }
 
 fn host_port(host: &str, port: u16) -> String {
@@ -215,12 +218,20 @@ impl ForwardsView {
     /// `why` above it, so it can be retried.
     pub fn refuse(&mut self, spec: &ForwardSpec, why: String) {
         self.input = spec.to_string();
-        self.message = Some(why);
+        self.message = Some(why.clone());
+        self.notice = Some((Some(spec.clone()), why));
     }
 
     /// Shows `why` on the add line until the next key.
     pub fn say(&mut self, why: String) {
-        self.message = Some(why);
+        self.message = Some(why.clone());
+        self.notice = Some((None, why));
+    }
+
+    /// What [`refuse`](Self::refuse) or [`say`](Self::say) last left for
+    /// the native pane.
+    pub fn take_notice(&mut self) -> Option<(Option<ForwardSpec>, String)> {
+        self.notice.take()
     }
 
     /// The selected forward, if a forward is selected.
@@ -433,6 +444,187 @@ impl ForwardsView {
             grid.set_row(HEADER + y, row(&l.text, fg, bg, flags));
         }
     }
+}
+
+// ---- The native pane's model -------------------------------------------
+
+/// The kinds the native pane's Type box offers, in its order.
+pub const KINDS: [(&str, ForwardKind); 3] = [
+    ("Local (-L)", ForwardKind::Local),
+    ("Remote (-R)", ForwardKind::Remote),
+    ("SOCKS (-D)", ForwardKind::Dynamic),
+];
+
+/// One row of the native list: a forward, or a connection's X11.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FwdRow {
+    pub connection: ChannelId,
+    /// The forward's index on its connection; `None` for X11.
+    pub forward: Option<usize>,
+    /// The forward, to change or retry; `None` for X11.
+    pub spec: Option<ForwardSpec>,
+    /// Connection, Type, Listen, To, State.
+    pub cells: [String; 5],
+    /// Stopped: drawn as a problem.
+    pub bad: bool,
+    /// What the line under the list says when it is selected: why it
+    /// stopped, its open connections, its last error.
+    pub details: String,
+    /// A remote desktop's tunnel, which ends with its tab.
+    pub desktop: bool,
+}
+
+/// The native list's rows: every forward and X11 of every connection.
+pub fn native_rows(view: &[ConnView]) -> Vec<FwdRow> {
+    let mut out = Vec::new();
+    for c in view {
+        for (i, f) in c.forwards.iter().enumerate() {
+            let s = &f.spec;
+            let kind = match s.kind {
+                ForwardKind::Local => "Local",
+                ForwardKind::Remote => "Remote",
+                ForwardKind::Dynamic => "SOCKS",
+            };
+            let listen = match &f.state {
+                FwdState::Listening(at) => at.clone(),
+                FwdState::Starting | FwdState::Failed(_) => {
+                    let port = s.port.to_string();
+                    match &s.bind {
+                        Some(b) => host_port(if b.is_empty() { "*" } else { b }, s.port),
+                        None if s.kind == ForwardKind::Remote => format!("server {port}"),
+                        None => port,
+                    }
+                }
+            };
+            let to = s
+                .target
+                .as_ref()
+                .map(|(h, p)| host_port(h, *p))
+                .unwrap_or_else(|| "anywhere".into());
+            let mut state = match &f.state {
+                FwdState::Starting => "Starting".to_owned(),
+                FwdState::Failed(_) => "Stopped".to_owned(),
+                FwdState::Listening(_) if f.open > 0 => format!("{} open", f.open),
+                FwdState::Listening(_) => "Listening".to_owned(),
+            };
+            if f.desktop {
+                state.push_str(" · desktop");
+            }
+            let mut details = Vec::new();
+            if let FwdState::Failed(why) = &f.state {
+                details.push(why.clone());
+            }
+            details.extend(f.streams.iter().cloned());
+            if f.total > 0 {
+                details.push(format!("{} connections since it started", f.total));
+            }
+            if let Some(e) = &f.error {
+                details.push(format!("Last error: {e}"));
+            }
+            if f.desktop {
+                details.push("A remote desktop's tunnel: it ends with its tab.".into());
+            }
+            out.push(FwdRow {
+                connection: c.connection,
+                forward: Some(i),
+                spec: Some(s.clone()),
+                cells: [c.label.clone(), kind.into(), listen, to, state],
+                bad: matches!(f.state, FwdState::Failed(_)),
+                details: details.join("\n"),
+                desktop: f.desktop,
+            });
+        }
+        if let Some(x) = &c.x11 {
+            let mut details = Vec::new();
+            if x.total > 0 {
+                details.push(format!("{} connections since it started", x.total));
+            }
+            if let Some(e) = &x.error {
+                details.push(format!("Last error: {e}"));
+            }
+            out.push(FwdRow {
+                connection: c.connection,
+                forward: None,
+                spec: None,
+                cells: [
+                    c.label.clone(),
+                    "X11".into(),
+                    "server display".into(),
+                    x.display.clone(),
+                    if x.open > 0 {
+                        format!("{} open", x.open)
+                    } else {
+                        "On".into()
+                    },
+                ],
+                bad: false,
+                details: details.join("\n"),
+                desktop: false,
+            });
+        }
+    }
+    out
+}
+
+/// What the native form's Add (or Save) asks for.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FormInput {
+    Add(ForwardSpec),
+    /// `-KL 8080` typed in the Listen box.
+    Cancel(CancelSpec),
+}
+
+/// Reads the native form: the Type box's `kind` (an index into
+/// [`KINDS`]), the Listen box (`8080`, `127.0.0.1:8080`, or a whole
+/// `-L 8080:db:5432` or `-KL 8080`) and the To box (`db:5432`).
+pub fn form_input(kind: usize, listen: &str, to: &str) -> Result<FormInput, String> {
+    let listen = listen.trim();
+    let to = to.trim();
+    if listen.starts_with('-') {
+        if let Some(cancel) = parse_cancel(listen) {
+            return Ok(FormInput::Cancel(cancel));
+        }
+        return parse_option(listen)
+            .map(FormInput::Add)
+            .ok_or_else(|| "Try -L 8080:host:80, -R 9000:localhost:3000 or -D 1080.".into());
+    }
+    let kind = KINDS.get(kind).map_or(ForwardKind::Local, |k| k.1);
+    if listen.is_empty() {
+        return Err("Type the port to listen on, such as 8080.".into());
+    }
+    let mut text = format!("-{} {listen}", kind.letter());
+    if kind != ForwardKind::Dynamic {
+        if to.is_empty() {
+            return Err("Type where it goes, such as db:5432.".into());
+        }
+        text.push(':');
+        text.push_str(to);
+    }
+    parse_option(&text).map(FormInput::Add).ok_or_else(|| {
+        if kind == ForwardKind::Dynamic {
+            "Listen takes a port, or an address and a port: 1080, 127.0.0.1:1080.".into()
+        } else {
+            "Listen takes a port (8080) or address:port; To takes host:port (db:5432).".into()
+        }
+    })
+}
+
+/// The native form's boxes for `spec`: the Type index, Listen and To.
+pub fn form_fields(spec: &ForwardSpec) -> (usize, String, String) {
+    let kind = KINDS.iter().position(|k| k.1 == spec.kind).unwrap_or(0);
+    let listen = match &spec.bind {
+        Some(b) => {
+            let b = if b.is_empty() { "*" } else { b };
+            host_port(b, spec.port)
+        }
+        None => spec.port.to_string(),
+    };
+    let to = spec
+        .target
+        .as_ref()
+        .map(|(h, p)| host_port(h, *p))
+        .unwrap_or_default();
+    (kind, listen, to)
 }
 
 #[cfg(test)]
@@ -663,5 +855,87 @@ mod tests {
         v.refuse(&spec, "no".into());
         assert_eq!(v.input, "-L 8000:localhost:8000");
         assert_eq!(v.message.as_deref(), Some("no"));
+    }
+
+    #[test]
+    fn the_native_form_reads_and_writes_forwards() {
+        let add = |k, l, t| match form_input(k, l, t) {
+            Ok(FormInput::Add(spec)) => spec.to_string(),
+            other => format!("{other:?}"),
+        };
+        assert_eq!(add(0, "8080", "db:5432"), "-L 8080:db:5432");
+        assert_eq!(add(1, " 9000 ", "localhost:3000"), "-R 9000:localhost:3000");
+        assert_eq!(add(2, "1080", "ignored"), "-D 1080");
+        assert_eq!(add(0, "127.0.0.1:8080", "db:80"), "-L 127.0.0.1:8080:db:80");
+        assert_eq!(add(0, "8080", "[::1]:80"), "-L 8080:[::1]:80");
+        assert_eq!(add(2, "-L 1:h:2", ""), "-L 1:h:2");
+        assert!(matches!(
+            form_input(0, "-KL 8080", ""),
+            Ok(FormInput::Cancel(_))
+        ));
+        assert!(form_input(0, "", "db:1").is_err());
+        assert!(form_input(0, "8080", "").is_err());
+        assert!(form_input(0, "port", "db:1").is_err());
+        assert!(form_input(0, "8080", "db").is_err());
+        assert!(form_input(0, "-X 1", "").is_err());
+        for text in [
+            "-L 8080:db:5432",
+            "-R 9000:localhost:3000",
+            "-D 1080",
+            "-L 127.0.0.1:8080:db:80",
+            "-L *:8080:[::1]:80",
+        ] {
+            let spec = parse_option(text).unwrap();
+            let (k, l, t) = form_fields(&spec);
+            assert_eq!(form_input(k, &l, &t), Ok(FormInput::Add(spec)), "{text}");
+        }
+    }
+
+    #[test]
+    fn native_rows_list_forwards_and_x11() {
+        let view = vec![ConnView {
+            connection: 3,
+            label: "web".into(),
+            forwards: vec![
+                FwdView {
+                    spec: parse_option("-L 8080:db:5432").unwrap(),
+                    state: FwdState::Listening("127.0.0.1:8080".into()),
+                    open: 2,
+                    total: 5,
+                    streams: vec!["a → b".into()],
+                    error: None,
+                    desktop: false,
+                },
+                FwdView {
+                    spec: parse_option("-R 9000:localhost:3000").unwrap(),
+                    state: FwdState::Failed("port in use".into()),
+                    open: 0,
+                    total: 0,
+                    streams: vec![],
+                    error: Some("refused".into()),
+                    desktop: false,
+                },
+            ],
+            x11: Some(X11View {
+                display: "localhost:0".into(),
+                open: 0,
+                total: 0,
+                error: None,
+            }),
+        }];
+        let rows = native_rows(&view);
+        assert_eq!(rows.len(), 3);
+        assert_eq!(
+            rows[0].cells,
+            ["web", "Local", "127.0.0.1:8080", "db:5432", "2 open"].map(String::from)
+        );
+        assert!(rows[0].details.contains("a → b") && rows[0].details.contains("5 connections"));
+        assert_eq!(
+            rows[1].cells,
+            ["web", "Remote", "server 9000", "localhost:3000", "Stopped"].map(String::from)
+        );
+        assert!(rows[1].bad && rows[1].details.contains("port in use"));
+        assert!(rows[1].details.contains("Last error: refused"));
+        assert_eq!((rows[2].forward, rows[2].cells[1].as_str()), (None, "X11"));
     }
 }

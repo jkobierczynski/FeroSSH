@@ -309,11 +309,12 @@ On a host without SFTP, such as a console server or a Telnet device, you can use
 
 ## Port forwards
 
-`LocalForward`, `RemoteForward` and `DynamicForward` in your ssh_config, or forwards in a saved connection's Extras, start when you log in. Tools > Port forwards (Ctrl+Shift+P) lists every connection's forwards with their state and open connections. Everything there works on a live connection, without reconnecting:
+`LocalForward`, `RemoteForward` and `DynamicForward` in your ssh_config, or forwards in a saved connection's Extras, start when you log in. Tools > Port forwards (Ctrl+Shift+P) opens a pane with a form at the top and a list of every connection's forwards and X11 under it, in columns: connection, type, listen, to and state. The line under the list shows the selected forward's open connections, why it stopped and its last error. Everything there works on a live connection, without reconnecting:
 
-- **Add**: type `-L 8080:db.internal:5432`, `-R 9000:localhost:3000` or `-D 1080` and press Enter. It goes to the connection you clicked in the list, or else the focused pane's.
-- **Change**: Enter or F2 on a forward puts it on the add line, to change its port or target. A new target on the same port keeps the open connections, and sending a stopped forward back unchanged retries it.
-- **Stop**: Del on a forward, or `-KL 8080`, `-KR 9000`, `-KD 1080` by port, as `~C` does in OpenSSH.
+- **Add**: pick the type (Local `-L`, Remote `-R` or SOCKS `-D`), type the port to listen on (`8080`, or `127.0.0.1:8080`) and where it goes (`db.internal:5432`; a SOCKS forward goes anywhere), then Add or Enter. The On box picks the connection; its first entry is the focused tab's. The Listen box also takes a whole `-L 8080:db.internal:5432`, `-R 9000:localhost:3000` or `-D 1080`.
+- **Change**: Edit, Enter, F2 or a double click on a forward puts it in the form; Save changes its port or target, and Escape leaves it as it was. A new target on the same port keeps the open connections.
+- **Retry**: Retry (or the right-click menu) starts a stopped forward again.
+- **Stop**: Stop, Del or the right-click menu on a forward, or `-KL 8080`, `-KR 9000`, `-KD 1080` in the Listen box by port, as `~C` does in OpenSSH.
 
 Changes last through the tab's reconnects; the saved connection is left as it was. A dynamic forward is a SOCKS 4, 4a and 5 proxy. Local listeners take `127.0.0.1` and `::1` unless you give an address (`*:8080`, or `GatewayPorts yes`). A tab whose connection forwards shows `⇄`, in amber when the server can reach back into your PC (remote forwards or X11).
 
@@ -402,7 +403,7 @@ The font menu lists eighteen monospace fonts. Cascadia Mono, Cascadia Code, Cons
 
 There are forty-two themes, in three columns of Settings > Theme. The dark ones are Nord (the default), Ayu Mirage, Carbonfox, Catppuccin Frappé, Macchiato and Mocha, Dracula, Everforest, GitHub Dark, Gruvbox Dark, Gruvbox Material, Kanagawa Dragon and Wave, Monokai, Night Owl, Nightfox, One Dark, Rosé Pine and Rosé Pine Moon, Snazzy, Solarized Dark, Tokyo Night and Tokyo Night Storm, Tomorrow Night and Tomorrow Night Eighties. The light ones are Ayu Light, Catppuccin Latte, Dawnfox, Everforest Light, GitHub Light, Gruvbox Light, Kanagawa Lotus, Rosé Pine Dawn, Solarized Light, Tokyo Night Day and Tomorrow. The classics are Campbell, One Half Dark, One Half Light, Tango Dark and Tango Light from Windows Terminal, and PuTTY's own colours. Every theme's text reads at 4.5:1 contrast or better. Two more are warnings: **Production** (red) and **Staging** (amber). Rules pick the theme by host pattern or ssh_config `Tag`, so production servers always look like production; hosts tagged `production`, `staging` or `development` get Production, Staging or Nord without any rule. `ferossh.exe --theme Production prod-db` opens a session in a theme, handy for desktop shortcuts. See `ThemeRule` and `Profile` in [Settings](settings.md).
 
-The window around the panes follows the theme too: the menu bar and its menus, the title bar, the tab strip, the tools rail and the tools pane (Connection manager, Session manager, the connection form, File transfer) take the focused pane's colours, dark for a dark theme. Settings > Window colours picks something else: Windows' own light or dark mode, its usual light look, or a neutral dark grey. Dark menus, buttons and scroll bars need Windows 10 version 1903 or later; the title bar takes the theme's colour on Windows 11.
+The window around the panes follows the theme too: the menu bar and its menus, the title bar, the tab strip, the tools rail and the tools pane (Connection manager, Session manager, the connection form, File transfer, Port forwards) take the focused pane's colours, dark for a dark theme. Settings > Window colours picks something else: Windows' own light or dark mode, its usual light look, or a neutral dark grey. Dark menus, buttons and scroll bars need Windows 10 version 1903 or later; the title bar takes the theme's colour on Windows 11.
 
 ## Selecting, copying and scrollback
 
