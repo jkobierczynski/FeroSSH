@@ -17,7 +17,7 @@ FeroSSH reads `~/.ssh/config` and `~/.ssh/known_hosts` too, and writes only to `
 | --- | --- | --- |
 | `SidePane right` | left | Shows the connection manager and file view on the right. |
 | `TabStrip no` | yes | Hides the tab strip. |
-| `WindowColours dark` | theme | Where the menu bar, menus, title bar, tab strip and tools pane take their colours: `theme` (the focused pane's colour theme), `windows` (Windows' light or dark app mode), `light` (Windows' usual light look) or `dark`. Settings > Window colours. |
+| `WindowColours dark` | light | Where the menu bar, menus, title bar, tab strip and tools pane take their colours: `theme` (the focused pane's colour theme), `windows` (Windows' light or dark app mode), `light` (Windows' usual light look) or `dark`. Settings > Window colours. |
 | `CopyOnSelect yes` | no | Copies a selection as soon as you make it, as PuTTY does. |
 | `RightClickPaste yes` | no | Pastes on a right click, as PuTTY does. |
 | `LogTimestamps yes` | no | Puts the time in front of each line of plain session logs (Session > Timestamp each log line). |
