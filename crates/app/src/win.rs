@@ -837,6 +837,9 @@ struct Window {
     /// and the pane they did for: the view does not follow that pane's
     /// shell until its next cd.
     started_in_folder: HashMap<String, PaneId>,
+    /// Of those, the queues whose listing another pane's shell has since
+    /// moved: going back to the owner lists its Remote folder again.
+    folder_left: HashSet<String>,
     /// The connection the file view last followed a pane of: another
     /// connection to the same host can name another Remote folder.
     files_alias_shown: Option<String>,
@@ -1589,6 +1592,7 @@ fn create_and_run(launch: Launch, theme: Option<String>) -> Result<()> {
                 files_key: None,
                 files_pane: None,
                 started_in_folder: HashMap::new(),
+                folder_left: HashSet::new(),
                 files_alias_shown: None,
                 transfer_timer: false,
                 forwards_view: ForwardsView::default(),
@@ -11391,6 +11395,7 @@ impl Window {
         // The connection's Remote folder, else the shell's directory.
         let folder = self.remote_folder(id).map(String::into_bytes);
         if folder.is_some() && !self.sftp.contains_key(&key) {
+            self.folder_left.remove(&key);
             self.started_in_folder.insert(key.clone(), id);
         }
         let cwd = folder.or_else(|| p.cwd.clone().filter(|_| self.settings.follow_directory));
@@ -11531,6 +11536,7 @@ impl Window {
             {
                 r.notice = None;
                 r.browse(folder.as_bytes());
+                self.folder_left.remove(&k);
                 self.started_in_folder.insert(k, id);
                 // Sent now: with nothing transferring, no timer would.
                 self.flush_sftp();
@@ -11543,13 +11549,23 @@ impl Window {
                 // A connection with no Remote folder of its own follows
                 // its shell.
                 self.started_in_folder.remove(k);
+                self.folder_left.remove(k);
             }
-            if key
-                .as_ref()
-                .is_some_and(|k| self.started_in_folder.get(k) == Some(&id))
+            if let Some(k) = &key
+                && self.started_in_folder.get(k) == Some(&id)
             {
                 // It stays in the connection's Remote folder; following
-                // picks up from the shell's next cd.
+                // picks up from the shell's next cd. If another pane's
+                // shell moved the shared listing meanwhile, list the
+                // folder again.
+                if self.folder_left.remove(k)
+                    && let Some(folder) = self.remote_folder(id)
+                    && let Some(r) = self.sftp.get_mut(k)
+                {
+                    r.notice = None;
+                    r.browse(folder.as_bytes());
+                    self.flush_sftp();
+                }
                 return;
             }
             self.follow_pane(id);
@@ -11591,6 +11607,9 @@ impl Window {
             && remote.listing.path != cwd
         {
             remote.browse(&cwd);
+            if self.started_in_folder.get(&key).is_some_and(|o| *o != id) {
+                self.folder_left.insert(key);
+            }
             self.flush_sftp();
         }
     }
@@ -11692,6 +11711,7 @@ impl Window {
             && self.started_in_folder.get(&key) == Some(&id)
         {
             self.started_in_folder.remove(&key);
+            self.folder_left.remove(&key);
         }
     }
 
