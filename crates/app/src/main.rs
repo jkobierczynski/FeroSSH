@@ -48,6 +48,8 @@ mod live_panel;
 #[cfg(windows)]
 mod native;
 #[cfg(windows)]
+mod script_args;
+#[cfg(windows)]
 mod script_editor;
 #[cfg(windows)]
 mod scripts_panel;

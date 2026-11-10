@@ -126,7 +126,7 @@ Insert or New adds a script (what you typed as a search becomes its name), F2 or
 
 **Enter or not, per line.** In the editor, Enter ends a line, and that line is typed with Enter after it. Shift+Enter ends a line that is typed without Enter: it becomes an `@type` line, so a script can fill in a command and leave it for you to check, or type a password prompt's answer only after a `@key`.
 
-**Arguments.** `$1` to `$9`, or `${1:Gi0/1}` with a default, are asked for in the side pane before the script is typed, prefilled with the defaults, with a preview of what will be typed. `$$` types a plain `$`; other `$` text such as `$HOME` is left alone.
+**Arguments.** `$1` to `$9`, or `${1:Gi0/1}` with a default, are asked for in the side pane before the script is typed, prefilled with the defaults, with a preview of what will be typed. Each argument has its own box: Enter goes to the next box and runs the script from the last one, Shift+Enter runs it from any box, and Escape cancels. `$$` types a plain `$`; other `$` text such as `$HOME` is left alone.
 
 **Variables** fill themselves in: `${session}`, `${host}`, `${user}`, `${port}`, `${date}`, `${time}`, `${stamp}` (safe in file names) and `${clipboard}`. For example `copy run tftp://10.0.0.5/${host}-${stamp}.cfg`.
 

@@ -289,6 +289,9 @@ struct Asking {
     /// For a run on picked hosts: the hosts, how many at once and the
     /// run's password.
     on: Option<(Vec<Place>, usize, Option<Password>)>,
+    /// Another number for another run: the native page fills its boxes
+    /// anew.
+    serial: u64,
 }
 
 impl Asking {
@@ -484,6 +487,23 @@ pub struct NativeDraft {
     /// Where the keyboard goes: a field of `head`, or (`HEAD`) the lines,
     /// with the line.
     pub focus: (usize, usize),
+}
+
+/// A script's arguments being asked for, as the native page shows them
+/// (see [`SnippetsView::native_ask`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NativeAsk {
+    /// Another number for another run: the boxes are filled anew.
+    pub serial: u64,
+    pub name: String,
+    /// The hosts it runs on; 0 for the focused pane.
+    pub hosts: usize,
+    /// Whether the last line is typed with Enter.
+    pub enter: bool,
+    /// Each argument's number and value.
+    pub args: Vec<(u8, String)>,
+    /// What will be typed, a line per step.
+    pub preview: Vec<String>,
 }
 
 /// A line made one typed without Enter, as Shift+Enter in the editor
@@ -703,6 +723,54 @@ impl SnippetsView {
         self.draft = None;
     }
 
+    /// The arguments being asked for, for the native page.
+    pub fn native_ask(&self) -> Option<NativeAsk> {
+        let a = self.asking.as_ref()?;
+        Some(NativeAsk {
+            serial: a.serial,
+            name: a.name.clone(),
+            hosts: a.on.as_ref().map_or(0, |(hosts, ..)| hosts.len()),
+            enter: a.enter,
+            args: a
+                .args
+                .iter()
+                .map(|g| g.number)
+                .zip(a.values.iter().cloned())
+                .collect(),
+            preview: a.filled().iter().map(preview).collect(),
+        })
+    }
+
+    /// The native page's boxes say `values`, one per argument, cut to
+    /// what the drawn page took.
+    pub fn native_ask_values(&mut self, values: Vec<String>) {
+        let Some(a) = &mut self.asking else {
+            return;
+        };
+        for (v, new) in a.values.iter_mut().zip(values) {
+            *v = new
+                .chars()
+                .filter(|c| !c.is_control())
+                .take(MAX_TEXT)
+                .collect();
+        }
+    }
+
+    /// Run on the native page: types the script, or starts the run on the
+    /// picked hosts.
+    pub fn native_ask_run(&mut self, values: Vec<String>) -> Option<SnipAction> {
+        self.native_ask_values(values);
+        let done = self.asking.as_mut()?.done();
+        self.asking = None;
+        Some(done)
+    }
+
+    /// Cancel or Escape on the native page: back to the terminal, as the
+    /// drawn page went.
+    pub fn native_ask_cancel(&mut self) -> Option<SnipAction> {
+        self.asking.take().map(|_| SnipAction::Leave)
+    }
+
     /// The selected script's place among [`Self::native_rows`].
     /// Kept within the shown ones: a delete may leave it past the end.
     pub fn native_selected(&self, all: &[Snippet]) -> usize {
@@ -824,6 +892,7 @@ impl SnippetsView {
             focus: 0,
             cursor: 0,
             on: None,
+            serial: DRAFTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
         };
         a.set_focus(0);
         self.draft = None;
@@ -1169,6 +1238,7 @@ impl SnippetsView {
                     focus: 0,
                     cursor: 0,
                     on: Some((hosts, parallel, password)),
+                    serial: DRAFTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
                 };
                 a.set_focus(0);
                 self.asking = Some(a);
@@ -2311,6 +2381,38 @@ mod tests {
             v.key(SideKey::Enter { split: true }, &all, 20),
             Some(SnipAction::Type { steps, .. }) if matches!(steps.last(), Some(Step::Send(_)))
         ));
+    }
+
+    #[test]
+    fn the_native_argument_page_previews_and_runs() {
+        let mut v = SnippetsView::default();
+        assert!(v.native_ask().is_none());
+        let lines: Vec<String> = vec!["interface $1".into(), "description ${2:uplink}".into()];
+        v.send("Port", &lines, true, Vec::new());
+        let a = v.native_ask().unwrap();
+        assert_eq!((a.name.as_str(), a.hosts, a.enter), ("Port", 0, true));
+        assert_eq!(a.args, [(1, String::new()), (2, "uplink".into())]);
+        assert_eq!(a.preview, ["interface ", "description uplink"]);
+        v.native_ask_values(vec!["Gi0/2\n".into(), "core".into()]);
+        let b = v.native_ask().unwrap();
+        assert_eq!(b.serial, a.serial, "the same run: the boxes stay");
+        assert_eq!(b.preview, ["interface Gi0/2", "description core"]);
+        assert_eq!(
+            v.native_ask_run(vec!["Gi0/3".into(), "core".into()]),
+            Some(SnipAction::Type {
+                name: "Port".into(),
+                steps: vec![
+                    Step::Send("interface Gi0/3".into()),
+                    Step::Send("description core".into()),
+                ],
+            })
+        );
+        assert!(!v.asking());
+        v.send("Port", &lines, true, Vec::new());
+        assert_ne!(v.native_ask().unwrap().serial, a.serial);
+        assert_eq!(v.native_ask_cancel(), Some(SnipAction::Leave));
+        assert!(!v.asking());
+        assert_eq!(v.native_ask_cancel(), None);
     }
 
     #[test]
