@@ -23,9 +23,9 @@ use ferossh_sftp::{Choice, JobId, State as JobState, names};
 use windows::Win32::Foundation::{COLORREF, FILETIME, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
     BeginPaint, COLOR_GRAYTEXT, COLOR_WINDOW, COLOR_WINDOWTEXT, ClientToScreen, CreateSolidBrush,
-    DT_LEFT, DT_NOPREFIX, DT_SINGLELINE, DT_VCENTER, DeleteObject, DrawTextW, EndPaint, FillRect,
-    HFONT, HGDIOBJ, InvalidateRect, PAINTSTRUCT, ScreenToClient, SelectObject, SetBkMode,
-    SetTextColor, TRANSPARENT,
+    DT_CALCRECT, DT_LEFT, DT_NOPREFIX, DT_SINGLELINE, DT_VCENTER, DeleteObject, DrawTextW,
+    EndPaint, FillRect, GetDC, HFONT, HGDIOBJ, InvalidateRect, PAINTSTRUCT, ReleaseDC,
+    ScreenToClient, SelectObject, SetBkMode, SetTextColor, TRANSPARENT,
 };
 use windows::Win32::Storage::FileSystem::{FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_NORMAL};
 use windows::Win32::System::Time::{FileTimeToSystemTime, SystemTimeToTzSpecificLocalTime};
@@ -288,6 +288,9 @@ struct State {
     arrange: Arrange,
     /// The panel's size as laid out, the lists' area and the gap.
     size: (i32, i32),
+    /// How much of the panel's width the terminal leaves uncovered: the
+    /// buttons at the right edge move left to stay in it.
+    visible: i32,
     lists: Rect,
     gap: Rect,
     /// Where the "Local" and "Remote" labels and the title go.
@@ -694,6 +697,7 @@ pub fn create(main: HWND, handler: Handler, dpi: u32) -> windows::core::Result<(
                 filter: String::new(),
                 arrange: Arrange::default(),
                 size: (0, 0),
+                visible: 0,
                 lists: Rect::default(),
                 gap: Rect::default(),
                 labels: [Rect::default(); 2],
@@ -830,8 +834,12 @@ pub fn place(at: Option<Rect>, width: i32, dpi: u32) {
     unsafe {
         let _ = MoveWindow(h.panel, at.x, at.y, at.w, at.h, true);
     }
-    let resized =
-        with(|s| std::mem::replace(&mut s.size, (width, at.h)) != (width, at.h)).unwrap_or(false);
+    let resized = with(|s| {
+        let sized = std::mem::replace(&mut s.size, (width, at.h)) != (width, at.h);
+        let uncovered = std::mem::replace(&mut s.visible, at.w) != at.w;
+        sized || uncovered
+    })
+    .unwrap_or(false);
     if resized || refont.is_some() {
         layout(&h);
     }
@@ -841,20 +849,68 @@ pub fn place(at: Option<Rect>, width: i32, dpi: u32) {
     }
 }
 
+/// Where the title ("File transfer" and the host) ends, as `paint` draws it.
+fn title_end(h: &Handles, dpi: u32) -> i32 {
+    let Some((title_font, font, host)) = with(|s| {
+        (
+            s.title_font,
+            s.font,
+            s.view.as_ref().and_then(|v| v.host.clone()),
+        )
+    }) else {
+        return 0;
+    };
+    let host = host.unwrap_or_else(|| "no SSH host".into());
+    let width = |dc, font: HFONT, text: &str| {
+        let mut t: Vec<u16> = text.encode_utf16().collect();
+        let mut r = RECT::default();
+        // SAFETY: measuring on a DC we hold; the font is selected back
+        // out by the caller.
+        unsafe {
+            SelectObject(dc, HGDIOBJ(font.0));
+            DrawTextW(
+                dc,
+                &mut t,
+                &mut r,
+                DT_CALCRECT | DT_SINGLELINE | DT_NOPREFIX,
+            );
+        }
+        r.right - r.left
+    };
+    // SAFETY: our own window's DC, released below with its font restored.
+    unsafe {
+        let dc = GetDC(Some(h.panel));
+        if dc.is_invalid() {
+            return 0;
+        }
+        let old = SelectObject(dc, HGDIOBJ(title_font.0));
+        let end = scale(10, dpi)
+            + width(dc, title_font, "File transfer")
+            + scale(10, dpi)
+            + width(dc, font, &host);
+        SelectObject(dc, old);
+        ReleaseDC(Some(h.panel), dc);
+        end
+    }
+}
+
 /// Places every control for the panel's size, arrangement, queue and
 /// question.
 fn layout(h: &Handles) {
-    let Some((dpi, (width, height), arrange, queued, asking, status, naming)) = with(|s| {
-        (
-            s.dpi,
-            s.size,
-            s.arrange,
-            s.queue_shown.len() as i32,
-            s.view.as_ref().is_some_and(|v| v.question.is_some()),
-            s.local_error.is_some() || s.view.as_ref().is_some_and(|v| v.status.is_some()),
-            s.naming.is_some(),
-        )
-    }) else {
+    let Some((dpi, (width, height), visible, arrange, queued, asking, status, naming)) =
+        with(|s| {
+            (
+                s.dpi,
+                s.size,
+                s.visible,
+                s.arrange,
+                s.queue_shown.len() as i32,
+                s.view.as_ref().is_some_and(|v| v.question.is_some()),
+                s.local_error.is_some() || s.view.as_ref().is_some_and(|v| v.status.is_some()),
+                s.naming.is_some(),
+            )
+        })
+    else {
         return;
     };
     let px = |d: i32| scale(d, dpi);
@@ -863,6 +919,11 @@ fn layout(h: &Handles) {
     let gap6 = px(6);
     let inner = (width - 2 * pad).max(0);
     let title = px(36);
+    // The buttons at the right edge keep to the part the terminal leaves
+    // uncovered, but never move over what is to their left.
+    let full_right = pad + inner;
+    let shown_right = (visible - pad).min(full_right);
+    let keep_right = |least: i32| shown_right.max(least).min(full_right);
     // The title row's buttons, against the right edge.
     let layout_w = px(78);
     let follow_w = px(112);
@@ -900,7 +961,9 @@ fn layout(h: &Handles) {
     let place_side = |side: Side, r: Rect| -> Rect {
         let b = px(28);
         let path_x = r.x + label_w + b + px(4);
-        let path_w = (r.w - label_w - 2 * b - px(8)).max(0);
+        // The path box shrinks, down to a short one, to keep "..." in view.
+        let right = keep_right(path_x + px(80) + px(4) + b).min(r.x + r.w);
+        let path_w = (right - path_x - b - px(4)).max(0);
         // SAFETY: moving our own windows.
         unsafe {
             let _ = MoveWindow(side.up, r.x + label_w, r.y, b, row, true);
@@ -922,23 +985,25 @@ fn layout(h: &Handles) {
     let (up_arrow, down_arrow) = arrange.arrows();
     let bw = px(32);
     let bh = px(28);
+    let sync_w = px(66);
+    let marks_w = px(108);
+    let buttons_w = marks_w + sync_w + follow_w + layout_w + 3 * gap6;
+    let title_right = keep_right(title_end(h, dpi) + px(6) + buttons_w);
     // SAFETY: moving and labelling our own windows; the texts live through
     // each call.
     unsafe {
         let _ = MoveWindow(
             h.layout,
-            pad + inner - layout_w,
+            title_right - layout_w,
             (title - row) / 2,
             layout_w,
             row,
             true,
         );
-        let follow_x = pad + inner - layout_w - gap6 - follow_w;
+        let follow_x = title_right - layout_w - gap6 - follow_w;
         let _ = MoveWindow(h.follow, follow_x, (title - row) / 2, follow_w, row, true);
-        let sync_w = px(66);
         let sync_x = follow_x - gap6 - sync_w;
         let _ = MoveWindow(h.sync, sync_x, (title - row) / 2, sync_w, row, true);
-        let marks_w = px(108);
         let marks_x = sync_x - gap6 - marks_w;
         with(|s| s.title_buttons_x = marks_x);
         let _ = MoveWindow(h.bookmarks, marks_x, (title - row) / 2, marks_w, row, true);
@@ -954,7 +1019,8 @@ fn layout(h: &Handles) {
         // Refresh ends the filter's row: the title row is full on a
         // narrow pane.
         let refresh_w = px(76).min(inner / 3);
-        let filter_w = (inner - gap6 - refresh_w).max(0);
+        let filter_right = keep_right(pad + px(120) + gap6 + refresh_w);
+        let filter_w = (filter_right - pad - gap6 - refresh_w).max(0);
         let _ = MoveWindow(h.filter, pad, filter_y, filter_w, row, true);
         let _ = MoveWindow(
             h.refresh,
@@ -1365,7 +1431,8 @@ pub fn set_view(view: View) {
         }
     }
     refresh_status(&h);
-    if relayout {
+    if relayout || host_changed {
+        // The title row's buttons stop at the host's name.
         layout(&h);
     }
     if host_changed {
@@ -2934,12 +3001,7 @@ fn paint(h: &Handles) {
         SetTextColor(dc, COLORREF(crate::ui_theme::sys_color(COLOR_WINDOWTEXT)));
         let mut text: Vec<u16> = "File transfer".encode_utf16().collect();
         let mut measure = tr;
-        DrawTextW(
-            dc,
-            &mut text,
-            &mut measure,
-            flags | windows::Win32::Graphics::Gdi::DT_CALCRECT,
-        );
+        DrawTextW(dc, &mut text, &mut measure, flags | DT_CALCRECT);
         DrawTextW(dc, &mut text, &mut tr, flags);
         SelectObject(dc, HGDIOBJ(font.0));
         SetTextColor(dc, COLORREF(crate::ui_theme::sys_color(COLOR_GRAYTEXT)));
