@@ -58,7 +58,7 @@ n=20;
 while [ $n -lt 100 ]; do
 if [ -e /tmp/.X$n-lock ] || [ -e /tmp/.X11-unix/X$n ]; then n=$((n+1)); continue; fi;
 k=$(od -An -N16 -tx1 /dev/urandom | tr -dc 0-9a-f);
-xauth -q -f "$d/auth" add :$n . $k >/dev/null 2>&1;
+echo "add :$n . $k" | xauth -q -f "$d/auth" source - >/dev/null 2>&1;
 if [ "$b" = xvnc ]; then
 Xvnc :$n -auth "$d/auth" -nolisten tcp -localhost -interface 127.0.0.1 -rfbport $((5900+n)) -SecurityTypes VncAuth -PasswordFile "$d/vncpw" -AcceptSetDesktopSize=$r -AcceptCutText=$ca -SendCutText=$cs -SendPrimary=$cp -AlwaysShared -geometry $size -depth 24 </dev/null >"$d/xvfb.log" 2>&1 3<&- &
 else

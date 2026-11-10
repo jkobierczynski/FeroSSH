@@ -14,9 +14,11 @@
 #![allow(unsafe_code)]
 
 use std::ffi::c_void;
+use std::path::PathBuf;
 use std::sync::mpsc::{Receiver, Sender, SyncSender, channel, sync_channel};
 use std::thread;
 
+use windows::Win32::Foundation::ERROR_FILE_NOT_FOUND;
 use windows::Win32::Foundation::{CloseHandle, HANDLE, WAIT_OBJECT_0};
 use windows::Win32::Storage::FileSystem::{ReadFile, WriteFile};
 use windows::Win32::System::Console::{
@@ -29,7 +31,9 @@ use windows::Win32::System::Threading::{
     PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE, PROCESS_INFORMATION, STARTF_USESTDHANDLES, STARTUPINFOEXW,
     UpdateProcThreadAttribute, WaitForSingleObject,
 };
-use windows::core::{HSTRING, PCWSTR, PWSTR, Result};
+use windows::core::{Error, HSTRING, PCWSTR, PWSTR, Result};
+
+use crate::program;
 
 /// Output chunks buffered between the reader thread and the UI; with
 /// 64 KB reads this caps the backlog at 4 MB and slows a flooding child
@@ -76,7 +80,25 @@ impl std::fmt::Debug for Shell {
 
 /// The command `Shell::spawn` runs when none is given.
 pub fn default_command() -> String {
-    std::env::var("COMSPEC").unwrap_or_else(|_| "cmd.exe".to_owned())
+    match std::env::var("COMSPEC") {
+        // A path with spaces must be quoted to stay one program.
+        Ok(c) if c.contains(' ') && !c.starts_with('"') => format!("\"{c}\""),
+        Ok(c) => c,
+        Err(_) => "cmd.exe".to_owned(),
+    }
+}
+
+/// Folders a bare program name is looked for in: System32 and Windows
+/// first, then `PATH` (whose relative entries [`program::resolve`] skips).
+/// Never FeroSSH's own folder or the current one.
+fn search_dirs() -> Vec<PathBuf> {
+    let root =
+        PathBuf::from(std::env::var_os("SystemRoot").unwrap_or_else(|| "C:\\Windows".into()));
+    let mut dirs = vec![root.join("System32"), root];
+    if let Some(path) = std::env::var_os("PATH") {
+        dirs.extend(std::env::split_paths(&path));
+    }
+    dirs
 }
 
 fn coord(cols: usize, rows: usize) -> COORD {
@@ -197,6 +219,11 @@ fn start_process(command: &str, dir: Option<&str>, console: HPCON) -> Result<Own
         si.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
         si.lpAttributeList = list;
 
+        // The program by its full path, so Windows does not look for it
+        // in FeroSSH's folder or the current one first.
+        let app = program::resolve(command, &search_dirs())
+            .map(|p| HSTRING::from(p.as_path()))
+            .ok_or_else(|| Error::from(ERROR_FILE_NOT_FOUND.to_hresult()))?;
         let mut cmdline: Vec<u16> = command.encode_utf16().chain([0]).collect();
         let home = dir
             .filter(|d| std::path::Path::new(d).is_dir())
@@ -209,7 +236,7 @@ fn start_process(command: &str, dir: Option<&str>, console: HPCON) -> Result<Own
         // info and attribute list live until the call returns.
         unsafe {
             CreateProcessW(
-                None,
+                PCWSTR(app.as_ptr()),
                 Some(PWSTR(cmdline.as_mut_ptr())),
                 None,
                 None,
