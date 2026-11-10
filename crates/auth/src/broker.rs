@@ -14,7 +14,7 @@ use std::thread;
 use russh::keys::{Certificate, PublicKey};
 use zeroize::Zeroizing;
 
-use crate::agent::{self, AgentKind};
+use crate::agent::{self, AgentChoice, AgentKind};
 use crate::keyfile::{KeyFile, KeyFileError};
 use crate::sk::Authenticator;
 use crate::userauth::{allowed_algorithms, is_certificate, key_type};
@@ -56,16 +56,30 @@ pub struct KeyFileSpec {
     pub explicit: bool,
 }
 
+/// Which keys a login offers, from the host's config.
+#[derive(Debug, Clone, Default)]
+pub struct KeyChoice {
+    pub files: Vec<KeyFileSpec>,
+    /// `CertificateFile`s: each is offered with the key file it certifies.
+    /// A `<key>-cert.pub` beside a key file is found without one.
+    pub certificates: Vec<PathBuf>,
+    /// `IdentityAgent`.
+    pub agent: AgentChoice,
+    /// `IdentitiesOnly yes`: agent keys only when a key file is the same key.
+    pub identities_only: bool,
+}
+
 #[derive(Debug)]
 pub enum Job {
-    /// List agent keys, then these key files.
-    Identities { files: Vec<KeyFileSpec> },
-    /// Sign `data` with `identity`.
+    /// List agent keys, then the key files.
+    Identities(KeyChoice),
+    /// Sign `data` with `identity`; an agent's key through `agent`.
     Sign {
         identity: Identity,
         data: Vec<u8>,
         flags: u32,
         passphrase: Option<Zeroizing<String>>,
+        agent: AgentChoice,
     },
 }
 
@@ -131,10 +145,74 @@ fn no_keys_note(files: &[String]) -> String {
     }
 }
 
-fn identities(rt: &tokio::runtime::Runtime, files: Vec<KeyFileSpec>) -> Reply {
-    let (agent_keys, mut notes) = agent::list(rt);
+/// A certificate file's blob: an OpenSSH `*-cert.pub` line.
+fn read_certificate(path: &std::path::Path) -> Option<Vec<u8>> {
+    let text = std::fs::read_to_string(path).ok()?;
+    let cert = Certificate::from_openssh(text.trim()).ok()?;
+    cert.to_bytes().ok()
+}
+
+/// The public key inside a certificate blob.
+fn certified_key(cert: &[u8]) -> Option<Vec<u8>> {
+    let cert = Certificate::from_bytes(cert).ok()?;
+    PublicKey::new(cert.public_key().clone(), "")
+        .to_bytes()
+        .ok()
+}
+
+/// The certificates for a key file: `CertificateFile`s that certify its
+/// key, and `<path>-cert.pub`.
+fn certificates_for(kf: &KeyFile, choice: &KeyChoice, notes: &mut Vec<String>) -> Vec<Vec<u8>> {
+    let mut beside = kf.path.clone().into_os_string();
+    beside.push("-cert.pub");
+    let beside = PathBuf::from(beside);
+    let mut out: Vec<Vec<u8>> = Vec::new();
+    for path in choice.certificates.iter().chain(std::iter::once(&beside)) {
+        let Some(cert) = read_certificate(path) else {
+            if path != &beside && path.exists() {
+                notes.push(format!(
+                    "Skipping certificate {}: it is not an OpenSSH certificate.",
+                    path.display()
+                ));
+            }
+            continue;
+        };
+        if certified_key(&cert).as_deref() != Some(&kf.public[..]) || out.contains(&cert) {
+            continue;
+        }
+        if let Some(why) = refusal(&cert) {
+            notes.push(format!("Skipping certificate {}: {why}.", path.display()));
+            continue;
+        }
+        out.push(cert);
+    }
+    out
+}
+
+fn identities(rt: &tokio::runtime::Runtime, choice: KeyChoice) -> Reply {
+    let (agent_keys, mut notes) = agent::list(rt, &choice.agent);
     let mut keys: Vec<Identity> = Vec::new();
+    let mut files: Vec<(KeyFileSpec, Result<KeyFile, KeyFileError>)> = choice
+        .files
+        .iter()
+        .map(|spec| (spec.clone(), KeyFile::load(&spec.path)))
+        .collect();
+    let file_publics: Vec<Vec<u8>> = files
+        .iter()
+        .filter_map(|(_, f)| f.as_ref().ok().map(|f| f.public.clone()))
+        .collect();
     for k in agent_keys {
+        if choice.identities_only {
+            // The key itself, or a certificate of it, must be a key file's.
+            let plain = if is_certificate(&k.public) {
+                certified_key(&k.public)
+            } else {
+                Some(k.public.clone())
+            };
+            if !plain.is_some_and(|p| file_publics.contains(&p)) {
+                continue;
+            }
+        }
         if let Some(why) = refusal(&k.public) {
             notes.push(format!(
                 "Skipping {} key \"{}\": {why}.",
@@ -149,10 +227,27 @@ fn identities(rt: &tokio::runtime::Runtime, files: Vec<KeyFileSpec>) -> Reply {
             source: Source::Agent(k.agent),
         });
     }
-    let files_tried: Vec<String> = files.iter().map(|f| f.path.display().to_string()).collect();
-    for spec in files {
-        match KeyFile::load(&spec.path) {
+    let files_tried: Vec<String> = choice
+        .files
+        .iter()
+        .map(|f| f.path.display().to_string())
+        .collect();
+    for (spec, loaded) in files.drain(..) {
+        match loaded {
             Ok(kf) => {
+                let certs = certificates_for(&kf, &choice, &mut notes);
+                let kf = Arc::new(kf);
+                // A certificate goes first: a server that trusts the CA
+                // takes it, one that does not may still know the key.
+                for cert in certs {
+                    if !keys.iter().any(|k| k.public == cert) {
+                        keys.push(Identity {
+                            public: cert,
+                            comment: kf.comment.clone(),
+                            source: Source::File(kf.clone()),
+                        });
+                    }
+                }
                 if keys.iter().any(|k| k.public == kf.public) {
                     // The agent already holds it and needs no passphrase.
                     continue;
@@ -160,7 +255,7 @@ fn identities(rt: &tokio::runtime::Runtime, files: Vec<KeyFileSpec>) -> Reply {
                 keys.push(Identity {
                     public: kf.public.clone(),
                     comment: kf.comment.clone(),
-                    source: Source::File(Arc::new(kf)),
+                    source: Source::File(kf),
                 });
             }
             Err(KeyFileError::Unreadable(_)) if !spec.explicit => {}
@@ -183,13 +278,14 @@ fn sign(
         data,
         flags,
         passphrase,
+        agent: choice,
     } = job
     else {
         return None;
     };
     let result = match &identity.source {
         Source::Agent(a) => {
-            agent::sign(rt, *a, &identity.public, &data, flags).map_err(SignError::Failed)
+            agent::sign(rt, *a, &choice, &identity.public, &data, flags).map_err(SignError::Failed)
         }
         Source::File(f) => f
             .sign_with(
@@ -242,7 +338,7 @@ impl Broker {
             .spawn(move || {
                 while let Ok(job) = job_rx.recv() {
                     let reply = match job {
-                        Job::Identities { files } => Some(identities(&rt, files)),
+                        Job::Identities(choice) => Some(identities(&rt, choice)),
                         sign_job @ Job::Sign { .. } => sign(&rt, authenticator.as_ref(), sign_job),
                     };
                     if let Some(reply) = reply {
@@ -298,10 +394,13 @@ mod tests {
         let missing = std::env::temp_dir().join("ferossh-no-such-key");
         let Reply::Identities { keys, notes } = identities(
             &rt,
-            vec![KeyFileSpec {
-                path: missing.clone(),
-                explicit: false,
-            }],
+            KeyChoice {
+                files: vec![KeyFileSpec {
+                    path: missing.clone(),
+                    explicit: false,
+                }],
+                ..KeyChoice::default()
+            },
         ) else {
             panic!("not identities");
         };

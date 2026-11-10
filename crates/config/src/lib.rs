@@ -16,7 +16,7 @@ pub mod login;
 pub mod mobaxterm;
 pub mod mremoteng;
 pub mod password;
-mod pattern;
+pub mod pattern;
 pub mod putty;
 pub mod record;
 pub mod saved;

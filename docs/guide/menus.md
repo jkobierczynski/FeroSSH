@@ -204,6 +204,7 @@ In the Local and Remote lists:
 | Backspace | Goes to the parent folder. |
 | Ctrl+A | Selects everything in the list. |
 | Del | Deletes the Remote selection on the server, after asking. |
+| F2 | Renames the selected file or folder. |
 | F5 | Refreshes the list. |
 | Shift+F10 or right-click | The list's menu. |
 | Tab | Moves between the filter, the lists, their buttons and the queue. |

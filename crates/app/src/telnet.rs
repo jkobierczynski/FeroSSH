@@ -281,6 +281,7 @@ mod tests {
         let env = Env {
             home: std::env::temp_dir(),
             local_user: "me".into(),
+            vars: Vec::new(),
             config: "Host core\n    HostName 10.1.1.1\n    Tag production\n\
                      Host console\n    HostName cs.lan\n    Port 2004\n"
                 .into(),

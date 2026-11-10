@@ -19,6 +19,8 @@
 #![cfg_attr(windows, windows_subsystem = "windows")]
 
 #[cfg_attr(not(windows), allow(dead_code))]
+mod agent_fwd;
+#[cfg_attr(not(windows), allow(dead_code))]
 mod batch;
 #[cfg_attr(not(windows), allow(dead_code))]
 mod broadcast;
@@ -58,6 +60,8 @@ mod script_report;
 #[cfg(windows)]
 mod scripts_panel;
 // Platform-neutral, tested everywhere; only the Windows build uses them.
+#[cfg_attr(not(windows), allow(dead_code))]
+mod edit_local;
 #[cfg_attr(not(windows), allow(dead_code))]
 mod files;
 #[cfg_attr(not(windows), allow(dead_code))]

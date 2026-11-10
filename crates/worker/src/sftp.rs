@@ -53,8 +53,28 @@ enum Pend {
     ListOpen { ui: u32 },
     /// `READDIR` for a listing, until end of file.
     ListRead { ui: u32, handle: Vec<u8> },
-    /// Removing the target before a plain rename that must replace it.
-    RemoveThenRename { ui: u32, from: Vec<u8>, to: Vec<u8> },
+    /// A plain rename that must replace its target: the target moved
+    /// aside first, so a failed promotion can put it back.
+    MoveAside {
+        ui: u32,
+        from: Vec<u8>,
+        to: Vec<u8>,
+        aside: Vec<u8>,
+    },
+    /// The new file renamed onto the freed target name.
+    Promote {
+        ui: u32,
+        to: Vec<u8>,
+        aside: Vec<u8>,
+    },
+    /// The original moved back after a failed promotion; the UI hears
+    /// the promotion's error once this answers.
+    Restore {
+        ui: u32,
+        aside: Vec<u8>,
+        code: u32,
+        message: String,
+    },
     /// Closing a listing's handle; nobody waits.
     Quiet,
 }
@@ -239,6 +259,16 @@ impl Sftp {
                 })
                 .await
             }
+            SftpOp::Chmod { path, mode } => {
+                self.one(ui, Want::Status, |id| {
+                    wire::encode(&Request::Chmod {
+                        id,
+                        path: &path,
+                        mode,
+                    })
+                })
+                .await
+            }
             SftpOp::Rmdir { path } => {
                 self.one(ui, Want::Status, |id| {
                     wire::encode(&Request::Rmdir { id, path: &path })
@@ -260,11 +290,25 @@ impl Sftp {
                     })
                     .await
                 } else if overwrite {
-                    // Plain SFTP renames refuse to replace: remove first.
-                    let path = to.clone();
+                    // Plain SFTP renames refuse to replace. Never remove the
+                    // original before the new file is in place: move it
+                    // aside, rename, then drop (or restore) the old one.
+                    let aside = aside_name(&to, self.next_id);
+                    let (t, a) = (to.clone(), aside.clone());
                     self.send(
-                        |id| wire::encode(&Request::Remove { id, path: &path }),
-                        Pend::RemoveThenRename { ui, from, to },
+                        |id| {
+                            wire::encode(&Request::Rename {
+                                id,
+                                from: &t,
+                                to: &a,
+                            })
+                        },
+                        Pend::MoveAside {
+                            ui,
+                            from,
+                            to,
+                            aside,
+                        },
                     )
                     .await
                 } else {
@@ -355,15 +399,85 @@ impl Sftp {
             (Pend::ListOpen { ui }, Response::Status { code, message, .. }) => {
                 self.failed(ui, code, &message).await
             }
-            (Pend::RemoveThenRename { ui, from, to }, _) => {
-                self.one(ui, Want::Status, |id| {
-                    wire::encode(&Request::Rename {
-                        id,
-                        from: &from,
-                        to: &to,
-                    })
-                })
-                .await
+            (
+                Pend::MoveAside {
+                    ui,
+                    from,
+                    to,
+                    aside,
+                },
+                Response::Status { code, message, .. },
+            ) => {
+                let rename =
+                    |from: &[u8], to: &[u8], id| wire::encode(&Request::Rename { id, from, to });
+                match code {
+                    // Nothing to replace: a plain rename does it.
+                    sftp_code::NO_SUCH_FILE => {
+                        self.one(ui, Want::Status, |id| rename(&from, &to, id))
+                            .await
+                    }
+                    0 => {
+                        let pend = Pend::Promote {
+                            ui,
+                            to: to.clone(),
+                            aside,
+                        };
+                        self.send(|id| rename(&from, &to, id), pend).await
+                    }
+                    _ => self.failed(ui, code, &message).await,
+                }
+            }
+            (Pend::Promote { ui, to, aside }, Response::Status { code, message, .. }) => {
+                if code == 0 {
+                    self.send(
+                        |id| wire::encode(&Request::Remove { id, path: &aside }),
+                        Pend::Quiet,
+                    )
+                    .await?;
+                    self.reply(ui, SftpReply::Done).await
+                } else {
+                    // Put the original back where it was.
+                    let a = aside.clone();
+                    self.send(
+                        |id| {
+                            wire::encode(&Request::Rename {
+                                id,
+                                from: &a,
+                                to: &to,
+                            })
+                        },
+                        Pend::Restore {
+                            ui,
+                            aside,
+                            code,
+                            message,
+                        },
+                    )
+                    .await
+                }
+            }
+            (
+                Pend::Restore {
+                    ui,
+                    aside,
+                    code,
+                    message,
+                },
+                resp,
+            ) => {
+                match resp {
+                    Response::Status { code: 0, .. } => self.failed(ui, code, &message).await,
+                    // A plain code's fixed text would hide where the
+                    // original is: send the full words instead.
+                    _ => {
+                        let message = restore_failed(&message, &aside);
+                        self.failed(ui, sftp_code::FAILURE, &message).await
+                    }
+                }
+            }
+            (Pend::MoveAside { ui, .. } | Pend::Promote { ui, .. }, _) => {
+                self.failed(ui, sftp_code::FAILURE, "Unexpected reply")
+                    .await
             }
             (Pend::ListOpen { ui } | Pend::ListRead { ui, .. }, _) => {
                 self.failed(ui, sftp_code::FAILURE, "Unexpected reply")
@@ -622,6 +736,29 @@ async fn serve(
     .await;
     s.checksums.shutdown().await;
     end
+}
+
+/// A free-looking name beside `to` for the original while it is
+/// replaced: same folder, so the rename stays on one file system.
+fn aside_name(to: &[u8], n: u32) -> Vec<u8> {
+    let mut name = to.to_vec();
+    name.extend_from_slice(format!(".ferossh-old-{n}").as_bytes());
+    name
+}
+
+/// The error when the original could not be moved back: say where
+/// it is, so nothing is lost without a word.
+fn restore_failed(message: &str, aside: &[u8]) -> String {
+    let why = message.trim().trim_end_matches('.');
+    let why = if why.is_empty() {
+        "The new copy could not replace the file"
+    } else {
+        why
+    };
+    format!(
+        "{why}; the original file is now {}",
+        String::from_utf8_lossy(aside)
+    )
 }
 
 /// The next packet from the server.
@@ -973,6 +1110,26 @@ mod tests {
         })
         .await??;
         Ok(())
+    }
+
+    #[test]
+    fn the_original_waits_beside_its_target() {
+        assert_eq!(
+            aside_name(b"/etc/app.conf", 7),
+            b"/etc/app.conf.ferossh-old-7"
+        );
+    }
+
+    #[test]
+    fn a_failed_restore_says_where_the_original_is() {
+        assert_eq!(
+            restore_failed("Permission denied.", b"/etc/app.conf.ferossh-old-7"),
+            "Permission denied; the original file is now /etc/app.conf.ferossh-old-7"
+        );
+        assert_eq!(
+            restore_failed(" ", b"/a.ferossh-old-1"),
+            "The new copy could not replace the file; the original file is now /a.ferossh-old-1"
+        );
     }
 
     #[test]

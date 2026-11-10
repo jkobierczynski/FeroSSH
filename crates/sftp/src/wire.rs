@@ -36,6 +36,7 @@ mod kind {
     pub const READ: u8 = 5;
     pub const WRITE: u8 = 6;
     pub const LSTAT: u8 = 7;
+    pub const SETSTAT: u8 = 9;
     pub const OPENDIR: u8 = 11;
     pub const READDIR: u8 = 12;
     pub const REMOVE: u8 = 13;
@@ -125,6 +126,13 @@ pub enum Request<'a> {
         from: &'a [u8],
         to: &'a [u8],
     },
+    /// Sets only the permission bits of `path` (follows a final symlink,
+    /// as `chmod` does).
+    Chmod {
+        id: u32,
+        path: &'a [u8],
+        mode: u32,
+    },
     /// `posix-rename@openssh.com`: a rename that replaces the target.
     PosixRename {
         id: u32,
@@ -212,6 +220,11 @@ pub fn encode(req: &Request<'_>) -> Vec<u8> {
         Request::Rename { id, from, to } => {
             o.id_path(kind::RENAME, id, from);
             o.bytes(to);
+        }
+        Request::Chmod { id, path, mode } => {
+            o.id_path(kind::SETSTAT, id, path);
+            o.u32(attr::PERMISSIONS);
+            o.u32(mode & 0o7777);
         }
         Request::PosixRename { id, from, to } => {
             o.id_path(kind::EXTENDED, id, POSIX_RENAME);
@@ -526,6 +539,16 @@ mod tests {
             from: b"a",
             to: b"b",
         });
+        assert_eq!(
+            encode(&Request::Chmod {
+                id: 2,
+                path: b"f",
+                mode: 0o100_755,
+            }),
+            [
+                0, 0, 0, 18, 9, 0, 0, 0, 2, 0, 0, 0, 1, b'f', 0, 0, 0, 4, 0, 0, 0x01, 0xed
+            ]
+        );
         assert_eq!(rename[4], 200);
         assert!(
             rename

@@ -27,6 +27,29 @@ Ctrl+Shift+N (File > Connect to...) asks for a host in a new tab. It takes `user
 
 File > Open local shell opens a Windows command prompt in a new tab. `ferossh.exe --local wsl -d Ubuntu` (or any other program) opens that instead.
 
+### Your ssh_config
+
+FeroSSH reads `~/.ssh/config` as OpenSSH does: the first value for a keyword wins, `Host` and `Match` blocks apply in order, and `Include` pulls in other files. `Match` takes `all`, `host`, `originalhost`, `user`, `localuser`, `tagged`, `canonical` and `final`, with `!` in front to negate; `Match exec`, `localnetwork` and `version` never match, because FeroSSH does not run commands to decide.
+
+Besides `HostName`, `User`, `Port`, `IdentityFile`, `Tag`, `ProxyJump`, `ProxyCommand` and the forwarding keywords, these work:
+
+| Keyword | What it does |
+| --- | --- |
+| `CertificateFile` | Offers this OpenSSH user certificate with its key (`<key>-cert.pub` next to a key file is picked up too). |
+| `IdentitiesOnly yes` | Offers only the `IdentityFile` keys, even from the agent. |
+| `IdentityAgent` | Another agent: `none`, a named pipe such as `\\.\pipe\my-agent`, or `SSH_AUTH_SOCK`. |
+| `ForwardAgent yes` | Forwards your agent to the server (see [Agent forwarding](#agent-forwarding)). |
+| `SendEnv`, `SetEnv` | Sends environment variables (the server's `AcceptEnv` must take them). |
+| `RemoteCommand`, `RequestTTY` | Runs a command instead of the login shell; `RequestTTY no` asks for no terminal. |
+| `StrictHostKeyChecking` | `yes` refuses unknown hosts; `accept-new` (or `no`) trusts a new host without asking. A changed key is always refused. |
+| `UserKnownHostsFile` | Other known_hosts files, in place of `~/.ssh/known_hosts`. |
+| `HostKeyAlias` | Looks the host key up under this name instead of the host's. |
+| `AddressFamily` | `inet` for IPv4 only, `inet6` for IPv6 only. |
+
+### Agent forwarding
+
+`ForwardAgent yes` in your ssh_config, or *Fwd agent* in a saved connection's Extras, lets programs on the server (`ssh`, `git`) use the keys in your agent. FeroSSH asks every time one wants a signature, and says what for: a login to a host (with that host's key fingerprint), a `git` commit signature, or another SSH signature. Yes signs once, No refuses, and Cancel refuses everything else from that connection. Only your agent's keys are offered, never key files, and FeroSSH refuses anything else the server asks of the agent (adding, removing or locking keys), and any signature that is not a login or an SSH signature.
+
 ### When the connection drops
 
 If the network drops, the laptop sleeps or the server reboots, the tab stays where it is and FeroSSH logs in again on its own: after 1 second, then 2, 4, 8, 15 and every 30 seconds, for up to 15 minutes. Enter tries at once and Esc stops.
@@ -55,7 +78,7 @@ Insert or the New button opens the connection form in the tools pane; F2, the Ed
 
 - **Connection**: **Name, Folder, Type**; the type is an SSH terminal, Telnet (unencrypted), Serial console, Remote desktop (RDP) or VNC desktop. Then **Host, User, Port, Key file** (with Browse...), the **Password** source (below) and the **Jump host** (see [Jump hosts](#jump-hosts)). A serial console has the port, speed, framing and flow control instead.
 - **Look** (a terminal's tab): theme, font, font size and scrollback.
-- **Extras** (a terminal's tab): tmux on or off, the tmux session to attach and its layout, the start directory, File transfer's Local and Remote folders, port forwards (such as `L 8080 localhost:80`), RDP and VNC ports, older crypto, and the login script (see [Login scripts](#login-scripts)).
+- **Extras** (a terminal's tab): tmux on or off, the tmux session to attach and its layout, the start directory, File transfer's Local and Remote folders, port forwards (such as `L 8080 localhost:80`), RDP and VNC ports, agent forwarding, older crypto, and the login script (see [Login scripts](#login-scripts)).
 
 Empty fields show their default in grey. Enter saves, Shift+Enter saves and connects, Esc cancels. Connections go to `%APPDATA%\FeroSSH\sessions.conf` in ssh_config syntax and their look to `ferossh.conf`. Hosts from `~/.ssh/config` and imports show their connection settings read-only, because FeroSSH never writes those files; their look and extras can still change, and giving one a new name saves an editable copy.
 
@@ -292,7 +315,8 @@ Ctrl+Shift+E opens File transfer in the tools pane: a **Local** list of a folder
 - **A connection's folders.** *Local folder* and *Remote folder* in a connection's Extras (`LocalFolder`, `RemoteFolder`) are where File transfer starts for that host: the Remote list opens there the first time, before following cd takes over at the shell's next `cd`, and the Local list opens there whenever File transfer turns to that host (without changing your download folder).
 - **Layout.** Layout ▾ puts the lists side by side or one above the other, and swaps Local and Remote. Drag the gap between the lists to give one more room. FeroSSH remembers it (`TransferLayout`).
 - **↻ Refresh** reads both lists again (F5 does too, anywhere in the pane outside the lists; in a list it reads only that list).
-- **Right-click** a list for Open, Upload or Download, Delete (on the server, after asking; Del too), Refresh (F5), Home folder, Upload files... and Open in Explorer.
+- **Right-click** a list for Open, Upload or Download, Delete (on the server, after asking; Del too), New folder, Rename (F2), Permissions, Refresh (F5), Home folder, Upload files... and Open in Explorer. New folder, Rename and Permissions open a box under the filter: Enter does it, Escape cancels. Permissions takes `755`, `rwxr-x---` or chmod's `u+x`, `go-w`, and applies to every file selected.
+- **Edit locally.** Right-click a file on the server and choose Edit locally: FeroSSH downloads it into a folder of its own under `%TEMP%\FeroSSH-edit` and opens it in the editor Windows has for that kind of file (Notepad when there is none; never by running it). Each time you save, FeroSSH puts it back over the server's file, keeping its permissions, and the line under the lists says so. It watches until the File transfer connection ends; edit folders older than a week are cleared.
 
 **Queue.** The transfer queue under the lists shows each transfer's progress. Right-click one to pause, resume, cancel (Del too) or retry it, or to clear the finished ones. Three files move at once (`ParallelTransfers`). A dropped connection pauses the queue, and it carries on from where each file stopped when you log in again.
 

@@ -84,11 +84,11 @@ use windows::Win32::UI::WindowsAndMessaging::{
     GWL_STYLE, GetClientRect, GetCursorPos, GetForegroundWindow, GetMenuItemCount, GetMenuItemID,
     GetMenuState, GetMenuStringW, GetMessageW, GetSubMenu, GetWindowLongPtrW, GetWindowPlacement,
     HCURSOR, HMENU, HTCLIENT, HWND_TOP, IDC_ARROW, IDC_IBEAM, IDC_SIZEALL, IDC_SIZENS, IDC_SIZEWE,
-    IDOK, IDYES, IsChild, IsIconic, IsWindowVisible, KillTimer, LoadCursorW, LoadIconW,
+    IDCANCEL, IDOK, IDYES, IsChild, IsIconic, IsWindowVisible, KillTimer, LoadCursorW, LoadIconW,
     MB_DEFBUTTON2, MB_ICONERROR, MB_ICONINFORMATION, MB_ICONQUESTION, MB_ICONWARNING, MB_OK,
-    MB_OKCANCEL, MB_YESNO, MESSAGEBOX_RESULT, MESSAGEBOX_STYLE, MF_BYCOMMAND, MF_BYPOSITION,
-    MF_CHECKED, MF_DISABLED, MF_GRAYED, MF_MENUBARBREAK, MF_POPUP, MF_SEPARATOR, MF_STRING,
-    MF_UNCHECKED, MSG, MessageBoxW, ModifyMenuW, PM_REMOVE, PeekMessageW, PostMessageW,
+    MB_OKCANCEL, MB_YESNO, MB_YESNOCANCEL, MESSAGEBOX_RESULT, MESSAGEBOX_STYLE, MF_BYCOMMAND,
+    MF_BYPOSITION, MF_CHECKED, MF_DISABLED, MF_GRAYED, MF_MENUBARBREAK, MF_POPUP, MF_SEPARATOR,
+    MF_STRING, MF_UNCHECKED, MSG, MessageBoxW, ModifyMenuW, PM_REMOVE, PeekMessageW, PostMessageW,
     PostQuitMessage, RegisterClassW, SIZE_MINIMIZED, SW_HIDE, SW_RESTORE, SW_SHOW, SW_SHOWNORMAL,
     SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOOWNERZORDER, SWP_NOSIZE, SWP_NOZORDER,
     SetCursor, SetForegroundWindow, SetMenu, SetTimer, SetWindowLongPtrW, SetWindowPlacement,
@@ -225,6 +225,10 @@ const TIMER_RUN: usize = 7;
 /// own (their login session goes once the desktop or app holds the
 /// connection), and on Remote Desktop Connections run through a tunnel.
 const TIMER_LAUNCH: usize = 8;
+/// Watches files edited locally (File transfer's Edit locally) for saves.
+const TIMER_EDIT: usize = 9;
+/// Asks the waiting agent question again once another dialog has closed.
+const TIMER_AGENT_ASK: usize = 10;
 const LAUNCH_TICK_MS: u32 = 1000;
 /// How long a launch's login session may stay hidden with nothing
 /// holding its connection before it is shown.
@@ -832,9 +836,12 @@ struct Window {
     /// The `ProxyCommand` each connection runs over, by the connection.
     proxies: HashMap<ChannelId, ProxyRun>,
     broker: Option<Broker>,
-    /// The channel of each job handed to the broker, oldest first. The
+    /// Whom each job handed to the broker is for, oldest first. The
     /// broker answers in order, so each reply goes to the front one.
-    broker_jobs: VecDeque<ChannelId>,
+    broker_jobs: VecDeque<BrokerFor>,
+    /// Agent forwarding: the keys each connection was shown, and the
+    /// signatures waiting for the user's answer.
+    agent_fwd: crate::agent_fwd::Forwarding,
     /// The channel id of the next SSH shell.
     next_channel: u32,
     /// Set while a WM_SHELL_OUTPUT is queued, so the background threads
@@ -863,6 +870,9 @@ struct Window {
     /// connection to the same host can name another Remote folder.
     files_alias_shown: Option<String>,
     transfer_timer: bool,
+    /// Server files being edited locally, put back on each save.
+    edits: crate::edit_local::Edits,
+    edit_timer: bool,
     forwards_view: ForwardsView,
     live_view: LiveView,
     /// tmux control mode, per SSH pane that has run `tmux -CC`.
@@ -1186,6 +1196,11 @@ fn ssh_env() -> Env {
         local_user: std::env::var("USERNAME").unwrap_or_default(),
         home,
         config,
+        // vars() panics on a name or value that is not Unicode, which
+        // Windows allows: those are left out, as they cannot be sent.
+        vars: std::env::vars_os()
+            .filter_map(|(k, v)| Some((k.into_string().ok()?, v.into_string().ok()?)))
+            .collect(),
     }
 }
 
@@ -1606,6 +1621,7 @@ fn create_and_run(launch: Launch, theme: Option<String>) -> Result<()> {
                 proxies: HashMap::new(),
                 broker: None,
                 broker_jobs: VecDeque::new(),
+                agent_fwd: Default::default(),
                 next_channel: 1,
                 output_pending: Arc::new(AtomicBool::new(false)),
                 sftp: HashMap::new(),
@@ -1616,6 +1632,8 @@ fn create_and_run(launch: Launch, theme: Option<String>) -> Result<()> {
                 folder_left: HashSet::new(),
                 files_alias_shown: None,
                 transfer_timer: false,
+                edits: crate::edit_local::Edits::default(),
+                edit_timer: false,
                 forwards_view: ForwardsView::default(),
                 live_view: LiveView::default(),
                 tmux: HashMap::new(),
@@ -5064,6 +5082,59 @@ impl Window {
         self.update_menu_checks();
     }
 
+    /// A forwarded agent's request from the worker of `connection`. Only
+    /// the connection's own login channel speaks for it, and only while a
+    /// session with `ForwardAgent` is logged in on it.
+    fn on_agent_request(&mut self, connection: ChannelId, msg: Message) {
+        let peer = (msg.channel() == Some(connection))
+            .then(|| {
+                self.panes.values().find_map(|p| match &p.host {
+                    Host::Ssh(s)
+                        if s.connection == connection
+                            && s.worker_for(Some(s.channel)) == Some(connection)
+                            && s.state() == State::Connected =>
+                    {
+                        Some(crate::agent_fwd::Peer {
+                            label: s.target.label(),
+                            forward: s.target.forward_agent,
+                            agent: s.target.agent.clone(),
+                        })
+                    }
+                    _ => None,
+                })
+            })
+            .flatten();
+        let outs = self.agent_fwd.on_request(connection, msg, peer);
+        self.agent_out(outs);
+    }
+
+    /// Carries out what agent forwarding decided.
+    fn agent_out(&mut self, outs: Vec<crate::agent_fwd::Out>) {
+        use crate::agent_fwd::Out;
+        for out in outs {
+            match out {
+                Out::Send { connection, msg } => {
+                    if let Some(w) = self.workers.get(&connection) {
+                        w.link.send(msg);
+                    }
+                }
+                Out::Broker { what, job } => {
+                    if let Some(b) = &self.broker {
+                        self.broker_jobs.push_back(BrokerFor::Agent(what));
+                        b.submit(job);
+                    }
+                }
+                Out::Ask => self.queued.push(Command::AskAgentSign),
+            }
+        }
+    }
+
+    /// The user's answer to the agent question.
+    fn agent_answered(&mut self, answer: crate::agent_fwd::Answer) {
+        let outs = self.agent_fwd.answer(answer);
+        self.agent_out(outs);
+    }
+
     /// Carries out what a pane's SSH session decided.
     fn apply(&mut self, id: PaneId, effects: Vec<Effect>) {
         // A run's row that ended: the next host may start.
@@ -5120,7 +5191,7 @@ impl Window {
                         _ => 0,
                     };
                     if let Some(b) = &self.broker {
-                        self.broker_jobs.push_back(channel);
+                        self.broker_jobs.push_back(BrokerFor::Login(channel));
                         b.submit(job);
                     }
                 }
@@ -5172,7 +5243,13 @@ impl Window {
                         Some(Host::Ssh(s)) => s.target.alias.clone(),
                         _ => String::new(),
                     };
-                    if !self.start_script(id, &alias, true) {
+                    // A RemoteCommand runs instead of a shell: nothing
+                    // is typed into it.
+                    let command = matches!(
+                        self.panes.get(&id).map(|p| &p.host),
+                        Some(Host::Ssh(s)) if s.target.command.is_some()
+                    );
+                    if !command && !self.start_script(id, &alias, true) {
                         self.cd_after_login(id);
                         self.tmux_after_login(id);
                     }
@@ -5200,6 +5277,15 @@ impl Window {
                     }
                     self.prune_sftp();
                     self.prune_forwards();
+                    let live: HashSet<ChannelId> = self
+                        .panes
+                        .values()
+                        .filter_map(|p| match &p.host {
+                            Host::Ssh(s) if s.state() == State::Connected => Some(s.connection),
+                            _ => None,
+                        })
+                        .collect();
+                    self.agent_fwd.retain(|c| live.contains(&c));
                     self.refresh_chrome();
                 }
             }
@@ -6339,7 +6425,15 @@ impl Window {
         }
         // The signing broker answers in the order it was asked.
         while let Some(reply) = self.broker.as_ref().and_then(Broker::try_recv) {
-            let channel = self.broker_jobs.pop_front().unwrap_or(0);
+            let channel = match self.broker_jobs.pop_front() {
+                Some(BrokerFor::Agent(what)) => {
+                    let outs = self.agent_fwd.on_broker(what, reply);
+                    self.agent_out(outs);
+                    continue;
+                }
+                Some(BrokerFor::Login(channel)) => channel,
+                None => 0,
+            };
             let Some(id) = self.pane_of_channel(channel) else {
                 continue;
             };
@@ -6434,6 +6528,10 @@ impl Window {
                 let Some(c) = msg.channel() else {
                     return false;
                 };
+                if matches!(msg, Message::AgentList { .. } | Message::AgentSign { .. }) {
+                    self.on_agent_request(connection, msg);
+                    return false;
+                }
                 if self
                     .vdesks
                     .get(&c)
@@ -9152,20 +9250,23 @@ impl Window {
                                     .iter()
                                     .find(|k| k.explicit)
                                     .map(|k| k.path.display().to_string());
-                                Values::from_resolved(
-                                    &name,
-                                    folder.as_deref(),
-                                    &t.hostname,
-                                    &t.user,
-                                    t.port,
-                                    key.as_deref(),
-                                    &t.jumps
-                                        .iter()
-                                        .map(|j| j.alias.as_str())
-                                        .collect::<Vec<_>>()
-                                        .join(","),
-                                    &t.forwards,
-                                )
+                                Values {
+                                    forward_agent: t.forward_agent,
+                                    ..Values::from_resolved(
+                                        &name,
+                                        folder.as_deref(),
+                                        &t.hostname,
+                                        &t.user,
+                                        t.port,
+                                        key.as_deref(),
+                                        &t.jumps
+                                            .iter()
+                                            .map(|j| j.alias.as_str())
+                                            .collect::<Vec<_>>()
+                                            .join(","),
+                                        &t.forwards,
+                                    )
+                                }
                             }
                             None => Values {
                                 name: name.clone(),
@@ -11202,8 +11303,10 @@ impl Window {
                 let p = self.panes.get_mut(&pane)?;
                 p.term.scroll_to_bottom();
                 p.term.feed(pattern::test_pattern().as_bytes());
-                // The pattern asks for nothing, so there are no commands.
-                let _ = self.after_feed();
+                // The pattern asks for nothing, but commands queued
+                // before (an agent question, say) must not be lost.
+                let commands = self.after_feed();
+                self.queued.extend(commands);
             }
             cmd::FIND => {
                 self.panes.get_mut(&pane)?.term.search_open();
@@ -12261,6 +12364,44 @@ impl Window {
                 }
                 None
             }
+            Event::MakeFolder { dir, name } => {
+                if let Some(r) = self.listed_in(key.as_deref(), &dir)
+                    && let Err(e) = r.make_folder(&name)
+                {
+                    r.notice = Some(e);
+                }
+                None
+            }
+            Event::Rename { dir, from, to } => {
+                if let Some(r) = self.listed_in(key.as_deref(), &dir)
+                    && let Err(e) = r.rename(&from, &to)
+                {
+                    r.notice = Some(e);
+                }
+                None
+            }
+            Event::Chmod { dir, keys, text } => {
+                if let Some(r) = self.listed_in(key.as_deref(), &dir) {
+                    for entry in files::entries_named(&r.listing, &keys) {
+                        let old = entry.attrs.permissions.unwrap_or(0);
+                        match files::parse_mode(&text, old, entry.attrs.is_dir()) {
+                            Ok(mode) if mode == old & 0o7777 => {}
+                            Ok(mode) => r.chmod(&entry.name, mode),
+                            Err(e) => {
+                                r.notice = Some(e);
+                                break;
+                            }
+                        }
+                    }
+                }
+                None
+            }
+            Event::Edit { dir, key: name } => {
+                if let Some(queue) = key.clone() {
+                    self.edit_locally(&queue, &dir, &name);
+                }
+                None
+            }
             Event::Delete(keys) => key.and_then(|key| {
                 let listing = &self.sftp.get(&key)?.listing;
                 let entries = files::entries_named(listing, &keys);
@@ -12356,6 +12497,118 @@ impl Window {
         remote
             .and_then(|r| r.home.clone())
             .unwrap_or_else(|| b".".to_vec())
+    }
+
+    /// Queue `key`'s SFTP, when it still lists folder `dir` (the folder a
+    /// change in the pane was typed for); else a notice says so.
+    fn listed_in(&mut self, key: Option<&str>, dir: &[u8]) -> Option<&mut Remote> {
+        let r = self.sftp.get_mut(key?)?;
+        r.notice = None;
+        if r.listing.path != dir {
+            r.notice = Some("The folder changed meanwhile: nothing was done.".into());
+            return None;
+        }
+        Some(r)
+    }
+
+    /// File transfer's Edit locally: downloads entry `name` of remote
+    /// folder `dir` into a folder of its own, to open in an editor once
+    /// it is in, and to put back on each save.
+    fn edit_locally(&mut self, queue: &str, dir: &[u8], name: &[u8]) {
+        let Some(r) = self.listed_in(Some(queue), dir) else {
+            return;
+        };
+        let Some(entry) = files::entries_named(&r.listing, &[name.to_vec()])
+            .into_iter()
+            .next()
+        else {
+            return;
+        };
+        let remote_path = ferossh_sftp::names::join(dir, name);
+        let local = match crate::edit_local::edit_folder(&std::env::temp_dir().join("FeroSSH-edit"))
+        {
+            Ok(folder) => folder,
+            Err(e) => {
+                r.notice = Some(format!("Could not make a folder to edit in: {e}"));
+                return;
+            }
+        };
+        match r.download(&entry, &local) {
+            Ok(job) => {
+                let file = ferossh_sftp::names::local_name(name)
+                    .map(|n| local.join(n))
+                    .unwrap_or_else(|| local.clone());
+                self.edits
+                    .start(queue, &remote_path, file, job, entry.attrs.permissions);
+                self.edit_timer(true);
+            }
+            Err(e) => r.notice = Some(e),
+        }
+    }
+
+    fn edit_timer(&mut self, on: bool) {
+        if on == self.edit_timer {
+            return;
+        }
+        self.edit_timer = on;
+        // SAFETY: our window and timer.
+        unsafe {
+            if on {
+                SetTimer(
+                    Some(self.hwnd),
+                    TIMER_EDIT,
+                    crate::edit_local::TICK.as_millis() as u32,
+                    None,
+                );
+            } else {
+                let _ = KillTimer(Some(self.hwnd), TIMER_EDIT);
+            }
+        }
+    }
+
+    /// Moves the local edits on; returns the files to open in an editor.
+    fn on_edit_timer(&mut self) -> Vec<PathBuf> {
+        use crate::edit_local::{Action, Stamp};
+        let sftp = &self.sftp;
+        self.edits.retain(|q| sftp.contains_key(q));
+        let actions = self.edits.tick(
+            |q, id| self.sftp.get(q).and_then(|r| r.job_state(id)),
+            Stamp::of,
+        );
+        let mut open = Vec::new();
+        for action in actions {
+            match action {
+                Action::Open(path) => open.push(path),
+                Action::PutBack {
+                    queue,
+                    local,
+                    remote,
+                    mode,
+                } => {
+                    let Some(r) = self.sftp.get_mut(&queue) else {
+                        continue;
+                    };
+                    let stamp = Stamp::of(&local);
+                    match (r.put_back(&local, &remote, mode), stamp) {
+                        (Ok(job), Some(stamp)) => self.edits.sending(&local, job, stamp),
+                        (Err(e), _) => r.notice = Some(e),
+                        (Ok(_), None) => {}
+                    }
+                }
+                Action::Notice { queue, text } => {
+                    if let Some(r) = self.sftp.get_mut(&queue) {
+                        r.notice = Some(text);
+                    }
+                }
+            }
+        }
+        let watching = !self.edits.is_empty();
+        self.edit_timer(watching);
+        self.flush_sftp();
+        if self.files_visible() {
+            self.refresh_chrome();
+        }
+        open
     }
 
     /// Queues uploads and shows the queue.
@@ -12578,8 +12831,19 @@ fn shortcut(vk: VIRTUAL_KEY, m: Mods, tabs: bool, split: bool) -> Option<u32> {
 /// Follow-up actions that call into Win32 functions which send messages to
 /// the window or open dialogs, so they run after the state borrow is
 /// released.
+/// Whom a job handed to the signing broker is for.
+#[derive(Debug, Clone, Copy)]
+enum BrokerFor {
+    /// The login on this channel.
+    Login(ChannelId),
+    /// A forwarded agent.
+    Agent(crate::agent_fwd::For),
+}
+
 enum Command {
     Id(u32),
+    /// A forwarded agent asks for a signature: ask the user.
+    AskAgentSign,
     /// Window > Standby window > Press a new hotkey: says what to do,
     /// then the next key pressed becomes the hotkey.
     PickStandbyHotkey,
@@ -13384,6 +13648,30 @@ fn files_event(hwnd: HWND, event: files_panel::Event) {
     }
 }
 
+/// Opens a file downloaded for editing in an editor: the file type's
+/// Edit verb, else Notepad. Never its Open verb, which runs a script or
+/// a program instead of showing it.
+fn open_in_editor(hwnd: HWND, path: &Path) {
+    let file = HSTRING::from(path.as_os_str());
+    // SAFETY: a file of our own handed to the shell; the strings live
+    // through each call.
+    unsafe {
+        let done = ShellExecuteW(Some(hwnd), w!("edit"), &file, None, None, SW_SHOWNORMAL);
+        if done.0 as isize > 32 {
+            return;
+        }
+        let quoted = HSTRING::from(format!("\"{}\"", path.display()));
+        ShellExecuteW(
+            Some(hwnd),
+            w!("open"),
+            w!("notepad.exe"),
+            &quoted,
+            None,
+            SW_SHOWNORMAL,
+        );
+    }
+}
+
 /// Carries out what the user did in the connection form's controls.
 fn form_event(hwnd: HWND, event: form_view::Event) {
     use form_view::Event;
@@ -14118,6 +14406,42 @@ fn run_command(hwnd: HWND, command: Command) {
         }
         Command::Message(text) => {
             dialog(hwnd, &text, MB_OK | MB_ICONINFORMATION);
+        }
+        Command::AskAgentSign => {
+            use crate::agent_fwd::Answer;
+            let Some(text) = with_window(|w| w.agent_fwd.question()).flatten() else {
+                return;
+            };
+            let info = FLASHWINFO {
+                cbSize: std::mem::size_of::<FLASHWINFO>() as u32,
+                hwnd,
+                dwFlags: FLASHW_TRAY | FLASHW_TIMERNOFG,
+                uCount: 0,
+                dwTimeout: 0,
+            };
+            // SAFETY: valid struct for our window.
+            let _ = unsafe { FlashWindowEx(&info) };
+            let answer = match dialog(hwnd, &text, MB_YESNOCANCEL | MB_ICONWARNING | MB_DEFBUTTON2)
+            {
+                Some(IDYES) => Answer::Allow,
+                Some(IDCANCEL) => Answer::RefuseAll,
+                Some(_) => Answer::Refuse,
+                None => {
+                    // Another dialog is open: the question waits for it,
+                    // unanswered, and is asked again shortly.
+                    // SAFETY: our window and timer.
+                    unsafe { SetTimer(Some(hwnd), TIMER_AGENT_ASK, 500, None) };
+                    return;
+                }
+            };
+            // The next question, if one waits, comes up now, along with
+            // anything else queued meanwhile.
+            let next = with_window(|w| {
+                w.agent_answered(answer);
+                std::mem::take(&mut w.queued)
+            })
+            .unwrap_or_default();
+            run_commands(hwnd, next);
         }
         Command::UpdateFound { outcome, asked } => {
             use crate::update::Outcome;
@@ -14901,6 +15225,17 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
             WM_SHELL_OUTPUT => {
                 if let Some(commands) = with_window(Window::on_output) {
                     run_commands(hwnd, commands);
+                }
+                LRESULT(0)
+            }
+            WM_TIMER if wparam.0 == TIMER_AGENT_ASK => {
+                let _ = KillTimer(Some(hwnd), TIMER_AGENT_ASK);
+                run_command(hwnd, Command::AskAgentSign);
+                LRESULT(0)
+            }
+            WM_TIMER if wparam.0 == TIMER_EDIT => {
+                for path in with_window(Window::on_edit_timer).unwrap_or_default() {
+                    open_in_editor(hwnd, &path);
                 }
                 LRESULT(0)
             }

@@ -24,11 +24,15 @@
 use std::cell::Cell;
 use std::path::PathBuf;
 
-use ferossh_auth::{Identity, Job, KeyFileSpec, Reply, SignError, Source, userauth};
+use ferossh_auth::{
+    AgentChoice, Identity, Job, KeyChoice, KeyFileSpec, Reply, SignError, Source, userauth,
+};
 use ferossh_config::known_hosts::{self, KnownHosts, Status};
+use ferossh_config::ssh_config::{AddressFamily, RequestTty, StrictHostKeyChecking};
 use ferossh_config::{ForwardSpec, hostkey, ssh_config};
 use ferossh_ipc::{
-    ChannelId, MAX_DATA_CHUNK, Message, PromptField, PromptKind, Secrets, Timing, X11Auth,
+    ChannelId, Family, MAX_DATA_CHUNK, Message, PromptField, PromptKind, Secrets, ShellOptions,
+    Timing, X11Auth,
 };
 use ferossh_worker::crypto_policy;
 use zeroize::Zeroizing;
@@ -77,6 +81,27 @@ pub struct Target {
     /// The program that carries the connection to the first hop
     /// (`ProxyCommand`): the first jump host, or this host without jumps.
     pub proxy_command: Option<ProxyCommand>,
+    /// `CertificateFile`s, expanded.
+    pub certificates: Vec<PathBuf>,
+    /// `IdentitiesOnly yes`.
+    pub identities_only: bool,
+    /// `IdentityAgent`.
+    pub agent: AgentChoice,
+    /// `ForwardAgent yes` (or the connection form's *Forward agent*).
+    pub forward_agent: bool,
+    /// `SetEnv`, then the local variables `SendEnv` names.
+    pub env: Vec<(String, String)>,
+    /// `RemoteCommand`: run instead of a login shell.
+    pub command: Option<String>,
+    /// Whether the shell gets a terminal (`RequestTTY`).
+    pub pty: bool,
+    pub strict: StrictHostKeyChecking,
+    /// `UserKnownHostsFile`, expanded: read all, write the first. `None`
+    /// for the usual `~/.ssh/known_hosts`; empty for `none`.
+    pub known_hosts_files: Option<Vec<PathBuf>>,
+    /// `HostKeyAlias`: the name the host key is kept under.
+    pub host_key_alias: Option<String>,
+    pub family: Family,
 }
 
 /// A `ProxyCommand` to run: never through a shell.
@@ -97,6 +122,26 @@ pub struct Env {
     /// The text of `~/.ssh/config`, if any, followed by the hosts
     /// imported from PuTTY. `Include` lines are read relative to `home`.
     pub config: String,
+    /// This PC's environment variables, for `SendEnv`.
+    pub vars: Vec<(String, String)>,
+}
+
+/// The variables a target sends: `SetEnv`'s, then the local ones whose
+/// names `SendEnv` patterns match (not ones `SetEnv` already set).
+fn env_for(cfg: &ssh_config::HostConfig, vars: &[(String, String)]) -> Vec<(String, String)> {
+    let mut out = cfg.set_env.clone();
+    for (name, value) in vars {
+        if ssh_config::valid_env_name(name)
+            && cfg
+                .send_env
+                .iter()
+                .any(|p| ferossh_config::pattern::match_pattern(name, p))
+            && !out.iter().any(|(n, _)| n == name)
+        {
+            out.push((name.clone(), value.clone()));
+        }
+    }
+    out
 }
 
 impl Env {
@@ -125,7 +170,14 @@ impl Target {
         let includes = ssh_config::DirIncludes {
             home: env.home.clone(),
         };
-        let proxy = ssh_config::resolve_in(&env.config, &target.alias, &includes).proxy;
+        // The user typed, as resolve_host has it: `Match user` sees the
+        // same config both times.
+        let typed_user = ssh_config::parse_destination(typed).and_then(|(u, _, _)| u);
+        let ctx = ssh_config::MatchContext {
+            local_user: &env.local_user,
+            user: typed_user.as_deref(),
+        };
+        let proxy = ssh_config::resolve_for(&env.config, &target.alias, &includes, &ctx).proxy;
         match proxy {
             Some(ssh_config::Proxy::Jump(hops)) => {
                 for (i, hop) in hops.iter().enumerate() {
@@ -176,14 +228,21 @@ impl Target {
         let includes = ssh_config::DirIncludes {
             home: env.home.clone(),
         };
-        let cfg = ssh_config::resolve_in(&env.config, &alias, &includes);
+        let ctx = ssh_config::MatchContext {
+            local_user: &env.local_user,
+            user: user.as_deref(),
+        };
+        let cfg = ssh_config::resolve_for(&env.config, &alias, &includes, &ctx);
         let forwards = cfg.active_forwards().to_vec();
         let home = env.home.to_string_lossy();
-        let user = user.or(cfg.user).unwrap_or_else(|| env.local_user.clone());
+        let user = user
+            .or_else(|| cfg.user.clone())
+            .unwrap_or_else(|| env.local_user.clone());
         let expand = |s: &str| ssh_config::expand_path(s, &home, &env.local_user, &alias, &user);
         let hostname = cfg
             .hostname
-            .map(|h| expand(&h))
+            .as_deref()
+            .map(expand)
             .unwrap_or_else(|| alias.clone());
         let mut key_files: Vec<KeyFileSpec> = cfg
             .identity_files
@@ -202,7 +261,37 @@ impl Target {
                 });
             }
         }
+        let command = cfg.remote_command.clone().filter(|c| !c.trim().is_empty());
+        let pty = match cfg.request_tty {
+            Some(RequestTty::No) => false,
+            Some(RequestTty::Yes | RequestTty::Force) => true,
+            Some(RequestTty::Auto) | None => command.is_none(),
+        };
         Some(Self {
+            certificates: cfg
+                .certificate_files
+                .iter()
+                .map(|f| PathBuf::from(expand(f)))
+                .collect(),
+            identities_only: cfg.identities_only == Some(true),
+            agent: AgentChoice::from_config(cfg.identity_agent.as_deref()),
+            forward_agent: cfg.forward_agent == Some(true),
+            env: env_for(&cfg, &env.vars),
+            command,
+            pty,
+            strict: cfg
+                .strict_host_key_checking
+                .unwrap_or(StrictHostKeyChecking::Ask),
+            known_hosts_files: cfg
+                .user_known_hosts_files
+                .as_ref()
+                .map(|files| files.iter().map(|f| PathBuf::from(expand(f))).collect()),
+            host_key_alias: cfg.host_key_alias.clone(),
+            family: match cfg.address_family {
+                Some(AddressFamily::Inet) => Family::V4,
+                Some(AddressFamily::Inet6) => Family::V6,
+                Some(AddressFamily::Any) | None => Family::Any,
+            },
             port: port.or(cfg.port).unwrap_or(22),
             forwards,
             forward_x11: cfg.forward_x11 == Some(true),
@@ -223,6 +312,25 @@ impl Target {
             jumps: Vec::new(),
             proxy_command: None,
         })
+    }
+
+    /// What the shell's channel asks for. Jump hosts open no shell.
+    pub fn shell_options(&self) -> ShellOptions {
+        ShellOptions {
+            env: self.env.clone(),
+            command: self.command.clone(),
+            pty: self.pty,
+            agent: self.forward_agent,
+        }
+    }
+
+    /// The name and port the host key is looked up and kept under: the
+    /// `HostKeyAlias` (without a port, as in OpenSSH), else the host.
+    pub fn key_host(&self) -> (&str, u16) {
+        match &self.host_key_alias {
+            Some(alias) => (alias, 22),
+            None => (&self.hostname, self.port),
+        }
     }
 
     /// Whether `other` logs in to the same host, port and user, the same
@@ -686,8 +794,60 @@ impl SshSession {
         self.blocked().changed_key.as_deref()
     }
 
+    /// The known_hosts files to read: `UserKnownHostsFile`'s, else the
+    /// usual one.
+    fn known_files(&self) -> Vec<PathBuf> {
+        match &self.target.known_hosts_files {
+            Some(files) => files.clone(),
+            None => vec![self.known_hosts.clone()],
+        }
+    }
+
+    /// The known_hosts file new keys go to; `None` for
+    /// `UserKnownHostsFile none`.
+    fn known_file(&self) -> Option<PathBuf> {
+        self.known_files().into_iter().next()
+    }
+
     fn known(&self) -> KnownHosts {
-        KnownHosts::load(&self.known_hosts).unwrap_or_default()
+        let files = self.known_files();
+        if let [one] = files.as_slice() {
+            return KnownHosts::load(one).unwrap_or_default();
+        }
+        let mut text = String::new();
+        for f in &files {
+            if let Ok(t) = std::fs::read_to_string(f) {
+                text.push_str(&t);
+                text.push('\n');
+            }
+        }
+        KnownHosts::parse(&text)
+    }
+
+    /// Trusts a new host key: adds it to known_hosts, or says why it is
+    /// trusted for this connection only.
+    fn trust_new_key(&mut self, key: &[u8]) -> Vec<Effect> {
+        let (host, port) = self.target.key_host();
+        let (host, port) = (host.to_owned(), port);
+        let mut effects = Vec::new();
+        match self.known_file() {
+            Some(file) => match known_hosts::add(&file, &host, port, key) {
+                Ok(()) => effects.push(Effect::Show(dim(&sanitize(&format!(
+                    "Added {host} to {}.",
+                    file.display()
+                ))))),
+                Err(e) => effects.push(Effect::Show(dim(&sanitize(&format!(
+                    "Could not save the key to {} ({e}); trusting it for this \
+                     connection only.",
+                    file.display()
+                ))))),
+            },
+            None => effects.push(Effect::Show(dim(
+                "UserKnownHostsFile is none: trusting the key for this connection only.",
+            ))),
+        }
+        effects.push(self.verdict(true));
+        effects
     }
 
     /// Starts connecting with a pane of `cols` x `rows`: the first jump
@@ -709,10 +869,11 @@ impl SshSession {
 
     /// Starts this login; `via` names the jump host its stream comes from.
     fn begin(&mut self, via: Option<&str>) -> Vec<Effect> {
-        let t = &self.target;
         let known = self.known();
-        let mut host_key_algs = known.key_types(&t.hostname, t.port);
-        if known.has_authority(&t.hostname, t.port) {
+        let t = &self.target;
+        let (key_host, key_port) = t.key_host();
+        let mut host_key_algs = known.key_types(key_host, key_port);
+        if known.has_authority(key_host, key_port) {
             host_key_algs.push(crypto_policy::CERT_AUTHORITY.to_owned());
         }
         let mut text = format!(
@@ -755,6 +916,12 @@ impl SshSession {
             timing: t.timing,
             tunnel: self.tunnel,
             shell: !self.jump,
+            options: if self.jump {
+                ShellOptions::default()
+            } else {
+                t.shell_options()
+            },
+            family: t.family,
         }));
         effects
     }
@@ -943,6 +1110,7 @@ impl SshSession {
                 cols,
                 rows,
                 x11: self.x11.clone(),
+                options: self.target.shell_options(),
             }),
         ]
     }
@@ -954,6 +1122,10 @@ impl SshSession {
             && self.target.hostname.eq_ignore_ascii_case(&target.hostname)
             && self.target.port == target.port
             && self.target.user == target.user
+            // Agent requests on a connection go to one agent, asked about
+            // under one setting: panes that differ get their own.
+            && self.target.forward_agent == target.forward_agent
+            && (!target.forward_agent || self.target.agent == target.agent)
             // The same name through other jump hosts can be another host.
             && self.target.route() == target.route()
     }
@@ -1113,9 +1285,12 @@ impl SshSession {
             }
             Message::Banner { text, .. } => vec![Effect::Show(sanitize(&text))],
             Message::Notice { text, .. } => vec![Effect::Show(dim(&sanitize(&text)))],
-            Message::IdentitiesRequest { .. } => vec![Effect::Broker(Job::Identities {
+            Message::IdentitiesRequest { .. } => vec![Effect::Broker(Job::Identities(KeyChoice {
                 files: self.target.key_files.clone(),
-            })],
+                certificates: self.target.certificates.clone(),
+                agent: self.target.agent.clone(),
+                identities_only: self.target.identities_only,
+            }))],
             Message::SignRequest { key, data, .. } => {
                 self.login.signatures += 1;
                 self.on_sign_request(&key, data)
@@ -1240,7 +1415,8 @@ impl SshSession {
     /// its principals, it is valid now and nothing in it is revoked. There
     /// is no prompt either way, as in OpenSSH.
     fn on_host_cert(&mut self, cert: &HostCert, now: u64) -> Vec<Effect> {
-        let (host, port) = (self.target.hostname.clone(), self.target.port);
+        let (host, port) = self.target.key_host();
+        let (host, port) = (host.to_owned(), port);
         let (Some(ca), Some(key)) = (hostkey::describe(&cert.ca), hostkey::describe(&cert.key))
         else {
             return vec![self.verdict(false)];
@@ -1301,7 +1477,8 @@ impl SshSession {
     }
 
     fn on_host_key(&mut self, key: Vec<u8>) -> Vec<Effect> {
-        let (host, port) = (self.target.hostname.clone(), self.target.port);
+        let (host, port) = self.target.key_host();
+        let (host, port) = (host.to_owned(), port);
         let Some(desc) = hostkey::describe(&key) else {
             return vec![self.verdict(false)];
         };
@@ -1333,12 +1510,41 @@ impl SshSession {
                     desc.kind,
                     desc.bits,
                     desc.fingerprint,
-                    self.known_hosts.display(),
+                    self.known_files()
+                        .iter()
+                        .map(|f| f.display().to_string())
+                        .collect::<Vec<_>>()
+                        .join(", "),
                     lines.join(", "),
                 );
                 vec![Effect::Show(text), self.verdict(false)]
             }
             Status::Unknown { other_types } => {
+                match self.target.strict {
+                    StrictHostKeyChecking::Yes => {
+                        return vec![
+                            Effect::Show(sanitize(&format!(
+                                "{RED}{host} is not in known_hosts and StrictHostKeyChecking \
+                                 is yes, so FeroSSH did not connect. Its {} key fingerprint is \
+                                 {}.{RESET}\r\n",
+                                desc.kind, desc.fingerprint
+                            ))),
+                            self.verdict(false),
+                        ];
+                    }
+                    // Only when nothing in known_hosts says otherwise: a
+                    // host that changed its key type still asks.
+                    StrictHostKeyChecking::AcceptNew if other_types.is_empty() => {
+                        let mut effects = vec![Effect::Show(dim(&sanitize(&format!(
+                            "Trusting the new {} key {} of {host} without asking \
+                             (StrictHostKeyChecking accept-new).",
+                            desc.kind, desc.fingerprint
+                        ))))];
+                        effects.extend(self.trust_new_key(&key));
+                        return effects;
+                    }
+                    _ => {}
+                }
                 let mut text = format!(
                     "The authenticity of host {}{BOLD}{host}{RESET} can't be established.\r\n",
                     if port == 22 {
@@ -1386,12 +1592,11 @@ impl SshSession {
         let Some(key) = self.changed_key.take() else {
             return Ok(());
         };
-        known_hosts::replace(
-            &self.known_hosts,
-            &self.target.hostname,
-            self.target.port,
-            &key,
-        )
+        let Some(file) = self.known_file() else {
+            return Ok(());
+        };
+        let (host, port) = self.target.key_host();
+        known_hosts::replace(&file, host, port, &key)
     }
 
     pub fn on_broker(&mut self, reply: Reply) -> Vec<Effect> {
@@ -1487,6 +1692,7 @@ impl SshSession {
             data,
             flags,
             passphrase: None,
+            agent: self.target.agent.clone(),
         }));
         effects
     }
@@ -1722,21 +1928,7 @@ impl SshSession {
                         self.verdict(false),
                     ];
                 }
-                let (host, port) = (&self.target.hostname, self.target.port);
-                let mut effects = Vec::new();
-                match known_hosts::add(&self.known_hosts, host, port, &key) {
-                    Ok(()) => effects.push(Effect::Show(dim(&format!(
-                        "Added {host} to {}.",
-                        self.known_hosts.display()
-                    )))),
-                    Err(e) => effects.push(Effect::Show(dim(&format!(
-                        "Could not save the key to {} ({e}); trusting it for this \
-                         connection only.",
-                        self.known_hosts.display()
-                    )))),
-                }
-                effects.push(self.verdict(true));
-                effects
+                self.trust_new_key(&key)
             }
             Purpose::Answer {
                 fields,
@@ -1763,6 +1955,7 @@ impl SshSession {
                     data,
                     flags,
                     passphrase: Some(text),
+                    agent: self.target.agent.clone(),
                 })]
             }
         }
@@ -1778,6 +1971,7 @@ mod tests {
         Env {
             home: dir.to_owned(),
             local_user: "me".into(),
+            vars: Vec::new(),
             config: "Host prod\n  HostName prod.example.org\n  User admin\n  Port 2200\n".into(),
         }
     }
@@ -2099,7 +2293,8 @@ mod tests {
                 connection: 1,
                 cols: 100,
                 rows: 30,
-                x11: None
+                x11: None,
+                options: ShellOptions::default(),
             }]
         );
         assert_eq!(second.connection, 1);

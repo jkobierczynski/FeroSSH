@@ -11,6 +11,7 @@
 //! and runs anywhere tokio does, so it is tested against a real OpenSSH
 //! server on Linux.
 
+mod agent;
 pub mod crypto_policy;
 mod exec;
 mod forward;
@@ -152,6 +153,7 @@ pub async fn serve(mut inbox: mpsc::Receiver<Message>, out: mpsc::Sender<Message
                 cols,
                 rows,
                 x11,
+                options,
             } => {
                 let Some((rx, guard)) = session(channel) else {
                     continue;
@@ -159,8 +161,11 @@ pub async fn serve(mut inbox: mpsc::Receiver<Message>, out: mpsc::Sender<Message
                 guard.track(tokio::spawn(session::open(
                     channel,
                     connection,
-                    (cols, rows),
-                    x11,
+                    session::ShellRequest {
+                        size: (cols, rows),
+                        x11,
+                        options,
+                    },
                     rx,
                     out.clone(),
                     connections.clone(),
@@ -213,6 +218,8 @@ pub async fn serve(mut inbox: mpsc::Receiver<Message>, out: mpsc::Sender<Message
                 timing,
                 tunnel,
                 shell,
+                options,
+                family,
             } => {
                 // The tunnel's stream first: the UI may send its bytes
                 // right behind this message.
@@ -244,6 +251,8 @@ pub async fn serve(mut inbox: mpsc::Receiver<Message>, out: mpsc::Sender<Message
                     timing,
                     tunnel,
                     shell,
+                    options,
+                    family,
                 };
                 guard.track(tokio::spawn(session::run(
                     channel,
@@ -315,6 +324,15 @@ pub async fn serve(mut inbox: mpsc::Receiver<Message>, out: mpsc::Sender<Message
                     out.clone(),
                     connections.clone(),
                 ));
+            }
+            // To an agent channel's task, by its own id: the message's
+            // channel names the connection.
+            msg @ (Message::AgentKeys { agent, .. } | Message::AgentSigned { agent, .. }) => {
+                if let Some(Route::Stream(tx)) = routes.get(agent)
+                    && tx.send(msg).is_err()
+                {
+                    routes.remove(agent);
+                }
             }
             other => {
                 let Some(channel) = other.channel() else {

@@ -37,6 +37,8 @@ pub struct SavedHost {
     /// session names or `[user@]host[:port]`, comma-separated.
     pub proxy_jump: Option<String>,
     pub forwards: Vec<ForwardSpec>,
+    /// `ForwardAgent yes`.
+    pub forward_agent: bool,
 }
 
 /// Whether `text` can go on a `ProxyJump` line: hosts that parse, and
@@ -129,6 +131,9 @@ pub fn parse(text: &str) -> Vec<SavedHost> {
             }
             "identityfile" => h.identity_file = first.filter(|f| !f.is_empty()),
             "proxyjump" => h.proxy_jump = first.filter(|j| valid_proxy_jump(j)),
+            "forwardagent" => {
+                h.forward_agent = first.is_some_and(|f| f.eq_ignore_ascii_case("yes"));
+            }
             "localforward" | "remoteforward" | "dynamicforward" => {
                 let kind = match keyword.as_str() {
                     "localforward" => ForwardKind::Local,
@@ -190,6 +195,9 @@ pub(crate) fn write_host(out: &mut String, h: &SavedHost, comment: Option<&str>)
     for f in &h.forwards {
         let _ = writeln!(out, "    {}", f.config_line());
     }
+    if h.forward_agent {
+        let _ = writeln!(out, "    ForwardAgent yes");
+    }
 }
 
 #[cfg(test)]
@@ -213,6 +221,7 @@ mod tests {
                     parse_option("L 8080 localhost:80").unwrap(),
                     parse_option("-D 1080").unwrap(),
                 ],
+                forward_agent: true,
             },
             SavedHost {
                 alias: "pi".into(),
@@ -229,6 +238,7 @@ mod tests {
         assert_eq!(cfg.hostname.as_deref(), Some("web.example.org"));
         assert_eq!(cfg.port, Some(2222));
         assert_eq!(cfg.identity_files, [r"C:\Keys\web key"]);
+        assert_eq!(cfg.forward_agent, Some(true));
         assert_eq!(
             cfg.proxy,
             Some(Proxy::Jump(vec![

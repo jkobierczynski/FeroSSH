@@ -30,6 +30,32 @@ impl AgentKind {
     }
 }
 
+/// Which agents to ask, after `IdentityAgent`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum AgentChoice {
+    /// The OpenSSH agent (`SSH_AUTH_SOCK`, else its usual pipe) and Pageant.
+    #[default]
+    Default,
+    /// `IdentityAgent none`: no agent at all.
+    None,
+    /// `IdentityAgent PIPE`: only this agent (a named pipe on Windows, a
+    /// socket elsewhere).
+    Pipe(String),
+}
+
+impl AgentChoice {
+    /// From an `IdentityAgent` value: `none`, `SSH_AUTH_SOCK` (or
+    /// `$SSH_AUTH_SOCK`), or a pipe.
+    pub fn from_config(value: Option<&str>) -> Self {
+        match value {
+            None => Self::Default,
+            Some(v) if v.eq_ignore_ascii_case("none") => Self::None,
+            Some("SSH_AUTH_SOCK" | "$SSH_AUTH_SOCK") => Self::Default,
+            Some(v) => Self::Pipe(v.to_owned()),
+        }
+    }
+}
+
 /// A public key an agent offers.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AgentKey {
@@ -114,9 +140,25 @@ fn openssh_pipe() -> std::ffi::OsString {
 /// Keys from every agent that is running, OpenSSH's first. Agents that
 /// are not running are skipped silently; other failures are returned as
 /// notes for the user.
-pub fn list(rt: &Runtime) -> (Vec<AgentKey>, Vec<String>) {
+pub fn list(rt: &Runtime, choice: &AgentChoice) -> (Vec<AgentKey>, Vec<String>) {
     let mut keys = Vec::new();
     let mut notes = Vec::new();
+    match choice {
+        AgentChoice::None => return (keys, notes),
+        AgentChoice::Pipe(pipe) => {
+            rt.block_on(async {
+                match connect_pipe(pipe).await {
+                    Ok(c) => match list_from(c, AgentKind::OpenSsh).await {
+                        Ok(k) => keys.extend(k),
+                        Err(e) => notes.push(format!("{pipe}: {e}")),
+                    },
+                    Err(e) => notes.push(format!("The agent at {pipe} did not answer: {e}")),
+                }
+            });
+            return (keys, notes);
+        }
+        AgentChoice::Default => {}
+    }
     rt.block_on(async {
         #[cfg(windows)]
         {
@@ -154,6 +196,22 @@ pub fn list(rt: &Runtime) -> (Vec<AgentKey>, Vec<String>) {
     (keys, notes)
 }
 
+/// Connects to the agent `IdentityAgent` names.
+#[cfg(windows)]
+async fn connect_pipe(
+    pipe: &str,
+) -> Result<AgentClient<impl AgentStream + Unpin + Send>, russh::keys::Error> {
+    AgentClient::connect_named_pipe(pipe).await
+}
+
+/// Connects to the agent `IdentityAgent` names.
+#[cfg(unix)]
+async fn connect_pipe(
+    pipe: &str,
+) -> Result<AgentClient<impl AgentStream + Unpin + Send>, russh::keys::Error> {
+    AgentClient::connect_uds(pipe).await
+}
+
 /// Whether an agent error just means nothing answered.
 #[cfg_attr(not(windows), allow(dead_code))]
 fn not_running(e: &russh::keys::Error) -> bool {
@@ -165,11 +223,20 @@ fn not_running(e: &russh::keys::Error) -> bool {
 pub fn sign(
     rt: &Runtime,
     agent: AgentKind,
+    choice: &AgentChoice,
     public: &[u8],
     data: &[u8],
     flags: u32,
 ) -> Result<Vec<u8>, String> {
     rt.block_on(async {
+        match (choice, agent) {
+            (AgentChoice::None, _) => return Err("IdentityAgent is none".to_owned()),
+            (AgentChoice::Pipe(pipe), _) => {
+                let c = connect_pipe(pipe).await.map_err(|e| e.to_string())?;
+                return sign_with(c, public, data, flags).await;
+            }
+            (AgentChoice::Default, _) => {}
+        }
         match agent {
             #[cfg(windows)]
             AgentKind::OpenSsh => {

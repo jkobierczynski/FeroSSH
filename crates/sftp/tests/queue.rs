@@ -68,6 +68,8 @@ struct Fake {
     checksum_unavailable: bool,
     /// Answer reads with half of what was asked.
     short_reads: bool,
+    /// Refuse every chmod.
+    chmod_fails: bool,
 }
 
 fn attrs_of(meta: &fs::Metadata) -> FileAttrs {
@@ -99,6 +101,7 @@ impl Fake {
             fake_sum: None,
             checksum_unavailable: false,
             short_reads: false,
+            chmod_fails: false,
         }
     }
 
@@ -260,6 +263,16 @@ impl Fake {
                     return one(failed(sftp_code::FAILURE));
                 }
                 match fs::rename(from, to) {
+                    Ok(()) => one(SftpReply::Done),
+                    Err(e) => one(Self::io(&e)),
+                }
+            }
+            SftpOp::Chmod { path, mode } => {
+                if self.chmod_fails {
+                    return one(failed(sftp_code::PERMISSION_DENIED));
+                }
+                use std::os::unix::fs::PermissionsExt;
+                match fs::set_permissions(self.path(&path), fs::Permissions::from_mode(mode)) {
                     Ok(()) => one(SftpReply::Done),
                     Err(e) => one(Self::io(&e)),
                 }
@@ -799,4 +812,147 @@ fn resumed_transfers_fail_closed_when_checksums_are_unavailable() {
         fs::read(s.remote().join("up.filepart")).unwrap(),
         b"correct content"
     );
+}
+
+#[test]
+fn makes_folders_renames_and_sets_permissions() {
+    use std::os::unix::fs::PermissionsExt;
+    let s = Scratch::new("folderops");
+    fs::write(s.remote().join("a.txt"), "a").unwrap();
+    fs::write(s.remote().join("b.txt"), "b").unwrap();
+    let (mut remote, mut fake) = connected(&s.remote());
+
+    remote.make_folder(b"new").unwrap();
+    assert!(run(&mut remote, &mut fake));
+    assert!(s.remote().join("new").is_dir());
+    assert!(remote.listing.entries.iter().any(|e| e.name == b"new"));
+    // Made again: the server refuses, and the pane says so.
+    remote.make_folder(b"new").unwrap();
+    assert!(run(&mut remote, &mut fake));
+    let notice = remote.notice.take().unwrap();
+    assert!(
+        notice.starts_with("Could not create the folder"),
+        "{notice}"
+    );
+    for bad in [&b""[..], b".", b"..", b"x/y", b"a\nb"] {
+        assert!(remote.make_folder(bad).is_err(), "{bad:?}");
+        assert!(remote.rename(b"a.txt", bad).is_err(), "{bad:?}");
+    }
+
+    remote.rename(b"a.txt", b"c.txt").unwrap();
+    assert!(run(&mut remote, &mut fake));
+    assert_eq!(fs::read_to_string(s.remote().join("c.txt")).unwrap(), "a");
+    // Never over an existing name.
+    remote.rename(b"c.txt", b"b.txt").unwrap();
+    assert!(run(&mut remote, &mut fake));
+    assert!(
+        remote
+            .notice
+            .take()
+            .unwrap()
+            .starts_with("Could not rename")
+    );
+    assert_eq!(fs::read_to_string(s.remote().join("b.txt")).unwrap(), "b");
+
+    remote.chmod(b"b.txt", 0o100_750);
+    assert!(run(&mut remote, &mut fake));
+    let mode = fs::metadata(s.remote().join("b.txt"))
+        .unwrap()
+        .permissions()
+        .mode();
+    assert_eq!(mode & 0o7777, 0o750);
+    let listed = entry(&remote, "b.txt").attrs.permissions.unwrap();
+    assert_eq!(listed & 0o7777, 0o750);
+}
+
+#[test]
+fn puts_an_edited_file_back_without_asking_and_keeps_its_mode() {
+    use std::os::unix::fs::PermissionsExt;
+    let s = Scratch::new("putback");
+    let script = s.remote().join("run.sh");
+    fs::write(&script, "echo old\n").unwrap();
+    fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+    // A part left by an earlier save, longer than nothing: never resumed.
+    fs::write(
+        s.remote().join("run.sh.filepart"),
+        "echo stale and longer\n",
+    )
+    .unwrap();
+    let local = s.local().join("run.sh");
+    fs::write(&local, "echo new and longer still\n").unwrap();
+    let (mut remote, mut fake) = connected(&s.remote());
+    let id = remote
+        .put_back(&local, b"/run.sh", Some(0o100_755))
+        .unwrap();
+    assert!(run(&mut remote, &mut fake));
+    assert_eq!(remote.job_state(id), Some(State::Done));
+    assert_eq!(
+        fs::read_to_string(&script).unwrap(),
+        "echo new and longer still\n"
+    );
+    let mode = fs::metadata(&script).unwrap().permissions().mode();
+    assert_eq!(mode & 0o7777, 0o755);
+    assert!(remote.put_back(&s.local(), b"/x", None).is_err());
+}
+
+#[test]
+fn saves_of_the_same_file_go_one_at_a_time() {
+    let s = Scratch::new("putback-twice");
+    let script = s.remote().join("run.sh");
+    fs::write(&script, "echo old\n").unwrap();
+    let (first, second) = (s.local().join("a"), s.local().join("b"));
+    fs::write(&first, "echo first and much longer\n").unwrap();
+    fs::write(&second, "echo second\n").unwrap();
+    let (mut remote, mut fake) = connected(&s.remote());
+    let one = remote.put_back(&first, b"/run.sh", None).unwrap();
+    let two = remote.put_back(&second, b"/run.sh", None).unwrap();
+    assert_eq!(remote.job_state(one), Some(State::Running));
+    assert_eq!(remote.job_state(two), Some(State::Queued));
+    // A paused save still owns the part file.
+    remote.pause(one);
+    assert_eq!(remote.job_state(one), Some(State::Paused));
+    assert_eq!(remote.job_state(two), Some(State::Queued));
+    remote.resume(one);
+    assert!(run(&mut remote, &mut fake));
+    assert_eq!(remote.job_state(one), Some(State::Done));
+    assert_eq!(remote.job_state(two), Some(State::Done));
+    assert_eq!(fs::read_to_string(&script).unwrap(), "echo second\n");
+}
+
+#[test]
+fn a_retried_put_back_still_replaces_without_asking() {
+    let s = Scratch::new("putback-retry");
+    let script = s.remote().join("run.sh");
+    fs::write(&script, "echo old\n").unwrap();
+    let local = s.local().join("run.sh");
+    fs::write(&local, "echo new\n").unwrap();
+    let (mut remote, mut fake) = connected(&s.remote());
+    fake.chmod_fails = true;
+    let id = remote
+        .put_back(&local, b"/run.sh", Some(0o100_644))
+        .unwrap();
+    run(&mut remote, &mut fake);
+    assert_eq!(remote.job_state(id), Some(State::Failed));
+    fake.chmod_fails = false;
+    remote.retry(id);
+    assert!(run(&mut remote, &mut fake));
+    assert_eq!(remote.job_state(id), Some(State::Done));
+    assert_eq!(fs::read_to_string(&script).unwrap(), "echo new\n");
+}
+
+#[test]
+fn a_failed_chmod_leaves_the_original_in_place() {
+    let s = Scratch::new("putback-chmod");
+    let script = s.remote().join("run.sh");
+    fs::write(&script, "echo old\n").unwrap();
+    let local = s.local().join("run.sh");
+    fs::write(&local, "echo new\n").unwrap();
+    let (mut remote, mut fake) = connected(&s.remote());
+    fake.chmod_fails = true;
+    let id = remote
+        .put_back(&local, b"/run.sh", Some(0o100_755))
+        .unwrap();
+    run(&mut remote, &mut fake);
+    assert_eq!(remote.job_state(id), Some(State::Failed));
+    assert_eq!(fs::read_to_string(&script).unwrap(), "echo old\n");
 }

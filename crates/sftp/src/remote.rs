@@ -115,6 +115,10 @@ pub struct Job {
     /// The folder job that added it.
     pub parent: Option<JobId>,
     choice: Option<Choice>,
+    /// A file put back after editing: always from the start (never a part
+    /// left from an earlier save), and given these permission bits before
+    /// it replaces the server's copy.
+    put_back: Option<Option<u32>>,
     /// Bumped whenever the job restarts, so replies to an earlier run are
     /// told apart and dropped.
     generation: u32,
@@ -298,7 +302,9 @@ enum Purpose {
     List {
         generation: u32,
     },
-    Delete,
+    /// A change to the listed folder (delete, new folder, rename,
+    /// permissions): its failure is shown, then the folder listed again.
+    Change(&'static str),
     Job {
         job: JobId,
         generation: u32,
@@ -317,6 +323,9 @@ enum Step {
     StatPart,
     Write { len: u64 },
     CloseWritten,
+    // Gives the part file the edited file's mode; the rename waits
+    // for it so a failure never replaces the original.
+    ChmodPart,
     Rename,
     Checksum,
     RootPath,
@@ -436,6 +445,21 @@ fn remote_numbered(path: &[u8], n: u32) -> Vec<u8> {
     let dir = names::parent(path);
     let name = String::from_utf8_lossy(names::file_name(path)).into_owned();
     names::join(&dir, names::numbered(&name, n).as_bytes())
+}
+
+/// `name` when it names an entry of a folder: not empty, no `/`, not
+/// `.` or `..`, and no control characters.
+fn plain_name(name: &[u8]) -> Result<&[u8], String> {
+    if name.is_empty() {
+        return Err("Type a name.".into());
+    }
+    if name == b"." || name == b".." || name.contains(&b'/') {
+        return Err("A name cannot be . or .. or contain /.".into());
+    }
+    if name.iter().any(|b| b.is_ascii_control()) {
+        return Err("A name cannot contain control characters.".into());
+    }
+    Ok(name)
 }
 
 fn plural(n: usize) -> &'static str {
@@ -647,7 +671,82 @@ impl Remote {
         } else {
             SftpOp::Remove { path }
         };
-        self.request(op, Purpose::Delete);
+        self.request(op, Purpose::Change("delete"));
+    }
+
+    /// Makes folder `name` in the listed directory.
+    pub fn make_folder(&mut self, name: &[u8]) -> Result<(), String> {
+        let name = plain_name(name)?;
+        let path = names::join(&self.listing.path, name);
+        self.request(SftpOp::Mkdir { path }, Purpose::Change("create the folder"));
+        Ok(())
+    }
+
+    /// Renames entry `from` of the listed directory to `to`, there too.
+    /// An existing `to` is not replaced.
+    pub fn rename(&mut self, from: &[u8], to: &[u8]) -> Result<(), String> {
+        let to = plain_name(to)?;
+        if from == to {
+            return Ok(());
+        }
+        let op = SftpOp::Rename {
+            from: names::join(&self.listing.path, from),
+            to: names::join(&self.listing.path, to),
+            overwrite: false,
+        };
+        self.request(op, Purpose::Change("rename"));
+        Ok(())
+    }
+
+    /// Sets the permission bits of entry `name` of the listed directory.
+    pub fn chmod(&mut self, name: &[u8], mode: u32) {
+        let path = names::join(&self.listing.path, name);
+        self.request(
+            SftpOp::Chmod {
+                path,
+                mode: mode & 0o7777,
+            },
+            Purpose::Change("change the permissions"),
+        );
+    }
+
+    /// Queues the upload of local file `local` over remote file `remote`,
+    /// replacing it without asking: a file edited locally going back. The
+    /// new copy gets permission bits `mode` (the old copy's), so a script
+    /// stays executable.
+    pub fn put_back(
+        &mut self,
+        local: &Path,
+        remote: &[u8],
+        mode: Option<u32>,
+    ) -> Result<JobId, String> {
+        let meta = std::fs::metadata(local).map_err(|e| format!("{}: {e}", local.display()))?;
+        if !meta.is_file() {
+            return Err(format!("{} is not a file.", local.display()));
+        }
+        let name = names::display(names::file_name(remote));
+        let id = self.add(Kind::Upload, name, remote.to_vec(), local.to_path_buf());
+        if let Some(job) = self.jobs.last_mut() {
+            job.size = Some(meta.len());
+            job.choice = Some(Choice::Overwrite);
+            job.put_back = Some(mode.map(|m| m & 0o7777));
+        }
+        self.pump();
+        Ok(id)
+    }
+
+    /// Folder changes ([`Self::delete`], [`Self::make_folder`],
+    /// [`Self::rename`], [`Self::chmod`]) not answered yet.
+    pub fn pending_changes(&self) -> usize {
+        self.pending
+            .values()
+            .filter(|p| matches!(p, Purpose::Change(_)))
+            .count()
+    }
+
+    /// Where job `id` is: queued, running, done and so on.
+    pub fn job_state(&self, id: JobId) -> Option<State> {
+        self.jobs.iter().find(|j| j.id == id).map(|j| j.state)
     }
 
     fn add(&mut self, kind: Kind, name: String, remote: Vec<u8>, local: PathBuf) -> JobId {
@@ -665,6 +764,7 @@ impl Remote {
             note: None,
             parent: None,
             choice: None,
+            put_back: None,
             generation: 0,
             run: Run::Idle,
             speed: Speed::default(),
@@ -823,7 +923,8 @@ impl Remote {
         {
             job.state = if ready { State::Queued } else { State::Waiting };
             job.note = None;
-            job.choice = None;
+            // An edited file put back always replaces the original.
+            job.choice = job.put_back.map(|_| Choice::Overwrite);
         }
         self.pump();
     }
@@ -982,12 +1083,26 @@ impl Remote {
             if job.state != State::Queued {
                 continue;
             }
-            if job.kind.is_folder() {
-                self.start(i);
-            } else if active < self.parallel {
-                active += 1;
-                self.start(i);
+            let file = !job.kind.is_folder();
+            if file && active >= self.parallel {
+                continue;
             }
+            // One upload at a time owns a target's part file: a second
+            // save of the same edited file waits for the first.
+            if job.kind == Kind::Upload
+                && self.jobs.iter().enumerate().any(|(k, other)| {
+                    k != i
+                        && other.kind == Kind::Upload
+                        && other.remote == job.remote
+                        && matches!(other.state, State::Running | State::Paused)
+                })
+            {
+                continue;
+            }
+            if file {
+                active += 1;
+            }
+            self.start(i);
         }
         for i in 0..self.jobs.len() {
             if self.jobs.get(i).is_some_and(|j| j.state == State::Running) {
@@ -1149,10 +1264,10 @@ impl Remote {
     fn on_reply(&mut self, purpose: Purpose, reply: SftpReply) {
         match purpose {
             Purpose::Ignore => {}
-            Purpose::Delete => {
+            Purpose::Change(what) => {
                 if let SftpReply::Failed { code, message } = &reply {
                     self.notice =
-                        Some(format!("Could not delete: {}", failed_text(*code, message)));
+                        Some(format!("Could not {what}: {}", failed_text(*code, message)));
                 }
                 self.refresh();
             }
@@ -1267,6 +1382,7 @@ impl Remote {
             }
             (Step::CloseWritten, SftpReply::Done) => self.upload_closed(i),
             (Step::Checksum, SftpReply::Checksum(hex)) => self.set_remote_sum(i, Ok(hex)),
+            (Step::ChmodPart, SftpReply::Done) => self.rename_part(i),
             (Step::Rename, SftpReply::Done) => {
                 let note = match self.jobs.get(i).map(|j| &j.run) {
                     Some(Run::Up(u)) => u.check.note(),
@@ -1545,7 +1661,9 @@ impl Remote {
             return;
         };
         let size = job.size.unwrap_or(0);
-        let resume = have.filter(|&h| h <= size).unwrap_or(0);
+        let resume = have
+            .filter(|&h| h <= size && job.put_back.is_none())
+            .unwrap_or(0);
         let opened = File::open(&job.local).and_then(|mut f| {
             f.seek(SeekFrom::Start(resume))?;
             Ok(f)
@@ -1707,10 +1825,25 @@ impl Remote {
     }
 
     fn rename_upload(&mut self, i: usize) {
-        let Some(Run::Up(u)) = self.jobs.get_mut(i).map(|j| &mut j.run) else {
+        let Some(job) = self.jobs.get_mut(i) else {
+            return;
+        };
+        let mode = job.put_back.flatten();
+        let Run::Up(u) = &mut job.run else {
             return;
         };
         u.phase = Phase::Renaming;
+        if let Some(mode) = mode {
+            let path = u.part.clone();
+            return self.job_request(i, SftpOp::Chmod { path, mode }, Step::ChmodPart);
+        }
+        self.rename_part(i);
+    }
+
+    fn rename_part(&mut self, i: usize) {
+        let Some(Run::Up(u)) = self.jobs.get_mut(i).map(|j| &mut j.run) else {
+            return;
+        };
         let op = SftpOp::Rename {
             from: u.part.clone(),
             to: u.target.clone(),

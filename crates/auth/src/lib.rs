@@ -16,4 +16,5 @@ pub mod userauth;
 #[cfg(windows)]
 pub mod webauthn;
 
-pub use broker::{Broker, Identity, Job, KeyFileSpec, Reply, SignError, Source};
+pub use agent::AgentChoice;
+pub use broker::{Broker, Identity, Job, KeyChoice, KeyFileSpec, Reply, SignError, Source};
