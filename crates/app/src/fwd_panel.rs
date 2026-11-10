@@ -116,6 +116,8 @@ struct State {
     conns: Vec<(ChannelId, String)>,
     /// The forward the form changes, and its connection.
     editing: Option<(ChannelId, ForwardSpec)>,
+    /// The change last saved from the form: refused, it is changed again.
+    replacing: Option<(ChannelId, ForwardSpec)>,
     /// The line under the form, and whether it is a problem.
     message: Option<(String, bool)>,
     /// Where the message and the selected row's details are painted.
@@ -277,6 +279,7 @@ pub fn create(main: HWND, handler: Handler, dpi: u32) -> windows::core::Result<(
                 rows: None,
                 conns: Vec::new(),
                 editing: None,
+                replacing: None,
                 message: None,
                 message_at: RECT::default(),
                 details_at: RECT::default(),
@@ -570,6 +573,11 @@ pub fn notice(spec: Option<ForwardSpec>, why: String) {
     };
     if let Some(spec) = spec {
         fill_form(&h, &spec);
+        // A refused change stays a change: Save again replaces the
+        // forward rather than adding another.
+        if let Some(was) = with(|s| s.replacing.take()).flatten() {
+            set_editing(&h, Some(was));
+        }
     }
     say(&h, why, true);
 }
@@ -764,6 +772,13 @@ fn submit(h: &Handles) {
             connection: picked_connection(),
         },
     };
+    let replacing = match &action {
+        FwdAction::Replace {
+            connection, old, ..
+        } => Some((*connection, old.clone())),
+        _ => None,
+    };
+    with(|s| s.replacing = replacing);
     quiet(h);
     // Emptied first: a refusal puts the forward back.
     clear_form(h);
@@ -816,6 +831,7 @@ fn retry_selected(h: &Handles) {
     }
     if let Some(spec) = row.spec {
         quiet(h);
+        with(|s| s.replacing = None);
         emit(Event::Action(FwdAction::Replace {
             connection: row.connection,
             old: spec.clone(),
@@ -830,6 +846,7 @@ fn stop_selected(h: &Handles) {
     };
     if let Some(index) = row.forward {
         quiet(h);
+        with(|s| s.replacing = None);
         emit(Event::Action(FwdAction::Remove {
             connection: row.connection,
             index,
