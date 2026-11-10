@@ -4278,6 +4278,13 @@ impl Window {
                     return false;
                 }
                 if matches!(button, Some((_, true))) {
+                    if self.side.visible && !self.settings.tools_pinned {
+                        // Pin off: a click on a remote desktop ends the
+                        // peek too; the desktop does not get it.
+                        self.hide_side();
+                        self.focus_pane(id);
+                        return true;
+                    }
                     if self.focused_id() != id {
                         self.focus_pane(id);
                     }
@@ -9683,7 +9690,18 @@ impl Window {
             let id = self.mouse.pane.take()?;
             return self.pane_button(id, button, false, (x, y), mods);
         }
-        match self.spot(x, y) {
+        let spot = self.spot(x, y);
+        if self.side.visible
+            && !self.settings.tools_pinned
+            && matches!(spot, Spot::Strip(_) | Spot::Divider(_) | Spot::Nothing)
+        {
+            // Pin off: a click anywhere outside the tools (the tab strip,
+            // a divider, a pane's margin) ends the peek, as one on a pane
+            // does. The click only does that, since everything moves.
+            self.hide_side();
+            return None;
+        }
+        match spot {
             Spot::SideEdge if button == MouseButton::Left => {
                 self.capture(true);
                 self.drag = Some(Drag::SideEdge);
