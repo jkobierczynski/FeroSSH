@@ -123,6 +123,12 @@ impl Recorder {
     }
 
     fn typed_char(&mut self, c: char) {
+        // The echo check looks only at what came back after typing began:
+        // a prompt such as `password for admin:` must not count as the
+        // echo of a typed `admin…` password.
+        if self.line.is_empty() && !self.split {
+            self.echo.clear();
+        }
         if self.line.chars().count() < MAX_TEXT {
             self.line.push(c);
         }
@@ -275,5 +281,15 @@ mod tests {
         assert!(!rec.lines.iter().any(|l| l.contains("hunter2")));
         let steps = expand(&rec.lines, true, |_| String::new(), |_| String::new());
         assert_eq!(steps.get(1), Some(&Step::Password));
+    }
+
+    #[test]
+    fn a_prompt_naming_the_password_is_not_its_echo() {
+        let mut r = Recorder::default();
+        r.output(b"[sudo] password for admin: ");
+        typing(&mut r, "admin123\r", false);
+        let rec = r.finish();
+        assert_eq!(rec.lines, ["@password"]);
+        assert!(!rec.lines.iter().any(|l| l.contains("admin")));
     }
 }

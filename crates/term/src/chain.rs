@@ -348,6 +348,19 @@ pub fn read_index(index: &str) -> Result<Vec<IndexEntry>, usize> {
 /// A report for the user on a log, its chain and the index.
 pub fn report(file_name: &str, log: &[u8], chain: Option<&str>, index: Option<&str>) -> String {
     let Some(chain) = chain else {
+        // A log the index lists had a chain: deleting it must not pass
+        // for a log from before chains.
+        let name = file_name.replace(char::is_whitespace, "_");
+        let listed = index
+            .and_then(|i| read_index(i).ok())
+            .is_some_and(|entries| entries.iter().any(|e| e.file_name == name));
+        if listed {
+            return format!(
+                "WARNING: {file_name} has no chain file ({file_name}.chain), but the log \
+                 index ({INDEX_FILE}) lists it, so its chain file was deleted. The log \
+                 cannot be checked and may have been changed."
+            );
+        }
         return format!(
             "{file_name} has no chain file ({file_name}.chain), so it cannot be checked. \
              Logs from earlier FeroSSH versions have none."
@@ -506,5 +519,11 @@ mod tests {
         assert!(bad.contains("rewritten together"), "{bad}");
         let none = report("a.log", &log, None, None);
         assert!(none.contains("no chain file"), "{none}");
+        assert!(!none.contains("WARNING"), "{none}");
+        let deleted = report("a.log", &log, None, Some(&index));
+        assert!(
+            deleted.contains("WARNING") && deleted.contains("deleted"),
+            "{deleted}"
+        );
     }
 }

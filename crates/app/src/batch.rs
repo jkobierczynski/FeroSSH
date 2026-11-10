@@ -148,10 +148,22 @@ pub struct Report {
     pub run: Option<Run>,
 }
 
-/// Quotes a CSV field when it needs it.
+/// A cell a spreadsheet will show as text: one that starts like a
+/// formula (`=`, `+`, `-`, `@`, even after spaces) gets a leading `'`.
+/// Quoting alone does not stop Excel from running `"=cmd|…"`, and the
+/// values come from the servers' output.
+fn neutral(text: &str) -> String {
+    if text.trim_start().starts_with(['=', '+', '-', '@']) {
+        format!("'{text}")
+    } else {
+        text.to_owned()
+    }
+}
+
+/// Quotes a CSV field when it needs it, after making it [`neutral`].
 fn csv_field(text: &str) -> String {
-    let text = text.replace(['\r', '\n'], " ");
-    if text.contains([',', '"', ';']) || text.starts_with([' ', '=', '+', '-', '@']) {
+    let text = neutral(&text.replace(['\r', '\n'], " "));
+    if text.contains([',', '"', ';']) || text.starts_with(' ') {
         format!("\"{}\"", text.replace('"', "\"\""))
     } else {
         text
@@ -273,7 +285,7 @@ impl Report {
             out.push_str(&format!("\tValue {i}"));
         }
         out.push_str("\r\n");
-        let cell = |t: &str| t.replace(['\t', '\r', '\n'], " ");
+        let cell = |t: &str| neutral(&t.replace(['\t', '\r', '\n'], " "));
         for r in &self.rows {
             out.push_str(&format!("{}\t{}", cell(&r.label), cell(&r.state.label())));
             for v in &r.values {
@@ -286,7 +298,7 @@ impl Report {
     }
 
     /// The report as CSV. Fields a spreadsheet would read as a formula
-    /// are quoted.
+    /// start with `'`.
     pub fn csv(&self) -> String {
         let width = self.rows.iter().map(|r| r.values.len()).max().unwrap_or(0);
         let mut out = String::from("Host,Status");
@@ -545,12 +557,12 @@ mod tests {
         assert_eq!(
             r.table(),
             "Host\tStatus\tValue 1\tValue 2\r\nsw0\tdone\t15.2(4)E10\ta,b\r\n\
-             =cmd|' /C calc'!A0\tfailed: asked for a password\r\n"
+             '=cmd|' /C calc'!A0\tfailed: asked for a password\r\n"
         );
         assert_eq!(
             r.csv(),
             "Host,Status,Value 1,Value 2\r\nsw0,done,15.2(4)E10,\"a,b\"\r\n\
-             \"=cmd|' /C calc'!A0\",failed: asked for a password\r\n"
+             '=cmd|' /C calc'!A0,failed: asked for a password\r\n"
         );
     }
 
