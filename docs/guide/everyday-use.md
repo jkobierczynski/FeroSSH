@@ -120,11 +120,11 @@ Secrets are never written to a FeroSSH file. The first time, the pane asks for t
 
 Ctrl+Shift+Space (Tools > Scripts) lists named command lines, grouped under their categories, with each script's hotkey, auto-response text and first line, and the selected script's lines under the list. Type in the search box (or just start typing in the list) to search names, categories and lines, then Enter, a double-click or Run types the script with Enter after each line, or Shift+Enter leaves the last line for you to finish. Left and Right jump between categories, and a right click offers the same as the buttons. With broadcast input on, it goes to every broadcast pane, so one script works several terminals at once.
 
-Insert or New adds a script (what you typed as a search becomes its name), F2 or Edit edits one, Del or Delete removes one, and F5 or On hosts runs it on saved hosts you pick. Edit > Save selection as script starts one from text selected in a pane.
+Insert or New adds a script (what you typed as a search becomes its name), F2 or Edit edits one, Del or Delete removes one, and F5 or On hosts runs it on saved hosts you pick. The editor has a field each for the name, category, hosts, folders, hotkey and *When* text, and a box for the lines below them; Save (or Enter in a field, or Ctrl+Enter in the lines) stores it, and Cancel or Escape leaves it. When something is wrong the reason shows above the buttons and the keyboard goes to the field or line at fault. Edit > Save selection as script starts one from text selected in a pane.
 
 **Categories.** The editor's *Category* field files a script under a category, such as `Linux` or `Network/Cisco` (a `/` makes a category within a category, up to four deep). A new script starts in the category of the one selected.
 
-**Enter or not, per line.** In the editor, Enter ends a line, and that line is typed with Enter after it. Shift+Enter ends a line that is typed without Enter: it becomes an `@type` line and shows *no Enter*, so a script can fill in a command and leave it for you to check, or type a password prompt's answer only after a `@key`.
+**Enter or not, per line.** In the editor, Enter ends a line, and that line is typed with Enter after it. Shift+Enter ends a line that is typed without Enter: it becomes an `@type` line, so a script can fill in a command and leave it for you to check, or type a password prompt's answer only after a `@key`.
 
 **Arguments.** `$1` to `$9`, or `${1:Gi0/1}` with a default, are asked for in the side pane before the script is typed, prefilled with the defaults, with a preview of what will be typed. `$$` types a plain `$`; other `$` text such as `$HOME` is left alone.
 

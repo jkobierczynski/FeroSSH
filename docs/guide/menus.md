@@ -240,7 +240,7 @@ The arrow buttons between the lists move the selection across, and the gap betwe
 
 The Run, Edit, New, Delete and On hosts buttons under the list, and the list's right-click menu, do the same.
 
-In the script editor, Enter ends a line, which is typed with Enter after it; Shift+Enter ends a line that is typed without Enter (it becomes an `@type` line, shown as *no Enter*).
+In the script editor's lines, Enter ends a line, which is typed with Enter after it; Shift+Enter ends a line that is typed without Enter (it becomes an `@type` line). Enter in a field or Ctrl+Enter in the lines saves; Escape cancels.
 
 In a run's report, Enter shows that host's pane, C copies the report as a table, S saves it as CSV in the download folder, R runs the failed hosts again and Esc stops the run (or closes the report when it is over).
 
