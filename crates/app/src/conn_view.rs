@@ -660,10 +660,13 @@ fn draw_detail(tree: HWND, cd: &NMTVCUSTOMDRAW) {
     }
     // TVM_GETITEMRECT takes the item in the rectangle's first field.
     let mut rc = RECT::default();
-    // SAFETY: RECT is at least pointer-sized and suitably aligned for the
-    // handle written into its start; the tree overwrites it.
+    // SAFETY: RECT (16 bytes) has room for the handle written into its
+    // start; RECT is only 4-aligned, so the write is unaligned. The tree
+    // overwrites it.
     unsafe {
-        *(&raw mut rc).cast::<isize>() = cd.nmcd.dwItemSpec as isize;
+        (&raw mut rc)
+            .cast::<isize>()
+            .write_unaligned(cd.nmcd.dwItemSpec as isize);
     }
     // SAFETY: our own control and the DC it lent for this paint; the font
     // is selected back out.

@@ -293,7 +293,8 @@ pub fn place(at: Option<Rect>, width: i32, dpi: u32) {
         x += w + gap;
     }
     let buttons_h = rows * button + (rows - 1) * gap;
-    let buttons_y = (at.h - pad - buttons_h).max(list_y + 4 * button);
+    // The list gives up room before the buttons leave the panel.
+    let buttons_y = (at.h - pad - buttons_h).max(list_y + button);
     let list_h = (buttons_y - gap - list_y).max(button);
     with(|s| {
         s.help_at = RECT {
