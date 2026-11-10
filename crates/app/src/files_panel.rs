@@ -66,8 +66,8 @@ use windows::Win32::UI::WindowsAndMessaging::{
 use windows::core::{PCWSTR, PWSTR, w};
 
 use crate::files::{
-    self, Arrange, FileRow, Follow, LocalPane, QueueRow, SyncLocal, SyncPending, SyncStep,
-    filtered, local_rows,
+    self, Arrange, BackStep, FileRow, Follow, LocalPane, QueueRow, SyncLocal, SyncPending,
+    SyncStep, filtered, local_rows,
 };
 use crate::layout::Rect;
 use crate::native::{fonts, key_down, pass_edge, scale, search_text, set_font, wide};
@@ -122,6 +122,11 @@ pub enum JobOp {
 pub enum Event {
     /// List this remote folder.
     Browse(Vec<u8>),
+    /// Sync's go-back: list remote folder `path`, but only on queue `key`.
+    SyncBack {
+        key: Option<String>,
+        path: Vec<u8>,
+    },
     Home,
     Refresh,
     /// Download these entries of the listed remote folder into `into`.
@@ -309,6 +314,8 @@ struct State {
     /// wait in `deferred` and go out from a posted message.
     in_view: bool,
     deferred: Vec<Event>,
+    /// A Sync go-back waiting for the Remote list to settle.
+    going_back: Option<files::SyncBack>,
 }
 
 /// Posted to the main window when events wait in `deferred`: it hands
@@ -697,6 +704,7 @@ pub fn create(main: HWND, handler: Handler, dpi: u32) -> windows::core::Result<(
                 title_buttons_x: i32::MAX,
                 in_view: false,
                 deferred: Vec::new(),
+                going_back: None,
                 shown_host: None,
             });
         });
@@ -1214,6 +1222,26 @@ pub fn set_view(view: View) {
             }
             step => step,
         };
+        // A go-back settles: say how it went.
+        if let Some(back) = s.going_back.take() {
+            let remote_error = view
+                .status
+                .as_ref()
+                .filter(|st| st.1)
+                .map(|st| st.0.as_str());
+            match files::back_step(
+                &back,
+                view.key.as_deref(),
+                alias_changed,
+                view.remote_loading,
+                &view.remote_dir,
+                remote_error,
+            ) {
+                BackStep::Wait => s.going_back = Some(back),
+                BackStep::Dropped => s.local_error = None,
+                BackStep::Done(line) => s.local_error = Some(line),
+            }
+        }
         let queue = s.queue_shown != view.queue;
         let before = (
             s.queue_shown.len(),
@@ -1271,8 +1299,17 @@ pub fn set_view(view: View) {
                 SyncLocal::Up => local_up(&h),
             };
             if !moved {
-                // Both or neither: the Remote list goes back.
-                emit(Event::Browse(p.back));
+                // Both or neither: the Remote list goes back, on the same
+                // queue; the line says how that went once it has.
+                let back = files::SyncBack {
+                    key: p.key,
+                    path: p.back,
+                };
+                with(|s| s.going_back = Some(back.clone()));
+                emit(Event::SyncBack {
+                    key: back.key,
+                    path: back.path,
+                });
                 local_problem(
                     "Sync browsing: the Local folder did not open, so Remote is going back to where it was.".into(),
                 );

@@ -11898,6 +11898,16 @@ impl Window {
                 }
                 None
             }
+            Event::SyncBack { key: on, path } => {
+                // Only on the queue it left: the view may have moved on.
+                if on == key
+                    && let Some(r) = key.as_ref().and_then(|k| self.sftp.get_mut(k))
+                {
+                    r.notice = None;
+                    r.browse(&path);
+                }
+                None
+            }
             Event::Home => {
                 if let Some(r) = key.as_ref().and_then(|k| self.sftp.get_mut(k))
                     && let Some(home) = r.home.clone()

@@ -573,11 +573,96 @@ pub fn sync_step(
     }
 }
 
+/// A Sync move whose Local half failed: the Remote list is going back to
+/// `path` on queue `key`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SyncBack {
+    pub key: Option<String>,
+    pub path: Vec<u8>,
+}
+
+/// Where a Remote go-back stands after a new view of the Remote list.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum BackStep {
+    /// Still listing: keep waiting.
+    Wait,
+    /// Another queue or connection now: nothing more to say.
+    Dropped,
+    /// Settled: the line to show under the lists.
+    Done(String),
+}
+
+/// Resolves go-back `back` against the Remote list now shown (see
+/// [`sync_step`]); `remote_error` is the Remote list's own problem line.
+pub fn back_step(
+    back: &SyncBack,
+    key: Option<&str>,
+    alias_changed: bool,
+    loading: bool,
+    remote_dir: &[u8],
+    remote_error: Option<&str>,
+) -> BackStep {
+    if back.key.as_deref() != key || alias_changed {
+        return BackStep::Dropped;
+    }
+    if loading {
+        return BackStep::Wait;
+    }
+    if remote_dir == back.path.as_slice() {
+        return BackStep::Done(
+            "Sync browsing: the Local folder did not open, so Remote went back to where it was."
+                .into(),
+        );
+    }
+    BackStep::Done(match remote_error {
+        Some(e) => format!(
+            "Sync browsing: the Local folder did not open, and Remote could not go back: {e}"
+        ),
+        None => {
+            "Sync browsing: the Local folder did not open, and Remote could not go back.".into()
+        }
+    })
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::indexing_slicing)]
 mod tests {
     use super::*;
     use ferossh_ipc::FileAttrs;
+
+    #[test]
+    fn sync_go_back_reports_how_it_went() {
+        let back = SyncBack {
+            key: Some("k".into()),
+            path: b"/srv".to_vec(),
+        };
+        let step =
+            |key, alias, loading, dir: &[u8], err| back_step(&back, key, alias, loading, dir, err);
+        assert_eq!(
+            step(Some("k"), false, true, b"/srv/a", None),
+            BackStep::Wait
+        );
+        assert!(matches!(
+            step(Some("k"), false, false, b"/srv", None),
+            BackStep::Done(t) if t.contains("went back")
+        ));
+        assert!(matches!(
+            step(Some("k"), false, false, b"/srv/a", Some("Permission denied")),
+            BackStep::Done(t) if t.contains("could not go back: Permission denied")
+        ));
+        assert!(matches!(
+            step(Some("k"), false, false, b"/srv/a", None),
+            BackStep::Done(t) if t.contains("could not go back")
+        ));
+        assert_eq!(
+            step(Some("other"), false, false, b"/srv", None),
+            BackStep::Dropped
+        );
+        assert_eq!(
+            step(Some("k"), true, false, b"/srv", None),
+            BackStep::Dropped
+        );
+    }
 
     #[test]
     fn sync_moves_local_only_once_remote_listed() {
