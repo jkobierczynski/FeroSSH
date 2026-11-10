@@ -506,6 +506,37 @@ pub struct NativeAsk {
     pub preview: Vec<String>,
 }
 
+/// One host the native picker lists.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NativePickHost {
+    /// Its place in the picker, to pick it.
+    pub index: usize,
+    pub folder: Option<String>,
+    pub name: String,
+    /// `user@host`.
+    pub detail: String,
+    pub picked: bool,
+}
+
+/// The host picker, as the native page shows it (see
+/// [`SnippetsView::native_picker`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NativePicker {
+    /// Another number for another picker: the boxes are filled anew.
+    pub serial: u64,
+    pub name: String,
+    /// The hosts the search keeps, by folder (hosts in no folder last).
+    pub hosts: Vec<NativePickHost>,
+    /// Hosts picked, of all of them (shown or not).
+    pub picked: usize,
+    pub total: usize,
+    pub filter: String,
+    pub parallel: String,
+    pub error: Option<String>,
+    /// The field at fault: 0 the list, 1 at once.
+    pub fault: usize,
+}
+
 /// A line made one typed without Enter, as Shift+Enter in the editor
 /// makes it (an `@type` line).
 pub fn without_enter(line: &str) -> String {
@@ -529,6 +560,8 @@ pub struct SnippetsView {
     /// The first report row shown.
     report_scroll: usize,
     picker: Option<Picker>,
+    /// Another number for another picker: the native page fills anew.
+    pick_serial: u64,
 }
 
 /// Lines of the picker above its list: title, help, filter, at once,
@@ -723,6 +756,93 @@ impl SnippetsView {
         self.draft = None;
     }
 
+    /// The host picker, for the native page.
+    pub fn native_picker(&self) -> Option<NativePicker> {
+        let p = self.picker.as_ref()?;
+        let hosts = p
+            .lines()
+            .into_iter()
+            .filter_map(|l| match l {
+                PickLine::Host(i) => Some(i),
+                PickLine::Folder(_) => None,
+            })
+            .filter_map(|i| {
+                let h = p.hosts.get(i)?;
+                Some(NativePickHost {
+                    index: i,
+                    folder: h.place.folder.clone(),
+                    name: h.place.session.clone(),
+                    detail: h.detail.clone(),
+                    picked: h.picked,
+                })
+            })
+            .collect();
+        Some(NativePicker {
+            serial: self.pick_serial,
+            name: p.name.clone(),
+            hosts,
+            picked: p.picked(),
+            total: p.hosts.len(),
+            filter: p.filter.clone(),
+            parallel: p.parallel.clone(),
+            error: p.error.clone(),
+            fault: usize::from(p.field == PickField::Parallel),
+        })
+    }
+
+    /// Picks or drops host `index` of the picker.
+    pub fn native_pick(&mut self, index: usize, picked: bool) {
+        if let Some(p) = &mut self.picker
+            && let Some(h) = p.hosts.get_mut(index)
+        {
+            h.picked = picked;
+            p.error = None;
+        }
+    }
+
+    /// Picks or drops every host the search keeps.
+    pub fn native_pick_shown(&mut self, picked: bool) {
+        let Some(p) = &mut self.picker else {
+            return;
+        };
+        let shown: Vec<usize> = p
+            .lines()
+            .into_iter()
+            .filter_map(|l| match l {
+                PickLine::Host(i) => Some(i),
+                PickLine::Folder(_) => None,
+            })
+            .collect();
+        for i in shown {
+            if let Some(h) = p.hosts.get_mut(i) {
+                h.picked = picked;
+            }
+        }
+        p.error = None;
+    }
+
+    /// The picker's search box says `text`.
+    pub fn native_pick_filter(&mut self, text: &str) {
+        if let Some(p) = &mut self.picker {
+            p.filter = text.chars().filter(|c| !c.is_control()).take(60).collect();
+        }
+    }
+
+    /// Run on the native picker, with its At once and password boxes:
+    /// starts the run, asks for the arguments first, or (`None`) says
+    /// why not.
+    pub fn native_pick_start(&mut self, parallel: &str, password: Password) -> Option<SnipAction> {
+        let p = self.picker.as_mut()?;
+        p.parallel = parallel.trim().chars().take(2).collect();
+        p.password = password;
+        self.pick_start()
+    }
+
+    /// Cancel or Escape on the native picker: the list again.
+    pub fn native_pick_cancel(&mut self) {
+        self.picker = None;
+    }
+
     /// The arguments being asked for, for the native page.
     pub fn native_ask(&self) -> Option<NativeAsk> {
         let a = self.asking.as_ref()?;
@@ -824,6 +944,7 @@ impl SnippetsView {
         self.draft = None;
         self.asking = None;
         self.picker = Some(picker);
+        self.pick_serial = DRAFTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Whether the host picker is shown.
@@ -1191,6 +1312,48 @@ impl SnippetsView {
         None
     }
 
+    /// Starts the run the picker set up: at once, or once its arguments
+    /// are asked for. `None` with the picker's error when it cannot.
+    fn pick_start(&mut self) -> Option<SnipAction> {
+        let p = self.picker.as_mut()?;
+        let (hosts, parallel) = p.start()?;
+        let password = (!p.password.0.is_empty()).then(|| p.password.clone());
+        let p = self.picker.take()?;
+        let args = login::args(&p.lines);
+        if args.is_empty() {
+            return Some(SnipAction::RunOn {
+                name: p.name,
+                hosts,
+                run: Run {
+                    lines: p.lines,
+                    args: Vec::new(),
+                    parallel,
+                    password,
+                },
+            });
+        }
+        // The variables differ per host: shown by name.
+        let vars = login::VARIABLES
+            .iter()
+            .map(|v| (*v, format!("${{{v}}}")))
+            .collect();
+        let mut a = Asking {
+            name: p.name,
+            lines: p.lines,
+            enter: true,
+            vars,
+            values: args.iter().map(|a| a.default.clone()).collect(),
+            args,
+            focus: 0,
+            cursor: 0,
+            on: Some((hosts, parallel, password)),
+            serial: DRAFTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+        };
+        a.set_focus(0);
+        self.asking = Some(a);
+        None
+    }
+
     fn pick_key(&mut self, key: SideKey, rows: usize) -> Option<SnipAction> {
         let p = self.picker.as_mut()?;
         let n = p.lines().len();
@@ -1206,44 +1369,7 @@ impl SnippetsView {
                 return None;
             }
             (f, SideKey::Tab) => p.field = next(f),
-            (_, SideKey::Enter { .. }) => {
-                let (hosts, parallel) = p.start()?;
-                let password = (!p.password.0.is_empty()).then(|| p.password.clone());
-                let p = self.picker.take()?;
-                let args = login::args(&p.lines);
-                if args.is_empty() {
-                    return Some(SnipAction::RunOn {
-                        name: p.name,
-                        hosts,
-                        run: Run {
-                            lines: p.lines,
-                            args: Vec::new(),
-                            parallel,
-                            password,
-                        },
-                    });
-                }
-                // The variables differ per host: shown by name.
-                let vars = login::VARIABLES
-                    .iter()
-                    .map(|v| (*v, format!("${{{v}}}")))
-                    .collect();
-                let mut a = Asking {
-                    name: p.name,
-                    lines: p.lines,
-                    enter: true,
-                    vars,
-                    values: args.iter().map(|a| a.default.clone()).collect(),
-                    args,
-                    focus: 0,
-                    cursor: 0,
-                    on: Some((hosts, parallel, password)),
-                    serial: DRAFTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
-                };
-                a.set_focus(0);
-                self.asking = Some(a);
-                return None;
-            }
+            (_, SideKey::Enter { .. }) => return self.pick_start(),
             (PickField::List, SideKey::Up) => p.selected = p.selected.saturating_sub(1),
             (PickField::List, SideKey::Down) => p.selected += 1,
             (PickField::List, SideKey::PageUp) => {
@@ -2655,6 +2781,56 @@ mod tests {
             ],
             4,
         )
+    }
+
+    #[test]
+    fn the_native_picker_picks_and_starts() {
+        let mut v = SnippetsView::default();
+        assert!(v.native_picker().is_none());
+        v.show_picker(picker());
+        let p = v.native_picker().unwrap();
+        assert_eq!((p.name.as_str(), p.picked, p.total), ("Version", 0, 3));
+        assert_eq!(
+            p.hosts.iter().map(|h| h.name.as_str()).collect::<Vec<_>>(),
+            ["sw1", "sw2", "web"]
+        );
+        // Nothing picked: refused, on the list.
+        assert_eq!(v.native_pick_start("4", Password::default()), None);
+        let p = v.native_picker().unwrap();
+        assert!(p.error.as_deref().unwrap().contains("Pick at least one"));
+        assert_eq!(p.fault, 0);
+        v.native_pick_filter("sw");
+        v.native_pick_shown(true);
+        v.native_pick_filter("");
+        let p = v.native_picker().unwrap();
+        assert_eq!(p.picked, 2);
+        assert!(p.error.is_none());
+        v.native_pick(1, false);
+        assert_eq!(v.native_picker().unwrap().picked, 1);
+        // A bad At once: refused, on that box.
+        assert_eq!(v.native_pick_start("99", Password::default()), None);
+        assert_eq!(v.native_picker().unwrap().fault, 1);
+        // The serial stays for the same picker.
+        let serial = v.native_picker().unwrap().serial;
+        assert_eq!(
+            v.native_pick_start(" 3 ", Password("pw".to_owned().into())),
+            None,
+            "asks for $1 first"
+        );
+        assert!(v.asking() && !v.picking());
+        let a = v.native_ask().unwrap();
+        assert_eq!(a.hosts, 1);
+        let Some(SnipAction::RunOn { hosts, run, .. }) = v.native_ask_run(vec!["IOS".into()])
+        else {
+            panic!("no run")
+        };
+        assert_eq!(hosts.len(), 1);
+        assert_eq!(run.parallel, 3);
+        assert_eq!(run.password.map(|p| p.0.to_string()).as_deref(), Some("pw"));
+        v.show_picker(picker());
+        assert_ne!(v.native_picker().unwrap().serial, serial);
+        v.native_pick_cancel();
+        assert!(!v.picking());
     }
 
     #[test]

@@ -795,14 +795,21 @@ fn notify(h: Handles, lparam: LPARAM) -> LRESULT {
 /// Draws a category heading in the window's text colour, its count in
 /// grey after it, and a thin line to the right edge.
 fn draw_heading(list: HWND, cd: &NMLVCUSTOMDRAW) {
+    let id = cd.nmcd.dwItemSpec;
+    let Some((name, count)) = with(|s| s.groups.get(id).cloned()).flatten() else {
+        return;
+    };
+    draw_group_heading(list, cd, &name, &count.to_string());
+}
+
+/// Draws group heading `cd` of `list` in the window's colours: `name`,
+/// `count` in grey and a thin line to the right edge.
+pub(crate) fn draw_group_heading(list: HWND, cd: &NMLVCUSTOMDRAW, name: &str, count: &str) {
     use windows::Win32::Graphics::Gdi::{
         COLOR_BTNSHADOW, DT_CALCRECT, HDC, PatBlt, SelectObject as Select,
     };
     use windows::Win32::UI::WindowsAndMessaging::WM_GETFONT;
     let id = cd.nmcd.dwItemSpec;
-    let Some((name, count)) = with(|s| s.groups.get(id).cloned()).flatten() else {
-        return;
-    };
     let mut rc = RECT {
         top: LVGGR_HEADER as i32,
         ..Default::default()
@@ -837,7 +844,7 @@ fn draw_heading(list: HWND, cd: &NMLVCUSTOMDRAW) {
         DrawTextW(dc, &mut text, &mut size, flags | DT_CALCRECT);
         DrawTextW(dc, &mut text, &mut at, flags);
         at.left = size.right + pad;
-        let mut n: Vec<u16> = count.to_string().encode_utf16().collect();
+        let mut n: Vec<u16> = count.encode_utf16().collect();
         SetTextColor(dc, COLORREF(crate::ui_theme::sys_color(COLOR_GRAYTEXT)));
         let mut size = at;
         DrawTextW(dc, &mut n, &mut size, flags | DT_CALCRECT);
