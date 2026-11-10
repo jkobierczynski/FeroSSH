@@ -266,6 +266,10 @@ A hotkey can hide a window and bring it back, so a terminal (or any other progra
 
 Pressing the hotkey hides the window when it is in front, and brings it to the front when it is hidden, minimised or behind another window. While hidden it has no taskbar button and only the hotkey brings it back; it keeps running. Another program's window is never left hidden: FeroSSH shows it again when you turn standby off, pick another window, or close FeroSSH, and at its next start if it ended without doing so. Windows does not let FeroSSH hide a program run as administrator unless FeroSSH runs as administrator too; FeroSSH says so when that happens.
 
+## Full screen
+
+F11 (or Settings > Full screen) makes the window cover the whole monitor, taskbar too, with no title bar, frame or menu bar; F11 again puts it back as it was, maximized or not. It works wherever the keyboard is: a terminal pane, a remote desktop, the tools pane. Alt still shows the menu bar, which hides again once a menu closes. A program on the server that needs F11 itself can have it: turn off Settings > F11 switches full screen, and F11 goes to the terminal like the other function keys (Full screen stays in the menu and the command palette).
+
 ## The command palette
 
 Ctrl+Shift+A (Tools > Command palette) is one search box over every menu item, every saved connection and every command script. Type a few letters in any order: `splr` finds Split right, `core` your core switch, `ctrl+shift+n` the item on that key. Enter runs the item, connects or types the script; Shift+Enter connects in a split or types a script without its last Enter. Each item shows its shortcut and check mark, greyed-out items are left out, and your last few picks come first.

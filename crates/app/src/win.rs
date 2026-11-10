@@ -49,7 +49,8 @@ use ferossh_term::{
 use windows::Win32::Foundation::E_FAIL;
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, SIZE, WPARAM};
 use windows::Win32::Graphics::Gdi::{
-    BeginPaint, EndPaint, InvalidateRect, LOGFONTW, PAINTSTRUCT, ScreenToClient,
+    BeginPaint, EndPaint, GetMonitorInfoW, InvalidateRect, LOGFONTW, MONITOR_DEFAULTTONEAREST,
+    MONITORINFO, MonitorFromWindow, PAINTSTRUCT, ScreenToClient,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::SystemInformation::GetLocalTime;
@@ -69,8 +70,8 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
     GetDoubleClickTime, GetKeyState, HOT_KEY_MODIFIERS, MAPVK_VK_TO_CHAR, MAPVK_VSC_TO_VK,
     MOD_NOREPEAT, MapVirtualKeyW, RegisterHotKey, ReleaseCapture, SetCapture, SetFocus,
     UnregisterHotKey, VIRTUAL_KEY, VK_ADD, VK_BACK, VK_CAPITAL, VK_CONTROL, VK_DELETE, VK_DOWN,
-    VK_END, VK_ESCAPE, VK_F1, VK_F2, VK_F3, VK_F4, VK_F5, VK_F12, VK_HOME, VK_INSERT, VK_LEFT,
-    VK_LWIN, VK_MENU, VK_NEXT, VK_NUMPAD0, VK_OEM_2, VK_OEM_MINUS, VK_OEM_PLUS, VK_PRIOR,
+    VK_END, VK_ESCAPE, VK_F1, VK_F2, VK_F3, VK_F4, VK_F5, VK_F11, VK_F12, VK_HOME, VK_INSERT,
+    VK_LEFT, VK_LWIN, VK_MENU, VK_NEXT, VK_NUMPAD0, VK_OEM_2, VK_OEM_MINUS, VK_OEM_PLUS, VK_PRIOR,
     VK_RETURN, VK_RIGHT, VK_RWIN, VK_SHIFT, VK_SPACE, VK_SUBTRACT, VK_TAB, VK_UP,
 };
 use windows::Win32::UI::Shell::{
@@ -80,23 +81,25 @@ use windows::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT, CheckMenuItem, CheckMenuRadioItem,
     CreateMenu, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyMenu, DestroyWindow,
     DispatchMessageW, EnableMenuItem, FLASHW_TIMERNOFG, FLASHW_TRAY, FLASHWINFO, FlashWindowEx,
-    GetClientRect, GetCursorPos, GetForegroundWindow, GetMenuItemCount, GetMenuItemID,
-    GetMenuState, GetMenuStringW, GetMessageW, GetSubMenu, HCURSOR, HMENU, HTCLIENT, IDC_ARROW,
-    IDC_IBEAM, IDC_SIZEALL, IDC_SIZENS, IDC_SIZEWE, IDOK, IDYES, IsIconic, IsWindowVisible,
-    KillTimer, LoadCursorW, LoadIconW, MB_DEFBUTTON2, MB_ICONERROR, MB_ICONINFORMATION,
-    MB_ICONQUESTION, MB_ICONWARNING, MB_OK, MB_OKCANCEL, MB_YESNO, MESSAGEBOX_RESULT,
-    MESSAGEBOX_STYLE, MF_BYCOMMAND, MF_BYPOSITION, MF_CHECKED, MF_DISABLED, MF_GRAYED,
-    MF_MENUBARBREAK, MF_POPUP, MF_SEPARATOR, MF_STRING, MF_UNCHECKED, MSG, MessageBoxW,
-    ModifyMenuW, PM_REMOVE, PeekMessageW, PostMessageW, PostQuitMessage, RegisterClassW,
-    SIZE_MINIMIZED, SW_HIDE, SW_RESTORE, SW_SHOW, SW_SHOWNORMAL, SWP_NOACTIVATE, SWP_NOMOVE,
-    SWP_NOZORDER, SetCursor, SetForegroundWindow, SetMenu, SetTimer, SetWindowPos, SetWindowTextW,
-    ShowWindow, TPM_NONOTIFY, TPM_RETURNCMD, TrackPopupMenu, TranslateMessage, WINDOW_EX_STYLE,
-    WINDOW_STYLE, WM_APP, WM_CHAR, WM_CLIPBOARDUPDATE, WM_CLOSE, WM_COMMAND, WM_DEADCHAR,
-    WM_DESTROY, WM_DPICHANGED, WM_DROPFILES, WM_ERASEBKGND, WM_GETDPISCALEDSIZE, WM_HOTKEY,
-    WM_IME_COMPOSITION, WM_IME_STARTCOMPOSITION, WM_KEYDOWN, WM_KEYUP, WM_KILLFOCUS,
-    WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL,
-    WM_PAINT, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SETCURSOR, WM_SETFOCUS, WM_SETTINGCHANGE, WM_SIZE,
-    WM_SYSCHAR, WM_SYSCOLORCHANGE, WM_SYSDEADCHAR, WM_SYSKEYDOWN, WM_SYSKEYUP, WM_TIMER, WNDCLASSW,
+    GWL_STYLE, GetClientRect, GetCursorPos, GetForegroundWindow, GetMenuItemCount, GetMenuItemID,
+    GetMenuState, GetMenuStringW, GetMessageW, GetSubMenu, GetWindowLongPtrW, GetWindowPlacement,
+    HCURSOR, HMENU, HTCLIENT, HWND_TOP, IDC_ARROW, IDC_IBEAM, IDC_SIZEALL, IDC_SIZENS, IDC_SIZEWE,
+    IDOK, IDYES, IsChild, IsIconic, IsWindowVisible, KillTimer, LoadCursorW, LoadIconW,
+    MB_DEFBUTTON2, MB_ICONERROR, MB_ICONINFORMATION, MB_ICONQUESTION, MB_ICONWARNING, MB_OK,
+    MB_OKCANCEL, MB_YESNO, MESSAGEBOX_RESULT, MESSAGEBOX_STYLE, MF_BYCOMMAND, MF_BYPOSITION,
+    MF_CHECKED, MF_DISABLED, MF_GRAYED, MF_MENUBARBREAK, MF_POPUP, MF_SEPARATOR, MF_STRING,
+    MF_UNCHECKED, MSG, MessageBoxW, ModifyMenuW, PM_REMOVE, PeekMessageW, PostMessageW,
+    PostQuitMessage, RegisterClassW, SIZE_MINIMIZED, SW_HIDE, SW_RESTORE, SW_SHOW, SW_SHOWNORMAL,
+    SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOOWNERZORDER, SWP_NOSIZE, SWP_NOZORDER,
+    SetCursor, SetForegroundWindow, SetMenu, SetTimer, SetWindowLongPtrW, SetWindowPlacement,
+    SetWindowPos, SetWindowTextW, ShowWindow, TPM_NONOTIFY, TPM_RETURNCMD, TrackPopupMenu,
+    TranslateMessage, WINDOW_EX_STYLE, WINDOW_STYLE, WINDOWPLACEMENT, WM_APP, WM_CHAR,
+    WM_CLIPBOARDUPDATE, WM_CLOSE, WM_COMMAND, WM_DEADCHAR, WM_DESTROY, WM_DPICHANGED, WM_DROPFILES,
+    WM_ERASEBKGND, WM_EXITMENULOOP, WM_GETDPISCALEDSIZE, WM_HOTKEY, WM_IME_COMPOSITION,
+    WM_IME_STARTCOMPOSITION, WM_KEYDOWN, WM_KEYUP, WM_KILLFOCUS, WM_LBUTTONDOWN, WM_LBUTTONUP,
+    WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_PAINT, WM_RBUTTONDOWN,
+    WM_RBUTTONUP, WM_SETCURSOR, WM_SETFOCUS, WM_SETTINGCHANGE, WM_SIZE, WM_SYSCHAR,
+    WM_SYSCOLORCHANGE, WM_SYSDEADCHAR, WM_SYSKEYDOWN, WM_SYSKEYUP, WM_TIMER, WNDCLASSW,
     WS_CLIPCHILDREN, WS_EX_APPWINDOW, WS_OVERLAPPEDWINDOW,
 };
 use windows::Win32::UI::WindowsAndMessaging::{DeleteMenu, ShowWindowAsync, WM_INITMENUPOPUP};
@@ -356,6 +359,10 @@ mod cmd {
     pub const SNIPPET_FOLDER: u32 = 215;
     pub const TOOLS_PIN: u32 = 216;
     pub const TOOLS_RAIL: u32 = 217;
+    /// View > Full screen (F11).
+    pub const FULL_SCREEN: u32 = 218;
+    /// View > F11 switches full screen.
+    pub const FULL_SCREEN_KEY: u32 = 219;
     /// Plus the index into `WindowColours::ALL`.
     pub const WINDOW_COLOURS: u32 = 220;
     /// Plus the index into `FONT_CHOICES`.
@@ -782,6 +789,8 @@ struct Window {
     strip_metrics: CellMetrics,
     menu: HMENU,
     menu_visible: bool,
+    /// Full screen (View > Full screen, F11): how to put the window back.
+    full_screen: Option<FullScreen>,
     focused: bool,
     /// Repaint everything on the next WM_PAINT, not only dirty rows.
     full_redraw: bool,
@@ -1572,6 +1581,7 @@ fn create_and_run(launch: Launch, theme: Option<String>) -> Result<()> {
                 strip_metrics,
                 menu,
                 menu_visible: true,
+                full_screen: None,
                 focused: false,
                 full_redraw: true,
                 high_surrogate: None,
@@ -1724,6 +1734,15 @@ fn create_and_run(launch: Launch, theme: Option<String>) -> Result<()> {
 
         let mut msg = MSG::default();
         while GetMessageW(&mut msg, None, 0, 0).as_bool() {
+            // F11 in the tool panes' controls is the window's F11.
+            if msg.message == WM_KEYDOWN
+                && msg.wParam.0 == usize::from(VK_F11.0)
+                && msg.hwnd != hwnd
+                && IsChild(hwnd, msg.hwnd).as_bool()
+                && with_window(|w| w.full_screen_f11(VK_F11, key_mods())) == Some(true)
+            {
+                msg.hwnd = hwnd;
+            }
             // Tab, Enter, Escape and the shortcuts in the connection
             // and session managers' controls.
             if conn_view::pre_translate(&msg)
@@ -2008,6 +2027,8 @@ fn build_menu() -> Result<HMENU> {
             cmd::HIDE_MENU,
             "&Hide menu bar (Alt shows it)\tCtrl+Shift+M",
         )?;
+        item(view, cmd::FULL_SCREEN, "F&ull screen\tF11")?;
+        item(view, cmd::FULL_SCREEN_KEY, "F11 switches full scree&n")?;
 
         let window = CreatePopupMenu()?;
         item(window, cmd::NEW_TAB, "Ne&w tab\tCtrl+Shift+T")?;
@@ -2132,6 +2153,93 @@ fn window_size(m: &CellMetrics, cols: usize, rows: usize, dpi: u32, menu: bool) 
         dpi,
         menu,
     )
+}
+
+/// What full screen changed, put back when it ends.
+struct FullScreen {
+    /// Where the window was, maximized or not.
+    placement: WINDOWPLACEMENT,
+    /// Its style, with the caption and the sizing frame.
+    style: isize,
+    /// Whether the menu bar showed.
+    menu: bool,
+}
+
+/// The whole monitor the window is on (taskbar included), in screen
+/// coordinates.
+fn monitor_rect(hwnd: HWND) -> Option<RECT> {
+    let mut info = MONITORINFO {
+        cbSize: size_of::<MONITORINFO>() as u32,
+        ..Default::default()
+    };
+    // SAFETY: our window and a local out-pointer with its size set.
+    unsafe {
+        let monitor = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
+        GetMonitorInfoW(monitor, &mut info)
+            .as_bool()
+            .then_some(info.rcMonitor)
+    }
+}
+
+/// View > Full screen and F11: the window loses its caption, frame and
+/// menu bar and covers its monitor, taskbar too; the second time puts
+/// back where it was, its size and whether it was maximized. Alt still
+/// shows the menu bar, which hides again once a menu closes.
+fn toggle_full_screen(hwnd: HWND) {
+    let Some((back, menu)) = with_window(|w| (w.full_screen.take(), w.menu)) else {
+        return;
+    };
+    // SAFETY: our own window and menu; locals for the out-pointers. No
+    // window borrow is held across the calls, which send WM_SIZE.
+    unsafe {
+        if let Some(back) = back {
+            with_window(|w| w.menu_visible = back.menu);
+            SetWindowLongPtrW(hwnd, GWL_STYLE, back.style);
+            let _ = SetMenu(hwnd, back.menu.then_some(menu));
+            let _ = SetWindowPlacement(hwnd, &back.placement);
+            let _ = SetWindowPos(
+                hwnd,
+                None,
+                0,
+                0,
+                0,
+                0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOOWNERZORDER | SWP_FRAMECHANGED,
+            );
+        } else {
+            let mut placement = WINDOWPLACEMENT {
+                length: size_of::<WINDOWPLACEMENT>() as u32,
+                ..Default::default()
+            };
+            let Some(r) = monitor_rect(hwnd) else {
+                return;
+            };
+            if GetWindowPlacement(hwnd, &mut placement).is_err() {
+                return;
+            }
+            let style = GetWindowLongPtrW(hwnd, GWL_STYLE);
+            with_window(|w| {
+                w.full_screen = Some(FullScreen {
+                    placement,
+                    style,
+                    menu: w.menu_visible,
+                });
+                w.menu_visible = false;
+            });
+            SetWindowLongPtrW(hwnd, GWL_STYLE, style & !(WS_OVERLAPPEDWINDOW.0 as isize));
+            let _ = SetMenu(hwnd, None);
+            let _ = SetWindowPos(
+                hwnd,
+                Some(HWND_TOP),
+                r.left,
+                r.top,
+                r.right - r.left,
+                r.bottom - r.top,
+                SWP_NOOWNERZORDER | SWP_FRAMECHANGED,
+            );
+        }
+    }
+    with_window(Window::update_menu_checks);
 }
 
 fn client_to_window(w: i32, h: i32, dpi: u32, menu: bool) -> (i32, i32) {
@@ -4243,7 +4351,11 @@ impl Window {
                 let down = matches!(msg, WM_KEYDOWN | WM_SYSKEYDOWN);
                 // FeroSSH's own shortcuts still work in the pane.
                 let split = self.ws.tab().is_some_and(|t| t.root.panes().len() > 1);
-                if down && shortcut(vk, key_mods(), self.ws.tabs.len() > 1, split).is_some() {
+                let mods = key_mods();
+                if down
+                    && (shortcut(vk, mods, self.ws.tabs.len() > 1, split).is_some()
+                        || self.full_screen_f11(vk, mods))
+                {
                     return false;
                 }
                 let extended = lparam.0 & (1 << 24) != 0;
@@ -7644,6 +7756,17 @@ impl Window {
         if mods.alt && vk == VK_F4 {
             return KeyOutcome::Default;
         }
+        // F11: full screen, before the tmux prefix and the panes, so it
+        // works in a side pane, the search bar and a remote desktop too.
+        // Held down, it does not flip back and forth.
+        if self.full_screen_f11(vk, mods) {
+            drop_pending_char(self.hwnd);
+            return if held {
+                KeyOutcome::Handled
+            } else {
+                KeyOutcome::Run(Command::FullScreen)
+            };
+        }
         // The key after the tmux prefix, before FeroSSH's own shortcuts:
         // Alt+arrow there resizes, as in tmux.
         if let Some(outcome) = self.tmux_key_down(vk, mods, held) {
@@ -7721,6 +7844,13 @@ impl Window {
             }
         }
         KeyOutcome::Default
+    }
+
+    /// Whether the key is plain F11 and F11 switches full screen (View >
+    /// F11 switches full screen); when that is off, F11 goes to the
+    /// terminal as `ESC [ 2 3 ~`, for programs that use it.
+    fn full_screen_f11(&self, vk: VIRTUAL_KEY, mods: Mods) -> bool {
+        vk == VK_F11 && mods == Mods::NONE && self.settings.full_screen_key
     }
 
     fn search_key(&mut self, id: PaneId, vk: VIRTUAL_KEY, mods: Mods) -> KeyOutcome {
@@ -10612,6 +10742,12 @@ impl Window {
                 return Some(self.standby_on(key));
             }
             cmd::HIDE_MENU => return Some(Command::SetMenuVisible(!self.menu_visible)),
+            cmd::FULL_SCREEN => return Some(Command::FullScreen),
+            cmd::FULL_SCREEN_KEY => {
+                self.settings.full_screen_key = !self.settings.full_screen_key;
+                self.save_settings();
+                self.update_menu_checks();
+            }
             cmd::COPY => return Some(Command::Copy),
             cmd::PASTE => return Some(Command::Paste),
             cmd::RECORD_SNIPPET => return self.toggle_recording(),
@@ -11261,6 +11397,8 @@ impl Window {
                 (cmd::REMOTE_APP_SELECTION, s.remote_app_share_selection),
                 (cmd::DESKTOP_SELECTION, s.desktop_share_selection),
                 (cmd::CONFIRM_PRODUCTION, s.confirm_production),
+                (cmd::FULL_SCREEN, self.full_screen.is_some()),
+                (cmd::FULL_SCREEN_KEY, s.full_screen_key),
                 (cmd::TMUX_KEYS, s.tmux_keys),
                 (cmd::RECORD_SNIPPET, self.recording.is_some()),
                 (
@@ -11560,7 +11698,8 @@ impl Window {
 
     /// The window size that keeps the layout at `dpi`: the client scaled.
     fn size_for_dpi(&self, dpi: u32) -> Option<(i32, i32)> {
-        if self.dpi == 0 {
+        // Full screen fills the monitor whatever the DPI.
+        if self.dpi == 0 || self.full_screen.is_some() {
             return None;
         }
         let s = |v: i32| v * dpi as i32 / self.dpi as i32;
@@ -12457,6 +12596,8 @@ enum Command {
     /// The last pane closed: the window goes.
     Destroy,
     SetMenuVisible(bool),
+    /// View > Full screen and F11: in or out of full screen.
+    FullScreen,
     Copy,
     Paste,
     /// The host asked to put text on the clipboard.
@@ -13520,6 +13661,7 @@ fn run_command(hwnd: HWND, command: Command) {
                 run_command(hwnd, next);
             }
         }
+        Command::FullScreen => toggle_full_screen(hwnd),
         Command::SetMenuVisible(visible) => {
             let Some(menu) = with_window(|w| {
                 w.menu_visible = visible;
@@ -14733,8 +14875,15 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                 }
             }
             WM_DPICHANGED => {
-                with_window(|w| w.set_dpi(loword(wparam.0)));
-                let r = lparam.0 as *const RECT;
+                let full = with_window(|w| {
+                    w.set_dpi(loword(wparam.0));
+                    w.full_screen.is_some()
+                }) == Some(true);
+                // Full screen keeps covering its monitor.
+                let monitor = if full { monitor_rect(hwnd) } else { None };
+                let r = monitor
+                    .as_ref()
+                    .map_or(lparam.0 as *const RECT, |m| m as *const RECT);
                 if let Some(r) = r.as_ref() {
                     // Sends WM_SIZE, which lays out the grid at the new DPI.
                     let _ = SetWindowPos(
@@ -14819,6 +14968,14 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                     }
                     Some(KeyOutcome::Default) | None => DefWindowProcW(hwnd, msg, wparam, lparam),
                 }
+            }
+            WM_EXITMENULOOP if wparam.0 == 0 => {
+                // Full screen: the menu bar Alt showed hides again once
+                // its menu closes.
+                if with_window(|w| w.full_screen.is_some() && w.menu_visible) == Some(true) {
+                    run_command(hwnd, Command::SetMenuVisible(false));
+                }
+                DefWindowProcW(hwnd, msg, wparam, lparam)
             }
             WM_SYSKEYUP if wparam.0 == usize::from(VK_MENU.0) => {
                 // Alt alone brings a hidden menu bar back.

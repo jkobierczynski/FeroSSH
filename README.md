@@ -114,6 +114,7 @@ ferossh.exe --check-sandbox    # report what the sandbox can do on this PC
 | Ctrl+click | Open a link (OSC 8) after showing its real target |
 | Ctrl+= / Ctrl+- / Ctrl+0, Ctrl+wheel | Larger, smaller, default text size |
 | Ctrl+Shift+M | Hide the menu bar (Alt shows it again) |
+| F11 | Full screen on and off (Settings > F11 switches full screen turns the key off, so F11 reaches the terminal) |
 | Settings > Font, Settings > Theme | Font family and colour theme for this pane |
 | Settings > Show test pattern | Colours, styles, box drawing, wide and combining characters |
 
