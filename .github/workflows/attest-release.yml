@@ -37,6 +37,10 @@ permissions:
 jobs:
   attest:
     name: Attest the release files
+    # Only from main: a run started from another branch would use that
+    # branch's copy of this workflow and its checks, yet its attestations
+    # would carry this repository's name all the same.
+    if: github.ref == 'refs/heads/main'
     # Windows, to check the exes' Authenticode signatures.
     runs-on: windows-latest
     permissions:
