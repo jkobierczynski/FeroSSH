@@ -239,6 +239,16 @@ impl Sftp {
                 })
                 .await
             }
+            SftpOp::Chmod { path, mode } => {
+                self.one(ui, Want::Status, |id| {
+                    wire::encode(&Request::Chmod {
+                        id,
+                        path: &path,
+                        mode,
+                    })
+                })
+                .await
+            }
             SftpOp::Rmdir { path } => {
                 self.one(ui, Want::Status, |id| {
                     wire::encode(&Request::Rmdir { id, path: &path })

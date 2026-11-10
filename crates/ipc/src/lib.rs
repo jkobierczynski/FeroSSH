@@ -311,6 +311,11 @@ pub enum SftpOp {
     Checksum {
         path: Vec<u8>,
     },
+    /// Sets the permission bits (the low 12 bits of `mode`) of `path`.
+    Chmod {
+        path: Vec<u8>,
+        mode: u32,
+    },
 }
 
 /// The outcome of one [`SftpOp`].
@@ -1046,6 +1051,11 @@ impl Writer {
             SftpOp::Checksum { path } => {
                 self.u8(11);
                 self.bytes(path);
+            }
+            SftpOp::Chmod { path, mode } => {
+                self.u8(12);
+                self.bytes(path);
+                self.u32(*mode);
             }
         }
     }
@@ -1944,6 +1954,10 @@ impl<'a> Reader<'a> {
                 overwrite: self.bool()?,
             },
             11 => SftpOp::Checksum { path: self.path()? },
+            12 => SftpOp::Chmod {
+                path: self.path()?,
+                mode: self.u32()?,
+            },
             _ => return Err(Error::Invalid),
         })
     }
@@ -2373,6 +2387,10 @@ mod tests {
             },
             SftpOp::Checksum {
                 path: b"a".to_vec(),
+            },
+            SftpOp::Chmod {
+                path: b"a".to_vec(),
+                mode: 0o755,
             },
         ];
         let replies = [

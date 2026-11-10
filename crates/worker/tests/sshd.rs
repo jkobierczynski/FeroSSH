@@ -785,6 +785,43 @@ async fn transfers_files_over_sftp() {
         &data[..1_000_001]
     );
 
+    // New folder, rename, permissions and an edited file put back, on a
+    // real server; each change lists the folder again.
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let listed = |r: &Remote| !r.listing.loading && r.pending_changes() == 0;
+        remote.make_folder(b"made").unwrap();
+        drive(&mut remote, &to_worker, &mut from_worker, listed).await;
+        assert!(remote_dir.join("made").is_dir());
+        remote.rename(b"made", b"renamed").unwrap();
+        drive(&mut remote, &to_worker, &mut from_worker, listed).await;
+        assert!(remote_dir.join("renamed").is_dir());
+        remote.chmod(b"renamed", 0o700);
+        drive(&mut remote, &to_worker, &mut from_worker, listed).await;
+        let mode = std::fs::metadata(remote_dir.join("renamed"))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o700);
+        assert!(remote.notice.is_none(), "{:?}", remote.notice);
+        std::fs::remove_dir(remote_dir.join("renamed")).unwrap();
+
+        let script = remote_dir.join("run.sh");
+        std::fs::write(&script, "old").unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o750)).unwrap();
+        let edited = local_dir.join("run.sh");
+        std::fs::write(&edited, "edited").unwrap();
+        let id = remote
+            .put_back(&edited, script.to_str().unwrap().as_bytes(), Some(0o750))
+            .unwrap();
+        drive(&mut remote, &to_worker, &mut from_worker, settled).await;
+        assert_eq!(remote.job_state(id), Some(State::Done));
+        assert_eq!(std::fs::read_to_string(&script).unwrap(), "edited");
+        let mode = std::fs::metadata(&script).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o750);
+        std::fs::remove_file(&script).unwrap();
+    }
+
     // The whole folder: the link to /etc/passwd stays behind.
     remote.browse(remote_dir.parent().unwrap().to_str().unwrap().as_bytes());
     drive(&mut remote, &to_worker, &mut from_worker, |r| {
