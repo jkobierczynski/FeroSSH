@@ -465,11 +465,15 @@ impl Sftp {
                 },
                 resp,
             ) => {
-                let message = match resp {
-                    Response::Status { code: 0, .. } => message,
-                    _ => restore_failed(&message, &aside),
-                };
-                self.failed(ui, code, &message).await
+                match resp {
+                    Response::Status { code: 0, .. } => self.failed(ui, code, &message).await,
+                    // A plain code's fixed text would hide where the
+                    // original is: send the full words instead.
+                    _ => {
+                        let message = restore_failed(&message, &aside);
+                        self.failed(ui, sftp_code::FAILURE, &message).await
+                    }
+                }
             }
             (Pend::MoveAside { ui, .. } | Pend::Promote { ui, .. }, _) => {
                 self.failed(ui, sftp_code::FAILURE, "Unexpected reply")
@@ -745,8 +749,14 @@ fn aside_name(to: &[u8], n: u32) -> Vec<u8> {
 /// The error when the original could not be moved back: say where
 /// it is, so nothing is lost without a word.
 fn restore_failed(message: &str, aside: &[u8]) -> String {
+    let why = message.trim().trim_end_matches('.');
+    let why = if why.is_empty() {
+        "The new copy could not replace the file"
+    } else {
+        why
+    };
     format!(
-        "{message}; the original file is now {}",
+        "{why}; the original file is now {}",
         String::from_utf8_lossy(aside)
     )
 }
