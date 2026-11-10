@@ -23,8 +23,8 @@ use std::collections::HashSet;
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
     BeginPaint, COLOR_WINDOW, COLOR_WINDOWTEXT, DT_LEFT, DT_NOPREFIX, DT_SINGLELINE, DT_VCENTER,
-    DeleteObject, DrawTextW, EndPaint, FillRect, GetSysColor, GetSysColorBrush, HFONT, HGDIOBJ,
-    PAINTSTRUCT, ScreenToClient, SelectObject, SetBkMode, SetTextColor, TRANSPARENT,
+    DeleteObject, DrawTextW, EndPaint, FillRect, HFONT, HGDIOBJ, PAINTSTRUCT, ScreenToClient,
+    SelectObject, SetBkMode, SetTextColor, TRANSPARENT,
 };
 use windows::Win32::UI::Controls::{
     EM_SETCUEBANNER, EM_SETSEL, HTREEITEM, NM_DBLCLK, NM_RCLICK, NM_SETFOCUS, NMHDR, NMTREEVIEWW,
@@ -40,12 +40,12 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     BN_CLICKED, BS_DEFPUSHBUTTON, BS_PUSHBUTTON, CS_HREDRAW, CS_VREDRAW, CreateWindowExW,
-    DefWindowProcW, EN_CHANGE, EN_SETFOCUS, ES_AUTOHSCROLL, GetClientRect, GetMessagePos,
-    GetWindowTextLengthW, HMENU, IDC_ARROW, IDCANCEL, IDOK, IsChild, IsDialogMessageW,
-    IsWindowVisible, LoadCursorW, MSG, MoveWindow, RegisterClassW, SW_HIDE, SW_SHOWNA,
-    SendMessageW, SetWindowTextW, ShowWindow, WINDOW_EX_STYLE, WINDOW_STYLE, WM_CHAR, WM_COMMAND,
-    WM_ERASEBKGND, WM_KEYDOWN, WM_NOTIFY, WM_PAINT, WNDCLASSW, WS_BORDER, WS_CHILD,
-    WS_CLIPCHILDREN, WS_CLIPSIBLINGS, WS_EX_CONTROLPARENT, WS_TABSTOP, WS_VISIBLE,
+    EN_CHANGE, EN_SETFOCUS, ES_AUTOHSCROLL, GetClientRect, GetMessagePos, GetWindowTextLengthW,
+    HMENU, IDC_ARROW, IDCANCEL, IDOK, IsChild, IsDialogMessageW, IsWindowVisible, LoadCursorW, MSG,
+    MoveWindow, RegisterClassW, SW_HIDE, SW_SHOWNA, SendMessageW, SetWindowTextW, ShowWindow,
+    WINDOW_EX_STYLE, WINDOW_STYLE, WM_CHAR, WM_COMMAND, WM_ERASEBKGND, WM_KEYDOWN, WM_NOTIFY,
+    WM_PAINT, WNDCLASSW, WS_BORDER, WS_CHILD, WS_CLIPCHILDREN, WS_CLIPSIBLINGS,
+    WS_EX_CONTROLPARENT, WS_TABSTOP, WS_VISIBLE,
 };
 use windows::core::{PCWSTR, PWSTR, w};
 
@@ -772,12 +772,12 @@ fn paint(h: Handles) {
         let dc = BeginPaint(h.panel, &mut ps);
         let mut rc = RECT::default();
         let _ = GetClientRect(h.panel, &mut rc);
-        FillRect(dc, &rc, GetSysColorBrush(COLOR_WINDOW));
+        FillRect(dc, &rc, crate::ui_theme::sys_brush(COLOR_WINDOW));
         let old = SelectObject(dc, HGDIOBJ(title_font.0));
         SetBkMode(dc, TRANSPARENT);
         SetTextColor(
             dc,
-            windows::Win32::Foundation::COLORREF(GetSysColor(COLOR_WINDOWTEXT)),
+            windows::Win32::Foundation::COLORREF(crate::ui_theme::sys_color(COLOR_WINDOWTEXT)),
         );
         let pad = scale(10, dpi);
         let mut tr = RECT {
@@ -812,6 +812,6 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
         }
         (WM_NOTIFY, Some(h)) => notify(h, lparam),
         // SAFETY: default handling for everything else.
-        _ => unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) },
+        _ => crate::ui_theme::def_window_proc(hwnd, msg, wparam, lparam),
     }
 }

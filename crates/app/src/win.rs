@@ -31,7 +31,8 @@ use ferossh_config::snippet_import::{self, SnippetClient};
 use ferossh_config::snippet_store;
 use ferossh_config::trigger::{Fire, Watch};
 use ferossh_config::{
-    ForwardSpec, SessionKind, Settings, mobaxterm, mremoteng, putty, securecrt, ssh_config, winscp,
+    ForwardSpec, SessionKind, Settings, WindowColours, mobaxterm, mremoteng, putty, securecrt,
+    ssh_config, winscp,
 };
 use ferossh_forward::x11::{Display, find_cookie, xauth_entries};
 use ferossh_ipc::{ChannelId, DirEntry, FORWARD_IDS, Message, SftpReply, X11Auth};
@@ -48,8 +49,7 @@ use ferossh_term::{
 use windows::Win32::Foundation::E_FAIL;
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, SIZE, WPARAM};
 use windows::Win32::Graphics::Gdi::{
-    BeginPaint, COLOR_GRAYTEXT, COLOR_HIGHLIGHT, COLOR_MENUBAR, COLOR_MENUTEXT, COLOR_WINDOW,
-    EndPaint, GetSysColor, InvalidateRect, LOGFONTW, PAINTSTRUCT, SYS_COLOR_INDEX, ScreenToClient,
+    BeginPaint, EndPaint, InvalidateRect, LOGFONTW, PAINTSTRUCT, ScreenToClient,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::SystemInformation::GetLocalTime;
@@ -95,9 +95,9 @@ use windows::Win32::UI::WindowsAndMessaging::{
     WM_DESTROY, WM_DPICHANGED, WM_DROPFILES, WM_ERASEBKGND, WM_GETDPISCALEDSIZE, WM_HOTKEY,
     WM_IME_COMPOSITION, WM_IME_STARTCOMPOSITION, WM_KEYDOWN, WM_KEYUP, WM_KILLFOCUS,
     WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL,
-    WM_PAINT, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SETCURSOR, WM_SETFOCUS, WM_SIZE, WM_SYSCHAR,
-    WM_SYSDEADCHAR, WM_SYSKEYDOWN, WM_SYSKEYUP, WM_TIMER, WNDCLASSW, WS_CLIPCHILDREN,
-    WS_EX_APPWINDOW, WS_OVERLAPPEDWINDOW,
+    WM_PAINT, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SETCURSOR, WM_SETFOCUS, WM_SETTINGCHANGE, WM_SIZE,
+    WM_SYSCHAR, WM_SYSCOLORCHANGE, WM_SYSDEADCHAR, WM_SYSKEYDOWN, WM_SYSKEYUP, WM_TIMER, WNDCLASSW,
+    WS_CLIPCHILDREN, WS_EX_APPWINDOW, WS_OVERLAPPEDWINDOW,
 };
 use windows::Win32::UI::WindowsAndMessaging::{DeleteMenu, ShowWindowAsync, WM_INITMENUPOPUP};
 use windows::core::{HSTRING, PCWSTR, PWSTR, Result, w};
@@ -145,6 +145,8 @@ use crate::telnet::{TelnetSession, TelnetTarget};
 use crate::tmux::{self, Mode as TmuxMode, Tmux};
 use crate::tmux_keys::{self, Action as TmuxKey};
 use crate::toolpane::{self, RailItem};
+use crate::ui_colours::{self, UiColours};
+use crate::ui_theme;
 use crate::vdesk;
 use crate::zmodem;
 use ferossh_tmuxcc::saved as tmux_saved;
@@ -348,6 +350,8 @@ mod cmd {
     pub const SNIPPET_FOLDER: u32 = 215;
     pub const TOOLS_PIN: u32 = 216;
     pub const TOOLS_RAIL: u32 = 217;
+    /// Plus the index into `WindowColours::ALL`.
+    pub const WINDOW_COLOURS: u32 = 220;
     /// Plus the index into `FONT_CHOICES`.
     pub const FONT: u32 = 300;
     /// Plus the index into `Theme::builtin()`.
@@ -1938,6 +1942,25 @@ fn build_menu() -> Result<HMENU> {
         separator(view)?;
         AppendMenuW(view, MF_POPUP, fonts.0 as usize, w!("&Font (this pane)"))?;
         AppendMenuW(view, MF_POPUP, themes.0 as usize, w!("&Theme (this pane)"))?;
+        let colours = CreatePopupMenu()?;
+        for (id, c) in (cmd::WINDOW_COLOURS..).zip(WindowColours::ALL) {
+            item(
+                colours,
+                id,
+                match c {
+                    WindowColours::Theme => "Follow the &terminal theme",
+                    WindowColours::System => "Follow &Windows (light or dark)",
+                    WindowColours::Light => "&Light",
+                    WindowColours::Dark => "&Dark",
+                },
+            )?;
+        }
+        AppendMenuW(
+            view,
+            MF_POPUP,
+            colours.0 as usize,
+            w!("&Window colours (menus, tools)"),
+        )?;
         separator(view)?;
         item(view, cmd::TEST_PATTERN, "Show test &pattern")?;
         separator(view)?;
@@ -2092,13 +2115,6 @@ fn win_rect(r: Rect) -> RECT {
         right: r.right(),
         bottom: r.bottom(),
     }
-}
-
-/// A system colour (`GetSysColor` is 0x00BBGGRR).
-fn sys_color(index: SYS_COLOR_INDEX) -> Rgb {
-    // SAFETY: plain query.
-    let c = unsafe { GetSysColor(index) };
-    Rgb::new(c as u8, (c >> 8) as u8, (c >> 16) as u8)
 }
 
 fn pixel(r: Rect) -> PixelRect {
@@ -6500,8 +6516,14 @@ impl Window {
         }
     }
 
-    /// The colours of the tab strip and side pane: the focused pane's.
+    /// The colours of the drawn side pane tools: the window's own (the
+    /// focused pane's theme by default), or with Windows' light look the
+    /// focused pane's theme, as before window colours existed.
     fn chrome_palette(&self) -> Palette {
+        let c = self.ui_colours();
+        if c.custom {
+            return c.strip;
+        }
         let theme = self
             .panes
             .get(&self.focused_id())
@@ -6509,16 +6531,25 @@ impl Window {
         Palette::of(&theme)
     }
 
-    /// The tab strip's colours: the system menu bar's, so the strip reads
-    /// as part of the window frame rather than of a terminal.
-    fn strip_palette(&self) -> Palette {
-        Palette::menu_bar(
-            sys_color(COLOR_MENUBAR),
-            sys_color(COLOR_WINDOW),
-            sys_color(COLOR_MENUTEXT),
-            sys_color(COLOR_GRAYTEXT),
-            sys_color(COLOR_HIGHLIGHT),
+    /// The window's own colours (Settings > Window colours): by default
+    /// from the focused pane's theme.
+    fn ui_colours(&self) -> UiColours {
+        let theme = self
+            .panes
+            .get(&self.focused_id())
+            .map_or(&self.default_theme, |p| &p.theme);
+        let mode = self.settings.window_colours;
+        ui_colours::resolve(
+            mode,
+            theme,
+            &ui_theme::system(mode == WindowColours::System),
         )
+    }
+
+    /// The tab strip's colours: the menu bar's, so the strip reads as part
+    /// of the window frame rather than of a terminal.
+    fn strip_palette(&self) -> Palette {
+        self.ui_colours().strip
     }
 
     /// What the tools rail shows: the open tool, the pin, and the tab
@@ -6666,12 +6697,14 @@ impl Window {
             .panes
             .get(&self.focused_id())
             .map_or_else(|| self.default_theme.clone(), |p| p.theme.clone());
-        t.background = Palette::of(&t).strip;
+        t.background = self.chrome_palette().strip;
         t
     }
 
-    /// Redraws the tab strip and side pane grids.
+    /// Redraws the tab strip and side pane grids, and repaints the menu
+    /// bar and tools pane when the window's colours change.
     fn refresh_chrome(&mut self) {
+        ui_theme::apply(self.hwnd, self.ui_colours());
         rail::set_look(self.rail_look());
         self.sync_conn_view();
         let palette = self.chrome_palette();
@@ -10639,6 +10672,17 @@ impl Window {
                 self.update_menu_checks();
                 self.layout();
             }
+            id if (cmd::WINDOW_COLOURS..cmd::WINDOW_COLOURS + WindowColours::ALL.len() as u32)
+                .contains(&id) =>
+            {
+                if let Some(c) = WindowColours::ALL.get((id - cmd::WINDOW_COLOURS) as usize) {
+                    self.settings.window_colours = *c;
+                    self.save_settings();
+                    self.update_menu_checks();
+                    self.refresh_chrome();
+                    self.request_full_redraw();
+                }
+            }
             cmd::TOOLS_PIN => {
                 self.settings.tools_pinned = !self.settings.tools_pinned;
                 self.save_settings();
@@ -10949,6 +10993,17 @@ impl Window {
         unsafe {
             let _ = CheckMenuRadioItem(self.menu, cmd::FONT, last_font, font, MF_BYCOMMAND.0);
             let _ = CheckMenuRadioItem(self.menu, cmd::THEME, last_theme, theme, MF_BYCOMMAND.0);
+            let colours = WindowColours::ALL
+                .iter()
+                .position(|c| *c == s.window_colours)
+                .unwrap_or(0) as u32;
+            let _ = CheckMenuRadioItem(
+                self.menu,
+                cmd::WINDOW_COLOURS,
+                cmd::WINDOW_COLOURS + WindowColours::ALL.len() as u32 - 1,
+                cmd::WINDOW_COLOURS + colours,
+                MF_BYCOMMAND.0,
+            );
             let way = s.remote_app_clipboard.as_deref().unwrap_or("off");
             let way = crate::stream::CLIPBOARD_WAYS
                 .iter()
@@ -14104,6 +14159,10 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
         if let Some(result) = standby_capture(hwnd, msg, wparam) {
             return result;
         }
+        // The menu bar in the window's colours.
+        if let Some(result) = ui_theme::frame_message(hwnd, msg, wparam, lparam) {
+            return result;
+        }
         if with_window(|w| w.desktop_message(msg, wparam, lparam)) == Some(true) {
             return LRESULT(0);
         }
@@ -14116,6 +14175,11 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                 LRESULT(0)
             }
             WM_ERASEBKGND => LRESULT(1),
+            // Windows' light or dark app mode, or its colours, changed.
+            WM_SETTINGCHANGE | WM_SYSCOLORCHANGE => {
+                with_window(Window::refresh_chrome);
+                DefWindowProcW(hwnd, msg, wparam, lparam)
+            }
             WM_SIZE => {
                 if wparam.0 as u32 != SIZE_MINIMIZED {
                     with_window(Window::layout);

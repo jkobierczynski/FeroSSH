@@ -4,8 +4,9 @@
 //! Each tab shows a state dot (green: logged in, amber: connecting, grey:
 //! closed or local), its title, a forwarding badge and a close mark; a `+`
 //! at the end opens a new tab. It is drawn into a [`Grid`] like a terminal row, so it needs
-//! nothing from the renderer. On Windows its colours follow the system menu
-//! bar, with the active tab in the window colour.
+//! nothing from the renderer. Its colours are the window's own (Settings >
+//! Window colours, see `ui_colours`): the menu bar's, with the active tab
+//! in the window colour.
 
 use ferossh_render::{Cell, Color, Flags, Grid, Rgb, Theme};
 use unicode_width::UnicodeWidthChar;
@@ -122,7 +123,7 @@ pub fn mix(a: Rgb, b: Rgb, amount: f32) -> Rgb {
 }
 
 /// Relative luminance, as WCAG defines it.
-fn luminance(c: Rgb) -> f32 {
+pub fn luminance(c: Rgb) -> f32 {
     let lin = |v: u8| {
         let v = f32::from(v) / 255.0;
         if v <= 0.039_28 {
@@ -145,7 +146,7 @@ pub fn contrast(a: Rgb, b: Rgb) -> f32 {
 pub const DIM_CONTRAST: f32 = 4.5;
 
 /// The strip's (and side pane's) colours.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Palette {
     pub strip: Rgb,
     pub active: Rgb,
@@ -158,24 +159,29 @@ pub struct Palette {
 impl Palette {
     /// From a pane theme.
     pub fn of(theme: &Theme) -> Self {
-        let strip = mix(theme.background, theme.foreground, 0.08);
-        let active = theme.background;
+        Self::from_colours(theme.background, theme.foreground, theme.cursor)
+    }
+
+    /// From a background, a text colour and an accent (a theme's cursor).
+    pub fn from_colours(background: Rgb, foreground: Rgb, accent: Rgb) -> Self {
+        let strip = mix(background, foreground, 0.08);
+        let active = background;
         // Grey, but no fainter than reads well on either background: from
         // a 40% fade toward the background, step back to the foreground.
         let mut fade = 0.40;
-        let mut dim = mix(theme.foreground, theme.background, fade);
+        let mut dim = mix(foreground, background, fade);
         while fade > 0.0
             && (contrast(dim, strip) < DIM_CONTRAST || contrast(dim, active) < DIM_CONTRAST)
         {
             fade = (fade - 0.02_f32).max(0.0);
-            dim = mix(theme.foreground, theme.background, fade);
+            dim = mix(foreground, background, fade);
         }
         Self {
             strip,
             active,
-            text: theme.foreground,
+            text: foreground,
             dim,
-            accent: theme.cursor,
+            accent,
         }
     }
 

@@ -1,4 +1,4 @@
-//! Helpers the native tool panels share (`conn_view`, `live_panel`):
+//! Helpers the native tool panels share (`conn_view`, `live_panel`, ...):
 //! the system font at a DPI, text in and out of controls, key state, and
 //! letting the mouse through to the terminal's edge.
 
@@ -31,9 +31,15 @@ pub fn set_edge_grab(main: HWND, grab: Option<crate::layout::Rect>) {
 }
 
 /// Lets the mouse through `panel` and every control in it at the time of
-/// the call (a list's header too) where it is over the edge's strip.
+/// the call (a list's header too) where it is over the edge's strip, and
+/// styles them for the window's colours (`ui_theme::restyle`).
 /// Called again when controls are added later; a repeat is harmless.
+///
+/// A panel also ends its window procedure with
+/// `ui_theme::def_window_proc` and paints with `ui_theme::sys_color` and
+/// `ui_theme::sys_brush`, so it follows Settings > Window colours.
 pub fn pass_edge(panel: HWND) {
+    crate::ui_theme::restyle(panel);
     unsafe extern "system" fn each(hwnd: HWND, _: LPARAM) -> windows::core::BOOL {
         // SAFETY: subclassing our own window with a procedure that lives
         // for the whole program.

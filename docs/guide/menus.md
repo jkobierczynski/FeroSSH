@@ -47,6 +47,7 @@ Items with a check mark are switches: picking them turns the setting on or off, 
 | Reset text size | Ctrl+0 | Back to the pane's normal size. |
 | Font (this pane) | | Eighteen monospace fonts for the focused pane. The five that come with Windows are listed first. A free font that is not installed reads "(download)" and opens its official download page; FeroSSH picks it up after a restart. |
 | Theme (this pane) | | The colour theme for the focused pane, in three columns: Nord and 24 other dark themes, 11 light themes, then the Production and Staging warning themes over the classics (Campbell, One Half Dark and Light, Tango Dark and Light from Windows Terminal, and PuTTY's colours). The list is in [Everyday use](everyday-use.md). |
+| Window colours (menus, tools) | | Where the menu bar and menus, the title bar, the tab strip, the tools rail and the tools pane take their colours. **Follow the terminal theme** (the default): the focused pane's theme, so a dark theme gives a dark window and Production a red one. **Follow Windows**: Windows' light or dark app mode. **Light**: Windows' usual light look. **Dark**: a neutral dark grey. `WindowColours`. |
 | Show test pattern | | Prints colours, text styles, box drawing, wide and combining characters in the pane, to check a font. |
 | Hide menu bar (Alt shows it) | Ctrl+Shift+M | Hides the menu bar. Pressing Alt shows it again. |
 

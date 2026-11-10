@@ -20,8 +20,8 @@ use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
     BeginPaint, COLOR_GRAYTEXT, COLOR_WINDOW, COLOR_WINDOWTEXT, DT_CALCRECT, DT_LEFT, DT_NOPREFIX,
     DT_SINGLELINE, DT_VCENTER, DT_WORDBREAK, DeleteObject, DrawTextW, EndPaint, FillRect, GetDC,
-    GetSysColor, GetSysColorBrush, HDC, HFONT, HGDIOBJ, InvalidateRect, PAINTSTRUCT, ReleaseDC,
-    SelectObject, SetBkMode, SetTextColor, TRANSPARENT,
+    HDC, HFONT, HGDIOBJ, InvalidateRect, PAINTSTRUCT, ReleaseDC, SelectObject, SetBkMode,
+    SetTextColor, TRANSPARENT,
 };
 use windows::Win32::UI::Controls::{
     EM_SETCUEBANNER, EM_SETREADONLY, EM_SETSEL, NMHDR, SetScrollInfo, TCIF_TEXT, TCITEMW,
@@ -34,12 +34,12 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
 use windows::Win32::UI::WindowsAndMessaging::{
     BN_CLICKED, BN_SETFOCUS, BS_DEFPUSHBUTTON, BS_NOTIFY, BS_PUSHBUTTON, CB_ADDSTRING,
     CB_GETCURSEL, CB_SETCURSEL, CBN_SELCHANGE, CBN_SETFOCUS, CBS_DROPDOWNLIST, CBS_HASSTRINGS,
-    CS_HREDRAW, CS_VREDRAW, CreateWindowExW, DefWindowProcW, DestroyWindow, EN_CHANGE, EN_SETFOCUS,
-    ES_AUTOHSCROLL, GetClientRect, GetParent, GetWindowTextLengthW, HMENU, IDC_ARROW, IDCANCEL,
-    IDOK, IsChild, IsDialogMessageW, IsWindowVisible, LoadCursorW, MSG, MoveWindow, PostMessageW,
-    RegisterClassW, SB_BOTTOM, SB_LINEDOWN, SB_LINEUP, SB_PAGEDOWN, SB_PAGEUP, SB_THUMBPOSITION,
-    SB_THUMBTRACK, SB_TOP, SB_VERT, SCROLLINFO, SIF_PAGE, SIF_POS, SIF_RANGE, SW_HIDE, SW_SHOWNA,
-    SendMessageW, SetWindowTextW, ShowWindow, WINDOW_EX_STYLE, WINDOW_STYLE, WM_APP, WM_COMMAND,
+    CS_HREDRAW, CS_VREDRAW, CreateWindowExW, DestroyWindow, EN_CHANGE, EN_SETFOCUS, ES_AUTOHSCROLL,
+    GetClientRect, GetParent, GetWindowTextLengthW, HMENU, IDC_ARROW, IDCANCEL, IDOK, IsChild,
+    IsDialogMessageW, IsWindowVisible, LoadCursorW, MSG, MoveWindow, PostMessageW, RegisterClassW,
+    SB_BOTTOM, SB_LINEDOWN, SB_LINEUP, SB_PAGEDOWN, SB_PAGEUP, SB_THUMBPOSITION, SB_THUMBTRACK,
+    SB_TOP, SB_VERT, SCROLLINFO, SIF_PAGE, SIF_POS, SIF_RANGE, SW_HIDE, SW_SHOWNA, SendMessageW,
+    SetWindowTextW, ShowWindow, WINDOW_EX_STYLE, WINDOW_STYLE, WM_APP, WM_COMMAND,
     WM_CTLCOLORSTATIC, WM_ERASEBKGND, WM_KEYDOWN, WM_MOUSEWHEEL, WM_NOTIFY, WM_PAINT, WM_SYSCHAR,
     WM_SYSKEYDOWN, WM_SYSKEYUP, WM_VSCROLL, WNDCLASSW, WS_BORDER, WS_CHILD, WS_CLIPCHILDREN,
     WS_CLIPSIBLINGS, WS_EX_CONTROLPARENT, WS_TABSTOP, WS_VISIBLE, WS_VSCROLL,
@@ -998,7 +998,7 @@ fn paint(h: Handles) {
         let dc = BeginPaint(h.panel, &mut ps);
         let mut rc = RECT::default();
         let _ = GetClientRect(h.panel, &mut rc);
-        FillRect(dc, &rc, GetSysColorBrush(COLOR_WINDOW));
+        FillRect(dc, &rc, crate::ui_theme::sys_brush(COLOR_WINDOW));
         let old = SelectObject(dc, HGDIOBJ(title_font.0));
         SetBkMode(dc, TRANSPARENT);
         let pad = scale(10, dpi);
@@ -1008,7 +1008,7 @@ fn paint(h: Handles) {
             right: rc.right - pad,
             bottom: scale(36, dpi),
         };
-        SetTextColor(dc, COLORREF(GetSysColor(COLOR_WINDOWTEXT)));
+        SetTextColor(dc, COLORREF(crate::ui_theme::sys_color(COLOR_WINDOWTEXT)));
         let mut text: Vec<u16> = title.encode_utf16().collect();
         DrawTextW(
             dc,
@@ -1019,7 +1019,7 @@ fn paint(h: Handles) {
         if let Some(e) = error {
             SelectObject(dc, HGDIOBJ(font.0));
             // Red, readable on the window colour.
-            SetTextColor(dc, COLORREF(0x0020_20C0));
+            SetTextColor(dc, crate::ui_theme::error_color());
             let button = scale(28, dpi);
             let gap = scale(6, dpi);
             let bottom = rc.bottom - scale(8, dpi) - button - gap;
@@ -1080,7 +1080,7 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
             LRESULT(0)
         }
         // SAFETY: default handling for everything else.
-        _ => unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) },
+        _ => crate::ui_theme::def_window_proc(hwnd, msg, wparam, lparam),
     }
 }
 
@@ -1092,7 +1092,7 @@ extern "system" fn page_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARA
             unsafe {
                 let mut ps = PAINTSTRUCT::default();
                 let dc = BeginPaint(hwnd, &mut ps);
-                FillRect(dc, &ps.rcPaint, GetSysColorBrush(COLOR_WINDOW));
+                FillRect(dc, &ps.rcPaint, crate::ui_theme::sys_brush(COLOR_WINDOW));
                 let _ = EndPaint(hwnd, &ps);
             }
             LRESULT(0)
@@ -1121,8 +1121,8 @@ extern "system" fn page_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARA
                 } else {
                     COLOR_WINDOWTEXT
                 };
-                SetTextColor(dc, COLORREF(GetSysColor(colour)));
-                LRESULT(GetSysColorBrush(COLOR_WINDOW).0 as isize)
+                SetTextColor(dc, COLORREF(crate::ui_theme::sys_color(colour)));
+                LRESULT(crate::ui_theme::sys_brush(COLOR_WINDOW).0 as isize)
             }
         }
         (WM_VSCROLL, Some(h)) => {
@@ -1156,6 +1156,6 @@ extern "system" fn page_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARA
             LRESULT(0)
         }
         // SAFETY: default handling for everything else.
-        _ => unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) },
+        _ => crate::ui_theme::def_window_proc(hwnd, msg, wparam, lparam),
     }
 }
