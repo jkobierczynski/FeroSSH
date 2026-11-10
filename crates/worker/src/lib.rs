@@ -161,9 +161,11 @@ pub async fn serve(mut inbox: mpsc::Receiver<Message>, out: mpsc::Sender<Message
                 guard.track(tokio::spawn(session::open(
                     channel,
                     connection,
-                    (cols, rows),
-                    x11,
-                    options,
+                    session::ShellRequest {
+                        size: (cols, rows),
+                        x11,
+                        options,
+                    },
                     rx,
                     out.clone(),
                     connections.clone(),

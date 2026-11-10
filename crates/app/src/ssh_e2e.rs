@@ -134,6 +134,8 @@ struct Run {
     shown: String,
     output: String,
     prompts: Vec<String>,
+    /// What forwarded agent signatures asked.
+    agent_questions: Vec<String>,
 }
 
 /// A worker of its own, over OS pipes.
@@ -171,6 +173,11 @@ fn connect_to(
     }
     let mut proxies: Vec<ProxyRun> = Vec::new();
     let mut run = Run::default();
+    // Agent forwarding as the window does it, every signature allowed.
+    let mut forwarding = crate::agent_fwd::Forwarding::default();
+    let mut jobs: std::collections::VecDeque<Option<crate::agent_fwd::For>> =
+        std::collections::VecDeque::new();
+    let mut agent_outs: Vec<crate::agent_fwd::Out> = Vec::new();
     let mut effects = session.start(80, 24);
     let deadline = Instant::now() + Duration::from_secs(30);
     loop {
@@ -205,7 +212,10 @@ fn connect_to(
                 }
                 Effect::Show(s) => run.shown.push_str(&s),
                 Effect::Output(b) => run.output.push_str(&String::from_utf8_lossy(&b)),
-                Effect::Broker(job) => broker.submit(job),
+                Effect::Broker(job) => {
+                    jobs.push_back(None);
+                    broker.submit(job);
+                }
                 Effect::Connected => effects.extend(session.input(command.as_bytes())),
                 Effect::Ended => return (run, session),
                 Effect::Reconnect => {}
@@ -229,14 +239,45 @@ fn connect_to(
             effects.extend(session.prompt_input(b"\r"));
             continue;
         }
+        while let Some(out) = agent_outs.pop() {
+            match out {
+                crate::agent_fwd::Out::Send { connection, msg } => links[&connection].send(msg),
+                crate::agent_fwd::Out::Broker { what, job } => {
+                    jobs.push_back(Some(what));
+                    broker.submit(job);
+                }
+                crate::agent_fwd::Out::Ask => {
+                    run.agent_questions
+                        .push(forwarding.question().unwrap_or_default());
+                    agent_outs.extend(forwarding.answer(crate::agent_fwd::Answer::Allow));
+                }
+            }
+        }
         if let Some(reply) = broker.try_recv() {
-            effects.extend(session.on_broker(reply));
+            match jobs.pop_front().flatten() {
+                Some(what) => agent_outs.extend(forwarding.on_broker(what, reply)),
+                None => effects.extend(session.on_broker(reply)),
+            }
             continue;
         }
         let event = links
             .iter()
             .find_map(|(&c, l)| l.try_recv().map(|e| (c, e)));
         match event {
+            Some((
+                c,
+                LinkEvent::Message(
+                    m @ (ferossh_ipc::Message::AgentList { .. }
+                    | ferossh_ipc::Message::AgentSign { .. }),
+                ),
+            )) => {
+                let peer = crate::agent_fwd::Peer {
+                    label: session.target.label(),
+                    forward: session.target.forward_agent,
+                    agent: session.target.agent.clone(),
+                };
+                agent_outs.extend(forwarding.on_request(c, m, Some(peer)));
+            }
             Some((c, LinkEvent::Message(m))) => {
                 // As the window does: only from the worker it belongs to.
                 if session.worker_for(m.channel()) == Some(c) {
@@ -392,13 +433,21 @@ fn match_blocks_certificates_and_session_keywords_reach_the_server() {
     let _ = std::fs::remove_dir_all(&ca_dir);
     std::fs::create_dir_all(&ca_dir).unwrap();
     let ca = ca_dir.join("ca");
-    if Command::new("ssh-keygen").arg("-?").stderr(Stdio::null()).status().is_err() {
+    if Command::new("ssh-keygen")
+        .arg("-?")
+        .stderr(Stdio::null())
+        .status()
+        .is_err()
+    {
         return;
     }
     keygen(&ca, "");
     let Some(server) = start_sshd(
         "keywords",
-        &format!("TrustedUserCAKeys {}.pub\nAcceptEnv FEROSSH_*", ca.display()),
+        &format!(
+            "TrustedUserCAKeys {}.pub\nAcceptEnv FEROSSH_*",
+            ca.display()
+        ),
     ) else {
         return;
     };
@@ -464,4 +513,105 @@ fn match_blocks_certificates_and_session_keywords_reach_the_server() {
     assert!(!ssh.join("known_hosts").exists());
     // sshd reads the CA at every login, so only now.
     let _ = std::fs::remove_dir_all(&ca_dir);
+}
+
+#[test]
+fn forwards_the_agent_and_asks_before_each_signature() {
+    let Some(server) = start_sshd("agent", "AllowAgentForwarding yes") else {
+        return;
+    };
+    let user = local_user();
+    let ssh = server.dir.join(".ssh");
+    // A key only the agent holds, which the server also takes, so that
+    // `ssh` on the server can log in to it again through the agent.
+    let sock = server.dir.join("agent.sock");
+    let mut agent = Command::new("ssh-agent")
+        .arg("-D")
+        .arg("-a")
+        .arg(&sock)
+        .stdout(Stdio::null())
+        .spawn()
+        .unwrap();
+    for _ in 0..200 {
+        if sock.exists() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let agent_key = server.dir.join("agentkey");
+    keygen(&agent_key, "");
+    let ok = Command::new("ssh-add")
+        .arg(&agent_key)
+        .env("SSH_AUTH_SOCK", &sock)
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|s| s.success());
+    assert!(ok);
+    let mut authorized = std::fs::read_to_string(server.dir.join("authorized_keys")).unwrap();
+    authorized.push_str(&std::fs::read_to_string(agent_key.with_extension("pub")).unwrap());
+    std::fs::write(server.dir.join("authorized_keys"), authorized).unwrap();
+    std::fs::remove_file(&agent_key).unwrap();
+    let env = Env {
+        home: server.dir.clone(),
+        local_user: user.clone(),
+        vars: Vec::new(),
+        config: format!(
+            "Host testhost\n  HostName 127.0.0.1\n  Port {}\n  User {user}\n\
+             \x20 IdentityAgent {}\n  ForwardAgent yes\n  StrictHostKeyChecking accept-new\n",
+            server.port,
+            sock.display()
+        ),
+    };
+    // On the server: list the forwarded keys, then log in to the server
+    // again with them.
+    let command = format!(
+        "ssh-add -l; ssh -o BatchMode=yes -o StrictHostKeyChecking=no \
+         -o UserKnownHostsFile=/dev/null -o IdentitiesOnly=no -F /dev/null -p {} \
+         {user}@127.0.0.1 echo hop$((40+2)); exit\n",
+        server.port
+    );
+    let (run, _) = connect(&env, &command, &[]);
+    let _ = agent.kill();
+    let _ = agent.wait();
+    assert!(run.output.contains("e2e (ED25519)"), "{}", run.output);
+    assert!(
+        run.output.contains("hop42"),
+        "{}\n{}",
+        run.shown,
+        run.output
+    );
+    assert_eq!(run.agent_questions.len(), 1, "{:?}", run.agent_questions);
+    let q = &run.agent_questions[0];
+    assert!(
+        q.contains(&format!("log in as \"{user}\" to another server")),
+        "{q}"
+    );
+    assert!(q.contains("ssh-agent, \"e2e\""), "{q}");
+    // OpenSSH names the server it logs in to by its host key.
+    assert!(q.contains("host key is SHA256:"), "{q}");
+}
+
+#[test]
+fn refuses_agent_channels_without_forward_agent() {
+    let Some(server) = start_sshd("noagent", "AllowAgentForwarding yes") else {
+        return;
+    };
+    let user = local_user();
+    let env = Env {
+        home: server.dir.clone(),
+        local_user: user.clone(),
+        vars: Vec::new(),
+        config: format!(
+            "Host testhost\n  HostName 127.0.0.1\n  Port {}\n  User {user}\n\
+             \x20 IdentityFile ~/.ssh/id_ed25519\n  StrictHostKeyChecking accept-new\n",
+            server.port
+        ),
+    };
+    let (run, _) = connect(
+        &env,
+        "echo [${SSH_AUTH_SOCK:-none}]; exit\n",
+        &[("Passphrase", "secret")],
+    );
+    assert!(run.output.contains("[none]"), "{}", run.output);
+    assert!(run.agent_questions.is_empty());
 }

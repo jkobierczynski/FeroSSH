@@ -680,8 +680,7 @@ fn apply(
                 cfg.host_key_alias = args.into_iter().next();
             }
             "addressfamily" if cfg.address_family.is_none() => {
-                cfg.address_family = match args.first().map(|a| a.to_ascii_lowercase()).as_deref()
-                {
+                cfg.address_family = match args.first().map(|a| a.to_ascii_lowercase()).as_deref() {
                     Some("any") => Some(AddressFamily::Any),
                     Some("inet") => Some(AddressFamily::Inet),
                     Some("inet6") => Some(AddressFamily::Inet6),
@@ -769,7 +768,10 @@ fn match_line_matches(
 
 /// `%h` and `%%` in a `HostName`, for `Match host`.
 fn expand_match_host(hostname: &str, name: &str) -> String {
-    hostname.replace("%%", "\u{0}").replace("%h", name).replace('\u{0}', "%")
+    hostname
+        .replace("%%", "\u{0}")
+        .replace("%h", name)
+        .replace('\u{0}', "%")
 }
 
 /// Expands `~` and the `%d %u %h %r %%` tokens in an `IdentityFile` path.
@@ -1094,7 +1096,10 @@ Host *
         assert_eq!(c.port, Some(2222));
         // The first pass set User already, and the first value wins.
         assert_eq!(c.user.as_deref(), Some("early"));
-        assert_eq!(resolve("Match !final\n User first\n", "x").user.as_deref(), Some("first"));
+        assert_eq!(
+            resolve("Match !final\n User first\n", "x").user.as_deref(),
+            Some("first")
+        );
     }
 
     #[test]

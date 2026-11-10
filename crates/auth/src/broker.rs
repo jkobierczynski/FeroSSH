@@ -155,7 +155,9 @@ fn read_certificate(path: &std::path::Path) -> Option<Vec<u8>> {
 /// The public key inside a certificate blob.
 fn certified_key(cert: &[u8]) -> Option<Vec<u8>> {
     let cert = Certificate::from_bytes(cert).ok()?;
-    PublicKey::new(cert.public_key().clone(), "").to_bytes().ok()
+    PublicKey::new(cert.public_key().clone(), "")
+        .to_bytes()
+        .ok()
 }
 
 /// The certificates for a key file: `CertificateFile`s that certify its
@@ -282,8 +284,9 @@ fn sign(
         return None;
     };
     let result = match &identity.source {
-        Source::Agent(a) => agent::sign(rt, *a, &choice, &identity.public, &data, flags)
-            .map_err(SignError::Failed),
+        Source::Agent(a) => {
+            agent::sign(rt, *a, &choice, &identity.public, &data, flags).map_err(SignError::Failed)
+        }
         Source::File(f) => f
             .sign_with(
                 passphrase.as_deref().map(String::as_str),

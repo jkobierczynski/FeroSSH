@@ -84,11 +84,11 @@ use windows::Win32::UI::WindowsAndMessaging::{
     GWL_STYLE, GetClientRect, GetCursorPos, GetForegroundWindow, GetMenuItemCount, GetMenuItemID,
     GetMenuState, GetMenuStringW, GetMessageW, GetSubMenu, GetWindowLongPtrW, GetWindowPlacement,
     HCURSOR, HMENU, HTCLIENT, HWND_TOP, IDC_ARROW, IDC_IBEAM, IDC_SIZEALL, IDC_SIZENS, IDC_SIZEWE,
-    IDOK, IDYES, IsChild, IsIconic, IsWindowVisible, KillTimer, LoadCursorW, LoadIconW,
+    IDCANCEL, IDOK, IDYES, IsChild, IsIconic, IsWindowVisible, KillTimer, LoadCursorW, LoadIconW,
     MB_DEFBUTTON2, MB_ICONERROR, MB_ICONINFORMATION, MB_ICONQUESTION, MB_ICONWARNING, MB_OK,
-    MB_OKCANCEL, MB_YESNO, MESSAGEBOX_RESULT, MESSAGEBOX_STYLE, MF_BYCOMMAND, MF_BYPOSITION,
-    MF_CHECKED, MF_DISABLED, MF_GRAYED, MF_MENUBARBREAK, MF_POPUP, MF_SEPARATOR, MF_STRING,
-    MF_UNCHECKED, MSG, MessageBoxW, ModifyMenuW, PM_REMOVE, PeekMessageW, PostMessageW,
+    MB_OKCANCEL, MB_YESNO, MB_YESNOCANCEL, MESSAGEBOX_RESULT, MESSAGEBOX_STYLE, MF_BYCOMMAND,
+    MF_BYPOSITION, MF_CHECKED, MF_DISABLED, MF_GRAYED, MF_MENUBARBREAK, MF_POPUP, MF_SEPARATOR,
+    MF_STRING, MF_UNCHECKED, MSG, MessageBoxW, ModifyMenuW, PM_REMOVE, PeekMessageW, PostMessageW,
     PostQuitMessage, RegisterClassW, SIZE_MINIMIZED, SW_HIDE, SW_RESTORE, SW_SHOW, SW_SHOWNORMAL,
     SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOOWNERZORDER, SWP_NOSIZE, SWP_NOZORDER,
     SetCursor, SetForegroundWindow, SetMenu, SetTimer, SetWindowLongPtrW, SetWindowPlacement,
@@ -832,9 +832,12 @@ struct Window {
     /// The `ProxyCommand` each connection runs over, by the connection.
     proxies: HashMap<ChannelId, ProxyRun>,
     broker: Option<Broker>,
-    /// The channel of each job handed to the broker, oldest first. The
+    /// Whom each job handed to the broker is for, oldest first. The
     /// broker answers in order, so each reply goes to the front one.
-    broker_jobs: VecDeque<ChannelId>,
+    broker_jobs: VecDeque<BrokerFor>,
+    /// Agent forwarding: the keys each connection was shown, and the
+    /// signatures waiting for the user's answer.
+    agent_fwd: crate::agent_fwd::Forwarding,
     /// The channel id of the next SSH shell.
     next_channel: u32,
     /// Set while a WM_SHELL_OUTPUT is queued, so the background threads
@@ -1607,6 +1610,7 @@ fn create_and_run(launch: Launch, theme: Option<String>) -> Result<()> {
                 proxies: HashMap::new(),
                 broker: None,
                 broker_jobs: VecDeque::new(),
+                agent_fwd: Default::default(),
                 next_channel: 1,
                 output_pending: Arc::new(AtomicBool::new(false)),
                 sftp: HashMap::new(),
@@ -5065,6 +5069,59 @@ impl Window {
         self.update_menu_checks();
     }
 
+    /// A forwarded agent's request from the worker of `connection`. Only
+    /// the connection's own login channel speaks for it, and only while a
+    /// session with `ForwardAgent` is logged in on it.
+    fn on_agent_request(&mut self, connection: ChannelId, msg: Message) {
+        let peer = (msg.channel() == Some(connection))
+            .then(|| {
+                self.panes.values().find_map(|p| match &p.host {
+                    Host::Ssh(s)
+                        if s.connection == connection
+                            && s.worker_for(Some(s.channel)) == Some(connection)
+                            && s.state() == State::Connected =>
+                    {
+                        Some(crate::agent_fwd::Peer {
+                            label: s.target.label(),
+                            forward: s.target.forward_agent,
+                            agent: s.target.agent.clone(),
+                        })
+                    }
+                    _ => None,
+                })
+            })
+            .flatten();
+        let outs = self.agent_fwd.on_request(connection, msg, peer);
+        self.agent_out(outs);
+    }
+
+    /// Carries out what agent forwarding decided.
+    fn agent_out(&mut self, outs: Vec<crate::agent_fwd::Out>) {
+        use crate::agent_fwd::Out;
+        for out in outs {
+            match out {
+                Out::Send { connection, msg } => {
+                    if let Some(w) = self.workers.get(&connection) {
+                        w.link.send(msg);
+                    }
+                }
+                Out::Broker { what, job } => {
+                    if let Some(b) = &self.broker {
+                        self.broker_jobs.push_back(BrokerFor::Agent(what));
+                        b.submit(job);
+                    }
+                }
+                Out::Ask => self.queued.push(Command::AskAgentSign),
+            }
+        }
+    }
+
+    /// The user's answer to the agent question.
+    fn agent_answered(&mut self, answer: crate::agent_fwd::Answer) {
+        let outs = self.agent_fwd.answer(answer);
+        self.agent_out(outs);
+    }
+
     /// Carries out what a pane's SSH session decided.
     fn apply(&mut self, id: PaneId, effects: Vec<Effect>) {
         // A run's row that ended: the next host may start.
@@ -5121,7 +5178,7 @@ impl Window {
                         _ => 0,
                     };
                     if let Some(b) = &self.broker {
-                        self.broker_jobs.push_back(channel);
+                        self.broker_jobs.push_back(BrokerFor::Login(channel));
                         b.submit(job);
                     }
                 }
@@ -5207,6 +5264,15 @@ impl Window {
                     }
                     self.prune_sftp();
                     self.prune_forwards();
+                    let live: HashSet<ChannelId> = self
+                        .panes
+                        .values()
+                        .filter_map(|p| match &p.host {
+                            Host::Ssh(s) if s.state() == State::Connected => Some(s.connection),
+                            _ => None,
+                        })
+                        .collect();
+                    self.agent_fwd.retain(|c| live.contains(&c));
                     self.refresh_chrome();
                 }
             }
@@ -6346,7 +6412,15 @@ impl Window {
         }
         // The signing broker answers in the order it was asked.
         while let Some(reply) = self.broker.as_ref().and_then(Broker::try_recv) {
-            let channel = self.broker_jobs.pop_front().unwrap_or(0);
+            let channel = match self.broker_jobs.pop_front() {
+                Some(BrokerFor::Agent(what)) => {
+                    let outs = self.agent_fwd.on_broker(what, reply);
+                    self.agent_out(outs);
+                    continue;
+                }
+                Some(BrokerFor::Login(channel)) => channel,
+                None => 0,
+            };
             let Some(id) = self.pane_of_channel(channel) else {
                 continue;
             };
@@ -6441,6 +6515,10 @@ impl Window {
                 let Some(c) = msg.channel() else {
                     return false;
                 };
+                if matches!(msg, Message::AgentList { .. } | Message::AgentSign { .. }) {
+                    self.on_agent_request(connection, msg);
+                    return false;
+                }
                 if self
                     .vdesks
                     .get(&c)
@@ -9159,20 +9237,23 @@ impl Window {
                                     .iter()
                                     .find(|k| k.explicit)
                                     .map(|k| k.path.display().to_string());
-                                Values::from_resolved(
-                                    &name,
-                                    folder.as_deref(),
-                                    &t.hostname,
-                                    &t.user,
-                                    t.port,
-                                    key.as_deref(),
-                                    &t.jumps
-                                        .iter()
-                                        .map(|j| j.alias.as_str())
-                                        .collect::<Vec<_>>()
-                                        .join(","),
-                                    &t.forwards,
-                                )
+                                Values {
+                                    forward_agent: t.forward_agent,
+                                    ..Values::from_resolved(
+                                        &name,
+                                        folder.as_deref(),
+                                        &t.hostname,
+                                        &t.user,
+                                        t.port,
+                                        key.as_deref(),
+                                        &t.jumps
+                                            .iter()
+                                            .map(|j| j.alias.as_str())
+                                            .collect::<Vec<_>>()
+                                            .join(","),
+                                        &t.forwards,
+                                    )
+                                }
                             }
                             None => Values {
                                 name: name.clone(),
@@ -12585,8 +12666,19 @@ fn shortcut(vk: VIRTUAL_KEY, m: Mods, tabs: bool, split: bool) -> Option<u32> {
 /// Follow-up actions that call into Win32 functions which send messages to
 /// the window or open dialogs, so they run after the state borrow is
 /// released.
+/// Whom a job handed to the signing broker is for.
+#[derive(Debug, Clone, Copy)]
+enum BrokerFor {
+    /// The login on this channel.
+    Login(ChannelId),
+    /// A forwarded agent.
+    Agent(crate::agent_fwd::For),
+}
+
 enum Command {
     Id(u32),
+    /// A forwarded agent asks for a signature: ask the user.
+    AskAgentSign,
     /// Window > Standby window > Press a new hotkey: says what to do,
     /// then the next key pressed becomes the hotkey.
     PickStandbyHotkey,
@@ -14125,6 +14217,28 @@ fn run_command(hwnd: HWND, command: Command) {
         }
         Command::Message(text) => {
             dialog(hwnd, &text, MB_OK | MB_ICONINFORMATION);
+        }
+        Command::AskAgentSign => {
+            use crate::agent_fwd::Answer;
+            let Some(text) = with_window(|w| w.agent_fwd.question()).flatten() else {
+                return;
+            };
+            let info = FLASHWINFO {
+                cbSize: std::mem::size_of::<FLASHWINFO>() as u32,
+                hwnd,
+                dwFlags: FLASHW_TRAY | FLASHW_TIMERNOFG,
+                uCount: 0,
+                dwTimeout: 0,
+            };
+            // SAFETY: valid struct for our window.
+            let _ = unsafe { FlashWindowEx(&info) };
+            let answer = match dialog(hwnd, &text, MB_YESNOCANCEL | MB_ICONWARNING | MB_DEFBUTTON2)
+            {
+                Some(IDYES) => Answer::Allow,
+                Some(IDCANCEL) => Answer::RefuseAll,
+                _ => Answer::Refuse,
+            };
+            with_window(|w| w.agent_answered(answer));
         }
         Command::UpdateFound { outcome, asked } => {
             use crate::update::Outcome;

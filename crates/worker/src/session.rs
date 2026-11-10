@@ -884,18 +884,26 @@ pub async fn run(
     let _ = out.send(Message::Disconnected { channel, reason }).await;
 }
 
+/// What a shell opened on an existing connection asks for.
+#[derive(Debug, Clone)]
+pub struct ShellRequest {
+    /// The pane's size.
+    pub size: (u16, u16),
+    pub x11: Option<X11Auth>,
+    pub options: ShellOptions,
+}
+
 /// Opens another shell on the connection `connection` made, for a new tab
 /// or pane: no new login. Reports why it ended, like [`run`].
 pub async fn open(
     channel: ChannelId,
     connection: ChannelId,
-    size: (u16, u16),
-    x11: Option<X11Auth>,
-    options: ShellOptions,
+    shell_request: ShellRequest,
     mut inbox: mpsc::Receiver<Message>,
     out: mpsc::Sender<Message>,
     connections: Connections,
 ) {
+    let ShellRequest { size, x11, options } = shell_request;
     let mut ctx = Ctx {
         channel,
         out: out.clone(),
@@ -1212,7 +1220,9 @@ async fn pump(
     // Variables first, as OpenSSH sends them; a server that does not take
     // one (sshd's AcceptEnv) just ignores it.
     for (name, value) in &ctx.options.env {
-        channel.set_env(false, name.as_str(), value.as_str()).await?;
+        channel
+            .set_env(false, name.as_str(), value.as_str())
+            .await?;
     }
     if ctx.options.agent
         && let Some(f) = &ctx.forwards

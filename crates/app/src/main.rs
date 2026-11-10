@@ -19,6 +19,8 @@
 #![cfg_attr(windows, windows_subsystem = "windows")]
 
 #[cfg_attr(not(windows), allow(dead_code))]
+mod agent_fwd;
+#[cfg_attr(not(windows), allow(dead_code))]
 mod batch;
 #[cfg_attr(not(windows), allow(dead_code))]
 mod broadcast;

@@ -95,6 +95,8 @@ pub struct Values {
     /// `off`.
     pub desk_clipboard: String,
     pub legacy: bool,
+    /// Let the server use the agent's keys (`ForwardAgent yes`).
+    pub forward_agent: bool,
     /// Where the password comes from: see [`PASSWORD_CHOICES`].
     pub password: usize,
     /// The password manager command, for a template or a custom one.
@@ -151,6 +153,7 @@ impl Values {
             key: h.identity_file.clone().unwrap_or_default(),
             jump: h.proxy_jump.clone().unwrap_or_default(),
             forwards: h.forwards.iter().map(forward_text).collect(),
+            forward_agent: h.forward_agent,
             ..Self::default()
         }
     }
@@ -263,6 +266,7 @@ enum Field {
     Clipboard,
     DeskClipboard,
     Legacy,
+    ForwardAgent,
     Password,
     PasswordCommand,
     Speed,
@@ -304,6 +308,7 @@ impl Field {
             Field::Clipboard => "App clip",
             Field::DeskClipboard => "Desk clip",
             Field::Legacy => "Old crypto",
+            Field::ForwardAgent => "Fwd agent",
             Field::Password => "Password",
             Field::PasswordCommand => "Command",
             Field::Speed => "Speed",
@@ -322,6 +327,7 @@ impl Field {
                 | Field::Tmux
                 | Field::TmuxLayout
                 | Field::Legacy
+                | Field::ForwardAgent
                 | Field::CopyAgent
                 | Field::RemoveAgent
                 | Field::Clipboard
@@ -637,6 +643,7 @@ impl SessionForm {
                         Field::CopyAgent,
                         Field::RemoveAgent,
                         Field::Clipboard,
+                        Field::ForwardAgent,
                         Field::Legacy,
                     ]
                     .map(Item::Field),
@@ -726,6 +733,7 @@ impl SessionForm {
             | Field::Tmux
             | Field::TmuxLayout
             | Field::Legacy
+            | Field::ForwardAgent
             | Field::CopyAgent
             | Field::RemoveAgent
             | Field::Clipboard
@@ -770,6 +778,7 @@ impl SessionForm {
             | Field::Tmux
             | Field::TmuxLayout
             | Field::Legacy
+            | Field::ForwardAgent
             | Field::CopyAgent
             | Field::RemoveAgent
             | Field::Clipboard
@@ -839,6 +848,12 @@ impl SessionForm {
             }
             .to_owned(),
             Field::Legacy => if v.legacy { "allowed" } else { "off" }.to_owned(),
+            Field::ForwardAgent => if v.forward_agent {
+                "on, asking before each use"
+            } else {
+                "off"
+            }
+            .to_owned(),
             Field::Password => match v.password {
                 PASSWORD_ASK => "ask every time".to_owned(),
                 PASSWORD_WINDOWS => "Windows Credential Manager".to_owned(),
@@ -912,6 +927,7 @@ impl SessionForm {
                 };
             }
             Field::Legacy => v.legacy = !v.legacy,
+            Field::ForwardAgent => v.forward_agent = !v.forward_agent,
             Field::CopyAgent => v.copy_agent = tri(v.copy_agent, forward),
             Field::RemoveAgent => v.remove_agent = tri(v.remove_agent, forward),
             Field::Clipboard | Field::DeskClipboard => {
@@ -1004,6 +1020,7 @@ impl SessionForm {
             | Field::Tmux
             | Field::TmuxLayout
             | Field::Legacy
+            | Field::ForwardAgent
             | Field::CopyAgent
             | Field::RemoveAgent
             | Field::Clipboard
@@ -1741,6 +1758,7 @@ impl SessionForm {
                     port: v.port.trim().parse().ok().filter(|&p| p != 0),
                     identity_file: trimmed(&v.key),
                     proxy_jump: trimmed(&v.jump).filter(|_| v.kind == SessionKind::Ssh),
+                    forward_agent: v.forward_agent && v.kind == SessionKind::Ssh,
                     forwards: v.forwards.iter().filter_map(|f| parse_option(f)).fold(
                         Vec::new(),
                         |mut all, f| {
@@ -2360,8 +2378,9 @@ mod tests {
         f.key(SideKey::Enter { split: false }, 30);
         // tmux, tmux panes, Start dir, Local folder, Remote folder,
         // Forward 1, RDP port, VNC port, Virtual desk, Desk size, Desk
-        // clip, Remote app, Copy agent, Clean up, App clip, Old crypto.
-        down(&mut f, 17);
+        // clip, Remote app, Copy agent, Clean up, App clip, Fwd agent,
+        // Old crypto.
+        down(&mut f, 18);
         assert_eq!(f.focused_field(), Some(Field::LoginStep(0)));
         let t = texts(&mut f);
         assert!(

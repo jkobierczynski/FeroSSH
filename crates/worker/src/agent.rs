@@ -216,7 +216,7 @@ pub(crate) async fn serve(
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used)]
+#[allow(clippy::unwrap_used, clippy::indexing_slicing)]
 mod tests {
     use super::*;
 
@@ -279,11 +279,35 @@ mod tests {
     fn answers() {
         assert_eq!(failure(), vec![0, 0, 0, 1, FAILURE]);
         assert_eq!(signed(&[]), failure());
-        assert_eq!(signed(b"sig"), vec![0, 0, 0, 8, SIGN_RESPONSE, 0, 0, 0, 3, b's', b'i', b'g']);
+        assert_eq!(
+            signed(b"sig"),
+            vec![0, 0, 0, 8, SIGN_RESPONSE, 0, 0, 0, 3, b's', b'i', b'g']
+        );
         let keys = vec![(b"kk".to_vec(), "c".to_owned())];
         assert_eq!(
             identities(&keys),
-            vec![0, 0, 0, 16, IDENTITIES_ANSWER, 0, 0, 0, 1, 0, 0, 0, 2, b'k', b'k', 0, 0, 0, 1, b'c']
+            vec![
+                0,
+                0,
+                0,
+                16,
+                IDENTITIES_ANSWER,
+                0,
+                0,
+                0,
+                1,
+                0,
+                0,
+                0,
+                2,
+                b'k',
+                b'k',
+                0,
+                0,
+                0,
+                1,
+                b'c'
+            ]
         );
     }
 }

@@ -677,7 +677,10 @@ pub enum Message {
     // connection's login channel, `agent` the agent channel's id in the
     // worker.
     /// Worker to UI: the server wants the list of keys.
-    AgentList { channel: ChannelId, agent: ChannelId },
+    AgentList {
+        channel: ChannelId,
+        agent: ChannelId,
+    },
     /// Worker to UI: the server wants `data` signed with `key`; `flags`
     /// are the agent protocol's (RSA hash).
     AgentSign {
