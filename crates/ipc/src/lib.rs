@@ -46,7 +46,7 @@ use std::fmt;
 use zeroize::Zeroize;
 
 /// Protocol version carried in every frame. Bump on any wire change.
-pub const PROTOCOL_VERSION: u8 = 16;
+pub const PROTOCOL_VERSION: u8 = 17;
 
 /// Largest frame body accepted, in bytes. Terminal and SFTP data is chunked
 /// below this, so anything larger is a bug or an attack.
@@ -133,6 +133,18 @@ pub struct ShellOptions {
     pub pty: bool,
     /// Ask for agent forwarding, so the server may open agent channels.
     pub agent: bool,
+    /// Start `mosh-server` instead of a shell and carry the terminal over
+    /// Mosh (UDP) from then on; `command` is what Mosh runs.
+    pub mosh: Option<MoshOptions>,
+}
+
+/// How a Mosh session starts its server.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MoshOptions {
+    /// The server program: `mosh-server`, or a path to it.
+    pub server: String,
+    /// The UDP port, or range of ports, the server may listen on.
+    pub ports: Option<(u16, u16)>,
 }
 
 impl Default for ShellOptions {
@@ -143,6 +155,7 @@ impl Default for ShellOptions {
             command: None,
             pty: true,
             agent: false,
+            mosh: None,
         }
     }
 }
@@ -999,6 +1012,14 @@ impl Writer {
         }
         self.bool(o.pty);
         self.bool(o.agent);
+        self.bool(o.mosh.is_some());
+        if let Some(m) = &o.mosh {
+            self.str(&m.server);
+            self.opt(m.ports, |w, (low, high)| {
+                w.u16(low);
+                w.u16(high);
+            });
+        }
     }
 
     fn x11(&mut self, x: &Option<X11Auth>) {
@@ -1975,6 +1996,12 @@ impl<'a> Reader<'a> {
             command: self.opt(Reader::string)?,
             pty: self.bool()?,
             agent: self.bool()?,
+            mosh: self.opt(|r| {
+                Ok(MoshOptions {
+                    server: r.string()?,
+                    ports: r.opt(|r| Ok((r.u16()?, r.u16()?)))?,
+                })
+            })?,
         })
     }
 
@@ -2182,6 +2209,10 @@ mod tests {
                     command: Some("tmux new -A -s \"my s\"".into()),
                     pty: false,
                     agent: true,
+                    mosh: Some(MoshOptions {
+                        server: "/opt/bin/mosh-server".into(),
+                        ports: Some((60001, 60010)),
+                    }),
                 },
                 family: Family::V6,
                 gssapi: true,

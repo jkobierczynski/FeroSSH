@@ -15,6 +15,7 @@ ferossh-auth = { path = "crates/auth" }
 ferossh-config = { path = "crates/config" }
 ferossh-forward = { path = "crates/forward" }
 ferossh-ipc = { path = "crates/ipc" }
+ferossh-mosh = { path = "crates/mosh" }
 ferossh-render = { path = "crates/render" }
 ferossh-sftp = { path = "crates/sftp" }
 ferossh-term = { path = "crates/term" }

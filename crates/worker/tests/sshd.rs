@@ -1415,3 +1415,146 @@ async fn transfers_files_with_zmodem() {
     assert!(!shown.contains("B0100"), "{shown}");
     assert!(std::fs::read(dir.join("up.bin")).unwrap() == up);
 }
+
+/// Whether `mosh-server` is installed (CI sets FEROSSH_REQUIRE_MOSH).
+fn mosh_available() -> bool {
+    let found = Command::new("mosh-server")
+        .arg("--version")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok();
+    if !found {
+        assert!(
+            std::env::var_os("FEROSSH_REQUIRE_MOSH").is_none(),
+            "FEROSSH_REQUIRE_MOSH is set but mosh-server is missing"
+        );
+        eprintln!("mosh-server not found; skipping");
+    }
+    found
+}
+
+/// A Mosh session: the worker logs in over SSH, starts `mosh-server`,
+/// and from then on the terminal goes over UDP; typing and resizing
+/// work, and the shell exiting ends the session.
+#[cfg(unix)]
+#[tokio::test]
+async fn mosh_session_after_an_ssh_login() {
+    if !available() || !mosh_available() {
+        return;
+    }
+    let server = start("mosh", "");
+    let (to_worker, worker_in) = mpsc::channel(64);
+    let (worker_out, mut from_worker) = mpsc::channel(64);
+    tokio::spawn(ferossh_worker::serve(worker_in, worker_out));
+    let key = KeyFile::load(&server.user_key).unwrap();
+    to_worker
+        .send(Message::Hello {
+            version: PROTOCOL_VERSION,
+        })
+        .await
+        .unwrap();
+    to_worker
+        .send(Message::Connect {
+            channel: 1,
+            host: "127.0.0.1".into(),
+            port: server.port,
+            user: whoami(),
+            cols: 80,
+            rows: 24,
+            host_key_algs: vec![],
+            x11: None,
+            legacy: false,
+            timing: Default::default(),
+            tunnel: None,
+            shell: true,
+            options: ferossh_ipc::ShellOptions {
+                command: Some("PS1='mosh> ' exec /bin/sh -i".into()),
+                mosh: Some(ferossh_ipc::MoshOptions {
+                    server: "mosh-server".into(),
+                    ports: None,
+                }),
+                ..Default::default()
+            },
+            family: Default::default(),
+            gssapi: false,
+        })
+        .await
+        .unwrap();
+    let mut screen = ferossh_mosh::screen::Screen::new(80, 24);
+    let text = |s: &ferossh_mosh::screen::Screen| -> String {
+        s.rows
+            .iter()
+            .map(|r| r.cells.iter().map(|c| c.text.as_str()).collect::<String>())
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    let mut cipher = String::new();
+    let mut step = 0;
+    let reason = loop {
+        let msg = tokio::time::timeout(Duration::from_secs(30), from_worker.recv())
+            .await
+            .unwrap_or_else(|_| panic!("timed out at step {step}: {}", text(&screen)))
+            .expect("worker hung up");
+        let reply = match msg {
+            Message::HostKey { channel, .. } => Message::HostKeyVerdict {
+                channel,
+                accept: true,
+            },
+            Message::IdentitiesRequest { channel } => Message::Identities {
+                channel,
+                keys: vec![key.public.clone()],
+            },
+            Message::SignRequest { channel, data, .. } => Message::Signature {
+                channel,
+                signature: key.sign(None, &data).unwrap(),
+            },
+            Message::Connected { cipher: c, .. } => {
+                cipher = c;
+                continue;
+            }
+            Message::Data { bytes, .. } => {
+                screen.apply(&bytes);
+                let shown = text(&screen);
+                match step {
+                    0 if shown.contains("mosh> ") => {
+                        step = 1;
+                        Message::Data {
+                            channel: 1,
+                            bytes: b"echo over$((40+2))udp\r".to_vec(),
+                        }
+                    }
+                    1 if shown.contains("over42udp") => {
+                        step = 2;
+                        screen.resize(100, 30);
+                        to_worker
+                            .send(Message::Resize {
+                                channel: 1,
+                                cols: 100,
+                                rows: 30,
+                            })
+                            .await
+                            .unwrap();
+                        Message::Data {
+                            channel: 1,
+                            bytes: b"stty size\r".to_vec(),
+                        }
+                    }
+                    2 if shown.contains("30 100") => {
+                        step = 3;
+                        Message::Data {
+                            channel: 1,
+                            bytes: b"exit\r".to_vec(),
+                        }
+                    }
+                    _ => continue,
+                }
+            }
+            Message::Disconnected { reason, .. } => break reason,
+            _ => continue,
+        };
+        to_worker.send(reply).await.unwrap();
+    };
+    assert_eq!(step, 3, "{reason}: {}", text(&screen));
+    assert!(cipher.starts_with("Mosh aes128-ocb, UDP 127.0.0.1:"), "{cipher}");
+}

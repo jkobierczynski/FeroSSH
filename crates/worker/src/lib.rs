@@ -15,8 +15,10 @@ mod agent;
 pub mod crypto_policy;
 mod exec;
 mod forward;
+mod mosh;
 mod session;
 mod sftp;
+
 pub mod telnet;
 mod tunnel;
 mod zmodem;
