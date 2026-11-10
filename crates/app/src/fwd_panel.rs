@@ -369,7 +369,15 @@ pub fn place(at: Option<Rect>, width: i32, dpi: u32) {
     let buttons_y = (at.h - pad - button).max(list_y + details + gap);
     let details_y = buttons_y - gap - details;
     let list_h = (details_y - gap - list_y).max(0);
-    let on_w = (inner - (button_w + gap) * if editing { 2 } else { 1 }).max(0);
+    // Add (and Cancel) keep to the part the terminal leaves uncovered,
+    // the connection box getting shorter, down to a short one (shorter
+    // still while editing, where it is greyed out, so Cancel stays too).
+    let tail_w = (button_w + gap) * if editing { 2 } else { 1 };
+    let full_right = pad + inner;
+    let shown_right = (at.w - pad)
+        .max(pad + scale(if editing { 40 } else { 100 }, dpi).min(inner / 2) + tail_w)
+        .min(full_right);
+    let on_w = (shown_right - pad - tail_w).max(0);
     with(|s| {
         s.message_at = RECT {
             left: pad,

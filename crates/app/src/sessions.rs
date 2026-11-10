@@ -536,6 +536,8 @@ pub struct TreeHost {
     pub label: String,
     /// The tooltip: `user@hostname:port`, and the kind.
     pub tip: String,
+    /// `user@hostname:port`, shown dimmed after the label.
+    pub detail: String,
 }
 
 /// A top-level entry of the native connection tree.
@@ -586,6 +588,7 @@ impl SessionList {
             name: h.name.clone(),
             label,
             tip,
+            detail: h.detail.clone(),
         })
     }
 
@@ -762,6 +765,7 @@ mod tests {
         // A favourite carries a star wherever it is listed.
         assert_eq!(tree[3].hosts()[0].label, "\u{2605} pi");
         assert_eq!(tree[1].hosts()[0].tip, "me@web.example");
+        assert_eq!(tree[1].hosts()[0].detail, "me@web.example");
     }
 
     #[test]

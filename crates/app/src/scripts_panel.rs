@@ -20,6 +20,7 @@
 #![allow(unsafe_code)]
 
 use std::cell::RefCell;
+use std::collections::HashSet;
 
 use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
@@ -31,14 +32,15 @@ use windows::Win32::Graphics::Gdi::{
 use windows::Win32::UI::Controls::{
     CDDS_ITEMPREPAINT, CDDS_PREPAINT, CDRF_DODEFAULT, CDRF_NOTIFYITEMDRAW, CDRF_SKIPDEFAULT,
     EM_SETCUEBANNER, EM_SETSEL, LIST_VIEW_ITEM_STATE_FLAGS, LVCDI_GROUP, LVCF_TEXT, LVCF_WIDTH,
-    LVCOLUMNW, LVGF_GROUPID, LVGF_HEADER, LVGGR_HEADER, LVGROUP, LVIF_GROUPID, LVIF_PARAM,
-    LVIF_TEXT, LVIS_FOCUSED, LVIS_SELECTED, LVITEMW, LVM_DELETEALLITEMS, LVM_ENABLEGROUPVIEW,
-    LVM_ENSUREVISIBLE, LVM_GETGROUPRECT, LVM_GETITEMW, LVM_GETNEXTITEM, LVM_INSERTCOLUMNW,
-    LVM_INSERTGROUP, LVM_INSERTITEMW, LVM_REMOVEALLGROUPS, LVM_SETCOLUMNWIDTH,
-    LVM_SETEXTENDEDLISTVIEWSTYLE, LVM_SETITEMSTATE, LVM_SETITEMTEXTW, LVN_ITEMCHANGED, LVN_KEYDOWN,
+    LVCOLUMNW, LVGF_GROUPID, LVGF_HEADER, LVGF_STATE, LVGGR_HEADER, LVGROUP, LVGS_COLLAPSED,
+    LVGS_COLLAPSIBLE, LVIF_GROUPID, LVIF_PARAM, LVIF_TEXT, LVIS_FOCUSED, LVIS_SELECTED, LVITEMW,
+    LVM_DELETEALLITEMS, LVM_ENABLEGROUPVIEW, LVM_ENSUREVISIBLE, LVM_GETGROUPRECT,
+    LVM_GETGROUPSTATE, LVM_GETITEMW, LVM_GETNEXTITEM, LVM_INSERTCOLUMNW, LVM_INSERTGROUP,
+    LVM_INSERTITEMW, LVM_REMOVEALLGROUPS, LVM_SETCOLUMNWIDTH, LVM_SETEXTENDEDLISTVIEWSTYLE,
+    LVM_SETGROUPINFO, LVM_SETITEMSTATE, LVM_SETITEMTEXTW, LVN_ITEMCHANGED, LVN_KEYDOWN,
     LVNI_SELECTED, LVS_EX_DOUBLEBUFFER, LVS_EX_FULLROWSELECT, LVS_NOSORTHEADER, LVS_REPORT,
-    LVS_SHOWSELALWAYS, LVS_SINGLESEL, NM_CUSTOMDRAW, NM_DBLCLK, NMHDR, NMLVCUSTOMDRAW, NMLVKEYDOWN,
-    SetWindowTheme, WC_BUTTONW, WC_EDITW, WC_LISTVIEWW,
+    LVS_SHOWSELALWAYS, LVS_SINGLESEL, NM_CLICK, NM_CUSTOMDRAW, NM_DBLCLK, NMHDR, NMITEMACTIVATE,
+    NMLVCUSTOMDRAW, NMLVKEYDOWN, SetWindowTheme, WC_BUTTONW, WC_EDITW, WC_LISTVIEWW,
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     EnableWindow, GetFocus, SetFocus, VK_CONTROL, VK_DELETE, VK_DOWN, VK_F2, VK_F5, VK_INSERT,
@@ -124,6 +126,14 @@ struct State {
     /// The list's category headings by group id, with how many scripts
     /// each has; drawn here in the window's text colour.
     groups: Vec<(String, usize)>,
+    /// Each heading's category in ASCII lower case (as the groups are
+    /// matched), by group id.
+    group_keys: Vec<String>,
+    /// The categories folded away, in ASCII lower case ("" for none);
+    /// kept while FeroSSH runs.
+    collapsed: HashSet<String>,
+    /// The list was last filled for a search.
+    searching: bool,
 }
 
 thread_local! {
@@ -264,6 +274,9 @@ pub fn create(main: HWND, handler: Handler, dpi: u32) -> windows::core::Result<(
                 filling: false,
                 details_at: RECT::default(),
                 groups: Vec::new(),
+                group_keys: Vec::new(),
+                collapsed: HashSet::new(),
+                searching: false,
             });
         });
         enable_buttons(&h);
@@ -395,10 +408,14 @@ pub fn set_view(rows: Vec<NativeScript>, selected: usize, filter: &str, total: u
         return;
     };
     let typed = search_text(h.search);
+    // A search shows every match, folded category or not: starting or
+    // clearing one refills the list even when the rows stay the same.
+    let searching = !filter.is_empty();
     let rebuild = with(|s| {
         s.filling = true;
         s.total = total;
-        if s.rows.as_ref() == Some(&rows) {
+        let search_changed = std::mem::replace(&mut s.searching, searching) != searching;
+        if s.rows.as_ref() == Some(&rows) && !search_changed {
             return false;
         }
         s.rows = Some(rows.clone());
@@ -421,12 +438,28 @@ pub fn set_view(rows: Vec<NativeScript>, selected: usize, filter: &str, total: u
             );
         }
         if rebuild {
-            fill_list(&h, &rows);
+            fill_list(&h, &rows, searching);
         }
         let current = selected_index(h.list)
             .and_then(|i| row_at(h.list, i))
             .map(|r| r.pos);
         if (rebuild || current != Some(selected)) && selected < rows.len() {
+            // A script picked in a folded category (Left or Right jumps
+            // there) opens it.
+            let id = with(|s| {
+                let key = rows.get(selected)?.category.to_ascii_lowercase();
+                s.group_keys
+                    .iter()
+                    .position(|k| *k == key)
+                    .filter(|_| s.collapsed.contains(&key))
+            })
+            .flatten();
+            if let Some(id) = id
+                && !rebuild
+                && !searching
+            {
+                set_folded(&h, id, false);
+            }
             set_state(h.list, selected as i32, true);
         }
         let _ = InvalidateRect(Some(h.panel), None, false);
@@ -437,7 +470,7 @@ pub fn set_view(rows: Vec<NativeScript>, selected: usize, filter: &str, total: u
 
 /// Fills the list with `rows`, under a heading per category when any
 /// has one.
-fn fill_list(h: &Handles, rows: &[NativeScript]) {
+fn fill_list(h: &Handles, rows: &[NativeScript], searching: bool) {
     let grouped = rows.iter().any(|r| !r.category.is_empty());
     // The groups, in the rows' order: those without a category first.
     let mut groups: Vec<&str> = Vec::new();
@@ -457,7 +490,15 @@ fn fill_list(h: &Handles, rows: &[NativeScript]) {
             (name.to_owned(), n)
         })
         .collect();
-    with(|s| s.groups = headings);
+    let keys: Vec<String> = groups.iter().map(|g| g.to_ascii_lowercase()).collect();
+    let folded: Vec<bool> = with(|s| {
+        s.groups = headings;
+        s.group_keys = keys.clone();
+        keys.iter()
+            .map(|k| !searching && s.collapsed.contains(k))
+            .collect()
+    })
+    .unwrap_or_default();
     // SAFETY: our own control; each struct and its text live through the
     // call, which copies them.
     unsafe {
@@ -474,9 +515,18 @@ fn fill_list(h: &Handles, rows: &[NativeScript]) {
                 let mut header = wide(if g.is_empty() { "No category" } else { g });
                 let group = LVGROUP {
                     cbSize: size_of::<LVGROUP>() as u32,
-                    mask: LVGF_HEADER | LVGF_GROUPID,
+                    mask: LVGF_HEADER | LVGF_GROUPID | LVGF_STATE,
                     pszHeader: PWSTR(header.as_mut_ptr()),
                     iGroupId: id as i32,
+                    stateMask: LVGS_COLLAPSIBLE | LVGS_COLLAPSED,
+                    // A search shows every match: nothing folds then.
+                    state: if searching {
+                        Default::default()
+                    } else if folded.get(id).copied().unwrap_or(false) {
+                        LVGS_COLLAPSIBLE | LVGS_COLLAPSED
+                    } else {
+                        LVGS_COLLAPSIBLE
+                    },
                     ..Default::default()
                 };
                 SendMessageW(
@@ -766,7 +816,21 @@ fn notify(h: Handles, lparam: LPARAM) -> LRESULT {
                 }
                 return LRESULT(CDRF_DODEFAULT as isize);
             }
-            NM_DBLCLK => run(false),
+            NM_DBLCLK => {
+                // A double click on a heading folds it, nothing more.
+                let a = &*(lparam.0 as *const NMITEMACTIVATE);
+                if heading_at(h.list, a.ptAction).is_none() {
+                    run(false);
+                }
+            }
+            NM_CLICK => {
+                let a = &*(lparam.0 as *const NMITEMACTIVATE);
+                if !with(|s| s.searching).unwrap_or(false)
+                    && let Some(id) = heading_at(h.list, a.ptAction)
+                {
+                    toggle(&h, id);
+                }
+            }
             LVN_ITEMCHANGED => {
                 if !filling()
                     && let Some(r) = selected_row()
@@ -799,7 +863,105 @@ fn draw_heading(list: HWND, cd: &NMLVCUSTOMDRAW) {
     let Some((name, count)) = with(|s| s.groups.get(id).cloned()).flatten() else {
         return;
     };
+    // SAFETY: a plain query of our own control.
+    let folded = unsafe {
+        SendMessageW(
+            list,
+            LVM_GETGROUPSTATE,
+            Some(WPARAM(id)),
+            Some(LPARAM(LVGS_COLLAPSED.0 as isize)),
+        )
+        .0 != 0
+    };
+    // No chevron while searching: nothing folds then.
+    let name = if with(|s| s.searching).unwrap_or(false) {
+        name
+    } else {
+        format!("{} {name}", if folded { '\u{25B8}' } else { '\u{25BE}' })
+    };
     draw_group_heading(list, cd, &name, &count.to_string());
+}
+
+/// The group whose heading is at `pt`, in the list's client coordinates.
+fn heading_at(list: HWND, pt: windows::Win32::Foundation::POINT) -> Option<usize> {
+    let n = with(|s| s.groups.len()).unwrap_or(0);
+    (0..n).find(|&id| {
+        let mut rc = RECT {
+            top: LVGGR_HEADER as i32,
+            ..Default::default()
+        };
+        // SAFETY: our own control; it fills `rc`.
+        unsafe {
+            SendMessageW(
+                list,
+                LVM_GETGROUPRECT,
+                Some(WPARAM(id)),
+                Some(LPARAM(&raw mut rc as isize)),
+            )
+            .0 != 0
+                && pt.x >= rc.left
+                && pt.x < rc.right
+                && pt.y >= rc.top
+                && pt.y < rc.bottom
+        }
+    })
+}
+
+/// Folds category `id` away, or opens it, and remembers which.
+fn toggle(h: &Handles, id: usize) {
+    // SAFETY: a plain query of our own control.
+    let now = unsafe {
+        SendMessageW(
+            h.list,
+            LVM_GETGROUPSTATE,
+            Some(WPARAM(id)),
+            Some(LPARAM(LVGS_COLLAPSED.0 as isize)),
+        )
+        .0 != 0
+    };
+    let mine = with(|s| {
+        s.group_keys
+            .get(id)
+            .is_some_and(|k| s.collapsed.contains(k))
+    })
+    .unwrap_or(false);
+    // The list folds a heading itself when its own button is clicked:
+    // then what it shows already is the new state.
+    set_folded(h, id, if now == mine { !now } else { now });
+}
+
+/// Folds category `id` away (`true`) or opens it.
+fn set_folded(h: &Handles, id: usize, fold: bool) {
+    with(|s| {
+        if let Some(k) = s.group_keys.get(id) {
+            if fold {
+                s.collapsed.insert(k.clone());
+            } else {
+                s.collapsed.remove(k);
+            }
+        }
+    });
+    let group = LVGROUP {
+        cbSize: size_of::<LVGROUP>() as u32,
+        mask: LVGF_STATE,
+        stateMask: LVGS_COLLAPSED,
+        state: if fold {
+            LVGS_COLLAPSED
+        } else {
+            Default::default()
+        },
+        ..Default::default()
+    };
+    // SAFETY: our own control; the struct lives through the call.
+    unsafe {
+        SendMessageW(
+            h.list,
+            LVM_SETGROUPINFO,
+            Some(WPARAM(id)),
+            Some(LPARAM(&raw const group as isize)),
+        );
+        let _ = InvalidateRect(Some(h.list), None, true);
+    }
 }
 
 /// Draws group heading `cd` of `list` in the window's colours: `name`,

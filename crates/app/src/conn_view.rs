@@ -27,10 +27,12 @@ use windows::Win32::Graphics::Gdi::{
     SelectObject, SetBkMode, SetTextColor, TRANSPARENT,
 };
 use windows::Win32::UI::Controls::{
-    EM_SETCUEBANNER, EM_SETSEL, HTREEITEM, NM_DBLCLK, NM_RCLICK, NM_SETFOCUS, NMHDR, NMTREEVIEWW,
-    NMTVGETINFOTIPW, NMTVKEYDOWN, SetWindowTheme, TVE_TOGGLE, TVGN_CARET, TVGN_ROOT, TVHITTESTINFO,
-    TVI_LAST, TVI_ROOT, TVIF_PARAM, TVIF_STATE, TVIF_TEXT, TVINSERTSTRUCTW, TVIS_EXPANDED, TVITEMW,
-    TVM_DELETEITEM, TVM_ENSUREVISIBLE, TVM_EXPAND, TVM_GETITEMW, TVM_GETNEXTITEM, TVM_HITTEST,
+    CDDS_ITEMPOSTPAINT, CDDS_ITEMPREPAINT, CDDS_PREPAINT, CDRF_DODEFAULT, CDRF_NOTIFYITEMDRAW,
+    CDRF_NOTIFYPOSTPAINT, EM_SETCUEBANNER, EM_SETSEL, HTREEITEM, NM_CUSTOMDRAW, NM_DBLCLK,
+    NM_RCLICK, NM_SETFOCUS, NMHDR, NMTREEVIEWW, NMTVCUSTOMDRAW, NMTVGETINFOTIPW, NMTVKEYDOWN,
+    SetWindowTheme, TVE_TOGGLE, TVGN_CARET, TVGN_ROOT, TVHITTESTINFO, TVI_LAST, TVI_ROOT,
+    TVIF_PARAM, TVIF_STATE, TVIF_TEXT, TVINSERTSTRUCTW, TVIS_EXPANDED, TVITEMW, TVM_DELETEITEM,
+    TVM_ENSUREVISIBLE, TVM_EXPAND, TVM_GETITEMRECT, TVM_GETITEMW, TVM_GETNEXTITEM, TVM_HITTEST,
     TVM_INSERTITEMW, TVM_SELECTITEM, TVM_SETEXTENDEDSTYLE, TVN_GETINFOTIPW, TVN_ITEMEXPANDEDW,
     TVN_KEYDOWN, TVS_EX_DOUBLEBUFFER, TVS_EX_FADEINOUTEXPANDOS, TVS_FULLROWSELECT, TVS_HASBUTTONS,
     TVS_INFOTIP, TVS_LINESATROOT, TVS_SHOWSELALWAYS, WC_BUTTONW, WC_EDITW, WC_TREEVIEWW,
@@ -645,6 +647,68 @@ fn command(h: Handles, id: usize, code: u32) {
     }
 }
 
+/// Draws a host's `user@hostname:port` dimmed after its name, cut short
+/// with "..." at the tree's right edge.
+fn draw_detail(tree: HWND, cd: &NMTVCUSTOMDRAW) {
+    use windows::Win32::Graphics::Gdi::{COLOR_GRAYTEXT, DT_END_ELLIPSIS};
+    use windows::Win32::UI::WindowsAndMessaging::WM_GETFONT;
+    let Some(Item::Host(host)) = item(cd.nmcd.lItemlParam.0 as usize) else {
+        return;
+    };
+    if host.detail.is_empty() {
+        return;
+    }
+    // TVM_GETITEMRECT takes the item in the rectangle's first field.
+    let mut rc = RECT::default();
+    // SAFETY: RECT (16 bytes) has room for the handle written into its
+    // start; RECT is only 4-aligned, so the write is unaligned. The tree
+    // overwrites it.
+    unsafe {
+        (&raw mut rc)
+            .cast::<isize>()
+            .write_unaligned(cd.nmcd.dwItemSpec as isize);
+    }
+    // SAFETY: our own control and the DC it lent for this paint; the font
+    // is selected back out.
+    unsafe {
+        if SendMessageW(
+            tree,
+            TVM_GETITEMRECT,
+            Some(WPARAM(1)),
+            Some(LPARAM(&raw mut rc as isize)),
+        )
+        .0 == 0
+        {
+            return;
+        }
+        let mut client = RECT::default();
+        let _ = GetClientRect(tree, &mut client);
+        let dc = cd.nmcd.hdc;
+        let font = SendMessageW(tree, WM_GETFONT, None, None).0;
+        let old = SelectObject(dc, HGDIOBJ(font as *mut _));
+        SetBkMode(dc, TRANSPARENT);
+        SetTextColor(
+            dc,
+            windows::Win32::Foundation::COLORREF(crate::ui_theme::sys_color(COLOR_GRAYTEXT)),
+        );
+        let mut at = RECT {
+            left: rc.right + 8,
+            right: client.right - 4,
+            ..rc
+        };
+        if at.left < at.right {
+            let mut text: Vec<u16> = host.detail.encode_utf16().collect();
+            DrawTextW(
+                dc,
+                &mut text,
+                &mut at,
+                DT_LEFT | DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX | DT_END_ELLIPSIS,
+            );
+        }
+        SelectObject(dc, old);
+    }
+}
+
 /// The tree's notifications; the result for `WM_NOTIFY`.
 fn notify(h: Handles, lparam: LPARAM) -> LRESULT {
     // SAFETY: Windows passes a valid NMHDR (and the larger struct its code
@@ -656,6 +720,18 @@ fn notify(h: Handles, lparam: LPARAM) -> LRESULT {
         }
         match hdr.code {
             NM_SETFOCUS => emit(Event::Focused),
+            NM_CUSTOMDRAW => {
+                let cd = &*(lparam.0 as *const NMTVCUSTOMDRAW);
+                return match cd.nmcd.dwDrawStage {
+                    CDDS_PREPAINT => LRESULT(CDRF_NOTIFYITEMDRAW as isize),
+                    CDDS_ITEMPREPAINT => LRESULT(CDRF_NOTIFYPOSTPAINT as isize),
+                    CDDS_ITEMPOSTPAINT => {
+                        draw_detail(h.tree, cd);
+                        LRESULT(CDRF_DODEFAULT as isize)
+                    }
+                    _ => LRESULT(CDRF_DODEFAULT as isize),
+                };
+            }
             NM_DBLCLK => {
                 if selected_host().is_some() {
                     open_selected(h, false);

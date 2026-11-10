@@ -279,19 +279,22 @@ pub fn place(at: Option<Rect>, width: i32, dpi: u32) {
     let inner = (width - 2 * pad).max(0);
     let help_h = 2 * line;
     let list_y = title + help_h;
-    // The buttons wrap onto as many rows as the width needs.
+    // The buttons wrap onto as many rows as the part the terminal leaves
+    // uncovered needs, so none of them hides under it.
+    let wrap = (at.w - 2 * pad).clamp(scale(104, dpi).min(inner), inner);
     let widths = [104, 64, 80, 96, 80].map(|w| scale(w, dpi));
     let mut rows = 1;
     let mut x = 0;
     for w in widths {
-        if x > 0 && x + w > inner {
+        if x > 0 && x + w > wrap {
             rows += 1;
             x = 0;
         }
         x += w + gap;
     }
     let buttons_h = rows * button + (rows - 1) * gap;
-    let buttons_y = (at.h - pad - buttons_h).max(list_y + 4 * button);
+    // The list gives up room before the buttons leave the panel.
+    let buttons_y = (at.h - pad - buttons_h).max(list_y + button);
     let list_h = (buttons_y - gap - list_y).max(button);
     with(|s| {
         s.help_at = RECT {
@@ -307,7 +310,7 @@ pub fn place(at: Option<Rect>, width: i32, dpi: u32) {
         let _ = MoveWindow(h.list, pad, list_y, inner, list_h, true);
         let (mut x, mut y) = (pad, buttons_y);
         for (b, w) in h.buttons.iter().zip(widths) {
-            if x > pad && x + w > pad + inner {
+            if x > pad && x + w > pad + wrap {
                 x = pad;
                 y += button + gap;
             }
