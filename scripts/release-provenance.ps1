@@ -21,7 +21,8 @@
 # PE checksum, the certificate table's directory entry and the certificate
 # table itself, which signing changes.
 #
-# Needs the GitHub CLI 2.68 or later (for --source-ref and --source-digest),
+# Needs the GitHub CLI 2.93 or later (--source-ref and --source-digest, and
+# the fix for GHSA-8xvp-7hj6-mcj9),
 # logged in with access to the repository.
 
 $ReleaseWorkflowPath = ".github/workflows/release.yml"
@@ -41,10 +42,23 @@ function Invoke-Gh {
 
 function Assert-GhAttestationSupport {
     if (-not (Get-Command gh -ErrorAction SilentlyContinue)) { throw "the GitHub CLI (gh) is not installed" }
+    # 2.68 to 2.92 can send the gh credential to TUF mirrors during
+    # `gh attestation verify` (GHSA-8xvp-7hj6-mcj9). On the maintainer's PC
+    # that credential can write to the repository, so an affected gh is
+    # refused there. In the attest workflow the token is the job's own,
+    # expires with the job, and the runner image's gh is not ours to pick:
+    # an affected gh only gets a warning there.
+    $line = (& gh --version 2>&1 | Select-Object -First 1) -as [string]
+    if ($line -notmatch 'gh version (\d+)\.(\d+)\.(\d+)') { throw "cannot read the GitHub CLI version from '$line'" }
+    $ghVersion = [version]"$($Matches[1]).$($Matches[2]).$($Matches[3])"
+    if ($ghVersion -lt [version]"2.93.0") {
+        $why = "the GitHub CLI is $ghVersion; 2.93 or later is needed (GHSA-8xvp-7hj6-mcj9; winget upgrade GitHub.cli)"
+        if ($env:GITHUB_ACTIONS -eq "true") { Write-Host "::warning::$why" } else { throw $why }
+    }
     $help = (& gh attestation verify --help 2>&1) -join "`n"
     foreach ($flag in "--cert-identity", "--source-ref", "--source-digest", "--deny-self-hosted-runners") {
         if ($help -notmatch [regex]::Escape($flag)) {
-            throw "gh attestation verify has no $flag option: update the GitHub CLI to 2.68 or later (winget upgrade GitHub.cli)"
+            throw "gh attestation verify has no $flag option: update the GitHub CLI to 2.93 or later (winget upgrade GitHub.cli)"
         }
     }
 }
