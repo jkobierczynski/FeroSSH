@@ -69,6 +69,6 @@ Coming from PuTTY, KiTTY, WinSCP or another client? File > Import connections br
 | Ctrl+Shift+E | File transfer for this pane's host |
 | Ctrl+Shift+C / Ctrl+Shift+V | Copy and paste |
 | Ctrl+Shift+F | Find in scrollback |
-| Ctrl+Shift+A | Command palette: every menu item, connection and snippet |
+| Ctrl+Shift+A | Command palette: every menu item, connection and script |
 
 Every other menu item and key is in the [Menu reference](menus.md).

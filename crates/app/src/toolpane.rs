@@ -50,7 +50,7 @@ impl RailItem {
             RailItem::Sessions => "Session manager (Ctrl+Shift+L)",
             RailItem::Files => "File transfer (Ctrl+Shift+E)",
             RailItem::Forwards => "Port forwards (Ctrl+Shift+P)",
-            RailItem::Snippets => "Command snippets (Ctrl+Shift+Space)",
+            RailItem::Snippets => "Scripts (Ctrl+Shift+Space)",
             RailItem::Palette => "Command palette (Ctrl+Shift+A)",
             RailItem::Pin if pinned => "Tools stay open (click: the terminal covers them again)",
             RailItem::Pin => "Tools cover again after use (click: keep them open)",

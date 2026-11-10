@@ -31,7 +31,8 @@ use ferossh_config::snippet_import::{self, SnippetClient};
 use ferossh_config::snippet_store;
 use ferossh_config::trigger::{Fire, Watch};
 use ferossh_config::{
-    ForwardSpec, SessionKind, Settings, mobaxterm, mremoteng, putty, securecrt, ssh_config, winscp,
+    ForwardSpec, SessionKind, Settings, WindowColours, mobaxterm, mremoteng, putty, securecrt,
+    ssh_config, winscp,
 };
 use ferossh_forward::x11::{Display, find_cookie, xauth_entries};
 use ferossh_ipc::{ChannelId, DirEntry, FORWARD_IDS, Message, SftpReply, X11Auth};
@@ -48,8 +49,7 @@ use ferossh_term::{
 use windows::Win32::Foundation::E_FAIL;
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, SIZE, WPARAM};
 use windows::Win32::Graphics::Gdi::{
-    BeginPaint, COLOR_GRAYTEXT, COLOR_HIGHLIGHT, COLOR_MENUBAR, COLOR_MENUTEXT, COLOR_WINDOW,
-    EndPaint, GetSysColor, InvalidateRect, LOGFONTW, PAINTSTRUCT, SYS_COLOR_INDEX, ScreenToClient,
+    BeginPaint, EndPaint, InvalidateRect, LOGFONTW, PAINTSTRUCT, ScreenToClient,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::SystemInformation::GetLocalTime;
@@ -95,9 +95,9 @@ use windows::Win32::UI::WindowsAndMessaging::{
     WM_DESTROY, WM_DPICHANGED, WM_DROPFILES, WM_ERASEBKGND, WM_GETDPISCALEDSIZE, WM_HOTKEY,
     WM_IME_COMPOSITION, WM_IME_STARTCOMPOSITION, WM_KEYDOWN, WM_KEYUP, WM_KILLFOCUS,
     WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL,
-    WM_PAINT, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SETCURSOR, WM_SETFOCUS, WM_SIZE, WM_SYSCHAR,
-    WM_SYSDEADCHAR, WM_SYSKEYDOWN, WM_SYSKEYUP, WM_TIMER, WNDCLASSW, WS_CLIPCHILDREN,
-    WS_EX_APPWINDOW, WS_OVERLAPPEDWINDOW,
+    WM_PAINT, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SETCURSOR, WM_SETFOCUS, WM_SETTINGCHANGE, WM_SIZE,
+    WM_SYSCHAR, WM_SYSCOLORCHANGE, WM_SYSDEADCHAR, WM_SYSKEYDOWN, WM_SYSKEYUP, WM_TIMER, WNDCLASSW,
+    WS_CLIPCHILDREN, WS_EX_APPWINDOW, WS_OVERLAPPEDWINDOW,
 };
 use windows::Win32::UI::WindowsAndMessaging::{DeleteMenu, ShowWindowAsync, WM_INITMENUPOPUP};
 use windows::core::{HSTRING, PCWSTR, PWSTR, Result, w};
@@ -110,7 +110,9 @@ use crate::conn_view;
 use crate::conpty::{self, Output, Shell};
 use crate::credman;
 use crate::desktop::{Desktop, Protocol, Update as DesktopUpdate};
-use crate::files::{Divider, FilesAction, FilesView, Follow};
+use crate::files::{self, Arrange, Follow};
+use crate::files_panel;
+use crate::form_view;
 use crate::forwards::{
     ConnView, DesktopEvent, Forwarder, FwdView, Setup as ForwardSetup, desktop_port_for,
 };
@@ -143,6 +145,8 @@ use crate::telnet::{TelnetSession, TelnetTarget};
 use crate::tmux::{self, Mode as TmuxMode, Tmux};
 use crate::tmux_keys::{self, Action as TmuxKey};
 use crate::toolpane::{self, RailItem};
+use crate::ui_colours::{self, UiColours};
+use crate::ui_theme;
 use crate::vdesk;
 use crate::zmodem;
 use ferossh_tmuxcc::saved as tmux_saved;
@@ -161,6 +165,9 @@ const MARK_MIN_DIP: i32 = 12;
 const CHROME_PADDING_DIP: i32 = 3;
 /// Extra pixels either side of a divider that still grab it, in DIPs.
 const GRAB_DIP: i32 = 3;
+/// How far either side of the tools pane's edge a drag can start; wider
+/// than a divider's, as the edge is a long target used often.
+const EDGE_GRAB_DIP: i32 = 8;
 /// The side pane's width when first shown, in chrome cells.
 const SIDE_COLS: i32 = 34;
 /// The side pane font size.
@@ -343,6 +350,8 @@ mod cmd {
     pub const SNIPPET_FOLDER: u32 = 215;
     pub const TOOLS_PIN: u32 = 216;
     pub const TOOLS_RAIL: u32 = 217;
+    /// Plus the index into `WindowColours::ALL`.
+    pub const WINDOW_COLOURS: u32 = 220;
     /// Plus the index into `FONT_CHOICES`.
     pub const FONT: u32 = 300;
     /// Plus the index into `Theme::builtin()`.
@@ -684,14 +693,6 @@ enum Drag {
     },
     /// The side pane's edge.
     SideEdge,
-    /// A section's title bar in the file transfer view, pressed at grid
-    /// cell `at`. Released where it was pressed, it is a click.
-    FilesBar {
-        which: Divider,
-        at: (usize, usize),
-        double: bool,
-        moved: bool,
-    },
     /// A tab in the strip. Dragged below the strip (`out`), the window
     /// shows the tab with pane `home` instead, and dropping on one of its
     /// panes merges the dragged tab in there.
@@ -830,7 +831,6 @@ struct Window {
     /// queues send goes to that connection's worker (a closing channel's
     /// queue has already let go of it).
     sftp_routes: HashMap<ChannelId, ChannelId>,
-    files: FilesView,
     /// The host the file view shows: the focused pane's.
     files_key: Option<String>,
     /// The pane whose directory the file view last followed, so that
@@ -1170,10 +1170,11 @@ fn load_settings() -> Settings {
         .unwrap_or_default()
 }
 
-/// The snippets folder: a file per command snippet, a folder per
-/// category (see [`snippet_store`]).
+/// The scripts folder: a file per script, a folder per category (see
+/// [`snippet_store`]). The `snippets` folder of an older FeroSSH is
+/// renamed to it the first time.
 fn snippets_dir() -> PathBuf {
-    app_dir().join("snippets")
+    snippet_store::move_old_folder(&app_dir().join("scripts"), &app_dir().join("snippets"))
 }
 
 /// Reads the snippets folder into `settings`. Snippets an older FeroSSH
@@ -1583,7 +1584,6 @@ fn create_and_run(launch: Launch, theme: Option<String>) -> Result<()> {
                 output_pending: Arc::new(AtomicBool::new(false)),
                 sftp: HashMap::new(),
                 sftp_routes: HashMap::new(),
-                files: FilesView::default(),
                 files_key: None,
                 files_pane: None,
                 transfer_timer: false,
@@ -1643,6 +1643,10 @@ fn create_and_run(launch: Launch, theme: Option<String>) -> Result<()> {
         let _ = conn_view::create(hwnd, conn_event, cmd::IMPORT, dpi);
         // The session manager's, likewise.
         let _ = live_panel::create(hwnd, live_event, dpi);
+        // The connection form's, likewise.
+        let _ = form_view::create(hwnd, form_event, dpi);
+        // The file transfer pane's, likewise.
+        let _ = files_panel::create(hwnd, files_event, dpi);
         // Files dropped from Explorer are uploaded, after a confirmation.
         DragAcceptFiles(hwnd, true);
         // Clipboard changes reach a remote desktop being worked in.
@@ -1689,7 +1693,11 @@ fn create_and_run(launch: Launch, theme: Option<String>) -> Result<()> {
         while GetMessageW(&mut msg, None, 0, 0).as_bool() {
             // Tab, Enter, Escape and the shortcuts in the connection
             // and session managers' controls.
-            if conn_view::pre_translate(&msg) || live_panel::pre_translate(&msg) {
+            if conn_view::pre_translate(&msg)
+                || live_panel::pre_translate(&msg)
+                || form_view::pre_translate(&msg)
+                || files_panel::pre_translate(&msg)
+            {
                 continue;
             }
             let _ = TranslateMessage(&msg);
@@ -1758,7 +1766,7 @@ fn build_menu() -> Result<HMENU> {
         separator(file)?;
         item(file, cmd::LOCAL_SHELL, "Open &local shell")?;
         item(file, cmd::IMPORT, "&Import connections...")?;
-        item(file, cmd::IMPORT_SNIPPETS, "Import s&nippets...")?;
+        item(file, cmd::IMPORT_SNIPPETS, "Import sc&ripts...")?;
         separator(file)?;
         item(file, cmd::EXIT, "E&xit\tAlt+F4")?;
 
@@ -1803,15 +1811,11 @@ fn build_menu() -> Result<HMENU> {
         separator(session)?;
         item(session, cmd::SERIAL_BREAK, "Send &break (serial)")?;
         item(session, cmd::RUN_SCRIPT, "Run &login script again")?;
-        item(
-            session,
-            cmd::AUTO_RESPONSES,
-            "A&uto-responses from snippets",
-        )?;
+        item(session, cmd::AUTO_RESPONSES, "A&uto-responses from scripts")?;
         item(
             session,
             cmd::CONFIRM_PRODUCTION,
-            "Confirm snippets on &Production hosts",
+            "Confirm scripts on &Production hosts",
         )?;
         separator(session)?;
         item(session, cmd::DESKTOP, "Open remote &desktop\tCtrl+Shift+D")?;
@@ -1879,8 +1883,8 @@ fn build_menu() -> Result<HMENU> {
         separator(edit)?;
         item(edit, cmd::FIND, "&Find in scrollback\tCtrl+Shift+F")?;
         item(edit, cmd::CLEAR_SCROLLBACK, "C&lear scrollback")?;
-        item(edit, cmd::SAVE_SNIPPET, "Sa&ve selection as snippet...")?;
-        item(edit, cmd::RECORD_SNIPPET, "Rec&ord keystrokes as snippet")?;
+        item(edit, cmd::SAVE_SNIPPET, "Sa&ve selection as script...")?;
+        item(edit, cmd::RECORD_SNIPPET, "Rec&ord keystrokes as script")?;
         separator(edit)?;
         item(edit, cmd::COPY_ON_SELECT, "Copy on &select")?;
         item(edit, cmd::RIGHT_CLICK_PASTE, "&Right-click pastes")?;
@@ -1921,8 +1925,8 @@ fn build_menu() -> Result<HMENU> {
         item(tools, cmd::LIVE, "&Session manager\tCtrl+Shift+L")?;
         item(tools, cmd::FILES, "&File transfer\tCtrl+Shift+E")?;
         item(tools, cmd::FORWARDS, "&Port forwards\tCtrl+Shift+P")?;
-        item(tools, cmd::SNIPPETS, "Command s&nippets\tCtrl+Shift+Space")?;
-        item(tools, cmd::SNIPPET_FOLDER, "Open snippets f&older")?;
+        item(tools, cmd::SNIPPETS, "Sc&ripts\tCtrl+Shift+Space")?;
+        item(tools, cmd::SNIPPET_FOLDER, "Open scripts f&older")?;
         item(tools, cmd::PALETTE, "Command p&alette\tCtrl+Shift+A")?;
 
         let view = CreatePopupMenu()?;
@@ -1938,6 +1942,25 @@ fn build_menu() -> Result<HMENU> {
         separator(view)?;
         AppendMenuW(view, MF_POPUP, fonts.0 as usize, w!("&Font (this pane)"))?;
         AppendMenuW(view, MF_POPUP, themes.0 as usize, w!("&Theme (this pane)"))?;
+        let colours = CreatePopupMenu()?;
+        for (id, c) in (cmd::WINDOW_COLOURS..).zip(WindowColours::ALL) {
+            item(
+                colours,
+                id,
+                match c {
+                    WindowColours::Theme => "Follow the &terminal theme",
+                    WindowColours::System => "Follow &Windows (light or dark)",
+                    WindowColours::Light => "&Light",
+                    WindowColours::Dark => "&Dark",
+                },
+            )?;
+        }
+        AppendMenuW(
+            view,
+            MF_POPUP,
+            colours.0 as usize,
+            w!("&Window colours (menus, tools)"),
+        )?;
         separator(view)?;
         item(view, cmd::TEST_PATTERN, "Show test &pattern")?;
         separator(view)?;
@@ -2094,13 +2117,6 @@ fn win_rect(r: Rect) -> RECT {
     }
 }
 
-/// A system colour (`GetSysColor` is 0x00BBGGRR).
-fn sys_color(index: SYS_COLOR_INDEX) -> Rgb {
-    // SAFETY: plain query.
-    let c = unsafe { GetSysColor(index) };
-    Rgb::new(c as u8, (c >> 8) as u8, (c >> 16) as u8)
-}
-
 fn pixel(r: Rect) -> PixelRect {
     PixelRect {
         left: r.x,
@@ -2111,10 +2127,6 @@ fn pixel(r: Rect) -> PixelRect {
 }
 
 /// `r` grown by `by` pixels on every side.
-fn inflate(r: Rect, by: i32) -> Rect {
-    Rect::new(r.x - by, r.y - by, r.w + 2 * by, r.h + 2 * by)
-}
-
 fn mix(a: Rgb, b: Rgb, amount: f32) -> Rgb {
     let m = |x: u8, y: u8| (f32::from(x) * (1.0 - amount) + f32::from(y) * amount).round() as u8;
     Rgb::new(m(a.r, b.r), m(a.g, b.g), m(a.b, b.b))
@@ -2901,7 +2913,7 @@ impl Window {
                 notes.push("logging");
             }
             if tab.is_none() {
-                notes.push("snippet run");
+                notes.push("script run");
             }
             out.push(LiveSession {
                 pane: id,
@@ -5428,6 +5440,20 @@ impl Window {
                         {
                             next = None;
                         }
+                        // The part after a move types what was captured
+                        // before it, up to its own next capture, whose
+                        // value its own runner fills in.
+                        next = next.map(|(r, name, rest)| {
+                            let mut captured = false;
+                            let rest = rest
+                                .into_iter()
+                                .map(|s| {
+                                    captured |= matches!(s, Step::Capture(_));
+                                    if captured { s } else { run.runner.fill(s) }
+                                })
+                                .collect();
+                            (r, name, rest)
+                        });
                         if run.report
                             && let Some(row) =
                                 self.snippets_view.report_mut().and_then(|r| r.row_mut(id))
@@ -6504,8 +6530,14 @@ impl Window {
         }
     }
 
-    /// The colours of the tab strip and side pane: the focused pane's.
+    /// The colours of the drawn side pane tools: the window's own (the
+    /// focused pane's theme by default), or with Windows' light look the
+    /// focused pane's theme, as before window colours existed.
     fn chrome_palette(&self) -> Palette {
+        let c = self.ui_colours();
+        if c.custom {
+            return c.strip;
+        }
         let theme = self
             .panes
             .get(&self.focused_id())
@@ -6513,16 +6545,25 @@ impl Window {
         Palette::of(&theme)
     }
 
-    /// The tab strip's colours: the system menu bar's, so the strip reads
-    /// as part of the window frame rather than of a terminal.
-    fn strip_palette(&self) -> Palette {
-        Palette::menu_bar(
-            sys_color(COLOR_MENUBAR),
-            sys_color(COLOR_WINDOW),
-            sys_color(COLOR_MENUTEXT),
-            sys_color(COLOR_GRAYTEXT),
-            sys_color(COLOR_HIGHLIGHT),
+    /// The window's own colours (Settings > Window colours): by default
+    /// from the focused pane's theme.
+    fn ui_colours(&self) -> UiColours {
+        let theme = self
+            .panes
+            .get(&self.focused_id())
+            .map_or(&self.default_theme, |p| &p.theme);
+        let mode = self.settings.window_colours;
+        ui_colours::resolve(
+            mode,
+            theme,
+            &ui_theme::system(mode == WindowColours::System),
         )
+    }
+
+    /// The tab strip's colours: the menu bar's, so the strip reads as part
+    /// of the window frame rather than of a terminal.
+    fn strip_palette(&self) -> Palette {
+        self.ui_colours().strip
     }
 
     /// What the tools rail shows: the open tool, the pin, and the tab
@@ -6562,6 +6603,45 @@ impl Window {
         self.side.visible && self.side.view == SideView::Live
     }
 
+    /// Whether the connection form shows as native controls (the import
+    /// page is still drawn).
+    fn form_native(&self) -> bool {
+        self.side.visible
+            && self.side.view == SideView::Sessions
+            && self.side.form.is_some()
+            && self.side.import.is_none()
+    }
+
+    /// The connection form as the native controls show it.
+    fn native_form(&self) -> Option<form_view::Form> {
+        let f = self.side.form.as_ref()?;
+        Some(form_view::Form {
+            title: match &f.original {
+                Some(name) => format!("Edit {name}"),
+                None => "New connection".to_owned(),
+            },
+            sections: f.sections(),
+            rows: f.native_rows(),
+            error: f.error().map(str::to_owned),
+            delete: f.button_names().contains(&"Delete"),
+        })
+    }
+
+    /// The open native tool's controls have the keyboard.
+    fn active_tool_has_focus(&self) -> bool {
+        if self.form_native() {
+            form_view::has_focus()
+        } else if self.conn_native() {
+            conn_view::has_focus()
+        } else if self.live_native() {
+            live_panel::has_focus()
+        } else if self.files_visible() {
+            files_panel::has_focus()
+        } else {
+            false
+        }
+    }
+
     /// Shows, fills and places the native tools' controls, and moves the
     /// keyboard to them or back as the side pane's focus says. Focus
     /// changes are posted: they send messages that need this window's
@@ -6581,13 +6661,27 @@ impl Window {
         } else {
             live_panel::place(None, 0, self.dpi);
         }
+        // The focused pane's host first, so the view never shows the
+        // host the pane had before.
+        self.sync_files();
+        if self.files_visible() {
+            files_panel::set_view(self.files_view());
+            files_panel::place(self.areas.side, self.areas.side_width, self.dpi);
+        } else {
+            files_panel::place(None, 0, self.dpi);
+        }
+        if let Some(form) = self.native_form().filter(|_| self.form_native()) {
+            form_view::set_form(form);
+            form_view::place(self.areas.side, self.areas.side_width, self.dpi);
+        } else {
+            form_view::place(None, 0, self.dpi);
+        }
         let want = self.wants_tools_focus();
-        let has = tools_have_focus();
         let to = if want && self.focused && self.live_native() && self.wants_name_edit() {
             Some(2)
-        } else if want && self.focused && !has {
+        } else if want && self.focused && !self.active_tool_has_focus() {
             Some(1)
-        } else if !want && has {
+        } else if !want && tools_have_focus() {
             Some(0)
         } else {
             None
@@ -6607,7 +6701,8 @@ impl Window {
 
     /// A native tool's controls should have the keyboard.
     fn wants_tools_focus(&self) -> bool {
-        (self.conn_native() || self.live_native()) && self.side.focused
+        (self.conn_native() || self.live_native() || self.form_native() || self.files_visible())
+            && self.side.focused
     }
 
     /// A theme whose background is the chrome's, for drawing its padding.
@@ -6616,12 +6711,14 @@ impl Window {
             .panes
             .get(&self.focused_id())
             .map_or_else(|| self.default_theme.clone(), |p| p.theme.clone());
-        t.background = Palette::of(&t).strip;
+        t.background = self.chrome_palette().strip;
         t
     }
 
-    /// Redraws the tab strip and side pane grids.
+    /// Redraws the tab strip and side pane grids, and repaints the menu
+    /// bar and tools pane when the window's colours change.
     fn refresh_chrome(&mut self) {
+        ui_theme::apply(self.hwnd, self.ui_colours());
         rail::set_look(self.rail_look());
         self.sync_conn_view();
         let palette = self.chrome_palette();
@@ -6664,7 +6761,6 @@ impl Window {
                 let _ = InvalidateRect(Some(self.hwnd), Some(&win_rect(strip)), false);
             }
         }
-        self.sync_files();
         if let Some(side) = self.areas.side {
             let focused = self.side.focused && self.focused;
             match self.side.view {
@@ -6694,29 +6790,8 @@ impl Window {
                         &self.settings.snippets,
                     );
                 }
-                SideView::Files => {
-                    let remote = self.files_key.as_ref().and_then(|k| self.sftp.get(k));
-                    let follow = if !self.settings.follow_directory {
-                        Follow::Off
-                    } else if self
-                        .panes
-                        .get(&self.focused_id())
-                        .is_some_and(|p| p.cwd.is_some())
-                    {
-                        Follow::On
-                    } else {
-                        Follow::Unreported
-                    };
-                    let downloads = self.download_dir();
-                    self.files.draw(
-                        &mut self.side.grid,
-                        &palette,
-                        focused,
-                        remote,
-                        follow,
-                        &downloads,
-                    );
-                }
+                // Native controls (`files_panel`).
+                SideView::Files => {}
             }
             self.invalidate_grid(side);
         }
@@ -6799,6 +6874,8 @@ impl Window {
         self.client = (w, h);
         self.renderer.resize(w.max(1) as u32, h.max(1) as u32);
         self.areas = self.compute_areas();
+        // The panels let the mouse through to the edge's strip.
+        crate::native::set_edge_grab(self.hwnd, self.edge_grab());
         let cpad = scale(CHROME_PADDING_DIP, self.dpi);
         let cm = self.chrome_metrics;
         let cells = |r: Rect| {
@@ -7519,16 +7596,6 @@ impl Window {
             }
             return self.live_action(action);
         }
-        if self.side.view == SideView::Files {
-            if key == SideKey::Refresh {
-                self.ensure_sftp(self.focused_id());
-            }
-            let rows = self.side.grid.rows();
-            let downloads = self.download_dir();
-            let remote = self.files_key.as_ref().and_then(|k| self.sftp.get_mut(k));
-            let action = self.files.key(remote, key, &downloads, rows);
-            return self.files_action(action);
-        }
         if let Some(form) = &mut self.side.form {
             let action = form.key(key, self.side.grid.rows());
             return self.form_action(action);
@@ -7786,7 +7853,7 @@ impl Window {
         let id = self.focused_id();
         if !self.takes_broadcast(id) {
             return Some(Command::Notice(
-                "Snippets are typed into a pane with a running shell or console; this \
+                "Scripts are typed into a pane with a running shell or console; this \
                  pane has none, or is at a prompt."
                     .into(),
             ));
@@ -7816,7 +7883,7 @@ impl Window {
         let id = self.focused_id();
         if !self.takes_broadcast(id) {
             return Some(Command::Notice(
-                "Snippets are typed into a pane with a running shell or console; this \
+                "Scripts are typed into a pane with a running shell or console; this \
                  pane has none, or is at a prompt."
                     .into(),
             ));
@@ -7863,7 +7930,7 @@ impl Window {
             .map(|at| steps.split_off(at));
         if after.is_some() && panes.len() > 1 {
             return Some(Command::Notice(format!(
-                "The snippet {name} moves to another pane or tab (@pane, @tab), so it runs \
+                "The script {name} moves to another pane or tab (@pane, @tab), so it runs \
                  in one pane only, not in {} at once.",
                 panes.len()
             )));
@@ -7883,7 +7950,7 @@ impl Window {
         for &p in panes {
             let label = self.pane_label(p);
             let state = if self.scripts.contains_key(&p) {
-                RowState::Failed("a login script or snippet runs there".into())
+                RowState::Failed("another script runs there".into())
             } else {
                 RowState::Running(None)
             };
@@ -7892,7 +7959,7 @@ impl Window {
         if report {
             self.show_report(Report::new(name, rows, None));
         }
-        let what = format!("the snippet {name}");
+        let what = format!("the script {name}");
         for &p in panes {
             if self.scripts.contains_key(&p) {
                 continue;
@@ -7965,7 +8032,7 @@ impl Window {
         let Some(to) = to else {
             self.show(
                 from,
-                &format!("\x1b[0;31m[the snippet {name} stopped: {missing}]\x1b[0m\r\n"),
+                &format!("\x1b[0;31m[the script {name} stopped: {missing}]\x1b[0m\r\n"),
             );
             return;
         };
@@ -7993,7 +8060,7 @@ impl Window {
         let r = self.snippets_view.report().filter(|r| r.run.is_some())?;
         Some(Command::Notice(format!(
             "The report of the run of {} is still open. Close it first: Escape in the \
-             snippets view (Ctrl+Shift+Space).",
+             scripts view (Ctrl+Shift+Space).",
             r.name
         )))
     }
@@ -8040,7 +8107,7 @@ impl Window {
             .collect();
         if hosts.is_empty() {
             return Some(Command::Notice(
-                "There are no saved SSH sessions to run the snippet on. Save the hosts in \
+                "There are no saved SSH sessions to run the script on. Save the hosts in \
                  the connection manager first."
                     .into(),
             ));
@@ -8233,7 +8300,7 @@ impl Window {
             row.state = RowState::Running(None);
         }
         self.script_runs += 1;
-        let mut runner = Runner::named(&format!("the snippet {name}"), steps);
+        let mut runner = Runner::named(&format!("the script {name}"), steps);
         let actions = runner.start(Instant::now());
         self.scripts.insert(
             id,
@@ -8548,7 +8615,7 @@ impl Window {
         self.recording = Some((id, Recorder::default()));
         self.show(
             id,
-            "\x1b[0;90m[Recording keystrokes as a snippet. Edit > Record keystrokes as snippet \
+            "\x1b[0;90m[Recording keystrokes as a script. Edit > Record keystrokes as script \
              again stops it.]\x1b[0m\r\n",
         );
         self.refresh(id);
@@ -8565,7 +8632,7 @@ impl Window {
                 self.save_settings();
             } else if let Err(e) = snippet_store::remove(&snippets_dir(), &s) {
                 out = Some(Command::Notice(format!(
-                    "Could not remove the snippet's file: {e}"
+                    "Could not remove the script's file: {e}"
                 )));
             }
         }
@@ -8629,7 +8696,7 @@ impl Window {
         self.side.import = None;
         self.show_side(SideView::Snippets, true);
         let mut text = format!(
-            "Imported {done} snippet{} into {}. Each has a file there, in a folder named \
+            "Imported {done} script{} into {}. Each has a file there, in a folder named \
              after its category.",
             plural(done),
             dir.display()
@@ -9535,11 +9602,18 @@ impl Window {
         }
     }
 
+    /// The strip around the tools pane's edge where a drag starts.
+    fn edge_grab(&self) -> Option<Rect> {
+        let e = self.areas.side_edge?;
+        let by = scale(EDGE_GRAB_DIP, self.dpi);
+        Some(Rect::new(e.x - by, e.y, e.w + 2 * by, e.h))
+    }
+
     /// Where a client point falls.
     fn spot(&self, x: i32, y: i32) -> Spot {
         let grab = scale(GRAB_DIP, self.dpi);
-        if let Some(e) = self.areas.side_edge
-            && inflate(e, grab).contains(x, y)
+        if let Some(e) = self.edge_grab()
+            && e.contains(x, y)
         {
             return Spot::SideEdge;
         }
@@ -9591,8 +9665,7 @@ impl Window {
                 | Drag::SideEdge => IDC_SIZEWE,
                 Drag::Divider {
                     axis: Axis::Column, ..
-                }
-                | Drag::FilesBar { .. } => IDC_SIZENS,
+                } => IDC_SIZENS,
                 Drag::Pane { active: true, .. } | Drag::Tab { out: true, .. } => IDC_SIZEALL,
                 Drag::Pane { .. } => IDC_IBEAM,
                 Drag::Tab { .. } => IDC_ARROW,
@@ -9600,32 +9673,11 @@ impl Window {
         }
         match self.spot(x, y) {
             Spot::SideEdge => IDC_SIZEWE,
-            Spot::Side(_, row) if self.files_bar_at(row).is_some() => IDC_SIZENS,
             Spot::Divider(d) if d.axis == Axis::Row => IDC_SIZEWE,
             Spot::Divider(_) => IDC_SIZENS,
             Spot::Pane(_) => IDC_IBEAM,
             _ => IDC_ARROW,
         }
-    }
-
-    /// The section title bar of the file transfer view on side pane grid
-    /// row `row`, if the side pane shows that view and one is there.
-    fn files_bar_at(&self, row: usize) -> Option<Divider> {
-        if !self.side.visible || self.side.view != SideView::Files {
-            return None;
-        }
-        let remote = self.files_key.as_ref().and_then(|k| self.sftp.get(k));
-        self.files.divider_at(remote, row, self.side.grid.rows())
-    }
-
-    /// The side pane grid row at client y, above or below the pane
-    /// included (clamped to its first row, or past its last).
-    fn side_row(&self, y: i32) -> usize {
-        let Some(s) = self.areas.side else {
-            return 0;
-        };
-        let cpad = scale(CHROME_PADDING_DIP, self.dpi);
-        ((y - s.y - cpad).max(0) / self.chrome_metrics.height.max(1) as i32) as usize
     }
 
     /// The viewport cell under a client-area point in pane `id`, and
@@ -9740,25 +9792,6 @@ impl Window {
                     self.refresh_chrome();
                     return None;
                 }
-                if self.side.view == SideView::Files {
-                    if let Some(which) = self.files_bar_at(row) {
-                        // A title bar: a drag moves it, a click is a click.
-                        self.capture(true);
-                        self.drag = Some(Drag::FilesBar {
-                            which,
-                            at: (col, row),
-                            double,
-                            moved: false,
-                        });
-                        self.refresh_chrome();
-                        return None;
-                    }
-                    let rows = self.side.grid.rows();
-                    let downloads = self.download_dir();
-                    let remote = self.files_key.as_ref().and_then(|k| self.sftp.get_mut(k));
-                    let action = self.files.click(remote, col, row, double, &downloads, rows);
-                    return self.files_action(action);
-                }
                 if let Some(form) = &mut self.side.form {
                     let action = form.click(col, row, self.side.grid.rows());
                     return self.form_action(action);
@@ -9864,24 +9897,6 @@ impl Window {
 
     /// Finishes a drag.
     fn end_drag(&mut self, drag: Drag, (x, y): (i32, i32)) -> Option<Command> {
-        if let Drag::FilesBar {
-            at: (col, row),
-            double,
-            moved,
-            ..
-        } = drag
-        {
-            if moved || self.side.view != SideView::Files {
-                self.refresh_chrome();
-                return None;
-            }
-            // Not moved: a click on the title (Local PC's picks a folder).
-            let rows = self.side.grid.rows();
-            let downloads = self.download_dir();
-            let remote = self.files_key.as_ref().and_then(|k| self.sftp.get_mut(k));
-            let action = self.files.click(remote, col, row, double, &downloads, rows);
-            return self.files_action(action);
-        }
         if let Drag::Tab {
             index, out: true, ..
         } = drag
@@ -9947,23 +9962,6 @@ impl Window {
     fn on_mouse_move(&mut self, (x, y): (i32, i32), mods: Mods) {
         self.mouse.at = (x, y);
         let hover = self.strip_tab_at(x);
-        let side_row = self.side_row(y);
-        if let Some(Drag::FilesBar {
-            which, at, moved, ..
-        }) = &mut self.drag
-        {
-            // Moved once it leaves the row it was pressed on.
-            *moved |= side_row != at.1;
-            if !*moved {
-                return;
-            }
-            let which = *which;
-            let rows = self.side.grid.rows();
-            let remote = self.files_key.as_ref().and_then(|k| self.sftp.get(k));
-            self.files.drag_divider(remote, which, side_row, rows);
-            self.refresh_chrome();
-            return;
-        }
         if let Some(drag) = &mut self.drag {
             match drag {
                 Drag::Divider { path, axis, span } => {
@@ -9978,7 +9976,6 @@ impl Window {
                     }
                     self.layout();
                 }
-                Drag::FilesBar { .. } => {}
                 Drag::SideEdge => {
                     let min = scale(toolpane::MIN_SHOWN_DIP, self.dpi);
                     let to = toolpane::drag(x, &self.tools_input(), min);
@@ -10238,11 +10235,6 @@ impl Window {
                     let rows = self.side.grid.rows();
                     self.snippets_view
                         .scroll_by(lines, &self.settings.snippets, rows);
-                } else if self.side.view == SideView::Files {
-                    let downloads = self.download_dir();
-                    let remote = self.files_key.as_ref().and_then(|k| self.sftp.get(k));
-                    let rows = self.side.grid.rows();
-                    self.files.scroll_by(remote, lines, &downloads, rows);
                 } else if let Some(form) = &mut self.side.form {
                     form.scroll_by(lines, self.side.grid.rows());
                 } else if let Some(view) = &mut self.side.import {
@@ -10460,8 +10452,8 @@ impl Window {
                     .filter(|t| !t.trim().is_empty());
                 let Some(text) = text else {
                     return Some(Command::Notice(
-                        "Select the text for the snippet in a pane first, then use Edit > Save \
-                         selection as snippet."
+                        "Select the text for the script in a pane first, then use Edit > Save \
+                         selection as script."
                             .into(),
                     ));
                 };
@@ -10693,6 +10685,17 @@ impl Window {
                 self.save_settings();
                 self.update_menu_checks();
                 self.layout();
+            }
+            id if (cmd::WINDOW_COLOURS..cmd::WINDOW_COLOURS + WindowColours::ALL.len() as u32)
+                .contains(&id) =>
+            {
+                if let Some(c) = WindowColours::ALL.get((id - cmd::WINDOW_COLOURS) as usize) {
+                    self.settings.window_colours = *c;
+                    self.save_settings();
+                    self.update_menu_checks();
+                    self.refresh_chrome();
+                    self.request_full_redraw();
+                }
             }
             cmd::TOOLS_PIN => {
                 self.settings.tools_pinned = !self.settings.tools_pinned;
@@ -11004,6 +11007,17 @@ impl Window {
         unsafe {
             let _ = CheckMenuRadioItem(self.menu, cmd::FONT, last_font, font, MF_BYCOMMAND.0);
             let _ = CheckMenuRadioItem(self.menu, cmd::THEME, last_theme, theme, MF_BYCOMMAND.0);
+            let colours = WindowColours::ALL
+                .iter()
+                .position(|c| *c == s.window_colours)
+                .unwrap_or(0) as u32;
+            let _ = CheckMenuRadioItem(
+                self.menu,
+                cmd::WINDOW_COLOURS,
+                cmd::WINDOW_COLOURS + WindowColours::ALL.len() as u32 - 1,
+                cmd::WINDOW_COLOURS + colours,
+                MF_BYCOMMAND.0,
+            );
             let way = s.remote_app_clipboard.as_deref().unwrap_or("off");
             let way = crate::stream::CLIPBOARD_WAYS
                 .iter()
@@ -11533,7 +11547,6 @@ impl Window {
         let key = self.pane_sftp_key(id);
         let host_changed = key != self.files_key;
         if host_changed {
-            self.files.reset();
             self.files_key.clone_from(&key);
             self.ensure_sftp(id);
         }
@@ -11672,39 +11685,178 @@ impl Window {
         self.refresh_chrome();
     }
 
-    /// Carries out what the file view picked.
-    fn files_action(&mut self, action: Option<FilesAction>) -> Option<Command> {
-        let command = match action {
-            Some(FilesAction::Leave) => {
-                self.focus_terminal();
-                None
-            }
-            Some(FilesAction::Delete(entry)) => self
-                .files_key
+    /// What the file transfer pane shows.
+    fn files_view(&self) -> files_panel::View {
+        let remote = self.files_key.as_ref().and_then(|k| self.sftp.get(k));
+        let follow = if !self.settings.follow_directory {
+            Follow::Off
+        } else if self
+            .panes
+            .get(&self.focused_id())
+            .is_some_and(|p| p.cwd.is_some())
+        {
+            Follow::On
+        } else {
+            Follow::Unreported
+        };
+        let status = match remote {
+            None => Some((NOT_CONNECTED.to_owned(), false)),
+            Some(r) => r
+                .notice
                 .clone()
-                .map(|key| Command::ConfirmDelete { key, entry }),
-            Some(FilesAction::PickUpload(dir)) => self
-                .files_key
-                .clone()
-                .filter(|k| self.sftp.contains_key(k))
-                .map(|key| Command::PickUpload { key, dir }),
-            Some(FilesAction::OpenDownloads) => Some(Command::OpenFolder(self.download_dir())),
-            Some(FilesAction::ToggleFollow) => {
-                self.toggle_follow();
+                .or_else(|| r.listing.error.clone())
+                .map(|n| (n, true))
+                .or_else(|| {
+                    (follow == Follow::Unreported).then(|| {
+                        (
+                            "Follow terminal: the shell has not said which folder it is in yet."
+                                .to_owned(),
+                            false,
+                        )
+                    })
+                }),
+        };
+        files_panel::View {
+            host: remote.map(|r| r.label.clone()),
+            key: remote.and(self.files_key.clone()),
+            remote_dir: remote.map(|r| r.listing.path.clone()).unwrap_or_default(),
+            remote_rows: remote
+                .map(|r| files::remote_rows(&r.listing, ""))
+                .unwrap_or_default(),
+            status,
+            queue: remote.map(files::queue_rows).unwrap_or_default(),
+            question: remote.and_then(Remote::question),
+            follow,
+            base: self.download_dir(),
+            landed: remote.map_or(0, files::landed),
+            arrange: self.arrange(),
+        }
+    }
+
+    /// How the file transfer pane arranges its lists.
+    fn arrange(&self) -> Arrange {
+        self.settings
+            .transfer_layout
+            .as_deref()
+            .map(Arrange::parse)
+            .unwrap_or_default()
+    }
+
+    /// Carries out what the user did in the file transfer pane.
+    fn files_event(&mut self, event: files_panel::Event) -> Option<Command> {
+        use files_panel::{Event, JobOp};
+        let key = self.files_key.clone().filter(|k| self.sftp.contains_key(k));
+        let command = match event {
+            Event::Browse(path) => {
+                if let Some(r) = key.as_ref().and_then(|k| self.sftp.get_mut(k)) {
+                    r.notice = None;
+                    r.browse(&path);
+                }
                 None
             }
-            Some(FilesAction::SetLocal(dir)) => {
-                self.set_download_dir(&dir);
+            Event::Home => {
+                if let Some(r) = key.as_ref().and_then(|k| self.sftp.get_mut(k))
+                    && let Some(home) = r.home.clone()
+                {
+                    r.notice = None;
+                    r.browse(&home);
+                }
                 None
             }
-            Some(FilesAction::PickLocal) => Some(Command::PickLocalFolder(self.download_dir())),
-            Some(FilesAction::Upload { paths, dir }) => {
-                if let Some(key) = self.files_key.clone() {
+            Event::Refresh => {
+                self.ensure_sftp(self.focused_id());
+                if let Some(r) = key.as_ref().and_then(|k| self.sftp.get_mut(k)) {
+                    r.notice = None;
+                    r.refresh();
+                }
+                None
+            }
+            Event::Download { keys, into } => {
+                if let Some(r) = key.as_ref().and_then(|k| self.sftp.get_mut(k)) {
+                    r.notice = None;
+                    if let Err(e) = std::fs::create_dir_all(&into) {
+                        r.notice = Some(format!("{}: {e}", into.display()));
+                    } else {
+                        for entry in files::entries_named(&r.listing, &keys) {
+                            if let Err(e) = r.download(&entry, &into) {
+                                r.notice = Some(e);
+                            }
+                        }
+                    }
+                }
+                None
+            }
+            Event::Upload { paths, dir } => {
+                if let Some(key) = key {
                     self.upload_files(&key, &paths, &dir);
                 }
                 None
             }
-            None => None,
+            Event::Delete(keys) => key.and_then(|key| {
+                let listing = &self.sftp.get(&key)?.listing;
+                let entries = files::entries_named(listing, &keys);
+                let dir = listing.path.clone();
+                (!entries.is_empty()).then_some(Command::ConfirmDelete { key, dir, entries })
+            }),
+            Event::SetLocal(dir) => {
+                self.set_download_dir(&dir);
+                None
+            }
+            Event::PickLocal => Some(Command::PickLocalFolder(self.download_dir())),
+            Event::PickUpload => key.and_then(|key| {
+                let dir = self.sftp.get(&key)?.listing.path.clone();
+                Some(Command::PickUpload { key, dir })
+            }),
+            Event::OpenLocal(dir) => Some(Command::OpenFolder(dir)),
+            Event::ToggleFollow => {
+                self.toggle_follow();
+                None
+            }
+            Event::Arrange(a) => {
+                let text = Some(a.to_setting());
+                if self.settings.transfer_layout != text {
+                    self.settings.transfer_layout = text;
+                    self.save_settings();
+                }
+                None
+            }
+            Event::Job(id, op) => {
+                if let Some(r) = key.as_ref().and_then(|k| self.sftp.get_mut(k)) {
+                    match op {
+                        JobOp::Pause => r.pause(id),
+                        JobOp::Resume => r.resume(id),
+                        JobOp::Cancel => r.cancel(id),
+                        JobOp::Retry => r.retry(id),
+                    }
+                }
+                None
+            }
+            Event::ClearFinished => {
+                if let Some(r) = key.as_ref().and_then(|k| self.sftp.get_mut(k)) {
+                    r.clear_finished();
+                }
+                None
+            }
+            Event::Answer(id, choice, all) => {
+                // Only the question the pane shows: not one that came up
+                // on another host since.
+                if let Some(r) = key.as_ref().and_then(|k| self.sftp.get_mut(k))
+                    && r.question().is_some_and(|q| q.0 == id)
+                {
+                    r.answer(id, choice, all);
+                }
+                None
+            }
+            Event::Focused => {
+                if !self.side.focused {
+                    self.side.focused = true;
+                }
+                None
+            }
+            Event::Leave => {
+                self.focus_terminal();
+                None
+            }
         };
         self.flush_sftp();
         self.refresh_chrome();
@@ -11749,16 +11901,40 @@ impl Window {
 
     /// Where files dropped at client point (`x`, `y`) go: the queue key,
     /// a label for the prompt, and the remote folder.
-    fn drop_target(&mut self, x: i32, y: i32) -> Option<(String, Vec<u8>)> {
-        let (id, listed) = match self.spot(x, y) {
-            Spot::Pane(id) => (id, false),
-            Spot::Side(..) if self.files_visible() => (self.focused_id(), true),
-            _ => return None,
+    fn drop_target(
+        &mut self,
+        x: i32,
+        y: i32,
+    ) -> std::result::Result<(String, Vec<u8>), &'static str> {
+        const ON_A_PANE: &str =
+            "Drop files on a pane that is logged in to an SSH host to upload them there.";
+        let (id, into) = match self.spot(x, y) {
+            Spot::Pane(id) => (id, None),
+            Spot::Side(..) if self.files_visible() => {
+                let mut pt = POINT { x, y };
+                // SAFETY: a plain conversion for our own window.
+                unsafe {
+                    let _ = windows::Win32::Graphics::Gdi::ClientToScreen(self.hwnd, &mut pt);
+                }
+                match files_panel::drop_at(pt) {
+                    files_panel::DropAt::Remote(folder) => (self.focused_id(), Some(folder)),
+                    files_panel::DropAt::Local => {
+                        return Err("Drop files on the Remote list to upload them.");
+                    }
+                    files_panel::DropAt::Pane => (self.focused_id(), Some(None)),
+                }
+            }
+            _ => return Err(ON_A_PANE),
         };
         self.ensure_sftp(id);
-        let key = self.files_target(id)?;
-        let listed = listed && self.files_key.as_deref() == Some(&key);
-        Some((key, self.upload_dir(id, listed)))
+        let key = self.files_target(id).ok_or(ON_A_PANE)?;
+        let listed = into.is_some() && self.files_key.as_deref() == Some(&key);
+        let dir = self.upload_dir(id, listed);
+        Ok(match into.flatten() {
+            Some(folder) if listed => names::join(&dir, &folder),
+            _ => dir,
+        })
+        .map(|dir| (key, dir))
     }
 
     /// Transfers not yet done, failed, skipped or cancelled.
@@ -11973,10 +12149,12 @@ enum Command {
     SaveLook,
     /// A message box with this text.
     Notice(String),
-    /// Ask, then delete `entry` in the listed folder of `key`'s host.
+    /// Ask, then delete `entries` in folder `dir` of `key`'s host (when
+    /// it is still the listed one).
     ConfirmDelete {
         key: String,
-        entry: DirEntry,
+        dir: Vec<u8>,
+        entries: Vec<DirEntry>,
     },
     /// The folder picker for the file view's Local PC section, starting
     /// in this folder.
@@ -12279,13 +12457,14 @@ fn drop_files(hwnd: HWND, drop: HDROP) {
     if paths.is_empty() {
         return;
     }
-    let Some((key, dir)) = with_window(|w| w.drop_target(at.x, at.y)).flatten() else {
-        dialog(
-            hwnd,
-            "Drop files on a pane that is logged in to an SSH host to upload them there.",
-            MB_OK | MB_ICONINFORMATION,
-        );
-        return;
+    let target = with_window(|w| w.drop_target(at.x, at.y))
+        .unwrap_or(Err("FeroSSH is busy; drop the files again."));
+    let (key, dir) = match target {
+        Ok(t) => t,
+        Err(why) => {
+            dialog(hwnd, why, MB_OK | MB_ICONINFORMATION);
+            return;
+        }
     };
     let what = match paths.as_slice() {
         [one] => format!(
@@ -12529,7 +12708,66 @@ fn conn_event(hwnd: HWND, event: conn_view::Event) {
 
 /// One of the native tools' controls has the keyboard.
 fn tools_have_focus() -> bool {
-    conn_view::has_focus() || live_panel::has_focus()
+    conn_view::has_focus()
+        || live_panel::has_focus()
+        || form_view::has_focus()
+        || files_panel::has_focus()
+}
+
+/// Carries out what the user did in the file transfer pane.
+fn files_event(hwnd: HWND, event: files_panel::Event) {
+    if let Some(command) = with_window(|w| w.files_event(event)).flatten() {
+        run_command(hwnd, command);
+    }
+}
+
+/// Carries out what the user did in the connection form's controls.
+fn form_event(hwnd: HWND, event: form_view::Event) {
+    use form_view::Event;
+    let command = match event {
+        Event::Text(field, text) => {
+            with_window(|w| {
+                if let Some(f) = &mut w.side.form {
+                    f.set_text(field, &text);
+                }
+                w.refresh_chrome();
+            });
+            None
+        }
+        Event::Choice(field, index) => {
+            with_window(|w| {
+                if let Some(f) = &mut w.side.form {
+                    f.set_choice(field, index);
+                }
+                w.refresh_chrome();
+            });
+            None
+        }
+        Event::Browse => with_window(|w| w.form_action(Some(FormAction::BrowseKey))).flatten(),
+        Event::Save(connect) => with_window(|w| {
+            let action = w.side.form.as_mut()?.submit(connect);
+            // A problem shows in the form; nothing else happens.
+            if action.is_none() {
+                w.refresh_chrome();
+            }
+            w.form_action(action)
+        })
+        .flatten(),
+        Event::Cancel => with_window(|w| w.form_action(Some(FormAction::Cancel))).flatten(),
+        Event::Delete => with_window(|w| w.form_action(Some(FormAction::Delete))).flatten(),
+        Event::Focused => {
+            with_window(|w| {
+                if !w.side.focused {
+                    w.side.focused = true;
+                    w.refresh_chrome();
+                }
+            });
+            None
+        }
+    };
+    if let Some(command) = command {
+        run_command(hwnd, command);
+    }
 }
 
 /// Carries out what the user did in the session manager's controls.
@@ -12887,32 +13125,37 @@ fn run_command(hwnd: HWND, command: Command) {
                 });
             }
         }
-        Command::ConfirmDelete { key, entry } => {
-            let what = if entry.attrs.is_dir() {
-                "the folder"
-            } else {
-                "the file"
+        Command::ConfirmDelete { key, dir, entries } => {
+            let host = key.rsplit_once(':').map_or(key.as_str(), |(h, _)| h);
+            let folders = entries.iter().any(|e| e.attrs.is_dir());
+            let what = match entries.as_slice() {
+                [entry] => {
+                    let path = names::display(&names::join(&dir, &entry.name));
+                    let kind = if folders { "the folder" } else { "the file" };
+                    format!("{kind} {path}")
+                }
+                many => format!("these {} items", many.len()),
             };
-            let path = with_window(|w| {
-                w.sftp
-                    .get(&key)
-                    .map(|r| names::display(&names::join(&r.listing.path, &entry.name)))
-            })
-            .flatten()
-            .unwrap_or_default();
-            let note = if entry.attrs.is_dir() {
+            let note = if folders {
                 " Only an empty folder can be deleted."
             } else {
                 ""
             };
-            let text = format!(
-                "Delete {what} {path} on {key}?{note}\n\nThis cannot be undone.",
-                key = key.rsplit_once(':').map_or(key.as_str(), |(h, _)| h)
-            );
+            let text = format!("Delete {what} on {host}?{note}\n\nThis cannot be undone.");
             if dialog(hwnd, &text, MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2) == Some(IDYES) {
                 with_window(|w| {
+                    // Not when another folder was listed meanwhile: its
+                    // entries of the same names are not the ones asked about.
                     if let Some(r) = w.sftp.get_mut(&key) {
-                        r.delete(&entry);
+                        if r.listing.path == dir {
+                            for entry in &entries {
+                                r.delete(entry);
+                            }
+                        } else {
+                            r.notice = Some(
+                                "Nothing was deleted: another folder was listed meanwhile.".into(),
+                            );
+                        }
                     }
                     w.flush_sftp();
                     w.refresh_chrome();
@@ -12987,8 +13230,11 @@ fn run_command(hwnd: HWND, command: Command) {
                 .unwrap_or(false) =>
         {
             let start = std::env::var_os("LOCALAPPDATA").map_or_else(home, PathBuf::from);
-            if let Some(path) = pick_file(hwnd, w!("Snippets or macros of another program"), &start)
-            {
+            if let Some(path) = pick_file(
+                hwnd,
+                w!("Scripts, snippets or macros of another program"),
+                &start,
+            ) {
                 match read_snippet_file(&path) {
                     Ok(found) => {
                         with_window(|w| w.add_snippet_import(found));
@@ -13042,7 +13288,7 @@ fn run_command(hwnd: HWND, command: Command) {
                 .collect();
             let more = if steps.len() > 8 { "\n..." } else { "" };
             let text = format!(
-                "Type the snippet {name} into {}, which {} the Production theme?\n\n{}{more}",
+                "Type the script {name} into {}, which {} the Production theme?\n\n{}{more}",
                 production.join(", "),
                 if production.len() == 1 { "has" } else { "have" },
                 shown.join("\n"),
@@ -13059,7 +13305,7 @@ fn run_command(hwnd: HWND, command: Command) {
             else {
                 return;
             };
-            let text = format!("Delete the snippet {name}?");
+            let text = format!("Delete the script {name}?");
             if dialog(hwnd, &text, MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2) == Some(IDYES)
                 && let Some(Some(command)) = with_window(|w| w.delete_snippet(index))
             {
@@ -13073,7 +13319,7 @@ fn run_command(hwnd: HWND, command: Command) {
             production,
         } => {
             let text = format!(
-                "Run the snippet {name} on {} hosts? {} {} the Production theme.",
+                "Run the script {name} on {} hosts? {} {} the Production theme.",
                 hosts.len(),
                 production.join(", "),
                 if production.len() == 1 { "has" } else { "have" },
@@ -13457,7 +13703,7 @@ fn read_snippet_file(path: &std::path::Path) -> std::result::Result<SnippetSourc
         return Err(none("macros"));
     }
     if text.len() > 1 << 20 {
-        return Err(format!("{} is too big for one snippet.", path.display()));
+        return Err(format!("{} is too big for one script.", path.display()));
     }
     let stem = path
         .file_stem()
@@ -13927,6 +14173,10 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
         if let Some(result) = standby_capture(hwnd, msg, wparam) {
             return result;
         }
+        // The menu bar in the window's colours.
+        if let Some(result) = ui_theme::frame_message(hwnd, msg, wparam, lparam) {
+            return result;
+        }
         if with_window(|w| w.desktop_message(msg, wparam, lparam)) == Some(true) {
             return LRESULT(0);
         }
@@ -13939,6 +14189,11 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                 LRESULT(0)
             }
             WM_ERASEBKGND => LRESULT(1),
+            // Windows' light or dark app mode, or its colours, changed.
+            WM_SETTINGCHANGE | WM_SYSCOLORCHANGE => {
+                with_window(Window::refresh_chrome);
+                DefWindowProcW(hwnd, msg, wparam, lparam)
+            }
             WM_SIZE => {
                 if wparam.0 as u32 != SIZE_MINIMIZED {
                     with_window(Window::layout);
@@ -14135,11 +14390,13 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
             }
             WM_TOOLS_FOCUS => {
                 // Checked again now: a click may have moved the focus since.
-                let (want, conn, live, rename) = with_window(|w| {
+                let (want, conn, live, form, files, rename) = with_window(|w| {
                     (
                         w.wants_tools_focus(),
                         w.conn_native(),
                         w.live_native(),
+                        w.form_native(),
+                        w.files_visible(),
                         w.wants_name_edit()
                             .then(|| w.live_view.renaming_pane())
                             .flatten(),
@@ -14154,8 +14411,10 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                         None if live_panel::editing() => {}
                         None => live_panel::focus_list(),
                     },
+                    1 if want && form => form_view::focus_first(),
                     1 if want && conn => conn_view::focus_tree(),
                     1 if want && live => live_panel::focus_list(),
+                    1 if want && files => files_panel::focus_first(),
                     0 if !want && tools_have_focus() => {
                         let _ = SetFocus(Some(hwnd));
                     }

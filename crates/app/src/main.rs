@@ -38,6 +38,10 @@ mod desktop;
 #[path = "desktop_off.rs"]
 mod desktop;
 #[cfg(windows)]
+mod files_panel;
+#[cfg(windows)]
+mod form_view;
+#[cfg(windows)]
 mod live_panel;
 #[cfg(windows)]
 mod native;
@@ -118,6 +122,10 @@ mod tmux_e2e;
 mod tmux_keys;
 #[cfg_attr(not(windows), allow(dead_code))]
 mod toolpane;
+#[cfg_attr(not(windows), allow(dead_code))]
+mod ui_colours;
+#[cfg(windows)]
+mod ui_theme;
 #[cfg(windows)]
 mod update;
 #[cfg_attr(not(windows), allow(dead_code))]

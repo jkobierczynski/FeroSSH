@@ -354,6 +354,39 @@ enum Item {
     Buttons,
 }
 
+/// A field of the form, for the native controls to name it by.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FieldId(Field);
+
+/// One row of the native form.
+#[derive(Clone, Debug, PartialEq)]
+pub struct NativeRow {
+    /// 0 Connection, 1 Look, 2 Extras.
+    pub section: usize,
+    pub field: Option<FieldId>,
+    pub label: String,
+    pub kind: NativeKind,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum NativeKind {
+    /// Typed; `hint` shows while it is empty, `locked` is read-only.
+    Text {
+        value: String,
+        hint: String,
+        locked: bool,
+    },
+    /// Picked from `options`.
+    Choice {
+        options: Vec<String>,
+        selected: usize,
+    },
+    /// A line of explanation.
+    Note(String),
+    /// A Browse... button for the key file.
+    Browse,
+}
+
 /// What the window should do.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FormAction {
@@ -461,10 +494,15 @@ impl SessionForm {
     }
 
     fn items(&self) -> Vec<Item> {
+        self.items_with(self.open)
+    }
+
+    /// The items with the sections `open` says.
+    fn items_with(&self, open: [bool; 3]) -> Vec<Item> {
         let mut out = Vec::new();
         let kind = self.values.kind;
         out.push(Item::Section(0));
-        if self.open[0] {
+        if open[0] {
             out.push(Item::Field(Field::Name));
             if let Source::ReadOnly(file) = &self.source {
                 if self.locked() {
@@ -547,7 +585,7 @@ impl SessionForm {
             SessionKind::Ssh | SessionKind::Serial | SessionKind::Telnet
         ) {
             out.push(Item::Section(1));
-            if self.open[1] {
+            if open[1] {
                 out.extend(
                     [
                         Field::Theme,
@@ -561,7 +599,7 @@ impl SessionForm {
         }
         if kind == SessionKind::Ssh {
             out.push(Item::Section(2));
-            if self.open[2] {
+            if open[2] {
                 out.push(Item::Field(Field::Tmux));
                 if self.values.tmux_on {
                     out.push(Item::Field(Field::TmuxSession));
@@ -600,7 +638,7 @@ impl SessionForm {
             if kind != SessionKind::Ssh {
                 out.push(Item::Section(2));
             }
-            if self.open[2] {
+            if open[2] {
                 let n = self.values.login_script.len();
                 out.extend((0..n).map(|i| Item::Field(Field::LoginStep(i))));
                 out.push(Item::Note(
@@ -997,6 +1035,129 @@ impl SessionForm {
         }
     }
 
+    /// Every section's rows, for the native form; the error and the
+    /// buttons are separate ([`Self::error`], [`Self::button_names`]).
+    pub fn native_rows(&self) -> Vec<NativeRow> {
+        let mut section = 0;
+        let mut out = Vec::new();
+        for item in self.items_with([true; 3]) {
+            let (field, label, kind) = match item {
+                Item::Section(s) => {
+                    section = s;
+                    continue;
+                }
+                Item::Error(_) | Item::Buttons => continue,
+                Item::Note(text) => (None, String::new(), NativeKind::Note(text)),
+                Item::Browse => (None, String::new(), NativeKind::Browse),
+                Item::Field(f) => {
+                    let label = match f {
+                        Field::Forward(i) => format!("Forward {}", i + 1),
+                        Field::LoginStep(i) => format!("Login {}", i + 1),
+                        _ => f.label().to_owned(),
+                    };
+                    let kind = if f.is_choice() {
+                        let options = self.options(f);
+                        let current = self.choice(f);
+                        let selected = options.iter().position(|o| *o == current).unwrap_or(0);
+                        NativeKind::Choice { options, selected }
+                    } else {
+                        NativeKind::Text {
+                            value: self.text(f).cloned().unwrap_or_default(),
+                            hint: self.hint(f),
+                            locked: self.field_locked(f),
+                        }
+                    };
+                    (Some(FieldId(f)), label, kind)
+                }
+            };
+            out.push(NativeRow {
+                section,
+                field,
+                label,
+                kind,
+            });
+        }
+        out
+    }
+
+    /// The sections the form has for its type, by number (0 Connection,
+    /// 1 Look, 2 Extras), with their names.
+    pub fn sections(&self) -> Vec<(usize, &'static str)> {
+        self.items_with([false; 3])
+            .into_iter()
+            .filter_map(|i| match i {
+                Item::Section(s) => SECTIONS.get(s).map(|n| (s, *n)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// A choice field's options in order, starting from its default.
+    fn options(&self, f: Field) -> Vec<String> {
+        let mut probe = SessionForm::new(
+            None,
+            Source::New,
+            Values::default(),
+            self.hints.clone(),
+            Vec::new(),
+            self.themes.clone(),
+        );
+        let mut out: Vec<String> = Vec::new();
+        for _ in 0..256 {
+            let c = probe.choice(f);
+            if out.contains(&c) {
+                break;
+            }
+            out.push(c);
+            probe.cycle(f, true);
+        }
+        out
+    }
+
+    /// Text typed into a native field. A new empty forward or login line
+    /// appears below the last one once it has text.
+    pub fn set_text(&mut self, field: FieldId, text: &str) {
+        if self.field_locked(field.0) {
+            return;
+        }
+        if let Some(t) = self.text_mut(field.0) {
+            *t = text.chars().take(MAX_TEXT).collect();
+        }
+        self.tidy_forwards();
+    }
+
+    /// Option `index` picked in a native choice field.
+    pub fn set_choice(&mut self, field: FieldId, index: usize) {
+        let f = field.0;
+        let options = self.options(f);
+        let Some(want) = options.get(index) else {
+            return;
+        };
+        for _ in 0..options.len() {
+            if self.choice(f) == *want {
+                return;
+            }
+            self.cycle(f, true);
+        }
+    }
+
+    /// Save or Connect pressed: checks, and on a problem keeps it for
+    /// [`Self::error`].
+    pub fn submit(&mut self, connect: bool) -> Option<FormAction> {
+        self.checked(connect)
+    }
+
+    /// The problem the last Save or Connect found.
+    pub fn error(&self) -> Option<&str> {
+        self.error.as_deref()
+    }
+
+    /// The buttons the form has: Save, Connect, Cancel, and Delete for a
+    /// saved connection.
+    pub fn button_names(&self) -> Vec<&'static str> {
+        self.buttons()
+    }
+
     /// Checks what was typed; the first problem, in words.
     pub fn check(&self) -> Result<(), String> {
         let v = &self.values;
@@ -1116,11 +1277,25 @@ impl SessionForm {
             v.kind,
             SessionKind::Ssh | SessionKind::Serial | SessionKind::Telnet
         ) {
+            let mut steps = Vec::new();
+            let mut at = Vec::new();
             for (i, step) in v.login_script.iter().enumerate() {
                 if !step.trim().is_empty() {
-                    Step::parse(step).map_err(|e| format!("Login step {}: {e}", i + 1))?;
+                    steps
+                        .push(Step::parse(step).map_err(|e| format!("Login step {}: {e}", i + 1))?);
+                    at.push(i);
                 }
             }
+            if let Some(i) = steps.iter().position(Step::moves) {
+                return Err(format!(
+                    "Login step {}: a login script types into its own pane; pane and tab \
+                     moves are for scripts.",
+                    at.get(i).copied().unwrap_or(0) + 1
+                ));
+            }
+            ferossh_config::login::check_flow(&steps).map_err(|(i, e)| {
+                format!("Login step {}: {e}", at.get(i).copied().unwrap_or(0) + 1)
+            })?;
         }
         port(&v.desktop_port, "The RDP port")?;
         port(&v.vnc_port, "The VNC port")?;
@@ -2356,6 +2531,69 @@ mod tests {
         assert!(settings.profile("old").is_none());
         delete("new", &mut hosts, &mut settings);
         assert!(hosts.is_empty() && settings.favourites.is_empty());
+    }
+
+    /// A choice row's options and selection; none for another row.
+    fn choice(r: &NativeRow) -> (Vec<String>, usize) {
+        match &r.kind {
+            NativeKind::Choice { options, selected } => (options.clone(), *selected),
+            _ => (Vec::new(), usize::MAX),
+        }
+    }
+
+    fn row<'a>(rows: &'a [NativeRow], label: &str) -> &'a NativeRow {
+        rows.iter().find(|r| r.label == label).unwrap()
+    }
+
+    #[test]
+    fn native_rows_cover_every_section_and_follow_the_type() {
+        let mut f = new_form();
+        assert_eq!(
+            f.sections(),
+            vec![(0, "Connection"), (1, "Look"), (2, "Extras")]
+        );
+        let rows = f.native_rows();
+        assert_eq!(row(&rows, "Name").section, 0);
+        assert_eq!(row(&rows, "Theme").section, 1);
+        assert_eq!(row(&rows, "tmux").section, 2);
+        assert!(rows.iter().any(|r| r.kind == NativeKind::Browse));
+        let (options, selected) = choice(row(&rows, "Type"));
+        assert_eq!(options.len(), 7);
+        assert_eq!(options[selected], "SSH terminal");
+        let (options, _) = choice(row(&rows, "Theme"));
+        assert_eq!(options, ["by theme rules", "Nord", "Dracula"]);
+        // An RDP desktop: no Look or Extras, a Via field.
+        let ty = row(&rows, "Type").field.unwrap();
+        f.set_choice(ty, 1);
+        assert_eq!(f.values.kind, SessionKind::Rdp);
+        assert_eq!(f.sections(), vec![(0, "Connection")]);
+        let rows = f.native_rows();
+        assert!(rows.iter().all(|r| r.section == 0));
+        assert!(rows.iter().any(|r| r.label == "Via SSH"));
+        assert!(!rows.iter().any(|r| r.label == "Key file"));
+    }
+
+    #[test]
+    fn native_typing_grows_forwards_and_submit_checks() {
+        let mut f = new_form();
+        let rows = f.native_rows();
+        let fwd = row(&rows, "Forward 1").field.unwrap();
+        f.set_text(fwd, "L 8080 web:80");
+        let rows = f.native_rows();
+        assert!(rows.iter().any(|r| r.label == "Forward 2"));
+        assert_eq!(f.submit(false), None);
+        assert!(f.error().unwrap().contains("name"));
+        let name = row(&rows, "Name").field.unwrap();
+        f.set_text(name, "db1");
+        assert_eq!(f.submit(true), Some(FormAction::Save { connect: true }));
+        assert_eq!(f.error(), None);
+        assert_eq!(f.button_names(), vec!["Save", "Connect", "Cancel"]);
+        // The password source fills in a template's command.
+        let pw = row(&rows, "Password").field.unwrap();
+        f.set_choice(pw, 2);
+        assert_eq!(f.values.password_command, TEMPLATES[0].command);
+        let rows = f.native_rows();
+        assert!(rows.iter().any(|r| r.label == "Command"));
     }
 
     #[test]

@@ -17,6 +17,7 @@ FeroSSH reads `~/.ssh/config` and `~/.ssh/known_hosts` too, and writes only to `
 | --- | --- | --- |
 | `SidePane right` | left | Shows the connection manager and file view on the right. |
 | `TabStrip no` | yes | Hides the tab strip. |
+| `WindowColours dark` | theme | Where the menu bar, menus, title bar, tab strip and tools pane take their colours: `theme` (the focused pane's colour theme), `windows` (Windows' light or dark app mode), `light` (Windows' usual light look) or `dark`. Settings > Window colours. |
 | `CopyOnSelect yes` | no | Copies a selection as soon as you make it, as PuTTY does. |
 | `RightClickPaste yes` | no | Pastes on a right click, as PuTTY does. |
 | `LogTimestamps yes` | no | Puts the time in front of each line of plain session logs (Session > Timestamp each log line). |
@@ -30,6 +31,7 @@ FeroSSH reads `~/.ssh/config` and `~/.ssh/known_hosts` too, and writes only to `
 | Keyword | Default | Meaning |
 | --- | --- | --- |
 | `DownloadFolder "D:\Transfers"` | your Downloads folder | Where downloads go. |
+| `TransferLayout "stacked swapped 40"` | side by side, Local first, half each | How File transfer arranges its lists: `side` or `stacked`, `swapped` for Remote first, and the first list's share in percent. Layout ▾ and dragging the gap set it. |
 | `VerifyTransfers yes` | no | Compares SHA-256 on both ends after each file (the server needs `sha256sum`). |
 | `ParallelTransfers 4` | 3 | Files that move at once, 1 to 8. |
 | `FollowDirectory no` | yes | Whether the file view follows the shell's `cd` (OSC 7). |
@@ -40,13 +42,13 @@ FeroSSH reads `~/.ssh/config` and `~/.ssh/known_hosts` too, and writes only to `
 | `StandbyHidden 263044` | | Written by FeroSSH while the standby hotkey has another program's window hidden, so that the window comes back at the next start if FeroSSH ended first. Leave it alone. |
 | `TmuxKeybindings yes` | no | In panes of a tmux session, the tmux prefix and a window or pane key work the tabs and panes (Session > Use tmux keybindings for tabs and panes). |
 
-## Snippets
+## Scripts
 
 | Keyword | Default | Meaning |
 | --- | --- | --- |
-| `ConfirmProduction no` | yes | Whether a snippet typed into a pane with the Production theme asks first (Session > Confirm snippets on Production hosts). |
-| `AutoResponses no` | yes | Whether snippets with a `When` text answer by themselves (Session > Auto-responses from snippets). |
-| `RunParallel 8` | 4 | How many hosts a multi-host snippet run logs in to at once, 1 to 16. |
+| `ConfirmProduction no` | yes | Whether a script typed into a pane with the Production theme asks first (Session > Confirm scripts on Production hosts). |
+| `AutoResponses no` | yes | Whether scripts with a `When` text answer by themselves (Session > Auto-responses from scripts). |
+| `RunParallel 8` | 4 | How many hosts a multi-host script run logs in to at once, 1 to 16. |
 
 ## Remote apps
 
@@ -104,7 +106,7 @@ Profile web1
 | `DesktopClipboard to-host`, `from-host` or `off` | Narrows the clipboard for this connection's remote and virtual desktops (*Desk clip*); it never widens the global setting. A desktop opened through another connection is held to both connections' limits. |
 | `Type ssh`, `telnet`, `serial`, `rdp`, `vnc`, `xvfb` or `remoteapp` | The kind of connection; `xvfb` is a virtual desktop and `remoteapp` a remote app, both on the `Via` host. |
 | `Serial 115200,8N1,rtscts` | For a serial console: speed, framing (8N1, 8E1, 8O1, 7E1, 7O1, 8N2) and flow control (`none`, `xonxoff`, `rtscts`, `dsrdtr`), in any order. Left out: 9600, 8N1, none. |
-| `LoginScript STEP` | One step of the login script, one line per step: `expect TEXT`, `send TEXT`, `password`, `secret NAME`, `pause SECONDS`. See [Login scripts](everyday-use.md#login-scripts). |
+| `LoginScript STEP` | One step of the login script, one line per step: `expect TEXT`, `send TEXT`, `password`, `secret NAME`, `pause SECONDS`, and the logic steps such as `on TEXT goto LABEL` and `label LABEL`. See [Login scripts](everyday-use.md#login-scripts). |
 | `Via SESSION` | For RDP, VNC, virtual desktops and remote apps: log in to this saved SSH connection first and tunnel the desktop through it. |
 | `PasswordSource windows` | Takes the password from Windows Credential Manager, after the first login that works. |
 | `PasswordCommand ...` | Runs this command (no shell, no window, 60 seconds at most) and uses the first line it prints as the password. `%n` is the connection's name, `%h` the host, `%u` the user, `%p` the port. FeroSSH asks before running a command the first time. |
@@ -127,16 +129,16 @@ Profile core-console
 
 ## Secrets
 
-A login script's `secret NAME` step, or a snippet's `@secret NAME`, types a named secret. Unless a `Secret` block names a command for it, FeroSSH asks for it once and keeps it in Windows Credential Manager as `FeroSSH secret:NAME`. With a block, the command's first line of output is the secret; `%n` is the secret's name. FeroSSH asks before it runs a command the first time.
+A login script's `secret NAME` step, or a script's `@secret NAME`, types a named secret. Unless a `Secret` block names a command for it, FeroSSH asks for it once and keeps it in Windows Credential Manager as `FeroSSH secret:NAME`. With a block, the command's first line of output is the secret; `%n` is the secret's name. FeroSSH asks before it runs a command the first time.
 
 ```
 Secret enable
     PasswordCommand op read "op://Network/%n/password"
 ```
 
-## Snippets
+## Scripts
 
-Command snippets are not kept in `ferossh.conf` but in a file each in `%APPDATA%\FeroSSH\snippets`, in the same syntax, with the folder a file is in as its category (see [The snippets folder](everyday-use.md#the-snippets-folder)). The snippet editor (Tools > Command snippets, then Insert or F2) writes them, but you can also write a `.snippet` file by hand, one snippet per file:
+Scripts are not kept in `ferossh.conf` but in a file each in `%APPDATA%\FeroSSH\scripts`, in the same syntax, with the folder a file is in as its category (see [The scripts folder](everyday-use.md#the-scripts-folder)). The script editor (Tools > Scripts, then Insert or F2) writes them, but you can also write a `.script` file by hand (older `.snippet` files are read too), one script per file:
 
 ```
 Snippet "Back up the config"
@@ -159,9 +161,9 @@ Snippet "Next page"
 
 | Keyword | Meaning |
 | --- | --- |
-| `Snippet NAME` | Starts a snippet. |
-| `Line TEXT` | One line to type, or an `@` step. See [Command snippets](everyday-use.md#command-snippets). |
-| `Hosts PATTERN...` | Keeps the snippet to these hosts. |
+| `Snippet NAME` | Starts a script. |
+| `Line TEXT` | One line to type, or an `@` step. See [Scripts](everyday-use.md#scripts). |
+| `Hosts PATTERN...` | Keeps the script to these hosts. |
 | `Folder NAME` | Keeps it to the hosts in this connection-manager folder. |
 | `Hotkey F1` to `F12` | Runs it with Ctrl+Shift and that key. |
 | `When TEXT` | Makes it an auto-response: it runs whenever the host prints this text. |

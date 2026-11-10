@@ -18,9 +18,8 @@ use std::cell::RefCell;
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
     BeginPaint, COLOR_GRAYTEXT, COLOR_WINDOW, COLOR_WINDOWTEXT, DT_LEFT, DT_NOPREFIX, DT_RIGHT,
-    DT_SINGLELINE, DT_VCENTER, DeleteObject, DrawTextW, EndPaint, FillRect, GetSysColor,
-    GetSysColorBrush, HFONT, HGDIOBJ, PAINTSTRUCT, SelectObject, SetBkMode, SetTextColor,
-    TRANSPARENT,
+    DT_SINGLELINE, DT_VCENTER, DeleteObject, DrawTextW, EndPaint, FillRect, HFONT, HGDIOBJ,
+    PAINTSTRUCT, SelectObject, SetBkMode, SetTextColor, TRANSPARENT,
 };
 use windows::Win32::UI::Controls::{
     EM_SETCUEBANNER, EM_SETSEL, LIST_VIEW_ITEM_STATE_FLAGS, LVCF_TEXT, LVCF_WIDTH, LVCOLUMNW,
@@ -36,19 +35,19 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
     GetFocus, SetFocus, VK_CONTROL, VK_DELETE, VK_DOWN, VK_F2, VK_SHIFT,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    BN_CLICKED, BS_DEFPUSHBUTTON, BS_PUSHBUTTON, CreateWindowExW, DefWindowProcW, EN_CHANGE,
-    EN_SETFOCUS, ES_AUTOHSCROLL, GetClientRect, GetWindowTextLengthW, HMENU, IDC_ARROW, IDCANCEL,
-    IDOK, IsChild, IsDialogMessageW, IsWindowVisible, LoadCursorW, MSG, MoveWindow, PostMessageW,
-    RegisterClassW, SW_HIDE, SW_SHOWNA, SendMessageW, SetWindowTextW, ShowWindow, WINDOW_EX_STYLE,
-    WINDOW_STYLE, WM_APP, WM_CHAR, WM_COMMAND, WM_ERASEBKGND, WM_KEYDOWN, WM_NOTIFY, WM_PAINT,
-    WM_SYSCHAR, WM_SYSKEYDOWN, WM_SYSKEYUP, WNDCLASSW, WS_BORDER, WS_CHILD, WS_CLIPCHILDREN,
-    WS_CLIPSIBLINGS, WS_EX_CONTROLPARENT, WS_TABSTOP, WS_VISIBLE,
+    BN_CLICKED, BS_DEFPUSHBUTTON, BS_PUSHBUTTON, CS_HREDRAW, CS_VREDRAW, CreateWindowExW,
+    EN_CHANGE, EN_SETFOCUS, ES_AUTOHSCROLL, GetClientRect, GetWindowTextLengthW, HMENU, IDC_ARROW,
+    IDCANCEL, IDOK, IsChild, IsDialogMessageW, IsWindowVisible, LoadCursorW, MSG, MoveWindow,
+    PostMessageW, RegisterClassW, SW_HIDE, SW_SHOWNA, SendMessageW, SetWindowTextW, ShowWindow,
+    WINDOW_EX_STYLE, WINDOW_STYLE, WM_APP, WM_CHAR, WM_COMMAND, WM_ERASEBKGND, WM_KEYDOWN,
+    WM_NOTIFY, WM_PAINT, WM_SYSCHAR, WM_SYSKEYDOWN, WM_SYSKEYUP, WNDCLASSW, WS_BORDER, WS_CHILD,
+    WS_CLIPCHILDREN, WS_CLIPSIBLINGS, WS_EX_CONTROLPARENT, WS_TABSTOP, WS_VISIBLE,
 };
 use windows::core::{PCWSTR, PWSTR, w};
 
 use crate::layout::{PaneId, Rect};
 use crate::live::LiveRow;
-use crate::native::{fonts, key_down, scale, search_text, set_font, wide};
+use crate::native::{fonts, key_down, pass_edge, scale, search_text, set_font, wide};
 
 /// What the user did in the panel.
 #[derive(Debug)]
@@ -131,6 +130,9 @@ pub fn create(main: HWND, handler: Handler, dpi: u32) -> windows::core::Result<(
         let instance = windows::Win32::System::LibraryLoader::GetModuleHandleW(None)?;
         let class = w!("FeroSSHSessions");
         let wc = WNDCLASSW {
+            // Redrawn whole when resized: the title row is laid out on
+            // the width.
+            style: CS_HREDRAW | CS_VREDRAW,
             lpfnWndProc: Some(wndproc),
             hInstance: instance.into(),
             hCursor: LoadCursorW(None, IDC_ARROW)?,
@@ -237,6 +239,9 @@ pub fn create(main: HWND, handler: Handler, dpi: u32) -> windows::core::Result<(
                 edited: None,
             });
         });
+    }
+    if let Some(h) = handles() {
+        pass_edge(h.panel);
     }
     Ok(())
 }
@@ -686,6 +691,103 @@ fn notify(h: Handles, lparam: LPARAM) -> LRESULT {
     LRESULT(0)
 }
 
+/// The list's right-click menu (or Shift+F10, the menu key): Show,
+/// Rename and Close for the session under the mouse or selected.
+fn context_menu(h: Handles, lparam: LPARAM) {
+    use windows::Win32::Foundation::POINT;
+    use windows::Win32::Graphics::Gdi::{ClientToScreen, ScreenToClient};
+    use windows::Win32::UI::Controls::{
+        LVHITTESTINFO, LVIR_LABEL, LVM_GETITEMRECT, LVM_SUBITEMHITTEST,
+    };
+    use windows::Win32::UI::WindowsAndMessaging::{
+        AppendMenuW, CreatePopupMenu, DestroyMenu, MF_SEPARATOR, MF_STRING, TPM_NONOTIFY,
+        TPM_RETURNCMD, TrackPopupMenu,
+    };
+    const SHOW: u32 = 1;
+    const RENAME: u32 = 2;
+    const CLOSE: u32 = 3;
+    // SAFETY: our own control and a popup menu of our own, destroyed after
+    // use; each struct lives through its call.
+    unsafe {
+        let keyboard = lparam.0 as i32 == -1;
+        let mut at;
+        let index = if keyboard {
+            let i = selected_index(h.list);
+            let mut rc = RECT {
+                left: LVIR_LABEL as i32,
+                ..Default::default()
+            };
+            at = POINT::default();
+            // Below the row's name; at the list's corner if that fails.
+            if let Some(i) = i
+                && SendMessageW(
+                    h.list,
+                    LVM_GETITEMRECT,
+                    Some(WPARAM(i as usize)),
+                    Some(LPARAM(&raw mut rc as isize)),
+                )
+                .0 != 0
+            {
+                at = POINT {
+                    x: rc.left,
+                    y: rc.bottom,
+                };
+            }
+            let _ = ClientToScreen(h.list, &mut at);
+            i
+        } else {
+            at = POINT {
+                x: i32::from(lparam.0 as u16 as i16),
+                y: i32::from((lparam.0 >> 16) as u16 as i16),
+            };
+            let mut hit = LVHITTESTINFO {
+                pt: at,
+                ..Default::default()
+            };
+            let _ = ScreenToClient(h.list, &mut hit.pt);
+            let i = SendMessageW(
+                h.list,
+                LVM_SUBITEMHITTEST,
+                Some(WPARAM(0)),
+                Some(LPARAM(&raw mut hit as isize)),
+            )
+            .0 as i32;
+            (i >= 0).then_some(i)
+        };
+        // Only on a session; empty space has no menu.
+        let Some(index) = index else {
+            return;
+        };
+        let Some(pane) = pane_at(h.list, index) else {
+            return;
+        };
+        set_state(h.list, index, true);
+        let Ok(menu) = CreatePopupMenu() else {
+            return;
+        };
+        let _ = AppendMenuW(menu, MF_STRING, SHOW as usize, w!("&Show\tEnter"));
+        let _ = AppendMenuW(menu, MF_STRING, RENAME as usize, w!("&Rename\tF2"));
+        let _ = AppendMenuW(menu, MF_SEPARATOR, 0, None);
+        let _ = AppendMenuW(menu, MF_STRING, CLOSE as usize, w!("&Close...\tDel"));
+        let chosen = TrackPopupMenu(
+            menu,
+            TPM_RETURNCMD | TPM_NONOTIFY,
+            at.x,
+            at.y,
+            None,
+            h.panel,
+            None,
+        );
+        let _ = DestroyMenu(menu);
+        match u32::try_from(chosen.0).unwrap_or(0) {
+            SHOW => emit(Event::Show(pane)),
+            RENAME => edit_name(pane),
+            CLOSE => emit(Event::Close(pane)),
+            _ => {}
+        }
+    }
+}
+
 fn paint(h: Handles) {
     let Some((title_font, dpi, total)) = STATE.with(|s| {
         s.try_borrow()
@@ -702,7 +804,7 @@ fn paint(h: Handles) {
         let dc = BeginPaint(h.panel, &mut ps);
         let mut rc = RECT::default();
         let _ = GetClientRect(h.panel, &mut rc);
-        FillRect(dc, &rc, GetSysColorBrush(COLOR_WINDOW));
+        FillRect(dc, &rc, crate::ui_theme::sys_brush(COLOR_WINDOW));
         let old = SelectObject(dc, HGDIOBJ(title_font.0));
         SetBkMode(dc, TRANSPARENT);
         let pad = scale(10, dpi);
@@ -714,7 +816,7 @@ fn paint(h: Handles) {
         };
         SetTextColor(
             dc,
-            windows::Win32::Foundation::COLORREF(GetSysColor(COLOR_WINDOWTEXT)),
+            windows::Win32::Foundation::COLORREF(crate::ui_theme::sys_color(COLOR_WINDOWTEXT)),
         );
         let mut text: Vec<u16> = "Sessions".encode_utf16().collect();
         DrawTextW(
@@ -726,7 +828,7 @@ fn paint(h: Handles) {
         if total > 0 {
             SetTextColor(
                 dc,
-                windows::Win32::Foundation::COLORREF(GetSysColor(COLOR_GRAYTEXT)),
+                windows::Win32::Foundation::COLORREF(crate::ui_theme::sys_color(COLOR_GRAYTEXT)),
             );
             let mut count: Vec<u16> = total.to_string().encode_utf16().collect();
             DrawTextW(
@@ -754,6 +856,12 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
             LRESULT(0)
         }
         (WM_NOTIFY, Some(h)) => notify(h, lparam),
+        (windows::Win32::UI::WindowsAndMessaging::WM_CONTEXTMENU, Some(h))
+            if HWND(wparam.0 as *mut _) == h.list =>
+        {
+            context_menu(h, lparam);
+            LRESULT(0)
+        }
         (WM_EDITED, Some(_)) => {
             let edited = STATE.with(|s| {
                 s.try_borrow_mut()
@@ -768,6 +876,6 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
             LRESULT(0)
         }
         // SAFETY: default handling for everything else.
-        _ => unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) },
+        _ => crate::ui_theme::def_window_proc(hwnd, msg, wparam, lparam),
     }
 }

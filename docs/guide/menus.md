@@ -17,7 +17,7 @@ Items with a check mark are switches: picking them turns the setting on or off, 
 | Open download folder | | Opens the folder downloads go to in Explorer. |
 | Open local shell | | Opens a Windows command prompt (`%COMSPEC%`, usually `cmd.exe`) in a new tab. To start another program, use `ferossh.exe --local wsl -d Ubuntu` and the like. |
 | Import connections... | | Brings saved sessions over from PuTTY, KiTTY, WinSCP, MobaXterm, mRemoteNG and SecureCRT (see [Imports](everyday-use.md#importing-from-other-clients)). |
-| Import snippets... | | Brings command snippets over from Windows Terminal (`sendInput` actions and `.wt.json` snippets), SecureCRT button bars and MobaXterm macros, or makes one from a text file (see [Importing snippets](everyday-use.md#importing-snippets)). |
+| Import scripts... | | Brings scripts over from Windows Terminal (`sendInput` actions and `.wt.json` scripts), SecureCRT button bars and MobaXterm macros, or makes one from a text file (see [Importing scripts](everyday-use.md#importing-scripts)). |
 | Exit | Alt+F4 | Closes FeroSSH. tmux sessions keep running on their servers. |
 
 ## Edit
@@ -28,8 +28,8 @@ Items with a check mark are switches: picking them turns the setting on or off, 
 | Paste | Ctrl+Shift+V (or Shift+Insert) | Pastes. Control characters other than Tab are removed, and a paste with line breaks asks first unless the program has bracketed paste on. |
 | Find in scrollback | Ctrl+Shift+F | Opens the search bar. Enter finds the older match, Shift+Enter the newer one, Esc closes. |
 | Clear scrollback | | Forgets the pane's scrollback. The screen stays. |
-| Save selection as snippet... | | Opens the snippet editor with the selected text as the snippet's lines. |
-| Record keystrokes as snippet | ✓ while recording | Records what you type in the focused pane until you pick it again, then opens the result in the snippet editor (see [Recording](everyday-use.md#recording-a-snippet)). |
+| Save selection as script... | | Opens the script editor with the selected text as the script's lines. |
+| Record keystrokes as script | ✓ while recording | Records what you type in the focused pane until you pick it again, then opens the result in the script editor (see [Recording](everyday-use.md#recording-a-script)). |
 | Copy on select | ✓ off | Copies a selection as soon as you make it, as PuTTY does. `CopyOnSelect`. |
 | Right-click pastes | ✓ off | A right click pastes, as in PuTTY. `RightClickPaste`. |
 
@@ -47,6 +47,7 @@ Items with a check mark are switches: picking them turns the setting on or off, 
 | Reset text size | Ctrl+0 | Back to the pane's normal size. |
 | Font (this pane) | | Eighteen monospace fonts for the focused pane. The five that come with Windows are listed first. A free font that is not installed reads "(download)" and opens its official download page; FeroSSH picks it up after a restart. |
 | Theme (this pane) | | The colour theme for the focused pane, in three columns: Nord and 24 other dark themes, 11 light themes, then the Production and Staging warning themes over the classics (Campbell, One Half Dark and Light, Tango Dark and Light from Windows Terminal, and PuTTY's colours). The list is in [Everyday use](everyday-use.md). |
+| Window colours (menus, tools) | | Where the menu bar and menus, the title bar, the tab strip, the tools rail and the tools pane take their colours. **Follow the terminal theme** (the default): the focused pane's theme, so a dark theme gives a dark window and Production a red one. **Follow Windows**: Windows' light or dark app mode. **Light**: Windows' usual light look. **Dark**: a neutral dark grey. `WindowColours`. |
 | Show test pattern | | Prints colours, text styles, box drawing, wide and combining characters in the pane, to check a font. |
 | Hide menu bar (Alt shows it) | Ctrl+Shift+M | Hides the menu bar. Pressing Alt shows it again. |
 
@@ -60,9 +61,9 @@ Font, theme and text size apply to the focused pane only. Session > Save font an
 | Session manager | Ctrl+Shift+L | Shows the sessions open right now, in every tab (see [The session manager](everyday-use.md#the-session-manager)). |
 | File transfer | Ctrl+Shift+E | Shows the focused pane's host over SFTP in the side pane (see [File transfer](everyday-use.md#file-transfer)). |
 | Port forwards | Ctrl+Shift+P | Lists, adds, changes and stops port forwards on live connections (see [Port forwards](everyday-use.md#port-forwards)). |
-| Command snippets | Ctrl+Shift+Space | Lists your snippets by category, to type one into the pane or edit them (see [Snippets](everyday-use.md#command-snippets)). |
-| Open snippets folder | | Opens `%APPDATA%\FeroSSH\snippets` in Explorer: one file per snippet, a folder per category, to copy to another PC or back up (see [The snippets folder](everyday-use.md#the-snippets-folder)). |
-| Command palette | Ctrl+Shift+A | One search box over every menu item, connection and snippet (see [Command palette](everyday-use.md#the-command-palette)). |
+| Scripts | Ctrl+Shift+Space | Lists your scripts by category, to type one into the pane or edit them (see [Scripts](everyday-use.md#scripts)). |
+| Open scripts folder | | Opens `%APPDATA%\FeroSSH\scripts` in Explorer: one file per script, a folder per category, to copy to another PC or back up (see [The scripts folder](everyday-use.md#the-scripts-folder)). |
+| Command palette | Ctrl+Shift+A | One search box over every menu item, connection and script (see [Command palette](everyday-use.md#the-command-palette)). |
 
 ## Window
 
@@ -113,8 +114,8 @@ Font, theme and text size apply to the focused pane only. Session > Save font an
 | Use tmux keybindings for tabs and panes | ✓ on: in a pane of a tmux session, your tmux prefix then `c`, `%`, `"`, `n`, `p`, an arrow and the other window and pane keys work the tabs and panes; the prefix then `?` lists them (see [tmux](everyday-use.md#tmux)). Off by default. |
 | Send break (serial) | Holds a serial line in break for 300 ms (Cisco ROM monitor, Linux SysRq). |
 | Run login script again | Runs the connection's login script from the start. |
-| Auto-responses from snippets | ✓ on: snippets with a *When* text answer by themselves. Off turns all of them off. `AutoResponses`. |
-| Confirm snippets on Production hosts | ✓ on: a snippet about to be typed into a pane with the Production theme asks first. `ConfirmProduction`. |
+| Auto-responses from scripts | ✓ on: scripts with a *When* text answer by themselves. Off turns all of them off. `AutoResponses`. |
+| Confirm scripts on Production hosts | ✓ on: a script about to be typed into a pane with the Production theme asks first. `ConfirmProduction`. |
 | Open remote desktop | Ctrl+Shift+D. Tunnels the host's RDP port through SSH and opens Windows' Remote Desktop Connection on it (see [Remote desktops](everyday-use.md#remote-desktops)). |
 | Open remote desktop in a tab (RDP) | Only in `ferossh-desktop.exe`: the desktop in a FeroSSH tab. |
 | Open remote desktop in a tab (VNC) | Only in `ferossh-desktop.exe`: a VNC desktop in a FeroSSH tab. |
@@ -163,15 +164,18 @@ The side pane shows one view at a time. Esc goes back to the terminal; the short
 
 ### Connection form
 
+The form has a tab for each section: Connection, Look and Extras (a desktop or remote app connection has only Connection).
+
 | Key | Action |
 | --- | --- |
-| Tab, Up, Down | Moves between fields. |
-| Left / Right | Picks the next choice in a choice field (type, password source, theme...), or opens and closes a section. |
-| Enter | Saves. On a section heading (Look, Extras), opens or closes it. |
+| Tab, Shift+Tab | Moves between fields and buttons. |
+| Ctrl+Tab, Ctrl+PageDown / Ctrl+PageUp | Goes to the next or previous section tab. |
+| Up / Down, Alt+Down | Picks another choice in a drop-down field (type, password source, theme...), or opens its list. |
+| Enter | Saves. |
 | Shift+Enter | Saves and connects. |
 | Esc | Cancels. |
 
-The buttons at the bottom do the same, and a saved connection has a Delete button that asks first.
+The buttons at the bottom do the same, and a saved connection has a Delete button that asks first. A problem with what was typed shows in red above the buttons.
 
 ### Session manager (Ctrl+Shift+L)
 
@@ -180,38 +184,32 @@ The buttons at the bottom do the same, and a saved connection has a Delete butto
 | Typing | Goes to the search box and filters by host, name, title or kind (SSH, Telnet, serial, tmux, desktop, local). |
 | Down (in the search box) | Moves into the list. |
 | Tab | Moves between the search box, the list and the buttons. |
-| Enter or double-click | Goes to the session's tab and pane (from the search box, the first one listed). A hidden snippet-run session, or the login of a desktop or remote app connection, is shown in a tab. |
+| Enter or double-click | Goes to the session's tab and pane (from the search box, the first one listed). A hidden script-run session, or the login of a desktop or remote app connection, is shown in a tab. |
 | F2 | Renames the session in place: Enter keeps the name, Esc drops it, an empty name clears it. |
 | Del | Closes the session, after asking when it is live. |
 | Esc | Clears the search, then leaves. |
 
-The Show, Rename and Close buttons below the list do the same.
+The Show, Rename and Close buttons below the list, and the right-click menu on a session (or Shift+F10 with the list focused, for example after Down from the search box), do the same.
 
 ### File transfer (Ctrl+Shift+E)
 
-In the remote listing:
+In the Local and Remote lists:
 
 | Key | Action |
 | --- | --- |
-| Enter or Right | Opens a folder or downloads a file. |
-| Left or Backspace | Goes to the parent folder. |
-| D | Downloads the selection (folders whole). |
-| U | Uploads files into the listed folder. |
-| Del | Deletes on the server, after asking. |
-| ~ or H | Goes to your home folder. |
-| F5 | Refreshes. |
-| F | Turns following the shell's `cd` off or on. |
-| O | Opens the download folder in Explorer. |
-| B | Picks another local folder for downloads. |
-| / | Searches the listing by name (see below). |
-| Escape | Clears the search; with none, gives the keyboard back to the terminal. |
-| Tab | Moves to the Local PC section. |
+| Enter or double-click | Opens a folder, or sends a file to the other list's folder. |
+| Ctrl+Enter | Sends the selection across: uploads from Local, downloads from Remote (folders whole). |
+| Backspace | Goes to the parent folder. |
+| Ctrl+A | Selects everything in the list. |
+| Del | Deletes the Remote selection on the server, after asking. |
+| F5 | Refreshes the list. |
+| Shift+F10 or right-click | The list's menu. |
+| Tab | Moves between the filter, the lists, their buttons and the queue. |
+| Escape | Clears the filter; with none, gives the keyboard back to the terminal. |
 
-While typing a search, letters go into it and the listing shows only the names that contain them, in any case; with `*` or `?` the whole name must match the pattern (`*.log`). Up and Down still move the selection, Enter stops typing and keeps the search, Backspace deletes a letter and Escape clears it. Opening another folder ends the search.
+In a path box, Enter goes to the folder typed. In the queue, Del cancels a transfer and the right-click menu pauses, resumes, retries and clears the finished ones. When a file already exists, Overwrite, Skip and Keep both answer above the queue; For all answers the same for the rest.
 
-In the Local PC section, Enter opens a folder or uploads a file, Left or Backspace goes up (above a drive comes the list of drives), U uploads the selected file or folder, / searches it by name as above, B picks another folder and F5 refreshes. Tab moves on to the transfer queue, where Space or P pauses and resumes, R retries a failed or cancelled transfer, X cancels and C clears the finished ones. When a file already exists, O overwrites, S skips and K keeps both (Shift for all).
-
-Drag the title bar of the Local PC section or of the transfer queue up or down to give that section more or fewer rows. The heights stay for every host until FeroSSH closes.
+The arrow buttons between the lists move the selection across, and the gap between them drags to share the room differently. Layout ▾ arranges the lists side by side or stacked, swaps them, and has Choose local folder, Upload files and Open local folder in Explorer.
 
 ### Port forwards (Ctrl+Shift+P)
 
@@ -223,27 +221,27 @@ Drag the title bar of the Local PC section or of the transfer queue up or down t
 | Del | Stops the selected forward. |
 | Esc | Clears the add line, then leaves. |
 
-### Command snippets (Ctrl+Shift+Space)
+### Scripts (Ctrl+Shift+Space)
 
 | Key | Action |
 | --- | --- |
 | Typing | Searches names, categories and lines. |
-| Enter | Types the snippet, with Enter after each line. |
+| Enter | Types the script, with Enter after each line. |
 | Shift+Enter | Types it but leaves the last line for you to finish. |
 | Left / Right | Jumps to the previous or next category. |
-| Insert | New snippet (the search text becomes its name; it goes in the selected snippet's category). |
-| F2 | Edits the snippet. |
+| Insert | New script (the search text becomes its name; it goes in the selected script's category). |
+| F2 | Edits the script. |
 | Del | Deletes it, after asking. |
 | F5 | Runs it on several saved hosts (see [Runs on many hosts](everyday-use.md#runs-on-many-hosts)). |
-| Ctrl+Shift+F1 to F12 | From anywhere: runs the snippet with that hotkey for the focused pane's host. |
+| Ctrl+Shift+F1 to F12 | From anywhere: runs the script with that hotkey for the focused pane's host. |
 
-In the snippet editor, Enter ends a line, which is typed with Enter after it; Shift+Enter ends a line that is typed without Enter (it becomes an `@type` line, shown as *no Enter*).
+In the script editor, Enter ends a line, which is typed with Enter after it; Shift+Enter ends a line that is typed without Enter (it becomes an `@type` line, shown as *no Enter*).
 
 In a run's report, Enter shows that host's pane, C copies the report as a table, S saves it as CSV in the download folder, R runs the failed hosts again and Esc stops the run (or closes the report when it is over).
 
 ### Command palette (Ctrl+Shift+A)
 
-Type a few letters in any order. Up and Down select, Enter runs the action, connects or types the snippet, Shift+Enter connects in a split or types a snippet without its last Enter, Esc closes.
+Type a few letters in any order. Up and Down select, Enter runs the action, connects or types the script, Shift+Enter connects in a split or types a script without its last Enter, Esc closes.
 
 ### Import connections
 

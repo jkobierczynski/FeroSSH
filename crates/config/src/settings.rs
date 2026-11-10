@@ -363,6 +363,41 @@ impl Profile {
     }
 }
 
+/// Where the window's own colours (menu bar, menus, title bar, tab strip
+/// and tools pane) come from: Settings > Window colours.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum WindowColours {
+    /// The focused pane's colour theme, dark or light as the theme is.
+    #[default]
+    Theme,
+    /// Windows' own light or dark app mode.
+    System,
+    /// Windows' light look, as before window colours existed.
+    Light,
+    /// A neutral dark grey.
+    Dark,
+}
+
+impl WindowColours {
+    pub const ALL: [Self; 4] = [Self::Theme, Self::System, Self::Light, Self::Dark];
+
+    /// The word in the settings file.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Theme => "theme",
+            Self::System => "windows",
+            Self::Light => "light",
+            Self::Dark => "dark",
+        }
+    }
+
+    pub fn parse(word: &str) -> Option<Self> {
+        Self::ALL
+            .into_iter()
+            .find(|c| c.name().eq_ignore_ascii_case(word))
+    }
+}
+
 /// Everything in the settings file.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Settings {
@@ -377,6 +412,9 @@ pub struct Settings {
     /// Keep an opened tool open; off, the terminal covers it again once
     /// the terminal is used (a peek).
     pub tools_pinned: bool,
+    /// Where the window's own colours come from: its menu bar and menus,
+    /// title bar, tab strip, tools rail and tools pane.
+    pub window_colours: WindowColours,
     /// Show the tab strip when there are two or more tabs.
     pub tab_strip: bool,
     pub copy_on_select: bool,
@@ -399,6 +437,10 @@ pub struct Settings {
     pub zmodem: bool,
     /// The file view follows the shell's working directory (OSC 7).
     pub follow_directory: bool,
+    /// How the file transfer pane arranges its Local and Remote lists,
+    /// such as `side 50` or `stacked swapped 40`; side by side, Local
+    /// first, when unset.
+    pub transfer_layout: Option<String>,
     /// The X server forwarded X11 goes to (`DISPLAY` syntax); the `DISPLAY`
     /// environment variable, or `localhost:0`, when unset.
     pub x11_display: Option<String>,
@@ -485,6 +527,7 @@ impl Default for Settings {
             side_pane_right: false,
             tools_rail: true,
             tools_pinned: true,
+            window_colours: WindowColours::default(),
             tab_strip: true,
             copy_on_select: false,
             right_click_paste: false,
@@ -496,6 +539,7 @@ impl Default for Settings {
             parallel_transfers: None,
             zmodem: false,
             follow_directory: true,
+            transfer_layout: None,
             x11_display: None,
             update_check_weekly: false,
             secrets: Vec::new(),
@@ -692,6 +736,13 @@ impl Settings {
                     block = Block::Top;
                     s.tools_pinned = yes(&args).unwrap_or(true);
                 }
+                "windowcolours" => {
+                    block = Block::Top;
+                    s.window_colours = first
+                        .as_deref()
+                        .and_then(WindowColours::parse)
+                        .unwrap_or_default();
+                }
                 "tabstrip" => {
                     block = Block::Top;
                     s.tab_strip = yes(&args).unwrap_or(true);
@@ -725,6 +776,10 @@ impl Settings {
                 "zmodem" => {
                     block = Block::Top;
                     s.zmodem = yes(&args).unwrap_or(false);
+                }
+                "transferlayout" => {
+                    block = Block::Top;
+                    s.transfer_layout = Some(joined).filter(|f| !f.is_empty());
                 }
                 "followdirectory" => {
                     block = Block::Top;
@@ -1011,6 +1066,7 @@ impl Settings {
         );
         let _ = writeln!(out, "ToolsRail {}", flag(self.tools_rail));
         let _ = writeln!(out, "ToolsPinned {}", flag(self.tools_pinned));
+        let _ = writeln!(out, "WindowColours {}", self.window_colours.name());
         let _ = writeln!(out, "TabStrip {}", flag(self.tab_strip));
         let _ = writeln!(out, "CopyOnSelect {}", flag(self.copy_on_select));
         let _ = writeln!(out, "RightClickPaste {}", flag(self.right_click_paste));
@@ -1069,6 +1125,9 @@ impl Settings {
             flag(self.desktop_share_selection)
         );
         let _ = writeln!(out, "FollowDirectory {}", flag(self.follow_directory));
+        if let Some(l) = &self.transfer_layout {
+            let _ = writeln!(out, "TransferLayout {}", arg(l));
+        }
         let _ = writeln!(out, "ConfirmProduction {}", flag(self.confirm_production));
         let _ = writeln!(out, "AutoResponses {}", flag(self.auto_responses));
         let _ = writeln!(out, "TmuxKeybindings {}", flag(self.tmux_keys));
@@ -1269,6 +1328,7 @@ ZModem yes
 AutoReconnect no
 ParallelTransfers 20
 FollowDirectory no
+TransferLayout stacked swapped 40
 X11Display 192.168.1.5:0.0
 Favourite web "db one"
 Favorite WEB
@@ -1398,6 +1458,7 @@ NewKeyword later
         assert!(Settings::default().auto_reconnect, "on unless turned off");
         assert_eq!(s.parallel_transfers, Some(8));
         assert!(!s.follow_directory);
+        assert_eq!(s.transfer_layout.as_deref(), Some("stacked swapped 40"));
         assert_eq!(s.x11_display.as_deref(), Some("192.168.1.5:0.0"));
         let big = s.profile("big").unwrap();
         assert_eq!(big.font_size, None);
@@ -1619,6 +1680,31 @@ DesktopShareSelection yes
         let s = Settings::parse("ToolsRail no\nToolsPinned no\n");
         assert!(!s.tools_rail && !s.tools_pinned);
         assert_eq!(Settings::parse(&s.to_text()), s);
+    }
+
+    #[test]
+    fn window_colours_follow_the_theme_unless_set() {
+        assert_eq!(Settings::default().window_colours, WindowColours::Theme);
+        assert_eq!(
+            Settings::parse("SidePane left\n").window_colours,
+            WindowColours::Theme
+        );
+        for c in WindowColours::ALL {
+            let s = Settings {
+                window_colours: c,
+                ..Settings::default()
+            };
+            assert_eq!(Settings::parse(&s.to_text()), s);
+        }
+        // An unknown word (a newer FeroSSH's) falls back to the default.
+        assert_eq!(
+            Settings::parse("WindowColours purple\n").window_colours,
+            WindowColours::Theme
+        );
+        assert_eq!(
+            Settings::parse("WindowColours Dark\n").window_colours,
+            WindowColours::Dark
+        );
     }
 
     #[test]
