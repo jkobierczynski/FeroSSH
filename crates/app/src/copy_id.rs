@@ -18,13 +18,16 @@ pub fn command() -> Vec<u8> {
         "IFS= read -r k || [ -n \"$k\" ] || exit 3; ",
         "mkdir -p \"$d\" || exit 4; ",
         "[ -f \"$f\" ] || : >> \"$f\" || exit 5; ",
-        // The type and the key itself, as two whole fields anywhere on a
-        // line that is not a comment: options before them and a comment
-        // after them do not matter. `\$` keeps sh from expanding awk's.
+        // The type and the key itself, as the entry's key fields: the
+        // first two, or the two after the options (one field unless a
+        // quoted value holds spaces). A comment never counts, nor does a
+        // comment line. `\$` keeps sh from expanding awk's fields.
         "t=${k%% *}; r=${k#* }; y=${r%% *}; ",
-        "if awk -v t=\"$t\" -v y=\"$y\" ",
-        "\"BEGIN { r = 1 } /^[ \t]*#/ { next } ",
-        "{ for (i = 1; i < NF; i++) if (\\$i == t && \\$(i + 1) == y) r = 0 } END { exit r }\" ",
+        "if awk -v t=\"$t\" -v y=\"$y\" -v d=\\\" ",
+        "\"BEGIN { r = 1 } /^[ \t]*#/ { next } { k = 1; ",
+        "if (\\$1 ~ /^(ssh-|ecdsa-|sk-)/) k = 1; else { q = 0; k = 0; ",
+        "for (i = 1; i <= NF; i++) { q = (q + gsub(d, d, \\$i)) % 2; if (q == 0) { k = i + 1; break } } } ",
+        "if (k > 0 && \\$k == t && \\$(k + 1) == y) r = 0 } END { exit r }\" ",
         "\"$f\"; then echo FEROSSH-KEY-PRESENT; exit 0; fi; ",
         // A last line without its newline would run into the new one.
         "if [ -s \"$f\" ] && [ -n \"$(tail -c 1 \"$f\")\" ]; then echo >> \"$f\" || exit 5; fi; ",
@@ -150,6 +153,9 @@ mod tests {
         assert_eq!(run(&home, c), Outcome::Present);
         std::fs::write(&file, format!("{text}no-pty,command=\"a b\" {c}\n")).unwrap();
         assert_eq!(run(&home, c), Outcome::Present);
+        // Another key whose comment holds this one is not this one.
+        std::fs::write(&file, format!("{text}{a} note {c}\n")).unwrap();
+        assert_eq!(run(&home, c), Outcome::Added);
         std::fs::write(&file, &text).unwrap();
         // A last line without its newline.
         let text = std::fs::read_to_string(&file).unwrap();
