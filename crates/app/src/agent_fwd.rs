@@ -486,12 +486,11 @@ mod tests {
         let out = sign(&mut f, 9, login("git"));
         assert!(matches!(&out[..], [Out::Ask]));
         let q = f.question().unwrap();
-        assert!(
-            q.contains("me@build asks to use your ED25519 key SHA256:"),
-            "{q}"
-        );
-        assert!(q.contains("log in as \"git\""), "{q}");
-        assert!(q.contains("ssh-agent, \"laptop\""), "{q}");
+        // No message with the question in it: CodeQL counts a key
+        // fingerprint in a panic message as logging sensitive data.
+        assert!(q.contains("me@build asks to use your ED25519 key SHA256:"));
+        assert!(q.contains("log in as \"git\""));
+        assert!(q.contains("ssh-agent, \"laptop\""));
         // A second one waits for the first.
         assert!(sign(&mut f, 10, login("deploy")).is_empty());
         let out = f.answer(Answer::Allow);
