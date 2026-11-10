@@ -94,8 +94,8 @@ pub fn make(
     )
     .map_err(|e| explain(key, e))?;
     make_dir(&key.path)?;
-    write_new(&key.path, enrolled.private.as_bytes())?;
-    if let Err(e) = write_new(&public_path, enrolled.public.as_bytes()) {
+    write_new(&key.path, enrolled.private.as_bytes(), true)?;
+    if let Err(e) = write_new(&public_path, enrolled.public.as_bytes(), false) {
         let _ = std::fs::remove_file(&key.path);
         return Err(e);
     }
@@ -113,15 +113,88 @@ fn make_dir(path: &Path) -> Result<(), String> {
 }
 
 /// Writes a new file, never over an old one.
-fn write_new(p: &Path, text: &[u8]) -> Result<(), String> {
+/// A `private` one only its owner (and SYSTEM and Administrators, as
+/// `ssh-keygen` on Windows leaves it) can read, from the start, whatever
+/// the folder lets others do: OpenSSH refuses a key others can read.
+fn write_new(p: &Path, text: &[u8], private: bool) -> Result<(), String> {
     use std::io::Write;
-    let mut f = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(p)
-        .map_err(|e| format!("cannot write {}: {e}", p.display()))?;
+    let mut f = match private {
+        true => create_private(p),
+        false => std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(p),
+    }
+    .map_err(|e| format!("cannot write {}: {e}", p.display()))?;
     f.write_all(text)
         .map_err(|e| format!("cannot write {}: {e}", p.display()))
+}
+
+#[cfg(windows)]
+#[allow(unsafe_code)]
+fn create_private(p: &Path) -> std::io::Result<std::fs::File> {
+    use std::os::windows::ffi::OsStrExt;
+    use std::os::windows::io::FromRawHandle;
+    use windows::Win32::Foundation::{HLOCAL, LocalFree};
+    use windows::Win32::Security::Authorization::{
+        ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
+    };
+    use windows::Win32::Security::{PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES};
+    use windows::Win32::Storage::FileSystem::{
+        CREATE_NEW, CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_GENERIC_READ, FILE_GENERIC_WRITE,
+        FILE_SHARE_NONE,
+    };
+    use windows::core::{PCWSTR, w};
+    // Protected (no inherited entries): full access for the file's owner,
+    // SYSTEM and Administrators only.
+    let mut sd = PSECURITY_DESCRIPTOR::default();
+    // SAFETY: a constant SDDL string; `sd` is freed below.
+    unsafe {
+        ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            w!("D:P(A;;FA;;;OW)(A;;FA;;;SY)(A;;FA;;;BA)"),
+            SDDL_REVISION_1,
+            &mut sd,
+            None,
+        )
+    }
+    .map_err(std::io::Error::other)?;
+    let sa = SECURITY_ATTRIBUTES {
+        nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
+        lpSecurityDescriptor: sd.0,
+        bInheritHandle: false.into(),
+    };
+    let name: Vec<u16> = p.as_os_str().encode_wide().chain(Some(0)).collect();
+    // SAFETY: a valid NUL-terminated path and security attributes that
+    // live through the call; the handle is handed to a File that owns it.
+    let made = unsafe {
+        CreateFileW(
+            PCWSTR(name.as_ptr()),
+            (FILE_GENERIC_READ | FILE_GENERIC_WRITE).0,
+            FILE_SHARE_NONE,
+            Some(&sa),
+            CREATE_NEW,
+            FILE_ATTRIBUTE_NORMAL,
+            None,
+        )
+    };
+    // SAFETY: allocated by the conversion above, used no more.
+    unsafe {
+        let _ = LocalFree(Some(HLOCAL(sd.0)));
+    }
+    let handle = made.map_err(|e| std::io::Error::from_raw_os_error(e.code().0 & 0xFFFF))?;
+    // SAFETY: a fresh handle of ours, owned by the File from here on.
+    Ok(unsafe { std::fs::File::from_raw_handle(handle.0) })
+}
+
+#[cfg(not(windows))]
+fn create_private(p: &Path) -> std::io::Result<std::fs::File> {
+    #[cfg(unix)]
+    use std::os::unix::fs::OpenOptionsExt;
+    let mut o = std::fs::OpenOptions::new();
+    o.write(true).create_new(true);
+    #[cfg(unix)]
+    o.mode(0o600);
+    o.open(p)
 }
 
 /// Makes an Ed25519 key, as `ssh-keygen -t ed25519` does, at `path`
@@ -136,8 +209,8 @@ pub fn make_ed25519(path: &Path, comment: &str, passphrase: &str) -> Result<Stri
     }
     make_dir(path)?;
     let pair = ferossh_auth::keygen::ed25519(comment, passphrase)?;
-    write_new(path, pair.private.as_bytes())?;
-    if let Err(e) = write_new(&public_path, pair.public.as_bytes()) {
+    write_new(path, pair.private.as_bytes(), true)?;
+    if let Err(e) = write_new(&public_path, pair.public.as_bytes(), false) {
         // Half a key pair is no use: take the private half away again.
         let _ = std::fs::remove_file(path);
         return Err(e);
@@ -334,6 +407,12 @@ mod tests {
         assert_eq!(path, ssh.join("id_ed25519"));
         let line = make_ed25519(&path, "me@pc", "pw").unwrap();
         assert!(line.starts_with("ssh-ed25519 ") && line.ends_with(" me@pc"));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o600);
+        }
         let kf = KeyFile::load(&path).unwrap();
         assert!(kf.is_encrypted());
         kf.sign(Some("pw"), b"data").unwrap();

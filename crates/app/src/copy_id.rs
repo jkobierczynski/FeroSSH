@@ -18,9 +18,14 @@ pub fn command() -> Vec<u8> {
         "IFS= read -r k || [ -n \"$k\" ] || exit 3; ",
         "mkdir -p \"$d\" || exit 4; ",
         "[ -f \"$f\" ] || : >> \"$f\" || exit 5; ",
-        // The type and the key itself: a comment or options do not matter.
-        "b=$(printf \"%s\\n\" \"$k\" | cut -d \" \" -f 1,2); ",
-        "if grep -qF -- \"$b\" \"$f\"; then echo FEROSSH-KEY-PRESENT; exit 0; fi; ",
+        // The type and the key itself, as two whole fields anywhere on a
+        // line that is not a comment: options before them and a comment
+        // after them do not matter. `\$` keeps sh from expanding awk's.
+        "t=${k%% *}; r=${k#* }; y=${r%% *}; ",
+        "if awk -v t=\"$t\" -v y=\"$y\" ",
+        "\"BEGIN { r = 1 } /^[ \t]*#/ { next } ",
+        "{ for (i = 1; i < NF; i++) if (\\$i == t && \\$(i + 1) == y) r = 0 } END { exit r }\" ",
+        "\"$f\"; then echo FEROSSH-KEY-PRESENT; exit 0; fi; ",
         // A last line without its newline would run into the new one.
         "if [ -s \"$f\" ] && [ -n \"$(tail -c 1 \"$f\")\" ]; then echo >> \"$f\" || exit 5; fi; ",
         "printf \"%s\\n\" \"$k\" >> \"$f\" || exit 5; ",
@@ -134,6 +139,18 @@ mod tests {
         assert_eq!(mode(&file), 0o600);
         // The same key with another comment is there already.
         assert_eq!(run(&home, &a.replace("me@pc", "other")), Outcome::Present);
+        // Only whole fields count: not a comment line, nor a longer key
+        // that starts with the same text; options before it are fine.
+        let c =
+            "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIGb1kTFnfWj0eRbsfFjvnU6oSo8mfx5h1JcsnEgD35Ax c";
+        let text = std::fs::read_to_string(&file).unwrap();
+        let longer = c.replace("Ax c", "Axyz c");
+        std::fs::write(&file, format!("{text}# {c}\n{longer}\n")).unwrap();
+        assert_eq!(run(&home, c), Outcome::Added);
+        assert_eq!(run(&home, c), Outcome::Present);
+        std::fs::write(&file, format!("{text}no-pty,command=\"a b\" {c}\n")).unwrap();
+        assert_eq!(run(&home, c), Outcome::Present);
+        std::fs::write(&file, &text).unwrap();
         // A last line without its newline.
         let text = std::fs::read_to_string(&file).unwrap();
         std::fs::write(&file, format!("{text}ssh-rsa AAAAB3 old")).unwrap();

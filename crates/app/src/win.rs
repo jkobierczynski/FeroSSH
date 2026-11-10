@@ -3656,12 +3656,6 @@ impl Window {
             .and_then(|d| d.fixed())
     }
 
-    /// Session > Open virtual desktop: runs [`vdesk::command`] on an exec
-    /// channel of the pane's connection; [`Self::on_vdesk`] opens a viewer
-    /// once x11vnc listens. A second ask on the same connection opens
-    /// another viewer on the running one.
-    /// `from` names a saved virtual desktop connection whose program and
-    /// size to use; else the SSH host's own.
     /// The SSH host `pane` is logged in to, as the user knows it: where
     /// Copy public key to this server sends the key.
     fn key_host(&self, pane: PaneId) -> Option<String> {
@@ -3789,6 +3783,12 @@ impl Window {
         })
     }
 
+    /// Session > Open virtual desktop: runs [`vdesk::command`] on an exec
+    /// channel of the pane's connection; [`Self::on_vdesk`] opens a viewer
+    /// once x11vnc listens. A second ask on the same connection opens
+    /// another viewer on the running one.
+    /// `from` names a saved virtual desktop connection whose program and
+    /// size to use; else the SSH host's own.
     fn open_virtual_desktop(&mut self, pane: PaneId, from: Option<&str>) -> Option<Command> {
         let host = self.host_pane(pane);
         let (Some(connection), Some(Host::Ssh(s))) = (
@@ -15098,6 +15098,12 @@ fn read_import_file(path: &std::path::Path) -> std::result::Result<ImportSource,
 /// background.
 fn new_key(hwnd: HWND) {
     if DIALOG_OPEN.get() {
+        return;
+    }
+    if with_window(|w| w.keygen.is_some()) == Some(true) {
+        let text = "A new key is still being made: Windows waits for the security key, \
+                    the phone or Windows Hello. Finish or cancel that first.";
+        dialog(hwnd, text, MB_OK | MB_ICONINFORMATION);
         return;
     }
     let Some(dpi) = with_window(|w| w.dpi) else {
