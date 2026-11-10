@@ -1784,7 +1784,14 @@ fn context_menu(h: &Handles, list: HWND, lparam: LPARAM) {
     // The menu runs its own message loop, in which the list can be
     // refreshed: the row is found again by its name afterwards.
     let clicked = row.and_then(|i| shown_row(remote, i));
-    match popup(list, &items, Some(at)) {
+    let host = shown_host();
+    let chosen = popup(list, &items, Some(at));
+    if shown_host() != host {
+        // The pane turned to another host meanwhile: its rows are not the
+        // ones the menu was for.
+        return;
+    }
+    match chosen {
         OPEN => open(h, remote, clicked.and_then(|c| find_row(remote, &c))),
         SEND if remote => download(h, None),
         SEND => upload(h, None),
@@ -1801,6 +1808,11 @@ fn context_menu(h: &Handles, list: HWND, lparam: LPARAM) {
         }
         _ => {}
     }
+}
+
+/// The host the Remote list is on.
+fn shown_host() -> Option<String> {
+    with(|s| s.view.as_ref().and_then(|v| v.host.clone())).flatten()
 }
 
 /// A row of a list by what it is, not where: its folder, name and
@@ -1884,7 +1896,11 @@ fn queue_menu(h: &Handles, lparam: LPARAM) {
         (0, "", false),
         (CLEAR, "C&lear finished", false),
     ];
+    let host = shown_host();
     let chosen = popup(h.queue, &items, Some(at));
+    if shown_host() != host {
+        return;
+    }
     let op = match chosen {
         PAUSE => Some(JobOp::Pause),
         RESUME => Some(JobOp::Resume),
