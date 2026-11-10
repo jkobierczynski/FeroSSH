@@ -24,7 +24,7 @@ use std::io::{Read, Write};
 use std::sync::Arc;
 use std::thread;
 
-use ferossh_ipc::{ChannelId, Decoder, Message, PROTOCOL_VERSION, SftpOp, Side, encode};
+use ferossh_ipc::{ChannelId, Decoder, Message, PROTOCOL_VERSION, Side, encode};
 use tokio::sync::{mpsc, oneshot};
 
 pub use session::Params;
@@ -42,20 +42,17 @@ const FRONT_QUEUE: usize = 4096;
 /// their own requests and never come near it.
 const FRONT_BYTES: usize = 32 << 20;
 
-/// About what a queued message holds in memory: its data, if it carries
-/// any, plus a little for the rest.
+/// About what a queued message holds in memory: its size on the wire,
+/// which counts every field (data, names, paths), plus a little for the
+/// rest.
 fn weight(msg: &Message) -> usize {
-    let data = match msg {
-        Message::Data { bytes, .. }
-        | Message::ZmodemData { bytes, .. }
-        | Message::ZmodemChunk { bytes, .. } => bytes.len(),
-        Message::SftpRequest {
-            op: SftpOp::Write { data, .. },
-            ..
-        } => data.len(),
-        _ => 0,
+    let mut frame = Vec::new();
+    let wire = match encode(msg, &mut frame) {
+        Ok(()) => frame.len(),
+        // Cannot be sent on, so as much as any one message may be.
+        Err(_) => ferossh_ipc::MAX_BODY_LEN,
     };
-    data.saturating_add(64)
+    wire.saturating_add(64)
 }
 
 /// What became of a message handed to a session's front queue.
@@ -68,12 +65,12 @@ enum Queued {
 }
 
 /// Hands `msg` to a session's front queue without waiting.
-fn queue(tx: &mpsc::Sender<Message>, guard: &SessionGuard, msg: Message) -> Queued {
+fn queue(tx: &mpsc::Sender<(Message, usize)>, guard: &SessionGuard, msg: Message) -> Queued {
     let n = weight(&msg);
     if !guard.reserve(n, FRONT_BYTES) {
         return Queued::Full;
     }
-    match tx.try_send(msg) {
+    match tx.try_send((msg, n)) {
         Ok(()) => Queued::Yes,
         Err(e) => {
             guard.release(n);
@@ -113,7 +110,7 @@ pub async fn serve(mut inbox: mpsc::Receiver<Message>, out: mpsc::Sender<Message
     // and tells the UI the session ended and why.
     let session = |channel: ChannelId| {
         let (tx, rx) = mpsc::channel(QUEUE);
-        let (front, mut queued) = mpsc::channel::<Message>(FRONT_QUEUE);
+        let (front, mut queued) = mpsc::channel::<(Message, usize)>(FRONT_QUEUE);
         let (alive, mut gone) = oneshot::channel::<()>();
         let guard = Arc::new(SessionGuard::new(alive));
         let taken = guard.clone();
@@ -127,8 +124,7 @@ pub async fn serve(mut inbox: mpsc::Receiver<Message>, out: mpsc::Sender<Message
                     _ = &mut gone => break,
                     () = tx.closed() => break,
                     msg = queued.recv() => match msg {
-                        Some(msg) => {
-                            let n = weight(&msg);
+                        Some((msg, n)) => {
                             tokio::select! {
                                 biased;
                                 _ = &mut gone => break,
@@ -423,6 +419,7 @@ pub fn run_blocking(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ferossh_ipc::SftpOp;
 
     /// A paste far past the byte budget fills the front queue long before
     /// its message count does, and room comes back as the session reads.
@@ -441,8 +438,31 @@ mod tests {
         }
         assert!(queued < FRONT_QUEUE);
         assert!(queued * ferossh_ipc::MAX_DATA_CHUNK <= FRONT_BYTES);
-        let taken = rx.recv().await.map(|m| weight(&m)).unwrap_or_default();
+        let taken = rx.recv().await.map(|(_, n)| n).unwrap_or_default();
         guard.release(taken);
         assert!(matches!(queue(&tx, &guard, chunk()), Queued::Yes));
+    }
+
+    /// Requests count what they carry, not only file data: long paths
+    /// fill the budget as surely as a paste does.
+    #[tokio::test]
+    async fn long_paths_count_against_the_budget() {
+        let (tx, _rx) = mpsc::channel(FRONT_QUEUE);
+        let (alive, _gone) = oneshot::channel();
+        let guard = SessionGuard::new(alive);
+        let stat = || Message::SftpRequest {
+            channel: 1,
+            id: 0,
+            op: SftpOp::Stat {
+                path: vec![b'a'; 512 * 1024],
+                follow: false,
+            },
+        };
+        let mut queued = 0;
+        while matches!(queue(&tx, &guard, stat()), Queued::Yes) {
+            queued += 1;
+        }
+        assert!(queued < FRONT_QUEUE);
+        assert!(queued * 512 * 1024 <= FRONT_BYTES);
     }
 }

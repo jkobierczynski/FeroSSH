@@ -158,8 +158,10 @@ pub(crate) enum Route {
     /// it (what the user types or pastes, and SFTP requests the UI keeps
     /// to a window), without waiting; a task per session feeds it into
     /// the session's bounded queue, so a stalled session never holds up
-    /// the pipe. A session whose front queue is full is aborted.
-    Session(mpsc::Sender<Message>, Arc<SessionGuard>),
+    /// the pipe. A session whose front queue is full is aborted. Each
+    /// message travels with its weight, the bytes it counts against the
+    /// session's budget.
+    Session(mpsc::Sender<(Message, usize)>, Arc<SessionGuard>),
     /// A forwarded stream: flow control bounds what the UI sends, and one
     /// slow stream must never hold up the pipe.
     Stream(mpsc::UnboundedSender<Message>),
