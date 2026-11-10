@@ -652,6 +652,7 @@ mod tests {
     impl russh::client::Handler for ChecksumClient {
         type Error = russh::Error;
 
+        /// Accept only the fixture key, so this client cannot trust an unrelated server.
         async fn check_server_key(
             &mut self,
             key: &russh::keys::PublicKeyOrCertificate,
@@ -675,10 +676,12 @@ mod tests {
     impl russh::server::Handler for ChecksumServer {
         type Error = russh::Error;
 
+        /// Allow the in-memory client to authenticate without external credentials.
         async fn auth_none(&mut self, _: &str) -> Result<russh::server::Auth, Self::Error> {
             Ok(russh::server::Auth::Accept)
         }
 
+        /// Accept each checksum channel opened by the production client.
         async fn channel_open_session(
             &mut self,
             _: russh::Channel<russh::server::Msg>,
@@ -689,6 +692,7 @@ mod tests {
             Ok(())
         }
 
+        /// Record the exact command independently of its stdin and acknowledge exec.
         async fn exec_request(
             &mut self,
             channel: russh::ChannelId,
@@ -699,6 +703,7 @@ mod tests {
             session.channel_success(channel)
         }
 
+        /// Accumulate stdin across packet boundaries without decoding filename bytes.
         async fn data(
             &mut self,
             _: russh::ChannelId,
@@ -709,6 +714,7 @@ mod tests {
             Ok(())
         }
 
+        /// Publish the complete request on EOF and simulate success or a missing tool.
         async fn channel_eof(
             &mut self,
             channel: russh::ChannelId,
