@@ -286,7 +286,14 @@ impl Renderer {
                 self.target = None;
                 Ok(Frame::Lost)
             }
-            other => other,
+            // A failure between BeginDraw and EndDraw (an image that would
+            // not draw) leaves the target mid-draw; the next BeginDraw on
+            // it would fail too. A fresh target redraws everything.
+            Err(e) => {
+                self.target = None;
+                Err(e)
+            }
+            ok => ok,
         }
     }
 

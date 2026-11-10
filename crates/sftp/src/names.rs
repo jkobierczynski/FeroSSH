@@ -46,6 +46,9 @@ pub fn local_name(remote: &[u8]) -> Option<String> {
         .map(|c| match c {
             '<' | '>' | ':' | '"' | '/' | '\\' | '|' | '?' | '*' | '\u{fffd}' => '_',
             c if c.is_control() => '_',
+            // Bidi overrides and marks would make Explorer show
+            // `exe<RLO>txt.exe` as `exeexe.txt`.
+            '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}' | '\u{200e}' | '\u{200f}' => '_',
             c => c,
         })
         .collect();
@@ -169,6 +172,18 @@ pub fn size(bytes: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn local_names_drop_bidi_controls() {
+        assert_eq!(
+            local_name("exe\u{202e}txt.exe".as_bytes()).as_deref(),
+            Some("exe_txt.exe")
+        );
+        assert_eq!(
+            local_name("a\u{2066}b\u{2069}\u{200f}c".as_bytes()).as_deref(),
+            Some("a_b__c")
+        );
+    }
 
     #[test]
     fn makes_windows_names() {

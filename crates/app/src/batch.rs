@@ -148,10 +148,29 @@ pub struct Report {
     pub run: Option<Run>,
 }
 
-/// Quotes a CSV field when it needs it.
+/// A cell a spreadsheet will show as text: one that starts like a
+/// formula (`=`, `+`, `-`, `@`, even after spaces) gets a leading `'`.
+/// Quoting alone does not stop Excel from running `"=cmd|…"`, and the
+/// values come from the servers' output.
+fn neutral(text: &str) -> String {
+    let t = text.trim();
+    // A plain signed number (`-42`, `+3.5`) stays a number.
+    let number = t.parse::<f64>().is_ok_and(f64::is_finite);
+    // Full-width forms too: some locales' spreadsheets read them alike.
+    let formula = [
+        '=', '+', '-', '@', '\u{ff1d}', '\u{ff0b}', '\u{ff0d}', '\u{ff20}',
+    ];
+    if !number && t.starts_with(formula) {
+        format!("'{text}")
+    } else {
+        text.to_owned()
+    }
+}
+
+/// Quotes a CSV field when it needs it, after making it [`neutral`].
 fn csv_field(text: &str) -> String {
-    let text = text.replace(['\r', '\n'], " ");
-    if text.contains([',', '"', ';']) || text.starts_with([' ', '=', '+', '-', '@']) {
+    let text = neutral(&text.replace(['\r', '\n'], " "));
+    if text.contains([',', '"', ';']) || text.starts_with(' ') {
         format!("\"{}\"", text.replace('"', "\"\""))
     } else {
         text
@@ -273,7 +292,7 @@ impl Report {
             out.push_str(&format!("\tValue {i}"));
         }
         out.push_str("\r\n");
-        let cell = |t: &str| t.replace(['\t', '\r', '\n'], " ");
+        let cell = |t: &str| neutral(&t.replace(['\t', '\r', '\n'], " "));
         for r in &self.rows {
             out.push_str(&format!("{}\t{}", cell(&r.label), cell(&r.state.label())));
             for v in &r.values {
@@ -286,7 +305,7 @@ impl Report {
     }
 
     /// The report as CSV. Fields a spreadsheet would read as a formula
-    /// are quoted.
+    /// start with `'`.
     pub fn csv(&self) -> String {
         let width = self.rows.iter().map(|r| r.values.len()).max().unwrap_or(0);
         let mut out = String::from("Host,Status");
@@ -535,6 +554,15 @@ mod tests {
     }
 
     #[test]
+    fn signed_numbers_stay_numbers() {
+        assert_eq!(neutral("-42"), "-42");
+        assert_eq!(neutral(" +3.5"), " +3.5");
+        assert_eq!(neutral("-2+3"), "'-2+3");
+        assert_eq!(neutral("@SUM(A1)"), "'@SUM(A1)");
+        assert_eq!(neutral("\u{ff1d}1+1"), "'\u{ff1d}1+1");
+    }
+
+    #[test]
     fn reports_export_as_table_and_csv() {
         let mut rows = queued(2);
         rows[0].state = RowState::Done;
@@ -545,12 +573,12 @@ mod tests {
         assert_eq!(
             r.table(),
             "Host\tStatus\tValue 1\tValue 2\r\nsw0\tdone\t15.2(4)E10\ta,b\r\n\
-             =cmd|' /C calc'!A0\tfailed: asked for a password\r\n"
+             '=cmd|' /C calc'!A0\tfailed: asked for a password\r\n"
         );
         assert_eq!(
             r.csv(),
             "Host,Status,Value 1,Value 2\r\nsw0,done,15.2(4)E10,\"a,b\"\r\n\
-             \"=cmd|' /C calc'!A0\",failed: asked for a password\r\n"
+             '=cmd|' /C calc'!A0,failed: asked for a password\r\n"
         );
     }
 
