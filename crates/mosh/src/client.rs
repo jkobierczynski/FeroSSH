@@ -290,10 +290,10 @@ impl Client {
     /// Takes one datagram from the server. Packets that fail the
     /// integrity check are dropped; only a protocol mismatch is fatal.
     pub fn receive(&mut self, datagram: &[u8], now: u64) -> Result<(), Fatal> {
-        let Ok((nonce, text)) = self.session.decrypt(datagram) else {
+        let Ok((value, text)) = self.session.decrypt(datagram) else {
             return Ok(());
         };
-        let Ok(p) = Packet::from_server(nonce, &text) else {
+        let Ok(p) = Packet::from_server(value, &text) else {
             return Ok(());
         };
         if p.seq >= self.expected_seq {
@@ -621,8 +621,8 @@ impl Client {
             payload,
         };
         self.next_seq += 1;
-        let (nonce, text) = p.to_server();
-        self.session.encrypt(nonce, &text).map_err(Fatal::Crypto)
+        let (value, text) = p.to_server();
+        self.session.encrypt(value, &text).map_err(Fatal::Crypto)
     }
 
     /// The output that brings the pane up to the newest screen, if it
@@ -710,9 +710,9 @@ mod tests {
 
     /// The nonce of the server's packet `seq` (bit 63 set), likewise.
     fn to_client(seq: u64) -> u64 {
-        let nonce = seq | 1u64.rotate_right(1);
-        debug_assert_eq!(nonce, crate::wire::TO_CLIENT | seq);
-        nonce
+        let value = seq | 1u64.rotate_right(1);
+        debug_assert_eq!(value, crate::wire::TO_CLIENT | seq);
+        value
     }
 
     /// A stand-in for mosh-server: decrypts the client's packets and
@@ -735,8 +735,8 @@ mod tests {
         }
 
         fn take(&mut self, datagram: &[u8]) -> Option<(Instruction, Vec<u8>)> {
-            let (nonce, text) = self.session.decrypt(datagram).unwrap();
-            assert_eq!(nonce & crate::wire::TO_CLIENT, 0);
+            let (value, text) = self.session.decrypt(datagram).unwrap();
+            assert_eq!(value & crate::wire::TO_CLIENT, 0);
             let payload = text[4..].to_vec();
             let frag = Fragment::parse(&payload).unwrap();
             let packed = self.assembly.add(frag)?;

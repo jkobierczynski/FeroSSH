@@ -65,9 +65,10 @@ pub struct Packet {
 }
 
 impl Packet {
-    /// Reads a packet the server sent: `nonce` and the plaintext.
-    pub fn from_server(nonce: u64, plaintext: &[u8]) -> Result<Self, WireError> {
-        if nonce & TO_CLIENT == 0 {
+    /// Reads a packet the server sent: the sequence value it was sealed
+    /// under (direction bit included) and the plaintext.
+    pub fn from_server(value: u64, plaintext: &[u8]) -> Result<Self, WireError> {
+        if value & TO_CLIENT == 0 {
             return Err(WireError::WrongDirection);
         }
         let (Some(ts), Some(reply), Some(payload)) =
@@ -76,14 +77,14 @@ impl Packet {
             return Err(WireError::Short);
         };
         Ok(Self {
-            seq: nonce & !TO_CLIENT,
+            seq: value & !TO_CLIENT,
             timestamp: be16(ts),
             timestamp_reply: be16(reply),
             payload: payload.to_vec(),
         })
     }
 
-    /// The nonce and plaintext of a packet to the server. The nonce is
+    /// The sequence value and plaintext of a packet to the server: it is
     /// `seq` as it is: the client counts from 0, and the session's block
     /// limit (2^47) ends it long before the direction bit, 2^63.
     /// (Masking the bit off here would put a constant into every nonce,
@@ -547,13 +548,13 @@ mod tests {
             timestamp_reply: 0xFFFF,
             payload: b"x".to_vec(),
         };
-        let (nonce, text) = p.to_server();
-        assert_eq!(nonce, 5);
+        let (value, text) = p.to_server();
+        assert_eq!(value, 5);
         assert_eq!(
-            Packet::from_server(nonce, &text),
+            Packet::from_server(value, &text),
             Err(WireError::WrongDirection)
         );
-        assert_eq!(Packet::from_server(nonce | TO_CLIENT, &text).unwrap(), p);
+        assert_eq!(Packet::from_server(value | TO_CLIENT, &text).unwrap(), p);
         assert_eq!(
             Packet::from_server(TO_CLIENT, &[1, 2, 3]),
             Err(WireError::Short)
