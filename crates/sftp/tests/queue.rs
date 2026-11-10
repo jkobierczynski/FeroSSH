@@ -791,4 +791,6 @@ fn resumed_transfers_fail_closed_when_checksums_are_unavailable() {
     assert!(remote.jobs().iter().all(|j| j.state == State::Failed));
     assert!(!s.local().join("down").exists());
     assert!(!s.remote().join("up").exists());
+    assert!(s.local().join("down.part").exists());
+    assert!(s.remote().join("up.filepart").exists());
 }

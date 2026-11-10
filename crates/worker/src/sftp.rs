@@ -416,20 +416,8 @@ impl Sftp {
     }
 }
 
-/// Quotes `arg` for a POSIX shell: inside single quotes, with each `'`
-/// written as `'\''`.
-fn shell_quote(arg: &[u8]) -> Vec<u8> {
-    let mut q = vec![b'\''];
-    for &b in arg {
-        if b == b'\'' {
-            q.extend_from_slice(b"'\\''");
-        } else {
-            q.push(b);
-        }
-    }
-    q.push(b'\'');
-    q
-}
+/// The shell sees only this fixed command; file names travel as NUL-delimited stdin.
+const CHECKSUM_COMMAND: &[u8] = b"xargs -0 sha256sum -b --";
 
 /// The hash `sha256sum` printed: 64 hex digits first on the line, after a
 /// `\` when the name needed escaping.
@@ -440,7 +428,8 @@ fn parse_sum(output: &[u8]) -> Option<String> {
     ok.then(|| String::from_utf8_lossy(hex).to_ascii_lowercase())
 }
 
-/// Runs `sha256sum` on the server for `path`.
+/// Runs `sha256sum` on the server for `path`, without putting the name in
+/// shell syntax. Servers without `xargs -0` and `sha256sum` fail verification.
 async fn checksum(conn: &Connection, path: &[u8]) -> SftpReply {
     let unsupported = |why: &str| SftpReply::Failed {
         code: sftp_code::UNSUPPORTED,
@@ -449,11 +438,12 @@ async fn checksum(conn: &Connection, path: &[u8]) -> SftpReply {
     if path.contains(&0) {
         return unsupported("the name cannot be passed to a command");
     }
-    let mut command = b"sha256sum -b -- ".to_vec();
-    command.extend(shell_quote(path));
     let run = async {
         let mut ch = conn.channel_open_session().await.ok()?;
-        ch.exec(true, command).await.ok()?;
+        ch.exec(true, CHECKSUM_COMMAND).await.ok()?;
+        ch.data(path).await.ok()?;
+        ch.data(&b"\0"[..]).await.ok()?;
+        ch.eof().await.ok()?;
         let mut output = Vec::new();
         let mut status = None;
         while let Some(msg) = ch.wait().await {
@@ -475,7 +465,7 @@ async fn checksum(conn: &Connection, path: &[u8]) -> SftpReply {
             Some(hex) => SftpReply::Checksum(hex),
             None => unsupported("sha256sum printed something unexpected"),
         },
-        Ok(_) => unsupported("the server has no sha256sum"),
+        Ok(_) => unsupported("the server could not run xargs -0 sha256sum"),
         Err(_) => unsupported("sha256sum took too long"),
     }
 }
@@ -653,11 +643,49 @@ async fn pump(
 mod tests {
     use super::*;
 
+    /// Exercise the actual fixed command with byte-exact filenames on stdin.
+    #[cfg(unix)]
     #[test]
-    fn quotes_for_the_shell() {
-        assert_eq!(shell_quote(b"a b"), b"'a b'");
-        assert_eq!(shell_quote(b"it's"), b"'it'\\''s'");
-        assert_eq!(shell_quote(b"$(rm -rf ~)"), b"'$(rm -rf ~)'");
+    fn checksum_names_are_data_not_shell_syntax() -> Result<(), Box<dyn std::error::Error>> {
+        use std::ffi::OsStr;
+        use std::io::Write;
+        use std::os::unix::ffi::OsStrExt;
+        use std::process::{Command, Stdio};
+
+        let dir = std::env::temp_dir().join(format!("ferossh-checksum-{}", std::process::id()));
+        std::fs::create_dir(&dir)?;
+        for name in [
+            b"a&touch injected&rem".as_slice(),
+            b"$(touch injected)",
+            b"`touch injected`",
+            b"'; touch injected; #",
+            b"a'$(touch injected)'",
+            b"spaces tabs\tnewlines\nbackslash\\",
+            b"-leading-dash",
+            b"non-utf8-\xff",
+        ] {
+            std::fs::write(dir.join(OsStr::from_bytes(name)), b"abc")?;
+            let mut child = Command::new("sh")
+                .args(["-c", std::str::from_utf8(CHECKSUM_COMMAND)?])
+                .current_dir(&dir)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()?;
+            let mut stdin = child.stdin.take().ok_or("missing piped checksum input")?;
+            stdin.write_all(name)?;
+            stdin.write_all(b"\0")?;
+            drop(stdin);
+            let output = child.wait_with_output()?;
+            assert!(output.status.success(), "{:?}", output);
+            assert_eq!(
+                parse_sum(&output.stdout).as_deref(),
+                Some("ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad")
+            );
+            assert!(!dir.join("injected").exists());
+        }
+        std::fs::remove_dir_all(dir)?;
+        Ok(())
     }
 
     #[test]
