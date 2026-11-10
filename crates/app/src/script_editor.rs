@@ -31,13 +31,13 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
     GetFocus, SetFocus, VK_CONTROL, VK_ESCAPE, VK_RETURN, VK_SHIFT,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    BN_CLICKED, BS_DEFPUSHBUTTON, BS_PUSHBUTTON, CB_ADDSTRING, CB_GETCURSEL, CB_SETCURSEL,
-    CBS_DROPDOWNLIST, CBS_HASSTRINGS, CS_HREDRAW, CS_VREDRAW, CreateWindowExW, ES_AUTOHSCROLL,
-    ES_AUTOVSCROLL, ES_MULTILINE, ES_WANTRETURN, GetClientRect, HMENU, IDC_ARROW, IDCANCEL, IDOK,
-    IsChild, IsDialogMessageW, IsWindowVisible, LoadCursorW, MSG, MoveWindow, RegisterClassW,
-    SW_HIDE, SW_SHOWNA, SendMessageW, SetWindowTextW, ShowWindow, WINDOW_EX_STYLE, WINDOW_STYLE,
-    WM_CLOSE, WM_COMMAND, WM_ERASEBKGND, WM_KEYDOWN, WM_PAINT, WM_SYSCHAR, WM_SYSKEYDOWN,
-    WM_SYSKEYUP, WNDCLASSW, WS_BORDER, WS_CHILD, WS_CLIPCHILDREN, WS_CLIPSIBLINGS,
+    BN_CLICKED, BS_DEFPUSHBUTTON, BS_PUSHBUTTON, CB_ADDSTRING, CB_GETCURSEL, CB_GETDROPPEDSTATE,
+    CB_SETCURSEL, CBS_DROPDOWNLIST, CBS_HASSTRINGS, CS_HREDRAW, CS_VREDRAW, CreateWindowExW,
+    ES_AUTOHSCROLL, ES_AUTOVSCROLL, ES_MULTILINE, ES_WANTRETURN, GetClientRect, HMENU, IDC_ARROW,
+    IDCANCEL, IDOK, IsChild, IsDialogMessageW, IsWindowVisible, LoadCursorW, MSG, MoveWindow,
+    RegisterClassW, SW_HIDE, SW_SHOWNA, SendMessageW, SetWindowTextW, ShowWindow, WINDOW_EX_STYLE,
+    WINDOW_STYLE, WM_CLOSE, WM_COMMAND, WM_ERASEBKGND, WM_KEYDOWN, WM_PAINT, WM_SYSCHAR,
+    WM_SYSKEYDOWN, WM_SYSKEYUP, WNDCLASSW, WS_BORDER, WS_CHILD, WS_CLIPCHILDREN, WS_CLIPSIBLINGS,
     WS_EX_CONTROLPARENT, WS_HSCROLL, WS_TABSTOP, WS_VISIBLE, WS_VSCROLL,
 };
 use windows::core::{PCWSTR, w};
@@ -599,6 +599,14 @@ pub fn pre_translate(msg: &MSG) -> bool {
         if !IsWindowVisible(h.panel).as_bool()
             || !(msg.hwnd == h.panel || IsChild(h.panel, msg.hwnd).as_bool())
         {
+            return false;
+        }
+        // Escape and Enter close the hotkey's open drop-down list.
+        let dropped = h.fields.get(HOTKEY).is_some_and(|c| {
+            (msg.hwnd == *c || IsChild(*c, msg.hwnd).as_bool())
+                && SendMessageW(*c, CB_GETDROPPEDSTATE, None, None).0 != 0
+        });
+        if dropped && msg.message == WM_KEYDOWN {
             return false;
         }
         match msg.message {

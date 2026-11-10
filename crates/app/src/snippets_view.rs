@@ -657,6 +657,24 @@ impl SnippetsView {
     /// store, or `None` when the editor says why not.
     pub fn native_save(&mut self, head: [String; HEAD], lines: &str) -> Option<SnipAction> {
         let d = self.draft.as_mut()?;
+        // Too much text is refused, not cut: the editor keeps what was
+        // typed, so it can be shortened.
+        let long = |t: &str| t.chars().count() > MAX_TEXT;
+        if let Some(i) = head.iter().position(|t| long(t)) {
+            return d.fail(format!("At most {MAX_TEXT} characters here."), i);
+        }
+        if let Some(n) = lines.lines().position(long) {
+            return d.fail(
+                format!("Line {} is longer than {MAX_TEXT} characters.", n + 1),
+                HEAD + n,
+            );
+        }
+        if lines.lines().count() > MAX_LINES {
+            return d.fail(
+                format!("A script has at most {MAX_LINES} lines."),
+                HEAD + MAX_LINES,
+            );
+        }
         d.head = head.map(|t| {
             t.chars()
                 .filter(|c| !c.is_control())
@@ -1953,6 +1971,20 @@ mod tests {
         assert_eq!(v.native_save(head.clone(), "uptime"), None);
         assert_eq!(v.native_draft().unwrap().focus, (HOTKEY, 0));
         head[HOTKEY] = "F3".into();
+        // Too much text is refused, not cut short.
+        let long = "x".repeat(MAX_TEXT + 1);
+        let mut too_long = head.clone();
+        too_long[NAME] = long.clone();
+        assert_eq!(v.native_save(too_long, "uptime"), None);
+        assert_eq!(v.native_draft().unwrap().focus.0, NAME);
+        assert_eq!(
+            v.native_save(head.clone(), &format!("uptime\n{long}")),
+            None
+        );
+        assert!(v.native_draft().unwrap().error.is_some());
+        let many = vec!["uptime"; MAX_LINES + 1].join("\n");
+        assert_eq!(v.native_save(head.clone(), &many), None);
+        assert!(v.native_draft().unwrap().error.is_some());
         match v.native_save(head, "uptime\n\n@type w\n") {
             Some(SnipAction::Save { index, snippet }) => {
                 assert_eq!(index, Some(1));
