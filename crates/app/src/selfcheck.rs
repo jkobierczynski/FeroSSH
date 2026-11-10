@@ -85,6 +85,8 @@ fn check_worker(w: &mut Worker, host: &str) -> Result<String, String> {
             },
             tunnel: None,
             shell: true,
+            options: Default::default(),
+            family: Default::default(),
         },
     )?;
     loop {

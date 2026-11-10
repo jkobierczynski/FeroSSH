@@ -143,6 +143,8 @@ pub async fn log_in(
             timing: Default::default(),
             tunnel: None,
             shell: true,
+            options: Default::default(),
+            family: Default::default(),
         },
     ] {
         to_worker.send(msg).await.unwrap();
@@ -171,6 +173,7 @@ pub async fn log_in(
                     data,
                     flags: target.flags,
                     passphrase: None,
+                    agent: Default::default(),
                 });
                 let Reply::Signed(signed) = broker_reply(broker) else {
                     panic!("not a signature");

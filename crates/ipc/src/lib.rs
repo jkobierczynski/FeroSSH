@@ -46,7 +46,7 @@ use std::fmt;
 use zeroize::Zeroize;
 
 /// Protocol version carried in every frame. Bump on any wire change.
-pub const PROTOCOL_VERSION: u8 = 14;
+pub const PROTOCOL_VERSION: u8 = 15;
 
 /// Largest frame body accepted, in bytes. Terminal and SFTP data is chunked
 /// below this, so anything larger is a bug or an attack.
@@ -119,6 +119,43 @@ impl Drop for Secrets {
 /// the local X server expects (empty when it needs none). The worker gives
 /// the server a fake cookie and puts this one in its place when a client
 /// connects; this one never leaves the PC. `Debug` leaves the cookie out.
+/// What a shell's channel asks the server for besides a login shell, from
+/// ssh_config: `SetEnv` and `SendEnv`, `RemoteCommand`, `RequestTTY` and
+/// `ForwardAgent`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ShellOptions {
+    /// Variables to set before the shell starts (`env` requests; the
+    /// server's `AcceptEnv` decides which it takes).
+    pub env: Vec<(String, String)>,
+    /// Run this instead of the login shell.
+    pub command: Option<String>,
+    /// Ask for a terminal.
+    pub pty: bool,
+    /// Ask for agent forwarding, so the server may open agent channels.
+    pub agent: bool,
+}
+
+impl Default for ShellOptions {
+    /// A login shell on a terminal, nothing else.
+    fn default() -> Self {
+        Self {
+            env: Vec::new(),
+            command: None,
+            pty: true,
+            agent: false,
+        }
+    }
+}
+
+/// Which IP versions a connection may use (`AddressFamily`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Family {
+    #[default]
+    Any,
+    V4,
+    V6,
+}
+
 /// How long the worker waits for a server, from ssh_config's
 /// `ConnectTimeout`, `ServerAliveInterval` and `ServerAliveCountMax`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -381,6 +418,8 @@ pub enum Message {
         timing: Timing,
         tunnel: Option<ChannelId>,
         shell: bool,
+        options: ShellOptions,
+        family: Family,
     },
     /// Open another shell on the connection that `connection` (a channel
     /// that made it with [`Message::Connect`]) belongs to. No new login:
@@ -392,6 +431,7 @@ pub enum Message {
         cols: u16,
         rows: u16,
         x11: Option<X11Auth>,
+        options: ShellOptions,
     },
     /// Open a Telnet session to `host`:`port` on a terminal of `cols` x
     /// `rows`. No login, no encryption: the worker opens the TCP
@@ -629,6 +669,38 @@ pub enum Message {
     },
     /// UI to worker: the user stopped the transfer.
     ZmodemCancel { channel: ChannelId },
+
+    // Agent forwarding. The server opens an agent channel only on a
+    // connection whose shell asked for it ([`ShellOptions::agent`]); the
+    // worker reads the agent protocol and asks the UI, which owns the
+    // keys, one request at a time per agent channel. `channel` is the
+    // connection's login channel, `agent` the agent channel's id in the
+    // worker.
+    /// Worker to UI: the server wants the list of keys.
+    AgentList { channel: ChannelId, agent: ChannelId },
+    /// Worker to UI: the server wants `data` signed with `key`; `flags`
+    /// are the agent protocol's (RSA hash).
+    AgentSign {
+        channel: ChannelId,
+        agent: ChannelId,
+        key: Vec<u8>,
+        data: Vec<u8>,
+        flags: u32,
+    },
+    /// UI to worker: the keys for an [`Message::AgentList`], with their
+    /// comments.
+    AgentKeys {
+        channel: ChannelId,
+        agent: ChannelId,
+        keys: Vec<(Vec<u8>, String)>,
+    },
+    /// UI to worker: the signature for an [`Message::AgentSign`]; empty
+    /// when the user refused or signing failed.
+    AgentSigned {
+        channel: ChannelId,
+        agent: ChannelId,
+        signature: Vec<u8>,
+    },
 }
 
 impl Message {
@@ -669,6 +741,10 @@ impl Message {
             Message::Lost { .. } => 32,
             Message::Exec { .. } => 33,
             Message::ExecStderr { .. } => 34,
+            Message::AgentList { .. } => 35,
+            Message::AgentSign { .. } => 36,
+            Message::AgentKeys { .. } => 37,
+            Message::AgentSigned { .. } => 38,
             Message::ZmodemStart { .. } => 40,
             Message::ZmodemFile { .. } => 41,
             Message::ZmodemData { .. } => 42,
@@ -708,7 +784,9 @@ impl Message {
             | Message::ZmodemAnswer { .. }
             | Message::ZmodemFileAnswer { .. }
             | Message::ZmodemChunk { .. }
-            | Message::ZmodemCancel { .. } => Side::Ui,
+            | Message::ZmodemCancel { .. }
+            | Message::AgentKeys { .. }
+            | Message::AgentSigned { .. } => Side::Ui,
             Message::HostKey { .. }
             | Message::HostCert { .. }
             | Message::Banner { .. }
@@ -731,7 +809,9 @@ impl Message {
             | Message::ZmodemData { .. }
             | Message::ZmodemRead { .. }
             | Message::ZmodemFileDone { .. }
-            | Message::ZmodemEnd { .. } => Side::Worker,
+            | Message::ZmodemEnd { .. }
+            | Message::AgentList { .. }
+            | Message::AgentSign { .. } => Side::Worker,
         }
     }
 
@@ -782,7 +862,11 @@ impl Message {
             | Message::ZmodemAnswer { channel, .. }
             | Message::ZmodemFileAnswer { channel, .. }
             | Message::ZmodemChunk { channel, .. }
-            | Message::ZmodemCancel { channel } => *channel,
+            | Message::ZmodemCancel { channel }
+            | Message::AgentList { channel, .. }
+            | Message::AgentSign { channel, .. }
+            | Message::AgentKeys { channel, .. }
+            | Message::AgentSigned { channel, .. } => *channel,
         })
     }
 }
@@ -856,6 +940,19 @@ impl Writer {
         if let Some(v) = v {
             item(self, v);
         }
+    }
+
+    fn options(&mut self, o: &ShellOptions) {
+        self.list(&o.env, |w, (k, v)| {
+            w.str(k);
+            w.str(v);
+        });
+        self.bool(o.command.is_some());
+        if let Some(c) = &o.command {
+            self.str(c);
+        }
+        self.bool(o.pty);
+        self.bool(o.agent);
     }
 
     fn x11(&mut self, x: &Option<X11Auth>) {
@@ -1045,6 +1142,8 @@ pub fn encode(msg: &Message, out: &mut Vec<u8>) -> Result<(), Error> {
             timing,
             tunnel,
             shell,
+            options,
+            family,
         } => {
             w.u32(*channel);
             w.str(host);
@@ -1060,6 +1159,12 @@ pub fn encode(msg: &Message, out: &mut Vec<u8>) -> Result<(), Error> {
             w.u32(timing.alive_max);
             w.opt(*tunnel, Writer::u32);
             w.bool(*shell);
+            w.options(options);
+            w.u8(match family {
+                Family::Any => 0,
+                Family::V4 => 4,
+                Family::V6 => 6,
+            });
         }
         Message::TelnetConnect {
             channel,
@@ -1169,12 +1274,52 @@ pub fn encode(msg: &Message, out: &mut Vec<u8>) -> Result<(), Error> {
             cols,
             rows,
             x11,
+            options,
         } => {
             w.u32(*channel);
             w.u32(*connection);
             w.u16(*cols);
             w.u16(*rows);
             w.x11(x11);
+            w.options(options);
+        }
+        Message::AgentList { channel, agent } => {
+            w.u32(*channel);
+            w.u32(*agent);
+        }
+        Message::AgentSign {
+            channel,
+            agent,
+            key,
+            data,
+            flags,
+        } => {
+            w.u32(*channel);
+            w.u32(*agent);
+            w.bytes(key);
+            w.bytes(data);
+            w.u32(*flags);
+        }
+        Message::AgentKeys {
+            channel,
+            agent,
+            keys,
+        } => {
+            w.u32(*channel);
+            w.u32(*agent);
+            w.list(keys, |w, (key, comment)| {
+                w.bytes(key);
+                w.str(comment);
+            });
+        }
+        Message::AgentSigned {
+            channel,
+            agent,
+            signature,
+        } => {
+            w.u32(*channel);
+            w.u32(*agent);
+            w.bytes(signature);
         }
         Message::SftpOpen {
             channel,
@@ -1438,6 +1583,13 @@ fn decode_body(body: &[u8]) -> Result<Message, Error> {
             },
             tunnel: r.opt(Reader::u32)?,
             shell: r.bool()?,
+            options: r.options()?,
+            family: match r.u8()? {
+                0 => Family::Any,
+                4 => Family::V4,
+                6 => Family::V6,
+                _ => return Err(Error::Invalid),
+            },
         },
         5 => Message::HostKeyVerdict {
             channel: r.u32()?,
@@ -1509,6 +1661,28 @@ fn decode_body(body: &[u8]) -> Result<Message, Error> {
             cols: r.u16()?,
             rows: r.u16()?,
             x11: r.x11()?,
+            options: r.options()?,
+        },
+        35 => Message::AgentList {
+            channel: r.u32()?,
+            agent: r.u32()?,
+        },
+        36 => Message::AgentSign {
+            channel: r.u32()?,
+            agent: r.u32()?,
+            key: r.path()?,
+            data: r.path()?,
+            flags: r.u32()?,
+        },
+        37 => Message::AgentKeys {
+            channel: r.u32()?,
+            agent: r.u32()?,
+            keys: r.list(|r| Ok((r.path()?, r.string()?)))?,
+        },
+        38 => Message::AgentSigned {
+            channel: r.u32()?,
+            agent: r.u32()?,
+            signature: r.path()?,
         },
         19 => Message::SftpOpen {
             channel: r.u32()?,
@@ -1697,6 +1871,15 @@ impl<'a> Reader<'a> {
         }
     }
 
+    fn options(&mut self) -> Result<ShellOptions, Error> {
+        Ok(ShellOptions {
+            env: self.list(|r| Ok((r.string()?, r.string()?)))?,
+            command: self.opt(Reader::string)?,
+            pty: self.bool()?,
+            agent: self.bool()?,
+        })
+    }
+
     fn x11(&mut self) -> Result<Option<X11Auth>, Error> {
         self.opt(|r| {
             Ok(X11Auth {
@@ -1867,6 +2050,8 @@ mod tests {
                 timing: Timing::default(),
                 tunnel: None,
                 shell: true,
+                options: ShellOptions::default(),
+                family: Family::Any,
             },
             Message::Connect {
                 channel: 3,
@@ -1889,6 +2074,13 @@ mod tests {
                 },
                 tunnel: Some(0x1234),
                 shell: false,
+                options: ShellOptions {
+                    env: vec![("LANG".into(), "nl_BE.UTF-8".into())],
+                    command: Some("tmux new -A -s \"my s\"".into()),
+                    pty: false,
+                    agent: true,
+                },
+                family: Family::V6,
             },
             Message::HostKeyVerdict {
                 channel: 1,
@@ -1979,6 +2171,28 @@ mod tests {
                 cols: 100,
                 rows: 30,
                 x11: Some(X11Auth::default()),
+                options: ShellOptions::default(),
+            },
+            Message::AgentList {
+                channel: 1,
+                agent: WORKER_IDS,
+            },
+            Message::AgentSign {
+                channel: 1,
+                agent: WORKER_IDS + 1,
+                key: vec![1, 2, 3],
+                data: vec![4; 40],
+                flags: 4,
+            },
+            Message::AgentKeys {
+                channel: 1,
+                agent: WORKER_IDS,
+                keys: vec![(vec![9; 51], "me@pc".into()), (Vec::new(), String::new())],
+            },
+            Message::AgentSigned {
+                channel: 1,
+                agent: WORKER_IDS + 1,
+                signature: Vec::new(),
             },
             Message::ForwardOpen {
                 channel: FORWARD_IDS,
@@ -2239,7 +2453,7 @@ mod tests {
         tags.sort_unstable();
         tags.dedup();
         // ZMODEM starts at 40, leaving room below.
-        let want: Vec<u8> = (0..=34).chain(40..=49).collect();
+        let want: Vec<u8> = (0..=38).chain(40..=49).collect();
         assert_eq!(tags, want);
     }
 

@@ -30,7 +30,7 @@ use std::time::Duration;
 use common::{Kill, available, base64, broker_reply, log_in, run, sshd, whoami};
 use ferossh_auth::sk::soft::SoftAuthenticator;
 use ferossh_auth::sk::{self, DEFAULT_APPLICATION, EnrollRequest, SkAlgorithm};
-use ferossh_auth::{Broker, Identity, Job, KeyFileSpec, Reply, Source, userauth};
+use ferossh_auth::{Broker, Identity, Job, KeyChoice, KeyFileSpec, Reply, Source, userauth};
 
 /// OpenSSH's software security key, if built.
 fn sk_dummy() -> Option<PathBuf> {
@@ -57,7 +57,10 @@ fn authorized(identity: &Identity) -> String {
 }
 
 fn identities(broker: &Broker, files: Vec<KeyFileSpec>) -> Vec<Identity> {
-    broker.submit(Job::Identities { files });
+    broker.submit(Job::Identities(KeyChoice {
+        files,
+        ..KeyChoice::default()
+    }));
     let Reply::Identities { keys, notes } = broker_reply(broker) else {
         panic!("not identities");
     };

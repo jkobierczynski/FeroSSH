@@ -1,14 +1,22 @@
-//! The part of OpenSSH's `ssh_config` that FeroSSH uses: `Host` blocks
-//! with `HostName`, `User`, `Port`, `IdentityFile`, `Tag`, the forwarding
-//! keywords (`LocalForward`, `RemoteForward`, `DynamicForward`,
-//! `ForwardX11`, `GatewayPorts`, `ClearAllForwardings`), how to get there
-//! (`ProxyJump`, `ProxyCommand`), `Include`d files, and the list of hosts
-//! the connection manager shows.
+//! The part of OpenSSH's `ssh_config` that FeroSSH uses: `Host` and
+//! `Match` blocks with `HostName`, `User`, `Port`, the keys
+//! (`IdentityFile`, `CertificateFile`, `IdentitiesOnly`, `IdentityAgent`,
+//! `ForwardAgent`), `Tag`, the forwarding keywords (`LocalForward`,
+//! `RemoteForward`, `DynamicForward`, `ForwardX11`, `GatewayPorts`,
+//! `ClearAllForwardings`), the session (`RemoteCommand`, `RequestTTY`,
+//! `SendEnv`, `SetEnv`), host keys (`StrictHostKeyChecking`,
+//! `UserKnownHostsFile`, `HostKeyAlias`), how to get there (`ProxyJump`,
+//! `ProxyCommand`, `AddressFamily`), `Include`d files, and the list of
+//! hosts the connection manager shows.
 //!
 //! The rules follow `ssh_config(5)`: keywords are case-insensitive, the
-//! first value found for a keyword wins (except `IdentityFile` and the
-//! forwards, which accumulate), and a `Host` line matches when any of its patterns matches
-//! the name typed and no `!` pattern does. `Match` blocks are skipped.
+//! first value found for a keyword wins (except `IdentityFile`,
+//! `CertificateFile`, `SendEnv` and the forwards, which accumulate), and a
+//! `Host` line matches when any of its patterns matches the name typed and
+//! no `!` pattern does. `Match` takes `all`, `host`, `originalhost`,
+//! `user`, `localuser`, `tagged`, `canonical` and `final` (with `!` to
+//! negate); `Match exec`, `localnetwork` and criteria FeroSSH does not know
+//! never match, so FeroSSH runs no command to read its config.
 //! `Include` reads files through an [`Includes`], so the parser itself
 //! never touches the disk.
 //!
@@ -49,6 +57,71 @@ pub struct HostConfig {
     /// `ProxyJump` or `ProxyCommand`, whichever came first, as OpenSSH
     /// takes them.
     pub proxy: Option<Proxy>,
+    /// `ForwardAgent yes`: lets the server use the agent's keys.
+    pub forward_agent: Option<bool>,
+    /// `CertificateFile`, as written; they accumulate like `IdentityFile`.
+    pub certificate_files: Vec<String>,
+    /// `IdentitiesOnly yes`: only the keys `IdentityFile` names, also
+    /// when an agent holds more.
+    pub identities_only: Option<bool>,
+    /// `IdentityAgent`: `none`, `SSH_AUTH_SOCK`, or an agent's pipe.
+    pub identity_agent: Option<String>,
+    /// `SendEnv`: names (patterns) of local variables to pass on.
+    pub send_env: Vec<String>,
+    /// `SetEnv`: variables to set on the server, first value wins.
+    pub set_env: Vec<(String, String)>,
+    /// `RemoteCommand`: run this instead of a login shell. Empty for
+    /// `RemoteCommand none`.
+    pub remote_command: Option<String>,
+    pub request_tty: Option<RequestTty>,
+    pub strict_host_key_checking: Option<StrictHostKeyChecking>,
+    /// `UserKnownHostsFile`: the files to read, the first to write; empty
+    /// for `none`.
+    pub user_known_hosts_files: Option<Vec<String>>,
+    /// `HostKeyAlias`: the name to look the host key up under.
+    pub host_key_alias: Option<String>,
+    pub address_family: Option<AddressFamily>,
+}
+
+/// `RequestTTY`: whether the session gets a terminal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RequestTty {
+    No,
+    Yes,
+    Force,
+    /// A terminal unless a `RemoteCommand` runs (the default).
+    Auto,
+}
+
+/// `StrictHostKeyChecking`: what to do with a host not in known_hosts.
+/// A changed key is never accepted, whatever this says.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StrictHostKeyChecking {
+    /// Refuse it.
+    Yes,
+    /// Show its fingerprint and ask (the default).
+    Ask,
+    /// Trust it and add it to known_hosts without asking (`accept-new`,
+    /// and `no` or `off`, which FeroSSH treats the same).
+    AcceptNew,
+}
+
+/// `AddressFamily`: which IP versions to connect over.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AddressFamily {
+    Any,
+    Inet,
+    Inet6,
+}
+
+/// What `Match` compares against besides the name typed.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct MatchContext<'a> {
+    /// The Windows user name (`Match localuser`, the default remote user).
+    pub local_user: &'a str,
+    /// The user given on the command line or the prompt (`user@host`),
+    /// which wins over `User`.
+    pub user: Option<&'a str>,
 }
 
 /// How a host is reached when not directly.
@@ -233,6 +306,9 @@ impl Includes for DirIncludes {
 struct Line {
     keyword: String,
     args: Vec<String>,
+    /// The text after the keyword, unsplit: `RemoteCommand` keeps its
+    /// quotes for the server's shell.
+    raw: String,
     folder: Option<String>,
 }
 
@@ -241,6 +317,7 @@ impl Line {
         Self {
             keyword: keyword.to_owned(),
             args: Vec::new(),
+            raw: String::new(),
             folder: None,
         }
     }
@@ -296,6 +373,7 @@ fn flatten(
         out.push(Line {
             keyword,
             args,
+            raw: rest_of_line(raw),
             folder: folder.clone(),
         });
     }
@@ -338,6 +416,16 @@ pub fn hosts(text: &str, includes: &dyn Includes) -> Vec<HostEntry> {
         }
     }
     out
+}
+
+/// The text after a line's keyword (and its `=`), trimmed.
+fn rest_of_line(line: &str) -> String {
+    let line = line.trim();
+    let end = line
+        .find(|c: char| c.is_ascii_whitespace() || c == '=')
+        .unwrap_or(line.len());
+    let rest = line.get(end..).unwrap_or_default().trim_start();
+    rest.strip_prefix('=').unwrap_or(rest).trim().to_owned()
 }
 
 /// Splits a config line into keyword and arguments, honouring `=` and
@@ -401,21 +489,60 @@ pub fn resolve(text: &str, name: &str) -> HostConfig {
 }
 
 /// Applies the config text, with its included files, to the name the user
-/// typed.
+/// typed, with no local user name for `Match`.
 pub fn resolve_in(text: &str, name: &str, includes: &dyn Includes) -> HostConfig {
+    resolve_for(text, name, includes, &MatchContext::default())
+}
+
+/// Applies the config text, with its included files, to the name the user
+/// typed, as OpenSSH does: a first pass, then a second one for `Match
+/// canonical` and `Match final` blocks when the config has any. FeroSSH
+/// does not canonicalize host names, so both match only in that pass.
+pub fn resolve_for(
+    text: &str,
+    name: &str,
+    includes: &dyn Includes,
+    ctx: &MatchContext<'_>,
+) -> HostConfig {
+    let lines = lines(text, includes);
     let mut cfg = HostConfig::default();
+    let wants_final = apply(&lines, name, ctx, false, &mut cfg);
+    if wants_final {
+        apply(&lines, name, ctx, true, &mut cfg);
+    }
+    cfg
+}
+
+/// One pass over the lines; returns whether a `Match` asked for the final
+/// pass.
+fn apply(
+    lines: &[Line],
+    name: &str,
+    ctx: &MatchContext<'_>,
+    final_pass: bool,
+    cfg: &mut HostConfig,
+) -> bool {
+    let mut wants_final = false;
     // Lines before the first Host apply to every host.
     let mut active = true;
     // The state where each open Include started. A Host line inside an
     // included file does not leak into the file that included it, and an
     // Include in a block that does not match never matches, as in OpenSSH.
     let mut outer: Vec<bool> = Vec::new();
-    for Line { keyword, args, .. } in lines(text, includes) {
+    for Line {
+        keyword, args, raw, ..
+    } in lines
+    {
+        let args = args.clone();
         match keyword.as_str() {
             "{" => outer.push(active),
             "}" => active = outer.pop().unwrap_or(active),
             "host" => active = outer.iter().all(|&a| a) && host_line_matches(&args, name),
-            "match" => active = false,
+            "match" => {
+                let (matched, asks_final) = match_line_matches(&args, name, ctx, cfg, final_pass);
+                wants_final |= asks_final;
+                active = outer.iter().all(|&a| a) && matched;
+            }
             _ if !active => {}
             "hostname" => {
                 if cfg.hostname.is_none() {
@@ -435,7 +562,27 @@ pub fn resolve_in(text: &str, name: &str, includes: &dyn Includes) -> HostConfig
                         .filter(|&p| p != 0);
                 }
             }
-            "identityfile" => cfg.identity_files.extend(args.into_iter().take(1)),
+            "identityfile" => {
+                for f in args.into_iter().take(1) {
+                    if !cfg.identity_files.contains(&f) {
+                        cfg.identity_files.push(f);
+                    }
+                }
+            }
+            "certificatefile" => {
+                for f in args.into_iter().take(1) {
+                    if !cfg.certificate_files.contains(&f) {
+                        cfg.certificate_files.push(f);
+                    }
+                }
+            }
+            "identitiesonly" if cfg.identities_only.is_none() => {
+                cfg.identities_only = flag(&args);
+            }
+            "identityagent" if cfg.identity_agent.is_none() => {
+                cfg.identity_agent = args.into_iter().next();
+            }
+            "forwardagent" if cfg.forward_agent.is_none() => cfg.forward_agent = flag(&args),
             "tag" if cfg.tag.is_none() => cfg.tag = args.into_iter().next(),
             "localforward" | "remoteforward" | "dynamicforward" => {
                 let kind = match keyword.as_str() {
@@ -473,10 +620,156 @@ pub fn resolve_in(text: &str, name: &str, includes: &dyn Includes) -> HostConfig
                     argv => Some(Proxy::Command(argv.to_vec())),
                 };
             }
+            "sendenv" => {
+                for pattern in args {
+                    if let Some(gone) = pattern.strip_prefix('-') {
+                        // `-PATTERN` takes earlier names back (OpenSSH 8.7).
+                        cfg.send_env
+                            .retain(|p| !crate::pattern::match_pattern(p, gone));
+                    } else if valid_env_name(&pattern.replace(['*', '?'], "A"))
+                        && !cfg.send_env.contains(&pattern)
+                    {
+                        cfg.send_env.push(pattern);
+                    }
+                }
+            }
+            "setenv" => {
+                for pair in args {
+                    if let Some((k, v)) = pair.split_once('=')
+                        && valid_env_name(k)
+                        && !cfg.set_env.iter().any(|(n, _)| n == k)
+                    {
+                        cfg.set_env.push((k.to_owned(), v.to_owned()));
+                    }
+                }
+            }
+            "remotecommand" if cfg.remote_command.is_none() => {
+                cfg.remote_command = Some(if raw.eq_ignore_ascii_case("none") {
+                    String::new()
+                } else {
+                    raw.clone()
+                });
+            }
+            "requesttty" if cfg.request_tty.is_none() => {
+                cfg.request_tty = match args.first().map(|a| a.to_ascii_lowercase()).as_deref() {
+                    Some("no" | "false") => Some(RequestTty::No),
+                    Some("yes" | "true") => Some(RequestTty::Yes),
+                    Some("force") => Some(RequestTty::Force),
+                    Some("auto") => Some(RequestTty::Auto),
+                    _ => None,
+                };
+            }
+            "stricthostkeychecking" if cfg.strict_host_key_checking.is_none() => {
+                cfg.strict_host_key_checking =
+                    match args.first().map(|a| a.to_ascii_lowercase()).as_deref() {
+                        Some("yes" | "true") => Some(StrictHostKeyChecking::Yes),
+                        Some("ask") => Some(StrictHostKeyChecking::Ask),
+                        Some("accept-new" | "no" | "false" | "off") => {
+                            Some(StrictHostKeyChecking::AcceptNew)
+                        }
+                        _ => None,
+                    };
+            }
+            "userknownhostsfile" if cfg.user_known_hosts_files.is_none() && !args.is_empty() => {
+                cfg.user_known_hosts_files = Some(match args.as_slice() {
+                    [one] if one.eq_ignore_ascii_case("none") => Vec::new(),
+                    files => files.to_vec(),
+                });
+            }
+            "hostkeyalias" if cfg.host_key_alias.is_none() => {
+                cfg.host_key_alias = args.into_iter().next();
+            }
+            "addressfamily" if cfg.address_family.is_none() => {
+                cfg.address_family = match args.first().map(|a| a.to_ascii_lowercase()).as_deref()
+                {
+                    Some("any") => Some(AddressFamily::Any),
+                    Some("inet") => Some(AddressFamily::Inet),
+                    Some("inet6") => Some(AddressFamily::Inet6),
+                    _ => None,
+                };
+            }
             _ => {}
         }
     }
-    cfg
+    wants_final
+}
+
+/// A name `SendEnv` and `SetEnv` may use: letters, digits and `_`, not
+/// starting with a digit, as a POSIX shell takes them.
+pub fn valid_env_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 255
+        && !name.starts_with(|c: char| c.is_ascii_digit())
+        && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+/// Whether a `Match` line matches, and whether it names `canonical` or
+/// `final` (which asks for a second pass). Criteria are ANDed; a `!`
+/// before one negates it. `exec`, `localnetwork`, `version` and unknown
+/// criteria never match.
+fn match_line_matches(
+    args: &[String],
+    name: &str,
+    ctx: &MatchContext<'_>,
+    cfg: &HostConfig,
+    final_pass: bool,
+) -> (bool, bool) {
+    let mut matched = true;
+    let mut asks_final = false;
+    let mut args = args.iter();
+    if args.len() == 0 {
+        return (false, false);
+    }
+    while let Some(word) = args.next() {
+        let lower = word.to_ascii_lowercase();
+        let (negate, criterion) = match lower.strip_prefix('!') {
+            Some(c) => (true, c.to_owned()),
+            None => (false, lower),
+        };
+        let result = match criterion.as_str() {
+            "all" => true,
+            "canonical" | "final" => {
+                asks_final = true;
+                final_pass
+            }
+            "host" | "originalhost" | "user" | "localuser" | "tagged" => {
+                let Some(list) = args.next() else {
+                    return (false, asks_final);
+                };
+                let subject = match criterion.as_str() {
+                    "host" => cfg
+                        .hostname
+                        .as_deref()
+                        .map(|h| expand_match_host(h, name))
+                        .unwrap_or_else(|| name.to_owned()),
+                    "originalhost" => name.to_owned(),
+                    "user" => ctx
+                        .user
+                        .or(cfg.user.as_deref())
+                        .unwrap_or(ctx.local_user)
+                        .to_owned(),
+                    "localuser" => ctx.local_user.to_owned(),
+                    _ => cfg.tag.clone().unwrap_or_default(),
+                };
+                !subject.is_empty() && match_pattern_list(list, &subject)
+            }
+            // A command to run, the local network, the version: FeroSSH
+            // reads its config without running anything, so these never
+            // match. Skip their argument.
+            "exec" | "localnetwork" | "version" => {
+                args.next();
+                false
+            }
+            _ => return (false, asks_final),
+        };
+        matched &= result != negate;
+    }
+    (matched, asks_final)
+}
+
+/// `%h` and `%%` in a `HostName`, for `Match host`.
+fn expand_match_host(hostname: &str, name: &str) -> String {
+    hostname.replace("%%", "\u{0}").replace("%h", name).replace('\u{0}', "%")
 }
 
 /// Expands `~` and the `%d %u %h %r %%` tokens in an `IdentityFile` path.
@@ -715,6 +1008,165 @@ Host *
     #[test]
     fn match_blocks_are_skipped() {
         assert_eq!(resolve(CONFIG, "other").user.as_deref(), Some("global"));
+    }
+
+    fn resolve_as(text: &str, name: &str, user: Option<&str>) -> HostConfig {
+        let ctx = MatchContext {
+            local_user: "jurgen",
+            user,
+        };
+        resolve_for(text, name, &NoIncludes, &ctx)
+    }
+
+    #[test]
+    fn match_criteria() {
+        let text = "\
+Match host *.prod.example !originalhost bastion
+    User ops
+Match user root
+    Port 2200
+Match localuser jurgen
+    ForwardAgent yes
+Match originalhost web
+    HostName web.prod.example
+Match all
+    Tag fallback
+";
+        // HostName is set after the first Match ran, so `host` only sees it
+        // for names that are already in the domain.
+        let c = resolve_as(text, "db.prod.example", None);
+        assert_eq!(c.user.as_deref(), Some("ops"));
+        assert_eq!(c.port, None);
+        assert_eq!(c.forward_agent, Some(true));
+        assert_eq!(c.tag.as_deref(), Some("fallback"));
+        let c = resolve_as(text, "web", Some("root"));
+        assert_eq!(c.user, None);
+        assert_eq!(c.port, Some(2200));
+        assert_eq!(c.hostname.as_deref(), Some("web.prod.example"));
+        // Without a local user `localuser` cannot match.
+        assert_eq!(resolve(text, "x").forward_agent, None);
+    }
+
+    #[test]
+    fn match_host_sees_the_hostname_so_far() {
+        let text = "\
+Host web
+    HostName %h.lan
+Match host *.lan
+    User lan
+";
+        assert_eq!(resolve(text, "web").user.as_deref(), Some("lan"));
+        assert_eq!(resolve(text, "web.lan").user.as_deref(), Some("lan"));
+        assert_eq!(resolve(text, "other").user, None);
+    }
+
+    #[test]
+    fn match_exec_and_unknown_criteria_never_match() {
+        let text = "\
+Match exec \"true\"
+    User a
+Match localnetwork 10.0.0.0/8
+    User b
+Match frobnicate
+    User c
+Match !exec \"false\" host x
+    User d
+Match host
+    User e
+";
+        assert_eq!(resolve(text, "x").user.as_deref(), Some("d"));
+        assert_eq!(resolve(text, "y").user, None);
+    }
+
+    #[test]
+    fn match_final_applies_in_a_second_pass() {
+        let text = "\
+Match final host *.example
+    Port 2222
+Host db
+    HostName db.example
+Match canonical
+    User late
+Host *
+    User early
+";
+        let c = resolve(text, "db");
+        assert_eq!(c.port, Some(2222));
+        // The first pass set User already, and the first value wins.
+        assert_eq!(c.user.as_deref(), Some("early"));
+        assert_eq!(resolve("Match !final\n User first\n", "x").user.as_deref(), Some("first"));
+    }
+
+    #[test]
+    fn session_and_key_keywords() {
+        let text = r#"
+Host build
+    ForwardAgent yes
+    IdentitiesOnly yes
+    IdentityAgent none
+    CertificateFile ~/.ssh/id_ed25519-cert.pub
+    CertificateFile ~/.ssh/other-cert.pub
+    SendEnv LANG LC_* 9BAD BAD-NAME
+    SendEnv -LC_ALL GIT_*
+    SetEnv EDITOR=vim "GREETING=hello world" EDITOR=nano bad-name=x
+    RemoteCommand tmux new -A -s "my session"
+    RequestTTY force
+    StrictHostKeyChecking accept-new
+    UserKnownHostsFile ~/.ssh/known_hosts_build "C:\keys\more hosts"
+    HostKeyAlias build.lan
+    AddressFamily inet6
+Host *
+    ForwardAgent no
+    RemoteCommand ls
+    StrictHostKeyChecking yes
+    UserKnownHostsFile none
+"#;
+        let c = resolve(text, "build");
+        assert_eq!(c.forward_agent, Some(true));
+        assert_eq!(c.identities_only, Some(true));
+        assert_eq!(c.identity_agent.as_deref(), Some("none"));
+        assert_eq!(
+            c.certificate_files,
+            vec!["~/.ssh/id_ed25519-cert.pub", "~/.ssh/other-cert.pub"]
+        );
+        assert_eq!(c.send_env, vec!["LANG", "LC_*", "GIT_*"]);
+        assert_eq!(
+            c.set_env,
+            vec![
+                ("EDITOR".to_owned(), "vim".to_owned()),
+                ("GREETING".to_owned(), "hello world".to_owned())
+            ]
+        );
+        assert_eq!(
+            c.remote_command.as_deref(),
+            Some(r#"tmux new -A -s "my session""#)
+        );
+        assert_eq!(c.request_tty, Some(RequestTty::Force));
+        assert_eq!(
+            c.strict_host_key_checking,
+            Some(StrictHostKeyChecking::AcceptNew)
+        );
+        assert_eq!(
+            c.user_known_hosts_files,
+            Some(vec![
+                "~/.ssh/known_hosts_build".to_owned(),
+                r"C:\keys\more hosts".to_owned()
+            ])
+        );
+        assert_eq!(c.host_key_alias.as_deref(), Some("build.lan"));
+        assert_eq!(c.address_family, Some(AddressFamily::Inet6));
+
+        let c = resolve(text, "other");
+        assert_eq!(c.forward_agent, Some(false));
+        assert_eq!(c.remote_command.as_deref(), Some("ls"));
+        assert_eq!(c.user_known_hosts_files, Some(Vec::new()));
+        let c = resolve("RemoteCommand none\nRemoteCommand ls\n", "x");
+        assert_eq!(c.remote_command.as_deref(), Some(""));
+        let c = resolve("StrictHostKeyChecking off\n", "x");
+        assert_eq!(
+            c.strict_host_key_checking,
+            Some(StrictHostKeyChecking::AcceptNew)
+        );
     }
 
     /// Serves included files from a list.

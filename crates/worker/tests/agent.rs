@@ -24,7 +24,7 @@ use std::process::{Command, Stdio};
 use std::time::Duration;
 
 use common::{Kill, available, base64, broker_reply, log_in, run, sshd, whoami};
-use ferossh_auth::{Broker, Identity, Job, Reply, userauth};
+use ferossh_auth::{Broker, Identity, Job, KeyChoice, Reply, userauth};
 
 #[tokio::test]
 async fn signs_in_with_every_agent_key_type_and_a_certificate() {
@@ -86,7 +86,7 @@ async fn signs_in_with_every_agent_key_type_and_a_certificate() {
     }
 
     let broker = Broker::spawn(|| {}).unwrap();
-    broker.submit(Job::Identities { files: vec![] });
+    broker.submit(Job::Identities(KeyChoice::default()));
     let Reply::Identities { keys, notes } = broker_reply(&broker) else {
         panic!("not identities");
     };

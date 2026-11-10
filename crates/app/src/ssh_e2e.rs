@@ -261,6 +261,7 @@ fn trusts_a_new_host_signs_with_a_key_file_and_runs_a_shell() {
     let env = Env {
         home: server.dir.clone(),
         local_user: user.clone(),
+        vars: Vec::new(),
         config: format!(
             "Host testhost\n  HostName 127.0.0.1\n  Port {}\n  User {user}\n  IdentityFile ~/.ssh/id_ed25519\n",
             server.port
@@ -304,6 +305,7 @@ fn jump_env(jump: &Server, target_port: u16, proxy: &str) -> Env {
     Env {
         home: jump.dir.clone(),
         local_user: user.clone(),
+        vars: Vec::new(),
         config: format!(
             "Host jump\n  HostName 127.0.0.1\n  Port {}\n  User {user}\n  IdentityFile ~/.ssh/id_ed25519\n\
              Host inner\n  HostName 127.0.0.1\n  Port {target_port}\n  User {user}\n  IdentityFile ~/.ssh/id_ed25519\n  {proxy}\n",

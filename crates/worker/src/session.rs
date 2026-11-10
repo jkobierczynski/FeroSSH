@@ -16,14 +16,14 @@
 use std::collections::HashMap;
 use std::fmt;
 use std::future::Future;
-use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 
 use ferossh_forward::x11::{MIT_COOKIE, hex};
 use ferossh_ipc::{
-    ChannelId, MAX_DATA_CHUNK, Message, PromptField, PromptKind, Secrets, Timing, WORKER_IDS,
-    X11Auth,
+    ChannelId, Family, MAX_DATA_CHUNK, Message, PromptField, PromptKind, Secrets, ShellOptions,
+    Timing, WORKER_IDS, X11Auth,
 };
 use russh::client::{self, AuthResult, DisconnectReason, Handle, KeyboardInteractiveAuthResponse};
 use russh::keys::agent::AgentIdentity;
@@ -76,6 +76,10 @@ pub struct Params {
     pub tunnel: Option<ChannelId>,
     /// Open a shell once logged in; a jump host's login opens none.
     pub shell: bool,
+    /// What the shell's channel asks for.
+    pub options: ShellOptions,
+    /// Which IP versions to connect over.
+    pub family: Family,
 }
 
 /// Why a session ended early.
@@ -269,6 +273,9 @@ pub(crate) struct ConnForwards {
     x11: Mutex<Option<([u8; 16], X11Auth)>>,
     /// Changes (fails) when the connection's handler is gone.
     alive: watch::Receiver<()>,
+    /// A shell asked for agent forwarding, so the server may open agent
+    /// channels.
+    agent: AtomicBool,
 }
 
 impl ConnForwards {
@@ -566,6 +573,29 @@ impl client::Handler for Client {
         Ok(())
     }
 
+    async fn server_channel_open_agent_forward(
+        &mut self,
+        channel: Channel<client::Msg>,
+        reply: client::ChannelOpenHandle,
+        _session: &mut client::Session,
+    ) -> Result<(), Failure> {
+        // Only after a shell asked for agent forwarding.
+        if self.forwards.agent.load(Ordering::Relaxed) {
+            reply.accept().await;
+            tokio::spawn(crate::agent::serve(
+                channel,
+                self.forwards.connection,
+                self.out.clone(),
+                self.connections.clone(),
+            ));
+        } else {
+            reply
+                .reject(ChannelOpenFailure::AdministrativelyProhibited)
+                .await;
+        }
+        Ok(())
+    }
+
     async fn disconnected(&mut self, reason: DisconnectReason<Failure>) -> Result<(), Failure> {
         match reason {
             DisconnectReason::ReceivedDisconnect(info) => {
@@ -750,6 +780,8 @@ struct Ctx {
     size: (u16, u16),
     /// X11 forwarding to ask for with the shell.
     x11: Option<X11Auth>,
+    /// What else the shell's channel asks for.
+    options: ShellOptions,
     /// The connection's forwarding state, once logged in.
     forwards: Option<Arc<ConnForwards>>,
 }
@@ -827,6 +859,7 @@ pub async fn run(
         shared: shared.clone(),
         size: (params.cols, params.rows),
         x11: params.x11.clone(),
+        options: params.options.clone(),
         forwards: None,
     };
     let result = session(&params, &mut inbox, tunnel, &mut ctx, &connections).await;
@@ -858,6 +891,7 @@ pub async fn open(
     connection: ChannelId,
     size: (u16, u16),
     x11: Option<X11Auth>,
+    options: ShellOptions,
     mut inbox: mpsc::Receiver<Message>,
     out: mpsc::Sender<Message>,
     connections: Connections,
@@ -868,6 +902,7 @@ pub async fn open(
         shared: Arc::default(),
         size,
         x11,
+        options,
         forwards: None,
     };
     let result = match connections.get(connection) {
@@ -1052,11 +1087,10 @@ async fn connect(
     ctx: &mut Ctx,
     connections: &Connections,
 ) -> Result<(Connection, Arc<ConnForwards>), Failure> {
-    let addr = (p.host.as_str(), p.port);
     let tcp = drive(
         tokio::time::timeout(
             Duration::from_secs(p.timing.connect_timeout.max(1).into()),
-            TcpStream::connect(addr),
+            connect_tcp(&p.host, p.port, p.family),
         ),
         inbox,
         ctx,
@@ -1066,6 +1100,34 @@ async fn connect(
     .map_err(|e| Failure::Refused(format!("Could not connect to {}: {e}.", p.host)))?;
     let _ = tcp.set_nodelay(true);
     handshake(p, preferred, tcp, inbox, ctx, connections).await
+}
+
+/// Connects to the first address of `host` that answers, of the IP
+/// versions `family` allows (`AddressFamily`).
+async fn connect_tcp(host: &str, port: u16, family: Family) -> std::io::Result<TcpStream> {
+    let addrs: Vec<std::net::SocketAddr> = tokio::net::lookup_host((host, port))
+        .await?
+        .filter(|a| match family {
+            Family::Any => true,
+            Family::V4 => a.is_ipv4(),
+            Family::V6 => a.is_ipv6(),
+        })
+        .collect();
+    let mut last = std::io::Error::new(
+        std::io::ErrorKind::NotFound,
+        match family {
+            Family::Any => "no address found",
+            Family::V4 => "no IPv4 address found (AddressFamily inet)",
+            Family::V6 => "no IPv6 address found (AddressFamily inet6)",
+        },
+    );
+    for addr in addrs {
+        match TcpStream::connect(addr).await {
+            Ok(s) => return Ok(s),
+            Err(e) => last = e,
+        }
+    }
+    Err(last)
 }
 
 /// Runs key exchange with `preferred` over `stream`.
@@ -1092,6 +1154,7 @@ async fn handshake(
         remote: Mutex::default(),
         x11: Mutex::default(),
         alive,
+        agent: AtomicBool::new(false),
     });
     let handler = Client {
         channel: ctx.channel,
@@ -1146,11 +1209,27 @@ async fn pump(
             x11_reply = true;
         }
     }
+    // Variables first, as OpenSSH sends them; a server that does not take
+    // one (sshd's AcceptEnv) just ignores it.
+    for (name, value) in &ctx.options.env {
+        channel.set_env(false, name.as_str(), value.as_str()).await?;
+    }
+    if ctx.options.agent
+        && let Some(f) = &ctx.forwards
+    {
+        f.agent.store(true, Ordering::Relaxed);
+        channel.agent_forward(false).await?;
+    }
     let (cols, rows) = ctx.size;
-    channel
-        .request_pty(false, TERM, cols.into(), rows.into(), 0, 0, &[])
-        .await?;
-    channel.request_shell(true).await?;
+    if ctx.options.pty {
+        channel
+            .request_pty(false, TERM, cols.into(), rows.into(), 0, 0, &[])
+            .await?;
+    }
+    match &ctx.options.command {
+        Some(command) => channel.exec(true, command.as_bytes()).await?,
+        None => channel.request_shell(true).await?,
+    }
     ctx.send(connected(ctx)).await?;
 
     let (mut read, write) = channel.split();

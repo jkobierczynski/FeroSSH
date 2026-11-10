@@ -207,6 +207,7 @@ fn local_remote_dynamic_and_x11_forwards() {
     let env = Env {
         home: server.dir.clone(),
         local_user: user.clone(),
+        vars: Vec::new(),
         config: format!(
             "Host testhost\n  HostName 127.0.0.1\n  Port {}\n  User {user}\n  \
              IdentityFile ~/.ssh/id_ed25519\n  LocalForward {local} 127.0.0.1:{echo}\n  \
@@ -510,6 +511,7 @@ fn forwards_change_on_a_live_connection() {
     let env = Env {
         home: server.dir.clone(),
         local_user: user.clone(),
+        vars: Vec::new(),
         config: format!(
             "Host testhost\n  HostName 127.0.0.1\n  Port {}\n  User {user}\n  \
              IdentityFile ~/.ssh/id_ed25519\n",
@@ -659,6 +661,7 @@ fn virtual_desktop(follow: bool) {
     let env = Env {
         home: server.dir.clone(),
         local_user: user.clone(),
+        vars: Vec::new(),
         config: format!(
             "Host testhost\n  HostName 127.0.0.1\n  Port {}\n  User {user}\n  \
              IdentityFile ~/.ssh/id_ed25519\n",
@@ -818,6 +821,7 @@ fn remote_app_agent_is_copied_and_streams_through_the_decoder() {
     let env = Env {
         home: server.dir.clone(),
         local_user: user.clone(),
+        vars: Vec::new(),
         config: format!(
             "Host testhost\n  HostName 127.0.0.1\n  Port {}\n  User {user}\n  \
              IdentityFile ~/.ssh/id_ed25519\n",

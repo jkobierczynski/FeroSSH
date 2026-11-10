@@ -227,6 +227,8 @@ async fn run_ui_with(server: &Server, command: &str, trust: bool, known: Vec<Str
         timing: Default::default(),
         tunnel: None,
         shell: true,
+        options: Default::default(),
+        family: Default::default(),
     })
     .await;
     let mut seen = Seen::default();
@@ -454,6 +456,8 @@ async fn second_shell_shares_the_connection() {
         timing: Default::default(),
         tunnel: None,
         shell: true,
+        options: Default::default(),
+        family: Default::default(),
     })
     .await;
     let (mut host_keys, mut signed) = (0, 0);
@@ -499,6 +503,7 @@ async fn second_shell_shares_the_connection() {
                     cols: 80,
                     rows: 24,
                     x11: None,
+                    options: Default::default(),
                 })
                 .await;
             }
@@ -548,6 +553,7 @@ async fn second_shell_shares_the_connection() {
         cols: 80,
         rows: 24,
         x11: None,
+        options: Default::default(),
     })
     .await;
     loop {
@@ -597,6 +603,8 @@ async fn login_at(server: &Server, port: u16) -> (mpsc::Sender<Message>, mpsc::R
             timing: Default::default(),
             tunnel: None,
             shell: true,
+            options: Default::default(),
+            family: Default::default(),
         })
         .await
         .unwrap();
@@ -980,6 +988,8 @@ async fn through(
         timing: Default::default(),
         tunnel: i.checked_sub(1).map(tunnel),
         shell: i == hops,
+        options: Default::default(),
+        family: Default::default(),
     };
     to[0].send(connect(0)).await.unwrap();
     let mut seen = Chain {

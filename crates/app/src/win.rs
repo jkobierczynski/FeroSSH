@@ -1186,6 +1186,7 @@ fn ssh_env() -> Env {
         local_user: std::env::var("USERNAME").unwrap_or_default(),
         home,
         config,
+        vars: std::env::vars().collect(),
     }
 }
 
@@ -5172,7 +5173,13 @@ impl Window {
                         Some(Host::Ssh(s)) => s.target.alias.clone(),
                         _ => String::new(),
                     };
-                    if !self.start_script(id, &alias, true) {
+                    // A RemoteCommand runs instead of a shell: nothing
+                    // is typed into it.
+                    let command = matches!(
+                        self.panes.get(&id).map(|p| &p.host),
+                        Some(Host::Ssh(s)) if s.target.command.is_some()
+                    );
+                    if !command && !self.start_script(id, &alias, true) {
                         self.cd_after_login(id);
                         self.tmux_after_login(id);
                     }
