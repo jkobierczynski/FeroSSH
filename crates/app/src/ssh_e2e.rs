@@ -383,3 +383,85 @@ fn logs_in_through_a_proxy_command() {
         run.shown
     );
 }
+
+#[test]
+fn match_blocks_certificates_and_session_keywords_reach_the_server() {
+    let user = local_user();
+    // A user CA the server trusts, made before the server starts.
+    let ca_dir = std::env::temp_dir().join(format!("ferossh-e2e-ca-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&ca_dir);
+    std::fs::create_dir_all(&ca_dir).unwrap();
+    let ca = ca_dir.join("ca");
+    if Command::new("ssh-keygen").arg("-?").stderr(Stdio::null()).status().is_err() {
+        return;
+    }
+    keygen(&ca, "");
+    let Some(server) = start_sshd(
+        "keywords",
+        &format!("TrustedUserCAKeys {}.pub\nAcceptEnv FEROSSH_*", ca.display()),
+    ) else {
+        return;
+    };
+    // A key the server knows only through its certificate, kept under a
+    // name only CertificateFile finds.
+    let ssh = server.dir.join(".ssh");
+    let key = ssh.join("certkey");
+    keygen(&key, "");
+    let ok = Command::new("ssh-keygen")
+        .args(["-q", "-s"])
+        .arg(&ca)
+        .args(["-I", "e2e", "-n", &user, "-V", "-5m:+1h"])
+        .arg(key.with_extension("pub"))
+        .status()
+        .is_ok_and(|s| s.success());
+    assert!(ok);
+    std::fs::rename(ssh.join("certkey-cert.pub"), ssh.join("signed.pub")).unwrap();
+    let env = Env {
+        home: server.dir.clone(),
+        local_user: user.clone(),
+        vars: vec![
+            ("FEROSSH_B".into(), "two".into()),
+            ("OTHER".into(), "no".into()),
+        ],
+        config: format!(
+            "Host testhost\n  HostName 127.0.0.1\n  Port {}\n\
+             Match originalhost testhost localuser {user}\n  User {user}\n\
+             \x20 IdentityFile ~/.ssh/certkey\n  CertificateFile ~/.ssh/signed.pub\n\
+             \x20 IdentitiesOnly yes\n  IdentityAgent none\n  StrictHostKeyChecking accept-new\n\
+             \x20 UserKnownHostsFile ~/.ssh/kh_test\n  HostKeyAlias aliased\n\
+             \x20 SetEnv FEROSSH_A=one\n  SendEnv FEROSSH_B OTHER\n\
+             \x20 RemoteCommand echo \"[$FEROSSH_A-$FEROSSH_B-$OTHER]\"; tty; exit 3\n",
+            server.port
+        ),
+    };
+    let (run, session) = connect(&env, "", &[]);
+    assert!(run.prompts.is_empty(), "{:?}", run.prompts);
+    assert!(
+        run.output.contains("[one-two-]"),
+        "{}\n{}",
+        run.shown,
+        run.output
+    );
+    assert!(run.output.contains("not a tty"), "{}", run.output);
+    assert_eq!(session.exit_code, Some(3), "{}", run.shown);
+    assert!(run.shown.contains("certificate"), "{}", run.shown);
+    assert!(
+        run.shown.contains("StrictHostKeyChecking accept-new"),
+        "{}",
+        run.shown
+    );
+    // The key went to the named file, under the alias.
+    let host_key = std::fs::read_to_string(server.dir.join("host_ed25519.pub")).unwrap();
+    let blob = russh::keys::PublicKey::from_openssh(host_key.trim())
+        .unwrap()
+        .to_bytes()
+        .unwrap();
+    let known = ferossh_config::known_hosts::KnownHosts::load(&ssh.join("kh_test")).unwrap();
+    assert_eq!(
+        known.check("aliased", 22, &blob),
+        ferossh_config::known_hosts::Status::Trusted
+    );
+    assert!(!ssh.join("known_hosts").exists());
+    // sshd reads the CA at every login, so only now.
+    let _ = std::fs::remove_dir_all(&ca_dir);
+}
