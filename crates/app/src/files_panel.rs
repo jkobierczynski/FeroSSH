@@ -293,6 +293,8 @@ struct State {
     shown_host: Option<Option<String>>,
     /// A Sync browsing move waiting for its remote folder to list.
     sync_pending: Option<SyncPending>,
+    /// Where the title row's buttons start: the host label ends before.
+    title_buttons_x: i32,
 }
 
 /// Sync browsing moves both lists or neither: the remote folder is asked
@@ -660,6 +662,7 @@ pub fn create(main: HWND, handler: Handler, dpi: u32) -> windows::core::Result<(
                 sync: false,
                 naming: None,
                 sync_pending: None,
+                title_buttons_x: i32::MAX,
                 shown_host: None,
             });
         });
@@ -891,14 +894,9 @@ fn layout(h: &Handles) {
         let sync_x = follow_x - gap6 - sync_w;
         let _ = MoveWindow(h.sync, sync_x, (title - row) / 2, sync_w, row, true);
         let marks_w = px(108);
-        let _ = MoveWindow(
-            h.bookmarks,
-            sync_x - gap6 - marks_w,
-            (title - row) / 2,
-            marks_w,
-            row,
-            true,
-        );
+        let marks_x = sync_x - gap6 - marks_w;
+        with(|s| s.title_buttons_x = marks_x);
+        let _ = MoveWindow(h.bookmarks, marks_x, (title - row) / 2, marks_w, row, true);
         let check_w = px(160);
         let b = px(70);
         let name_w = (inner - check_w - 2 * b - 3 * gap6).max(0);
@@ -1940,7 +1938,7 @@ fn bookmarks_menu(h: &Handles) {
             .remote
             .as_deref()
             .or(b.local.as_deref())
-            .map(|p| short_path(p, 40))
+            .map(|p| short_path(p, 40).replace('&', "&&"))
             .unwrap_or_default();
         windows::core::HSTRING::from(format!("{}\t{place}", b.name.replace('&', "&&")))
     };
@@ -2705,13 +2703,14 @@ fn drag_end(h: &Handles, drag: Drag, x: i32, y: i32) {
 }
 
 fn paint(h: &Handles) {
-    let Some((title_font, font, dpi, host, labels)) = with(|s| {
+    let Some((title_font, font, dpi, host, labels, title_buttons_x)) = with(|s| {
         (
             s.title_font,
             s.font,
             s.dpi,
             s.view.as_ref().and_then(|v| v.host.clone()),
             s.labels,
+            s.title_buttons_x,
         )
     }) else {
         return;
@@ -2754,7 +2753,7 @@ fn paint(h: &Handles) {
             left: measure.right + scale(10, dpi),
             ..tr
         };
-        hr.right = hr.right.min(rc.right - scale(210, dpi));
+        hr.right = hr.right.min(title_buttons_x - scale(6, dpi));
         DrawTextW(
             dc,
             &mut host,
