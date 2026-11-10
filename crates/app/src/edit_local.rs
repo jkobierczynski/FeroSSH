@@ -105,14 +105,6 @@ impl Edits {
         });
     }
 
-    /// The local copy of `remote` on `queue` being edited, if any.
-    pub fn local_of(&self, queue: &str, remote: &[u8]) -> Option<&Path> {
-        self.list
-            .iter()
-            .find(|e| e.queue == queue && e.remote == remote)
-            .map(|e| e.local.as_path())
-    }
-
     /// The put-back of the edit of `local` runs as job `job`.
     pub fn sending(&mut self, local: &Path, job: JobId, sending: Stamp) {
         if let Some(e) = self.list.iter_mut().find(|e| e.local == local) {
@@ -254,6 +246,17 @@ pub fn edit_folder(root: &Path) -> std::io::Result<PathBuf> {
 #[allow(clippy::unwrap_used, clippy::indexing_slicing)]
 mod tests {
     use super::*;
+
+    impl Edits {
+        /// The local copy of `remote` on `queue` being edited, if any.
+        pub fn local_of(&self, queue: &str, remote: &[u8]) -> Option<&Path> {
+            self.list
+                .iter()
+                .find(|e| e.queue == queue && e.remote == remote)
+                .map(|e| e.local.as_path())
+        }
+    }
+
     use std::cell::RefCell;
     use std::collections::HashMap;
 
