@@ -3732,7 +3732,8 @@ impl Window {
                          changed."
                     ),
                     (None, _) if k.out.is_empty() => format!(
-                        "Could not copy the key to {host}: the command did not run ({}).",
+                        "Could not confirm that the key was copied to {host} ({}). Check \
+                         ~/.ssh/authorized_keys on the server.",
                         crate::ssh::sanitize(&reason)
                     ),
                     (_, copy_id::Outcome::Failed(why)) => {
