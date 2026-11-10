@@ -521,7 +521,6 @@ fn forwards_the_agent_and_asks_before_each_signature() {
         return;
     };
     let user = local_user();
-    let ssh = server.dir.join(".ssh");
     // A key only the agent holds, which the server also takes, so that
     // `ssh` on the server can log in to it again through the agent.
     let sock = server.dir.join("agent.sock");
