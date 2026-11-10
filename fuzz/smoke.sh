@@ -20,6 +20,10 @@ cd "$(dirname "$0")/.."
 
 cargo "+$toolchain" fuzz build --target "$triple" || exit 1
 targets=$(cargo "+$toolchain" fuzz list) || exit 1
+if [ -z "$targets" ]; then
+    echo "::error::cargo fuzz list found no fuzz targets"
+    exit 1
+fi
 logs=$(mktemp -d)
 
 run_one() {
