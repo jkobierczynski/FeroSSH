@@ -54,6 +54,8 @@ mod script_editor;
 #[cfg(windows)]
 mod script_hosts;
 #[cfg(windows)]
+mod script_report;
+#[cfg(windows)]
 mod scripts_panel;
 // Platform-neutral, tested everywhere; only the Windows build uses them.
 #[cfg_attr(not(windows), allow(dead_code))]

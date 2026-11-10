@@ -447,6 +447,47 @@ enum ListRow {
     Snippet(usize),
 }
 
+/// How one host's run went, as the native report marks it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RowMark {
+    /// Queued, logging in or running.
+    Waiting,
+    Done,
+    Failed,
+    Stopped,
+}
+
+/// One host's row in the native report.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NativeReportRow {
+    pub label: String,
+    pub mark: RowMark,
+    /// Where it is: queued, logging in, waiting for some text, done, or
+    /// why it failed.
+    pub status: String,
+    /// What its `@capture` steps kept.
+    pub values: String,
+    /// Whether it has a session to show.
+    pub shown: bool,
+}
+
+/// A run's report, as the native page shows it (see
+/// [`SnippetsView::native_report`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NativeReport {
+    /// Another number for another report: its selection starts afresh.
+    pub serial: u64,
+    pub name: String,
+    pub rows: Vec<NativeReportRow>,
+    pub selected: usize,
+    /// Rows over.
+    pub over: usize,
+    /// A run on picked hosts still going: Escape stops it.
+    pub running: bool,
+    /// A run on picked hosts with failed or stopped rows to run again.
+    pub can_retry: bool,
+}
+
 /// A script as the native list shows it (see
 /// [`SnippetsView::native_rows`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -562,6 +603,8 @@ pub struct SnippetsView {
     picker: Option<Picker>,
     /// Another number for another picker: the native page fills anew.
     pick_serial: u64,
+    /// Another number for another report.
+    report_serial: u64,
 }
 
 /// Lines of the picker above its list: title, help, filter, at once,
@@ -843,6 +886,52 @@ impl SnippetsView {
         self.picker = None;
     }
 
+    /// The report shown, for the native page.
+    pub fn native_report(&self) -> Option<NativeReport> {
+        let r = self.report.as_ref()?;
+        let rows = r
+            .rows
+            .iter()
+            .map(|row| {
+                let (mark, status) = match &row.state {
+                    RowState::Queued => (RowMark::Waiting, "queued".to_owned()),
+                    RowState::Connecting => (RowMark::Waiting, "logging in".to_owned()),
+                    RowState::Running(Some(w)) => (RowMark::Waiting, format!("waiting for {w}")),
+                    RowState::Running(None) => (RowMark::Waiting, "running".to_owned()),
+                    RowState::Done => (RowMark::Done, "done".to_owned()),
+                    RowState::Failed(why) => (RowMark::Failed, format!("failed: {why}")),
+                    RowState::Stopped => (RowMark::Stopped, "stopped".to_owned()),
+                };
+                NativeReportRow {
+                    label: row.label.clone(),
+                    mark,
+                    status,
+                    values: row.values.join(" · "),
+                    shown: row.pane.is_some(),
+                }
+            })
+            .collect();
+        Some(NativeReport {
+            serial: self.report_serial,
+            name: r.name.clone(),
+            rows,
+            selected: r.selected.min(r.rows.len().saturating_sub(1)),
+            over: r.rows.iter().filter(|row| row.state.over()).count(),
+            running: r.run.is_some() && !r.over(),
+            can_retry: r.run.is_some()
+                && r.rows
+                    .iter()
+                    .any(|row| matches!(row.state, RowState::Failed(_) | RowState::Stopped)),
+        })
+    }
+
+    /// Selects row `i` of the report.
+    pub fn native_report_select(&mut self, i: usize) {
+        if let Some(r) = &mut self.report {
+            r.selected = i.min(r.rows.len().saturating_sub(1));
+        }
+    }
+
     /// The arguments being asked for, for the native page.
     pub fn native_ask(&self) -> Option<NativeAsk> {
         let a = self.asking.as_ref()?;
@@ -937,6 +1026,7 @@ impl SnippetsView {
         self.picker = None;
         self.report = Some(report);
         self.report_scroll = 0;
+        self.report_serial = DRAFTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Shows the page that picks the hosts to run a snippet on.
@@ -2901,6 +2991,41 @@ mod tests {
             Some("s3cret")
         );
         assert!(!format!("{:?}", v).contains("s3cret"));
+    }
+
+    #[test]
+    fn the_native_report_says_how_each_host_went() {
+        let mut v = SnippetsView::default();
+        assert!(v.native_report().is_none());
+        let mut sw1 = ReportRow::new("sw1", Some(5), RowState::Running(Some("#".into())));
+        sw1.values = vec!["15.2".into(), "up".into()];
+        let rows = vec![
+            sw1,
+            ReportRow::new("sw2", None, RowState::Queued),
+            ReportRow::new("sw3", None, RowState::Failed("refused".into())),
+        ];
+        let run = Run {
+            lines: vec!["show clock".into()],
+            args: Vec::new(),
+            parallel: 1,
+            password: None,
+        };
+        v.show_report(Report::new("Clock", rows, Some(run)));
+        let r = v.native_report().unwrap();
+        assert_eq!((r.name.as_str(), r.over, r.running), ("Clock", 1, true));
+        assert!(r.can_retry);
+        assert_eq!(r.rows[0].status, "waiting for #");
+        assert_eq!(r.rows[0].values, "15.2 · up");
+        assert!(r.rows[0].shown && !r.rows[1].shown);
+        assert_eq!(r.rows[2].mark, RowMark::Failed);
+        assert_eq!(r.rows[2].status, "failed: refused");
+        v.native_report_select(9);
+        assert_eq!(v.native_report().unwrap().selected, 2);
+        let serial = r.serial;
+        v.show_report(Report::new("Clock", Vec::new(), None));
+        let r = v.native_report().unwrap();
+        assert_ne!(r.serial, serial);
+        assert!(!r.running && !r.can_retry);
     }
 
     #[test]
