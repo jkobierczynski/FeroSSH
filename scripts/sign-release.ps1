@@ -28,7 +28,7 @@
 #   6. names the signer in the release notes, publishes the release and
 #      writes the winget manifests for the signed ferossh.exe.
 #
-# It needs PowerShell 7, the GitHub CLI 2.56 or later (gh, logged in with
+# It needs PowerShell 7, the GitHub CLI 2.68 or later (gh, logged in with
 # write access; `gh attestation verify` with --source-ref and
 # --source-digest) and signtool from the Windows SDK. Nothing is published
 # until every check passes; run it again after a failure (it starts again

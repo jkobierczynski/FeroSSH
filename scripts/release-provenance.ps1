@@ -21,7 +21,7 @@
 # PE checksum, the certificate table's directory entry and the certificate
 # table itself, which signing changes.
 #
-# Needs the GitHub CLI 2.56 or later (for --source-ref and --source-digest),
+# Needs the GitHub CLI 2.68 or later (for --source-ref and --source-digest),
 # logged in with access to the repository.
 
 $ReleaseWorkflowPath = ".github/workflows/release.yml"
@@ -44,7 +44,7 @@ function Assert-GhAttestationSupport {
     $help = (& gh attestation verify --help 2>&1) -join "`n"
     foreach ($flag in "--cert-identity", "--source-ref", "--source-digest", "--deny-self-hosted-runners") {
         if ($help -notmatch [regex]::Escape($flag)) {
-            throw "gh attestation verify has no $flag option: update the GitHub CLI to 2.56 or later (winget upgrade GitHub.cli)"
+            throw "gh attestation verify has no $flag option: update the GitHub CLI to 2.68 or later (winget upgrade GitHub.cli)"
         }
     }
 }
