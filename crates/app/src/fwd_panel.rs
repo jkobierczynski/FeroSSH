@@ -708,13 +708,14 @@ fn selected_row() -> Option<FwdRow> {
     row_at(h.list, selected_index(h.list)?)
 }
 
-/// Edit for a forward (not a desktop's tunnel), Retry for a stopped one,
-/// Stop for any forward.
+/// Edit for a forward (not a desktop's tunnel), Retry for a stopped one
+/// (not a desktop's tunnel either: it would become a saved forward), Stop
+/// for any forward.
 fn enable_buttons(h: &Handles) {
     let row = selected_row();
     let forward = row.as_ref().is_some_and(|r| r.spec.is_some());
     let edit = forward && row.as_ref().is_some_and(|r| !r.desktop);
-    let retry = row.as_ref().is_some_and(|r| r.bad);
+    let retry = edit && row.as_ref().is_some_and(|r| r.bad);
     // SAFETY: our own controls.
     unsafe {
         for (b, on) in h.buttons.iter().zip([edit, retry, forward]) {
@@ -808,6 +809,11 @@ fn retry_selected(h: &Handles) {
     let Some(row) = selected_row() else {
         return;
     };
+    // A desktop's tunnel is not in the connection's forwards: replacing
+    // it would add it there for good.
+    if row.desktop {
+        return;
+    }
     if let Some(spec) = row.spec {
         quiet(h);
         emit(Event::Action(FwdAction::Replace {
@@ -1029,7 +1035,12 @@ fn context_menu(h: Handles, lparam: LPARAM) {
             EDIT as usize,
             w!("&Edit\tEnter"),
         );
-        let _ = AppendMenuW(menu, flag(row.bad), RETRY as usize, w!("&Retry"));
+        let _ = AppendMenuW(
+            menu,
+            flag(row.bad && forward && !row.desktop),
+            RETRY as usize,
+            w!("&Retry"),
+        );
         let _ = AppendMenuW(menu, MF_SEPARATOR, 0, None);
         let _ = AppendMenuW(menu, flag(forward), STOP as usize, w!("&Stop\tDel"));
         let chosen = TrackPopupMenu(
