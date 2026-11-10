@@ -744,10 +744,13 @@ mod tests {
     }
 
     /// Capture exec and stdin separately, replying only after the client sends EOF.
+    /// A name of `hang` gets no reply at all, like a command that never ends.
     struct ChecksumServer {
         command: Vec<u8>,
         input: Vec<u8>,
         received: mpsc::UnboundedSender<(Vec<u8>, Vec<u8>)>,
+        /// What the client did to a hung command: `TERM` and `close`.
+        cleanup: mpsc::UnboundedSender<&'static str>,
     }
 
     impl russh::server::Handler for ChecksumServer {
@@ -798,52 +801,100 @@ mod tests {
             session: &mut russh::server::Session,
         ) -> Result<(), Self::Error> {
             let failed = self.input == b"missing-tool\0";
+            let hang = self.input == b"hang\0";
             self.received
                 .send((
                     std::mem::take(&mut self.command),
                     std::mem::take(&mut self.input),
                 ))
                 .map_err(|_| russh::Error::Inconsistent)?;
+            if hang {
+                return Ok(());
+            }
             // Even plausible hash output must not override an unsuccessful exit.
             session.data(channel, format!("{} *file\n", "a".repeat(64)).into_bytes())?;
             session.exit_status_request(channel, if failed { 127 } else { 0 })?;
             session.eof(channel)?;
             session.close(channel)
         }
+
+        /// Report the signal a stopped checksum sends.
+        async fn signal(
+            &mut self,
+            _: russh::ChannelId,
+            signal: Sig,
+            _: &mut russh::server::Session,
+        ) -> Result<(), Self::Error> {
+            if matches!(signal, Sig::TERM) {
+                let _ = self.cleanup.send("TERM");
+            }
+            Ok(())
+        }
+
+        /// Report the client closing a channel.
+        async fn channel_close(
+            &mut self,
+            _: russh::ChannelId,
+            _: &mut russh::server::Session,
+        ) -> Result<(), Self::Error> {
+            let _ = self.cleanup.send("close");
+            Ok(())
+        }
+    }
+
+    /// The fixture server's captures and cleanup events.
+    type Fixture = (
+        mpsc::UnboundedReceiver<(Vec<u8>, Vec<u8>)>,
+        mpsc::UnboundedReceiver<&'static str>,
+    );
+
+    /// Connects a client to an in-process [`ChecksumServer`].
+    async fn checksum_fixture() -> Result<
+        (
+            russh::client::Handle<ChecksumClient>,
+            russh::server::RunningSession<ChecksumServer>,
+            Fixture,
+        ),
+        Box<dyn std::error::Error>,
+    > {
+        use russh::keys::ssh_key::{PrivateKey, private::Ed25519Keypair};
+
+        let (client_stream, server_stream) = tokio::io::duplex(64 * 1024);
+        let mut config = russh::server::Config::default();
+        config
+            .keys
+            .push(PrivateKey::from(Ed25519Keypair::from_seed(&[3; 32])));
+        let (received, captures) = mpsc::unbounded_channel();
+        let (cleanup, cleanups) = mpsc::unbounded_channel();
+        let server = tokio::spawn(async move {
+            russh::server::run_stream(
+                Arc::new(config),
+                server_stream,
+                ChecksumServer {
+                    command: Vec::new(),
+                    input: Vec::new(),
+                    received,
+                    cleanup,
+                },
+            )
+            .await
+        });
+        let mut conn = russh::client::connect_stream(
+            Arc::new(russh::client::Config::default()),
+            client_stream,
+            ChecksumClient,
+        )
+        .await?;
+        let running = server.await??;
+        assert!(conn.authenticate_none("checksum-test").await?.success());
+        Ok((conn, running, (captures, cleanups)))
     }
 
     /// Exercise the production checksum path over SSH without shells or external tools.
     #[tokio::test]
     async fn checksum_names_are_data_not_shell_syntax() -> Result<(), Box<dyn std::error::Error>> {
-        use russh::keys::ssh_key::{PrivateKey, private::Ed25519Keypair};
-
         tokio::time::timeout(Duration::from_secs(10), async {
-            let (client_stream, server_stream) = tokio::io::duplex(64 * 1024);
-            let mut config = russh::server::Config::default();
-            config
-                .keys
-                .push(PrivateKey::from(Ed25519Keypair::from_seed(&[3; 32])));
-            let (received, mut captures) = mpsc::unbounded_channel();
-            let server = tokio::spawn(async move {
-                russh::server::run_stream(
-                    Arc::new(config),
-                    server_stream,
-                    ChecksumServer {
-                        command: Vec::new(),
-                        input: Vec::new(),
-                        received,
-                    },
-                )
-                .await
-            });
-            let mut conn = russh::client::connect_stream(
-                Arc::new(russh::client::Config::default()),
-                client_stream,
-                ChecksumClient,
-            )
-            .await?;
-            let running = server.await??;
-            assert!(conn.authenticate_none("checksum-test").await?.success());
+            let (conn, running, (mut captures, _)) = checksum_fixture().await?;
             let (_stop_tx, stop) = watch::channel(false);
             for path in [
                 b"a&calc&rem".as_slice(),
@@ -882,6 +933,39 @@ mod tests {
                 }
             ));
             assert!(captures.try_recv().is_err());
+            conn.disconnect(Disconnect::ByApplication, "test complete", "")
+                .await?;
+            running.await?;
+            Ok::<_, Box<dyn std::error::Error>>(())
+        })
+        .await??;
+        Ok(())
+    }
+
+    /// A checksum stopped while its command hangs answers at once, and
+    /// signals and closes the remote command rather than leaving it running.
+    #[tokio::test]
+    async fn a_stopped_checksum_ends_its_command() -> Result<(), Box<dyn std::error::Error>> {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            let (conn, running, (mut captures, mut cleanups)) = checksum_fixture().await?;
+            let conn = Arc::new(conn);
+            let (stop_tx, stop) = watch::channel(false);
+            let job = tokio::spawn({
+                let conn = conn.clone();
+                async move { checksum(&conn, b"hang", stop).await }
+            });
+            // The server has the request and is holding its reply.
+            captures.recv().await.ok_or("missing checksum capture")?;
+            stop_tx.send(true)?;
+            assert!(matches!(
+                job.await?,
+                SftpReply::Failed {
+                    code: sftp_code::UNSUPPORTED,
+                    ..
+                }
+            ));
+            assert_eq!(cleanups.recv().await, Some("TERM"));
+            assert_eq!(cleanups.recv().await, Some("close"));
             conn.disconnect(Disconnect::ByApplication, "test complete", "")
                 .await?;
             running.await?;
