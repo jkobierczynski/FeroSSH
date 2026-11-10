@@ -230,6 +230,8 @@ const TIMER_LAUNCH: usize = 8;
 const TIMER_EDIT: usize = 9;
 /// Asks the waiting agent question again once another dialog has closed.
 const TIMER_AGENT_ASK: usize = 10;
+/// Looks again for the new key once another dialog has closed.
+const TIMER_KEYGEN: usize = 11;
 const LAUNCH_TICK_MS: u32 = 1000;
 /// How long a launch's login session may stay hidden with nothing
 /// holding its connection before it is shown.
@@ -3765,6 +3767,13 @@ impl Window {
 
     fn poll_keygen(&mut self) -> Option<Command> {
         let rx = self.keygen.as_ref()?;
+        if DIALOG_OPEN.get() {
+            // Another dialog would swallow the answer: keep it, and look
+            // again soon.
+            // SAFETY: our window; replaces any earlier timer with this id.
+            unsafe { SetTimer(Some(self.hwnd), TIMER_KEYGEN, 500, None) };
+            return None;
+        }
         let (path, result) = match rx.try_recv() {
             Ok(made) => made,
             Err(std::sync::mpsc::TryRecvError::Empty) => return None,
@@ -15589,6 +15598,12 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                 if let Some(commands) = with_window(Window::on_output) {
                     run_commands(hwnd, commands);
                 }
+                LRESULT(0)
+            }
+            WM_TIMER if wparam.0 == TIMER_KEYGEN => {
+                let _ = KillTimer(Some(hwnd), TIMER_KEYGEN);
+                let made = with_window(Window::poll_keygen).flatten();
+                run_commands(hwnd, made.into_iter().collect());
                 LRESULT(0)
             }
             WM_TIMER if wparam.0 == TIMER_AGENT_ASK => {
