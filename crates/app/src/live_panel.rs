@@ -18,9 +18,8 @@ use std::cell::RefCell;
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
     BeginPaint, COLOR_GRAYTEXT, COLOR_WINDOW, COLOR_WINDOWTEXT, DT_LEFT, DT_NOPREFIX, DT_RIGHT,
-    DT_SINGLELINE, DT_VCENTER, DeleteObject, DrawTextW, EndPaint, FillRect, GetSysColor,
-    GetSysColorBrush, HFONT, HGDIOBJ, PAINTSTRUCT, SelectObject, SetBkMode, SetTextColor,
-    TRANSPARENT,
+    DT_SINGLELINE, DT_VCENTER, DeleteObject, DrawTextW, EndPaint, FillRect, HFONT, HGDIOBJ,
+    PAINTSTRUCT, SelectObject, SetBkMode, SetTextColor, TRANSPARENT,
 };
 use windows::Win32::UI::Controls::{
     EM_SETCUEBANNER, EM_SETSEL, LIST_VIEW_ITEM_STATE_FLAGS, LVCF_TEXT, LVCF_WIDTH, LVCOLUMNW,
@@ -37,12 +36,12 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     BN_CLICKED, BS_DEFPUSHBUTTON, BS_PUSHBUTTON, CS_HREDRAW, CS_VREDRAW, CreateWindowExW,
-    DefWindowProcW, EN_CHANGE, EN_SETFOCUS, ES_AUTOHSCROLL, GetClientRect, GetWindowTextLengthW,
-    HMENU, IDC_ARROW, IDCANCEL, IDOK, IsChild, IsDialogMessageW, IsWindowVisible, LoadCursorW, MSG,
-    MoveWindow, PostMessageW, RegisterClassW, SW_HIDE, SW_SHOWNA, SendMessageW, SetWindowTextW,
-    ShowWindow, WINDOW_EX_STYLE, WINDOW_STYLE, WM_APP, WM_CHAR, WM_COMMAND, WM_ERASEBKGND,
-    WM_KEYDOWN, WM_NOTIFY, WM_PAINT, WM_SYSCHAR, WM_SYSKEYDOWN, WM_SYSKEYUP, WNDCLASSW, WS_BORDER,
-    WS_CHILD, WS_CLIPCHILDREN, WS_CLIPSIBLINGS, WS_EX_CONTROLPARENT, WS_TABSTOP, WS_VISIBLE,
+    EN_CHANGE, EN_SETFOCUS, ES_AUTOHSCROLL, GetClientRect, GetWindowTextLengthW, HMENU, IDC_ARROW,
+    IDCANCEL, IDOK, IsChild, IsDialogMessageW, IsWindowVisible, LoadCursorW, MSG, MoveWindow,
+    PostMessageW, RegisterClassW, SW_HIDE, SW_SHOWNA, SendMessageW, SetWindowTextW, ShowWindow,
+    WINDOW_EX_STYLE, WINDOW_STYLE, WM_APP, WM_CHAR, WM_COMMAND, WM_ERASEBKGND, WM_KEYDOWN,
+    WM_NOTIFY, WM_PAINT, WM_SYSCHAR, WM_SYSKEYDOWN, WM_SYSKEYUP, WNDCLASSW, WS_BORDER, WS_CHILD,
+    WS_CLIPCHILDREN, WS_CLIPSIBLINGS, WS_EX_CONTROLPARENT, WS_TABSTOP, WS_VISIBLE,
 };
 use windows::core::{PCWSTR, PWSTR, w};
 
@@ -805,7 +804,7 @@ fn paint(h: Handles) {
         let dc = BeginPaint(h.panel, &mut ps);
         let mut rc = RECT::default();
         let _ = GetClientRect(h.panel, &mut rc);
-        FillRect(dc, &rc, GetSysColorBrush(COLOR_WINDOW));
+        FillRect(dc, &rc, crate::ui_theme::sys_brush(COLOR_WINDOW));
         let old = SelectObject(dc, HGDIOBJ(title_font.0));
         SetBkMode(dc, TRANSPARENT);
         let pad = scale(10, dpi);
@@ -817,7 +816,7 @@ fn paint(h: Handles) {
         };
         SetTextColor(
             dc,
-            windows::Win32::Foundation::COLORREF(GetSysColor(COLOR_WINDOWTEXT)),
+            windows::Win32::Foundation::COLORREF(crate::ui_theme::sys_color(COLOR_WINDOWTEXT)),
         );
         let mut text: Vec<u16> = "Sessions".encode_utf16().collect();
         DrawTextW(
@@ -829,7 +828,7 @@ fn paint(h: Handles) {
         if total > 0 {
             SetTextColor(
                 dc,
-                windows::Win32::Foundation::COLORREF(GetSysColor(COLOR_GRAYTEXT)),
+                windows::Win32::Foundation::COLORREF(crate::ui_theme::sys_color(COLOR_GRAYTEXT)),
             );
             let mut count: Vec<u16> = total.to_string().encode_utf16().collect();
             DrawTextW(
@@ -877,6 +876,6 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
             LRESULT(0)
         }
         // SAFETY: default handling for everything else.
-        _ => unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) },
+        _ => crate::ui_theme::def_window_proc(hwnd, msg, wparam, lparam),
     }
 }
