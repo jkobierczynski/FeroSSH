@@ -359,9 +359,9 @@ mod cmd {
     pub const SNIPPET_FOLDER: u32 = 215;
     pub const TOOLS_PIN: u32 = 216;
     pub const TOOLS_RAIL: u32 = 217;
-    /// View > Full screen (F11).
+    /// Settings > Full screen (F11).
     pub const FULL_SCREEN: u32 = 218;
-    /// View > F11 switches full screen.
+    /// Settings > F11 switches full screen.
     pub const FULL_SCREEN_KEY: u32 = 219;
     /// Plus the index into `WindowColours::ALL`.
     pub const WINDOW_COLOURS: u32 = 220;
@@ -789,7 +789,7 @@ struct Window {
     strip_metrics: CellMetrics,
     menu: HMENU,
     menu_visible: bool,
-    /// Full screen (View > Full screen, F11): how to put the window back.
+    /// Full screen (Settings > Full screen, F11): how to put the window back.
     full_screen: Option<FullScreen>,
     focused: bool,
     /// Repaint everything on the next WM_PAINT, not only dirty rows.
@@ -2181,7 +2181,7 @@ fn monitor_rect(hwnd: HWND) -> Option<RECT> {
     }
 }
 
-/// View > Full screen and F11: the window loses its caption, frame and
+/// Settings > Full screen and F11: the window loses its caption, frame and
 /// menu bar and covers its monitor, taskbar too; the second time puts
 /// back where it was, its size and whether it was maximized. Alt still
 /// shows the menu bar, which hides again once a menu closes.
@@ -12596,7 +12596,7 @@ enum Command {
     /// The last pane closed: the window goes.
     Destroy,
     SetMenuVisible(bool),
-    /// View > Full screen and F11: in or out of full screen.
+    /// Settings > Full screen and F11: in or out of full screen.
     FullScreen,
     Copy,
     Paste,

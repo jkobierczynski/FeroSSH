@@ -502,7 +502,7 @@ pub struct Settings {
     /// Ask before a snippet is typed into a pane with the Production
     /// theme. On unless turned off.
     pub confirm_production: bool,
-    /// F11 switches full screen (View > F11 switches full screen). On
+    /// F11 switches full screen (Settings > F11 switches full screen). On
     /// unless turned off; off, F11 goes to the terminal as before.
     pub full_screen_key: bool,
     /// Snippets with a `When` text answer the host by themselves. On
