@@ -156,9 +156,15 @@ pub(crate) type Connection = Handle<Client>;
 pub(crate) enum Route {
     /// A shell, SFTP or a remote forward's listener. Only the UI sends on
     /// it (what the user types or pastes, and SFTP requests the UI keeps
-    /// to a window); a task per session feeds it into the session's
-    /// bounded queue, so a stalled session never holds up the pipe.
-    Session(mpsc::UnboundedSender<Message>),
+    /// to a window), without waiting; a task per session feeds it into
+    /// the session's bounded queue, so a stalled session never holds up
+    /// the pipe. A session whose front queue is full is closed. Dropping
+    /// the second half (with the route) stops that task.
+    Session(
+        mpsc::Sender<Message>,
+        #[allow(dead_code)] // Held only to be dropped with the route.
+        Arc<oneshot::Sender<()>>,
+    ),
     /// A forwarded stream: flow control bounds what the UI sends, and one
     /// slow stream must never hold up the pipe.
     Stream(mpsc::UnboundedSender<Message>),
@@ -167,7 +173,7 @@ pub(crate) enum Route {
 impl Route {
     fn is_closed(&self) -> bool {
         match self {
-            Route::Session(tx) => tx.is_closed(),
+            Route::Session(tx, _) => tx.is_closed(),
             Route::Stream(tx) => tx.is_closed(),
         }
     }

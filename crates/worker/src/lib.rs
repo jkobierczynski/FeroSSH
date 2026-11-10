@@ -21,16 +21,21 @@ mod tunnel;
 mod zmodem;
 
 use std::io::{Read, Write};
+use std::sync::Arc;
 use std::thread;
 
 use ferossh_ipc::{ChannelId, Decoder, Message, PROTOCOL_VERSION, Side, encode};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 
 pub use session::Params;
 use session::{Connections, Route};
 
 /// Messages queued in each direction before the sender waits.
 const QUEUE: usize = 64;
+/// Messages the dispatcher queues for one session that is not taking
+/// them (its server stopped reading). Past this the session is closed
+/// rather than let what the user types or pastes fill the worker's memory.
+const FRONT_QUEUE: usize = 4096;
 
 /// Serves the UI: one task per shell, SFTP channel, remote forward
 /// listener and forwarded stream, routed by channel id; shells opened with
@@ -52,27 +57,35 @@ pub async fn serve(mut inbox: mpsc::Receiver<Message>, out: mpsc::Sender<Message
     let connections = Connections::default();
     let routes = connections.routes.clone();
     // A queue for a session task, or `None` when the id is taken. The
-    // dispatcher hands messages to an unbounded front queue and a task of
-    // its own feeds them on, so one session that stops reading (its
-    // server stopped taking data) never stalls the others.
+    // dispatcher hands messages to a front queue without waiting and a
+    // task of its own feeds them on, so one session that stops reading
+    // (its server stopped taking data) never stalls the others. When the
+    // front queue fills, the dispatcher drops the session's route: the
+    // task stops at once, without the messages still queued, and the
+    // session's queue ends, which closes it once it reads again.
     let session = |channel: ChannelId| {
         let (tx, rx) = mpsc::channel(QUEUE);
-        let (front, mut queued) = mpsc::unbounded_channel::<Message>();
-        if !routes.insert(channel, Route::Session(front)) {
+        let (front, mut queued) = mpsc::channel::<Message>(FRONT_QUEUE);
+        let (alive, mut gone) = oneshot::channel::<()>();
+        if !routes.insert(channel, Route::Session(front, Arc::new(alive))) {
             return None;
         }
         tokio::spawn(async move {
             loop {
                 tokio::select! {
+                    biased;
+                    _ = &mut gone => break,
+                    () = tx.closed() => break,
                     msg = queued.recv() => match msg {
-                        Some(msg) => {
-                            if tx.send(msg).await.is_err() {
+                        Some(msg) => tokio::select! {
+                            biased;
+                            _ = &mut gone => break,
+                            sent = tx.send(msg) => if sent.is_err() {
                                 break;
-                            }
-                        }
+                            },
+                        },
                         None => break,
                     },
-                    () = tx.closed() => break,
                 }
             }
         });
@@ -245,7 +258,7 @@ pub async fn serve(mut inbox: mpsc::Receiver<Message>, out: mpsc::Sender<Message
                     continue;
                 };
                 let delivered = match routes.get(channel) {
-                    Some(Route::Session(tx)) => tx.send(other).is_ok(),
+                    Some(Route::Session(tx, _)) => tx.try_send(other).is_ok(),
                     Some(Route::Stream(tx)) => tx.send(other).is_ok(),
                     None => true,
                 };

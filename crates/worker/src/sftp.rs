@@ -21,8 +21,8 @@ use std::time::Duration;
 
 use ferossh_ipc::{ChannelId, DirEntry, Message, OpenMode, SftpOp, SftpReply, sftp_code};
 use ferossh_sftp::wire::{self, Decoder, Request, Response, pflags};
-use russh::{ChannelMsg, Disconnect};
-use tokio::sync::mpsc;
+use russh::{ChannelMsg, Disconnect, Sig};
+use tokio::sync::{mpsc, watch};
 
 use crate::session::{Connection, Connections};
 
@@ -41,6 +41,8 @@ const CHECKSUM_TIMEOUT: Duration = Duration::from_secs(600);
 /// Checksums running at once: each holds an exec channel on the server
 /// for up to [`CHECKSUM_TIMEOUT`].
 const MAX_CHECKSUMS: usize = 4;
+/// How long SFTP's end waits for checksums to stop their commands.
+const CHECKSUM_STOP: Duration = Duration::from_secs(2);
 
 /// What an SFTP request id is waiting for.
 #[derive(Debug)]
@@ -79,6 +81,8 @@ struct Sftp {
     next_handle: u32,
     /// Remote checksums in progress, stopped when SFTP ends.
     checksums: tokio::task::JoinSet<()>,
+    /// Set when SFTP ends: each checksum then stops its remote command.
+    stop: watch::Sender<bool>,
 }
 
 /// Why the SFTP channel ended.
@@ -284,8 +288,9 @@ impl Sftp {
                 let conn = self.conn.clone();
                 let out = self.out.clone();
                 let channel = self.channel;
+                let stop = self.stop.subscribe();
                 self.checksums.spawn(async move {
-                    let reply = checksum(&conn, &path).await;
+                    let reply = checksum(&conn, &path, stop).await;
                     let _ = out
                         .send(Message::SftpReply {
                             channel,
@@ -456,7 +461,7 @@ fn parse_sum(output: &[u8]) -> Option<String> {
 }
 
 /// Runs `sha256sum` on the server for `path`.
-async fn checksum(conn: &Connection, path: &[u8]) -> SftpReply {
+async fn checksum(conn: &Connection, path: &[u8], mut stop: watch::Receiver<bool>) -> SftpReply {
     let unsupported = |why: &str| SftpReply::Failed {
         code: sftp_code::UNSUPPORTED,
         message: why.to_owned(),
@@ -464,34 +469,54 @@ async fn checksum(conn: &Connection, path: &[u8]) -> SftpReply {
     let Some(input) = checksum_input(path) else {
         return unsupported("the name cannot be passed to a command");
     };
-    let run = async {
-        let mut ch = conn.channel_open_session().await.ok()?;
+    let deadline = tokio::time::sleep(CHECKSUM_TIMEOUT);
+    tokio::pin!(deadline);
+    let start = async {
+        let ch = conn.channel_open_session().await.ok()?;
         ch.exec(true, CHECKSUM_COMMAND).await.ok()?;
         ch.data(&input[..]).await.ok()?;
         ch.eof().await.ok()?;
-        let mut output = Vec::new();
-        let mut status = None;
-        while let Some(msg) = ch.wait().await {
-            match msg {
-                ChannelMsg::Data { data } => {
+        Some(ch)
+    };
+    let mut ch = tokio::select! {
+        ch = start => match ch {
+            Some(ch) => ch,
+            None => return unsupported("the server has no xargs or sha256sum"),
+        },
+        () = &mut deadline => return unsupported("sha256sum took too long"),
+        _ = stop.wait_for(|s| *s) => return unsupported("SFTP closed"),
+    };
+    let mut output = Vec::new();
+    let mut status = None;
+    let why = loop {
+        tokio::select! {
+            msg = ch.wait() => match msg {
+                Some(ChannelMsg::Data { data }) => {
                     if output.len() < 4096 {
                         output.extend_from_slice(&data);
                     }
                 }
-                ChannelMsg::ExitStatus { exit_status } => status = Some(exit_status),
-                ChannelMsg::Close => break,
-                _ => {}
-            }
+                Some(ChannelMsg::ExitStatus { exit_status }) => status = Some(exit_status),
+                Some(ChannelMsg::Close) | None => break None,
+                Some(_) => {}
+            },
+            () = &mut deadline => break Some("sha256sum took too long"),
+            _ = stop.wait_for(|s| *s) => break Some("SFTP closed"),
         }
-        Some((status, output))
     };
-    match tokio::time::timeout(CHECKSUM_TIMEOUT, run).await {
-        Ok(Some((Some(0), output))) => match parse_sum(&output) {
+    if let Some(why) = why {
+        // Stop the command rather than leave it hashing on the server
+        // (OpenSSH 7.9 and later deliver the signal), then close.
+        let _ = ch.signal(Sig::TERM).await;
+        let _ = ch.close().await;
+        return unsupported(why);
+    }
+    match status {
+        Some(0) => match parse_sum(&output) {
             Some(hex) => SftpReply::Checksum(hex),
             None => unsupported("sha256sum printed something unexpected"),
         },
-        Ok(_) => unsupported("the server has no xargs or sha256sum"),
-        Err(_) => unsupported("sha256sum took too long"),
+        _ => unsupported("the server has no xargs or sha256sum"),
     }
 }
 
@@ -558,6 +583,7 @@ async fn serve(
         handles: HashMap::new(),
         next_handle: 1,
         checksums: tokio::task::JoinSet::new(),
+        stop: watch::channel(false).0,
     };
     let mut decoder = Decoder::new();
     let end =
@@ -567,8 +593,14 @@ async fn serve(
             Err(_) => refused("The server's SFTP did not answer."),
         };
     writer.abort();
-    // Their connection holds go with them, so the caller's release can
-    // still be the last one.
+    // Checksums stop their remote commands and end; their connection
+    // holds go with them, so the caller's release can still be the last
+    // one. One that does not end in time is dropped.
+    let _ = s.stop.send(true);
+    let _ = tokio::time::timeout(CHECKSUM_STOP, async {
+        while s.checksums.join_next().await.is_some() {}
+    })
+    .await;
     s.checksums.shutdown().await;
     end
 }
