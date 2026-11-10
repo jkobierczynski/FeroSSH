@@ -5,11 +5,13 @@
 //! through this crate after checking that each request is a user-auth
 //! request for the session the user started ([`userauth::check`]).
 //! FIDO2 security keys in key files sign through an [`sk::Authenticator`]:
-//! Windows' WebAuthn ([`webauthn`]) in the window. TPM keys through CNG
-//! are still to come.
+//! Windows' WebAuthn ([`webauthn`]) in the window. Kerberos logins use
+//! the Windows logon's tickets through SSPI ([`gss`]). TPM keys through
+//! CNG are still to come.
 
 pub mod agent;
 pub mod broker;
+pub mod gss;
 pub mod keyfile;
 pub mod keygen;
 pub mod sk;

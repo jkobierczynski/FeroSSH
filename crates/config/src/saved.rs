@@ -39,6 +39,10 @@ pub struct SavedHost {
     pub forwards: Vec<ForwardSpec>,
     /// `ForwardAgent yes`.
     pub forward_agent: bool,
+    /// `GSSAPIAuthentication yes` or `no`; unset leaves it to FeroSSH.
+    pub gssapi: Option<bool>,
+    /// `GSSAPIDelegateCredentials yes`.
+    pub gssapi_delegate: bool,
 }
 
 /// Whether `text` can go on a `ProxyJump` line: hosts that parse, and
@@ -134,6 +138,16 @@ pub fn parse(text: &str) -> Vec<SavedHost> {
             "forwardagent" => {
                 h.forward_agent = first.is_some_and(|f| f.eq_ignore_ascii_case("yes"));
             }
+            "gssapiauthentication" => {
+                h.gssapi = match first.map(|f| f.to_ascii_lowercase()).as_deref() {
+                    Some("yes") => Some(true),
+                    Some("no") => Some(false),
+                    _ => None,
+                };
+            }
+            "gssapidelegatecredentials" => {
+                h.gssapi_delegate = first.is_some_and(|f| f.eq_ignore_ascii_case("yes"));
+            }
             "localforward" | "remoteforward" | "dynamicforward" => {
                 let kind = match keyword.as_str() {
                     "localforward" => ForwardKind::Local,
@@ -198,6 +212,16 @@ pub(crate) fn write_host(out: &mut String, h: &SavedHost, comment: Option<&str>)
     if h.forward_agent {
         let _ = writeln!(out, "    ForwardAgent yes");
     }
+    if let Some(on) = h.gssapi {
+        let _ = writeln!(
+            out,
+            "    GSSAPIAuthentication {}",
+            if on { "yes" } else { "no" }
+        );
+    }
+    if h.gssapi_delegate {
+        let _ = writeln!(out, "    GSSAPIDelegateCredentials yes");
+    }
 }
 
 #[cfg(test)]
@@ -222,6 +246,8 @@ mod tests {
                     parse_option("-D 1080").unwrap(),
                 ],
                 forward_agent: true,
+                gssapi: Some(true),
+                gssapi_delegate: true,
             },
             SavedHost {
                 alias: "pi".into(),
@@ -239,6 +265,8 @@ mod tests {
         assert_eq!(cfg.port, Some(2222));
         assert_eq!(cfg.identity_files, [r"C:\Keys\web key"]);
         assert_eq!(cfg.forward_agent, Some(true));
+        assert_eq!(cfg.gssapi_authentication, Some(true));
+        assert_eq!(cfg.gssapi_delegate_credentials, Some(true));
         assert_eq!(
             cfg.proxy,
             Some(Proxy::Jump(vec![

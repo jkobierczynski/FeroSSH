@@ -216,13 +216,16 @@ jobs:
       # Telnet test talks to BusyBox's telnetd (only the static build has it).
       # The ZMODEM tests run lrzsz's sz and rz, over pipes and in the shell.
       # Open virtual desktop's tests start Xvfb and x11vnc, and Xvnc, through sshd.
+      # The Kerberos test runs MIT's KDC (krb5-kdc, and kadmin.local from
+      # krb5-admin-server) for a throwaway realm in a temporary directory.
       - run: |
           sudo sed -i 's/^Types: deb$/Types: deb deb-src/' /etc/apt/sources.list.d/ubuntu.sources
           sudo apt-get update
-          sudo apt-get install -y openssh-server putty-tools xauth tmux dpkg-dev autoconf libssl-dev zlib1g-dev busybox-static lrzsz xvfb x11vnc tigervnc-standalone-server
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y openssh-server putty-tools xauth tmux dpkg-dev autoconf libssl-dev zlib1g-dev busybox-static lrzsz xvfb x11vnc tigervnc-standalone-server krb5-kdc krb5-admin-server
       - run: sudo mkdir -p /run/sshd
       - run: cargo test --locked -p ferossh-worker --test sshd
       - run: cargo test --locked -p ferossh-worker --test agent
+      - run: cargo test --locked -p ferossh-worker --test kerberos
       - run: cargo test --locked -p ferossh-worker --test telnetd
       - run: cargo test --locked -p ferossh-zmodem --test lrzsz
       - run: interop/sk-dummy.sh "$RUNNER_TEMP/sk-dummy.so"

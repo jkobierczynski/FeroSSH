@@ -24,6 +24,7 @@
 use std::cell::Cell;
 use std::path::PathBuf;
 
+use ferossh_auth::gss::{self, GssOutput, GssStepJob};
 use ferossh_auth::{
     AgentChoice, Identity, Job, KeyChoice, KeyFileSpec, Reply, SignError, Source, userauth,
 };
@@ -31,8 +32,8 @@ use ferossh_config::known_hosts::{self, KnownHosts, Status};
 use ferossh_config::ssh_config::{AddressFamily, RequestTty, StrictHostKeyChecking};
 use ferossh_config::{ForwardSpec, hostkey, ssh_config};
 use ferossh_ipc::{
-    ChannelId, Family, MAX_DATA_CHUNK, Message, PromptField, PromptKind, Secrets, ShellOptions,
-    Timing, X11Auth,
+    ChannelId, Family, GssReply, MAX_DATA_CHUNK, Message, PromptField, PromptKind, Secrets,
+    ShellOptions, Timing, X11Auth,
 };
 use ferossh_worker::crypto_policy;
 use zeroize::Zeroizing;
@@ -102,6 +103,15 @@ pub struct Target {
     /// `HostKeyAlias`: the name the host key is kept under.
     pub host_key_alias: Option<String>,
     pub family: Family,
+    /// Log in with the Windows logon's Kerberos tickets when the server
+    /// offers it: `GSSAPIAuthentication`, else when Windows logged on to
+    /// a domain.
+    pub gssapi: bool,
+    /// `GSSAPIDelegateCredentials yes`.
+    pub gssapi_delegate: bool,
+    /// `GSSAPIServerIdentity`: the name in the server's service principal
+    /// when not [`Target::hostname`].
+    pub gssapi_host: Option<String>,
 }
 
 /// A `ProxyCommand` to run: never through a shell.
@@ -262,6 +272,13 @@ impl Target {
             }
         }
         let command = cfg.remote_command.clone().filter(|c| !c.trim().is_empty());
+        // Windows sets USERDNSDOMAIN for a domain logon, which is when it
+        // holds Kerberos tickets; elsewhere Kerberos is tried only when
+        // the config asks.
+        let domain_logon = env
+            .vars
+            .iter()
+            .any(|(n, v)| n.eq_ignore_ascii_case("USERDNSDOMAIN") && !v.is_empty());
         let pty = match cfg.request_tty {
             Some(RequestTty::No) => false,
             Some(RequestTty::Yes | RequestTty::Force) => true,
@@ -287,6 +304,9 @@ impl Target {
                 .as_ref()
                 .map(|files| files.iter().map(|f| PathBuf::from(expand(f))).collect()),
             host_key_alias: cfg.host_key_alias.clone(),
+            gssapi: cfg.gssapi_authentication.unwrap_or(domain_logon),
+            gssapi_delegate: cfg.gssapi_delegate_credentials == Some(true),
+            gssapi_host: cfg.gssapi_server_identity.clone(),
             family: match cfg.address_family {
                 Some(AddressFamily::Inet) => Family::V4,
                 Some(AddressFamily::Inet6) => Family::V6,
@@ -537,6 +557,8 @@ struct Login {
     host_trusted: bool,
     /// Signatures asked for so far.
     signatures: u32,
+    /// Kerberos steps asked for so far.
+    gss_steps: u32,
     /// The login worked.
     done: bool,
 }
@@ -545,6 +567,9 @@ struct Login {
 /// partial-success logins that need several. OpenSSH tries at most a few
 /// dozen keys before the server's MaxAuthTries ends it anyway.
 const MAX_SIGNATURES: u32 = 32;
+
+/// Kerberos steps one login may ask for: Kerberos takes one or two.
+const MAX_GSS_STEPS: u32 = 8;
 
 /// Questions in one prompt. OpenSSH's sshd sends one or two; PAM stacks a
 /// few more.
@@ -926,6 +951,7 @@ impl SshSession {
                 t.shell_options()
             },
             family: t.family,
+            gssapi: t.gssapi,
         }));
         effects
     }
@@ -1195,9 +1221,16 @@ impl SshSession {
                     None
                 }
             }
+            Message::GssapiStep { .. } if !self.target.gssapi => {
+                Some("a Kerberos login this connection does not use")
+            }
+            Message::GssapiStep { .. } if login.gss_steps >= MAX_GSS_STEPS => {
+                Some("too many Kerberos steps")
+            }
             Message::Banner { .. }
             | Message::IdentitiesRequest { .. }
             | Message::SignRequest { .. }
+            | Message::GssapiStep { .. }
             | Message::Prompt { .. } => {
                 if !logging_in {
                     Some("a login step outside a login")
@@ -1298,6 +1331,15 @@ impl SshSession {
             Message::SignRequest { key, data, .. } => {
                 self.login.signatures += 1;
                 self.on_sign_request(&key, data)
+            }
+            Message::GssapiStep {
+                first,
+                token,
+                mic_data,
+                ..
+            } => {
+                self.login.gss_steps += 1;
+                self.on_gssapi_step(first, token, mic_data)
             }
             Message::Prompt {
                 kind,
@@ -1638,7 +1680,87 @@ impl SshSession {
                     self.signature(Vec::new()),
                 ]
             }
+            Reply::Gssapi { login, .. } if login != self.channel => Vec::new(),
+            Reply::Gssapi {
+                result: Ok(GssOutput::Continue(token)),
+                ..
+            } => vec![self.gssapi_reply(GssReply::Continue(token))],
+            Reply::Gssapi {
+                result: Ok(GssOutput::Complete { token, mic }),
+                ..
+            } => vec![self.gssapi_reply(GssReply::Complete { token, mic })],
+            Reply::Gssapi { result: Err(e), .. } => vec![
+                Effect::Show(dim(&format!(
+                    "No Kerberos login: {}. Trying other ways.",
+                    sanitize(e.trim_end_matches('.'))
+                ))),
+                self.gssapi_reply(GssReply::Failed),
+            ],
         }
+    }
+
+    fn gssapi_reply(&self, reply: GssReply) -> Effect {
+        Effect::Send(Message::GssapiReply {
+            channel: self.channel,
+            reply,
+        })
+    }
+
+    /// The name in the server's Kerberos service principal,
+    /// `host/<name>`.
+    fn gssapi_host(&self) -> &str {
+        self.target
+            .gssapi_host
+            .as_deref()
+            .unwrap_or(&self.target.hostname)
+    }
+
+    /// A Kerberos step: checked like a signature request, then run on the
+    /// broker thread, which holds the security context.
+    fn on_gssapi_step(&mut self, first: bool, token: Vec<u8>, mic_data: Vec<u8>) -> Vec<Effect> {
+        if let Err(why) = gss::check_mic_data(&mic_data, &self.target.user) {
+            return vec![
+                Effect::Show(format!(
+                    "{RED}The SSH worker asked for a Kerberos step that is not a login to {} \
+                     ({why}); refused.{RESET}\r\n",
+                    sanitize(&self.target.hostname)
+                )),
+                self.gssapi_reply(GssReply::Failed),
+            ];
+        }
+        let host = self.gssapi_host().to_owned();
+        // A name that could change the service principal's form (`/`,
+        // `@`) gets no ticket.
+        if !ssh_config::valid_gss_host(&host) {
+            return vec![
+                Effect::Show(dim(&format!(
+                    "No Kerberos login: {} is not a name a Kerberos service has. Trying other ways.",
+                    sanitize(&host)
+                ))),
+                self.gssapi_reply(GssReply::Failed),
+            ];
+        }
+        let mut effects = Vec::new();
+        if first {
+            let deleg = if self.target.gssapi_delegate {
+                ", passing on your ticket"
+            } else {
+                ""
+            };
+            effects.push(Effect::Show(dim(&sanitize(&format!(
+                "Logging in to {} with Kerberos (host/{host}){deleg}.",
+                self.target.hostname
+            )))));
+        }
+        effects.push(Effect::Broker(Job::Gssapi(GssStepJob {
+            login: self.channel,
+            host,
+            delegate: self.target.gssapi_delegate,
+            first,
+            token,
+            mic_data,
+        })));
+        effects
     }
 
     fn signature(&self, signature: Vec<u8>) -> Effect {
@@ -2925,6 +3047,165 @@ mod tests {
         let fx = s.prompt_input(&[0x1b]);
         assert_eq!(sent(&fx), vec![&Message::Close { channel: 1 }]);
         assert_eq!(s.state(), State::Ended);
+    }
+
+    fn mic_data(user: &str) -> Vec<u8> {
+        let mut d = Vec::new();
+        for (i, part) in [
+            &[7u8; 32][..],
+            user.as_bytes(),
+            b"ssh-connection",
+            b"gssapi-with-mic",
+        ]
+        .iter()
+        .enumerate()
+        {
+            d.extend_from_slice(&u32::try_from(part.len()).unwrap().to_be_bytes());
+            d.extend_from_slice(part);
+            if i == 0 {
+                d.push(50);
+            }
+        }
+        d
+    }
+
+    #[test]
+    fn kerberos_follows_the_config_or_a_domain_logon() {
+        let dir = temp("krb-target");
+        let mut e = env(&dir);
+        let t = Target::resolve("host", &e).unwrap();
+        assert!(!t.gssapi && !t.gssapi_delegate && t.gssapi_host.is_none());
+        e.vars = vec![("USERDNSDOMAIN".into(), "CORP.EXAMPLE".into())];
+        assert!(Target::resolve("host", &e).unwrap().gssapi);
+        e.config =
+            "Host nokrb\n  GSSAPIAuthentication no\nHost gw\n  GSSAPIDelegateCredentials yes\n  \
+                    GSSAPIServerIdentity sshgw.corp.example\n"
+                .into();
+        assert!(!Target::resolve("nokrb", &e).unwrap().gssapi);
+        let t = Target::resolve("gw", &e).unwrap();
+        assert!(t.gssapi && t.gssapi_delegate);
+        assert_eq!(t.gssapi_host.as_deref(), Some("sshgw.corp.example"));
+        e.vars.clear();
+        e.config = "GSSAPIAuthentication yes\n".into();
+        let mut s = SshSession::new(1, Target::resolve("host", &e).unwrap(), e.known_hosts());
+        let fx = s.start(80, 24);
+        assert!(
+            sent(&fx)
+                .iter()
+                .any(|m| matches!(m, Message::Connect { gssapi: true, .. }))
+        );
+    }
+
+    #[test]
+    fn kerberos_steps_are_checked_and_run_on_the_broker() {
+        let dir = temp("krb-steps");
+        let mut e = env(&dir);
+        e.config =
+            "Host db\n  HostName db.corp.example\n  User ops\n  GSSAPIAuthentication yes\n  \
+                    GSSAPIServerIdentity sshgw.corp.example\n"
+                .into();
+        let mut s = SshSession::new(1, Target::resolve("db", &e).unwrap(), e.known_hosts());
+        trusted(&mut s);
+        // Another user's request is refused without asking the broker.
+        let fx = s.on_worker(Message::GssapiStep {
+            channel: 1,
+            first: true,
+            token: Vec::new(),
+            mic_data: mic_data("root"),
+        });
+        assert!(!fx.iter().any(|e| matches!(e, Effect::Broker(_))));
+        assert_eq!(
+            sent(&fx),
+            vec![&Message::GssapiReply {
+                channel: 1,
+                reply: GssReply::Failed
+            }]
+        );
+        let fx = s.on_worker(Message::GssapiStep {
+            channel: 1,
+            first: true,
+            token: Vec::new(),
+            mic_data: mic_data("ops"),
+        });
+        let jobs: Vec<&GssStepJob> = fx
+            .iter()
+            .filter_map(|e| match e {
+                Effect::Broker(Job::Gssapi(j)) => Some(j),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].host, "sshgw.corp.example");
+        assert!(jobs[0].first && !jobs[0].delegate && jobs[0].login == 1);
+        // Another login's reply is not this one's.
+        let other = Reply::Gssapi {
+            login: 9,
+            result: Ok(GssOutput::Continue(vec![1, 2])),
+        };
+        assert!(s.on_broker(other).is_empty());
+        let fx = s.on_broker(Reply::Gssapi {
+            login: 1,
+            result: Ok(GssOutput::Continue(vec![1, 2])),
+        });
+        assert_eq!(
+            sent(&fx),
+            vec![&Message::GssapiReply {
+                channel: 1,
+                reply: GssReply::Continue(vec![1, 2])
+            }]
+        );
+        let fx = s.on_broker(Reply::Gssapi {
+            login: 1,
+            result: Err("no ticket".into()),
+        });
+        assert_eq!(
+            sent(&fx),
+            vec![&Message::GssapiReply {
+                channel: 1,
+                reply: GssReply::Failed
+            }]
+        );
+    }
+
+    #[test]
+    fn a_host_name_that_is_no_service_name_gets_no_ticket() {
+        let dir = temp("krb-name");
+        let mut e = env(&dir);
+        e.config =
+            "Host odd\n  HostName evil/x@OTHER.REALM\n  User me\n  GSSAPIAuthentication yes\n"
+                .into();
+        let mut s = SshSession::new(1, Target::resolve("odd", &e).unwrap(), e.known_hosts());
+        trusted(&mut s);
+        let fx = s.on_worker(Message::GssapiStep {
+            channel: 1,
+            first: true,
+            token: Vec::new(),
+            mic_data: mic_data("me"),
+        });
+        assert!(!fx.iter().any(|e| matches!(e, Effect::Broker(_))));
+        assert_eq!(
+            sent(&fx),
+            vec![&Message::GssapiReply {
+                channel: 1,
+                reply: GssReply::Failed
+            }]
+        );
+    }
+
+    #[test]
+    fn a_kerberos_step_the_connection_does_not_use_ends_it() {
+        let dir = temp("krb-off");
+        let e = env(&dir);
+        let mut s = SshSession::new(1, Target::resolve("host", &e).unwrap(), e.known_hosts());
+        trusted(&mut s);
+        let fx = s.on_worker(Message::GssapiStep {
+            channel: 1,
+            first: true,
+            token: Vec::new(),
+            mic_data: mic_data("me"),
+        });
+        assert!(fx.iter().any(|e| matches!(e, Effect::Ended)));
+        assert!(!fx.iter().any(|e| matches!(e, Effect::Broker(_))));
     }
 
     #[test]

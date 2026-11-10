@@ -12,9 +12,13 @@ publish.workspace = true
 # A software FIDO2 authenticator (src/sk/soft.rs) for tests on machines
 # without a security key. Never enabled in FeroSSH itself.
 soft-authenticator = ["dep:p256"]
+# Kerberos through MIT's libgssapi_krb5 (src/gss/mit.rs), for tests on
+# Linux against a real KDC. Never enabled in FeroSSH itself.
+mit-gssapi = ["dep:libloading"]
 
 [dependencies]
 getrandom = { version = "0.4", features = ["sys_rng"] }
+libloading = { version = "0.8", optional = true }
 p256 = { version = "0.14", default-features = false, features = ["ecdsa"], optional = true }
 russh.workspace = true
 tokio = { version = "1.54", features = ["rt", "net", "time"] }
@@ -24,6 +28,8 @@ zeroize = "1.9"
 windows = { version = "0.62", features = [
     "Win32_Foundation",
     "Win32_Networking_WindowsWebServices",
+    "Win32_Security_Authentication_Identity",
+    "Win32_Security_Credentials",
     "Win32_UI_WindowsAndMessaging",
 ] }
 

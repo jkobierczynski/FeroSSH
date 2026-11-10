@@ -15,6 +15,7 @@ use russh::keys::{Certificate, PublicKey};
 use zeroize::Zeroizing;
 
 use crate::agent::{self, AgentChoice, AgentKind};
+use crate::gss::{Contexts, GssOutput, GssProvider, GssStepJob};
 use crate::keyfile::{KeyFile, KeyFileError};
 use crate::sk::Authenticator;
 use crate::userauth::{allowed_algorithms, is_certificate, key_type};
@@ -81,6 +82,9 @@ pub enum Job {
         passphrase: Option<Zeroizing<String>>,
         agent: AgentChoice,
     },
+    /// One step of a Kerberos login, checked by the caller with
+    /// [`crate::gss::check_mic_data`].
+    Gssapi(GssStepJob),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -99,6 +103,14 @@ pub enum Reply {
         notes: Vec<String>,
     },
     Signed(Result<Vec<u8>, SignError>),
+    /// A [`Job::Gssapi`] step's tokens, or why there is no Kerberos login.
+    /// Kerberos runs on a thread of its own, so a KDC that is slow to
+    /// answer never holds up signing: this reply comes out of order, and
+    /// `login` says whose it is.
+    Gssapi {
+        login: u32,
+        result: Result<GssOutput, String>,
+    },
 }
 
 /// Why FeroSSH will not use a key, if it will not.
@@ -328,24 +340,59 @@ impl Broker {
         notify: impl Fn() + Send + 'static,
         authenticator: Box<dyn Authenticator>,
     ) -> std::io::Result<Self> {
+        Self::spawn_full(notify, authenticator, crate::gss::platform_provider())
+    }
+
+    /// [`Broker::spawn_with`] with another source of Kerberos tickets.
+    pub fn spawn_full(
+        notify: impl Fn() + Send + 'static,
+        authenticator: Box<dyn Authenticator>,
+        gss: Box<dyn GssProvider>,
+    ) -> std::io::Result<Self> {
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()?;
         let (jobs, job_rx) = channel::<Job>();
+        let (gss_jobs, gss_rx) = channel::<GssStepJob>();
         let (reply_tx, replies) = channel();
+        // Both threads wake the window; the callback need not be Sync.
+        let notify = Arc::new(std::sync::Mutex::new(notify));
+        fn wake<F: Fn()>(n: &std::sync::Mutex<F>) {
+            if let Ok(f) = n.lock() {
+                f();
+            }
+        }
+        let (gss_reply, gss_notify) = (reply_tx.clone(), notify.clone());
+        thread::Builder::new()
+            .name("kerberos".into())
+            .spawn(move || {
+                let mut contexts = Contexts::default();
+                while let Ok(step) = gss_rx.recv() {
+                    let login = step.login;
+                    let result = contexts.step(gss.as_ref(), step);
+                    if gss_reply.send(Reply::Gssapi { login, result }).is_err() {
+                        break;
+                    }
+                    wake(&gss_notify);
+                }
+            })?;
         thread::Builder::new()
             .name("signing broker".into())
             .spawn(move || {
                 while let Ok(job) = job_rx.recv() {
                     let reply = match job {
                         Job::Identities(choice) => Some(identities(&rt, choice)),
+                        Job::Gssapi(step) => {
+                            let _ = gss_jobs.send(step);
+                            None
+                        }
                         sign_job @ Job::Sign { .. } => sign(&rt, authenticator.as_ref(), sign_job),
                     };
                     if let Some(reply) = reply {
                         if reply_tx.send(reply).is_err() {
                             break;
                         }
-                        notify();
+                        wake(&notify);
                     }
                 }
             })?;

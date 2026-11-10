@@ -251,6 +251,7 @@ async fn session(
         shell: true,
         options: Default::default(),
         family: Default::default(),
+        gssapi: false,
     })
     .await;
     let mut seen = Outcome::default();
@@ -605,6 +606,7 @@ async fn log_in_with(
             shell: true,
             options: Default::default(),
             family: Default::default(),
+            gssapi: false,
         },
     ] {
         to_worker.send(msg).await.unwrap();
@@ -1449,6 +1451,7 @@ async fn through(jump: u16, target: &str, keys: &[KeyFile], command: &str) -> Ou
         shell: i == 1,
         options: Default::default(),
         family: Default::default(),
+        gssapi: false,
     };
     to[0].send(connect(0)).await.unwrap();
     let mut seen = Outcome::default();

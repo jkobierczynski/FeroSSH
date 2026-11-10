@@ -5352,7 +5352,10 @@ impl Window {
                         _ => 0,
                     };
                     if let Some(b) = &self.broker {
-                        self.broker_jobs.push_back(BrokerFor::Login(channel));
+                        // Kerberos answers out of order, by login.
+                        if !matches!(job, ferossh_auth::Job::Gssapi(_)) {
+                            self.broker_jobs.push_back(BrokerFor::Login(channel));
+                        }
                         b.submit(job);
                     }
                 }
@@ -6584,16 +6587,20 @@ impl Window {
                 }
             }
         }
-        // The signing broker answers in the order it was asked.
+        // The signing broker answers in the order it was asked, except
+        // Kerberos, which says whose login it is.
         while let Some(reply) = self.broker.as_ref().and_then(Broker::try_recv) {
-            let channel = match self.broker_jobs.pop_front() {
-                Some(BrokerFor::Agent(what)) => {
-                    let outs = self.agent_fwd.on_broker(what, reply);
-                    self.agent_out(outs);
-                    continue;
-                }
-                Some(BrokerFor::Login(channel)) => channel,
-                None => 0,
+            let channel = match &reply {
+                ferossh_auth::Reply::Gssapi { login, .. } => *login,
+                _ => match self.broker_jobs.pop_front() {
+                    Some(BrokerFor::Agent(what)) => {
+                        let outs = self.agent_fwd.on_broker(what, reply);
+                        self.agent_out(outs);
+                        continue;
+                    }
+                    Some(BrokerFor::Login(channel)) => channel,
+                    None => 0,
+                },
             };
             let Some(id) = self.pane_of_channel(channel) else {
                 continue;

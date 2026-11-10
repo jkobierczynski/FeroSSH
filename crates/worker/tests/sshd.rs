@@ -229,6 +229,7 @@ async fn run_ui_with(server: &Server, command: &str, trust: bool, known: Vec<Str
         shell: true,
         options: Default::default(),
         family: Default::default(),
+        gssapi: false,
     })
     .await;
     let mut seen = Seen::default();
@@ -458,6 +459,7 @@ async fn second_shell_shares_the_connection() {
         shell: true,
         options: Default::default(),
         family: Default::default(),
+        gssapi: false,
     })
     .await;
     let (mut host_keys, mut signed) = (0, 0);
@@ -605,6 +607,7 @@ async fn login_at(server: &Server, port: u16) -> (mpsc::Sender<Message>, mpsc::R
             shell: true,
             options: Default::default(),
             family: Default::default(),
+            gssapi: false,
         })
         .await
         .unwrap();
@@ -1027,6 +1030,7 @@ async fn through(
         shell: i == hops,
         options: Default::default(),
         family: Default::default(),
+        gssapi: false,
     };
     to[0].send(connect(0)).await.unwrap();
     let mut seen = Chain {
