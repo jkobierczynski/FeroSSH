@@ -34,6 +34,9 @@ const MAX_READ: u32 = 64 * 1024;
 const ENTRIES_PER_REPLY: usize = 512;
 /// How long a remote checksum may take: hashing a large file is slow.
 const CHECKSUM_TIMEOUT: Duration = Duration::from_secs(600);
+/// Checksums running at once: each holds an exec channel on the server
+/// for up to [`CHECKSUM_TIMEOUT`].
+const MAX_CHECKSUMS: usize = 4;
 
 /// What an SFTP request id is waiting for.
 #[derive(Debug)]
@@ -70,6 +73,8 @@ struct Sftp {
     /// The server's handles by the worker's number.
     handles: HashMap<u32, Vec<u8>>,
     next_handle: u32,
+    /// Remote checksums in progress, stopped when SFTP ends.
+    checksums: tokio::task::JoinSet<()>,
 }
 
 /// Why the SFTP channel ended.
@@ -266,10 +271,16 @@ impl Sftp {
                 }
             }
             SftpOp::Checksum { path } => {
+                while self.checksums.try_join_next().is_some() {}
+                if self.checksums.len() >= MAX_CHECKSUMS {
+                    return self
+                        .failed(ui, sftp_code::REFUSED, "Too many checksums at once")
+                        .await;
+                }
                 let conn = self.conn.clone();
                 let out = self.out.clone();
                 let channel = self.channel;
-                tokio::spawn(async move {
+                self.checksums.spawn(async move {
                     let reply = checksum(&conn, &path).await;
                     let _ = out
                         .send(Message::SftpReply {
@@ -542,6 +553,7 @@ async fn serve(
         pending: HashMap::new(),
         handles: HashMap::new(),
         next_handle: 1,
+        checksums: tokio::task::JoinSet::new(),
     };
     let mut decoder = Decoder::new();
     let end =
@@ -551,6 +563,9 @@ async fn serve(
             Err(_) => refused("The server's SFTP did not answer."),
         };
     writer.abort();
+    // Their connection holds go with them, so the caller's release can
+    // still be the last one.
+    s.checksums.shutdown().await;
     end
 }
 

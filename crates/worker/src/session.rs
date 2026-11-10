@@ -154,9 +154,11 @@ pub(crate) type Connection = Handle<Client>;
 /// Where the worker's dispatcher sends a channel's messages from the UI.
 #[derive(Clone)]
 pub(crate) enum Route {
-    /// A shell, SFTP or a remote forward's listener: few messages, and a
-    /// full queue may make the UI wait.
-    Session(mpsc::Sender<Message>),
+    /// A shell, SFTP or a remote forward's listener. Only the UI sends on
+    /// it (what the user types or pastes, and SFTP requests the UI keeps
+    /// to a window); a task per session feeds it into the session's
+    /// bounded queue, so a stalled session never holds up the pipe.
+    Session(mpsc::UnboundedSender<Message>),
     /// A forwarded stream: flow control bounds what the UI sends, and one
     /// slow stream must never hold up the pipe.
     Stream(mpsc::UnboundedSender<Message>),
