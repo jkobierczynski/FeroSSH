@@ -67,6 +67,14 @@ enum Pend {
         to: Vec<u8>,
         aside: Vec<u8>,
     },
+    /// The original moved back after a failed promotion; the UI hears
+    /// the promotion's error once this answers.
+    Restore {
+        ui: u32,
+        aside: Vec<u8>,
+        code: u32,
+        message: String,
+    },
     /// Closing a listing's handle; nobody waits.
     Quiet,
 }
@@ -429,19 +437,39 @@ impl Sftp {
                     self.reply(ui, SftpReply::Done).await
                 } else {
                     // Put the original back where it was.
+                    let a = aside.clone();
                     self.send(
                         |id| {
                             wire::encode(&Request::Rename {
                                 id,
-                                from: &aside,
+                                from: &a,
                                 to: &to,
                             })
                         },
-                        Pend::Quiet,
+                        Pend::Restore {
+                            ui,
+                            aside,
+                            code,
+                            message,
+                        },
                     )
-                    .await?;
-                    self.failed(ui, code, &message).await
+                    .await
                 }
+            }
+            (
+                Pend::Restore {
+                    ui,
+                    aside,
+                    code,
+                    message,
+                },
+                resp,
+            ) => {
+                let message = match resp {
+                    Response::Status { code: 0, .. } => message,
+                    _ => restore_failed(&message, &aside),
+                };
+                self.failed(ui, code, &message).await
             }
             (Pend::MoveAside { ui, .. } | Pend::Promote { ui, .. }, _) => {
                 self.failed(ui, sftp_code::FAILURE, "Unexpected reply")
@@ -712,6 +740,15 @@ fn aside_name(to: &[u8], n: u32) -> Vec<u8> {
     let mut name = to.to_vec();
     name.extend_from_slice(format!(".ferossh-old-{n}").as_bytes());
     name
+}
+
+/// The error when the original could not be moved back: say where
+/// it is, so nothing is lost without a word.
+fn restore_failed(message: &str, aside: &[u8]) -> String {
+    format!(
+        "{message}; the original file is now {}",
+        String::from_utf8_lossy(aside)
+    )
 }
 
 /// The next packet from the server.

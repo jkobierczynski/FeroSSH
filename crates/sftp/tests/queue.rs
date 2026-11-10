@@ -908,6 +908,11 @@ fn saves_of_the_same_file_go_one_at_a_time() {
     let two = remote.put_back(&second, b"/run.sh", None).unwrap();
     assert_eq!(remote.job_state(one), Some(State::Running));
     assert_eq!(remote.job_state(two), Some(State::Queued));
+    // A paused save still owns the part file.
+    remote.pause(one);
+    assert_eq!(remote.job_state(one), Some(State::Paused));
+    assert_eq!(remote.job_state(two), Some(State::Queued));
+    remote.resume(one);
     assert!(run(&mut remote, &mut fake));
     assert_eq!(remote.job_state(one), Some(State::Done));
     assert_eq!(remote.job_state(two), Some(State::Done));
