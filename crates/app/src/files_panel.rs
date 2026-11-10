@@ -1781,8 +1781,11 @@ fn context_menu(h: &Handles, list: HWND, lparam: LPARAM) {
             (can(EXPLORER, local), "Open in &Explorer", false),
         ]
     };
+    // The menu runs its own message loop, in which the list can be
+    // refreshed: the row is found again by its name afterwards.
+    let clicked = row.and_then(|i| shown_row(remote, i));
     match popup(list, &items, Some(at)) {
-        OPEN => open(h, remote, row),
+        OPEN => open(h, remote, clicked.and_then(|c| find_row(remote, &c))),
         SEND if remote => download(h, None),
         SEND => upload(h, None),
         DELETE => delete(h),
@@ -1798,6 +1801,49 @@ fn context_menu(h: &Handles, list: HWND, lparam: LPARAM) {
         }
         _ => {}
     }
+}
+
+/// A row of a list by what it is, not where: its folder, name and
+/// whether it is the ".." row.
+#[derive(Clone, PartialEq, Eq)]
+struct RowId {
+    folder: (Option<PathBuf>, Vec<u8>),
+    key: Vec<u8>,
+    up: bool,
+}
+
+/// Row `i` of the Remote (`remote`) or Local list as shown.
+fn shown_row(remote: bool, i: usize) -> Option<RowId> {
+    with(|s| {
+        let (rows, folder) = if remote {
+            (&s.remote_shown, (None, s.remote_dir.clone()))
+        } else {
+            (&s.local_shown, (s.local_dir.clone(), Vec::new()))
+        };
+        rows.get(i).map(|r| RowId {
+            folder,
+            key: r.key.clone(),
+            up: r.up,
+        })
+    })
+    .flatten()
+}
+
+/// Where row `id` is in its list now; `None` when the list shows another
+/// folder or the row went.
+fn find_row(remote: bool, id: &RowId) -> Option<usize> {
+    with(|s| {
+        let (rows, folder) = if remote {
+            (&s.remote_shown, (None, s.remote_dir.clone()))
+        } else {
+            (&s.local_shown, (s.local_dir.clone(), Vec::new()))
+        };
+        if folder != id.folder {
+            return None;
+        }
+        rows.iter().position(|r| r.up == id.up && r.key == id.key)
+    })
+    .flatten()
 }
 
 fn queue_menu(h: &Handles, lparam: LPARAM) {
