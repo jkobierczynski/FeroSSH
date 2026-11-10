@@ -205,6 +205,17 @@ mod tests {
     use crate::framebuffer::{Applied, Framebuffer};
     use crate::pipe::MAX_NET;
 
+    /// The tests against a real VNC server share one Xvnc, so they take
+    /// turns. TigerVNC drops a viewer whose screen changes size between
+    /// ServerInit and its SetEncodings ("Client does not support desktop
+    /// size"), and the resize test changes the size just as the clipboard
+    /// test may be logging in.
+    static REAL_VNC: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn real_vnc() -> std::sync::MutexGuard<'static, ()> {
+        REAL_VNC.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     fn vnc_start() -> ToViewer {
         ToViewer::Start {
             protocol: Protocol::Vnc,
@@ -299,6 +310,7 @@ mod tests {
             eprintln!("FEROSSH_TEST_VNC not set; skipped");
             return;
         };
+        let _turn = real_vnc();
         let tcp = TcpStream::connect(addr.trim()).unwrap();
         let (viewer_in, window_out) = std::io::pipe().unwrap();
         let (mut window_in, viewer_out) = std::io::pipe().unwrap();
@@ -379,6 +391,7 @@ mod tests {
             eprintln!("FEROSSH_TEST_VNC or FEROSSH_TEST_VNC_DISPLAY not set; skipped");
             return;
         };
+        let _turn = real_vnc();
         let tcp = TcpStream::connect(addr.trim()).unwrap();
         let (viewer_in, window_out) = std::io::pipe().unwrap();
         let (mut window_in, viewer_out) = std::io::pipe().unwrap();

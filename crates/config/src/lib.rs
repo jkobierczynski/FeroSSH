@@ -33,4 +33,4 @@ pub use forward::{ForwardKind, ForwardSpec};
 pub use host_theme::{HostThemes, ThemeRule};
 pub use password::PasswordSource;
 pub use pattern::{match_host, match_pattern};
-pub use settings::{Bookmark, DEFAULT_TELNET_PORT, Profile, SessionKind, Settings};
+pub use settings::{Bookmark, DEFAULT_TELNET_PORT, Profile, SessionKind, Settings, WindowColours};

@@ -24,8 +24,8 @@ use windows::Win32::Foundation::{COLORREF, FILETIME, HWND, LPARAM, LRESULT, POIN
 use windows::Win32::Graphics::Gdi::{
     BeginPaint, COLOR_GRAYTEXT, COLOR_WINDOW, COLOR_WINDOWTEXT, ClientToScreen, CreateSolidBrush,
     DT_LEFT, DT_NOPREFIX, DT_SINGLELINE, DT_VCENTER, DeleteObject, DrawTextW, EndPaint, FillRect,
-    GetSysColor, GetSysColorBrush, HFONT, HGDIOBJ, InvalidateRect, PAINTSTRUCT, ScreenToClient,
-    SelectObject, SetBkMode, SetTextColor, TRANSPARENT,
+    HFONT, HGDIOBJ, InvalidateRect, PAINTSTRUCT, ScreenToClient, SelectObject, SetBkMode,
+    SetTextColor, TRANSPARENT,
 };
 use windows::Win32::Storage::FileSystem::{FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_NORMAL};
 use windows::Win32::System::Time::{FileTimeToSystemTime, SystemTimeToTzSpecificLocalTime};
@@ -2501,7 +2501,7 @@ fn draw_progress(h: &Handles, cd: &NMLVCUSTOMDRAW) -> LRESULT {
             return LRESULT(CDRF_DODEFAULT as isize);
         }
         let dc = cd.nmcd.hdc;
-        FillRect(dc, &rc, GetSysColorBrush(COLOR_WINDOW));
+        FillRect(dc, &rc, crate::ui_theme::sys_brush(COLOR_WINDOW));
         let bar_h = scale(6, dpi);
         let mut track = RECT {
             left: rc.left + scale(4, dpi),
@@ -2510,7 +2510,7 @@ fn draw_progress(h: &Handles, cd: &NMLVCUSTOMDRAW) -> LRESULT {
             bottom: 0,
         };
         track.bottom = track.top + bar_h;
-        let grey = CreateSolidBrush(COLORREF(0x00E5_E5E5));
+        let grey = CreateSolidBrush(crate::ui_theme::track_color());
         FillRect(dc, &track, grey);
         let _ = DeleteObject(HGDIOBJ(grey.0));
         let mut done = track;
@@ -2782,7 +2782,7 @@ fn paint(h: &Handles) {
         let dc = BeginPaint(h.panel, &mut ps);
         let mut rc = RECT::default();
         let _ = GetClientRect(h.panel, &mut rc);
-        FillRect(dc, &rc, GetSysColorBrush(COLOR_WINDOW));
+        FillRect(dc, &rc, crate::ui_theme::sys_brush(COLOR_WINDOW));
         let old = SelectObject(dc, HGDIOBJ(title_font.0));
         SetBkMode(dc, TRANSPARENT);
         let pad = scale(10, dpi);
@@ -2793,7 +2793,7 @@ fn paint(h: &Handles) {
             right: rc.right - pad,
             bottom: scale(36, dpi),
         };
-        SetTextColor(dc, COLORREF(GetSysColor(COLOR_WINDOWTEXT)));
+        SetTextColor(dc, COLORREF(crate::ui_theme::sys_color(COLOR_WINDOWTEXT)));
         let mut text: Vec<u16> = "File transfer".encode_utf16().collect();
         let mut measure = tr;
         DrawTextW(
@@ -2804,7 +2804,7 @@ fn paint(h: &Handles) {
         );
         DrawTextW(dc, &mut text, &mut tr, flags);
         SelectObject(dc, HGDIOBJ(font.0));
-        SetTextColor(dc, COLORREF(GetSysColor(COLOR_GRAYTEXT)));
+        SetTextColor(dc, COLORREF(crate::ui_theme::sys_color(COLOR_GRAYTEXT)));
         let mut host: Vec<u16> = host
             .unwrap_or_else(|| "no SSH host".into())
             .encode_utf16()
@@ -2820,7 +2820,7 @@ fn paint(h: &Handles) {
             &mut hr,
             flags | windows::Win32::Graphics::Gdi::DT_END_ELLIPSIS,
         );
-        SetTextColor(dc, COLORREF(GetSysColor(COLOR_WINDOWTEXT)));
+        SetTextColor(dc, COLORREF(crate::ui_theme::sys_color(COLOR_WINDOWTEXT)));
         for (r, name) in labels.iter().zip(["Local", "Remote"]) {
             let mut t: Vec<u16> = name.encode_utf16().collect();
             let mut lr = RECT {
@@ -2865,12 +2865,12 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                 SetTextColor(
                     dc,
                     if problem {
-                        COLORREF(0x0020_20C0)
+                        crate::ui_theme::error_color()
                     } else {
-                        COLORREF(GetSysColor(COLOR_WINDOWTEXT))
+                        COLORREF(crate::ui_theme::sys_color(COLOR_WINDOWTEXT))
                     },
                 );
-                LRESULT(GetSysColorBrush(COLOR_WINDOW).0 as isize)
+                LRESULT(crate::ui_theme::sys_brush(COLOR_WINDOW).0 as isize)
             }
         }
         (WM_COMMAND, Some(h)) => {
@@ -2939,6 +2939,6 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
             LRESULT(0)
         }
         // SAFETY: default handling for everything else.
-        _ => unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) },
+        _ => crate::ui_theme::def_window_proc(hwnd, msg, wparam, lparam),
     }
 }

@@ -403,6 +403,41 @@ impl Profile {
     }
 }
 
+/// Where the window's own colours (menu bar, menus, title bar, tab strip
+/// and tools pane) come from: Settings > Window colours.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum WindowColours {
+    /// The focused pane's colour theme, dark or light as the theme is.
+    #[default]
+    Theme,
+    /// Windows' own light or dark app mode.
+    System,
+    /// Windows' light look, as before window colours existed.
+    Light,
+    /// A neutral dark grey.
+    Dark,
+}
+
+impl WindowColours {
+    pub const ALL: [Self; 4] = [Self::Theme, Self::System, Self::Light, Self::Dark];
+
+    /// The word in the settings file.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Theme => "theme",
+            Self::System => "windows",
+            Self::Light => "light",
+            Self::Dark => "dark",
+        }
+    }
+
+    pub fn parse(word: &str) -> Option<Self> {
+        Self::ALL
+            .into_iter()
+            .find(|c| c.name().eq_ignore_ascii_case(word))
+    }
+}
+
 /// Everything in the settings file.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Settings {
@@ -417,6 +452,9 @@ pub struct Settings {
     /// Keep an opened tool open; off, the terminal covers it again once
     /// the terminal is used (a peek).
     pub tools_pinned: bool,
+    /// Where the window's own colours come from: its menu bar and menus,
+    /// title bar, tab strip, tools rail and tools pane.
+    pub window_colours: WindowColours,
     /// Show the tab strip when there are two or more tabs.
     pub tab_strip: bool,
     pub copy_on_select: bool,
@@ -531,6 +569,7 @@ impl Default for Settings {
             side_pane_right: false,
             tools_rail: true,
             tools_pinned: true,
+            window_colours: WindowColours::default(),
             tab_strip: true,
             copy_on_select: false,
             right_click_paste: false,
@@ -739,6 +778,13 @@ impl Settings {
                 "toolspinned" => {
                     block = Block::Top;
                     s.tools_pinned = yes(&args).unwrap_or(true);
+                }
+                "windowcolours" => {
+                    block = Block::Top;
+                    s.window_colours = first
+                        .as_deref()
+                        .and_then(WindowColours::parse)
+                        .unwrap_or_default();
                 }
                 "tabstrip" => {
                     block = Block::Top;
@@ -1072,6 +1118,7 @@ impl Settings {
         );
         let _ = writeln!(out, "ToolsRail {}", flag(self.tools_rail));
         let _ = writeln!(out, "ToolsPinned {}", flag(self.tools_pinned));
+        let _ = writeln!(out, "WindowColours {}", self.window_colours.name());
         let _ = writeln!(out, "TabStrip {}", flag(self.tab_strip));
         let _ = writeln!(out, "CopyOnSelect {}", flag(self.copy_on_select));
         let _ = writeln!(out, "RightClickPaste {}", flag(self.right_click_paste));
@@ -1728,6 +1775,31 @@ DesktopShareSelection yes
         let s = Settings::parse("ToolsRail no\nToolsPinned no\n");
         assert!(!s.tools_rail && !s.tools_pinned);
         assert_eq!(Settings::parse(&s.to_text()), s);
+    }
+
+    #[test]
+    fn window_colours_follow_the_theme_unless_set() {
+        assert_eq!(Settings::default().window_colours, WindowColours::Theme);
+        assert_eq!(
+            Settings::parse("SidePane left\n").window_colours,
+            WindowColours::Theme
+        );
+        for c in WindowColours::ALL {
+            let s = Settings {
+                window_colours: c,
+                ..Settings::default()
+            };
+            assert_eq!(Settings::parse(&s.to_text()), s);
+        }
+        // An unknown word (a newer FeroSSH's) falls back to the default.
+        assert_eq!(
+            Settings::parse("WindowColours purple\n").window_colours,
+            WindowColours::Theme
+        );
+        assert_eq!(
+            Settings::parse("WindowColours Dark\n").window_colours,
+            WindowColours::Dark
+        );
     }
 
     #[test]

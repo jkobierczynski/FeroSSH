@@ -31,7 +31,8 @@ use ferossh_config::snippet_import::{self, SnippetClient};
 use ferossh_config::snippet_store;
 use ferossh_config::trigger::{Fire, Watch};
 use ferossh_config::{
-    ForwardSpec, SessionKind, Settings, mobaxterm, mremoteng, putty, securecrt, ssh_config, winscp,
+    ForwardSpec, SessionKind, Settings, WindowColours, mobaxterm, mremoteng, putty, securecrt,
+    ssh_config, winscp,
 };
 use ferossh_forward::x11::{Display, find_cookie, xauth_entries};
 use ferossh_ipc::{ChannelId, DirEntry, FORWARD_IDS, Message, SftpReply, X11Auth};
@@ -48,8 +49,7 @@ use ferossh_term::{
 use windows::Win32::Foundation::E_FAIL;
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, SIZE, WPARAM};
 use windows::Win32::Graphics::Gdi::{
-    BeginPaint, COLOR_GRAYTEXT, COLOR_HIGHLIGHT, COLOR_MENUBAR, COLOR_MENUTEXT, COLOR_WINDOW,
-    EndPaint, GetSysColor, InvalidateRect, LOGFONTW, PAINTSTRUCT, SYS_COLOR_INDEX, ScreenToClient,
+    BeginPaint, EndPaint, InvalidateRect, LOGFONTW, PAINTSTRUCT, ScreenToClient,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::SystemInformation::GetLocalTime;
@@ -95,9 +95,9 @@ use windows::Win32::UI::WindowsAndMessaging::{
     WM_DESTROY, WM_DPICHANGED, WM_DROPFILES, WM_ERASEBKGND, WM_GETDPISCALEDSIZE, WM_HOTKEY,
     WM_IME_COMPOSITION, WM_IME_STARTCOMPOSITION, WM_KEYDOWN, WM_KEYUP, WM_KILLFOCUS,
     WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL,
-    WM_PAINT, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SETCURSOR, WM_SETFOCUS, WM_SIZE, WM_SYSCHAR,
-    WM_SYSDEADCHAR, WM_SYSKEYDOWN, WM_SYSKEYUP, WM_TIMER, WNDCLASSW, WS_CLIPCHILDREN,
-    WS_EX_APPWINDOW, WS_OVERLAPPEDWINDOW,
+    WM_PAINT, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SETCURSOR, WM_SETFOCUS, WM_SETTINGCHANGE, WM_SIZE,
+    WM_SYSCHAR, WM_SYSCOLORCHANGE, WM_SYSDEADCHAR, WM_SYSKEYDOWN, WM_SYSKEYUP, WM_TIMER, WNDCLASSW,
+    WS_CLIPCHILDREN, WS_EX_APPWINDOW, WS_OVERLAPPEDWINDOW,
 };
 use windows::Win32::UI::WindowsAndMessaging::{DeleteMenu, ShowWindowAsync, WM_INITMENUPOPUP};
 use windows::core::{HSTRING, PCWSTR, PWSTR, Result, w};
@@ -145,6 +145,8 @@ use crate::telnet::{TelnetSession, TelnetTarget};
 use crate::tmux::{self, Mode as TmuxMode, Tmux};
 use crate::tmux_keys::{self, Action as TmuxKey};
 use crate::toolpane::{self, RailItem};
+use crate::ui_colours::{self, UiColours};
+use crate::ui_theme;
 use crate::vdesk;
 use crate::zmodem;
 use ferossh_tmuxcc::saved as tmux_saved;
@@ -348,6 +350,8 @@ mod cmd {
     pub const SNIPPET_FOLDER: u32 = 215;
     pub const TOOLS_PIN: u32 = 216;
     pub const TOOLS_RAIL: u32 = 217;
+    /// Plus the index into `WindowColours::ALL`.
+    pub const WINDOW_COLOURS: u32 = 220;
     /// Plus the index into `FONT_CHOICES`.
     pub const FONT: u32 = 300;
     /// Plus the index into `Theme::builtin()`.
@@ -1176,10 +1180,11 @@ fn load_settings() -> Settings {
         .unwrap_or_default()
 }
 
-/// The snippets folder: a file per command snippet, a folder per
-/// category (see [`snippet_store`]).
+/// The scripts folder: a file per script, a folder per category (see
+/// [`snippet_store`]). The `snippets` folder of an older FeroSSH is
+/// renamed to it the first time.
 fn snippets_dir() -> PathBuf {
-    app_dir().join("snippets")
+    snippet_store::move_old_folder(&app_dir().join("scripts"), &app_dir().join("snippets"))
 }
 
 /// Reads the snippets folder into `settings`. Snippets an older FeroSSH
@@ -1774,7 +1779,7 @@ fn build_menu() -> Result<HMENU> {
         separator(file)?;
         item(file, cmd::LOCAL_SHELL, "Open &local shell")?;
         item(file, cmd::IMPORT, "&Import connections...")?;
-        item(file, cmd::IMPORT_SNIPPETS, "Import s&nippets...")?;
+        item(file, cmd::IMPORT_SNIPPETS, "Import sc&ripts...")?;
         separator(file)?;
         item(file, cmd::EXIT, "E&xit\tAlt+F4")?;
 
@@ -1819,15 +1824,11 @@ fn build_menu() -> Result<HMENU> {
         separator(session)?;
         item(session, cmd::SERIAL_BREAK, "Send &break (serial)")?;
         item(session, cmd::RUN_SCRIPT, "Run &login script again")?;
-        item(
-            session,
-            cmd::AUTO_RESPONSES,
-            "A&uto-responses from snippets",
-        )?;
+        item(session, cmd::AUTO_RESPONSES, "A&uto-responses from scripts")?;
         item(
             session,
             cmd::CONFIRM_PRODUCTION,
-            "Confirm snippets on &Production hosts",
+            "Confirm scripts on &Production hosts",
         )?;
         separator(session)?;
         item(session, cmd::DESKTOP, "Open remote &desktop\tCtrl+Shift+D")?;
@@ -1895,8 +1896,8 @@ fn build_menu() -> Result<HMENU> {
         separator(edit)?;
         item(edit, cmd::FIND, "&Find in scrollback\tCtrl+Shift+F")?;
         item(edit, cmd::CLEAR_SCROLLBACK, "C&lear scrollback")?;
-        item(edit, cmd::SAVE_SNIPPET, "Sa&ve selection as snippet...")?;
-        item(edit, cmd::RECORD_SNIPPET, "Rec&ord keystrokes as snippet")?;
+        item(edit, cmd::SAVE_SNIPPET, "Sa&ve selection as script...")?;
+        item(edit, cmd::RECORD_SNIPPET, "Rec&ord keystrokes as script")?;
         separator(edit)?;
         item(edit, cmd::COPY_ON_SELECT, "Copy on &select")?;
         item(edit, cmd::RIGHT_CLICK_PASTE, "&Right-click pastes")?;
@@ -1937,8 +1938,8 @@ fn build_menu() -> Result<HMENU> {
         item(tools, cmd::LIVE, "&Session manager\tCtrl+Shift+L")?;
         item(tools, cmd::FILES, "&File transfer\tCtrl+Shift+E")?;
         item(tools, cmd::FORWARDS, "&Port forwards\tCtrl+Shift+P")?;
-        item(tools, cmd::SNIPPETS, "Command s&nippets\tCtrl+Shift+Space")?;
-        item(tools, cmd::SNIPPET_FOLDER, "Open snippets f&older")?;
+        item(tools, cmd::SNIPPETS, "Sc&ripts\tCtrl+Shift+Space")?;
+        item(tools, cmd::SNIPPET_FOLDER, "Open scripts f&older")?;
         item(tools, cmd::PALETTE, "Command p&alette\tCtrl+Shift+A")?;
 
         let view = CreatePopupMenu()?;
@@ -1954,6 +1955,25 @@ fn build_menu() -> Result<HMENU> {
         separator(view)?;
         AppendMenuW(view, MF_POPUP, fonts.0 as usize, w!("&Font (this pane)"))?;
         AppendMenuW(view, MF_POPUP, themes.0 as usize, w!("&Theme (this pane)"))?;
+        let colours = CreatePopupMenu()?;
+        for (id, c) in (cmd::WINDOW_COLOURS..).zip(WindowColours::ALL) {
+            item(
+                colours,
+                id,
+                match c {
+                    WindowColours::Theme => "Follow the &terminal theme",
+                    WindowColours::System => "Follow &Windows (light or dark)",
+                    WindowColours::Light => "&Light",
+                    WindowColours::Dark => "&Dark",
+                },
+            )?;
+        }
+        AppendMenuW(
+            view,
+            MF_POPUP,
+            colours.0 as usize,
+            w!("&Window colours (menus, tools)"),
+        )?;
         separator(view)?;
         item(view, cmd::TEST_PATTERN, "Show test &pattern")?;
         separator(view)?;
@@ -2108,13 +2128,6 @@ fn win_rect(r: Rect) -> RECT {
         right: r.right(),
         bottom: r.bottom(),
     }
-}
-
-/// A system colour (`GetSysColor` is 0x00BBGGRR).
-fn sys_color(index: SYS_COLOR_INDEX) -> Rgb {
-    // SAFETY: plain query.
-    let c = unsafe { GetSysColor(index) };
-    Rgb::new(c as u8, (c >> 8) as u8, (c >> 16) as u8)
 }
 
 fn pixel(r: Rect) -> PixelRect {
@@ -2913,7 +2926,7 @@ impl Window {
                 notes.push("logging");
             }
             if tab.is_none() {
-                notes.push("snippet run");
+                notes.push("script run");
             }
             out.push(LiveSession {
                 pane: id,
@@ -5447,6 +5460,20 @@ impl Window {
                         {
                             next = None;
                         }
+                        // The part after a move types what was captured
+                        // before it, up to its own next capture, whose
+                        // value its own runner fills in.
+                        next = next.map(|(r, name, rest)| {
+                            let mut captured = false;
+                            let rest = rest
+                                .into_iter()
+                                .map(|s| {
+                                    captured |= matches!(s, Step::Capture(_));
+                                    if captured { s } else { run.runner.fill(s) }
+                                })
+                                .collect();
+                            (r, name, rest)
+                        });
                         if run.report
                             && let Some(row) =
                                 self.snippets_view.report_mut().and_then(|r| r.row_mut(id))
@@ -6523,8 +6550,14 @@ impl Window {
         }
     }
 
-    /// The colours of the tab strip and side pane: the focused pane's.
+    /// The colours of the drawn side pane tools: the window's own (the
+    /// focused pane's theme by default), or with Windows' light look the
+    /// focused pane's theme, as before window colours existed.
     fn chrome_palette(&self) -> Palette {
+        let c = self.ui_colours();
+        if c.custom {
+            return c.strip;
+        }
         let theme = self
             .panes
             .get(&self.focused_id())
@@ -6532,16 +6565,25 @@ impl Window {
         Palette::of(&theme)
     }
 
-    /// The tab strip's colours: the system menu bar's, so the strip reads
-    /// as part of the window frame rather than of a terminal.
-    fn strip_palette(&self) -> Palette {
-        Palette::menu_bar(
-            sys_color(COLOR_MENUBAR),
-            sys_color(COLOR_WINDOW),
-            sys_color(COLOR_MENUTEXT),
-            sys_color(COLOR_GRAYTEXT),
-            sys_color(COLOR_HIGHLIGHT),
+    /// The window's own colours (Settings > Window colours): by default
+    /// from the focused pane's theme.
+    fn ui_colours(&self) -> UiColours {
+        let theme = self
+            .panes
+            .get(&self.focused_id())
+            .map_or(&self.default_theme, |p| &p.theme);
+        let mode = self.settings.window_colours;
+        ui_colours::resolve(
+            mode,
+            theme,
+            &ui_theme::system(mode == WindowColours::System),
         )
+    }
+
+    /// The tab strip's colours: the menu bar's, so the strip reads as part
+    /// of the window frame rather than of a terminal.
+    fn strip_palette(&self) -> Palette {
+        self.ui_colours().strip
     }
 
     /// What the tools rail shows: the open tool, the pin, and the tab
@@ -6689,12 +6731,14 @@ impl Window {
             .panes
             .get(&self.focused_id())
             .map_or_else(|| self.default_theme.clone(), |p| p.theme.clone());
-        t.background = Palette::of(&t).strip;
+        t.background = self.chrome_palette().strip;
         t
     }
 
-    /// Redraws the tab strip and side pane grids.
+    /// Redraws the tab strip and side pane grids, and repaints the menu
+    /// bar and tools pane when the window's colours change.
     fn refresh_chrome(&mut self) {
+        ui_theme::apply(self.hwnd, self.ui_colours());
         rail::set_look(self.rail_look());
         self.sync_conn_view();
         let palette = self.chrome_palette();
@@ -7829,7 +7873,7 @@ impl Window {
         let id = self.focused_id();
         if !self.takes_broadcast(id) {
             return Some(Command::Notice(
-                "Snippets are typed into a pane with a running shell or console; this \
+                "Scripts are typed into a pane with a running shell or console; this \
                  pane has none, or is at a prompt."
                     .into(),
             ));
@@ -7859,7 +7903,7 @@ impl Window {
         let id = self.focused_id();
         if !self.takes_broadcast(id) {
             return Some(Command::Notice(
-                "Snippets are typed into a pane with a running shell or console; this \
+                "Scripts are typed into a pane with a running shell or console; this \
                  pane has none, or is at a prompt."
                     .into(),
             ));
@@ -7906,7 +7950,7 @@ impl Window {
             .map(|at| steps.split_off(at));
         if after.is_some() && panes.len() > 1 {
             return Some(Command::Notice(format!(
-                "The snippet {name} moves to another pane or tab (@pane, @tab), so it runs \
+                "The script {name} moves to another pane or tab (@pane, @tab), so it runs \
                  in one pane only, not in {} at once.",
                 panes.len()
             )));
@@ -7926,7 +7970,7 @@ impl Window {
         for &p in panes {
             let label = self.pane_label(p);
             let state = if self.scripts.contains_key(&p) {
-                RowState::Failed("a login script or snippet runs there".into())
+                RowState::Failed("another script runs there".into())
             } else {
                 RowState::Running(None)
             };
@@ -7935,7 +7979,7 @@ impl Window {
         if report {
             self.show_report(Report::new(name, rows, None));
         }
-        let what = format!("the snippet {name}");
+        let what = format!("the script {name}");
         for &p in panes {
             if self.scripts.contains_key(&p) {
                 continue;
@@ -8008,7 +8052,7 @@ impl Window {
         let Some(to) = to else {
             self.show(
                 from,
-                &format!("\x1b[0;31m[the snippet {name} stopped: {missing}]\x1b[0m\r\n"),
+                &format!("\x1b[0;31m[the script {name} stopped: {missing}]\x1b[0m\r\n"),
             );
             return;
         };
@@ -8036,7 +8080,7 @@ impl Window {
         let r = self.snippets_view.report().filter(|r| r.run.is_some())?;
         Some(Command::Notice(format!(
             "The report of the run of {} is still open. Close it first: Escape in the \
-             snippets view (Ctrl+Shift+Space).",
+             scripts view (Ctrl+Shift+Space).",
             r.name
         )))
     }
@@ -8083,7 +8127,7 @@ impl Window {
             .collect();
         if hosts.is_empty() {
             return Some(Command::Notice(
-                "There are no saved SSH sessions to run the snippet on. Save the hosts in \
+                "There are no saved SSH sessions to run the script on. Save the hosts in \
                  the connection manager first."
                     .into(),
             ));
@@ -8276,7 +8320,7 @@ impl Window {
             row.state = RowState::Running(None);
         }
         self.script_runs += 1;
-        let mut runner = Runner::named(&format!("the snippet {name}"), steps);
+        let mut runner = Runner::named(&format!("the script {name}"), steps);
         let actions = runner.start(Instant::now());
         self.scripts.insert(
             id,
@@ -8591,7 +8635,7 @@ impl Window {
         self.recording = Some((id, Recorder::default()));
         self.show(
             id,
-            "\x1b[0;90m[Recording keystrokes as a snippet. Edit > Record keystrokes as snippet \
+            "\x1b[0;90m[Recording keystrokes as a script. Edit > Record keystrokes as script \
              again stops it.]\x1b[0m\r\n",
         );
         self.refresh(id);
@@ -8608,7 +8652,7 @@ impl Window {
                 self.save_settings();
             } else if let Err(e) = snippet_store::remove(&snippets_dir(), &s) {
                 out = Some(Command::Notice(format!(
-                    "Could not remove the snippet's file: {e}"
+                    "Could not remove the script's file: {e}"
                 )));
             }
         }
@@ -8672,7 +8716,7 @@ impl Window {
         self.side.import = None;
         self.show_side(SideView::Snippets, true);
         let mut text = format!(
-            "Imported {done} snippet{} into {}. Each has a file there, in a folder named \
+            "Imported {done} script{} into {}. Each has a file there, in a folder named \
              after its category.",
             plural(done),
             dir.display()
@@ -10439,8 +10483,8 @@ impl Window {
                     .filter(|t| !t.trim().is_empty());
                 let Some(text) = text else {
                     return Some(Command::Notice(
-                        "Select the text for the snippet in a pane first, then use Edit > Save \
-                         selection as snippet."
+                        "Select the text for the script in a pane first, then use Edit > Save \
+                         selection as script."
                             .into(),
                     ));
                 };
@@ -10672,6 +10716,17 @@ impl Window {
                 self.save_settings();
                 self.update_menu_checks();
                 self.layout();
+            }
+            id if (cmd::WINDOW_COLOURS..cmd::WINDOW_COLOURS + WindowColours::ALL.len() as u32)
+                .contains(&id) =>
+            {
+                if let Some(c) = WindowColours::ALL.get((id - cmd::WINDOW_COLOURS) as usize) {
+                    self.settings.window_colours = *c;
+                    self.save_settings();
+                    self.update_menu_checks();
+                    self.refresh_chrome();
+                    self.request_full_redraw();
+                }
             }
             cmd::TOOLS_PIN => {
                 self.settings.tools_pinned = !self.settings.tools_pinned;
@@ -10983,6 +11038,17 @@ impl Window {
         unsafe {
             let _ = CheckMenuRadioItem(self.menu, cmd::FONT, last_font, font, MF_BYCOMMAND.0);
             let _ = CheckMenuRadioItem(self.menu, cmd::THEME, last_theme, theme, MF_BYCOMMAND.0);
+            let colours = WindowColours::ALL
+                .iter()
+                .position(|c| *c == s.window_colours)
+                .unwrap_or(0) as u32;
+            let _ = CheckMenuRadioItem(
+                self.menu,
+                cmd::WINDOW_COLOURS,
+                cmd::WINDOW_COLOURS + WindowColours::ALL.len() as u32 - 1,
+                cmd::WINDOW_COLOURS + colours,
+                MF_BYCOMMAND.0,
+            );
             let way = s.remote_app_clipboard.as_deref().unwrap_or("off");
             let way = crate::stream::CLIPBOARD_WAYS
                 .iter()
@@ -13327,8 +13393,11 @@ fn run_command(hwnd: HWND, command: Command) {
                 .unwrap_or(false) =>
         {
             let start = std::env::var_os("LOCALAPPDATA").map_or_else(home, PathBuf::from);
-            if let Some(path) = pick_file(hwnd, w!("Snippets or macros of another program"), &start)
-            {
+            if let Some(path) = pick_file(
+                hwnd,
+                w!("Scripts, snippets or macros of another program"),
+                &start,
+            ) {
                 match read_snippet_file(&path) {
                     Ok(found) => {
                         with_window(|w| w.add_snippet_import(found));
@@ -13382,7 +13451,7 @@ fn run_command(hwnd: HWND, command: Command) {
                 .collect();
             let more = if steps.len() > 8 { "\n..." } else { "" };
             let text = format!(
-                "Type the snippet {name} into {}, which {} the Production theme?\n\n{}{more}",
+                "Type the script {name} into {}, which {} the Production theme?\n\n{}{more}",
                 production.join(", "),
                 if production.len() == 1 { "has" } else { "have" },
                 shown.join("\n"),
@@ -13399,7 +13468,7 @@ fn run_command(hwnd: HWND, command: Command) {
             else {
                 return;
             };
-            let text = format!("Delete the snippet {name}?");
+            let text = format!("Delete the script {name}?");
             if dialog(hwnd, &text, MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2) == Some(IDYES)
                 && let Some(Some(command)) = with_window(|w| w.delete_snippet(index))
             {
@@ -13413,7 +13482,7 @@ fn run_command(hwnd: HWND, command: Command) {
             production,
         } => {
             let text = format!(
-                "Run the snippet {name} on {} hosts? {} {} the Production theme.",
+                "Run the script {name} on {} hosts? {} {} the Production theme.",
                 hosts.len(),
                 production.join(", "),
                 if production.len() == 1 { "has" } else { "have" },
@@ -13797,7 +13866,7 @@ fn read_snippet_file(path: &std::path::Path) -> std::result::Result<SnippetSourc
         return Err(none("macros"));
     }
     if text.len() > 1 << 20 {
-        return Err(format!("{} is too big for one snippet.", path.display()));
+        return Err(format!("{} is too big for one script.", path.display()));
     }
     let stem = path
         .file_stem()
@@ -14267,6 +14336,10 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
         if let Some(result) = standby_capture(hwnd, msg, wparam) {
             return result;
         }
+        // The menu bar in the window's colours.
+        if let Some(result) = ui_theme::frame_message(hwnd, msg, wparam, lparam) {
+            return result;
+        }
         if with_window(|w| w.desktop_message(msg, wparam, lparam)) == Some(true) {
             return LRESULT(0);
         }
@@ -14279,6 +14352,11 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                 LRESULT(0)
             }
             WM_ERASEBKGND => LRESULT(1),
+            // Windows' light or dark app mode, or its colours, changed.
+            WM_SETTINGCHANGE | WM_SYSCOLORCHANGE => {
+                with_window(Window::refresh_chrome);
+                DefWindowProcW(hwnd, msg, wparam, lparam)
+            }
             WM_SIZE => {
                 if wparam.0 as u32 != SIZE_MINIMIZED {
                     with_window(Window::layout);
