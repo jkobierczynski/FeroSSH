@@ -1083,6 +1083,10 @@ impl Remote {
             if job.state != State::Queued {
                 continue;
             }
+            let file = !job.kind.is_folder();
+            if file && active >= self.parallel {
+                continue;
+            }
             // One upload at a time owns a target's part file: a second
             // save of the same edited file waits for the first.
             if job.kind == Kind::Upload
@@ -1095,12 +1099,10 @@ impl Remote {
             {
                 continue;
             }
-            if job.kind.is_folder() {
-                self.start(i);
-            } else if active < self.parallel {
+            if file {
                 active += 1;
-                self.start(i);
             }
+            self.start(i);
         }
         for i in 0..self.jobs.len() {
             if self.jobs.get(i).is_some_and(|j| j.state == State::Running) {
