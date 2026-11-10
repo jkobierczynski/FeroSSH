@@ -6,21 +6,35 @@
 # release workflow then leaves a draft release with the unsigned exes. This
 # script, run from a checkout of the repository:
 #
-#   1. downloads ferossh.exe, ferossh-desktop.exe and BUILD-MANIFEST.json
-#      from the draft, and checks the exes are the ones CI built;
-#   2. signs both exes with signtool and the code signing certificate whose
+#   1. downloads the unsigned exes and BUILD-MANIFEST.json that the release
+#      run for the tag kept as workflow artifacts, and checks with
+#      `gh attestation verify` that each was built by release.yml for this
+#      tag, at the commit the tag points to, on GitHub's runners; the
+#      manifest must name that tag and commit and the attested exes' hashes
+#      (scripts/release-provenance.ps1). A file in the draft release is
+#      never trusted because another file in the draft vouches for it;
+#   2. checks the Linux agents in the draft the same way (they are
+#      published as CI built them);
+#   3. signs both exes with signtool and the code signing certificate whose
 #      subject contains -Subject (a Certum card, or SimplySign Desktop
-#      logged in), with an RFC 3161 timestamp from Certum;
-#   3. writes SHA256SUMS.txt and BUILD-MANIFEST.json for the signed exes
-#      (and the Linux agents, which are not signed) and uploads the exes,
-#      the sums and the manifest to the draft;
-#   4. runs the "Attest a signed release" workflow on them and waits;
-#   5. names the signer in the release notes, publishes the release and
+#      logged in), with an RFC 3161 timestamp from Certum, and checks each
+#      signed exe is its attested unsigned exe plus the signature;
+#   4. writes SHA256SUMS.txt and BUILD-MANIFEST.json for the signed exes
+#      (each exe keeps its attested sha256_unsigned, and "signing" records
+#      the verified build: workflow, run, commit and CI manifest hash) and
+#      uploads the exes, the sums and the manifest to the draft;
+#   5. runs the "Attest a signed release" workflow on them, which checks
+#      them against CI's build again before attesting, and waits;
+#   6. names the signer in the release notes, publishes the release and
 #      writes the winget manifests for the signed ferossh.exe.
 #
-# It needs the GitHub CLI (gh, logged in with write access) and signtool
-# from the Windows SDK. Nothing is published until every check passes; run
-# it again after a failure.
+# It needs PowerShell 7, the GitHub CLI 2.56 or later (gh, logged in with
+# write access; `gh attestation verify` with --source-ref and
+# --source-digest) and signtool from the Windows SDK. Nothing is published
+# until every check passes; run it again after a failure (it starts again
+# from CI's unsigned exes, so it signs again).
+
+#Requires -Version 7
 
 param(
     [Parameter(Mandatory)] [string]$Tag,
@@ -35,9 +49,8 @@ $ErrorActionPreference = "Stop"
 # gh writes UTF-8; without this PowerShell reads its output in the console's
 # code page and the notes come back with "⚠" turned into "ΓÜá".
 [Console]::OutputEncoding = [Text.UTF8Encoding]::new($false)
-$exes = "ferossh.exe", "ferossh-desktop.exe"
-# Linux agents for Run remote app: listed in the sums, never signed.
-$agents = "ferostream-agent", "ferostream-agent-aarch64"
+. (Join-Path $PSScriptRoot "release-provenance.ps1")
+$exes = @($ReleaseExeArtifacts.Keys)
 
 function Invoke-Native {
     param([string]$Program, [string[]]$Arguments)
@@ -57,8 +70,10 @@ function Find-SignTool {
     $tool.FullName
 }
 
-if (-not (Get-Command gh -ErrorAction SilentlyContinue)) { throw "the GitHub CLI (gh) is not installed" }
+Assert-GhAttestationSupport
 $signtool = Find-SignTool
+# The attestations name the repository as GitHub spells it.
+$Repository = Get-CanonicalRepository $Repository
 
 $release = gh release view $Tag -R $Repository --json isDraft,body | ConvertFrom-Json
 if ($LASTEXITCODE) { throw "release $Tag not found in $Repository" }
@@ -67,63 +82,72 @@ if (-not $release.isDraft) { throw "release $Tag is already published; this scri
 $work = Join-Path ([IO.Path]::GetTempPath()) "ferossh-sign-$Tag"
 Remove-Item $work -Recurse -Force -ErrorAction SilentlyContinue
 New-Item -ItemType Directory $work | Out-Null
-Write-Host "Downloading the draft's files to $work"
-Invoke-Native gh @("release", "download", $Tag, "-R", $Repository, "-D", $work,
-    "-p", "ferossh.exe", "-p", "ferossh-desktop.exe", "-p", "BUILD-MANIFEST.json",
-    "-p", "ferostream-agent*")
+$out = Join-Path $work "release"
+New-Item -ItemType Directory $out | Out-Null
 
-# Sign only what CI built: the manifest has each exe's SHA-256 before
-# signing, the hash a rebuild from the tag reproduces. When an earlier run
-# of this script already signed and uploaded them (and failed later, for
-# example while attesting), the draft holds that run's manifest and signed
-# exes: those are checked against the manifest and not signed again.
-$manifest = Get-Content -Raw (Join-Path $work "BUILD-MANIFEST.json") | ConvertFrom-Json
-$signed = 0
+# Sign only what CI built, as its attestations prove: not whatever the
+# draft holds, which anyone with release write access could have replaced
+# together with BUILD-MANIFEST.json.
+$build = Get-VerifiedReleaseBuild -Repository $Repository -Tag $Tag -OutDir (Join-Path $work "ci")
+$manifest = $build.Manifest
+
+Write-Host "Downloading the draft's Linux agents to $out"
+Invoke-Native gh @("release", "download", $Tag, "-R", $Repository, "-D", $out, "-p", "ferostream-agent*")
+Assert-ReleaseAgents -Dir $out -Build $build -Repository $Repository -Tag $Tag
+$agents = @($manifest.files | Where-Object name -like "ferostream-agent*" | ForEach-Object name)
+
+foreach ($exe in $exes) { Copy-Item $build.Exes[$exe] (Join-Path $out $exe) }
+Write-Host "Signing with the certificate for '$Subject' (SimplySign or the card may ask for your PIN or a code)"
 foreach ($exe in $exes) {
-    $entry = $manifest.files | Where-Object name -eq $exe
-    $hash = (Get-FileHash (Join-Path $work $exe) -Algorithm SHA256).Hash.ToLower()
-    if ($entry -and $hash -eq $entry.sha256_unsigned) { continue }
-    if ($entry -and $hash -eq $entry.sha256 -and $entry.authenticode -eq "Valid") { $signed++; continue }
-    throw "$exe does not match the SHA-256 the release workflow built ($($entry.sha256_unsigned)); not signing it"
-}
-if ($signed -ne 0 -and $signed -ne $exes.Count) { throw "the draft has some exes signed and some not; delete the draft and run the release again" }
-
-if ($signed) {
-    Write-Host "The draft's exes are already signed by an earlier run; going on from there"
-} else {
-    Write-Host "Signing with the certificate for '$Subject' (SimplySign or the card may ask for your PIN or a code)"
-    foreach ($exe in $exes) {
-        Invoke-Native $signtool @("sign", "/n", $Subject, "/fd", "sha256", "/tr", $Timestamp, "/td", "sha256",
-            "/d", "FeroSSH", "/du", "https://github.com/$Repository", (Join-Path $work $exe))
-    }
+    Invoke-Native $signtool @("sign", "/n", $Subject, "/fd", "sha256", "/tr", $Timestamp, "/td", "sha256",
+        "/d", "FeroSSH", "/du", "https://github.com/$Repository", (Join-Path $out $exe))
 }
 $signer = $null
+$signerSubject = $null
 foreach ($exe in $exes) {
-    $sig = Get-AuthenticodeSignature (Join-Path $work $exe)
+    $path = Join-Path $out $exe
+    $sig = Get-AuthenticodeSignature $path
     if ($sig.Status -ne "Valid") { throw "$exe is not validly signed: $($sig.Status) $($sig.StatusMessage)" }
     if (-not $sig.TimeStamperCertificate) { throw "$exe has no timestamp" }
+    # The signed exe must be CI's attested exe with a signature added and
+    # nothing else changed.
+    if (-not (Test-SignedFromUnsigned -Signed $path -Unsigned $build.Exes[$exe])) {
+        throw "signed $exe differs from CI's attested unsigned exe in more than its signature"
+    }
     $signer = $sig.SignerCertificate.GetNameInfo([Security.Cryptography.X509Certificates.X509NameType]::SimpleName, $false)
-    Write-Host "$exe signed by $($sig.SignerCertificate.Subject)"
+    $signerSubject = $sig.SignerCertificate.Subject
+    Write-Host "$exe signed by $signerSubject"
 }
 
 # The same sums and manifest the release workflow writes, now for the
-# signed exes.
-$sums = Join-Path $work "SHA256SUMS.txt"
-($exes + ($agents | Where-Object { Test-Path (Join-Path $work $_) })) | Sort-Object | ForEach-Object {
-    "$((Get-FileHash (Join-Path $work $_) -Algorithm SHA256).Hash.ToLower())  $_"
+# signed exes. Each exe keeps sha256_unsigned, the hash its attestation
+# from the release workflow covers; "signing" says which build was checked.
+$sums = Join-Path $out "SHA256SUMS.txt"
+($exes + $agents) | Sort-Object | ForEach-Object {
+    "$(Get-Sha256 (Join-Path $out $_))  $_"
 } | Set-Content -Encoding ascii $sums
 foreach ($entry in $manifest.files | Where-Object name -in $exes) {
-    $path = Join-Path $work $entry.name
+    $path = Join-Path $out $entry.name
     $entry.size = (Get-Item $path).Length
-    $entry.sha256 = (Get-FileHash $path -Algorithm SHA256).Hash.ToLower()
+    $entry.sha256 = Get-Sha256 $path
     $entry.authenticode = "$((Get-AuthenticodeSignature $path).Status)"
 }
-$manifest | ConvertTo-Json -Depth 4 | Set-Content -Encoding utf8NoBOM (Join-Path $work "BUILD-MANIFEST.json")
+$manifest | Add-Member -Force -NotePropertyName signing -NotePropertyValue ([ordered]@{
+    signed_by      = $signerSubject
+    verified_build = [ordered]@{
+        workflow        = "$ReleaseWorkflowPath@refs/tags/$Tag"
+        run             = $build.Run
+        commit          = $build.Commit
+        manifest_sha256 = $build.ManifestHash
+    }
+})
+$manifestPath = Join-Path $out "BUILD-MANIFEST.json"
+$manifest | ConvertTo-Json -Depth 5 | Set-Content -Encoding utf8NoBOM $manifestPath
 Get-Content $sums
 
 Write-Host "Uploading the signed files to the draft"
 Invoke-Native gh @("release", "upload", $Tag, "-R", $Repository, "--clobber",
-    (Join-Path $work "ferossh.exe"), (Join-Path $work "ferossh-desktop.exe"), $sums, (Join-Path $work "BUILD-MANIFEST.json"))
+    (Join-Path $out "ferossh.exe"), (Join-Path $out "ferossh-desktop.exe"), $sums, $manifestPath)
 
 Write-Host "Attesting the signed files"
 $started = (Get-Date).ToUniversalTime()

@@ -30,6 +30,16 @@ gh attestation verify ferossh.exe -R jkobierczynski/FeroSSH
 
 When the exes are signed on the maintainer's PC (from v1.0.0-rc2 on), the release workflow attests the unsigned exes it built, and after signing a second workflow (*Attest a signed release*) attests the signed files that are published. The second attestation proves the files came from FeroSSH's repository unchanged since; that they match the build is shown by `BUILD-MANIFEST.json`, below, and by rebuilding.
 
+Neither the signing script nor that second workflow trusts the files in the draft release. Before anything is signed, `scripts/sign-release.ps1` takes the unsigned exes and `BUILD-MANIFEST.json` from the release run itself and checks each with `gh attestation verify`: the attestation must come from `.github/workflows/release.yml` running for that release's tag, at the commit the tag points to, on GitHub's own runners, and the manifest must name that tag, that commit and those exes' hashes. After signing it checks that each signed exe is the attested unsigned exe plus the signature and nothing else. The *Attest a signed release* workflow repeats all of these checks against the files in the draft before it attests them. From the first release after v1.3.0, `BUILD-MANIFEST.json` also has a `signing` section naming the signer and the build that was checked: the workflow, its run, the commit and the SHA-256 of the release workflow's own manifest.
+
+To check the link yourself, verify the unsigned exe's attestation as above with the release workflow's identity, for example:
+
+```
+gh attestation verify ferossh.exe -R jkobierczynski/FeroSSH --signer-workflow jkobierczynski/FeroSSH/.github/workflows/release.yml --source-ref refs/tags/<tag>
+```
+
+run on an exe you rebuilt with the steps below (it has the unsigned hash), or on the signed download with `--signer-workflow jkobierczynski/FeroSSH/.github/workflows/attest-release.yml`.
+
 `BUILD-MANIFEST.json` lists the tag, the commit, the Rust toolchain and, for each exe, its size, its SHA-256 as downloaded (`sha256`) and its SHA-256 before code signing (`sha256_unsigned`).
 
 ## Rebuilding a release yourself
