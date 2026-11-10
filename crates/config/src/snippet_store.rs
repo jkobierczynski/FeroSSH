@@ -379,7 +379,7 @@ fn merge_into(from: &Path, to: &Path, depth: usize) {
                 merge_into(&entry.path(), &target, depth + 1);
                 let _ = std::fs::remove_dir(entry.path());
             }
-        } else if kind.is_file() && !target.exists() {
+        } else if kind.is_file() && !target.exists() && !target.with_extension(EXTENSION).exists() {
             let _ = std::fs::rename(entry.path(), &target);
         }
     }
@@ -562,9 +562,22 @@ mod tests {
         .unwrap();
         assert_eq!(move_old_folder(&dir, &old), dir);
         assert!(dir.join("Ops").join("New.snippet").is_file());
+        // A .script of the same name counts as taken too.
+        std::fs::write(
+            dir.join("Ops").join("Same.script"),
+            "Snippet \"Same\"\n  Line y\n",
+        )
+        .unwrap();
+        std::fs::write(
+            old.join("Ops").join("Same.snippet"),
+            "Snippet \"Same\"\n  Line z\n",
+        )
+        .unwrap();
+        assert_eq!(move_old_folder(&dir, &old), dir);
+        assert!(old.join("Ops").join("Same.snippet").is_file());
         assert!(old.join("Ops").join("Up.snippet").is_file());
         let (all, _) = load(&dir);
-        assert_eq!(all.len(), 2);
+        assert_eq!(all.len(), 3);
         assert!(all.iter().any(|s| s.name == "Up"));
         let _ = std::fs::remove_dir_all(&base);
     }
