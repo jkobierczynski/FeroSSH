@@ -518,7 +518,10 @@ fn fill_list(h: &Handles, rows: &[NativeScript], searching: bool) {
                     pszHeader: PWSTR(header.as_mut_ptr()),
                     iGroupId: id as i32,
                     stateMask: LVGS_COLLAPSIBLE | LVGS_COLLAPSED,
-                    state: if folded.get(id).copied().unwrap_or(false) {
+                    // A search shows every match: nothing folds then.
+                    state: if searching {
+                        Default::default()
+                    } else if folded.get(id).copied().unwrap_or(false) {
                         LVGS_COLLAPSIBLE | LVGS_COLLAPSED
                     } else {
                         LVGS_COLLAPSIBLE
@@ -815,7 +818,9 @@ fn notify(h: Handles, lparam: LPARAM) -> LRESULT {
             NM_DBLCLK => run(false),
             NM_CLICK => {
                 let a = &*(lparam.0 as *const NMITEMACTIVATE);
-                if let Some(id) = heading_at(h.list, a.ptAction) {
+                if !with(|s| s.searching).unwrap_or(false)
+                    && let Some(id) = heading_at(h.list, a.ptAction)
+                {
                     toggle(&h, id);
                 }
             }
@@ -861,7 +866,12 @@ fn draw_heading(list: HWND, cd: &NMLVCUSTOMDRAW) {
         )
         .0 != 0
     };
-    let name = format!("{} {name}", if folded { '\u{25B8}' } else { '\u{25BE}' });
+    // No chevron while searching: nothing folds then.
+    let name = if with(|s| s.searching).unwrap_or(false) {
+        name
+    } else {
+        format!("{} {name}", if folded { '\u{25B8}' } else { '\u{25BE}' })
+    };
     draw_group_heading(list, cd, &name, &count.to_string());
 }
 
