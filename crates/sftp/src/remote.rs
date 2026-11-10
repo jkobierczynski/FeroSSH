@@ -406,6 +406,16 @@ fn hash_file(path: &Path) -> Result<String, String> {
         .collect())
 }
 
+/// Why a resumed transfer stopped without a matching SHA-256 on both ends,
+/// and how to start it over: the part file is kept, so a retry resumes
+/// from it and would stop the same way.
+fn unverified_resume(part: &str) -> String {
+    format!(
+        "the resumed part could not be checked (the server needs sha256sum), \
+         so it was kept: delete {part} and retry to start over"
+    )
+}
+
 /// `path` with `suffix` added to its file name.
 fn with_suffix(path: &Path, suffix: &str) -> PathBuf {
     let mut s = path.as_os_str().to_owned();
@@ -1642,7 +1652,8 @@ impl Remote {
                         return self.fail(i, MISMATCH.into());
                     }
                     if u.resumed && !u.check.verified() {
-                        return self.fail(i, "Cannot verify resumed upload; partial file retained. Restart the transfer from scratch.".into());
+                        let why = unverified_resume(&String::from_utf8_lossy(&u.part));
+                        return self.fail(i, why);
                     }
                     self.rename_upload(i);
                 }
@@ -1668,7 +1679,8 @@ impl Remote {
             return self.fail(i, MISMATCH.into());
         }
         if d.resumed && !d.check.verified() {
-            return self.fail(i, "Cannot verify resumed download; partial file retained. Restart the transfer from scratch.".into());
+            let why = unverified_resume(&d.part.display().to_string());
+            return self.fail(i, why);
         }
         let note = d.check.note();
         if let Err(e) = std::fs::rename(&d.part, &d.target) {
