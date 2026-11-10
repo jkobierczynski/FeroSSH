@@ -105,7 +105,7 @@ Font, theme and text size apply to the focused pane only. Session > Save font an
 | Save font and theme for this host | Keeps the focused pane's font, text size and theme in the host's profile. |
 | Start new tabs and panes in this directory | Keeps the focused pane's directory as the host's start directory (Start dir in the connection form): new tabs, panes and tmux windows on that host start there when the directory of the pane they come from is not known, also after a restart. |
 | Replace host key... | After a host key change you know the reason for, trusts the new key. It asks twice. |
-| Verify transfers (SHA-256) | Compares SHA-256 sums on both ends after each SFTP transfer (the server needs `sha256sum`). ✓ `VerifyTransfers`. |
+| Verify transfers (SHA-256) | Compares SHA-256 sums on both ends after each SFTP transfer (the server needs `sha256sum` and `xargs`). ✓ `VerifyTransfers`. |
 | ZMODEM: answer rz and sz | Answers `rz` and `sz` in the terminal (see [ZMODEM](everyday-use.md#zmodem)). ✓ `ZModem`. |
 | Attach tmux | Types `tmux -CC new-session -A -s main` in the pane and turns tmux windows and panes into native tabs and panes (see [tmux](everyday-use.md#tmux)). |
 | Switch tmux session... | Lists the other tmux sessions on the server and switches to one. |
