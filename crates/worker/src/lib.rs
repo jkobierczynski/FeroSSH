@@ -282,13 +282,14 @@ pub async fn serve(mut inbox: mpsc::Receiver<Message>, out: mpsc::Sender<Message
                                           session was closed and the last input was \
                                           not sent."
                                 .to_owned();
-                            if out
-                                .send(Message::Disconnected { channel, reason })
-                                .await
-                                .is_err()
-                            {
-                                return;
-                            }
+                            // Sent from its own task: a UI slow to read
+                            // must not hold up input for other sessions.
+                            // The session is gone, so nothing for this
+                            // channel can follow it.
+                            let out = out.clone();
+                            tokio::spawn(async move {
+                                let _ = out.send(Message::Disconnected { channel, reason }).await;
+                            });
                             continue;
                         }
                         Err(mpsc::error::TrySendError::Closed(_)) => false,
