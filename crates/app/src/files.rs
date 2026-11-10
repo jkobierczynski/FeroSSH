@@ -9,6 +9,7 @@
 
 use std::path::{Path, PathBuf};
 
+use ferossh_config::Bookmark;
 use ferossh_ipc::DirEntry;
 use ferossh_sftp::{JobId, Kind, Listing, Remote, State, names};
 
@@ -448,6 +449,62 @@ pub fn split_at(a: Arrange, area: Rect, gap: i32, pos: i32) -> u8 {
     pct.clamp(MIN_SPLIT, 100 - MIN_SPLIT)
 }
 
+/// The bookmarks that go with connection `alias` (those for any host, and
+/// those for this one), with their indexes in `all`, sorted by name.
+pub fn bookmarks_for<'a>(all: &'a [Bookmark], alias: Option<&str>) -> Vec<(usize, &'a Bookmark)> {
+    let mut shown: Vec<(usize, &Bookmark)> = all
+        .iter()
+        .enumerate()
+        .filter(|(_, b)| match (&b.host, alias) {
+            (None, _) => true,
+            (Some(h), Some(a)) => h.eq_ignore_ascii_case(a),
+            (Some(_), None) => false,
+        })
+        .collect();
+    shown.sort_by_key(|(_, b)| b.name.to_lowercase());
+    shown
+}
+
+/// A bookmark name as kept: trimmed, without quotes or control
+/// characters (it is written quoted on one line); `None` when empty.
+pub fn bookmark_name(text: &str) -> Option<String> {
+    let name: String = text
+        .chars()
+        .filter(|c| *c != '"' && !c.is_control())
+        .take(60)
+        .collect();
+    let name = name.trim();
+    (!name.is_empty()).then(|| name.to_owned())
+}
+
+/// `all` with `new` added, or put in place of bookmark `replacing`; one
+/// with the same name for the same host goes.
+pub fn put_bookmark(all: &[Bookmark], new: Bookmark, replacing: Option<usize>) -> Vec<Bookmark> {
+    let mut out: Vec<Bookmark> = all
+        .iter()
+        .enumerate()
+        .filter(|(i, b)| Some(*i) != replacing && !b.same_name(&new))
+        .map(|(_, b)| b.clone())
+        .collect();
+    out.push(new);
+    out
+}
+
+/// A name for a new bookmark: the last part of the remote folder, else
+/// of the local one.
+pub fn bookmark_suggestion(local: Option<&Path>, remote: Option<&[u8]>) -> String {
+    let remote = remote
+        .map(names::file_name)
+        .filter(|n| !n.is_empty() && *n != b"/")
+        .map(|n| String::from_utf8_lossy(n).into_owned());
+    let local = local.and_then(|p| {
+        p.file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .or_else(|| Some(p.display().to_string()))
+    });
+    remote.or(local).unwrap_or_else(|| "Bookmark".to_owned())
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::indexing_slicing)]
 mod tests {
@@ -606,5 +663,51 @@ mod tests {
     fn rights_read_like_ls() {
         assert_eq!(rights(Some(0o100_755)), "-rwxr-xr-x");
         assert_eq!(rights(None), "");
+    }
+    fn mark(name: &str, host: Option<&str>) -> Bookmark {
+        Bookmark {
+            name: name.into(),
+            local: None,
+            remote: Some("/srv".into()),
+            host: host.map(Into::into),
+        }
+    }
+
+    #[test]
+    fn bookmarks_show_for_any_host_or_this_one() {
+        let all = [
+            mark("web", Some("prod")),
+            mark("Logs", None),
+            mark("db", Some("other")),
+        ];
+        let at = |alias| -> Vec<usize> { bookmarks_for(&all, alias).iter().map(|b| b.0).collect() };
+        assert_eq!(at(Some("PROD")), vec![1, 0]);
+        assert_eq!(at(None), vec![1]);
+    }
+
+    #[test]
+    fn a_bookmark_replaces_one_with_its_name() {
+        let all = [mark("web", Some("prod")), mark("web", None)];
+        let out = put_bookmark(&all, mark("WEB", Some("prod")), None);
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[1].name, "WEB");
+        // Renaming bookmark 1 drops the old one.
+        let out = put_bookmark(&all, mark("site", None), Some(1));
+        assert_eq!(
+            out.iter().map(|b| b.name.as_str()).collect::<Vec<_>>(),
+            ["web", "site"]
+        );
+        assert_eq!(bookmark_name("  \"my\" site\n "), Some("my site".into()));
+        assert_eq!(bookmark_name(" \" "), None);
+    }
+
+    #[test]
+    fn a_new_bookmark_is_named_after_its_folder() {
+        assert_eq!(bookmark_suggestion(None, Some(b"/var/www/")), "www");
+        assert_eq!(
+            bookmark_suggestion(Some(Path::new("/home/me/Sites")), Some(b"/")),
+            "Sites"
+        );
+        assert_eq!(bookmark_suggestion(None, None), "Bookmark");
     }
 }

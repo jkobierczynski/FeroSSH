@@ -31,6 +31,7 @@ FeroSSH reads `~/.ssh/config` and `~/.ssh/known_hosts` too, and writes only to `
 | --- | --- | --- |
 | `DownloadFolder "D:\Transfers"` | your Downloads folder | Where downloads go. |
 | `TransferLayout "stacked swapped 40"` | side by side, Local first, half each | How File transfer arranges its lists: `side` or `stacked`, `swapped` for Remote first, and the first list's share in percent. Layout ▾ and dragging the gap set it. |
+| `Bookmark "web" "D:\Sites\web" "/var/www/web" "web1"` | none | A File transfer bookmark: its name, Local folder, Remote folder and the connection it is for, `""` for none (one folder at least). One line per bookmark; ★ Bookmarks ▾ adds, renames and deletes them. |
 | `VerifyTransfers yes` | no | Compares SHA-256 on both ends after each file (the server needs `sha256sum`). |
 | `ParallelTransfers 4` | 3 | Files that move at once, 1 to 8. |
 | `FollowDirectory no` | yes | Whether the file view follows the shell's `cd` (OSC 7). |
@@ -81,6 +82,8 @@ Profile web1
     Tmux main
     TmuxLayout ferossh
     StartDir /srv/www
+    LocalFolder "D:\Sites\web"
+    RemoteFolder /var/www/web
 ```
 
 | Keyword | Meaning |
@@ -91,6 +94,8 @@ Profile web1
 | `Scrollback N` | Lines of scrollback for this host's panes. |
 | `Tmux SESSION` | Attaches to this tmux session after every login. `off`, `no` or `none` (or leaving it out) means no tmux; `on`, `yes` or `true` attaches to `main`. |
 | `StartDir PATH` | The server directory shells on this host start in: FeroSSH types `cd` after each login (before tmux attaches) and gives a new tmux session `-c`. New tabs and panes follow the pane they came from and use it only when that pane's directory is not known. Session > Start new tabs and panes in this directory sets it from the focused pane. |
+| `LocalFolder PATH` | The folder on this PC the Local list of File transfer opens when it turns to this host (Local folder in the connection form). It does not change `DownloadFolder`. |
+| `RemoteFolder PATH` | The server folder the Remote list of File transfer starts in for this host (Remote folder in the connection form), before following cd takes over. |
 | `TmuxLayout ferossh` or `tmux` | `ferossh` (the default) makes each native pane its own tmux window, so each can have its own font; `tmux` uses tmux's own splits. |
 | `AutoReconnect no` or `yes` | Overrides the global `AutoReconnect` for this host, for example to keep a production host from logging in again by itself. |
 | `LegacyAlgorithms yes` | Also offers older crypto (ECDH on NIST curves, DH groups 14 to 18 with SHA-2, AES-CTR, plain HMAC-SHA-2) for old switches and routers. Still no SHA-1, CBC or DSA. The tab shows an amber ⚠. |

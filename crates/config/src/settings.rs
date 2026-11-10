@@ -120,6 +120,12 @@ pub struct Profile {
     /// this host start in; the server's choice (the home folder) when
     /// unset.
     pub start_dir: Option<String>,
+    /// The folder on this PC File transfer's Local list opens for this
+    /// host; the download folder when unset.
+    pub local_folder: Option<String>,
+    /// The server folder File transfer's Remote list opens for this host;
+    /// the shell's or the home folder when unset.
+    pub remote_folder: Option<String>,
     /// Also offer the legacy algorithm set (ECDH NIST curves, DH groups
     /// 14 to 18 with SHA-2, AES-CTR, plain HMAC-SHA-2) for older switches,
     /// routers and servers.
@@ -320,6 +326,38 @@ pub fn start_dir(dir: &str) -> Option<String> {
     (!dir.is_empty() && !dir.chars().any(|c| c.is_control() || c == '"')).then(|| dir.to_owned())
 }
 
+/// A named pair of folders for File transfer: one on this PC, one on a
+/// server (either may be missing), for one host or (`host` unset) any.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Bookmark {
+    pub name: String,
+    pub local: Option<String>,
+    pub remote: Option<String>,
+    pub host: Option<String>,
+}
+
+impl Bookmark {
+    /// `Bookmark "name" "local" "remote" "host"`, an empty one for none.
+    fn from_args(args: &[String]) -> Option<Self> {
+        let get = |i: usize| args.get(i).and_then(|a| start_dir(a));
+        let name = get(0)?;
+        let b = Self {
+            name,
+            local: get(1),
+            remote: get(2),
+            host: get(3),
+        };
+        (b.local.is_some() || b.remote.is_some()).then_some(b)
+    }
+
+    /// The same name for the same host (names are matched in any case).
+    pub fn same_name(&self, other: &Self) -> bool {
+        self.name.eq_ignore_ascii_case(&other.name)
+            && self.host.as_deref().map(str::to_ascii_lowercase)
+                == other.host.as_deref().map(str::to_ascii_lowercase)
+    }
+}
+
 /// A `VirtualDesktop` command as kept: trimmed, `None` when empty or
 /// holding control characters (it travels as one line). Written back as
 /// is, so quotes in it stay the shell's.
@@ -344,6 +382,8 @@ impl Profile {
             && self.tmux.is_none()
             && self.tmux_layout.is_none()
             && self.start_dir.is_none()
+            && self.local_folder.is_none()
+            && self.remote_folder.is_none()
             && !self.legacy_algorithms
             && self.desktop_port.is_none()
             && self.vnc_port.is_none()
@@ -403,6 +443,8 @@ pub struct Settings {
     /// such as `side 50` or `stacked swapped 40`; side by side, Local
     /// first, when unset.
     pub transfer_layout: Option<String>,
+    /// File transfer's named folder pairs, in the order made.
+    pub bookmarks: Vec<Bookmark>,
     /// The X server forwarded X11 goes to (`DISPLAY` syntax); the `DISPLAY`
     /// environment variable, or `localhost:0`, when unset.
     pub x11_display: Option<String>,
@@ -501,6 +543,7 @@ impl Default for Settings {
             zmodem: false,
             follow_directory: true,
             transfer_layout: None,
+            bookmarks: Vec::new(),
             x11_display: None,
             update_check_weekly: false,
             secrets: Vec::new(),
@@ -731,6 +774,13 @@ impl Settings {
                     block = Block::Top;
                     s.zmodem = yes(&args).unwrap_or(false);
                 }
+                "bookmark" => {
+                    block = Block::Top;
+                    if let Some(b) = Bookmark::from_args(&args) {
+                        s.bookmarks.retain(|x| !x.same_name(&b));
+                        s.bookmarks.push(b);
+                    }
+                }
                 "transferlayout" => {
                     block = Block::Top;
                     s.transfer_layout = Some(joined).filter(|f| !f.is_empty());
@@ -942,6 +992,8 @@ impl Settings {
                                 }
                             }
                             "startdir" => p.start_dir = start_dir(&raw_rest(line)),
+                            "localfolder" => p.local_folder = start_dir(&raw_rest(line)),
+                            "remotefolder" => p.remote_folder = start_dir(&raw_rest(line)),
                             "desktopsize" => {
                                 p.desktop_size = first.as_deref().and_then(DesktopSize::parse);
                             }
@@ -1081,6 +1133,18 @@ impl Settings {
         if let Some(l) = &self.transfer_layout {
             let _ = writeln!(out, "TransferLayout {}", arg(l));
         }
+        for b in &self.bookmarks {
+            let quoted = |t: &str| format!("\"{}\"", clean(t).replace('"', ""));
+            let opt = |t: &Option<String>| quoted(t.as_deref().unwrap_or_default());
+            let _ = writeln!(
+                out,
+                "Bookmark {} {} {} {}",
+                quoted(&b.name),
+                opt(&b.local),
+                opt(&b.remote),
+                opt(&b.host)
+            );
+        }
         let _ = writeln!(out, "ConfirmProduction {}", flag(self.confirm_production));
         let _ = writeln!(out, "AutoResponses {}", flag(self.auto_responses));
         let _ = writeln!(out, "TmuxKeybindings {}", flag(self.tmux_keys));
@@ -1140,6 +1204,12 @@ impl Settings {
             }
             if let Some(d) = &p.start_dir {
                 let _ = writeln!(out, "    StartDir {}", arg(d));
+            }
+            if let Some(d) = &p.local_folder {
+                let _ = writeln!(out, "    LocalFolder {}", arg(d));
+            }
+            if let Some(d) = &p.remote_folder {
+                let _ = writeln!(out, "    RemoteFolder {}", arg(d));
             }
             if p.legacy_algorithms {
                 let _ = writeln!(out, "    LegacyAlgorithms yes");
@@ -1282,6 +1352,9 @@ AutoReconnect no
 ParallelTransfers 20
 FollowDirectory no
 TransferLayout stacked swapped 40
+Bookmark "nginx config" "C:\Users\j\Documents" /etc/nginx "web01.prod"
+Bookmark logs "" /var/log ""
+Bookmark empty "" "" ""
 X11Display 192.168.1.5:0.0
 Favourite web "db one"
 Favorite WEB
@@ -1300,6 +1373,8 @@ Profile web
     Tmux work
     TmuxLayout TMUX
     StartDir "/srv/my site"
+    LocalFolder "D:\Web site"
+    RemoteFolder /var/www
     LegacyAlgorithms YES
     AutoReconnect yes
     DesktopPort 3390
@@ -1412,6 +1487,24 @@ NewKeyword later
         assert_eq!(s.parallel_transfers, Some(8));
         assert!(!s.follow_directory);
         assert_eq!(s.transfer_layout.as_deref(), Some("stacked swapped 40"));
+        assert_eq!(
+            s.bookmarks,
+            [
+                Bookmark {
+                    name: "nginx config".into(),
+                    local: Some("C:\\Users\\j\\Documents".into()),
+                    remote: Some("/etc/nginx".into()),
+                    host: Some("web01.prod".into()),
+                },
+                Bookmark {
+                    name: "logs".into(),
+                    local: None,
+                    remote: Some("/var/log".into()),
+                    host: None,
+                },
+            ]
+        );
+        assert_eq!(Settings::parse(&s.to_text()).bookmarks, s.bookmarks);
         assert_eq!(s.x11_display.as_deref(), Some("192.168.1.5:0.0"));
         let big = s.profile("big").unwrap();
         assert_eq!(big.font_size, None);
@@ -1420,6 +1513,8 @@ NewKeyword later
         assert_eq!(big.tmux_layout, None);
         assert_eq!(big.start_dir, None);
         assert_eq!(web.start_dir.as_deref(), Some("/srv/my site"));
+        assert_eq!(web.local_folder.as_deref(), Some("D:\\Web site"));
+        assert_eq!(web.remote_folder.as_deref(), Some("/var/www"));
         assert_eq!(
             s.profile("router").unwrap().tmux.as_deref(),
             Some("main"),

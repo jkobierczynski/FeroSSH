@@ -11361,7 +11361,11 @@ impl Window {
         let key = sftp_key(&s.target);
         let label = s.target.label();
         let connection = s.connection;
-        let cwd = p.cwd.clone().filter(|_| self.settings.follow_directory);
+        // The connection's Remote folder, else the shell's directory.
+        let cwd = self
+            .remote_folder(id)
+            .map(String::into_bytes)
+            .or_else(|| p.cwd.clone().filter(|_| self.settings.follow_directory));
         let (verify, parallel) = (
             self.settings.verify_transfers,
             self.settings.parallel_transfers,
@@ -11480,13 +11484,31 @@ impl Window {
         let id = self.focused_id();
         let key = self.pane_sftp_key(id);
         let host_changed = key != self.files_key;
+        let fresh = key.as_ref().is_some_and(|k| !self.sftp.contains_key(k));
         if host_changed {
             self.files_key.clone_from(&key);
             self.ensure_sftp(id);
         }
         if host_changed || self.files_pane != Some(id) {
             self.files_pane = Some(id);
+            if fresh && self.remote_folder(id).is_some() {
+                // It starts in the connection's Remote folder; following
+                // picks up from the shell's next cd.
+                return;
+            }
             self.follow_pane(id);
+        }
+    }
+
+    /// The Remote folder pane `id`'s connection names for file transfer.
+    fn remote_folder(&self, id: PaneId) -> Option<String> {
+        match &self.panes.get(&self.host_pane(id))?.host {
+            Host::Ssh(s) => self
+                .settings
+                .profile(&s.target.alias)?
+                .remote_folder
+                .clone(),
+            _ => None,
         }
     }
 
@@ -11650,6 +11672,7 @@ impl Window {
                     })
                 }),
         };
+        let alias = remote.and(self.files_alias());
         files_panel::View {
             host: remote.map(|r| r.label.clone()),
             key: remote.and(self.files_key.clone()),
@@ -11664,6 +11687,23 @@ impl Window {
             base: self.download_dir(),
             landed: remote.map_or(0, files::landed),
             arrange: self.arrange(),
+            bookmarks: self.settings.bookmarks.clone(),
+            local_start: alias
+                .as_deref()
+                .and_then(|a| self.settings.profile(a))
+                .and_then(|p| p.local_folder.as_deref())
+                .map(PathBuf::from),
+            alias,
+        }
+    }
+
+    /// The connection name of the host the file transfer pane shows.
+    fn files_alias(&self) -> Option<String> {
+        self.files_key.as_ref()?;
+        let id = self.files_pane?;
+        match &self.panes.get(&self.host_pane(id))?.host {
+            Host::Ssh(s) => Some(s.target.alias.clone()),
+            _ => None,
         }
     }
 
@@ -11744,6 +11784,13 @@ impl Window {
             Event::OpenLocal(dir) => Some(Command::OpenFolder(dir)),
             Event::ToggleFollow => {
                 self.toggle_follow();
+                None
+            }
+            Event::Bookmarks(all) => {
+                if self.settings.bookmarks != all {
+                    self.settings.bookmarks = all;
+                    self.save_settings();
+                }
                 None
             }
             Event::Arrange(a) => {
