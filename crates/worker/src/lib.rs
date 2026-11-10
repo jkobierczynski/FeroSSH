@@ -28,7 +28,7 @@ use ferossh_ipc::{ChannelId, Decoder, Message, PROTOCOL_VERSION, Side, encode};
 use tokio::sync::{mpsc, oneshot};
 
 pub use session::Params;
-use session::{Connections, Route};
+use session::{Connections, Route, SessionGuard};
 
 /// Messages queued in each direction before the sender waits.
 const QUEUE: usize = 64;
@@ -60,14 +60,15 @@ pub async fn serve(mut inbox: mpsc::Receiver<Message>, out: mpsc::Sender<Message
     // dispatcher hands messages to a front queue without waiting and a
     // task of its own feeds them on, so one session that stops reading
     // (its server stopped taking data) never stalls the others. When the
-    // front queue fills, the dispatcher drops the session's route: the
-    // task stops at once, without the messages still queued, and the
-    // session's queue ends, which closes it once it reads again.
+    // front queue fills, the dispatcher aborts the session (it may be
+    // stuck in a write), drops its route, which stops the feeding task,
+    // and tells the UI the session ended and why.
     let session = |channel: ChannelId| {
         let (tx, rx) = mpsc::channel(QUEUE);
         let (front, mut queued) = mpsc::channel::<Message>(FRONT_QUEUE);
         let (alive, mut gone) = oneshot::channel::<()>();
-        if !routes.insert(channel, Route::Session(front, Arc::new(alive))) {
+        let guard = Arc::new(SessionGuard::new(alive));
+        if !routes.insert(channel, Route::Session(front, guard.clone())) {
             return None;
         }
         tokio::spawn(async move {
@@ -89,7 +90,7 @@ pub async fn serve(mut inbox: mpsc::Receiver<Message>, out: mpsc::Sender<Message
                 }
             }
         });
-        Some(rx)
+        Some((rx, guard))
     };
     while let Some(msg) = inbox.recv().await {
         match msg {
@@ -100,8 +101,10 @@ pub async fn serve(mut inbox: mpsc::Receiver<Message>, out: mpsc::Sender<Message
                 rows,
                 x11,
             } => {
-                let Some(rx) = session(channel) else { continue };
-                tokio::spawn(session::open(
+                let Some((rx, guard)) = session(channel) else {
+                    continue;
+                };
+                guard.track(tokio::spawn(session::open(
                     channel,
                     connection,
                     (cols, rows),
@@ -109,20 +112,22 @@ pub async fn serve(mut inbox: mpsc::Receiver<Message>, out: mpsc::Sender<Message
                     rx,
                     out.clone(),
                     connections.clone(),
-                ));
+                )));
             }
             Message::SftpOpen {
                 channel,
                 connection,
             } => {
-                let Some(rx) = session(channel) else { continue };
-                tokio::spawn(sftp::run(
+                let Some((rx, guard)) = session(channel) else {
+                    continue;
+                };
+                guard.track(tokio::spawn(sftp::run(
                     channel,
                     connection,
                     rx,
                     out.clone(),
                     connections.clone(),
-                ));
+                )));
             }
             Message::Exec {
                 channel,
@@ -130,8 +135,10 @@ pub async fn serve(mut inbox: mpsc::Receiver<Message>, out: mpsc::Sender<Message
                 command,
                 split_stderr,
             } => {
-                let Some(rx) = session(channel) else { continue };
-                tokio::spawn(exec::run(
+                let Some((rx, guard)) = session(channel) else {
+                    continue;
+                };
+                guard.track(tokio::spawn(exec::run(
                     channel,
                     connection,
                     command,
@@ -139,7 +146,7 @@ pub async fn serve(mut inbox: mpsc::Receiver<Message>, out: mpsc::Sender<Message
                     rx,
                     out.clone(),
                     connections.clone(),
-                ));
+                )));
             }
             Message::Connect {
                 channel,
@@ -167,7 +174,7 @@ pub async fn serve(mut inbox: mpsc::Receiver<Message>, out: mpsc::Sender<Message
                     }
                     None => None,
                 };
-                let Some(rx) = session(channel) else {
+                let Some((rx, guard)) = session(channel) else {
                     if let Some(id) = tunnel {
                         routes.remove(id);
                     }
@@ -186,14 +193,14 @@ pub async fn serve(mut inbox: mpsc::Receiver<Message>, out: mpsc::Sender<Message
                     tunnel,
                     shell,
                 };
-                tokio::spawn(session::run(
+                guard.track(tokio::spawn(session::run(
                     channel,
                     params,
                     rx,
                     tunnel_rx,
                     out.clone(),
                     connections.clone(),
-                ));
+                )));
             }
             Message::TelnetConnect {
                 channel,
@@ -203,7 +210,9 @@ pub async fn serve(mut inbox: mpsc::Receiver<Message>, out: mpsc::Sender<Message
                 rows,
                 connect_timeout,
             } => {
-                let Some(rx) = session(channel) else { continue };
+                let Some((rx, guard)) = session(channel) else {
+                    continue;
+                };
                 let params = telnet::Params {
                     host,
                     port,
@@ -211,7 +220,7 @@ pub async fn serve(mut inbox: mpsc::Receiver<Message>, out: mpsc::Sender<Message
                     rows,
                     connect_timeout,
                 };
-                tokio::spawn(telnet::run(channel, params, rx, out.clone()));
+                guard.track(tokio::spawn(telnet::run(channel, params, rx, out.clone())));
             }
             Message::RemoteForward {
                 channel,
@@ -219,8 +228,10 @@ pub async fn serve(mut inbox: mpsc::Receiver<Message>, out: mpsc::Sender<Message
                 bind,
                 port,
             } => {
-                let Some(rx) = session(channel) else { continue };
-                tokio::spawn(forward::remote(
+                let Some((rx, guard)) = session(channel) else {
+                    continue;
+                };
+                guard.track(tokio::spawn(forward::remote(
                     channel,
                     connection,
                     bind,
@@ -228,7 +239,7 @@ pub async fn serve(mut inbox: mpsc::Receiver<Message>, out: mpsc::Sender<Message
                     rx,
                     out.clone(),
                     connections.clone(),
-                ));
+                )));
             }
             Message::ForwardOpen {
                 channel,
@@ -258,7 +269,30 @@ pub async fn serve(mut inbox: mpsc::Receiver<Message>, out: mpsc::Sender<Message
                     continue;
                 };
                 let delivered = match routes.get(channel) {
-                    Some(Route::Session(tx, _)) => tx.try_send(other).is_ok(),
+                    Some(Route::Session(tx, guard)) => match tx.try_send(other) {
+                        Ok(()) => true,
+                        Err(mpsc::error::TrySendError::Full(_)) => {
+                            // Its server has stopped taking what the user
+                            // types or pastes. End the session even if it
+                            // is stuck in a write, and say why: the input
+                            // from here on is lost.
+                            guard.abort();
+                            routes.remove(channel);
+                            let reason = "The server stopped taking input, so the \
+                                          session was closed and the last input was \
+                                          not sent."
+                                .to_owned();
+                            if out
+                                .send(Message::Disconnected { channel, reason })
+                                .await
+                                .is_err()
+                            {
+                                return;
+                            }
+                            continue;
+                        }
+                        Err(mpsc::error::TrySendError::Closed(_)) => false,
+                    },
                     Some(Route::Stream(tx)) => tx.send(other).is_ok(),
                     None => true,
                 };

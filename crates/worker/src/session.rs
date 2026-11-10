@@ -158,16 +158,41 @@ pub(crate) enum Route {
     /// it (what the user types or pastes, and SFTP requests the UI keeps
     /// to a window), without waiting; a task per session feeds it into
     /// the session's bounded queue, so a stalled session never holds up
-    /// the pipe. A session whose front queue is full is closed. Dropping
-    /// the second half (with the route) stops that task.
-    Session(
-        mpsc::Sender<Message>,
-        #[allow(dead_code)] // Held only to be dropped with the route.
-        Arc<oneshot::Sender<()>>,
-    ),
+    /// the pipe. A session whose front queue is full is aborted.
+    Session(mpsc::Sender<Message>, Arc<SessionGuard>),
     /// A forwarded stream: flow control bounds what the UI sends, and one
     /// slow stream must never hold up the pipe.
     Stream(mpsc::UnboundedSender<Message>),
+}
+
+/// A session's task and the task that feeds its queue: dropping the
+/// last copy (with the route) stops the feeding task.
+pub(crate) struct SessionGuard {
+    _feed: oneshot::Sender<()>,
+    task: Mutex<Option<tokio::task::AbortHandle>>,
+}
+
+impl SessionGuard {
+    pub(crate) fn new(feed: oneshot::Sender<()>) -> Self {
+        Self {
+            _feed: feed,
+            task: Mutex::new(None),
+        }
+    }
+
+    /// The session's own task, for [`SessionGuard::abort`].
+    pub(crate) fn track(&self, task: tokio::task::JoinHandle<()>) {
+        if let Ok(mut t) = self.task.lock() {
+            *t = Some(task.abort_handle());
+        }
+    }
+
+    /// Ends the session's task where it is, even mid-write.
+    pub(crate) fn abort(&self) {
+        if let Some(t) = self.task.lock().ok().and_then(|mut t| t.take()) {
+            t.abort();
+        }
+    }
 }
 
 impl Route {
