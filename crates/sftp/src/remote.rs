@@ -411,7 +411,7 @@ fn hash_file(path: &Path) -> Result<String, String> {
 /// from it and would stop the same way.
 fn unverified_resume(part: &str) -> String {
     format!(
-        "the resumed part could not be checked (the server needs sha256sum), \
+        "the resumed part could not be checked (the server needs xargs -0 and sha256sum), \
          so it was kept: delete {part} and retry to start over"
     )
 }
