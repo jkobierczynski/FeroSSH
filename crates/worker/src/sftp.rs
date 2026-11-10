@@ -9,7 +9,11 @@
 //! reads or writes in flight, and the replies go back as they come.
 //!
 //! Remote checksums run `sha256sum` on an exec channel of the same
-//! connection; that is the one thing SFTP itself cannot do.
+//! connection; that is the one thing SFTP itself cannot do. The file's
+//! name never goes on that command line: the server hands the line to the
+//! user's login shell, which may be `cmd.exe` or PowerShell, and no one
+//! quoting is safe in all of them. The command is fixed and the name goes
+//! to `xargs -0` on stdin instead.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -416,8 +420,20 @@ impl Sftp {
     }
 }
 
-/// The shell sees only this fixed command; file names travel as NUL-delimited stdin.
+/// The command a remote checksum runs. It holds no part of the file's
+/// name, so the login shell has nothing to misread, whichever shell it is.
 const CHECKSUM_COMMAND: &[u8] = b"xargs -0 sha256sum -b --";
+
+/// What the checksum command reads on stdin: the name, ended by a NUL.
+/// `None` for a name holding a NUL, which no command could be given.
+fn checksum_input(path: &[u8]) -> Option<Vec<u8>> {
+    if path.is_empty() || path.contains(&0) {
+        return None;
+    }
+    let mut input = path.to_vec();
+    input.push(0);
+    Some(input)
+}
 
 /// The hash `sha256sum` printed: 64 hex digits first on the line, after a
 /// `\` when the name needed escaping.
@@ -428,8 +444,7 @@ fn parse_sum(output: &[u8]) -> Option<String> {
     ok.then(|| String::from_utf8_lossy(hex).to_ascii_lowercase())
 }
 
-/// Runs `sha256sum` on the server for `path`, without putting the name in
-/// shell syntax. Servers without `xargs -0` and `sha256sum` fail verification.
+/// Runs `sha256sum` on the server for `path`.
 async fn checksum<H: russh::client::Handler>(
     conn: &russh::client::Handle<H>,
     path: &[u8],
@@ -438,14 +453,13 @@ async fn checksum<H: russh::client::Handler>(
         code: sftp_code::UNSUPPORTED,
         message: why.to_owned(),
     };
-    if path.contains(&0) {
+    let Some(input) = checksum_input(path) else {
         return unsupported("the name cannot be passed to a command");
-    }
+    };
     let run = async {
         let mut ch = conn.channel_open_session().await.ok()?;
         ch.exec(true, CHECKSUM_COMMAND).await.ok()?;
-        ch.data(path).await.ok()?;
-        ch.data(&b"\0"[..]).await.ok()?;
+        ch.data(&input[..]).await.ok()?;
         ch.eof().await.ok()?;
         let mut output = Vec::new();
         let mut status = None;
@@ -468,7 +482,7 @@ async fn checksum<H: russh::client::Handler>(
             Some(hex) => SftpReply::Checksum(hex),
             None => unsupported("sha256sum printed something unexpected"),
         },
-        Ok(_) => unsupported("the server could not run xargs -0 sha256sum"),
+        Ok(_) => unsupported("the server has no xargs or sha256sum"),
         Err(_) => unsupported("sha256sum took too long"),
     }
 }
@@ -811,6 +825,30 @@ mod tests {
         })
         .await??;
         Ok(())
+    }
+
+    #[test]
+    fn keeps_the_name_off_the_command_line() {
+        // Only plain words: nothing cmd.exe, PowerShell or sh would
+        // treat specially, and no name.
+        assert!(
+            CHECKSUM_COMMAND
+                .iter()
+                .all(|b| b.is_ascii_alphanumeric() || b" -".contains(b))
+        );
+        for name in [
+            &b"a&calc&rem"[..],
+            b"it's",
+            b"$(rm -rf ~)",
+            b"x`whoami`;y|z\"\nw",
+            b"-rf",
+        ] {
+            let mut want = name.to_vec();
+            want.push(0);
+            assert_eq!(checksum_input(name), Some(want));
+        }
+        assert_eq!(checksum_input(b"a\0b"), None);
+        assert_eq!(checksum_input(b""), None);
     }
 
     #[test]

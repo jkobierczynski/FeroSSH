@@ -1031,7 +1031,10 @@ fn layout(h: &Handles) {
             true,
         );
         let (u, d) = if arrange.stacked {
-            let cx = gap.x + gap.w / 2;
+            // Centred in the part of the gap the terminal leaves uncovered,
+            // but never squeezed past room for both buttons.
+            let shown_w = (shown_right - gap.x).max(2 * bw + px(8)).min(gap.w);
+            let cx = gap.x + shown_w / 2;
             let y = gap.y + (gap.h - bh) / 2;
             ((cx - bw - px(4), y), (cx + px(4), y))
         } else {
