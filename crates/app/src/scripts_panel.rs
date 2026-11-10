@@ -29,15 +29,16 @@ use windows::Win32::Graphics::Gdi::{
     SetTextColor, TRANSPARENT,
 };
 use windows::Win32::UI::Controls::{
-    CDDS_ITEMPREPAINT, CDDS_PREPAINT, CDRF_DODEFAULT, CDRF_NOTIFYITEMDRAW, EM_SETCUEBANNER,
-    EM_SETSEL, LIST_VIEW_ITEM_STATE_FLAGS, LVCF_TEXT, LVCF_WIDTH, LVCOLUMNW, LVGF_GROUPID,
-    LVGF_HEADER, LVGROUP, LVIF_GROUPID, LVIF_PARAM, LVIF_TEXT, LVIS_FOCUSED, LVIS_SELECTED,
-    LVITEMW, LVM_DELETEALLITEMS, LVM_ENABLEGROUPVIEW, LVM_ENSUREVISIBLE, LVM_GETITEMW,
-    LVM_GETNEXTITEM, LVM_INSERTCOLUMNW, LVM_INSERTGROUP, LVM_INSERTITEMW, LVM_REMOVEALLGROUPS,
-    LVM_SETCOLUMNWIDTH, LVM_SETEXTENDEDLISTVIEWSTYLE, LVM_SETITEMSTATE, LVM_SETITEMTEXTW,
-    LVN_ITEMCHANGED, LVN_KEYDOWN, LVNI_SELECTED, LVS_EX_DOUBLEBUFFER, LVS_EX_FULLROWSELECT,
-    LVS_NOSORTHEADER, LVS_REPORT, LVS_SHOWSELALWAYS, LVS_SINGLESEL, NM_CUSTOMDRAW, NM_DBLCLK,
-    NMHDR, NMLVCUSTOMDRAW, NMLVKEYDOWN, SetWindowTheme, WC_BUTTONW, WC_EDITW, WC_LISTVIEWW,
+    CDDS_ITEMPREPAINT, CDDS_PREPAINT, CDRF_DODEFAULT, CDRF_NOTIFYITEMDRAW, CDRF_SKIPDEFAULT,
+    EM_SETCUEBANNER, EM_SETSEL, LIST_VIEW_ITEM_STATE_FLAGS, LVCDI_GROUP, LVCF_TEXT, LVCF_WIDTH,
+    LVCOLUMNW, LVGF_GROUPID, LVGF_HEADER, LVGGR_HEADER, LVGROUP, LVIF_GROUPID, LVIF_PARAM,
+    LVIF_TEXT, LVIS_FOCUSED, LVIS_SELECTED, LVITEMW, LVM_DELETEALLITEMS, LVM_ENABLEGROUPVIEW,
+    LVM_ENSUREVISIBLE, LVM_GETGROUPRECT, LVM_GETITEMW, LVM_GETNEXTITEM, LVM_INSERTCOLUMNW,
+    LVM_INSERTGROUP, LVM_INSERTITEMW, LVM_REMOVEALLGROUPS, LVM_SETCOLUMNWIDTH,
+    LVM_SETEXTENDEDLISTVIEWSTYLE, LVM_SETITEMSTATE, LVM_SETITEMTEXTW, LVN_ITEMCHANGED, LVN_KEYDOWN,
+    LVNI_SELECTED, LVS_EX_DOUBLEBUFFER, LVS_EX_FULLROWSELECT, LVS_NOSORTHEADER, LVS_REPORT,
+    LVS_SHOWSELALWAYS, LVS_SINGLESEL, NM_CUSTOMDRAW, NM_DBLCLK, NMHDR, NMLVCUSTOMDRAW, NMLVKEYDOWN,
+    SetWindowTheme, WC_BUTTONW, WC_EDITW, WC_LISTVIEWW,
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     EnableWindow, GetFocus, SetFocus, VK_CONTROL, VK_DELETE, VK_DOWN, VK_F2, VK_F5, VK_INSERT,
@@ -120,6 +121,9 @@ struct State {
     filling: bool,
     /// Where the selected script's lines are painted.
     details_at: RECT,
+    /// The list's category headings by group id, with how many scripts
+    /// each has; drawn here in the window's text colour.
+    groups: Vec<(String, usize)>,
 }
 
 thread_local! {
@@ -259,6 +263,7 @@ pub fn create(main: HWND, handler: Handler, dpi: u32) -> windows::core::Result<(
                 total: 0,
                 filling: false,
                 details_at: RECT::default(),
+                groups: Vec::new(),
             });
         });
         enable_buttons(&h);
@@ -441,6 +446,18 @@ fn fill_list(h: &Handles, rows: &[NativeScript]) {
             groups.push(&r.category);
         }
     }
+    let headings: Vec<(String, usize)> = groups
+        .iter()
+        .map(|g| {
+            let name = if g.is_empty() { "No category" } else { g };
+            let n = rows
+                .iter()
+                .filter(|r| r.category.eq_ignore_ascii_case(g))
+                .count();
+            (name.to_owned(), n)
+        })
+        .collect();
+    with(|s| s.groups = headings);
     // SAFETY: our own control; each struct and its text live through the
     // call, which copies them.
     unsafe {
@@ -724,6 +741,12 @@ fn notify(h: Handles, lparam: LPARAM) -> LRESULT {
             NM_CUSTOMDRAW => {
                 let cd = &mut *(lparam.0 as *mut NMLVCUSTOMDRAW);
                 let stage = cd.nmcd.dwDrawStage;
+                if stage == CDDS_PREPAINT && cd.dwItemType == LVCDI_GROUP {
+                    // The theme draws headings in its own blue, which a
+                    // dark window colour makes hard to read.
+                    draw_heading(h.list, cd);
+                    return LRESULT(CDRF_SKIPDEFAULT as isize);
+                }
                 if stage == CDDS_PREPAINT {
                     return LRESULT(CDRF_NOTIFYITEMDRAW as isize);
                 }
@@ -767,6 +790,75 @@ fn notify(h: Handles, lparam: LPARAM) -> LRESULT {
         }
     }
     LRESULT(0)
+}
+
+/// Draws a category heading in the window's text colour, its count in
+/// grey after it, and a thin line to the right edge.
+fn draw_heading(list: HWND, cd: &NMLVCUSTOMDRAW) {
+    use windows::Win32::Graphics::Gdi::{
+        COLOR_BTNSHADOW, DT_CALCRECT, HDC, PatBlt, SelectObject as Select,
+    };
+    use windows::Win32::UI::WindowsAndMessaging::WM_GETFONT;
+    let id = cd.nmcd.dwItemSpec;
+    let Some((name, count)) = with(|s| s.groups.get(id).cloned()).flatten() else {
+        return;
+    };
+    let mut rc = RECT {
+        top: LVGGR_HEADER as i32,
+        ..Default::default()
+    };
+    // SAFETY: the list's own DC for this paint, and our own control; the
+    // font is selected back out.
+    unsafe {
+        let dc: HDC = cd.nmcd.hdc;
+        if SendMessageW(
+            list,
+            LVM_GETGROUPRECT,
+            Some(WPARAM(id)),
+            Some(LPARAM(&raw mut rc as isize)),
+        )
+        .0 == 0
+        {
+            rc = cd.rcText;
+        }
+        FillRect(dc, &rc, crate::ui_theme::sys_brush(COLOR_WINDOW));
+        let font = SendMessageW(list, WM_GETFONT, None, None).0;
+        let old = Select(dc, HGDIOBJ(font as *mut _));
+        SetBkMode(dc, TRANSPARENT);
+        let pad = 6;
+        let mut at = RECT {
+            left: rc.left + pad,
+            ..rc
+        };
+        let flags = DT_LEFT | DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX;
+        let mut text: Vec<u16> = name.encode_utf16().collect();
+        SetTextColor(dc, COLORREF(crate::ui_theme::sys_color(COLOR_WINDOWTEXT)));
+        let mut size = at;
+        DrawTextW(dc, &mut text, &mut size, flags | DT_CALCRECT);
+        DrawTextW(dc, &mut text, &mut at, flags);
+        at.left = size.right + pad;
+        let mut n: Vec<u16> = count.to_string().encode_utf16().collect();
+        SetTextColor(dc, COLORREF(crate::ui_theme::sys_color(COLOR_GRAYTEXT)));
+        let mut size = at;
+        DrawTextW(dc, &mut n, &mut size, flags | DT_CALCRECT);
+        DrawTextW(dc, &mut n, &mut at, flags);
+        // A one-pixel line in the middle of the rest of the heading.
+        let left = size.right + pad;
+        let y = (rc.top + rc.bottom) / 2;
+        if left < rc.right - pad {
+            let old_brush = Select(dc, HGDIOBJ(crate::ui_theme::sys_brush(COLOR_BTNSHADOW).0));
+            let _ = PatBlt(
+                dc,
+                left,
+                y,
+                rc.right - pad - left,
+                1,
+                windows::Win32::Graphics::Gdi::PATCOPY,
+            );
+            Select(dc, old_brush);
+        }
+        Select(dc, old);
+    }
 }
 
 /// The list's right-click menu (or Shift+F10, the menu key) for the
