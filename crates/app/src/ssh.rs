@@ -170,9 +170,12 @@ impl Target {
         let includes = ssh_config::DirIncludes {
             home: env.home.clone(),
         };
+        // The user typed, as resolve_host has it: `Match user` sees the
+        // same config both times.
+        let typed_user = ssh_config::parse_destination(typed).and_then(|(u, _, _)| u);
         let ctx = ssh_config::MatchContext {
             local_user: &env.local_user,
-            user: Some(&target.user),
+            user: typed_user.as_deref(),
         };
         let proxy = ssh_config::resolve_for(&env.config, &target.alias, &includes, &ctx).proxy;
         match proxy {
@@ -1119,6 +1122,10 @@ impl SshSession {
             && self.target.hostname.eq_ignore_ascii_case(&target.hostname)
             && self.target.port == target.port
             && self.target.user == target.user
+            // Agent requests on a connection go to one agent, asked about
+            // under one setting: panes that differ get their own.
+            && self.target.forward_agent == target.forward_agent
+            && (!target.forward_agent || self.target.agent == target.agent)
             // The same name through other jump hosts can be another host.
             && self.target.route() == target.route()
     }

@@ -260,11 +260,13 @@ impl Forwarding {
         let mut out = Vec::new();
         match answer {
             Answer::Allow => {
-                let agent = self
-                    .conns
-                    .get(&ask.connection)
-                    .map(|c| c.agent.clone())
-                    .unwrap_or_default();
+                // A connection gone while the question was open: nothing
+                // to sign for, and no agent to sign with.
+                let Some(agent) = self.conns.get(&ask.connection).map(|c| c.agent.clone()) else {
+                    out.push(refuse(ask.connection, ask.agent));
+                    out.extend(self.next());
+                    return out;
+                };
                 out.push(Out::Broker {
                     what: For::Sign {
                         connection: ask.connection,
@@ -551,8 +553,10 @@ mod tests {
         f.retain(|_| false);
         // The open question stays until answered; the rest is gone.
         assert!(f.question().is_some());
+        // Allowed after its connection went: refused, never signed.
         let out = f.answer(Answer::Allow);
         assert_eq!(out.len(), 1);
+        assert!(refused(&out));
         assert!(refused(&sign(&mut f, 11, login("c"))));
     }
 }

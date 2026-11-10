@@ -44,6 +44,8 @@ pub struct FileRow {
     pub modified: Option<i64>,
     /// `drwxr-xr-x` and so on; empty for local rows.
     pub rights: String,
+    /// A remote row's mode as the server sent it, special bits included.
+    pub mode: Option<u32>,
 }
 
 impl FileRow {
@@ -57,6 +59,7 @@ impl FileRow {
             size: None,
             modified: None,
             rights: String::new(),
+            mode: None,
         }
     }
 }
@@ -109,6 +112,7 @@ fn remote_row(e: &DirEntry) -> FileRow {
         size: (!e.attrs.is_dir()).then_some(e.attrs.size).flatten(),
         modified: e.attrs.mtime.map(i64::from),
         rights: rights(e.attrs.permissions),
+        mode: e.attrs.permissions,
     }
 }
 
@@ -154,6 +158,7 @@ pub fn local_rows(dir: &LocalDir, find: &str) -> Vec<FileRow> {
                 size: (!e.dir).then_some(e.size),
                 modified: e.modified,
                 rights: String::new(),
+                mode: None,
             }),
     );
     rows

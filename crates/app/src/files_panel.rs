@@ -2509,15 +2509,12 @@ fn permissions(h: &Handles) {
     let Some(dir) = with(|s| s.view.as_ref().map(|v| v.remote_dir.clone())).flatten() else {
         return;
     };
-    // The box starts from the first row's rights.
+    // The box starts from the first row's mode, special bits included,
+    // so Set unchanged changes nothing.
     let start = rows
         .first()
-        .map(|r| {
-            let bits = r.rights.get(1..).unwrap_or_default();
-            files::parse_mode(bits, 0, false)
-                .map(files::mode_text)
-                .unwrap_or_default()
-        })
+        .and_then(|r| r.mode)
+        .map(files::mode_text)
         .unwrap_or_default();
     let keys = rows.into_iter().map(|r| r.key).collect();
     start_file_naming(

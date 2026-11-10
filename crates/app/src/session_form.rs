@@ -495,6 +495,9 @@ impl SessionForm {
                     | Field::Key
                     | Field::Jump
                     | Field::Forward(_)
+                    // Kept with the connection, which a read-only host
+                    // cannot save.
+                    | Field::ForwardAgent
             )
     }
 
@@ -868,6 +871,9 @@ impl SessionForm {
 
     /// Steps a choice field forwards or back.
     fn cycle(&mut self, f: Field, forward: bool) {
+        if self.field_locked(f) {
+            return;
+        }
         let step = |i: usize, n: usize| {
             if forward {
                 (i + 1) % n
@@ -1164,6 +1170,9 @@ impl SessionForm {
     /// Option `index` picked in a native choice field.
     pub fn set_choice(&mut self, field: FieldId, index: usize) {
         let f = field.0;
+        if self.field_locked(f) {
+            return;
+        }
         let options = self.options(f);
         let Some(want) = options.get(index) else {
             return;

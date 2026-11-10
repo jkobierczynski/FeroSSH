@@ -158,7 +158,8 @@ pub fn check_forwarded(data: &[u8], key: &[u8], flags: u32) -> Result<Forwarded,
         return Err("a key type FeroSSH does not allow");
     }
     let rsa = kind == "ssh-rsa" || kind == "ssh-rsa-cert-v01@openssh.com";
-    if rsa && flags & (SSH_AGENT_RSA_SHA2_256 | SSH_AGENT_RSA_SHA2_512) == 0 {
+    // Exactly one SHA-2 flag: both set, the agent may fall back to SHA-1.
+    if rsa && flags != SSH_AGENT_RSA_SHA2_256 && flags != SSH_AGENT_RSA_SHA2_512 {
         return Err("an RSA signature with SHA-1");
     }
     if let Some(rest) = data.strip_prefix(SSHSIG) {
@@ -234,7 +235,7 @@ pub fn check_forwarded(data: &[u8], key: &[u8], flags: u32) -> Result<Forwarded,
         "rsa-sha2-512" | "rsa-sha2-512-cert-v01@openssh.com" => SSH_AGENT_RSA_SHA2_512,
         _ => 0,
     };
-    if rsa && flags & wanted == 0 {
+    if rsa && flags != wanted {
         return Err("flags that do not match the algorithm");
     }
     Ok(Forwarded::Login {
@@ -384,6 +385,14 @@ pub(crate) mod tests {
                 SSH_AGENT_RSA_SHA2_256
             )
             .is_err()
+        );
+        // Both SHA-2 flags at once, for a login or an SSHSIG blob: an
+        // agent may read that as neither, which is SHA-1.
+        let both = SSH_AGENT_RSA_SHA2_256 | SSH_AGENT_RSA_SHA2_512;
+        assert!(check_forwarded(&request("x", "rsa-sha2-512", &rsa), &rsa, both).is_err());
+        assert!(check_forwarded(&sshsig(b"git", b"sha512", 64), &rsa, both).is_err());
+        assert!(
+            check_forwarded(&sshsig(b"git", b"sha512", 64), &rsa, SSH_AGENT_RSA_SHA2_512).is_ok()
         );
         // Another key named inside, an algorithm the key cannot have.
         assert!(

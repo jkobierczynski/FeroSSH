@@ -754,11 +754,9 @@ fn match_line_matches(
             }
             // A command to run, the local network, the version: FeroSSH
             // reads its config without running anything, so these never
-            // match. Skip their argument.
-            "exec" | "localnetwork" | "version" => {
-                args.next();
-                false
-            }
+            // match, negated or not: a block meant for when a command
+            // fails must not apply everywhere.
+            "exec" | "localnetwork" | "version" => return (false, asks_final),
             _ => return (false, asks_final),
         };
         matched &= result != negate;
@@ -1076,7 +1074,8 @@ Match !exec \"false\" host x
 Match host
     User e
 ";
-        assert_eq!(resolve(text, "x").user.as_deref(), Some("d"));
+        // Not even negated: FeroSSH cannot tell whether the command fails.
+        assert_eq!(resolve(text, "x").user, None);
         assert_eq!(resolve(text, "y").user, None);
     }
 

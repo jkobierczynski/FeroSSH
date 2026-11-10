@@ -227,6 +227,8 @@ const TIMER_RUN: usize = 7;
 const TIMER_LAUNCH: usize = 8;
 /// Watches files edited locally (File transfer's Edit locally) for saves.
 const TIMER_EDIT: usize = 9;
+/// Asks the waiting agent question again once another dialog has closed.
+const TIMER_AGENT_ASK: usize = 10;
 const LAUNCH_TICK_MS: u32 = 1000;
 /// How long a launch's login session may stay hidden with nothing
 /// holding its connection before it is shown.
@@ -1194,7 +1196,11 @@ fn ssh_env() -> Env {
         local_user: std::env::var("USERNAME").unwrap_or_default(),
         home,
         config,
-        vars: std::env::vars().collect(),
+        // vars() panics on a name or value that is not Unicode, which
+        // Windows allows: those are left out, as they cannot be sent.
+        vars: std::env::vars_os()
+            .filter_map(|(k, v)| Some((k.into_string().ok()?, v.into_string().ok()?)))
+            .collect(),
     }
 }
 
@@ -11297,8 +11303,10 @@ impl Window {
                 let p = self.panes.get_mut(&pane)?;
                 p.term.scroll_to_bottom();
                 p.term.feed(pattern::test_pattern().as_bytes());
-                // The pattern asks for nothing, so there are no commands.
-                let _ = self.after_feed();
+                // The pattern asks for nothing, but commands queued
+                // before (an agent question, say) must not be lost.
+                let commands = self.after_feed();
+                self.queued.extend(commands);
             }
             cmd::FIND => {
                 self.panes.get_mut(&pane)?.term.search_open();
@@ -14417,9 +14425,23 @@ fn run_command(hwnd: HWND, command: Command) {
             {
                 Some(IDYES) => Answer::Allow,
                 Some(IDCANCEL) => Answer::RefuseAll,
-                _ => Answer::Refuse,
+                Some(_) => Answer::Refuse,
+                None => {
+                    // Another dialog is open: the question waits for it,
+                    // unanswered, and is asked again shortly.
+                    // SAFETY: our window and timer.
+                    unsafe { SetTimer(Some(hwnd), TIMER_AGENT_ASK, 500, None) };
+                    return;
+                }
             };
-            with_window(|w| w.agent_answered(answer));
+            // The next question, if one waits, comes up now, along with
+            // anything else queued meanwhile.
+            let next = with_window(|w| {
+                w.agent_answered(answer);
+                std::mem::take(&mut w.queued)
+            })
+            .unwrap_or_default();
+            run_commands(hwnd, next);
         }
         Command::UpdateFound { outcome, asked } => {
             use crate::update::Outcome;
@@ -15204,6 +15226,11 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                 if let Some(commands) = with_window(Window::on_output) {
                     run_commands(hwnd, commands);
                 }
+                LRESULT(0)
+            }
+            WM_TIMER if wparam.0 == TIMER_AGENT_ASK => {
+                let _ = KillTimer(Some(hwnd), TIMER_AGENT_ASK);
+                run_command(hwnd, Command::AskAgentSign);
                 LRESULT(0)
             }
             WM_TIMER if wparam.0 == TIMER_EDIT => {
