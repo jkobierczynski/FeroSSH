@@ -1680,13 +1680,16 @@ impl SshSession {
                     self.signature(Vec::new()),
                 ]
             }
-            Reply::Gssapi(Ok(GssOutput::Continue(token))) => {
-                vec![self.gssapi_reply(GssReply::Continue(token))]
-            }
-            Reply::Gssapi(Ok(GssOutput::Complete { token, mic })) => {
-                vec![self.gssapi_reply(GssReply::Complete { token, mic })]
-            }
-            Reply::Gssapi(Err(e)) => vec![
+            Reply::Gssapi { login, .. } if login != self.channel => Vec::new(),
+            Reply::Gssapi {
+                result: Ok(GssOutput::Continue(token)),
+                ..
+            } => vec![self.gssapi_reply(GssReply::Continue(token))],
+            Reply::Gssapi {
+                result: Ok(GssOutput::Complete { token, mic }),
+                ..
+            } => vec![self.gssapi_reply(GssReply::Complete { token, mic })],
+            Reply::Gssapi { result: Err(e), .. } => vec![
                 Effect::Show(dim(&format!(
                     "No Kerberos login: {}. Trying other ways.",
                     sanitize(e.trim_end_matches('.'))
@@ -1726,6 +1729,17 @@ impl SshSession {
             ];
         }
         let host = self.gssapi_host().to_owned();
+        // A name that could change the service principal's form (`/`,
+        // `@`) gets no ticket.
+        if !ssh_config::valid_gss_host(&host) {
+            return vec![
+                Effect::Show(dim(&format!(
+                    "No Kerberos login: {} is not a name a Kerberos service has. Trying other ways.",
+                    sanitize(&host)
+                ))),
+                self.gssapi_reply(GssReply::Failed),
+            ];
+        }
         let mut effects = Vec::new();
         if first {
             let deleg = if self.target.gssapi_delegate {
@@ -3123,7 +3137,16 @@ mod tests {
         assert_eq!(jobs.len(), 1);
         assert_eq!(jobs[0].host, "sshgw.corp.example");
         assert!(jobs[0].first && !jobs[0].delegate && jobs[0].login == 1);
-        let fx = s.on_broker(Reply::Gssapi(Ok(GssOutput::Continue(vec![1, 2]))));
+        // Another login's reply is not this one's.
+        let other = Reply::Gssapi {
+            login: 9,
+            result: Ok(GssOutput::Continue(vec![1, 2])),
+        };
+        assert!(s.on_broker(other).is_empty());
+        let fx = s.on_broker(Reply::Gssapi {
+            login: 1,
+            result: Ok(GssOutput::Continue(vec![1, 2])),
+        });
         assert_eq!(
             sent(&fx),
             vec![&Message::GssapiReply {
@@ -3131,7 +3154,35 @@ mod tests {
                 reply: GssReply::Continue(vec![1, 2])
             }]
         );
-        let fx = s.on_broker(Reply::Gssapi(Err("no ticket".into())));
+        let fx = s.on_broker(Reply::Gssapi {
+            login: 1,
+            result: Err("no ticket".into()),
+        });
+        assert_eq!(
+            sent(&fx),
+            vec![&Message::GssapiReply {
+                channel: 1,
+                reply: GssReply::Failed
+            }]
+        );
+    }
+
+    #[test]
+    fn a_host_name_that_is_no_service_name_gets_no_ticket() {
+        let dir = temp("krb-name");
+        let mut e = env(&dir);
+        e.config =
+            "Host odd\n  HostName evil/x@OTHER.REALM\n  User me\n  GSSAPIAuthentication yes\n"
+                .into();
+        let mut s = SshSession::new(1, Target::resolve("odd", &e).unwrap(), e.known_hosts());
+        trusted(&mut s);
+        let fx = s.on_worker(Message::GssapiStep {
+            channel: 1,
+            first: true,
+            token: Vec::new(),
+            mic_data: mic_data("me"),
+        });
+        assert!(!fx.iter().any(|e| matches!(e, Effect::Broker(_))));
         assert_eq!(
             sent(&fx),
             vec![&Message::GssapiReply {
