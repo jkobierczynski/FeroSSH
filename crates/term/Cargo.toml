@@ -1,0 +1,21 @@
+[package]
+name = "ferossh-term"
+description = "FeroSSH: VT emulation wrapper, sanitising, paste and clipboard policy"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+# Grid, scrollback, selection and search on top of `vte`. Its own pty and
+# event-loop modules are compiled in but never used: the host connection
+# is FeroSSH's.
+alacritty_terminal = { version = "0.26", default-features = false }
+ferossh-render.workspace = true
+# Hash chains for tamper-evident logs; the SFTP crate already links it.
+sha2 = "0.11"
+
+[lints]
+workspace = true
