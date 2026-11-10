@@ -75,6 +75,9 @@ pub struct View {
     /// The host the Remote list is on; `None` when the focused pane is not
     /// logged in to an SSH host.
     pub host: Option<String>,
+    /// The transfer queue the Remote list is on (`host` is only its
+    /// label, which two queues can share).
+    pub key: Option<String>,
     /// The listed remote folder; empty until one is listed.
     pub remote_dir: Vec<u8>,
     /// All of its rows, unfiltered.
@@ -1784,9 +1787,9 @@ fn context_menu(h: &Handles, list: HWND, lparam: LPARAM) {
     // The menu runs its own message loop, in which the list can be
     // refreshed: the row is found again by its name afterwards.
     let clicked = row.and_then(|i| shown_row(remote, i));
-    let host = shown_host();
+    let queue = shown_queue();
     let chosen = popup(list, &items, Some(at));
-    if shown_host() != host {
+    if shown_queue() != queue {
         // The pane turned to another host meanwhile: its rows are not the
         // ones the menu was for.
         return;
@@ -1810,9 +1813,9 @@ fn context_menu(h: &Handles, list: HWND, lparam: LPARAM) {
     }
 }
 
-/// The host the Remote list is on.
-fn shown_host() -> Option<String> {
-    with(|s| s.view.as_ref().and_then(|v| v.host.clone())).flatten()
+/// The transfer queue the Remote list is on.
+fn shown_queue() -> Option<String> {
+    with(|s| s.view.as_ref().and_then(|v| v.key.clone())).flatten()
 }
 
 /// A row of a list by what it is, not where: its folder, name and
@@ -1896,9 +1899,9 @@ fn queue_menu(h: &Handles, lparam: LPARAM) {
         (0, "", false),
         (CLEAR, "C&lear finished", false),
     ];
-    let host = shown_host();
+    let queue = shown_queue();
     let chosen = popup(h.queue, &items, Some(at));
-    if shown_host() != host {
+    if shown_queue() != queue {
         return;
     }
     let op = match chosen {

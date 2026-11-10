@@ -11652,6 +11652,7 @@ impl Window {
         };
         files_panel::View {
             host: remote.map(|r| r.label.clone()),
+            key: remote.and(self.files_key.clone()),
             remote_dir: remote.map(|r| r.listing.path.clone()).unwrap_or_default(),
             remote_rows: remote
                 .map(|r| files::remote_rows(&r.listing, ""))
