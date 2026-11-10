@@ -111,6 +111,7 @@ use crate::conpty::{self, Output, Shell};
 use crate::credman;
 use crate::desktop::{Desktop, Protocol, Update as DesktopUpdate};
 use crate::files::{Divider, FilesAction, FilesView, Follow};
+use crate::form_view;
 use crate::forwards::{
     ConnView, DesktopEvent, Forwarder, FwdView, Setup as ForwardSetup, desktop_port_for,
 };
@@ -161,6 +162,9 @@ const MARK_MIN_DIP: i32 = 12;
 const CHROME_PADDING_DIP: i32 = 3;
 /// Extra pixels either side of a divider that still grab it, in DIPs.
 const GRAB_DIP: i32 = 3;
+/// How far either side of the tools pane's edge a drag can start; wider
+/// than a divider's, as the edge is a long target used often.
+const EDGE_GRAB_DIP: i32 = 8;
 /// The side pane's width when first shown, in chrome cells.
 const SIDE_COLS: i32 = 34;
 /// The side pane font size.
@@ -1643,6 +1647,8 @@ fn create_and_run(launch: Launch, theme: Option<String>) -> Result<()> {
         let _ = conn_view::create(hwnd, conn_event, cmd::IMPORT, dpi);
         // The session manager's, likewise.
         let _ = live_panel::create(hwnd, live_event, dpi);
+        // The connection form's, likewise.
+        let _ = form_view::create(hwnd, form_event, dpi);
         // Files dropped from Explorer are uploaded, after a confirmation.
         DragAcceptFiles(hwnd, true);
         // Clipboard changes reach a remote desktop being worked in.
@@ -1689,7 +1695,10 @@ fn create_and_run(launch: Launch, theme: Option<String>) -> Result<()> {
         while GetMessageW(&mut msg, None, 0, 0).as_bool() {
             // Tab, Enter, Escape and the shortcuts in the connection
             // and session managers' controls.
-            if conn_view::pre_translate(&msg) || live_panel::pre_translate(&msg) {
+            if conn_view::pre_translate(&msg)
+                || live_panel::pre_translate(&msg)
+                || form_view::pre_translate(&msg)
+            {
                 continue;
             }
             let _ = TranslateMessage(&msg);
@@ -2111,10 +2120,6 @@ fn pixel(r: Rect) -> PixelRect {
 }
 
 /// `r` grown by `by` pixels on every side.
-fn inflate(r: Rect, by: i32) -> Rect {
-    Rect::new(r.x - by, r.y - by, r.w + 2 * by, r.h + 2 * by)
-}
-
 fn mix(a: Rgb, b: Rgb, amount: f32) -> Rgb {
     let m = |x: u8, y: u8| (f32::from(x) * (1.0 - amount) + f32::from(y) * amount).round() as u8;
     Rgb::new(m(a.r, b.r), m(a.g, b.g), m(a.b, b.b))
@@ -6562,6 +6567,43 @@ impl Window {
         self.side.visible && self.side.view == SideView::Live
     }
 
+    /// Whether the connection form shows as native controls (the import
+    /// page is still drawn).
+    fn form_native(&self) -> bool {
+        self.side.visible
+            && self.side.view == SideView::Sessions
+            && self.side.form.is_some()
+            && self.side.import.is_none()
+    }
+
+    /// The connection form as the native controls show it.
+    fn native_form(&self) -> Option<form_view::Form> {
+        let f = self.side.form.as_ref()?;
+        Some(form_view::Form {
+            title: match &f.original {
+                Some(name) => format!("Edit {name}"),
+                None => "New connection".to_owned(),
+            },
+            sections: f.sections(),
+            rows: f.native_rows(),
+            error: f.error().map(str::to_owned),
+            delete: f.button_names().contains(&"Delete"),
+        })
+    }
+
+    /// The open native tool's controls have the keyboard.
+    fn active_tool_has_focus(&self) -> bool {
+        if self.form_native() {
+            form_view::has_focus()
+        } else if self.conn_native() {
+            conn_view::has_focus()
+        } else if self.live_native() {
+            live_panel::has_focus()
+        } else {
+            false
+        }
+    }
+
     /// Shows, fills and places the native tools' controls, and moves the
     /// keyboard to them or back as the side pane's focus says. Focus
     /// changes are posted: they send messages that need this window's
@@ -6581,13 +6623,18 @@ impl Window {
         } else {
             live_panel::place(None, 0, self.dpi);
         }
+        if let Some(form) = self.native_form().filter(|_| self.form_native()) {
+            form_view::set_form(form);
+            form_view::place(self.areas.side, self.areas.side_width, self.dpi);
+        } else {
+            form_view::place(None, 0, self.dpi);
+        }
         let want = self.wants_tools_focus();
-        let has = tools_have_focus();
         let to = if want && self.focused && self.live_native() && self.wants_name_edit() {
             Some(2)
-        } else if want && self.focused && !has {
+        } else if want && self.focused && !self.active_tool_has_focus() {
             Some(1)
-        } else if !want && has {
+        } else if !want && tools_have_focus() {
             Some(0)
         } else {
             None
@@ -6607,7 +6654,7 @@ impl Window {
 
     /// A native tool's controls should have the keyboard.
     fn wants_tools_focus(&self) -> bool {
-        (self.conn_native() || self.live_native()) && self.side.focused
+        (self.conn_native() || self.live_native() || self.form_native()) && self.side.focused
     }
 
     /// A theme whose background is the chrome's, for drawing its padding.
@@ -6799,6 +6846,8 @@ impl Window {
         self.client = (w, h);
         self.renderer.resize(w.max(1) as u32, h.max(1) as u32);
         self.areas = self.compute_areas();
+        // The panels let the mouse through to the edge's strip.
+        crate::native::set_edge_grab(self.hwnd, self.edge_grab());
         let cpad = scale(CHROME_PADDING_DIP, self.dpi);
         let cm = self.chrome_metrics;
         let cells = |r: Rect| {
@@ -9535,11 +9584,18 @@ impl Window {
         }
     }
 
+    /// The strip around the tools pane's edge where a drag starts.
+    fn edge_grab(&self) -> Option<Rect> {
+        let e = self.areas.side_edge?;
+        let by = scale(EDGE_GRAB_DIP, self.dpi);
+        Some(Rect::new(e.x - by, e.y, e.w + 2 * by, e.h))
+    }
+
     /// Where a client point falls.
     fn spot(&self, x: i32, y: i32) -> Spot {
         let grab = scale(GRAB_DIP, self.dpi);
-        if let Some(e) = self.areas.side_edge
-            && inflate(e, grab).contains(x, y)
+        if let Some(e) = self.edge_grab()
+            && e.contains(x, y)
         {
             return Spot::SideEdge;
         }
@@ -12529,7 +12585,56 @@ fn conn_event(hwnd: HWND, event: conn_view::Event) {
 
 /// One of the native tools' controls has the keyboard.
 fn tools_have_focus() -> bool {
-    conn_view::has_focus() || live_panel::has_focus()
+    conn_view::has_focus() || live_panel::has_focus() || form_view::has_focus()
+}
+
+/// Carries out what the user did in the connection form's controls.
+fn form_event(hwnd: HWND, event: form_view::Event) {
+    use form_view::Event;
+    let command = match event {
+        Event::Text(field, text) => {
+            with_window(|w| {
+                if let Some(f) = &mut w.side.form {
+                    f.set_text(field, &text);
+                }
+                w.refresh_chrome();
+            });
+            None
+        }
+        Event::Choice(field, index) => {
+            with_window(|w| {
+                if let Some(f) = &mut w.side.form {
+                    f.set_choice(field, index);
+                }
+                w.refresh_chrome();
+            });
+            None
+        }
+        Event::Browse => with_window(|w| w.form_action(Some(FormAction::BrowseKey))).flatten(),
+        Event::Save(connect) => with_window(|w| {
+            let action = w.side.form.as_mut()?.submit(connect);
+            // A problem shows in the form; nothing else happens.
+            if action.is_none() {
+                w.refresh_chrome();
+            }
+            w.form_action(action)
+        })
+        .flatten(),
+        Event::Cancel => with_window(|w| w.form_action(Some(FormAction::Cancel))).flatten(),
+        Event::Delete => with_window(|w| w.form_action(Some(FormAction::Delete))).flatten(),
+        Event::Focused => {
+            with_window(|w| {
+                if !w.side.focused {
+                    w.side.focused = true;
+                    w.refresh_chrome();
+                }
+            });
+            None
+        }
+    };
+    if let Some(command) = command {
+        run_command(hwnd, command);
+    }
 }
 
 /// Carries out what the user did in the session manager's controls.
@@ -14135,11 +14240,12 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
             }
             WM_TOOLS_FOCUS => {
                 // Checked again now: a click may have moved the focus since.
-                let (want, conn, live, rename) = with_window(|w| {
+                let (want, conn, live, form, rename) = with_window(|w| {
                     (
                         w.wants_tools_focus(),
                         w.conn_native(),
                         w.live_native(),
+                        w.form_native(),
                         w.wants_name_edit()
                             .then(|| w.live_view.renaming_pane())
                             .flatten(),
@@ -14154,6 +14260,7 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                         None if live_panel::editing() => {}
                         None => live_panel::focus_list(),
                     },
+                    1 if want && form => form_view::focus_first(),
                     1 if want && conn => conn_view::focus_tree(),
                     1 if want && live => live_panel::focus_list(),
                     0 if !want && tools_have_focus() => {

@@ -39,18 +39,18 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
     GetFocus, SetFocus, VK_CONTROL, VK_DELETE, VK_DOWN, VK_F2, VK_F5, VK_INSERT, VK_SHIFT,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    BN_CLICKED, BS_DEFPUSHBUTTON, BS_PUSHBUTTON, CreateWindowExW, DefWindowProcW, EN_CHANGE,
-    EN_SETFOCUS, ES_AUTOHSCROLL, GetClientRect, GetMessagePos, GetWindowTextLengthW, HMENU,
-    IDC_ARROW, IDCANCEL, IDOK, IsChild, IsDialogMessageW, IsWindowVisible, LoadCursorW, MSG,
-    MoveWindow, RegisterClassW, SW_HIDE, SW_SHOWNA, SendMessageW, SetWindowTextW, ShowWindow,
-    WINDOW_EX_STYLE, WINDOW_STYLE, WM_CHAR, WM_COMMAND, WM_ERASEBKGND, WM_KEYDOWN, WM_NOTIFY,
-    WM_PAINT, WNDCLASSW, WS_BORDER, WS_CHILD, WS_CLIPCHILDREN, WS_CLIPSIBLINGS,
-    WS_EX_CONTROLPARENT, WS_TABSTOP, WS_VISIBLE,
+    BN_CLICKED, BS_DEFPUSHBUTTON, BS_PUSHBUTTON, CS_HREDRAW, CS_VREDRAW, CreateWindowExW,
+    DefWindowProcW, EN_CHANGE, EN_SETFOCUS, ES_AUTOHSCROLL, GetClientRect, GetMessagePos,
+    GetWindowTextLengthW, HMENU, IDC_ARROW, IDCANCEL, IDOK, IsChild, IsDialogMessageW,
+    IsWindowVisible, LoadCursorW, MSG, MoveWindow, RegisterClassW, SW_HIDE, SW_SHOWNA,
+    SendMessageW, SetWindowTextW, ShowWindow, WINDOW_EX_STYLE, WINDOW_STYLE, WM_CHAR, WM_COMMAND,
+    WM_ERASEBKGND, WM_KEYDOWN, WM_NOTIFY, WM_PAINT, WNDCLASSW, WS_BORDER, WS_CHILD,
+    WS_CLIPCHILDREN, WS_CLIPSIBLINGS, WS_EX_CONTROLPARENT, WS_TABSTOP, WS_VISIBLE,
 };
 use windows::core::{PCWSTR, PWSTR, w};
 
 use crate::layout::Rect;
-use crate::native::{fonts, key_down, scale, search_text, set_font, wide};
+use crate::native::{fonts, key_down, pass_edge, scale, search_text, set_font, wide};
 use crate::sessions::{SideAction, TreeHost, TreeNode};
 
 /// What the user did in the panel.
@@ -131,6 +131,9 @@ pub fn create(main: HWND, handler: Handler, import: u32, dpi: u32) -> windows::c
         let instance = windows::Win32::System::LibraryLoader::GetModuleHandleW(None)?;
         let class = w!("FeroSSHConnections");
         let wc = WNDCLASSW {
+            // Redrawn whole when resized: the title row is laid out on
+            // the width.
+            style: CS_HREDRAW | CS_VREDRAW,
             lpfnWndProc: Some(wndproc),
             hInstance: instance.into(),
             hCursor: LoadCursorW(None, IDC_ARROW)?,
@@ -231,6 +234,9 @@ pub fn create(main: HWND, handler: Handler, import: u32, dpi: u32) -> windows::c
                 width: 0,
             });
         });
+    }
+    if let Some(h) = handles() {
+        pass_edge(h.panel);
     }
     Ok(())
 }

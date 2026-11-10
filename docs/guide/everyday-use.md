@@ -51,12 +51,11 @@ Ctrl+Shift+S shows your hosts in the tools pane: those from `~/.ssh/config`, you
 
 ### Saved connections
 
-Insert or the New button opens the connection form in the side pane; F2, the Edit button or a right click edits the selected connection. The form has:
+Insert or the New button opens the connection form in the tools pane; F2, the Edit button or a right click edits the selected connection. It is a Windows form of text boxes and drop-down lists, with a tab per section:
 
-- **Name, Folder, Type**: the type is an SSH terminal, Telnet (unencrypted), Serial console, Remote desktop (RDP) or VNC desktop.
-- **Host, User, Port, Key file** (with Browse...), the **Password** source (below) and the **Jump host** (see [Jump hosts](#jump-hosts)). A serial console has the port, speed, framing and flow control instead.
-- **Look**: theme, font, font size and scrollback.
-- **Extras**: tmux on or off, the tmux session to attach and its layout, the start directory, port forwards (such as `L 8080 localhost:80`), RDP and VNC ports, older crypto, and the login script (see [Login scripts](#login-scripts)).
+- **Connection**: **Name, Folder, Type**; the type is an SSH terminal, Telnet (unencrypted), Serial console, Remote desktop (RDP) or VNC desktop. Then **Host, User, Port, Key file** (with Browse...), the **Password** source (below) and the **Jump host** (see [Jump hosts](#jump-hosts)). A serial console has the port, speed, framing and flow control instead.
+- **Look** (a terminal's tab): theme, font, font size and scrollback.
+- **Extras** (a terminal's tab): tmux on or off, the tmux session to attach and its layout, the start directory, port forwards (such as `L 8080 localhost:80`), RDP and VNC ports, older crypto, and the login script (see [Login scripts](#login-scripts)).
 
 Empty fields show their default in grey. Enter saves, Shift+Enter saves and connects, Esc cancels. Connections go to `%APPDATA%\FeroSSH\sessions.conf` in ssh_config syntax and their look to `ferossh.conf`. Hosts from `~/.ssh/config` and imports show their connection settings read-only, because FeroSSH never writes those files; their look and extras can still change, and giving one a new name saves an editable copy.
 
@@ -81,7 +80,7 @@ Host, user, port, key file, folders, PuTTY and KiTTY port forwards and jump host
 
 ## The session manager
 
-Ctrl+Shift+L lists the sessions that are open right now, in every tab: their host, kind (SSH, Telnet, serial, tmux, desktop or local shell), tab and state (connected, connecting, reconnecting or ended), with notes such as tmux, forwards, logging or a jump host. It also shows the hidden sessions of a [multi-host snippet run](#runs-on-many-hosts). It is a Windows list with columns (session, kind, tab, state, details) and updates as sessions connect, drop and reconnect. Type to filter, Enter or a double-click goes to the session's tab and pane, F2 renames it in place, and Del closes it after asking. The Show, Rename and Close buttons below the list do the same.
+Ctrl+Shift+L lists the sessions that are open right now, in every tab: their host, kind (SSH, Telnet, serial, tmux, desktop or local shell), tab and state (connected, connecting, reconnecting or ended), with notes such as tmux, forwards, logging or a jump host. It also shows the hidden sessions of a [multi-host snippet run](#runs-on-many-hosts). It is a Windows list with columns (session, kind, tab, state, details) and updates as sessions connect, drop and reconnect. Type to filter, Enter or a double-click goes to the session's tab and pane, F2 renames it in place, and Del closes it after asking. The Show, Rename and Close buttons below the list, and a right-click on a session, do the same.
 
 The connection manager is for the hosts you *can* connect to; the session manager for the ones you *are* connected to.
 

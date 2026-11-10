@@ -163,15 +163,18 @@ The side pane shows one view at a time. Esc goes back to the terminal; the short
 
 ### Connection form
 
+The form has a tab for each section: Connection, Look and Extras (a desktop or remote app connection has only Connection).
+
 | Key | Action |
 | --- | --- |
-| Tab, Up, Down | Moves between fields. |
-| Left / Right | Picks the next choice in a choice field (type, password source, theme...), or opens and closes a section. |
-| Enter | Saves. On a section heading (Look, Extras), opens or closes it. |
+| Tab, Shift+Tab | Moves between fields and buttons. |
+| Ctrl+Tab, Ctrl+PageDown / Ctrl+PageUp | Goes to the next or previous section tab. |
+| Up / Down, Alt+Down | Picks another choice in a drop-down field (type, password source, theme...), or opens its list. |
+| Enter | Saves. |
 | Shift+Enter | Saves and connects. |
 | Esc | Cancels. |
 
-The buttons at the bottom do the same, and a saved connection has a Delete button that asks first.
+The buttons at the bottom do the same, and a saved connection has a Delete button that asks first. A problem with what was typed shows in red above the buttons.
 
 ### Session manager (Ctrl+Shift+L)
 
@@ -185,7 +188,7 @@ The buttons at the bottom do the same, and a saved connection has a Delete butto
 | Del | Closes the session, after asking when it is live. |
 | Esc | Clears the search, then leaves. |
 
-The Show, Rename and Close buttons below the list do the same.
+The Show, Rename and Close buttons below the list, and the right-click menu on a session (or Shift+F10 with the list focused, for example after Down from the search box), do the same.
 
 ### File transfer (Ctrl+Shift+E)
 
