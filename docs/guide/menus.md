@@ -209,17 +209,19 @@ In the Local and Remote lists:
 
 In a path box, Enter goes to the folder typed. In the queue, Del cancels a transfer and the right-click menu pauses, resumes, retries and clears the finished ones. When a file already exists, Overwrite, Skip and Keep both answer above the queue; For all answers the same for the rest.
 
-The arrow buttons between the lists move the selection across, and the gap between them drags to share the room differently. ★ Bookmarks ▾ opens, adds, renames and deletes bookmarks; in its name box Enter saves and Escape cancels. ⇆ Sync turns on Sync browsing, so opening a folder or going up in one list does the same in the other. Layout ▾ arranges the lists side by side or stacked, swaps them, and has Choose local folder, Upload files and Open local folder in Explorer.
+The arrow buttons between the lists move the selection across, and the gap between them drags to share the room differently. ★ Bookmarks ▾ opens, adds, renames and deletes bookmarks; in its name box Enter saves and Escape cancels. ↻ Refresh reads both lists again (F5 outside the lists). ⇆ Sync turns on Sync browsing, so opening a folder or going up in one list does the same in the other. Layout ▾ arranges the lists side by side or stacked, swaps them, and has Choose local folder, Upload files and Open local folder in Explorer.
 
 ### Port forwards (Ctrl+Shift+P)
 
 | Key | Action |
 | --- | --- |
-| Typing, then Enter | Adds a forward: `-L 8080:db.internal:5432`, `-R 9000:localhost:3000`, `-D 1080`, or stops one with `-KL 8080`, `-KR 9000`, `-KD 1080`. |
-| Up / Down | Selects a forward. New forwards go to the connection you clicked in the list, or else to the focused pane's. |
-| Enter or F2 on a forward | Puts it on the add line, to change its port or target, or to retry it. |
-| Del | Stops the selected forward. |
-| Esc | Clears the add line, then leaves. |
+| Enter in the form, or Add | Adds the forward the form describes (Type, Listen, To) on the connection in the On box. The Listen box also takes `-L 8080:db.internal:5432`, `-R 9000:localhost:3000`, `-D 1080`, or `-KL 8080`, `-KR 9000`, `-KD 1080` to stop one. |
+| Up / Down in the list | Selects a forward; the line under the list shows its details. |
+| Enter, F2, a double click or Edit | Puts the selected forward in the form to change it; Save keeps the change. |
+| Retry | Starts a stopped forward again. |
+| Del or Stop | Stops the selected forward. |
+| Right click or Shift+F10 | Edit, Retry and Stop for the forward. |
+| Esc | Ends a change or clears the form, then leaves. |
 
 ### Scripts (Ctrl+Shift+Space)
 

@@ -21,6 +21,17 @@ thread_local! {
     /// The main window and, in its client coordinates, the strip around
     /// the terminal's edge that drags the tools pane.
     static EDGE: Cell<Option<(HWND, crate::layout::Rect)>> = const { Cell::new(None) };
+    /// Told when any panel control takes the keyboard.
+    static ON_FOCUS: Cell<Option<fn()>> = const { Cell::new(None) };
+}
+
+/// Calls `f` whenever a control in a panel (any panel `pass_edge` saw)
+/// takes the keyboard, by a click or Tab or a call: the window then knows
+/// the tools have it before anything moves it back to the terminal. A
+/// push button tells nothing of its own, and a button that loses the
+/// keyboard between press and release never clicks.
+pub fn on_control_focus(f: fn()) {
+    ON_FOCUS.with(|c| c.set(Some(f)));
 }
 
 /// Sets the strip around the terminal's edge (`None` when there is no
@@ -68,7 +79,16 @@ unsafe extern "system" fn edge_proc(
     _data: usize,
 ) -> LRESULT {
     const WM_NCHITTEST: u32 = 0x0084;
+    const WM_SETFOCUS: u32 = 0x0007;
     const HTTRANSPARENT: isize = -1;
+    if msg == WM_SETFOCUS {
+        // SAFETY: the default first, so the control has the keyboard.
+        let r = unsafe { DefSubclassProc(hwnd, msg, wparam, lparam) };
+        if let Some(f) = ON_FOCUS.with(Cell::get) {
+            f();
+        }
+        return r;
+    }
     if msg == WM_NCHITTEST
         && let Some((main, grab)) = EDGE.with(Cell::get)
     {
