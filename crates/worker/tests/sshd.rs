@@ -833,6 +833,85 @@ async fn transfers_files_over_sftp() {
     assert!(String::from_utf8_lossy(&out).contains("still42"));
 }
 
+/// Checksums of files whose names a shell would run: the name reaches
+/// the server's `sha256sum` through `xargs -0` on stdin, never on the
+/// command line, so nothing in it runs and both transfers verify.
+#[cfg(unix)]
+#[tokio::test]
+async fn checksums_hostile_names_without_running_them() {
+    use ferossh_sftp::{Remote, State};
+    if !available() {
+        return;
+    }
+    let server = start("sftp-names", "Subsystem sftp internal-sftp");
+    let (to_worker, mut from_worker) = login(&server).await;
+    let remote_dir = server.dir.join("files");
+    let local_dir = server.dir.join("local");
+    std::fs::create_dir_all(&remote_dir).unwrap();
+    std::fs::create_dir_all(&local_dir).unwrap();
+    // A file name cannot hold `/`, so the commands touch a relative name:
+    // the server runs the checksum in the user's home folder.
+    let canary_s = format!("ferossh-ran-{}", std::process::id());
+    let home = std::env::var_os("HOME")
+        .map(std::path::PathBuf::from)
+        .unwrap();
+    let canary = home.join(&canary_s);
+    let _ = std::fs::remove_file(&canary);
+    // Breaks out of the old single quotes, and runs under sh, cmd.exe
+    // (`&`) and backticks alike; a newline makes sha256sum escape it.
+    let name = format!("it's '$(touch {canary_s})'&touch {canary_s}&`touch {canary_s}`\nx");
+    let data: Vec<u8> = (0..200_000u32).map(|i| (i % 251) as u8).collect();
+    std::fs::write(remote_dir.join(&name), &data).unwrap();
+
+    let mut remote = Remote::new("test");
+    remote.verify = true;
+    remote.attach(2, 1);
+    drive(&mut remote, &to_worker, &mut from_worker, |r| {
+        r.is_ready() && !r.listing.loading
+    })
+    .await;
+    let dir = remote_dir.to_str().unwrap().as_bytes().to_vec();
+    remote.browse(&dir);
+    drive(&mut remote, &to_worker, &mut from_worker, |r| {
+        !r.listing.loading && r.listing.path == dir
+    })
+    .await;
+    let entry = remote
+        .listing
+        .entries
+        .iter()
+        .find(|e| e.name == name.as_bytes())
+        .expect("the file is listed")
+        .clone();
+
+    let settled = |r: &Remote| r.jobs().iter().all(|j| j.state.finished());
+    remote.download(&entry, &local_dir).unwrap();
+    drive(&mut remote, &to_worker, &mut from_worker, settled).await;
+    let job = &remote.jobs()[0];
+    assert_eq!(job.state, State::Done, "{:?}", job.note);
+    assert_eq!(job.note.as_deref(), Some("SHA-256 verified"));
+
+    // Uploading a local file of that name checks `<name>.filepart` too.
+    let up_dir = remote_dir.join("up");
+    std::fs::create_dir_all(&up_dir).unwrap();
+    // (The download above was saved under a name Windows can hold.)
+    let up = local_dir.join("up").join(&name);
+    std::fs::create_dir_all(up.parent().unwrap()).unwrap();
+    std::fs::write(&up, &data).unwrap();
+    remote
+        .upload(&up, up_dir.to_str().unwrap().as_bytes())
+        .unwrap();
+    drive(&mut remote, &to_worker, &mut from_worker, settled).await;
+    let job = &remote.jobs()[1];
+    assert_eq!(job.state, State::Done, "{:?}", job.note);
+    assert_eq!(job.note.as_deref(), Some("SHA-256 verified"));
+    assert_eq!(std::fs::read(up_dir.join(&name)).unwrap(), data);
+
+    let ran = canary.exists();
+    let _ = std::fs::remove_file(&canary);
+    assert!(!ran, "a command in the file name ran");
+}
+
 /// What [`through`] saw.
 #[derive(Debug, Default)]
 struct Chain {

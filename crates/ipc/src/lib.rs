@@ -269,8 +269,8 @@ pub enum SftpOp {
         overwrite: bool,
     },
     /// The SHA-256 of a remote file, computed on the server by
-    /// `sha256sum` (an exec channel, not SFTP). Fails where the server has
-    /// no such command.
+    /// `xargs -0 sha256sum`, the path on stdin (an exec channel, not SFTP).
+    /// Fails where the server has no such commands.
     Checksum {
         path: Vec<u8>,
     },

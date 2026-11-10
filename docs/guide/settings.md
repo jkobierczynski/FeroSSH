@@ -33,7 +33,7 @@ FeroSSH reads `~/.ssh/config` and `~/.ssh/known_hosts` too, and writes only to `
 | `DownloadFolder "D:\Transfers"` | your Downloads folder | Where downloads go. |
 | `TransferLayout "stacked swapped 40"` | side by side, Local first, half each | How File transfer arranges its lists: `side` or `stacked`, `swapped` for Remote first, and the first list's share in percent. Layout ▾ and dragging the gap set it. |
 | `Bookmark "web" "D:\Sites\web" "/var/www/web" "web1"` | none | A File transfer bookmark: its name, Local folder, Remote folder and the connection it is for, `""` for none (one folder at least). One line per bookmark; ★ Bookmarks ▾ adds, renames and deletes them. |
-| `VerifyTransfers yes` | no | Compares SHA-256 on both ends after each file (the server needs `sha256sum`). |
+| `VerifyTransfers yes` | no | Compares SHA-256 on both ends after each file (the server needs `sha256sum` and `xargs`). |
 | `ParallelTransfers 4` | 3 | Files that move at once, 1 to 8. |
 | `FollowDirectory no` | yes | Whether the file view follows the shell's `cd` (OSC 7). |
 | `ZModem yes` | no | Answers `rz` and `sz` in the terminal with ZMODEM (Session > ZMODEM: answer rz and sz). |
