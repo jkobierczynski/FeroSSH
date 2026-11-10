@@ -134,6 +134,7 @@ use crate::rail;
 use crate::reconnect::{self, Next, Retry};
 use crate::same_dir;
 use crate::sandbox;
+use crate::script_editor;
 use crate::scripts_panel;
 use crate::scrollmark;
 use crate::serial_port::{Output as SerialOutput, SerialPort};
@@ -1666,6 +1667,8 @@ fn create_and_run(launch: Launch, theme: Option<String>) -> Result<()> {
         let _ = fwd_panel::create(hwnd, fwd_event, dpi);
         // The scripts pane's, likewise.
         let _ = scripts_panel::create(hwnd, scripts_event, dpi);
+        // The script editor's, likewise.
+        let _ = script_editor::create(hwnd, script_editor_event, dpi);
         // A click on any of their controls hands the keyboard to the tools.
         crate::native::on_control_focus(tools_focused);
         // Files dropped from Explorer are uploaded, after a confirmation.
@@ -1720,6 +1723,7 @@ fn create_and_run(launch: Launch, theme: Option<String>) -> Result<()> {
                 || files_panel::pre_translate(&msg)
                 || fwd_panel::pre_translate(&msg)
                 || scripts_panel::pre_translate(&msg)
+                || script_editor::pre_translate(&msg)
             {
                 continue;
             }
@@ -6650,6 +6654,17 @@ impl Window {
             && !self.snippets_view.reporting()
     }
 
+    /// Whether the script editor shows as native controls (the argument
+    /// page, the host picker and a report are still drawn).
+    fn script_editor_native(&self) -> bool {
+        self.side.visible
+            && self.side.view == SideView::Snippets
+            && self.snippets_view.editing()
+            && !self.snippets_view.asking()
+            && !self.snippets_view.picking()
+            && !self.snippets_view.reporting()
+    }
+
     /// Whether the connection form shows as native controls (the import
     /// page is still drawn).
     fn form_native(&self) -> bool {
@@ -6688,6 +6703,8 @@ impl Window {
             fwd_panel::has_focus()
         } else if self.scripts_native() {
             scripts_panel::has_focus()
+        } else if self.script_editor_native() {
+            script_editor::has_focus()
         } else {
             false
         }
@@ -6742,6 +6759,16 @@ impl Window {
         } else {
             scripts_panel::place(None, 0, self.dpi);
         }
+        if let Some(draft) = self
+            .snippets_view
+            .native_draft()
+            .filter(|_| self.script_editor_native())
+        {
+            script_editor::set_draft(draft);
+            script_editor::place(self.areas.side, self.areas.side_width, self.dpi);
+        } else {
+            script_editor::place(None, 0, self.dpi);
+        }
         if let Some(form) = self.native_form().filter(|_| self.form_native()) {
             form_view::set_form(form);
             form_view::place(self.areas.side, self.areas.side_width, self.dpi);
@@ -6778,7 +6805,8 @@ impl Window {
             || self.form_native()
             || self.files_visible()
             || self.fwd_native()
-            || self.scripts_native())
+            || self.scripts_native()
+            || self.script_editor_native())
             && self.side.focused
     }
 
@@ -7908,6 +7936,11 @@ impl Window {
         }
         if !(self.side.visible && self.side.focused && self.side.view == SideView::Snippets) {
             return false;
+        }
+        // The native editor's fields take it themselves.
+        if self.script_editor_native() {
+            script_editor::paste(text);
+            return true;
         }
         self.snippets_view.paste(text);
         self.refresh_chrome();
@@ -12940,6 +12973,29 @@ fn tools_have_focus() -> bool {
         || files_panel::has_focus()
         || fwd_panel::has_focus()
         || scripts_panel::has_focus()
+        || script_editor::has_focus()
+}
+
+/// Carries out what the user did in the script editor: Save goes through
+/// the scripts view's checks, as the drawn editor's did.
+fn script_editor_event(hwnd: HWND, event: script_editor::Event) {
+    let command = match event {
+        script_editor::Event::Save { head, lines } => with_window(|w| {
+            let action = w.snippets_view.native_save(head, &lines);
+            w.snippets_action(action)
+        })
+        .flatten(),
+        script_editor::Event::Cancel => {
+            with_window(|w| {
+                w.snippets_view.native_cancel();
+                w.refresh_chrome();
+            });
+            None
+        }
+    };
+    if let Some(command) = command {
+        run_command(hwnd, command);
+    }
 }
 
 /// Carries out what the user did in the scripts pane: its keys go to
@@ -14690,21 +14746,23 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
             }
             WM_TOOLS_FOCUS => {
                 // Checked again now: a click may have moved the focus since.
-                let (want, conn, live, form, files, fwd, scripts, rename) = with_window(|w| {
-                    (
-                        w.wants_tools_focus(),
-                        w.conn_native(),
-                        w.live_native(),
-                        w.form_native(),
-                        w.files_visible(),
-                        w.fwd_native(),
-                        w.scripts_native(),
-                        w.wants_name_edit()
-                            .then(|| w.live_view.renaming_pane())
-                            .flatten(),
-                    )
-                })
-                .unwrap_or_default();
+                let (want, conn, live, form, files, fwd, scripts, editor, rename) =
+                    with_window(|w| {
+                        (
+                            w.wants_tools_focus(),
+                            w.conn_native(),
+                            w.live_native(),
+                            w.form_native(),
+                            w.files_visible(),
+                            w.fwd_native(),
+                            w.scripts_native(),
+                            w.script_editor_native(),
+                            w.wants_name_edit()
+                                .then(|| w.live_view.renaming_pane())
+                                .flatten(),
+                        )
+                    })
+                    .unwrap_or_default();
                 match wparam.0 {
                     2 if want => match rename {
                         Some(pane) => live_panel::edit_name(pane),
@@ -14719,6 +14777,7 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                     1 if want && files => files_panel::focus_first(),
                     1 if want && fwd => fwd_panel::focus_first(),
                     1 if want && scripts => scripts_panel::focus_first(),
+                    1 if want && editor => script_editor::focus_first(),
                     0 if !want && tools_have_focus() => {
                         let _ = SetFocus(Some(hwnd));
                     }

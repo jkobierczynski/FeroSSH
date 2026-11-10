@@ -48,6 +48,8 @@ mod live_panel;
 #[cfg(windows)]
 mod native;
 #[cfg(windows)]
+mod script_editor;
+#[cfg(windows)]
 mod scripts_panel;
 // Platform-neutral, tested everywhere; only the Windows build uses them.
 #[cfg_attr(not(windows), allow(dead_code))]

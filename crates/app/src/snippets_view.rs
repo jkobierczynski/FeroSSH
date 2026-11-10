@@ -44,15 +44,15 @@ const MAX_TEXT: usize = 400;
 const MAX_LINES: usize = 50;
 /// The fields above a snippet's lines: name, category, hosts, folders,
 /// hotkey and auto-response text.
-const HEAD: usize = 6;
+pub const HEAD: usize = 6;
 const NAME: usize = 0;
 const CATEGORY: usize = 1;
 const HOSTS: usize = 2;
 const FOLDERS: usize = 3;
 const HOTKEY: usize = 4;
 const WHEN: usize = 5;
-const HEAD_LABELS: [&str; HEAD] = ["Name", "Category", "Hosts", "Folders", "Hotkey", "When"];
-const HEAD_HINTS: [&str; HEAD] = [
+pub const HEAD_LABELS: [&str; HEAD] = ["Name", "Category", "Hosts", "Folders", "Hotkey", "When"];
+pub const HEAD_HINTS: [&str; HEAD] = [
     "e.g. Show interfaces",
     "none, or e.g. Network/Cisco",
     "every host, or patterns: sw-* core-?",
@@ -140,7 +140,12 @@ struct Draft {
     error: Option<String>,
     /// A note above the fields, such as what a recording left out.
     note: Option<String>,
+    /// Tells this draft from the one before, for the native editor.
+    serial: u64,
 }
+
+/// Counts drafts, for [`Draft::serial`].
+static DRAFTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
 impl Draft {
     fn new(index: Option<usize>, snippet: &Snippet) -> Self {
@@ -159,6 +164,7 @@ impl Draft {
             cursor: snippet.name.chars().count(),
             error: None,
             note: None,
+            serial: DRAFTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
         };
         d.tidy();
         d
@@ -458,6 +464,34 @@ pub struct NativeScript {
     pub details: String,
 }
 
+/// The script being edited, as the native editor shows it (see
+/// [`SnippetsView::native_draft`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NativeDraft {
+    /// Another number for another draft: its fields are filled anew.
+    pub serial: u64,
+    /// Whether it changes a script (else it is a new one).
+    pub existing: bool,
+    /// Name, category, hosts, folders, hotkey (`F3` or empty) and `When`
+    /// text, as in [`HEAD_LABELS`].
+    pub head: [String; HEAD],
+    /// The lines, one per line.
+    pub lines: Vec<String>,
+    /// Why it could not be saved.
+    pub error: Option<String>,
+    /// A note above the fields, such as what a recording left out.
+    pub note: Option<String>,
+    /// Where the keyboard goes: a field of `head`, or (`HEAD`) the lines,
+    /// with the line.
+    pub focus: (usize, usize),
+}
+
+/// A line made one typed without Enter, as Shift+Enter in the editor
+/// makes it (an `@type` line).
+pub fn without_enter(line: &str) -> String {
+    with_enter(line, false)
+}
+
 /// Lines of a script shown in its details.
 const DETAIL_LINES: usize = 4;
 
@@ -595,6 +629,78 @@ impl SnippetsView {
                 })
             })
             .collect()
+    }
+
+    /// The script being edited, for the native editor.
+    pub fn native_draft(&self) -> Option<NativeDraft> {
+        let d = self.draft.as_ref()?;
+        let mut lines = d.lines.clone();
+        while lines.last().is_some_and(String::is_empty) {
+            lines.pop();
+        }
+        Some(NativeDraft {
+            serial: d.serial,
+            existing: d.index.is_some(),
+            head: d.head.clone(),
+            lines,
+            error: d.error.clone(),
+            note: d.note.clone(),
+            focus: if d.focus < HEAD {
+                (d.focus, 0)
+            } else {
+                (HEAD, d.focus - HEAD)
+            },
+        })
+    }
+
+    /// Save in the native editor, with what its fields say: what to
+    /// store, or `None` when the editor says why not.
+    pub fn native_save(&mut self, head: [String; HEAD], lines: &str) -> Option<SnipAction> {
+        let d = self.draft.as_mut()?;
+        // Too much text is refused, not cut: the editor keeps what was
+        // typed, so it can be shortened.
+        let long = |t: &str| t.chars().count() > MAX_TEXT;
+        if let Some(i) = head.iter().position(|t| long(t)) {
+            return d.fail(format!("At most {MAX_TEXT} characters here."), i);
+        }
+        if let Some(n) = lines.lines().position(long) {
+            return d.fail(
+                format!("Line {} is longer than {MAX_TEXT} characters.", n + 1),
+                HEAD + n,
+            );
+        }
+        if lines.lines().count() > MAX_LINES {
+            return d.fail(
+                format!("A script has at most {MAX_LINES} lines."),
+                HEAD + MAX_LINES,
+            );
+        }
+        d.head = head.map(|t| {
+            t.chars()
+                .filter(|c| !c.is_control())
+                .take(MAX_TEXT)
+                .collect()
+        });
+        d.lines = lines
+            .lines()
+            .take(MAX_LINES)
+            .map(|l| {
+                l.chars()
+                    .map(|c| if c == '\t' { ' ' } else { c })
+                    .filter(|c| !c.is_control())
+                    .take(MAX_TEXT)
+                    .collect()
+            })
+            .collect();
+        d.error = None;
+        d.note = None;
+        d.tidy();
+        d.save()
+    }
+
+    /// Cancel in the native editor: the list again.
+    pub fn native_cancel(&mut self) {
+        self.draft = None;
     }
 
     /// The selected script's place among [`Self::native_rows`].
@@ -1831,6 +1937,65 @@ mod tests {
                     .to_owned()
             })
             .collect()
+    }
+
+    #[test]
+    fn native_editor_saves_what_its_fields_say() {
+        let all = snippets();
+        let mut v = SnippetsView::default();
+        assert!(v.native_draft().is_none());
+        v.select(1);
+        v.key(SideKey::Edit, &all, 20);
+        let d = v.native_draft().unwrap();
+        assert!(d.existing);
+        assert_eq!(d.head[NAME], "Save config");
+        // The empty line to type in is not shown.
+        assert_eq!(d.lines, ["copy running-config startup-config"]);
+        // Another draft, another serial.
+        let serial = d.serial;
+        v.native_cancel();
+        assert!(v.native_draft().is_none());
+        v.key(SideKey::Edit, &all, 20);
+        assert_ne!(v.native_draft().unwrap().serial, serial);
+        // A missing name is refused, with the keyboard sent there.
+        let mut head = d.head.clone();
+        head[NAME] = String::new();
+        assert_eq!(v.native_save(head.clone(), "uptime\r\nwho"), None);
+        let d = v.native_draft().unwrap();
+        assert!(d.error.is_some());
+        assert_eq!(d.focus, (NAME, 0));
+        assert_eq!(d.lines, ["uptime", "who"]);
+        // A bad hotkey too.
+        head[NAME] = "Load".into();
+        head[HOTKEY] = "F99".into();
+        assert_eq!(v.native_save(head.clone(), "uptime"), None);
+        assert_eq!(v.native_draft().unwrap().focus, (HOTKEY, 0));
+        head[HOTKEY] = "F3".into();
+        // Too much text is refused, not cut short.
+        let long = "x".repeat(MAX_TEXT + 1);
+        let mut too_long = head.clone();
+        too_long[NAME] = long.clone();
+        assert_eq!(v.native_save(too_long, "uptime"), None);
+        assert_eq!(v.native_draft().unwrap().focus.0, NAME);
+        assert_eq!(
+            v.native_save(head.clone(), &format!("uptime\n{long}")),
+            None
+        );
+        assert!(v.native_draft().unwrap().error.is_some());
+        let many = vec!["uptime"; MAX_LINES + 1].join("\n");
+        assert_eq!(v.native_save(head.clone(), &many), None);
+        assert!(v.native_draft().unwrap().error.is_some());
+        match v.native_save(head, "uptime\n\n@type w\n") {
+            Some(SnipAction::Save { index, snippet }) => {
+                assert_eq!(index, Some(1));
+                assert_eq!(snippet.name, "Load");
+                assert_eq!(snippet.hotkey, Some(3));
+                assert_eq!(snippet.lines, ["uptime", "@type w"]);
+            }
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(without_enter("ls -l"), "@type ls -l");
+        assert_eq!(without_enter("@type ls"), "@type ls");
     }
 
     #[test]

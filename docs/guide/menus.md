@@ -47,7 +47,7 @@ Items with a check mark are switches: picking them turns the setting on or off, 
 | Reset text size | Ctrl+0 | Back to the pane's normal size. |
 | Font (this pane) | | Eighteen monospace fonts for the focused pane. The five that come with Windows are listed first. A free font that is not installed reads "(download)" and opens its official download page; FeroSSH picks it up after a restart. |
 | Theme (this pane) | | The colour theme for the focused pane, in three columns: Nord and 24 other dark themes, 11 light themes, then the Production and Staging warning themes over the classics (Campbell, One Half Dark and Light, Tango Dark and Light from Windows Terminal, and PuTTY's colours). The list is in [Everyday use](everyday-use.md). |
-| Window colours (menus, tools) | | Where the menu bar and menus, the title bar, the tab strip, the tools rail and the tools pane take their colours. **Follow the terminal theme** (the default): the focused pane's theme, so a dark theme gives a dark window and Production a red one. **Follow Windows**: Windows' light or dark app mode. **Light**: Windows' usual light look. **Dark**: a neutral dark grey. `WindowColours`. |
+| Window colours (menus, tools) | | Where the menu bar and menus, the title bar, the tab strip, the tools rail and the tools pane take their colours. **Follow the terminal theme**: the focused pane's theme, so a dark theme gives a dark window and Production a red one. **Follow Windows**: Windows' light or dark app mode. **Light** (the default): Windows' usual light look. **Dark**: a neutral dark grey. `WindowColours`. |
 | Show test pattern | | Prints colours, text styles, box drawing, wide and combining characters in the pane, to check a font. |
 | Hide menu bar (Alt shows it) | Ctrl+Shift+M | Hides the menu bar. Pressing Alt shows it again. |
 
@@ -240,7 +240,7 @@ The arrow buttons between the lists move the selection across, and the gap betwe
 
 The Run, Edit, New, Delete and On hosts buttons under the list, and the list's right-click menu, do the same.
 
-In the script editor, Enter ends a line, which is typed with Enter after it; Shift+Enter ends a line that is typed without Enter (it becomes an `@type` line, shown as *no Enter*).
+In the script editor's lines, Enter ends a line, which is typed with Enter after it; Shift+Enter ends a line that is typed without Enter (it becomes an `@type` line). Enter in a field or Ctrl+Enter in the lines saves; Escape cancels.
 
 In a run's report, Enter shows that host's pane, C copies the report as a table, S saves it as CSV in the download folder, R runs the failed hosts again and Esc stops the run (or closes the report when it is over).
 

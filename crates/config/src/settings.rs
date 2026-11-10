@@ -408,11 +408,12 @@ impl Profile {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum WindowColours {
     /// The focused pane's colour theme, dark or light as the theme is.
-    #[default]
     Theme,
     /// Windows' own light or dark app mode.
     System,
-    /// Windows' light look, as before window colours existed.
+    /// Windows' light look, as before window colours existed: the
+    /// default, a light window around the terminal.
+    #[default]
     Light,
     /// A neutral dark grey.
     Dark,
@@ -1778,11 +1779,11 @@ DesktopShareSelection yes
     }
 
     #[test]
-    fn window_colours_follow_the_theme_unless_set() {
-        assert_eq!(Settings::default().window_colours, WindowColours::Theme);
+    fn window_colours_are_light_unless_set() {
+        assert_eq!(Settings::default().window_colours, WindowColours::Light);
         assert_eq!(
             Settings::parse("SidePane left\n").window_colours,
-            WindowColours::Theme
+            WindowColours::Light
         );
         for c in WindowColours::ALL {
             let s = Settings {
@@ -1794,6 +1795,10 @@ DesktopShareSelection yes
         // An unknown word (a newer FeroSSH's) falls back to the default.
         assert_eq!(
             Settings::parse("WindowColours purple\n").window_colours,
+            WindowColours::Light
+        );
+        assert_eq!(
+            Settings::parse("WindowColours theme\n").window_colours,
             WindowColours::Theme
         );
         assert_eq!(
