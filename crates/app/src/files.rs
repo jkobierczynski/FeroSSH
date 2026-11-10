@@ -443,8 +443,8 @@ pub fn split_at(a: Arrange, area: Rect, gap: i32, pos: i32) -> u8 {
     };
     let room = (along - gap).max(1);
     let first = (pos - start - gap / 2).clamp(0, room);
+    // The first (left or top) block's share, whichever list it shows.
     let pct = (first * 100 / room) as u8;
-    let pct = if a.swapped { 100 - pct } else { pct };
     pct.clamp(MIN_SPLIT, 100 - MIN_SPLIT)
 }
 
@@ -576,7 +576,17 @@ mod tests {
         assert_eq!(split_at(a, area, 10, 0), MIN_SPLIT);
         assert_eq!(split_at(a, area, 10, 400), 100 - MIN_SPLIT);
         let swapped = Arrange { swapped: true, ..a };
-        assert_eq!(split_at(swapped, area, 10, 105), 75);
+        // The split is the left block's share, whichever list it shows.
+        assert_eq!(split_at(swapped, area, 10, 105), 25);
+        let (_, gap, _) = arrange(
+            Arrange {
+                split: 25,
+                ..swapped
+            },
+            area,
+            10,
+        );
+        assert_eq!(gap.x + gap.w / 2, 105);
     }
 
     #[test]
