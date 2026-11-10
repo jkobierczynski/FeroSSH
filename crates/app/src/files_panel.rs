@@ -122,11 +122,9 @@ pub enum JobOp {
 pub enum Event {
     /// List this remote folder.
     Browse(Vec<u8>),
-    /// Sync's go-back: list remote folder `path`, but only on queue `key`.
-    SyncBack {
-        key: Option<String>,
-        path: Vec<u8>,
-    },
+    /// Sync's go-back: list its remote folder, but only while the view
+    /// still shows its queue and connection.
+    SyncBack(files::SyncBack),
     Home,
     Refresh,
     /// Download these entries of the listed remote folder into `into`.
@@ -1303,13 +1301,11 @@ pub fn set_view(view: View) {
                 // queue; the line says how that went once it has.
                 let back = files::SyncBack {
                     key: p.key,
+                    alias: view.alias.clone(),
                     path: p.back,
                 };
                 with(|s| s.going_back = Some(back.clone()));
-                emit(Event::SyncBack {
-                    key: back.key,
-                    path: back.path,
-                });
+                emit(Event::SyncBack(back));
                 local_problem(
                     "Sync browsing: the Local folder did not open, so Remote is going back to where it was.".into(),
                 );

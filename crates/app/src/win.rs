@@ -11898,13 +11898,14 @@ impl Window {
                 }
                 None
             }
-            Event::SyncBack { key: on, path } => {
-                // Only on the queue it left: the view may have moved on.
-                if on == key
+            Event::SyncBack(back) => {
+                // Only for the queue and connection it left: the view may
+                // have moved on, even to another connection on the queue.
+                if back.applies(key.as_deref(), self.files_alias().as_deref())
                     && let Some(r) = key.as_ref().and_then(|k| self.sftp.get_mut(k))
                 {
                     r.notice = None;
-                    r.browse(&path);
+                    r.browse(&back.path);
                 }
                 None
             }

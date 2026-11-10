@@ -574,11 +574,21 @@ pub fn sync_step(
 }
 
 /// A Sync move whose Local half failed: the Remote list is going back to
-/// `path` on queue `key`.
+/// `path` on queue `key`, for connection `alias`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SyncBack {
     pub key: Option<String>,
+    pub alias: Option<String>,
     pub path: Vec<u8>,
+}
+
+impl SyncBack {
+    /// Whether the go-back still belongs to the Remote list showing queue
+    /// `key` for connection `alias`: another connection on the same queue
+    /// has its own folder.
+    pub fn applies(&self, key: Option<&str>, alias: Option<&str>) -> bool {
+        self.key.as_deref() == key && self.alias.as_deref() == alias
+    }
 }
 
 /// Where a Remote go-back stands after a new view of the Remote list.
@@ -634,8 +644,15 @@ mod tests {
     fn sync_go_back_reports_how_it_went() {
         let back = SyncBack {
             key: Some("k".into()),
+            alias: Some("a".into()),
             path: b"/srv".to_vec(),
         };
+        assert!(back.applies(Some("k"), Some("a")));
+        assert!(
+            !back.applies(Some("k"), Some("b")),
+            "another connection on the queue"
+        );
+        assert!(!back.applies(Some("other"), Some("a")));
         let step =
             |key, alias, loading, dir: &[u8], err| back_step(&back, key, alias, loading, dir, err);
         assert_eq!(
