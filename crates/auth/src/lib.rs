@@ -11,6 +11,7 @@
 pub mod agent;
 pub mod broker;
 pub mod keyfile;
+pub mod keygen;
 pub mod sk;
 pub mod userauth;
 #[cfg(windows)]

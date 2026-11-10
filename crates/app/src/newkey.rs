@@ -93,12 +93,236 @@ pub fn make(
         comment,
     )
     .map_err(|e| explain(key, e))?;
-    let write = |p: &Path, text: &str| {
-        std::fs::write(p, text).map_err(|e| format!("cannot write {}: {e}", p.display()))
-    };
-    write(&key.path, &enrolled.private)?;
-    write(&public_path, &enrolled.public)?;
+    make_dir(&key.path)?;
+    write_new(&key.path, enrolled.private.as_bytes(), true)?;
+    if let Err(e) = write_new(&public_path, enrolled.public.as_bytes(), false) {
+        let _ = std::fs::remove_file(&key.path);
+        return Err(e);
+    }
     Ok(enrolled.public.trim_end().to_owned())
+}
+
+/// Makes the folder `path` goes in when it is missing.
+fn make_dir(path: &Path) -> Result<(), String> {
+    match path.parent().filter(|d| !d.as_os_str().is_empty()) {
+        Some(dir) => {
+            std::fs::create_dir_all(dir).map_err(|e| format!("cannot make {}: {e}", dir.display()))
+        }
+        None => Ok(()),
+    }
+}
+
+/// Writes a new file, never over an old one.
+/// A `private` one only its owner (and SYSTEM and Administrators, as
+/// `ssh-keygen` on Windows leaves it) can read, from the start, whatever
+/// the folder lets others do: OpenSSH refuses a key others can read.
+fn write_new(p: &Path, text: &[u8], private: bool) -> Result<(), String> {
+    use std::io::Write;
+    let mut f = match private {
+        true => create_private(p),
+        false => std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(p),
+    }
+    .map_err(|e| format!("cannot write {}: {e}", p.display()))?;
+    f.write_all(text)
+        .map_err(|e| format!("cannot write {}: {e}", p.display()))
+}
+
+#[cfg(windows)]
+#[allow(unsafe_code)]
+fn create_private(p: &Path) -> std::io::Result<std::fs::File> {
+    use std::os::windows::ffi::OsStrExt;
+    use std::os::windows::io::FromRawHandle;
+    use windows::Win32::Foundation::{HLOCAL, LocalFree};
+    use windows::Win32::Security::Authorization::{
+        ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
+    };
+    use windows::Win32::Security::{PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES};
+    use windows::Win32::Storage::FileSystem::{
+        CREATE_NEW, CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_GENERIC_READ, FILE_GENERIC_WRITE,
+        FILE_SHARE_NONE,
+    };
+    use windows::core::{PCWSTR, w};
+    // Protected (no inherited entries): full access for the file's owner,
+    // SYSTEM and Administrators only.
+    let mut sd = PSECURITY_DESCRIPTOR::default();
+    // SAFETY: a constant SDDL string; `sd` is freed below.
+    unsafe {
+        ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            w!("D:P(A;;FA;;;OW)(A;;FA;;;SY)(A;;FA;;;BA)"),
+            SDDL_REVISION_1,
+            &mut sd,
+            None,
+        )
+    }
+    .map_err(std::io::Error::other)?;
+    let sa = SECURITY_ATTRIBUTES {
+        nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
+        lpSecurityDescriptor: sd.0,
+        bInheritHandle: false.into(),
+    };
+    let name: Vec<u16> = p.as_os_str().encode_wide().chain(Some(0)).collect();
+    // SAFETY: a valid NUL-terminated path and security attributes that
+    // live through the call; the handle is handed to a File that owns it.
+    let made = unsafe {
+        CreateFileW(
+            PCWSTR(name.as_ptr()),
+            (FILE_GENERIC_READ | FILE_GENERIC_WRITE).0,
+            FILE_SHARE_NONE,
+            Some(&sa),
+            CREATE_NEW,
+            FILE_ATTRIBUTE_NORMAL,
+            None,
+        )
+    };
+    // SAFETY: allocated by the conversion above, used no more.
+    unsafe {
+        let _ = LocalFree(Some(HLOCAL(sd.0)));
+    }
+    let handle = made.map_err(|e| std::io::Error::from_raw_os_error(e.code().0 & 0xFFFF))?;
+    // SAFETY: a fresh handle of ours, owned by the File from here on.
+    Ok(unsafe { std::fs::File::from_raw_handle(handle.0) })
+}
+
+#[cfg(not(windows))]
+fn create_private(p: &Path) -> std::io::Result<std::fs::File> {
+    #[cfg(unix)]
+    use std::os::unix::fs::OpenOptionsExt;
+    let mut o = std::fs::OpenOptions::new();
+    o.write(true).create_new(true);
+    #[cfg(unix)]
+    o.mode(0o600);
+    o.open(p)
+}
+
+/// Makes an Ed25519 key, as `ssh-keygen -t ed25519` does, at `path`
+/// and `path.pub`, encrypted with `passphrase` unless it is empty; makes
+/// the folder when missing. Returns the public key line.
+pub fn make_ed25519(path: &Path, comment: &str, passphrase: &str) -> Result<String, String> {
+    let public_path = pub_path(path);
+    for p in [path, &public_path] {
+        if p.exists() {
+            return Err(format!("{} already exists", p.display()));
+        }
+    }
+    make_dir(path)?;
+    let pair = ferossh_auth::keygen::ed25519(comment, passphrase)?;
+    write_new(path, pair.private.as_bytes(), true)?;
+    if let Err(e) = write_new(&public_path, pair.public.as_bytes(), false) {
+        // Half a key pair is no use: take the private half away again.
+        let _ = std::fs::remove_file(path);
+        return Err(e);
+    }
+    Ok(pair.public.trim_end().to_owned())
+}
+
+/// The kinds of key Tools > New SSH key makes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Kind {
+    /// An Ed25519 key file, optionally with a passphrase.
+    File,
+    /// A FIDO2 security key or phone, ECDSA (`id_ecdsa_sk`).
+    SecurityKey,
+    /// A FIDO2 security key, Ed25519 (`id_ed25519_sk`).
+    SecurityKeyEd25519,
+    /// Windows Hello on this PC (ECDSA).
+    Hello,
+}
+
+impl Kind {
+    pub const ALL: [Kind; 4] = [
+        Kind::File,
+        Kind::SecurityKey,
+        Kind::SecurityKeyEd25519,
+        Kind::Hello,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Kind::File => "Ed25519 key file (with or without a passphrase)",
+            Kind::SecurityKey => "Security key or phone, ECDSA (ecdsa-sk)",
+            Kind::SecurityKeyEd25519 => "Security key, Ed25519 (ed25519-sk)",
+            Kind::Hello => "Windows Hello on this PC (ecdsa-sk)",
+        }
+    }
+
+    /// The file name OpenSSH and FeroSSH try without an IdentityFile.
+    pub fn file_name(self) -> &'static str {
+        match self {
+            Kind::File => "id_ed25519",
+            Kind::SecurityKey | Kind::Hello => "id_ecdsa_sk",
+            Kind::SecurityKeyEd25519 => "id_ed25519_sk",
+        }
+    }
+
+    /// Only a key file is encrypted; a security key's file holds no
+    /// secret.
+    pub fn has_passphrase(self) -> bool {
+        self == Kind::File
+    }
+}
+
+/// What the New SSH key window asks for.
+#[derive(Debug)]
+pub struct Request {
+    pub kind: Kind,
+    pub path: PathBuf,
+    pub comment: String,
+    pub passphrase: zeroize::Zeroizing<String>,
+}
+
+/// Whether the window's answers can make a key: a file name that is not
+/// taken, and the passphrase typed the same twice.
+pub fn check(kind: Kind, path: &Path, passphrase: &str, repeat: &str) -> Result<(), String> {
+    if path.as_os_str().is_empty() {
+        return Err("Choose a file for the key.".into());
+    }
+    for p in [path.to_path_buf(), pub_path(path)] {
+        if p.exists() {
+            return Err(format!(
+                "{} already exists. Choose another name.",
+                p.display()
+            ));
+        }
+    }
+    if kind.has_passphrase() && passphrase != repeat {
+        return Err("The two passphrases differ.".into());
+    }
+    Ok(())
+}
+
+/// Makes the key `request` asks for, with `authenticator` for a security
+/// key; returns the public key line.
+pub fn make_kind(authenticator: &dyn Authenticator, request: &Request) -> Result<String, String> {
+    match request.kind {
+        Kind::File => make_ed25519(&request.path, &request.comment, &request.passphrase),
+        kind => make(
+            authenticator,
+            &NewKey {
+                path: request.path.clone(),
+                algorithm: match kind {
+                    Kind::SecurityKeyEd25519 => SkAlgorithm::Ed25519,
+                    _ => SkAlgorithm::EcdsaP256,
+                },
+                hello: kind == Kind::Hello,
+            },
+            &request.comment,
+        ),
+    }
+}
+
+/// The first of `base`, `base_2`, `base_3`... in `dir` with neither the
+/// file nor its `.pub` there.
+pub fn free_name(dir: &Path, base: &str) -> PathBuf {
+    (1..1000)
+        .map(|n| match n {
+            1 => dir.join(base),
+            n => dir.join(format!("{base}_{n}")),
+        })
+        .find(|p| !p.exists() && !pub_path(p).exists())
+        .unwrap_or_else(|| dir.join(base))
 }
 
 #[cfg(test)]
@@ -171,6 +395,58 @@ mod tests {
                 .unwrap_err()
                 .contains("already exists")
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn writes_an_ed25519_key_and_never_overwrites() {
+        let dir = std::env::temp_dir().join(format!("ferossh-newkey-ed-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let ssh = dir.join(".ssh");
+        let path = free_name(&ssh, "id_ed25519");
+        assert_eq!(path, ssh.join("id_ed25519"));
+        let line = make_ed25519(&path, "me@pc", "pw").unwrap();
+        assert!(line.starts_with("ssh-ed25519 ") && line.ends_with(" me@pc"));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o600);
+        }
+        let kf = KeyFile::load(&path).unwrap();
+        assert!(kf.is_encrypted());
+        kf.sign(Some("pw"), b"data").unwrap();
+        assert!(
+            make_ed25519(&path, "me@pc", "")
+                .unwrap_err()
+                .contains("already exists")
+        );
+        assert_eq!(free_name(&ssh, "id_ed25519"), ssh.join("id_ed25519_2"));
+        // The window's checks.
+        assert!(
+            check(Kind::File, &path, "a", "a")
+                .unwrap_err()
+                .contains("already exists")
+        );
+        let other = ssh.join("other");
+        assert!(
+            check(Kind::File, &other, "a", "b")
+                .unwrap_err()
+                .contains("differ")
+        );
+        assert!(check(Kind::Hello, &other, "a", "b").is_ok());
+        assert!(check(Kind::File, Path::new(""), "", "").is_err());
+        let line = make_kind(
+            &SoftAuthenticator::new(),
+            &Request {
+                kind: Kind::SecurityKeyEd25519,
+                path: ssh.join("sub").join(Kind::SecurityKeyEd25519.file_name()),
+                comment: "me@pc".into(),
+                passphrase: String::new().into(),
+            },
+        )
+        .unwrap();
+        assert!(line.starts_with("sk-ssh-ed25519@openssh.com "), "{line}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -294,6 +294,11 @@ pub fn apply(main: HWND, c: UiColours) {
     }
 }
 
+/// A popup window's title bar in the colours in use.
+pub fn popup_frame(hwnd: HWND) {
+    title_bar(hwnd, &colours());
+}
+
 /// The title bar: dark or light, and on Windows 11 the menu bar's colour.
 fn title_bar(main: HWND, c: &UiColours) {
     let set = |attr: DWMWINDOWATTRIBUTE, value: u32| {

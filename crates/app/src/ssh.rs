@@ -254,7 +254,7 @@ impl Target {
             .collect();
         // Like ssh: the default keys only when the config names none.
         if key_files.is_empty() {
-            for name in ["id_ed25519", "id_ecdsa", "id_ecdsa_sk", "id_ed25519_sk"] {
+            for name in DEFAULT_KEYS {
                 key_files.push(KeyFileSpec {
                     path: env.home.join(".ssh").join(name),
                     explicit: false,
@@ -572,6 +572,10 @@ fn is_password_prompt(kind: PromptKind, fields: &[PromptField]) -> bool {
         _ => false,
     }
 }
+
+/// The key files in `~/.ssh` tried, in order, when the config names
+/// none, as OpenSSH does.
+pub const DEFAULT_KEYS: [&str; 4] = ["id_ed25519", "id_ecdsa", "id_ecdsa_sk", "id_ed25519_sk"];
 
 /// Server-supplied text made safe to show: printable characters, tabs and
 /// line breaks only, so a banner cannot send escape sequences to the

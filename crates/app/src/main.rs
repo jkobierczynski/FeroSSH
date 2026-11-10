@@ -46,6 +46,8 @@ mod form_view;
 #[cfg(windows)]
 mod fwd_panel;
 #[cfg(windows)]
+mod keygen_view;
+#[cfg(windows)]
 mod live_panel;
 #[cfg(windows)]
 mod native;
@@ -60,6 +62,8 @@ mod script_report;
 #[cfg(windows)]
 mod scripts_panel;
 // Platform-neutral, tested everywhere; only the Windows build uses them.
+#[cfg_attr(not(windows), allow(dead_code))]
+mod copy_id;
 #[cfg_attr(not(windows), allow(dead_code))]
 mod edit_local;
 #[cfg_attr(not(windows), allow(dead_code))]
