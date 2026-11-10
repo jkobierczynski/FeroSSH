@@ -24,6 +24,7 @@ A new host shows its SHA-256 fingerprint; check it before you type `yes`. A chan
 - Private keys stay in the Windows OpenSSH agent, Pageant, a FIDO2 security key or passkey, or a key file you choose. Key file passphrases are asked for each time and never kept.
 - FeroSSH never stores a password itself. A saved connection can take its password from Windows Credential Manager, a password manager's command line tool or a command of your own, and FeroSSH asks before running such a command the first time.
 - Imports from other clients never bring passwords over.
+- Agent forwarding is off unless a host turns it on (`ForwardAgent yes` or *Fwd agent*). Then the sandboxed worker reads the agent protocol and passes on only two requests, the list of keys and a signature, and FeroSSH asks you before every signature, naming the host a login is for. Signatures that are not an SSH login or an SSH signature (`ssh-keygen -Y`, git) are refused, and so is SHA-1 RSA. Only the agent's keys are offered, never your key files.
 - Logs never contain passwords or passphrases.
 
 ## Crypto
