@@ -118,7 +118,7 @@ Secrets are never written to a FeroSSH file. The first time, the pane asks for t
 
 ## Scripts
 
-Ctrl+Shift+Space (Tools > Scripts) lists named command lines, grouped under their categories, with each script's hotkey, auto-response text and first line, and the selected script's lines under the list. Type in the search box (or just start typing in the list) to search names, categories and lines, then Enter, a double click or Run types the script with Enter after each line, or Shift+Enter leaves the last line for you to finish. Left and Right jump between categories, and a right click offers the same as the buttons. With broadcast input on, it goes to every broadcast pane, so one script works several terminals at once.
+Ctrl+Shift+Space (Tools > Scripts) lists named command lines, grouped under their categories, with each script's hotkey, auto-response text and first line, and the selected script's lines under the list. Type in the search box (or just start typing in the list) to search names, categories and lines, then Enter, a double-click or Run types the script with Enter after each line, or Shift+Enter leaves the last line for you to finish. Left and Right jump between categories, and a right click offers the same as the buttons. With broadcast input on, it goes to every broadcast pane, so one script works several terminals at once.
 
 Insert or New adds a script (what you typed as a search becomes its name), F2 or Edit edits one, Del or Delete removes one, and F5 or On hosts runs it on saved hosts you pick. Edit > Save selection as script starts one from text selected in a pane.
 

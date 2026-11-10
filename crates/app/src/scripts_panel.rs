@@ -879,11 +879,14 @@ fn context_menu(h: Handles, lparam: LPARAM) {
         let Some(row) = row else {
             return;
         };
+        // The same row if it is still there, else one of that name in
+        // that category.
         let again = with(|s| {
-            s.rows
-                .as_ref()?
-                .iter()
-                .position(|r| r.name == row.name && r.category == row.category)
+            let rows = s.rows.as_ref()?;
+            rows.iter().position(|r| *r == row).or_else(|| {
+                rows.iter()
+                    .position(|r| r.name == row.name && r.category == row.category)
+            })
         })
         .flatten();
         let Some(i) = again else {

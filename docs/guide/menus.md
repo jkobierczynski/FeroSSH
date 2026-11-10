@@ -228,7 +228,7 @@ The arrow buttons between the lists move the selection across, and the gap betwe
 | Key | Action |
 | --- | --- |
 | Typing | Searches names, categories and lines (in the list it goes to the search box; Up and Down there move in the list). |
-| Enter, double click | Types the script, with Enter after each line. |
+| Enter, double-click | Types the script, with Enter after each line. |
 | Shift+Enter | Types it but leaves the last line for you to finish. |
 | Left / Right | Jumps to the previous or next category. |
 | Insert | New script (the search text becomes its name; it goes in the selected script's category). |

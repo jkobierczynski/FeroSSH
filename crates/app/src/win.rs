@@ -6734,7 +6734,7 @@ impl Window {
             let all = &self.settings.snippets;
             scripts_panel::set_view(
                 self.snippets_view.native_rows(all),
-                self.snippets_view.native_selected(),
+                self.snippets_view.native_selected(all),
                 self.snippets_view.filter(),
                 all.len(),
             );

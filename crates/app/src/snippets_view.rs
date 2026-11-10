@@ -598,8 +598,9 @@ impl SnippetsView {
     }
 
     /// The selected script's place among [`Self::native_rows`].
-    pub fn native_selected(&self) -> usize {
-        self.selected
+    /// Kept within the shown ones: a delete may leave it past the end.
+    pub fn native_selected(&self, all: &[Snippet]) -> usize {
+        self.selected.min(self.shown(all).len().saturating_sub(1))
     }
 
     /// Selects the script at `pos` among the shown ones.
@@ -1873,14 +1874,17 @@ mod tests {
         // A filter keeps the matches and selects the first.
         v.set_filter("config");
         assert_eq!(v.filter(), "config");
-        assert_eq!(v.native_selected(), 0);
+        assert_eq!(v.native_selected(&all), 0);
         let rows = v.native_rows(&all);
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].name, "Save config");
         // The same filter again leaves the selection.
         v.select(0);
         v.set_filter("config");
-        assert_eq!(v.native_selected(), 0);
+        assert_eq!(v.native_selected(&all), 0);
+        // A selection past the shown ones comes back to the last.
+        v.select(5);
+        assert_eq!(v.native_selected(&all), 0);
         // Escape with a filter clears it; then it leaves.
         v.key(SideKey::Escape, &all, 20);
         assert_eq!(v.filter(), "");
