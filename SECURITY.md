@@ -103,7 +103,9 @@ request, and for half an hour per parser every night.
   `%LOCALAPPDATA%\FeroSSH\approved-proxy-commands.txt`). The program
   carries the SSH connection, so it sees what any network hop sees: the
   server's version line and the key exchange in the clear, then only
-  encrypted bytes. It never gets your keys or passwords.
+  encrypted bytes; SSH sends it none of your keys or passwords. It still
+  runs as you, so it can read any file you can, keys included: allow
+  only commands you trust.
 - A jump host sees which host and port you connect to through it, and
   can refuse or cut that stream, as with OpenSSH.
 - Release exes from v1.0.0-rc2 on are signed on the maintainer's PC (a
