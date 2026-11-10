@@ -1,0 +1,15096 @@
+//! The Win32 window, menu, input and message loop.
+//!
+//! The window holds tabs, each a tree of split panes (see [`crate::layout`]).
+//! A window opens with one tab and one pane; the tab strip appears with the
+//! second tab, and the side pane (the connection manager, or file transfer)
+//! only when asked for. Each pane has its own terminal, host, log, font and
+//! colour theme.
+
+// Win32 calls are FFI; each unsafe block below is a direct, documented API call.
+#![allow(unsafe_code)]
+
+use std::cell::{Cell as StdCell, RefCell};
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::ffi::c_void;
+use std::fs::File;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
+
+use ferossh_auth::Broker;
+use ferossh_config::hotkey::Hotkey;
+use ferossh_config::import::{self, Client};
+use ferossh_config::login::{self, Place, Snippet, Step};
+use ferossh_config::password::{self as pw_source, PasswordSource};
+use ferossh_config::record::Recorder;
+use ferossh_config::saved::{self, SavedHost};
+use ferossh_config::serial::{self, SerialTarget};
+use ferossh_config::settings::{DEFAULT_DESKTOP_PORT, DEFAULT_VNC_PORT};
+use ferossh_config::snippet_import::{self, SnippetClient};
+use ferossh_config::snippet_store;
+use ferossh_config::trigger::{Fire, Watch};
+use ferossh_config::{
+    ForwardSpec, SessionKind, Settings, WindowColours, mobaxterm, mremoteng, putty, securecrt,
+    ssh_config, winscp,
+};
+use ferossh_forward::x11::{Display, find_cookie, xauth_entries};
+use ferossh_ipc::{ChannelId, DirEntry, FORWARD_IDS, Message, SftpReply, X11Auth};
+use ferossh_render::{
+    CellMetrics, Cursor, FontSpec, Frame, Grid, PaneView, PixelRect, Renderer, Rgb, Theme,
+    ThemeGroup,
+};
+use ferossh_sftp::{Remote, names};
+use ferossh_term::{
+    Action, Clock, Key, LogWriter, Mods, MouseButton, MouseEvent, SelectionKind,
+    Settings as TermSettings, Terminal, WorkingDir, chain, check_link, clipboard_preview,
+    log_file_name, prompt_dir,
+};
+use windows::Win32::Foundation::E_FAIL;
+use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, SIZE, WPARAM};
+use windows::Win32::Graphics::Gdi::{
+    BeginPaint, EndPaint, InvalidateRect, LOGFONTW, PAINTSTRUCT, ScreenToClient,
+};
+use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows::Win32::System::SystemInformation::GetLocalTime;
+use windows::Win32::UI::Controls::Dialogs::{
+    GetOpenFileNameW, OFN_ALLOWMULTISELECT, OFN_EXPLORER, OFN_FILEMUSTEXIST, OFN_NOCHANGEDIR,
+    OFN_PATHMUSTEXIST, OPENFILENAMEW,
+};
+use windows::Win32::UI::HiDpi::{
+    AdjustWindowRectExForDpi, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, GetDpiForWindow,
+    SetProcessDpiAwarenessContext,
+};
+use windows::Win32::UI::Input::Ime::{
+    CANDIDATEFORM, CFS_CANDIDATEPOS, CFS_POINT, COMPOSITIONFORM, ImmGetContext, ImmReleaseContext,
+    ImmSetCandidateWindow, ImmSetCompositionFontW, ImmSetCompositionWindow,
+};
+use windows::Win32::UI::Input::KeyboardAndMouse::{
+    GetDoubleClickTime, GetKeyState, HOT_KEY_MODIFIERS, MAPVK_VK_TO_CHAR, MAPVK_VSC_TO_VK,
+    MOD_NOREPEAT, MapVirtualKeyW, RegisterHotKey, ReleaseCapture, SetCapture, SetFocus,
+    UnregisterHotKey, VIRTUAL_KEY, VK_ADD, VK_BACK, VK_CAPITAL, VK_CONTROL, VK_DELETE, VK_DOWN,
+    VK_END, VK_ESCAPE, VK_F1, VK_F2, VK_F3, VK_F4, VK_F5, VK_F12, VK_HOME, VK_INSERT, VK_LEFT,
+    VK_LWIN, VK_MENU, VK_NEXT, VK_NUMPAD0, VK_OEM_2, VK_OEM_MINUS, VK_OEM_PLUS, VK_PRIOR,
+    VK_RETURN, VK_RIGHT, VK_RWIN, VK_SHIFT, VK_SPACE, VK_SUBTRACT, VK_TAB, VK_UP,
+};
+use windows::Win32::UI::Shell::{
+    DragAcceptFiles, DragFinish, DragQueryFileW, DragQueryPoint, HDROP, ShellExecuteW,
+};
+use windows::Win32::UI::WindowsAndMessaging::{
+    AppendMenuW, CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT, CheckMenuItem, CheckMenuRadioItem,
+    CreateMenu, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyMenu, DestroyWindow,
+    DispatchMessageW, EnableMenuItem, FLASHW_TIMERNOFG, FLASHW_TRAY, FLASHWINFO, FlashWindowEx,
+    GetClientRect, GetCursorPos, GetForegroundWindow, GetMenuItemCount, GetMenuItemID,
+    GetMenuState, GetMenuStringW, GetMessageW, GetSubMenu, HCURSOR, HMENU, HTCLIENT, IDC_ARROW,
+    IDC_IBEAM, IDC_SIZEALL, IDC_SIZENS, IDC_SIZEWE, IDOK, IDYES, IsIconic, IsWindowVisible,
+    KillTimer, LoadCursorW, LoadIconW, MB_DEFBUTTON2, MB_ICONERROR, MB_ICONINFORMATION,
+    MB_ICONQUESTION, MB_ICONWARNING, MB_OK, MB_OKCANCEL, MB_YESNO, MESSAGEBOX_RESULT,
+    MESSAGEBOX_STYLE, MF_BYCOMMAND, MF_BYPOSITION, MF_CHECKED, MF_DISABLED, MF_GRAYED,
+    MF_MENUBARBREAK, MF_POPUP, MF_SEPARATOR, MF_STRING, MF_UNCHECKED, MSG, MessageBoxW,
+    ModifyMenuW, PM_REMOVE, PeekMessageW, PostMessageW, PostQuitMessage, RegisterClassW,
+    SIZE_MINIMIZED, SW_HIDE, SW_RESTORE, SW_SHOW, SW_SHOWNORMAL, SWP_NOACTIVATE, SWP_NOMOVE,
+    SWP_NOZORDER, SetCursor, SetForegroundWindow, SetMenu, SetTimer, SetWindowPos, SetWindowTextW,
+    ShowWindow, TPM_NONOTIFY, TPM_RETURNCMD, TrackPopupMenu, TranslateMessage, WINDOW_EX_STYLE,
+    WINDOW_STYLE, WM_APP, WM_CHAR, WM_CLIPBOARDUPDATE, WM_CLOSE, WM_COMMAND, WM_DEADCHAR,
+    WM_DESTROY, WM_DPICHANGED, WM_DROPFILES, WM_ERASEBKGND, WM_GETDPISCALEDSIZE, WM_HOTKEY,
+    WM_IME_COMPOSITION, WM_IME_STARTCOMPOSITION, WM_KEYDOWN, WM_KEYUP, WM_KILLFOCUS,
+    WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL,
+    WM_PAINT, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SETCURSOR, WM_SETFOCUS, WM_SETTINGCHANGE, WM_SIZE,
+    WM_SYSCHAR, WM_SYSCOLORCHANGE, WM_SYSDEADCHAR, WM_SYSKEYDOWN, WM_SYSKEYUP, WM_TIMER, WNDCLASSW,
+    WS_CLIPCHILDREN, WS_EX_APPWINDOW, WS_OVERLAPPEDWINDOW,
+};
+use windows::Win32::UI::WindowsAndMessaging::{DeleteMenu, ShowWindowAsync, WM_INITMENUPOPUP};
+use windows::core::{HSTRING, PCWSTR, PWSTR, Result, w};
+
+use crate::Launch;
+use crate::batch::{self, PickHost, Picker, Report, ReportRow, RowState, Run};
+use crate::broadcast;
+use crate::clipboard;
+use crate::conn_view;
+use crate::conpty::{self, Output, Shell};
+use crate::credman;
+use crate::desktop::{Desktop, Protocol, Update as DesktopUpdate};
+use crate::files::{self, Arrange, Follow};
+use crate::files_panel;
+use crate::form_view;
+use crate::forwards::{
+    ConnView, DesktopEvent, Forwarder, FwdView, Setup as ForwardSetup, desktop_port_for,
+};
+use crate::fwd_panel;
+use crate::fwdview::{ForwardsView, FwdAction};
+use crate::import_reg;
+use crate::import_view::{Found, ImportAction, ImportView, Items};
+use crate::layout::{self, Axis, Closed, Dir, Drop, PaneId, Rect, Workspace};
+use crate::link::{Link, LinkEvent};
+use crate::live::{self, LiveAction, LiveSession, LiveState, LiveView};
+use crate::live_panel;
+use crate::login_script::{self, Need, Outcome, Runner};
+use crate::look;
+use crate::palette::{self, CommandPalette, PalAction};
+use crate::pattern;
+use crate::proxycmd::ProxyRun;
+use crate::pwcommand;
+use crate::rail;
+use crate::reconnect::{self, Next, Retry};
+use crate::same_dir;
+use crate::sandbox;
+use crate::script_args;
+use crate::script_editor;
+use crate::script_hosts;
+use crate::script_report;
+use crate::scripts_panel;
+use crate::scrollmark;
+use crate::serial_port::{Output as SerialOutput, SerialPort};
+use crate::session_form::{self, FormAction, Hints, SessionForm, Source, Values};
+use crate::sessions::{HostItem, SessionList, SideAction, SideKey};
+use crate::snippets_view::{self, SnipAction, SnippetsView, Vars};
+use crate::ssh::{Effect, Env, ProxyCommand, SshSession, State, Target};
+use crate::standby::{self, Capture, Picked, Standby, Toggle};
+use crate::tabstrip::{self, Forwarding, Health, Hit, Palette, StripLayout, TabLabel};
+use crate::telnet::{TelnetSession, TelnetTarget};
+use crate::tmux::{self, Mode as TmuxMode, Tmux};
+use crate::tmux_keys::{self, Action as TmuxKey};
+use crate::toolpane::{self, RailItem};
+use crate::ui_colours::{self, UiColours};
+use crate::ui_theme;
+use crate::vdesk;
+use crate::zmodem;
+use ferossh_tmuxcc::saved as tmux_saved;
+use zeroize::Zeroizing;
+
+const DEFAULT_COLS: usize = 80;
+const DEFAULT_ROWS: usize = 24;
+/// Space between a pane's edge and its grid, in DIPs.
+const PADDING_DIP: i32 = 4;
+/// The scroll mark's width, its gap to the pane's right edge and its
+/// shortest length, in DIPs. Width plus gap stays inside the padding.
+const MARK_WIDTH_DIP: i32 = 3;
+const MARK_INSET_DIP: i32 = 1;
+const MARK_MIN_DIP: i32 = 12;
+/// Space around the tab strip's and side pane's text, in DIPs.
+const CHROME_PADDING_DIP: i32 = 3;
+/// Extra pixels either side of a divider that still grab it, in DIPs.
+const GRAB_DIP: i32 = 3;
+/// How far either side of the tools pane's edge a drag can start; wider
+/// than a divider's, as the edge is a long target used often.
+const EDGE_GRAB_DIP: i32 = 8;
+/// The side pane's width when first shown, in chrome cells.
+const SIDE_COLS: i32 = 34;
+/// The side pane font size.
+const CHROME_PT: f32 = 10.5;
+/// The tab strip font size.
+const STRIP_PT: f32 = 10.5;
+/// Space above and below the tab titles, in DIPs.
+const STRIP_PAD_DIP: i32 = 6;
+/// The line over the active tab, in DIPs.
+const ACCENT_DIP: i32 = 2;
+/// How far Alt+Shift+arrow moves a divider.
+const RESIZE_STEP: f32 = 0.05;
+/// Pixels the mouse moves before a press becomes a drag.
+const DRAG_START_PX: i32 = 6;
+// Clip children: the renderer must not paint over the tools rail.
+const STYLE: WINDOW_STYLE = WINDOW_STYLE(WS_OVERLAPPEDWINDOW.0 | WS_CLIPCHILDREN.0);
+const EX_STYLE: WINDOW_EX_STYLE = WS_EX_APPWINDOW;
+const APP_NAME: &str = "FeroSSH";
+
+/// Posted by the shell's, worker link's and broker's threads when
+/// something is waiting.
+const WM_SHELL_OUTPUT: u32 = WM_APP + 1;
+/// Moves the keyboard to the connection manager's controls (wParam 1) or
+/// back to the window (0), outside any borrow of the window's state.
+const WM_TOOLS_FOCUS: u32 = WM_APP + 40;
+/// Fires when a synchronized update must be shown even though it has not
+/// ended.
+const TIMER_SYNC: usize = 1;
+/// Updates the transfer queue's progress while files move.
+const TIMER_TRANSFER: usize = 2;
+const TRANSFER_TICK_MS: u32 = 250;
+/// Gives remote desktops their pane's new size once it stops changing,
+/// so dragging a divider does not resize the desktop at every step.
+const TIMER_DESKTOP_SIZE: usize = 3;
+/// Ends the workers of connections nothing uses any more, once they had
+/// time to close them.
+const TIMER_RETIRE: usize = 4;
+/// Wakes the login scripts: an `expect` that waited too long, or a pause
+/// that ended.
+const TIMER_SCRIPT: usize = 5;
+/// Checks for SSH panes due to reconnect after a dropped connection.
+const TIMER_RECONNECT: usize = 6;
+/// Fails the hosts of a snippet run that took too long.
+const TIMER_RUN: usize = 7;
+/// Checks on saved desktop and remote app connections that open on their
+/// own (their login session goes once the desktop or app holds the
+/// connection), and on Remote Desktop Connections run through a tunnel.
+const TIMER_LAUNCH: usize = 8;
+const LAUNCH_TICK_MS: u32 = 1000;
+/// How long a launch's login session may stay hidden with nothing
+/// holding its connection before it is shown.
+const LAUNCH_WAIT: Duration = Duration::from_secs(90);
+const RECONNECT_TICK_MS: u32 = 500;
+/// How long a worker whose connection nothing uses keeps running, so its
+/// last shell's close reaches the server as a clean disconnect.
+const RETIRE_GRACE: Duration = Duration::from_secs(2);
+const DESKTOP_SIZE_MS: u32 = 300;
+/// Output processed per message before the window gets a chance to paint.
+const OUTPUT_BUDGET: usize = 1 << 20;
+/// Wheel units (120 per notch) per scrolled line: three lines a notch.
+const WHEEL_PER_LINE: i32 = 40;
+/// One wheel notch, as WM_MOUSEWHEEL counts it.
+const WHEEL_DELTA_NOTCH: i32 = 120;
+/// Characters of host-supplied text shown in a confirmation prompt.
+const PREVIEW_CHARS: usize = 400;
+
+/// Font families offered in Settings > Font. A pane's font can be any
+/// installed family; this list is only the menu. The first
+/// `WINDOWS_FONTS` ship with Windows (the Cascadias with Windows 11 and
+/// Windows Terminal); the rest are free downloads under permissive
+/// licences (OFL, Apache, MIT/Bitstream Vera). None are bundled, so the
+/// list costs the exe nothing. A missing one reads "(download)" and
+/// opens its page from `FONT_PAGES`; a missing Windows font is greyed out.
+const FONT_CHOICES: [&str; 18] = [
+    "Cascadia Mono",
+    "Cascadia Code",
+    "Consolas",
+    "Lucida Console",
+    "Courier New",
+    "DejaVu Sans Mono",
+    "Fira Code",
+    "Geist Mono",
+    "Hack",
+    "IBM Plex Mono",
+    "Inconsolata",
+    "Iosevka",
+    "JetBrains Mono",
+    "Monaspace Neon",
+    "Noto Sans Mono",
+    "Roboto Mono",
+    "Source Code Pro",
+    "Victor Mono",
+];
+/// How many of `FONT_CHOICES` come with Windows; a separator follows them.
+const WINDOWS_FONTS: usize = 5;
+/// Official download page of each free font in `FONT_CHOICES`.
+const FONT_PAGES: [(&str, &str); 13] = [
+    ("DejaVu Sans Mono", "https://dejavu-fonts.github.io/"),
+    (
+        "Fira Code",
+        "https://github.com/tonsky/FiraCode/releases/latest",
+    ),
+    (
+        "Geist Mono",
+        "https://github.com/vercel/geist-font/releases/latest",
+    ),
+    (
+        "Hack",
+        "https://github.com/source-foundry/Hack/releases/latest",
+    ),
+    (
+        "IBM Plex Mono",
+        "https://fonts.google.com/specimen/IBM+Plex+Mono",
+    ),
+    (
+        "Inconsolata",
+        "https://fonts.google.com/specimen/Inconsolata",
+    ),
+    (
+        "Iosevka",
+        "https://github.com/be5invis/Iosevka/releases/latest",
+    ),
+    ("JetBrains Mono", "https://www.jetbrains.com/lp/mono/"),
+    (
+        "Monaspace Neon",
+        "https://github.com/githubnext/monaspace/releases/latest",
+    ),
+    (
+        "Noto Sans Mono",
+        "https://fonts.google.com/noto/specimen/Noto+Sans+Mono",
+    ),
+    (
+        "Roboto Mono",
+        "https://fonts.google.com/specimen/Roboto+Mono",
+    ),
+    (
+        "Source Code Pro",
+        "https://github.com/adobe-fonts/source-code-pro/releases/latest",
+    ),
+    ("Victor Mono", "https://rubjo.github.io/victor-mono/"),
+];
+
+/// Where to download `family`, when it is one of the free fonts.
+fn font_page(family: &str) -> Option<&'static str> {
+    FONT_PAGES
+        .iter()
+        .find(|(f, _)| *f == family)
+        .map(|(_, url)| *url)
+}
+
+/// Menu command ids. Shortcuts map to the same ids.
+mod cmd {
+    pub const LOCAL_SHELL: u32 = 100;
+    pub const EXIT: u32 = 101;
+    pub const CONNECT: u32 = 102;
+    pub const RECONNECT: u32 = 103;
+    pub const DISCONNECT: u32 = 104;
+    pub const NEW_TAB: u32 = 105;
+    pub const CLOSE_PANE: u32 = 106;
+    pub const IMPORT: u32 = 107;
+    pub const UPLOAD: u32 = 108;
+    pub const DOWNLOADS: u32 = 109;
+    pub const AUTO_RECONNECT: u32 = 110;
+    pub const IMPORT_SNIPPETS: u32 = 111;
+    pub const ZOOM_IN: u32 = 200;
+    pub const ZOOM_OUT: u32 = 201;
+    pub const ZOOM_RESET: u32 = 202;
+    pub const HIDE_MENU: u32 = 203;
+    pub const TEST_PATTERN: u32 = 204;
+    pub const SESSIONS: u32 = 205;
+    pub const SIDE_RIGHT: u32 = 206;
+    pub const TAB_STRIP: u32 = 207;
+    pub const SAVE_LOOK: u32 = 208;
+    pub const FILES: u32 = 209;
+    pub const FOLLOW_CD: u32 = 210;
+    pub const FORWARDS: u32 = 211;
+    pub const SNIPPETS: u32 = 212;
+    pub const PALETTE: u32 = 213;
+    pub const LIVE: u32 = 214;
+    pub const SNIPPET_FOLDER: u32 = 215;
+    pub const TOOLS_PIN: u32 = 216;
+    pub const TOOLS_RAIL: u32 = 217;
+    /// Plus the index into `WindowColours::ALL`.
+    pub const WINDOW_COLOURS: u32 = 220;
+    /// Plus the index into `FONT_CHOICES`.
+    pub const FONT: u32 = 300;
+    /// Plus the index into `Theme::builtin()`.
+    pub const THEME: u32 = 400;
+    pub const COPY: u32 = 500;
+    pub const PASTE: u32 = 501;
+    pub const FIND: u32 = 502;
+    pub const CLEAR_SCROLLBACK: u32 = 503;
+    pub const COPY_ON_SELECT: u32 = 504;
+    pub const RIGHT_CLICK_PASTE: u32 = 505;
+    pub const SAVE_SNIPPET: u32 = 506;
+    pub const RECORD_SNIPPET: u32 = 507;
+    pub const SCROLL_PAGE_UP: u32 = 510;
+    pub const SCROLL_PAGE_DOWN: u32 = 511;
+    pub const SCROLL_TOP: u32 = 512;
+    pub const SCROLL_BOTTOM: u32 = 513;
+    pub const LOG_TOGGLE: u32 = 600;
+    pub const LOG_RAW: u32 = 601;
+    pub const LOG_FOLDER: u32 = 602;
+    pub const LOG_VERIFY: u32 = 605;
+    pub const SERIAL_BREAK: u32 = 606;
+    pub const LOG_TIMESTAMPS: u32 = 607;
+    pub const REPLACE_KEY: u32 = 603;
+    pub const VERIFY: u32 = 604;
+    pub const ZMODEM: u32 = 608;
+    pub const SAVE_PANE: u32 = 609;
+    pub const SAVE_ALL: u32 = 620;
+    pub const TMUX_KEYS: u32 = 621;
+    /// Session > Start new tabs and panes in this directory.
+    pub const START_DIR: u32 = 622;
+    /// Session > Open virtual desktop (Xvfb and x11vnc on the server).
+    pub const VDESK: u32 = 623;
+    pub const VDESK_STOP: u32 = 624;
+    pub const REMOTE_APP: u32 = 625;
+    pub const REMOTE_APP_ATTACH: u32 = 626;
+    pub const REMOTE_APP_COPY: u32 = 627;
+    pub const REMOTE_APP_REMOVE: u32 = 628;
+    /// Session > Remote apps > Clipboard: both ways, to the host, from
+    /// the host, off (a radio group, in [`crate::stream::CLIPBOARD_WAYS`] order).
+    pub const REMOTE_APP_CLIP: u32 = 629;
+    pub const REMOTE_APP_CLIP_LAST: u32 = 632;
+    /// ... > Share mouse selections from the host.
+    pub const REMOTE_APP_SELECTION: u32 = 633;
+    /// Session > Desktop clipboard: the same four ways, for remote and
+    /// virtual desktops.
+    pub const DESKTOP_CLIP: u32 = 634;
+    pub const DESKTOP_CLIP_LAST: u32 = 637;
+    /// ... > Share mouse selections from virtual desktops.
+    pub const DESKTOP_SELECTION: u32 = 638;
+    pub const TMUX_ATTACH: u32 = 610;
+    pub const TMUX_DETACH: u32 = 611;
+    pub const TMUX_PICK: u32 = 612;
+    pub const TMUX_LAYOUT: u32 = 613;
+    pub const DESKTOP: u32 = 614;
+    pub const DESKTOP_TAB: u32 = 615;
+    pub const DESKTOP_TAB_RDP: u32 = 616;
+    pub const RUN_SCRIPT: u32 = 617;
+    pub const AUTO_RESPONSES: u32 = 618;
+    pub const CONFIRM_PRODUCTION: u32 = 619;
+    /// Plus the index in the session picker's list; the one past the
+    /// last is "New connection".
+    pub const TMUX_SESSION: u32 = 800;
+    pub const SPLIT_RIGHT: u32 = 700;
+    pub const SPLIT_DOWN: u32 = 701;
+    pub const NEXT_TAB: u32 = 702;
+    pub const PREV_TAB: u32 = 703;
+    pub const TAB_LEFT: u32 = 704;
+    pub const TAB_RIGHT: u32 = 705;
+    pub const PANE_TO_TAB: u32 = 706;
+    pub const JOIN_TAB: u32 = 707;
+    /// Plus 0-3: left, right, up, down.
+    pub const FOCUS: u32 = 710;
+    /// Plus 0-3: left, right, up, down.
+    pub const RESIZE: u32 = 720;
+    pub const BROADCAST_TAB: u32 = 730;
+    pub const BROADCAST_ALL: u32 = 731;
+    pub const BROADCAST_SKIP: u32 = 732;
+    pub const CLOSE_TAB: u32 = 733;
+    pub const RENAME: u32 = 734;
+    /// Window > Standby window: the status line, on/off, pick by pressing.
+    pub const STANDBY_STATUS: u32 = 740;
+    pub const STANDBY_TOGGLE: u32 = 741;
+    pub const STANDBY_PICK: u32 = 742;
+    /// Plus the index into `standby_presets()`.
+    pub const STANDBY_PRESET: u32 = 743;
+    /// Window to show and hide: this FeroSSH window, or plus the index
+    /// into the windows listed when the menu opened.
+    pub const STANDBY_OWN: u32 = 750;
+    pub const STANDBY_TARGET: u32 = 751;
+    pub const UPDATE_CHECK: u32 = 900;
+    pub const UPDATE_WEEKLY: u32 = 901;
+    pub const ABOUT: u32 = 902;
+}
+
+const DIRS: [Dir; 4] = [Dir::Left, Dir::Right, Dir::Up, Dir::Down];
+
+/// The frame around every pane that broadcast input reaches.
+const BROADCAST_FRAME: Rgb = Rgb::new(0xe5, 0x8e, 0x26);
+
+/// Something typed in the focused pane, for the panes broadcast reaches.
+#[derive(Debug)]
+enum Typed {
+    Char(char, bool),
+    Key(Key, Mods),
+    Bytes(Vec<u8>),
+    Paste(String),
+}
+
+/// The prompt shown when no host was given.
+const CONNECT_PROMPT: &str = "\x1b[0mConnect to (user@host[:port], a Host from ~/.ssh/config, telnet://host[:port], or a COM port such as COM3:115200; Ctrl+Shift+S lists them): ";
+
+/// What a pane is connected to.
+enum Host {
+    /// Asking for a destination; the text typed so far.
+    Ask(String),
+    /// A local shell on ConPTY (`--local`); `exited` once it ended, when
+    /// Enter starts a new one.
+    Local {
+        shell: Option<Shell>,
+        exited: bool,
+    },
+    Ssh(Box<SshSession>),
+    /// A pane of the tmux session that SSH pane `gateway` runs in control
+    /// mode; `label` names the host.
+    Tmux {
+        gateway: PaneId,
+        label: String,
+    },
+    /// The built-in viewer's remote desktop (in the pane's `desktop`);
+    /// `label` names the host, and `connection` is the SSH connection the
+    /// tunnel runs on, which stays open while the desktop shows.
+    #[cfg_attr(not(feature = "viewer"), allow(dead_code))]
+    Desktop {
+        label: String,
+        connection: ChannelId,
+        /// The virtual desktop's script channel, when it shows one: it
+        /// stops with the tab.
+        vdesk: Option<ChannelId>,
+    },
+    /// A serial console; `port` is `None` once it closed, when Enter
+    /// opens it again.
+    Serial {
+        port: Option<Box<SerialPort>>,
+        target: SerialTarget,
+        /// The saved session it was opened from, for its look and login
+        /// script.
+        session: Option<String>,
+    },
+    /// An unencrypted Telnet session, run by a worker of its own.
+    Telnet(Box<TelnetSession>),
+}
+
+/// A worker process, the pipes to it, and the forwarding engine that
+/// shares them. Each SSH connection has its own, so a server that took
+/// over one worker reaches only its own connection: the shells, SFTP and
+/// forwards on it, never another host's.
+struct WorkerConn {
+    link: Link,
+    forwarder: Forwarder,
+    _process: sandbox::Worker,
+}
+
+/// Session logging for a pane: on or off, plain or raw, and the open file.
+#[derive(Default)]
+struct Logging {
+    enabled: bool,
+    raw: bool,
+    writer: Option<LogWriter<File>>,
+    path: Option<PathBuf>,
+}
+
+/// One terminal pane with its own font and colour theme.
+struct Pane {
+    id: PaneId,
+    term: Terminal,
+    /// What the renderer draws: the visible part of `term`.
+    grid: Grid,
+    cursor: Option<Cursor>,
+    host: Host,
+    log: Logging,
+    font: FontSpec,
+    theme: Theme,
+    metrics: CellMetrics,
+    /// The pane's area in the client, padding included.
+    rect: Rect,
+    /// The title the host set (OSC 0/2).
+    title: Option<String>,
+    /// The name the user gave the session (Window > Rename session), shown
+    /// instead of the title and host until cleared.
+    name: Option<String>,
+    /// A bell rang while the pane was out of sight.
+    bell: bool,
+    /// The remote working directory the shell last reported (OSC 7), or
+    /// showed in its prompt when it does not report it.
+    cwd: Option<Vec<u8>>,
+    /// The host name in the first report: reports naming another host
+    /// come from a nested `ssh` and are not this connection's.
+    cwd_host: Option<String>,
+    /// The shell reports its directory with OSC 7: prompts are not read.
+    cwd_reported: bool,
+    /// The host name in the first prompt read, as for `cwd_host`.
+    prompt_host: Option<String>,
+    /// Where the scroll mark was last drawn, so moving or hiding it can
+    /// repaint the rows it covered.
+    mark: Option<Rect>,
+    /// A remote desktop shown instead of the terminal, which then only
+    /// carries messages (the `desktop-viewer` feature).
+    desktop: Option<Box<Desktop>>,
+    /// Window > Leave this pane out of broadcast input.
+    no_broadcast: bool,
+    /// A new tab or pane opened from another: the directory its shell
+    /// goes to once logged in (after the login script, before tmux
+    /// attaches).
+    start_dir: Option<Vec<u8>>,
+    /// The folder a local shell's cmd or PowerShell prompt shows, for
+    /// new tabs and panes opened from it.
+    local_cwd: Option<String>,
+}
+
+impl Pane {
+    /// Top-left corner of cell (0, 0).
+    fn origin(&self, dpi: u32) -> (i32, i32) {
+        let pad = padding(dpi);
+        (self.rect.x + pad, self.rect.y + pad)
+    }
+
+    /// The scroll mark's place while the view is scrolled back: a thin bar
+    /// in the right padding, beside the rows, never over the text.
+    fn scroll_mark(&self, dpi: u32) -> Option<Rect> {
+        let (_, oy) = self.origin(dpi);
+        let rows = self.grid.rows();
+        let len = (rows as i32 * self.metrics.height as i32).min(self.rect.bottom() - oy);
+        let (offset, size) = scrollmark::thumb(
+            len,
+            rows,
+            self.term.history_len(),
+            self.term.display_offset(),
+            scale(MARK_MIN_DIP, dpi),
+        )?;
+        let w = scale(MARK_WIDTH_DIP, dpi).max(2);
+        let right = self.rect.right() - scale(MARK_INSET_DIP, dpi).max(1);
+        Some(Rect::new(right - w, oy + offset, w, size))
+    }
+
+    /// The scroll mark's colour: the theme's text, faded well into its
+    /// background.
+    fn mark_colour(&self) -> Rgb {
+        mix(self.theme.background, self.theme.foreground, 0.4)
+    }
+
+    /// What the tab strip and window title call this pane: the name the
+    /// user gave it, else the title the host set, else the host.
+    fn label(&self) -> String {
+        if let Some(n) = &self.name {
+            return n.clone();
+        }
+        if let Some(t) = self.title.as_deref().filter(|t| !t.is_empty()) {
+            return t.to_owned();
+        }
+        self.host_label()
+    }
+
+    /// The host this pane is (or was) connected to, whatever title it set.
+    fn host_label(&self) -> String {
+        match &self.host {
+            Host::Ssh(s) => s.target.label(),
+            Host::Local { .. } => "local".to_owned(),
+            Host::Ask(_) => "new tab".to_owned(),
+            Host::Tmux { label, .. } | Host::Desktop { label, .. } => label.clone(),
+            Host::Serial { target, .. } => target.label(),
+            Host::Telnet(s) => s.target.label(),
+        }
+    }
+
+    /// The remote desktop's picture, while it shows.
+    fn image(&self) -> Option<ferossh_render::Image<'_>> {
+        self.desktop.as_ref()?.image(u64::from(self.id))
+    }
+
+    fn health(&self) -> Health {
+        match &self.host {
+            Host::Ssh(s) => match s.state() {
+                State::Connected => Health::Connected,
+                State::Connecting => Health::Connecting,
+                State::Blocked | State::Ended => Health::Idle,
+            },
+            Host::Telnet(s) => match s.state() {
+                State::Connected => Health::Connected,
+                State::Connecting => Health::Connecting,
+                State::Blocked | State::Ended => Health::Idle,
+            },
+            // tmux panes exist only while the gateway is logged in.
+            Host::Tmux { .. } | Host::Serial { port: Some(_), .. } => Health::Connected,
+            _ => Health::Idle,
+        }
+    }
+
+    fn connected(&self) -> bool {
+        matches!(&self.host, Host::Ssh(s) if s.state() == State::Connected)
+            || matches!(self.host, Host::Tmux { .. })
+    }
+
+    /// The SSH pane carrying a tmux pane.
+    fn gateway(&self) -> Option<PaneId> {
+        match self.host {
+            Host::Tmux { gateway, .. } => Some(gateway),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Default)]
+struct Mouse {
+    /// The pane that got the button press and gets the motion until it is
+    /// released.
+    pane: Option<PaneId>,
+    /// The button held while the host receives mouse reports.
+    reporting: Option<MouseButton>,
+    /// A left-button selection is being dragged.
+    selecting: bool,
+    /// The cell of the last motion report.
+    last_cell: Option<(usize, usize)>,
+    /// Time, cell and count of the last left click, for double and triple
+    /// clicks.
+    last_click: Option<(Instant, (usize, usize), u8)>,
+    /// Wheel movement not yet worth a line.
+    wheel_rest: i32,
+    /// The last point seen in the client, for the mouse cursor shape.
+    at: (i32, i32),
+}
+
+/// What a mouse drag moves.
+enum Drag {
+    /// A split divider in the active tab.
+    Divider {
+        path: Vec<bool>,
+        axis: Axis,
+        span: Rect,
+    },
+    /// The side pane's edge.
+    SideEdge,
+    /// A tab in the strip. Dragged below the strip (`out`), the window
+    /// shows the tab with pane `home` instead, and dropping on one of its
+    /// panes merges the dragged tab in there.
+    Tab {
+        index: usize,
+        home: Option<PaneId>,
+        out: bool,
+    },
+    /// A pane (Ctrl+Shift+drag): `start` is where the press was; `active`
+    /// once it moved far enough.
+    Pane {
+        id: PaneId,
+        start: (i32, i32),
+        active: bool,
+    },
+}
+
+/// What the side pane shows.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SideView {
+    Sessions,
+    Files,
+    Forwards,
+    Snippets,
+    /// The session manager: the sessions open now.
+    Live,
+    /// The command palette, shown over whatever the side pane showed.
+    Palette,
+}
+
+/// The side pane: the connection manager, file transfer or the forwards.
+struct Side {
+    visible: bool,
+    view: SideView,
+    /// Has the keyboard.
+    focused: bool,
+    list: SessionList,
+    /// The session form, shown in place of the list while open.
+    form: Option<SessionForm>,
+    /// The import page, likewise.
+    import: Option<ImportView>,
+    grid: Grid,
+    /// Width in pixels, edge excluded; 0 until first shown.
+    width: i32,
+    /// How much of it shows (pixels): the terminal covers the rest.
+    shown: i32,
+    /// Last click time and row, for double clicks.
+    last_click: Option<(Instant, usize)>,
+}
+
+/// The parts of the client area.
+#[derive(Clone, Copy, Debug, Default)]
+struct Areas {
+    /// The tools rail (a child window of its own).
+    rail: Option<Rect>,
+    /// The part of the side pane the terminal leaves uncovered; its grid
+    /// starts at its left and is `side_width` wide.
+    side: Option<Rect>,
+    side_width: i32,
+    side_edge: Option<Rect>,
+    strip: Option<Rect>,
+    panes: Rect,
+}
+
+struct Window {
+    hwnd: HWND,
+    /// Window > Standby window: the global hotkey this window holds.
+    standby: Standby,
+    renderer: Renderer,
+    dpi: u32,
+    client: (i32, i32),
+    ws: Workspace,
+    panes: HashMap<PaneId, Pane>,
+    areas: Areas,
+    strip_grid: Grid,
+    strip_layout: StripLayout,
+    side: Side,
+    chrome_font: FontSpec,
+    chrome_metrics: CellMetrics,
+    strip_font: FontSpec,
+    strip_metrics: CellMetrics,
+    menu: HMENU,
+    menu_visible: bool,
+    focused: bool,
+    /// Repaint everything on the next WM_PAINT, not only dirty rows.
+    full_redraw: bool,
+    high_surrogate: Option<u16>,
+    /// The tmux prefix was typed in this pane: the next key is a tmux
+    /// window or pane key (Session > Use tmux keybindings).
+    tmux_armed: Option<PaneId>,
+    /// A repeatable tmux key (an arrow, PageUp) was just used: until this
+    /// time, more of them work without the prefix, as with tmux's `bind
+    /// -r` and `repeat-time`.
+    tmux_repeat: Option<Instant>,
+    /// The pane focused before, in another tab and in the same tab, for
+    /// tmux's `l` and `;`.
+    last_tab_pane: Option<PaneId>,
+    last_pane: Option<PaneId>,
+    mouse: Mouse,
+    drag: Option<Drag>,
+    /// The last left click on a tab: when, and which, for double-clicks.
+    tab_click: Option<(Instant, usize)>,
+    /// What the side pane showed before a rename opened the session
+    /// manager (`None` inside: hidden), to go back to once it is done.
+    rename_return: Option<Option<SideView>>,
+    settings: Settings,
+    /// The theme panes start with (`--theme`, or Nord).
+    default_theme: Theme,
+    /// The command line the local shell runs.
+    command: String,
+    /// Run the worker in the AppContainer (off only with `--no-sandbox`).
+    sandbox: bool,
+    /// The worker of each SSH connection, by the connection's id (the
+    /// channel of the shell that logged in).
+    workers: HashMap<ChannelId, WorkerConn>,
+    /// Workers whose connection nothing uses any more, with when that was;
+    /// they end after [`RETIRE_GRACE`].
+    retiring: Vec<(WorkerConn, Instant)>,
+    /// The jump hosts' connections each connection goes through: their
+    /// workers run as long as it is in use.
+    via: HashMap<ChannelId, Vec<ChannelId>>,
+    /// The `ProxyCommand` each connection runs over, by the connection.
+    proxies: HashMap<ChannelId, ProxyRun>,
+    broker: Option<Broker>,
+    /// The channel of each job handed to the broker, oldest first. The
+    /// broker answers in order, so each reply goes to the front one.
+    broker_jobs: VecDeque<ChannelId>,
+    /// The channel id of the next SSH shell.
+    next_channel: u32,
+    /// Set while a WM_SHELL_OUTPUT is queued, so the background threads
+    /// post one message per batch rather than one per read.
+    output_pending: Arc<AtomicBool>,
+    /// SFTP and the transfer queue, per `user@host:port`.
+    sftp: HashMap<String, Remote>,
+    /// The connection each SFTP channel was opened on, so that what the
+    /// queues send goes to that connection's worker (a closing channel's
+    /// queue has already let go of it).
+    sftp_routes: HashMap<ChannelId, ChannelId>,
+    /// The host the file view shows: the focused pane's.
+    files_key: Option<String>,
+    /// The pane whose directory the file view last followed, so that
+    /// focusing another pane (even on the same host) or reopening the
+    /// view lists that pane's directory.
+    files_pane: Option<PaneId>,
+    /// Transfer queues that started in their connection's Remote folder,
+    /// and the pane they did for: the view does not follow that pane's
+    /// shell until its next cd.
+    started_in_folder: HashMap<String, PaneId>,
+    /// Of those, the queues whose listing another pane's shell has since
+    /// moved: going back to the owner lists its Remote folder again.
+    folder_left: HashSet<String>,
+    /// The connection the file view last followed a pane of: another
+    /// connection to the same host can name another Remote folder.
+    files_alias_shown: Option<String>,
+    transfer_timer: bool,
+    forwards_view: ForwardsView,
+    live_view: LiveView,
+    /// tmux control mode, per SSH pane that has run `tmux -CC`.
+    tmux: HashMap<PaneId, Tmux>,
+    /// SSH panes whose connection dropped while tmux ran: the host's
+    /// queue key and the session to attach again after the next login.
+    reattach: HashMap<PaneId, (String, String)>,
+    /// SSH panes reconnecting after their connection dropped.
+    retries: HashMap<PaneId, Retry>,
+    /// Commands decided outside a handler that returns them; the next
+    /// redraw runs them.
+    queued: Vec<Command>,
+    /// Remote desktops asked for and not yet open, by connection and
+    /// desktop server (host as the SSH server sees it, and port).
+    desktops: HashMap<(ChannelId, String, u16), DesktopWant>,
+    /// Virtual desktops by their script's exec channel.
+    vdesks: HashMap<ChannelId, VirtualDesk>,
+    /// The pane whose host the remote app picker (the palette) runs on.
+    app_pane: Option<PaneId>,
+    /// Programs run as remote apps lately, latest first.
+    recent_apps: Vec<String>,
+    /// Running remote app sessions and the clipboard limit of the
+    /// connection each came from (`RemoteAppClipboard` in its profile).
+    app_clip_limits: HashMap<u32, Option<String>>,
+    /// The desktop pane given this PC's clipboard since it last changed
+    /// or the window last had the keyboard.
+    clip_pane: Option<PaneId>,
+    /// Login sessions of saved desktop and remote app connections that
+    /// open on their own, and when each started: once the desktop or app
+    /// holds the connection, the session goes.
+    launches: HashMap<PaneId, Instant>,
+    /// Those of them no tab shows: they show only when the login needs
+    /// an answer or fails.
+    launch_hidden: HashSet<PaneId>,
+    /// Remote Desktop Connections running on a connection's tunnel: the
+    /// connection stays while they run.
+    mstsc: Vec<(std::process::Child, ChannelId)>,
+    /// Passwords from password manager commands, as they finish: the pane,
+    /// its session's channel, the program and the result.
+    passwords: Arc<std::sync::Mutex<Vec<PasswordAnswer>>>,
+    /// Desktop sessions waiting for their SSH pane to log in.
+    pending_desktops: HashMap<PaneId, PendingDesktop>,
+    /// VNC connections on another machine than their SSH server that the
+    /// user agreed to open unencrypted past it, until FeroSSH quits, by
+    /// [`crate::forwards::plain_desktop_key`]: connection, host, port and
+    /// SSH server, so a changed connection asks again.
+    plain_vnc_ok: HashSet<String>,
+    /// Window > Broadcast input: which panes also get what is typed.
+    broadcast: broadcast::Scope,
+    /// The update check running in the background, if any, and whether
+    /// the user asked for it (an automatic one only speaks up about a new
+    /// release).
+    update: Option<(std::sync::mpsc::Receiver<crate::update::Outcome>, bool)>,
+    /// Login scripts running, by pane.
+    scripts: HashMap<PaneId, ScriptRun>,
+    /// Snippets with an `@pane` or `@tab` step, by the pane their first
+    /// part runs in: that run's number, the snippet's name and the steps
+    /// from the move on, which follow when the run finishes.
+    snippet_next: HashMap<PaneId, (u64, String, Vec<Step>)>,
+    /// ZMODEM transfers running, by pane.
+    zmodem: HashMap<PaneId, zmodem::Transfer>,
+    /// Secrets for login scripts from password manager commands, as they
+    /// finish.
+    script_secrets: Arc<std::sync::Mutex<Vec<ScriptSecret>>>,
+    /// Login scripts started so far, which numbers each run.
+    script_runs: u64,
+    snippets_view: SnippetsView,
+    /// Ctrl+Shift+Space showed the snippets on a hidden side pane, so
+    /// typing one hides it again.
+    snippets_peek: bool,
+    palette: CommandPalette,
+    /// What the side pane showed before the command palette, which comes
+    /// back when the palette closes; `None` if it was hidden.
+    palette_return: Option<SideView>,
+    /// Auto-response watches, by pane.
+    watches: HashMap<PaneId, Watch>,
+    /// Edit > Record keystrokes as snippet: the pane and what it typed.
+    recording: Option<(PaneId, Recorder)>,
+    /// Session folders by session name, for snippets kept to folders,
+    /// and when they were read.
+    folders: Option<(Instant, HashMap<String, String>)>,
+    /// Sessions of a snippet run on picked hosts that no tab shows.
+    run_hidden: HashSet<PaneId>,
+    /// Sessions of a run still logging in: the snippet starts once they
+    /// are in.
+    run_login: HashSet<PaneId>,
+    /// The last line each of those showed: why a login failed.
+    run_notes: HashMap<PaneId, String>,
+}
+
+/// A login script running in a pane.
+struct ScriptRun {
+    runner: Runner,
+    /// Which run it is, so a secret that arrives late finds only its own.
+    run: u64,
+    /// Attach tmux once it is over, if the host's profile asks for that.
+    tmux: bool,
+    /// A snippet run with a row in the snippets view's report.
+    report: bool,
+}
+
+/// What a password manager command gave a login script: the pane, the
+/// run and the result.
+type ScriptSecret = (PaneId, u64, std::result::Result<Zeroizing<String>, String>);
+
+/// Where a login script's named secret is kept in the Windows Credential
+/// Manager.
+fn secret_target(name: &str) -> String {
+    format!("FeroSSH secret:{name}")
+}
+
+/// What a password manager command gave for a pane's login.
+type PasswordAnswer = (
+    PaneId,
+    ChannelId,
+    String,
+    std::result::Result<Zeroizing<String>, String>,
+);
+
+/// A desktop session whose SSH connection is still logging in.
+#[derive(Debug, Clone)]
+struct PendingDesktop {
+    /// The session's name, for the tab and the tunnel's port.
+    label: String,
+    /// The desktop server as the SSH host sees it.
+    host: String,
+    port: u16,
+    kind: SessionKind,
+    user: Option<String>,
+}
+
+/// A remote desktop asked for.
+// No Debug: it holds passwords.
+#[derive(Clone)]
+enum DesktopWant {
+    /// Windows' Remote Desktop Connection, over RDP.
+    /// `size` is the window's fixed size, if one was set.
+    Rdp {
+        pane: PaneId,
+        size: Option<(u16, u16)>,
+        /// Share the clipboard (Remote Desktop Connection has no way to
+        /// share it one way only).
+        clipboard: bool,
+    },
+    /// The built-in viewer in a new tab.
+    Tab(TabWant),
+    /// A VNC viewer installed on this PC, for a virtual desktop without
+    /// the built-in viewer; notes go to `pane`.
+    Vnc {
+        pane: PaneId,
+        password: Zeroizing<String>,
+        /// Which ways copied text may travel (to and from the host).
+        clipboard: (bool, bool),
+    },
+}
+
+/// A desktop for the built-in viewer's tab: `label` names the host and
+/// `user` is the SSH user, offered for RDP.
+// No Debug: it holds passwords.
+#[derive(Clone)]
+#[cfg_attr(not(feature = "viewer"), allow(dead_code))]
+struct TabWant {
+    label: String,
+    user: String,
+    protocol: Protocol,
+    /// A virtual desktop's: its password and script channel.
+    vdesk: Option<(Zeroizing<String>, ChannelId)>,
+    /// A fixed size; `None` follows the pane.
+    size: Option<(u16, u16)>,
+    /// The connection's limit on the clipboard: to and from the host.
+    clip_limit: (bool, bool),
+}
+
+/// Session > Open virtual desktop: Xvfb and x11vnc on the server, run by
+/// [`vdesk::command`] on an exec channel of `connection`.
+struct VirtualDesk {
+    connection: ChannelId,
+    /// The terminal it was opened from, for notes.
+    pane: PaneId,
+    label: String,
+    user: String,
+    password: Zeroizing<String>,
+    out: vdesk::Output,
+    /// x11vnc's port on the server, once it listens.
+    port: Option<u16>,
+    /// The size it was started at, and whether it should follow its
+    /// viewer (which takes Xvnc on the server).
+    size: (u16, u16),
+    follow: bool,
+    /// Its server takes the viewer's size changes (Xvnc).
+    resizes: bool,
+    /// In a tab of the built-in viewer, rather than a viewer on this PC.
+    tab: bool,
+    /// Its tab opened; closing that tab now stops it.
+    shown: bool,
+    /// The user heard why it failed.
+    reported: bool,
+    /// The connection's limit on the clipboard: to and from the host.
+    clip_limit: (bool, bool),
+}
+
+thread_local! {
+    // The UI thread's one window. Handlers borrow it briefly and never hold
+    // the borrow across a call that sends messages back to the window.
+    static WINDOW: RefCell<Option<Window>> = const { RefCell::new(None) };
+    // A confirmation dialog is open. Requests that would open another one
+    // meanwhile are dropped.
+    static DIALOG_OPEN: StdCell<bool> = const { StdCell::new(false) };
+}
+
+/// Runs `f` on the window state, or returns `None` before the window is set
+/// up or when called re-entrantly.
+fn with_window<R>(f: impl FnOnce(&mut Window) -> R) -> Option<R> {
+    WINDOW.with(|cell| {
+        let mut guard = cell.try_borrow_mut().ok()?;
+        guard.as_mut().map(f)
+    })
+}
+
+pub fn run(launch: Launch, theme: Option<String>) -> Result<()> {
+    let result = create_and_run(launch, theme);
+    if let Err(e) = &result {
+        let text = HSTRING::from(format!("FeroSSH could not start:\n\n{}", e.message()));
+        // SAFETY: plain message box with valid strings.
+        unsafe { MessageBoxW(None, &text, w!("FeroSSH"), MB_OK | MB_ICONERROR) };
+    }
+    result
+}
+
+/// A command line FeroSSH does not understand.
+pub fn run_error(problem: &str) -> Result<()> {
+    let text = HSTRING::from(format!(
+        "{problem}\n\nUsage:\n  ferossh [--theme NAME] [-l user] [-p port] [--no-sandbox] [user@]host[:port]\n  \
+         ferossh [--theme NAME] --local [command]\n  \
+         ferossh --new-security-key [--hello] [--ed25519] FILE"
+    ));
+    // SAFETY: plain message box with valid strings.
+    unsafe { MessageBoxW(None, &text, w!("FeroSSH"), MB_OK | MB_ICONERROR) };
+    Ok(())
+}
+
+/// `ferossh --new-security-key`: makes the key through Windows' WebAuthn
+/// dialog and says what happened.
+pub fn new_security_key(key: &crate::newkey::NewKey) -> Result<()> {
+    let env = |k: &str| std::env::var(k).unwrap_or_default();
+    let comment = format!("{}@{}", env("USERNAME"), env("COMPUTERNAME"));
+    let (text, icon) = match crate::newkey::make(&ferossh_auth::webauthn::WebAuthn, key, &comment) {
+        Ok(line) => (
+            format!(
+                "Made {} and {}.pub.\n\nAdd this line to ~/.ssh/authorized_keys on the server \
+                 (Ctrl+C copies this message):\n\n{line}\n\nThen log in with IdentityFile {} \
+                 in ~/.ssh/config, or name the file id_ecdsa_sk or id_ed25519_sk in ~/.ssh.",
+                key.path.display(),
+                key.path.display(),
+                key.path.display(),
+            ),
+            MB_ICONINFORMATION,
+        ),
+        Err(e) => (
+            format!("Could not make the security key: {e}"),
+            MB_ICONERROR,
+        ),
+    };
+    let text = HSTRING::from(text);
+    // SAFETY: plain message box with valid strings.
+    unsafe { MessageBoxW(None, &text, w!("FeroSSH"), MB_OK | icon) };
+    Ok(())
+}
+
+fn home() -> PathBuf {
+    std::env::var_os("USERPROFILE").map_or_else(|| PathBuf::from("."), PathBuf::from)
+}
+
+/// FeroSSH's own folder for settings: `%APPDATA%\FeroSSH`.
+fn app_dir() -> PathBuf {
+    std::env::var_os("APPDATA")
+        .map_or_else(|| PathBuf::from("."), PathBuf::from)
+        .join("FeroSSH")
+}
+
+fn settings_path() -> PathBuf {
+    app_dir().join("ferossh.conf")
+}
+
+/// Where sessions imported from `client` go, in ssh_config syntax.
+/// FeroSSH reads it after `~/.ssh/config`; OpenSSH never sees it.
+fn imported_path(client: Client) -> PathBuf {
+    app_dir().join(client.file_name())
+}
+
+/// Sessions made in the session form, in ssh_config syntax. FeroSSH reads
+/// it after `~/.ssh/config`; OpenSSH never sees it.
+fn sessions_path() -> PathBuf {
+    app_dir().join("sessions.conf")
+}
+
+fn load_saved() -> Vec<SavedHost> {
+    std::fs::read_to_string(sessions_path())
+        .map(|t| saved::parse(&t))
+        .unwrap_or_default()
+}
+
+/// The user's home folder, account name, ssh_config, saved sessions and
+/// imported hosts.
+fn ssh_env() -> Env {
+    let home = home();
+    let mut config = std::fs::read_to_string(home.join(".ssh").join("config")).unwrap_or_default();
+    if let Ok(made) = std::fs::read_to_string(sessions_path()) {
+        // A Host line first: the user's last block must not swallow it.
+        config.push_str("\nHost !*\n");
+        config.push_str(&made);
+    }
+    for client in Client::ALL {
+        if let Ok(imported) = std::fs::read_to_string(imported_path(client)) {
+            // A Host line first: the user's last block must not swallow it.
+            config.push_str("\nHost !*\n");
+            config.push_str(&imported);
+        }
+    }
+    Env {
+        local_user: std::env::var("USERNAME").unwrap_or_default(),
+        home,
+        config,
+    }
+}
+
+fn load_settings() -> Settings {
+    std::fs::read_to_string(settings_path())
+        .map(|t| Settings::parse(&t))
+        .unwrap_or_default()
+}
+
+/// The scripts folder: a file per script, a folder per category (see
+/// [`snippet_store`]). The `snippets` folder of an older FeroSSH is
+/// renamed to it the first time.
+fn snippets_dir() -> PathBuf {
+    snippet_store::move_old_folder(&app_dir().join("scripts"), &app_dir().join("snippets"))
+}
+
+/// Reads the snippets folder into `settings`. Snippets an older FeroSSH
+/// kept in `ferossh.conf` move to the folder first, with a copy of the
+/// old file kept beside it; if the folder cannot be written they stay in
+/// `ferossh.conf` and are used from there.
+fn load_snippets(settings: &mut Settings) {
+    let dir = snippets_dir();
+    if !settings.snippets.is_empty() {
+        let _ = std::fs::copy(
+            settings_path(),
+            app_dir().join("ferossh.conf.before-snippets-folder"),
+        );
+        if snippet_store::migrate(&dir, &settings.snippets).is_err() {
+            return;
+        }
+        settings.snippets = snippet_store::load(&dir).0;
+        // The file no longer needs the moved blocks.
+        let _ = write_app_file(&settings_path(), &settings.to_text());
+        return;
+    }
+    settings.snippets = snippet_store::load(&dir).0;
+}
+
+/// Writes a file in FeroSSH's folder through a temporary file, so a crash
+/// never leaves half a file.
+fn write_app_file(path: &std::path::Path, text: &str) -> std::io::Result<()> {
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    let tmp = path.with_extension("tmp");
+    std::fs::write(&tmp, text)?;
+    std::fs::rename(&tmp, path)
+}
+
+/// The hosts the connection manager lists.
+fn host_items(env: &Env, settings: &Settings) -> Vec<HostItem> {
+    let includes = ssh_config::DirIncludes {
+        home: env.home.clone(),
+    };
+    ssh_config::hosts(&env.config, &includes)
+        .into_iter()
+        .map(|h| {
+            let detail = Target::resolve(&h.name, env)
+                .map(|t| {
+                    let mut d = format!("{}@{}", t.user, t.hostname);
+                    if t.port != 22 {
+                        d.push_str(&format!(":{}", t.port));
+                    }
+                    // The last jump host is the one that reaches it.
+                    if let Some(j) = t.jumps.last() {
+                        d.push_str(&format!(" via {}", j.alias));
+                    }
+                    d
+                })
+                .unwrap_or_default();
+            let kind = settings
+                .profile(&h.name)
+                .map(|p| p.kind)
+                .unwrap_or_default();
+            HostItem {
+                name: h.name,
+                folder: h.folder,
+                detail,
+                kind,
+            }
+        })
+        .collect()
+}
+
+/// The password manager commands the user allowed, one per line, in
+/// `%LOCALAPPDATA%\FeroSSH`: on this PC only, not beside the settings
+/// that may be copied or shared, so a settings file from elsewhere cannot
+/// run a command without asking.
+fn approved_commands_path() -> PathBuf {
+    std::env::var_os("LOCALAPPDATA")
+        .map_or_else(|| PathBuf::from("."), PathBuf::from)
+        .join("FeroSSH")
+        .join("approved-password-commands.txt")
+}
+
+fn command_approved(line: &str) -> bool {
+    std::fs::read_to_string(approved_commands_path())
+        .is_ok_and(|t| t.lines().any(|l| l == line.trim()))
+}
+
+fn approve_command(line: &str) {
+    let path = approved_commands_path();
+    let mut text = std::fs::read_to_string(&path).unwrap_or_default();
+    if !text.is_empty() && !text.ends_with('\n') {
+        text.push('\n');
+    }
+    text.push_str(line.trim());
+    text.push('\n');
+    let _ = write_app_file(&path, &text);
+}
+
+/// The `ProxyCommand` lines the user allowed, one per line, beside the
+/// password commands: on this PC only.
+fn approved_proxies_path() -> PathBuf {
+    std::env::var_os("LOCALAPPDATA")
+        .map_or_else(|| PathBuf::from("."), PathBuf::from)
+        .join("FeroSSH")
+        .join("approved-proxy-commands.txt")
+}
+
+fn proxy_approved(line: &str) -> bool {
+    std::fs::read_to_string(approved_proxies_path())
+        .is_ok_and(|t| t.lines().any(|l| l == line.trim()))
+}
+
+fn approve_proxy(line: &str) {
+    let path = approved_proxies_path();
+    let mut text = std::fs::read_to_string(&path).unwrap_or_default();
+    if !text.is_empty() && !text.ends_with('\n') {
+        text.push('\n');
+    }
+    text.push_str(line.trim());
+    text.push('\n');
+    let _ = write_app_file(&path, &text);
+}
+
+/// The chain file that seals log `path`: the same name plus `.chain`.
+fn chain_path(path: &Path) -> PathBuf {
+    let mut name = path.as_os_str().to_owned();
+    name.push(".chain");
+    PathBuf::from(name)
+}
+
+/// Creates a new log file and the chain beside it in the log folder, named
+/// from the host in `label`, the pane and the time, plus `suffix` before
+/// `.log`. Never overwrites: a second log in the same minute gets a
+/// number.
+fn new_log_file(
+    label: &str,
+    id: PaneId,
+    suffix: &str,
+) -> std::io::Result<(File, File, PathBuf, String)> {
+    let host = label.rsplit('@').next().unwrap_or(label);
+    let dir = log_dir();
+    let name = log_file_name(host, id as usize, local_time());
+    // Only the ending: a host such as `web.logs.example` keeps its name.
+    let stem = name.strip_suffix(".log").unwrap_or(&name);
+    std::fs::create_dir_all(&dir)?;
+    let mut n = 1;
+    loop {
+        let name = if n == 1 {
+            format!("{stem}{suffix}.log")
+        } else {
+            format!("{stem}{suffix}-{n}.log")
+        };
+        let path = dir.join(&name);
+        let new = |path: &Path| {
+            std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(path)
+        };
+        match new(&path) {
+            Ok(f) => {
+                // The chain beside it seals the log against edits.
+                let chain = new(&chain_path(&path))?;
+                return Ok((f, chain, path, name));
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists && n < 100 => n += 1,
+            Err(e) => return Err(e),
+        }
+    }
+}
+
+/// Writes `lines` (a pane's scrollback and screen) to a new sealed log in
+/// the log folder and adds it to the log index; returns its path.
+fn save_text_log(label: &str, id: PaneId, lines: &[String]) -> std::io::Result<PathBuf> {
+    let (f, chain, path, name) = new_log_file(label, id, "_saved")?;
+    let header = format!(
+        "FeroSSH saved output of {label} ({} lines of scrollback and screen), saved {}",
+        lines.len(),
+        timestamp()
+    );
+    let mut writer = LogWriter::sealed(f, chain, &name, false, &header)?;
+    for line in lines {
+        writer.write(line.as_bytes())?;
+        writer.write(b"\r\n")?;
+    }
+    if let Some(sealed) = writer.finish_sealed("End of saved output")? {
+        add_to_log_index(&name, &sealed)?;
+    }
+    Ok(path)
+}
+
+/// Appends a log that ended to the log index, linked to the line before.
+fn add_to_log_index(name: &str, sealed: &ferossh_term::Sealed) -> std::io::Result<()> {
+    use std::io::Write as _;
+    let path = log_dir().join(chain::INDEX_FILE);
+    let index = match std::fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(e) => return Err(e),
+    };
+    let line = chain::index_line(&index, name, sealed.bytes, &sealed.head);
+    std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)?
+        .write_all(line.as_bytes())
+}
+
+/// Session > Check a log: the log against its chain and the log index.
+/// `true` when nothing was found wrong.
+fn check_log(path: &Path) -> (String, bool) {
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let log = match std::fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(e) => return (format!("Could not read {}: {e}", path.display()), false),
+    };
+    let chain = std::fs::read_to_string(chain_path(path)).ok();
+    let index_path = path.with_file_name(chain::INDEX_FILE);
+    let index = std::fs::read_to_string(index_path).ok();
+    let text = chain::report(&name, &log, chain.as_deref(), index.as_deref());
+    let ok = chain
+        .as_deref()
+        .is_some_and(|c| chain::verify(&name, &log, c).is_ok())
+        && !text.contains("WARNING");
+    (text, ok)
+}
+
+/// Where tab logs go: `%LOCALAPPDATA%\FeroSSH\logs`.
+fn log_dir() -> PathBuf {
+    std::env::var_os("LOCALAPPDATA")
+        .map_or_else(|| PathBuf::from("."), PathBuf::from)
+        .join("FeroSSH")
+        .join("logs")
+}
+
+/// The local time as (year, month, day, hour, minute, second).
+fn local_time() -> (u16, u8, u8, u8, u8, u8) {
+    // SAFETY: plain query.
+    let t = unsafe { GetLocalTime() };
+    let b = |v: u16| u8::try_from(v).unwrap_or(0);
+    (
+        t.wYear,
+        b(t.wMonth),
+        b(t.wDay),
+        b(t.wHour),
+        b(t.wMinute),
+        b(t.wSecond),
+    )
+}
+
+fn timestamp() -> String {
+    let (y, mo, d, h, mi, s) = local_time();
+    format!("{y:04}-{mo:02}-{d:02} {h:02}:{mi:02}:{s:02}")
+}
+
+/// The time for a log line, to the millisecond: `2026-10-26 19:24:49.123`.
+fn log_line_time() -> String {
+    // SAFETY: plain query.
+    let t = unsafe { GetLocalTime() };
+    format!(
+        "{:04}-{:02}-{:02} {:02}:{:02}:{:02}.{:03}",
+        t.wYear, t.wMonth, t.wDay, t.wHour, t.wMinute, t.wSecond, t.wMilliseconds
+    )
+}
+
+fn term_settings(lines: Option<usize>) -> TermSettings {
+    lines.map_or_else(TermSettings::default, TermSettings::new)
+}
+
+fn create_and_run(launch: Launch, theme: Option<String>) -> Result<()> {
+    // SAFETY: plain Win32 calls on this thread with valid arguments; the
+    // window procedure below upholds the WNDPROC contract.
+    unsafe {
+        // The manifest already sets this; the call covers a missing manifest.
+        let _ = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+
+        let instance = GetModuleHandleW(None)?.into();
+        let class = w!("FeroSSHWindow");
+        let wc = WNDCLASSW {
+            style: CS_HREDRAW | CS_VREDRAW,
+            lpfnWndProc: Some(wndproc),
+            hInstance: instance,
+            hCursor: LoadCursorW(None, IDC_IBEAM)?,
+            // The FeroSSH logo, icon group 1 (build.rs); Windows picks the
+            // size the title bar and taskbar need from the same group.
+            hIcon: LoadIconW(Some(instance), PCWSTR(1 as _)).unwrap_or_default(),
+            // No background brush: the renderer paints every pixel.
+            lpszClassName: class,
+            ..Default::default()
+        };
+        if RegisterClassW(&wc) == 0 {
+            return Err(windows::core::Error::from_thread());
+        }
+
+        let menu = build_menu()?;
+        let hwnd = CreateWindowExW(
+            EX_STYLE,
+            class,
+            w!("FeroSSH"),
+            STYLE,
+            CW_USEDEFAULT,
+            CW_USEDEFAULT,
+            CW_USEDEFAULT,
+            CW_USEDEFAULT,
+            None,
+            Some(menu),
+            Some(instance),
+            None,
+        )?;
+
+        // Size the window for 80x24 cells at the DPI of the monitor it
+        // opened on.
+        let dpi = GetDpiForWindow(hwnd);
+        let mut settings = load_settings();
+        load_snippets(&mut settings);
+        let font = FontSpec::default();
+        // An unknown theme name falls back to the default (Nord).
+        let default_theme = theme.and_then(|n| Theme::by_name(&n)).unwrap_or_default();
+        let mut renderer = Renderer::new(hwnd, 1, 1)?;
+        for (id, family) in (cmd::FONT..).zip(FONT_CHOICES) {
+            if renderer.has_family(family) {
+                continue;
+            }
+            if font_page(family).is_some() {
+                let text = HSTRING::from(format!("{family} (download)"));
+                // SAFETY: valid menu handle; the id is ours.
+                let _ = ModifyMenuW(menu, id, MF_BYCOMMAND | MF_STRING, id as usize, &text);
+            } else {
+                // SAFETY: valid menu handle; the id is ours.
+                let _ = EnableMenuItem(menu, id, MF_BYCOMMAND | MF_GRAYED);
+            }
+        }
+        let metrics = renderer.metrics(&font, dpi)?;
+        let chrome_font = FontSpec::new(&font.family, CHROME_PT);
+        let chrome_metrics = renderer.metrics(&chrome_font, dpi)?;
+        let strip_font = FontSpec::new(&font.family, STRIP_PT);
+        let strip_metrics = renderer.metrics(&strip_font, dpi)?;
+        let (mut width, height) = window_size(&metrics, DEFAULT_COLS, DEFAULT_ROWS, dpi, true);
+        if settings.tools_rail {
+            // The terminal still gets its 80 columns beside the rail.
+            width += scale(toolpane::RAIL_DIP, dpi) + gap(dpi);
+        }
+        let (ws, first) = Workspace::new();
+        let pane = new_pane(
+            first,
+            font,
+            default_theme.clone(),
+            metrics,
+            settings.scrollback,
+        );
+        WINDOW.with(|cell| {
+            *cell.borrow_mut() = Some(Window {
+                hwnd,
+                renderer,
+                dpi,
+                client: (0, 0),
+                ws,
+                panes: HashMap::from([(first, pane)]),
+                areas: Areas::default(),
+                strip_grid: Grid::new(1, 1),
+                strip_layout: StripLayout::default(),
+                side: Side {
+                    visible: false,
+                    view: SideView::Sessions,
+                    focused: false,
+                    list: SessionList::default(),
+                    form: None,
+                    import: None,
+                    grid: Grid::new(1, 1),
+                    width: 0,
+                    shown: 0,
+                    last_click: None,
+                },
+                chrome_font,
+                chrome_metrics,
+                strip_font,
+                strip_metrics,
+                menu,
+                menu_visible: true,
+                focused: false,
+                full_redraw: true,
+                high_surrogate: None,
+                tmux_armed: None,
+                tmux_repeat: None,
+                last_tab_pane: None,
+                last_pane: None,
+                mouse: Mouse::default(),
+                drag: None,
+                tab_click: None,
+                rename_return: None,
+                settings,
+                default_theme,
+                command: match &launch {
+                    Launch::Local(c) if !c.is_empty() => c.clone(),
+                    _ => conpty::default_command(),
+                },
+                sandbox: !matches!(launch, Launch::Ssh { sandbox: false, .. }),
+                workers: HashMap::new(),
+                retiring: Vec::new(),
+                via: HashMap::new(),
+                proxies: HashMap::new(),
+                broker: None,
+                broker_jobs: VecDeque::new(),
+                next_channel: 1,
+                output_pending: Arc::new(AtomicBool::new(false)),
+                sftp: HashMap::new(),
+                sftp_routes: HashMap::new(),
+                files_key: None,
+                files_pane: None,
+                started_in_folder: HashMap::new(),
+                folder_left: HashSet::new(),
+                files_alias_shown: None,
+                transfer_timer: false,
+                forwards_view: ForwardsView::default(),
+                live_view: LiveView::default(),
+                tmux: HashMap::new(),
+                reattach: HashMap::new(),
+                retries: HashMap::new(),
+                queued: Vec::new(),
+                desktops: HashMap::new(),
+                vdesks: HashMap::new(),
+                app_pane: None,
+                recent_apps: Vec::new(),
+                app_clip_limits: HashMap::new(),
+                clip_pane: None,
+                launches: HashMap::new(),
+                launch_hidden: HashSet::new(),
+                mstsc: Vec::new(),
+                passwords: Arc::default(),
+                pending_desktops: HashMap::new(),
+                plain_vnc_ok: HashSet::new(),
+                broadcast: broadcast::Scope::Off,
+                update: None,
+                scripts: HashMap::new(),
+                snippet_next: HashMap::new(),
+                zmodem: HashMap::new(),
+                script_secrets: Arc::default(),
+                script_runs: 0,
+                snippets_view: SnippetsView::default(),
+                snippets_peek: false,
+                palette: CommandPalette::default(),
+                palette_return: None,
+                watches: HashMap::new(),
+                recording: None,
+                folders: None,
+                run_hidden: HashSet::new(),
+                run_login: HashSet::new(),
+                run_notes: HashMap::new(),
+                standby: Standby::new(),
+            });
+        });
+        // The tools rail, a native child window; placed by layout().
+        if let Some(look) = with_window(|w| w.rail_look()) {
+            let commands = RailItem::ALL.map(|i| match i {
+                RailItem::Connections => cmd::SESSIONS,
+                RailItem::Sessions => cmd::LIVE,
+                RailItem::Files => cmd::FILES,
+                RailItem::Forwards => cmd::FORWARDS,
+                RailItem::Snippets => cmd::SNIPPETS,
+                RailItem::Palette => cmd::PALETTE,
+                RailItem::Pin => cmd::TOOLS_PIN,
+            });
+            // Without it (it never fails in practice) the menus still work.
+            let _ = rail::create(hwnd, commands, look);
+        }
+        // The connection manager's native controls; placed by layout().
+        let _ = conn_view::create(hwnd, conn_event, cmd::IMPORT, dpi);
+        // The session manager's, likewise.
+        let _ = live_panel::create(hwnd, live_event, dpi);
+        // The connection form's, likewise.
+        let _ = form_view::create(hwnd, form_event, dpi);
+        // The file transfer pane's, likewise.
+        let _ = files_panel::create(hwnd, files_event, dpi);
+        // The port forwards pane's, likewise.
+        let _ = fwd_panel::create(hwnd, fwd_event, dpi);
+        // The scripts pane's, likewise.
+        let _ = scripts_panel::create(hwnd, scripts_event, dpi);
+        // The script editor's, likewise.
+        let _ = script_editor::create(hwnd, script_editor_event, dpi);
+        // The page that asks for a script's arguments, likewise.
+        let _ = script_args::create(hwnd, script_args_event, dpi);
+        // The page that picks the hosts to run a script on, likewise.
+        let _ = script_hosts::create(hwnd, script_hosts_event, dpi);
+        // A script run's report, likewise.
+        let _ = script_report::create(hwnd, script_report_event, dpi);
+        // A click on any of their controls hands the keyboard to the tools.
+        crate::native::on_control_focus(tools_focused);
+        // Files dropped from Explorer are uploaded, after a confirmation.
+        DragAcceptFiles(hwnd, true);
+        // Clipboard changes reach a remote desktop being worked in.
+        let _ = windows::Win32::System::DataExchange::AddClipboardFormatListener(hwnd);
+        // Window > Standby window, when it was left on: the first window
+        // takes the hotkey; for a later one the status says it is taken.
+        with_window(|w| {
+            // A window another program's standby left hidden (FeroSSH
+            // ended without showing it) comes back, unless the hotkey is
+            // taken, likely by a FeroSSH window that still has it hidden.
+            if w.apply_standby() || !w.settings.standby {
+                w.restore_hidden();
+            }
+        });
+        with_window(Window::update_menu_checks);
+        // Sends WM_SIZE, which sizes the terminal before the shell starts.
+        SetWindowPos(
+            hwnd,
+            None,
+            0,
+            0,
+            width,
+            height,
+            SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE,
+        )?;
+        match launch {
+            Launch::Local(_) => with_window(|w| w.start_shell(first)),
+            Launch::Ssh {
+                destination: Some(d),
+                ..
+            } => with_window(|w| w.connect(first, &d)),
+            _ => with_window(|w| w.ask_destination(first)),
+        };
+        let _ = ShowWindow(hwnd, SW_SHOW);
+        // Help > Check for updates weekly, when it is on and a week has
+        // passed.
+        with_window(|w| {
+            if w.settings.update_check_weekly && crate::update::due() {
+                w.start_update_check(false);
+            }
+        });
+
+        let mut msg = MSG::default();
+        while GetMessageW(&mut msg, None, 0, 0).as_bool() {
+            // Tab, Enter, Escape and the shortcuts in the connection
+            // and session managers' controls.
+            if conn_view::pre_translate(&msg)
+                || live_panel::pre_translate(&msg)
+                || form_view::pre_translate(&msg)
+                || files_panel::pre_translate(&msg)
+                || fwd_panel::pre_translate(&msg)
+                || scripts_panel::pre_translate(&msg)
+                || script_editor::pre_translate(&msg)
+                || script_args::pre_translate(&msg)
+                || script_hosts::pre_translate(&msg)
+                || script_report::pre_translate(&msg)
+            {
+                continue;
+            }
+            let _ = TranslateMessage(&msg);
+            DispatchMessageW(&msg);
+        }
+    }
+    Ok(())
+}
+
+fn new_pane(
+    id: PaneId,
+    font: FontSpec,
+    theme: Theme,
+    metrics: CellMetrics,
+    scrollback: Option<usize>,
+) -> Pane {
+    let mut term = Terminal::new(DEFAULT_COLS, DEFAULT_ROWS, &term_settings(scrollback));
+    term.set_theme(&theme);
+    term.set_cell_size(metrics.width, metrics.height);
+    Pane {
+        id,
+        term,
+        grid: Grid::new(DEFAULT_COLS, DEFAULT_ROWS),
+        cursor: None,
+        host: Host::Ask(String::new()),
+        log: Logging::default(),
+        font,
+        theme,
+        metrics,
+        rect: Rect::default(),
+        title: None,
+        name: None,
+        bell: false,
+        cwd: None,
+        cwd_host: None,
+        cwd_reported: false,
+        prompt_host: None,
+        mark: None,
+        desktop: None,
+        no_broadcast: false,
+        start_dir: None,
+        local_cwd: None,
+    }
+}
+
+fn build_menu() -> Result<HMENU> {
+    let item = |menu: HMENU, id: u32, text: &str| {
+        // SAFETY: valid menu handle and string.
+        unsafe { AppendMenuW(menu, MF_STRING, id as usize, &HSTRING::from(text)) }
+    };
+    let separator = |menu: HMENU| {
+        // SAFETY: valid menu handle.
+        unsafe { AppendMenuW(menu, MF_SEPARATOR, 0, None) }
+    };
+    // SAFETY: menu construction with valid handles.
+    unsafe {
+        let file = CreatePopupMenu()?;
+        item(file, cmd::CONNECT, "&Connect to...\tCtrl+Shift+N")?;
+        item(file, cmd::RECONNECT, "&Reconnect\tCtrl+Shift+R")?;
+        item(file, cmd::DISCONNECT, "&Disconnect")?;
+        item(file, cmd::AUTO_RECONNECT, "Reconnect &automatically")?;
+        item(file, cmd::CLOSE_PANE, "Close &pane\tCtrl+Shift+W")?;
+        separator(file)?;
+        item(file, cmd::UPLOAD, "&Upload files...\tCtrl+Shift+U")?;
+        item(file, cmd::DOWNLOADS, "Open do&wnload folder")?;
+        separator(file)?;
+        item(file, cmd::LOCAL_SHELL, "Open &local shell")?;
+        item(file, cmd::IMPORT, "&Import connections...")?;
+        item(file, cmd::IMPORT_SNIPPETS, "Import sc&ripts...")?;
+        separator(file)?;
+        item(file, cmd::EXIT, "E&xit\tAlt+F4")?;
+
+        let session = CreatePopupMenu()?;
+        item(session, cmd::LOG_TOGGLE, "&Log to file")?;
+        item(session, cmd::LOG_RAW, "Log &raw output (keep escape codes)")?;
+        item(session, cmd::LOG_TIMESTAMPS, "&Timestamp each log line")?;
+        item(session, cmd::SAVE_PANE, "Save this pane's &output to a log")?;
+        item(session, cmd::SAVE_ALL, "Save output of all pa&nes to logs")?;
+        item(session, cmd::LOG_FOLDER, "Open log &folder")?;
+        item(session, cmd::LOG_VERIFY, "C&heck a log for changes...")?;
+        separator(session)?;
+        item(
+            session,
+            cmd::SAVE_LOOK,
+            "&Save font and theme for this host",
+        )?;
+        item(
+            session,
+            cmd::START_DIR,
+            "Start new tabs and panes in this director&y",
+        )?;
+        separator(session)?;
+        item(session, cmd::REPLACE_KEY, "Replace host &key...")?;
+        separator(session)?;
+        item(session, cmd::VERIFY, "&Verify transfers (SHA-256)")?;
+        item(session, cmd::ZMODEM, "&ZMODEM: answer rz and sz")?;
+        separator(session)?;
+        item(session, cmd::TMUX_ATTACH, "&Attach tmux")?;
+        item(session, cmd::TMUX_PICK, "S&witch tmux session...")?;
+        item(session, cmd::TMUX_DETACH, "&Detach tmux")?;
+        item(
+            session,
+            cmd::TMUX_LAYOUT,
+            "tmux: one &window per pane (own fonts)",
+        )?;
+        item(
+            session,
+            cmd::TMUX_KEYS,
+            "Use tmux ke&ybindings for tabs and panes",
+        )?;
+        separator(session)?;
+        item(session, cmd::SERIAL_BREAK, "Send &break (serial)")?;
+        item(session, cmd::RUN_SCRIPT, "Run &login script again")?;
+        item(session, cmd::AUTO_RESPONSES, "A&uto-responses from scripts")?;
+        item(
+            session,
+            cmd::CONFIRM_PRODUCTION,
+            "Confirm scripts on &Production hosts",
+        )?;
+        separator(session)?;
+        item(session, cmd::DESKTOP, "Open remote &desktop\tCtrl+Shift+D")?;
+        if cfg!(feature = "rdp-viewer") {
+            item(
+                session,
+                cmd::DESKTOP_TAB_RDP,
+                "Open remote desktop in a &tab (RDP)",
+            )?;
+        }
+        if cfg!(feature = "vnc-viewer") {
+            item(
+                session,
+                cmd::DESKTOP_TAB,
+                "Open remote desktop in a tab (&VNC)",
+            )?;
+        }
+        item(session, cmd::VDESK, "Open virtual d&esktop (Xvfb)")?;
+        item(session, cmd::VDESK_STOP, "Stop v&irtual desktop")?;
+        let desk_clip = CreatePopupMenu()?;
+        item(desk_clip, cmd::DESKTOP_CLIP, "&Both ways")?;
+        item(desk_clip, cmd::DESKTOP_CLIP + 1, "Only &Windows to host")?;
+        item(desk_clip, cmd::DESKTOP_CLIP + 2, "Only &host to Windows")?;
+        item(desk_clip, cmd::DESKTOP_CLIP + 3, "&Off")?;
+        separator(desk_clip)?;
+        item(
+            desk_clip,
+            cmd::DESKTOP_SELECTION,
+            "Also share &mouse selections from virtual desktops",
+        )?;
+        AppendMenuW(
+            session,
+            MF_POPUP,
+            desk_clip.0 as usize,
+            w!("Desktop c&lipboard"),
+        )?;
+        let apps = CreatePopupMenu()?;
+        item(apps, cmd::REMOTE_APP, "&Run remote app...")?;
+        item(apps, cmd::REMOTE_APP_ATTACH, "Re&attach remote app")?;
+        separator(apps)?;
+        item(apps, cmd::REMOTE_APP_COPY, "&Copy the agent to hosts")?;
+        item(apps, cmd::REMOTE_APP_REMOVE, "Re&move the agent when done")?;
+        let clip = CreatePopupMenu()?;
+        item(clip, cmd::REMOTE_APP_CLIP, "&Both ways")?;
+        item(clip, cmd::REMOTE_APP_CLIP + 1, "Only &Windows to host")?;
+        item(clip, cmd::REMOTE_APP_CLIP + 2, "Only &host to Windows")?;
+        item(clip, cmd::REMOTE_APP_CLIP + 3, "&Off")?;
+        separator(clip)?;
+        item(
+            clip,
+            cmd::REMOTE_APP_SELECTION,
+            "Also share &mouse selections from the host",
+        )?;
+        AppendMenuW(apps, MF_POPUP, clip.0 as usize, w!("Clip&board"))?;
+        AppendMenuW(
+            session,
+            MF_POPUP,
+            apps.0 as usize,
+            w!("Remote a&pps (native windows)"),
+        )?;
+
+        let edit = CreatePopupMenu()?;
+        item(edit, cmd::COPY, "&Copy\tCtrl+Shift+C")?;
+        item(edit, cmd::PASTE, "&Paste\tCtrl+Shift+V")?;
+        separator(edit)?;
+        item(edit, cmd::FIND, "&Find in scrollback\tCtrl+Shift+F")?;
+        item(edit, cmd::CLEAR_SCROLLBACK, "C&lear scrollback")?;
+        item(edit, cmd::SAVE_SNIPPET, "Sa&ve selection as script...")?;
+        item(edit, cmd::RECORD_SNIPPET, "Rec&ord keystrokes as script")?;
+        separator(edit)?;
+        item(edit, cmd::COPY_ON_SELECT, "Copy on &select")?;
+        item(edit, cmd::RIGHT_CLICK_PASTE, "&Right-click pastes")?;
+
+        let fonts = CreatePopupMenu()?;
+        for (i, (id, name)) in (cmd::FONT..).zip(FONT_CHOICES).enumerate() {
+            if i == WINDOWS_FONTS {
+                separator(fonts)?;
+            }
+            item(fonts, id, name)?;
+        }
+        // Three columns: dark themes, light themes, then the warning
+        // themes over the classics.
+        let themes = CreatePopupMenu()?;
+        let mut last = None;
+        for (id, theme) in (cmd::THEME..).zip(Theme::builtin()) {
+            let group = theme.group();
+            match (last, group) {
+                (Some(prev), ThemeGroup::Light | ThemeGroup::Warning) if prev != group => {
+                    AppendMenuW(
+                        themes,
+                        MF_STRING | MF_MENUBARBREAK,
+                        id as usize,
+                        &HSTRING::from(theme.name),
+                    )?;
+                }
+                (Some(prev), ThemeGroup::Classic) if prev != group => {
+                    separator(themes)?;
+                    item(themes, id, theme.name)?;
+                }
+                _ => item(themes, id, theme.name)?,
+            }
+            last = Some(group);
+        }
+
+        let tools = CreatePopupMenu()?;
+        item(tools, cmd::SESSIONS, "&Connection manager\tCtrl+Shift+S")?;
+        item(tools, cmd::LIVE, "&Session manager\tCtrl+Shift+L")?;
+        item(tools, cmd::FILES, "&File transfer\tCtrl+Shift+E")?;
+        item(tools, cmd::FORWARDS, "&Port forwards\tCtrl+Shift+P")?;
+        item(tools, cmd::SNIPPETS, "Sc&ripts\tCtrl+Shift+Space")?;
+        item(tools, cmd::SNIPPET_FOLDER, "Open scripts f&older")?;
+        item(tools, cmd::PALETTE, "Command p&alette\tCtrl+Shift+A")?;
+
+        let view = CreatePopupMenu()?;
+        item(view, cmd::FOLLOW_CD, "File transfer f&ollows cd")?;
+        item(view, cmd::SIDE_RIGHT, "Side pane on the &right")?;
+        item(view, cmd::TOOLS_RAIL, "Tools ra&il")?;
+        item(view, cmd::TOOLS_PIN, "&Keep tools open")?;
+        item(view, cmd::TAB_STRIP, "Ta&b strip")?;
+        separator(view)?;
+        item(view, cmd::ZOOM_IN, "&Larger text\tCtrl+=")?;
+        item(view, cmd::ZOOM_OUT, "&Smaller text\tCtrl+-")?;
+        item(view, cmd::ZOOM_RESET, "&Reset text size\tCtrl+0")?;
+        separator(view)?;
+        AppendMenuW(view, MF_POPUP, fonts.0 as usize, w!("&Font (this pane)"))?;
+        AppendMenuW(view, MF_POPUP, themes.0 as usize, w!("&Theme (this pane)"))?;
+        let colours = CreatePopupMenu()?;
+        for (id, c) in (cmd::WINDOW_COLOURS..).zip(WindowColours::ALL) {
+            item(
+                colours,
+                id,
+                match c {
+                    WindowColours::Theme => "Follow the &terminal theme",
+                    WindowColours::System => "Follow &Windows (light or dark)",
+                    WindowColours::Light => "&Light",
+                    WindowColours::Dark => "&Dark",
+                },
+            )?;
+        }
+        AppendMenuW(
+            view,
+            MF_POPUP,
+            colours.0 as usize,
+            w!("&Window colours (menus, tools)"),
+        )?;
+        separator(view)?;
+        item(view, cmd::TEST_PATTERN, "Show test &pattern")?;
+        separator(view)?;
+        item(
+            view,
+            cmd::HIDE_MENU,
+            "&Hide menu bar (Alt shows it)\tCtrl+Shift+M",
+        )?;
+
+        let window = CreatePopupMenu()?;
+        item(window, cmd::NEW_TAB, "Ne&w tab\tCtrl+Shift+T")?;
+        item(window, cmd::RENAME, "Rena&me session...")?;
+        let standby = CreatePopupMenu()?;
+        item(
+            standby,
+            cmd::STANDBY_STATUS,
+            &Standby::new().status(&hotkey_label(Hotkey::DEFAULT), "this window"),
+        )?;
+        separator(standby)?;
+        item(standby, cmd::STANDBY_TOGGLE, "Standby hotkey &on")?;
+        // Filled with the open windows each time it opens.
+        let targets = CreatePopupMenu()?;
+        item(targets, cmd::STANDBY_OWN, "This &FeroSSH window")?;
+        AppendMenuW(
+            standby,
+            MF_POPUP,
+            targets.0 as usize,
+            w!("&Window to show and hide"),
+        )?;
+        separator(standby)?;
+        item(standby, cmd::STANDBY_PICK, "&Press a new hotkey...")?;
+        for (id, key) in (cmd::STANDBY_PRESET..).zip(standby_presets()) {
+            item(standby, id, &hotkey_label(key))?;
+        }
+        AppendMenuW(
+            window,
+            MF_POPUP,
+            standby.0 as usize,
+            w!("Standb&y window (hotkey)"),
+        )?;
+        separator(window)?;
+        item(window, cmd::SPLIT_RIGHT, "Split &right\tAlt+Shift+=")?;
+        item(window, cmd::SPLIT_DOWN, "Split &down\tAlt+Shift+-")?;
+        item(window, cmd::PANE_TO_TAB, "Move pane to its own &tab")?;
+        item(
+            window,
+            cmd::JOIN_TAB,
+            "&Join tab into the tab before it\tCtrl+Shift+J",
+        )?;
+        separator(window)?;
+        item(
+            window,
+            cmd::BROADCAST_TAB,
+            "&Broadcast input to this tab's panes\tCtrl+Shift+B",
+        )?;
+        item(window, cmd::BROADCAST_ALL, "Broadcast input to &all tabs")?;
+        item(
+            window,
+            cmd::BROADCAST_SKIP,
+            "Leave this pane &out of broadcast",
+        )?;
+        separator(window)?;
+        item(window, cmd::NEXT_TAB, "&Next tab\tCtrl+Tab")?;
+        item(window, cmd::PREV_TAB, "&Previous tab\tCtrl+Shift+Tab")?;
+        item(window, cmd::TAB_LEFT, "Move tab &left\tCtrl+Shift+PgUp")?;
+        item(window, cmd::TAB_RIGHT, "Move tab ri&ght\tCtrl+Shift+PgDn")?;
+        separator(window)?;
+        let names = ["left", "right", "up", "down"];
+        let keys = ["Left", "Right", "Up", "Down"];
+        for (i, (name, key)) in names.iter().zip(keys).enumerate() {
+            item(
+                window,
+                cmd::FOCUS + i as u32,
+                &format!("Focus pane {name}\tAlt+{key}"),
+            )?;
+        }
+        separator(window)?;
+        for (i, (name, key)) in names.iter().zip(keys).enumerate() {
+            item(
+                window,
+                cmd::RESIZE + i as u32,
+                &format!("Grow pane {name}\tAlt+Shift+{key}"),
+            )?;
+        }
+        separator(window)?;
+        item(window, cmd::CLOSE_PANE, "&Close pane\tCtrl+Shift+W")?;
+        item(window, cmd::CLOSE_TAB, "Clos&e tab\tCtrl+F4")?;
+
+        let help = CreatePopupMenu()?;
+        item(help, cmd::UPDATE_CHECK, "Check for &updates...")?;
+        item(help, cmd::UPDATE_WEEKLY, "Check for updates &weekly")?;
+        separator(help)?;
+        item(help, cmd::ABOUT, "&About FeroSSH")?;
+
+        let bar = CreateMenu()?;
+        AppendMenuW(bar, MF_POPUP, file.0 as usize, w!("&File"))?;
+        AppendMenuW(bar, MF_POPUP, edit.0 as usize, w!("&Edit"))?;
+        AppendMenuW(bar, MF_POPUP, view.0 as usize, w!("&Settings"))?;
+        AppendMenuW(bar, MF_POPUP, tools.0 as usize, w!("&Tools"))?;
+        AppendMenuW(bar, MF_POPUP, window.0 as usize, w!("&Window"))?;
+        AppendMenuW(bar, MF_POPUP, session.0 as usize, w!("&Session"))?;
+        AppendMenuW(bar, MF_POPUP, help.0 as usize, w!("&Help"))?;
+        Ok(bar)
+    }
+}
+
+fn io_error(e: std::io::Error) -> windows::core::Error {
+    windows::core::Error::new(E_FAIL, e.to_string())
+}
+
+fn scale(dip: i32, dpi: u32) -> i32 {
+    dip * dpi as i32 / 96
+}
+
+fn padding(dpi: u32) -> i32 {
+    scale(PADDING_DIP, dpi)
+}
+
+/// Pixels between split panes.
+fn gap(dpi: u32) -> i32 {
+    scale(1, dpi).max(1)
+}
+
+/// Outer window size for a grid of `cols` x `rows` cells.
+fn window_size(m: &CellMetrics, cols: usize, rows: usize, dpi: u32, menu: bool) -> (i32, i32) {
+    let pad = padding(dpi);
+    client_to_window(
+        cols as i32 * m.width as i32 + 2 * pad,
+        rows as i32 * m.height as i32 + 2 * pad,
+        dpi,
+        menu,
+    )
+}
+
+fn client_to_window(w: i32, h: i32, dpi: u32, menu: bool) -> (i32, i32) {
+    let mut r = RECT {
+        left: 0,
+        top: 0,
+        right: w,
+        bottom: h,
+    };
+    // SAFETY: valid pointer to a local rect. On failure the client size is
+    // used as is, which only makes the window slightly small.
+    let _ = unsafe { AdjustWindowRectExForDpi(&mut r, STYLE, menu, EX_STYLE, dpi) };
+    (r.right - r.left, r.bottom - r.top)
+}
+
+fn win_rect(r: Rect) -> RECT {
+    RECT {
+        left: r.x,
+        top: r.y,
+        right: r.right(),
+        bottom: r.bottom(),
+    }
+}
+
+fn pixel(r: Rect) -> PixelRect {
+    PixelRect {
+        left: r.x,
+        top: r.y,
+        right: r.right(),
+        bottom: r.bottom(),
+    }
+}
+
+/// `r` grown by `by` pixels on every side.
+fn mix(a: Rgb, b: Rgb, amount: f32) -> Rgb {
+    let m = |x: u8, y: u8| (f32::from(x) * (1.0 - amount) + f32::from(y) * amount).round() as u8;
+    Rgb::new(m(a.r, b.r), m(a.g, b.g), m(a.b, b.b))
+}
+
+/// The four thin rects that outline `r`, `t` pixels thick.
+fn frame(r: Rect, t: i32, colour: Rgb, out: &mut Vec<(PixelRect, Rgb)>) {
+    for e in [
+        Rect::new(r.x, r.y, r.w, t),
+        Rect::new(r.x, r.bottom() - t, r.w, t),
+        Rect::new(r.x, r.y, t, r.h),
+        Rect::new(r.right() - t, r.y, t, r.h),
+    ] {
+        out.push((pixel(e), colour));
+    }
+}
+
+/// The modifier keys held now.
+fn key_mods() -> Mods {
+    // SAFETY: plain key-state queries.
+    let down = |vk: VIRTUAL_KEY| unsafe { GetKeyState(i32::from(vk.0)) } < 0;
+    Mods {
+        shift: down(VK_SHIFT),
+        alt: down(VK_MENU),
+        ctrl: down(VK_CONTROL),
+    }
+}
+
+/// Removes the WM_CHAR or WM_SYSCHAR that TranslateMessage queued for a
+/// key this window already handled on key-down.
+fn drop_pending_char(hwnd: HWND) {
+    let mut msg = MSG::default();
+    // SAFETY: our window and a local out-pointer.
+    unsafe {
+        let _ = PeekMessageW(&mut msg, Some(hwnd), WM_CHAR, WM_CHAR, PM_REMOVE);
+        let _ = PeekMessageW(&mut msg, Some(hwnd), WM_SYSCHAR, WM_SYSCHAR, PM_REMOVE);
+    }
+}
+
+/// The terminal key for a virtual key, if it is one that does not type
+/// text.
+fn terminal_key(vk: VIRTUAL_KEY) -> Option<Key> {
+    Some(match vk {
+        VK_UP => Key::Up,
+        VK_DOWN => Key::Down,
+        VK_LEFT => Key::Left,
+        VK_RIGHT => Key::Right,
+        VK_HOME => Key::Home,
+        VK_END => Key::End,
+        VK_INSERT => Key::Insert,
+        VK_DELETE => Key::Delete,
+        VK_PRIOR => Key::PageUp,
+        VK_NEXT => Key::PageDown,
+        VK_BACK => Key::Backspace,
+        VK_TAB => Key::Tab,
+        VK_RETURN => Key::Enter,
+        VK_ESCAPE => Key::Escape,
+        v if (VK_F1.0..=VK_F12.0).contains(&v.0) => Key::F((v.0 - VK_F1.0 + 1) as u8),
+        _ => return None,
+    })
+}
+
+/// The side pane key for a virtual key.
+fn side_key(vk: VIRTUAL_KEY, mods: Mods) -> Option<SideKey> {
+    Some(match vk {
+        VK_UP => SideKey::Up,
+        VK_DOWN => SideKey::Down,
+        VK_PRIOR => SideKey::PageUp,
+        VK_NEXT => SideKey::PageDown,
+        VK_HOME => SideKey::Home,
+        VK_END => SideKey::End,
+        VK_LEFT => SideKey::Left,
+        VK_RIGHT => SideKey::Right,
+        VK_RETURN => SideKey::Enter { split: mods.shift },
+        VK_ESCAPE => SideKey::Escape,
+        VK_BACK => SideKey::Backspace,
+        VK_DELETE => SideKey::Delete,
+        VK_TAB if !mods.ctrl => SideKey::Tab,
+        VK_F5 => SideKey::Refresh,
+        VK_F2 => SideKey::Edit,
+        VK_INSERT => SideKey::New,
+        v if mods.ctrl && !mods.alt && v == VIRTUAL_KEY(u16::from(b'D')) => {
+            SideKey::ToggleFavourite
+        }
+        _ => return None,
+    })
+}
+
+fn lparam_point(lparam: LPARAM) -> (i32, i32) {
+    let x = (lparam.0 & 0xFFFF) as u16 as i16;
+    let y = ((lparam.0 >> 16) & 0xFFFF) as u16 as i16;
+    (i32::from(x), i32::from(y))
+}
+
+/// What a key-down handler decided.
+enum KeyOutcome {
+    Handled,
+    /// Not ours: let DefWindowProc and the queued WM_CHAR handle it.
+    Default,
+    Run(Command),
+}
+
+/// Where a point in the client falls.
+enum Spot {
+    /// Column and row in the side pane's grid.
+    Side(usize, usize),
+    SideEdge,
+    Strip(usize),
+    Divider(layout::Divider),
+    Pane(PaneId),
+    Nothing,
+}
+
+fn clamp16(v: usize) -> u16 {
+    u16::try_from(v).unwrap_or(u16::MAX)
+}
+
+impl Window {
+    /// Wakes the window from a background thread: one WM_SHELL_OUTPUT per
+    /// batch.
+    fn notifier(&self) -> impl Fn() + Send + Clone + 'static {
+        let pending = self.output_pending.clone();
+        let hwnd = self.hwnd.0 as isize;
+        move || {
+            if !pending.swap(true, Ordering::AcqRel) {
+                // SAFETY: posting to our window; if it is gone the post
+                // fails harmlessly.
+                unsafe {
+                    let _ = PostMessageW(
+                        Some(HWND(hwnd as *mut c_void)),
+                        WM_SHELL_OUTPUT,
+                        WPARAM(0),
+                        LPARAM(0),
+                    );
+                }
+            }
+        }
+    }
+
+    fn focused_id(&self) -> PaneId {
+        self.ws.focused()
+    }
+
+    /// The panes of the active tab, in layout order.
+    fn visible_ids(&self) -> Vec<PaneId> {
+        self.ws.tab().map(|t| t.root.panes()).unwrap_or_default()
+    }
+
+    fn is_visible(&self, id: PaneId) -> bool {
+        self.ws.tab().is_some_and(|t| t.root.contains(id))
+    }
+
+    /// Whether `id` shows a focused cursor.
+    fn has_keyboard(&self, id: PaneId) -> bool {
+        self.focused && !self.side.focused && id == self.focused_id()
+    }
+
+    /// An id for a new shell or SFTP channel, below the forwarding
+    /// engine's range.
+    fn new_channel(&mut self) -> ChannelId {
+        let channel = self.next_channel;
+        self.next_channel = ((self.next_channel + 1) % crate::remote_app::FIRST_ID).max(1);
+        channel
+    }
+
+    /// The pane whose SSH session has `channel`: its shell, or a jump
+    /// host's login or stream on the way.
+    fn pane_of_channel(&self, channel: ChannelId) -> Option<PaneId> {
+        self.panes.values().find_map(|p| match &p.host {
+            Host::Ssh(s) if s.owns(channel) => Some(p.id),
+            Host::Telnet(s) if s.channel == channel => Some(p.id),
+            _ => None,
+        })
+    }
+
+    /// The pane with the SSH session for pane `id`: the gateway of a tmux
+    /// pane, else the pane itself.
+    fn host_pane(&self, id: PaneId) -> PaneId {
+        self.panes.get(&id).and_then(Pane::gateway).unwrap_or(id)
+    }
+
+    /// A tmux pane in tmux layout, whose place tmux decides: it does not
+    /// move between tabs natively.
+    fn locked(&self, id: PaneId) -> bool {
+        self.panes
+            .get(&id)
+            .and_then(Pane::gateway)
+            .and_then(|g| self.tmux.get(&g))
+            .is_some_and(|t| t.mode() == TmuxMode::Tmux)
+    }
+
+    fn locked_tab(&self, i: usize) -> bool {
+        self.ws
+            .tabs
+            .get(i)
+            .is_some_and(|t| t.root.panes().iter().any(|id| self.locked(*id)))
+    }
+
+    /// Lines of scrollback for `target`'s panes.
+    fn scrollback_for(&self, target: &Target) -> Option<usize> {
+        self.settings
+            .profile(&target.alias)
+            .and_then(|p| p.scrollback)
+            .or(self.settings.scrollback)
+    }
+
+    /// A tmux watcher for SSH pane `id`, with its host's preferences.
+    fn new_tmux(&self, id: PaneId) -> Tmux {
+        let (mode, history) = match self.panes.get(&id).map(|p| &p.host) {
+            Some(Host::Ssh(s)) => (
+                self.settings
+                    .profile(&s.target.alias)
+                    .and_then(|p| p.tmux_layout.as_deref())
+                    .and_then(TmuxMode::parse)
+                    .unwrap_or(TmuxMode::Ferossh),
+                self.scrollback_for(&s.target),
+            ),
+            _ => (TmuxMode::Ferossh, None),
+        };
+        let mut t = Tmux::new(
+            id,
+            mode,
+            history.unwrap_or(TermSettings::DEFAULT_SCROLLBACK),
+        );
+        // Not attached yet, so nothing to send.
+        let _ = t.want_keys(self.settings.tmux_keys);
+        t.start_dir = self.profile_start_dir(id);
+        t
+    }
+
+    /// The start directory in the profile of SSH pane `id`'s host.
+    fn profile_start_dir(&self, id: PaneId) -> Option<String> {
+        match self.panes.get(&id).map(|p| &p.host) {
+            Some(Host::Ssh(s)) => self
+                .settings
+                .profile(&s.target.alias)
+                .and_then(|p| p.start_dir.clone()),
+            _ => None,
+        }
+    }
+
+    /// Session > Start new tabs and panes in this directory, from pane
+    /// `pane`: tmux is asked for a tmux pane's directory (the answer
+    /// comes back as an action); an SSH shell's is the one it reported.
+    fn start_dir_here(&mut self, pane: PaneId) -> Option<Command> {
+        let host = self.host_pane(pane);
+        if host != pane {
+            let actions = self
+                .tmux
+                .get_mut(&host)
+                .filter(|t| t.active())
+                .map(|t| t.ask_dir(pane))
+                .unwrap_or_default();
+            self.run_tmux(host, actions);
+            return None;
+        }
+        let p = self.panes.get(&pane)?;
+        if !matches!(p.host, Host::Ssh(_)) {
+            return Some(Command::Notice(
+                "Only a pane connected to an SSH host has a start directory to save.".into(),
+            ));
+        }
+        let Some(dir) = p.cwd.clone() else {
+            return Some(Command::Notice(
+                "FeroSSH does not know this shell's directory: it reports none and has a \
+                 prompt FeroSSH does not read. Type the directory in Settings > Connection \
+                 manager, Edit connection, Start dir."
+                    .into(),
+            ));
+        };
+        self.save_start_dir(pane, &String::from_utf8_lossy(&dir))
+    }
+
+    /// Keeps `dir` as the start directory of SSH pane `gateway`'s host:
+    /// in its profile, and for the tmux sessions on that host now.
+    fn save_start_dir(&mut self, gateway: PaneId, dir: &str) -> Option<Command> {
+        let Some(Host::Ssh(s)) = self.panes.get(&gateway).map(|p| &p.host) else {
+            return None;
+        };
+        let alias = s.target.alias.clone();
+        let Some(dir) = ferossh_config::settings::start_dir(dir) else {
+            return Some(Command::Notice(
+                "This directory's name cannot be typed safely at a shell, so it is not saved."
+                    .into(),
+            ));
+        };
+        self.settings.profile_mut(&alias).start_dir = Some(dir.clone());
+        self.save_settings();
+        let gateways: Vec<PaneId> = self.tmux.keys().copied().collect();
+        for g in gateways {
+            let same = matches!(
+                self.panes.get(&g).map(|p| &p.host),
+                Some(Host::Ssh(o)) if o.target.alias.eq_ignore_ascii_case(&alias)
+            );
+            if same && let Some(t) = self.tmux.get_mut(&g) {
+                t.start_dir = Some(dir.clone());
+            }
+        }
+        Some(Command::Notice(format!(
+            "New tabs and panes on {alias} start in {dir} now, also after FeroSSH restarts. \
+             New tabs and panes opened from a pane whose directory FeroSSH knows still \
+             follow that pane. Change or clear it in Edit connection, Start dir."
+        )))
+    }
+
+    /// Writes to the host of SSH pane `id`, past any local prompt: tmux
+    /// commands, and the line that starts tmux.
+    fn send_host(&mut self, id: PaneId, bytes: &[u8]) {
+        let effects = match self.panes.get_mut(&id).map(|p| &mut p.host) {
+            Some(Host::Ssh(s)) => s.input(bytes),
+            _ => return,
+        };
+        self.apply(id, effects);
+    }
+
+    /// Output from SSH pane `id`'s host, which may be tmux in control
+    /// mode.
+    fn host_output(&mut self, id: PaneId, bytes: &[u8]) {
+        if !self.tmux.contains_key(&id) {
+            let t = self.new_tmux(id);
+            self.tmux.insert(id, t);
+        }
+        let Some(t) = self.tmux.get_mut(&id) else {
+            return;
+        };
+        let actions = t.feed(&mut self.ws, bytes);
+        self.run_tmux(id, actions);
+    }
+
+    /// Carries out what gateway `gateway`'s tmux watcher decided.
+    fn run_tmux(&mut self, gateway: PaneId, actions: Vec<tmux::Action>) {
+        let mut structure = false;
+        for action in actions {
+            match action {
+                tmux::Action::Write(bytes) => self.send_host(gateway, &bytes),
+                tmux::Action::GatewayOutput(bytes) => {
+                    if let Some(p) = self.panes.get_mut(&gateway) {
+                        p.term.feed(&bytes);
+                    }
+                    self.log(gateway, &bytes);
+                    self.watch_output(gateway, &bytes);
+                }
+                tmux::Action::Create {
+                    native,
+                    look,
+                    cols,
+                    rows,
+                    ..
+                } => self.add_tmux_pane(gateway, native, &look, cols, rows),
+                tmux::Action::Feed { native, bytes } => {
+                    if let Some(p) = self.panes.get_mut(&native) {
+                        p.term.feed(&bytes);
+                    }
+                    self.log(native, &bytes);
+                    self.watch_output(native, &bytes);
+                }
+                tmux::Action::Resize { native, cols, rows } => {
+                    if let Some(p) = self.panes.get_mut(&native) {
+                        p.term.resize(usize::from(cols), usize::from(rows));
+                        p.grid.mark_all_dirty();
+                    }
+                }
+                tmux::Action::Remove { native } => {
+                    self.stop_log(native);
+                    self.panes.remove(&native);
+                    if self.mouse.pane == Some(native) {
+                        self.mouse.pane = None;
+                    }
+                    structure = true;
+                }
+                tmux::Action::Focus { .. }
+                | tmux::Action::ShowGateway
+                | tmux::Action::Structure => structure = true,
+                tmux::Action::Picker(names) => {
+                    self.queued.push(Command::TmuxPicker { gateway, names });
+                }
+                tmux::Action::Notice(text) => {
+                    let text = crate::ssh::sanitize(&text);
+                    self.show(gateway, &format!("\x1b[0;90m{text}\x1b[0m\r\n"));
+                }
+                tmux::Action::StartDir(dir) => {
+                    if let Some(command) = self.save_start_dir(gateway, &dir) {
+                        self.queued.push(command);
+                    }
+                }
+            }
+        }
+        if structure {
+            self.after_structure_change();
+        }
+    }
+
+    /// A native pane for a tmux pane: the gateway's look, with the font,
+    /// size and theme the session saved for its window.
+    fn add_tmux_pane(
+        &mut self,
+        gateway: PaneId,
+        native: PaneId,
+        look: &tmux_saved::Look,
+        cols: u16,
+        rows: u16,
+    ) {
+        let Some(g) = self.panes.get(&gateway) else {
+            return;
+        };
+        let (label, scrollback) = match &g.host {
+            Host::Ssh(s) => (s.target.label(), self.scrollback_for(&s.target)),
+            _ => (String::new(), None),
+        };
+        let mut font = g.font.clone();
+        let mut metrics = g.metrics;
+        let theme = look
+            .theme
+            .as_deref()
+            .and_then(Theme::by_name)
+            .unwrap_or_else(|| g.theme.clone());
+        if look.font.is_some() || look.size.is_some() {
+            let wanted = FontSpec::new(
+                look.font.as_deref().unwrap_or(&font.family),
+                look.size.unwrap_or(font.size_pt),
+            );
+            if let Ok(m) = self.renderer.metrics(&wanted, self.dpi) {
+                font = wanted;
+                metrics = m;
+            }
+        }
+        let mut pane = new_pane(native, font, theme, metrics, scrollback);
+        pane.term.resize(usize::from(cols), usize::from(rows));
+        pane.host = Host::Tmux { gateway, label };
+        pane.name = look.name.as_deref().and_then(live::clean_name);
+        pane.log.enabled = self.panes.get(&gateway).is_some_and(|g| g.log.enabled);
+        pane.log.raw = self.panes.get(&gateway).is_some_and(|g| g.log.raw);
+        self.panes.insert(native, pane);
+        self.start_log(native);
+    }
+
+    /// Tells each tmux session its panes' sizes, and saves its layout and
+    /// looks when they changed.
+    fn sync_tmux(&mut self) {
+        let pad = padding(self.dpi);
+        let gateways: Vec<PaneId> = self
+            .tmux
+            .iter()
+            .filter(|(_, t)| t.active())
+            .map(|(g, _)| *g)
+            .collect();
+        for g in gateways {
+            let panes = &self.panes;
+            let cells = |n: PaneId| {
+                let p = panes.get(&n)?;
+                let m = p.metrics;
+                let cols = (p.rect.w - 2 * pad).max(0) / m.width.max(1) as i32;
+                let rows = (p.rect.h - 2 * pad).max(0) / m.height.max(1) as i32;
+                Some((
+                    u16::try_from(cols.max(1)).unwrap_or(u16::MAX),
+                    u16::try_from(rows.max(1)).unwrap_or(u16::MAX),
+                ))
+            };
+            let look_of = |n: PaneId| {
+                panes
+                    .get(&n)
+                    .map(|p| tmux_saved::Look {
+                        font: Some(p.font.family.clone()),
+                        size: Some(p.font.size_pt),
+                        theme: Some(p.theme.name.to_owned()),
+                        name: p.name.clone(),
+                    })
+                    .unwrap_or_default()
+            };
+            let Some(t) = self.tmux.get_mut(&g) else {
+                continue;
+            };
+            let mut actions = t.sync_sizes(&self.ws, &cells);
+            actions.extend(t.sync_saved(&self.ws, &look_of));
+            self.run_tmux(g, actions);
+        }
+    }
+
+    /// SSH pane `id` lost its connection: if it ran tmux, its panes go
+    /// and the session is attached again after the next login.
+    fn tmux_lost(&mut self, id: PaneId) {
+        let key = self.pane_sftp_key(id);
+        let Some(t) = self.tmux.get_mut(&id) else {
+            return;
+        };
+        let actions = t.connection_lost(&mut self.ws);
+        if let (Some(name), Some(key)) = (t.reattach.take(), key) {
+            self.reattach.insert(id, (key, name));
+        }
+        self.run_tmux(id, actions);
+    }
+
+    /// After a login on SSH pane `id`: attach tmux again after a dropped
+    /// connection, or when the host's profile asks for it. Only one pane
+    /// per host runs tmux, so a second tab on the host stays a shell.
+    fn tmux_after_login(&mut self, id: PaneId) {
+        let Some(Host::Ssh(s)) = self.panes.get(&id).map(|p| &p.host) else {
+            return;
+        };
+        let key = sftp_key(&s.target);
+        let profile = self
+            .settings
+            .profile(&s.target.alias)
+            .and_then(|p| p.tmux.clone());
+        let name = match self.reattach.remove(&id) {
+            Some((k, name)) if k == key => name,
+            _ => match profile {
+                Some(name) => name,
+                None => return,
+            },
+        };
+        let busy = self.tmux.iter().any(|(g, t)| {
+            *g != id && t.active() && self.pane_sftp_key(*g).as_deref() == Some(key.as_str())
+        });
+        if !busy {
+            self.attach_tmux(id, &name, false);
+        }
+    }
+
+    /// Types the `cd` to the directory of the pane a new tab or pane was
+    /// opened from at pane `id`'s freshly logged-in shell. Once: a
+    /// reconnect starts where the server starts it. Otherwise (the
+    /// directory was not known, or later logins) the host's start
+    /// directory, after every login.
+    fn cd_after_login(&mut self, id: PaneId) {
+        let split_dir = self.panes.get_mut(&id).and_then(|p| p.start_dir.take());
+        let Some(dir) = split_dir.or_else(|| self.profile_start_dir(id).map(String::into_bytes))
+        else {
+            return;
+        };
+        if let Some(line) = same_dir::cd_line(&dir) {
+            self.send_host(id, &line);
+        }
+    }
+
+    /// Types the line that starts tmux in control mode at pane `id`'s
+    /// shell.
+    fn attach_tmux(&mut self, id: PaneId, name: &str, pick: bool) {
+        if !self.tmux.contains_key(&id) {
+            let t = self.new_tmux(id);
+            self.tmux.insert(id, t);
+        }
+        let Some(t) = self.tmux.get_mut(&id) else {
+            return;
+        };
+        let line = t.attach(name, pick);
+        self.send_host(id, &line);
+    }
+
+    /// Feeds local text (not from the host) to a pane's terminal.
+    fn show(&mut self, id: PaneId, text: &str) {
+        if self.run_login.contains(&id)
+            && let Some(line) = batch::last_line(text)
+        {
+            self.run_notes.insert(id, line);
+        }
+        if let Some(p) = self.panes.get_mut(&id) {
+            p.term.feed(text.as_bytes());
+        }
+    }
+
+    /// Ends whatever the pane is connected to.
+    fn end_host(&mut self, id: PaneId) {
+        self.scripts.remove(&id);
+        self.zmodem.remove(&id);
+        self.retries.remove(&id);
+        // tmux on it is over too; a reattach after a dropped connection
+        // stays wanted.
+        if let Some(mut t) = self.tmux.remove(&id) {
+            let actions = t.connection_lost(&mut self.ws);
+            self.run_tmux(id, actions);
+        }
+        let effects = match self.panes.get_mut(&id).map(|p| &mut p.host) {
+            Some(Host::Ssh(session)) => session.close(),
+            Some(Host::Telnet(session)) => session.close(),
+            _ => Vec::new(),
+        };
+        self.apply(id, effects);
+        self.stop_log(id);
+        if let Some(p) = self.panes.get_mut(&id) {
+            p.host = Host::Ask(String::new());
+            p.desktop = None;
+            p.title = None;
+            p.cwd = None;
+            p.cwd_host = None;
+            p.cwd_reported = false;
+            p.prompt_host = None;
+            p.start_dir = None;
+            p.local_cwd = None;
+        }
+        self.prune_sftp();
+        self.prune_forwards();
+    }
+
+    fn start_shell(&mut self, id: PaneId) {
+        self.start_shell_in(id, None);
+    }
+
+    /// Starts the local shell in folder `dir`, or in the profile folder.
+    fn start_shell_in(&mut self, id: PaneId, dir: Option<&str>) {
+        self.end_host(id);
+        let notify = self.notifier();
+        let Some(p) = self.panes.get_mut(&id) else {
+            return;
+        };
+        let (cols, rows) = (p.term.cols(), p.term.rows());
+        match Shell::spawn(&self.command, cols, rows, dir, notify) {
+            Ok(shell) => {
+                p.host = Host::Local {
+                    shell: Some(shell),
+                    exited: false,
+                };
+                self.start_log(id);
+            }
+            Err(e) => {
+                let text = format!(
+                    "\x1b[0;31mCould not start {}: {}\x1b[0m\r\nPress Enter to try again.\r\n",
+                    self.command,
+                    e.message()
+                );
+                p.host = Host::Local {
+                    shell: None,
+                    exited: true,
+                };
+                self.show(id, &text);
+            }
+        }
+        self.update_title();
+        self.refresh(id);
+    }
+
+    /// Shows the connect prompt.
+    fn ask_destination(&mut self, id: PaneId) {
+        self.end_host(id);
+        if let Some(p) = self.panes.get_mut(&id) {
+            p.term.scroll_to_bottom();
+        }
+        self.show(id, &format!("\r\n{CONNECT_PROMPT}"));
+        self.update_title();
+        self.refresh_chrome();
+        self.refresh(id);
+    }
+
+    fn set_title_text(&self, text: &str) {
+        // SAFETY: our window and a valid string.
+        let _ = unsafe { SetWindowTextW(self.hwnd, &HSTRING::from(text)) };
+    }
+
+    /// The window title follows the focused pane.
+    fn update_title(&self) {
+        if self.standby.capture == Capture::Waiting {
+            self.set_title_text(&format!(
+                "Press the new standby hotkey, or Esc to cancel - {APP_NAME}"
+            ));
+            return;
+        }
+        let focused = self.focused_id();
+        let label = self.panes.get(&focused).map(Pane::label);
+        let badge = self.forwarding(&self.forward_view(), focused).badge();
+        let legacy = if self.unencrypted(focused) {
+            " ⚠ (Telnet, unencrypted)"
+        } else if self.legacy_in_use(focused) {
+            tabstrip::LEGACY_BADGE
+        } else {
+            ""
+        };
+        let broadcast = match self.broadcast {
+            broadcast::Scope::Off => "",
+            broadcast::Scope::Tab => " (broadcast to tab)",
+            broadcast::Scope::All => " (broadcast to all tabs)",
+        };
+        match label {
+            Some(l) if l != "new tab" => {
+                self.set_title_text(&format!("{l}{legacy}{badge}{broadcast} - {APP_NAME}"));
+            }
+            _ => self.set_title_text(APP_NAME),
+        }
+    }
+
+    /// Every connection's forwards, from the forwarding engine.
+    fn forward_view(&self) -> Vec<ConnView> {
+        let mut views: Vec<ConnView> = self
+            .workers
+            .values()
+            .flat_map(|w| w.forwarder.view())
+            .collect();
+        views.sort_by_key(|v| v.connection);
+        views
+    }
+
+    /// What the badge of pane `id`'s tab shows.
+    fn forwarding(&self, views: &[ConnView], id: PaneId) -> Forwarding {
+        let Some(connection) = self.pane_connection(id) else {
+            return Forwarding::None;
+        };
+        match views.iter().find(|v| v.connection == connection) {
+            Some(v) if v.inbound() => Forwarding::Inbound,
+            Some(v) if !v.forwards.is_empty() => Forwarding::Outbound,
+            _ => Forwarding::None,
+        }
+    }
+
+    /// What the session manager lists: each tab's sessions in tab order,
+    /// then a snippet run's sessions that no tab shows. Empty connect
+    /// prompts are left out.
+    fn open_sessions(&self) -> Vec<LiveSession> {
+        let views = self.forward_view();
+        let focused = self.focused_id();
+        let mut hidden: Vec<PaneId> = self
+            .run_hidden
+            .iter()
+            .chain(&self.launch_hidden)
+            .copied()
+            .collect();
+        hidden.sort_unstable();
+        let panes = self
+            .ws
+            .tabs
+            .iter()
+            .enumerate()
+            .flat_map(|(i, t)| t.root.panes().into_iter().map(move |id| (Some(i), id)))
+            .chain(hidden.into_iter().map(|id| (None, id)));
+        let state = |s: State| match s {
+            State::Connected => LiveState::Connected,
+            State::Connecting => LiveState::Connecting,
+            State::Blocked | State::Ended => LiveState::Ended,
+        };
+        let mut out = Vec::new();
+        for (tab, id) in panes {
+            let Some(p) = self.panes.get(&id) else {
+                continue;
+            };
+            let mut notes = Vec::new();
+            let (kind, target, mut st) = match &p.host {
+                Host::Ask(_) => continue,
+                Host::Ssh(s) => {
+                    if self.via.get(&s.connection).is_some_and(|v| !v.is_empty())
+                        || self.proxies.contains_key(&s.connection)
+                    {
+                        notes.push("via jump host");
+                    }
+                    (live::Kind::Ssh, s.target.label(), state(s.state()))
+                }
+                Host::Telnet(s) => {
+                    notes.push("unencrypted");
+                    (live::Kind::Telnet, s.target.label(), state(s.state()))
+                }
+                Host::Serial { port, target, .. } => (
+                    live::Kind::Serial,
+                    target.label(),
+                    if port.is_some() {
+                        LiveState::Connected
+                    } else {
+                        LiveState::Ended
+                    },
+                ),
+                Host::Tmux { label, .. } => (live::Kind::Tmux, label.clone(), LiveState::Connected),
+                Host::Desktop { label, .. } => {
+                    (live::Kind::Desktop, label.clone(), LiveState::Connected)
+                }
+                Host::Local { exited, .. } => (
+                    live::Kind::Local,
+                    "local shell".to_owned(),
+                    if *exited {
+                        LiveState::Ended
+                    } else {
+                        LiveState::Connected
+                    },
+                ),
+            };
+            if self.retries.contains_key(&id) {
+                st = LiveState::Reconnecting;
+            }
+            if self.tmux.get(&id).is_some_and(|t| t.active()) {
+                notes.push("tmux");
+            }
+            if self.forwarding(&views, id) != Forwarding::None {
+                notes.push("forwards");
+            }
+            if self.legacy_in_use(id) {
+                notes.push("older crypto");
+            }
+            if p.log.enabled {
+                notes.push("logging");
+            }
+            if tab.is_none() {
+                notes.push("script run");
+            }
+            out.push(LiveSession {
+                pane: id,
+                tab,
+                kind,
+                target,
+                name: p.name.clone(),
+                title: p.title.clone().filter(|t| !t.is_empty()),
+                state: st,
+                notes,
+                focused: tab.is_some() && id == focused,
+            });
+        }
+        out
+    }
+
+    fn live_action(&mut self, action: Option<LiveAction>) -> Option<Command> {
+        match action? {
+            LiveAction::Show(id) => {
+                if self.run_hidden.contains(&id) {
+                    return self.show_run_pane(id);
+                }
+                if self.launch_hidden.contains(&id) {
+                    self.reveal_launch(id);
+                    return None;
+                }
+                self.focus_pane(id);
+                self.focus_terminal();
+                None
+            }
+            LiveAction::Close(id) => {
+                let s = self.open_sessions().into_iter().find(|s| s.pane == id)?;
+                let in_tabs: usize = self.ws.tabs.iter().map(|t| t.root.panes().len()).sum();
+                Some(Command::CloseSession {
+                    pane: id,
+                    label: s.target,
+                    live: s.state != LiveState::Ended,
+                    last: s.tab.is_some() && in_tabs == 1,
+                })
+            }
+            LiveAction::Rename(id, name) => {
+                self.rename_session(id, name);
+                self.end_rename();
+                None
+            }
+            LiveAction::Leave => {
+                self.focus_terminal();
+                None
+            }
+        }
+    }
+
+    /// Window > Rename session, a double-click on a tab, or its right-click
+    /// menu: the session manager opens with pane `id`'s name to type.
+    fn start_rename(&mut self, id: PaneId) {
+        if !self.open_sessions().iter().any(|s| s.pane == id) {
+            return;
+        }
+        let back = self.rename_return.take();
+        let before = match (self.side.visible, self.side.view) {
+            (true, SideView::Palette) => {
+                self.palette_return = None;
+                None
+            }
+            (visible, view) => visible.then_some(view),
+        };
+        if !(self.side.visible && self.side.view == SideView::Live) {
+            self.show_side(SideView::Live, true);
+        }
+        // A rename started during another keeps where the first goes back.
+        self.rename_return = Some(back.unwrap_or(before));
+        self.side.focused = true;
+        let all = self.open_sessions();
+        let rows = self.side.grid.rows();
+        self.live_view.start_rename(id, &all, rows);
+        self.refresh_chrome();
+        self.request_full_redraw();
+        self.refresh(self.focused_id());
+    }
+
+    /// After a rename that opened the session manager: the side pane goes
+    /// back to what it showed, and the keyboard to the terminal.
+    fn end_rename(&mut self) {
+        match self.rename_return.take() {
+            None => {}
+            Some(None) => self.hide_side(),
+            Some(Some(SideView::Live)) => self.focus_terminal(),
+            Some(Some(view)) => {
+                self.show_side(view, false);
+                self.focus_terminal();
+            }
+        }
+        self.update_menu_checks();
+    }
+
+    /// Gives pane `id`'s session the name (`None` clears it). A tmux pane's
+    /// window takes it too, and the session saves it with the layout.
+    fn rename_session(&mut self, id: PaneId, name: Option<String>) {
+        let name = name.as_deref().and_then(live::clean_name);
+        let Some(p) = self.panes.get_mut(&id) else {
+            return;
+        };
+        p.name = name.clone();
+        if let Some(gateway) = p.gateway()
+            && let Some(t) = self.tmux.get_mut(&gateway).filter(|t| t.active())
+        {
+            let actions = t.rename(id, name.as_deref());
+            self.run_tmux(gateway, actions);
+            self.sync_tmux();
+        }
+        self.update_title();
+        self.refresh_chrome();
+    }
+
+    /// The session manager's Delete, once the user said yes: closes the
+    /// session's pane, or ends a snippet run's session that no tab shows.
+    fn close_session(&mut self, id: PaneId) -> Option<Command> {
+        if self.run_hidden.contains(&id) {
+            self.drop_run_pane(id);
+            self.refresh_chrome();
+            return None;
+        }
+        if self.launch_hidden.contains(&id) {
+            self.abandon_launch(id);
+            return None;
+        }
+        self.launches.remove(&id);
+        self.close_pane(id)
+    }
+
+    /// The X server forwarded X11 goes to: the X11Display setting, else
+    /// `DISPLAY`, else display 0 on this PC.
+    fn x11_display(&self) -> std::result::Result<Display, String> {
+        let text = self
+            .settings
+            .x11_display
+            .clone()
+            .or_else(|| std::env::var("DISPLAY").ok().filter(|d| !d.is_empty()))
+            .unwrap_or_else(|| "localhost:0".to_owned());
+        Display::parse(&text).ok_or(text)
+    }
+
+    /// X11 forwarding for a new shell in pane `id`: the screen and the
+    /// cookie the X server expects, from `XAUTHORITY` or `~/.Xauthority`
+    /// (none, for an X server without access control).
+    fn x11_auth(&mut self, id: PaneId) -> Option<X11Auth> {
+        let display = match self.x11_display() {
+            Ok(d) => d,
+            Err(text) => {
+                let text = format!(
+                    "\x1b[0;31mX11Display \"{}\" is not a display (try localhost:0); X11 is \
+                     not forwarded.\x1b[0m\r\n",
+                    crate::ssh::sanitize(&text)
+                );
+                self.show(id, &text);
+                return None;
+            }
+        };
+        let file = std::env::var_os("XAUTHORITY")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| home().join(".Xauthority"));
+        let entries = std::fs::read(file)
+            .map(|b| xauth_entries(&b))
+            .unwrap_or_default();
+        let (protocol, cookie) = find_cookie(&entries, &display).unwrap_or_default();
+        Some(X11Auth {
+            screen: display.screen,
+            protocol,
+            cookie,
+        })
+    }
+
+    /// A fresh login in pane `id`: starts the connection's forwards (an
+    /// empty list too, so forwards can be added) and says what runs.
+    fn start_forwards(&mut self, id: PaneId) {
+        let Some(Host::Ssh(s)) = self.panes.get(&id).map(|p| &p.host) else {
+            return;
+        };
+        if s.connection != s.channel {
+            return;
+        }
+        let target = s.target.clone();
+        let connection = s.connection;
+        let x11 = target
+            .forward_x11
+            .then(|| self.x11_display().ok())
+            .flatten();
+        let mut notes: Vec<String> = target.forwards.iter().map(ToString::to_string).collect();
+        if let Some(d) = &x11 {
+            notes.push(format!("X11 to {d}"));
+        }
+        let Some(w) = self.workers.get(&connection) else {
+            return;
+        };
+        w.forwarder.start(
+            connection,
+            target.label(),
+            ForwardSetup {
+                forwards: target.forwards,
+                gateway_ports: target.gateway_ports,
+                x11,
+            },
+        );
+        if !notes.is_empty() {
+            let text = format!(
+                "\x1b[0;90mForwarding {}. Ctrl+Shift+P lists the forwards.\x1b[0m\r\n",
+                notes.join(", ")
+            );
+            self.show(id, &text);
+        }
+    }
+
+    /// Stops the forwards of connections no logged-in pane and no remote
+    /// desktop uses any more.
+    fn prune_forwards(&mut self) {
+        self.prune_vdesks();
+        for w in self.workers.values() {
+            for v in w.forwarder.view() {
+                let used = self.panes.values().any(|p| match &p.host {
+                    Host::Ssh(s) => s.connection == v.connection && s.state() == State::Connected,
+                    Host::Desktop { connection, .. } => {
+                        *connection == v.connection && p.desktop.is_some()
+                    }
+                    _ => false,
+                }) || self.mstsc.iter().any(|(_, c)| *c == v.connection);
+                if !used {
+                    w.forwarder.stop(v.connection);
+                }
+            }
+        }
+        self.prune_workers();
+    }
+
+    /// Retires the workers of connections that no pane logs in on or is
+    /// logged in on, no remote desktop and no SFTP channel uses: each ends
+    /// [`RETIRE_GRACE`] later.
+    fn prune_workers(&mut self) {
+        let unused: Vec<ChannelId> = self
+            .workers
+            .keys()
+            .copied()
+            .filter(|&c| !self.connection_in_use(c))
+            .collect();
+        if unused.is_empty() {
+            return;
+        }
+        let now = Instant::now();
+        for c in unused {
+            if let Some(w) = self.workers.remove(&c) {
+                self.retiring.push((w, now));
+            }
+            self.proxies.remove(&c);
+        }
+        let workers = &self.workers;
+        self.sftp_routes.retain(|_, c| workers.contains_key(c));
+        self.via.retain(|c, _| workers.contains_key(c));
+        // SAFETY: our window and timer.
+        unsafe {
+            SetTimer(
+                Some(self.hwnd),
+                TIMER_RETIRE,
+                u32::try_from(RETIRE_GRACE.as_millis()).unwrap_or(u32::MAX),
+                None,
+            );
+        }
+    }
+
+    /// Whether anything still needs the SSH connection `connection`, or a
+    /// connection that goes through it.
+    fn connection_in_use(&self, connection: ChannelId) -> bool {
+        self.used_directly(connection)
+            || self
+                .via
+                .iter()
+                .any(|(c, hops)| hops.contains(&connection) && self.used_directly(*c))
+    }
+
+    fn used_directly(&self, connection: ChannelId) -> bool {
+        self.panes.values().any(|p| match &p.host {
+            Host::Ssh(s) => {
+                s.connection == connection
+                    && matches!(s.state(), State::Connecting | State::Connected)
+            }
+            Host::Telnet(s) => {
+                s.connection() == connection
+                    && matches!(s.state(), State::Connecting | State::Connected)
+            }
+            Host::Desktop { connection: c, .. } => *c == connection && p.desktop.is_some(),
+            _ => false,
+        }) || self.desktops.keys().any(|(c, ..)| *c == connection)
+            // A virtual desktop on its way to a tab.
+            || self
+                .vdesks
+                .values()
+                .any(|v| v.connection == connection && v.tab && !v.shown)
+            || self
+                .sftp
+                .values()
+                .any(|r| r.connection() == Some(connection))
+            || crate::remote_app::connections_in_use().contains(&connection)
+            || self.mstsc.iter().any(|(_, c)| *c == connection)
+    }
+
+    /// Ends the workers that retired long enough ago.
+    fn on_retire_timer(&mut self) {
+        self.retiring
+            .retain(|(_, since)| since.elapsed() < RETIRE_GRACE);
+        if self.retiring.is_empty() {
+            // SAFETY: our window and timer.
+            unsafe {
+                let _ = KillTimer(Some(self.hwnd), TIMER_RETIRE);
+            }
+        }
+    }
+
+    /// The SSH connection pane `id` is logged in on; a tmux pane's is its
+    /// gateway's.
+    /// Whether pane `id`'s connection (its gateway's, for a tmux pane)
+    /// uses the opt-in legacy algorithms.
+    fn legacy_in_use(&self, id: PaneId) -> bool {
+        match self.panes.get(&id).map(|p| &p.host) {
+            Some(Host::Ssh(s)) => s.legacy_in_use(),
+            Some(Host::Tmux { gateway, .. }) => self.legacy_in_use(*gateway),
+            _ => false,
+        }
+    }
+
+    /// Whether pane `id` is a Telnet session, which nothing encrypts.
+    fn unencrypted(&self, id: PaneId) -> bool {
+        matches!(self.panes.get(&id).map(|p| &p.host), Some(Host::Telnet(_)))
+    }
+
+    fn pane_connection(&self, id: PaneId) -> Option<ChannelId> {
+        match self.panes.get(&id).map(|p| &p.host)? {
+            Host::Ssh(s) if s.state() == State::Connected => Some(s.connection),
+            Host::Tmux { gateway, .. } => self.pane_connection(*gateway),
+            _ => None,
+        }
+    }
+
+    /// Session > Open remote desktop: asks the forwarding engine for a
+    /// tunnel to the host's RDP port (or, for the built-in viewer in a
+    /// tab, its RDP or VNC port); [`Self::desktop_events`] opens the
+    /// viewer once it listens.
+    fn open_desktop(&mut self, pane: PaneId, tab: Option<Protocol>) -> Option<Command> {
+        let host = self.host_pane(pane);
+        let (Some(connection), Some(Host::Ssh(s))) = (
+            self.pane_connection(pane),
+            self.panes.get(&host).map(|p| &p.host),
+        ) else {
+            return Some(Command::Notice(NO_DESKTOP_HOST.into()));
+        };
+        let profile = self.settings.profile(&s.target.alias);
+        let label = s.target.label();
+        let size = self.fixed_desktop_size(&s.target.alias);
+        let clip_limit = self.desktop_clip_limit(&[&s.target.alias]);
+        let rdp_port = profile
+            .and_then(|p| p.desktop_port)
+            .unwrap_or(DEFAULT_DESKTOP_PORT);
+        let (port, local, want) = match tab {
+            Some(protocol) => {
+                let port = match protocol {
+                    Protocol::Rdp => rdp_port,
+                    Protocol::Vnc => profile.and_then(|p| p.vnc_port).unwrap_or(DEFAULT_VNC_PORT),
+                };
+                let user = s.target.user.clone();
+                // Only the viewer connects; any free port will do.
+                (
+                    port,
+                    0,
+                    DesktopWant::Tab(TabWant {
+                        label,
+                        user,
+                        protocol,
+                        vdesk: None,
+                        size,
+                        clip_limit,
+                    }),
+                )
+            }
+            None => (
+                rdp_port,
+                desktop_port_for(&label),
+                DesktopWant::Rdp {
+                    pane,
+                    size,
+                    clipboard: self.desktop_clip(clip_limit) == (true, true),
+                },
+            ),
+        };
+        let w = self.workers.get(&connection)?;
+        w.forwarder
+            .open_desktop(connection, "localhost", port, local);
+        self.desktops
+            .insert((connection, "localhost".to_owned(), port), want);
+        self.show(
+            pane,
+            &format!(
+                "\x1b[0;90mOpening the remote desktop on port {port} of the server...\x1b[0m\r\n"
+            ),
+        );
+        self.refresh(pane);
+        None
+    }
+
+    /// Opens a viewer on the desktop tunnels that are ready, and says why
+    /// the others failed.
+    fn desktop_events(&mut self) {
+        let events: Vec<DesktopEvent> = self
+            .workers
+            .values()
+            .flat_map(|w| w.forwarder.take_desktop_events())
+            .collect();
+        for event in events {
+            match event {
+                DesktopEvent::Ready {
+                    connection,
+                    host,
+                    port,
+                    addr,
+                } => match self.desktops.remove(&(connection, host.clone(), port)) {
+                    Some(DesktopWant::Rdp {
+                        pane,
+                        size,
+                        clipboard,
+                    }) => {
+                        let note = match launch_rdp_client(&addr, size, clipboard) {
+                            Ok(child) => {
+                                // The tunnel's connection stays while it runs.
+                                self.mstsc.push((child, connection));
+                                self.arm_launch_timer();
+                                format!(
+                                    "\x1b[0;90mRemote desktop tunnel at {addr}; Remote Desktop \
+                                     Connection opens on it{}. The connection stays while it \
+                                     runs.\x1b[0m\r\n",
+                                    if clipboard {
+                                        ""
+                                    } else {
+                                        ", without the clipboard"
+                                    }
+                                )
+                            }
+                            Err(e) => {
+                                self.reveal_launch(pane);
+                                format!(
+                                    "\x1b[0;31mThe remote desktop tunnel listens at {addr}, but \
+                                     Remote Desktop Connection (mstsc.exe) did not start: \
+                                     {e}\x1b[0m\r\n"
+                                )
+                            }
+                        };
+                        self.show(pane, &note);
+                        self.refresh(pane);
+                    }
+                    Some(DesktopWant::Tab(want)) => {
+                        self.desktop_tab(connection, want, &host, &addr);
+                    }
+                    Some(DesktopWant::Vnc {
+                        pane,
+                        password,
+                        clipboard,
+                    }) => {
+                        let note = match launch_vnc_viewer(&addr, clipboard) {
+                            Some(viewer) => format!(
+                                "\x1b[0;90mVirtual desktop tunnel at {addr}; {viewer} opens on \
+                                 it. VNC password: {}\x1b[0m\r\n",
+                                password.as_str()
+                            ),
+                            None => format!(
+                                "\x1b[0;33mThe virtual desktop listens at {addr} (VNC password: \
+                                 {}). No VNC viewer was found on this PC: install one (TigerVNC, \
+                                 TightVNC, RealVNC or UltraVNC) and point it there, or use \
+                                 ferossh-desktop.exe, which shows it in a tab.\x1b[0m\r\n",
+                                password.as_str()
+                            ),
+                        };
+                        self.show(pane, &note);
+                        self.refresh(pane);
+                    }
+                    None => {}
+                },
+                DesktopEvent::Failed {
+                    connection,
+                    host,
+                    port,
+                    why,
+                } => {
+                    // A launch that waited for this desktop is over.
+                    let waiting: Vec<PaneId> = self
+                        .launches
+                        .keys()
+                        .copied()
+                        .filter(|id| {
+                            matches!(self.panes.get(id).map(|p| &p.host),
+                                Some(Host::Ssh(s)) if s.connection == connection)
+                        })
+                        .collect();
+                    for id in waiting {
+                        self.abandon_launch(id);
+                    }
+                    let advice = match self.desktops.remove(&(connection, host, port)) {
+                        // The script started that server: nothing to advise.
+                        Some(DesktopWant::Vnc { .. })
+                        | Some(DesktopWant::Tab(TabWant { vdesk: Some(_), .. })) => "",
+                        Some(DesktopWant::Tab(TabWant {
+                            protocol: Protocol::Vnc,
+                            ..
+                        })) => {
+                            " Start a VNC server for your desktop there (x11vnc or TigerVNC \
+                             for X11, wayvnc or GNOME's VNC mode for Wayland), or set VncPort \
+                             in this host's profile if it listens elsewhere."
+                        }
+                        _ => {
+                            " Install xrdp (sudo apt install xrdp) or turn on GNOME Remote \
+                             Desktop, or set DesktopPort in this host's profile if it listens \
+                             elsewhere."
+                        }
+                    };
+                    self.queued.push(Command::Notice(format!("{why}{advice}")));
+                }
+            }
+        }
+    }
+
+    /// The most the connections `names` let copied text travel to and
+    /// from their desktops: each connection's `DesktopClipboard` only
+    /// narrows it.
+    fn desktop_clip_limit(&self, names: &[&str]) -> (bool, bool) {
+        names
+            .iter()
+            .filter_map(|n| self.settings.profile(n))
+            .map(|p| ferossh_config::settings::clipboard_ways(p.desktop_clipboard.as_deref()))
+            .fold((true, true), |(a, b), (x, y)| (a && x, b && y))
+    }
+
+    /// Which ways copied text travels for a desktop: the global
+    /// `DesktopClipboard` within the connection's `limit`.
+    fn desktop_clip(&self, limit: (bool, bool)) -> (bool, bool) {
+        let (a, b) = ferossh_config::settings::global_clipboard_ways(
+            self.settings.desktop_clipboard.as_deref(),
+        );
+        (a && limit.0, b && limit.1)
+    }
+
+    /// The fixed desktop size set for connection `alias`; `None` when its
+    /// desktops follow their pane.
+    fn fixed_desktop_size(&self, alias: &str) -> Option<(u16, u16)> {
+        self.settings
+            .profile(alias)
+            .and_then(|p| p.desktop_size)
+            .and_then(|d| d.fixed())
+    }
+
+    /// Session > Open virtual desktop: runs [`vdesk::command`] on an exec
+    /// channel of the pane's connection; [`Self::on_vdesk`] opens a viewer
+    /// once x11vnc listens. A second ask on the same connection opens
+    /// another viewer on the running one.
+    /// `from` names a saved virtual desktop connection whose program and
+    /// size to use; else the SSH host's own.
+    fn open_virtual_desktop(&mut self, pane: PaneId, from: Option<&str>) -> Option<Command> {
+        let host = self.host_pane(pane);
+        let (Some(connection), Some(Host::Ssh(s))) = (
+            self.pane_connection(pane),
+            self.panes.get(&host).map(|p| &p.host),
+        ) else {
+            return Some(Command::Notice(NO_VDESK_HOST.into()));
+        };
+        let running = self
+            .vdesks
+            .iter()
+            .find(|(_, v)| v.connection == connection)
+            .map(|(&c, v)| (c, v.port));
+        match running {
+            Some((channel, Some(_))) => {
+                self.vdesk_viewer(channel);
+                return None;
+            }
+            Some((_, None)) => {
+                return Some(Command::Notice(
+                    "The virtual desktop on this connection is still starting.".into(),
+                ));
+            }
+            None => {}
+        }
+        let alias = from.unwrap_or(&s.target.alias).to_owned();
+        let program = self
+            .settings
+            .profile(&alias)
+            .and_then(|p| p.virtual_desktop.clone());
+        let label = from.map_or_else(|| s.target.label(), str::to_owned);
+        let user = s.target.user.clone();
+        let fixed = self.fixed_desktop_size(&alias);
+        let (width, height) = fixed.unwrap_or_else(|| {
+            self.panes
+                .get(&pane)
+                .map(|p| desktop_size(p.rect))
+                .unwrap_or((1600, 900))
+        });
+        let follow = fixed.is_none();
+        let password = vdesk::password();
+        let clip_limit = self.desktop_clip_limit(&[&alias, &s.target.alias]);
+        let (to_host, from_host) = self.desktop_clip(clip_limit);
+        let clip = vdesk::Clip {
+            to_host,
+            from_host,
+            selection: self.settings.desktop_share_selection,
+        };
+        let Some(input) = vdesk::input(&password, program.as_deref(), width, height, follow, clip)
+        else {
+            return Some(Command::Notice(
+                "This host's VirtualDesktop command must be one line.".into(),
+            ));
+        };
+        let channel = self.new_channel();
+        let w = self.workers.get(&connection)?;
+        w.link.send(Message::Exec {
+            channel,
+            connection,
+            command: vdesk::command(),
+            split_stderr: false,
+        });
+        w.link.send(Message::Data {
+            channel,
+            bytes: input.to_vec(),
+        });
+        self.vdesks.insert(
+            channel,
+            VirtualDesk {
+                connection,
+                pane,
+                label,
+                user,
+                password,
+                out: vdesk::Output::default(),
+                port: None,
+                size: (width, height),
+                follow,
+                resizes: false,
+                tab: cfg!(feature = "vnc-viewer"),
+                shown: false,
+                reported: false,
+                clip_limit,
+            },
+        );
+        let what = match &program {
+            Some(p) => format!(" running {}", crate::ssh::sanitize(p)),
+            None => String::new(),
+        };
+        self.show(
+            pane,
+            &format!(
+                "\x1b[0;90mStarting a virtual desktop{what} on the server (Xvfb or \
+                 Xvnc)...\x1b[0m\r\n"
+            ),
+        );
+        self.refresh(pane);
+        None
+    }
+
+    /// Session > Remote apps > Run remote app: the palette offers programs
+    /// (this connection's, the recent ones, xterm) and runs what is
+    /// picked or typed, on the pane's host.
+    fn pick_remote_app(&mut self, pane: PaneId) -> Option<Command> {
+        let host = self.host_pane(pane);
+        let (Some(_), Some(Host::Ssh(s))) = (
+            self.pane_connection(pane),
+            self.panes.get(&host).map(|p| &p.host),
+        ) else {
+            return Some(Command::Notice(NO_APP_HOST.into()));
+        };
+        let mut entries = Vec::new();
+        if let Some(p) = self
+            .settings
+            .profile(&s.target.alias)
+            .and_then(|p| p.remote_app.clone())
+        {
+            entries.push(palette::Entry::remote_app(&p, "this connection's"));
+        }
+        for p in &self.recent_apps {
+            if !entries.iter().any(|e| e.label == *p) {
+                entries.push(palette::Entry::remote_app(p, "recent"));
+            }
+        }
+        if !entries.iter().any(|e| e.label == "xterm") {
+            entries.push(palette::Entry::remote_app("xterm", "a terminal"));
+        }
+        if self.side.visible && self.side.view == SideView::Palette {
+            self.leave_palette();
+        }
+        self.app_pane = Some(pane);
+        self.palette.open_apps(entries);
+        self.palette_return = (self.side.visible && !self.snippets_peek).then_some(self.side.view);
+        self.snippets_peek = false;
+        self.show_side(SideView::Palette, true);
+        None
+    }
+
+    /// Runs `program` (a command line; `None` when attaching) on the
+    /// pane's SSH connection as a remote app: no new login, the agent on
+    /// an exec channel, the host's bytes decoded in a sandboxed process,
+    /// the windows native ([`crate::remote_app`]). `from` names a saved
+    /// remote app connection whose agent settings apply; else the SSH
+    /// host's own.
+    fn run_remote_app(
+        &mut self,
+        pane: PaneId,
+        program: Option<&str>,
+        from: Option<&str>,
+        attach: ferostream_client::transport::AttachTo,
+    ) -> Option<Command> {
+        use ferostream_client::transport::{DEFAULT_AGENT_PATH, Place as AgentPlace};
+        let host = self.host_pane(pane);
+        let (Some(connection), Some(Host::Ssh(s))) = (
+            self.pane_connection(pane),
+            self.panes.get(&host).map(|p| &p.host),
+        ) else {
+            return Some(Command::Notice(NO_APP_HOST.into()));
+        };
+        let alias = s.target.alias.clone();
+        let label = from.map_or_else(|| s.target.label(), str::to_owned);
+        let argv = match program {
+            Some(line) => match crate::stream::words(line) {
+                Some(argv) => argv,
+                None => {
+                    return Some(Command::Notice(
+                        "Type a program and its arguments; quotes must be closed.".into(),
+                    ));
+                }
+            },
+            None => Vec::new(),
+        };
+        let own = from
+            .and_then(|f| self.settings.profile(f))
+            .or_else(|| self.settings.profile(&alias));
+        let copy = own
+            .and_then(|p| p.remote_app_copy_agent)
+            .unwrap_or(self.settings.remote_app_copy_agent);
+        let remove = own
+            .and_then(|p| p.remote_app_remove_agent)
+            .unwrap_or(self.settings.remote_app_remove_agent);
+        let path = self
+            .settings
+            .remote_app_agent_path
+            .clone()
+            .unwrap_or_else(|| DEFAULT_AGENT_PATH.to_owned());
+        let place = match AgentPlace::new(&path, remove) {
+            Ok(p) => p,
+            Err(e) => {
+                return Some(Command::Notice(format!(
+                    "RemoteAppAgentPath in ferossh.conf: {e}"
+                )));
+            }
+        };
+        let clip_limit = own.and_then(|p| p.remote_app_clipboard.clone());
+        let clipboard = crate::stream::app_clipboard(&self.settings, clip_limit.as_deref());
+        let files = if copy {
+            crate::remote_app::agent_files()
+        } else {
+            Vec::new()
+        };
+        let w = self.workers.get(&connection)?;
+        let route = crate::remote_app::Route {
+            connection,
+            send: Arc::new(w.link.sender()),
+            relays: w.link.relays().clone(),
+        };
+        let lookup = Box::new(|c: ChannelId| with_window(|w| w.remote_route(c)).flatten());
+        let what = match program {
+            Some(line) => crate::ssh::sanitize(line),
+            None => "The remote app".into(),
+        };
+        let on_end = {
+            let label = label.clone();
+            let what = what.clone();
+            Box::new(move |end: ferostream_client::win32::End| {
+                let note = remote_app_note(&what, &label, &end);
+                let Some(note) = note else { return };
+                let hwnd = with_window(|w| {
+                    w.queued.push(Command::Notice(note));
+                    w.hwnd
+                });
+                // The notice shows when the window next takes its queue.
+                if let Some(hwnd) = hwnd {
+                    // SAFETY: posting to our own window.
+                    unsafe {
+                        let _ = PostMessageW(Some(hwnd), WM_SHELL_OUTPUT, WPARAM(0), LPARAM(0));
+                    }
+                }
+            })
+        };
+        let app_host = crate::remote_app::AppHost::new(route, lookup, files.clone(), place, on_end);
+        let settings = ferostream_client::win32::Settings {
+            program: argv,
+            clipboard,
+            attach,
+            packing: self
+                .settings
+                .remote_app_packing
+                .as_deref()
+                .and_then(ferostream_proto::Packing::parse)
+                .unwrap_or_default(),
+            raw_only: true,
+        };
+        match ferostream_client::win32::start(settings, Box::new(app_host)) {
+            Ok(id) => {
+                self.app_clip_limits.insert(id, clip_limit);
+            }
+            Err(e) => {
+                return Some(Command::Notice(format!(
+                    "The remote app did not start: {e}"
+                )));
+            }
+        }
+        if let Some(line) = program {
+            let line = line.trim().to_owned();
+            self.recent_apps.retain(|p| *p != line);
+            self.recent_apps.insert(0, line);
+            self.recent_apps.truncate(8);
+        }
+        let mut note = format!("\x1b[0;90mStarting {what} on the host; its windows open here");
+        if copy && files.is_empty() {
+            note.push_str(
+                " (no ferostream-agent next to ferossh.exe: the host's own agent is used)",
+            );
+        }
+        note.push_str("...\x1b[0m\r\n");
+        self.show(pane, &note);
+        self.refresh(pane);
+        None
+    }
+
+    /// How a remote app reaches connection `connection`'s worker, while
+    /// that worker runs.
+    fn remote_route(&self, connection: ChannelId) -> Option<crate::remote_app::Route> {
+        let w = self.workers.get(&connection)?;
+        Some(crate::remote_app::Route {
+            connection,
+            send: Arc::new(w.link.sender()),
+            relays: w.link.relays().clone(),
+        })
+    }
+
+    /// Session > Stop virtual desktop: ends the virtual desktops on the
+    /// pane's connection, which stops Xvfb, x11vnc and the program there.
+    fn stop_virtual_desktop(&mut self, pane: PaneId) -> Option<Command> {
+        let connection = self.pane_connection(pane);
+        let channels: Vec<ChannelId> = self
+            .vdesks
+            .iter()
+            .filter(|(_, v)| Some(v.connection) == connection)
+            .map(|(&c, _)| c)
+            .collect();
+        if channels.is_empty() {
+            return Some(Command::Notice(
+                "No virtual desktop runs on this pane's connection.".into(),
+            ));
+        }
+        for channel in channels {
+            self.close_vdesk(channel);
+        }
+        self.show(pane, "\x1b[0;90mVirtual desktop stopped.\x1b[0m\r\n");
+        self.refresh(pane);
+        self.prune_forwards();
+        None
+    }
+
+    /// Closes a virtual desktop's script channel: the end of its input
+    /// tells the script to stop everything it started.
+    fn close_vdesk(&mut self, channel: ChannelId) {
+        if let Some(v) = self.vdesks.remove(&channel)
+            && let Some(w) = self.workers.get(&v.connection)
+        {
+            w.link.send(Message::Close { channel });
+        }
+    }
+
+    /// Stops the virtual desktops nothing shows any more: the tab closed
+    /// (or its viewer ended), or, for a viewer on this PC, no terminal is
+    /// logged in on the connection.
+    fn prune_vdesks(&mut self) {
+        let unused: Vec<ChannelId> = self
+            .vdesks
+            .iter()
+            .filter(|&(&c, v)| {
+                if v.tab {
+                    v.shown
+                        && !self.panes.values().any(|p| {
+                            matches!(p.host, Host::Desktop { vdesk: Some(d), .. } if d == c)
+                                && p.desktop.is_some()
+                        })
+                } else {
+                    !self.panes.values().any(|p| {
+                        matches!(&p.host, Host::Ssh(s)
+                            if s.connection == v.connection && s.state() == State::Connected)
+                    })
+                }
+            })
+            .map(|(&c, _)| c)
+            .collect();
+        for channel in unused {
+            self.close_vdesk(channel);
+        }
+    }
+
+    /// Opens a viewer on the running virtual desktop of script `channel`.
+    fn vdesk_viewer(&mut self, channel: ChannelId) {
+        // A viewer on this PC needs the password its pane shows.
+        if let Some(pane) = self.vdesks.get(&channel).filter(|v| !v.tab).map(|v| v.pane) {
+            self.reveal_launch(pane);
+        }
+        let Some(v) = self.vdesks.get(&channel) else {
+            return;
+        };
+        let Some(port) = v.port else {
+            return;
+        };
+        let (local, want) = if v.tab {
+            (
+                0,
+                DesktopWant::Tab(TabWant {
+                    label: v.label.clone(),
+                    user: v.user.clone(),
+                    protocol: Protocol::Vnc,
+                    vdesk: Some((v.password.clone(), channel)),
+                    // Xvnc follows the tab; Xvfb keeps its size.
+                    size: (!(v.follow && v.resizes)).then_some(v.size),
+                    clip_limit: v.clip_limit,
+                }),
+            )
+        } else {
+            (
+                desktop_port_for(&format!("virtual {}", v.label)),
+                DesktopWant::Vnc {
+                    pane: v.pane,
+                    password: v.password.clone(),
+                    clipboard: self.desktop_clip(v.clip_limit),
+                },
+            )
+        };
+        let connection = v.connection;
+        let Some(w) = self.workers.get(&connection) else {
+            return;
+        };
+        // x11vnc listens on the server's IPv4 loopback only.
+        w.forwarder
+            .open_desktop(connection, VDESK_HOST, port, local);
+        self.desktops
+            .insert((connection, VDESK_HOST.to_owned(), port), want);
+    }
+
+    /// What a virtual desktop's script said, or that it ended.
+    fn on_vdesk(&mut self, channel: ChannelId, msg: Message) {
+        let Some(v) = self.vdesks.get_mut(&channel) else {
+            return;
+        };
+        let pane = v.pane;
+        match msg {
+            Message::Data { bytes, .. } => {
+                for event in v.out.feed(&bytes) {
+                    self.vdesk_event(channel, pane, event);
+                }
+            }
+            Message::Disconnected { reason, .. } => {
+                let Some(v) = self.vdesks.remove(&channel) else {
+                    return;
+                };
+                if v.port.is_none() && !v.reported {
+                    let said = match v.out.other.is_empty() {
+                        true => String::new(),
+                        false => format!(
+                            " The server said: {}",
+                            crate::ssh::sanitize(&v.out.other.join(" / "))
+                        ),
+                    };
+                    self.queued.push(Command::Notice(format!(
+                        "The virtual desktop did not start ({}).{said}",
+                        crate::ssh::sanitize(&reason)
+                    )));
+                }
+                if v.port.is_none() {
+                    self.abandon_launch(v.pane);
+                }
+                self.prune_forwards();
+            }
+            _ => {}
+        }
+    }
+
+    fn vdesk_event(&mut self, channel: ChannelId, pane: PaneId, event: vdesk::Event) {
+        match event {
+            vdesk::Event::Missing(missing) => {
+                if let Some(v) = self.vdesks.get_mut(&channel) {
+                    v.reported = true;
+                }
+                self.abandon_launch(pane);
+                self.queued
+                    .push(Command::Notice(vdesk::install_advice(&missing)));
+            }
+            vdesk::Event::Error(why) => {
+                if let Some(v) = self.vdesks.get_mut(&channel) {
+                    v.reported = true;
+                }
+                self.abandon_launch(pane);
+                self.queued.push(Command::Notice(format!(
+                    "The virtual desktop did not start: {why}. Set VirtualDesktop in this \
+                     host's connection settings to the desktop or program to run."
+                )));
+            }
+            vdesk::Event::Ready {
+                port,
+                display,
+                resizes,
+            } => {
+                let mut fixed_note = String::new();
+                if let Some(v) = self.vdesks.get_mut(&channel) {
+                    v.port = Some(port);
+                    v.resizes = resizes;
+                    if v.follow && !resizes {
+                        fixed_note = format!(
+                            " It stays {}x{}: to follow the window's size, install TigerVNC's \
+                             Xvnc on the server (tigervnc-standalone-server).",
+                            v.size.0, v.size.1
+                        );
+                    }
+                }
+                self.show(
+                    pane,
+                    &format!(
+                        "\x1b[0;90mVirtual desktop {display} runs on the server; opening it \
+                         through the SSH tunnel. It stops when its viewer tab closes, with \
+                         Session > Stop virtual desktop, or with this connection.{fixed_note}\x1b[0m\r\n"
+                    ),
+                );
+                self.refresh(pane);
+                self.vdesk_viewer(channel);
+            }
+            vdesk::Event::Ended(said) => {
+                let said = if said.is_empty() {
+                    String::new()
+                } else {
+                    format!(": {said}")
+                };
+                self.show(
+                    pane,
+                    &format!(
+                        "\x1b[0;90mThe program in the virtual desktop ended, so the virtual \
+                         desktop stopped{said}\x1b[0m\r\n"
+                    ),
+                );
+                self.refresh(pane);
+            }
+        }
+    }
+
+    /// Opens the built-in viewer on the tunnel at `addr` in a new tab;
+    /// `host` is the desktop server as the SSH server reaches it.
+    #[cfg(feature = "viewer")]
+    fn desktop_tab(&mut self, connection: ChannelId, want: TabWant, host: &str, addr: &str) {
+        let TabWant {
+            label,
+            user,
+            protocol,
+            vdesk,
+            size,
+            clip_limit,
+        } = want;
+        // The RDP viewer takes the server's certificate as it is, which is
+        // safe only where the SSH host key already identified the server.
+        if protocol == Protocol::Rdp && !crate::forwards::on_ssh_host(host) {
+            self.queued.push(Command::Notice(format!(
+                "The built-in RDP viewer only opens desktops on the SSH server itself; {} is \
+                 another machine, whose certificate it cannot check. Open it with Remote \
+                 Desktop Connection instead.",
+                crate::ssh::sanitize(host)
+            )));
+            return;
+        }
+        let id = self.new_tab_pane();
+        // The server draws the desktop at the size of the tab, when it
+        // can, unless a size was set.
+        let (width, height) = size.unwrap_or_else(|| {
+            self.panes
+                .get(&id)
+                .map(|p| desktop_size(p.rect))
+                .unwrap_or((1024, 768))
+        });
+        let session = crate::desktop::Session {
+            protocol,
+            width,
+            height,
+            layout: keyboard_layout(),
+            user,
+            password: vdesk.as_ref().map(|(pw, _)| pw.clone()),
+            fixed: size.is_some(),
+            clipboard: self.desktop_clip(clip_limit),
+            clipboard_limit: clip_limit,
+        };
+        let script = vdesk.map(|(_, channel)| channel);
+        // From here its tab decides: closing it, or a viewer that never
+        // started, stops the virtual desktop.
+        if let Some(v) = script.and_then(|c| self.vdesks.get_mut(&c)) {
+            v.shown = true;
+        }
+        let started = sandbox::spawn_viewer().and_then(|v| {
+            let to = v.to_worker.try_clone().map_err(io_error)?;
+            let from = v.from_worker.try_clone().map_err(io_error)?;
+            Desktop::start(addr, session, to, from, Box::new(v), self.notifier()).map_err(io_error)
+        });
+        let note = match started {
+            Ok(desktop) => {
+                if let Some(p) = self.panes.get_mut(&id) {
+                    p.host = Host::Desktop {
+                        label: match script {
+                            Some(_) => format!("virtual desktop {label}"),
+                            None => format!("desktop {label}"),
+                        },
+                        connection,
+                        vdesk: script,
+                    };
+                    p.desktop = Some(Box::new(desktop));
+                }
+                let server = match protocol {
+                    Protocol::Rdp => "RDP",
+                    Protocol::Vnc => "VNC",
+                };
+                format!(
+                    "\x1b[0;90mConnecting to the {server} server through the SSH tunnel...\x1b[0m\r\n"
+                )
+            }
+            Err(e) => format!("\x1b[0;31mThe desktop viewer did not start: {e}\x1b[0m\r\n"),
+        };
+        self.show(id, &note);
+        self.refresh(id);
+        self.update_title();
+    }
+
+    #[cfg(not(feature = "viewer"))]
+    fn desktop_tab(&mut self, _connection: ChannelId, _want: TabWant, _host: &str, _addr: &str) {}
+
+    /// Gives each remote desktop its pane's size, after the layout
+    /// settled.
+    fn on_desktop_size_timer(&mut self) {
+        // SAFETY: our window and timer.
+        unsafe {
+            let _ = KillTimer(Some(self.hwnd), TIMER_DESKTOP_SIZE);
+        }
+        for p in self.panes.values_mut() {
+            let (w, h) = desktop_size(p.rect);
+            if let Some(d) = p.desktop.as_mut() {
+                d.resize(w, h);
+            }
+        }
+    }
+
+    /// Gives desktop pane `id` this PC's clipboard text, once per change
+    /// of either: only the desktop being worked in sees it.
+    fn desktop_clip_touch(&mut self, id: PaneId) {
+        if self.clip_pane == Some(id) {
+            return;
+        }
+        let hwnd = self.hwnd;
+        let Some(d) = self.panes.get_mut(&id).and_then(|p| p.desktop.as_mut()) else {
+            return;
+        };
+        if !d.takes_clipboard() {
+            return;
+        }
+        self.clip_pane = Some(id);
+        if let Some(text) = crate::clipboard::get_text(hwnd) {
+            d.offer_clipboard(&text);
+        }
+    }
+
+    /// WM_CLIPBOARDUPDATE: this PC's clipboard changed. A desktop being
+    /// worked in gets it at once; the others when next used.
+    fn clipboard_changed(&mut self) {
+        self.clip_pane = None;
+        let id = self.focused_id();
+        if self.focused && !self.side.focused {
+            self.desktop_clip_touch(id);
+        }
+    }
+
+    /// Saves a changed desktop clipboard setting and applies it at once to
+    /// the open desktops, each within its connection's limit.
+    fn apply_desktop_clipboard(&mut self) {
+        self.save_settings();
+        self.update_menu_checks();
+        let ways = ferossh_config::settings::global_clipboard_ways(
+            self.settings.desktop_clipboard.as_deref(),
+        );
+        for p in self.panes.values_mut() {
+            if let Some(d) = p.desktop.as_mut() {
+                let limit = d.clipboard_limit();
+                d.set_clipboard(ways.0 && limit.0, ways.1 && limit.1);
+            }
+        }
+        self.clip_pane = None;
+    }
+
+    /// Applies what the remote desktops sent.
+    fn poll_desktops(&mut self) {
+        let ids: Vec<PaneId> = self
+            .panes
+            .iter()
+            .filter(|(_, p)| p.desktop.is_some())
+            .map(|(id, _)| *id)
+            .collect();
+        for id in ids {
+            let (updates, fresh) = match self.panes.get_mut(&id).and_then(|p| p.desktop.as_mut()) {
+                Some(d) => (d.poll(), d.take_fresh()),
+                None => continue,
+            };
+            // The picture came up in the pane being worked in.
+            if fresh && self.focused && !self.side.focused && self.focused_id() == id {
+                self.clip_pane = None;
+                self.desktop_clip_touch(id);
+            }
+            for update in updates {
+                match update {
+                    DesktopUpdate::Redraw => {
+                        if let Some(p) = self.panes.get_mut(&id) {
+                            p.grid.mark_all_dirty();
+                        }
+                        self.invalidate_dirty(id);
+                    }
+                    DesktopUpdate::Title(name) => {
+                        if let Some(p) = self.panes.get_mut(&id) {
+                            p.title = Some(name).filter(|n| !n.is_empty());
+                        }
+                        self.update_title();
+                        self.refresh_chrome();
+                    }
+                    DesktopUpdate::Bell => {
+                        if !self.is_visible(id)
+                            && let Some(p) = self.panes.get_mut(&id)
+                        {
+                            p.bell = true;
+                            self.refresh_chrome();
+                        }
+                    }
+                    DesktopUpdate::Ask(prompt) => {
+                        self.show(id, &prompt);
+                        self.refresh(id);
+                    }
+                    DesktopUpdate::Note(note) => {
+                        self.show(id, &format!("\x1b[0;33m{note}\x1b[0m\r\n"));
+                        self.refresh(id);
+                    }
+                    DesktopUpdate::Clipboard(text) => {
+                        // Windows keeps line ends as CR LF.
+                        let text = text.replace("\r\n", "\n").replace('\n', "\r\n");
+                        crate::clipboard::set_text(self.hwnd, &text);
+                    }
+                    DesktopUpdate::Ended(why) => {
+                        if let Some(p) = self.panes.get_mut(&id) {
+                            p.desktop = None;
+                            p.grid.mark_all_dirty();
+                        }
+                        // The connection may have stayed open only for it.
+                        self.prune_forwards();
+                        let why = crate::ssh::sanitize(&why);
+                        self.show(
+                            id,
+                            &format!("\r\n\x1b[0;31mThe remote desktop ended: {why}\x1b[0m\r\n"),
+                        );
+                        self.request_full_redraw();
+                        self.refresh(id);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Keyboard and mouse messages for a remote desktop pane; `true` when
+    /// the desktop took the message.
+    fn desktop_message(&mut self, msg: u32, wparam: WPARAM, lparam: LPARAM) -> bool {
+        if !self.panes.values().any(|p| p.desktop.is_some()) {
+            return false;
+        }
+        match msg {
+            WM_KEYDOWN | WM_SYSKEYDOWN | WM_KEYUP | WM_SYSKEYUP => {
+                let id = self.focused_id();
+                if self.side.focused {
+                    return false;
+                }
+                let vk = VIRTUAL_KEY(wparam.0 as u16);
+                let down = matches!(msg, WM_KEYDOWN | WM_SYSKEYDOWN);
+                // FeroSSH's own shortcuts still work in the pane.
+                let split = self.ws.tab().is_some_and(|t| t.root.panes().len() > 1);
+                if down && shortcut(vk, key_mods(), self.ws.tabs.len() > 1, split).is_some() {
+                    return false;
+                }
+                let extended = lparam.0 & (1 << 24) != 0;
+                let scan = ((lparam.0 >> 16) & 0xff) as u16;
+                let Some(d) = self.panes.get_mut(&id).and_then(|p| p.desktop.as_mut()) else {
+                    return false;
+                };
+                // A prompt (user name, password) reads WM_CHAR, Enter and
+                // Backspace included: keep the terminal from taking them.
+                if d.asking() {
+                    return true;
+                }
+                if !d.running() {
+                    return false;
+                }
+                if down {
+                    self.desktop_clip_touch(id);
+                }
+                let Some(d) = self.panes.get_mut(&id).and_then(|p| p.desktop.as_mut()) else {
+                    return true;
+                };
+                if d.key(vk.0, extended, scan, down) {
+                    drop_pending_char(self.hwnd);
+                }
+                true
+            }
+            WM_CHAR | WM_SYSCHAR => {
+                if self.side.focused {
+                    return false;
+                }
+                let id = self.focused_id();
+                let Some(d) = self.panes.get_mut(&id).and_then(|p| p.desktop.as_mut()) else {
+                    return false;
+                };
+                if !d.asking() && !d.running() {
+                    return false;
+                }
+                let Some(c) = char::from_u32(wparam.0 as u32) else {
+                    return true;
+                };
+                if let Some(echo) = d.char(c) {
+                    self.show(id, &echo);
+                    self.refresh(id);
+                }
+                true
+            }
+            WM_LBUTTONDOWN | WM_LBUTTONUP | WM_RBUTTONDOWN | WM_RBUTTONUP | WM_MBUTTONDOWN
+            | WM_MBUTTONUP | WM_MOUSEMOVE => {
+                if self.drag.is_some() {
+                    return false;
+                }
+                let (x, y) = lparam_point(lparam);
+                let Spot::Pane(id) = self.spot(x, y) else {
+                    return false;
+                };
+                let button = match msg {
+                    WM_LBUTTONDOWN => Some((1, true)),
+                    WM_LBUTTONUP => Some((1, false)),
+                    WM_MBUTTONDOWN => Some((2, true)),
+                    WM_MBUTTONUP => Some((2, false)),
+                    WM_RBUTTONDOWN => Some((4, true)),
+                    WM_RBUTTONUP => Some((4, false)),
+                    _ => None,
+                };
+                let Some(p) = self.panes.get(&id) else {
+                    return false;
+                };
+                if !p.desktop.as_ref().is_some_and(|d| d.running()) {
+                    return false;
+                }
+                let area = (p.rect.x, p.rect.y, p.rect.right(), p.rect.bottom());
+                // Ctrl+Shift+drag still moves panes.
+                let mods = mouse_mods(wparam);
+                if mods.ctrl && mods.shift {
+                    return false;
+                }
+                if matches!(button, Some((_, true))) {
+                    if self.side.visible && !self.settings.tools_pinned {
+                        // Pin off: a click on a remote desktop ends the
+                        // peek too; the desktop does not get it.
+                        self.hide_side();
+                        self.focus_pane(id);
+                        return true;
+                    }
+                    if self.focused_id() != id {
+                        self.focus_pane(id);
+                    }
+                    self.desktop_clip_touch(id);
+                }
+                if let Some(d) = self.panes.get_mut(&id).and_then(|p| p.desktop.as_mut()) {
+                    d.mouse(area, x, y, button);
+                }
+                true
+            }
+            WM_MOUSEWHEEL => {
+                let (x, y) = lparam_point(lparam);
+                let mut pt = POINT { x, y };
+                // SAFETY: our window and a local point.
+                let _ = unsafe { ScreenToClient(self.hwnd, &mut pt) };
+                let Spot::Pane(id) = self.spot(pt.x, pt.y) else {
+                    return false;
+                };
+                let delta = ((wparam.0 >> 16) & 0xFFFF) as u16 as i16;
+                let Some(p) = self.panes.get_mut(&id) else {
+                    return false;
+                };
+                let area = (p.rect.x, p.rect.y, p.rect.right(), p.rect.bottom());
+                match p.desktop.as_mut() {
+                    Some(d) if d.running() => {
+                        // Touchpads send part notches: each counts as one.
+                        let notches = i32::from(delta) / WHEEL_DELTA_NOTCH;
+                        let notches = if notches == 0 {
+                            i32::from(delta).signum()
+                        } else {
+                            notches
+                        };
+                        d.wheel(area, pt.x, pt.y, notches);
+                        true
+                    }
+                    _ => false,
+                }
+            }
+            WM_KILLFOCUS => {
+                let id = self.focused_id();
+                if let Some(d) = self.panes.get_mut(&id).and_then(|p| p.desktop.as_mut()) {
+                    d.focus_lost();
+                }
+                false
+            }
+            _ => false,
+        }
+    }
+
+    /// Carries out what the forwards view asked for. Changes also go into
+    /// the hosts of the connection's panes, so a reconnect keeps them.
+    fn forwards_action(&mut self, action: Option<FwdAction>) -> Option<Command> {
+        let view = self.forward_view();
+        match action {
+            Some(FwdAction::Add { spec, connection }) => {
+                match self.forward_connection(connection, &view) {
+                    Err(why) => self.forwards_view.refuse(&spec, why),
+                    Ok(c) if forwards_of(&view, c).any(|f| f.spec == spec) => {
+                        self.forwards_view
+                            .refuse(&spec, "That forward is already there.".into());
+                    }
+                    Ok(c) => {
+                        if let Some(w) = self.workers.get(&c) {
+                            w.forwarder.add(c, spec.clone());
+                        }
+                        self.keep_forwards(c, |list| {
+                            if !list.contains(&spec) {
+                                list.push(spec.clone());
+                            }
+                        });
+                    }
+                }
+            }
+            Some(FwdAction::Remove { connection, index }) => {
+                if let Some(w) = self.workers.get(&connection) {
+                    w.forwarder.remove(connection, index);
+                }
+                if let Some(f) = forwards_of(&view, connection).nth(index) {
+                    let spec = f.spec.clone();
+                    self.keep_forwards(connection, |list| list.retain(|s| *s != spec));
+                }
+            }
+            Some(FwdAction::Replace {
+                connection,
+                old,
+                new,
+            }) => {
+                if old != new && forwards_of(&view, connection).any(|f| f.spec == new) {
+                    self.forwards_view
+                        .refuse(&new, "That forward is already there.".into());
+                } else if let Some(w) = self.workers.get(&connection) {
+                    w.forwarder.replace(connection, old.clone(), new.clone());
+                    self.keep_forwards(connection, |list| {
+                        if let Some(s) = list.iter_mut().find(|s| **s == old) {
+                            *s = new.clone();
+                        } else if !list.contains(&new) {
+                            list.push(new.clone());
+                        }
+                    });
+                }
+            }
+            Some(FwdAction::Cancel { cancel, connection }) => {
+                let found = self.forward_connection(connection, &view).and_then(|c| {
+                    let matching: Vec<(usize, &ForwardSpec)> = forwards_of(&view, c)
+                        .enumerate()
+                        .filter(|(_, f)| !f.desktop && cancel.cancels(&f.spec))
+                        .map(|(i, f)| (i, &f.spec))
+                        .collect();
+                    match &matching[..] {
+                        [(i, spec)] => Ok((c, *i, (*spec).clone())),
+                        [] => Err("No forward listens there.".to_owned()),
+                        _ => {
+                            Err("More than one forward listens there: add the address.".to_owned())
+                        }
+                    }
+                });
+                match found {
+                    Ok((c, index, spec)) => {
+                        if let Some(w) = self.workers.get(&c) {
+                            w.forwarder.remove(c, index);
+                        }
+                        self.keep_forwards(c, |list| list.retain(|s| *s != spec));
+                    }
+                    Err(why) => self.forwards_view.say(why),
+                }
+            }
+            Some(FwdAction::Leave) => self.focus_terminal(),
+            None => {}
+        }
+        self.refresh_chrome();
+        None
+    }
+
+    /// The connection a forward goes to: the one picked in the list, else
+    /// the focused pane's, else the only one there is.
+    fn forward_connection(
+        &self,
+        picked: Option<ChannelId>,
+        view: &[ConnView],
+    ) -> std::result::Result<ChannelId, String> {
+        let known =
+            |c: &ChannelId| view.iter().any(|v| v.connection == *c) && self.workers.contains_key(c);
+        picked
+            .filter(known)
+            .or_else(|| self.pane_connection(self.focused_id()).filter(known))
+            .or_else(|| match view {
+                [only] => Some(only.connection).filter(known),
+                _ => None,
+            })
+            .ok_or_else(|| {
+                if view.is_empty() {
+                    "Log in to a host first.".to_owned()
+                } else {
+                    "Choose the connection in the On box.".to_owned()
+                }
+            })
+    }
+
+    /// Changes the forwards a reconnect of `connection`'s panes starts.
+    fn keep_forwards(
+        &mut self,
+        connection: ChannelId,
+        mut change: impl FnMut(&mut Vec<ForwardSpec>),
+    ) {
+        for p in self.panes.values_mut() {
+            if let Host::Ssh(s) = &mut p.host
+                && s.connection == connection
+            {
+                change(&mut s.target.forwards);
+            }
+        }
+    }
+
+    /// Starts the worker of the connection `connection` if it is not
+    /// running: a new login gets a worker of its own.
+    fn ensure_worker(&mut self, id: PaneId, connection: ChannelId) -> bool {
+        if self.workers.contains_key(&connection) {
+            return true;
+        }
+        let result = sandbox::spawn_worker(self.sandbox).and_then(|w| {
+            let input = w.from_worker.try_clone().map_err(io_error)?;
+            let output = w.to_worker.try_clone().map_err(io_error)?;
+            let (forwarder, runner) = Forwarder::new();
+            let link =
+                Link::start(input, output, self.notifier(), forwarder.sink()).map_err(io_error)?;
+            runner
+                .spawn(link.sender(), self.notifier())
+                .map_err(io_error)?;
+            Ok(WorkerConn {
+                link,
+                forwarder,
+                _process: w,
+            })
+        });
+        match result {
+            Ok(conn) => {
+                self.workers.insert(connection, conn);
+                true
+            }
+            Err(e) => {
+                let text = format!(
+                    "\x1b[0;31mCould not start the sandboxed SSH worker: {}\x1b[0m\r\n\
+                     If this Windows does not allow AppContainers, start FeroSSH with \
+                     --no-sandbox.\r\n",
+                    e.message()
+                );
+                self.show(id, &text);
+                false
+            }
+        }
+    }
+
+    fn ensure_broker(&mut self, id: PaneId) -> bool {
+        if self.broker.is_some() {
+            return true;
+        }
+        match Broker::spawn(self.notifier()) {
+            Ok(b) => {
+                self.broker = Some(b);
+                true
+            }
+            Err(e) => {
+                self.show(
+                    id,
+                    &format!("\x1b[0;31mCould not start the signing broker: {e}\x1b[0m\r\n"),
+                );
+                false
+            }
+        }
+    }
+
+    /// Connects pane `id` to `destination` (`[user@]host[:port]` or a
+    /// Host from ssh_config).
+    fn connect(&mut self, id: PaneId, destination: &str) {
+        if let Some(target) = serial::parse_target(destination) {
+            self.open_serial(id, target, None);
+            return;
+        }
+        let env = ssh_env();
+        let telnet = if self
+            .settings
+            .profile(destination)
+            .is_some_and(|p| p.kind == SessionKind::Telnet)
+        {
+            TelnetTarget::resolve(destination, &env)
+        } else {
+            TelnetTarget::typed(destination)
+        };
+        if let Some(target) = telnet {
+            self.connect_telnet(id, target);
+            return;
+        }
+        let target = match Target::resolve_route(destination, &env) {
+            Ok(t) => t,
+            Err(why) => {
+                self.end_host(id);
+                self.show(id, &format!("\x1b[0;31m{why}\x1b[0m\r\n"));
+                self.ask_destination(id);
+                return;
+            }
+        };
+        self.connect_to(id, target, &env);
+    }
+
+    /// Opens serial console `target` in pane `id`, with the look of saved
+    /// session `session` (or the port's, by theme rules).
+    fn open_serial(&mut self, id: PaneId, target: SerialTarget, session: Option<&str>) {
+        self.end_host(id);
+        let alias = session.unwrap_or(&target.port).to_owned();
+        let (font, theme) = look::for_host(
+            &self.settings,
+            &alias,
+            &target.port,
+            None,
+            &FontSpec::default(),
+            &self.default_theme,
+        );
+        let scrollback = self
+            .settings
+            .profile(&alias)
+            .and_then(|p| p.scrollback)
+            .or(self.settings.scrollback);
+        if let Some(p) = self.panes.get_mut(&id) {
+            p.term.set_settings(&term_settings(scrollback));
+            p.term.scroll_to_bottom();
+        }
+        self.set_theme(id, theme);
+        self.set_font(id, font);
+        let notify = self.notifier();
+        let opened = SerialPort::open(&target, notify);
+        let text = match &opened {
+            Ok(_) => format!(
+                "\x1b[0;90mOpened {} at {} bits/s, {}, flow control {}. \
+                 Session > Send break sends a break.\x1b[0m\r\n",
+                target.port,
+                target.settings.speed,
+                target.settings.framing(),
+                target.settings.flow.label()
+            ),
+            Err(e) => format!("\x1b[0;31m{e}\x1b[0m\r\nPress Enter to try again.\r\n"),
+        };
+        let opened = opened.ok();
+        let is_open = opened.is_some();
+        if let Some(p) = self.panes.get_mut(&id) {
+            p.host = Host::Serial {
+                port: opened.map(Box::new),
+                target,
+                session: session.map(str::to_owned),
+            };
+        }
+        self.show(id, &text);
+        self.start_log(id);
+        if is_open {
+            self.start_script(id, &alias, false);
+        }
+        self.update_title();
+        self.refresh_chrome();
+        self.refresh(id);
+    }
+
+    /// Connects pane `id` to `target`. When another pane is logged in to
+    /// the same host, port and user, the new shell is a channel on that
+    /// connection: no second login.
+    fn connect_to(&mut self, id: PaneId, target: Target, env: &Env) {
+        self.end_host(id);
+        if let Some(p) = self.panes.get_mut(&id) {
+            p.term.scroll_to_bottom();
+        }
+        let shared = self.panes.values().find_map(|p| match &p.host {
+            Host::Ssh(s) if p.id != id && s.can_share(&target) => Some(s.connection),
+            _ => None,
+        });
+        let channel = self.new_channel();
+        // A new login runs in a worker of its own; a shared connection's
+        // shell in that connection's.
+        if !self.ensure_worker(id, shared.unwrap_or(channel)) || !self.ensure_broker(id) {
+            self.refresh(id);
+            return;
+        }
+        if !self.sandbox {
+            self.show(
+                id,
+                "\x1b[0;31mThe SSH worker runs without its sandbox (--no-sandbox).\x1b[0m\r\n",
+            );
+        }
+        self.apply_look(id, &target.alias, &target.hostname, target.tag.as_deref());
+        let x11 = target.forward_x11.then(|| self.x11_auth(id)).flatten();
+        let legacy = self
+            .settings
+            .profile(&target.alias)
+            .is_some_and(|p| p.legacy_algorithms);
+        let source = self
+            .settings
+            .profile(&target.alias)
+            .map(|p| p.password.clone())
+            .unwrap_or_default();
+        let auto_reconnect = self
+            .settings
+            .profile(&target.alias)
+            .and_then(|p| p.auto_reconnect)
+            .unwrap_or(self.settings.auto_reconnect);
+        let mut session = SshSession::new(channel, target, env.known_hosts());
+        session.auto_reconnect = auto_reconnect;
+        if shared.is_none() {
+            // Each jump host logs in in a worker of its own.
+            session = session.with_route(&mut || self.new_channel());
+            let hops = session.hop_connections();
+            for &hop in &hops {
+                if !self.ensure_worker(id, hop) {
+                    self.refresh(id);
+                    return;
+                }
+            }
+            if !hops.is_empty() {
+                self.via.insert(channel, hops);
+            }
+            for hop in session.hops_mut() {
+                let profile = self.settings.profile(&hop.target.alias);
+                let source = profile.map(|p| p.password.clone()).unwrap_or_default();
+                hop.legacy = profile.is_some_and(|p| p.legacy_algorithms);
+                hop.password_source = source != PasswordSource::Ask;
+                hop.remember_password = source == PasswordSource::Windows;
+            }
+        }
+        session.x11 = x11;
+        session.legacy = legacy;
+        session.password_source = source != PasswordSource::Ask;
+        session.remember_password = source == PasswordSource::Windows;
+        if self.run_login.contains(&id) {
+            // A run never reconnects by itself, and the password typed
+            // for it answers the logins that have none saved.
+            // A password a run used is never saved: not the one typed for
+            // it, and one already in the Credential Manager stays as it is.
+            session.auto_reconnect = false;
+            session.remember_password = false;
+            let typed = self.run_password().is_some();
+            session.password_source |= typed;
+            for hop in session.hops_mut() {
+                hop.password_source |= typed;
+                hop.remember_password = false;
+            }
+        }
+        let Some(p) = self.panes.get_mut(&id) else {
+            return;
+        };
+        let (cols, rows) = (clamp16(p.term.cols()), clamp16(p.term.rows()));
+        let effects = match shared {
+            Some(connection) => session.start_on(connection, cols, rows),
+            None => session.start(cols, rows),
+        };
+        p.host = Host::Ssh(Box::new(session));
+        self.apply(id, effects);
+        self.update_title();
+        self.refresh_chrome();
+        self.refresh(id);
+    }
+
+    /// Opens Telnet session `target` in pane `id`, in a worker of its
+    /// own: Telnet is parsed in the sandbox too.
+    fn connect_telnet(&mut self, id: PaneId, target: TelnetTarget) {
+        self.end_host(id);
+        if let Some(p) = self.panes.get_mut(&id) {
+            p.term.scroll_to_bottom();
+        }
+        let channel = self.new_channel();
+        if !self.ensure_worker(id, channel) {
+            self.refresh(id);
+            return;
+        }
+        if !self.sandbox {
+            self.show(
+                id,
+                "\x1b[0;31mThe Telnet worker runs without its sandbox (--no-sandbox).\x1b[0m\r\n",
+            );
+        }
+        self.apply_look(id, &target.alias, &target.hostname, target.tag.as_deref());
+        let mut session = TelnetSession::new(channel, target);
+        let Some(p) = self.panes.get_mut(&id) else {
+            return;
+        };
+        let effects = session.start(clamp16(p.term.cols()), clamp16(p.term.rows()));
+        p.host = Host::Telnet(Box::new(session));
+        self.apply(id, effects);
+        self.update_title();
+        self.refresh_chrome();
+        self.refresh(id);
+    }
+
+    /// Gives a pane the font, size, theme and scrollback its host's
+    /// profile and the theme rules pick.
+    fn apply_look(&mut self, id: PaneId, alias: &str, hostname: &str, tag: Option<&str>) {
+        let (font, theme) = look::for_host(
+            &self.settings,
+            alias,
+            hostname,
+            tag,
+            &FontSpec::default(),
+            &self.default_theme,
+        );
+        let scrollback = self
+            .settings
+            .profile(alias)
+            .and_then(|p| p.scrollback)
+            .or(self.settings.scrollback);
+        if let Some(p) = self.panes.get_mut(&id) {
+            p.term.set_settings(&term_settings(scrollback));
+        }
+        self.set_theme(id, theme);
+        self.set_font(id, font);
+    }
+
+    /// Connects again to the pane's host, or asks for one.
+    fn reconnect(&mut self, id: PaneId) {
+        let target = match self.panes.get(&id).map(|p| &p.host) {
+            Some(Host::Ssh(s)) => Some(s.target.clone()),
+            Some(Host::Local { .. }) => {
+                self.start_shell(id);
+                return;
+            }
+            Some(Host::Serial {
+                target, session, ..
+            }) => {
+                let (target, session) = (target.clone(), session.clone());
+                self.open_serial(id, target, session.as_deref());
+                return;
+            }
+            Some(Host::Telnet(s)) => {
+                let target = s.target.clone();
+                self.connect_telnet(id, target);
+                return;
+            }
+            _ => None,
+        };
+        if let Some(target) = target {
+            self.connect_to(id, target, &ssh_env());
+        }
+    }
+
+    /// SSH pane `id`'s connection dropped, or a reconnect did not get
+    /// through: wait, then try again, or give up after a while.
+    fn schedule_reconnect(&mut self, id: PaneId) {
+        let now = Instant::now();
+        let retry = self.retries.entry(id).or_insert_with(|| Retry::new(now));
+        let text = match retry.schedule(now) {
+            Next::In(wait) => reconnect::waiting_text(wait, retry.attempts()),
+            Next::GiveUp => {
+                let text = reconnect::gave_up_text(retry.down_for(now));
+                self.retries.remove(&id);
+                text
+            }
+        };
+        self.show(id, &text);
+        self.arm_reconnect_timer();
+        self.refresh_chrome();
+    }
+
+    /// Starts SSH pane `id`'s next reconnect attempt now, keeping its log
+    /// file open across it.
+    fn retry_now(&mut self, id: PaneId) {
+        let Some(mut retry) = self.retries.remove(&id) else {
+            return;
+        };
+        retry.begin();
+        let log = self.panes.get_mut(&id).and_then(|p| p.log.writer.take());
+        self.reconnect(id);
+        let Some(p) = self.panes.get_mut(&id) else {
+            return;
+        };
+        if p.log.writer.is_none() {
+            p.log.writer = log;
+        }
+        match &mut p.host {
+            Host::Ssh(s) => {
+                s.set_retrying();
+                self.retries.insert(id, retry);
+            }
+            _ => self.stop_log(id),
+        }
+        self.arm_reconnect_timer();
+        self.refresh_chrome();
+        self.refresh(id);
+    }
+
+    /// The user stopped pane `id` reconnecting (Esc, or Disconnect).
+    fn stop_reconnecting(&mut self, id: PaneId) {
+        if self.retries.remove(&id).is_none() {
+            return;
+        }
+        let effects = match self.panes.get_mut(&id).map(|p| &mut p.host) {
+            Some(Host::Ssh(s)) if s.state() == State::Connecting => s.close(),
+            _ => Vec::new(),
+        };
+        self.apply(id, effects);
+        self.scripts.remove(&id);
+        self.stop_log(id);
+        self.show(
+            id,
+            "\r\n\x1b[0;90m[Stopped reconnecting. Press Enter to reconnect.]\x1b[0m\r\n",
+        );
+        self.arm_reconnect_timer();
+        self.refresh_chrome();
+        self.refresh(id);
+    }
+
+    /// Ticks while a pane waits to reconnect.
+    fn arm_reconnect_timer(&mut self) {
+        let waiting = self.retries.values().any(Retry::waiting);
+        // SAFETY: our window; replaces any earlier timer with this id.
+        unsafe {
+            if waiting {
+                SetTimer(Some(self.hwnd), TIMER_RECONNECT, RECONNECT_TICK_MS, None);
+            } else {
+                let _ = KillTimer(Some(self.hwnd), TIMER_RECONNECT);
+            }
+        }
+    }
+
+    /// Starts the reconnects that are due. Tabs that shared a connection
+    /// go one at a time: the first logs in again and the others then open
+    /// their shells on its new connection.
+    fn on_reconnect_timer(&mut self) {
+        let now = Instant::now();
+        let mut due: Vec<PaneId> = self
+            .retries
+            .iter()
+            .filter(|(_, r)| r.is_due(now))
+            .map(|(id, _)| *id)
+            .collect();
+        due.sort_unstable();
+        for id in due {
+            let Some(Host::Ssh(s)) = self.panes.get(&id).map(|p| &p.host) else {
+                self.retries.remove(&id);
+                continue;
+            };
+            let busy = self.panes.values().any(|o| {
+                o.id != id
+                    && matches!(&o.host, Host::Ssh(t)
+                        if t.state() == State::Connecting && t.target.same_login(&s.target))
+            });
+            if !busy {
+                self.retry_now(id);
+            }
+        }
+        self.arm_reconnect_timer();
+    }
+
+    /// Turns automatic reconnect on or off, for the open sessions too
+    /// (a host's profile can still say otherwise).
+    fn toggle_auto_reconnect(&mut self) {
+        self.settings.auto_reconnect = !self.settings.auto_reconnect;
+        self.save_settings();
+        let global = self.settings.auto_reconnect;
+        for p in self.panes.values_mut() {
+            if let Host::Ssh(s) = &mut p.host {
+                s.auto_reconnect = self
+                    .settings
+                    .profile(&s.target.alias)
+                    .and_then(|p| p.auto_reconnect)
+                    .unwrap_or(global);
+            }
+        }
+        self.update_menu_checks();
+    }
+
+    /// Carries out what a pane's SSH session decided.
+    fn apply(&mut self, id: PaneId, effects: Vec<Effect>) {
+        // A run's row that ended: the next host may start.
+        let mut pump = false;
+        for effect in effects {
+            match effect {
+                Effect::Send(msg) => {
+                    // Only to the worker of the login the channel is on.
+                    let connection = match self.panes.get(&id).map(|p| &p.host) {
+                        Some(Host::Ssh(s)) => s.worker_for(msg.channel()),
+                        Some(Host::Telnet(s)) => Some(s.connection()),
+                        _ => None,
+                    };
+                    if let Some(w) = connection.and_then(|c| self.workers.get(&c)) {
+                        w.link.send(msg);
+                    }
+                }
+                Effect::Tunnel { from, to, channel } => {
+                    if let (Some(a), Some(b)) = (self.workers.get(&from), self.workers.get(&to)) {
+                        a.link.relay_with(&b.link, channel);
+                    }
+                }
+                Effect::ProxyCommand {
+                    connection,
+                    tunnel,
+                    command,
+                } => {
+                    // The worker's first bytes wait for the command, which
+                    // may start only once the user allowed it.
+                    let (sink, input) = crate::proxycmd::input();
+                    if let Some(w) = self.workers.get(&connection) {
+                        w.link.relays().insert(tunnel, sink);
+                    }
+                    if proxy_approved(&command.line) {
+                        self.run_proxy(id, connection, tunnel, &command, input);
+                    } else {
+                        self.queued.push(Command::ApproveProxy {
+                            pane: id,
+                            connection,
+                            tunnel,
+                            command,
+                            input,
+                        });
+                    }
+                }
+                Effect::Show(text) => self.show(id, &text),
+                Effect::Output(bytes) => {
+                    self.host_output(id, &bytes);
+                    self.script_output(id, &bytes);
+                }
+                Effect::Broker(job) => {
+                    let channel = match self.panes.get(&id).map(|p| &p.host) {
+                        Some(Host::Ssh(s)) => s.channel,
+                        _ => 0,
+                    };
+                    if let Some(b) = &self.broker {
+                        self.broker_jobs.push_back(channel);
+                        b.submit(job);
+                    }
+                }
+                Effect::FetchPassword => self.fetch_password(id),
+                Effect::StorePassword {
+                    user,
+                    host,
+                    port,
+                    password,
+                } => self.store_password(id, (&user, &host, port), &password),
+                Effect::Connected
+                    if self.run_login.contains(&id) || self.run_hidden.contains(&id) =>
+                {
+                    // Only the login script and the snippet run: no
+                    // forwards, tmux or desktops for a run's sessions.
+                    self.retries.remove(&id);
+                    self.start_log(id);
+                    if self.run_login.contains(&id) {
+                        let alias = match self.panes.get(&id).map(|p| &p.host) {
+                            Some(Host::Ssh(s)) => s.target.alias.clone(),
+                            Some(Host::Telnet(s)) => s.target.alias.clone(),
+                            _ => String::new(),
+                        };
+                        if !self.start_script(id, &alias, false) {
+                            self.begin_run_snippet(id);
+                        }
+                    }
+                }
+                Effect::Connected if self.unencrypted(id) => {
+                    // Nothing of SSH (SFTP, forwards, tmux, desktops)
+                    // runs over Telnet; a login script does.
+                    self.start_log(id);
+                    self.refresh_chrome();
+                    let alias = match self.panes.get(&id).map(|p| &p.host) {
+                        Some(Host::Telnet(s)) => s.target.alias.clone(),
+                        _ => String::new(),
+                    };
+                    self.start_script(id, &alias, false);
+                }
+                Effect::Connected => {
+                    self.retries.remove(&id);
+                    self.arm_reconnect_timer();
+                    self.start_log(id);
+                    self.sftp_connected(id);
+                    self.start_forwards(id);
+                    self.refresh_chrome();
+                    // A login script runs first; tmux attaches after it.
+                    let alias = match self.panes.get(&id).map(|p| &p.host) {
+                        Some(Host::Ssh(s)) => s.target.alias.clone(),
+                        _ => String::new(),
+                    };
+                    if !self.start_script(id, &alias, true) {
+                        self.cd_after_login(id);
+                        self.tmux_after_login(id);
+                    }
+                    self.desktop_after_login(id);
+                }
+                Effect::Reconnect => self.schedule_reconnect(id),
+                Effect::Ended => {
+                    if !self.run_login.contains(&id)
+                        && let Some(row) =
+                            self.snippets_view.report_mut().and_then(|r| r.row_mut(id))
+                        && !row.state.over()
+                    {
+                        row.state = RowState::Failed("the connection ended".into());
+                        pump = true;
+                    }
+                    self.proxy_errors(id);
+                    self.scripts.remove(&id);
+                    self.zmodem.remove(&id);
+                    self.pending_desktops.remove(&id);
+                    self.tmux_lost(id);
+                    // A pane that reconnects keeps writing the same log.
+                    if !self.retries.get(&id).is_some_and(Retry::waiting) {
+                        self.retries.remove(&id);
+                        self.stop_log(id);
+                    }
+                    self.prune_sftp();
+                    self.prune_forwards();
+                    self.refresh_chrome();
+                }
+            }
+        }
+        if self.run_login.contains(&id) {
+            self.check_run_login(id);
+        }
+        if self.launch_hidden.contains(&id) {
+            self.check_launch(id);
+        }
+        if pump {
+            self.pump_run();
+        }
+    }
+
+    /// What the worker said about a ZMODEM transfer in pane `id`, whose
+    /// shell is `channel`.
+    fn on_zmodem(&mut self, id: PaneId, channel: ChannelId, msg: Message) {
+        if let Message::ZmodemStart { upload, .. } = msg {
+            let effects = if !self.settings.zmodem {
+                vec![zmodem::refuse(channel, true)]
+            } else if self.zmodem.contains_key(&id) || self.scripts.contains_key(&id) {
+                // One at a time; and a login script owns the pane's
+                // output until it ends.
+                vec![zmodem::refuse(channel, false)]
+            } else if upload {
+                self.queued.push(Command::PickZmodem { pane: id, channel });
+                Vec::new()
+            } else {
+                let (transfer, effects) = zmodem::Transfer::receive(channel, self.download_dir());
+                self.zmodem.insert(id, transfer);
+                effects
+            };
+            self.apply(id, effects);
+            return;
+        }
+        let Some(transfer) = self.zmodem.get_mut(&id) else {
+            return;
+        };
+        let (effects, over) = transfer.on_worker(msg);
+        if over {
+            self.zmodem.remove(&id);
+        }
+        self.apply(id, effects);
+    }
+
+    /// The user picked `paths` (or nothing) for the server's `rz` in pane
+    /// `pane`.
+    fn zmodem_send(&mut self, pane: PaneId, channel: ChannelId, paths: &[PathBuf]) {
+        let alive = match self.panes.get(&pane).map(|p| &p.host) {
+            Some(Host::Ssh(s)) => s.channel == channel,
+            Some(Host::Telnet(s)) => s.channel == channel,
+            _ => false,
+        };
+        if !alive {
+            return;
+        }
+        let (transfer, effects) = zmodem::Transfer::send(channel, paths);
+        if let Some(t) = transfer {
+            self.zmodem.insert(pane, t);
+        }
+        self.apply(pane, effects);
+        self.refresh_visible();
+    }
+
+    /// Starts `command` for the login of connection `connection` (in pane
+    /// `id`), whose SSH connection runs over stream `tunnel`; `input` is
+    /// what the worker sends on it.
+    fn run_proxy(
+        &mut self,
+        id: PaneId,
+        connection: ChannelId,
+        tunnel: ChannelId,
+        command: &ProxyCommand,
+        input: std::sync::mpsc::Receiver<Message>,
+    ) {
+        let Some(w) = self.workers.get(&connection) else {
+            return;
+        };
+        match ProxyRun::spawn(
+            &command.program,
+            &command.args,
+            tunnel,
+            input,
+            w.link.sender(),
+        ) {
+            Ok(run) => {
+                self.proxies.insert(connection, run);
+            }
+            Err(e) => {
+                let why = format!(
+                    "The ProxyCommand {} did not start ({e}). Is it installed and on PATH?",
+                    command.program
+                );
+                self.proxy_refused(id, connection, tunnel, &why);
+            }
+        }
+    }
+
+    /// No `ProxyCommand` for stream `tunnel`: says why, and closes the
+    /// stream, which ends the login waiting on it.
+    fn proxy_refused(&mut self, id: PaneId, connection: ChannelId, tunnel: ChannelId, why: &str) {
+        self.show(
+            id,
+            &format!("\x1b[0;31m{}\x1b[0m\r\n", crate::ssh::sanitize(why)),
+        );
+        if let Some(w) = self.workers.get(&connection) {
+            w.link.relays().remove(tunnel);
+            w.link.send(Message::Close { channel: tunnel });
+        }
+        self.refresh(id);
+    }
+
+    /// What the `ProxyCommand` of pane `id`'s connection printed on its
+    /// error output, once the login ended.
+    fn proxy_errors(&mut self, id: PaneId) {
+        let Some(Host::Ssh(s)) = self.panes.get(&id).map(|p| &p.host) else {
+            return;
+        };
+        let connections: Vec<ChannelId> = std::iter::once(s.connection)
+            .chain(s.hop_connections())
+            .collect();
+        let said: Vec<String> = connections
+            .iter()
+            .filter_map(|c| self.proxies.get(c))
+            .map(ProxyRun::errors)
+            .filter(|e| !e.is_empty())
+            .collect();
+        for text in said {
+            self.show(
+                id,
+                &format!("\x1b[0;90mThe ProxyCommand said: {text}\x1b[0m\r\n"),
+            );
+        }
+    }
+
+    /// Gets the login password of SSH pane `id` from its password source.
+    fn fetch_password(&mut self, id: PaneId) {
+        let Some(Host::Ssh(s)) = self.panes.get(&id).map(|p| &p.host) else {
+            return;
+        };
+        // The login asking: a jump host's, or the pane's host's.
+        let t = s.login_target();
+        let source = self
+            .settings
+            .profile(&t.alias)
+            .map(|p| p.password.clone())
+            .unwrap_or_default();
+        if self.run_login.contains(&id)
+            && let Some(password) = self.run_password()
+        {
+            // A run's password answers the logins with none saved; one
+            // in the Credential Manager comes first.
+            let saved = match &source {
+                PasswordSource::Windows => {
+                    credman::read(&credman::target(&t.user, &t.hostname, t.port))
+                        .ok()
+                        .flatten()
+                }
+                _ => None,
+            };
+            if !matches!(source, PasswordSource::Command(_)) {
+                match saved {
+                    Some(saved) => {
+                        self.password_result(id, Ok(saved), "the Windows Credential Manager");
+                    }
+                    None => self.password_result(id, Ok(password), "the run"),
+                }
+                return;
+            }
+        }
+        match source {
+            PasswordSource::Ask => {
+                self.password_result(id, Err(String::new()), "");
+            }
+            PasswordSource::Windows => {
+                let result = match credman::read(&credman::target(&t.user, &t.hostname, t.port)) {
+                    Ok(Some(password)) => Ok(password),
+                    Ok(None) => Err(
+                        "No password saved in the Windows Credential Manager yet; type it \
+                         and FeroSSH saves it once the login works."
+                            .into(),
+                    ),
+                    Err(e) => Err(e),
+                };
+                self.password_result(id, result, "the Windows Credential Manager");
+            }
+            PasswordSource::Command(line) => {
+                if command_approved(&line) {
+                    self.run_password_command(id, &line);
+                } else {
+                    self.queued
+                        .push(Command::ConfirmPasswordTool { pane: id, line });
+                }
+            }
+        }
+    }
+
+    /// Runs the password manager command `line` for pane `id`'s login on
+    /// a thread of its own; [`Self::poll_passwords`] takes the answer.
+    fn run_password_command(&mut self, id: PaneId, line: &str) {
+        let Some(Host::Ssh(s)) = self.panes.get(&id).map(|p| &p.host) else {
+            return;
+        };
+        let t = s.login_target();
+        let tokens = pw_source::Tokens {
+            name: &t.alias,
+            host: &t.hostname,
+            user: &t.user,
+            port: t.port,
+        };
+        let Some((program, args)) = pw_source::command(line, &tokens) else {
+            self.password_result(id, Err("The password command is empty.".into()), "");
+            return;
+        };
+        let channel = s.channel;
+        let name = Path::new(&program)
+            .file_stem()
+            .map_or_else(|| program.clone(), |n| n.to_string_lossy().into_owned());
+        self.show(
+            id,
+            &format!(
+                "\x1b[0;90mGetting the password from {}...\x1b[0m\r\n",
+                crate::ssh::sanitize(&name)
+            ),
+        );
+        self.refresh(id);
+        let answers = self.passwords.clone();
+        let notify = self.notifier();
+        std::thread::spawn(move || {
+            let result = pwcommand::run(&program, &args, pwcommand::TIMEOUT);
+            if let Ok(mut a) = answers.lock() {
+                a.push((id, channel, name, result));
+            }
+            notify();
+        });
+    }
+
+    /// Hands finished password commands to their panes, if those still
+    /// wait for them.
+    fn poll_passwords(&mut self) {
+        let done = match self.passwords.lock() {
+            Ok(mut a) => std::mem::take(&mut *a),
+            Err(_) => return,
+        };
+        for (id, channel, name, result) in done {
+            let waiting = matches!(
+                self.panes.get(&id).map(|p| &p.host),
+                Some(Host::Ssh(s)) if s.channel == channel && s.fetching_password()
+            );
+            if waiting {
+                self.password_result(id, result, &name);
+            }
+        }
+    }
+
+    /// Gives pane `id`'s session the password its source found, or why
+    /// there is none (it then asks at the prompt).
+    fn password_result(
+        &mut self,
+        id: PaneId,
+        result: std::result::Result<Zeroizing<String>, String>,
+        from: &str,
+    ) {
+        let Some(Host::Ssh(s)) = self.panes.get_mut(&id).map(|p| &mut p.host) else {
+            return;
+        };
+        let effects = s.password_fetched(result, from);
+        self.apply(id, effects);
+        self.refresh(id);
+    }
+
+    /// Keeps the password that just worked for `user` at `host`:`port`
+    /// (pane `id`'s host, or a jump host on the way) in the Windows
+    /// Credential Manager.
+    fn store_password(
+        &mut self,
+        id: PaneId,
+        (user, host, port): (&str, &str, u16),
+        password: &ferossh_ipc::Secrets,
+    ) {
+        let Some(password) = password.0.first() else {
+            return;
+        };
+        let note = match credman::write(&credman::target(user, host, port), user, password) {
+            Ok(()) => "Saved the password in the Windows Credential Manager.".to_owned(),
+            Err(e) => e,
+        };
+        self.show(id, &format!("\x1b[0;90m{note}\x1b[0m\r\n"));
+    }
+
+    /// Starts the login script of session `alias` in pane `id`, if its
+    /// profile has one; `tmux` attaches tmux after it as the profile asks.
+    /// Returns whether a script started.
+    fn start_script(&mut self, id: PaneId, alias: &str, tmux: bool) -> bool {
+        let steps = self
+            .settings
+            .profile(alias)
+            .map(|p| p.login_script.clone())
+            .unwrap_or_default();
+        if steps.is_empty() {
+            return false;
+        }
+        self.script_runs += 1;
+        let mut runner = Runner::new(steps);
+        let actions = runner.start(Instant::now());
+        self.scripts.insert(
+            id,
+            ScriptRun {
+                runner,
+                run: self.script_runs,
+                tmux,
+                report: false,
+            },
+        );
+        self.script_actions(id, actions);
+        true
+    }
+
+    /// Session > Run login script again, in the focused pane.
+    fn rerun_script(&mut self, id: PaneId) -> Option<Command> {
+        let alias = match self.panes.get(&id).map(|p| &p.host) {
+            Some(Host::Ssh(s)) if s.state() == State::Connected => Some(s.target.alias.clone()),
+            Some(Host::Serial {
+                port: Some(_),
+                target,
+                session,
+            }) => Some(session.clone().unwrap_or_else(|| target.port.clone())),
+            Some(Host::Telnet(s)) if s.state() == State::Connected => Some(s.target.alias.clone()),
+            _ => None,
+        };
+        let Some(alias) = alias else {
+            return Some(Command::Notice(
+                "The login script runs in a pane logged in to an SSH or Telnet host or open \
+                 on a serial port."
+                    .into(),
+            ));
+        };
+        self.scripts.remove(&id);
+        if self.start_script(id, &alias, false) {
+            self.refresh(id);
+            None
+        } else {
+            Some(Command::Notice(format!(
+                "{alias} has no login script. Add one under Extras in its session (F2 in \
+                 the connection manager)."
+            )))
+        }
+    }
+
+    /// Hands pane `id`'s login script to `f` and carries out what it
+    /// decided.
+    fn with_script(
+        &mut self,
+        id: PaneId,
+        f: impl FnOnce(&mut Runner) -> Vec<login_script::Action>,
+    ) {
+        let Some(run) = self.scripts.get_mut(&id) else {
+            return;
+        };
+        let actions = f(&mut run.runner);
+        self.script_actions(id, actions);
+    }
+
+    /// What pane `id`'s host printed, for its login script.
+    fn script_output(&mut self, id: PaneId, bytes: &[u8]) {
+        if self.scripts.contains_key(&id) {
+            self.with_script(id, |r| r.feed(bytes, Instant::now()));
+        }
+    }
+
+    /// Carries out what pane `id`'s login script decided.
+    fn script_actions(&mut self, id: PaneId, actions: Vec<login_script::Action>) {
+        if actions.is_empty() {
+            return;
+        }
+        for action in actions {
+            match action {
+                login_script::Action::Send(bytes) => self.send(id, bytes.to_vec()),
+                login_script::Action::Show(text) => self.show(id, &text),
+                login_script::Action::Fetch(need) => self.fetch_secret(id, need),
+                login_script::Action::Save(name, secret) => self.save_secret(id, &name, &secret),
+                login_script::Action::Captured(value) => {
+                    if let Some(row) = self.snippets_view.report_mut().and_then(|r| r.row_mut(id)) {
+                        row.values.push(value);
+                    }
+                }
+                login_script::Action::Done => {
+                    let mut next = self.snippet_next.remove(&id);
+                    if let Some(run) = self.scripts.remove(&id) {
+                        if next.as_ref().is_some_and(|n| n.0 != run.run)
+                            || matches!(
+                                run.runner.outcome(),
+                                Some(Outcome::Failed(_) | Outcome::Stopped)
+                            )
+                        {
+                            next = None;
+                        }
+                        // The part after a move types what was captured
+                        // before it, up to its own next capture, whose
+                        // value its own runner fills in.
+                        next = next.map(|(r, name, rest)| {
+                            let mut captured = false;
+                            let rest = rest
+                                .into_iter()
+                                .map(|s| {
+                                    captured |= matches!(s, Step::Capture(_));
+                                    if captured { s } else { run.runner.fill(s) }
+                                })
+                                .collect();
+                            (r, name, rest)
+                        });
+                        if run.report
+                            && let Some(row) =
+                                self.snippets_view.report_mut().and_then(|r| r.row_mut(id))
+                        {
+                            row.state = match run.runner.outcome() {
+                                Some(Outcome::Failed(why)) => RowState::Failed(why.clone()),
+                                Some(Outcome::Stopped) => RowState::Stopped,
+                                _ => RowState::Done,
+                            };
+                        }
+                        if run.tmux {
+                            self.cd_after_login(id);
+                            self.tmux_after_login(id);
+                        }
+                        if run.report {
+                            self.pump_run();
+                        } else if self.run_login.contains(&id) {
+                            // The login script of a run's host is over.
+                            match run.runner.outcome() {
+                                Some(Outcome::Failed(why)) => {
+                                    self.fail_run_row(id, format!("login script: {why}"));
+                                }
+                                Some(Outcome::Stopped) => {
+                                    self.fail_run_row(id, "the login script stopped".into());
+                                }
+                                _ => self.begin_run_snippet(id),
+                            }
+                        }
+                    } else {
+                        next = None;
+                    }
+                    if let Some((_, name, rest)) = next {
+                        self.snippet_move(id, &name, rest);
+                    }
+                }
+            }
+        }
+        if let Some(run) = self.scripts.get(&id)
+            && run.report
+            && let Some(row) = self.snippets_view.report_mut().and_then(|r| r.row_mut(id))
+        {
+            row.state = RowState::Running(run.runner.waiting_for());
+        }
+        if self.snippets_view.reporting() {
+            self.refresh_chrome();
+        }
+        self.arm_script_timer();
+        self.refresh(id);
+    }
+
+    /// Sets the timer for the first login script deadline.
+    fn arm_script_timer(&mut self) {
+        let next = self
+            .scripts
+            .values()
+            .filter_map(|r| r.runner.deadline())
+            .min();
+        // SAFETY: our window; replaces any earlier timer with this id.
+        unsafe {
+            match next {
+                Some(at) => {
+                    let wait = at.saturating_duration_since(Instant::now());
+                    let ms = u32::try_from(wait.as_millis()).unwrap_or(u32::MAX).max(1);
+                    SetTimer(Some(self.hwnd), TIMER_SCRIPT, ms, None);
+                }
+                None => {
+                    let _ = KillTimer(Some(self.hwnd), TIMER_SCRIPT);
+                }
+            }
+        }
+    }
+
+    fn on_script_timer(&mut self) {
+        let now = Instant::now();
+        let ids: Vec<PaneId> = self.scripts.keys().copied().collect();
+        for id in ids {
+            self.with_script(id, |r| r.tick(now));
+        }
+        self.arm_script_timer();
+    }
+
+    /// Finds the secret pane `id`'s login script needs: the login
+    /// password from the session's password source, or a named secret
+    /// from its password manager command or the Windows Credential
+    /// Manager. One that none has is asked for in the pane.
+    fn fetch_secret(&mut self, id: PaneId, need: Need) {
+        let (alias, is_ssh, login_target) = match self.panes.get(&id).map(|p| &p.host) {
+            Some(Host::Ssh(s)) => (
+                s.target.alias.clone(),
+                true,
+                credman::target(&s.target.user, &s.target.hostname, s.target.port),
+            ),
+            Some(Host::Serial {
+                target, session, ..
+            }) => (
+                session.clone().unwrap_or_else(|| target.port.clone()),
+                false,
+                String::new(),
+            ),
+            Some(Host::Telnet(s)) => (s.target.alias.clone(), false, String::new()),
+            _ => return,
+        };
+        let now = Instant::now();
+        match need {
+            Need::Password => {
+                let source = if is_ssh {
+                    self.settings
+                        .profile(&alias)
+                        .map(|p| p.password.clone())
+                        .unwrap_or_default()
+                } else {
+                    PasswordSource::Ask
+                };
+                let ask = "\r\nLogin password, for the login script: ";
+                match source {
+                    PasswordSource::Ask => self.with_script(id, |r| r.ask(ask, None)),
+                    PasswordSource::Windows => match credman::read(&login_target) {
+                        Ok(Some(pw)) => self.with_script(id, |r| r.secret(&pw, now)),
+                        Ok(None) => self.with_script(id, |r| r.ask(ask, None)),
+                        Err(e) => self.with_script(id, |r| r.secret_failed(&e)),
+                    },
+                    PasswordSource::Command(line) => self.script_command(id, line, None),
+                }
+            }
+            Need::Secret(name) => {
+                let command = self
+                    .settings
+                    .secrets
+                    .iter()
+                    .find(|x| x.name.eq_ignore_ascii_case(&name))
+                    .map(|x| x.command.clone());
+                if let Some(line) = command {
+                    self.script_command(id, line, Some(name));
+                    return;
+                }
+                match credman::read(&secret_target(&name)) {
+                    Ok(Some(secret)) => self.with_script(id, |r| r.secret(&secret, now)),
+                    Ok(None) => {
+                        let text = format!(
+                            "\r\n\x1b[0;90mThe login script needs the secret {name}. FeroSSH \
+                             keeps it in the Windows Credential Manager as {}.\x1b[0m\r\n\
+                             Secret {name}: ",
+                            secret_target(&name)
+                        );
+                        self.with_script(id, |r| r.ask(&text, Some(name.clone())));
+                    }
+                    Err(e) => self.with_script(id, |r| r.secret_failed(&e)),
+                }
+            }
+        }
+    }
+
+    /// Gets a login script's secret from password manager command `line`,
+    /// once the user allowed it; `name` is the secret's (`None` for the
+    /// login password).
+    fn script_command(&mut self, id: PaneId, line: String, name: Option<String>) {
+        if command_approved(&line) {
+            self.run_script_command(id, &line, name.as_deref());
+        } else {
+            self.queued.push(Command::ConfirmSecretTool {
+                pane: id,
+                line,
+                name,
+            });
+        }
+    }
+
+    /// Runs password manager command `line` for pane `id`'s login script
+    /// on a thread of its own; [`Self::poll_script_secrets`] takes the
+    /// answer. `%n` is the secret's name, or the session's for the login
+    /// password.
+    fn run_script_command(&mut self, id: PaneId, line: &str, name: Option<&str>) {
+        let Some(run) = self.scripts.get(&id).map(|r| r.run) else {
+            return;
+        };
+        let (alias, host, user, port) = match self.panes.get(&id).map(|p| &p.host) {
+            Some(Host::Ssh(s)) => (
+                s.target.alias.clone(),
+                s.target.hostname.clone(),
+                s.target.user.clone(),
+                s.target.port,
+            ),
+            Some(Host::Serial {
+                target, session, ..
+            }) => (
+                session.clone().unwrap_or_else(|| target.port.clone()),
+                target.port.clone(),
+                String::new(),
+                0,
+            ),
+            _ => return,
+        };
+        let tokens = pw_source::Tokens {
+            name: name.unwrap_or(&alias),
+            host: &host,
+            user: &user,
+            port,
+        };
+        let Some((program, args)) = pw_source::command(line, &tokens) else {
+            self.with_script(id, |r| r.secret_failed("the password command is empty."));
+            return;
+        };
+        let what = match name {
+            Some(n) => format!("the secret {n}"),
+            None => "the password".to_owned(),
+        };
+        let from = Path::new(&program)
+            .file_stem()
+            .map_or_else(|| program.clone(), |n| n.to_string_lossy().into_owned());
+        self.show(
+            id,
+            &format!(
+                "\x1b[0;90mGetting {what} from {}...\x1b[0m\r\n",
+                crate::ssh::sanitize(&from)
+            ),
+        );
+        self.refresh(id);
+        let answers = self.script_secrets.clone();
+        let notify = self.notifier();
+        std::thread::spawn(move || {
+            let result = pwcommand::run(&program, &args, pwcommand::TIMEOUT);
+            if let Ok(mut a) = answers.lock() {
+                a.push((id, run, result));
+            }
+            notify();
+        });
+    }
+
+    /// Hands finished password manager commands to the login scripts
+    /// still waiting for them.
+    fn poll_script_secrets(&mut self) {
+        let done = match self.script_secrets.lock() {
+            Ok(mut a) => std::mem::take(&mut *a),
+            Err(_) => return,
+        };
+        for (id, run, result) in done {
+            if self.scripts.get(&id).is_none_or(|r| r.run != run) {
+                continue;
+            }
+            match result {
+                Ok(secret) => self.with_script(id, |r| r.secret(&secret, Instant::now())),
+                Err(e) => self.with_script(id, |r| r.secret_failed(&e)),
+            }
+        }
+    }
+
+    /// Keeps a secret typed at a login script's prompt in the Windows
+    /// Credential Manager.
+    fn save_secret(&mut self, id: PaneId, name: &str, secret: &str) {
+        let note = match credman::write(&secret_target(name), name, secret) {
+            Ok(()) => format!(
+                "Saved the secret {name} in the Windows Credential Manager; remove it \
+                 there to type a new one."
+            ),
+            Err(e) => e,
+        };
+        self.show(id, &format!("\x1b[0;90m{note}\x1b[0m\r\n"));
+    }
+
+    /// Opens the pane's log if logging is on and the pane has a host.
+    fn start_log(&mut self, id: PaneId) {
+        let Some(p) = self.panes.get(&id) else {
+            return;
+        };
+        if !p.log.enabled || p.log.writer.is_some() {
+            return;
+        }
+        let label = match &p.host {
+            Host::Ssh(s) if s.state() == State::Connected => s.target.label(),
+            Host::Telnet(s) if s.state() == State::Connected => s.target.label(),
+            Host::Local { exited: false, .. } => "local".to_owned(),
+            Host::Tmux { label, .. } => label.clone(),
+            Host::Serial {
+                port: Some(_),
+                target,
+                ..
+            } => target.port.clone(),
+            _ => return,
+        };
+        let raw = p.log.raw;
+        let dir = log_dir();
+        let opened = new_log_file(&label, id, "");
+        let header = format!("FeroSSH log of {label}, started {}", timestamp());
+        let stamps = self
+            .settings
+            .log_timestamps
+            .then_some(log_line_time as Clock);
+        let writer = opened.and_then(|(f, chain, path, name)| {
+            let mut writer = LogWriter::sealed(f, chain, &name, raw, &header)?;
+            writer.set_timestamps(stamps);
+            Ok((writer, path))
+        });
+        match writer {
+            Ok((writer, path)) => {
+                self.show(
+                    id,
+                    &format!("\x1b[0;90mLogging to {}\x1b[0m\r\n", path.display()),
+                );
+                if let Some(p) = self.panes.get_mut(&id) {
+                    p.log.writer = Some(writer);
+                    p.log.path = Some(path);
+                }
+            }
+            Err(e) => {
+                self.show(
+                    id,
+                    &format!(
+                        "\x1b[0;31mCould not open a log file in {}: {e}\x1b[0m\r\n",
+                        dir.display()
+                    ),
+                );
+                if let Some(p) = self.panes.get_mut(&id) {
+                    p.log.enabled = false;
+                }
+                self.update_menu_checks();
+            }
+        }
+    }
+
+    /// Session > Save output: each pane's scrollback and screen, as plain
+    /// text, to a log file of its own. Returns what to tell the user.
+    fn save_output(&self, panes: &[PaneId]) -> String {
+        let mut saved = Vec::new();
+        let mut failed = Vec::new();
+        for id in panes {
+            let Some(p) = self.panes.get(id) else {
+                continue;
+            };
+            if matches!(p.host, Host::Desktop { .. }) {
+                continue;
+            }
+            let lines = p.term.all_text();
+            if lines.is_empty() {
+                continue;
+            }
+            match save_text_log(&p.host_label(), *id, &lines) {
+                Ok(path) => saved.push(format!("{} ({} lines)", path.display(), lines.len())),
+                Err(e) => failed.push(format!("{}: {e}", p.label())),
+            }
+        }
+        let mut text = match saved.len() {
+            0 if failed.is_empty() => "There was no output to save.".to_owned(),
+            0 => String::new(),
+            1 => format!("Saved the output to\n\n{}", saved.join("")),
+            n => format!("Saved the output of {n} panes to\n\n{}", saved.join("\n")),
+        };
+        if !failed.is_empty() {
+            if !text.is_empty() {
+                text.push_str("\n\n");
+            }
+            text.push_str(&format!(
+                "Could not save to {}:\n\n{}",
+                log_dir().display(),
+                failed.join("\n")
+            ));
+        }
+        text
+    }
+
+    fn stop_log(&mut self, id: PaneId) {
+        let Some(p) = self.panes.get_mut(&id) else {
+            return;
+        };
+        let Some(writer) = p.log.writer.take() else {
+            return;
+        };
+        let footer = format!("Log ended {}", timestamp());
+        if let (Ok(Some(sealed)), Some(name)) = (
+            writer.finish_sealed(&footer),
+            p.log.path.as_deref().and_then(Path::file_name),
+        ) {
+            let name = name.to_string_lossy();
+            if let Err(e) = add_to_log_index(&name, &sealed) {
+                self.show(
+                    id,
+                    &format!("\x1b[0;31mCould not add the log to the log index: {e}\x1b[0m\r\n"),
+                );
+            }
+        }
+    }
+
+    fn log(&mut self, id: PaneId, bytes: &[u8]) {
+        let Some(p) = self.panes.get_mut(&id) else {
+            return;
+        };
+        let Some(writer) = &mut p.log.writer else {
+            return;
+        };
+        if let Err(e) = writer.write(bytes) {
+            p.log.writer = None;
+            p.log.enabled = false;
+            self.show(
+                id,
+                &format!("\r\n\x1b[0;31mLogging stopped: {e}\x1b[0m\r\n"),
+            );
+            self.update_menu_checks();
+        }
+    }
+
+    /// Sends the terminal's answers and other non-user bytes to the host.
+    /// They never go into a local prompt.
+    fn send(&mut self, id: PaneId, bytes: Vec<u8>) {
+        if let Some(gateway) = self.panes.get(&id).and_then(Pane::gateway) {
+            let actions = self
+                .tmux
+                .get_mut(&gateway)
+                .map(|t| t.input(id, &bytes))
+                .unwrap_or_default();
+            self.run_tmux(gateway, actions);
+            return;
+        }
+        let effects = match self.panes.get_mut(&id).map(|p| &mut p.host) {
+            Some(Host::Local {
+                shell: Some(shell),
+                exited: false,
+            }) => {
+                shell.write(bytes);
+                return;
+            }
+            Some(Host::Ssh(session)) if !session.prompt_active() => session.input(&bytes),
+            Some(Host::Telnet(session)) => session.input(&bytes),
+            Some(Host::Serial {
+                port: Some(port), ..
+            }) => {
+                port.write(bytes);
+                return;
+            }
+            _ => return,
+        };
+        self.apply(id, effects);
+    }
+
+    /// Sends what the user typed or pasted; brings the view to the bottom.
+    /// Local prompts, the connect prompt and "Press Enter to reconnect"
+    /// take it first.
+    fn input(&mut self, id: PaneId, bytes: Vec<u8>) {
+        let Some(p) = self.panes.get_mut(&id) else {
+            return;
+        };
+        if p.term.display_offset() != 0 {
+            p.term.scroll_to_bottom();
+            self.refresh(id);
+        }
+        // A login script's secret prompt takes the typing; other typing
+        // stops the script and goes on to the host.
+        if let Some(run) = self.scripts.get_mut(&id) {
+            let prompt = run.runner.prompting();
+            let actions = if prompt {
+                run.runner.prompt_input(&bytes, Instant::now())
+            } else {
+                run.runner.cancel()
+            };
+            self.script_actions(id, actions);
+            if prompt {
+                return;
+            }
+        }
+        // Typing starts paused auto-responses again, and is recorded.
+        if let Some(w) = self.watches.get_mut(&id) {
+            w.resume();
+        }
+        if let Some((pane, rec)) = &mut self.recording
+            && *pane == id
+        {
+            rec.input(&bytes);
+        }
+        let enter = matches!(bytes.as_slice(), b"\r" | b"\r\n" | b"\n");
+        let Some(p) = self.panes.get_mut(&id) else {
+            return;
+        };
+        match &mut p.host {
+            Host::Local { exited: true, .. } => {
+                if enter {
+                    self.start_shell(id);
+                }
+            }
+            Host::Local { .. } => self.send(id, bytes),
+            // Typing reaches the desktop before this; the pane only shows
+            // messages once it ended.
+            Host::Desktop { .. } => {}
+            Host::Ask(text) => {
+                if enter {
+                    let destination = std::mem::take(text);
+                    self.show(id, "\r\n");
+                    if destination.trim().is_empty() {
+                        self.show(id, CONNECT_PROMPT);
+                    } else {
+                        self.connect(id, destination.trim());
+                    }
+                } else if let [0x7f] | [0x08] = bytes.as_slice() {
+                    if text.pop().is_some() {
+                        self.show(id, "\x08 \x08");
+                    }
+                } else if !bytes.starts_with(&[0x1b]) {
+                    let typed: String = String::from_utf8_lossy(&bytes)
+                        .chars()
+                        .filter(|c| !c.is_control())
+                        .collect();
+                    text.push_str(&typed);
+                    self.show(id, &typed);
+                }
+                self.refresh(id);
+            }
+            Host::Ssh(session) if session.prompt_active() => {
+                let effects = session.prompt_input(&bytes);
+                self.apply(id, effects);
+                self.refresh(id);
+            }
+            Host::Ssh(session)
+                if session.state() == State::Connecting
+                    && bytes == b"\x1b"
+                    && self.retries.contains_key(&id) =>
+            {
+                self.stop_reconnecting(id);
+            }
+            Host::Ssh(session) if session.state() == State::Ended => {
+                if self.retries.contains_key(&id) {
+                    if enter {
+                        self.retry_now(id);
+                    } else if bytes == b"\x1b" {
+                        self.stop_reconnecting(id);
+                    }
+                } else if enter {
+                    self.reconnect(id);
+                }
+            }
+            Host::Serial {
+                port: None,
+                target,
+                session,
+            } => {
+                if enter {
+                    let (target, session) = (target.clone(), session.clone());
+                    self.open_serial(id, target, session.as_deref());
+                }
+            }
+            Host::Telnet(session) if session.state() == State::Ended => {
+                if enter {
+                    self.reconnect(id);
+                }
+            }
+            Host::Ssh(_) | Host::Tmux { .. } | Host::Serial { .. } | Host::Telnet(_) => {
+                self.send(id, bytes);
+            }
+        }
+    }
+
+    /// Whether pane `id` passes typing straight to its host, so it may
+    /// send or receive broadcast input. Prompts and ended sessions do not.
+    fn takes_broadcast(&self, id: PaneId) -> bool {
+        let Some(p) = self.panes.get(&id) else {
+            return false;
+        };
+        if p.desktop.is_some() || self.scripts.get(&id).is_some_and(|r| r.runner.prompting()) {
+            return false;
+        }
+        match &p.host {
+            Host::Local {
+                shell: Some(_),
+                exited: false,
+            }
+            | Host::Tmux { .. }
+            | Host::Serial { port: Some(_), .. } => true,
+            Host::Ssh(s) => s.state() == State::Connected && !s.prompt_active(),
+            Host::Telnet(s) => s.state() == State::Connected,
+            _ => false,
+        }
+    }
+
+    /// The other panes that get what is typed in pane `id`.
+    fn broadcast_targets(&self, id: PaneId) -> Vec<PaneId> {
+        if self.broadcast == broadcast::Scope::Off {
+            return Vec::new();
+        }
+        broadcast::targets(
+            self.broadcast,
+            id,
+            &self.visible_ids(),
+            &self.ws.all_panes(),
+            |p| self.panes.get(&p).is_none_or(|p| p.no_broadcast),
+            |p| self.takes_broadcast(p),
+        )
+    }
+
+    /// Sends a key, character or paste to each of `targets`, encoded by
+    /// that pane's own terminal: its cursor-key mode, bracketed paste and
+    /// keypad mode can differ from the focused pane's.
+    fn send_typed(&mut self, targets: &[PaneId], typed: &Typed) {
+        for &id in targets {
+            let Some(p) = self.panes.get_mut(&id) else {
+                continue;
+            };
+            let bytes = match typed {
+                Typed::Char(ch, alt) => Some(p.term.text(*ch, *alt)),
+                Typed::Key(key, mods) => p.term.key(*key, *mods),
+                Typed::Bytes(b) => Some(b.clone()),
+                Typed::Paste(text) => Some(p.term.paste(text).bytes),
+            };
+            if let Some(bytes) = bytes {
+                self.input(id, bytes);
+            }
+        }
+    }
+
+    /// Pastes into a local prompt; `false` if no prompt is open and the
+    /// paste goes to the host.
+    fn paste_local(&mut self, id: PaneId, text: &str) -> bool {
+        if let Some(run) = self.scripts.get_mut(&id)
+            && run.runner.prompting()
+        {
+            run.runner.prompt_paste(text);
+            return true;
+        }
+        let Some(p) = self.panes.get_mut(&id) else {
+            return true;
+        };
+        match &mut p.host {
+            Host::Ssh(session) if session.prompt_active() => {
+                let effects = session.prompt_paste(text);
+                self.apply(id, effects);
+            }
+            Host::Ask(typed) => {
+                let clean: String = text.chars().filter(|c| !c.is_control()).collect();
+                typed.push_str(&clean);
+                self.show(id, &clean);
+            }
+            _ => return false,
+        }
+        self.refresh(id);
+        true
+    }
+
+    /// Reads what the shells, the worker and the broker have queued.
+    fn on_output(&mut self) -> Vec<Command> {
+        self.output_pending.store(false, Ordering::Release);
+        let mut fed = 0;
+        let mut more = false;
+        // The local shells.
+        let ids: Vec<PaneId> = self.panes.keys().copied().collect();
+        for id in ids {
+            while let Some(Pane {
+                host:
+                    Host::Local {
+                        shell: Some(shell),
+                        exited: false,
+                    },
+                ..
+            }) = self.panes.get_mut(&id)
+            {
+                let Some(out) = shell.try_read() else {
+                    break;
+                };
+                match out {
+                    Output::Data(data) => {
+                        fed += data.len();
+                        if let Some(p) = self.panes.get_mut(&id) {
+                            p.term.feed(&data);
+                        }
+                        self.log(id, &data);
+                    }
+                    Output::Exited(code) => {
+                        self.stop_log(id);
+                        if let Some(p) = self.panes.get_mut(&id) {
+                            p.host = Host::Local {
+                                shell: None,
+                                exited: true,
+                            };
+                        }
+                        let text = format!(
+                            "\r\n\x1b[0;90m[Process exited with code {code}. Press Enter to start a new one.]\x1b[0m\r\n"
+                        );
+                        self.show(id, &text);
+                    }
+                }
+                if fed >= OUTPUT_BUDGET {
+                    more = true;
+                    break;
+                }
+            }
+        }
+        // The serial consoles.
+        let ids: Vec<PaneId> = self.panes.keys().copied().collect();
+        for id in ids {
+            while let Some(Pane {
+                host: Host::Serial {
+                    port: Some(port), ..
+                },
+                ..
+            }) = self.panes.get_mut(&id)
+            {
+                let Some(out) = port.try_read() else {
+                    break;
+                };
+                match out {
+                    SerialOutput::Data(data) => {
+                        fed += data.len();
+                        if let Some(p) = self.panes.get_mut(&id) {
+                            p.term.feed(&data);
+                        }
+                        self.log(id, &data);
+                        self.script_output(id, &data);
+                        self.watch_output(id, &data);
+                    }
+                    SerialOutput::Closed(why) => {
+                        self.stop_log(id);
+                        self.scripts.remove(&id);
+                        if let Some(Host::Serial { port, .. }) =
+                            self.panes.get_mut(&id).map(|p| &mut p.host)
+                        {
+                            *port = None;
+                        }
+                        let text = format!(
+                            "\r\n\x1b[0;31m[The serial port stopped: {}. Press Enter to open it again.]\x1b[0m\r\n",
+                            why.trim()
+                        );
+                        self.show(id, &text);
+                        self.refresh_chrome();
+                    }
+                }
+                if fed >= OUTPUT_BUDGET {
+                    more = true;
+                    break;
+                }
+            }
+        }
+        // The signing broker answers in the order it was asked.
+        while let Some(reply) = self.broker.as_ref().and_then(Broker::try_recv) {
+            let channel = self.broker_jobs.pop_front().unwrap_or(0);
+            let Some(id) = self.pane_of_channel(channel) else {
+                continue;
+            };
+            let effects = match self.panes.get_mut(&id).map(|p| &mut p.host) {
+                Some(Host::Ssh(session)) => session.on_broker(reply),
+                _ => Vec::new(),
+            };
+            self.apply(id, effects);
+        }
+        // The workers, a message from each in turn so that a flooding
+        // host does not hold up the others.
+        let mut transfers = false;
+        let connections: Vec<ChannelId> = self.workers.keys().copied().collect();
+        while !more {
+            let mut idle = true;
+            for &connection in &connections {
+                let Some(event) = self
+                    .workers
+                    .get(&connection)
+                    .and_then(|w| w.link.try_recv())
+                else {
+                    continue;
+                };
+                idle = false;
+                transfers |= self.on_worker_event(connection, event, &mut fed);
+                more = fed >= OUTPUT_BUDGET;
+                if more {
+                    break;
+                }
+            }
+            if idle {
+                break;
+            }
+        }
+        if transfers {
+            self.flush_sftp();
+            if self.files_visible() {
+                self.refresh_chrome();
+            }
+        }
+        self.desktop_events();
+        self.poll_desktops();
+        // A launch's desktop may have just taken over its connection.
+        if self.launches.values().next().is_some()
+            && self.panes.values().any(|p| p.desktop.is_some())
+        {
+            self.retire_launches();
+        }
+        self.poll_passwords();
+        self.poll_script_secrets();
+        // The forwards list and the tab badges.
+        if self
+            .workers
+            .values()
+            .fold(false, |changed, w| w.forwarder.take_changed() | changed)
+        {
+            self.refresh_chrome();
+            self.update_title();
+        }
+        if more && !self.output_pending.swap(true, Ordering::AcqRel) {
+            // Let the window paint, then carry on.
+            // SAFETY: posting to our own window.
+            unsafe {
+                let _ = PostMessageW(Some(self.hwnd), WM_SHELL_OUTPUT, WPARAM(0), LPARAM(0));
+            }
+        }
+        self.after_feed()
+    }
+
+    /// Handles what the worker of the connection `connection` sent, and
+    /// returns whether it was for a file transfer. A worker only reaches
+    /// the shells and SFTP channels on its own connection: anything it
+    /// says about another one's is dropped.
+    fn on_worker_event(
+        &mut self,
+        connection: ChannelId,
+        event: LinkEvent,
+        fed: &mut usize,
+    ) -> bool {
+        match event {
+            LinkEvent::Message(msg) => {
+                match &msg {
+                    Message::Data { bytes, .. } | Message::ZmodemData { bytes, .. } => {
+                        *fed += bytes.len();
+                    }
+                    Message::SftpReply {
+                        reply: SftpReply::Data(data),
+                        ..
+                    } => *fed += data.len(),
+                    _ => {}
+                }
+                let Some(c) = msg.channel() else {
+                    return false;
+                };
+                if self
+                    .vdesks
+                    .get(&c)
+                    .is_some_and(|v| v.connection == connection)
+                {
+                    self.on_vdesk(c, msg);
+                    return false;
+                }
+                if let Some(remote) = self
+                    .sftp
+                    .values_mut()
+                    .find(|r| r.channel() == Some(c) && r.connection() == Some(connection))
+                {
+                    remote.on_message(msg);
+                    return true;
+                }
+                let Some(id) = self.pane_of_channel(c) else {
+                    return false;
+                };
+                if zmodem::is_zmodem(&msg) {
+                    let own = match self.panes.get(&id).map(|p| &p.host) {
+                        Some(Host::Ssh(s)) => c == s.channel && s.connection == connection,
+                        Some(Host::Telnet(s)) => s.connection() == connection,
+                        _ => false,
+                    };
+                    if own {
+                        self.on_zmodem(id, c, msg);
+                    }
+                    return false;
+                }
+                let effects = match self.panes.get_mut(&id).map(|p| &mut p.host) {
+                    Some(Host::Ssh(session)) if session.worker_for(Some(c)) == Some(connection) => {
+                        session.on_worker(msg)
+                    }
+                    Some(Host::Telnet(session)) if session.connection() == connection => {
+                        session.on_worker(msg)
+                    }
+                    _ => Vec::new(),
+                };
+                self.apply(id, effects);
+                false
+            }
+            LinkEvent::Closed(why) => {
+                if let Some(w) = self.workers.remove(&connection) {
+                    w.forwarder.worker_gone();
+                }
+                crate::remote_app::connection_gone(connection);
+                self.proxies.remove(&connection);
+                self.vdesks.retain(|_, v| v.connection != connection);
+                for remote in self.sftp.values_mut() {
+                    if remote.connection() == Some(connection) {
+                        remote.detach();
+                    }
+                }
+                let ids: Vec<PaneId> = self.panes.keys().copied().collect();
+                for id in ids {
+                    let effects = match self.panes.get_mut(&id).map(|p| &mut p.host) {
+                        Some(Host::Ssh(session))
+                            if matches!(session.state(), State::Connecting | State::Connected) =>
+                        {
+                            // The login in that worker: the pane's own, or
+                            // a jump host's on the way.
+                            match session.login_on(connection) {
+                                Some(channel) => session.on_worker(Message::Disconnected {
+                                    channel,
+                                    reason: why.clone(),
+                                }),
+                                None => Vec::new(),
+                            }
+                        }
+                        Some(Host::Telnet(session))
+                            if session.connection() == connection
+                                && matches!(
+                                    session.state(),
+                                    State::Connecting | State::Connected
+                                ) =>
+                        {
+                            session.on_worker(Message::Disconnected {
+                                channel: session.channel,
+                                reason: why.clone(),
+                            })
+                        }
+                        _ => Vec::new(),
+                    };
+                    self.apply(id, effects);
+                }
+                true
+            }
+        }
+    }
+
+    /// Acts on what the terminals asked for and redraws.
+    fn after_feed(&mut self) -> Vec<Command> {
+        let mut commands = Vec::new();
+        let mut deadline: Option<Instant> = None;
+        let focused = self.focused_id();
+        let ids: Vec<PaneId> = self.panes.keys().copied().collect();
+        let mut chrome = false;
+        for id in ids {
+            let visible = self.is_visible(id);
+            let Some(p) = self.panes.get_mut(&id) else {
+                continue;
+            };
+            let actions = p.term.take_actions();
+            if let Some(d) = p.term.sync_deadline() {
+                deadline = Some(deadline.map_or(d, |old| old.min(d)));
+            }
+            for action in actions {
+                match action {
+                    // tmux answered its panes' queries already.
+                    Action::Reply(_)
+                        if self.panes.get(&id).is_some_and(|p| p.gateway().is_some()) => {}
+                    Action::Reply(bytes) => self.send(id, bytes),
+                    Action::Title(title) => {
+                        if let Some(p) = self.panes.get_mut(&id) {
+                            p.title = title;
+                        }
+                        if id == focused {
+                            commands.push(Command::UpdateTitle);
+                        }
+                        chrome = true;
+                    }
+                    Action::ClipboardRequest(text) => commands.push(Command::ClipboardWrite(text)),
+                    Action::Bell => {
+                        if !visible && let Some(p) = self.panes.get_mut(&id) {
+                            p.bell = true;
+                            chrome = true;
+                        }
+                        if !self.focused {
+                            commands.push(Command::Bell);
+                        }
+                    }
+                    Action::WorkingDirectory(dir) => {
+                        if self.on_working_dir(id, dir) {
+                            chrome = true;
+                        }
+                    }
+                }
+            }
+            if self.read_prompt(id) {
+                chrome = true;
+            }
+            self.read_local_prompt(id);
+        }
+        if let Some(deadline) = deadline {
+            let wait = deadline.saturating_duration_since(Instant::now());
+            let ms = u32::try_from(wait.as_millis()).unwrap_or(u32::MAX).max(1);
+            // SAFETY: our window; replaces any earlier timer with this id.
+            unsafe { SetTimer(Some(self.hwnd), TIMER_SYNC, ms, None) };
+        }
+        if chrome {
+            self.refresh_chrome();
+        }
+        self.refresh_visible();
+        if let Some(found) = self.poll_update_check() {
+            commands.push(found);
+        }
+        commands.append(&mut self.queued);
+        commands
+    }
+
+    /// Starts Help > Check for updates in the background, unless one is
+    /// already running; its answer wakes the window like shell output.
+    fn start_update_check(&mut self, asked: bool) {
+        if self.update.is_some() {
+            return;
+        }
+        let (tx, rx) = std::sync::mpsc::channel();
+        let wake = self.notifier();
+        let spawned = std::thread::Builder::new()
+            .name("update-check".into())
+            .spawn(move || {
+                let _ = tx.send(crate::update::check());
+                wake();
+            });
+        if spawned.is_ok() {
+            self.update = Some((rx, asked));
+        }
+    }
+
+    /// The finished update check's answer, as a command that shows it.
+    fn poll_update_check(&mut self) -> Option<Command> {
+        let (rx, asked) = self.update.as_ref()?;
+        let asked = *asked;
+        let outcome = match rx.try_recv() {
+            Ok(outcome) => outcome,
+            Err(std::sync::mpsc::TryRecvError::Empty) => return None,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                crate::update::Outcome::Failed("the check stopped".into())
+            }
+        };
+        self.update = None;
+        if !matches!(outcome, crate::update::Outcome::Failed(_)) {
+            crate::update::checked();
+        }
+        Some(Command::UpdateFound { outcome, asked })
+    }
+
+    fn on_sync_timer(&mut self) -> Vec<Command> {
+        // SAFETY: our window and timer.
+        unsafe {
+            let _ = KillTimer(Some(self.hwnd), TIMER_SYNC);
+        }
+        let soon = Instant::now() + Duration::from_millis(1);
+        for p in self.panes.values_mut() {
+            if p.term.sync_deadline().is_some_and(|d| d <= soon) {
+                p.term.flush_sync();
+            }
+        }
+        self.after_feed()
+    }
+
+    /// Copies a visible pane's terminal into its grid and asks Windows to
+    /// repaint the rows that changed.
+    fn refresh(&mut self, id: PaneId) {
+        if !self.is_visible(id) {
+            return;
+        }
+        let keyboard = self.has_keyboard(id);
+        let Some(pane) = self.panes.get_mut(&id) else {
+            return;
+        };
+        let old = pane.cursor;
+        pane.cursor = pane.term.draw_into(&mut pane.grid, keyboard);
+        if old != pane.cursor {
+            for c in [old, pane.cursor].into_iter().flatten() {
+                pane.grid.mark_dirty(c.y);
+            }
+        }
+        // A moved or hidden mark: repaint the rows under where it was and
+        // where it goes; the mark itself is drawn over them as a fill.
+        let mark = pane.scroll_mark(self.dpi);
+        if mark != pane.mark {
+            let (_, oy) = pane.origin(self.dpi);
+            let ch = pane.metrics.height.max(1) as i32;
+            let last = pane.grid.rows().saturating_sub(1);
+            for r in [pane.mark, mark].into_iter().flatten() {
+                let first = ((r.y - oy) / ch).max(0) as usize;
+                let end = ((r.bottom() - 1 - oy) / ch).max(0) as usize;
+                for y in first.min(last)..=end.min(last) {
+                    pane.grid.mark_dirty(y);
+                }
+            }
+            pane.mark = mark;
+        }
+        self.invalidate_dirty(id);
+    }
+
+    fn refresh_visible(&mut self) {
+        for id in self.visible_ids() {
+            self.refresh(id);
+        }
+    }
+
+    /// The colours of the drawn side pane tools: the window's own (the
+    /// focused pane's theme by default), or with Windows' light look the
+    /// focused pane's theme, as before window colours existed.
+    fn chrome_palette(&self) -> Palette {
+        let c = self.ui_colours();
+        if c.custom {
+            return c.strip;
+        }
+        let theme = self
+            .panes
+            .get(&self.focused_id())
+            .map_or_else(|| self.default_theme.clone(), |p| p.theme.clone());
+        Palette::of(&theme)
+    }
+
+    /// The window's own colours (Settings > Window colours): by default
+    /// from the focused pane's theme.
+    fn ui_colours(&self) -> UiColours {
+        let theme = self
+            .panes
+            .get(&self.focused_id())
+            .map_or(&self.default_theme, |p| &p.theme);
+        let mode = self.settings.window_colours;
+        ui_colours::resolve(
+            mode,
+            theme,
+            &ui_theme::system(mode == WindowColours::System),
+        )
+    }
+
+    /// The tab strip's colours: the menu bar's, so the strip reads as part
+    /// of the window frame rather than of a terminal.
+    fn strip_palette(&self) -> Palette {
+        self.ui_colours().strip
+    }
+
+    /// What the tools rail shows: the open tool, the pin, and the tab
+    /// strip's (system menu bar) colours.
+    fn rail_look(&self) -> rail::Look {
+        let p = self.strip_palette();
+        let active = self.side.visible.then_some(match self.side.view {
+            SideView::Sessions => RailItem::Connections,
+            SideView::Live => RailItem::Sessions,
+            SideView::Files => RailItem::Files,
+            SideView::Forwards => RailItem::Forwards,
+            SideView::Snippets => RailItem::Snippets,
+            SideView::Palette => RailItem::Palette,
+        });
+        rail::Look {
+            active,
+            pinned: self.settings.tools_pinned,
+            background: p.strip,
+            selected: p.active,
+            text: p.text,
+            accent: p.accent,
+            dpi: self.dpi,
+        }
+    }
+
+    /// Whether the connection manager shows as native controls: its list
+    /// is open (not the session form or the import page, still drawn).
+    fn conn_native(&self) -> bool {
+        self.side.visible
+            && self.side.view == SideView::Sessions
+            && self.side.form.is_none()
+            && self.side.import.is_none()
+    }
+
+    /// Whether the session manager shows as native controls.
+    fn live_native(&self) -> bool {
+        self.side.visible && self.side.view == SideView::Live
+    }
+
+    /// Whether port forwards show as native controls.
+    fn fwd_native(&self) -> bool {
+        self.side.visible && self.side.view == SideView::Forwards
+    }
+
+    /// Whether the scripts show as native controls: the list is open (not
+    /// the editor, the arguments, the host picker or a report).
+    fn scripts_native(&self) -> bool {
+        self.side.visible
+            && self.side.view == SideView::Snippets
+            && !self.snippets_view.editing()
+            && !self.snippets_view.asking()
+            && !self.snippets_view.picking()
+            && !self.snippets_view.reporting()
+    }
+
+    /// Whether the page asking for a script's arguments shows as native
+    /// controls.
+    fn script_args_native(&self) -> bool {
+        self.side.visible
+            && self.side.view == SideView::Snippets
+            && self.snippets_view.asking()
+            && !self.snippets_view.picking()
+            && !self.snippets_view.reporting()
+    }
+
+    /// Whether the page picking the hosts to run a script on shows as
+    /// native controls.
+    fn script_hosts_native(&self) -> bool {
+        self.side.visible
+            && self.side.view == SideView::Snippets
+            && self.snippets_view.picking()
+            && !self.snippets_view.reporting()
+    }
+
+    /// Whether a script run's report shows as native controls.
+    fn script_report_native(&self) -> bool {
+        self.side.visible && self.side.view == SideView::Snippets && self.snippets_view.reporting()
+    }
+
+    /// Whether the script editor shows as native controls.
+    fn script_editor_native(&self) -> bool {
+        self.side.visible
+            && self.side.view == SideView::Snippets
+            && self.snippets_view.editing()
+            && !self.snippets_view.asking()
+            && !self.snippets_view.picking()
+            && !self.snippets_view.reporting()
+    }
+
+    /// Whether the connection form shows as native controls (the import
+    /// page is still drawn).
+    fn form_native(&self) -> bool {
+        self.side.visible
+            && self.side.view == SideView::Sessions
+            && self.side.form.is_some()
+            && self.side.import.is_none()
+    }
+
+    /// The connection form as the native controls show it.
+    fn native_form(&self) -> Option<form_view::Form> {
+        let f = self.side.form.as_ref()?;
+        Some(form_view::Form {
+            title: match &f.original {
+                Some(name) => format!("Edit {name}"),
+                None => "New connection".to_owned(),
+            },
+            sections: f.sections(),
+            rows: f.native_rows(),
+            error: f.error().map(str::to_owned),
+            delete: f.button_names().contains(&"Delete"),
+        })
+    }
+
+    /// The open native tool's controls have the keyboard.
+    fn active_tool_has_focus(&self) -> bool {
+        if self.form_native() {
+            form_view::has_focus()
+        } else if self.conn_native() {
+            conn_view::has_focus()
+        } else if self.live_native() {
+            live_panel::has_focus()
+        } else if self.files_visible() {
+            files_panel::has_focus()
+        } else if self.fwd_native() {
+            fwd_panel::has_focus()
+        } else if self.scripts_native() {
+            scripts_panel::has_focus()
+        } else if self.script_editor_native() {
+            script_editor::has_focus()
+        } else if self.script_args_native() {
+            script_args::has_focus()
+        } else if self.script_hosts_native() {
+            script_hosts::has_focus()
+        } else if self.script_report_native() {
+            script_report::has_focus()
+        } else {
+            false
+        }
+    }
+
+    /// Shows, fills and places the native tools' controls, and moves the
+    /// keyboard to them or back as the side pane's focus says. Focus
+    /// changes are posted: they send messages that need this window's
+    /// state, which is borrowed here.
+    fn sync_conn_view(&mut self) {
+        if self.conn_native() {
+            conn_view::set_nodes(self.side.list.tree());
+            conn_view::place(self.areas.side, self.areas.side_width, self.dpi);
+        } else {
+            conn_view::place(None, 0, self.dpi);
+        }
+        if self.live_native() {
+            let all = self.open_sessions();
+            live_panel::set_search(self.live_view.query());
+            live_panel::set_rows(self.live_view.rows(&all), all.len());
+            live_panel::place(self.areas.side, self.areas.side_width, self.dpi);
+        } else {
+            live_panel::place(None, 0, self.dpi);
+        }
+        // The focused pane's host first, so the view never shows the
+        // host the pane had before.
+        self.sync_files();
+        if self.files_visible() {
+            files_panel::set_view(self.files_view());
+            files_panel::place(self.areas.side, self.areas.side_width, self.dpi);
+        } else {
+            files_panel::place(None, 0, self.dpi);
+        }
+        if self.fwd_native() {
+            fwd_panel::set_view(&self.forward_view());
+            if let Some((spec, why)) = self.forwards_view.take_notice() {
+                fwd_panel::notice(spec, why);
+            }
+            fwd_panel::place(self.areas.side, self.areas.side_width, self.dpi);
+        } else {
+            fwd_panel::place(None, 0, self.dpi);
+        }
+        if self.scripts_native() {
+            let all = &self.settings.snippets;
+            scripts_panel::set_view(
+                self.snippets_view.native_rows(all),
+                self.snippets_view.native_selected(all),
+                self.snippets_view.filter(),
+                all.len(),
+            );
+            scripts_panel::place(self.areas.side, self.areas.side_width, self.dpi);
+        } else {
+            scripts_panel::place(None, 0, self.dpi);
+        }
+        if let Some(draft) = self
+            .snippets_view
+            .native_draft()
+            .filter(|_| self.script_editor_native())
+        {
+            script_editor::set_draft(draft);
+            script_editor::place(self.areas.side, self.areas.side_width, self.dpi);
+        } else {
+            script_editor::place(None, 0, self.dpi);
+        }
+        if let Some(ask) = self
+            .snippets_view
+            .native_ask()
+            .filter(|_| self.script_args_native())
+        {
+            script_args::set_ask(ask);
+            script_args::place(self.areas.side, self.areas.side_width, self.dpi);
+        } else {
+            script_args::place(None, 0, self.dpi);
+        }
+        if let Some(picker) = self
+            .snippets_view
+            .native_picker()
+            .filter(|_| self.script_hosts_native())
+        {
+            script_hosts::set_picker(picker);
+            script_hosts::place(self.areas.side, self.areas.side_width, self.dpi);
+        } else {
+            script_hosts::place(None, 0, self.dpi);
+        }
+        if let Some(report) = self
+            .snippets_view
+            .native_report()
+            .filter(|_| self.script_report_native())
+        {
+            script_report::set_report(report);
+            script_report::place(self.areas.side, self.areas.side_width, self.dpi);
+        } else {
+            script_report::place(None, 0, self.dpi);
+        }
+        if let Some(form) = self.native_form().filter(|_| self.form_native()) {
+            form_view::set_form(form);
+            form_view::place(self.areas.side, self.areas.side_width, self.dpi);
+        } else {
+            form_view::place(None, 0, self.dpi);
+        }
+        let want = self.wants_tools_focus();
+        let to = if want && self.focused && self.live_native() && self.wants_name_edit() {
+            Some(2)
+        } else if want && self.focused && !self.active_tool_has_focus() {
+            Some(1)
+        } else if !want && tools_have_focus() {
+            Some(0)
+        } else {
+            None
+        };
+        if let Some(to) = to {
+            // SAFETY: posting to our own window.
+            unsafe {
+                let _ = PostMessageW(Some(self.hwnd), WM_TOOLS_FOCUS, WPARAM(to), LPARAM(0));
+            }
+        }
+    }
+
+    /// A rename waits for the session manager's list to start its edit.
+    fn wants_name_edit(&self) -> bool {
+        self.live_native() && self.live_view.renaming_pane().is_some() && !live_panel::editing()
+    }
+
+    /// A native tool's controls should have the keyboard.
+    fn wants_tools_focus(&self) -> bool {
+        (self.conn_native()
+            || self.live_native()
+            || self.form_native()
+            || self.files_visible()
+            || self.fwd_native()
+            || self.scripts_native()
+            || self.script_editor_native()
+            || self.script_args_native()
+            || self.script_hosts_native()
+            || self.script_report_native())
+            && self.side.focused
+    }
+
+    /// A theme whose background is the chrome's, for drawing its padding.
+    fn chrome_theme(&self) -> Theme {
+        let mut t = self
+            .panes
+            .get(&self.focused_id())
+            .map_or_else(|| self.default_theme.clone(), |p| p.theme.clone());
+        t.background = self.chrome_palette().strip;
+        t
+    }
+
+    /// Redraws the tab strip and side pane grids, and repaints the menu
+    /// bar and tools pane when the window's colours change.
+    fn refresh_chrome(&mut self) {
+        ui_theme::apply(self.hwnd, self.ui_colours());
+        rail::set_look(self.rail_look());
+        self.sync_conn_view();
+        let palette = self.chrome_palette();
+        if let Some(strip) = self.areas.strip {
+            let palette = self.strip_palette();
+            let active = self.ws.active;
+            let views = self.forward_view();
+            let labels: Vec<TabLabel> = self
+                .ws
+                .tabs
+                .iter()
+                .enumerate()
+                .map(|(i, t)| {
+                    let pane = self.panes.get(&t.focus);
+                    let bell = i != active
+                        && t.root
+                            .panes()
+                            .iter()
+                            .any(|id| self.panes.get(id).is_some_and(|p| p.bell));
+                    TabLabel {
+                        title: pane.map(Pane::label).unwrap_or_default(),
+                        // A pane waiting to reconnect shows as connecting.
+                        health: if self.retries.contains_key(&t.focus) {
+                            Health::Connecting
+                        } else {
+                            pane.map_or(Health::Idle, Pane::health)
+                        },
+                        bell,
+                        forwarding: self.forwarding(&views, t.focus),
+                        legacy: self.legacy_in_use(t.focus),
+                        unencrypted: self.unencrypted(t.focus),
+                    }
+                })
+                .collect();
+            self.strip_layout = tabstrip::draw(&mut self.strip_grid, &labels, active, &palette);
+            // The strip is drawn whole (the active tab's background and
+            // line reach past the text row).
+            // SAFETY: valid window and rect.
+            unsafe {
+                let _ = InvalidateRect(Some(self.hwnd), Some(&win_rect(strip)), false);
+            }
+        }
+        if let Some(side) = self.areas.side {
+            let focused = self.side.focused && self.focused;
+            match self.side.view {
+                SideView::Sessions => match (&mut self.side.form, &mut self.side.import) {
+                    (Some(form), _) => form.draw(&mut self.side.grid, &palette, focused),
+                    (None, Some(view)) => view.draw(&mut self.side.grid, &palette, focused),
+                    (None, None) => self.side.list.draw(&mut self.side.grid, &palette, focused),
+                },
+                SideView::Forwards => {
+                    let view = self.forward_view();
+                    self.forwards_view
+                        .draw(&mut self.side.grid, &palette, focused, &view);
+                }
+                SideView::Palette => {
+                    self.palette.draw(&mut self.side.grid, &palette, focused);
+                }
+                SideView::Live => {
+                    let all = self.open_sessions();
+                    self.live_view
+                        .draw(&mut self.side.grid, &palette, focused, &all);
+                }
+                SideView::Snippets => {
+                    self.snippets_view.draw(
+                        &mut self.side.grid,
+                        &palette,
+                        focused,
+                        &self.settings.snippets,
+                    );
+                }
+                // Native controls (`files_panel`).
+                SideView::Files => {}
+            }
+            self.invalidate_grid(side);
+        }
+    }
+
+    /// Invalidates the dirty rows of the side pane's grid in `area`.
+    fn invalidate_grid(&self, area: Rect) {
+        let grid = &self.side.grid;
+        let Some((first, last)) = grid.dirty_span() else {
+            return;
+        };
+        let pad = scale(CHROME_PADDING_DIP, self.dpi);
+        let ch = self.chrome_metrics.height as i32;
+        let r = RECT {
+            left: area.x,
+            top: area.y + pad + first as i32 * ch,
+            right: area.right(),
+            bottom: area.y + pad + (last as i32 + 1) * ch,
+        };
+        // SAFETY: valid window and rect.
+        unsafe {
+            let _ = InvalidateRect(Some(self.hwnd), Some(&r), false);
+        }
+    }
+
+    /// Splits the client area into tools rail, side pane, tab strip and
+    /// panes. The side pane keeps its width; the terminal covers what of
+    /// it does not show (see `toolpane`).
+    fn compute_areas(&mut self) -> Areas {
+        let cpad = scale(CHROME_PADDING_DIP, self.dpi);
+        let cm = self.chrome_metrics;
+        let mut areas = Areas::default();
+        if self.side.width <= 0 {
+            self.side.width = SIDE_COLS * cm.width as i32 + 2 * cpad;
+        }
+        let parts = toolpane::split(&self.tools_input());
+        if self.side.visible {
+            self.side.width = parts.width;
+            self.side.shown = parts.shown.map_or(0, |r| r.w);
+        }
+        areas.rail = parts.rail;
+        areas.side = parts.shown;
+        areas.side_width = parts.width;
+        areas.side_edge = parts.edge.filter(|e| e.w > 0);
+        let mut main = parts.main;
+        if self.settings.tab_strip && self.ws.tabs.len() >= 2 {
+            let sh = self.strip_metrics.height as i32 + 2 * scale(STRIP_PAD_DIP, self.dpi);
+            areas.strip = Some(Rect::new(main.x, main.y, main.w, sh));
+            main = Rect::new(main.x, main.y + sh, main.w, (main.h - sh).max(0));
+        }
+        areas.panes = main;
+        areas
+    }
+
+    /// What the tools pane's geometry depends on.
+    fn tools_input(&self) -> toolpane::Input {
+        toolpane::Input {
+            client: self.client,
+            rail: if self.settings.tools_rail {
+                scale(toolpane::RAIL_DIP, self.dpi)
+            } else {
+                0
+            },
+            width: self.side.width,
+            shown: self.side.shown,
+            open: self.side.visible,
+            right: self.settings.side_pane_right,
+            gap: gap(self.dpi),
+        }
+    }
+
+    /// Fits every pane, and the chrome, to the client area.
+    fn layout(&mut self) {
+        let mut r = RECT::default();
+        // SAFETY: valid window and out-pointer.
+        if unsafe { GetClientRect(self.hwnd, &mut r) }.is_err() {
+            return;
+        }
+        let (w, h) = (r.right - r.left, r.bottom - r.top);
+        self.client = (w, h);
+        self.renderer.resize(w.max(1) as u32, h.max(1) as u32);
+        self.areas = self.compute_areas();
+        // The panels let the mouse through to the edge's strip.
+        crate::native::set_edge_grab(self.hwnd, self.edge_grab());
+        let cpad = scale(CHROME_PADDING_DIP, self.dpi);
+        let cm = self.chrome_metrics;
+        let cells = |r: Rect| {
+            (
+                ((r.w - 2 * cpad).max(0) / cm.width.max(1) as i32).max(1) as usize,
+                ((r.h - 2 * cpad).max(0) / cm.height.max(1) as i32).max(1) as usize,
+            )
+        };
+        if let Some(s) = self.areas.strip {
+            let cols = ((s.w - 2 * cpad).max(0) / self.strip_metrics.width.max(1) as i32).max(1);
+            self.strip_grid.resize(cols as usize, 1);
+            self.strip_grid.mark_all_dirty();
+        }
+        if let Some(s) = self.areas.side {
+            // Laid out for its whole width, covered or not, so covering
+            // it does not rewrap it.
+            let (c, rows) = cells(Rect::new(s.x, s.y, self.areas.side_width, s.h));
+            self.side.grid.resize(c, rows);
+            self.side.grid.mark_all_dirty();
+        }
+        rail::place(self.areas.rail);
+        self.sync_conn_view();
+        // Every tab, so background shells know their size too.
+        let pad = padding(self.dpi);
+        let g = gap(self.dpi);
+        let placed: Vec<(PaneId, Rect)> = self
+            .ws
+            .tabs
+            .iter()
+            .flat_map(|t| t.root.layout(self.areas.panes, g))
+            .collect();
+        for (id, rect) in placed {
+            let Some(p) = self.panes.get_mut(&id) else {
+                continue;
+            };
+            p.rect = rect;
+            if p.gateway().is_some() {
+                // tmux sizes its panes; see sync_tmux.
+                let m = p.metrics;
+                p.term.set_cell_size(m.width, m.height);
+                continue;
+            }
+            let m = p.metrics;
+            let cols = ((rect.w - 2 * pad).max(0) / m.width.max(1) as i32).max(1) as usize;
+            let rows = ((rect.h - 2 * pad).max(0) / m.height.max(1) as i32).max(1) as usize;
+            p.term.resize(cols, rows);
+            p.term.set_cell_size(m.width, m.height);
+            let (cols, rows) = (p.term.cols(), p.term.rows());
+            let effect = match &p.host {
+                Host::Local {
+                    shell: Some(shell), ..
+                } => {
+                    shell.resize(cols, rows);
+                    None
+                }
+                Host::Ssh(session) => session.resize(clamp16(cols), clamp16(rows)),
+                Host::Telnet(session) => session.resize(clamp16(cols), clamp16(rows)),
+                _ => None,
+            };
+            if let Some(e) = effect {
+                self.apply(id, vec![e]);
+            }
+        }
+        if self.panes.values().any(|p| p.desktop.is_some()) {
+            // SAFETY: our window; replaces any earlier timer with this id.
+            unsafe { SetTimer(Some(self.hwnd), TIMER_DESKTOP_SIZE, DESKTOP_SIZE_MS, None) };
+        }
+        self.sync_tmux();
+        self.refresh_chrome();
+        self.refresh_visible();
+        self.request_full_redraw();
+    }
+
+    fn request_full_redraw(&mut self) {
+        self.full_redraw = true;
+        // SAFETY: valid window; no erase, the renderer paints everything.
+        unsafe {
+            let _ = InvalidateRect(Some(self.hwnd), None, false);
+        }
+    }
+
+    /// Asks Windows to repaint the band of rows a pane's grid marked dirty.
+    fn invalidate_dirty(&self, id: PaneId) {
+        let Some(p) = self.panes.get(&id) else {
+            return;
+        };
+        let Some((first, last)) = p.grid.dirty_span() else {
+            return;
+        };
+        let (_, oy) = p.origin(self.dpi);
+        let ch = p.metrics.height as i32;
+        let r = RECT {
+            left: p.rect.x,
+            top: oy + first as i32 * ch,
+            right: p.rect.right(),
+            bottom: oy + (last as i32 + 1) * ch,
+        };
+        // SAFETY: valid window and rect.
+        unsafe {
+            let _ = InvalidateRect(Some(self.hwnd), Some(&r), false);
+        }
+    }
+
+    /// Dividers, the focus frame, the side pane's edge and a drop marker.
+    fn fills(&self) -> Vec<(PixelRect, Rgb)> {
+        let mut out = Vec::new();
+        let palette = self.chrome_palette();
+        let line = mix(palette.strip, palette.text, 0.18);
+        let g = gap(self.dpi);
+        if let Some(e) = self.areas.side_edge {
+            out.push((pixel(e), line));
+        }
+        if let Some(s) = self.areas.strip {
+            self.strip_fills(s, &mut out);
+        }
+        let Some(tab) = self.ws.tab() else {
+            return out;
+        };
+        for d in tab.root.dividers(self.areas.panes, g) {
+            out.push((pixel(d.rect), line));
+        }
+        let split = tab.root.panes().len() > 1;
+        let receivers = self.broadcast_targets(tab.focus);
+        if !receivers.is_empty() {
+            // Every pane that gets the typing, the focused one too, is
+            // framed in amber while broadcast is on.
+            for id in std::iter::once(tab.focus).chain(receivers) {
+                if let Some(p) = self.panes.get(&id)
+                    && self.is_visible(id)
+                {
+                    frame(p.rect, g, BROADCAST_FRAME, &mut out);
+                }
+            }
+        } else if split
+            && !self.side.focused
+            && let Some(p) = self.panes.get(&tab.focus)
+        {
+            frame(p.rect, g, p.theme.cursor, &mut out);
+        }
+        for id in self.visible_ids() {
+            if let Some(p) = self.panes.get(&id)
+                && let Some(m) = p.scroll_mark(self.dpi)
+            {
+                out.push((pixel(m), p.mark_colour()));
+            }
+        }
+        if let Some(Drag::Pane { active: true, .. } | Drag::Tab { out: true, .. }) = &self.drag {
+            let accent = Rgb::new(0xe5, 0xb5, 0x3b);
+            if let Some(r) = self.drop_marker() {
+                frame(r, 2 * g, accent, &mut out);
+            }
+        }
+        out
+    }
+
+    /// The tab strip's shapes: the active tab's background above and below
+    /// its text row, its accent line, and thin lines between the others.
+    fn strip_fills(&self, s: Rect, out: &mut Vec<(PixelRect, Rgb)>) {
+        let p = self.strip_palette();
+        let cpad = scale(CHROME_PADDING_DIP, self.dpi);
+        let spad = scale(STRIP_PAD_DIP, self.dpi);
+        let cw = self.strip_metrics.width as i32;
+        let ch = self.strip_metrics.height as i32;
+        let g = gap(self.dpi);
+        let x_of = |col: usize| s.x + cpad + col as i32 * cw;
+        let active = self.ws.active;
+        for i in 0..self.strip_layout.len() {
+            let Some((start, end)) = self.strip_layout.span(i) else {
+                continue;
+            };
+            let (x0, x1) = (x_of(start), x_of(end));
+            if i == active {
+                let top = Rect::new(x0, s.y, x1 - x0, spad);
+                let bottom =
+                    Rect::new(x0, s.y + spad + ch, x1 - x0, s.bottom() - (s.y + spad + ch));
+                out.push((pixel(top), p.active));
+                out.push((pixel(bottom), p.active));
+                let accent = scale(ACCENT_DIP, self.dpi).max(1);
+                out.push((pixel(Rect::new(x0, s.y, x1 - x0, accent)), p.accent));
+            } else if i + 1 != active {
+                // A short line after each inactive tab not next to the
+                // active one.
+                let line = Rect::new(x1 - g, s.y + spad, g, ch);
+                out.push((pixel(line), tabstrip::mix(p.strip, p.text, 0.25)));
+            }
+        }
+    }
+
+    /// Where a dragged pane or tab would land, outlined while dragging.
+    fn drop_marker(&self) -> Option<Rect> {
+        let (x, y) = self.mouse.at;
+        let (pane, tab) = match &self.drag {
+            Some(Drag::Pane { id, .. }) => (Some(*id), None),
+            Some(Drag::Tab {
+                index, out: true, ..
+            }) => (None, Some(*index)),
+            _ => return None,
+        };
+        if pane.is_some()
+            && let Some(s) = self.areas.strip
+            && s.contains(x, y)
+        {
+            return Some(s);
+        }
+        let Spot::Pane(target) = self.spot(x, y) else {
+            return None;
+        };
+        if Some(target) == pane || tab.is_some_and(|t| self.ws.tab_of(target) == Some(t)) {
+            return None;
+        }
+        let r = self.panes.get(&target)?.rect;
+        let zone = if tab.is_some() {
+            Drop::Side(layout::join_side(r, x, y))
+        } else {
+            layout::drop_zone(r, x, y)
+        };
+        Some(match zone {
+            Drop::Swap => r,
+            Drop::Side(Dir::Left) => Rect::new(r.x, r.y, r.w / 2, r.h),
+            Drop::Side(Dir::Right) => Rect::new(r.x + r.w / 2, r.y, r.w - r.w / 2, r.h),
+            Drop::Side(Dir::Up) => Rect::new(r.x, r.y, r.w, r.h / 2),
+            Drop::Side(Dir::Down) => Rect::new(r.x, r.y + r.h / 2, r.w, r.h - r.h / 2),
+        })
+    }
+
+    fn paint(&mut self, update: RECT) {
+        // Rows Windows wants repainted (e.g. after a restore) join the
+        // grids' own dirty rows; anything outside a pane's rows means
+        // everything.
+        let ids = self.visible_ids();
+        let mut inside = false;
+        for id in &ids {
+            let Some(p) = self.panes.get_mut(id) else {
+                continue;
+            };
+            let r = p.rect;
+            if update.right <= r.x
+                || update.left >= r.right()
+                || update.bottom <= r.y
+                || update.top >= r.bottom()
+            {
+                continue;
+            }
+            let pad = padding(self.dpi);
+            let ch = p.metrics.height.max(1) as i32;
+            let rows = p.grid.rows() as i32;
+            let top = r.y + pad;
+            if update.top >= top && update.bottom <= top + rows * ch {
+                inside = true;
+                for y in (update.top - top) / ch..=(update.bottom - 1 - top) / ch {
+                    p.grid.mark_dirty(y.max(0) as usize);
+                }
+            }
+        }
+        let in_chrome = [self.areas.strip, self.areas.side]
+            .into_iter()
+            .flatten()
+            .any(|r| {
+                update.left >= r.x
+                    && update.right <= r.right()
+                    && update.top >= r.y
+                    && update.bottom <= r.bottom()
+            });
+        if !inside && !in_chrome {
+            self.full_redraw = true;
+        }
+        let full = self.full_redraw;
+        let chrome_theme = self.chrome_theme();
+        let mut strip_theme = chrome_theme.clone();
+        strip_theme.background = self.strip_palette().strip;
+        let cpad = scale(CHROME_PADDING_DIP, self.dpi);
+        let spad = scale(STRIP_PAD_DIP, self.dpi);
+        let fills = self.fills();
+        let mut views: Vec<PaneView<'_>> = Vec::new();
+        for id in &ids {
+            let Some(p) = self.panes.get(id) else {
+                continue;
+            };
+            views.push(PaneView {
+                grid: &p.grid,
+                font: &p.font,
+                theme: &p.theme,
+                rect: pixel(p.rect),
+                origin: p.origin(self.dpi),
+                cursor: p.cursor,
+                full,
+                image: p.image(),
+            });
+        }
+        if let Some(s) = self.areas.strip {
+            views.push(PaneView {
+                grid: &self.strip_grid,
+                font: &self.strip_font,
+                theme: &strip_theme,
+                rect: pixel(s),
+                origin: (s.x + cpad, s.y + spad),
+                cursor: None,
+                full: true,
+                image: None,
+            });
+        }
+        if let Some(s) = self.areas.side {
+            views.push(PaneView {
+                grid: &self.side.grid,
+                font: &self.chrome_font,
+                theme: &chrome_theme,
+                rect: pixel(s),
+                origin: (s.x + cpad, s.y + cpad),
+                cursor: None,
+                full,
+                image: None,
+            });
+        }
+        let result = self.renderer.draw(&views, &fills, self.dpi);
+        drop(views);
+        match result {
+            Ok(Frame::Presented) => {
+                for id in &ids {
+                    if let Some(p) = self.panes.get_mut(id) {
+                        p.grid.clear_dirty();
+                        if let Some(d) = p.desktop.as_mut() {
+                            d.drawn();
+                        }
+                    }
+                }
+                self.strip_grid.clear_dirty();
+                self.side.grid.clear_dirty();
+                self.full_redraw = false;
+            }
+            Ok(Frame::Lost) => self.request_full_redraw(),
+            // Leave the rows dirty; the next change or resize retries.
+            Err(_) => {}
+        }
+    }
+
+    /// A character from WM_CHAR or WM_SYSCHAR; what a tmux key asked
+    /// for comes back.
+    fn on_char(&mut self, unit: u16, alt: bool) -> Option<Command> {
+        let ch = match unit {
+            0xD800..=0xDBFF => {
+                self.high_surrogate = Some(unit);
+                return None;
+            }
+            0xDC00..=0xDFFF => {
+                let high = self.high_surrogate.take()?;
+                char::decode_utf16([high, unit]).next().and_then(|r| r.ok())
+            }
+            _ => char::from_u32(u32::from(unit)),
+        };
+        let ch = ch?;
+        if self.side.focused {
+            if !ch.is_control() {
+                self.side_key(SideKey::Char(ch));
+            }
+            return None;
+        }
+        let id = self.focused_id();
+        let p = self.panes.get_mut(&id)?;
+        if p.term.search_active() {
+            if !ch.is_control() {
+                let mut query = p.term.search_query().unwrap_or_default().to_owned();
+                query.push(ch);
+                p.term.search_set(&query);
+                self.refresh(id);
+            }
+            return None;
+        }
+        if let Some(command) = self.tmux_char(id, ch, alt) {
+            return command;
+        }
+        let p = self.panes.get_mut(&id)?;
+        let bytes = p.term.text(ch, alt);
+        // Who else gets it is decided first: the key may end a prompt.
+        let targets = self.broadcast_targets(id);
+        self.input(id, bytes);
+        self.send_typed(&targets, &Typed::Char(ch, alt));
+        None
+    }
+
+    /// The prefix keys of the tmux session pane `id` shows, when tmux
+    /// keybindings are on and it is a pane of a tmux session.
+    fn tmux_keys_of(&self, id: PaneId) -> Option<tmux_keys::Keys> {
+        if !self.settings.tmux_keys {
+            return None;
+        }
+        let gateway = self.panes.get(&id).and_then(Pane::gateway)?;
+        let t = self.tmux.get(&gateway).filter(|t| t.active())?;
+        // Until tmux answers, its default.
+        Some(
+            t.keys()
+                .and_then(tmux_keys::Keys::parse)
+                .unwrap_or_default(),
+        )
+    }
+
+    /// A character typed in pane `id`, for the tmux keybindings: the
+    /// prefix arms them, and the next key is a window or pane key.
+    /// `Some` when they took it, with what to run.
+    fn tmux_char(&mut self, id: PaneId, ch: char, alt: bool) -> Option<Option<Command>> {
+        let keys = self.tmux_keys_of(id)?;
+        if self.tmux_armed.take() == Some(id) {
+            return Some(self.tmux_key(id, &keys, tmux_keys::Key::Char(ch, alt)));
+        }
+        // Repeating: another repeatable key needs no prefix; any other key
+        // ends the repeat and is typed (or arms the prefix) as usual.
+        if self.tmux_repeating(false) {
+            let key = tmux_keys::Key::Char(ch, alt);
+            if tmux_keys::repeatable(tmux_keys::action(&keys, key)) {
+                return Some(self.tmux_key(id, &keys, key));
+            }
+        }
+        self.tmux_repeat = None;
+        if keys.is_prefix(tmux_keys::Prefix { ch, alt }) {
+            self.tmux_armed = Some(id);
+            return Some(None);
+        }
+        None
+    }
+
+    /// Carries out a tmux window or pane key typed after the prefix in
+    /// pane `id`.
+    fn tmux_key(
+        &mut self,
+        id: PaneId,
+        keys: &tmux_keys::Keys,
+        key: tmux_keys::Key,
+    ) -> Option<Command> {
+        let dir_index = |d: Dir| DIRS.iter().position(|x| *x == d).unwrap_or(0) as u32;
+        let run = |c: u32| Some(Command::Id(c));
+        let action = tmux_keys::action(keys, key);
+        self.tmux_repeat = tmux_keys::repeatable(action)
+            .then(|| Instant::now() + Duration::from_millis(keys.repeat_ms));
+        match action {
+            TmuxKey::SendPrefix(p) => {
+                self.input(id, p.bytes());
+                None
+            }
+            TmuxKey::NewTab => run(cmd::NEW_TAB),
+            TmuxKey::SplitRight => run(cmd::SPLIT_RIGHT),
+            TmuxKey::SplitDown => run(cmd::SPLIT_DOWN),
+            TmuxKey::NextTab => run(cmd::NEXT_TAB),
+            TmuxKey::PrevTab => run(cmd::PREV_TAB),
+            TmuxKey::LastTab => {
+                if let Some(p) = self.last_tab_pane.filter(|p| self.ws.tab_of(*p).is_some()) {
+                    self.focus_pane(p);
+                }
+                None
+            }
+            TmuxKey::Tab(n) => {
+                if n < self.ws.tabs.len() {
+                    self.select_tab(n);
+                }
+                None
+            }
+            TmuxKey::NextPane => {
+                let panes = self.ws.tab().map(|t| t.root.panes()).unwrap_or_default();
+                let at = panes.iter().position(|p| *p == id).unwrap_or(0);
+                if let Some(next) = panes.get((at + 1) % panes.len().max(1)).copied() {
+                    self.focus_pane(next);
+                }
+                None
+            }
+            TmuxKey::LastPane => {
+                let same_tab = self.last_pane.filter(|p| {
+                    self.ws.tab_of(*p).is_some() && self.ws.tab_of(*p) == self.ws.tab_of(id)
+                });
+                if let Some(p) = same_tab {
+                    self.focus_pane(p);
+                }
+                None
+            }
+            TmuxKey::Focus(d) => run(cmd::FOCUS + dir_index(d)),
+            TmuxKey::Resize(d) => run(cmd::RESIZE + dir_index(d)),
+            TmuxKey::ClosePane => Some(Command::Confirm {
+                text: "Close this tmux pane? tmux ends the program in it (kill-pane).".into(),
+                then: Box::new(Command::Id(cmd::CLOSE_PANE)),
+            }),
+            TmuxKey::CloseTab => {
+                let n = self.ws.tab().map_or(0, |t| t.root.panes().len());
+                let panes = if n == 1 {
+                    "its pane".to_owned()
+                } else {
+                    format!("its {n} panes")
+                };
+                Some(Command::Confirm {
+                    text: format!(
+                        "Close this tab and {panes}? tmux ends the programs in them \
+                         (kill-window)."
+                    ),
+                    then: Box::new(Command::CloseTabNow(self.ws.active)),
+                })
+            }
+            TmuxKey::BreakPane => run(cmd::PANE_TO_TAB),
+            TmuxKey::Detach => run(cmd::TMUX_DETACH),
+            TmuxKey::ChooseSession => run(cmd::TMUX_PICK),
+            TmuxKey::ScrollBack => run(cmd::SCROLL_PAGE_UP),
+            TmuxKey::ScrollForward => run(cmd::SCROLL_PAGE_DOWN),
+            TmuxKey::Palette => run(cmd::PALETTE),
+            TmuxKey::Find => run(cmd::FIND),
+            TmuxKey::Help => {
+                let prefix = keys
+                    .prefixes
+                    .first()
+                    .map_or_else(|| "the prefix".to_owned(), |p| tmux_keys::name(*p));
+                Some(Command::Message(tmux_keys::help(&prefix, keys.repeat_ms)))
+            }
+            TmuxKey::Nothing => None,
+        }
+    }
+
+    /// Whether a repeatable tmux key still needs no prefix: within
+    /// `repeat-time` of the last one, or while that key is held down and
+    /// Windows repeats it (its first repeat can come later than 500 ms).
+    fn tmux_repeating(&self, held: bool) -> bool {
+        self.tmux_repeat
+            .is_some_and(|until| held || Instant::now() < until)
+    }
+
+    /// A key-down while the tmux prefix is armed in the focused pane, or
+    /// while repeatable keys work without it. Armed: arrows, PageUp,
+    /// PageDown and Escape are tmux keys, and any other key that types no
+    /// text ends the wait, as tmux ignores an unbound key. Repeating: a
+    /// repeatable key runs again, and any other key ends the repeat and
+    /// goes on as usual. Text keys wait for their WM_CHAR. `held` is set
+    /// for Windows' auto-repeat of a key held down.
+    fn tmux_key_down(&mut self, vk: VIRTUAL_KEY, mods: Mods, held: bool) -> Option<KeyOutcome> {
+        let id = self.focused_id();
+        let armed = self.tmux_armed == Some(id);
+        if self.side.focused || (!armed && !self.tmux_repeating(held)) {
+            return None;
+        }
+        if matches!(
+            vk,
+            VK_SHIFT | VK_CONTROL | VK_MENU | VK_CAPITAL | VK_LWIN | VK_RWIN
+        ) {
+            return None;
+        }
+        let Some(keys) = self.tmux_keys_of(id) else {
+            self.tmux_armed = None;
+            self.tmux_repeat = None;
+            return None;
+        };
+        let arrow = |dir| tmux_keys::Key::Arrow {
+            dir,
+            ctrl: mods.ctrl,
+            alt: mods.alt,
+        };
+        let key = match vk {
+            VK_LEFT => arrow(Dir::Left),
+            VK_RIGHT => arrow(Dir::Right),
+            VK_UP => arrow(Dir::Up),
+            VK_DOWN => arrow(Dir::Down),
+            VK_PRIOR => tmux_keys::Key::PageUp,
+            VK_NEXT => tmux_keys::Key::PageDown,
+            VK_ESCAPE => tmux_keys::Key::Escape,
+            // Enter, Backspace, Tab, F-keys and the like: no binding.
+            _ if terminal_key(vk).is_some() => tmux_keys::Key::Escape,
+            // A text key, or Ctrl with one: its WM_CHAR follows, unless
+            // it is a FeroSSH shortcut, which also ends the wait.
+            _ => {
+                let split = self.ws.tab().is_some_and(|t| t.root.panes().len() > 1);
+                if shortcut(vk, mods, self.ws.tabs.len() > 1, split).is_some() {
+                    self.tmux_armed = None;
+                    self.tmux_repeat = None;
+                }
+                return None;
+            }
+        };
+        if !armed && !tmux_keys::repeatable(tmux_keys::action(&keys, key)) {
+            // Not a repeat: the key goes to the pane as usual.
+            self.tmux_repeat = None;
+            return None;
+        }
+        self.tmux_armed = None;
+        drop_pending_char(self.hwnd);
+        Some(match self.tmux_key(id, &keys, key) {
+            Some(c) => KeyOutcome::Run(c),
+            None => KeyOutcome::Handled,
+        })
+    }
+
+    /// Handles a key-down: window shortcuts first, then the side pane or
+    /// the search bar, then keys that do not type text. Text keys are left
+    /// to the WM_CHAR that TranslateMessage made from the keyboard layout,
+    /// which is what gets AltGr, dead keys and IME input right.
+    fn on_key_down(&mut self, vk: VIRTUAL_KEY, held: bool) -> KeyOutcome {
+        let mods = key_mods();
+        if mods.alt && vk == VK_F4 {
+            return KeyOutcome::Default;
+        }
+        // The key after the tmux prefix, before FeroSSH's own shortcuts:
+        // Alt+arrow there resizes, as in tmux.
+        if let Some(outcome) = self.tmux_key_down(vk, mods, held) {
+            return outcome;
+        }
+        // Ctrl+Shift+F1 to F12: the snippet with that hotkey, if there is
+        // one for this host; otherwise the key goes on.
+        if mods.ctrl
+            && mods.shift
+            && !mods.alt
+            && (0x70..0x70 + u16::from(login::MAX_HOTKEY)).contains(&vk.0)
+            && let Ok(n) = u8::try_from(vk.0 - 0x6f)
+            && let Some(command) = self.snippet_hotkey(n)
+        {
+            drop_pending_char(self.hwnd);
+            return match command {
+                Some(c) => KeyOutcome::Run(c),
+                None => KeyOutcome::Handled,
+            };
+        }
+        let split = self.ws.tab().is_some_and(|t| t.root.panes().len() > 1);
+        if let Some(id) = shortcut(vk, mods, self.ws.tabs.len() > 1, split) {
+            drop_pending_char(self.hwnd);
+            return KeyOutcome::Run(Command::Id(id));
+        }
+        if self.side.focused {
+            if let Some(key) = side_key(vk, mods) {
+                drop_pending_char(self.hwnd);
+                return match self.side_key(key) {
+                    Some(command) => KeyOutcome::Run(command),
+                    None => KeyOutcome::Handled,
+                };
+            }
+            return KeyOutcome::Default;
+        }
+        let id = self.focused_id();
+        let Some(p) = self.panes.get_mut(&id) else {
+            return KeyOutcome::Default;
+        };
+        if p.term.search_active() {
+            return self.search_key(id, vk, mods);
+        }
+        if let Some(key) = terminal_key(vk) {
+            drop_pending_char(self.hwnd);
+            let targets = self.broadcast_targets(id);
+            let Some(p) = self.panes.get_mut(&id) else {
+                return KeyOutcome::Handled;
+            };
+            if let Some(bytes) = p.term.key(key, mods) {
+                self.input(id, bytes);
+            }
+            self.send_typed(&targets, &Typed::Key(key, mods));
+            return KeyOutcome::Handled;
+        }
+        // Control codes that have no character on most layouts. AltGr
+        // (Ctrl+Alt) is left alone.
+        if mods.ctrl && !mods.alt {
+            let code = match vk {
+                VK_SPACE => Some(0x00),
+                VIRTUAL_KEY(0x32) => Some(0x00), // Ctrl+2, as in xterm
+                VIRTUAL_KEY(0x36) => Some(0x1E), // Ctrl+6
+                VK_OEM_2 => Some(0x1F),          // Ctrl+/
+                _ => None,
+            };
+            if let Some(code) = code {
+                drop_pending_char(self.hwnd);
+                // Ctrl+Space can be the tmux prefix (C-Space).
+                if let Some(command) = self.tmux_char(id, char::from(code), false) {
+                    return command.map_or(KeyOutcome::Handled, KeyOutcome::Run);
+                }
+                let targets = self.broadcast_targets(id);
+                self.input(id, vec![code]);
+                self.send_typed(&targets, &Typed::Bytes(vec![code]));
+                return KeyOutcome::Handled;
+            }
+        }
+        KeyOutcome::Default
+    }
+
+    fn search_key(&mut self, id: PaneId, vk: VIRTUAL_KEY, mods: Mods) -> KeyOutcome {
+        let Some(p) = self.panes.get_mut(&id) else {
+            return KeyOutcome::Default;
+        };
+        let term = &mut p.term;
+        match vk {
+            VK_ESCAPE => term.search_close(),
+            VK_RETURN | VK_F3 => term.search_next(!mods.shift),
+            VK_BACK => {
+                let mut query = term.search_query().unwrap_or_default().to_owned();
+                query.pop();
+                term.search_set(&query);
+            }
+            // Characters arrive as WM_CHAR.
+            _ => return KeyOutcome::Default,
+        }
+        drop_pending_char(self.hwnd);
+        self.refresh(id);
+        KeyOutcome::Handled
+    }
+
+    /// A key for the side pane; what it picked runs here.
+    fn side_key(&mut self, key: SideKey) -> Option<Command> {
+        if self.side.view == SideView::Palette {
+            let action = self.palette.key(key, self.side.grid.rows());
+            return self.palette_action(action);
+        }
+        if self.side.view == SideView::Snippets {
+            let rows = self.side.grid.rows();
+            let action = self.snippets_view.key(key, &self.settings.snippets, rows);
+            return self.snippets_action(action);
+        }
+        if self.side.view == SideView::Forwards {
+            let view = self.forward_view();
+            let rows = self.side.grid.rows();
+            let action = self.forwards_view.key(key, &view, rows);
+            return self.forwards_action(action);
+        }
+        if self.side.view == SideView::Live {
+            let all = self.open_sessions();
+            let action = self.live_view.key(key, &all, self.side.grid.rows());
+            // Every key changes what the view shows: the filter, the
+            // selection or the name being typed.
+            self.refresh_chrome();
+            if action.is_none() && !self.live_view.renaming() && self.rename_return.is_some() {
+                // Escape ended the rename.
+                self.end_rename();
+                return None;
+            }
+            return self.live_action(action);
+        }
+        if let Some(form) = &mut self.side.form {
+            let action = form.key(key, self.side.grid.rows());
+            return self.form_action(action);
+        }
+        if let Some(view) = &mut self.side.import {
+            let action = view.key(key, self.side.grid.rows());
+            return self.import_action(action);
+        }
+        let visible = SessionList::visible(self.side.grid.rows());
+        let action = self.side.list.key(key, visible);
+        self.side_action(action)
+    }
+
+    fn side_action(&mut self, action: Option<SideAction>) -> Option<Command> {
+        let mut out = None;
+        match action {
+            Some(SideAction::Open { host, split }) => {
+                self.open_host(&host, split);
+            }
+            Some(SideAction::ToggleFavourite(host)) => {
+                self.settings.toggle_favourite(&host);
+                self.side
+                    .list
+                    .set_favourites(self.settings.favourites.clone());
+                self.save_settings();
+            }
+            Some(SideAction::New) => self.open_form(None),
+            Some(SideAction::Edit(host)) => self.open_form(Some(host)),
+            Some(SideAction::Delete(host)) => {
+                out = Some(
+                    if load_saved()
+                        .iter()
+                        .any(|h| h.alias.eq_ignore_ascii_case(&host))
+                    {
+                        Command::DeleteSession(host)
+                    } else {
+                        Command::Notice(format!(
+                            "{host} comes from {}, which FeroSSH does not change. Edit or \
+                             remove it there.",
+                            host_file(&host)
+                        ))
+                    },
+                );
+            }
+            Some(SideAction::Leave) => self.focus_terminal(),
+            None => {}
+        }
+        self.refresh_chrome();
+        out
+    }
+
+    /// Carries out what the snippets view decided.
+    fn snippets_action(&mut self, action: Option<SnipAction>) -> Option<Command> {
+        let mut out = None;
+        match action {
+            Some(SnipAction::Send { name, lines, enter }) => {
+                out = self.send_snippet(&name, &lines, enter);
+            }
+            Some(SnipAction::Type { name, steps }) => out = self.type_snippet(&name, steps),
+            Some(SnipAction::Copy(text)) => {
+                clipboard::set_text(self.hwnd, &text);
+            }
+            Some(SnipAction::Save { index, mut snippet }) => {
+                let all = &mut self.settings.snippets;
+                let index = index.filter(|&i| i < all.len());
+                // An edit keeps the snippet's file, so a new name or
+                // category moves it.
+                snippet.file = index.and_then(|i| all.get(i)).and_then(|s| s.file.clone());
+                if let Err(e) = snippet_store::save(&snippets_dir(), &mut snippet) {
+                    self.snippets_view.fail(e);
+                    self.refresh_chrome();
+                    return None;
+                }
+                match index {
+                    Some(i) => {
+                        if let Some(slot) = all.get_mut(i) {
+                            *slot = snippet.clone();
+                        }
+                    }
+                    None => all.push(snippet.clone()),
+                }
+                snippet_store::sort(all);
+                let at = all.iter().position(|s| s.file == snippet.file);
+                self.snippets_view.saved(&self.settings.snippets, at);
+            }
+            Some(SnipAction::Delete(i)) => out = Some(Command::DeleteSnippet(i)),
+            Some(SnipAction::PickHosts { name, lines }) => out = self.pick_hosts(&name, &lines),
+            Some(SnipAction::RunOn { name, hosts, run }) => out = self.run_on(name, hosts, run),
+            Some(SnipAction::ShowRow(id)) => out = self.show_run_pane(id),
+            Some(SnipAction::SaveCsv(text)) => {
+                let name = self
+                    .snippets_view
+                    .report()
+                    .map(|r| r.name.clone())
+                    .unwrap_or_default();
+                out = Some(Command::Notice(self.save_report(&name, &text)));
+            }
+            Some(SnipAction::Retry) => self.retry_run(),
+            Some(SnipAction::Cancel) => self.cancel_run(),
+            Some(SnipAction::CloseReport(report)) => self.close_report(&report),
+            Some(SnipAction::Leave) => self.leave_snippets(),
+            None => {}
+        }
+        self.refresh_chrome();
+        out
+    }
+
+    /// Saves a report as CSV in the download folder; what happened.
+    fn save_report(&self, name: &str, text: &str) -> String {
+        let (y, mo, d, h, mi, sec) = local_time();
+        let name: String = name
+            .chars()
+            .map(|c| {
+                if c.is_alphanumeric() || c == '-' {
+                    c
+                } else {
+                    '_'
+                }
+            })
+            .take(60)
+            .collect();
+        let dir = self.download_dir();
+        let path = dir.join(format!(
+            "{name}-{y:04}{mo:02}{d:02}-{h:02}{mi:02}{sec:02}.csv"
+        ));
+        match std::fs::create_dir_all(&dir).and_then(|()| std::fs::write(&path, text)) {
+            Ok(()) => format!("Saved the report as {}.", path.display()),
+            Err(e) => format!("Could not save the report as {}: {e}", path.display()),
+        }
+    }
+
+    /// Ctrl+Shift+A: the command palette, on every menu action, session
+    /// and snippet; again, back to the terminal. A palette that lost the
+    /// keyboard to a click in a pane gets it back first.
+    fn toggle_palette(&mut self) {
+        if self.side.visible && self.side.view == SideView::Palette {
+            if self.side.focused {
+                self.leave_palette();
+            } else {
+                self.side.focused = true;
+                self.refresh_chrome();
+                self.request_full_redraw();
+                self.refresh(self.focused_id());
+            }
+            return;
+        }
+        // The menu's check marks are brought up to date first, since the
+        // palette shows them.
+        self.update_menu_checks();
+        let mut entries = menu_entries(self.menu);
+        entries.retain(|e| e.kind != palette::Kind::Action(cmd::PALETTE));
+        let env = ssh_env();
+        entries.extend(
+            host_items(&env, &self.settings)
+                .iter()
+                .map(|h| palette::Entry::session(&h.name, &h.detail, h.kind)),
+        );
+        let place = self.place(self.focused_id()).map(|p| p.0);
+        entries.extend(
+            self.settings
+                .snippets
+                .iter()
+                .enumerate()
+                .filter(|(_, s)| s.applies(place.as_ref()))
+                .map(|(i, s)| palette::Entry::snippet(i, &s.name, &s.lines)),
+        );
+        self.palette.open(entries);
+        // Snippets that only peeked go with the palette.
+        self.palette_return = (self.side.visible && !self.snippets_peek).then_some(self.side.view);
+        self.snippets_peek = false;
+        self.show_side(SideView::Palette, true);
+    }
+
+    /// Closes the palette: the side pane shows what it showed before, or
+    /// hides again, and the keyboard goes back to the terminal.
+    fn leave_palette(&mut self) {
+        match self.palette_return.take() {
+            Some(view) => {
+                self.side.view = view;
+                self.side.focused = false;
+                self.refresh_chrome();
+                self.request_full_redraw();
+                self.refresh(self.focused_id());
+            }
+            None => self.hide_side(),
+        }
+        self.update_menu_checks();
+    }
+
+    /// Carries out what the palette picked, once it is closed, so what
+    /// runs sees the side pane as it was.
+    fn palette_action(&mut self, action: Option<PalAction>) -> Option<Command> {
+        let Some(action) = action else {
+            self.refresh_chrome();
+            return None;
+        };
+        self.leave_palette();
+        match action {
+            // Picked by name like a menu item: a side pane that is open
+            // hides at once instead of first taking the keyboard.
+            PalAction::Run(id) if is_side_pane(id) => self.toggle_side(id, true),
+            PalAction::Run(id) => return Some(Command::Id(id)),
+            PalAction::Open { host, split } => self.open_host(&host, split),
+            PalAction::Send { index, enter } => {
+                let s = self.settings.snippets.get(index)?.clone();
+                return self.send_snippet(&s.name, &s.lines, enter);
+            }
+            PalAction::RunApp(program) => {
+                let pane = self.app_pane.take().unwrap_or_else(|| self.focused_id());
+                return self.run_remote_app(
+                    pane,
+                    Some(&program),
+                    None,
+                    ferostream_client::transport::AttachTo::New,
+                );
+            }
+            PalAction::Leave => {}
+        }
+        None
+    }
+
+    /// Pastes into the snippets view when it has the keyboard; `false`
+    /// when the paste is for the terminal.
+    fn paste_side(&mut self, text: &str) -> bool {
+        if self.side.visible
+            && self.side.focused
+            && self.side.view == SideView::Live
+            && self.live_view.renaming()
+        {
+            self.live_view.paste(text);
+            self.refresh_chrome();
+            return true;
+        }
+        if !(self.side.visible && self.side.focused && self.side.view == SideView::Snippets) {
+            return false;
+        }
+        // The native editor's fields take it themselves.
+        if self.script_editor_native() {
+            script_editor::paste(text);
+            return true;
+        }
+        if self.script_args_native() {
+            script_args::paste(text);
+            return true;
+        }
+        if self.script_hosts_native() {
+            script_hosts::paste(text);
+            return true;
+        }
+        // A report has nowhere to paste into.
+        if self.script_report_native() {
+            return true;
+        }
+        self.snippets_view.paste(text);
+        self.refresh_chrome();
+        true
+    }
+
+    /// Back to the terminal from the snippets: the side pane hides again
+    /// when Ctrl+Shift+Space showed it.
+    fn leave_snippets(&mut self) {
+        if self.snippets_peek {
+            self.hide_side();
+        } else {
+            self.focus_terminal();
+        }
+    }
+
+    /// Types snippet `name` (see [`Self::type_snippet`]); one with
+    /// arguments first asks for them in the snippets view.
+    fn send_snippet(&mut self, name: &str, lines: &[String], enter: bool) -> Option<Command> {
+        let id = self.focused_id();
+        if !self.takes_broadcast(id) {
+            return Some(Command::Notice(
+                "Scripts are typed into a pane with a running shell or console; this \
+                 pane has none, or is at a prompt."
+                    .into(),
+            ));
+        }
+        let vars = self.vars(id, lines, true);
+        if let Some(SnipAction::Type { name, steps }) =
+            self.snippets_view.send(name, lines, enter, vars)
+        {
+            return self.type_snippet(&name, steps);
+        }
+        if self.side.visible && self.side.view == SideView::Snippets {
+            self.side.focused = true;
+            self.request_full_redraw();
+        } else {
+            let peek = !self.side.visible;
+            self.show_side(SideView::Snippets, true);
+            self.snippets_peek = peek;
+        }
+        self.refresh_chrome();
+        None
+    }
+
+    /// Types a snippet's steps, arguments and variables filled in, into
+    /// the focused pane and the panes broadcast input reaches; asks first
+    /// when one of them has the Production theme.
+    fn type_snippet(&mut self, name: &str, steps: Vec<Step>) -> Option<Command> {
+        let id = self.focused_id();
+        if !self.takes_broadcast(id) {
+            return Some(Command::Notice(
+                "Scripts are typed into a pane with a running shell or console; this \
+                 pane has none, or is at a prompt."
+                    .into(),
+            ));
+        }
+        let mut panes = vec![id];
+        panes.extend(self.broadcast_targets(id));
+        let red: Vec<PaneId> = panes
+            .iter()
+            .copied()
+            .filter(|p| {
+                self.panes
+                    .get(p)
+                    .is_some_and(|p| p.theme.name == "Production")
+            })
+            .collect();
+        let production: Vec<String> = red.into_iter().map(|p| self.pane_label(p)).collect();
+        if self.settings.confirm_production && !production.is_empty() {
+            return Some(Command::ConfirmSnippet {
+                name: name.to_owned(),
+                steps,
+                panes,
+                production,
+            });
+        }
+        self.run_snippet(name, steps, &panes)
+    }
+
+    /// Types `steps` into `panes`: at once when none waits, else as a run
+    /// in each pane, with a live report when it runs in several or
+    /// captures values.
+    fn run_snippet(&mut self, name: &str, steps: Vec<Step>, panes: &[PaneId]) -> Option<Command> {
+        let capture = steps.iter().any(|s| matches!(s, Step::Capture(_)));
+        if (capture || panes.len() > 1)
+            && let Some(notice) = self.run_still_open()
+        {
+            return Some(notice);
+        }
+        // The steps from the first `@pane` or `@tab` on follow in the
+        // pane it moves to, once the steps before it are done.
+        let mut steps = steps;
+        let after = steps
+            .iter()
+            .position(Step::moves)
+            .map(|at| steps.split_off(at));
+        if after.is_some() && panes.len() > 1 {
+            return Some(Command::Notice(format!(
+                "The script {name} moves to another pane or tab (@pane, @tab), so it runs \
+                 in one pane only, not in {} at once.",
+                panes.len()
+            )));
+        }
+        self.leave_snippets();
+        if !capture && let Some(bytes) = login::steps_bytes(&steps) {
+            for &p in panes {
+                self.input(p, bytes.clone());
+            }
+            if let (Some(after), Some(&p)) = (after, panes.first()) {
+                self.snippet_move(p, name, after);
+            }
+            return None;
+        }
+        let report = capture || panes.len() > 1;
+        let mut rows = Vec::new();
+        for &p in panes {
+            let label = self.pane_label(p);
+            let state = if self.scripts.contains_key(&p) {
+                RowState::Failed("another script runs there".into())
+            } else {
+                RowState::Running(None)
+            };
+            rows.push(ReportRow::new(&label, Some(p), state));
+        }
+        if report {
+            self.show_report(Report::new(name, rows, None));
+        }
+        let what = format!("the script {name}");
+        for &p in panes {
+            if self.scripts.contains_key(&p) {
+                continue;
+            }
+            if let Some(w) = self.watches.get_mut(&p) {
+                w.resume();
+            }
+            self.script_runs += 1;
+            let mut runner = Runner::named(&what, steps.clone());
+            if let Some(after) = &after {
+                self.snippet_next
+                    .insert(p, (self.script_runs, name.to_owned(), after.clone()));
+            }
+            let actions = runner.start(Instant::now());
+            self.scripts.insert(
+                p,
+                ScriptRun {
+                    runner,
+                    run: self.script_runs,
+                    tmux: false,
+                    report,
+                },
+            );
+            self.script_actions(p, actions);
+        }
+        self.refresh_chrome();
+        None
+    }
+
+    /// The rest of snippet `name` after the part that ran in pane `from`:
+    /// `rest` starts with an `@pane` or `@tab` step, which focuses the
+    /// pane it names; the steps after it run there.
+    fn snippet_move(&mut self, from: PaneId, name: &str, mut rest: Vec<Step>) {
+        if rest.is_empty() {
+            return;
+        }
+        let step = rest.remove(0);
+        let Some(t) = self.ws.tab_of(from) else {
+            return;
+        };
+        let (to, missing) = match &step {
+            Step::Pane(d) => {
+                let dir = match d.as_str() {
+                    "left" => Dir::Left,
+                    "right" => Dir::Right,
+                    "up" => Dir::Up,
+                    _ => Dir::Down,
+                };
+                let g = gap(self.dpi);
+                let to = self.ws.tabs.get(t).and_then(|tab| {
+                    layout::neighbour(&tab.root.layout(self.areas.panes, g), from, dir)
+                });
+                (to, format!("there is no pane {d} of this one"))
+            }
+            Step::Tab(w) => {
+                let n = self.ws.tabs.len();
+                let i = if w == "next" {
+                    (t + 1) % n.max(1)
+                } else {
+                    (t + n - 1) % n.max(1)
+                };
+                let to = Some(i)
+                    .filter(|&i| i != t)
+                    .and_then(|i| self.ws.tabs.get(i))
+                    .map(|tab| tab.focus);
+                (to, "there is no other tab".to_owned())
+            }
+            _ => return,
+        };
+        let Some(to) = to else {
+            self.show(
+                from,
+                &format!("\x1b[0;31m[the script {name} stopped: {missing}]\x1b[0m\r\n"),
+            );
+            return;
+        };
+        self.focus_pane(to);
+        if let Some(Command::Notice(text)) = self.run_snippet(name, rest, &[to]) {
+            self.show(to, &format!("\x1b[0;31m{text}\x1b[0m\r\n"));
+        }
+    }
+
+    /// Shows `report` in the snippets view, which takes the keyboard.
+    fn show_report(&mut self, report: Report) {
+        if !(self.side.visible && self.side.view == SideView::Snippets) {
+            let peek = !self.side.visible;
+            self.show_side(SideView::Snippets, true);
+            self.snippets_peek = peek;
+        } else {
+            self.side.focused = true;
+        }
+        self.snippets_view.show_report(report);
+    }
+
+    /// A notice when the report of a run on picked hosts is still open:
+    /// its sessions go only when it closes, so a new report waits.
+    fn run_still_open(&self) -> Option<Command> {
+        let r = self.snippets_view.report().filter(|r| r.run.is_some())?;
+        Some(Command::Notice(format!(
+            "The report of the run of {} is still open. Close it first: Escape in the \
+             scripts view (Ctrl+Shift+Space).",
+            r.name
+        )))
+    }
+
+    /// The password typed for the run on picked hosts, if one was.
+    fn run_password(&self) -> Option<Zeroizing<String>> {
+        let run = self.snippets_view.report()?.run.as_ref()?;
+        run.password.as_ref().map(|p| p.0.clone())
+    }
+
+    /// F5 in the snippets view: the page that picks the hosts to run
+    /// snippet `name` on. The hosts the snippet is kept to come picked.
+    fn pick_hosts(&mut self, name: &str, lines: &[String]) -> Option<Command> {
+        if let Some(notice) = self.run_still_open() {
+            return Some(notice);
+        }
+        let snippet = self
+            .settings
+            .snippets
+            .iter()
+            .find(|s| s.name == name)
+            .cloned()
+            .unwrap_or_default();
+        let env = ssh_env();
+        let hosts: Vec<PickHost> = host_items(&env, &self.settings)
+            .into_iter()
+            .filter(|h| h.kind == SessionKind::Ssh)
+            .map(|h| {
+                let host = Target::resolve(&h.name, &env)
+                    .map(|t| t.hostname)
+                    .unwrap_or_default();
+                let place = Place {
+                    session: h.name,
+                    host,
+                    folder: h.folder,
+                };
+                let picked = !snippet.everywhere() && snippet.applies(Some(&place));
+                PickHost {
+                    place,
+                    detail: h.detail,
+                    picked,
+                }
+            })
+            .collect();
+        if hosts.is_empty() {
+            return Some(Command::Notice(
+                "There are no saved SSH sessions to run the script on. Save the hosts in \
+                 the connection manager first."
+                    .into(),
+            ));
+        }
+        let parallel = self
+            .settings
+            .run_parallel
+            .unwrap_or(batch::DEFAULT_PARALLEL);
+        self.snippets_view
+            .show_picker(Picker::new(name, lines, hosts, parallel));
+        None
+    }
+
+    /// Runs snippet `name` on `hosts`; asks first when one of them has
+    /// the Production theme.
+    fn run_on(&mut self, name: String, hosts: Vec<Place>, run: Run) -> Option<Command> {
+        if let Some(notice) = self.run_still_open() {
+            return Some(notice);
+        }
+        if self
+            .settings
+            .run_parallel
+            .unwrap_or(batch::DEFAULT_PARALLEL)
+            != run.parallel
+        {
+            self.settings.run_parallel = Some(run.parallel);
+            self.save_settings();
+        }
+        let env = ssh_env();
+        let production: Vec<String> = hosts
+            .iter()
+            .filter(|h| {
+                let tag = Target::resolve(&h.session, &env).and_then(|t| t.tag);
+                let (_, theme) = look::for_host(
+                    &self.settings,
+                    &h.session,
+                    &h.host,
+                    tag.as_deref(),
+                    &FontSpec::default(),
+                    &self.default_theme,
+                );
+                theme.name == "Production"
+            })
+            .map(|h| h.session.clone())
+            .collect();
+        if self.settings.confirm_production && !production.is_empty() {
+            return Some(Command::ConfirmRun {
+                name,
+                hosts,
+                run,
+                production,
+            });
+        }
+        self.start_run(&name, &hosts, run);
+        None
+    }
+
+    /// Starts the run of snippet `name` on `hosts`: its report opens and
+    /// the first hosts log in.
+    fn start_run(&mut self, name: &str, hosts: &[Place], run: Run) {
+        let rows = hosts
+            .iter()
+            .map(|h| ReportRow::new(&h.session, None, RowState::Queued))
+            .collect();
+        self.show_report(Report::new(name, rows, Some(run)));
+        self.pump_run();
+    }
+
+    /// Starts the queued hosts of the run there is room for, each in a
+    /// session of its own that no tab shows (a new channel on a
+    /// connection another pane already has to it).
+    fn pump_run(&mut self) {
+        let starts: Vec<(usize, String)> = match self.snippets_view.report_mut() {
+            Some(r) => r
+                .starting(Instant::now())
+                .into_iter()
+                .filter_map(|i| r.rows.get(i).map(|row| (i, row.label.clone())))
+                .collect(),
+            None => Vec::new(),
+        };
+        for (i, session) in starts {
+            let id = self.ws.alloc_id();
+            self.add_pane(id);
+            self.run_hidden.insert(id);
+            self.run_login.insert(id);
+            if let Some(row) = self
+                .snippets_view
+                .report_mut()
+                .and_then(|r| r.rows.get_mut(i))
+            {
+                row.pane = Some(id);
+            }
+            self.connect(id, &session);
+            if self
+                .panes
+                .get(&id)
+                .is_some_and(|p| matches!(p.host, Host::Ask(_)))
+            {
+                let why = self.run_notes.get(&id).cloned();
+                self.fail_run_row(id, why.unwrap_or_else(|| "could not connect".into()));
+            } else {
+                self.check_run_login(id);
+            }
+        }
+        self.arm_run_timer();
+        self.refresh_chrome();
+    }
+
+    /// A run's host that is logging in: its row fails when the login
+    /// asks for anything (a host key, a password, a code) or ends. The
+    /// session stays, so it can be shown and answered by hand.
+    fn check_run_login(&mut self, id: PaneId) {
+        if !self.run_login.contains(&id) {
+            return;
+        }
+        // A key whose passphrase is not in the agent is skipped, as an
+        // empty passphrase does by hand: the login goes on with the next
+        // key or the password.
+        if let Some(Host::Ssh(s)) = self.panes.get_mut(&id).map(|p| &mut p.host)
+            && s.prompt_asks() == Some("a key passphrase")
+        {
+            let effects = s.prompt_input(b"\r");
+            self.apply(id, effects);
+            return;
+        }
+        let said = || self.run_notes.get(&id).cloned();
+        // A pane with no host yet is still being set up: `pump_run` checks
+        // that the connection started.
+        let why = match self.panes.get(&id).map(|p| &p.host) {
+            Some(Host::Ssh(s)) => match s.state() {
+                State::Blocked => Some("the host key changed".to_owned()),
+                State::Ended => {
+                    Some(said().unwrap_or_else(|| "could not connect or log in".into()))
+                }
+                _ => s.prompt_asks().map(|what| format!("asked for {what}")),
+            },
+            Some(Host::Telnet(s)) if s.state() == State::Ended => {
+                Some(said().unwrap_or_else(|| "could not connect".into()))
+            }
+            Some(_) => None,
+            None => Some("the session was closed".to_owned()),
+        };
+        if let Some(why) = why {
+            self.fail_run_row(id, why);
+        }
+    }
+
+    /// Fails the row of a run's pane `id`; the next host may start.
+    fn fail_run_row(&mut self, id: PaneId, why: String) {
+        self.run_login.remove(&id);
+        self.run_notes.remove(&id);
+        self.scripts.remove(&id);
+        if let Some(row) = self.snippets_view.report_mut().and_then(|r| r.row_mut(id))
+            && !row.state.over()
+        {
+            row.state = RowState::Failed(why);
+        }
+        self.pump_run();
+    }
+
+    /// A run's host is logged in (its login script over): the snippet
+    /// starts there, its arguments and that host's variables filled in.
+    fn begin_run_snippet(&mut self, id: PaneId) {
+        self.run_login.remove(&id);
+        self.run_notes.remove(&id);
+        let Some((name, lines, args)) = self.snippets_view.report().and_then(|r| {
+            let run = r.run.as_ref()?;
+            Some((r.name.clone(), run.lines.clone(), run.args.clone()))
+        }) else {
+            return;
+        };
+        let vars = self.vars(id, &lines, true);
+        let steps = login::expand(
+            &lines,
+            true,
+            |n| {
+                args.iter()
+                    .find(|(k, _)| *k == n)
+                    .map(|(_, v)| v.clone())
+                    .unwrap_or_default()
+            },
+            |v| {
+                vars.iter()
+                    .find(|(k, _)| *k == v)
+                    .map(|(_, x)| x.clone())
+                    .unwrap_or_default()
+            },
+        );
+        if let Some(row) = self.snippets_view.report_mut().and_then(|r| r.row_mut(id)) {
+            row.state = RowState::Running(None);
+        }
+        self.script_runs += 1;
+        let mut runner = Runner::named(&format!("the script {name}"), steps);
+        let actions = runner.start(Instant::now());
+        self.scripts.insert(
+            id,
+            ScriptRun {
+                runner,
+                run: self.script_runs,
+                tmux: false,
+                report: true,
+            },
+        );
+        self.script_actions(id, actions);
+    }
+
+    /// Ends a run's session that no tab shows.
+    fn drop_run_pane(&mut self, id: PaneId) {
+        self.run_login.remove(&id);
+        self.run_notes.remove(&id);
+        self.scripts.remove(&id);
+        if self.run_hidden.remove(&id) {
+            self.end_host(id);
+            self.panes.remove(&id);
+            self.watches.remove(&id);
+        }
+    }
+
+    /// Escape while the run goes: the queued hosts never start, and the
+    /// running ones stop. Sessions still logging in end.
+    fn cancel_run(&mut self) {
+        let panes = self
+            .snippets_view
+            .report_mut()
+            .map(Report::cancel)
+            .unwrap_or_default();
+        for p in panes {
+            self.scripts.remove(&p);
+            self.run_notes.remove(&p);
+            if self.run_login.remove(&p) && self.run_hidden.contains(&p) {
+                self.end_host(p);
+            }
+        }
+        self.arm_run_timer();
+    }
+
+    /// R in the report: the failed and stopped hosts run again, in new
+    /// sessions.
+    fn retry_run(&mut self) {
+        let panes = self
+            .snippets_view
+            .report_mut()
+            .map(Report::retry)
+            .unwrap_or_default();
+        for p in panes {
+            self.drop_run_pane(p);
+        }
+        self.pump_run();
+    }
+
+    /// The report closed: the sessions of a run that no tab shows end.
+    fn close_report(&mut self, report: &Report) {
+        if report.run.is_some() {
+            for p in report.rows.iter().filter_map(|r| r.pane) {
+                self.drop_run_pane(p);
+            }
+        }
+        self.arm_run_timer();
+        self.leave_snippets();
+    }
+
+    /// Enter on a report row: that host's session in a tab of its own,
+    /// live, or its tab when it has one.
+    fn show_run_pane(&mut self, id: PaneId) -> Option<Command> {
+        if !self.panes.contains_key(&id) {
+            return Some(Command::Notice("That session was closed.".into()));
+        }
+        if self.run_hidden.remove(&id) {
+            let at = self.ws.tabs.len();
+            self.ws.insert_tab(at, layout::Node::Leaf(id), id);
+        }
+        self.focus_pane(id);
+        self.after_structure_change();
+        self.focus_terminal();
+        None
+    }
+
+    /// Sets the timer for the next host of the run to take too long.
+    fn arm_run_timer(&mut self) {
+        let next = self.snippets_view.report().and_then(Report::deadline);
+        // SAFETY: our window; replaces any earlier timer with this id.
+        unsafe {
+            match next {
+                Some(at) => {
+                    let wait = at.saturating_duration_since(Instant::now());
+                    let ms = u32::try_from(wait.as_millis()).unwrap_or(u32::MAX).max(1);
+                    SetTimer(Some(self.hwnd), TIMER_RUN, ms, None);
+                }
+                None => {
+                    let _ = KillTimer(Some(self.hwnd), TIMER_RUN);
+                }
+            }
+        }
+    }
+
+    fn on_run_timer(&mut self) {
+        let late = self
+            .snippets_view
+            .report_mut()
+            .map(|r| r.timed_out(Instant::now()))
+            .unwrap_or_default();
+        for p in late {
+            self.scripts.remove(&p);
+            self.run_login.remove(&p);
+            self.run_notes.remove(&p);
+        }
+        self.pump_run();
+    }
+
+    /// Ctrl+Shift+F`n`: the first snippet with that hotkey for the
+    /// focused pane's host; `None` when there is none.
+    fn snippet_hotkey(&mut self, n: u8) -> Option<Option<Command>> {
+        let place = self.place(self.focused_id()).map(|p| p.0);
+        let s = self
+            .settings
+            .snippets
+            .iter()
+            .find(|s| s.hotkey == Some(n) && s.applies(place.as_ref()))?
+            .clone();
+        Some(self.send_snippet(&s.name, &s.lines, true))
+    }
+
+    /// A short name for pane `id`'s host, for the report.
+    fn pane_label(&mut self, id: PaneId) -> String {
+        match self.place(id) {
+            Some((place, ..)) if !place.session.is_empty() => place.session,
+            _ => format!("pane {id}"),
+        }
+    }
+
+    /// Where pane `id` is connected, with its user and port.
+    fn place(&mut self, id: PaneId) -> Option<(Place, String, u16)> {
+        let (session, host, user, port) = match &self.panes.get(&id)?.host {
+            Host::Ssh(s) => (
+                s.target.alias.clone(),
+                s.target.hostname.clone(),
+                s.target.user.clone(),
+                s.target.port,
+            ),
+            Host::Telnet(s) => (
+                s.target.alias.clone(),
+                s.target.hostname.clone(),
+                String::new(),
+                s.target.port,
+            ),
+            Host::Serial {
+                target, session, ..
+            } => (
+                session.clone().unwrap_or_else(|| target.port.clone()),
+                target.port.clone(),
+                String::new(),
+                0,
+            ),
+            Host::Tmux { gateway, .. } => {
+                let gateway = *gateway;
+                return self.place(gateway);
+            }
+            _ => return None,
+        };
+        let folder = self.folder_of(&session);
+        Some((
+            Place {
+                session,
+                host,
+                folder,
+            },
+            user,
+            port,
+        ))
+    }
+
+    /// Session `name`'s folder in the connection manager, read again from
+    /// ssh_config at most every half minute.
+    fn folder_of(&mut self, name: &str) -> Option<String> {
+        if self
+            .folders
+            .as_ref()
+            .is_none_or(|(at, _)| at.elapsed() > Duration::from_secs(30))
+        {
+            let env = ssh_env();
+            let map = host_items(&env, &self.settings)
+                .into_iter()
+                .filter_map(|h| Some((h.name, h.folder?)))
+                .collect();
+            self.folders = Some((Instant::now(), map));
+        }
+        self.folders.as_ref()?.1.get(name).cloned()
+    }
+
+    /// The variables' values in pane `id`; the clipboard is read only
+    /// when `lines` use it and `clipboard` allows it.
+    fn vars(&mut self, id: PaneId, lines: &[String], clipboard: bool) -> Vars {
+        let (y, mo, d, h, mi, sec) = local_time();
+        let mut vars: Vars = vec![
+            ("date", format!("{y:04}-{mo:02}-{d:02}")),
+            ("time", format!("{h:02}:{mi:02}:{sec:02}")),
+            (
+                "stamp",
+                format!("{y:04}{mo:02}{d:02}-{h:02}{mi:02}{sec:02}"),
+            ),
+        ];
+        if let Some((place, user, port)) = self.place(id) {
+            vars.push(("session", place.session));
+            vars.push(("host", place.host));
+            vars.push(("user", user));
+            if port != 0 {
+                vars.push(("port", port.to_string()));
+            }
+        }
+        if clipboard && login::uses_var(lines, "clipboard") {
+            vars.push((
+                "clipboard",
+                clipboard::get_text(self.hwnd).unwrap_or_default(),
+            ));
+        }
+        vars
+    }
+
+    /// What pane `id`'s host printed, for auto-responses and a recording.
+    fn watch_output(&mut self, id: PaneId, bytes: &[u8]) {
+        if let Some((pane, rec)) = &mut self.recording
+            && *pane == id
+        {
+            rec.output(bytes);
+        }
+        // A running script or snippet owns the pane's answers.
+        if !self.settings.auto_responses
+            || self.scripts.contains_key(&id)
+            || !self.settings.snippets.iter().any(|s| !s.when.is_empty())
+        {
+            self.watches.remove(&id);
+            return;
+        }
+        let place = self.place(id).map(|p| p.0);
+        let whens: Vec<(usize, &str)> = self
+            .settings
+            .snippets
+            .iter()
+            .enumerate()
+            .filter(|(_, s)| {
+                !s.when.is_empty() && s.auto_problem().is_none() && s.applies(place.as_ref())
+            })
+            .map(|(i, s)| (i, s.when.as_str()))
+            .collect();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX));
+        let fires = self.watches.entry(id).or_default().feed(bytes, &whens, now);
+        for fire in fires {
+            match fire {
+                Fire::Snippet(i) => {
+                    let Some(s) = self.settings.snippets.get(i).cloned() else {
+                        continue;
+                    };
+                    // No clipboard: the host decides when this types.
+                    let vars = self.vars(id, &s.lines, false);
+                    let steps = login::expand(
+                        &s.lines,
+                        true,
+                        |_| String::new(),
+                        |n| {
+                            vars.iter()
+                                .find(|(k, _)| *k == n)
+                                .map(|(_, v)| v.clone())
+                                .unwrap_or_default()
+                        },
+                    );
+                    if let Some(bytes) = login::steps_bytes(&steps) {
+                        self.send(id, bytes);
+                    }
+                }
+                Fire::Paused => self.show(
+                    id,
+                    "\r\n\x1b[0;90m[Auto-responses paused: the host asked too often. They \
+                     start again when you type.]\x1b[0m\r\n",
+                ),
+            }
+        }
+    }
+
+    /// Edit > Record keystrokes as snippet: starts recording the focused
+    /// pane's typing, or stops and opens the recording in the snippets
+    /// view to name and check.
+    fn toggle_recording(&mut self) -> Option<Command> {
+        if let Some((pane, rec)) = self.recording.take() {
+            self.show(pane, "\x1b[0;90m[Recording stopped]\x1b[0m\r\n");
+            self.refresh(pane);
+            self.update_menu_checks();
+            let rec = rec.finish();
+            if rec.lines.is_empty() {
+                return Some(Command::Notice("Nothing was typed while recording.".into()));
+            }
+            self.snippets_view.new_recorded(rec);
+            self.show_side(SideView::Snippets, true);
+            self.snippets_peek = false;
+            self.refresh_chrome();
+            return None;
+        }
+        let id = self.focused_id();
+        if !self.takes_broadcast(id) {
+            return Some(Command::Notice(
+                "Recording takes typing in a pane with a running shell or console.".into(),
+            ));
+        }
+        self.recording = Some((id, Recorder::default()));
+        self.show(
+            id,
+            "\x1b[0;90m[Recording keystrokes as a script. Edit > Record keystrokes as script \
+             again stops it.]\x1b[0m\r\n",
+        );
+        self.refresh(id);
+        self.update_menu_checks();
+        None
+    }
+
+    fn delete_snippet(&mut self, index: usize) -> Option<Command> {
+        let mut out = None;
+        if index < self.settings.snippets.len() {
+            let s = self.settings.snippets.remove(index);
+            if s.file.is_none() {
+                // One still kept in ferossh.conf.
+                self.save_settings();
+            } else if let Err(e) = snippet_store::remove(&snippets_dir(), &s) {
+                out = Some(Command::Notice(format!(
+                    "Could not remove the script's file: {e}"
+                )));
+            }
+        }
+        self.snippets_view.saved(&self.settings.snippets, None);
+        self.refresh_chrome();
+        out
+    }
+
+    /// Reads the snippets folder again, so snippet files copied into it
+    /// show up. Snippets still kept in `ferossh.conf` (the folder could
+    /// not be written) stay.
+    fn reload_snippets(&mut self) {
+        let dir = snippets_dir();
+        if self.settings.snippets.iter().any(|s| s.file.is_none()) {
+            if snippet_store::migrate(&dir, &self.settings.snippets).is_err() {
+                return;
+            }
+            self.settings.snippets = snippet_store::load(&dir).0;
+            self.save_settings();
+            return;
+        }
+        self.settings.snippets = snippet_store::load(&dir).0;
+    }
+
+    /// File > Import snippets: the import page, on what other programs
+    /// on this account have.
+    fn open_snippet_import(&mut self, found: Vec<SnippetSource>, problems: Vec<String>) {
+        let list = found
+            .into_iter()
+            .map(|(c, origin, s)| found_snippets(c, origin, s))
+            .collect();
+        self.side.form = None;
+        self.side.import = Some(ImportView::snippets(list, problems));
+        self.show_side(SideView::Sessions, true);
+        self.refresh_chrome();
+    }
+
+    /// Snippets read from a file the user picked on the import page.
+    fn add_snippet_import(&mut self, (client, origin, snippets): SnippetSource) {
+        if let Some(view) = &mut self.side.import {
+            view.add(found_snippets(client, origin, snippets));
+        }
+        self.refresh_chrome();
+    }
+
+    /// Adds imported snippets to the snippets folder; says what happened.
+    fn write_snippet_import(&mut self, snippets: Vec<Snippet>) -> String {
+        let dir = snippets_dir();
+        let mut done = 0;
+        let mut failed = None;
+        for mut s in snippets {
+            match snippet_store::add(&dir, &mut s) {
+                Ok(()) => done += 1,
+                Err(e) => {
+                    failed = Some(e);
+                    break;
+                }
+            }
+        }
+        self.reload_snippets();
+        self.side.import = None;
+        self.show_side(SideView::Snippets, true);
+        let mut text = format!(
+            "Imported {done} script{} into {}. Each has a file there, in a folder named \
+             after its category.",
+            plural(done),
+            dir.display()
+        );
+        if let Some(e) = failed {
+            text.push_str(&format!("\n\nThe rest were not imported: {e}"));
+        }
+        text
+    }
+
+    /// File > Import connections: the import page, on what the clients
+    /// on this account have saved.
+    fn open_import(&mut self, sessions: Vec<ImportSource>, problems: Vec<String>) {
+        let list = sessions
+            .into_iter()
+            .map(|(c, origin, s)| found(c, origin, s))
+            .collect();
+        self.side.form = None;
+        self.side.import = Some(ImportView::new(list, problems));
+        self.show_side(SideView::Sessions, true);
+        self.refresh_chrome();
+    }
+
+    /// Sessions read from a file the user picked on the import page.
+    fn add_import(&mut self, (client, origin, sessions): ImportSource) {
+        if let Some(view) = &mut self.side.import {
+            view.add(found(client, origin, sessions));
+        }
+        self.refresh_chrome();
+    }
+
+    /// Carries out what the import page asked for.
+    fn import_action(&mut self, action: Option<ImportAction>) -> Option<Command> {
+        let mut out = None;
+        match action {
+            Some(ImportAction::Close) => self.side.import = None,
+            Some(ImportAction::FromFile) => out = Some(Command::PickImportFile),
+            Some(ImportAction::Import { client, sessions }) => {
+                out = Some(Command::Notice(self.write_import(client, &sessions)));
+            }
+            Some(ImportAction::ImportSnippets(snippets)) => {
+                out = Some(Command::Notice(self.write_snippet_import(snippets)));
+            }
+            None => {}
+        }
+        self.refresh_chrome();
+        out
+    }
+
+    /// Writes `client`'s import file (replacing an earlier import from
+    /// it) and the fonts the sessions bring; says what happened.
+    fn write_import(&mut self, client: Client, sessions: &[import::Session]) -> String {
+        let path = imported_path(client);
+        let all: Vec<&import::Session> = sessions.iter().collect();
+        if let Err(e) = write_app_file(&path, &import::to_config(client, &all)) {
+            return format!("Could not write {}: {e}", path.display());
+        }
+        // Fonts become profiles, unless the host already has one.
+        for s in sessions {
+            if let Some(p) = import::profile(s)
+                && self.settings.profile(&p.host).is_none()
+            {
+                let host = p.host.clone();
+                *self.settings.profile_mut(&host) = p;
+            }
+        }
+        self.save_settings();
+        self.side.import = None;
+        self.show_side(SideView::Sessions, true);
+        self.update_menu_checks();
+        let n = sessions.len();
+        let mut text = format!(
+            "Imported {n} connection{} from {} into the {} folder of the connection manager.",
+            plural(n),
+            client.name(),
+            client.name(),
+        );
+        let saved = sessions.iter().filter(|s| s.had_password).count();
+        if saved > 0 {
+            text.push_str(&format!(
+                "\n\n{saved} of them had a password saved in {}, which FeroSSH does not import. \
+                 To log in without typing it, pick a password source with F2 on the session.",
+                client.name()
+            ));
+        }
+        text
+    }
+
+    /// Opens the session form on `host`, or on a new session.
+    fn open_form(&mut self, host: Option<String>) {
+        let env = ssh_env();
+        let items = host_items(&env, &self.settings);
+        let names: Vec<String> = items.iter().map(|h| h.name.clone()).collect();
+        let font = FontSpec::default();
+        let hints = Hints {
+            local_user: env.local_user.clone(),
+            font: font.family,
+            font_size: font.size_pt,
+            scrollback: self
+                .settings
+                .scrollback
+                .unwrap_or(TermSettings::DEFAULT_SCROLLBACK),
+        };
+        let themes: Vec<String> = Theme::builtin().iter().map(|t| t.name.to_owned()).collect();
+        let form = match host {
+            None => SessionForm::new(None, Source::New, Values::default(), hints, names, themes),
+            Some(name) => {
+                let profile = self.settings.profile(&name);
+                let saved = load_saved();
+                match saved.iter().find(|h| h.alias.eq_ignore_ascii_case(&name)) {
+                    Some(h) => SessionForm::new(
+                        Some(h.alias.clone()),
+                        Source::Saved,
+                        Values::from_saved(h).with_profile(profile),
+                        hints,
+                        names,
+                        themes,
+                    ),
+                    None => {
+                        let folder = items
+                            .iter()
+                            .find(|h| h.name == name)
+                            .and_then(|h| h.folder.clone());
+                        let values = match Target::resolve(&name, &env) {
+                            Some(t) => {
+                                let key = t
+                                    .key_files
+                                    .iter()
+                                    .find(|k| k.explicit)
+                                    .map(|k| k.path.display().to_string());
+                                Values::from_resolved(
+                                    &name,
+                                    folder.as_deref(),
+                                    &t.hostname,
+                                    &t.user,
+                                    t.port,
+                                    key.as_deref(),
+                                    &t.jumps
+                                        .iter()
+                                        .map(|j| j.alias.as_str())
+                                        .collect::<Vec<_>>()
+                                        .join(","),
+                                    &t.forwards,
+                                )
+                            }
+                            None => Values {
+                                name: name.clone(),
+                                ..Values::default()
+                            },
+                        };
+                        let source = Source::ReadOnly(host_file(&name));
+                        SessionForm::new(
+                            Some(name),
+                            source,
+                            values.with_profile(profile),
+                            hints,
+                            names,
+                            themes,
+                        )
+                    }
+                }
+            }
+        };
+        self.side.form = Some(form);
+        self.side.focused = true;
+        self.refresh_chrome();
+    }
+
+    /// Carries out what the session form asked for.
+    fn form_action(&mut self, action: Option<FormAction>) -> Option<Command> {
+        let mut out = None;
+        match action {
+            Some(FormAction::Cancel) => self.side.form = None,
+            Some(FormAction::Save { connect }) => {
+                let form = self.side.form.as_ref()?;
+                let mut hosts = load_saved();
+                let mut settings = self.settings.clone();
+                let name = form.apply(&mut hosts, &mut settings);
+                // Off the Windows Credential Manager: the saved password goes. Its
+                // name is resolved before the session's settings change.
+                let was_windows = form.original.as_deref().is_some_and(|o| {
+                    self.settings
+                        .profile(o)
+                        .is_some_and(|p| p.password == PasswordSource::Windows)
+                });
+                let still_windows = settings
+                    .profile(&name)
+                    .is_some_and(|p| p.password == PasswordSource::Windows);
+                let forget = (was_windows && !still_windows)
+                    .then(|| form.original.clone())
+                    .flatten()
+                    .and_then(|o| Target::resolve(&o, &ssh_env()));
+                if let Err(e) = write_app_file(&sessions_path(), &saved::to_text(&hosts)) {
+                    return Some(Command::Notice(format!(
+                        "Could not save the connection to {}: {e}",
+                        sessions_path().display()
+                    )));
+                }
+                if let Some(t) = forget {
+                    credman::delete(&credman::target(&t.user, &t.hostname, t.port));
+                }
+                self.settings = settings;
+                self.save_settings();
+                self.side.form = None;
+                self.reload_sessions(Some(&name));
+                if connect {
+                    self.open_host(&name, false);
+                }
+            }
+            Some(FormAction::Delete) => {
+                out = self
+                    .side
+                    .form
+                    .as_ref()
+                    .and_then(|f| f.original.clone())
+                    .map(Command::DeleteSession);
+            }
+            Some(FormAction::BrowseKey) => out = Some(Command::PickKey),
+            None => {}
+        }
+        self.refresh_chrome();
+        out
+    }
+
+    /// Removes saved session `name` (after the user said yes).
+    fn delete_session(&mut self, name: &str) {
+        if self
+            .settings
+            .profile(name)
+            .is_some_and(|p| p.password == PasswordSource::Windows)
+            && let Some(t) = Target::resolve(name, &ssh_env())
+        {
+            credman::delete(&credman::target(&t.user, &t.hostname, t.port));
+        }
+        let mut hosts = load_saved();
+        session_form::delete(name, &mut hosts, &mut self.settings);
+        if let Err(e) = write_app_file(&sessions_path(), &saved::to_text(&hosts)) {
+            self.queued.push(Command::Notice(format!(
+                "Could not save {}: {e}",
+                sessions_path().display()
+            )));
+            return;
+        }
+        self.save_settings();
+        self.side.form = None;
+        self.reload_sessions(None);
+        self.refresh_chrome();
+    }
+
+    /// Reads the hosts again after a session was saved or deleted.
+    fn reload_sessions(&mut self, select: Option<&str>) {
+        let env = ssh_env();
+        self.side.list.set_hosts(
+            host_items(&env, &self.settings),
+            self.settings.favourites.clone(),
+        );
+        if let Some(name) = select {
+            self.side.list.select(name);
+        }
+    }
+
+    /// A desktop session: Remote Desktop Connection straight to the
+    /// machine, or a tunnel through the session named in Via once that
+    /// SSH session has logged in.
+    fn open_desktop_session(
+        &mut self,
+        name: &str,
+        kind: SessionKind,
+        via: Option<String>,
+        split: bool,
+    ) {
+        let env = ssh_env();
+        let includes = ssh_config::DirIncludes {
+            home: env.home.clone(),
+        };
+        let cfg = ssh_config::resolve_in(&env.config, name, &includes);
+        let port = cfg.port.unwrap_or(match kind {
+            SessionKind::Vnc => DEFAULT_VNC_PORT,
+            _ => DEFAULT_DESKTOP_PORT,
+        });
+        let Some(via) = via else {
+            if kind != SessionKind::Rdp {
+                self.queued.push(Command::Notice(format!(
+                    "A VNC or virtual desktop goes through an SSH connection. Choose one under \
+                     Via SSH in the connection form (F2 on {name})."
+                )));
+                return;
+            }
+            let host = cfg.hostname.unwrap_or_else(|| name.to_owned());
+            let addr = if host.contains(':') {
+                format!("[{host}]:{port}")
+            } else {
+                format!("{host}:{port}")
+            };
+            let clipboard = self.desktop_clip(self.desktop_clip_limit(&[name])) == (true, true);
+            if let Err(e) = launch_rdp_client(&addr, self.fixed_desktop_size(name), clipboard) {
+                self.queued.push(Command::Notice(format!(
+                    "Remote Desktop Connection (mstsc.exe) did not start: {e}"
+                )));
+            }
+            return;
+        };
+        if kind == SessionKind::Vnc && !cfg!(feature = "vnc-viewer") {
+            self.queued.push(Command::Notice(
+                "This FeroSSH has no built-in VNC viewer. VNC sessions open in the desktop \
+                 build (ferossh-desktop.exe)."
+                    .into(),
+            ));
+            return;
+        }
+        // Without a host of its own, the desktop is on the SSH host.
+        let host = cfg.hostname.unwrap_or_else(|| "localhost".to_owned());
+        // VNC to another machine is plain past the SSH server: ask first.
+        let plain_key = crate::forwards::plain_desktop_key(name, &host, port, &via);
+        if kind == SessionKind::Vnc
+            && !crate::forwards::on_ssh_host(&host)
+            && !self.plain_vnc_ok.contains(&plain_key)
+        {
+            self.queued.push(Command::ApprovePlainVnc {
+                key: plain_key,
+                name: name.to_owned(),
+                target: host,
+                via,
+                split,
+            });
+            return;
+        }
+        let pending = PendingDesktop {
+            label: name.to_owned(),
+            host,
+            port,
+            kind,
+            user: cfg.user,
+        };
+        // Only the desktop or app shows: the SSH login runs in a session
+        // no tab shows, which shows when the login asks for something or
+        // fails, and goes once the desktop or app holds the connection.
+        let _ = split;
+        let id = self.ws.alloc_id();
+        self.add_pane(id);
+        self.launches.insert(id, Instant::now());
+        self.launch_hidden.insert(id);
+        self.pending_desktops.insert(id, pending);
+        self.connect(id, &via);
+        self.check_launch(id);
+        self.arm_launch_timer();
+        self.refresh_chrome();
+    }
+
+    /// A launch's hidden login session shows in a tab of its own when it
+    /// needs the user: a prompt, a changed host key, or a failure.
+    fn check_launch(&mut self, id: PaneId) {
+        if !self.launch_hidden.contains(&id) {
+            return;
+        }
+        let needs_user = match self.panes.get(&id).map(|p| &p.host) {
+            Some(Host::Ssh(s)) => {
+                s.prompt_asks().is_some() || matches!(s.state(), State::Blocked | State::Ended)
+            }
+            Some(Host::Ask(_)) => true,
+            Some(_) => false,
+            None => {
+                self.launches.remove(&id);
+                self.launch_hidden.remove(&id);
+                return;
+            }
+        };
+        if needs_user {
+            self.reveal_launch(id);
+        }
+    }
+
+    /// Shows a launch's hidden login session in a tab of its own.
+    fn reveal_launch(&mut self, id: PaneId) {
+        if self.launch_hidden.remove(&id) && self.panes.contains_key(&id) {
+            let at = self.ws.tabs.len();
+            self.ws.insert_tab(at, layout::Node::Leaf(id), id);
+            self.focus_pane(id);
+            self.after_structure_change();
+            self.focus_terminal();
+        }
+    }
+
+    /// A launch failed (the reason was told): its hidden login session
+    /// ends; one in a tab stays for the user.
+    fn abandon_launch(&mut self, id: PaneId) {
+        if !self.launches.contains_key(&id) {
+            return;
+        }
+        self.launches.remove(&id);
+        if self.launch_hidden.remove(&id) {
+            self.end_host(id);
+            self.panes.remove(&id);
+            self.watches.remove(&id);
+            self.refresh_chrome();
+        }
+    }
+
+    /// The launches whose desktop or app now holds the connection: their
+    /// login sessions go. A session still hidden after [`LAUNCH_WAIT`]
+    /// with nothing holding it shows instead.
+    fn retire_launches(&mut self) {
+        let before = self.mstsc.len();
+        self.mstsc
+            .retain_mut(|(child, _)| matches!(child.try_wait(), Ok(None)));
+        let apps = crate::remote_app::connections_in_use();
+        let mut held = Vec::new();
+        let mut late = Vec::new();
+        for (&id, &since) in &self.launches {
+            let Some(Host::Ssh(s)) = self.panes.get(&id).map(|p| &p.host) else {
+                continue;
+            };
+            if s.state() != State::Connected || self.pending_desktops.contains_key(&id) {
+                continue;
+            }
+            let c = s.connection;
+            let holds = self.panes.iter().any(|(&o, p)| {
+                o != id
+                    && matches!(p.host, Host::Desktop { connection, .. } if connection == c)
+                    && p.desktop.is_some()
+            }) || apps.contains(&c)
+                || self.mstsc.iter().any(|(_, m)| *m == c);
+            if holds {
+                held.push(id);
+            } else if since.elapsed() > LAUNCH_WAIT {
+                late.push(id);
+            }
+        }
+        let changed = !late.is_empty() || !held.is_empty();
+        for id in late {
+            self.launches.remove(&id);
+            self.reveal_launch(id);
+        }
+        for id in held {
+            self.launches.remove(&id);
+            if self.launch_hidden.remove(&id) {
+                self.end_host(id);
+                self.panes.remove(&id);
+                self.watches.remove(&id);
+            } else if self.ws.tabs.len() > 1
+                || self.ws.tab().is_some_and(|t| t.root.panes().len() > 1)
+            {
+                if let Some(c) = self.close_pane(id) {
+                    self.queued.push(c);
+                }
+            } else {
+                // The window's only tab: it stays, free for another
+                // connection.
+                self.end_host(id);
+                self.show(
+                    id,
+                    "\r\n\x1b[0;90mThe login is done; the connection stays while its desktop \
+                     or app runs.\x1b[0m\r\n",
+                );
+                self.refresh(id);
+            }
+        }
+        let panes = &self.panes;
+        self.launches.retain(|id, _| panes.contains_key(id));
+        self.launch_hidden.retain(|id| panes.contains_key(id));
+        if self.mstsc.len() != before {
+            self.prune_forwards();
+        }
+        self.arm_launch_timer();
+        if changed {
+            self.refresh_chrome();
+        }
+    }
+
+    /// Keeps [`TIMER_LAUNCH`] running while launches or tunnelled Remote
+    /// Desktop Connections need watching.
+    fn arm_launch_timer(&mut self) {
+        // SAFETY: our window and timer.
+        unsafe {
+            if self.launches.is_empty() && self.mstsc.is_empty() {
+                let _ = KillTimer(Some(self.hwnd), TIMER_LAUNCH);
+            } else {
+                SetTimer(Some(self.hwnd), TIMER_LAUNCH, LAUNCH_TICK_MS, None);
+            }
+        }
+    }
+
+    /// After a login on SSH pane `id`: opens the desktop a desktop session
+    /// waited for.
+    fn desktop_after_login(&mut self, id: PaneId) {
+        let Some(p) = self.pending_desktops.remove(&id) else {
+            return;
+        };
+        let (Some(connection), Some(Host::Ssh(s))) = (
+            self.pane_connection(id),
+            self.panes.get(&id).map(|p| &p.host),
+        ) else {
+            return;
+        };
+        if p.kind == SessionKind::Xvfb {
+            if let Some(c) = self.open_virtual_desktop(id, Some(&p.label)) {
+                self.queued.push(c);
+                self.abandon_launch(id);
+            }
+            return;
+        }
+        if p.kind == SessionKind::RemoteApp {
+            let program = self
+                .settings
+                .profile(&p.label)
+                .and_then(|pr| pr.remote_app.clone())
+                .unwrap_or_else(|| "xterm".into());
+            if let Some(c) = self.run_remote_app(
+                id,
+                Some(&program),
+                Some(&p.label),
+                ferostream_client::transport::AttachTo::New,
+            ) {
+                self.queued.push(c);
+                self.abandon_launch(id);
+            }
+            self.retire_launches();
+            return;
+        }
+        let size = self.fixed_desktop_size(&p.label);
+        let clip_limit = self.desktop_clip_limit(&[&p.label, &s.target.alias]);
+        let (local, want) = match p.kind {
+            SessionKind::Vnc => (
+                0,
+                DesktopWant::Tab(TabWant {
+                    label: p.label.clone(),
+                    user: p.user.clone().unwrap_or_else(|| s.target.user.clone()),
+                    protocol: Protocol::Vnc,
+                    vdesk: None,
+                    size,
+                    clip_limit,
+                }),
+            ),
+            _ => (
+                desktop_port_for(&p.label),
+                DesktopWant::Rdp {
+                    pane: id,
+                    size,
+                    clipboard: self.desktop_clip(clip_limit) == (true, true),
+                },
+            ),
+        };
+        let Some(w) = self.workers.get(&connection) else {
+            return;
+        };
+        w.forwarder.open_desktop(connection, &p.host, p.port, local);
+        self.desktops
+            .insert((connection, p.host.clone(), p.port), want);
+        self.show(
+            id,
+            &format!(
+                "\x1b[0;90mOpening the desktop {} on {} port {}...\x1b[0m\r\n",
+                crate::ssh::sanitize(&p.label),
+                crate::ssh::sanitize(&p.host),
+                p.port
+            ),
+        );
+        self.refresh(id);
+    }
+
+    /// The pane a session opens in: the focused one if it waits at the
+    /// connect prompt, else a new tab (or, with `split`, a split).
+    fn host_pane_for(&mut self, split: bool) -> Option<PaneId> {
+        let focused = self.focused_id();
+        let idle = matches!(
+            self.panes.get(&focused).map(|p| &p.host),
+            Some(Host::Ask(t)) if t.is_empty()
+        );
+        if split {
+            self.split(Dir::Right)
+        } else if idle {
+            Some(focused)
+        } else {
+            Some(self.new_tab_pane())
+        }
+    }
+
+    /// Opens `host` from the connection manager: in the focused pane if it is
+    /// waiting at the connect prompt, else in a new tab (or a split).
+    fn open_host(&mut self, host: &str, split: bool) {
+        if let Some(p) = self.settings.profile(host)
+            && p.kind == SessionKind::Serial
+        {
+            let line = p.serial.unwrap_or_default();
+            let hostname = Target::resolve(host, &ssh_env()).map(|t| t.hostname);
+            let port = hostname.as_deref().and_then(serial::port_name);
+            match port.or_else(|| serial::port_name(host)) {
+                Some(port) => {
+                    if let Some(id) = self.host_pane_for(split) {
+                        self.focus_terminal();
+                        let target = SerialTarget {
+                            port,
+                            settings: line,
+                        };
+                        self.open_serial(id, target, Some(host));
+                    }
+                }
+                None => self.queued.push(Command::Notice(format!(
+                    "The connection {host} has no COM port: press F2 on it and fill one in."
+                ))),
+            }
+            return;
+        }
+        if let Some(p) = self.settings.profile(host)
+            && !matches!(p.kind, SessionKind::Ssh | SessionKind::Telnet)
+        {
+            let (kind, via) = (p.kind, p.via.clone());
+            self.open_desktop_session(host, kind, via, split);
+            return;
+        }
+        if let Some(id) = self.host_pane_for(split) {
+            self.focus_terminal();
+            self.connect(id, host);
+        }
+    }
+
+    /// Connect to...: asks for a destination in `pane` if it is already
+    /// waiting at the connect prompt, else in a new tab, so the shells
+    /// already open keep running.
+    fn connect_in_new_tab(&mut self, pane: PaneId) {
+        let idle = matches!(
+            self.panes.get(&pane).map(|p| &p.host),
+            Some(Host::Ask(t)) if t.is_empty()
+        );
+        let id = if idle { pane } else { self.new_tab_pane() };
+        self.focus_terminal();
+        self.ask_destination(id);
+    }
+
+    /// Open local shell: starts it in `pane` if that waits at the connect
+    /// prompt or holds a local shell that ended, else in a new tab, so a
+    /// running SSH, Telnet, serial or tmux session is never ended.
+    fn local_shell_in_new_tab(&mut self, pane: PaneId) {
+        let idle = match self.panes.get(&pane).map(|p| &p.host) {
+            Some(Host::Ask(t)) => t.is_empty(),
+            Some(Host::Local { exited, .. }) => *exited,
+            _ => false,
+        };
+        // From a live local shell, in its folder.
+        let dir = self.panes.get(&pane).and_then(|p| match p.host {
+            Host::Local { exited: false, .. } => p.local_cwd.clone(),
+            _ => None,
+        });
+        let id = if idle { pane } else { self.new_tab_pane() };
+        self.focus_terminal();
+        self.start_shell_in(id, dir.as_deref());
+    }
+
+    /// Gives the keyboard back to the focused pane. Unless Settings >
+    /// Keep tools open is on, the terminal covers the tool again.
+    fn focus_terminal(&mut self) {
+        if self.side.visible && !self.settings.tools_pinned {
+            self.hide_side();
+        }
+        if self.side.focused {
+            self.side.focused = false;
+            self.refresh_chrome();
+            self.request_full_redraw();
+        }
+        let id = self.focused_id();
+        if let Some(p) = self.panes.get_mut(&id)
+            && let Some(c) = p.cursor
+        {
+            p.grid.mark_dirty(c.y);
+        }
+        self.refresh(id);
+    }
+
+    /// Shows the side pane in `view`; the connection manager re-reads
+    /// ssh_config, file transfer opens SFTP if it is not open.
+    fn show_side(&mut self, view: SideView, focus: bool) {
+        self.side.view = view;
+        self.rename_return = None;
+        match view {
+            SideView::Sessions => {
+                let env = ssh_env();
+                self.side.list.set_hosts(
+                    host_items(&env, &self.settings),
+                    self.settings.favourites.clone(),
+                );
+            }
+            SideView::Files => {
+                // Opening the view lists the focused pane's directory.
+                self.files_pane = None;
+                self.ensure_sftp(self.focused_id());
+            }
+            SideView::Forwards | SideView::Palette => {}
+            SideView::Live => {
+                let all = self.open_sessions();
+                self.live_view.reset(&all);
+            }
+            SideView::Snippets => {
+                let place = self.place(self.focused_id()).map(|p| p.0);
+                self.snippets_view.set_place(place);
+                if !self.snippets_view.editing()
+                    && !self.snippets_view.asking()
+                    && !self.snippets_view.reporting()
+                {
+                    self.reload_snippets();
+                    self.snippets_view.reset();
+                }
+            }
+        }
+        if !self.side.visible {
+            let min = scale(toolpane::MIN_SHOWN_DIP, self.dpi);
+            self.side.shown = toolpane::reopen(self.side.shown, self.side.width, min);
+        }
+        self.side.visible = true;
+        self.side.focused = focus;
+        self.layout();
+        self.update_menu_checks();
+    }
+
+    /// Tools > Connection manager, Session manager, File transfer,
+    /// Port forwards or Command snippets (`id`). The shortcut first moves
+    /// the focus to a pane that is open but not focused, then hides it; a
+    /// menu click (`from_menu`) hides it at once, since its checkmark says
+    /// the pane is open.
+    fn toggle_side(&mut self, id: u32, from_menu: bool) {
+        let view = match id {
+            cmd::FILES => SideView::Files,
+            cmd::FORWARDS => SideView::Forwards,
+            cmd::SNIPPETS => SideView::Snippets,
+            cmd::LIVE => SideView::Live,
+            _ => SideView::Sessions,
+        };
+        let open = self.side.visible && self.side.view == view;
+        match side_toggle(open, self.side.focused, from_menu) {
+            SideToggle::Show => {
+                self.snippets_peek = view == SideView::Snippets && !self.side.visible;
+                self.show_side(view, true);
+            }
+            SideToggle::Hide => self.hide_side(),
+            SideToggle::Focus => {
+                self.side.focused = true;
+                self.refresh_chrome();
+                self.request_full_redraw();
+                self.refresh(self.focused_id());
+            }
+        }
+        self.update_menu_checks();
+    }
+
+    fn hide_side(&mut self) {
+        self.rename_return = None;
+        self.snippets_peek = false;
+        self.palette_return = None;
+        self.side.visible = false;
+        self.side.focused = false;
+        self.layout();
+        self.update_menu_checks();
+    }
+
+    /// A pane for a new tab, with the default look.
+    fn new_tab_pane(&mut self) -> PaneId {
+        let id = self.ws.new_tab();
+        self.add_pane(id);
+        self.after_structure_change();
+        id
+    }
+
+    fn add_pane(&mut self, id: PaneId) {
+        let font = FontSpec::default();
+        let metrics = self
+            .renderer
+            .metrics(&font, self.dpi)
+            .unwrap_or(self.chrome_metrics);
+        let pane = new_pane(
+            id,
+            font,
+            self.default_theme.clone(),
+            metrics,
+            self.settings.scrollback,
+        );
+        self.panes.insert(id, pane);
+    }
+
+    /// Splits the focused pane; the new pane takes the focus.
+    fn split(&mut self, side: Dir) -> Option<PaneId> {
+        let id = self.ws.split(side)?;
+        self.add_pane(id);
+        self.after_structure_change();
+        Some(id)
+    }
+
+    /// Opens a new pane like `from`: the same host as a new channel on its
+    /// connection, a local shell, or the connect prompt, in the directory
+    /// `from`'s shell is in where FeroSSH knows it (SSH: OSC 7 or the
+    /// prompt; local: the cmd or PowerShell prompt). Telnet has no login
+    /// FeroSSH can tell, so it starts where it starts.
+    fn fill_like(&mut self, id: PaneId, from: PaneId) {
+        enum Like {
+            Ssh(Box<Target>),
+            Telnet(TelnetTarget),
+            Local,
+            Ask,
+        }
+        let from = self.host_pane(from);
+        let (cwd, local_cwd) = self
+            .panes
+            .get(&from)
+            .map(|p| (p.cwd.clone(), p.local_cwd.clone()))
+            .unwrap_or_default();
+        // A COM port opens once, so a split of a serial console asks.
+        let like = match self.panes.get(&from).map(|p| &p.host) {
+            Some(Host::Ssh(s)) => Like::Ssh(Box::new(s.target.clone())),
+            Some(Host::Telnet(s)) => Like::Telnet(s.target.clone()),
+            Some(Host::Local { .. }) => Like::Local,
+            _ => Like::Ask,
+        };
+        match like {
+            Like::Ssh(target) => {
+                self.connect_to(id, *target, &ssh_env());
+                if let Some(p) = self.panes.get_mut(&id) {
+                    p.start_dir = cwd;
+                }
+            }
+            Like::Telnet(target) => self.connect_telnet(id, target),
+            Like::Local => self.start_shell_in(id, local_cwd.as_deref()),
+            Like::Ask => self.ask_destination(id),
+        }
+    }
+
+    /// After tabs or panes changed: lay out, redraw, retitle.
+    fn after_structure_change(&mut self) {
+        if let Some(p) = self.panes.get_mut(&self.ws.focused()) {
+            p.bell = false;
+        }
+        self.layout();
+        self.update_title();
+        self.update_menu_checks();
+    }
+
+    /// Closes a pane; the last one closes the window. A tmux pane is
+    /// closed in tmux, and goes when tmux says it went.
+    fn close_pane(&mut self, id: PaneId) -> Option<Command> {
+        if let Some(gateway) = self.panes.get(&id).and_then(Pane::gateway)
+            && let Some(t) = self.tmux.get_mut(&gateway).filter(|t| t.active())
+        {
+            let actions = t.close(id);
+            self.run_tmux(gateway, actions);
+            return None;
+        }
+        self.reattach.remove(&id);
+        match self.ws.close(id) {
+            Some(Closed::Window) => return Some(Command::Destroy),
+            Some(_) => {}
+            None => return None,
+        }
+        self.end_host(id);
+        self.panes.remove(&id);
+        if self.mouse.pane == Some(id) {
+            self.mouse.pane = None;
+        }
+        self.after_structure_change();
+        None
+    }
+
+    /// Focuses a pane (and its tab).
+    fn focus_pane(&mut self, id: PaneId) {
+        let before = self.focused_id();
+        let tab_before = self.ws.active;
+        if !self.ws.focus(id) {
+            return;
+        }
+        if before != id {
+            if tab_before == self.ws.active {
+                self.last_pane = Some(before);
+            } else {
+                self.last_tab_pane = Some(before);
+            }
+        }
+        let was_side = std::mem::take(&mut self.side.focused);
+        if before == id && tab_before == self.ws.active && !was_side {
+            return;
+        }
+        if let Some(p) = self.panes.get_mut(&id) {
+            p.bell = false;
+        }
+        for pid in [before, id] {
+            if let Some(p) = self.panes.get_mut(&pid)
+                && let Some(c) = p.cursor
+            {
+                p.grid.mark_dirty(c.y);
+            }
+        }
+        if tab_before != self.ws.active {
+            self.after_structure_change();
+        } else {
+            self.refresh(before);
+            self.refresh(id);
+            self.refresh_chrome();
+            self.update_title();
+            self.update_menu_checks();
+            // The focus frame moves.
+            self.request_full_redraw();
+        }
+    }
+
+    fn select_tab(&mut self, i: usize) {
+        if let Some(focus) = self.ws.tabs.get(i).map(|t| t.focus) {
+            self.focus_pane(focus);
+        }
+    }
+
+    /// The strip around the tools pane's edge where a drag starts.
+    fn edge_grab(&self) -> Option<Rect> {
+        let e = self.areas.side_edge?;
+        let by = scale(EDGE_GRAB_DIP, self.dpi);
+        Some(Rect::new(e.x - by, e.y, e.w + 2 * by, e.h))
+    }
+
+    /// Where a client point falls.
+    fn spot(&self, x: i32, y: i32) -> Spot {
+        let grab = scale(GRAB_DIP, self.dpi);
+        if let Some(e) = self.edge_grab()
+            && e.contains(x, y)
+        {
+            return Spot::SideEdge;
+        }
+        if let Some(s) = self.areas.side
+            && s.contains(x, y)
+        {
+            let cpad = scale(CHROME_PADDING_DIP, self.dpi);
+            let col = ((x - s.x - cpad).max(0) / self.chrome_metrics.width.max(1) as i32) as usize;
+            let row = ((y - s.y - cpad).max(0) / self.chrome_metrics.height.max(1) as i32) as usize;
+            return Spot::Side(col, row);
+        }
+        if let Some(s) = self.areas.strip
+            && s.contains(x, y)
+        {
+            let cpad = scale(CHROME_PADDING_DIP, self.dpi);
+            let col = ((x - s.x - cpad).max(0) / self.strip_metrics.width.max(1) as i32) as usize;
+            return Spot::Strip(col);
+        }
+        if let Some(tab) = self.ws.tab() {
+            for d in tab.root.dividers(self.areas.panes, gap(self.dpi)) {
+                let hit = match d.axis {
+                    Axis::Row => {
+                        Rect::new(d.rect.x - grab, d.rect.y, d.rect.w + 2 * grab, d.rect.h)
+                    }
+                    Axis::Column => {
+                        Rect::new(d.rect.x, d.rect.y - grab, d.rect.w, d.rect.h + 2 * grab)
+                    }
+                };
+                if hit.contains(x, y) {
+                    return Spot::Divider(d);
+                }
+            }
+            for id in tab.root.panes() {
+                if self.panes.get(&id).is_some_and(|p| p.rect.contains(x, y)) {
+                    return Spot::Pane(id);
+                }
+            }
+        }
+        Spot::Nothing
+    }
+
+    /// The mouse cursor for a client point.
+    fn cursor_at(&self, x: i32, y: i32) -> PCWSTR {
+        if let Some(drag) = &self.drag {
+            return match drag {
+                Drag::Divider {
+                    axis: Axis::Row, ..
+                }
+                | Drag::SideEdge => IDC_SIZEWE,
+                Drag::Divider {
+                    axis: Axis::Column, ..
+                } => IDC_SIZENS,
+                Drag::Pane { active: true, .. } | Drag::Tab { out: true, .. } => IDC_SIZEALL,
+                Drag::Pane { .. } => IDC_IBEAM,
+                Drag::Tab { .. } => IDC_ARROW,
+            };
+        }
+        match self.spot(x, y) {
+            Spot::SideEdge => IDC_SIZEWE,
+            Spot::Divider(d) if d.axis == Axis::Row => IDC_SIZEWE,
+            Spot::Divider(_) => IDC_SIZENS,
+            Spot::Pane(_) => IDC_IBEAM,
+            _ => IDC_ARROW,
+        }
+    }
+
+    /// The viewport cell under a client-area point in pane `id`, and
+    /// whether the point is in the cell's right half.
+    fn cell_at(&self, id: PaneId, x: i32, y: i32) -> (usize, usize, bool) {
+        let Some(p) = self.panes.get(&id) else {
+            return (0, 0, false);
+        };
+        let (ox, oy) = p.origin(self.dpi);
+        let m = &p.metrics;
+        let (cw, ch) = (m.width.max(1) as i32, m.height.max(1) as i32);
+        let (rx, ry) = ((x - ox).max(0), (y - oy).max(0));
+        let col = ((rx / cw) as usize).min(p.term.cols().saturating_sub(1));
+        let row = ((ry / ch) as usize).min(p.term.rows().saturating_sub(1));
+        (col, row, rx % cw >= cw / 2)
+    }
+
+    fn capture(&self, on: bool) {
+        capture(self.hwnd, on);
+    }
+
+    /// A button press or release anywhere in the client.
+    fn on_button(
+        &mut self,
+        button: MouseButton,
+        down: bool,
+        (x, y): (i32, i32),
+        mods: Mods,
+    ) -> Option<Command> {
+        self.mouse.at = (x, y);
+        if !down {
+            if button == MouseButton::Left
+                && let Some(drag) = self.drag.take()
+            {
+                self.capture(false);
+                return self.end_drag(drag, (x, y));
+            }
+            let id = self.mouse.pane.take()?;
+            return self.pane_button(id, button, false, (x, y), mods);
+        }
+        let spot = self.spot(x, y);
+        if self.side.visible
+            && !self.settings.tools_pinned
+            && matches!(spot, Spot::Strip(_) | Spot::Divider(_) | Spot::Nothing)
+        {
+            // Pin off: a click anywhere outside the tools (the tab strip,
+            // a divider, a pane's margin) ends the peek, as one on a pane
+            // does. The click only does that, since everything moves.
+            self.hide_side();
+            return None;
+        }
+        match spot {
+            Spot::SideEdge if button == MouseButton::Left => {
+                self.capture(true);
+                self.drag = Some(Drag::SideEdge);
+                None
+            }
+            Spot::Side(col, row) => {
+                if !self.side.focused {
+                    self.side.focused = true;
+                    self.request_full_redraw();
+                }
+                if button == MouseButton::Right
+                    && self.side.view == SideView::Sessions
+                    && self.side.form.is_none()
+                    && self.side.import.is_none()
+                {
+                    let visible = SessionList::visible(self.side.grid.rows());
+                    self.side.list.select_at(row, visible);
+                    self.refresh_chrome();
+                    return Some(Command::SessionMenu(self.side.list.selected_host()));
+                }
+                if button != MouseButton::Left {
+                    self.refresh_chrome();
+                    return None;
+                }
+                // SAFETY: plain query.
+                let limit = Duration::from_millis(u64::from(unsafe { GetDoubleClickTime() }));
+                let now = Instant::now();
+                let double = self
+                    .side
+                    .last_click
+                    .is_some_and(|(at, r)| r == row && now - at <= limit);
+                self.side.last_click = Some((now, row));
+                if self.side.view == SideView::Forwards {
+                    let view = self.forward_view();
+                    let rows = self.side.grid.rows();
+                    self.forwards_view.click(row, &view, rows);
+                    self.refresh_chrome();
+                    return None;
+                }
+                if self.side.view == SideView::Live {
+                    let all = self.open_sessions();
+                    let rows = self.side.grid.rows();
+                    // A click ends a rename; the pane stays as it is now.
+                    self.rename_return = None;
+                    let action = self.live_view.click(row, double, &all, rows);
+                    self.refresh_chrome();
+                    return self.live_action(action);
+                }
+                if self.side.view == SideView::Palette {
+                    let action = self.palette.click(row, double, self.side.grid.rows());
+                    return self.palette_action(action);
+                }
+                if self.side.view == SideView::Snippets {
+                    let rows = self.side.grid.rows();
+                    self.snippets_view.click(row, &self.settings.snippets, rows);
+                    if double && !self.snippets_view.editing() {
+                        // A double-click picks a host, or runs a snippet
+                        // or shows a report row's session.
+                        let key = if self.snippets_view.picking() {
+                            if row < snippets_view::PICK_HEAD {
+                                self.refresh_chrome();
+                                return None;
+                            }
+                            SideKey::Char(' ')
+                        } else {
+                            SideKey::Enter { split: false }
+                        };
+                        let action = self.snippets_view.key(key, &self.settings.snippets, rows);
+                        return self.snippets_action(action);
+                    }
+                    self.refresh_chrome();
+                    return None;
+                }
+                if let Some(form) = &mut self.side.form {
+                    let action = form.click(col, row, self.side.grid.rows());
+                    return self.form_action(action);
+                }
+                if let Some(view) = &mut self.side.import {
+                    let action = view.click(col, row, self.side.grid.rows());
+                    return self.import_action(action);
+                }
+                let visible = SessionList::visible(self.side.grid.rows());
+                let action = self.side.list.click(row, double, visible);
+                self.side_action(action)
+            }
+            Spot::Strip(col) => {
+                match (button, self.strip_layout.hit(col)) {
+                    (MouseButton::Left, Some(Hit::Tab(i))) => {
+                        // SAFETY: plain query.
+                        let limit =
+                            Duration::from_millis(u64::from(unsafe { GetDoubleClickTime() }));
+                        let now = Instant::now();
+                        let double = self
+                            .tab_click
+                            .is_some_and(|(at, t)| t == i && now - at <= limit);
+                        if double {
+                            // A double-click renames the tab's session.
+                            self.tab_click = None;
+                            self.select_tab(i);
+                            if let Some(focus) = self.ws.tabs.get(i).map(|t| t.focus) {
+                                self.start_rename(focus);
+                            }
+                            return None;
+                        }
+                        self.tab_click = Some((now, i));
+                        // The tab a drag below the strip shows: the one
+                        // active before, or a neighbour.
+                        let before = self.ws.active;
+                        let home_tab = if before != i {
+                            Some(before)
+                        } else if i > 0 {
+                            Some(i - 1)
+                        } else {
+                            (self.ws.tabs.len() > 1).then_some(1)
+                        };
+                        let home = home_tab.and_then(|t| self.ws.tabs.get(t)).map(|t| t.focus);
+                        self.select_tab(i);
+                        self.capture(true);
+                        self.drag = Some(Drag::Tab {
+                            index: i,
+                            home,
+                            out: false,
+                        });
+                    }
+                    (MouseButton::Left, Some(Hit::Close(i))) => {
+                        return Some(Command::CloseTab(i));
+                    }
+                    (MouseButton::Left, Some(Hit::NewTab)) => {
+                        return Some(Command::Id(cmd::NEW_TAB));
+                    }
+                    // Middle-click closes a tab, as in browsers.
+                    (MouseButton::Middle, Some(Hit::Tab(i) | Hit::Close(i))) => {
+                        return Some(Command::CloseTab(i));
+                    }
+                    (MouseButton::Right, Some(Hit::Tab(i) | Hit::Close(i))) => {
+                        self.select_tab(i);
+                        return Some(Command::TabMenu(i));
+                    }
+                    _ => {}
+                }
+                None
+            }
+            Spot::Divider(d) if button == MouseButton::Left => {
+                self.capture(true);
+                self.drag = Some(Drag::Divider {
+                    path: d.path,
+                    axis: d.axis,
+                    span: d.span,
+                });
+                None
+            }
+            Spot::Pane(id) => {
+                if self.side.visible && !self.settings.tools_pinned {
+                    // A peek ends: the terminal covers the tool again.
+                    // The click only does that, since the panes move.
+                    self.hide_side();
+                    self.focus_pane(id);
+                    return None;
+                }
+                self.focus_pane(id);
+                if button == MouseButton::Left && mods.ctrl && mods.shift {
+                    self.capture(true);
+                    self.drag = Some(Drag::Pane {
+                        id,
+                        start: (x, y),
+                        active: false,
+                    });
+                    return None;
+                }
+                self.mouse.pane = Some(id);
+                self.pane_button(id, button, true, (x, y), mods)
+            }
+            _ => None,
+        }
+    }
+
+    /// Finishes a drag.
+    fn end_drag(&mut self, drag: Drag, (x, y): (i32, i32)) -> Option<Command> {
+        if let Drag::Tab {
+            index, out: true, ..
+        } = drag
+        {
+            let joined = match self.spot(x, y) {
+                Spot::Pane(target)
+                    if self.ws.tab_of(target) != Some(index)
+                        && !self.locked_tab(index)
+                        && !self.locked(target) =>
+                {
+                    let r = self.panes.get(&target).map(|p| p.rect).unwrap_or_default();
+                    self.ws.join_tab(index, target, layout::join_side(r, x, y))
+                }
+                _ => false,
+            };
+            if !joined && let Some(focus) = self.ws.tabs.get(index).map(|t| t.focus) {
+                // Dropped elsewhere: back to the dragged tab.
+                self.ws.focus(focus);
+            }
+            self.after_structure_change();
+            self.request_full_redraw();
+            return None;
+        }
+        if let Drag::Pane {
+            id, active: true, ..
+        } = drag
+            && !self.locked(id)
+        {
+            let moved = if self.areas.strip.is_some_and(|s| s.contains(x, y)) {
+                self.ws.pane_to_tab(id)
+            } else if let Spot::Pane(target) = self.spot(x, y) {
+                let r = self.panes.get(&target).map(|p| p.rect).unwrap_or_default();
+                self.ws.move_pane(id, target, layout::drop_zone(r, x, y))
+            } else {
+                false
+            };
+            if moved {
+                self.after_structure_change();
+            } else {
+                // Back to the pane's own tab, if the drag showed another.
+                let shown = self.ws.active;
+                self.ws.focus(id);
+                if self.ws.active != shown {
+                    self.after_structure_change();
+                }
+                self.request_full_redraw();
+            }
+        }
+        None
+    }
+
+    /// The tab under client x in the strip, if any.
+    fn strip_tab_at(&self, x: i32) -> Option<usize> {
+        let s = self.areas.strip?;
+        let cpad = scale(CHROME_PADDING_DIP, self.dpi);
+        let col = ((x - s.x - cpad).max(0) / self.strip_metrics.width.max(1) as i32) as usize;
+        match self.strip_layout.hit(col)? {
+            Hit::Tab(i) | Hit::Close(i) => Some(i),
+            Hit::NewTab => None,
+        }
+    }
+
+    fn on_mouse_move(&mut self, (x, y): (i32, i32), mods: Mods) {
+        self.mouse.at = (x, y);
+        let hover = self.strip_tab_at(x);
+        if let Some(drag) = &mut self.drag {
+            match drag {
+                Drag::Divider { path, axis, span } => {
+                    let ratio = match axis {
+                        Axis::Row => (x - span.x) as f32 / span.w.max(1) as f32,
+                        Axis::Column => (y - span.y) as f32 / span.h.max(1) as f32,
+                    };
+                    let path = path.clone();
+                    let active = self.ws.active;
+                    if let Some(tab) = self.ws.tabs.get_mut(active) {
+                        tab.root.set_ratio(&path, ratio);
+                    }
+                    self.layout();
+                }
+                Drag::SideEdge => {
+                    let min = scale(toolpane::MIN_SHOWN_DIP, self.dpi);
+                    let to = toolpane::drag(x, &self.tools_input(), min);
+                    self.side.width = to.width;
+                    match (self.side.visible, to.open) {
+                        (true, false) => {
+                            // Opened again later, it shows whole.
+                            self.side.shown = 0;
+                            self.hide_side();
+                        }
+                        (false, true) => {
+                            // Uncovering from the rail: the tool shown last
+                            // (not the command palette, which opens alone).
+                            self.side.shown = to.shown;
+                            let view = match self.side.view {
+                                SideView::Palette => SideView::Sessions,
+                                v => v,
+                            };
+                            self.show_side(view, false);
+                        }
+                        _ => {
+                            self.side.shown = to.shown;
+                            self.layout();
+                        }
+                    }
+                    self.update_menu_checks();
+                }
+                Drag::Tab { index, home, out } => {
+                    let Some(s) = self.areas.strip else {
+                        return;
+                    };
+                    let in_strip = y < s.bottom();
+                    if *out && in_strip {
+                        // Back over the strip: another tab shows that tab
+                        // to drop into; the dragged one goes back to
+                        // moving it along the strip.
+                        match hover {
+                            Some(i) if i != *index => {
+                                let focus = self.ws.tabs.get(i).map(|t| t.focus);
+                                if focus.is_some() && focus != *home {
+                                    *home = focus;
+                                    if let Some(f) = focus {
+                                        self.ws.focus(f);
+                                    }
+                                    self.after_structure_change();
+                                }
+                            }
+                            _ => {
+                                *out = false;
+                                if let Some(f) = self.ws.tabs.get(*index).map(|t| t.focus) {
+                                    self.ws.focus(f);
+                                }
+                                self.after_structure_change();
+                            }
+                        }
+                        self.request_full_redraw();
+                        return;
+                    }
+                    let below = home.is_some() && !in_strip;
+                    if below != *out {
+                        // Show the tab to drop into, or the dragged one again.
+                        *out = below;
+                        let shown = if below {
+                            *home
+                        } else {
+                            self.ws.tabs.get(*index).map(|t| t.focus)
+                        };
+                        if let Some(focus) = shown {
+                            self.ws.focus(focus);
+                        }
+                        self.after_structure_change();
+                        self.request_full_redraw();
+                        return;
+                    }
+                    if *out {
+                        self.request_full_redraw();
+                        return;
+                    }
+                    let cpad = scale(CHROME_PADDING_DIP, self.dpi);
+                    let col =
+                        ((x - s.x - cpad).max(0) / self.strip_metrics.width.max(1) as i32) as usize;
+                    let to = self.strip_layout.slot(col);
+                    if to != *index {
+                        let from = *index;
+                        *index = to;
+                        self.ws.move_tab(from, to);
+                        self.refresh_chrome();
+                        self.update_menu_checks();
+                    }
+                }
+                Drag::Pane { id, start, active } => {
+                    if !*active
+                        && ((x - start.0).abs() > DRAG_START_PX
+                            || (y - start.1).abs() > DRAG_START_PX)
+                    {
+                        *active = true;
+                    }
+                    if *active {
+                        // Over a tab in the strip: show it, to drop the
+                        // pane into one of its panes.
+                        let id = *id;
+                        let over_strip = self.areas.strip.is_some_and(|s| s.contains(x, y));
+                        if let Some(i) = hover.filter(|_| over_strip)
+                            && i != self.ws.active
+                            && let Some(f) = self.ws.tabs.get(i).map(|t| t.focus)
+                        {
+                            let f = if self.ws.tab_of(id) == Some(i) { id } else { f };
+                            self.ws.focus(f);
+                            self.after_structure_change();
+                        }
+                        self.request_full_redraw();
+                    }
+                }
+            }
+            return;
+        }
+        // Motion goes to the pane holding the button, or the one under the
+        // mouse for hover reports.
+        let id = match self.mouse.pane {
+            Some(id) => id,
+            None => match self.spot(x, y) {
+                Spot::Pane(id) => id,
+                _ => return,
+            },
+        };
+        let (col, row, right_half) = self.cell_at(id, x, y);
+        let dpi = self.dpi;
+        let Some(p) = self.panes.get_mut(&id) else {
+            return;
+        };
+        let mut reply = None;
+        if p.term.mouse_reporting() && self.mouse.last_cell != Some((col, row)) {
+            self.mouse.last_cell = Some((col, row));
+            let event = MouseEvent::Motion(self.mouse.reporting);
+            reply = p.term.mouse(event, col, row, mods);
+        }
+        if self.mouse.selecting && self.mouse.pane == Some(id) {
+            // Dragging past the top or bottom edge scrolls the history.
+            let (_, oy) = p.origin(dpi);
+            let bottom = oy + p.term.rows() as i32 * p.metrics.height as i32;
+            if y < oy {
+                p.term.scroll_lines(1);
+            } else if y >= bottom {
+                p.term.scroll_lines(-1);
+            }
+            p.term.select_update(col, row, right_half);
+            self.refresh(id);
+        }
+        if let Some(bytes) = reply {
+            self.send(id, bytes);
+        }
+    }
+
+    /// A button event inside pane `id`.
+    fn pane_button(
+        &mut self,
+        id: PaneId,
+        button: MouseButton,
+        down: bool,
+        (x, y): (i32, i32),
+        mods: Mods,
+    ) -> Option<Command> {
+        let (col, row, right_half) = self.cell_at(id, x, y);
+        let copy_on_select = self.settings.copy_on_select;
+        let right_click_paste = self.settings.right_click_paste;
+        let hwnd = self.hwnd;
+        let p = self.panes.get_mut(&id)?;
+        if !down {
+            capture(hwnd, false);
+            if self.mouse.reporting == Some(button) {
+                self.mouse.reporting = None;
+                if let Some(bytes) = p.term.mouse(MouseEvent::Release(button), col, row, mods) {
+                    self.send(id, bytes);
+                }
+                return None;
+            }
+            if button == MouseButton::Left
+                && std::mem::take(&mut self.mouse.selecting)
+                && copy_on_select
+                && p.term.has_selection()
+            {
+                return Some(Command::Id(cmd::COPY));
+            }
+            return None;
+        }
+
+        capture(hwnd, true);
+        // Shift-click always selects, even when the host wants the mouse.
+        if p.term.mouse_reporting() && !mods.shift {
+            let reply = p.term.mouse(MouseEvent::Press(button), col, row, mods);
+            self.mouse.reporting = Some(button);
+            self.mouse.last_cell = Some((col, row));
+            if let Some(bytes) = reply {
+                self.send(id, bytes);
+            }
+            return None;
+        }
+        match button {
+            MouseButton::Left => {
+                if mods.ctrl
+                    && let Some(link) = p.term.link_at(col, row)
+                {
+                    return Some(Command::OpenLink(link));
+                }
+                // SAFETY: plain query.
+                let double = Duration::from_millis(u64::from(unsafe { GetDoubleClickTime() }));
+                let now = Instant::now();
+                let count = match self.mouse.last_click {
+                    Some((at, cell, n)) if now - at <= double && cell == (col, row) => n % 3 + 1,
+                    _ => 1,
+                };
+                self.mouse.last_click = Some((now, (col, row), count));
+                let kind = match count {
+                    2 => SelectionKind::Word,
+                    3 => SelectionKind::Line,
+                    _ if mods.alt => SelectionKind::Block,
+                    _ => SelectionKind::Simple,
+                };
+                p.term.select_start(col, row, right_half, kind);
+                self.mouse.selecting = true;
+                self.refresh(id);
+            }
+            MouseButton::Right if right_click_paste => {
+                return Some(Command::Id(cmd::PASTE));
+            }
+            _ => {}
+        }
+        None
+    }
+
+    fn on_wheel(&mut self, delta: i16, screen: (i32, i32), mods: Mods) -> Option<Command> {
+        let mut pt = POINT {
+            x: screen.0,
+            y: screen.1,
+        };
+        // SAFETY: our window and a local point.
+        let _ = unsafe { ScreenToClient(self.hwnd, &mut pt) };
+        self.mouse.wheel_rest += i32::from(delta);
+        let lines = self.mouse.wheel_rest / WHEEL_PER_LINE;
+        if lines == 0 {
+            return None;
+        }
+        self.mouse.wheel_rest -= lines * WHEEL_PER_LINE;
+        let id = match self.spot(pt.x, pt.y) {
+            Spot::Side(..) => {
+                if self.side.view == SideView::Forwards {
+                    let view = self.forward_view();
+                    let rows = self.side.grid.rows();
+                    self.forwards_view.scroll_by(lines, &view, rows);
+                } else if self.side.view == SideView::Live {
+                    let all = self.open_sessions();
+                    let rows = self.side.grid.rows();
+                    self.live_view.scroll_by(lines, &all, rows);
+                } else if self.side.view == SideView::Palette {
+                    self.palette.scroll_by(lines, self.side.grid.rows());
+                } else if self.side.view == SideView::Snippets {
+                    let rows = self.side.grid.rows();
+                    self.snippets_view
+                        .scroll_by(lines, &self.settings.snippets, rows);
+                } else if let Some(form) = &mut self.side.form {
+                    form.scroll_by(lines, self.side.grid.rows());
+                } else if let Some(view) = &mut self.side.import {
+                    view.scroll_by(lines, self.side.grid.rows());
+                } else {
+                    let visible = SessionList::visible(self.side.grid.rows());
+                    self.side.list.scroll_by(lines, visible);
+                }
+                self.refresh_chrome();
+                return None;
+            }
+            Spot::Pane(id) => id,
+            _ => self.focused_id(),
+        };
+        if mods.ctrl {
+            self.focus_pane(id);
+            let cmd = if delta > 0 {
+                cmd::ZOOM_IN
+            } else {
+                cmd::ZOOM_OUT
+            };
+            return Some(Command::Id(cmd));
+        }
+        let (col, row, _) = self.cell_at(id, pt.x, pt.y);
+        let reply = self
+            .panes
+            .get_mut(&id)
+            .and_then(|p| p.term.wheel(lines, col, row, mods));
+        if let Some(bytes) = reply {
+            self.send(id, bytes);
+        }
+        self.refresh(id);
+        None
+    }
+
+    /// Puts the IME's composition and candidate windows at the focused
+    /// pane's cursor, in its font.
+    fn place_ime(&self) {
+        let Some(p) = self.panes.get(&self.focused_id()) else {
+            return;
+        };
+        let Some(cursor) = p.cursor else {
+            return;
+        };
+        let (ox, oy) = p.origin(self.dpi);
+        let m = &p.metrics;
+        let x = ox + cursor.x as i32 * m.width as i32;
+        let y = oy + cursor.y as i32 * m.height as i32;
+        let mut font = LOGFONTW {
+            lfHeight: -(m.em_px.round() as i32),
+            ..Default::default()
+        };
+        for (dst, src) in font
+            .lfFaceName
+            .iter_mut()
+            .take(31)
+            .zip(p.font.family.encode_utf16())
+        {
+            *dst = src;
+        }
+        // SAFETY: our window's input context, released below; the structs
+        // are valid locals.
+        unsafe {
+            let himc = ImmGetContext(self.hwnd);
+            if himc.is_invalid() {
+                return;
+            }
+            let composition = COMPOSITIONFORM {
+                dwStyle: CFS_POINT,
+                ptCurrentPos: POINT { x, y },
+                rcArea: RECT::default(),
+            };
+            let _ = ImmSetCompositionWindow(himc, &composition);
+            let candidate = CANDIDATEFORM {
+                dwIndex: 0,
+                dwStyle: CFS_CANDIDATEPOS,
+                ptCurrentPos: POINT {
+                    x,
+                    y: y + m.height as i32,
+                },
+                rcArea: RECT::default(),
+            };
+            let _ = ImmSetCandidateWindow(himc, &candidate);
+            let _ = ImmSetCompositionFontW(himc, &font);
+            let _ = ImmReleaseContext(self.hwnd, himc);
+        }
+    }
+
+    fn save_settings(&mut self) {
+        if let Err(e) = write_app_file(&settings_path(), &self.settings.to_text()) {
+            let id = self.focused_id();
+            self.show(
+                id,
+                &format!(
+                    "\r\n\x1b[0;31mCould not save settings to {}: {e}\x1b[0m\r\n",
+                    settings_path().display()
+                ),
+            );
+            self.refresh(id);
+        }
+    }
+
+    /// Saves a changed remote app clipboard setting and applies it at once
+    /// to every remote app running (each still within its connection's
+    /// limit).
+    fn apply_app_clipboard(&mut self) {
+        self.save_settings();
+        self.update_menu_checks();
+        let running = ferostream_client::win32::sessions();
+        self.app_clip_limits.retain(|id, _| running.contains(id));
+        for (&id, limit) in &self.app_clip_limits {
+            ferostream_client::win32::set_clipboard(
+                id,
+                crate::stream::app_clipboard(&self.settings, limit.as_deref()),
+            );
+        }
+    }
+
+    /// Runs a menu command that needs no call back into the window.
+    fn command(&mut self, id: u32) -> Option<Command> {
+        let pane = self.focused_id();
+        match id {
+            cmd::EXIT => return Some(Command::Exit),
+            cmd::CLOSE_TAB => return Some(Command::CloseTab(self.ws.active)),
+            cmd::RENAME => self.start_rename(pane),
+            cmd::STANDBY_STATUS => {
+                let what = self.standby_what();
+                return Some(Command::Notice(
+                    self.standby
+                        .details(&hotkey_label(self.standby_key()), &what),
+                ));
+            }
+            cmd::STANDBY_TOGGLE => {
+                if self.standby.held.is_some() {
+                    self.settings.standby = false;
+                    self.restore_hidden();
+                    self.save_settings();
+                    self.apply_standby();
+                } else {
+                    return Some(self.standby_on(None));
+                }
+            }
+            cmd::STANDBY_PICK => return Some(Command::PickStandbyHotkey),
+            cmd::STANDBY_OWN => {
+                self.restore_hidden();
+                self.settings.standby_target = None;
+                self.standby.target = None;
+                return Some(self.standby_on(None));
+            }
+            id if (cmd::STANDBY_TARGET..cmd::STANDBY_TARGET + standby::MAX_CANDIDATES as u32)
+                .contains(&id) =>
+            {
+                let picked = self
+                    .standby
+                    .candidates
+                    .get((id - cmd::STANDBY_TARGET) as usize)
+                    .cloned()?;
+                self.restore_hidden();
+                self.settings.standby_target = Some(picked.exe);
+                self.standby.target = Some(picked.hwnd);
+                return Some(self.standby_on(None));
+            }
+            id if (cmd::STANDBY_PRESET..cmd::STANDBY_PRESET + STANDBY_PRESETS as u32)
+                .contains(&id) =>
+            {
+                let key = standby_presets()
+                    .get((id - cmd::STANDBY_PRESET) as usize)
+                    .copied();
+                return Some(self.standby_on(key));
+            }
+            cmd::HIDE_MENU => return Some(Command::SetMenuVisible(!self.menu_visible)),
+            cmd::COPY => return Some(Command::Copy),
+            cmd::PASTE => return Some(Command::Paste),
+            cmd::RECORD_SNIPPET => return self.toggle_recording(),
+            cmd::AUTO_RESPONSES => {
+                self.settings.auto_responses = !self.settings.auto_responses;
+                self.watches.clear();
+                self.save_settings();
+                self.update_menu_checks();
+            }
+            cmd::CONFIRM_PRODUCTION => {
+                self.settings.confirm_production = !self.settings.confirm_production;
+                self.save_settings();
+                self.update_menu_checks();
+            }
+            cmd::TMUX_KEYS => {
+                let on = !self.settings.tmux_keys;
+                self.settings.tmux_keys = on;
+                self.tmux_armed = None;
+                self.tmux_repeat = None;
+                self.save_settings();
+                self.update_menu_checks();
+                let gateways: Vec<PaneId> = self.tmux.keys().copied().collect();
+                for g in gateways {
+                    if let Some(t) = self.tmux.get_mut(&g) {
+                        let actions = t.want_keys(on);
+                        self.run_tmux(g, actions);
+                    }
+                }
+                if on && !self.tmux.values().any(Tmux::active) {
+                    return Some(Command::Notice(
+                        "tmux keybindings work in panes of a tmux session: Session > Attach \
+                         tmux starts one. Then press the tmux prefix (Ctrl+B unless tmux is set \
+                         up with another) and c, %, \", n, p, o, x, d or another window or pane \
+                         key; the prefix and ? lists them."
+                            .into(),
+                    ));
+                }
+            }
+            cmd::SAVE_SNIPPET => {
+                let text = self
+                    .panes
+                    .get_mut(&pane)
+                    .and_then(|p| p.term.selection_text())
+                    .filter(|t| !t.trim().is_empty());
+                let Some(text) = text else {
+                    return Some(Command::Notice(
+                        "Select the text for the script in a pane first, then use Edit > Save \
+                         selection as script."
+                            .into(),
+                    ));
+                };
+                self.snippets_view.new_from(&text);
+                self.show_side(SideView::Snippets, true);
+                self.snippets_peek = false;
+                self.refresh_chrome();
+            }
+            cmd::REPLACE_KEY => return Some(Command::ReplaceHostKey),
+            cmd::IMPORT => return Some(Command::ImportSessions),
+            cmd::IMPORT_SNIPPETS => return Some(Command::ImportSnippets),
+            cmd::SNIPPET_FOLDER => return Some(Command::OpenFolder(snippets_dir())),
+            cmd::LOCAL_SHELL => self.local_shell_in_new_tab(pane),
+            cmd::CONNECT => self.connect_in_new_tab(pane),
+            cmd::RECONNECT => {
+                let pane = self.host_pane(pane);
+                if self.retries.get(&pane).is_some_and(Retry::waiting) {
+                    self.retry_now(pane);
+                } else {
+                    self.reconnect(pane);
+                }
+            }
+            cmd::AUTO_RECONNECT => self.toggle_auto_reconnect(),
+            cmd::NEW_TAB => {
+                // A tmux pane's new tab is a new tmux window.
+                if let Some(gateway) = self.panes.get(&pane).and_then(Pane::gateway) {
+                    let actions = self
+                        .tmux
+                        .get_mut(&gateway)
+                        .map(|t| t.new_tab(pane))
+                        .unwrap_or_default();
+                    self.run_tmux(gateway, actions);
+                    return None;
+                }
+                let id = self.new_tab_pane();
+                self.fill_like(id, pane);
+            }
+            cmd::SPLIT_RIGHT | cmd::SPLIT_DOWN => {
+                let dir = if id == cmd::SPLIT_RIGHT {
+                    Dir::Right
+                } else {
+                    Dir::Down
+                };
+                if let Some(gateway) = self.panes.get(&pane).and_then(Pane::gateway) {
+                    // tmux knows each pane's directory itself.
+                    let actions = self
+                        .tmux
+                        .get_mut(&gateway)
+                        .map(|t| t.split(pane, dir))
+                        .unwrap_or_default();
+                    self.run_tmux(gateway, actions);
+                    return None;
+                }
+                if let Some(new) = self.split(dir) {
+                    self.fill_like(new, pane);
+                }
+            }
+            cmd::CLOSE_PANE => return self.close_pane(pane),
+            cmd::PANE_TO_TAB => {
+                if !self.locked(pane) && self.ws.pane_to_tab(pane) {
+                    self.after_structure_change();
+                }
+            }
+            cmd::JOIN_TAB => {
+                let next = if self.ws.active == 0 {
+                    1
+                } else {
+                    self.ws.active - 1
+                };
+                if !self.locked_tab(self.ws.active)
+                    && !self.locked_tab(next)
+                    && self.ws.join_neighbour()
+                {
+                    self.after_structure_change();
+                }
+            }
+            cmd::TMUX_ATTACH => {
+                let host = self.host_pane(pane);
+                if host != pane {
+                    // Already in tmux: offer the other sessions.
+                    let actions = self
+                        .tmux
+                        .get_mut(&host)
+                        .map(Tmux::pick_session)
+                        .unwrap_or_default();
+                    self.run_tmux(host, actions);
+                    return None;
+                }
+                let name = match self.panes.get(&pane).map(|p| &p.host) {
+                    Some(Host::Ssh(s)) if s.state() == State::Connected && !s.prompt_active() => {
+                        self.settings
+                            .profile(&s.target.alias)
+                            .and_then(|p| p.tmux.clone())
+                            .unwrap_or_else(|| "main".to_owned())
+                    }
+                    _ => return Some(Command::Notice(NOT_IN_SHELL.into())),
+                };
+                self.attach_tmux(pane, &name, true);
+            }
+            cmd::DESKTOP => return self.open_desktop(pane, None),
+            cmd::DESKTOP_TAB => return self.open_desktop(pane, Some(Protocol::Vnc)),
+            cmd::DESKTOP_TAB_RDP => return self.open_desktop(pane, Some(Protocol::Rdp)),
+            cmd::VDESK => return self.open_virtual_desktop(pane, None),
+            cmd::VDESK_STOP => return self.stop_virtual_desktop(pane),
+            cmd::REMOTE_APP => return self.pick_remote_app(pane),
+            cmd::REMOTE_APP_ATTACH => {
+                return self.run_remote_app(
+                    pane,
+                    None,
+                    None,
+                    ferostream_client::transport::AttachTo::Newest,
+                );
+            }
+            cmd::REMOTE_APP_COPY => {
+                self.settings.remote_app_copy_agent = !self.settings.remote_app_copy_agent;
+                self.save_settings();
+                self.update_menu_checks();
+            }
+            cmd::REMOTE_APP_REMOVE => {
+                self.settings.remote_app_remove_agent = !self.settings.remote_app_remove_agent;
+                self.save_settings();
+                self.update_menu_checks();
+            }
+            cmd::REMOTE_APP_CLIP..=cmd::REMOTE_APP_CLIP_LAST => {
+                let way = crate::stream::CLIPBOARD_WAYS
+                    .get((id - cmd::REMOTE_APP_CLIP) as usize)
+                    .copied()
+                    .unwrap_or("off");
+                // Unset means off, so every choice is written down.
+                self.settings.remote_app_clipboard = Some(way.to_owned());
+                self.apply_app_clipboard();
+            }
+            cmd::DESKTOP_CLIP..=cmd::DESKTOP_CLIP_LAST => {
+                let way = ferossh_config::settings::CLIPBOARD_WAYS
+                    .get((id - cmd::DESKTOP_CLIP) as usize)
+                    .copied()
+                    .unwrap_or("off");
+                // Unset means off, so every choice is written down.
+                self.settings.desktop_clipboard = Some(way.to_owned());
+                self.apply_desktop_clipboard();
+            }
+            cmd::DESKTOP_SELECTION => {
+                // Read when a virtual desktop starts.
+                self.settings.desktop_share_selection = !self.settings.desktop_share_selection;
+                self.save_settings();
+                self.update_menu_checks();
+            }
+            cmd::REMOTE_APP_SELECTION => {
+                self.settings.remote_app_share_selection =
+                    !self.settings.remote_app_share_selection;
+                self.apply_app_clipboard();
+            }
+            cmd::TMUX_DETACH | cmd::TMUX_PICK | cmd::TMUX_LAYOUT => {
+                let host = self.host_pane(pane);
+                let Some(t) = self.tmux.get_mut(&host).filter(|t| t.active()) else {
+                    return Some(Command::Notice(
+                        "This pane is not showing a tmux session. Session > Attach tmux \
+                         starts one."
+                            .into(),
+                    ));
+                };
+                let actions = match id {
+                    cmd::TMUX_DETACH => t.detach(),
+                    cmd::TMUX_PICK => t.pick_session(),
+                    _ => {
+                        let mode = match t.mode() {
+                            TmuxMode::Ferossh => TmuxMode::Tmux,
+                            TmuxMode::Tmux => TmuxMode::Ferossh,
+                        };
+                        t.set_mode(mode)
+                    }
+                };
+                self.run_tmux(host, actions);
+                self.update_menu_checks();
+            }
+            cmd::NEXT_TAB | cmd::PREV_TAB => {
+                let mut ws = self.ws.clone();
+                ws.cycle_tab(id == cmd::NEXT_TAB);
+                if let Some(t) = ws.tab() {
+                    let focus = t.focus;
+                    self.focus_pane(focus);
+                }
+            }
+            cmd::TAB_LEFT | cmd::TAB_RIGHT => {
+                let from = self.ws.active;
+                let to = if id == cmd::TAB_LEFT {
+                    from.checked_sub(1)
+                } else {
+                    Some(from + 1).filter(|&t| t < self.ws.tabs.len())
+                };
+                if let Some(to) = to {
+                    self.ws.move_tab(from, to);
+                    self.refresh_chrome();
+                }
+            }
+            id if (cmd::FOCUS..cmd::FOCUS + 4).contains(&id) => {
+                let dir = DIRS.get((id - cmd::FOCUS) as usize).copied()?;
+                let g = gap(self.dpi);
+                let next = self.ws.tab().and_then(|t| {
+                    layout::neighbour(&t.root.layout(self.areas.panes, g), t.focus, dir)
+                });
+                if let Some(next) = next {
+                    self.focus_pane(next);
+                }
+            }
+            id if (cmd::RESIZE..cmd::RESIZE + 4).contains(&id) => {
+                let dir = DIRS.get((id - cmd::RESIZE) as usize).copied()?;
+                let active = self.ws.active;
+                let changed = self
+                    .ws
+                    .tabs
+                    .get_mut(active)
+                    .is_some_and(|t| t.root.resize(t.focus, dir, RESIZE_STEP));
+                if changed {
+                    self.layout();
+                }
+            }
+            id if is_side_pane(id) => self.toggle_side(id, false),
+            cmd::PALETTE => self.toggle_palette(),
+            cmd::RUN_SCRIPT => return self.rerun_script(self.focused_id()),
+            cmd::SIDE_RIGHT => {
+                self.settings.side_pane_right = !self.settings.side_pane_right;
+                self.save_settings();
+                self.update_menu_checks();
+                self.layout();
+            }
+            cmd::TOOLS_RAIL => {
+                self.settings.tools_rail = !self.settings.tools_rail;
+                self.save_settings();
+                self.update_menu_checks();
+                self.layout();
+            }
+            id if (cmd::WINDOW_COLOURS..cmd::WINDOW_COLOURS + WindowColours::ALL.len() as u32)
+                .contains(&id) =>
+            {
+                if let Some(c) = WindowColours::ALL.get((id - cmd::WINDOW_COLOURS) as usize) {
+                    self.settings.window_colours = *c;
+                    self.save_settings();
+                    self.update_menu_checks();
+                    self.refresh_chrome();
+                    self.request_full_redraw();
+                }
+            }
+            cmd::TOOLS_PIN => {
+                self.settings.tools_pinned = !self.settings.tools_pinned;
+                self.save_settings();
+                self.update_menu_checks();
+                self.refresh_chrome();
+            }
+            cmd::TAB_STRIP => {
+                self.settings.tab_strip = !self.settings.tab_strip;
+                self.save_settings();
+                self.update_menu_checks();
+                self.layout();
+            }
+            cmd::SAVE_LOOK => return Some(Command::SaveLook),
+            cmd::START_DIR => return self.start_dir_here(pane),
+            cmd::UPLOAD => {
+                self.ensure_sftp(pane);
+                let Some(key) = self.files_target(pane) else {
+                    return Some(Command::Notice(NOT_CONNECTED.into()));
+                };
+                let listed = self.files_visible() && self.files_key.as_deref() == Some(&key);
+                let dir = self.upload_dir(pane, listed);
+                return Some(Command::PickUpload { key, dir });
+            }
+            cmd::DOWNLOADS => return Some(Command::OpenFolder(self.download_dir())),
+            cmd::ZMODEM => {
+                self.settings.zmodem = !self.settings.zmodem;
+                self.save_settings();
+                self.update_menu_checks();
+            }
+            cmd::VERIFY => {
+                self.settings.verify_transfers = !self.settings.verify_transfers;
+                for remote in self.sftp.values_mut() {
+                    remote.verify = self.settings.verify_transfers;
+                }
+                self.save_settings();
+                self.update_menu_checks();
+                self.refresh_chrome();
+            }
+            cmd::FOLLOW_CD => self.toggle_follow(),
+            cmd::DISCONNECT => {
+                let pane = self.host_pane(pane);
+                if self.retries.contains_key(&pane) {
+                    self.stop_reconnecting(pane);
+                    return None;
+                }
+                self.tmux_lost(pane);
+                let effects = match self.panes.get_mut(&pane).map(|p| &mut p.host) {
+                    Some(Host::Ssh(session))
+                        if matches!(session.state(), State::Connecting | State::Connected) =>
+                    {
+                        session.close()
+                    }
+                    Some(Host::Telnet(session))
+                        if matches!(session.state(), State::Connecting | State::Connected) =>
+                    {
+                        session.close()
+                    }
+                    _ => return None,
+                };
+                self.apply(pane, effects);
+                self.stop_log(pane);
+                self.show(
+                    pane,
+                    "\r\n\x1b[0;90m[Disconnected. Press Enter to reconnect.]\x1b[0m\r\n",
+                );
+                self.refresh_chrome();
+                self.refresh(pane);
+            }
+            cmd::LOG_TOGGLE => {
+                let p = self.panes.get_mut(&pane)?;
+                p.log.enabled = !p.log.enabled;
+                if p.log.enabled {
+                    self.start_log(pane);
+                } else {
+                    let path = p.log.path.clone();
+                    self.stop_log(pane);
+                    if let Some(path) = path {
+                        let text = format!("\x1b[0;90mLog saved to {}\x1b[0m\r\n", path.display());
+                        self.show(pane, &text);
+                    }
+                }
+                self.update_menu_checks();
+                self.refresh(pane);
+            }
+            cmd::LOG_RAW => {
+                // Takes effect for the next log file.
+                let p = self.panes.get_mut(&pane)?;
+                p.log.raw = !p.log.raw;
+                self.update_menu_checks();
+            }
+            cmd::LOG_TIMESTAMPS => {
+                // For every plain log, the open ones too, from the next line.
+                self.settings.log_timestamps = !self.settings.log_timestamps;
+                let stamps = self
+                    .settings
+                    .log_timestamps
+                    .then_some(log_line_time as Clock);
+                for p in self.panes.values_mut() {
+                    if let Some(w) = &mut p.log.writer {
+                        w.set_timestamps(stamps);
+                    }
+                }
+                self.save_settings();
+                self.update_menu_checks();
+            }
+            cmd::SAVE_PANE => return Some(Command::Message(self.save_output(&[pane]))),
+            cmd::SAVE_ALL => {
+                let panes: Vec<PaneId> = self.ws.tabs.iter().flat_map(|t| t.root.panes()).collect();
+                return Some(Command::Message(self.save_output(&panes)));
+            }
+            cmd::LOG_FOLDER => return Some(Command::OpenFolder(log_dir())),
+            cmd::LOG_VERIFY => return Some(Command::VerifyLog),
+            cmd::SERIAL_BREAK => {
+                let pane = self.focused_id();
+                match self.panes.get(&pane).map(|p| &p.host) {
+                    Some(Host::Serial {
+                        port: Some(port), ..
+                    }) => {
+                        port.send_break();
+                        self.show(pane, "\x1b[0;90m[break]\x1b[0m");
+                    }
+                    _ => {
+                        return Some(Command::Notice(
+                            "Send break is for serial consoles: open a COM port first \
+                             (type COM3 at the connect prompt, or make a Serial console \
+                             session)."
+                                .into(),
+                        ));
+                    }
+                }
+            }
+            cmd::BROADCAST_TAB | cmd::BROADCAST_ALL => {
+                let wanted = if id == cmd::BROADCAST_TAB {
+                    broadcast::Scope::Tab
+                } else {
+                    broadcast::Scope::All
+                };
+                self.broadcast = self.broadcast.toggle(wanted);
+                self.update_menu_checks();
+                self.update_title();
+                self.refresh_chrome();
+            }
+            cmd::BROADCAST_SKIP => {
+                let pane = self.focused_id();
+                if let Some(p) = self.panes.get_mut(&pane) {
+                    p.no_broadcast = !p.no_broadcast;
+                }
+                self.update_menu_checks();
+                self.refresh_chrome();
+            }
+            cmd::ZOOM_IN | cmd::ZOOM_OUT | cmd::ZOOM_RESET => {
+                let font = self.panes.get(&pane)?.font.clone();
+                let font = match id {
+                    cmd::ZOOM_IN => font.zoomed(1),
+                    cmd::ZOOM_OUT => font.zoomed(-1),
+                    _ => FontSpec::new(&font.family, FontSpec::DEFAULT_PT),
+                };
+                self.set_font(pane, font);
+            }
+            cmd::TEST_PATTERN => {
+                let p = self.panes.get_mut(&pane)?;
+                p.term.scroll_to_bottom();
+                p.term.feed(pattern::test_pattern().as_bytes());
+                // The pattern asks for nothing, so there are no commands.
+                let _ = self.after_feed();
+            }
+            cmd::FIND => {
+                self.panes.get_mut(&pane)?.term.search_open();
+                self.refresh(pane);
+            }
+            cmd::CLEAR_SCROLLBACK => {
+                self.panes.get_mut(&pane)?.term.clear_scrollback();
+                self.refresh(pane);
+            }
+            cmd::UPDATE_CHECK => {
+                if ferossh_update::public_key().is_none() {
+                    return Some(Command::Message(
+                        "This build of FeroSSH cannot check for updates: it was built without \
+                         the project's update key. Releases are listed at \
+                         https://github.com/jkobierczynski/FeroSSH/releases."
+                            .into(),
+                    ));
+                }
+                self.start_update_check(true);
+            }
+            cmd::UPDATE_WEEKLY => {
+                self.settings.update_check_weekly = !self.settings.update_check_weekly;
+                self.save_settings();
+                self.update_menu_checks();
+            }
+            cmd::ABOUT => {
+                return Some(Command::Message(format!(
+                    "FeroSSH {}\n\nSecure connections. Forged in Rust.\n\n\
+                     https://github.com/jkobierczynski/FeroSSH\n\n\
+                     Dual licensed under MIT or Apache-2.0.",
+                    env!("CARGO_PKG_VERSION")
+                )));
+            }
+            cmd::COPY_ON_SELECT => {
+                self.settings.copy_on_select = !self.settings.copy_on_select;
+                self.save_settings();
+                self.update_menu_checks();
+            }
+            cmd::RIGHT_CLICK_PASTE => {
+                self.settings.right_click_paste = !self.settings.right_click_paste;
+                self.save_settings();
+                self.update_menu_checks();
+            }
+            cmd::SCROLL_PAGE_UP | cmd::SCROLL_PAGE_DOWN | cmd::SCROLL_TOP | cmd::SCROLL_BOTTOM => {
+                let term = &mut self.panes.get_mut(&pane)?.term;
+                match id {
+                    cmd::SCROLL_PAGE_UP => term.scroll_pages(1),
+                    cmd::SCROLL_PAGE_DOWN => term.scroll_pages(-1),
+                    cmd::SCROLL_TOP => term.scroll_to_top(),
+                    _ => term.scroll_to_bottom(),
+                }
+                self.refresh(pane);
+            }
+            id if (cmd::FONT..cmd::FONT + FONT_CHOICES.len() as u32).contains(&id) => {
+                if let Some(family) = FONT_CHOICES.get((id - cmd::FONT) as usize) {
+                    if !self.renderer.has_family(family)
+                        && let Some(url) = font_page(family)
+                    {
+                        return Some(Command::FontPage { family, url });
+                    }
+                    let size = self.panes.get(&pane)?.font.size_pt;
+                    self.set_font(pane, FontSpec::new(family, size));
+                }
+            }
+            id if (cmd::THEME..cmd::THEME + Theme::builtin().len() as u32).contains(&id) => {
+                if let Some(theme) = Theme::builtin().get((id - cmd::THEME) as usize) {
+                    self.set_theme(pane, theme.clone());
+                    // A tmux pane's theme is kept in the session.
+                    self.sync_tmux();
+                    self.refresh_chrome();
+                    self.request_full_redraw();
+                }
+            }
+            _ => {}
+        }
+        None
+    }
+
+    /// Changes a pane's font; the window keeps its size and the grid gains
+    /// or loses cells right away, so a shell started next (the pty-req of
+    /// a new connection) gets the rows and columns that fit.
+    fn set_font(&mut self, id: PaneId, font: FontSpec) {
+        let Ok(metrics) = self.renderer.metrics(&font, self.dpi) else {
+            return;
+        };
+        if let Some(p) = self.panes.get_mut(&id) {
+            p.font = font;
+            p.metrics = metrics;
+        }
+        self.layout();
+        self.update_menu_checks();
+    }
+
+    fn set_theme(&mut self, id: PaneId, theme: Theme) {
+        if let Some(p) = self.panes.get_mut(&id) {
+            p.term.set_theme(&theme);
+            p.theme = theme;
+        }
+        self.update_menu_checks();
+    }
+
+    /// Session > Save font and theme for this host.
+    fn save_look(&mut self) -> std::result::Result<String, String> {
+        let pane = self.focused_id();
+        let p = self.panes.get(&pane).ok_or_else(String::new)?;
+        let host = self.panes.get(&self.host_pane(pane)).map(|g| &g.host);
+        let Some(Host::Ssh(s)) = host else {
+            return Err(
+                "Only a pane connected to an SSH host has a host to save the look for.".into(),
+            );
+        };
+        let host = s.target.alias.clone();
+        let (font, size, theme) = (p.font.family.clone(), p.font.size_pt, p.theme.name);
+        let profile = self.settings.profile_mut(&host);
+        profile.font = Some(font.clone());
+        profile.font_size = Some(size);
+        profile.theme = Some(theme.to_owned());
+        self.save_settings();
+        Ok(format!(
+            "Saved for {host}: {font} {size} pt, {theme} theme. New panes on this host use it."
+        ))
+    }
+
+    fn update_menu_checks(&mut self) {
+        let p = self.panes.get(&self.focused_id());
+        let font = p
+            .and_then(|p| FONT_CHOICES.iter().position(|f| *f == p.font.family))
+            .map_or(u32::MAX, |i| cmd::FONT + i as u32);
+        let theme = p
+            .and_then(|p| Theme::builtin().iter().position(|t| t.name == p.theme.name))
+            .map_or(u32::MAX, |i| cmd::THEME + i as u32);
+        let (log, raw) = p.map_or((false, false), |p| (p.log.enabled, p.log.raw));
+        let last_font = cmd::FONT + FONT_CHOICES.len() as u32 - 1;
+        let last_theme = cmd::THEME + Theme::builtin().len() as u32 - 1;
+        let check = |on: bool| if on { MF_CHECKED } else { MF_UNCHECKED };
+        let own_layout = self
+            .tmux
+            .get(&self.host_pane(self.focused_id()))
+            .is_some_and(|t| t.active() && t.mode() == TmuxMode::Ferossh);
+        let s = &self.settings;
+        // SAFETY: valid menu handle; ids are ours. A missing id just leaves
+        // the group unchecked.
+        unsafe {
+            let _ = CheckMenuRadioItem(self.menu, cmd::FONT, last_font, font, MF_BYCOMMAND.0);
+            let _ = CheckMenuRadioItem(self.menu, cmd::THEME, last_theme, theme, MF_BYCOMMAND.0);
+            let colours = WindowColours::ALL
+                .iter()
+                .position(|c| *c == s.window_colours)
+                .unwrap_or(0) as u32;
+            let _ = CheckMenuRadioItem(
+                self.menu,
+                cmd::WINDOW_COLOURS,
+                cmd::WINDOW_COLOURS + WindowColours::ALL.len() as u32 - 1,
+                cmd::WINDOW_COLOURS + colours,
+                MF_BYCOMMAND.0,
+            );
+            let way = s.remote_app_clipboard.as_deref().unwrap_or("off");
+            let way = crate::stream::CLIPBOARD_WAYS
+                .iter()
+                .position(|w| *w == way)
+                .unwrap_or(0) as u32;
+            let _ = CheckMenuRadioItem(
+                self.menu,
+                cmd::REMOTE_APP_CLIP,
+                cmd::REMOTE_APP_CLIP_LAST,
+                cmd::REMOTE_APP_CLIP + way,
+                MF_BYCOMMAND.0,
+            );
+            let way = s.desktop_clipboard.as_deref().unwrap_or("off");
+            let way = ferossh_config::settings::CLIPBOARD_WAYS
+                .iter()
+                .position(|w| *w == way)
+                .unwrap_or(0) as u32;
+            let _ = CheckMenuRadioItem(
+                self.menu,
+                cmd::DESKTOP_CLIP,
+                cmd::DESKTOP_CLIP_LAST,
+                cmd::DESKTOP_CLIP + way,
+                MF_BYCOMMAND.0,
+            );
+            for (id, on) in [
+                (cmd::COPY_ON_SELECT, s.copy_on_select),
+                (cmd::UPDATE_WEEKLY, s.update_check_weekly),
+                (cmd::RIGHT_CLICK_PASTE, s.right_click_paste),
+                (cmd::LOG_TOGGLE, log),
+                (cmd::LOG_RAW, raw),
+                (cmd::LOG_TIMESTAMPS, s.log_timestamps),
+                (cmd::AUTO_RESPONSES, s.auto_responses),
+                (cmd::REMOTE_APP_COPY, s.remote_app_copy_agent),
+                (cmd::REMOTE_APP_REMOVE, s.remote_app_remove_agent),
+                (cmd::REMOTE_APP_SELECTION, s.remote_app_share_selection),
+                (cmd::DESKTOP_SELECTION, s.desktop_share_selection),
+                (cmd::CONFIRM_PRODUCTION, s.confirm_production),
+                (cmd::TMUX_KEYS, s.tmux_keys),
+                (cmd::RECORD_SNIPPET, self.recording.is_some()),
+                (
+                    cmd::SESSIONS,
+                    self.side.visible && self.side.view == SideView::Sessions,
+                ),
+                (
+                    cmd::LIVE,
+                    self.side.visible && self.side.view == SideView::Live,
+                ),
+                (
+                    cmd::FILES,
+                    self.side.visible && self.side.view == SideView::Files,
+                ),
+                (
+                    cmd::FORWARDS,
+                    self.side.visible && self.side.view == SideView::Forwards,
+                ),
+                (
+                    cmd::SNIPPETS,
+                    self.side.visible && self.side.view == SideView::Snippets,
+                ),
+                (cmd::FOLLOW_CD, s.follow_directory),
+                (cmd::VERIFY, s.verify_transfers),
+                (cmd::ZMODEM, s.zmodem),
+                (cmd::AUTO_RECONNECT, s.auto_reconnect),
+                (cmd::SIDE_RIGHT, s.side_pane_right),
+                (cmd::TOOLS_RAIL, s.tools_rail),
+                (cmd::TOOLS_PIN, s.tools_pinned),
+                (cmd::TAB_STRIP, s.tab_strip),
+                (cmd::TMUX_LAYOUT, own_layout),
+                (cmd::BROADCAST_TAB, self.broadcast == broadcast::Scope::Tab),
+                (cmd::BROADCAST_ALL, self.broadcast == broadcast::Scope::All),
+                (cmd::BROADCAST_SKIP, p.is_some_and(|p| p.no_broadcast)),
+                (cmd::STANDBY_TOGGLE, self.standby.held.is_some()),
+            ] {
+                CheckMenuItem(self.menu, id, (MF_BYCOMMAND | check(on)).0);
+            }
+        }
+        self.update_standby_menu();
+    }
+
+    /// The hotkey the standby window uses (or would use).
+    fn standby_key(&self) -> Hotkey {
+        self.settings.standby_hotkey.unwrap_or(Hotkey::DEFAULT)
+    }
+
+    /// The window the standby hotkey works, for people to read.
+    fn standby_what(&self) -> String {
+        self.settings
+            .standby_target
+            .clone()
+            .unwrap_or_else(|| "this window".to_owned())
+    }
+
+    /// Window > Standby window > Window to show and hide, as it opens:
+    /// this FeroSSH window, then the open windows of other programs, the
+    /// one in use marked.
+    fn fill_standby_targets(&mut self, menu: HMENU) {
+        self.standby.candidates = standby::sys::windows(self.hwnd);
+        let exe = self.settings.standby_target.clone();
+        let current = exe.as_deref().and_then(|e| {
+            standby::find(
+                &self.standby.candidates,
+                e,
+                self.standby.target.or(self.standby.hidden),
+            )
+        });
+        // SAFETY: our popup menu; it is being opened, when changing it is
+        // allowed. Only the window items after the first are replaced.
+        unsafe {
+            while GetMenuItemCount(Some(menu)) > 1 {
+                let _ = DeleteMenu(menu, 1, MF_BYPOSITION);
+            }
+            if !self.standby.candidates.is_empty() {
+                let _ = AppendMenuW(menu, MF_SEPARATOR, 0, None);
+            }
+            for (id, c) in (cmd::STANDBY_TARGET..).zip(&self.standby.candidates) {
+                let _ = AppendMenuW(
+                    menu,
+                    MF_STRING,
+                    id as usize,
+                    &HSTRING::from(standby::menu_label(c)),
+                );
+            }
+            let last = cmd::STANDBY_TARGET + standby::MAX_CANDIDATES as u32;
+            let checked = match (&exe, current) {
+                (None, _) => Some(cmd::STANDBY_OWN),
+                (Some(_), Some(h)) => self
+                    .standby
+                    .candidates
+                    .iter()
+                    .position(|c| c.hwnd == h)
+                    .map(|i| cmd::STANDBY_TARGET + i as u32),
+                // Its program has no window open (or it is hidden).
+                (Some(_), None) => None,
+            };
+            let _ = CheckMenuRadioItem(
+                menu,
+                cmd::STANDBY_OWN,
+                last,
+                checked.unwrap_or(u32::MAX),
+                MF_BYCOMMAND.0,
+            );
+        }
+    }
+
+    /// Shows another program's window that the standby hotkey hid, and
+    /// forgets it.
+    fn restore_hidden(&mut self) {
+        let hidden = self.standby.hidden.take();
+        let saved = self.settings.standby_hidden.take();
+        // A handle from the settings may be a reused one after a restart:
+        // it is shown only while it is still a window of the picked
+        // program.
+        let from_file = saved.and_then(|v| isize::try_from(v).ok()).filter(|&h| {
+            self.settings
+                .standby_target
+                .as_deref()
+                .is_some_and(|exe| standby::sys::alive_with_exe(h, exe))
+        });
+        if let Some(h) = hidden.or(from_file) {
+            standby::sys::show_async(h);
+        }
+        if hidden.is_some() || saved.is_some() {
+            self.save_settings();
+        }
+    }
+
+    /// Notes another program's window as hidden by the hotkey (`Some`) or
+    /// shown again (`None`), also in the settings, so that a FeroSSH that
+    /// ends without showing it shows it at its next start.
+    fn note_hidden(&mut self, h: Option<isize>) {
+        self.standby.hidden = h;
+        let saved = h.and_then(|v| u64::try_from(v).ok());
+        if self.settings.standby_hidden != saved {
+            self.settings.standby_hidden = saved;
+            self.save_settings();
+        }
+    }
+
+    /// The window a press of the hotkey works on now.
+    fn standby_target(&mut self) -> StandbyTarget {
+        let Some(exe) = self.settings.standby_target.clone() else {
+            return StandbyTarget::Own;
+        };
+        for h in [self.standby.hidden, self.standby.target]
+            .into_iter()
+            .flatten()
+        {
+            if standby::sys::alive_with_exe(h, &exe) {
+                return StandbyTarget::Other(h);
+            }
+        }
+        let found = standby::find(&standby::sys::windows(self.hwnd), &exe, None);
+        self.standby.target = found;
+        found.map_or(StandbyTarget::Missing(exe), StandbyTarget::Other)
+    }
+
+    /// Window > Standby window's status line and the checked hotkey.
+    fn update_standby_menu(&self) {
+        let key = self.standby_key();
+        let status = self
+            .standby
+            .status(&hotkey_label(key), &self.standby_what());
+        let presets = standby_presets();
+        let last = cmd::STANDBY_PRESET + presets.len() as u32 - 1;
+        let picked = presets
+            .iter()
+            .position(|p| *p == key)
+            .map_or(u32::MAX, |i| cmd::STANDBY_PRESET + i as u32);
+        // SAFETY: valid menu handle; ids are ours.
+        unsafe {
+            let _ = ModifyMenuW(
+                self.menu,
+                cmd::STANDBY_STATUS,
+                MF_BYCOMMAND | MF_STRING,
+                cmd::STANDBY_STATUS as usize,
+                &HSTRING::from(status),
+            );
+            // A hotkey that is none of these leaves them all unchecked.
+            let _ =
+                CheckMenuRadioItem(self.menu, cmd::STANDBY_PRESET, last, picked, MF_BYCOMMAND.0);
+        }
+    }
+
+    /// Takes or lets go of the standby hotkey to match the settings: held
+    /// when Standby is on and Windows gives it, else noted as taken.
+    /// Returns whether the window now holds it. `RegisterHotKey` sends no
+    /// messages, so this is safe inside `with_window`.
+    fn apply_standby(&mut self) -> bool {
+        if self.standby.held.take().is_some() {
+            // SAFETY: our window and the id it registered.
+            let _ = unsafe { UnregisterHotKey(Some(self.hwnd), standby::HOTKEY_ID) };
+        }
+        self.standby.taken = None;
+        if self.settings.standby {
+            let key = self.standby_key();
+            let mods = HOT_KEY_MODIFIERS(key.modifiers()) | MOD_NOREPEAT;
+            // SAFETY: our window; Windows checks the key and modifiers.
+            let ok = unsafe {
+                RegisterHotKey(Some(self.hwnd), standby::HOTKEY_ID, mods, u32::from(key.vk))
+            }
+            .is_ok();
+            if ok {
+                self.standby.held = Some(key);
+            } else {
+                self.standby.taken = Some(key);
+            }
+        }
+        self.update_menu_checks();
+        self.standby.held.is_some()
+    }
+
+    /// Turns Standby on with `key` (the current one when `None`), and
+    /// says how that went.
+    fn standby_on(&mut self, key: Option<Hotkey>) -> Command {
+        if let Some(k) = key {
+            self.settings.standby_hotkey = Some(k);
+        }
+        self.settings.standby = true;
+        self.save_settings();
+        let label = hotkey_label(self.standby_key());
+        let what = match &self.settings.standby_target {
+            Some(exe) => format!("the window of {exe}"),
+            None => "this FeroSSH window".to_owned(),
+        };
+        if self.apply_standby() {
+            Command::Notice(format!(
+                "{label} now hides {what} and brings it back.\n\nWhile hidden it has no \
+                 taskbar button; only {label} brings it back, and FeroSSH shows it again when \
+                 standby goes off or FeroSSH closes. Window > Standby window shows whether it \
+                 is active, picks the window, and turns it off."
+            ))
+        } else {
+            Command::Notice(self.standby.details(&label, &self.standby_what()))
+        }
+    }
+
+    /// Picking a hotkey by pressing it ended: with the key pressed, or
+    /// cancelled (`None`).
+    fn end_capture(&mut self, key: Option<Hotkey>) -> Option<Command> {
+        if self.standby.capture != Capture::Waiting {
+            return None;
+        }
+        self.standby.capture = if key.is_some() {
+            Capture::Finishing
+        } else {
+            Capture::Off
+        };
+        self.update_title();
+        key.map(|k| self.standby_on(Some(k)))
+    }
+
+    fn set_focus(&mut self, focused: bool) {
+        self.focused = focused;
+        // The clipboard may change while away: a desktop gets it again.
+        self.clip_pane = None;
+        let id = self.focused_id();
+        let reply = self.panes.get_mut(&id).and_then(|p| p.term.focus(focused));
+        if let Some(bytes) = reply {
+            self.send(id, bytes);
+        }
+        if !focused {
+            self.mouse.selecting = false;
+            self.mouse.reporting = None;
+        }
+        // The cursor changes shape; its row must redraw even if nothing
+        // else changed.
+        if let Some(p) = self.panes.get_mut(&id)
+            && let Some(c) = p.cursor
+        {
+            p.grid.mark_dirty(c.y);
+        }
+        self.refresh(id);
+        self.refresh_chrome();
+    }
+
+    /// The DPI changed: reload fonts at the new size.
+    fn set_dpi(&mut self, dpi: u32) {
+        self.dpi = dpi;
+        self.renderer.clear_font_cache();
+        for p in self.panes.values_mut() {
+            if let Ok(metrics) = self.renderer.metrics(&p.font, dpi) {
+                p.metrics = metrics;
+            }
+        }
+        if let Ok(m) = self.renderer.metrics(&self.chrome_font, dpi) {
+            self.chrome_metrics = m;
+        }
+        if let Ok(m) = self.renderer.metrics(&self.strip_font, dpi) {
+            self.strip_metrics = m;
+        }
+        self.side.width = 0;
+        self.full_redraw = true;
+    }
+
+    /// The window size that keeps the layout at `dpi`: the client scaled.
+    fn size_for_dpi(&self, dpi: u32) -> Option<(i32, i32)> {
+        if self.dpi == 0 {
+            return None;
+        }
+        let s = |v: i32| v * dpi as i32 / self.dpi as i32;
+        Some(client_to_window(
+            s(self.client.0),
+            s(self.client.1),
+            dpi,
+            self.menu_visible,
+        ))
+    }
+
+    /// Where downloads go: the setting, else the user's Downloads folder.
+    fn download_dir(&self) -> PathBuf {
+        self.settings
+            .download_folder
+            .as_ref()
+            .map_or_else(|| home().join("Downloads"), PathBuf::from)
+    }
+
+    /// The file view's Local PC folder moved: downloads go there from now
+    /// on, and it is remembered (`DownloadFolder`; unset for Downloads).
+    fn set_download_dir(&mut self, dir: &Path) {
+        let Some(text) = dir.to_str() else {
+            return;
+        };
+        let folder = (dir != home().join("Downloads")).then(|| text.to_owned());
+        if self.settings.download_folder != folder {
+            self.settings.download_folder = folder;
+            self.save_settings();
+        }
+        self.refresh_chrome();
+    }
+
+    fn files_visible(&self) -> bool {
+        self.side.visible && self.side.view == SideView::Files
+    }
+
+    /// The transfer queue's key for pane `id`, if it is an SSH pane.
+    fn pane_sftp_key(&self, id: PaneId) -> Option<String> {
+        match &self.panes.get(&self.host_pane(id))?.host {
+            Host::Ssh(s) => Some(sftp_key(&s.target)),
+            _ => None,
+        }
+    }
+
+    /// The queue key for pane `id` when it is logged in and its host's
+    /// queue exists.
+    fn files_target(&self, id: PaneId) -> Option<String> {
+        let p = self.panes.get(&id)?;
+        if !p.connected() {
+            return None;
+        }
+        let key = self.pane_sftp_key(id)?;
+        self.sftp.contains_key(&key).then_some(key)
+    }
+
+    /// Opens SFTP on pane `id`'s connection, if the pane is logged in and
+    /// its host has no SFTP channel yet. The queue starts in the pane's
+    /// directory when it reported one.
+    fn ensure_sftp(&mut self, id: PaneId) {
+        let Some(p) = self.panes.get(&id) else {
+            return;
+        };
+        let Some(Host::Ssh(s)) = self.panes.get(&self.host_pane(id)).map(|g| &g.host) else {
+            return;
+        };
+        if s.state() != State::Connected || !self.workers.contains_key(&s.connection) {
+            return;
+        }
+        let key = sftp_key(&s.target);
+        let label = s.target.label();
+        let connection = s.connection;
+        // The connection's Remote folder, else the shell's directory.
+        let folder = self.remote_folder(id).map(String::into_bytes);
+        if folder.is_some() && !self.sftp.contains_key(&key) {
+            self.folder_left.remove(&key);
+            self.started_in_folder.insert(key.clone(), id);
+        }
+        let cwd = folder.or_else(|| p.cwd.clone().filter(|_| self.settings.follow_directory));
+        let (verify, parallel) = (
+            self.settings.verify_transfers,
+            self.settings.parallel_transfers,
+        );
+        let remote = self.sftp.entry(key).or_insert_with(|| {
+            let mut r = Remote::new(&label);
+            r.verify = verify;
+            if let Some(n) = parallel {
+                r.parallel = n;
+            }
+            r
+        });
+        if remote.channel().is_some() {
+            return;
+        }
+        if let Some(cwd) = cwd
+            && remote.listing.path.is_empty()
+        {
+            remote.browse(&cwd);
+        }
+        // `self.sftp` is borrowed: the same as `new_channel`, inline.
+        let channel = self.next_channel;
+        self.next_channel = ((channel + 1) % FORWARD_IDS).max(1);
+        remote.attach(channel, connection);
+        self.sftp_routes.insert(channel, connection);
+        self.flush_sftp();
+    }
+
+    /// A pane logged in: transfers waiting for its host carry on, and the
+    /// file view opens SFTP if it shows that host.
+    fn sftp_connected(&mut self, id: PaneId) {
+        let Some(key) = self.pane_sftp_key(id) else {
+            return;
+        };
+        let shown = self.files_visible() && self.files_key.as_deref() == Some(&key);
+        let waiting = self.sftp.get(&key).is_some_and(Remote::wants_connection);
+        if shown || waiting {
+            self.ensure_sftp(id);
+        }
+    }
+
+    /// Closes SFTP channels whose connection no logged-in pane uses any
+    /// more, so they do not keep it open. Their transfers wait.
+    fn prune_sftp(&mut self) {
+        let live: Vec<(String, ChannelId)> = self
+            .panes
+            .values()
+            .filter_map(|p| match &p.host {
+                Host::Ssh(s) if s.state() == State::Connected => {
+                    Some((sftp_key(&s.target), s.connection))
+                }
+                _ => None,
+            })
+            .collect();
+        let mut closed = false;
+        for (key, remote) in &mut self.sftp {
+            if let Some(conn) = remote.connection()
+                && !live.iter().any(|(k, c)| k == key && *c == conn)
+            {
+                remote.close();
+                closed = true;
+            }
+        }
+        if closed {
+            self.flush_sftp();
+        }
+    }
+
+    /// Sends what the queues asked for, and runs the progress timer while
+    /// anything moves.
+    fn flush_sftp(&mut self) {
+        for remote in self.sftp.values_mut() {
+            // Each to the worker of the connection its channel runs on.
+            for msg in remote.take_outbox() {
+                if let Some(w) = msg
+                    .channel()
+                    .and_then(|c| self.sftp_routes.get(&c))
+                    .and_then(|c| self.workers.get(c))
+                {
+                    w.link.send(msg);
+                }
+            }
+        }
+        let busy = self.sftp.values().any(Remote::busy);
+        if busy != self.transfer_timer {
+            self.transfer_timer = busy;
+            // SAFETY: our window and timer.
+            unsafe {
+                if busy {
+                    SetTimer(Some(self.hwnd), TIMER_TRANSFER, TRANSFER_TICK_MS, None);
+                } else {
+                    let _ = KillTimer(Some(self.hwnd), TIMER_TRANSFER);
+                }
+            }
+        }
+    }
+
+    fn on_transfer_timer(&mut self) {
+        for remote in self.sftp.values_mut() {
+            remote.poll();
+        }
+        self.flush_sftp();
+        if self.files_visible() {
+            self.refresh_chrome();
+        }
+    }
+
+    /// Points the file view at the focused pane's host when focus moved
+    /// to a pane on another host, and at the focused pane's directory
+    /// when focus moved to another pane (on any host).
+    fn sync_files(&mut self) {
+        if !self.files_visible() {
+            self.files_pane = None;
+            return;
+        }
+        let id = self.focused_id();
+        let key = self.pane_sftp_key(id);
+        let host_changed = key != self.files_key;
+        if host_changed {
+            self.files_key.clone_from(&key);
+            self.ensure_sftp(id);
+        }
+        if host_changed || self.files_pane != Some(id) {
+            self.files_pane = Some(id);
+            let alias = self.pane_alias(id);
+            let alias_changed = alias != self.files_alias_shown;
+            self.files_alias_shown = alias;
+            // Another connection to a host already listed: its own Remote
+            // folder, if it names one.
+            if !host_changed
+                && alias_changed
+                && let Some(k) = key.clone()
+                && let Some(folder) = self.remote_folder(id)
+                && let Some(r) = self.sftp.get_mut(&k)
+            {
+                r.notice = None;
+                r.browse(folder.as_bytes());
+                self.folder_left.remove(&k);
+                self.started_in_folder.insert(k, id);
+                // Sent now: with nothing transferring, no timer would.
+                self.flush_sftp();
+                return;
+            }
+            if !host_changed
+                && alias_changed
+                && let Some(k) = &key
+            {
+                // A connection with no Remote folder of its own follows
+                // its shell.
+                self.started_in_folder.remove(k);
+                self.folder_left.remove(k);
+            }
+            if let Some(k) = &key
+                && self.started_in_folder.get(k) == Some(&id)
+            {
+                // It stays in the connection's Remote folder; following
+                // picks up from the shell's next cd. If another pane's
+                // shell moved the shared listing meanwhile, list the
+                // folder again.
+                if self.folder_left.remove(k)
+                    && let Some(folder) = self.remote_folder(id)
+                    && let Some(r) = self.sftp.get_mut(k)
+                {
+                    r.notice = None;
+                    r.browse(folder.as_bytes());
+                    self.flush_sftp();
+                }
+                return;
+            }
+            self.follow_pane(id);
+        }
+    }
+
+    /// The connection name of pane `id`'s SSH host.
+    fn pane_alias(&self, id: PaneId) -> Option<String> {
+        match &self.panes.get(&self.host_pane(id))?.host {
+            Host::Ssh(s) => Some(s.target.alias.clone()),
+            _ => None,
+        }
+    }
+
+    /// The Remote folder pane `id`'s connection names for file transfer.
+    fn remote_folder(&self, id: PaneId) -> Option<String> {
+        match &self.panes.get(&self.host_pane(id))?.host {
+            Host::Ssh(s) => self
+                .settings
+                .profile(&s.target.alias)?
+                .remote_folder
+                .clone(),
+            _ => None,
+        }
+    }
+
+    /// Lists pane `id`'s reported directory, when following is on.
+    fn follow_pane(&mut self, id: PaneId) {
+        if !self.settings.follow_directory {
+            return;
+        }
+        let Some(cwd) = self.panes.get(&id).and_then(|p| p.cwd.clone()) else {
+            return;
+        };
+        let Some(key) = self.pane_sftp_key(id) else {
+            return;
+        };
+        if let Some(remote) = self.sftp.get_mut(&key)
+            && remote.listing.path != cwd
+        {
+            remote.browse(&cwd);
+            if self.started_in_folder.get(&key).is_some_and(|o| *o != id) {
+                self.folder_left.insert(key);
+            }
+            self.flush_sftp();
+        }
+    }
+
+    /// The shell reported its directory (OSC 7). Returns whether the file
+    /// view changed.
+    fn on_working_dir(&mut self, id: PaneId, dir: WorkingDir) -> bool {
+        let Some(p) = self.panes.get_mut(&id) else {
+            return false;
+        };
+        if !matches!(p.host, Host::Ssh(_) | Host::Tmux { .. }) {
+            return false;
+        }
+        let host = dir.host.to_ascii_lowercase();
+        let first = p.cwd_host.get_or_insert_with(|| host.clone());
+        if *first != host {
+            // A nested ssh on another host: its paths are not ours.
+            p.cwd = None;
+            return false;
+        }
+        let moved = p.cwd.as_ref() != Some(&dir.path);
+        p.cwd = Some(dir.path);
+        p.cwd_reported = true;
+        if !moved {
+            // The same folder again (a new prompt): nothing to follow.
+            return false;
+        }
+        self.shell_moved(id);
+        if !self.files_visible() || id != self.focused_id() {
+            return false;
+        }
+        self.follow_pane(id);
+        true
+    }
+
+    /// For shells that do not report their directory (OSC 7, which stock
+    /// bash does not send): reads it from a `user@host:dir$ ` prompt at
+    /// the cursor. Returns whether the file view changed.
+    fn read_prompt(&mut self, id: PaneId) -> bool {
+        let Some(p) = self.panes.get(&id) else {
+            return false;
+        };
+        if p.cwd_reported || !matches!(p.host, Host::Ssh(_) | Host::Tmux { .. }) {
+            return false;
+        }
+        let Some(dir) = p.term.prompt_line().as_deref().and_then(prompt_dir) else {
+            return false;
+        };
+        // `~` is the home folder; before SFTP has told us where that is,
+        // a path relative to where SFTP starts (the home folder) does.
+        let home = self
+            .pane_sftp_key(id)
+            .and_then(|k| self.sftp.get(&k))
+            .and_then(|r| r.home.clone());
+        let path = match dir.path.strip_prefix(b"~") {
+            None => dir.path,
+            Some(rest) => {
+                let rest = rest.strip_prefix(b"/").unwrap_or(rest);
+                match (home, rest.is_empty()) {
+                    (Some(home), true) => home,
+                    (Some(mut home), false) => {
+                        if !home.ends_with(b"/") {
+                            home.push(b'/');
+                        }
+                        home.extend_from_slice(rest);
+                        home
+                    }
+                    (None, true) => b".".to_vec(),
+                    (None, false) => rest.to_vec(),
+                }
+            }
+        };
+        let Some(p) = self.panes.get_mut(&id) else {
+            return false;
+        };
+        let host = dir.host.to_ascii_lowercase();
+        let first = p.prompt_host.get_or_insert_with(|| host.clone());
+        if *first != host {
+            // A nested ssh on another host: its paths are not ours.
+            let had = p.cwd.take().is_some();
+            return had && id == self.focused_id() && self.files_visible();
+        }
+        if p.cwd.as_deref() == Some(path.as_slice()) {
+            return false;
+        }
+        p.cwd = Some(path);
+        self.shell_moved(id);
+        if !self.files_visible() || id != self.focused_id() {
+            return false;
+        }
+        self.follow_pane(id);
+        true
+    }
+
+    /// Pane `id`'s shell went to another folder: from now on its file
+    /// view follows the shell, even if it started in the Remote folder.
+    fn shell_moved(&mut self, id: PaneId) {
+        if let Some(key) = self.pane_sftp_key(id)
+            && self.started_in_folder.get(&key) == Some(&id)
+        {
+            self.started_in_folder.remove(&key);
+            self.folder_left.remove(&key);
+        }
+    }
+
+    /// Notes the folder a local shell's prompt shows, for new tabs and
+    /// panes opened from it.
+    fn read_local_prompt(&mut self, id: PaneId) {
+        let Some(p) = self.panes.get_mut(&id) else {
+            return;
+        };
+        if !matches!(p.host, Host::Local { exited: false, .. }) {
+            return;
+        }
+        if let Some(dir) = p
+            .term
+            .prompt_line()
+            .as_deref()
+            .and_then(same_dir::local_prompt_dir)
+        {
+            p.local_cwd = Some(dir);
+        }
+    }
+
+    fn toggle_follow(&mut self) {
+        self.settings.follow_directory = !self.settings.follow_directory;
+        self.save_settings();
+        self.update_menu_checks();
+        self.follow_pane(self.focused_id());
+        self.refresh_chrome();
+    }
+
+    /// What the file transfer pane shows.
+    fn files_view(&self) -> files_panel::View {
+        let remote = self.files_key.as_ref().and_then(|k| self.sftp.get(k));
+        let follow = if !self.settings.follow_directory {
+            Follow::Off
+        } else if self
+            .panes
+            .get(&self.focused_id())
+            .is_some_and(|p| p.cwd.is_some())
+        {
+            Follow::On
+        } else {
+            Follow::Unreported
+        };
+        let status = match remote {
+            None => Some((NOT_CONNECTED.to_owned(), false)),
+            Some(r) => r
+                .notice
+                .clone()
+                .or_else(|| r.listing.error.clone())
+                .map(|n| (n, true))
+                .or_else(|| {
+                    (follow == Follow::Unreported).then(|| {
+                        (
+                            "Follow terminal: the shell has not said which folder it is in yet."
+                                .to_owned(),
+                            false,
+                        )
+                    })
+                }),
+        };
+        let alias = remote.and(self.files_alias());
+        files_panel::View {
+            host: remote.map(|r| r.label.clone()),
+            key: remote.and(self.files_key.clone()),
+            remote_dir: remote.map(|r| r.listing.path.clone()).unwrap_or_default(),
+            remote_loading: remote.is_some_and(|r| r.listing.loading),
+            remote_rows: remote
+                .map(|r| files::remote_rows(&r.listing, ""))
+                .unwrap_or_default(),
+            status,
+            queue: remote.map(files::queue_rows).unwrap_or_default(),
+            question: remote.and_then(Remote::question),
+            follow,
+            base: self.download_dir(),
+            landed: remote.map_or(0, files::landed),
+            arrange: self.arrange(),
+            bookmarks: self.settings.bookmarks.clone(),
+            local_start: alias
+                .as_deref()
+                .and_then(|a| self.settings.profile(a))
+                .and_then(|p| p.local_folder.as_deref())
+                .map(PathBuf::from),
+            alias,
+        }
+    }
+
+    /// The connection name of the host the file transfer pane shows.
+    fn files_alias(&self) -> Option<String> {
+        self.files_key.as_ref()?;
+        let id = self.files_pane?;
+        match &self.panes.get(&self.host_pane(id))?.host {
+            Host::Ssh(s) => Some(s.target.alias.clone()),
+            _ => None,
+        }
+    }
+
+    /// How the file transfer pane arranges its lists.
+    fn arrange(&self) -> Arrange {
+        self.settings
+            .transfer_layout
+            .as_deref()
+            .map(Arrange::parse)
+            .unwrap_or_default()
+    }
+
+    /// Carries out what the user did in the file transfer pane.
+    fn files_event(&mut self, event: files_panel::Event) -> Option<Command> {
+        use files_panel::{Event, JobOp};
+        let key = self.files_key.clone().filter(|k| self.sftp.contains_key(k));
+        let command = match event {
+            // Handled before the window is borrowed: it asks first.
+            Event::DropOut { .. } => None,
+            Event::Browse(path) => {
+                if let Some(r) = key.as_ref().and_then(|k| self.sftp.get_mut(k)) {
+                    r.notice = None;
+                    r.browse(&path);
+                }
+                None
+            }
+            Event::SyncBack(back) => {
+                // Only for the queue and connection it left: the view may
+                // have moved on, even to another connection on the queue.
+                if back.applies(key.as_deref(), self.files_alias().as_deref())
+                    && let Some(r) = key.as_ref().and_then(|k| self.sftp.get_mut(k))
+                {
+                    r.notice = None;
+                    r.browse(&back.path);
+                }
+                None
+            }
+            Event::Home => {
+                if let Some(r) = key.as_ref().and_then(|k| self.sftp.get_mut(k))
+                    && let Some(home) = r.home.clone()
+                {
+                    r.notice = None;
+                    r.browse(&home);
+                }
+                None
+            }
+            Event::Refresh => {
+                self.ensure_sftp(self.focused_id());
+                if let Some(r) = key.as_ref().and_then(|k| self.sftp.get_mut(k)) {
+                    r.notice = None;
+                    r.refresh();
+                }
+                None
+            }
+            Event::Download { keys, into } => {
+                if let Some(r) = key.as_ref().and_then(|k| self.sftp.get_mut(k)) {
+                    r.notice = None;
+                    if let Err(e) = std::fs::create_dir_all(&into) {
+                        r.notice = Some(format!("{}: {e}", into.display()));
+                    } else {
+                        for entry in files::entries_named(&r.listing, &keys) {
+                            if let Err(e) = r.download(&entry, &into) {
+                                r.notice = Some(e);
+                            }
+                        }
+                    }
+                }
+                None
+            }
+            Event::Upload { paths, dir } => {
+                if let Some(key) = key {
+                    self.upload_files(&key, &paths, &dir);
+                }
+                None
+            }
+            Event::Delete(keys) => key.and_then(|key| {
+                let listing = &self.sftp.get(&key)?.listing;
+                let entries = files::entries_named(listing, &keys);
+                let dir = listing.path.clone();
+                (!entries.is_empty()).then_some(Command::ConfirmDelete { key, dir, entries })
+            }),
+            Event::SetLocal(dir) => {
+                self.set_download_dir(&dir);
+                None
+            }
+            Event::PickLocal => Some(Command::PickLocalFolder(self.download_dir())),
+            Event::PickUpload => key.and_then(|key| {
+                let dir = self.sftp.get(&key)?.listing.path.clone();
+                Some(Command::PickUpload { key, dir })
+            }),
+            Event::OpenLocal(dir) => Some(Command::OpenFolder(dir)),
+            Event::ToggleFollow => {
+                self.toggle_follow();
+                None
+            }
+            Event::Bookmarks(all) => {
+                if self.settings.bookmarks != all {
+                    self.settings.bookmarks = all;
+                    self.save_settings();
+                }
+                None
+            }
+            Event::Arrange(a) => {
+                let text = Some(a.to_setting());
+                if self.settings.transfer_layout != text {
+                    self.settings.transfer_layout = text;
+                    self.save_settings();
+                }
+                None
+            }
+            Event::Job(id, op) => {
+                if let Some(r) = key.as_ref().and_then(|k| self.sftp.get_mut(k)) {
+                    match op {
+                        JobOp::Pause => r.pause(id),
+                        JobOp::Resume => r.resume(id),
+                        JobOp::Cancel => r.cancel(id),
+                        JobOp::Retry => r.retry(id),
+                    }
+                }
+                None
+            }
+            Event::ClearFinished => {
+                if let Some(r) = key.as_ref().and_then(|k| self.sftp.get_mut(k)) {
+                    r.clear_finished();
+                }
+                None
+            }
+            Event::Answer(id, choice, all) => {
+                // Only the question the pane shows: not one that came up
+                // on another host since.
+                if let Some(r) = key.as_ref().and_then(|k| self.sftp.get_mut(k))
+                    && r.question().is_some_and(|q| q.0 == id)
+                {
+                    r.answer(id, choice, all);
+                }
+                None
+            }
+            Event::Focused => {
+                if !self.side.focused {
+                    self.side.focused = true;
+                }
+                None
+            }
+            Event::Leave => {
+                self.focus_terminal();
+                None
+            }
+        };
+        self.flush_sftp();
+        self.refresh_chrome();
+        command
+    }
+
+    /// Where an upload from pane `id` goes: the listed folder when
+    /// `listed`, else the shell's directory, else the home folder, else
+    /// wherever the server starts SFTP.
+    fn upload_dir(&self, id: PaneId, listed: bool) -> Vec<u8> {
+        let remote = self.pane_sftp_key(id).and_then(|k| self.sftp.get(&k));
+        if listed
+            && let Some(r) = remote
+            && !r.listing.path.is_empty()
+        {
+            return r.listing.path.clone();
+        }
+        if let Some(cwd) = self.panes.get(&id).and_then(|p| p.cwd.clone()) {
+            return cwd;
+        }
+        remote
+            .and_then(|r| r.home.clone())
+            .unwrap_or_else(|| b".".to_vec())
+    }
+
+    /// Queues uploads and shows the queue.
+    fn upload_files(&mut self, key: &str, paths: &[PathBuf], dir: &[u8]) {
+        let Some(remote) = self.sftp.get_mut(key) else {
+            return;
+        };
+        for path in paths {
+            if let Err(e) = remote.upload(path, dir) {
+                remote.notice = Some(e);
+            }
+        }
+        self.flush_sftp();
+        if !self.files_visible() {
+            self.show_side(SideView::Files, false);
+        }
+        self.refresh_chrome();
+    }
+
+    /// Where files dropped at client point (`x`, `y`) go: the queue key,
+    /// a label for the prompt, and the remote folder.
+    fn drop_target(
+        &mut self,
+        x: i32,
+        y: i32,
+    ) -> std::result::Result<(String, Vec<u8>), &'static str> {
+        const ON_A_PANE: &str =
+            "Drop files on a pane that is logged in to an SSH host to upload them there.";
+        let (id, into) = match self.spot(x, y) {
+            Spot::Pane(id) => (id, None),
+            Spot::Side(..) if self.files_visible() => {
+                let mut pt = POINT { x, y };
+                // SAFETY: a plain conversion for our own window.
+                unsafe {
+                    let _ = windows::Win32::Graphics::Gdi::ClientToScreen(self.hwnd, &mut pt);
+                }
+                match files_panel::drop_at(pt) {
+                    files_panel::DropAt::Remote(folder) => (self.focused_id(), Some(folder)),
+                    files_panel::DropAt::Local => {
+                        return Err("Drop files on the Remote list to upload them.");
+                    }
+                    files_panel::DropAt::Pane => (self.focused_id(), Some(None)),
+                }
+            }
+            _ => return Err(ON_A_PANE),
+        };
+        self.ensure_sftp(id);
+        let key = self.files_target(id).ok_or(ON_A_PANE)?;
+        let listed = into.is_some() && self.files_key.as_deref() == Some(&key);
+        let dir = self.upload_dir(id, listed);
+        Ok(match into.flatten() {
+            Some(folder) if listed => names::join(&dir, &folder),
+            _ => dir,
+        })
+        .map(|dir| (key, dir))
+    }
+
+    /// Transfers not yet done, failed, skipped or cancelled.
+    fn unfinished_transfers(&self) -> usize {
+        self.sftp
+            .values()
+            .flat_map(Remote::jobs)
+            .filter(|j| j.parent.is_none() && !j.state.finished())
+            .count()
+    }
+
+    /// SSH sessions logged in, in all tabs or in one.
+    fn live_sessions(&self, tab: Option<usize>) -> usize {
+        let ids = match tab {
+            Some(i) => self
+                .ws
+                .tabs
+                .get(i)
+                .map(|t| t.root.panes())
+                .unwrap_or_default(),
+            None => self.ws.all_panes(),
+        };
+        // Leaving the window only detaches tmux; closing a tab closes its
+        // tmux windows.
+        ids.iter()
+            .filter_map(|id| self.panes.get(id))
+            .filter(|p| {
+                let open = p.connected()
+                    || matches!(p.host, Host::Serial { port: Some(_), .. })
+                    || matches!(&p.host, Host::Telnet(s) if s.state() == State::Connected);
+                open && (tab.is_some() || p.gateway().is_none())
+            })
+            .count()
+    }
+
+    fn close_tab(&mut self, i: usize) -> Option<Command> {
+        let ids = self.ws.tabs.get(i).map(|t| t.root.panes())?;
+        for id in ids {
+            if let Some(c) = self.close_pane(id) {
+                return Some(c);
+            }
+        }
+        None
+    }
+}
+
+/// The command palette's actions: every item of `menu` and its submenus
+/// that is not greyed out, with the menus it is in.
+fn menu_entries(menu: HMENU) -> Vec<palette::Entry> {
+    fn walk(menu: HMENU, path: &mut Vec<String>, out: &mut Vec<palette::Entry>) {
+        // SAFETY: a menu handle of ours.
+        let count = unsafe { GetMenuItemCount(Some(menu)) };
+        for pos in 0..count.max(0) {
+            let at = pos as u32;
+            let mut buf = [0u16; 256];
+            // SAFETY: our menu, a position in it and a local buffer.
+            let (len, state, sub) = unsafe {
+                (
+                    GetMenuStringW(menu, at, Some(&mut buf), MF_BYPOSITION),
+                    GetMenuState(menu, at, MF_BYPOSITION),
+                    GetSubMenu(menu, pos),
+                )
+            };
+            if state & MF_SEPARATOR.0 != 0 {
+                continue;
+            }
+            let len = usize::try_from(len).unwrap_or(0).min(buf.len());
+            let text = String::from_utf16_lossy(buf.get(..len).unwrap_or_default());
+            if !sub.is_invalid() {
+                path.push(text);
+                walk(sub, path, out);
+                path.pop();
+                continue;
+            }
+            if state & (MF_GRAYED.0 | MF_DISABLED.0) != 0 {
+                continue;
+            }
+            // SAFETY: as above.
+            let id = unsafe { GetMenuItemID(menu, pos) };
+            let on = state & MF_CHECKED.0 != 0;
+            out.push(palette::Entry::action(path, &text, id, on));
+        }
+    }
+    let mut out = Vec::new();
+    walk(menu, &mut Vec::new(), &mut out);
+    out
+}
+
+/// The window shortcut for a key, as a command id. Tab and pane keys only
+/// apply when there is more than one tab or pane, so that otherwise the
+/// keys reach the terminal.
+fn shortcut(vk: VIRTUAL_KEY, m: Mods, tabs: bool, split: bool) -> Option<u32> {
+    let key = |c: u8| VIRTUAL_KEY(u16::from(c));
+    let arrow = match vk {
+        VK_LEFT => Some(0),
+        VK_RIGHT => Some(1),
+        VK_UP => Some(2),
+        VK_DOWN => Some(3),
+        _ => None,
+    };
+    if m.alt && !m.ctrl {
+        if m.shift {
+            return match vk {
+                VK_OEM_PLUS | VK_ADD => Some(cmd::SPLIT_RIGHT),
+                VK_OEM_MINUS | VK_SUBTRACT => Some(cmd::SPLIT_DOWN),
+                _ if split => arrow.map(|a| cmd::RESIZE + a),
+                _ => None,
+            };
+        }
+        return if split {
+            arrow.map(|a| cmd::FOCUS + a)
+        } else {
+            None
+        };
+    }
+    if m.ctrl && !m.alt {
+        return match vk {
+            VK_TAB if tabs => Some(if m.shift {
+                cmd::PREV_TAB
+            } else {
+                cmd::NEXT_TAB
+            }),
+            VK_PRIOR if m.shift && tabs => Some(cmd::TAB_LEFT),
+            VK_NEXT if m.shift && tabs => Some(cmd::TAB_RIGHT),
+            v if v == key(b'J') && m.shift && tabs => Some(cmd::JOIN_TAB),
+            VK_OEM_PLUS | VK_ADD => Some(cmd::ZOOM_IN),
+            VK_OEM_MINUS | VK_SUBTRACT if !m.shift => Some(cmd::ZOOM_OUT),
+            VK_NUMPAD0 if !m.shift => Some(cmd::ZOOM_RESET),
+            v if v == key(b'0') && !m.shift => Some(cmd::ZOOM_RESET),
+            v if v == key(b'M') && m.shift => Some(cmd::HIDE_MENU),
+            v if v == key(b'C') && m.shift => Some(cmd::COPY),
+            v if v == key(b'V') && m.shift => Some(cmd::PASTE),
+            v if v == key(b'F') && m.shift => Some(cmd::FIND),
+            v if v == key(b'N') && m.shift => Some(cmd::CONNECT),
+            v if v == key(b'R') && m.shift => Some(cmd::RECONNECT),
+            v if v == key(b'T') && m.shift => Some(cmd::NEW_TAB),
+            v if v == key(b'W') && m.shift => Some(cmd::CLOSE_PANE),
+            VK_F4 if !m.shift => Some(cmd::CLOSE_TAB),
+            v if v == key(b'S') && m.shift => Some(cmd::SESSIONS),
+            v if v == key(b'L') && m.shift => Some(cmd::LIVE),
+            v if v == key(b'E') && m.shift => Some(cmd::FILES),
+            v if v == key(b'P') && m.shift => Some(cmd::FORWARDS),
+            v if v == key(b'A') && m.shift => Some(cmd::PALETTE),
+            VK_SPACE if m.shift => Some(cmd::SNIPPETS),
+            v if v == key(b'D') && m.shift => Some(cmd::DESKTOP),
+            v if v == key(b'U') && m.shift => Some(cmd::UPLOAD),
+            v if v == key(b'B') && m.shift => Some(cmd::BROADCAST_TAB),
+            VK_INSERT if !m.shift => Some(cmd::COPY),
+            VK_HOME if m.shift => Some(cmd::SCROLL_TOP),
+            VK_END if m.shift => Some(cmd::SCROLL_BOTTOM),
+            _ => None,
+        };
+    }
+    if m.shift && !m.ctrl && !m.alt {
+        return match vk {
+            VK_PRIOR => Some(cmd::SCROLL_PAGE_UP),
+            VK_NEXT => Some(cmd::SCROLL_PAGE_DOWN),
+            VK_INSERT => Some(cmd::PASTE),
+            _ => None,
+        };
+    }
+    None
+}
+
+/// Follow-up actions that call into Win32 functions which send messages to
+/// the window or open dialogs, so they run after the state borrow is
+/// released.
+enum Command {
+    Id(u32),
+    /// Window > Standby window > Press a new hotkey: says what to do,
+    /// then the next key pressed becomes the hotkey.
+    PickStandbyHotkey,
+    /// An information box.
+    Message(String),
+    /// Help > Check for updates found its answer; `asked` is false for
+    /// the weekly check, which only speaks up about a new release.
+    UpdateFound {
+        outcome: crate::update::Outcome,
+        asked: bool,
+    },
+    /// File > Exit or the close box: asks first when sessions are open.
+    Exit,
+    /// The last pane closed: the window goes.
+    Destroy,
+    SetMenuVisible(bool),
+    Copy,
+    Paste,
+    /// The host asked to put text on the clipboard.
+    ClipboardWrite(String),
+    /// Ctrl+click on an OSC 8 link; the target is unchecked.
+    OpenLink(String),
+    UpdateTitle,
+    Bell,
+    /// Session > Replace host key: two confirmations, then replace.
+    ReplaceHostKey,
+    OpenFolder(PathBuf),
+    /// Settings > Font on a free font that is not installed.
+    FontPage {
+        family: &'static str,
+        url: &'static str,
+    },
+    /// The tab strip's close mark: asks first when sessions are open.
+    CloseTab(usize),
+    /// File > Import connections: the side pane's import page.
+    ImportSessions,
+    /// File > Import snippets: the side pane's import page for snippets.
+    ImportSnippets,
+    /// Session > Check a log: the file picker, then the chain check.
+    VerifyLog,
+    /// The import page's file picker.
+    PickImportFile,
+    SaveLook,
+    /// A message box with this text.
+    Notice(String),
+    /// Ask, then delete `entries` in folder `dir` of `key`'s host (when
+    /// it is still the listed one).
+    ConfirmDelete {
+        key: String,
+        dir: Vec<u8>,
+        entries: Vec<DirEntry>,
+    },
+    /// The folder picker for the file view's Local PC section, starting
+    /// in this folder.
+    PickLocalFolder(PathBuf),
+    /// The file picker, then upload into `dir` on `key`'s host.
+    PickUpload {
+        key: String,
+        dir: Vec<u8>,
+    },
+    /// The file picker, for the server's `rz` in pane `pane`.
+    PickZmodem {
+        pane: PaneId,
+        channel: ChannelId,
+    },
+    /// A menu of tmux sessions to switch gateway `gateway`'s client to.
+    TmuxPicker {
+        gateway: PaneId,
+        names: Vec<String>,
+    },
+    /// The connection manager's right-click menu, on this host if any.
+    SessionMenu(Option<String>),
+    /// A tab's right-click menu.
+    TabMenu(usize),
+    /// Ask, then remove this saved session.
+    DeleteSession(String),
+    /// The session manager's Delete: ask (when it is still open, or the
+    /// last pane), then close the session's pane.
+    CloseSession {
+        pane: PaneId,
+        label: String,
+        live: bool,
+        last: bool,
+    },
+    /// Ask this; on yes, run the command.
+    Confirm {
+        text: String,
+        then: Box<Command>,
+    },
+    /// Close tab `i` without asking (it was asked already).
+    CloseTabNow(usize),
+    /// Ask, then remove the snippet at this index.
+    DeleteSnippet(usize),
+    /// A snippet is about to go to a pane with the Production theme: asks
+    /// first.
+    ConfirmSnippet {
+        name: String,
+        steps: Vec<Step>,
+        panes: Vec<PaneId>,
+        /// The Production panes' hosts.
+        production: Vec<String>,
+    },
+    /// A run on picked hosts includes hosts with the Production theme:
+    /// asks first.
+    ConfirmRun {
+        name: String,
+        hosts: Vec<Place>,
+        run: Run,
+        /// The Production hosts.
+        production: Vec<String>,
+    },
+    /// Ask before a password manager command gets a login script's
+    /// secret the first time (`name`; `None` is the login password).
+    ConfirmSecretTool {
+        pane: PaneId,
+        line: String,
+        name: Option<String>,
+    },
+    /// The file picker for the session form's key file.
+    PickKey,
+    /// Ask before a password manager command runs the first time.
+    ConfirmPasswordTool {
+        pane: PaneId,
+        line: String,
+    },
+    /// Ask before opening VNC connection `name`, whose desktop `target`
+    /// is another machine than its SSH server `via`.
+    ApprovePlainVnc {
+        /// What the approval is kept under in `plain_vnc_ok`.
+        key: String,
+        name: String,
+        target: String,
+        via: String,
+        split: bool,
+    },
+    /// Ask before running a host's `ProxyCommand` for the first time.
+    ApproveProxy {
+        pane: PaneId,
+        connection: ChannelId,
+        tunnel: ChannelId,
+        command: ProxyCommand,
+        input: std::sync::mpsc::Receiver<Message>,
+    },
+}
+
+/// A modal message box; `None` if another one is already open.
+fn dialog(hwnd: HWND, text: &str, style: MESSAGEBOX_STYLE) -> Option<MESSAGEBOX_RESULT> {
+    if DIALOG_OPEN.get() {
+        return None;
+    }
+    DIALOG_OPEN.set(true);
+    // SAFETY: our window and valid strings. The box runs a modal loop that
+    // dispatches messages back to the window; no state borrow is held.
+    let result = unsafe { MessageBoxW(Some(hwnd), &HSTRING::from(text), w!("FeroSSH"), style) };
+    DIALOG_OPEN.set(false);
+    Some(result)
+}
+
+fn run_commands(hwnd: HWND, commands: Vec<Command>) {
+    for command in commands {
+        run_command(hwnd, command);
+    }
+}
+
+/// Session > Attach tmux on a pane that is not at a logged-in shell.
+const NOT_IN_SHELL: &str = "Log in to an SSH host in this pane first; Attach tmux types \
+                            `tmux -CC new-session -A -s main` at its shell (the session name \
+                            comes from the host's Tmux setting in ferossh.conf).";
+
+/// The size, in pixels, a remote desktop in a pane at `rect` should have.
+fn desktop_size(rect: Rect) -> (u16, u16) {
+    let side = |v: i32| u16::try_from(v.clamp(200, 8192)).unwrap_or(1024);
+    (side(rect.w), side(rect.h))
+}
+
+/// Session > Open virtual desktop on a pane that is not logged in.
+const NO_VDESK_HOST: &str = "Log in to an SSH host in this pane first. Open virtual desktop \
+                             starts Xvfb and x11vnc on that host and shows the desktop through \
+                             the connection.";
+
+/// Where a virtual desktop's x11vnc listens, as the server sees it.
+const VDESK_HOST: &str = "127.0.0.1";
+const NO_APP_HOST: &str = "Log in to an SSH host in this pane first. Run remote app starts the \
+                           program on that host and shows its windows here.";
+
+/// What to tell the user when a remote app ended: nothing when its
+/// program simply exited.
+fn remote_app_note(what: &str, label: &str, end: &ferostream_client::win32::End) -> Option<String> {
+    if let Some(id) = &end.left_running {
+        return Some(format!(
+            "{what} still runs on {label} (session {id}). Session > Remote apps > Reattach \
+             remote app brings its windows back."
+        ));
+    }
+    let problem = end.problem.as_deref()?;
+    let mut text = format!("{what} on {label} stopped.\n\n{problem}");
+    if problem.contains("ferostream-agent") && problem.contains("not found") {
+        text.push_str(
+            "\n\nThe host has no FeroStream agent. Turn on Session > Remote apps > Copy the \
+             agent to hosts, and keep ferostream-agent next to ferossh.exe.",
+        );
+    }
+    if problem.contains("Xvfb") {
+        text.push_str(
+            "\n\nThe host needs Xvfb: sudo apt install xvfb (Fedora: xorg-x11-server-Xvfb).",
+        );
+    }
+    Some(text)
+}
+
+/// Session > Open remote desktop on a pane that is not logged in.
+const NO_DESKTOP_HOST: &str = "Log in to an SSH host in this pane first. Open remote desktop \
+                               tunnels the host's Remote Desktop (RDP) port over that \
+                               connection and opens Remote Desktop Connection on it.";
+
+/// The message for file transfer without a logged-in pane.
+const NOT_CONNECTED: &str = "Log in to an SSH host in this pane first; files go to and from \
+                             the host of the focused pane.";
+
+/// Starts Windows' Remote Desktop Connection on `addr`, from System32 so
+/// nothing earlier on PATH stands in for it.
+/// The keyboard layout's language id (0x409 for US English), which an
+/// RDP server needs to read the scan codes the viewer sends.
+#[cfg(feature = "viewer")]
+fn keyboard_layout() -> u32 {
+    // SAFETY: no arguments to get wrong; 0 is this thread.
+    let hkl = unsafe { windows::Win32::UI::Input::KeyboardAndMouse::GetKeyboardLayout(0) };
+    (hkl.0 as usize & 0xffff) as u32
+}
+
+/// Starts a VNC viewer installed on this PC on `addr` (`host:port`), and
+/// names it; `None` when none was found. TigerVNC, TightVNC, RealVNC and
+/// UltraVNC all take `host::port`.
+fn launch_vnc_viewer(addr: &str, (to_host, from_host): (bool, bool)) -> Option<&'static str> {
+    const KNOWN: [(&str, &str); 5] = [
+        ("TigerVNC\\vncviewer.exe", "TigerVNC Viewer"),
+        ("TightVNC\\tvnviewer.exe", "TightVNC Viewer"),
+        ("RealVNC\\VNC Viewer\\vncviewer.exe", "RealVNC Viewer"),
+        ("uvnc bvba\\UltraVNC\\vncviewer.exe", "UltraVNC Viewer"),
+        ("UltraVNC\\vncviewer.exe", "UltraVNC Viewer"),
+    ];
+    let target = match addr.rsplit_once(':') {
+        Some((host, port)) => format!("{host}::{port}"),
+        None => addr.to_owned(),
+    };
+    let roots: Vec<PathBuf> = ["ProgramFiles", "ProgramFiles(x86)", "ProgramW6432"]
+        .iter()
+        .filter_map(std::env::var_os)
+        .map(PathBuf::from)
+        .chain(std::env::var_os("LOCALAPPDATA").map(|d| PathBuf::from(d).join("Programs")))
+        .collect();
+    let installed = KNOWN.iter().find_map(|(path, name)| {
+        roots
+            .iter()
+            .map(|r| r.join(path))
+            .find(|p| p.is_file())
+            .map(|p| (p, *name))
+    });
+    // Then the PATH, looked up here so no current folder is searched.
+    let found = installed.or_else(|| {
+        let path = std::env::var_os("PATH")?;
+        std::env::split_paths(&path).find_map(|dir| {
+            [
+                ("vncviewer.exe", "the VNC viewer"),
+                ("tvnviewer.exe", "TightVNC Viewer"),
+            ]
+            .iter()
+            .map(|(exe, name)| (dir.join(exe), *name))
+            .find(|(p, _)| p.is_absolute() && p.is_file())
+        })
+    });
+    let (exe, name) = found?;
+    let mut c = std::process::Command::new(exe);
+    // TigerVNC's viewer takes the clipboard's ways; for the others the
+    // virtual desktop's server enforces them.
+    if name == "TigerVNC Viewer" {
+        c.arg(format!("-SendClipboard={}", u8::from(to_host)))
+            .arg(format!("-AcceptClipboard={}", u8::from(from_host)));
+    }
+    c.arg(target).spawn().ok().map(|_| name)
+}
+
+/// Opens Remote Desktop Connection on `addr`, at `size` when one is set
+/// (else at its own default). Its own settings share the clipboard; with
+/// `clipboard` false it opens a connection file that turns that off
+/// (mstsc has no switch for it on its command line).
+fn launch_rdp_client(
+    addr: &str,
+    size: Option<(u16, u16)>,
+    clipboard: bool,
+) -> std::io::Result<std::process::Child> {
+    let root = std::env::var_os("SystemRoot").unwrap_or_else(|| "C:\\Windows".into());
+    let mstsc = PathBuf::from(root).join("System32").join("mstsc.exe");
+    let mut c = std::process::Command::new(mstsc);
+    if !clipboard {
+        let file = app_dir().join("rdp").join("no-clipboard.rdp");
+        write_app_file(&file, &rdp_file(addr, size))?;
+        c.arg(file);
+    }
+    c.arg(format!("/v:{addr}"));
+    if let Some((w, h)) = size {
+        c.arg(format!("/w:{w}")).arg(format!("/h:{h}"));
+    }
+    c.spawn()
+}
+
+/// A Remote Desktop Connection file for `addr` without the clipboard.
+fn rdp_file(addr: &str, size: Option<(u16, u16)>) -> String {
+    let addr: String = addr.chars().filter(|c| !c.is_control()).collect();
+    let mut text = format!("full address:s:{addr}\r\nredirectclipboard:i:0\r\n");
+    if let Some((w, h)) = size {
+        text.push_str(&format!(
+            "screen mode id:i:1\r\ndesktopwidth:i:{w}\r\ndesktopheight:i:{h}\r\n"
+        ));
+    }
+    text
+}
+
+/// The key of a host's transfer queue: one per user, host name and port.
+fn sftp_key(t: &Target) -> String {
+    format!("{}@{}:{}", t.user, t.hostname.to_ascii_lowercase(), t.port)
+}
+
+/// The paths of files dropped from Explorer, and where they were dropped.
+fn dropped_files(drop: HDROP) -> (Vec<PathBuf>, POINT) {
+    let mut paths = Vec::new();
+    let mut at = POINT::default();
+    // SAFETY: `drop` is the handle WM_DROPFILES carried; each buffer is
+    // sized from the length the first call reports, and DragFinish frees
+    // the handle once.
+    unsafe {
+        let count = DragQueryFileW(drop, u32::MAX, None);
+        for i in 0..count {
+            let len = DragQueryFileW(drop, i, None) as usize;
+            let mut buf = vec![0u16; len + 1];
+            let got = DragQueryFileW(drop, i, Some(&mut buf)) as usize;
+            if let Some(name) = buf.get(..got) {
+                paths.push(PathBuf::from(String::from_utf16_lossy(name)));
+            }
+        }
+        let _ = DragQueryPoint(drop, &mut at);
+        DragFinish(drop);
+    }
+    (paths, at)
+}
+
+/// Files dropped on the window: asks, then uploads them to the host of
+/// the pane they landed on.
+fn drop_files(hwnd: HWND, drop: HDROP) {
+    let (paths, at) = dropped_files(drop);
+    upload_dropped(hwnd, &paths, at);
+}
+
+/// Local files let go at client point `at`, from Explorer or dragged out
+/// of File transfer's Local list: asks, then uploads them to the host of
+/// the pane they landed on.
+fn upload_dropped(hwnd: HWND, paths: &[PathBuf], at: POINT) {
+    if paths.is_empty() {
+        return;
+    }
+    let target = with_window(|w| w.drop_target(at.x, at.y))
+        .unwrap_or(Err("FeroSSH is busy; drop the files again."));
+    let (key, dir) = match target {
+        Ok(t) => t,
+        Err(why) => {
+            dialog(hwnd, why, MB_OK | MB_ICONINFORMATION);
+            return;
+        }
+    };
+    let what = match paths {
+        [one] => format!(
+            "\"{}\"",
+            one.file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default()
+        ),
+        many => format!("{} items", many.len()),
+    };
+    let host = key.rsplit_once(':').map_or(key.as_str(), |(h, _)| h);
+    let text = format!("Upload {what} to {} on {host}?", names::display(&dir));
+    if dialog(hwnd, &text, MB_YESNO | MB_ICONQUESTION) == Some(IDYES) {
+        with_window(|w| w.upload_files(&key, paths, &dir));
+    }
+}
+
+/// File > Upload files (and ZMODEM): the system file picker, several
+/// files at once.
+fn pick_files(hwnd: HWND, title: PCWSTR) -> Vec<PathBuf> {
+    if DIALOG_OPEN.get() {
+        return Vec::new();
+    }
+    let mut buf = vec![0u16; 64 * 1024];
+    let mut ofn = OPENFILENAMEW {
+        lStructSize: std::mem::size_of::<OPENFILENAMEW>() as u32,
+        hwndOwner: hwnd,
+        lpstrFile: PWSTR(buf.as_mut_ptr()),
+        nMaxFile: buf.len() as u32,
+        lpstrTitle: title,
+        Flags: OFN_ALLOWMULTISELECT
+            | OFN_EXPLORER
+            | OFN_FILEMUSTEXIST
+            | OFN_PATHMUSTEXIST
+            | OFN_NOCHANGEDIR,
+        ..Default::default()
+    };
+    DIALOG_OPEN.set(true);
+    // SAFETY: the struct is filled in as documented and `buf` outlives the
+    // call; the dialog's modal loop holds no state borrow.
+    let ok = unsafe { GetOpenFileNameW(&mut ofn) }.as_bool();
+    DIALOG_OPEN.set(false);
+    if !ok {
+        return Vec::new();
+    }
+    // A folder, then the names, each NUL-terminated; one file comes as its
+    // full path alone.
+    let parts: Vec<String> = buf
+        .split(|&c| c == 0)
+        .take_while(|p| !p.is_empty())
+        .map(String::from_utf16_lossy)
+        .collect();
+    match parts.as_slice() {
+        [] => Vec::new(),
+        [one] => vec![PathBuf::from(one)],
+        [dir, names @ ..] => names.iter().map(|n| Path::new(dir).join(n)).collect(),
+    }
+}
+
+/// The folder picker (the Vista-style one Explorer users know), starting
+/// in `start`.
+fn pick_folder(hwnd: HWND, title: PCWSTR, start: &Path) -> Option<PathBuf> {
+    use windows::Win32::System::Com::{
+        CLSCTX_INPROC_SERVER, COINIT_APARTMENTTHREADED, CoCreateInstance, CoInitializeEx,
+        CoTaskMemFree, CoUninitialize,
+    };
+    use windows::Win32::UI::Shell::{
+        FOS_FORCEFILESYSTEM, FOS_PATHMUSTEXIST, FOS_PICKFOLDERS, FileOpenDialog, IFileOpenDialog,
+        IShellItem, SHCreateItemFromParsingName, SIGDN_FILESYSPATH,
+    };
+    if DIALOG_OPEN.get() {
+        return None;
+    }
+    // SAFETY: COM on this (the UI) thread, balanced below when it took;
+    // the dialog and its items are released when they drop; the path
+    // string is freed with CoTaskMemFree after it is copied.
+    unsafe {
+        let com = CoInitializeEx(None, COINIT_APARTMENTTHREADED).is_ok();
+        let picked = (|| -> Result<PathBuf> {
+            let dialog: IFileOpenDialog =
+                CoCreateInstance(&FileOpenDialog, None, CLSCTX_INPROC_SERVER)?;
+            let options = dialog.GetOptions()?;
+            dialog
+                .SetOptions(options | FOS_PICKFOLDERS | FOS_FORCEFILESYSTEM | FOS_PATHMUSTEXIST)?;
+            dialog.SetTitle(title)?;
+            let start = HSTRING::from(start.as_os_str());
+            if let Ok(folder) = SHCreateItemFromParsingName::<_, _, IShellItem>(&start, None) {
+                let _ = dialog.SetFolder(&folder);
+            }
+            DIALOG_OPEN.set(true);
+            let shown = dialog.Show(Some(hwnd));
+            DIALOG_OPEN.set(false);
+            shown?;
+            let name = dialog.GetResult()?.GetDisplayName(SIGDN_FILESYSPATH)?;
+            let path = name
+                .to_string()
+                .map_err(|e| windows::core::Error::new(E_FAIL, e.to_string()));
+            CoTaskMemFree(Some(name.0 as *const _));
+            Ok(PathBuf::from(path?))
+        })();
+        if com {
+            CoUninitialize();
+        }
+        picked.ok()
+    }
+}
+
+/// The session form's Browse: one key file, starting in `~/.ssh`.
+fn pick_key_file(hwnd: HWND) -> Option<PathBuf> {
+    pick_file(
+        hwnd,
+        w!("Key file for this connection"),
+        &home().join(".ssh"),
+    )
+}
+
+/// The open-file dialog, starting in `dir`.
+fn pick_file(hwnd: HWND, title: PCWSTR, dir: &std::path::Path) -> Option<PathBuf> {
+    if DIALOG_OPEN.get() {
+        return None;
+    }
+    let mut buf = vec![0u16; 4096];
+    let dir = HSTRING::from(dir.as_os_str());
+    let mut ofn = OPENFILENAMEW {
+        lStructSize: std::mem::size_of::<OPENFILENAMEW>() as u32,
+        hwndOwner: hwnd,
+        lpstrFile: PWSTR(buf.as_mut_ptr()),
+        nMaxFile: buf.len() as u32,
+        lpstrInitialDir: PCWSTR(dir.as_ptr()),
+        lpstrTitle: title,
+        Flags: OFN_EXPLORER | OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR,
+        ..Default::default()
+    };
+    DIALOG_OPEN.set(true);
+    // SAFETY: the struct is filled in as documented; `buf` and `dir`
+    // outlive the call; the dialog's modal loop holds no state borrow.
+    let ok = unsafe { GetOpenFileNameW(&mut ofn) }.as_bool();
+    DIALOG_OPEN.set(false);
+    if !ok {
+        return None;
+    }
+    let len = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
+    buf.get(..len)
+        .map(|name| PathBuf::from(String::from_utf16_lossy(name)))
+}
+
+/// Which file a host the session form cannot change comes from, as the
+/// user knows it.
+fn host_file(host: &str) -> String {
+    let imported = Client::ALL.into_iter().find(|&c| {
+        std::fs::read_to_string(imported_path(c)).is_ok_and(|t| {
+            ssh_config::hosts(&t, &ssh_config::NoIncludes)
+                .iter()
+                .any(|h| h.name.eq_ignore_ascii_case(host))
+        })
+    });
+    match imported {
+        Some(c) => format!("the {} import", c.name()),
+        None => "~/.ssh/config".to_owned(),
+    }
+}
+
+/// A tab's right-click menu: rename its session, or close it.
+fn tab_menu(hwnd: HWND, tab: usize) {
+    const RENAME: u32 = 1;
+    const CLOSE: u32 = 2;
+    // SAFETY: a popup menu of our own on our window, destroyed after use.
+    // TPM_RETURNCMD returns the picked id, 0 for none.
+    let picked = unsafe {
+        let Ok(menu) = CreatePopupMenu() else {
+            return;
+        };
+        let _ = AppendMenuW(menu, MF_STRING, RENAME as usize, w!("Rena&me session..."));
+        let _ = AppendMenuW(menu, MF_SEPARATOR, 0, None);
+        let _ = AppendMenuW(menu, MF_STRING, CLOSE as usize, w!("&Close tab\tCtrl+F4"));
+        let mut pt = POINT::default();
+        let _ = GetCursorPos(&mut pt);
+        let chosen = TrackPopupMenu(
+            menu,
+            TPM_RETURNCMD | TPM_NONOTIFY,
+            pt.x,
+            pt.y,
+            None,
+            hwnd,
+            None,
+        );
+        let _ = DestroyMenu(menu);
+        u32::try_from(chosen.0).unwrap_or(0)
+    };
+    match picked {
+        RENAME => {
+            with_window(|w| {
+                if let Some(focus) = w.ws.tabs.get(tab).map(|t| t.focus) {
+                    w.start_rename(focus);
+                }
+            });
+        }
+        CLOSE => run_command(hwnd, Command::CloseTab(tab)),
+        _ => {}
+    }
+}
+
+/// The connection manager's right-click menu.
+/// Carries out what the user did in the connection manager's controls.
+fn conn_event(hwnd: HWND, event: conn_view::Event) {
+    use conn_view::Event;
+    let command = match event {
+        Event::Action(action) => with_window(|w| w.side_action(Some(action))).flatten(),
+        Event::OpenFirst { split } => with_window(|w| {
+            let host = w.side.list.first_match()?;
+            w.side_action(Some(SideAction::Open { host, split }))
+        })
+        .flatten(),
+        Event::Menu(host) => Some(Command::SessionMenu(host)),
+        Event::Command(id) => Some(Command::Id(id)),
+        Event::Query(query) => {
+            with_window(|w| {
+                w.side.list.set_query(&query);
+                w.refresh_chrome();
+            });
+            None
+        }
+        Event::Focused => {
+            with_window(|w| {
+                if !w.side.focused {
+                    w.side.focused = true;
+                    w.refresh_chrome();
+                }
+            });
+            None
+        }
+        Event::Refresh => {
+            with_window(|w| w.show_side(SideView::Sessions, true));
+            None
+        }
+    };
+    if let Some(command) = command {
+        run_command(hwnd, command);
+    }
+}
+
+/// One of the native tools' controls has the keyboard.
+fn tools_have_focus() -> bool {
+    conn_view::has_focus()
+        || live_panel::has_focus()
+        || form_view::has_focus()
+        || files_panel::has_focus()
+        || fwd_panel::has_focus()
+        || scripts_panel::has_focus()
+        || script_editor::has_focus()
+        || script_args::has_focus()
+        || script_hosts::has_focus()
+        || script_report::has_focus()
+}
+
+/// Carries out what the user did on a script run's report: its keys go
+/// to the scripts view, as the drawn report's did.
+fn script_report_event(hwnd: HWND, event: script_report::Event) {
+    let command = match event {
+        script_report::Event::Select(i) => {
+            with_window(|w| w.snippets_view.native_report_select(i));
+            None
+        }
+        script_report::Event::Key(key) => with_window(|w| w.side_key(key)).flatten(),
+    };
+    if let Some(command) = command {
+        run_command(hwnd, command);
+    }
+}
+
+/// Carries out what the user did on the page picking the hosts to run a
+/// script on.
+fn script_hosts_event(hwnd: HWND, event: script_hosts::Event) {
+    let command = match event {
+        script_hosts::Event::Filter(text) => {
+            with_window(|w| {
+                w.snippets_view.native_pick_filter(&text);
+                w.refresh_chrome();
+            });
+            None
+        }
+        script_hosts::Event::Pick(index, picked) => {
+            with_window(|w| {
+                w.snippets_view.native_pick(index, picked);
+                w.refresh_chrome();
+            });
+            None
+        }
+        script_hosts::Event::PickShown(picked) => {
+            with_window(|w| {
+                w.snippets_view.native_pick_shown(picked);
+                w.refresh_chrome();
+            });
+            None
+        }
+        script_hosts::Event::Run { parallel, password } => with_window(|w| {
+            let action = w.snippets_view.native_pick_start(&parallel, password);
+            w.snippets_action(action)
+        })
+        .flatten(),
+        script_hosts::Event::Cancel => {
+            with_window(|w| {
+                w.snippets_view.native_pick_cancel();
+                w.refresh_chrome();
+            });
+            None
+        }
+    };
+    if let Some(command) = command {
+        run_command(hwnd, command);
+    }
+}
+
+/// Carries out what the user did on the page asking for a script's
+/// arguments.
+fn script_args_event(hwnd: HWND, event: script_args::Event) {
+    let command = match event {
+        script_args::Event::Values(values) => {
+            with_window(|w| {
+                w.snippets_view.native_ask_values(values);
+                w.refresh_chrome();
+            });
+            None
+        }
+        script_args::Event::Run(values) => with_window(|w| {
+            let action = w.snippets_view.native_ask_run(values);
+            w.snippets_action(action)
+        })
+        .flatten(),
+        script_args::Event::Cancel => with_window(|w| {
+            let action = w.snippets_view.native_ask_cancel();
+            w.snippets_action(action)
+        })
+        .flatten(),
+    };
+    if let Some(command) = command {
+        run_command(hwnd, command);
+    }
+}
+
+/// Carries out what the user did in the script editor: Save goes through
+/// the scripts view's checks, as the drawn editor's did.
+fn script_editor_event(hwnd: HWND, event: script_editor::Event) {
+    let command = match event {
+        script_editor::Event::Save { head, lines } => with_window(|w| {
+            let action = w.snippets_view.native_save(head, &lines);
+            w.snippets_action(action)
+        })
+        .flatten(),
+        script_editor::Event::Cancel => {
+            with_window(|w| {
+                w.snippets_view.native_cancel();
+                w.refresh_chrome();
+            });
+            None
+        }
+    };
+    if let Some(command) = command {
+        run_command(hwnd, command);
+    }
+}
+
+/// Carries out what the user did in the scripts pane: its keys go to
+/// the scripts view, as the drawn list's did.
+fn scripts_event(hwnd: HWND, event: scripts_panel::Event) {
+    let command = match event {
+        scripts_panel::Event::Select(pos) => {
+            with_window(|w| w.snippets_view.select(pos));
+            None
+        }
+        scripts_panel::Event::Filter(text) => {
+            with_window(|w| {
+                w.snippets_view.set_filter(&text);
+                w.refresh_chrome();
+            });
+            None
+        }
+        scripts_panel::Event::Key(pos, key) => with_window(|w| {
+            if let Some(pos) = pos {
+                w.snippets_view.select(pos);
+            }
+            w.side_key(key)
+        })
+        .flatten(),
+    };
+    if let Some(command) = command {
+        run_command(hwnd, command);
+    }
+}
+
+/// Carries out what the user did in the port forwards pane.
+fn fwd_event(hwnd: HWND, event: fwd_panel::Event) {
+    let command = match event {
+        fwd_panel::Event::Action(action) => {
+            with_window(|w| w.forwards_action(Some(action))).flatten()
+        }
+        fwd_panel::Event::Focused => {
+            with_window(|w| {
+                if !w.side.focused {
+                    w.side.focused = true;
+                    w.refresh_chrome();
+                }
+            });
+            None
+        }
+    };
+    if let Some(command) = command {
+        run_command(hwnd, command);
+    }
+}
+
+/// Carries out what the user did in the file transfer pane.
+/// A control in a tools panel took the keyboard: the tools have it now,
+/// so nothing hands it back to the terminal mid-click.
+fn tools_focused() {
+    with_window(|w| {
+        if !w.side.focused {
+            w.side.focused = true;
+            w.refresh_chrome();
+        }
+    });
+}
+
+fn files_event(hwnd: HWND, event: files_panel::Event) {
+    // Asks first, with no window state borrowed.
+    if let files_panel::Event::DropOut { paths, at } = &event {
+        upload_dropped(hwnd, paths, *at);
+        return;
+    }
+    if let Some(command) = with_window(|w| w.files_event(event)).flatten() {
+        run_command(hwnd, command);
+    }
+}
+
+/// Carries out what the user did in the connection form's controls.
+fn form_event(hwnd: HWND, event: form_view::Event) {
+    use form_view::Event;
+    let command = match event {
+        Event::Text(field, text) => {
+            with_window(|w| {
+                if let Some(f) = &mut w.side.form {
+                    f.set_text(field, &text);
+                }
+                w.refresh_chrome();
+            });
+            None
+        }
+        Event::Choice(field, index) => {
+            with_window(|w| {
+                if let Some(f) = &mut w.side.form {
+                    f.set_choice(field, index);
+                }
+                w.refresh_chrome();
+            });
+            None
+        }
+        Event::Browse => with_window(|w| w.form_action(Some(FormAction::BrowseKey))).flatten(),
+        Event::Save(connect) => with_window(|w| {
+            let action = w.side.form.as_mut()?.submit(connect);
+            // A problem shows in the form; nothing else happens.
+            if action.is_none() {
+                w.refresh_chrome();
+            }
+            w.form_action(action)
+        })
+        .flatten(),
+        Event::Cancel => with_window(|w| w.form_action(Some(FormAction::Cancel))).flatten(),
+        Event::Delete => with_window(|w| w.form_action(Some(FormAction::Delete))).flatten(),
+        Event::Focused => {
+            with_window(|w| {
+                if !w.side.focused {
+                    w.side.focused = true;
+                    w.refresh_chrome();
+                }
+            });
+            None
+        }
+    };
+    if let Some(command) = command {
+        run_command(hwnd, command);
+    }
+}
+
+/// Carries out what the user did in the session manager's controls.
+fn live_event(hwnd: HWND, event: live_panel::Event) {
+    use live_panel::Event;
+    let command = match event {
+        Event::Show(pane) => with_window(|w| w.live_action(Some(LiveAction::Show(pane)))).flatten(),
+        Event::Close(pane) => {
+            with_window(|w| w.live_action(Some(LiveAction::Close(pane)))).flatten()
+        }
+        Event::Rename(pane, text) => {
+            with_window(|w| {
+                w.live_view.cancel_rename();
+                let session = w.open_sessions().into_iter().find(|s| s.pane == pane);
+                // An unnamed session's row shows its target: left as it
+                // was, it stays unnamed.
+                let unchanged = session.is_some_and(|s| {
+                    s.name.is_none() && live::clean_name(&text).is_none_or(|n| n == s.target)
+                });
+                if !unchanged {
+                    w.rename_session(pane, Some(text));
+                }
+                w.end_rename();
+                w.refresh_chrome();
+            });
+            None
+        }
+        Event::RenameCancelled => {
+            with_window(|w| {
+                w.live_view.cancel_rename();
+                if w.rename_return.is_some() {
+                    w.end_rename();
+                }
+                w.refresh_chrome();
+            });
+            None
+        }
+        Event::Query(query) => {
+            with_window(|w| {
+                w.live_view.set_query(&query);
+                w.refresh_chrome();
+            });
+            None
+        }
+        Event::Focused => {
+            with_window(|w| {
+                if !w.side.focused {
+                    w.side.focused = true;
+                    w.refresh_chrome();
+                }
+            });
+            None
+        }
+        Event::Leave => with_window(|w| w.live_action(Some(LiveAction::Leave))).flatten(),
+    };
+    if let Some(command) = command {
+        run_command(hwnd, command);
+    }
+}
+
+fn session_menu(hwnd: HWND, host: Option<String>) {
+    const CONNECT: u32 = 1;
+    const SPLIT: u32 = 2;
+    const EDIT: u32 = 3;
+    const DELETE: u32 = 4;
+    const NEW: u32 = 5;
+    // SAFETY: a popup menu of our own on our window, destroyed after use.
+    // TPM_RETURNCMD returns the picked id, 0 for none.
+    let picked = unsafe {
+        let Ok(menu) = CreatePopupMenu() else {
+            return;
+        };
+        if host.is_some() {
+            let _ = AppendMenuW(menu, MF_STRING, CONNECT as usize, w!("&Connect\tEnter"));
+            let _ = AppendMenuW(
+                menu,
+                MF_STRING,
+                SPLIT as usize,
+                w!("Open in a &split\tShift+Enter"),
+            );
+            let _ = AppendMenuW(menu, MF_SEPARATOR, 0, None);
+            let _ = AppendMenuW(
+                menu,
+                MF_STRING,
+                EDIT as usize,
+                w!("&Edit connection...\tF2"),
+            );
+            let _ = AppendMenuW(
+                menu,
+                MF_STRING,
+                DELETE as usize,
+                w!("&Delete connection...\tDel"),
+            );
+            let _ = AppendMenuW(menu, MF_SEPARATOR, 0, None);
+        }
+        let _ = AppendMenuW(menu, MF_STRING, NEW as usize, w!("&New connection...\tIns"));
+        let mut pt = POINT::default();
+        let _ = GetCursorPos(&mut pt);
+        let chosen = TrackPopupMenu(
+            menu,
+            TPM_RETURNCMD | TPM_NONOTIFY,
+            pt.x,
+            pt.y,
+            None,
+            hwnd,
+            None,
+        );
+        let _ = DestroyMenu(menu);
+        u32::try_from(chosen.0).unwrap_or(0)
+    };
+    let action = match (picked, host) {
+        (CONNECT, Some(host)) => SideAction::Open { host, split: false },
+        (SPLIT, Some(host)) => SideAction::Open { host, split: true },
+        (EDIT, Some(host)) => SideAction::Edit(host),
+        (DELETE, Some(host)) => SideAction::Delete(host),
+        (NEW, _) => SideAction::New,
+        _ => return,
+    };
+    if let Some(Some(command)) = with_window(|w| w.side_action(Some(action))) {
+        run_command(hwnd, command);
+    }
+}
+
+/// The Tools menu commands that show or hide a side pane. Menu clicks
+/// and the shortcuts both go through [`Window::toggle_side`]; keep this
+/// the one list, so a new pane cannot miss the menu path.
+fn is_side_pane(id: u32) -> bool {
+    matches!(
+        id,
+        cmd::SESSIONS | cmd::LIVE | cmd::FILES | cmd::FORWARDS | cmd::SNIPPETS
+    )
+}
+
+/// What a side pane command does.
+#[derive(Debug, PartialEq)]
+enum SideToggle {
+    Show,
+    Hide,
+    Focus,
+}
+
+/// `open`: the pane shows this view; `focused`: it has the keyboard.
+fn side_toggle(open: bool, focused: bool, from_menu: bool) -> SideToggle {
+    match (open, focused || from_menu) {
+        (false, _) => SideToggle::Show,
+        (true, true) => SideToggle::Hide,
+        (true, false) => SideToggle::Focus,
+    }
+}
+
+fn plural(n: usize) -> &'static str {
+    if n == 1 { "" } else { "s" }
+}
+
+fn run_command(hwnd: HWND, command: Command) {
+    match command {
+        Command::Id(id) => {
+            if let Some(next) = with_window(|w| w.command(id)).flatten() {
+                run_command(hwnd, next);
+            }
+        }
+        Command::Exit => {
+            let moving = with_window(|w| w.unfinished_transfers()).unwrap_or(0);
+            let live = with_window(|w| w.live_sessions(None)).unwrap_or(0);
+            if moving > 0 {
+                let text = format!(
+                    "{moving} file transfer{s} not finished. Exit anyway?\n\n\
+                     Partly downloaded files stay as .part files next to where they were going.",
+                    s = if moving == 1 { " is" } else { "s are" },
+                );
+                if dialog(hwnd, &text, MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2) != Some(IDYES) {
+                    return;
+                }
+            } else if live > 1 {
+                let text = format!("{live} SSH sessions are open. Close them all and exit?");
+                if dialog(hwnd, &text, MB_YESNO | MB_ICONQUESTION | MB_DEFBUTTON2) != Some(IDYES) {
+                    return;
+                }
+            }
+            // SAFETY: our own window.
+            let _ = unsafe { DestroyWindow(hwnd) };
+        }
+        Command::Destroy => {
+            // SAFETY: our own window.
+            let _ = unsafe { DestroyWindow(hwnd) };
+        }
+        Command::CloseSession {
+            pane,
+            label,
+            live,
+            last,
+        } => {
+            if live || last {
+                let mut text = format!("Close {label}?");
+                if live {
+                    text.push_str(" Its session ends.");
+                }
+                if last {
+                    text.push_str(" It is the last pane, so FeroSSH closes too.");
+                }
+                if dialog(hwnd, &text, MB_YESNO | MB_ICONQUESTION | MB_DEFBUTTON2) != Some(IDYES) {
+                    return;
+                }
+            }
+            if let Some(next) = with_window(|w| w.close_session(pane)).flatten() {
+                run_command(hwnd, next);
+            }
+        }
+        Command::Confirm { text, then } => {
+            if dialog(hwnd, &text, MB_YESNO | MB_ICONQUESTION | MB_DEFBUTTON2) == Some(IDYES) {
+                run_command(hwnd, *then);
+            }
+        }
+        Command::CloseTabNow(i) => {
+            if let Some(next) = with_window(|w| w.close_tab(i)).flatten() {
+                run_command(hwnd, next);
+            }
+        }
+        Command::CloseTab(i) => {
+            let live = with_window(|w| w.live_sessions(Some(i))).unwrap_or(0);
+            if live > 1 {
+                let text = format!("This tab has {live} open SSH sessions. Close them?");
+                if dialog(hwnd, &text, MB_YESNO | MB_ICONQUESTION | MB_DEFBUTTON2) != Some(IDYES) {
+                    return;
+                }
+            }
+            if let Some(next) = with_window(|w| w.close_tab(i)).flatten() {
+                run_command(hwnd, next);
+            }
+        }
+        Command::SetMenuVisible(visible) => {
+            let Some(menu) = with_window(|w| {
+                w.menu_visible = visible;
+                w.menu
+            }) else {
+                return;
+            };
+            // SAFETY: our window and menu. SetMenu sends WM_SIZE, which
+            // re-lays out the grid.
+            let _ = unsafe { SetMenu(hwnd, visible.then_some(menu)) };
+        }
+        Command::Copy => {
+            let text = with_window(|w| {
+                let focused = w.focused_id();
+                w.panes
+                    .get_mut(&focused)
+                    .and_then(|p| p.term.selection_text())
+            })
+            .flatten();
+            if let Some(text) = text {
+                clipboard::set_text(hwnd, &text);
+            }
+        }
+        Command::Paste => {
+            let Some(text) = clipboard::get_text(hwnd) else {
+                return;
+            };
+            if with_window(|w| w.paste_side(&text)) == Some(true) {
+                return;
+            }
+            let Some(id) = with_window(|w| w.focused_id()) else {
+                return;
+            };
+            if with_window(|w| w.paste_local(id, &text)) != Some(false) {
+                return;
+            }
+            let Some(paste) =
+                with_window(|w| w.panes.get(&id).map(|p| p.term.paste(&text))).flatten()
+            else {
+                return;
+            };
+            let targets = with_window(|w| w.broadcast_targets(id)).unwrap_or_default();
+            let others = if targets.is_empty() {
+                String::new()
+            } else {
+                format!(
+                    "\n\nBroadcast input is on: it goes to {} other pane{} too.",
+                    targets.len(),
+                    plural(targets.len())
+                )
+            };
+            if paste.needs_confirmation() || (!targets.is_empty() && paste.line_breaks > 0) {
+                let lines = paste.line_breaks;
+                let text = format!(
+                    "The text you are pasting contains {lines} line break{s}. Each one acts as \
+                     Enter, so a shell runs every line as soon as it arrives.{others}\n\n{}\n\n\
+                     Paste it?",
+                    clipboard_preview(&text, PREVIEW_CHARS),
+                    s = plural(lines),
+                );
+                let answer = dialog(hwnd, &text, MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2);
+                if answer != Some(IDYES) {
+                    return;
+                }
+            }
+            with_window(|w| {
+                w.input(id, paste.bytes);
+                w.send_typed(&targets, &Typed::Paste(text));
+            });
+        }
+        Command::ClipboardWrite(text) => {
+            let prompt = format!(
+                "The remote program wants to copy {} characters to your clipboard:\n\n{}\n\nAllow it?",
+                text.chars().count(),
+                clipboard_preview(&text, PREVIEW_CHARS)
+            );
+            // While another prompt is open, further requests are refused.
+            if dialog(hwnd, &prompt, MB_YESNO | MB_ICONQUESTION | MB_DEFBUTTON2) == Some(IDYES) {
+                clipboard::set_text(hwnd, &text);
+            }
+        }
+        Command::OpenLink(raw) => match check_link(&raw) {
+            Some(uri) => {
+                let prompt = format!("Open this link in your browser?\n\n{uri}");
+                if dialog(hwnd, &prompt, MB_YESNO | MB_ICONQUESTION) == Some(IDYES) {
+                    // SAFETY: a checked http(s)/mailto URL handed to the
+                    // default handler.
+                    unsafe {
+                        ShellExecuteW(
+                            Some(hwnd),
+                            w!("open"),
+                            &HSTRING::from(uri),
+                            None,
+                            None,
+                            SW_SHOWNORMAL,
+                        );
+                    }
+                }
+            }
+            None => {
+                let text = format!(
+                    "FeroSSH does not open this link. Only http, https and mailto links \
+                     without spaces or hidden characters can be opened.\n\n{}",
+                    clipboard_preview(&raw, PREVIEW_CHARS)
+                );
+                dialog(hwnd, &text, MB_OK | MB_ICONWARNING);
+            }
+        },
+        Command::UpdateTitle => {
+            with_window(|w| w.update_title());
+        }
+        Command::ReplaceHostKey => replace_host_key(hwnd),
+        Command::Notice(text) => {
+            dialog(hwnd, &text, MB_OK | MB_ICONINFORMATION);
+        }
+        Command::PickStandbyHotkey => {
+            let text = "After OK, press the hotkey you want for the standby window, such as \
+                        Win+` or Ctrl+Alt+Space. Esc cancels.\n\nIt needs Ctrl, Alt or Win \
+                        (Pause, Scroll Lock and F13 to F24 work alone). If nothing happens \
+                        when you press it, another program already uses it.";
+            if dialog(hwnd, text, MB_OKCANCEL | MB_ICONINFORMATION) == Some(IDOK) {
+                with_window(|w| {
+                    w.standby.capture = Capture::Waiting;
+                    w.update_title();
+                });
+            }
+        }
+        Command::ConfirmDelete { key, dir, entries } => {
+            let host = key.rsplit_once(':').map_or(key.as_str(), |(h, _)| h);
+            let folders = entries.iter().any(|e| e.attrs.is_dir());
+            let what = match entries.as_slice() {
+                [entry] => {
+                    let path = names::display(&names::join(&dir, &entry.name));
+                    let kind = if folders { "the folder" } else { "the file" };
+                    format!("{kind} {path}")
+                }
+                many => format!("these {} items", many.len()),
+            };
+            let note = if folders {
+                " Only an empty folder can be deleted."
+            } else {
+                ""
+            };
+            let text = format!("Delete {what} on {host}?{note}\n\nThis cannot be undone.");
+            if dialog(hwnd, &text, MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2) == Some(IDYES) {
+                with_window(|w| {
+                    // Not when another folder was listed meanwhile: its
+                    // entries of the same names are not the ones asked about.
+                    if let Some(r) = w.sftp.get_mut(&key) {
+                        if r.listing.path == dir {
+                            for entry in &entries {
+                                r.delete(entry);
+                            }
+                        } else {
+                            r.notice = Some(
+                                "Nothing was deleted: another folder was listed meanwhile.".into(),
+                            );
+                        }
+                    }
+                    w.flush_sftp();
+                    w.refresh_chrome();
+                });
+            }
+        }
+        Command::TmuxPicker { gateway, names } => {
+            let new = cmd::TMUX_SESSION + names.len() as u32;
+            // SAFETY: a popup menu of our own on our window, destroyed
+            // after use. TPM_RETURNCMD returns the picked id, 0 for none.
+            let picked = unsafe {
+                let Ok(menu) = CreatePopupMenu() else {
+                    return;
+                };
+                for (id, name) in (cmd::TMUX_SESSION..).zip(&names) {
+                    let text = crate::ssh::sanitize(name).replace('&', "&&");
+                    let _ = AppendMenuW(menu, MF_STRING, id as usize, &HSTRING::from(text));
+                }
+                let _ = AppendMenuW(menu, MF_SEPARATOR, 0, None);
+                let _ = AppendMenuW(menu, MF_STRING, new as usize, w!("&New tmux session"));
+                let mut pt = POINT::default();
+                let _ = GetCursorPos(&mut pt);
+                let chosen = TrackPopupMenu(
+                    menu,
+                    TPM_RETURNCMD | TPM_NONOTIFY,
+                    pt.x,
+                    pt.y,
+                    None,
+                    hwnd,
+                    None,
+                );
+                let _ = DestroyMenu(menu);
+                u32::try_from(chosen.0).unwrap_or(0)
+            };
+            if (cmd::TMUX_SESSION..=new).contains(&picked) {
+                let name = names.get((picked - cmd::TMUX_SESSION) as usize).cloned();
+                with_window(|w| {
+                    let actions = w
+                        .tmux
+                        .get_mut(&gateway)
+                        .map(|t| t.switch_session(name.as_deref()))
+                        .unwrap_or_default();
+                    w.run_tmux(gateway, actions);
+                });
+            }
+        }
+        Command::PickUpload { key, dir } => {
+            let picked = pick_files(hwnd, w!("Upload files"));
+            if !picked.is_empty() {
+                with_window(|w| w.upload_files(&key, &picked, &dir));
+            }
+        }
+        Command::PickLocalFolder(start) => {
+            if let Some(dir) = pick_folder(hwnd, w!("Local PC folder for file transfers"), &start) {
+                with_window(|w| w.set_download_dir(&dir));
+            }
+        }
+        Command::PickZmodem { pane, channel } => {
+            let picked = pick_files(hwnd, w!("Send files to the server's rz"));
+            with_window(|w| w.zmodem_send(pane, channel, &picked));
+        }
+        Command::ImportSessions => {
+            let (found, problems) = known_imports();
+            with_window(|w| w.open_import(found, problems));
+        }
+        Command::ImportSnippets => {
+            let (found, problems) = known_snippet_imports();
+            with_window(|w| w.open_snippet_import(found, problems));
+        }
+        Command::PickImportFile
+            if with_window(|w| w.side.import.as_ref().is_some_and(ImportView::is_snippets))
+                .unwrap_or(false) =>
+        {
+            let start = std::env::var_os("LOCALAPPDATA").map_or_else(home, PathBuf::from);
+            if let Some(path) = pick_file(
+                hwnd,
+                w!("Scripts, snippets or macros of another program"),
+                &start,
+            ) {
+                match read_snippet_file(&path) {
+                    Ok(found) => {
+                        with_window(|w| w.add_snippet_import(found));
+                    }
+                    Err(e) => {
+                        dialog(hwnd, &e, MB_OK | MB_ICONWARNING);
+                    }
+                }
+            }
+        }
+        Command::PickImportFile => {
+            let start = std::env::var_os("APPDATA").map_or_else(home, PathBuf::from);
+            if let Some(path) = pick_file(hwnd, w!("Sessions file of another SSH client"), &start) {
+                match read_import_file(&path) {
+                    Ok(found) => {
+                        with_window(|w| w.add_import(found));
+                    }
+                    Err(e) => {
+                        dialog(hwnd, &e, MB_OK | MB_ICONWARNING);
+                    }
+                }
+            }
+        }
+        Command::SessionMenu(host) => session_menu(hwnd, host),
+        Command::TabMenu(tab) => tab_menu(hwnd, tab),
+        Command::VerifyLog => {
+            if let Some(path) = pick_file(hwnd, w!("Check a log for changes"), &log_dir()) {
+                let (text, ok) = check_log(&path);
+                let icon = if ok {
+                    MB_ICONINFORMATION
+                } else {
+                    MB_ICONWARNING
+                };
+                dialog(hwnd, &text, MB_OK | icon);
+            }
+        }
+        Command::ConfirmSnippet {
+            name,
+            steps,
+            panes,
+            production,
+        } => {
+            let shown: Vec<String> = steps
+                .iter()
+                .take(8)
+                .map(|s| match s {
+                    Step::Send(t) | Step::Type(t) => t.clone(),
+                    other => format!("@{other}"),
+                })
+                .map(|l| l.chars().filter(|c| !c.is_control()).take(100).collect())
+                .collect();
+            let more = if steps.len() > 8 { "\n..." } else { "" };
+            let text = format!(
+                "Type the script {name} into {}, which {} the Production theme?\n\n{}{more}",
+                production.join(", "),
+                if production.len() == 1 { "has" } else { "have" },
+                shown.join("\n"),
+            );
+            if dialog(hwnd, &text, MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2) == Some(IDYES)
+                && let Some(next) = with_window(|w| w.run_snippet(&name, steps, &panes)).flatten()
+            {
+                run_command(hwnd, next);
+            }
+        }
+        Command::DeleteSnippet(index) => {
+            let Some(name) =
+                with_window(|w| w.settings.snippets.get(index).map(|s| s.name.clone())).flatten()
+            else {
+                return;
+            };
+            let text = format!("Delete the script {name}?");
+            if dialog(hwnd, &text, MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2) == Some(IDYES)
+                && let Some(Some(command)) = with_window(|w| w.delete_snippet(index))
+            {
+                run_command(hwnd, command);
+            }
+        }
+        Command::ConfirmRun {
+            name,
+            hosts,
+            run,
+            production,
+        } => {
+            let text = format!(
+                "Run the script {name} on {} hosts? {} {} the Production theme.",
+                hosts.len(),
+                production.join(", "),
+                if production.len() == 1 { "has" } else { "have" },
+            );
+            if dialog(hwnd, &text, MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2) == Some(IDYES) {
+                with_window(|w| w.start_run(&name, &hosts, run));
+            }
+        }
+        Command::ConfirmSecretTool { pane, line, name } => {
+            let what = match &name {
+                Some(n) => format!("the secret {n} for the login script"),
+                None => "the login password for the login script".to_owned(),
+            };
+            let text = format!(
+                "FeroSSH will run this command to get {what}, and type the first line it \
+                 prints:\n\n{}\n\nIt runs without a shell, a window or any input. Run it now \
+                 and from now on?",
+                line.chars().filter(|c| !c.is_control()).collect::<String>()
+            );
+            let yes =
+                dialog(hwnd, &text, MB_YESNO | MB_ICONQUESTION | MB_DEFBUTTON2) == Some(IDYES);
+            with_window(|w| {
+                if yes {
+                    approve_command(&line);
+                    w.run_script_command(pane, &line, name.as_deref());
+                } else {
+                    w.with_script(pane, |r| {
+                        r.secret_failed("the password command was not run.")
+                    });
+                }
+            });
+        }
+        Command::DeleteSession(name) => {
+            let text = format!(
+                "Delete the connection {name}? Its look and extras in FeroSSH go with it.\n\n\
+                 This cannot be undone."
+            );
+            if dialog(hwnd, &text, MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2) == Some(IDYES) {
+                with_window(|w| w.delete_session(&name));
+            }
+        }
+        Command::ConfirmPasswordTool { pane, line } => {
+            let text = format!(
+                "FeroSSH will run this command to get the login password, and type the first \
+                 line it prints as the password:\n\n{}\n\nIt runs without a shell, a window \
+                 or any input. Run it now and from now on?",
+                line.chars().filter(|c| !c.is_control()).collect::<String>()
+            );
+            let yes =
+                dialog(hwnd, &text, MB_YESNO | MB_ICONQUESTION | MB_DEFBUTTON2) == Some(IDYES);
+            with_window(|w| {
+                if yes {
+                    approve_command(&line);
+                    w.run_password_command(pane, &line);
+                } else {
+                    w.password_result(pane, Err("The password command was not run.".into()), "");
+                }
+            });
+        }
+        Command::ApprovePlainVnc {
+            key,
+            name,
+            target,
+            via,
+            split,
+        } => {
+            let clean = crate::ssh::sanitize_line;
+            // Shown cleaned; the session opens under its own name and SSH server.
+            let (raw_name, raw_via) = (name.clone(), via.clone());
+            let (name, target, via) = (clean(&name), clean(&target), clean(&via));
+            let text = format!(
+                "The VNC desktop {name} is on {target}, another machine than its SSH server \
+                 {via}.\n\nSSH encrypts only the way to {via}. From there to {target}, VNC \
+                 travels unencrypted: anyone on that network can watch the screen and what you \
+                 type, and VNC's own password is weak. Only open it on a network you trust; \
+                 with SSH on {target}, make that machine the SSH server instead.\n\nOpen it \
+                 anyway? FeroSSH asks again after it restarts."
+            );
+            let yes = dialog(hwnd, &text, MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2) == Some(IDYES);
+            if yes {
+                with_window(|w| {
+                    w.plain_vnc_ok.insert(key);
+                    w.open_desktop_session(&raw_name, SessionKind::Vnc, Some(raw_via), split);
+                });
+            }
+        }
+        Command::ApproveProxy {
+            pane,
+            connection,
+            tunnel,
+            command,
+            input,
+        } => {
+            let line: String = command.line.chars().filter(|c| !c.is_control()).collect();
+            let text = format!(
+                "The SSH config says to reach this host through a program (ProxyCommand):\n\n\
+                 {line}\n\nFeroSSH runs it with your rights, outside the sandbox, without a \
+                 shell or a window, and sends the connection through its input and output. \
+                 Only allow a program you know. Run it now and from now on?"
+            );
+            let yes =
+                dialog(hwnd, &text, MB_YESNO | MB_ICONQUESTION | MB_DEFBUTTON2) == Some(IDYES);
+            with_window(|w| {
+                if yes {
+                    approve_proxy(&command.line);
+                    w.run_proxy(pane, connection, tunnel, &command, input);
+                } else {
+                    w.proxy_refused(pane, connection, tunnel, "The ProxyCommand was not run.");
+                }
+            });
+        }
+        Command::PickKey => {
+            if let Some(path) = pick_key_file(hwnd) {
+                with_window(|w| {
+                    if let Some(form) = &mut w.side.form {
+                        form.set_key(&path.display().to_string());
+                    }
+                    w.refresh_chrome();
+                });
+            }
+        }
+        Command::SaveLook => {
+            if let Some(result) = with_window(Window::save_look) {
+                let (text, icon) = match result {
+                    Ok(t) => (t, MB_ICONINFORMATION),
+                    Err(t) => (t, MB_ICONWARNING),
+                };
+                if !text.is_empty() {
+                    dialog(hwnd, &text, MB_OK | icon);
+                }
+            }
+        }
+        Command::Message(text) => {
+            dialog(hwnd, &text, MB_OK | MB_ICONINFORMATION);
+        }
+        Command::UpdateFound { outcome, asked } => {
+            use crate::update::Outcome;
+            let current = env!("CARGO_PKG_VERSION");
+            match outcome {
+                Outcome::Newer(update) => {
+                    let text = format!(
+                        "FeroSSH {} is available (released {}). You have {current}.\n\n\
+                         Open its release page to download it?",
+                        update.version, update.released,
+                    );
+                    if dialog(hwnd, &text, MB_YESNO | MB_ICONINFORMATION) == Some(IDYES) {
+                        // SAFETY: a signed, checked https URL on the
+                        // project's Releases, handed to the browser.
+                        unsafe {
+                            ShellExecuteW(
+                                Some(hwnd),
+                                w!("open"),
+                                &HSTRING::from(update.url.as_str()),
+                                None,
+                                None,
+                                SW_SHOWNORMAL,
+                            );
+                        }
+                    }
+                }
+                Outcome::Current(update) if asked => {
+                    let text = format!(
+                        "FeroSSH {current} is up to date. The latest release is {}.",
+                        update.version
+                    );
+                    dialog(hwnd, &text, MB_OK | MB_ICONINFORMATION);
+                }
+                Outcome::Failed(why) if asked => {
+                    let text = format!("Could not check for updates: {why}.");
+                    dialog(hwnd, &text, MB_OK | MB_ICONWARNING);
+                }
+                Outcome::Current(_) | Outcome::Failed(_) => {}
+            }
+        }
+        Command::FontPage { family, url } => {
+            let text = format!(
+                "{family} is not installed. Open its download page?\n\n{url}\n\n\
+                 Install the font, then restart FeroSSH to use it."
+            );
+            if dialog(hwnd, &text, MB_YESNO | MB_ICONQUESTION) == Some(IDYES) {
+                // SAFETY: a fixed https URL from FONT_PAGES handed to the
+                // browser.
+                unsafe {
+                    ShellExecuteW(
+                        Some(hwnd),
+                        w!("open"),
+                        &HSTRING::from(url),
+                        None,
+                        None,
+                        SW_SHOWNORMAL,
+                    );
+                }
+            }
+        }
+        Command::OpenFolder(dir) => {
+            let _ = std::fs::create_dir_all(&dir);
+            // SAFETY: our own log folder handed to Explorer.
+            unsafe {
+                ShellExecuteW(
+                    Some(hwnd),
+                    w!("open"),
+                    &HSTRING::from(dir.as_os_str()),
+                    None,
+                    None,
+                    SW_SHOWNORMAL,
+                );
+            }
+        }
+        Command::Bell => {
+            let info = FLASHWINFO {
+                cbSize: std::mem::size_of::<FLASHWINFO>() as u32,
+                hwnd,
+                dwFlags: FLASHW_TRAY | FLASHW_TIMERNOFG,
+                uCount: 0,
+                dwTimeout: 0,
+            };
+            // SAFETY: valid struct for our window.
+            let _ = unsafe { FlashWindowEx(&info) };
+        }
+    }
+}
+
+/// Host names already taken outside `client`'s own import: in the user's
+/// ssh_config, the saved sessions and the other imports. Lowercase.
+fn taken_aliases(client: Client) -> Vec<String> {
+    let home = home();
+    let config = std::fs::read_to_string(home.join(".ssh").join("config")).unwrap_or_default();
+    let includes = ssh_config::DirIncludes { home };
+    let mut taken: Vec<String> = ssh_config::hosts(&config, &includes)
+        .into_iter()
+        .map(|h| h.name.to_ascii_lowercase())
+        .collect();
+    taken.extend(
+        load_saved()
+            .into_iter()
+            .map(|h| h.alias.to_ascii_lowercase()),
+    );
+    for other in Client::ALL.into_iter().filter(|&c| c != client) {
+        if let Ok(text) = std::fs::read_to_string(imported_path(other)) {
+            taken.extend(
+                ssh_config::hosts(&text, &ssh_config::NoIncludes)
+                    .into_iter()
+                    .map(|h| h.name.to_ascii_lowercase()),
+            );
+        }
+    }
+    taken
+}
+
+/// What the import page shows for sessions read from `origin`: distinct
+/// names, and the ones a host elsewhere already has marked.
+fn found(client: Client, origin: String, mut sessions: Vec<import::Session>) -> Found {
+    import::distinct(&mut sessions);
+    let taken = taken_aliases(client);
+    let taken = sessions
+        .iter()
+        .map(|s| taken.contains(&s.host.alias.to_ascii_lowercase()))
+        .collect();
+    Found {
+        origin,
+        items: Items::Sessions(client, sessions),
+        taken,
+    }
+}
+
+/// What the snippet import page shows for snippets read from `origin`:
+/// the ones a snippet in the same category already has the name of are
+/// marked (by what is in the snippets folder now).
+fn found_snippets(client: SnippetClient, origin: String, snippets: Vec<Snippet>) -> Found {
+    let (have, _) = snippet_store::load(&snippets_dir());
+    let taken = snippets
+        .iter()
+        .map(|s| snippet_store::has(&have, s))
+        .collect();
+    Found {
+        origin,
+        items: Items::Snippets(client, snippets),
+        taken,
+    }
+}
+
+/// Snippets of one program, with where they were read.
+type SnippetSource = (SnippetClient, String, Vec<Snippet>);
+
+/// The snippets of other programs on this account: Windows Terminal's
+/// `settings.json` (the Store, Preview and unpackaged ones), SecureCRT's
+/// button bars and MobaXterm's macros. Files that could not be read come
+/// back as problems.
+fn known_snippet_imports() -> (Vec<SnippetSource>, Vec<String>) {
+    let mut files: Vec<PathBuf> = Vec::new();
+    if let Some(local) = std::env::var_os("LOCALAPPDATA").map(PathBuf::from) {
+        for package in [
+            "Microsoft.WindowsTerminal_8wekyb3d8bbwe",
+            "Microsoft.WindowsTerminalPreview_8wekyb3d8bbwe",
+        ] {
+            files.push(
+                local
+                    .join("Packages")
+                    .join(package)
+                    .join("LocalState")
+                    .join("settings.json"),
+            );
+        }
+        files.push(
+            local
+                .join("Microsoft")
+                .join("Windows Terminal")
+                .join("settings.json"),
+        );
+    }
+    let appdata = std::env::var_os("APPDATA").map(PathBuf::from);
+    let crt = import_reg::securecrt_config()
+        .map(PathBuf::from)
+        .or_else(|| appdata.as_ref().map(|a| a.join("VanDyke").join("Config")));
+    if let Some(c) = crt {
+        files.push(c.join("ButtonBarV5.ini"));
+        files.push(c.join("ButtonBarV4.ini"));
+    }
+    if let Some(a) = &appdata {
+        files.push(a.join("MobaXterm").join("MobaXterm.ini"));
+    }
+    files.push(
+        home()
+            .join("Documents")
+            .join("MobaXterm")
+            .join("MobaXterm.ini"),
+    );
+    let mut found = Vec::new();
+    let mut problems = Vec::new();
+    for file in files.into_iter().filter(|f| f.is_file()) {
+        match read_snippet_file(&file) {
+            Ok(f) if !f.2.is_empty() => found.push(f),
+            // A MobaXterm.ini or settings.json without snippets.
+            Ok(_) => {}
+            Err(_)
+                if file
+                    .extension()
+                    .is_some_and(|e| e.eq_ignore_ascii_case("ini")) => {}
+            Err(e) => problems.push(e),
+        }
+    }
+    (found, problems)
+}
+
+/// Reads a file the user picked for a snippet import: Windows Terminal's
+/// `settings.json` or a `.wt.json`, SecureCRT's button bars, a
+/// `MobaXterm.ini`, a FeroSSH `.snippet` file, or any other text file as
+/// one snippet.
+fn read_snippet_file(path: &std::path::Path) -> std::result::Result<SnippetSource, String> {
+    let text = read_text(path, 16 << 20)?;
+    let origin = path.display().to_string();
+    let file = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let lower = file.to_ascii_lowercase();
+    let none = |what: &str| format!("{} has no {what}.", path.display());
+    if lower.ends_with(".json") || text.trim_start().starts_with('{') {
+        let s = snippet_import::windows_terminal(&text)
+            .map_err(|e| format!("Could not read {}. {e}", path.display()))?;
+        return Ok((SnippetClient::WindowsTerminal, origin, s));
+    }
+    if text.lines().any(|l| l.starts_with("Z:\"")) {
+        let s = snippet_import::securecrt_buttons(&text);
+        if s.is_empty() {
+            return Err(none("Send String buttons"));
+        }
+        return Ok((SnippetClient::SecureCrt, origin, s));
+    }
+    if text
+        .lines()
+        .any(|l| l.trim().eq_ignore_ascii_case("[Macros]"))
+    {
+        return Ok((
+            SnippetClient::MobaXterm,
+            origin,
+            snippet_import::mobaxterm_macros(&text),
+        ));
+    }
+    if lower.ends_with(".ini") && text.contains("[Bookmarks") {
+        return Err(none("macros"));
+    }
+    if text.len() > 1 << 20 {
+        return Err(format!("{} is too big for one script.", path.display()));
+    }
+    let stem = path
+        .file_stem()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let snippet = snippet_store::parse_file(&text, SnippetClient::TextFile.category())
+        .or_else(|| snippet_import::text_file(&stem, &text))
+        .ok_or_else(|| none("lines"))?;
+    Ok((SnippetClient::TextFile, origin, vec![snippet]))
+}
+
+/// Sessions of one client, with where they were read: "registry" or a
+/// path.
+type ImportSource = (Client, String, Vec<import::Session>);
+
+/// The sessions of other clients on this account: PuTTY, KiTTY and WinSCP
+/// in the registry, and the files where WinSCP, MobaXterm, mRemoteNG and
+/// SecureCRT keep theirs. Files that could not be read come back as
+/// problems, for the import page to show.
+fn known_imports() -> (Vec<ImportSource>, Vec<String>) {
+    let mut found: Vec<_> = Client::ALL
+        .into_iter()
+        .map(|c| (c, "registry".to_owned(), import_reg::sessions(c)))
+        .filter(|(_, _, s)| !s.is_empty())
+        .collect();
+    let mut problems = Vec::new();
+    let appdata = std::env::var_os("APPDATA").map(PathBuf::from);
+    let home = home();
+    let mut files: Vec<PathBuf> = Vec::new();
+    if let Some(a) = &appdata {
+        // WinSCP's sites when it is set to keep them in an INI file.
+        files.push(a.join("WinSCP.ini"));
+        files.push(a.join("MobaXterm").join("MobaXterm.ini"));
+        files.push(a.join("mRemoteNG").join("confCons.xml"));
+    }
+    files.push(
+        home.join("Documents")
+            .join("MobaXterm")
+            .join("MobaXterm.ini"),
+    );
+    for file in files.into_iter().filter(|f| f.is_file()) {
+        match read_import_file(&file) {
+            Ok(f) if !f.2.is_empty() => found.push(f),
+            Ok(_) => {}
+            Err(e) => problems.push(e),
+        }
+    }
+    let crt = import_reg::securecrt_config()
+        .map(PathBuf::from)
+        .or_else(|| appdata.map(|a| a.join("VanDyke").join("Config")))
+        .map(|c| c.join("Sessions"));
+    if let Some(dir) = crt.filter(|d| d.is_dir()) {
+        let sessions = securecrt_sessions(&dir);
+        if !sessions.is_empty() {
+            found.push((Client::SecureCrt, dir.display().to_string(), sessions));
+        }
+    }
+    (found, problems)
+}
+
+/// Reads a file for an import, up to `max` bytes.
+fn read_text(p: &std::path::Path, max: u64) -> std::result::Result<String, String> {
+    let meta = std::fs::metadata(p).map_err(|e| format!("Could not read {}: {e}", p.display()))?;
+    if meta.len() > max {
+        return Err(format!("{} is too big to be a session file.", p.display()));
+    }
+    std::fs::read(p)
+        .map(|b| {
+            String::from_utf8_lossy(&b)
+                .trim_start_matches('\u{feff}')
+                .to_owned()
+        })
+        .map_err(|e| format!("Could not read {}: {e}", p.display()))
+}
+
+/// SecureCRT's sessions in its `Sessions` folder and the folders in it.
+fn securecrt_sessions(root: &std::path::Path) -> Vec<import::Session> {
+    let mut out = Vec::new();
+    let mut dirs = vec![(root.to_path_buf(), String::new(), 0)];
+    let mut seen = 0;
+    while let Some((dir, prefix, depth)) = dirs.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            seen += 1;
+            if seen > 20_000 {
+                return out;
+            }
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let Ok(kind) = entry.file_type() else {
+                continue;
+            };
+            if kind.is_dir() && depth < 8 {
+                dirs.push((entry.path(), format!("{prefix}{name}/"), depth + 1));
+            } else if kind.is_file()
+                && securecrt::is_session_file(&name)
+                && let Ok(text) = read_text(&entry.path(), 1 << 20)
+                && let Some(stem) = name.get(..name.len() - 4)
+                && let Some(s) = securecrt::session(&format!("{prefix}{stem}"), &text)
+            {
+                out.push(s);
+            }
+        }
+    }
+    out.sort_by_key(|a| a.name.to_lowercase());
+    out
+}
+
+/// Reads a file the user picked for an import: a `WinSCP.ini`, a
+/// `MobaXterm.ini` (or `.mxtsessions`), mRemoteNG's `confCons.xml`, one
+/// of SecureCRT's session files (which brings the `Sessions` folder it is
+/// in), or one of a portable KiTTY's session files (which brings the
+/// folder it is in).
+fn read_import_file(path: &std::path::Path) -> std::result::Result<ImportSource, String> {
+    let text = read_text(path, 16 << 20)?;
+    let origin = path.display().to_string();
+    let none = |what: &str| format!("{} has no {what}.", path.display());
+    let line_starts = |prefix: &str| text.lines().any(|l| l.trim_start().starts_with(prefix));
+    if line_starts("[Sessions\\") {
+        let sessions = winscp::from_ini(&text);
+        if sessions.is_empty() {
+            return Err(none("SFTP or SCP sites"));
+        }
+        return Ok((Client::WinScp, origin, sessions));
+    }
+    if line_starts("[Bookmarks") {
+        let sessions = mobaxterm::from_ini(&text);
+        if sessions.is_empty() {
+            return Err(none("SSH, SFTP, RDP or VNC sessions"));
+        }
+        return Ok((Client::MobaXterm, origin, sessions));
+    }
+    if text.contains("Connections") && text.trim_start().starts_with('<') {
+        let sessions = mremoteng::from_xml(&text)?;
+        if sessions.is_empty() {
+            return Err(none("SSH, RDP or VNC connections"));
+        }
+        return Ok((Client::MRemoteNg, origin, sessions));
+    }
+    let file_name = |p: &std::path::Path| p.file_name().map(|n| n.to_string_lossy().into_owned());
+    let name = file_name(path).unwrap_or_default();
+    if line_starts("S:\"Hostname\"=") || line_starts("S:\"Protocol Name\"=") {
+        // The whole Sessions folder: the nearest one up, else this folder.
+        let root = path
+            .ancestors()
+            .skip(1)
+            .find(|a| {
+                a.file_name()
+                    .is_some_and(|n| n.eq_ignore_ascii_case("Sessions"))
+            })
+            .or_else(|| path.parent())
+            .ok_or_else(|| none("sessions"))?;
+        let sessions = securecrt_sessions(root);
+        if sessions.is_empty() {
+            return Err(format!("{} has no SSH sessions.", root.display()));
+        }
+        return Ok((Client::SecureCrt, root.display().to_string(), sessions));
+    }
+    let unknown = || {
+        format!(
+            "{} is not a sessions file FeroSSH knows. It reads WinSCP.ini, MobaXterm.ini, \
+             mRemoteNG's confCons.xml, and the session files of SecureCRT and of a portable \
+             KiTTY.",
+            path.display()
+        )
+    };
+    if text.len() > 1 << 20 || putty::file_session(&name, &text).is_none() {
+        return Err(unknown());
+    }
+    let dir = path.parent().ok_or_else(unknown)?;
+    let mut sessions = Vec::new();
+    let entries =
+        std::fs::read_dir(dir).map_err(|e| format!("Could not read {}: {e}", dir.display()))?;
+    for entry in entries.flatten().take(10_000) {
+        let p = entry.path();
+        if !entry.file_type().is_ok_and(|t| t.is_file()) {
+            continue;
+        }
+        if let (Some(name), Ok(text)) = (file_name(&p), read_text(&p, 1 << 20))
+            && let Some(s) = putty::file_session(&name, &text)
+        {
+            sessions.push(s);
+        }
+    }
+    sessions.sort_by_key(|a| a.name.to_lowercase());
+    Ok((Client::Kitty, dir.display().to_string(), sessions))
+}
+
+/// The changed-key screen's only way forward: replace the stored key,
+/// behind two confirmations, then reconnect.
+fn replace_host_key(hwnd: HWND) {
+    let info = with_window(|w| {
+        let id = w.focused_id();
+        match w.panes.get(&id).map(|p| &p.host) {
+            Some(Host::Ssh(s)) => s.changed_key().map(|k| {
+                let desc = ferossh_config::hostkey::describe(k)
+                    .map(|d| format!("{} {}", d.kind, d.fingerprint))
+                    .unwrap_or_default();
+                (id, s.blocked_host().to_owned(), desc)
+            }),
+            _ => None,
+        }
+    })
+    .flatten();
+    let Some((id, host, fingerprint)) = info else {
+        dialog(
+            hwnd,
+            "There is no changed host key to replace. This is only needed after FeroSSH \
+             refused a connection because a host key changed.",
+            MB_OK | MB_ICONWARNING,
+        );
+        return;
+    };
+    let first = format!(
+        "Replace the stored host key of {host}?\n\nThe server now offers:\n{fingerprint}\n\n\
+         Only do this if you have checked this fingerprint with the server's administrator \
+         or on the server's console. If the key changed unexpectedly, someone may be \
+         intercepting the connection."
+    );
+    if dialog(hwnd, &first, MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2) != Some(IDYES) {
+        return;
+    }
+    let second = format!(
+        "Are you sure? FeroSSH will forget every stored key of {host} and trust\n{fingerprint}\n\n\
+         from now on."
+    );
+    if dialog(hwnd, &second, MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2) != Some(IDYES) {
+        return;
+    }
+    with_window(|w| {
+        let result = match w.panes.get_mut(&id).map(|p| &mut p.host) {
+            Some(Host::Ssh(s)) => s.replace_host_key(),
+            _ => Ok(()),
+        };
+        match result {
+            Ok(()) => w.reconnect(id),
+            Err(e) => {
+                w.show(
+                    id,
+                    &format!("\x1b[0;31mCould not update known_hosts: {e}\x1b[0m\r\n"),
+                );
+                w.refresh(id);
+            }
+        }
+    });
+}
+
+/// The forwards of `connection` in the forwards view.
+fn forwards_of(view: &[ConnView], connection: ChannelId) -> impl Iterator<Item = &FwdView> {
+    view.iter()
+        .filter(move |v| v.connection == connection)
+        .flat_map(|v| &v.forwards)
+}
+
+fn loword(v: usize) -> u32 {
+    (v & 0xFFFF) as u32
+}
+
+/// Modifiers for a mouse message: Shift and Ctrl from its flags, Alt from
+/// the key state.
+fn mouse_mods(wparam: WPARAM) -> Mods {
+    const MK_SHIFT: usize = 0x4;
+    const MK_CONTROL: usize = 0x8;
+    Mods {
+        shift: wparam.0 & MK_SHIFT != 0,
+        ctrl: wparam.0 & MK_CONTROL != 0,
+        alt: key_mods().alt,
+    }
+}
+
+/// How many hotkeys Window > Standby window offers to pick from.
+const STANDBY_PRESETS: usize = 5;
+
+/// The hotkeys Window > Standby window offers: Win or Ctrl with the key
+/// below Esc (whatever this keyboard prints on it), Ctrl+Alt+Space,
+/// Scroll Lock and Pause.
+fn standby_presets() -> [Hotkey; STANDBY_PRESETS] {
+    // SAFETY: a plain keyboard layout query.
+    let below = unsafe { MapVirtualKeyW(standby::BELOW_ESC_SCAN, MAPVK_VSC_TO_VK) };
+    let vk = u16::try_from(below)
+        .ok()
+        .filter(|&vk| {
+            Hotkey {
+                vk,
+                ..Hotkey::DEFAULT
+            }
+            .check()
+            .is_ok()
+        })
+        .unwrap_or(Hotkey::DEFAULT.vk);
+    let key = |ctrl, alt, win, vk| Hotkey {
+        ctrl,
+        alt,
+        shift: false,
+        win,
+        vk,
+    };
+    [
+        key(false, false, true, vk),
+        key(true, false, false, vk),
+        key(true, true, false, 0x20),
+        key(false, false, false, 0x91),
+        key(false, false, false, 0x13),
+    ]
+}
+
+/// A hotkey as this keyboard shows it: a punctuation key as the
+/// character the layout puts on it.
+fn hotkey_label(key: Hotkey) -> String {
+    key.label(|vk| {
+        // SAFETY: a plain keyboard layout query. Bit 31 marks a dead key;
+        // the low word is still its character.
+        let c = unsafe { MapVirtualKeyW(u32::from(vk), MAPVK_VK_TO_CHAR) } & 0xFFFF;
+        char::from_u32(c).filter(|&c| c != '\0')
+    })
+}
+
+/// The standby hotkey was pressed: hide the window when it is in front,
+/// otherwise bring it to the front. Outside `with_window`, as ShowWindow
+/// sends WM_SIZE, WM_ACTIVATE and the focus messages straight back.
+fn standby_toggle(hwnd: HWND) {
+    if with_window(|w| w.standby.capture == Capture::Waiting) == Some(true) {
+        // The hotkey itself pressed while picking one: keep it.
+        let key = with_window(|w| w.standby_key());
+        if let Some(command) = key.and_then(|k| with_window(|w| w.end_capture(Some(k))).flatten()) {
+            run_command(hwnd, command);
+        }
+        return;
+    }
+    let (target, own) = match with_window(Window::standby_target) {
+        None => return,
+        Some(StandbyTarget::Own) => (hwnd, true),
+        Some(StandbyTarget::Other(h)) => (standby::sys::hwnd(h), false),
+        Some(StandbyTarget::Missing(exe)) => {
+            run_command(
+                hwnd,
+                Command::Notice(format!(
+                    "{exe} has no window open for the standby hotkey to show. Start it, or \
+                     pick another window under Window > Standby window > Window to show and \
+                     hide."
+                )),
+            );
+            return;
+        }
+    };
+    // Another program that does not answer would hang a waiting call.
+    let hung = !own && standby::sys::hung(target);
+    // SAFETY: plain state queries and show calls on a window Windows
+    // checks. Windows lets the process that got the hotkey take the
+    // foreground, also for another program's window.
+    unsafe {
+        let show = |cmd| {
+            if hung {
+                let _ = ShowWindowAsync(target, cmd);
+            } else {
+                let _ = ShowWindow(target, cmd);
+            }
+        };
+        let visible = IsWindowVisible(target).as_bool();
+        let minimised = IsIconic(target).as_bool();
+        let front = GetForegroundWindow() == target;
+        match standby::toggle(visible, minimised, front) {
+            Toggle::Hide => {
+                show(SW_HIDE);
+                if !own {
+                    if IsWindowVisible(target).as_bool() && !hung {
+                        // Windows refuses this for a program run as
+                        // administrator when FeroSSH is not.
+                        run_command(
+                            hwnd,
+                            Command::Notice(
+                                "Windows did not let FeroSSH hide that window. A program run \
+                                 as administrator can only be hidden by a FeroSSH run as \
+                                 administrator."
+                                    .to_owned(),
+                            ),
+                        );
+                    } else {
+                        with_window(|w| w.note_hidden(Some(target.0 as isize)));
+                    }
+                }
+            }
+            Toggle::Show => {
+                show(if minimised { SW_RESTORE } else { SW_SHOW });
+                let _ = SetForegroundWindow(target);
+                if !own {
+                    with_window(|w| w.note_hidden(None));
+                }
+            }
+        }
+    }
+}
+
+/// The window a press of the standby hotkey works on.
+enum StandbyTarget {
+    /// This FeroSSH window.
+    Own,
+    /// Another program's window.
+    Other(isize),
+    /// The picked program has no window open.
+    Missing(String),
+}
+
+/// While a standby hotkey is being picked: the keys go here and nowhere
+/// else (the terminal, shortcuts, the menu bar's Alt). `None` lets the
+/// message go on as usual.
+fn standby_capture(hwnd: HWND, msg: u32, wparam: WPARAM) -> Option<LRESULT> {
+    let state = with_window(|w| w.standby.capture)?;
+    if state == Capture::Off {
+        return None;
+    }
+    // SAFETY: plain key-state queries.
+    let down = |vk: VIRTUAL_KEY| unsafe { GetKeyState(i32::from(vk.0)) } < 0;
+    match msg {
+        WM_KEYDOWN | WM_SYSKEYDOWN if state == Capture::Finishing => {
+            // Typing again: the hotkey's key-ups are over.
+            with_window(|w| w.standby.capture = Capture::Off);
+            None
+        }
+        WM_KEYDOWN | WM_SYSKEYDOWN => {
+            drop_pending_char(hwnd);
+            let vk = wparam.0 as u16;
+            let mods = key_mods();
+            let win = down(VK_LWIN) || down(VK_RWIN);
+            let command = match standby::pick(vk, mods.ctrl, mods.alt, mods.shift, win) {
+                Picked::Wait => None,
+                Picked::Cancel => with_window(|w| w.end_capture(None)).flatten(),
+                Picked::Key(key) => with_window(|w| w.end_capture(Some(key))).flatten(),
+                Picked::Refused(why) => {
+                    with_window(|w| w.end_capture(None));
+                    Some(Command::Notice(format!(
+                        "{why}\n\nChoose Press a new hotkey again to pick another."
+                    )))
+                }
+            };
+            if let Some(command) = command {
+                run_command(hwnd, command);
+            }
+            Some(LRESULT(0))
+        }
+        WM_KEYUP | WM_SYSKEYUP => {
+            let held = [VK_SHIFT, VK_CONTROL, VK_MENU, VK_LWIN, VK_RWIN]
+                .into_iter()
+                .any(down);
+            if state == Capture::Finishing && !held {
+                with_window(|w| w.standby.capture = Capture::Off);
+            }
+            Some(LRESULT(0))
+        }
+        WM_CHAR | WM_SYSCHAR | WM_DEADCHAR | WM_SYSDEADCHAR => Some(LRESULT(0)),
+        WM_KILLFOCUS if state == Capture::Waiting => {
+            // Clicked away: stop picking, so later typing is not taken.
+            with_window(|w| w.end_capture(None));
+            None
+        }
+        _ => None,
+    }
+}
+
+extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    // SAFETY: called by Windows with valid arguments for this window; the
+    // pointer casts below follow each message's documented lparam type.
+    unsafe {
+        // Picking the standby hotkey takes the keys before anything else,
+        // the remote desktop viewer included.
+        if let Some(result) = standby_capture(hwnd, msg, wparam) {
+            return result;
+        }
+        // The menu bar in the window's colours.
+        if let Some(result) = ui_theme::frame_message(hwnd, msg, wparam, lparam) {
+            return result;
+        }
+        if with_window(|w| w.desktop_message(msg, wparam, lparam)) == Some(true) {
+            return LRESULT(0);
+        }
+        match msg {
+            WM_PAINT => {
+                let mut ps = PAINTSTRUCT::default();
+                BeginPaint(hwnd, &mut ps);
+                with_window(|w| w.paint(ps.rcPaint));
+                let _ = EndPaint(hwnd, &ps);
+                LRESULT(0)
+            }
+            WM_ERASEBKGND => LRESULT(1),
+            // Windows' light or dark app mode, or its colours, changed.
+            WM_SETTINGCHANGE | WM_SYSCOLORCHANGE => {
+                with_window(Window::refresh_chrome);
+                DefWindowProcW(hwnd, msg, wparam, lparam)
+            }
+            WM_SIZE => {
+                if wparam.0 as u32 != SIZE_MINIMIZED {
+                    with_window(Window::layout);
+                }
+                LRESULT(0)
+            }
+            WM_GETDPISCALEDSIZE => {
+                let size = lparam.0 as *mut SIZE;
+                match with_window(|w| w.size_for_dpi(loword(wparam.0))).flatten() {
+                    Some((cx, cy)) if !size.is_null() => {
+                        *size = SIZE { cx, cy };
+                        LRESULT(1)
+                    }
+                    _ => LRESULT(0),
+                }
+            }
+            WM_DPICHANGED => {
+                with_window(|w| w.set_dpi(loword(wparam.0)));
+                let r = lparam.0 as *const RECT;
+                if let Some(r) = r.as_ref() {
+                    // Sends WM_SIZE, which lays out the grid at the new DPI.
+                    let _ = SetWindowPos(
+                        hwnd,
+                        None,
+                        r.left,
+                        r.top,
+                        r.right - r.left,
+                        r.bottom - r.top,
+                        SWP_NOZORDER | SWP_NOACTIVATE,
+                    );
+                }
+                LRESULT(0)
+            }
+            WM_SHELL_OUTPUT => {
+                if let Some(commands) = with_window(Window::on_output) {
+                    run_commands(hwnd, commands);
+                }
+                LRESULT(0)
+            }
+            WM_TIMER if wparam.0 == TIMER_TRANSFER => {
+                with_window(Window::on_transfer_timer);
+                LRESULT(0)
+            }
+            WM_TIMER if wparam.0 == TIMER_SCRIPT => {
+                with_window(Window::on_script_timer);
+                LRESULT(0)
+            }
+            WM_TIMER if wparam.0 == TIMER_RECONNECT => {
+                with_window(Window::on_reconnect_timer);
+                LRESULT(0)
+            }
+            WM_TIMER if wparam.0 == TIMER_RUN => {
+                with_window(Window::on_run_timer);
+                LRESULT(0)
+            }
+            WM_TIMER if wparam.0 == TIMER_LAUNCH => {
+                with_window(Window::retire_launches);
+                LRESULT(0)
+            }
+            WM_TIMER if wparam.0 == TIMER_RETIRE => {
+                with_window(Window::on_retire_timer);
+                LRESULT(0)
+            }
+            WM_TIMER if wparam.0 == TIMER_DESKTOP_SIZE => {
+                with_window(Window::on_desktop_size_timer);
+                LRESULT(0)
+            }
+            WM_DROPFILES => {
+                drop_files(hwnd, HDROP(wparam.0 as *mut c_void));
+                LRESULT(0)
+            }
+            WM_TIMER if wparam.0 == TIMER_SYNC => {
+                if let Some(commands) = with_window(Window::on_sync_timer) {
+                    run_commands(hwnd, commands);
+                }
+                LRESULT(0)
+            }
+            WM_CHAR => {
+                if let Some(command) = with_window(|w| w.on_char(wparam.0 as u16, false)).flatten()
+                {
+                    run_command(hwnd, command);
+                }
+                LRESULT(0)
+            }
+            // Alt+Space opens the system menu as usual.
+            WM_SYSCHAR if wparam.0 != usize::from(b' ') => {
+                if let Some(command) = with_window(|w| w.on_char(wparam.0 as u16, true)).flatten() {
+                    run_command(hwnd, command);
+                }
+                LRESULT(0)
+            }
+            WM_KEYDOWN | WM_SYSKEYDOWN => {
+                let vk = VIRTUAL_KEY(wparam.0 as u16);
+                // Bit 30: the key was down already (Windows' auto-repeat).
+                let held = lparam.0 & (1 << 30) != 0;
+                match with_window(|w| w.on_key_down(vk, held)) {
+                    Some(KeyOutcome::Handled) => LRESULT(0),
+                    Some(KeyOutcome::Run(command)) => {
+                        run_command(hwnd, command);
+                        LRESULT(0)
+                    }
+                    Some(KeyOutcome::Default) | None => DefWindowProcW(hwnd, msg, wparam, lparam),
+                }
+            }
+            WM_SYSKEYUP if wparam.0 == usize::from(VK_MENU.0) => {
+                // Alt alone brings a hidden menu bar back.
+                if with_window(|w| !w.menu_visible) == Some(true) {
+                    run_command(hwnd, Command::SetMenuVisible(true));
+                    return LRESULT(0);
+                }
+                DefWindowProcW(hwnd, msg, wparam, lparam)
+            }
+            WM_LBUTTONDOWN | WM_LBUTTONUP | WM_RBUTTONDOWN | WM_RBUTTONUP | WM_MBUTTONDOWN
+            | WM_MBUTTONUP => {
+                let (button, down) = match msg {
+                    WM_LBUTTONDOWN => (MouseButton::Left, true),
+                    WM_LBUTTONUP => (MouseButton::Left, false),
+                    WM_RBUTTONDOWN => (MouseButton::Right, true),
+                    WM_RBUTTONUP => (MouseButton::Right, false),
+                    WM_MBUTTONDOWN => (MouseButton::Middle, true),
+                    _ => (MouseButton::Middle, false),
+                };
+                let at = lparam_point(lparam);
+                let mods = mouse_mods(wparam);
+                if let Some(command) =
+                    with_window(|w| w.on_button(button, down, at, mods)).flatten()
+                {
+                    run_command(hwnd, command);
+                }
+                LRESULT(0)
+            }
+            WM_MOUSEMOVE => {
+                let at = lparam_point(lparam);
+                let mods = mouse_mods(wparam);
+                with_window(|w| w.on_mouse_move(at, mods));
+                LRESULT(0)
+            }
+            WM_SETCURSOR if loword(lparam.0 as usize) == HTCLIENT => {
+                let mut pt = POINT::default();
+                let _ = GetCursorPos(&mut pt);
+                let _ = ScreenToClient(hwnd, &mut pt);
+                let shape = with_window(|w| w.cursor_at(pt.x, pt.y)).unwrap_or(IDC_IBEAM);
+                if let Ok(c) = LoadCursorW(None, shape) {
+                    let _: HCURSOR = SetCursor(Some(c));
+                }
+                LRESULT(1)
+            }
+            WM_MOUSEWHEEL => {
+                let delta = ((wparam.0 >> 16) & 0xFFFF) as u16 as i16;
+                let at = lparam_point(lparam);
+                let mods = mouse_mods(wparam);
+                if let Some(command) = with_window(|w| w.on_wheel(delta, at, mods)).flatten() {
+                    run_command(hwnd, command);
+                }
+                LRESULT(0)
+            }
+            WM_IME_STARTCOMPOSITION | WM_IME_COMPOSITION => {
+                with_window(|w| w.place_ime());
+                // The default handling turns the result string into WM_CHAR.
+                DefWindowProcW(hwnd, msg, wparam, lparam)
+            }
+            WM_COMMAND => {
+                let id = loword(wparam.0);
+                if is_side_pane(id) {
+                    with_window(|w| w.toggle_side(id, true));
+                } else {
+                    run_command(hwnd, Command::Id(id));
+                }
+                LRESULT(0)
+            }
+            WM_INITMENUPOPUP => {
+                let popup = HMENU(wparam.0 as *mut c_void);
+                // SAFETY: the menu Windows is opening.
+                if GetMenuItemID(popup, 0) == cmd::STANDBY_OWN {
+                    with_window(|w| w.fill_standby_targets(popup));
+                }
+                DefWindowProcW(hwnd, msg, wparam, lparam)
+            }
+            WM_HOTKEY if wparam.0 == standby::HOTKEY_ID as usize => {
+                standby_toggle(hwnd);
+                LRESULT(0)
+            }
+            WM_CLOSE => {
+                run_command(hwnd, Command::Exit);
+                LRESULT(0)
+            }
+            WM_SETFOCUS => {
+                with_window(|w| w.set_focus(true));
+                LRESULT(0)
+            }
+            WM_CLIPBOARDUPDATE => {
+                with_window(Window::clipboard_changed);
+                LRESULT(0)
+            }
+            files_panel::WM_FILES_DEFERRED => {
+                // What the file pane emitted while the view was being set.
+                for event in files_panel::take_deferred() {
+                    files_event(hwnd, event);
+                }
+                LRESULT(0)
+            }
+            WM_TOOLS_FOCUS => {
+                // Checked again now: a click may have moved the focus since.
+                let (
+                    want,
+                    conn,
+                    live,
+                    form,
+                    files,
+                    fwd,
+                    scripts,
+                    editor,
+                    args,
+                    hosts,
+                    report,
+                    rename,
+                ) = with_window(|w| {
+                    (
+                        w.wants_tools_focus(),
+                        w.conn_native(),
+                        w.live_native(),
+                        w.form_native(),
+                        w.files_visible(),
+                        w.fwd_native(),
+                        w.scripts_native(),
+                        w.script_editor_native(),
+                        w.script_args_native(),
+                        w.script_hosts_native(),
+                        w.script_report_native(),
+                        w.wants_name_edit()
+                            .then(|| w.live_view.renaming_pane())
+                            .flatten(),
+                    )
+                })
+                .unwrap_or_default();
+                match wparam.0 {
+                    2 if want => match rename {
+                        Some(pane) => live_panel::edit_name(pane),
+                        // A second post while the name is edited: the
+                        // edit keeps the keyboard.
+                        None if live_panel::editing() => {}
+                        None => live_panel::focus_list(),
+                    },
+                    1 if want && form => form_view::focus_first(),
+                    1 if want && conn => conn_view::focus_tree(),
+                    1 if want && live => live_panel::focus_list(),
+                    1 if want && files => files_panel::focus_first(),
+                    1 if want && fwd => fwd_panel::focus_first(),
+                    1 if want && scripts => scripts_panel::focus_first(),
+                    1 if want && editor => script_editor::focus_first(),
+                    1 if want && args => script_args::focus_first(),
+                    1 if want && hosts => script_hosts::focus_first(),
+                    1 if want && report => script_report::focus_first(),
+                    0 if !want && tools_have_focus() => {
+                        let _ = SetFocus(Some(hwnd));
+                    }
+                    _ => {}
+                }
+                LRESULT(0)
+            }
+            WM_KILLFOCUS => {
+                with_window(|w| w.set_focus(false));
+                LRESULT(0)
+            }
+            WM_DESTROY => {
+                // Dropping the window closes the shells' consoles, finishes
+                // the logs and closes the worker's job, which ends it.
+                with_window(|w| {
+                    // Another program's window the standby hotkey hid
+                    // comes back with FeroSSH gone.
+                    w.restore_hidden();
+                    // tmux keeps its sessions; leave them detached.
+                    let gateways: Vec<PaneId> = w.tmux.keys().copied().collect();
+                    for g in gateways {
+                        let actions = w
+                            .tmux
+                            .get_mut(&g)
+                            .filter(|t| t.active())
+                            .map(Tmux::detach)
+                            .unwrap_or_default();
+                        w.run_tmux(g, actions);
+                    }
+                    let ids: Vec<PaneId> = w.panes.keys().copied().collect();
+                    for id in ids {
+                        w.end_host(id);
+                    }
+                });
+                let window =
+                    WINDOW.with(|cell| cell.try_borrow_mut().ok().and_then(|mut w| w.take()));
+                drop(window);
+                PostQuitMessage(0);
+                LRESULT(0)
+            }
+            _ => DefWindowProcW(hwnd, msg, wparam, lparam),
+        }
+    }
+}
+
+/// Captures the mouse for `hwnd` while a button is held, or releases it.
+fn capture(hwnd: HWND, on: bool) {
+    // SAFETY: our window.
+    unsafe {
+        if on {
+            SetCapture(hwnd);
+        } else {
+            let _ = ReleaseCapture();
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn every_free_font_has_an_https_download_page() {
+        for family in &FONT_CHOICES[WINDOWS_FONTS..] {
+            let page = font_page(family);
+            assert!(page.is_some_and(|u| u.starts_with("https://")), "{family}");
+        }
+        for family in &FONT_CHOICES[..WINDOWS_FONTS] {
+            assert_eq!(font_page(family), None);
+        }
+    }
+
+    #[test]
+    fn menu_click_hides_an_open_side_pane_at_once() {
+        for id in [
+            cmd::SESSIONS,
+            cmd::LIVE,
+            cmd::FILES,
+            cmd::FORWARDS,
+            cmd::SNIPPETS,
+        ] {
+            assert!(is_side_pane(id), "{id}");
+        }
+        assert!(!is_side_pane(cmd::PALETTE));
+        assert_eq!(side_toggle(true, false, true), SideToggle::Hide);
+        assert_eq!(side_toggle(true, true, true), SideToggle::Hide);
+        assert_eq!(side_toggle(false, false, true), SideToggle::Show);
+    }
+
+    #[test]
+    fn shortcut_focuses_an_open_side_pane_before_hiding_it() {
+        assert_eq!(side_toggle(true, false, false), SideToggle::Focus);
+        assert_eq!(side_toggle(true, true, false), SideToggle::Hide);
+        assert_eq!(side_toggle(false, true, false), SideToggle::Show);
+    }
+
+    #[test]
+    fn ctrl_f4_closes_the_tab_even_when_it_is_the_only_one() {
+        let ctrl = Mods {
+            ctrl: true,
+            ..Mods::NONE
+        };
+        assert_eq!(shortcut(VK_F4, ctrl, false, false), Some(cmd::CLOSE_TAB));
+        let alt = Mods {
+            alt: true,
+            ..Mods::NONE
+        };
+        assert_eq!(shortcut(VK_F4, alt, true, true), None);
+    }
+
+    #[test]
+    fn ctrl_shift_a_opens_the_palette_and_ctrl_a_stays_the_hosts() {
+        let a = VIRTUAL_KEY(u16::from(b'A'));
+        let ctrl = Mods {
+            ctrl: true,
+            ..Mods::NONE
+        };
+        let ctrl_shift = Mods {
+            shift: true,
+            ..ctrl
+        };
+        assert_eq!(shortcut(a, ctrl_shift, false, false), Some(cmd::PALETTE));
+        assert_eq!(shortcut(a, ctrl, true, true), None);
+    }
+}

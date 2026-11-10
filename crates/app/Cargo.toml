@@ -1,0 +1,82 @@
+[package]
+name = "ferossh"
+description = "FeroSSH: Win32 entry point, window, tabs and splits, message loop"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[features]
+# The built-in remote desktop viewer in a tab, for VNC, RDP or both
+# (desktop-viewer). Off by default: the standard exe has none of its
+# code. See crates/viewer. `viewer` is what both have in common.
+desktop-viewer = ["vnc-viewer", "rdp-viewer"]
+vnc-viewer = ["viewer", "ferossh-viewer/vnc"]
+rdp-viewer = ["viewer", "ferossh-viewer/rdp"]
+viewer = ["dep:ferossh-viewer", "ferossh-render/images"]
+
+[dependencies]
+ferossh-auth.workspace = true
+ferossh-config.workspace = true
+ferossh-forward.workspace = true
+ferossh-ipc.workspace = true
+ferossh-render.workspace = true
+ferossh-sftp.workspace = true
+ferossh-term.workspace = true
+ferossh-tmuxcc.workspace = true
+ferossh-update.workspace = true
+ferossh-viewer = { workspace = true, optional = true }
+ferossh-worker.workspace = true
+ferostream-client.workspace = true
+ferostream-proto.workspace = true
+# The forwarding engine's sockets; the worker already links tokio.
+tokio = { version = "1.54", features = ["rt", "net", "time", "sync", "macros", "io-util"] }
+getrandom = "0.4"
+unicode-width = "0.2"
+zeroize = "1.9"
+
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.62", features = [
+    "Win32_Devices_Communication",
+    "Win32_Foundation",
+    "Win32_Globalization",
+    "Win32_Graphics_Dwm",
+    "Win32_Graphics_Gdi",
+    "Win32_Networking_WinHttp",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_Security_Credentials",
+    "Win32_Security_Isolation",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Com",
+    "Win32_System_Console",
+    "Win32_System_DataExchange",
+    "Win32_System_IO",
+    "Win32_System_JobObjects",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Memory",
+    "Win32_System_Ole",
+    "Win32_System_Pipes",
+    "Win32_System_Registry",
+    "Win32_System_SystemInformation",
+    "Win32_System_Threading",
+    "Win32_System_Time",
+    "Win32_UI_HiDpi",
+    "Win32_UI_Input_Ime",
+    "Win32_UI_Controls",
+    "Win32_UI_Controls_Dialogs",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_Shell",
+    "Win32_UI_Shell_Common",
+    "Win32_UI_WindowsAndMessaging",
+] }
+
+[dev-dependencies]
+ferossh-auth = { workspace = true, features = ["soft-authenticator"] }
+russh.workspace = true
+tokio = { version = "1.54", features = ["rt", "macros", "time"] }
+
+[lints]
+workspace = true
