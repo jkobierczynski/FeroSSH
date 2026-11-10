@@ -471,21 +471,32 @@ async fn checksum(conn: &Connection, path: &[u8], mut stop: watch::Receiver<bool
     };
     let deadline = tokio::time::sleep(CHECKSUM_TIMEOUT);
     tokio::pin!(deadline);
-    let start = async {
-        let ch = conn.channel_open_session().await.ok()?;
-        ch.exec(true, CHECKSUM_COMMAND).await.ok()?;
-        ch.data(&input[..]).await.ok()?;
-        ch.eof().await.ok()?;
-        Some(ch)
-    };
     let mut ch = tokio::select! {
-        ch = start => match ch {
-            Some(ch) => ch,
-            None => return unsupported("the server has no xargs or sha256sum"),
+        ch = conn.channel_open_session() => match ch {
+            Ok(ch) => ch,
+            Err(_) => return unsupported("the server has no xargs or sha256sum"),
         },
         () = &mut deadline => return unsupported("sha256sum took too long"),
         _ = stop.wait_for(|s| *s) => return unsupported("SFTP closed"),
     };
+    // From here on the channel is ours to stop on every way out.
+    let start = async {
+        ch.exec(true, CHECKSUM_COMMAND).await.ok()?;
+        ch.data(&input[..]).await.ok()?;
+        ch.eof().await.ok()
+    };
+    let why = tokio::select! {
+        started = start => match started {
+            Some(()) => None,
+            None => Some("the server has no xargs or sha256sum"),
+        },
+        () = &mut deadline => Some("sha256sum took too long"),
+        _ = stop.wait_for(|s| *s) => Some("SFTP closed"),
+    };
+    if let Some(why) = why {
+        stop_remote(&ch).await;
+        return unsupported(why);
+    }
     let mut output = Vec::new();
     let mut status = None;
     let why = loop {
@@ -505,10 +516,7 @@ async fn checksum(conn: &Connection, path: &[u8], mut stop: watch::Receiver<bool
         }
     };
     if let Some(why) = why {
-        // Stop the command rather than leave it hashing on the server
-        // (OpenSSH 7.9 and later deliver the signal), then close.
-        let _ = ch.signal(Sig::TERM).await;
-        let _ = ch.close().await;
+        stop_remote(&ch).await;
         return unsupported(why);
     }
     match status {
@@ -518,6 +526,13 @@ async fn checksum(conn: &Connection, path: &[u8], mut stop: watch::Receiver<bool
         },
         _ => unsupported("the server has no xargs or sha256sum"),
     }
+}
+
+/// Stops a checksum's command rather than leave it running on the server
+/// (OpenSSH 7.9 and later deliver the signal), then closes its channel.
+async fn stop_remote(ch: &russh::Channel<russh::client::Msg>) {
+    let _ = ch.signal(Sig::TERM).await;
+    let _ = ch.close().await;
 }
 
 /// Serves SFTP on the connection `connection` made, as channel `channel`,
