@@ -9,7 +9,11 @@
 //! reads or writes in flight, and the replies go back as they come.
 //!
 //! Remote checksums run `sha256sum` on an exec channel of the same
-//! connection; that is the one thing SFTP itself cannot do.
+//! connection; that is the one thing SFTP itself cannot do. The file's
+//! name never goes on that command line: the server hands the line to the
+//! user's login shell, which may be `cmd.exe` or PowerShell, and no one
+//! quoting is safe in all of them. The command is fixed and the name goes
+//! to `xargs -0` on stdin instead.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -416,19 +420,19 @@ impl Sftp {
     }
 }
 
-/// Quotes `arg` for a POSIX shell: inside single quotes, with each `'`
-/// written as `'\''`.
-fn shell_quote(arg: &[u8]) -> Vec<u8> {
-    let mut q = vec![b'\''];
-    for &b in arg {
-        if b == b'\'' {
-            q.extend_from_slice(b"'\\''");
-        } else {
-            q.push(b);
-        }
+/// The command a remote checksum runs. It holds no part of the file's
+/// name, so the login shell has nothing to misread, whichever shell it is.
+const CHECKSUM_COMMAND: &[u8] = b"xargs -0 sha256sum -b --";
+
+/// What the checksum command reads on stdin: the name, ended by a NUL.
+/// `None` for a name holding a NUL, which no command could be given.
+fn checksum_input(path: &[u8]) -> Option<Vec<u8>> {
+    if path.is_empty() || path.contains(&0) {
+        return None;
     }
-    q.push(b'\'');
-    q
+    let mut input = path.to_vec();
+    input.push(0);
+    Some(input)
 }
 
 /// The hash `sha256sum` printed: 64 hex digits first on the line, after a
@@ -446,14 +450,14 @@ async fn checksum(conn: &Connection, path: &[u8]) -> SftpReply {
         code: sftp_code::UNSUPPORTED,
         message: why.to_owned(),
     };
-    if path.contains(&0) {
+    let Some(input) = checksum_input(path) else {
         return unsupported("the name cannot be passed to a command");
-    }
-    let mut command = b"sha256sum -b -- ".to_vec();
-    command.extend(shell_quote(path));
+    };
     let run = async {
         let mut ch = conn.channel_open_session().await.ok()?;
-        ch.exec(true, command).await.ok()?;
+        ch.exec(true, CHECKSUM_COMMAND).await.ok()?;
+        ch.data(&input[..]).await.ok()?;
+        ch.eof().await.ok()?;
         let mut output = Vec::new();
         let mut status = None;
         while let Some(msg) = ch.wait().await {
@@ -475,7 +479,7 @@ async fn checksum(conn: &Connection, path: &[u8]) -> SftpReply {
             Some(hex) => SftpReply::Checksum(hex),
             None => unsupported("sha256sum printed something unexpected"),
         },
-        Ok(_) => unsupported("the server has no sha256sum"),
+        Ok(_) => unsupported("the server has no xargs or sha256sum"),
         Err(_) => unsupported("sha256sum took too long"),
     }
 }
@@ -654,10 +658,27 @@ mod tests {
     use super::*;
 
     #[test]
-    fn quotes_for_the_shell() {
-        assert_eq!(shell_quote(b"a b"), b"'a b'");
-        assert_eq!(shell_quote(b"it's"), b"'it'\\''s'");
-        assert_eq!(shell_quote(b"$(rm -rf ~)"), b"'$(rm -rf ~)'");
+    fn keeps_the_name_off_the_command_line() {
+        // Only plain words: nothing cmd.exe, PowerShell or sh would
+        // treat specially, and no name.
+        assert!(
+            CHECKSUM_COMMAND
+                .iter()
+                .all(|b| b.is_ascii_alphanumeric() || b" -".contains(b))
+        );
+        for name in [
+            &b"a&calc&rem"[..],
+            b"it's",
+            b"$(rm -rf ~)",
+            b"x`whoami`;y|z\"\nw",
+            b"-rf",
+        ] {
+            let mut want = name.to_vec();
+            want.push(0);
+            assert_eq!(checksum_input(name), Some(want));
+        }
+        assert_eq!(checksum_input(b"a\0b"), None);
+        assert_eq!(checksum_input(b""), None);
     }
 
     #[test]
