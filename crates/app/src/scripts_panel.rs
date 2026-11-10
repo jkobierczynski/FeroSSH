@@ -126,9 +126,10 @@ struct State {
     /// The list's category headings by group id, with how many scripts
     /// each has; drawn here in the window's text colour.
     groups: Vec<(String, usize)>,
-    /// Each heading's category in lower case, by group id.
+    /// Each heading's category in ASCII lower case (as the groups are
+    /// matched), by group id.
     group_keys: Vec<String>,
-    /// The categories folded away, in lower case ("" for no category);
+    /// The categories folded away, in ASCII lower case ("" for none);
     /// kept while FeroSSH runs.
     collapsed: HashSet<String>,
     /// The list was last filled for a search.
@@ -446,7 +447,7 @@ pub fn set_view(rows: Vec<NativeScript>, selected: usize, filter: &str, total: u
             // A script picked in a folded category (Left or Right jumps
             // there) opens it.
             let id = with(|s| {
-                let key = rows.get(selected)?.category.to_lowercase();
+                let key = rows.get(selected)?.category.to_ascii_lowercase();
                 s.group_keys
                     .iter()
                     .position(|k| *k == key)
@@ -489,7 +490,7 @@ fn fill_list(h: &Handles, rows: &[NativeScript], searching: bool) {
             (name.to_owned(), n)
         })
         .collect();
-    let keys: Vec<String> = groups.iter().map(|g| g.to_lowercase()).collect();
+    let keys: Vec<String> = groups.iter().map(|g| g.to_ascii_lowercase()).collect();
     let folded: Vec<bool> = with(|s| {
         s.groups = headings;
         s.group_keys = keys.clone();
@@ -815,7 +816,13 @@ fn notify(h: Handles, lparam: LPARAM) -> LRESULT {
                 }
                 return LRESULT(CDRF_DODEFAULT as isize);
             }
-            NM_DBLCLK => run(false),
+            NM_DBLCLK => {
+                // A double click on a heading folds it, nothing more.
+                let a = &*(lparam.0 as *const NMITEMACTIVATE);
+                if heading_at(h.list, a.ptAction).is_none() {
+                    run(false);
+                }
+            }
             NM_CLICK => {
                 let a = &*(lparam.0 as *const NMITEMACTIVATE);
                 if !with(|s| s.searching).unwrap_or(false)
