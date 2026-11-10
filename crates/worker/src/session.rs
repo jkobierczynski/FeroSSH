@@ -16,7 +16,7 @@
 use std::collections::HashMap;
 use std::fmt;
 use std::future::Future;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 
@@ -154,18 +154,75 @@ pub(crate) type Connection = Handle<Client>;
 /// Where the worker's dispatcher sends a channel's messages from the UI.
 #[derive(Clone)]
 pub(crate) enum Route {
-    /// A shell, SFTP or a remote forward's listener: few messages, and a
-    /// full queue may make the UI wait.
-    Session(mpsc::Sender<Message>),
+    /// A shell, SFTP or a remote forward's listener. Only the UI sends on
+    /// it (what the user types or pastes, and SFTP requests the UI keeps
+    /// to a window), without waiting; a task per session feeds it into
+    /// the session's bounded queue, so a stalled session never holds up
+    /// the pipe. A session whose front queue is full is aborted. Each
+    /// message travels with its weight, the bytes it counts against the
+    /// session's budget.
+    Session(mpsc::Sender<(Message, usize)>, Arc<SessionGuard>),
     /// A forwarded stream: flow control bounds what the UI sends, and one
     /// slow stream must never hold up the pipe.
     Stream(mpsc::UnboundedSender<Message>),
 }
 
+/// A session's task and the task that feeds its queue: dropping the
+/// last copy (with the route) stops the feeding task.
+pub(crate) struct SessionGuard {
+    _feed: oneshot::Sender<()>,
+    task: Mutex<Option<tokio::task::AbortHandle>>,
+    /// Bytes the dispatcher has queued that the session has not taken.
+    queued: AtomicUsize,
+}
+
+impl SessionGuard {
+    pub(crate) fn new(feed: oneshot::Sender<()>) -> Self {
+        Self {
+            _feed: feed,
+            task: Mutex::new(None),
+            queued: AtomicUsize::new(0),
+        }
+    }
+
+    /// Counts `n` more queued bytes, or refuses when that would pass
+    /// `limit`.
+    pub(crate) fn reserve(&self, n: usize, limit: usize) -> bool {
+        self.queued
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |q| {
+                q.checked_add(n).filter(|total| *total <= limit)
+            })
+            .is_ok()
+    }
+
+    /// Counts `n` queued bytes as taken by the session.
+    pub(crate) fn release(&self, n: usize) {
+        let _ = self
+            .queued
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |q| {
+                Some(q.saturating_sub(n))
+            });
+    }
+
+    /// The session's own task, for [`SessionGuard::abort`].
+    pub(crate) fn track(&self, task: tokio::task::JoinHandle<()>) {
+        if let Ok(mut t) = self.task.lock() {
+            *t = Some(task.abort_handle());
+        }
+    }
+
+    /// Ends the session's task where it is, even mid-write.
+    pub(crate) fn abort(&self) {
+        if let Some(t) = self.task.lock().ok().and_then(|mut t| t.take()) {
+            t.abort();
+        }
+    }
+}
+
 impl Route {
     fn is_closed(&self) -> bool {
         match self {
-            Route::Session(tx) => tx.is_closed(),
+            Route::Session(tx, _) => tx.is_closed(),
             Route::Stream(tx) => tx.is_closed(),
         }
     }

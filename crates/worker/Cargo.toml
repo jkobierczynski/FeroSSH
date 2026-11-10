@@ -18,6 +18,7 @@ ferossh-term.workspace = true
 ferossh-zmodem.workspace = true
 russh.workspace = true
 tokio = { version = "1.54", features = ["rt", "net", "time", "sync", "macros", "io-util"] }
+zeroize = "1.9"
 
 
 [dev-dependencies]

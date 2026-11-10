@@ -14,6 +14,9 @@ const OUTRO: &[u8] = b"\x1b\\";
 const MAX_LINE: usize = 16 << 20;
 /// A reply keeps at most this many bytes; the rest is dropped.
 const MAX_REPLY: usize = 64 << 20;
+/// What each kept reply line costs against `MAX_REPLY` on top of its
+/// bytes: its `Vec` and the allocator's share, so empty lines count too.
+const LINE_COST: usize = 64;
 
 /// What the stream held.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -207,8 +210,10 @@ impl<T: Clone> Client<T> {
                         });
                     }
                 }
-                None if block.bytes + line.len() <= MAX_REPLY => {
-                    block.bytes += line.len();
+                // Nobody receives an untagged block's lines.
+                None if block.tag.is_none() => {}
+                None if block.bytes + line.len() + LINE_COST <= MAX_REPLY => {
+                    block.bytes += line.len() + LINE_COST;
                     block.lines.push(line);
                 }
                 None => {}
@@ -419,5 +424,26 @@ mod tests {
                 }
             ]
         );
+    }
+
+    #[test]
+    fn empty_reply_lines_count_against_the_limit() {
+        let mut c: Client<u32> = Client::new();
+        c.feed(b"\x1bP1000p%begin 1 1 0\n%end 1 1 0\n");
+        c.command("list-windows", 3);
+        c.feed(b"%begin 2 3 1\n");
+        let empty = vec![b'\n'; 2 * MAX_REPLY / LINE_COST];
+        c.feed(&empty);
+        let block = c.block.as_ref().unwrap();
+        assert!(block.lines.len() <= MAX_REPLY / LINE_COST);
+        assert!(block.bytes <= MAX_REPLY);
+    }
+
+    #[test]
+    fn untagged_blocks_keep_no_lines() {
+        let mut c: Client<u32> = Client::new();
+        c.feed(b"\x1bP1000p%begin 1 1 0\n%end 1 1 0\n%begin 2 2 0\n");
+        c.feed(&vec![b'\n'; 10_000]);
+        assert!(c.block.as_ref().unwrap().lines.is_empty());
     }
 }

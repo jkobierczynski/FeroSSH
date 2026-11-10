@@ -61,8 +61,10 @@ impl Perform for Line {
             b'\r' => self.col = 0,
             0x08 => self.col = self.col.saturating_sub(1),
             b'\t' => {
-                let next = (self.col / TAB + 1) * TAB;
-                while self.col < next {
+                // A fixed count: `put` can end the line and reset `col`
+                // part way, so looping until `col` reaches the stop
+                // would never end.
+                for _ in 0..TAB - self.col % TAB {
                     self.put(' ');
                 }
             }
@@ -81,7 +83,9 @@ impl Perform for Line {
             'K' if first == 0 => self.chars.truncate(self.col),
             'K' if first == 2 => self.chars.clear(),
             // Cursor forward and back within the line.
-            'C' => self.col += usize::from(first.max(1)),
+            // Kept inside one line piece, so a host cannot make `put` pad
+            // the line out to any length it likes.
+            'C' => self.col = (self.col + usize::from(first.max(1))).min(MAX_LINE - 1),
             'D' => self.col = self.col.saturating_sub(usize::from(first.max(1))),
             _ => {}
         }
@@ -306,6 +310,27 @@ mod tests {
             b"long line\r\x1b[Kshort\n",
         ]);
         assert_eq!(got, "start\r\n100%\r\nls\r\nshort\r\nend\r\n");
+    }
+
+    #[test]
+    fn a_tab_at_the_line_limit_ends() {
+        // 65528 characters and a tab: the tab's padding reaches the line
+        // limit, which ends the line part way through the padding.
+        let mut line = vec![b'x'; MAX_LINE - 8];
+        line.extend_from_slice(b"\tafter\n");
+        let got = plain(&[&line]);
+        let lines: Vec<&str> = got.split("\r\n").collect();
+        assert_eq!(lines.get(1).map(|l| l.len()), Some(MAX_LINE - 8));
+        assert_eq!(lines.get(2), Some(&"after"));
+    }
+
+    #[test]
+    fn cursor_forward_cannot_grow_a_line_past_the_limit() {
+        let mut bytes = b"\x1b[65535C".repeat(1000);
+        bytes.extend_from_slice(b"x\n");
+        let got = plain(&[&bytes]);
+        assert!(got.len() < 2 * MAX_LINE, "log grew to {} bytes", got.len());
+        assert!(got.contains('x'));
     }
 
     #[test]
