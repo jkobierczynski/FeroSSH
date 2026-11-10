@@ -438,6 +438,29 @@ enum ListRow {
     Snippet(usize),
 }
 
+/// A script as the native list shows it (see
+/// [`SnippetsView::native_rows`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NativeScript {
+    /// Its place among the shown scripts, what [`SnippetsView::select`]
+    /// takes.
+    pub pos: usize,
+    pub name: String,
+    /// The category it is listed under; empty for none.
+    pub category: String,
+    /// Its hotkey and auto-response text, such as `F3 · on --More--`.
+    pub keys: String,
+    /// Its first line, and how many follow.
+    pub first: String,
+    /// Not for the focused pane's host: dimmed.
+    pub other_host: bool,
+    /// What it types, and where it applies, under the list.
+    pub details: String,
+}
+
+/// Lines of a script shown in its details.
+const DETAIL_LINES: usize = 4;
+
 #[derive(Debug, Default)]
 pub struct SnippetsView {
     /// Where the focused pane is connected: its snippets come first.
@@ -510,6 +533,92 @@ impl SnippetsView {
         rows.iter()
             .position(|r| *r == ListRow::Snippet(selected))
             .unwrap_or(0)
+    }
+
+    /// The shown scripts, in order, for the native list; the selected
+    /// one is at [`Self::native_selected`].
+    pub fn native_rows(&self, all: &[Snippet]) -> Vec<NativeScript> {
+        self.shown(all)
+            .iter()
+            .enumerate()
+            .filter_map(|(pos, &i)| {
+                let s = all.get(i)?;
+                let mut keys = Vec::new();
+                if let Some(n) = s.hotkey {
+                    keys.push(format!("F{n}"));
+                }
+                if !s.when.is_empty() {
+                    keys.push(format!("on {}", s.when));
+                }
+                let first = s.lines.first().map(String::as_str).unwrap_or_default();
+                let first = if s.lines.len() > 1 {
+                    format!("{first} (+{})", s.lines.len() - 1)
+                } else {
+                    first.to_owned()
+                };
+                let mut details: Vec<String> = s
+                    .lines
+                    .iter()
+                    .take(DETAIL_LINES)
+                    .map(|l| match l.trim_start().strip_prefix("@type ") {
+                        Some(t) => format!("{t}   (no Enter)"),
+                        None => l.clone(),
+                    })
+                    .collect();
+                if s.lines.len() > DETAIL_LINES {
+                    details.push(format!("… {} more", s.lines.len() - DETAIL_LINES));
+                }
+                let mut only = Vec::new();
+                if !s.hosts.is_empty() {
+                    only.push(format!("hosts {}", s.hosts.join(" ")));
+                }
+                if !s.folders.is_empty() {
+                    only.push(format!("folders {}", s.folders.join(", ")));
+                }
+                if !only.is_empty() {
+                    details.push(format!("Only for {}", only.join("; ")));
+                }
+                if let Some(n) = s.hotkey {
+                    details.push(format!("Ctrl+Shift+F{n} types it"));
+                }
+                if !s.when.is_empty() {
+                    details.push(format!("Typed by itself when the host prints {}", s.when));
+                }
+                Some(NativeScript {
+                    pos,
+                    name: s.name.clone(),
+                    category: s.category.clone(),
+                    keys: keys.join(" · "),
+                    first,
+                    other_host: !s.applies(self.place.as_ref()),
+                    details: details.join("\n"),
+                })
+            })
+            .collect()
+    }
+
+    /// The selected script's place among [`Self::native_rows`].
+    pub fn native_selected(&self) -> usize {
+        self.selected
+    }
+
+    /// Selects the script at `pos` among the shown ones.
+    pub fn select(&mut self, pos: usize) {
+        self.selected = pos;
+    }
+
+    /// What the list is filtered by.
+    pub fn filter(&self) -> &str {
+        &self.filter
+    }
+
+    /// Filters the list by `text`; a new filter selects the first match.
+    pub fn set_filter(&mut self, text: &str) {
+        let text: String = text.chars().filter(|c| !c.is_control()).take(60).collect();
+        if text != self.filter {
+            self.filter = text;
+            self.selected = 0;
+        }
     }
 
     /// Where the focused pane is connected (`None`: no host).
@@ -1721,6 +1830,61 @@ mod tests {
                     .to_owned()
             })
             .collect()
+    }
+
+    #[test]
+    fn native_rows_follow_the_drawn_order_and_selection() {
+        let mut all = snippets();
+        all.push(Snippet {
+            name: "Pager".into(),
+            category: "Network".into(),
+            lines: vec![
+                "@type  ".into(),
+                "a".into(),
+                "b".into(),
+                "c".into(),
+                "d".into(),
+            ],
+            hosts: vec!["sw-*".into()],
+            hotkey: Some(3),
+            when: "--More--".into(),
+            ..Snippet::default()
+        });
+        let mut v = SnippetsView::default();
+        let rows = v.native_rows(&all);
+        let names: Vec<&str> = rows.iter().map(|r| r.name.as_str()).collect();
+        assert_eq!(names, ["Show interfaces", "Save config", "Pager"]);
+        assert!(rows.iter().enumerate().all(|(i, r)| r.pos == i));
+        let pager = &rows[2];
+        assert_eq!(pager.keys, "F3 · on --More--");
+        assert_eq!(pager.first, "@type   (+4)");
+        assert!(pager.other_host);
+        assert!(pager.details.contains("… 1 more"), "{}", pager.details);
+        assert!(pager.details.contains("Only for hosts sw-*"));
+        assert!(pager.details.contains("Ctrl+Shift+F3"));
+        assert_eq!(rows[1].first, "copy running-config startup-config (+1)");
+        assert!(!rows[1].other_host);
+        // Selecting by place runs that script.
+        v.select(1);
+        assert!(matches!(
+            v.key(SideKey::Enter { split: true }, &all, 20),
+            Some(SnipAction::Send { name, enter: false, .. }) if name == "Save config"
+        ));
+        // A filter keeps the matches and selects the first.
+        v.set_filter("config");
+        assert_eq!(v.filter(), "config");
+        assert_eq!(v.native_selected(), 0);
+        let rows = v.native_rows(&all);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].name, "Save config");
+        // The same filter again leaves the selection.
+        v.select(0);
+        v.set_filter("config");
+        assert_eq!(v.native_selected(), 0);
+        // Escape with a filter clears it; then it leaves.
+        v.key(SideKey::Escape, &all, 20);
+        assert_eq!(v.filter(), "");
+        assert_eq!(v.key(SideKey::Escape, &all, 20), Some(SnipAction::Leave));
     }
 
     #[test]

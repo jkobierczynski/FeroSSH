@@ -227,8 +227,8 @@ The arrow buttons between the lists move the selection across, and the gap betwe
 
 | Key | Action |
 | --- | --- |
-| Typing | Searches names, categories and lines. |
-| Enter | Types the script, with Enter after each line. |
+| Typing | Searches names, categories and lines (in the list it goes to the search box; Up and Down there move in the list). |
+| Enter, double click | Types the script, with Enter after each line. |
 | Shift+Enter | Types it but leaves the last line for you to finish. |
 | Left / Right | Jumps to the previous or next category. |
 | Insert | New script (the search text becomes its name; it goes in the selected script's category). |
@@ -236,6 +236,9 @@ The arrow buttons between the lists move the selection across, and the gap betwe
 | Del | Deletes it, after asking. |
 | F5 | Runs it on several saved hosts (see [Runs on many hosts](everyday-use.md#runs-on-many-hosts)). |
 | Ctrl+Shift+F1 to F12 | From anywhere: runs the script with that hotkey for the focused pane's host. |
+| Escape | Empties the search box, then goes back to the terminal. |
+
+The Run, Edit, New, Delete and On hosts buttons under the list, and the list's right-click menu, do the same.
 
 In the script editor, Enter ends a line, which is typed with Enter after it; Shift+Enter ends a line that is typed without Enter (it becomes an `@type` line, shown as *no Enter*).
 

@@ -134,6 +134,7 @@ use crate::rail;
 use crate::reconnect::{self, Next, Retry};
 use crate::same_dir;
 use crate::sandbox;
+use crate::scripts_panel;
 use crate::scrollmark;
 use crate::serial_port::{Output as SerialOutput, SerialPort};
 use crate::session_form::{self, FormAction, Hints, SessionForm, Source, Values};
@@ -1663,6 +1664,8 @@ fn create_and_run(launch: Launch, theme: Option<String>) -> Result<()> {
         let _ = files_panel::create(hwnd, files_event, dpi);
         // The port forwards pane's, likewise.
         let _ = fwd_panel::create(hwnd, fwd_event, dpi);
+        // The scripts pane's, likewise.
+        let _ = scripts_panel::create(hwnd, scripts_event, dpi);
         // A click on any of their controls hands the keyboard to the tools.
         crate::native::on_control_focus(tools_focused);
         // Files dropped from Explorer are uploaded, after a confirmation.
@@ -1716,6 +1719,7 @@ fn create_and_run(launch: Launch, theme: Option<String>) -> Result<()> {
                 || form_view::pre_translate(&msg)
                 || files_panel::pre_translate(&msg)
                 || fwd_panel::pre_translate(&msg)
+                || scripts_panel::pre_translate(&msg)
             {
                 continue;
             }
@@ -6634,6 +6638,18 @@ impl Window {
         self.side.visible && self.side.view == SideView::Forwards
     }
 
+    /// Whether the scripts show as native controls: the list is open (not
+    /// the editor, the arguments, the host picker or a report, still
+    /// drawn).
+    fn scripts_native(&self) -> bool {
+        self.side.visible
+            && self.side.view == SideView::Snippets
+            && !self.snippets_view.editing()
+            && !self.snippets_view.asking()
+            && !self.snippets_view.picking()
+            && !self.snippets_view.reporting()
+    }
+
     /// Whether the connection form shows as native controls (the import
     /// page is still drawn).
     fn form_native(&self) -> bool {
@@ -6670,6 +6686,8 @@ impl Window {
             files_panel::has_focus()
         } else if self.fwd_native() {
             fwd_panel::has_focus()
+        } else if self.scripts_native() {
+            scripts_panel::has_focus()
         } else {
             false
         }
@@ -6712,6 +6730,18 @@ impl Window {
         } else {
             fwd_panel::place(None, 0, self.dpi);
         }
+        if self.scripts_native() {
+            let all = &self.settings.snippets;
+            scripts_panel::set_view(
+                self.snippets_view.native_rows(all),
+                self.snippets_view.native_selected(),
+                self.snippets_view.filter(),
+                all.len(),
+            );
+            scripts_panel::place(self.areas.side, self.areas.side_width, self.dpi);
+        } else {
+            scripts_panel::place(None, 0, self.dpi);
+        }
         if let Some(form) = self.native_form().filter(|_| self.form_native()) {
             form_view::set_form(form);
             form_view::place(self.areas.side, self.areas.side_width, self.dpi);
@@ -6747,7 +6777,8 @@ impl Window {
             || self.live_native()
             || self.form_native()
             || self.files_visible()
-            || self.fwd_native())
+            || self.fwd_native()
+            || self.scripts_native())
             && self.side.focused
     }
 
@@ -12908,6 +12939,35 @@ fn tools_have_focus() -> bool {
         || form_view::has_focus()
         || files_panel::has_focus()
         || fwd_panel::has_focus()
+        || scripts_panel::has_focus()
+}
+
+/// Carries out what the user did in the scripts pane: its keys go to
+/// the scripts view, as the drawn list's did.
+fn scripts_event(hwnd: HWND, event: scripts_panel::Event) {
+    let command = match event {
+        scripts_panel::Event::Select(pos) => {
+            with_window(|w| w.snippets_view.select(pos));
+            None
+        }
+        scripts_panel::Event::Filter(text) => {
+            with_window(|w| {
+                w.snippets_view.set_filter(&text);
+                w.refresh_chrome();
+            });
+            None
+        }
+        scripts_panel::Event::Key(pos, key) => with_window(|w| {
+            if let Some(pos) = pos {
+                w.snippets_view.select(pos);
+            }
+            w.side_key(key)
+        })
+        .flatten(),
+    };
+    if let Some(command) = command {
+        run_command(hwnd, command);
+    }
 }
 
 /// Carries out what the user did in the port forwards pane.
@@ -14630,7 +14690,7 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
             }
             WM_TOOLS_FOCUS => {
                 // Checked again now: a click may have moved the focus since.
-                let (want, conn, live, form, files, fwd, rename) = with_window(|w| {
+                let (want, conn, live, form, files, fwd, scripts, rename) = with_window(|w| {
                     (
                         w.wants_tools_focus(),
                         w.conn_native(),
@@ -14638,6 +14698,7 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                         w.form_native(),
                         w.files_visible(),
                         w.fwd_native(),
+                        w.scripts_native(),
                         w.wants_name_edit()
                             .then(|| w.live_view.renaming_pane())
                             .flatten(),
@@ -14657,6 +14718,7 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                     1 if want && live => live_panel::focus_list(),
                     1 if want && files => files_panel::focus_first(),
                     1 if want && fwd => fwd_panel::focus_first(),
+                    1 if want && scripts => scripts_panel::focus_first(),
                     0 if !want && tools_have_focus() => {
                         let _ = SetFocus(Some(hwnd));
                     }
