@@ -445,7 +445,10 @@ fn parse_sum(output: &[u8]) -> Option<String> {
 }
 
 /// Runs `sha256sum` on the server for `path`.
-async fn checksum(conn: &Connection, path: &[u8]) -> SftpReply {
+async fn checksum<H: russh::client::Handler>(
+    conn: &russh::client::Handle<H>,
+    path: &[u8],
+) -> SftpReply {
     let unsupported = |why: &str| SftpReply::Failed {
         code: sftp_code::UNSUPPORTED,
         message: why.to_owned(),
@@ -656,6 +659,173 @@ async fn pump(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Trust only the deterministic host key of the in-process checksum server.
+    struct ChecksumClient;
+
+    impl russh::client::Handler for ChecksumClient {
+        type Error = russh::Error;
+
+        /// Accept only the fixture key, so this client cannot trust an unrelated server.
+        async fn check_server_key(
+            &mut self,
+            key: &russh::keys::PublicKeyOrCertificate,
+        ) -> Result<bool, Self::Error> {
+            use russh::keys::ssh_key::{PrivateKey, private::Ed25519Keypair};
+            let expected = PrivateKey::from(Ed25519Keypair::from_seed(&[3; 32]));
+            Ok(
+                matches!(key, russh::keys::PublicKeyOrCertificate::PublicKey { key, .. }
+                if key == expected.public_key()),
+            )
+        }
+    }
+
+    /// Capture exec and stdin separately, replying only after the client sends EOF.
+    struct ChecksumServer {
+        command: Vec<u8>,
+        input: Vec<u8>,
+        received: mpsc::UnboundedSender<(Vec<u8>, Vec<u8>)>,
+    }
+
+    impl russh::server::Handler for ChecksumServer {
+        type Error = russh::Error;
+
+        /// Allow the in-memory client to authenticate without external credentials.
+        async fn auth_none(&mut self, _: &str) -> Result<russh::server::Auth, Self::Error> {
+            Ok(russh::server::Auth::Accept)
+        }
+
+        /// Accept each checksum channel opened by the production client.
+        async fn channel_open_session(
+            &mut self,
+            _: russh::Channel<russh::server::Msg>,
+            reply: russh::server::ChannelOpenHandle,
+            _: &mut russh::server::Session,
+        ) -> Result<(), Self::Error> {
+            reply.accept().await;
+            Ok(())
+        }
+
+        /// Record the exact command independently of its stdin and acknowledge exec.
+        async fn exec_request(
+            &mut self,
+            channel: russh::ChannelId,
+            command: &[u8],
+            session: &mut russh::server::Session,
+        ) -> Result<(), Self::Error> {
+            self.command = command.to_vec();
+            session.channel_success(channel)
+        }
+
+        /// Accumulate stdin across packet boundaries without decoding filename bytes.
+        async fn data(
+            &mut self,
+            _: russh::ChannelId,
+            data: &[u8],
+            _: &mut russh::server::Session,
+        ) -> Result<(), Self::Error> {
+            self.input.extend_from_slice(data);
+            Ok(())
+        }
+
+        /// Publish the complete request on EOF and simulate success or a missing tool.
+        async fn channel_eof(
+            &mut self,
+            channel: russh::ChannelId,
+            session: &mut russh::server::Session,
+        ) -> Result<(), Self::Error> {
+            let failed = self.input == b"missing-tool\0";
+            self.received
+                .send((
+                    std::mem::take(&mut self.command),
+                    std::mem::take(&mut self.input),
+                ))
+                .map_err(|_| russh::Error::Inconsistent)?;
+            // Even plausible hash output must not override an unsuccessful exit.
+            session.data(channel, format!("{} *file\n", "a".repeat(64)).into_bytes())?;
+            session.exit_status_request(channel, if failed { 127 } else { 0 })?;
+            session.eof(channel)?;
+            session.close(channel)
+        }
+    }
+
+    /// Exercise the production checksum path over SSH without shells or external tools.
+    #[tokio::test]
+    async fn checksum_names_are_data_not_shell_syntax() -> Result<(), Box<dyn std::error::Error>> {
+        use russh::keys::ssh_key::{PrivateKey, private::Ed25519Keypair};
+
+        tokio::time::timeout(Duration::from_secs(10), async {
+            let (client_stream, server_stream) = tokio::io::duplex(64 * 1024);
+            let mut config = russh::server::Config::default();
+            config
+                .keys
+                .push(PrivateKey::from(Ed25519Keypair::from_seed(&[3; 32])));
+            let (received, mut captures) = mpsc::unbounded_channel();
+            let server = tokio::spawn(async move {
+                russh::server::run_stream(
+                    Arc::new(config),
+                    server_stream,
+                    ChecksumServer {
+                        command: Vec::new(),
+                        input: Vec::new(),
+                        received,
+                    },
+                )
+                .await
+            });
+            let mut conn = russh::client::connect_stream(
+                Arc::new(russh::client::Config::default()),
+                client_stream,
+                ChecksumClient,
+            )
+            .await?;
+            let running = server.await??;
+            assert!(conn.authenticate_none("checksum-test").await?.success());
+            for path in [
+                b"a&calc&rem".as_slice(),
+                b"$(touch injected)",
+                b"`touch injected`",
+                b"'; touch injected; #",
+                b"a'$(touch injected)'",
+                b"spaces tabs\tnewlines\nbackslash\\",
+                b"-leading-dash",
+                b"non-utf8-\xff",
+                b"missing-tool",
+            ] {
+                let reply = checksum(&conn, path).await;
+                if path == b"missing-tool" {
+                    assert!(matches!(
+                        reply,
+                        SftpReply::Failed {
+                            code: sftp_code::UNSUPPORTED,
+                            ..
+                        }
+                    ));
+                } else {
+                    assert!(matches!(reply, SftpReply::Checksum(sum) if sum == "a".repeat(64)));
+                }
+                let (command, input) = captures.recv().await.ok_or("missing checksum capture")?;
+                assert_eq!(command, b"xargs -0 sha256sum -b --");
+                let mut expected = path.to_vec();
+                expected.push(0);
+                assert_eq!(input, expected);
+            }
+            assert!(matches!(
+                checksum(&conn, b"bad\0path").await,
+                SftpReply::Failed {
+                    code: sftp_code::UNSUPPORTED,
+                    ..
+                }
+            ));
+            assert!(captures.try_recv().is_err());
+            conn.disconnect(Disconnect::ByApplication, "test complete", "")
+                .await?;
+            running.await?;
+            Ok::<_, Box<dyn std::error::Error>>(())
+        })
+        .await??;
+        Ok(())
+    }
 
     #[test]
     fn keeps_the_name_off_the_command_line() {
