@@ -225,6 +225,8 @@ const TIMER_RUN: usize = 7;
 /// own (their login session goes once the desktop or app holds the
 /// connection), and on Remote Desktop Connections run through a tunnel.
 const TIMER_LAUNCH: usize = 8;
+/// Watches files edited locally (File transfer's Edit locally) for saves.
+const TIMER_EDIT: usize = 9;
 const LAUNCH_TICK_MS: u32 = 1000;
 /// How long a launch's login session may stay hidden with nothing
 /// holding its connection before it is shown.
@@ -866,6 +868,9 @@ struct Window {
     /// connection to the same host can name another Remote folder.
     files_alias_shown: Option<String>,
     transfer_timer: bool,
+    /// Server files being edited locally, put back on each save.
+    edits: crate::edit_local::Edits,
+    edit_timer: bool,
     forwards_view: ForwardsView,
     live_view: LiveView,
     /// tmux control mode, per SSH pane that has run `tmux -CC`.
@@ -1621,6 +1626,8 @@ fn create_and_run(launch: Launch, theme: Option<String>) -> Result<()> {
                 folder_left: HashSet::new(),
                 files_alias_shown: None,
                 transfer_timer: false,
+                edits: crate::edit_local::Edits::default(),
+                edit_timer: false,
                 forwards_view: ForwardsView::default(),
                 live_view: LiveView::default(),
                 tmux: HashMap::new(),
@@ -12349,6 +12356,44 @@ impl Window {
                 }
                 None
             }
+            Event::MakeFolder { dir, name } => {
+                if let Some(r) = self.listed_in(key.as_deref(), &dir)
+                    && let Err(e) = r.make_folder(&name)
+                {
+                    r.notice = Some(e);
+                }
+                None
+            }
+            Event::Rename { dir, from, to } => {
+                if let Some(r) = self.listed_in(key.as_deref(), &dir)
+                    && let Err(e) = r.rename(&from, &to)
+                {
+                    r.notice = Some(e);
+                }
+                None
+            }
+            Event::Chmod { dir, keys, text } => {
+                if let Some(r) = self.listed_in(key.as_deref(), &dir) {
+                    for entry in files::entries_named(&r.listing, &keys) {
+                        let old = entry.attrs.permissions.unwrap_or(0);
+                        match files::parse_mode(&text, old, entry.attrs.is_dir()) {
+                            Ok(mode) if mode == old & 0o7777 => {}
+                            Ok(mode) => r.chmod(&entry.name, mode),
+                            Err(e) => {
+                                r.notice = Some(e);
+                                break;
+                            }
+                        }
+                    }
+                }
+                None
+            }
+            Event::Edit { dir, key: name } => {
+                if let Some(queue) = key.clone() {
+                    self.edit_locally(&queue, &dir, &name);
+                }
+                None
+            }
             Event::Delete(keys) => key.and_then(|key| {
                 let listing = &self.sftp.get(&key)?.listing;
                 let entries = files::entries_named(listing, &keys);
@@ -12444,6 +12489,118 @@ impl Window {
         remote
             .and_then(|r| r.home.clone())
             .unwrap_or_else(|| b".".to_vec())
+    }
+
+    /// Queue `key`'s SFTP, when it still lists folder `dir` (the folder a
+    /// change in the pane was typed for); else a notice says so.
+    fn listed_in(&mut self, key: Option<&str>, dir: &[u8]) -> Option<&mut Remote> {
+        let r = self.sftp.get_mut(key?)?;
+        r.notice = None;
+        if r.listing.path != dir {
+            r.notice = Some("The folder changed meanwhile: nothing was done.".into());
+            return None;
+        }
+        Some(r)
+    }
+
+    /// File transfer's Edit locally: downloads entry `name` of remote
+    /// folder `dir` into a folder of its own, to open in an editor once
+    /// it is in, and to put back on each save.
+    fn edit_locally(&mut self, queue: &str, dir: &[u8], name: &[u8]) {
+        let Some(r) = self.listed_in(Some(queue), dir) else {
+            return;
+        };
+        let Some(entry) = files::entries_named(&r.listing, &[name.to_vec()])
+            .into_iter()
+            .next()
+        else {
+            return;
+        };
+        let remote_path = ferossh_sftp::names::join(dir, name);
+        let local = match crate::edit_local::edit_folder(&std::env::temp_dir().join("FeroSSH-edit"))
+        {
+            Ok(folder) => folder,
+            Err(e) => {
+                r.notice = Some(format!("Could not make a folder to edit in: {e}"));
+                return;
+            }
+        };
+        match r.download(&entry, &local) {
+            Ok(job) => {
+                let file = ferossh_sftp::names::local_name(name)
+                    .map(|n| local.join(n))
+                    .unwrap_or_else(|| local.clone());
+                self.edits
+                    .start(queue, &remote_path, file, job, entry.attrs.permissions);
+                self.edit_timer(true);
+            }
+            Err(e) => r.notice = Some(e),
+        }
+    }
+
+    fn edit_timer(&mut self, on: bool) {
+        if on == self.edit_timer {
+            return;
+        }
+        self.edit_timer = on;
+        // SAFETY: our window and timer.
+        unsafe {
+            if on {
+                SetTimer(
+                    Some(self.hwnd),
+                    TIMER_EDIT,
+                    crate::edit_local::TICK.as_millis() as u32,
+                    None,
+                );
+            } else {
+                let _ = KillTimer(Some(self.hwnd), TIMER_EDIT);
+            }
+        }
+    }
+
+    /// Moves the local edits on; returns the files to open in an editor.
+    fn on_edit_timer(&mut self) -> Vec<PathBuf> {
+        use crate::edit_local::{Action, Stamp};
+        let sftp = &self.sftp;
+        self.edits.retain(|q| sftp.contains_key(q));
+        let actions = self.edits.tick(
+            |q, id| self.sftp.get(q).and_then(|r| r.job_state(id)),
+            Stamp::of,
+        );
+        let mut open = Vec::new();
+        for action in actions {
+            match action {
+                Action::Open(path) => open.push(path),
+                Action::PutBack {
+                    queue,
+                    local,
+                    remote,
+                    mode,
+                } => {
+                    let Some(r) = self.sftp.get_mut(&queue) else {
+                        continue;
+                    };
+                    let stamp = Stamp::of(&local);
+                    match (r.put_back(&local, &remote, mode), stamp) {
+                        (Ok(job), Some(stamp)) => self.edits.sending(&local, job, stamp),
+                        (Err(e), _) => r.notice = Some(e),
+                        (Ok(_), None) => {}
+                    }
+                }
+                Action::Notice { queue, text } => {
+                    if let Some(r) = self.sftp.get_mut(&queue) {
+                        r.notice = Some(text);
+                    }
+                }
+            }
+        }
+        let watching = !self.edits.is_empty();
+        self.edit_timer(watching);
+        self.flush_sftp();
+        if self.files_visible() {
+            self.refresh_chrome();
+        }
+        open
     }
 
     /// Queues uploads and shows the queue.
@@ -13480,6 +13637,30 @@ fn files_event(hwnd: HWND, event: files_panel::Event) {
     }
     if let Some(command) = with_window(|w| w.files_event(event)).flatten() {
         run_command(hwnd, command);
+    }
+}
+
+/// Opens a file downloaded for editing in an editor: the file type's
+/// Edit verb, else Notepad. Never its Open verb, which runs a script or
+/// a program instead of showing it.
+fn open_in_editor(hwnd: HWND, path: &Path) {
+    let file = HSTRING::from(path.as_os_str());
+    // SAFETY: a file of our own handed to the shell; the strings live
+    // through each call.
+    unsafe {
+        let done = ShellExecuteW(Some(hwnd), w!("edit"), &file, None, None, SW_SHOWNORMAL);
+        if done.0 as isize > 32 {
+            return;
+        }
+        let quoted = HSTRING::from(format!("\"{}\"", path.display()));
+        ShellExecuteW(
+            Some(hwnd),
+            w!("open"),
+            w!("notepad.exe"),
+            &quoted,
+            None,
+            SW_SHOWNORMAL,
+        );
     }
 }
 
@@ -15022,6 +15203,12 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
             WM_SHELL_OUTPUT => {
                 if let Some(commands) = with_window(Window::on_output) {
                     run_commands(hwnd, commands);
+                }
+                LRESULT(0)
+            }
+            WM_TIMER if wparam.0 == TIMER_EDIT => {
+                for path in with_window(Window::on_edit_timer).unwrap_or_default() {
+                    open_in_editor(hwnd, &path);
                 }
                 LRESULT(0)
             }

@@ -2,11 +2,13 @@
 //! possibly compromised SSH worker and the user's keys. It must never
 //! panic, and whatever it accepts must be exactly one RFC 4252 publickey
 //! request for that user and key, with an algorithm FeroSSH allows: the
-//! accepted bytes are rebuilt from the parts and must match.
+//! accepted bytes are rebuilt from the parts and must match. The check
+//! for a forwarded agent's sign requests reads the same bytes and must
+//! not panic either.
 
 #![no_main]
 
-use ferossh_auth::userauth::{allowed_algorithms, check, key_type};
+use ferossh_auth::userauth::{allowed_algorithms, check, check_forwarded, key_type};
 use libfuzzer_sys::fuzz_target;
 
 fn string(out: &mut Vec<u8>, s: &[u8]) {
@@ -65,6 +67,7 @@ fuzz_target!(|data: &[u8]| {
         d.extend_from_slice(p.get(6).copied().unwrap_or_default());
         d
     };
+    let _ = check_forwarded(&request, &key, u32::from(mode >> 6) << 1);
     let Ok(target) = check(&request, user, &key) else {
         return;
     };

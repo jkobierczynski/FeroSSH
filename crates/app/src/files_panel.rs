@@ -17,7 +17,7 @@
 
 use std::cell::RefCell;
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use ferossh_sftp::{Choice, JobId, State as JobState, names};
 use windows::Win32::Foundation::{COLORREF, FILETIME, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
@@ -45,7 +45,8 @@ use windows::Win32::UI::Controls::{
     WC_STATICW,
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    GetFocus, ReleaseCapture, SetCapture, SetFocus, VK_BACK, VK_CONTROL, VK_DELETE, VK_F5, VK_SHIFT,
+    GetFocus, ReleaseCapture, SetCapture, SetFocus, VK_BACK, VK_CONTROL, VK_DELETE, VK_F2, VK_F5,
+    VK_SHIFT,
 };
 use windows::Win32::UI::Shell::{
     SHFILEINFOW, SHGFI_SMALLICON, SHGFI_SYSICONINDEX, SHGFI_USEFILEATTRIBUTES, SHGetFileInfoW,
@@ -146,6 +147,30 @@ pub enum Event {
     },
     /// Ask, then delete these entries of the listed remote folder.
     Delete(Vec<Vec<u8>>),
+    /// Make folder `name` in remote folder `dir`.
+    MakeFolder {
+        dir: Vec<u8>,
+        name: Vec<u8>,
+    },
+    /// Rename entry `from` of remote folder `dir` to `to`.
+    Rename {
+        dir: Vec<u8>,
+        from: Vec<u8>,
+        to: Vec<u8>,
+    },
+    /// Set the permissions typed (`text`) on entries `keys` of remote
+    /// folder `dir`.
+    Chmod {
+        dir: Vec<u8>,
+        keys: Vec<Vec<u8>>,
+        text: String,
+    },
+    /// Download entry `key` of remote folder `dir`, open it in an editor,
+    /// and put it back on each save.
+    Edit {
+        dir: Vec<u8>,
+        key: Vec<u8>,
+    },
     /// The Local list moved here: downloads go here from now on.
     SetLocal(PathBuf),
     PickLocal,
@@ -163,6 +188,35 @@ pub enum Event {
     Focused,
     /// Escape with no filter: back to the terminal.
     Leave,
+}
+
+/// What the name row under the filter is for.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum Naming {
+    /// A new bookmark (`None`), or renaming bookmark `Some(i)`.
+    Bookmark(Option<usize>),
+    /// A new folder in remote folder `dir`.
+    RemoteFolder { dir: Vec<u8> },
+    /// Renaming entry `key` of remote folder `dir`.
+    RemoteRename { dir: Vec<u8>, key: Vec<u8> },
+    /// New permissions for entries `keys` of remote folder `dir`.
+    Chmod { dir: Vec<u8>, keys: Vec<Vec<u8>> },
+    /// A new folder in local folder `dir`.
+    LocalFolder { dir: PathBuf },
+    /// Renaming local file or folder `path`.
+    LocalRename { path: PathBuf },
+}
+
+impl Naming {
+    /// The remote folder it is for: another one cancels it.
+    fn remote_dir(&self) -> Option<&[u8]> {
+        match self {
+            Naming::RemoteFolder { dir }
+            | Naming::RemoteRename { dir, .. }
+            | Naming::Chmod { dir, .. } => Some(dir),
+            _ => None,
+        }
+    }
 }
 
 /// Carries out an [`Event`]; `HWND` is the main window.
@@ -304,9 +358,8 @@ struct State {
     /// Sync browsing: opening a folder, or going up, in one list does the
     /// same in the other.
     sync: bool,
-    /// A bookmark name being typed: for a new bookmark, or for renaming
-    /// bookmark `Some(i)`.
-    naming: Option<Option<usize>>,
+    /// What the name row is open for.
+    naming: Option<Naming>,
     /// The host the pane showed, to open its connection's Local folder
     /// when it turns to another.
     shown_host: Option<(Option<String>, Option<String>)>,
@@ -897,7 +950,7 @@ fn title_end(h: &Handles, dpi: u32) -> i32 {
 /// Places every control for the panel's size, arrangement, queue and
 /// question.
 fn layout(h: &Handles) {
-    let Some((dpi, (width, height), visible, arrange, queued, asking, status, naming)) =
+    let Some((dpi, (width, height), visible, arrange, queued, asking, status, naming, marks)) =
         with(|s| {
             (
                 s.dpi,
@@ -908,6 +961,7 @@ fn layout(h: &Handles) {
                 s.view.as_ref().is_some_and(|v| v.question.is_some()),
                 s.local_error.is_some() || s.view.as_ref().is_some_and(|v| v.status.is_some()),
                 s.naming.is_some(),
+                matches!(s.naming, Some(Naming::Bookmark(_))),
             )
         })
     else {
@@ -1013,7 +1067,9 @@ fn layout(h: &Handles) {
         let mut x = pad;
         for (c, w) in h.name.iter().zip([name_w, b, b, check_w]) {
             let _ = MoveWindow(*c, x, name_y, w, row, true);
-            let _ = ShowWindow(*c, if naming { SW_SHOWNA } else { SW_HIDE });
+            // The host check box is the bookmarks' own.
+            let show = naming && (marks || *c != h.name[3]);
+            let _ = ShowWindow(*c, if show { SW_SHOWNA } else { SW_HIDE });
             x += w + gap6;
         }
         // Refresh ends the filter's row: the title row is full on a
@@ -1284,8 +1340,12 @@ pub fn set_view(view: View) {
         let host = old.map(|v| &v.host) != Some(&view.host);
         // A bookmark name being typed belongs to the connection it was
         // started on: another connection cancels it.
-        let renaming_lost =
-            s.naming.is_some() && old.is_some_and(|v| v.alias != view.alias || v.key != view.key);
+        let renaming_lost = s.naming.is_some()
+            && old.is_some_and(|v| v.alias != view.alias || v.key != view.key)
+            || s.naming
+                .as_ref()
+                .and_then(Naming::remote_dir)
+                .is_some_and(|d| d != view.remote_dir.as_slice());
         if renaming_lost {
             s.naming = None;
         }
@@ -2298,13 +2358,14 @@ fn start_naming(h: &Handles, which: Option<usize>) {
             ),
         };
         let has_alias = v.alias.is_some();
-        s.naming = Some(which);
+        s.naming = Some(Naming::Bookmark(which));
         Some((name, only_host && has_alias, has_alias))
     })
     .flatten() else {
         return;
     };
     layout(h);
+    set_cue(h.name[0], "Bookmark name");
     let text = wide(&name);
     // SAFETY: our own controls; the text lives through the call.
     unsafe {
@@ -2333,18 +2394,254 @@ fn start_naming(h: &Handles, which: Option<usize>) {
     }
 }
 
-/// Hides the name row.
+/// Hides the name row, and gives the keyboard back to where it was
+/// opened from.
 fn end_naming(h: &Handles) {
-    with(|s| s.naming = None);
+    let was = with(|s| s.naming.take()).flatten();
     layout(h);
+    let back = match was {
+        Some(Naming::Bookmark(_)) | None => h.bookmarks,
+        Some(Naming::LocalFolder { .. } | Naming::LocalRename { .. }) => h.local.list,
+        Some(_) => h.remote.list,
+    };
     // SAFETY: our own control.
     unsafe {
-        let _ = SetFocus(Some(h.bookmarks));
+        let _ = SetFocus(Some(back));
     }
 }
 
-/// Saves the bookmark named in the name row.
+fn set_cue(edit: HWND, text: &str) {
+    let cue = wide(text);
+    // SAFETY: our own control; the text lives through the call.
+    unsafe {
+        SendMessageW(
+            edit,
+            EM_SETCUEBANNER,
+            Some(WPARAM(1)),
+            Some(LPARAM(cue.as_ptr() as isize)),
+        );
+    }
+}
+
+/// Opens the name row for a change to the lists' files: `text` to start
+/// from, `button` the Save button's label, `cue` the hint in the empty
+/// box.
+fn start_file_naming(h: &Handles, naming: Naming, text: &str, button: &str, cue: &str) {
+    with(|s| s.naming = Some(naming));
+    layout(h);
+    set_cue(h.name[0], cue);
+    let text_w = wide(text);
+    let button_w = wide(button);
+    // SAFETY: our own controls; the texts live through each call.
+    unsafe {
+        let _ = SetWindowTextW(h.name[0], PCWSTR(text_w.as_ptr()));
+        let _ = SetWindowTextW(h.name[1], PCWSTR(button_w.as_ptr()));
+        let _ = SetFocus(Some(h.name[0]));
+        // A rename selects the name without its extension, as Explorer
+        // does.
+        let end = match text.rfind('.') {
+            Some(dot) if dot > 0 && button == "Rename" => text[..dot].encode_utf16().count(),
+            _ => text.encode_utf16().count(),
+        };
+        SendMessageW(
+            h.name[0],
+            EM_SETSEL,
+            Some(WPARAM(0)),
+            Some(LPARAM(end as isize)),
+        );
+    }
+}
+
+/// New folder, in the Remote (`remote`) or Local list's folder.
+fn new_folder(h: &Handles, remote: bool) {
+    let naming = if remote {
+        with(|s| {
+            s.view
+                .as_ref()
+                .filter(|v| v.host.is_some() && !v.remote_dir.is_empty())
+                .map(|v| Naming::RemoteFolder {
+                    dir: v.remote_dir.clone(),
+                })
+        })
+        .flatten()
+    } else {
+        with(|s| {
+            s.local.dir().map(|d| Naming::LocalFolder {
+                dir: d.to_path_buf(),
+            })
+        })
+        .flatten()
+    };
+    if let Some(naming) = naming {
+        start_file_naming(h, naming, "", "Create", "New folder name");
+    }
+}
+
+/// Rename the one row picked in the Remote (`remote`) or Local list.
+fn rename(h: &Handles, remote: bool) {
+    let rows = picked(h, remote);
+    let [row] = rows.as_slice() else {
+        return;
+    };
+    let naming = if remote {
+        let Some(dir) = with(|s| s.view.as_ref().map(|v| v.remote_dir.clone())).flatten() else {
+            return;
+        };
+        Naming::RemoteRename {
+            dir,
+            key: row.key.clone(),
+        }
+    } else {
+        let Some(path) = row.local.clone() else {
+            return;
+        };
+        Naming::LocalRename { path }
+    };
+    start_file_naming(h, naming, &row.name, "Rename", "New name");
+}
+
+/// New permissions for the rows picked in the Remote list.
+fn permissions(h: &Handles) {
+    let rows = picked(h, true);
+    if rows.is_empty() {
+        return;
+    }
+    let Some(dir) = with(|s| s.view.as_ref().map(|v| v.remote_dir.clone())).flatten() else {
+        return;
+    };
+    // The box starts from the first row's rights.
+    let start = rows
+        .first()
+        .map(|r| {
+            let bits = r.rights.get(1..).unwrap_or_default();
+            files::parse_mode(bits, 0, false)
+                .map(files::mode_text)
+                .unwrap_or_default()
+        })
+        .unwrap_or_default();
+    let keys = rows.into_iter().map(|r| r.key).collect();
+    start_file_naming(
+        h,
+        Naming::Chmod { dir, keys },
+        &start,
+        "Set",
+        "Permissions: 755, rwxr-xr-x or u+x",
+    );
+}
+
+/// Edit the one file picked in the Remote list locally.
+fn edit_locally(h: &Handles) {
+    let rows = picked(h, true);
+    let [row] = rows.as_slice() else {
+        return;
+    };
+    if row.dir {
+        return;
+    }
+    if let Some(dir) = with(|s| s.view.as_ref().map(|v| v.remote_dir.clone())).flatten() {
+        emit(Event::Edit {
+            dir,
+            key: row.key.clone(),
+        });
+    }
+}
+
+/// A local name typed for a new folder or a rename, or why it will not do.
+fn local_name(text: &str) -> Result<&str, String> {
+    let name = text.trim_end_matches([' ', '.']);
+    if name.trim().is_empty() {
+        return Err("Type a name.".into());
+    }
+    if name == "."
+        || name == ".."
+        || name.contains(['\\', '/', ':', '*', '?', '"', '<', '>', '|'])
+        || name.chars().any(char::is_control)
+    {
+        return Err(format!("{name} is not a name Windows takes."));
+    }
+    Ok(name)
+}
+
+/// Carries out the name row for the lists' files.
+fn save_file_name(h: &Handles, naming: Naming, text: String) {
+    match naming {
+        Naming::Bookmark(_) => {}
+        Naming::RemoteFolder { dir } => {
+            end_naming(h);
+            emit(Event::MakeFolder {
+                dir,
+                name: text.into_bytes(),
+            });
+        }
+        Naming::RemoteRename { dir, key } => {
+            end_naming(h);
+            emit(Event::Rename {
+                dir,
+                from: key,
+                to: text.into_bytes(),
+            });
+        }
+        Naming::Chmod { dir, keys } => {
+            end_naming(h);
+            emit(Event::Chmod { dir, keys, text });
+        }
+        Naming::LocalFolder { dir } => {
+            let made = local_name(&text).and_then(|name| {
+                std::fs::create_dir(dir.join(name))
+                    .map(|()| name.to_owned())
+                    .map_err(|e| format!("Could not create the folder: {e}"))
+            });
+            match made {
+                Ok(name) => {
+                    end_naming(h);
+                    local_go(h, dir, Some(name.into_bytes()), false);
+                }
+                Err(e) => local_problem(e),
+            }
+        }
+        Naming::LocalRename { path } => {
+            let Some(dir) = path.parent().map(Path::to_path_buf) else {
+                return;
+            };
+            let moved = local_name(&text).and_then(|name| {
+                let to = dir.join(name);
+                if to == path {
+                    return Ok(name.to_owned());
+                }
+                if to.exists() && !same_name_but_case(&path, &to) {
+                    return Err(format!("{name} exists already."));
+                }
+                std::fs::rename(&path, &to)
+                    .map(|()| name.to_owned())
+                    .map_err(|e| format!("Could not rename: {e}"))
+            });
+            match moved {
+                Ok(name) => {
+                    end_naming(h);
+                    local_go(h, dir, Some(name.into_bytes()), false);
+                }
+                Err(e) => local_problem(e),
+            }
+        }
+    }
+}
+
+/// Whether `a` and `b` are one name in another case (a rename Windows
+/// allows over "itself").
+fn same_name_but_case(a: &Path, b: &Path) -> bool {
+    a.parent() == b.parent()
+        && a.file_name().zip(b.file_name()).is_some_and(|(x, y)| {
+            x != y && x.to_string_lossy().to_lowercase() == y.to_string_lossy().to_lowercase()
+        })
+}
+
+/// Saves what the name row was opened for.
 fn save_name(h: &Handles) {
+    let naming = with(|s| s.naming.clone()).flatten();
+    if let Some(n) = naming.filter(|n| !matches!(n, Naming::Bookmark(_))) {
+        let text = search_text(h.name[0]);
+        return save_file_name(h, n, text);
+    }
     let Some(name) = files::bookmark_name(&search_text(h.name[0])) else {
         local_problem("Type a name for the bookmark.".into());
         return;
@@ -2353,7 +2650,9 @@ fn save_name(h: &Handles) {
     let only_host =
         unsafe { SendMessageW(h.name[3], BM_GETCHECK, None, None) }.0 == BST_CHECKED.0 as isize;
     let Some(Some((all, which, new))) = with(|s| {
-        let which = s.naming?;
+        let Some(Naming::Bookmark(which)) = s.naming.clone() else {
+            return None;
+        };
         let v = s.view.as_ref()?;
         let host = |old: Option<&String>| {
             only_host
@@ -2511,16 +2810,28 @@ fn context_menu(h: &Handles, list: HWND, lparam: LPARAM) {
     const PICK: u32 = 6;
     const EXPLORER: u32 = 7;
     const UPLOAD: u32 = 8;
+    const EDIT: u32 = 9;
+    const NEW_FOLDER: u32 = 10;
+    const RENAME: u32 = 11;
+    const CHMOD: u32 = 12;
     let (at, row) = menu_spot(list, lparam);
     let remote = list == h.remote.list;
-    let any = !picked(h, remote).is_empty();
+    let rows = picked(h, remote);
+    let any = !rows.is_empty();
+    let one = rows.len() == 1;
+    let one_file = one && rows.first().is_some_and(|r| !r.dir);
     let host = remote_dir().is_some();
     let can = |id: u32, on: bool| if on { id } else { u32::MAX };
     let items: Vec<(u32, &str, bool)> = if remote {
         vec![
             (can(OPEN, row.is_some()), "&Open\tEnter", false),
+            (can(EDIT, one_file), "&Edit locally", false),
             (can(SEND, any), "&Download\tCtrl+Enter", false),
             (can(DELETE, any), "D&elete...\tDel", false),
+            (0, "", false),
+            (can(NEW_FOLDER, host), "&New folder...", false),
+            (can(RENAME, one), "Rena&me...\tF2", false),
+            (can(CHMOD, any), "&Permissions...", false),
             (0, "", false),
             (can(REFRESH, host), "&Refresh\tF5", false),
             (can(HOME, host), "&Home folder", false),
@@ -2531,6 +2842,9 @@ fn context_menu(h: &Handles, list: HWND, lparam: LPARAM) {
         vec![
             (can(OPEN, row.is_some()), "&Open\tEnter", false),
             (can(SEND, any && host), "&Upload\tCtrl+Enter", false),
+            (0, "", false),
+            (can(NEW_FOLDER, local), "&New folder...", false),
+            (can(RENAME, one), "Rena&me...\tF2", false),
             (0, "", false),
             (REFRESH, "&Refresh\tF5", false),
             (PICK, "&Choose local folder...", false),
@@ -2552,6 +2866,10 @@ fn context_menu(h: &Handles, list: HWND, lparam: LPARAM) {
         SEND if remote => download(h, None),
         SEND => upload(h, None),
         DELETE => delete(h),
+        EDIT => edit_locally(h),
+        NEW_FOLDER => new_folder(h, remote),
+        RENAME => rename(h, remote),
+        CHMOD => permissions(h),
         REFRESH if remote => emit(Event::Refresh),
         REFRESH => refresh_local(h, true),
         HOME => emit(Event::Home),
@@ -2775,6 +3093,8 @@ fn notify(h: &Handles, lparam: LPARAM) -> LRESULT {
                     go_up(h, remote);
                 } else if vk == VK_DELETE.0 && remote {
                     delete(h);
+                } else if vk == VK_F2.0 {
+                    rename(h, remote);
                 } else if vk == VK_F5.0 {
                     if remote {
                         emit(Event::Refresh);

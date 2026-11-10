@@ -61,6 +61,8 @@ mod script_report;
 mod scripts_panel;
 // Platform-neutral, tested everywhere; only the Windows build uses them.
 #[cfg_attr(not(windows), allow(dead_code))]
+mod edit_local;
+#[cfg_attr(not(windows), allow(dead_code))]
 mod files;
 #[cfg_attr(not(windows), allow(dead_code))]
 mod forwards;

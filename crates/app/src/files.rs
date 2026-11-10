@@ -634,6 +634,102 @@ pub fn back_step(
     })
 }
 
+/// Permission bits as the Permissions box shows them: `755`, or `2775`
+/// with special bits.
+pub fn mode_text(mode: u32) -> String {
+    let m = mode & 0o7777;
+    if m > 0o777 {
+        format!("{m:04o}")
+    } else {
+        format!("{m:03o}")
+    }
+}
+
+/// The permission bits typed in the Permissions box, given the entry's
+/// mode now (`old`) and whether it is a folder. Takes octal (`755`,
+/// `0640`, `2775`), the nine letters `ls -l` shows (`rwxr-x---`), or
+/// chmod's symbolic clauses (`u+x`, `go-w`, `a=r,u+w`, `+X`). Three octal
+/// digits or nine letters keep a folder's setgid and sticky bits, as
+/// GNU chmod does.
+pub fn parse_mode(text: &str, old: u32, dir: bool) -> Result<u32, String> {
+    let text = text.trim();
+    let old = old & 0o7777;
+    let keep = if dir { old & 0o7000 } else { 0 };
+    if text.is_empty() {
+        return Err("Type permissions, such as 755 or u+x.".into());
+    }
+    if text.bytes().all(|b| (b'0'..=b'7').contains(&b)) {
+        if text.len() > 4 {
+            return Err(format!("{text} is too long for permissions."));
+        }
+        let m = u32::from_str_radix(text, 8).map_err(|e| e.to_string())?;
+        return Ok(if text.len() <= 3 { m | keep } else { m });
+    }
+    let letters = text
+        .strip_prefix(['-', 'd'])
+        .filter(|t| t.len() == 9)
+        .unwrap_or(text);
+    if letters.len() == 9 && letters.bytes().all(|b| b"rwx-".contains(&b)) {
+        let mut m = 0;
+        for (i, (b, want)) in letters.bytes().zip(b"rwxrwxrwx".iter()).enumerate() {
+            if b == *want {
+                m |= 1 << (8 - i);
+            } else if b != b'-' {
+                return Err(format!("{text}: {} is out of place.", b as char));
+            }
+        }
+        return Ok(m | keep);
+    }
+    let mut m = old;
+    for clause in text.split(',') {
+        let bad = || format!("{clause} is not a permission change (try 755 or u+x).");
+        let ops_at = clause.find(['+', '-', '=']).ok_or_else(bad)?;
+        let (who_text, mut rest) = clause.split_at(ops_at);
+        let mut who = 0u32;
+        for c in who_text.chars() {
+            who |= match c {
+                'u' => 0o4700,
+                'g' => 0o2070,
+                'o' => 0o1007,
+                'a' => 0o7777,
+                _ => return Err(bad()),
+            };
+        }
+        if who == 0 {
+            who = 0o7777;
+        }
+        while let Some(op) = rest.chars().next() {
+            let perms_end = rest
+                .get(1..)
+                .and_then(|r| r.find(['+', '-', '=']))
+                .map_or(rest.len(), |n| n + 1);
+            let perms = rest.get(1..perms_end).unwrap_or_default();
+            rest = rest.get(perms_end..).unwrap_or_default();
+            let mut bits = 0u32;
+            for c in perms.chars() {
+                bits |= match c {
+                    'r' => 0o444,
+                    'w' => 0o222,
+                    'x' => 0o111,
+                    'X' if dir || old & 0o111 != 0 => 0o111,
+                    'X' => 0,
+                    's' => 0o6000,
+                    't' => 0o1000,
+                    _ => return Err(bad()),
+                };
+            }
+            let bits = bits & who;
+            m = match op {
+                '+' => m | bits,
+                '-' => m & !bits,
+                '=' => (m & !(who & 0o777)) | bits,
+                _ => return Err(bad()),
+            };
+        }
+    }
+    Ok(m)
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::indexing_slicing)]
 mod tests {
@@ -936,5 +1032,44 @@ mod tests {
         }
         assert_eq!(sync_local(here, b".."), None);
         assert_eq!(sync_local(here, b"a/b"), None);
+    }
+
+    #[test]
+    fn reads_permissions_in_three_forms() {
+        assert_eq!(mode_text(0o100_755), "755");
+        assert_eq!(mode_text(0o42_775), "2775");
+        let file = |t| parse_mode(t, 0o644, false);
+        assert_eq!(file("755"), Ok(0o755));
+        assert_eq!(file("0640"), Ok(0o640));
+        assert_eq!(file("4755"), Ok(0o4755));
+        assert_eq!(file("rwxr-x---"), Ok(0o750));
+        assert_eq!(file("-rw-r--r--"), Ok(0o644));
+        assert_eq!(file("u+x"), Ok(0o744));
+        assert_eq!(file("+x"), Ok(0o755));
+        assert_eq!(file("go-r"), Ok(0o600));
+        assert_eq!(file("a=r,u+w"), Ok(0o644));
+        assert_eq!(file("u=rwx,g=rx,o="), Ok(0o750));
+        assert_eq!(file("u+x-w"), Ok(0o544));
+        assert_eq!(file("+X"), Ok(0o644), "X needs a folder or an x bit");
+        assert_eq!(parse_mode("+X", 0o744, false), Ok(0o755));
+        assert_eq!(parse_mode("+X", 0o644, true), Ok(0o755));
+        assert_eq!(file("u+s"), Ok(0o4644));
+        assert_eq!(file("+t"), Ok(0o1644));
+        // A folder keeps setgid and sticky through three digits.
+        assert_eq!(parse_mode("755", 0o2775, true), Ok(0o2755));
+        assert_eq!(parse_mode("0755", 0o2775, true), Ok(0o755));
+        assert_eq!(parse_mode("755", 0o4775, false), Ok(0o755));
+        for bad in [
+            "",
+            "8",
+            "77777",
+            "rwz------",
+            "q+x",
+            "u",
+            "u+y",
+            "wrx------",
+        ] {
+            assert!(file(bad).is_err(), "{bad}");
+        }
     }
 }
