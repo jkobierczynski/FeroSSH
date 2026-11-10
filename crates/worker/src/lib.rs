@@ -26,6 +26,7 @@ use std::thread;
 
 use ferossh_ipc::{ChannelId, Decoder, Message, PROTOCOL_VERSION, Side, encode};
 use tokio::sync::{mpsc, oneshot};
+use zeroize::Zeroize;
 
 pub use session::Params;
 use session::{Connections, Route, SessionGuard};
@@ -52,6 +53,8 @@ fn weight(msg: &Message) -> usize {
         // Cannot be sent on, so as much as any one message may be.
         Err(_) => ferossh_ipc::MAX_BODY_LEN,
     };
+    // The copy may hold a password the user typed.
+    frame.zeroize();
     wire.saturating_add(64)
 }
 

@@ -986,6 +986,7 @@ dependencies = [
  "getrandom 0.4.3",
  "russh",
  "tokio",
+ "zeroize",
 ]
 
 [[package]]
