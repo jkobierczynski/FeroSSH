@@ -896,6 +896,46 @@ fn puts_an_edited_file_back_without_asking_and_keeps_its_mode() {
 }
 
 #[test]
+fn saves_of_the_same_file_go_one_at_a_time() {
+    let s = Scratch::new("putback-twice");
+    let script = s.remote().join("run.sh");
+    fs::write(&script, "echo old\n").unwrap();
+    let (first, second) = (s.local().join("a"), s.local().join("b"));
+    fs::write(&first, "echo first and much longer\n").unwrap();
+    fs::write(&second, "echo second\n").unwrap();
+    let (mut remote, mut fake) = connected(&s.remote());
+    let one = remote.put_back(&first, b"/run.sh", None).unwrap();
+    let two = remote.put_back(&second, b"/run.sh", None).unwrap();
+    assert_eq!(remote.job_state(one), Some(State::Running));
+    assert_eq!(remote.job_state(two), Some(State::Queued));
+    assert!(run(&mut remote, &mut fake));
+    assert_eq!(remote.job_state(one), Some(State::Done));
+    assert_eq!(remote.job_state(two), Some(State::Done));
+    assert_eq!(fs::read_to_string(&script).unwrap(), "echo second\n");
+}
+
+#[test]
+fn a_retried_put_back_still_replaces_without_asking() {
+    let s = Scratch::new("putback-retry");
+    let script = s.remote().join("run.sh");
+    fs::write(&script, "echo old\n").unwrap();
+    let local = s.local().join("run.sh");
+    fs::write(&local, "echo new\n").unwrap();
+    let (mut remote, mut fake) = connected(&s.remote());
+    fake.chmod_fails = true;
+    let id = remote
+        .put_back(&local, b"/run.sh", Some(0o100_644))
+        .unwrap();
+    run(&mut remote, &mut fake);
+    assert_eq!(remote.job_state(id), Some(State::Failed));
+    fake.chmod_fails = false;
+    remote.retry(id);
+    assert!(run(&mut remote, &mut fake));
+    assert_eq!(remote.job_state(id), Some(State::Done));
+    assert_eq!(fs::read_to_string(&script).unwrap(), "echo new\n");
+}
+
+#[test]
 fn a_failed_chmod_leaves_the_original_in_place() {
     let s = Scratch::new("putback-chmod");
     let script = s.remote().join("run.sh");

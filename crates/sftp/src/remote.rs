@@ -923,7 +923,8 @@ impl Remote {
         {
             job.state = if ready { State::Queued } else { State::Waiting };
             job.note = None;
-            job.choice = None;
+            // An edited file put back always replaces the original.
+            job.choice = job.put_back.map(|_| Choice::Overwrite);
         }
         self.pump();
     }
@@ -1080,6 +1081,18 @@ impl Remote {
                 break;
             };
             if job.state != State::Queued {
+                continue;
+            }
+            // One upload at a time owns a target's part file: a second
+            // save of the same edited file waits for the first.
+            if job.kind == Kind::Upload
+                && self.jobs.iter().enumerate().any(|(k, other)| {
+                    k != i
+                        && other.kind == Kind::Upload
+                        && other.remote == job.remote
+                        && matches!(other.state, State::Running | State::Paused)
+                })
+            {
                 continue;
             }
             if job.kind.is_folder() {
