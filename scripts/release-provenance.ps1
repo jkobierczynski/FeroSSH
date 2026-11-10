@@ -219,6 +219,12 @@ function Assert-ReleaseAgents {
         [Parameter(Mandatory)] [string]$Tag,
         [string]$Server = "https://github.com"
     )
+    # An extra agent in the draft would be published (and attested by
+    # attest-release.yml) without ever being checked against CI's build.
+    $expected = @($Build.Manifest.files | Where-Object name -like "ferostream-agent*" | ForEach-Object name)
+    foreach ($file in Get-ChildItem -LiteralPath $Dir -File -Filter "ferostream-agent*") {
+        if ($file.Name -notin $expected) { throw "the draft has $($file.Name), which the release workflow did not build" }
+    }
     foreach ($entry in $Build.Manifest.files | Where-Object name -like "ferostream-agent*") {
         $path = Join-Path $Dir $entry.name
         if (-not (Test-Path $path)) { throw "the draft has no $($entry.name), which the release workflow built" }
