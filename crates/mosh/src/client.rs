@@ -340,15 +340,20 @@ impl Client {
         if self.states.iter().any(|s| s.num == inst.new_num) {
             return Ok(());
         }
-        let Some(reference) = self.states.iter().position(|s| s.num == inst.old_num) else {
+        if !self.states.iter().any(|s| s.num == inst.old_num) {
             // A diff from a state we do not have: never applied, so a
             // diff cannot be replayed onto the wrong screen.
             return Ok(());
-        };
+        }
+        // Drop the states the server no longer refers to, keeping the one
+        // the diff came from, before checking for room: a full list would
+        // otherwise refuse the very instruction that empties it.
+        let throwaway = inst.throwaway_num.min(inst.old_num);
+        self.states.retain(|s| s.num >= throwaway);
         if self.states.len() >= MAX_STATES {
             return Ok(());
         }
-        let Some(base) = self.states.get(reference) else {
+        let Some(base) = self.states.iter().find(|s| s.num == inst.old_num) else {
             return Ok(());
         };
         let mut next = Received {
@@ -368,10 +373,6 @@ impl Client {
                 HostEvent::EchoAck(n) => next.echo_ack = next.echo_ack.max(n),
             }
         }
-        // Drop the states the server no longer refers to, keeping the one
-        // the diff came from.
-        let throwaway = inst.throwaway_num.min(inst.old_num);
-        self.states.retain(|s| s.num >= throwaway);
         if let Some(at) = self.states.iter().position(|s| s.num > next.num) {
             // Older than one we have: kept to diff from, not shown.
             self.states.insert(at, next);
@@ -777,6 +778,22 @@ mod tests {
             self.seq += 1;
             self.session.encrypt(to_client(self.seq), &text).unwrap()
         }
+    }
+
+    #[test]
+    fn a_full_state_list_takes_the_instruction_that_empties_it() {
+        let mut c = Client::new(&key(), false, 20, 4, 1, 0);
+        let mut s = Server::new();
+        // The server never hears our acks, so every diff is from state 0
+        // and nothing is thrown away: the list fills up.
+        for n in 1..400 {
+            c.receive(&s.send(0, n, 0, b"x"), 10).unwrap();
+        }
+        let held = c.remote_num();
+        assert!(held < 399, "the list is capped");
+        // Then it hears one: throwing away all before it makes room.
+        c.receive(&s.send(held, 500, 0, b"y"), 20).unwrap();
+        assert_eq!(c.remote_num(), 500);
     }
 
     #[test]

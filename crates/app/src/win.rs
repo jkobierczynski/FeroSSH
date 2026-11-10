@@ -4960,17 +4960,21 @@ impl Window {
     /// connection: no second login.
     fn connect_to(&mut self, id: PaneId, mut target: Target, env: &Env) {
         self.end_host(id);
-        if let Some(p) = self.settings.profile(&target.alias)
-            && p.kind == SessionKind::Mosh
-        {
-            target.mosh = Some(Box::new(MoshOptions {
-                server: p
-                    .mosh_server
-                    .clone()
-                    .unwrap_or_else(|| DEFAULT_MOSH_SERVER.to_owned()),
-                ports: p.mosh_ports,
-            }));
-        }
+        // The profile decides, every time: a reconnect or a split passes
+        // the old target back, which may predate a change of type.
+        target.mosh = self
+            .settings
+            .profile(&target.alias)
+            .filter(|p| p.kind == SessionKind::Mosh)
+            .map(|p| {
+                Box::new(MoshOptions {
+                    server: p
+                        .mosh_server
+                        .clone()
+                        .unwrap_or_else(|| DEFAULT_MOSH_SERVER.to_owned()),
+                    ports: p.mosh_ports,
+                })
+            });
         if let Some(p) = self.panes.get_mut(&id) {
             p.term.scroll_to_bottom();
         }
