@@ -11727,8 +11727,10 @@ impl Window {
                 None
             }
             Event::Delete(keys) => key.and_then(|key| {
-                let entries = files::entries_named(&self.sftp.get(&key)?.listing, &keys);
-                (!entries.is_empty()).then_some(Command::ConfirmDelete { key, entries })
+                let listing = &self.sftp.get(&key)?.listing;
+                let entries = files::entries_named(listing, &keys);
+                let dir = listing.path.clone();
+                (!entries.is_empty()).then_some(Command::ConfirmDelete { key, dir, entries })
             }),
             Event::SetLocal(dir) => {
                 self.set_download_dir(&dir);
@@ -12081,9 +12083,11 @@ enum Command {
     SaveLook,
     /// A message box with this text.
     Notice(String),
-    /// Ask, then delete `entries` in the listed folder of `key`'s host.
+    /// Ask, then delete `entries` in folder `dir` of `key`'s host (when
+    /// it is still the listed one).
     ConfirmDelete {
         key: String,
+        dir: Vec<u8>,
         entries: Vec<DirEntry>,
     },
     /// The folder picker for the file view's Local PC section, starting
@@ -13055,18 +13059,12 @@ fn run_command(hwnd: HWND, command: Command) {
                 });
             }
         }
-        Command::ConfirmDelete { key, entries } => {
+        Command::ConfirmDelete { key, dir, entries } => {
             let host = key.rsplit_once(':').map_or(key.as_str(), |(h, _)| h);
             let folders = entries.iter().any(|e| e.attrs.is_dir());
             let what = match entries.as_slice() {
                 [entry] => {
-                    let path = with_window(|w| {
-                        w.sftp
-                            .get(&key)
-                            .map(|r| names::display(&names::join(&r.listing.path, &entry.name)))
-                    })
-                    .flatten()
-                    .unwrap_or_default();
+                    let path = names::display(&names::join(&dir, &entry.name));
                     let kind = if folders { "the folder" } else { "the file" };
                     format!("{kind} {path}")
                 }
@@ -13080,9 +13078,17 @@ fn run_command(hwnd: HWND, command: Command) {
             let text = format!("Delete {what} on {host}?{note}\n\nThis cannot be undone.");
             if dialog(hwnd, &text, MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2) == Some(IDYES) {
                 with_window(|w| {
+                    // Not when another folder was listed meanwhile: its
+                    // entries of the same names are not the ones asked about.
                     if let Some(r) = w.sftp.get_mut(&key) {
-                        for entry in &entries {
-                            r.delete(entry);
+                        if r.listing.path == dir {
+                            for entry in &entries {
+                                r.delete(entry);
+                            }
+                        } else {
+                            r.notice = Some(
+                                "Nothing was deleted: another folder was listed meanwhile.".into(),
+                            );
                         }
                     }
                     w.flush_sftp();

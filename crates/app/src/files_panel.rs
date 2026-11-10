@@ -241,6 +241,8 @@ struct State {
     /// The folders the lists show, to start a new folder at the top.
     local_dir: Option<PathBuf>,
     remote_dir: Vec<u8>,
+    /// The transfer queue the Remote list shows.
+    remote_key: Option<String>,
     /// A row to select once its folder is listed (the folder just left).
     select_local: Option<Vec<u8>>,
     select_remote: Option<Vec<u8>>,
@@ -563,6 +565,7 @@ pub fn create(main: HWND, handler: Handler, dpi: u32) -> windows::core::Result<(
                 queue_shown: Vec::new(),
                 local_dir: None,
                 remote_dir: Vec::new(),
+                remote_key: None,
                 select_local: None,
                 select_remote: None,
                 filter: String::new(),
@@ -1177,7 +1180,14 @@ fn refresh_remote(h: &Handles) {
     let Some((rows, old, new_folder, pick, mut icons, dir)) = with(|s| {
         let v = s.view.as_ref()?;
         let rows = filtered(&v.remote_rows, &s.filter);
-        let new_folder = v.remote_dir != s.remote_dir;
+        // Another queue is another host: nothing selected carries over,
+        // even when its folder and names are the same.
+        let new_queue = v.key != s.remote_key;
+        if new_queue {
+            s.remote_key.clone_from(&v.key);
+            s.select_remote = None;
+        }
+        let new_folder = new_queue || v.remote_dir != s.remote_dir;
         if rows == s.remote_shown && !new_folder {
             return None;
         }
