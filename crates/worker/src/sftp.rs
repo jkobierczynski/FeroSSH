@@ -1121,6 +1121,18 @@ mod tests {
     }
 
     #[test]
+    fn a_failed_restore_says_where_the_original_is() {
+        assert_eq!(
+            restore_failed("Permission denied.", b"/etc/app.conf.ferossh-old-7"),
+            "Permission denied; the original file is now /etc/app.conf.ferossh-old-7"
+        );
+        assert_eq!(
+            restore_failed(" ", b"/a.ferossh-old-1"),
+            "The new copy could not replace the file; the original file is now /a.ferossh-old-1"
+        );
+    }
+
+    #[test]
     fn keeps_the_name_off_the_command_line() {
         // Only plain words: nothing cmd.exe, PowerShell or sh would
         // treat specially, and no name.
