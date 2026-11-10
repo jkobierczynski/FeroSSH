@@ -113,8 +113,9 @@ jobs:
       # Without SignPath, the LOCAL_SIGNING repository variable set to true
       # makes the release a draft with the unsigned exes: the maintainer
       # signs them on their own PC (a Certum certificate on a card or in
-      # SimplySign) with scripts/sign-release.ps1, which uploads them,
-      # attests them and publishes the release.
+      # SimplySign) with scripts/sign-release.ps1, which checks them against
+      # this run's attestations, uploads them, attests them and publishes
+      # the release.
       - name: Check for SignPath
         id: signpath
         shell: pwsh
@@ -215,6 +216,16 @@ jobs:
             files      = @($files)
           } | ConvertTo-Json -Depth 4 | Set-Content -Encoding utf8NoBOM dist\BUILD-MANIFEST.json
           Get-Content dist\BUILD-MANIFEST.json
+
+      # Kept with the run, like the exes CI built: when the maintainer signs
+      # the exes (LOCAL_SIGNING), scripts/sign-release.ps1 and the "Attest a
+      # signed release" workflow take this manifest and the unsigned exes
+      # from the run's artifacts, not from the draft release, and check them
+      # against the attestation below before signing or attesting anything.
+      - uses: actions/upload-artifact@v4
+        with:
+          name: build-manifest
+          path: dist/BUILD-MANIFEST.json
 
       # Verify with: gh attestation verify ferossh.exe -R jkobierczynski/FeroSSH
       - uses: actions/attest-build-provenance@v2
