@@ -502,6 +502,9 @@ pub struct Settings {
     /// Ask before a snippet is typed into a pane with the Production
     /// theme. On unless turned off.
     pub confirm_production: bool,
+    /// F11 switches full screen (Settings > F11 switches full screen). On
+    /// unless turned off; off, F11 goes to the terminal as before.
+    pub full_screen_key: bool,
     /// Snippets with a `When` text answer the host by themselves. On
     /// unless turned off.
     pub auto_responses: bool,
@@ -589,6 +592,7 @@ impl Default for Settings {
             secrets: Vec::new(),
             snippets: Vec::new(),
             confirm_production: true,
+            full_screen_key: true,
             auto_responses: true,
             run_parallel: None,
             tmux_keys: false,
@@ -843,6 +847,10 @@ impl Settings {
                 "confirmproduction" => {
                     block = Block::Top;
                     s.confirm_production = yes(&args).unwrap_or(true);
+                }
+                "fullscreenkey" => {
+                    block = Block::Top;
+                    s.full_screen_key = yes(&args).unwrap_or(true);
                 }
                 "autoresponses" => {
                     block = Block::Top;
@@ -1195,6 +1203,7 @@ impl Settings {
         }
         let _ = writeln!(out, "ConfirmProduction {}", flag(self.confirm_production));
         let _ = writeln!(out, "AutoResponses {}", flag(self.auto_responses));
+        let _ = writeln!(out, "FullScreenKey {}", flag(self.full_screen_key));
         let _ = writeln!(out, "TmuxKeybindings {}", flag(self.tmux_keys));
         let _ = writeln!(out, "Standby {}", flag(self.standby));
         if let Some(k) = self.standby_hotkey {
@@ -1852,6 +1861,18 @@ DesktopShareSelection yes
             ..Settings::default()
         };
         assert!(Settings::parse(&s.to_text()).tmux_keys);
+    }
+
+    #[test]
+    fn full_screen_key_is_on_unless_turned_off() {
+        assert!(Settings::default().full_screen_key);
+        assert!(Settings::parse("").full_screen_key);
+        assert!(!Settings::parse("FullScreenKey no\n").full_screen_key);
+        let s = Settings {
+            full_screen_key: false,
+            ..Settings::default()
+        };
+        assert!(!Settings::parse(&s.to_text()).full_screen_key);
     }
 
     #[test]

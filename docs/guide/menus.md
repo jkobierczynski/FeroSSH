@@ -50,6 +50,8 @@ Items with a check mark are switches: picking them turns the setting on or off, 
 | Window colours (menus, tools) | | Where the menu bar and menus, the title bar, the tab strip, the tools rail and the tools pane take their colours. **Follow the terminal theme**: the focused pane's theme, so a dark theme gives a dark window and Production a red one. **Follow Windows**: Windows' light or dark app mode. **Light** (the default): Windows' usual light look. **Dark**: a neutral dark grey. `WindowColours`. |
 | Show test pattern | | Prints colours, text styles, box drawing, wide and combining characters in the pane, to check a font. |
 | Hide menu bar (Alt shows it) | Ctrl+Shift+M | Hides the menu bar. Pressing Alt shows it again. |
+| Full screen | F11 | ✓ while on. The window drops its title bar, frame and menu bar and covers the whole monitor, taskbar too. F11 again (or this item) puts it back as it was, maximized or not. Alt still shows the menu bar; it hides again once a menu closes. |
+| F11 switches full screen | ✓ on | Off, F11 goes to the terminal like the other function keys, for programs that use it; Full screen stays in this menu and the command palette. `FullScreenKey`. |
 
 Font, theme and text size apply to the focused pane only. Session > Save font and theme for this host keeps them for that host.
 
