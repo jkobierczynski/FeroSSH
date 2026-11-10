@@ -14,7 +14,7 @@ publish.workspace = true
 soft-authenticator = ["dep:p256"]
 
 [dependencies]
-getrandom = "0.4"
+getrandom = { version = "0.4", features = ["sys_rng"] }
 p256 = { version = "0.14", default-features = false, features = ["ecdsa"], optional = true }
 russh.workspace = true
 tokio = { version = "1.54", features = ["rt", "net", "time"] }

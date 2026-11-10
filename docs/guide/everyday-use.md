@@ -453,9 +453,20 @@ While you are scrolled back, a thin bar at the right edge shows where you are. E
 
 Session > Log to file writes what a tab receives to `%LOCALAPPDATA%\FeroSSH\logs`, one file per tab, optionally with a timestamp on each line, and Session > Save this pane's output to a log saves what a pane already holds. Every log is sealed with a chain file, and Session > Check a log for changes tells you whether it was changed later. [Logs](logs.md) explains all of this, including what the `.chain` files are.
 
+## Making a key and putting it on a server
+
+Tools > New SSH key... makes a key without OpenSSH installed. Choose what kind:
+
+- **Ed25519 key file**, the usual kind, like `ssh-keygen -t ed25519`. Give it a passphrase to have it encrypted, or leave the passphrase empty.
+- **Security key or phone** (ECDSA or Ed25519) or **Windows Hello**, like `ssh-keygen -t ecdsa-sk`. Windows asks you to touch the key, scan the QR code with your phone or confirm with Windows Hello. The file holds no secret.
+
+The file goes in `%USERPROFILE%\.ssh` under the name OpenSSH tries by itself (`id_ed25519`, `id_ecdsa_sk`, `id_ed25519_sk`), or `id_ed25519_2` and so on when that is taken; Browse... picks another place. FeroSSH never writes over an existing key. Afterwards it shows the public key line, and when the focused pane is logged in to an SSH host it offers to copy the key there.
+
+Session > Copy public key to this server... does what `ssh-copy-id` does for the host the focused pane is logged in to: pick a `.pub` file and FeroSSH adds its line to `~/.ssh/authorized_keys` there, unless the key is there already. It makes `~/.ssh` (700) and the file (600) when missing. The key line goes to the server as data, never as part of a command, so nothing in it runs. The server needs a Unix shell (`sh`); Windows servers are not supported.
+
 ## Security keys and passkeys
 
-FIDO2 security keys and passkeys work through Windows' own dialog: touch a USB or NFC key, scan the QR code with your phone, or confirm with Windows Hello. Use key files such as `id_ecdsa_sk` or `id_ed25519_sk` (made with `ssh-keygen -t ecdsa-sk` or `ferossh.exe --new-security-key`), or keys the OpenSSH agent holds. See [Getting started](getting-started.md#command-line).
+FIDO2 security keys and passkeys work through Windows' own dialog: touch a USB or NFC key, scan the QR code with your phone, or confirm with Windows Hello. Use key files such as `id_ecdsa_sk` or `id_ed25519_sk` (made with Tools > New SSH key, `ssh-keygen -t ecdsa-sk` or `ferossh.exe --new-security-key`), or keys the OpenSSH agent holds. See [Getting started](getting-started.md#command-line).
 
 ## Updates
 

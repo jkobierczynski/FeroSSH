@@ -66,6 +66,7 @@ Font, theme and text size apply to the focused pane only. Session > Save font an
 | Scripts | Ctrl+Shift+Space | Lists your scripts by category, to type one into the pane or edit them (see [Scripts](everyday-use.md#scripts)). |
 | Open scripts folder | | Opens `%APPDATA%\FeroSSH\scripts` in Explorer: one file per script, a folder per category, to copy to another PC or back up (see [The scripts folder](everyday-use.md#the-scripts-folder)). |
 | Command palette | Ctrl+Shift+A | One search box over every menu item, connection and script (see [Command palette](everyday-use.md#the-command-palette)). |
+| New SSH key... | | Makes an Ed25519 key file (with or without a passphrase) or a security key or Windows Hello key, and offers to copy it to the focused pane's host (see [Making a key](everyday-use.md#making-a-key-and-putting-it-on-a-server)). |
 
 ## Window
 
@@ -107,6 +108,7 @@ Font, theme and text size apply to the focused pane only. Session > Save font an
 | Save font and theme for this host | Keeps the focused pane's font, text size and theme in the host's profile. |
 | Start new tabs and panes in this directory | Keeps the focused pane's directory as the host's start directory (Start dir in the connection form): new tabs, panes and tmux windows on that host start there when the directory of the pane they come from is not known, also after a restart. |
 | Replace host key... | After a host key change you know the reason for, trusts the new key. It asks twice. |
+| Copy public key to this server... | Like `ssh-copy-id`: adds a `.pub` file's key to `~/.ssh/authorized_keys` on the focused pane's host, unless it is there already (see [Making a key](everyday-use.md#making-a-key-and-putting-it-on-a-server)). |
 | Verify transfers (SHA-256) | Compares SHA-256 sums on both ends after each SFTP transfer (the server needs `sha256sum` and `xargs`). ✓ `VerifyTransfers`. |
 | ZMODEM: answer rz and sz | Answers `rz` and `sz` in the terminal (see [ZMODEM](everyday-use.md#zmodem)). ✓ `ZModem`. |
 | Attach tmux | Types `tmux -CC new-session -A -s main` in the pane and turns tmux windows and panes into native tabs and panes (see [tmux](everyday-use.md#tmux)). |

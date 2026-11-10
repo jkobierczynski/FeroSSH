@@ -111,6 +111,7 @@ use crate::broadcast;
 use crate::clipboard;
 use crate::conn_view;
 use crate::conpty::{self, Output, Shell};
+use crate::copy_id;
 use crate::credman;
 use crate::desktop::{Desktop, Protocol, Update as DesktopUpdate};
 use crate::files::{self, Arrange, Follow};
@@ -418,6 +419,10 @@ mod cmd {
     pub const DESKTOP_CLIP_LAST: u32 = 637;
     /// ... > Share mouse selections from virtual desktops.
     pub const DESKTOP_SELECTION: u32 = 638;
+    /// Tools > New SSH key.
+    pub const NEW_KEY: u32 = 639;
+    /// Session > Copy public key to this server.
+    pub const COPY_ID: u32 = 640;
     pub const TMUX_ATTACH: u32 = 610;
     pub const TMUX_DETACH: u32 = 611;
     pub const TMUX_PICK: u32 = 612;
@@ -890,6 +895,10 @@ struct Window {
     desktops: HashMap<(ChannelId, String, u16), DesktopWant>,
     /// Virtual desktops by their script's exec channel.
     vdesks: HashMap<ChannelId, VirtualDesk>,
+    /// Session > Copy public key to this server, by its exec channel.
+    key_copies: HashMap<ChannelId, KeyCopy>,
+    /// Tools > New SSH key making the key in the background.
+    keygen: Option<std::sync::mpsc::Receiver<(PathBuf, std::result::Result<String, String>)>>,
     /// The pane whose host the remote app picker (the palette) runs on.
     app_pane: Option<PaneId>,
     /// Programs run as remote apps lately, latest first.
@@ -1044,6 +1053,16 @@ struct TabWant {
     size: Option<(u16, u16)>,
     /// The connection's limit on the clipboard: to and from the host.
     clip_limit: (bool, bool),
+}
+
+/// Session > Copy public key to this server: [`copy_id::command`] on an
+/// exec channel of `connection`.
+struct KeyCopy {
+    connection: ChannelId,
+    /// The host, as the user knows it.
+    label: String,
+    out: Vec<u8>,
+    status: Option<u32>,
 }
 
 /// Session > Open virtual desktop: Xvfb and x11vnc on the server, run by
@@ -1642,6 +1661,8 @@ fn create_and_run(launch: Launch, theme: Option<String>) -> Result<()> {
                 queued: Vec::new(),
                 desktops: HashMap::new(),
                 vdesks: HashMap::new(),
+                key_copies: HashMap::new(),
+                keygen: None,
                 app_pane: None,
                 recent_apps: Vec::new(),
                 app_clip_limits: HashMap::new(),
@@ -1867,6 +1888,7 @@ fn build_menu() -> Result<HMENU> {
         )?;
         separator(session)?;
         item(session, cmd::REPLACE_KEY, "Replace host &key...")?;
+        item(session, cmd::COPY_ID, "Copy public key to this ser&ver...")?;
         separator(session)?;
         item(session, cmd::VERIFY, "&Verify transfers (SHA-256)")?;
         item(session, cmd::ZMODEM, "&ZMODEM: answer rz and sz")?;
@@ -2003,6 +2025,8 @@ fn build_menu() -> Result<HMENU> {
         item(tools, cmd::FORWARDS, "&Port forwards\tCtrl+Shift+P")?;
         item(tools, cmd::SNIPPETS, "Sc&ripts\tCtrl+Shift+Space")?;
         item(tools, cmd::SNIPPET_FOLDER, "Open scripts f&older")?;
+        separator(tools)?;
+        item(tools, cmd::NEW_KEY, "New SSH &key...")?;
         item(tools, cmd::PALETTE, "Command p&alette\tCtrl+Shift+A")?;
 
         let view = CreatePopupMenu()?;
@@ -3638,6 +3662,133 @@ impl Window {
     /// another viewer on the running one.
     /// `from` names a saved virtual desktop connection whose program and
     /// size to use; else the SSH host's own.
+    /// The SSH host `pane` is logged in to, as the user knows it: where
+    /// Copy public key to this server sends the key.
+    fn key_host(&self, pane: PaneId) -> Option<String> {
+        self.pane_connection(pane)?;
+        match self.panes.get(&self.host_pane(pane)).map(|p| &p.host) {
+            Some(Host::Ssh(s)) => Some(s.target.label()),
+            _ => None,
+        }
+    }
+
+    /// Sends `line` (a checked public key line) to the host `pane` is
+    /// logged in to, for [`copy_id::command`] to add to its
+    /// `authorized_keys`; [`Self::on_key_copy`] reports how it went.
+    fn copy_key(&mut self, pane: PaneId, line: &str) -> Option<Command> {
+        let (Some(connection), Some(label)) = (self.pane_connection(pane), self.key_host(pane))
+        else {
+            return Some(Command::Notice(NO_COPY_HOST.into()));
+        };
+        let channel = self.new_channel();
+        let w = self.workers.get(&connection)?;
+        w.link.send(Message::Exec {
+            channel,
+            connection,
+            command: copy_id::command(),
+            split_stderr: false,
+        });
+        w.link.send(Message::Data {
+            channel,
+            bytes: copy_id::input(line),
+        });
+        w.link.send(Message::Eof { channel });
+        self.key_copies.insert(
+            channel,
+            KeyCopy {
+                connection,
+                label,
+                out: Vec::new(),
+                status: None,
+            },
+        );
+        None
+    }
+
+    /// What the key copy's command said, or that it ended.
+    fn on_key_copy(&mut self, channel: ChannelId, msg: Message) {
+        /// More is never needed: the answer is the last line.
+        const KEEP: usize = 16 * 1024;
+        let Some(k) = self.key_copies.get_mut(&channel) else {
+            return;
+        };
+        match msg {
+            Message::Data { bytes, .. } => {
+                k.out.extend_from_slice(&bytes);
+                if k.out.len() > KEEP {
+                    let cut = k.out.len() - KEEP;
+                    k.out.drain(..cut);
+                }
+            }
+            Message::ExitStatus { code, .. } => k.status = Some(code),
+            Message::Disconnected { reason, .. } => {
+                let Some(k) = self.key_copies.remove(&channel) else {
+                    return;
+                };
+                let host = crate::ssh::sanitize(&k.label);
+                let text = match (k.status, copy_id::outcome(k.status, &k.out)) {
+                    (_, copy_id::Outcome::Added) => format!(
+                        "Added the key to ~/.ssh/authorized_keys on {host}. The next login \
+                         there can use it."
+                    ),
+                    (_, copy_id::Outcome::Present) => format!(
+                        "{host} has this key in ~/.ssh/authorized_keys already; nothing \
+                         changed."
+                    ),
+                    (None, _) if k.out.is_empty() => format!(
+                        "Could not copy the key to {host}: the command did not run ({}).",
+                        crate::ssh::sanitize(&reason)
+                    ),
+                    (_, copy_id::Outcome::Failed(why)) => {
+                        format!("Could not copy the key to {host}: {why}.")
+                    }
+                };
+                self.queued.push(Command::Notice(text));
+            }
+            _ => {}
+        }
+    }
+
+    /// Makes the key the New SSH key window asked for, in the background:
+    /// a security key waits for the user's touch.
+    fn start_keygen(&mut self, request: crate::newkey::Request) {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let wake = self.notifier();
+        let spawned = std::thread::Builder::new()
+            .name("new-key".into())
+            .spawn(move || {
+                let made = crate::newkey::make_kind(&ferossh_auth::webauthn::WebAuthn, &request);
+                let _ = tx.send((request.path.clone(), made));
+                wake();
+            });
+        match spawned {
+            Ok(_) => self.keygen = Some(rx),
+            Err(e) => self
+                .queued
+                .push(Command::Notice(format!("Could not make the key: {e}"))),
+        }
+    }
+
+    fn poll_keygen(&mut self) -> Option<Command> {
+        let rx = self.keygen.as_ref()?;
+        let (path, result) = match rx.try_recv() {
+            Ok(made) => made,
+            Err(std::sync::mpsc::TryRecvError::Empty) => return None,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                (PathBuf::new(), Err("it stopped".to_owned()))
+            }
+        };
+        self.keygen = None;
+        let pane = self.focused_id();
+        let host = self.key_host(pane);
+        Some(Command::KeyMade {
+            path,
+            result,
+            pane,
+            host,
+        })
+    }
+
     fn open_virtual_desktop(&mut self, pane: PaneId, from: Option<&str>) -> Option<Command> {
         let host = self.host_pane(pane);
         let (Some(connection), Some(Host::Ssh(s))) = (
@@ -6540,6 +6691,14 @@ impl Window {
                     self.on_vdesk(c, msg);
                     return false;
                 }
+                if self
+                    .key_copies
+                    .get(&c)
+                    .is_some_and(|k| k.connection == connection)
+                {
+                    self.on_key_copy(c, msg);
+                    return false;
+                }
                 if let Some(remote) = self
                     .sftp
                     .values_mut()
@@ -6581,6 +6740,21 @@ impl Window {
                 crate::remote_app::connection_gone(connection);
                 self.proxies.remove(&connection);
                 self.vdesks.retain(|_, v| v.connection != connection);
+                let lost: Vec<ChannelId> = self
+                    .key_copies
+                    .iter()
+                    .filter(|(_, k)| k.connection == connection)
+                    .map(|(&c, _)| c)
+                    .collect();
+                for c in lost {
+                    self.on_key_copy(
+                        c,
+                        Message::Disconnected {
+                            channel: c,
+                            reason: why.clone(),
+                        },
+                    );
+                }
                 for remote in self.sftp.values_mut() {
                     if remote.connection() == Some(connection) {
                         remote.detach();
@@ -6688,6 +6862,9 @@ impl Window {
         self.refresh_visible();
         if let Some(found) = self.poll_update_check() {
             commands.push(found);
+        }
+        if let Some(made) = self.poll_keygen() {
+            commands.push(made);
         }
         commands.append(&mut self.queued);
         commands
@@ -10906,6 +11083,13 @@ impl Window {
                 self.refresh_chrome();
             }
             cmd::REPLACE_KEY => return Some(Command::ReplaceHostKey),
+            cmd::NEW_KEY => return Some(Command::NewKey),
+            cmd::COPY_ID => {
+                return Some(match self.key_host(pane) {
+                    Some(host) => Command::CopyKey { pane, host },
+                    None => Command::Notice(NO_COPY_HOST.into()),
+                });
+            }
             cmd::IMPORT => return Some(Command::ImportSessions),
             cmd::IMPORT_SNIPPETS => return Some(Command::ImportSnippets),
             cmd::SNIPPET_FOLDER => return Some(Command::OpenFolder(snippets_dir())),
@@ -12842,6 +13026,21 @@ enum BrokerFor {
 
 enum Command {
     Id(u32),
+    /// Tools > New SSH key: the window that asks what to make.
+    NewKey,
+    /// The new key is made, or why not; `host` is what the pane it was
+    /// asked from is logged in to, to offer copying it there.
+    KeyMade {
+        path: PathBuf,
+        result: std::result::Result<String, String>,
+        pane: PaneId,
+        host: Option<String>,
+    },
+    /// Session > Copy public key to this server: picks the `.pub` file.
+    CopyKey {
+        pane: PaneId,
+        host: String,
+    },
     /// A forwarded agent asks for a signature: ask the user.
     AskAgentSign,
     /// Window > Standby window > Press a new hotkey: says what to do,
@@ -13022,6 +13221,10 @@ fn desktop_size(rect: Rect) -> (u16, u16) {
 }
 
 /// Session > Open virtual desktop on a pane that is not logged in.
+const NO_COPY_HOST: &str = "Log in to an SSH host in this pane first. Copy public key to this \
+                            server adds a key to ~/.ssh/authorized_keys on that host, so it \
+                            can log in with the key next time.";
+
 const NO_VDESK_HOST: &str = "Log in to an SSH host in this pane first. Open virtual desktop \
                              starts Xvfb and x11vnc on that host and shows the desktop through \
                              the connection.";
@@ -14062,6 +14265,14 @@ fn run_command(hwnd: HWND, command: Command) {
             with_window(|w| w.update_title());
         }
         Command::ReplaceHostKey => replace_host_key(hwnd),
+        Command::NewKey => new_key(hwnd),
+        Command::KeyMade {
+            path,
+            result,
+            pane,
+            host,
+        } => key_made(hwnd, &path, result, pane, host),
+        Command::CopyKey { pane, host } => pick_key_to_copy(hwnd, pane, &host),
         Command::Notice(text) => {
             dialog(hwnd, &text, MB_OK | MB_ICONINFORMATION);
         }
@@ -14883,6 +15094,152 @@ fn read_import_file(path: &std::path::Path) -> std::result::Result<ImportSource,
 
 /// The changed-key screen's only way forward: replace the stored key,
 /// behind two confirmations, then reconnect.
+/// Tools > New SSH key: asks what to make, then makes it in the
+/// background.
+fn new_key(hwnd: HWND) {
+    if DIALOG_OPEN.get() {
+        return;
+    }
+    let Some(dpi) = with_window(|w| w.dpi) else {
+        return;
+    };
+    let env = |k: &str| std::env::var(k).unwrap_or_default();
+    let comment = format!("{}@{}", env("USERNAME"), env("COMPUTERNAME"));
+    DIALOG_OPEN.set(true);
+    let asked = crate::keygen_view::ask(hwnd, dpi, &home().join(".ssh"), &comment);
+    DIALOG_OPEN.set(false);
+    if let Some(request) = asked {
+        let next = with_window(|w| {
+            w.start_keygen(request);
+            std::mem::take(&mut w.queued)
+        })
+        .unwrap_or_default();
+        run_commands(hwnd, next);
+    }
+}
+
+/// The new key is made: says where, with its public line, and offers
+/// to copy it to the host the pane is logged in to.
+fn key_made(
+    hwnd: HWND,
+    path: &std::path::Path,
+    result: std::result::Result<String, String>,
+    pane: PaneId,
+    host: Option<String>,
+) {
+    let line = match result {
+        Ok(line) => line,
+        Err(e) => {
+            dialog(
+                hwnd,
+                &format!("Could not make the key: {e}"),
+                MB_OK | MB_ICONERROR,
+            );
+            return;
+        }
+    };
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let found = crate::ssh::DEFAULT_KEYS.contains(&name.as_str())
+        && path.parent() == Some(home().join(".ssh").as_path());
+    let login = if found {
+        "FeroSSH tries it by itself on hosts with no IdentityFile, as OpenSSH does.".to_owned()
+    } else {
+        format!(
+            "To log in with it, set IdentityFile {} in the connection's settings or \
+             ~/.ssh/config.",
+            path.display()
+        )
+    };
+    let made = format!(
+        "Made {} and {}.pub.\n\nThe public key (Ctrl+C copies this message):\n\n{line}\n\n{login}",
+        path.display(),
+        path.display()
+    );
+    match host {
+        Some(host) => {
+            let text = format!(
+                "{made}\n\nCopy the public key to {} now, so it can log in there with \
+                 the key?",
+                crate::ssh::sanitize(&host)
+            );
+            if dialog(hwnd, &text, MB_YESNO | MB_ICONQUESTION) == Some(IDYES) {
+                let next = with_window(|w| w.copy_key(pane, &line)).flatten();
+                run_commands(hwnd, next.into_iter().collect());
+            }
+        }
+        None => {
+            let text = format!(
+                "{made}\n\nTo use it on a server, log in there with a password once and \
+                 choose Session > Copy public key to this server."
+            );
+            dialog(hwnd, &text, MB_OK | MB_ICONINFORMATION);
+        }
+    }
+}
+
+/// Session > Copy public key to this server: a `.pub` file from
+/// `~/.ssh`, checked, then sent.
+fn pick_key_to_copy(hwnd: HWND, pane: PaneId, host: &str) {
+    if DIALOG_OPEN.get() {
+        return;
+    }
+    let dir = home().join(".ssh");
+    let mut buf = vec![0u16; 4096];
+    let dir_w = HSTRING::from(dir.as_os_str());
+    let title = HSTRING::from(format!(
+        "Public key to add to {}",
+        crate::ssh::sanitize(host)
+    ));
+    let filter = w!("Public keys (*.pub)\0*.pub\0All files\0*.*\0\0");
+    let mut ofn = OPENFILENAMEW {
+        lStructSize: std::mem::size_of::<OPENFILENAMEW>() as u32,
+        hwndOwner: hwnd,
+        lpstrFilter: filter,
+        lpstrFile: PWSTR(buf.as_mut_ptr()),
+        nMaxFile: buf.len() as u32,
+        lpstrInitialDir: PCWSTR(dir_w.as_ptr()),
+        lpstrTitle: PCWSTR(title.as_ptr()),
+        Flags: OFN_EXPLORER | OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR,
+        ..Default::default()
+    };
+    DIALOG_OPEN.set(true);
+    // SAFETY: the struct is filled in as documented; `buf`, `dir_w` and
+    // `title` outlive the call; the dialog's modal loop holds no state
+    // borrow.
+    let ok = unsafe { GetOpenFileNameW(&mut ofn) }.as_bool();
+    DIALOG_OPEN.set(false);
+    if !ok {
+        return;
+    }
+    let len = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
+    let path = PathBuf::from(String::from_utf16_lossy(buf.get(..len).unwrap_or_default()));
+    let line = std::fs::metadata(&path)
+        .map_err(|e| e.to_string())
+        .and_then(|m| match m.len() {
+            // A public key line is a few hundred bytes; a certificate a
+            // few thousand.
+            0..=65536 => std::fs::read_to_string(&path).map_err(|e| e.to_string()),
+            _ => Err("it is too big for a public key".to_owned()),
+        })
+        .and_then(|text| ferossh_auth::keygen::public_line(&text));
+    let line = match line {
+        Ok(line) => line,
+        Err(e) => {
+            let text = format!(
+                "{} is not a public key file: {e}. Choose the .pub file next to the key.",
+                path.display()
+            );
+            dialog(hwnd, &text, MB_OK | MB_ICONWARNING);
+            return;
+        }
+    };
+    let next = with_window(|w| w.copy_key(pane, &line)).flatten();
+    run_commands(hwnd, next.into_iter().collect());
+}
+
 fn replace_host_key(hwnd: HWND) {
     let info = with_window(|w| {
         let id = w.focused_id();
