@@ -81,6 +81,8 @@ pub struct View {
     pub key: Option<String>,
     /// The listed remote folder; empty until one is listed.
     pub remote_dir: Vec<u8>,
+    /// A remote folder is being listed.
+    pub remote_loading: bool,
     /// All of its rows, unfiltered.
     pub remote_rows: Vec<FileRow>,
     /// A line under the lists, and whether it is a problem.
@@ -289,6 +291,23 @@ struct State {
     /// The host the pane showed, to open its connection's Local folder
     /// when it turns to another.
     shown_host: Option<Option<String>>,
+    /// A Sync browsing move waiting for its remote folder to list.
+    sync_pending: Option<SyncPending>,
+}
+
+/// Sync browsing moves both lists or neither: the remote folder is asked
+/// for first, and the Local list moves only once it has listed.
+struct SyncPending {
+    /// The transfer queue it was asked on.
+    key: Option<String>,
+    /// The remote folder asked for.
+    target: Vec<u8>,
+    local: SyncLocal,
+}
+
+enum SyncLocal {
+    Enter(PathBuf),
+    Up,
 }
 
 thread_local! {
@@ -640,6 +659,7 @@ pub fn create(main: HWND, handler: Handler, dpi: u32) -> windows::core::Result<(
                 icons: HashMap::new(),
                 sync: false,
                 naming: None,
+                sync_pending: None,
                 shown_host: None,
             });
         });
@@ -1134,6 +1154,25 @@ pub fn set_view(view: View) {
     let changes = with(|s| {
         let old = s.view.as_ref();
         let host = old.map(|v| &v.host) != Some(&view.host);
+        // A bookmark name being typed belongs to the connection it was
+        // started on: another connection cancels it.
+        let renaming_lost =
+            s.naming.is_some() && old.is_some_and(|v| v.alias != view.alias || v.key != view.key);
+        if renaming_lost {
+            s.naming = None;
+        }
+        // A Sync move: the Local list follows once the remote folder has
+        // listed, and stays if it did not.
+        let synced = match s.sync_pending.take() {
+            Some(p) if p.key != view.key => Some(Err(p)),
+            Some(p) if view.remote_loading => {
+                s.sync_pending = Some(p);
+                None
+            }
+            Some(p) if view.remote_dir == p.target => Some(Ok(p.local)),
+            Some(p) => Some(Err(p)),
+            None => None,
+        };
         let queue = s.queue_shown != view.queue;
         let before = (
             s.queue_shown.len(),
@@ -1161,14 +1200,22 @@ pub fn set_view(view: View) {
             view.status.is_some(),
             s.arrange,
         );
-        (before != after, host, queue, start)
+        (before != after || renaming_lost, host, queue, start, synced)
     });
-    let Some((relayout, host_changed, queue_changed, start)) = changes else {
+    let Some((relayout, host_changed, queue_changed, start, synced)) = changes else {
         return;
     };
     if let Some(dir) = start {
         // It does not become the download folder.
         local_go(&h, dir, None, false);
+    }
+    match synced {
+        Some(Ok(SyncLocal::Enter(dir))) => local_enter(&h, dir, None),
+        Some(Ok(SyncLocal::Up)) => local_up(&h),
+        Some(Err(_)) => local_problem(
+            "Sync browsing: the Remote folder did not open, so Local stayed where it was.".into(),
+        ),
+        None => {}
     }
     refresh_local(&h, false);
     refresh_remote(&h);
@@ -1580,55 +1627,92 @@ fn synced() -> bool {
 }
 
 /// One folder up in the Remote (`remote`) or Local list, and in the
-/// other one too with Sync browsing on.
+/// other one too with Sync browsing on: both move, or neither.
 fn go_up(h: &Handles, remote: bool) {
-    if remote {
-        remote_up();
-    } else {
-        local_up(h);
-    }
-    if synced() {
+    if !synced() {
         if remote {
-            local_up(h);
-        } else {
             remote_up();
+        } else {
+            local_up(h);
         }
+        return;
     }
+    let Some(dir) = remote_dir() else {
+        // No Remote list to keep in step.
+        if !remote {
+            local_up(h);
+        }
+        return;
+    };
+    if dir.as_slice() == b"/" {
+        local_problem("Sync browsing: Remote is at / already.".into());
+        return;
+    }
+    if with(|s| s.local.dir().is_none()).unwrap_or(true) {
+        remote_up();
+        return;
+    }
+    sync_browse(names::parent(&dir), SyncLocal::Up);
+    with(|s| s.select_remote = Some(names::file_name(&dir).to_vec()));
 }
 
 /// Opens folder `row` of the Remote (`remote`) or Local list, and the
-/// folder of the same name in the other list with Sync browsing on.
+/// folder of the same name in the other list with Sync browsing on: both
+/// open, or neither.
 fn go_into(h: &Handles, remote: bool, row: &FileRow) {
-    if remote {
+    let open_remote = || {
         if let Some(dir) = remote_dir() {
             emit(Event::Browse(names::join(&dir, &row.key)));
         }
-    } else if let Some(p) = &row.local {
-        local_enter(h, p.clone(), None);
-    }
+    };
     if !synced() {
+        if remote {
+            open_remote();
+        } else if let Some(p) = &row.local {
+            local_enter(h, p.clone(), None);
+        }
         return;
     }
+    let Some(dir) = remote_dir() else {
+        if let Some(p) = row.local.as_ref().filter(|_| !remote) {
+            local_enter(h, p.clone(), None);
+        }
+        return;
+    };
+    let target = names::join(&dir, &row.key);
     if !remote {
-        if let Some(dir) = remote_dir() {
-            emit(Event::Browse(names::join(&dir, &row.key)));
+        if let Some(p) = &row.local {
+            sync_browse(target, SyncLocal::Enter(p.clone()));
         }
         return;
     }
     let Some(here) = with(|s| s.local.dir().map(PathBuf::from)).flatten() else {
+        open_remote();
         return;
     };
     // The server picks the name: map it to one plain local name before
     // anything touches the file system (no `\\host\share`, drive or `..`).
-    let name = String::from_utf8_lossy(&row.key).into_owned();
     match files::sync_local(&here, &row.key) {
-        Some(there) if there.is_dir() => local_enter(h, there, None),
+        Some(there) if there.is_dir() => sync_browse(target, SyncLocal::Enter(there)),
         _ => local_problem(format!(
-            "Sync browsing: {} has no folder {}.",
+            "Sync browsing: {} has no folder {}, so neither list moved.",
             here.display(),
-            crate::ssh::sanitize_line(&name)
+            crate::ssh::sanitize_line(&String::from_utf8_lossy(&row.key))
         )),
     }
+}
+
+/// Asks for remote folder `target`; the Local list does `local` once it
+/// has listed.
+fn sync_browse(target: Vec<u8>, local: SyncLocal) {
+    with(|s| {
+        s.sync_pending = Some(SyncPending {
+            key: s.view.as_ref().and_then(|v| v.key.clone()),
+            target: target.clone(),
+            local,
+        });
+    });
+    emit(Event::Browse(target));
 }
 
 fn focused_index(list: HWND) -> Option<usize> {
@@ -1715,6 +1799,7 @@ fn command(h: &Handles, id: usize, code: u32) {
         (ID_SYNC, BN_CLICKED) => {
             let on = with(|s| {
                 s.sync = !s.sync;
+                s.sync_pending = None;
                 s.sync
             })
             .unwrap_or(false);

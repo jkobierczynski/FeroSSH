@@ -11677,6 +11677,7 @@ impl Window {
             host: remote.map(|r| r.label.clone()),
             key: remote.and(self.files_key.clone()),
             remote_dir: remote.map(|r| r.listing.path.clone()).unwrap_or_default(),
+            remote_loading: remote.is_some_and(|r| r.listing.loading),
             remote_rows: remote
                 .map(|r| files::remote_rows(&r.listing, ""))
                 .unwrap_or_default(),
