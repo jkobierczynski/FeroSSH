@@ -38,7 +38,7 @@ To check the link yourself, verify the unsigned exe's attestation as above with 
 gh attestation verify ferossh.exe -R jkobierczynski/FeroSSH --signer-workflow jkobierczynski/FeroSSH/.github/workflows/release.yml --source-ref refs/tags/<tag>
 ```
 
-run on an exe you rebuilt with the steps below (it has the unsigned hash), or on the signed download with `--signer-workflow jkobierczynski/FeroSSH/.github/workflows/attest-release.yml`.
+run on an exe you rebuilt with the steps below (it has the unsigned hash), or on the signed download with `--signer-workflow jkobierczynski/FeroSSH/.github/workflows/attest-release.yml --source-ref refs/heads/main` (that workflow only attests when it runs from `main`).
 
 `BUILD-MANIFEST.json` lists the tag, the commit, the Rust toolchain and, for each exe, its size, its SHA-256 as downloaded (`sha256`) and its SHA-256 before code signing (`sha256_unsigned`).
 

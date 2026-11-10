@@ -101,9 +101,15 @@ request, and for half an hour per parser every night.
   runs it without a shell or a window, and only after you allowed that
   exact command line once (kept in
   `%LOCALAPPDATA%\FeroSSH\approved-proxy-commands.txt`). The program
-  only ever sees the connection's encrypted bytes.
+  carries the SSH connection, so it sees what any network hop sees: the
+  server's version line and the key exchange in the clear, then only
+  encrypted bytes; SSH sends it none of your keys or passwords. It still
+  runs as you, so it can read any file you can, keys included: allow
+  only commands you trust.
 - A jump host sees which host and port you connect to through it, and
   can refuse or cut that stream, as with OpenSSH.
-- Release exes are signed on the maintainer's PC, so the signature says who
-  released a file, not that it was built by CI; the build provenance
-  attestations and reproducible builds show that.
+- Release exes from v1.0.0-rc2 on are signed on the maintainer's PC (a
+  release could also go out signed through SignPath, or unsigned, as the
+  first ones did; its notes say which). The signature says who released
+  a file, not that it was built by CI; the build provenance attestations
+  and reproducible builds show that.
