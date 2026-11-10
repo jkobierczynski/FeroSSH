@@ -13,6 +13,8 @@ pub struct LocalEntry {
     pub path: PathBuf,
     pub dir: bool,
     pub size: u64,
+    /// Last written, seconds since 1970.
+    pub modified: Option<i64>,
 }
 
 /// Where `..` leads.
@@ -67,6 +69,11 @@ impl LocalDir {
                 path: item.path(),
                 dir: meta.is_dir(),
                 size: meta.len(),
+                modified: meta
+                    .modified()
+                    .ok()
+                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                    .and_then(|d| i64::try_from(d.as_secs()).ok()),
             });
         }
         out.entries.sort_by(|a, b| {
@@ -89,17 +96,11 @@ impl LocalDir {
                     path,
                     dir: true,
                     size: 0,
+                    modified: None,
                 })
                 .collect(),
             error: None,
         }
-    }
-
-    /// The title's name for what is listed.
-    pub fn label(&self) -> String {
-        self.dir
-            .as_ref()
-            .map_or_else(|| "This PC".to_owned(), |d| d.display().to_string())
     }
 }
 
@@ -153,7 +154,6 @@ mod tests {
         assert!(l.entries[0].dir && !l.entries[2].dir);
         assert_eq!(l.entries[3].size, 5);
         assert_eq!(l.up, Some(Up::Folder(std::env::temp_dir())));
-        assert_eq!(l.label(), dir.display().to_string());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -177,6 +177,5 @@ mod tests {
         if cfg!(windows) {
             assert!(LocalDir::drives().entries.iter().any(|e| e.dir));
         }
-        assert_eq!(LocalDir::drives().label(), "This PC");
     }
 }

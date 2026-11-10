@@ -228,17 +228,17 @@ Nothing typed at a password prompt or the connect prompt is broadcast, and a pan
 
 ## File transfer
 
-Ctrl+Shift+E shows the focused pane's host over SFTP in the side pane, on the same connection. Enter opens a folder or downloads a file, D downloads (folders whole), U or Ctrl+Shift+U uploads, Del deletes after asking, and ~ goes home. You can also drop files or folders from Explorer on a terminal pane to upload them to the shell's current folder, after a confirmation.
+Ctrl+Shift+E opens File transfer in the tools pane: a **Local** list of a folder on your PC and a **Remote** list of the focused pane's host over SFTP, on the same connection. Both are Windows file lists with icons, size and date (and the rights on the server). Select several files and folders with Ctrl or Shift as in Explorer, or Ctrl+A for all.
 
-**Local PC.** Tab moves to the Local PC section under the listing: the folder on your PC that downloads go to. Enter opens a folder (above a drive comes the list of drives) or uploads a file, U uploads the selected file or folder, and B, or a click on the section's title, picks another folder. FeroSSH remembers it (`DownloadFolder`); until you pick one it is your Downloads folder. File > Open download folder opens it in Explorer.
+- **Moving files.** The arrow buttons between the lists upload the Local selection or download the Remote selection; they point the way the files go. Ctrl+Enter does the same from either list, and Enter or a double-click on a file sends that file across. You can also drag the selection from one list to the other, onto the list for its folder or onto a folder in it, and drop files or folders from Explorer on the Remote list (or on a terminal pane, for the shell's current folder), after a confirmation.
+- **Folders.** Enter or a double-click opens a folder; Backspace or the ↑ button goes up (above a drive comes the list of drives). Type a path in the box above a list and press Enter to go there. ⌂ goes to your home folder on the server, and ... picks the Local folder. Downloads go to the Local list's folder; FeroSSH remembers it (`DownloadFolder`), and until you pick one it is your Downloads folder.
+- **Filter.** The box at the top shows only the names in both lists that contain what you type (any case), or match a pattern such as `*.log`. Escape clears it.
+- **Layout.** Layout ▾ puts the lists side by side or one above the other, and swaps Local and Remote. Drag the gap between the lists to give one more room. FeroSSH remembers it (`TransferLayout`).
+- **Right-click** a list for Open, Upload or Download, Delete (on the server, after asking; Del too), Refresh (F5), Home folder, Upload files... and Open in Explorer.
 
-**Search.** / searches the listing, or the Local PC section, by name: type part of a name (any case) or a pattern such as `*.log`, and only matching files and folders are listed. Enter stops typing and keeps the search, Escape clears it, and opening another folder ends it.
+**Queue.** The transfer queue under the lists shows each transfer's progress. Right-click one to pause, resume, cancel (Del too) or retry it, or to clear the finished ones. Three files move at once (`ParallelTransfers`). A dropped connection pauses the queue, and it carries on from where each file stopped when you log in again.
 
-**Section heights.** Drag the title bar of the Local PC section or of the transfer queue up or down to make that section taller or shorter.
-
-**Queue.** Tab again moves to the transfer queue: Space pauses or resumes, R retries, X cancels and C clears finished transfers. Three files move at once (`ParallelTransfers`). A dropped connection pauses the queue, and it carries on from where each file stopped when you log in again.
-
-**Safe file names.** An existing file is never overwritten without asking (Overwrite, Skip or Keep both, Shift for all). Server names Windows cannot hold (`CON`, `a:b`, trailing dots) are made safe or refused, and a folder download does not follow links out of the folder. Partial files are `.part` locally and `.filepart` on the server until complete. Session > Verify transfers compares SHA-256 sums on both ends after each file.
+**Safe file names.** An existing file is never overwritten without asking: Overwrite, Skip or Keep both, above the queue, with For all to answer the same for the rest. Server names Windows cannot hold (`CON`, `a:b`, trailing dots) are made safe or refused, and a folder download does not follow links out of the folder. Partial files are `.part` locally and `.filepart` on the server until complete. Session > Verify transfers compares SHA-256 sums on both ends after each file.
 
 ### Following cd
 
@@ -248,7 +248,7 @@ The file view, and files dropped on a pane, follow the shell's current directory
 PROMPT_COMMAND='printf "\e]7;file://%s%s\e\\" "$HOSTNAME" "$PWD"'
 ```
 
-Settings > File transfer follows cd, or F in the file view, turns it off.
+Settings > File transfer follows cd, or the Follow terminal button in File transfer, turns it off.
 
 ### ZMODEM
 

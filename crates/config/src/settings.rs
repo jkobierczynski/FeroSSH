@@ -399,6 +399,10 @@ pub struct Settings {
     pub zmodem: bool,
     /// The file view follows the shell's working directory (OSC 7).
     pub follow_directory: bool,
+    /// How the file transfer pane arranges its Local and Remote lists,
+    /// such as `side 50` or `stacked swapped 40`; side by side, Local
+    /// first, when unset.
+    pub transfer_layout: Option<String>,
     /// The X server forwarded X11 goes to (`DISPLAY` syntax); the `DISPLAY`
     /// environment variable, or `localhost:0`, when unset.
     pub x11_display: Option<String>,
@@ -496,6 +500,7 @@ impl Default for Settings {
             parallel_transfers: None,
             zmodem: false,
             follow_directory: true,
+            transfer_layout: None,
             x11_display: None,
             update_check_weekly: false,
             secrets: Vec::new(),
@@ -725,6 +730,10 @@ impl Settings {
                 "zmodem" => {
                     block = Block::Top;
                     s.zmodem = yes(&args).unwrap_or(false);
+                }
+                "transferlayout" => {
+                    block = Block::Top;
+                    s.transfer_layout = Some(joined).filter(|f| !f.is_empty());
                 }
                 "followdirectory" => {
                     block = Block::Top;
@@ -1069,6 +1078,9 @@ impl Settings {
             flag(self.desktop_share_selection)
         );
         let _ = writeln!(out, "FollowDirectory {}", flag(self.follow_directory));
+        if let Some(l) = &self.transfer_layout {
+            let _ = writeln!(out, "TransferLayout {}", arg(l));
+        }
         let _ = writeln!(out, "ConfirmProduction {}", flag(self.confirm_production));
         let _ = writeln!(out, "AutoResponses {}", flag(self.auto_responses));
         let _ = writeln!(out, "TmuxKeybindings {}", flag(self.tmux_keys));
@@ -1269,6 +1281,7 @@ ZModem yes
 AutoReconnect no
 ParallelTransfers 20
 FollowDirectory no
+TransferLayout stacked swapped 40
 X11Display 192.168.1.5:0.0
 Favourite web "db one"
 Favorite WEB
@@ -1398,6 +1411,7 @@ NewKeyword later
         assert!(Settings::default().auto_reconnect, "on unless turned off");
         assert_eq!(s.parallel_transfers, Some(8));
         assert!(!s.follow_directory);
+        assert_eq!(s.transfer_layout.as_deref(), Some("stacked swapped 40"));
         assert_eq!(s.x11_display.as_deref(), Some("192.168.1.5:0.0"));
         let big = s.profile("big").unwrap();
         assert_eq!(big.font_size, None);

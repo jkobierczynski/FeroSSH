@@ -192,29 +192,23 @@ The Show, Rename and Close buttons below the list, and the right-click menu on a
 
 ### File transfer (Ctrl+Shift+E)
 
-In the remote listing:
+In the Local and Remote lists:
 
 | Key | Action |
 | --- | --- |
-| Enter or Right | Opens a folder or downloads a file. |
-| Left or Backspace | Goes to the parent folder. |
-| D | Downloads the selection (folders whole). |
-| U | Uploads files into the listed folder. |
-| Del | Deletes on the server, after asking. |
-| ~ or H | Goes to your home folder. |
-| F5 | Refreshes. |
-| F | Turns following the shell's `cd` off or on. |
-| O | Opens the download folder in Explorer. |
-| B | Picks another local folder for downloads. |
-| / | Searches the listing by name (see below). |
-| Escape | Clears the search; with none, gives the keyboard back to the terminal. |
-| Tab | Moves to the Local PC section. |
+| Enter or double-click | Opens a folder, or sends a file to the other list's folder. |
+| Ctrl+Enter | Sends the selection across: uploads from Local, downloads from Remote (folders whole). |
+| Backspace | Goes to the parent folder. |
+| Ctrl+A | Selects everything in the list. |
+| Del | Deletes the Remote selection on the server, after asking. |
+| F5 | Refreshes the list. |
+| Shift+F10 or right-click | The list's menu. |
+| Tab | Moves between the filter, the lists, their buttons and the queue. |
+| Escape | Clears the filter; with none, gives the keyboard back to the terminal. |
 
-While typing a search, letters go into it and the listing shows only the names that contain them, in any case; with `*` or `?` the whole name must match the pattern (`*.log`). Up and Down still move the selection, Enter stops typing and keeps the search, Backspace deletes a letter and Escape clears it. Opening another folder ends the search.
+In a path box, Enter goes to the folder typed. In the queue, Del cancels a transfer and the right-click menu pauses, resumes, retries and clears the finished ones. When a file already exists, Overwrite, Skip and Keep both answer above the queue; For all answers the same for the rest.
 
-In the Local PC section, Enter opens a folder or uploads a file, Left or Backspace goes up (above a drive comes the list of drives), U uploads the selected file or folder, / searches it by name as above, B picks another folder and F5 refreshes. Tab moves on to the transfer queue, where Space or P pauses and resumes, R retries a failed or cancelled transfer, X cancels and C clears the finished ones. When a file already exists, O overwrites, S skips and K keeps both (Shift for all).
-
-Drag the title bar of the Local PC section or of the transfer queue up or down to give that section more or fewer rows. The heights stay for every host until FeroSSH closes.
+The arrow buttons between the lists move the selection across, and the gap between them drags to share the room differently. Layout ▾ arranges the lists side by side or stacked, swaps them, and has Choose local folder, Upload files and Open local folder in Explorer.
 
 ### Port forwards (Ctrl+Shift+P)
 

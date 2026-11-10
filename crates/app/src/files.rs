@@ -1,200 +1,71 @@
-//! The file transfer view: the side pane's listing of the focused pane's
-//! remote directory, then the Local PC section (the folder downloads go
-//! to, and uploads come from), then the transfer queue.
+//! What the file transfer pane shows, kept apart from the Windows controls
+//! (`files_panel`) so it can be tested anywhere: the rows of the Local
+//! and Remote lists, the queue's rows, the Local list's folder, and where
+//! the two lists and the gap with the arrow buttons go.
 //!
-//! Drawn into a [`Grid`] like the connection manager. The listing and the
-//! queue live in the host's [`Remote`]; this view only keeps the
-//! selection and turns keys and clicks into calls on it. What needs the
-//! window (a confirm box, the file picker) comes out as a [`FilesAction`].
-//!
-//! The title bars of the Local PC section and the queue are dividers: a
-//! drag moves them up or down ([`FilesView::drag_divider`]). `/` searches
-//! the listing or the Local PC section by name.
+//! The remote listing and the queue live in the host's [`Remote`]; the
+//! local folder is read straight from disk here (the UI process does disk
+//! I/O; the sandboxed workers never see local files).
 
 use std::path::{Path, PathBuf};
 
 use ferossh_ipc::DirEntry;
-use ferossh_render::{Cell, Color, Flags, Grid, Rgb};
-use ferossh_sftp::{Choice, Job, JobId, Kind, Remote, State, names};
+use ferossh_sftp::{JobId, Kind, Listing, Remote, State, names};
 
-use crate::local_dir::{LocalDir, LocalEntry, Up};
-use crate::sessions::SideKey;
-use crate::tabstrip::{Palette, fit};
+use crate::layout::Rect;
+use crate::local_dir::{LocalDir, Up};
 
-/// Rows above the listing: the title and the path.
-const HEADER: usize = 2;
-const OPTIONS: &str = " [O]verwrite  [S]kip  [K]eep both";
-/// The longest search, in characters.
-const MAX_FIND: usize = 60;
-/// Shown after a search being typed.
-const CARET: &str = "▏";
-
-/// What the window should do.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum FilesAction {
-    /// Give the keyboard back to the terminal.
-    Leave,
-    /// Ask before deleting this entry of the listed folder.
-    Delete(DirEntry),
-    /// Show the file picker and upload what is picked into this folder.
-    PickUpload(Vec<u8>),
-    OpenDownloads,
-    ToggleFollow,
-    /// The Local PC section moved to this folder: downloads go there now.
-    SetLocal(PathBuf),
-    /// Show the folder picker for the Local PC section.
-    PickLocal,
-    /// Upload these local files or folders into this remote folder.
-    Upload {
-        paths: Vec<PathBuf>,
-        dir: Vec<u8>,
-    },
-}
-
-/// Whether the listing follows the terminal's directory, as the title
-/// shows it.
+/// Whether the Remote list follows the terminal's directory.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Follow {
     Off,
     /// Following, and the focused pane's shell has reported its directory.
     On,
     /// Following is on, but the focused pane's shell has not reported its
-    /// directory (OSC 7), so there is nothing to follow.
+    /// directory, so there is nothing to follow.
     Unreported,
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-enum Focus {
-    #[default]
-    List,
-    Local,
-    Queue,
+/// One row of the Local or Remote list.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FileRow {
+    /// As shown; ".." for the row that goes up.
+    pub name: String,
+    /// What a remote row is called on the server, or a local row's path;
+    /// empty for "..".
+    pub key: Vec<u8>,
+    pub local: Option<PathBuf>,
+    pub up: bool,
+    /// A folder, or a link (which opens like one).
+    pub dir: bool,
+    pub size: Option<u64>,
+    /// Seconds since 1970.
+    pub modified: Option<i64>,
+    /// `drwxr-xr-x` and so on; empty for local rows.
+    pub rights: String,
 }
 
-/// A section divider: the title bar of the Local PC section or of the
-/// queue, which a drag moves up (a taller section) or down.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Divider {
-    Local,
-    Queue,
-}
-
-/// Section heights the user set by dragging a divider; `None` is the
-/// default height. Kept for the window's life, for every host.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-struct Sizes {
-    local: Option<usize>,
-    queue: Option<usize>,
-}
-
-/// Where each part of the pane is, for a grid of some height.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct Geometry {
-    /// Listing rows: first row and count.
-    list: (usize, usize),
-    /// The Local PC section's title row, then its rows: first row and count.
-    local: Option<(usize, usize, usize)>,
-    /// The queue's title row, then its rows: first row and count.
-    queue: Option<(usize, usize, usize)>,
-    /// The question's two rows.
-    question: Option<usize>,
-    footer: usize,
-}
-
-fn geometry(rows: usize, queued: usize, asking: bool, sizes: Sizes) -> Geometry {
-    let footer = rows.saturating_sub(1);
-    let mut bottom = footer;
-    let question = if asking && bottom >= HEADER + 3 {
-        bottom -= 2;
-        Some(bottom)
-    } else {
-        None
-    };
-    let queue = if queued > 0 && bottom >= HEADER + 3 {
-        // The listing keeps a row.
-        let room = bottom.saturating_sub(HEADER + 2);
-        let n = sizes
-            .queue
-            .unwrap_or_else(|| queued.min((rows / 3).max(2)))
-            .min(room)
-            .max(1);
-        bottom -= n + 1;
-        Some((bottom, bottom + 1, n))
-    } else {
-        None
-    };
-    // The Local PC section, when the listing keeps three rows: a quarter
-    // of the pane, whatever the folder holds, so nothing jumps. A height
-    // the user dragged it to only needs the listing to keep one row.
-    let local = match sizes.local {
-        Some(n) if bottom >= HEADER + 3 => {
-            let n = n.min(bottom - HEADER - 2).max(1);
-            bottom -= n + 1;
-            Some((bottom, bottom + 1, n))
+impl FileRow {
+    fn up() -> Self {
+        Self {
+            name: "..".into(),
+            key: Vec::new(),
+            local: None,
+            up: true,
+            dir: true,
+            size: None,
+            modified: None,
+            rights: String::new(),
         }
-        None if bottom >= HEADER + 3 + 2 => {
-            let room = bottom - HEADER - 3 - 1;
-            let n = (rows / 4).clamp(3, 8).min(room);
-            bottom -= n + 1;
-            Some((bottom, bottom + 1, n))
-        }
-        _ => None,
-    };
-    Geometry {
-        list: (HEADER, bottom.saturating_sub(HEADER).max(1)),
-        local,
-        queue,
-        question,
-        footer,
     }
 }
 
-/// The jobs the queue shows: every top-level job, and the files of a
-/// folder that are moving, stuck or asking.
-fn queue_rows(remote: &Remote) -> Vec<usize> {
-    remote
-        .jobs()
-        .iter()
-        .enumerate()
-        .filter(|(_, j)| {
-            j.parent.is_none()
-                || matches!(
-                    j.state,
-                    State::Running | State::Asking | State::Failed | State::Paused
-                )
-        })
-        .map(|(i, _)| i)
-        .collect()
-}
-
-fn has_up(remote: &Remote) -> bool {
-    let path = &remote.listing.path;
-    !path.is_empty() && path.as_slice() != b"/"
-}
-
-/// What a listing row is.
-enum Item<'a> {
-    Up,
-    Entry(&'a DirEntry),
-}
-
-fn item(remote: &Remote, i: usize) -> Option<Item<'_>> {
-    if has_up(remote) {
-        if i == 0 {
-            return Some(Item::Up);
-        }
-        return remote.listing.entries.get(i - 1).map(Item::Entry);
-    }
-    remote.listing.entries.get(i).map(Item::Entry)
-}
-
-fn item_count(remote: &Remote) -> usize {
-    remote.listing.entries.len() + usize::from(has_up(remote))
-}
-
-/// Whether `name` matches the search `find`: any part of the name, in
+/// Whether `name` matches the filter `find`: any part of the name, in
 /// any case; with `*` or `?`, the whole name as a wildcard pattern.
-fn matches(name: &str, find: &str) -> bool {
+pub fn matches(name: &str, find: &str) -> bool {
+    if find.is_empty() {
+        return true;
+    }
     if find.contains(['*', '?']) {
         ferossh_config::match_pattern(name, find)
     } else {
@@ -202,53 +73,142 @@ fn matches(name: &str, find: &str) -> bool {
     }
 }
 
-/// The entries whose names match `find`, by index; `None` when there is
-/// no search.
-fn found<S: AsRef<str>>(names: impl Iterator<Item = S>, find: &str) -> Option<Vec<usize>> {
-    if find.is_empty() {
-        return None;
-    }
-    Some(
-        names
-            .enumerate()
-            .filter(|(_, n)| matches(n.as_ref(), find))
-            .map(|(i, _)| i)
-            .collect(),
-    )
-}
-
-/// What a section's search shows after its title: the words, and a caret
-/// while they are being typed.
-fn search_label(find: &str, typing: bool) -> String {
-    if find.is_empty() && !typing {
+/// `ls -l`'s first column for Unix mode bits.
+pub fn rights(mode: Option<u32>) -> String {
+    let Some(m) = mode else {
         return String::new();
+    };
+    let kind = match m & 0o170_000 {
+        0o040_000 => 'd',
+        0o120_000 => 'l',
+        0o020_000 => 'c',
+        0o060_000 => 'b',
+        0o010_000 => 'p',
+        0o140_000 => 's',
+        _ => '-',
+    };
+    let mut s = String::with_capacity(10);
+    s.push(kind);
+    for shift in [6, 3, 0] {
+        let bits = (m >> shift) & 7;
+        s.push(if bits & 4 != 0 { 'r' } else { '-' });
+        s.push(if bits & 2 != 0 { 'w' } else { '-' });
+        s.push(if bits & 1 != 0 { 'x' } else { '-' });
     }
-    format!("/ {find}{}", if typing { CARET } else { "" })
+    s
 }
 
-/// `left`, then `right` against the right edge, in `width` cells.
-fn spread(left: &str, right: &str, width: usize) -> String {
-    let rw = unicode_width::UnicodeWidthStr::width(right);
-    if rw + 2 >= width {
-        return fit(left, width);
+fn remote_row(e: &DirEntry) -> FileRow {
+    FileRow {
+        name: names::display(&e.name),
+        key: e.name.clone(),
+        local: None,
+        up: false,
+        dir: e.attrs.is_dir() || e.attrs.is_symlink(),
+        size: (!e.attrs.is_dir()).then_some(e.attrs.size).flatten(),
+        modified: e.attrs.mtime.map(i64::from),
+        rights: rights(e.attrs.permissions),
     }
-    let left = fit(left, width - rw - 1);
-    let lw = unicode_width::UnicodeWidthStr::width(left.as_str());
-    format!("{left}{}{right}", " ".repeat(width - rw - lw))
 }
 
-fn percent(job: &Job) -> Option<u64> {
-    let size = job.size.filter(|&s| s > 0)?;
-    Some((job.done.min(size) * 100) / size)
+/// The Remote list's rows: ".." (unless at the root or filtering), then
+/// the entries whose names match `find`, folders first.
+pub fn remote_rows(listing: &Listing, find: &str) -> Vec<FileRow> {
+    let path = &listing.path;
+    let mut rows = Vec::new();
+    if find.is_empty() && !path.is_empty() && path.as_slice() != b"/" {
+        rows.push(FileRow::up());
+    }
+    let mut entries: Vec<FileRow> = listing
+        .entries
+        .iter()
+        .map(remote_row)
+        .filter(|r| matches(&r.name, find))
+        .collect();
+    entries.sort_by(|a, b| {
+        b.dir
+            .cmp(&a.dir)
+            .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
+    });
+    rows.extend(entries);
+    rows
 }
 
-/// The queue's status column for a job.
-fn status(job: &Job) -> String {
+/// The Local list's rows, the same way.
+pub fn local_rows(dir: &LocalDir, find: &str) -> Vec<FileRow> {
+    let mut rows = Vec::new();
+    if find.is_empty() && dir.up.is_some() {
+        rows.push(FileRow::up());
+    }
+    rows.extend(
+        dir.entries
+            .iter()
+            .filter(|e| matches(&e.name, find))
+            .map(|e| FileRow {
+                name: e.name.clone(),
+                key: e.name.as_bytes().to_vec(),
+                local: Some(e.path.clone()),
+                up: false,
+                dir: e.dir,
+                size: (!e.dir).then_some(e.size),
+                modified: e.modified,
+                rights: String::new(),
+            }),
+    );
+    rows
+}
+
+/// `rows` with only the names matching `find`, and no ".." while
+/// filtering.
+pub fn filtered(rows: &[FileRow], find: &str) -> Vec<FileRow> {
+    rows.iter()
+        .filter(|r| {
+            if r.up {
+                find.is_empty()
+            } else {
+                matches(&r.name, find)
+            }
+        })
+        .cloned()
+        .collect()
+}
+
+/// The entries of the listed remote folder called `keys`.
+pub fn entries_named(listing: &Listing, keys: &[Vec<u8>]) -> Vec<DirEntry> {
+    listing
+        .entries
+        .iter()
+        .filter(|e| keys.contains(&e.name))
+        .cloned()
+        .collect()
+}
+
+/// One row of the queue.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct QueueRow {
+    pub id: JobId,
+    /// Indented under its folder's row.
+    pub name: String,
+    pub upload: bool,
+    pub state: State,
+    /// Done of 100, when the size is known.
+    pub percent: Option<u64>,
+    pub status: String,
+}
+
+fn percent(done: u64, size: Option<u64>) -> Option<u64> {
+    let size = size.filter(|&s| s > 0)?;
+    Some((done.min(size) * 100) / size)
+}
+
+/// The status column for a job.
+fn status(job: &ferossh_sftp::Job) -> String {
+    let pct = percent(job.done, job.size);
     match job.state {
         State::Queued => "queued".into(),
         State::Asking => "exists".into(),
         State::Running => {
-            let mut s = match percent(job) {
+            let mut s = match pct {
                 Some(p) => format!("{p}%"),
                 None => names::size(job.done),
             };
@@ -257,42 +217,55 @@ fn status(job: &Job) -> String {
             }
             s
         }
-        State::Paused => match percent(job) {
+        State::Paused => match pct {
             Some(p) => format!("paused {p}%"),
             None => "paused".into(),
         },
-        State::Waiting => "waiting".into(),
+        State::Waiting => "waiting for the connection".into(),
         State::Done => job.note.clone().unwrap_or_else(|| "done".into()),
-        State::Failed => "failed".into(),
+        State::Failed => match &job.note {
+            Some(n) => format!("failed: {n}"),
+            None => "failed".into(),
+        },
         State::Cancelled => "cancelled".into(),
         State::Skipped => "skipped".into(),
     }
 }
 
-/// The last `width` cells of `text`, with "…" in front when cut.
-fn tail(text: &str, width: usize) -> String {
-    use unicode_width::UnicodeWidthChar;
-    if unicode_width::UnicodeWidthStr::width(text) <= width {
-        return text.to_owned();
-    }
-    if width == 0 {
-        return String::new();
-    }
-    let mut kept = Vec::new();
-    let mut used = 1;
-    for c in text.chars().rev() {
-        let w = c.width().unwrap_or(0);
-        if used + w > width {
-            break;
-        }
-        used += w;
-        kept.push(c);
-    }
-    std::iter::once('…').chain(kept.into_iter().rev()).collect()
+/// The queue's rows: every top-level job, and the files of a folder that
+/// are moving, stuck or asking.
+pub fn queue_rows(remote: &Remote) -> Vec<QueueRow> {
+    remote
+        .jobs()
+        .iter()
+        .filter(|j| {
+            j.parent.is_none()
+                || matches!(
+                    j.state,
+                    State::Running | State::Asking | State::Failed | State::Paused
+                )
+        })
+        .map(|j| QueueRow {
+            id: j.id,
+            name: if j.parent.is_some() {
+                format!("    {}", j.name)
+            } else {
+                j.name.clone()
+            },
+            upload: matches!(j.kind, Kind::Upload | Kind::SendFolder),
+            state: j.state,
+            percent: if j.state == State::Done {
+                Some(100)
+            } else {
+                percent(j.done, j.size)
+            },
+            status: status(j),
+        })
+        .collect()
 }
 
-/// Finished downloads, so one that lands shows up in the Local PC listing.
-fn landed(remote: &Remote) -> usize {
+/// Finished downloads, so one that lands shows up in the Local list.
+pub fn landed(remote: &Remote) -> usize {
     remote
         .jobs()
         .iter()
@@ -304,1605 +277,324 @@ fn landed(remote: &Remote) -> usize {
         .count()
 }
 
-/// What a Local PC row is.
-enum LocalItem<'a> {
-    Up,
-    Entry(&'a LocalEntry),
-}
-
-/// The Local PC section: a folder on this PC and the selection in it.
+/// The Local list's folder.
 #[derive(Debug, Default)]
-struct LocalView {
-    listing: LocalDir,
+pub struct LocalPane {
+    pub listing: LocalDir,
     /// The download folder the window last gave: when it changes (the
-    /// folder picker, Settings) to a folder not listed, the section lists
-    /// it. Moving around here changes it after the window has heard.
+    /// folder picker, Settings) the list moves there.
     given: Option<PathBuf>,
-    selected: usize,
-    scroll: usize,
     landed: usize,
-    /// The search: only entries whose names match are listed, and no "..".
-    find: String,
-    /// The entries the search matches, by index.
-    found: Option<Vec<usize>>,
 }
 
-impl LocalView {
-    fn count(&self) -> usize {
-        match &self.found {
-            Some(found) => found.len(),
-            None => self.listing.entries.len() + usize::from(self.listing.up.is_some()),
-        }
-    }
-
-    fn item(&self, i: usize) -> Option<LocalItem<'_>> {
-        if let Some(found) = &self.found {
-            return found
-                .get(i)
-                .and_then(|&k| self.listing.entries.get(k))
-                .map(LocalItem::Entry);
-        }
-        if self.listing.up.is_some() {
-            if i == 0 {
-                return Some(LocalItem::Up);
-            }
-            return self.listing.entries.get(i - 1).map(LocalItem::Entry);
-        }
-        self.listing.entries.get(i).map(LocalItem::Entry)
-    }
-
-    /// Shows `listing`, with `select` selected when it is in it. Another
-    /// folder ends the search.
-    fn show(&mut self, listing: LocalDir, select: Option<&Path>) {
-        if listing.dir != self.listing.dir {
-            self.find.clear();
-        }
-        self.listing = listing;
-        self.refind();
-        self.selected = select
-            .and_then(|p| {
-                (0..self.count())
-                    .position(|i| matches!(self.item(i), Some(LocalItem::Entry(e)) if e.path == p))
-            })
-            .unwrap_or(0);
-        self.scroll = 0;
-    }
-
-    /// Applies the search to the listing again.
-    fn refind(&mut self) {
-        self.found = found(
-            self.listing.entries.iter().map(|e| e.name.as_str()),
-            &self.find,
-        );
-    }
-
-    /// Reads the listed folder again, keeping the selection.
-    fn reload(&mut self) {
-        let keep = match self.item(self.selected) {
-            Some(LocalItem::Entry(e)) => Some(e.path.clone()),
-            _ => None,
-        };
-        let listing = match &self.listing.dir {
-            Some(d) => LocalDir::read(d),
-            None => LocalDir::drives(),
-        };
-        self.show(listing, keep.as_deref());
-    }
-
-    /// Follows the download folder `base`, and reads the folder again when
-    /// a download has landed.
-    fn sync(&mut self, base: &Path, remote: &Remote) {
-        let landed = landed(remote);
+impl LocalPane {
+    /// Follows the download folder `base`, and reads the folder again
+    /// when a download has landed (`landed` counts them). True when the
+    /// listing changed.
+    pub fn sync(&mut self, base: &Path, landed: usize) -> bool {
+        let mut changed = false;
         if self.given.as_deref() != Some(base) {
             self.given = Some(base.to_path_buf());
             if self.listing.dir.as_deref() != Some(base) {
-                self.show(LocalDir::read(base), None);
+                self.listing = LocalDir::read(base);
+                changed = true;
             }
         } else if landed != self.landed {
             self.reload();
+            changed = true;
         }
         self.landed = landed;
+        changed
     }
 
-    /// Lists folder `dir`, selecting `select`; the window makes it the
-    /// download folder. A folder that cannot be read is not entered.
-    fn enter(&mut self, dir: PathBuf, select: Option<&Path>) -> Result<FilesAction, String> {
-        let listing = LocalDir::read(&dir);
+    /// Reads the listed folder again.
+    pub fn reload(&mut self) {
+        self.listing = match &self.listing.dir {
+            Some(d) => LocalDir::read(d),
+            None => LocalDir::drives(),
+        };
+    }
+
+    /// Lists folder `dir`. A folder that cannot be read is not entered.
+    pub fn enter(&mut self, dir: &Path) -> Result<(), String> {
+        let listing = LocalDir::read(dir);
         if let Some(e) = listing.error {
             return Err(e);
         }
-        self.show(listing, select);
-        Ok(FilesAction::SetLocal(dir))
+        self.listing = listing;
+        Ok(())
     }
 
-    /// One folder up, or to the drives above a drive's root.
-    fn up(&mut self) -> Result<Option<FilesAction>, String> {
+    /// One folder up, or to the drives above a drive's root; the folder
+    /// left, to select it.
+    pub fn up(&mut self) -> Result<Option<PathBuf>, String> {
         let here = self.listing.dir.clone();
         match self.listing.up.clone() {
-            Some(Up::Folder(p)) => self.enter(p, here.as_deref()).map(Some),
+            Some(Up::Folder(p)) => self.enter(&p).map(|()| here),
             Some(Up::Drives) => {
-                self.show(LocalDir::drives(), here.as_deref());
-                Ok(None)
+                self.listing = LocalDir::drives();
+                Ok(here)
             }
             None => Ok(None),
         }
     }
-}
 
-/// The selection in the file transfer view.
-#[derive(Debug, Default)]
-pub struct FilesView {
-    focus: Focus,
-    local: LocalView,
-    selected: usize,
-    scroll: usize,
-    queue_selected: usize,
-    queue_scroll: usize,
-    /// The folder the selection belongs to: a new folder starts at the top.
-    path: Vec<u8>,
-    /// The listing's search: only entries whose names match are listed,
-    /// and no "..". Another folder ends it.
-    find: String,
-    /// The entries the search matches, by index, as of the last sync.
-    found: Option<Vec<usize>>,
-    /// Keys type into the focused section's search.
-    typing: bool,
-    sizes: Sizes,
-}
-
-impl FilesView {
-    /// Starts over, for another host. The Local PC section stays where
-    /// it is, and the sections keep their heights.
-    pub fn reset(&mut self) {
-        let local = std::mem::take(&mut self.local);
-        let sizes = self.sizes;
-        *self = Self::default();
-        self.local = local;
-        self.sizes = sizes;
+    /// The listed folder (`None` for the drives).
+    pub fn dir(&self) -> Option<&Path> {
+        self.listing.dir.as_deref()
     }
+}
 
-    /// The listing's row `i`, as searched.
-    fn item<'a>(&self, remote: &'a Remote, i: usize) -> Option<Item<'a>> {
-        match &self.found {
-            Some(found) => found
-                .get(i)
-                .and_then(|&k| remote.listing.entries.get(k))
-                .map(Item::Entry),
-            None => item(remote, i),
+/// How the two lists are arranged.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Arrange {
+    /// One above the other, else side by side.
+    pub stacked: bool,
+    /// Remote first (left or top), else Local first.
+    pub swapped: bool,
+    /// The first list's share of the room, in percent.
+    pub split: u8,
+}
+
+impl Default for Arrange {
+    fn default() -> Self {
+        Self {
+            stacked: false,
+            swapped: false,
+            split: 50,
         }
     }
+}
 
-    /// The listing's rows, as searched.
-    fn count(&self, remote: &Remote) -> usize {
-        self.found
-            .as_ref()
-            .map_or_else(|| item_count(remote), Vec::len)
+impl Arrange {
+    /// The `TransferLayout` setting: `side` or `stacked`, then `swapped`
+    /// and the split, such as `side swapped 40`.
+    pub fn parse(text: &str) -> Self {
+        let mut a = Self::default();
+        for word in text.split_whitespace() {
+            match word.to_ascii_lowercase().as_str() {
+                "stacked" => a.stacked = true,
+                "side" => a.stacked = false,
+                "swapped" => a.swapped = true,
+                n => {
+                    if let Ok(n) = n.parse::<u8>() {
+                        a.split = n.clamp(MIN_SPLIT, 100 - MIN_SPLIT);
+                    }
+                }
+            }
+        }
+        a
     }
 
-    fn layout(&self, remote: &Remote, rows: usize) -> Geometry {
-        geometry(
-            rows,
-            queue_rows(remote).len(),
-            remote.question().is_some(),
-            self.sizes,
+    pub fn to_setting(self) -> String {
+        format!(
+            "{}{} {}",
+            if self.stacked { "stacked" } else { "side" },
+            if self.swapped { " swapped" } else { "" },
+            self.split
         )
     }
 
-    /// The divider on grid row `y`, if one is there.
-    pub fn divider_at(&self, remote: Option<&Remote>, y: usize, rows: usize) -> Option<Divider> {
-        let g = self.layout(remote?, rows);
-        if g.local.is_some_and(|l| l.0 == y) {
-            Some(Divider::Local)
-        } else if g.queue.is_some_and(|q| q.0 == y) {
-            Some(Divider::Queue)
-        } else {
-            None
+    /// The arrow that moves files from the Local list to the Remote list,
+    /// and the one back.
+    pub fn arrows(self) -> (&'static str, &'static str) {
+        match (self.stacked, self.swapped) {
+            (false, false) => ("→", "←"),
+            (false, true) => ("←", "→"),
+            (true, false) => ("↓", "↑"),
+            (true, true) => ("↑", "↓"),
         }
     }
+}
 
-    /// Moves divider `which` to grid row `y`, as far as the sections
-    /// around it keep a row each. The section below it gets the rows; the
-    /// queue's divider leaves the Local PC title where it is until the
-    /// Local PC section is down to one row, then pushes it up.
-    pub fn drag_divider(&mut self, remote: Option<&Remote>, which: Divider, y: usize, rows: usize) {
-        let Some(remote) = remote else {
-            return;
-        };
-        let g = self.layout(remote, rows);
-        match which {
-            Divider::Local => {
-                let Some((_, first, n)) = g.local else {
-                    return;
-                };
-                let end = first + n;
-                let y = y.clamp(HEADER + 1, end.saturating_sub(2).max(HEADER + 1));
-                self.sizes.local = Some(end.saturating_sub(y + 1).max(1));
-            }
-            Divider::Queue => {
-                let Some((_, first, n)) = g.queue else {
-                    return;
-                };
-                let end = first + n;
-                let top = HEADER + 1 + if g.local.is_some() { 2 } else { 0 };
-                let y = y.clamp(top, end.saturating_sub(2).max(top));
-                self.sizes.queue = Some(end.saturating_sub(y + 1).max(1));
-                if let Some((_, lfirst, _)) = g.local {
-                    self.sizes.local = Some(y.saturating_sub(lfirst).max(1));
-                }
-            }
-        }
-    }
+/// The smallest share either list gets.
+pub const MIN_SPLIT: u8 = 15;
 
-    /// Whether keys type into a search.
-    #[cfg(test)]
-    fn typing(&self) -> bool {
-        self.typing
-    }
+/// Where the parts go in `area`: the Local list's block, the gap with
+/// the arrow buttons (`gap` wide or tall), and the Remote list's block.
+pub fn arrange(a: Arrange, area: Rect, gap: i32) -> (Rect, Rect, Rect) {
+    let along = if a.stacked { area.h } else { area.w };
+    let room = (along - gap).max(0);
+    let first = room * i32::from(a.split) / 100;
+    let second = room - first;
+    let (r1, g, r2) = if a.stacked {
+        (
+            Rect::new(area.x, area.y, area.w, first),
+            Rect::new(area.x, area.y + first, area.w, gap.min(along)),
+            Rect::new(area.x, area.y + first + gap, area.w, second),
+        )
+    } else {
+        (
+            Rect::new(area.x, area.y, first, area.h),
+            Rect::new(area.x + first, area.y, gap.min(along), area.h),
+            Rect::new(area.x + first + gap, area.y, second, area.h),
+        )
+    };
+    if a.swapped { (r2, g, r1) } else { (r1, g, r2) }
+}
 
-    /// Fits the selections to the pane; `base` is the download folder.
-    fn sync(&mut self, remote: &Remote, base: &Path, rows: usize) -> Geometry {
-        self.local.sync(base, remote);
-        if self.path != remote.listing.path {
-            self.path.clone_from(&remote.listing.path);
-            self.selected = 0;
-            self.scroll = 0;
-            // Another folder ends the search.
-            self.find.clear();
-            if self.focus == Focus::List {
-                self.typing = false;
-            }
-        }
-        self.found = found(
-            remote
-                .listing
-                .entries
-                .iter()
-                .map(|e| names::display(&e.name)),
-            &self.find,
-        );
-        let queued = queue_rows(remote).len();
-        let g = self.layout(remote, rows);
-        let n = self.count(remote);
-        self.selected = self.selected.min(n.saturating_sub(1));
-        let visible = g.list.1.max(1);
-        if self.selected < self.scroll {
-            self.scroll = self.selected;
-        }
-        if self.selected >= self.scroll + visible {
-            self.scroll = self.selected + 1 - visible;
-        }
-        let local = &mut self.local;
-        local.selected = local.selected.min(local.count().saturating_sub(1));
-        if let Some((_, _, ln)) = g.local {
-            if local.selected < local.scroll {
-                local.scroll = local.selected;
-            }
-            if local.selected >= local.scroll + ln {
-                local.scroll = local.selected + 1 - ln;
-            }
-        } else if self.focus == Focus::Local {
-            self.focus = Focus::List;
-            self.typing = false;
-        }
-        self.queue_selected = self.queue_selected.min(queued.saturating_sub(1));
-        if let Some((_, _, qn)) = g.queue {
-            if self.queue_selected < self.queue_scroll {
-                self.queue_scroll = self.queue_selected;
-            }
-            if self.queue_selected >= self.queue_scroll + qn {
-                self.queue_scroll = self.queue_selected + 1 - qn;
-            }
-        }
-        if queued == 0 && self.focus == Focus::Queue {
-            self.focus = Focus::List;
-        }
-        if self.focus == Focus::Queue {
-            self.typing = false;
-        }
-        g
-    }
-
-    fn selected_job(&self, remote: &Remote) -> Option<JobId> {
-        let i = *queue_rows(remote).get(self.queue_selected)?;
-        remote.jobs().get(i).map(|j| j.id)
-    }
-
-    /// Opens the selected row: a folder is listed, a file downloaded.
-    fn open(&mut self, remote: &mut Remote, downloads: &Path) {
-        let path = remote.listing.path.clone();
-        match self.item(remote, self.selected) {
-            Some(Item::Up) => remote.browse(&names::parent(&path)),
-            Some(Item::Entry(e)) if e.attrs.is_dir() || e.attrs.is_symlink() => {
-                let target = names::join(&path, &e.name);
-                remote.browse(&target);
-            }
-            Some(Item::Entry(_)) => self.download(remote, downloads),
-            None => {}
-        }
-    }
-
-    fn download(&mut self, remote: &mut Remote, downloads: &Path) {
-        let Some(Item::Entry(entry)) = self.item(remote, self.selected) else {
-            return;
-        };
-        let entry = entry.clone();
-        if let Err(e) = std::fs::create_dir_all(downloads) {
-            remote.notice = Some(format!("{}: {e}", downloads.display()));
-            return;
-        }
-        if let Err(e) = remote.download(&entry, downloads) {
-            remote.notice = Some(e);
-        }
-    }
-
-    /// Handles a key; `rows` is the grid's height and `downloads` where
-    /// downloads go.
-    pub fn key(
-        &mut self,
-        remote: Option<&mut Remote>,
-        key: SideKey,
-        downloads: &Path,
-        rows: usize,
-    ) -> Option<FilesAction> {
-        let Some(remote) = remote else {
-            return match key {
-                SideKey::Escape => Some(FilesAction::Leave),
-                SideKey::Char('f' | 'F') => Some(FilesAction::ToggleFollow),
-                SideKey::Char('o') => Some(FilesAction::OpenDownloads),
-                _ => None,
-            };
-        };
-        remote.notice = None;
-        let g = self.sync(remote, downloads, rows);
-        if self.typing && self.search_key(key) {
-            self.sync(remote, downloads, rows);
-            return None;
-        }
-        // The question takes its answer from either half.
-        if let (Some((id, _)), SideKey::Char(c)) = (remote.question(), key) {
-            let choice = match c.to_ascii_lowercase() {
-                'o' => Some(Choice::Overwrite),
-                's' => Some(Choice::Skip),
-                'k' => Some(Choice::KeepBoth),
-                _ => None,
-            };
-            if let Some(choice) = choice {
-                remote.answer(id, choice, c.is_ascii_uppercase());
-                self.sync(remote, downloads, rows);
-                return None;
-            }
-        }
-        let action = match self.focus {
-            Focus::List => self.list_key(remote, key, downloads, g),
-            Focus::Local => self.local_key(remote, key, g),
-            Focus::Queue => {
-                let n = g.queue.map_or(1, |q| q.2);
-                self.queue_key(remote, key, n)
-            }
-        };
-        self.sync(remote, downloads, rows);
-        action
-    }
-
-    /// A key while typing into the focused section's search; false when
-    /// the key does what it does without a search (the arrows move the
-    /// selection, Tab moves on and ends the typing).
-    fn search_key(&mut self, key: SideKey) -> bool {
-        let local = self.focus == Focus::Local;
-        let find = if local {
-            &mut self.local.find
-        } else {
-            &mut self.find
-        };
-        match key {
-            SideKey::Char(c) => {
-                if !c.is_control() && find.chars().count() < MAX_FIND {
-                    find.push(c);
-                }
-            }
-            SideKey::Backspace => {
-                if find.pop().is_none() {
-                    self.typing = false;
-                }
-            }
-            SideKey::Escape => {
-                find.clear();
-                self.typing = false;
-            }
-            SideKey::Enter { .. } => {
-                self.typing = false;
-                return true;
-            }
-            SideKey::Tab => {
-                self.typing = false;
-                return false;
-            }
-            SideKey::Up
-            | SideKey::Down
-            | SideKey::PageUp
-            | SideKey::PageDown
-            | SideKey::Home
-            | SideKey::End
-            | SideKey::Refresh => return false,
-            // Nothing that would leave the folder or change files while
-            // typing.
-            _ => return true,
-        }
-        // The search changed: start at its first match.
-        if local {
-            self.local.refind();
-            self.local.selected = 0;
-            self.local.scroll = 0;
-        } else {
-            self.selected = 0;
-            self.scroll = 0;
-        }
-        true
-    }
-
-    fn list_key(
-        &mut self,
-        remote: &mut Remote,
-        key: SideKey,
-        downloads: &Path,
-        g: Geometry,
-    ) -> Option<FilesAction> {
-        let n = self.count(remote);
-        let page = g.list.1.saturating_sub(1).max(1);
-        match key {
-            SideKey::Up => self.selected = self.selected.saturating_sub(1),
-            SideKey::Down => self.selected += 1,
-            SideKey::PageUp => self.selected = self.selected.saturating_sub(page),
-            SideKey::PageDown => self.selected += page,
-            SideKey::Home => self.selected = 0,
-            SideKey::End => self.selected = n.saturating_sub(1),
-            SideKey::Enter { .. } | SideKey::Right => self.open(remote, downloads),
-            SideKey::Left | SideKey::Backspace => {
-                if has_up(remote) {
-                    let up = names::parent(&remote.listing.path);
-                    remote.browse(&up);
-                }
-            }
-            SideKey::Refresh => remote.refresh(),
-            SideKey::Delete => {
-                if let Some(Item::Entry(e)) = self.item(remote, self.selected) {
-                    return Some(FilesAction::Delete(e.clone()));
-                }
-            }
-            SideKey::Tab => {
-                if g.local.is_some() {
-                    self.focus = Focus::Local;
-                    self.local.reload();
-                } else if g.queue.is_some() {
-                    self.focus = Focus::Queue;
-                }
-            }
-            // Escape ends a search first.
-            SideKey::Escape if !self.find.is_empty() => self.find.clear(),
-            SideKey::Escape => return Some(FilesAction::Leave),
-            SideKey::Char('/') => self.typing = true,
-            SideKey::Char(c) => match c.to_ascii_lowercase() {
-                'd' => self.download(remote, downloads),
-                'b' => return Some(FilesAction::PickLocal),
-                'u' => return Some(FilesAction::PickUpload(remote.listing.path.clone())),
-                'f' => return Some(FilesAction::ToggleFollow),
-                'o' => return Some(FilesAction::OpenDownloads),
-                '~' | 'h' => {
-                    if let Some(home) = remote.home.clone() {
-                        remote.browse(&home);
-                    }
-                }
-                _ => {}
-            },
-            SideKey::ToggleFavourite | SideKey::Edit | SideKey::New => {}
-        }
-        None
-    }
-
-    fn local_key(&mut self, remote: &mut Remote, key: SideKey, g: Geometry) -> Option<FilesAction> {
-        let n = self.local.count();
-        let page = g.local.map_or(1, |l| l.2).saturating_sub(1).max(1);
-        let local = &mut self.local;
-        match key {
-            SideKey::Up => local.selected = local.selected.saturating_sub(1),
-            SideKey::Down => local.selected += 1,
-            SideKey::PageUp => local.selected = local.selected.saturating_sub(page),
-            SideKey::PageDown => local.selected += page,
-            SideKey::Home => local.selected = 0,
-            SideKey::End => local.selected = n.saturating_sub(1),
-            _ => return self.local_command(remote, key, g),
-        }
-        None
-    }
-
-    /// The Local PC keys that do more than move the selection.
-    fn local_command(
-        &mut self,
-        remote: &mut Remote,
-        key: SideKey,
-        g: Geometry,
-    ) -> Option<FilesAction> {
-        let done = match key {
-            SideKey::Enter { .. } | SideKey::Right => return self.local_open(remote),
-            SideKey::Left | SideKey::Backspace => self.local.up(),
-            SideKey::Refresh => {
-                self.local.reload();
-                Ok(None)
-            }
-            SideKey::Tab => {
-                self.focus = if g.queue.is_some() {
-                    Focus::Queue
-                } else {
-                    Focus::List
-                };
-                Ok(None)
-            }
-            SideKey::Escape if !self.local.find.is_empty() => {
-                self.local.find.clear();
-                self.local.refind();
-                Ok(None)
-            }
-            SideKey::Escape => Ok(Some(FilesAction::Leave)),
-            SideKey::Char('/') => {
-                self.typing = true;
-                Ok(None)
-            }
-            SideKey::Char(c) => match c.to_ascii_lowercase() {
-                'u' => return self.local_upload(remote),
-                'b' => Ok(Some(FilesAction::PickLocal)),
-                'o' => Ok(Some(FilesAction::OpenDownloads)),
-                'f' => Ok(Some(FilesAction::ToggleFollow)),
-                _ => Ok(None),
-            },
-            _ => Ok(None),
-        };
-        done.unwrap_or_else(|e| {
-            remote.notice = Some(e);
-            None
-        })
-    }
-
-    /// Opens the selected Local PC row: a folder or drive is listed, a
-    /// file uploaded into the listed remote folder.
-    fn local_open(&mut self, remote: &mut Remote) -> Option<FilesAction> {
-        let done = match self.local.item(self.local.selected) {
-            Some(LocalItem::Up) => self.local.up(),
-            Some(LocalItem::Entry(e)) if e.dir => {
-                let dir = e.path.clone();
-                self.local.enter(dir, None).map(Some)
-            }
-            Some(LocalItem::Entry(_)) => return self.local_upload(remote),
-            None => Ok(None),
-        };
-        done.unwrap_or_else(|e| {
-            remote.notice = Some(e);
-            None
-        })
-    }
-
-    /// Uploads the selected Local PC file or folder into the listed remote
-    /// folder.
-    fn local_upload(&mut self, remote: &mut Remote) -> Option<FilesAction> {
-        // Not a whole drive.
-        self.local.listing.dir.as_ref()?;
-        let Some(LocalItem::Entry(e)) = self.local.item(self.local.selected) else {
-            return None;
-        };
-        if remote.listing.path.is_empty() {
-            remote.notice = Some("Wait for the remote folder to be listed.".into());
-            return None;
-        }
-        Some(FilesAction::Upload {
-            paths: vec![e.path.clone()],
-            dir: remote.listing.path.clone(),
-        })
-    }
-
-    fn queue_key(
-        &mut self,
-        remote: &mut Remote,
-        key: SideKey,
-        visible: usize,
-    ) -> Option<FilesAction> {
-        let n = queue_rows(remote).len();
-        let job = self.selected_job(remote);
-        let state = job
-            .and_then(|id| remote.jobs().iter().find(|j| j.id == id))
-            .map(|j| j.state);
-        let page = visible.saturating_sub(1).max(1);
-        match key {
-            SideKey::Up => self.queue_selected = self.queue_selected.saturating_sub(1),
-            SideKey::Down => self.queue_selected += 1,
-            SideKey::PageUp => self.queue_selected = self.queue_selected.saturating_sub(page),
-            SideKey::PageDown => self.queue_selected += page,
-            SideKey::Home => self.queue_selected = 0,
-            SideKey::End => self.queue_selected = n.saturating_sub(1),
-            SideKey::Tab | SideKey::Left => self.focus = Focus::List,
-            SideKey::Escape => return Some(FilesAction::Leave),
-            SideKey::Delete => {
-                if let Some(id) = job {
-                    remote.cancel(id);
-                }
-            }
-            SideKey::Char(c) => match (c.to_ascii_lowercase(), job, state) {
-                (' ' | 'p', Some(id), Some(State::Paused)) => remote.resume(id),
-                (' ' | 'p', Some(id), Some(s)) if !s.finished() => remote.pause(id),
-                ('x', Some(id), _) => remote.cancel(id),
-                ('r', Some(id), Some(State::Failed | State::Cancelled)) => remote.retry(id),
-                ('c', _, _) => remote.clear_finished(),
-                _ => {}
-            },
-            _ => {}
-        }
-        None
-    }
-
-    /// A click on grid cell (`x`, `y`); `double` opens.
-    pub fn click(
-        &mut self,
-        remote: Option<&mut Remote>,
-        x: usize,
-        y: usize,
-        double: bool,
-        downloads: &Path,
-        rows: usize,
-    ) -> Option<FilesAction> {
-        let remote = remote?;
-        let g = self.sync(remote, downloads, rows);
-        self.typing = false;
-        if let Some(q) = g.question
-            && y == q + 1
-            && let Some((id, _)) = remote.question()
-        {
-            // The options row: which word was hit.
-            let choice = if x < 13 {
-                Choice::Overwrite
-            } else if x < 21 {
-                Choice::Skip
-            } else {
-                Choice::KeepBoth
-            };
-            remote.answer(id, choice, false);
-            self.sync(remote, downloads, rows);
-            return None;
-        }
-        if let Some((_, first, n)) = g.queue
-            && (first..first + n).contains(&y)
-        {
-            self.focus = Focus::Queue;
-            self.queue_selected = self.queue_scroll + (y - first);
-            self.sync(remote, downloads, rows);
-            return None;
-        }
-        if let Some((title, first, n)) = g.local {
-            if y == title {
-                // The section's title: choose another folder.
-                return Some(FilesAction::PickLocal);
-            }
-            if (first..first + n).contains(&y) {
-                let i = self.local.scroll + (y - first);
-                if i >= self.local.count() {
-                    return None;
-                }
-                self.focus = Focus::Local;
-                self.local.selected = i;
-                let action = if double {
-                    self.local_open(remote)
-                } else {
-                    None
-                };
-                self.sync(remote, downloads, rows);
-                return action;
-            }
-        }
-        let (first, n) = g.list;
-        if !(first..first + n).contains(&y) {
-            return None;
-        }
-        let i = self.scroll + (y - first);
-        if i >= self.count(remote) {
-            return None;
-        }
-        self.focus = Focus::List;
-        self.selected = i;
-        if double {
-            self.open(remote, downloads);
-        }
-        self.sync(remote, downloads, rows);
-        None
-    }
-
-    /// Wheel scrolling by `lines` (positive: up), of the Local PC section
-    /// when it has the keyboard, else of the listing.
-    pub fn scroll_by(
-        &mut self,
-        remote: Option<&Remote>,
-        lines: i32,
-        downloads: &Path,
-        rows: usize,
-    ) {
-        let Some(remote) = remote else {
-            return;
-        };
-        let g = self.sync(remote, downloads, rows);
-        if self.focus == Focus::Local
-            && let Some((_, _, n)) = g.local
-        {
-            let local = &mut self.local;
-            let max = local.count().saturating_sub(n);
-            local.scroll = if lines > 0 {
-                local.scroll.saturating_sub(lines as usize)
-            } else {
-                (local.scroll + lines.unsigned_abs() as usize).min(max)
-            };
-            local.selected = local
-                .selected
-                .clamp(local.scroll, local.scroll + n.saturating_sub(1));
-            return;
-        }
-        let max = self.count(remote).saturating_sub(g.list.1.max(1));
-        self.scroll = if lines > 0 {
-            self.scroll.saturating_sub(lines as usize)
-        } else {
-            (self.scroll + lines.unsigned_abs() as usize).min(max)
-        };
-        // Keep the selection on screen so the next sync does not undo it.
-        let visible = g.list.1.max(1);
-        self.selected = self
-            .selected
-            .clamp(self.scroll, self.scroll + visible.saturating_sub(1));
-    }
-
-    /// Draws the pane. `follow` is whether the listing follows the
-    /// terminal's directory; `downloads` is the download folder.
-    pub fn draw(
-        &mut self,
-        grid: &mut Grid,
-        palette: &Palette,
-        focused: bool,
-        remote: Option<&Remote>,
-        follow: Follow,
-        downloads: &Path,
-    ) {
-        let width = grid.cols();
-        let rows = grid.rows();
-        let bg = palette.strip;
-        let accent = Rgb::new(0xe5, 0xb5, 0x3b);
-        let line = |text: &str, fg: Rgb, bg: Rgb, flags: Flags| -> Vec<Cell> {
-            let mut cells: Vec<Cell> = Vec::new();
-            for c in fit(text, width).chars() {
-                cells.push(Cell::new(c, Color::Rgb(fg), Color::Rgb(bg), flags));
-                if unicode_width::UnicodeWidthChar::width(c) == Some(2) {
-                    if let Some(last) = cells.last_mut() {
-                        last.flags.insert(Flags::WIDE);
-                    }
-                    cells.push(Cell::new(
-                        ' ',
-                        Color::Rgb(fg),
-                        Color::Rgb(bg),
-                        Flags::WIDE_SPACER,
-                    ));
-                }
-            }
-            cells.resize(
-                width,
-                Cell::new(' ', Color::Rgb(fg), Color::Rgb(bg), Flags::empty()),
-            );
-            cells.truncate(width);
-            cells
-        };
-        let blank = line("", palette.dim, bg, Flags::empty());
-        let Some(remote) = remote else {
-            grid.set_row(0, line(" Files", palette.text, bg, Flags::BOLD));
-            grid.set_row(
-                1,
-                line(
-                    " Connect a pane to an SSH host to see its files.",
-                    palette.dim,
-                    palette.active,
-                    Flags::empty(),
-                ),
-            );
-            for y in 2..rows {
-                grid.set_row(y, blank.clone());
-            }
-            return;
-        };
-        let g = self.sync(remote, downloads, rows);
-        let follows = match follow {
-            Follow::Off => "",
-            Follow::On => "follows cd ",
-            Follow::Unreported => "cd not reported ",
-        };
-        let title = spread(&format!(" Files  {}", remote.label), follows, width);
-        let mut cells = line(&title, palette.text, bg, Flags::empty());
-        for c in cells.iter_mut().take(6) {
-            c.flags.insert(Flags::BOLD);
-        }
-        for c in cells.iter_mut().skip(width.saturating_sub(follows.len())) {
-            c.fg = Color::Rgb(palette.dim);
-        }
-        grid.set_row(0, cells);
-        let path = if remote.listing.path.is_empty() {
-            if remote.is_ready() {
-                " Listing…".to_owned()
-            } else {
-                " Opening SFTP…".to_owned()
-            }
-        } else {
-            let loading = if remote.listing.loading { " …" } else { "" };
-            format!(" {}{loading}", names::display(&remote.listing.path))
-        };
-        // The search sits at the path's right end; a long path gives way.
-        let typing = focused && self.typing;
-        let find = search_label(&self.find, typing && self.focus == Focus::List);
-        if find.is_empty() {
-            grid.set_row(1, line(&path, palette.text, palette.active, Flags::BOLD));
-        } else {
-            let fw = unicode_width::UnicodeWidthStr::width(find.as_str()) + 1;
-            let room = width.saturating_sub(fw + 2);
-            let text = spread(&tail(&path, room), &format!("{find} "), width);
-            let mut cells = line(&text, palette.text, palette.active, Flags::BOLD);
-            for c in cells.iter_mut().skip(width.saturating_sub(fw)) {
-                c.fg = Color::Rgb(accent);
-            }
-            grid.set_row(1, cells);
-        }
-        // The listing.
-        let (first, n) = g.list;
-        let list_focus = focused && self.focus == Focus::List;
-        for y in 0..n {
-            let i = self.scroll + y;
-            let selected = i == self.selected && list_focus;
-            let row_bg = if selected { palette.active } else { bg };
-            let flags = if selected {
-                Flags::BOLD
-            } else {
-                Flags::empty()
-            };
-            let cells = match self.item(remote, i) {
-                Some(Item::Up) => line(" ▴ ..", palette.dim, row_bg, flags),
-                Some(Item::Entry(e)) => {
-                    let name = names::display(&e.name);
-                    if e.attrs.is_dir() {
-                        line(&format!(" ▸ {name}/"), palette.text, row_bg, flags)
-                    } else if e.attrs.is_symlink() {
-                        line(&format!(" ↪ {name}"), palette.text, row_bg, flags)
-                    } else {
-                        let size = e.attrs.size.map(names::size).unwrap_or_default();
-                        let text = spread(&format!("   {name}"), &format!("{size} "), width);
-                        let mut cells = line(&text, palette.text, row_bg, flags);
-                        let from = width.saturating_sub(size.chars().count() + 1);
-                        for c in cells.iter_mut().skip(from) {
-                            c.fg = Color::Rgb(palette.dim);
-                        }
-                        cells
-                    }
-                }
-                None if i == 0 => {
-                    let text = match &remote.listing.error {
-                        Some(e) => format!(" {e}"),
-                        None if remote.listing.loading || remote.listing.path.is_empty() => {
-                            String::new()
-                        }
-                        None if self.found.is_some() => " (nothing matches)".into(),
-                        None => " (empty)".into(),
-                    };
-                    line(&text, palette.dim, bg, Flags::empty())
-                }
-                None => blank.clone(),
-            };
-            grid.set_row(first + y, cells);
-        }
-        if let Some(e) = &remote.listing.error
-            && self.count(remote) > 0
-            && n > 0
-        {
-            // A failed refresh keeps the old listing; say so at its foot.
-            grid.set_row(
-                first + n - 1,
-                line(&format!(" {e}"), accent, bg, Flags::empty()),
-            );
-        }
-        // The Local PC section.
-        if let Some((title_row, lfirst, ln)) = g.local {
-            let label = self.local.listing.label();
-            let find = search_label(&self.local.find, typing && self.focus == Focus::Local);
-            let left = if find.is_empty() {
-                " Local PC".to_owned()
-            } else {
-                format!(" Local PC  {find}")
-            };
-            let lw = unicode_width::UnicodeWidthStr::width(left.as_str());
-            let room = width.saturating_sub(lw + 2);
-            let text = spread(&left, &format!("{} ", tail(&label, room)), width);
-            let mut cells = line(&text, palette.dim, palette.active, Flags::empty());
-            for c in cells.iter_mut().take(9) {
-                c.flags.insert(Flags::BOLD);
-            }
-            for c in cells.iter_mut().skip(11).take(lw.saturating_sub(11)) {
-                c.fg = Color::Rgb(accent);
-            }
-            grid.set_row(title_row, cells);
-            let local_focus = focused && self.focus == Focus::Local;
-            let sep = std::path::MAIN_SEPARATOR;
-            for y in 0..ln {
-                let i = self.local.scroll + y;
-                let selected = i == self.local.selected && local_focus;
-                let row_bg = if selected { palette.active } else { bg };
-                let flags = if selected {
-                    Flags::BOLD
-                } else {
-                    Flags::empty()
-                };
-                let cells = match self.local.item(i) {
-                    Some(LocalItem::Up) => line(" ▴ ..", palette.dim, row_bg, flags),
-                    Some(LocalItem::Entry(e)) if e.dir => {
-                        let name = e.name.trim_end_matches(['\\', '/']);
-                        line(&format!(" ▸ {name}{sep}"), palette.text, row_bg, flags)
-                    }
-                    Some(LocalItem::Entry(e)) => {
-                        let size = names::size(e.size);
-                        let text = spread(&format!("   {}", e.name), &format!("{size} "), width);
-                        let mut cells = line(&text, palette.text, row_bg, flags);
-                        let from = width.saturating_sub(size.chars().count() + 1);
-                        for c in cells.iter_mut().skip(from) {
-                            c.fg = Color::Rgb(palette.dim);
-                        }
-                        cells
-                    }
-                    None if i == 0
-                        || (i == 1
-                            && self.local.listing.up.is_some()
-                            && self.local.found.is_none()) =>
-                    {
-                        let text = match &self.local.listing.error {
-                            Some(e) => format!(" {e}"),
-                            None if self.local.found.is_some() => " (nothing matches)".into(),
-                            None => " (empty)".into(),
-                        };
-                        line(&text, palette.dim, bg, Flags::empty())
-                    }
-                    None => blank.clone(),
-                };
-                grid.set_row(lfirst + y, cells);
-            }
-        }
-        // The queue.
-        if let Some((title_row, qfirst, qn)) = g.queue {
-            let jobs = remote.jobs();
-            let shown = queue_rows(remote);
-            let running = jobs.iter().filter(|j| j.state == State::Running).count();
-            let waiting = jobs.iter().filter(|j| j.state == State::Waiting).count();
-            let mut right = String::new();
-            if running > 0 {
-                right = format!("{running} moving ");
-            } else if waiting > 0 {
-                right = "waiting for connection ".into();
-            }
-            if remote.verify {
-                right.push_str("· verify ");
-            }
-            let text = spread(" Transfers", &right, width);
-            grid.set_row(
-                title_row,
-                line(&text, palette.dim, palette.active, Flags::BOLD),
-            );
-            let queue_focus = focused && self.focus == Focus::Queue;
-            for y in 0..qn {
-                let k = self.queue_scroll + y;
-                let selected = k == self.queue_selected && queue_focus;
-                let row_bg = if selected { palette.active } else { bg };
-                let cells = match shown.get(k).and_then(|&i| jobs.get(i)) {
-                    Some(job) => {
-                        let arrow = match job.kind {
-                            Kind::Download | Kind::FetchFolder => "↓",
-                            Kind::Upload | Kind::SendFolder => "↑",
-                        };
-                        let indent = if job.parent.is_some() { "  " } else { "" };
-                        let st = status(job);
-                        let text = spread(
-                            &format!(" {indent}{arrow} {}", job.name),
-                            &format!("{st} "),
-                            width,
-                        );
-                        let fg = match job.state {
-                            State::Failed | State::Asking => accent,
-                            State::Done | State::Cancelled | State::Skipped => palette.dim,
-                            _ => palette.text,
-                        };
-                        line(
-                            &text,
-                            fg,
-                            row_bg,
-                            if selected {
-                                Flags::BOLD
-                            } else {
-                                Flags::empty()
-                            },
-                        )
-                    }
-                    None => blank.clone(),
-                };
-                grid.set_row(qfirst + y, cells);
-            }
-        }
-        if let Some(q) = g.question {
-            let text = remote.question().map(|(_, t)| t).unwrap_or_default();
-            grid.set_row(
-                q,
-                line(&format!(" {text}"), accent, palette.active, Flags::BOLD),
-            );
-            grid.set_row(
-                q + 1,
-                line(
-                    &format!("{OPTIONS}  (Shift: all)"),
-                    palette.text,
-                    palette.active,
-                    Flags::empty(),
-                ),
-            );
-        }
-        // The footer: a notice, else what the keys do.
-        let (text, fg) = if let Some(n) = &remote.notice {
-            (format!(" {n}"), accent)
-        } else if typing {
-            (
-                " Type to search · * ? wildcards · Enter done · Esc clear".into(),
-                palette.dim,
-            )
-        } else if focused && self.focus == Focus::Queue {
-            (
-                " Space pause · R retry · X cancel · C clear · Tab files".into(),
-                palette.dim,
-            )
-        } else if focused && self.focus == Focus::Local {
-            let next = if g.queue.is_some() { "queue" } else { "files" };
-            (
-                format!(
-                    " Enter open · U upload · / search · B choose folder · O Explorer · Tab {next}"
-                ),
-                palette.dim,
-            )
-        } else if focused {
-            let next = if g.local.is_some() {
-                "Local PC"
-            } else {
-                "queue"
-            };
-            (
-                format!(" Enter open · D download · U upload · / search · Del delete · Tab {next}"),
-                palette.dim,
-            )
-        } else {
-            (" Ctrl+Shift+E to browse".into(), palette.dim)
-        };
-        if g.footer >= HEADER {
-            grid.set_row(g.footer, line(&text, fg, bg, Flags::empty()));
-        }
-    }
+/// The split for a drag that put the gap's middle at `pos` (along the
+/// arrangement's axis, in `area`).
+pub fn split_at(a: Arrange, area: Rect, gap: i32, pos: i32) -> u8 {
+    let (start, along) = if a.stacked {
+        (area.y, area.h)
+    } else {
+        (area.x, area.w)
+    };
+    let room = (along - gap).max(1);
+    let first = (pos - start - gap / 2).clamp(0, room);
+    let pct = (first * 100 / room) as u8;
+    let pct = if a.swapped { 100 - pct } else { pct };
+    pct.clamp(MIN_SPLIT, 100 - MIN_SPLIT)
 }
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::indexing_slicing)]
 mod tests {
     use super::*;
-    use ferossh_ipc::{FileAttrs, Message, SftpOp, SftpReply};
-    use ferossh_render::Theme;
+    use ferossh_ipc::FileAttrs;
 
-    fn entry(name: &str, dir: bool, size: u64) -> DirEntry {
+    fn entry(name: &str, mode: u32, size: u64) -> DirEntry {
         DirEntry {
             name: name.as_bytes().to_vec(),
             attrs: FileAttrs {
                 size: Some(size),
-                permissions: Some(if dir { 0o040755 } else { 0o100644 }),
-                mtime: None,
+                permissions: Some(mode),
+                mtime: Some(1_762_700_000),
             },
         }
     }
 
-    /// A remote that is open and lists /home/me.
-    fn remote() -> Remote {
-        let mut r = Remote::new("me@host:22");
-        r.attach(7, 1);
-        r.on_message(Message::SftpReady {
-            channel: 7,
-            home: b"/home/me".to_vec(),
-        });
-        let list = r
-            .take_outbox()
-            .into_iter()
-            .find_map(|m| match m {
-                Message::SftpRequest {
-                    id,
-                    op: SftpOp::List { .. },
-                    ..
-                } => Some(id),
-                _ => None,
-            })
-            .unwrap();
-        r.on_message(Message::SftpReply {
-            channel: 7,
-            id: list,
-            reply: SftpReply::Entries {
-                entries: vec![entry("notes.txt", false, 1500), entry("src", true, 0)],
-                last: true,
-            },
-        });
-        r
-    }
-
-    fn texts(v: &mut FilesView, r: Option<&Remote>, rows: usize) -> Vec<String> {
-        texts_in(v, r, rows, Path::new("dl"))
-    }
-
-    fn texts_in(v: &mut FilesView, r: Option<&Remote>, rows: usize, local: &Path) -> Vec<String> {
-        let mut grid = Grid::new(60, rows);
-        v.draw(
-            &mut grid,
-            &Palette::of(&Theme::default()),
-            true,
-            r,
-            Follow::On,
-            local,
-        );
-        (0..rows)
-            .map(|y| {
-                grid.row(y)
-                    .unwrap()
-                    .iter()
-                    .map(|c| c.ch)
-                    .collect::<String>()
-                    .trim_end()
-                    .to_owned()
-            })
-            .collect()
+    fn listing(path: &str) -> Listing {
+        let mut l = Listing::default();
+        l.path = path.as_bytes().to_vec();
+        l.entries = vec![
+            entry("zeta.txt", 0o100_644, 10),
+            entry("Alpha", 0o040_755, 4096),
+            entry("link", 0o120_777, 7),
+            entry("beta.log", 0o100_600, 2048),
+        ];
+        l
     }
 
     #[test]
-    fn lists_folders_first() {
-        let mut v = FilesView::default();
-        let r = remote();
-        let t = texts(&mut v, Some(&r), 10);
-        assert!(t[0].starts_with(" Files  me@host:22"), "{:?}", t[0]);
-        assert!(t[0].ends_with("follows cd"));
-        assert_eq!(t[1], " /home/me");
-        assert_eq!(t[2], " ▴ ..");
-        assert_eq!(t[3], " ▸ src/");
-        assert!(
-            t[4].starts_with("   notes.txt") && t[4].ends_with("1.5 KB"),
-            "{:?}",
-            t[4]
-        );
-        assert!(t[9].contains("Enter open"));
+    fn remote_rows_put_folders_first_then_names() {
+        let rows = remote_rows(&listing("/etc"), "");
+        let names: Vec<_> = rows.iter().map(|r| r.name.as_str()).collect();
+        assert_eq!(names, ["..", "Alpha", "link", "beta.log", "zeta.txt"]);
+        assert!(rows[0].up && rows[1].dir && rows[2].dir && !rows[3].dir);
+        assert_eq!(rows[1].size, None);
+        assert_eq!(rows[3].size, Some(2048));
+        assert_eq!(rows[1].rights, "drwxr-xr-x");
+        assert_eq!(rows[3].rights, "-rw-------");
+        assert_eq!(rows[2].rights, "lrwxrwxrwx");
+        assert_eq!(rows[4].key, b"zeta.txt");
     }
 
     #[test]
-    fn without_a_host() {
-        let mut v = FilesView::default();
-        let t = texts(&mut v, None, 5);
-        assert!(t[1].contains("Connect a pane"));
-        let d = Path::new("dl");
-        assert_eq!(v.key(None, SideKey::Escape, d, 5), Some(FilesAction::Leave));
+    fn the_root_has_no_up_row_and_a_filter_hides_it() {
+        assert!(!remote_rows(&listing("/"), "")[0].up);
+        let rows = remote_rows(&listing("/etc"), "TXT");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].name, "zeta.txt");
+        let rows = remote_rows(&listing("/etc"), "*.log");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].name, "beta.log");
     }
 
     #[test]
-    fn keys_browse_and_ask() {
-        let mut v = FilesView::default();
-        let mut r = remote();
-        let d = Path::new("dl");
-        // Down to src and in.
-        v.key(Some(&mut r), SideKey::Down, d, 10);
-        v.key(Some(&mut r), SideKey::Enter { split: false }, d, 10);
-        let asked = r.take_outbox();
-        assert!(
-            asked.iter().any(|m| matches!(m, Message::SftpRequest {
-                op: SftpOp::List { path }, ..
-            } if path == b"/home/me/src")),
-            "{asked:?}"
-        );
-        // Backspace goes up.
-        v.key(Some(&mut r), SideKey::Backspace, d, 10);
-        assert!(
-            r.take_outbox()
-                .iter()
-                .any(|m| matches!(m, Message::SftpRequest {
-            op: SftpOp::List { path }, ..
-        } if path == b"/home"))
-        );
-        // Del on a file asks the window first.
-        v.key(Some(&mut r), SideKey::Down, d, 10);
-        assert_eq!(
-            v.key(Some(&mut r), SideKey::Delete, d, 10),
-            Some(FilesAction::Delete(entry("notes.txt", false, 1500)))
-        );
-        assert_eq!(
-            v.key(Some(&mut r), SideKey::Char('u'), d, 10),
-            Some(FilesAction::PickUpload(b"/home/me".to_vec()))
-        );
-        assert_eq!(
-            v.key(Some(&mut r), SideKey::Escape, d, 10),
-            Some(FilesAction::Leave)
-        );
+    fn filtering_shown_rows_drops_the_up_row() {
+        let rows = remote_rows(&listing("/etc"), "");
+        assert_eq!(filtered(&rows, ""), rows);
+        let got = filtered(&rows, "a");
+        let names: Vec<_> = got.iter().map(|r| r.name.as_str()).collect();
+        assert_eq!(names, ["Alpha", "beta.log", "zeta.txt"]);
     }
 
     #[test]
-    fn queue_shows_and_controls_jobs() {
+    fn entries_are_found_by_name() {
+        let l = listing("/etc");
+        let got = entries_named(&l, &[b"beta.log".to_vec(), b"Alpha".to_vec()]);
+        let names: Vec<_> = got.iter().map(|e| e.name.clone()).collect();
+        assert_eq!(names, [b"Alpha".to_vec(), b"beta.log".to_vec()]);
+    }
+
+    #[test]
+    fn local_rows_list_a_folder_and_follow_the_download_folder() {
         let dir = std::env::temp_dir().join(format!("ferossh-files-{}", std::process::id()));
-        let mut v = FilesView::default();
-        let mut r = remote();
-        // Select notes.txt and download it.
-        v.key(Some(&mut r), SideKey::End, &dir, 12);
-        v.key(Some(&mut r), SideKey::Char('d'), &dir, 12);
-        assert_eq!(r.jobs().len(), 1);
-        let t = texts(&mut v, Some(&r), 12);
-        let title = t.iter().position(|l| l.starts_with(" Transfers")).unwrap();
-        assert!(t[title + 1].starts_with(" ↓ notes.txt"), "{t:?}");
-        // Past Local PC into the queue; pause and resume.
-        v.key(Some(&mut r), SideKey::Tab, &dir, 12);
-        v.key(Some(&mut r), SideKey::Tab, &dir, 12);
-        v.key(Some(&mut r), SideKey::Char(' '), &dir, 12);
-        assert_eq!(r.jobs()[0].state, State::Paused);
-        let t = texts(&mut v, Some(&r), 12);
-        assert!(t[title + 1].ends_with("paused 0%"), "{:?}", t[title + 1]);
-        assert!(t[11].contains("Space pause"));
-        v.key(Some(&mut r), SideKey::Char('p'), &dir, 12);
-        assert_ne!(r.jobs()[0].state, State::Paused);
-        v.key(Some(&mut r), SideKey::Char('x'), &dir, 12);
-        assert_eq!(r.jobs()[0].state, State::Cancelled);
-        v.key(Some(&mut r), SideKey::Char('c'), &dir, 12);
-        assert!(r.jobs().is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("sub")).unwrap();
+        std::fs::write(dir.join("a.txt"), b"12345").unwrap();
+        let mut pane = LocalPane::default();
+        assert!(pane.sync(&dir, 0));
+        assert!(!pane.sync(&dir, 0));
+        let rows = local_rows(&pane.listing, "");
+        let names: Vec<_> = rows.iter().map(|r| r.name.as_str()).collect();
+        assert_eq!(names, ["..", "sub", "a.txt"]);
+        assert_eq!(rows[2].size, Some(5));
+        assert!(rows[2].modified.is_some());
+        assert_eq!(rows[2].local.as_deref(), Some(dir.join("a.txt").as_path()));
+        // A download landed: read again.
+        std::fs::write(dir.join("b.txt"), b"1").unwrap();
+        assert!(pane.sync(&dir, 1));
+        assert_eq!(local_rows(&pane.listing, "b.").len(), 1);
+        pane.enter(&dir.join("sub")).unwrap();
+        assert_eq!(pane.dir(), Some(dir.join("sub").as_path()));
+        assert_eq!(pane.up().unwrap(), Some(dir.join("sub")));
+        assert_eq!(pane.dir(), Some(dir.as_path()));
+        assert!(pane.enter(&dir.join("missing")).is_err());
+        assert_eq!(pane.dir(), Some(dir.as_path()));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
-    fn clicks_select_and_open() {
-        let mut v = FilesView::default();
-        let mut r = remote();
-        let d = Path::new("dl");
-        assert_eq!(v.click(Some(&mut r), 3, 3, false, d, 10), None);
-        assert_eq!(v.selected, 1);
-        r.take_outbox();
-        v.click(Some(&mut r), 3, 3, true, d, 10);
-        assert!(
-            r.take_outbox()
-                .iter()
-                .any(|m| matches!(m, Message::SftpRequest {
-            op: SftpOp::List { path }, ..
-        } if path == b"/home/me/src"))
-        );
+    fn arrange_splits_the_room_and_swaps() {
+        let area = Rect::new(0, 0, 410, 300);
+        let a = Arrange::default();
+        let (l, g, r) = arrange(a, area, 10);
+        assert_eq!((l.x, l.w, g.x, g.w, r.x, r.w), (0, 200, 200, 10, 210, 200));
+        let swapped = Arrange {
+            swapped: true,
+            split: 25,
+            ..a
+        };
+        let (l, _, r) = arrange(swapped, area, 10);
+        // Remote first, with a quarter of the room.
+        assert_eq!((r.x, r.w, l.x, l.w), (0, 100, 110, 300));
+        let stacked = Arrange { stacked: true, ..a };
+        let (l, g, r) = arrange(stacked, Rect::new(0, 0, 400, 210), 10);
+        assert_eq!((l.y, l.h, g.y, r.y, r.h), (0, 100, 100, 110, 100));
+        assert_eq!(stacked.arrows(), ("↓", "↑"));
+        assert_eq!(swapped.arrows(), ("←", "→"));
     }
 
     #[test]
-    fn geometry_fits() {
-        let g = geometry(20, 3, true, Sizes::default());
-        assert_eq!(g.footer, 19);
-        assert_eq!(g.question, Some(17));
-        assert_eq!(g.queue, Some((13, 14, 3)));
-        assert_eq!(g.local, Some((7, 8, 5)));
-        assert_eq!(g.list, (2, 5));
-        // A tall pane gives Local PC a quarter, up to eight rows.
-        let g = geometry(60, 0, false, Sizes::default());
-        assert_eq!(g.local, Some((50, 51, 8)));
-        assert_eq!(g.list, (2, 48));
-        // Too small for the queue and Local PC: the listing keeps what
-        // there is.
-        let g = geometry(4, 3, true, Sizes::default());
-        assert_eq!(g.queue, None);
-        assert_eq!(g.local, None);
-        assert_eq!(g.list, (2, 1));
-    }
-
-    /// A local folder with a subfolder and a file.
-    fn local_dir(tag: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("ferossh-files-{tag}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(dir.join("photos")).unwrap();
-        std::fs::write(dir.join("report.pdf"), vec![0u8; 2048]).unwrap();
-        dir
+    fn dragging_the_gap_sets_the_split_within_limits() {
+        let area = Rect::new(0, 0, 410, 300);
+        let a = Arrange::default();
+        assert_eq!(split_at(a, area, 10, 105), 25);
+        assert_eq!(split_at(a, area, 10, 0), MIN_SPLIT);
+        assert_eq!(split_at(a, area, 10, 400), 100 - MIN_SPLIT);
+        let swapped = Arrange { swapped: true, ..a };
+        assert_eq!(split_at(swapped, area, 10, 105), 75);
     }
 
     #[test]
-    fn local_pc_sits_between_files_and_transfers() {
-        let dir = local_dir("between");
-        let mut v = FilesView::default();
-        let mut r = remote();
-        // Download notes.txt so the queue shows.
-        v.key(Some(&mut r), SideKey::End, &dir, 20);
-        v.key(Some(&mut r), SideKey::Char('d'), &dir, 20);
-        let t = texts_in(&mut v, Some(&r), 20, &dir);
-        let files = t
-            .iter()
-            .position(|l| l.starts_with("   notes.txt"))
-            .unwrap();
-        let local = t.iter().position(|l| l.starts_with(" Local PC")).unwrap();
-        let transfers = t.iter().position(|l| l.starts_with(" Transfers")).unwrap();
-        assert!(files < local && local < transfers, "{t:?}");
-        assert!(
-            t[local].ends_with(&*dir.file_name().unwrap().to_string_lossy()),
-            "{:?}",
-            t[local]
-        );
-        assert_eq!(t[local + 1], " ▴ ..");
-        assert_eq!(
-            t[local + 2],
-            format!(" ▸ photos{}", std::path::MAIN_SEPARATOR)
-        );
-        assert!(t[local + 3].starts_with("   report.pdf") && t[local + 3].ends_with("2.0 KB"));
-        let _ = std::fs::remove_dir_all(&dir);
+    fn the_layout_setting_round_trips() {
+        let a = Arrange {
+            stacked: true,
+            swapped: true,
+            split: 40,
+        };
+        assert_eq!(a.to_setting(), "stacked swapped 40");
+        assert_eq!(Arrange::parse(&a.to_setting()), a);
+        assert_eq!(Arrange::parse("side 3").split, MIN_SPLIT);
+        assert_eq!(Arrange::parse("nonsense"), Arrange::default());
     }
 
     #[test]
-    fn local_pc_browses_and_uploads() {
-        let dir = local_dir("browse");
-        let mut v = FilesView::default();
-        let mut r = remote();
-        texts_in(&mut v, Some(&r), 20, &dir);
-        // Tab moves to Local PC; Down to photos; Enter goes in.
-        v.key(Some(&mut r), SideKey::Tab, &dir, 20);
-        assert_eq!(v.focus, Focus::Local);
-        let t = texts_in(&mut v, Some(&r), 20, &dir);
-        assert!(t[19].contains("B choose folder"), "{:?}", t[19]);
-        v.key(Some(&mut r), SideKey::Down, &dir, 20);
-        assert_eq!(
-            v.key(Some(&mut r), SideKey::Enter { split: false }, &dir, 20),
-            Some(FilesAction::SetLocal(dir.join("photos")))
-        );
-        let photos = dir.join("photos");
-        let t = texts_in(&mut v, Some(&r), 20, &photos);
-        let local = t.iter().position(|l| l.starts_with(" Local PC")).unwrap();
-        assert!(t[local].ends_with("photos"), "{:?}", t[local]);
-        assert_eq!(t[local + 2], " (empty)");
-        // Backspace goes back up, with the folder we came from selected.
-        assert_eq!(
-            v.key(Some(&mut r), SideKey::Backspace, &photos, 20),
-            Some(FilesAction::SetLocal(dir.clone()))
-        );
-        assert_eq!(v.local.selected, 1);
-        // U (or Enter on a file) uploads into the listed remote folder.
-        v.key(Some(&mut r), SideKey::Down, &dir, 20);
-        let up = Some(FilesAction::Upload {
-            paths: vec![dir.join("report.pdf")],
-            dir: b"/home/me".to_vec(),
-        });
-        assert_eq!(v.key(Some(&mut r), SideKey::Char('u'), &dir, 20), up);
-        assert_eq!(
-            v.key(Some(&mut r), SideKey::Enter { split: false }, &dir, 20),
-            up
-        );
-        assert_eq!(
-            v.key(Some(&mut r), SideKey::Char('b'), &dir, 20),
-            Some(FilesAction::PickLocal)
-        );
-        // Tab with no queue goes back to the files.
-        v.key(Some(&mut r), SideKey::Tab, &dir, 20);
-        assert_eq!(v.focus, Focus::List);
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn local_pc_clicks_and_follows_the_download_folder() {
-        let dir = local_dir("click");
-        let mut v = FilesView::default();
-        let mut r = remote();
-        let t = texts_in(&mut v, Some(&r), 20, &dir);
-        let local = t.iter().position(|l| l.starts_with(" Local PC")).unwrap();
-        // The title picks another folder; a row selects; a double click
-        // on a folder opens it.
-        assert_eq!(
-            v.click(Some(&mut r), 3, local, false, &dir, 20),
-            Some(FilesAction::PickLocal)
-        );
-        assert_eq!(v.click(Some(&mut r), 3, local + 3, false, &dir, 20), None);
-        assert_eq!(v.focus, Focus::Local);
-        assert_eq!(v.local.selected, 2);
-        assert_eq!(
-            v.click(Some(&mut r), 3, local + 2, true, &dir, 20),
-            Some(FilesAction::SetLocal(dir.join("photos")))
-        );
-        // A new download folder (the picker, Settings) is listed at once,
-        // and another host keeps it.
-        v.reset();
-        let t = texts_in(&mut v, Some(&r), 20, &dir.join("photos"));
-        assert!(t[local].ends_with("photos"), "{:?}", t[local]);
-        let t = texts_in(&mut v, Some(&r), 20, &dir);
-        assert_eq!(
-            t[local + 2],
-            format!(" ▸ photos{}", std::path::MAIN_SEPARATOR)
-        );
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn slash_searches_the_listing() {
-        let mut v = FilesView::default();
-        let mut r = remote();
-        let d = Path::new("dl");
-        texts(&mut v, Some(&r), 10);
-        v.key(Some(&mut r), SideKey::Char('/'), d, 10);
-        assert!(v.typing());
-        // Letters type, even command letters; ".." goes while searching.
-        for c in "NO".chars() {
-            assert_eq!(v.key(Some(&mut r), SideKey::Char(c), d, 10), None);
-        }
-        let t = texts(&mut v, Some(&r), 10);
-        assert!(
-            t[1].starts_with(" /home/me") && t[1].ends_with("/ NO▏"),
-            "{:?}",
-            t[1]
-        );
-        assert!(t[2].starts_with("   notes.txt"), "{t:?}");
-        assert_eq!(t[3], "");
-        assert!(t[9].contains("Type to search"), "{:?}", t[9]);
-        assert!(r.jobs().is_empty());
-        // Enter ends the typing and keeps the search; keys work again.
-        v.key(Some(&mut r), SideKey::Enter { split: false }, d, 10);
-        assert!(!v.typing());
-        let t = texts(&mut v, Some(&r), 10);
-        assert!(t[1].ends_with("/ NO"), "{:?}", t[1]);
-        assert_eq!(
-            v.key(Some(&mut r), SideKey::Delete, d, 10),
-            Some(FilesAction::Delete(entry("notes.txt", false, 1500)))
-        );
-        // Nothing matching says so; a wildcard matches whole names.
-        v.key(Some(&mut r), SideKey::Char('/'), d, 10);
-        v.key(Some(&mut r), SideKey::Char('x'), d, 10);
-        assert_eq!(texts(&mut v, Some(&r), 10)[2], " (nothing matches)");
-        // "NOx", then Backspace on the empty search.
-        for _ in 0..4 {
-            v.key(Some(&mut r), SideKey::Backspace, d, 10);
-        }
-        assert!(!v.typing(), "Backspace on an empty search stops typing");
-        v.key(Some(&mut r), SideKey::Char('/'), d, 10);
-        for c in "s*".chars() {
-            v.key(Some(&mut r), SideKey::Char(c), d, 10);
-        }
-        let t = texts(&mut v, Some(&r), 10);
-        assert_eq!(t[2], " ▸ src/");
-        assert_eq!(t[3], "");
-        // Escape while typing clears the search; then Escape leaves.
-        v.key(Some(&mut r), SideKey::Escape, d, 10);
-        assert!(!v.typing());
-        assert_eq!(texts(&mut v, Some(&r), 10)[2], " ▴ ..");
-        // Escape with a search kept clears it before it leaves.
-        v.key(Some(&mut r), SideKey::Char('/'), d, 10);
-        v.key(Some(&mut r), SideKey::Char('t'), d, 10);
-        v.key(Some(&mut r), SideKey::Enter { split: false }, d, 10);
-        assert_eq!(v.key(Some(&mut r), SideKey::Escape, d, 10), None);
-        assert_eq!(texts(&mut v, Some(&r), 10)[1], " /home/me");
-        assert_eq!(
-            v.key(Some(&mut r), SideKey::Escape, d, 10),
-            Some(FilesAction::Leave)
-        );
-    }
-
-    #[test]
-    fn another_folder_ends_the_search() {
-        let mut v = FilesView::default();
-        let mut r = remote();
-        let d = Path::new("dl");
-        texts(&mut v, Some(&r), 10);
-        v.key(Some(&mut r), SideKey::Char('/'), d, 10);
-        v.key(Some(&mut r), SideKey::Char('s'), d, 10);
-        v.key(Some(&mut r), SideKey::Enter { split: false }, d, 10);
-        // Enter on the match opens it.
-        r.take_outbox();
-        v.key(Some(&mut r), SideKey::Enter { split: false }, d, 10);
-        let list = r
-            .take_outbox()
-            .into_iter()
-            .find_map(|m| match m {
-                Message::SftpRequest {
-                    id,
-                    op: SftpOp::List { path },
-                    ..
-                } if path == b"/home/me/src" => Some(id),
-                _ => None,
-            })
-            .unwrap();
-        r.on_message(Message::SftpReply {
-            channel: 7,
-            id: list,
-            reply: SftpReply::Entries {
-                entries: vec![entry("main.rs", false, 10)],
-                last: true,
-            },
-        });
-        let t = texts(&mut v, Some(&r), 10);
-        assert_eq!(t[1], " /home/me/src");
-        assert_eq!(t[2], " ▴ ..");
-        assert!(t[3].starts_with("   main.rs"), "{t:?}");
-    }
-
-    #[test]
-    fn slash_searches_the_local_pc_section() {
-        let dir = local_dir("search");
-        let mut v = FilesView::default();
-        let mut r = remote();
-        texts_in(&mut v, Some(&r), 20, &dir);
-        v.key(Some(&mut r), SideKey::Tab, &dir, 20);
-        v.key(Some(&mut r), SideKey::Char('/'), &dir, 20);
-        for c in "PDF".chars() {
-            v.key(Some(&mut r), SideKey::Char(c), &dir, 20);
-        }
-        let t = texts_in(&mut v, Some(&r), 20, &dir);
-        let local = t.iter().position(|l| l.starts_with(" Local PC")).unwrap();
-        assert!(t[local].starts_with(" Local PC  / PDF▏"), "{:?}", t[local]);
-        assert!(t[local + 1].starts_with("   report.pdf"), "{t:?}");
-        assert_eq!(t[local + 2], "");
-        // The remote listing is not searched.
-        assert_eq!(t[2], " ▴ ..");
-        v.key(Some(&mut r), SideKey::Enter { split: false }, &dir, 20);
-        assert_eq!(
-            v.key(Some(&mut r), SideKey::Char('u'), &dir, 20),
-            Some(FilesAction::Upload {
-                paths: vec![dir.join("report.pdf")],
-                dir: b"/home/me".to_vec(),
-            })
-        );
-        // Escape clears it, then leaves.
-        assert_eq!(v.key(Some(&mut r), SideKey::Escape, &dir, 20), None);
-        let t = texts_in(&mut v, Some(&r), 20, &dir);
-        assert_eq!(t[local], format!(" Local PC{}", &t[local][9..]));
-        assert_eq!(t[local + 1], " ▴ ..");
-        assert_eq!(
-            v.key(Some(&mut r), SideKey::Escape, &dir, 20),
-            Some(FilesAction::Leave)
-        );
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn dividers_drag_up_and_down() {
-        let dir = local_dir("dividers");
-        let mut v = FilesView::default();
-        let mut r = remote();
-        v.key(Some(&mut r), SideKey::End, &dir, 30);
-        v.key(Some(&mut r), SideKey::Char('d'), &dir, 30);
-        let t = texts_in(&mut v, Some(&r), 30, &dir);
-        let local = t.iter().position(|l| l.starts_with(" Local PC")).unwrap();
-        let queue = t.iter().position(|l| l.starts_with(" Transfers")).unwrap();
-        assert_eq!(v.divider_at(Some(&r), local, 30), Some(Divider::Local));
-        assert_eq!(v.divider_at(Some(&r), queue, 30), Some(Divider::Queue));
-        assert_eq!(v.divider_at(Some(&r), local + 1, 30), None);
-        // Up five rows: Local PC is five rows taller, the queue stays.
-        v.drag_divider(Some(&r), Divider::Local, local - 5, 30);
-        let t = texts_in(&mut v, Some(&r), 30, &dir);
-        assert!(t[local - 5].starts_with(" Local PC"), "{t:?}");
-        assert!(t[queue].starts_with(" Transfers"), "{t:?}");
-        // As far up as it goes, the listing keeps one row.
-        v.drag_divider(Some(&r), Divider::Local, 0, 30);
-        let t = texts_in(&mut v, Some(&r), 30, &dir);
-        assert!(t[HEADER + 1].starts_with(" Local PC"), "{t:?}");
-        // The queue's divider up: the queue grows into Local PC, whose
-        // title stays.
-        v.drag_divider(Some(&r), Divider::Queue, queue - 4, 30);
-        let t = texts_in(&mut v, Some(&r), 30, &dir);
-        assert!(t[HEADER + 1].starts_with(" Local PC"), "{t:?}");
-        assert!(t[queue - 4].starts_with(" Transfers"), "{t:?}");
-        // Down as far as it goes: the queue keeps one row.
-        let footer = 29;
-        v.drag_divider(Some(&r), Divider::Queue, 100, 30);
-        let t = texts_in(&mut v, Some(&r), 30, &dir);
-        assert!(t[footer - 2].starts_with(" Transfers"), "{t:?}");
-        assert!(t[footer - 1].starts_with(" ↓ notes.txt"), "{t:?}");
-        // To the top, it pushes Local PC up to one row; Local PC keeps
-        // its title row and a row, the listing one row.
-        v.drag_divider(Some(&r), Divider::Queue, 0, 30);
-        let t = texts_in(&mut v, Some(&r), 30, &dir);
-        assert!(t[HEADER + 1].starts_with(" Local PC"), "{t:?}");
-        assert!(t[HEADER + 3].starts_with(" Transfers"), "{t:?}");
-        // Another host keeps the heights.
-        v.reset();
-        let t = texts_in(&mut v, Some(&r), 30, &dir);
-        assert!(t[HEADER + 3].starts_with(" Transfers"), "{t:?}");
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn tail_keeps_the_end() {
-        assert_eq!(tail("C:\\Users\\me\\Downloads", 11), "…\\Downloads");
-        assert_eq!(tail("short", 12), "short");
-        assert_eq!(tail("abc", 0), "");
+    fn rights_read_like_ls() {
+        assert_eq!(rights(Some(0o100_755)), "-rwxr-xr-x");
+        assert_eq!(rights(None), "");
     }
 }
