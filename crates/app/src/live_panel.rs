@@ -611,6 +611,15 @@ fn show(h: Handles, from_search: bool) {
     }
 }
 
+/// Whether a `WM_COMMAND` came from the panel's own search box or
+/// buttons, or from the dialog keys (Enter, Escape), which send none.
+/// The list passes its name edit's notifications on to us too, and that
+/// box's id can be IDOK: its first change (one typed character) read as
+/// Enter, showed the session and ended the rename.
+fn ours(h: Handles, from: HWND) -> bool {
+    from.is_invalid() || from == h.search || h.buttons.contains(&from)
+}
+
 fn command(h: Handles, id: usize, code: u32) {
     match (id, code) {
         (ID_SEARCH, EN_CHANGE) => emit(Event::Query(search_text(h.search))),
@@ -852,7 +861,10 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
         }
         (WM_ERASEBKGND, _) => LRESULT(1),
         (WM_COMMAND, Some(h)) => {
-            command(h, wparam.0 & 0xFFFF, ((wparam.0 >> 16) & 0xFFFF) as u32);
+            let from = HWND(lparam.0 as *mut _);
+            if ours(h, from) {
+                command(h, wparam.0 & 0xFFFF, ((wparam.0 >> 16) & 0xFFFF) as u32);
+            }
             LRESULT(0)
         }
         (WM_NOTIFY, Some(h)) => notify(h, lparam),
