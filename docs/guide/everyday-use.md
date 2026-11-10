@@ -110,7 +110,7 @@ Some devices want answers after the login: a second user name, `enable`, `termin
 | `secret enable` | Types a named secret (see below). |
 | `pause 2` | Waits 2 seconds. |
 
-A login script can use every step of a script, without the `@`: `on`, `goto`, `if`, `timeout` and the others below (see [Logic](#logic-expect-style)), so one script can answer a host-key question or a second password only when the device asks.
+A login script can use the logic steps of a script, without the `@`: `on`, `goto`, `if`, `timeout` and the others below (see [Logic](#logic-expect-style)), so one script can answer an `enable` password or a second login only when the device asks. It types into its own pane only, so `pane` and `tab` moves are for scripts, a line to type needs `send` in front, and variables such as `${host}` are not filled in.
 
 The script runs once after an SSH or Telnet login, or when a serial port opens; tmux attaches after it. Pressing any key stops it, and Session > Run login script again starts it over. What it types is never broadcast.
 
@@ -152,8 +152,8 @@ Like Expect or Tera Term macros, a script can wait for one of several answers, b
 
 | Step | Does |
 | --- | --- |
-| `@on (yes/no)? goto hostkey` | Waits for one of several texts: the `@on` lines in a row wait together, and the first text the host prints goes to its label. An `@on` without `goto` goes on after the last of them. |
-| `@label hostkey` | A place to go to. Labels are letters, digits, `_` and `-`, each used once. |
+| `@on [confirm] goto confirm` | Waits for one of several texts: the `@on` lines in a row wait together, and the first text the host prints goes to its label. An `@on` without `goto` goes on after the last of them. |
+| `@label confirm` | A place to go to. Labels are letters, digits, `_` and `-`, each used once. |
 | `@goto login` | Goes on at that label. |
 | `@timeout 60` | How long the `@expect`, `@capture` and `@on` steps after it wait (15 seconds until set, up to 3600). |
 | `@timeout 30 goto slow` | The same, and a step that times out goes to the label instead of stopping the script. |
@@ -166,31 +166,31 @@ Like Expect or Tera Term macros, a script can wait for one of several answers, b
 
 `@capture` keeps its value in `${captured}` too, so a later line can type it or test it. A variable holds one line of text: what the host prints can fill in a value but never becomes a key, a step or a second line.
 
-For example, a login that answers a host-key question only when it comes, and gives up after three wrong passwords:
+For example, to back up a switch's configuration, answering its questions in whatever order they come and saying how it went:
 
 ```
-@timeout 20 goto slow
-@label login
-@on (yes/no)? goto hostkey
-@on assword: goto pw
-@on $
-@show Logged in to ${host}
+@timeout 30 goto slow
+copy running-config tftp://10.0.0.5/${host}.cfg
+@label ask
+@on Address or name of remote host goto confirm
+@on Destination filename goto confirm
+@on bytes copied goto done
+@on Error goto failed
+@label confirm
+@add answers 1
+@if ${answers} > 5 goto failed
+@key enter
+@goto ask
+@label done
+@show Saved ${host}
 @stop
-@label hostkey
-yes
-@goto login
-@label pw
-@add tries 1
-@if ${tries} > 3 goto give_up
-@password
-@goto login
-@label give_up
-@fail the password was refused three times
+@label failed
+@fail the copy failed on ${host}
 @label slow
-@fail no prompt within 20 seconds
+@fail no answer within 30 seconds
 ```
 
-A script with logic needs no extra program: it runs in FeroSSH itself, on what the pane shows, and can only type into its own pane. A loop that runs 1000 steps without waiting for the host, a pause or a delay stops with a message, and any key you press stops a script. The editor checks that every `goto` has its label before it saves. Logic and `@pane`/`@tab` moves do not mix in one script.
+A script with logic needs no extra program: it runs in FeroSSH itself, on what the pane shows, and can only type into its own pane. A loop that runs 1000 steps without waiting for the host, a pause or a delay stops with a message, and any key you press stops a script. The editor checks that every `goto` has its label before it saves. Logic and `@pane`/`@tab` moves do not mix in one script; a `@capture` before a move does, and its `${captured}` is filled in after it.
 
 For example, to start a capture on one host and a ping from the host beside it:
 
@@ -234,7 +234,7 @@ scripts\
             Save config.script
 ```
 
-Scripts used to be called snippets. The first time this version starts, it renames the old `%APPDATA%\FeroSSH\snippets` folder to `scripts`, and `.snippet` files are still read as they are; one is saved as `.script` the next time you edit it.
+Scripts used to be called snippets. The first time this version starts, it renames the old `%APPDATA%\FeroSSH\snippets` folder to `scripts` (when a `scripts` folder is there already, the old files move into it, and one whose name is taken there stays behind in `snippets`). `.snippet` files are still read as they are; one is saved as `.script` the next time you edit it.
 
 To take scripts to another PC, copy the files or folders into that PC's scripts folder; FeroSSH reads the folder again each time the scripts pane opens. The files are plain text (see [Settings](settings.md#scripts)), so they can go in git or be shared with a team. Scripts an older FeroSSH kept in `ferossh.conf` move to the folder by themselves at the first start, and a copy of the old file stays as `ferossh.conf.before-snippets-folder`.
 

@@ -159,6 +159,12 @@ impl Runner {
         out
     }
 
+    /// `step` with the variables set so far filled in, for the part of a
+    /// script that runs in another pane after a move.
+    pub fn fill(&self, step: Step) -> Step {
+        step.map_text(|t| self.subst(t))
+    }
+
     /// Keeps a variable's value, one line of at most [`MAX_VAR_LEN`]
     /// characters; `false` when the script has too many.
     fn set_var(&mut self, name: &str, value: &str) -> bool {

@@ -5440,6 +5440,20 @@ impl Window {
                         {
                             next = None;
                         }
+                        // The part after a move types what was captured
+                        // before it, up to its own next capture, whose
+                        // value its own runner fills in.
+                        next = next.map(|(r, name, rest)| {
+                            let mut captured = false;
+                            let rest = rest
+                                .into_iter()
+                                .map(|s| {
+                                    captured |= matches!(s, Step::Capture(_));
+                                    if captured { s } else { run.runner.fill(s) }
+                                })
+                                .collect();
+                            (r, name, rest)
+                        });
                         if run.report
                             && let Some(row) =
                                 self.snippets_view.report_mut().and_then(|r| r.row_mut(id))
