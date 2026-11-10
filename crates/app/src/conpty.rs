@@ -80,7 +80,12 @@ impl std::fmt::Debug for Shell {
 
 /// The command `Shell::spawn` runs when none is given.
 pub fn default_command() -> String {
-    std::env::var("COMSPEC").unwrap_or_else(|_| "cmd.exe".to_owned())
+    match std::env::var("COMSPEC") {
+        // A path with spaces must be quoted to stay one program.
+        Ok(c) if c.contains(' ') && !c.starts_with('"') => format!("\"{c}\""),
+        Ok(c) => c,
+        Err(_) => "cmd.exe".to_owned(),
+    }
 }
 
 /// Folders a bare program name is looked for in: System32 and Windows

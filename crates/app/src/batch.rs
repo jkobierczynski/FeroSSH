@@ -153,7 +153,10 @@ pub struct Report {
 /// Quoting alone does not stop Excel from running `"=cmd|…"`, and the
 /// values come from the servers' output.
 fn neutral(text: &str) -> String {
-    if text.trim_start().starts_with(['=', '+', '-', '@']) {
+    let t = text.trim();
+    // A plain signed number (`-42`, `+3.5`) stays a number.
+    let number = t.parse::<f64>().is_ok_and(f64::is_finite);
+    if !number && t.starts_with(['=', '+', '-', '@']) {
         format!("'{text}")
     } else {
         text.to_owned()
@@ -544,6 +547,14 @@ mod tests {
         assert_eq!(r.rows[1].state, RowState::Done);
         assert_eq!(r.rows[0].state, RowState::Queued);
         assert_eq!(r.rows[0].pane, None);
+    }
+
+    #[test]
+    fn signed_numbers_stay_numbers() {
+        assert_eq!(neutral("-42"), "-42");
+        assert_eq!(neutral(" +3.5"), " +3.5");
+        assert_eq!(neutral("-2+3"), "'-2+3");
+        assert_eq!(neutral("@SUM(A1)"), "'@SUM(A1)");
     }
 
     #[test]

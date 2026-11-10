@@ -351,9 +351,17 @@ pub fn report(file_name: &str, log: &[u8], chain: Option<&str>, index: Option<&s
         // A log the index lists had a chain: deleting it must not pass
         // for a log from before chains.
         let name = file_name.replace(char::is_whitespace, "_");
-        let listed = index
-            .and_then(|i| read_index(i).ok())
-            .is_some_and(|entries| entries.iter().any(|e| e.file_name == name));
+        let listed = match index.map(read_index) {
+            Some(Err(line)) => {
+                return format!(
+                    "WARNING: {file_name} has no chain file ({file_name}.chain), and the \
+                     log index ({INDEX_FILE}) was changed at line {line}, so it cannot \
+                     tell whether the log had one. The log cannot be checked."
+                );
+            }
+            Some(Ok(entries)) => entries.iter().any(|e| e.file_name == name),
+            None => false,
+        };
         if listed {
             return format!(
                 "WARNING: {file_name} has no chain file ({file_name}.chain), but the log \
@@ -524,6 +532,11 @@ mod tests {
         assert!(
             deleted.contains("WARNING") && deleted.contains("deleted"),
             "{deleted}"
+        );
+        let tampered = report("a.log", &log, None, Some(&index.replacen(' ', "  ", 1)));
+        assert!(
+            tampered.contains("WARNING") && tampered.contains("changed at line 1"),
+            "{tampered}"
         );
     }
 }

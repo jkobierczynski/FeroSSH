@@ -94,13 +94,20 @@ impl Recorder {
     fn enter(&mut self) {
         let line = std::mem::take(&mut self.line);
         let echoed = {
-            // Half the line is surely echoed by the time Enter is pressed.
-            let half: String = line
-                .trim()
-                .chars()
-                .take(line.trim().chars().count().div_ceil(2))
-                .collect();
-            half.is_empty() || self.echo.contains(&half)
+            // Half the line is surely echoed by the time Enter is pressed,
+            // and what the host printed after it agrees with the rest of
+            // the line as far as it goes. So a prompt that arrived after
+            // typing began (`password for admin: ` against `admin123`)
+            // does not pass for the echo.
+            let typed: Vec<char> = line.trim().chars().collect();
+            let half = typed.len().div_ceil(2);
+            let head: String = typed.iter().take(half).collect();
+            let rest = typed.get(half..).unwrap_or_default();
+            head.is_empty()
+                || self.echo.match_indices(&head).any(|(i, _)| {
+                    let after = self.echo.get(i + head.len()..).unwrap_or_default();
+                    after.chars().zip(rest).all(|(a, b)| a == *b)
+                })
         };
         if !echoed && !self.split {
             if self.out.lines.len() < MAX_LINES {
@@ -291,5 +298,16 @@ mod tests {
         let rec = r.finish();
         assert_eq!(rec.lines, ["@password"]);
         assert!(!rec.lines.iter().any(|l| l.contains("admin")));
+    }
+
+    #[test]
+    fn a_prompt_after_typing_began_is_not_the_echo() {
+        let mut r = Recorder::default();
+        r.output(b"[sudo] password for ");
+        typing(&mut r, "a", false);
+        r.output(b"admin: ");
+        typing(&mut r, "dmin123\r", false);
+        let rec = r.finish();
+        assert_eq!(rec.lines, ["@password"]);
     }
 }

@@ -32,10 +32,13 @@ pub fn resolve(command: &str, dirs: &[PathBuf]) -> Option<PathBuf> {
     if name.contains(['\\', '/', ':']) {
         return Some(PathBuf::from(name));
     }
-    let mut names = vec![name.to_owned()];
+    // CreateProcessW adds no `.exe` to an application name, so `tool.exe`
+    // goes before a `tool` next to it.
+    let mut names = Vec::new();
     if Path::new(name).extension().is_none() {
         names.push(format!("{name}.exe"));
     }
+    names.push(name.to_owned());
     dirs.iter()
         .filter(|d| is_absolute(d))
         .flat_map(|d| names.iter().map(move |n| d.join(n)))
@@ -80,6 +83,8 @@ mod tests {
         let planted = PathBuf::from("ferossh-program-test-planted");
         let dirs = vec![planted.clone(), sys.clone()];
         assert_eq!(resolve("cmd.exe /k", &dirs), Some(sys.join("cmd.exe")));
+        assert_eq!(resolve("wsl", &dirs), Some(sys.join("wsl.exe")));
+        std::fs::write(sys.join("wsl"), b"").unwrap();
         assert_eq!(resolve("wsl", &dirs), Some(sys.join("wsl.exe")));
         assert_eq!(resolve("nothere", &dirs), None);
         assert_eq!(resolve("cmd.exe", &[planted]), None);
