@@ -112,7 +112,7 @@ impl Entry {
             prefix: "Send",
             label: name.to_owned(),
             hint: first.to_owned(),
-            extra: format!("send snippet {}", lines.join(" ")),
+            extra: format!("send script {}", lines.join(" ")),
             on: false,
             kind: Kind::Snippet(index),
         }
@@ -436,7 +436,7 @@ impl CommandPalette {
             let hint = if focused && self.apps {
                 " Type a program and its arguments▏"
             } else if focused {
-                " Type an action, connection or snippet▏"
+                " Type an action, connection or script▏"
             } else {
                 " Ctrl+Shift+A to search"
             };

@@ -64,7 +64,7 @@ impl Found {
         let s = if n == 1 { "" } else { "s" };
         match &self.items {
             Items::Sessions(..) => format!("{n} session{s}"),
-            Items::Snippets(..) => format!("{n} snippet{s}"),
+            Items::Snippets(..) => format!("{n} script{s}"),
         }
     }
 
@@ -114,7 +114,7 @@ impl Found {
                     .get(i)
                     .map(|s| format!("{} is already a host", s.host.alias))
                     .unwrap_or_default(),
-                Items::Snippets(..) => "already a snippet in this category".to_owned(),
+                Items::Snippets(..) => "already a script in this category".to_owned(),
             }];
         }
         match &self.items {
@@ -277,7 +277,7 @@ impl ImportView {
             if self.found.is_empty() {
                 r.push(Row::Note(
                     if self.snippets {
-                        "No other program has snippets here."
+                        "No other program has scripts here."
                     } else {
                         "No other SSH client has sessions here."
                     }
@@ -296,10 +296,12 @@ impl ImportView {
                 r.push(Row::Note(
                     "SecureCRT ButtonBarV5.ini, MobaXterm.ini,".into(),
                 ));
-                r.push(Row::Note("a .snippet file, or a text file as one".into()));
+                r.push(Row::Note(
+                    "a .script or .snippet file, or a text file as one".into(),
+                ));
                 r.push(Row::Blank);
                 r.push(Row::Note(
-                    "Each becomes a file in the snippets folder.".into(),
+                    "Each becomes a file in the scripts folder.".into(),
                 ));
             } else {
                 r.push(Row::Note("WinSCP.ini, MobaXterm.ini, confCons.xml,".into()));
@@ -322,7 +324,7 @@ impl ImportView {
                 client.file_name(),
                 client.name()
             ),
-            Items::Snippets(..) => "Added to the snippets folder, by category.".to_owned(),
+            Items::Snippets(..) => "Added to the scripts folder, by category.".to_owned(),
         }));
         r
     }
@@ -511,7 +513,7 @@ impl ImportView {
         let bg = palette.strip;
         let title = match self.current() {
             Some(f) => format!(" Import from {}", f.name()),
-            None if self.snippets => " Import snippets".to_owned(),
+            None if self.snippets => " Import scripts".to_owned(),
             None => " Import connections".to_owned(),
         };
         grid.set_row(
@@ -788,12 +790,12 @@ mod tests {
             Vec::new(),
         );
         let t = texts(&mut v);
-        assert_eq!(t[0], " Import snippets");
-        assert_eq!(t[1], " ▸ Windows Terminal  2 snippets, settings.json");
+        assert_eq!(t[0], " Import scripts");
+        assert_eq!(t[1], " ▸ Windows Terminal  2 scripts, settings.json");
         v.key(SideKey::Enter { split: false }, 16);
         let t = texts(&mut v);
         assert_eq!(t[2], "     ps  Docker");
-        assert_eq!(t[3], "     already a snippet in this category");
+        assert_eq!(t[3], "     already a script in this category");
         assert_eq!(t[4], " [x] up  Docker");
         assert_eq!(t[5], "     › a");
         assert_eq!(t[8], "     … 1 more line");

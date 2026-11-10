@@ -3,7 +3,12 @@
 //! the app's own (`crates/app/src/login_script.rs`, compiled in here: the
 //! app is a binary, not a library). Nothing may panic, and what it types
 //! at the host is always the script's next `send` or secret, in order:
-//! host output can only make it wait, never type something else.
+//! host output can only make it wait, never type something else. A
+//! script with logic (`on`, `goto`, `if`, `set`...) may type its lines
+//! in any order and again, and one that captures fills in `${captured}`
+//! from the host's text: then each thing typed is still a key the script
+//! names, a secret, or one line of text with no control character in it,
+//! so the host can never type a key of its own through a captured value.
 
 #![no_main]
 
@@ -39,6 +44,14 @@ fuzz_target!(|data: &[u8]| {
         .filter_map(|l| Step::parse(l).ok())
         .take(16)
         .collect();
+    let jumps = steps
+        .iter()
+        .any(|s| s.is_flow() || matches!(s, Step::Capture(_)));
+    let keys: Vec<Vec<u8>> = steps
+        .iter()
+        .filter(|s| matches!(s, Step::Key(_)))
+        .filter_map(Step::bytes)
+        .collect();
     let mut expected = steps.iter().filter_map(|s| match s {
         Step::Send(_) | Step::Type(_) | Step::Key(_) => s.bytes(),
         Step::Password | Step::Secret(_) => Some(format!("{SECRET}\r").into_bytes()),
@@ -48,6 +61,7 @@ fuzz_target!(|data: &[u8]| {
         | Step::Delay(_)
         | Step::Pane(_)
         | Step::Tab(_) => None,
+        _ => None,
     });
 
     let start = Instant::now();
@@ -61,6 +75,15 @@ fuzz_target!(|data: &[u8]| {
     loop {
         for action in std::mem::take(&mut pending) {
             match action {
+                Action::Send(bytes) if jumps => {
+                    let line = bytes.strip_suffix(b"\r").unwrap_or(&bytes);
+                    let text = String::from_utf8_lossy(line);
+                    assert!(
+                        keys.iter().any(|k| k[..] == bytes[..])
+                            || !text.chars().any(char::is_control),
+                        "the host typed a key: {bytes:?}"
+                    );
+                }
                 Action::Send(bytes) => {
                     let want = expected.next();
                     assert_eq!(want.as_deref(), Some(&bytes[..]), "typed out of turn");

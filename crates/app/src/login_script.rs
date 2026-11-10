@@ -9,9 +9,10 @@
 //! typing there while [`Runner::prompting`] is true, so the secret never
 //! reaches the host's echo, the log or broadcast.
 
+use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
 
-use ferossh_config::login::{self, EXPECT_TIMEOUT_SECS, Step};
+use ferossh_config::login::{self, Cond, EXPECT_TIMEOUT_SECS, Step};
 use ferossh_config::trigger::OutputText;
 use zeroize::Zeroizing;
 
@@ -21,6 +22,14 @@ const RESET: &str = "\x1b[0m";
 
 /// Output kept for matching, after escape sequences are dropped.
 const SEEN_MAX: usize = 8192;
+
+/// The most steps a script runs in a row without waiting for the host,
+/// a moment or a secret: a `goto` loop that never waits stops there
+/// instead of hanging the window or flooding the host.
+const MAX_BUSY_STEPS: usize = 1000;
+/// The most variables a script sets, and the longest value one holds.
+const MAX_VARS: usize = 64;
+const MAX_VAR_LEN: usize = 256;
 
 /// A secret the script needs next.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -89,6 +98,12 @@ pub struct Runner {
     text: OutputText,
     prompt: Option<Prompt>,
     outcome: Option<Outcome>,
+    /// How long `expect`, `capture` and `on` wait, and where a timeout
+    /// goes (`None`: the script fails).
+    timeout: Duration,
+    on_timeout: Option<String>,
+    /// Variables set by `set`, `add` and `capture` (as `captured`).
+    vars: BTreeMap<String, String>,
 }
 
 impl Runner {
@@ -109,7 +124,74 @@ impl Runner {
             text: OutputText::default(),
             prompt: None,
             outcome: None,
+            timeout: Duration::from_secs(EXPECT_TIMEOUT_SECS),
+            on_timeout: None,
+            vars: BTreeMap::new(),
         }
+    }
+
+    /// `text` with each `${name}` of a variable the script set replaced
+    /// by its value; other `$` text stays as it is.
+    fn subst(&self, text: &str) -> String {
+        if self.vars.is_empty() || !text.contains("${") {
+            return text.to_owned();
+        }
+        let mut out = String::new();
+        let mut rest = text;
+        while let Some(at) = rest.find("${") {
+            out.push_str(rest.get(..at).unwrap_or_default());
+            let after = rest.get(at + 2..).unwrap_or_default();
+            match after
+                .find('}')
+                .and_then(|end| Some((self.vars.get(after.get(..end)?)?, end)))
+            {
+                Some((value, end)) => {
+                    out.push_str(value);
+                    rest = after.get(end + 1..).unwrap_or_default();
+                }
+                None => {
+                    out.push_str("${");
+                    rest = after;
+                }
+            }
+        }
+        out.push_str(rest);
+        out
+    }
+
+    /// Keeps a variable's value, one line of at most [`MAX_VAR_LEN`]
+    /// characters; `false` when the script has too many.
+    fn set_var(&mut self, name: &str, value: &str) -> bool {
+        if !self.vars.contains_key(name) && self.vars.len() >= MAX_VARS {
+            return false;
+        }
+        let value = value
+            .chars()
+            .map(|c| if c.is_control() { ' ' } else { c })
+            .take(MAX_VAR_LEN)
+            .collect();
+        self.vars.insert(name.to_owned(), value);
+        true
+    }
+
+    /// Where label `name` is.
+    fn label(&self, name: &str) -> Option<usize> {
+        self.steps
+            .iter()
+            .position(|s| matches!(s, Step::Label(l) if l.eq_ignore_ascii_case(name)))
+    }
+
+    /// The `on` steps from `at` on that wait together, as (text, label).
+    fn on_group(&self, at: usize) -> Vec<(String, Option<String>)> {
+        self.steps
+            .get(at..)
+            .unwrap_or_default()
+            .iter()
+            .map_while(|s| match s {
+                Step::On(t, l) => Some((self.subst(t), l.clone())),
+                _ => None,
+            })
+            .collect()
     }
 
     /// Starts the script.
@@ -141,8 +223,15 @@ impl Runner {
     pub fn waiting_for(&self) -> Option<String> {
         match (self.wait, self.steps.get(self.next)) {
             (Wait::Expect, Some(Step::Expect(t) | Step::Capture(t))) => {
-                Some(crate::ssh::sanitize(t))
+                Some(crate::ssh::sanitize(&self.subst(t)))
             }
+            (Wait::Expect, Some(Step::On(..))) => Some(
+                self.on_group(self.next)
+                    .iter()
+                    .map(|(t, _)| crate::ssh::sanitize(t))
+                    .collect::<Vec<_>>()
+                    .join(" or "),
+            ),
             (Wait::Pause, _) => Some("a pause".into()),
             (Wait::Secret, _) => Some("a secret".into()),
             _ => None,
@@ -158,26 +247,74 @@ impl Runner {
     fn advance(&mut self, now: Instant, out: &mut Vec<Action>) {
         self.deadline = None;
         self.wait = Wait::Ready;
-        while let Some(step) = self.steps.get(self.next) {
+        let mut busy = 0;
+        while let Some(step) = self.steps.get(self.next).cloned() {
+            busy += 1;
+            if busy > MAX_BUSY_STEPS {
+                self.fail(
+                    &format!(
+                        "it ran {MAX_BUSY_STEPS} steps without waiting for the host; a goto \
+                         loop needs an expect, on, pause or delay."
+                    ),
+                    out,
+                );
+                return;
+            }
             match step {
                 Step::Expect(text) => {
+                    let text = self.subst(&text);
                     let Some(at) = self.seen.find(text.as_str()) else {
-                        self.wait = Wait::Expect;
-                        self.deadline = Some(now + Duration::from_secs(EXPECT_TIMEOUT_SECS));
+                        self.wait_for_host(now);
                         return;
                     };
                     self.seen.drain(..at + text.len());
                 }
                 Step::Capture(pattern) => {
-                    let Some((end, value)) = login::capture(&self.seen, pattern) else {
-                        self.wait = Wait::Expect;
-                        self.deadline = Some(now + Duration::from_secs(EXPECT_TIMEOUT_SECS));
+                    let pattern = self.subst(&pattern);
+                    let Some((end, value)) = login::capture(&self.seen, &pattern) else {
+                        self.wait_for_host(now);
                         return;
                     };
                     self.seen.drain(..end);
+                    self.set_var("captured", &value);
                     out.push(Action::Captured(value));
                 }
-                Step::Send(_) | Step::Type(_) | Step::Key(_) => {
+                Step::On(..) => {
+                    let group = self.on_group(self.next);
+                    // The text that shows up first wins; at the same
+                    // place, the one listed first.
+                    let hit = group
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(i, (t, _))| Some((self.seen.find(t.as_str())?, i)))
+                        .min();
+                    let Some((at, i)) = hit else {
+                        self.wait_for_host(now);
+                        return;
+                    };
+                    let Some((text, label)) = group.get(i) else {
+                        return;
+                    };
+                    self.seen.drain(..at + text.len());
+                    match label {
+                        Some(l) => {
+                            if !self.jump(l, out) {
+                                return;
+                            }
+                            continue;
+                        }
+                        None => {
+                            self.next += group.len();
+                            continue;
+                        }
+                    }
+                }
+                Step::Send(_) | Step::Type(_) => {
+                    if let Some(bytes) = step.map_text(|t| self.subst(t)).bytes() {
+                        out.push(Action::Send(Zeroizing::new(bytes)));
+                    }
+                }
+                Step::Key(_) => {
                     if let Some(bytes) = step.bytes() {
                         out.push(Action::Send(Zeroizing::new(bytes)));
                     }
@@ -185,16 +322,16 @@ impl Runner {
                 Step::Pause(secs) => {
                     self.next += 1;
                     self.wait = Wait::Pause;
-                    self.deadline = Some(now + Duration::from_secs(u64::from(*secs)));
+                    self.deadline = Some(now + Duration::from_secs(u64::from(secs)));
                     return;
                 }
                 // Moves are carried out by the window, between the parts
                 // of a snippet; a runner that meets one goes on.
-                Step::Pane(_) | Step::Tab(_) => {}
+                Step::Pane(_) | Step::Tab(_) | Step::Label(_) => {}
                 Step::Delay(ms) => {
                     self.next += 1;
                     self.wait = Wait::Pause;
-                    self.deadline = Some(now + Duration::from_millis(u64::from(*ms)));
+                    self.deadline = Some(now + Duration::from_millis(u64::from(ms)));
                     return;
                 }
                 Step::Password => {
@@ -204,13 +341,103 @@ impl Runner {
                 }
                 Step::Secret(name) => {
                     self.wait = Wait::Secret;
-                    out.push(Action::Fetch(Need::Secret(name.clone())));
+                    out.push(Action::Fetch(Need::Secret(name)));
+                    return;
+                }
+                Step::Goto(l) => {
+                    if !self.jump(&l, out) {
+                        return;
+                    }
+                    continue;
+                }
+                Step::Timeout(secs, label) => {
+                    self.timeout = Duration::from_secs(u64::from(secs));
+                    self.on_timeout = label;
+                }
+                Step::Set(name, value) => {
+                    let value = self.subst(&value);
+                    if !self.set_var(&name, &value) {
+                        self.fail(&format!("it sets more than {MAX_VARS} variables."), out);
+                        return;
+                    }
+                }
+                Step::Add(name, n) => {
+                    let old = self.vars.get(&name).map_or("0", String::as_str);
+                    let Some(sum) = old
+                        .trim()
+                        .parse::<i64>()
+                        .ok()
+                        .and_then(|v| v.checked_add(n))
+                    else {
+                        let why = format!(
+                            "${{{name}}} is \"{}\", not a whole number to add to.",
+                            crate::ssh::sanitize(old)
+                        );
+                        self.fail(&why, out);
+                        return;
+                    };
+                    if !self.set_var(&name, &sum.to_string()) {
+                        self.fail(&format!("it sets more than {MAX_VARS} variables."), out);
+                        return;
+                    }
+                }
+                Step::If(Cond {
+                    left,
+                    op,
+                    right,
+                    label,
+                }) => match Cond::holds(op, &self.subst(&left), &self.subst(&right)) {
+                    Ok(true) => {
+                        if !self.jump(&label, out) {
+                            return;
+                        }
+                        continue;
+                    }
+                    Ok(false) => {}
+                    Err(why) => {
+                        self.fail(&crate::ssh::sanitize(&why), out);
+                        return;
+                    }
+                },
+                Step::Show(text) => {
+                    let text = crate::ssh::sanitize(&self.subst(&text));
+                    out.push(Action::Show(format!("{DIM}{text}{RESET}\r\n")));
+                }
+                Step::Stop => {
+                    self.next = self.steps.len();
+                    break;
+                }
+                Step::Fail(why) => {
+                    let why = crate::ssh::sanitize(&self.subst(&why));
+                    self.fail(&why, out);
                     return;
                 }
             }
             self.next += 1;
         }
         self.finish(out);
+    }
+
+    /// Waits for the host's text, until the timeout.
+    fn wait_for_host(&mut self, now: Instant) {
+        self.wait = Wait::Expect;
+        self.deadline = Some(now + self.timeout);
+    }
+
+    /// Goes on at label `name`; `false` (and the script fails) when there
+    /// is none, which a checked script never has.
+    fn jump(&mut self, name: &str, out: &mut Vec<Action>) -> bool {
+        match self.label(name) {
+            Some(i) => {
+                self.next = i;
+                true
+            }
+            None => {
+                let why = format!("there is no label {}.", crate::ssh::sanitize(name));
+                self.fail(&why, out);
+                false
+            }
+        }
     }
 
     fn finish(&mut self, out: &mut Vec<Action>) {
@@ -263,12 +490,18 @@ impl Runner {
         }
         match self.wait {
             Wait::Expect => {
-                let text = match self.steps.get(self.next) {
-                    Some(Step::Expect(t) | Step::Capture(t)) => crate::ssh::sanitize(t),
-                    _ => String::new(),
-                };
+                if let Some(label) = self.on_timeout.clone() {
+                    if self.jump(&label, &mut out) {
+                        self.advance(now, &mut out);
+                    }
+                    return out;
+                }
+                let text = self.waiting_for().unwrap_or_default();
                 self.fail(
-                    &format!("\"{text}\" did not show up within {EXPECT_TIMEOUT_SECS} seconds."),
+                    &format!(
+                        "\"{text}\" did not show up within {} seconds.",
+                        self.timeout.as_secs()
+                    ),
                     &mut out,
                 );
             }
@@ -523,25 +756,25 @@ mod tests {
     fn snippets_type_keys_and_say_their_name() {
         let now = Instant::now();
         let mut r = Runner::named(
-            "the snippet Save",
+            "the script Save",
             steps(&["send copy run start", "expect ]?", "key enter", "type y"]),
         );
         let a = r.start(now);
-        assert!(matches!(&a[0], Action::Show(t) if t.contains("Running the snippet Save")));
+        assert!(matches!(&a[0], Action::Show(t) if t.contains("Running the script Save")));
         assert_eq!(sent(&a), ["copy run start\r"]);
         let a = r.feed(b"Destination filename [startup-config]?", now);
         assert_eq!(sent(&a), ["\r", "y"]);
         assert_eq!(a.last(), Some(&Action::Done));
-        let mut r = Runner::named("the snippet Save", steps(&["expect #"]));
+        let mut r = Runner::named("the script Save", steps(&["expect #"]));
         r.start(now);
-        assert!(matches!(&r.cancel()[0], Action::Show(t) if t.contains("[Snippet Save stopped]")));
+        assert!(matches!(&r.cancel()[0], Action::Show(t) if t.contains("[Script Save stopped]")));
     }
 
     #[test]
     fn captures_report_values_and_outcomes() {
         let now = Instant::now();
         let mut r = Runner::named(
-            "the snippet Version",
+            "the script Version",
             steps(&["send show version", "capture Version *,", "expect #"]),
         );
         r.start(now);
@@ -553,13 +786,146 @@ mod tests {
         assert!(a.contains(&Action::Captured("15.2(4)E10".into())));
         assert_eq!(r.outcome(), Some(&Outcome::Finished));
 
-        let mut r = Runner::named("the snippet V", steps(&["capture Version *,"]));
+        let mut r = Runner::named("the script V", steps(&["capture Version *,"]));
         r.start(now);
         r.tick(now + Duration::from_secs(EXPECT_TIMEOUT_SECS));
         assert!(matches!(r.outcome(), Some(Outcome::Failed(w)) if w.contains("Version *,")));
-        let mut r = Runner::named("the snippet V", steps(&["expect x"]));
+        let mut r = Runner::named("the script V", steps(&["expect x"]));
         r.start(now);
         r.cancel();
         assert_eq!(r.outcome(), Some(&Outcome::Stopped));
+    }
+
+    fn outcome_why(r: &Runner) -> String {
+        match r.outcome() {
+            Some(Outcome::Failed(w)) => w.clone(),
+            other => format!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn on_waits_for_whichever_text_comes_first() {
+        let now = Instant::now();
+        let script = [
+            "label login",
+            "on (yes/no)? goto hostkey",
+            "on assword: goto pw",
+            "on $",
+            "send whoami",
+            "stop",
+            "label hostkey",
+            "send yes",
+            "goto login",
+            "label pw",
+            "password",
+            "goto login",
+        ];
+        let mut r = Runner::new(steps(&script));
+        r.start(now);
+        assert_eq!(
+            r.waiting_for().as_deref(),
+            Some("(yes/no)? or assword: or $")
+        );
+        let a = r.feed(b"Are you sure you want to continue (yes/no)? ", now);
+        assert_eq!(sent(&a), ["yes\r"]);
+        let a = r.feed(b"Password: ", now);
+        assert_eq!(a, [Action::Fetch(Need::Password)]);
+        let a = r.secret("pw", now);
+        assert_eq!(sent(&a), ["pw\r"]);
+        // Both show up: the first one in the text wins.
+        let a = r.feed(b"\r\nuser@host:~$ cat Password:", now);
+        assert_eq!(sent(&a), ["whoami\r"]);
+        assert_eq!(r.outcome(), Some(&Outcome::Finished));
+    }
+
+    #[test]
+    fn variables_counters_and_ifs() {
+        let now = Instant::now();
+        let mut r = Runner::named(
+            "the script Retry",
+            steps(&[
+                "set tries 0",
+                "label again",
+                "add tries 1",
+                "if ${tries} > 3 goto give_up",
+                "send ping -c1 ${host2}",
+                "timeout 5 goto again",
+                "capture time=* ms",
+                "if ${captured} contains . goto done",
+                "label done",
+                "show took ${captured} ms after ${tries} tries",
+                "stop",
+                "label give_up",
+                "fail no answer after ${tries} tries",
+            ]),
+        );
+        let a = r.start(now);
+        assert_eq!(
+            sent(&a),
+            ["ping -c1 ${host2}\r"],
+            "unset variables stay as written"
+        );
+        let t = now + Duration::from_secs(5);
+        assert_eq!(sent(&r.tick(t)), ["ping -c1 ${host2}\r"]);
+        let a = r.feed(b"64 bytes: time=0.42 ms\r\n", t);
+        assert!(a.contains(&Action::Captured("0.42".into())));
+        assert!(
+            a.iter()
+                .any(|x| matches!(x, Action::Show(s) if s.contains("took 0.42 ms after 2 tries")))
+        );
+        assert_eq!(r.outcome(), Some(&Outcome::Finished));
+
+        let mut r = Runner::named(
+            "the script Retry",
+            steps(&[
+                "timeout 1 goto x",
+                "label x",
+                "add n 1",
+                "if ${n} >= 3 goto out",
+                "expect never",
+                "label out",
+                "fail gave up at ${n}",
+            ]),
+        );
+        r.start(now);
+        r.tick(now + Duration::from_secs(1));
+        r.tick(now + Duration::from_secs(2));
+        assert_eq!(outcome_why(&r), "gave up at 3");
+    }
+
+    #[test]
+    fn a_loop_that_never_waits_stops() {
+        let now = Instant::now();
+        let mut r = Runner::new(steps(&["label a", "send x", "goto a"]));
+        let a = r.start(now);
+        assert!(sent(&a).len() < MAX_BUSY_STEPS);
+        assert!(outcome_why(&r).contains("without waiting"));
+    }
+
+    #[test]
+    fn bad_numbers_and_timeouts_fail_clearly() {
+        let now = Instant::now();
+        let mut r = Runner::new(steps(&["set v abc", "add v 1"]));
+        r.start(now);
+        assert!(outcome_why(&r).contains("not a whole number"));
+        let mut r = Runner::new(steps(&["set v abc", "if ${v} < 2 goto x", "label x"]));
+        r.start(now);
+        assert!(outcome_why(&r).contains("compares whole numbers"));
+        let mut r = Runner::new(steps(&["timeout 30", "on a", "on b"]));
+        r.start(now);
+        assert!(r.tick(now + Duration::from_secs(29)).is_empty());
+        r.tick(now + Duration::from_secs(30));
+        assert!(outcome_why(&r).contains("\"a or b\" did not show up within 30 seconds"));
+    }
+
+    #[test]
+    fn host_text_never_becomes_a_key_or_a_step() {
+        let now = Instant::now();
+        let mut r = Runner::new(steps(&["capture name=*;", "send echo ${captured}"]));
+        r.start(now);
+        let a = r.feed(b"name=a\x1b[2Jb;", now);
+        // Escape sequences are dropped from what is matched; a control
+        // character never reaches what is typed.
+        assert_eq!(sent(&a), ["echo ab\r"]);
     }
 }

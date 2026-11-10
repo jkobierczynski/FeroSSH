@@ -1166,10 +1166,11 @@ fn load_settings() -> Settings {
         .unwrap_or_default()
 }
 
-/// The snippets folder: a file per command snippet, a folder per
-/// category (see [`snippet_store`]).
+/// The scripts folder: a file per script, a folder per category (see
+/// [`snippet_store`]). The `snippets` folder of an older FeroSSH is
+/// renamed to it the first time.
 fn snippets_dir() -> PathBuf {
-    app_dir().join("snippets")
+    snippet_store::move_old_folder(&app_dir().join("scripts"), &app_dir().join("snippets"))
 }
 
 /// Reads the snippets folder into `settings`. Snippets an older FeroSSH
@@ -1761,7 +1762,7 @@ fn build_menu() -> Result<HMENU> {
         separator(file)?;
         item(file, cmd::LOCAL_SHELL, "Open &local shell")?;
         item(file, cmd::IMPORT, "&Import connections...")?;
-        item(file, cmd::IMPORT_SNIPPETS, "Import s&nippets...")?;
+        item(file, cmd::IMPORT_SNIPPETS, "Import sc&ripts...")?;
         separator(file)?;
         item(file, cmd::EXIT, "E&xit\tAlt+F4")?;
 
@@ -1806,15 +1807,11 @@ fn build_menu() -> Result<HMENU> {
         separator(session)?;
         item(session, cmd::SERIAL_BREAK, "Send &break (serial)")?;
         item(session, cmd::RUN_SCRIPT, "Run &login script again")?;
-        item(
-            session,
-            cmd::AUTO_RESPONSES,
-            "A&uto-responses from snippets",
-        )?;
+        item(session, cmd::AUTO_RESPONSES, "A&uto-responses from scripts")?;
         item(
             session,
             cmd::CONFIRM_PRODUCTION,
-            "Confirm snippets on &Production hosts",
+            "Confirm scripts on &Production hosts",
         )?;
         separator(session)?;
         item(session, cmd::DESKTOP, "Open remote &desktop\tCtrl+Shift+D")?;
@@ -1882,8 +1879,8 @@ fn build_menu() -> Result<HMENU> {
         separator(edit)?;
         item(edit, cmd::FIND, "&Find in scrollback\tCtrl+Shift+F")?;
         item(edit, cmd::CLEAR_SCROLLBACK, "C&lear scrollback")?;
-        item(edit, cmd::SAVE_SNIPPET, "Sa&ve selection as snippet...")?;
-        item(edit, cmd::RECORD_SNIPPET, "Rec&ord keystrokes as snippet")?;
+        item(edit, cmd::SAVE_SNIPPET, "Sa&ve selection as script...")?;
+        item(edit, cmd::RECORD_SNIPPET, "Rec&ord keystrokes as script")?;
         separator(edit)?;
         item(edit, cmd::COPY_ON_SELECT, "Copy on &select")?;
         item(edit, cmd::RIGHT_CLICK_PASTE, "&Right-click pastes")?;
@@ -1924,8 +1921,8 @@ fn build_menu() -> Result<HMENU> {
         item(tools, cmd::LIVE, "&Session manager\tCtrl+Shift+L")?;
         item(tools, cmd::FILES, "&File transfer\tCtrl+Shift+E")?;
         item(tools, cmd::FORWARDS, "&Port forwards\tCtrl+Shift+P")?;
-        item(tools, cmd::SNIPPETS, "Command s&nippets\tCtrl+Shift+Space")?;
-        item(tools, cmd::SNIPPET_FOLDER, "Open snippets f&older")?;
+        item(tools, cmd::SNIPPETS, "Sc&ripts\tCtrl+Shift+Space")?;
+        item(tools, cmd::SNIPPET_FOLDER, "Open scripts f&older")?;
         item(tools, cmd::PALETTE, "Command p&alette\tCtrl+Shift+A")?;
 
         let view = CreatePopupMenu()?;
@@ -2900,7 +2897,7 @@ impl Window {
                 notes.push("logging");
             }
             if tab.is_none() {
-                notes.push("snippet run");
+                notes.push("script run");
             }
             out.push(LiveSession {
                 pane: id,
@@ -7809,7 +7806,7 @@ impl Window {
         let id = self.focused_id();
         if !self.takes_broadcast(id) {
             return Some(Command::Notice(
-                "Snippets are typed into a pane with a running shell or console; this \
+                "Scripts are typed into a pane with a running shell or console; this \
                  pane has none, or is at a prompt."
                     .into(),
             ));
@@ -7839,7 +7836,7 @@ impl Window {
         let id = self.focused_id();
         if !self.takes_broadcast(id) {
             return Some(Command::Notice(
-                "Snippets are typed into a pane with a running shell or console; this \
+                "Scripts are typed into a pane with a running shell or console; this \
                  pane has none, or is at a prompt."
                     .into(),
             ));
@@ -7886,7 +7883,7 @@ impl Window {
             .map(|at| steps.split_off(at));
         if after.is_some() && panes.len() > 1 {
             return Some(Command::Notice(format!(
-                "The snippet {name} moves to another pane or tab (@pane, @tab), so it runs \
+                "The script {name} moves to another pane or tab (@pane, @tab), so it runs \
                  in one pane only, not in {} at once.",
                 panes.len()
             )));
@@ -7906,7 +7903,7 @@ impl Window {
         for &p in panes {
             let label = self.pane_label(p);
             let state = if self.scripts.contains_key(&p) {
-                RowState::Failed("a login script or snippet runs there".into())
+                RowState::Failed("another script runs there".into())
             } else {
                 RowState::Running(None)
             };
@@ -7915,7 +7912,7 @@ impl Window {
         if report {
             self.show_report(Report::new(name, rows, None));
         }
-        let what = format!("the snippet {name}");
+        let what = format!("the script {name}");
         for &p in panes {
             if self.scripts.contains_key(&p) {
                 continue;
@@ -7988,7 +7985,7 @@ impl Window {
         let Some(to) = to else {
             self.show(
                 from,
-                &format!("\x1b[0;31m[the snippet {name} stopped: {missing}]\x1b[0m\r\n"),
+                &format!("\x1b[0;31m[the script {name} stopped: {missing}]\x1b[0m\r\n"),
             );
             return;
         };
@@ -8016,7 +8013,7 @@ impl Window {
         let r = self.snippets_view.report().filter(|r| r.run.is_some())?;
         Some(Command::Notice(format!(
             "The report of the run of {} is still open. Close it first: Escape in the \
-             snippets view (Ctrl+Shift+Space).",
+             scripts view (Ctrl+Shift+Space).",
             r.name
         )))
     }
@@ -8063,7 +8060,7 @@ impl Window {
             .collect();
         if hosts.is_empty() {
             return Some(Command::Notice(
-                "There are no saved SSH sessions to run the snippet on. Save the hosts in \
+                "There are no saved SSH sessions to run the script on. Save the hosts in \
                  the connection manager first."
                     .into(),
             ));
@@ -8256,7 +8253,7 @@ impl Window {
             row.state = RowState::Running(None);
         }
         self.script_runs += 1;
-        let mut runner = Runner::named(&format!("the snippet {name}"), steps);
+        let mut runner = Runner::named(&format!("the script {name}"), steps);
         let actions = runner.start(Instant::now());
         self.scripts.insert(
             id,
@@ -8571,7 +8568,7 @@ impl Window {
         self.recording = Some((id, Recorder::default()));
         self.show(
             id,
-            "\x1b[0;90m[Recording keystrokes as a snippet. Edit > Record keystrokes as snippet \
+            "\x1b[0;90m[Recording keystrokes as a script. Edit > Record keystrokes as script \
              again stops it.]\x1b[0m\r\n",
         );
         self.refresh(id);
@@ -8588,7 +8585,7 @@ impl Window {
                 self.save_settings();
             } else if let Err(e) = snippet_store::remove(&snippets_dir(), &s) {
                 out = Some(Command::Notice(format!(
-                    "Could not remove the snippet's file: {e}"
+                    "Could not remove the script's file: {e}"
                 )));
             }
         }
@@ -8652,7 +8649,7 @@ impl Window {
         self.side.import = None;
         self.show_side(SideView::Snippets, true);
         let mut text = format!(
-            "Imported {done} snippet{} into {}. Each has a file there, in a folder named \
+            "Imported {done} script{} into {}. Each has a file there, in a folder named \
              after its category.",
             plural(done),
             dir.display()
@@ -10408,8 +10405,8 @@ impl Window {
                     .filter(|t| !t.trim().is_empty());
                 let Some(text) = text else {
                     return Some(Command::Notice(
-                        "Select the text for the snippet in a pane first, then use Edit > Save \
-                         selection as snippet."
+                        "Select the text for the script in a pane first, then use Edit > Save \
+                         selection as script."
                             .into(),
                     ));
                 };
@@ -13164,8 +13161,11 @@ fn run_command(hwnd: HWND, command: Command) {
                 .unwrap_or(false) =>
         {
             let start = std::env::var_os("LOCALAPPDATA").map_or_else(home, PathBuf::from);
-            if let Some(path) = pick_file(hwnd, w!("Snippets or macros of another program"), &start)
-            {
+            if let Some(path) = pick_file(
+                hwnd,
+                w!("Scripts, snippets or macros of another program"),
+                &start,
+            ) {
                 match read_snippet_file(&path) {
                     Ok(found) => {
                         with_window(|w| w.add_snippet_import(found));
@@ -13219,7 +13219,7 @@ fn run_command(hwnd: HWND, command: Command) {
                 .collect();
             let more = if steps.len() > 8 { "\n..." } else { "" };
             let text = format!(
-                "Type the snippet {name} into {}, which {} the Production theme?\n\n{}{more}",
+                "Type the script {name} into {}, which {} the Production theme?\n\n{}{more}",
                 production.join(", "),
                 if production.len() == 1 { "has" } else { "have" },
                 shown.join("\n"),
@@ -13236,7 +13236,7 @@ fn run_command(hwnd: HWND, command: Command) {
             else {
                 return;
             };
-            let text = format!("Delete the snippet {name}?");
+            let text = format!("Delete the script {name}?");
             if dialog(hwnd, &text, MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2) == Some(IDYES)
                 && let Some(Some(command)) = with_window(|w| w.delete_snippet(index))
             {
@@ -13250,7 +13250,7 @@ fn run_command(hwnd: HWND, command: Command) {
             production,
         } => {
             let text = format!(
-                "Run the snippet {name} on {} hosts? {} {} the Production theme.",
+                "Run the script {name} on {} hosts? {} {} the Production theme.",
                 hosts.len(),
                 production.join(", "),
                 if production.len() == 1 { "has" } else { "have" },
@@ -13634,7 +13634,7 @@ fn read_snippet_file(path: &std::path::Path) -> std::result::Result<SnippetSourc
         return Err(none("macros"));
     }
     if text.len() > 1 << 20 {
-        return Err(format!("{} is too big for one snippet.", path.display()));
+        return Err(format!("{} is too big for one script.", path.display()));
     }
     let stem = path
         .file_stem()
