@@ -1618,15 +1618,16 @@ fn go_into(h: &Handles, remote: bool, row: &FileRow) {
     let Some(here) = with(|s| s.local.dir().map(PathBuf::from)).flatten() else {
         return;
     };
+    // The server picks the name: map it to one plain local name before
+    // anything touches the file system (no `\\host\share`, drive or `..`).
     let name = String::from_utf8_lossy(&row.key).into_owned();
-    let there = here.join(&name);
-    if there.is_dir() {
-        local_enter(h, there, None);
-    } else {
-        local_problem(format!(
-            "Sync browsing: {} has no folder {name}.",
-            here.display()
-        ));
+    match files::sync_local(&here, &row.key) {
+        Some(there) if there.is_dir() => local_enter(h, there, None),
+        _ => local_problem(format!(
+            "Sync browsing: {} has no folder {}.",
+            here.display(),
+            crate::ssh::sanitize_line(&name)
+        )),
     }
 }
 

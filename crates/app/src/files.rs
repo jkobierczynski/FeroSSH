@@ -505,6 +505,21 @@ pub fn bookmark_suggestion(local: Option<&Path>, remote: Option<&[u8]>) -> Strin
     remote.or(local).unwrap_or_else(|| "Bookmark".to_owned())
 }
 
+/// The local folder Sync browsing opens for remote folder `remote` inside
+/// `here`: the remote name mapped the way a download names it, so it is
+/// always one plain name below `here`. `None` for a name that must not
+/// reach the local file system at all, so a server-chosen name such as
+/// `\\host\share`, `C:\` or `..` is never probed.
+pub fn sync_local(here: &Path, remote: &[u8]) -> Option<PathBuf> {
+    use std::path::Component;
+    let name = names::local_name(remote)?;
+    let mut parts = Path::new(&name).components();
+    match (parts.next(), parts.next()) {
+        (Some(Component::Normal(one)), None) if one == name.as_str() => Some(here.join(one)),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::indexing_slicing)]
 mod tests {
@@ -709,5 +724,31 @@ mod tests {
             "Sites"
         );
         assert_eq!(bookmark_suggestion(None, None), "Bookmark");
+    }
+
+    #[test]
+    fn sync_browsing_never_leaves_the_local_folder() {
+        let here = Path::new("base");
+        assert_eq!(sync_local(here, b"logs"), Some(here.join("logs")));
+        // Mapped like a download, so the folder it would have landed in.
+        assert_eq!(sync_local(here, b"a:b"), Some(here.join("a_b")));
+        for bad in [
+            &b"\\\\host\\share"[..],
+            b"C:\\",
+            b"C:",
+            b"\\x",
+            b"..",
+            b".",
+            b"",
+            b"a/b",
+        ] {
+            let got = sync_local(here, bad);
+            assert!(
+                got.as_ref().is_none_or(|p| p.parent() == Some(here)),
+                "{bad:?} -> {got:?}"
+            );
+        }
+        assert_eq!(sync_local(here, b".."), None);
+        assert_eq!(sync_local(here, b"a/b"), None);
     }
 }
