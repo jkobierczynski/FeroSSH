@@ -65,7 +65,10 @@ use windows::Win32::UI::WindowsAndMessaging::{
 };
 use windows::core::{PCWSTR, PWSTR, w};
 
-use crate::files::{self, Arrange, FileRow, Follow, LocalPane, QueueRow, filtered, local_rows};
+use crate::files::{
+    self, Arrange, FileRow, Follow, LocalPane, QueueRow, SyncLocal, SyncPending, SyncStep,
+    filtered, local_rows,
+};
 use crate::layout::Rect;
 use crate::native::{fonts, key_down, pass_edge, scale, search_text, set_font, wide};
 use ferossh_config::Bookmark;
@@ -302,21 +305,6 @@ struct State {
     sync_pending: Option<SyncPending>,
     /// Where the title row's buttons start: the host label ends before.
     title_buttons_x: i32,
-}
-
-/// Sync browsing moves both lists or neither: the remote folder is asked
-/// for first, and the Local list moves only once it has listed.
-struct SyncPending {
-    /// The transfer queue it was asked on.
-    key: Option<String>,
-    /// The remote folder asked for.
-    target: Vec<u8>,
-    local: SyncLocal,
-}
-
-enum SyncLocal {
-    Enter(PathBuf),
-    Up,
 }
 
 thread_local! {
@@ -1170,15 +1158,18 @@ pub fn set_view(view: View) {
         // listed, and stays if it did not.
         // On another queue or connection it is dropped: neither moves.
         let alias_changed = old.is_some_and(|v| v.alias != view.alias);
-        let synced = match s.sync_pending.take() {
-            Some(p) if p.key != view.key || alias_changed => None,
-            Some(p) if view.remote_loading => {
+        let synced = match files::sync_step(
+            s.sync_pending.take(),
+            view.key.as_deref(),
+            alias_changed,
+            view.remote_loading,
+            &view.remote_dir,
+        ) {
+            SyncStep::Wait(p) => {
                 s.sync_pending = Some(p);
-                None
+                SyncStep::None
             }
-            Some(p) if view.remote_dir == p.target => Some(Ok(p.local)),
-            Some(p) => Some(Err(p)),
-            None => None,
+            step => step,
         };
         let queue = s.queue_shown != view.queue;
         let before = (
@@ -1231,12 +1222,23 @@ pub fn set_view(view: View) {
         local_go(&h, dir, None, false);
     }
     match synced {
-        Some(Ok(SyncLocal::Enter(dir))) => local_enter(&h, dir, None),
-        Some(Ok(SyncLocal::Up)) => local_up(&h),
-        Some(Err(_)) => local_problem(
+        SyncStep::Move(p) => {
+            let moved = match p.local {
+                SyncLocal::Enter(dir) => local_go(&h, dir, None, true),
+                SyncLocal::Up => local_up(&h),
+            };
+            if !moved {
+                // Both or neither: the Remote list goes back.
+                emit(Event::Browse(p.back));
+                local_problem(
+                    "Sync browsing: the Local folder did not open, so Remote went back too.".into(),
+                );
+            }
+        }
+        SyncStep::Failed => local_problem(
             "Sync browsing: the Remote folder did not open, so Local stayed where it was.".into(),
         ),
-        None => {}
+        SyncStep::None | SyncStep::Wait(_) => {}
     }
     refresh_local(&h, false);
     refresh_remote(&h);
@@ -1562,7 +1564,8 @@ fn local_enter(h: &Handles, dir: PathBuf, select_name: Option<Vec<u8>>) {
 }
 
 /// Lists local folder `dir`; `remember` makes it the download folder.
-fn local_go(h: &Handles, dir: PathBuf, select_name: Option<Vec<u8>>, remember: bool) {
+/// Returns whether the Local list moved.
+fn local_go(h: &Handles, dir: PathBuf, select_name: Option<Vec<u8>>, remember: bool) -> bool {
     let done = with(|s| {
         let r = s.local.enter(&dir);
         if r.is_ok() {
@@ -1578,13 +1581,18 @@ fn local_go(h: &Handles, dir: PathBuf, select_name: Option<Vec<u8>>, remember: b
             if remember {
                 emit(Event::SetLocal(dir));
             }
+            true
         }
-        Some(Err(e)) => local_problem(e),
-        None => {}
+        Some(Err(e)) => {
+            local_problem(e);
+            false
+        }
+        None => false,
     }
 }
 
-fn local_up(h: &Handles) {
+/// Returns whether the Local list moved.
+fn local_up(h: &Handles) -> bool {
     let done = with(|s| s.local.up());
     match done {
         Some(Ok(left)) => {
@@ -1601,9 +1609,13 @@ fn local_up(h: &Handles) {
             if let Some(dir) = with(|s| s.local.dir().map(PathBuf::from)).flatten() {
                 emit(Event::SetLocal(dir));
             }
+            true
         }
-        Some(Err(e)) => local_problem(e),
-        None => {}
+        Some(Err(e)) => {
+            local_problem(e);
+            false
+        }
+        None => false,
     }
 }
 
@@ -1726,10 +1738,14 @@ fn go_into(h: &Handles, remote: bool, row: &FileRow) {
 /// Asks for remote folder `target`; the Local list does `local` once it
 /// has listed.
 fn sync_browse(target: Vec<u8>, local: SyncLocal) {
+    let Some(back) = remote_dir() else {
+        return;
+    };
     with(|s| {
         s.sync_pending = Some(SyncPending {
             key: s.view.as_ref().and_then(|v| v.key.clone()),
             target: target.clone(),
+            back,
             local,
         });
     });

@@ -520,11 +520,95 @@ pub fn sync_local(here: &Path, remote: &[u8]) -> Option<PathBuf> {
     }
 }
 
+/// Sync browsing moves both lists or neither: the remote folder is asked
+/// for first, and the Local list moves only once it has listed. If the
+/// Local list then cannot move, the Remote list goes back.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SyncPending {
+    /// The transfer queue it was asked on.
+    pub key: Option<String>,
+    /// The remote folder asked for.
+    pub target: Vec<u8>,
+    /// The remote folder it left, to go back to.
+    pub back: Vec<u8>,
+    pub local: SyncLocal,
+}
+
+/// What the Local list does once the remote folder has listed.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SyncLocal {
+    Enter(PathBuf),
+    Up,
+}
+
+/// Where a pending Sync move stands after a new view of the Remote list.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SyncStep {
+    /// Nothing pending, or dropped: another queue or connection.
+    None,
+    /// Still listing: keep waiting.
+    Wait(SyncPending),
+    /// The remote folder listed: move the Local list (and if that fails,
+    /// browse `back`).
+    Move(SyncPending),
+    /// The remote folder did not open: the Local list stays.
+    Failed,
+}
+
+/// Resolves `pending` against the Remote list now shown: queue `key`,
+/// `alias_changed` since the last view, still `loading`, at `remote_dir`.
+pub fn sync_step(
+    pending: Option<SyncPending>,
+    key: Option<&str>,
+    alias_changed: bool,
+    loading: bool,
+    remote_dir: &[u8],
+) -> SyncStep {
+    match pending {
+        None => SyncStep::None,
+        Some(p) if p.key.as_deref() != key || alias_changed => SyncStep::None,
+        Some(p) if loading => SyncStep::Wait(p),
+        Some(p) if remote_dir == p.target.as_slice() => SyncStep::Move(p),
+        Some(_) => SyncStep::Failed,
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::indexing_slicing)]
 mod tests {
     use super::*;
     use ferossh_ipc::FileAttrs;
+
+    #[test]
+    fn sync_moves_local_only_once_remote_listed() {
+        let p = SyncPending {
+            key: Some("k".into()),
+            target: b"/srv/a".to_vec(),
+            back: b"/srv".to_vec(),
+            local: SyncLocal::Up,
+        };
+        let step =
+            |key, alias, loading, dir: &[u8]| sync_step(Some(p.clone()), key, alias, loading, dir);
+        assert_eq!(
+            step(Some("k"), false, true, b"/srv"),
+            SyncStep::Wait(p.clone())
+        );
+        assert_eq!(
+            step(Some("k"), false, false, b"/srv/a"),
+            SyncStep::Move(p.clone())
+        );
+        // The move carries the folder to go back to if Local cannot move.
+        if let SyncStep::Move(m) = step(Some("k"), false, false, b"/srv/a") {
+            assert_eq!(m.back, b"/srv".to_vec());
+        }
+        assert_eq!(step(Some("k"), false, false, b"/srv"), SyncStep::Failed);
+        assert_eq!(step(Some("other"), false, false, b"/srv/a"), SyncStep::None);
+        assert_eq!(step(Some("k"), true, false, b"/srv/a"), SyncStep::None);
+        assert_eq!(
+            sync_step(None, Some("k"), false, false, b"/"),
+            SyncStep::None
+        );
+    }
 
     fn entry(name: &str, mode: u32, size: u64) -> DirEntry {
         DirEntry {
