@@ -730,7 +730,12 @@ pub fn pre_translate(msg: &MSG) -> bool {
                 SendMessageW(h.list, WM_KEYDOWN, Some(msg.wParam), Some(msg.lParam));
                 return true;
             }
-            WM_KEYDOWN if msg.wParam.0 == usize::from(VK_RETURN.0) => {
+            // Enter runs from the boxes and the list; a focused button
+            // does its own thing.
+            WM_KEYDOWN
+                if msg.wParam.0 == usize::from(VK_RETURN.0)
+                    && [h.search, h.list, h.parallel, h.password].contains(&msg.hwnd) =>
+            {
                 run(&h);
                 return true;
             }

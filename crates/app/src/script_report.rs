@@ -607,8 +607,8 @@ fn notify(h: Handles, lparam: LPARAM) -> LRESULT {
                 let vk = k.wVKey;
                 match u8::try_from(vk).map(char::from) {
                     Ok('C') if !key_down(VK_CONTROL.0) => key(&h, SideKey::Char('c')),
-                    Ok('S') => key(&h, SideKey::Char('s')),
-                    Ok('R') => key(&h, SideKey::Char('r')),
+                    Ok('S') if !key_down(VK_CONTROL.0) => key(&h, SideKey::Char('s')),
+                    Ok('R') if !key_down(VK_CONTROL.0) => key(&h, SideKey::Char('r')),
                     _ => {}
                 }
             }

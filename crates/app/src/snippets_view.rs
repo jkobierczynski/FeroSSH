@@ -39,7 +39,7 @@ const HEADER: usize = 2;
 /// Lines under the list: the key help.
 const FOOTER: usize = 1;
 /// Longest name or line one can type.
-const MAX_TEXT: usize = 400;
+pub(crate) const MAX_TEXT: usize = 400;
 /// Lines in one snippet.
 const MAX_LINES: usize = 50;
 /// The fields above a snippet's lines: name, category, hosts, folders,

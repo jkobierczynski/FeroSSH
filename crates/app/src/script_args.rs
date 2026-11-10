@@ -151,6 +151,13 @@ pub fn create(main: HWND, handler: Handler, dpi: u32) -> windows::core::Result<(
                 WS_BORDER.0 | ES_AUTOHSCROLL as u32,
                 ID_BOX + i,
             )?;
+            // As much as the view keeps.
+            SendMessageW(
+                *b,
+                windows::Win32::UI::Controls::EM_LIMITTEXT,
+                Some(WPARAM(crate::snippets_view::MAX_TEXT)),
+                None,
+            );
         }
         let run = child(
             WC_BUTTONW,
