@@ -32,8 +32,8 @@ use ferossh_config::known_hosts::{self, KnownHosts, Status};
 use ferossh_config::ssh_config::{AddressFamily, RequestTty, StrictHostKeyChecking};
 use ferossh_config::{ForwardSpec, hostkey, ssh_config};
 use ferossh_ipc::{
-    ChannelId, Family, GssReply, MAX_DATA_CHUNK, Message, PromptField, PromptKind, Secrets,
-    ShellOptions, Timing, X11Auth,
+    ChannelId, Family, GssReply, MAX_DATA_CHUNK, Message, MoshOptions, PromptField, PromptKind,
+    Secrets, ShellOptions, Timing, X11Auth,
 };
 use ferossh_worker::crypto_policy;
 use zeroize::Zeroizing;
@@ -112,6 +112,9 @@ pub struct Target {
     /// `GSSAPIServerIdentity`: the name in the server's service principal
     /// when not [`Target::hostname`].
     pub gssapi_host: Option<String>,
+    /// Run the shell as a Mosh session: start `mosh-server` over this SSH
+    /// login and talk to it over UDP. Never shares a connection.
+    pub mosh: Option<Box<MoshOptions>>,
 }
 
 /// A `ProxyCommand` to run: never through a shell.
@@ -307,6 +310,7 @@ impl Target {
             gssapi: cfg.gssapi_authentication.unwrap_or(domain_logon),
             gssapi_delegate: cfg.gssapi_delegate_credentials == Some(true),
             gssapi_host: cfg.gssapi_server_identity.clone(),
+            mosh: None,
             family: match cfg.address_family {
                 Some(AddressFamily::Inet) => Family::V4,
                 Some(AddressFamily::Inet6) => Family::V6,
@@ -341,6 +345,7 @@ impl Target {
             command: self.command.clone(),
             pty: self.pty,
             agent: self.forward_agent,
+            mosh: self.mosh.clone(),
         }
     }
 
@@ -360,6 +365,8 @@ impl Target {
             && self.port == other.port
             && self.user == other.user
             && self.route() == other.route()
+            && self.mosh.is_none()
+            && other.mosh.is_none()
     }
 
     /// The way there, for the log and for telling routes apart: the jump
@@ -1158,6 +1165,9 @@ impl SshSession {
             && (!target.forward_agent || self.target.agent == target.agent)
             // The same name through other jump hosts can be another host.
             && self.target.route() == target.route()
+            // A Mosh session is its connection's only shell.
+            && self.target.mosh.is_none()
+            && target.mosh.is_none()
     }
 
     /// Typed or pasted bytes for the host, once connected.

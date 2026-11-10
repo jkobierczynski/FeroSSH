@@ -40,6 +40,10 @@ X11 forwarding is off unless a host turns it on, because X programs on the serve
 
 Telnet sends everything in the clear, passwords included. FeroSSH offers it only for old gear that has nothing better: the pane says so when it connects and the tab carries a red **⚠ telnet** badge. The Telnet connection runs in a sandboxed worker like SSH, agrees to only a handful of options, and never sends your user name or environment.
 
+## Mosh
+
+A Mosh connection logs in with SSH, with the usual host key check, and only then starts `mosh-server`. The session key it prints comes back over that SSH connection; after that the terminal goes over UDP, encrypted and authenticated with AES-128-OCB, so nobody on the way can read or change it. FeroSSH parses the server's packets and screens in the sandboxed worker, and those parsers are fuzz-tested. The UDP ports have to be open on the host, which widens what the host exposes: narrow them with *UDP ports* if you can.
+
 ## Logs
 
 Logs never contain what you type at a password prompt. Each log is sealed with a SHA-256 hash chain, so a later change to it shows; see [Logs](logs.md) for what that does and does not protect against.

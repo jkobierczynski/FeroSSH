@@ -429,7 +429,9 @@ impl Client {
         });
         let assumed_end = self.sent.get(self.assumed).map_or(end, |s| s.end);
         let front_end = self.sent.front().map_or(end, |s| s.end);
-        let active = self.remote_heard.is_some_and(|h| h + ACTIVE_RETRY_TIMEOUT > now);
+        let active = self
+            .remote_heard
+            .is_some_and(|h| h + ACTIVE_RETRY_TIMEOUT > now);
         if end != back.end {
             let clock = *self.mindelay_clock.get_or_insert(now);
             self.next_send_time = (clock + SEND_MINDELAY).max(back.at + self.send_interval());
@@ -550,7 +552,12 @@ impl Client {
         }
     }
 
-    fn send_instruction(&mut self, diff: Vec<u8>, new_num: u64, now: u64) -> Result<Vec<Vec<u8>>, Fatal> {
+    fn send_instruction(
+        &mut self,
+        diff: Vec<u8>,
+        new_num: u64,
+        now: u64,
+    ) -> Result<Vec<Vec<u8>>, Fatal> {
         let chaff = self.next_chaff();
         let inst = Instruction {
             protocol_version: PROTOCOL_VERSION,
@@ -632,7 +639,11 @@ impl Client {
         if let Some(text) = &notice {
             overlay(&mut next, text);
         }
-        let out = screen::render(!self.repaint && self.shown_num.is_some(), &self.shown, &next);
+        let out = screen::render(
+            !self.repaint && self.shown_num.is_some(),
+            &self.shown,
+            &next,
+        );
         self.shown = next;
         self.shown_num = Some(latest.num);
         self.repaint = false;
@@ -645,9 +656,7 @@ impl Client {
             return Some("mosh: Exiting...".into());
         }
         match self.last_heard {
-            None if now.saturating_sub(self.started) > 250 => {
-                Some("mosh: Connecting...".into())
-            }
+            None if now.saturating_sub(self.started) > 250 => Some("mosh: Connecting...".into()),
             Some(at) if now.saturating_sub(at) > LATE => {
                 let secs = now.saturating_sub(at) / 1000;
                 Some(if secs < 60 {
@@ -769,7 +778,10 @@ mod tests {
         assert_eq!(first.len(), 1);
         let (inst, diff) = s.take(&first[0]).unwrap();
         assert_eq!((inst.old_num, inst.new_num, inst.ack_num), (0, 1, 0));
-        assert_eq!(diff, user_message(&[UserEvent::Resize { cols: 80, rows: 24 }]));
+        assert_eq!(
+            diff,
+            user_message(&[UserEvent::Resize { cols: 80, rows: 24 }])
+        );
 
         // The server's first screen, from state 0.
         c.receive(&s.send(0, 1, 1, b"hello"), 30).unwrap();
@@ -836,7 +848,10 @@ mod tests {
         };
         let mut text = vec![0, 1, 0xFF, 0xFF];
         text.extend(frag.to_bytes());
-        p = s.session.encrypt(crate::wire::TO_CLIENT | 77, &text).unwrap_or(p);
+        p = s
+            .session
+            .encrypt(crate::wire::TO_CLIENT | 77, &text)
+            .unwrap_or(p);
         assert_eq!(
             c.receive(&p, 1),
             Err(Fatal::Protocol(WireError::Version(3)))
@@ -886,7 +901,11 @@ mod tests {
         c.receive(&p, 1080).unwrap();
         assert_eq!(c.srtt(), 80.0);
         assert!(!c.frame(1100).unwrap().contains("mosh:"));
-        assert!(c.frame(9000).unwrap().contains("Last contact 7 seconds ago"));
+        assert!(
+            c.frame(9000)
+                .unwrap()
+                .contains("Last contact 7 seconds ago")
+        );
         assert!(!c.wants_new_port(9000));
         assert!(c.wants_new_port(13_000));
         c.port_changed(13_000);

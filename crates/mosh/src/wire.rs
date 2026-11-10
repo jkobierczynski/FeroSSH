@@ -70,11 +70,9 @@ impl Packet {
         if nonce & TO_CLIENT == 0 {
             return Err(WireError::WrongDirection);
         }
-        let (Some(ts), Some(reply), Some(payload)) = (
-            plaintext.get(0..2),
-            plaintext.get(2..4),
-            plaintext.get(4..),
-        ) else {
+        let (Some(ts), Some(reply), Some(payload)) =
+            (plaintext.get(0..2), plaintext.get(2..4), plaintext.get(4..))
+        else {
             return Err(WireError::Short);
         };
         Ok(Self {
@@ -522,7 +520,10 @@ mod tests {
         assert_eq!(a.add(frags[2].clone()), None);
         assert_eq!(a.add(frags[0].clone()), None);
         assert_eq!(a.add(frags[0].clone()), None);
-        assert_eq!(a.add(frags[1].clone()), Some(vec![0, 0, 0, 1, 1, 1, 2, 2, 2]));
+        assert_eq!(
+            a.add(frags[1].clone()),
+            Some(vec![0, 0, 0, 1, 1, 1, 2, 2, 2])
+        );
         // A newer instruction replaces a half-built one.
         assert_eq!(a.add(frags[0].clone()), None);
         let lone = Fragment {
@@ -549,6 +550,9 @@ mod tests {
             Err(WireError::WrongDirection)
         );
         assert_eq!(Packet::from_server(nonce | TO_CLIENT, &text).unwrap(), p);
-        assert_eq!(Packet::from_server(TO_CLIENT, &[1, 2, 3]), Err(WireError::Short));
+        assert_eq!(
+            Packet::from_server(TO_CLIENT, &[1, 2, 3]),
+            Err(WireError::Short)
+        );
     }
 }

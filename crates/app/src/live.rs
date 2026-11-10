@@ -43,6 +43,7 @@ pub fn clean_name(text: &str) -> Option<String> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Kind {
     Ssh,
+    Mosh,
     Telnet,
     Serial,
     Tmux,
@@ -54,6 +55,7 @@ impl Kind {
     fn name(self) -> &'static str {
         match self {
             Kind::Ssh => "SSH",
+            Kind::Mosh => "Mosh",
             Kind::Telnet => "Telnet",
             Kind::Serial => "serial",
             Kind::Tmux => "tmux",

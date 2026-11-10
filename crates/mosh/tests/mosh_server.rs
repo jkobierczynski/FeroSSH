@@ -4,7 +4,12 @@
 //! when `mosh-server` is not installed, unless FEROSSH_REQUIRE_MOSH is
 //! set (as in CI).
 
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing
+)]
 
 use std::net::UdpSocket;
 use std::process::Command;
@@ -16,7 +21,19 @@ use ferossh_mosh::screen::Screen;
 
 fn start(shell: &str) -> Option<(u16, [u8; 16])> {
     let out = Command::new("mosh-server")
-        .args(["new", "-i", "127.0.0.1", "-c", "256", "-l", "LANG=C.UTF-8", "--", "/bin/sh", "-c", shell])
+        .args([
+            "new",
+            "-i",
+            "127.0.0.1",
+            "-c",
+            "256",
+            "-l",
+            "LANG=C.UTF-8",
+            "--",
+            "/bin/sh",
+            "-c",
+            shell,
+        ])
         .env("MOSH_SERVER_NETWORK_TMOUT", "30")
         .output();
     let out = match out {
@@ -140,7 +157,8 @@ fn types_into_a_real_server_and_sees_the_screen() {
     );
     // Lots of output scrolls, and the pane ends up the same as the
     // server's screen.
-    r.client.keys(b"i=0; while [ $i -lt 300 ]; do echo line $i; i=$((i+1)); done\r");
+    r.client
+        .keys(b"i=0; while [ $i -lt 300 ]; do echo line $i; i=$((i+1)); done\r");
     assert!(
         r.until(15, |r| r.screen_text().contains("line 299")),
         "no scroll: {}",
@@ -188,8 +206,11 @@ fn survives_packet_loss() {
     assert!(r.until(20, |r| r.screen_text().contains("ready>")));
     for round in 0..5 {
         r.client.keys(
-            format!("i=0; while [ $i -lt 60 ]; do echo line $((i+{})); i=$((i+1)); done\r", round * 100)
-                .as_bytes(),
+            format!(
+                "i=0; while [ $i -lt 60 ]; do echo line $((i+{})); i=$((i+1)); done\r",
+                round * 100
+            )
+            .as_bytes(),
         );
         let want = format!("line {}", round * 100 + 59);
         assert!(
@@ -201,5 +222,9 @@ fn survives_packet_loss() {
     r.loss = 0;
     assert!(r.until(5, |r| r.screen_text().matches("ready>").count() >= 1));
     let lines = r.numbered();
-    assert!(lines.windows(2).all(|w| w[1] == w[0] + 1), "{lines:?}\n{}", r.screen_text());
+    assert!(
+        lines.windows(2).all(|w| w[1] == w[0] + 1),
+        "{lines:?}\n{}",
+        r.screen_text()
+    );
 }

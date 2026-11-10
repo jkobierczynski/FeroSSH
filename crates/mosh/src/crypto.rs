@@ -154,10 +154,19 @@ mod tests {
     fn keys_are_22_letters_for_16_bytes() {
         let key = parse_key("AAECAwQFBgcICQoLDA0ODw").unwrap();
         assert_eq!(*key, core::array::from_fn::<u8, 16, _>(|i| i as u8));
-        assert_eq!(parse_key("AAECAwQFBgcICQoLDA0ODx"), Err(CryptoError::BadKey));
+        assert_eq!(
+            parse_key("AAECAwQFBgcICQoLDA0ODx"),
+            Err(CryptoError::BadKey)
+        );
         assert_eq!(parse_key("AAECAwQFBgcICQoLDA0OD"), Err(CryptoError::BadKey));
-        assert_eq!(parse_key("AAECAwQFBgcICQoLDA0OD="), Err(CryptoError::BadKey));
-        assert_eq!(parse_key("AAECAwQFBgcICQoLDA0ODwA"), Err(CryptoError::BadKey));
+        assert_eq!(
+            parse_key("AAECAwQFBgcICQoLDA0OD="),
+            Err(CryptoError::BadKey)
+        );
+        assert_eq!(
+            parse_key("AAECAwQFBgcICQoLDA0ODwA"),
+            Err(CryptoError::BadKey)
+        );
     }
 
     #[test]
@@ -191,9 +200,7 @@ mod tests {
             0xBB, 0xAA, 0x99, 0x88, 0x77, 0x66, 0x55, 0x44, 0x33, 0x22, 0x11, 0x03,
         ];
         let mut body: Vec<u8> = (0u8..8).collect();
-        cipher
-            .encrypt_in_place(&n.into(), &[], &mut body)
-            .unwrap();
+        cipher.encrypt_in_place(&n.into(), &[], &mut body).unwrap();
         let want = [
             0x45, 0xDD, 0x69, 0xF8, 0xF5, 0xAA, 0xE7, 0x24, 0x14, 0x05, 0x4C, 0xD1, 0xF3, 0x5D,
             0x82, 0x76, 0x0B, 0x2C, 0xD0, 0x0D, 0x2F, 0x99, 0xBF, 0xA9,

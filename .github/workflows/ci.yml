@@ -200,6 +200,7 @@ jobs:
       FEROSSH_REQUIRE_LRZSZ: 1
       FEROSSH_REQUIRE_XVFB: 1
       FEROSSH_REQUIRE_XVNC: 1
+      FEROSSH_REQUIRE_MOSH: 1
     steps:
       - uses: actions/checkout@v4
       - run: rustup show active-toolchain
@@ -218,16 +219,18 @@ jobs:
       # Open virtual desktop's tests start Xvfb and x11vnc, and Xvnc, through sshd.
       # The Kerberos test runs MIT's KDC (krb5-kdc, and kadmin.local from
       # krb5-admin-server) for a throwaway realm in a temporary directory.
+      # The Mosh tests start Debian's mosh-server, directly and over sshd.
       - run: |
           sudo sed -i 's/^Types: deb$/Types: deb deb-src/' /etc/apt/sources.list.d/ubuntu.sources
           sudo apt-get update
-          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y openssh-server putty-tools xauth tmux dpkg-dev autoconf libssl-dev zlib1g-dev busybox-static lrzsz xvfb x11vnc tigervnc-standalone-server krb5-kdc krb5-admin-server
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y openssh-server putty-tools xauth tmux dpkg-dev autoconf libssl-dev zlib1g-dev busybox-static lrzsz xvfb x11vnc tigervnc-standalone-server krb5-kdc krb5-admin-server mosh
       - run: sudo mkdir -p /run/sshd
       - run: cargo test --locked -p ferossh-worker --test sshd
       - run: cargo test --locked -p ferossh-worker --test agent
       - run: cargo test --locked -p ferossh-worker --test kerberos
       - run: cargo test --locked -p ferossh-worker --test telnetd
       - run: cargo test --locked -p ferossh-zmodem --test lrzsz
+      - run: cargo test --locked -p ferossh-mosh --test mosh_server
       - run: interop/sk-dummy.sh "$RUNNER_TEMP/sk-dummy.so"
       - run: cargo test --locked -p ferossh-worker --test security_keys
         env:

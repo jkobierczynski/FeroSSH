@@ -70,6 +70,7 @@ impl Rendition {
         let mut s = String::from("\x1b[0");
         for (bit, code) in [
             (BOLD, ";1"),
+            (FAINT, ";2"),
             (ITALIC, ";3"),
             (UNDERLINE, ";4"),
             (BLINK, ";5"),
@@ -476,7 +477,8 @@ impl Screen {
         }
         self.ds.width = width;
         self.ds.height = height;
-        self.ds.snap(self.ds.cursor_row as i64, self.ds.cursor_col as i64);
+        self.ds
+            .snap(self.ds.cursor_row as i64, self.ds.cursor_col as i64);
         if let Some((r, c)) = self.ds.combining
             && (c >= width || r >= height)
         {
@@ -701,9 +703,7 @@ impl Screen {
                 } else if self.parser.state == State::Escape && u == u32::from(b']') {
                     self.parser.osc.clear();
                     self.parser.state = State::Osc;
-                } else if self.parser.state == State::Escape
-                    && matches!(c, 'P' | 'X' | '^' | '_')
-                {
+                } else if self.parser.state == State::Escape && matches!(c, 'P' | 'X' | '^' | '_') {
                     self.parser.state = State::Skip;
                 } else if (0x30..=0x7E).contains(&u) {
                     self.parser.state = State::Ground;
@@ -781,7 +781,8 @@ impl Screen {
             0x08 => self.ds.move_col(-1, true, false),
             0x09 => {
                 let col = ((self.ds.cursor_col / 8) + 1) * 8;
-                self.ds.move_col(col.min(self.ds.width - 1) as i64, false, false);
+                self.ds
+                    .move_col(col.min(self.ds.width - 1) as i64, false, false);
                 self.ds.next_print_wraps = saved;
             }
             0x0A..=0x0C | 0x84 => self.move_rows_autoscroll(1),
@@ -848,7 +849,8 @@ impl Screen {
         let private = self.parser.collect.as_slice() == b"?";
         let plain = self.parser.collect.is_empty();
         // Mode and rendition changes keep the pending wrap.
-        let keeps = matches!(c, 'h' | 'l') && private || plain && matches!(c, 'm' | 'g' | 'I' | 'Z');
+        let keeps =
+            matches!(c, 'h' | 'l') && private || plain && matches!(c, 'm' | 'g' | 'I' | 'Z');
         if !keeps {
             self.ds.next_print_wraps = false;
         }
@@ -872,7 +874,8 @@ impl Screen {
             'D' => self.ds.move_col(-n, true, false),
             'H' | 'f' => {
                 self.ds.move_row(i64::from(self.param(0, 1)) - 1, false);
-                self.ds.move_col(i64::from(self.param(1, 1)) - 1, false, false);
+                self.ds
+                    .move_col(i64::from(self.param(1, 1)) - 1, false, false);
             }
             'G' | '`' => self.ds.move_col(n - 1, false, false),
             'd' => self.ds.move_row(n - 1, false),
@@ -1249,10 +1252,13 @@ pub fn render(initialized: bool, last: &Screen, next: &Screen) -> String {
     {
         let clean = |s: &str| -> String { s.chars().filter(|c| !c.is_control()).collect() };
         if next.icon_name == next.title {
-            f.out.push_str(&format!("\x1b]0;{}\x07", clean(&next.title)));
+            f.out
+                .push_str(&format!("\x1b]0;{}\x07", clean(&next.title)));
         } else {
-            f.out.push_str(&format!("\x1b]1;{}\x07", clean(&next.icon_name)));
-            f.out.push_str(&format!("\x1b]2;{}\x07", clean(&next.title)));
+            f.out
+                .push_str(&format!("\x1b]1;{}\x07", clean(&next.icon_name)));
+            f.out
+                .push_str(&format!("\x1b]2;{}\x07", clean(&next.title)));
         }
     }
     if next.clipboard != f.last.clipboard {
@@ -1264,12 +1270,15 @@ pub fn render(initialized: bool, last: &Screen, next: &Screen) -> String {
         f.out.push_str(&format!("\x1b]52;c;{clip}\x07"));
     }
     if !initialized || next.ds.reverse_video != f.last.ds.reverse_video {
-        f.out
-            .push_str(if next.ds.reverse_video { "\x1b[?5h" } else { "\x1b[?5l" });
+        f.out.push_str(if next.ds.reverse_video {
+            "\x1b[?5h"
+        } else {
+            "\x1b[?5l"
+        });
     }
     let (w, h) = (next.width(), next.height());
     if !initialized || w != f.last.width() || h != f.last.height() {
-        f.out.push_str("\x1b[r\x1b[0m\x1b[H\x1b[2J");
+        f.out.push_str("\x1b[r\x1b[0m\x1b]8;;\x1b\\\x1b[H\x1b[2J");
         initialized = false;
         f.x = 0;
         f.y = 0;
@@ -1394,7 +1403,8 @@ pub fn render(initialized: bool, last: &Screen, next: &Screen) -> String {
     let (m, lm) = (next.ds.mouse, lds.mouse);
     if !initialized || m.reporting != lm.reporting {
         if m.reporting == 0 {
-            f.out.push_str("\x1b[?1003l\x1b[?1002l\x1b[?1001l\x1b[?1000l");
+            f.out
+                .push_str("\x1b[?1003l\x1b[?1002l\x1b[?1001l\x1b[?1000l");
         } else {
             if lm.reporting != 0 {
                 f.out.push_str(&format!("\x1b[?{}l", lm.reporting));
@@ -1403,8 +1413,11 @@ pub fn render(initialized: bool, last: &Screen, next: &Screen) -> String {
         }
     }
     if !initialized || m.focus != lm.focus {
-        f.out
-            .push_str(if m.focus { "\x1b[?1004h" } else { "\x1b[?1004l" });
+        f.out.push_str(if m.focus {
+            "\x1b[?1004h"
+        } else {
+            "\x1b[?1004l"
+        });
     }
     if !initialized || m.encoding != lm.encoding {
         if m.encoding == 0 {
@@ -1430,20 +1443,31 @@ fn put_row(
 ) -> bool {
     let mut x = 0;
     let cells = &row.cells;
+    let mut wrote_last = false;
     if wrap && let Some(cell) = cells.first() {
         f.rendition(cell.rend, false);
         f.hyperlink(&cell.link, false);
-        f.cell(cell);
-        x += cell.width();
-        f.x += cell.width() as i64;
+        let cw = if cell.wide && next.width() < 2 {
+            f.out.push(' ');
+            1
+        } else {
+            f.cell(cell);
+            cell.width()
+        };
+        x += cw;
+        f.x += cw as i64;
+        wrote_last = x >= next.width();
     }
     if initialized && Arc::ptr_eq(row, old) {
+        if wrote_last {
+            f.x = -1;
+            f.y = -1;
+        }
         return false;
     }
     let wrap_this = row.wraps();
     let width = next.width();
     let mut clear = 0;
-    let mut wrote_last = false;
     let mut blank_rend = Rendition::default();
     let mut blank_link: Link = None;
     while x < width {
@@ -1486,7 +1510,10 @@ fn put_row(
                 continue;
             }
         }
-        let cw = cell.width();
+        // A wide character with no room for its right half (left there
+        // by a resize) would wrap the pane's terminal: draw a space.
+        let squeezed = cell.wide && x + 2 > width;
+        let cw = if squeezed { 1 } else { cell.width() };
         if wrap_this && x + cw >= width {
             f.x = -1;
             f.y = -1;
@@ -1494,7 +1521,11 @@ fn put_row(
         f.silent_move(y, x);
         f.rendition(cell.rend, false);
         f.hyperlink(&cell.link, false);
-        f.cell(cell);
+        if squeezed {
+            f.out.push(' ');
+        } else {
+            f.cell(cell);
+        }
         x += cw;
         f.x += cw as i64;
         if x >= width {
@@ -1516,6 +1547,12 @@ fn put_row(
         }
     }
     if !(wrote_last && y + 1 < next.height()) {
+        if wrote_last {
+            // The cursor sits on the last column with a wrap pending,
+            // where terminals differ: place it explicitly next time.
+            f.x = -1;
+            f.y = -1;
+        }
         return false;
     }
     if wrap_this {
@@ -1529,8 +1566,95 @@ fn put_row(
     false
 }
 
+/// How a terminal showing `last`, after the output of `render(init,
+/// last, next)`, differs from `next`, if it does: for tests and the
+/// fuzzer. The first cell of a row that starts with a combining
+/// character is drawn on a no-break space, so those compare without it.
+#[doc(hidden)]
+pub fn render_mismatch(init: bool, last: &Screen, next: &Screen) -> Option<String> {
+    let out = render(init, last, next);
+    // The pane is already the new size (the server follows the pane).
+    let mut shown = last.clone();
+    shown.resize(next.width(), next.height());
+    // What the server's programs set but Mosh never passes on: the pane
+    // has none of it (each frame leaves the scrolling region reset and
+    // the cursor placed).
+    let ds = &mut shown.ds;
+    ds.top = 0;
+    ds.bottom = ds.height - 1;
+    ds.origin = false;
+    ds.insert = false;
+    ds.autowrap = true;
+    ds.next_print_wraps = false;
+    shown.apply(out.as_bytes());
+    let norm = |c: &Cell| -> String {
+        // Blank, a space and a no-break space look the same (Mosh's
+        // `contents_match`).
+        if c.text.is_empty() || c.text == " " || c.text == "\u{a0}" {
+            return String::new();
+        }
+        if c.fallback {
+            c.text.clone()
+        } else {
+            c.text
+                .strip_prefix('\u{a0}')
+                .filter(|t| !t.is_empty())
+                .unwrap_or(&c.text)
+                .to_owned()
+        }
+    };
+    for y in 0..next.height() {
+        for x in 0..next.width() {
+            let (Some(a), Some(b)) = (shown.cell(y, x), next.cell(y, x)) else {
+                return Some(format!("cell {y},{x} missing"));
+            };
+            // The right half of a wide character shows that character,
+            // whatever a program later wrote there; Mosh draws it so too.
+            if x > 0 && next.cell(y, x - 1).is_some_and(|c| c.wide) {
+                continue;
+            }
+            if b.wide && x + 2 > next.width() {
+                continue;
+            }
+            if norm(a) != norm(b) || a.rend != b.rend || a.link != b.link || a.wide != b.wide {
+                return Some(format!(
+                    "cell {y},{x}: {a:?} != {b:?}; output {out:?}; last parser {:?} ds {:?}",
+                    last.parser, last.ds
+                ));
+            }
+        }
+    }
+    let (a, b) = (&shown.ds, &next.ds);
+    if (a.cursor_row, a.cursor_col) != (b.cursor_row, b.cursor_col) {
+        return Some(format!(
+            "cursor {:?} != {:?} (size {}x{}, last {}x{}); output {out:?}",
+            (a.cursor_row, a.cursor_col),
+            (b.cursor_row, b.cursor_col),
+            next.width(),
+            next.height(),
+            last.width(),
+            last.height()
+        ));
+    }
+    if a.rend != b.rend
+        || a.link != b.link
+        || a.cursor_visible != b.cursor_visible
+        || a.reverse_video != b.reverse_video
+        || a.bracketed_paste != b.bracketed_paste
+        || a.mouse.reporting != b.mouse.reporting
+        || a.mouse.encoding != b.mouse.encoding
+        || a.mouse.focus != b.mouse.focus
+    {
+        return Some(format!("modes {a:?} != {b:?}"));
+    }
+    if next.title_set && (shown.title != next.title || shown.icon_name != next.icon_name) {
+        return Some(format!("title {:?} != {:?}", shown.title, next.title));
+    }
+    None
+}
+
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::indexing_slicing)]
+#[allow(clippy::unwrap_used, clippy::indexing_slicing, clippy::panic)]
 mod tests {
     use super::*;
 
@@ -1538,7 +1662,13 @@ mod tests {
         s.rows[row]
             .cells
             .iter()
-            .map(|c| if c.text.is_empty() { " ".into() } else { c.text.clone() })
+            .map(|c| {
+                if c.text.is_empty() {
+                    " ".into()
+                } else {
+                    c.text.clone()
+                }
+            })
             .collect::<String>()
             .trim_end()
             .to_owned()
@@ -1552,7 +1682,11 @@ mod tests {
             let mut shown = last.clone();
             shown.apply(out.as_bytes());
             for y in 0..next.height() {
-                assert_eq!(text(&shown, y), text(next, y), "row {y} init {init}: {out:?}");
+                assert_eq!(
+                    text(&shown, y),
+                    text(next, y),
+                    "row {y} init {init}: {out:?}"
+                );
                 for x in 0..next.width() {
                     let (a, b) = (&shown.rows[y].cells[x], &next.rows[y].cells[x]);
                     assert_eq!(a.text, b.text, "{y},{x}");
@@ -1611,7 +1745,10 @@ mod tests {
     fn titles_and_links() {
         let mut s = Screen::new(10, 2);
         s.apply(b"\x1b]0;hi there\x07\x1b]8;id=1;http://x\x1b\\L\x1b]8;;\x1b\\M");
-        assert_eq!((s.title.as_str(), s.icon_name.as_str()), ("hi there", "hi there"));
+        assert_eq!(
+            (s.title.as_str(), s.icon_name.as_str()),
+            ("hi there", "hi there")
+        );
         assert_eq!(
             s.rows[0].cells[0].link.as_deref(),
             Some(&("id=1".to_owned(), "http://x".to_owned()))
@@ -1654,12 +1791,115 @@ mod tests {
         round_trip(&t, &s);
     }
 
+    /// Random output of the kinds mosh-server's renderer and ordinary
+    /// programs write: rendering any state to any later one, applied to
+    /// the first, gives the later one.
+    #[test]
+    fn rendering_reproduces_random_screens() {
+        let mut x: u64 = 0x2545_F491_4F6C_DD1D;
+        let mut rnd = |n: u64| {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x % n
+        };
+        for round in 0..400 {
+            let (w, h) = (1 + rnd(30) as usize, 1 + rnd(12) as usize);
+            let mut a = Screen::new(w, h);
+            let mut states = vec![a.clone()];
+            for _ in 0..6 {
+                let mut out = String::new();
+                for _ in 0..rnd(40) {
+                    match rnd(24) {
+                        0..=7 => {
+                            for _ in 0..rnd(12) {
+                                out.push(char::from(b' ' + rnd(95) as u8));
+                            }
+                        }
+                        8 => out.push_str(["漢", "字", "😀", "é"][rnd(4) as usize]),
+                        9 => out.push_str(["\u{301}", "\u{308}"][rnd(2) as usize]),
+                        10 => out.push_str("\r\n"),
+                        11 => out.push(['\r', '\n', '\x08', '\t', '\x07'][rnd(5) as usize]),
+                        12 => out.push_str(&format!(
+                            "\x1b[{};{}H",
+                            rnd(h as u64 + 2),
+                            rnd(w as u64 + 2)
+                        )),
+                        13 => out.push_str(&format!(
+                            "\x1b[{}{}",
+                            rnd(3),
+                            ["J", "K", "X", "@", "P", "L", "M"][rnd(7) as usize]
+                        )),
+                        14 => out.push_str(&format!(
+                            "\x1b[{};{};{}m",
+                            rnd(10),
+                            [31, 42, 93, 104, 39, 49, 22, 27][rnd(8) as usize],
+                            rnd(2)
+                        )),
+                        15 => out.push_str(&format!(
+                            "\x1b[38;5;{}m\x1b[48;2;{};2;3m",
+                            rnd(256),
+                            rnd(256)
+                        )),
+                        16 => out.push_str(&format!(
+                            "\x1b[{};{}r",
+                            1 + rnd(h as u64),
+                            1 + rnd(h as u64)
+                        )),
+                        17 => out.push_str("\x1b[r"),
+                        18 => out.push_str(
+                            [
+                                "\x1b[?25l",
+                                "\x1b[?25h",
+                                "\x1b[?2004h",
+                                "\x1b[?1000h",
+                                "\x1b[?1006h",
+                                "\x1b[?1004h",
+                                "\x1b[?5h",
+                                "\x1b[?1002l",
+                            ][rnd(8) as usize],
+                        ),
+                        19 => out.push_str(&format!("\x1b]{};t{}\x07", rnd(3), rnd(9))),
+                        20 => out.push_str(
+                            ["\x1b]8;;http://x\x1b\\", "\x1b]8;;\x1b\\"][rnd(2) as usize],
+                        ),
+                        21 => out.push_str(
+                            ["\x1b7", "\x1b8", "\x1bM", "\x1bD", "\x1bE"][rnd(5) as usize],
+                        ),
+                        22 => out.push_str(&format!(
+                            "\x1b[{}{}",
+                            rnd(4),
+                            ["S", "T", "A", "B", "C", "D"][rnd(6) as usize]
+                        )),
+                        _ => {
+                            let (nw, nh) = (1 + rnd(30) as usize, 1 + rnd(12) as usize);
+                            a.resize(nw, nh);
+                        }
+                    }
+                }
+                a.apply(out.as_bytes());
+                states.push(a.clone());
+            }
+            for (i, last) in states.iter().enumerate() {
+                for next in &states[i..] {
+                    for init in [true, false] {
+                        if let Some(why) = render_mismatch(init, last, next) {
+                            panic!("round {round} init {init}: {why}");
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     #[test]
     fn hostile_input_stays_bounded() {
         let mut s = Screen::new(3, 2);
         s.apply(b"\x1b[99999999999;99999999999H\x1b[99999@\x1b[99999P\x1b[99999L\x1b[99999M");
         s.apply(b"\x1b[99999X\x1b[0;0r\x1b[5;1r\x1b[2;99r\x1b[?6h\x1b[99B\x1b[S\x1b[T");
-        s.apply(&[0xF0, 0x9F, b'x', 0xC3, 0x28, 0xFF, 0x9B, b'2', b'J', 0x9D, b'0', b';', 0x07]);
+        s.apply(&[
+            0xF0, 0x9F, b'x', 0xC3, 0x28, 0xFF, 0x9B, b'2', b'J', 0x9D, b'0', b';', 0x07,
+        ]);
         let long = vec![b'a'; 100_000];
         s.apply(b"\x1b]0;");
         s.apply(&long);

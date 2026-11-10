@@ -994,8 +994,16 @@ async fn session(
             // without ChaCha20: AES-GCM goes first instead, which any
             // server without strict key exchange has.
             let stream = crate::tunnel::open(id, rx, ctx.out.clone(), connections.routes.clone());
-            match handshake(p, aes_gcm_first(preferred), stream, None, inbox, ctx, connections)
-                .await
+            match handshake(
+                p,
+                aes_gcm_first(preferred),
+                stream,
+                None,
+                inbox,
+                ctx,
+                connections,
+            )
+            .await
             {
                 Err(Failure::Ssh(e @ russh::Error::NoCommonAlgo { .. })) if !p.legacy => {
                     return Err(suggest_legacy(e));
@@ -1227,7 +1235,7 @@ async fn pump(
     ctx: &mut Ctx,
 ) -> Result<Closed, Failure> {
     if let Some(mosh) = ctx.options.mosh.clone() {
-        return mosh_session(conn, mosh, inbox, ctx).await;
+        return mosh_session(conn, *mosh, inbox, ctx).await;
     }
     let channel = drive(conn.channel_open_session(), inbox, ctx).await??;
     // X11 first: its reply is then the first one back.
@@ -1410,9 +1418,9 @@ async fn mosh_session(
             BootError::NoConnect(said) if said.is_empty() => {
                 "mosh-server did not start: is Mosh installed on the server?".to_owned()
             }
-            BootError::NoConnect(said) => format!(
-                "mosh-server did not start: {said} (is Mosh installed on the server?)"
-            ),
+            BootError::NoConnect(said) => {
+                format!("mosh-server did not start: {said} (is Mosh installed on the server?)")
+            }
             BootError::Malformed => "mosh-server's MOSH CONNECT line is malformed.".to_owned(),
         })
     })?;

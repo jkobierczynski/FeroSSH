@@ -113,6 +113,10 @@ pub struct Values {
     pub flow: Flow,
     /// The login script, one step per entry, as `expect Password:`.
     pub login_script: Vec<String>,
+    /// A Mosh session's server program; empty is `mosh-server`.
+    pub mosh_server: String,
+    /// A Mosh session's UDP port or range, as `60001:60010`.
+    pub mosh_ports: String,
 }
 
 /// Asking, Windows, the password manager templates, then a command of
@@ -232,6 +236,11 @@ impl Values {
         self.legacy = p.legacy_algorithms;
         (self.password, self.password_command) = password_choice(&p.password);
         self.login_script = p.login_script.iter().map(ToString::to_string).collect();
+        self.mosh_server = p.mosh_server.clone().unwrap_or_default();
+        self.mosh_ports = p
+            .mosh_ports
+            .map(ferossh_config::settings::mosh_ports_text)
+            .unwrap_or_default();
         if let Some(line) = &p.serial {
             self.speed = line.speed.to_string();
             self.framing = line.framing();
@@ -281,6 +290,8 @@ enum Field {
     Speed,
     Framing,
     Flow,
+    MoshServer,
+    MoshPorts,
     LoginStep(usize),
 }
 
@@ -325,6 +336,8 @@ impl Field {
             Field::Speed => "Speed",
             Field::Framing => "Framing",
             Field::Flow => "Flow ctrl",
+            Field::MoshServer => "Mosh server",
+            Field::MoshPorts => "UDP ports",
             Field::LoginStep(_) => "Login",
         }
     }
@@ -562,7 +575,7 @@ impl SessionForm {
                 _ => out.extend([Field::User, Field::Port].map(Item::Field)),
             }
             match kind {
-                SessionKind::Ssh => {
+                SessionKind::Ssh | SessionKind::Mosh => {
                     out.push(Item::Field(Field::Key));
                     if !self.field_locked(Field::Key) {
                         out.push(Item::Browse);
@@ -579,6 +592,11 @@ impl SessionForm {
                         }
                     }
                     out.push(Item::Field(Field::Jump));
+                    if kind == SessionKind::Mosh {
+                        out.extend([Field::MoshServer, Field::MoshPorts].map(Item::Field));
+                        out.push(Item::Note("SSH logs in and starts the server;".into()));
+                        out.push(Item::Note("then UDP to the host's ports.".into()));
+                    }
                 }
                 SessionKind::Rdp | SessionKind::Vnc => {
                     out.extend(
@@ -616,7 +634,7 @@ impl SessionForm {
         }
         if matches!(
             kind,
-            SessionKind::Ssh | SessionKind::Serial | SessionKind::Telnet
+            SessionKind::Ssh | SessionKind::Mosh | SessionKind::Serial | SessionKind::Telnet
         ) {
             out.push(Item::Section(1));
             if open[1] {
@@ -631,14 +649,18 @@ impl SessionForm {
                 );
             }
         }
-        if kind == SessionKind::Ssh {
+        if matches!(kind, SessionKind::Ssh | SessionKind::Mosh) {
             out.push(Item::Section(2));
             if open[2] {
-                out.push(Item::Field(Field::Tmux));
-                if self.values.tmux_on {
-                    out.push(Item::Field(Field::TmuxSession));
+                // tmux control mode needs SSH's byte stream; Mosh sends
+                // screens.
+                if kind == SessionKind::Ssh {
+                    out.push(Item::Field(Field::Tmux));
+                    if self.values.tmux_on {
+                        out.push(Item::Field(Field::TmuxSession));
+                    }
+                    out.push(Item::Field(Field::TmuxLayout));
                 }
-                out.push(Item::Field(Field::TmuxLayout));
                 out.push(Item::Field(Field::StartDir));
                 out.push(Item::Field(Field::LocalFolder));
                 out.push(Item::Field(Field::RemoteFolder));
@@ -650,31 +672,43 @@ impl SessionForm {
                         out.push(Item::Field(Field::Forward(i)));
                     }
                 }
-                out.extend(
-                    [
-                        Field::DesktopPort,
-                        Field::VncPort,
-                        Field::VirtualDesktop,
-                        Field::DesktopSize,
-                        Field::DeskClipboard,
-                        Field::RemoteApp,
-                        Field::CopyAgent,
-                        Field::RemoveAgent,
-                        Field::Clipboard,
-                        Field::ForwardAgent,
-                        Field::Kerberos,
-                        Field::KerberosDelegate,
-                        Field::Legacy,
-                    ]
-                    .map(Item::Field),
-                );
+                if kind == SessionKind::Mosh {
+                    out.extend(
+                        [
+                            Field::ForwardAgent,
+                            Field::Kerberos,
+                            Field::KerberosDelegate,
+                            Field::Legacy,
+                        ]
+                        .map(Item::Field),
+                    );
+                } else {
+                    out.extend(
+                        [
+                            Field::DesktopPort,
+                            Field::VncPort,
+                            Field::VirtualDesktop,
+                            Field::DesktopSize,
+                            Field::DeskClipboard,
+                            Field::RemoteApp,
+                            Field::CopyAgent,
+                            Field::RemoveAgent,
+                            Field::Clipboard,
+                            Field::ForwardAgent,
+                            Field::Kerberos,
+                            Field::KerberosDelegate,
+                            Field::Legacy,
+                        ]
+                        .map(Item::Field),
+                    );
+                }
             }
         }
         if matches!(
             kind,
-            SessionKind::Ssh | SessionKind::Serial | SessionKind::Telnet
+            SessionKind::Ssh | SessionKind::Mosh | SessionKind::Serial | SessionKind::Telnet
         ) {
-            if kind != SessionKind::Ssh {
+            if !matches!(kind, SessionKind::Ssh | SessionKind::Mosh) {
                 out.push(Item::Section(2));
             }
             if open[2] {
@@ -748,6 +782,8 @@ impl SessionForm {
             Field::RemoteApp => &v.remote_app,
             Field::PasswordCommand => &v.password_command,
             Field::Speed => &v.speed,
+            Field::MoshServer => &v.mosh_server,
+            Field::MoshPorts => &v.mosh_ports,
             Field::Type
             | Field::Theme
             | Field::Tmux
@@ -795,6 +831,8 @@ impl SessionForm {
             Field::DesktopSize => &mut v.desktop_size,
             Field::PasswordCommand => &mut v.password_command,
             Field::Speed => &mut v.speed,
+            Field::MoshServer => &mut v.mosh_server,
+            Field::MoshPorts => &mut v.mosh_ports,
             Field::Type
             | Field::Theme
             | Field::Tmux
@@ -825,6 +863,7 @@ impl SessionForm {
                 SessionKind::Vnc => "VNC desktop",
                 SessionKind::Serial => "Serial console",
                 SessionKind::Telnet => "Telnet (unencrypted)",
+                SessionKind::Mosh => "Mosh terminal (SSH + UDP)",
                 SessionKind::Xvfb => "Virtual desktop (Xvfb)",
                 SessionKind::RemoteApp => "Remote app (FeroStream)",
             }
@@ -923,6 +962,7 @@ impl SessionForm {
                     SessionKind::Vnc,
                     SessionKind::Xvfb,
                     SessionKind::RemoteApp,
+                    SessionKind::Mosh,
                     SessionKind::Telnet,
                     SessionKind::Serial,
                 ];
@@ -1009,8 +1049,10 @@ impl SessionForm {
             Field::Folder => "none".into(),
             Field::Host if v.kind == SessionKind::Serial => "COM port, e.g. COM3".into(),
             Field::Host
-                if !matches!(v.kind, SessionKind::Ssh | SessionKind::Telnet)
-                    && !v.via.trim().is_empty() =>
+                if !matches!(
+                    v.kind,
+                    SessionKind::Ssh | SessionKind::Mosh | SessionKind::Telnet
+                ) && !v.via.trim().is_empty() =>
             {
                 "the Via SSH host itself".into()
             }
@@ -1022,7 +1064,7 @@ impl SessionForm {
                 _ => h.local_user.clone(),
             },
             Field::Port => match v.kind {
-                SessionKind::Ssh => "22".into(),
+                SessionKind::Ssh | SessionKind::Mosh => "22".into(),
                 SessionKind::Rdp => "3389".into(),
                 SessionKind::Vnc => "5900".into(),
                 SessionKind::Telnet => "23".into(),
@@ -1056,6 +1098,8 @@ impl SessionForm {
             Field::DesktopSize => "follows the window, or e.g. 1920x1080".into(),
             Field::RemoteApp => "xterm, or e.g. gimp ~/photo.png".into(),
             Field::PasswordCommand => "program and arguments".into(),
+            Field::MoshServer => "mosh-server, or a path to it".into(),
+            Field::MoshPorts => "any in 60001-60999, or e.g. 60001:60010".into(),
             Field::Type
             | Field::Theme
             | Field::Tmux
@@ -1274,7 +1318,7 @@ impl SessionForm {
             }
             port(&v.port, "The port")?;
             let jump = v.jump.trim();
-            if v.kind == SessionKind::Ssh && !jump.is_empty() {
+            if matches!(v.kind, SessionKind::Ssh | SessionKind::Mosh) && !jump.is_empty() {
                 if !saved::valid_proxy_jump(jump) {
                     return Err(
                         "Jump host: a connection name or user@host:port; several go \
@@ -1315,7 +1359,7 @@ impl SessionForm {
         }
         let via = v.via.trim();
         match v.kind {
-            SessionKind::Ssh | SessionKind::Serial | SessionKind::Telnet => {}
+            SessionKind::Ssh | SessionKind::Mosh | SessionKind::Serial | SessionKind::Telnet => {}
             SessionKind::Vnc if via.is_empty() => {
                 return Err(
                     "A VNC desktop goes through an SSH connection: fill in Via SSH.".into(),
@@ -1364,7 +1408,7 @@ impl SessionForm {
         }
         if matches!(
             v.kind,
-            SessionKind::Ssh | SessionKind::Serial | SessionKind::Telnet
+            SessionKind::Ssh | SessionKind::Mosh | SessionKind::Serial | SessionKind::Telnet
         ) {
             let mut steps = Vec::new();
             let mut at = Vec::new();
@@ -1402,7 +1446,23 @@ impl SessionForm {
         if v.remote_app.chars().any(char::is_control) {
             return Err("The remote app cannot hold control characters.".into());
         }
-        if v.kind == SessionKind::Ssh
+        if v.kind == SessionKind::Mosh {
+            let server = v.mosh_server.trim();
+            if !server.is_empty() && !ferossh_config::settings::valid_mosh_server(server) {
+                return Err(
+                    "The Mosh server is a program name or path: letters, digits and / . _ - ~ + only."
+                        .into(),
+                );
+            }
+            if !v.mosh_ports.trim().is_empty()
+                && ferossh_config::settings::mosh_ports(&v.mosh_ports).is_none()
+            {
+                return Err(
+                    "UDP ports: one port such as 60001, or a range such as 60001:60010.".into(),
+                );
+            }
+        }
+        if matches!(v.kind, SessionKind::Ssh | SessionKind::Mosh)
             && v.password > PASSWORD_WINDOWS
             && v.password_command.trim().is_empty()
         {
@@ -1796,6 +1856,7 @@ impl SessionForm {
                     ..SavedHost::default()
                 }
             } else {
+                let ssh = matches!(v.kind, SessionKind::Ssh | SessionKind::Mosh);
                 SavedHost {
                     alias: name.clone(),
                     folder: trimmed(&v.folder),
@@ -1803,10 +1864,10 @@ impl SessionForm {
                     user: trimmed(&v.user),
                     port: v.port.trim().parse().ok().filter(|&p| p != 0),
                     identity_file: trimmed(&v.key),
-                    proxy_jump: trimmed(&v.jump).filter(|_| v.kind == SessionKind::Ssh),
-                    forward_agent: v.forward_agent && v.kind == SessionKind::Ssh,
-                    gssapi: v.kerberos.filter(|_| v.kind == SessionKind::Ssh),
-                    gssapi_delegate: v.kerberos_delegate && v.kind == SessionKind::Ssh,
+                    proxy_jump: trimmed(&v.jump).filter(|_| ssh),
+                    forward_agent: v.forward_agent && ssh,
+                    gssapi: v.kerberos.filter(|_| ssh),
+                    gssapi_delegate: v.kerberos_delegate && ssh,
                     forwards: v.forwards.iter().filter_map(|f| parse_option(f)).fold(
                         Vec::new(),
                         |mut all, f| {
@@ -1865,7 +1926,7 @@ impl SessionForm {
         p.font = trimmed(&v.font);
         p.font_size = v.font_size.trim().parse().ok();
         p.scrollback = v.scrollback.trim().parse().ok();
-        p.tmux = v.tmux_on.then(|| {
+        p.tmux = (v.tmux_on && v.kind != SessionKind::Mosh).then(|| {
             trimmed(&v.tmux)
                 .filter(|t| {
                     !ferossh_config::settings::tmux_off(t) && !ferossh_config::settings::tmux_on(t)
@@ -1888,15 +1949,15 @@ impl SessionForm {
             .filter(|d| *d != ferossh_config::settings::DesktopSize::Follow);
         p.legacy_algorithms = v.legacy;
         p.password = match (v.kind, v.password) {
-            (SessionKind::Ssh, PASSWORD_WINDOWS) => PasswordSource::Windows,
-            (SessionKind::Ssh, i) if i > PASSWORD_WINDOWS => {
+            (SessionKind::Ssh | SessionKind::Mosh, PASSWORD_WINDOWS) => PasswordSource::Windows,
+            (SessionKind::Ssh | SessionKind::Mosh, i) if i > PASSWORD_WINDOWS => {
                 PasswordSource::Command(v.password_command.trim().to_owned())
             }
             _ => PasswordSource::Ask,
         };
         p.login_script = if matches!(
             v.kind,
-            SessionKind::Ssh | SessionKind::Serial | SessionKind::Telnet
+            SessionKind::Ssh | SessionKind::Mosh | SessionKind::Serial | SessionKind::Telnet
         ) {
             v.login_script
                 .iter()
@@ -1905,6 +1966,10 @@ impl SessionForm {
         } else {
             Vec::new()
         };
+        let mosh = v.kind == SessionKind::Mosh;
+        p.mosh_server = trimmed(&v.mosh_server)
+            .filter(|s| mosh && s != ferossh_config::settings::DEFAULT_MOSH_SERVER);
+        p.mosh_ports = ferossh_config::settings::mosh_ports(&v.mosh_ports).filter(|_| mosh);
         p.serial = is_serial.then(|| {
             let mut line = LineSettings {
                 flow: v.flow,
@@ -2415,6 +2480,56 @@ mod tests {
     }
 
     #[test]
+    fn mosh_sessions_log_in_like_ssh_without_tmux() {
+        let mut f = new_form();
+        typed(&mut f, "laptop");
+        down(&mut f, 2);
+        // Type: SSH -> Serial -> Telnet -> Mosh, going back.
+        for _ in 0..3 {
+            f.key(SideKey::Left, 30);
+        }
+        assert_eq!(f.values.kind, SessionKind::Mosh);
+        let t = texts(&mut f);
+        assert!(t[4].contains("‹ Mosh terminal (SSH + UDP) ›"), "{:?}", t[4]);
+        assert!(t.iter().any(|l| l.contains("Key file")));
+        assert!(
+            t.iter()
+                .any(|l| l.contains("Mosh server") && l.contains("mosh-server"))
+        );
+        assert!(t.iter().any(|l| l.contains("UDP ports")));
+        let rows = f.native_rows();
+        assert!(rows.iter().any(|r| r.label == "Start dir"));
+        assert!(!rows.iter().any(|r| r.label == "tmux"), "no tmux over Mosh");
+        assert!(!rows.iter().any(|r| r.label == "RDP port"));
+        f.values.host = "box.example.org".into();
+        f.values.user = "me".into();
+        f.values.tmux_on = true;
+        f.values.mosh_server = "mosh-server; reboot".into();
+        assert!(f.check().is_err());
+        f.values.mosh_server = "~/bin/mosh-server".into();
+        f.values.mosh_ports = "60001-".into();
+        assert!(f.check().is_err());
+        f.values.mosh_ports = "60001-60010".into();
+        assert_eq!(f.check(), Ok(()));
+        let (mut hosts, mut settings) = (Vec::new(), Settings::default());
+        f.apply(&mut hosts, &mut settings);
+        assert_eq!(hosts[0].user.as_deref(), Some("me"));
+        let p = settings.profile("laptop").unwrap();
+        assert_eq!(p.kind, SessionKind::Mosh);
+        assert_eq!(p.mosh_server.as_deref(), Some("~/bin/mosh-server"));
+        assert_eq!(p.mosh_ports, Some((60001, 60010)));
+        assert_eq!(p.tmux, None);
+        // Back as it was saved.
+        let again = Values::default().with_profile(Some(p));
+        assert_eq!(again.mosh_ports, "60001:60010");
+        // Another type keeps no Mosh settings.
+        f.values.kind = SessionKind::Ssh;
+        f.apply(&mut hosts, &mut settings);
+        let p = settings.profile("laptop").unwrap();
+        assert_eq!((p.mosh_server.as_deref(), p.mosh_ports), (None, None));
+    }
+
+    #[test]
     fn forwards_grow_a_new_line() {
         let mut f = new_form();
         typed(&mut f, "web2");
@@ -2723,7 +2838,7 @@ mod tests {
         assert_eq!(row(&rows, "tmux").section, 2);
         assert!(rows.iter().any(|r| r.kind == NativeKind::Browse));
         let (options, selected) = choice(row(&rows, "Type"));
-        assert_eq!(options.len(), 7);
+        assert_eq!(options.len(), 8);
         assert_eq!(options[selected], "SSH terminal");
         let (options, _) = choice(row(&rows, "Theme"));
         assert_eq!(options, ["by theme rules", "Nord", "Dracula"]);

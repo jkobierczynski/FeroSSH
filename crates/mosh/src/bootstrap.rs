@@ -35,9 +35,9 @@ impl Default for ServerCommand {
 pub fn valid_program(program: &str) -> bool {
     !program.is_empty()
         && program.len() <= 256
-        && program
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'/' | b'.' | b'_' | b'-' | b'~' | b'+'))
+        && program.bytes().all(|b| {
+            b.is_ascii_alphanumeric() || matches!(b, b'/' | b'.' | b'_' | b'-' | b'~' | b'+')
+        })
 }
 
 fn quote(s: &str) -> String {
@@ -131,7 +131,10 @@ mod tests {
     #[test]
     fn command_lines() {
         let mut c = ServerCommand::default();
-        assert_eq!(c.line().unwrap(), "mosh-server new -s -c 256 -l LANG=C.UTF-8");
+        assert_eq!(
+            c.line().unwrap(),
+            "mosh-server new -s -c 256 -l LANG=C.UTF-8"
+        );
         c.ports = Some((60001, 60010));
         c.command = Some("tmux new -A -s it's".into());
         assert_eq!(

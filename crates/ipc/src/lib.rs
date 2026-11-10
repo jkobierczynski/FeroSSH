@@ -135,7 +135,7 @@ pub struct ShellOptions {
     pub agent: bool,
     /// Start `mosh-server` instead of a shell and carry the terminal over
     /// Mosh (UDP) from then on; `command` is what Mosh runs.
-    pub mosh: Option<MoshOptions>,
+    pub mosh: Option<Box<MoshOptions>>,
 }
 
 /// How a Mosh session starts its server.
@@ -1997,10 +1997,10 @@ impl<'a> Reader<'a> {
             pty: self.bool()?,
             agent: self.bool()?,
             mosh: self.opt(|r| {
-                Ok(MoshOptions {
+                Ok(Box::new(MoshOptions {
                     server: r.string()?,
                     ports: r.opt(|r| Ok((r.u16()?, r.u16()?)))?,
-                })
+                }))
             })?,
         })
     }
@@ -2209,10 +2209,10 @@ mod tests {
                     command: Some("tmux new -A -s \"my s\"".into()),
                     pty: false,
                     agent: true,
-                    mosh: Some(MoshOptions {
+                    mosh: Some(Box::new(MoshOptions {
                         server: "/opt/bin/mosh-server".into(),
                         ports: Some((60001, 60010)),
-                    }),
+                    })),
                 },
                 family: Family::V6,
                 gssapi: true,

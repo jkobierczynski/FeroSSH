@@ -131,7 +131,7 @@ impl Session {
 /// The port to write: none for the kind's usual one.
 pub(crate) fn port(kind: SessionKind, port: Option<u32>) -> Option<u16> {
     let usual = match kind {
-        SessionKind::Ssh => 22,
+        SessionKind::Ssh | SessionKind::Mosh => 22,
         SessionKind::Rdp => DEFAULT_DESKTOP_PORT,
         SessionKind::Vnc => DEFAULT_VNC_PORT,
         SessionKind::Telnet => DEFAULT_TELNET_PORT,

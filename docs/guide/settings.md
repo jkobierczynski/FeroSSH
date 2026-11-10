@@ -110,7 +110,9 @@ Profile web1
 | `RemoteAppRemoveAgent yes` or `no` | Overrides `RemoteAppRemoveAgent` for this connection. |
 | `RemoteAppClipboard to-host`, `from-host` or `off` | Narrows the clipboard for this connection's remote apps (*App clip*); it never widens the global setting. |
 | `DesktopClipboard to-host`, `from-host` or `off` | Narrows the clipboard for this connection's remote and virtual desktops (*Desk clip*); it never widens the global setting. A desktop opened through another connection is held to both connections' limits. |
-| `Type ssh`, `telnet`, `serial`, `rdp`, `vnc`, `xvfb` or `remoteapp` | The kind of connection; `xvfb` is a virtual desktop and `remoteapp` a remote app, both on the `Via` host. |
+| `Type ssh`, `mosh`, `telnet`, `serial`, `rdp`, `vnc`, `xvfb` or `remoteapp` | The kind of connection; `mosh` logs in over SSH and runs the terminal over [Mosh](everyday-use.md#mosh), `xvfb` is a virtual desktop and `remoteapp` a remote app, both on the `Via` host. |
+| `MoshServer PROGRAM` | For a Mosh connection: the server program, when not `mosh-server` on the path, such as `~/bin/mosh-server`. |
+| `MoshPorts 60001:60010` | For a Mosh connection: the UDP port, or range of ports, the server may listen on. Unset, any free one from 60001 to 60999. |
 | `Serial 115200,8N1,rtscts` | For a serial console: speed, framing (8N1, 8E1, 8O1, 7E1, 7O1, 8N2) and flow control (`none`, `xonxoff`, `rtscts`, `dsrdtr`), in any order. Left out: 9600, 8N1, none. |
 | `LoginScript STEP` | One step of the login script, one line per step: `expect TEXT`, `send TEXT`, `password`, `secret NAME`, `pause SECONDS`, and the logic steps such as `on TEXT goto LABEL` and `label LABEL`. See [Login scripts](everyday-use.md#login-scripts). |
 | `Via SESSION` | For RDP, VNC, virtual desktops and remote apps: log in to this saved SSH connection first and tunnel the desktop through it. |

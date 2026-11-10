@@ -1470,10 +1470,10 @@ async fn mosh_session_after_an_ssh_login() {
             shell: true,
             options: ferossh_ipc::ShellOptions {
                 command: Some("PS1='mosh> ' exec /bin/sh -i".into()),
-                mosh: Some(ferossh_ipc::MoshOptions {
+                mosh: Some(Box::new(ferossh_ipc::MoshOptions {
                     server: "mosh-server".into(),
                     ports: None,
-                }),
+                })),
                 ..Default::default()
             },
             family: Default::default(),
@@ -1556,5 +1556,8 @@ async fn mosh_session_after_an_ssh_login() {
         to_worker.send(reply).await.unwrap();
     };
     assert_eq!(step, 3, "{reason}: {}", text(&screen));
-    assert!(cipher.starts_with("Mosh aes128-ocb, UDP 127.0.0.1:"), "{cipher}");
+    assert!(
+        cipher.starts_with("Mosh aes128-ocb, UDP 127.0.0.1:"),
+        "{cipher}"
+    );
 }

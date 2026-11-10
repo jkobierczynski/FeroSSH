@@ -19,6 +19,9 @@ use ferossh_ipc::{
 /// what the window can show.
 const BACKLOG: usize = 256;
 
+// A message is as big here as on every channel it passes through; boxing
+// it would add an allocation per message for nothing.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug)]
 pub enum LinkEvent {
     Message(Message),
