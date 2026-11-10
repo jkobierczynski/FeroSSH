@@ -48,7 +48,13 @@ mod live_panel;
 #[cfg(windows)]
 mod native;
 #[cfg(windows)]
+mod script_args;
+#[cfg(windows)]
 mod script_editor;
+#[cfg(windows)]
+mod script_hosts;
+#[cfg(windows)]
+mod script_report;
 #[cfg(windows)]
 mod scripts_panel;
 // Platform-neutral, tested everywhere; only the Windows build uses them.

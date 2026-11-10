@@ -126,7 +126,7 @@ Insert or New adds a script (what you typed as a search becomes its name), F2 or
 
 **Enter or not, per line.** In the editor, Enter ends a line, and that line is typed with Enter after it. Shift+Enter ends a line that is typed without Enter: it becomes an `@type` line, so a script can fill in a command and leave it for you to check, or type a password prompt's answer only after a `@key`.
 
-**Arguments.** `$1` to `$9`, or `${1:Gi0/1}` with a default, are asked for in the side pane before the script is typed, prefilled with the defaults, with a preview of what will be typed. `$$` types a plain `$`; other `$` text such as `$HOME` is left alone.
+**Arguments.** `$1` to `$9`, or `${1:Gi0/1}` with a default, are asked for in the side pane before the script is typed, prefilled with the defaults, with a preview of what will be typed. Each argument has its own box: Enter goes to the next box and runs the script from the last one, Shift+Enter runs it from any box, and Escape cancels. `$$` types a plain `$`; other `$` text such as `$HOME` is left alone.
 
 **Variables** fill themselves in: `${session}`, `${host}`, `${user}`, `${port}`, `${date}`, `${time}`, `${stamp}` (safe in file names) and `${clipboard}`. For example `copy run tftp://10.0.0.5/${host}-${stamp}.cfg`.
 
@@ -209,9 +209,9 @@ A script with `@pane` or `@tab` runs from one pane: with broadcast input on it s
 
 ### Runs on many hosts
 
-F5 on a script picks saved SSH connections to run it on, without opening them first. Space picks a host, or a whole folder on its heading; the hosts the script is kept to come picked. *At once* sets how many run together (4 by default, 1 to 16), and a password typed for the run is kept in memory only.
+F5 on a script picks saved SSH connections to run it on, without opening them first. Tick the connections in the list, grouped by folder with each folder's picked count; Space ticks the selected one, the search box narrows the list, and Pick shown or Clear shown ticks or clears every connection the search keeps. The hosts the script is kept to come picked. Enter or Run starts the run, Escape goes back to the scripts. *At once* sets how many run together (4 by default, 1 to 16), and a password typed for the run is kept in memory only.
 
-Each host logs in in a session of its own that no tab shows, with its own sandboxed worker (or a new channel on a connection already open). The report shows each host queued, logging in, running, done or failed, and Enter on a row brings that session into a tab, live. A run never accepts a host key and never asks a question: a host with an unknown key, or a login that wants a password or a code, fails with what it asked, and you can show it and answer by hand. Each host gets 2 minutes. Esc stops the run, R runs the failed hosts again, and closing the report ends the sessions it opened. Production hosts in a run are confirmed once, all listed.
+Each host logs in in a session of its own that no tab shows, with its own sandboxed worker (or a new channel on a connection already open). The report shows each host queued, logging in, running, done or failed, and Enter on a row brings that session into a tab, live. A run never accepts a host key and never asks a question: a host with an unknown key, or a login that wants a password or a code, fails with what it asked, and you can show it and answer by hand. Each host gets 2 minutes. Esc or Stop run stops the run, R or Retry failed runs the failed hosts again, C or Copy copies the report as a table and S or Save CSV saves it, and closing the report ends the sessions it opened. Production hosts in a run are confirmed once, all listed.
 
 ### Auto-responses
 

@@ -39,7 +39,7 @@ const HEADER: usize = 2;
 /// Lines under the list: the key help.
 const FOOTER: usize = 1;
 /// Longest name or line one can type.
-const MAX_TEXT: usize = 400;
+pub(crate) const MAX_TEXT: usize = 400;
 /// Lines in one snippet.
 const MAX_LINES: usize = 50;
 /// The fields above a snippet's lines: name, category, hosts, folders,
@@ -289,6 +289,9 @@ struct Asking {
     /// For a run on picked hosts: the hosts, how many at once and the
     /// run's password.
     on: Option<(Vec<Place>, usize, Option<Password>)>,
+    /// Another number for another run: the native page fills its boxes
+    /// anew.
+    serial: u64,
 }
 
 impl Asking {
@@ -444,6 +447,47 @@ enum ListRow {
     Snippet(usize),
 }
 
+/// How one host's run went, as the native report marks it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RowMark {
+    /// Queued, logging in or running.
+    Waiting,
+    Done,
+    Failed,
+    Stopped,
+}
+
+/// One host's row in the native report.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NativeReportRow {
+    pub label: String,
+    pub mark: RowMark,
+    /// Where it is: queued, logging in, waiting for some text, done, or
+    /// why it failed.
+    pub status: String,
+    /// What its `@capture` steps kept.
+    pub values: String,
+    /// Whether it has a session to show.
+    pub shown: bool,
+}
+
+/// A run's report, as the native page shows it (see
+/// [`SnippetsView::native_report`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NativeReport {
+    /// Another number for another report: its selection starts afresh.
+    pub serial: u64,
+    pub name: String,
+    pub rows: Vec<NativeReportRow>,
+    pub selected: usize,
+    /// Rows over.
+    pub over: usize,
+    /// A run on picked hosts still going: Escape stops it.
+    pub running: bool,
+    /// A run on picked hosts with failed or stopped rows to run again.
+    pub can_retry: bool,
+}
+
 /// A script as the native list shows it (see
 /// [`SnippetsView::native_rows`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -486,6 +530,54 @@ pub struct NativeDraft {
     pub focus: (usize, usize),
 }
 
+/// A script's arguments being asked for, as the native page shows them
+/// (see [`SnippetsView::native_ask`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NativeAsk {
+    /// Another number for another run: the boxes are filled anew.
+    pub serial: u64,
+    pub name: String,
+    /// The hosts it runs on; 0 for the focused pane.
+    pub hosts: usize,
+    /// Whether the last line is typed with Enter.
+    pub enter: bool,
+    /// Each argument's number and value.
+    pub args: Vec<(u8, String)>,
+    /// What will be typed, a line per step.
+    pub preview: Vec<String>,
+}
+
+/// One host the native picker lists.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NativePickHost {
+    /// Its place in the picker, to pick it.
+    pub index: usize,
+    pub folder: Option<String>,
+    pub name: String,
+    /// `user@host`.
+    pub detail: String,
+    pub picked: bool,
+}
+
+/// The host picker, as the native page shows it (see
+/// [`SnippetsView::native_picker`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NativePicker {
+    /// Another number for another picker: the boxes are filled anew.
+    pub serial: u64,
+    pub name: String,
+    /// The hosts the search keeps, by folder (hosts in no folder last).
+    pub hosts: Vec<NativePickHost>,
+    /// Hosts picked, of all of them (shown or not).
+    pub picked: usize,
+    pub total: usize,
+    pub filter: String,
+    pub parallel: String,
+    pub error: Option<String>,
+    /// The field at fault: 0 the list, 1 at once.
+    pub fault: usize,
+}
+
 /// A line made one typed without Enter, as Shift+Enter in the editor
 /// makes it (an `@type` line).
 pub fn without_enter(line: &str) -> String {
@@ -509,6 +601,10 @@ pub struct SnippetsView {
     /// The first report row shown.
     report_scroll: usize,
     picker: Option<Picker>,
+    /// Another number for another picker: the native page fills anew.
+    pick_serial: u64,
+    /// Another number for another report.
+    report_serial: u64,
 }
 
 /// Lines of the picker above its list: title, help, filter, at once,
@@ -703,6 +799,187 @@ impl SnippetsView {
         self.draft = None;
     }
 
+    /// The host picker, for the native page.
+    pub fn native_picker(&self) -> Option<NativePicker> {
+        let p = self.picker.as_ref()?;
+        let hosts = p
+            .lines()
+            .into_iter()
+            .filter_map(|l| match l {
+                PickLine::Host(i) => Some(i),
+                PickLine::Folder(_) => None,
+            })
+            .filter_map(|i| {
+                let h = p.hosts.get(i)?;
+                Some(NativePickHost {
+                    index: i,
+                    folder: h.place.folder.clone(),
+                    name: h.place.session.clone(),
+                    detail: h.detail.clone(),
+                    picked: h.picked,
+                })
+            })
+            .collect();
+        Some(NativePicker {
+            serial: self.pick_serial,
+            name: p.name.clone(),
+            hosts,
+            picked: p.picked(),
+            total: p.hosts.len(),
+            filter: p.filter.clone(),
+            parallel: p.parallel.clone(),
+            error: p.error.clone(),
+            fault: usize::from(p.field == PickField::Parallel),
+        })
+    }
+
+    /// Picks or drops host `index` of the picker.
+    pub fn native_pick(&mut self, index: usize, picked: bool) {
+        if let Some(p) = &mut self.picker
+            && let Some(h) = p.hosts.get_mut(index)
+        {
+            h.picked = picked;
+            p.error = None;
+        }
+    }
+
+    /// Picks or drops every host the search keeps.
+    pub fn native_pick_shown(&mut self, picked: bool) {
+        let Some(p) = &mut self.picker else {
+            return;
+        };
+        let shown: Vec<usize> = p
+            .lines()
+            .into_iter()
+            .filter_map(|l| match l {
+                PickLine::Host(i) => Some(i),
+                PickLine::Folder(_) => None,
+            })
+            .collect();
+        for i in shown {
+            if let Some(h) = p.hosts.get_mut(i) {
+                h.picked = picked;
+            }
+        }
+        p.error = None;
+    }
+
+    /// The picker's search box says `text`.
+    pub fn native_pick_filter(&mut self, text: &str) {
+        if let Some(p) = &mut self.picker {
+            p.filter = text.chars().filter(|c| !c.is_control()).take(60).collect();
+        }
+    }
+
+    /// Run on the native picker, with its At once and password boxes:
+    /// starts the run, asks for the arguments first, or (`None`) says
+    /// why not.
+    pub fn native_pick_start(&mut self, parallel: &str, password: Password) -> Option<SnipAction> {
+        let p = self.picker.as_mut()?;
+        p.parallel = parallel.trim().chars().take(2).collect();
+        p.password = password;
+        self.pick_start()
+    }
+
+    /// Cancel or Escape on the native picker: the list again.
+    pub fn native_pick_cancel(&mut self) {
+        self.picker = None;
+    }
+
+    /// The report shown, for the native page.
+    pub fn native_report(&self) -> Option<NativeReport> {
+        let r = self.report.as_ref()?;
+        let rows = r
+            .rows
+            .iter()
+            .map(|row| {
+                let (mark, status) = match &row.state {
+                    RowState::Queued => (RowMark::Waiting, "queued".to_owned()),
+                    RowState::Connecting => (RowMark::Waiting, "logging in".to_owned()),
+                    RowState::Running(Some(w)) => (RowMark::Waiting, format!("waiting for {w}")),
+                    RowState::Running(None) => (RowMark::Waiting, "running".to_owned()),
+                    RowState::Done => (RowMark::Done, "done".to_owned()),
+                    RowState::Failed(why) => (RowMark::Failed, format!("failed: {why}")),
+                    RowState::Stopped => (RowMark::Stopped, "stopped".to_owned()),
+                };
+                NativeReportRow {
+                    label: row.label.clone(),
+                    mark,
+                    status,
+                    values: row.values.join(" · "),
+                    shown: row.pane.is_some(),
+                }
+            })
+            .collect();
+        Some(NativeReport {
+            serial: self.report_serial,
+            name: r.name.clone(),
+            rows,
+            selected: r.selected.min(r.rows.len().saturating_sub(1)),
+            over: r.rows.iter().filter(|row| row.state.over()).count(),
+            running: r.run.is_some() && !r.over(),
+            can_retry: r.run.is_some()
+                && r.rows
+                    .iter()
+                    .any(|row| matches!(row.state, RowState::Failed(_) | RowState::Stopped)),
+        })
+    }
+
+    /// Selects row `i` of the report.
+    pub fn native_report_select(&mut self, i: usize) {
+        if let Some(r) = &mut self.report {
+            r.selected = i.min(r.rows.len().saturating_sub(1));
+        }
+    }
+
+    /// The arguments being asked for, for the native page.
+    pub fn native_ask(&self) -> Option<NativeAsk> {
+        let a = self.asking.as_ref()?;
+        Some(NativeAsk {
+            serial: a.serial,
+            name: a.name.clone(),
+            hosts: a.on.as_ref().map_or(0, |(hosts, ..)| hosts.len()),
+            enter: a.enter,
+            args: a
+                .args
+                .iter()
+                .map(|g| g.number)
+                .zip(a.values.iter().cloned())
+                .collect(),
+            preview: a.filled().iter().map(preview).collect(),
+        })
+    }
+
+    /// The native page's boxes say `values`, one per argument, cut to
+    /// what the drawn page took.
+    pub fn native_ask_values(&mut self, values: Vec<String>) {
+        let Some(a) = &mut self.asking else {
+            return;
+        };
+        for (v, new) in a.values.iter_mut().zip(values) {
+            *v = new
+                .chars()
+                .filter(|c| !c.is_control())
+                .take(MAX_TEXT)
+                .collect();
+        }
+    }
+
+    /// Run on the native page: types the script, or starts the run on the
+    /// picked hosts.
+    pub fn native_ask_run(&mut self, values: Vec<String>) -> Option<SnipAction> {
+        self.native_ask_values(values);
+        let done = self.asking.as_mut()?.done();
+        self.asking = None;
+        Some(done)
+    }
+
+    /// Cancel or Escape on the native page: back to the terminal, as the
+    /// drawn page went.
+    pub fn native_ask_cancel(&mut self) -> Option<SnipAction> {
+        self.asking.take().map(|_| SnipAction::Leave)
+    }
+
     /// The selected script's place among [`Self::native_rows`].
     /// Kept within the shown ones: a delete may leave it past the end.
     pub fn native_selected(&self, all: &[Snippet]) -> usize {
@@ -749,6 +1026,7 @@ impl SnippetsView {
         self.picker = None;
         self.report = Some(report);
         self.report_scroll = 0;
+        self.report_serial = DRAFTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Shows the page that picks the hosts to run a snippet on.
@@ -756,6 +1034,7 @@ impl SnippetsView {
         self.draft = None;
         self.asking = None;
         self.picker = Some(picker);
+        self.pick_serial = DRAFTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Whether the host picker is shown.
@@ -824,6 +1103,7 @@ impl SnippetsView {
             focus: 0,
             cursor: 0,
             on: None,
+            serial: DRAFTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
         };
         a.set_focus(0);
         self.draft = None;
@@ -1122,6 +1402,48 @@ impl SnippetsView {
         None
     }
 
+    /// Starts the run the picker set up: at once, or once its arguments
+    /// are asked for. `None` with the picker's error when it cannot.
+    fn pick_start(&mut self) -> Option<SnipAction> {
+        let p = self.picker.as_mut()?;
+        let (hosts, parallel) = p.start()?;
+        let password = (!p.password.0.is_empty()).then(|| p.password.clone());
+        let p = self.picker.take()?;
+        let args = login::args(&p.lines);
+        if args.is_empty() {
+            return Some(SnipAction::RunOn {
+                name: p.name,
+                hosts,
+                run: Run {
+                    lines: p.lines,
+                    args: Vec::new(),
+                    parallel,
+                    password,
+                },
+            });
+        }
+        // The variables differ per host: shown by name.
+        let vars = login::VARIABLES
+            .iter()
+            .map(|v| (*v, format!("${{{v}}}")))
+            .collect();
+        let mut a = Asking {
+            name: p.name,
+            lines: p.lines,
+            enter: true,
+            vars,
+            values: args.iter().map(|a| a.default.clone()).collect(),
+            args,
+            focus: 0,
+            cursor: 0,
+            on: Some((hosts, parallel, password)),
+            serial: DRAFTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+        };
+        a.set_focus(0);
+        self.asking = Some(a);
+        None
+    }
+
     fn pick_key(&mut self, key: SideKey, rows: usize) -> Option<SnipAction> {
         let p = self.picker.as_mut()?;
         let n = p.lines().len();
@@ -1137,43 +1459,7 @@ impl SnippetsView {
                 return None;
             }
             (f, SideKey::Tab) => p.field = next(f),
-            (_, SideKey::Enter { .. }) => {
-                let (hosts, parallel) = p.start()?;
-                let password = (!p.password.0.is_empty()).then(|| p.password.clone());
-                let p = self.picker.take()?;
-                let args = login::args(&p.lines);
-                if args.is_empty() {
-                    return Some(SnipAction::RunOn {
-                        name: p.name,
-                        hosts,
-                        run: Run {
-                            lines: p.lines,
-                            args: Vec::new(),
-                            parallel,
-                            password,
-                        },
-                    });
-                }
-                // The variables differ per host: shown by name.
-                let vars = login::VARIABLES
-                    .iter()
-                    .map(|v| (*v, format!("${{{v}}}")))
-                    .collect();
-                let mut a = Asking {
-                    name: p.name,
-                    lines: p.lines,
-                    enter: true,
-                    vars,
-                    values: args.iter().map(|a| a.default.clone()).collect(),
-                    args,
-                    focus: 0,
-                    cursor: 0,
-                    on: Some((hosts, parallel, password)),
-                };
-                a.set_focus(0);
-                self.asking = Some(a);
-                return None;
-            }
+            (_, SideKey::Enter { .. }) => return self.pick_start(),
             (PickField::List, SideKey::Up) => p.selected = p.selected.saturating_sub(1),
             (PickField::List, SideKey::Down) => p.selected += 1,
             (PickField::List, SideKey::PageUp) => {
@@ -2314,6 +2600,38 @@ mod tests {
     }
 
     #[test]
+    fn the_native_argument_page_previews_and_runs() {
+        let mut v = SnippetsView::default();
+        assert!(v.native_ask().is_none());
+        let lines: Vec<String> = vec!["interface $1".into(), "description ${2:uplink}".into()];
+        v.send("Port", &lines, true, Vec::new());
+        let a = v.native_ask().unwrap();
+        assert_eq!((a.name.as_str(), a.hosts, a.enter), ("Port", 0, true));
+        assert_eq!(a.args, [(1, String::new()), (2, "uplink".into())]);
+        assert_eq!(a.preview, ["interface ", "description uplink"]);
+        v.native_ask_values(vec!["Gi0/2\n".into(), "core".into()]);
+        let b = v.native_ask().unwrap();
+        assert_eq!(b.serial, a.serial, "the same run: the boxes stay");
+        assert_eq!(b.preview, ["interface Gi0/2", "description core"]);
+        assert_eq!(
+            v.native_ask_run(vec!["Gi0/3".into(), "core".into()]),
+            Some(SnipAction::Type {
+                name: "Port".into(),
+                steps: vec![
+                    Step::Send("interface Gi0/3".into()),
+                    Step::Send("description core".into()),
+                ],
+            })
+        );
+        assert!(!v.asking());
+        v.send("Port", &lines, true, Vec::new());
+        assert_ne!(v.native_ask().unwrap().serial, a.serial);
+        assert_eq!(v.native_ask_cancel(), Some(SnipAction::Leave));
+        assert!(!v.asking());
+        assert_eq!(v.native_ask_cancel(), None);
+    }
+
+    #[test]
     fn selections_and_pastes_become_lines() {
         let all = snippets();
         let mut v = SnippetsView::default();
@@ -2556,6 +2874,56 @@ mod tests {
     }
 
     #[test]
+    fn the_native_picker_picks_and_starts() {
+        let mut v = SnippetsView::default();
+        assert!(v.native_picker().is_none());
+        v.show_picker(picker());
+        let p = v.native_picker().unwrap();
+        assert_eq!((p.name.as_str(), p.picked, p.total), ("Version", 0, 3));
+        assert_eq!(
+            p.hosts.iter().map(|h| h.name.as_str()).collect::<Vec<_>>(),
+            ["sw1", "sw2", "web"]
+        );
+        // Nothing picked: refused, on the list.
+        assert_eq!(v.native_pick_start("4", Password::default()), None);
+        let p = v.native_picker().unwrap();
+        assert!(p.error.as_deref().unwrap().contains("Pick at least one"));
+        assert_eq!(p.fault, 0);
+        v.native_pick_filter("sw");
+        v.native_pick_shown(true);
+        v.native_pick_filter("");
+        let p = v.native_picker().unwrap();
+        assert_eq!(p.picked, 2);
+        assert!(p.error.is_none());
+        v.native_pick(1, false);
+        assert_eq!(v.native_picker().unwrap().picked, 1);
+        // A bad At once: refused, on that box.
+        assert_eq!(v.native_pick_start("99", Password::default()), None);
+        assert_eq!(v.native_picker().unwrap().fault, 1);
+        // The serial stays for the same picker.
+        let serial = v.native_picker().unwrap().serial;
+        assert_eq!(
+            v.native_pick_start(" 3 ", Password("pw".to_owned().into())),
+            None,
+            "asks for $1 first"
+        );
+        assert!(v.asking() && !v.picking());
+        let a = v.native_ask().unwrap();
+        assert_eq!(a.hosts, 1);
+        let Some(SnipAction::RunOn { hosts, run, .. }) = v.native_ask_run(vec!["IOS".into()])
+        else {
+            panic!("no run")
+        };
+        assert_eq!(hosts.len(), 1);
+        assert_eq!(run.parallel, 3);
+        assert_eq!(run.password.map(|p| p.0.to_string()).as_deref(), Some("pw"));
+        v.show_picker(picker());
+        assert_ne!(v.native_picker().unwrap().serial, serial);
+        v.native_pick_cancel();
+        assert!(!v.picking());
+    }
+
+    #[test]
     fn hosts_are_picked_then_arguments_asked_then_run() {
         let all = snippets();
         let mut v = SnippetsView::default();
@@ -2623,6 +2991,41 @@ mod tests {
             Some("s3cret")
         );
         assert!(!format!("{:?}", v).contains("s3cret"));
+    }
+
+    #[test]
+    fn the_native_report_says_how_each_host_went() {
+        let mut v = SnippetsView::default();
+        assert!(v.native_report().is_none());
+        let mut sw1 = ReportRow::new("sw1", Some(5), RowState::Running(Some("#".into())));
+        sw1.values = vec!["15.2".into(), "up".into()];
+        let rows = vec![
+            sw1,
+            ReportRow::new("sw2", None, RowState::Queued),
+            ReportRow::new("sw3", None, RowState::Failed("refused".into())),
+        ];
+        let run = Run {
+            lines: vec!["show clock".into()],
+            args: Vec::new(),
+            parallel: 1,
+            password: None,
+        };
+        v.show_report(Report::new("Clock", rows, Some(run)));
+        let r = v.native_report().unwrap();
+        assert_eq!((r.name.as_str(), r.over, r.running), ("Clock", 1, true));
+        assert!(r.can_retry);
+        assert_eq!(r.rows[0].status, "waiting for #");
+        assert_eq!(r.rows[0].values, "15.2 · up");
+        assert!(r.rows[0].shown && !r.rows[1].shown);
+        assert_eq!(r.rows[2].mark, RowMark::Failed);
+        assert_eq!(r.rows[2].status, "failed: refused");
+        v.native_report_select(9);
+        assert_eq!(v.native_report().unwrap().selected, 2);
+        let serial = r.serial;
+        v.show_report(Report::new("Clock", Vec::new(), None));
+        let r = v.native_report().unwrap();
+        assert_ne!(r.serial, serial);
+        assert!(!r.running && !r.can_retry);
     }
 
     #[test]
