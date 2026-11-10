@@ -940,18 +940,8 @@ fn layout(h: &Handles) {
         let _ = MoveWindow(h.sync, sync_x, (title - row) / 2, sync_w, row, true);
         let marks_w = px(108);
         let marks_x = sync_x - gap6 - marks_w;
+        with(|s| s.title_buttons_x = marks_x);
         let _ = MoveWindow(h.bookmarks, marks_x, (title - row) / 2, marks_w, row, true);
-        let refresh_w = px(76);
-        let refresh_x = marks_x - gap6 - refresh_w;
-        with(|s| s.title_buttons_x = refresh_x);
-        let _ = MoveWindow(
-            h.refresh,
-            refresh_x,
-            (title - row) / 2,
-            refresh_w,
-            row,
-            true,
-        );
         let check_w = px(160);
         let b = px(70);
         let name_w = (inner - check_w - 2 * b - 3 * gap6).max(0);
@@ -961,7 +951,19 @@ fn layout(h: &Handles) {
             let _ = ShowWindow(*c, if naming { SW_SHOWNA } else { SW_HIDE });
             x += w + gap6;
         }
-        let _ = MoveWindow(h.filter, pad, filter_y, inner, row, true);
+        // Refresh ends the filter's row: the title row is full on a
+        // narrow pane.
+        let refresh_w = px(76).min(inner / 3);
+        let filter_w = (inner - gap6 - refresh_w).max(0);
+        let _ = MoveWindow(h.filter, pad, filter_y, filter_w, row, true);
+        let _ = MoveWindow(
+            h.refresh,
+            pad + filter_w + gap6,
+            filter_y,
+            refresh_w,
+            row,
+            true,
+        );
         let (u, d) = if arrange.stacked {
             let cx = gap.x + gap.w / 2;
             let y = gap.y + (gap.h - bh) / 2;
