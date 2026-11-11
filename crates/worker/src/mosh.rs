@@ -59,6 +59,8 @@ pub enum Ended {
 pub struct Target {
     pub addr: SocketAddr,
     pub key: zeroize::Zeroizing<[u8; 16]>,
+    /// When typed text shows before the server echoes it.
+    pub predict: ferossh_mosh::predict::Mode,
 }
 
 async fn bind(addr: &SocketAddr) -> std::io::Result<UdpSocket> {
@@ -93,6 +95,7 @@ pub async fn run(
         u64::from_le_bytes(seed),
         now(),
     );
+    client.set_prediction(target.predict);
     let first = bind(&target.addr)
         .await
         .map_err(|e| format!("Could not open a UDP socket for Mosh: {e}."))?;

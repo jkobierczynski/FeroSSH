@@ -35,7 +35,9 @@ use ferossh_config::{
     ssh_config, winscp,
 };
 use ferossh_forward::x11::{Display, find_cookie, xauth_entries};
-use ferossh_ipc::{ChannelId, DirEntry, FORWARD_IDS, Message, MoshOptions, SftpReply, X11Auth};
+use ferossh_ipc::{
+    ChannelId, DirEntry, FORWARD_IDS, Message, MoshOptions, MoshPredict, SftpReply, X11Auth,
+};
 use ferossh_render::{
     CellMetrics, Cursor, FontSpec, Frame, Grid, PaneView, PixelRect, Renderer, Rgb, Theme,
     ThemeGroup,
@@ -5109,6 +5111,11 @@ impl Window {
                         .clone()
                         .unwrap_or_else(|| DEFAULT_MOSH_SERVER.to_owned()),
                     ports: p.mosh_ports,
+                    predict: match p.mosh_predict.as_deref() {
+                        Some("always") => MoshPredict::Always,
+                        Some("never") => MoshPredict::Never,
+                        _ => MoshPredict::Adaptive,
+                    },
                 })
             });
         // An `sftp://` address asks for file transfer only, whatever the

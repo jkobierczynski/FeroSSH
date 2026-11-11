@@ -46,7 +46,7 @@ use std::fmt;
 use zeroize::Zeroize;
 
 /// Protocol version carried in every frame. Bump on any wire change.
-pub const PROTOCOL_VERSION: u8 = 20;
+pub const PROTOCOL_VERSION: u8 = 21;
 
 /// Largest frame body accepted, in bytes. Terminal and SFTP data is chunked
 /// below this, so anything larger is a bug or an attack.
@@ -145,6 +145,18 @@ pub struct MoshOptions {
     pub server: String,
     /// The UDP port, or range of ports, the server may listen on.
     pub ports: Option<(u16, u16)>,
+    /// When typed text shows before the server echoes it.
+    pub predict: MoshPredict,
+}
+
+/// When a Mosh session shows typed text before the server echoes it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum MoshPredict {
+    /// Only on a slow link.
+    #[default]
+    Adaptive,
+    Always,
+    Never,
 }
 
 impl Default for ShellOptions {
@@ -1140,6 +1152,11 @@ impl Writer {
             self.opt(m.ports, |w, (low, high)| {
                 w.u16(low);
                 w.u16(high);
+            });
+            self.u8(match m.predict {
+                MoshPredict::Adaptive => 0,
+                MoshPredict::Always => 1,
+                MoshPredict::Never => 2,
             });
         }
     }
@@ -2295,6 +2312,11 @@ impl<'a> Reader<'a> {
                 Ok(Box::new(MoshOptions {
                     server: r.string()?,
                     ports: r.opt(|r| Ok((r.u16()?, r.u16()?)))?,
+                    predict: match r.u8()? {
+                        1 => MoshPredict::Always,
+                        2 => MoshPredict::Never,
+                        _ => MoshPredict::Adaptive,
+                    },
                 }))
             })?,
         })
@@ -2532,6 +2554,7 @@ mod tests {
                     mosh: Some(Box::new(MoshOptions {
                         server: "/opt/bin/mosh-server".into(),
                         ports: Some((60001, 60010)),
+                        predict: MoshPredict::Never,
                     })),
                 },
                 family: Family::V6,

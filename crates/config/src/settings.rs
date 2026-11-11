@@ -78,6 +78,7 @@
 //!     Type mosh
 //!     MoshServer ~/bin/mosh-server
 //!     MoshPorts 60001:60010
+//!     MoshPredict always
 //! Profile uploads
 //!     Type sftp
 //!     RemoteFolder /incoming
@@ -209,6 +210,9 @@ pub struct Profile {
     /// may listen on (a firewall's opening); any free one in 60001 to
     /// 60999 when unset.
     pub mosh_ports: Option<(u16, u16)>,
+    /// For a Mosh session: when typed text shows before the server
+    /// echoes it, `always` or `never`; only on a slow link when unset.
+    pub mosh_predict: Option<String>,
     /// For a WinRM session: the command its shell runs;
     /// [`DEFAULT_WINRM_COMMAND`] when unset.
     pub winrm_command: Option<String>,
@@ -345,6 +349,14 @@ pub fn mosh_ports(text: &str) -> Option<(u16, u16)> {
     let low: u16 = low.trim().parse().ok()?;
     let high: u16 = high.trim().parse().ok()?;
     (low != 0 && low <= high).then_some((low, high))
+}
+
+/// A Mosh echo prediction setting: `adaptive`, `always` or `never`,
+/// in any case.
+pub fn mosh_predict(text: &str) -> Option<&'static str> {
+    ["adaptive", "always", "never"]
+        .into_iter()
+        .find(|w| w.eq_ignore_ascii_case(text.trim()))
 }
 
 /// How [`mosh_ports`] reads a port or range back.
@@ -498,6 +510,7 @@ impl Profile {
             && self.desktop_clipboard.is_none()
             && self.mosh_server.is_none()
             && self.mosh_ports.is_none()
+            && self.mosh_predict.is_none()
             && self.winrm_command.is_none()
             && !self.winrm_https
     }
@@ -1230,6 +1243,13 @@ impl Settings {
                                 p.mosh_server = first.filter(|v| valid_mosh_server(v));
                             }
                             "moshports" => p.mosh_ports = first.as_deref().and_then(mosh_ports),
+                            "moshpredict" => {
+                                p.mosh_predict = first
+                                    .as_deref()
+                                    .and_then(mosh_predict)
+                                    .filter(|w| *w != "adaptive")
+                                    .map(str::to_owned);
+                            }
                             "winrmcommand" => {
                                 p.winrm_command = virtual_desktop(&raw_rest(line));
                             }
@@ -1542,6 +1562,9 @@ impl Settings {
             }
             if let Some(ports) = p.mosh_ports {
                 let _ = writeln!(out, "    MoshPorts {}", mosh_ports_text(ports));
+            }
+            if let Some(w) = &p.mosh_predict {
+                let _ = writeln!(out, "    MoshPredict {w}");
             }
             if let Some(c) = &p.winrm_command {
                 let _ = writeln!(out, "    WinrmCommand {c}");
@@ -1955,16 +1978,20 @@ Profile lab
     fn mosh_settings() {
         let s = Settings::parse(
             "Profile a\n    Type mosh\n    MoshServer /opt/mosh/bin/mosh-server\n    MoshPorts 60001-60010\n\
-             Profile b\n    Type mosh\n    MoshServer \"mosh-server; rm\"\n    MoshPorts 70000\n",
+             \x20   MoshPredict Never\n\
+             Profile b\n    Type mosh\n    MoshServer \"mosh-server; rm\"\n    MoshPorts 70000\n\
+             \x20   MoshPredict sometimes\n",
         );
         let a = s.profile("a").unwrap();
         assert_eq!(a.kind, SessionKind::Mosh);
         assert_eq!(a.mosh_server.as_deref(), Some("/opt/mosh/bin/mosh-server"));
         assert_eq!(a.mosh_ports, Some((60001, 60010)));
+        assert_eq!(a.mosh_predict.as_deref(), Some("never"));
         let b = s.profile("b").unwrap();
         assert_eq!(b.kind, SessionKind::Mosh);
         assert_eq!(b.mosh_server, None, "not a program name");
         assert_eq!(b.mosh_ports, None);
+        assert_eq!(b.mosh_predict, None, "not a setting");
         assert_eq!(Settings::parse(&s.to_text()), s);
         assert_eq!(mosh_ports("60001"), Some((60001, 60001)));
         assert_eq!(mosh_ports("60010:60001"), None);

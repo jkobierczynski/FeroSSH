@@ -153,7 +153,7 @@ Mosh keeps a terminal going when the network does not: on a laptop that moves be
 - If the server does not answer over UDP within 15 seconds, the pane says so: usually a firewall blocks the ports.
 - The SSH connection stays open next to the Mosh session for File transfer and port forwards. A Mosh tab never shares its connection with another tab.
 - tmux integration needs an SSH terminal (Mosh sends screens, not the byte stream tmux control mode needs); run `tmux` in a Mosh pane as usual. ZMODEM does not work over Mosh for the same reason. Logs, themes, login scripts, scripts and broadcast input work.
-- Typing shows when the server echoes it; Mosh's local echo prediction is not in this version yet.
+- **Local echo.** On a slow link, what you type shows at once instead of after a round trip, underlined while the server has not yet confirmed it. FeroSSH guesses only plain typing, Backspace, and Left and Right; after Enter or any other key it waits for the server before guessing again. It checks every guess against what the server then shows, drops them all when one was wrong, and shows a new run of guesses only once one has come true, so text a program hides (a password prompt) never shows. The form's **Local echo** picks when: *on a slow link* (the default: from about 30 ms round trip, or when an echo is late), *always*, or *never* (only what the server sends).
 
 ## WinRM (PowerShell on Windows servers)
 
