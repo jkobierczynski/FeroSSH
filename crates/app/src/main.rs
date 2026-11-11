@@ -138,6 +138,8 @@ mod ssh_e2e;
 #[cfg_attr(not(windows), allow(dead_code))]
 mod standby;
 #[cfg_attr(not(windows), allow(dead_code))]
+mod statusbar;
+#[cfg_attr(not(windows), allow(dead_code))]
 mod stream;
 #[cfg_attr(not(windows), allow(dead_code))]
 mod suggest;

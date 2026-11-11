@@ -47,6 +47,7 @@ Items with a check mark are switches: picking them turns the setting on or off, 
 | Tools rail | ✓ on | Shows a narrow bar of tool icons on the window's edge. A click opens or closes that tool; hover for its name. `ToolsRail`. |
 | Keep tools open | ✓ on | Off, an opened tool is a peek: clicking in the terminal, Esc, or connecting covers it again. Also the pin at the bottom of the rail. `ToolsPinned`. |
 | Tab strip | ✓ on | Shows the tab strip once there are two tabs. `TabStrip`. |
+| Server status bar | ✓ off | A row under the panes with the CPU, memory, root disk and network use of the server the focused pane is logged in to, sampled every 2 seconds on a channel of its own. `StatusBar`. |
 | Larger text | Ctrl+= (or Ctrl+wheel up) | Makes the focused pane's text bigger. |
 | Smaller text | Ctrl+- (or Ctrl+wheel down) | Makes it smaller. |
 | Reset text size | Ctrl+0 | Back to the pane's normal size. |

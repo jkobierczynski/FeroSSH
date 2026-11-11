@@ -566,6 +566,10 @@ pub struct Settings {
     pub window_colours: WindowColours,
     /// Show the tab strip when there are two or more tabs.
     pub tab_strip: bool,
+    /// Show the server status bar (CPU, memory, disk and network of the
+    /// focused pane's server) under the panes. Off unless turned on: it
+    /// runs a command on the server every few seconds.
+    pub status_bar: bool,
     pub copy_on_select: bool,
     pub right_click_paste: bool,
     /// Put the time in front of each line of plain session logs.
@@ -690,6 +694,7 @@ impl Default for Settings {
             tools_pinned: true,
             window_colours: WindowColours::default(),
             tab_strip: true,
+            status_bar: false,
             copy_on_select: false,
             right_click_paste: false,
             log_timestamps: false,
@@ -969,6 +974,10 @@ impl Settings {
                 "tabstrip" => {
                     block = Block::Top;
                     s.tab_strip = yes(&args).unwrap_or(true);
+                }
+                "statusbar" => {
+                    block = Block::Top;
+                    s.status_bar = yes(&args).unwrap_or(false);
                 }
                 "copyonselect" => {
                     block = Block::Top;
@@ -1346,6 +1355,7 @@ impl Settings {
         let _ = writeln!(out, "ToolsPinned {}", flag(self.tools_pinned));
         let _ = writeln!(out, "WindowColours {}", self.window_colours.name());
         let _ = writeln!(out, "TabStrip {}", flag(self.tab_strip));
+        let _ = writeln!(out, "StatusBar {}", flag(self.status_bar));
         let _ = writeln!(out, "CopyOnSelect {}", flag(self.copy_on_select));
         let _ = writeln!(out, "RightClickPaste {}", flag(self.right_click_paste));
         let _ = writeln!(out, "LogTimestamps {}", flag(self.log_timestamps));
@@ -2117,6 +2127,15 @@ DesktopShareSelection yes
         assert!(old.tools_rail && old.tools_pinned);
         let s = Settings::parse("ToolsRail no\nToolsPinned no\n");
         assert!(!s.tools_rail && !s.tools_pinned);
+        assert_eq!(Settings::parse(&s.to_text()), s);
+    }
+
+    #[test]
+    fn status_bar_is_off_unless_turned_on() {
+        assert!(!Settings::default().status_bar);
+        assert!(!Settings::parse("SidePane left\n").status_bar);
+        let s = Settings::parse("StatusBar yes\n");
+        assert!(s.status_bar);
         assert_eq!(Settings::parse(&s.to_text()), s);
     }
 
