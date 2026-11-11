@@ -456,7 +456,8 @@ impl TlsContext for Connection {
                 .join(":");
             Ok(ServerCert {
                 sha256,
-                windows: self.verify(cert),
+                // SAFETY: checked non-null above; valid until freed below.
+                windows: self.verify(unsafe { &*cert }),
             })
         })();
         // SAFETY: the context SChannel handed out, freed once.
@@ -470,7 +471,7 @@ impl TlsContext for Connection {
 impl Connection {
     /// Windows' verdict on `cert` for this host: a chain to a trusted
     /// root, for server authentication, naming the host.
-    fn verify(&self, cert: *const CERT_CONTEXT) -> Result<(), String> {
+    fn verify(&self, cert: &CERT_CONTEXT) -> Result<(), String> {
         let mut usage = [PSTR(szOID_PKIX_KP_SERVER_AUTH.0.cast_mut())];
         let para = CERT_CHAIN_PARA {
             cbSize: u32::try_from(std::mem::size_of::<CERT_CHAIN_PARA>()).unwrap_or(0),
@@ -487,9 +488,16 @@ impl Connection {
         // SAFETY: cert is valid; the server's other certificates are in
         // its store; the chain is freed below.
         unsafe {
-            // SAFETY: cert came from SChannel and is valid here.
-            let store = (*cert).hCertStore;
-            CertGetCertificateChain(None, cert, None, Some(store), &para, 0, None, &mut chain)
+            CertGetCertificateChain(
+                None,
+                cert,
+                None,
+                Some(cert.hCertStore),
+                &para,
+                0,
+                None,
+                &mut chain,
+            )
         }
         .map_err(|e| format!("no certificate chain ({})", e.message()))?;
         let mut host = self.host.clone();

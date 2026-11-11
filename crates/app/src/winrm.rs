@@ -1278,7 +1278,7 @@ mod tests {
     fn a_certificate_windows_trusts_goes_through() {
         let mut s = https_session(None);
         let fx = handshake_done(&mut s, 0, cert("AA", Ok(())));
-        assert!(shown(&fx).contains("checked by Windows"), "{fx:?}");
+        assert!(shown(&fx).contains("checked by Windows"));
         assert!(matches!(
             replied(&fx),
             Some(SspiResult::Tls { ready: true, .. })
@@ -1312,12 +1312,12 @@ mod tests {
         // Next time it is known.
         let mut s = https_session(Some(store.clone()));
         let fx = handshake_done(&mut s, 0, cert("AB:CD", Err("self-signed".into())));
-        assert!(shown(&fx).contains("trusted before"), "{fx:?}");
+        assert!(shown(&fx).contains("trusted before"));
         assert!(matches!(replied(&fx), Some(SspiResult::Tls { .. })));
         // Another certificate for the same server is refused outright.
         let mut s = https_session(Some(store.clone()));
         let fx = handshake_done(&mut s, 0, cert("EE:FF", Err("self-signed".into())));
-        assert!(shown(&fx).contains("not the one you trusted"), "{fx:?}");
+        assert!(shown(&fx).contains("not the one you trusted"));
         assert!(matches!(replied(&fx), Some(SspiResult::Failed(_))));
         let _ = std::fs::remove_dir_all(&dir);
     }
