@@ -875,8 +875,9 @@ impl WinrmSession {
         match known {
             // A pinned certificate is good only while it is valid: an
             // expired one is asked about again.
+            // Not added to `trusted_certs`, which holds only what the user
+            // said yes to this session: each handshake checks the pin again.
             Some(sha) if sha == cert.sha256 && cert.current => {
-                self.trusted_certs.push(cert.sha256);
                 let mut effects = Vec::new();
                 if first {
                     effects.push(Effect::Show(dim(
@@ -1321,6 +1322,14 @@ mod tests {
         let fx = handshake_done(&mut s, 0, cert("AB:CD", Err("self-signed".into())));
         assert!(shown(&fx).contains("trusted before"));
         assert!(matches!(replied(&fx), Some(SspiResult::Tls { .. })));
+        // A pin is checked again on each handshake: one that expires
+        // between the two connections is asked about.
+        let mut s = https_session(Some(store.clone()));
+        handshake_done(&mut s, 0, cert("AB:CD", Err("self-signed".into())));
+        let mut old = cert("AB:CD", Err("expired".into()));
+        old.current = false;
+        let fx = handshake_done(&mut s, 1, old);
+        assert!(shown(&fx).contains("(yes/no)"));
         // Once expired, the pinned certificate is asked about again.
         let mut s = https_session(Some(store.clone()));
         let mut old = cert("AB:CD", Err("expired".into()));
