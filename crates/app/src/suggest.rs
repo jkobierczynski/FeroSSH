@@ -417,7 +417,7 @@ pub struct Tracker {
     /// `seen`: until it does, no suggestion (keys typed faster than the
     /// echo would otherwise get one made for an older line).
     expect: Option<String>,
-    /// Another editing key (Tab, an arrow) came while typed text was not
+    /// An editing key (Backspace, Tab, an arrow) came while typed text was not
     /// echoed yet: what the line was to read, and whether it has. No
     /// suggestion until the screen has shown it and then changed (the
     /// host answered the key), or the next key.
@@ -482,9 +482,12 @@ impl Tracker {
                     (false, ..) => {}
                     (true, Some(base), Some(text)) => self.expect = Some(base + text),
                     // Backspace at the end of the line: one character off.
+                    // A key not echoed yet must show first (the line before
+                    // may already read as expected).
                     (true, Some(mut base), None) if backspace => {
                         base.pop();
                         self.expect = Some(base);
+                        self.stale = unechoed.map(|line| (line, false));
                     }
                     // Not echoed yet, and this key's line only the host
                     // knows.
@@ -841,6 +844,8 @@ mod tests {
         k.typed(&t, b"t");
         k.typed(&t, b"\x7f");
         assert!(k.line(&t).is_none(), "nothing is answered yet");
+        t.feed(b"\x1b[0m");
+        assert!(k.line(&t).is_none(), "output that is not the echo");
         t.feed(b"t");
         assert!(k.line(&t).is_none(), "the Backspace is not answered yet");
         t.feed(b"\x08\x1b[K");
