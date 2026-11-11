@@ -26,6 +26,9 @@ use crate::sftp::release;
 const MAX_LINE: usize = 512;
 /// Network interfaces counted per sample; the rest are skipped.
 const MAX_INTERFACES: usize = 256;
+/// How long a channel open still pending when the UI closes the bar is
+/// waited for, so a late confirmation can be closed again.
+const LATE_OPEN: std::time::Duration = std::time::Duration::from_secs(60);
 /// The longest interval asked for, in seconds.
 const MAX_INTERVAL: u16 = 3600;
 
@@ -402,11 +405,18 @@ async fn serve(
         },
         _ = closed(inbox) => {
             tokio::spawn(async move {
-                if let Ok((owned, started)) = start.await {
-                    if let Ok(ch) = started {
-                        let _ = ch.close().await;
+                match tokio::time::timeout(LATE_OPEN, &mut start).await {
+                    Ok(Ok((owned, started))) => {
+                        if let Ok(ch) = started {
+                            let _ = ch.close().await;
+                        }
+                        release(owned).await;
                     }
-                    release(owned).await;
+                    // A server that never answers gets no more waiting:
+                    // the open is given up and its connection reference
+                    // dropped.
+                    Err(_) => start.abort(),
+                    Ok(Err(_)) => {}
                 }
             });
             return "Closed.".into();
