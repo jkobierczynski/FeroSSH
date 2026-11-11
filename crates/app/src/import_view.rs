@@ -646,8 +646,15 @@ mod tests {
 
     /// A terminal session, as PuTTY's and KiTTY's are.
     fn ssh_site(name: &str, host: &str) -> Session {
-        let mut s = site(name, host, false);
-        s.kind = SessionKind::Ssh;
+        // FSProtocol 0 is WinSCP's SCP, which stays an SSH terminal.
+        let mut s = winscp::session(name, |k| match k {
+            "HostName" => Some(Value::Text(host.into())),
+            "FSProtocol" => Some(Value::Number(0)),
+            _ => None,
+        })
+        .unwrap();
+        s.host.user = Some("me".into());
+        assert_eq!(s.kind, SessionKind::Ssh);
         s
     }
 
