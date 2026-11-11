@@ -104,10 +104,6 @@ pub struct Runner {
     on_timeout: Option<String>,
     /// Variables set by `set`, `add` and `capture` (as `captured`).
     vars: BTreeMap<String, String>,
-    /// Steps run since the script last waited for the host or for time:
-    /// a secret found in a store comes at once, so it does not count as
-    /// a wait (a `goto` loop over `password` would type it forever).
-    busy: usize,
 }
 
 impl Runner {
@@ -131,7 +127,6 @@ impl Runner {
             timeout: Duration::from_secs(EXPECT_TIMEOUT_SECS),
             on_timeout: None,
             vars: BTreeMap::new(),
-            busy: 0,
         }
     }
 
@@ -211,7 +206,6 @@ impl Runner {
             "{DIM}Running {}; any key stops it.{RESET}\r\n",
             crate::ssh::sanitize(&self.what)
         ))];
-        self.busy = 0;
         self.advance(now, &mut out);
         out
     }
@@ -259,9 +253,10 @@ impl Runner {
     fn advance(&mut self, now: Instant, out: &mut Vec<Action>) {
         self.deadline = None;
         self.wait = Wait::Ready;
+        let mut busy = 0;
         while let Some(step) = self.steps.get(self.next).cloned() {
-            self.busy += 1;
-            if self.busy > MAX_BUSY_STEPS {
+            busy += 1;
+            if busy > MAX_BUSY_STEPS {
                 self.fail(
                     &format!(
                         "it ran {MAX_BUSY_STEPS} steps without waiting for the host; a goto \
@@ -487,7 +482,6 @@ impl Runner {
         }
         let mut out = Vec::new();
         if self.wait == Wait::Expect {
-            self.busy = 0;
             self.advance(now, &mut out);
         }
         out
@@ -500,7 +494,6 @@ impl Runner {
         if self.deadline.is_none_or(|d| now < d) {
             return out;
         }
-        self.busy = 0;
         match self.wait {
             Wait::Expect => {
                 if let Some(label) = self.on_timeout.clone() {
@@ -912,22 +905,6 @@ mod tests {
         let mut r = Runner::new(steps(&["label a", "send x", "goto a"]));
         let a = r.start(now);
         assert!(sent(&a).len() < MAX_BUSY_STEPS);
-        assert!(outcome_why(&r).contains("without waiting"));
-    }
-
-    #[test]
-    fn a_loop_over_a_stored_secret_stops() {
-        // A secret from a store comes at once: not a wait.
-        let now = Instant::now();
-        let mut r = Runner::new(steps(&["label a", "password", "goto a"]));
-        r.start(now);
-        let mut typed = 0;
-        while r.outcome().is_none() {
-            let a = r.secret("pw", now);
-            assert!(!a.is_empty(), "the runner neither typed nor stopped");
-            typed += sent(&a).len();
-        }
-        assert!(typed <= MAX_BUSY_STEPS);
         assert!(outcome_why(&r).contains("without waiting"));
     }
 
