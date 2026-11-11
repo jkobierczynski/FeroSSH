@@ -10014,9 +10014,14 @@ impl Window {
                 let still_windows = settings
                     .profile(&name)
                     .is_some_and(|p| p.password == PasswordSource::Windows);
+                // A renamed read-only connection is saved as a copy: the
+                // original stays, and so does its password.
                 let old_target = was_windows
                     .then(|| form.original.clone())
                     .flatten()
+                    .filter(|o| {
+                        !matches!(form.source, Source::ReadOnly(_)) || o.eq_ignore_ascii_case(&name)
+                    })
                     .and_then(|o| self.saved_password_target(&o));
                 if let Err(e) = write_app_file(&sessions_path(), &saved::to_text(&hosts)) {
                     return Some(Command::Notice(format!(
