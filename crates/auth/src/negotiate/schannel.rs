@@ -462,16 +462,14 @@ impl TlsContext for Connection {
             )
         }
         .map_err(|e| format!("the server sent no certificate ({})", e.message()))?;
-        if cert.is_null() {
-            return Err("the server sent no certificate".into());
-        }
+        let cert = std::ptr::NonNull::new(cert).ok_or("the server sent no certificate")?;
         let result = (|| {
             let mut hash = [0u8; 32];
             let mut len = 32u32;
             // SAFETY: cert is a valid context; hash holds 32 bytes.
             unsafe {
                 CertGetCertificateContextProperty(
-                    cert,
+                    cert.as_ptr(),
                     CERT_SHA256_HASH_PROP_ID,
                     Some(hash.as_mut_ptr().cast()),
                     &mut len,
@@ -483,8 +481,8 @@ impl TlsContext for Connection {
                 .map(|b| format!("{b:02X}"))
                 .collect::<Vec<_>>()
                 .join(":");
-            // SAFETY: checked non-null above; valid until freed below.
-            let cert = unsafe { &*cert };
+            // SAFETY: non-null (NonNull above); valid until freed below.
+            let cert = unsafe { cert.as_ref() };
             // SAFETY: the certificate's own CERT_INFO; None means now.
             let current = unsafe { CertVerifyTimeValidity(None, cert.pCertInfo) } == 0;
             Ok(ServerCert {
@@ -495,7 +493,7 @@ impl TlsContext for Connection {
         })();
         // SAFETY: the context SChannel handed out, freed once.
         unsafe {
-            let _ = CertFreeCertificateContext(Some(cert));
+            let _ = CertFreeCertificateContext(Some(cert.as_ptr()));
         }
         result
     }
