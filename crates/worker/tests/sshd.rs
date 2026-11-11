@@ -1649,6 +1649,7 @@ async fn mosh_session_after_an_ssh_login() {
     );
 }
 
+#[cfg(unix)]
 #[tokio::test]
 async fn samples_the_servers_load_for_the_status_bar() {
     if !available() {
