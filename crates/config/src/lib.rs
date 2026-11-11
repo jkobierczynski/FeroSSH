@@ -6,6 +6,7 @@
 //! (session profiles, favourites, theme rules) use ssh_config's syntax.
 
 pub mod forward;
+pub mod highlight;
 mod host_theme;
 pub mod hostkey;
 pub mod hotkey;
@@ -31,6 +32,7 @@ pub mod trigger;
 pub mod winscp;
 
 pub use forward::{ForwardKind, ForwardSpec};
+pub use highlight::{HighlightColour, HighlightRule};
 pub use host_theme::{HostThemes, ThemeRule};
 pub use password::PasswordSource;
 pub use pattern::{match_host, match_pattern};

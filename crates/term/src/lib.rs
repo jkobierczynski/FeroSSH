@@ -26,6 +26,7 @@
 
 pub mod chain;
 mod cwd;
+pub mod highlight;
 mod input;
 mod log;
 mod sanitize;

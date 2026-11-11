@@ -1,6 +1,6 @@
 # Settings
 
-FeroSSH keeps its settings in `%APPDATA%\FeroSSH\ferossh.conf`. Most of them are changed from the menus, and FeroSSH rewrites the file when they change, but you can edit it by hand too. It uses ssh_config syntax: one keyword per line, case doesn't matter, `#` starts a comment, and indented lines belong to the `Profile` or `ThemeRule` above them. Unknown keywords are skipped, so an older FeroSSH can read a newer file.
+FeroSSH keeps its settings in `%APPDATA%\FeroSSH\ferossh.conf`. Most of them are changed from the menus, and FeroSSH rewrites the file when they change, but you can edit it by hand too. It uses ssh_config syntax: one keyword per line, case doesn't matter, `#` starts a comment, and indented lines belong to the `Profile`, `ThemeRule` or `HighlightRule` above them. Unknown keywords are skipped, so an older FeroSSH can read a newer file.
 
 Other files in the same folder:
 
@@ -26,6 +26,8 @@ FeroSSH reads `~/.ssh/config` and `~/.ssh/known_hosts` too, and writes only to `
 | `Favourite web db1` | | Hosts marked as favourites in the connection manager. |
 | `UpdateCheck weekly` | off | Looks for a new release once a week (Help > Check for updates weekly). |
 | `AutoReconnect no` | yes | Whether a dropped SSH connection reconnects on its own (File > Reconnect automatically). |
+| `Highlight no` | yes | Colours keywords in the output (Session > Highlight keywords). In a `Profile`, for that host only. |
+| `HighlightStandard no` | yes | Whether the standard rules (errors, warnings, success, IP and MAC addresses) come after your own `HighlightRule`s. |
 
 ## File transfer
 
@@ -100,6 +102,7 @@ Profile web1
 | `RemoteFolder PATH` | The server folder the Remote list of File transfer starts in for this host (Remote folder in the connection form), before following cd takes over. |
 | `TmuxLayout ferossh` or `tmux` | `ferossh` (the default) makes each native pane its own tmux window, so each can have its own font; `tmux` uses tmux's own splits. |
 | `AutoReconnect no` or `yes` | Overrides the global `AutoReconnect` for this host, for example to keep a production host from logging in again by itself. |
+| `Highlight no` or `yes` | Overrides the global `Highlight` for this host: keyword highlighting off for a switch whose output is coloured already, say. |
 | `LegacyAlgorithms yes` | Also offers older crypto (ECDH on NIST curves, DH groups 14 to 18 with SHA-2, AES-CTR, plain HMAC-SHA-2) for old switches and routers. Still no SHA-1, CBC or DSA. The tab shows an amber ⚠. |
 | `DesktopPort N` | The server's RDP port for Open remote desktop (3389). |
 | `VncPort N` | The server's VNC port (5900). |
@@ -176,6 +179,36 @@ Snippet "Next page"
 | `Folder NAME` | Keeps it to the hosts in this connection-manager folder. |
 | `Hotkey F1` to `F12` | Runs it with Ctrl+Shift and that key. |
 | `When TEXT` | Makes it an auto-response: it runs whenever the host prints this text. |
+
+## Highlight rules
+
+A `HighlightRule` colours what it matches in terminal output. The first rule that matches a stretch of text wins, so your rules come before the standard set.
+
+```text
+HighlightRule
+    Words error failed "permission denied"
+    Colour bright-red
+    Bold yes
+HighlightRule
+    Pattern \bOOM-killer\b|Out of memory
+    CaseSensitive yes
+    Colour ffffff
+    Background red
+    Hosts db-* !db-test
+    Stop yes
+```
+
+| Keyword | Meaning |
+| --- | --- |
+| `Words` | Whole words or phrases (quote a phrase), matched literally. |
+| `Pattern` | A regular expression, the rest of the line as written. A rule can have both. |
+| `CaseSensitive yes` | Matches only as written; any case otherwise. |
+| `Colour`, `Background` | `black`, `red`, `green`, `yellow`, `blue`, `magenta`, `cyan`, `white`, `bright-` and one of those, a colour number 0 to 255, or `rrggbb`. Named colours follow the pane's theme. |
+| `Bold yes`, `Underline yes` | Text style. |
+| `Hosts` | Host patterns, as in `ThemeRule`; without it the rule is for every host and local shells. |
+| `Stop yes` | Following the output stops at a match (see [Highlighting and following output](everyday-use.md#highlighting-and-following-output)). |
+
+Only text in the terminal's own colours is recoloured. A rule that does not compile, such as an unclosed `(`, is left out and named in the pane when it opens. At most 64 rules are used, each pattern up to 1,000 characters.
 
 ## Theme rules
 

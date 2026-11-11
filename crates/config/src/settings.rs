@@ -15,6 +15,16 @@
 //! RemoteAppShareSelection no
 //! DesktopClipboard both
 //! DesktopShareSelection no
+//! Highlight yes
+//! HighlightStandard yes
+//! HighlightRule
+//!     Words error failed "permission denied"
+//!     Colour bright-red
+//!     Bold yes
+//! HighlightRule
+//!     Pattern \bOOM-killer\b
+//!     Background red
+//!     Stop yes
 //! Favourite web
 //! ThemeRule
 //!     Hosts prod-* *.prod.example.com
@@ -30,6 +40,7 @@
 //!     StartDir /srv/www
 //! Profile core-switch
 //!     LegacyAlgorithms yes
+//!     Highlight no
 //!     AutoReconnect no
 //! Profile desktop-box
 //!     DesktopPort 3390
@@ -103,6 +114,7 @@
 
 use std::fmt::Write as _;
 
+use crate::highlight::{HighlightColour, HighlightRule};
 use crate::host_theme::ThemeRule;
 use crate::hotkey::Hotkey;
 use crate::login::{SecretSource, Snippet, Step, parse_hotkey, valid_secret_name};
@@ -169,6 +181,9 @@ pub struct Profile {
     /// Connect again on its own when the connection drops; the global
     /// setting when unset.
     pub auto_reconnect: Option<bool>,
+    /// Keyword highlighting on or off for this host; the global setting
+    /// when unset.
+    pub highlight: Option<bool>,
     /// The program Session > Run remote app offers first (and what a
     /// remote app session runs), as a shell-like command line.
     pub remote_app: Option<String>,
@@ -469,6 +484,7 @@ impl Profile {
             && self.serial.is_none()
             && self.login_script.is_empty()
             && self.auto_reconnect.is_none()
+            && self.highlight.is_none()
             && self.remote_app.is_none()
             && self.remote_app_copy_agent.is_none()
             && self.remote_app_remove_agent.is_none()
@@ -523,6 +539,14 @@ pub struct Settings {
     pub favourites: Vec<String>,
     /// User theme rules, tried before the built-in tag rules.
     pub theme_rules: Vec<ThemeRule>,
+    /// Keyword highlighting in terminal output (Session > Highlight
+    /// keywords). On unless turned off.
+    pub highlight: bool,
+    /// Use the standard highlighting rules after the user's. On unless
+    /// turned off.
+    pub highlight_standard: bool,
+    /// The user's highlighting rules, tried before the standard ones.
+    pub highlight_rules: Vec<HighlightRule>,
     /// Dock the side pane on the right instead of the left.
     pub side_pane_right: bool,
     /// Show the tools rail (an icon per tool) on the window's edge.
@@ -647,6 +671,9 @@ impl Default for Settings {
             profiles: Vec::new(),
             favourites: Vec::new(),
             theme_rules: Vec::new(),
+            highlight: true,
+            highlight_standard: true,
+            highlight_rules: Vec::new(),
             side_pane_right: false,
             tools_rail: true,
             tools_pinned: true,
@@ -694,6 +721,7 @@ enum Block {
     Top,
     Profile(usize),
     Rule(usize),
+    Highlight(usize),
     Secret(usize),
     Snippet(usize),
 }
@@ -790,6 +818,45 @@ pub fn snippet_block(snippet: &Snippet) -> String {
     out
 }
 
+/// A highlighting rule as a `HighlightRule` block.
+fn highlight_block(r: &HighlightRule) -> String {
+    let mut out = String::from("HighlightRule\n");
+    let words: Vec<String> = r.words.iter().map(|w| arg(w)).collect();
+    if !words.is_empty() {
+        let _ = writeln!(out, "    Words {}", words.join(" "));
+    }
+    if let Some(p) = &r.pattern {
+        let p = clean(p);
+        // A pattern that starts with `=` gets one of its own after the
+        // keyword, since the reader takes one `=` there as the separator.
+        let sep = if p.starts_with('=') { " = " } else { " " };
+        let _ = writeln!(out, "    Pattern{sep}{p}");
+    }
+    if r.case_sensitive {
+        out.push_str("    CaseSensitive yes\n");
+    }
+    if let Some(c) = r.colour {
+        let _ = writeln!(out, "    Colour {}", c.text());
+    }
+    if let Some(c) = r.background {
+        let _ = writeln!(out, "    Background {}", c.text());
+    }
+    if r.bold {
+        out.push_str("    Bold yes\n");
+    }
+    if r.underline {
+        out.push_str("    Underline yes\n");
+    }
+    let hosts: Vec<String> = r.hosts.iter().map(|h| arg(h)).collect();
+    if !hosts.is_empty() {
+        let _ = writeln!(out, "    Hosts {}", hosts.join(" "));
+    }
+    if r.stop {
+        out.push_str("    Stop yes\n");
+    }
+    out
+}
+
 impl Settings {
     pub fn parse(text: &str) -> Self {
         let mut s = Settings::default();
@@ -836,6 +903,25 @@ impl Settings {
                         ..Snippet::default()
                     });
                     block = Block::Snippet(s.snippets.len() - 1);
+                }
+                "highlightrule" => {
+                    s.highlight_rules.push(HighlightRule::default());
+                    block = Block::Highlight(s.highlight_rules.len() - 1);
+                }
+                "highlight" if matches!(block, Block::Profile(_)) => {
+                    if let Block::Profile(i) = block
+                        && let Some(p) = s.profiles.get_mut(i)
+                    {
+                        p.highlight = yes(&args);
+                    }
+                }
+                "highlight" => {
+                    block = Block::Top;
+                    s.highlight = yes(&args).unwrap_or(true);
+                }
+                "highlightstandard" => {
+                    block = Block::Top;
+                    s.highlight_standard = yes(&args).unwrap_or(true);
                 }
                 "themerule" => {
                     s.theme_rules.push(ThemeRule::new(""));
@@ -1164,6 +1250,31 @@ impl Settings {
                             _ => {}
                         }
                     }
+                    Block::Highlight(i) => {
+                        let Some(r) = s.highlight_rules.get_mut(i) else {
+                            continue;
+                        };
+                        match keyword.as_str() {
+                            "words" => r.words.extend(args.into_iter().map(|w| clean(&w))),
+                            // As written: backslashes and quotes are the
+                            // pattern's own.
+                            "pattern" => {
+                                r.pattern = Some(clean(&raw_rest(line))).filter(|p| !p.is_empty());
+                            }
+                            "casesensitive" => r.case_sensitive = yes(&args).unwrap_or(false),
+                            "colour" | "color" => {
+                                r.colour = first.as_deref().and_then(HighlightColour::parse);
+                            }
+                            "background" => {
+                                r.background = first.as_deref().and_then(HighlightColour::parse);
+                            }
+                            "bold" => r.bold = yes(&args).unwrap_or(false),
+                            "underline" => r.underline = yes(&args).unwrap_or(false),
+                            "hosts" => r.hosts.extend(args),
+                            "stop" => r.stop = yes(&args).unwrap_or(false),
+                            _ => {}
+                        }
+                    }
                     Block::Secret(i) => {
                         if keyword == "passwordcommand"
                             && let Some(x) = s.secrets.get_mut(i)
@@ -1190,6 +1301,8 @@ impl Settings {
         }
         s.theme_rules
             .retain(|r| !r.theme.is_empty() && !(r.hosts.is_empty() && r.tags.is_empty()));
+        s.highlight_rules
+            .retain(|r| r.regex().is_some() && (r.styled() || r.stop));
         s.secrets.retain(|x| !x.command.is_empty());
         s
     }
@@ -1308,6 +1421,11 @@ impl Settings {
         for f in &self.favourites {
             let _ = writeln!(out, "Favourite {}", arg(f));
         }
+        let _ = writeln!(out, "Highlight {}", flag(self.highlight));
+        let _ = writeln!(out, "HighlightStandard {}", flag(self.highlight_standard));
+        for r in &self.highlight_rules {
+            out.push_str(&highlight_block(r));
+        }
         for r in &self.theme_rules {
             out.push_str("ThemeRule\n");
             if !r.hosts.is_empty() {
@@ -1384,6 +1502,9 @@ impl Settings {
             }
             if let Some(on) = p.auto_reconnect {
                 let _ = writeln!(out, "    AutoReconnect {}", if on { "yes" } else { "no" });
+            }
+            if let Some(on) = p.highlight {
+                let _ = writeln!(out, "    Highlight {}", if on { "yes" } else { "no" });
             }
             if let Some(c) = &p.remote_app {
                 let _ = writeln!(out, "    RemoteApp {c}");
@@ -1736,6 +1857,52 @@ NewKeyword later
         assert!(Settings::default().auto_responses);
         assert_eq!(s.run_parallel, Some(16), "at most 16");
         assert_eq!(Settings::default().run_parallel, None);
+    }
+
+    #[test]
+    fn highlight_rules_round_trip() {
+        let text = r#"
+HighlightStandard no
+HighlightRule
+    Words error "permission denied" a#b
+    Colour bright-red
+    Bold yes
+HighlightRule
+    Pattern =\bOOM "killer"\b
+    CaseSensitive yes
+    Colour ff8000
+    Background 4
+    Underline yes
+    Hosts db-* !db-test
+    Stop yes
+HighlightRule
+    Words nothing-to-show
+HighlightRule
+    Words just-stop
+    Stop yes
+Profile lab
+    Highlight no
+"#;
+        let s = Settings::parse(text);
+        assert!(s.highlight);
+        assert!(!s.highlight_standard);
+        assert_eq!(
+            s.highlight_rules.len(),
+            3,
+            "a rule that shows nothing is dropped"
+        );
+        let r = &s.highlight_rules[0];
+        assert_eq!(r.words, ["error", "permission denied", "a#b"]);
+        assert_eq!(r.colour, Some(HighlightColour::Index(9)));
+        let r = &s.highlight_rules[1];
+        assert_eq!(r.pattern.as_deref(), Some(r#"\bOOM "killer"\b"#));
+        assert_eq!(r.background, Some(HighlightColour::Index(4)));
+        assert!(r.stop && r.underline && r.case_sensitive);
+        assert_eq!(s.profile("lab").unwrap().highlight, Some(false));
+        let again = Settings::parse(&s.to_text());
+        assert_eq!(again, s);
+        let off = Settings::parse("Highlight no\n");
+        assert!(!Settings::parse(&off.to_text()).highlight);
     }
 
     #[test]

@@ -21,6 +21,7 @@ use alacritty_terminal::vte::ansi::{
 use ferossh_render::{Cell, Color, Cursor, CursorShape, Flags, Grid, Rgb, Theme};
 
 use crate::cwd::{CwdScanner, WorkingDir};
+use crate::highlight::{self, Highlighter};
 use crate::input::{self, Key, Mods, MouseButton, MouseEvent};
 use crate::sanitize::{Paste, prepare_paste, sanitize_title};
 
@@ -125,6 +126,27 @@ struct Search {
     query: String,
     regex: Option<RegexSearch>,
     found: Option<Match>,
+    /// The bar asks for the stop pattern instead of searching.
+    stop: bool,
+    /// Why the stop pattern typed so far is not valid.
+    error: Option<String>,
+}
+
+/// Lines added to the history limit while new output is watched for the
+/// stop pattern, so that the lines scrolled out can be counted.
+const WATCH_BUMP: usize = 512;
+
+/// Stops following the output where a line matches a pattern.
+#[derive(Debug)]
+struct Stop {
+    regex: highlight::Regex,
+    cache: highlight::Cache,
+    /// The first line not yet looked at, counted from the first line
+    /// ever written (see `Terminal::scrolled`).
+    scan_from: u64,
+    /// The line the last stop was on, so a line that grows is not
+    /// stopped at twice.
+    last_hit: Option<u64>,
 }
 
 /// One terminal: the emulator, its parser and the pane's search state.
@@ -136,6 +158,23 @@ pub struct Terminal {
     theme: Theme,
     cell_px: (u16, u16),
     search: Option<Search>,
+    scrollback: usize,
+    highlighter: Option<Rc<Highlighter>>,
+    highlight_cache: RefCell<Option<highlight::Cache>>,
+    /// Stop patterns from the settings; with the one typed into the stop
+    /// bar they make `stop`.
+    stop_rules: Vec<String>,
+    stop_typed: Option<String>,
+    stop: Option<Stop>,
+    /// Lines scrolled into the history since the start, while a stop
+    /// pattern is set.
+    scrolled: u64,
+    /// Following the output stopped at a match: the view holds still
+    /// until it is scrolled to the bottom or the user types.
+    stopped: bool,
+    /// Whether the selection is still the match a stop selected.
+    stop_selected: bool,
+    scroll_scan: ScrollScan,
     cwd: CwdScanner,
     /// Working directories reported since the last `take_actions`.
     reported: Vec<WorkingDir>,
@@ -171,6 +210,16 @@ impl Terminal {
             theme: Theme::default(),
             cell_px: (8, 16),
             search: None,
+            scrollback: settings.scrollback.min(Settings::MAX_SCROLLBACK),
+            highlighter: None,
+            highlight_cache: RefCell::new(None),
+            stop_rules: Vec::new(),
+            stop_typed: None,
+            stop: None,
+            scrolled: 0,
+            stopped: false,
+            stop_selected: false,
+            scroll_scan: ScrollScan::default(),
             cwd: CwdScanner::default(),
             reported: Vec::new(),
             title: None,
@@ -179,7 +228,96 @@ impl Terminal {
     }
 
     pub fn set_settings(&mut self, settings: &Settings) {
+        self.scrollback = settings.scrollback.min(Settings::MAX_SCROLLBACK);
         self.term.set_options(config(settings));
+    }
+
+    /// The keyword highlighting rules for this pane, or none.
+    pub fn set_highlighter(&mut self, highlighter: Option<Rc<Highlighter>>) {
+        let same = match (&self.highlighter, &highlighter) {
+            (Some(a), Some(b)) => Rc::ptr_eq(a, b),
+            (None, None) => true,
+            _ => false,
+        };
+        if !same {
+            *self.highlight_cache.borrow_mut() = highlighter.as_ref().map(|h| h.create_cache());
+            self.highlighter = highlighter;
+        }
+    }
+
+    pub fn highlighting(&self) -> bool {
+        self.highlighter.is_some()
+    }
+
+    /// Stop patterns from the settings (already checked; a pattern that
+    /// does not compile is left out).
+    pub fn set_stop_rules(&mut self, patterns: Vec<String>) {
+        if patterns != self.stop_rules {
+            self.stop_rules = patterns;
+            self.rebuild_stop();
+        }
+    }
+
+    /// Sets or clears the pane's own stop pattern.
+    pub fn set_stop_pattern(&mut self, pattern: Option<&str>) -> Result<(), String> {
+        let pattern = pattern.filter(|p| !p.is_empty());
+        if let Some(p) = pattern {
+            highlight::check(p)?;
+        }
+        self.stop_typed = pattern.map(str::to_owned);
+        self.rebuild_stop();
+        Ok(())
+    }
+
+    /// The pane's own stop pattern.
+    pub fn stop_pattern(&self) -> Option<&str> {
+        self.stop_typed.as_deref()
+    }
+
+    /// Whether output is watched for a stop pattern.
+    pub fn stop_armed(&self) -> bool {
+        self.stop.is_some()
+    }
+
+    /// Whether following the output stopped at a match.
+    pub fn stopped(&self) -> bool {
+        self.stopped
+    }
+
+    fn rebuild_stop(&mut self) {
+        let mut patterns: Vec<&str> = self.stop_typed.iter().map(String::as_str).collect();
+        patterns.extend(self.stop_rules.iter().map(String::as_str));
+        patterns.truncate(highlight::MAX_RULES);
+        let regex = (!patterns.is_empty())
+            .then(|| highlight::compile(&patterns).ok())
+            .flatten();
+        self.stop = regex.map(|regex| {
+            let cache = regex.create_cache();
+            Stop {
+                cache,
+                regex,
+                scan_from: 0,
+                last_hit: None,
+            }
+        });
+        if self.stopped && self.stop_selected {
+            // The match selected when it stopped goes with the stop; a
+            // selection made since stays.
+            self.term.selection = None;
+        }
+        self.stop_selected = false;
+        self.stopped = false;
+        self.rescan_from_cursor();
+    }
+
+    /// Looks for stops only in output still to come.
+    fn rescan_from_cursor(&mut self) {
+        let cursor = self.term.grid().cursor.point.line.0.max(0) as u64;
+        let from = self.scrolled + cursor;
+        if let Some(stop) = &mut self.stop {
+            stop.scan_from = from;
+            stop.last_hit = None;
+        }
     }
 
     /// The theme colour queries (OSC 4/10/11) are answered from.
@@ -210,6 +348,7 @@ impl Terminal {
         if size.cols != self.cols() || size.rows != self.rows() {
             self.term.resize(size);
             self.drop_lone_spacers();
+            self.rescan_from_cursor();
             if let Some(s) = &mut self.search {
                 s.found = None;
             }
@@ -230,7 +369,18 @@ impl Terminal {
         for end in alt_switch_ends(bytes).chain([bytes.len()]) {
             if let Some(piece) = bytes.get(start..end).filter(|p| !p.is_empty()) {
                 let queued = self.events.0.borrow().len();
-                self.parser.advance(&mut self.term, piece);
+                if self.stop.is_some() {
+                    let ends = watch_parts(piece, self.cols(), self.rows(), &mut self.scroll_scan);
+                    let mut from = 0;
+                    for to in ends {
+                        if let Some(part) = piece.get(from..to).filter(|p| !p.is_empty()) {
+                            self.watched(|t| t.parser.advance(&mut t.term, part));
+                        }
+                        from = to;
+                    }
+                } else {
+                    self.parser.advance(&mut self.term, piece);
+                }
                 self.repair();
                 self.follow_title(queued);
             }
@@ -360,8 +510,137 @@ impl Terminal {
 
     /// Ends a pending synchronized update and shows what it buffered.
     pub fn flush_sync(&mut self) {
-        self.parser.stop_sync(&mut self.term);
+        if self.stop.is_some() {
+            self.watched(|t| t.parser.stop_sync(&mut t.term));
+        } else {
+            self.parser.stop_sync(&mut self.term);
+        }
         self.repair();
+    }
+
+    /// Runs `process` (which hands output to the emulator) while counting
+    /// the lines it scrolls into the history, then holds a stopped view
+    /// still and looks at the new lines for the stop pattern.
+    ///
+    /// alacritty_terminal keeps a scrolled-back view in place by itself,
+    /// but at the bottom it follows, and once the history is full lines
+    /// leave it as fast as they come, so its size says nothing. For the
+    /// time of `process` the history may grow by [`WATCH_BUMP`] lines and
+    /// a screen more, which [`watch_parts`] keeps it under; the growth is the
+    /// count. The limit goes back after.
+    fn watched(&mut self, process: impl FnOnce(&mut Self)) {
+        let alt = self.mode().contains(TermMode::ALT_SCREEN);
+        if alt {
+            process(self);
+            return;
+        }
+        let before = self.term.history_size();
+        let offset = self.display_offset();
+        let bumped = self.scrollback.saturating_add(WATCH_BUMP + self.rows());
+        self.term.grid_mut().update_history(bumped);
+        process(self);
+        if self.mode().contains(TermMode::ALT_SCREEN) {
+            // The main screen went away mid-way; set its limit back
+            // through the options (which also say the title again).
+            let queued = self.events.0.borrow().len();
+            self.term
+                .set_options(config(&Settings::new(self.scrollback)));
+            self.events.0.borrow_mut().truncate(queued);
+            return;
+        }
+        let after = self.term.history_size();
+        if after < before {
+            // The history was cleared (CSI 3 J): start again from here.
+            self.term.grid_mut().update_history(self.scrollback);
+            self.rescan_from_cursor();
+            return;
+        }
+        let added = after - before;
+        self.scrolled += added as u64;
+        if self.stopped && offset == 0 && added > 0 {
+            // The view still follows until the line stopped at reaches
+            // the middle row, then holds it there.
+            let middle = (self.rows() as i64 - 1) / 2;
+            match self.stop.as_ref().and_then(|s| s.last_hit) {
+                Some(hit) => {
+                    let line = hit as i64 - self.scrolled as i64;
+                    if line < middle {
+                        self.centre_line(Line(line.max(i64::from(i32::MIN)) as i32));
+                    }
+                }
+                None => self.term.scroll_display(Scroll::Delta(added as i32)),
+            }
+        }
+        if self.stopped {
+            // Held still above; nothing to look for until it follows.
+        } else if offset == 0 {
+            self.scan_for_stop();
+        } else {
+            // Scrolled back by hand, the user is not following the
+            // output anyway: the view does not jump to a match.
+            let hit = self.stop.as_ref().and_then(|s| s.last_hit);
+            self.rescan_from_cursor();
+            if let Some(stop) = &mut self.stop {
+                stop.last_hit = hit;
+            }
+        }
+        self.term.grid_mut().update_history(self.scrollback);
+    }
+
+    /// Looks at the lines written since the last look, up to the cursor's,
+    /// and stops following at the first that matches.
+    fn scan_for_stop(&mut self) {
+        let Some(stop) = &mut self.stop else {
+            return;
+        };
+        let history = self.term.history_size() as u64;
+        let cursor = self.term.grid().cursor.point.line.0.max(0) as u64;
+        let oldest = self.scrolled.saturating_sub(history);
+        let last = self.scrolled + cursor;
+        let mut abs = stop.scan_from.max(oldest);
+        let cols = self.term.columns();
+        let mut cells = Vec::with_capacity(cols);
+        let mut hit = None;
+        while abs <= last {
+            if stop.last_hit != Some(abs) {
+                let line = Line((abs as i64 - self.scrolled as i64) as i32);
+                let row = &self.term.grid()[line];
+                cells.clear();
+                cells.extend((0..cols).map(|x| plain_cell(&row[Column(x)])));
+                if let Some(cols) = highlight::find_in(&stop.regex, &mut stop.cache, &cells) {
+                    hit = Some((abs, line, cols));
+                    break;
+                }
+            }
+            abs += 1;
+        }
+        // The cursor's line may still grow: look at it again next time.
+        stop.scan_from = last;
+        let Some((abs, line, (first, end))) = hit else {
+            return;
+        };
+        stop.last_hit = Some(abs);
+        stop.scan_from = abs;
+        self.stopped = true;
+        let mut sel = Selection::new(
+            SelectionType::Simple,
+            Point::new(line, Column(first)),
+            Side::Left,
+        );
+        sel.update(Point::new(line, Column(end)), Side::Right);
+        self.term.selection = Some(sel);
+        self.stop_selected = true;
+        self.centre_line(line);
+    }
+
+    /// Scrolls so that `line` is on the middle row of the pane, where the
+    /// eye finds it first, or as near as the scrollback allows.
+    fn centre_line(&mut self, line: Line) {
+        let rows = self.rows() as i32;
+        let offset = self.display_offset() as i32;
+        let history = self.term.history_size() as i32;
+        let want = ((rows - 1) / 2 - line.0).clamp(0, history);
+        self.term.scroll_display(Scroll::Delta(want - offset));
     }
 
     /// What the host's output asked the UI to do, in order.
@@ -488,12 +767,33 @@ impl Terminal {
             return Some(one.repeat(count));
         }
         self.term.scroll_display(Scroll::Delta(lines));
+        self.follow_at_bottom(up);
         None
+    }
+
+    /// Following the output starts again once the view is scrolled down
+    /// to the bottom.
+    fn follow_at_bottom(&mut self, up: bool) {
+        if !up && self.display_offset() == 0 && self.stopped {
+            self.stopped = false;
+            if self.stop_selected {
+                self.term.selection = None;
+            }
+            self.stop_selected = false;
+            // The line stopped at may still be the cursor's: it is not
+            // stopped at again.
+            let hit = self.stop.as_ref().and_then(|s| s.last_hit);
+            self.rescan_from_cursor();
+            if let Some(stop) = &mut self.stop {
+                stop.last_hit = hit;
+            }
+        }
     }
 
     /// Scrolls the view by lines (positive moves back in history).
     pub fn scroll_lines(&mut self, lines: i32) {
         self.term.scroll_display(Scroll::Delta(lines));
+        self.follow_at_bottom(lines > 0);
     }
 
     /// Scrolls the view by whole pages (positive moves back in history).
@@ -506,14 +806,17 @@ impl Terminal {
         for _ in 0..pages.unsigned_abs() {
             self.term.scroll_display(scroll);
         }
+        self.follow_at_bottom(pages > 0);
     }
 
     pub fn scroll_to_top(&mut self) {
         self.term.scroll_display(Scroll::Top);
     }
 
+    /// Goes to the bottom and follows the output again.
     pub fn scroll_to_bottom(&mut self) {
         self.term.scroll_display(Scroll::Bottom);
+        self.follow_at_bottom(false);
     }
 
     /// How many lines the view is scrolled back.
@@ -532,6 +835,8 @@ impl Terminal {
         if let Some(s) = &mut self.search {
             s.found = None;
         }
+        self.stopped = false;
+        self.rescan_from_cursor();
     }
 
     fn grid_point(&self, col: usize, row: usize) -> Point {
@@ -552,6 +857,7 @@ impl Terminal {
         let side = if right_half { Side::Right } else { Side::Left };
         let point = self.grid_point(col, row);
         self.term.selection = Some(Selection::new(ty, point, side));
+        self.stop_selected = false;
     }
 
     pub fn select_update(&mut self, col: usize, row: usize, right_half: bool) {
@@ -564,6 +870,7 @@ impl Terminal {
 
     pub fn select_clear(&mut self) {
         self.term.selection = None;
+        self.stop_selected = false;
     }
 
     pub fn has_selection(&self) -> bool {
@@ -710,7 +1017,20 @@ impl Terminal {
 
     /// Opens the search bar (or keeps it open).
     pub fn search_open(&mut self) {
+        if self.search.as_ref().is_some_and(|s| s.stop) {
+            self.search = None;
+        }
         self.search.get_or_insert_with(Search::default);
+    }
+
+    /// Opens the bar that asks for the stop pattern, holding the current
+    /// one.
+    pub fn stop_bar_open(&mut self) {
+        self.search = Some(Search {
+            query: self.stop_typed.clone().unwrap_or_default(),
+            stop: true,
+            ..Search::default()
+        });
     }
 
     pub fn search_close(&mut self) {
@@ -737,6 +1057,15 @@ impl Terminal {
         let Some(search) = &mut self.search else {
             return;
         };
+        if search.stop {
+            search.query = query.to_owned();
+            search.error = if query.is_empty() {
+                None
+            } else {
+                highlight::check(query).err()
+            };
+            return;
+        }
         search.query = query.to_owned();
         search.regex = if query.is_empty() {
             None
@@ -754,6 +1083,16 @@ impl Terminal {
     /// The next match further back in history (`older`) or towards the
     /// bottom, wrapping around.
     pub fn search_next(&mut self, older: bool) {
+        if let Some(search) = self.search.as_ref().filter(|s| s.stop) {
+            // Enter in the stop bar sets the pattern and closes it.
+            if search.error.is_none() {
+                let query = search.query.clone();
+                if self.set_stop_pattern(Some(&query)).is_ok() {
+                    self.search = None;
+                }
+            }
+            return;
+        }
         let Some(found) = self.search.as_ref().and_then(|s| s.found.clone()) else {
             // Nothing found yet: start again from the bottom.
             let query = self.search_query().unwrap_or_default().to_owned();
@@ -782,12 +1121,13 @@ impl Terminal {
             .as_mut()
             .and_then(|regex| self.term.search_next(regex, origin, direction, side, None));
         search.found = found.clone();
+        self.stop_selected = false;
         match found {
             Some(m) => {
                 let mut sel = Selection::new(SelectionType::Simple, *m.start(), Side::Left);
                 sel.update(*m.end(), Side::Right);
                 self.term.selection = Some(sel);
-                self.term.scroll_to_point(*m.start());
+                self.centre_line(m.start().line);
             }
             None => self.term.selection = None,
         }
@@ -805,6 +1145,15 @@ impl Terminal {
         let selection = content.selection;
         let colors = content.colors;
 
+        // Full-screen programs draw their own screens: no highlighting
+        // there.
+        let alt = self.mode().contains(TermMode::ALT_SCREEN);
+        let mut cache = self.highlight_cache.borrow_mut();
+        let mut highlight = self
+            .highlighter
+            .as_deref()
+            .zip(cache.as_mut())
+            .filter(|_| !alt);
         let mut row_cells = Vec::with_capacity(cols);
         for y in 0..rows {
             row_cells.clear();
@@ -813,16 +1162,27 @@ impl Terminal {
             for x in 0..cols {
                 let cell = &row[Column(x)];
                 let mut out = convert_cell(cell, colors);
-                if selection.is_some_and(|s| s.contains(Point::new(line, Column(x)))) {
-                    toggle(&mut out.flags, Flags::INVERSE);
-                }
                 if let Some(marks) = cell.zerowidth() {
                     out.cluster = grid.add_cluster(&marks.iter().collect::<String>());
                 }
                 row_cells.push(out);
             }
+            if let Some((h, cache)) = &mut highlight {
+                h.apply(cache, &mut row_cells);
+            }
+            if let Some(s) = selection {
+                for (x, out) in row_cells.iter_mut().enumerate() {
+                    if s.contains(Point::new(line, Column(x))) {
+                        toggle(&mut out.flags, Flags::INVERSE);
+                    }
+                }
+            }
+            if y == 0 && self.stopped && self.search.is_none() {
+                stopped_badge(&mut row_cells);
+            }
             grid.set_row(y, row_cells.iter().copied());
         }
+        drop(cache);
 
         if let Some(search) = &self.search {
             let (bar, cursor_x) = search_bar(search, cols);
@@ -934,6 +1294,163 @@ fn color(c: TermColor, colors: &Colors) -> Color {
     }
 }
 
+/// A cell's character and width, for matching its text.
+fn plain_cell(cell: &alacritty_terminal::term::cell::Cell) -> Cell {
+    let mut flags = Flags::empty();
+    if cell.flags.contains(TermFlags::WIDE_CHAR_SPACER) {
+        flags.insert(Flags::WIDE_SPACER);
+    }
+    if cell.flags.contains(TermFlags::WIDE_CHAR) {
+        flags.insert(Flags::WIDE);
+    }
+    let ch = if cell.c.is_control() { ' ' } else { cell.c };
+    Cell::new(ch, Color::Default, Color::Default, flags)
+}
+
+/// Where the output is in an escape sequence, as far as counting the
+/// lines it can scroll goes. Kept between feeds, since a sequence can be
+/// split across them.
+#[derive(Clone, Copy, Debug, Default)]
+enum ScrollScan {
+    #[default]
+    Ground,
+    Esc,
+    /// In a control sequence: its first number, and whether it is still
+    /// a plain one (no private marker or intermediate byte).
+    Csi {
+        param: usize,
+        first: bool,
+        plain: bool,
+    },
+}
+
+impl ScrollScan {
+    /// How many lines `b` may scroll into the history, at most: one for a
+    /// line feed, vertical tab, form feed, index or next line, the count
+    /// of a scroll up (CSI n S, at most a screen). Wrapping is counted by
+    /// the caller.
+    fn cost(&mut self, b: u8, rows: usize) -> usize {
+        match (*self, b) {
+            // C0 controls run even inside a sequence; CAN and SUB end it.
+            (_, b'\n' | 0x0B | 0x0C) => 1,
+            (_, 0x18 | 0x1A) => {
+                *self = Self::Ground;
+                0
+            }
+            (_, 0x1B) => {
+                *self = Self::Esc;
+                0
+            }
+            (Self::Ground, _) => 0,
+            (Self::Esc, b'[') => {
+                *self = Self::Csi {
+                    param: 0,
+                    first: true,
+                    plain: true,
+                };
+                0
+            }
+            (Self::Esc, b'D' | b'E') => {
+                *self = Self::Ground;
+                1
+            }
+            (Self::Esc, _) => {
+                *self = Self::Ground;
+                0
+            }
+            (
+                Self::Csi {
+                    param,
+                    first,
+                    plain,
+                },
+                _,
+            ) => match b {
+                b'0'..=b'9' if first => {
+                    let param = (param * 10 + usize::from(b - b'0')).min(1 << 20);
+                    *self = Self::Csi {
+                        param,
+                        first,
+                        plain,
+                    };
+                    0
+                }
+                b';' | b':' => {
+                    *self = Self::Csi {
+                        param,
+                        first: false,
+                        plain,
+                    };
+                    0
+                }
+                0x20..=0x2F | 0x3C..=0x3F => {
+                    *self = Self::Csi {
+                        param,
+                        first,
+                        plain: false,
+                    };
+                    0
+                }
+                0x40..=0x7E => {
+                    *self = Self::Ground;
+                    if b == b'S' && plain {
+                        param.clamp(1, rows.max(1))
+                    } else {
+                        0
+                    }
+                }
+                _ => 0,
+            },
+        }
+    }
+}
+
+/// Where to split output so that no part can scroll more than
+/// [`WATCH_BUMP`] lines plus a screen into the history (see
+/// [`ScrollScan::cost`]; every screen width of other bytes may wrap one
+/// more line). Returns the end of each part. Splitting mid-sequence is
+/// fine: the parser keeps its state between parts.
+fn watch_parts(bytes: &[u8], cols: usize, rows: usize, scan: &mut ScrollScan) -> Vec<usize> {
+    let cols = cols.max(1);
+    let mut ends = Vec::new();
+    let mut spent = 0;
+    let mut run = 0;
+    for (i, &b) in bytes.iter().enumerate() {
+        let mut cost = scan.cost(b, rows);
+        if cost == 0 {
+            run += 1;
+            if run % cols == 0 {
+                cost = 1;
+            }
+        }
+        if spent > 0 && spent + cost > WATCH_BUMP {
+            ends.push(i);
+            spent = 0;
+        }
+        spent += cost;
+    }
+    ends.push(bytes.len());
+    ends
+}
+
+/// Marks the top right corner while following the output is stopped at
+/// a match.
+fn stopped_badge(cells: &mut [Cell]) {
+    let text = " Stopped at a match \u{b7} End follows ";
+    let width = text.chars().count();
+    let start = cells.len().saturating_sub(width);
+    let flags = Flags::INVERSE.union(Flags::BOLD);
+    for (cell, ch) in cells.iter_mut().skip(start).zip(text.chars()) {
+        *cell = Cell::new(ch, Color::Default, Color::Default, flags);
+    }
+    // A wide character cut in half by the badge loses its right half.
+    if let Some(cell) = start.checked_sub(1).and_then(|x| cells.get_mut(x))
+        && cell.flags.contains(Flags::WIDE)
+    {
+        *cell = Cell::BLANK;
+    }
+}
+
 /// Escapes regex syntax so a search query matches literally.
 fn escape_regex(query: &str) -> String {
     let mut out = String::with_capacity(query.len() * 2);
@@ -949,11 +1466,16 @@ fn escape_regex(query: &str) -> String {
 /// The search bar's cells and the column of its text cursor.
 fn search_bar(search: &Search, cols: usize) -> (Vec<Cell>, usize) {
     let status = match (&search.found, search.query.is_empty()) {
+        _ if search.stop => match (&search.error, search.query.is_empty()) {
+            (Some(_), _) => "not a valid pattern",
+            (None, true) => "Enter: stop at nothing  Esc: close",
+            (None, false) => "Enter: stop following at a match",
+        },
         (_, true) => "Enter: older  Shift+Enter: newer  Esc: close",
         (Some(_), false) => "Enter: older  Shift+Enter: newer",
         (None, false) => "no match",
     };
-    let prompt = " Find: ";
+    let prompt = if search.stop { " Stop at: " } else { " Find: " };
     let bar = Cell::new(' ', Color::Default, Color::Default, Flags::INVERSE);
     let mut cells = vec![bar; cols];
     let mut x = 0;
