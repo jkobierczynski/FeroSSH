@@ -163,7 +163,7 @@ impl Contexts {
         if matches!(job.op, SspiOp::Start) {
             self.open.remove(&key);
             if self.open.len() >= MAX_CONTEXTS {
-                self.open.clear();
+                return Err("too many WinRM logins at once".into());
             }
             let ctx = provider.start(&job.host, job.credentials.as_ref())?;
             self.open.insert(key, ctx);
@@ -301,6 +301,25 @@ pub(crate) mod tests {
         ));
         c.end(7);
         assert_eq!(c.open.len(), 0);
+    }
+
+    #[test]
+    fn refuses_new_logins_when_full_and_keeps_the_open_ones() {
+        let mut c = Contexts::default();
+        let p = FakeProvider;
+        for login in 0..MAX_CONTEXTS as u32 {
+            let mut j = job(0, SspiOp::Start);
+            j.login = login;
+            assert!(matches!(c.run(&p, j).result, SspiResult::Continue(_)));
+        }
+        let mut j = job(0, SspiOp::Start);
+        j.login = 1000;
+        assert!(matches!(c.run(&p, j).result, SspiResult::Failed(_)));
+        assert_eq!(c.open.len(), MAX_CONTEXTS);
+        // A restart of an open login still works.
+        let mut j = job(0, SspiOp::Start);
+        j.login = 3;
+        assert!(matches!(c.run(&p, j).result, SspiResult::Continue(_)));
     }
 
     #[test]

@@ -3,7 +3,7 @@
 //!
 //! The connection runs in a sandboxed worker of its own
 //! ([`ferossh_worker::winrm`]), which speaks HTTP and SOAP. The login and
-//! the encryption of every message happen here, through the signing
+//! the encryption of every shell request and reply happen here, through the signing
 //! broker's SSPI thread ([`ferossh_auth::negotiate`]), so the password
 //! and the session keys never reach the worker: it asks for each step
 //! with [`Message::SspiRequest`].
@@ -174,6 +174,71 @@ pub struct WinrmSession {
     recall: usize,
     /// The line being typed when Up was first pressed.
     draft: String,
+    /// Closed from this side while the shell is open: what still seals
+    /// the worker's goodbye (terminate, delete) until the window takes it.
+    closer: Option<WinrmCloser>,
+}
+
+/// A closed session's last errand: the worker tells the server to end the
+/// command and delete the shell, and those requests (and the replies)
+/// still need the login's keys. It relays only sealing and unsealing,
+/// and forgets the keys once the worker says it is done.
+#[derive(Debug)]
+pub struct WinrmCloser {
+    pub channel: ChannelId,
+    host: String,
+}
+
+impl WinrmCloser {
+    /// The worker's connection: the session's own.
+    pub fn connection(&self) -> ChannelId {
+        self.channel
+    }
+
+    /// What the worker sent; true once the closer is done.
+    pub fn on_worker(&mut self, msg: Message) -> (Vec<Effect>, bool) {
+        match msg {
+            Message::SspiRequest {
+                conn,
+                op: op @ (SspiOp::Seal(_) | SspiOp::Unseal { .. }),
+                ..
+            } if conn <= 1 => (
+                vec![Effect::Broker(Job::Sspi(SspiJob {
+                    login: self.channel,
+                    conn,
+                    host: self.host.clone(),
+                    credentials: None,
+                    op,
+                }))],
+                false,
+            ),
+            Message::Disconnected { .. } => (self.end(), true),
+            // Late output and the like: the pane is gone.
+            Message::SspiRequest { .. } => (self.end(), true),
+            _ => (Vec::new(), false),
+        }
+    }
+
+    /// The broker's answer to a seal or unseal.
+    pub fn on_broker(&self, reply: ferossh_auth::Reply) -> Vec<Effect> {
+        match reply {
+            ferossh_auth::Reply::Sspi {
+                login,
+                conn,
+                output,
+            } if login == self.channel => vec![Effect::Send(Message::SspiReply {
+                channel: self.channel,
+                conn,
+                result: output.result,
+            })],
+            _ => Vec::new(),
+        }
+    }
+
+    /// Forgets the login's keys.
+    pub fn end(&self) -> Vec<Effect> {
+        vec![Effect::Broker(Job::SspiEnd(self.channel))]
+    }
 }
 
 impl std::fmt::Debug for WinrmSession {
@@ -204,7 +269,14 @@ impl WinrmSession {
             history: Vec::new(),
             recall: 0,
             draft: String::new(),
+            closer: None,
         }
+    }
+
+    /// The closer [`close`](Self::close) left, for the window to keep
+    /// until the worker is done.
+    pub fn take_closer(&mut self) -> Option<WinrmCloser> {
+        self.closer.take()
     }
 
     pub fn state(&self) -> State {
@@ -424,15 +496,24 @@ impl WinrmSession {
         if self.state == State::Ended {
             return Vec::new();
         }
+        let was = self.state;
         self.state = State::Ended;
         self.asking = false;
         self.password = None;
-        vec![
-            Effect::Send(Message::Close {
+        let mut effects = vec![Effect::Send(Message::Close {
+            channel: self.channel,
+        })];
+        if was == State::Connected {
+            // The worker still ends the command and deletes the shell on
+            // the server, sealed with this login's keys.
+            self.closer = Some(WinrmCloser {
                 channel: self.channel,
-            }),
-            Effect::Broker(Job::SspiEnd(self.channel)),
-        ]
+                host: self.target.hostname.clone(),
+            });
+        } else {
+            effects.push(Effect::Broker(Job::SspiEnd(self.channel)));
+        }
+        effects
     }
 
     fn cut_off(&mut self) -> Vec<Effect> {
@@ -441,6 +522,10 @@ impl WinrmSession {
              FeroSSH closed the connection.{RESET}\r\n"
         ))];
         effects.extend(self.close());
+        // A worker that misbehaves gets no more sealing.
+        if let Some(c) = self.closer.take() {
+            effects.extend(c.end());
+        }
         effects.push(Effect::Ended);
         effects
     }
@@ -494,7 +579,7 @@ impl WinrmSession {
                     _ => "",
                 };
                 let mut effects = vec![Effect::Show(dim(&format!(
-                    "Connected{how}; every message is encrypted. This is a WinRS shell \
+                    "Connected{how}; shell traffic is encrypted. This is a WinRS shell \
                      without a terminal: lines are sent on Enter, Ctrl+C interrupts, \
                      full-screen programs do not work."
                 )))];
@@ -763,6 +848,81 @@ mod tests {
                 .any(|e| matches!(e, Effect::Broker(Job::SspiEnd(5))))
         );
         assert_eq!(s.state(), State::Ended);
+    }
+
+    #[test]
+    fn closing_keeps_sealing_until_the_worker_is_done() {
+        // Before the shell is open: the keys go at once.
+        let mut s = WinrmSession::new(5, WinrmTarget::typed("winrm srv").unwrap());
+        s.start();
+        let fx = s.close();
+        assert!(
+            fx.iter()
+                .any(|e| matches!(e, Effect::Broker(Job::SspiEnd(5))))
+        );
+        assert!(s.take_closer().is_none());
+        // With the shell open, a closer seals the goodbye.
+        let mut s = connected(false);
+        let fx = s.close();
+        assert!(matches!(
+            &fx[..],
+            [Effect::Send(Message::Close { channel: 5 })]
+        ));
+        let mut c = s.take_closer().unwrap();
+        let (fx, done) = c.on_worker(Message::SspiRequest {
+            channel: 5,
+            conn: 1,
+            op: SspiOp::Seal(b"terminate".to_vec()),
+        });
+        assert!(!done);
+        assert!(matches!(
+            &fx[..],
+            [Effect::Broker(Job::Sspi(SspiJob {
+                login: 5,
+                conn: 1,
+                credentials: None,
+                ..
+            }))]
+        ));
+        let fx = c.on_broker(ferossh_auth::Reply::Sspi {
+            login: 5,
+            conn: 1,
+            output: ferossh_auth::negotiate::SspiOutput {
+                result: SspiResult::Sealed {
+                    header: vec![1],
+                    data: vec![2],
+                },
+                package: None,
+            },
+        });
+        assert!(matches!(
+            &fx[..],
+            [Effect::Send(Message::SspiReply {
+                channel: 5,
+                conn: 1,
+                ..
+            })]
+        ));
+        // Output after the close is ignored; a new login ends it.
+        let (fx, done) = c.on_worker(Message::Data {
+            channel: 5,
+            bytes: vec![1],
+        });
+        assert!(fx.is_empty() && !done);
+        let (fx, done) = c.on_worker(Message::Disconnected {
+            channel: 5,
+            reason: String::new(),
+        });
+        assert!(done);
+        assert!(matches!(&fx[..], [Effect::Broker(Job::SspiEnd(5))]));
+        // A worker cut off gets no closer.
+        let mut s = connected(false);
+        let fx = s.on_worker(Message::IdentitiesRequest { channel: 5 });
+        assert!(
+            fx.iter()
+                .any(|e| matches!(e, Effect::Broker(Job::SspiEnd(5))))
+        );
+        assert!(s.take_closer().is_none());
     }
 
     #[test]

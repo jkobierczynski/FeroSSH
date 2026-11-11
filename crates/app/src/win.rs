@@ -158,7 +158,7 @@ use crate::toolpane::{self, RailItem};
 use crate::ui_colours::{self, UiColours};
 use crate::ui_theme;
 use crate::vdesk;
-use crate::winrm::{WinrmSession, WinrmTarget};
+use crate::winrm::{WinrmCloser, WinrmSession, WinrmTarget};
 use crate::zmodem;
 use ferossh_tmuxcc::saved as tmux_saved;
 use zeroize::Zeroizing;
@@ -909,6 +909,9 @@ struct Window {
     vdesks: HashMap<ChannelId, VirtualDesk>,
     /// Session > Copy public key to this server, by its exec channel.
     key_copies: HashMap<ChannelId, KeyCopy>,
+    /// Closed WinRM sessions whose worker is still ending the shell on
+    /// the server, by channel.
+    winrm_closing: HashMap<ChannelId, WinrmCloser>,
     /// Tools > New SSH key making the key in the background.
     keygen: Option<std::sync::mpsc::Receiver<(PathBuf, std::result::Result<String, String>)>>,
     /// The pane whose host the remote app picker (the palette) runs on.
@@ -1674,6 +1677,7 @@ fn create_and_run(launch: Launch, theme: Option<String>) -> Result<()> {
                 desktops: HashMap::new(),
                 vdesks: HashMap::new(),
                 key_copies: HashMap::new(),
+                winrm_closing: HashMap::new(),
                 keygen: None,
                 app_pane: None,
                 recent_apps: Vec::new(),
@@ -3439,6 +3443,10 @@ impl Window {
                 .any(|r| r.connection() == Some(connection))
             || crate::remote_app::connections_in_use().contains(&connection)
             || self.mstsc.iter().any(|(_, c)| *c == connection)
+            || self
+                .winrm_closing
+                .values()
+                .any(|w| w.connection() == connection)
     }
 
     /// Ends the workers that retired long enough ago.
@@ -5570,8 +5578,49 @@ impl Window {
         if self.launch_hidden.contains(&id) {
             self.check_launch(id);
         }
+        // A WinRM session closed with its shell open: keep sealing for
+        // the worker's goodbye after the pane moves on.
+        if let Some(Host::Winrm(s)) = self.panes.get_mut(&id).map(|p| &mut p.host)
+            && let Some(closer) = s.take_closer()
+        {
+            self.winrm_closing.insert(closer.channel, closer);
+        }
         if pump {
             self.pump_run();
+        }
+    }
+
+    /// What a closed WinRM session's closer asks for: only messages to
+    /// its own worker and SSPI jobs.
+    fn apply_winrm_closing(&mut self, channel: ChannelId, effects: Vec<Effect>) {
+        for effect in effects {
+            match effect {
+                Effect::Send(msg) => {
+                    if let Some(w) = self.workers.get(&channel) {
+                        w.link.send(msg);
+                    }
+                }
+                Effect::Broker(job) => {
+                    if let Some(b) = &self.broker {
+                        b.submit(job);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    fn on_winrm_closing(&mut self, channel: ChannelId, msg: Message) {
+        let Some(closer) = self.winrm_closing.get_mut(&channel) else {
+            return;
+        };
+        let (effects, done) = closer.on_worker(msg);
+        if done {
+            self.winrm_closing.remove(&channel);
+        }
+        self.apply_winrm_closing(channel, effects);
+        if done {
+            self.prune_workers();
         }
     }
 
@@ -6725,6 +6774,13 @@ impl Window {
                     None => 0,
                 },
             };
+            if matches!(reply, ferossh_auth::Reply::Sspi { .. })
+                && let Some(closer) = self.winrm_closing.get(&channel)
+            {
+                let effects = closer.on_broker(reply);
+                self.apply_winrm_closing(channel, effects);
+                continue;
+            }
             let Some(id) = self.pane_of_channel(channel) else {
                 continue;
             };
@@ -6840,6 +6896,14 @@ impl Window {
                     self.on_key_copy(c, msg);
                     return false;
                 }
+                if self
+                    .winrm_closing
+                    .get(&c)
+                    .is_some_and(|w| w.connection() == connection)
+                {
+                    self.on_winrm_closing(c, msg);
+                    return false;
+                }
                 if let Some(remote) = self
                     .sftp
                     .values_mut()
@@ -6883,6 +6947,18 @@ impl Window {
                 }
                 crate::remote_app::connection_gone(connection);
                 self.proxies.remove(&connection);
+                let gone: Vec<ChannelId> = self
+                    .winrm_closing
+                    .iter()
+                    .filter(|(_, w)| w.connection() == connection)
+                    .map(|(&c, _)| c)
+                    .collect();
+                for c in gone {
+                    if let Some(closer) = self.winrm_closing.remove(&c) {
+                        let effects = closer.end();
+                        self.apply_winrm_closing(c, effects);
+                    }
+                }
                 self.vdesks.retain(|_, v| v.connection != connection);
                 let lost: Vec<ChannelId> = self
                     .key_copies

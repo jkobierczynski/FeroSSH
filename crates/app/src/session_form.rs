@@ -1331,12 +1331,19 @@ impl SessionForm {
             }
             // Telnet has no user field: whatever an SSH session left there
             // is not saved.
+            // WinRM users may be user@domain (a UPN); everywhere else @
+            // would split the user from the host.
+            let at_ok = v.kind == SessionKind::WinRm;
             if v.kind != SessionKind::Telnet
                 && v.user
                     .trim()
-                    .contains(|c: char| c.is_whitespace() || c.is_control() || c == '@')
+                    .contains(|c: char| c.is_whitespace() || c.is_control() || (c == '@' && !at_ok))
             {
-                return Err("The user name has a space or @ in it.".into());
+                return Err(if at_ok {
+                    "The user name has a space in it.".into()
+                } else {
+                    "The user name has a space or @ in it.".into()
+                });
             }
             port(&v.port, "The port")?;
             let jump = v.jump.trim();

@@ -20,6 +20,7 @@ pub mod sealed;
 pub mod soap;
 pub mod xml;
 
+use std::collections::VecDeque;
 use std::time::Duration;
 
 use base64ct::{Base64, Encoding};
@@ -85,30 +86,80 @@ impl<T> Drop for Task<T> {
 pub async fn run(
     channel: ChannelId,
     params: Params,
-    mut inbox: mpsc::Receiver<Message>,
+    inbox: mpsc::Receiver<Message>,
     out: mpsc::Sender<Message>,
 ) {
     // SSPI answers go to the connection that asked; the rest is input.
     let (sspi_tx, sspi_rx) = (mpsc::channel(4), mpsc::channel(4));
     let (input_tx, mut input) = mpsc::channel::<Message>(64);
     let sspi = [sspi_tx.0, sspi_rx.0];
-    let _demux = Task(tokio::spawn(async move {
-        while let Some(msg) = inbox.recv().await {
-            let sent = match msg {
-                Message::SspiReply { conn, result, .. } => match sspi.get(usize::from(conn)) {
-                    Some(tx) => tx.send(result).await.is_ok(),
-                    None => true,
-                },
-                other => input_tx.send(other).await.is_ok(),
-            };
-            if !sent {
-                break;
-            }
-        }
-    }));
+    let _demux = Task(tokio::spawn(demux(channel, inbox, sspi, input_tx)));
     let replies = [sspi_tx.1, sspi_rx.1];
     let reason = session(channel, &params, replies, &mut input, &out).await;
     let _ = out.send(Message::Disconnected { channel, reason }).await;
+}
+
+/// The most typed input held while the session is busy sending earlier
+/// input; past it the session is closed rather than grow without bound.
+const MAX_PENDING: usize = 32 * 1024 * 1024;
+
+/// Splits the UI's messages: SSPI answers to the connection that asked,
+/// the rest to the session in order. Input waits in a queue of its own
+/// so a session busy sending (and waiting on SSPI to seal it) never
+/// keeps an SSPI answer from getting through.
+async fn demux(
+    channel: ChannelId,
+    mut inbox: mpsc::Receiver<Message>,
+    sspi: [mpsc::Sender<SspiResult>; 2],
+    input_tx: mpsc::Sender<Message>,
+) {
+    let mut pending: VecDeque<Message> = VecDeque::new();
+    let mut held = 0usize;
+    let mut overflowed = false;
+    loop {
+        tokio::select! {
+            msg = inbox.recv() => {
+                let Some(msg) = msg else { break };
+                match msg {
+                    Message::SspiReply { conn, result, .. } => {
+                        if let Some(tx) = sspi.get(usize::from(conn))
+                            && tx.send(result).await.is_err()
+                        {
+                            break;
+                        }
+                    }
+                    _ if overflowed => {}
+                    other => {
+                        held = held.saturating_add(input_size(&other));
+                        pending.push_back(other);
+                        if held > MAX_PENDING {
+                            // Too much typed input waiting: end the
+                            // session, which still ends the shell on the
+                            // server through the SSPI answers above.
+                            overflowed = true;
+                            pending.clear();
+                            held = 0;
+                            pending.push_back(Message::Close { channel });
+                        }
+                    }
+                }
+            }
+            permit = input_tx.reserve(), if !pending.is_empty() => {
+                let Ok(permit) = permit else { break };
+                if let Some(msg) = pending.pop_front() {
+                    held = held.saturating_sub(input_size(&msg));
+                    permit.send(msg);
+                }
+            }
+        }
+    }
+}
+
+fn input_size(msg: &Message) -> usize {
+    match msg {
+        Message::Data { bytes, .. } => bytes.len(),
+        _ => 0,
+    }
 }
 
 /// Waits for the UI to close the session; input meanwhile is dropped.
@@ -585,5 +636,70 @@ pub fn fuzz_reply_chunked(data: &[u8], step: usize) {
     if whole_end.is_ok() {
         assert!(end.is_ok());
         assert_eq!(got, want);
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::panic)]
+mod tests {
+    use super::*;
+
+    fn data(n: usize) -> Message {
+        Message::Data {
+            channel: 1,
+            bytes: vec![b'x'; n],
+        }
+    }
+
+    #[tokio::test]
+    async fn sspi_answers_pass_queued_input() {
+        let (ui, inbox) = mpsc::channel(8);
+        let (a, mut a_rx) = mpsc::channel(4);
+        let (b, _b_rx) = mpsc::channel(4);
+        let (input_tx, mut input) = mpsc::channel(1);
+        let _d = Task(tokio::spawn(demux(1, inbox, [a, b], input_tx)));
+        // The session is not reading input: far more than the input
+        // channel holds is waiting.
+        for _ in 0..100 {
+            ui.send(data(10)).await.unwrap();
+        }
+        ui.send(Message::SspiReply {
+            channel: 1,
+            conn: 0,
+            result: SspiResult::Unsealed(b"ok".to_vec()),
+        })
+        .await
+        .unwrap();
+        let got = tokio::time::timeout(Duration::from_secs(5), a_rx.recv())
+            .await
+            .unwrap();
+        assert_eq!(got, Some(SspiResult::Unsealed(b"ok".to_vec())));
+        // The input still arrives, all of it and in order.
+        for _ in 0..100 {
+            assert!(matches!(input.recv().await, Some(Message::Data { .. })));
+        }
+    }
+
+    #[tokio::test]
+    async fn too_much_waiting_input_closes_the_session() {
+        let (ui, inbox) = mpsc::channel(64);
+        let (a, _a_rx) = mpsc::channel(4);
+        let (b, _b_rx) = mpsc::channel(4);
+        let (input_tx, mut input) = mpsc::channel(1);
+        let _d = Task(tokio::spawn(demux(1, inbox, [a, b], input_tx)));
+        let chunk = 1024 * 1024;
+        for _ in 0..MAX_PENDING / chunk + 8 {
+            ui.send(data(chunk)).await.unwrap();
+        }
+        // Let the demux take everything in before the session reads any.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        // Whatever got through before the cap, then the close.
+        loop {
+            match tokio::time::timeout(Duration::from_secs(5), input.recv()).await {
+                Ok(Some(Message::Data { .. })) => {}
+                Ok(Some(Message::Close { .. })) => break,
+                other => panic!("{:?}", other.map(|m| m.map(|m| std::mem::discriminant(&m)))),
+            }
+        }
     }
 }

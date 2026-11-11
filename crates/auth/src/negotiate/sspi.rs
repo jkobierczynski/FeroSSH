@@ -241,8 +241,10 @@ impl NegotiateContext for Context {
         if attrs & ISC_RET_CONFIDENTIALITY == 0 || attrs & ISC_RET_INTEGRITY == 0 {
             return Err("the login gives no encryption".into());
         }
-        // Kerberos proves the server holds the service's key; NTLM cannot.
-        if self.package().eq_ignore_ascii_case("Kerberos") && attrs & ISC_RET_MUTUAL_AUTH == 0 {
+        // Kerberos proves the server holds the service's key; NTLM cannot,
+        // so only an explicit NTLM login may finish without it. An unknown
+        // or unreadable package fails closed.
+        if !self.package().eq_ignore_ascii_case("NTLM") && attrs & ISC_RET_MUTUAL_AUTH == 0 {
             return Err("the server did not authenticate itself".into());
         }
         Ok(ContextStep::Done(token))
