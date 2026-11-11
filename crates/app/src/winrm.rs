@@ -442,7 +442,7 @@ impl WinrmSession {
     /// echo would.
     fn flush_echo(&self, echo: &mut String, effects: &mut Vec<Effect>) {
         if !echo.is_empty() {
-            effects.push(Effect::Output(std::mem::take(echo).into_bytes()));
+            effects.push(Effect::Echo(std::mem::take(echo).into_bytes()));
         }
     }
 
@@ -675,7 +675,9 @@ mod tests {
             .iter()
             .filter_map(|e| match e {
                 Effect::Show(t) => Some(t.clone()),
-                Effect::Output(b) => Some(String::from_utf8_lossy(b).into_owned()),
+                Effect::Output(b) | Effect::Echo(b) => {
+                    Some(String::from_utf8_lossy(b).into_owned())
+                }
                 _ => None,
             })
             .collect()

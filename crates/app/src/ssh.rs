@@ -400,6 +400,10 @@ pub enum Effect {
     Show(String),
     /// Bytes from the host: feed the terminal and the log.
     Output(Vec<u8>),
+    /// This side's echo of typed input (WinRM edits lines locally): the
+    /// terminal and the log, but not output watches or scripts, which
+    /// wait for what the host sends.
+    Echo(Vec<u8>),
     /// Hand a job to the signing broker.
     Broker(Job),
     /// Logged in: the shell is open.

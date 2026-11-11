@@ -5477,6 +5477,12 @@ impl Window {
                     }
                 }
                 Effect::Show(text) => self.show(id, &text),
+                Effect::Echo(bytes) => {
+                    if let Some(p) = self.panes.get_mut(&id) {
+                        p.term.feed(&bytes);
+                    }
+                    self.log(id, &bytes);
+                }
                 Effect::Output(bytes)
                     if matches!(self.panes.get(&id).map(|p| &p.host), Some(Host::Winrm(_))) =>
                 {
@@ -6907,7 +6913,9 @@ impl Window {
         match event {
             LinkEvent::Message(msg) => {
                 match &msg {
-                    Message::Data { bytes, .. } | Message::ZmodemData { bytes, .. } => {
+                    Message::Data { bytes, .. }
+                    | Message::ZmodemData { bytes, .. }
+                    | Message::ExecStderr { bytes, .. } => {
                         *fed += bytes.len();
                     }
                     Message::SftpReply {

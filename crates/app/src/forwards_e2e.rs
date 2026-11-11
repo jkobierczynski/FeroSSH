@@ -269,7 +269,9 @@ fn local_remote_dynamic_and_x11_forwards() {
             match effect {
                 Effect::Send(m) => link.send(m),
                 Effect::Show(s) => shown.push_str(&s),
-                Effect::Output(b) => output.push_str(&String::from_utf8_lossy(&b)),
+                Effect::Output(b) | Effect::Echo(b) => {
+                    output.push_str(&String::from_utf8_lossy(&b))
+                }
                 Effect::Broker(job) => broker.submit(job),
                 Effect::Connected => {
                     forwarder.start(session.connection, target.label(), setup.clone());
@@ -392,7 +394,9 @@ impl Shell {
                 match effect {
                     Effect::Send(m) => self.link.send(m),
                     Effect::Show(s) => self.shown.push_str(&s),
-                    Effect::Output(b) => self.output.push_str(&String::from_utf8_lossy(&b)),
+                    Effect::Output(b) | Effect::Echo(b) => {
+                        self.output.push_str(&String::from_utf8_lossy(&b))
+                    }
                     Effect::Broker(job) => self.broker.submit(job),
                     Effect::Connected => {
                         let label = self.session.target.label();
