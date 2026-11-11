@@ -369,23 +369,48 @@ async fn serve(
     inbox: &mut mpsc::Receiver<Message>,
     out: &mpsc::Sender<Message>,
 ) -> String {
-    // A server slow to answer must not keep the UI's Close waiting.
-    let start = async {
-        let ch = conn
+    // A server slow to answer must not keep the UI's Close waiting, but
+    // an open already asked for is still seen through: a channel the
+    // server confirms after the Close is closed again, so enabling and
+    // disabling the bar never leaves channels open on the server.
+    let owned = Arc::clone(conn);
+    let mut start = tokio::spawn(async move {
+        let ch = owned
             .channel_open_session()
             .await
-            .map_err(|_| "The server would not open a channel for its statistics.")?;
-        ch.exec(true, command(interval))
-            .await
-            .map_err(|_| "The server would not report its statistics.")?;
-        Ok::<_, &str>(ch)
-    };
+            .map_err(|_| "The server would not open a channel for its statistics.");
+        let started = match ch {
+            Ok(ch) => match ch.exec(true, command(interval)).await {
+                Ok(()) => Ok(ch),
+                Err(_) => {
+                    let _ = ch.close().await;
+                    Err("The server would not report its statistics.")
+                }
+            },
+            Err(why) => Err(why),
+        };
+        (owned, started)
+    });
     let ch = tokio::select! {
-        started = start => match started {
-            Ok(ch) => ch,
-            Err(why) => return why.into(),
+        joined = &mut start => match joined {
+            Ok((owned, Ok(ch))) => {
+                drop(owned);
+                ch
+            }
+            Ok((_, Err(why))) => return why.into(),
+            Err(_) => return "The server would not report its statistics.".into(),
         },
-        _ = closed(inbox) => return "Closed.".into(),
+        _ = closed(inbox) => {
+            tokio::spawn(async move {
+                if let Ok((owned, started)) = start.await {
+                    if let Ok(ch) = started {
+                        let _ = ch.close().await;
+                    }
+                    release(owned).await;
+                }
+            });
+            return "Closed.".into();
+        }
     };
     let (mut read, write) = ch.split();
     let mut sampler = Sampler::new();
