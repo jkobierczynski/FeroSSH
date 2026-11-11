@@ -23,10 +23,15 @@ const RESET: &str = "\x1b[0m";
 /// Output kept for matching, after escape sequences are dropped.
 const SEEN_MAX: usize = 8192;
 
-/// The most steps a script runs in a row without waiting for the host,
-/// a moment or a secret: a `goto` loop that never waits stops there
-/// instead of hanging the window or flooding the host.
+/// The most steps a script runs in a row without waiting for the host
+/// or a moment: a `goto` loop that never waits stops there instead of
+/// hanging the window or flooding the host. Getting a secret is no wait
+/// (a store answers at once), so a loop through `secret` stops too.
 const MAX_BUSY_STEPS: usize = 1000;
+/// The most secrets a script types in a row without waiting for the host
+/// or a moment: a loop through a secret step stops there instead of
+/// typing the password at the host again and again.
+const MAX_BUSY_SECRETS: usize = 8;
 /// The most variables a script sets, and the longest value one holds.
 const MAX_VARS: usize = 64;
 const MAX_VAR_LEN: usize = 256;
@@ -104,6 +109,10 @@ pub struct Runner {
     on_timeout: Option<String>,
     /// Variables set by `set`, `add` and `capture` (as `captured`).
     vars: BTreeMap<String, String>,
+    /// Steps run and secrets typed since the script last waited for the
+    /// host or a moment (see [`MAX_BUSY_STEPS`], [`MAX_BUSY_SECRETS`]).
+    busy: usize,
+    busy_secrets: usize,
 }
 
 impl Runner {
@@ -127,6 +136,8 @@ impl Runner {
             timeout: Duration::from_secs(EXPECT_TIMEOUT_SECS),
             on_timeout: None,
             vars: BTreeMap::new(),
+            busy: 0,
+            busy_secrets: 0,
         }
     }
 
@@ -253,10 +264,9 @@ impl Runner {
     fn advance(&mut self, now: Instant, out: &mut Vec<Action>) {
         self.deadline = None;
         self.wait = Wait::Ready;
-        let mut busy = 0;
         while let Some(step) = self.steps.get(self.next).cloned() {
-            busy += 1;
-            if busy > MAX_BUSY_STEPS {
+            self.busy += 1;
+            if self.busy > MAX_BUSY_STEPS {
                 self.fail(
                     &format!(
                         "it ran {MAX_BUSY_STEPS} steps without waiting for the host; a goto \
@@ -482,9 +492,16 @@ impl Runner {
         }
         let mut out = Vec::new();
         if self.wait == Wait::Expect {
+            self.waited();
             self.advance(now, &mut out);
         }
         out
+    }
+
+    /// The script waited for the host or a moment: its loops may go on.
+    fn waited(&mut self) {
+        self.busy = 0;
+        self.busy_secrets = 0;
     }
 
     /// Acts on a passed deadline: an `expect` that timed out, or a pause
@@ -493,6 +510,10 @@ impl Runner {
         let mut out = Vec::new();
         if self.deadline.is_none_or(|d| now < d) {
             return out;
+        }
+        match self.wait {
+            Wait::Expect | Wait::Pause => self.waited(),
+            _ => {}
         }
         match self.wait {
             Wait::Expect => {
@@ -521,6 +542,17 @@ impl Runner {
     pub fn secret(&mut self, secret: &str, now: Instant) -> Vec<Action> {
         let mut out = Vec::new();
         if self.wait != Wait::Secret {
+            return out;
+        }
+        self.busy_secrets += 1;
+        if self.busy_secrets > MAX_BUSY_SECRETS {
+            self.fail(
+                &format!(
+                    "it typed {MAX_BUSY_SECRETS} secrets without waiting for the host; a goto \
+                     loop needs an expect, on, pause or delay."
+                ),
+                &mut out,
+            );
             return out;
         }
         let mut bytes = Zeroizing::new(secret.as_bytes().to_vec());
@@ -906,6 +938,87 @@ mod tests {
         let a = r.start(now);
         assert!(sent(&a).len() < MAX_BUSY_STEPS);
         assert!(outcome_why(&r).contains("without waiting"));
+    }
+
+    #[test]
+    fn a_loop_through_a_secret_stops() {
+        let now = Instant::now();
+        // From a store: the window hands the secret over at once.
+        let mut r = Runner::new(steps(&["label a", "secret enable", "goto a"]));
+        let mut pending = r.start(now);
+        let mut typed = 0;
+        while let Some(a) = pending.pop() {
+            match a {
+                Action::Fetch(_) => pending.extend(r.secret("pw", now)),
+                Action::Send(_) => typed += 1,
+                _ => {}
+            }
+        }
+        assert!(typed <= MAX_BUSY_SECRETS);
+        assert!(outcome_why(&r).contains("without waiting"));
+
+        // Typed at the pane's prompt.
+        let mut r = Runner::new(steps(&["label a", "password", "send x", "goto a"]));
+        let mut pending = r.start(now);
+        while let Some(a) = pending.pop() {
+            if let Action::Fetch(_) = a {
+                pending.extend(r.ask("Password: ", None));
+                pending.extend(r.prompt_input(b"pw", now));
+                pending.extend(r.prompt_input(b"\r", now));
+            }
+        }
+        assert!(outcome_why(&r).contains("without waiting"));
+    }
+
+    /// The inputs that once hung the `login_script` fuzz target (script,
+    /// NUL, host output) end, with secrets from a store or the prompt.
+    #[test]
+    fn fuzz_regressions_end() {
+        let dir = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../fuzz/regressions/login_script"
+        );
+        let now = Instant::now();
+        for entry in std::fs::read_dir(dir).unwrap() {
+            let data = std::fs::read(entry.unwrap().path()).unwrap();
+            let script = data.split(|&b| b == 0).next().unwrap();
+            let lines: Vec<Step> = String::from_utf8_lossy(script)
+                .lines()
+                .filter_map(|l| Step::parse(l).ok())
+                .take(16)
+                .collect();
+            for from_store in [true, false] {
+                let mut r = Runner::new(lines.clone());
+                let mut pending = r.start(now);
+                let mut actions = 0;
+                while let Some(a) = pending.pop() {
+                    actions += 1;
+                    assert!(actions < 100_000, "it did not stop");
+                    match a {
+                        Action::Fetch(_) if from_store => pending.extend(r.secret("pw", now)),
+                        Action::Fetch(_) => {
+                            pending.extend(r.ask("Secret: ", None));
+                            pending.extend(r.prompt_input(b"pw", now));
+                            pending.extend(r.prompt_input(b"\r", now));
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_loop_that_waits_for_the_host_goes_on() {
+        let now = Instant::now();
+        let mut r = Runner::new(steps(&["label a", "expect $", "secret enable", "goto a"]));
+        assert!(r.start(now).iter().all(|a| !matches!(a, Action::Fetch(_))));
+        for _ in 0..MAX_BUSY_SECRETS * 4 {
+            let a = r.feed(b"$ ", now);
+            assert!(matches!(a.as_slice(), [Action::Fetch(_)]));
+            assert_eq!(sent(&r.secret("pw", now)), ["pw\r"]);
+        }
+        assert!(!r.is_over());
     }
 
     #[test]
