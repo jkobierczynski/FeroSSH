@@ -46,6 +46,7 @@ Besides `HostName`, `User`, `Port`, `IdentityFile`, `Tag`, `ProxyJump`, `ProxyCo
 | `UserKnownHostsFile` | Other known_hosts files, in place of `~/.ssh/known_hosts`. |
 | `HostKeyAlias` | Looks the host key up under this name instead of the host's. |
 | `AddressFamily` | `inet` for IPv4 only, `inet6` for IPv6 only. |
+| `ProxyServer` | FeroSSH's own: a SOCKS 5 or HTTP proxy to go through (see [Proxies](#proxies)). OpenSSH does not know it, so put `IgnoreUnknown ProxyServer` above it in a file OpenSSH reads too. |
 
 ### Agent forwarding
 
@@ -87,7 +88,7 @@ Ctrl+Shift+S shows your hosts in the tools pane: those from `~/.ssh/config`, you
 
 Insert or the New button opens the connection form in the tools pane; F2, the Edit button or a right click edits the selected connection. It is a Windows form of text boxes and drop-down lists, with a tab per section:
 
-- **Connection**: **Name, Folder, Type**; the type is an SSH terminal, Mosh terminal, Telnet (unencrypted), Serial console, Remote desktop (RDP) or VNC desktop. Then **Host, User, Port, Key file** (with Browse...), the **Password** source (below) and the **Jump host** (see [Jump hosts](#jump-hosts)). A Mosh terminal adds the **Mosh server** program and its **UDP ports** (see [Mosh](#mosh)). A serial console has the port, speed, framing and flow control instead.
+- **Connection**: **Name, Folder, Type**; the type is an SSH terminal, Mosh terminal, Telnet (unencrypted), Serial console, Remote desktop (RDP) or VNC desktop. Then **Host, User, Port, Key file** (with Browse...), the **Password** source (below), the **Jump host** (see [Jump hosts](#jump-hosts)) and the **Proxy** (see [Proxies](#proxies)). A Mosh terminal adds the **Mosh server** program and its **UDP ports** (see [Mosh](#mosh)). A serial console has the port, speed, framing and flow control instead.
 - **Look** (a terminal's tab): theme, font, font size and scrollback.
 - **Extras** (a terminal's tab): tmux on or off, the tmux session to attach and its layout, the start directory, File transfer's Local and Remote folders, port forwards (such as `L 8080 localhost:80`), RDP and VNC ports, agent forwarding, Kerberos and passing a ticket on, older crypto, and the login script (see [Login scripts](#login-scripts)).
 
@@ -110,7 +111,7 @@ A command runs without a shell, a window or any input, for at most 60 seconds, a
 
 File > Import connections lists the clients that have saved sessions on your account: PuTTY and KiTTY (from the registry), WinSCP (registry or `WinSCP.ini`), MobaXterm (`MobaXterm.ini`), mRemoteNG (`confCons.xml`) and SecureCRT (its `Config\Sessions` folder). Pick one to see its sessions, untick what you don't want, and choose Import. *From a file...* reads the same files from a portable install or an export.
 
-Host, user, port, key file, folders, PuTTY and KiTTY port forwards and jump hosts come over, and so do Telnet sessions and (from MobaXterm and mRemoteNG) RDP and VNC sessions. **Passwords never come over**: the preview marks the sessions that had one, so you can give them a password source. The preview also says what else does not come over. Imports go to `%APPDATA%\FeroSSH\imported-<client>.conf`, in a folder named after the client, and importing again from the same client replaces that file. A name already in use is left out.
+Host, user, port, key file, folders, PuTTY and KiTTY port forwards, jump hosts and the SOCKS 5 and HTTP proxies of PuTTY, KiTTY and WinSCP come over, and so do Telnet sessions and (from MobaXterm and mRemoteNG) RDP and VNC sessions. **Passwords never come over**: the preview marks the sessions that had one, so you can give them a password source. The preview also says what else does not come over. Imports go to `%APPDATA%\FeroSSH\imported-<client>.conf`, in a folder named after the client, and importing again from the same client replaces that file. A name already in use is left out.
 
 ## The session manager
 
@@ -124,7 +125,23 @@ To reach a host that is only reachable through another one, give it a jump host:
 
 Each jump host logs in as if you connected to it, with its own host key check and its own key or password, in a sandboxed worker of its own. The host behind it is then reached through that login, encrypted end to end, so a jump host never sees what you type on the target. If a jump host cannot reach the next one, the pane says which one and why.
 
-`ProxyCommand` in your ssh_config runs a local program (for example `ncat --proxy proxy.example.org:8080 %h %p`) and sends the connection through it. FeroSSH asks once before it runs a command line it has not run before, and shows what the program printed when it fails. `ProxyJump none` or `ProxyCommand none` turns either off for a host.
+`ProxyCommand` in your ssh_config runs a local program (for example `corkscrew proxy.example.org 8080 %h %p`) and sends the connection through it. FeroSSH asks once before it runs a command line it has not run before, and shows what the program printed when it fails. `ProxyJump none` or `ProxyCommand none` turns either off for a host.
+
+## Proxies
+
+When the way out of your network is a SOCKS 5 or HTTP proxy, put it in the connection form's **Proxy** field as a URL:
+
+- `socks5://proxy.example.org:1080` (`socks5h://` means the same; the proxy looks the host name up),
+- `http://proxy.example.org:3128` (HTTP `CONNECT`),
+- with a user to log in to the proxy: `socks5://me@proxy.example.org:1080`.
+
+Without a port, SOCKS 5 uses 1080 and HTTP 8080. In your ssh_config the same URL goes after `ProxyServer`, FeroSSH's own keyword; OpenSSH stops at keywords it does not know, so add `IgnoreUnknown ProxyServer` above it in a file OpenSSH reads too. `ProxyServer none` turns it off for a host. `ProxyJump`, `ProxyCommand` and `ProxyServer` share one place: the first of them a host gets counts.
+
+The usual proxy commands work without the program, so `nc` or `ncat` need not be installed: FeroSSH reads `nc -X 5 -x proxy:1080 %h %p` (SOCKS 5, also without `-X`), `nc -X connect -x proxy:3128 -P me %h %p` (HTTP, user `me`), `ncat --proxy proxy:8080 --proxy-type socks5 %h %p` (HTTP without `--proxy-type`), and `connect -S proxy:1080 %h %p` or `connect -H proxy:3128 %h %p` as a proxy and runs nothing. Other commands, and these with other options, still run as commands.
+
+A proxy with a user asks for its password once, in the pane, before connecting. When the proxy takes it, FeroSSH keeps it in the Windows Credential Manager (as `FeroSSH proxy:me@proxy.example.org:1080`, where you can remove it), so the next connection does not ask. When the proxy refuses a kept password, FeroSSH forgets it and asks the next time. A password never goes in the URL, and the form refuses one there.
+
+The proxy carries only the SSH connection, which stays encrypted end to end: the proxy sees which host and port you connect to, nothing more. The sandboxed worker speaks to the proxy itself, and its replies are parsed there and fuzz-tested. With jump hosts, give the proxy to the first jump host's own connection: the proxy is how FeroSSH reaches that one, and the others are reached through it. Mosh logs in through the proxy, but its UDP goes straight to the host.
 
 ## Mosh
 

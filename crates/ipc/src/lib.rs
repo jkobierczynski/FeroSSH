@@ -46,7 +46,7 @@ use std::fmt;
 use zeroize::Zeroize;
 
 /// Protocol version carried in every frame. Bump on any wire change.
-pub const PROTOCOL_VERSION: u8 = 17;
+pub const PROTOCOL_VERSION: u8 = 18;
 
 /// Largest frame body accepted, in bytes. Terminal and SFTP data is chunked
 /// below this, so anything larger is a bug or an attack.
@@ -167,6 +167,26 @@ pub enum Family {
     Any,
     V4,
     V6,
+}
+
+/// Which protocol a [`ProxyServer`] speaks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProxyKind {
+    Socks5,
+    /// HTTP `CONNECT`.
+    Http,
+}
+
+/// A SOCKS 5 or HTTP proxy that a [`Message::Connect`] goes through: the
+/// worker connects to it and asks it for the host, then runs SSH over
+/// that. `user` empty means no login; `password` holds one string then.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProxyServer {
+    pub kind: ProxyKind,
+    pub host: String,
+    pub port: u16,
+    pub user: String,
+    pub password: Secrets,
 }
 
 /// The UI's answer to a [`Message::GssapiStep`].
@@ -433,7 +453,9 @@ pub enum Message {
     /// With a `tunnel`, the worker does not open a TCP connection: the SSH
     /// connection runs over that stream channel instead, whose other end
     /// the UI connects to a jump host's `direct-tcpip` channel in another
-    /// worker, or to a local `ProxyCommand`. A login without `shell` is a
+    /// worker, or to a local `ProxyCommand`. With a `proxy` (and no
+    /// `tunnel`), the TCP connection goes to that proxy, which the worker
+    /// asks for `host`:`port`. A login without `shell` is a
     /// jump host's: the worker logs in, answers [`Message::Connected`] and
     /// keeps the connection for the streams opened on it until
     /// [`Message::Close`].
@@ -456,6 +478,7 @@ pub enum Message {
         /// Try a Kerberos login (`gssapi-with-mic`) first, when the server
         /// offers it (`GSSAPIAuthentication yes`).
         gssapi: bool,
+        proxy: Option<ProxyServer>,
     },
     /// Open another shell on the connection that `connection` (a channel
     /// that made it with [`Message::Connect`]) belongs to. No new login:
@@ -507,6 +530,10 @@ pub enum Message {
     GssapiReply { channel: ChannelId, reply: GssReply },
 
     // Worker to UI.
+    /// The [`Message::Connect`]'s proxy took its user name and password
+    /// (`accepted`), or refused them; sent only when there was a login,
+    /// before anything else of the connection.
+    ProxyAuth { channel: ChannelId, accepted: bool },
     /// The server's host key (SSH wire format), for the UI to check against
     /// known_hosts. The worker waits for a [`Message::HostKeyVerdict`].
     HostKey { channel: ChannelId, key: Vec<u8> },
@@ -800,6 +827,7 @@ impl Message {
             Message::AgentSigned { .. } => 38,
             Message::GssapiStep { .. } => 50,
             Message::GssapiReply { .. } => 51,
+            Message::ProxyAuth { .. } => 52,
             Message::ZmodemStart { .. } => 40,
             Message::ZmodemFile { .. } => 41,
             Message::ZmodemData { .. } => 42,
@@ -844,6 +872,7 @@ impl Message {
             | Message::AgentSigned { .. }
             | Message::GssapiReply { .. } => Side::Ui,
             Message::HostKey { .. }
+            | Message::ProxyAuth { .. }
             | Message::HostCert { .. }
             | Message::Banner { .. }
             | Message::IdentitiesRequest { .. }
@@ -886,6 +915,7 @@ impl Message {
             | Message::Signature { channel, .. }
             | Message::Answers { channel, .. }
             | Message::HostKey { channel, .. }
+            | Message::ProxyAuth { channel, .. }
             | Message::HostCert { channel, .. }
             | Message::Banner { channel, .. }
             | Message::IdentitiesRequest { channel }
@@ -1217,6 +1247,7 @@ pub fn encode(msg: &Message, out: &mut Vec<u8>) -> Result<(), Error> {
             options,
             family,
             gssapi,
+            proxy,
         } => {
             w.u32(*channel);
             w.str(host);
@@ -1239,6 +1270,23 @@ pub fn encode(msg: &Message, out: &mut Vec<u8>) -> Result<(), Error> {
                 Family::V6 => 6,
             });
             w.bool(*gssapi);
+            match proxy {
+                None => w.u8(0),
+                Some(p) => {
+                    w.u8(match p.kind {
+                        ProxyKind::Socks5 => 5,
+                        ProxyKind::Http => 1,
+                    });
+                    w.str(&p.host);
+                    w.u16(p.port);
+                    w.str(&p.user);
+                    w.list(&p.password.0, |w, s| w.str(s));
+                }
+            }
+        }
+        Message::ProxyAuth { channel, accepted } => {
+            w.u32(*channel);
+            w.bool(*accepted);
         }
         Message::TelnetConnect {
             channel,
@@ -1691,6 +1739,28 @@ fn decode_body(body: &[u8]) -> Result<Message, Error> {
                 _ => return Err(Error::Invalid),
             },
             gssapi: r.bool()?,
+            proxy: {
+                let kind = match r.u8()? {
+                    0 => None,
+                    5 => Some(ProxyKind::Socks5),
+                    1 => Some(ProxyKind::Http),
+                    _ => return Err(Error::Invalid),
+                };
+                match kind {
+                    None => None,
+                    Some(kind) => Some(ProxyServer {
+                        kind,
+                        host: r.string()?,
+                        port: r.u16()?,
+                        user: r.string()?,
+                        password: Secrets(r.list(Reader::string)?),
+                    }),
+                }
+            },
+        },
+        52 => Message::ProxyAuth {
+            channel: r.u32()?,
+            accepted: r.bool()?,
         },
         5 => Message::HostKeyVerdict {
             channel: r.u32()?,
@@ -2182,6 +2252,31 @@ mod tests {
                 options: ShellOptions::default(),
                 family: Family::Any,
                 gssapi: false,
+                proxy: None,
+            },
+            Message::Connect {
+                channel: 2,
+                host: "srv".into(),
+                port: 22,
+                user: "u".into(),
+                cols: 80,
+                rows: 24,
+                host_key_algs: Vec::new(),
+                x11: None,
+                legacy: false,
+                timing: Timing::default(),
+                tunnel: None,
+                shell: true,
+                options: ShellOptions::default(),
+                family: Family::Any,
+                gssapi: false,
+                proxy: Some(ProxyServer {
+                    kind: ProxyKind::Http,
+                    host: "[::1]".into(),
+                    port: 3128,
+                    user: "me".into(),
+                    password: Secrets(vec!["pw".into()]),
+                }),
             },
             Message::Connect {
                 channel: 3,
@@ -2216,6 +2311,13 @@ mod tests {
                 },
                 family: Family::V6,
                 gssapi: true,
+                proxy: Some(ProxyServer {
+                    kind: ProxyKind::Socks5,
+                    host: "proxy".into(),
+                    port: 1080,
+                    user: String::new(),
+                    password: Secrets::default(),
+                }),
             },
             Message::HostKeyVerdict {
                 channel: 1,
@@ -2296,6 +2398,10 @@ mod tests {
                 code: 130,
             },
             Message::Lost { channel: 1 },
+            Message::ProxyAuth {
+                channel: 1,
+                accepted: false,
+            },
             Message::Disconnected {
                 channel: 1,
                 reason: "Connection closed".into(),
@@ -2624,8 +2730,9 @@ mod tests {
         let mut tags: Vec<u8> = samples().iter().map(Message::tag).collect();
         tags.sort_unstable();
         tags.dedup();
-        // ZMODEM starts at 40, leaving room below; Kerberos at 50.
-        let want: Vec<u8> = (0..=38).chain(40..=51).collect();
+        // ZMODEM starts at 40, leaving room below; Kerberos at 50, the
+        // proxy's verdict at 52.
+        let want: Vec<u8> = (0..=38).chain(40..=52).collect();
         assert_eq!(tags, want);
     }
 
@@ -2728,5 +2835,13 @@ mod tests {
             answers: Secrets(vec!["hunter2".into()]),
         };
         assert!(!format!("{msg:?}").contains("hunter2"));
+        let proxy = ProxyServer {
+            kind: ProxyKind::Http,
+            host: "p".into(),
+            port: 1,
+            user: "u".into(),
+            password: Secrets(vec!["hunter2".into()]),
+        };
+        assert!(!format!("{proxy:?}").contains("hunter2"));
     }
 }

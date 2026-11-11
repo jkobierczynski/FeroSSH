@@ -223,6 +223,7 @@ pub async fn serve(mut inbox: mpsc::Receiver<Message>, out: mpsc::Sender<Message
                 options,
                 family,
                 gssapi,
+                proxy,
             } => {
                 // The tunnel's stream first: the UI may send its bytes
                 // right behind this message.
@@ -257,6 +258,7 @@ pub async fn serve(mut inbox: mpsc::Receiver<Message>, out: mpsc::Sender<Message
                     options,
                     family,
                     gssapi,
+                    proxy,
                 };
                 guard.track(tokio::spawn(session::run(
                     channel,

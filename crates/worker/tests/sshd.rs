@@ -230,6 +230,7 @@ async fn run_ui_with(server: &Server, command: &str, trust: bool, known: Vec<Str
         options: Default::default(),
         family: Default::default(),
         gssapi: false,
+        proxy: None,
     })
     .await;
     let mut seen = Seen::default();
@@ -460,6 +461,7 @@ async fn second_shell_shares_the_connection() {
         options: Default::default(),
         family: Default::default(),
         gssapi: false,
+        proxy: None,
     })
     .await;
     let (mut host_keys, mut signed) = (0, 0);
@@ -608,6 +610,7 @@ async fn login_at(server: &Server, port: u16) -> (mpsc::Sender<Message>, mpsc::R
             options: Default::default(),
             family: Default::default(),
             gssapi: false,
+            proxy: None,
         })
         .await
         .unwrap();
@@ -1031,6 +1034,7 @@ async fn through(
         options: Default::default(),
         family: Default::default(),
         gssapi: false,
+        proxy: None,
     };
     to[0].send(connect(0)).await.unwrap();
     let mut seen = Chain {
@@ -1479,6 +1483,7 @@ async fn mosh_session_after_an_ssh_login() {
             },
             family: Default::default(),
             gssapi: false,
+            proxy: None,
         })
         .await
         .unwrap();
