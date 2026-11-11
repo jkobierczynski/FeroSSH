@@ -933,6 +933,7 @@ dependencies = [
  "miniz_oxide 0.9.1",
  "ocb3",
  "unicode-width",
+ "vte",
  "zeroize",
 ]
 

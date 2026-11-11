@@ -17,7 +17,7 @@ use std::time::{Duration, Instant};
 
 use ferossh_mosh::bootstrap::parse_connect;
 use ferossh_mosh::client::Client;
-use ferossh_mosh::screen::Screen;
+use ferossh_mosh::screen::{Rendition, Screen};
 
 fn start(shell: &str) -> Option<(u16, [u8; 16])> {
     let out = Command::new("mosh-server")
@@ -229,4 +229,153 @@ fn survives_packet_loss() {
         "{lines:?}\n{}",
         r.screen_text()
     );
+}
+
+/// Random terminal output, run through the real server's emulator and
+/// renderer, leaves the pane as reading that output directly does: the
+/// two emulators agree.
+#[test]
+fn random_output_reads_as_the_server_reads_it() {
+    let rounds: u64 = std::env::var("MOSH_SERVER_ROUNDS")
+        .ok()
+        .and_then(|r| r.parse().ok())
+        .unwrap_or(4);
+    for seed in 1..=rounds {
+        let script = random_output(seed);
+        let dir = std::env::temp_dir().join(format!("ferossh-mosh-{}-{seed}", std::process::id()));
+        std::fs::write(&dir, &script).unwrap();
+        let cmd = format!("stty -opost -echo; cat '{}'; exec sleep 60", dir.display());
+        let Some((port, key)) = start(&cmd) else {
+            return;
+        };
+        let mut want = Screen::new(80, 24);
+        want.apply(&script);
+        let mut r = run(port, key);
+        let mut why = String::new();
+        let same = r.until(10, |r| match differs(&r.shown, &want) {
+            Some(w) => {
+                why = w;
+                false
+            }
+            None => true,
+        });
+        let _ = std::fs::remove_file(&dir);
+        assert!(
+            same,
+            "seed {seed}: {why}\nscript {:?}",
+            String::from_utf8_lossy(&script)
+        );
+    }
+}
+
+fn differs(a: &Screen, b: &Screen) -> Option<String> {
+    // Blank, a space and a no-break space look the same, and a lone
+    // combining character is drawn on a no-break space.
+    let norm = |t: &str| -> String {
+        let t = t.trim_start_matches('\u{a0}');
+        if t == " " {
+            String::new()
+        } else {
+            t.to_owned()
+        }
+    };
+    for y in 0..b.height() {
+        for x in 0..b.width() {
+            let (p, q) = (a.cell(y, x)?, b.cell(y, x)?);
+            // Right halves, and a wide character squeezed into the last
+            // column (no terminal can draw it), are left out.
+            if x > 0 && b.cell(y, x - 1).is_some_and(|c| c.wide) || q.wide && x + 1 == b.width() {
+                continue;
+            }
+            if norm(&p.text) != norm(&q.text) || !same_look(p.rend, q.rend) || p.wide != q.wide {
+                return Some(format!("cell {y},{x}: {p:?} != {q:?}"));
+            }
+        }
+    }
+    let (p, q) = (&a.ds, &b.ds);
+    if (p.cursor_row, p.cursor_col) != (q.cursor_row, q.cursor_col) {
+        return Some(format!(
+            "cursor {:?} != {:?}",
+            (p.cursor_row, p.cursor_col),
+            (q.cursor_row, q.cursor_col)
+        ));
+    }
+    if !same_look(p.rend, q.rend) || p.cursor_visible != q.cursor_visible {
+        return Some(format!("modes {p:?} != {q:?}"));
+    }
+    None
+}
+
+/// Mosh has no faint text (SGR 2): the server drops it.
+fn same_look(a: Rendition, b: Rendition) -> bool {
+    let faint = 1 << 1;
+    Rendition {
+        attrs: a.attrs & !faint,
+        ..a
+    } == Rendition {
+        attrs: b.attrs & !faint,
+        ..b
+    }
+}
+
+fn random_output(seed: u64) -> Vec<u8> {
+    let mut x = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
+    let mut rnd = |n: u64| {
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        x % n
+    };
+    // From the top left (the server's screen may not start there).
+    let mut out = String::from("\x1b[H");
+    // Mosh's renderer draws a wide character squeezed into the last
+    // column (autowrap off) where the terminal wraps it: none while off.
+    let mut wrap = true;
+    for _ in 0..400 {
+        match rnd(24) {
+            0..=7 => {
+                for _ in 0..rnd(30) {
+                    out.push(char::from(b' ' + rnd(95) as u8));
+                }
+            }
+            8 => out.push_str(["é", "ü", "漢", "字", "😀"][rnd(if wrap { 5 } else { 2 }) as usize]),
+            9 => out.push_str(["e\u{301}", "a\u{308}"][rnd(2) as usize]),
+            10 => out.push_str("\r\n"),
+            11 => out.push(['\r', '\n', '\x08', '\t'][rnd(4) as usize]),
+            12 => out.push_str(&format!("\x1b[{};{}H", rnd(26), rnd(82))),
+            13 => out.push_str(&format!(
+                "\x1b[{}{}",
+                rnd(3),
+                ["J", "K", "X", "@", "P", "L", "M"][rnd(7) as usize]
+            )),
+            14 => out.push_str(&format!(
+                "\x1b[{};{};{}m",
+                rnd(10),
+                [31, 42, 93, 104, 39, 49, 22, 27][rnd(8) as usize],
+                rnd(2)
+            )),
+            15 => out.push_str(&format!(
+                "\x1b[38;5;{}m\x1b[48;2;{};2;3m",
+                rnd(256),
+                rnd(256)
+            )),
+            16 => out.push_str(&format!("\x1b[{};{}r", 1 + rnd(24), 1 + rnd(24))),
+            17 => out.push_str("\x1b[r"),
+            18 => out.push_str(["\x1b[?25l", "\x1b[?25h", "\x1b[4h", "\x1b[4l"][rnd(4) as usize]),
+            19 => out.push_str(["\x1b7", "\x1b8", "\x1bM", "\x1bD", "\x1bE"][rnd(5) as usize]),
+            20 => out.push_str(&format!(
+                "\x1b[{}{}",
+                rnd(4),
+                ["S", "T", "A", "B", "C", "D", "G", "d"][rnd(8) as usize]
+            )),
+            21 => {
+                wrap = !wrap;
+                out.push_str(if wrap { "\x1b[?7h" } else { "\x1b[?7l" });
+            }
+            // A wide character in the last column.
+            22 if wrap => out.push_str("\x1b[80G漢"),
+            _ => out.push_str("\x1b[0m"),
+        }
+    }
+    out.into_bytes()
 }
