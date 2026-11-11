@@ -1,5 +1,6 @@
 //! The sandboxed SSH worker: russh sessions, channels and forwards,
-//! Telnet sessions ([`telnet`]), and ZMODEM in either's shell.
+//! Telnet sessions ([`telnet`]), WinRM shells ([`winrm`]), and ZMODEM in
+//! an SSH or Telnet shell.
 //!
 //! `ferossh.exe` starts a copy of itself in an AppContainer that may only
 //! use the network, and talks to it over two inherited pipes. The worker
@@ -21,6 +22,7 @@ mod sftp;
 
 pub mod telnet;
 mod tunnel;
+pub mod winrm;
 mod zmodem;
 
 use std::io::{Read, Write};
@@ -288,6 +290,24 @@ pub async fn serve(mut inbox: mpsc::Receiver<Message>, out: mpsc::Sender<Message
                     connect_timeout,
                 };
                 guard.track(tokio::spawn(telnet::run(channel, params, rx, out.clone())));
+            }
+            Message::WinrmConnect {
+                channel,
+                host,
+                port,
+                connect_timeout,
+                command,
+            } => {
+                let Some((rx, guard)) = session(channel) else {
+                    continue;
+                };
+                let params = winrm::Params {
+                    host,
+                    port,
+                    connect_timeout,
+                    command,
+                };
+                guard.track(tokio::spawn(winrm::run(channel, params, rx, out.clone())));
             }
             Message::RemoteForward {
                 channel,

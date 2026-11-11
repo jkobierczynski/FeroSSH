@@ -47,6 +47,7 @@ pub enum Kind {
     /// An SFTP-only login: file transfer, no shell.
     Sftp,
     Telnet,
+    WinRm,
     Serial,
     Tmux,
     Desktop,
@@ -60,6 +61,7 @@ impl Kind {
             Kind::Mosh => "Mosh",
             Kind::Sftp => "SFTP",
             Kind::Telnet => "Telnet",
+            Kind::WinRm => "WinRM",
             Kind::Serial => "serial",
             Kind::Tmux => "tmux",
             Kind::Desktop => "desktop",

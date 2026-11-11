@@ -17,6 +17,7 @@ use zeroize::Zeroizing;
 use crate::agent::{self, AgentChoice, AgentKind};
 use crate::gss::{Contexts, GssOutput, GssProvider, GssStepJob};
 use crate::keyfile::{KeyFile, KeyFileError};
+use crate::negotiate::{self, NegotiateProvider, SspiJob, SspiOutput};
 use crate::sk::Authenticator;
 use crate::userauth::{allowed_algorithms, is_certificate, key_type};
 
@@ -85,6 +86,10 @@ pub enum Job {
     /// One step of a Kerberos login, checked by the caller with
     /// [`crate::gss::check_mic_data`].
     Gssapi(GssStepJob),
+    /// One SSPI step of a WinRM session's HTTP connection.
+    Sspi(SspiJob),
+    /// WinRM session `login` has ended: forget its contexts.
+    SspiEnd(u32),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -110,6 +115,13 @@ pub enum Reply {
     Gssapi {
         login: u32,
         result: Result<GssOutput, String>,
+    },
+    /// A [`Job::Sspi`] step's answer, on the same thread as Kerberos and
+    /// as out of order; `login` and `conn` say whose it is.
+    Sspi {
+        login: u32,
+        conn: u8,
+        output: SspiOutput,
     },
 }
 
@@ -340,20 +352,27 @@ impl Broker {
         notify: impl Fn() + Send + 'static,
         authenticator: Box<dyn Authenticator>,
     ) -> std::io::Result<Self> {
-        Self::spawn_full(notify, authenticator, crate::gss::platform_provider())
+        Self::spawn_full(
+            notify,
+            authenticator,
+            crate::gss::platform_provider(),
+            negotiate::platform_provider(),
+        )
     }
 
-    /// [`Broker::spawn_with`] with another source of Kerberos tickets.
+    /// [`Broker::spawn_with`] with another source of Kerberos tickets and
+    /// of Negotiate contexts.
     pub fn spawn_full(
         notify: impl Fn() + Send + 'static,
         authenticator: Box<dyn Authenticator>,
         gss: Box<dyn GssProvider>,
+        winrm: Box<dyn NegotiateProvider>,
     ) -> std::io::Result<Self> {
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()?;
         let (jobs, job_rx) = channel::<Job>();
-        let (gss_jobs, gss_rx) = channel::<GssStepJob>();
+        let (gss_jobs, gss_rx) = channel::<Job>();
         let (reply_tx, replies) = channel();
         // Both threads wake the window; the callback need not be Sync.
         let notify = Arc::new(std::sync::Mutex::new(notify));
@@ -364,13 +383,33 @@ impl Broker {
         }
         let (gss_reply, gss_notify) = (reply_tx.clone(), notify.clone());
         thread::Builder::new()
-            .name("kerberos".into())
+            .name("kerberos and negotiate".into())
             .spawn(move || {
                 let mut contexts = Contexts::default();
-                while let Ok(step) = gss_rx.recv() {
-                    let login = step.login;
-                    let result = contexts.step(gss.as_ref(), step);
-                    if gss_reply.send(Reply::Gssapi { login, result }).is_err() {
+                let mut negotiations = negotiate::Contexts::default();
+                while let Ok(job) = gss_rx.recv() {
+                    let reply = match job {
+                        Job::Gssapi(step) => {
+                            let login = step.login;
+                            let result = contexts.step(gss.as_ref(), step);
+                            Reply::Gssapi { login, result }
+                        }
+                        Job::Sspi(step) => {
+                            let (login, conn) = (step.login, step.conn);
+                            let output = negotiations.run(winrm.as_ref(), step);
+                            Reply::Sspi {
+                                login,
+                                conn,
+                                output,
+                            }
+                        }
+                        Job::SspiEnd(login) => {
+                            negotiations.end(login);
+                            continue;
+                        }
+                        _ => continue,
+                    };
+                    if gss_reply.send(reply).is_err() {
                         break;
                     }
                     wake(&gss_notify);
@@ -382,8 +421,10 @@ impl Broker {
                 while let Ok(job) = job_rx.recv() {
                     let reply = match job {
                         Job::Identities(choice) => Some(identities(&rt, choice)),
-                        Job::Gssapi(step) => {
-                            let _ = gss_jobs.send(step);
+                        // Kerberos and Negotiate share a thread of their own,
+                        // so a slow KDC never holds up signing.
+                        job @ (Job::Gssapi(_) | Job::Sspi(_) | Job::SspiEnd(_)) => {
+                            let _ = gss_jobs.send(job);
                             None
                         }
                         sign_job @ Job::Sign { .. } => sign(&rt, authenticator.as_ref(), sign_job),

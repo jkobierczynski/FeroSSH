@@ -191,6 +191,7 @@ pub(crate) fn port(kind: SessionKind, port: Option<u32>) -> Option<u16> {
         SessionKind::Rdp => DEFAULT_DESKTOP_PORT,
         SessionKind::Vnc => DEFAULT_VNC_PORT,
         SessionKind::Telnet => DEFAULT_TELNET_PORT,
+        SessionKind::WinRm => crate::DEFAULT_WINRM_PORT,
         // Imports bring no serial sessions; a COM port has no port number.
         SessionKind::Serial | SessionKind::Xvfb | SessionKind::RemoteApp => return None,
     };

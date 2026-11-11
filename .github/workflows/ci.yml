@@ -81,6 +81,13 @@ jobs:
       - run: cargo clippy -p ferossh --all-targets --features vnc-viewer --locked -- -D warnings
       - run: cargo clippy -p ferossh --all-targets --features rdp-viewer --locked -- -D warnings
       - run: cargo clippy -p ferossh --all-targets --features desktop-viewer --locked -- -D warnings
+      # The WinRM test logs in to the runner's own WinRM service (NTLM
+      # with the runner's user) and runs cmd and PowerShell there.
+      - name: Turn on WinRM
+        shell: pwsh
+        run: |
+          Enable-PSRemoting -Force -SkipNetworkProfileCheck
+          "FEROSSH_WINRM_LIVE=1" >> $env:GITHUB_ENV
       - run: cargo test --workspace --locked
       - run: cargo test -p ferossh --features desktop-viewer --locked
       # Three exes: the standard one, with none of the viewer's code;

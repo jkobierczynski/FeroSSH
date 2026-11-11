@@ -211,7 +211,9 @@ fn connect_to(
                     proxies.push(proxy);
                 }
                 Effect::Show(s) => run.shown.push_str(&s),
-                Effect::Output(b) => run.output.push_str(&String::from_utf8_lossy(&b)),
+                Effect::Output(b) | Effect::Echo(b) => {
+                    run.output.push_str(&String::from_utf8_lossy(&b))
+                }
                 Effect::Broker(job) => {
                     jobs.push_back(None);
                     broker.submit(job);

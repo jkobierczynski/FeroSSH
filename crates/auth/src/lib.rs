@@ -6,7 +6,8 @@
 //! request for the session the user started ([`userauth::check`]).
 //! FIDO2 security keys in key files sign through an [`sk::Authenticator`]:
 //! Windows' WebAuthn ([`webauthn`]) in the window. Kerberos logins use
-//! the Windows logon's tickets through SSPI ([`gss`]). TPM keys through
+//! the Windows logon's tickets through SSPI ([`gss`]); WinRM sessions'
+//! Negotiate logins and message encryption run here too ([`negotiate`]). TPM keys through
 //! CNG are still to come.
 
 pub mod agent;
@@ -14,6 +15,7 @@ pub mod broker;
 pub mod gss;
 pub mod keyfile;
 pub mod keygen;
+pub mod negotiate;
 pub mod sk;
 pub mod userauth;
 #[cfg(windows)]

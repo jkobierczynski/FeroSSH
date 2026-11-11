@@ -46,7 +46,7 @@ use std::fmt;
 use zeroize::Zeroize;
 
 /// Protocol version carried in every frame. Bump on any wire change.
-pub const PROTOCOL_VERSION: u8 = 18;
+pub const PROTOCOL_VERSION: u8 = 19;
 
 /// Largest frame body accepted, in bytes. Terminal and SFTP data is chunked
 /// below this, so anything larger is a bug or an attack.
@@ -202,6 +202,40 @@ pub enum GssReply {
     /// No Kerberos login: no ticket, unknown host, or the user is not
     /// in a domain. The worker goes on with the other methods.
     Failed,
+}
+
+/// One SSPI operation a WinRM session's worker asks the UI for. The UI
+/// holds the user's credentials and the security contexts (Negotiate:
+/// Kerberos or NTLM); the worker only moves opaque tokens and sealed
+/// messages between them and the server. `conn` in
+/// [`Message::SspiRequest`] says which of the session's HTTP connections
+/// (each has a context of its own) it is for.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SspiOp {
+    /// Start a new security context for the host's `HTTP` service.
+    Start,
+    /// Continue with the server's token.
+    Step(Vec<u8>),
+    /// Encrypt a request body.
+    Seal(Vec<u8>),
+    /// Decrypt a response body: its signature and encrypted data.
+    Unseal { header: Vec<u8>, data: Vec<u8> },
+}
+
+/// The UI's answer to a [`Message::SspiRequest`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SspiResult {
+    /// Send `token` to the server and pass on its answer.
+    Continue(Vec<u8>),
+    /// The context is established; `token`, if not empty, is the last one
+    /// for the server.
+    Done(Vec<u8>),
+    /// A sealed request body: its signature and encrypted data.
+    Sealed { header: Vec<u8>, data: Vec<u8> },
+    /// An unsealed response body.
+    Unsealed(Vec<u8>),
+    /// No login, or a message that failed its check: the session ends.
+    Failed(String),
 }
 
 /// How long the worker waits for a server, from ssh_config's
@@ -507,6 +541,28 @@ pub enum Message {
         /// Seconds for the TCP connection.
         connect_timeout: u32,
     },
+    /// Open a WinRM (WS-Management) shell on `host`:`port` over HTTP and
+    /// run `command` in it (`powershell`, `cmd`). The worker speaks HTTP
+    /// and SOAP; every login step and every message's encryption it asks
+    /// the UI for with [`Message::SspiRequest`]. It answers with
+    /// [`Message::Connected`], the command's output as [`Message::Data`]
+    /// (stdout) and [`Message::ExecStderr`], its [`Message::ExitStatus`]
+    /// and finally [`Message::Disconnected`]. [`Message::Data`] from the
+    /// UI is the command's input; a lone `0x03` byte sends Ctrl+C.
+    WinrmConnect {
+        channel: ChannelId,
+        host: String,
+        port: u16,
+        /// Seconds for the TCP connection.
+        connect_timeout: u32,
+        command: String,
+    },
+    /// The answer to the last [`Message::SspiRequest`] for `conn`.
+    SspiReply {
+        channel: ChannelId,
+        conn: u8,
+        result: SspiResult,
+    },
     /// The user (or known_hosts) trusts, or rejects, the key in the last
     /// [`Message::HostKey`].
     HostKeyVerdict { channel: ChannelId, accept: bool },
@@ -577,6 +633,13 @@ pub enum Message {
         first: bool,
         token: Vec<u8>,
         mic_data: Vec<u8>,
+    },
+    /// A WinRM session's SSPI step, for its HTTP connection `conn`; the
+    /// worker waits for [`Message::SspiReply`].
+    SspiRequest {
+        channel: ChannelId,
+        conn: u8,
+        op: SspiOp,
     },
     /// Ask the user something; the worker waits for [`Message::Answers`].
     Prompt {
@@ -829,6 +892,9 @@ impl Message {
             Message::GssapiStep { .. } => 50,
             Message::GssapiReply { .. } => 51,
             Message::ProxyAuth { .. } => 52,
+            Message::WinrmConnect { .. } => 60,
+            Message::SspiRequest { .. } => 61,
+            Message::SspiReply { .. } => 62,
             Message::ZmodemStart { .. } => 40,
             Message::ZmodemFile { .. } => 41,
             Message::ZmodemData { .. } => 42,
@@ -855,6 +921,8 @@ impl Message {
             Message::Resize { .. }
             | Message::Connect { .. }
             | Message::TelnetConnect { .. }
+            | Message::WinrmConnect { .. }
+            | Message::SspiReply { .. }
             | Message::OpenChannel { .. }
             | Message::HostKeyVerdict { .. }
             | Message::Identities { .. }
@@ -898,7 +966,8 @@ impl Message {
             | Message::ZmodemEnd { .. }
             | Message::AgentList { .. }
             | Message::AgentSign { .. }
-            | Message::GssapiStep { .. } => Side::Worker,
+            | Message::GssapiStep { .. }
+            | Message::SspiRequest { .. } => Side::Worker,
         }
     }
 
@@ -911,6 +980,9 @@ impl Message {
             | Message::Close { channel }
             | Message::Connect { channel, .. }
             | Message::TelnetConnect { channel, .. }
+            | Message::WinrmConnect { channel, .. }
+            | Message::SspiRequest { channel, .. }
+            | Message::SspiReply { channel, .. }
             | Message::HostKeyVerdict { channel, .. }
             | Message::Identities { channel, .. }
             | Message::Signature { channel, .. }
@@ -1303,6 +1375,70 @@ pub fn encode(msg: &Message, out: &mut Vec<u8>) -> Result<(), Error> {
             w.u16(*cols);
             w.u16(*rows);
             w.u32(*connect_timeout);
+        }
+        Message::WinrmConnect {
+            channel,
+            host,
+            port,
+            connect_timeout,
+            command,
+        } => {
+            w.u32(*channel);
+            w.str(host);
+            w.u16(*port);
+            w.u32(*connect_timeout);
+            w.str(command);
+        }
+        Message::SspiRequest { channel, conn, op } => {
+            w.u32(*channel);
+            w.u8(*conn);
+            match op {
+                SspiOp::Start => w.u8(0),
+                SspiOp::Step(token) => {
+                    w.u8(1);
+                    w.bytes(token);
+                }
+                SspiOp::Seal(data) => {
+                    w.u8(2);
+                    w.bytes(data);
+                }
+                SspiOp::Unseal { header, data } => {
+                    w.u8(3);
+                    w.bytes(header);
+                    w.bytes(data);
+                }
+            }
+        }
+        Message::SspiReply {
+            channel,
+            conn,
+            result,
+        } => {
+            w.u32(*channel);
+            w.u8(*conn);
+            match result {
+                SspiResult::Continue(token) => {
+                    w.u8(0);
+                    w.bytes(token);
+                }
+                SspiResult::Done(token) => {
+                    w.u8(1);
+                    w.bytes(token);
+                }
+                SspiResult::Sealed { header, data } => {
+                    w.u8(2);
+                    w.bytes(header);
+                    w.bytes(data);
+                }
+                SspiResult::Unsealed(data) => {
+                    w.u8(3);
+                    w.bytes(data);
+                }
+                SspiResult::Failed(why) => {
+                    w.u8(4);
+                    w.str(why);
+                }
+            }
         }
         Message::HostKeyVerdict { channel, accept } => {
             w.u32(*channel);
@@ -1956,6 +2092,42 @@ fn decode_body(body: &[u8]) -> Result<Message, Error> {
             connect_timeout: r.u32()?,
         },
         32 => Message::Lost { channel: r.u32()? },
+        60 => Message::WinrmConnect {
+            channel: r.u32()?,
+            host: r.string()?,
+            port: r.u16()?,
+            connect_timeout: r.u32()?,
+            command: r.string()?,
+        },
+        61 => Message::SspiRequest {
+            channel: r.u32()?,
+            conn: r.u8()?,
+            op: match r.u8()? {
+                0 => SspiOp::Start,
+                1 => SspiOp::Step(r.bytes()?.to_vec()),
+                2 => SspiOp::Seal(r.bytes()?.to_vec()),
+                3 => SspiOp::Unseal {
+                    header: r.bytes()?.to_vec(),
+                    data: r.bytes()?.to_vec(),
+                },
+                _ => return Err(Error::Invalid),
+            },
+        },
+        62 => Message::SspiReply {
+            channel: r.u32()?,
+            conn: r.u8()?,
+            result: match r.u8()? {
+                0 => SspiResult::Continue(r.bytes()?.to_vec()),
+                1 => SspiResult::Done(r.bytes()?.to_vec()),
+                2 => SspiResult::Sealed {
+                    header: r.bytes()?.to_vec(),
+                    data: r.bytes()?.to_vec(),
+                },
+                3 => SspiResult::Unsealed(r.bytes()?.to_vec()),
+                4 => SspiResult::Failed(r.string()?),
+                _ => return Err(Error::Invalid),
+            },
+        },
         40 => Message::ZmodemStart {
             channel: r.u32()?,
             upload: r.bool()?,
@@ -2452,6 +2624,64 @@ mod tests {
                 channel: 1,
                 reply: GssReply::Continue(vec![0x60; 1200]),
             },
+            Message::WinrmConnect {
+                channel: 4,
+                host: "win-srv.lab.test".into(),
+                port: 5985,
+                connect_timeout: 20,
+                command: "powershell -NoLogo".into(),
+            },
+            Message::SspiRequest {
+                channel: 4,
+                conn: 0,
+                op: SspiOp::Start,
+            },
+            Message::SspiRequest {
+                channel: 4,
+                conn: 1,
+                op: SspiOp::Step(vec![0xa1; 200]),
+            },
+            Message::SspiRequest {
+                channel: 4,
+                conn: 1,
+                op: SspiOp::Seal(b"<s:Envelope/>".to_vec()),
+            },
+            Message::SspiRequest {
+                channel: 4,
+                conn: 0,
+                op: SspiOp::Unseal {
+                    header: vec![1; 16],
+                    data: vec![2; 40],
+                },
+            },
+            Message::SspiReply {
+                channel: 4,
+                conn: 0,
+                result: SspiResult::Continue(vec![3; 30]),
+            },
+            Message::SspiReply {
+                channel: 4,
+                conn: 1,
+                result: SspiResult::Done(Vec::new()),
+            },
+            Message::SspiReply {
+                channel: 4,
+                conn: 1,
+                result: SspiResult::Sealed {
+                    header: vec![1; 16],
+                    data: vec![2; 40],
+                },
+            },
+            Message::SspiReply {
+                channel: 4,
+                conn: 0,
+                result: SspiResult::Unsealed(b"<s:Envelope/>".to_vec()),
+            },
+            Message::SspiReply {
+                channel: 4,
+                conn: 0,
+                result: SspiResult::Failed("no credentials".into()),
+            },
             Message::GssapiReply {
                 channel: 1,
                 reply: GssReply::Complete {
@@ -2709,13 +2939,16 @@ mod tests {
                 Message::SignRequest { .. }
                 | Message::Prompt { .. }
                 | Message::HostKey { .. }
-                | Message::GssapiStep { .. } => {
+                | Message::GssapiStep { .. }
+                | Message::SspiRequest { .. } => {
                     assert_eq!(side, Side::Worker);
                 }
                 Message::Connect { .. }
                 | Message::Answers { .. }
                 | Message::Signature { .. }
-                | Message::GssapiReply { .. } => {
+                | Message::GssapiReply { .. }
+                | Message::WinrmConnect { .. }
+                | Message::SspiReply { .. } => {
                     assert_eq!(side, Side::Ui);
                 }
                 Message::Hello { .. } | Message::Data { .. } | Message::Close { .. } => {
@@ -2732,8 +2965,8 @@ mod tests {
         tags.sort_unstable();
         tags.dedup();
         // ZMODEM starts at 40, leaving room below; Kerberos at 50, the
-        // proxy's verdict at 52.
-        let want: Vec<u8> = (0..=38).chain(40..=52).collect();
+        // proxy's verdict at 52, WinRM at 60.
+        let want: Vec<u8> = (0..=38).chain(40..=52).chain(60..=62).collect();
         assert_eq!(tags, want);
     }
 

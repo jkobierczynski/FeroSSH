@@ -1,0 +1,1016 @@
+//! The UI side of one WinRM session: a Windows Remote Shell running
+//! PowerShell or cmd on a Windows server.
+//!
+//! The connection runs in a sandboxed worker of its own
+//! ([`ferossh_worker::winrm`]), which speaks HTTP and SOAP. The login and
+//! the encryption of every shell request and reply happen here, through the signing
+//! broker's SSPI thread ([`ferossh_auth::negotiate`]), so the password
+//! and the session keys never reach the worker: it asks for each step
+//! with [`Message::SspiRequest`].
+//!
+//! WinRS has no terminal. The remote command reads lines, so this side
+//! edits the line being typed (echo, Backspace, Up and Down for earlier
+//! lines) and sends it whole on Enter; Ctrl+C interrupts the command.
+//!
+//! A WinRM worker never has a reason to ask for host keys, keys,
+//! signatures or SSH passwords. One that does is treated as compromised
+//! and the connection is closed.
+
+use ferossh_auth::Job;
+use ferossh_auth::negotiate::{Credentials, SspiJob};
+use ferossh_config::saved::SavedHost;
+use ferossh_config::ssh_config;
+use ferossh_config::{DEFAULT_WINRM_COMMAND, DEFAULT_WINRM_PORT};
+use ferossh_ipc::{ChannelId, MAX_DATA_CHUNK, Message, SspiOp, Timing};
+use zeroize::Zeroizing;
+
+use crate::ssh::{Effect, Env, State, sanitize};
+
+const DIM: &str = "\x1b[0;90m";
+const RED: &str = "\x1b[0;31m";
+const YELLOW: &str = "\x1b[0;33m";
+const RESET: &str = "\x1b[0m";
+/// Earlier lines kept for Up and Down.
+const HISTORY: usize = 200;
+/// Logins the worker may start: one per HTTP connection, and a spare.
+const MAX_STARTS: u32 = 3;
+/// The longest line kept while typing.
+const MAX_LINE: usize = 64 * 1024;
+
+/// Where a WinRM session goes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WinrmTarget {
+    /// The saved connection's name, or the host as typed.
+    pub alias: String,
+    pub hostname: String,
+    pub port: u16,
+    /// `DOMAIN\user`, `user@domain` or a local user; none logs in as the
+    /// Windows user FeroSSH runs as.
+    pub user: Option<String>,
+    /// What the shell runs.
+    pub command: String,
+    /// ssh_config's `Tag`, which picks a colour theme.
+    pub tag: Option<String>,
+    pub connect_timeout: u32,
+}
+
+fn valid_user(user: &str) -> bool {
+    !user.is_empty() && user.len() <= 256 && !user.chars().any(char::is_control)
+}
+
+impl WinrmTarget {
+    /// What was typed at the connect prompt, if it asks for WinRM:
+    /// `winrm://[user@]host[:port]`, or `winrm [user@]host [port]`.
+    pub fn typed(text: &str) -> Option<Self> {
+        let text = text.trim();
+        let rest = match strip_prefix_ci(text, "winrm://") {
+            Some(r) => r.trim_end_matches('/').to_owned(),
+            None => {
+                let mut words = strip_prefix_ci(text, "winrm ")?.split_whitespace();
+                let host = words.next()?;
+                match (words.next(), words.next()) {
+                    (None, _) => host.to_owned(),
+                    (Some(port), None) if !host.contains(':') => format!("{host}:{port}"),
+                    _ => return None,
+                }
+            }
+        };
+        let (user, hostname, port) = ssh_config::parse_destination(&rest)?;
+        if user.as_deref().is_some_and(|u| !valid_user(u)) {
+            return None;
+        }
+        Some(Self {
+            alias: hostname.clone(),
+            hostname,
+            port: port.unwrap_or(DEFAULT_WINRM_PORT),
+            user,
+            command: DEFAULT_WINRM_COMMAND.to_owned(),
+            tag: None,
+            connect_timeout: Timing::default().connect_timeout,
+        })
+    }
+
+    /// A saved WinRM connection `name`: its `HostName`, `Port` (5985
+    /// when unset), `User`, `Tag` and `ConnectTimeout`, and the command
+    /// its profile names.
+    ///
+    /// The host, user and port come from the saved connection itself when
+    /// there is one (`saved`), so an SSH `Host *` block's `User` or `Port`
+    /// cannot override them, and a blank user still means the Windows
+    /// logon.
+    pub fn resolve(
+        name: &str,
+        env: &Env,
+        command: Option<&str>,
+        saved: Option<&SavedHost>,
+    ) -> Option<Self> {
+        let includes = ssh_config::DirIncludes {
+            home: env.home.clone(),
+        };
+        let cfg = ssh_config::resolve_in(&env.config, name, &includes);
+        let (hostname, port, user) = match saved {
+            Some(h) => (h.hostname.clone(), h.port, h.user.clone()),
+            None => (cfg.hostname, cfg.port, cfg.user),
+        };
+        let hostname = hostname.unwrap_or_else(|| name.to_owned());
+        if !ferossh_config::saved::valid_hostname(&hostname) {
+            return None;
+        }
+        Some(Self {
+            alias: name.to_owned(),
+            hostname,
+            port: port.unwrap_or(DEFAULT_WINRM_PORT),
+            user: user.filter(|u| valid_user(u)),
+            command: command
+                .map(str::trim)
+                .filter(|c| !c.is_empty())
+                .unwrap_or(DEFAULT_WINRM_COMMAND)
+                .to_owned(),
+            tag: cfg.tag,
+            connect_timeout: cfg
+                .connect_timeout
+                .unwrap_or(Timing::default().connect_timeout),
+        })
+    }
+
+    /// `host`, or `host:port` off the WinRM port, for titles and logs.
+    pub fn label(&self) -> String {
+        if self.port == DEFAULT_WINRM_PORT {
+            self.alias.clone()
+        } else {
+            format!("{}:{}", self.alias, self.port)
+        }
+    }
+}
+
+fn strip_prefix_ci<'a>(text: &'a str, prefix: &str) -> Option<&'a str> {
+    let head = text.get(..prefix.len())?;
+    head.eq_ignore_ascii_case(prefix)
+        .then(|| text.get(prefix.len()..))
+        .flatten()
+}
+
+fn dim(text: &str) -> String {
+    format!("{DIM}{text}{RESET}\r\n")
+}
+
+/// Where typed bytes go.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Keys {
+    /// Into the line.
+    Text,
+    /// After ESC: a CSI or SS3 sequence follows.
+    Esc,
+    /// Inside `ESC [` or `ESC O`, up to the final byte.
+    Seq,
+}
+
+/// One WinRM session, from the UI's side.
+pub struct WinrmSession {
+    pub channel: ChannelId,
+    pub target: WinrmTarget,
+    state: State,
+    /// Typing the password, before connecting.
+    asking: bool,
+    typed_password: Zeroizing<String>,
+    /// The password for the logins; dropped once logged in.
+    password: Option<Zeroizing<String>>,
+    starts: u32,
+    /// `Kerberos` or `NTLM`, once a login has been made.
+    package: Option<String>,
+    line: String,
+    keys: Keys,
+    seq: Vec<u8>,
+    /// The last byte typed was CR: a LF after it is the same Enter.
+    after_cr: bool,
+    history: Vec<String>,
+    /// Where Up and Down are in `history`; `history.len()` is the line
+    /// being typed.
+    recall: usize,
+    /// The line being typed when Up was first pressed.
+    draft: String,
+    /// Closed from this side while the shell is open: what still seals
+    /// the worker's goodbye (terminate, delete) until the window takes it.
+    closer: Option<WinrmCloser>,
+}
+
+/// A closed session's last errand: the worker tells the server to end the
+/// command and delete the shell, and those requests (and the replies)
+/// still need the login's keys. It relays only sealing and unsealing,
+/// and forgets the keys once the worker says it is done.
+#[derive(Debug)]
+pub struct WinrmCloser {
+    pub channel: ChannelId,
+    host: String,
+}
+
+impl WinrmCloser {
+    /// The worker's connection: the session's own.
+    pub fn connection(&self) -> ChannelId {
+        self.channel
+    }
+
+    /// What the worker sent; true once the closer is done.
+    pub fn on_worker(&mut self, msg: Message) -> (Vec<Effect>, bool) {
+        match msg {
+            Message::SspiRequest {
+                conn,
+                op: op @ (SspiOp::Seal(_) | SspiOp::Unseal { .. }),
+                ..
+            } if conn <= 1 => (
+                vec![Effect::Broker(Job::Sspi(SspiJob {
+                    login: self.channel,
+                    conn,
+                    host: self.host.clone(),
+                    credentials: None,
+                    op,
+                }))],
+                false,
+            ),
+            Message::Disconnected { .. } => (self.end(), true),
+            // Late output and the like: the pane is gone.
+            Message::SspiRequest { .. } => (self.end(), true),
+            _ => (Vec::new(), false),
+        }
+    }
+
+    /// The broker's answer to a seal or unseal.
+    pub fn on_broker(&self, reply: ferossh_auth::Reply) -> Vec<Effect> {
+        match reply {
+            ferossh_auth::Reply::Sspi {
+                login,
+                conn,
+                output,
+            } if login == self.channel => vec![Effect::Send(Message::SspiReply {
+                channel: self.channel,
+                conn,
+                result: output.result,
+            })],
+            _ => Vec::new(),
+        }
+    }
+
+    /// Forgets the login's keys.
+    pub fn end(&self) -> Vec<Effect> {
+        vec![Effect::Broker(Job::SspiEnd(self.channel))]
+    }
+}
+
+impl std::fmt::Debug for WinrmSession {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WinrmSession")
+            .field("channel", &self.channel)
+            .field("target", &self.target)
+            .field("state", &self.state)
+            .finish_non_exhaustive()
+    }
+}
+
+impl WinrmSession {
+    pub fn new(channel: ChannelId, target: WinrmTarget) -> Self {
+        Self {
+            channel,
+            target,
+            state: State::Connecting,
+            asking: false,
+            typed_password: Zeroizing::new(String::new()),
+            password: None,
+            starts: 0,
+            package: None,
+            line: String::new(),
+            keys: Keys::Text,
+            seq: Vec::new(),
+            after_cr: false,
+            history: Vec::new(),
+            recall: 0,
+            draft: String::new(),
+            closer: None,
+        }
+    }
+
+    /// The closer [`close`](Self::close) left, for the window to keep
+    /// until the worker is done.
+    pub fn take_closer(&mut self) -> Option<WinrmCloser> {
+        self.closer.take()
+    }
+
+    pub fn state(&self) -> State {
+        self.state
+    }
+
+    /// The worker's connection: a WinRM session has its own.
+    pub fn connection(&self) -> ChannelId {
+        self.channel
+    }
+
+    /// Starts: asks for the password first when the session names a
+    /// user.
+    pub fn start(&mut self) -> Vec<Effect> {
+        match &self.target.user {
+            Some(user) => {
+                self.asking = true;
+                vec![Effect::Show(format!(
+                    "{}'s password on {}: ",
+                    sanitize(user),
+                    sanitize(&self.target.label())
+                ))]
+            }
+            None => self.connect(),
+        }
+    }
+
+    fn connect(&mut self) -> Vec<Effect> {
+        let t = &self.target;
+        let mut text = format!("Connecting to {}", sanitize(&t.label()));
+        if t.hostname != t.alias {
+            text.push_str(&format!(" ({}:{})", sanitize(&t.hostname), t.port));
+        }
+        text.push_str(" over WinRM...");
+        vec![
+            Effect::Show(dim(&text)),
+            Effect::Send(Message::WinrmConnect {
+                channel: self.channel,
+                host: t.hostname.clone(),
+                port: t.port,
+                connect_timeout: t.connect_timeout,
+                command: t.command.clone(),
+            }),
+        ]
+    }
+
+    /// Typed or pasted bytes.
+    pub fn input(&mut self, bytes: &[u8]) -> Vec<Effect> {
+        if self.asking {
+            return self.password_input(bytes);
+        }
+        if self.state != State::Connected {
+            return Vec::new();
+        }
+        let mut effects = Vec::new();
+        let mut echo = String::new();
+        let text = String::from_utf8_lossy(bytes).into_owned();
+        for c in text.chars() {
+            let after_cr = std::mem::replace(&mut self.after_cr, false);
+            match self.keys {
+                Keys::Esc => {
+                    self.keys = if c == '[' || c == 'O' {
+                        Keys::Seq
+                    } else {
+                        Keys::Text
+                    };
+                    self.seq.clear();
+                    continue;
+                }
+                Keys::Seq => {
+                    if ('\u{40}'..='\u{7e}').contains(&c) {
+                        self.keys = Keys::Text;
+                        match c {
+                            'A' => self.recall_line(-1, &mut echo),
+                            'B' => self.recall_line(1, &mut echo),
+                            _ => {}
+                        }
+                    } else if self.seq.len() < 16 {
+                        self.seq.push(c as u8);
+                    }
+                    continue;
+                }
+                Keys::Text => {}
+            }
+            match c {
+                '\x1b' => self.keys = Keys::Esc,
+                '\r' | '\n' => {
+                    if c == '\n' && after_cr {
+                        continue;
+                    }
+                    self.after_cr = c == '\r';
+                    echo.push_str("\r\n");
+                    let line = std::mem::take(&mut self.line);
+                    if !line.trim().is_empty() && self.history.last() != Some(&line) {
+                        if self.history.len() >= HISTORY {
+                            self.history.remove(0);
+                        }
+                        self.history.push(line.clone());
+                    }
+                    self.recall = self.history.len();
+                    self.draft.clear();
+                    self.flush_echo(&mut echo, &mut effects);
+                    let mut bytes = line.into_bytes();
+                    bytes.extend_from_slice(b"\r\n");
+                    for chunk in bytes.chunks(MAX_DATA_CHUNK) {
+                        effects.push(Effect::Send(Message::Data {
+                            channel: self.channel,
+                            bytes: chunk.to_vec(),
+                        }));
+                    }
+                }
+                '\x7f' | '\x08' => {
+                    if self.line.pop().is_some() {
+                        echo.push_str("\x08 \x08");
+                    }
+                }
+                '\x03' => {
+                    // Interrupt the command; what was typed is dropped.
+                    self.line.clear();
+                    echo.push_str("^C\r\n");
+                    self.flush_echo(&mut echo, &mut effects);
+                    effects.push(Effect::Send(Message::Data {
+                        channel: self.channel,
+                        bytes: vec![0x03],
+                    }));
+                }
+                '\x15' => self.erase_line(&mut echo),
+                '\t' => {
+                    if self.line.len() < MAX_LINE {
+                        self.line.push(' ');
+                        echo.push(' ');
+                    }
+                }
+                c if c.is_control() => {}
+                c => {
+                    if self.line.len() < MAX_LINE {
+                        self.line.push(c);
+                        echo.push(c);
+                    }
+                }
+            }
+        }
+        self.flush_echo(&mut echo, &mut effects);
+        effects
+    }
+
+    /// Echo goes into the terminal and the log, as a terminal's own
+    /// echo would.
+    fn flush_echo(&self, echo: &mut String, effects: &mut Vec<Effect>) {
+        if !echo.is_empty() {
+            effects.push(Effect::Echo(std::mem::take(echo).into_bytes()));
+        }
+    }
+
+    fn erase_line(&mut self, echo: &mut String) {
+        for _ in self.line.chars() {
+            echo.push_str("\x08 \x08");
+        }
+        self.line.clear();
+    }
+
+    /// Up (`-1`) or Down (`1`) through earlier lines.
+    fn recall_line(&mut self, step: isize, echo: &mut String) {
+        let len = self.history.len();
+        let next = match step {
+            -1 if self.recall > 0 => self.recall - 1,
+            1 if self.recall < len => self.recall + 1,
+            _ => return,
+        };
+        if self.recall == len {
+            self.draft = self.line.clone();
+        }
+        self.erase_line(echo);
+        self.recall = next;
+        self.line = self
+            .history
+            .get(next)
+            .cloned()
+            .unwrap_or_else(|| self.draft.clone());
+        echo.push_str(&sanitize(&self.line));
+    }
+
+    fn password_input(&mut self, bytes: &[u8]) -> Vec<Effect> {
+        let text = String::from_utf8_lossy(bytes).into_owned();
+        for c in text.chars() {
+            match c {
+                '\r' | '\n' => {
+                    self.asking = false;
+                    self.password = Some(std::mem::take(&mut self.typed_password));
+                    let mut effects = vec![Effect::Show("\r\n".into())];
+                    effects.extend(self.connect());
+                    return effects;
+                }
+                '\x7f' | '\x08' => {
+                    self.typed_password.pop();
+                }
+                '\x03' => {
+                    self.asking = false;
+                    self.typed_password = Zeroizing::new(String::new());
+                    self.state = State::Ended;
+                    return vec![
+                        Effect::Show(format!(
+                            "\r\n{DIM}[Cancelled. Press Enter to connect again.]{RESET}\r\n"
+                        )),
+                        Effect::Ended,
+                    ];
+                }
+                c if c.is_control() => {}
+                c => self.typed_password.push(c),
+            }
+        }
+        Vec::new()
+    }
+
+    /// Ends the connection from this side.
+    pub fn close(&mut self) -> Vec<Effect> {
+        if self.state == State::Ended {
+            return Vec::new();
+        }
+        let was = self.state;
+        self.state = State::Ended;
+        self.asking = false;
+        self.password = None;
+        let mut effects = vec![Effect::Send(Message::Close {
+            channel: self.channel,
+        })];
+        if was == State::Connected {
+            // The worker still ends the command and deletes the shell on
+            // the server, sealed with this login's keys.
+            self.closer = Some(WinrmCloser {
+                channel: self.channel,
+                host: self.target.hostname.clone(),
+            });
+        } else {
+            effects.push(Effect::Broker(Job::SspiEnd(self.channel)));
+        }
+        effects
+    }
+
+    fn cut_off(&mut self) -> Vec<Effect> {
+        let mut effects = vec![Effect::Show(format!(
+            "\r\n{RED}The WinRM worker sent something a WinRM session never does, so \
+             FeroSSH closed the connection.{RESET}\r\n"
+        ))];
+        effects.extend(self.close());
+        // A worker that misbehaves gets no more sealing.
+        if let Some(c) = self.closer.take() {
+            effects.extend(c.end());
+        }
+        effects.push(Effect::Ended);
+        effects
+    }
+
+    pub fn on_worker(&mut self, msg: Message) -> Vec<Effect> {
+        match msg {
+            Message::SspiRequest { conn, op, .. }
+                if self.state == State::Connecting && !self.asking && conn <= 1 =>
+            {
+                if matches!(op, SspiOp::Start) {
+                    self.starts += 1;
+                    if self.starts > MAX_STARTS {
+                        return self.cut_off();
+                    }
+                }
+                let credentials = match (&self.target.user, &self.password) {
+                    (Some(user), Some(password)) => Some(Credentials {
+                        user: user.clone(),
+                        password: password.clone(),
+                    }),
+                    _ => None,
+                };
+                vec![Effect::Broker(Job::Sspi(SspiJob {
+                    login: self.channel,
+                    conn,
+                    host: self.target.hostname.clone(),
+                    credentials: credentials.filter(|_| matches!(op, SspiOp::Start)),
+                    op,
+                }))]
+            }
+            // Once logged in, only sealing and unsealing.
+            Message::SspiRequest {
+                conn,
+                op: op @ (SspiOp::Seal(_) | SspiOp::Unseal { .. }),
+                ..
+            } if self.state == State::Connected && conn <= 1 => {
+                vec![Effect::Broker(Job::Sspi(SspiJob {
+                    login: self.channel,
+                    conn,
+                    host: self.target.hostname.clone(),
+                    credentials: None,
+                    op,
+                }))]
+            }
+            Message::Connected { .. } if self.state == State::Connecting && !self.asking => {
+                self.state = State::Connected;
+                self.password = None;
+                let how = match self.package.as_deref() {
+                    Some(p) if p.eq_ignore_ascii_case("Kerberos") => " with Kerberos",
+                    Some(p) if p.eq_ignore_ascii_case("NTLM") => " with NTLM",
+                    _ => "",
+                };
+                let mut effects = vec![Effect::Show(dim(&format!(
+                    "Connected{how}; shell traffic is encrypted. This is a WinRS shell \
+                     without a terminal: lines are sent on Enter, Ctrl+C interrupts, \
+                     full-screen programs do not work."
+                )))];
+                if how == " with NTLM" {
+                    effects.push(Effect::Show(format!(
+                        "{YELLOW}NTLM does not prove the server's identity. Use the \
+                         server's domain name to log in with Kerberos.{RESET}\r\n"
+                    )));
+                }
+                effects.push(Effect::Connected);
+                effects
+            }
+            Message::Data { bytes, .. } if self.state == State::Connected => {
+                vec![Effect::Output(bytes)]
+            }
+            Message::ExecStderr { bytes, .. } if self.state == State::Connected => {
+                let mut out = RED.as_bytes().to_vec();
+                out.extend_from_slice(&bytes);
+                out.extend_from_slice(RESET.as_bytes());
+                vec![Effect::Output(out)]
+            }
+            Message::ExitStatus { .. } if self.state == State::Connected => Vec::new(),
+            Message::Notice { text, .. } => vec![Effect::Show(dim(&sanitize(&text)))],
+            Message::Disconnected { reason, .. } => {
+                if self.state == State::Ended {
+                    return vec![Effect::Ended];
+                }
+                self.state = State::Ended;
+                self.password = None;
+                vec![
+                    Effect::Broker(Job::SspiEnd(self.channel)),
+                    Effect::Show(format!(
+                        "\r\n{DIM}[{} Press Enter to reconnect.]{RESET}\r\n",
+                        sanitize(&reason)
+                    )),
+                    Effect::Ended,
+                ]
+            }
+            // Once closed from this side, late messages are dropped.
+            _ if self.state == State::Ended => Vec::new(),
+            _ => self.cut_off(),
+        }
+    }
+
+    /// The broker's answer to an SSPI step.
+    pub fn on_broker(&mut self, reply: ferossh_auth::Reply) -> Vec<Effect> {
+        let ferossh_auth::Reply::Sspi {
+            login,
+            conn,
+            output,
+        } = reply
+        else {
+            return Vec::new();
+        };
+        if login != self.channel || self.state == State::Ended {
+            return Vec::new();
+        }
+        if let Some(p) = output.package {
+            self.package = Some(p);
+        }
+        vec![Effect::Send(Message::SspiReply {
+            channel: self.channel,
+            conn,
+            result: output.result,
+        })]
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::indexing_slicing, clippy::panic)]
+mod tests {
+    use super::*;
+    use ferossh_auth::negotiate::SspiOutput;
+    use ferossh_ipc::SspiResult;
+
+    fn shown(effects: &[Effect]) -> String {
+        effects
+            .iter()
+            .filter_map(|e| match e {
+                Effect::Show(t) => Some(t.clone()),
+                Effect::Output(b) | Effect::Echo(b) => {
+                    Some(String::from_utf8_lossy(b).into_owned())
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn sent(effects: &[Effect]) -> Vec<Vec<u8>> {
+        effects
+            .iter()
+            .filter_map(|e| match e {
+                Effect::Send(Message::Data { bytes, .. }) => Some(bytes.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn connected(user: bool) -> WinrmSession {
+        let text = if user {
+            "winrm://LAB\\admin@srv"
+        } else {
+            "winrm srv"
+        };
+        let mut s = WinrmSession::new(5, WinrmTarget::typed(text).unwrap());
+        s.start();
+        if user {
+            s.input(b"pw\r");
+        }
+        s.on_worker(Message::Connected {
+            channel: 5,
+            kex: "WinRM".into(),
+            cipher: "SSPI".into(),
+            host_key: "none".into(),
+        });
+        s
+    }
+
+    #[test]
+    fn reads_what_was_typed() {
+        let t = WinrmTarget::typed("winrm://admin@10.0.0.5:5986/").unwrap();
+        assert_eq!(
+            (t.hostname.as_str(), t.port, t.user.as_deref()),
+            ("10.0.0.5", 5986, Some("admin"))
+        );
+        assert_eq!(t.label(), "10.0.0.5:5986");
+        let t = WinrmTarget::typed("WINRM win-srv").unwrap();
+        assert_eq!(
+            (t.port, t.user.as_deref(), t.label()),
+            (5985, None, "win-srv".into())
+        );
+        assert_eq!(t.command, DEFAULT_WINRM_COMMAND);
+        let t = WinrmTarget::typed("winrm jurgen@lab.test@srv 5985").unwrap();
+        assert_eq!(t.user.as_deref(), Some("jurgen@lab.test"));
+        assert_eq!(WinrmTarget::typed("srv"), None);
+        assert_eq!(WinrmTarget::typed("winrm -oProxyCommand=calc"), None);
+        assert_eq!(WinrmTarget::typed("winrm a 1 2"), None);
+    }
+
+    #[test]
+    fn resolves_saved_connections() {
+        let env = Env {
+            home: std::env::temp_dir(),
+            local_user: "me".into(),
+            vars: Vec::new(),
+            config: "Host dc\n    HostName dc1.lab.test\n    User LAB\\admin\n    Tag production\n"
+                .into(),
+        };
+        let t = WinrmTarget::resolve("dc", &env, Some("cmd"), None).unwrap();
+        assert_eq!((t.hostname.as_str(), t.port), ("dc1.lab.test", 5985));
+        assert_eq!(t.user.as_deref(), Some("LAB\\admin"));
+        assert_eq!(t.command, "cmd");
+        assert_eq!(t.tag.as_deref(), Some("production"));
+        let t = WinrmTarget::resolve("dc", &env, Some("  "), None).unwrap();
+        assert_eq!(t.command, DEFAULT_WINRM_COMMAND);
+        // A saved connection keeps its own user and port over an SSH
+        // `Host *` block, and a blank user stays blank.
+        let env = Env {
+            config: "Host *\n    User sshuser\n    Port 2222\n".into(),
+            ..env
+        };
+        let saved = SavedHost {
+            alias: "dc".into(),
+            hostname: Some("dc1.lab.test".into()),
+            ..SavedHost::default()
+        };
+        let t = WinrmTarget::resolve("dc", &env, None, Some(&saved)).unwrap();
+        assert_eq!((t.hostname.as_str(), t.port), ("dc1.lab.test", 5985));
+        assert_eq!(t.user, None);
+        let saved = SavedHost {
+            user: Some("LAB\\admin".into()),
+            port: Some(5986),
+            ..saved
+        };
+        let t = WinrmTarget::resolve("dc", &env, None, Some(&saved)).unwrap();
+        assert_eq!((t.port, t.user.as_deref()), (5986, Some("LAB\\admin")));
+    }
+
+    #[test]
+    fn asks_for_the_password_and_relays_logins() {
+        let mut s = WinrmSession::new(5, WinrmTarget::typed("winrm://LAB\\admin@srv").unwrap());
+        let fx = s.start();
+        assert!(shown(&fx).contains("LAB\\admin's password on srv"));
+        // The password is not echoed and not sent to the worker.
+        let fx = s.input(b"se");
+        assert!(fx.is_empty());
+        let fx = s.input(b"cret\x7ft\r");
+        assert!(matches!(
+            fx.last(),
+            Some(Effect::Send(Message::WinrmConnect { port: 5985, .. }))
+        ));
+        assert!(!shown(&fx).contains("secret"));
+        let fx = s.on_worker(Message::SspiRequest {
+            channel: 5,
+            conn: 0,
+            op: SspiOp::Start,
+        });
+        let [Effect::Broker(Job::Sspi(job))] = &fx[..] else {
+            panic!("{fx:?}")
+        };
+        assert_eq!(job.host, "srv");
+        let c = job.credentials.as_ref().unwrap();
+        assert_eq!(
+            (c.user.as_str(), c.password.as_str()),
+            ("LAB\\admin", "secret")
+        );
+        // Later steps carry no credentials.
+        let fx = s.on_worker(Message::SspiRequest {
+            channel: 5,
+            conn: 0,
+            op: SspiOp::Step(vec![1]),
+        });
+        let [Effect::Broker(Job::Sspi(job))] = &fx[..] else {
+            panic!()
+        };
+        assert!(job.credentials.is_none());
+        let fx = s.on_broker(ferossh_auth::Reply::Sspi {
+            login: 5,
+            conn: 0,
+            output: SspiOutput {
+                result: SspiResult::Done(Vec::new()),
+                package: Some("NTLM".into()),
+            },
+        });
+        assert!(matches!(
+            &fx[..],
+            [Effect::Send(Message::SspiReply {
+                channel: 5,
+                conn: 0,
+                ..
+            })]
+        ));
+        let fx = s.on_worker(Message::Connected {
+            channel: 5,
+            kex: String::new(),
+            cipher: String::new(),
+            host_key: String::new(),
+        });
+        assert!(shown(&fx).contains("with NTLM"));
+        assert!(shown(&fx).contains("does not prove the server's identity"));
+        assert!(matches!(fx.last(), Some(Effect::Connected)));
+        assert!(s.password.is_none());
+    }
+
+    #[test]
+    fn edits_lines_locally() {
+        let mut s = connected(false);
+        let fx = s.input(b"dirx\x7f\r");
+        assert_eq!(sent(&fx), vec![b"dir\r\n".to_vec()]);
+        assert!(shown(&fx).starts_with("dirx\x08 \x08\r\n"));
+        // CR LF is one Enter; a paste of two lines sends two.
+        let fx = s.input(b"a\r\nb\n");
+        assert_eq!(sent(&fx), vec![b"a\r\n".to_vec(), b"b\r\n".to_vec()]);
+        // Up recalls, Down goes back to the draft.
+        let fx = s.input(b"dr\x1b[A");
+        assert!(shown(&fx).ends_with('b'));
+        s.input(b"\x1b[A\x1b[A");
+        assert_eq!(s.line, "dir");
+        s.input(b"\x1b[B\x1b[B\x1b[B");
+        assert_eq!(s.line, "dr");
+        // Other keys' sequences are ignored, Ctrl+U clears.
+        s.input(b"\x1b[3~\x1bOP\x15");
+        assert_eq!(s.line, "");
+        let fx = s.input(b"long\x03");
+        assert_eq!(sent(&fx), vec![vec![3]]);
+        assert_eq!(s.line, "");
+    }
+
+    #[test]
+    fn shows_output_and_ends() {
+        let mut s = connected(true);
+        let fx = s.on_worker(Message::Data {
+            channel: 5,
+            bytes: b"PS C:\\> ".to_vec(),
+        });
+        assert!(matches!(&fx[..], [Effect::Output(b)] if b == b"PS C:\\> "));
+        let fx = s.on_worker(Message::ExecStderr {
+            channel: 5,
+            bytes: b"oops".to_vec(),
+        });
+        assert!(shown(&fx).contains("\x1b[0;31moops"));
+        let fx = s.on_worker(Message::Disconnected {
+            channel: 5,
+            reason: "The command ended (exit code 0).".into(),
+        });
+        assert!(shown(&fx).contains("Press Enter to reconnect"));
+        assert!(
+            fx.iter()
+                .any(|e| matches!(e, Effect::Broker(Job::SspiEnd(5))))
+        );
+        assert_eq!(s.state(), State::Ended);
+    }
+
+    #[test]
+    fn closing_keeps_sealing_until_the_worker_is_done() {
+        // Before the shell is open: the keys go at once.
+        let mut s = WinrmSession::new(5, WinrmTarget::typed("winrm srv").unwrap());
+        s.start();
+        let fx = s.close();
+        assert!(
+            fx.iter()
+                .any(|e| matches!(e, Effect::Broker(Job::SspiEnd(5))))
+        );
+        assert!(s.take_closer().is_none());
+        // With the shell open, a closer seals the goodbye.
+        let mut s = connected(false);
+        let fx = s.close();
+        assert!(matches!(
+            &fx[..],
+            [Effect::Send(Message::Close { channel: 5 })]
+        ));
+        let mut c = s.take_closer().unwrap();
+        let (fx, done) = c.on_worker(Message::SspiRequest {
+            channel: 5,
+            conn: 1,
+            op: SspiOp::Seal(b"terminate".to_vec()),
+        });
+        assert!(!done);
+        assert!(matches!(
+            &fx[..],
+            [Effect::Broker(Job::Sspi(SspiJob {
+                login: 5,
+                conn: 1,
+                credentials: None,
+                ..
+            }))]
+        ));
+        let fx = c.on_broker(ferossh_auth::Reply::Sspi {
+            login: 5,
+            conn: 1,
+            output: ferossh_auth::negotiate::SspiOutput {
+                result: SspiResult::Sealed {
+                    header: vec![1],
+                    data: vec![2],
+                },
+                package: None,
+            },
+        });
+        assert!(matches!(
+            &fx[..],
+            [Effect::Send(Message::SspiReply {
+                channel: 5,
+                conn: 1,
+                ..
+            })]
+        ));
+        // Output after the close is ignored; a new login ends it.
+        let (fx, done) = c.on_worker(Message::Data {
+            channel: 5,
+            bytes: vec![1],
+        });
+        assert!(fx.is_empty() && !done);
+        let (fx, done) = c.on_worker(Message::Disconnected {
+            channel: 5,
+            reason: String::new(),
+        });
+        assert!(done);
+        assert!(matches!(&fx[..], [Effect::Broker(Job::SspiEnd(5))]));
+        // A worker cut off gets no closer.
+        let mut s = connected(false);
+        let fx = s.on_worker(Message::IdentitiesRequest { channel: 5 });
+        assert!(
+            fx.iter()
+                .any(|e| matches!(e, Effect::Broker(Job::SspiEnd(5))))
+        );
+        assert!(s.take_closer().is_none());
+    }
+
+    #[test]
+    fn a_worker_that_asks_for_other_things_is_cut_off() {
+        for msg in [
+            Message::HostKey {
+                channel: 5,
+                key: vec![1],
+            },
+            Message::IdentitiesRequest { channel: 5 },
+            Message::SspiRequest {
+                channel: 5,
+                conn: 2,
+                op: SspiOp::Start,
+            },
+            // A new login once connected.
+            Message::SspiRequest {
+                channel: 5,
+                conn: 0,
+                op: SspiOp::Start,
+            },
+        ] {
+            let mut s = connected(false);
+            let fx = s.on_worker(msg);
+            assert!(shown(&fx).contains("closed the connection"), "{fx:?}");
+            assert_eq!(s.state(), State::Ended);
+        }
+        // Data before the connection is reported, and too many logins.
+        let mut s = WinrmSession::new(5, WinrmTarget::typed("winrm srv").unwrap());
+        s.start();
+        let fx = s.on_worker(Message::Data {
+            channel: 5,
+            bytes: vec![1],
+        });
+        assert!(shown(&fx).contains("closed the connection"));
+        let mut s = WinrmSession::new(5, WinrmTarget::typed("winrm srv").unwrap());
+        s.start();
+        for _ in 0..MAX_STARTS {
+            s.on_worker(Message::SspiRequest {
+                channel: 5,
+                conn: 0,
+                op: SspiOp::Start,
+            });
+        }
+        assert_eq!(s.state(), State::Connecting);
+        s.on_worker(Message::SspiRequest {
+            channel: 5,
+            conn: 1,
+            op: SspiOp::Start,
+        });
+        assert_eq!(s.state(), State::Ended);
+    }
+}

@@ -59,6 +59,9 @@
 //!     RemoteApp gimp
 //!     RemoteAppRemoveAgent yes
 //!     RemoteAppClipboard to-host
+//! Profile win-srv
+//!     Type winrm
+//!     WinrmCommand cmd
 //! Profile laptop-roaming
 //!     Type mosh
 //!     MoshServer ~/bin/mosh-server
@@ -190,6 +193,9 @@ pub struct Profile {
     /// may listen on (a firewall's opening); any free one in 60001 to
     /// 60999 when unset.
     pub mosh_ports: Option<(u16, u16)>,
+    /// For a WinRM session: the command its shell runs;
+    /// [`DEFAULT_WINRM_COMMAND`] when unset.
+    pub winrm_command: Option<String>,
 }
 
 /// The ways copied text can travel, as the clipboard settings spell
@@ -251,6 +257,9 @@ pub enum SessionKind {
     /// A terminal over Mosh: SSH logs in and starts `mosh-server`, then
     /// the session goes over UDP, survives network changes and sleep.
     Mosh,
+    /// A Windows Remote Shell (WinRM, WS-Management over HTTP): PowerShell
+    /// or cmd on a Windows server, line by line, without a terminal.
+    WinRm,
     /// File transfer only: SSH logs in without asking for a shell and
     /// File transfer opens on the host, for SFTP-only accounts
     /// (`ForceCommand internal-sftp`).
@@ -339,6 +348,7 @@ impl SessionKind {
             SessionKind::Xvfb => "xvfb",
             SessionKind::RemoteApp => "remoteapp",
             SessionKind::Mosh => "mosh",
+            SessionKind::WinRm => "winrm",
             SessionKind::Sftp => "sftp",
         }
     }
@@ -353,6 +363,7 @@ impl SessionKind {
             "xvfb" | "virtual" => Some(SessionKind::Xvfb),
             "remoteapp" | "app" | "ferostream" => Some(SessionKind::RemoteApp),
             "mosh" => Some(SessionKind::Mosh),
+            "winrm" | "wsman" => Some(SessionKind::WinRm),
             "sftp" => Some(SessionKind::Sftp),
             _ => None,
         }
@@ -431,6 +442,10 @@ pub const DEFAULT_TELNET_PORT: u16 = 23;
 /// The program a Mosh connection starts on the server when its profile
 /// names none.
 pub const DEFAULT_MOSH_SERVER: &str = "mosh-server";
+/// WinRM over HTTP (5986 is HTTPS).
+pub const DEFAULT_WINRM_PORT: u16 = 5985;
+/// The command a WinRM session runs when its profile names none.
+pub const DEFAULT_WINRM_COMMAND: &str = "powershell -NoLogo";
 
 impl Profile {
     fn is_empty(&self) -> bool {
@@ -461,6 +476,7 @@ impl Profile {
             && self.desktop_clipboard.is_none()
             && self.mosh_server.is_none()
             && self.mosh_ports.is_none()
+            && self.winrm_command.is_none()
     }
 }
 
@@ -1121,6 +1137,9 @@ impl Settings {
                                 p.mosh_server = first.filter(|v| valid_mosh_server(v));
                             }
                             "moshports" => p.mosh_ports = first.as_deref().and_then(mosh_ports),
+                            "winrmcommand" => {
+                                p.winrm_command = virtual_desktop(&raw_rest(line));
+                            }
                             "tmuxlayout" => {
                                 p.tmux_layout = first
                                     .map(|l| l.to_ascii_lowercase())
@@ -1391,6 +1410,9 @@ impl Settings {
             }
             if let Some(ports) = p.mosh_ports {
                 let _ = writeln!(out, "    MoshPorts {}", mosh_ports_text(ports));
+            }
+            if let Some(c) = &p.winrm_command {
+                let _ = writeln!(out, "    WinrmCommand {c}");
             }
             match &p.password {
                 PasswordSource::Ask => {}
@@ -1728,6 +1750,22 @@ NewKeyword later
         }
         assert!(Settings::parse(&moved.to_text()).snippets.is_empty());
         assert_eq!(Settings::parse(""), Settings::default());
+    }
+
+    #[test]
+    fn winrm_settings() {
+        let s = Settings::parse(
+            "Profile a\n    Type winrm\n    WinrmCommand cmd /k \"echo hi\"\nProfile b\n    Type WinRM\n",
+        );
+        let a = s.profile("a").unwrap();
+        assert_eq!(a.kind, SessionKind::WinRm);
+        assert_eq!(a.winrm_command.as_deref(), Some("cmd /k \"echo hi\""));
+        let b = s.profile("b").unwrap();
+        assert_eq!(
+            (b.kind, b.winrm_command.as_deref()),
+            (SessionKind::WinRm, None)
+        );
+        assert_eq!(Settings::parse(&s.to_text()), s);
     }
 
     #[test]

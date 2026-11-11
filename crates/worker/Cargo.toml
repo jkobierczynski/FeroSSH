@@ -9,6 +9,8 @@ repository.workspace = true
 publish.workspace = true
 
 [dependencies]
+# Already linked through ferossh-update.
+base64ct = { version = "1.8", features = ["alloc"] }
 ferossh-forward.workspace = true
 ferossh-ipc.workspace = true
 ferossh-mosh.workspace = true
