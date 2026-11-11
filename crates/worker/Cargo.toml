@@ -11,6 +11,7 @@ publish.workspace = true
 [dependencies]
 ferossh-forward.workspace = true
 ferossh-ipc.workspace = true
+ferossh-mosh.workspace = true
 getrandom = "0.4"
 ferossh-render.workspace = true
 ferossh-sftp.workspace = true

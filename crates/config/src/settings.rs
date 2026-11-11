@@ -59,6 +59,10 @@
 //!     RemoteApp gimp
 //!     RemoteAppRemoveAgent yes
 //!     RemoteAppClipboard to-host
+//! Profile laptop-roaming
+//!     Type mosh
+//!     MoshServer ~/bin/mosh-server
+//!     MoshPorts 60001:60010
 //! Secret enable
 //!     PasswordCommand op read "op://Network/%n/password"
 //! ```
@@ -176,6 +180,13 @@ pub struct Profile {
     /// and virtual desktops and Windows: `to-host`, `from-host` or `off`.
     /// It only narrows the global `DesktopClipboard`, never widens it.
     pub desktop_clipboard: Option<String>,
+    /// For a Mosh session: the server program to start over SSH;
+    /// `mosh-server` when unset.
+    pub mosh_server: Option<String>,
+    /// For a Mosh session: the UDP port, or range of ports, the server
+    /// may listen on (a firewall's opening); any free one in 60001 to
+    /// 60999 when unset.
+    pub mosh_ports: Option<(u16, u16)>,
 }
 
 /// The ways copied text can travel, as the clipboard settings spell
@@ -234,6 +245,9 @@ pub enum SessionKind {
     /// A program on the `Via` SSH host whose windows show as native
     /// windows here (FeroStream).
     RemoteApp,
+    /// A terminal over Mosh: SSH logs in and starts `mosh-server`, then
+    /// the session goes over UDP, survives network changes and sleep.
+    Mosh,
 }
 
 /// How big a desktop is: as big as its pane, following it as it changes
@@ -276,6 +290,37 @@ impl std::fmt::Display for DesktopSize {
     }
 }
 
+/// Whether `program` can be the Mosh server: a program name or path,
+/// nothing a shell would read as more.
+pub fn valid_mosh_server(program: &str) -> bool {
+    !program.is_empty()
+        && program.len() <= 256
+        && program.bytes().all(|b| {
+            b.is_ascii_alphanumeric() || matches!(b, b'/' | b'.' | b'_' | b'-' | b'~' | b'+')
+        })
+}
+
+/// A Mosh UDP port (`60001`) or range (`60001:60010`, or with `-`).
+pub fn mosh_ports(text: &str) -> Option<(u16, u16)> {
+    let text = text.trim();
+    let (low, high) = text
+        .split_once(':')
+        .or_else(|| text.split_once('-'))
+        .unwrap_or((text, text));
+    let low: u16 = low.trim().parse().ok()?;
+    let high: u16 = high.trim().parse().ok()?;
+    (low != 0 && low <= high).then_some((low, high))
+}
+
+/// How [`mosh_ports`] reads a port or range back.
+pub fn mosh_ports_text((low, high): (u16, u16)) -> String {
+    if low == high {
+        low.to_string()
+    } else {
+        format!("{low}:{high}")
+    }
+}
+
 impl SessionKind {
     pub fn name(self) -> &'static str {
         match self {
@@ -286,6 +331,7 @@ impl SessionKind {
             SessionKind::Telnet => "telnet",
             SessionKind::Xvfb => "xvfb",
             SessionKind::RemoteApp => "remoteapp",
+            SessionKind::Mosh => "mosh",
         }
     }
 
@@ -298,6 +344,7 @@ impl SessionKind {
             "telnet" => Some(SessionKind::Telnet),
             "xvfb" | "virtual" => Some(SessionKind::Xvfb),
             "remoteapp" | "app" | "ferostream" => Some(SessionKind::RemoteApp),
+            "mosh" => Some(SessionKind::Mosh),
             _ => None,
         }
     }
@@ -372,6 +419,9 @@ pub const DEFAULT_DESKTOP_PORT: u16 = 3389;
 pub const DEFAULT_VNC_PORT: u16 = 5900;
 /// The Telnet port.
 pub const DEFAULT_TELNET_PORT: u16 = 23;
+/// The program a Mosh connection starts on the server when its profile
+/// names none.
+pub const DEFAULT_MOSH_SERVER: &str = "mosh-server";
 
 impl Profile {
     fn is_empty(&self) -> bool {
@@ -400,6 +450,8 @@ impl Profile {
             && self.remote_app_remove_agent.is_none()
             && self.remote_app_clipboard.is_none()
             && self.desktop_clipboard.is_none()
+            && self.mosh_server.is_none()
+            && self.mosh_ports.is_none()
     }
 }
 
@@ -1056,6 +1108,10 @@ impl Settings {
                                 p.virtual_desktop = virtual_desktop(&raw_rest(line));
                             }
                             "remoteapp" => p.remote_app = virtual_desktop(&raw_rest(line)),
+                            "moshserver" => {
+                                p.mosh_server = first.filter(|v| valid_mosh_server(v));
+                            }
+                            "moshports" => p.mosh_ports = first.as_deref().and_then(mosh_ports),
                             "tmuxlayout" => {
                                 p.tmux_layout = first
                                     .map(|l| l.to_ascii_lowercase())
@@ -1320,6 +1376,12 @@ impl Settings {
             }
             if let Some(c) = &p.remote_app_clipboard {
                 let _ = writeln!(out, "    RemoteAppClipboard {c}");
+            }
+            if let Some(m) = &p.mosh_server {
+                let _ = writeln!(out, "    MoshServer {}", arg(m));
+            }
+            if let Some(ports) = p.mosh_ports {
+                let _ = writeln!(out, "    MoshPorts {}", mosh_ports_text(ports));
             }
             match &p.password {
                 PasswordSource::Ask => {}
@@ -1657,6 +1719,27 @@ NewKeyword later
         }
         assert!(Settings::parse(&moved.to_text()).snippets.is_empty());
         assert_eq!(Settings::parse(""), Settings::default());
+    }
+
+    #[test]
+    fn mosh_settings() {
+        let s = Settings::parse(
+            "Profile a\n    Type mosh\n    MoshServer /opt/mosh/bin/mosh-server\n    MoshPorts 60001-60010\n\
+             Profile b\n    Type mosh\n    MoshServer \"mosh-server; rm\"\n    MoshPorts 70000\n",
+        );
+        let a = s.profile("a").unwrap();
+        assert_eq!(a.kind, SessionKind::Mosh);
+        assert_eq!(a.mosh_server.as_deref(), Some("/opt/mosh/bin/mosh-server"));
+        assert_eq!(a.mosh_ports, Some((60001, 60010)));
+        let b = s.profile("b").unwrap();
+        assert_eq!(b.kind, SessionKind::Mosh);
+        assert_eq!(b.mosh_server, None, "not a program name");
+        assert_eq!(b.mosh_ports, None);
+        assert_eq!(Settings::parse(&s.to_text()), s);
+        assert_eq!(mosh_ports("60001"), Some((60001, 60001)));
+        assert_eq!(mosh_ports("60010:60001"), None);
+        assert_eq!(mosh_ports("0"), None);
+        assert_eq!(mosh_ports_text((60001, 60010)), "60001:60010");
     }
 
     #[test]

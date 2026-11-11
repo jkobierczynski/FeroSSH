@@ -14,6 +14,7 @@ ferossh-auth = { path = "../crates/auth" }
 ferossh-config = { path = "../crates/config" }
 ferossh-forward = { path = "../crates/forward" }
 ferossh-ipc = { path = "../crates/ipc" }
+ferossh-mosh = { path = "../crates/mosh" }
 ferossh-render = { path = "../crates/render" }
 ferossh-sftp = { path = "../crates/sftp" }
 ferossh-term = { path = "../crates/term" }
@@ -164,6 +165,20 @@ bench = false
 [[bin]]
 name = "trigger_feed"
 path = "fuzz_targets/trigger_feed.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "mosh_receive"
+path = "fuzz_targets/mosh_receive.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "mosh_screen"
+path = "fuzz_targets/mosh_screen.rs"
 test = false
 doc = false
 bench = false

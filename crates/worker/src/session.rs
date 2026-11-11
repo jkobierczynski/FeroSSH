@@ -22,8 +22,8 @@ use std::time::Duration;
 
 use ferossh_forward::x11::{MIT_COOKIE, hex};
 use ferossh_ipc::{
-    ChannelId, Family, GssReply, MAX_DATA_CHUNK, Message, PromptField, PromptKind, Secrets,
-    ShellOptions, Timing, WORKER_IDS, X11Auth,
+    ChannelId, Family, GssReply, MAX_DATA_CHUNK, Message, MoshOptions, PromptField, PromptKind,
+    Secrets, ShellOptions, Timing, WORKER_IDS, X11Auth,
 };
 use russh::client::{self, AuthResult, DisconnectReason, Handle, KeyboardInteractiveAuthResponse};
 use russh::keys::agent::AgentIdentity;
@@ -278,6 +278,12 @@ pub(crate) struct ConnForwards {
     /// A shell asked for agent forwarding, so the server may open agent
     /// channels.
     agent: AtomicBool,
+    /// The host name as given, and the address the TCP connection went
+    /// to (none through a jump host or a `ProxyCommand`): where Mosh's
+    /// UDP goes.
+    host: String,
+    peer: Option<std::net::IpAddr>,
+    family: Family,
 }
 
 impl ConnForwards {
@@ -988,7 +994,17 @@ async fn session(
             // without ChaCha20: AES-GCM goes first instead, which any
             // server without strict key exchange has.
             let stream = crate::tunnel::open(id, rx, ctx.out.clone(), connections.routes.clone());
-            match handshake(p, aes_gcm_first(preferred), stream, inbox, ctx, connections).await {
+            match handshake(
+                p,
+                aes_gcm_first(preferred),
+                stream,
+                None,
+                inbox,
+                ctx,
+                connections,
+            )
+            .await
+            {
                 Err(Failure::Ssh(e @ russh::Error::NoCommonAlgo { .. })) if !p.legacy => {
                     return Err(suggest_legacy(e));
                 }
@@ -1115,7 +1131,8 @@ async fn connect(
     .map_err(|_| Failure::Refused(format!("Timed out connecting to {}.", p.host)))?
     .map_err(|e| Failure::Refused(format!("Could not connect to {}: {e}.", p.host)))?;
     let _ = tcp.set_nodelay(true);
-    handshake(p, preferred, tcp, inbox, ctx, connections).await
+    let peer = tcp.peer_addr().ok().map(|a| a.ip());
+    handshake(p, preferred, tcp, peer, inbox, ctx, connections).await
 }
 
 /// Connects to the first address of `host` that answers, of the IP
@@ -1151,6 +1168,7 @@ async fn handshake(
     p: &Params,
     preferred: Preferred,
     stream: impl AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    peer: Option<std::net::IpAddr>,
     inbox: &mut mpsc::Receiver<Message>,
     ctx: &mut Ctx,
     connections: &Connections,
@@ -1171,6 +1189,9 @@ async fn handshake(
         x11: Mutex::default(),
         alive,
         agent: AtomicBool::new(false),
+        host: p.host.clone(),
+        peer,
+        family: p.family,
     });
     let handler = Client {
         channel: ctx.channel,
@@ -1213,6 +1234,9 @@ async fn pump(
     inbox: &mut mpsc::Receiver<Message>,
     ctx: &mut Ctx,
 ) -> Result<Closed, Failure> {
+    if let Some(mosh) = ctx.options.mosh.clone() {
+        return mosh_session(conn, *mosh, inbox, ctx).await;
+    }
     let channel = drive(conn.channel_open_session(), inbox, ctx).await??;
     // X11 first: its reply is then the first one back.
     let mut x11_reply = false;
@@ -1338,6 +1362,120 @@ async fn pump(
     writer.abort();
     result
 }
+
+/// Starts `mosh-server` on an exec channel, reads where it listens and
+/// its key, and runs the session over UDP from there. The SSH connection
+/// stays open beside it, for File transfer and forwards while it lasts;
+/// the Mosh session does not need it.
+async fn mosh_session(
+    conn: &Connection,
+    mosh: MoshOptions,
+    inbox: &mut mpsc::Receiver<Message>,
+    ctx: &mut Ctx,
+) -> Result<Closed, Failure> {
+    use ferossh_mosh::bootstrap::{BootError, MAX_OUTPUT, ServerCommand, parse_connect};
+
+    let command = ServerCommand {
+        program: mosh.server.clone(),
+        ports: mosh.ports,
+        command: ctx.options.command.clone(),
+    };
+    let Some(line) = command.line() else {
+        return Err(Failure::Refused(format!(
+            "Not a program name: {:?}. Set the Mosh server to mosh-server or a path.",
+            mosh.server
+        )));
+    };
+    let channel = drive(conn.channel_open_session(), inbox, ctx).await??;
+    channel.exec(true, line.as_bytes()).await?;
+    let (mut read, _write) = channel.split();
+    let output = async {
+        let mut got = Vec::new();
+        while got.len() < MAX_OUTPUT {
+            match read.wait().await {
+                Some(ChannelMsg::Data { data }) | Some(ChannelMsg::ExtendedData { data, .. }) => {
+                    got.extend_from_slice(&data);
+                    // mosh-server prints the line, then detaches; stop as
+                    // soon as it is complete.
+                    if got.windows(13).any(|w| w == b"MOSH CONNECT ")
+                        && got.ends_with(b"\n")
+                        && parse_connect(&got).is_ok()
+                    {
+                        break;
+                    }
+                }
+                Some(ChannelMsg::Close | ChannelMsg::Eof) | None => break,
+                Some(_) => {}
+            }
+        }
+        got
+    };
+    let got = drive(tokio::time::timeout(MOSH_START, output), inbox, ctx)
+        .await?
+        .map_err(|_| Failure::Refused("mosh-server did not answer in time.".into()))?;
+    let connect = parse_connect(&got).map_err(|e| {
+        Failure::Refused(match e {
+            BootError::NoConnect(said) if said.is_empty() => {
+                "mosh-server did not start: is Mosh installed on the server?".to_owned()
+            }
+            BootError::NoConnect(said) => {
+                format!("mosh-server did not start: {said} (is Mosh installed on the server?)")
+            }
+            BootError::Malformed => "mosh-server's MOSH CONNECT line is malformed.".to_owned(),
+        })
+    })?;
+    let Some(f) = ctx.forwards.clone() else {
+        return Err(Failure::Refused("The connection is gone.".into()));
+    };
+    let ip = match f.peer {
+        Some(ip) => ip,
+        None => {
+            // Through a jump host or a ProxyCommand: Mosh's UDP goes to the
+            // host itself, as the mosh script does.
+            let found = tokio::net::lookup_host((f.host.as_str(), connect.port))
+                .await
+                .map_err(|e| Failure::Refused(format!("Mosh: could not look up {}: {e}.", f.host)))?
+                .find(|a| match f.family {
+                    Family::Any => true,
+                    Family::V4 => a.is_ipv4(),
+                    Family::V6 => a.is_ipv6(),
+                });
+            found
+                .map(|a| a.ip())
+                .ok_or_else(|| Failure::Refused(format!("Mosh: no address for {}.", f.host)))?
+        }
+    };
+    let addr = std::net::SocketAddr::new(ip, connect.port);
+    let (kex, _, host_key) = with(&ctx.shared, |s| s.names.clone())
+        .flatten()
+        .unwrap_or_default();
+    ctx.send(Message::Connected {
+        channel: ctx.channel,
+        kex,
+        cipher: format!("Mosh aes128-ocb, UDP {addr}"),
+        host_key,
+    })
+    .await?;
+    let target = crate::mosh::Target {
+        addr,
+        key: connect.key,
+    };
+    let ended = crate::mosh::run(ctx.channel, target, ctx.size, inbox, &ctx.out).await;
+    // Whatever became of the SSH connection meanwhile is not why the
+    // Mosh session ended.
+    with(&ctx.shared, |s| {
+        s.lost = None;
+        s.server_said = None;
+    });
+    match ended {
+        Ok(crate::mosh::Ended::Server) => Ok(Closed::Channel),
+        Ok(crate::mosh::Ended::Closed) => Err(Failure::Cancelled),
+        Err(why) => Err(Failure::Refused(why)),
+    }
+}
+
+/// How long `mosh-server new` may take to print where it listens.
+const MOSH_START: Duration = Duration::from_secs(20);
 
 /// Carries out a ZMODEM step: messages (terminal output among them) to the
 /// UI, and bytes for the server to the writer. A writer that has gone is

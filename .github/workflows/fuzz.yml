@@ -49,6 +49,8 @@ jobs:
           - login_script
           - sanitize
           - trigger_feed
+          - mosh_receive
+          - mosh_screen
     steps:
       - uses: actions/checkout@v4
       - run: rustup toolchain install "$FUZZ_TOOLCHAIN" --profile minimal

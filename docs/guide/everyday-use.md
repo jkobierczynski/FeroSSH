@@ -87,7 +87,7 @@ Ctrl+Shift+S shows your hosts in the tools pane: those from `~/.ssh/config`, you
 
 Insert or the New button opens the connection form in the tools pane; F2, the Edit button or a right click edits the selected connection. It is a Windows form of text boxes and drop-down lists, with a tab per section:
 
-- **Connection**: **Name, Folder, Type**; the type is an SSH terminal, Telnet (unencrypted), Serial console, Remote desktop (RDP) or VNC desktop. Then **Host, User, Port, Key file** (with Browse...), the **Password** source (below) and the **Jump host** (see [Jump hosts](#jump-hosts)). A serial console has the port, speed, framing and flow control instead.
+- **Connection**: **Name, Folder, Type**; the type is an SSH terminal, Mosh terminal, Telnet (unencrypted), Serial console, Remote desktop (RDP) or VNC desktop. Then **Host, User, Port, Key file** (with Browse...), the **Password** source (below) and the **Jump host** (see [Jump hosts](#jump-hosts)). A Mosh terminal adds the **Mosh server** program and its **UDP ports** (see [Mosh](#mosh)). A serial console has the port, speed, framing and flow control instead.
 - **Look** (a terminal's tab): theme, font, font size and scrollback.
 - **Extras** (a terminal's tab): tmux on or off, the tmux session to attach and its layout, the start directory, File transfer's Local and Remote folders, port forwards (such as `L 8080 localhost:80`), RDP and VNC ports, agent forwarding, Kerberos and passing a ticket on, older crypto, and the login script (see [Login scripts](#login-scripts)).
 
@@ -114,7 +114,7 @@ Host, user, port, key file, folders, PuTTY and KiTTY port forwards and jump host
 
 ## The session manager
 
-Ctrl+Shift+L lists the sessions that are open right now, in every tab: their host, kind (SSH, Telnet, serial, tmux, desktop or local shell), tab and state (connected, connecting, reconnecting or ended), with notes such as tmux, forwards, logging or a jump host. It also shows the hidden sessions of a [multi-host script run](#runs-on-many-hosts). It is a Windows list with columns (session, kind, tab, state, details) and updates as sessions connect, drop and reconnect. Type to filter, Enter or a double-click goes to the session's tab and pane, F2 renames it in place, and Del closes it after asking. The Show, Rename and Close buttons below the list, and a right-click on a session, do the same.
+Ctrl+Shift+L lists the sessions that are open right now, in every tab: their host, kind (SSH, Mosh, Telnet, serial, tmux, desktop or local shell), tab and state (connected, connecting, reconnecting or ended), with notes such as tmux, forwards, logging or a jump host. It also shows the hidden sessions of a [multi-host script run](#runs-on-many-hosts). It is a Windows list with columns (session, kind, tab, state, details) and updates as sessions connect, drop and reconnect. Type to filter, Enter or a double-click goes to the session's tab and pane, F2 renames it in place, and Del closes it after asking. The Show, Rename and Close buttons below the list, and a right-click on a session, do the same.
 
 The connection manager is for the hosts you *can* connect to; the session manager for the ones you *are* connected to.
 
@@ -125,6 +125,18 @@ To reach a host that is only reachable through another one, give it a jump host:
 Each jump host logs in as if you connected to it, with its own host key check and its own key or password, in a sandboxed worker of its own. The host behind it is then reached through that login, encrypted end to end, so a jump host never sees what you type on the target. If a jump host cannot reach the next one, the pane says which one and why.
 
 `ProxyCommand` in your ssh_config runs a local program (for example `ncat --proxy proxy.example.org:8080 %h %p`) and sends the connection through it. FeroSSH asks once before it runs a command line it has not run before, and shows what the program printed when it fails. `ProxyJump none` or `ProxyCommand none` turns either off for a host.
+
+## Mosh
+
+Mosh keeps a terminal going when the network does not: on a laptop that moves between Wi-Fi networks, sleeps, or sits on a slow or lossy link. Make a connection of type *Mosh terminal (SSH + UDP)* in the connection form. FeroSSH logs in over SSH as for an SSH terminal (keys, agent, password sources, jump hosts all work), runs `mosh-server` on the host, and from then on talks to it over UDP, as the `mosh` command does.
+
+- The host needs Mosh installed (`apt install mosh`, `dnf install mosh`), and its firewall has to let UDP in on the ports the server uses: 60001 to 60999 unless the form's **UDP ports** field narrows them (`60001` or `60001:60010`). **Mosh server** names the program when it is not on the path, such as `~/bin/mosh-server`.
+- When you change network, the next packet simply comes from the new address and the server answers there. When the server stays quiet, FeroSSH tries a new local port in case a router forgot the old one, and a bar on the top line says how long ago the server was last heard. Nothing is lost: the screen catches up when the network comes back.
+- Through a jump host, the SSH login goes through the jump host but the UDP goes straight to the host, as with `mosh`, so the host's UDP ports must be reachable from your PC.
+- If the server does not answer over UDP within 15 seconds, the pane says so: usually a firewall blocks the ports.
+- The SSH connection stays open next to the Mosh session for File transfer and port forwards. A Mosh tab never shares its connection with another tab.
+- tmux integration needs an SSH terminal (Mosh sends screens, not the byte stream tmux control mode needs); run `tmux` in a Mosh pane as usual. ZMODEM does not work over Mosh for the same reason. Logs, themes, login scripts, scripts and broadcast input work.
+- Typing shows when the server echoes it; Mosh's local echo prediction is not in this version yet.
 
 ## Telnet and serial consoles
 

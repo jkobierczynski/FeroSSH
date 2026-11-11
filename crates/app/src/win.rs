@@ -26,7 +26,7 @@ use ferossh_config::password::{self as pw_source, PasswordSource};
 use ferossh_config::record::Recorder;
 use ferossh_config::saved::{self, SavedHost};
 use ferossh_config::serial::{self, SerialTarget};
-use ferossh_config::settings::{DEFAULT_DESKTOP_PORT, DEFAULT_VNC_PORT};
+use ferossh_config::settings::{DEFAULT_DESKTOP_PORT, DEFAULT_MOSH_SERVER, DEFAULT_VNC_PORT};
 use ferossh_config::snippet_import::{self, SnippetClient};
 use ferossh_config::snippet_store;
 use ferossh_config::trigger::{Fire, Watch};
@@ -35,7 +35,7 @@ use ferossh_config::{
     ssh_config, winscp,
 };
 use ferossh_forward::x11::{Display, find_cookie, xauth_entries};
-use ferossh_ipc::{ChannelId, DirEntry, FORWARD_IDS, Message, SftpReply, X11Auth};
+use ferossh_ipc::{ChannelId, DirEntry, FORWARD_IDS, Message, MoshOptions, SftpReply, X11Auth};
 use ferossh_render::{
     CellMetrics, Cursor, FontSpec, Frame, Grid, PaneView, PixelRect, Renderer, Rgb, Theme,
     ThemeGroup,
@@ -2856,6 +2856,17 @@ impl Window {
     /// Types the line that starts tmux in control mode at pane `id`'s
     /// shell.
     fn attach_tmux(&mut self, id: PaneId, name: &str, pick: bool) {
+        // Mosh sends screens, not the byte stream tmux control mode needs.
+        if let Some(Host::Ssh(s)) = self.panes.get(&id).map(|p| &p.host)
+            && s.target.mosh.is_some()
+        {
+            self.show(
+                id,
+                "\x1b[0;90mtmux integration needs an SSH shell: it does not work over Mosh. \
+                 Run tmux in the pane as usual.\x1b[0m\r\n",
+            );
+            return;
+        }
         if !self.tmux.contains_key(&id) {
             let t = self.new_tmux(id);
             self.tmux.insert(id, t);
@@ -3059,7 +3070,12 @@ impl Window {
                     {
                         notes.push("via jump host");
                     }
-                    (live::Kind::Ssh, s.target.label(), state(s.state()))
+                    let kind = if s.target.mosh.is_some() {
+                        live::Kind::Mosh
+                    } else {
+                        live::Kind::Ssh
+                    };
+                    (kind, s.target.label(), state(s.state()))
                 }
                 Host::Telnet(s) => {
                     notes.push("unencrypted");
@@ -4942,8 +4958,23 @@ impl Window {
     /// Connects pane `id` to `target`. When another pane is logged in to
     /// the same host, port and user, the new shell is a channel on that
     /// connection: no second login.
-    fn connect_to(&mut self, id: PaneId, target: Target, env: &Env) {
+    fn connect_to(&mut self, id: PaneId, mut target: Target, env: &Env) {
         self.end_host(id);
+        // The profile decides, every time: a reconnect or a split passes
+        // the old target back, which may predate a change of type.
+        target.mosh = self
+            .settings
+            .profile(&target.alias)
+            .filter(|p| p.kind == SessionKind::Mosh)
+            .map(|p| {
+                Box::new(MoshOptions {
+                    server: p
+                        .mosh_server
+                        .clone()
+                        .unwrap_or_else(|| DEFAULT_MOSH_SERVER.to_owned()),
+                    ports: p.mosh_ports,
+                })
+            });
         if let Some(p) = self.panes.get_mut(&id) {
             p.term.scroll_to_bottom();
         }
@@ -9921,7 +9952,10 @@ impl Window {
             return;
         }
         if let Some(p) = self.settings.profile(host)
-            && !matches!(p.kind, SessionKind::Ssh | SessionKind::Telnet)
+            && !matches!(
+                p.kind,
+                SessionKind::Ssh | SessionKind::Telnet | SessionKind::Mosh
+            )
         {
             let (kind, via) = (p.kind, p.via.clone());
             self.open_desktop_session(host, kind, via, split);

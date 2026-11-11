@@ -97,6 +97,7 @@ impl Found {
                     SessionKind::Vnc => to.push_str(" VNC"),
                     SessionKind::Serial => to.push_str(" serial"),
                     SessionKind::Telnet => to.push_str(" Telnet"),
+                    SessionKind::Mosh => to.push_str(" Mosh"),
                     SessionKind::Xvfb => to.push_str(" virtual desktop"),
                     SessionKind::RemoteApp => to.push_str(" remote app"),
                 }

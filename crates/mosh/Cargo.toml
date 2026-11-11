@@ -1,0 +1,22 @@
+[package]
+name = "ferossh-mosh"
+description = "FeroSSH: the Mosh protocol without the I/O: AES-128-OCB packets, fragments, state sync, the screen model and local echo prediction"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+# AES-128-OCB3 (RFC 7253), as Mosh's packets use it. `aes` is already in
+# the exe through the SSH key code; ocb3 adds the mode on top.
+aes = "0.9"
+ocb3 = { version = "0.2", default-features = false, features = ["alloc"] }
+# zlib, as Mosh compresses each instruction; FeroStream already links it.
+miniz_oxide = { version = "0.9", default-features = false, features = ["with-alloc"] }
+unicode-width = "0.2"
+zeroize = "1.9"
+
+[lints]
+workspace = true

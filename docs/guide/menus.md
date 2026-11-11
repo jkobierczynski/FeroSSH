@@ -185,7 +185,7 @@ The buttons at the bottom do the same, and a saved connection has a Delete butto
 
 | Key | Action |
 | --- | --- |
-| Typing | Goes to the search box and filters by host, name, title or kind (SSH, Telnet, serial, tmux, desktop, local). |
+| Typing | Goes to the search box and filters by host, name, title or kind (SSH, Mosh, Telnet, serial, tmux, desktop, local). |
 | Down (in the search box) | Moves into the list. |
 | Tab | Moves between the search box, the list and the buttons. |
 | Enter or double-click | Goes to the session's tab and pane (from the search box, the first one listed). A hidden script-run session, or the login of a desktop or remote app connection, is shown in a tab. |
