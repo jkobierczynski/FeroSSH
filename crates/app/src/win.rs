@@ -873,9 +873,10 @@ struct Window {
     /// Of those, the queues whose listing another pane's shell has since
     /// moved: going back to the owner lists its Remote folder again.
     folder_left: HashSet<String>,
-    /// The connection the file view last followed a pane of: another
-    /// connection to the same host can name another Remote folder.
-    files_alias_shown: Option<String>,
+    /// Per queue, the connection (and `sftp://` folder) the file view
+    /// last followed a pane of: another connection to the same host can
+    /// name another Remote folder.
+    files_alias_shown: HashMap<String, String>,
     transfer_timer: bool,
     /// Server files being edited locally, put back on each save.
     edits: crate::edit_local::Edits,
@@ -1651,7 +1652,7 @@ fn create_and_run(launch: Launch, theme: Option<String>) -> Result<()> {
                 files_pane: None,
                 started_in_folder: HashMap::new(),
                 folder_left: HashSet::new(),
-                files_alias_shown: None,
+                files_alias_shown: HashMap::new(),
                 transfer_timer: false,
                 edits: crate::edit_local::Edits::default(),
                 edit_timer: false,
@@ -12311,26 +12312,26 @@ impl Window {
         }
         if host_changed || self.files_pane != Some(id) {
             self.files_pane = Some(id);
-            // Two `sftp://` addresses for one login differ by folder.
-            let folder = match self.panes.get(&self.host_pane(id)).map(|p| &p.host) {
-                Some(Host::Ssh(s)) => s.target.sftp_folder.clone(),
-                _ => None,
+            let ident = self.files_ident(id);
+            let alias_changed = match (&key, &ident) {
+                (Some(k), Some(a)) => {
+                    self.files_alias_shown.insert(k.clone(), a.clone()).as_ref() != Some(a)
+                }
+                _ => false,
             };
-            let alias = self
-                .pane_alias(id)
-                .map(|a| folder.map_or_else(|| a.clone(), |f| format!("{a} {f}")));
-            let alias_changed = alias != self.files_alias_shown;
-            self.files_alias_shown = alias;
-            // Another connection to a host already listed: its own Remote
-            // folder, if it names one.
-            if !host_changed
-                && alias_changed
+            // Another connection to a host already listed, also when
+            // coming back from another host: its own Remote folder, if it
+            // names one. Returning to the same one keeps where it was.
+            if alias_changed
                 && let Some(k) = key.clone()
                 && let Some(folder) = self.remote_folder(id)
                 && let Some(r) = self.sftp.get_mut(&k)
             {
-                r.notice = None;
-                r.browse(folder.as_bytes());
+                // A queue that just opened there already asked for it.
+                if !(host_changed && r.listing.path.is_empty()) {
+                    r.notice = None;
+                    r.browse(folder.as_bytes());
+                }
                 self.folder_left.remove(&k);
                 self.started_in_folder.insert(k, id);
                 // Sent now: with nothing transferring, no timer would.
@@ -12368,9 +12369,15 @@ impl Window {
     }
 
     /// The connection name of pane `id`'s SSH host.
-    fn pane_alias(&self, id: PaneId) -> Option<String> {
+    /// Which connection pane `id` is to File transfer: its name, and the
+    /// folder of the `sftp://` address it was opened with, since two such
+    /// addresses for one login differ only by folder.
+    fn files_ident(&self, id: PaneId) -> Option<String> {
         match &self.panes.get(&self.host_pane(id))?.host {
-            Host::Ssh(s) => Some(s.target.alias.clone()),
+            Host::Ssh(s) => Some(match &s.target.sftp_folder {
+                Some(f) => format!("{} {f}", s.target.alias),
+                None => s.target.alias.clone(),
+            }),
             _ => None,
         }
     }
@@ -12819,7 +12826,14 @@ impl Window {
         // No shell reports a folder on an SFTP-only login: the folder File
         // transfer shows, else the one it started in.
         if self.sftp_only(id) {
-            if let Some(r) = remote
+            // The listing, when it was last this connection's; another
+            // tab's for the same login lists its own folder.
+            let ours = self
+                .pane_sftp_key(id)
+                .and_then(|k| self.files_alias_shown.get(&k))
+                .is_none_or(|a| Some(a) == self.files_ident(id).as_ref());
+            if ours
+                && let Some(r) = remote
                 && !r.listing.path.is_empty()
             {
                 return r.listing.path.clone();
