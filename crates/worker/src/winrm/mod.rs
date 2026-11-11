@@ -627,6 +627,8 @@ impl Conn {
                         "The server does not take Negotiate (Kerberos or NTLM) logins.".to_owned(),
                     );
                 }
+                // The window reads "Access denied: the server refused the login" as a
+                // refused password (`source_refused`); keep the words.
                 (401, _) => return Err("Access denied: the server refused the login.".to_owned()),
                 (status, _) => {
                     return Err(format!("The server answered the login with HTTP {status}."));

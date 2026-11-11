@@ -32,6 +32,10 @@ const DIM: &str = "\x1b[0;90m";
 const RED: &str = "\x1b[0;31m";
 const YELLOW: &str = "\x1b[0;33m";
 const RESET: &str = "\x1b[0m";
+/// How the worker starts its message when the server refuses the login
+/// (`crates/worker/src/winrm`).
+const ACCESS_DENIED: &str = "Access denied: the server refused the login";
+
 /// Earlier lines kept for Up and Down.
 const HISTORY: usize = 200;
 /// Logins the worker may start: one per HTTP connection, and a spare.
@@ -232,6 +236,9 @@ pub struct WinrmSession {
     to_store: Option<Zeroizing<String>>,
     /// The shell opened at least once.
     was_connected: bool,
+    /// The server refused the login (HTTP 401 after the last token), as
+    /// opposed to a network failure or a disconnect from this side.
+    login_refused: bool,
     /// TLS connections the worker started.
     tls_starts: u32,
     /// Where certificates the user trusted are kept (`host:port` and the
@@ -354,6 +361,7 @@ impl WinrmSession {
             from_source: false,
             to_store: None,
             was_connected: false,
+            login_refused: false,
             tls_starts: 0,
             cert_store: None,
             trusted_certs: Vec::new(),
@@ -441,7 +449,7 @@ impl WinrmSession {
 
     /// The password from the source did not get in: the next try asks.
     pub fn source_refused(&self) -> bool {
-        self.from_source && self.state == State::Ended && !self.was_connected
+        self.from_source && self.login_refused && !self.was_connected
     }
 
     fn connect(&mut self) -> Vec<Effect> {
@@ -782,6 +790,8 @@ impl WinrmSession {
                 }
                 self.state = State::Ended;
                 self.password = None;
+                // The worker's words for a 401 to the last login token.
+                self.login_refused = !self.was_connected && reason.starts_with(ACCESS_DENIED);
                 vec![
                     Effect::Broker(Job::SspiEnd(self.channel)),
                     Effect::Show(format!(
@@ -1106,7 +1116,7 @@ mod tests {
         // Typing meanwhile goes nowhere.
         assert!(s.input(b"x").is_empty());
         let fx = s.password_fetched(Ok(Zeroizing::new("secret".into())), "pass");
-        assert!(shown(&fx).contains("Password from pass."), "{fx:?}");
+        assert!(shown(&fx).contains("Password from pass."));
         assert!(
             fx.iter()
                 .any(|e| matches!(e, Effect::Send(Message::WinrmConnect { .. })))
@@ -1189,6 +1199,16 @@ mod tests {
         s.on_worker(Message::Disconnected {
             channel: 5,
             reason: "The server closed the connection.".into(),
+        });
+        assert!(!s.source_refused());
+        // Nor is a network failure while logging in.
+        let mut s = WinrmSession::new(5, WinrmTarget::typed("winrm://admin@srv").unwrap());
+        s.password_source = true;
+        s.start();
+        s.password_fetched(Ok(Zeroizing::new("ok".into())), "pass");
+        s.on_worker(Message::Disconnected {
+            channel: 5,
+            reason: "Could not reach srv:5985: timed out.".into(),
         });
         assert!(!s.source_refused());
     }
