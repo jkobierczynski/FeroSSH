@@ -241,6 +241,9 @@ pub struct WinrmSession {
     login_refused: bool,
     /// TLS connections the worker started.
     tls_starts: u32,
+    /// Over HTTPS, each connection's handshake finished with a certificate
+    /// that was accepted: only then may it log in.
+    tls_approved: [bool; 2],
     /// Where certificates the user trusted are kept (`host:port` and the
     /// SHA-256 fingerprint, a line each); none keeps them for the
     /// session only.
@@ -363,6 +366,7 @@ impl WinrmSession {
             was_connected: false,
             login_refused: false,
             tls_starts: 0,
+            tls_approved: [false; 2],
             cert_store: None,
             trusted_certs: Vec::new(),
             cert_prompt: None,
@@ -702,6 +706,17 @@ impl WinrmSession {
                     if !self.target.https || self.tls_starts > MAX_STARTS {
                         return self.cut_off();
                     }
+                    if let Some(ok) = self.tls_approved.get_mut(usize::from(conn)) {
+                        *ok = false;
+                    }
+                }
+                // Over HTTPS a login goes only inside a TLS connection whose
+                // certificate was accepted, so it is bound to that server.
+                if self.target.https
+                    && matches!(op, SspiOp::Start | SspiOp::Step(_))
+                    && self.tls_approved.get(usize::from(conn)) != Some(&true)
+                {
+                    return self.cut_off();
                 }
                 if self.cert_prompt.is_some() {
                     // Nothing goes on while the user decides.
@@ -837,6 +852,15 @@ impl WinrmSession {
         })
     }
 
+    /// Passes on a finished handshake whose certificate was accepted:
+    /// from now on that connection may log in.
+    fn approve(&mut self, conn: u8, held: SspiResult) -> Effect {
+        if let Some(ok) = self.tls_approved.get_mut(usize::from(conn)) {
+            *ok = true;
+        }
+        self.reply(conn, held)
+    }
+
     /// `host:port`, as the certificate store keys a server.
     fn cert_key(&self) -> String {
         if self.target.hostname.contains(':') {
@@ -863,11 +887,11 @@ impl WinrmSession {
                         "HTTPS: the server's certificate is valid for this name (checked by Windows).",
                     )));
                 }
-                effects.push(self.reply(conn, held));
+                effects.push(self.approve(conn, held));
                 return effects;
             }
             Err(_) if self.trusted_certs.contains(&cert.sha256) => {
-                return vec![self.reply(conn, held)];
+                return vec![self.approve(conn, held)];
             }
             Err(_) => {}
         }
@@ -884,7 +908,7 @@ impl WinrmSession {
                         "HTTPS: the server's certificate is the one you trusted before.",
                     )));
                 }
-                effects.push(self.reply(conn, held));
+                effects.push(self.approve(conn, held));
                 effects
             }
             Some(sha) if sha == cert.sha256 => self.ask_cert(conn, cert, held, &key),
@@ -961,7 +985,7 @@ impl WinrmSession {
                             effects.push(Effect::Show(dim(&sanitize(&note))));
                         }
                         self.trusted_certs.push(prompt.sha256);
-                        effects.push(self.reply(prompt.conn, prompt.held));
+                        effects.push(self.approve(prompt.conn, prompt.held));
                     } else {
                         effects.push(self.reply(
                             prompt.conn,
@@ -1358,6 +1382,36 @@ mod tests {
             replied(&s.input(b"\x03")),
             Some(SspiResult::Failed(_))
         ));
+    }
+
+    #[test]
+    fn an_https_login_waits_for_an_accepted_certificate() {
+        // Before any TLS connection.
+        let mut s = https_session(None);
+        let fx = s.on_worker(Message::SspiRequest {
+            channel: 5,
+            conn: 1,
+            op: SspiOp::Start,
+        });
+        assert!(fx.iter().any(|e| matches!(e, Effect::Ended)));
+        // While the certificate question is open.
+        let mut s = https_session(None);
+        handshake_done(&mut s, 0, cert("AB", Err("self-signed".into())));
+        let fx = s.on_worker(Message::SspiRequest {
+            channel: 5,
+            conn: 0,
+            op: SspiOp::Start,
+        });
+        assert!(fx.iter().any(|e| matches!(e, Effect::Ended)));
+        // Once accepted, it goes to the broker.
+        let mut s = https_session(None);
+        handshake_done(&mut s, 0, cert("AB", Ok(())));
+        let fx = s.on_worker(Message::SspiRequest {
+            channel: 5,
+            conn: 0,
+            op: SspiOp::Start,
+        });
+        assert!(matches!(&fx[..], [Effect::Broker(Job::Sspi(_))]));
     }
 
     #[test]

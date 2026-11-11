@@ -92,6 +92,8 @@ impl Sspi {
             host,
             pending: Vec::new(),
             ready: false,
+            renegotiating: false,
+            held: Vec::new(),
             sizes: None,
             rounds: 0,
         }))
@@ -106,6 +108,11 @@ struct Connection {
     /// The server's bytes not used yet (part of a record).
     pending: Vec<u8>,
     ready: bool,
+    /// The server started a new handshake (TLS 1.2 renegotiation) that
+    /// has not finished: its bytes go to the handshake, and what the
+    /// worker sends meanwhile waits in `held`.
+    renegotiating: bool,
+    held: Vec<u8>,
     sizes: Option<SecPkgContext_StreamSizes>,
     rounds: u32,
 }
@@ -235,8 +242,9 @@ impl Connection {
         (send, status)
     }
 
-    /// Runs the handshake as far as the bytes in `pending` go.
-    fn handshake(&mut self, out: &mut TlsOutput) -> Result<(), String> {
+    /// Runs the handshake as far as the bytes in `pending` go; true once
+    /// it is done.
+    fn handshake(&mut self, out: &mut TlsOutput) -> Result<bool, String> {
         loop {
             self.rounds += 1;
             if self.rounds > MAX_ROUNDS {
@@ -246,20 +254,88 @@ impl Connection {
             out.send.extend_from_slice(&send);
             if status == SEC_E_OK {
                 self.ready = true;
-                return Ok(());
+                return Ok(true);
             }
             if status == SEC_E_INCOMPLETE_MESSAGE {
-                return Ok(());
+                return Ok(false);
             }
             if status == SEC_I_CONTINUE_NEEDED || status == SEC_I_INCOMPLETE_CREDENTIALS {
                 // No client certificate to give: SChannel goes on without.
                 if self.pending.is_empty() && status == SEC_I_CONTINUE_NEEDED {
-                    return Ok(());
+                    return Ok(false);
                 }
                 continue;
             }
             return Err(format!("the TLS handshake failed ({})", why(status)));
         }
+    }
+
+    /// Encrypts plain bytes into records.
+    fn encrypt(&mut self, plain: &[u8]) -> Result<Vec<u8>, String> {
+        let sizes = self.sizes()?;
+        let ctx = self.ctx.ok_or("no TLS connection")?;
+        let max = (sizes.cbMaximumMessage as usize).max(1);
+        let mut out = Vec::new();
+        for chunk in plain.chunks(max) {
+            let (h, t) = (sizes.cbHeader as usize, sizes.cbTrailer as usize);
+            let mut record = vec![0u8; h + chunk.len() + t];
+            record
+                .get_mut(h..h + chunk.len())
+                .ok_or("bad record")?
+                .copy_from_slice(chunk);
+            let base = record.as_mut_ptr();
+            // SAFETY: the three buffers are disjoint parts of `record`.
+            let mut bufs = unsafe {
+                [
+                    SecBuffer {
+                        cbBuffer: sizes.cbHeader,
+                        BufferType: SECBUFFER_STREAM_HEADER,
+                        pvBuffer: base.cast(),
+                    },
+                    SecBuffer {
+                        cbBuffer: u32::try_from(chunk.len()).map_err(|_| "too much data")?,
+                        BufferType: SECBUFFER_DATA,
+                        pvBuffer: base.add(h).cast(),
+                    },
+                    SecBuffer {
+                        cbBuffer: sizes.cbTrailer,
+                        BufferType: SECBUFFER_STREAM_TRAILER,
+                        pvBuffer: base.add(h + chunk.len()).cast(),
+                    },
+                    SecBuffer::default(),
+                ]
+            };
+            let desc = SecBufferDesc {
+                ulVersion: SECBUFFER_VERSION,
+                cBuffers: 4,
+                pBuffers: bufs.as_mut_ptr(),
+            };
+            // SAFETY: the buffers outlive the call and are as large as
+            // SChannel said; it encrypts in place.
+            let status = unsafe { EncryptMessage(&ctx, 0, &desc, 0) };
+            if status != SEC_E_OK {
+                return Err(format!("TLS encryption failed ({})", why(status)));
+            }
+            let [hb, db, tb, _] = &bufs;
+            let used = (hb.cbBuffer + db.cbBuffer + tb.cbBuffer) as usize;
+            record.truncate(used);
+            out.extend_from_slice(&record);
+        }
+        Ok(out)
+    }
+
+    /// Goes on with a renegotiation; once done, sends what was held.
+    fn finish_renegotiation(&mut self, out: &mut TlsOutput) -> Result<bool, String> {
+        if !self.handshake(out)? {
+            return Ok(false);
+        }
+        self.renegotiating = false;
+        let held = std::mem::take(&mut self.held);
+        if !held.is_empty() {
+            let records = self.encrypt(&held)?;
+            out.send.extend_from_slice(&records);
+        }
+        Ok(true)
     }
 
     fn sizes(&mut self) -> Result<SecPkgContext_StreamSizes, String> {
@@ -328,13 +404,14 @@ impl Connection {
             if status == SEC_I_CONTEXT_EXPIRED {
                 out.closed = true;
             } else if status == SEC_I_RENEGOTIATE {
-                // TLS 1.3 sends tickets and key updates after the
-                // handshake: they go through the handshake call, with
-                // what follows them.
-                let (send, status) = self.handshake_call(false);
-                out.send.extend_from_slice(&send);
-                if status != SEC_E_OK && status != SEC_I_CONTINUE_NEEDED {
-                    return Err(format!("the server's TLS update failed ({})", why(status)));
+                // TLS 1.3 tickets and key updates, or a TLS 1.2
+                // renegotiation, go through the handshake call with what
+                // follows them. Until a new handshake is done, records
+                // wait.
+                self.renegotiating = true;
+                self.rounds = 0;
+                if !self.finish_renegotiation(out)? {
+                    return Ok(());
                 }
             }
         }
@@ -359,8 +436,10 @@ impl TlsContext for Connection {
         let mut out = TlsOutput::default();
         if !self.ready {
             self.handshake(&mut out)?;
+        } else if self.renegotiating {
+            self.finish_renegotiation(&mut out)?;
         }
-        if self.ready {
+        if self.ready && !self.renegotiating {
             // What came after the handshake's last message is records.
             self.decrypt(&mut out)?;
         }
@@ -369,56 +448,14 @@ impl TlsContext for Connection {
     }
 
     fn send(&mut self, plain: &[u8]) -> Result<Vec<u8>, String> {
-        let sizes = self.sizes()?;
-        let ctx = self.ctx.ok_or("no TLS connection")?;
-        let max = (sizes.cbMaximumMessage as usize).max(1);
-        let mut out = Vec::new();
-        for chunk in plain.chunks(max) {
-            let (h, t) = (sizes.cbHeader as usize, sizes.cbTrailer as usize);
-            let mut record = vec![0u8; h + chunk.len() + t];
-            record
-                .get_mut(h..h + chunk.len())
-                .ok_or("bad record")?
-                .copy_from_slice(chunk);
-            let base = record.as_mut_ptr();
-            // SAFETY: the three buffers are disjoint parts of `record`.
-            let mut bufs = unsafe {
-                [
-                    SecBuffer {
-                        cbBuffer: sizes.cbHeader,
-                        BufferType: SECBUFFER_STREAM_HEADER,
-                        pvBuffer: base.cast(),
-                    },
-                    SecBuffer {
-                        cbBuffer: u32::try_from(chunk.len()).map_err(|_| "too much data")?,
-                        BufferType: SECBUFFER_DATA,
-                        pvBuffer: base.add(h).cast(),
-                    },
-                    SecBuffer {
-                        cbBuffer: sizes.cbTrailer,
-                        BufferType: SECBUFFER_STREAM_TRAILER,
-                        pvBuffer: base.add(h + chunk.len()).cast(),
-                    },
-                    SecBuffer::default(),
-                ]
-            };
-            let desc = SecBufferDesc {
-                ulVersion: SECBUFFER_VERSION,
-                cBuffers: 4,
-                pBuffers: bufs.as_mut_ptr(),
-            };
-            // SAFETY: the buffers outlive the call and are as large as
-            // SChannel said; it encrypts in place.
-            let status = unsafe { EncryptMessage(&ctx, 0, &desc, 0) };
-            if status != SEC_E_OK {
-                return Err(format!("TLS encryption failed ({})", why(status)));
+        if self.renegotiating {
+            if self.held.len() + plain.len() > MAX_PENDING {
+                return Err("too much to send while TLS renegotiates".into());
             }
-            let [hb, db, tb, _] = &bufs;
-            let used = (hb.cbBuffer + db.cbBuffer + tb.cbBuffer) as usize;
-            record.truncate(used);
-            out.extend_from_slice(&record);
+            self.held.extend_from_slice(plain);
+            return Ok(Vec::new());
         }
-        Ok(out)
+        self.encrypt(plain)
     }
 
     fn channel_bindings(&self) -> Result<Vec<u8>, String> {
