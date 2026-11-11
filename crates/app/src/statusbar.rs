@@ -15,7 +15,7 @@ use ferossh_ipc::ServerStats;
 use ferossh_render::{Cell, Color, Flags, Grid, Rgb};
 use unicode_width::UnicodeWidthChar;
 
-use crate::tabstrip::{Palette, fit};
+use crate::tabstrip::{DIM_CONTRAST, Palette, contrast, fit, mix};
 
 /// A share (of CPU, memory or disk), in tenths of a percent, from which
 /// it shows in amber.
@@ -53,6 +53,19 @@ struct Part {
     label: &'static str,
     value: String,
     high: bool,
+}
+
+/// Amber, moved toward the text colour until it reads on the bar (a
+/// light bar makes plain amber faint).
+fn high_colour(palette: &Palette) -> Rgb {
+    let floor = DIM_CONTRAST.min(contrast(palette.text, palette.strip));
+    let mut colour = AMBER;
+    let mut amount = 0.0_f32;
+    while amount < 1.0 && contrast(colour, palette.strip) < floor {
+        amount = (amount + 0.1).min(1.0);
+        colour = mix(AMBER, palette.text, amount);
+    }
+    colour
 }
 
 /// What the bar says, label by label.
@@ -150,7 +163,7 @@ fn in_unit(kib: u64, scale: u64) -> String {
     if tenths < 100 {
         format!("{}.{}", tenths / 10, tenths % 10)
     } else {
-        (tenths / 10).to_string()
+        ((u128::from(kib) + scale / 2) / scale).to_string()
     }
 }
 
@@ -174,7 +187,11 @@ pub fn rate(bytes: u64) -> String {
     if bytes < 1024 {
         return format!("{bytes} B/s");
     }
-    format!("{}/s", size_kib(bytes / 1024))
+    // The unit from whole KiB, the figure from the bytes, so 1.5 KB/s
+    // stays 1.5.
+    let (unit, scale) = unit_of(bytes / 1024);
+    let bytes_per_unit = scale.saturating_mul(1024);
+    format!("{} {unit}/s", in_unit(bytes, bytes_per_unit))
 }
 
 /// A row being filled cell by cell, up to `width` cells.
@@ -256,7 +273,7 @@ pub fn draw(grid: &mut Grid, shown: &Shown, palette: &Palette) {
         let (fg, flags) = if part.label.is_empty() {
             (palette.dim, Flags::empty())
         } else if part.high {
-            (AMBER, Flags::BOLD)
+            (high_colour(palette), Flags::BOLD)
         } else {
             (palette.text, Flags::empty())
         };
@@ -348,6 +365,19 @@ mod tests {
     }
 
     #[test]
+    fn amber_darkens_on_a_light_bar() {
+        let light = Palette::from_colours(
+            Rgb::new(0xf0, 0xf0, 0xf0),
+            Rgb::new(0x10, 0x10, 0x10),
+            Rgb::new(0x00, 0x60, 0xc0),
+        );
+        let c = high_colour(&light);
+        assert_ne!(c, AMBER);
+        assert!(contrast(c, light.strip) >= DIM_CONTRAST);
+        assert_eq!(high_colour(&palette()), AMBER);
+    }
+
+    #[test]
     fn says_why_there_is_nothing() {
         let mut grid = Grid::new(80, 1);
         draw(&mut grid, &Shown::NoServer, &palette());
@@ -367,10 +397,12 @@ mod tests {
         assert_eq!(size_kib(512), "512 KB");
         assert_eq!(size_kib(1024), "1.0 MB");
         assert_eq!(size_kib(40 * GB), "40 GB");
+        assert_eq!(size_kib(10 * GB + 9 * GB / 10), "11 GB");
         assert_eq!(size_kib(u64::MAX), "16777216 PB");
         assert_eq!(rate(0), "0 B/s");
         assert_eq!(rate(1023), "1023 B/s");
         assert_eq!(rate(12 * 1024), "12 KB/s");
+        assert_eq!(rate(1536), "1.5 KB/s");
         assert_eq!(rate(u64::MAX), "16384 PB/s");
         assert_eq!(percent(0, 0), "0%");
         assert_eq!(percent(1, 3), "33%");

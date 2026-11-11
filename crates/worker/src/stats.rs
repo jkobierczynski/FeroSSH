@@ -369,12 +369,24 @@ async fn serve(
     inbox: &mut mpsc::Receiver<Message>,
     out: &mpsc::Sender<Message>,
 ) -> String {
-    let Ok(ch) = conn.channel_open_session().await else {
-        return "The server would not open a channel for its statistics.".into();
+    // A server slow to answer must not keep the UI's Close waiting.
+    let start = async {
+        let ch = conn
+            .channel_open_session()
+            .await
+            .map_err(|_| "The server would not open a channel for its statistics.")?;
+        ch.exec(true, command(interval))
+            .await
+            .map_err(|_| "The server would not report its statistics.")?;
+        Ok::<_, &str>(ch)
     };
-    if ch.exec(true, command(interval)).await.is_err() {
-        return "The server would not report its statistics.".into();
-    }
+    let ch = tokio::select! {
+        started = start => match started {
+            Ok(ch) => ch,
+            Err(why) => return why.into(),
+        },
+        _ = closed(inbox) => return "Closed.".into(),
+    };
     let (mut read, write) = ch.split();
     let mut sampler = Sampler::new();
     loop {
@@ -408,6 +420,16 @@ async fn serve(
         }
     }
     "The server stopped reporting its statistics.".into()
+}
+
+/// Waits for the UI to close the channel (or go away), dropping anything
+/// else it sends.
+async fn closed(inbox: &mut mpsc::Receiver<Message>) {
+    while let Some(msg) = inbox.recv().await {
+        if matches!(msg, Message::Close { .. }) {
+            return;
+        }
+    }
 }
 
 #[cfg(test)]
