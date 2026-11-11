@@ -264,3 +264,16 @@ fn clearing_the_pattern_drops_the_stop_and_its_selection() {
     assert!(!t.stopped());
     assert_eq!(t.selection_text(), None);
 }
+
+#[test]
+fn a_selection_made_while_stopped_stays() {
+    let mut t = Terminal::new(40, 5, &Settings::new(100));
+    t.set_stop_pattern(Some("boom")).unwrap();
+    t.feed(b"line a\r\nboom\r\n");
+    assert!(t.stopped());
+    t.select_start(0, 1, false, ferossh_term::SelectionKind::Line);
+    let picked = t.selection_text();
+    assert!(picked.is_some());
+    t.set_stop_pattern(None).unwrap();
+    assert_eq!(t.selection_text(), picked);
+}

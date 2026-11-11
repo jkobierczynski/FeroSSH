@@ -172,6 +172,8 @@ pub struct Terminal {
     /// Following the output stopped at a match: the view holds still
     /// until it is scrolled to the bottom or the user types.
     stopped: bool,
+    /// Whether the selection is still the match a stop selected.
+    stop_selected: bool,
     scroll_scan: ScrollScan,
     cwd: CwdScanner,
     /// Working directories reported since the last `take_actions`.
@@ -216,6 +218,7 @@ impl Terminal {
             stop: None,
             scrolled: 0,
             stopped: false,
+            stop_selected: false,
             scroll_scan: ScrollScan::default(),
             cwd: CwdScanner::default(),
             reported: Vec::new(),
@@ -297,10 +300,12 @@ impl Terminal {
                 last_hit: None,
             }
         });
-        if self.stopped {
-            // The match selected when it stopped goes with the stop.
+        if self.stopped && self.stop_selected {
+            // The match selected when it stopped goes with the stop; a
+            // selection made since stays.
             self.term.selection = None;
         }
+        self.stop_selected = false;
         self.stopped = false;
         self.rescan_from_cursor();
     }
@@ -624,6 +629,7 @@ impl Terminal {
         );
         sel.update(Point::new(line, Column(end)), Side::Right);
         self.term.selection = Some(sel);
+        self.stop_selected = true;
         self.centre_line(line);
     }
 
@@ -770,7 +776,10 @@ impl Terminal {
     fn follow_at_bottom(&mut self, up: bool) {
         if !up && self.display_offset() == 0 && self.stopped {
             self.stopped = false;
-            self.term.selection = None;
+            if self.stop_selected {
+                self.term.selection = None;
+            }
+            self.stop_selected = false;
             // The line stopped at may still be the cursor's: it is not
             // stopped at again.
             let hit = self.stop.as_ref().and_then(|s| s.last_hit);
@@ -848,6 +857,7 @@ impl Terminal {
         let side = if right_half { Side::Right } else { Side::Left };
         let point = self.grid_point(col, row);
         self.term.selection = Some(Selection::new(ty, point, side));
+        self.stop_selected = false;
     }
 
     pub fn select_update(&mut self, col: usize, row: usize, right_half: bool) {
@@ -860,6 +870,7 @@ impl Terminal {
 
     pub fn select_clear(&mut self) {
         self.term.selection = None;
+        self.stop_selected = false;
     }
 
     pub fn has_selection(&self) -> bool {
@@ -1110,6 +1121,7 @@ impl Terminal {
             .as_mut()
             .and_then(|regex| self.term.search_next(regex, origin, direction, side, None));
         search.found = found.clone();
+        self.stop_selected = false;
         match found {
             Some(m) => {
                 let mut sel = Selection::new(SelectionType::Simple, *m.start(), Side::Left);
