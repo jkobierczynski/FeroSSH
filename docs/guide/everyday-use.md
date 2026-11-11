@@ -489,6 +489,12 @@ There are forty-two themes, in three columns of Settings > Theme. The dark ones 
 
 The window around the panes (the menu bar and its menus, the title bar, the tab strip, the tools rail and the tools pane: Connection manager, Session manager, the connection form, File transfer, Port forwards, Scripts) has Windows' light look unless you pick something else in Settings > Window colours: the focused pane's colours (dark for a dark theme, red for Production), Windows' own light or dark mode, or a neutral dark grey. Dark menus, buttons and scroll bars need Windows 10 version 1903 or later; the title bar takes the theme's colour on Windows 11.
 
+## Server status bar
+
+Settings > Server status bar adds one quiet row under the panes with the load of the server the focused pane is logged in to: CPU, memory in use, how full the root file system is, and network traffic in and out (every interface but loopback). A figure at 90% or more turns amber. It is off unless you turn it on.
+
+While it is on, FeroSSH runs one small read-only command per server on a channel of its own (no terminal, nothing in your shell's history): every 2 seconds it reads `/proc/stat`, `/proc/meminfo`, `/proc/net/dev` and `/proc/uptime` and runs `df -kP /`. The sandboxed worker reads that output and passes on only the numbers. Linux servers show everything; a server without `/proc` (macOS, the BSDs) shows only its disk, and one that cannot run `sh` (a Windows server, an SFTP-only account) says it does not report its load. Turning the bar off stops the command on every server.
+
 ## Selecting, copying and scrollback
 
 | To | Do |

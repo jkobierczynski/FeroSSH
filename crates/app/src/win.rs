@@ -36,7 +36,8 @@ use ferossh_config::{
 };
 use ferossh_forward::x11::{Display, find_cookie, xauth_entries};
 use ferossh_ipc::{
-    ChannelId, DirEntry, FORWARD_IDS, Message, MoshOptions, MoshPredict, SftpReply, X11Auth,
+    ChannelId, DirEntry, FORWARD_IDS, Message, MoshOptions, MoshPredict, ServerStats, SftpReply,
+    X11Auth,
 };
 use ferossh_render::{
     CellMetrics, Cursor, FontSpec, Frame, Grid, PaneView, PixelRect, Renderer, Rgb, Theme,
@@ -153,6 +154,7 @@ use crate::sessions::{HostItem, SessionList, SideAction, SideKey};
 use crate::snippets_view::{self, SnipAction, SnippetsView, Vars};
 use crate::ssh::{Effect, Env, ProxyCommand, SshSession, State, Target};
 use crate::standby::{self, Capture, Picked, Standby, Toggle};
+use crate::statusbar;
 use crate::tabstrip::{self, Forwarding, Health, Hit, Palette, StripLayout, TabLabel};
 use crate::telnet::{TelnetSession, TelnetTarget};
 use crate::tmux::{self, Mode as TmuxMode, Tmux};
@@ -190,6 +192,8 @@ const CHROME_PT: f32 = 10.5;
 const STRIP_PT: f32 = 10.5;
 /// Space above and below the tab titles, in DIPs.
 const STRIP_PAD_DIP: i32 = 6;
+/// Space above and below the server status bar's text.
+const STATUS_PAD_DIP: i32 = 3;
 /// The line over the active tab, in DIPs.
 const ACCENT_DIP: i32 = 2;
 /// How far Alt+Shift+arrow moves a divider.
@@ -376,6 +380,8 @@ mod cmd {
     pub const FULL_SCREEN_KEY: u32 = 219;
     /// Plus the index into `WindowColours::ALL`.
     pub const WINDOW_COLOURS: u32 = 220;
+    /// Settings > Server status bar.
+    pub const STATUS_BAR: u32 = 230;
     /// Plus the index into `FONT_CHOICES`.
     pub const FONT: u32 = 300;
     /// Plus the index into `Theme::builtin()`.
@@ -808,6 +814,8 @@ struct Areas {
     side_width: i32,
     side_edge: Option<Rect>,
     strip: Option<Rect>,
+    /// The server status bar, under the panes.
+    status: Option<Rect>,
     panes: Rect,
 }
 
@@ -823,6 +831,8 @@ struct Window {
     areas: Areas,
     strip_grid: Grid,
     strip_layout: StripLayout,
+    /// The server status bar's one row.
+    status_grid: Grid,
     side: Side,
     chrome_font: FontSpec,
     chrome_metrics: CellMetrics,
@@ -930,6 +940,9 @@ struct Window {
     vdesks: HashMap<ChannelId, VirtualDesk>,
     /// Session > Copy public key to this server, by its exec channel.
     key_copies: HashMap<ChannelId, KeyCopy>,
+    /// The server status bar's samples, by their channel: one per
+    /// connection shown while the bar is on.
+    stats: HashMap<ChannelId, StatsFeed>,
     /// Closed WinRM sessions whose worker is still ending the shell on
     /// the server, by channel.
     winrm_closing: HashMap<ChannelId, WinrmCloser>,
@@ -1089,6 +1102,14 @@ struct TabWant {
     size: Option<(u16, u16)>,
     /// The connection's limit on the clipboard: to and from the host.
     clip_limit: (bool, bool),
+}
+
+/// The server status bar's samples of one connection's server.
+struct StatsFeed {
+    connection: ChannelId,
+    latest: Option<ServerStats>,
+    /// The worker stopped sampling: the server cannot run the command.
+    ended: bool,
 }
 
 /// Session > Copy public key to this server: [`copy_id::command`] on an
@@ -1660,6 +1681,7 @@ fn create_and_run(launch: Launch, theme: Option<String>) -> Result<()> {
                 areas: Areas::default(),
                 strip_grid: Grid::new(1, 1),
                 strip_layout: StripLayout::default(),
+                status_grid: Grid::new(1, 1),
                 side: Side {
                     visible: false,
                     view: SideView::Sessions,
@@ -1725,6 +1747,7 @@ fn create_and_run(launch: Launch, theme: Option<String>) -> Result<()> {
                 desktops: HashMap::new(),
                 vdesks: HashMap::new(),
                 key_copies: HashMap::new(),
+                stats: HashMap::new(),
                 winrm_closing: HashMap::new(),
                 keygen: None,
                 app_pane: None,
@@ -2107,6 +2130,7 @@ fn build_menu() -> Result<HMENU> {
         item(view, cmd::TOOLS_RAIL, "Tools ra&il")?;
         item(view, cmd::TOOLS_PIN, "&Keep tools open")?;
         item(view, cmd::TAB_STRIP, "Ta&b strip")?;
+        item(view, cmd::STATUS_BAR, "Server stat&us bar")?;
         separator(view)?;
         item(view, cmd::ZOOM_IN, "&Larger text\tCtrl+=")?;
         item(view, cmd::ZOOM_OUT, "&Smaller text\tCtrl+-")?;
@@ -3457,6 +3481,8 @@ impl Window {
         let workers = &self.workers;
         self.sftp_routes.retain(|_, c| workers.contains_key(c));
         self.via.retain(|c, _| workers.contains_key(c));
+        self.stats
+            .retain(|_, f| workers.contains_key(&f.connection));
         // SAFETY: our window and timer.
         unsafe {
             SetTimer(
@@ -3803,6 +3829,101 @@ impl Window {
             },
         );
         None
+    }
+
+    /// Keeps the server status bar's samples to what it shows: one feed
+    /// for the focused pane's connection while the bar is on (feeds
+    /// opened for other connections run on, so switching back shows
+    /// figures at once), none while it is off.
+    fn sync_stats(&mut self) {
+        if !self.settings.status_bar {
+            for (channel, feed) in std::mem::take(&mut self.stats) {
+                if let Some(w) = self.workers.get(&feed.connection) {
+                    w.link.send(Message::Close { channel });
+                }
+            }
+            return;
+        }
+        let Some(connection) = self.pane_connection(self.focused_id()) else {
+            return;
+        };
+        if self.stats.values().any(|f| f.connection == connection) {
+            return;
+        }
+        let channel = self.new_channel();
+        let Some(w) = self.workers.get(&connection) else {
+            return;
+        };
+        w.link.send(Message::StatsOpen {
+            channel,
+            connection,
+            interval: statusbar::INTERVAL,
+        });
+        self.stats.insert(
+            channel,
+            StatsFeed {
+                connection,
+                latest: None,
+                ended: false,
+            },
+        );
+    }
+
+    /// What the server status bar shows for the focused pane.
+    fn status_shown(&self) -> statusbar::Shown {
+        let pane = self.focused_id();
+        let (Some(connection), Some(host)) = (self.pane_connection(pane), self.key_host(pane))
+        else {
+            return statusbar::Shown::NoServer;
+        };
+        match self.stats.values().find(|f| f.connection == connection) {
+            Some(StatsFeed { ended: true, .. }) => statusbar::Shown::Unavailable { host },
+            Some(StatsFeed {
+                latest: Some(stats),
+                ..
+            }) => statusbar::Shown::Stats {
+                host,
+                stats: *stats,
+            },
+            _ => statusbar::Shown::Waiting { host },
+        }
+    }
+
+    /// Redraws the server status bar, opening the focused pane's samples
+    /// first if need be.
+    fn refresh_status(&mut self) {
+        self.sync_stats();
+        let Some(area) = self.areas.status else {
+            return;
+        };
+        let shown = self.status_shown();
+        let palette = self.strip_palette();
+        statusbar::draw(&mut self.status_grid, &shown, &palette);
+        // SAFETY: valid window and rect.
+        unsafe {
+            let _ = InvalidateRect(Some(self.hwnd), Some(&win_rect(area)), false);
+        }
+    }
+
+    /// A sample for the server status bar, or the end of its samples.
+    fn on_stats(&mut self, channel: ChannelId, msg: Message) {
+        let Some(feed) = self.stats.get_mut(&channel) else {
+            return;
+        };
+        match msg {
+            Message::Stats { stats, .. } => feed.latest = Some(stats),
+            // Not opened again until the connection is: a server that
+            // cannot report would only fail again.
+            Message::Disconnected { .. } => feed.ended = true,
+            _ => return,
+        }
+        let connection = feed.connection;
+        let shown = self
+            .pane_connection(self.focused_id())
+            .is_some_and(|c| c == connection);
+        if shown {
+            self.refresh_status();
+        }
     }
 
     /// What the key copy's command said, or that it ended.
@@ -7161,6 +7282,14 @@ impl Window {
                     return false;
                 }
                 if self
+                    .stats
+                    .get(&c)
+                    .is_some_and(|f| f.connection == connection)
+                {
+                    self.on_stats(c, msg);
+                    return false;
+                }
+                if self
                     .winrm_closing
                     .get(&c)
                     .is_some_and(|w| w.connection() == connection)
@@ -7224,6 +7353,7 @@ impl Window {
                     }
                 }
                 self.vdesks.retain(|_, v| v.connection != connection);
+                self.stats.retain(|_, f| f.connection != connection);
                 let lost: Vec<ChannelId> = self
                     .key_copies
                     .iter()
@@ -7787,6 +7917,7 @@ impl Window {
         ui_theme::apply(self.hwnd, self.ui_colours());
         rail::set_look(self.rail_look());
         self.sync_conn_view();
+        self.refresh_status();
         let palette = self.chrome_palette();
         if let Some(strip) = self.areas.strip {
             let palette = self.strip_palette();
@@ -7903,6 +8034,12 @@ impl Window {
         areas.side_width = parts.width;
         areas.side_edge = parts.edge.filter(|e| e.w > 0);
         let mut main = parts.main;
+        if self.settings.status_bar {
+            let sh = self.strip_metrics.height as i32 + 2 * scale(STATUS_PAD_DIP, self.dpi);
+            let sh = sh.min(main.h);
+            areas.status = Some(Rect::new(main.x, main.y + main.h - sh, main.w, sh));
+            main = Rect::new(main.x, main.y, main.w, main.h - sh);
+        }
         if self.settings.tab_strip && self.ws.tabs.len() >= 2 {
             let sh = self.strip_metrics.height as i32 + 2 * scale(STRIP_PAD_DIP, self.dpi);
             areas.strip = Some(Rect::new(main.x, main.y, main.w, sh));
@@ -7954,6 +8091,11 @@ impl Window {
             let cols = ((s.w - 2 * cpad).max(0) / self.strip_metrics.width.max(1) as i32).max(1);
             self.strip_grid.resize(cols as usize, 1);
             self.strip_grid.mark_all_dirty();
+        }
+        if let Some(s) = self.areas.status {
+            let cols = ((s.w - 2 * cpad).max(0) / self.strip_metrics.width.max(1) as i32).max(1);
+            self.status_grid.resize(cols as usize, 1);
+            self.status_grid.mark_all_dirty();
         }
         if let Some(s) = self.areas.side {
             // Laid out for its whole width, covered or not, so covering
@@ -8196,7 +8338,7 @@ impl Window {
                 }
             }
         }
-        let in_chrome = [self.areas.strip, self.areas.side]
+        let in_chrome = [self.areas.strip, self.areas.side, self.areas.status]
             .into_iter()
             .flatten()
             .any(|r| {
@@ -8243,6 +8385,18 @@ impl Window {
                 image: None,
             });
         }
+        if let Some(s) = self.areas.status {
+            views.push(PaneView {
+                grid: &self.status_grid,
+                font: &self.strip_font,
+                theme: &strip_theme,
+                rect: pixel(s),
+                origin: (s.x + cpad, s.y + scale(STATUS_PAD_DIP, self.dpi)),
+                cursor: None,
+                full: true,
+                image: None,
+            });
+        }
         if let Some(s) = self.areas.side {
             views.push(PaneView {
                 grid: &self.side.grid,
@@ -8268,6 +8422,7 @@ impl Window {
                     }
                 }
                 self.strip_grid.clear_dirty();
+                self.status_grid.clear_dirty();
                 self.side.grid.clear_dirty();
                 self.full_redraw = false;
             }
@@ -11906,6 +12061,14 @@ impl Window {
                 self.update_menu_checks();
                 self.layout();
             }
+            cmd::STATUS_BAR => {
+                self.settings.status_bar = !self.settings.status_bar;
+                self.save_settings();
+                self.update_menu_checks();
+                self.layout();
+                self.refresh_status();
+                self.request_full_redraw();
+            }
             cmd::SAVE_LOOK => return Some(Command::SaveLook),
             cmd::START_DIR => return self.start_dir_here(pane),
             cmd::UPLOAD => {
@@ -12297,6 +12460,7 @@ impl Window {
                 (cmd::TOOLS_RAIL, s.tools_rail),
                 (cmd::TOOLS_PIN, s.tools_pinned),
                 (cmd::TAB_STRIP, s.tab_strip),
+                (cmd::STATUS_BAR, s.status_bar),
                 (cmd::TMUX_LAYOUT, own_layout),
                 (cmd::BROADCAST_TAB, self.broadcast == broadcast::Scope::Tab),
                 (cmd::BROADCAST_ALL, self.broadcast == broadcast::Scope::All),

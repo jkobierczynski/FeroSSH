@@ -1649,3 +1649,54 @@ async fn mosh_session_after_an_ssh_login() {
         "{cipher}"
     );
 }
+
+#[cfg(unix)]
+#[tokio::test]
+async fn samples_the_servers_load_for_the_status_bar() {
+    if !available() {
+        return;
+    }
+    let server = start("stats", "");
+    let (to_worker, mut from_worker) = login(&server).await;
+    to_worker
+        .send(Message::StatsOpen {
+            channel: 9,
+            connection: 1,
+            interval: 1,
+        })
+        .await
+        .unwrap();
+    // The first sample has memory and disk; the second, compared with
+    // it, CPU and network too.
+    let mut samples = Vec::new();
+    while samples.len() < 2 {
+        let msg = tokio::time::timeout(Duration::from_secs(30), from_worker.recv())
+            .await
+            .expect("timed out")
+            .expect("worker hung up");
+        match msg {
+            Message::Stats { channel: 9, stats } => samples.push(stats),
+            Message::Disconnected { channel: 9, reason } => panic!("{reason}"),
+            _ => {}
+        }
+    }
+    let (first, second) = (samples[0], samples[1]);
+    let (used, all) = first.mem.expect("memory");
+    assert!(all > 0 && used <= all);
+    let (used, size) = first.disk.expect("disk");
+    assert!(size > 0 && used <= size);
+    assert_eq!((first.cpu, first.net), (None, None));
+    assert!(second.cpu.is_some_and(|c| c <= 1000), "{second:?}");
+    assert!(second.net.is_some(), "{second:?}");
+
+    to_worker.send(Message::Close { channel: 9 }).await.unwrap();
+    loop {
+        let msg = tokio::time::timeout(Duration::from_secs(30), from_worker.recv())
+            .await
+            .expect("timed out")
+            .expect("worker hung up");
+        if let Message::Disconnected { channel: 9, .. } = msg {
+            break;
+        }
+    }
+}

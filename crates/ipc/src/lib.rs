@@ -46,7 +46,7 @@ use std::fmt;
 use zeroize::Zeroize;
 
 /// Protocol version carried in every frame. Bump on any wire change.
-pub const PROTOCOL_VERSION: u8 = 21;
+pub const PROTOCOL_VERSION: u8 = 22;
 
 /// Largest frame body accepted, in bytes. Terminal and SFTP data is chunked
 /// below this, so anything larger is a bug or an attack.
@@ -490,6 +490,30 @@ pub struct ZmodemUpload {
     pub mtime: u64,
 }
 
+/// One sample of a server's load, for the status bar
+/// ([`Message::Stats`]). A field is `None` when the server does not say
+/// (no `/proc`, no `df`), or for the CPU and network until the second
+/// sample gives something to compare with.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ServerStats {
+    /// CPU busy since the last sample, all cores together, in tenths of a
+    /// percent: 0 to [`ServerStats::CPU_FULL`].
+    pub cpu: Option<u16>,
+    /// Memory in use (what is not available to programs) and in all, in
+    /// KiB; in use is never more than all.
+    pub mem: Option<(u64, u64)>,
+    /// The root file system: used and size, in KiB; used is never more
+    /// than size.
+    pub disk: Option<(u64, u64)>,
+    /// Bytes per second received and sent, every interface but loopback.
+    pub net: Option<(u64, u64)>,
+}
+
+impl ServerStats {
+    /// [`ServerStats::cpu`] of a server whose every core is busy.
+    pub const CPU_FULL: u16 = 1000;
+}
+
 /// A message on the UI/worker pipe.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Message {
@@ -876,6 +900,24 @@ pub enum Message {
         agent: ChannelId,
         signature: Vec<u8>,
     },
+
+    // The server status bar.
+    /// UI to worker: sample the load of the server `connection` is logged
+    /// in to every `interval` seconds (1 or more), on a channel of its own
+    /// running a fixed read-only command of the worker's (it reads
+    /// `/proc` and runs `df`). The worker reads the output itself and
+    /// sends only [`Message::Stats`], then [`Message::Disconnected`] when
+    /// the command ends; [`Message::Close`] stops it.
+    StatsOpen {
+        channel: ChannelId,
+        connection: ChannelId,
+        interval: u16,
+    },
+    /// Worker to UI: the latest sample for a [`Message::StatsOpen`].
+    Stats {
+        channel: ChannelId,
+        stats: ServerStats,
+    },
 }
 
 impl Message {
@@ -920,6 +962,8 @@ impl Message {
             Message::AgentSign { .. } => 36,
             Message::AgentKeys { .. } => 37,
             Message::AgentSigned { .. } => 38,
+            Message::StatsOpen { .. } => 70,
+            Message::Stats { .. } => 71,
             Message::GssapiStep { .. } => 50,
             Message::GssapiReply { .. } => 51,
             Message::ProxyAuth { .. } => 52,
@@ -970,6 +1014,7 @@ impl Message {
             | Message::ZmodemCancel { .. }
             | Message::AgentKeys { .. }
             | Message::AgentSigned { .. }
+            | Message::StatsOpen { .. }
             | Message::GssapiReply { .. } => Side::Ui,
             Message::HostKey { .. }
             | Message::ProxyAuth { .. }
@@ -998,6 +1043,7 @@ impl Message {
             | Message::AgentList { .. }
             | Message::AgentSign { .. }
             | Message::GssapiStep { .. }
+            | Message::Stats { .. }
             | Message::SspiRequest { .. } => Side::Worker,
         }
     }
@@ -1058,6 +1104,8 @@ impl Message {
             | Message::AgentSign { channel, .. }
             | Message::AgentKeys { channel, .. }
             | Message::AgentSigned { channel, .. }
+            | Message::StatsOpen { channel, .. }
+            | Message::Stats { channel, .. }
             | Message::GssapiStep { channel, .. }
             | Message::GssapiReply { channel, .. } => *channel,
         })
@@ -1639,6 +1687,26 @@ pub fn encode(msg: &Message, out: &mut Vec<u8>) -> Result<(), Error> {
             w.u32(*agent);
             w.bytes(signature);
         }
+        Message::StatsOpen {
+            channel,
+            connection,
+            interval,
+        } => {
+            w.u32(*channel);
+            w.u32(*connection);
+            w.u16(*interval);
+        }
+        Message::Stats { channel, stats } => {
+            w.u32(*channel);
+            w.opt(stats.cpu, Writer::u16);
+            let pair = |w: &mut Writer, (a, b): (u64, u64)| {
+                w.u64(a);
+                w.u64(b);
+            };
+            w.opt(stats.mem, pair);
+            w.opt(stats.disk, pair);
+            w.opt(stats.net, pair);
+        }
         Message::GssapiStep {
             channel,
             first,
@@ -2051,6 +2119,41 @@ fn decode_body(body: &[u8]) -> Result<Message, Error> {
             agent: r.u32()?,
             signature: r.path()?,
         },
+        70 => Message::StatsOpen {
+            channel: r.u32()?,
+            connection: r.u32()?,
+            interval: match r.u16()? {
+                0 => return Err(Error::Invalid),
+                n => n,
+            },
+        },
+        71 => {
+            let channel = r.u32()?;
+            let cpu = r.opt(Reader::u16)?;
+            if cpu.is_some_and(|c| c > ServerStats::CPU_FULL) {
+                return Err(Error::Invalid);
+            }
+            // A part of a whole: never more than the whole.
+            let part = |r: &mut Reader<'_>| {
+                let (used, all) = (r.u64()?, r.u64()?);
+                if used > all {
+                    return Err(Error::Invalid);
+                }
+                Ok((used, all))
+            };
+            let mem = r.opt(part)?;
+            let disk = r.opt(part)?;
+            let net = r.opt(|r| Ok((r.u64()?, r.u64()?)))?;
+            Message::Stats {
+                channel,
+                stats: ServerStats {
+                    cpu,
+                    mem,
+                    disk,
+                    net,
+                },
+            }
+        }
         50 => Message::GssapiStep {
             channel: r.u32()?,
             first: r.bool()?,
@@ -2684,6 +2787,24 @@ mod tests {
                 agent: WORKER_IDS + 1,
                 signature: Vec::new(),
             },
+            Message::StatsOpen {
+                channel: 7,
+                connection: 1,
+                interval: 2,
+            },
+            Message::Stats {
+                channel: 7,
+                stats: ServerStats {
+                    cpu: Some(ServerStats::CPU_FULL),
+                    mem: Some((3 << 20, 8 << 20)),
+                    disk: None,
+                    net: Some((u64::MAX, 0)),
+                },
+            },
+            Message::Stats {
+                channel: 7,
+                stats: ServerStats::default(),
+            },
             Message::GssapiStep {
                 channel: 1,
                 first: true,
@@ -3094,8 +3215,12 @@ mod tests {
         tags.sort_unstable();
         tags.dedup();
         // ZMODEM starts at 40, leaving room below; Kerberos at 50, the
-        // proxy's verdict at 52, WinRM at 60.
-        let want: Vec<u8> = (0..=38).chain(40..=52).chain(60..=62).collect();
+        // proxy's verdict at 52, WinRM at 60, server stats at 70.
+        let want: Vec<u8> = (0..=38)
+            .chain(40..=52)
+            .chain(60..=62)
+            .chain(70..=71)
+            .collect();
         assert_eq!(tags, want);
     }
 
@@ -3169,6 +3294,29 @@ mod tests {
             dec.feed(&(body.len() as u32).to_le_bytes());
             dec.feed(body);
             assert_eq!(dec.next_message(), Err(want), "{body:?}");
+        }
+    }
+
+    #[test]
+    fn rejects_impossible_stats() {
+        let v = PROTOCOL_VERSION;
+        let mut used_over_all = vec![v, 71, 7, 0, 0, 0, 0, 1];
+        used_over_all.extend_from_slice(&9u64.to_le_bytes());
+        used_over_all.extend_from_slice(&8u64.to_le_bytes());
+        used_over_all.extend_from_slice(&[0, 0]);
+        let cases: [&[u8]; 3] = [
+            // Sampled every 0 seconds.
+            &[v, 70, 7, 0, 0, 0, 1, 0, 0, 0, 0, 0],
+            // CPU at 100.1%.
+            &[v, 71, 7, 0, 0, 0, 1, 0xe9, 0x03, 0, 0, 0],
+            // More memory in use than there is.
+            &used_over_all,
+        ];
+        for body in cases {
+            let mut dec = Decoder::new();
+            dec.feed(&(body.len() as u32).to_le_bytes());
+            dec.feed(body);
+            assert_eq!(dec.next_message(), Err(Error::Invalid), "{body:?}");
         }
     }
 
