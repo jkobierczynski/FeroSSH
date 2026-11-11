@@ -1,19 +1,21 @@
 //! The terminal state Mosh synchronises: a screen of cells and the modes
-//! that show, as `mosh-server`'s emulator keeps them.
+//! that show.
 //!
 //! The server sends each new state as terminal output that turns an older
 //! state's screen into the new one. That older state need not be the one
 //! on show here (the server may not have heard our acknowledgement yet),
 //! so the worker keeps the screens of the states the server may still
 //! refer to and applies each diff to the right one: [`Screen::apply`]
-//! interprets the output the way Mosh's emulator does. [`Screen::render`]
-//! then writes the output that turns the pane's terminal from what it
-//! shows into a new screen, as Mosh's client does for a real terminal.
+//! reads the output with the `vte` parser into a small VT100-style
+//! screen. [`render`] then writes the output that turns the pane's
+//! terminal from what it shows into a new screen.
 //!
-//! The emulator follows Mosh's for everything the server's renderer
-//! writes (text, cursor moves, erasing, scrolling regions, renditions,
-//! modes, titles, hyperlinks) and the usual VT100 controls besides. Input
-//! is hostile: sizes are capped, and nothing panics or grows unbounded.
+//! The screen handles everything the server writes (text, wide and
+//! combining characters, cursor moves, erasing, scrolling regions,
+//! renditions, modes, titles, hyperlinks, the clipboard) and the usual
+//! VT100 controls besides; tests against a real `mosh-server` check that
+//! it reads output as the server does. Input is hostile: sizes are
+//! capped, and nothing panics or grows unbounded.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -28,8 +30,6 @@ const CELL_TEXT: usize = 32;
 const TITLE: usize = 256;
 /// Bytes kept of an OSC string (a clipboard copy).
 const OSC_MAX: usize = 16 * 1024;
-/// Parameters kept of a control sequence.
-const PARAMS: usize = 16;
 
 /// A colour: the terminal's default, one of 256, or 24-bit.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -188,7 +188,7 @@ fn next_gen() -> u64 {
 }
 
 /// A row of cells. Rows made at different times differ even when blank,
-/// as in Mosh, so a cleared row is never mistaken for a scrolled one.
+/// so a cleared row is never mistaken for a scrolled one.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Row {
     pub cells: Vec<Cell>,
@@ -232,13 +232,26 @@ pub struct Mouse {
     pub alternate_scroll: bool,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+/// What ESC 7 keeps for ESC 8.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Saved {
-    col: usize,
     row: usize,
+    col: usize,
     rend: Rendition,
     autowrap: bool,
     origin: bool,
+}
+
+impl Default for Saved {
+    fn default() -> Self {
+        Self {
+            row: 0,
+            col: 0,
+            rend: Rendition::default(),
+            autowrap: true,
+            origin: false,
+        }
+    }
 }
 
 /// The cursor and the modes that go with the screen.
@@ -248,13 +261,18 @@ pub struct DrawState {
     pub height: usize,
     pub cursor_col: usize,
     pub cursor_row: usize,
-    combining: Option<(usize, usize)>,
+    /// The cell a combining character joins: the one printed last, or
+    /// the one under the cursor once the cursor has been moved.
+    glyph: Option<(usize, usize)>,
+    /// The scrolling region's first and last rows.
     top: usize,
     bottom: usize,
     pub rend: Rendition,
     pub link: Link,
     saved: Saved,
-    next_print_wraps: bool,
+    /// The last column was just written: the next character goes to the
+    /// start of the next line (with autowrap on).
+    wrap_pending: bool,
     origin: bool,
     autowrap: bool,
     insert: bool,
@@ -272,16 +290,13 @@ impl DrawState {
             height,
             cursor_col: 0,
             cursor_row: 0,
-            combining: Some((0, 0)),
+            glyph: Some((0, 0)),
             top: 0,
             bottom: height - 1,
             rend: Rendition::default(),
             link: None,
-            saved: Saved {
-                autowrap: true,
-                ..Saved::default()
-            },
-            next_print_wraps: false,
+            saved: Saved::default(),
+            wrap_pending: false,
             origin: false,
             autowrap: true,
             insert: false,
@@ -293,65 +308,57 @@ impl DrawState {
         }
     }
 
-    fn limit_top(&self) -> usize {
-        if self.origin { self.top } else { 0 }
-    }
-
-    fn limit_bottom(&self) -> usize {
+    /// The rows the cursor may go to: the region in origin mode, else
+    /// the whole screen.
+    fn reach(&self) -> (usize, usize) {
         if self.origin {
-            self.bottom
+            (self.top, self.bottom)
         } else {
-            self.height - 1
+            (0, self.height - 1)
         }
     }
 
-    fn snap(&mut self, row: i64, col: i64) {
-        let row = row.clamp(self.limit_top() as i64, self.limit_bottom() as i64);
-        self.cursor_row = row as usize;
+    fn in_region(&self) -> bool {
+        (self.top..=self.bottom).contains(&self.cursor_row)
+    }
+
+    /// Puts the cursor at `row`, `col` (screen coordinates), kept within
+    /// reach. A moved cursor no longer waits to wrap, and a combining
+    /// character now joins the cell under it.
+    fn place(&mut self, row: i64, col: i64) {
+        let (lo, hi) = self.reach();
+        self.cursor_row = row.clamp(lo as i64, hi as i64) as usize;
         self.cursor_col = col.clamp(0, self.width as i64 - 1) as usize;
+        self.glyph = Some((self.cursor_row, self.cursor_col));
+        self.wrap_pending = false;
     }
 
-    fn new_grapheme(&mut self) {
-        self.combining = Some((self.cursor_row, self.cursor_col));
+    fn step(&mut self, rows: i64, cols: i64) {
+        self.place(self.cursor_row as i64 + rows, self.cursor_col as i64 + cols);
     }
 
-    fn move_row(&mut self, n: i64, relative: bool) {
-        let row = if relative {
-            self.cursor_row as i64 + n
-        } else {
-            n + self.limit_top() as i64
-        };
-        self.snap(row, self.cursor_col as i64);
-        self.new_grapheme();
-        self.next_print_wraps = false;
+    /// Row `n` counted from the top of reach (the region in origin mode).
+    fn row_at(&mut self, n: i64) {
+        let top = self.reach().0 as i64;
+        self.place(top + n, self.cursor_col as i64);
     }
 
-    fn move_col(&mut self, n: i64, relative: bool, implicit: bool) {
-        if implicit {
-            self.new_grapheme();
-        }
-        let col = if relative {
-            self.cursor_col as i64 + n
-        } else {
-            n
-        };
-        if implicit {
-            self.next_print_wraps = col >= self.width as i64;
-        }
-        self.snap(self.cursor_row as i64, col);
-        if !implicit {
-            self.new_grapheme();
-            self.next_print_wraps = false;
-        }
+    fn col_at(&mut self, n: i64) {
+        self.place(self.cursor_row as i64, n);
     }
 
-    fn set_region(&mut self, top: usize, bottom: usize) {
-        self.top = top.min(self.height - 1);
-        self.bottom = bottom.min(self.height - 1).max(self.top);
-        if self.origin {
-            self.snap(self.cursor_row as i64, self.cursor_col as i64);
-            self.new_grapheme();
-        }
+    fn home(&mut self) {
+        self.row_at(0);
+        self.col_at(0);
+    }
+
+    /// Moves past a character of `cells` columns just written at the
+    /// cursor; past the last column it waits there to wrap.
+    fn advance(&mut self, cells: usize) {
+        self.glyph = Some((self.cursor_row, self.cursor_col));
+        let col = self.cursor_col + cells;
+        self.wrap_pending = col >= self.width;
+        self.cursor_col = col.min(self.width - 1);
     }
 }
 
@@ -365,34 +372,6 @@ pub struct Screen {
     pub title_set: bool,
     pub clipboard: String,
     pub bells: u32,
-    parser: Parser,
-}
-
-/// Where the escape-sequence parser is.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
-enum State {
-    #[default]
-    Ground,
-    Escape,
-    EscapeIntermediate,
-    Csi,
-    CsiIgnore,
-    Osc,
-    OscEscape,
-    /// A DCS, SOS, PM or APC string: skipped up to its end.
-    Skip,
-    SkipEscape,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
-struct Parser {
-    state: State,
-    /// UTF-8 bytes of a character still to come.
-    utf8: Vec<u8>,
-    params: Vec<Option<u32>>,
-    current: Option<u32>,
-    collect: Vec<u8>,
-    osc: String,
 }
 
 impl Screen {
@@ -410,7 +389,6 @@ impl Screen {
             title_set: false,
             clipboard: String::new(),
             bells: 0,
-            parser: Parser::default(),
         }
     }
 
@@ -422,14 +400,9 @@ impl Screen {
         self.ds.height
     }
 
-    /// Whether two states look the same (the parser's state aside).
+    /// Whether two states look the same.
     pub fn same_as(&self, other: &Screen) -> bool {
-        self.rows == other.rows
-            && self.ds == other.ds
-            && self.title == other.title
-            && self.icon_name == other.icon_name
-            && self.clipboard == other.clipboard
-            && self.bells == other.bells
+        self == other
     }
 
     pub fn cell(&self, row: usize, col: usize) -> Option<&Cell> {
@@ -448,21 +421,35 @@ impl Screen {
         self.ds.rend.bg
     }
 
-    fn new_row(&self) -> Arc<Row> {
+    fn blank_row(&self) -> Arc<Row> {
         Arc::new(Row::new(self.ds.width, self.bg()))
     }
 
-    fn reset_cell(&mut self, row: usize, col: usize) {
+    /// Blanks columns `cols` of `row` in the current background.
+    fn erase_cells(&mut self, row: usize, cols: std::ops::Range<usize>) {
         let bg = self.bg();
-        if let Some(c) = self.cell_mut(row, col) {
-            *c = Cell::blank(bg);
+        if let Some(r) = self.row_mut(row) {
+            let end = cols.end.min(r.cells.len());
+            for c in r
+                .cells
+                .get_mut(cols.start.min(end)..end)
+                .unwrap_or_default()
+            {
+                *c = Cell::blank(bg);
+            }
         }
     }
 
-    fn reset_row(&mut self, row: usize) {
+    /// Replaces rows `rows` with new blank ones.
+    fn erase_rows(&mut self, rows: std::ops::Range<usize>) {
         let bg = self.bg();
-        if let Some(r) = self.row_mut(row) {
-            r.reset(bg);
+        let end = rows.end.min(self.rows.len());
+        for r in self
+            .rows
+            .get_mut(rows.start.min(end)..end)
+            .unwrap_or_default()
+        {
+            Arc::make_mut(r).reset(bg);
         }
     }
 
@@ -471,373 +458,238 @@ impl Screen {
         let width = width.clamp(1, MAX_SIDE);
         let height = height.clamp(1, MAX_SIDE);
         let (old_w, old_h) = (self.ds.width, self.ds.height);
-        if (old_w, old_h) != (width, height) {
-            self.ds.top = 0;
-            self.ds.bottom = height - 1;
-        }
-        self.ds.width = width;
-        self.ds.height = height;
-        self.ds
-            .snap(self.ds.cursor_row as i64, self.ds.cursor_col as i64);
-        if let Some((r, c)) = self.ds.combining
-            && (c >= width || r >= height)
-        {
-            self.ds.combining = None;
-        }
-        let blank = self.new_row();
-        if old_h != height {
-            self.rows.resize(height, blank.clone());
-        }
-        if old_w == width {
+        if (old_w, old_h) == (width, height) {
             return;
         }
+        let ds = &mut self.ds;
+        ds.width = width;
+        ds.height = height;
+        ds.top = 0;
+        ds.bottom = height - 1;
+        let (lo, hi) = ds.reach();
+        ds.cursor_row = ds.cursor_row.clamp(lo, hi);
+        ds.cursor_col = ds.cursor_col.min(width - 1);
+        ds.glyph = ds.glyph.filter(|&(r, c)| r < height && c < width);
         let bg = self.bg();
-        for row in &mut self.rows {
-            if Arc::ptr_eq(row, &blank) {
-                break;
-            }
-            let r = Arc::make_mut(row);
-            r.set_wrap(false);
-            r.cells.resize(width, Cell::blank(bg));
-        }
-        for row in &mut self.rows {
-            if row.cells.len() != width {
-                Arc::make_mut(row).cells.resize(width, Cell::blank(bg));
+        if old_w != width {
+            // Rows cut or widened no longer wrap.
+            for row in self.rows.iter_mut().take(height) {
+                let r = Arc::make_mut(row);
+                r.set_wrap(false);
+                r.cells.resize(width, Cell::blank(bg));
             }
         }
+        let fresh = self.blank_row();
+        self.rows.resize(height, fresh);
     }
 
+    /// Takes `count` rows out at `at` and puts as many blank ones in at
+    /// `fill`, within the scrolling region (both indexes after removal).
+    fn shift_rows(&mut self, at: usize, count: usize, fill: usize) {
+        let fresh = self.blank_row();
+        self.rows.drain(at..at + count);
+        self.rows
+            .splice(fill..fill, std::iter::repeat_n(fresh, count));
+    }
+
+    /// Scrolls the region up by `n` rows (down when negative).
     fn scroll(&mut self, n: i64) {
-        if n >= 0 {
-            self.delete_lines(self.ds.top, n as usize);
+        let (top, bottom) = (self.ds.top, self.ds.bottom);
+        let count = (n.unsigned_abs() as usize).min(bottom + 1 - top);
+        if count == 0 {
+            return;
+        }
+        if n > 0 {
+            self.shift_rows(top, count, bottom + 1 - count);
         } else {
-            self.insert_lines(self.ds.top, n.unsigned_abs() as usize);
+            self.shift_rows(bottom + 1 - count, count, top);
         }
     }
 
-    fn insert_lines(&mut self, before: usize, count: usize) {
-        if before < self.ds.top || before > self.ds.bottom + 1 {
+    /// Inserts (`n` > 0) or deletes blank rows at the cursor's row, when
+    /// it is in the scrolling region; the rows below move within it.
+    fn insert_delete_rows(&mut self, n: i64) {
+        if !self.ds.in_region() {
             return;
         }
-        let n = count.min(self.ds.bottom + 1 - before);
-        if n == 0 {
-            return;
-        }
-        let end = self.ds.bottom + 1;
-        self.rows.drain(end - n..end);
-        let fresh = self.new_row();
-        for _ in 0..n {
-            self.rows.insert(before, fresh.clone());
+        let (row, bottom) = (self.ds.cursor_row, self.ds.bottom);
+        let count = (n.unsigned_abs() as usize).min(bottom + 1 - row);
+        if n > 0 {
+            self.shift_rows(bottom + 1 - count, count, row);
+        } else {
+            self.shift_rows(row, count, bottom + 1 - count);
         }
     }
 
-    fn delete_lines(&mut self, row: usize, count: usize) {
-        if row < self.ds.top || row > self.ds.bottom {
-            return;
-        }
-        let n = count.min(self.ds.bottom + 1 - row);
-        if n == 0 {
-            return;
-        }
-        self.rows.drain(row..row + n);
-        let fresh = self.new_row();
-        let at = self.ds.bottom + 1 - n;
-        for _ in 0..n {
-            self.rows.insert(at, fresh.clone());
+    /// Moves the cursor a line down (or up): at the region's edge the
+    /// region scrolls instead.
+    fn line_feed(&mut self, down: bool) {
+        let ds = &self.ds;
+        let edge = if down { ds.bottom } else { ds.top };
+        if ds.in_region() && ds.cursor_row == edge {
+            self.scroll(if down { 1 } else { -1 });
+            self.ds.step(0, 0);
+        } else {
+            self.ds.step(if down { 1 } else { -1 }, 0);
         }
     }
 
-    fn move_rows_autoscroll(&mut self, rows: i64) {
-        let row = self.ds.cursor_row as i64;
-        let (top, bottom) = (self.ds.top as i64, self.ds.bottom as i64);
-        if row < top || row > bottom {
-            self.ds.move_row(rows, true);
+    /// Inserts (`n` > 0) or deletes blank cells at the cursor; the rest
+    /// of the row moves right (and off the edge) or left.
+    fn insert_delete_cells(&mut self, n: i64) {
+        let (row, col, bg) = (self.ds.cursor_row, self.ds.cursor_col, self.bg());
+        let Some(r) = self.row_mut(row) else {
             return;
+        };
+        let Some(tail) = r.cells.get_mut(col..) else {
+            return;
+        };
+        let count = (n.unsigned_abs() as usize).min(tail.len());
+        if n > 0 {
+            tail.rotate_right(count);
+            tail.iter_mut()
+                .take(count)
+                .for_each(|c| *c = Cell::blank(bg));
+        } else {
+            tail.rotate_left(count);
+            tail.iter_mut()
+                .rev()
+                .take(count)
+                .for_each(|c| *c = Cell::blank(bg));
         }
-        if row + rows > bottom {
-            let n = row + rows - bottom;
-            self.scroll(n);
-            self.ds.move_row(-n, true);
-        } else if row + rows < top {
-            let n = row + rows - top;
-            self.scroll(n);
-            self.ds.move_row(-n, true);
-        }
-        self.ds.move_row(rows, true);
     }
 
-    /// Interprets terminal output, as the server's diffs hold.
+    /// Interprets one instruction's terminal output: the server's diff
+    /// from an older state to a new one, always whole sequences.
     pub fn apply(&mut self, bytes: &[u8]) {
-        for &b in bytes {
-            self.byte(b);
-        }
+        let mut parser = vte::Parser::new();
+        parser.advance(&mut Feed(self), bytes);
     }
 
-    fn byte(&mut self, b: u8) {
-        // Mosh decodes UTF-8 before parsing; C1 controls arrive only as
-        // two-byte characters.
-        if !self.parser.utf8.is_empty() || b >= 0x80 {
-            if b & 0xC0 == 0x80 && !self.parser.utf8.is_empty() {
-                self.parser.utf8.push(b);
-            } else {
-                if !self.parser.utf8.is_empty() {
-                    // An unfinished character is dropped.
-                    self.parser.utf8.clear();
-                }
-                if (0xC2..=0xF4).contains(&b) {
-                    self.parser.utf8.push(b);
-                    return;
-                }
-                if b >= 0x80 {
+    fn print(&mut self, c: char) {
+        let cells = if (' '..='~').contains(&c) || ('\u{a0}'..='\u{ff}').contains(&c) {
+            1
+        } else {
+            match c.width() {
+                Some(w) => w,
+                None => {
+                    // C1 controls, decoded from UTF-8.
+                    self.control(u32::from(c));
                     return;
                 }
             }
-            let need = match self.parser.utf8.first() {
-                Some(0xC2..=0xDF) => 2,
-                Some(0xE0..=0xEF) => 3,
-                _ => 4,
-            };
-            if self.parser.utf8.len() < need {
+        };
+        if cells == 0 {
+            let target = self
+                .ds
+                .glyph
+                .filter(|&(r, col)| self.cell(r, col).is_some_and(|cell| !cell.text.is_empty()));
+            if let Some((r, col)) = target {
+                if let Some(cell) = self.cell_mut(r, col) {
+                    cell.push(c);
+                }
                 return;
             }
-            let ch = std::str::from_utf8(&self.parser.utf8)
-                .ok()
-                .and_then(|s| s.chars().next());
-            self.parser.utf8.clear();
-            if let Some(ch) = ch {
-                self.char(ch);
-            }
-            return;
         }
-        self.char(char::from(b));
+        let w = self.ds.width;
+        if self.ds.autowrap {
+            if self.ds.wrap_pending {
+                if let Some(r) = self.row_mut(self.ds.cursor_row) {
+                    r.set_wrap(true);
+                }
+                self.ds.col_at(0);
+                self.line_feed(true);
+            } else if cells == 2 && self.ds.cursor_col == w - 1 {
+                // No room for both halves: the last column stays blank.
+                let row = self.ds.cursor_row;
+                self.erase_cells(row, w - 1..w);
+                if let Some(r) = self.row_mut(row) {
+                    r.set_wrap(false);
+                }
+                self.ds.col_at(0);
+                self.line_feed(true);
+            }
+        }
+        let used = cells.max(1);
+        if self.ds.insert {
+            self.insert_delete_cells(used as i64);
+        }
+        let (row, col) = (self.ds.cursor_row, self.ds.cursor_col);
+        let (rend, link) = (self.ds.rend, self.ds.link.clone());
+        self.erase_cells(row, col..col + used);
+        if let Some(cell) = self.cell_mut(row, col) {
+            cell.push(c);
+            cell.wide = used == 2;
+            // A combining character with nothing to join stands alone.
+            cell.fallback = cells == 0;
+            cell.rend = rend;
+            cell.link = link;
+        }
+        self.ds.advance(used);
     }
 
-    fn char(&mut self, c: char) {
-        let u = u32::from(c);
-        // Anywhere: CAN and SUB cancel, ESC starts over.
-        match (&self.parser.state, u) {
-            (State::Osc, 0x07) => {
-                self.osc_end();
-                return;
-            }
-            (State::Skip | State::SkipEscape, 0x07) => {
-                self.parser.state = State::Ground;
-                return;
-            }
-            (State::Osc, 0x1B) => {
-                self.parser.state = State::OscEscape;
-                return;
-            }
-            (State::Skip, 0x1B) => {
-                self.parser.state = State::SkipEscape;
-                return;
-            }
-            (State::OscEscape, _) => {
-                // ESC \ ends the string; anything else ends it too.
-                self.osc_end();
-                if u != u32::from(b'\\') {
-                    self.parser.state = State::Escape;
-                    self.esc_start();
-                    self.char(c);
-                }
-                return;
-            }
-            (State::SkipEscape, _) => {
-                self.parser.state = State::Ground;
-                return;
-            }
-            (State::Osc, _) => {
-                if u >= 0x20 && self.parser.osc.len() < OSC_MAX {
-                    self.parser.osc.push(c);
-                }
-                return;
-            }
-            (State::Skip, _) => return,
-            (_, 0x18 | 0x1A) => {
-                self.parser.state = State::Ground;
-                return;
-            }
-            (_, 0x1B) => {
-                self.parser.state = State::Escape;
-                self.esc_start();
-                return;
-            }
-            (_, 0x9B) => {
-                self.esc_start();
-                self.parser.state = State::Csi;
-                return;
-            }
-            (_, 0x9D) => {
-                self.parser.osc.clear();
-                self.parser.state = State::Osc;
-                return;
-            }
-            (_, 0x90 | 0x98 | 0x9E | 0x9F) => {
-                self.parser.state = State::Skip;
-                return;
-            }
-            (_, 0..=0x1F) => {
-                // C0 controls act inside sequences too.
-                self.control(u);
-                return;
-            }
-            (_, 0x80..=0x9F) => {
-                self.parser.state = State::Ground;
-                self.control(u);
-                return;
-            }
-            _ => {}
-        }
-        match self.parser.state {
-            State::Ground => {
-                if u != 0x7F {
-                    self.print(c);
-                }
-            }
-            State::Escape | State::EscapeIntermediate => {
-                if (0x20..=0x2F).contains(&u) {
-                    self.collect(u);
-                    self.parser.state = State::EscapeIntermediate;
-                } else if self.parser.state == State::Escape && u == u32::from(b'[') {
-                    self.parser.state = State::Csi;
-                } else if self.parser.state == State::Escape && u == u32::from(b']') {
-                    self.parser.osc.clear();
-                    self.parser.state = State::Osc;
-                } else if self.parser.state == State::Escape && matches!(c, 'P' | 'X' | '^' | '_') {
-                    self.parser.state = State::Skip;
-                } else if (0x30..=0x7E).contains(&u) {
-                    self.parser.state = State::Ground;
-                    self.esc_dispatch(c);
-                } else {
-                    self.parser.state = State::Ground;
-                }
-            }
-            State::Csi => match c {
-                '0'..='9' => {
-                    let d = u - u32::from(b'0');
-                    let v = self.parser.current.unwrap_or(0);
-                    self.parser.current = Some(v.saturating_mul(10).saturating_add(d).min(99_999));
-                }
-                ';' => {
-                    if self.parser.params.len() < PARAMS {
-                        self.parser.params.push(self.parser.current.take());
-                    } else {
-                        self.parser.current = None;
-                    }
-                }
-                ':' => self.parser.state = State::CsiIgnore,
-                '<'..='?' | ' '..='/' => self.collect(u),
-                '@'..='~' => {
-                    if self.parser.params.len() < PARAMS {
-                        self.parser.params.push(self.parser.current.take());
-                    }
-                    self.parser.state = State::Ground;
-                    self.csi_dispatch(c);
-                }
-                _ => self.parser.state = State::Ground,
-            },
-            State::CsiIgnore => {
-                if (0x40..=0x7E).contains(&u) {
-                    self.parser.state = State::Ground;
-                }
-            }
-            State::Osc | State::OscEscape | State::Skip | State::SkipEscape => {}
-        }
-    }
-
-    fn esc_start(&mut self) {
-        self.parser.params.clear();
-        self.parser.current = None;
-        self.parser.collect.clear();
-    }
-
-    fn collect(&mut self, u: u32) {
-        if self.parser.collect.len() < 8 {
-            self.parser.collect.push(u as u8);
-        }
-    }
-
-    /// Parameter `i`, or `default` when missing or zero (as Mosh reads
-    /// them).
-    fn param(&self, i: usize, default: u32) -> u32 {
-        match self.parser.params.get(i).copied().flatten() {
-            Some(v) if v >= 1 => v,
-            _ => default,
-        }
-    }
-
-    fn param_count(&self) -> usize {
-        self.parser.params.len()
-    }
-
-    fn control(&mut self, u: u32) {
-        let keep_wrap = u == 0x09;
-        let saved = self.ds.next_print_wraps;
-        if !keep_wrap {
-            self.ds.next_print_wraps = false;
-        }
-        match u {
+    /// C0 controls, and the C1 ones that move the cursor.
+    fn control(&mut self, code: u32) {
+        let pending = self.ds.wrap_pending;
+        self.ds.wrap_pending = false;
+        match code {
             0x07 => self.bells = self.bells.wrapping_add(1),
-            0x08 => self.ds.move_col(-1, true, false),
+            0x08 => self.ds.step(0, -1),
             0x09 => {
-                let col = ((self.ds.cursor_col / 8) + 1) * 8;
-                self.ds
-                    .move_col(col.min(self.ds.width - 1) as i64, false, false);
-                self.ds.next_print_wraps = saved;
+                let stop = (self.ds.cursor_col / 8 + 1) * 8;
+                self.ds.col_at(stop as i64);
+                // A tab keeps a wrap that is due.
+                self.ds.wrap_pending = pending;
             }
-            0x0A..=0x0C | 0x84 => self.move_rows_autoscroll(1),
-            0x0D => self.ds.move_col(0, false, false),
+            0x0A..=0x0C | 0x84 => self.line_feed(true),
+            0x0D => self.ds.col_at(0),
             0x85 => {
-                self.ds.move_col(0, false, false);
-                self.move_rows_autoscroll(1);
+                self.ds.col_at(0);
+                self.line_feed(true);
             }
-            0x8D => self.move_rows_autoscroll(-1),
+            0x8D => self.line_feed(false),
             _ => {}
         }
     }
 
-    fn esc_dispatch(&mut self, c: char) {
-        if self.parser.collect.is_empty() && ('@'..='_').contains(&c) {
-            // ESC Fe: the 7-bit form of a C1 control.
-            self.control(u32::from(c) + 0x40);
-            return;
-        }
-        self.ds.next_print_wraps = false;
-        match (self.parser.collect.as_slice(), c) {
-            (b"", '7') => {
-                self.ds.saved = Saved {
-                    col: self.ds.cursor_col,
-                    row: self.ds.cursor_row,
-                    rend: self.ds.rend,
-                    autowrap: self.ds.autowrap,
-                    origin: self.ds.origin,
+    fn escape(&mut self, intermediates: &[u8], byte: u8) {
+        self.ds.wrap_pending = false;
+        match (intermediates, byte) {
+            (b"", b'D') => self.control(0x84),
+            (b"", b'E') => self.control(0x85),
+            (b"", b'M') => self.control(0x8D),
+            (b"", b'7') => {
+                let ds = &mut self.ds;
+                ds.saved = Saved {
+                    row: ds.cursor_row,
+                    col: ds.cursor_col,
+                    rend: ds.rend,
+                    autowrap: ds.autowrap,
+                    origin: ds.origin,
                 };
             }
-            (b"", '8') => {
-                let s = self.ds.saved;
-                self.ds.cursor_col = s.col;
-                self.ds.cursor_row = s.row;
-                self.ds.rend = s.rend;
-                self.ds.autowrap = s.autowrap;
-                self.ds.origin = s.origin;
-                self.ds.snap(s.row as i64, s.col as i64);
-                self.ds.new_grapheme();
+            (b"", b'8') => {
+                let ds = &mut self.ds;
+                let s = ds.saved;
+                ds.rend = s.rend;
+                ds.autowrap = s.autowrap;
+                ds.origin = s.origin;
+                ds.place(s.row as i64, s.col as i64);
             }
-            (b"", 'c') => {
-                let (w, h) = (self.ds.width, self.ds.height);
-                let keep = (self.title.clone(), self.icon_name.clone(), self.title_set);
-                let bells = self.bells;
-                *self = Screen::new(w, h);
-                (self.title, self.icon_name, self.title_set) = keep;
-                self.bells = bells;
+            (b"", b'c') => {
+                let mut fresh = Screen::new(self.ds.width, self.ds.height);
+                fresh.title = std::mem::take(&mut self.title);
+                fresh.icon_name = std::mem::take(&mut self.icon_name);
+                fresh.title_set = self.title_set;
+                fresh.bells = self.bells;
+                *self = fresh;
             }
-            (b"#", '8') => {
-                for row in 0..self.ds.height {
-                    for col in 0..self.ds.width {
-                        self.reset_cell(row, col);
-                        if let Some(cell) = self.cell_mut(row, col) {
-                            cell.text.push('E');
-                        }
+            (b"#", b'8') => {
+                // The alignment test: every cell an E.
+                self.erase_rows(0..self.ds.height);
+                for row in &mut self.rows {
+                    for cell in &mut Arc::make_mut(row).cells {
+                        cell.text.push('E');
                     }
                 }
             }
@@ -845,725 +697,527 @@ impl Screen {
         }
     }
 
-    fn csi_dispatch(&mut self, c: char) {
-        let private = self.parser.collect.as_slice() == b"?";
-        let plain = self.parser.collect.is_empty();
-        // Mode and rendition changes keep the pending wrap.
-        let keeps =
-            matches!(c, 'h' | 'l') && private || plain && matches!(c, 'm' | 'g' | 'I' | 'Z');
-        if !keeps {
-            self.ds.next_print_wraps = false;
+    fn csi(&mut self, params: &vte::Params, intermediates: &[u8], action: char) {
+        let dec = intermediates == b"?";
+        let plain = intermediates.is_empty();
+        // Mode and rendition changes leave a due wrap alone.
+        let leaves_wrap =
+            dec && matches!(action, 'h' | 'l') || plain && matches!(action, 'm' | 'g' | 'I' | 'Z');
+        if !leaves_wrap {
+            self.ds.wrap_pending = false;
         }
-        if private {
-            match c {
-                'h' => self.dec_modes(true),
-                'l' => self.dec_modes(false),
-                _ => {}
+        let args: Vec<u16> = params
+            .iter()
+            .map(|g| g.first().copied().unwrap_or(0))
+            .collect();
+        // Argument `i`; missing or 0 means `default`.
+        let arg = |i: usize, default: u16| -> i64 {
+            i64::from(args.get(i).copied().filter(|&v| v > 0).unwrap_or(default))
+        };
+        if dec {
+            if matches!(action, 'h' | 'l') {
+                for &mode in &args {
+                    self.dec_mode(mode, action == 'h');
+                }
             }
             return;
         }
         if !plain {
             return;
         }
-        let n = i64::from(self.param(0, 1));
-        let w = self.ds.width;
-        match c {
-            'A' => self.ds.move_row(-n, true),
-            'B' => self.ds.move_row(n, true),
-            'C' => self.ds.move_col(n, true, false),
-            'D' => self.ds.move_col(-n, true, false),
+        let n = arg(0, 1);
+        let (row, col, w, h) = (
+            self.ds.cursor_row,
+            self.ds.cursor_col,
+            self.ds.width,
+            self.ds.height,
+        );
+        match action {
+            'A' => self.ds.step(-n, 0),
+            'B' => self.ds.step(n, 0),
+            'C' => self.ds.step(0, n),
+            'D' => self.ds.step(0, -n),
             'H' | 'f' => {
-                self.ds.move_row(i64::from(self.param(0, 1)) - 1, false);
-                self.ds
-                    .move_col(i64::from(self.param(1, 1)) - 1, false, false);
+                self.ds.row_at(arg(0, 1) - 1);
+                self.ds.col_at(arg(1, 1) - 1);
             }
-            'G' | '`' => self.ds.move_col(n - 1, false, false),
-            'd' => self.ds.move_row(n - 1, false),
-            'J' => {
-                let (row, col) = (self.ds.cursor_row, self.ds.cursor_col);
-                match self.param(0, 0) {
-                    0 => {
-                        for x in col..w {
-                            self.reset_cell(row, x);
-                        }
-                        for y in row + 1..self.ds.height {
-                            self.reset_row(y);
-                        }
-                    }
-                    1 => {
-                        for y in 0..row {
-                            self.reset_row(y);
-                        }
-                        for x in 0..=col {
-                            self.reset_cell(row, x);
-                        }
-                    }
-                    2 => {
-                        for y in 0..self.ds.height {
-                            self.reset_row(y);
-                        }
-                    }
-                    _ => {}
+            'G' | '`' => self.ds.col_at(n - 1),
+            'd' => self.ds.row_at(n - 1),
+            'J' => match arg(0, 0) {
+                0 => {
+                    self.erase_cells(row, col..w);
+                    self.erase_rows(row + 1..h);
                 }
-            }
-            'K' => {
-                let (row, col) = (self.ds.cursor_row, self.ds.cursor_col);
-                match self.param(0, 0) {
-                    0 => (col..w).for_each(|x| self.reset_cell(row, x)),
-                    1 => (0..=col).for_each(|x| self.reset_cell(row, x)),
-                    2 => self.reset_row(row),
-                    _ => {}
+                1 => {
+                    self.erase_rows(0..row);
+                    self.erase_cells(row, 0..col + 1);
                 }
-            }
-            'X' => {
-                let (row, col) = (self.ds.cursor_row, self.ds.cursor_col);
-                let end = (col + n as usize).min(w);
-                (col..end).for_each(|x| self.reset_cell(row, x));
-            }
-            '@' => {
-                let (row, col) = (self.ds.cursor_row, self.ds.cursor_col);
-                let bg = self.bg();
-                if let Some(r) = self.row_mut(row) {
-                    for _ in 0..(n as usize).min(w) {
-                        r.cells.insert(col, Cell::blank(bg));
-                        r.cells.pop();
-                    }
-                }
-            }
-            'P' => {
-                let (row, col) = (self.ds.cursor_row, self.ds.cursor_col);
-                let bg = self.bg();
-                if let Some(r) = self.row_mut(row) {
-                    for _ in 0..(n as usize).min(w) {
-                        if col < r.cells.len() {
-                            r.cells.remove(col);
-                            r.cells.push(Cell::blank(bg));
-                        }
-                    }
-                }
-            }
-            'L' => {
-                let row = self.ds.cursor_row;
-                self.insert_lines(row, n as usize);
-                self.ds.move_col(0, false, false);
-            }
-            'M' => {
-                let row = self.ds.cursor_row;
-                self.delete_lines(row, n as usize);
-                self.ds.move_col(0, false, false);
+                2 => self.erase_rows(0..h),
+                _ => {}
+            },
+            'K' => match arg(0, 0) {
+                0 => self.erase_cells(row, col..w),
+                1 => self.erase_cells(row, 0..col + 1),
+                2 => self.erase_rows(row..row + 1),
+                _ => {}
+            },
+            'X' => self.erase_cells(row, col..col.saturating_add(n as usize)),
+            '@' => self.insert_delete_cells(n),
+            'P' => self.insert_delete_cells(-n),
+            'L' | 'M' => {
+                self.insert_delete_rows(if action == 'L' { n } else { -n });
+                self.ds.col_at(0);
             }
             'S' => self.scroll(n),
             'T' => self.scroll(-n),
             'r' => {
-                let top = self.param(0, 1) as usize;
-                let bottom = self.param(1, self.ds.height as u32) as usize;
-                if bottom <= top || top > self.ds.height {
-                    return;
-                }
-                self.ds.set_region(top - 1, bottom - 1);
-                self.ds.move_row(0, false);
-                self.ds.move_col(0, false, false);
-            }
-            'm' => self.sgr(),
-            'h' | 'l' => {
-                for i in 0..self.param_count() {
-                    if self.param(i, 0) == 4 {
-                        self.ds.insert = c == 'h';
-                    }
+                let (top, bottom) = (arg(0, 1) as usize, arg(1, h as u16) as usize);
+                if top < bottom && top <= h {
+                    self.ds.top = top - 1;
+                    self.ds.bottom = (bottom - 1).min(h - 1);
+                    self.ds.home();
                 }
             }
+            'm' => self.sgr(params),
+            'h' | 'l' if args.contains(&4) => self.ds.insert = action == 'h',
             _ => {}
         }
     }
 
-    fn dec_modes(&mut self, on: bool) {
-        for i in 0..self.param_count() {
-            let p = self.param(i, 0);
-            match p {
-                9 | 1000..=1003 => self.ds.mouse.reporting = if on { p as u16 } else { 0 },
-                1005 | 1006 | 1015 => self.ds.mouse.encoding = if on { p as u16 } else { 0 },
-                1 => self.ds.app_cursor_keys = on,
-                3 => {
-                    self.ds.move_row(0, false);
-                    self.ds.move_col(0, false, false);
-                    for y in 0..self.ds.height {
-                        self.reset_row(y);
-                    }
-                }
-                5 => self.ds.reverse_video = on,
-                6 => {
-                    self.ds.move_row(0, false);
-                    self.ds.move_col(0, false, false);
-                    self.ds.origin = on;
-                }
-                7 => self.ds.autowrap = on,
-                25 => self.ds.cursor_visible = on,
-                1004 => self.ds.mouse.focus = on,
-                1007 => self.ds.mouse.alternate_scroll = on,
-                2004 => self.ds.bracketed_paste = on,
-                _ => {}
+    fn dec_mode(&mut self, mode: u16, on: bool) {
+        let ds = &mut self.ds;
+        match mode {
+            1 => ds.app_cursor_keys = on,
+            3 => {
+                // Column mode: only its clearing and homing.
+                ds.home();
+                self.erase_rows(0..self.ds.height);
             }
+            5 => ds.reverse_video = on,
+            6 => {
+                ds.origin = on;
+                ds.home();
+            }
+            7 => ds.autowrap = on,
+            25 => ds.cursor_visible = on,
+            9 | 1000..=1003 => ds.mouse.reporting = if on { mode } else { 0 },
+            1004 => ds.mouse.focus = on,
+            1005 | 1006 | 1015 => ds.mouse.encoding = if on { mode } else { 0 },
+            1007 => ds.mouse.alternate_scroll = on,
+            2004 => ds.bracketed_paste = on,
+            _ => {}
         }
     }
 
-    fn sgr(&mut self) {
-        let count = self.param_count();
-        let mut i = 0;
-        while i < count {
-            let r = self.param(i, 0);
-            let sub = self.parser.params.get(i + 1).copied().flatten();
-            if (r == 38 || r == 48) && count - i >= 3 && sub == Some(5) {
-                let n = self.param(i + 2, 0);
-                if n <= 255 {
-                    let color = Color::Indexed(n as u8);
-                    if r == 38 {
-                        self.ds.rend.fg = color;
-                    } else {
-                        self.ds.rend.bg = color;
-                    }
-                }
-                i += 3;
-                continue;
-            }
-            if (r == 38 || r == 48) && count - i >= 5 && sub == Some(2) {
-                let ch = |k: usize| self.param(i + k, 0).min(255) as u8;
-                let color = Color::Rgb(ch(2), ch(3), ch(4));
-                if r == 38 {
-                    self.ds.rend.fg = color;
-                } else {
-                    self.ds.rend.bg = color;
-                }
-                i += 5;
-                continue;
-            }
-            self.ds.rend.set(r);
-            i += 1;
-        }
-    }
-
-    fn osc_end(&mut self) {
-        self.parser.state = State::Ground;
-        let osc = std::mem::take(&mut self.parser.osc);
-        if let Some(clip) = osc.strip_prefix("52;c;") {
-            self.clipboard = clip.to_owned();
+    fn sgr(&mut self, params: &vte::Params) {
+        let groups: Vec<&[u16]> = params.iter().collect();
+        if groups.is_empty() {
+            self.ds.rend = Rendition::default();
             return;
         }
-        let (cmd, text) = if let Some(t) = osc.strip_prefix(';') {
-            (Some('0'), t)
-        } else {
-            let mut cs = osc.chars();
-            match (cs.next(), cs.next()) {
-                (Some(d), Some(';')) => (Some(d), cs.as_str()),
-                _ => (None, ""),
+        let mut i = 0;
+        while let Some(group) = groups.get(i) {
+            let code = group.first().copied().unwrap_or(0);
+            i += 1;
+            if !matches!(code, 38 | 48) {
+                self.ds.rend.set(u32::from(code));
+                continue;
             }
-        };
-        match cmd {
-            Some('8') => {
-                // 8;params;url
-                if let Some((params, url)) = text.split_once(';') {
-                    self.ds.link = if url.is_empty() {
-                        None
-                    } else {
-                        Some(Arc::new((params.to_owned(), url.to_owned())))
-                    };
+            // An extended colour: 38:5:n or 38:2:[space:]r:g:b in one
+            // group, or the same split by semicolons.
+            let rest: Vec<u16> = if group.len() > 1 {
+                match group {
+                    [_, 2, _, r, g, b] => vec![2, *r, *g, *b],
+                    _ => group.get(1..).unwrap_or_default().to_vec(),
                 }
+            } else {
+                let take = match groups.get(i).and_then(|g| g.first()) {
+                    Some(5) => 2,
+                    Some(2) => 4,
+                    _ => 0,
+                };
+                if groups.len() - i < take {
+                    continue;
+                }
+                let rest = groups
+                    .get(i..i + take)
+                    .unwrap_or_default()
+                    .iter()
+                    .map(|g| g.first().copied().unwrap_or(0))
+                    .collect();
+                i += take;
+                rest
+            };
+            let color = match rest.as_slice() {
+                [5, n] if *n <= 255 => Color::Indexed(*n as u8),
+                [2, r, g, b] => {
+                    let c = |v: u16| v.min(255) as u8;
+                    Color::Rgb(c(*r), c(*g), c(*b))
+                }
+                _ => continue,
+            };
+            if code == 38 {
+                self.ds.rend.fg = color;
+            } else {
+                self.ds.rend.bg = color;
             }
-            Some(d @ ('0' | '1' | '2')) => {
+        }
+    }
+
+    fn osc(&mut self, params: &[&[u8]]) {
+        let text = |from: usize| -> String {
+            let parts: Vec<String> = params
+                .get(from..)
+                .unwrap_or_default()
+                .iter()
+                .map(|p| String::from_utf8_lossy(p).into_owned())
+                .collect();
+            parts.join(";")
+        };
+        match params.first().copied().unwrap_or_default() {
+            b"52" if params.get(1).copied() == Some(b"c".as_slice()) => {
+                let mut data = text(2);
+                let mut end = data.len().min(OSC_MAX);
+                while !data.is_char_boundary(end) {
+                    end -= 1;
+                }
+                data.truncate(end);
+                self.clipboard = data;
+            }
+            b"8" if params.len() >= 3 => {
+                let url = text(2);
+                self.ds.link = (!url.is_empty()).then(|| {
+                    Arc::new((
+                        String::from_utf8_lossy(params.get(1).copied().unwrap_or_default())
+                            .into_owned(),
+                        url,
+                    ))
+                });
+            }
+            which @ (b"" | b"0" | b"1" | b"2") if params.len() >= 2 => {
                 self.title_set = true;
-                // Mosh keeps the first 256 characters of the whole OSC.
-                let keep = TITLE.saturating_sub(osc.chars().count() - text.chars().count());
-                let title: String = text.chars().take(keep).collect();
-                if d != '2' {
+                // At most TITLE characters of the whole string count,
+                // its number and semicolon included.
+                let title: String = text(1)
+                    .chars()
+                    .filter(|c| !c.is_control())
+                    .take(TITLE.saturating_sub(which.len() + 1))
+                    .collect();
+                if which != b"2" {
                     self.icon_name = title.clone();
                 }
-                if d != '1' {
+                if which != b"1" {
                     self.title = title;
                 }
             }
             _ => {}
         }
     }
+}
 
+/// Feeds the parser's events to a screen.
+struct Feed<'a>(&'a mut Screen);
+
+impl vte::Perform for Feed<'_> {
     fn print(&mut self, c: char) {
-        let width = if c == '\0' {
-            None
-        } else if (' '..='~').contains(&c) || ('\u{a0}'..='\u{ff}').contains(&c) {
-            Some(1)
+        self.0.print(c);
+    }
+
+    fn execute(&mut self, byte: u8) {
+        self.0.control(u32::from(byte));
+    }
+
+    fn csi_dispatch(&mut self, params: &vte::Params, intermediates: &[u8], ignore: bool, c: char) {
+        if ignore {
+            self.0.ds.wrap_pending = false;
         } else {
-            c.width()
-        };
-        let w = self.ds.width;
-        match width {
-            Some(cw @ (1 | 2)) => {
-                if self.ds.autowrap && self.ds.next_print_wraps {
-                    let row = self.ds.cursor_row;
-                    if let Some(r) = self.row_mut(row) {
-                        r.set_wrap(true);
-                    }
-                    self.ds.move_col(0, false, false);
-                    self.move_rows_autoscroll(1);
-                } else if self.ds.autowrap && cw == 2 && self.ds.cursor_col == w - 1 {
-                    let (row, col) = (self.ds.cursor_row, self.ds.cursor_col);
-                    self.reset_cell(row, col);
-                    if let Some(r) = self.row_mut(row) {
-                        r.set_wrap(false);
-                    }
-                    self.ds.move_col(0, false, false);
-                    self.move_rows_autoscroll(1);
-                }
-                let (row, col) = (self.ds.cursor_row, self.ds.cursor_col);
-                if self.ds.insert {
-                    let bg = self.bg();
-                    if let Some(r) = self.row_mut(row) {
-                        for _ in 0..cw {
-                            r.cells.insert(col, Cell::blank(bg));
-                            r.cells.pop();
-                        }
-                    }
-                }
-                let (rend, link) = (self.ds.rend, self.ds.link.clone());
-                self.reset_cell(row, col);
-                if let Some(cell) = self.cell_mut(row, col) {
-                    cell.push(c);
-                    cell.wide = cw == 2;
-                    cell.rend = rend;
-                    cell.link = link;
-                }
-                if cw == 2 && col + 1 < w {
-                    self.reset_cell(row, col + 1);
-                }
-                self.ds.move_col(cw as i64, true, true);
-            }
-            Some(0) => {
-                let Some((row, col)) = self.ds.combining else {
-                    return;
-                };
-                if row >= self.ds.height || col >= w {
-                    return;
-                }
-                let empty = self.cell(row, col).is_some_and(|c| c.text.is_empty());
-                if empty {
-                    if let Some(cell) = self.cell_mut(row, col) {
-                        cell.fallback = true;
-                    }
-                    self.ds.move_col(1, true, true);
-                }
-                if let Some(cell) = self.cell_mut(row, col) {
-                    cell.push(c);
-                }
-            }
-            _ => {}
+            self.0.csi(params, intermediates, c);
         }
+    }
+
+    fn esc_dispatch(&mut self, intermediates: &[u8], ignore: bool, byte: u8) {
+        if !ignore {
+            self.0.escape(intermediates, byte);
+        }
+    }
+
+    fn osc_dispatch(&mut self, params: &[&[u8]], _bell_terminated: bool) {
+        self.0.osc(params);
     }
 }
 
-/// What the pane's terminal is drawing with while a frame is written.
-struct Frame<'a> {
+/// The pane's terminal while a frame is written to it: where its cursor
+/// is (`None` after writing the last column, where terminals disagree)
+/// and what it draws with.
+struct Pen {
     out: String,
-    x: i64,
-    y: i64,
+    at: Option<(usize, usize)>,
     rend: Rendition,
     link: Link,
-    cursor_visible: bool,
-    last: &'a Screen,
+    cursor_shown: bool,
 }
 
-impl Frame<'_> {
+impl Pen {
+    /// Puts the cursor at row `y`, column `x`, unless it is there.
+    fn go(&mut self, y: usize, x: usize) {
+        if self.at != Some((y, x)) {
+            self.out.push_str(&format!("\x1b[{};{}H", y + 1, x + 1));
+            self.at = Some((y, x));
+        }
+    }
+
+    fn style(&mut self, rend: Rendition, link: &Link) {
+        if self.rend != rend {
+            self.out.push_str(&rend.sgr());
+            self.rend = rend;
+        }
+        if self.link != *link {
+            self.out.push_str(&osc8(link));
+            self.link = link.clone();
+        }
+    }
+
+    /// Hides the cursor while cells change under it.
     fn hide_cursor(&mut self) {
-        if self.cursor_visible {
+        if self.cursor_shown {
             self.out.push_str("\x1b[?25l");
-            self.cursor_visible = false;
+            self.cursor_shown = false;
         }
     }
 
-    fn silent_move(&mut self, y: usize, x: usize) {
-        if self.x == x as i64 && self.y == y as i64 {
-            return;
-        }
-        self.hide_cursor();
-        self.move_to(y, x);
+    /// Switches DEC private mode `mode` on or off.
+    fn mode(&mut self, mode: u16, on: bool) {
+        self.out
+            .push_str(&format!("\x1b[?{mode}{}", if on { 'h' } else { 'l' }));
     }
+}
 
-    fn move_to(&mut self, y: usize, x: usize) {
-        let (lx, ly) = (self.x, self.y);
-        let (x, y) = (x as i64, y as i64);
-        self.x = x;
-        self.y = y;
-        if lx != -1 && ly != -1 {
-            if x == 0 && y - ly >= 0 && y - ly < 5 {
-                if lx != 0 {
-                    self.out.push('\r');
-                }
-                for _ in 0..y - ly {
-                    self.out.push('\n');
-                }
-                return;
-            }
-            if y == ly && x - lx < 0 && x - lx > -5 {
-                for _ in 0..lx - x {
-                    self.out.push('\x08');
-                }
-                return;
-            }
-        }
-        self.out.push_str(&format!("\x1b[{};{}H", y + 1, x + 1));
-    }
+/// Whether `c` is a blank that erasing leaves: no text, no link, and only
+/// a background colour.
+fn erased(c: &Cell) -> bool {
+    c.text.is_empty() && c.link.is_none() && c.rend == Rendition::blank(c.rend.bg)
+}
 
-    fn rendition(&mut self, r: Rendition, force: bool) {
-        if force || self.rend != r {
-            self.out.push_str(&r.sgr());
-            self.rend = r;
+/// Shifted rows that `next` shares with `last`: how far the screen moved
+/// up (0 when it did not) so that most of the rows need no redraw.
+fn scrolled_by(last: &[Arc<Row>], next: &[Arc<Row>]) -> usize {
+    let h = next.len().min(last.len());
+    let same = |k: usize| -> usize {
+        (0..h - k)
+            .filter(|&i| match (next.get(i), last.get(i + k)) {
+                (Some(a), Some(b)) => Arc::ptr_eq(a, b) || a == b,
+                _ => false,
+            })
+            .count()
+    };
+    let unmoved = same(0);
+    let mut best = (0, unmoved);
+    for k in 1..h {
+        let kept = same(k);
+        // Worth it only when the moved rows outnumber the unmoved ones
+        // and make up half of what stays on screen.
+        if kept > best.1 && kept * 2 >= h - k {
+            best = (k, kept);
         }
     }
-
-    fn hyperlink(&mut self, l: &Link, force: bool) {
-        if force || self.link != *l {
-            self.out.push_str(&osc8(l));
-            self.link = l.clone();
-        }
-    }
-
-    fn cell(&mut self, c: &Cell) {
-        c.grapheme(&mut self.out);
-    }
+    best.0
 }
 
 /// Writes the output that turns a terminal showing `last` into one
 /// showing `next`. Without `initialized`, the terminal's contents are
-/// unknown and everything is drawn. This is Mosh's own display algorithm,
-/// so the output scrolls the terminal (and its scrollback) as the screen
-/// scrolled, rather than redrawing it.
+/// unknown and everything is drawn. When the screen scrolled, the
+/// terminal is scrolled too (so the lines go to its scrollback) and only
+/// what then differs is drawn.
 pub fn render(initialized: bool, last: &Screen, next: &Screen) -> String {
-    let mut initialized = initialized;
-    let mut f = Frame {
+    let (w, h) = (next.width(), next.height());
+    let full = !initialized || w != last.width() || h != last.height();
+    let mut pen = Pen {
         out: String::new(),
-        x: 0,
-        y: 0,
+        at: None,
         rend: Rendition::default(),
         link: None,
-        cursor_visible: last.ds.cursor_visible,
-        last,
+        cursor_shown: last.ds.cursor_visible,
     };
-    if next.bells != f.last.bells {
-        f.out.push('\x07');
+
+    // Things outside the cells.
+    if next.bells != last.bells {
+        pen.out.push('\x07');
     }
-    if next.title_set
-        && (!initialized || next.icon_name != f.last.icon_name || next.title != f.last.title)
-    {
-        let clean = |s: &str| -> String { s.chars().filter(|c| !c.is_control()).collect() };
-        if next.icon_name == next.title {
-            f.out
-                .push_str(&format!("\x1b]0;{}\x07", clean(&next.title)));
+    let printable = |s: &str| -> String { s.chars().filter(|c| !c.is_control()).collect() };
+    if next.title_set && (full || next.title != last.title || next.icon_name != last.icon_name) {
+        if next.title == next.icon_name {
+            pen.out
+                .push_str(&format!("\x1b]0;{}\x07", printable(&next.title)));
         } else {
-            f.out
-                .push_str(&format!("\x1b]1;{}\x07", clean(&next.icon_name)));
-            f.out
-                .push_str(&format!("\x1b]2;{}\x07", clean(&next.title)));
+            pen.out
+                .push_str(&format!("\x1b]1;{}\x07", printable(&next.icon_name)));
+            pen.out
+                .push_str(&format!("\x1b]2;{}\x07", printable(&next.title)));
         }
     }
-    if next.clipboard != f.last.clipboard {
-        let clip: String = next
+    if next.clipboard != last.clipboard {
+        let base64: String = next
             .clipboard
             .chars()
             .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '/' | '='))
             .collect();
-        f.out.push_str(&format!("\x1b]52;c;{clip}\x07"));
+        pen.out.push_str(&format!("\x1b]52;c;{base64}\x07"));
     }
-    if !initialized || next.ds.reverse_video != f.last.ds.reverse_video {
-        f.out.push_str(if next.ds.reverse_video {
-            "\x1b[?5h"
-        } else {
-            "\x1b[?5l"
-        });
+    if full || next.ds.reverse_video != last.ds.reverse_video {
+        pen.mode(5, next.ds.reverse_video);
     }
-    let (w, h) = (next.width(), next.height());
-    if !initialized || w != f.last.width() || h != f.last.height() {
-        f.out.push_str("\x1b[r\x1b[0m\x1b]8;;\x1b\\\x1b[H\x1b[2J");
-        initialized = false;
-        f.x = 0;
-        f.y = 0;
-        f.rend = Rendition::default();
-        f.link = None;
+
+    // What the terminal shows now, row by row.
+    let mut shown: Vec<Arc<Row>>;
+    if full {
+        pen.hide_cursor();
+        pen.out.push_str("\x1b[r\x1b[0m\x1b]8;;\x1b\\\x1b[H\x1b[2J");
+        pen.at = Some((0, 0));
+        let blank = Arc::new(Row::new(w, Color::Default));
+        shown = vec![blank; h];
     } else {
-        f.x = f.last.ds.cursor_col as i64;
-        f.y = f.last.ds.cursor_row as i64;
-        f.rend = f.last.ds.rend;
-        f.link = f.last.ds.link.clone();
-    }
-    if !initialized {
-        f.cursor_visible = false;
-        f.out.push_str("\x1b[?25l");
-    }
-
-    let mut rows: Vec<Arc<Row>> = f.last.rows.clone();
-    if f.last.width() < w {
-        for r in &mut rows {
-            let mut wider = (**r).clone();
-            wider.cells.resize(w, Cell::blank(Color::Default));
-            *r = Arc::new(wider);
+        if !last.ds.wrap_pending {
+            pen.at = Some((last.ds.cursor_row, last.ds.cursor_col));
         }
-    }
-    let blank = Arc::new(Row::new(w, Color::Default));
-    if rows.len() < h {
-        rows.resize(h, blank.clone());
-    }
-
-    let mut frame_y = 0;
-    if initialized {
-        let mut lines_scrolled = 0;
-        let mut scroll_height = 0;
-        if let Some(first) = next.rows.first() {
-            for (row, old) in rows.iter().enumerate().take(h) {
-                if !(Arc::ptr_eq(first, old) || **first == **old) {
-                    continue;
-                }
-                if row == 0 {
-                    break;
-                }
-                lines_scrolled = row;
-                scroll_height = 1;
-                let mut region = 1;
-                while lines_scrolled + region < h {
-                    match (next.rows.get(region), rows.get(lines_scrolled + region)) {
-                        (Some(a), Some(b)) if **a == **b => scroll_height = region + 1,
-                        _ => break,
-                    }
-                    region += 1;
-                }
-                break;
+        pen.rend = last.ds.rend;
+        pen.link = last.ds.link.clone();
+        shown = last.rows.clone();
+        let k = scrolled_by(&shown, &next.rows);
+        if k > 0 {
+            // A line feed on the bottom row scrolls the whole screen up.
+            pen.hide_cursor();
+            pen.style(Rendition::default(), &None);
+            pen.go(h - 1, 0);
+            for _ in 0..k {
+                pen.out.push('\n');
             }
-        }
-        if scroll_height > 0 {
-            frame_y = scroll_height;
-            if lines_scrolled > 0 {
-                f.rendition(Rendition::default(), true);
-                f.hyperlink(&None, true);
-                let bottom = lines_scrolled + scroll_height - 1;
-                if scroll_height + lines_scrolled == h && f.y + 1 == h as i64 {
-                    f.out.push('\r');
-                    for _ in 0..lines_scrolled {
-                        f.out.push('\n');
-                    }
-                    f.x = 0;
-                } else {
-                    f.out.push_str(&format!("\x1b[1;{}r", bottom + 1));
-                    f.x = -1;
-                    f.y = -1;
-                    f.silent_move(bottom, 0);
-                    for _ in 0..lines_scrolled {
-                        f.out.push('\n');
-                    }
-                    f.out.push_str("\x1b[r");
-                    f.x = -1;
-                    f.y = -1;
-                }
-                for i in 0..=bottom {
-                    let moved = if i + lines_scrolled <= bottom {
-                        rows.get(i + lines_scrolled).cloned()
-                    } else {
-                        None
-                    };
-                    if let Some(slot) = rows.get_mut(i) {
-                        *slot = moved.unwrap_or_else(|| blank.clone());
-                    }
-                }
-            }
+            shown.drain(..k);
+            shown.extend((0..k).map(|_| Arc::new(Row::new(w, Color::Default))));
         }
     }
 
-    let mut wrap = false;
-    while frame_y < h {
-        if let (Some(row), Some(old)) = (next.rows.get(frame_y), rows.get(frame_y)) {
-            wrap = put_row(initialized, &mut f, next, frame_y, row, old, wrap);
-        }
-        frame_y += 1;
-    }
-
-    let (cy, cx) = (next.ds.cursor_row, next.ds.cursor_col);
-    if !initialized || cy as i64 != f.y || cx as i64 != f.x {
-        f.move_to(cy, cx);
-    }
-    if !initialized || next.ds.cursor_visible != f.cursor_visible {
-        f.out.push_str(if next.ds.cursor_visible {
-            "\x1b[?25h"
-        } else {
-            "\x1b[?25l"
-        });
-    }
-    f.rendition(next.ds.rend, !initialized);
-    f.hyperlink(&next.ds.link, !initialized);
-    let lds = &f.last.ds;
-    if !initialized || next.ds.bracketed_paste != lds.bracketed_paste {
-        f.out.push_str(if next.ds.bracketed_paste {
-            "\x1b[?2004h"
-        } else {
-            "\x1b[?2004l"
-        });
-    }
-    let (m, lm) = (next.ds.mouse, lds.mouse);
-    if !initialized || m.reporting != lm.reporting {
-        if m.reporting == 0 {
-            f.out
-                .push_str("\x1b[?1003l\x1b[?1002l\x1b[?1001l\x1b[?1000l");
-        } else {
-            if lm.reporting != 0 {
-                f.out.push_str(&format!("\x1b[?{}l", lm.reporting));
-            }
-            f.out.push_str(&format!("\x1b[?{}h", m.reporting));
-        }
-    }
-    if !initialized || m.focus != lm.focus {
-        f.out.push_str(if m.focus {
-            "\x1b[?1004h"
-        } else {
-            "\x1b[?1004l"
-        });
-    }
-    if !initialized || m.encoding != lm.encoding {
-        if m.encoding == 0 {
-            f.out.push_str("\x1b[?1015l\x1b[?1006l\x1b[?1005l");
-        } else {
-            if lm.encoding != 0 {
-                f.out.push_str(&format!("\x1b[?{}l", lm.encoding));
-            }
-            f.out.push_str(&format!("\x1b[?{}h", m.encoding));
-        }
-    }
-    f.out
-}
-
-fn put_row(
-    initialized: bool,
-    f: &mut Frame<'_>,
-    next: &Screen,
-    y: usize,
-    row: &Arc<Row>,
-    old: &Arc<Row>,
-    wrap: bool,
-) -> bool {
-    let mut x = 0;
-    let cells = &row.cells;
-    let mut wrote_last = false;
-    if wrap && let Some(cell) = cells.first() {
-        f.rendition(cell.rend, false);
-        f.hyperlink(&cell.link, false);
-        let cw = if cell.wide && next.width() < 2 {
-            f.out.push(' ');
-            1
-        } else {
-            f.cell(cell);
-            cell.width()
-        };
-        x += cw;
-        f.x += cw as i64;
-        wrote_last = x >= next.width();
-    }
-    if initialized && Arc::ptr_eq(row, old) {
-        if wrote_last {
-            f.x = -1;
-            f.y = -1;
-        }
-        return false;
-    }
-    let wrap_this = row.wraps();
-    let width = next.width();
-    let mut clear = 0;
-    let mut blank_rend = Rendition::default();
-    let mut blank_link: Link = None;
-    while x < width {
-        let Some(cell) = cells.get(x) else {
-            break;
-        };
-        if initialized && clear == 0 && old.cells.get(x) == Some(cell) {
-            x += cell.width();
+    for (y, (row, old)) in next.rows.iter().zip(shown.iter_mut()).enumerate() {
+        if Arc::ptr_eq(row, old) || row.cells == old.cells {
             continue;
         }
-        if cell.text.is_empty() {
-            if clear == 0 {
-                blank_rend = cell.rend;
-                blank_link = cell.link.clone();
-            }
-            if cell.rend == blank_rend && cell.link == blank_link {
-                clear += 1;
-                x += 1;
-                continue;
-            }
+        pen.hide_cursor();
+        draw_row(&mut pen, y, w, &row.cells, &mut Arc::make_mut(old).cells);
+    }
+
+    // The cursor and modes.
+    let (cy, cx) = (next.ds.cursor_row, next.ds.cursor_col);
+    pen.go(cy.min(h.saturating_sub(1)), cx.min(w.saturating_sub(1)));
+    if full {
+        pen.out.push_str("\x1b[0m\x1b]8;;\x1b\\");
+        pen.rend = Rendition::default();
+        pen.link = None;
+    }
+    pen.style(next.ds.rend, &next.ds.link);
+    if pen.cursor_shown != next.ds.cursor_visible || full {
+        pen.mode(25, next.ds.cursor_visible);
+    }
+    let (now, was) = (&next.ds, &last.ds);
+    if full || now.bracketed_paste != was.bracketed_paste {
+        pen.mode(2004, now.bracketed_paste);
+    }
+    if full || now.mouse.reporting != was.mouse.reporting {
+        // Switch every reporting mode off, then the one in use on.
+        for m in [9, 1000, 1001, 1002, 1003] {
+            pen.mode(m, false);
         }
-        if clear > 0 {
-            f.silent_move(y, x - clear);
-            f.rendition(blank_rend, false);
-            f.hyperlink(&blank_link, false);
-            if clear > 4 {
-                f.out.push_str(&format!("\x1b[{clear}X"));
-            } else {
-                for _ in 0..clear {
-                    f.out.push(' ');
-                }
-                f.x = x as i64;
-            }
-            clear = 0;
-            if cell.text.is_empty() {
-                blank_rend = cell.rend;
-                blank_link = cell.link.clone();
-                clear = 1;
-                x += 1;
-                continue;
-            }
+        if now.mouse.reporting != 0 {
+            pen.mode(now.mouse.reporting, true);
         }
-        // A wide character with no room for its right half (left there
-        // by a resize) would wrap the pane's terminal: draw a space.
-        let squeezed = cell.wide && x + 2 > width;
-        let cw = if squeezed { 1 } else { cell.width() };
-        if wrap_this && x + cw >= width {
-            f.x = -1;
-            f.y = -1;
+    }
+    if full || now.mouse.focus != was.mouse.focus {
+        pen.mode(1004, now.mouse.focus);
+    }
+    if full || now.mouse.encoding != was.mouse.encoding {
+        for m in [1005, 1006, 1015] {
+            pen.mode(m, false);
         }
-        f.silent_move(y, x);
-        f.rendition(cell.rend, false);
-        f.hyperlink(&cell.link, false);
-        if squeezed {
-            f.out.push(' ');
+        if now.mouse.encoding != 0 {
+            pen.mode(now.mouse.encoding, true);
+        }
+    }
+    pen.out
+}
+
+/// Draws the cells of row `y` that differ between `want` and `have`,
+/// and brings `have` up to date.
+fn draw_row(pen: &mut Pen, y: usize, w: usize, want: &[Cell], have: &mut [Cell]) {
+    // Where the row's trailing erased blanks of one colour begin: one
+    // erase-to-end draws them.
+    let mut tail = want.len().min(w);
+    if let Some(last) = want.get(tail.wrapping_sub(1)).filter(|c| erased(c)) {
+        while tail > 0
+            && want
+                .get(tail - 1)
+                .is_some_and(|c| erased(c) && c.rend == last.rend)
+        {
+            tail -= 1;
+        }
+        // The right half of a wide character is blank in the model; an
+        // erase from there would cut the character in two.
+        if tail > 0 && want.get(tail - 1).is_some_and(|c| c.wide) {
+            tail += 1;
+        }
+    }
+    let mut x = 0;
+    while x < tail {
+        let Some(cell) = want.get(x) else {
+            break;
+        };
+        let width = if cell.wide { 2 } else { 1 };
+        if have.get(x) == Some(cell) && (width == 1 || have.get(x + 1) == want.get(x + 1)) {
+            x += width;
+            continue;
+        }
+        // A run of erased blanks: erase them without moving.
+        let run = want
+            .get(x..tail)
+            .unwrap_or_default()
+            .iter()
+            .take_while(|c| erased(c) && c.rend == cell.rend)
+            .count();
+        if run >= 4 {
+            pen.go(y, x);
+            pen.style(cell.rend, &None);
+            pen.out.push_str(&format!("\x1b[{run}X"));
+            for (h, c) in have.iter_mut().zip(want).skip(x).take(run) {
+                *h = c.clone();
+            }
+            x += run;
+            continue;
+        }
+        pen.go(y, x);
+        pen.style(cell.rend, &cell.link);
+        if cell.wide && x + 2 > w {
+            // No room for the right half (left by a resize): a space,
+            // which cannot wrap the terminal.
+            pen.out.push(' ');
         } else {
-            f.cell(cell);
+            cell.grapheme(&mut pen.out);
         }
-        x += cw;
-        f.x += cw as i64;
-        if x >= width {
-            wrote_last = true;
-        }
-    }
-    if clear > 0 {
-        f.silent_move(y, x - clear);
-        f.rendition(blank_rend, false);
-        f.hyperlink(&blank_link, false);
-        if !wrap_this {
-            f.out.push_str("\x1b[K");
-        } else {
-            for _ in 0..clear {
-                f.out.push(' ');
+        let drawn = if cell.wide && x + 2 <= w { 2 } else { 1 };
+        for i in x..x + drawn {
+            if let (Some(h), Some(c)) = (have.get_mut(i), want.get(i)) {
+                *h = c.clone();
             }
-            f.x = x as i64;
-            wrote_last = true;
+        }
+        x += drawn;
+        pen.at = (x < w).then_some((y, x));
+    }
+    if have.get(tail..) != want.get(tail..) {
+        if let Some(c) = want.get(tail) {
+            pen.go(y, tail);
+            pen.style(c.rend, &None);
+            pen.out.push_str("\x1b[K");
+        }
+        for (h, c) in have.iter_mut().zip(want).skip(tail) {
+            *h = c.clone();
         }
     }
-    if !(wrote_last && y + 1 < next.height()) {
-        if wrote_last {
-            // The cursor sits on the last column with a wrap pending,
-            // where terminals differ: place it explicitly next time.
-            f.x = -1;
-            f.y = -1;
-        }
-        return false;
-    }
-    if wrap_this {
-        f.x = 0;
-        f.y += 1;
-        return true;
-    }
-    f.out.push_str("\r\n");
-    f.x = 0;
-    f.y += 1;
-    false
 }
 
 /// How a terminal showing `last`, after the output of `render(init,
@@ -1585,11 +1239,10 @@ pub fn render_mismatch(init: bool, last: &Screen, next: &Screen) -> Option<Strin
     ds.origin = false;
     ds.insert = false;
     ds.autowrap = true;
-    ds.next_print_wraps = false;
+    ds.wrap_pending = false;
     shown.apply(out.as_bytes());
     let norm = |c: &Cell| -> String {
-        // Blank, a space and a no-break space look the same (Mosh's
-        // `contents_match`).
+        // Blank, a space and a no-break space look the same.
         if c.text.is_empty() || c.text == " " || c.text == "\u{a0}" {
             return String::new();
         }
@@ -1618,8 +1271,8 @@ pub fn render_mismatch(init: bool, last: &Screen, next: &Screen) -> Option<Strin
             }
             if norm(a) != norm(b) || a.rend != b.rend || a.link != b.link || a.wide != b.wide {
                 return Some(format!(
-                    "cell {y},{x}: {a:?} != {b:?}; output {out:?}; last parser {:?} ds {:?}",
-                    last.parser, last.ds
+                    "cell {y},{x}: {a:?} != {b:?}; output {out:?}; last ds {:?}",
+                    last.ds
                 ));
             }
         }
@@ -1795,6 +1448,43 @@ mod tests {
     /// programs write: rendering any state to any later one, applied to
     /// the first, gives the later one.
     #[test]
+    fn trailing_blanks_leave_a_wide_character_whole() {
+        let mut last = Screen::new(6, 1);
+        last.apply(b"zzzzzz\r");
+        let mut next = last.clone();
+        next.apply("ab漢\x1b[K".as_bytes());
+        let out = render(true, &last, &next);
+        // The erase of the trailing blanks starts after the right half.
+        assert!(out.contains("\x1b[K"), "{out:?}");
+        assert!(!out.contains("\x1b[1;4H"), "{out:?}");
+        round_trip(&last, &next);
+    }
+
+    #[test]
+    fn x10_mouse_reporting_is_switched_off() {
+        let mut last = Screen::new(4, 1);
+        last.apply(b"\x1b[?9h");
+        let mut next = last.clone();
+        next.apply(b"\x1b[?9l");
+        assert!(render(true, &last, &next).contains("\x1b[?9l"));
+    }
+
+    #[test]
+    fn scrolling_output_scrolls_the_terminal() {
+        let mut a = Screen::new(20, 6);
+        for i in 0..6 {
+            a.apply(format!("line {i}\r\n").as_bytes());
+        }
+        let mut b = a.clone();
+        b.apply(b"line 6\r\nline 7\r\n");
+        let out = render(true, &a, &b);
+        assert!(out.contains("\n\n"), "{out:?}");
+        // Only the new lines are drawn, not the ones that moved up.
+        assert!(!out.contains("line 3"), "{out:?}");
+        assert_eq!(render_mismatch(true, &a, &b), None);
+    }
+
+    #[test]
     fn rendering_reproduces_random_screens() {
         let mut x: u64 = 0x2545_F491_4F6C_DD1D;
         let mut rnd = |n: u64| {
@@ -1803,7 +1493,11 @@ mod tests {
             x ^= x << 17;
             x % n
         };
-        for round in 0..400 {
+        for round in 0..std::env::var("MOSH_ROUNDS")
+            .ok()
+            .and_then(|r| r.parse().ok())
+            .unwrap_or(400)
+        {
             let (w, h) = (1 + rnd(30) as usize, 1 + rnd(12) as usize);
             let mut a = Screen::new(w, h);
             let mut states = vec![a.clone()];
@@ -1900,10 +1594,10 @@ mod tests {
         s.apply(&[
             0xF0, 0x9F, b'x', 0xC3, 0x28, 0xFF, 0x9B, b'2', b'J', 0x9D, b'0', b';', 0x07,
         ]);
-        let long = vec![b'a'; 100_000];
-        s.apply(b"\x1b]0;");
+        let mut long = b"\x1b]0;".to_vec();
+        long.extend(vec![b'a'; 100_000]);
+        long.push(0x07);
         s.apply(&long);
-        s.apply(b"\x07");
         assert!(s.title.chars().count() <= 256);
         assert_eq!(s.rows.len(), 2);
         assert!(s.rows.iter().all(|r| r.cells.len() == 3));
