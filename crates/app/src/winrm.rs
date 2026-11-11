@@ -21,7 +21,7 @@ use ferossh_auth::negotiate::{Credentials, SspiJob};
 use ferossh_config::saved::SavedHost;
 use ferossh_config::ssh_config;
 use ferossh_config::{DEFAULT_WINRM_COMMAND, DEFAULT_WINRM_PORT};
-use ferossh_ipc::{ChannelId, MAX_DATA_CHUNK, Message, SspiOp, Timing};
+use ferossh_ipc::{ChannelId, MAX_DATA_CHUNK, Message, Secrets, SspiOp, Timing};
 use zeroize::Zeroizing;
 
 use crate::ssh::{Effect, Env, State, sanitize};
@@ -192,6 +192,20 @@ pub struct WinrmSession {
     /// Closed from this side while the shell is open: what still seals
     /// the worker's goodbye (terminate, delete) until the window takes it.
     closer: Option<WinrmCloser>,
+    /// The connection has a password source (Credential Manager or a
+    /// command): asked before the prompt.
+    pub password_source: bool,
+    /// The password typed goes to the Windows Credential Manager once
+    /// the login works.
+    pub remember_password: bool,
+    /// Waiting for the password source.
+    fetching: bool,
+    /// The password came from the source.
+    from_source: bool,
+    /// The typed password, kept to store once logged in.
+    to_store: Option<Zeroizing<String>>,
+    /// The shell opened at least once.
+    was_connected: bool,
 }
 
 /// A closed session's last errand: the worker tells the server to end the
@@ -285,6 +299,12 @@ impl WinrmSession {
             recall: 0,
             draft: String::new(),
             closer: None,
+            password_source: false,
+            remember_password: false,
+            fetching: false,
+            from_source: false,
+            to_store: None,
+            was_connected: false,
         }
     }
 
@@ -307,16 +327,68 @@ impl WinrmSession {
     /// user.
     pub fn start(&mut self) -> Vec<Effect> {
         match &self.target.user {
-            Some(user) => {
-                self.asking = true;
-                vec![Effect::Show(format!(
-                    "{}'s password on {}: ",
-                    sanitize(user),
-                    sanitize(&self.target.label())
-                ))]
+            Some(_) if self.password_source => {
+                self.fetching = true;
+                vec![Effect::FetchPassword]
             }
+            Some(_) => self.ask(),
             None => self.connect(),
         }
+    }
+
+    /// Asks for the password at the prompt.
+    fn ask(&mut self) -> Vec<Effect> {
+        let user = self.target.user.as_deref().unwrap_or_default();
+        self.asking = true;
+        vec![Effect::Show(format!(
+            "{}'s password on {}: ",
+            sanitize(user),
+            sanitize(&self.target.label())
+        ))]
+    }
+
+    /// Whether the session waits for its password source.
+    pub fn fetching_password(&self) -> bool {
+        self.fetching && self.state == State::Connecting
+    }
+
+    /// The password source answered: `Ok` logs in with the password,
+    /// `Err` says why not and asks for it at the prompt instead. `from`
+    /// names the source for the note.
+    pub fn password_fetched(
+        &mut self,
+        result: Result<Zeroizing<String>, String>,
+        from: &str,
+    ) -> Vec<Effect> {
+        if !self.fetching_password() {
+            return Vec::new();
+        }
+        self.fetching = false;
+        match result {
+            Ok(password) => {
+                self.from_source = true;
+                self.password = Some(password);
+                let mut effects = vec![Effect::Show(dim(&format!(
+                    "Password from {}.",
+                    sanitize(from)
+                )))];
+                effects.extend(self.connect());
+                effects
+            }
+            Err(why) => {
+                let mut effects = Vec::new();
+                if !why.is_empty() {
+                    effects.push(Effect::Show(dim(&sanitize(&why))));
+                }
+                effects.extend(self.ask());
+                effects
+            }
+        }
+    }
+
+    /// The password from the source did not get in: the next try asks.
+    pub fn source_refused(&self) -> bool {
+        self.from_source && self.state == State::Ended && !self.was_connected
     }
 
     fn connect(&mut self) -> Vec<Effect> {
@@ -480,7 +552,11 @@ impl WinrmSession {
             match c {
                 '\r' | '\n' => {
                     self.asking = false;
-                    self.password = Some(std::mem::take(&mut self.typed_password));
+                    let password = std::mem::take(&mut self.typed_password);
+                    if self.remember_password && !password.is_empty() {
+                        self.to_store = Some(password.clone());
+                    }
+                    self.password = Some(password);
                     let mut effects = vec![Effect::Show("\r\n".into())];
                     effects.extend(self.connect());
                     return effects;
@@ -587,6 +663,7 @@ impl WinrmSession {
             }
             Message::Connected { .. } if self.state == State::Connecting && !self.asking => {
                 self.state = State::Connected;
+                self.was_connected = true;
                 self.password = None;
                 let how = match self.package.as_deref() {
                     Some(p) if p.eq_ignore_ascii_case("Kerberos") => " with Kerberos",
@@ -603,6 +680,14 @@ impl WinrmSession {
                         "{YELLOW}NTLM does not prove the server's identity. Use the \
                          server's domain name to log in with Kerberos.{RESET}\r\n"
                     )));
+                }
+                if let (Some(user), Some(password)) = (&self.target.user, self.to_store.take()) {
+                    effects.push(Effect::StorePassword {
+                        user: user.clone(),
+                        host: self.target.hostname.clone(),
+                        port: self.target.port,
+                        password: Secrets(vec![password.to_string()]),
+                    });
                 }
                 effects.push(Effect::Connected);
                 effects
@@ -711,6 +796,137 @@ mod tests {
             host_key: "none".into(),
         });
         s
+    }
+
+    fn connected_msg() -> Message {
+        Message::Connected {
+            channel: 5,
+            kex: "WinRM".into(),
+            cipher: "SSPI".into(),
+            host_key: "none".into(),
+        }
+    }
+
+    /// The password the first login hands the broker.
+    fn login_password(s: &mut WinrmSession) -> Option<String> {
+        let fx = s.on_worker(Message::SspiRequest {
+            channel: 5,
+            conn: 0,
+            op: SspiOp::Start,
+        });
+        fx.into_iter().find_map(|e| match e {
+            Effect::Broker(Job::Sspi(j)) => j.credentials.map(|c| c.password.to_string()),
+            _ => None,
+        })
+    }
+
+    fn stored(effects: &[Effect]) -> Option<String> {
+        effects.iter().find_map(|e| match e {
+            Effect::StorePassword {
+                user,
+                host,
+                port,
+                password,
+            } => Some(format!("{user}@{host}:{port}={}", password.0.first()?)),
+            _ => None,
+        })
+    }
+
+    #[test]
+    fn a_password_source_answers_before_the_prompt() {
+        let mut s = WinrmSession::new(5, WinrmTarget::typed("winrm://admin@srv").unwrap());
+        s.password_source = true;
+        let fx = s.start();
+        assert!(matches!(fx[..], [Effect::FetchPassword]), "{fx:?}");
+        assert!(s.fetching_password());
+        // Typing meanwhile goes nowhere.
+        assert!(s.input(b"x").is_empty());
+        let fx = s.password_fetched(Ok(Zeroizing::new("secret".into())), "pass");
+        assert!(shown(&fx).contains("Password from pass."), "{fx:?}");
+        assert!(
+            fx.iter()
+                .any(|e| matches!(e, Effect::Send(Message::WinrmConnect { .. })))
+        );
+        assert!(!s.fetching_password());
+        // A late second answer changes nothing.
+        assert!(
+            s.password_fetched(Ok(Zeroizing::new("x".into())), "pass")
+                .is_empty()
+        );
+        assert_eq!(login_password(&mut s).as_deref(), Some("secret"));
+        // From the source: nothing to store.
+        assert_eq!(stored(&s.on_worker(connected_msg())), None);
+        assert!(!s.source_refused());
+    }
+
+    #[test]
+    fn without_a_password_from_the_source_it_asks() {
+        let mut s = WinrmSession::new(5, WinrmTarget::typed("winrm://admin@srv").unwrap());
+        s.password_source = true;
+        s.start();
+        let fx = s.password_fetched(Err("No password saved yet.".into()), "");
+        let text = shown(&fx);
+        assert!(text.contains("No password saved yet."), "{text:?}");
+        assert!(text.contains("admin's password on srv"), "{text:?}");
+        assert!(!fx.iter().any(|e| matches!(e, Effect::Send(_))));
+        let fx = s.input(b"typed\r");
+        assert!(
+            fx.iter()
+                .any(|e| matches!(e, Effect::Send(Message::WinrmConnect { .. })))
+        );
+        assert_eq!(login_password(&mut s).as_deref(), Some("typed"));
+    }
+
+    #[test]
+    fn a_typed_password_is_kept_once_the_login_works() {
+        let mut s = WinrmSession::new(5, WinrmTarget::typed("winrm://LAB\\admin@srv").unwrap());
+        s.remember_password = true;
+        s.start();
+        s.input(b"pw\r");
+        let fx = s.on_worker(connected_msg());
+        assert_eq!(stored(&fx).as_deref(), Some("LAB\\admin@srv:5985=pw"));
+        // Not without the Credential Manager as the source.
+        let mut s = WinrmSession::new(5, WinrmTarget::typed("winrm://admin@srv").unwrap());
+        s.start();
+        s.input(b"pw\r");
+        assert_eq!(stored(&s.on_worker(connected_msg())), None);
+        // Nor when the login fails.
+        let mut s = WinrmSession::new(5, WinrmTarget::typed("winrm://admin@srv").unwrap());
+        s.remember_password = true;
+        s.start();
+        s.input(b"pw\r");
+        let fx = s.on_worker(Message::Disconnected {
+            channel: 5,
+            reason: "Access denied: the server refused the login.".into(),
+        });
+        assert_eq!(stored(&fx), None);
+    }
+
+    #[test]
+    fn a_refused_source_password_is_asked_for_next_time() {
+        let mut s = WinrmSession::new(5, WinrmTarget::typed("winrm://admin@srv").unwrap());
+        s.password_source = true;
+        s.start();
+        s.password_fetched(
+            Ok(Zeroizing::new("old".into())),
+            "the Windows Credential Manager",
+        );
+        s.on_worker(Message::Disconnected {
+            channel: 5,
+            reason: "Access denied: the server refused the login.".into(),
+        });
+        assert!(s.source_refused());
+        // Once the shell was open, a drop later is not the password's fault.
+        let mut s = WinrmSession::new(5, WinrmTarget::typed("winrm://admin@srv").unwrap());
+        s.password_source = true;
+        s.start();
+        s.password_fetched(Ok(Zeroizing::new("ok".into())), "pass");
+        s.on_worker(connected_msg());
+        s.on_worker(Message::Disconnected {
+            channel: 5,
+            reason: "The server closed the connection.".into(),
+        });
+        assert!(!s.source_refused());
     }
 
     #[test]

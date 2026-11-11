@@ -520,6 +520,21 @@ impl SessionForm {
                 .is_some_and(|o| o.eq_ignore_ascii_case(self.values.name.trim()))
     }
 
+    /// The password source and what goes with it.
+    fn password_items(&self, out: &mut Vec<Item>) {
+        out.push(Item::Field(Field::Password));
+        match self.values.password {
+            PASSWORD_ASK => {}
+            PASSWORD_WINDOWS => {
+                out.push(Item::Note("Saved after a login that works.".into()));
+            }
+            _ => {
+                out.push(Item::Field(Field::PasswordCommand));
+                out.push(Item::Note("%n is the connection's name.".into()));
+            }
+        }
+    }
+
     fn field_locked(&self, f: Field) -> bool {
         self.locked()
             && matches!(
@@ -591,17 +606,7 @@ impl SessionForm {
                     if !self.field_locked(Field::Key) {
                         out.push(Item::Browse);
                     }
-                    out.push(Item::Field(Field::Password));
-                    match self.values.password {
-                        PASSWORD_ASK => {}
-                        PASSWORD_WINDOWS => {
-                            out.push(Item::Note("Saved after a login that works.".into()));
-                        }
-                        _ => {
-                            out.push(Item::Field(Field::PasswordCommand));
-                            out.push(Item::Note("%n is the connection's name.".into()));
-                        }
-                    }
+                    self.password_items(&mut out);
                     out.push(Item::Field(Field::Jump));
                     out.push(Item::Field(Field::Proxy));
                     if kind == SessionKind::Mosh {
@@ -647,9 +652,10 @@ impl SessionForm {
                     out.push(Item::Note("can read it, passwords too.".into()));
                 }
                 SessionKind::WinRm => {
+                    self.password_items(&mut out);
                     out.push(Item::Field(Field::WinrmCommand));
-                    out.push(Item::Note("Kerberos or NTLM login, asks the".into()));
-                    out.push(Item::Note("password; empty user: your own.".into()));
+                    out.push(Item::Note("Kerberos or NTLM login; an empty".into()));
+                    out.push(Item::Note("user logs in as yourself.".into()));
                     out.push(Item::Note("Lines go on Enter: no full screen.".into()));
                 }
             }
@@ -1564,11 +1570,18 @@ impl SessionForm {
         }
         if matches!(
             v.kind,
-            SessionKind::Ssh | SessionKind::Mosh | SessionKind::Sftp
+            SessionKind::Ssh | SessionKind::Mosh | SessionKind::Sftp | SessionKind::WinRm
         ) && v.password > PASSWORD_WINDOWS
             && v.password_command.trim().is_empty()
         {
             return Err("Fill in the password manager's command, or pick another source.".into());
+        }
+        if v.kind == SessionKind::WinRm && v.password != PASSWORD_ASK && v.user.trim().is_empty() {
+            return Err(
+                "A password source needs a user: without one, WinRM logs in as yourself \
+                 with no password."
+                    .into(),
+            );
         }
         Ok(())
     }
@@ -2069,10 +2082,11 @@ impl SessionForm {
             .filter(|d| *d != ferossh_config::settings::DesktopSize::Follow);
         p.legacy_algorithms = v.legacy;
         p.password = match (v.kind, v.password) {
-            (SessionKind::Ssh | SessionKind::Mosh | SessionKind::Sftp, PASSWORD_WINDOWS) => {
-                PasswordSource::Windows
-            }
-            (SessionKind::Ssh | SessionKind::Mosh | SessionKind::Sftp, i)
+            (
+                SessionKind::Ssh | SessionKind::Mosh | SessionKind::Sftp | SessionKind::WinRm,
+                PASSWORD_WINDOWS,
+            ) => PasswordSource::Windows,
+            (SessionKind::Ssh | SessionKind::Mosh | SessionKind::Sftp | SessionKind::WinRm, i)
                 if i > PASSWORD_WINDOWS =>
             {
                 PasswordSource::Command(v.password_command.trim().to_owned())
@@ -2654,6 +2668,28 @@ mod tests {
         let p = settings.profile("win-srv").unwrap();
         assert_eq!(p.kind, SessionKind::WinRm);
         assert_eq!(p.winrm_command.as_deref(), Some("cmd"));
+        assert_eq!(p.password, PasswordSource::Ask);
+        // A password source: shown, saved, and only with a user.
+        assert!(t.iter().any(|l| l.contains("Password")));
+        f.values.password = PASSWORD_WINDOWS;
+        let t = texts(&mut f);
+        assert!(t.iter().any(|l| l.contains("Saved after a login")));
+        f.apply(&mut hosts, &mut settings);
+        assert_eq!(
+            settings.profile("win-srv").unwrap().password,
+            PasswordSource::Windows
+        );
+        f.values.password = PASSWORD_WINDOWS + 1;
+        f.values.password_command = "pass show win/%n".into();
+        f.apply(&mut hosts, &mut settings);
+        assert_eq!(
+            settings.profile("win-srv").unwrap().password,
+            PasswordSource::Command("pass show win/%n".into())
+        );
+        f.values.user.clear();
+        assert!(f.check().unwrap_err().contains("needs a user"));
+        f.values.user = "LAB\\admin".into();
+        f.values.password = PASSWORD_ASK;
         // The default command is not written out.
         f.values.winrm_command = ferossh_config::DEFAULT_WINRM_COMMAND.into();
         f.apply(&mut hosts, &mut settings);

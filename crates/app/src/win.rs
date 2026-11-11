@@ -539,6 +539,18 @@ enum Host {
 /// shares them. Each SSH connection has its own, so a server that took
 /// over one worker reaches only its own connection: the shells, SFTP and
 /// forwards on it, never another host's.
+/// The login a password source answers, from [`Window::password_login`].
+struct PasswordLogin {
+    /// The saved connection's name, whose profile names the source.
+    alias: String,
+    user: String,
+    hostname: String,
+    port: u16,
+    channel: ChannelId,
+    /// An SSH login (a multi-host run's password can answer it).
+    ssh: bool,
+}
+
 struct WorkerConn {
     link: Link,
     forwarder: Forwarder,
@@ -5238,6 +5250,12 @@ impl Window {
     /// that parses everything the server sends; the login and the
     /// encryption run on the broker.
     fn connect_winrm(&mut self, id: PaneId, target: WinrmTarget) {
+        self.connect_winrm_with(id, target, false);
+    }
+
+    /// Opens WinRM session `target` in pane `id`; `ask` skips the
+    /// connection's password source (it just failed) and asks.
+    fn connect_winrm_with(&mut self, id: PaneId, target: WinrmTarget, ask: bool) {
         self.end_host(id);
         if let Some(p) = self.panes.get_mut(&id) {
             p.term.scroll_to_bottom();
@@ -5254,7 +5272,15 @@ impl Window {
             );
         }
         self.apply_look(id, &target.alias, &target.hostname, target.tag.as_deref());
+        let source = self
+            .settings
+            .profile(&target.alias)
+            .filter(|p| p.kind == SessionKind::WinRm)
+            .map(|p| p.password.clone())
+            .unwrap_or_default();
         let mut session = WinrmSession::new(channel, target);
+        session.password_source = source != PasswordSource::Ask && !ask;
+        session.remember_password = source == PasswordSource::Windows;
         let effects = session.start();
         let Some(p) = self.panes.get_mut(&id) else {
             return;
@@ -5343,8 +5369,8 @@ impl Window {
                 return;
             }
             Some(Host::Winrm(s)) => {
-                let target = s.target.clone();
-                self.connect_winrm(id, target);
+                let (target, ask) = (s.target.clone(), s.source_refused());
+                self.connect_winrm_with(id, target, ask);
                 return;
             }
             _ => None,
@@ -5937,19 +5963,46 @@ impl Window {
         }
     }
 
-    /// Gets the login password of SSH pane `id` from its password source.
+    /// The login of pane `id` that a password source answers: an SSH
+    /// pane's (a jump host's, or its host's) or a WinRM pane's.
+    fn password_login(&self, id: PaneId) -> Option<PasswordLogin> {
+        match self.panes.get(&id).map(|p| &p.host)? {
+            Host::Ssh(s) => {
+                let t = s.login_target();
+                Some(PasswordLogin {
+                    alias: t.alias.clone(),
+                    user: t.user.clone(),
+                    hostname: t.hostname.clone(),
+                    port: t.port,
+                    channel: s.channel,
+                    ssh: true,
+                })
+            }
+            Host::Winrm(s) => Some(PasswordLogin {
+                alias: s.target.alias.clone(),
+                user: s.target.user.clone()?,
+                hostname: s.target.hostname.clone(),
+                port: s.target.port,
+                channel: s.channel,
+                ssh: false,
+            }),
+            _ => None,
+        }
+    }
+
+    /// Gets the login password of pane `id` (SSH or WinRM) from its
+    /// password source.
     fn fetch_password(&mut self, id: PaneId) {
-        let Some(Host::Ssh(s)) = self.panes.get(&id).map(|p| &p.host) else {
+        let Some(t) = self.password_login(id) else {
             return;
         };
-        // The login asking: a jump host's, or the pane's host's.
-        let t = s.login_target();
         let source = self
             .settings
             .profile(&t.alias)
             .map(|p| p.password.clone())
             .unwrap_or_default();
-        if self.run_login.contains(&id)
+        if t.ssh
+            && self.run_login.contains(&id)
             && let Some(password) = self.run_password()
         {
             // A run's password answers the logins with none saved; one
@@ -6002,10 +6055,9 @@ impl Window {
     /// Runs the password manager command `line` for pane `id`'s login on
     /// a thread of its own; [`Self::poll_passwords`] takes the answer.
     fn run_password_command(&mut self, id: PaneId, line: &str) {
-        let Some(Host::Ssh(s)) = self.panes.get(&id).map(|p| &p.host) else {
+        let Some(t) = self.password_login(id) else {
             return;
         };
-        let t = s.login_target();
         let tokens = pw_source::Tokens {
             name: &t.alias,
             host: &t.hostname,
@@ -6016,7 +6068,7 @@ impl Window {
             self.password_result(id, Err("The password command is empty.".into()), "");
             return;
         };
-        let channel = s.channel;
+        let channel = t.channel;
         let name = Path::new(&program)
             .file_stem()
             .map_or_else(|| program.clone(), |n| n.to_string_lossy().into_owned());
@@ -6047,10 +6099,11 @@ impl Window {
             Err(_) => return,
         };
         for (id, channel, name, result) in done {
-            let waiting = matches!(
-                self.panes.get(&id).map(|p| &p.host),
-                Some(Host::Ssh(s)) if s.channel == channel && s.fetching_password()
-            );
+            let waiting = match self.panes.get(&id).map(|p| &p.host) {
+                Some(Host::Ssh(s)) => s.channel == channel && s.fetching_password(),
+                Some(Host::Winrm(s)) => s.channel == channel && s.fetching_password(),
+                _ => false,
+            };
             if waiting {
                 self.password_result(id, result, &name);
             }
@@ -6065,10 +6118,11 @@ impl Window {
         result: std::result::Result<Zeroizing<String>, String>,
         from: &str,
     ) {
-        let Some(Host::Ssh(s)) = self.panes.get_mut(&id).map(|p| &mut p.host) else {
-            return;
+        let effects = match self.panes.get_mut(&id).map(|p| &mut p.host) {
+            Some(Host::Ssh(s)) => s.password_fetched(result, from),
+            Some(Host::Winrm(s)) => s.password_fetched(result, from),
+            _ => return,
         };
-        let effects = s.password_fetched(result, from);
         self.apply(id, effects);
         self.refresh(id);
     }
@@ -9956,15 +10010,15 @@ impl Window {
                 let forget = (was_windows && !still_windows)
                     .then(|| form.original.clone())
                     .flatten()
-                    .and_then(|o| Target::resolve(&o, &ssh_env()));
+                    .and_then(|o| self.saved_password_target(&o));
                 if let Err(e) = write_app_file(&sessions_path(), &saved::to_text(&hosts)) {
                     return Some(Command::Notice(format!(
                         "Could not save the connection to {}: {e}",
                         sessions_path().display()
                     )));
                 }
-                if let Some(t) = forget {
-                    credman::delete(&credman::target(&t.user, &t.hostname, t.port));
+                if let Some(target) = forget {
+                    credman::delete(&target);
                 }
                 self.settings = settings;
                 self.save_settings();
@@ -9989,15 +10043,33 @@ impl Window {
         out
     }
 
+    /// The Credential Manager entry of saved connection `name`'s password:
+    /// its WinRM or SSH login, as the settings now describe it.
+    fn saved_password_target(&self, name: &str) -> Option<String> {
+        if self
+            .settings
+            .profile(name)
+            .is_some_and(|p| p.kind == SessionKind::WinRm)
+        {
+            let saved = load_saved()
+                .into_iter()
+                .find(|h| h.alias.eq_ignore_ascii_case(name));
+            let t = WinrmTarget::resolve(name, &ssh_env(), None, saved.as_ref())?;
+            return Some(credman::target(t.user.as_deref()?, &t.hostname, t.port));
+        }
+        let t = Target::resolve(name, &ssh_env())?;
+        Some(credman::target(&t.user, &t.hostname, t.port))
+    }
+
     /// Removes saved session `name` (after the user said yes).
     fn delete_session(&mut self, name: &str) {
         if self
             .settings
             .profile(name)
             .is_some_and(|p| p.password == PasswordSource::Windows)
-            && let Some(t) = Target::resolve(name, &ssh_env())
+            && let Some(target) = self.saved_password_target(name)
         {
-            credman::delete(&credman::target(&t.user, &t.hostname, t.port));
+            credman::delete(&target);
         }
         let mut hosts = load_saved();
         session_form::delete(name, &mut hosts, &mut self.settings);
