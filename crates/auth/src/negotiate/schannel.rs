@@ -24,9 +24,9 @@ use windows::Win32::Security::Authentication::Identity::{
     QueryContextAttributesW, SCH_CRED_MANUAL_CRED_VALIDATION, SCH_CRED_NO_DEFAULT_CREDS,
     SCH_CREDENTIALS, SCH_CREDENTIALS_VERSION, SCH_USE_STRONG_CRYPTO, SECBUFFER_ALERT,
     SECBUFFER_DATA, SECBUFFER_EMPTY, SECBUFFER_EXTRA, SECBUFFER_STREAM_HEADER,
-    SECBUFFER_STREAM_TRAILER, SECBUFFER_TOKEN, SECBUFFER_VERSION, SECPKG_ATTR_REMOTE_CERT_CONTEXT,
-    SECPKG_ATTR_STREAM_SIZES, SECPKG_CRED_OUTBOUND, SecBuffer, SecBufferDesc,
-    SecPkgContext_StreamSizes, UNISP_NAME,
+    SECBUFFER_STREAM_TRAILER, SECBUFFER_TOKEN, SECBUFFER_VERSION, SECPKG_ATTR_ENDPOINT_BINDINGS,
+    SECPKG_ATTR_REMOTE_CERT_CONTEXT, SECPKG_ATTR_STREAM_SIZES, SECPKG_CRED_OUTBOUND, SecBuffer,
+    SecBufferDesc, SecPkgContext_Bindings, SecPkgContext_StreamSizes, UNISP_NAME,
 };
 use windows::Win32::Security::Credentials::SecHandle;
 use windows::Win32::Security::Cryptography::{
@@ -418,6 +418,34 @@ impl TlsContext for Connection {
             out.extend_from_slice(&record);
         }
         Ok(out)
+    }
+
+    fn channel_bindings(&self) -> Result<Vec<u8>, String> {
+        let ctx = self.ctx.ok_or("no TLS connection")?;
+        let mut b = SecPkgContext_Bindings::default();
+        // SAFETY: SECPKG_ATTR_ENDPOINT_BINDINGS fills in the structure; its
+        // buffer is SChannel's, copied and freed below.
+        unsafe {
+            QueryContextAttributesW(
+                &ctx,
+                SECPKG_ATTR_ENDPOINT_BINDINGS,
+                (&mut b as *mut SecPkgContext_Bindings).cast::<c_void>(),
+            )
+        }
+        .map_err(|e| format!("no channel bindings ({})", e.message()))?;
+        if b.Bindings.is_null() {
+            return Err("no channel bindings".into());
+        }
+        // SAFETY: SChannel wrote BindingsLength bytes at Bindings.
+        let bytes = unsafe {
+            std::slice::from_raw_parts(b.Bindings.cast::<u8>(), b.BindingsLength as usize)
+        }
+        .to_vec();
+        // SAFETY: allocated by SChannel for this call, freed once.
+        unsafe {
+            let _ = FreeContextBuffer(b.Bindings.cast());
+        }
+        Ok(bytes)
     }
 
     fn certificate(&self) -> Result<ServerCert, String> {

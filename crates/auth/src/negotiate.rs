@@ -103,15 +103,23 @@ pub trait TlsContext: Send {
     fn send(&mut self, plain: &[u8]) -> Result<Vec<u8>, String>;
     /// The server's certificate, once the handshake is done.
     fn certificate(&self) -> Result<ServerCert, String>;
+    /// The connection's channel bindings (RFC 5929 `tls-server-end-point`),
+    /// as SSPI hands them to a login over it, once the handshake is done.
+    fn channel_bindings(&self) -> Result<Vec<u8>, String> {
+        Err("no channel bindings".into())
+    }
 }
 
 /// Makes Negotiate contexts.
 pub trait NegotiateProvider: Send {
-    /// A context for the `HTTP` service on `host`.
+    /// A context for the `HTTP` service on `host`. Over HTTPS,
+    /// `bindings` are the TLS connection's channel bindings, which tie the
+    /// login to it (Extended Protection for Authentication).
     fn start(
         &self,
         host: &str,
         credentials: Option<&Credentials>,
+        bindings: Option<&[u8]>,
     ) -> Result<Box<dyn NegotiateContext>, String>;
 
     /// A TLS connection to `host`.
@@ -129,6 +137,7 @@ impl NegotiateProvider for Unavailable {
         &self,
         _host: &str,
         _credentials: Option<&Credentials>,
+        _bindings: Option<&[u8]>,
     ) -> Result<Box<dyn NegotiateContext>, String> {
         Err("WinRM logins need Windows".into())
     }
@@ -307,7 +316,13 @@ impl Contexts {
             if self.open.len() + self.tls.len() >= MAX_CONTEXTS {
                 return Err("too many WinRM logins at once".into());
             }
-            let ctx = provider.start(&job.host, job.credentials.as_ref())?;
+            // A login on a TLS connection is bound to it.
+            let bindings = match self.tls.get(&key) {
+                Some(tls) if tls.ready => Some(tls.ctx.channel_bindings()?),
+                Some(_) => return Err("a login before the TLS handshake".into()),
+                None => None,
+            };
+            let ctx = provider.start(&job.host, job.credentials.as_ref(), bindings.as_deref())?;
             self.open.insert(key, ctx);
         }
         let ctx = self.open.get_mut(&key).ok_or("the login was not started")?;
@@ -384,6 +399,7 @@ pub(crate) mod tests {
             &self,
             host: &str,
             _c: Option<&Credentials>,
+            _b: Option<&[u8]>,
         ) -> Result<Box<dyn NegotiateContext>, String> {
             if host == "nowhere" {
                 return Err("no such host".into());
