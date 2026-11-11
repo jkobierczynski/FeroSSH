@@ -13,7 +13,8 @@
 //! maps the key) drops every guess and makes the rest tentative again.
 //! Tentative guesses are made but not shown until one of them comes true,
 //! so nothing a program keeps hidden is ever drawn. Shown guesses are
-//! underlined while the link is slow, to mark them as not yet confirmed.
+//! underlined while the link is very slow (from about 80 ms), to mark
+//! them as not yet confirmed.
 
 use std::sync::Arc;
 
@@ -75,6 +76,8 @@ pub struct Predictor {
     version: u64,
     /// Undecoded bytes of a UTF-8 character or escape sequence.
     pending: Vec<u8>,
+    /// Where the server's cursor was at the last update.
+    last_cursor: Option<(usize, usize)>,
 }
 
 impl Predictor {
@@ -187,23 +190,52 @@ impl Predictor {
             self.frozen_until = None;
             self.trusted = false;
         }
+        let cursor = (screen.ds.cursor_row, screen.ds.cursor_col);
         let done = self.guesses.iter().take_while(|g| g.pos <= echoed).count();
         if done > 0 {
             let checked: Vec<Guess> = self.guesses.drain(..done).collect();
-            let right = checked.iter().all(|g| holds(screen, g))
-                && checked
-                    .last()
-                    .is_some_and(|g| (screen.ds.cursor_row, screen.ds.cursor_col) == g.cursor);
-            if right {
-                if !self.trusted {
-                    self.trusted = true;
+            // Only the last guess for each cell must still show: an
+            // earlier one was typed over or erased by a later keystroke.
+            let mut cells = Vec::new();
+            let mut right = checked.last().is_some_and(|g| cursor == g.cursor);
+            // Trust needs a typed character that came true: an erased
+            // cell or a cursor move also "holds" where the server echoes
+            // nothing, as at a password prompt.
+            let mut typed = false;
+            for g in checked.iter().rev() {
+                let Some((row, col, c)) = g.cell else {
+                    continue;
+                };
+                if cells.contains(&(row, col)) {
+                    continue;
                 }
-            } else {
+                cells.push((row, col));
+                if !holds(screen, g) {
+                    right = false;
+                    break;
+                }
+                typed |= c.is_some();
+            }
+            if !right {
                 self.guesses.clear();
                 self.trusted = false;
+            } else if typed {
+                self.trusted = true;
             }
             self.changed();
+        } else if self.last_cursor.is_some_and(|c| c != cursor)
+            && !self.guesses.iter().any(|g| g.cursor == cursor)
+        {
+            // The cursor moved, and not as a keystroke of ours (the
+            // server may echo before it acknowledges): the program wrote
+            // something, perhaps a password prompt. Start over.
+            if !self.guesses.is_empty() {
+                self.changed();
+            }
+            self.guesses.clear();
+            self.trusted = false;
         }
+        self.last_cursor = Some(cursor);
         let late = self
             .guesses
             .first()
@@ -421,6 +453,55 @@ mod tests {
         assert_eq!(text(&shown(&p, &server), 0), "Password:");
         p.update(&server, 6, 100.0, 0);
         assert_eq!(text(&shown(&p, &server), 0), "Password:");
+    }
+
+    #[test]
+    fn a_typed_over_cell_counts_only_its_last_guess() {
+        let mut server = Screen::new(20, 1);
+        server.apply(b"$ ");
+        let mut p = Predictor::new(Mode::Always);
+        p.typed(b"l", 1, &server, 0);
+        server.apply(b"l");
+        p.update(&server, 1, 100.0, 0);
+        // "x" then Backspace, both echoed in one go: the cell is empty
+        // again, and that is right.
+        p.typed(b"x\x7f", 3, &server, 0);
+        server.apply(b"x\x08\x1b[K");
+        p.update(&server, 3, 100.0, 0);
+        p.typed(b"s", 4, &server, 0);
+        p.update(&server, 3, 100.0, 0);
+        assert_eq!(text(&shown(&p, &server), 0), "$ ls");
+    }
+
+    #[test]
+    fn erasing_at_a_password_prompt_earns_no_trust() {
+        let mut server = Screen::new(30, 1);
+        server.apply(b"Password: ");
+        let mut p = Predictor::new(Mode::Always);
+        // Typed and erased: the screen is unchanged, as it would be
+        // whether or not the server echoes.
+        p.typed(b"a\x7f", 2, &server, 0);
+        p.update(&server, 2, 100.0, 0);
+        p.typed(b"b", 3, &server, 0);
+        p.update(&server, 2, 100.0, 0);
+        assert_eq!(text(&shown(&p, &server), 0), "Password:");
+    }
+
+    #[test]
+    fn a_prompt_appearing_on_its_own_resets_trust() {
+        let mut server = Screen::new(30, 2);
+        server.apply(b"$ ");
+        let mut p = Predictor::new(Mode::Always);
+        p.typed(b"l", 1, &server, 0);
+        server.apply(b"l");
+        p.update(&server, 1, 100.0, 0);
+        // No keystroke of ours, yet the screen moves on: say a locked
+        // tmux asking for the password.
+        server.apply(b"\r\nPassword: ");
+        p.update(&server, 1, 100.0, 0);
+        p.typed(b"h", 2, &server, 0);
+        p.update(&server, 1, 100.0, 0);
+        assert_eq!(text(&shown(&p, &server), 1), "Password:");
     }
 
     #[test]
