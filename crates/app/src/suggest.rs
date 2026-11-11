@@ -411,6 +411,12 @@ pub struct Tracker {
     /// Typed ahead while the host had not answered the last Enter yet:
     /// where this line starts is unknown, so it is not followed.
     skip_line: bool,
+    /// The line as last read with the cursor at its end.
+    seen: Option<String>,
+    /// What the line must read once the host echoed the text typed since
+    /// `seen`: until it does, no suggestion (keys typed faster than the
+    /// echo would otherwise get one made for an older line).
+    expect: Option<String>,
 }
 
 impl Tracker {
@@ -420,6 +426,8 @@ impl Tracker {
     pub fn typed(&mut self, term: &Terminal, bytes: &[u8]) -> Option<String> {
         self.choice = 0;
         self.sent_at = Some(term.output_count());
+        let had_mark = self.mark.is_some();
+        let base = self.expect.take().or_else(|| self.seen.take());
         let done = self.settle(term);
         match bytes {
             b"\r" | b"\r\n" | b"\n" => {
@@ -454,6 +462,18 @@ impl Tracker {
                 if self.mark.is_none() && !self.skip_line {
                     self.mark = term.input_mark();
                 }
+                // Plain text typed at the end of the line: the line it
+                // makes is known. Other keys (Backspace, arrows, Tab) make
+                // a line only the host knows: then any output will do.
+                let base = if had_mark { base } else { Some(String::new()) };
+                let text = std::str::from_utf8(bytes)
+                    .ok()
+                    .filter(|t| !t.is_empty() && !t.chars().any(char::is_control));
+                if self.mark.is_some()
+                    && let (Some(base), Some(text)) = (base, text)
+                {
+                    self.expect = Some(base + text);
+                }
             }
         }
         done
@@ -487,12 +507,6 @@ impl Tracker {
     /// started on the main screen, not at a prompt for a secret, and the
     /// cursor is at its end.
     pub fn line(&mut self, term: &Terminal) -> Option<InputLine> {
-        if let Some(at) = self.sent_at {
-            if at == term.output_count() {
-                return None;
-            }
-            self.sent_at = None;
-        }
         if term.wrap_pending() {
             return None;
         }
@@ -501,7 +515,23 @@ impl Tracker {
             return None;
         }
         let line = term.input_line(mark)?;
-        line.after.is_empty().then_some(line)
+        if let Some(e) = &self.expect {
+            if line.before != *e {
+                return None;
+            }
+            self.expect = None;
+            self.sent_at = None;
+        } else if let Some(at) = self.sent_at {
+            if at == term.output_count() {
+                return None;
+            }
+            self.sent_at = None;
+        }
+        if !line.after.is_empty() {
+            return None;
+        }
+        self.seen = Some(line.before.clone());
+        Some(line)
     }
 
     /// Forgets the line being typed (the pane was cleared or reset).
@@ -748,6 +778,23 @@ mod tests {
         assert!(k.line(&t).is_none());
         t.feed(b"i");
         assert_eq!(k.line(&t).unwrap().before, "gi");
+    }
+
+    #[test]
+    fn no_suggestion_while_keys_typed_ahead_are_not_echoed() {
+        let mut t = term();
+        let mut k = Tracker::default();
+        t.feed(b"$ ");
+        k.typed(&t, b"g");
+        t.feed(b"g");
+        assert_eq!(k.line(&t).unwrap().before, "g");
+        // Two keys before the first echo.
+        k.typed(&t, b"i");
+        k.typed(&t, b"t");
+        t.feed(b"i");
+        assert!(k.line(&t).is_none(), "t is not echoed yet");
+        t.feed(b"t");
+        assert_eq!(k.line(&t).unwrap().before, "git");
     }
 
     #[test]
