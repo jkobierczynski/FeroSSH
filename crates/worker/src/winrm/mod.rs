@@ -182,11 +182,27 @@ async fn session(
     let setup = async {
         let mut main = Conn::open(channel, OUTPUT, params, replies_out, out).await?;
         let endpoint = main.endpoint.clone();
+        // Opening the shell loads the account's Windows profile, which
+        // the first time means creating it: say what the wait is.
+        let _ = out
+            .send(Message::Notice {
+                channel,
+                text: "Logged in; opening a shell (an account's first login can \
+                       take a minute while Windows creates its profile)..."
+                    .into(),
+            })
+            .await;
         let shell = main
             .call(&soap::create_shell(&header(&endpoint, None)))
             .await
             .map_err(|e| e.say("open a shell"))?;
         let shell = soap::shell_id(&shell).ok_or("The server did not say which shell it made.")?;
+        let _ = out
+            .send(Message::Notice {
+                channel,
+                text: format!("Shell open; starting {}...", params.command),
+            })
+            .await;
         let started = main
             .call(&soap::command(
                 &header(&endpoint, Some(&shell)),

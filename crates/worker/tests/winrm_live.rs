@@ -105,6 +105,7 @@ async fn run(command: &str, line: &str, want: &str) -> (Option<u32>, String) {
                 assert!(exited, "{command}: ended early: {reason}; shown {shown:?}");
                 return (code, shown);
             }
+            Message::Notice { .. } => {}
             other => panic!("{command}: unexpected {other:?}"),
         }
     }

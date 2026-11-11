@@ -344,6 +344,7 @@ async fn runs_a_winrm_shell() {
             }
             Message::ExitStatus { channel: 3, code } => exit = Some(code),
             Message::Disconnected { channel: 3, reason } => break reason,
+            Message::Notice { channel: 3, .. } => {}
             other => panic!("unexpected {other:?}"),
         }
     };
@@ -426,6 +427,7 @@ async fn refuses_unsealed_replies() {
                     .unwrap();
             }
             Message::Disconnected { reason, .. } => break reason,
+            Message::Notice { channel: 3, .. } => {}
             other => panic!("unexpected {other:?}"),
         }
     };
