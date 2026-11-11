@@ -5,7 +5,8 @@
 //! PowerShell, sends a line to each and reads the answer, then exits.
 //!
 //! Runs only where `FEROSSH_WINRM_LIVE` is set: the Windows CI job turns
-//! WinRM on (`Enable-PSRemoting`) and sets it.
+//! WinRM on (`Enable-PSRemoting`), adds an HTTPS listener on 5986 with a
+//! self-signed certificate, and sets it.
 
 #![cfg(windows)]
 #![allow(
@@ -22,8 +23,10 @@ use ferossh_ipc::{Message, PROTOCOL_VERSION};
 use tokio::sync::mpsc;
 
 /// Runs `command`, types `line`, waits for `want` in the output, types
-/// `exit` and returns the exit code and everything shown.
-async fn run(command: &str, line: &str, want: &str) -> (Option<u32>, String) {
+/// `exit` and returns the exit code and everything shown. With `https`
+/// the session goes to the HTTPS listener on 5986, with TLS done by
+/// SChannel in the test as the window would do it.
+async fn run(command: &str, line: &str, want: &str, https: bool) -> (Option<u32>, String) {
     let (to_worker, inbox) = mpsc::channel(64);
     let (out, mut from_worker) = mpsc::channel(64);
     tokio::spawn(ferossh_worker::serve(inbox, out));
@@ -42,9 +45,10 @@ async fn run(command: &str, line: &str, want: &str) -> (Option<u32>, String) {
     send(Message::WinrmConnect {
         channel: 1,
         host: "localhost".into(),
-        port: 5985,
+        port: if https { 5986 } else { 5985 },
         connect_timeout: 20,
         command: command.into(),
+        https,
     })
     .await;
     let mut contexts = Contexts::default();
@@ -52,6 +56,7 @@ async fn run(command: &str, line: &str, want: &str) -> (Option<u32>, String) {
     let mut typed = false;
     let mut exited = false;
     let mut code = None;
+    let mut certified = false;
     let deadline = tokio::time::Instant::now() + Duration::from_secs(120);
     loop {
         let msg = tokio::time::timeout_at(deadline, from_worker.recv())
@@ -73,6 +78,16 @@ async fn run(command: &str, line: &str, want: &str) -> (Option<u32>, String) {
                 if let Some(p) = &output.package {
                     eprintln!("{command}: logged in with {p}");
                 }
+                // The CI listener has a self-signed certificate, which
+                // Windows does not trust; the window would ask about it.
+                if let Some(cert) = &output.cert {
+                    eprintln!(
+                        "{command}: certificate {} ({:?})",
+                        cert.sha256, cert.windows
+                    );
+                    assert!(https, "{command}: a certificate over HTTP");
+                    certified = true;
+                }
                 send(Message::SspiReply {
                     channel: 1,
                     conn,
@@ -81,6 +96,7 @@ async fn run(command: &str, line: &str, want: &str) -> (Option<u32>, String) {
                 .await;
             }
             Message::Connected { .. } => {
+                assert_eq!(certified, https, "{command}: certificate check");
                 send(Message::Data {
                     channel: 1,
                     bytes: format!("{line}\r\n").into_bytes(),
@@ -117,7 +133,7 @@ async fn runs_cmd_and_powershell_over_winrm() {
         eprintln!("FEROSSH_WINRM_LIVE is not set; skipping");
         return;
     }
-    let (code, shown) = run("cmd", "set /a 6*7", "42").await;
+    let (code, shown) = run("cmd", "set /a 6*7", "42", false).await;
     assert_eq!(code, Some(0), "{shown}");
     // FeroSSH's default command. The output, not the typed line, holds
     // the word.
@@ -125,7 +141,18 @@ async fn runs_cmd_and_powershell_over_winrm() {
         "powershell -NoLogo",
         "Write-Output ('fero' + 'ssh')",
         "ferossh",
+        false,
     )
     .await;
+    assert_eq!(code, Some(0), "{shown}");
+}
+
+#[tokio::test]
+async fn runs_cmd_over_winrm_https() {
+    if std::env::var_os("FEROSSH_WINRM_LIVE").is_none() {
+        eprintln!("FEROSSH_WINRM_LIVE is not set; skipping");
+        return;
+    }
+    let (code, shown) = run("cmd", "set /a 6*7", "42", true).await;
     assert_eq!(code, Some(0), "{shown}");
 }

@@ -13,10 +13,11 @@ use windows::Win32::Security::Authentication::Identity::{
     FreeContextBuffer, FreeCredentialsHandle, ISC_REQ_ALLOCATE_MEMORY, ISC_REQ_CONFIDENTIALITY,
     ISC_REQ_FLAGS, ISC_REQ_INTEGRITY, ISC_REQ_MUTUAL_AUTH, ISC_REQ_REPLAY_DETECT,
     ISC_REQ_SEQUENCE_DETECT, ISC_RET_CONFIDENTIALITY, ISC_RET_INTEGRITY, ISC_RET_MUTUAL_AUTH,
-    InitializeSecurityContextW, QueryContextAttributesW, SECBUFFER_DATA, SECBUFFER_PADDING,
-    SECBUFFER_TOKEN, SECBUFFER_VERSION, SECPKG_ATTR_NEGOTIATION_INFO, SECPKG_ATTR_SIZES,
-    SECPKG_CRED_OUTBOUND, SECQOP_WRAP_NO_ENCRYPT, SECURITY_NATIVE_DREP, SecBuffer, SecBufferDesc,
-    SecPkgContext_NegotiationInfoW, SecPkgContext_Sizes,
+    InitializeSecurityContextW, QueryContextAttributesW, SECBUFFER_CHANNEL_BINDINGS,
+    SECBUFFER_DATA, SECBUFFER_PADDING, SECBUFFER_TOKEN, SECBUFFER_VERSION,
+    SECPKG_ATTR_NEGOTIATION_INFO, SECPKG_ATTR_SIZES, SECPKG_CRED_OUTBOUND, SECQOP_WRAP_NO_ENCRYPT,
+    SECURITY_NATIVE_DREP, SecBuffer, SecBufferDesc, SecPkgContext_NegotiationInfoW,
+    SecPkgContext_Sizes,
 };
 use windows::Win32::Security::Credentials::SecHandle;
 use windows::Win32::System::Rpc::{SEC_WINNT_AUTH_IDENTITY_UNICODE, SEC_WINNT_AUTH_IDENTITY_W};
@@ -38,10 +39,15 @@ fn len32(v: &[u16]) -> Result<u32, String> {
 }
 
 impl NegotiateProvider for Sspi {
+    fn tls(&self, host: &str) -> Result<Box<dyn super::TlsContext>, String> {
+        Self::tls_connection(host)
+    }
+
     fn start(
         &self,
         host: &str,
         credentials: Option<&Credentials>,
+        bindings: Option<&[u8]>,
     ) -> Result<Box<dyn NegotiateContext>, String> {
         let mut cred = SecHandle::default();
         let result = match credentials {
@@ -111,6 +117,7 @@ impl NegotiateProvider for Sspi {
                 | ISC_REQ_REPLAY_DETECT
                 | ISC_REQ_ALLOCATE_MEMORY,
             sizes: None,
+            bindings: bindings.map(<[u8]>::to_vec),
         }))
     }
 }
@@ -122,6 +129,9 @@ struct Context {
     target: Vec<u16>,
     flags: ISC_REQ_FLAGS,
     sizes: Option<SecPkgContext_Sizes>,
+    /// The TLS connection's `SEC_CHANNEL_BINDINGS`, given with every
+    /// step of a login over HTTPS.
+    bindings: Option<Vec<u8>>,
 }
 
 // SAFETY: SSPI handles are plain values, usable from any thread; the
@@ -174,15 +184,26 @@ impl Context {
 impl NegotiateContext for Context {
     fn step(&mut self, input: Option<&[u8]>) -> Result<ContextStep, String> {
         let mut input_copy = input.map(<[u8]>::to_vec).unwrap_or_default();
-        let mut in_buf = SecBuffer {
-            cbBuffer: u32::try_from(input_copy.len()).map_err(|_| "token too large")?,
-            BufferType: SECBUFFER_TOKEN,
-            pvBuffer: input_copy.as_mut_ptr().cast(),
-        };
+        let mut bindings = self.bindings.clone().unwrap_or_default();
+        let mut in_bufs = Vec::with_capacity(2);
+        if input.is_some() {
+            in_bufs.push(SecBuffer {
+                cbBuffer: u32::try_from(input_copy.len()).map_err(|_| "token too large")?,
+                BufferType: SECBUFFER_TOKEN,
+                pvBuffer: input_copy.as_mut_ptr().cast(),
+            });
+        }
+        if self.bindings.is_some() {
+            in_bufs.push(SecBuffer {
+                cbBuffer: u32::try_from(bindings.len()).map_err(|_| "bindings too large")?,
+                BufferType: SECBUFFER_CHANNEL_BINDINGS,
+                pvBuffer: bindings.as_mut_ptr().cast(),
+            });
+        }
         let in_desc = SecBufferDesc {
             ulVersion: SECBUFFER_VERSION,
-            cBuffers: 1,
-            pBuffers: &mut in_buf,
+            cBuffers: u32::try_from(in_bufs.len()).unwrap_or(0),
+            pBuffers: in_bufs.as_mut_ptr(),
         };
         let mut out_buf = SecBuffer {
             cbBuffer: 0,
@@ -206,7 +227,7 @@ impl NegotiateContext for Context {
                 self.flags,
                 0,
                 SECURITY_NATIVE_DREP,
-                input.map(|_| &in_desc as *const SecBufferDesc),
+                (!in_bufs.is_empty()).then_some(&in_desc as *const SecBufferDesc),
                 0,
                 Some(&mut new_ctx),
                 Some(&mut out_desc),

@@ -10,6 +10,12 @@
 //! ([`Message::SspiRequest`]). Nothing goes out or is believed
 //! unencrypted: a reply that is not sealed is refused.
 //!
+//! Over HTTPS the TLS connection is the UI's too (SChannel): the worker
+//! hands it the server's bytes as they come and sends what it gives
+//! back, and asks it to encrypt each request ([`SspiOp::TlsSend`]). The
+//! messages inside are then not sealed again, as with any WinRM client
+//! over HTTPS; the login is the same Negotiate exchange.
+//!
 //! WinRS has no terminal: the command's input and output are plain
 //! streams. A Receive waits on the server for output, so typed input
 //! goes over a second HTTP connection of the session's own, with its own
@@ -58,6 +64,8 @@ pub struct Params {
     pub port: u16,
     pub connect_timeout: u32,
     pub command: String,
+    /// TLS (through the UI) instead of sealed messages.
+    pub https: bool,
 }
 
 impl Params {
@@ -376,6 +384,17 @@ struct Conn {
     out: mpsc::Sender<Message>,
     replies: mpsc::Receiver<SspiResult>,
     connect_timeout: Duration,
+    /// TLS through the UI: every byte to and from the server goes
+    /// through [`SspiOp::TlsSend`] and [`SspiOp::TlsReceived`].
+    https: bool,
+}
+
+/// What the UI's TLS connection gave back.
+struct TlsBytes {
+    send: Vec<u8>,
+    plain: Vec<u8>,
+    ready: bool,
+    closed: bool,
 }
 
 impl Conn {
@@ -396,19 +415,123 @@ impl Conn {
         };
         let _ = stream.set_nodelay(true);
         let authority = params.authority();
+        let scheme = if params.https { "https" } else { "http" };
         let mut c = Self {
             channel,
             conn,
             stream,
             buf: Vec::new(),
-            endpoint: format!("http://{authority}/wsman"),
+            endpoint: format!("{scheme}://{authority}/wsman"),
             authority,
             out: out.clone(),
             replies,
             connect_timeout: timeout,
+            https: params.https,
         };
+        if c.https {
+            // The UI may ask the user about the certificate: no timeout
+            // on its answer, only on the server's bytes.
+            c.tls_handshake().await?;
+        }
         c.login().await?;
         Ok(c)
+    }
+
+    /// One TLS step in the UI.
+    async fn tls(&mut self, op: SspiOp) -> Result<TlsBytes, String> {
+        match self.sspi(op).await? {
+            SspiResult::Tls {
+                send,
+                plain,
+                ready,
+                closed,
+            } => Ok(TlsBytes {
+                send,
+                plain,
+                ready,
+                closed,
+            }),
+            _ => Err("The TLS connection went wrong.".to_owned()),
+        }
+    }
+
+    /// Reads what the server sends next, within `wait`.
+    async fn read_raw(&mut self, wait: Duration) -> Result<Vec<u8>, String> {
+        let mut chunk = vec![0u8; 16 * 1024];
+        let n = match tokio::time::timeout(wait, self.stream.read(&mut chunk)).await {
+            Ok(r) => r.map_err(|e| format!("The connection failed: {e}."))?,
+            Err(_) => {
+                return Err(format!(
+                    "The server did not answer within {} s.",
+                    wait.as_secs()
+                ));
+            }
+        };
+        if n == 0 {
+            return Err("The server closed the connection.".to_owned());
+        }
+        chunk.truncate(n);
+        Ok(chunk)
+    }
+
+    async fn write_raw(&mut self, data: &[u8]) -> Result<(), String> {
+        self.stream
+            .write_all(data)
+            .await
+            .map_err(|e| format!("The connection failed: {e}."))
+    }
+
+    /// The TLS handshake, through the UI, up to the checked certificate.
+    async fn tls_handshake(&mut self) -> Result<(), String> {
+        let hello = self.tls(SspiOp::TlsStart).await?;
+        self.write_raw(&hello.send).await?;
+        let wait = self.connect_timeout + REPLY_GRACE;
+        loop {
+            let data = self.read_raw(wait).await?;
+            let got = self.tls(SspiOp::TlsReceived(data)).await?;
+            if !got.send.is_empty() {
+                self.write_raw(&got.send).await?;
+            }
+            self.buf.extend_from_slice(&got.plain);
+            if got.closed {
+                return Err("The server closed the TLS connection.".to_owned());
+            }
+            if got.ready {
+                return Ok(());
+            }
+        }
+    }
+
+    /// Sends bytes to the server, through TLS over HTTPS.
+    async fn send_bytes(&mut self, data: &[u8]) -> Result<(), String> {
+        if !self.https {
+            return self.write_raw(data).await;
+        }
+        let sealed = self.tls(SspiOp::TlsSend(data.to_vec())).await?;
+        self.write_raw(&sealed.send).await
+    }
+
+    /// Reads more of the server's plain bytes into `buf`.
+    async fn receive_bytes(&mut self, wait: Duration) -> Result<(), String> {
+        loop {
+            let data = self.read_raw(wait).await?;
+            if !self.https {
+                self.buf.extend_from_slice(&data);
+                return Ok(());
+            }
+            let got = self.tls(SspiOp::TlsReceived(data)).await?;
+            if !got.send.is_empty() {
+                self.write_raw(&got.send).await?;
+            }
+            let any = !got.plain.is_empty();
+            self.buf.extend_from_slice(&got.plain);
+            if any {
+                return Ok(());
+            }
+            if got.closed {
+                return Err("The server closed the connection.".to_owned());
+            }
+        }
     }
 
     /// Asks the UI for an SSPI step.
@@ -438,25 +561,13 @@ impl Conn {
     ) -> Result<http::Response, String> {
         let req = http::post(&self.authority, "/wsman", headers, body);
         let exchange = async {
-            self.stream
-                .write_all(&req)
-                .await
-                .map_err(|e| format!("The connection failed: {e}."))?;
-            let mut chunk = vec![0u8; 16 * 1024];
+            self.send_bytes(&req).await?;
             loop {
                 if let Some(r) = http::take_response(&mut self.buf).map_err(|e| format!("{e}."))? {
                     return Ok(r);
                 }
-                let n = self
-                    .stream
-                    .read(&mut chunk)
-                    .await
-                    .map_err(|e| format!("The connection failed: {e}."))?;
-                if n == 0 {
-                    return Err("The server closed the connection.".to_owned());
-                }
-                self.buf
-                    .extend_from_slice(chunk.get(..n).unwrap_or_default());
+                // The whole exchange has its own deadline.
+                self.receive_bytes(wait).await?;
             }
         };
         match tokio::time::timeout(wait, exchange).await {
@@ -516,6 +627,8 @@ impl Conn {
                         "The server does not take Negotiate (Kerberos or NTLM) logins.".to_owned(),
                     );
                 }
+                // The window reads "Access denied: the server refused the login" as a
+                // refused password (`source_refused`); keep the words.
                 (401, _) => return Err("Access denied: the server refused the login.".to_owned()),
                 (status, _) => {
                     return Err(format!("The server answered the login with HTTP {status}."));
@@ -527,6 +640,29 @@ impl Conn {
 
     /// Sends one sealed request and returns its unsealed reply, or the
     /// fault in it.
+    /// [`Self::call`] over HTTPS: the envelope as it is, inside TLS.
+    async fn call_tls(&mut self, envelope: &[u8]) -> Result<Element, CallError> {
+        let wait = Duration::from_secs(u64::from(soap::RECEIVE_WAIT)) + REPLY_GRACE;
+        let resp = self
+            .exchange(
+                &[("Content-Type", "application/soap+xml;charset=UTF-8")],
+                envelope,
+                wait,
+            )
+            .await?;
+        if resp.status == 401 {
+            return Err("The server no longer accepts the login.".to_owned().into());
+        }
+        let root = soap::parse(&resp.body).map_err(|e| format!("The server sent {e}."))?;
+        if let Some(f) = soap::fault(&root) {
+            return Err(CallError::Fault(f));
+        }
+        if resp.status != 200 {
+            return Err(format!("The server answered with HTTP {}.", resp.status).into());
+        }
+        Ok(root)
+    }
+
     async fn call(&mut self, envelope: &str) -> Result<Element, CallError> {
         let id = message_id();
         let envelope = envelope.replacen(
@@ -535,6 +671,9 @@ impl Conn {
             1,
         );
         let plain = envelope.into_bytes();
+        if self.https {
+            return self.call_tls(&plain).await;
+        }
         let plain_len = plain.len();
         let (header, data) = match self.sspi(SspiOp::Seal(plain)).await? {
             SspiResult::Sealed { header, data } => (header, data),

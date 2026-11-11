@@ -16,12 +16,14 @@
 //! signatures or SSH passwords. One that does is treated as compromised
 //! and the connection is closed.
 
+use std::path::{Path, PathBuf};
+
 use ferossh_auth::Job;
-use ferossh_auth::negotiate::{Credentials, SspiJob};
+use ferossh_auth::negotiate::{Credentials, ServerCert, SspiJob};
 use ferossh_config::saved::SavedHost;
 use ferossh_config::ssh_config;
-use ferossh_config::{DEFAULT_WINRM_COMMAND, DEFAULT_WINRM_PORT};
-use ferossh_ipc::{ChannelId, MAX_DATA_CHUNK, Message, SspiOp, Timing};
+use ferossh_config::{DEFAULT_WINRM_COMMAND, DEFAULT_WINRM_HTTPS_PORT, DEFAULT_WINRM_PORT};
+use ferossh_ipc::{ChannelId, MAX_DATA_CHUNK, Message, Secrets, SspiOp, SspiResult, Timing};
 use zeroize::Zeroizing;
 
 use crate::ssh::{Effect, Env, State, sanitize};
@@ -30,6 +32,10 @@ const DIM: &str = "\x1b[0;90m";
 const RED: &str = "\x1b[0;31m";
 const YELLOW: &str = "\x1b[0;33m";
 const RESET: &str = "\x1b[0m";
+/// How the worker starts its message when the server refuses the login
+/// (`crates/worker/src/winrm`).
+const ACCESS_DENIED: &str = "Access denied: the server refused the login";
+
 /// Earlier lines kept for Up and Down.
 const HISTORY: usize = 200;
 /// Logins the worker may start: one per HTTP connection, and a spare.
@@ -52,6 +58,9 @@ pub struct WinrmTarget {
     /// ssh_config's `Tag`, which picks a colour theme.
     pub tag: Option<String>,
     pub connect_timeout: u32,
+    /// HTTPS (TLS through SChannel) instead of HTTP with encrypted
+    /// messages.
+    pub https: bool,
 }
 
 fn valid_user(user: &str) -> bool {
@@ -60,11 +69,19 @@ fn valid_user(user: &str) -> bool {
 
 impl WinrmTarget {
     /// What was typed at the connect prompt, if it asks for WinRM:
-    /// `winrm://[user@]host[:port]`, or `winrm [user@]host [port]`.
+    /// `winrm://[user@]host[:port]`, `winrms://` for HTTPS, or
+    /// `winrm [user@]host [port]`. Port 5986 is HTTPS too.
     pub fn typed(text: &str) -> Option<Self> {
         let text = text.trim();
+        let mut https = false;
         let rest = match strip_prefix_ci(text, "winrm://") {
             Some(r) => r.trim_end_matches('/').to_owned(),
+            None if strip_prefix_ci(text, "winrms://").is_some() => {
+                https = true;
+                strip_prefix_ci(text, "winrms://")?
+                    .trim_end_matches('/')
+                    .to_owned()
+            }
             None => {
                 let mut words = strip_prefix_ci(text, "winrm ")?.split_whitespace();
                 let host = words.next()?;
@@ -79,20 +96,22 @@ impl WinrmTarget {
         if user.as_deref().is_some_and(|u| !valid_user(u)) {
             return None;
         }
+        let https = https || port == Some(DEFAULT_WINRM_HTTPS_PORT);
         Some(Self {
             alias: hostname.clone(),
             hostname,
-            port: port.unwrap_or(DEFAULT_WINRM_PORT),
+            port: port.unwrap_or(default_port(https)),
             user,
             command: DEFAULT_WINRM_COMMAND.to_owned(),
             tag: None,
             connect_timeout: Timing::default().connect_timeout,
+            https,
         })
     }
 
-    /// A saved WinRM connection `name`: its `HostName`, `Port` (5985
-    /// when unset), `User`, `Tag` and `ConnectTimeout`, and the command
-    /// its profile names.
+    /// A saved WinRM connection `name`: its `HostName`, `Port` (5985,
+    /// or 5986 with `https`, when unset), `User`, `Tag` and
+    /// `ConnectTimeout`, and the command and transport its profile names.
     ///
     /// The host, user and port come from the saved connection itself when
     /// there is one (`saved`), so an SSH `Host *` block's `User` or `Port`
@@ -102,6 +121,7 @@ impl WinrmTarget {
         name: &str,
         env: &Env,
         command: Option<&str>,
+        https: bool,
         saved: Option<&SavedHost>,
     ) -> Option<Self> {
         let includes = ssh_config::DirIncludes {
@@ -119,7 +139,7 @@ impl WinrmTarget {
         Some(Self {
             alias: name.to_owned(),
             hostname,
-            port: port.unwrap_or(DEFAULT_WINRM_PORT),
+            port: port.unwrap_or(default_port(https)),
             user: user.filter(|u| valid_user(u)),
             command: command
                 .map(str::trim)
@@ -130,16 +150,26 @@ impl WinrmTarget {
             connect_timeout: cfg
                 .connect_timeout
                 .unwrap_or(Timing::default().connect_timeout),
+            https,
         })
     }
 
     /// `host`, or `host:port` off the WinRM port, for titles and logs.
     pub fn label(&self) -> String {
-        if self.port == DEFAULT_WINRM_PORT {
+        if self.port == default_port(self.https) {
             self.alias.clone()
         } else {
             format!("{}:{}", self.alias, self.port)
         }
+    }
+}
+
+/// WinRM's port for HTTP or HTTPS.
+pub fn default_port(https: bool) -> u16 {
+    if https {
+        DEFAULT_WINRM_HTTPS_PORT
+    } else {
+        DEFAULT_WINRM_PORT
     }
 }
 
@@ -192,6 +222,45 @@ pub struct WinrmSession {
     /// Closed from this side while the shell is open: what still seals
     /// the worker's goodbye (terminate, delete) until the window takes it.
     closer: Option<WinrmCloser>,
+    /// The connection has a password source (Credential Manager or a
+    /// command): asked before the prompt.
+    pub password_source: bool,
+    /// The password typed goes to the Windows Credential Manager once
+    /// the login works.
+    pub remember_password: bool,
+    /// Waiting for the password source.
+    fetching: bool,
+    /// The password came from the source.
+    from_source: bool,
+    /// The typed password, kept to store once logged in.
+    to_store: Option<Zeroizing<String>>,
+    /// The shell opened at least once.
+    was_connected: bool,
+    /// The server refused the login (HTTP 401 after the last token), as
+    /// opposed to a network failure or a disconnect from this side.
+    login_refused: bool,
+    /// TLS connections the worker started.
+    tls_starts: u32,
+    /// Over HTTPS, each connection's handshake finished with a certificate
+    /// that was accepted: only then may it log in.
+    tls_approved: [bool; 2],
+    /// Where certificates the user trusted are kept (`host:port` and the
+    /// SHA-256 fingerprint, a line each); none keeps them for the
+    /// session only.
+    pub cert_store: Option<PathBuf>,
+    /// Fingerprints trusted for this session.
+    trusted_certs: Vec<String>,
+    /// Asking whether to trust the server's certificate.
+    cert_prompt: Option<CertPrompt>,
+}
+
+/// The question about a certificate Windows does not trust, and the
+/// TLS answer held for the worker until the user says yes.
+struct CertPrompt {
+    conn: u8,
+    held: SspiResult,
+    sha256: String,
+    answer: String,
 }
 
 /// A closed session's last errand: the worker tells the server to end the
@@ -215,7 +284,11 @@ impl WinrmCloser {
         match msg {
             Message::SspiRequest {
                 conn,
-                op: op @ (SspiOp::Seal(_) | SspiOp::Unseal { .. }),
+                op:
+                    op @ (SspiOp::Seal(_)
+                    | SspiOp::Unseal { .. }
+                    | SspiOp::TlsSend(_)
+                    | SspiOp::TlsReceived(_)),
                 ..
             } if conn <= 1 => (
                 vec![Effect::Broker(Job::Sspi(SspiJob {
@@ -285,6 +358,18 @@ impl WinrmSession {
             recall: 0,
             draft: String::new(),
             closer: None,
+            password_source: false,
+            remember_password: false,
+            fetching: false,
+            from_source: false,
+            to_store: None,
+            was_connected: false,
+            login_refused: false,
+            tls_starts: 0,
+            tls_approved: [false; 2],
+            cert_store: None,
+            trusted_certs: Vec::new(),
+            cert_prompt: None,
         }
     }
 
@@ -307,16 +392,68 @@ impl WinrmSession {
     /// user.
     pub fn start(&mut self) -> Vec<Effect> {
         match &self.target.user {
-            Some(user) => {
-                self.asking = true;
-                vec![Effect::Show(format!(
-                    "{}'s password on {}: ",
-                    sanitize(user),
-                    sanitize(&self.target.label())
-                ))]
+            Some(_) if self.password_source => {
+                self.fetching = true;
+                vec![Effect::FetchPassword]
             }
+            Some(_) => self.ask(),
             None => self.connect(),
         }
+    }
+
+    /// Asks for the password at the prompt.
+    fn ask(&mut self) -> Vec<Effect> {
+        let user = self.target.user.as_deref().unwrap_or_default();
+        self.asking = true;
+        vec![Effect::Show(format!(
+            "{}'s password on {}: ",
+            sanitize(user),
+            sanitize(&self.target.label())
+        ))]
+    }
+
+    /// Whether the session waits for its password source.
+    pub fn fetching_password(&self) -> bool {
+        self.fetching && self.state == State::Connecting
+    }
+
+    /// The password source answered: `Ok` logs in with the password,
+    /// `Err` says why not and asks for it at the prompt instead. `from`
+    /// names the source for the note.
+    pub fn password_fetched(
+        &mut self,
+        result: Result<Zeroizing<String>, String>,
+        from: &str,
+    ) -> Vec<Effect> {
+        if !self.fetching_password() {
+            return Vec::new();
+        }
+        self.fetching = false;
+        match result {
+            Ok(password) => {
+                self.from_source = true;
+                self.password = Some(password);
+                let mut effects = vec![Effect::Show(dim(&format!(
+                    "Password from {}.",
+                    sanitize(from)
+                )))];
+                effects.extend(self.connect());
+                effects
+            }
+            Err(why) => {
+                let mut effects = Vec::new();
+                if !why.is_empty() {
+                    effects.push(Effect::Show(dim(&sanitize(&why))));
+                }
+                effects.extend(self.ask());
+                effects
+            }
+        }
+    }
+
+    /// The password from the source did not get in: the next try asks.
+    pub fn source_refused(&self) -> bool {
+        self.from_source && self.login_refused && !self.was_connected
     }
 
     fn connect(&mut self) -> Vec<Effect> {
@@ -334,6 +471,7 @@ impl WinrmSession {
                 port: t.port,
                 connect_timeout: t.connect_timeout,
                 command: t.command.clone(),
+                https: t.https,
             }),
         ]
     }
@@ -342,6 +480,9 @@ impl WinrmSession {
     pub fn input(&mut self, bytes: &[u8]) -> Vec<Effect> {
         if self.asking {
             return self.password_input(bytes);
+        }
+        if self.cert_prompt.is_some() {
+            return self.cert_input(bytes);
         }
         if self.state != State::Connected {
             return Vec::new();
@@ -480,7 +621,11 @@ impl WinrmSession {
             match c {
                 '\r' | '\n' => {
                     self.asking = false;
-                    self.password = Some(std::mem::take(&mut self.typed_password));
+                    let password = std::mem::take(&mut self.typed_password);
+                    if self.remember_password && !password.is_empty() {
+                        self.to_store = Some(password.clone());
+                    }
+                    self.password = Some(password);
                     let mut effects = vec![Effect::Show("\r\n".into())];
                     effects.extend(self.connect());
                     return effects;
@@ -556,6 +701,27 @@ impl WinrmSession {
                         return self.cut_off();
                     }
                 }
+                if matches!(op, SspiOp::TlsStart) {
+                    self.tls_starts += 1;
+                    if !self.target.https || self.tls_starts > MAX_STARTS {
+                        return self.cut_off();
+                    }
+                    if let Some(ok) = self.tls_approved.get_mut(usize::from(conn)) {
+                        *ok = false;
+                    }
+                }
+                // Over HTTPS a login goes only inside a TLS connection whose
+                // certificate was accepted, so it is bound to that server.
+                if self.target.https
+                    && matches!(op, SspiOp::Start | SspiOp::Step(_))
+                    && self.tls_approved.get(usize::from(conn)) != Some(&true)
+                {
+                    return self.cut_off();
+                }
+                if self.cert_prompt.is_some() {
+                    // Nothing goes on while the user decides.
+                    return self.cut_off();
+                }
                 let credentials = match (&self.target.user, &self.password) {
                     (Some(user), Some(password)) => Some(Credentials {
                         user: user.clone(),
@@ -574,7 +740,11 @@ impl WinrmSession {
             // Once logged in, only sealing and unsealing.
             Message::SspiRequest {
                 conn,
-                op: op @ (SspiOp::Seal(_) | SspiOp::Unseal { .. }),
+                op:
+                    op @ (SspiOp::Seal(_)
+                    | SspiOp::Unseal { .. }
+                    | SspiOp::TlsSend(_)
+                    | SspiOp::TlsReceived(_)),
                 ..
             } if self.state == State::Connected && conn <= 1 => {
                 vec![Effect::Broker(Job::Sspi(SspiJob {
@@ -587,22 +757,33 @@ impl WinrmSession {
             }
             Message::Connected { .. } if self.state == State::Connecting && !self.asking => {
                 self.state = State::Connected;
+                self.was_connected = true;
                 self.password = None;
                 let how = match self.package.as_deref() {
                     Some(p) if p.eq_ignore_ascii_case("Kerberos") => " with Kerberos",
                     Some(p) if p.eq_ignore_ascii_case("NTLM") => " with NTLM",
                     _ => "",
                 };
+                let over = if self.target.https { " over HTTPS" } else { "" };
                 let mut effects = vec![Effect::Show(dim(&format!(
-                    "Connected{how}; shell traffic is encrypted. This is a WinRS shell \
+                    "Connected{how}{over}; shell traffic is encrypted. This is a WinRS shell \
                      without a terminal: lines are sent on Enter, Ctrl+C interrupts, \
                      full-screen programs do not work."
                 )))];
-                if how == " with NTLM" {
+                // Over HTTPS the certificate proves the server's identity.
+                if how == " with NTLM" && !self.target.https {
                     effects.push(Effect::Show(format!(
                         "{YELLOW}NTLM does not prove the server's identity. Use the \
                          server's domain name to log in with Kerberos.{RESET}\r\n"
                     )));
+                }
+                if let (Some(user), Some(password)) = (&self.target.user, self.to_store.take()) {
+                    effects.push(Effect::StorePassword {
+                        user: user.clone(),
+                        host: self.target.hostname.clone(),
+                        port: self.target.port,
+                        password: Secrets(vec![password.to_string()]),
+                    });
                 }
                 effects.push(Effect::Connected);
                 effects
@@ -624,6 +805,8 @@ impl WinrmSession {
                 }
                 self.state = State::Ended;
                 self.password = None;
+                // The worker's words for a 401 to the last login token.
+                self.login_refused = !self.was_connected && reason.starts_with(ACCESS_DENIED);
                 vec![
                     Effect::Broker(Job::SspiEnd(self.channel)),
                     Effect::Show(format!(
@@ -655,12 +838,219 @@ impl WinrmSession {
         if let Some(p) = output.package {
             self.package = Some(p);
         }
-        vec![Effect::Send(Message::SspiReply {
+        if let Some(cert) = output.cert {
+            return self.check_cert(conn, cert, output.result);
+        }
+        vec![self.reply(conn, output.result)]
+    }
+
+    fn reply(&self, conn: u8, result: SspiResult) -> Effect {
+        Effect::Send(Message::SspiReply {
             channel: self.channel,
             conn,
-            result: output.result,
-        })]
+            result,
+        })
     }
+
+    /// Passes on a finished handshake whose certificate was accepted:
+    /// from now on that connection may log in.
+    fn approve(&mut self, conn: u8, held: SspiResult) -> Effect {
+        if let Some(ok) = self.tls_approved.get_mut(usize::from(conn)) {
+            *ok = true;
+        }
+        self.reply(conn, held)
+    }
+
+    /// `host:port`, as the certificate store keys a server.
+    fn cert_key(&self) -> String {
+        if self.target.hostname.contains(':') {
+            format!("[{}]:{}", self.target.hostname, self.target.port)
+        } else {
+            format!("{}:{}", self.target.hostname, self.target.port)
+        }
+    }
+
+    /// The handshake is done: the worker gets `held` once the server's
+    /// certificate is trusted, by Windows, by an earlier "yes", or by the
+    /// user now.
+    fn check_cert(&mut self, conn: u8, cert: ServerCert, held: SspiResult) -> Vec<Effect> {
+        if matches!(held, SspiResult::Failed(_)) {
+            return vec![self.reply(conn, held)];
+        }
+        let key = self.cert_key();
+        let first = conn == 0 && self.state == State::Connecting;
+        match &cert.windows {
+            Ok(()) => {
+                let mut effects = Vec::new();
+                if first {
+                    effects.push(Effect::Show(dim(
+                        "HTTPS: the server's certificate is valid for this name (checked by Windows).",
+                    )));
+                }
+                effects.push(self.approve(conn, held));
+                return effects;
+            }
+            Err(_) if self.trusted_certs.contains(&cert.sha256) => {
+                return vec![self.approve(conn, held)];
+            }
+            Err(_) => {}
+        }
+        let known = self.cert_store.as_deref().and_then(|p| known_cert(p, &key));
+        match known {
+            // A pinned certificate is good only while it is valid: an
+            // expired one is asked about again.
+            // Not added to `trusted_certs`, which holds only what the user
+            // said yes to this session: each handshake checks the pin again.
+            Some(sha) if sha == cert.sha256 && cert.current => {
+                let mut effects = Vec::new();
+                if first {
+                    effects.push(Effect::Show(dim(
+                        "HTTPS: the server's certificate is the one you trusted before.",
+                    )));
+                }
+                effects.push(self.approve(conn, held));
+                effects
+            }
+            Some(sha) if sha == cert.sha256 => self.ask_cert(conn, cert, held, &key),
+            Some(_) => {
+                let text = format!(
+                    "{RED}The server's certificate is not the one you trusted for {} before, \
+                     and Windows does not trust it either. Someone may be in the way. \
+                     Its SHA-256 fingerprint is now {}. If the server got a new certificate, \
+                     remove the old line from {}.{RESET}\r\n",
+                    sanitize(&key),
+                    cert.sha256,
+                    self.cert_store
+                        .as_deref()
+                        .map(|p| p.display().to_string())
+                        .unwrap_or_default()
+                );
+                vec![
+                    Effect::Show(text),
+                    self.reply(
+                        conn,
+                        SspiResult::Failed("The server's certificate changed.".into()),
+                    ),
+                ]
+            }
+            None => self.ask_cert(conn, cert, held, &key),
+        }
+    }
+
+    /// Shows a certificate Windows does not trust and asks about it.
+    fn ask_cert(&mut self, conn: u8, cert: ServerCert, held: SspiResult, key: &str) -> Vec<Effect> {
+        let why = cert.windows.err().unwrap_or_default();
+        let text = format!(
+            "{YELLOW}Windows does not trust the server's certificate: {}{RESET}\r\n\
+             SHA-256 fingerprint: {}\r\n\
+             Check it on the server (Get-ChildItem Cert:\\LocalMachine\\My | \
+             Format-List Subject, Thumbprint shows SHA-1; \
+             (Get-ChildItem Cert:\\LocalMachine\\My\\<thumbprint>).GetCertHashString('SHA256') \
+             the SHA-256).\r\n\
+             Trust this certificate for {}? (yes/no) ",
+            sanitize(why.trim_end_matches('.')),
+            cert.sha256,
+            sanitize(key)
+        );
+        self.cert_prompt = Some(CertPrompt {
+            conn,
+            held,
+            sha256: cert.sha256,
+            answer: String::new(),
+        });
+        vec![Effect::Show(text)]
+    }
+
+    /// Typing the answer to the certificate question.
+    fn cert_input(&mut self, bytes: &[u8]) -> Vec<Effect> {
+        let text = String::from_utf8_lossy(bytes).into_owned();
+        let mut effects = Vec::new();
+        for c in text.chars() {
+            let Some(prompt) = self.cert_prompt.as_mut() else {
+                break;
+            };
+            match c {
+                '\r' | '\n' => {
+                    let Some(prompt) = self.cert_prompt.take() else {
+                        break;
+                    };
+                    effects.push(Effect::Show("\r\n".into()));
+                    if prompt.answer.trim().eq_ignore_ascii_case("yes") {
+                        let key = self.cert_key();
+                        if let Some(path) = self.cert_store.clone() {
+                            let note = match remember_cert(&path, &key, &prompt.sha256) {
+                                Ok(()) => format!("Trusted; kept in {}.", path.display()),
+                                Err(e) => format!("Trusted for this session ({e})."),
+                            };
+                            effects.push(Effect::Show(dim(&sanitize(&note))));
+                        }
+                        self.trusted_certs.push(prompt.sha256);
+                        effects.push(self.approve(prompt.conn, prompt.held));
+                    } else {
+                        effects.push(self.reply(
+                            prompt.conn,
+                            SspiResult::Failed("The certificate was not trusted.".into()),
+                        ));
+                    }
+                    break;
+                }
+                '\x7f' | '\x08' => {
+                    if prompt.answer.pop().is_some() {
+                        effects.push(Effect::Show("\x08 \x08".into()));
+                    }
+                }
+                '\x03' => {
+                    let Some(prompt) = self.cert_prompt.take() else {
+                        break;
+                    };
+                    effects.push(Effect::Show("\r\n".into()));
+                    effects.push(self.reply(
+                        prompt.conn,
+                        SspiResult::Failed("The certificate was not trusted.".into()),
+                    ));
+                    break;
+                }
+                c if c.is_control() => {}
+                c if prompt.answer.len() < 16 => {
+                    prompt.answer.push(c);
+                    effects.push(Effect::Show(c.to_string()));
+                }
+                _ => {}
+            }
+        }
+        effects
+    }
+}
+
+/// The fingerprint kept for `key` (`host:port`) in `path`.
+fn known_cert(path: &Path, key: &str) -> Option<String> {
+    let text = std::fs::read_to_string(path).ok()?;
+    text.lines().find_map(|l| {
+        let (k, sha) = l.trim().split_once(' ')?;
+        k.eq_ignore_ascii_case(key).then(|| sha.trim().to_owned())
+    })
+}
+
+/// Keeps `sha256` as the certificate of `key` in `path`, replacing an
+/// older one.
+fn remember_cert(path: &Path, key: &str, sha256: &str) -> Result<(), String> {
+    let old = std::fs::read_to_string(path).unwrap_or_default();
+    let mut text: String = old
+        .lines()
+        .filter(|l| {
+            l.trim()
+                .split_once(' ')
+                .is_none_or(|(k, _)| !k.eq_ignore_ascii_case(key))
+        })
+        .map(|l| format!("{l}\n"))
+        .collect();
+    text.push_str(&format!("{key} {sha256}\n"));
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+    }
+    let tmp = path.with_extension("tmp");
+    std::fs::write(&tmp, text).map_err(|e| e.to_string())?;
+    std::fs::rename(&tmp, path).map_err(|e| e.to_string())
 }
 
 #[cfg(test)]
@@ -713,6 +1103,329 @@ mod tests {
         s
     }
 
+    fn connected_msg() -> Message {
+        Message::Connected {
+            channel: 5,
+            kex: "WinRM".into(),
+            cipher: "SSPI".into(),
+            host_key: "none".into(),
+        }
+    }
+
+    /// The password the first login hands the broker.
+    fn login_password(s: &mut WinrmSession) -> Option<String> {
+        let fx = s.on_worker(Message::SspiRequest {
+            channel: 5,
+            conn: 0,
+            op: SspiOp::Start,
+        });
+        fx.into_iter().find_map(|e| match e {
+            Effect::Broker(Job::Sspi(j)) => j.credentials.map(|c| c.password.to_string()),
+            _ => None,
+        })
+    }
+
+    fn stored(effects: &[Effect]) -> Option<String> {
+        effects.iter().find_map(|e| match e {
+            Effect::StorePassword {
+                user,
+                host,
+                port,
+                password,
+            } => Some(format!("{user}@{host}:{port}={}", password.0.first()?)),
+            _ => None,
+        })
+    }
+
+    #[test]
+    fn a_password_source_answers_before_the_prompt() {
+        let mut s = WinrmSession::new(5, WinrmTarget::typed("winrm://admin@srv").unwrap());
+        s.password_source = true;
+        let fx = s.start();
+        assert!(matches!(fx[..], [Effect::FetchPassword]), "{fx:?}");
+        assert!(s.fetching_password());
+        // Typing meanwhile goes nowhere.
+        assert!(s.input(b"x").is_empty());
+        let fx = s.password_fetched(Ok(Zeroizing::new("secret".into())), "pass");
+        assert!(shown(&fx).contains("Password from pass."));
+        assert!(
+            fx.iter()
+                .any(|e| matches!(e, Effect::Send(Message::WinrmConnect { .. })))
+        );
+        assert!(!s.fetching_password());
+        // A late second answer changes nothing.
+        assert!(
+            s.password_fetched(Ok(Zeroizing::new("x".into())), "pass")
+                .is_empty()
+        );
+        assert_eq!(login_password(&mut s).as_deref(), Some("secret"));
+        // From the source: nothing to store.
+        assert_eq!(stored(&s.on_worker(connected_msg())), None);
+        assert!(!s.source_refused());
+    }
+
+    #[test]
+    fn without_a_password_from_the_source_it_asks() {
+        let mut s = WinrmSession::new(5, WinrmTarget::typed("winrm://admin@srv").unwrap());
+        s.password_source = true;
+        s.start();
+        let fx = s.password_fetched(Err("No password saved yet.".into()), "");
+        let text = shown(&fx);
+        assert!(text.contains("No password saved yet."), "{text:?}");
+        assert!(text.contains("admin's password on srv"), "{text:?}");
+        assert!(!fx.iter().any(|e| matches!(e, Effect::Send(_))));
+        let fx = s.input(b"typed\r");
+        assert!(
+            fx.iter()
+                .any(|e| matches!(e, Effect::Send(Message::WinrmConnect { .. })))
+        );
+        assert_eq!(login_password(&mut s).as_deref(), Some("typed"));
+    }
+
+    #[test]
+    fn a_typed_password_is_kept_once_the_login_works() {
+        let mut s = WinrmSession::new(5, WinrmTarget::typed("winrm://LAB\\admin@srv").unwrap());
+        s.remember_password = true;
+        s.start();
+        s.input(b"pw\r");
+        let fx = s.on_worker(connected_msg());
+        assert_eq!(stored(&fx).as_deref(), Some("LAB\\admin@srv:5985=pw"));
+        // Not without the Credential Manager as the source.
+        let mut s = WinrmSession::new(5, WinrmTarget::typed("winrm://admin@srv").unwrap());
+        s.start();
+        s.input(b"pw\r");
+        assert_eq!(stored(&s.on_worker(connected_msg())), None);
+        // Nor when the login fails.
+        let mut s = WinrmSession::new(5, WinrmTarget::typed("winrm://admin@srv").unwrap());
+        s.remember_password = true;
+        s.start();
+        s.input(b"pw\r");
+        let fx = s.on_worker(Message::Disconnected {
+            channel: 5,
+            reason: "Access denied: the server refused the login.".into(),
+        });
+        assert_eq!(stored(&fx), None);
+    }
+
+    #[test]
+    fn a_refused_source_password_is_asked_for_next_time() {
+        let mut s = WinrmSession::new(5, WinrmTarget::typed("winrm://admin@srv").unwrap());
+        s.password_source = true;
+        s.start();
+        s.password_fetched(
+            Ok(Zeroizing::new("old".into())),
+            "the Windows Credential Manager",
+        );
+        s.on_worker(Message::Disconnected {
+            channel: 5,
+            reason: "Access denied: the server refused the login.".into(),
+        });
+        assert!(s.source_refused());
+        // Once the shell was open, a drop later is not the password's fault.
+        let mut s = WinrmSession::new(5, WinrmTarget::typed("winrm://admin@srv").unwrap());
+        s.password_source = true;
+        s.start();
+        s.password_fetched(Ok(Zeroizing::new("ok".into())), "pass");
+        s.on_worker(connected_msg());
+        s.on_worker(Message::Disconnected {
+            channel: 5,
+            reason: "The server closed the connection.".into(),
+        });
+        assert!(!s.source_refused());
+        // Nor is a network failure while logging in.
+        let mut s = WinrmSession::new(5, WinrmTarget::typed("winrm://admin@srv").unwrap());
+        s.password_source = true;
+        s.start();
+        s.password_fetched(Ok(Zeroizing::new("ok".into())), "pass");
+        s.on_worker(Message::Disconnected {
+            channel: 5,
+            reason: "Could not reach srv:5985: timed out.".into(),
+        });
+        assert!(!s.source_refused());
+    }
+
+    /// A broker answer that finished a TLS handshake, with `cert`.
+    fn handshake_done(s: &mut WinrmSession, conn: u8, cert: ServerCert) -> Vec<Effect> {
+        s.on_broker(ferossh_auth::Reply::Sspi {
+            login: 5,
+            conn,
+            output: SspiOutput {
+                result: SspiResult::Tls {
+                    send: Vec::new(),
+                    plain: Vec::new(),
+                    ready: true,
+                    closed: false,
+                },
+                package: None,
+                cert: Some(cert),
+            },
+        })
+    }
+
+    fn replied(effects: &[Effect]) -> Option<&SspiResult> {
+        effects.iter().find_map(|e| match e {
+            Effect::Send(Message::SspiReply { result, .. }) => Some(result),
+            _ => None,
+        })
+    }
+
+    fn https_session(store: Option<PathBuf>) -> WinrmSession {
+        let mut s = WinrmSession::new(5, WinrmTarget::typed("winrms://srv").unwrap());
+        s.cert_store = store;
+        let fx = s.start();
+        assert!(fx.iter().any(|e| matches!(
+            e,
+            Effect::Send(Message::WinrmConnect {
+                https: true,
+                port: 5986,
+                ..
+            })
+        )));
+        // The worker's TLS steps go to the broker, without credentials.
+        let fx = s.on_worker(Message::SspiRequest {
+            channel: 5,
+            conn: 0,
+            op: SspiOp::TlsStart,
+        });
+        assert!(matches!(
+            &fx[..],
+            [Effect::Broker(Job::Sspi(SspiJob {
+                op: SspiOp::TlsStart,
+                credentials: None,
+                ..
+            }))]
+        ));
+        s
+    }
+
+    fn cert(sha: &str, windows: Result<(), String>) -> ServerCert {
+        ServerCert {
+            sha256: sha.into(),
+            windows,
+            current: true,
+        }
+    }
+
+    #[test]
+    fn a_certificate_windows_trusts_goes_through() {
+        let mut s = https_session(None);
+        let fx = handshake_done(&mut s, 0, cert("AA", Ok(())));
+        assert!(shown(&fx).contains("checked by Windows"));
+        assert!(matches!(
+            replied(&fx),
+            Some(SspiResult::Tls { ready: true, .. })
+        ));
+    }
+
+    #[test]
+    fn an_untrusted_certificate_is_asked_about_and_remembered() {
+        let dir = std::env::temp_dir().join(format!("ferossh-winrm-certs-{}", std::process::id()));
+        let store = dir.join("winrm_certs");
+        let _ = std::fs::remove_file(&store);
+        let mut s = https_session(Some(store.clone()));
+        let fx = handshake_done(&mut s, 0, cert("AB:CD", Err("self-signed".into())));
+        let text = shown(&fx);
+        assert!(
+            text.contains("self-signed") && text.contains("AB:CD"),
+            "{text:?}"
+        );
+        assert!(text.contains("(yes/no)"));
+        // Held until the user answers.
+        assert!(replied(&fx).is_none());
+        let fx = s.input(b"yes\r");
+        assert!(matches!(
+            replied(&fx),
+            Some(SspiResult::Tls { ready: true, .. })
+        ));
+        assert_eq!(known_cert(&store, "srv:5986").as_deref(), Some("AB:CD"));
+        // The input connection's handshake shows the same certificate.
+        let fx = handshake_done(&mut s, 1, cert("AB:CD", Err("self-signed".into())));
+        assert!(matches!(replied(&fx), Some(SspiResult::Tls { .. })));
+        // Next time it is known.
+        let mut s = https_session(Some(store.clone()));
+        let fx = handshake_done(&mut s, 0, cert("AB:CD", Err("self-signed".into())));
+        assert!(shown(&fx).contains("trusted before"));
+        assert!(matches!(replied(&fx), Some(SspiResult::Tls { .. })));
+        // A pin is checked again on each handshake: one that expires
+        // between the two connections is asked about.
+        let mut s = https_session(Some(store.clone()));
+        handshake_done(&mut s, 0, cert("AB:CD", Err("self-signed".into())));
+        let mut old = cert("AB:CD", Err("expired".into()));
+        old.current = false;
+        let fx = handshake_done(&mut s, 1, old);
+        assert!(shown(&fx).contains("(yes/no)"));
+        // Once expired, the pinned certificate is asked about again.
+        let mut s = https_session(Some(store.clone()));
+        let mut old = cert("AB:CD", Err("expired".into()));
+        old.current = false;
+        let fx = handshake_done(&mut s, 0, old);
+        assert!(shown(&fx).contains("(yes/no)"));
+        assert!(replied(&fx).is_none());
+        // Another certificate for the same server is refused outright.
+        let mut s = https_session(Some(store.clone()));
+        let fx = handshake_done(&mut s, 0, cert("EE:FF", Err("self-signed".into())));
+        assert!(shown(&fx).contains("not the one you trusted"));
+        assert!(matches!(replied(&fx), Some(SspiResult::Failed(_))));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_certificate_not_trusted_ends_the_login() {
+        let mut s = https_session(None);
+        handshake_done(&mut s, 0, cert("AB", Err("expired".into())));
+        let fx = s.input(b"no\r");
+        assert!(matches!(replied(&fx), Some(SspiResult::Failed(_))));
+        // Kept for nothing: no store.
+        let mut s = https_session(None);
+        handshake_done(&mut s, 0, cert("AB", Err("expired".into())));
+        assert!(matches!(
+            replied(&s.input(b"\x03")),
+            Some(SspiResult::Failed(_))
+        ));
+    }
+
+    #[test]
+    fn an_https_login_waits_for_an_accepted_certificate() {
+        // Before any TLS connection.
+        let mut s = https_session(None);
+        let fx = s.on_worker(Message::SspiRequest {
+            channel: 5,
+            conn: 1,
+            op: SspiOp::Start,
+        });
+        assert!(fx.iter().any(|e| matches!(e, Effect::Ended)));
+        // While the certificate question is open.
+        let mut s = https_session(None);
+        handshake_done(&mut s, 0, cert("AB", Err("self-signed".into())));
+        let fx = s.on_worker(Message::SspiRequest {
+            channel: 5,
+            conn: 0,
+            op: SspiOp::Start,
+        });
+        assert!(fx.iter().any(|e| matches!(e, Effect::Ended)));
+        // Once accepted, it goes to the broker.
+        let mut s = https_session(None);
+        handshake_done(&mut s, 0, cert("AB", Ok(())));
+        let fx = s.on_worker(Message::SspiRequest {
+            channel: 5,
+            conn: 0,
+            op: SspiOp::Start,
+        });
+        assert!(matches!(&fx[..], [Effect::Broker(Job::Sspi(_))]));
+    }
+
+    #[test]
+    fn an_http_session_never_starts_tls() {
+        let mut s = WinrmSession::new(5, WinrmTarget::typed("winrm srv").unwrap());
+        s.start();
+        let fx = s.on_worker(Message::SspiRequest {
+            channel: 5,
+            conn: 0,
+            op: SspiOp::TlsStart,
+        });
+        assert!(fx.iter().any(|e| matches!(e, Effect::Ended)), "{fx:?}");
+    }
+
     #[test]
     fn reads_what_was_typed() {
         let t = WinrmTarget::typed("winrm://admin@10.0.0.5:5986/").unwrap();
@@ -720,11 +1433,17 @@ mod tests {
             (t.hostname.as_str(), t.port, t.user.as_deref()),
             ("10.0.0.5", 5986, Some("admin"))
         );
-        assert_eq!(t.label(), "10.0.0.5:5986");
+        // 5986 is WinRM's HTTPS port.
+        assert!(t.https);
+        assert_eq!(t.label(), "10.0.0.5");
+        let t = WinrmTarget::typed("winrms://srv").unwrap();
+        assert_eq!((t.port, t.https), (5986, true));
+        let t = WinrmTarget::typed("winrms://srv:443").unwrap();
+        assert_eq!((t.port, t.https, t.label()), (443, true, "srv:443".into()));
         let t = WinrmTarget::typed("WINRM win-srv").unwrap();
         assert_eq!(
-            (t.port, t.user.as_deref(), t.label()),
-            (5985, None, "win-srv".into())
+            (t.port, t.user.as_deref(), t.label(), t.https),
+            (5985, None, "win-srv".into(), false)
         );
         assert_eq!(t.command, DEFAULT_WINRM_COMMAND);
         let t = WinrmTarget::typed("winrm jurgen@lab.test@srv 5985").unwrap();
@@ -743,12 +1462,12 @@ mod tests {
             config: "Host dc\n    HostName dc1.lab.test\n    User LAB\\admin\n    Tag production\n"
                 .into(),
         };
-        let t = WinrmTarget::resolve("dc", &env, Some("cmd"), None).unwrap();
+        let t = WinrmTarget::resolve("dc", &env, Some("cmd"), false, None).unwrap();
         assert_eq!((t.hostname.as_str(), t.port), ("dc1.lab.test", 5985));
         assert_eq!(t.user.as_deref(), Some("LAB\\admin"));
         assert_eq!(t.command, "cmd");
         assert_eq!(t.tag.as_deref(), Some("production"));
-        let t = WinrmTarget::resolve("dc", &env, Some("  "), None).unwrap();
+        let t = WinrmTarget::resolve("dc", &env, Some("  "), false, None).unwrap();
         assert_eq!(t.command, DEFAULT_WINRM_COMMAND);
         // A saved connection keeps its own user and port over an SSH
         // `Host *` block, and a blank user stays blank.
@@ -761,7 +1480,7 @@ mod tests {
             hostname: Some("dc1.lab.test".into()),
             ..SavedHost::default()
         };
-        let t = WinrmTarget::resolve("dc", &env, None, Some(&saved)).unwrap();
+        let t = WinrmTarget::resolve("dc", &env, None, false, Some(&saved)).unwrap();
         assert_eq!((t.hostname.as_str(), t.port), ("dc1.lab.test", 5985));
         assert_eq!(t.user, None);
         let saved = SavedHost {
@@ -769,7 +1488,7 @@ mod tests {
             port: Some(5986),
             ..saved
         };
-        let t = WinrmTarget::resolve("dc", &env, None, Some(&saved)).unwrap();
+        let t = WinrmTarget::resolve("dc", &env, None, false, Some(&saved)).unwrap();
         assert_eq!((t.port, t.user.as_deref()), (5986, Some("LAB\\admin")));
     }
 
@@ -817,6 +1536,7 @@ mod tests {
             output: SspiOutput {
                 result: SspiResult::Done(Vec::new()),
                 package: Some("NTLM".into()),
+                cert: None,
             },
         });
         assert!(matches!(
@@ -931,6 +1651,7 @@ mod tests {
                     data: vec![2],
                 },
                 package: None,
+                cert: None,
             },
         });
         assert!(matches!(

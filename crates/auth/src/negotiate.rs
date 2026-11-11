@@ -10,6 +10,11 @@
 //!
 //! Credentials are the Windows logon session's, or a user name and
 //! password the user typed for this session.
+//!
+//! Over HTTPS the TLS connection is held here too (Windows' SChannel):
+//! the worker moves the server's bytes in and the encrypted bytes out,
+//! the handshake, the keys and the check of the server's certificate
+//! stay in this process.
 
 use std::collections::HashMap;
 
@@ -18,6 +23,8 @@ use zeroize::Zeroizing;
 
 pub use crate::gss::ContextStep;
 
+#[cfg(windows)]
+pub mod schannel;
 #[cfg(windows)]
 pub mod sspi;
 
@@ -63,14 +70,64 @@ pub trait NegotiateContext: Send {
     fn package(&self) -> String;
 }
 
+/// What a TLS connection made of the bytes it was given.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TlsOutput {
+    /// Bytes for the server.
+    pub send: Vec<u8>,
+    /// Plain bytes the server's records held.
+    pub plain: Vec<u8>,
+    /// The handshake is done.
+    pub ready: bool,
+    /// The server closed the TLS connection.
+    pub closed: bool,
+}
+
+/// The certificate a TLS server showed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ServerCert {
+    /// Its SHA-256 fingerprint, as `AB:CD:...`.
+    pub sha256: String,
+    /// Windows' verdict for this host name: `Ok` when it chains to a
+    /// trusted root and names the host, else why not.
+    pub windows: Result<(), String>,
+    /// It is within its validity period now.
+    pub current: bool,
+}
+
+/// One TLS connection, client side.
+pub trait TlsContext: Send {
+    /// The first bytes for the server (the ClientHello).
+    fn start(&mut self) -> Result<Vec<u8>, String>;
+    /// Bytes the server sent: the handshake's, then records.
+    fn received(&mut self, data: &[u8]) -> Result<TlsOutput, String>;
+    /// Encrypts plain bytes for the server.
+    fn send(&mut self, plain: &[u8]) -> Result<Vec<u8>, String>;
+    /// The server's certificate, once the handshake is done.
+    fn certificate(&self) -> Result<ServerCert, String>;
+    /// The connection's channel bindings (RFC 5929 `tls-server-end-point`),
+    /// as SSPI hands them to a login over it, once the handshake is done.
+    fn channel_bindings(&self) -> Result<Vec<u8>, String> {
+        Err("no channel bindings".into())
+    }
+}
+
 /// Makes Negotiate contexts.
 pub trait NegotiateProvider: Send {
-    /// A context for the `HTTP` service on `host`.
+    /// A context for the `HTTP` service on `host`. Over HTTPS,
+    /// `bindings` are the TLS connection's channel bindings, which tie the
+    /// login to it (Extended Protection for Authentication).
     fn start(
         &self,
         host: &str,
         credentials: Option<&Credentials>,
+        bindings: Option<&[u8]>,
     ) -> Result<Box<dyn NegotiateContext>, String>;
+
+    /// A TLS connection to `host`.
+    fn tls(&self, _host: &str) -> Result<Box<dyn TlsContext>, String> {
+        Err("HTTPS needs Windows".into())
+    }
 }
 
 /// No SSPI on this system.
@@ -82,6 +139,7 @@ impl NegotiateProvider for Unavailable {
         &self,
         _host: &str,
         _credentials: Option<&Credentials>,
+        _bindings: Option<&[u8]>,
     ) -> Result<Box<dyn NegotiateContext>, String> {
         Err("WinRM logins need Windows".into())
     }
@@ -107,24 +165,35 @@ pub struct SspiJob {
     pub op: SspiOp,
 }
 
-/// What a [`SspiJob`] gave: the answer for the worker, and the package
-/// once a login is complete.
+/// What a [`SspiJob`] gave: the answer for the worker, the package once
+/// a login is complete, and the server's certificate once a TLS
+/// handshake is: the UI checks it before the worker gets the answer.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SspiOutput {
     pub result: SspiResult,
     pub package: Option<String>,
+    pub cert: Option<ServerCert>,
 }
 
-/// The broker's Negotiate contexts, by session and connection.
+/// The broker's Negotiate contexts and TLS connections, by session and
+/// connection.
 #[derive(Default)]
 pub struct Contexts {
     open: HashMap<(u32, u8), Box<dyn NegotiateContext>>,
+    tls: HashMap<(u32, u8), Tls>,
+}
+
+/// A TLS connection and whether its handshake was reported done.
+struct Tls {
+    ctx: Box<dyn TlsContext>,
+    ready: bool,
 }
 
 impl std::fmt::Debug for Contexts {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Contexts")
             .field("open", &self.open.len())
+            .field("tls", &self.tls.len())
             .finish()
     }
 }
@@ -136,10 +205,18 @@ impl Contexts {
         match self.step(provider, key, &job) {
             Ok(out) => out,
             Err(why) => {
-                self.open.remove(&key);
+                if matches!(
+                    job.op,
+                    SspiOp::TlsStart | SspiOp::TlsReceived(_) | SspiOp::TlsSend(_)
+                ) {
+                    self.tls.remove(&key);
+                } else {
+                    self.open.remove(&key);
+                }
                 SspiOutput {
                     result: SspiResult::Failed(why),
                     package: None,
+                    cert: None,
                 }
             }
         }
@@ -148,6 +225,75 @@ impl Contexts {
     /// Forgets session `login`'s contexts.
     pub fn end(&mut self, login: u32) {
         self.open.retain(|(l, _), _| *l != login);
+        self.tls.retain(|(l, _), _| *l != login);
+    }
+
+    fn tls_step(
+        &mut self,
+        provider: &dyn NegotiateProvider,
+        key: (u32, u8),
+        job: &SspiJob,
+    ) -> Result<SspiOutput, String> {
+        let answer = |out: TlsOutput| SspiResult::Tls {
+            send: out.send,
+            plain: out.plain,
+            ready: out.ready,
+            closed: out.closed,
+        };
+        if matches!(job.op, SspiOp::TlsStart) {
+            self.tls.remove(&key);
+            if self.open.len() + self.tls.len() >= MAX_CONTEXTS {
+                return Err("too many WinRM connections at once".into());
+            }
+            let mut ctx = provider.tls(&job.host)?;
+            let hello = ctx.start()?;
+            self.tls.insert(key, Tls { ctx, ready: false });
+            return Ok(SspiOutput {
+                result: answer(TlsOutput {
+                    send: hello,
+                    ..TlsOutput::default()
+                }),
+                package: None,
+                cert: None,
+            });
+        }
+        let tls = self
+            .tls
+            .get_mut(&key)
+            .ok_or("the TLS connection was not started")?;
+        match &job.op {
+            SspiOp::TlsReceived(data) => {
+                let out = tls.ctx.received(data)?;
+                // The certificate goes with the answer that first says
+                // ready, for the UI to check before the worker sees it.
+                let cert = if out.ready && !tls.ready {
+                    tls.ready = true;
+                    Some(tls.ctx.certificate()?)
+                } else {
+                    None
+                };
+                Ok(SspiOutput {
+                    result: answer(out),
+                    package: None,
+                    cert,
+                })
+            }
+            SspiOp::TlsSend(plain) => {
+                if !tls.ready {
+                    return Err("data before the TLS handshake".into());
+                }
+                Ok(SspiOutput {
+                    result: answer(TlsOutput {
+                        send: tls.ctx.send(plain)?,
+                        ready: true,
+                        ..TlsOutput::default()
+                    }),
+                    package: None,
+                    cert: None,
+                })
+            }
+            _ => Err("not a TLS operation".into()),
+        }
     }
 
     fn step(
@@ -156,16 +302,29 @@ impl Contexts {
         key: (u32, u8),
         job: &SspiJob,
     ) -> Result<SspiOutput, String> {
+        if matches!(
+            job.op,
+            SspiOp::TlsStart | SspiOp::TlsReceived(_) | SspiOp::TlsSend(_)
+        ) {
+            return self.tls_step(provider, key, job);
+        }
         let plain = |result| SspiOutput {
             result,
             package: None,
+            cert: None,
         };
         if matches!(job.op, SspiOp::Start) {
             self.open.remove(&key);
-            if self.open.len() >= MAX_CONTEXTS {
+            if self.open.len() + self.tls.len() >= MAX_CONTEXTS {
                 return Err("too many WinRM logins at once".into());
             }
-            let ctx = provider.start(&job.host, job.credentials.as_ref())?;
+            // A login on a TLS connection is bound to it.
+            let bindings = match self.tls.get(&key) {
+                Some(tls) if tls.ready => Some(tls.ctx.channel_bindings()?),
+                Some(_) => return Err("a login before the TLS handshake".into()),
+                None => None,
+            };
+            let ctx = provider.start(&job.host, job.credentials.as_ref(), bindings.as_deref())?;
             self.open.insert(key, ctx);
         }
         let ctx = self.open.get_mut(&key).ok_or("the login was not started")?;
@@ -175,6 +334,7 @@ impl Contexts {
                 ContextStep::Done(t) => SspiOutput {
                     result: SspiResult::Done(t),
                     package: Some(ctx.package()),
+                    cert: None,
                 },
             },
             SspiOp::Step(token) => match ctx.step(Some(token))? {
@@ -182,6 +342,7 @@ impl Contexts {
                 ContextStep::Done(t) => SspiOutput {
                     result: SspiResult::Done(t),
                     package: Some(ctx.package()),
+                    cert: None,
                 },
             },
             SspiOp::Seal(data) => {
@@ -190,6 +351,9 @@ impl Contexts {
             }
             SspiOp::Unseal { header, data } => {
                 plain(SspiResult::Unsealed(ctx.unseal(header, data)?))
+            }
+            SspiOp::TlsStart | SspiOp::TlsReceived(_) | SspiOp::TlsSend(_) => {
+                return Err("not a Negotiate operation".into());
             }
         })
     }
@@ -237,6 +401,7 @@ pub(crate) mod tests {
             &self,
             host: &str,
             _c: Option<&Credentials>,
+            _b: Option<&[u8]>,
         ) -> Result<Box<dyn NegotiateContext>, String> {
             if host == "nowhere" {
                 return Err("no such host".into());

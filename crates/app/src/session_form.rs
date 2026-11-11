@@ -97,6 +97,8 @@ pub struct Values {
     /// `off`.
     pub desk_clipboard: String,
     pub legacy: bool,
+    /// WinRM over HTTPS (`WinrmHttps yes`).
+    pub winrm_https: bool,
     /// Let the server use the agent's keys (`ForwardAgent yes`).
     pub forward_agent: bool,
     /// Kerberos login (`GSSAPIAuthentication`): FeroSSH's choice when
@@ -243,6 +245,7 @@ impl Values {
         self.login_script = p.login_script.iter().map(ToString::to_string).collect();
         self.mosh_server = p.mosh_server.clone().unwrap_or_default();
         self.winrm_command = p.winrm_command.clone().unwrap_or_default();
+        self.winrm_https = p.winrm_https;
         self.mosh_ports = p
             .mosh_ports
             .map(ferossh_config::settings::mosh_ports_text)
@@ -289,6 +292,7 @@ enum Field {
     Clipboard,
     DeskClipboard,
     Legacy,
+    WinrmHttps,
     ForwardAgent,
     Kerberos,
     KerberosDelegate,
@@ -337,6 +341,7 @@ impl Field {
             Field::Clipboard => "App clip",
             Field::DeskClipboard => "Desk clip",
             Field::Legacy => "Old crypto",
+            Field::WinrmHttps => "Transport",
             Field::ForwardAgent => "Fwd agent",
             Field::Kerberos => "Kerberos",
             Field::KerberosDelegate => "Fwd ticket",
@@ -361,6 +366,7 @@ impl Field {
                 | Field::Tmux
                 | Field::TmuxLayout
                 | Field::Legacy
+                | Field::WinrmHttps
                 | Field::ForwardAgent
                 | Field::Kerberos
                 | Field::KerberosDelegate
@@ -520,6 +526,21 @@ impl SessionForm {
                 .is_some_and(|o| o.eq_ignore_ascii_case(self.values.name.trim()))
     }
 
+    /// The password source and what goes with it.
+    fn password_items(&self, out: &mut Vec<Item>) {
+        out.push(Item::Field(Field::Password));
+        match self.values.password {
+            PASSWORD_ASK => {}
+            PASSWORD_WINDOWS => {
+                out.push(Item::Note("Saved after a login that works.".into()));
+            }
+            _ => {
+                out.push(Item::Field(Field::PasswordCommand));
+                out.push(Item::Note("%n is the connection's name.".into()));
+            }
+        }
+    }
+
     fn field_locked(&self, f: Field) -> bool {
         self.locked()
             && matches!(
@@ -591,17 +612,7 @@ impl SessionForm {
                     if !self.field_locked(Field::Key) {
                         out.push(Item::Browse);
                     }
-                    out.push(Item::Field(Field::Password));
-                    match self.values.password {
-                        PASSWORD_ASK => {}
-                        PASSWORD_WINDOWS => {
-                            out.push(Item::Note("Saved after a login that works.".into()));
-                        }
-                        _ => {
-                            out.push(Item::Field(Field::PasswordCommand));
-                            out.push(Item::Note("%n is the connection's name.".into()));
-                        }
-                    }
+                    self.password_items(&mut out);
                     out.push(Item::Field(Field::Jump));
                     out.push(Item::Field(Field::Proxy));
                     if kind == SessionKind::Mosh {
@@ -647,9 +658,11 @@ impl SessionForm {
                     out.push(Item::Note("can read it, passwords too.".into()));
                 }
                 SessionKind::WinRm => {
+                    self.password_items(&mut out);
+                    out.push(Item::Field(Field::WinrmHttps));
                     out.push(Item::Field(Field::WinrmCommand));
-                    out.push(Item::Note("Kerberos or NTLM login, asks the".into()));
-                    out.push(Item::Note("password; empty user: your own.".into()));
+                    out.push(Item::Note("Kerberos or NTLM login; an empty".into()));
+                    out.push(Item::Note("user logs in as yourself.".into()));
                     out.push(Item::Note("Lines go on Enter: no full screen.".into()));
                 }
             }
@@ -831,6 +844,7 @@ impl SessionForm {
             | Field::Tmux
             | Field::TmuxLayout
             | Field::Legacy
+            | Field::WinrmHttps
             | Field::ForwardAgent
             | Field::Kerberos
             | Field::KerberosDelegate
@@ -882,6 +896,7 @@ impl SessionForm {
             | Field::Tmux
             | Field::TmuxLayout
             | Field::Legacy
+            | Field::WinrmHttps
             | Field::ForwardAgent
             | Field::Kerberos
             | Field::KerberosDelegate
@@ -957,6 +972,12 @@ impl SessionForm {
             }
             .to_owned(),
             Field::Legacy => if v.legacy { "allowed" } else { "off" }.to_owned(),
+            Field::WinrmHttps => if v.winrm_https {
+                "HTTPS (5986)"
+            } else {
+                "HTTP, encrypted messages (5985)"
+            }
+            .to_owned(),
             Field::ForwardAgent => if v.forward_agent {
                 "on, asking before each use"
             } else {
@@ -1054,6 +1075,7 @@ impl SessionForm {
                 };
             }
             Field::Legacy => v.legacy = !v.legacy,
+            Field::WinrmHttps => v.winrm_https = !v.winrm_https,
             Field::ForwardAgent => v.forward_agent = !v.forward_agent,
             Field::Kerberos => v.kerberos = tri(v.kerberos, forward),
             Field::KerberosDelegate => v.kerberos_delegate = !v.kerberos_delegate,
@@ -1121,7 +1143,7 @@ impl SessionForm {
                 SessionKind::Rdp => "3389".into(),
                 SessionKind::Vnc => "5900".into(),
                 SessionKind::Telnet => "23".into(),
-                SessionKind::WinRm => ferossh_config::DEFAULT_WINRM_PORT.to_string(),
+                SessionKind::WinRm => crate::winrm::default_port(v.winrm_https).to_string(),
                 SessionKind::Serial | SessionKind::Xvfb | SessionKind::RemoteApp => String::new(),
             },
             Field::Speed => "9600 bits/s".into(),
@@ -1161,6 +1183,7 @@ impl SessionForm {
             | Field::Tmux
             | Field::TmuxLayout
             | Field::Legacy
+            | Field::WinrmHttps
             | Field::ForwardAgent
             | Field::Kerberos
             | Field::KerberosDelegate
@@ -1564,11 +1587,18 @@ impl SessionForm {
         }
         if matches!(
             v.kind,
-            SessionKind::Ssh | SessionKind::Mosh | SessionKind::Sftp
+            SessionKind::Ssh | SessionKind::Mosh | SessionKind::Sftp | SessionKind::WinRm
         ) && v.password > PASSWORD_WINDOWS
             && v.password_command.trim().is_empty()
         {
             return Err("Fill in the password manager's command, or pick another source.".into());
+        }
+        if v.kind == SessionKind::WinRm && v.password != PASSWORD_ASK && v.user.trim().is_empty() {
+            return Err(
+                "A password source needs a user: without one, WinRM logs in as yourself \
+                 with no password."
+                    .into(),
+            );
         }
         Ok(())
     }
@@ -2069,10 +2099,11 @@ impl SessionForm {
             .filter(|d| *d != ferossh_config::settings::DesktopSize::Follow);
         p.legacy_algorithms = v.legacy;
         p.password = match (v.kind, v.password) {
-            (SessionKind::Ssh | SessionKind::Mosh | SessionKind::Sftp, PASSWORD_WINDOWS) => {
-                PasswordSource::Windows
-            }
-            (SessionKind::Ssh | SessionKind::Mosh | SessionKind::Sftp, i)
+            (
+                SessionKind::Ssh | SessionKind::Mosh | SessionKind::Sftp | SessionKind::WinRm,
+                PASSWORD_WINDOWS,
+            ) => PasswordSource::Windows,
+            (SessionKind::Ssh | SessionKind::Mosh | SessionKind::Sftp | SessionKind::WinRm, i)
                 if i > PASSWORD_WINDOWS =>
             {
                 PasswordSource::Command(v.password_command.trim().to_owned())
@@ -2096,6 +2127,7 @@ impl SessionForm {
         p.mosh_ports = ferossh_config::settings::mosh_ports(&v.mosh_ports).filter(|_| mosh);
         p.winrm_command = ferossh_config::settings::virtual_desktop(&v.winrm_command)
             .filter(|c| v.kind == SessionKind::WinRm && c != ferossh_config::DEFAULT_WINRM_COMMAND);
+        p.winrm_https = v.kind == SessionKind::WinRm && v.winrm_https;
         p.serial = is_serial.then(|| {
             let mut line = LineSettings {
                 flow: v.flow,
@@ -2654,6 +2686,40 @@ mod tests {
         let p = settings.profile("win-srv").unwrap();
         assert_eq!(p.kind, SessionKind::WinRm);
         assert_eq!(p.winrm_command.as_deref(), Some("cmd"));
+        assert_eq!(p.password, PasswordSource::Ask);
+        // A password source: shown, saved, and only with a user.
+        assert!(t.iter().any(|l| l.contains("Password")));
+        f.values.password = PASSWORD_WINDOWS;
+        let t = texts(&mut f);
+        assert!(t.iter().any(|l| l.contains("Saved after a login")));
+        f.apply(&mut hosts, &mut settings);
+        assert_eq!(
+            settings.profile("win-srv").unwrap().password,
+            PasswordSource::Windows
+        );
+        f.values.password = PASSWORD_WINDOWS + 1;
+        f.values.password_command = "pass show win/%n".into();
+        f.apply(&mut hosts, &mut settings);
+        assert_eq!(
+            settings.profile("win-srv").unwrap().password,
+            PasswordSource::Command("pass show win/%n".into())
+        );
+        f.values.user.clear();
+        assert!(f.check().unwrap_err().contains("needs a user"));
+        f.values.user = "LAB\\admin".into();
+        f.values.password = PASSWORD_ASK;
+        // HTTPS: shown, saved, and its port the default.
+        let t = texts(&mut f);
+        assert!(
+            t.iter()
+                .any(|l| l.contains("Transport") && l.contains("5985"))
+        );
+        f.values.winrm_https = true;
+        let t = texts(&mut f);
+        assert!(t.iter().any(|l| l.contains("Port") && l.contains("5986")));
+        f.apply(&mut hosts, &mut settings);
+        assert!(settings.profile("win-srv").unwrap().winrm_https);
+        f.values.winrm_https = false;
         // The default command is not written out.
         f.values.winrm_command = ferossh_config::DEFAULT_WINRM_COMMAND.into();
         f.apply(&mut hosts, &mut settings);
@@ -2666,7 +2732,7 @@ mod tests {
             vars: Vec::new(),
             config: text,
         };
-        let t = crate::winrm::WinrmTarget::resolve("win-srv", &env, None, None).unwrap();
+        let t = crate::winrm::WinrmTarget::resolve("win-srv", &env, None, false, None).unwrap();
         assert_eq!(t.user.as_deref(), Some("LAB\\admin"));
     }
 

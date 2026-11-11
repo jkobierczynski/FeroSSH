@@ -8,7 +8,7 @@ Items with a check mark are switches: picking them turns the setting on or off, 
 
 | Item | Shortcut | What it does |
 | --- | --- | --- |
-| Connect to... | Ctrl+Shift+N | Asks for a host in a new tab. The prompt takes `user@host`, `user@host:2222`, a `Host` alias from your ssh_config, a saved connection's name, `sftp://user@host[:port][/folder]` (file transfer only, no shell), `telnet://host[:port]` or `telnet host port`, `winrm://[user@]host[:port]` or `winrm host`, and a COM port such as `COM3` or `COM3:115200`. |
+| Connect to... | Ctrl+Shift+N | Asks for a host in a new tab. The prompt takes `user@host`, `user@host:2222`, a `Host` alias from your ssh_config, a saved connection's name, `sftp://user@host[:port][/folder]` (file transfer only, no shell), `telnet://host[:port]` or `telnet host port`, `winrm://[user@]host[:port]`, `winrms://[user@]host[:port]` (HTTPS) or `winrm host`, and a COM port such as `COM3` or `COM3:115200`. |
 | Reconnect | Ctrl+Shift+R | Logs in again on the focused pane's connection. While FeroSSH is already waiting to reconnect, it tries at once instead. |
 | Disconnect | | Ends the focused pane's connection, or stops the retries while it is reconnecting. |
 | Reconnect automatically | ✓ on | Logs in again by itself when a connection drops (see [When the connection drops](everyday-use.md#when-the-connection-drops)). `AutoReconnect`. |

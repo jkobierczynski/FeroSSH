@@ -46,7 +46,7 @@ use std::fmt;
 use zeroize::Zeroize;
 
 /// Protocol version carried in every frame. Bump on any wire change.
-pub const PROTOCOL_VERSION: u8 = 19;
+pub const PROTOCOL_VERSION: u8 = 20;
 
 /// Largest frame body accepted, in bytes. Terminal and SFTP data is chunked
 /// below this, so anything larger is a bug or an attack.
@@ -220,6 +220,13 @@ pub enum SspiOp {
     Seal(Vec<u8>),
     /// Decrypt a response body: its signature and encrypted data.
     Unseal { header: Vec<u8>, data: Vec<u8> },
+    /// HTTPS: start a TLS connection to the host (Windows' SChannel, in
+    /// the UI); the answer is [`SspiResult::Tls`].
+    TlsStart,
+    /// HTTPS: bytes the server sent, as they came (handshake or records).
+    TlsReceived(Vec<u8>),
+    /// HTTPS: plain bytes to encrypt for the server.
+    TlsSend(Vec<u8>),
 }
 
 /// The UI's answer to a [`Message::SspiRequest`].
@@ -234,6 +241,15 @@ pub enum SspiResult {
     Sealed { header: Vec<u8>, data: Vec<u8> },
     /// An unsealed response body.
     Unsealed(Vec<u8>),
+    /// HTTPS: bytes to send the server, the plain bytes its records held,
+    /// whether the handshake is done (the server's certificate checked),
+    /// and whether the server closed the TLS connection.
+    Tls {
+        send: Vec<u8>,
+        plain: Vec<u8>,
+        ready: bool,
+        closed: bool,
+    },
     /// No login, or a message that failed its check: the session ends.
     Failed(String),
 }
@@ -556,6 +572,9 @@ pub enum Message {
         /// Seconds for the TCP connection.
         connect_timeout: u32,
         command: String,
+        /// HTTPS (TLS through the UI) instead of HTTP with sealed
+        /// messages.
+        https: bool,
     },
     /// The answer to the last [`Message::SspiRequest`] for `conn`.
     SspiReply {
@@ -1382,12 +1401,14 @@ pub fn encode(msg: &Message, out: &mut Vec<u8>) -> Result<(), Error> {
             port,
             connect_timeout,
             command,
+            https,
         } => {
             w.u32(*channel);
             w.str(host);
             w.u16(*port);
             w.u32(*connect_timeout);
             w.str(command);
+            w.bool(*https);
         }
         Message::SspiRequest { channel, conn, op } => {
             w.u32(*channel);
@@ -1405,6 +1426,15 @@ pub fn encode(msg: &Message, out: &mut Vec<u8>) -> Result<(), Error> {
                 SspiOp::Unseal { header, data } => {
                     w.u8(3);
                     w.bytes(header);
+                    w.bytes(data);
+                }
+                SspiOp::TlsStart => w.u8(4),
+                SspiOp::TlsReceived(data) => {
+                    w.u8(5);
+                    w.bytes(data);
+                }
+                SspiOp::TlsSend(data) => {
+                    w.u8(6);
                     w.bytes(data);
                 }
             }
@@ -1437,6 +1467,18 @@ pub fn encode(msg: &Message, out: &mut Vec<u8>) -> Result<(), Error> {
                 SspiResult::Failed(why) => {
                     w.u8(4);
                     w.str(why);
+                }
+                SspiResult::Tls {
+                    send,
+                    plain,
+                    ready,
+                    closed,
+                } => {
+                    w.u8(5);
+                    w.bytes(send);
+                    w.bytes(plain);
+                    w.bool(*ready);
+                    w.bool(*closed);
                 }
             }
         }
@@ -2098,6 +2140,7 @@ fn decode_body(body: &[u8]) -> Result<Message, Error> {
             port: r.u16()?,
             connect_timeout: r.u32()?,
             command: r.string()?,
+            https: r.bool()?,
         },
         61 => Message::SspiRequest {
             channel: r.u32()?,
@@ -2110,6 +2153,9 @@ fn decode_body(body: &[u8]) -> Result<Message, Error> {
                     header: r.bytes()?.to_vec(),
                     data: r.bytes()?.to_vec(),
                 },
+                4 => SspiOp::TlsStart,
+                5 => SspiOp::TlsReceived(r.bytes()?.to_vec()),
+                6 => SspiOp::TlsSend(r.bytes()?.to_vec()),
                 _ => return Err(Error::Invalid),
             },
         },
@@ -2125,6 +2171,12 @@ fn decode_body(body: &[u8]) -> Result<Message, Error> {
                 },
                 3 => SspiResult::Unsealed(r.bytes()?.to_vec()),
                 4 => SspiResult::Failed(r.string()?),
+                5 => SspiResult::Tls {
+                    send: r.bytes()?.to_vec(),
+                    plain: r.bytes()?.to_vec(),
+                    ready: r.bool()?,
+                    closed: r.bool()?,
+                },
                 _ => return Err(Error::Invalid),
             },
         },
@@ -2630,6 +2682,7 @@ mod tests {
                 port: 5985,
                 connect_timeout: 20,
                 command: "powershell -NoLogo".into(),
+                https: true,
             },
             Message::SspiRequest {
                 channel: 4,
@@ -2681,6 +2734,31 @@ mod tests {
                 channel: 4,
                 conn: 0,
                 result: SspiResult::Failed("no credentials".into()),
+            },
+            Message::SspiRequest {
+                channel: 4,
+                conn: 0,
+                op: SspiOp::TlsStart,
+            },
+            Message::SspiRequest {
+                channel: 4,
+                conn: 1,
+                op: SspiOp::TlsReceived(vec![0x16; 90]),
+            },
+            Message::SspiRequest {
+                channel: 4,
+                conn: 1,
+                op: SspiOp::TlsSend(b"POST /wsman".to_vec()),
+            },
+            Message::SspiReply {
+                channel: 4,
+                conn: 1,
+                result: SspiResult::Tls {
+                    send: vec![0x17; 60],
+                    plain: b"HTTP/1.1 200".to_vec(),
+                    ready: true,
+                    closed: false,
+                },
             },
             Message::GssapiReply {
                 channel: 1,

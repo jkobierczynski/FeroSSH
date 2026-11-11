@@ -87,6 +87,14 @@ jobs:
         shell: pwsh
         run: |
           Enable-PSRemoting -Force -SkipNetworkProfileCheck
+          # An HTTPS listener on 5986 for the live test over TLS. The runner
+          # image may already have one, with a certificate of its own;
+          # replace it with one for localhost.
+          Get-ChildItem WSMan:\localhost\Listener |
+            Where-Object { $_.Keys -contains 'Transport=HTTPS' } |
+            Remove-Item -Recurse -Force
+          $cert = New-SelfSignedCertificate -DnsName localhost -CertStoreLocation Cert:\LocalMachine\My
+          New-Item -Path WSMan:\localhost\Listener -Transport HTTPS -Address * -CertificateThumbPrint $cert.Thumbprint -Force | Out-Null
           "FEROSSH_WINRM_LIVE=1" >> $env:GITHUB_ENV
       - run: cargo test --workspace --locked
       - run: cargo test -p ferossh --features desktop-viewer --locked

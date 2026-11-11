@@ -3,7 +3,10 @@
 //! relays output (across a Receive that times out on the server), input,
 //! Ctrl+C and the exit code, with every message sealed. The test plays
 //! the UI, with a stand-in security context: tokens are fixed strings
-//! and sealing XORs the message, so the server can check both.
+//! and sealing XORs the message, so the server can check both. The same
+//! session runs over "HTTPS" with a stand-in TLS connection in the UI:
+//! a HELLO/WELCOME handshake, then the bytes as they are, and no
+//! sealing inside.
 
 #![allow(
     clippy::unwrap_used,
@@ -94,9 +97,25 @@ async fn respond(s: &mut TcpStream, status: &str, headers: &[(&str, &str)], body
     s.write_all(&out).await.unwrap();
 }
 
+/// A reply: sealed over HTTP, as it is over (stand-in) HTTPS.
 async fn respond_sealed(s: &mut TcpStream, status: &str, envelope: &str) {
+    if tls_mode() {
+        let ct = [("Content-Type", "application/soap+xml;charset=UTF-8")];
+        respond(s, status, &ct, envelope.as_bytes()).await;
+        return;
+    }
     let body = sealed::frame(envelope.len(), SIG, &xor(envelope.as_bytes()));
     respond(s, status, &[("Content-Type", sealed::CONTENT_TYPE)], &body).await;
+}
+
+tokio::task_local! {
+    /// The connection being served is the stand-in HTTPS one.
+    static TLS_MODE: bool;
+}
+
+/// Whether the task serves stand-in HTTPS.
+fn tls_mode() -> bool {
+    TLS_MODE.try_with(|t| *t).unwrap_or(false)
 }
 
 fn envelope(body: &str) -> String {
@@ -114,9 +133,20 @@ fn stream(name: &str, data: &[u8]) -> String {
     )
 }
 
-/// One client connection: the Negotiate login, then sealed requests.
-async fn serve_conn(mut s: TcpStream, shared: Arc<Mutex<Shared>>, input: Arc<Notify>) {
+/// One client connection: the stand-in TLS handshake when `tls`, then
+/// the Negotiate login, then the requests.
+async fn serve_conn(s: TcpStream, shared: Arc<Mutex<Shared>>, input: Arc<Notify>, tls: bool) {
+    TLS_MODE.scope(tls, serve(s, shared, input)).await;
+}
+
+async fn serve(mut s: TcpStream, shared: Arc<Mutex<Shared>>, input: Arc<Notify>) {
     let mut buf = Vec::new();
+    if tls_mode() {
+        let mut hello = [0u8; 5];
+        s.read_exact(&mut hello).await.unwrap();
+        assert_eq!(&hello, b"HELLO");
+        s.write_all(b"WELCOME").await.unwrap();
+    }
     // Login: T1 -> 401 S1 -> T2 -> 200.
     let r = read_request(&mut s, &mut buf).await.unwrap();
     assert_eq!(r.header("Authorization"), Some("Negotiate VDE="));
@@ -132,12 +162,18 @@ async fn serve_conn(mut s: TcpStream, shared: Arc<Mutex<Shared>>, input: Arc<Not
     assert_eq!(r.header("Authorization"), Some("Negotiate VDI="));
     respond(&mut s, "200 OK", &[], b"").await;
     while let Some(r) = read_request(&mut s, &mut buf).await {
-        assert!(sealed::is_sealed(r.header("Content-Type")));
         assert!(r.header("Authorization").is_none());
-        let parts = sealed::unframe(&r.body).unwrap();
-        assert_eq!(parts.header, SIG);
-        let plain = xor(parts.data);
-        assert_eq!(plain.len(), parts.plain_len);
+        let plain = if tls_mode() {
+            assert!(!sealed::is_sealed(r.header("Content-Type")));
+            r.body.clone()
+        } else {
+            assert!(sealed::is_sealed(r.header("Content-Type")));
+            let parts = sealed::unframe(&r.body).unwrap();
+            assert_eq!(parts.header, SIG);
+            let plain = xor(parts.data);
+            assert_eq!(plain.len(), parts.plain_len);
+            plain
+        };
         let root = xml::parse(&plain).unwrap();
         let action = root.find("Action").unwrap().text();
         let verb = action.rsplit('/').next().unwrap().to_owned();
@@ -227,9 +263,39 @@ async fn serve_conn(mut s: TcpStream, shared: Arc<Mutex<Shared>>, input: Arc<Not
     }
 }
 
+/// Plays the UI's side of SSPI: fixed tokens and XOR sealing; over
+/// HTTPS, a stand-in TLS connection per `conn` (`ready` lists the ones
+/// past the handshake) and no sealing.
+fn answer_tls(op: SspiOp, conn: u8, ready: &mut Vec<u8>) -> SspiResult {
+    let tls = |send: &[u8], plain: &[u8], ready: bool| SspiResult::Tls {
+        send: send.to_vec(),
+        plain: plain.to_vec(),
+        ready,
+        closed: false,
+    };
+    match op {
+        SspiOp::TlsStart => tls(b"HELLO", b"", false),
+        SspiOp::TlsReceived(data) if !ready.contains(&conn) => {
+            assert!(data.starts_with(b"WELCOME"), "{data:?}");
+            ready.push(conn);
+            tls(b"", &data[7..], true)
+        }
+        SspiOp::TlsReceived(data) => tls(b"", &data, true),
+        SspiOp::TlsSend(plain) => {
+            assert!(ready.contains(&conn), "data before the handshake");
+            tls(&plain, b"", true)
+        }
+        SspiOp::Seal(_) | SspiOp::Unseal { .. } => panic!("sealing inside HTTPS"),
+        op => answer(op),
+    }
+}
+
 /// Plays the UI's side of SSPI: fixed tokens and XOR sealing.
 fn answer(op: SspiOp) -> SspiResult {
     match op {
+        SspiOp::TlsStart | SspiOp::TlsReceived(_) | SspiOp::TlsSend(_) => {
+            panic!("TLS over HTTP")
+        }
         SspiOp::Start => SspiResult::Continue(b"T1".to_vec()),
         SspiOp::Step(t) => {
             assert_eq!(t, b"S1");
@@ -250,6 +316,15 @@ fn answer(op: SspiOp) -> SspiResult {
 
 #[tokio::test]
 async fn runs_a_winrm_shell() {
+    run_shell(false).await;
+}
+
+#[tokio::test]
+async fn runs_a_winrm_shell_over_https() {
+    run_shell(true).await;
+}
+
+async fn run_shell(https: bool) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
     let shared = Arc::new(Mutex::new(Shared::default()));
@@ -258,7 +333,7 @@ async fn runs_a_winrm_shell() {
     tokio::spawn(async move {
         loop {
             let (s, _) = listener.accept().await.unwrap();
-            tokio::spawn(serve_conn(s, sh.clone(), inp.clone()));
+            tokio::spawn(serve_conn(s, sh.clone(), inp.clone(), https));
         }
     });
 
@@ -282,10 +357,12 @@ async fn runs_a_winrm_shell() {
             port,
             connect_timeout: 5,
             command: "powershell -NoLogo".into(),
+            https,
         })
         .await
         .unwrap();
 
+    let mut ready = Vec::new();
     let mut stdout = String::new();
     let mut stderr = String::new();
     let mut conns = std::collections::HashSet::new();
@@ -305,7 +382,11 @@ async fn runs_a_winrm_shell() {
                 op,
             } => {
                 conns.insert(conn);
-                let result = answer(op);
+                let result = if https {
+                    answer_tls(op, conn, &mut ready)
+                } else {
+                    answer(op)
+                };
                 to_worker
                     .send(Message::SspiReply {
                         channel: 3,
@@ -349,6 +430,9 @@ async fn runs_a_winrm_shell() {
         }
     };
     assert_eq!(conns.len(), 2, "output and input each log in");
+    if https {
+        assert_eq!(ready.len(), 2, "each connection has its own TLS");
+    }
     assert!(stdout.ends_with("bye\r\n"), "{stdout:?}");
     assert_eq!(stderr, "warning\r\n");
     assert_eq!(exit, Some(7));
@@ -406,6 +490,7 @@ async fn refuses_unsealed_replies() {
             port,
             connect_timeout: 5,
             command: "cmd".into(),
+            https: false,
         })
         .await
         .unwrap();

@@ -38,6 +38,6 @@ pub use password::PasswordSource;
 pub use pattern::{match_host, match_pattern};
 pub use proxy::{ProxyKind, ProxyServer};
 pub use settings::{
-    Bookmark, DEFAULT_TELNET_PORT, DEFAULT_WINRM_COMMAND, DEFAULT_WINRM_PORT, Profile, SessionKind,
-    Settings, WindowColours,
+    Bookmark, DEFAULT_TELNET_PORT, DEFAULT_WINRM_COMMAND, DEFAULT_WINRM_HTTPS_PORT,
+    DEFAULT_WINRM_PORT, Profile, SessionKind, Settings, WindowColours,
 };
