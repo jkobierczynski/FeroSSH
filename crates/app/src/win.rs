@@ -874,9 +874,10 @@ struct Window {
     histories: HashMap<String, (suggest::History, Option<SystemTime>)>,
     /// The suggestion showing after the cursor, for the keys that take it.
     ghost: Option<Ghost>,
-    /// Suggestions Shift+Delete dismissed (built-in commands; history
-    /// entries are also removed from the history).
-    dismissed: HashSet<String>,
+    /// Suggestions Shift+Delete dismissed, by history key and line
+    /// (built-in commands; history entries are also removed from the
+    /// history).
+    dismissed: HashSet<(String, String)>,
     /// A repeatable tmux key (an arrow, PageUp) was just used: until this
     /// time, more of them work without the prefix, as with tmux's `bind
     /// -r` and `repeat-time`.
@@ -7132,7 +7133,7 @@ impl Window {
         let typed = p.typing.line(&p.term)?.before;
         let choice = p.typing.choice;
         let mut choices = suggest::choices(Some(self.history(&key)), &typed);
-        choices.retain(|c| !self.dismissed.contains(c));
+        choices.retain(|c| !self.dismissed.contains(&(key.clone(), c.clone())));
         if choices.is_empty() {
             return None;
         }
@@ -7225,8 +7226,8 @@ impl Window {
             Key::Delete if shift => {
                 // A built-in command is not in the history: it stays out of
                 // the suggestions until FeroSSH restarts.
-                self.dismissed.insert(line.clone());
                 if let Some(k) = self.history_key(id) {
+                    self.dismissed.insert((k.clone(), line.clone()));
                     self.change_history(&k, |h| h.remove(&line));
                 }
                 self.refresh(id);

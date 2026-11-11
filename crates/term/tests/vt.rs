@@ -822,3 +822,17 @@ fn a_right_hand_prompt_one_cell_from_the_edge_is_cut() {
     t.feed(b"make\r\n");
     assert_eq!(t.input_text(&mark).as_deref(), Some("make"));
 }
+
+#[test]
+fn input_line_follows_a_command_wrapped_over_many_rows() {
+    // 350 characters on 20 columns: 18 rows.
+    let mut t = term(20, 30);
+    t.feed(b"$ ");
+    let mut mark = t.input_mark().unwrap();
+    let cmd = "x".repeat(350);
+    t.feed(cmd.as_bytes());
+    assert_eq!(t.input_line(&mut mark).unwrap().before, cmd);
+    assert!(t.input_here(&mark));
+    t.feed(b"\r\n$ ");
+    assert_eq!(t.input_text(&mark).as_deref(), Some(cmd.as_str()));
+}

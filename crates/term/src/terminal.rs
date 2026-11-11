@@ -207,8 +207,15 @@ fn without_right_prompt<'a>(text: &'a str, right: &str) -> &'a str {
     }
 }
 
-/// The most rows a command line read by [`Terminal::input_line`] spans.
-const MAX_INPUT_ROWS: usize = 16;
+/// The longest command line [`Terminal::input_line`] follows, in
+/// characters (the longest a history keeps).
+const MAX_INPUT_CHARS: usize = 1024;
+
+/// The most rows a command line of [`MAX_INPUT_CHARS`] spans on rows of
+/// `cols` columns, with the prompt.
+fn max_input_rows(cols: usize) -> usize {
+    MAX_INPUT_CHARS / cols.max(1) + 2
+}
 
 /// One terminal: the emulator, its parser and the pane's search state.
 pub struct Terminal {
@@ -1114,7 +1121,7 @@ impl Terminal {
             && grid[l - 1i32][Column(cols - 1)]
                 .flags
                 .contains(TermFlags::WRAPLINE)
-            && starts.len() < MAX_INPUT_ROWS
+            && starts.len() < max_input_rows(cols)
         {
             l -= 1i32;
             starts.push(l);
@@ -1199,7 +1206,7 @@ impl Terminal {
         };
         let cols = grid.columns();
         let mut l = grid.cursor.point.line;
-        for _ in 0..MAX_INPUT_ROWS {
+        for _ in 0..max_input_rows(cols) {
             if l == start {
                 return true;
             }
@@ -1233,7 +1240,7 @@ impl Terminal {
         let mut text = self.row_text(line, mark.col, cols);
         let mut rows = 1;
         while line < grid.bottommost_line()
-            && rows < MAX_INPUT_ROWS
+            && rows < max_input_rows(cols)
             && grid[line][Column(cols - 1)]
                 .flags
                 .contains(TermFlags::WRAPLINE)
