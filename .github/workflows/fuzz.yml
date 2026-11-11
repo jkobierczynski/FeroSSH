@@ -36,6 +36,7 @@ jobs:
           - term_feed
           - sftp_decode
           - forward_parse
+          - proxy_reply
           - tmux_feed
           - vnc_decode
           - rdp_decode

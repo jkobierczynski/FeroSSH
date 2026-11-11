@@ -79,6 +79,13 @@ doc = false
 bench = false
 
 [[bin]]
+name = "proxy_reply"
+path = "fuzz_targets/proxy_reply.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
 name = "tmux_feed"
 path = "fuzz_targets/tmux_feed.rs"
 test = false

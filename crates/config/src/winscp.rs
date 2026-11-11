@@ -6,14 +6,14 @@
 //! `/`. Only SFTP and SCP sites are imported: FTP, WebDAV and S3 have no
 //! SSH login. Workspaces and site shortcuts are skipped. Passwords are
 //! never read, only noticed. A site's SSH tunnel becomes its jump host
-//! (`ProxyJump`).
+//! (`ProxyJump`); a SOCKS 5 or HTTP proxy comes over without its password.
 
 use crate::import::{Session, Value, clean, decode};
 use crate::ssh_config::parse_destination;
 
 /// The values FeroSSH reads from each site. The password values are only
 /// checked for being there.
-pub const VALUES: [&str; 14] = [
+pub const VALUES: [&str; 18] = [
     "HostName",
     "UserName",
     "PortNumber",
@@ -28,6 +28,10 @@ pub const VALUES: [&str; 14] = [
     "Link",
     "Password",
     "PasswordPlain",
+    "ProxyMethod",
+    "ProxyHost",
+    "ProxyPort",
+    "ProxyUsername",
 ];
 
 /// WinSCP's protocols that log in over SSH: SCP, SFTP with SCP fallback
@@ -91,6 +95,12 @@ pub fn session(raw_name: &str, get: impl Fn(&str) -> Option<Value>) -> Option<Se
             ));
         }
     }
+    s.set_proxy(
+        number("ProxyMethod"),
+        text("ProxyHost"),
+        number("ProxyPort"),
+        text("ProxyUsername"),
+    );
     Some(s)
 }
 
