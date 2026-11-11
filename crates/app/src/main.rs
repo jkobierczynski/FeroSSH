@@ -80,6 +80,8 @@ mod fwdview;
 #[cfg_attr(not(windows), allow(dead_code))]
 mod highlight;
 #[cfg(windows)]
+mod history_store;
+#[cfg(windows)]
 mod import_reg;
 #[cfg_attr(not(windows), allow(dead_code))]
 mod import_view;
@@ -137,6 +139,8 @@ mod ssh_e2e;
 mod standby;
 #[cfg_attr(not(windows), allow(dead_code))]
 mod stream;
+#[cfg_attr(not(windows), allow(dead_code))]
+mod suggest;
 #[cfg_attr(not(windows), allow(dead_code))]
 mod tabstrip;
 #[cfg_attr(not(windows), allow(dead_code))]

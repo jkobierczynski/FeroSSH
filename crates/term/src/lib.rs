@@ -36,4 +36,4 @@ pub use cwd::{WorkingDir, prompt_dir};
 pub use input::{Key, Mods, MouseButton, MouseEvent};
 pub use log::{Clock, LogWriter, Sealed, log_file_name};
 pub use sanitize::{Paste, check_link, clipboard_preview, prepare_paste, sanitize_title};
-pub use terminal::{Action, SelectionKind, Settings, Terminal};
+pub use terminal::{Action, InputLine, InputMark, SelectionKind, Settings, Terminal};

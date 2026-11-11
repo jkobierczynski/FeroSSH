@@ -710,3 +710,74 @@ fn all_text_joins_wrapped_lines_and_keeps_wide_characters() {
     assert_eq!(t.all_text(), vec!["one", "", "two"]);
     assert!(term(10, 4).all_text().is_empty());
 }
+
+#[test]
+fn input_line_reads_what_was_typed_after_the_prompt() {
+    let mut t = term(20, 5);
+    t.feed(b"total 0\r\nuser@h:~$ ");
+    let mut mark = t.input_mark().unwrap();
+    assert_eq!(mark.prompt(), "user@h:~$ ");
+    t.feed(b"git st");
+    let line = t.input_line(&mut mark).unwrap();
+    assert_eq!(line.before, "git st");
+    assert_eq!(line.after, "");
+    // Left arrow: the cursor is inside the line.
+    t.feed(b"\x08\x08");
+    let line = t.input_line(&mut mark).unwrap();
+    assert_eq!(line.before, "git ");
+    assert_eq!(line.after, "st");
+    // A line that wraps onto the next row.
+    t.feed(b"\x1b[Kstatus --short --branch");
+    let line = t.input_line(&mut mark).unwrap();
+    assert_eq!(line.before, "git status --short --branch");
+    // Output moves the cursor off the line.
+    t.feed(b"\r\n## main\r\n");
+    assert_eq!(t.input_line(&mut mark), None);
+}
+
+#[test]
+fn input_line_follows_a_prompt_redrawn_elsewhere() {
+    let mut t = term(30, 6);
+    t.feed(b"a\r\nb\r\n$ ");
+    let mut mark = t.input_mark().unwrap();
+    t.feed(b"ls -l");
+    // Ctrl+L: the screen is cleared and the prompt drawn at the top.
+    t.feed(b"\x1b[H\x1b[2J$ ls -l");
+    assert_eq!(t.input_line(&mut mark).unwrap().before, "ls -l");
+    t.feed(b"a");
+    assert_eq!(t.input_line(&mut mark).unwrap().before, "ls -la");
+}
+
+#[test]
+fn input_line_stops_at_a_right_hand_prompt() {
+    let mut t = term(40, 3);
+    t.feed(b"% ");
+    let mut mark = t.input_mark().unwrap();
+    t.feed(b"make\x1b[30G[main]\x1b[7G");
+    let line = t.input_line(&mut mark).unwrap();
+    assert_eq!(line.before, "make");
+    assert_eq!(line.after, "");
+}
+
+#[test]
+fn input_mark_is_none_on_the_alternate_screen() {
+    let mut t = term(20, 5);
+    t.feed(b"$ ");
+    let mut mark = t.input_mark().unwrap();
+    t.feed(b"\x1b[?1049h");
+    assert!(t.input_mark().is_none());
+    assert_eq!(t.input_line(&mut mark), None);
+}
+
+#[test]
+fn input_text_reads_the_line_after_enter() {
+    let mut t = term(20, 5);
+    t.feed(b"$ ");
+    let mark = t.input_mark().unwrap();
+    t.feed(b"echo one two three four");
+    t.feed(b"\r\none two three four\r\n$ ");
+    assert_eq!(
+        t.input_text(&mark).as_deref(),
+        Some("echo one two three four")
+    );
+}

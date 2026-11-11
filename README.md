@@ -127,7 +127,7 @@ ferossh.exe --check-sandbox    # report what the sandbox can do on this PC
 | Settings > Font, Settings > Theme | Font family and colour theme for this pane |
 | Settings > Show test pattern | Colours, styles, box drawing, wide and combining characters |
 
-Edit > Copy on select and Edit > Right-click pastes turn on the PuTTY habits; both are off by default.
+Edit > Copy on select and Edit > Right-click pastes turn on the PuTTY habits; both are off by default. Edit > Suggest commands as you type (also off by default) shows earlier commands on the same host greyed after the cursor, from a per-host history kept encrypted on your PC; Right arrow takes one.
 
 ### Colour themes
 

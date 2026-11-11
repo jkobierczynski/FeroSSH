@@ -622,6 +622,10 @@ pub struct Settings {
     /// In panes of a tmux session, the tmux prefix and a window or pane
     /// key work FeroSSH's tabs and panes. Off unless turned on.
     pub tmux_keys: bool,
+    /// Earlier commands on the host (and a few common ones) show greyed
+    /// after the cursor while typing; Enter keeps echoed command lines in
+    /// an encrypted per-host history. Off unless turned on.
+    pub command_suggestions: bool,
     /// A global hotkey hides and shows the FeroSSH window (Window >
     /// Standby window). Off unless turned on; the first window that opens
     /// takes the hotkey.
@@ -707,6 +711,7 @@ impl Default for Settings {
             auto_responses: true,
             run_parallel: None,
             tmux_keys: false,
+            command_suggestions: false,
             standby: false,
             standby_hotkey: None,
             standby_target: None,
@@ -1029,6 +1034,10 @@ impl Settings {
                 "tmuxkeybindings" => {
                     block = Block::Top;
                     s.tmux_keys = yes(&args).unwrap_or(false);
+                }
+                "commandsuggestions" => {
+                    block = Block::Top;
+                    s.command_suggestions = yes(&args).unwrap_or(false);
                 }
                 "standby" => {
                     block = Block::Top;
@@ -1413,6 +1422,7 @@ impl Settings {
         let _ = writeln!(out, "AutoResponses {}", flag(self.auto_responses));
         let _ = writeln!(out, "FullScreenKey {}", flag(self.full_screen_key));
         let _ = writeln!(out, "TmuxKeybindings {}", flag(self.tmux_keys));
+        let _ = writeln!(out, "CommandSuggestions {}", flag(self.command_suggestions));
         let _ = writeln!(out, "Standby {}", flag(self.standby));
         if let Some(k) = self.standby_hotkey {
             let _ = writeln!(out, "StandbyHotkey {k}");
@@ -2184,6 +2194,18 @@ DesktopShareSelection yes
             ..Settings::default()
         };
         assert!(Settings::parse(&s.to_text()).tmux_keys);
+    }
+
+    #[test]
+    fn command_suggestions_are_off_unless_turned_on() {
+        assert!(!Settings::default().command_suggestions);
+        assert!(Settings::parse("CommandSuggestions yes\n").command_suggestions);
+        assert!(!Settings::parse("CommandSuggestions maybe\n").command_suggestions);
+        let s = Settings {
+            command_suggestions: true,
+            ..Settings::default()
+        };
+        assert!(Settings::parse(&s.to_text()).command_suggestions);
     }
 
     #[test]

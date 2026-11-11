@@ -34,6 +34,9 @@ Items with a check mark are switches: picking them turns the setting on or off, 
 | Record keystrokes as script | ✓ while recording | Records what you type in the focused pane until you pick it again, then opens the result in the script editor (see [Recording](everyday-use.md#recording-a-script)). |
 | Copy on select | ✓ off | Copies a selection as soon as you make it, as PuTTY does. `CopyOnSelect`. |
 | Right-click pastes | ✓ off | A right click pastes, as in PuTTY. `RightClickPaste`. |
+| Suggest commands as you type | ✓ off | Shows an earlier command on this host (or a common one) greyed after the cursor; Right arrow or End types it (see [Command suggestions](everyday-use.md#command-suggestions)). `CommandSuggestions`. |
+| Clear command history for this host | | Forgets the commands kept for the focused pane's host. |
+| Clear command history for all hosts... | | Asks, then forgets the commands kept for every host. |
 
 ## Settings
 

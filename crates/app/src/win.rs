@@ -151,6 +151,7 @@ use crate::sessions::{HostItem, SessionList, SideAction, SideKey};
 use crate::snippets_view::{self, SnipAction, SnippetsView, Vars};
 use crate::ssh::{Effect, Env, ProxyCommand, SshSession, State, Target};
 use crate::standby::{self, Capture, Picked, Standby, Toggle};
+use crate::suggest;
 use crate::tabstrip::{self, Forwarding, Health, Hit, Palette, StripLayout, TabLabel};
 use crate::telnet::{TelnetSession, TelnetTarget};
 use crate::tmux::{self, Mode as TmuxMode, Tmux};
@@ -392,6 +393,10 @@ mod cmd {
     pub const SCROLL_PAGE_DOWN: u32 = 511;
     pub const SCROLL_TOP: u32 = 512;
     pub const SCROLL_BOTTOM: u32 = 513;
+    /// Edit > Suggest commands as you type.
+    pub const SUGGEST: u32 = 514;
+    pub const CLEAR_HISTORY: u32 = 515;
+    pub const CLEAR_ALL_HISTORY: u32 = 516;
     pub const LOG_TOGGLE: u32 = 600;
     pub const LOG_RAW: u32 = 601;
     pub const LOG_FOLDER: u32 = 602;
@@ -615,6 +620,20 @@ struct Pane {
     /// The host alias and name keyword highlighting picks its rules by;
     /// none for a local shell or prompt.
     hl_host: Option<(String, String)>,
+    /// The command line being typed, for Edit > Suggest commands as you
+    /// type.
+    typing: suggest::Tracker,
+}
+
+/// A command suggestion showing greyed after the cursor in `pane`.
+struct Ghost {
+    pane: PaneId,
+    /// The whole suggested line.
+    line: String,
+    /// What it adds to what is typed.
+    rest: String,
+    /// How many there are to go through (Ctrl+Up, Ctrl+Down).
+    count: usize,
 }
 
 impl Pane {
@@ -837,6 +856,11 @@ struct Window {
     /// The tmux prefix was typed in this pane: the next key is a tmux
     /// window or pane key (Session > Use tmux keybindings).
     tmux_armed: Option<PaneId>,
+    /// Edit > Suggest commands as you type: each host's history, read
+    /// when the host is first typed into.
+    histories: HashMap<String, suggest::History>,
+    /// The suggestion showing after the cursor, for the keys that take it.
+    ghost: Option<Ghost>,
     /// A repeatable tmux key (an arrow, PageUp) was just used: until this
     /// time, more of them work without the prefix, as with tmux's `bind
     /// -r` and `repeat-time`.
@@ -1681,6 +1705,8 @@ fn create_and_run(launch: Launch, theme: Option<String>) -> Result<()> {
                 full_redraw: true,
                 high_surrogate: None,
                 tmux_armed: None,
+                histories: HashMap::new(),
+                ghost: None,
                 tmux_repeat: None,
                 last_tab_pane: None,
                 last_pane: None,
@@ -1900,6 +1926,7 @@ fn new_pane(
         start_dir: None,
         local_cwd: None,
         hl_host: None,
+        typing: suggest::Tracker::default(),
     }
 }
 
@@ -2056,6 +2083,18 @@ fn build_menu() -> Result<HMENU> {
         separator(edit)?;
         item(edit, cmd::COPY_ON_SELECT, "Copy on &select")?;
         item(edit, cmd::RIGHT_CLICK_PASTE, "&Right-click pastes")?;
+        separator(edit)?;
+        item(edit, cmd::SUGGEST, "Suggest co&mmands as you type")?;
+        item(
+            edit,
+            cmd::CLEAR_HISTORY,
+            "Clear command &history for this host",
+        )?;
+        item(
+            edit,
+            cmd::CLEAR_ALL_HISTORY,
+            "Clear command history for &all hosts...",
+        )?;
 
         let fonts = CreatePopupMenu()?;
         for (i, (id, name)) in (cmd::FONT..).zip(FONT_CHOICES).enumerate() {
@@ -6751,7 +6790,10 @@ impl Window {
                     self.start_shell(id);
                 }
             }
-            Host::Local { .. } => self.send(id, bytes),
+            Host::Local { .. } => {
+                self.track_typing(id, &bytes);
+                self.send(id, bytes);
+            }
             // Typing reaches the desktop before this; the pane only shows
             // messages once it ended.
             Host::Desktop { .. } => {}
@@ -6826,9 +6868,222 @@ impl Window {
             | Host::Serial { .. }
             | Host::Telnet(_)
             | Host::Winrm(_) => {
+                self.track_typing(id, &bytes);
                 self.send(id, bytes);
             }
         }
+    }
+
+    /// The history that pane `id`'s commands go in: per host (and user and
+    /// port), a tmux pane's being its connection's. `None` for prompts and
+    /// desktops.
+    fn history_key(&self, id: PaneId) -> Option<String> {
+        let p = self.panes.get(&id)?;
+        Some(match &p.host {
+            Host::Ssh(s) => format!(
+                "ssh:{}@{}:{}",
+                s.target.user,
+                s.target.hostname.to_ascii_lowercase(),
+                s.target.port
+            ),
+            Host::Tmux { gateway, .. } => return self.history_key(*gateway),
+            Host::Local { .. } => "local".to_owned(),
+            Host::Serial { target, .. } => format!("serial:{}", target.port),
+            Host::Telnet(s) => format!("telnet:{}", s.target.label().to_ascii_lowercase()),
+            Host::Winrm(s) => format!("winrm:{}", s.target.label().to_ascii_lowercase()),
+            Host::Ask(_) | Host::Desktop { .. } => return None,
+        })
+    }
+
+    /// Edit > Suggest commands as you type: follows what is typed in pane
+    /// `id` before it goes to the host, and keeps a line an earlier Enter
+    /// ran.
+    fn track_typing(&mut self, id: PaneId, bytes: &[u8]) {
+        if !self.settings.command_suggestions {
+            return;
+        }
+        let Some(p) = self.panes.get_mut(&id) else {
+            return;
+        };
+        if p.desktop.is_some() {
+            return;
+        }
+        // What shows was for the line before this key: until the echo
+        // redraws it, no key takes it.
+        if self.ghost.as_ref().is_some_and(|g| g.pane == id) {
+            self.ghost = None;
+        }
+        let Some(p) = self.panes.get_mut(&id) else {
+            return;
+        };
+        let done = p.typing.typed(&p.term, bytes);
+        if let Some(line) = done {
+            self.keep_command(id, &line);
+        }
+    }
+
+    /// Puts `line` in pane `id`'s host history and saves it.
+    fn keep_command(&mut self, id: PaneId, line: &str) {
+        let Some(key) = self.history_key(id) else {
+            return;
+        };
+        let history = self.history(&key);
+        if history.record(line) {
+            #[cfg(windows)]
+            let _ = crate::history_store::save(history);
+        }
+    }
+
+    /// The history of host `key`, read from disk the first time.
+    fn history(&mut self, key: &str) -> &mut suggest::History {
+        self.histories.entry(key.to_owned()).or_insert_with(|| {
+            #[cfg(windows)]
+            {
+                crate::history_store::load(key)
+            }
+            #[cfg(not(windows))]
+            {
+                suggest::History::new(key)
+            }
+        })
+    }
+
+    /// The suggestion for what is typed in pane `id` now, if one shows:
+    /// suggestions on, the pane focused, at the bottom of its output, and
+    /// the cursor at the end of a line typed at a prompt.
+    fn find_ghost(&mut self, id: PaneId) -> Option<Ghost> {
+        if !self.settings.command_suggestions || id != self.focused_id() || self.side.focused {
+            return None;
+        }
+        let key = self.history_key(id)?;
+        let p = self.panes.get_mut(&id)?;
+        if p.desktop.is_some()
+            || p.cursor.is_none()
+            || p.term.search_active()
+            || p.term.display_offset() != 0
+            || p.term.stopped()
+            || !self.takes_broadcast(id)
+        {
+            return None;
+        }
+        let p = self.panes.get_mut(&id)?;
+        let typed = p.typing.line(&p.term)?.before;
+        let choice = p.typing.choice;
+        let choices = suggest::choices(Some(self.history(&key)), &typed);
+        if choices.is_empty() {
+            return None;
+        }
+        let line = choices.get(choice % choices.len())?.clone();
+        let rest = line.get(typed.len()..)?.to_owned();
+        Some(Ghost {
+            pane: id,
+            line,
+            rest,
+            count: choices.len(),
+        })
+    }
+
+    /// Draws the suggestion greyed after the cursor in pane `id`'s grid,
+    /// as far as the row goes.
+    fn draw_ghost(&mut self, id: PaneId) {
+        let Some(g) = self.ghost.as_ref().filter(|g| g.pane == id) else {
+            return;
+        };
+        let Some(p) = self.panes.get_mut(&id) else {
+            return;
+        };
+        let Some(c) = p.cursor else {
+            return;
+        };
+        let cols = p.grid.cols();
+        let mut x = c.x;
+        for ch in g.rest.chars() {
+            let w = unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0);
+            if w == 0 || x + w > cols {
+                break;
+            }
+            let Some(cell) = p.grid.cell_mut(x, c.y) else {
+                break;
+            };
+            cell.ch = ch;
+            cell.flags = if w == 2 {
+                ferossh_render::Flags::DIM.union(ferossh_render::Flags::WIDE)
+            } else {
+                ferossh_render::Flags::DIM
+            };
+            cell.fg = ferossh_render::Color::Default;
+            if w == 2
+                && let Some(spacer) = p.grid.cell_mut(x + 1, c.y)
+            {
+                *spacer = ferossh_render::Cell::new(
+                    ' ',
+                    ferossh_render::Color::Default,
+                    spacer.bg,
+                    ferossh_render::Flags::WIDE_SPACER,
+                );
+            }
+            x += w;
+        }
+    }
+
+    /// A key that works on the suggestion showing in pane `id`: Right or
+    /// End types the rest, Ctrl+Right its next word, Ctrl+Up and
+    /// Ctrl+Down show another, Shift+Delete forgets it. `false` when the
+    /// key is not one, or no suggestion shows: it goes to the host.
+    fn ghost_key(&mut self, id: PaneId, key: Key, mods: Mods) -> bool {
+        let Some(g) = self.ghost.as_ref().filter(|g| g.pane == id) else {
+            return false;
+        };
+        let (rest, line, count) = (g.rest.clone(), g.line.clone(), g.count);
+        let plain = mods == Mods::NONE;
+        let ctrl = mods
+            == Mods {
+                ctrl: true,
+                ..Mods::NONE
+            };
+        let shift = mods
+            == Mods {
+                shift: true,
+                ..Mods::NONE
+            };
+        match key {
+            Key::Right | Key::End if plain => self.type_ghost(id, &rest),
+            Key::Right if ctrl => self.type_ghost(id, suggest::next_word(&rest)),
+            Key::Up | Key::Down if ctrl && count > 1 => {
+                if let Some(p) = self.panes.get_mut(&id) {
+                    p.typing.choice = if key == Key::Up {
+                        (p.typing.choice + 1) % count
+                    } else {
+                        (p.typing.choice + count - 1) % count
+                    };
+                }
+                self.refresh(id);
+            }
+            Key::Delete if shift => {
+                if let Some(k) = self.history_key(id) {
+                    let history = self.history(&k);
+                    if history.remove(&line) {
+                        #[cfg(windows)]
+                        let _ = crate::history_store::save(history);
+                    }
+                }
+                self.refresh(id);
+            }
+            _ => return false,
+        }
+        true
+    }
+
+    /// Types `text` of a suggestion into pane `id` (and the panes
+    /// broadcast input goes to), as if typed.
+    fn type_ghost(&mut self, id: PaneId, text: &str) {
+        if text.is_empty() {
+            return;
+        }
+        let targets = self.broadcast_targets(id);
+        let bytes = text.as_bytes().to_vec();
+        self.input(id, bytes.clone());
+        self.send_typed(&targets, &Typed::Bytes(bytes));
     }
 
     /// Whether pane `id` passes typing straight to its host, so it may
@@ -7427,6 +7682,20 @@ impl Window {
         };
         let old = pane.cursor;
         pane.cursor = pane.term.draw_into(&mut pane.grid, keyboard);
+        if self.settings.command_suggestions {
+            let done = pane.typing.poll(&pane.term);
+            if let Some(line) = done {
+                self.keep_command(id, &line);
+            }
+            let ghost = self.find_ghost(id);
+            if ghost.is_some() || self.ghost.as_ref().is_some_and(|g| g.pane == id) {
+                self.ghost = ghost;
+            }
+            self.draw_ghost(id);
+        }
+        let Some(pane) = self.panes.get_mut(&id) else {
+            return;
+        };
         if old != pane.cursor {
             for c in [old, pane.cursor].into_iter().flatten() {
                 pane.grid.mark_dirty(c.y);
@@ -8594,6 +8863,9 @@ impl Window {
         }
         if let Some(key) = terminal_key(vk) {
             drop_pending_char(self.hwnd);
+            if self.ghost_key(id, key, mods) {
+                return KeyOutcome::Handled;
+            }
             let targets = self.broadcast_targets(id);
             let Some(p) = self.panes.get_mut(&id) else {
                 return KeyOutcome::Handled;
@@ -12107,6 +12379,50 @@ impl Window {
                 self.save_settings();
                 self.update_menu_checks();
             }
+            cmd::SUGGEST => {
+                let on = !self.settings.command_suggestions;
+                self.settings.command_suggestions = on;
+                self.save_settings();
+                self.update_menu_checks();
+                if !on {
+                    // Nothing typed from here on is read or kept.
+                    self.ghost = None;
+                    self.histories.clear();
+                    for p in self.panes.values_mut() {
+                        p.typing.reset();
+                    }
+                }
+                self.refresh(pane);
+                if on {
+                    return Some(Command::Notice(
+                        "Earlier commands on this host, and a few common ones, now show greyed \
+                         after the cursor as you type. Right arrow or End types the rest, \
+                         Ctrl+Right its next word, Ctrl+Up and Ctrl+Down show other matches, and \
+                         Shift+Delete forgets the one shown. Commands are kept per host, \
+                         encrypted with your Windows sign-in, on this PC only; nothing typed at a \
+                         password prompt is kept, nor lines that start with a space."
+                            .into(),
+                    ));
+                }
+            }
+            cmd::CLEAR_HISTORY => {
+                let Some(key) = self.history_key(pane) else {
+                    return Some(Command::Notice(
+                        "This pane has no host with a command history.".into(),
+                    ));
+                };
+                self.histories.remove(&key);
+                #[cfg(windows)]
+                crate::history_store::clear(&key);
+                self.ghost = None;
+                self.refresh(pane);
+            }
+            cmd::CLEAR_ALL_HISTORY => {
+                return Some(Command::Confirm {
+                    text: "Clear the command history of every host?".into(),
+                    then: Box::new(Command::ClearAllHistory),
+                });
+            }
             cmd::SCROLL_PAGE_UP | cmd::SCROLL_PAGE_DOWN | cmd::SCROLL_TOP | cmd::SCROLL_BOTTOM => {
                 let term = &mut self.panes.get_mut(&pane)?.term;
                 match id {
@@ -12248,6 +12564,7 @@ impl Window {
                 (cmd::COPY_ON_SELECT, s.copy_on_select),
                 (cmd::UPDATE_WEEKLY, s.update_check_weekly),
                 (cmd::RIGHT_CLICK_PASTE, s.right_click_paste),
+                (cmd::SUGGEST, s.command_suggestions),
                 (cmd::LOG_TOGGLE, log),
                 (cmd::LOG_RAW, raw),
                 (cmd::LOG_TIMESTAMPS, s.log_timestamps),
@@ -13731,6 +14048,8 @@ enum Command {
     /// The import page's file picker.
     PickImportFile,
     SaveLook,
+    /// Edit > Clear command history for all hosts, once confirmed.
+    ClearAllHistory,
     /// A message box with this text.
     Notice(String),
     /// Ask, then delete `entries` in folder `dir` of `key`'s host (when
@@ -14777,6 +15096,14 @@ fn run_command(hwnd: HWND, command: Command) {
             if dialog(hwnd, &text, MB_YESNO | MB_ICONQUESTION | MB_DEFBUTTON2) == Some(IDYES) {
                 run_command(hwnd, *then);
             }
+        }
+        Command::ClearAllHistory => {
+            with_window(|w| {
+                w.histories.clear();
+                w.ghost = None;
+                crate::history_store::clear_all();
+                w.refresh_visible();
+            });
         }
         Command::CloseTabNow(i) => {
             if let Some(next) = with_window(|w| w.close_tab(i)).flatten() {
