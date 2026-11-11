@@ -17,6 +17,7 @@
 use std::collections::VecDeque;
 
 use crate::crypto::{CryptoError, Session, TAG_LEN};
+use crate::predict::{Mode, Predictor};
 use crate::screen::{self, Screen};
 use crate::wire::{
     Assembly, FRAGMENT_HEADER, Fragment, HostEvent, Instruction, PROTOCOL_VERSION, Packet,
@@ -121,8 +122,18 @@ pub struct Client {
     shutdown: Option<(u64, u32)>,
     rng: u64,
     started: u64,
+    // Local echo.
+    predictor: Predictor,
+    /// Our states as sent, by number, and where each ends in the event
+    /// stream: what the server's echo acknowledgement covers.
+    marks: VecDeque<(u64, u64)>,
+    /// The event-stream position the server has echoed up to.
+    echoed: u64,
+    /// The latest time the caller gave.
+    clock: u64,
     // Display.
     shown: Screen,
+    shown_version: u64,
     shown_num: Option<u64>,
     repaint: bool,
     notice: Option<String>,
@@ -170,7 +181,12 @@ impl Client {
             shutdown: None,
             rng: seed | 1,
             started: now,
+            predictor: Predictor::new(Mode::Never),
+            marks: VecDeque::new(),
+            echoed: 0,
+            clock: now,
             shown: Screen::new(cols.into(), rows.into()),
+            shown_version: 0,
             shown_num: None,
             repaint: true,
             notice: None,
@@ -190,7 +206,21 @@ impl Client {
             // Arrow keys always go as in application mode; the server
             // turns them back when its terminal is not in that mode.
             self.events.push_back(UserEvent::Keys(bytes.to_vec()));
+            let end = self.events_end();
+            if let Some(latest) = self.states.last() {
+                self.predictor.typed(bytes, end, &latest.screen, self.clock);
+            }
         }
+    }
+
+    /// Whether typed text not yet echoed is drawn now.
+    pub fn predicting(&self) -> bool {
+        self.predictor.active()
+    }
+
+    /// When typed text shows before the server echoes it.
+    pub fn set_prediction(&mut self, mode: Mode) {
+        self.predictor = Predictor::new(mode);
     }
 
     /// The pane changed size.
@@ -198,6 +228,7 @@ impl Client {
         if self.shutdown.is_none() {
             self.events.push_back(UserEvent::Resize { cols, rows });
         }
+        self.predictor.resized(self.events_end());
         self.repaint = true;
     }
 
@@ -290,6 +321,7 @@ impl Client {
     /// Takes one datagram from the server. Packets that fail the
     /// integrity check are dropped; only a protocol mismatch is fatal.
     pub fn receive(&mut self, datagram: &[u8], now: u64) -> Result<(), Fatal> {
+        self.clock = now;
         let Ok((value, text)) = self.session.decrypt(datagram) else {
             return Ok(());
         };
@@ -382,6 +414,14 @@ impl Client {
         self.remote_heard = Some(now);
         if !inst.diff.is_empty() {
             self.pending_data_ack = true;
+        }
+        // What the server has echoed of our keystrokes.
+        let echo_ack = next.echo_ack;
+        while let Some(&(num, end)) = self.marks.front()
+            && num <= echo_ack
+        {
+            self.echoed = self.echoed.max(end);
+            self.marks.pop_front();
         }
         self.states.push(next);
         Ok(())
@@ -479,6 +519,7 @@ impl Client {
 
     /// The datagrams to send now, if any.
     pub fn tick(&mut self, now: u64) -> Result<Vec<Vec<u8>>, Fatal> {
+        self.clock = now;
         self.calculate_timers(now);
         if now < self.next_ack_time && now < self.next_send_time {
             return Ok(Vec::new());
@@ -545,6 +586,12 @@ impl Client {
     fn add_sent(&mut self, now: u64, num: u64) {
         let end = self.events_end();
         self.sent.push_back(Sent { num, at: now, end });
+        if num != SHUTDOWN {
+            self.marks.push_back((num, end));
+            if self.marks.len() > MAX_STATES {
+                self.marks.pop_front();
+            }
+        }
         if self.sent.len() > 32 {
             // As Mosh: drop one from the middle, keeping the newest 15.
             let at = self.sent.len() - 16;
@@ -631,12 +678,20 @@ impl Client {
     /// on the top line says when the server was last heard, once that is
     /// a while ago, as mosh-client shows it.
     pub fn frame(&mut self, now: u64) -> Option<String> {
+        self.clock = now;
         let notice = self.notice_text(now);
         let latest = self.states.last()?;
-        if !self.repaint && self.shown_num == Some(latest.num) && notice == self.notice {
+        self.predictor
+            .update(&latest.screen, self.echoed, self.srtt, now);
+        if !self.repaint
+            && self.shown_num == Some(latest.num)
+            && notice == self.notice
+            && self.predictor.version() == self.shown_version
+        {
             return None;
         }
         let mut next = latest.screen.clone();
+        self.predictor.overlay(&mut next);
         if let Some(text) = &notice {
             overlay(&mut next, text);
         }
@@ -647,6 +702,7 @@ impl Client {
         );
         self.shown = next;
         self.shown_num = Some(latest.num);
+        self.shown_version = self.predictor.version();
         self.repaint = false;
         self.notice = notice;
         Some(out)

@@ -17,6 +17,7 @@ use std::time::{Duration, Instant};
 
 use ferossh_mosh::bootstrap::parse_connect;
 use ferossh_mosh::client::Client;
+use ferossh_mosh::predict::Mode;
 use ferossh_mosh::screen::{Rendition, Screen};
 
 fn start(shell: &str) -> Option<(u16, [u8; 16])> {
@@ -57,6 +58,8 @@ struct Run {
     rng: u64,
     sock: UdpSocket,
     shown: Screen,
+    /// Every frame's output so far.
+    frames: String,
     t0: Instant,
 }
 
@@ -88,6 +91,7 @@ impl Run {
             }
             if let Some(out) = self.client.frame(self.now()) {
                 self.shown.apply(out.as_bytes());
+                self.frames.push_str(&out);
             }
             if done(self) {
                 return true;
@@ -134,6 +138,7 @@ fn run_lossy(port: u16, key: [u8; 16], loss: u64) -> Run {
         rng: 0x9E37_79B9_7F4A_7C15,
         sock,
         shown: Screen::new(80, 24),
+        frames: String::new(),
         t0: Instant::now(),
     }
 }
@@ -180,6 +185,64 @@ fn types_into_a_real_server_and_sees_the_screen() {
     // The shell exits: the server ends the session and we acknowledge.
     r.client.keys(b"exit\r");
     assert!(r.until(10, |r| r.client.server_ended()), "no shutdown");
+}
+
+/// With local echo always on, typed text that the server echoes ends up
+/// exactly as the server shows it, and text it hides is never drawn.
+#[test]
+fn local_echo_shows_only_what_the_server_would() {
+    let Some((port, key)) = start("PS1='ready> ' exec bash --norc --noprofile -i") else {
+        return;
+    };
+    let mut r = run(port, key);
+    r.client.set_prediction(Mode::Always);
+    assert!(r.until(10, |r| r.screen_text().contains("ready>")));
+    // Half the packets lost: echoes come late, and guesses show.
+    r.loss = 50;
+    let mut guessed = false;
+    for c in b"echo prex\x7fdic\x1b[D\x1b[Ct" {
+        r.client.keys(&[*c]);
+        r.until(0, |_| true);
+        r.until(1, |r| r.client.predicting());
+        guessed |= r.client.predicting();
+    }
+    r.loss = 0;
+    assert!(guessed, "no guess was shown");
+    r.client.keys(b"ed\r");
+    assert!(
+        r.until(10, |r| r.screen_text().contains("\npredicted")),
+        "{}",
+        r.screen_text()
+    );
+    // Nothing guessed is left over: the pane is the server's screen.
+    assert!(r.until(5, |r| r.client.frame(r.now()).is_none()
+        && !r.screen_text().contains("ed\n\nready")));
+    let lines: Vec<String> = r
+        .screen_text()
+        .lines()
+        .map(|l| l.trim_end().to_owned())
+        .collect();
+    assert!(
+        lines.iter().any(|l| l == "ready> echo predicted"),
+        "{lines:?}"
+    );
+    // A password typed with echo off is never drawn.
+    r.frames.clear();
+    r.client
+        .keys(b"stty -echo; read secret; stty echo; echo done\r");
+    assert!(r.until(10, |r| r.frames.contains("echo done")));
+    for c in b"hunter2" {
+        r.client.keys(&[*c]);
+        r.until(0, |_| true);
+    }
+    r.until(1, |_| false);
+    r.client.keys(b"\r");
+    assert!(
+        r.until(10, |r| r.screen_text().contains("\ndone")),
+        "{}",
+        r.screen_text()
+    );
+    assert!(!r.frames.contains("unter"), "{:?}", r.frames);
 }
 
 #[test]

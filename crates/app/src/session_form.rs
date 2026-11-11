@@ -121,6 +121,8 @@ pub struct Values {
     pub mosh_server: String,
     /// A Mosh session's UDP port or range, as `60001:60010`.
     pub mosh_ports: String,
+    /// `always`, `never`, or empty for only on a slow link.
+    pub mosh_predict: String,
     /// What a WinRM session runs; empty is `powershell -NoLogo`.
     pub winrm_command: String,
 }
@@ -246,6 +248,7 @@ impl Values {
         self.mosh_server = p.mosh_server.clone().unwrap_or_default();
         self.winrm_command = p.winrm_command.clone().unwrap_or_default();
         self.winrm_https = p.winrm_https;
+        self.mosh_predict = p.mosh_predict.clone().unwrap_or_default();
         self.mosh_ports = p
             .mosh_ports
             .map(ferossh_config::settings::mosh_ports_text)
@@ -303,6 +306,7 @@ enum Field {
     Flow,
     MoshServer,
     MoshPorts,
+    MoshPredict,
     WinrmCommand,
     LoginStep(usize),
 }
@@ -352,6 +356,7 @@ impl Field {
             Field::Flow => "Flow ctrl",
             Field::MoshServer => "Mosh server",
             Field::MoshPorts => "UDP ports",
+            Field::MoshPredict => "Local echo",
             Field::WinrmCommand => "Runs",
             Field::LoginStep(_) => "Login",
         }
@@ -377,6 +382,7 @@ impl Field {
                 | Field::Password
                 | Field::Framing
                 | Field::Flow
+                | Field::MoshPredict
         )
     }
 }
@@ -616,7 +622,10 @@ impl SessionForm {
                     out.push(Item::Field(Field::Jump));
                     out.push(Item::Field(Field::Proxy));
                     if kind == SessionKind::Mosh {
-                        out.extend([Field::MoshServer, Field::MoshPorts].map(Item::Field));
+                        out.extend(
+                            [Field::MoshServer, Field::MoshPorts, Field::MoshPredict]
+                                .map(Item::Field),
+                        );
                         out.push(Item::Note("SSH logs in and starts the server;".into()));
                         out.push(Item::Note("then UDP to the host's ports.".into()));
                     }
@@ -854,7 +863,8 @@ impl SessionForm {
             | Field::DeskClipboard
             | Field::Password
             | Field::Framing
-            | Field::Flow => {
+            | Field::Flow
+            | Field::MoshPredict => {
                 return None;
             }
         })
@@ -906,7 +916,8 @@ impl SessionForm {
             | Field::DeskClipboard
             | Field::Password
             | Field::Framing
-            | Field::Flow => {
+            | Field::Flow
+            | Field::MoshPredict => {
                 return None;
             }
         })
@@ -946,6 +957,12 @@ impl SessionForm {
                 "from-host" => "only host to Windows",
                 "off" => "off for this host",
                 _ => "as in Session > Remote apps",
+            }
+            .to_owned(),
+            Field::MoshPredict => match v.mosh_predict.as_str() {
+                "always" => "always",
+                "never" => "never, only the server's",
+                _ => "on a slow link",
             }
             .to_owned(),
             Field::DeskClipboard => match v.desk_clipboard.as_str() {
@@ -1095,6 +1112,18 @@ impl SessionForm {
                     .unwrap_or("")
                     .to_owned();
             }
+            Field::MoshPredict => {
+                let all = ["", "always", "never"];
+                let i = all
+                    .iter()
+                    .position(|c| *c == v.mosh_predict.as_str())
+                    .unwrap_or(0);
+                v.mosh_predict = all
+                    .get(step(i, all.len()))
+                    .copied()
+                    .unwrap_or("")
+                    .to_owned();
+            }
             Field::Tmux => v.tmux_on = !v.tmux_on,
             Field::Password => {
                 v.password = step(v.password, PASSWORD_CUSTOM + 1);
@@ -1193,7 +1222,8 @@ impl SessionForm {
             | Field::DeskClipboard
             | Field::Password
             | Field::Framing
-            | Field::Flow => String::new(),
+            | Field::Flow
+            | Field::MoshPredict => String::new(),
         }
     }
 
@@ -2125,6 +2155,7 @@ impl SessionForm {
         p.mosh_server = trimmed(&v.mosh_server)
             .filter(|s| mosh && s != ferossh_config::settings::DEFAULT_MOSH_SERVER);
         p.mosh_ports = ferossh_config::settings::mosh_ports(&v.mosh_ports).filter(|_| mosh);
+        p.mosh_predict = Some(v.mosh_predict.clone()).filter(|w| mosh && !w.is_empty());
         p.winrm_command = ferossh_config::settings::virtual_desktop(&v.winrm_command)
             .filter(|c| v.kind == SessionKind::WinRm && c != ferossh_config::DEFAULT_WINRM_COMMAND);
         p.winrm_https = v.kind == SessionKind::WinRm && v.winrm_https;
@@ -2754,6 +2785,12 @@ mod tests {
                 .any(|l| l.contains("Mosh server") && l.contains("mosh-server"))
         );
         assert!(t.iter().any(|l| l.contains("UDP ports")));
+        assert!(
+            t.iter()
+                .any(|l| l.contains("Local echo") && l.contains("on a slow link"))
+        );
+        f.cycle(Field::MoshPredict, true);
+        assert_eq!(f.choice(Field::MoshPredict), "always");
         let rows = f.native_rows();
         assert!(rows.iter().any(|r| r.label == "Start dir"));
         assert!(!rows.iter().any(|r| r.label == "tmux"), "no tmux over Mosh");
@@ -2775,10 +2812,12 @@ mod tests {
         assert_eq!(p.kind, SessionKind::Mosh);
         assert_eq!(p.mosh_server.as_deref(), Some("~/bin/mosh-server"));
         assert_eq!(p.mosh_ports, Some((60001, 60010)));
+        assert_eq!(p.mosh_predict.as_deref(), Some("always"));
         assert_eq!(p.tmux, None);
         // Back as it was saved.
         let again = Values::default().with_profile(Some(p));
         assert_eq!(again.mosh_ports, "60001:60010");
+        assert_eq!(again.mosh_predict, "always");
         // Another type keeps no Mosh settings.
         f.values.kind = SessionKind::Ssh;
         f.apply(&mut hosts, &mut settings);
