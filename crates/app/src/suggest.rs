@@ -198,7 +198,9 @@ pub fn carries_secret(command: &str) -> bool {
                 .take_while(|c| c.is_alphanumeric() || *c == '_' || *c == '-')
                 .collect();
             let after = lower[end + tail.len()..].trim_start_matches(['"', '\'']);
-            if after.starts_with('=') || after.starts_with(':') {
+            // `password = 'x'` at a Python or SQL prompt too.
+            let next = after.trim_start();
+            if next.starts_with('=') || next.starts_with(':') {
                 return true;
             }
             let before = &lower[..from + i];
@@ -219,6 +221,23 @@ pub fn carries_secret(command: &str) -> bool {
         && command
             .split_whitespace()
             .any(|w| w.len() > 2 && w.starts_with("-p"))
+    {
+        return true;
+    }
+    // curl -u user:pass, sshpass -p pass.
+    let words: Vec<&str> = command.split_whitespace().collect();
+    for pair in words.windows(2) {
+        if let [flag, value] = pair {
+            let curl_user = matches!(*flag, "-u" | "--user" | "-U" | "--proxy-user");
+            if curl_user && value.contains(':') {
+                return true;
+            }
+        }
+    }
+    if words.first().is_some_and(|w| *w == "sshpass")
+        && words
+            .iter()
+            .any(|w| *w == "-p" || (w.starts_with("-p") && w.len() > 2))
     {
         return true;
     }
@@ -535,6 +554,11 @@ mod tests {
             "tool --password hunter2",
             "tool --api-key=abc",
             "export GITHUB_TOKEN=abc",
+            "password = 'hunter2'",
+            "SET PASSWORD = 'x';",
+            "token : abc",
+            "curl -u jo:hunter2 https://x",
+            "sshpass -p hunter2 ssh jo@h",
         ] {
             assert!(carries_secret(c), "{c}");
         }
@@ -547,6 +571,8 @@ mod tests {
             "mysql -u root -p",
             "cat token.txt",
             "grep -r password src",
+            "curl -u jo https://x",
+            "echo \"a   b\"",
         ] {
             assert!(!carries_secret(c), "{c}");
         }

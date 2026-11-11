@@ -16,7 +16,7 @@ use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use ferossh_auth::Broker;
 use ferossh_config::hotkey::Hotkey;
@@ -858,7 +858,9 @@ struct Window {
     tmux_armed: Option<PaneId>,
     /// Edit > Suggest commands as you type: each host's history, read
     /// when the host is first typed into.
-    histories: HashMap<String, suggest::History>,
+    /// Each host's history as last read, with the file's time then: another
+    /// FeroSSH window may have changed or cleared it since.
+    histories: HashMap<String, (suggest::History, Option<SystemTime>)>,
     /// The suggestion showing after the cursor, for the keys that take it.
     ghost: Option<Ghost>,
     /// A repeatable tmux key (an arrow, PageUp) was just used: until this
@@ -6927,25 +6929,45 @@ impl Window {
         let Some(key) = self.history_key(id) else {
             return;
         };
-        let history = self.history(&key);
-        if history.record(line) {
-            #[cfg(windows)]
-            let _ = crate::history_store::save(history);
+        self.change_history(&key, |h| h.record(line));
+    }
+
+    /// Changes host `key`'s history as kept on disk (which another FeroSSH
+    /// window may have changed or cleared), saves it if `change` changed
+    /// it, and keeps the result.
+    fn change_history(&mut self, key: &str, change: impl FnOnce(&mut suggest::History) -> bool) {
+        #[cfg(windows)]
+        {
+            let fresh = crate::history_store::update(key, change);
+            self.histories.insert(key.to_owned(), fresh);
+        }
+        #[cfg(not(windows))]
+        {
+            let (h, _) = self
+                .histories
+                .entry(key.to_owned())
+                .or_insert_with(|| (suggest::History::new(key), None));
+            change(h);
         }
     }
 
-    /// The history of host `key`, read from disk the first time.
-    fn history(&mut self, key: &str) -> &mut suggest::History {
-        self.histories.entry(key.to_owned()).or_insert_with(|| {
-            #[cfg(windows)]
-            {
-                crate::history_store::load(key)
+    /// The history of host `key`: read from disk the first time, and again
+    /// when another window changed or cleared the file.
+    fn history(&mut self, key: &str) -> &suggest::History {
+        #[cfg(windows)]
+        {
+            let stamp = crate::history_store::modified(key);
+            let stale = self.histories.get(key).is_none_or(|(_, s)| *s != stamp);
+            if stale {
+                let loaded = crate::history_store::load(key);
+                self.histories.insert(key.to_owned(), loaded);
             }
-            #[cfg(not(windows))]
-            {
-                suggest::History::new(key)
-            }
-        })
+        }
+        &self
+            .histories
+            .entry(key.to_owned())
+            .or_insert_with(|| (suggest::History::new(key), None))
+            .0
     }
 
     /// The suggestion for what is typed in pane `id` now, if one shows:
@@ -7061,11 +7083,7 @@ impl Window {
             }
             Key::Delete if shift => {
                 if let Some(k) = self.history_key(id) {
-                    let history = self.history(&k);
-                    if history.remove(&line) {
-                        #[cfg(windows)]
-                        let _ = crate::history_store::save(history);
-                    }
+                    self.change_history(&k, |h| h.remove(&line));
                 }
                 self.refresh(id);
             }

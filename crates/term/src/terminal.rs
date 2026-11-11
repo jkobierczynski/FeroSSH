@@ -172,14 +172,33 @@ impl InputMark {
 pub struct InputLine {
     /// From the mark to the cursor.
     pub before: String,
-    /// After the cursor, up to a gap of [`INPUT_GAP`] (where a right-hand
-    /// prompt starts), trailing blanks dropped.
+    /// After the cursor, without a right-hand prompt at the row's end,
+    /// trailing blanks dropped.
     pub after: String,
 }
 
 /// Where the command line ends on a row that goes on with a right-hand
 /// prompt.
 const INPUT_GAP: &str = "   ";
+
+/// Blank cells a right-hand prompt may leave at the row's end (zsh leaves
+/// one, `ZLE_RPROMPT_INDENT`).
+const RIGHT_PROMPT_INDENT: usize = 2;
+
+/// `text` (whole rows, to the right edge) without a right-hand prompt: the
+/// last run of text after a gap of [`INPUT_GAP`], when it ends at the
+/// right edge. A gap inside a command (`echo "a   b"`) stays.
+fn without_right_prompt(text: &str) -> &str {
+    let Some(i) = text.rfind(INPUT_GAP) else {
+        return text;
+    };
+    let tail = text.get(i..).unwrap_or("").trim_start();
+    let at_edge = text.len() - text.trim_end().len() <= RIGHT_PROMPT_INDENT;
+    if tail.is_empty() || !at_edge {
+        return text;
+    }
+    text.get(..i).unwrap_or(text)
+}
 
 /// The most rows a command line read by [`Terminal::input_line`] spans.
 const MAX_INPUT_ROWS: usize = 16;
@@ -1128,13 +1147,9 @@ impl Terminal {
             l += 1i32;
             rest.push_str(&self.row_text(l, 0, cols));
         }
-        let after = match rest.find(INPUT_GAP) {
-            Some(i) => &rest[..i],
-            None => &rest,
-        };
         Some(InputLine {
             before,
-            after: after.trim_end().to_owned(),
+            after: without_right_prompt(&rest).trim_end().to_owned(),
         })
     }
 
@@ -1197,10 +1212,7 @@ impl Terminal {
             rows += 1;
             text.push_str(&self.row_text(line, 0, cols));
         }
-        if let Some(i) = text.find(INPUT_GAP) {
-            text.truncate(i);
-        }
-        Some(text.trim_end().to_owned())
+        Some(without_right_prompt(&text).trim_end().to_owned())
     }
 
     /// The text of grid line `line` from column `from` to before `to`,

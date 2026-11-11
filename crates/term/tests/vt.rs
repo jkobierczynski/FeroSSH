@@ -753,7 +753,7 @@ fn input_line_stops_at_a_right_hand_prompt() {
     let mut t = term(40, 3);
     t.feed(b"% ");
     let mut mark = t.input_mark().unwrap();
-    t.feed(b"make\x1b[30G[main]\x1b[7G");
+    t.feed(b"make\x1b[34G[main]\x1b[7G");
     let line = t.input_line(&mut mark).unwrap();
     assert_eq!(line.before, "make");
     assert_eq!(line.after, "");
@@ -780,4 +780,29 @@ fn input_text_reads_the_line_after_enter() {
         t.input_text(&mark).as_deref(),
         Some("echo one two three four")
     );
+}
+
+#[test]
+fn a_gap_inside_a_command_is_not_a_right_hand_prompt() {
+    let mut t = term(40, 4);
+    t.feed(b"$ ");
+    let mut mark = t.input_mark().unwrap();
+    t.feed(b"echo \"a   b\"");
+    assert_eq!(t.input_line(&mut mark).unwrap().before, "echo \"a   b\"");
+    // The cursor before the gap: text still follows it.
+    t.feed(b"\x1b[5D");
+    let line = t.input_line(&mut mark).unwrap();
+    assert_eq!(line.after, "   b\"");
+    t.feed(b"\r\na   b\r\n$ ");
+    assert_eq!(t.input_text(&mark).as_deref(), Some("echo \"a   b\""));
+}
+
+#[test]
+fn a_right_hand_prompt_one_cell_from_the_edge_is_cut() {
+    let mut t = term(40, 3);
+    t.feed(b"% ");
+    let mark = t.input_mark().unwrap();
+    // zsh's RPROMPT, one cell in from the edge.
+    t.feed(b"make\x1b[34G[main]\x1b[7G\r\n");
+    assert_eq!(t.input_text(&mark).as_deref(), Some("make"));
 }

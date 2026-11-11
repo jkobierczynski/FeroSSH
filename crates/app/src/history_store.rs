@@ -7,6 +7,7 @@
 #![allow(unsafe_code)]
 
 use std::path::PathBuf;
+use std::time::SystemTime;
 
 use windows::Win32::Foundation::{HLOCAL, LocalFree};
 use windows::Win32::Security::Cryptography::{
@@ -36,31 +37,53 @@ fn file(key: &str) -> Option<PathBuf> {
     Some(dir()?.join(format!("{h:016x}.dat")))
 }
 
-/// The history kept for `key`; an empty one when there is none, or it
-/// cannot be read (another user's, damaged).
-pub fn load(key: &str) -> History {
-    let Some(path) = file(key) else {
-        return History::new(key);
-    };
-    std::fs::read(path)
-        .ok()
+/// When the history file of `key` last changed; `None` when there is none.
+/// Another FeroSSH window may change or delete it.
+pub fn modified(key: &str) -> Option<SystemTime> {
+    std::fs::metadata(file(key)?).ok()?.modified().ok()
+}
+
+/// The history kept for `key`, with the file's time; an empty one when
+/// there is none, or it cannot be read (another user's, damaged).
+pub fn load(key: &str) -> (History, Option<SystemTime>) {
+    let stamp = modified(key);
+    let history = file(key)
+        .and_then(|path| std::fs::read(path).ok())
         .and_then(|blob| unprotect(&blob))
         .and_then(|plain| {
             let text = std::str::from_utf8(&plain).ok()?;
             History::parse(text, key)
         })
-        .unwrap_or_else(|| History::new(key))
+        .unwrap_or_else(|| History::new(key));
+    (history, stamp)
 }
 
-/// Writes `history` (to a new file, then over the old one).
-pub fn save(history: &History) -> Result<(), String> {
+/// Reads the history of `key` from disk as it is now, applies `change`,
+/// and writes it back when `change` changed it: so two windows typing on
+/// the same host keep each other's commands, and a clear in one holds.
+pub fn update(
+    key: &str,
+    change: impl FnOnce(&mut History) -> bool,
+) -> (History, Option<SystemTime>) {
+    let (mut history, stamp) = load(key);
+    if !change(&mut history) {
+        return (history, stamp);
+    }
+    let _ = save(&history);
+    let stamp = modified(key);
+    (history, stamp)
+}
+
+/// Writes `history` (to a file of this process's own, then over the old
+/// one).
+fn save(history: &History) -> Result<(), String> {
     let path = file(&history.key).ok_or("LOCALAPPDATA is not set")?;
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
     }
     let plain = Zeroizing::new(history.to_text().into_bytes());
     let blob = protect(&plain)?;
-    let tmp = path.with_extension("tmp");
+    let tmp = path.with_extension(format!("{}.tmp", std::process::id()));
     std::fs::write(&tmp, blob).map_err(|e| e.to_string())?;
     std::fs::rename(&tmp, &path).map_err(|e| {
         let _ = std::fs::remove_file(&tmp);
