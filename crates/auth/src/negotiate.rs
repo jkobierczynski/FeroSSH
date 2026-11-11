@@ -91,6 +91,8 @@ pub struct ServerCert {
     /// Windows' verdict for this host name: `Ok` when it chains to a
     /// trusted root and names the host, else why not.
     pub windows: Result<(), String>,
+    /// It is within its validity period now.
+    pub current: bool,
 }
 
 /// One TLS connection, client side.

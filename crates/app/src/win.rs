@@ -10003,8 +10003,9 @@ impl Window {
                 let mut hosts = load_saved();
                 let mut settings = self.settings.clone();
                 let name = form.apply(&mut hosts, &mut settings);
-                // Off the Windows Credential Manager: the saved password goes. Its
-                // name is resolved before the session's settings change.
+                // Off the Windows Credential Manager, or to another user, host
+                // or port: the old saved password goes. Its name is resolved
+                // before the connection's settings change.
                 let was_windows = form.original.as_deref().is_some_and(|o| {
                     self.settings
                         .profile(o)
@@ -10013,7 +10014,7 @@ impl Window {
                 let still_windows = settings
                     .profile(&name)
                     .is_some_and(|p| p.password == PasswordSource::Windows);
-                let forget = (was_windows && !still_windows)
+                let old_target = was_windows
                     .then(|| form.original.clone())
                     .flatten()
                     .and_then(|o| self.saved_password_target(&o));
@@ -10023,10 +10024,12 @@ impl Window {
                         sessions_path().display()
                     )));
                 }
-                if let Some(target) = forget {
-                    credman::delete(&target);
-                }
                 self.settings = settings;
+                if let Some(old) = old_target
+                    && (!still_windows || self.saved_password_target(&name).as_ref() != Some(&old))
+                {
+                    credman::delete(&old);
+                }
                 self.save_settings();
                 self.side.form = None;
                 self.reload_sessions(Some(&name));

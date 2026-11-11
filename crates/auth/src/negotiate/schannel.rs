@@ -34,7 +34,8 @@ use windows::Win32::Security::Cryptography::{
     CERT_CHAIN_POLICY_SSL, CERT_CHAIN_POLICY_STATUS, CERT_CONTEXT, CERT_SHA256_HASH_PROP_ID,
     CERT_USAGE_MATCH, CTL_USAGE, CertFreeCertificateChain, CertFreeCertificateContext,
     CertGetCertificateChain, CertGetCertificateContextProperty, CertVerifyCertificateChainPolicy,
-    HTTPSPolicyCallbackData, USAGE_MATCH_TYPE_AND, szOID_PKIX_KP_SERVER_AUTH,
+    CertVerifyTimeValidity, HTTPSPolicyCallbackData, USAGE_MATCH_TYPE_AND,
+    szOID_PKIX_KP_SERVER_AUTH,
 };
 use windows::core::{PSTR, PWSTR};
 
@@ -482,10 +483,14 @@ impl TlsContext for Connection {
                 .map(|b| format!("{b:02X}"))
                 .collect::<Vec<_>>()
                 .join(":");
+            // SAFETY: checked non-null above; valid until freed below.
+            let cert = unsafe { &*cert };
+            // SAFETY: the certificate's own CERT_INFO; None means now.
+            let current = unsafe { CertVerifyTimeValidity(None, cert.pCertInfo) } == 0;
             Ok(ServerCert {
                 sha256,
-                // SAFETY: checked non-null above; valid until freed below.
-                windows: self.verify(unsafe { &*cert }),
+                windows: self.verify(cert),
+                current,
             })
         })();
         // SAFETY: the context SChannel handed out, freed once.

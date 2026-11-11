@@ -873,7 +873,9 @@ impl WinrmSession {
         }
         let known = self.cert_store.as_deref().and_then(|p| known_cert(p, &key));
         match known {
-            Some(sha) if sha == cert.sha256 => {
+            // A pinned certificate is good only while it is valid: an
+            // expired one is asked about again.
+            Some(sha) if sha == cert.sha256 && cert.current => {
                 self.trusted_certs.push(cert.sha256);
                 let mut effects = Vec::new();
                 if first {
@@ -884,6 +886,7 @@ impl WinrmSession {
                 effects.push(self.reply(conn, held));
                 effects
             }
+            Some(sha) if sha == cert.sha256 => self.ask_cert(conn, cert, held, &key),
             Some(_) => {
                 let text = format!(
                     "{RED}The server's certificate is not the one you trusted for {} before, \
@@ -905,29 +908,32 @@ impl WinrmSession {
                     ),
                 ]
             }
-            None => {
-                let why = cert.windows.err().unwrap_or_default();
-                let text = format!(
-                    "{YELLOW}Windows does not trust the server's certificate: {}{RESET}\r\n\
-                     SHA-256 fingerprint: {}\r\n\
-                     Check it on the server (Get-ChildItem Cert:\\LocalMachine\\My | \
-                     Format-List Subject, Thumbprint shows SHA-1; \
-                     (Get-ChildItem Cert:\\LocalMachine\\My\\<thumbprint>).GetCertHashString('SHA256') \
-                     the SHA-256).\r\n\
-                     Trust this certificate for {}? (yes/no) ",
-                    sanitize(why.trim_end_matches('.')),
-                    cert.sha256,
-                    sanitize(&key)
-                );
-                self.cert_prompt = Some(CertPrompt {
-                    conn,
-                    held,
-                    sha256: cert.sha256,
-                    answer: String::new(),
-                });
-                vec![Effect::Show(text)]
-            }
+            None => self.ask_cert(conn, cert, held, &key),
         }
+    }
+
+    /// Shows a certificate Windows does not trust and asks about it.
+    fn ask_cert(&mut self, conn: u8, cert: ServerCert, held: SspiResult, key: &str) -> Vec<Effect> {
+        let why = cert.windows.err().unwrap_or_default();
+        let text = format!(
+            "{YELLOW}Windows does not trust the server's certificate: {}{RESET}\r\n\
+             SHA-256 fingerprint: {}\r\n\
+             Check it on the server (Get-ChildItem Cert:\\LocalMachine\\My | \
+             Format-List Subject, Thumbprint shows SHA-1; \
+             (Get-ChildItem Cert:\\LocalMachine\\My\\<thumbprint>).GetCertHashString('SHA256') \
+             the SHA-256).\r\n\
+             Trust this certificate for {}? (yes/no) ",
+            sanitize(why.trim_end_matches('.')),
+            cert.sha256,
+            sanitize(key)
+        );
+        self.cert_prompt = Some(CertPrompt {
+            conn,
+            held,
+            sha256: cert.sha256,
+            answer: String::new(),
+        });
+        vec![Effect::Show(text)]
     }
 
     /// Typing the answer to the certificate question.
@@ -1271,6 +1277,7 @@ mod tests {
         ServerCert {
             sha256: sha.into(),
             windows,
+            current: true,
         }
     }
 
@@ -1314,6 +1321,13 @@ mod tests {
         let fx = handshake_done(&mut s, 0, cert("AB:CD", Err("self-signed".into())));
         assert!(shown(&fx).contains("trusted before"));
         assert!(matches!(replied(&fx), Some(SspiResult::Tls { .. })));
+        // Once expired, the pinned certificate is asked about again.
+        let mut s = https_session(Some(store.clone()));
+        let mut old = cert("AB:CD", Err("expired".into()));
+        old.current = false;
+        let fx = handshake_done(&mut s, 0, old);
+        assert!(shown(&fx).contains("(yes/no)"));
+        assert!(replied(&fx).is_none());
         // Another certificate for the same server is refused outright.
         let mut s = https_session(Some(store.clone()));
         let fx = handshake_done(&mut s, 0, cert("EE:FF", Err("self-signed".into())));
