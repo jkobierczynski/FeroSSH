@@ -38,6 +38,10 @@ fn len32(v: &[u16]) -> Result<u32, String> {
 }
 
 impl NegotiateProvider for Sspi {
+    fn tls(&self, host: &str) -> Result<Box<dyn super::TlsContext>, String> {
+        Self::tls_connection(host)
+    }
+
     fn start(
         &self,
         host: &str,

@@ -489,7 +489,7 @@ enum Typed {
 }
 
 /// The prompt shown when no host was given.
-const CONNECT_PROMPT: &str = "\x1b[0mConnect to (user@host[:port], a Host from ~/.ssh/config, sftp://host for file transfer only, telnet://host[:port], winrm://[user@]host[:port], or a COM port such as COM3:115200; Ctrl+Shift+S lists them): ";
+const CONNECT_PROMPT: &str = "\x1b[0mConnect to (user@host[:port], a Host from ~/.ssh/config, sftp://host for file transfer only, telnet://host[:port], winrm://[user@]host[:port] (winrms:// for HTTPS), or a COM port such as COM3:115200; Ctrl+Shift+S lists them): ";
 
 /// What a pane is connected to.
 enum Host {
@@ -1319,14 +1319,18 @@ fn host_items(env: &Env, settings: &Settings) -> Vec<HostItem> {
             if kind == SessionKind::WinRm {
                 // As connect() resolves it: the saved user and port.
                 let own = saved.iter().find(|s| s.alias.eq_ignore_ascii_case(&h.name));
-                let detail = WinrmTarget::resolve(&h.name, env, None, own)
+                let https = settings.profile(&h.name).is_some_and(|p| p.winrm_https);
+                let detail = WinrmTarget::resolve(&h.name, env, None, https, own)
                     .map(|t| {
                         let mut d = match &t.user {
                             Some(u) => format!("{u}@{}", t.hostname),
                             None => t.hostname.clone(),
                         };
-                        if t.port != ferossh_config::DEFAULT_WINRM_PORT {
+                        if t.port != crate::winrm::default_port(t.https) {
                             d.push_str(&format!(":{}", t.port));
+                        }
+                        if t.https {
+                            d.push_str(" (HTTPS)");
                         }
                         d
                     })
@@ -5007,6 +5011,7 @@ impl Window {
                     destination,
                     &env,
                     p.winrm_command.as_deref(),
+                    p.winrm_https,
                     saved.as_ref(),
                 )
             }
@@ -5281,6 +5286,7 @@ impl Window {
         let mut session = WinrmSession::new(channel, target);
         session.password_source = source != PasswordSource::Ask && !ask;
         session.remember_password = source == PasswordSource::Windows;
+        session.cert_store = Some(app_dir().join("winrm_certs"));
         let effects = session.start();
         let Some(p) = self.panes.get_mut(&id) else {
             return;
@@ -10054,7 +10060,8 @@ impl Window {
             let saved = load_saved()
                 .into_iter()
                 .find(|h| h.alias.eq_ignore_ascii_case(name));
-            let t = WinrmTarget::resolve(name, &ssh_env(), None, saved.as_ref())?;
+            let https = self.settings.profile(name).is_some_and(|p| p.winrm_https);
+            let t = WinrmTarget::resolve(name, &ssh_env(), None, https, saved.as_ref())?;
             return Some(credman::target(t.user.as_deref()?, &t.hostname, t.port));
         }
         let t = Target::resolve(name, &ssh_env())?;

@@ -297,6 +297,7 @@ pub async fn serve(mut inbox: mpsc::Receiver<Message>, out: mpsc::Sender<Message
                 port,
                 connect_timeout,
                 command,
+                https,
             } => {
                 let Some((rx, guard)) = session(channel) else {
                     continue;
@@ -306,6 +307,7 @@ pub async fn serve(mut inbox: mpsc::Receiver<Message>, out: mpsc::Sender<Message
                     port,
                     connect_timeout,
                     command,
+                    https,
                 };
                 guard.track(tokio::spawn(winrm::run(channel, params, rx, out.clone())));
             }

@@ -73,6 +73,7 @@
 //! Profile win-srv
 //!     Type winrm
 //!     WinrmCommand cmd
+//!     WinrmHttps yes
 //! Profile laptop-roaming
 //!     Type mosh
 //!     MoshServer ~/bin/mosh-server
@@ -211,6 +212,9 @@ pub struct Profile {
     /// For a WinRM session: the command its shell runs;
     /// [`DEFAULT_WINRM_COMMAND`] when unset.
     pub winrm_command: Option<String>,
+    /// For a WinRM session: HTTPS (port [`DEFAULT_WINRM_HTTPS_PORT`])
+    /// instead of HTTP with encrypted messages.
+    pub winrm_https: bool,
 }
 
 /// The ways copied text can travel, as the clipboard settings spell
@@ -457,8 +461,10 @@ pub const DEFAULT_TELNET_PORT: u16 = 23;
 /// The program a Mosh connection starts on the server when its profile
 /// names none.
 pub const DEFAULT_MOSH_SERVER: &str = "mosh-server";
-/// WinRM over HTTP (5986 is HTTPS).
+/// WinRM over HTTP.
 pub const DEFAULT_WINRM_PORT: u16 = 5985;
+/// WinRM over HTTPS.
+pub const DEFAULT_WINRM_HTTPS_PORT: u16 = 5986;
 /// The command a WinRM session runs when its profile names none.
 pub const DEFAULT_WINRM_COMMAND: &str = "powershell -NoLogo";
 
@@ -493,6 +499,7 @@ impl Profile {
             && self.mosh_server.is_none()
             && self.mosh_ports.is_none()
             && self.winrm_command.is_none()
+            && !self.winrm_https
     }
 }
 
@@ -1226,6 +1233,10 @@ impl Settings {
                             "winrmcommand" => {
                                 p.winrm_command = virtual_desktop(&raw_rest(line));
                             }
+                            "winrmhttps" => {
+                                p.winrm_https =
+                                    first.is_some_and(|v| v.eq_ignore_ascii_case("yes"));
+                            }
                             "tmuxlayout" => {
                                 p.tmux_layout = first
                                     .map(|l| l.to_ascii_lowercase())
@@ -1534,6 +1545,9 @@ impl Settings {
             }
             if let Some(c) = &p.winrm_command {
                 let _ = writeln!(out, "    WinrmCommand {c}");
+            }
+            if p.winrm_https {
+                let _ = writeln!(out, "    WinrmHttps yes");
             }
             match &p.password {
                 PasswordSource::Ask => {}
@@ -1922,12 +1936,14 @@ Profile lab
     #[test]
     fn winrm_settings() {
         let s = Settings::parse(
-            "Profile a\n    Type winrm\n    WinrmCommand cmd /k \"echo hi\"\nProfile b\n    Type WinRM\n",
+            "Profile a\n    Type winrm\n    WinrmCommand cmd /k \"echo hi\"\n    WinrmHttps yes\nProfile b\n    Type WinRM\n",
         );
         let a = s.profile("a").unwrap();
         assert_eq!(a.kind, SessionKind::WinRm);
         assert_eq!(a.winrm_command.as_deref(), Some("cmd /k \"echo hi\""));
+        assert!(a.winrm_https);
         let b = s.profile("b").unwrap();
+        assert!(!b.winrm_https);
         assert_eq!(
             (b.kind, b.winrm_command.as_deref()),
             (SessionKind::WinRm, None)
