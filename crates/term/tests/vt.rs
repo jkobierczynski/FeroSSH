@@ -836,3 +836,25 @@ fn input_line_follows_a_command_wrapped_over_many_rows() {
     t.feed(b"\r\n$ ");
     assert_eq!(t.input_text(&mark).as_deref(), Some(cmd.as_str()));
 }
+
+#[test]
+fn input_text_is_none_for_a_line_longer_than_any_kept() {
+    let mut t = term(20, 200);
+    t.feed(b"$ ");
+    let mark = t.input_mark().unwrap();
+    t.feed(b"echo safe");
+    t.feed(" ".repeat(2200).as_bytes());
+    t.feed(b"other\r\n$ ");
+    assert_eq!(t.input_text(&mark), None);
+}
+
+#[test]
+fn input_line_follows_a_long_line_of_wide_characters() {
+    // 550 double-width characters on 20 columns: 55 rows.
+    let mut t = term(20, 80);
+    t.feed(b"$ ");
+    let mut mark = t.input_mark().unwrap();
+    let cmd = "\u{754c}".repeat(550);
+    t.feed(cmd.as_bytes());
+    assert_eq!(t.input_line(&mut mark).unwrap().before, cmd);
+}

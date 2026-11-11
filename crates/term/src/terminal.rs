@@ -212,9 +212,9 @@ fn without_right_prompt<'a>(text: &'a str, right: &str) -> &'a str {
 const MAX_INPUT_CHARS: usize = 1024;
 
 /// The most rows a command line of [`MAX_INPUT_CHARS`] spans on rows of
-/// `cols` columns, with the prompt.
+/// `cols` columns, with the prompt (wide characters take two cells).
 fn max_input_rows(cols: usize) -> usize {
-    MAX_INPUT_CHARS / cols.max(1) + 2
+    2 * MAX_INPUT_CHARS / cols.max(1) + 2
 }
 
 /// One terminal: the emulator, its parser and the pane's search state.
@@ -1248,6 +1248,14 @@ impl Terminal {
             line += 1i32;
             rows += 1;
             text.push_str(&self.row_text(line, 0, cols));
+        }
+        // Longer than any command kept: not cut to a prefix.
+        if line < grid.bottommost_line()
+            && grid[line][Column(cols - 1)]
+                .flags
+                .contains(TermFlags::WRAPLINE)
+        {
+            return None;
         }
         Some(
             without_right_prompt(&text, &mark.right)

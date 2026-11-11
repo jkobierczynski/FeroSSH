@@ -7065,6 +7065,8 @@ impl Window {
         let Some(key) = self.history_key(id) else {
             return;
         };
+        // Run again: no longer dismissed.
+        self.dismissed.remove(&(key.clone(), line.to_owned()));
         self.change_history(&key, |h| h.record(line));
     }
 
