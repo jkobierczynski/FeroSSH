@@ -79,8 +79,8 @@ pub struct Predictor {
     version: u64,
     /// Undecoded bytes of a UTF-8 character or escape sequence.
     pending: Vec<u8>,
-    /// Where the server's cursor was at the last update.
-    last_cursor: Option<(usize, usize)>,
+    /// The server's screen at the last update.
+    last: Option<Screen>,
 }
 
 impl Predictor {
@@ -197,6 +197,17 @@ impl Predictor {
             self.trusted = false;
         }
         let cursor = (screen.ds.cursor_row, screen.ds.cursor_col);
+        let last = self.last.replace(screen.clone());
+        if last.is_some_and(|last| self.unexplained(&last, screen)) {
+            // The program wrote something that is not one of our keys
+            // (the server may echo before it acknowledges, so pending
+            // guesses count): perhaps a password prompt. Start over.
+            if !self.guesses.is_empty() {
+                self.changed();
+            }
+            self.guesses.clear();
+            self.trusted = false;
+        }
         let done = self.guesses.iter().take_while(|g| g.pos <= echoed).count();
         if done > 0 {
             let checked: Vec<Guess> = self.guesses.drain(..done).collect();
@@ -238,19 +249,7 @@ impl Predictor {
                 self.trusted = true;
             }
             self.changed();
-        } else if self.last_cursor.is_some_and(|c| c != cursor)
-            && !self.guesses.iter().any(|g| g.cursor == cursor)
-        {
-            // The cursor moved, and not as a keystroke of ours (the
-            // server may echo before it acknowledges): the program wrote
-            // something, perhaps a password prompt. Start over.
-            if !self.guesses.is_empty() {
-                self.changed();
-            }
-            self.guesses.clear();
-            self.trusted = false;
         }
-        self.last_cursor = Some(cursor);
         let late = self
             .guesses
             .first()
@@ -266,6 +265,38 @@ impl Predictor {
             self.flagging = flagging;
             self.changed();
         }
+    }
+
+    /// Whether the screen changed from `last` other than where a guess
+    /// (checked or pending) types, erases or moves the cursor to.
+    fn unexplained(&self, last: &Screen, screen: &Screen) -> bool {
+        let cursor = (screen.ds.cursor_row, screen.ds.cursor_col);
+        if cursor != (last.ds.cursor_row, last.ds.cursor_col)
+            && !self.guesses.iter().any(|g| g.cursor == cursor)
+        {
+            return true;
+        }
+        if last.rows.len() != screen.rows.len() {
+            return true;
+        }
+        let guessed = |row: usize, col: usize| {
+            self.guesses
+                .iter()
+                .any(|g| g.cell.is_some_and(|(r, c, _)| (r, c) == (row, col)))
+        };
+        last.rows
+            .iter()
+            .zip(&screen.rows)
+            .enumerate()
+            .any(|(row, (a, b))| {
+                !Arc::ptr_eq(a, b)
+                    && (a.cells.len() != b.cells.len()
+                        || a.cells
+                            .iter()
+                            .zip(&b.cells)
+                            .enumerate()
+                            .any(|(col, (x, y))| x != y && !guessed(row, col)))
+            })
     }
 
     /// Whether guesses are drawn now.
@@ -503,6 +534,23 @@ mod tests {
         p.typed(b"b", 3, &server, 0);
         p.update(&server, 2, 100.0, 0);
         assert_eq!(text(&shown(&p, &server), 0), "Password:");
+    }
+
+    #[test]
+    fn a_prompt_drawn_under_the_cursor_resets_trust() {
+        let mut server = Screen::new(30, 1);
+        server.apply(b"$ ");
+        let mut p = Predictor::new(Mode::Always);
+        p.typed(b"l", 1, &server, 0);
+        server.apply(b"l");
+        p.update(&server, 1, 100.0, 0);
+        // The line is redrawn as a prompt, the cursor where it was.
+        server.apply(b"\rPw:");
+        assert_eq!(server.ds.cursor_col, 3);
+        p.update(&server, 1, 100.0, 0);
+        p.typed(b"h", 2, &server, 0);
+        p.update(&server, 1, 100.0, 0);
+        assert_eq!(text(&shown(&p, &server), 0), "Pw:");
     }
 
     #[test]
