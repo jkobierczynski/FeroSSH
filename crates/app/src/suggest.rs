@@ -417,11 +417,10 @@ pub struct Tracker {
     /// `seen`: until it does, no suggestion (keys typed faster than the
     /// echo would otherwise get one made for an older line).
     expect: Option<String>,
-    /// An editing key (Backspace, Tab, an arrow) came while typed text was not
-    /// echoed yet: what the line was to read, and whether it has. No
-    /// suggestion until the screen has shown it and then changed (the
-    /// host answered the key), or the next key.
-    stale: Option<(String, bool)>,
+    /// An editing key (Backspace, Tab, an arrow) came while an earlier key
+    /// was not answered yet: which screen shows the line after all of them
+    /// cannot be told, so no suggestion until the line ends.
+    lost: bool,
 }
 
 impl Tracker {
@@ -430,16 +429,17 @@ impl Tracker {
     /// an earlier Enter ran, to keep.
     pub fn typed(&mut self, term: &Terminal, bytes: &[u8]) -> Option<String> {
         self.choice = 0;
+        let unanswered = self.sent_at == Some(term.output_count());
         self.sent_at = Some(term.output_count());
         let had_mark = self.mark.is_some();
         let unechoed = self.expect.take();
-        self.stale = None;
-        let base = unechoed.clone().or_else(|| self.seen.take());
+        let busy = unechoed.is_some() || unanswered || self.lost;
+        let base = unechoed.or_else(|| self.seen.take());
         let done = self.settle(term);
         match bytes {
             b"\r" | b"\r\n" | b"\n" => {
                 self.skip_line = false;
-                self.stale = None;
+                self.lost = false;
                 if let Some(mut mark) = self.mark.take()
                     && let Some(line) = term.input_line(&mut mark)
                 {
@@ -452,6 +452,7 @@ impl Tracker {
             [0x03] | [0x04] | [0x1a] => {
                 self.mark = None;
                 self.skip_line = false;
+                self.lost = false;
             }
             // A paste of several lines runs them as they come: not followed.
             b if b.contains(&b'\r') || b.contains(&b'\n') => self.mark = None,
@@ -481,17 +482,14 @@ impl Tracker {
                 match (self.mark.is_some(), base, text) {
                     (false, ..) => {}
                     (true, Some(base), Some(text)) => self.expect = Some(base + text),
+                    // An editing key while an earlier one is unanswered.
+                    (true, _, None) if busy => self.lost = true,
                     // Backspace at the end of the line: one character off.
-                    // A key not echoed yet must show first (the line before
-                    // may already read as expected).
                     (true, Some(mut base), None) if backspace => {
                         base.pop();
                         self.expect = Some(base);
-                        self.stale = unechoed.map(|line| (line, false));
                     }
-                    // Not echoed yet, and this key's line only the host
-                    // knows.
-                    _ => self.stale = unechoed.map(|line| (line, false)),
+                    _ => {}
                 }
             }
         }
@@ -534,16 +532,8 @@ impl Tracker {
             return None;
         }
         let line = term.input_line(mark)?;
-        if let Some((s, shown)) = &mut self.stale {
-            if line.before == *s {
-                *shown = true;
-                return None;
-            }
-            if !*shown {
-                return None;
-            }
-            self.stale = None;
-            self.sent_at = None;
+        if self.lost {
+            return None;
         }
         if let Some(e) = &self.expect {
             // The line must read as expected, and the host must have
@@ -840,23 +830,39 @@ mod tests {
         k.typed(&t, b"i");
         t.feed(b"i");
         assert_eq!(k.line(&t).unwrap().before, "gi");
-        // t, then Backspace, before either echo.
+        // Backspace once the screen caught up: the line it makes is known.
+        k.typed(&t, b"\x7f");
+        assert!(k.line(&t).is_none(), "the Backspace is not answered yet");
+        t.feed(b"\x08\x1b[K");
+        assert_eq!(k.line(&t).unwrap().before, "g");
+        k.typed(&t, b"i");
+        t.feed(b"i");
+        assert_eq!(k.line(&t).unwrap().before, "gi");
+        // t, Backspace and Left before any echo: no suggestion for the
+        // rest of the line, whatever comes back.
         k.typed(&t, b"t");
         k.typed(&t, b"\x7f");
-        assert!(k.line(&t).is_none(), "nothing is answered yet");
+        k.typed(&t, b"\x1b[D");
         t.feed(b"\x1b[0m");
         assert!(k.line(&t).is_none(), "output that is not the echo");
         t.feed(b"t");
-        assert!(k.line(&t).is_none(), "the Backspace is not answered yet");
-        t.feed(b"\x08\x1b[K");
-        assert_eq!(k.line(&t).unwrap().before, "gi");
+        assert!(k.line(&t).is_none(), "only the t is answered");
+        t.feed(b"\x08\x1b[K\x08");
+        assert!(k.line(&t).is_none());
+        k.typed(&t, b"\x1b[C");
+        t.feed(b"\x1b[C");
+        assert!(k.line(&t).is_none(), "lost until the line ends");
+        // The next line is followed again.
+        k.typed(&t, b"\r");
+        t.feed(b"\r\n$ ");
+        k.typed(&t, b"l");
+        t.feed(b"l");
+        assert_eq!(k.line(&t).unwrap().before, "l");
         // t, then Tab, before either answer.
-        k.typed(&t, b"t");
+        k.typed(&t, b"s");
         k.typed(&t, b"\t");
-        t.feed(b"t");
-        assert!(k.line(&t).is_none(), "the Tab is not answered yet");
-        t.feed(b" ");
-        assert_eq!(k.line(&t).unwrap().before, "git ");
+        t.feed(b"s ");
+        assert!(k.line(&t).is_none(), "lost until the line ends");
     }
 
     #[test]
