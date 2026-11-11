@@ -26,7 +26,7 @@ Items with a check mark are switches: picking them turns the setting on or off, 
 | --- | --- | --- |
 | Copy | Ctrl+Shift+C (or Ctrl+Insert) | Copies the selection. |
 | Paste | Ctrl+Shift+V (or Shift+Insert) | Pastes. Control characters other than Tab are removed, and a paste with line breaks asks first unless the program has bracketed paste on. |
-| Find in scrollback | Ctrl+Shift+F | Opens the search bar. Enter finds the older match, Shift+Enter the newer one, Esc closes. |
+| Find in scrollback | Ctrl+Shift+F | Opens the search bar. Enter finds the older match, Shift+Enter the newer one, Esc closes. The match is shown on the middle row of the pane where the scrollback allows. |
 | Stop following at a match... | | Opens a bar for a regular expression: Enter sets it, and when new output matches, the view holds still on that line until you go back to the bottom. An empty pattern stops watching (see [Highlighting and following output](everyday-use.md#highlighting-and-following-output)). |
 | Follow new output | Ctrl+Shift+End (or Shift+End while scrolled back or stopped) | Goes back to the bottom and follows the output again. End or any key typed does too. |
 | Clear scrollback | | Forgets the pane's scrollback. The screen stays. |

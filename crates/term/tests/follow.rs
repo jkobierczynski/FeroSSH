@@ -45,14 +45,15 @@ fn stops_at_a_match_and_holds_the_view() {
         held.iter().any(|r| r.starts_with("ERROR: disk full")),
         "{held:?}"
     );
-    // More output, also in big bursts, does not move the view.
+    // More output, also in big bursts.
     lines(&mut t, 10, 50);
     let burst: String = (50..400).map(|i| format!("line {i}\r\n")).collect();
     t.feed(burst.as_bytes());
     // The badge covers the top right corner, and the bottom row was the
     // cursor's, which the next line filled.
     let now = rows(&t);
-    assert_eq!(now[1..4], held[1..4]);
+    // It followed until the line reached the middle row, then held.
+    assert_eq!(now[1..4], ["line 9", "ERROR: disk full", "line 10"]);
     // Typing or Shift+End follows again.
     t.scroll_to_bottom();
     assert!(!t.stopped());
@@ -217,4 +218,37 @@ fn reading_the_scrollback_is_not_interrupted() {
     t.feed(b"boom\r\n");
     assert!(!t.stopped());
     assert_eq!(rows(&t), reading);
+}
+
+#[test]
+fn scroll_up_sequences_are_counted_in_full() {
+    let mut t = Terminal::new(40, 30, &Settings::new(2000));
+    t.set_stop_pattern(Some("boom")).unwrap();
+    // Fill the history first, so its size counts nothing by itself.
+    lines(&mut t, 0, 2100);
+    t.feed(b"boom\r\n");
+    assert!(t.stopped());
+    // 20 screens in one burst (more than the 512 lines a part may
+    // scroll), with a sequence split across two feeds.
+    let burst = "\x1b[30S".repeat(20);
+    let (a, b) = burst.as_bytes().split_at(3);
+    t.feed(a);
+    t.feed(b);
+    let now = rows(&t);
+    assert_eq!(now[13..15], ["line 2099", "boom"]);
+}
+
+#[test]
+fn matches_are_shown_in_the_middle_row() {
+    let mut t = Terminal::new(40, 9, &Settings::new(100));
+    lines(&mut t, 0, 50);
+    t.search_open();
+    t.search_set("line 30");
+    assert_eq!(rows(&t)[4], "line 30");
+    t.search_close();
+    t.scroll_to_bottom();
+    t.set_stop_pattern(Some("boom")).unwrap();
+    t.feed(b"boom\r\n");
+    lines(&mut t, 50, 60);
+    assert_eq!(rows(&t)[4], "boom");
 }

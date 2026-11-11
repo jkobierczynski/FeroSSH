@@ -223,6 +223,12 @@ impl LineText {
                 cell_of.push(x);
             }
         }
+        // Blank cells after the last character are padding, not text, so
+        // a pattern ending in `$` matches at the end of what is written.
+        while bytes.last() == Some(&b' ') {
+            bytes.pop();
+            cell_of.pop();
+        }
         Self { bytes, cell_of }
     }
 
@@ -400,6 +406,15 @@ mod tests {
         }
         assert!(start.elapsed() < std::time::Duration::from_secs(5));
         assert_eq!(cells[0].fg, Color::Default);
+    }
+
+    #[test]
+    fn end_anchors_ignore_the_padding() {
+        let regex = compile(&["done$"]).expect("compiles");
+        let mut cache = regex.create_cache();
+        let mut cells = line("all done");
+        cells.extend(line("        "));
+        assert_eq!(find_in(&regex, &mut cache, &cells), Some((4, 7)));
     }
 
     #[test]

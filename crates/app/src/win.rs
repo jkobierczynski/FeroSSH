@@ -2766,7 +2766,7 @@ impl Window {
         pane.log.enabled = self.panes.get(&gateway).is_some_and(|g| g.log.enabled);
         pane.log.raw = self.panes.get(&gateway).is_some_and(|g| g.log.raw);
         self.panes.insert(native, pane);
-        self.apply_highlight(native);
+        self.apply_highlight(native, false);
         self.start_log(native);
     }
 
@@ -2934,7 +2934,10 @@ impl Window {
             p.prompt_host = None;
             p.start_dir = None;
             p.local_cwd = None;
+            p.hl_host = None;
         }
+        // A host's rules leave with it; the pane's own stop pattern stays.
+        self.apply_highlight(id, false);
         self.prune_sftp();
         self.prune_forwards();
     }
@@ -4938,7 +4941,7 @@ impl Window {
             p.term.scroll_to_bottom();
             p.hl_host = Some((alias.clone(), target.port.clone()));
         }
-        self.apply_highlight(id);
+        self.apply_highlight(id, true);
         self.set_theme(id, theme);
         self.set_font(id, font);
         let notify = self.notifier();
@@ -5142,14 +5145,15 @@ impl Window {
             p.term.set_settings(&term_settings(scrollback));
             p.hl_host = Some((alias.to_owned(), hostname.to_owned()));
         }
-        self.apply_highlight(id);
+        self.apply_highlight(id, true);
         self.set_theme(id, theme);
         self.set_font(id, font);
     }
 
     /// Gives a pane the keyword highlighting and stop patterns its host's
-    /// rules pick; rules that do not compile are named in the pane.
-    fn apply_highlight(&mut self, id: PaneId) {
+    /// rules pick. With `report`, when a host connects, rules that do not
+    /// compile are named in the pane.
+    fn apply_highlight(&mut self, id: PaneId, report: bool) {
         let Some(p) = self.panes.get(&id) else {
             return;
         };
@@ -5159,7 +5163,7 @@ impl Window {
             p.term.set_highlighter(got.highlighter);
             p.term.set_stop_rules(got.stops);
         }
-        for e in got.errors {
+        for e in got.errors.into_iter().filter(|_| report) {
             let e: String = e.chars().filter(|c| !c.is_control()).collect();
             self.show(id, &format!("\x1b[0;33m{e} Left out.\x1b[0m\r\n"));
         }
@@ -5171,7 +5175,7 @@ impl Window {
         self.save_settings();
         let ids: Vec<PaneId> = self.panes.keys().copied().collect();
         for id in ids {
-            self.apply_highlight(id);
+            self.apply_highlight(id, false);
         }
         self.update_menu_checks();
         self.request_full_redraw();
@@ -10225,7 +10229,7 @@ impl Window {
             self.settings.scrollback,
         );
         self.panes.insert(id, pane);
-        self.apply_highlight(id);
+        self.apply_highlight(id, false);
     }
 
     /// Splits the focused pane; the new pane takes the focus.

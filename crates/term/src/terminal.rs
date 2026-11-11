@@ -172,6 +172,7 @@ pub struct Terminal {
     /// Following the output stopped at a match: the view holds still
     /// until it is scrolled to the bottom or the user types.
     stopped: bool,
+    scroll_scan: ScrollScan,
     cwd: CwdScanner,
     /// Working directories reported since the last `take_actions`.
     reported: Vec<WorkingDir>,
@@ -215,6 +216,7 @@ impl Terminal {
             stop: None,
             scrolled: 0,
             stopped: false,
+            scroll_scan: ScrollScan::default(),
             cwd: CwdScanner::default(),
             reported: Vec::new(),
             title: None,
@@ -359,8 +361,13 @@ impl Terminal {
             if let Some(piece) = bytes.get(start..end).filter(|p| !p.is_empty()) {
                 let queued = self.events.0.borrow().len();
                 if self.stop.is_some() {
-                    for part in watch_parts(piece, self.cols()) {
-                        self.watched(|t| t.parser.advance(&mut t.term, part));
+                    let ends = watch_parts(piece, self.cols(), self.rows(), &mut self.scroll_scan);
+                    let mut from = 0;
+                    for to in ends {
+                        if let Some(part) = piece.get(from..to).filter(|p| !p.is_empty()) {
+                            self.watched(|t| t.parser.advance(&mut t.term, part));
+                        }
+                        from = to;
                     }
                 } else {
                     self.parser.advance(&mut self.term, piece);
@@ -509,8 +516,8 @@ impl Terminal {
     /// alacritty_terminal keeps a scrolled-back view in place by itself,
     /// but at the bottom it follows, and once the history is full lines
     /// leave it as fast as they come, so its size says nothing. For the
-    /// time of `process` the history may grow by [`WATCH_BUMP`] lines
-    /// more, which [`watch_parts`] keeps it under; the growth is the
+    /// time of `process` the history may grow by [`WATCH_BUMP`] lines and
+    /// a screen more, which [`watch_parts`] keeps it under; the growth is the
     /// count. The limit goes back after.
     fn watched(&mut self, process: impl FnOnce(&mut Self)) {
         let alt = self.mode().contains(TermMode::ALT_SCREEN);
@@ -520,9 +527,8 @@ impl Terminal {
         }
         let before = self.term.history_size();
         let offset = self.display_offset();
-        self.term
-            .grid_mut()
-            .update_history(self.scrollback.saturating_add(WATCH_BUMP));
+        let bumped = self.scrollback.saturating_add(WATCH_BUMP + self.rows());
+        self.term.grid_mut().update_history(bumped);
         process(self);
         if self.mode().contains(TermMode::ALT_SCREEN) {
             // The main screen went away mid-way; set its limit back
@@ -543,7 +549,18 @@ impl Terminal {
         let added = after - before;
         self.scrolled += added as u64;
         if self.stopped && offset == 0 && added > 0 {
-            self.term.scroll_display(Scroll::Delta(added as i32));
+            // The view still follows until the line stopped at reaches
+            // the middle row, then holds it there.
+            let middle = (self.rows() as i64 - 1) / 2;
+            match self.stop.as_ref().and_then(|s| s.last_hit) {
+                Some(hit) => {
+                    let line = hit as i64 - self.scrolled as i64;
+                    if line < middle {
+                        self.centre_line(Line(line.max(i64::from(i32::MIN)) as i32));
+                    }
+                }
+                None => self.term.scroll_display(Scroll::Delta(added as i32)),
+            }
         }
         if self.stopped {
             // Held still above; nothing to look for until it follows.
@@ -603,13 +620,17 @@ impl Terminal {
         );
         sel.update(Point::new(line, Column(end)), Side::Right);
         self.term.selection = Some(sel);
-        // Show the line, at the bottom if it went out of view.
+        self.centre_line(line);
+    }
+
+    /// Scrolls so that `line` is on the middle row of the pane, where the
+    /// eye finds it first, or as near as the scrollback allows.
+    fn centre_line(&mut self, line: Line) {
         let rows = self.rows() as i32;
         let offset = self.display_offset() as i32;
-        if line.0 < -offset || line.0 > rows - 1 - offset {
-            let want = (rows - 1 - line.0).max(0);
-            self.term.scroll_display(Scroll::Delta(want - offset));
-        }
+        let history = self.term.history_size() as i32;
+        let want = ((rows - 1) / 2 - line.0).clamp(0, history);
+        self.term.scroll_display(Scroll::Delta(want - offset));
     }
 
     /// What the host's output asked the UI to do, in order.
@@ -1090,7 +1111,7 @@ impl Terminal {
                 let mut sel = Selection::new(SelectionType::Simple, *m.start(), Side::Left);
                 sel.update(*m.end(), Side::Right);
                 self.term.selection = Some(sel);
-                self.term.scroll_to_point(*m.start());
+                self.centre_line(m.start().line);
             }
             None => self.term.selection = None,
         }
@@ -1270,39 +1291,130 @@ fn plain_cell(cell: &alacritty_terminal::term::cell::Cell) -> Cell {
     Cell::new(ch, Color::Default, Color::Default, flags)
 }
 
-/// Splits output so that no part can scroll more than [`WATCH_BUMP`]
-/// lines into the history: each line feed, vertical tab, form feed and
-/// escape (index, next line, scroll up) may scroll one, and so may every
-/// screen width of other bytes (wrapping). Splitting mid-sequence is
-/// fine: the parser keeps its state between parts.
-fn watch_parts(bytes: &[u8], cols: usize) -> impl Iterator<Item = &[u8]> {
-    let cols = cols.max(1);
-    let mut rest = bytes;
-    std::iter::from_fn(move || {
-        if rest.is_empty() {
-            return None;
-        }
-        let mut budget = WATCH_BUMP / 2;
-        let mut run = 0;
-        let mut end = rest.len();
-        for (i, &b) in rest.iter().enumerate() {
-            let costs = matches!(b, b'\n' | 0x0B | 0x0C | 0x1B) || {
-                run += 1;
-                run % cols == 0
-            };
-            if costs {
-                if budget == 0 {
-                    end = i;
-                    break;
+/// Where the output is in an escape sequence, as far as counting the
+/// lines it can scroll goes. Kept between feeds, since a sequence can be
+/// split across them.
+#[derive(Clone, Copy, Debug, Default)]
+enum ScrollScan {
+    #[default]
+    Ground,
+    Esc,
+    /// In a control sequence: its first number, and whether it is still
+    /// a plain one (no private marker or intermediate byte).
+    Csi {
+        param: usize,
+        first: bool,
+        plain: bool,
+    },
+}
+
+impl ScrollScan {
+    /// How many lines `b` may scroll into the history, at most: one for a
+    /// line feed, vertical tab, form feed, index or next line, the count
+    /// of a scroll up (CSI n S, at most a screen). Wrapping is counted by
+    /// the caller.
+    fn cost(&mut self, b: u8, rows: usize) -> usize {
+        match (*self, b) {
+            // C0 controls run even inside a sequence; CAN and SUB end it.
+            (_, b'\n' | 0x0B | 0x0C) => 1,
+            (_, 0x18 | 0x1A) => {
+                *self = Self::Ground;
+                0
+            }
+            (_, 0x1B) => {
+                *self = Self::Esc;
+                0
+            }
+            (Self::Ground, _) => 0,
+            (Self::Esc, b'[') => {
+                *self = Self::Csi {
+                    param: 0,
+                    first: true,
+                    plain: true,
+                };
+                0
+            }
+            (Self::Esc, b'D' | b'E') => {
+                *self = Self::Ground;
+                1
+            }
+            (Self::Esc, _) => {
+                *self = Self::Ground;
+                0
+            }
+            (
+                Self::Csi {
+                    param,
+                    first,
+                    plain,
+                },
+                _,
+            ) => match b {
+                b'0'..=b'9' if first => {
+                    let param = (param * 10 + usize::from(b - b'0')).min(1 << 20);
+                    *self = Self::Csi {
+                        param,
+                        first,
+                        plain,
+                    };
+                    0
                 }
-                budget -= 1;
+                b';' | b':' => {
+                    *self = Self::Csi {
+                        param,
+                        first: false,
+                        plain,
+                    };
+                    0
+                }
+                0x20..=0x2F | 0x3C..=0x3F => {
+                    *self = Self::Csi {
+                        param,
+                        first,
+                        plain: false,
+                    };
+                    0
+                }
+                0x40..=0x7E => {
+                    *self = Self::Ground;
+                    if b == b'S' && plain {
+                        param.clamp(1, rows.max(1))
+                    } else {
+                        0
+                    }
+                }
+                _ => 0,
+            },
+        }
+    }
+}
+
+/// Where to split output so that no part can scroll more than
+/// [`WATCH_BUMP`] lines plus a screen into the history (see
+/// [`ScrollScan::cost`]; every screen width of other bytes may wrap one
+/// more line). Returns the end of each part. Splitting mid-sequence is
+/// fine: the parser keeps its state between parts.
+fn watch_parts(bytes: &[u8], cols: usize, rows: usize, scan: &mut ScrollScan) -> Vec<usize> {
+    let cols = cols.max(1);
+    let mut ends = Vec::new();
+    let mut spent = 0;
+    let mut run = 0;
+    for (i, &b) in bytes.iter().enumerate() {
+        let mut cost = scan.cost(b, rows);
+        if cost == 0 {
+            run += 1;
+            if run % cols == 0 {
+                cost = 1;
             }
         }
-        let end = end.max(1);
-        let (part, tail) = rest.split_at(end.min(rest.len()));
-        rest = tail;
-        Some(part)
-    })
+        if spent > 0 && spent + cost > WATCH_BUMP {
+            ends.push(i);
+            spent = 0;
+        }
+        spent += cost;
+    }
+    ends.push(bytes.len());
+    ends
 }
 
 /// Marks the top right corner while following the output is stopped at
