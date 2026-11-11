@@ -4891,6 +4891,20 @@ impl Window {
             }
             return;
         }
+        // Meant as an `sftp://` address but not one: never a shell login.
+        if destination
+            .trim()
+            .get(..7)
+            .is_some_and(|h| h.eq_ignore_ascii_case("sftp://"))
+        {
+            self.end_host(id);
+            self.show(
+                id,
+                "\x1b[0;31mThat is not an SFTP address: write sftp://user@host[:port][/folder].\x1b[0m\r\n",
+            );
+            self.ask_destination(id);
+            return;
+        }
         let telnet = if self
             .settings
             .profile(destination)
