@@ -16,7 +16,10 @@
 //! sees no more of the target than the jump host itself does. Each hop
 //! checks its own host key against known_hosts and signs its own login.
 //! A `ProxyCommand` is a local program whose input and output the window
-//! relays the same way ([`Effect::ProxyCommand`]).
+//! relays the same way ([`Effect::ProxyCommand`]). A SOCKS 5 or HTTP
+//! proxy (`ProxyServer`) needs no relay: the first login's worker talks to
+//! it itself, in the sandbox; only the proxy's password is asked for here
+//! and kept in the Windows Credential Manager once the proxy took it.
 //!
 //! It only returns [`Effect`]s; the window carries them out. That keeps
 //! this logic platform-neutral and tested on any host.
@@ -30,7 +33,7 @@ use ferossh_auth::{
 };
 use ferossh_config::known_hosts::{self, KnownHosts, Status};
 use ferossh_config::ssh_config::{AddressFamily, RequestTty, StrictHostKeyChecking};
-use ferossh_config::{ForwardSpec, hostkey, ssh_config};
+use ferossh_config::{ForwardSpec, ProxyKind, ProxyServer, hostkey, ssh_config};
 use ferossh_ipc::{
     ChannelId, Family, GssReply, MAX_DATA_CHUNK, Message, MoshOptions, PromptField, PromptKind,
     Secrets, ShellOptions, Timing, X11Auth,
@@ -82,6 +85,9 @@ pub struct Target {
     /// The program that carries the connection to the first hop
     /// (`ProxyCommand`): the first jump host, or this host without jumps.
     pub proxy_command: Option<ProxyCommand>,
+    /// The SOCKS 5 or HTTP proxy the connection to the first hop goes
+    /// through (`ProxyServer`).
+    pub proxy_server: Option<ProxyServer>,
     /// `CertificateFile`s, expanded.
     pub certificates: Vec<PathBuf>,
     /// `IdentitiesOnly yes`.
@@ -214,6 +220,7 @@ impl Target {
                     };
                     if i == 0 {
                         target.proxy_command = hop.proxy_command.take();
+                        target.proxy_server = hop.proxy_server.take();
                         target.jumps.append(&mut hop.jumps);
                     }
                     target.jumps.push(hop);
@@ -230,6 +237,7 @@ impl Target {
                         },
                     );
             }
+            Some(ssh_config::Proxy::Server(server)) => target.proxy_server = Some(server),
             Some(ssh_config::Proxy::Direct) | None => {}
         }
         Ok(target)
@@ -335,6 +343,7 @@ impl Target {
             key_files,
             jumps: Vec::new(),
             proxy_command: None,
+            proxy_server: None,
         })
     }
 
@@ -369,13 +378,14 @@ impl Target {
             && other.mosh.is_none()
     }
 
-    /// The way there, for the log and for telling routes apart: the jump
-    /// hosts' labels, or the command.
+    /// The way there, for the log and for telling routes apart: the
+    /// proxy or command, then the jump hosts' labels.
     pub fn route(&self) -> Vec<String> {
         let mut out: Vec<String> = self
             .proxy_command
             .iter()
             .map(|c| format!("command {}", c.line))
+            .chain(self.proxy_server.iter().map(|p| format!("proxy {p}")))
             .collect();
         out.extend(self.jumps.iter().map(Target::label));
         out
@@ -438,6 +448,15 @@ pub enum Effect {
         tunnel: ChannelId,
         command: ProxyCommand,
     },
+    /// The proxy took the password typed for it: keep it in the Windows
+    /// Credential Manager for `proxy`'s user at its host and port.
+    StoreProxyPassword {
+        proxy: ProxyServer,
+        password: Secrets,
+    },
+    /// The proxy refused the password kept for it: forget it, so the next
+    /// connection asks.
+    ForgetProxyPassword { proxy: ProxyServer },
     /// The connection is gone.
     Ended,
     /// The connection dropped (or a reconnect could not reach the host):
@@ -472,6 +491,9 @@ enum Purpose {
         data: Vec<u8>,
         flags: u32,
     },
+    /// The password of the proxy the connection goes through, asked
+    /// before connecting.
+    ProxyPassword,
 }
 
 struct LocalPrompt {
@@ -534,6 +556,15 @@ pub struct SshSession {
     tunnel: Option<ChannelId>,
     /// The `ProxyCommand` this login's stream comes from.
     proxy: Option<ProxyCommand>,
+    /// The SOCKS 5 or HTTP proxy this login's TCP connection goes
+    /// through: the first login's, with or without jump hosts.
+    proxy_server: Option<ProxyServer>,
+    /// Its password, when it has a user: kept in the Windows Credential
+    /// Manager ([`SshSession::set_proxy_password`]) or typed.
+    proxy_password: Option<Zeroizing<String>>,
+    /// The proxy password was typed for this login, so it is kept once
+    /// the proxy took it.
+    proxy_typed: bool,
     /// A jump host's login: no shell, only the next hop's stream.
     jump: bool,
     /// The pane's size, for a login that starts after its jump hosts'.
@@ -566,6 +597,10 @@ struct Login {
     host_asked: bool,
     /// The host key was trusted.
     host_trusted: bool,
+    /// The worker said whether the proxy took its login.
+    proxy_told: bool,
+    /// The proxy refused the login.
+    proxy_refused: bool,
     /// Signatures asked for so far.
     signatures: u32,
     /// Kerberos steps asked for so far.
@@ -677,6 +712,9 @@ impl SshSession {
             hops: Vec::new(),
             tunnel: None,
             proxy: None,
+            proxy_server: None,
+            proxy_password: None,
+            proxy_typed: false,
             jump: false,
             size: Cell::new((80, 24)),
             held: None,
@@ -707,7 +745,31 @@ impl SshSession {
             first.proxy = Some(command);
             first.tunnel = tunnel;
         }
+        if let Some(server) = self.target.proxy_server.clone() {
+            match self.hops.first_mut() {
+                Some(h) => h.session.proxy_server = Some(server),
+                None => self.proxy_server = Some(server),
+            }
+        }
         self
+    }
+
+    /// The proxy the connection goes through and the user to log in to
+    /// it as, when it has one: for looking up its kept password.
+    pub fn proxy_login(&self) -> Option<&ProxyServer> {
+        let first = self.hops.first().map_or(self, |h| &h.session);
+        first.proxy_server.as_ref().filter(|p| p.user.is_some())
+    }
+
+    /// The proxy's password, from the Windows Credential Manager: not
+    /// asked for then, and forgotten if the proxy refuses it.
+    pub fn set_proxy_password(&mut self, password: Zeroizing<String>) {
+        let first = match self.hops.first_mut() {
+            Some(h) => &mut h.session,
+            None => self,
+        };
+        first.proxy_password = Some(password);
+        first.proxy_typed = false;
     }
 
     /// The jump hosts' logins, to give them their profiles' settings.
@@ -825,6 +887,7 @@ impl SshSession {
             Purpose::Answer { password: true, .. } => "a password",
             Purpose::Answer { .. } => "an answer",
             Purpose::Passphrase { .. } => "a key passphrase",
+            Purpose::ProxyPassword => "a proxy password",
         })
     }
 
@@ -909,13 +972,7 @@ impl SshSession {
 
     /// Starts this login; `via` names the jump host its stream comes from.
     fn begin(&mut self, via: Option<&str>) -> Vec<Effect> {
-        let known = self.known();
         let t = &self.target;
-        let (key_host, key_port) = t.key_host();
-        let mut host_key_algs = known.key_types(key_host, key_port);
-        if known.has_authority(key_host, key_port) {
-            host_key_algs.push(crypto_policy::CERT_AUTHORITY.to_owned());
-        }
         let mut text = format!(
             "Connecting to {}{}",
             if self.jump { "jump host " } else { "" },
@@ -924,17 +981,17 @@ impl SshSession {
         if t.hostname != t.alias {
             text.push_str(&format!(" ({})", t.hostname));
         }
-        match (via, &self.proxy) {
-            (Some(hop), _) => text.push_str(&format!(" through {hop}")),
-            (None, Some(c)) => text.push_str(&format!(" through the command {}", c.program)),
-            (None, None) => {}
+        match (via, &self.proxy, &self.proxy_server) {
+            (Some(hop), _, _) => text.push_str(&format!(" through {hop}")),
+            (None, Some(c), _) => text.push_str(&format!(" through the command {}", c.program)),
+            (None, None, Some(p)) => text.push_str(&format!(" through the proxy {p}")),
+            (None, None, None) => {}
         }
         text.push_str("...");
         self.login = Login {
             started: true,
             ..Login::default()
         };
-        let (cols, rows) = self.size.get();
         let mut effects = vec![Effect::Show(dim(&sanitize(&text)))];
         if let (Some(command), Some(tunnel)) = (&self.proxy, self.tunnel) {
             effects.push(Effect::ProxyCommand {
@@ -943,7 +1000,58 @@ impl SshSession {
                 command: command.clone(),
             });
         }
-        effects.push(Effect::Send(Message::Connect {
+        let ask = self.tunnel.is_none()
+            && self.proxy_password.is_none()
+            && self.proxy_server.as_ref().is_some_and(|p| p.user.is_some());
+        if let (true, Some(p)) = (ask, &self.proxy_server) {
+            let user = p.user.clone().unwrap_or_default();
+            let at = ProxyServer {
+                user: None,
+                ..p.clone()
+            };
+            effects.push(Effect::Show(sanitize(&format!(
+                "Password for {user} on the proxy {at}: "
+            ))));
+            self.prompt = Some(LocalPrompt {
+                echo: false,
+                text: Zeroizing::new(String::new()),
+                purpose: Purpose::ProxyPassword,
+            });
+            return effects;
+        }
+        effects.push(self.connect_message());
+        effects
+    }
+
+    /// The [`Message::Connect`] that starts this login.
+    fn connect_message(&self) -> Effect {
+        let t = &self.target;
+        let (key_host, key_port) = t.key_host();
+        let known = self.known();
+        let mut host_key_algs = known.key_types(key_host, key_port);
+        if known.has_authority(key_host, key_port) {
+            host_key_algs.push(crypto_policy::CERT_AUTHORITY.to_owned());
+        }
+        let (cols, rows) = self.size.get();
+        // A tunnelled login has its stream already; the proxy is the
+        // first login's way to its host.
+        let proxy = match (&self.proxy_server, self.tunnel) {
+            (Some(p), None) => Some(ferossh_ipc::ProxyServer {
+                kind: match p.kind {
+                    ProxyKind::Socks5 => ferossh_ipc::ProxyKind::Socks5,
+                    ProxyKind::Http => ferossh_ipc::ProxyKind::Http,
+                },
+                host: p.host.clone(),
+                port: p.port,
+                user: p.user.clone().unwrap_or_default(),
+                password: match (&p.user, &self.proxy_password) {
+                    (Some(_), Some(pw)) => Secrets(vec![pw.to_string()]),
+                    _ => Secrets::default(),
+                },
+            }),
+            _ => None,
+        };
+        Effect::Send(Message::Connect {
             channel: self.channel,
             host: t.hostname.clone(),
             port: t.port,
@@ -963,8 +1071,8 @@ impl SshSession {
             },
             family: t.family,
             gssapi: t.gssapi,
-        }));
-        effects
+            proxy,
+        })
     }
 
     /// What became of jump host `i`'s login: once in, its worker opens
@@ -1226,6 +1334,15 @@ impl SshSession {
         let login = self.login;
         let logging_in = login.started && self.state == State::Connecting;
         match msg {
+            Message::ProxyAuth { .. } => {
+                if !logging_in || self.proxy_login_here().is_none() {
+                    Some("a proxy login this connection does not use")
+                } else if login.proxy_told || login.host_asked {
+                    Some("a proxy login out of turn")
+                } else {
+                    None
+                }
+            }
             Message::HostKey { .. } | Message::HostCert { .. } => {
                 if !logging_in {
                     Some("a host key check outside a login")
@@ -1306,6 +1423,10 @@ impl SshSession {
             return effects;
         }
         match msg {
+            Message::ProxyAuth { accepted, .. } => {
+                self.login.proxy_told = true;
+                self.on_proxy_auth(accepted)
+            }
             Message::HostKey { key, .. } => {
                 self.login.host_asked = true;
                 self.on_host_key(key)
@@ -1438,8 +1559,10 @@ impl SshSession {
                 // still down): try again. A login that failed, a host key
                 // that changed or a shell that exited stays ended.
                 let dropped = self.lost && was == State::Connected && self.auto_reconnect;
-                let unreachable =
-                    self.retrying && was == State::Connecting && !self.login.host_asked;
+                let unreachable = self.retrying
+                    && was == State::Connecting
+                    && !self.login.host_asked
+                    && !self.login.proxy_refused;
                 if dropped || unreachable {
                     return vec![
                         Effect::Show(format!("\r\n{DIM}[{text}]{RESET}\r\n")),
@@ -1458,6 +1581,45 @@ impl SshSession {
                 ]
             }
             // UI-to-worker messages never come this way.
+            _ => Vec::new(),
+        }
+    }
+
+    /// This login's proxy with a user, if it goes through one.
+    fn proxy_login_here(&self) -> Option<&ProxyServer> {
+        if self.tunnel.is_some() {
+            return None;
+        }
+        self.proxy_server.as_ref().filter(|p| p.user.is_some())
+    }
+
+    /// The proxy took the password (keep it if it was typed) or refused
+    /// it (forget it if it was kept, so the next connection asks).
+    fn on_proxy_auth(&mut self, accepted: bool) -> Vec<Effect> {
+        let Some(proxy) = self.proxy_login_here().cloned() else {
+            return Vec::new();
+        };
+        let typed = std::mem::take(&mut self.proxy_typed);
+        let password = self.proxy_password.take();
+        match (accepted, typed, password) {
+            (true, true, Some(password)) => vec![Effect::StoreProxyPassword {
+                proxy,
+                password: Secrets(vec![password.to_string()]),
+            }],
+            (false, typed, _) => {
+                self.login.proxy_refused = true;
+                if typed {
+                    Vec::new()
+                } else {
+                    vec![
+                        Effect::Show(dim(
+                            "The proxy refused the password kept for it in the Windows \
+                             Credential Manager; FeroSSH forgot it and asks next time.",
+                        )),
+                        Effect::ForgetProxyPassword { proxy },
+                    ]
+                }
+            }
             _ => Vec::new(),
         }
     }
@@ -2063,6 +2225,11 @@ impl SshSession {
     fn submit(&mut self, prompt: LocalPrompt) -> Vec<Effect> {
         let LocalPrompt { text, purpose, .. } = prompt;
         match purpose {
+            Purpose::ProxyPassword => {
+                self.proxy_password = Some(text);
+                self.proxy_typed = true;
+                vec![self.connect_message()]
+            }
             Purpose::TrustHostKey { key } => {
                 if text.trim() != "yes" {
                     return vec![
@@ -2612,14 +2779,20 @@ mod tests {
         let err = Target::resolve_route("a", &e).unwrap_err();
         assert!(err.contains("loop"), "{err}");
         let e = Env {
-            config: "Host a\n  ProxyCommand nc -X connect -x proxy:3128 %h %p\n".into(),
+            config: "Host a\n  ProxyCommand corkscrew proxy 3128 %h %p\n\
+                     Host b\n  ProxyCommand nc -X connect -x proxy:3128 %h %p\n"
+                .into(),
             ..env(&dir)
         };
         let t = Target::resolve_route("a", &e).unwrap();
         let c = t.proxy_command.unwrap();
-        assert_eq!(c.program, "nc");
-        assert_eq!(c.args, ["-X", "connect", "-x", "proxy:3128", "a", "22"]);
-        assert_eq!(c.line, "nc -X connect -x proxy:3128 %h %p");
+        assert_eq!(c.program, "corkscrew");
+        assert_eq!(c.args, ["proxy", "3128", "a", "22"]);
+        assert_eq!(c.line, "corkscrew proxy 3128 %h %p");
+        // A proxy tool's usual command runs built in: no program.
+        let t = Target::resolve_route("b", &e).unwrap();
+        assert!(t.proxy_command.is_none());
+        assert_eq!(t.proxy_server.unwrap().to_string(), "http://proxy:3128");
     }
 
     #[test]
@@ -2894,6 +3067,125 @@ mod tests {
         assert_eq!(command.args, ["bastion", "22"]);
         assert!(sent(&fx).iter().any(|m| matches!(m,
             Message::Connect { channel: 2, tunnel: Some(t), .. } if t == tunnel)));
+    }
+
+    fn proxy_sent(fx: &[Effect]) -> Option<ferossh_ipc::ProxyServer> {
+        sent(fx).iter().find_map(|m| match m {
+            Message::Connect { proxy, .. } => Some(proxy.clone()),
+            _ => None,
+        })?
+    }
+
+    #[test]
+    fn a_proxy_server_carries_the_first_login_and_its_password_is_asked_once() {
+        let dir = temp("chain-proxy");
+        let e = Env {
+            config: "Host inner\n  ProxyJump bastion\n\
+                     Host bastion\n  ProxyServer socks5://me@proxy.corp:1081\n"
+                .into(),
+            ..env(&dir)
+        };
+        let mut s = chain(&e);
+        assert_eq!(
+            s.target.route(),
+            ["proxy socks5://me@proxy.corp:1081", "me@bastion"]
+        );
+        assert_eq!(s.proxy_login().map(|p| p.port), Some(1081));
+        // The first login asks for the proxy's password before connecting.
+        let fx = s.start(80, 24);
+        assert!(shown(&fx).contains("through the proxy socks5://me@proxy.corp:1081"));
+        assert!(shown(&fx).contains("Password for me on the proxy socks5://proxy.corp:1081: "));
+        assert!(sent(&fx).is_empty());
+        assert_eq!(s.prompt_asks(), Some("a proxy password"));
+        assert!(s.prompt_input(b"pw").is_empty(), "no echo");
+        let fx = s.prompt_input(b"\r");
+        let p = proxy_sent(&fx).unwrap();
+        assert_eq!(
+            (p.kind, p.host.as_str(), p.port, p.user.as_str()),
+            (ferossh_ipc::ProxyKind::Socks5, "proxy.corp", 1081, "me")
+        );
+        assert_eq!(p.password.0, ["pw"]);
+        assert!(sent(&fx).iter().any(|m| matches!(
+            m,
+            Message::Connect {
+                channel: 2,
+                tunnel: None,
+                ..
+            }
+        )));
+        // Taken: kept, once.
+        let fx = s.on_worker(Message::ProxyAuth {
+            channel: 2,
+            accepted: true,
+        });
+        assert!(
+            matches!(&fx[..], [Effect::StoreProxyPassword { password, .. }]
+            if password.0 == ["pw"])
+        );
+        // Only the first login goes through the proxy.
+        let fx = hop_in(&mut s, 2);
+        assert!(sent(&fx).iter().any(|m| matches!(
+            m,
+            Message::Connect {
+                channel: 1,
+                proxy: None,
+                tunnel: Some(_),
+                ..
+            }
+        )));
+        // Saying it again is out of turn.
+        let fx = s.on_worker(Message::ProxyAuth {
+            channel: 1,
+            accepted: true,
+        });
+        assert!(fx.iter().any(|f| matches!(f, Effect::Ended)));
+    }
+
+    #[test]
+    fn a_kept_proxy_password_is_used_and_forgotten_when_refused() {
+        let dir = temp("proxy-kept");
+        let e = Env {
+            config: "Host p\n  ProxyCommand nc -X connect -x proxy:3128 -P me %h %p\n".into(),
+            ..env(&dir)
+        };
+        let target = Target::resolve_route("p", &e).unwrap();
+        let mut s = SshSession::new(1, target, e.known_hosts()).with_route(&mut || 9);
+        s.set_proxy_password(Zeroizing::new("old".into()));
+        s.retrying = true;
+        let fx = s.start(80, 24);
+        let p = proxy_sent(&fx).unwrap();
+        assert_eq!(p.kind, ferossh_ipc::ProxyKind::Http);
+        assert_eq!(p.password.0, ["old"]);
+        let fx = s.on_worker(Message::ProxyAuth {
+            channel: 1,
+            accepted: false,
+        });
+        assert!(
+            fx.iter()
+                .any(|f| matches!(f, Effect::ForgetProxyPassword { .. }))
+        );
+        // A refused login is no network trouble: no retry.
+        let fx = s.on_worker(Message::Disconnected {
+            channel: 1,
+            reason: "The HTTP proxy refused the user name or password.".into(),
+        });
+        assert!(!reconnects(&fx));
+
+        // Without a user nothing is asked, and a verdict is out of turn.
+        let e = Env {
+            config: "Host q\n  ProxyServer http://proxy\n".into(),
+            ..env(&dir)
+        };
+        let target = Target::resolve_route("q", &e).unwrap();
+        let mut s = SshSession::new(1, target, e.known_hosts()).with_route(&mut || 9);
+        let fx = s.start(80, 24);
+        let p = proxy_sent(&fx).unwrap();
+        assert!(p.user.is_empty() && p.password.0.is_empty());
+        let fx = s.on_worker(Message::ProxyAuth {
+            channel: 1,
+            accepted: true,
+        });
+        assert!(fx.iter().any(|f| matches!(f, Effect::Ended)));
     }
 
     #[test]

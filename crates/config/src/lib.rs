@@ -17,6 +17,7 @@ pub mod mobaxterm;
 pub mod mremoteng;
 pub mod password;
 pub mod pattern;
+pub mod proxy;
 pub mod putty;
 pub mod record;
 pub mod saved;
@@ -33,6 +34,7 @@ pub use forward::{ForwardKind, ForwardSpec};
 pub use host_theme::{HostThemes, ThemeRule};
 pub use password::PasswordSource;
 pub use pattern::{match_host, match_pattern};
+pub use proxy::{ProxyKind, ProxyServer};
 pub use settings::{
     Bookmark, DEFAULT_TELNET_PORT, DEFAULT_WINRM_COMMAND, DEFAULT_WINRM_PORT, Profile, SessionKind,
     Settings, WindowColours,

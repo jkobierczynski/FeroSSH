@@ -278,7 +278,10 @@ fn local_remote_dynamic_and_x11_forwards() {
                 }
                 Effect::Ended | Effect::Reconnect => {}
                 // No password source in these tests.
-                Effect::FetchPassword | Effect::StorePassword { .. } => {}
+                Effect::FetchPassword
+                | Effect::StorePassword { .. }
+                | Effect::StoreProxyPassword { .. }
+                | Effect::ForgetProxyPassword { .. } => {}
                 Effect::Tunnel { .. } | Effect::ProxyCommand { .. } => {}
             }
         }
@@ -406,7 +409,9 @@ impl Shell {
                     Effect::Ended
                     | Effect::Reconnect
                     | Effect::FetchPassword
-                    | Effect::StorePassword { .. } => {}
+                    | Effect::StorePassword { .. }
+                    | Effect::StoreProxyPassword { .. }
+                    | Effect::ForgetProxyPassword { .. } => {}
                     Effect::Tunnel { .. } | Effect::ProxyCommand { .. } => {}
                 }
             }

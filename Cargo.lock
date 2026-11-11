@@ -917,6 +917,9 @@ dependencies = [
 [[package]]
 name = "ferossh-forward"
 version = "1.3.1"
+dependencies = [
+ "zeroize",
+]
 
 [[package]]
 name = "ferossh-ipc"
@@ -933,6 +936,7 @@ dependencies = [
  "miniz_oxide 0.9.1",
  "ocb3",
  "unicode-width",
+ "vte",
  "zeroize",
 ]
 

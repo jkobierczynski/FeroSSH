@@ -242,6 +242,7 @@ async fn log_in(
             },
             family: Default::default(),
             gssapi,
+            proxy: None,
         },
     ] {
         to_worker.send(msg).await.unwrap();

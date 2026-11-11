@@ -222,7 +222,10 @@ fn connect_to(
                 Effect::Ended => return (run, session),
                 Effect::Reconnect => {}
                 // No password source in these tests.
-                Effect::FetchPassword | Effect::StorePassword { .. } => {}
+                Effect::FetchPassword
+                | Effect::StorePassword { .. }
+                | Effect::StoreProxyPassword { .. }
+                | Effect::ForgetProxyPassword { .. } => {}
             }
         }
         if session.prompt_active() {

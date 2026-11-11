@@ -146,6 +146,7 @@ pub async fn log_in(
             options: Default::default(),
             family: Default::default(),
             gssapi: false,
+            proxy: None,
         },
     ] {
         to_worker.send(msg).await.unwrap();
