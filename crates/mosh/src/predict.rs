@@ -267,8 +267,8 @@ impl Predictor {
         }
     }
 
-    /// Whether the screen changed from `last` other than where a guess
-    /// (checked or pending) types, erases or moves the cursor to.
+    /// Whether the screen changed from `last` other than as a guess
+    /// (checked or pending) types, erases or moves the cursor.
     fn unexplained(&self, last: &Screen, screen: &Screen) -> bool {
         let cursor = (screen.ds.cursor_row, screen.ds.cursor_col);
         if cursor != (last.ds.cursor_row, last.ds.cursor_col)
@@ -279,10 +279,13 @@ impl Predictor {
         if last.rows.len() != screen.rows.len() {
             return true;
         }
+        // A changed cell is ours only if it now shows what a guess for
+        // that cell types or erases.
         let guessed = |row: usize, col: usize| {
-            self.guesses
-                .iter()
-                .any(|g| g.cell.is_some_and(|(r, c, _)| (r, c) == (row, col)))
+            self.guesses.iter().any(|g| {
+                g.cell
+                    .is_some_and(|(r, k, c)| (r, k) == (row, col) && shows(screen, r, k, c))
+            })
         };
         last.rows
             .iter()
@@ -551,6 +554,24 @@ mod tests {
         p.typed(b"h", 2, &server, 0);
         p.update(&server, 1, 100.0, 0);
         assert_eq!(text(&shown(&p, &server), 0), "Pw:");
+    }
+
+    #[test]
+    fn other_text_in_a_guessed_cell_resets_trust() {
+        let mut server = Screen::new(30, 1);
+        server.apply(b"$ ");
+        let mut p = Predictor::new(Mode::Always);
+        p.typed(b"l", 1, &server, 0);
+        server.apply(b"l");
+        p.update(&server, 1, 100.0, 0);
+        // "s" is pending at column 3, but the program writes something
+        // else there, leaving the cursor where "s" would.
+        p.typed(b"s", 2, &server, 0);
+        server.apply(b"*");
+        p.update(&server, 1, 100.0, 0);
+        p.typed(b"h", 3, &server, 0);
+        p.update(&server, 1, 100.0, 0);
+        assert_eq!(text(&shown(&p, &server), 0), "$ l*");
     }
 
     #[test]
