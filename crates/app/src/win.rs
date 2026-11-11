@@ -1289,9 +1289,36 @@ fn host_items(env: &Env, settings: &Settings) -> Vec<HostItem> {
     let includes = ssh_config::DirIncludes {
         home: env.home.clone(),
     };
+    let saved = load_saved();
     ssh_config::hosts(&env.config, &includes)
         .into_iter()
         .map(|h| {
+            let kind = settings
+                .profile(&h.name)
+                .map(|p| p.kind)
+                .unwrap_or_default();
+            if kind == SessionKind::WinRm {
+                // As connect() resolves it: the saved user and port.
+                let own = saved.iter().find(|s| s.alias.eq_ignore_ascii_case(&h.name));
+                let detail = WinrmTarget::resolve(&h.name, env, None, own)
+                    .map(|t| {
+                        let mut d = match &t.user {
+                            Some(u) => format!("{u}@{}", t.hostname),
+                            None => t.hostname.clone(),
+                        };
+                        if t.port != ferossh_config::DEFAULT_WINRM_PORT {
+                            d.push_str(&format!(":{}", t.port));
+                        }
+                        d
+                    })
+                    .unwrap_or_default();
+                return HostItem {
+                    name: h.name,
+                    folder: h.folder,
+                    detail,
+                    kind,
+                };
+            }
             let detail = Target::resolve(&h.name, env)
                 .map(|t| {
                     let mut d = format!("{}@{}", t.user, t.hostname);
@@ -1304,10 +1331,6 @@ fn host_items(env: &Env, settings: &Settings) -> Vec<HostItem> {
                     }
                     d
                 })
-                .unwrap_or_default();
-            let kind = settings
-                .profile(&h.name)
-                .map(|p| p.kind)
                 .unwrap_or_default();
             HostItem {
                 name: h.name,
@@ -5454,6 +5477,18 @@ impl Window {
                     }
                 }
                 Effect::Show(text) => self.show(id, &text),
+                Effect::Output(bytes)
+                    if matches!(self.panes.get(&id).map(|p| &p.host), Some(Host::Winrm(_))) =>
+                {
+                    // No tmux on the far side of WinRM: straight to the
+                    // terminal, never through tmux's control-mode parser.
+                    if let Some(p) = self.panes.get_mut(&id) {
+                        p.term.feed(&bytes);
+                    }
+                    self.log(id, &bytes);
+                    self.watch_output(id, &bytes);
+                    self.script_output(id, &bytes);
+                }
                 Effect::Output(bytes) => {
                     self.host_output(id, &bytes);
                     self.script_output(id, &bytes);
