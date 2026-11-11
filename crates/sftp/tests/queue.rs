@@ -382,6 +382,30 @@ fn lists_the_home_folder_folders_first() {
 }
 
 #[test]
+fn a_listing_is_settled_only_once_the_folder_asked_for_is_in() {
+    let s = Scratch::new("settled");
+    fs::create_dir(s.remote().join("sub")).unwrap();
+    let (mut remote, mut fake) = connected(&s.remote());
+    assert!(remote.listing_settled());
+    // Asked for, not yet in: the old folder is still listed.
+    remote.browse(b"/sub");
+    assert!(!remote.listing_settled());
+    assert_eq!(remote.listing.path, b"/");
+    run(&mut remote, &mut fake);
+    assert!(remote.listing_settled());
+    assert_eq!(remote.listing.path, b"/sub");
+    // A relative folder is in the home folder.
+    remote.browse(b"sub");
+    run(&mut remote, &mut fake);
+    assert_eq!(remote.listing.path, b"/sub");
+    // A failed listing keeps the old folder but is not settled.
+    remote.browse(b"/missing");
+    run(&mut remote, &mut fake);
+    assert_eq!(remote.listing.path, b"/sub");
+    assert!(!remote.listing_settled());
+}
+
+#[test]
 fn downloads_a_large_file_in_order() {
     let s = Scratch::new("down");
     let data = pattern(3 * 1024 * 1024 + 123);

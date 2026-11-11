@@ -489,10 +489,11 @@ pub enum Message {
     /// the UI connects to a jump host's `direct-tcpip` channel in another
     /// worker, or to a local `ProxyCommand`. With a `proxy` (and no
     /// `tunnel`), the TCP connection goes to that proxy, which the worker
-    /// asks for `host`:`port`. A login without `shell` is a
-    /// jump host's: the worker logs in, answers [`Message::Connected`] and
-    /// keeps the connection for the streams opened on it until
-    /// [`Message::Close`].
+    /// asks for `host`:`port`. A login without `shell` is a jump host's
+    /// or an SFTP-only connection's: the worker logs in, answers
+    /// [`Message::Connected`] and keeps the connection for the streams,
+    /// SFTP and forwards opened on it until [`Message::Close`], or sends
+    /// [`Message::Lost`] when the connection breaks first.
     Connect {
         channel: ChannelId,
         host: String,
