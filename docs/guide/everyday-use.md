@@ -23,7 +23,7 @@ A split (Window > Split right or Split down) and a new tab (Ctrl+Shift+T) start 
 
 ## Connecting
 
-Ctrl+Shift+N (File > Connect to...) asks for a host in a new tab. It takes `user@host`, `host:2222`, a `Host` alias from `~/.ssh/config`, a saved connection's name, `telnet://router` or a COM port such as `COM3:115200`. File > Reconnect (Ctrl+Shift+R) logs in again and File > Disconnect ends the connection.
+Ctrl+Shift+N (File > Connect to...) asks for a host in a new tab. It takes `user@host`, `host:2222`, a `Host` alias from `~/.ssh/config`, a saved connection's name, `telnet://router`, `winrm://server` or a COM port such as `COM3:115200`. File > Reconnect (Ctrl+Shift+R) logs in again and File > Disconnect ends the connection.
 
 File > Open local shell opens a Windows command prompt in a new tab. `ferossh.exe --local wsl -d Ubuntu` (or any other program) opens that instead.
 
@@ -87,7 +87,7 @@ Ctrl+Shift+S shows your hosts in the tools pane: those from `~/.ssh/config`, you
 
 Insert or the New button opens the connection form in the tools pane; F2, the Edit button or a right click edits the selected connection. It is a Windows form of text boxes and drop-down lists, with a tab per section:
 
-- **Connection**: **Name, Folder, Type**; the type is an SSH terminal, Mosh terminal, Telnet (unencrypted), Serial console, Remote desktop (RDP) or VNC desktop. Then **Host, User, Port, Key file** (with Browse...), the **Password** source (below) and the **Jump host** (see [Jump hosts](#jump-hosts)). A Mosh terminal adds the **Mosh server** program and its **UDP ports** (see [Mosh](#mosh)). A serial console has the port, speed, framing and flow control instead.
+- **Connection**: **Name, Folder, Type**; the type is an SSH terminal, Mosh terminal, WinRM (PowerShell, cmd), Telnet (unencrypted), Serial console, Remote desktop (RDP) or VNC desktop. Then **Host, User, Port, Key file** (with Browse...), the **Password** source (below) and the **Jump host** (see [Jump hosts](#jump-hosts)). A Mosh terminal adds the **Mosh server** program and its **UDP ports** (see [Mosh](#mosh)). A WinRM connection has **Host, User, Port** and what it **Runs** (see [WinRM](#winrm-powershell-on-windows-servers)). A serial console has the port, speed, framing and flow control instead.
 - **Look** (a terminal's tab): theme, font, font size and scrollback.
 - **Extras** (a terminal's tab): tmux on or off, the tmux session to attach and its layout, the start directory, File transfer's Local and Remote folders, port forwards (such as `L 8080 localhost:80`), RDP and VNC ports, agent forwarding, Kerberos and passing a ticket on, older crypto, and the login script (see [Login scripts](#login-scripts)).
 
@@ -114,7 +114,7 @@ Host, user, port, key file, folders, PuTTY and KiTTY port forwards and jump host
 
 ## The session manager
 
-Ctrl+Shift+L lists the sessions that are open right now, in every tab: their host, kind (SSH, Mosh, Telnet, serial, tmux, desktop or local shell), tab and state (connected, connecting, reconnecting or ended), with notes such as tmux, forwards, logging or a jump host. It also shows the hidden sessions of a [multi-host script run](#runs-on-many-hosts). It is a Windows list with columns (session, kind, tab, state, details) and updates as sessions connect, drop and reconnect. Type to filter, Enter or a double-click goes to the session's tab and pane, F2 renames it in place, and Del closes it after asking. The Show, Rename and Close buttons below the list, and a right-click on a session, do the same.
+Ctrl+Shift+L lists the sessions that are open right now, in every tab: their host, kind (SSH, Mosh, WinRM, Telnet, serial, tmux, desktop or local shell), tab and state (connected, connecting, reconnecting or ended), with notes such as tmux, forwards, logging or a jump host. It also shows the hidden sessions of a [multi-host script run](#runs-on-many-hosts). It is a Windows list with columns (session, kind, tab, state, details) and updates as sessions connect, drop and reconnect. Type to filter, Enter or a double-click goes to the session's tab and pane, F2 renames it in place, and Del closes it after asking. The Show, Rename and Close buttons below the list, and a right-click on a session, do the same.
 
 The connection manager is for the hosts you *can* connect to; the session manager for the ones you *are* connected to.
 
@@ -137,6 +137,16 @@ Mosh keeps a terminal going when the network does not: on a laptop that moves be
 - The SSH connection stays open next to the Mosh session for File transfer and port forwards. A Mosh tab never shares its connection with another tab.
 - tmux integration needs an SSH terminal (Mosh sends screens, not the byte stream tmux control mode needs); run `tmux` in a Mosh pane as usual. ZMODEM does not work over Mosh for the same reason. Logs, themes, login scripts, scripts and broadcast input work.
 - Typing shows when the server echoes it; Mosh's local echo prediction is not in this version yet.
+
+## WinRM (PowerShell on Windows servers)
+
+A **WinRM** connection opens PowerShell (or cmd) on a Windows server through its WinRM service, the one `Enter-PSSession` and `winrs` use, on port 5985. Type `winrm://host`, `winrm://LAB\\admin@host` or `winrm host` at the connect prompt or on the command line, or make a connection of type *WinRM (PowerShell, cmd)*. *Runs* says what the shell starts: `powershell -NoLogo` unless you give another command, such as `cmd`.
+
+- **Login.** With a user name (`LAB\\admin`, or a local account such as `admin`) the pane asks for the password; with none, FeroSSH logs in as the Windows user it runs as. Windows picks Kerberos when the server is in your domain and you use its name, otherwise NTLM. The pane says which one it used. NTLM does not prove the server's identity, so use the server's domain name where you can.
+- **Encrypted.** Every message is encrypted with the login's keys, as Windows' own WinRM client does over HTTP; FeroSSH refuses any reply that is not. HTTPS (port 5986) comes in a later version.
+- **Lines, not a terminal.** WinRM's remote shell has no terminal, so FeroSSH edits the line you type and sends it on Enter. Backspace, Ctrl+U (clear the line), Up and Down (earlier lines) and Ctrl+C (interrupt the command) work; full-screen programs and tab completion do not. Errors show in red. When the command ends, Enter connects again.
+- On the server, WinRM must be on (`Enable-PSRemoting`, or `winrm quickconfig`) and your account allowed to use it (an administrator, or a member of *Remote Management Users*). A server with the Windows OpenSSH server is better reached over SSH, which gives a full terminal.
+- Logs, themes, fonts and splits work as for SSH tabs; SFTP, forwards, tmux, login scripts and broadcast input do not.
 
 ## Telnet and serial consoles
 

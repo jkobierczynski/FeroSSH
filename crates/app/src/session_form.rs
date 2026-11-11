@@ -117,6 +117,8 @@ pub struct Values {
     pub mosh_server: String,
     /// A Mosh session's UDP port or range, as `60001:60010`.
     pub mosh_ports: String,
+    /// What a WinRM session runs; empty is `powershell -NoLogo`.
+    pub winrm_command: String,
 }
 
 /// Asking, Windows, the password manager templates, then a command of
@@ -237,6 +239,7 @@ impl Values {
         (self.password, self.password_command) = password_choice(&p.password);
         self.login_script = p.login_script.iter().map(ToString::to_string).collect();
         self.mosh_server = p.mosh_server.clone().unwrap_or_default();
+        self.winrm_command = p.winrm_command.clone().unwrap_or_default();
         self.mosh_ports = p
             .mosh_ports
             .map(ferossh_config::settings::mosh_ports_text)
@@ -292,6 +295,7 @@ enum Field {
     Flow,
     MoshServer,
     MoshPorts,
+    WinrmCommand,
     LoginStep(usize),
 }
 
@@ -338,6 +342,7 @@ impl Field {
             Field::Flow => "Flow ctrl",
             Field::MoshServer => "Mosh server",
             Field::MoshPorts => "UDP ports",
+            Field::WinrmCommand => "Runs",
             Field::LoginStep(_) => "Login",
         }
     }
@@ -630,11 +635,21 @@ impl SessionForm {
                     out.push(Item::Note("Unencrypted: anyone on the way".into()));
                     out.push(Item::Note("can read it, passwords too.".into()));
                 }
+                SessionKind::WinRm => {
+                    out.push(Item::Field(Field::WinrmCommand));
+                    out.push(Item::Note("Kerberos or NTLM login, asks the".into()));
+                    out.push(Item::Note("password; empty user: your own.".into()));
+                    out.push(Item::Note("Lines go on Enter: no full screen.".into()));
+                }
             }
         }
         if matches!(
             kind,
-            SessionKind::Ssh | SessionKind::Mosh | SessionKind::Serial | SessionKind::Telnet
+            SessionKind::Ssh
+                | SessionKind::Mosh
+                | SessionKind::Serial
+                | SessionKind::Telnet
+                | SessionKind::WinRm
         ) {
             out.push(Item::Section(1));
             if open[1] {
@@ -784,6 +799,7 @@ impl SessionForm {
             Field::Speed => &v.speed,
             Field::MoshServer => &v.mosh_server,
             Field::MoshPorts => &v.mosh_ports,
+            Field::WinrmCommand => &v.winrm_command,
             Field::Type
             | Field::Theme
             | Field::Tmux
@@ -833,6 +849,7 @@ impl SessionForm {
             Field::Speed => &mut v.speed,
             Field::MoshServer => &mut v.mosh_server,
             Field::MoshPorts => &mut v.mosh_ports,
+            Field::WinrmCommand => &mut v.winrm_command,
             Field::Type
             | Field::Theme
             | Field::Tmux
@@ -864,6 +881,7 @@ impl SessionForm {
                 SessionKind::Serial => "Serial console",
                 SessionKind::Telnet => "Telnet (unencrypted)",
                 SessionKind::Mosh => "Mosh terminal (SSH + UDP)",
+                SessionKind::WinRm => "WinRM (PowerShell, cmd)",
                 SessionKind::Xvfb => "Virtual desktop (Xvfb)",
                 SessionKind::RemoteApp => "Remote app (FeroStream)",
             }
@@ -963,6 +981,7 @@ impl SessionForm {
                     SessionKind::Xvfb,
                     SessionKind::RemoteApp,
                     SessionKind::Mosh,
+                    SessionKind::WinRm,
                     SessionKind::Telnet,
                     SessionKind::Serial,
                 ];
@@ -1051,7 +1070,7 @@ impl SessionForm {
             Field::Host
                 if !matches!(
                     v.kind,
-                    SessionKind::Ssh | SessionKind::Mosh | SessionKind::Telnet
+                    SessionKind::Ssh | SessionKind::Mosh | SessionKind::Telnet | SessionKind::WinRm
                 ) && !v.via.trim().is_empty() =>
             {
                 "the Via SSH host itself".into()
@@ -1060,6 +1079,7 @@ impl SessionForm {
             Field::Host => v.name.trim().to_owned(),
             Field::User => match (v.kind, v.via.is_empty()) {
                 (SessionKind::Vnc, _) => "asked by the server".into(),
+                (SessionKind::WinRm, _) => "you, or e.g. LAB\\admin".into(),
                 (SessionKind::Rdp, true) => "asked by Windows".into(),
                 _ => h.local_user.clone(),
             },
@@ -1068,6 +1088,7 @@ impl SessionForm {
                 SessionKind::Rdp => "3389".into(),
                 SessionKind::Vnc => "5900".into(),
                 SessionKind::Telnet => "23".into(),
+                SessionKind::WinRm => ferossh_config::DEFAULT_WINRM_PORT.to_string(),
                 SessionKind::Serial | SessionKind::Xvfb | SessionKind::RemoteApp => String::new(),
             },
             Field::Speed => "9600 bits/s".into(),
@@ -1100,6 +1121,7 @@ impl SessionForm {
             Field::PasswordCommand => "program and arguments".into(),
             Field::MoshServer => "mosh-server, or a path to it".into(),
             Field::MoshPorts => "any in 60001-60999, or e.g. 60001:60010".into(),
+            Field::WinrmCommand => format!("{}, or cmd", ferossh_config::DEFAULT_WINRM_COMMAND),
             Field::Type
             | Field::Theme
             | Field::Tmux
@@ -1359,7 +1381,11 @@ impl SessionForm {
         }
         let via = v.via.trim();
         match v.kind {
-            SessionKind::Ssh | SessionKind::Mosh | SessionKind::Serial | SessionKind::Telnet => {}
+            SessionKind::Ssh
+            | SessionKind::Mosh
+            | SessionKind::Serial
+            | SessionKind::Telnet
+            | SessionKind::WinRm => {}
             SessionKind::Vnc if via.is_empty() => {
                 return Err(
                     "A VNC desktop goes through an SSH connection: fill in Via SSH.".into(),
@@ -1445,6 +1471,9 @@ impl SessionForm {
         }
         if v.remote_app.chars().any(char::is_control) {
             return Err("The remote app cannot hold control characters.".into());
+        }
+        if v.winrm_command.chars().any(char::is_control) {
+            return Err("The command cannot hold control characters.".into());
         }
         if v.kind == SessionKind::Mosh {
             let server = v.mosh_server.trim();
@@ -1846,6 +1875,16 @@ impl SessionForm {
                     hostname: serial::port_name(&v.host).filter(|h| *h != name),
                     ..SavedHost::default()
                 }
+            } else if v.kind == SessionKind::WinRm {
+                // A host, a user and a port; nothing of SSH.
+                SavedHost {
+                    alias: name.clone(),
+                    folder: trimmed(&v.folder),
+                    hostname: trimmed(&v.host).filter(|h| *h != name),
+                    user: trimmed(&v.user),
+                    port: v.port.trim().parse().ok().filter(|&p| p != 0),
+                    ..SavedHost::default()
+                }
             } else if v.kind == SessionKind::Telnet {
                 // A host and a port; no user, keys or forwards.
                 SavedHost {
@@ -1970,6 +2009,8 @@ impl SessionForm {
         p.mosh_server = trimmed(&v.mosh_server)
             .filter(|s| mosh && s != ferossh_config::settings::DEFAULT_MOSH_SERVER);
         p.mosh_ports = ferossh_config::settings::mosh_ports(&v.mosh_ports).filter(|_| mosh);
+        p.winrm_command = ferossh_config::settings::virtual_desktop(&v.winrm_command)
+            .filter(|c| v.kind == SessionKind::WinRm && c != ferossh_config::DEFAULT_WINRM_COMMAND);
         p.serial = is_serial.then(|| {
             let mut line = LineSettings {
                 flow: v.flow,
@@ -2480,12 +2521,62 @@ mod tests {
     }
 
     #[test]
+    fn winrm_sessions_save_a_host_user_port_and_command() {
+        let mut f = new_form();
+        typed(&mut f, "win-srv");
+        down(&mut f, 2);
+        // Type: SSH -> Serial -> Telnet -> WinRM, going back.
+        for _ in 0..3 {
+            f.key(SideKey::Left, 30);
+        }
+        assert_eq!(f.values.kind, SessionKind::WinRm);
+        let t = texts(&mut f);
+        assert!(t[4].contains("‹ WinRM (PowerShell, cmd) ›"), "{:?}", t[4]);
+        assert!(t.iter().any(|l| l.contains("Port") && l.contains("5985")));
+        assert!(
+            t.iter()
+                .any(|l| l.contains("Runs") && l.contains("powershell"))
+        );
+        assert!(t.iter().any(|l| l.contains("Look")));
+        assert!(
+            !t.iter()
+                .any(|l| l.contains("Key file") || l.contains("Extras"))
+        );
+        f.values.host = "win-srv.lab.test".into();
+        f.values.user = "LAB\\admin".into();
+        f.values.winrm_command = "cmd".into();
+        assert_eq!(f.check(), Ok(()));
+        let (mut hosts, mut settings) = (Vec::new(), Settings::default());
+        f.apply(&mut hosts, &mut settings);
+        assert_eq!(hosts[0].hostname.as_deref(), Some("win-srv.lab.test"));
+        assert_eq!(hosts[0].user.as_deref(), Some("LAB\\admin"));
+        assert!(hosts[0].identity_file.is_none() && hosts[0].forwards.is_empty());
+        let p = settings.profile("win-srv").unwrap();
+        assert_eq!(p.kind, SessionKind::WinRm);
+        assert_eq!(p.winrm_command.as_deref(), Some("cmd"));
+        // The default command is not written out.
+        f.values.winrm_command = ferossh_config::DEFAULT_WINRM_COMMAND.into();
+        f.apply(&mut hosts, &mut settings);
+        assert_eq!(settings.profile("win-srv").unwrap().winrm_command, None);
+        // Saved and read back, the user's backslash survives.
+        let text = ferossh_config::saved::to_text(&hosts);
+        let env = crate::ssh::Env {
+            home: std::env::temp_dir(),
+            local_user: "me".into(),
+            vars: Vec::new(),
+            config: text,
+        };
+        let t = crate::winrm::WinrmTarget::resolve("win-srv", &env, None).unwrap();
+        assert_eq!(t.user.as_deref(), Some("LAB\\admin"));
+    }
+
+    #[test]
     fn mosh_sessions_log_in_like_ssh_without_tmux() {
         let mut f = new_form();
         typed(&mut f, "laptop");
         down(&mut f, 2);
-        // Type: SSH -> Serial -> Telnet -> Mosh, going back.
-        for _ in 0..3 {
+        // Type: SSH -> Serial -> Telnet -> WinRM -> Mosh, going back.
+        for _ in 0..4 {
             f.key(SideKey::Left, 30);
         }
         assert_eq!(f.values.kind, SessionKind::Mosh);
@@ -2838,7 +2929,7 @@ mod tests {
         assert_eq!(row(&rows, "tmux").section, 2);
         assert!(rows.iter().any(|r| r.kind == NativeKind::Browse));
         let (options, selected) = choice(row(&rows, "Type"));
-        assert_eq!(options.len(), 8);
+        assert_eq!(options.len(), 9);
         assert_eq!(options[selected], "SSH terminal");
         let (options, _) = choice(row(&rows, "Theme"));
         assert_eq!(options, ["by theme rules", "Nord", "Dracula"]);

@@ -40,6 +40,10 @@ X11 forwarding is off unless a host turns it on, because X programs on the serve
 
 Telnet sends everything in the clear, passwords included. FeroSSH offers it only for old gear that has nothing better: the pane says so when it connects and the tab carries a red **⚠ telnet** badge. The Telnet connection runs in a sandboxed worker like SSH, agrees to only a handful of options, and never sends your user name or environment.
 
+## WinRM
+
+A WinRM connection's password and its login (Kerberos or NTLM, through Windows' SSPI) stay in the FeroSSH window. The sandboxed worker that talks to the server only passes the login's tokens along and asks the window to encrypt each request and decrypt each reply, so it never sees the password or the keys. Every message is encrypted, and a reply that is not is refused, whatever it says. The HTTP, encryption framing, SOAP and XML parsers run in the worker and are fuzz-tested; the XML reader accepts no DTDs. NTLM, which Windows falls back to outside a domain or for a server named by address, does not prove the server's identity: the pane says so. FeroSSH never delegates your credentials to the server (no CredSSP).
+
 ## Mosh
 
 A Mosh connection logs in with SSH, with the usual host key check, and only then starts `mosh-server`. The session key it prints comes back over that SSH connection; after that the terminal goes over UDP, encrypted and authenticated with AES-128-OCB, so nobody on the way can read or change it. FeroSSH parses the server's packets and screens in the sandboxed worker, and those parsers are fuzz-tested. The UDP ports have to be open on the host, which widens what the host exposes: narrow them with *UDP ports* if you can.

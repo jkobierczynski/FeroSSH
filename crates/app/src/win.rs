@@ -158,6 +158,7 @@ use crate::toolpane::{self, RailItem};
 use crate::ui_colours::{self, UiColours};
 use crate::ui_theme;
 use crate::vdesk;
+use crate::winrm::{WinrmSession, WinrmTarget};
 use crate::zmodem;
 use ferossh_tmuxcc::saved as tmux_saved;
 use zeroize::Zeroizing;
@@ -485,7 +486,7 @@ enum Typed {
 }
 
 /// The prompt shown when no host was given.
-const CONNECT_PROMPT: &str = "\x1b[0mConnect to (user@host[:port], a Host from ~/.ssh/config, telnet://host[:port], or a COM port such as COM3:115200; Ctrl+Shift+S lists them): ";
+const CONNECT_PROMPT: &str = "\x1b[0mConnect to (user@host[:port], a Host from ~/.ssh/config, telnet://host[:port], winrm://[user@]host[:port], or a COM port such as COM3:115200; Ctrl+Shift+S lists them): ";
 
 /// What a pane is connected to.
 enum Host {
@@ -526,6 +527,9 @@ enum Host {
     },
     /// An unencrypted Telnet session, run by a worker of its own.
     Telnet(Box<TelnetSession>),
+    /// A WinRM shell (PowerShell or cmd on Windows), run by a worker of
+    /// its own.
+    Winrm(Box<WinrmSession>),
 }
 
 /// A worker process, the pipes to it, and the forwarding engine that
@@ -647,6 +651,7 @@ impl Pane {
             Host::Tmux { label, .. } | Host::Desktop { label, .. } => label.clone(),
             Host::Serial { target, .. } => target.label(),
             Host::Telnet(s) => s.target.label(),
+            Host::Winrm(s) => s.target.label(),
         }
     }
 
@@ -663,6 +668,11 @@ impl Pane {
                 State::Blocked | State::Ended => Health::Idle,
             },
             Host::Telnet(s) => match s.state() {
+                State::Connected => Health::Connected,
+                State::Connecting => Health::Connecting,
+                State::Blocked | State::Ended => Health::Idle,
+            },
+            Host::Winrm(s) => match s.state() {
                 State::Connected => Health::Connected,
                 State::Connecting => Health::Connecting,
                 State::Blocked | State::Ended => Health::Idle,
@@ -2489,6 +2499,7 @@ impl Window {
         self.panes.values().find_map(|p| match &p.host {
             Host::Ssh(s) if s.owns(channel) => Some(p.id),
             Host::Telnet(s) if s.channel == channel => Some(p.id),
+            Host::Winrm(s) if s.channel == channel => Some(p.id),
             _ => None,
         })
     }
@@ -2904,6 +2915,7 @@ impl Window {
         let effects = match self.panes.get_mut(&id).map(|p| &mut p.host) {
             Some(Host::Ssh(session)) => session.close(),
             Some(Host::Telnet(session)) => session.close(),
+            Some(Host::Winrm(session)) => session.close(),
             _ => Vec::new(),
         };
         self.apply(id, effects);
@@ -3081,6 +3093,7 @@ impl Window {
                     notes.push("unencrypted");
                     (live::Kind::Telnet, s.target.label(), state(s.state()))
                 }
+                Host::Winrm(s) => (live::Kind::WinRm, s.target.label(), state(s.state())),
                 Host::Serial { port, target, .. } => (
                     live::Kind::Serial,
                     target.label(),
@@ -3405,6 +3418,10 @@ impl Window {
                     && matches!(s.state(), State::Connecting | State::Connected)
             }
             Host::Telnet(s) => {
+                s.connection() == connection
+                    && matches!(s.state(), State::Connecting | State::Connected)
+            }
+            Host::Winrm(s) => {
                 s.connection() == connection
                     && matches!(s.state(), State::Connecting | State::Connected)
             }
@@ -4887,6 +4904,16 @@ impl Window {
             self.connect_telnet(id, target);
             return;
         }
+        let winrm = match self.settings.profile(destination) {
+            Some(p) if p.kind == SessionKind::WinRm => {
+                WinrmTarget::resolve(destination, &env, p.winrm_command.as_deref())
+            }
+            _ => WinrmTarget::typed(destination),
+        };
+        if let Some(target) = winrm {
+            self.connect_winrm(id, target);
+            return;
+        }
         let target = match Target::resolve_route(destination, &env) {
             Ok(t) => t,
             Err(why) => {
@@ -5098,6 +5125,38 @@ impl Window {
         self.refresh(id);
     }
 
+    /// Opens WinRM session `target` in pane `id`, in a worker of its own
+    /// that parses everything the server sends; the login and the
+    /// encryption run on the broker.
+    fn connect_winrm(&mut self, id: PaneId, target: WinrmTarget) {
+        self.end_host(id);
+        if let Some(p) = self.panes.get_mut(&id) {
+            p.term.scroll_to_bottom();
+        }
+        let channel = self.new_channel();
+        if !self.ensure_broker(id) || !self.ensure_worker(id, channel) {
+            self.refresh(id);
+            return;
+        }
+        if !self.sandbox {
+            self.show(
+                id,
+                "\x1b[0;31mThe WinRM worker runs without its sandbox (--no-sandbox).\x1b[0m\r\n",
+            );
+        }
+        self.apply_look(id, &target.alias, &target.hostname, target.tag.as_deref());
+        let mut session = WinrmSession::new(channel, target);
+        let effects = session.start();
+        let Some(p) = self.panes.get_mut(&id) else {
+            return;
+        };
+        p.host = Host::Winrm(Box::new(session));
+        self.apply(id, effects);
+        self.update_title();
+        self.refresh_chrome();
+        self.refresh(id);
+    }
+
     /// Gives a pane the font, size, theme and scrollback its host's
     /// profile and the theme rules pick.
     fn apply_look(&mut self, id: PaneId, alias: &str, hostname: &str, tag: Option<&str>) {
@@ -5139,6 +5198,11 @@ impl Window {
             Some(Host::Telnet(s)) => {
                 let target = s.target.clone();
                 self.connect_telnet(id, target);
+                return;
+            }
+            Some(Host::Winrm(s)) => {
+                let target = s.target.clone();
+                self.connect_winrm(id, target);
                 return;
             }
             _ => None,
@@ -5338,6 +5402,7 @@ impl Window {
                     let connection = match self.panes.get(&id).map(|p| &p.host) {
                         Some(Host::Ssh(s)) => s.worker_for(msg.channel()),
                         Some(Host::Telnet(s)) => Some(s.connection()),
+                        Some(Host::Winrm(s)) => Some(s.connection()),
                         _ => None,
                     };
                     if let Some(w) = connection.and_then(|c| self.workers.get(&c)) {
@@ -5383,8 +5448,14 @@ impl Window {
                         _ => 0,
                     };
                     if let Some(b) = &self.broker {
-                        // Kerberos answers out of order, by login.
-                        if !matches!(job, ferossh_auth::Job::Gssapi(_)) {
+                        // Kerberos and WinRM's SSPI answer out of order,
+                        // by login.
+                        if !matches!(
+                            job,
+                            ferossh_auth::Job::Gssapi(_)
+                                | ferossh_auth::Job::Sspi(_)
+                                | ferossh_auth::Job::SspiEnd(_)
+                        ) {
                             self.broker_jobs.push_back(BrokerFor::Login(channel));
                         }
                         b.submit(job);
@@ -5414,6 +5485,14 @@ impl Window {
                             self.begin_run_snippet(id);
                         }
                     }
+                }
+                Effect::Connected
+                    if matches!(self.panes.get(&id).map(|p| &p.host), Some(Host::Winrm(_))) =>
+                {
+                    // Nothing of SSH (SFTP, forwards, tmux, desktops) and
+                    // no login script: the line goes whole on Enter.
+                    self.start_log(id);
+                    self.refresh_chrome();
                 }
                 Effect::Connected if self.unencrypted(id) => {
                     // Nothing of SSH (SFTP, forwards, tmux, desktops)
@@ -6163,6 +6242,7 @@ impl Window {
         let label = match &p.host {
             Host::Ssh(s) if s.state() == State::Connected => s.target.label(),
             Host::Telnet(s) if s.state() == State::Connected => s.target.label(),
+            Host::Winrm(s) if s.state() == State::Connected => s.target.label(),
             Host::Local { exited: false, .. } => "local".to_owned(),
             Host::Tmux { label, .. } => label.clone(),
             Host::Serial {
@@ -6314,6 +6394,7 @@ impl Window {
             }
             Some(Host::Ssh(session)) if !session.prompt_active() => session.input(&bytes),
             Some(Host::Telnet(session)) => session.input(&bytes),
+            Some(Host::Winrm(session)) => session.input(&bytes),
             Some(Host::Serial {
                 port: Some(port), ..
             }) => {
@@ -6434,7 +6515,16 @@ impl Window {
                     self.reconnect(id);
                 }
             }
-            Host::Ssh(_) | Host::Tmux { .. } | Host::Serial { .. } | Host::Telnet(_) => {
+            Host::Winrm(session) if session.state() == State::Ended => {
+                if enter {
+                    self.reconnect(id);
+                }
+            }
+            Host::Ssh(_)
+            | Host::Tmux { .. }
+            | Host::Serial { .. }
+            | Host::Telnet(_)
+            | Host::Winrm(_) => {
                 self.send(id, bytes);
             }
         }
@@ -6458,6 +6548,7 @@ impl Window {
             | Host::Serial { port: Some(_), .. } => true,
             Host::Ssh(s) => s.state() == State::Connected && !s.prompt_active(),
             Host::Telnet(s) => s.state() == State::Connected,
+            Host::Winrm(s) => s.state() == State::Connected,
             _ => false,
         }
     }
@@ -6622,7 +6713,8 @@ impl Window {
         // Kerberos, which says whose login it is.
         while let Some(reply) = self.broker.as_ref().and_then(Broker::try_recv) {
             let channel = match &reply {
-                ferossh_auth::Reply::Gssapi { login, .. } => *login,
+                ferossh_auth::Reply::Gssapi { login, .. }
+                | ferossh_auth::Reply::Sspi { login, .. } => *login,
                 _ => match self.broker_jobs.pop_front() {
                     Some(BrokerFor::Agent(what)) => {
                         let outs = self.agent_fwd.on_broker(what, reply);
@@ -6638,6 +6730,7 @@ impl Window {
             };
             let effects = match self.panes.get_mut(&id).map(|p| &mut p.host) {
                 Some(Host::Ssh(session)) => session.on_broker(reply),
+                Some(Host::Winrm(session)) => session.on_broker(reply),
                 _ => Vec::new(),
             };
             self.apply(id, effects);
@@ -6776,6 +6869,9 @@ impl Window {
                     Some(Host::Telnet(session)) if session.connection() == connection => {
                         session.on_worker(msg)
                     }
+                    Some(Host::Winrm(session)) if session.connection() == connection => {
+                        session.on_worker(msg)
+                    }
                     _ => Vec::new(),
                 };
                 self.apply(id, effects);
@@ -6825,6 +6921,18 @@ impl Window {
                             }
                         }
                         Some(Host::Telnet(session))
+                            if session.connection() == connection
+                                && matches!(
+                                    session.state(),
+                                    State::Connecting | State::Connected
+                                ) =>
+                        {
+                            session.on_worker(Message::Disconnected {
+                                channel: session.channel,
+                                reason: why.clone(),
+                            })
+                        }
+                        Some(Host::Winrm(session))
                             if session.connection() == connection
                                 && matches!(
                                     session.state(),
@@ -8895,6 +9003,9 @@ impl Window {
             Some(Host::Telnet(s)) if s.state() == State::Ended => {
                 Some(said().unwrap_or_else(|| "could not connect".into()))
             }
+            Some(Host::Winrm(s)) if s.state() == State::Ended => {
+                Some(said().unwrap_or_else(|| "could not connect or log in".into()))
+            }
             Some(_) => None,
             None => Some("the session was closed".to_owned()),
         };
@@ -10145,6 +10256,7 @@ impl Window {
         enum Like {
             Ssh(Box<Target>),
             Telnet(TelnetTarget),
+            Winrm(WinrmTarget),
             Local,
             Ask,
         }
@@ -10158,6 +10270,7 @@ impl Window {
         let like = match self.panes.get(&from).map(|p| &p.host) {
             Some(Host::Ssh(s)) => Like::Ssh(Box::new(s.target.clone())),
             Some(Host::Telnet(s)) => Like::Telnet(s.target.clone()),
+            Some(Host::Winrm(s)) => Like::Winrm(s.target.clone()),
             Some(Host::Local { .. }) => Like::Local,
             _ => Like::Ask,
         };
@@ -10169,6 +10282,7 @@ impl Window {
                 }
             }
             Like::Telnet(target) => self.connect_telnet(id, target),
+            Like::Winrm(target) => self.connect_winrm(id, target),
             Like::Local => self.start_shell_in(id, local_cwd.as_deref()),
             Like::Ask => self.ask_destination(id),
         }
@@ -11428,6 +11542,11 @@ impl Window {
                         session.close()
                     }
                     Some(Host::Telnet(session))
+                        if matches!(session.state(), State::Connecting | State::Connected) =>
+                    {
+                        session.close()
+                    }
+                    Some(Host::Winrm(session))
                         if matches!(session.state(), State::Connecting | State::Connected) =>
                     {
                         session.close()
@@ -12928,7 +13047,8 @@ impl Window {
             .filter(|p| {
                 let open = p.connected()
                     || matches!(p.host, Host::Serial { port: Some(_), .. })
-                    || matches!(&p.host, Host::Telnet(s) if s.state() == State::Connected);
+                    || matches!(&p.host, Host::Telnet(s) if s.state() == State::Connected)
+                    || matches!(&p.host, Host::Winrm(s) if s.state() == State::Connected);
                 open && (tab.is_some() || p.gateway().is_none())
             })
             .count()

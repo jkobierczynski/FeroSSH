@@ -135,6 +135,13 @@ doc = false
 bench = false
 
 [[bin]]
+name = "winrm_reply"
+path = "fuzz_targets/winrm_reply.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
 name = "zmodem_feed"
 path = "fuzz_targets/zmodem_feed.rs"
 test = false

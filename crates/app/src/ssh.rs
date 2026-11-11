@@ -1706,6 +1706,8 @@ impl SshSession {
                 ))),
                 self.gssapi_reply(GssReply::Failed),
             ],
+            // A WinRM session's; never an SSH login's.
+            Reply::Sspi { .. } => Vec::new(),
         }
     }
 
