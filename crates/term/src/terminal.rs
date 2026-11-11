@@ -157,6 +157,9 @@ pub struct InputMark {
     col: usize,
     /// The text before the mark on its row.
     prompt: String,
+    /// A right-hand prompt the row showed when the mark was made (what
+    /// followed the cursor before anything was typed), or empty.
+    right: String,
 }
 
 impl InputMark {
@@ -185,19 +188,23 @@ const INPUT_GAP: &str = "   ";
 /// one, `ZLE_RPROMPT_INDENT`).
 const RIGHT_PROMPT_INDENT: usize = 2;
 
-/// `text` (whole rows, to the right edge) without a right-hand prompt: the
-/// last run of text after a gap of [`INPUT_GAP`], when it ends at the
-/// right edge. A gap inside a command (`echo "a   b"`) stays.
-fn without_right_prompt(text: &str) -> &str {
-    let Some(i) = text.rfind(INPUT_GAP) else {
-        return text;
-    };
-    let tail = text.get(i..).unwrap_or("").trim_start();
-    let at_edge = text.len() - text.trim_end().len() <= RIGHT_PROMPT_INDENT;
-    if tail.is_empty() || !at_edge {
+/// `text` (whole rows, to the right edge) without the right-hand prompt
+/// `right` its row showed before typing started: when `text` ends with it,
+/// after a gap of [`INPUT_GAP`], at the right edge. Only a prompt seen
+/// there before typing is cut, so a gap inside a command (`echo "a   b"`)
+/// stays, even when it ends at the edge.
+fn without_right_prompt<'a>(text: &'a str, right: &str) -> &'a str {
+    if right.is_empty() {
         return text;
     }
-    text.get(..i).unwrap_or(text)
+    let t = text.trim_end();
+    if text.len() - t.len() > RIGHT_PROMPT_INDENT {
+        return text;
+    }
+    match t.strip_suffix(right) {
+        Some(head) if head.ends_with(INPUT_GAP) => head,
+        _ => text,
+    }
 }
 
 /// The most rows a command line read by [`Terminal::input_line`] spans.
@@ -1080,6 +1087,10 @@ impl Terminal {
             line: self.absolute(at.line)?,
             col,
             prompt: self.row_text(at.line, 0, col),
+            right: self
+                .row_text(at.line, col, grid.columns())
+                .trim()
+                .to_owned(),
         })
     }
 
@@ -1154,7 +1165,9 @@ impl Terminal {
         }
         Some(InputLine {
             before,
-            after: without_right_prompt(&rest).trim_end().to_owned(),
+            after: without_right_prompt(&rest, &mark.right)
+                .trim_end()
+                .to_owned(),
         })
     }
 
@@ -1229,7 +1242,11 @@ impl Terminal {
             rows += 1;
             text.push_str(&self.row_text(line, 0, cols));
         }
-        Some(without_right_prompt(&text).trim_end().to_owned())
+        Some(
+            without_right_prompt(&text, &mark.right)
+                .trim_end()
+                .to_owned(),
+        )
     }
 
     /// The text of grid line `line` from column `from` to before `to`,
