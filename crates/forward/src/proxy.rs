@@ -84,8 +84,8 @@ pub struct Client {
     kind: Kind,
     host: String,
     port: u16,
-    user: String,
-    password: Zeroizing<String>,
+    /// The user name and its password, when the proxy wants a login.
+    auth: Option<(String, Zeroizing<String>)>,
     state: State,
     buf: Vec<u8>,
     /// HTTP: how far [`Client::buf`] was searched for the empty line.
@@ -98,7 +98,7 @@ impl std::fmt::Debug for Client {
             .field("kind", &self.kind)
             .field("host", &self.host)
             .field("port", &self.port)
-            .field("user", &self.user)
+            .field("user", &self.auth.as_ref().map(|(u, _)| u))
             .field("state", &self.state)
             .finish_non_exhaustive()
     }
@@ -165,30 +165,28 @@ fn socks_error(code: u8) -> &'static str {
 }
 
 impl Client {
-    /// A handshake to reach `host`:`port` through a proxy of `kind`;
-    /// `user` empty means no authentication. `None` when `host` could not
-    /// be sent ([`valid_host`]) or, for SOCKS 5, the user name or password
-    /// is longer than 255 bytes.
-    pub fn new(kind: Kind, host: &str, port: u16, user: &str, password: &str) -> Option<Self> {
+    /// A handshake to reach `host`:`port` through a proxy of `kind`,
+    /// logging in with `login` (a user name and its password) when given.
+    /// `None` when `host` could not be sent ([`valid_host`]), or the user
+    /// name could not: a control character, a colon for HTTP (Basic
+    /// authentication cannot carry one), or for SOCKS 5 more than 255
+    /// bytes in either.
+    pub fn new(kind: Kind, host: &str, port: u16, login: Option<(&str, &str)>) -> Option<Self> {
         if !valid_host(host) || port == 0 {
             return None;
         }
-        if kind == Kind::Socks5 && (user.len() > 255 || password.len() > 255) {
-            return None;
-        }
-        if kind == Kind::Http && user.contains(':') {
-            // Basic authentication cannot carry a colon in the user name.
-            return None;
-        }
-        if user.chars().any(char::is_control) {
-            return None;
+        if let Some((name, word)) = login {
+            let too_long = kind == Kind::Socks5 && (name.len() > 255 || word.len() > 255);
+            let colon = kind == Kind::Http && name.contains(':');
+            if name.is_empty() || too_long || colon || name.chars().any(char::is_control) {
+                return None;
+            }
         }
         Some(Self {
             kind,
             host: host.to_owned(),
             port,
-            user: user.to_owned(),
-            password: Zeroizing::new(password.to_owned()),
+            auth: login.map(|(name, word)| (name.to_owned(), Zeroizing::new(word.to_owned()))),
             state: State::Done,
             buf: Vec::new(),
             scanned: 0,
@@ -202,7 +200,7 @@ impl Client {
         match self.kind {
             Kind::Socks5 => {
                 self.state = State::Method;
-                if self.user.is_empty() {
+                if self.auth.is_none() {
                     vec![5, 1, 0]
                 } else {
                     // Offer both: a proxy that needs none picks none.
@@ -216,11 +214,11 @@ impl Client {
                     _ => format!("{}:{}", self.host, self.port),
                 };
                 let mut req = format!("CONNECT {target} HTTP/1.1\r\nHost: {target}\r\n");
-                if !self.user.is_empty() {
-                    let mut pair = Vec::with_capacity(self.user.len() + self.password.len() + 1);
-                    pair.extend_from_slice(self.user.as_bytes());
+                if let Some((name, word)) = &self.auth {
+                    let mut pair = Vec::with_capacity(name.len() + word.len() + 1);
+                    pair.extend_from_slice(name.as_bytes());
                     pair.push(b':');
-                    pair.extend_from_slice(self.password.as_bytes());
+                    pair.extend_from_slice(word.as_bytes());
                     req.push_str("Proxy-Authorization: Basic ");
                     req.push_str(&base64(&pair));
                     req.push_str("\r\n");
@@ -296,17 +294,18 @@ impl Client {
         self.buf.drain(..2);
         match method {
             0 => Some(Step::Send(self.connect5())),
-            2 if !self.user.is_empty() => {
+            2 if self.auth.is_some() => {
                 self.state = State::Auth;
-                let mut out = Vec::with_capacity(3 + self.user.len() + self.password.len());
+                let (name, word) = self.auth.as_ref()?;
+                let mut out = Vec::with_capacity(3 + name.len() + word.len());
                 out.push(1);
-                out.push(self.user.len() as u8);
-                out.extend_from_slice(self.user.as_bytes());
-                out.push(self.password.len() as u8);
-                out.extend_from_slice(self.password.as_bytes());
+                out.push(name.len() as u8);
+                out.extend_from_slice(name.as_bytes());
+                out.push(word.len() as u8);
+                out.extend_from_slice(word.as_bytes());
                 Some(Step::Send(out))
             }
-            0xff if self.user.is_empty() => Some(Step::AuthFailed(
+            0xff if self.auth.is_none() => Some(Step::AuthFailed(
                 "The SOCKS proxy wants a user name and password.".into(),
             )),
             _ => Some(Step::Failed(
@@ -429,7 +428,7 @@ impl Client {
         let text = printable(line, MAX_STATUS_TEXT);
         match code.first() {
             Some(b'2') => Some(Step::Open { rest }),
-            _ if code == b"407" => Some(Step::AuthFailed(if self.user.is_empty() {
+            _ if code == b"407" => Some(Step::AuthFailed(if self.auth.is_none() {
                 format!("The HTTP proxy wants a user name and password ({text}).")
             } else {
                 format!("The HTTP proxy refused the user name or password ({text}).")
@@ -484,7 +483,7 @@ mod tests {
 
     #[test]
     fn socks5_without_login_sends_the_name_for_the_proxy_to_look_up() {
-        let mut c = Client::new(Kind::Socks5, "srv.example", 22, "", "").unwrap();
+        let mut c = Client::new(Kind::Socks5, "srv.example", 22, None).unwrap();
         let reply = [
             &[5, 0][..],
             &[5, 0, 0, 1, 10, 0, 0, 1, 0x1f, 0x90],
@@ -502,7 +501,7 @@ mod tests {
 
     #[test]
     fn socks5_with_login_and_addresses() {
-        let mut c = Client::new(Kind::Socks5, "2001:db8::1", 2222, "me", "pw").unwrap();
+        let mut c = Client::new(Kind::Socks5, "2001:db8::1", 2222, Some(("me", "pw"))).unwrap();
         let mut reply = vec![5, 2, 1, 0, 5, 0, 0, 3, 3];
         reply.extend_from_slice(b"abc");
         reply.extend_from_slice(&[0, 1]);
@@ -518,7 +517,7 @@ mod tests {
         assert_eq!(sent, want);
         assert_eq!(step, Step::Open { rest: Vec::new() });
 
-        let mut c = Client::new(Kind::Socks5, "192.0.2.7", 22, "", "").unwrap();
+        let mut c = Client::new(Kind::Socks5, "192.0.2.7", 22, None).unwrap();
         let start = c.start();
         assert_eq!(start, [5, 1, 0]);
         assert_eq!(
@@ -539,18 +538,18 @@ mod tests {
 
     #[test]
     fn socks5_refusals_are_worded() {
-        let mut c = Client::new(Kind::Socks5, "h", 22, "me", "bad").unwrap();
+        let mut c = Client::new(Kind::Socks5, "h", 22, Some(("me", "bad"))).unwrap();
         let (_, step) = run(&mut c, &[5, 2, 1, 1]);
         assert!(
             matches!(step, Step::AuthFailed(ref t) if t.contains("refused")),
             "{step:?}"
         );
 
-        let mut c = Client::new(Kind::Socks5, "h", 22, "", "").unwrap();
+        let mut c = Client::new(Kind::Socks5, "h", 22, None).unwrap();
         let (_, step) = run(&mut c, &[5, 0xff]);
         assert!(matches!(step, Step::AuthFailed(_)), "{step:?}");
 
-        let mut c = Client::new(Kind::Socks5, "h", 22, "", "").unwrap();
+        let mut c = Client::new(Kind::Socks5, "h", 22, None).unwrap();
         let (_, step) = run(&mut c, &[5, 0, 5, 5, 0, 1]);
         assert_eq!(
             step,
@@ -560,11 +559,11 @@ mod tests {
             )
         );
 
-        let mut c = Client::new(Kind::Socks5, "h", 22, "", "").unwrap();
+        let mut c = Client::new(Kind::Socks5, "h", 22, None).unwrap();
         let (_, step) = run(&mut c, b"HTTP/1.1 400 Bad");
         assert!(matches!(step, Step::Failed(_)), "{step:?}");
 
-        let mut c = Client::new(Kind::Socks5, "h", 22, "", "").unwrap();
+        let mut c = Client::new(Kind::Socks5, "h", 22, None).unwrap();
         let (_, step) = run(&mut c, &[5, 0, 5, 0, 0, 9]);
         assert!(
             matches!(step, Step::Failed(ref t) if t.contains("address type")),
@@ -574,7 +573,13 @@ mod tests {
 
     #[test]
     fn http_connect_with_basic_login() {
-        let mut c = Client::new(Kind::Http, "srv.example", 22, "Aladdin", "open sesame").unwrap();
+        let mut c = Client::new(
+            Kind::Http,
+            "srv.example",
+            22,
+            Some(("Aladdin", "open sesame")),
+        )
+        .unwrap();
         let reply = b"HTTP/1.1 200 Connection established\r\nVia: x\r\n\r\nSSH-2.0-x";
         let (sent, step) = run(&mut c, reply);
         assert_eq!(
@@ -584,7 +589,7 @@ mod tests {
         );
         assert_eq!(step, Step::Open { rest: Vec::new() });
 
-        let mut c = Client::new(Kind::Http, "::1", 22, "", "").unwrap();
+        let mut c = Client::new(Kind::Http, "::1", 22, None).unwrap();
         assert!(
             String::from_utf8(c.start())
                 .unwrap()
@@ -601,7 +606,7 @@ mod tests {
 
     #[test]
     fn http_refusals_are_worded_and_bounded() {
-        let mut c = Client::new(Kind::Http, "h", 22, "", "").unwrap();
+        let mut c = Client::new(Kind::Http, "h", 22, None).unwrap();
         let (_, step) = run(
             &mut c,
             b"HTTP/1.1 407 Proxy Authentication Required\r\n\r\n",
@@ -611,14 +616,14 @@ mod tests {
             "{step:?}"
         );
 
-        let mut c = Client::new(Kind::Http, "h", 22, "u", "p").unwrap();
+        let mut c = Client::new(Kind::Http, "h", 22, Some(("u", "p"))).unwrap();
         let (_, step) = run(&mut c, b"HTTP/1.1 407 No\r\n\r\n");
         assert!(
             matches!(step, Step::AuthFailed(ref t) if t.contains("refused")),
             "{step:?}"
         );
 
-        let mut c = Client::new(Kind::Http, "h", 22, "", "").unwrap();
+        let mut c = Client::new(Kind::Http, "h", 22, None).unwrap();
         let (_, step) = run(&mut c, b"HTTP/1.1 403 Forbidden \x1b[31m\r\n\r\n");
         assert_eq!(
             step,
@@ -627,14 +632,14 @@ mod tests {
             )
         );
 
-        let mut c = Client::new(Kind::Http, "h", 22, "", "").unwrap();
+        let mut c = Client::new(Kind::Http, "h", 22, None).unwrap();
         let (_, step) = run(&mut c, b"SSH-2.0-OpenSSH\r\n\r\n");
         assert!(
             matches!(step, Step::Failed(ref t) if t.contains("not an HTTP")),
             "{step:?}"
         );
 
-        let mut c = Client::new(Kind::Http, "h", 22, "", "").unwrap();
+        let mut c = Client::new(Kind::Http, "h", 22, None).unwrap();
         let _ = c.start();
         let mut step = Step::Send(Vec::new());
         for _ in 0..=MAX_HTTP_REPLY {
@@ -651,19 +656,19 @@ mod tests {
 
     #[test]
     fn hosts_and_users_that_could_inject_are_refused() {
-        assert!(Client::new(Kind::Http, "h\r\nX: y", 22, "", "").is_none());
-        assert!(Client::new(Kind::Http, "h x", 22, "", "").is_none());
-        assert!(Client::new(Kind::Http, "", 22, "", "").is_none());
-        assert!(Client::new(Kind::Http, "h", 0, "", "").is_none());
-        assert!(Client::new(Kind::Http, "h", 22, "a:b", "").is_none());
-        assert!(Client::new(Kind::Http, "h", 22, "a\nb", "").is_none());
-        assert!(Client::new(Kind::Socks5, "h", 22, &"u".repeat(256), "").is_none());
-        assert!(Client::new(Kind::Socks5, &"h".repeat(256), 22, "", "").is_none());
+        assert!(Client::new(Kind::Http, "h\r\nX: y", 22, None).is_none());
+        assert!(Client::new(Kind::Http, "h x", 22, None).is_none());
+        assert!(Client::new(Kind::Http, "", 22, None).is_none());
+        assert!(Client::new(Kind::Http, "h", 0, None).is_none());
+        assert!(Client::new(Kind::Http, "h", 22, Some(("a:b", ""))).is_none());
+        assert!(Client::new(Kind::Http, "h", 22, Some(("a\nb", ""))).is_none());
+        assert!(Client::new(Kind::Socks5, "h", 22, Some((&"u".repeat(256), ""))).is_none());
+        assert!(Client::new(Kind::Socks5, &"h".repeat(256), 22, None).is_none());
     }
 
     #[test]
     fn feeding_after_the_end_fails() {
-        let mut c = Client::new(Kind::Socks5, "h", 22, "", "").unwrap();
+        let mut c = Client::new(Kind::Socks5, "h", 22, None).unwrap();
         let _ = c.start();
         let _ = c.feed(&[5, 0xff]);
         assert_eq!(c.wants(), 0);

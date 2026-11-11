@@ -1195,13 +1195,20 @@ async fn through_proxy(
         ProxyKind::Socks5 => proxy::Kind::Socks5,
         ProxyKind::Http => proxy::Kind::Http,
     };
-    let password = proxy.password.0.first().map(String::as_str).unwrap_or("");
-    let mut client =
-        proxy::Client::new(kind, host, port, &proxy.user, password).ok_or_else(|| {
-            ProxyError::Other(format!(
-                "FeroSSH cannot ask a proxy for {host} with that user name."
-            ))
-        })?;
+    // No login without a user; a missing password is an empty one.
+    let login = (!proxy.user.is_empty()).then(|| {
+        let word = proxy
+            .password
+            .0
+            .first()
+            .map_or(Default::default(), String::as_str);
+        (proxy.user.as_str(), word)
+    });
+    let mut client = proxy::Client::new(kind, host, port, login).ok_or_else(|| {
+        ProxyError::Other(format!(
+            "FeroSSH cannot ask a proxy for {host} with that user name."
+        ))
+    })?;
     let mut tcp = connect_tcp(&proxy.host, proxy.port, family)
         .await
         .map_err(|e| {

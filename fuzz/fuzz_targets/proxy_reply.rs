@@ -14,9 +14,9 @@ fuzz_target!(|data: &[u8]| {
         return;
     };
     let kind = if mode & 1 == 0 { Kind::Socks5 } else { Kind::Http };
-    let (user, password) = if mode & 2 == 0 { ("", "") } else { ("me", "pw") };
+    let login = (mode & 2 != 0).then_some(("me", "pw"));
     let host = if mode & 4 == 0 { "host.example" } else { "2001:db8::1" };
-    let Some(mut client) = Client::new(kind, host, 22, user, password) else {
+    let Some(mut client) = Client::new(kind, host, 22, login) else {
         panic!("a valid request was refused");
     };
 
