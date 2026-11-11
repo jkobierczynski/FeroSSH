@@ -5040,6 +5040,11 @@ impl Window {
             let hops = session.hop_connections();
             for &hop in &hops {
                 if !self.ensure_worker(id, hop) {
+                    // No host after all: its rules go too.
+                    if let Some(p) = self.panes.get_mut(&id) {
+                        p.hl_host = None;
+                    }
+                    self.apply_highlight(id, false);
                     self.refresh(id);
                     return;
                 }
