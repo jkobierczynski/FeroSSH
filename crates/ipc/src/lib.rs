@@ -2313,9 +2313,10 @@ impl<'a> Reader<'a> {
                     server: r.string()?,
                     ports: r.opt(|r| Ok((r.u16()?, r.u16()?)))?,
                     predict: match r.u8()? {
+                        0 => MoshPredict::Adaptive,
                         1 => MoshPredict::Always,
                         2 => MoshPredict::Never,
-                        _ => MoshPredict::Adaptive,
+                        _ => return Err(Error::Invalid),
                     },
                 }))
             })?,
@@ -3028,6 +3029,33 @@ mod tests {
             assert_eq!(dec.next_message().unwrap(), Some(msg));
             assert_eq!(dec.next_message().unwrap(), None);
         }
+    }
+
+    #[test]
+    fn unknown_local_echo_mode_is_refused() {
+        // Found by the ipc_decode fuzz target: an unknown mode byte read as
+        // Adaptive, so the message did not re-encode to the same bytes.
+        let with = |predict| {
+            let mut msg = samples()
+                .into_iter()
+                .find(|m| matches!(m, Message::Connect { options, .. } if options.mosh.is_some()))
+                .unwrap();
+            if let Message::Connect { options, .. } = &mut msg {
+                options.mosh.as_mut().unwrap().predict = predict;
+            }
+            let mut wire = Vec::new();
+            encode(&msg, &mut wire).unwrap();
+            wire
+        };
+        let mut wire = with(MoshPredict::Never);
+        let always = with(MoshPredict::Always);
+        let at = wire.iter().zip(&always).position(|(a, b)| a != b).unwrap();
+        let byte = wire.get_mut(at).unwrap();
+        assert_eq!((*byte, always.get(at)), (2, Some(&1)));
+        *byte = 3;
+        let mut dec = Decoder::new();
+        dec.feed(&wire);
+        assert!(dec.next_message().is_err());
     }
 
     #[test]
