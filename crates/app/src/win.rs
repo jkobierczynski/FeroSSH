@@ -12227,17 +12227,31 @@ impl Window {
                 _ => None,
             })
             .collect();
-        let mut closed = false;
+        let mut closed = Vec::new();
         for (key, remote) in &mut self.sftp {
             if let Some(conn) = remote.connection()
                 && !live.iter().any(|(k, c)| k == key && *c == conn)
             {
                 remote.close();
-                closed = true;
+                closed.push(key.clone());
             }
         }
-        if closed {
-            self.flush_sftp();
+        if closed.is_empty() {
+            return;
+        }
+        self.flush_sftp();
+        // Another login to the same host (two SFTP-only tabs never share
+        // one) takes the queue over, so it carries on without a refresh.
+        for key in closed {
+            let heir = self.panes.iter().find_map(|(&id, p)| match &p.host {
+                Host::Ssh(s) if s.state() == State::Connected && sftp_key(&s.target) == key => {
+                    Some(id)
+                }
+                _ => None,
+            });
+            if let Some(id) = heir {
+                self.ensure_sftp(id);
+            }
         }
     }
 
@@ -12297,7 +12311,14 @@ impl Window {
         }
         if host_changed || self.files_pane != Some(id) {
             self.files_pane = Some(id);
-            let alias = self.pane_alias(id);
+            // Two `sftp://` addresses for one login differ by folder.
+            let folder = match self.panes.get(&self.host_pane(id)).map(|p| &p.host) {
+                Some(Host::Ssh(s)) => s.target.sftp_folder.clone(),
+                _ => None,
+            };
+            let alias = self
+                .pane_alias(id)
+                .map(|a| folder.map_or_else(|| a.clone(), |f| format!("{a} {f}")));
             let alias_changed = alias != self.files_alias_shown;
             self.files_alias_shown = alias;
             // Another connection to a host already listed: its own Remote
@@ -12794,6 +12815,18 @@ impl Window {
         }
         if let Some(cwd) = self.panes.get(&id).and_then(|p| p.cwd.clone()) {
             return cwd;
+        }
+        // No shell reports a folder on an SFTP-only login: the folder File
+        // transfer shows, else the one it started in.
+        if self.sftp_only(id) {
+            if let Some(r) = remote
+                && !r.listing.path.is_empty()
+            {
+                return r.listing.path.clone();
+            }
+            if let Some(folder) = self.remote_folder(id) {
+                return folder.into_bytes();
+            }
         }
         remote
             .and_then(|r| r.home.clone())
