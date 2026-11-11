@@ -2,11 +2,13 @@
 //! resizes, scrolling, selection, search and the user's keys and mouse in
 //! between. It must never panic, titles must come out sanitised, and
 //! replies to the host must be plain ASCII escape sequences, never echoes
-//! of host-chosen text.
+//! of host-chosen text. Half the runs also watch for a stop pattern and
+//! highlight keywords, which count and hold lines as output scrolls.
 
 #![no_main]
 
 use ferossh_render::Grid;
+use ferossh_term::highlight::{Highlighter, Rule, Style};
 use ferossh_term::{Action, Key, Mods, MouseButton, MouseEvent, SelectionKind, Settings, Terminal};
 use libfuzzer_sys::fuzz_target;
 
@@ -15,6 +17,18 @@ fuzz_target!(|data: &[u8]| {
         return;
     };
     let mut t = Terminal::new(20, 6, &Settings::new(50));
+    if split & 1 == 1 {
+        let _ = t.set_stop_pattern(Some("a[b ]+c"));
+        let (h, _) = Highlighter::new(&[Rule {
+            pattern: r"(?i)\berr(or)?\b|[0-9]+\.[0-9]+".into(),
+            style: Style {
+                fg: Some(ferossh_render::Color::Indexed(9)),
+                bold: true,
+                ..Style::default()
+            },
+        }]);
+        t.set_highlighter(h.map(std::rc::Rc::new));
+    }
     let mut grid = Grid::new(1, 1);
     for (i, chunk) in stream.chunks(usize::from(split % 64).max(1)).enumerate() {
         t.feed(chunk);

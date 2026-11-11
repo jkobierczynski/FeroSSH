@@ -122,6 +122,7 @@ use crate::forwards::{
 };
 use crate::fwd_panel;
 use crate::fwdview::{ForwardsView, FwdAction};
+use crate::highlight;
 use crate::import_reg;
 use crate::import_view::{Found, ImportAction, ImportView, Items};
 use crate::layout::{self, Axis, Closed, Dir, Drop, PaneId, Rect, Workspace};
@@ -384,6 +385,8 @@ mod cmd {
     pub const RIGHT_CLICK_PASTE: u32 = 505;
     pub const SAVE_SNIPPET: u32 = 506;
     pub const RECORD_SNIPPET: u32 = 507;
+    pub const HIGHLIGHT: u32 = 508;
+    pub const STOP_AT: u32 = 509;
     pub const SCROLL_PAGE_UP: u32 = 510;
     pub const SCROLL_PAGE_DOWN: u32 = 511;
     pub const SCROLL_TOP: u32 = 512;
@@ -593,6 +596,9 @@ struct Pane {
     /// The folder a local shell's cmd or PowerShell prompt shows, for
     /// new tabs and panes opened from it.
     local_cwd: Option<String>,
+    /// The host alias and name keyword highlighting picks its rules by;
+    /// none for a local shell or prompt.
+    hl_host: Option<(String, String)>,
 }
 
 impl Pane {
@@ -1839,6 +1845,7 @@ fn new_pane(
         no_broadcast: false,
         start_dir: None,
         local_cwd: None,
+        hl_host: None,
     }
 }
 
@@ -1894,6 +1901,7 @@ fn build_menu() -> Result<HMENU> {
         separator(session)?;
         item(session, cmd::VERIFY, "&Verify transfers (SHA-256)")?;
         item(session, cmd::ZMODEM, "&ZMODEM: answer rz and sz")?;
+        item(session, cmd::HIGHLIGHT, "Hi&ghlight keywords")?;
         separator(session)?;
         item(session, cmd::TMUX_ATTACH, "&Attach tmux")?;
         item(session, cmd::TMUX_PICK, "S&witch tmux session...")?;
@@ -1982,6 +1990,12 @@ fn build_menu() -> Result<HMENU> {
         item(edit, cmd::PASTE, "&Paste\tCtrl+Shift+V")?;
         separator(edit)?;
         item(edit, cmd::FIND, "&Find in scrollback\tCtrl+Shift+F")?;
+        item(edit, cmd::STOP_AT, "Stop following at a &match...")?;
+        item(
+            edit,
+            cmd::SCROLL_BOTTOM,
+            "Follow &new output\tCtrl+Shift+End",
+        )?;
         item(edit, cmd::CLEAR_SCROLLBACK, "C&lear scrollback")?;
         item(edit, cmd::SAVE_SNIPPET, "Sa&ve selection as script...")?;
         item(edit, cmd::RECORD_SNIPPET, "Rec&ord keystrokes as script")?;
@@ -2747,10 +2761,12 @@ impl Window {
         let mut pane = new_pane(native, font, theme, metrics, scrollback);
         pane.term.resize(usize::from(cols), usize::from(rows));
         pane.host = Host::Tmux { gateway, label };
+        pane.hl_host = self.panes.get(&gateway).and_then(|g| g.hl_host.clone());
         pane.name = look.name.as_deref().and_then(live::clean_name);
         pane.log.enabled = self.panes.get(&gateway).is_some_and(|g| g.log.enabled);
         pane.log.raw = self.panes.get(&gateway).is_some_and(|g| g.log.raw);
         self.panes.insert(native, pane);
+        self.apply_highlight(native);
         self.start_log(native);
     }
 
@@ -4920,7 +4936,9 @@ impl Window {
         if let Some(p) = self.panes.get_mut(&id) {
             p.term.set_settings(&term_settings(scrollback));
             p.term.scroll_to_bottom();
+            p.hl_host = Some((alias.clone(), target.port.clone()));
         }
+        self.apply_highlight(id);
         self.set_theme(id, theme);
         self.set_font(id, font);
         let notify = self.notifier();
@@ -5122,9 +5140,41 @@ impl Window {
             .or(self.settings.scrollback);
         if let Some(p) = self.panes.get_mut(&id) {
             p.term.set_settings(&term_settings(scrollback));
+            p.hl_host = Some((alias.to_owned(), hostname.to_owned()));
         }
+        self.apply_highlight(id);
         self.set_theme(id, theme);
         self.set_font(id, font);
+    }
+
+    /// Gives a pane the keyword highlighting and stop patterns its host's
+    /// rules pick; rules that do not compile are named in the pane.
+    fn apply_highlight(&mut self, id: PaneId) {
+        let Some(p) = self.panes.get(&id) else {
+            return;
+        };
+        let host = p.hl_host.as_ref().map(|(a, h)| (a.as_str(), h.as_str()));
+        let got = highlight::for_host(&self.settings, host);
+        if let Some(p) = self.panes.get_mut(&id) {
+            p.term.set_highlighter(got.highlighter);
+            p.term.set_stop_rules(got.stops);
+        }
+        for e in got.errors {
+            let e: String = e.chars().filter(|c| !c.is_control()).collect();
+            self.show(id, &format!("\x1b[0;33m{e} Left out.\x1b[0m\r\n"));
+        }
+    }
+
+    /// Session > Highlight keywords.
+    fn toggle_highlight(&mut self) {
+        self.settings.highlight = !self.settings.highlight;
+        self.save_settings();
+        let ids: Vec<PaneId> = self.panes.keys().copied().collect();
+        for id in ids {
+            self.apply_highlight(id);
+        }
+        self.update_menu_checks();
+        self.request_full_redraw();
     }
 
     /// Connects again to the pane's host, or asks for one.
@@ -6359,7 +6409,7 @@ impl Window {
         let Some(p) = self.panes.get_mut(&id) else {
             return;
         };
-        if p.term.display_offset() != 0 {
+        if p.term.display_offset() != 0 || p.term.stopped() {
             p.term.scroll_to_bottom();
             self.refresh(id);
         }
@@ -8136,6 +8186,20 @@ impl Window {
                 Some(c) => KeyOutcome::Run(c),
                 None => KeyOutcome::Handled,
             };
+        }
+        // Shift+End follows the output again when the view is scrolled
+        // back or stopped at a match; otherwise it is the program's.
+        if vk == VK_END
+            && mods.shift
+            && !mods.ctrl
+            && !mods.alt
+            && !self.side.focused
+            && self.panes.get(&self.focused_id()).is_some_and(|p| {
+                !p.term.search_active() && (p.term.display_offset() != 0 || p.term.stopped())
+            })
+        {
+            drop_pending_char(self.hwnd);
+            return KeyOutcome::Run(Command::Id(cmd::SCROLL_BOTTOM));
         }
         let split = self.ws.tab().is_some_and(|t| t.root.panes().len() > 1);
         if let Some(id) = shortcut(vk, mods, self.ws.tabs.len() > 1, split) {
@@ -10161,6 +10225,7 @@ impl Window {
             self.settings.scrollback,
         );
         self.panes.insert(id, pane);
+        self.apply_highlight(id);
     }
 
     /// Splits the focused pane; the new pane takes the focus.
@@ -11582,6 +11647,11 @@ impl Window {
                 self.panes.get_mut(&pane)?.term.search_open();
                 self.refresh(pane);
             }
+            cmd::STOP_AT => {
+                self.panes.get_mut(&pane)?.term.stop_bar_open();
+                self.refresh(pane);
+            }
+            cmd::HIGHLIGHT => self.toggle_highlight(),
             cmd::CLEAR_SCROLLBACK => {
                 self.panes.get_mut(&pane)?.term.clear_scrollback();
                 self.refresh(pane);
@@ -11797,6 +11867,7 @@ impl Window {
                 (cmd::FOLLOW_CD, s.follow_directory),
                 (cmd::VERIFY, s.verify_transfers),
                 (cmd::ZMODEM, s.zmodem),
+                (cmd::HIGHLIGHT, s.highlight),
                 (cmd::AUTO_RECONNECT, s.auto_reconnect),
                 (cmd::SIDE_RIGHT, s.side_pane_right),
                 (cmd::TOOLS_RAIL, s.tools_rail),

@@ -74,6 +74,8 @@ mod forwards;
 mod forwards_e2e;
 #[cfg_attr(not(windows), allow(dead_code))]
 mod fwdview;
+#[cfg_attr(not(windows), allow(dead_code))]
+mod highlight;
 #[cfg(windows)]
 mod import_reg;
 #[cfg_attr(not(windows), allow(dead_code))]
