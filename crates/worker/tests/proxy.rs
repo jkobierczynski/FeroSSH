@@ -286,6 +286,19 @@ async fn http_refusals_are_reported() {
         })
     ));
 
+    // A proxy that wants a login when none was given: no verdict, which
+    // the window would take as out of turn, only the reason.
+    let (port, _) = http("407 Proxy Authentication Required", 9).await;
+    let got = connect(proxy(ProxyKind::Http, port, "", ""), 22).await;
+    assert!(!got.iter().any(|m| matches!(m, Message::ProxyAuth { .. })));
+    let Some(Message::Disconnected { reason, .. }) = got.last() else {
+        panic!("{got:?}");
+    };
+    assert!(
+        reason.contains("wants a user name and password"),
+        "{reason}"
+    );
+
     let (port, _) = http("403 Forbidden", 9).await;
     let got = connect(proxy(ProxyKind::Http, port, "", ""), 22).await;
     let Some(Message::Disconnected { reason, .. }) = got.last() else {

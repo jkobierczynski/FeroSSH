@@ -183,13 +183,26 @@ impl ProxyServer {
         // `connect` takes `user@host:port` itself.
         let (in_addr, host, port) = parse_destination(&addr)?;
         let user = user.or(in_addr);
-        if user.as_deref().is_some_and(|u| !valid_user(u)) || host.contains('%') {
+        // A `%r` or other token is the command's to expand: leave it one.
+        if user
+            .as_deref()
+            .is_some_and(|u| !valid_user(u) || u.contains('%'))
+            || host.contains('%')
+        {
             return None;
         }
+        // Without a port, nc and ncat use the well-known ones: 1080 for
+        // SOCKS, 3128 for HTTP. Leave `connect` without one to itself.
+        let port = match (port, name, kind) {
+            (Some(port), _, _) => port,
+            (None, "connect", _) => return None,
+            (None, _, ProxyKind::Http) => 3128,
+            (None, _, ProxyKind::Socks5) => 1080,
+        };
         Some(Self {
             kind,
             host,
-            port: port.unwrap_or(kind.default_port()),
+            port,
             user,
         })
     }
@@ -298,7 +311,9 @@ mod tests {
         .unwrap();
         assert_eq!(p.to_string(), "socks5://proxy:1080");
         let p = ProxyServer::from_command(&argv("ncat --proxy proxy %h %p")).unwrap();
-        assert_eq!(p.to_string(), "http://proxy:8080");
+        assert_eq!(p.to_string(), "http://proxy:3128");
+        let p = ProxyServer::from_command(&argv("nc -X connect -x proxy %h %p")).unwrap();
+        assert_eq!(p.to_string(), "http://proxy:3128");
         let p = ProxyServer::from_command(&argv("connect -S me@proxy:1080 %h %p")).unwrap();
         assert_eq!(p.to_string(), "socks5://me@proxy:1080");
         let p = ProxyServer::from_command(&argv("connect -H proxy:3128 %h %p")).unwrap();
@@ -319,6 +334,9 @@ mod tests {
             "ssh -W %h:%p bastion",
             "nc -x %h %h %p",
             "corkscrew proxy 3128 %h %p",
+            "connect -S %r@proxy:1080 %h %p",
+            "nc -X connect -x proxy:3128 -P %r %h %p",
+            "connect -H proxy %h %p",
         ] {
             assert_eq!(ProxyServer::from_command(&argv(line)), None, "{line}");
         }

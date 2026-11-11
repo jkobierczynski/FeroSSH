@@ -1139,12 +1139,16 @@ async fn connect(
         let tcp = match tcp {
             Ok(tcp) => tcp,
             Err(ProxyError::Auth(why)) => {
-                let channel = ctx.channel;
-                ctx.send(Message::ProxyAuth {
-                    channel,
-                    accepted: false,
-                })
-                .await?;
+                // Only a login the UI gave can be refused; a proxy that
+                // wants one when none was given just says so.
+                if !proxy.user.is_empty() {
+                    let channel = ctx.channel;
+                    ctx.send(Message::ProxyAuth {
+                        channel,
+                        accepted: false,
+                    })
+                    .await?;
+                }
                 return Err(Failure::Refused(why));
             }
             Err(ProxyError::Other(why)) => return Err(Failure::Refused(why)),
@@ -1206,7 +1210,8 @@ async fn through_proxy(
     });
     let mut client = proxy::Client::new(kind, host, port, login).ok_or_else(|| {
         ProxyError::Other(format!(
-            "FeroSSH cannot ask a proxy for {host} with that user name."
+            "FeroSSH cannot ask the proxy for {host}: the host name, user name or \
+             password is not one the proxy protocol can carry."
         ))
     })?;
     let mut tcp = connect_tcp(&proxy.host, proxy.port, family)
