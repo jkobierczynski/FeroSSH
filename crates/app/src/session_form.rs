@@ -16,7 +16,7 @@ use ferossh_config::login::Step;
 use ferossh_config::password::{PasswordSource, TEMPLATES};
 use ferossh_config::saved::{self, SavedHost};
 use ferossh_config::serial::{self, FRAMINGS, Flow, LineSettings};
-use ferossh_config::{Profile, SessionKind, Settings};
+use ferossh_config::{Profile, ProxyServer, SessionKind, Settings};
 use ferossh_render::{Cell, Color, Flags, Grid, Rgb};
 use unicode_width::UnicodeWidthChar;
 
@@ -55,6 +55,8 @@ pub struct Values {
     pub key: String,
     /// Jump hosts, as a `ProxyJump` line: `bastion` or `me@gw:2222,inner`.
     pub jump: String,
+    /// The SOCKS 5 or HTTP proxy, as a URL: `socks5://me@proxy:1080`.
+    pub proxy: String,
     pub via: String,
     /// Empty: the theme rules decide.
     pub theme: String,
@@ -161,6 +163,7 @@ impl Values {
             port: opt_text(&h.port),
             key: h.identity_file.clone().unwrap_or_default(),
             jump: h.proxy_jump.clone().unwrap_or_default(),
+            proxy: h.proxy_server.clone().unwrap_or_default(),
             forwards: h.forwards.iter().map(forward_text).collect(),
             forward_agent: h.forward_agent,
             kerberos: h.gssapi,
@@ -260,6 +263,7 @@ enum Field {
     Port,
     Key,
     Jump,
+    Proxy,
     Via,
     Theme,
     Font,
@@ -306,6 +310,7 @@ impl Field {
             Field::Port => "Port",
             Field::Key => "Key file",
             Field::Jump => "Jump host",
+            Field::Proxy => "Proxy",
             Field::Via => "Via SSH",
             Field::Theme => "Theme",
             Field::Font => "Font",
@@ -520,6 +525,7 @@ impl SessionForm {
                     | Field::Port
                     | Field::Key
                     | Field::Jump
+                    | Field::Proxy
                     | Field::Forward(_)
                     // Kept with the connection, which a read-only host
                     // cannot save.
@@ -592,6 +598,7 @@ impl SessionForm {
                         }
                     }
                     out.push(Item::Field(Field::Jump));
+                    out.push(Item::Field(Field::Proxy));
                     if kind == SessionKind::Mosh {
                         out.extend([Field::MoshServer, Field::MoshPorts].map(Item::Field));
                         out.push(Item::Note("SSH logs in and starts the server;".into()));
@@ -783,6 +790,7 @@ impl SessionForm {
             Field::Port => &v.port,
             Field::Key => &v.key,
             Field::Jump => &v.jump,
+            Field::Proxy => &v.proxy,
             Field::Via => &v.via,
             Field::Font => &v.font,
             Field::FontSize => &v.font_size,
@@ -832,6 +840,7 @@ impl SessionForm {
             Field::Port => &mut v.port,
             Field::Key => &mut v.key,
             Field::Jump => &mut v.jump,
+            Field::Proxy => &mut v.proxy,
             Field::Via => &mut v.via,
             Field::Font => &mut v.font,
             Field::FontSize => &mut v.font_size,
@@ -1093,6 +1102,7 @@ impl SessionForm {
             Field::Speed => "9600 bits/s".into(),
             Field::Key => "default keys and agent".into(),
             Field::Jump => "none, or e.g. bastion".into(),
+            Field::Proxy => "none, or socks5:// or http://host".into(),
             Field::Via
                 if matches!(
                     v.kind,
@@ -1352,6 +1362,31 @@ impl SessionForm {
                 }
                 if jump.split(',').any(|h| h.trim().eq_ignore_ascii_case(name)) {
                     return Err("The jump host is another connection, not this one.".into());
+                }
+            }
+            let proxy = v.proxy.trim();
+            if matches!(
+                v.kind,
+                SessionKind::Ssh | SessionKind::Mosh | SessionKind::Sftp
+            ) && !proxy.is_empty()
+            {
+                if ProxyServer::parse(proxy).is_none() {
+                    let login = proxy
+                        .split_once("://")
+                        .and_then(|(_, rest)| rest.rsplit_once('@'))
+                        .map(|(login, _)| login);
+                    return Err(if login.is_some_and(|l| l.contains(':')) {
+                        "Proxy: no password in the address; FeroSSH asks for it and keeps \
+                         it in the Windows Credential Manager."
+                            .into()
+                    } else {
+                        "Proxy: socks5://[user@]host[:port] or http://[user@]host[:port].".into()
+                    });
+                }
+                if !jump.is_empty() {
+                    return Err("A proxy and jump hosts: put the proxy on the first jump \
+                                host's own connection."
+                        .into());
                 }
             }
             for (i, f) in v.forwards.iter().enumerate() {
@@ -1898,6 +1933,9 @@ impl SessionForm {
                     port: v.port.trim().parse().ok().filter(|&p| p != 0),
                     identity_file: trimmed(&v.key),
                     proxy_jump: trimmed(&v.jump).filter(|_| login),
+                    proxy_server: ProxyServer::parse(&v.proxy)
+                        .filter(|_| login)
+                        .map(|p| p.to_string()),
                     forward_agent: v.forward_agent && ssh,
                     gssapi: v.kerberos.filter(|_| login),
                     gssapi_delegate: v.kerberos_delegate && ssh,
@@ -2207,9 +2245,10 @@ mod tests {
         assert_eq!(t[9].trim(), "Browse…");
         assert!(t[10].contains("ask every time"));
         assert!(t[11].contains("Jump host") && t[11].contains("none, or e.g. bastion"));
-        assert_eq!(t[12], " ▸ Look");
-        assert_eq!(t[13], " ▸ Extras");
-        assert!(t[14].contains("Save") && t[14].contains("Connect") && !t[14].contains("Delete"));
+        assert!(t[12].contains("Proxy") && t[12].contains("socks5://"));
+        assert_eq!(t[13], " ▸ Look");
+        assert_eq!(t[14], " ▸ Extras");
+        assert!(t[15].contains("Save") && t[15].contains("Connect") && !t[15].contains("Delete"));
 
         assert_eq!(f.key(SideKey::Enter { split: false }, 30), None);
         assert!(
@@ -2241,6 +2280,18 @@ mod tests {
             hosts[0].proxy_jump.as_deref(),
             Some("admin@gw:2222,bastion")
         );
+        // A proxy too: that belongs on the jump host.
+        f.values.proxy = "socks5://proxy".into();
+        assert!(f.check().unwrap_err().contains("first jump host"));
+        f.values.jump.clear();
+        assert_eq!(f.check(), Ok(()));
+        let mut hosts = Vec::new();
+        f.apply(&mut hosts, &mut settings);
+        assert_eq!(
+            hosts[0].proxy_server.as_deref(),
+            Some("socks5://proxy:1080")
+        );
+        assert_eq!(Values::from_saved(&hosts[0]).proxy, "socks5://proxy:1080");
     }
 
     #[test]
@@ -2289,6 +2340,8 @@ mod tests {
             (Field::DesktopSize, "100x100", "desktop size"),
             (Field::Jump, "gw host", "Jump host"),
             (Field::Jump, "gw,ok", "not this one"),
+            (Field::Proxy, "proxy:1080", "socks5://[user@]host"),
+            (Field::Proxy, "socks5://me:pw@proxy", "no password"),
         ] {
             f.values = Values {
                 name: "ok".into(),
@@ -2609,8 +2662,8 @@ mod tests {
         let mut f = new_form();
         typed(&mut f, "web2");
         // Open Extras: Name, Folder, Type, Host, User, Port, Key, Browse,
-        // Password, Jump host, Look, Extras.
-        down(&mut f, 11);
+        // Password, Jump host, Proxy, Look, Extras.
+        down(&mut f, 12);
         f.key(SideKey::Enter { split: false }, 30);
         // tmux, tmux panes, Start dir, Local folder, Remote folder.
         down(&mut f, 6);
@@ -2641,7 +2694,7 @@ mod tests {
     fn login_steps_are_checked_and_saved_in_the_profile() {
         let mut f = new_form();
         typed(&mut f, "sw1");
-        down(&mut f, 11);
+        down(&mut f, 12);
         f.key(SideKey::Enter { split: false }, 30);
         // tmux, tmux panes, Start dir, Local folder, Remote folder,
         // Forward 1, RDP port, VNC port, Virtual desk, Desk size, Desk
@@ -2735,8 +2788,8 @@ mod tests {
         let mut f = new_form();
         typed(&mut f, "web2");
         // Open Extras: Name, Folder, Type, Host, User, Port, Key, Browse,
-        // Password, Jump host, Look, Extras.
-        down(&mut f, 11);
+        // Password, Jump host, Proxy, Look, Extras.
+        down(&mut f, 12);
         f.key(SideKey::Enter { split: false }, 30);
         f.key(SideKey::Down, 30);
         assert_eq!(f.focused_field(), Some(Field::Tmux));
@@ -2793,9 +2846,9 @@ mod tests {
         assert_eq!(f.focused_field(), Some(Field::Host));
         typed(&mut f, "x");
         assert_eq!(f.values.host, "web.example.org");
-        // The theme can: past user, port, key, password and jump host to
-        // Look.
-        down(&mut f, 6);
+        // The theme can: past user, port, key, password, jump host and
+        // proxy to Look.
+        down(&mut f, 7);
         f.key(SideKey::Enter { split: false }, 30);
         f.key(SideKey::Down, 30);
         f.key(SideKey::Right, 30);

@@ -16,6 +16,8 @@ ocb3 = { version = "0.2", default-features = false, features = ["alloc"] }
 # zlib, as Mosh compresses each instruction; FeroStream already links it.
 miniz_oxide = { version = "0.9", default-features = false, features = ["with-alloc"] }
 unicode-width = "0.2"
+# The escape-sequence parser; alacritty_terminal already links it.
+vte = "0.15"
 zeroize = "1.9"
 
 [lints]

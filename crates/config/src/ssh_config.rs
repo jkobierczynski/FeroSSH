@@ -28,6 +28,7 @@
 
 use crate::forward::{ForwardKind, ForwardSpec, parse_config};
 use crate::known_hosts::match_pattern_list;
+use crate::proxy::ProxyServer;
 
 /// Settings for one host after applying the config.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -55,8 +56,8 @@ pub struct HostConfig {
     pub server_alive_count_max: Option<u32>,
     /// Seconds to wait for the TCP connection and the server's banner.
     pub connect_timeout: Option<u32>,
-    /// `ProxyJump` or `ProxyCommand`, whichever came first, as OpenSSH
-    /// takes them.
+    /// `ProxyJump`, `ProxyCommand` or `ProxyServer`, whichever came
+    /// first, as OpenSSH takes the first two.
     pub proxy: Option<Proxy>,
     /// `ForwardAgent yes`: lets the server use the agent's keys.
     pub forward_agent: Option<bool>,
@@ -147,6 +148,9 @@ pub enum Proxy {
     /// the connection, split into the program and its arguments, tokens
     /// not yet filled in (see [`proxy_command`]).
     Command(Vec<String>),
+    /// `ProxyServer`, or a `ProxyCommand` of a proxy tool that says the
+    /// same (see [`crate::proxy`]): through a SOCKS 5 or HTTP proxy.
+    Server(ProxyServer),
 }
 
 /// The hosts on a `ProxyJump` line (or `-J`): comma-separated
@@ -636,7 +640,17 @@ fn apply(
                 cfg.proxy = match args.as_slice() {
                     [] => None,
                     [one] if one.eq_ignore_ascii_case("none") => Some(Proxy::Direct),
-                    argv => Some(Proxy::Command(argv.to_vec())),
+                    argv => Some(match ProxyServer::from_command(argv) {
+                        Some(server) => Proxy::Server(server),
+                        None => Proxy::Command(argv.to_vec()),
+                    }),
+                };
+            }
+            "proxyserver" if cfg.proxy.is_none() => {
+                cfg.proxy = match args.as_slice() {
+                    [one] if one.eq_ignore_ascii_case("none") => Some(Proxy::Direct),
+                    [url] => ProxyServer::parse(url).map(Proxy::Server),
+                    _ => None,
                 };
             }
             "sendenv" => {
@@ -1026,6 +1040,38 @@ Host bad
         );
         assert_eq!(parse_proxy_jump("a,,b"), None);
         assert_eq!(parse_proxy_jump("NONE"), Some(Proxy::Direct));
+    }
+
+    #[test]
+    fn proxy_server_takes_its_turn_and_proxy_tools_become_one() {
+        let text = "\
+Host socks
+    ProxyServer socks5://me@proxy:1081
+    ProxyJump bastion
+Host tool
+    ProxyCommand nc -X connect -x proxy:3128 %h %p
+Host jumpfirst
+    ProxyJump bastion
+    ProxyServer http://proxy
+Host off
+    ProxyServer none
+Host bad
+    ProxyServer socks5://me:pw@proxy
+Host *
+    ProxyServer http://fallback
+";
+        let server = |name| match resolve(text, name).proxy {
+            Some(Proxy::Server(s)) => s.to_string(),
+            other => format!("{other:?}"),
+        };
+        assert_eq!(server("socks"), "socks5://me@proxy:1081");
+        assert_eq!(server("tool"), "http://proxy:3128");
+        assert_eq!(server("bad"), "http://fallback:8080");
+        assert_eq!(resolve(text, "off").proxy, Some(Proxy::Direct));
+        assert_eq!(
+            resolve(text, "jumpfirst").proxy,
+            Some(Proxy::Jump(vec!["bastion".into()]))
+        );
     }
 
     #[test]

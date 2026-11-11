@@ -20,10 +20,11 @@ use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 
+use ferossh_forward::proxy;
 use ferossh_forward::x11::{MIT_COOKIE, hex};
 use ferossh_ipc::{
     ChannelId, Family, GssReply, MAX_DATA_CHUNK, Message, MoshOptions, PromptField, PromptKind,
-    Secrets, ShellOptions, Timing, WORKER_IDS, X11Auth,
+    ProxyKind, ProxyServer, Secrets, ShellOptions, Timing, WORKER_IDS, X11Auth,
 };
 use russh::client::{self, AuthResult, DisconnectReason, Handle, KeyboardInteractiveAuthResponse};
 use russh::keys::agent::AgentIdentity;
@@ -35,7 +36,7 @@ use russh::{
     AlgorithmKind, Channel, ChannelMsg, ChannelOpenFailure, Disconnect, MethodKind, MethodSet,
     Names, Preferred, SshId,
 };
-use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio::time::Instant;
@@ -83,6 +84,8 @@ pub struct Params {
     pub family: Family,
     /// Try Kerberos (`gssapi-with-mic`) first when the server offers it.
     pub gssapi: bool,
+    /// Reach the host through this SOCKS 5 or HTTP proxy.
+    pub proxy: Option<ProxyServer>,
 }
 
 /// Why a session ended early.
@@ -1123,11 +1126,52 @@ async fn connect(
     ctx: &mut Ctx,
     connections: &Connections,
 ) -> Result<(Connection, Arc<ConnForwards>), Failure> {
+    let timeout = Duration::from_secs(p.timing.connect_timeout.max(1).into());
+    if let Some(proxy) = &p.proxy {
+        let tcp = drive(
+            tokio::time::timeout(timeout, through_proxy(proxy, &p.host, p.port, p.family)),
+            inbox,
+            ctx,
+        )
+        .await?
+        .map_err(|_| {
+            Failure::Refused(format!(
+                "Timed out connecting to {} through the proxy {}.",
+                p.host, proxy.host
+            ))
+        })?;
+        let tcp = match tcp {
+            Ok(tcp) => tcp,
+            Err(ProxyError::Auth(why)) => {
+                // Only a login the UI gave can be refused; a proxy that
+                // wants one when none was given just says so.
+                if !proxy.user.is_empty() {
+                    let channel = ctx.channel;
+                    ctx.send(Message::ProxyAuth {
+                        channel,
+                        accepted: false,
+                    })
+                    .await?;
+                }
+                return Err(Failure::Refused(why));
+            }
+            Err(ProxyError::Other(why)) => return Err(Failure::Refused(why)),
+        };
+        if !proxy.user.is_empty() {
+            let channel = ctx.channel;
+            ctx.send(Message::ProxyAuth {
+                channel,
+                accepted: true,
+            })
+            .await?;
+        }
+        let _ = tcp.set_nodelay(true);
+        // The address is the proxy's, not the host's: Mosh looks the host
+        // up itself.
+        return handshake(p, preferred, tcp, None, inbox, ctx, connections).await;
+    }
     let tcp = drive(
-        tokio::time::timeout(
-            Duration::from_secs(p.timing.connect_timeout.max(1).into()),
-            connect_tcp(&p.host, p.port, p.family),
-        ),
+        tokio::time::timeout(timeout, connect_tcp(&p.host, p.port, p.family)),
         inbox,
         ctx,
     )
@@ -1137,6 +1181,71 @@ async fn connect(
     let _ = tcp.set_nodelay(true);
     let peer = tcp.peer_addr().ok().map(|a| a.ip());
     handshake(p, preferred, tcp, peer, inbox, ctx, connections).await
+}
+
+/// Why the way through a proxy failed.
+enum ProxyError {
+    /// The proxy wants a login, or refused the one given.
+    Auth(String),
+    Other(String),
+}
+
+/// Connects to `proxy` and asks it for `host`:`port`; returns the
+/// connection, the server's bytes next. The proxy's replies are parsed
+/// here, in the sandbox ([`ferossh_forward::proxy`]).
+async fn through_proxy(
+    proxy: &ProxyServer,
+    host: &str,
+    port: u16,
+    family: Family,
+) -> Result<TcpStream, ProxyError> {
+    let kind = match proxy.kind {
+        ProxyKind::Socks5 => proxy::Kind::Socks5,
+        ProxyKind::Http => proxy::Kind::Http,
+    };
+    // No login without a user; a missing password is an empty one.
+    let login = (!proxy.user.is_empty()).then(|| {
+        let word = proxy
+            .password
+            .0
+            .first()
+            .map_or(Default::default(), String::as_str);
+        (proxy.user.as_str(), word)
+    });
+    let mut client = proxy::Client::new(kind, host, port, login).ok_or_else(|| {
+        ProxyError::Other(format!(
+            "FeroSSH cannot ask the proxy for {host}: the host name, user name or \
+             password is not one the proxy protocol can carry."
+        ))
+    })?;
+    let mut tcp = connect_tcp(&proxy.host, proxy.port, family)
+        .await
+        .map_err(|e| {
+            ProxyError::Other(format!(
+                "Could not connect to the proxy {}: {e}.",
+                proxy.host
+            ))
+        })?;
+    let lost = |e: std::io::Error| {
+        ProxyError::Other(format!(
+            "The proxy {} closed the connection before it was through: {e}.",
+            proxy.host
+        ))
+    };
+    let mut send = client.start();
+    let mut buf = Vec::new();
+    loop {
+        tcp.write_all(&send).await.map_err(lost)?;
+        buf.resize(client.wants(), 0);
+        tcp.read_exact(&mut buf).await.map_err(lost)?;
+        match client.feed(&buf) {
+            proxy::Step::Send(bytes) => send = bytes,
+            // Only what the handshake wanted was read, so `rest` is empty.
+            proxy::Step::Open { .. } => return Ok(tcp),
+            proxy::Step::AuthFailed(why) => return Err(ProxyError::Auth(why)),
+            proxy::Step::Failed(why) => return Err(ProxyError::Other(why)),
+        }
+    }
 }
 
 /// Connects to the first address of `host` that answers, of the IP

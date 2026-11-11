@@ -7,7 +7,7 @@
 //! `%XX`-escaped. The window reads the values; this module makes them
 //! [`Session`]s. SSH and Telnet sessions are imported; serial and raw
 //! ones are not. Passwords (KiTTY can store one) are never read, only
-//! noticed.
+//! noticed. A SOCKS 5 or HTTP proxy comes over without its password.
 
 use crate::forward::{ForwardKind, parse_config};
 use crate::import::port;
@@ -17,7 +17,7 @@ use crate::ssh_config::parse_destination;
 
 /// The values FeroSSH reads from each session. `Password` is only
 /// checked for being there.
-pub const VALUES: [&str; 10] = [
+pub const VALUES: [&str; 14] = [
     "Protocol",
     "HostName",
     "PortNumber",
@@ -28,6 +28,10 @@ pub const VALUES: [&str; 10] = [
     "PortForwardings",
     "Folder",
     "Password",
+    "ProxyMethod",
+    "ProxyHost",
+    "ProxyPort",
+    "ProxyUsername",
 ];
 
 /// PuTTY's forwards: `L8080=db:5432,R2222=localhost:22,D1080`, each
@@ -117,6 +121,12 @@ pub fn session(raw_name: &str, get: impl Fn(&str) -> Option<Value>) -> Option<Se
         }
     }
     s.had_password = get("Password").is_some();
+    s.set_proxy(
+        number("ProxyMethod"),
+        text("ProxyHost"),
+        number("ProxyPort"),
+        text("ProxyUsername"),
+    );
     Some(s)
 }
 
@@ -169,6 +179,40 @@ mod tests {
                 .find(|(k, _)| *k == key)
                 .map(|(_, v)| v.clone())
         }
+    }
+
+    #[test]
+    fn imports_socks5_and_http_proxies_without_passwords() {
+        let session_with = |method: u32, user: &str| {
+            let v = [
+                ("HostName", Value::Text("db".into())),
+                ("ProxyMethod", Value::Number(method)),
+                ("ProxyHost", Value::Text("proxy.corp".into())),
+                ("ProxyPort", Value::Number(3128)),
+                ("ProxyUsername", Value::Text(user.into())),
+            ];
+            session("db", values(&v)).unwrap()
+        };
+        let s = session_with(3, "me");
+        assert_eq!(
+            s.host.proxy_server.as_deref(),
+            Some("http://me@proxy.corp:3128")
+        );
+        let text = to_config(Client::Putty, &[&s]);
+        assert!(matches!(ssh_config::resolve(&text, "db").proxy,
+            Some(ssh_config::Proxy::Server(p)) if p.port == 3128));
+        assert_eq!(
+            session_with(2, "").host.proxy_server.as_deref(),
+            Some("socks5://proxy.corp:3128")
+        );
+        let s = session_with(1, "");
+        assert_eq!(s.host.proxy_server, None);
+        assert_eq!(s.notes, ["its SOCKS 4 proxy is not imported"]);
+        assert_eq!(session_with(0, "me").host.proxy_server, None);
+        assert!(session_with(0, "me").notes.is_empty());
+        let s = session_with(2, "me:pw");
+        assert_eq!(s.host.proxy_server, None);
+        assert_eq!(s.notes, ["its proxy proxy.corp is not imported"]);
     }
 
     #[test]

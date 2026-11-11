@@ -9,6 +9,7 @@
 //!     Port 2222
 //!     IdentityFile "C:\Keys\web key"
 //!     ProxyJump bastion
+//!     ProxyServer socks5://me@proxy.corp:1080
 //!     LocalForward 8080 localhost:80
 //! ```
 //!
@@ -20,6 +21,7 @@
 use std::fmt::Write as _;
 
 use crate::forward::{ForwardKind, ForwardSpec, parse_config};
+use crate::proxy::ProxyServer;
 use crate::ssh_config::{Proxy, folder_comment, parse_destination, parse_proxy_jump, split_line};
 
 /// One saved session's connection settings.
@@ -36,6 +38,9 @@ pub struct SavedHost {
     /// The jump hosts to go through, as a `ProxyJump` line has them:
     /// session names or `[user@]host[:port]`, comma-separated.
     pub proxy_jump: Option<String>,
+    /// The SOCKS 5 or HTTP proxy to go through, as a URL
+    /// ([`crate::ProxyServer`]).
+    pub proxy_server: Option<String>,
     pub forwards: Vec<ForwardSpec>,
     /// `ForwardAgent yes`.
     pub forward_agent: bool,
@@ -135,6 +140,12 @@ pub fn parse(text: &str) -> Vec<SavedHost> {
             }
             "identityfile" => h.identity_file = first.filter(|f| !f.is_empty()),
             "proxyjump" => h.proxy_jump = first.filter(|j| valid_proxy_jump(j)),
+            "proxyserver" => {
+                h.proxy_server = first
+                    .as_deref()
+                    .and_then(ProxyServer::parse)
+                    .map(|p| p.to_string());
+            }
             "forwardagent" => {
                 h.forward_agent = first.is_some_and(|f| f.eq_ignore_ascii_case("yes"));
             }
@@ -206,6 +217,16 @@ pub(crate) fn write_host(out: &mut String, h: &SavedHost, comment: Option<&str>)
     if let Some(jump) = h.proxy_jump.as_deref().filter(|j| valid_proxy_jump(j)) {
         let _ = writeln!(out, "    ProxyJump {jump}");
     }
+    // Only one way there counts: the first. A proxy for the jump hosts
+    // goes on the first jump host's own connection.
+    if let Some(proxy) = h
+        .proxy_server
+        .as_deref()
+        .and_then(ProxyServer::parse)
+        .filter(|_| h.proxy_jump.is_none())
+    {
+        let _ = writeln!(out, "    ProxyServer {proxy}");
+    }
     for f in &h.forwards {
         let _ = writeln!(out, "    {}", f.config_line());
     }
@@ -241,6 +262,7 @@ mod tests {
                 port: Some(2222),
                 identity_file: Some(r"C:\Keys\web key".into()),
                 proxy_jump: Some("admin@bastion:2222,edge".into()),
+                proxy_server: None,
                 forwards: vec![
                     parse_option("L 8080 localhost:80").unwrap(),
                     parse_option("-D 1080").unwrap(),
@@ -251,6 +273,11 @@ mod tests {
             },
             SavedHost {
                 alias: "pi".into(),
+                ..SavedHost::default()
+            },
+            SavedHost {
+                alias: "behind".into(),
+                proxy_server: Some("socks5://me@proxy.corp:1080".into()),
                 ..SavedHost::default()
             },
         ]
@@ -275,6 +302,8 @@ mod tests {
             ]))
         );
         assert_eq!(cfg.forwards, sample()[0].forwards);
+        assert!(matches!(ssh_config::resolve(&text, "behind").proxy,
+            Some(Proxy::Server(p)) if p.to_string() == "socks5://me@proxy.corp:1080"));
         let hosts = ssh_config::hosts(&text, &ssh_config::NoIncludes);
         assert_eq!(hosts[0].folder.as_deref(), Some("Work"));
         assert_eq!(hosts[1].folder, None, "an empty folder comment ends it");

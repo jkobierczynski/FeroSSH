@@ -128,6 +128,62 @@ impl Session {
     }
 }
 
+impl Session {
+    /// Sets the proxy PuTTY, KiTTY and WinSCP store (`ProxyMethod`: 2
+    /// SOCKS 5, 3 HTTP; 0 none), or notes why it does not come over. A
+    /// session with a jump host gets none: the proxy belongs on the jump
+    /// host's connection. The proxy's password is never read; FeroSSH
+    /// asks for it.
+    pub(crate) fn set_proxy(
+        &mut self,
+        method: Option<u32>,
+        host: Option<String>,
+        port: Option<u32>,
+        user: Option<String>,
+    ) {
+        let scheme = match method.unwrap_or(0) {
+            0 => return,
+            2 => "socks5",
+            3 => "http",
+            1 => return self.notes.push("its SOCKS 4 proxy is not imported".into()),
+            4 => return self.notes.push("its Telnet proxy is not imported".into()),
+            5 => {
+                return self
+                    .notes
+                    .push("its local proxy command is not imported".into());
+            }
+            _ => return self.notes.push("its proxy is not imported".into()),
+        };
+        let Some(host) = host.map(|h| h.trim().to_owned()).filter(|h| !h.is_empty()) else {
+            return self
+                .notes
+                .push("its proxy has no host; not imported".into());
+        };
+        let mut url = format!("{scheme}://");
+        if let Some(user) = user.map(|u| u.trim().to_owned()).filter(|u| !u.is_empty()) {
+            url.push_str(&user);
+            url.push('@');
+        }
+        if host.contains(':') && !host.starts_with('[') {
+            url.push_str(&format!("[{host}]"));
+        } else {
+            url.push_str(&host);
+        }
+        if let Some(port) = port.filter(|&p| p != 0) {
+            url.push_str(&format!(":{port}"));
+        }
+        match crate::proxy::ProxyServer::parse(&url) {
+            Some(_) if self.host.proxy_jump.is_some() => self
+                .notes
+                .push("its proxy is not imported: it goes on the jump host's connection".into()),
+            Some(p) => self.host.proxy_server = Some(p.to_string()),
+            None => self
+                .notes
+                .push(format!("its proxy {} is not imported", clean(&host))),
+        }
+    }
+}
+
 /// The port to write: none for the kind's usual one.
 pub(crate) fn port(kind: SessionKind, port: Option<u32>) -> Option<u16> {
     let usual = match kind {

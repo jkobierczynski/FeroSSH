@@ -5072,6 +5072,12 @@ impl Window {
                 hop.remember_password = source == PasswordSource::Windows;
             }
         }
+        if let Some(p) = session.proxy_login()
+            && let Some(user) = p.user.as_deref()
+            && let Ok(Some(password)) = credman::read(&credman::proxy_target(user, &p.host, p.port))
+        {
+            session.set_proxy_password(password);
+        }
         session.x11 = x11;
         session.legacy = legacy;
         session.password_source = source != PasswordSource::Ask;
@@ -5435,6 +5441,27 @@ impl Window {
                     port,
                     password,
                 } => self.store_password(id, (&user, &host, port), &password),
+                Effect::StoreProxyPassword { proxy, password } => {
+                    let Some(user) = proxy.user.as_deref() else {
+                        continue;
+                    };
+                    let Some(password) = password.0.first() else {
+                        continue;
+                    };
+                    let target = credman::proxy_target(user, &proxy.host, proxy.port);
+                    let note = match credman::write(&target, user, password) {
+                        Ok(()) => {
+                            "Saved the proxy password in the Windows Credential Manager.".to_owned()
+                        }
+                        Err(e) => e,
+                    };
+                    self.show(id, &format!("\x1b[0;90m{note}\x1b[0m\r\n"));
+                }
+                Effect::ForgetProxyPassword { proxy } => {
+                    if let Some(user) = proxy.user.as_deref() {
+                        credman::delete(&credman::proxy_target(user, &proxy.host, proxy.port));
+                    }
+                }
                 Effect::Connected
                     if self.run_login.contains(&id) || self.run_hidden.contains(&id) =>
                 {
@@ -9534,6 +9561,14 @@ impl Window {
                                     .map(|k| k.path.display().to_string());
                                 Values {
                                     forward_agent: t.forward_agent,
+                                    // With jump hosts, the proxy is the
+                                    // first one's.
+                                    proxy: t
+                                        .proxy_server
+                                        .as_ref()
+                                        .filter(|_| t.jumps.is_empty())
+                                        .map(ToString::to_string)
+                                        .unwrap_or_default(),
                                     ..Values::from_resolved(
                                         &name,
                                         folder.as_deref(),

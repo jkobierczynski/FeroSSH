@@ -18,6 +18,12 @@ pub fn target(user: &str, host: &str, port: u16) -> String {
     format!("FeroSSH:{user}@{}:{port}", host.to_ascii_lowercase())
 }
 
+/// The credential's name for the password of `user` on the proxy at
+/// `host`:`port`.
+pub fn proxy_target(user: &str, host: &str, port: u16) -> String {
+    format!("FeroSSH proxy:{user}@{}:{port}", host.to_ascii_lowercase())
+}
+
 /// The password kept under `target`; `Ok(None)` when there is none.
 pub fn read(target: &str) -> Result<Option<Zeroizing<String>>, String> {
     let name = HSTRING::from(target);
