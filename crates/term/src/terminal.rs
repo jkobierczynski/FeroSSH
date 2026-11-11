@@ -237,6 +237,9 @@ pub struct Terminal {
     /// While the alternate screen is up: the title from before it, and
     /// whether the app on it set another.
     alt_title: Option<(Option<String>, bool)>,
+    /// Feeds of host output so far, to tell whether the host answered
+    /// something typed.
+    fed: u64,
 }
 
 impl std::fmt::Debug for Terminal {
@@ -278,6 +281,7 @@ impl Terminal {
             reported: Vec::new(),
             title: None,
             alt_title: None,
+            fed: 0,
         }
     }
 
@@ -411,6 +415,7 @@ impl Terminal {
 
     /// Processes output from the host. Call [`Self::take_actions`] after.
     pub fn feed(&mut self, bytes: &[u8]) {
+        self.fed = self.fed.wrapping_add(1);
         let found = self.cwd.scan(bytes);
         // Only the last report of a burst matters.
         if let Some(last) = found.into_iter().last() {
@@ -1151,6 +1156,18 @@ impl Terminal {
             before,
             after: without_right_prompt(&rest).trim_end().to_owned(),
         })
+    }
+
+    /// How many times host output was fed in: a change means the host
+    /// answered (echoed) what was typed before.
+    pub fn output_count(&self) -> u64 {
+        self.fed
+    }
+
+    /// Whether the cursor waits at the end of a full row: the next
+    /// character goes on the next row, not where the cursor is drawn.
+    pub fn wrap_pending(&self) -> bool {
+        self.term.grid().cursor.input_needs_wrap
     }
 
     /// Whether the cursor is still on the line `mark` starts, where it

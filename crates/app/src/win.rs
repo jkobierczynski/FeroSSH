@@ -874,6 +874,9 @@ struct Window {
     histories: HashMap<String, (suggest::History, Option<SystemTime>)>,
     /// The suggestion showing after the cursor, for the keys that take it.
     ghost: Option<Ghost>,
+    /// Suggestions Shift+Delete dismissed (built-in commands; history
+    /// entries are also removed from the history).
+    dismissed: HashSet<String>,
     /// A repeatable tmux key (an arrow, PageUp) was just used: until this
     /// time, more of them work without the prefix, as with tmux's `bind
     /// -r` and `repeat-time`.
@@ -1732,6 +1735,7 @@ fn create_and_run(launch: Launch, theme: Option<String>) -> Result<()> {
                 tmux_armed: None,
                 histories: HashMap::new(),
                 ghost: None,
+                dismissed: HashSet::new(),
                 tmux_repeat: None,
                 last_tab_pane: None,
                 last_pane: None,
@@ -7013,8 +7017,17 @@ impl Window {
             Host::Tmux { gateway, .. } => return self.history_key(*gateway),
             Host::Local { .. } => "local".to_owned(),
             Host::Serial { target, .. } => format!("serial:{}", target.port),
-            Host::Telnet(s) => format!("telnet:{}", s.target.label().to_ascii_lowercase()),
-            Host::Winrm(s) => format!("winrm:{}", s.target.label().to_ascii_lowercase()),
+            Host::Telnet(s) => format!(
+                "telnet:{}:{}",
+                s.target.hostname.to_ascii_lowercase(),
+                s.target.port
+            ),
+            Host::Winrm(s) => format!(
+                "winrm:{}@{}:{}",
+                s.target.user.as_deref().unwrap_or("").to_lowercase(),
+                s.target.hostname.to_ascii_lowercase(),
+                s.target.port
+            ),
             Host::Ask(_) | Host::Desktop { .. } => return None,
         })
     }
@@ -7060,7 +7073,12 @@ impl Window {
     fn change_history(&mut self, key: &str, change: impl FnOnce(&mut suggest::History) -> bool) {
         #[cfg(windows)]
         {
-            let fresh = crate::history_store::update(key, change);
+            // Not saved (the folder cannot be written): this window keeps
+            // the change, with the file's old time so it is not read over.
+            let fresh = match crate::history_store::update(key, change) {
+                Ok(fresh) => fresh,
+                Err((kept, _)) => kept,
+            };
             self.histories.insert(key.to_owned(), fresh);
         }
         #[cfg(not(windows))]
@@ -7113,7 +7131,8 @@ impl Window {
         let p = self.panes.get_mut(&id)?;
         let typed = p.typing.line(&p.term)?.before;
         let choice = p.typing.choice;
-        let choices = suggest::choices(Some(self.history(&key)), &typed);
+        let mut choices = suggest::choices(Some(self.history(&key)), &typed);
+        choices.retain(|c| !self.dismissed.contains(c));
         if choices.is_empty() {
             return None;
         }
@@ -7204,6 +7223,9 @@ impl Window {
                 self.refresh(id);
             }
             Key::Delete if shift => {
+                // A built-in command is not in the history: it stays out of
+                // the suggestions until FeroSSH restarts.
+                self.dismissed.insert(line.clone());
                 if let Some(k) = self.history_key(id) {
                     self.change_history(&k, |h| h.remove(&line));
                 }
@@ -12594,6 +12616,19 @@ impl Window {
                     ));
                 };
                 self.histories.remove(&key);
+                // A pane out of sight may hold a command Enter ran that is
+                // not kept yet: it would bring the history back.
+                let same: Vec<PaneId> = self
+                    .panes
+                    .keys()
+                    .copied()
+                    .filter(|p| self.history_key(*p).as_deref() == Some(key.as_str()))
+                    .collect();
+                for p in same {
+                    if let Some(p) = self.panes.get_mut(&p) {
+                        p.typing.reset();
+                    }
+                }
                 #[cfg(windows)]
                 crate::history_store::clear(&key);
                 self.ghost = None;
@@ -15284,6 +15319,9 @@ fn run_command(hwnd: HWND, command: Command) {
             with_window(|w| {
                 w.histories.clear();
                 w.ghost = None;
+                for p in w.panes.values_mut() {
+                    p.typing.reset();
+                }
                 crate::history_store::clear_all();
                 w.refresh_visible();
             });

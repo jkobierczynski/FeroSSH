@@ -404,6 +404,13 @@ pub struct Tracker {
     pending: Option<(InputMark, String)>,
     /// Which of the choices shows: Ctrl+Up and Ctrl+Down move it.
     pub choice: usize,
+    /// The host's output count when a key was last sent: until the host
+    /// answers, the screen shows the line from before that key, and no
+    /// suggestion may be made from it.
+    sent_at: Option<u64>,
+    /// Typed ahead while the host had not answered the last Enter yet:
+    /// where this line starts is unknown, so it is not followed.
+    skip_line: bool,
 }
 
 impl Tracker {
@@ -412,9 +419,11 @@ impl Tracker {
     /// an earlier Enter ran, to keep.
     pub fn typed(&mut self, term: &Terminal, bytes: &[u8]) -> Option<String> {
         self.choice = 0;
-        let done = self.settle(term, true);
+        self.sent_at = Some(term.output_count());
+        let done = self.settle(term);
         match bytes {
             b"\r" | b"\r\n" | b"\n" => {
+                self.skip_line = false;
                 if let Some(mut mark) = self.mark.take()
                     && let Some(line) = term.input_line(&mut mark)
                 {
@@ -424,7 +433,10 @@ impl Tracker {
             }
             // Ctrl+C, Ctrl+D, Ctrl+Z: the line is dropped, or the program
             // ends.
-            [0x03] | [0x04] | [0x1a] => self.mark = None,
+            [0x03] | [0x04] | [0x1a] => {
+                self.mark = None;
+                self.skip_line = false;
+            }
             // A paste of several lines runs them as they come: not followed.
             b if b.contains(&b'\r') || b.contains(&b'\n') => self.mark = None,
             // The first key of a line marks where it starts. A mark that
@@ -432,7 +444,14 @@ impl Tracker {
             // prompt) stays: it reads again once the prompt is back, and a
             // new mark in mid-line would take typed text for the prompt.
             _ => {
-                if self.mark.is_none() {
+                let answered = self
+                    .pending
+                    .as_ref()
+                    .is_none_or(|(mark, _)| !term.input_here(mark));
+                if !answered {
+                    self.skip_line = true;
+                }
+                if self.mark.is_none() && !self.skip_line {
                     self.mark = term.input_mark();
                 }
             }
@@ -442,22 +461,25 @@ impl Tracker {
 
     /// After output: the line Enter ran, once the cursor moved past it.
     pub fn poll(&mut self, term: &Terminal) -> Option<String> {
-        self.settle(term, false)
+        self.settle(term)
     }
 
-    fn settle(&mut self, term: &Terminal, typing: bool) -> Option<String> {
+    fn settle(&mut self, term: &Terminal) -> Option<String> {
         let (mark, read) = self.pending.as_ref()?;
-        if term.input_here(mark) {
-            // Still on the line: Enter has not been answered yet. New
-            // typing there means it ran nothing.
-            if typing {
-                self.pending = None;
-            }
+        let now = term.input_text(mark);
+        // Still on the line as Enter left it: not answered yet. (A line
+        // the shell redrew, or a mark that moved with a full scrollback
+        // onto the next prompt, reads differently.)
+        if term.input_here(mark) && now.as_deref() == Some(read.as_str()) {
             return None;
         }
         let (mark, read) = (mark.clone(), read.clone());
         self.pending = None;
-        let line = term.input_text(&mark).unwrap_or(read);
+        // The line as redrawn, when the shell only dropped the end (its
+        // own grey suggestion); otherwise as Enter read it.
+        let line = now
+            .filter(|t| !t.is_empty() && read.starts_with(t.as_str()))
+            .unwrap_or(read);
         to_record(mark.prompt(), &line)
     }
 
@@ -465,6 +487,15 @@ impl Tracker {
     /// started on the main screen, not at a prompt for a secret, and the
     /// cursor is at its end.
     pub fn line(&mut self, term: &Terminal) -> Option<InputLine> {
+        if let Some(at) = self.sent_at {
+            if at == term.output_count() {
+                return None;
+            }
+            self.sent_at = None;
+        }
+        if term.wrap_pending() {
+            return None;
+        }
         let mark = self.mark.as_mut()?;
         if secret_prompt(mark.prompt()) {
             return None;
@@ -665,6 +696,58 @@ mod tests {
         // zsh drops it before the new line.
         t.feed(b"\x1b[K\r\ntotal 0\r\n% ");
         assert_eq!(k.poll(&t), Some("ls".into()));
+    }
+
+    #[test]
+    fn tracker_keeps_a_command_when_typing_runs_ahead_of_the_host() {
+        let mut t = term();
+        let mut k = Tracker::default();
+        t.feed(b"$ ");
+        k.typed(&t, b"l");
+        t.feed(b"l");
+        k.typed(&t, b"s");
+        t.feed(b"s");
+        k.typed(&t, b"\r");
+        // pwd typed before the host answered ls.
+        for b in b"pwd" {
+            assert_eq!(k.typed(&t, &[*b]), None);
+        }
+        t.feed(b"\r\nfile\r\n$ pwd");
+        assert_eq!(k.poll(&t), Some("ls".into()));
+        // The typed-ahead line is not followed (its start is unknown).
+        assert!(k.line(&t).is_none());
+        k.typed(&t, b"\r");
+        t.feed(b"\r\n/home/jo\r\n$ ");
+        assert_eq!(k.poll(&t), None);
+    }
+
+    #[test]
+    fn tracker_records_with_no_scrollback_left() {
+        let mut t = Terminal::new(40, 3, &Settings::new(0));
+        let mut k = Tracker::default();
+        t.feed(b"a\r\nb\r\n$ ");
+        k.typed(&t, b"l");
+        t.feed(b"l");
+        k.typed(&t, b"s");
+        t.feed(b"s");
+        k.typed(&t, b"\r");
+        t.feed(b"\r\n$ ");
+        assert_eq!(k.poll(&t), Some("ls".into()));
+    }
+
+    #[test]
+    fn no_suggestion_until_the_host_echoes() {
+        let mut t = term();
+        let mut k = Tracker::default();
+        t.feed(b"$ ");
+        k.typed(&t, b"g");
+        t.feed(b"g");
+        assert_eq!(k.line(&t).unwrap().before, "g");
+        k.typed(&t, b"i");
+        // A refresh before the echo: the screen still shows "g".
+        assert!(k.line(&t).is_none());
+        t.feed(b"i");
+        assert_eq!(k.line(&t).unwrap().before, "gi");
     }
 
     #[test]

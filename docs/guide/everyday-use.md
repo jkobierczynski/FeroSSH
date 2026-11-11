@@ -520,7 +520,7 @@ Edit > Suggest commands as you type (off until you turn it on) shows, greyed aft
 | Type the whole suggestion | Right arrow or End |
 | Type its next word | Ctrl+Right |
 | See another match | Ctrl+Up, Ctrl+Down |
-| Forget the one shown | Shift+Delete |
+| Forget the one shown (a built-in one until FeroSSH restarts) | Shift+Delete |
 
 Any other key goes to the host as usual, and typing on simply changes or hides the suggestion. Nothing shows while you are scrolled back, in a full-screen program such as vim or less, or when the shell already shows its own suggestion after the cursor (fish, zsh-autosuggestions, PowerShell's PSReadLine).
 
@@ -528,7 +528,7 @@ FeroSSH reads the command from the screen, from the end of the prompt to the end
 
 - anything the host does not echo, such as a password typed at `Password:`, since it never appears on the screen;
 - lines typed at a prompt that asks for a password, passphrase, PIN, token or code, even when they are echoed;
-- commands that carry a secret: `PASSWORD=...`, `--token x`, `api_key: ...`, `mysql -pSecret`, `https://user:pass@host`;
+- commands that match common secret patterns: `PASSWORD=...`, `password = '...'`, `--token x`, `api_key: ...`, `mysql -pSecret`, `curl -u user:pass`, `sshpass -p`, `https://user:pass@host` (a secret in another form, such as a bare argument, can still be kept: start such a line with a space);
 - lines that start with a space, as bash's `ignorespace` does.
 
 The histories stay on this PC in `%LOCALAPPDATA%\FeroSSH\history`, one file per host, encrypted with your Windows sign-in (DPAPI): another Windows account, or the files copied to another PC, cannot read them. Edit > Clear command history for this host, or for all hosts, deletes them. Turning suggestions off stops reading what you type straight away.

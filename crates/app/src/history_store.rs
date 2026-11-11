@@ -58,20 +58,61 @@ pub fn load(key: &str) -> (History, Option<SystemTime>) {
     (history, stamp)
 }
 
+/// A history with its file's time when read.
+pub type Stamped = (History, Option<SystemTime>);
+
+/// Held while a history is read, changed and written, or histories are
+/// deleted: an exclusive open of `history.lock`, which every FeroSSH
+/// process takes the same way, so their changes and clears do not
+/// interleave. Released when dropped.
+struct Lock(#[allow(dead_code)] std::fs::File);
+
+fn lock() -> Result<Lock, String> {
+    use std::os::windows::fs::OpenOptionsExt;
+    let dir = dir().ok_or("LOCALAPPDATA is not set")?;
+    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    let path = dir.join("history.lock");
+    let mut last = String::new();
+    // Another window holds it for a few milliseconds at most.
+    for _ in 0..100 {
+        match std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .share_mode(0)
+            .open(&path)
+        {
+            Ok(f) => return Ok(Lock(f)),
+            Err(e) => last = e.to_string(),
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    Err(format!("The command history is busy ({last})."))
+}
+
 /// Reads the history of `key` from disk as it is now, applies `change`,
-/// and writes it back when `change` changed it: so two windows typing on
-/// the same host keep each other's commands, and a clear in one holds.
+/// and writes it back when `change` changed it, all under [`lock`]: so two
+/// windows typing on the same host keep each other's commands, and a clear
+/// in one holds. On an error the history comes back as changed but not
+/// saved, with the file's time from before.
 pub fn update(
     key: &str,
     change: impl FnOnce(&mut History) -> bool,
-) -> (History, Option<SystemTime>) {
+) -> Result<Stamped, (Stamped, String)> {
+    let guard = lock();
     let (mut history, stamp) = load(key);
     if !change(&mut history) {
-        return (history, stamp);
+        return Ok((history, stamp));
     }
-    let _ = save(&history);
-    let stamp = modified(key);
-    (history, stamp)
+    let saved = guard.and_then(|_guard| save(&history));
+    match saved {
+        Ok(()) => {
+            let stamp = modified(key);
+            Ok((history, stamp))
+        }
+        Err(e) => Err(((history, stamp), e)),
+    }
 }
 
 /// Writes `history` (to a file of this process's own, then over the old
@@ -93,6 +134,7 @@ fn save(history: &History) -> Result<(), String> {
 
 /// Deletes the history kept for `key`.
 pub fn clear(key: &str) {
+    let _guard = lock();
     if let Some(path) = file(key) {
         let _ = std::fs::remove_file(path);
     }
@@ -100,6 +142,7 @@ pub fn clear(key: &str) {
 
 /// Deletes every host's history.
 pub fn clear_all() {
+    let _guard = lock();
     let Some(dir) = dir() else {
         return;
     };
