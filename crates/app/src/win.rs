@@ -6540,7 +6540,10 @@ impl Window {
             }
             | Host::Tmux { .. }
             | Host::Serial { port: Some(_), .. } => true,
-            Host::Ssh(s) => s.state() == State::Connected && !s.prompt_active(),
+            // An SFTP-only login has no shell to type into.
+            Host::Ssh(s) => {
+                s.state() == State::Connected && !s.prompt_active() && !s.target.sftp_only
+            }
             Host::Telnet(s) => s.state() == State::Connected,
             _ => false,
         }

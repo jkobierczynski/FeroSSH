@@ -394,6 +394,10 @@ fn a_listing_is_settled_only_once_the_folder_asked_for_is_in() {
     run(&mut remote, &mut fake);
     assert!(remote.listing_settled());
     assert_eq!(remote.listing.path, b"/sub");
+    // A relative folder is in the home folder.
+    remote.browse(b"sub");
+    run(&mut remote, &mut fake);
+    assert_eq!(remote.listing.path, b"/sub");
     // A failed listing keeps the old folder but is not settled.
     remote.browse(b"/missing");
     run(&mut remote, &mut fake);

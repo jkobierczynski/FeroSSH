@@ -891,8 +891,18 @@ pub fn sftp_url(text: &str) -> Option<(String, Option<String>)> {
         return None;
     }
     let path = path.trim_end_matches('/');
-    let folder =
-        (!path.is_empty() && path != "/~" && !path.starts_with("/~/")).then(|| path.to_owned());
+    // `/~` is the home folder; `/~/docs` a folder in it, kept relative
+    // (the SFTP queue lists it from the home folder).
+    let folder = match path.strip_prefix("/~") {
+        Some("") => None,
+        Some(rest) => rest
+            .strip_prefix('/')
+            .map(|r| r.trim_start_matches('/').to_owned())
+            .filter(|r| !r.is_empty())
+            .map(Some)
+            .unwrap_or_else(|| Some(path.to_owned())),
+        None => (!path.is_empty()).then(|| path.to_owned()),
+    };
     Some((authority, folder))
 }
 
@@ -948,12 +958,21 @@ mod tests {
             sftp_url("SFTP://up@files.lan:2222/srv/in%20box/"),
             Some(("up@files.lan:2222".into(), Some("/srv/in box".into())))
         );
-        // WinSCP's fingerprint parameter after the user is dropped; the
-        // home folder needs no path.
+        // WinSCP's fingerprint parameter after the user is dropped; a
+        // folder under the home folder stays relative to it.
         assert_eq!(
             sftp_url("sftp://up;fingerprint=ssh-ed25519-xx@[fe80::1]:22/~/docs"),
-            Some(("up@[fe80::1]:22".into(), None))
+            Some(("up@[fe80::1]:22".into(), Some("docs".into())))
         );
+        assert_eq!(sftp_url("sftp://h/~/"), Some(("h".into(), None)));
+        assert_eq!(sftp_url("sftp://h/~"), Some(("h".into(), None)));
+        assert_eq!(
+            sftp_url("sftp://h/~user/x"),
+            Some(("h".into(), Some("/~user/x".into())))
+        );
+        assert_eq!(sftp_url("sftp://h:0"), None);
+        assert_eq!(sftp_url("sftp://h:x"), None);
+        assert_eq!(sftp_url("sftp://a,b"), None);
         assert_eq!(sftp_url("sftp://h/"), Some(("h".into(), None)));
         assert_eq!(sftp_url("files.lan"), None);
         assert_eq!(sftp_url("sftp://"), None);

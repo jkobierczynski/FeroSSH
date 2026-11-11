@@ -635,8 +635,13 @@ impl Remote {
 
     /// Lists `path` in the side pane. The old listing stays until the new
     /// one arrives, and stays if it fails.
+    /// Lists folder `path`; a relative one is in the home folder, once the
+    /// server has said which that is.
     pub fn browse(&mut self, path: &[u8]) {
-        self.listing.want = path.to_vec();
+        self.listing.want = match &self.home {
+            Some(home) if !path.starts_with(b"/") => names::join(home, path),
+            _ => path.to_vec(),
+        };
         if !self.is_ready() {
             return;
         }
@@ -646,7 +651,7 @@ impl Remote {
         let generation = self.listing.generation;
         self.request(
             SftpOp::List {
-                path: path.to_vec(),
+                path: self.listing.want.clone(),
             },
             Purpose::List { generation },
         );

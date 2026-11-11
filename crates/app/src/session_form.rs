@@ -2655,6 +2655,11 @@ mod tests {
         assert_eq!(p.kind, SessionKind::Sftp);
         assert_eq!(p.remote_folder.as_deref(), Some("/incoming"));
         assert_eq!(p.tmux, None, "no shell for tmux");
+        // Edited again, it is still an SFTP-only connection.
+        let v = Values::from_saved(&hosts[0]).with_profile(Some(p));
+        assert_eq!(v.kind, SessionKind::Sftp);
+        assert_eq!(v.jump, "bastion");
+        assert_eq!(v.remote_folder, "/incoming");
     }
 
     #[test]

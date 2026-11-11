@@ -39,7 +39,8 @@ fuzz_target!(|data: &[u8]| {
     if let Some((destination, folder)) = ssh_config::sftp_url(host) {
         assert!(ssh_config::parse_destination(&destination).is_some());
         if let Some(folder) = folder {
-            assert!(folder.starts_with('/') && !folder.chars().any(char::is_control));
+            // Absolute, or relative to the home folder (`/~/docs`).
+            assert!(!folder.is_empty() && !folder.chars().any(char::is_control));
         }
     }
 
