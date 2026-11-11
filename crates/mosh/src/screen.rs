@@ -1122,7 +1122,7 @@ pub fn render(initialized: bool, last: &Screen, next: &Screen) -> String {
     }
     if full || now.mouse.reporting != was.mouse.reporting {
         // Switch every reporting mode off, then the one in use on.
-        for m in [1000, 1001, 1002, 1003] {
+        for m in [9, 1000, 1001, 1002, 1003] {
             pen.mode(m, false);
         }
         if now.mouse.reporting != 0 {
@@ -1156,6 +1156,11 @@ fn draw_row(pen: &mut Pen, y: usize, w: usize, want: &[Cell], have: &mut [Cell])
                 .is_some_and(|c| erased(c) && c.rend == last.rend)
         {
             tail -= 1;
+        }
+        // The right half of a wide character is blank in the model; an
+        // erase from there would cut the character in two.
+        if tail > 0 && want.get(tail - 1).is_some_and(|c| c.wide) {
+            tail += 1;
         }
     }
     let mut x = 0;
@@ -1442,6 +1447,28 @@ mod tests {
     /// Random output of the kinds mosh-server's renderer and ordinary
     /// programs write: rendering any state to any later one, applied to
     /// the first, gives the later one.
+    #[test]
+    fn trailing_blanks_leave_a_wide_character_whole() {
+        let mut last = Screen::new(6, 1);
+        last.apply(b"zzzzzz\r");
+        let mut next = last.clone();
+        next.apply("ab漢\x1b[K".as_bytes());
+        let out = render(true, &last, &next);
+        // The erase of the trailing blanks starts after the right half.
+        assert!(out.contains("\x1b[K"), "{out:?}");
+        assert!(!out.contains("\x1b[1;4H"), "{out:?}");
+        round_trip(&last, &next);
+    }
+
+    #[test]
+    fn x10_mouse_reporting_is_switched_off() {
+        let mut last = Screen::new(4, 1);
+        last.apply(b"\x1b[?9h");
+        let mut next = last.clone();
+        next.apply(b"\x1b[?9l");
+        assert!(render(true, &last, &next).contains("\x1b[?9l"));
+    }
+
     #[test]
     fn scrolling_output_scrolls_the_terminal() {
         let mut a = Screen::new(20, 6);
