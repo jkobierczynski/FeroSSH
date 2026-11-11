@@ -417,6 +417,11 @@ pub struct Tracker {
     /// `seen`: until it does, no suggestion (keys typed faster than the
     /// echo would otherwise get one made for an older line).
     expect: Option<String>,
+    /// Another editing key (Tab, an arrow) came while typed text was not
+    /// echoed yet: what the line was to read, and whether it has. No
+    /// suggestion until the screen has shown it and then changed (the
+    /// host answered the key), or the next key.
+    stale: Option<(String, bool)>,
 }
 
 impl Tracker {
@@ -427,11 +432,14 @@ impl Tracker {
         self.choice = 0;
         self.sent_at = Some(term.output_count());
         let had_mark = self.mark.is_some();
-        let base = self.expect.take().or_else(|| self.seen.take());
+        let unechoed = self.expect.take();
+        self.stale = None;
+        let base = unechoed.clone().or_else(|| self.seen.take());
         let done = self.settle(term);
         match bytes {
             b"\r" | b"\r\n" | b"\n" => {
                 self.skip_line = false;
+                self.stale = None;
                 if let Some(mut mark) = self.mark.take()
                     && let Some(line) = term.input_line(&mut mark)
                 {
@@ -469,10 +477,18 @@ impl Tracker {
                 let text = std::str::from_utf8(bytes)
                     .ok()
                     .filter(|t| !t.is_empty() && !t.chars().any(char::is_control));
-                if self.mark.is_some()
-                    && let (Some(base), Some(text)) = (base, text)
-                {
-                    self.expect = Some(base + text);
+                let backspace = matches!(bytes, b"\x7f" | b"\x08");
+                match (self.mark.is_some(), base, text) {
+                    (false, ..) => {}
+                    (true, Some(base), Some(text)) => self.expect = Some(base + text),
+                    // Backspace at the end of the line: one character off.
+                    (true, Some(mut base), None) if backspace => {
+                        base.pop();
+                        self.expect = Some(base);
+                    }
+                    // Not echoed yet, and this key's line only the host
+                    // knows.
+                    _ => self.stale = unechoed.map(|line| (line, false)),
                 }
             }
         }
@@ -515,6 +531,17 @@ impl Tracker {
             return None;
         }
         let line = term.input_line(mark)?;
+        if let Some((s, shown)) = &mut self.stale {
+            if line.before == *s {
+                *shown = true;
+                return None;
+            }
+            if !*shown {
+                return None;
+            }
+            self.stale = None;
+            self.sent_at = None;
+        }
         if let Some(e) = &self.expect {
             if line.before != *e {
                 return None;
@@ -795,6 +822,32 @@ mod tests {
         assert!(k.line(&t).is_none(), "t is not echoed yet");
         t.feed(b"t");
         assert_eq!(k.line(&t).unwrap().before, "git");
+    }
+
+    #[test]
+    fn no_suggestion_while_editing_keys_are_not_answered() {
+        let mut t = term();
+        let mut k = Tracker::default();
+        t.feed(b"$ ");
+        k.typed(&t, b"g");
+        t.feed(b"g");
+        k.typed(&t, b"i");
+        t.feed(b"i");
+        assert_eq!(k.line(&t).unwrap().before, "gi");
+        // t, then Backspace, before either echo.
+        k.typed(&t, b"t");
+        k.typed(&t, b"\x7f");
+        t.feed(b"t");
+        assert!(k.line(&t).is_none(), "the Backspace is not answered yet");
+        t.feed(b"\x08\x1b[K");
+        assert_eq!(k.line(&t).unwrap().before, "gi");
+        // t, then Tab, before either answer.
+        k.typed(&t, b"t");
+        k.typed(&t, b"\t");
+        t.feed(b"t");
+        assert!(k.line(&t).is_none(), "the Tab is not answered yet");
+        t.feed(b" ");
+        assert_eq!(k.line(&t).unwrap().before, "git ");
     }
 
     #[test]
