@@ -10141,7 +10141,7 @@ impl Window {
         if let Some(p) = self.settings.profile(host)
             && !matches!(
                 p.kind,
-                SessionKind::Ssh | SessionKind::Telnet | SessionKind::Mosh
+                SessionKind::Ssh | SessionKind::Telnet | SessionKind::Mosh | SessionKind::WinRm
             )
         {
             let (kind, via) = (p.kind, p.via.clone());
