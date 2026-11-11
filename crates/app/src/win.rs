@@ -6887,9 +6887,11 @@ impl Window {
                         },
                     );
                 }
-                for remote in self.sftp.values_mut() {
+                let mut orphaned = Vec::new();
+                for (key, remote) in &mut self.sftp {
                     if remote.connection() == Some(connection) {
                         remote.detach();
+                        orphaned.push(key.clone());
                     }
                 }
                 let ids: Vec<PaneId> = self.panes.keys().copied().collect();
@@ -6924,6 +6926,9 @@ impl Window {
                     };
                     self.apply(id, effects);
                 }
+                // The panes on that worker are down now: another login to
+                // the same host takes their queues over.
+                self.hand_over_sftp(orphaned);
                 true
             }
         }
@@ -12278,9 +12283,14 @@ impl Window {
             return;
         }
         self.flush_sftp();
-        // Another login to the same host (two SFTP-only tabs never share
-        // one) takes the queue over, so it carries on without a refresh.
-        for key in closed {
+        self.hand_over_sftp(closed);
+    }
+
+    /// Queues `keys` lost their connection: another login to the same
+    /// host (two SFTP-only tabs never share one) takes each over, so its
+    /// transfers carry on without a refresh.
+    fn hand_over_sftp(&mut self, keys: Vec<String>) {
+        for key in keys {
             let heir = self.panes.iter().find_map(|(&id, p)| match &p.host {
                 Host::Ssh(s) if s.state() == State::Connected && sftp_key(&s.target) == key => {
                     Some(id)
@@ -12365,9 +12375,9 @@ impl Window {
                 && let Some(folder) = self.remote_folder(id)
                 && let Some(r) = self.sftp.get_mut(&k)
             {
-                // A queue that just opened for this pane already asked
-                // for it.
-                if !opened {
+                // A queue that just opened empty for this pane already
+                // asked for it; one that kept another's listing did not.
+                if !opened || !r.listing.path.is_empty() {
                     r.notice = None;
                     r.browse(folder.as_bytes());
                 }
