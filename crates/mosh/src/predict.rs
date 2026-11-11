@@ -46,6 +46,9 @@ const UNFLAG_RTT: f64 = 50.0;
 const LATE_ECHO: u64 = 250;
 /// Guesses kept at most; typing past this is not guessed.
 const MAX_GUESSES: usize = 512;
+/// Characters a prompt may show in place of hidden input: typing one of
+/// these and seeing it proves nothing, so it never earns trust.
+const MASKS: [char; 5] = ['*', '\u{2022}', '\u{25cf}', '\u{2219}', '\u{00b7}'];
 
 /// One keystroke's guess.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -169,8 +172,9 @@ impl Predictor {
             };
             match guess {
                 Some(cell) => {
-                    let proves = cell
-                        .is_some_and(|(row, col, c)| c.is_some() && !shows(screen, row, col, c));
+                    let proves = cell.is_some_and(|(row, col, c)| {
+                        c.is_some_and(|k| !MASKS.contains(&k)) && !shows(screen, row, col, c)
+                    });
                     self.guesses.push(Guess {
                         pos,
                         cell,
@@ -572,6 +576,21 @@ mod tests {
         p.typed(b"h", 3, &server, 0);
         p.update(&server, 1, 100.0, 0);
         assert_eq!(text(&shown(&p, &server), 0), "$ l*");
+    }
+
+    #[test]
+    fn a_mask_character_earns_no_trust() {
+        // A prompt that shows "*" for each key: a password starting with
+        // "*" looks echoed, but must not unlock the rest.
+        let mut server = Screen::new(30, 1);
+        server.apply(b"Password: ");
+        let mut p = Predictor::new(Mode::Always);
+        p.typed(b"*", 1, &server, 0);
+        server.apply(b"*");
+        p.update(&server, 1, 100.0, 0);
+        p.typed(b"s", 2, &server, 0);
+        p.update(&server, 1, 100.0, 0);
+        assert_eq!(text(&shown(&p, &server), 0), "Password: *");
     }
 
     #[test]
