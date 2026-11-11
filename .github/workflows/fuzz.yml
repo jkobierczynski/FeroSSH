@@ -53,6 +53,7 @@ jobs:
           - mosh_receive
           - mosh_screen
           - winrm_reply
+          - stats_feed
     steps:
       - uses: actions/checkout@v4
       - run: rustup toolchain install "$FUZZ_TOOLCHAIN" --profile minimal
