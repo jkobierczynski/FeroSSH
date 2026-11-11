@@ -1157,413 +1157,273 @@ impl Screen {
     }
 }
 
-/// What the pane's terminal is drawing with while a frame is written.
-struct Frame<'a> {
+/// The pane's terminal while a frame is written to it: where its cursor
+/// is (`None` after writing the last column, where terminals disagree)
+/// and what it draws with.
+struct Pen {
     out: String,
-    x: i64,
-    y: i64,
+    at: Option<(usize, usize)>,
     rend: Rendition,
     link: Link,
-    cursor_visible: bool,
-    last: &'a Screen,
+    cursor_shown: bool,
 }
 
-impl Frame<'_> {
+impl Pen {
+    /// Puts the cursor at row `y`, column `x`, unless it is there.
+    fn go(&mut self, y: usize, x: usize) {
+        if self.at != Some((y, x)) {
+            self.out.push_str(&format!("\x1b[{};{}H", y + 1, x + 1));
+            self.at = Some((y, x));
+        }
+    }
+
+    fn style(&mut self, rend: Rendition, link: &Link) {
+        if self.rend != rend {
+            self.out.push_str(&rend.sgr());
+            self.rend = rend;
+        }
+        if self.link != *link {
+            self.out.push_str(&osc8(link));
+            self.link = link.clone();
+        }
+    }
+
+    /// Hides the cursor while cells change under it.
     fn hide_cursor(&mut self) {
-        if self.cursor_visible {
+        if self.cursor_shown {
             self.out.push_str("\x1b[?25l");
-            self.cursor_visible = false;
+            self.cursor_shown = false;
         }
     }
 
-    fn silent_move(&mut self, y: usize, x: usize) {
-        if self.x == x as i64 && self.y == y as i64 {
-            return;
-        }
-        self.hide_cursor();
-        self.move_to(y, x);
+    /// Switches DEC private mode `mode` on or off.
+    fn mode(&mut self, mode: u16, on: bool) {
+        self.out
+            .push_str(&format!("\x1b[?{mode}{}", if on { 'h' } else { 'l' }));
     }
+}
 
-    fn move_to(&mut self, y: usize, x: usize) {
-        let (lx, ly) = (self.x, self.y);
-        let (x, y) = (x as i64, y as i64);
-        self.x = x;
-        self.y = y;
-        if lx != -1 && ly != -1 {
-            if x == 0 && y - ly >= 0 && y - ly < 5 {
-                if lx != 0 {
-                    self.out.push('\r');
-                }
-                for _ in 0..y - ly {
-                    self.out.push('\n');
-                }
-                return;
-            }
-            if y == ly && x - lx < 0 && x - lx > -5 {
-                for _ in 0..lx - x {
-                    self.out.push('\x08');
-                }
-                return;
-            }
-        }
-        self.out.push_str(&format!("\x1b[{};{}H", y + 1, x + 1));
-    }
+/// Whether `c` is a blank that erasing leaves: no text, no link, and only
+/// a background colour.
+fn erased(c: &Cell) -> bool {
+    c.text.is_empty() && c.link.is_none() && c.rend == Rendition::blank(c.rend.bg)
+}
 
-    fn rendition(&mut self, r: Rendition, force: bool) {
-        if force || self.rend != r {
-            self.out.push_str(&r.sgr());
-            self.rend = r;
+/// Shifted rows that `next` shares with `last`: how far the screen moved
+/// up (0 when it did not) so that most of the rows need no redraw.
+fn scrolled_by(last: &[Arc<Row>], next: &[Arc<Row>]) -> usize {
+    let h = next.len().min(last.len());
+    let same = |k: usize| -> usize {
+        (0..h - k)
+            .filter(|&i| match (next.get(i), last.get(i + k)) {
+                (Some(a), Some(b)) => Arc::ptr_eq(a, b) || a == b,
+                _ => false,
+            })
+            .count()
+    };
+    let unmoved = same(0);
+    let mut best = (0, unmoved);
+    for k in 1..h {
+        let kept = same(k);
+        // Worth it only when the moved rows outnumber the unmoved ones
+        // and make up half of what stays on screen.
+        if kept > best.1 && kept * 2 >= h - k {
+            best = (k, kept);
         }
     }
-
-    fn hyperlink(&mut self, l: &Link, force: bool) {
-        if force || self.link != *l {
-            self.out.push_str(&osc8(l));
-            self.link = l.clone();
-        }
-    }
-
-    fn cell(&mut self, c: &Cell) {
-        c.grapheme(&mut self.out);
-    }
+    best.0
 }
 
 /// Writes the output that turns a terminal showing `last` into one
 /// showing `next`. Without `initialized`, the terminal's contents are
-/// unknown and everything is drawn. This is Mosh's own display algorithm,
-/// so the output scrolls the terminal (and its scrollback) as the screen
-/// scrolled, rather than redrawing it.
+/// unknown and everything is drawn. When the screen scrolled, the
+/// terminal is scrolled too (so the lines go to its scrollback) and only
+/// what then differs is drawn.
 pub fn render(initialized: bool, last: &Screen, next: &Screen) -> String {
-    let mut initialized = initialized;
-    let mut f = Frame {
+    let (w, h) = (next.width(), next.height());
+    let full = !initialized || w != last.width() || h != last.height();
+    let mut pen = Pen {
         out: String::new(),
-        x: 0,
-        y: 0,
+        at: None,
         rend: Rendition::default(),
         link: None,
-        cursor_visible: last.ds.cursor_visible,
-        last,
+        cursor_shown: last.ds.cursor_visible,
     };
-    if next.bells != f.last.bells {
-        f.out.push('\x07');
+
+    // Things outside the cells.
+    if next.bells != last.bells {
+        pen.out.push('\x07');
     }
-    if next.title_set
-        && (!initialized || next.icon_name != f.last.icon_name || next.title != f.last.title)
-    {
-        let clean = |s: &str| -> String { s.chars().filter(|c| !c.is_control()).collect() };
-        if next.icon_name == next.title {
-            f.out
-                .push_str(&format!("\x1b]0;{}\x07", clean(&next.title)));
+    let printable = |s: &str| -> String { s.chars().filter(|c| !c.is_control()).collect() };
+    if next.title_set && (full || next.title != last.title || next.icon_name != last.icon_name) {
+        if next.title == next.icon_name {
+            pen.out
+                .push_str(&format!("\x1b]0;{}\x07", printable(&next.title)));
         } else {
-            f.out
-                .push_str(&format!("\x1b]1;{}\x07", clean(&next.icon_name)));
-            f.out
-                .push_str(&format!("\x1b]2;{}\x07", clean(&next.title)));
+            pen.out
+                .push_str(&format!("\x1b]1;{}\x07", printable(&next.icon_name)));
+            pen.out
+                .push_str(&format!("\x1b]2;{}\x07", printable(&next.title)));
         }
     }
-    if next.clipboard != f.last.clipboard {
-        let clip: String = next
+    if next.clipboard != last.clipboard {
+        let base64: String = next
             .clipboard
             .chars()
             .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '/' | '='))
             .collect();
-        f.out.push_str(&format!("\x1b]52;c;{clip}\x07"));
+        pen.out.push_str(&format!("\x1b]52;c;{base64}\x07"));
     }
-    if !initialized || next.ds.reverse_video != f.last.ds.reverse_video {
-        f.out.push_str(if next.ds.reverse_video {
-            "\x1b[?5h"
-        } else {
-            "\x1b[?5l"
-        });
+    if full || next.ds.reverse_video != last.ds.reverse_video {
+        pen.mode(5, next.ds.reverse_video);
     }
-    let (w, h) = (next.width(), next.height());
-    if !initialized || w != f.last.width() || h != f.last.height() {
-        f.out.push_str("\x1b[r\x1b[0m\x1b]8;;\x1b\\\x1b[H\x1b[2J");
-        initialized = false;
-        f.x = 0;
-        f.y = 0;
-        f.rend = Rendition::default();
-        f.link = None;
+
+    // What the terminal shows now, row by row.
+    let mut shown: Vec<Arc<Row>>;
+    if full {
+        pen.hide_cursor();
+        pen.out.push_str("\x1b[r\x1b[0m\x1b]8;;\x1b\\\x1b[H\x1b[2J");
+        pen.at = Some((0, 0));
+        let blank = Arc::new(Row::new(w, Color::Default));
+        shown = vec![blank; h];
     } else {
-        f.x = f.last.ds.cursor_col as i64;
-        f.y = f.last.ds.cursor_row as i64;
-        f.rend = f.last.ds.rend;
-        f.link = f.last.ds.link.clone();
-    }
-    if !initialized {
-        f.cursor_visible = false;
-        f.out.push_str("\x1b[?25l");
-    }
-
-    let mut rows: Vec<Arc<Row>> = f.last.rows.clone();
-    if f.last.width() < w {
-        for r in &mut rows {
-            let mut wider = (**r).clone();
-            wider.cells.resize(w, Cell::blank(Color::Default));
-            *r = Arc::new(wider);
+        if !last.ds.next_print_wraps {
+            pen.at = Some((last.ds.cursor_row, last.ds.cursor_col));
         }
-    }
-    let blank = Arc::new(Row::new(w, Color::Default));
-    if rows.len() < h {
-        rows.resize(h, blank.clone());
-    }
-
-    let mut frame_y = 0;
-    if initialized {
-        let mut lines_scrolled = 0;
-        let mut scroll_height = 0;
-        if let Some(first) = next.rows.first() {
-            for (row, old) in rows.iter().enumerate().take(h) {
-                if !(Arc::ptr_eq(first, old) || **first == **old) {
-                    continue;
-                }
-                if row == 0 {
-                    break;
-                }
-                lines_scrolled = row;
-                scroll_height = 1;
-                let mut region = 1;
-                while lines_scrolled + region < h {
-                    match (next.rows.get(region), rows.get(lines_scrolled + region)) {
-                        (Some(a), Some(b)) if **a == **b => scroll_height = region + 1,
-                        _ => break,
-                    }
-                    region += 1;
-                }
-                break;
+        pen.rend = last.ds.rend;
+        pen.link = last.ds.link.clone();
+        shown = last.rows.clone();
+        let k = scrolled_by(&shown, &next.rows);
+        if k > 0 {
+            // A line feed on the bottom row scrolls the whole screen up.
+            pen.hide_cursor();
+            pen.style(Rendition::default(), &None);
+            pen.go(h - 1, 0);
+            for _ in 0..k {
+                pen.out.push('\n');
             }
-        }
-        if scroll_height > 0 {
-            frame_y = scroll_height;
-            if lines_scrolled > 0 {
-                f.rendition(Rendition::default(), true);
-                f.hyperlink(&None, true);
-                let bottom = lines_scrolled + scroll_height - 1;
-                if scroll_height + lines_scrolled == h && f.y + 1 == h as i64 {
-                    f.out.push('\r');
-                    for _ in 0..lines_scrolled {
-                        f.out.push('\n');
-                    }
-                    f.x = 0;
-                } else {
-                    f.out.push_str(&format!("\x1b[1;{}r", bottom + 1));
-                    f.x = -1;
-                    f.y = -1;
-                    f.silent_move(bottom, 0);
-                    for _ in 0..lines_scrolled {
-                        f.out.push('\n');
-                    }
-                    f.out.push_str("\x1b[r");
-                    f.x = -1;
-                    f.y = -1;
-                }
-                for i in 0..=bottom {
-                    let moved = if i + lines_scrolled <= bottom {
-                        rows.get(i + lines_scrolled).cloned()
-                    } else {
-                        None
-                    };
-                    if let Some(slot) = rows.get_mut(i) {
-                        *slot = moved.unwrap_or_else(|| blank.clone());
-                    }
-                }
-            }
+            shown.drain(..k);
+            shown.extend((0..k).map(|_| Arc::new(Row::new(w, Color::Default))));
         }
     }
 
-    let mut wrap = false;
-    while frame_y < h {
-        if let (Some(row), Some(old)) = (next.rows.get(frame_y), rows.get(frame_y)) {
-            wrap = put_row(initialized, &mut f, next, frame_y, row, old, wrap);
-        }
-        frame_y += 1;
-    }
-
-    let (cy, cx) = (next.ds.cursor_row, next.ds.cursor_col);
-    if !initialized || cy as i64 != f.y || cx as i64 != f.x {
-        f.move_to(cy, cx);
-    }
-    if !initialized || next.ds.cursor_visible != f.cursor_visible {
-        f.out.push_str(if next.ds.cursor_visible {
-            "\x1b[?25h"
-        } else {
-            "\x1b[?25l"
-        });
-    }
-    f.rendition(next.ds.rend, !initialized);
-    f.hyperlink(&next.ds.link, !initialized);
-    let lds = &f.last.ds;
-    if !initialized || next.ds.bracketed_paste != lds.bracketed_paste {
-        f.out.push_str(if next.ds.bracketed_paste {
-            "\x1b[?2004h"
-        } else {
-            "\x1b[?2004l"
-        });
-    }
-    let (m, lm) = (next.ds.mouse, lds.mouse);
-    if !initialized || m.reporting != lm.reporting {
-        if m.reporting == 0 {
-            f.out
-                .push_str("\x1b[?1003l\x1b[?1002l\x1b[?1001l\x1b[?1000l");
-        } else {
-            if lm.reporting != 0 {
-                f.out.push_str(&format!("\x1b[?{}l", lm.reporting));
-            }
-            f.out.push_str(&format!("\x1b[?{}h", m.reporting));
-        }
-    }
-    if !initialized || m.focus != lm.focus {
-        f.out.push_str(if m.focus {
-            "\x1b[?1004h"
-        } else {
-            "\x1b[?1004l"
-        });
-    }
-    if !initialized || m.encoding != lm.encoding {
-        if m.encoding == 0 {
-            f.out.push_str("\x1b[?1015l\x1b[?1006l\x1b[?1005l");
-        } else {
-            if lm.encoding != 0 {
-                f.out.push_str(&format!("\x1b[?{}l", lm.encoding));
-            }
-            f.out.push_str(&format!("\x1b[?{}h", m.encoding));
-        }
-    }
-    f.out
-}
-
-fn put_row(
-    initialized: bool,
-    f: &mut Frame<'_>,
-    next: &Screen,
-    y: usize,
-    row: &Arc<Row>,
-    old: &Arc<Row>,
-    wrap: bool,
-) -> bool {
-    let mut x = 0;
-    let cells = &row.cells;
-    let mut wrote_last = false;
-    if wrap && let Some(cell) = cells.first() {
-        f.rendition(cell.rend, false);
-        f.hyperlink(&cell.link, false);
-        let cw = if cell.wide && next.width() < 2 {
-            f.out.push(' ');
-            1
-        } else {
-            f.cell(cell);
-            cell.width()
-        };
-        x += cw;
-        f.x += cw as i64;
-        wrote_last = x >= next.width();
-    }
-    if initialized && Arc::ptr_eq(row, old) {
-        if wrote_last {
-            f.x = -1;
-            f.y = -1;
-        }
-        return false;
-    }
-    let wrap_this = row.wraps();
-    let width = next.width();
-    let mut clear = 0;
-    let mut blank_rend = Rendition::default();
-    let mut blank_link: Link = None;
-    while x < width {
-        let Some(cell) = cells.get(x) else {
-            break;
-        };
-        if initialized && clear == 0 && old.cells.get(x) == Some(cell) {
-            x += cell.width();
+    for (y, (row, old)) in next.rows.iter().zip(shown.iter_mut()).enumerate() {
+        if Arc::ptr_eq(row, old) || row.cells == old.cells {
             continue;
         }
-        if cell.text.is_empty() {
-            if clear == 0 {
-                blank_rend = cell.rend;
-                blank_link = cell.link.clone();
-            }
-            if cell.rend == blank_rend && cell.link == blank_link {
-                clear += 1;
-                x += 1;
-                continue;
-            }
+        pen.hide_cursor();
+        draw_row(&mut pen, y, w, &row.cells, &mut Arc::make_mut(old).cells);
+    }
+
+    // The cursor and modes.
+    let (cy, cx) = (next.ds.cursor_row, next.ds.cursor_col);
+    pen.go(cy.min(h.saturating_sub(1)), cx.min(w.saturating_sub(1)));
+    if full {
+        pen.out.push_str("\x1b[0m\x1b]8;;\x1b\\");
+        pen.rend = Rendition::default();
+        pen.link = None;
+    }
+    pen.style(next.ds.rend, &next.ds.link);
+    if pen.cursor_shown != next.ds.cursor_visible || full {
+        pen.mode(25, next.ds.cursor_visible);
+    }
+    let (now, was) = (&next.ds, &last.ds);
+    if full || now.bracketed_paste != was.bracketed_paste {
+        pen.mode(2004, now.bracketed_paste);
+    }
+    if full || now.mouse.reporting != was.mouse.reporting {
+        // Switch every reporting mode off, then the one in use on.
+        for m in [1000, 1001, 1002, 1003] {
+            pen.mode(m, false);
         }
-        if clear > 0 {
-            f.silent_move(y, x - clear);
-            f.rendition(blank_rend, false);
-            f.hyperlink(&blank_link, false);
-            if clear > 4 {
-                f.out.push_str(&format!("\x1b[{clear}X"));
-            } else {
-                for _ in 0..clear {
-                    f.out.push(' ');
-                }
-                f.x = x as i64;
-            }
-            clear = 0;
-            if cell.text.is_empty() {
-                blank_rend = cell.rend;
-                blank_link = cell.link.clone();
-                clear = 1;
-                x += 1;
-                continue;
-            }
+        if now.mouse.reporting != 0 {
+            pen.mode(now.mouse.reporting, true);
         }
-        // A wide character with no room for its right half (left there
-        // by a resize) would wrap the pane's terminal: draw a space.
-        let squeezed = cell.wide && x + 2 > width;
-        let cw = if squeezed { 1 } else { cell.width() };
-        if wrap_this && x + cw >= width {
-            f.x = -1;
-            f.y = -1;
+    }
+    if full || now.mouse.focus != was.mouse.focus {
+        pen.mode(1004, now.mouse.focus);
+    }
+    if full || now.mouse.encoding != was.mouse.encoding {
+        for m in [1005, 1006, 1015] {
+            pen.mode(m, false);
         }
-        f.silent_move(y, x);
-        f.rendition(cell.rend, false);
-        f.hyperlink(&cell.link, false);
-        if squeezed {
-            f.out.push(' ');
+        if now.mouse.encoding != 0 {
+            pen.mode(now.mouse.encoding, true);
+        }
+    }
+    pen.out
+}
+
+/// Draws the cells of row `y` that differ between `want` and `have`,
+/// and brings `have` up to date.
+fn draw_row(pen: &mut Pen, y: usize, w: usize, want: &[Cell], have: &mut [Cell]) {
+    // Where the row's trailing erased blanks of one colour begin: one
+    // erase-to-end draws them.
+    let mut tail = want.len().min(w);
+    if let Some(last) = want.get(tail.wrapping_sub(1)).filter(|c| erased(c)) {
+        while tail > 0
+            && want
+                .get(tail - 1)
+                .is_some_and(|c| erased(c) && c.rend == last.rend)
+        {
+            tail -= 1;
+        }
+    }
+    let mut x = 0;
+    while x < tail {
+        let Some(cell) = want.get(x) else {
+            break;
+        };
+        let width = if cell.wide { 2 } else { 1 };
+        if have.get(x) == Some(cell) && (width == 1 || have.get(x + 1) == want.get(x + 1)) {
+            x += width;
+            continue;
+        }
+        // A run of erased blanks: erase them without moving.
+        let run = want
+            .get(x..tail)
+            .unwrap_or_default()
+            .iter()
+            .take_while(|c| erased(c) && c.rend == cell.rend)
+            .count();
+        if run >= 4 {
+            pen.go(y, x);
+            pen.style(cell.rend, &None);
+            pen.out.push_str(&format!("\x1b[{run}X"));
+            for (h, c) in have.iter_mut().zip(want).skip(x).take(run) {
+                *h = c.clone();
+            }
+            x += run;
+            continue;
+        }
+        pen.go(y, x);
+        pen.style(cell.rend, &cell.link);
+        if cell.wide && x + 2 > w {
+            // No room for the right half (left by a resize): a space,
+            // which cannot wrap the terminal.
+            pen.out.push(' ');
         } else {
-            f.cell(cell);
+            cell.grapheme(&mut pen.out);
         }
-        x += cw;
-        f.x += cw as i64;
-        if x >= width {
-            wrote_last = true;
-        }
-    }
-    if clear > 0 {
-        f.silent_move(y, x - clear);
-        f.rendition(blank_rend, false);
-        f.hyperlink(&blank_link, false);
-        if !wrap_this {
-            f.out.push_str("\x1b[K");
-        } else {
-            for _ in 0..clear {
-                f.out.push(' ');
+        let drawn = if cell.wide && x + 2 <= w { 2 } else { 1 };
+        for i in x..x + drawn {
+            if let (Some(h), Some(c)) = (have.get_mut(i), want.get(i)) {
+                *h = c.clone();
             }
-            f.x = x as i64;
-            wrote_last = true;
+        }
+        x += drawn;
+        pen.at = (x < w).then_some((y, x));
+    }
+    if have.get(tail..) != want.get(tail..) {
+        if let Some(c) = want.get(tail) {
+            pen.go(y, tail);
+            pen.style(c.rend, &None);
+            pen.out.push_str("\x1b[K");
+        }
+        for (h, c) in have.iter_mut().zip(want).skip(tail) {
+            *h = c.clone();
         }
     }
-    if !(wrote_last && y + 1 < next.height()) {
-        if wrote_last {
-            // The cursor sits on the last column with a wrap pending,
-            // where terminals differ: place it explicitly next time.
-            f.x = -1;
-            f.y = -1;
-        }
-        return false;
-    }
-    if wrap_this {
-        f.x = 0;
-        f.y += 1;
-        return true;
-    }
-    f.out.push_str("\r\n");
-    f.x = 0;
-    f.y += 1;
-    false
 }
 
 /// How a terminal showing `last`, after the output of `render(init,
@@ -1795,6 +1655,21 @@ mod tests {
     /// programs write: rendering any state to any later one, applied to
     /// the first, gives the later one.
     #[test]
+    fn scrolling_output_scrolls_the_terminal() {
+        let mut a = Screen::new(20, 6);
+        for i in 0..6 {
+            a.apply(format!("line {i}\r\n").as_bytes());
+        }
+        let mut b = a.clone();
+        b.apply(b"line 6\r\nline 7\r\n");
+        let out = render(true, &a, &b);
+        assert!(out.contains("\n\n"), "{out:?}");
+        // Only the new lines are drawn, not the ones that moved up.
+        assert!(!out.contains("line 3"), "{out:?}");
+        assert_eq!(render_mismatch(true, &a, &b), None);
+    }
+
+    #[test]
     fn rendering_reproduces_random_screens() {
         let mut x: u64 = 0x2545_F491_4F6C_DD1D;
         let mut rnd = |n: u64| {
@@ -1803,7 +1678,11 @@ mod tests {
             x ^= x << 17;
             x % n
         };
-        for round in 0..400 {
+        for round in 0..std::env::var("MOSH_ROUNDS")
+            .ok()
+            .and_then(|r| r.parse().ok())
+            .unwrap_or(400)
+        {
             let (w, h) = (1 + rnd(30) as usize, 1 + rnd(12) as usize);
             let mut a = Screen::new(w, h);
             let mut states = vec![a.clone()];

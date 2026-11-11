@@ -168,6 +168,8 @@ fn types_into_a_real_server_and_sees_the_screen() {
     assert!(lines.len() >= 20, "{}", r.screen_text());
     assert!(lines.windows(2).all(|w| w[1] == w[0] + 1), "{lines:?}");
     // Resizing: the server's screen follows.
+    // The pane changes size first; the client tells the server.
+    r.shown.resize(100, 30);
     r.client.resize(100, 30);
     r.client.keys(b"stty size\r");
     assert!(
