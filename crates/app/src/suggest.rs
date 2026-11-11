@@ -543,7 +543,10 @@ impl Tracker {
             self.sent_at = None;
         }
         if let Some(e) = &self.expect {
-            if line.before != *e {
+            // The line must read as expected, and the host must have
+            // answered since the last key: Backspace after an unechoed
+            // key expects a line the screen may show already.
+            if line.before != *e || self.sent_at == Some(term.output_count()) {
                 return None;
             }
             self.expect = None;
@@ -837,6 +840,7 @@ mod tests {
         // t, then Backspace, before either echo.
         k.typed(&t, b"t");
         k.typed(&t, b"\x7f");
+        assert!(k.line(&t).is_none(), "nothing is answered yet");
         t.feed(b"t");
         assert!(k.line(&t).is_none(), "the Backspace is not answered yet");
         t.feed(b"\x08\x1b[K");
