@@ -18,6 +18,7 @@
 
 use ferossh_auth::Job;
 use ferossh_auth::negotiate::{Credentials, SspiJob};
+use ferossh_config::saved::SavedHost;
 use ferossh_config::ssh_config;
 use ferossh_config::{DEFAULT_WINRM_COMMAND, DEFAULT_WINRM_PORT};
 use ferossh_ipc::{ChannelId, MAX_DATA_CHUNK, Message, SspiOp, Timing};
@@ -92,20 +93,34 @@ impl WinrmTarget {
     /// A saved WinRM connection `name`: its `HostName`, `Port` (5985
     /// when unset), `User`, `Tag` and `ConnectTimeout`, and the command
     /// its profile names.
-    pub fn resolve(name: &str, env: &Env, command: Option<&str>) -> Option<Self> {
+    ///
+    /// The host, user and port come from the saved connection itself when
+    /// there is one (`saved`), so an SSH `Host *` block's `User` or `Port`
+    /// cannot override them, and a blank user still means the Windows
+    /// logon.
+    pub fn resolve(
+        name: &str,
+        env: &Env,
+        command: Option<&str>,
+        saved: Option<&SavedHost>,
+    ) -> Option<Self> {
         let includes = ssh_config::DirIncludes {
             home: env.home.clone(),
         };
         let cfg = ssh_config::resolve_in(&env.config, name, &includes);
-        let hostname = cfg.hostname.unwrap_or_else(|| name.to_owned());
+        let (hostname, port, user) = match saved {
+            Some(h) => (h.hostname.clone(), h.port, h.user.clone()),
+            None => (cfg.hostname, cfg.port, cfg.user),
+        };
+        let hostname = hostname.unwrap_or_else(|| name.to_owned());
         if !ferossh_config::saved::valid_hostname(&hostname) {
             return None;
         }
         Some(Self {
             alias: name.to_owned(),
             hostname,
-            port: cfg.port.unwrap_or(DEFAULT_WINRM_PORT),
-            user: cfg.user.filter(|u| valid_user(u)),
+            port: port.unwrap_or(DEFAULT_WINRM_PORT),
+            user: user.filter(|u| valid_user(u)),
             command: command
                 .map(str::trim)
                 .filter(|c| !c.is_empty())
@@ -726,13 +741,34 @@ mod tests {
             config: "Host dc\n    HostName dc1.lab.test\n    User LAB\\admin\n    Tag production\n"
                 .into(),
         };
-        let t = WinrmTarget::resolve("dc", &env, Some("cmd")).unwrap();
+        let t = WinrmTarget::resolve("dc", &env, Some("cmd"), None).unwrap();
         assert_eq!((t.hostname.as_str(), t.port), ("dc1.lab.test", 5985));
         assert_eq!(t.user.as_deref(), Some("LAB\\admin"));
         assert_eq!(t.command, "cmd");
         assert_eq!(t.tag.as_deref(), Some("production"));
-        let t = WinrmTarget::resolve("dc", &env, Some("  ")).unwrap();
+        let t = WinrmTarget::resolve("dc", &env, Some("  "), None).unwrap();
         assert_eq!(t.command, DEFAULT_WINRM_COMMAND);
+        // A saved connection keeps its own user and port over an SSH
+        // `Host *` block, and a blank user stays blank.
+        let env = Env {
+            config: "Host *\n    User sshuser\n    Port 2222\n".into(),
+            ..env
+        };
+        let saved = SavedHost {
+            alias: "dc".into(),
+            hostname: Some("dc1.lab.test".into()),
+            ..SavedHost::default()
+        };
+        let t = WinrmTarget::resolve("dc", &env, None, Some(&saved)).unwrap();
+        assert_eq!((t.hostname.as_str(), t.port), ("dc1.lab.test", 5985));
+        assert_eq!(t.user, None);
+        let saved = SavedHost {
+            user: Some("LAB\\admin".into()),
+            port: Some(5986),
+            ..saved
+        };
+        let t = WinrmTarget::resolve("dc", &env, None, Some(&saved)).unwrap();
+        assert_eq!((t.port, t.user.as_deref()), (5986, Some("LAB\\admin")));
     }
 
     #[test]

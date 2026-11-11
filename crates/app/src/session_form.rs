@@ -2573,7 +2573,7 @@ mod tests {
             vars: Vec::new(),
             config: text,
         };
-        let t = crate::winrm::WinrmTarget::resolve("win-srv", &env, None).unwrap();
+        let t = crate::winrm::WinrmTarget::resolve("win-srv", &env, None, None).unwrap();
         assert_eq!(t.user.as_deref(), Some("LAB\\admin"));
     }
 

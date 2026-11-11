@@ -4914,7 +4914,15 @@ impl Window {
         }
         let winrm = match self.settings.profile(destination) {
             Some(p) if p.kind == SessionKind::WinRm => {
-                WinrmTarget::resolve(destination, &env, p.winrm_command.as_deref())
+                let saved = load_saved()
+                    .into_iter()
+                    .find(|h| h.alias.eq_ignore_ascii_case(destination));
+                WinrmTarget::resolve(
+                    destination,
+                    &env,
+                    p.winrm_command.as_deref(),
+                    saved.as_ref(),
+                )
             }
             _ => WinrmTarget::typed(destination),
         };
@@ -9295,6 +9303,12 @@ impl Window {
                 target.port.clone(),
                 String::new(),
                 0,
+            ),
+            Host::Winrm(s) => (
+                s.target.alias.clone(),
+                s.target.hostname.clone(),
+                s.target.user.clone().unwrap_or_default(),
+                s.target.port,
             ),
             Host::Tmux { gateway, .. } => {
                 let gateway = *gateway;
