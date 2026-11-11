@@ -12830,14 +12830,17 @@ impl Window {
         // No shell reports a folder on an SFTP-only login: the folder File
         // transfer shows, else the one it started in.
         if self.sftp_only(id) {
-            // The listing, when it was last this connection's; another
-            // tab's for the same login lists its own folder.
+            // The listing, only when this connection asked for it and it
+            // has come in: another tab's for the same login lists its own
+            // folder, and a queue opened in the background, a listing
+            // still loading or one that failed may show another's.
             let ours = self
                 .pane_sftp_key(id)
                 .and_then(|k| self.files_alias_shown.get(&k))
-                .is_none_or(|a| Some(a) == self.files_ident(id).as_ref());
+                .is_some_and(|a| Some(a) == self.files_ident(id).as_ref());
             if ours
                 && let Some(r) = remote
+                && r.listing_settled()
                 && !r.listing.path.is_empty()
             {
                 return r.listing.path.clone();

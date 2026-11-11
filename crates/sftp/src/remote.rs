@@ -652,6 +652,12 @@ impl Remote {
         );
     }
 
+    /// The listing shows what the last [`Self::browse`] asked for: no
+    /// request is waiting or loading, and the last one did not fail.
+    pub fn listing_settled(&self) -> bool {
+        !self.listing.loading && self.listing.want.is_empty() && self.listing.error.is_none()
+    }
+
     pub fn refresh(&mut self) {
         let path = if self.listing.path.is_empty() {
             self.listing.want.clone()
