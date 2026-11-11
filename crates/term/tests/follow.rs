@@ -252,3 +252,15 @@ fn matches_are_shown_in_the_middle_row() {
     lines(&mut t, 50, 60);
     assert_eq!(rows(&t)[4], "boom");
 }
+
+#[test]
+fn clearing_the_pattern_drops_the_stop_and_its_selection() {
+    let mut t = Terminal::new(40, 5, &Settings::new(100));
+    t.set_stop_pattern(Some("boom")).unwrap();
+    t.feed(b"boom\r\n");
+    assert!(t.stopped());
+    assert_eq!(t.selection_text().as_deref(), Some("boom"));
+    t.set_stop_pattern(None).unwrap();
+    assert!(!t.stopped());
+    assert_eq!(t.selection_text(), None);
+}

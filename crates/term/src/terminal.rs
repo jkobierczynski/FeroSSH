@@ -297,6 +297,10 @@ impl Terminal {
                 last_hit: None,
             }
         });
+        if self.stopped {
+            // The match selected when it stopped goes with the stop.
+            self.term.selection = None;
+        }
         self.stopped = false;
         self.rescan_from_cursor();
     }
