@@ -212,9 +212,10 @@ fn without_right_prompt<'a>(text: &'a str, right: &str) -> &'a str {
 const MAX_INPUT_CHARS: usize = 1024;
 
 /// The most rows a command line of [`MAX_INPUT_CHARS`] spans on rows of
-/// `cols` columns, with the prompt (wide characters take two cells).
+/// `cols` columns, with the prompt: wide characters take two cells, and
+/// one that does not fit at a row's end leaves that cell blank.
 fn max_input_rows(cols: usize) -> usize {
-    2 * MAX_INPUT_CHARS / cols.max(1) + 2
+    MAX_INPUT_CHARS / (cols / 2).max(1) + 2
 }
 
 /// One terminal: the emulator, its parser and the pane's search state.

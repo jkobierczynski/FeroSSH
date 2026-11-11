@@ -857,4 +857,11 @@ fn input_line_follows_a_long_line_of_wide_characters() {
     let cmd = "\u{754c}".repeat(550);
     t.feed(cmd.as_bytes());
     assert_eq!(t.input_line(&mut mark).unwrap().before, cmd);
+    // An odd width leaves a blank cell at each row's end.
+    let mut t = term(19, 130);
+    t.feed(b"$ ");
+    let mut mark = t.input_mark().unwrap();
+    let cmd = "\u{754c}".repeat(1024);
+    t.feed(cmd.as_bytes());
+    assert_eq!(t.input_line(&mut mark).unwrap().before, cmd);
 }
