@@ -59,6 +59,9 @@ struct Guess {
     cursor: (usize, usize),
     /// When it was made (ms).
     at: u64,
+    /// The cell showed something else when the key was typed, so the
+    /// screen showing the character later proves the server echoed it.
+    proves: bool,
 }
 
 /// The guesses not yet confirmed, and whether they may be shown.
@@ -166,11 +169,14 @@ impl Predictor {
             };
             match guess {
                 Some(cell) => {
+                    let proves = cell
+                        .is_some_and(|(row, col, c)| c.is_some() && !shows(screen, row, col, c));
                     self.guesses.push(Guess {
                         pos,
                         cell,
                         cursor,
                         at: now,
+                        proves,
                     });
                     if self.trusted {
                         self.changed();
@@ -197,13 +203,16 @@ impl Predictor {
             // Only the last guess for each cell must still show: an
             // earlier one was typed over or erased by a later keystroke.
             let mut cells = Vec::new();
-            let mut right = checked.last().is_some_and(|g| cursor == g.cursor);
+            // The server may already show keys it has not acknowledged:
+            // the cursor and a cell may be where a pending guess put them.
+            let mut right = checked.last().is_some_and(|g| cursor == g.cursor)
+                || self.guesses.iter().any(|g| g.cursor == cursor);
             // Trust needs a typed character that came true: an erased
             // cell or a cursor move also "holds" where the server echoes
             // nothing, as at a password prompt.
             let mut typed = false;
             for g in checked.iter().rev() {
-                let Some((row, col, c)) = g.cell else {
+                let Some((row, col, _)) = g.cell else {
                     continue;
                 };
                 if cells.contains(&(row, col)) {
@@ -211,10 +220,16 @@ impl Predictor {
                 }
                 cells.push((row, col));
                 if !holds(screen, g) {
+                    let later = |p: &Guess| {
+                        p.cell.is_some_and(|(r, k, _)| (r, k) == (row, col)) && holds(screen, p)
+                    };
+                    if self.guesses.iter().any(later) {
+                        continue;
+                    }
                     right = false;
                     break;
                 }
-                typed |= c.is_some();
+                typed |= g.proves;
             }
             if !right {
                 self.guesses.clear();
@@ -296,9 +311,12 @@ impl Predictor {
 
 /// Whether the screen shows what guess `g` put in its cell.
 fn holds(screen: &Screen, g: &Guess) -> bool {
-    let Some((row, col, c)) = g.cell else {
-        return true;
-    };
+    g.cell
+        .is_none_or(|(row, col, c)| shows(screen, row, col, c))
+}
+
+/// Whether the cell at `row`, `col` shows `c` (`None`: is blank).
+fn shows(screen: &Screen, row: usize, col: usize, c: Option<char>) -> bool {
     let Some(cell) = screen.cell(row, col) else {
         return false;
     };
@@ -485,6 +503,40 @@ mod tests {
         p.typed(b"b", 3, &server, 0);
         p.update(&server, 2, 100.0, 0);
         assert_eq!(text(&shown(&p, &server), 0), "Password:");
+    }
+
+    #[test]
+    fn a_character_already_there_earns_no_trust() {
+        // A hidden prompt with an "x" under the cursor: typing x and Left,
+        // both acknowledged and neither echoed, leaves the screen as is.
+        let mut server = Screen::new(30, 1);
+        server.apply(b"Password: x\x08");
+        let mut p = Predictor::new(Mode::Always);
+        p.typed(b"x\x1b[D", 2, &server, 0);
+        p.update(&server, 2, 100.0, 0);
+        p.typed(b"s", 3, &server, 0);
+        p.update(&server, 2, 100.0, 0);
+        assert_eq!(text(&shown(&p, &server), 0), "Password: x");
+    }
+
+    #[test]
+    fn a_screen_ahead_of_the_acknowledgement_keeps_trust() {
+        let mut server = Screen::new(20, 1);
+        server.apply(b"$ ");
+        let mut p = Predictor::new(Mode::Always);
+        p.typed(b"l", 1, &server, 0);
+        server.apply(b"l");
+        p.update(&server, 1, 100.0, 0);
+        // The server shows a, b and x-then-erased, but has acknowledged
+        // only up to x.
+        for (i, k) in [&b"a"[..], b"b", b"x", b"\x7f"].into_iter().enumerate() {
+            p.typed(k, 2 + i as u64, &server, 0);
+        }
+        server.apply(b"abx\x08\x1b[K");
+        p.update(&server, 4, 100.0, 0);
+        p.typed(b"s", 6, &server, 0);
+        p.update(&server, 4, 100.0, 0);
+        assert_eq!(text(&shown(&p, &server), 0), "$ labs");
     }
 
     #[test]
