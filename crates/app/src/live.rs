@@ -44,6 +44,8 @@ pub fn clean_name(text: &str) -> Option<String> {
 pub enum Kind {
     Ssh,
     Mosh,
+    /// An SFTP-only login: file transfer, no shell.
+    Sftp,
     Telnet,
     Serial,
     Tmux,
@@ -56,6 +58,7 @@ impl Kind {
         match self {
             Kind::Ssh => "SSH",
             Kind::Mosh => "Mosh",
+            Kind::Sftp => "SFTP",
             Kind::Telnet => "Telnet",
             Kind::Serial => "serial",
             Kind::Tmux => "tmux",

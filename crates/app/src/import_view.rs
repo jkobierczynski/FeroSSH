@@ -98,6 +98,7 @@ impl Found {
                     SessionKind::Serial => to.push_str(" serial"),
                     SessionKind::Telnet => to.push_str(" Telnet"),
                     SessionKind::Mosh => to.push_str(" Mosh"),
+                    SessionKind::Sftp => to.push_str(" SFTP"),
                     SessionKind::Xvfb => to.push_str(" virtual desktop"),
                     SessionKind::RemoteApp => to.push_str(" remote app"),
                 }
@@ -643,6 +644,20 @@ mod tests {
         s
     }
 
+    /// A terminal session, as PuTTY's and KiTTY's are.
+    fn ssh_site(name: &str, host: &str) -> Session {
+        // FSProtocol 0 is WinSCP's SCP, which stays an SSH terminal.
+        let mut s = winscp::session(name, |k| match k {
+            "HostName" => Some(Value::Text(host.into())),
+            "FSProtocol" => Some(Value::Number(0)),
+            _ => None,
+        })
+        .unwrap();
+        s.host.user = Some("me".into());
+        assert_eq!(s.kind, SessionKind::Ssh);
+        s
+    }
+
     fn view() -> ImportView {
         ImportView::new(
             vec![Found {
@@ -688,11 +703,11 @@ mod tests {
         let t = texts(&mut v);
         assert_eq!(t[0], " Import from WinSCP");
         assert_eq!(t[1], " [x] All (2 of 2)");
-        assert_eq!(t[2], " [x] Work/web  me@web.lan");
+        assert_eq!(t[2], " [x] Work/web  me@web.lan SFTP");
         assert_eq!(t[3], "     its saved password stays behind");
-        assert_eq!(t[4], "     db  me@db.lan");
+        assert_eq!(t[4], "     db  me@db.lan SFTP");
         assert_eq!(t[5], "     db is already a host");
-        assert_eq!(t[6], " [x] files  me@files.lan");
+        assert_eq!(t[6], " [x] files  me@files.lan SFTP");
         assert_eq!(t[8], "  Import 2   Back");
         // Down skips the taken session.
         v.key(SideKey::Down, 16);
@@ -700,7 +715,7 @@ mod tests {
         v.key(SideKey::Char(' '), 16);
         let t = texts(&mut v);
         assert_eq!(t[1], " [-] All (1 of 2)");
-        assert_eq!(t[6], " [ ] files  me@files.lan");
+        assert_eq!(t[6], " [ ] files  me@files.lan SFTP");
         v.key(SideKey::Down, 16);
         match v.key(SideKey::Enter { split: false }, 16) {
             Some(ImportAction::Import { client, sessions }) => {
@@ -747,7 +762,7 @@ mod tests {
         desk.host.port = Some(5901);
         v.add(Found {
             origin: r"D:\kitty\Sessions".into(),
-            items: Items::Sessions(Client::Kitty, vec![site("box", "box.lan", false), desk]),
+            items: Items::Sessions(Client::Kitty, vec![ssh_site("box", "box.lan"), desk]),
             taken: vec![false, false],
         });
         let t = texts(&mut v);

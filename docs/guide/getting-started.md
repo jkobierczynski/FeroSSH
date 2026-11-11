@@ -50,6 +50,7 @@ Coming from PuTTY, KiTTY, WinSCP or another client? File > Import connections br
 | `ferossh.exe [user@]host[:port]` | Connects to a host. |
 | `ferossh.exe -l user -p port host` | The same, OpenSSH style. |
 | `ferossh.exe COM3:115200` | Opens a serial console, optionally with speed, framing and flow control (`COM3:9600,7E1,xonxoff`). |
+| `ferossh.exe sftp://user@host[:port][/folder]` | Opens File transfer on the host without a shell, for SFTP-only accounts. |
 | `ferossh.exe telnet://host[:port]` | Opens a Telnet session (unencrypted; port 23 unless given). |
 | `ferossh.exe --theme NAME host` | Connects with a colour theme, for example `--theme Production`. Handy for desktop shortcuts. |
 | `ferossh.exe --no-sandbox host` | Runs the SSH worker without its sandbox. Needed only for an SSH server on the same PC (see [Troubleshooting](troubleshooting.md)). |

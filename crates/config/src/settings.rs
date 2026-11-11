@@ -63,6 +63,9 @@
 //!     Type mosh
 //!     MoshServer ~/bin/mosh-server
 //!     MoshPorts 60001:60010
+//! Profile uploads
+//!     Type sftp
+//!     RemoteFolder /incoming
 //! Secret enable
 //!     PasswordCommand op read "op://Network/%n/password"
 //! ```
@@ -248,6 +251,10 @@ pub enum SessionKind {
     /// A terminal over Mosh: SSH logs in and starts `mosh-server`, then
     /// the session goes over UDP, survives network changes and sleep.
     Mosh,
+    /// File transfer only: SSH logs in without asking for a shell and
+    /// File transfer opens on the host, for SFTP-only accounts
+    /// (`ForceCommand internal-sftp`).
+    Sftp,
 }
 
 /// How big a desktop is: as big as its pane, following it as it changes
@@ -332,6 +339,7 @@ impl SessionKind {
             SessionKind::Xvfb => "xvfb",
             SessionKind::RemoteApp => "remoteapp",
             SessionKind::Mosh => "mosh",
+            SessionKind::Sftp => "sftp",
         }
     }
 
@@ -345,6 +353,7 @@ impl SessionKind {
             "xvfb" | "virtual" => Some(SessionKind::Xvfb),
             "remoteapp" | "app" | "ferostream" => Some(SessionKind::RemoteApp),
             "mosh" => Some(SessionKind::Mosh),
+            "sftp" => Some(SessionKind::Sftp),
             _ => None,
         }
     }
@@ -1740,6 +1749,16 @@ NewKeyword later
         assert_eq!(mosh_ports("60010:60001"), None);
         assert_eq!(mosh_ports("0"), None);
         assert_eq!(mosh_ports_text((60001, 60010)), "60001:60010");
+    }
+
+    #[test]
+    fn sftp_only_settings() {
+        let s = Settings::parse("Profile up\n    Type SFTP\n    RemoteFolder /incoming\n");
+        let p = s.profile("up").unwrap();
+        assert_eq!(p.kind, SessionKind::Sftp);
+        assert_eq!(p.remote_folder.as_deref(), Some("/incoming"));
+        assert!(s.to_text().contains("    Type sftp\n"));
+        assert_eq!(Settings::parse(&s.to_text()), s);
     }
 
     #[test]

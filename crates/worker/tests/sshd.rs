@@ -582,6 +582,17 @@ async fn login(server: &Server) -> (mpsc::Sender<Message>, mpsc::Receiver<Messag
 /// Like [`login`], connecting to `port` (a relay in front of the server).
 #[cfg(unix)]
 async fn login_at(server: &Server, port: u16) -> (mpsc::Sender<Message>, mpsc::Receiver<Message>) {
+    login_with(server, port, true).await
+}
+
+/// Like [`login_at`]; without `shell`, the login asks for none, as a jump
+/// host's and an SFTP-only connection's do.
+#[cfg(unix)]
+async fn login_with(
+    server: &Server,
+    port: u16,
+    shell: bool,
+) -> (mpsc::Sender<Message>, mpsc::Receiver<Message>) {
     let (to_worker, worker_in) = mpsc::channel(64);
     let (worker_out, mut from_worker) = mpsc::channel(64);
     tokio::spawn(ferossh_worker::serve(worker_in, worker_out));
@@ -606,7 +617,7 @@ async fn login_at(server: &Server, port: u16) -> (mpsc::Sender<Message>, mpsc::R
             legacy: false,
             timing: Default::default(),
             tunnel: None,
-            shell: true,
+            shell,
             options: Default::default(),
             family: Default::default(),
             gssapi: false,
@@ -694,6 +705,76 @@ async fn a_broken_connection_is_reported_as_lost() {
             }
             Message::Data { .. } => {}
             other => panic!("unexpected {other:?}"),
+        }
+    }
+}
+
+/// An SFTP-only account (`ForceCommand internal-sftp`, where a shell
+/// would end at once): a login without a shell lists and fetches files,
+/// and a connection that breaks under it is lost, not closed, so the UI
+/// logs in again.
+#[cfg(unix)]
+#[tokio::test]
+async fn sftp_only_login_without_a_shell() {
+    use ferossh_sftp::{Remote, State};
+    if !available() {
+        return;
+    }
+    let server = start(
+        "sftp-only",
+        "Subsystem sftp internal-sftp\nForceCommand internal-sftp",
+    );
+    let (port, cut) = relay(server.port);
+    let (to_worker, mut from_worker) = login_with(&server, port, false).await;
+    let remote_dir = server.dir.join("files");
+    let local_dir = server.dir.join("local");
+    std::fs::create_dir_all(&remote_dir).unwrap();
+    std::fs::create_dir_all(&local_dir).unwrap();
+    std::fs::write(remote_dir.join("report.txt"), b"only files here").unwrap();
+
+    let mut remote = Remote::new("test");
+    remote.attach(2, 1);
+    let dir = remote_dir.to_str().unwrap().as_bytes().to_vec();
+    remote.browse(&dir);
+    drive(&mut remote, &to_worker, &mut from_worker, |r| {
+        r.is_ready() && !r.listing.loading && r.listing.path == dir
+    })
+    .await;
+    let names: Vec<&[u8]> = remote.listing.entries.iter().map(|e| &e.name[..]).collect();
+    assert_eq!(names, [&b"report.txt"[..]]);
+    let report = remote.listing.entries[0].clone();
+    remote.download(&report, &local_dir).unwrap();
+    drive(&mut remote, &to_worker, &mut from_worker, |r| {
+        r.jobs().iter().all(|j| j.state.finished())
+    })
+    .await;
+    assert_eq!(
+        remote.jobs()[0].state,
+        State::Done,
+        "{:?}",
+        remote.jobs()[0].note
+    );
+    assert_eq!(
+        std::fs::read(local_dir.join("report.txt")).unwrap(),
+        b"only files here"
+    );
+
+    // The network goes: the login without a shell reports it lost.
+    let client = cut.recv().unwrap();
+    client.shutdown(std::net::Shutdown::Both).unwrap();
+    let mut lost = false;
+    loop {
+        let msg = tokio::time::timeout(Duration::from_secs(30), from_worker.recv())
+            .await
+            .expect("timed out")
+            .expect("worker hung up");
+        match msg {
+            Message::Lost { channel: 1 } => lost = true,
+            Message::Disconnected { channel: 1, reason } => {
+                assert!(lost, "no Lost before: {reason}");
+                break;
+            }
+            _ => {}
         }
     }
 }

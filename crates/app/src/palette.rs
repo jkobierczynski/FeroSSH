@@ -94,6 +94,7 @@ impl Entry {
             SessionKind::Serial => "serial",
             SessionKind::Telnet => "telnet",
             SessionKind::Mosh => "mosh",
+            SessionKind::Sftp => "sftp files file transfer",
             SessionKind::Xvfb => "xvfb virtual desktop",
             SessionKind::RemoteApp => "remote app ferostream",
         };

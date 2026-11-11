@@ -2,8 +2,10 @@
 //! with an Include that serves the same text again (a config including
 //! itself; the unit test `self_including_configs_stay_small` covers the
 //! exponential case), and checks arbitrary host keys against known_hosts.
-//! None may panic or blow up, and a key known_hosts trusts is never also
-//! revoked.
+//! The first line also goes to the `sftp://` address parser. None may
+//! panic or blow up, a key known_hosts trusts is never also revoked, and
+//! an `sftp://` address yields a destination that parses and an absolute
+//! folder without control characters.
 
 #![no_main]
 
@@ -34,6 +36,13 @@ fuzz_target!(|data: &[u8]| {
     let _ = cfg.active_forwards();
     let _ = ssh_config::hosts(&text, &again);
     let _ = ssh_config::parse_destination(host);
+    if let Some((destination, folder)) = ssh_config::sftp_url(host) {
+        assert!(ssh_config::parse_destination(&destination).is_some());
+        if let Some(folder) = folder {
+            // Absolute, or relative to the home folder (`/~/docs`).
+            assert!(!folder.is_empty() && !folder.chars().any(char::is_control));
+        }
+    }
 
     let kh = KnownHosts::parse(&text);
     let port = u16::from(key.first().copied().unwrap_or(22));
