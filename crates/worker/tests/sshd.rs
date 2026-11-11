@@ -1559,6 +1559,7 @@ async fn mosh_session_after_an_ssh_login() {
                 mosh: Some(Box::new(ferossh_ipc::MoshOptions {
                     server: "mosh-server".into(),
                     ports: None,
+                    predict: ferossh_ipc::MoshPredict::Adaptive,
                 })),
                 ..Default::default()
             },

@@ -1572,6 +1572,11 @@ async fn mosh_session(
     let target = crate::mosh::Target {
         addr,
         key: connect.key,
+        predict: match mosh.predict {
+            ferossh_ipc::MoshPredict::Adaptive => ferossh_mosh::predict::Mode::Adaptive,
+            ferossh_ipc::MoshPredict::Always => ferossh_mosh::predict::Mode::Always,
+            ferossh_ipc::MoshPredict::Never => ferossh_mosh::predict::Mode::Never,
+        },
     };
     let ended = crate::mosh::run(ctx.channel, target, ctx.size, inbox, &ctx.out).await;
     // Whatever became of the SSH connection meanwhile is not why the
