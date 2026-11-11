@@ -12153,16 +12153,17 @@ impl Window {
 
     /// Opens SFTP on pane `id`'s connection, if the pane is logged in and
     /// its host has no SFTP channel yet. The queue starts in the pane's
-    /// directory when it reported one.
-    fn ensure_sftp(&mut self, id: PaneId) {
+    /// directory when it reported one. Returns true when it opened the
+    /// channel here (its first listing already asks for that folder).
+    fn ensure_sftp(&mut self, id: PaneId) -> bool {
         let Some(p) = self.panes.get(&id) else {
-            return;
+            return false;
         };
         let Some(Host::Ssh(s)) = self.panes.get(&self.host_pane(id)).map(|g| &g.host) else {
-            return;
+            return false;
         };
         if s.state() != State::Connected || !self.workers.contains_key(&s.connection) {
-            return;
+            return false;
         }
         let key = sftp_key(&s.target);
         let label = s.target.label();
@@ -12187,7 +12188,7 @@ impl Window {
             r
         });
         if remote.channel().is_some() {
-            return;
+            return false;
         }
         if let Some(cwd) = cwd
             && remote.listing.path.is_empty()
@@ -12200,6 +12201,7 @@ impl Window {
         remote.attach(channel, connection);
         self.sftp_routes.insert(channel, connection);
         self.flush_sftp();
+        true
     }
 
     /// A pane logged in: transfers waiting for its host carry on, and the
@@ -12306,9 +12308,10 @@ impl Window {
         let id = self.focused_id();
         let key = self.pane_sftp_key(id);
         let host_changed = key != self.files_key;
+        let mut opened = false;
         if host_changed {
             self.files_key.clone_from(&key);
-            self.ensure_sftp(id);
+            opened = self.ensure_sftp(id);
         }
         if host_changed || self.files_pane != Some(id) {
             self.files_pane = Some(id);
@@ -12327,8 +12330,9 @@ impl Window {
                 && let Some(folder) = self.remote_folder(id)
                 && let Some(r) = self.sftp.get_mut(&k)
             {
-                // A queue that just opened there already asked for it.
-                if !(host_changed && r.listing.path.is_empty()) {
+                // A queue that just opened for this pane already asked
+                // for it.
+                if !opened {
                     r.notice = None;
                     r.browse(folder.as_bytes());
                 }
