@@ -836,6 +836,52 @@ pub fn expand_path(
     out
 }
 
+/// `sftp://[user@]host[:port][/path]`, as WinSCP, FileZilla and browsers
+/// write it: the destination to log in to, and the absolute folder to
+/// start in (none for the home folder, also for `/~` paths).
+pub fn sftp_url(text: &str) -> Option<(String, Option<String>)> {
+    let text = text.trim();
+    let head = text.get(..7)?;
+    if !head.eq_ignore_ascii_case("sftp://") {
+        return None;
+    }
+    let rest = text.get(7..)?;
+    let (authority, path) = match rest.find('/') {
+        Some(i) => rest.split_at(i),
+        None => (rest, ""),
+    };
+    // A bracketed IPv6 address keeps its colons; WinSCP's `;fingerprint=`
+    // and other parameters after the user are not used.
+    let authority = match authority.split_once('@') {
+        Some((user, host)) => {
+            let user = user.split(';').next().unwrap_or_default();
+            let user = crate::import::decode(user);
+            if user.is_empty() {
+                host.to_owned()
+            } else {
+                format!("{user}@{host}")
+            }
+        }
+        None => authority.to_owned(),
+    };
+    // One host, no options: a comma would make it a jump host list.
+    let (user, _, _) = parse_destination(&authority)?;
+    if authority.contains(',')
+        || user.is_some_and(|u| u.starts_with('-'))
+        || !crate::saved::valid_proxy_jump(&authority)
+    {
+        return None;
+    }
+    let path = crate::import::decode(path);
+    if path.chars().any(char::is_control) {
+        return None;
+    }
+    let path = path.trim_end_matches('/');
+    let folder =
+        (!path.is_empty() && path != "/~" && !path.starts_with("/~/")).then(|| path.to_owned());
+    Some((authority, folder))
+}
+
 /// Parses `[user@]host[:port]` as typed on the command line or at the
 /// connect prompt. IPv6 literals go in brackets: `[::1]:2222`.
 pub fn parse_destination(text: &str) -> Option<(Option<String>, String, Option<u16>)> {
@@ -877,6 +923,32 @@ pub fn parse_destination(text: &str) -> Option<(Option<String>, String, Option<u
 #[allow(clippy::unwrap_used, clippy::indexing_slicing, clippy::panic)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sftp_addresses() {
+        assert_eq!(
+            sftp_url("sftp://files.lan"),
+            Some(("files.lan".into(), None))
+        );
+        assert_eq!(
+            sftp_url("SFTP://up@files.lan:2222/srv/in%20box/"),
+            Some(("up@files.lan:2222".into(), Some("/srv/in box".into())))
+        );
+        // WinSCP's fingerprint parameter after the user is dropped; the
+        // home folder needs no path.
+        assert_eq!(
+            sftp_url("sftp://up;fingerprint=ssh-ed25519-xx@[fe80::1]:22/~/docs"),
+            Some(("up@[fe80::1]:22".into(), None))
+        );
+        assert_eq!(sftp_url("sftp://h/"), Some(("h".into(), None)));
+        assert_eq!(sftp_url("files.lan"), None);
+        assert_eq!(sftp_url("sftp://"), None);
+        assert_eq!(sftp_url("sftp://-oProxyCommand=calc"), None);
+        assert_eq!(sftp_url("sftp://h/a%0Ab"), None);
+        assert_eq!(sftp_url("sftp://a%2Cb@h"), None);
+        assert_eq!(sftp_url("sftp://-oProxyCommand=x@h"), None);
+        assert_eq!(sftp_url("sftp://a b@h"), None);
+    }
 
     const CONFIG: &str = r#"
 User global

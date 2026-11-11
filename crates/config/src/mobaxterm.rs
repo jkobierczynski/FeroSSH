@@ -37,7 +37,9 @@ fn bookmark(folder: &str, name: &str, value: &str) -> Option<Session> {
     let fields: Vec<String> = groups.next()?.split('%').map(unescape).collect();
     let field = |i: usize| fields.get(i).map(|f| f.trim()).filter(|f| !f.is_empty());
     let (kind, gateway) = match field(0)? {
-        "0" | "7" => (SessionKind::Ssh, 8),
+        "0" => (SessionKind::Ssh, 8),
+        // An SFTP bookmark has an SSH bookmark's fields.
+        "7" => (SessionKind::Sftp, 8),
         // A Telnet bookmark has no gateway field FeroSSH knows of.
         "1" => (SessionKind::Telnet, usize::MAX),
         "4" => (SessionKind::Rdp, 13),
@@ -62,9 +64,8 @@ fn bookmark(folder: &str, name: &str, value: &str) -> Option<Session> {
     } else {
         field(3).map(str::to_owned).or(user_in_host)
     };
-    if kind == SessionKind::Ssh
-        && let Some(key) = field(14)
-    {
+    let ssh = matches!(kind, SessionKind::Ssh | SessionKind::Sftp);
+    if ssh && let Some(key) = field(14) {
         // `_ProfileDir_` is the user's home folder; MobaXterm's other
         // place names have no equivalent here.
         let key = key.replace("_ProfileDir_", "~");
@@ -76,15 +77,13 @@ fn bookmark(folder: &str, name: &str, value: &str) -> Option<Session> {
         }
     }
     if let Some(via) = field(gateway) {
-        let jump = (kind == SessionKind::Ssh)
+        let jump = ssh
             .then(|| gateways(via, field(gateway + 1), field(gateway + 2)))
             .filter(|j| crate::saved::valid_proxy_jump(j));
         let via = clean(&via.replace('|', ", "));
-        match (kind, jump) {
-            (SessionKind::Ssh, Some(jump)) => s.host.proxy_jump = Some(jump),
-            (SessionKind::Ssh, None) => {
-                s.notes.push(format!("its jump host {via} is not imported"))
-            }
+        match (ssh, jump) {
+            (true, Some(jump)) => s.host.proxy_jump = Some(jump),
+            (true, None) => s.notes.push(format!("its jump host {via} is not imported")),
             _ => s
                 .notes
                 .push(format!("it went through {via}: pick Via SSH with F2")),
@@ -185,6 +184,7 @@ desk=#128#5%desk.lan%5901%-1%0%bastion.lan%22%me%%0%#MobaFont#0# #-1\r
 inner=#109#0%inner.lan%22%%%-1%-1%%jump1.lan__PIPE__jump2.lan%22__PIPE__2222%me__PIPE__%%0%0%%#MobaFont#0# #-1\r
 odd=#109#0%odd.lan%22%%%-1%-1%%-oProxyCommand=calc%22%%%%0%0%%#MobaFont#0# #-1\r
 tel=#98#1%router%23%%%2%%#MobaFont#0# #-1\r
+files=#140#7%files.lan%2022%up%%-1%-1%%bastion.lan%22%me%%0%0%_ProfileDir_\\.ssh\\id_up%#MobaFont#0# #-1\r
 bad=#109#0%-oProxyCommand=calc%22%%#x#0#\r
 ";
 
@@ -200,9 +200,16 @@ bad=#109#0%-oProxyCommand=calc%22%%#x#0#\r
                 "Work/Prod/desk",
                 "Work/Prod/inner",
                 "Work/Prod/odd",
-                "Work/Prod/tel"
+                "Work/Prod/tel",
+                "Work/Prod/files"
             ]
         );
+        let files = &s[6];
+        assert_eq!(files.kind, SessionKind::Sftp);
+        assert_eq!(files.host.port, Some(2022));
+        assert_eq!(files.host.user.as_deref(), Some("up"));
+        assert_eq!(files.host.proxy_jump.as_deref(), Some("me@bastion.lan"));
+        assert_eq!(files.host.identity_file.as_deref(), Some(r"~\.ssh\id_up"));
         assert_eq!(s[5].kind, SessionKind::Telnet);
         assert_eq!((s[5].host.port, s[5].host.user.as_deref()), (None, None));
         assert!(s[5].notes.is_empty());
@@ -237,7 +244,9 @@ bad=#109#0%-oProxyCommand=calc%22%%#x#0#\r
         let text = to_config(Client::MobaXterm, &all);
         let hosts = ssh_config::hosts(&text, &ssh_config::NoIncludes);
         assert_eq!(hosts[1].folder.as_deref(), Some("MobaXterm/Work/Prod"));
-        assert_eq!(saved::parse(&text).len(), 6);
+        assert_eq!(saved::parse(&text).len(), 7);
         assert!(text.contains("ProxyJump me@jump1.lan,jump2.lan:2222\n"));
+        let p = crate::import::profile(files).unwrap();
+        assert_eq!(p.kind, SessionKind::Sftp);
     }
 }

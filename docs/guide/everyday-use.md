@@ -23,7 +23,7 @@ A split (Window > Split right or Split down) and a new tab (Ctrl+Shift+T) start 
 
 ## Connecting
 
-Ctrl+Shift+N (File > Connect to...) asks for a host in a new tab. It takes `user@host`, `host:2222`, a `Host` alias from `~/.ssh/config`, a saved connection's name, `telnet://router` or a COM port such as `COM3:115200`. File > Reconnect (Ctrl+Shift+R) logs in again and File > Disconnect ends the connection.
+Ctrl+Shift+N (File > Connect to...) asks for a host in a new tab. It takes `user@host`, `host:2222`, a `Host` alias from `~/.ssh/config`, a saved connection's name, `sftp://user@host/folder` (file transfer only, see [SFTP-only connections](#sftp-only-connections)), `telnet://router` or a COM port such as `COM3:115200`. File > Reconnect (Ctrl+Shift+R) logs in again and File > Disconnect ends the connection.
 
 File > Open local shell opens a Windows command prompt in a new tab. `ferossh.exe --local wsl -d Ubuntu` (or any other program) opens that instead.
 
@@ -87,7 +87,7 @@ Ctrl+Shift+S shows your hosts in the tools pane: those from `~/.ssh/config`, you
 
 Insert or the New button opens the connection form in the tools pane; F2, the Edit button or a right click edits the selected connection. It is a Windows form of text boxes and drop-down lists, with a tab per section:
 
-- **Connection**: **Name, Folder, Type**; the type is an SSH terminal, Mosh terminal, Telnet (unencrypted), Serial console, Remote desktop (RDP) or VNC desktop. Then **Host, User, Port, Key file** (with Browse...), the **Password** source (below) and the **Jump host** (see [Jump hosts](#jump-hosts)). A Mosh terminal adds the **Mosh server** program and its **UDP ports** (see [Mosh](#mosh)). A serial console has the port, speed, framing and flow control instead.
+- **Connection**: **Name, Folder, Type**; the type is an SSH terminal, Mosh terminal, SFTP file transfer only, Telnet (unencrypted), Serial console, Remote desktop (RDP) or VNC desktop. Then **Host, User, Port, Key file** (with Browse...), the **Password** source (below) and the **Jump host** (see [Jump hosts](#jump-hosts)). A Mosh terminal adds the **Mosh server** program and its **UDP ports** (see [Mosh](#mosh)). A serial console has the port, speed, framing and flow control instead.
 - **Look** (a terminal's tab): theme, font, font size and scrollback.
 - **Extras** (a terminal's tab): tmux on or off, the tmux session to attach and its layout, the start directory, File transfer's Local and Remote folders, port forwards (such as `L 8080 localhost:80`), RDP and VNC ports, agent forwarding, Kerberos and passing a ticket on, older crypto, and the login script (see [Login scripts](#login-scripts)).
 
@@ -110,11 +110,11 @@ A command runs without a shell, a window or any input, for at most 60 seconds, a
 
 File > Import connections lists the clients that have saved sessions on your account: PuTTY and KiTTY (from the registry), WinSCP (registry or `WinSCP.ini`), MobaXterm (`MobaXterm.ini`), mRemoteNG (`confCons.xml`) and SecureCRT (its `Config\Sessions` folder). Pick one to see its sessions, untick what you don't want, and choose Import. *From a file...* reads the same files from a portable install or an export.
 
-Host, user, port, key file, folders, PuTTY and KiTTY port forwards and jump hosts come over, and so do Telnet sessions and (from MobaXterm and mRemoteNG) RDP and VNC sessions. **Passwords never come over**: the preview marks the sessions that had one, so you can give them a password source. The preview also says what else does not come over. Imports go to `%APPDATA%\FeroSSH\imported-<client>.conf`, in a folder named after the client, and importing again from the same client replaces that file. A name already in use is left out.
+Host, user, port, key file, folders, PuTTY and KiTTY port forwards and jump hosts come over, and so do Telnet sessions and (from MobaXterm and mRemoteNG) RDP and VNC sessions. WinSCP's SFTP sites and MobaXterm's SFTP sessions become [SFTP-only connections](#sftp-only-connections); WinSCP's SCP sites become SSH terminals, since SCP needs a shell. **Passwords never come over**: the preview marks the sessions that had one, so you can give them a password source. The preview also says what else does not come over. Imports go to `%APPDATA%\FeroSSH\imported-<client>.conf`, in a folder named after the client, and importing again from the same client replaces that file. A name already in use is left out.
 
 ## The session manager
 
-Ctrl+Shift+L lists the sessions that are open right now, in every tab: their host, kind (SSH, Mosh, Telnet, serial, tmux, desktop or local shell), tab and state (connected, connecting, reconnecting or ended), with notes such as tmux, forwards, logging or a jump host. It also shows the hidden sessions of a [multi-host script run](#runs-on-many-hosts). It is a Windows list with columns (session, kind, tab, state, details) and updates as sessions connect, drop and reconnect. Type to filter, Enter or a double-click goes to the session's tab and pane, F2 renames it in place, and Del closes it after asking. The Show, Rename and Close buttons below the list, and a right-click on a session, do the same.
+Ctrl+Shift+L lists the sessions that are open right now, in every tab: their host, kind (SSH, Mosh, SFTP, Telnet, serial, tmux, desktop or local shell), tab and state (connected, connecting, reconnecting or ended), with notes such as tmux, forwards, logging or a jump host. It also shows the hidden sessions of a [multi-host script run](#runs-on-many-hosts). It is a Windows list with columns (session, kind, tab, state, details) and updates as sessions connect, drop and reconnect. Type to filter, Enter or a double-click goes to the session's tab and pane, F2 renames it in place, and Del closes it after asking. The Show, Rename and Close buttons below the list, and a right-click on a session, do the same.
 
 The connection manager is for the hosts you *can* connect to; the session manager for the ones you *are* connected to.
 
@@ -344,6 +344,10 @@ Ctrl+Shift+E opens File transfer in the tools pane: a **Local** list of a folder
 **Queue.** The transfer queue under the lists shows each transfer's progress. Right-click one to pause, resume, cancel (Del too) or retry it, or to clear the finished ones. Three files move at once (`ParallelTransfers`). A dropped connection pauses the queue, and it carries on from where each file stopped when you log in again.
 
 **Safe file names.** An existing file is never overwritten without asking: Overwrite, Skip or Keep both, above the queue, with For all to answer the same for the rest. Server names Windows cannot hold (`CON`, `a:b`, trailing dots) are made safe or refused, and a folder download does not follow links out of the folder. Partial files are `.part` locally and `.filepart` on the server until complete. Session > Verify transfers compares SHA-256 sums on both ends after each file. A resumed transfer is always checked this way before its partial file becomes the file, even with that setting off: a mismatch fails the transfer and deletes the partial file, and if the server cannot give a sum (it needs `xargs -0` and `sha256sum`) the transfer fails and keeps the partial file. Delete it to start over.
+
+### SFTP-only connections
+
+Some accounts may only move files: `ForceCommand internal-sftp` in the server's `sshd_config`, chrooted upload users, many hosting providers. A shell there ends at once (*This service allows sftp connections only*), and the connection with it. For these, make a connection of type *SFTP file transfer only*, or type `sftp://user@host[:port][/folder]` at the connect prompt (WinSCP's and FileZilla's addresses work, `;fingerprint=` and all). FeroSSH logs in as usual (keys, agent, passwords, jump hosts, Kerberos) but asks for no shell: the tab says so, and File transfer opens on the host, in the address's folder or the connection's *Remote folder* when there is one. Close the tab to log out. A dropped connection logs in again on its own, and the queue carries on, as for a terminal. Its Extras hold only what makes sense without a shell: Remote folder, Local folder, Kerberos and legacy algorithms.
 
 ### Following cd
 

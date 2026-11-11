@@ -4,11 +4,14 @@
 //!
 //! Site names and text values are `%XX`-escaped, folders are separated by
 //! `/`. Only SFTP and SCP sites are imported: FTP, WebDAV and S3 have no
-//! SSH login. Workspaces and site shortcuts are skipped. Passwords are
+//! SSH login. SFTP sites become SFTP-only connections (File transfer, no
+//! shell), SCP sites SSH ones, since SCP runs in a shell. Workspaces and
+//! site shortcuts are skipped. Passwords are
 //! never read, only noticed. A site's SSH tunnel becomes its jump host
 //! (`ProxyJump`).
 
 use crate::import::{Session, Value, clean, decode};
+use crate::settings::SessionKind;
 use crate::ssh_config::parse_destination;
 
 /// The values FeroSSH reads from each site. The password values are only
@@ -34,6 +37,9 @@ pub const VALUES: [&str; 14] = [
 /// (its default) and SFTP.
 const SSH_PROTOCOLS: [u32; 3] = [0, 1, 2];
 
+/// WinSCP's `FSProtocol` for SCP only.
+const SCP: u32 = 0;
+
 /// Builds a session from a site's values; `None` for what is not an SSH
 /// site, the default settings, workspaces and site shortcuts.
 pub fn session(raw_name: &str, get: impl Fn(&str) -> Option<Value>) -> Option<Session> {
@@ -50,7 +56,8 @@ pub fn session(raw_name: &str, get: impl Fn(&str) -> Option<Value>) -> Option<Se
     if number("IsWorkspace").is_some_and(|w| w != 0) || text("Link").is_some() {
         return None;
     }
-    if !SSH_PROTOCOLS.contains(&number("FSProtocol").unwrap_or(1)) {
+    let protocol = number("FSProtocol").unwrap_or(1);
+    if !SSH_PROTOCOLS.contains(&protocol) {
         return None;
     }
     // HostName may be `user@host`.
@@ -58,6 +65,9 @@ pub fn session(raw_name: &str, get: impl Fn(&str) -> Option<Value>) -> Option<Se
     let mut s = Session::new(name, None, hostname);
     if s.host.alias.is_empty() {
         return None;
+    }
+    if protocol != SCP {
+        s.kind = SessionKind::Sftp;
     }
     s.host.port = number("PortNumber")
         .and_then(|p| u16::try_from(p).ok())
@@ -206,6 +216,9 @@ HostName=-oProxyCommand=calc\r
         );
         assert_eq!(s[1].host.user.as_deref(), Some("root"));
         assert!(!s[1].had_password);
+        // SFTP (WinSCP's default) is file transfer only; SCP needs a shell.
+        assert_eq!(web.kind, SessionKind::Sftp);
+        assert_eq!(s[1].kind, SessionKind::Ssh);
         let text = to_config(Client::WinScp, &[&s[0], &s[1]]);
         assert!(!text.contains("A35C"));
         let hosts = ssh_config::hosts(&text, &ssh_config::NoIncludes);
@@ -251,6 +264,7 @@ HostName=-oProxyCommand=calc\r
         };
         let s = session("Home/files", get).unwrap();
         assert_eq!((s.name.as_str(), s.host.port), ("Home/files", None));
+        assert_eq!(s.kind, SessionKind::Sftp);
         assert!(s.had_password);
         let webdav = |k: &str| match k {
             "HostName" => Some(Value::Text("dav".into())),

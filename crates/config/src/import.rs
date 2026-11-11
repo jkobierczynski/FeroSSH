@@ -98,7 +98,7 @@ pub struct Session {
     /// What goes to the file; the folder is set by [`to_config`]. For a
     /// desktop session the port is the desktop's.
     pub host: SavedHost,
-    /// SSH, Telnet, or a Remote Desktop or VNC desktop.
+    /// SSH, SFTP only, Telnet, or a Remote Desktop or VNC desktop.
     pub kind: SessionKind,
     /// The client had a password stored for it (not read).
     pub had_password: bool,
@@ -131,7 +131,7 @@ impl Session {
 /// The port to write: none for the kind's usual one.
 pub(crate) fn port(kind: SessionKind, port: Option<u32>) -> Option<u16> {
     let usual = match kind {
-        SessionKind::Ssh | SessionKind::Mosh => 22,
+        SessionKind::Ssh | SessionKind::Mosh | SessionKind::Sftp => 22,
         SessionKind::Rdp => DEFAULT_DESKTOP_PORT,
         SessionKind::Vnc => DEFAULT_VNC_PORT,
         SessionKind::Telnet => DEFAULT_TELNET_PORT,

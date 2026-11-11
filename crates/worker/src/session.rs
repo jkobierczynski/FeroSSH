@@ -74,7 +74,8 @@ pub struct Params {
     /// Run the connection over this stream channel instead of TCP: the
     /// hop after a jump host, or a `ProxyCommand` (see [`crate::tunnel`]).
     pub tunnel: Option<ChannelId>,
-    /// Open a shell once logged in; a jump host's login opens none.
+    /// Open a shell once logged in; a jump host's or an SFTP-only
+    /// connection's login opens none.
     pub shell: bool,
     /// What the shell's channel asks for.
     pub options: ShellOptions,
@@ -1054,9 +1055,11 @@ async fn direct(
     })
 }
 
-/// A jump host's login: no shell, only the streams the UI opens on the
-/// connection for the next hop. Holds the connection until the UI closes
-/// the channel or the server goes away; the streams hold it after that.
+/// A login without a shell: a jump host's, or an SFTP-only connection's.
+/// Only the streams, SFTP and forwards the UI opens use the connection.
+/// Holds it until the UI closes the channel or the server goes away; the
+/// streams hold it after that. A connection that went away under it was
+/// lost, as under a shell, so an SFTP-only tab can log in again.
 async fn carry(
     conn: Arc<Connection>,
     forwards: &ConnForwards,
@@ -1065,24 +1068,25 @@ async fn carry(
 ) -> Result<Ended, Failure> {
     ctx.send(connected(ctx)).await?;
     let mut alive = forwards.alive();
-    loop {
+    let lost = loop {
         tokio::select! {
             msg = inbox.recv() => match msg {
-                None | Some(Message::Close { .. }) => break,
+                None | Some(Message::Close { .. }) => break false,
                 Some(_) => {}
             },
             gone = alive.changed() => if gone.is_err() {
-                break;
+                break true;
             },
         }
-    }
-    Ok(match Arc::into_inner(conn) {
+    };
+    let ended = match Arc::into_inner(conn) {
         Some(handle) => {
             let _ = handle.disconnect(Disconnect::ByApplication, "", "en").await;
             Ended::Connection
         }
         None => Ended::Shell,
-    })
+    };
+    Ok(if lost { Ended::Lost } else { ended })
 }
 
 /// [`Message::Connected`] with the negotiated algorithms.

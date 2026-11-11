@@ -485,7 +485,7 @@ enum Typed {
 }
 
 /// The prompt shown when no host was given.
-const CONNECT_PROMPT: &str = "\x1b[0mConnect to (user@host[:port], a Host from ~/.ssh/config, telnet://host[:port], or a COM port such as COM3:115200; Ctrl+Shift+S lists them): ";
+const CONNECT_PROMPT: &str = "\x1b[0mConnect to (user@host[:port], a Host from ~/.ssh/config, sftp://host for file transfer only, telnet://host[:port], or a COM port such as COM3:115200; Ctrl+Shift+S lists them): ";
 
 /// What a pane is connected to.
 enum Host {
@@ -3072,6 +3072,8 @@ impl Window {
                     }
                     let kind = if s.target.mosh.is_some() {
                         live::Kind::Mosh
+                    } else if s.target.sftp_only {
+                        live::Kind::Sftp
                     } else {
                         live::Kind::Ssh
                     };
@@ -4874,6 +4876,21 @@ impl Window {
             return;
         }
         let env = ssh_env();
+        if let Some((destination, folder)) = ferossh_config::ssh_config::sftp_url(destination) {
+            match Target::resolve_route(&destination, &env) {
+                Ok(mut target) => {
+                    target.sftp_only = true;
+                    target.sftp_folder = folder;
+                    self.connect_to(id, target, &env);
+                }
+                Err(why) => {
+                    self.end_host(id);
+                    self.show(id, &format!("\x1b[0;31m{why}\x1b[0m\r\n"));
+                    self.ask_destination(id);
+                }
+            }
+            return;
+        }
         let telnet = if self
             .settings
             .profile(destination)
@@ -4975,6 +4992,12 @@ impl Window {
                     ports: p.mosh_ports,
                 })
             });
+        // An `sftp://` address asks for file transfer only, whatever the
+        // connection it names is.
+        target.sftp_only |= self
+            .settings
+            .profile(&target.alias)
+            .is_some_and(|p| p.kind == SessionKind::Sftp);
         if let Some(p) = self.panes.get_mut(&id) {
             p.term.scroll_to_bottom();
         }
@@ -5425,6 +5448,25 @@ impl Window {
                         _ => String::new(),
                     };
                     self.start_script(id, &alias, false);
+                }
+                Effect::Connected if self.sftp_only(id) => {
+                    // No shell: no login script, tmux or start folder.
+                    // File transfer opens on the host instead.
+                    self.retries.remove(&id);
+                    self.arm_reconnect_timer();
+                    self.start_log(id);
+                    self.show(
+                        id,
+                        "\x1b[0;90mFile transfer only: no shell. File transfer \
+                         (Ctrl+Shift+E) shows this host; closing the tab logs out.\x1b[0m\r\n",
+                    );
+                    self.start_forwards(id);
+                    if self.focused_id() == id {
+                        self.show_side(SideView::Files, true);
+                    } else {
+                        self.ensure_sftp(id);
+                    }
+                    self.refresh_chrome();
                 }
                 Effect::Connected => {
                     self.retries.remove(&id);
@@ -9954,7 +9996,7 @@ impl Window {
         if let Some(p) = self.settings.profile(host)
             && !matches!(
                 p.kind,
-                SessionKind::Ssh | SessionKind::Telnet | SessionKind::Mosh
+                SessionKind::Ssh | SessionKind::Telnet | SessionKind::Mosh | SessionKind::Sftp
             )
         {
             let (kind, via) = (p.kind, p.via.clone());
@@ -12301,13 +12343,23 @@ impl Window {
     /// The Remote folder pane `id`'s connection names for file transfer.
     fn remote_folder(&self, id: PaneId) -> Option<String> {
         match &self.panes.get(&self.host_pane(id))?.host {
-            Host::Ssh(s) => self
-                .settings
-                .profile(&s.target.alias)?
-                .remote_folder
-                .clone(),
+            // An `sftp://` address's folder, else the connection's.
+            Host::Ssh(s) => s.target.sftp_folder.clone().or_else(|| {
+                self.settings
+                    .profile(&s.target.alias)?
+                    .remote_folder
+                    .clone()
+            }),
             _ => None,
         }
+    }
+
+    /// Whether pane `id` is an SFTP-only login, with no shell.
+    fn sftp_only(&self, id: PaneId) -> bool {
+        matches!(
+            self.panes.get(&id).map(|p| &p.host),
+            Some(Host::Ssh(s)) if s.target.sftp_only
+        )
     }
 
     /// Lists pane `id`'s reported directory, when following is on.

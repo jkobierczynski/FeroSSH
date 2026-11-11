@@ -115,6 +115,13 @@ pub struct Target {
     /// Run the shell as a Mosh session: start `mosh-server` over this SSH
     /// login and talk to it over UDP. Never shares a connection.
     pub mosh: Option<Box<MoshOptions>>,
+    /// File transfer only: log in without asking for a shell, for
+    /// SFTP-only accounts (`ForceCommand internal-sftp`). Never shares a
+    /// connection, since no shell can open on it.
+    pub sftp_only: bool,
+    /// Where File transfer starts on an SFTP-only login typed as an
+    /// `sftp://` address with a path.
+    pub sftp_folder: Option<String>,
 }
 
 /// A `ProxyCommand` to run: never through a shell.
@@ -311,6 +318,8 @@ impl Target {
             gssapi_delegate: cfg.gssapi_delegate_credentials == Some(true),
             gssapi_host: cfg.gssapi_server_identity.clone(),
             mosh: None,
+            sftp_only: false,
+            sftp_folder: None,
             family: match cfg.address_family {
                 Some(AddressFamily::Inet) => Family::V4,
                 Some(AddressFamily::Inet6) => Family::V6,
@@ -367,6 +376,7 @@ impl Target {
             && self.route() == other.route()
             && self.mosh.is_none()
             && other.mosh.is_none()
+            && self.sftp_only == other.sftp_only
     }
 
     /// The way there, for the log and for telling routes apart: the jump
@@ -951,7 +961,7 @@ impl SshSession {
             legacy: self.legacy,
             timing: t.timing,
             tunnel: self.tunnel,
-            shell: !self.jump,
+            shell: !self.jump && !t.sftp_only,
             options: if self.jump {
                 ShellOptions::default()
             } else {
@@ -1168,11 +1178,16 @@ impl SshSession {
             // A Mosh session is its connection's only shell.
             && self.target.mosh.is_none()
             && target.mosh.is_none()
+            // No shell opens on an SFTP-only login, and an SFTP-only tab
+            // logs in on its own so a shell's end does not take it along.
+            && !self.target.sftp_only
+            && !target.sftp_only
     }
 
     /// Typed or pasted bytes for the host, once connected.
     pub fn input(&self, bytes: &[u8]) -> Vec<Effect> {
-        if self.state != State::Connected {
+        // An SFTP-only login has no shell to type into.
+        if self.state != State::Connected || self.target.sftp_only {
             return Vec::new();
         }
         bytes
@@ -1409,7 +1424,9 @@ impl SshSession {
                 Vec::new()
             }
             Message::Lost { .. } => {
-                self.lost = self.state == State::Connected;
+                // A jump host's loss is its route's: the target's own
+                // login reports it.
+                self.lost = self.state == State::Connected && !self.jump;
                 Vec::new()
             }
             Message::Disconnected { reason, .. } => {
@@ -2188,6 +2205,31 @@ mod tests {
             channel: s.channel,
             reason: reason.into(),
         })
+    }
+
+    #[test]
+    fn an_sftp_only_login_asks_for_no_shell() {
+        let dir = temp("sftp-only");
+        let e = env(&dir);
+        let mut t = Target::resolve("host", &e).unwrap();
+        t.sftp_only = true;
+        let shell = SshSession::new(2, Target::resolve("host", &e).unwrap(), e.known_hosts());
+        let mut s = SshSession::new(1, t, e.known_hosts());
+        s.auto_reconnect = true;
+        let fx = s.start(80, 24);
+        assert!(
+            matches!(&sent(&fx)[..], [Message::Connect { shell: false, .. }]),
+            "{fx:?}"
+        );
+        // Neither way round does it share a shell's connection.
+        assert!(!shell.can_share(&s.target));
+        assert!(!s.can_share(&shell.target));
+        assert!(!s.target.same_login(&shell.target));
+        connected(&mut s);
+        assert!(s.input(b"ls\r").is_empty(), "no shell to type into");
+        // The network went: log in again, as for a shell.
+        s.on_worker(Message::Lost { channel: 1 });
+        assert!(reconnects(&gone(&mut s, "The connection was lost.")));
     }
 
     #[test]

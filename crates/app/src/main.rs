@@ -3,7 +3,9 @@
 //! `ferossh.exe [user@]host[:port]` connects to a host (names from
 //! `~/.ssh/config` work too); without a host it asks for one.
 //! `ferossh.exe COM3:115200,8N1` opens a serial console instead, and
-//! `ferossh.exe telnet://host[:port]` an (unencrypted) Telnet session. The same exe
+//! `ferossh.exe telnet://host[:port]` an (unencrypted) Telnet session, and
+//! `ferossh.exe sftp://user@host[/folder]` File transfer without a shell
+//! (for SFTP-only accounts). The same exe
 //! is also the SSH worker: the window starts it again as
 //! `ferossh.exe --worker <in> <out>` inside an AppContainer, where it runs
 //! the network side over two inherited pipes.
