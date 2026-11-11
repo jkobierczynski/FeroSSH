@@ -19,6 +19,7 @@ mod forward;
 mod mosh;
 mod session;
 mod sftp;
+pub mod stats;
 
 pub mod telnet;
 mod tunnel;
@@ -204,6 +205,23 @@ pub async fn serve(mut inbox: mpsc::Receiver<Message>, out: mpsc::Sender<Message
                     connection,
                     command,
                     split_stderr,
+                    rx,
+                    out.clone(),
+                    connections.clone(),
+                )));
+            }
+            Message::StatsOpen {
+                channel,
+                connection,
+                interval,
+            } => {
+                let Some((rx, guard)) = session(channel) else {
+                    continue;
+                };
+                guard.track(tokio::spawn(stats::run(
+                    channel,
+                    connection,
+                    interval,
                     rx,
                     out.clone(),
                     connections.clone(),

@@ -196,3 +196,10 @@ path = "fuzz_targets/mosh_screen.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "stats_feed"
+path = "fuzz_targets/stats_feed.rs"
+test = false
+doc = false
+bench = false

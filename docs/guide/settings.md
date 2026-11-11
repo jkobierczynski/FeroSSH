@@ -17,6 +17,7 @@ FeroSSH reads `~/.ssh/config` and `~/.ssh/known_hosts` too, and writes only to `
 | --- | --- | --- |
 | `SidePane right` | left | Shows the connection manager and file view on the right. |
 | `TabStrip no` | yes | Hides the tab strip. |
+| `StatusBar yes` | no | Shows the server status bar under the panes. Settings > Server status bar. |
 | `FullScreenKey no` | yes | Whether F11 switches full screen (Settings > F11 switches full screen). Off, F11 goes to the terminal. |
 | `WindowColours dark` | light | Where the menu bar, menus, title bar, tab strip and tools pane take their colours: `theme` (the focused pane's colour theme), `windows` (Windows' light or dark app mode), `light` (Windows' usual light look) or `dark`. Settings > Window colours. |
 | `CopyOnSelect yes` | no | Copies a selection as soon as you make it, as PuTTY does. |
