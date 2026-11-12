@@ -113,6 +113,24 @@ pub fn shares_login(destination: &str, ssh_kind: Option<bool>) -> bool {
         && ferossh_config::serial::parse_target(d).is_none()
 }
 
+/// An `sftp://` address for `destination` with `folder`, written so
+/// [`ferossh_config::ssh_config::sftp_url`] reads the same folder back:
+/// an absolute one as it is, one relative to the home folder under `/~/`.
+pub fn sftp_address(destination: &str, folder: Option<&str>) -> String {
+    let folder = folder
+        .filter(|f| !f.is_empty())
+        .map(|f| {
+            let f = f.replace('%', "%25");
+            if f.starts_with('/') {
+                f
+            } else {
+                format!("/~/{f}")
+            }
+        })
+        .unwrap_or_default();
+    format!("sftp://{destination}{folder}")
+}
+
 /// Panes waiting for another pane on the same host to log in, so they
 /// open on its connection instead of logging in again.
 #[derive(Debug, Default)]
@@ -257,6 +275,22 @@ mod tests {
         assert!(!shares_login("COM3:115200", None));
         assert!(!shares_login("telnet sw1 23", None));
         assert!(!shares_login(" ", None));
+    }
+
+    #[test]
+    fn sftp_addresses_keep_their_folder() {
+        use ferossh_config::ssh_config::sftp_url;
+        for (dest, folder) in [
+            ("web1", Some("/var/log")),
+            ("me@web1:2222", Some("docs/a b")),
+            ("web1", Some("/data/100%")),
+            ("web1", None),
+        ] {
+            let address = sftp_address(dest, folder);
+            let (back, f) = sftp_url(&address).unwrap();
+            assert_eq!(back, dest, "{address}");
+            assert_eq!(f.as_deref(), folder, "{address}");
+        }
     }
 
     #[test]

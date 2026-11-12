@@ -11090,14 +11090,9 @@ impl Window {
                 } else {
                     format!("{}@{}:{}", t.user, bracket(&t.alias), t.port)
                 };
-                if t.sftp_only && kind(&t.alias) != Some(SessionKind::Sftp) {
-                    let folder = t
-                        .sftp_folder
-                        .as_deref()
-                        .filter(|f| !f.is_empty())
-                        .map(|f| format!("/{}", f.trim_start_matches('/')))
-                        .unwrap_or_default();
-                    dest = format!("sftp://{dest}{folder}");
+                let folder = t.sftp_folder.as_deref().filter(|f| !f.is_empty());
+                if t.sftp_only && (folder.is_some() || kind(&t.alias) != Some(SessionKind::Sftp)) {
+                    dest = workspaces::sftp_address(&dest, folder);
                 }
                 let dir = (!in_tmux)
                     .then(|| {
