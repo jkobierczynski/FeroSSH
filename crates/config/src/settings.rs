@@ -154,13 +154,13 @@ pub struct Profile {
     /// 14 to 18 with SHA-2, AES-CTR, plain HMAC-SHA-2) for older switches,
     /// routers and servers.
     pub legacy_algorithms: bool,
-    /// The server's RDP port for Session > Open remote desktop; 3389 when
+    /// The server's RDP port for Session > Remote desktop > Open remote desktop; 3389 when
     /// unset.
     pub desktop_port: Option<u16>,
     /// The server's VNC port for the built-in desktop viewer; 5900 when
     /// unset.
     pub vnc_port: Option<u16>,
-    /// What Session > Open virtual desktop runs in its Xvfb display: a
+    /// What Session > Remote desktop > Open virtual desktop runs in its Xvfb display: a
     /// desktop session or a single program, as a shell command. Unset,
     /// it picks a desktop session the server has.
     pub virtual_desktop: Option<String>,
@@ -186,7 +186,7 @@ pub struct Profile {
     /// Keyword highlighting on or off for this host; the global setting
     /// when unset.
     pub highlight: Option<bool>,
-    /// The program Session > Run remote app offers first (and what a
+    /// The program Session > Remote apps > Run remote app offers first (and what a
     /// remote app session runs), as a shell-like command line.
     pub remote_app: Option<String>,
     /// Copy the FeroStream agent to this host when it lacks it; the
@@ -583,11 +583,17 @@ impl WindowColours {
     }
 }
 
+/// How many recent connections File > Recent connections keeps.
+pub const MAX_RECENT: usize = 8;
+
 /// Everything in the settings file.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Settings {
     pub profiles: Vec<Profile>,
     pub favourites: Vec<String>,
+    /// File > Recent connections: what was last connected to, newest
+    /// first, at most [`MAX_RECENT`].
+    pub recent: Vec<String>,
     /// User theme rules, tried before the built-in tag rules.
     pub theme_rules: Vec<ThemeRule>,
     /// Keyword highlighting in terminal output (Session > Highlight
@@ -736,6 +742,7 @@ impl Default for Settings {
         Self {
             profiles: Vec::new(),
             favourites: Vec::new(),
+            recent: Vec::new(),
             theme_rules: Vec::new(),
             highlight: true,
             highlight_standard: true,
@@ -1002,6 +1009,17 @@ impl Settings {
                     for host in args {
                         if !s.favourites.iter().any(|f| f.eq_ignore_ascii_case(&host)) {
                             s.favourites.push(host);
+                        }
+                    }
+                }
+                "recent" => {
+                    block = Block::Top;
+                    for dest in args {
+                        if s.recent.len() < MAX_RECENT
+                            && !dest.is_empty()
+                            && !s.recent.contains(&dest)
+                        {
+                            s.recent.push(dest);
                         }
                     }
                 }
@@ -1546,6 +1564,9 @@ impl Settings {
         for f in &self.favourites {
             let _ = writeln!(out, "Favourite {}", arg(f));
         }
+        for r in &self.recent {
+            let _ = writeln!(out, "Recent {}", arg(r));
+        }
         let _ = writeln!(out, "Highlight {}", flag(self.highlight));
         let _ = writeln!(out, "HighlightStandard {}", flag(self.highlight_standard));
         for r in &self.highlight_rules {
@@ -1725,6 +1746,19 @@ impl Settings {
             self.favourites.push(host.to_owned());
             true
         }
+    }
+
+    /// Puts `destination` first in the recent connections (once, newest
+    /// first), keeping at most [`MAX_RECENT`].
+    pub fn note_recent(&mut self, destination: &str) {
+        let destination = destination.trim();
+        if destination.is_empty() {
+            return;
+        }
+        // Exact: a user name or an sftp:// folder may differ only in case.
+        self.recent.retain(|r| r != destination);
+        self.recent.insert(0, destination.to_owned());
+        self.recent.truncate(MAX_RECENT);
     }
 
     /// The theme rules: the user's, then the built-in tag rules.
@@ -2419,5 +2453,38 @@ DesktopShareSelection yes
         assert!(s.is_favourite("Web"));
         assert!(!s.toggle_favourite("WEB"));
         assert!(s.favourites.is_empty());
+    }
+
+    #[test]
+    fn recent_connections() {
+        let mut s = Settings::default();
+        for i in 0..10 {
+            s.note_recent(&format!("host{i}"));
+        }
+        s.note_recent(" host5 ");
+        assert_eq!(s.recent.len(), MAX_RECENT);
+        assert_eq!(s.recent[0], "host5");
+        assert_eq!(s.recent[1], "host9");
+        assert_eq!(s.recent.iter().filter(|r| *r == "host5").count(), 1);
+        s.note_recent("  ");
+        assert_eq!(s.recent[0], "host5");
+        // Case can matter in a user name or an sftp:// folder.
+        s.note_recent("sftp://h/Reports");
+        s.note_recent("sftp://h/reports");
+        s.note_recent("Admin@h");
+        s.note_recent("admin@h");
+        assert_eq!(
+            &s.recent[..4],
+            ["admin@h", "Admin@h", "sftp://h/reports", "sftp://h/Reports"]
+        );
+        let back = Settings::parse(&s.to_text());
+        assert_eq!(back.recent, s.recent);
+        s.recent.push("user@db one".into());
+        let back = Settings::parse(&s.to_text());
+        assert_eq!(back.recent.len(), MAX_RECENT);
+        assert_eq!(
+            Settings::parse("Recent a A a \"b c\"\n").recent,
+            ["a", "A", "b c"]
+        );
     }
 }

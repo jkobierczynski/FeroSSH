@@ -10,11 +10,11 @@ Session > Log to file starts a log for the focused tab; pick it again to stop. E
 web1_tab1_2026-10-24_2215.log
 ```
 
-Session > Open log folder opens that folder in Explorer.
+Session > Logs and recordings > Open log folder opens that folder in Explorer.
 
 There are two kinds of log:
 
-- **Plain** (the default) keeps the readable text, as you saw it, without colours or cursor movements. Session > Timestamp each log line puts the local time each line started in front of it, to the millisecond:
+- **Plain** (the default) keeps the readable text, as you saw it, without colours or cursor movements. Session > Logs and recordings > Timestamp each log line puts the local time each line started in front of it, to the millisecond:
 
   ```
   [2026-10-26 19:24:49.123] $ uptime
@@ -22,35 +22,35 @@ There are two kinds of log:
   ```
 
   The setting applies to open logs from their next line and stays on for new ones (`LogTimestamps yes` in `ferossh.conf`).
-- **Raw**: Session > Log raw output (keep escape codes) keeps every byte the host sent, colours and all, so `cat file.log` in a terminal replays the session. Raw logs are never timestamped, because that would break the replay.
+- **Raw**: Session > Logs and recordings > Log raw output (keep escape codes) keeps every byte the host sent, colours and all, so `cat file.log` in a terminal replays the session. Raw logs are never timestamped, because that would break the replay.
 
 Passwords and passphrases you type never reach a log.
 
 ## Saving what a pane already shows
 
-Turned logging on too late? Session > Save this pane's output to a log writes everything the focused pane still holds, its whole scrollback and the screen, as plain text, to a new file ending in `_saved.log`:
+Turned logging on too late? Session > Logs and recordings > Save this pane's output to a log writes everything the focused pane still holds, its whole scrollback and the screen, as plain text, to a new file ending in `_saved.log`:
 
 ```
 web1_tab1_2026-10-24_2215_saved.log
 ```
 
-Session > Save output of all panes to logs does that for every pane in every tab, one file each. A message lists the files it wrote. How much there is depends on the scrollback (10,000 lines unless you set `Scrollback`).
+Session > Logs and recordings > Save output of all panes to logs does that for every pane in every tab, one file each. A message lists the files it wrote. How much there is depends on the scrollback (10,000 lines unless you set `Scrollback`).
 
 ## Recording a pane and playing it back
 
 A log keeps the text. A recording keeps the session as it happened, with its timing, so you can watch it again later: for an audit, to show someone how something was done, or for a demo.
 
-**Recording.** Session > Record this pane (asciicast) starts recording the focused pane; choose it again to stop. It is off until you turn it on, and the menu shows ✓ while the pane records. The file goes to the log folder, named like a log but ending in `.cast`:
+**Recording.** Session > Logs and recordings > Record this pane (asciicast) starts recording the focused pane; choose it again to stop. It is off until you turn it on, and the menu shows ✓ while the pane records. The file goes to the log folder, named like a log but ending in `.cast`:
 
 ```
 web1_tab1_2026-11-12_0935.cast
 ```
 
-It holds what the host sent and when, and the size of the terminal whenever it changed. It never holds your keystrokes: what you type is in it only as far as the host echoes it back to the screen, and hosts do not echo passwords, so passwords typed at a `sudo` or login prompt are not in it. A secret the host does show is: one typed as part of a command line (`mysql -pSecret`) or printed by a program. FeroSSH's own prompts (the connect prompt, password and passphrase questions) and messages are left out too. A recording starts from an empty screen, so turn it on before the part you want; it keeps going across a reconnect and ends when you stop it, close the pane or quit FeroSSH. Recordings are sealed with a chain file and go into the log index like logs (see below), so Session > Check a log for changes works on them too.
+It holds what the host sent and when, and the size of the terminal whenever it changed. It never holds your keystrokes: what you type is in it only as far as the host echoes it back to the screen, and hosts do not echo passwords, so passwords typed at a `sudo` or login prompt are not in it. A secret the host does show is: one typed as part of a command line (`mysql -pSecret`) or printed by a program. FeroSSH's own prompts (the connect prompt, password and passphrase questions) and messages are left out too. A recording starts from an empty screen, so turn it on before the part you want; it keeps going across a reconnect and ends when you stop it, close the pane or quit FeroSSH. Recordings are sealed with a chain file and go into the log index like logs (see below), so Session > Logs and recordings > Check a log for changes works on them too.
 
 The format is asciicast version 2, the format of [asciinema](https://asciinema.org): you can also play a FeroSSH recording with `asciinema play`, put it on a web page with the asciinema player, or play recordings made by asciinema in FeroSSH.
 
-**Playing.** Session > Play a recording... asks for a `.cast` file and plays it in a new tab, at the size it was recorded at. The tab shows the file, ▶ while playing (‖ paused, ■ at the end), where it stands and how long it is, and the speed when it is not normal.
+**Playing.** Session > Logs and recordings > Play a recording... asks for a `.cast` file and plays it in a new tab, at the size it was recorded at. The tab shows the file, ▶ while playing (‖ paused, ■ at the end), where it stands and how long it is, and the speed when it is not normal.
 
 | Key | What it does |
 | --- | --- |
@@ -91,7 +91,7 @@ You never need to open these files yourself. They are plain text, so you can, bu
 
 ## Checking a log
 
-Session > Check a log for changes... asks for a log file and tells you what it found:
+Session > Logs and recordings > Check a log for changes... asks for a log file and tells you what it found:
 
 | Message | Meaning |
 | --- | --- |

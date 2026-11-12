@@ -41,7 +41,7 @@ If you already use OpenSSH, FeroSSH reads `~/.ssh/config` as it is: `HostName`, 
 
 If you don't have an ssh_config, open the connection manager, press Insert ("+ New connection") and fill in the form. Saved connections go to `%APPDATA%\FeroSSH\sessions.conf`.
 
-Coming from PuTTY, KiTTY, WinSCP or another client? File > Import connections brings your saved sessions over, without their passwords.
+Coming from PuTTY, KiTTY, WinSCP or another client? File > Import and export > Import connections brings your saved sessions over, without their passwords.
 
 ## Command line
 

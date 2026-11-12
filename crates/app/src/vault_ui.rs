@@ -1,4 +1,4 @@
-//! File > Export connections, Import encrypted connections and the
+//! File > Import and export > Export connections, Import encrypted connections and the
 //! Master password menu: the dialogs around [`crate::vault`] and
 //! [`ferossh_config::sealed`]. A part of `win`, for its file helpers.
 
@@ -262,7 +262,7 @@ fn open_sealed(hwnd: HWND, path: &Path, text: &str, title: &str) -> Option<Bundl
     }
 }
 
-/// File > Export connections: a passphrase, the file, and the export.
+/// File > Import and export > Export connections: a passphrase, the file, and the export.
 pub(super) fn export(hwnd: HWND) {
     let mut b = match connection_bundle() {
         Ok(b) => b,
@@ -288,7 +288,7 @@ pub(super) fn export(hwnd: HWND) {
     let intro = format!(
         "FeroSSH writes your {} and their settings to one file, encrypted with this \
          passphrase. Keep it in OneDrive, a git repository or on a USB stick, and open it \
-         on another PC with File > Import encrypted connections. Nobody can read it \
+         on another PC with File > Import and export > Import encrypted connections. Nobody can read it \
          without the passphrase, and FeroSSH cannot recover a forgotten one.",
         plural(hosts, "saved connection", "saved connections"),
     );
@@ -411,7 +411,7 @@ fn merge_keys(local: &mut Settings, incoming: &Settings) -> usize {
         .count()
 }
 
-/// File > Import encrypted connections: the file, its passphrase, what
+/// File > Import and export > Import encrypted connections: the file, its passphrase, what
 /// it would change, and the import.
 pub(super) fn import(hwnd: HWND) {
     let start = home().join("Documents");
@@ -552,7 +552,7 @@ pub(super) fn import(hwnd: HWND) {
 }
 
 const FORGOTTEN: &str = "There is no way to recover a forgotten master password, so keep an \
-                         export (File > Export connections) somewhere safe as well.";
+                         export (File > Import and export > Export connections) somewhere safe as well.";
 
 /// Removes the plain connection files the vault now holds; a line for
 /// each that is still there.

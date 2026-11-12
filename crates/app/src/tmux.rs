@@ -356,7 +356,7 @@ pub struct Tmux {
     saved_text: Option<String>,
     /// The session to attach again after a reconnect.
     pub reattach: Option<String>,
-    /// Read the prefix keys on attach (Session > Use tmux keybindings).
+    /// Read the prefix keys on attach (Session > tmux > Use tmux keybindings).
     keys_wanted: bool,
     /// tmux's answer to [`tmux_keys::FORMAT`].
     keys: Option<String>,
@@ -626,7 +626,7 @@ impl Tmux {
         );
     }
 
-    /// Session > Use tmux keybindings: read the prefix keys on each attach
+    /// Session > tmux > Use tmux keybindings: read the prefix keys on each attach
     /// while on, and now if attached already.
     pub fn want_keys(&mut self, on: bool) -> Vec<Action> {
         let mut out = Vec::new();
@@ -650,7 +650,7 @@ impl Tmux {
         );
     }
 
-    /// Session > Switch tmux session.
+    /// Session > tmux > Switch tmux session.
     pub fn pick_session(&mut self) -> Vec<Action> {
         let mut out = Vec::new();
         self.list_sessions(&mut out);
