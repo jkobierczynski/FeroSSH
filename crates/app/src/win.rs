@@ -15037,6 +15037,12 @@ impl Window {
             base: self.download_dir(),
             landed: remote.map_or(0, files::landed),
             arrange: self.arrange(),
+            sort: self
+                .settings
+                .transfer_sort
+                .as_deref()
+                .map(files::Sorts::parse)
+                .unwrap_or_default(),
             bookmarks: self.settings.bookmarks.clone(),
             local_start: alias
                 .as_deref()
@@ -15194,6 +15200,15 @@ impl Window {
                 }
                 None
             }
+            Event::Sort(sort) => {
+                let text = Some(sort.to_setting());
+                if self.settings.transfer_sort != text {
+                    self.settings.transfer_sort = text;
+                    self.save_settings();
+                }
+                None
+            }
+            Event::DeleteLocal(paths) => Some(Command::ConfirmDeleteLocal(paths)),
             Event::Arrange(a) => {
                 let text = Some(a.to_setting());
                 if self.settings.transfer_layout != text {
@@ -15713,6 +15728,8 @@ enum Command {
         dir: Vec<u8>,
         entries: Vec<DirEntry>,
     },
+    /// Asks, then moves these local files and folders to the Recycle Bin.
+    ConfirmDeleteLocal(Vec<PathBuf>),
     /// The folder picker for the file view's Local PC section, starting
     /// in this folder.
     PickLocalFolder(PathBuf),
@@ -15806,6 +15823,47 @@ enum Command {
         command: ProxyCommand,
         input: std::sync::mpsc::Receiver<Message>,
     },
+}
+
+/// Moves `paths` to the Recycle Bin (Windows warns first when one cannot
+/// go there and would be deleted for good).
+fn recycle(hwnd: HWND, paths: &[PathBuf]) -> std::result::Result<(), String> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows::Win32::UI::Shell::{
+        FO_DELETE, FOF_ALLOWUNDO, FOF_NO_CONNECTED_ELEMENTS, FOF_NOCONFIRMATION,
+        FOF_WANTNUKEWARNING, SHFILEOPSTRUCTW, SHFileOperationW,
+    };
+    // Each path ends in a NUL, and the list in another. Only a full path
+    // goes to the Recycle Bin (a relative one is deleted for good), and
+    // `absolute` keeps a link itself rather than what it points to.
+    let mut from: Vec<u16> = Vec::new();
+    for p in paths {
+        let full = std::path::absolute(p).map_err(|e| format!("Delete did not start ({e})."))?;
+        from.extend(full.as_os_str().encode_wide().filter(|&c| c != 0));
+        from.push(0);
+    }
+    from.push(0);
+    let mut op = SHFILEOPSTRUCTW {
+        hwnd,
+        wFunc: FO_DELETE,
+        pFrom: PCWSTR(from.as_ptr()),
+        // Only what was asked about: not `page_files` with `page.html`.
+        fFlags: (FOF_ALLOWUNDO.0
+            | FOF_NOCONFIRMATION.0
+            | FOF_WANTNUKEWARNING.0
+            | FOF_NO_CONNECTED_ELEMENTS.0) as u16,
+        ..Default::default()
+    };
+    // SAFETY: a valid, double-NUL-terminated list living through the
+    // call, and our own window for any dialog it shows.
+    let code = unsafe { SHFileOperationW(&mut op) };
+    if code != 0 {
+        Err(format!("Delete did not finish (error {code:#x})."))
+    } else if op.fAnyOperationsAborted.as_bool() {
+        Err("Delete was cancelled; some items may be left.".into())
+    } else {
+        Ok(())
+    }
 }
 
 /// A modal message box; `None` if another one is already open.
@@ -17049,6 +17107,28 @@ fn run_command(hwnd: HWND, command: Command) {
                     w.flush_sftp();
                     w.refresh_chrome();
                 });
+            }
+        }
+        Command::ConfirmDeleteLocal(paths) => {
+            let folders = paths.iter().any(|p| p.is_dir());
+            let what = match paths.as_slice() {
+                [path] => {
+                    let kind = if folders { "the folder" } else { "the file" };
+                    format!("{kind} {}", path.display())
+                }
+                many => format!("these {} items", many.len()),
+            };
+            let note = if folders {
+                " A folder goes with everything in it."
+            } else {
+                ""
+            };
+            let text = format!(
+                "Move {what} to the Recycle Bin?{note}\n\nWhere there is no Recycle Bin (such as a network folder), Windows asks again before deleting for good."
+            );
+            if dialog(hwnd, &text, MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2) == Some(IDYES) {
+                let problem = recycle(hwnd, &paths).err();
+                files_panel::local_deleted(problem);
             }
         }
         Command::TmuxPicker { gateway, names } => {

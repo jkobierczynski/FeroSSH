@@ -32,14 +32,16 @@ use windows::Win32::System::Time::{FileTimeToSystemTime, SystemTimeToTzSpecificL
 use windows::Win32::UI::Controls::{
     BST_CHECKED, BST_UNCHECKED, CDDS_ITEMPREPAINT, CDDS_PREPAINT, CDDS_SUBITEM, CDRF_DODEFAULT,
     CDRF_NOTIFYITEMDRAW, CDRF_NOTIFYSUBITEMDRAW, CDRF_SKIPDEFAULT, EM_SETCUEBANNER, EM_SETSEL,
-    LIST_VIEW_ITEM_STATE_FLAGS, LVCF_FMT, LVCF_TEXT, LVCF_WIDTH, LVCFMT_LEFT, LVCFMT_RIGHT,
-    LVCOLUMNW, LVHITTESTINFO, LVIF_IMAGE, LVIF_PARAM, LVIF_TEXT, LVIR_BOUNDS, LVIS_DROPHILITED,
-    LVIS_FOCUSED, LVIS_SELECTED, LVITEMW, LVM_DELETEALLITEMS, LVM_ENSUREVISIBLE, LVM_GETITEMCOUNT,
-    LVM_GETITEMRECT, LVM_GETNEXTITEM, LVM_GETSUBITEMRECT, LVM_HITTEST, LVM_INSERTCOLUMNW,
-    LVM_INSERTITEMW, LVM_SETCOLUMNWIDTH, LVM_SETEXTENDEDLISTVIEWSTYLE, LVM_SETIMAGELIST,
-    LVM_SETITEMSTATE, LVM_SETITEMTEXTW, LVN_BEGINDRAG, LVN_KEYDOWN, LVNI_SELECTED,
-    LVS_EX_DOUBLEBUFFER, LVS_EX_FULLROWSELECT, LVS_REPORT, LVS_SHAREIMAGELISTS, LVS_SHOWSELALWAYS,
-    LVS_SINGLESEL, LVSIL_SMALL, NM_CUSTOMDRAW, NM_DBLCLK, NM_SETFOCUS, NMHDR, NMITEMACTIVATE,
+    HDF_SORTDOWN, HDF_SORTUP, HDI_FORMAT, HDITEMW, HDM_GETITEMCOUNT, HDM_GETITEMW, HDM_SETITEMW,
+    HEADER_CONTROL_FORMAT_FLAGS, LIST_VIEW_ITEM_STATE_FLAGS, LVCF_FMT, LVCF_TEXT, LVCF_WIDTH,
+    LVCFMT_LEFT, LVCFMT_RIGHT, LVCOLUMNW, LVHITTESTINFO, LVIF_IMAGE, LVIF_PARAM, LVIF_TEXT,
+    LVIR_BOUNDS, LVIS_DROPHILITED, LVIS_FOCUSED, LVIS_SELECTED, LVITEMW, LVM_DELETEALLITEMS,
+    LVM_ENSUREVISIBLE, LVM_GETHEADER, LVM_GETITEMCOUNT, LVM_GETITEMRECT, LVM_GETNEXTITEM,
+    LVM_GETSUBITEMRECT, LVM_HITTEST, LVM_INSERTCOLUMNW, LVM_INSERTITEMW, LVM_SETCOLUMNWIDTH,
+    LVM_SETEXTENDEDLISTVIEWSTYLE, LVM_SETIMAGELIST, LVM_SETITEMSTATE, LVM_SETITEMTEXTW,
+    LVN_BEGINDRAG, LVN_COLUMNCLICK, LVN_KEYDOWN, LVNI_SELECTED, LVS_EX_DOUBLEBUFFER,
+    LVS_EX_FULLROWSELECT, LVS_REPORT, LVS_SHAREIMAGELISTS, LVS_SHOWSELALWAYS, LVS_SINGLESEL,
+    LVSIL_SMALL, NM_CUSTOMDRAW, NM_DBLCLK, NM_SETFOCUS, NMHDR, NMITEMACTIVATE, NMLISTVIEW,
     NMLVCUSTOMDRAW, NMLVKEYDOWN, SetWindowTheme, TOOLTIPS_CLASSW, TTF_IDISHWND, TTF_SUBCLASS,
     TTM_ADDTOOLW, TTS_ALWAYSTIP, TTS_NOPREFIX, TTTOOLINFOW, WC_BUTTONW, WC_EDITW, WC_LISTVIEWW,
     WC_STATICW,
@@ -67,8 +69,8 @@ use windows::Win32::UI::WindowsAndMessaging::{
 use windows::core::{PCWSTR, PWSTR, w};
 
 use crate::files::{
-    self, Arrange, BackStep, FileRow, Follow, LocalPane, QueueRow, SyncLocal, SyncPending,
-    SyncStep, filtered, local_rows,
+    self, Arrange, BackStep, FileRow, Follow, LocalPane, QueueRow, Sort, Sorts, SyncLocal,
+    SyncPending, SyncStep, filtered, local_rows,
 };
 use crate::layout::Rect;
 use crate::native::{fonts, key_down, pass_edge, scale, search_text, set_font, wide};
@@ -100,6 +102,8 @@ pub struct View {
     /// Downloads finished so far, to read the Local list again.
     pub landed: usize,
     pub arrange: Arrange,
+    /// How each list is sorted (the `TransferSort` setting).
+    pub sort: Sorts,
     /// Every bookmark; the menu leaves out those for other hosts.
     pub bookmarks: Vec<Bookmark>,
     /// The connection the Remote list shows, to match bookmarks to.
@@ -179,6 +183,11 @@ pub enum Event {
     OpenLocal(PathBuf),
     ToggleFollow,
     Arrange(Arrange),
+    /// The lists are sorted this way now (one of them just changed).
+    Sort(Sorts),
+    /// Delete these local files and folders (to the Recycle Bin), once
+    /// the user says yes.
+    DeleteLocal(Vec<PathBuf>),
     /// The bookmarks as they are now (one was added, renamed or deleted).
     Bookmarks(Vec<Bookmark>),
     Job(JobId, JobOp),
@@ -340,6 +349,7 @@ struct State {
     select_remote: Option<Vec<u8>>,
     filter: String,
     arrange: Arrange,
+    sort: Sorts,
     /// The panel's size as laid out, the lists' area and the gap.
     size: (i32, i32),
     /// How much of the panel's width the terminal leaves uncovered: the
@@ -749,6 +759,7 @@ pub fn create(main: HWND, handler: Handler, dpi: u32) -> windows::core::Result<(
                 select_remote: None,
                 filter: String::new(),
                 arrange: Arrange::default(),
+                sort: Sorts::default(),
                 size: (0, 0),
                 visible: 0,
                 lists: Rect::default(),
@@ -1397,6 +1408,7 @@ pub fn set_view(view: View) {
         );
         if old.is_none() {
             s.arrange = view.arrange;
+            s.sort = view.sort;
         }
         // The pane turned to another host, or another connection to the
         // same host: its connection's Local folder, else the download
@@ -1464,6 +1476,7 @@ pub fn set_view(view: View) {
         ),
         SyncStep::None | SyncStep::Wait(_) => {}
     }
+    show_sort(&h);
     refresh_local(&h, false);
     refresh_remote(&h);
     if queue_changed {
@@ -1534,7 +1547,8 @@ fn refresh_local(h: &Handles, reread: bool) {
         if reread {
             s.local.reload();
         }
-        let rows = local_rows(&s.local.listing, &s.filter);
+        let mut rows = local_rows(&s.local.listing, &s.filter);
+        s.sort.local.apply(&mut rows);
         let dir = s.local.dir().map(PathBuf::from);
         let new_folder = dir != s.local_dir;
         if rows == s.local_shown && !new_folder {
@@ -1572,7 +1586,8 @@ fn refresh_local(h: &Handles, reread: bool) {
 fn refresh_remote(h: &Handles) {
     let Some((rows, old, new_folder, pick, mut icons, dir)) = with(|s| {
         let v = s.view.as_ref()?;
-        let rows = filtered(&v.remote_rows, &s.filter);
+        let mut rows = filtered(&v.remote_rows, &s.filter);
+        s.sort.remote.apply(&mut rows);
         // Another queue is another host: nothing selected carries over,
         // even when its folder and names are the same.
         let new_queue = v.key != s.remote_key;
@@ -2813,6 +2828,9 @@ fn context_menu(h: &Handles, list: HWND, lparam: LPARAM) {
     const NEW_FOLDER: u32 = 10;
     const RENAME: u32 = 11;
     const CHMOD: u32 = 12;
+    const SORT_NAME: u32 = 13;
+    const SORT_SIZE: u32 = 14;
+    const SORT_MODIFIED: u32 = 15;
     let (at, row) = menu_spot(list, lparam);
     let remote = list == h.remote.list;
     let rows = picked(h, remote);
@@ -2821,7 +2839,18 @@ fn context_menu(h: &Handles, list: HWND, lparam: LPARAM) {
     let one_file = one && rows.first().is_some_and(|r| !r.dir);
     let host = remote_dir().is_some();
     let can = |id: u32, on: bool| if on { id } else { u32::MAX };
-    let items: Vec<(u32, &str, bool)> = if remote {
+    let sort = with(|s| s.sort.get(remote)).unwrap_or_default();
+    let sorted = [
+        (0, "", false),
+        (SORT_NAME, "Sort by &name", sort.by == files::SortBy::Name),
+        (SORT_SIZE, "Sort by si&ze", sort.by == files::SortBy::Size),
+        (
+            SORT_MODIFIED,
+            "Sort by modified &date",
+            sort.by == files::SortBy::Modified,
+        ),
+    ];
+    let mut items: Vec<(u32, &str, bool)> = if remote {
         vec![
             (can(OPEN, row.is_some()), "&Open\tEnter", false),
             (can(EDIT, one_file), "&Edit locally", false),
@@ -2841,6 +2870,7 @@ fn context_menu(h: &Handles, list: HWND, lparam: LPARAM) {
         vec![
             (can(OPEN, row.is_some()), "&Open\tEnter", false),
             (can(SEND, any && host), "&Upload\tCtrl+Enter", false),
+            (can(DELETE, any), "D&elete...\tDel", false),
             (0, "", false),
             (can(NEW_FOLDER, local), "&New folder...", false),
             (can(RENAME, one), "Rena&me...\tF2", false),
@@ -2850,6 +2880,7 @@ fn context_menu(h: &Handles, list: HWND, lparam: LPARAM) {
             (can(EXPLORER, local), "Open in &Explorer", false),
         ]
     };
+    items.extend(sorted);
     // The menu runs its own message loop, in which the list can be
     // refreshed: the row is found again by its name afterwards.
     let clicked = row.and_then(|i| shown_row(remote, i));
@@ -2864,7 +2895,15 @@ fn context_menu(h: &Handles, list: HWND, lparam: LPARAM) {
         OPEN => open(h, remote, clicked.and_then(|c| find_row(remote, &c))),
         SEND if remote => download(h, None),
         SEND => upload(h, None),
-        DELETE => delete(h),
+        DELETE if remote => delete(h),
+        DELETE => delete_local(h),
+        SORT_NAME | SORT_SIZE | SORT_MODIFIED => {
+            // The column picked again turns around, as a header click does.
+            let column = (chosen - SORT_NAME) as usize;
+            if let Some(next) = sort.clicked(column) {
+                set_sort(h, remote, next);
+            }
+        }
         EDIT => edit_locally(h),
         NEW_FOLDER => new_folder(h, remote),
         RENAME => rename(h, remote),
@@ -2880,6 +2919,80 @@ fn context_menu(h: &Handles, list: HWND, lparam: LPARAM) {
             }
         }
         _ => {}
+    }
+}
+
+/// Sorts the Remote list (`remote`) or the Local list this way, and
+/// remembers it.
+fn set_sort(h: &Handles, remote: bool, sort: Sort) {
+    let Some(all) = with(|s| {
+        let was = s.sort.get(remote);
+        s.sort.set(remote, sort);
+        (was != sort).then_some(s.sort)
+    })
+    .flatten() else {
+        return;
+    };
+    show_sort(h);
+    if remote {
+        refresh_remote(h);
+    } else {
+        refresh_local(h, false);
+    }
+    emit(Event::Sort(all));
+}
+
+/// Puts the sort arrow on the sorted column's header in each list, and
+/// takes it off the others.
+fn show_sort(h: &Handles) {
+    let Some(sorts) = with(|s| s.sort) else {
+        return;
+    };
+    for (list, sort) in [(h.local.list, sorts.local), (h.remote.list, sorts.remote)] {
+        // SAFETY: our own controls; each struct lives through its call.
+        unsafe {
+            let header = HWND(SendMessageW(list, LVM_GETHEADER, None, None).0 as *mut _);
+            if header.is_invalid() {
+                continue;
+            }
+            let n = SendMessageW(header, HDM_GETITEMCOUNT, None, None).0.max(0) as usize;
+            for i in 0..n {
+                let mut item = HDITEMW {
+                    mask: HDI_FORMAT,
+                    ..Default::default()
+                };
+                if SendMessageW(
+                    header,
+                    HDM_GETITEMW,
+                    Some(WPARAM(i)),
+                    Some(LPARAM(&raw mut item as isize)),
+                )
+                .0 == 0
+                {
+                    continue;
+                }
+                let arrows = HDF_SORTUP.0 | HDF_SORTDOWN.0;
+                let want = if i == sort.column() {
+                    if sort.descending {
+                        HDF_SORTDOWN.0
+                    } else {
+                        HDF_SORTUP.0
+                    }
+                } else {
+                    0
+                };
+                let fmt = (item.fmt.0 & !arrows) | want;
+                if fmt != item.fmt.0 {
+                    item.fmt = HEADER_CONTROL_FORMAT_FLAGS(fmt);
+                    SendMessageW(
+                        header,
+                        HDM_SETITEMW,
+                        Some(WPARAM(i)),
+                        Some(LPARAM(&raw const item as isize)),
+                    );
+                }
+            }
+        }
     }
 }
 
@@ -2997,6 +3110,31 @@ fn delete(h: &Handles) {
     }
 }
 
+/// Asks to delete the selected local rows (to the Recycle Bin).
+fn delete_local(h: &Handles) {
+    let paths: Vec<PathBuf> = picked(h, false)
+        .into_iter()
+        .filter_map(|r| r.local)
+        // Never a drive (in This PC).
+        .filter(|p| p.parent().is_some())
+        .collect();
+    if !paths.is_empty() {
+        emit(Event::DeleteLocal(paths));
+    }
+}
+
+/// Reads the Local list's folder again (after a delete), and says what
+/// went wrong, if anything.
+pub fn local_deleted(problem: Option<String>) {
+    let Some(h) = handles() else {
+        return;
+    };
+    refresh_local(&h, true);
+    if let Some(p) = problem {
+        local_problem(p);
+    }
+}
+
 /// Draws a queue row's progress bar in its Progress column.
 fn draw_progress(h: &Handles, cd: &NMLVCUSTOMDRAW) -> LRESULT {
     let item = cd.nmcd.dwItemSpec;
@@ -3092,6 +3230,8 @@ fn notify(h: &Handles, lparam: LPARAM) -> LRESULT {
                     go_up(h, remote);
                 } else if vk == VK_DELETE.0 && remote {
                     delete(h);
+                } else if vk == VK_DELETE.0 {
+                    delete_local(h);
                 } else if vk == VK_F2.0 {
                     rename(h, remote);
                 } else if vk == VK_F5.0 {
@@ -3102,6 +3242,13 @@ fn notify(h: &Handles, lparam: LPARAM) -> LRESULT {
                     }
                 } else if vk == u16::from(b'A') && key_down(VK_CONTROL.0) {
                     set_state(from, -1, LIST_VIEW_ITEM_STATE_FLAGS(LVIS_SELECTED.0), true);
+                }
+            }
+            LVN_COLUMNCLICK if is_list => {
+                let click = &*(lparam.0 as *const NMLISTVIEW);
+                let column = click.iSubItem as usize;
+                if let Some(sort) = with(|s| s.sort.get(remote).clicked(column)).flatten() {
+                    set_sort(h, remote, sort);
                 }
             }
             LVN_BEGINDRAG if is_list => {

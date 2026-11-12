@@ -413,6 +413,165 @@ impl Arrange {
     }
 }
 
+/// The column the Local and Remote lists are sorted on.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum SortBy {
+    #[default]
+    Name,
+    Size,
+    Modified,
+}
+
+/// How the Local and Remote lists are sorted: folders always come first
+/// (and ".." before them), whichever way.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Sort {
+    pub by: SortBy,
+    /// Z to A, largest first, newest first.
+    pub descending: bool,
+}
+
+impl Sort {
+    /// The `TransferSort` setting: `name`, `size` or `modified`, then
+    /// `descending` or `ascending`, such as `size descending`.
+    pub fn parse(text: &str) -> Self {
+        let mut s = Self::default();
+        for word in text.split_whitespace() {
+            match word.to_ascii_lowercase().as_str() {
+                "name" => s.by = SortBy::Name,
+                "size" => s.by = SortBy::Size,
+                "modified" | "date" => s.by = SortBy::Modified,
+                "descending" | "desc" => s.descending = true,
+                "ascending" | "asc" => s.descending = false,
+                _ => {}
+            }
+        }
+        s
+    }
+
+    pub fn to_setting(self) -> String {
+        format!(
+            "{} {}",
+            match self.by {
+                SortBy::Name => "name",
+                SortBy::Size => "size",
+                SortBy::Modified => "modified",
+            },
+            if self.descending {
+                "descending"
+            } else {
+                "ascending"
+            }
+        )
+    }
+
+    /// The column a list's header shows it on: 0 Name, 1 Size,
+    /// 2 Modified.
+    pub fn column(self) -> usize {
+        match self.by {
+            SortBy::Name => 0,
+            SortBy::Size => 1,
+            SortBy::Modified => 2,
+        }
+    }
+
+    /// After a click on header `column`: the same column turns around;
+    /// another starts A to Z for names, largest and newest first for
+    /// sizes and dates. `None` for a column that does not sort (Rights).
+    pub fn clicked(self, column: usize) -> Option<Self> {
+        let by = match column {
+            0 => SortBy::Name,
+            1 => SortBy::Size,
+            2 => SortBy::Modified,
+            _ => return None,
+        };
+        Some(if by == self.by {
+            Self {
+                by,
+                descending: !self.descending,
+            }
+        } else {
+            Self {
+                by,
+                descending: by != SortBy::Name,
+            }
+        })
+    }
+
+    /// Sorts `rows` in place: ".." first, then folders, then files, each
+    /// group on the column (ties by name).
+    pub fn apply(self, rows: &mut [FileRow]) {
+        rows.sort_by(|a, b| {
+            b.up.cmp(&a.up)
+                .then_with(|| b.dir.cmp(&a.dir))
+                .then_with(|| {
+                    let name = || a.name.to_lowercase().cmp(&b.name.to_lowercase());
+                    let o = match self.by {
+                        SortBy::Name => name(),
+                        SortBy::Size => a.size.cmp(&b.size).then_with(name),
+                        SortBy::Modified => a.modified.cmp(&b.modified).then_with(name),
+                    };
+                    if self.descending { o.reverse() } else { o }
+                })
+        });
+    }
+}
+
+/// How each list is sorted: the Local and Remote lists keep their own.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Sorts {
+    pub local: Sort,
+    pub remote: Sort,
+}
+
+impl Sorts {
+    /// The `TransferSort` setting: `local` and `remote`, each followed by
+    /// its sort, such as `local name ascending remote size descending`.
+    /// Words before either name are for both lists.
+    pub fn parse(text: &str) -> Self {
+        let lower = text.to_ascii_lowercase();
+        let mut both = String::new();
+        let mut local = String::new();
+        let mut remote = String::new();
+        let mut into = &mut both;
+        for word in lower.split_whitespace() {
+            match word {
+                "local" => into = &mut local,
+                "remote" => into = &mut remote,
+                w => {
+                    into.push(' ');
+                    into.push_str(w);
+                }
+            }
+        }
+        let side = |own: &str| Sort::parse(&format!("{both} {own}"));
+        Self {
+            local: side(&local),
+            remote: side(&remote),
+        }
+    }
+
+    pub fn to_setting(self) -> String {
+        format!(
+            "local {} remote {}",
+            self.local.to_setting(),
+            self.remote.to_setting()
+        )
+    }
+
+    pub fn get(self, remote: bool) -> Sort {
+        if remote { self.remote } else { self.local }
+    }
+
+    pub fn set(&mut self, remote: bool, sort: Sort) {
+        if remote {
+            self.remote = sort;
+        } else {
+            self.local = sort;
+        }
+    }
+}
+
 /// The smallest share either list gets.
 pub const MIN_SPLIT: u8 = 15;
 
@@ -859,6 +1018,147 @@ mod tests {
         let rows = remote_rows(&listing("/etc"), "*.log");
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].name, "beta.log");
+    }
+
+    #[test]
+    fn sorting_keeps_up_then_folders_first() {
+        let mut rows = remote_rows(&listing("/etc"), "");
+        let names =
+            |rows: &[FileRow]| -> Vec<String> { rows.iter().map(|r| r.name.clone()).collect() };
+        Sort::default().apply(&mut rows);
+        assert_eq!(
+            names(&rows),
+            ["..", "Alpha", "link", "beta.log", "zeta.txt"]
+        );
+        Sort {
+            by: SortBy::Name,
+            descending: true,
+        }
+        .apply(&mut rows);
+        assert_eq!(
+            names(&rows),
+            ["..", "link", "Alpha", "zeta.txt", "beta.log"]
+        );
+        Sort {
+            by: SortBy::Size,
+            descending: true,
+        }
+        .apply(&mut rows);
+        assert_eq!(
+            names(&rows),
+            ["..", "link", "Alpha", "beta.log", "zeta.txt"]
+        );
+        Sort {
+            by: SortBy::Size,
+            descending: false,
+        }
+        .apply(&mut rows);
+        assert_eq!(
+            names(&rows),
+            ["..", "Alpha", "link", "zeta.txt", "beta.log"]
+        );
+        for (r, t) in rows.iter_mut().zip([0, 5, 3, 9, 1]) {
+            r.modified = Some(t);
+        }
+        // .. Alpha(5) link(3) zeta(9) beta(1)
+        Sort {
+            by: SortBy::Modified,
+            descending: true,
+        }
+        .apply(&mut rows);
+        assert_eq!(
+            names(&rows),
+            ["..", "Alpha", "link", "zeta.txt", "beta.log"]
+        );
+        Sort {
+            by: SortBy::Modified,
+            descending: false,
+        }
+        .apply(&mut rows);
+        assert_eq!(
+            names(&rows),
+            ["..", "link", "Alpha", "beta.log", "zeta.txt"]
+        );
+    }
+
+    #[test]
+    fn sort_setting_and_header_clicks() {
+        for text in ["name ascending", "size descending", "modified ascending"] {
+            assert_eq!(Sort::parse(text).to_setting(), text);
+        }
+        assert_eq!(Sort::parse(""), Sort::default());
+        assert_eq!(
+            Sort::parse("Date DESC"),
+            Sort {
+                by: SortBy::Modified,
+                descending: true
+            }
+        );
+        let s = Sort::default();
+        assert_eq!(
+            s.clicked(0),
+            Some(Sort {
+                by: SortBy::Name,
+                descending: true
+            })
+        );
+        let size = s.clicked(1).unwrap();
+        assert_eq!(
+            size,
+            Sort {
+                by: SortBy::Size,
+                descending: true
+            }
+        );
+        assert_eq!(
+            size.clicked(1),
+            Some(Sort {
+                by: SortBy::Size,
+                descending: false
+            })
+        );
+        assert_eq!(
+            size.clicked(2),
+            Some(Sort {
+                by: SortBy::Modified,
+                descending: true
+            })
+        );
+        assert_eq!(size.clicked(0), Some(Sort::default()));
+        assert_eq!(s.clicked(3), None);
+        assert_eq!(size.column(), 1);
+    }
+
+    #[test]
+    fn each_list_keeps_its_own_sort() {
+        let both = Sorts {
+            local: Sort::default(),
+            remote: Sort {
+                by: SortBy::Size,
+                descending: true,
+            },
+        };
+        let text = both.to_setting();
+        assert_eq!(text, "local name ascending remote size descending");
+        assert_eq!(Sorts::parse(&text), both);
+        // One sort for both, from before the lists had their own.
+        let old = Sorts::parse("modified descending");
+        assert_eq!(old.local, old.remote);
+        assert_eq!(old.local.by, SortBy::Modified);
+        assert_eq!(
+            Sorts::parse("Remote Size"),
+            Sorts {
+                local: Sort::default(),
+                remote: Sort {
+                    by: SortBy::Size,
+                    descending: false
+                },
+            }
+        );
+        let mut s = Sorts::default();
+        s.set(true, both.remote);
+        assert_eq!(s, both);
+        assert_eq!(s.get(false), Sort::default());
     }
 
     #[test]
