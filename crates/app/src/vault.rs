@@ -232,6 +232,12 @@ pub fn remove() -> Result<Removed, String> {
     })
 }
 
+/// Closes the vault as it is, without reading its file again (which may
+/// fail): FeroSSH goes back to plain files at once.
+pub fn close() {
+    with(|v| *v = None);
+}
+
 /// Opens a vault [`remove`] closed again, as it was.
 pub fn restore(removed: Removed) {
     with(|v| *v = Some(removed.0));

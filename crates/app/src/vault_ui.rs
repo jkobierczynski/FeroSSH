@@ -796,6 +796,8 @@ pub(super) fn use_file(hwnd: HWND) {
     if let Some(t) = vault::read("ferossh.conf") {
         note_settings(&t);
     }
+    // As they were, for going back to this PC's own files.
+    let before = with_window(|w| w.settings.clone());
     let saved = with_window(|w| {
         if let Some(s) = &shared {
             // A profile in both takes the vault's.
@@ -844,7 +846,10 @@ pub(super) fn use_file(hwnd: HWND) {
     } else {
         // Back to this PC's own files, which are all still there, for the
         // rest of this run and the next start alike.
-        drop(vault::remove());
+        vault::close();
+        if let Some(before) = before {
+            with_window(|w| w.settings = before);
+        }
         format!(
             "FeroSSH could not switch to the vault {}, so it keeps using this PC's own files \
              in {}:\n\n{}",
