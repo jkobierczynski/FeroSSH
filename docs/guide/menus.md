@@ -268,4 +268,4 @@ Type a few letters in any order. Up and Down select, Enter runs the action, conn
 
 ### Import connections
 
-Up and Down move, Space or Enter ticks a session (or opens a client), Esc goes back.
+A standard Windows page in the tools pane: the programs that have something saved, in a list (Enter or a double click opens one; Alt+O Open, Alt+M From a file...), then that program's connections with a tick box each. Space or a click ticks one, Alt+A selects all, Alt+L clears all, Enter or Alt+I imports, Esc, Backspace or Alt+B goes back. Names that are already a host show greyed with no box. File > Import scripts works the same way.

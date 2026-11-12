@@ -82,6 +82,8 @@ mod highlight;
 #[cfg(windows)]
 mod history_store;
 #[cfg(windows)]
+mod import_panel;
+#[cfg(windows)]
 mod import_reg;
 #[cfg_attr(not(windows), allow(dead_code))]
 mod import_view;
