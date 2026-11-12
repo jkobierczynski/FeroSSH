@@ -58,3 +58,7 @@ For the ARM64 exes, check out the tag of a release that has them, and run `pwsh 
 The script prints the SHA-256 of each exe it built. Those of the published exes must equal the `sha256_unsigned` values in that release's `BUILD-MANIFEST.json`. (`ferossh-vnc.exe` and `ferossh-vnc-arm64.exe` are built but not published.) They differ from `SHA256SUMS.txt` only when the release is code-signed, because the signature is added to the exe after it is built.
 
 The script builds with the toolchain pinned in `rust-toolchain.toml` (rustup installs it), the dependencies pinned in `Cargo.lock`, `/Brepro` so the exe holds no timestamps, and `--remap-path-prefix` so the folder you build in does not end up in the exe.
+
+## The FeroStream agents
+
+`ferostream-agent` and `ferostream-agent-aarch64` are Linux programs, so they carry no Authenticode signature. Check them with the other two steps instead: their lines in `SHA256SUMS.txt` (`(Get-FileHash .\ferostream-agent).Hash.ToLower()`), and `gh attestation verify ferostream-agent -R jkobierczynski/FeroSSH`. To build them yourself from the FeroStream commit a release pins, see [FeroStream agents](../../README.md#ferostream-agents) in the README. CI does not check that build for identical bytes as it does for the exes, so compare it by what it does rather than by its hash.
