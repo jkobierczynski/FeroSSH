@@ -5,8 +5,9 @@
 //! panic; a connect line that reads has a port and a 16-byte key from the
 //! line itself; what the server said instead comes back short and
 //! without control characters; and a command line, when one is made,
-//! names a program the settings allow, quotes the command so the shell
-//! reads it as one word, and has no line break.
+//! names a program the settings allow and quotes the command so the shell
+//! reads it as one word (a command may hold line breaks, inside those
+//! quotes); without a command it has no line break or shell syntax.
 
 #![no_main]
 

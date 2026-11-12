@@ -246,7 +246,11 @@ pub fn fuzz_stream(data: &[u8], step: usize) {
     }
     let whole = requests(&mut std::iter::once(data));
     let chunked = requests(&mut data.chunks(step.max(1)));
-    assert_eq!(whole, chunked);
+    // Past the limit, `serve` stops as soon as its buffer holds too much,
+    // which depends on how the bytes arrived.
+    if data.len() <= MAX_MESSAGE + 4 {
+        assert_eq!(whole, chunked);
+    }
     for body in &whole {
         match parse(body) {
             Request::List => assert_eq!(body.as_slice(), [REQUEST_IDENTITIES]),
@@ -264,7 +268,11 @@ pub fn fuzz_stream(data: &[u8], step: usize) {
     let keys: Vec<(Vec<u8>, String)> = whole
         .iter()
         .take(4)
-        .map(|b| (b.clone(), String::from_utf8_lossy(b).into_owned()))
+        .map(|b| {
+            // Kept small, so the answer stays within one message.
+            let b = b.get(..b.len().min(MAX_MESSAGE / 16)).unwrap_or_default();
+            (b.to_vec(), String::from_utf8_lossy(b).into_owned())
+        })
         .collect();
     let mut answer = identities(&keys);
     assert_eq!(
