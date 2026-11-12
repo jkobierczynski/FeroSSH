@@ -99,6 +99,8 @@ Font, theme and text size apply to the focused pane only. Session > Save font an
 | Split right | Alt+Shift+= | Splits the focused pane, the new one on the right, on the same connection and in the same directory (see [New tabs and panes start in the same directory](everyday-use.md#new-tabs-and-panes-start-in-the-same-directory)). |
 | Split down | Alt+Shift+- | The same, the new pane below. |
 | Move pane to its own tab | | Takes the focused pane out of its tab into a new one. |
+| Hide pane (keeps running) | Ctrl+Shift+H | Takes the focused pane out of the tabs without closing it; the session runs on and the Session manager lists it as hidden, to show it again. Not for tmux sessions in tmux's own layout. |
+| Show last hidden pane | | Puts the pane hidden last back where it was. |
 | Join tab into the tab before it | Ctrl+Shift+J | Puts this tab's panes into the tab to its left. |
 | Focus pane left, right, up, down | Alt+arrows | Moves the focus to the pane in that direction. |
 | Grow pane left, right, up, down | Alt+Shift+arrows | Moves the focused pane's edge that way. |
@@ -216,12 +218,12 @@ The buttons at the bottom do the same, and a saved connection has a Delete butto
 | Typing | Goes to the search box and filters by host, name, title or kind (SSH, Mosh, SFTP, WinRM, Telnet, serial, tmux, desktop, local). |
 | Down (in the search box) | Moves into the list. |
 | Tab | Moves between the search box, the list and the buttons. |
-| Enter or double-click | Goes to the session's tab and pane (from the search box, the first one listed). A hidden script-run session, or the login of a desktop or remote app connection, is shown in a tab. |
+| Enter or double-click | Goes to the session's tab and pane (from the search box, the first one listed). A pane you hid comes back where it was; a hidden script-run session, or the login of a desktop or remote app connection, is shown in a tab. |
 | F2 | Renames the session in place: Enter keeps the name, Esc drops it, an empty name clears it. |
 | Del | Closes the session, after asking when it is live. |
 | Esc | Clears the search, then leaves. |
 
-The Show, Rename and Close buttons below the list, and the right-click menu on a session (or Shift+F10 with the list focused, for example after Down from the search box), do the same.
+The Show, Rename and Close buttons below the list, and the right-click menu on a session (which also has Hide) (or Shift+F10 with the list focused, for example after Down from the search box), do the same.
 
 ### File transfer (Ctrl+Shift+E)
 

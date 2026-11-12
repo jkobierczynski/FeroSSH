@@ -954,6 +954,20 @@ impl Tmux {
         let saved = self.saved.take().unwrap_or_default();
         let mut used: BTreeSet<WindowId> = BTreeSet::new();
         let mut active_tab = 0;
+        // Windows the user hid stay hidden, out of the tabs.
+        let mut hidden: Vec<Node> = Vec::new();
+        if self.mode == Mode::Ferossh {
+            for w in &saved.hidden {
+                if !infos.contains_key(w) || !used.insert(*w) {
+                    continue;
+                }
+                if let Some(tree) =
+                    self.expand(ws, &saved::Node::Window(*w), &mut infos, &saved, out)
+                {
+                    hidden.push(tree);
+                }
+            }
+        }
         if self.mode == Mode::Ferossh {
             for (i, tab) in saved.tabs.iter().enumerate() {
                 let root = tab
@@ -986,7 +1000,22 @@ impl Tmux {
             }
         }
         if made.is_empty() {
+            // Nothing else to show: the hidden ones show after all.
+            made = hidden
+                .drain(..)
+                .map(|tree| {
+                    let focus = tree.panes().first().copied().unwrap_or(0);
+                    (tree, focus)
+                })
+                .collect();
+        }
+        if made.is_empty() {
             return;
+        }
+        for tree in hidden {
+            for native in tree.panes() {
+                ws.add_hidden(native);
+            }
         }
         // The new tabs go where the gateway or the old panes were.
         let mut place: Vec<Native> = self.stale.clone();
@@ -1010,7 +1039,22 @@ impl Tmux {
         ws.remove_pane(self.gateway);
         if let Some(f) = first_focus {
             ws.focus(f);
-            out.push(Action::Focus { native: f });
+        }
+        // Hidden panes of windows that show leave their tabs again (the
+        // focus moving to a pane that shows), in FeroSSH's layout only.
+        if self.mode == Mode::Ferossh {
+            for p in &saved.hidden_panes {
+                if let Some(n) = self.native_of(*p)
+                    && ws.tab_of(n).is_some()
+                {
+                    ws.hide(n);
+                }
+            }
+        }
+        if first_focus.is_some() {
+            out.push(Action::Focus {
+                native: ws.focused(),
+            });
         }
         out.push(Action::Structure);
     }
@@ -1601,6 +1645,23 @@ impl Tmux {
                 saved.tabs.push(saved::Tab { root, focus });
             }
         }
+        if self.mode == Mode::Ferossh {
+            let shown: BTreeSet<WindowId> =
+                saved.tabs.iter().flat_map(|t| t.root.windows()).collect();
+            for n in ws.hidden() {
+                let Some(w) = window_of(n) else {
+                    continue;
+                };
+                if !shown.contains(&w) {
+                    if !saved.hidden.contains(&w) {
+                        saved.hidden.push(w);
+                    }
+                } else if let Some(p) = self.pane_of(n) {
+                    // Part of a window that shows: the pane alone.
+                    saved.hidden_panes.push(p);
+                }
+            }
+        }
         for p in self.panes.values() {
             saved
                 .looks
@@ -1873,6 +1934,74 @@ mod tests {
         assert!(w.contains(&"set-option -q @ferossh-mode ferossh".to_owned()));
         assert!(w.contains(&"capture-pane -p -e -q -t %3 -S -100".to_owned()));
         assert_eq!(t.mode(), Mode::Ferossh);
+    }
+
+    #[test]
+    fn hidden_windows_stay_hidden_and_are_saved() {
+        let panes = [
+            pane_line(0, 0, 80, 24, "b25f,80x24,0,0,0"),
+            pane_line(1, 1, 80, 24, "b25f,80x24,0,0,1"),
+            pane_line(2, 2, 80, 24, "b25f,80x24,0,0,2"),
+        ];
+        let saved = "ferossh1 active=0 tab=r500(@0,@1)/@0 hidden=@2";
+        let (mut t, mut ws, _) = attached(None, Some(saved), &panes);
+        let [n0, n1, n2] = [0, 1, 2].map(|p| t.native_of(p).unwrap());
+        assert_eq!(ws.all_panes(), [n0, n1]);
+        assert_eq!(ws.hidden(), [n2]);
+        let look = |_| Look::default();
+        let w = writes(&t.sync_saved(&ws, &look));
+        assert!(w[0].contains("tab=r500(@0,@1)/@0 hidden=@2 look="), "{w:?}");
+        // Hiding another and showing the first saves that.
+        assert!(ws.hide(n1));
+        assert!(ws.show(n2));
+        let w = writes(&t.sync_saved(&ws, &look));
+        assert!(w[0].contains("hidden=@1 look="), "{w:?}");
+        assert!(!w[0].contains("hidden=@2"), "{w:?}");
+        // A hidden pane's window closing forgets it.
+        let a = t.feed(&mut ws, b"%window-close @1\n");
+        assert!(a.contains(&Action::Remove { native: n1 }));
+        assert!(ws.hidden().is_empty());
+    }
+
+    #[test]
+    fn a_hidden_pane_of_a_window_that_shows_stays_hidden() {
+        let layout = "x,80x24,0,0{40x24,0,0,2,39x24,41,0,3}";
+        let panes = [
+            pane_line(2, 2, 80, 24, layout),
+            pane_line(3, 2, 80, 24, layout),
+        ];
+        let (t, mut ws, _) = attached(None, None, &panes);
+        let [n2, n3] = [2, 3].map(|p| t.native_of(p).unwrap());
+        assert!(ws.hide(n3));
+        let mut t = t;
+        let w = writes(&t.sync_saved(&ws, &|_| Look::default()));
+        assert!(w[0].contains("tab=@2/@2 hidden=%3 look="), "{w:?}");
+        // Attaching again with that layout hides the pane again.
+        let saved = "ferossh1 active=0 tab=@2/@2 hidden=%3";
+        let (t, ws, _) = attached(None, Some(saved), &panes);
+        let [m2, m3] = [2, 3].map(|p| t.native_of(p).unwrap());
+        assert_eq!(ws.all_panes(), [m2]);
+        assert_eq!(ws.hidden(), [m3]);
+        // The window's first pane hidden: the focus goes to the other.
+        let saved = "ferossh1 active=0 tab=@2/@2 hidden=%2";
+        let (t, ws, a) = attached(None, Some(saved), &panes);
+        let [m2, m3] = [2, 3].map(|p| t.native_of(p).unwrap());
+        assert_eq!(ws.all_panes(), [m3]);
+        assert_eq!(ws.hidden(), [m2]);
+        assert_eq!(ws.focused(), m3);
+        assert!(a.contains(&Action::Focus { native: m3 }));
+        // In tmux's own layout nothing is hidden.
+        let (_, ws, _) = attached(Some("tmux"), Some(saved), &panes);
+        assert!(ws.hidden().is_empty());
+        let _ = n2;
+    }
+
+    #[test]
+    fn hidden_windows_show_when_nothing_else_would() {
+        let panes = [pane_line(0, 0, 80, 24, "b25f,80x24,0,0,0")];
+        let (t, ws, _) = attached(None, Some("ferossh1 active=0 hidden=@0"), &panes);
+        assert_eq!(ws.all_panes(), [t.native_of(0).unwrap()]);
+        assert!(ws.hidden().is_empty());
     }
 
     #[test]

@@ -54,6 +54,8 @@ use crate::native::{fonts, key_down, pass_edge, scale, search_text, set_font, wi
 pub enum Event {
     /// Show the session (Enter, a double click, the Show button).
     Show(PaneId),
+    /// Hide its pane: out of the tabs, running on (the right-click menu).
+    Hide(PaneId),
     /// Close it, after asking (Del, the Close button).
     Close(PaneId),
     /// A name was typed for it (`text` as typed; empty clears the name).
@@ -701,7 +703,7 @@ fn notify(h: Handles, lparam: LPARAM) -> LRESULT {
 }
 
 /// The list's right-click menu (or Shift+F10, the menu key): Show,
-/// Rename and Close for the session under the mouse or selected.
+/// Hide, Rename and Close for the session under the mouse or selected.
 fn context_menu(h: Handles, lparam: LPARAM) {
     use windows::Win32::Foundation::POINT;
     use windows::Win32::Graphics::Gdi::{ClientToScreen, ScreenToClient};
@@ -715,6 +717,7 @@ fn context_menu(h: Handles, lparam: LPARAM) {
     const SHOW: u32 = 1;
     const RENAME: u32 = 2;
     const CLOSE: u32 = 3;
+    const HIDE: u32 = 4;
     // SAFETY: our own control and a popup menu of our own, destroyed after
     // use; each struct lives through its call.
     unsafe {
@@ -775,6 +778,7 @@ fn context_menu(h: Handles, lparam: LPARAM) {
             return;
         };
         let _ = AppendMenuW(menu, MF_STRING, SHOW as usize, w!("&Show\tEnter"));
+        let _ = AppendMenuW(menu, MF_STRING, HIDE as usize, w!("&Hide (keeps running)"));
         let _ = AppendMenuW(menu, MF_STRING, RENAME as usize, w!("&Rename\tF2"));
         let _ = AppendMenuW(menu, MF_SEPARATOR, 0, None);
         let _ = AppendMenuW(menu, MF_STRING, CLOSE as usize, w!("&Close...\tDel"));
@@ -790,6 +794,7 @@ fn context_menu(h: Handles, lparam: LPARAM) {
         let _ = DestroyMenu(menu);
         match u32::try_from(chosen.0).unwrap_or(0) {
             SHOW => emit(Event::Show(pane)),
+            HIDE => emit(Event::Hide(pane)),
             RENAME => edit_name(pane),
             CLOSE => emit(Event::Close(pane)),
             _ => {}
