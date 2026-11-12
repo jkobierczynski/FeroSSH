@@ -74,10 +74,10 @@ use windows::Win32::UI::Input::Ime::{
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     GetDoubleClickTime, GetKeyState, HOT_KEY_MODIFIERS, MAPVK_VK_TO_CHAR, MAPVK_VSC_TO_VK,
     MOD_NOREPEAT, MapVirtualKeyW, RegisterHotKey, ReleaseCapture, SetCapture, SetFocus,
-    UnregisterHotKey, VIRTUAL_KEY, VK_ADD, VK_BACK, VK_CAPITAL, VK_CONTROL, VK_DELETE, VK_DOWN,
-    VK_END, VK_ESCAPE, VK_F1, VK_F2, VK_F3, VK_F4, VK_F5, VK_F11, VK_F12, VK_HOME, VK_INSERT,
-    VK_LEFT, VK_LWIN, VK_MENU, VK_NEXT, VK_NUMPAD0, VK_OEM_2, VK_OEM_MINUS, VK_OEM_PLUS, VK_PRIOR,
-    VK_RETURN, VK_RIGHT, VK_RWIN, VK_SHIFT, VK_SPACE, VK_SUBTRACT, VK_TAB, VK_UP,
+    UnregisterHotKey, VIRTUAL_KEY, VK_BACK, VK_CAPITAL, VK_CONTROL, VK_DELETE, VK_DOWN, VK_END,
+    VK_ESCAPE, VK_F1, VK_F2, VK_F3, VK_F4, VK_F5, VK_F12, VK_HOME, VK_INSERT, VK_LEFT, VK_LWIN,
+    VK_MENU, VK_NEXT, VK_OEM_2, VK_PRIOR, VK_RETURN, VK_RIGHT, VK_RWIN, VK_SHIFT, VK_SPACE, VK_TAB,
+    VK_UP,
 };
 use windows::Win32::UI::Shell::{
     DragAcceptFiles, DragFinish, DragQueryFileW, DragQueryPoint, HDROP, ShellExecuteW,
@@ -131,6 +131,7 @@ use crate::highlight;
 use crate::import_panel;
 use crate::import_reg;
 use crate::import_view::{Found, ImportAction, ImportView, Items};
+use crate::keymap::{self, KeyDefault, Keymap};
 use crate::layout::{self, Axis, Closed, Dir, Drop, PaneId, Rect, Workspace};
 use crate::link::{Link, LinkEvent};
 use crate::live::{self, LiveAction, LiveSession, LiveState, LiveView};
@@ -138,6 +139,7 @@ use crate::live_panel;
 use crate::login_script::{self, Need, Outcome, Runner};
 use crate::look;
 use crate::palette::{self, CommandPalette, PalAction};
+use crate::palette_panel;
 use crate::pattern;
 use crate::proxycmd::ProxyRun;
 use crate::pwcommand;
@@ -351,6 +353,92 @@ fn font_page(family: &str) -> Option<&'static str> {
         .map(|(_, url)| *url)
 }
 
+/// The shortcuts every action has until Settings > Key bindings changes
+/// them, the main one (shown in the menus) first.
+const KEY_DEFAULTS: &[KeyDefault] = {
+    use keymap::When::{Always, Split, Tabs};
+    const fn d(id: u32, when: keymap::When, keys: &'static [&'static str]) -> KeyDefault {
+        KeyDefault { id, when, keys }
+    }
+    &[
+        d(cmd::CONNECT, Always, &["Ctrl+Shift+N"]),
+        d(cmd::RECONNECT, Always, &["Ctrl+Shift+R"]),
+        d(cmd::NEW_TAB, Always, &["Ctrl+Shift+T"]),
+        d(cmd::CLOSE_PANE, Always, &["Ctrl+Shift+W"]),
+        d(cmd::CLOSE_TAB, Always, &["Ctrl+F4"]),
+        d(cmd::UPLOAD, Always, &["Ctrl+Shift+U"]),
+        d(cmd::DESKTOP, Always, &["Ctrl+Shift+D"]),
+        d(cmd::COPY, Always, &["Ctrl+Shift+C", "Ctrl+Insert"]),
+        d(cmd::PASTE, Always, &["Ctrl+Shift+V", "Shift+Insert"]),
+        d(cmd::FIND, Always, &["Ctrl+Shift+F"]),
+        d(cmd::SCROLL_PAGE_UP, Always, &["Shift+PageUp"]),
+        d(cmd::SCROLL_PAGE_DOWN, Always, &["Shift+PageDown"]),
+        d(cmd::SCROLL_TOP, Always, &["Ctrl+Shift+Home"]),
+        d(cmd::SCROLL_BOTTOM, Always, &["Ctrl+Shift+End"]),
+        d(cmd::SESSIONS, Always, &["Ctrl+Shift+S"]),
+        d(cmd::LIVE, Always, &["Ctrl+Shift+L"]),
+        d(cmd::FILES, Always, &["Ctrl+Shift+E"]),
+        d(cmd::FORWARDS, Always, &["Ctrl+Shift+P"]),
+        d(cmd::SNIPPETS, Always, &["Ctrl+Shift+Space"]),
+        d(cmd::PALETTE, Always, &["Ctrl+Shift+A"]),
+        d(
+            cmd::ZOOM_IN,
+            Always,
+            &[
+                "Ctrl+OemPlus",
+                "Ctrl+NumPlus",
+                "Ctrl+Shift+OemPlus",
+                "Ctrl+Shift+NumPlus",
+            ],
+        ),
+        d(cmd::ZOOM_OUT, Always, &["Ctrl+OemMinus", "Ctrl+NumMinus"]),
+        d(cmd::ZOOM_RESET, Always, &["Ctrl+0", "Ctrl+Num0"]),
+        d(cmd::HIDE_MENU, Always, &["Ctrl+Shift+M"]),
+        d(cmd::FULL_SCREEN, Always, &["F11"]),
+        d(
+            cmd::SPLIT_RIGHT,
+            Always,
+            &["Alt+Shift+OemPlus", "Alt+Shift+NumPlus"],
+        ),
+        d(
+            cmd::SPLIT_DOWN,
+            Always,
+            &["Alt+Shift+OemMinus", "Alt+Shift+NumMinus"],
+        ),
+        d(cmd::NEXT_TAB, Tabs, &["Ctrl+Tab"]),
+        d(cmd::PREV_TAB, Tabs, &["Ctrl+Shift+Tab"]),
+        d(cmd::TAB_LEFT, Tabs, &["Ctrl+Shift+PageUp"]),
+        d(cmd::TAB_RIGHT, Tabs, &["Ctrl+Shift+PageDown"]),
+        d(cmd::JOIN_TAB, Tabs, &["Ctrl+Shift+J"]),
+        d(cmd::BROADCAST_TAB, Always, &["Ctrl+Shift+B"]),
+        d(cmd::FOCUS, Split, &["Alt+Left"]),
+        d(cmd::FOCUS + 1, Split, &["Alt+Right"]),
+        d(cmd::FOCUS + 2, Split, &["Alt+Up"]),
+        d(cmd::FOCUS + 3, Split, &["Alt+Down"]),
+        d(cmd::RESIZE, Split, &["Alt+Shift+Left"]),
+        d(cmd::RESIZE + 1, Split, &["Alt+Shift+Right"]),
+        d(cmd::RESIZE + 2, Split, &["Alt+Shift+Up"]),
+        d(cmd::RESIZE + 3, Split, &["Alt+Shift+Down"]),
+    ]
+};
+
+/// Whether Settings > Key bindings offers menu command `id`: not the
+/// items of lists that change (fonts, themes, tmux sessions, standby
+/// windows, workspaces), whose ids say a place in the list.
+fn bindable(id: u32) -> bool {
+    let lists = [
+        cmd::WINDOW_COLOURS..cmd::STATUS_BAR,
+        cmd::FONT..cmd::COPY,
+        cmd::REMOTE_APP_CLIP..cmd::REMOTE_APP_CLIP_LAST + 1,
+        cmd::DESKTOP_CLIP..cmd::DESKTOP_CLIP_LAST + 1,
+        cmd::STANDBY_STATUS..cmd::STANDBY_STATUS + 1,
+        cmd::STANDBY_PRESET..cmd::STANDBY_OWN,
+        cmd::STANDBY_TARGET..cmd::UPDATE_CHECK,
+        cmd::WORKSPACE_OPEN..u32::MAX,
+    ];
+    id != cmd::KEY_BINDINGS && !lists.iter().any(|r| r.contains(&id))
+}
+
 /// Menu command ids. Shortcuts map to the same ids.
 mod cmd {
     pub const LOCAL_SHELL: u32 = 100;
@@ -401,6 +489,8 @@ mod cmd {
     pub const WINDOW_COLOURS: u32 = 220;
     /// Settings > Server status bar.
     pub const STATUS_BAR: u32 = 230;
+    /// Settings > Key bindings.
+    pub const KEY_BINDINGS: u32 = 231;
     /// Plus the index into `FONT_CHOICES`.
     pub const FONT: u32 = 300;
     /// Plus the index into `Theme::builtin()`.
@@ -1012,6 +1102,8 @@ struct Window {
     /// What the side pane showed before a rename opened the session
     /// manager (`None` inside: hidden), to go back to once it is done.
     rename_return: Option<Option<SideView>>,
+    /// Which keys run which action (Settings > Key bindings).
+    keymap: Keymap,
     settings: Settings,
     /// The theme panes start with (`--theme`, or Nord).
     default_theme: Theme,
@@ -2013,6 +2105,7 @@ fn create_and_run(launch: Launch, theme: Option<String>) -> Result<()> {
                 drag: None,
                 tab_click: None,
                 rename_return: None,
+                keymap: Keymap::new(KEY_DEFAULTS, &settings.key_bindings),
                 settings,
                 default_theme,
                 command: match &launch {
@@ -2111,6 +2204,8 @@ fn create_and_run(launch: Launch, theme: Option<String>) -> Result<()> {
         let _ = import_panel::create(hwnd, import_event, dpi);
         // The file transfer pane's, likewise.
         let _ = files_panel::create(hwnd, files_event, dpi);
+        // The command palette's, likewise.
+        let _ = palette_panel::create(hwnd, palette_event, dpi);
         // The port forwards pane's, likewise.
         let _ = fwd_panel::create(hwnd, fwd_event, dpi);
         // The scripts pane's, likewise.
@@ -2140,6 +2235,7 @@ fn create_and_run(launch: Launch, theme: Option<String>) -> Result<()> {
             }
         });
         with_window(Window::update_menu_checks);
+        with_window(|w| w.apply_key_labels());
         // Sends WM_SIZE, which sizes the terminal before the shell starts.
         SetWindowPos(
             hwnd,
@@ -2178,12 +2274,14 @@ fn create_and_run(launch: Launch, theme: Option<String>) -> Result<()> {
 
         let mut msg = MSG::default();
         while GetMessageW(&mut msg, None, 0, 0).as_bool() {
-            // F11 in the tool panes' controls is the window's F11.
-            if msg.message == WM_KEYDOWN
-                && msg.wParam.0 == usize::from(VK_F11.0)
+            // The window's shortcuts in the tool panes' controls (F11,
+            // Ctrl+Shift keys and the keys Settings > Key bindings gave
+            // actions), except the editing keys the controls use.
+            if (msg.message == WM_KEYDOWN || msg.message == WM_SYSKEYDOWN)
                 && msg.hwnd != hwnd
                 && IsChild(hwnd, msg.hwnd).as_bool()
-                && with_window(|w| w.full_screen_f11(VK_F11, key_mods())) == Some(true)
+                && with_window(|w| w.tools_shortcut(VIRTUAL_KEY(msg.wParam.0 as u16), key_mods()))
+                    == Some(true)
             {
                 msg.hwnd = hwnd;
             }
@@ -2193,6 +2291,7 @@ fn create_and_run(launch: Launch, theme: Option<String>) -> Result<()> {
                 || live_panel::pre_translate(&msg)
                 || form_view::pre_translate(&msg)
                 || import_panel::pre_translate(&msg)
+                || palette_panel::pre_translate(&msg)
                 || files_panel::pre_translate(&msg)
                 || fwd_panel::pre_translate(&msg)
                 || scripts_panel::pre_translate(&msg)
@@ -2514,6 +2613,8 @@ fn build_menu() -> Result<HMENU> {
         )?;
         item(view, cmd::FULL_SCREEN, "F&ull screen\tF11")?;
         item(view, cmd::FULL_SCREEN_KEY, "F11 switches full scree&n")?;
+        separator(view)?;
+        item(view, cmd::KEY_BINDINGS, "Key bin&dings...")?;
 
         let window = CreatePopupMenu()?;
         item(window, cmd::NEW_TAB, "Ne&w tab\tCtrl+Shift+T")?;
@@ -5151,12 +5252,8 @@ impl Window {
                 let vk = VIRTUAL_KEY(wparam.0 as u16);
                 let down = matches!(msg, WM_KEYDOWN | WM_SYSKEYDOWN);
                 // FeroSSH's own shortcuts still work in the pane.
-                let split = self.ws.tab().is_some_and(|t| t.root.panes().len() > 1);
                 let mods = key_mods();
-                if down
-                    && (shortcut(vk, mods, self.ws.tabs.len() > 1, split).is_some()
-                        || self.full_screen_f11(vk, mods))
-                {
+                if down && self.shortcut_for(vk, mods).is_some() {
                     return false;
                 }
                 let extended = lparam.0 & (1 << 24) != 0;
@@ -8580,6 +8677,11 @@ impl Window {
         self.side.visible && self.side.view == SideView::Live
     }
 
+    /// Whether the command palette shows as native controls.
+    fn palette_native(&self) -> bool {
+        self.side.visible && self.side.view == SideView::Palette
+    }
+
     /// Whether port forwards show as native controls.
     fn fwd_native(&self) -> bool {
         self.side.visible && self.side.view == SideView::Forwards
@@ -8672,6 +8774,8 @@ impl Window {
             conn_view::has_focus()
         } else if self.live_native() {
             live_panel::has_focus()
+        } else if self.palette_native() {
+            palette_panel::has_focus()
         } else if self.files_visible() {
             files_panel::has_focus()
         } else if self.fwd_native() {
@@ -8709,6 +8813,12 @@ impl Window {
             live_panel::place(self.areas.side, self.areas.side_width, self.dpi);
         } else {
             live_panel::place(None, 0, self.dpi);
+        }
+        if self.palette_native() {
+            palette_panel::set_view(self.palette.native());
+            palette_panel::place(self.areas.side, self.areas.side_width, self.dpi);
+        } else {
+            palette_panel::place(None, 0, self.dpi);
         }
         // The focused pane's host first, so the view never shows the
         // host the pane had before.
@@ -8819,6 +8929,7 @@ impl Window {
     fn wants_tools_focus(&self) -> bool {
         (self.conn_native()
             || self.live_native()
+            || self.palette_native()
             || self.form_native()
             || self.import_native()
             || self.files_visible()
@@ -9418,6 +9529,27 @@ impl Window {
 
     /// The prefix keys of the tmux session pane `id` shows, when tmux
     /// keybindings are on and it is a pane of a tmux session.
+    /// The prefix of an open tmux session as a key (Ctrl+B), for the
+    /// warnings of Settings > Key bindings; `None` when none is open or
+    /// its prefix is no Ctrl key.
+    fn tmux_prefix_key(&self) -> Option<Hotkey> {
+        let keys = self
+            .tmux
+            .values()
+            .filter(|t| t.active())
+            .find_map(|t| t.keys().and_then(tmux_keys::Keys::parse))?;
+        let p = keys.prefixes.first()?;
+        match p.ch {
+            c @ '\x01'..='\x1a' => Some(keymap::chord(
+                u16::from(b'A' + c as u8 - 1),
+                true,
+                p.alt,
+                false,
+            )),
+            _ => None,
+        }
+    }
+
     fn tmux_keys_of(&self, id: PaneId) -> Option<tmux_keys::Keys> {
         if !self.settings.tmux_keys {
             return None;
@@ -9597,8 +9729,7 @@ impl Window {
             // A text key, or Ctrl with one: its WM_CHAR follows, unless
             // it is a FeroSSH shortcut, which also ends the wait.
             _ => {
-                let split = self.ws.tab().is_some_and(|t| t.root.panes().len() > 1);
-                if shortcut(vk, mods, self.ws.tabs.len() > 1, split).is_some() {
+                if self.shortcut_for(vk, mods).is_some() {
                     self.tmux_armed = None;
                     self.tmux_repeat = None;
                 }
@@ -9672,8 +9803,7 @@ impl Window {
             drop_pending_char(self.hwnd);
             return KeyOutcome::Run(Command::Id(cmd::SCROLL_BOTTOM));
         }
-        let split = self.ws.tab().is_some_and(|t| t.root.panes().len() > 1);
-        if let Some(id) = shortcut(vk, mods, self.ws.tabs.len() > 1, split) {
+        if let Some(id) = self.shortcut_for(vk, mods) {
             drop_pending_char(self.hwnd);
             return KeyOutcome::Run(Command::Id(id));
         }
@@ -9738,11 +9868,59 @@ impl Window {
         KeyOutcome::Default
     }
 
-    /// Whether the key is plain F11 and F11 switches full screen (View >
-    /// F11 switches full screen); when that is off, F11 goes to the
-    /// terminal as `ESC [ 2 3 ~`, for programs that use it.
+    /// Whether the key is the full screen key (F11 unless Settings > Key
+    /// bindings changed it) and it switches full screen (Settings > F11
+    /// switches full screen); when that is off, F11 goes to the terminal
+    /// as `ESC [ 2 3 ~`, for programs that use it.
     fn full_screen_f11(&self, vk: VIRTUAL_KEY, mods: Mods) -> bool {
-        vk == VK_F11 && mods == Mods::NONE && self.settings.full_screen_key
+        self.shortcut_for(vk, mods) == Some(cmd::FULL_SCREEN)
+    }
+
+    /// The action a key runs here, by Settings > Key bindings: tab keys
+    /// only with more than one tab, pane keys only with more than one
+    /// pane, the full screen key only while it switches full screen.
+    fn shortcut_for(&self, vk: VIRTUAL_KEY, mods: Mods) -> Option<u32> {
+        let split = self.ws.tab().is_some_and(|t| t.root.panes().len() > 1);
+        let id = shortcut(&self.keymap, vk, mods, self.ws.tabs.len() > 1, split)?;
+        (id != cmd::FULL_SCREEN || self.settings.full_screen_key).then_some(id)
+    }
+
+    /// Whether a key pressed in a tool pane's controls is a shortcut that
+    /// goes to the window, not to the control (see
+    /// [`keymap::reaches_main_from_tools`]).
+    fn tools_shortcut(&self, vk: VIRTUAL_KEY, mods: Mods) -> bool {
+        self.shortcut_for(vk, mods).is_some()
+            && keymap::reaches_main_from_tools(keymap::chord(vk.0, mods.ctrl, mods.alt, mods.shift))
+    }
+
+    /// Shows the key bindings in the menus (after a tab, as menus do), in
+    /// the rail's tooltips, and so in the command palette.
+    fn apply_key_labels(&self) {
+        let label = |id: u32| self.keymap.keys(id).first().map(|k| hotkey_label(*k));
+        let full = match label(cmd::FULL_SCREEN) {
+            Some(k) => format!("{k} switches full scree&n"),
+            None => "The full screen key switches full scree&n".to_owned(),
+        };
+        menu_key_labels(self.menu, &|id| {
+            match id {
+                cmd::FULL_SCREEN_KEY => MenuText::Whole(full.clone()),
+                // Windows closes the window on Alt+F4 whatever is bound.
+                cmd::EXIT => MenuText::Key(label(id).or_else(|| Some("Alt+F4".to_owned()))),
+                _ => MenuText::Key(label(id)),
+            }
+        });
+        rail::set_keys(RailItem::ALL.map(|i| {
+            let id = match i {
+                RailItem::Connections => cmd::SESSIONS,
+                RailItem::Sessions => cmd::LIVE,
+                RailItem::Files => cmd::FILES,
+                RailItem::Forwards => cmd::FORWARDS,
+                RailItem::Snippets => cmd::SNIPPETS,
+                RailItem::Palette => cmd::PALETTE,
+                RailItem::Pin => return String::new(),
+            };
+            label(id).unwrap_or_default()
+        }));
     }
 
     fn search_key(&mut self, id: PaneId, vk: VIRTUAL_KEY, mods: Mods) -> KeyOutcome {
@@ -13274,6 +13452,7 @@ impl Window {
             }
             cmd::HIDE_MENU => return Some(Command::SetMenuVisible(!self.menu_visible)),
             cmd::FULL_SCREEN => return Some(Command::FullScreen),
+            cmd::KEY_BINDINGS => return Some(Command::KeyBindings),
             cmd::FULL_SCREEN_KEY => {
                 self.settings.full_screen_key = !self.settings.full_screen_key;
                 self.save_settings();
@@ -15319,10 +15498,74 @@ impl Window {
     }
 }
 
+/// What a menu item's text becomes: its shortcut after a tab (none:
+/// the tab and what followed it go), or a whole new text.
+enum MenuText {
+    Key(Option<String>),
+    Whole(String),
+}
+
+/// Sets the shortcut part of every item of `menu` and its submenus as
+/// `text` says for its command id.
+fn menu_key_labels(menu: HMENU, text: &dyn Fn(u32) -> MenuText) {
+    use windows::Win32::UI::WindowsAndMessaging::{MENUITEMINFOW, MIIM_STRING, SetMenuItemInfoW};
+    // SAFETY: a menu handle of ours.
+    let count = unsafe { GetMenuItemCount(Some(menu)) };
+    for pos in 0..count.max(0) {
+        let at = pos as u32;
+        // SAFETY: our menu and a position in it.
+        let (state, sub) =
+            unsafe { (GetMenuState(menu, at, MF_BYPOSITION), GetSubMenu(menu, pos)) };
+        if state & MF_SEPARATOR.0 != 0 {
+            continue;
+        }
+        if !sub.is_invalid() {
+            menu_key_labels(sub, text);
+            continue;
+        }
+        // SAFETY: as above.
+        let id = unsafe { GetMenuItemID(menu, pos) };
+        if id == u32::MAX || !bindable(id) {
+            continue;
+        }
+        let mut buf = [0u16; 256];
+        // SAFETY: our menu, a position in it and a local buffer.
+        let len = unsafe { GetMenuStringW(menu, at, Some(&mut buf), MF_BYPOSITION) };
+        let len = usize::try_from(len).unwrap_or(0).min(buf.len());
+        let now = String::from_utf16_lossy(buf.get(..len).unwrap_or_default());
+        let base = now.split_once('\t').map_or(now.as_str(), |(b, _)| b);
+        let new = match text(id) {
+            MenuText::Key(Some(k)) => format!("{base}\t{k}"),
+            MenuText::Key(None) => base.to_owned(),
+            MenuText::Whole(t) => t,
+        };
+        if new == now {
+            continue;
+        }
+        let mut wide_text: Vec<u16> = new.encode_utf16().chain(std::iter::once(0)).collect();
+        let mii = MENUITEMINFOW {
+            cbSize: std::mem::size_of::<MENUITEMINFOW>() as u32,
+            fMask: MIIM_STRING,
+            dwTypeData: windows::core::PWSTR(wide_text.as_mut_ptr()),
+            ..Default::default()
+        };
+        // SAFETY: our menu; the text lives through the call, which copies it.
+        unsafe {
+            let _ = SetMenuItemInfoW(menu, at, true, &mii);
+        }
+    }
+}
+
 /// The command palette's actions: every item of `menu` and its submenus
 /// that is not greyed out, with the menus it is in.
 fn menu_entries(menu: HMENU) -> Vec<palette::Entry> {
-    fn walk(menu: HMENU, path: &mut Vec<String>, out: &mut Vec<palette::Entry>) {
+    menu_items(menu, false)
+}
+
+/// Every item of `menu` and its submenus, with the menus it is in;
+/// greyed-out ones too with `greyed`.
+fn menu_items(menu: HMENU, greyed: bool) -> Vec<palette::Entry> {
+    fn walk(menu: HMENU, path: &mut Vec<String>, out: &mut Vec<palette::Entry>, greyed: bool) {
         // SAFETY: a menu handle of ours.
         let count = unsafe { GetMenuItemCount(Some(menu)) };
         for pos in 0..count.max(0) {
@@ -15347,11 +15590,11 @@ fn menu_entries(menu: HMENU) -> Vec<palette::Entry> {
             };
             if !sub.is_invalid() {
                 path.push(text);
-                walk(sub, path, out);
+                walk(sub, path, out, greyed);
                 path.pop();
                 continue;
             }
-            if state & (MF_GRAYED.0 | MF_DISABLED.0) != 0 {
+            if !greyed && state & (MF_GRAYED.0 | MF_DISABLED.0) != 0 {
                 continue;
             }
             // SAFETY: as above.
@@ -15361,84 +15604,15 @@ fn menu_entries(menu: HMENU) -> Vec<palette::Entry> {
         }
     }
     let mut out = Vec::new();
-    walk(menu, &mut Vec::new(), &mut out);
+    walk(menu, &mut Vec::new(), &mut out, greyed);
     out
 }
 
-/// The window shortcut for a key, as a command id. Tab and pane keys only
-/// apply when there is more than one tab or pane, so that otherwise the
-/// keys reach the terminal.
-fn shortcut(vk: VIRTUAL_KEY, m: Mods, tabs: bool, split: bool) -> Option<u32> {
-    let key = |c: u8| VIRTUAL_KEY(u16::from(c));
-    let arrow = match vk {
-        VK_LEFT => Some(0),
-        VK_RIGHT => Some(1),
-        VK_UP => Some(2),
-        VK_DOWN => Some(3),
-        _ => None,
-    };
-    if m.alt && !m.ctrl {
-        if m.shift {
-            return match vk {
-                VK_OEM_PLUS | VK_ADD => Some(cmd::SPLIT_RIGHT),
-                VK_OEM_MINUS | VK_SUBTRACT => Some(cmd::SPLIT_DOWN),
-                _ if split => arrow.map(|a| cmd::RESIZE + a),
-                _ => None,
-            };
-        }
-        return if split {
-            arrow.map(|a| cmd::FOCUS + a)
-        } else {
-            None
-        };
-    }
-    if m.ctrl && !m.alt {
-        return match vk {
-            VK_TAB if tabs => Some(if m.shift {
-                cmd::PREV_TAB
-            } else {
-                cmd::NEXT_TAB
-            }),
-            VK_PRIOR if m.shift && tabs => Some(cmd::TAB_LEFT),
-            VK_NEXT if m.shift && tabs => Some(cmd::TAB_RIGHT),
-            v if v == key(b'J') && m.shift && tabs => Some(cmd::JOIN_TAB),
-            VK_OEM_PLUS | VK_ADD => Some(cmd::ZOOM_IN),
-            VK_OEM_MINUS | VK_SUBTRACT if !m.shift => Some(cmd::ZOOM_OUT),
-            VK_NUMPAD0 if !m.shift => Some(cmd::ZOOM_RESET),
-            v if v == key(b'0') && !m.shift => Some(cmd::ZOOM_RESET),
-            v if v == key(b'M') && m.shift => Some(cmd::HIDE_MENU),
-            v if v == key(b'C') && m.shift => Some(cmd::COPY),
-            v if v == key(b'V') && m.shift => Some(cmd::PASTE),
-            v if v == key(b'F') && m.shift => Some(cmd::FIND),
-            v if v == key(b'N') && m.shift => Some(cmd::CONNECT),
-            v if v == key(b'R') && m.shift => Some(cmd::RECONNECT),
-            v if v == key(b'T') && m.shift => Some(cmd::NEW_TAB),
-            v if v == key(b'W') && m.shift => Some(cmd::CLOSE_PANE),
-            VK_F4 if !m.shift => Some(cmd::CLOSE_TAB),
-            v if v == key(b'S') && m.shift => Some(cmd::SESSIONS),
-            v if v == key(b'L') && m.shift => Some(cmd::LIVE),
-            v if v == key(b'E') && m.shift => Some(cmd::FILES),
-            v if v == key(b'P') && m.shift => Some(cmd::FORWARDS),
-            v if v == key(b'A') && m.shift => Some(cmd::PALETTE),
-            VK_SPACE if m.shift => Some(cmd::SNIPPETS),
-            v if v == key(b'D') && m.shift => Some(cmd::DESKTOP),
-            v if v == key(b'U') && m.shift => Some(cmd::UPLOAD),
-            v if v == key(b'B') && m.shift => Some(cmd::BROADCAST_TAB),
-            VK_INSERT if !m.shift => Some(cmd::COPY),
-            VK_HOME if m.shift => Some(cmd::SCROLL_TOP),
-            VK_END if m.shift => Some(cmd::SCROLL_BOTTOM),
-            _ => None,
-        };
-    }
-    if m.shift && !m.ctrl && !m.alt {
-        return match vk {
-            VK_PRIOR => Some(cmd::SCROLL_PAGE_UP),
-            VK_NEXT => Some(cmd::SCROLL_PAGE_DOWN),
-            VK_INSERT => Some(cmd::PASTE),
-            _ => None,
-        };
-    }
-    None
+/// The window shortcut for a key, as a command id (Settings > Key
+/// bindings). Tab and pane keys only apply when there is more than one tab
+/// or pane, so that otherwise the keys reach the terminal.
+fn shortcut(keys: &Keymap, vk: VIRTUAL_KEY, m: Mods, tabs: bool, split: bool) -> Option<u32> {
+    keys.lookup(keymap::chord(vk.0, m.ctrl, m.alt, m.shift), tabs, split)
 }
 
 /// Follow-up actions that call into Win32 functions which send messages to
@@ -15461,6 +15635,8 @@ enum Command {
     OpenWorkspaceFile,
     /// Tools > New SSH key: the window that asks what to make.
     NewKey,
+    /// Settings > Key bindings: the window that changes them.
+    KeyBindings,
     /// File > Export connections, Import encrypted connections and the
     /// Master password items, by menu id.
     Vault(u32),
@@ -16100,12 +16276,43 @@ fn conn_event(hwnd: HWND, event: conn_view::Event) {
     }
 }
 
+/// Carries out what the user did in the command palette.
+fn palette_event(hwnd: HWND, event: palette_panel::Event) {
+    use palette_panel::Event;
+    let command = match event {
+        Event::Query(text) => {
+            with_window(|w| {
+                w.palette.set_filter(&text);
+                w.refresh_chrome();
+            });
+            None
+        }
+        Event::Run { row, split } => with_window(|w| {
+            let action = w.palette.run_row(row, split);
+            w.palette_action(action)
+        })
+        .flatten(),
+        Event::Leave => {
+            with_window(|w| w.palette_action(Some(PalAction::Leave)));
+            None
+        }
+        Event::Focused => {
+            tools_focused();
+            None
+        }
+    };
+    if let Some(command) = command {
+        run_command(hwnd, command);
+    }
+}
+
 /// One of the native tools' controls has the keyboard.
 fn tools_have_focus() -> bool {
     conn_view::has_focus()
         || live_panel::has_focus()
         || form_view::has_focus()
         || import_panel::has_focus()
+        || palette_panel::has_focus()
         || files_panel::has_focus()
         || fwd_panel::has_focus()
         || scripts_panel::has_focus()
@@ -16766,6 +16973,7 @@ fn run_command(hwnd: HWND, command: Command) {
         }
         Command::ReplaceHostKey => replace_host_key(hwnd),
         Command::NewKey => new_key(hwnd),
+        Command::KeyBindings => key_bindings(hwnd),
         Command::Vault(id) => match id {
             cmd::EXPORT => vault_ui::export(hwnd),
             cmd::IMPORT_SEALED => vault_ui::import(hwnd),
@@ -17739,6 +17947,69 @@ fn save_workspace_as(hwnd: HWND) {
     dialog(hwnd, &text, MB_OK | icon);
 }
 
+/// Settings > Key bindings: the window that changes them; on OK the new
+/// keys work at once, show in the menus, and are saved.
+fn key_bindings(hwnd: HWND) {
+    let Some((actions, keys, ctx, dpi)) = with_window(|w| {
+        // Every action of the menus, greyed ones too, once each.
+        let mut actions: Vec<crate::keys_view::Action> = Vec::new();
+        for e in menu_items(w.menu, true) {
+            let palette::Kind::Action(id) = e.kind else {
+                continue;
+            };
+            if !bindable(id) || actions.iter().any(|a| a.id == id) {
+                continue;
+            }
+            let name = if e.group.is_empty() {
+                e.label
+            } else {
+                format!("{}: {}", e.group, e.label)
+            };
+            actions.push(crate::keys_view::Action { id, name });
+        }
+        // Actions with keys that are in no menu.
+        for d in KEY_DEFAULTS {
+            if !actions.iter().any(|a| a.id == d.id) {
+                actions.push(crate::keys_view::Action {
+                    id: d.id,
+                    name: unlisted_action(d.id).to_owned(),
+                });
+            }
+        }
+        let ctx = crate::keys_view::Context {
+            tmux_prefix: w.tmux_prefix_key(),
+            standby: w
+                .settings
+                .standby
+                .then(|| w.settings.standby_hotkey.unwrap_or(Hotkey::DEFAULT)),
+            label: hotkey_label,
+        };
+        (actions, w.keymap.clone(), ctx, w.dpi)
+    }) else {
+        return;
+    };
+    let Some(keys) = crate::keys_view::ask(hwnd, dpi, actions, keys, ctx) else {
+        return;
+    };
+    with_window(|w| {
+        w.keymap = keys;
+        w.settings.key_bindings = w.keymap.changed();
+        w.save_settings();
+        w.apply_key_labels();
+    });
+}
+
+/// The name of an action with keys that is in no menu.
+fn unlisted_action(id: u32) -> &'static str {
+    match id {
+        cmd::SCROLL_PAGE_UP => "Edit: Scroll up a page",
+        cmd::SCROLL_PAGE_DOWN => "Edit: Scroll down a page",
+        cmd::SCROLL_TOP => "Edit: Scroll to the top",
+        cmd::SCROLL_BOTTOM => "Edit: Follow new output",
+        _ => "Other action",
+    }
+}
+
 fn new_key(hwnd: HWND) {
     if DIALOG_OPEN.get() {
         return;
@@ -18482,6 +18753,9 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                     1 if want && with_window(|w| w.import_native()) == Some(true) => {
                         import_panel::focus_first();
                     }
+                    1 if want && with_window(|w| w.palette_native()) == Some(true) => {
+                        palette_panel::focus_first();
+                    }
                     1 if want && conn => conn_view::focus_tree(),
                     1 if want && live => live_panel::focus_list(),
                     1 if want && files => files_panel::focus_first(),
@@ -18593,12 +18867,16 @@ mod tests {
             ctrl: true,
             ..Mods::NONE
         };
-        assert_eq!(shortcut(VK_F4, ctrl, false, false), Some(cmd::CLOSE_TAB));
+        let keys = Keymap::new(KEY_DEFAULTS, &std::collections::BTreeMap::new());
+        assert_eq!(
+            shortcut(&keys, VK_F4, ctrl, false, false),
+            Some(cmd::CLOSE_TAB)
+        );
         let alt = Mods {
             alt: true,
             ..Mods::NONE
         };
-        assert_eq!(shortcut(VK_F4, alt, true, true), None);
+        assert_eq!(shortcut(&keys, VK_F4, alt, true, true), None);
     }
 
     #[test]
@@ -18612,7 +18890,40 @@ mod tests {
             shift: true,
             ..ctrl
         };
-        assert_eq!(shortcut(a, ctrl_shift, false, false), Some(cmd::PALETTE));
-        assert_eq!(shortcut(a, ctrl, true, true), None);
+        let keys = Keymap::new(KEY_DEFAULTS, &std::collections::BTreeMap::new());
+        assert_eq!(
+            shortcut(&keys, a, ctrl_shift, false, false),
+            Some(cmd::PALETTE)
+        );
+        assert_eq!(shortcut(&keys, a, ctrl, true, true), None);
+    }
+
+    #[test]
+    fn every_default_key_parses_and_belongs_to_one_action() {
+        let mut seen = std::collections::HashSet::new();
+        for d in KEY_DEFAULTS {
+            assert!(bindable(d.id), "{}", d.id);
+            for k in d.keys {
+                let key = Hotkey::parse_key(k);
+                assert!(key.is_ok(), "{k}: {key:?}");
+                assert!(seen.insert(key.ok()), "{k} is bound twice");
+            }
+        }
+        let keys = Keymap::new(KEY_DEFAULTS, &std::collections::BTreeMap::new());
+        assert!(!keys.any_changed());
+        // The keys as they were before they could be changed.
+        let k = |t: &str| Hotkey::parse_key(t).unwrap_or(Hotkey::DEFAULT);
+        assert_eq!(
+            keys.lookup(k("Ctrl+Shift+OemPlus"), false, false),
+            Some(cmd::ZOOM_IN)
+        );
+        assert_eq!(keys.lookup(k("Ctrl+Shift+OemMinus"), false, false), None);
+        assert_eq!(keys.lookup(k("Alt+Left"), true, false), None);
+        assert_eq!(keys.lookup(k("Alt+Left"), false, true), Some(cmd::FOCUS));
+        assert_eq!(
+            keys.lookup(k("Alt+Shift+NumPlus"), false, false),
+            Some(cmd::SPLIT_RIGHT)
+        );
+        assert_eq!(keys.lookup(k("Ctrl+Tab"), false, true), None);
     }
 }

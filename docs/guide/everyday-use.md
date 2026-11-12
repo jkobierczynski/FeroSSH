@@ -389,7 +389,11 @@ F11 (or Settings > Full screen) makes the window cover the whole monitor, taskba
 
 ## The command palette
 
-Ctrl+Shift+A (Tools > Command palette) is one search box over every menu item, every saved connection and every command script. Type a few letters in any order: `splr` finds Split right, `core` your core switch, `ctrl+shift+n` the item on that key. Enter runs the item, connects or types the script; Shift+Enter connects in a split or types a script without its last Enter. Each item shows its shortcut and check mark, greyed-out items are left out, and your last few picks come first.
+Ctrl+Shift+A (Tools > Command palette) opens a search box over every menu item, every saved connection and every command script, as a list in the tools pane. Type a few letters in any order: `splr` finds Split right, `core` your core switch, `ctrl+shift+n` the item on that key. Up and Down select; Enter (or Run) runs the item, connects or types the script; Shift+Enter connects in a split or types a script without its last Enter. Each item shows its shortcut as it is now (Settings > Key bindings), its check mark, and the menu it is in; greyed-out items are left out, and your last few picks come first. Esc clears the search, then closes the palette.
+
+## Key bindings
+
+Settings > Key bindings lists every action with its shortcuts and its default ones. Select one and press Change (or Enter), then the keys you want; Add key gives it a second one, No shortcut takes them away, Reset to default puts its own back, and Reset all every action's. A key another action has moves after asking, keys that would stop typing are refused, and keys that programs in the terminal use (Ctrl+C, Alt+B, the tmux prefix) need a yes first. Details are in the [menu reference](menus.md#key-bindings).
 
 ## Broadcast input
 

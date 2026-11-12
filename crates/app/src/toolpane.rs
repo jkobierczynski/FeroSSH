@@ -43,15 +43,15 @@ impl RailItem {
         RailItem::Pin,
     ];
 
-    /// The tooltip.
+    /// The tooltip, without the shortcut the rail adds.
     pub fn name(self, pinned: bool) -> &'static str {
         match self {
-            RailItem::Connections => "Connection manager (Ctrl+Shift+S)",
-            RailItem::Sessions => "Session manager (Ctrl+Shift+L)",
-            RailItem::Files => "File transfer (Ctrl+Shift+E)",
-            RailItem::Forwards => "Port forwards (Ctrl+Shift+P)",
-            RailItem::Snippets => "Scripts (Ctrl+Shift+Space)",
-            RailItem::Palette => "Command palette (Ctrl+Shift+A)",
+            RailItem::Connections => "Connection manager",
+            RailItem::Sessions => "Session manager",
+            RailItem::Files => "File transfer",
+            RailItem::Forwards => "Port forwards",
+            RailItem::Snippets => "Scripts",
+            RailItem::Palette => "Command palette",
             RailItem::Pin if pinned => "Tools stay open (click: the terminal covers them again)",
             RailItem::Pin => "Tools cover again after use (click: keep them open)",
         }

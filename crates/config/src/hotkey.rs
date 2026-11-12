@@ -16,7 +16,7 @@ pub const MOD_SHIFT: u32 = 0x4;
 pub const MOD_WIN: u32 = 0x8;
 
 /// A key with its modifiers.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Hotkey {
     pub ctrl: bool,
     pub alt: bool,
@@ -185,6 +185,58 @@ impl Hotkey {
         Ok(h)
     }
 
+    /// A key with its modifiers, as [`Hotkey::parse`] reads it but not
+    /// checked as a global hotkey: for FeroSSH's own key bindings, where
+    /// Shift+PageUp or F11 are fine.
+    pub fn parse_key(text: &str) -> Result<Hotkey, String> {
+        let text = text.trim();
+        let parts: Vec<&str> = text.split('+').map(str::trim).collect();
+        // "Ctrl++" is Ctrl with the + key: an empty last part after a +.
+        let (key, mods) = match parts.split_last() {
+            Some((&"", rest)) if text.ends_with("++") => (
+                "=",
+                rest.get(..rest.len().saturating_sub(1)).unwrap_or_default(),
+            ),
+            Some((key, rest)) => (*key, rest),
+            None => ("", &[][..]),
+        };
+        let mut h = Hotkey {
+            ctrl: false,
+            alt: false,
+            shift: false,
+            win: false,
+            vk: 0,
+        };
+        for m in mods {
+            let flag = match m.to_ascii_lowercase().as_str() {
+                "ctrl" | "control" => &mut h.ctrl,
+                "alt" => &mut h.alt,
+                "shift" => &mut h.shift,
+                "win" | "windows" => &mut h.win,
+                _ => return Err(format!("{m:?} is not Ctrl, Alt, Shift or Win.")),
+            };
+            *flag = true;
+        }
+        h.vk = key_code(key).ok_or_else(|| format!("FeroSSH does not know the key {key:?}."))?;
+        Ok(h)
+    }
+
+    /// Whether the key, without Ctrl or Alt, types a character: a
+    /// letter, a digit, the space bar or punctuation.
+    pub fn types_text(&self) -> bool {
+        types_text(self.vk)
+    }
+
+    /// Whether, as a key binding, this would stop typing: no Ctrl or Alt
+    /// (and no Win) on a key that types a character (the number pad's
+    /// digits and operators too) or edits a line (Enter, Tab, Backspace,
+    /// Esc). Such a key is never bound, whatever a settings file says.
+    pub fn types_alone(&self) -> bool {
+        let pad = matches!(self.vk, 0x60..=0x6F);
+        let editing = matches!(self.vk, 0x08 | 0x09 | 0x0D | 0x1B);
+        !self.ctrl && !self.alt && !self.win && (types_text(self.vk) || pad || editing)
+    }
+
     /// Whether this works as a hotkey that does not get in the way of
     /// typing: it needs Ctrl, Alt or Win, except on keys nothing else
     /// uses (F13 to F24, Pause, Scroll Lock). Ctrl+Alt with a character
@@ -277,6 +329,25 @@ pub fn is_modifier(vk: u16) -> bool {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn key_bindings_parse_without_the_hotkey_checks() {
+        for text in [
+            "F11",
+            "Shift+PageUp",
+            "Ctrl+Tab",
+            "Alt+Shift+OemPlus",
+            "Ctrl+NumPlus",
+        ] {
+            let h = Hotkey::parse_key(text).unwrap();
+            assert_eq!(h.to_string(), text);
+        }
+        assert!(Hotkey::parse("F11").is_err());
+        assert_eq!(Hotkey::parse_key("Alt+Shift+=").unwrap().vk, 0xBB);
+        assert_eq!(Hotkey::parse_key("ctrl+pgdn").unwrap().vk, 0x22);
+        assert!(Hotkey::parse_key("Hyper+A").is_err());
+        assert!(Hotkey::parse_key("").is_err());
+    }
 
     #[test]
     fn parses_and_writes_back_the_same() {

@@ -1,6 +1,8 @@
 # Menu reference
 
-Every item in FeroSSH's menus, in the order they appear, with its shortcut and what it does. The menu bar has seven menus: File, Edit, Settings, Tools, Window, Session and Help. Ctrl+Shift+M hides the menu bar; Alt shows it again. Every item here is also in the command palette (Ctrl+Shift+A), so you can type part of its name instead.
+Every item in FeroSSH's menus, in the order they appear, with its default shortcut and what it does. The menu bar has seven menus: File, Edit, Settings, Tools, Window, Session and Help. Ctrl+Shift+M hides the menu bar; Alt shows it again. Every item here is also in the command palette (Ctrl+Shift+A), so you can type part of its name instead.
+
+Settings > Key bindings changes the shortcuts, and gives one to any item that has none. The menus, the command palette and the tools rail's tooltips always show the keys as they are now; this page lists the defaults.
 
 Items with a check mark are switches: picking them turns the setting on or off, and FeroSSH remembers it in `ferossh.conf` (see [Settings](settings.md)).
 
@@ -64,7 +66,8 @@ Items with a check mark are switches: picking them turns the setting on or off, 
 | Show test pattern | | Prints colours, text styles, box drawing, wide and combining characters in the pane, to check a font. |
 | Hide menu bar (Alt shows it) | Ctrl+Shift+M | Hides the menu bar. Pressing Alt shows it again. |
 | Full screen | F11 | ✓ while on. The window drops its title bar, frame and menu bar and covers the whole monitor, taskbar too. F11 again (or this item) puts it back as it was, maximized or not. Alt still shows the menu bar; it hides again once a menu closes. |
-| F11 switches full screen | ✓ on | Off, F11 goes to the terminal like the other function keys, for programs that use it; Full screen stays in this menu and the command palette. `FullScreenKey`. |
+| F11 switches full screen | ✓ on | Off, F11 goes to the terminal like the other function keys, for programs that use it; Full screen stays in this menu and the command palette. With another key for Full screen (Key bindings), the item names that key. `FullScreenKey`. |
+| Key bindings... | | A window listing every action of the menus with its shortcuts and its default ones: change them, add a second key, take a key away, or reset one action or all of them. See [Key bindings](#key-bindings). `KeyBinding`. |
 
 Font, theme and text size apply to the focused pane only. Session > Save font and theme for this host keeps them for that host.
 
@@ -273,7 +276,26 @@ In a run's report, Enter shows that host's pane, C copies the report as a table,
 
 ### Command palette (Ctrl+Shift+A)
 
-Type a few letters in any order. Up and Down select, Enter runs the action, connects or types the script, Shift+Enter connects in a split or types a script without its last Enter, Esc closes.
+A standard Windows page in the tools pane: a search box over a list with each entry's name, its shortcut (or the connection's `user@host`, the script's first line) and where it comes from (the menu, Connection, Script, Workspace). The keyboard stays in the search box: type a few letters in any order, Up, Down, Page Up and Page Down select, Enter (or Alt+R, Run, a double click) runs the action, connects or types the script, Shift+Enter connects in a split or types a script without its last Enter. Esc clears the search, then closes; so does Close. Typing while the list has the keyboard goes on in the search box.
+
+## Key bindings
+
+Settings > Key bindings opens a window with every action of the menus, greyed ones too, plus the scroll keys, which are in no menu. Each row shows the action, its shortcuts now and its default ones; a dot marks the ones you changed. The search box finds an action by name or by key (`ctrl+shift+n`).
+
+- **Change...** (Enter or a double click on a row) waits for a key: press it with Ctrl, Alt or Shift as you want it, and it becomes the action's only shortcut. Esc cancels. **Add key...** adds a second one instead.
+- **No shortcut** takes the action's keys away. **Reset to default** gives it its default keys back, and **Reset all** every action.
+- A key that another action has moves to this one, after asking. A key that would stop typing working (a letter, Enter, Tab, Shift with a letter, AltGr with a letter) is refused. A key that programs in the terminal use is taken only after a warning: Ctrl with a letter (Ctrl+C stops a program, Ctrl+R searches the shell's history), Alt with a letter (Meta in shells and editors, and the menu letters), plain function keys and the like. Keys with Ctrl+Shift are the safest.
+- Nothing changes until OK. The new keys work at once, show in the menus, the palette and the rail, and are saved in `ferossh.conf` as `KeyBinding` lines for the actions you changed.
+
+Some keys only work in some places, whatever they are: the tab keys (Next tab, Previous tab, Move tab, Join tab) while the window has more than one tab, the pane keys (Focus pane, Grow pane) while the tab has more than one pane. Elsewhere those keys go to the terminal, as before. Shift+End also follows new output while the view is scrolled back, and Alt+F4 always closes the window.
+
+In the tools pane's search boxes and lists, a key bound to an action runs it when it has Ctrl+Shift, is a function key, or is Ctrl or Alt with a key the control does not use itself; Ctrl+C, Ctrl+V, Ctrl+A, Ctrl+arrows, Shift+Insert and Alt with a button's letter stay with the control.
+
+**tmux.** With Session > Use tmux keybindings on, the key after the tmux prefix goes to tmux first, before any key binding, as before. The prefix itself is a terminal key: if you give it to an action (Ctrl+B unless your tmux has another), tmux never gets it and the tmux keybindings stop working, so the Key bindings window warns before it takes it. The window knows the prefix of an open tmux session; with none open it assumes Ctrl+B. Likewise Ctrl+A, Ctrl+B and the other Ctrl letters reach tmux or screen running inside a plain SSH pane only while no action has them.
+
+**Scripts and standby.** A script's hotkey (Ctrl+Shift+F1 to F12) runs before a key binding on the hosts the script is for, and the standby window's hotkey goes to Windows before FeroSSH sees it; the window warns about both.
+
+**Other PCs.** In a master password vault, the key bindings travel with the settings: the PC that saves last decides them. File > Import encrypted connections takes in the key bindings of the exported file too, after saying how many actions change.
 
 ### Import connections
 
