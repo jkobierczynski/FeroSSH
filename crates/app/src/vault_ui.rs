@@ -819,7 +819,16 @@ pub(super) fn use_file(hwnd: HWND) {
     if let Err(e) = set_pointer(&path) {
         problems.push(format!("Could not remember where the vault is: {e}"));
     }
-    remove_plain_files();
+    // The plain files go only once everything is safely in the vault and
+    // FeroSSH will find it again; otherwise they are what it starts with.
+    if problems.is_empty() {
+        remove_plain_files();
+    } else {
+        problems.push(format!(
+            "The plain files in {} are kept until this works.",
+            app_dir().display()
+        ));
+    }
     after_change();
     let mut text = format!(
         "FeroSSH now uses the vault {}, with this PC's connections added. It asks for its \
@@ -886,12 +895,25 @@ pub(super) fn remove(hwnd: HWND) {
     // The window's settings are written out as they are now.
     with_window(|w| w.save_settings());
     after_change();
+    if problems.is_empty()
+        && let Err(e) = set_pointer(&default_vault_path())
+    {
+        problems.push(format!("Could not forget where the vault is: {e}"));
+    }
     let text = if problems.is_empty() {
-        let _ = set_pointer(&default_vault_path());
-        if !elsewhere {
-            let _ = std::fs::remove_file(&file);
+        // Only FeroSSH's own vault file is deleted; one the user chose
+        // (in OneDrive, say) stays for the other PCs that use it.
+        if file == default_vault_path()
+            && let Err(e) = std::fs::remove_file(&file)
+        {
+            format!(
+                "The master password is removed, but the old vault file {} could not be \
+                 deleted: {e}",
+                file.display()
+            )
+        } else {
+            "The master password is removed.".to_owned()
         }
-        "The master password is removed.".to_owned()
     } else {
         // Nothing is lost: the vault stays, and FeroSSH opens it again
         // at the next start.
