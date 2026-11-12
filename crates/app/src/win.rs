@@ -13731,7 +13731,11 @@ fn menu_entries(menu: HMENU) -> Vec<palette::Entry> {
                 continue;
             }
             let len = usize::try_from(len).unwrap_or(0).min(buf.len());
-            let text = String::from_utf16_lossy(buf.get(..len).unwrap_or_default());
+            let text = match ui_theme::owned_text(menu, at) {
+                // Owner-drawn (dark Theme menu) items may report no text.
+                Some(kept) if len == 0 => kept,
+                _ => String::from_utf16_lossy(buf.get(..len).unwrap_or_default()),
+            };
             if !sub.is_invalid() {
                 path.push(text);
                 walk(sub, path, out);

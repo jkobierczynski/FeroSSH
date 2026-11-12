@@ -911,13 +911,25 @@ const MENU_TEXT: Rgb = Rgb::new(0xFF, 0xFF, 0xFF);
 const MENU_GRAY: Rgb = Rgb::new(0x6D, 0x6D, 0x6D);
 const MENU_LINE: Rgb = Rgb::new(0x3C, 0x3C, 0x3C);
 
-/// Item data of our owner-drawn items: this tag, the menu's index in
-/// `OWN` (bits 16..24) and the item's position plus one (bits 0..16).
-const OWN_TAG: usize = 0x5E00_0000;
+/// `MSAAMENUINFO`: an owner-drawn item's data starts with this, so that
+/// screen readers still get the item's name.
+#[repr(C)]
+struct MsaaMenuInfo {
+    signature: u32,
+    chars: u32,
+    text: *const u16,
+}
+
+/// `MSAA_MENU_SIG`.
+const MSAA_MENU_SIG: u32 = 0xAA0D_F00D;
 
 /// One item of an owned menu, as it was built.
 struct OwnItem {
+    /// Ends with a nul (not counted in [`MsaaMenuInfo::chars`]).
     text: Vec<u16>,
+    /// The owner-drawn item's data; points into `text`, which never
+    /// changes once built.
+    msaa: Box<MsaaMenuInfo>,
     separator: bool,
     /// Starts a new column (with a bar in Windows' drawing).
     breaks: bool,
@@ -968,8 +980,16 @@ pub fn own_columns(menu: HMENU) {
                 column += 1;
             }
             let n = (mii.cch as usize).min(buf.len());
+            let mut text = buf.get(..n).unwrap_or_default().to_vec();
+            text.push(0);
+            let msaa = Box::new(MsaaMenuInfo {
+                signature: MSAA_MENU_SIG,
+                chars: n as u32,
+                text: text.as_ptr(),
+            });
             items.push(OwnItem {
-                text: buf.get(..n).unwrap_or_default().to_vec(),
+                text,
+                msaa,
                 separator: mii.fType.0 & MFT_SEPARATOR.0 != 0,
                 breaks,
                 column,
@@ -986,9 +1006,8 @@ pub fn own_columns(menu: HMENU) {
             items,
             drawn: false,
         });
-        let index = own.len() - 1;
         if let Some(m) = own.last_mut() {
-            set_drawn(m, index, dark);
+            set_drawn(m, dark);
         }
     });
 }
@@ -1001,8 +1020,8 @@ fn sync_columns() {
         let Ok(mut own) = own.try_borrow_mut() else {
             return;
         };
-        for (index, m) in own.iter_mut().enumerate() {
-            set_drawn(m, index, dark);
+        for m in own.iter_mut() {
+            set_drawn(m, dark);
         }
     });
 }
@@ -1018,14 +1037,14 @@ fn menu_back_brush() -> HBRUSH {
     })
 }
 
-fn set_drawn(m: &mut OwnMenu, index: usize, on: bool) {
+fn set_drawn(m: &mut OwnMenu, on: bool) {
     if m.drawn == on {
         return;
     }
     // SAFETY: a menu we built; each item's text is a buffer that outlives
     // the call (Windows copies it).
     unsafe {
-        for (pos, item) in m.items.iter_mut().enumerate() {
+        for (pos, item) in m.items.iter().enumerate() {
             let mut mii = MENUITEMINFOW {
                 cbSize: size_of::<MENUITEMINFOW>() as u32,
                 fMask: MIIM_FTYPE,
@@ -1038,13 +1057,12 @@ fn set_drawn(m: &mut OwnMenu, index: usize, on: bool) {
             let mut ty = mii.fType.0
                 & !(MFT_OWNERDRAW.0 | MFT_MENUBARBREAK.0 | MFT_MENUBREAK.0 | MFT_STRING.0);
             let mut text = item.text.clone();
-            text.push(0);
             mii.fMask = MIIM_FTYPE | MIIM_DATA;
             if on {
                 // Our own line between the columns instead of Windows'
                 // light one.
                 ty |= MFT_OWNERDRAW.0 | if item.breaks { MFT_MENUBREAK.0 } else { 0 };
-                mii.dwItemData = OWN_TAG | (index << 16) | (pos + 1);
+                mii.dwItemData = (&raw const *item.msaa) as usize;
             } else {
                 ty |= if item.breaks { MFT_MENUBARBREAK.0 } else { 0 };
                 mii.dwItemData = 0;
@@ -1075,15 +1093,35 @@ fn set_drawn(m: &mut OwnMenu, index: usize, on: bool) {
 /// Our item behind owner-draw item data, with a copy of what drawing it
 /// needs.
 fn own_item(data: usize) -> Option<(bool, u32, Vec<u16>)> {
-    if data & !0x00FF_FFFF != OWN_TAG {
-        return None;
-    }
-    let index = (data >> 16) & 0xFF;
-    let pos = (data & 0xFFFF).checked_sub(1)?;
     OWN.with(|own| {
         let own = own.try_borrow().ok()?;
-        let item = own.get(index)?.items.get(pos)?;
-        Some((item.separator, item.column, item.text.clone()))
+        let item = own
+            .iter()
+            .flat_map(|m| &m.items)
+            .find(|i| (&raw const *i.msaa) as usize == data)?;
+        Some((
+            item.separator,
+            item.column,
+            without_nul(&item.text).to_vec(),
+        ))
+    })
+}
+
+fn without_nul(text: &[u16]) -> &[u16] {
+    text.strip_suffix(&[0]).unwrap_or(text)
+}
+
+/// The text of the item at `pos` of a menu given to [`own_columns`]
+/// (Windows may report none while it is owner-drawn).
+pub fn owned_text(menu: HMENU, pos: u32) -> Option<String> {
+    OWN.with(|own| {
+        let own = own.try_borrow().ok()?;
+        let item = own
+            .iter()
+            .find(|m| m.menu == menu)?
+            .items
+            .get(pos as usize)?;
+        Some(String::from_utf16_lossy(without_nul(&item.text)))
     })
 }
 
