@@ -115,6 +115,7 @@ pub enum Action {
     /// the native panes (tmux sizes a window to its smallest client):
     /// offer to detach them. Asked once per attach.
     Crowded {
+        session: SessionId,
         have: (u16, u16),
         want: (u16, u16),
         others: u32,
@@ -164,6 +165,10 @@ enum Tag {
     /// The size tmux gave a window after we asked for this one, and how
     /// many clients the session has.
     SizeCheck(WindowId, (u16, u16)),
+    /// Our own client's name, before detaching the others of session `.0`.
+    OwnClient(SessionId),
+    /// The clients of session `.0` to detach, all but ours (`.1`).
+    DetachOthers(SessionId, String),
     /// The reply does not matter.
     Ignore,
 }
@@ -379,12 +384,26 @@ pub struct Tmux {
 }
 
 /// A window's size and its session's client count, for [`Tag::SizeCheck`].
-const SIZE_FORMAT: &str = "#{window_width} #{window_height} #{session_attached}";
+const SIZE_FORMAT: &str = "#{window_width} #{window_height} #{session_attached} #{window-size}";
 
-fn parse_size_check(text: &str) -> Option<((u16, u16), u32)> {
-    let mut it = text.split_whitespace().map(str::parse::<u32>);
-    let (w, h, n) = (it.next()?.ok()?, it.next()?.ok()?, it.next()?.ok()?);
-    Some(((u16::try_from(w).ok()?, u16::try_from(h).ok()?), n))
+#[derive(Debug, PartialEq, Eq)]
+struct SizeCheck {
+    have: (u16, u16),
+    clients: u32,
+    /// `window-size manual`: tmux keeps the size whatever the clients.
+    manual: bool,
+}
+
+fn parse_size_check(text: &str) -> Option<SizeCheck> {
+    let mut it = text.split_whitespace();
+    let mut num = || it.next()?.parse::<u32>().ok();
+    let (w, h, clients) = (num()?, num()?, num()?);
+    let manual = it.next() == Some("manual");
+    Some(SizeCheck {
+        have: (u16::try_from(w).ok()?, u16::try_from(h).ok()?),
+        clients,
+        manual,
+    })
 }
 
 fn win_of(text: &[u8]) -> Option<WindowId> {
@@ -838,17 +857,46 @@ impl Tmux {
                 if !ok || !current || self.crowded_asked {
                     return;
                 }
-                if let Some((have, clients)) = parse_size_check(&first())
-                    && (have.0 < want.0 || have.1 < want.1)
-                    && clients > 1
+                if let Some(check) = parse_size_check(&first())
+                    && (check.have.0 < want.0 || check.have.1 < want.1)
+                    && check.clients > 1
+                    // A manual size stays whatever the other clients do.
+                    && !check.manual
+                    && let Some((session, _)) = self.session
                 {
                     self.crowded_asked = true;
                     out.push(Action::Crowded {
-                        have,
+                        session,
+                        have: check.have,
                         want,
-                        others: clients - 1,
+                        others: check.clients - 1,
                     });
                 }
+            }
+            Tag::DetachOthers(session, me) => {
+                if !ok || self.session.as_ref().map(|(s, _)| *s) != Some(session) {
+                    return;
+                }
+                for name in lines
+                    .iter()
+                    .map(|l| String::from_utf8_lossy(l).trim().to_owned())
+                {
+                    if !name.is_empty() && name != me {
+                        let line = format!("detach-client -t {}", command::quote(&name));
+                        self.send(&line, Tag::Ignore, out);
+                    }
+                }
+            }
+            Tag::OwnClient(session) => {
+                if !ok || self.session.as_ref().map(|(s, _)| *s) != Some(session) {
+                    return;
+                }
+                let me = first();
+                if me.is_empty() {
+                    return;
+                }
+                let line = format!("list-clients -t ${session} -F '#{{client_name}}'");
+                self.send(&line, Tag::DetachOthers(session, me), out);
             }
             Tag::Ignore => {}
         }
@@ -1394,12 +1442,30 @@ impl Tmux {
     /// Leaves tmux running and the gateway at its shell.
     /// Detaches every other client from the session, so that tmux sizes
     /// its windows to FeroSSH's panes again.
-    pub fn detach_others(&mut self) -> Vec<Action> {
+    ///
+    /// Only clients of this session go (`detach-client -a` would detach
+    /// every other session's clients too), and only while `session`, the
+    /// one the user was asked about, is still the one attached.
+    pub fn detach_others(&mut self, session: Option<SessionId>) -> Vec<Action> {
         let mut out = Vec::new();
-        if self.client.is_control() {
-            self.send("detach-client -a", Tag::Ignore, &mut out);
+        let Some((current, _)) = self.session else {
+            return out;
+        };
+        if !self.client.is_control() || session.is_some_and(|s| s != current) {
+            return out;
         }
+        self.send(
+            "display-message -p '#{client_name}'",
+            Tag::OwnClient(current),
+            &mut out,
+        );
         out
+    }
+
+    /// The question about other clients went unanswered (another dialog
+    /// was open): ask again at the next size change.
+    pub fn ask_crowded_again(&mut self) {
+        self.crowded_asked = false;
     }
 
     pub fn detach(&mut self) -> Vec<Action> {
@@ -2038,15 +2104,43 @@ mod tests {
         answer(&mut t, &mut ws, &[]);
         let a = answer(&mut t, &mut ws, &["100 30 3".into()]);
         assert!(a.contains(&Action::Crowded {
+            session: 0,
             have: (100, 30),
             want: (120, 40),
             others: 2
         }));
         let w = writes(&t.sync_sizes(&ws, &|_| Some((121, 40))));
         assert_eq!(w, ["refresh-client -C @0:121x40"]);
-        assert_eq!(writes(&t.detach_others()), ["detach-client -a"]);
-        // Smaller but alone (tmux clamps the size itself): no question.
-        assert_eq!(parse_size_check("100 30 1"), Some(((100, 30), 1)));
+        // Only this session's other clients go, and only while it is
+        // still the session asked about.
+        assert!(t.detach_others(Some(7)).is_empty());
+        assert_eq!(
+            writes(&t.detach_others(Some(0))),
+            ["display-message -p '#{client_name}'"]
+        );
+        answer(&mut t, &mut ws, &[]);
+        let a = answer(&mut t, &mut ws, &["client-2".into()]);
+        assert_eq!(writes(&a), ["list-clients -t $0 -F '#{client_name}'"]);
+        let a = answer(
+            &mut t,
+            &mut ws,
+            &["client-1".into(), "client-2".into(), "/dev/pts/3".into()],
+        );
+        assert_eq!(
+            writes(&a),
+            [
+                "detach-client -t 'client-1'",
+                "detach-client -t '/dev/pts/3'"
+            ]
+        );
+        // Smaller but alone (tmux clamps the size itself), or a manual
+        // size: no question.
+        let check = parse_size_check("100 30 1 latest").unwrap();
+        assert_eq!(
+            (check.have, check.clients, check.manual),
+            ((100, 30), 1, false)
+        );
+        assert!(parse_size_check("100 30 2 manual").unwrap().manual);
         assert_eq!(parse_size_check("100 x 1"), None);
     }
 

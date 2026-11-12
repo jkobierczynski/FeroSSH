@@ -3272,9 +3272,15 @@ impl Window {
                 tmux::Action::Picker(names) => {
                     self.queued.push(Command::TmuxPicker { gateway, names });
                 }
-                tmux::Action::Crowded { have, want, others } => {
+                tmux::Action::Crowded {
+                    session,
+                    have,
+                    want,
+                    others,
+                } => {
                     self.queued.push(Command::TmuxCrowded {
                         gateway,
+                        session,
                         have,
                         want,
                         others,
@@ -3387,11 +3393,12 @@ impl Window {
     }
 
     /// Session > Detach other tmux clients, as answered in the dialog.
-    fn detach_other_tmux(&mut self, gateway: PaneId) {
+    /// Skipped when another session is attached by now.
+    fn detach_other_tmux(&mut self, gateway: PaneId, session: ferossh_tmuxcc::SessionId) {
         let Some(t) = self.tmux.get_mut(&gateway).filter(|t| t.active()) else {
             return;
         };
-        let actions = t.detach_others();
+        let actions = t.detach_others(Some(session));
         self.run_tmux(gateway, actions);
     }
 
@@ -13716,7 +13723,7 @@ impl Window {
                 };
                 let actions = match id {
                     cmd::TMUX_DETACH => t.detach(),
-                    cmd::TMUX_DETACH_OTHERS => t.detach_others(),
+                    cmd::TMUX_DETACH_OTHERS => t.detach_others(None),
                     cmd::TMUX_PICK => t.pick_session(),
                     _ => {
                         let mode = match t.mode() {
@@ -15781,6 +15788,8 @@ enum Command {
     /// to detach them.
     TmuxCrowded {
         gateway: PaneId,
+        /// The tmux session asked about.
+        session: ferossh_tmuxcc::SessionId,
         have: (u16, u16),
         want: (u16, u16),
         others: u32,
@@ -17175,6 +17184,7 @@ fn run_command(hwnd: HWND, command: Command) {
         }
         Command::TmuxCrowded {
             gateway,
+            session,
             have,
             want,
             others,
@@ -17192,8 +17202,19 @@ fn run_command(hwnd: HWND, command: Command) {
                  Detach the other clients? (Later: Session > Detach other tmux clients.)",
                 have.0, have.1, want.0, want.1
             );
-            if dialog(hwnd, &text, MB_YESNO | MB_ICONQUESTION) == Some(IDYES) {
-                with_window(|w| w.detach_other_tmux(gateway));
+            match dialog(hwnd, &text, MB_YESNO | MB_ICONQUESTION) {
+                Some(IDYES) => {
+                    with_window(|w| w.detach_other_tmux(gateway, session));
+                }
+                // Another dialog was open: ask at the next size change.
+                None => {
+                    with_window(|w| {
+                        if let Some(t) = w.tmux.get_mut(&gateway) {
+                            t.ask_crowded_again();
+                        }
+                    });
+                }
+                Some(_) => {}
             }
         }
         Command::TmuxPicker { gateway, names } => {
