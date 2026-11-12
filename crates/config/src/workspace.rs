@@ -490,11 +490,34 @@ pub fn read(path: &Path) -> Result<Workspace, String> {
 /// Writes `ws` to `path` through a temporary file of its own, so a crash
 /// never leaves half a file and two windows saving at once never mix
 /// theirs. A workspace too big to read back is refused, leaving the file
-/// as it was.
+/// as it was, and so is one with a connection it could not keep (too
+/// long, or with control characters), rather than saving it as a prompt.
 pub fn write(path: &Path, ws: &Workspace) -> io::Result<()> {
     use std::io::Write as _;
     use std::sync::atomic::{AtomicU32, Ordering};
     static SAVES: AtomicU32 = AtomicU32::new(0);
+    if let Some(c) = ws
+        .tabs
+        .iter()
+        .flat_map(|t| t.root.panes())
+        .find_map(|p| match &p.open {
+            Open::Connection(c) if clean(c).is_none() => Some(c),
+            _ => None,
+        })
+    {
+        let shown: String = c
+            .trim()
+            .chars()
+            .take(40)
+            .filter(|ch| !ch.is_control())
+            .collect();
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "the connection {shown}... is too long to keep (at most {MAX_VALUE} characters)"
+            ),
+        ));
+    }
     let text = to_text(ws);
     if text.len() as u64 > MAX_FILE_BYTES {
         return Err(io::Error::new(
@@ -693,6 +716,13 @@ mod tests {
             .collect();
         assert!(fits(&big));
         assert!(write(&path, &big).is_err());
+        assert_eq!(read(&path).unwrap(), sample());
+        let mut long = sample();
+        long.tabs[0].root = Layout::Pane(PaneSpec::new(Open::Connection(format!(
+            "sftp://web1/{}",
+            "d".repeat(MAX_VALUE)
+        ))));
+        assert!(write(&path, &long).is_err());
         assert_eq!(read(&path).unwrap(), sample());
         assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 4);
         let _ = std::fs::remove_dir_all(&dir);
