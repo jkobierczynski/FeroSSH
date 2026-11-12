@@ -1037,18 +1037,24 @@ impl Tmux {
             out.push(Action::Remove { native });
         }
         ws.remove_pane(self.gateway);
-        // Hidden panes of windows that show leave their tabs again.
-        for p in &saved.hidden_panes {
-            if let Some(n) = self.native_of(*p)
-                && ws.tab_of(n).is_some()
-                && Some(n) != first_focus
-            {
-                ws.hide(n);
-            }
-        }
         if let Some(f) = first_focus {
             ws.focus(f);
-            out.push(Action::Focus { native: f });
+        }
+        // Hidden panes of windows that show leave their tabs again (the
+        // focus moving to a pane that shows), in FeroSSH's layout only.
+        if self.mode == Mode::Ferossh {
+            for p in &saved.hidden_panes {
+                if let Some(n) = self.native_of(*p)
+                    && ws.tab_of(n).is_some()
+                {
+                    ws.hide(n);
+                }
+            }
+        }
+        if first_focus.is_some() {
+            out.push(Action::Focus {
+                native: ws.focused(),
+            });
         }
         out.push(Action::Structure);
     }
@@ -1976,6 +1982,17 @@ mod tests {
         let [m2, m3] = [2, 3].map(|p| t.native_of(p).unwrap());
         assert_eq!(ws.all_panes(), [m2]);
         assert_eq!(ws.hidden(), [m3]);
+        // The window's first pane hidden: the focus goes to the other.
+        let saved = "ferossh1 active=0 tab=@2/@2 hidden=%2";
+        let (t, ws, a) = attached(None, Some(saved), &panes);
+        let [m2, m3] = [2, 3].map(|p| t.native_of(p).unwrap());
+        assert_eq!(ws.all_panes(), [m3]);
+        assert_eq!(ws.hidden(), [m2]);
+        assert_eq!(ws.focused(), m3);
+        assert!(a.contains(&Action::Focus { native: m3 }));
+        // In tmux's own layout nothing is hidden.
+        let (_, ws, _) = attached(Some("tmux"), Some(saved), &panes);
+        assert!(ws.hidden().is_empty());
         let _ = n2;
     }
 
