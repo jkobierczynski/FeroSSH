@@ -969,7 +969,7 @@ impl SessionForm {
                 "to-host" => "only Windows to host",
                 "from-host" => "only host to Windows",
                 "off" => "off for this host",
-                _ => "as in Session > Desktop clipboard",
+                _ => "as in Session > Remote desktop > Clipboard",
             }
             .to_owned(),
             Field::Framing if v.framing.is_empty() => "8N1".to_owned(),
@@ -2510,7 +2510,7 @@ mod tests {
         // The clipboard only narrows: unset, to-host, from-host, off.
         assert_eq!(
             f.choice(Field::DeskClipboard),
-            "as in Session > Desktop clipboard"
+            "as in Session > Remote desktop > Clipboard"
         );
         f.cycle(Field::DeskClipboard, true);
         f.cycle(Field::DeskClipboard, true);

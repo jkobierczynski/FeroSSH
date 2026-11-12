@@ -1,4 +1,4 @@
-//! File > Import connections (and Import scripts) as native Windows
+//! File > Import and export > Import connections (and Import scripts) as native Windows
 //! controls, on a panel over the uncovered part of the tools pane.
 //!
 //! Two pages, as on `ImportView`: the programs that have something saved

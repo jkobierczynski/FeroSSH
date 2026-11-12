@@ -26,7 +26,7 @@ FeroSSH reads `~/.ssh/config` and `~/.ssh/known_hosts` too, and writes only to `
 | `CopyOnSelect yes` | no | Copies a selection as soon as you make it, as PuTTY does. |
 | `RightClickPaste yes` | no | Pastes on a right click, as PuTTY does. |
 | `CommandSuggestions yes` | no | Suggests commands as you type from the host's history and a short list of common ones, and keeps the commands you run in an encrypted history per host (Edit > Suggest commands as you type). |
-| `LogTimestamps yes` | no | Puts the time in front of each line of plain session logs (Session > Timestamp each log line). |
+| `LogTimestamps yes` | no | Puts the time in front of each line of plain session logs (Session > Logs and recordings > Timestamp each log line). |
 | `Scrollback 50000` | 10000 | Lines of scrollback per pane, up to 1,000,000. |
 | `Favourite web db1` | | Hosts marked as favourites in the connection manager. |
 | `UpdateCheck weekly` | off | Looks for a new release once a week (Help > Check for updates weekly). |
@@ -50,14 +50,14 @@ FeroSSH reads `~/.ssh/config` and `~/.ssh/known_hosts` too, and writes only to `
 | `StandbyHotkey Ctrl+Alt+Space` | `Win+Oem3` | The standby window's hotkey: Ctrl, Alt, Shift and Win joined by `+` to a key. Keys are letters, digits, `F1` to `F24`, `Space`, `Esc`, `Pause`, `ScrollLock`, `Num0` to `Num9`, the arrows and the like, and the punctuation keys by code (`Oem3` is the key below Esc on a US keyboard). |
 | `StandbyWindow notepad.exe` | this FeroSSH window | The program whose window the standby hotkey shows and hides, by file name (Window > Standby window > Window to show and hide). |
 | `StandbyHidden 263044` | | Written by FeroSSH while the standby hotkey has another program's window hidden, so that the window comes back at the next start if FeroSSH ended first. Leave it alone. |
-| `TmuxKeybindings yes` | no | In panes of a tmux session, the tmux prefix and a window or pane key work the tabs and panes (Session > Use tmux keybindings for tabs and panes). |
+| `TmuxKeybindings yes` | no | In panes of a tmux session, the tmux prefix and a window or pane key work the tabs and panes (Session > tmux > Use tmux keybindings for tabs and panes). |
 
 ## Scripts
 
 | Keyword | Default | Meaning |
 | --- | --- | --- |
-| `ConfirmProduction no` | yes | Whether a script typed into a pane with the Production theme asks first (Session > Confirm scripts on Production hosts). |
-| `AutoResponses no` | yes | Whether scripts with a `When` text answer by themselves (Session > Auto-responses from scripts). |
+| `ConfirmProduction no` | yes | Whether a script typed into a pane with the Production theme asks first (Session > Scripts > Confirm scripts on Production hosts). |
+| `AutoResponses no` | yes | Whether scripts with a `When` text answer by themselves (Session > Scripts > Auto-responses from scripts). |
 | `RunParallel 8` | 4 | How many hosts a multi-host script run logs in to at once, 1 to 16. |
 
 ## Remote apps
@@ -69,7 +69,7 @@ FeroSSH reads `~/.ssh/config` and `~/.ssh/known_hosts` too, and writes only to `
 | `RemoteAppAgentPath ~/bin/ferostream-agent` | `~/.local/bin/ferostream-agent` | Where on the host the agent is copied to: under `~/` or an absolute path, letters, digits and `._-+/` only. |
 | `RemoteAppClipboard to-host` | off | Which way copied text goes between remote apps and Windows: `both`, `to-host`, `from-host` or `off` (Session > Remote apps > Clipboard). |
 | `RemoteAppShareSelection yes` | no | Text selected with the mouse in a remote app (X PRIMARY, how xterm copies) goes to the Windows clipboard too, not only copied text. |
-| `DesktopClipboard to-host` | off | Which way copied text goes between remote and virtual desktops and Windows: `both`, `to-host`, `from-host` or `off` (Session > Desktop clipboard). |
+| `DesktopClipboard to-host` | off | Which way copied text goes between remote and virtual desktops and Windows: `both`, `to-host`, `from-host` or `off` (Session > Remote desktop > Clipboard). |
 | `DesktopShareSelection yes` | no | Text selected with the mouse in a virtual desktop goes to the Windows clipboard too, not only copied text. |
 | `RemoteAppPacking strong` | auto | How hard the host packs remote app pictures: `auto` picks from the measured link speed, `fast` uses LZ4 (least CPU), `strong` uses Deflate (fewest bytes, for slow links). Unchanged pixels are never sent and scrolls go as copies either way. |
 
@@ -113,7 +113,7 @@ Profile web1
 | `DesktopPort N` | The server's RDP port for Open remote desktop (3389). |
 | `VncPort N` | The server's VNC port (5900). |
 | `DesktopSize follow` or `WxH` | The size of this connection's remote and virtual desktops: following the pane (the default) or fixed, such as `1920x1080`. See [Desktop size](everyday-use.md#desktop-size). |
-| `VirtualDesktop COMMAND` | What Session > Open virtual desktop runs in its Xvfb display: a desktop session or one program, as a shell command, such as `startxfce4` or `firefox`. Unset, it runs `~/.xsession` or the first desktop session the server has. |
+| `VirtualDesktop COMMAND` | What Session > Remote desktop > Open virtual desktop runs in its Xvfb display: a desktop session or one program, as a shell command, such as `startxfce4` or `firefox`. Unset, it runs `~/.xsession` or the first desktop session the server has. |
 | `RemoteApp COMMAND` | The program a remote app connection runs, and the first one Run remote app offers on this host, such as `gimp` or `xterm -T 'my term'`. |
 | `RemoteAppCopyAgent yes` or `no` | Overrides `RemoteAppCopyAgent` for this connection. |
 | `RemoteAppRemoveAgent yes` or `no` | Overrides `RemoteAppRemoveAgent` for this connection. |

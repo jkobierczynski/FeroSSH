@@ -296,7 +296,7 @@ pub fn help(prefix: &str, repeat_ms: u64) -> String {
          Arrows, Ctrl or Alt+arrows, [, PageUp and PageDown repeat: \
          press them again without {prefix} while they keep coming \
          (tmux's repeat-time, {repeat_ms} ms).\n\n\
-         Session > Use tmux keybindings turns them off."
+         Session > tmux > Use tmux keybindings turns them off."
     )
 }
 

@@ -53,7 +53,7 @@ pub fn write(target: &str, user: &str, password: &str) -> Result<(), String> {
     if crate::portable::is_portable() {
         return Err(
             "A portable FeroSSH keeps passwords only in a master password vault \
-                    (File > Master password), so none is left on this PC."
+                    (Settings > Master password), so none is left on this PC."
                 .into(),
         );
     }

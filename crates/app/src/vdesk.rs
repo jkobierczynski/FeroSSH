@@ -1,4 +1,4 @@
-//! Session > Open virtual desktop: a desktop that exists only on the
+//! Session > Remote desktop > Open virtual desktop: a desktop that exists only on the
 //! server, in Xvfb, shown through x11vnc.
 //!
 //! FeroSSH runs [`script`] on an exec channel of the pane's connection.

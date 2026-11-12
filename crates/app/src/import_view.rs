@@ -1,5 +1,5 @@
 //! The side pane's import page: which other SSH clients have saved
-//! sessions (or, for File > Import snippets, command snippets) on this
+//! sessions (or, for File > Import and export > Import scripts, command snippets) on this
 //! account, then a preview with a box per item, so nothing is written
 //! until the user has said which ones.
 //!
@@ -267,7 +267,7 @@ impl ImportView {
         Self::with(false, found, problems)
     }
 
-    /// The page for File > Import snippets.
+    /// The page for File > Import and export > Import scripts.
     pub fn snippets(found: Vec<Found>, problems: Vec<String>) -> Self {
         Self::with(true, found, problems)
     }
