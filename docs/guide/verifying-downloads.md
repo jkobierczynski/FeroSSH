@@ -53,7 +53,7 @@ git checkout v1.0.0
 pwsh scripts/build-release.ps1
 ```
 
-For the ARM64 exes, run `pwsh scripts/build-release.ps1 -Arch arm64` on an ARM64 PC. It also needs Visual Studio's ARM64 build tools and clang (LLVM, or Visual Studio's "C++ Clang Compiler for Windows"), because ring compiles its C code for ARM64 with clang. CI checks these exes the same way, on ARM64 runners. Cross-compiling from an x64 PC with the same command should work too, but only the native ARM64 build is checked against the release.
+For the ARM64 exes, check out the tag of a release that has them, and run `pwsh scripts/build-release.ps1 -Arch arm64` on an ARM64 PC. Compare `ferossh-arm64.exe` and `ferossh-desktop-arm64.exe` with the manifest; the script also builds `ferossh-vnc-arm64.exe`, which releases do not publish. It also needs Visual Studio's ARM64 build tools and clang (LLVM, or Visual Studio's "C++ Clang Compiler for Windows"), because ring compiles its C code for ARM64 with clang. CI checks these exes the same way, on ARM64 runners. Cross-compiling from an x64 PC with the same command should work too, but only the native ARM64 build is checked against the release.
 
 The script prints the SHA-256 of each exe it built. They must equal the `sha256_unsigned` values in that release's `BUILD-MANIFEST.json`. They differ from `SHA256SUMS.txt` only when the release is code-signed, because the signature is added to the exe after it is built.
 
