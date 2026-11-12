@@ -48,14 +48,22 @@ fn with<T>(f: impl FnOnce(&mut Option<Vault>) -> T) -> T {
     // Other FeroSSH processes on this PC wait too, so a read, change and
     // write of the vault never interleaves with theirs. (Other PCs, via a
     // sync client, cannot be locked out: there the last save wins.)
-    let _lock = ProcessLock::take();
+    let lock = ProcessLock::take();
+    LOCKED.store(
+        lock.is_some() || cfg!(not(windows)),
+        std::sync::atomic::Ordering::Relaxed,
+    );
     f(&mut guard)
 }
 
+/// Whether the [`with`] running now holds `vault.lock`: a vault is only
+/// written while it does, so two FeroSSH processes never interleave.
+static LOCKED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 /// An exclusive open of `vault.lock` in FeroSSH's local folder, which
 /// every FeroSSH process takes the same way; released when dropped. None
-/// when it cannot be had within a second (the work goes on unlocked
-/// rather than hang).
+/// when it cannot be had within five seconds: reads go on, but nothing is
+/// written (see [`Vault::save`]) rather than hang.
 struct ProcessLock(#[allow(dead_code)] std::fs::File);
 
 impl ProcessLock {
@@ -65,7 +73,7 @@ impl ProcessLock {
         let dir = crate::portable::local_dir()?;
         std::fs::create_dir_all(&dir).ok()?;
         let path = dir.join("vault.lock");
-        for _ in 0..100 {
+        for _ in 0..500 {
             if let Ok(f) = std::fs::OpenOptions::new()
                 .read(true)
                 .write(true)
@@ -150,6 +158,13 @@ impl Vault {
     }
 
     fn save(&mut self) -> Result<(), String> {
+        if !LOCKED.load(std::sync::atomic::Ordering::Relaxed) {
+            return Err(format!(
+                "The vault {} is busy in another FeroSSH window; nothing was saved. \
+                 Try again in a moment.",
+                self.path.display()
+            ));
+        }
         let text = self.key.seal(&self.bundle.to_bytes())?;
         write_file(&self.path, &text).map_err(|e| {
             format!(
@@ -226,9 +241,11 @@ pub fn create(path: &Path, passphrase: &str, bundle: Bundle) -> Result<(), Strin
         bundle,
         seen: None,
     };
-    vault.save()?;
-    with(|v| *v = Some(vault));
-    Ok(())
+    with(|v| {
+        vault.save()?;
+        *v = Some(vault);
+        Ok(())
+    })
 }
 
 /// A new master password: a new salt and key, sealed at once.

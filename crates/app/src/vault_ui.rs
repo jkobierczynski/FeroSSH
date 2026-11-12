@@ -495,10 +495,7 @@ pub(super) fn import(hwnd: HWND) {
             plural(saved, "password", "passwords")
         ));
     }
-    for p in problems.iter().take(4) {
-        text.push_str("\n\n");
-        text.push_str(p);
-    }
+    text.push_str(&list_notes(&problems, "\n\n"));
     let icon = if problems.is_empty() {
         MB_ICONINFORMATION
     } else {
@@ -631,11 +628,25 @@ pub(super) fn set(hwnd: HWND) {
         ));
     }
     text.push_str("\n\nTo share it between PCs, use Master password > Move the vault file to put it in a OneDrive folder.");
-    for l in left.iter().take(4) {
-        text.push_str("\n\n");
-        text.push_str(l);
-    }
+    text.push_str(&list_notes(&left, "\n\n"));
     dialog(hwnd, &text, MB_OK | MB_ICONINFORMATION);
+}
+
+/// The notes, each after `sep`; past a dozen the rest are counted, so a
+/// dialog stays on the screen. Callers put the ones that matter most (plain
+/// files left behind) first, and there are never more than a dozen of those.
+fn list_notes(notes: &[String], sep: &str) -> String {
+    const SHOWN: usize = 12;
+    let mut text = String::new();
+    for n in notes.iter().take(SHOWN) {
+        text.push_str(sep);
+        text.push_str(n);
+    }
+    if notes.len() > SHOWN {
+        text.push_str(sep);
+        text.push_str(&format!("And {} more.", notes.len() - SHOWN));
+    }
+    text
 }
 
 /// Asks for the current master password before a change to the vault;
@@ -897,16 +908,16 @@ pub(super) fn use_file(hwnd: HWND) {
                 }
             }
         }
-        notes.extend(remove_plain_files());
+        // The plain files left behind first: those matter most.
+        let mut left = remove_plain_files();
+        left.append(&mut notes);
+        let notes = left;
         let mut text = format!(
             "FeroSSH now uses the vault {}, with this PC's connections added. It asks for its \
              master password when it starts.",
             path.display()
         );
-        for n in notes.iter().take(4) {
-            text.push_str("\n\n");
-            text.push_str(n);
-        }
+        text.push_str(&list_notes(&notes, "\n\n"));
         text
     } else {
         // Back to this PC's own files, which are all still there, for the
@@ -920,12 +931,7 @@ pub(super) fn use_file(hwnd: HWND) {
              in {}:\n\n{}",
             path.display(),
             app_dir().display(),
-            problems
-                .iter()
-                .take(4)
-                .cloned()
-                .collect::<Vec<_>>()
-                .join("\n")
+            list_notes(&problems, "\n").trim_start()
         )
     };
     after_change();
