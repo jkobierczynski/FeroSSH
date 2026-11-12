@@ -106,22 +106,36 @@ fn write_file(path: &Path, text: &str) -> std::io::Result<()> {
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)?;
     }
-    // A name of this write's own, made new: two writers never share one.
+    // A name of this write's own, made new: two writers never share one,
+    // and a file another writer made is never touched (another PC with
+    // the same process id may be writing beside it on a shared folder).
     static COUNT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-    let n = COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let mut tmp = path.as_os_str().to_owned();
-    tmp.push(format!(".{}-{n}.tmp", std::process::id()));
-    let tmp = PathBuf::from(tmp);
-    let written = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&tmp)
-        .and_then(|mut f| {
-            use std::io::Write;
-            f.write_all(text.as_bytes())?;
-            f.sync_all()
-        })
-        .and_then(|()| std::fs::rename(&tmp, path));
+    let (tmp, mut file) = loop {
+        let n = COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let nanos = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .map_or(0, |d| d.subsec_nanos());
+        let mut tmp = path.as_os_str().to_owned();
+        tmp.push(format!(".{}-{n}-{nanos}.tmp", std::process::id()));
+        let tmp = PathBuf::from(tmp);
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&tmp)
+        {
+            Ok(f) => break (tmp, f),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e),
+        }
+    };
+    // From here on the temporary file is this write's own.
+    let written = {
+        use std::io::Write;
+        file.write_all(text.as_bytes())
+            .and_then(|()| file.sync_all())
+    };
+    drop(file);
+    let written = written.and_then(|()| std::fs::rename(&tmp, path));
     if written.is_err() {
         let _ = std::fs::remove_file(&tmp);
     }
@@ -503,6 +517,25 @@ mod tests {
         assert!(unlock(&path, "other pass").is_ok());
         lock();
         let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn write_never_touches_another_writers_temporary_file() {
+        let d = dir("tmp-owned");
+        let path = d.join("vault.fsv");
+        let other = d.join("vault.fsv.other.tmp");
+        std::fs::write(&other, "theirs").unwrap();
+        write_file(&path, "mine").unwrap();
+        write_file(&path, "mine again").unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "mine again");
+        assert_eq!(std::fs::read_to_string(&other).unwrap(), "theirs");
+        let left: Vec<_> = std::fs::read_dir(&d)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.ends_with(".tmp") && n != "vault.fsv.other.tmp")
+            .collect();
+        assert!(left.is_empty(), "{left:?}");
     }
 
     #[test]
