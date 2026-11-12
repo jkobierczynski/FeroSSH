@@ -485,7 +485,7 @@ mod cmd {
     pub const FULL_SCREEN: u32 = 218;
     /// Settings > F11 switches full screen.
     pub const FULL_SCREEN_KEY: u32 = 219;
-    /// Plus the index into `WindowColours::ALL`.
+    /// Plus the index into `WindowColours::ALL` (room for ten, up to 229).
     pub const WINDOW_COLOURS: u32 = 220;
     /// Settings > Server status bar.
     pub const STATUS_BAR: u32 = 230;
@@ -2586,14 +2586,23 @@ fn build_menu() -> Result<HMENU> {
         AppendMenuW(view, MF_POPUP, themes.0 as usize, w!("&Theme (this pane)"))?;
         let colours = CreatePopupMenu()?;
         for (id, c) in (cmd::WINDOW_COLOURS..).zip(WindowColours::ALL) {
+            if c == WindowColours::Light {
+                separator(colours)?;
+            }
             item(
                 colours,
                 id,
                 match c {
                     WindowColours::Theme => "Follow the &terminal theme",
                     WindowColours::System => "Follow &Windows (light or dark)",
-                    WindowColours::Light => "&Light",
+                    WindowColours::Light => "&Light (Windows' usual look)",
+                    WindowColours::SoftGrey => "S&oft grey",
+                    WindowColours::Silver => "&Silver",
+                    WindowColours::MidGrey => "&Mid grey",
+                    WindowColours::Steel => "St&eel grey",
+                    WindowColours::Graphite => "&Graphite",
                     WindowColours::Dark => "&Dark",
+                    WindowColours::Black => "&Black",
                 },
             )?;
         }

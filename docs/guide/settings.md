@@ -22,7 +22,7 @@ FeroSSH reads `~/.ssh/config` and `~/.ssh/known_hosts` too, and writes only to `
 | `StatusBar yes` | no | Shows the server status bar under the panes. Settings > Server status bar. |
 | `FullScreenKey no` | yes | Whether F11 switches full screen (Settings > F11 switches full screen). Off, F11 goes to the terminal. |
 | `KeyBinding 213 Ctrl+K` | | The keys of one action, by its menu command number, written by Settings > Key bindings for the actions you changed: none after the number means no shortcut. Keys are spelled as for `StandbyHotkey` (`Ctrl+Shift+PageUp`, `Alt+Shift+OemPlus`); Win is not allowed. Actions with no `KeyBinding` line keep their default keys. |
-| `WindowColours dark` | light | Where the menu bar, menus, title bar, tab strip and tools pane take their colours: `theme` (the focused pane's colour theme), `windows` (Windows' light or dark app mode), `light` (Windows' usual light look) or `dark`. Settings > Window colours. |
+| `WindowColours dark` | light | Where the menu bar, menus, title bar, tab strip and tools pane take their colours: `theme` (the focused pane's colour theme), `windows` (Windows' light or dark app mode), `light` (Windows' usual light look), or a neutral grey: `softgrey`, `silver`, `midgrey`, `steel`, `graphite`, `dark` or `black`. Settings > Window colours. |
 | `CopyOnSelect yes` | no | Copies a selection as soon as you make it, as PuTTY does. |
 | `RightClickPaste yes` | no | Pastes on a right click, as PuTTY does. |
 | `CommandSuggestions yes` | no | Suggests commands as you type from the host's history and a short list of common ones, and keeps the commands you run in an encrypted history per host (Edit > Suggest commands as you type). |

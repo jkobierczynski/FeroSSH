@@ -57,7 +57,26 @@ pub struct UiColours {
 /// The fixed dark look: Windows 11's dark greys.
 const DARK_BACKGROUND: Rgb = Rgb::new(0x20, 0x20, 0x20);
 const DARK_TEXT: Rgb = Rgb::new(0xE8, 0xE8, 0xE8);
+/// Windows 11's accent blues for dark and light surfaces.
 const DARK_ACCENT: Rgb = Rgb::new(0x4C, 0xC2, 0xFF);
+const LIGHT_ACCENT: Rgb = Rgb::new(0x00, 0x5F, 0xB8);
+
+/// The fixed neutral looks: pure greys (no tint) from light to dark, as
+/// background, text and accent. `None` for the looks that follow
+/// something (the terminal theme, Windows, Windows' light look).
+fn neutral(mode: WindowColours) -> Option<(Rgb, Rgb, Rgb)> {
+    let grey = |v: u8| Rgb::new(v, v, v);
+    Some(match mode {
+        WindowColours::Theme | WindowColours::System | WindowColours::Light => return None,
+        WindowColours::SoftGrey => (grey(0xF3), grey(0x1A), LIGHT_ACCENT),
+        WindowColours::Silver => (grey(0xDC), grey(0x14), LIGHT_ACCENT),
+        WindowColours::MidGrey => (grey(0xB4), grey(0x00), LIGHT_ACCENT),
+        WindowColours::Steel => (grey(0x5A), grey(0xFF), DARK_ACCENT),
+        WindowColours::Graphite => (grey(0x38), grey(0xEA), DARK_ACCENT),
+        WindowColours::Dark => (DARK_BACKGROUND, DARK_TEXT, DARK_ACCENT),
+        WindowColours::Black => (grey(0x0C), grey(0xE0), DARK_ACCENT),
+    })
+}
 
 /// Red for problems, before it is made readable on the background.
 const RED_ON_DARK: Rgb = Rgb::new(0xFF, 0x70, 0x70);
@@ -65,16 +84,14 @@ const RED_ON_LIGHT: Rgb = Rgb::new(0xC0, 0x20, 0x20);
 
 /// The window's colours in `mode`; `theme` is the focused pane's.
 pub fn resolve(mode: WindowColours, theme: &Theme, system: &System) -> UiColours {
+    if let Some((background, text, accent)) = neutral(mode) {
+        return from_colours(background, text, accent);
+    }
     match mode {
         WindowColours::Theme => from_colours(theme.background, theme.foreground, theme.cursor),
-        WindowColours::Dark => dark(),
-        WindowColours::System if system.dark => dark(),
-        WindowColours::System | WindowColours::Light => light(system),
+        WindowColours::System if system.dark => resolve(WindowColours::Dark, theme, system),
+        _ => light(system),
     }
-}
-
-fn dark() -> UiColours {
-    from_colours(DARK_BACKGROUND, DARK_TEXT, DARK_ACCENT)
 }
 
 /// Our own colours from a background, a text colour and an accent.
@@ -220,6 +237,56 @@ mod tests {
         let other = Theme::builtin().last().cloned().unwrap_or_default();
         assert_eq!(resolve(WindowColours::Dark, &other, &system(false)), dark);
         assert_eq!(resolve(WindowColours::Light, &other, &system(true)), light);
+    }
+
+    #[test]
+    fn neutral_looks_are_grey_readable_and_ordered() {
+        let nord = Theme::default();
+        let mut last = f32::INFINITY;
+        for mode in WindowColours::ALL {
+            let Some((background, ..)) = neutral(mode) else {
+                continue;
+            };
+            let name = mode.name();
+            let c = resolve(mode, &nord, &system(false));
+            assert!(c.custom, "{name}");
+            assert_eq!(c.window, background, "{name}");
+            let grey = |x: Rgb| x.r == x.g && x.g == x.b;
+            for (part, x) in [
+                ("window", c.window),
+                ("control", c.control),
+                ("text", c.text),
+                ("dim", c.dim),
+                ("bar", c.bar),
+                ("hot", c.hot),
+                ("track", c.track),
+            ] {
+                assert!(grey(x), "{name} {part} is not neutral");
+            }
+            // Full readability, not just as much as a theme allows.
+            for (part, fg, bg) in [
+                ("text", c.text, c.window),
+                ("edit", c.text, c.control),
+                ("bar", c.text, c.bar),
+                ("hot", c.text, c.hot),
+                ("dim", c.dim, c.window),
+                ("dim on bar", c.dim, c.bar),
+                ("error", c.error, c.window),
+                ("tab", c.strip.text, c.strip.strip),
+                ("dim tab", c.strip.dim, c.strip.strip),
+            ] {
+                assert!(contrast(fg, bg) >= DIM_CONTRAST, "{name} {part}");
+            }
+            assert!(c.hot != c.bar, "{name}: a hot item shows");
+            assert_eq!(c.dark, luminance(background) < 0.18, "{name} dark");
+            // The menu lists them from light to dark.
+            let l = luminance(background);
+            assert!(l < last, "{name} out of order");
+            last = l;
+            // The pane's theme does not change them.
+            let other = Theme::builtin().last().cloned().unwrap_or_default();
+            assert_eq!(resolve(mode, &other, &system(true)), c, "{name}");
+        }
     }
 
     #[test]
