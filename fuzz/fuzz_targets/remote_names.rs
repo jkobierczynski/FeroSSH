@@ -9,8 +9,8 @@
 //!   would land on `a.txt`), no bidi control, at most 255 UTF-16 units;
 //! - a shown name has no control character or bidi override;
 //! - `inside` never lets a path out of its root;
-//! - the directory a shell reports is the same however its output is
-//!   split, and never holds a NUL.
+//! - the directory a shell reports ends up the same however its output
+//!   is split, and never holds a NUL.
 
 #![no_main]
 
@@ -120,5 +120,9 @@ fuzz_target!(|data: &[u8]| {
     };
     let whole = dirs(&mut std::iter::once(rest));
     let pieces = dirs(&mut rest.chunks(step));
-    assert_eq!(whole, pieces);
+    // The terminal passes on only the last report of each burst of
+    // output, so more pieces can give more reports; the directory the
+    // pane ends up in is the same.
+    assert!(whole.len() <= 1);
+    assert_eq!(whole.last(), pieces.last());
 });
