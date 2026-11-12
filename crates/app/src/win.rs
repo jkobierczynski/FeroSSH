@@ -7183,7 +7183,8 @@ impl Window {
         {
             // Not saved (the folder cannot be written): this window keeps
             // the change, with the file's old time so it is not read over.
-            let fresh = match crate::history_store::update(key, change) {
+            let kept = self.histories.get(key).map(|(h, _)| h);
+            let fresh = match crate::history_store::update(key, kept, change) {
                 Ok(fresh) => fresh,
                 Err((kept, _)) => kept,
             };

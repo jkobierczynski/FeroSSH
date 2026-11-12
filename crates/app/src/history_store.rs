@@ -124,9 +124,12 @@ fn lock() -> Result<Lock, String> {
 /// and writes it back when `change` changed it, all under [`lock`]: so two
 /// windows typing on the same host keep each other's commands, and a clear
 /// in one holds. On an error the history comes back as changed but not
-/// saved, with the file's time from before.
+/// saved, with the file's time from before. `kept` is what this window
+/// holds already: an unreadable file is changed from it rather than from
+/// nothing, so unsaved commands add up instead of replacing each other.
 pub fn update(
     key: &str,
+    kept: Option<&History>,
     change: impl FnOnce(&mut History) -> bool,
 ) -> Result<Stamped, (Stamped, String)> {
     let guard = lock();
@@ -135,7 +138,10 @@ pub fn update(
     // A portable folder travels: a file another PC or account sealed (two
     // PCs can share a name) is left alone rather than replaced.
     let unreadable = found.is_err() && crate::portable::is_portable();
-    let mut history = found.ok().flatten().unwrap_or_else(|| History::new(key));
+    let mut history = match found {
+        Ok(found) => found.unwrap_or_else(|| History::new(key)),
+        Err(()) => kept.cloned().unwrap_or_else(|| History::new(key)),
+    };
     if !change(&mut history) {
         return Ok((history, stamp));
     }
