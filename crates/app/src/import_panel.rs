@@ -430,14 +430,10 @@ pub fn place(at: Option<Rect>, width: i32, dpi: u32) {
     let sources_end = if problems_h > 0 { problems_y } else { file_y };
     let sources_h = (sources_end - gap - list_y).max(0);
     // Preview: Select all and Clear all, then where it is saved.
-    // Where the import goes (and that it replaces an earlier one) stays
-    // as long as Select all and one row of list fit.
-    let footer_h = if room >= 2 * line + gap + button + gap + button {
-        2 * line
-    } else {
-        0
-    };
-    let footer_y = buttons_y - if footer_h > 0 { gap + footer_h } else { 0 };
+    // Where the import goes (and that it replaces an earlier one) always
+    // stays next to Import: the list gives up its room first.
+    let footer_h = 2 * line;
+    let footer_y = buttons_y - gap - footer_h;
     let picks_y = footer_y - gap - button;
     let items_h = (picks_y - gap - list_y).max(0);
     let button_w = scale(80, dpi);
