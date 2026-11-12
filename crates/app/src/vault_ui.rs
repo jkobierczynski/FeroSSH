@@ -810,39 +810,55 @@ pub(super) fn use_file(hwnd: HWND) {
     if let Err(e) = saved {
         problems.push(e);
     }
-    if answer.option {
-        for s in &os_secrets {
-            if vault::secret(&s.target).is_none() {
-                match vault::set_secret(&s.target, &s.user, &s.password) {
-                    Ok(()) => credman::os_delete(&s.target),
-                    Err(e) => problems.push(e),
+    // Only with everything in the vault does FeroSSH switch to it for
+    // good: the pointer, the passwords and the plain files' removal.
+    if problems.is_empty()
+        && let Err(e) = set_pointer(&path)
+    {
+        problems.push(format!("Could not remember where the vault is: {e}"));
+    }
+    let text = if problems.is_empty() {
+        let mut notes = Vec::new();
+        if answer.option {
+            for s in &os_secrets {
+                if vault::secret(&s.target).is_none() {
+                    // One that fails stays in the Credential Manager.
+                    match vault::set_secret(&s.target, &s.user, &s.password) {
+                        Ok(()) => credman::os_delete(&s.target),
+                        Err(e) => notes.push(e),
+                    }
                 }
             }
         }
-    }
-    if let Err(e) = set_pointer(&path) {
-        problems.push(format!("Could not remember where the vault is: {e}"));
-    }
-    // The plain files go only once everything is safely in the vault and
-    // FeroSSH will find it again; otherwise they are what it starts with.
-    if problems.is_empty() {
         remove_plain_files();
+        let mut text = format!(
+            "FeroSSH now uses the vault {}, with this PC's connections added. It asks for its \
+             master password when it starts.",
+            path.display()
+        );
+        for n in notes.iter().take(4) {
+            text.push_str("\n\n");
+            text.push_str(n);
+        }
+        text
     } else {
-        problems.push(format!(
-            "The plain files in {} are kept until this works.",
-            app_dir().display()
-        ));
-    }
+        // Back to this PC's own files, which are all still there, for the
+        // rest of this run and the next start alike.
+        drop(vault::remove());
+        format!(
+            "FeroSSH could not switch to the vault {}, so it keeps using this PC's own files \
+             in {}:\n\n{}",
+            path.display(),
+            app_dir().display(),
+            problems
+                .iter()
+                .take(4)
+                .cloned()
+                .collect::<Vec<_>>()
+                .join("\n")
+        )
+    };
     after_change();
-    let mut text = format!(
-        "FeroSSH now uses the vault {}, with this PC's connections added. It asks for its \
-         master password when it starts.",
-        path.display()
-    );
-    for p in problems.iter().take(4) {
-        text.push_str("\n\n");
-        text.push_str(p);
-    }
     dialog(hwnd, &text, MB_OK | MB_ICONINFORMATION);
 }
 
@@ -874,13 +890,15 @@ pub(super) fn remove(hwnd: HWND) {
     if dialog(hwnd, &question, MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2) != Some(IDYES) {
         return;
     }
-    let (b, file) = match vault::remove() {
-        Ok(b) => b,
+    let removed = match vault::remove() {
+        Ok(r) => r,
         Err(e) => {
             dialog(hwnd, &e, MB_OK | MB_ICONERROR);
             return;
         }
     };
+    let b = removed.bundle();
+    let file = removed.path().to_path_buf();
     let mut problems = Vec::new();
     for (name, path) in connection_files() {
         if let Some(text) = b.file(&name)
@@ -896,18 +914,30 @@ pub(super) fn remove(hwnd: HWND) {
             }
         }
     }
-    // The window's settings are written out as they are now.
-    let saved = with_window(|w| w.try_save_settings())
-        .unwrap_or_else(|| Err("Could not save the settings.".to_owned()));
+    // The window's settings are written out as they are now, with host
+    // profiles another PC put in the vault since this window read it.
+    let theirs = b.file("ferossh.conf").map(str::to_owned);
+    let saved = with_window(|w| {
+        if let Some(t) = &theirs {
+            merge_theirs(&mut w.settings, t);
+        }
+        w.try_save_settings()
+    })
+    .unwrap_or_else(|| Err("Could not save the settings.".to_owned()));
     if let Err(e) = saved {
         problems.push(e);
     }
-    after_change();
     if problems.is_empty()
         && let Err(e) = set_pointer(&default_vault_path())
     {
         problems.push(format!("Could not forget where the vault is: {e}"));
     }
+    if !problems.is_empty() {
+        // The vault stays in use, now and at the next start, so nothing
+        // changed from here on goes to plain files the vault would hide.
+        vault::restore(removed);
+    }
+    after_change();
     let text = if problems.is_empty() {
         // Only FeroSSH's own vault file is deleted; one the user chose
         // (in OneDrive, say) stays for the other PCs that use it.
@@ -1004,15 +1034,42 @@ pub(super) fn sync_settings(settings: &mut Settings) {
     if !vault::is_open() {
         return;
     }
-    let Some(theirs) = vault::read("ferossh.conf") else {
-        return;
-    };
+    if let Some(theirs) = vault::read("ferossh.conf") {
+        merge_theirs(settings, &theirs);
+    }
+}
+
+/// Takes in the host profiles of `theirs` (the vault's settings) that
+/// changed since this window last read or wrote them; `false` when
+/// nothing changed.
+fn merge_theirs(settings: &mut Settings, theirs: &str) -> bool {
     let base = SETTINGS_BASE.lock().ok().and_then(|b| b.clone());
-    if base.as_deref() == Some(theirs.as_str()) {
-        return;
+    if base.as_deref() == Some(theirs) {
+        return false;
     }
     let base = base.map(|b| Settings::parse(&b)).unwrap_or_default();
-    let theirs = Settings::parse(&theirs);
+    let parsed = Settings::parse(theirs);
     settings.profiles =
-        bundle::merge_profiles3(&base.profiles, &settings.profiles, &theirs.profiles);
+        bundle::merge_profiles3(&base.profiles, &settings.profiles, &parsed.profiles);
+    true
+}
+
+/// When another PC changed the shared vault's host profiles: takes them
+/// into the window's settings now, so connections open the way they are
+/// saved, without waiting for a save here or a restart. `true` when
+/// something was taken in.
+pub(super) fn pull_settings(settings: &mut Settings) -> bool {
+    if !vault::is_open() {
+        return false;
+    }
+    let Some(theirs) = vault::read("ferossh.conf") else {
+        return false;
+    };
+    if !merge_theirs(settings, &theirs) {
+        return false;
+    }
+    // What this window has now includes theirs: the next save compares
+    // with this.
+    note_settings(&theirs);
+    true
 }

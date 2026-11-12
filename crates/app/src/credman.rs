@@ -35,6 +35,11 @@ pub fn read(target: &str) -> Result<Option<Zeroizing<String>>, String> {
     if let Some(s) = crate::vault::secret(target) {
         return Ok(Some(s.password));
     }
+    // A portable FeroSSH uses only its own vault: the PC's saved passwords
+    // are not for connection settings that came on a USB stick.
+    if crate::portable::is_portable() {
+        return Ok(None);
+    }
     os_read(target)
 }
 

@@ -10606,12 +10606,15 @@ impl Window {
                     )));
                 }
                 self.settings = settings;
+                // Not saved: the form stays open, so nothing typed is lost.
+                if let Err(e) = self.try_save_settings() {
+                    return Some(Command::Notice(e));
+                }
                 if let Some(old) = old_target
                     && (!still_windows || self.saved_password_target(&name).as_ref() != Some(&old))
                 {
                     credman::delete(&old);
                 }
-                self.save_settings();
                 self.side.form = None;
                 self.reload_sessions(Some(&name));
                 if connect {
@@ -10678,6 +10681,14 @@ impl Window {
     }
 
     /// Reads the hosts again after a session was saved or deleted.
+    /// Takes in host profiles another PC changed in a shared vault, and
+    /// shows them in the connection list.
+    fn pull_vault_settings(&mut self) {
+        if vault_ui::pull_settings(&mut self.settings) {
+            self.reload_sessions(None);
+        }
+    }
+
     fn reload_sessions(&mut self, select: Option<&str>) {
         let env = ssh_env();
         self.side.list.set_hosts(
@@ -11008,6 +11019,7 @@ impl Window {
     /// Opens `host` from the connection manager: in the focused pane if it is
     /// waiting at the connect prompt, else in a new tab (or a split).
     fn open_host(&mut self, host: &str, split: bool) {
+        self.pull_vault_settings();
         if let Some(p) = self.settings.profile(host)
             && p.kind == SessionKind::Serial
         {
@@ -12844,7 +12856,7 @@ impl Window {
         profile.font = Some(font.clone());
         profile.font_size = Some(size);
         profile.theme = Some(theme.to_owned());
-        self.save_settings();
+        self.try_save_settings()?;
         Ok(format!(
             "Saved for {host}: {font} {size} pt, {theme} theme. New panes on this host use it."
         ))
@@ -17115,7 +17127,10 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                 LRESULT(0)
             }
             WM_SETFOCUS => {
-                with_window(|w| w.set_focus(true));
+                with_window(|w| {
+                    w.pull_vault_settings();
+                    w.set_focus(true);
+                });
                 LRESULT(0)
             }
             WM_CLIPBOARDUPDATE => {

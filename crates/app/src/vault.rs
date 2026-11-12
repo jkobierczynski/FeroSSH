@@ -206,16 +206,35 @@ pub fn move_to(to: &Path) -> Result<(), String> {
     })
 }
 
-/// Closes the vault and hands back what it held, for writing out as
-/// plain files again, and where its file is. The file stays: the caller
-/// deletes it once everything is written out (and never a shared one).
-pub fn remove() -> Result<(Bundle, PathBuf), String> {
+/// A vault closed by [`remove`]: what it held, for writing out as plain
+/// files again, and the way to open it again with [`restore`] when that
+/// fails.
+pub struct Removed(Vault);
+
+impl Removed {
+    pub fn bundle(&self) -> &Bundle {
+        &self.0.bundle
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.0.path
+    }
+}
+
+/// Closes the vault and hands it back. The file stays: the caller deletes
+/// it once everything is written out (and never a shared one).
+pub fn remove() -> Result<Removed, String> {
     with(|v| {
         let open = v.as_mut().ok_or("No vault is open.")?;
         open.refresh()?;
         let vault = v.take().ok_or("No vault is open.")?;
-        Ok((vault.bundle, vault.path))
+        Ok(Removed(vault))
     })
+}
+
+/// Opens a vault [`remove`] closed again, as it was.
+pub fn restore(removed: Removed) {
+    with(|v| *v = Some(removed.0));
 }
 
 /// Whether `passphrase` opens the vault file as it is now.
@@ -364,9 +383,12 @@ mod tests {
         move_to(&moved).unwrap();
         assert!(!path.exists() && moved.exists());
         assert!(verify("new master") && !verify("master pass"));
-        let (back, at) = remove().unwrap();
-        assert!(at == moved && moved.exists() && !is_open());
-        assert_eq!(back.file("sessions.conf"), Some("Host a\n"));
+        let back = remove().unwrap();
+        assert!(back.path() == moved && moved.exists() && !is_open());
+        assert_eq!(back.bundle().file("sessions.conf"), Some("Host a\n"));
+        restore(back);
+        assert!(is_open() && read("sessions.conf").as_deref() == Some("Host a\n"));
+        drop(remove().unwrap());
         let _ = std::fs::remove_dir_all(&d);
     }
 
