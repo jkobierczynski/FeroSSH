@@ -6,9 +6,10 @@
 //!
 //! The actions are read from the window's menu when the palette opens, so
 //! the palette offers exactly what the menus offer, with their shortcuts,
-//! check marks and greyed-out items. Drawn into a [`Grid`] like the other
-//! side pane views; keys come in as [`SideKey`]s and what the user chose
-//! goes out as a [`PalAction`].
+//! check marks and greyed-out items. The window shows it as native
+//! controls (`palette_panel`, from [`CommandPalette::native`]); the older
+//! grid drawing and [`SideKey`] handling remain for the drawn side pane
+//! underneath. What the user chose goes out as a [`PalAction`].
 
 use ferossh_config::settings::SessionKind;
 use ferossh_render::{Flags, Grid};

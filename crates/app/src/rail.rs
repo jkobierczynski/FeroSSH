@@ -63,6 +63,9 @@ struct State {
     tracking: bool,
     /// The command each button sends, in `RailItem::ALL` order.
     commands: [u32; 7],
+    /// The shortcut of each button's command, as its tooltip says it
+    /// (Settings > Key bindings); empty for none.
+    keys: [String; 7],
 }
 
 thread_local! {
@@ -136,6 +139,7 @@ pub fn create(parent: HWND, commands: [u32; 7], look: Look) -> windows::core::Re
                 pressed: None,
                 tracking: false,
                 commands,
+                keys: Default::default(),
             });
         });
         if !tooltip.is_invalid() {
@@ -215,7 +219,16 @@ fn update_tips(hwnd: HWND, tooltip: HWND, w: i32, h: i32, pinned: bool) {
             right: r.right(),
             bottom: r.bottom(),
         };
-        let mut text = wide(item.name(pinned));
+        let key = RAIL.with(|r| {
+            r.try_borrow()
+                .ok()
+                .and_then(|r| r.as_ref().and_then(|s| s.keys.get(index).cloned()))
+        });
+        let text = match key.filter(|k| !k.is_empty()) {
+            Some(k) => format!("{} ({k})", item.name(pinned)),
+            None => item.name(pinned).to_owned(),
+        };
+        let mut text = wide(&text);
         let info = tool_info(hwnd, index, rect, &mut text);
         // SAFETY: the tooltip copies the struct and text during the call.
         unsafe {
@@ -232,6 +245,27 @@ fn update_tips(hwnd: HWND, tooltip: HWND, w: i32, h: i32, pinned: bool) {
                 Some(LPARAM(&raw const info as isize)),
             );
         }
+    }
+}
+
+/// The buttons' shortcuts, in `RailItem::ALL` order, for their tooltips.
+pub fn set_keys(keys: [String; 7]) {
+    let changed = RAIL.with(|r| {
+        let mut r = r.try_borrow_mut().ok()?;
+        let s = r.as_mut()?;
+        if s.keys == keys {
+            return None;
+        }
+        s.keys = keys;
+        Some((s.hwnd, s.tooltip, s.look.pinned))
+    });
+    if let Some((hwnd, tooltip, pinned)) = changed {
+        let mut rc = RECT::default();
+        // SAFETY: our own child window.
+        unsafe {
+            let _ = GetClientRect(hwnd, &mut rc);
+        }
+        update_tips(hwnd, tooltip, rc.right, rc.bottom, pinned);
     }
 }
 

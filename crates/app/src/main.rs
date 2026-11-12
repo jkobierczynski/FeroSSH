@@ -51,6 +51,8 @@ mod fwd_panel;
 #[cfg(windows)]
 mod keygen_view;
 #[cfg(windows)]
+mod keys_view;
+#[cfg(windows)]
 mod live_panel;
 #[cfg(windows)]
 mod native;
@@ -91,6 +93,8 @@ mod import_panel;
 mod import_reg;
 #[cfg_attr(not(windows), allow(dead_code))]
 mod import_view;
+#[cfg_attr(not(windows), allow(dead_code))]
+mod keymap;
 #[cfg_attr(not(windows), allow(dead_code))]
 mod layout;
 #[cfg_attr(not(windows), allow(dead_code))]

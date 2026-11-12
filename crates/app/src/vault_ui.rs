@@ -21,10 +21,11 @@ use windows::Win32::UI::WindowsAndMessaging::{
 use windows::core::{PCWSTR, PWSTR, w};
 
 use super::{
-    DIALOG_OPEN, SideView, app_dir, app_read, dialog, home, imported_path, pick_file,
+    DIALOG_OPEN, KEY_DEFAULTS, SideView, app_dir, app_read, dialog, home, imported_path, pick_file,
     sessions_path, settings_path, with_window, write_app_file,
 };
 use crate::credman;
+use crate::keymap::Keymap;
 use crate::passphrase_view::{self, Ask};
 use crate::vault;
 
@@ -352,6 +353,8 @@ struct Plan {
     files: Vec<(PathBuf, String)>,
     hosts: Merged,
     profiles: Merged,
+    /// Actions whose keys (Settings > Key bindings) the file changes.
+    keys: usize,
     settings: Option<Settings>,
 }
 
@@ -360,6 +363,7 @@ fn plan(incoming: &Bundle, current: &Settings) -> Plan {
         files: Vec::new(),
         hosts: Merged::default(),
         profiles: Merged::default(),
+        keys: 0,
         settings: None,
     };
     for (name, path) in connection_files() {
@@ -368,7 +372,9 @@ fn plan(incoming: &Bundle, current: &Settings) -> Plan {
         };
         if name == "ferossh.conf" {
             let mut s = current.clone();
-            plan.profiles = bundle::merge_profiles(&mut s, &Settings::parse(theirs));
+            let theirs = Settings::parse(theirs);
+            plan.profiles = bundle::merge_profiles(&mut s, &theirs);
+            plan.keys = merge_keys(&mut s, &theirs);
             plan.settings = Some(s);
             continue;
         }
@@ -380,6 +386,22 @@ fn plan(incoming: &Bundle, current: &Settings) -> Plan {
         }
     }
     plan
+}
+
+/// Takes in the key bindings `incoming` changed: an action it gives
+/// other keys than ours gets its keys (taken from any action of ours
+/// that has them). How many actions changed.
+fn merge_keys(local: &mut Settings, incoming: &Settings) -> usize {
+    let mut map = Keymap::new(KEY_DEFAULTS, &local.key_bindings);
+    let mut changed = 0;
+    for (id, keys) in &incoming.key_bindings {
+        if map.keys(*id) != keys.as_slice() {
+            map.set(*id, keys.clone());
+            changed += 1;
+        }
+    }
+    local.key_bindings = map.changed();
+    changed
 }
 
 /// File > Import encrypted connections: the file, its passphrase, what
@@ -406,7 +428,7 @@ pub(super) fn import(hwnd: HWND) {
     let n_secrets = incoming.secrets.len();
     let can_keep = vault::is_open() || !crate::portable::is_portable();
     let h = plan.hosts;
-    if !h.changed() && !plan.profiles.changed() && n_secrets == 0 {
+    if !h.changed() && !plan.profiles.changed() && plan.keys == 0 && n_secrets == 0 {
         dialog(
             hwnd,
             &format!(
@@ -441,6 +463,13 @@ pub(super) fn import(hwnd: HWND) {
             )
         });
     }
+    if plan.keys > 0 {
+        question.push_str(&format!(
+            "\n\nIt also changes the shortcuts of {} (Settings > Key bindings), which replace \
+             yours for the same actions.",
+            plural(plan.keys, "action", "actions")
+        ));
+    }
     question.push_str("\n\nImport?");
     if dialog(hwnd, &question, MB_YESNO | MB_ICONINFORMATION) != Some(IDYES) {
         return;
@@ -462,6 +491,11 @@ pub(super) fn import(hwnd: HWND) {
         with_window(|w| {
             w.settings.profiles = s.profiles;
             w.settings.favourites = s.favourites;
+            if plan.keys > 0 {
+                w.settings.key_bindings = s.key_bindings;
+                w.keymap = Keymap::new(KEY_DEFAULTS, &w.settings.key_bindings);
+                w.apply_key_labels();
+            }
             w.save_settings();
         });
     }
@@ -493,6 +527,12 @@ pub(super) fn import(hwnd: HWND) {
         text.push_str(&format!(
             " {} saved.",
             plural(saved, "password", "passwords")
+        ));
+    }
+    if plan.keys > 0 {
+        text.push_str(&format!(
+            " Shortcuts of {} changed.",
+            plural(plan.keys, "action", "actions")
         ));
     }
     text.push_str(&list_notes(&problems, "\n\n"));

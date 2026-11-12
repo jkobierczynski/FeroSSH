@@ -649,6 +649,10 @@ pub struct Settings {
     pub standby: bool,
     /// The standby window's hotkey; [`Hotkey::DEFAULT`] when unset.
     pub standby_hotkey: Option<Hotkey>,
+    /// Settings > Key bindings: the actions (by menu command id) whose
+    /// shortcuts were changed, with the keys they have now (none: the
+    /// action has no shortcut). Actions not listed keep their defaults.
+    pub key_bindings: std::collections::BTreeMap<u32, Vec<Hotkey>>,
     /// The program whose window the standby hotkey shows and hides, by
     /// file name (`notepad.exe`); the FeroSSH window itself when unset.
     pub standby_target: Option<String>,
@@ -732,6 +736,7 @@ impl Default for Settings {
             command_suggestions: false,
             standby: false,
             standby_hotkey: None,
+            key_bindings: std::collections::BTreeMap::new(),
             standby_target: None,
             standby_hidden: None,
             remote_app_copy_agent: true,
@@ -1068,6 +1073,20 @@ impl Settings {
                 "standbyhotkey" => {
                     block = Block::Top;
                     s.standby_hotkey = first.and_then(|k| Hotkey::parse(&k).ok());
+                }
+                "keybinding" => {
+                    block = Block::Top;
+                    // `KeyBinding <id> [key...]`; a key FeroSSH does not
+                    // know is left out, the others kept.
+                    if let Some(id) = first.and_then(|a| a.parse::<u32>().ok()) {
+                        let keys = args
+                            .iter()
+                            .skip(1)
+                            .filter_map(|k| Hotkey::parse_key(k).ok())
+                            .filter(|k| !k.win)
+                            .collect();
+                        s.key_bindings.insert(id, keys);
+                    }
                 }
                 "standbywindow" => {
                     block = Block::Top;
@@ -1456,6 +1475,13 @@ impl Settings {
         let _ = writeln!(out, "Standby {}", flag(self.standby));
         if let Some(k) = self.standby_hotkey {
             let _ = writeln!(out, "StandbyHotkey {k}");
+        }
+        for (id, keys) in &self.key_bindings {
+            let mut line = format!("KeyBinding {id}");
+            for k in keys {
+                let _ = write!(line, " {k}");
+            }
+            let _ = writeln!(out, "{line}");
         }
         if let Some(p) = &self.standby_target {
             let _ = writeln!(out, "StandbyWindow {}", arg(p));
@@ -2193,6 +2219,26 @@ DesktopShareSelection yes
             Settings::parse("WindowColours Dark\n").window_colours,
             WindowColours::Dark
         );
+    }
+
+    #[test]
+    fn key_bindings_round_trip() {
+        assert!(Settings::default().key_bindings.is_empty());
+        let s = Settings::parse(
+            "KeyBinding 213 Ctrl+K Ctrl+Shift+A\nKeyBinding 500\nKeyBinding 501 Bogus+Q F5\n\
+             KeyBinding x Ctrl+A\n",
+        );
+        let key = |t| Hotkey::parse_key(t).unwrap();
+        assert_eq!(
+            s.key_bindings.get(&213),
+            Some(&vec![key("Ctrl+K"), key("Ctrl+Shift+A")])
+        );
+        // No keys: the action has none.
+        assert_eq!(s.key_bindings.get(&500), Some(&vec![]));
+        // An unknown key is left out, the others kept.
+        assert_eq!(s.key_bindings.get(&501), Some(&vec![key("F5")]));
+        assert_eq!(s.key_bindings.len(), 3);
+        assert_eq!(Settings::parse(&s.to_text()).key_bindings, s.key_bindings);
     }
 
     #[test]
