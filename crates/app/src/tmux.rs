@@ -1470,12 +1470,6 @@ impl Tmux {
         out
     }
 
-    /// The question about other clients went unanswered (another dialog
-    /// was open): ask again at the next size change.
-    pub fn ask_crowded_again(&mut self) {
-        self.crowded_asked = false;
-    }
-
     pub fn detach(&mut self) -> Vec<Action> {
         let mut out = Vec::new();
         self.reattach = None;

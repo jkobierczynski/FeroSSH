@@ -251,6 +251,8 @@ const TIMER_AGENT_ASK: usize = 10;
 const TIMER_KEYGEN: usize = 11;
 /// Plays the next part of the recordings that play in replay tabs.
 const TIMER_REPLAY: usize = 12;
+/// Asks about other tmux clients once another dialog has closed.
+const TIMER_CROWDED: usize = 13;
 /// How often a playing replay's tab updates its clock, at most.
 const REPLAY_TICK_MS: u64 = 250;
 const LAUNCH_TICK_MS: u32 = 1000;
@@ -1197,6 +1199,8 @@ struct Window {
     winrm_closing: HashMap<ChannelId, WinrmCloser>,
     /// Tools > New SSH key making the key in the background.
     keygen: Option<std::sync::mpsc::Receiver<(PathBuf, std::result::Result<String, String>)>>,
+    /// The question about other tmux clients, while another dialog is open.
+    crowded_waiting: Option<CrowdedOffer>,
     /// The pane whose host the remote app picker (the palette) runs on.
     app_pane: Option<PaneId>,
     /// Programs run as remote apps lately, latest first.
@@ -2156,6 +2160,7 @@ fn create_and_run(launch: Launch, theme: Option<String>) -> Result<()> {
                 stats: HashMap::new(),
                 winrm_closing: HashMap::new(),
                 keygen: None,
+                crowded_waiting: None,
                 app_pane: None,
                 recent_apps: Vec::new(),
                 app_clip_limits: HashMap::new(),
@@ -3311,7 +3316,7 @@ impl Window {
                         .and_then(|t| t.session_name())
                         .unwrap_or_default()
                         .to_owned();
-                    self.queued.push(Command::TmuxCrowded {
+                    self.queued.push(Command::TmuxCrowded(CrowdedOffer {
                         gateway,
                         host: self.key_host(gateway).unwrap_or_default(),
                         name,
@@ -3319,7 +3324,7 @@ impl Window {
                         have,
                         want,
                         others,
-                    });
+                    }));
                 }
                 tmux::Action::Notice(text) => {
                     let text = crate::ssh::sanitize(&text);
@@ -15825,6 +15830,21 @@ enum BrokerFor {
     Agent(crate::agent_fwd::For),
 }
 
+/// Other tmux clients keep a gateway's windows small: the question to
+/// ask, kept while another dialog is open.
+#[derive(Debug, Clone)]
+struct CrowdedOffer {
+    gateway: PaneId,
+    /// The tmux session asked about, its name and its host, for the
+    /// question (it may be another tab's connection).
+    session: ferossh_tmuxcc::SessionId,
+    name: String,
+    host: String,
+    have: (u16, u16),
+    want: (u16, u16),
+    others: u32,
+}
+
 enum Command {
     Id(u32),
     /// Window > Workspaces > Save layout as workspace: asks for a name.
@@ -15928,17 +15948,7 @@ enum Command {
     },
     /// Other tmux clients keep gateway `gateway`'s windows small: offer
     /// to detach them.
-    TmuxCrowded {
-        gateway: PaneId,
-        /// The tmux session asked about, its name and its host, for the
-        /// question (it may be another tab's connection).
-        session: ferossh_tmuxcc::SessionId,
-        name: String,
-        host: String,
-        have: (u16, u16),
-        want: (u16, u16),
-        others: u32,
-    },
+    TmuxCrowded(CrowdedOffer),
     /// A menu of tmux sessions to switch gateway `gateway`'s client to.
     TmuxPicker {
         gateway: PaneId,
@@ -17327,15 +17337,23 @@ fn run_command(hwnd: HWND, command: Command) {
                 files_panel::local_deleted(problem);
             }
         }
-        Command::TmuxCrowded {
-            gateway,
-            session,
-            name,
-            host,
-            have,
-            want,
-            others,
-        } => {
+        Command::TmuxCrowded(offer) => {
+            if DIALOG_OPEN.get() {
+                // Another dialog is open: ask once it has closed.
+                with_window(|w| w.crowded_waiting = Some(offer));
+                // SAFETY: our window; replaces any earlier timer with this id.
+                unsafe { SetTimer(Some(hwnd), TIMER_CROWDED, 500, None) };
+                return;
+            }
+            let CrowdedOffer {
+                gateway,
+                session,
+                ref name,
+                ref host,
+                have,
+                want,
+                others,
+            } = offer;
             // Queued output can switch or end the session before this
             // runs: ask only about the session still attached.
             let current = with_window(|w| w.tmux.get(&gateway).and_then(|t| t.session_id()));
@@ -17354,8 +17372,8 @@ fn run_command(hwnd: HWND, command: Command) {
                  Often it is a client left behind by a dropped connection.\n\n\
                  Detach the other clients of this session? (Later: Session > tmux > \
                  Detach other clients.)",
-                crate::ssh::sanitize(&name),
-                crate::ssh::sanitize(&host),
+                crate::ssh::sanitize(name),
+                crate::ssh::sanitize(host),
                 have.0,
                 have.1,
                 want.0,
@@ -17365,15 +17383,13 @@ fn run_command(hwnd: HWND, command: Command) {
                 Some(IDYES) => {
                     with_window(|w| w.detach_other_tmux(gateway, session));
                 }
-                // Another dialog was open: ask at the next size change.
-                None => {
-                    with_window(|w| {
-                        if let Some(t) = w.tmux.get_mut(&gateway) {
-                            t.ask_crowded_again();
-                        }
-                    });
-                }
                 Some(_) => {}
+                // Another dialog opened meanwhile: ask once it has closed.
+                None => {
+                    with_window(|w| w.crowded_waiting = Some(offer.clone()));
+                    // SAFETY: our window; replaces any earlier timer.
+                    unsafe { SetTimer(Some(hwnd), TIMER_CROWDED, 500, None) };
+                }
             }
         }
         Command::TmuxPicker { gateway, names } => {
@@ -18827,6 +18843,13 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
             WM_SHELL_OUTPUT => {
                 if let Some(commands) = with_window(Window::on_output) {
                     run_commands(hwnd, commands);
+                }
+                LRESULT(0)
+            }
+            WM_TIMER if wparam.0 == TIMER_CROWDED => {
+                let _ = KillTimer(Some(hwnd), TIMER_CROWDED);
+                if let Some(offer) = with_window(|w| w.crowded_waiting.take()).flatten() {
+                    run_command(hwnd, Command::TmuxCrowded(offer));
                 }
                 LRESULT(0)
             }
