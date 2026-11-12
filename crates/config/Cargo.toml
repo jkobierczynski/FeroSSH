@@ -9,13 +9,19 @@ repository.workspace = true
 publish.workspace = true
 
 [dependencies]
+# Argon2id stretches the passphrase of an encrypted connections file or
+# vault (`sealed`); ssh-key already brings this crate into the exe.
+argon2 = { version = "0.6", default-features = false, features = ["alloc"] }
 base64ct = { version = "1.8", features = ["alloc"] }
 getrandom = "0.4"
 # HMAC-SHA1 is what OpenSSH's hashed known_hosts names use; it is not an
 # SSH algorithm and never reaches the wire.
 hmac = "0.13"
+# ChaCha20-Poly1305 for the encrypted file; ring is in the exe for SSH.
+ring = "0.17"
 russh.workspace = true
 sha1 = "0.11"
+zeroize = "1"
 
 [lints]
 workspace = true

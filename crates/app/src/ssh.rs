@@ -171,8 +171,9 @@ fn env_for(cfg: &ssh_config::HostConfig, vars: &[(String, String)]) -> Vec<(Stri
 }
 
 impl Env {
+    /// `~/.ssh/known_hosts`, or the portable data folder's.
     pub fn known_hosts(&self) -> PathBuf {
-        self.home.join(".ssh").join("known_hosts")
+        crate::portable::known_hosts().unwrap_or_else(|| self.home.join(".ssh").join("known_hosts"))
     }
 }
 

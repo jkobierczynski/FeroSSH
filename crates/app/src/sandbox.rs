@@ -56,7 +56,7 @@ use windows::Win32::Security::Authorization::{
     SetNamedSecurityInfoW, TRUSTEE_IS_SID, TRUSTEE_IS_WELL_KNOWN_GROUP, TRUSTEE_W,
 };
 use windows::Win32::Security::Isolation::{
-    CreateAppContainerProfile, DeriveAppContainerSidFromAppContainerName,
+    CreateAppContainerProfile, DeleteAppContainerProfile, DeriveAppContainerSidFromAppContainerName,
 };
 use windows::Win32::Security::{
     ACL, CreateWellKnownSid, DACL_SECURITY_INFORMATION, FreeSid, NO_INHERITANCE,
@@ -324,6 +324,23 @@ impl Worker {
             cfg: on(ProcessControlFlowGuardPolicy),
             shadow_stacks: on(ProcessUserShadowStackPolicy),
         }
+    }
+}
+
+/// Removes FeroSSH's AppContainer profiles from this Windows account
+/// (a portable FeroSSH does this as it quits, so the PC keeps none).
+/// Windows makes them again the next time they are needed.
+pub fn forget_profiles() {
+    let kinds = [
+        Kind::Worker,
+        #[cfg(feature = "viewer")]
+        Kind::Viewer,
+        Kind::Stream,
+    ];
+    for kind in kinds {
+        // SAFETY: a constant name; a missing profile is no error worth
+        // reporting.
+        let _ = unsafe { DeleteAppContainerProfile(kind.profile().0) };
     }
 }
 

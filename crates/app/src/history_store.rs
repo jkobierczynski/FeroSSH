@@ -1,5 +1,6 @@
 //! Command history on disk: one file per host in
-//! `%LOCALAPPDATA%\FeroSSH\history` (on this PC only, never roamed),
+//! `%LOCALAPPDATA%\FeroSSH\history` (on this PC only, never roamed; in
+//! the data folder when FeroSSH is portable),
 //! encrypted with DPAPI under the user's Windows sign-in, so another
 //! account on the PC, or the file copied elsewhere, reads nothing. The
 //! file name is a hash of the host, so a listing does not name hosts.
@@ -24,7 +25,7 @@ const ENTROPY: &[u8] = b"FeroSSH command history";
 
 /// The folder the histories are kept in.
 pub fn dir() -> Option<PathBuf> {
-    std::env::var_os("LOCALAPPDATA").map(|d| PathBuf::from(d).join("FeroSSH").join("history"))
+    crate::portable::local_dir().map(|d| d.join("history"))
 }
 
 fn file(key: &str) -> Option<PathBuf> {

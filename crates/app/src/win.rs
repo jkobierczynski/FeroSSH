@@ -90,19 +90,19 @@ use windows::Win32::UI::WindowsAndMessaging::{
     IDCANCEL, IDOK, IDYES, IsChild, IsIconic, IsWindowVisible, KillTimer, LoadCursorW, LoadIconW,
     MB_DEFBUTTON2, MB_ICONERROR, MB_ICONINFORMATION, MB_ICONQUESTION, MB_ICONWARNING, MB_OK,
     MB_OKCANCEL, MB_YESNO, MB_YESNOCANCEL, MESSAGEBOX_RESULT, MESSAGEBOX_STYLE, MF_BYCOMMAND,
-    MF_BYPOSITION, MF_CHECKED, MF_DISABLED, MF_GRAYED, MF_MENUBARBREAK, MF_POPUP, MF_SEPARATOR,
-    MF_STRING, MF_UNCHECKED, MSG, MessageBoxW, ModifyMenuW, PM_REMOVE, PeekMessageW, PostMessageW,
-    PostQuitMessage, RegisterClassW, SIZE_MINIMIZED, SW_HIDE, SW_RESTORE, SW_SHOW, SW_SHOWNORMAL,
-    SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOOWNERZORDER, SWP_NOSIZE, SWP_NOZORDER,
-    SetCursor, SetForegroundWindow, SetMenu, SetTimer, SetWindowLongPtrW, SetWindowPlacement,
-    SetWindowPos, SetWindowTextW, ShowWindow, TPM_NONOTIFY, TPM_RETURNCMD, TrackPopupMenu,
-    TranslateMessage, WINDOW_EX_STYLE, WINDOW_STYLE, WINDOWPLACEMENT, WM_APP, WM_CHAR,
-    WM_CLIPBOARDUPDATE, WM_CLOSE, WM_COMMAND, WM_DEADCHAR, WM_DESTROY, WM_DPICHANGED, WM_DROPFILES,
-    WM_ERASEBKGND, WM_EXITMENULOOP, WM_GETDPISCALEDSIZE, WM_HOTKEY, WM_IME_COMPOSITION,
-    WM_IME_STARTCOMPOSITION, WM_KEYDOWN, WM_KEYUP, WM_KILLFOCUS, WM_LBUTTONDOWN, WM_LBUTTONUP,
-    WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_PAINT, WM_RBUTTONDOWN,
-    WM_RBUTTONUP, WM_SETCURSOR, WM_SETFOCUS, WM_SETTINGCHANGE, WM_SIZE, WM_SYSCHAR,
-    WM_SYSCOLORCHANGE, WM_SYSDEADCHAR, WM_SYSKEYDOWN, WM_SYSKEYUP, WM_TIMER, WNDCLASSW,
+    MF_BYPOSITION, MF_CHECKED, MF_DISABLED, MF_ENABLED, MF_GRAYED, MF_MENUBARBREAK, MF_POPUP,
+    MF_SEPARATOR, MF_STRING, MF_UNCHECKED, MSG, MessageBoxW, ModifyMenuW, PM_REMOVE, PeekMessageW,
+    PostMessageW, PostQuitMessage, RegisterClassW, SIZE_MINIMIZED, SW_HIDE, SW_RESTORE, SW_SHOW,
+    SW_SHOWNORMAL, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOOWNERZORDER, SWP_NOSIZE,
+    SWP_NOZORDER, SetCursor, SetForegroundWindow, SetMenu, SetTimer, SetWindowLongPtrW,
+    SetWindowPlacement, SetWindowPos, SetWindowTextW, ShowWindow, TPM_NONOTIFY, TPM_RETURNCMD,
+    TrackPopupMenu, TranslateMessage, WINDOW_EX_STYLE, WINDOW_STYLE, WINDOWPLACEMENT, WM_APP,
+    WM_CHAR, WM_CLIPBOARDUPDATE, WM_CLOSE, WM_COMMAND, WM_DEADCHAR, WM_DESTROY, WM_DPICHANGED,
+    WM_DROPFILES, WM_ERASEBKGND, WM_EXITMENULOOP, WM_GETDPISCALEDSIZE, WM_HOTKEY,
+    WM_IME_COMPOSITION, WM_IME_STARTCOMPOSITION, WM_KEYDOWN, WM_KEYUP, WM_KILLFOCUS,
+    WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL,
+    WM_PAINT, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SETCURSOR, WM_SETFOCUS, WM_SETTINGCHANGE, WM_SIZE,
+    WM_SYSCHAR, WM_SYSCOLORCHANGE, WM_SYSDEADCHAR, WM_SYSKEYDOWN, WM_SYSKEYUP, WM_TIMER, WNDCLASSW,
     WS_CLIPCHILDREN, WS_EX_APPWINDOW, WS_OVERLAPPEDWINDOW,
 };
 use windows::Win32::UI::WindowsAndMessaging::{DeleteMenu, ShowWindowAsync, WM_INITMENUPOPUP};
@@ -357,6 +357,16 @@ mod cmd {
     pub const DOWNLOADS: u32 = 109;
     pub const AUTO_RECONNECT: u32 = 110;
     pub const IMPORT_SNIPPETS: u32 = 111;
+    /// File > Export connections (an encrypted file).
+    pub const EXPORT: u32 = 112;
+    /// File > Import encrypted connections.
+    pub const IMPORT_SEALED: u32 = 113;
+    /// File > Master password > Set, Use a vault file, Move, Change, Remove.
+    pub const VAULT_SET: u32 = 114;
+    pub const VAULT_USE: u32 = 115;
+    pub const VAULT_MOVE: u32 = 116;
+    pub const VAULT_CHANGE: u32 = 117;
+    pub const VAULT_REMOVE: u32 = 118;
     pub const ZOOM_IN: u32 = 200;
     pub const ZOOM_OUT: u32 = 201;
     pub const ZOOM_RESET: u32 = 202;
@@ -1198,14 +1208,30 @@ fn with_window<R>(f: impl FnOnce(&mut Window) -> R) -> Option<R> {
     })
 }
 
+#[path = "vault_ui.rs"]
+mod vault_ui;
+
 pub fn run(launch: Launch, theme: Option<String>) -> Result<()> {
+    if !vault_ui::unlock_at_start() {
+        return Ok(());
+    }
     let result = create_and_run(launch, theme);
+    if crate::portable::is_portable() {
+        // Leave nothing of FeroSSH's sandbox on a PC it ran on portable.
+        crate::sandbox::forget_profiles();
+    }
     if let Err(e) = &result {
         let text = HSTRING::from(format!("FeroSSH could not start:\n\n{}", e.message()));
         // SAFETY: plain message box with valid strings.
         unsafe { MessageBoxW(None, &text, w!("FeroSSH"), MB_OK | MB_ICONERROR) };
     }
     result
+}
+
+/// A message box with no window under it (before the main one exists).
+fn message(text: &str, style: MESSAGEBOX_STYLE) -> Option<MESSAGEBOX_RESULT> {
+    // SAFETY: plain message box with valid strings.
+    Some(unsafe { MessageBoxW(None, &HSTRING::from(text), w!("FeroSSH"), style) })
 }
 
 /// A command line FeroSSH does not understand.
@@ -1252,11 +1278,16 @@ fn home() -> PathBuf {
     std::env::var_os("USERPROFILE").map_or_else(|| PathBuf::from("."), PathBuf::from)
 }
 
-/// FeroSSH's own folder for settings: `%APPDATA%\FeroSSH`.
+/// FeroSSH's own folder for settings: `%APPDATA%\FeroSSH`, or the
+/// data folder of a portable FeroSSH.
 fn app_dir() -> PathBuf {
-    std::env::var_os("APPDATA")
-        .map_or_else(|| PathBuf::from("."), PathBuf::from)
-        .join("FeroSSH")
+    crate::portable::app_dir()
+}
+
+/// FeroSSH's folder for what stays on this PC: `%LOCALAPPDATA%\FeroSSH`,
+/// or `local` in a portable FeroSSH's data folder.
+fn local_dir() -> PathBuf {
+    crate::portable::local_dir().unwrap_or_else(|| PathBuf::from(".").join("FeroSSH"))
 }
 
 fn settings_path() -> PathBuf {
@@ -1275,8 +1306,32 @@ fn sessions_path() -> PathBuf {
     app_dir().join("sessions.conf")
 }
 
+/// The name of a file the master password vault holds instead of the
+/// disk: FeroSSH's settings and connection files in its own folder.
+fn vaulted_name(path: &Path) -> Option<String> {
+    if path.parent() != Some(app_dir().as_path()) {
+        return None;
+    }
+    let name = path.file_name()?.to_str()?;
+    let kept = name == "ferossh.conf"
+        || name == "sessions.conf"
+        || Client::ALL.iter().any(|c| c.file_name() == name);
+    kept.then(|| name.to_owned())
+}
+
+/// Reads one of FeroSSH's files: from the vault when it holds it, else
+/// from disk.
+fn app_read(path: &Path) -> std::io::Result<String> {
+    if crate::vault::is_open()
+        && let Some(name) = vaulted_name(path)
+    {
+        return crate::vault::read(&name).ok_or_else(|| std::io::ErrorKind::NotFound.into());
+    }
+    std::fs::read_to_string(path)
+}
+
 fn load_saved() -> Vec<SavedHost> {
-    std::fs::read_to_string(sessions_path())
+    app_read(&sessions_path())
         .map(|t| saved::parse(&t))
         .unwrap_or_default()
 }
@@ -1286,13 +1341,13 @@ fn load_saved() -> Vec<SavedHost> {
 fn ssh_env() -> Env {
     let home = home();
     let mut config = std::fs::read_to_string(home.join(".ssh").join("config")).unwrap_or_default();
-    if let Ok(made) = std::fs::read_to_string(sessions_path()) {
+    if let Ok(made) = app_read(&sessions_path()) {
         // A Host line first: the user's last block must not swallow it.
         config.push_str("\nHost !*\n");
         config.push_str(&made);
     }
     for client in Client::ALL {
-        if let Ok(imported) = std::fs::read_to_string(imported_path(client)) {
+        if let Ok(imported) = app_read(&imported_path(client)) {
             // A Host line first: the user's last block must not swallow it.
             config.push_str("\nHost !*\n");
             config.push_str(&imported);
@@ -1311,8 +1366,11 @@ fn ssh_env() -> Env {
 }
 
 fn load_settings() -> Settings {
-    std::fs::read_to_string(settings_path())
-        .map(|t| Settings::parse(&t))
+    app_read(&settings_path())
+        .map(|t| {
+            vault_ui::note_settings(&t);
+            Settings::parse(&t)
+        })
         .unwrap_or_default()
 }
 
@@ -1346,8 +1404,13 @@ fn load_snippets(settings: &mut Settings) {
 }
 
 /// Writes a file in FeroSSH's folder through a temporary file, so a crash
-/// never leaves half a file.
+/// never leaves half a file; into the vault instead when it holds it.
 fn write_app_file(path: &std::path::Path, text: &str) -> std::io::Result<()> {
+    if crate::vault::is_open()
+        && let Some(name) = vaulted_name(path)
+    {
+        return crate::vault::write(&name, text).map_err(std::io::Error::other);
+    }
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)?;
     }
@@ -1423,10 +1486,7 @@ fn host_items(env: &Env, settings: &Settings) -> Vec<HostItem> {
 /// that may be copied or shared, so a settings file from elsewhere cannot
 /// run a command without asking.
 fn approved_commands_path() -> PathBuf {
-    std::env::var_os("LOCALAPPDATA")
-        .map_or_else(|| PathBuf::from("."), PathBuf::from)
-        .join("FeroSSH")
-        .join("approved-password-commands.txt")
+    local_dir().join("approved-password-commands.txt")
 }
 
 fn command_approved(line: &str) -> bool {
@@ -1448,10 +1508,7 @@ fn approve_command(line: &str) {
 /// The `ProxyCommand` lines the user allowed, one per line, beside the
 /// password commands: on this PC only.
 fn approved_proxies_path() -> PathBuf {
-    std::env::var_os("LOCALAPPDATA")
-        .map_or_else(|| PathBuf::from("."), PathBuf::from)
-        .join("FeroSSH")
-        .join("approved-proxy-commands.txt")
+    local_dir().join("approved-proxy-commands.txt")
 }
 
 fn proxy_approved(line: &str) -> bool {
@@ -1577,12 +1634,10 @@ fn check_log(path: &Path) -> (String, bool) {
     (text, ok)
 }
 
-/// Where tab logs go: `%LOCALAPPDATA%\FeroSSH\logs`.
+/// Where tab logs go: `%LOCALAPPDATA%\FeroSSH\logs` (portable: in the
+/// data folder).
 fn log_dir() -> PathBuf {
-    std::env::var_os("LOCALAPPDATA")
-        .map_or_else(|| PathBuf::from("."), PathBuf::from)
-        .join("FeroSSH")
-        .join("logs")
+    local_dir().join("logs")
 }
 
 /// The local time as (year, month, day, hour, minute, second).
@@ -1986,6 +2041,16 @@ fn build_menu() -> Result<HMENU> {
         item(file, cmd::LOCAL_SHELL, "Open &local shell")?;
         item(file, cmd::IMPORT, "&Import connections...")?;
         item(file, cmd::IMPORT_SNIPPETS, "Import sc&ripts...")?;
+        separator(file)?;
+        item(file, cmd::EXPORT, "Expor&t connections...")?;
+        item(file, cmd::IMPORT_SEALED, "Import encr&ypted connections...")?;
+        let vault = CreatePopupMenu()?;
+        item(vault, cmd::VAULT_SET, "&Set a master password...")?;
+        item(vault, cmd::VAULT_USE, "&Use a vault file...")?;
+        item(vault, cmd::VAULT_MOVE, "&Move the vault file...")?;
+        item(vault, cmd::VAULT_CHANGE, "&Change master password...")?;
+        item(vault, cmd::VAULT_REMOVE, "&Remove master password...")?;
+        AppendMenuW(file, MF_POPUP, vault.0 as usize, w!("&Master password"))?;
         separator(file)?;
         item(file, cmd::EXIT, "E&xit\tAlt+F4")?;
 
@@ -11980,7 +12045,13 @@ impl Window {
     }
 
     fn save_settings(&mut self) {
-        if let Err(e) = write_app_file(&settings_path(), &self.settings.to_text()) {
+        vault_ui::sync_settings(&mut self.settings);
+        let text = self.settings.to_text();
+        let written = write_app_file(&settings_path(), &text);
+        if written.is_ok() {
+            vault_ui::note_settings(&text);
+        }
+        if let Err(e) = written {
             let id = self.focused_id();
             self.show(
                 id,
@@ -12126,6 +12197,13 @@ impl Window {
             }
             cmd::REPLACE_KEY => return Some(Command::ReplaceHostKey),
             cmd::NEW_KEY => return Some(Command::NewKey),
+            cmd::EXPORT
+            | cmd::IMPORT_SEALED
+            | cmd::VAULT_SET
+            | cmd::VAULT_USE
+            | cmd::VAULT_MOVE
+            | cmd::VAULT_CHANGE
+            | cmd::VAULT_REMOVE => return Some(Command::Vault(id)),
             cmd::COPY_ID => {
                 return Some(match self.key_host(pane) {
                     Some(host) => Command::CopyKey { pane, host },
@@ -12846,6 +12924,20 @@ impl Window {
             }
         }
         self.update_standby_menu();
+        let open = crate::vault::is_open();
+        let grey = |on: bool| if on { MF_ENABLED } else { MF_GRAYED };
+        // SAFETY: valid menu handle; ids are ours.
+        unsafe {
+            for (id, on) in [
+                (cmd::VAULT_SET, !open),
+                (cmd::VAULT_USE, !open),
+                (cmd::VAULT_MOVE, open),
+                (cmd::VAULT_CHANGE, open),
+                (cmd::VAULT_REMOVE, open),
+            ] {
+                let _ = EnableMenuItem(self.menu, id, MF_BYCOMMAND | grey(on));
+            }
+        }
     }
 
     /// The hotkey the standby window uses (or would use).
@@ -14221,6 +14313,9 @@ enum Command {
     Id(u32),
     /// Tools > New SSH key: the window that asks what to make.
     NewKey,
+    /// File > Export connections, Import encrypted connections and the
+    /// Master password items, by menu id.
+    Vault(u32),
     /// The new key is made, or why not; `host` is what the pane it was
     /// asked from is logged in to, to offer copying it there.
     KeyMade {
@@ -14762,7 +14857,7 @@ fn pick_file(hwnd: HWND, title: PCWSTR, dir: &std::path::Path) -> Option<PathBuf
 /// user knows it.
 fn host_file(host: &str) -> String {
     let imported = Client::ALL.into_iter().find(|&c| {
-        std::fs::read_to_string(imported_path(c)).is_ok_and(|t| {
+        app_read(&imported_path(c)).is_ok_and(|t| {
             ssh_config::hosts(&t, &ssh_config::NoIncludes)
                 .iter()
                 .any(|h| h.name.eq_ignore_ascii_case(host))
@@ -15472,6 +15567,15 @@ fn run_command(hwnd: HWND, command: Command) {
         }
         Command::ReplaceHostKey => replace_host_key(hwnd),
         Command::NewKey => new_key(hwnd),
+        Command::Vault(id) => match id {
+            cmd::EXPORT => vault_ui::export(hwnd),
+            cmd::IMPORT_SEALED => vault_ui::import(hwnd),
+            cmd::VAULT_SET => vault_ui::set(hwnd),
+            cmd::VAULT_USE => vault_ui::use_file(hwnd),
+            cmd::VAULT_MOVE => vault_ui::move_file(hwnd),
+            cmd::VAULT_CHANGE => vault_ui::change(hwnd),
+            _ => vault_ui::remove(hwnd),
+        },
         Command::KeyMade {
             path,
             result,
@@ -15963,7 +16067,7 @@ fn taken_aliases(client: Client) -> Vec<String> {
             .map(|h| h.alias.to_ascii_lowercase()),
     );
     for other in Client::ALL.into_iter().filter(|&c| c != client) {
-        if let Ok(text) = std::fs::read_to_string(imported_path(other)) {
+        if let Ok(text) = app_read(&imported_path(other)) {
             taken.extend(
                 ssh_config::hosts(&text, &ssh_config::NoIncludes)
                     .into_iter()

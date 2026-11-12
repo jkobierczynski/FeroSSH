@@ -61,9 +61,8 @@ pub fn check() -> Outcome {
 
 /// When the last automatic check ran: `%LOCALAPPDATA%\FeroSSH\last-update-check`.
 fn stamp_path() -> PathBuf {
-    std::env::var_os("LOCALAPPDATA")
-        .map_or_else(|| PathBuf::from("."), PathBuf::from)
-        .join("FeroSSH")
+    crate::portable::local_dir()
+        .unwrap_or_else(|| PathBuf::from(".").join("FeroSSH"))
         .join("last-update-check")
 }
 

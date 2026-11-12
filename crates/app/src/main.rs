@@ -55,6 +55,8 @@ mod live_panel;
 #[cfg(windows)]
 mod native;
 #[cfg(windows)]
+mod passphrase_view;
+#[cfg(windows)]
 mod script_args;
 #[cfg(windows)]
 mod script_editor;
@@ -103,6 +105,8 @@ mod newkey;
 mod palette;
 #[cfg_attr(not(windows), allow(dead_code))]
 mod pattern;
+#[cfg_attr(not(windows), allow(dead_code))]
+mod portable;
 #[cfg_attr(not(windows), allow(dead_code))]
 mod program;
 #[cfg_attr(not(windows), allow(dead_code))]
@@ -161,6 +165,8 @@ mod ui_colours;
 mod ui_theme;
 #[cfg(windows)]
 mod update;
+#[cfg_attr(not(windows), allow(dead_code))]
+mod vault;
 #[cfg_attr(not(windows), allow(dead_code))]
 mod vdesk;
 #[cfg(windows)]

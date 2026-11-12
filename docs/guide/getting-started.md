@@ -9,7 +9,7 @@ Every release on the [Releases page](https://github.com/jkobierczynski/FeroSSH/r
 | `ferossh.exe` | You want an SSH client. This is the one most people want. |
 | `ferossh-desktop.exe` | You also want to see Linux desktops (RDP or VNC) inside a FeroSSH tab. It is the same client plus a sandboxed desktop viewer, and about 2.6 MB larger. |
 
-There is no installer. Put the exe wherever you like, for example `%LOCALAPPDATA%\Programs\FeroSSH`, and pin it to the Start menu or taskbar. It runs on Windows 10 1903 or later and Windows 11, on x64.
+There is no installer. Put the exe wherever you like, for example `%LOCALAPPDATA%\Programs\FeroSSH`, and pin it to the Start menu or taskbar. It runs on Windows 10 1903 or later and Windows 11, on x64. To carry it on a USB stick, make a folder named `FeroSSH-data` next to the exe: FeroSSH then keeps everything in that folder (see [Portable use](everyday-use.md#portable-use)).
 
 Before you run a download, you can check that it is the one the project built: see [Verifying a download](verifying-downloads.md).
 
