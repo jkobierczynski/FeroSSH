@@ -382,7 +382,9 @@ pub fn merge_hosts(local: &str, incoming: &str) -> (String, Merged) {
         // A blank line between blocks, so comments at the end of one
         // stay with it rather than with the next.
         let last_blank = out.lines().last().is_some_and(|l| l.trim().is_empty());
-        if !out.is_empty() && !last_blank && !b.text.lines().next().is_some_and(|l| l.trim().is_empty())
+        if !out.is_empty()
+            && !last_blank
+            && !b.text.lines().next().is_some_and(|l| l.trim().is_empty())
         {
             out.push('\n');
         }
