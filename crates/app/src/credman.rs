@@ -63,7 +63,10 @@ pub fn write(target: &str, user: &str, password: &str) -> Result<(), String> {
 /// Forgets the password under `target`, in the vault and here.
 pub fn delete(target: &str) {
     crate::vault::delete_secret(target);
-    os_delete(target);
+    // The PC's own passwords are not a portable FeroSSH's to delete.
+    if !crate::portable::is_portable() {
+        os_delete(target);
+    }
 }
 
 /// The password under `target` in the Credential Manager alone.

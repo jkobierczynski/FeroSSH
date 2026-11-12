@@ -64,22 +64,31 @@ fn connection_files() -> Vec<(String, PathBuf)> {
     out
 }
 
-/// What the connection files hold now.
-fn connection_bundle() -> Bundle {
+/// What the connection files hold now. An error when one is there but
+/// cannot be read, so nothing goes on to delete it unread.
+fn connection_bundle() -> Result<Bundle, String> {
     let mut b = Bundle::default();
     for (name, path) in connection_files() {
-        if let Ok(text) = app_read(&path) {
-            b.set_file(&name, text);
+        match app_read(&path) {
+            Ok(text) => b.set_file(&name, text),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(format!("Could not read {}: {e}", path.display())),
         }
     }
-    b
+    Ok(b)
 }
 
 /// Every saved password: the vault's, then the Credential Manager's
-/// that the vault has not.
+/// that the vault has not (not on a portable FeroSSH: those are the
+/// PC's, not its own).
 fn all_secrets() -> Vec<Secret> {
     let mut out = vault::secrets();
-    for s in credman::os_list() {
+    let os = if crate::portable::is_portable() {
+        Vec::new()
+    } else {
+        credman::os_list()
+    };
+    for s in os {
         if !out.iter().any(|o| o.target == s.target) {
             out.push(s);
         }
@@ -254,7 +263,13 @@ fn open_sealed(hwnd: HWND, path: &Path, text: &str, title: &str) -> Option<Bundl
 
 /// File > Export connections: a passphrase, the file, and the export.
 pub(super) fn export(hwnd: HWND) {
-    let mut b = connection_bundle();
+    let mut b = match connection_bundle() {
+        Ok(b) => b,
+        Err(e) => {
+            dialog(hwnd, &e, MB_OK | MB_ICONERROR);
+            return;
+        }
+    };
     let hosts = host_count(&b);
     let profiles = b
         .file("ferossh.conf")
@@ -430,6 +445,13 @@ pub(super) fn import(hwnd: HWND) {
     if dialog(hwnd, &question, MB_YESNO | MB_ICONINFORMATION) != Some(IDYES) {
         return;
     }
+    // Merged again with the files and settings as they are now: another
+    // PC (through a shared vault) may have changed them while the
+    // question was open.
+    let Some(current) = with_window(|w| w.settings.clone()) else {
+        return;
+    };
+    let plan = self::plan(&incoming, &current);
     let mut problems = Vec::new();
     for (p, t) in &plan.files {
         if let Err(e) = write_app_file(p, t) {
@@ -488,11 +510,22 @@ pub(super) fn import(hwnd: HWND) {
 const FORGOTTEN: &str = "There is no way to recover a forgotten master password, so keep an \
                          export (File > Export connections) somewhere safe as well.";
 
-/// Removes the plain connection files the vault now holds.
-fn remove_plain_files() {
+/// Removes the plain connection files the vault now holds; a line for
+/// each that is still there.
+fn remove_plain_files() -> Vec<String> {
+    let mut left = Vec::new();
     for (_, path) in connection_files() {
-        let _ = std::fs::remove_file(&path);
+        match std::fs::remove_file(&path) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => left.push(format!(
+                "{} could not be deleted ({e}) and is still readable without the master \
+                 password: delete it by hand.",
+                path.display()
+            )),
+        }
     }
+    left
 }
 
 /// Master password > Set a master password: a new vault in FeroSSH's
@@ -543,7 +576,17 @@ pub(super) fn set(hwnd: HWND) {
     ) else {
         return;
     };
-    let mut b = connection_bundle();
+    let mut b = match connection_bundle() {
+        Ok(b) => b,
+        Err(e) => {
+            dialog(
+                hwnd,
+                &format!("No vault was made: {e}"),
+                MB_OK | MB_ICONERROR,
+            );
+            return;
+        }
+    };
     let moved = answer.option && !os_secrets.is_empty();
     if moved {
         b.secrets = os_secrets;
@@ -557,7 +600,19 @@ pub(super) fn set(hwnd: HWND) {
         );
         return;
     }
-    remove_plain_files();
+    // A pointer to another vault (one missing at this start) would be
+    // followed at the next start instead of this new one.
+    if let Err(e) = set_pointer(&path) {
+        vault::close();
+        let _ = std::fs::remove_file(&path);
+        dialog(
+            hwnd,
+            &format!("No vault was made: FeroSSH could not forget the vault it used before ({e})."),
+            MB_OK | MB_ICONERROR,
+        );
+        return;
+    }
+    let left = remove_plain_files();
     if moved {
         for s in &b.secrets {
             credman::os_delete(&s.target);
@@ -576,6 +631,10 @@ pub(super) fn set(hwnd: HWND) {
         ));
     }
     text.push_str("\n\nTo share it between PCs, use Master password > Move the vault file to put it in a OneDrive folder.");
+    for l in left.iter().take(4) {
+        text.push_str("\n\n");
+        text.push_str(l);
+    }
     dialog(hwnd, &text, MB_OK | MB_ICONINFORMATION);
 }
 
@@ -747,7 +806,13 @@ pub(super) fn use_file(hwnd: HWND) {
         plural(os_secrets.len(), "saved password", "saved passwords")
     );
     // This PC's files, read before the vault takes over the reads.
-    let mine = connection_bundle();
+    let mine = match connection_bundle() {
+        Ok(b) => b,
+        Err(e) => {
+            dialog(hwnd, &e, MB_OK | MB_ICONERROR);
+            return;
+        }
+    };
     let mut problem: Option<String> = None;
     let answer = loop {
         let Some(answer) = ask(
@@ -832,7 +897,7 @@ pub(super) fn use_file(hwnd: HWND) {
                 }
             }
         }
-        remove_plain_files();
+        notes.extend(remove_plain_files());
         let mut text = format!(
             "FeroSSH now uses the vault {}, with this PC's connections added. It asks for its \
              master password when it starts.",

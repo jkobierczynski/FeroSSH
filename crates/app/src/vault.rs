@@ -45,7 +45,46 @@ fn with<T>(f: impl FnOnce(&mut Option<Vault>) -> T) -> T {
     let mut guard = VAULT
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
+    // Other FeroSSH processes on this PC wait too, so a read, change and
+    // write of the vault never interleaves with theirs. (Other PCs, via a
+    // sync client, cannot be locked out: there the last save wins.)
+    let _lock = ProcessLock::take();
     f(&mut guard)
+}
+
+/// An exclusive open of `vault.lock` in FeroSSH's local folder, which
+/// every FeroSSH process takes the same way; released when dropped. None
+/// when it cannot be had within a second (the work goes on unlocked
+/// rather than hang).
+struct ProcessLock(#[allow(dead_code)] std::fs::File);
+
+impl ProcessLock {
+    #[cfg(windows)]
+    fn take() -> Option<Self> {
+        use std::os::windows::fs::OpenOptionsExt;
+        let dir = crate::portable::local_dir()?;
+        std::fs::create_dir_all(&dir).ok()?;
+        let path = dir.join("vault.lock");
+        for _ in 0..100 {
+            if let Ok(f) = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .share_mode(0)
+                .open(&path)
+            {
+                return Some(Self(f));
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        None
+    }
+
+    #[cfg(not(windows))]
+    fn take() -> Option<Self> {
+        None
+    }
 }
 
 fn stamp(path: &Path) -> Option<(u64, SystemTime)> {
@@ -59,11 +98,26 @@ fn write_file(path: &Path, text: &str) -> std::io::Result<()> {
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)?;
     }
+    // A name of this write's own, made new: two writers never share one.
+    static COUNT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    let n = COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let mut tmp = path.as_os_str().to_owned();
-    tmp.push(".tmp");
+    tmp.push(format!(".{}-{n}.tmp", std::process::id()));
     let tmp = PathBuf::from(tmp);
-    std::fs::write(&tmp, text)?;
-    std::fs::rename(&tmp, path)
+    let written = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&tmp)
+        .and_then(|mut f| {
+            use std::io::Write;
+            f.write_all(text.as_bytes())?;
+            f.sync_all()
+        })
+        .and_then(|()| std::fs::rename(&tmp, path));
+    if written.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    written
 }
 
 impl Vault {
