@@ -269,8 +269,9 @@ pub fn fuzz_stream(data: &[u8], step: usize) {
         .iter()
         .take(4)
         .map(|b| {
-            // Kept small, so the answer stays within one message.
-            let b = b.get(..b.len().min(MAX_MESSAGE / 16)).unwrap_or_default();
+            // Kept small, so the answer stays within one message even with
+            // each byte of the comment turned into a three-byte U+FFFD.
+            let b = b.get(..b.len().min(MAX_MESSAGE / 32)).unwrap_or_default();
             (b.to_vec(), String::from_utf8_lossy(b).into_owned())
         })
         .collect();
