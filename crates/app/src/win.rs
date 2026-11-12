@@ -6973,6 +6973,15 @@ impl Window {
         };
         let actions = f(&mut run.runner);
         self.script_actions(id, actions);
+        // A hidden pane whose login script asks for a secret shows again.
+        if self.ws.is_hidden(id)
+            && self
+                .scripts
+                .get(&id)
+                .is_some_and(|run| run.runner.prompting())
+        {
+            self.show_hidden(id);
+        }
     }
 
     /// What pane `id`'s host printed, for its login script.
@@ -12769,6 +12778,13 @@ impl Window {
         self.workspace_tmux.remove(&id);
         self.workspace_waiting.forget(id);
         self.release_workspace_panes(id, false);
+        // The last pane in the tabs closing while others are hidden: the
+        // one hidden last shows, so the window and their sessions stay.
+        if self.ws.all_panes() == [id]
+            && let Some(&last) = self.ws.hidden().last()
+        {
+            self.ws.show(last);
+        }
         if self.ws.forget_hidden(id) {
             // A hidden pane: no tab changes.
             self.end_host(id);

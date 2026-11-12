@@ -13,7 +13,8 @@
 //! focused window. A look is a window's font, text size and colour theme,
 //! each percent-encoded and empty when unset, and the name the user gave
 //! it, when there is one (`look=@1,,,Nord,prod%20db`). A window whose
-//! panes the user hid is listed as `hidden=@5`: it runs on in no tab. The text is only ever ASCII
+//! panes the user hid is listed as `hidden=@5`: it runs on in no tab. A
+//! hidden pane of a window that also shows is listed as `hidden=%7`. The text is only ever ASCII
 //! letters, digits and `%(),./=@`, so it needs no escaping inside tmux's
 //! single quotes. The session's other clients may have written it, so it
 //! is read as untrusted input.
@@ -133,6 +134,8 @@ pub struct Saved {
     pub looks: BTreeMap<WindowId, Look>,
     /// Windows whose panes are hidden: they run on in no tab.
     pub hidden: Vec<WindowId>,
+    /// Hidden panes of windows that also show (tmux pane ids).
+    pub hidden_panes: Vec<u32>,
 }
 
 fn encode(text: &str, out: &mut String) {
@@ -176,6 +179,9 @@ impl Saved {
         // Only when there are some, so older text stays the same.
         for w in &self.hidden {
             let _ = write!(out, " hidden=@{w}");
+        }
+        for p in &self.hidden_panes {
+            let _ = write!(out, " hidden=%{p}");
         }
         for (w, look) in &self.looks {
             let _ = write!(out, " look=@{w},");
@@ -230,10 +236,17 @@ impl Saved {
                     let focus = window(focus)?;
                     saved.tabs.push(Tab { root, focus });
                 }
-                "hidden" if saved.hidden.len() < MAX_TABS => {
-                    let w = window(value)?;
-                    if !saved.hidden.contains(&w) {
-                        saved.hidden.push(w);
+                "hidden" if saved.hidden.len() + saved.hidden_panes.len() < MAX_TABS => {
+                    if let Some(p) = value.strip_prefix('%') {
+                        let p: u32 = p.parse().ok()?;
+                        if !saved.hidden_panes.contains(&p) {
+                            saved.hidden_panes.push(p);
+                        }
+                    } else {
+                        let w = window(value)?;
+                        if !saved.hidden.contains(&w) {
+                            saved.hidden.push(w);
+                        }
                     }
                 }
                 "look" if saved.looks.len() < MAX_LOOKS => {
@@ -366,6 +379,7 @@ mod tests {
             active: 1,
             looks,
             hidden: Vec::new(),
+            hidden_panes: Vec::new(),
         }
     }
 
@@ -390,14 +404,16 @@ mod tests {
     fn keeps_hidden_windows() {
         let mut s = sample();
         s.hidden = vec![5, 7];
+        s.hidden_panes = vec![9];
         let text = s.to_text();
-        assert!(text.contains(" hidden=@5 hidden=@7 look="));
+        assert!(text.contains(" hidden=@5 hidden=@7 hidden=%9 look="));
         assert_eq!(Saved::parse(&text), Some(s));
         assert_eq!(
             Saved::parse("ferossh1 hidden=@3 hidden=@3").unwrap().hidden,
             [3]
         );
         assert_eq!(Saved::parse("ferossh1 hidden=3"), None);
+        assert_eq!(Saved::parse("ferossh1 hidden=%x"), None);
     }
 
     #[test]

@@ -615,8 +615,17 @@ impl Workspace {
             self.tabs.push(Tab { root: new, focus });
             return;
         };
-        let shown = new.panes();
-        self.hidden.retain(|h| !shown.contains(&h.id));
+        // Hidden members stay hidden: the rest takes the place.
+        let mut new = new;
+        for h in new.panes() {
+            if self.is_hidden(h) {
+                match new.remove(h) {
+                    Some(rest) => new = rest,
+                    None => return,
+                }
+            }
+        }
+        let focus = new.panes().first().copied().unwrap_or(focus);
         for m in rest {
             self.detach(*m);
         }
@@ -1228,6 +1237,19 @@ mod tests {
         assert_eq!(ws.tabs[0].root.panes(), [1, 2]);
         assert!(ws.remove_pane(9));
         assert!(ws.hidden().is_empty());
+        // A group with a visible and a hidden member: the hidden one stays
+        // out of the tab.
+        assert!(ws.hide(2));
+        let tree = Node::Split {
+            axis: Axis::Row,
+            ratio: 0.5,
+            first: Box::new(Node::Leaf(1)),
+            second: Box::new(Node::Leaf(2)),
+        };
+        ws.replace_group(&[1, 2], tree);
+        assert_eq!(ws.all_panes(), [1]);
+        assert_eq!(ws.hidden(), [2]);
+        assert!(ws.show(2));
         ws.add_hidden(7);
         assert!(ws.is_hidden(7));
         assert!(ws.show(7));
