@@ -217,3 +217,31 @@ path = "fuzz_targets/sealed_bundle.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "agent_forward"
+path = "fuzz_targets/agent_forward.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "mosh_bootstrap"
+path = "fuzz_targets/mosh_bootstrap.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "remote_names"
+path = "fuzz_targets/remote_names.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "command_history"
+path = "fuzz_targets/command_history.rs"
+test = false
+doc = false
+bench = false

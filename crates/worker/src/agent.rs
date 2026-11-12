@@ -215,6 +215,79 @@ pub(crate) async fn serve(
     let _ = channel.close().await;
 }
 
+/// What [`serve`] makes of a server's bytes on an agent channel, for the
+/// fuzzer: the bytes arrive `step` at a time and are read as `serve`
+/// reads them (whole messages off the front, the same size limit). The
+/// requests must be the same as from the bytes whole, a sign request
+/// must be exactly its parts again, and the buffer never holds more than
+/// one message over the limit.
+pub fn fuzz_stream(data: &[u8], step: usize) {
+    fn requests(chunks: &mut dyn Iterator<Item = &[u8]>) -> Vec<Vec<u8>> {
+        let mut buf = Vec::new();
+        let mut out = Vec::new();
+        for chunk in chunks {
+            buf.extend_from_slice(chunk);
+            if buf.len() > MAX_MESSAGE + 4 {
+                break;
+            }
+            loop {
+                match next_message(&mut buf) {
+                    Ok(Some(body)) => {
+                        assert!(body.len() <= MAX_MESSAGE);
+                        out.push(body);
+                    }
+                    Ok(None) => break,
+                    Err(()) => return out,
+                }
+            }
+            assert!(buf.len() <= MAX_MESSAGE + 4);
+        }
+        out
+    }
+    let whole = requests(&mut std::iter::once(data));
+    let chunked = requests(&mut data.chunks(step.max(1)));
+    // Past the limit, `serve` stops as soon as its buffer holds too much,
+    // which depends on how the bytes arrived.
+    if data.len() <= MAX_MESSAGE + 4 {
+        assert_eq!(whole, chunked);
+    }
+    for body in &whole {
+        match parse(body) {
+            Request::List => assert_eq!(body.as_slice(), [REQUEST_IDENTITIES]),
+            Request::Sign { key, data, flags } => {
+                let mut again = vec![SIGN_REQUEST];
+                put_string(&mut again, &key);
+                put_string(&mut again, &data);
+                again.extend_from_slice(&flags.to_be_bytes());
+                assert_eq!(&again, body);
+            }
+            Request::Other => {}
+        }
+    }
+    // The answers the worker writes back stay well formed.
+    let keys: Vec<(Vec<u8>, String)> = whole
+        .iter()
+        .take(4)
+        .map(|b| {
+            // Kept small, so the answer stays within one message even with
+            // each byte of the comment turned into a three-byte U+FFFD.
+            let b = b.get(..b.len().min(MAX_MESSAGE / 32)).unwrap_or_default();
+            (b.to_vec(), String::from_utf8_lossy(b).into_owned())
+        })
+        .collect();
+    let mut answer = identities(&keys);
+    assert_eq!(
+        next_message(&mut answer)
+            .ok()
+            .flatten()
+            .map(|b| b.first().copied()),
+        Some(Some(IDENTITIES_ANSWER))
+    );
+    assert!(answer.is_empty());
+    let mut answer = signed(data);
+    assert!(matches!(next_message(&mut answer), Ok(Some(_)) | Err(())));
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::indexing_slicing)]
 mod tests {

@@ -55,6 +55,10 @@ jobs:
           - winrm_reply
           - stats_feed
           - sealed_bundle
+          - agent_forward
+          - mosh_bootstrap
+          - remote_names
+          - command_history
     steps:
       - uses: actions/checkout@v4
       - run: rustup toolchain install "$FUZZ_TOOLCHAIN" --profile minimal
