@@ -1489,12 +1489,37 @@ fn approved_commands_path() -> PathBuf {
     local_dir().join("approved-password-commands.txt")
 }
 
+/// Commands allowed while a portable FeroSSH runs. A portable data folder
+/// travels between PCs and anyone may have filled it in, so its approval
+/// files are never trusted: approvals there last only until FeroSSH quits.
+static PORTABLE_APPROVALS: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
+fn portable_approved(kind: &str, line: &str) -> bool {
+    let key = format!("{kind}\t{}", line.trim());
+    PORTABLE_APPROVALS
+        .lock()
+        .is_ok_and(|list| list.contains(&key))
+}
+
+fn portable_approve(kind: &str, line: &str) {
+    if let Ok(mut list) = PORTABLE_APPROVALS.lock() {
+        list.push(format!("{kind}\t{}", line.trim()));
+    }
+}
+
 fn command_approved(line: &str) -> bool {
+    if crate::portable::is_portable() {
+        return portable_approved("password", line);
+    }
     std::fs::read_to_string(approved_commands_path())
         .is_ok_and(|t| t.lines().any(|l| l == line.trim()))
 }
 
 fn approve_command(line: &str) {
+    if crate::portable::is_portable() {
+        portable_approve("password", line);
+        return;
+    }
     let path = approved_commands_path();
     let mut text = std::fs::read_to_string(&path).unwrap_or_default();
     if !text.is_empty() && !text.ends_with('\n') {
@@ -1512,11 +1537,18 @@ fn approved_proxies_path() -> PathBuf {
 }
 
 fn proxy_approved(line: &str) -> bool {
+    if crate::portable::is_portable() {
+        return portable_approved("proxy", line);
+    }
     std::fs::read_to_string(approved_proxies_path())
         .is_ok_and(|t| t.lines().any(|l| l == line.trim()))
 }
 
 fn approve_proxy(line: &str) {
+    if crate::portable::is_portable() {
+        portable_approve("proxy", line);
+        return;
+    }
     let path = approved_proxies_path();
     let mut text = std::fs::read_to_string(&path).unwrap_or_default();
     if !text.is_empty() && !text.ends_with('\n') {

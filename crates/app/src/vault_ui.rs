@@ -679,7 +679,21 @@ pub(super) fn move_file(hwnd: HWND) {
         );
         return;
     }
-    let done = vault::move_to(&to).and_then(|()| set_pointer(&to).map_err(|e| e.to_string()));
+    let done = vault::move_to(&to).and_then(|()| {
+        set_pointer(&to).map_err(|e| {
+            // Without the pointer the next start would not find the vault:
+            // put it back where FeroSSH looks.
+            let why = format!("where it is could not be remembered ({e})");
+            match vault::move_to(&now) {
+                Ok(()) => why,
+                Err(back) => format!(
+                    "{why}, and it could not be moved back ({back}). It is now {}: \
+                     after a restart, pick Master password > Use a vault file and choose it.",
+                    to.display()
+                ),
+            }
+        })
+    });
     match done {
         Ok(()) => {
             dialog(
@@ -713,13 +727,10 @@ pub(super) fn use_file(hwnd: HWND) {
     let Some(path) = pick_file(hwnd, w!("A FeroSSH vault"), &start) else {
         return;
     };
-    let text = match read_sealed(&path) {
-        Ok(t) => t,
-        Err(e) => {
-            dialog(hwnd, &e, MB_OK | MB_ICONWARNING);
-            return;
-        }
-    };
+    if let Err(e) = read_sealed(&path) {
+        dialog(hwnd, &e, MB_OK | MB_ICONWARNING);
+        return;
+    }
     let portable = crate::portable::is_portable();
     let os_secrets = if portable {
         Vec::new()
@@ -735,6 +746,8 @@ pub(super) fn use_file(hwnd: HWND) {
         "Move {} from Windows into the vault",
         plural(os_secrets.len(), "saved password", "saved passwords")
     );
+    // This PC's files, read before the vault takes over the reads.
+    let mine = connection_bundle();
     let mut problem: Option<String> = None;
     let answer = loop {
         let Some(answer) = ask(
@@ -752,17 +765,17 @@ pub(super) fn use_file(hwnd: HWND) {
             return;
         };
         busy();
-        if sealed::open(&answer.passphrase, &text).is_ok() {
-            break answer;
+        match vault::unlock(&path, &answer.passphrase) {
+            Ok(()) => break answer,
+            Err(vault::UnlockError::WrongPassphrase) => {
+                problem = Some(vault::UnlockError::WrongPassphrase.to_string());
+            }
+            Err(e) => {
+                dialog(hwnd, &e.to_string(), MB_OK | MB_ICONERROR);
+                return;
+            }
         }
-        problem = Some(OpenError::WrongPassphrase.to_string());
     };
-    // This PC's files, read before the vault takes over the reads.
-    let mine = connection_bundle();
-    if let Err(e) = vault::unlock(&path, &answer.passphrase) {
-        dialog(hwnd, &e, MB_OK | MB_ICONERROR);
-        return;
-    }
     // The vault's connections win over this PC's of the same name.
     let mut problems = Vec::new();
     for (name, p) in connection_files() {
@@ -848,7 +861,7 @@ pub(super) fn remove(hwnd: HWND) {
     if dialog(hwnd, &question, MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2) != Some(IDYES) {
         return;
     }
-    let b = match vault::remove(!elsewhere) {
+    let (b, file) = match vault::remove() {
         Ok(b) => b,
         Err(e) => {
             dialog(hwnd, &e, MB_OK | MB_ICONERROR);
@@ -870,15 +883,22 @@ pub(super) fn remove(hwnd: HWND) {
             }
         }
     }
-    let _ = set_pointer(&default_vault_path());
     // The window's settings are written out as they are now.
     with_window(|w| w.save_settings());
     after_change();
     let text = if problems.is_empty() {
+        let _ = set_pointer(&default_vault_path());
+        if !elsewhere {
+            let _ = std::fs::remove_file(&file);
+        }
         "The master password is removed.".to_owned()
     } else {
+        // Nothing is lost: the vault stays, and FeroSSH opens it again
+        // at the next start.
         format!(
-            "The master password is removed, but:\n\n{}",
+            "Not everything could be written out, so the vault {} is kept and FeroSSH asks \
+             for its master password again when it next starts:\n\n{}",
+            file.display(),
             problems.join("\n")
         )
     };
@@ -931,7 +951,7 @@ pub(super) fn unlock_at_start() -> bool {
         busy();
         match vault::unlock(&path, &answer.passphrase) {
             Ok(()) => return true,
-            Err(e) => problem = Some(e),
+            Err(e) => problem = Some(e.to_string()),
         }
     }
 }

@@ -23,9 +23,26 @@ use crate::suggest::History;
 /// not open each other.
 const ENTROPY: &[u8] = b"FeroSSH command history";
 
-/// The folder the histories are kept in.
+/// The folder the histories are kept in. A portable FeroSSH keeps one
+/// per PC and Windows account: each file is sealed for one account on one
+/// PC (DPAPI), so another PC could not read it and would replace it.
 pub fn dir() -> Option<PathBuf> {
-    crate::portable::local_dir().map(|d| d.join("history"))
+    let dir = crate::portable::local_dir()?.join("history");
+    if !crate::portable::is_portable() {
+        return Some(dir);
+    }
+    let var = |k: &str| std::env::var(k).unwrap_or_default();
+    let who: String = format!("{}-{}", var("COMPUTERNAME"), var("USERNAME"))
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    Some(dir.join(who))
 }
 
 fn file(key: &str) -> Option<PathBuf> {

@@ -6,7 +6,9 @@
 //! stick, say), FeroSSH is portable: everything it writes goes in that
 //! folder, `known_hosts` included, and it saves no passwords in the
 //! Windows Credential Manager (only in the master password vault), so a
-//! PC it ran on keeps nothing of it.
+//! PC it ran on keeps nothing of it. Approvals of password and proxy
+//! commands are not kept at all then: the folder travels, so a command
+//! is asked about again each time FeroSSH starts.
 
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;

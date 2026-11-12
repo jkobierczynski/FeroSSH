@@ -24,7 +24,7 @@ Items with a check mark are switches: picking them turns the setting on or off, 
 | Master password > Use a vault file... | | Uses a vault another PC made, in a shared folder such as OneDrive, and adds this PC's connections to it. |
 | Master password > Move the vault file... | | Moves the vault, for example into a OneDrive folder to share it between PCs. |
 | Master password > Change master password... | | Asks for the current master password, then a new one. |
-| Master password > Remove master password... | | Asks for the current master password, then writes the connections and settings back as plain files and the passwords back to the Windows Credential Manager. A vault in a shared folder stays there for the other PCs. |
+| Master password > Remove master password... | | Asks for the current master password, then writes the connections and settings back as plain files and the passwords back to the Windows Credential Manager. A portable FeroSSH drops the saved passwords instead (export them first to keep them). A vault in a shared folder stays there for the other PCs. |
 | Exit | Alt+F4 | Closes FeroSSH. tmux sessions keep running on their servers. |
 
 ## Edit

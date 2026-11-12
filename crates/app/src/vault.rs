@@ -118,14 +118,41 @@ pub fn path() -> Option<PathBuf> {
     with(|v| v.as_ref().map(|v| v.path.clone()))
 }
 
+/// Why a vault did not unlock.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UnlockError {
+    /// Worth another try.
+    WrongPassphrase,
+    /// Not worth one: unreadable, damaged or from a newer FeroSSH.
+    Other(String),
+}
+
+impl std::fmt::Display for UnlockError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            UnlockError::WrongPassphrase => OpenError::WrongPassphrase.fmt(f),
+            UnlockError::Other(e) => f.write_str(e),
+        }
+    }
+}
+
 /// Unlocks the vault at `path` with `passphrase`.
-pub fn unlock(path: &Path, passphrase: &str) -> Result<(), String> {
-    let text = std::fs::read_to_string(path)
-        .map_err(|e| format!("The vault {} could not be read ({e}).", path.display()))?;
+pub fn unlock(path: &Path, passphrase: &str) -> Result<(), UnlockError> {
+    // The stamp first: a newer file written meanwhile is then read again
+    // on the next refresh, never taken for the one read here.
     let seen = stamp(path);
-    let (content, key) = sealed::open(passphrase, &text).map_err(|e| e.to_string())?;
+    let text = std::fs::read_to_string(path).map_err(|e| {
+        UnlockError::Other(format!(
+            "The vault {} could not be read ({e}).",
+            path.display()
+        ))
+    })?;
+    let (content, key) = sealed::open(passphrase, &text).map_err(|e| match e {
+        OpenError::WrongPassphrase => UnlockError::WrongPassphrase,
+        other => UnlockError::Other(format!("{}: {other}", path.display())),
+    })?;
     let bundle = Bundle::parse(&content)
-        .ok_or_else(|| format!("The vault {} is damaged.", path.display()))?;
+        .ok_or_else(|| UnlockError::Other(format!("The vault {} is damaged.", path.display())))?;
     with(|v| {
         *v = Some(Vault {
             path: path.to_path_buf(),
@@ -180,18 +207,14 @@ pub fn move_to(to: &Path) -> Result<(), String> {
 }
 
 /// Closes the vault and hands back what it held, for writing out as
-/// plain files again. The vault file itself is removed when
-/// `delete_file` (a shared one, in a synced folder, is left for the
-/// other PCs).
-pub fn remove(delete_file: bool) -> Result<Bundle, String> {
+/// plain files again, and where its file is. The file stays: the caller
+/// deletes it once everything is written out (and never a shared one).
+pub fn remove() -> Result<(Bundle, PathBuf), String> {
     with(|v| {
         let open = v.as_mut().ok_or("No vault is open.")?;
         open.refresh()?;
         let vault = v.take().ok_or("No vault is open.")?;
-        if delete_file {
-            let _ = std::fs::remove_file(&vault.path);
-        }
-        Ok(vault.bundle)
+        Ok((vault.bundle, vault.path))
     })
 }
 
@@ -341,8 +364,8 @@ mod tests {
         move_to(&moved).unwrap();
         assert!(!path.exists() && moved.exists());
         assert!(verify("new master") && !verify("master pass"));
-        let back = remove(true).unwrap();
-        assert!(!moved.exists() && !is_open());
+        let (back, at) = remove().unwrap();
+        assert!(at == moved && moved.exists() && !is_open());
         assert_eq!(back.file("sessions.conf"), Some("Host a\n"));
         let _ = std::fs::remove_dir_all(&d);
     }
