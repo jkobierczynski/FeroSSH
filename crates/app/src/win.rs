@@ -414,6 +414,7 @@ const KEY_DEFAULTS: &[KeyDefault] = {
         d(cmd::TAB_LEFT, Tabs, &["Ctrl+Shift+PageUp"]),
         d(cmd::TAB_RIGHT, Tabs, &["Ctrl+Shift+PageDown"]),
         d(cmd::JOIN_TAB, Tabs, &["Ctrl+Shift+J"]),
+        d(cmd::HIDE_PANE, Always, &["Ctrl+Shift+H"]),
         d(cmd::BROADCAST_TAB, Always, &["Ctrl+Shift+B"]),
         d(cmd::FOCUS, Split, &["Alt+Left"]),
         d(cmd::FOCUS + 1, Split, &["Alt+Right"]),
@@ -580,6 +581,9 @@ mod cmd {
     pub const TAB_RIGHT: u32 = 705;
     pub const PANE_TO_TAB: u32 = 706;
     pub const JOIN_TAB: u32 = 707;
+    /// Window > Hide pane, and Show last hidden pane.
+    pub const HIDE_PANE: u32 = 708;
+    pub const SHOW_HIDDEN: u32 = 709;
     /// Plus 0-3: left, right, up, down.
     pub const FOCUS: u32 = 710;
     /// Plus 0-3: left, right, up, down.
@@ -2678,6 +2682,12 @@ fn build_menu() -> Result<HMENU> {
         item(window, cmd::PANE_TO_TAB, "Move pane to its own &tab")?;
         item(
             window,
+            cmd::HIDE_PANE,
+            "&Hide pane (keeps running)\tCtrl+Shift+H",
+        )?;
+        item(window, cmd::SHOW_HIDDEN, "Show last h&idden pane")?;
+        item(
+            window,
             cmd::JOIN_TAB,
             "&Join tab into the tab before it\tCtrl+Shift+J",
         )?;
@@ -3404,7 +3414,8 @@ impl Window {
         for g in gateways {
             let panes = &self.panes;
             let cells = |n: PaneId| {
-                let p = panes.get(&n)?;
+                // A hidden pane never shown here has no size to give.
+                let p = panes.get(&n).filter(|p| p.rect.w > 0 && p.rect.h > 0)?;
                 let m = p.metrics;
                 let cols = (p.rect.w - 2 * pad).max(0) / m.width.max(1) as i32;
                 let rows = (p.rect.h - 2 * pad).max(0) / m.height.max(1) as i32;
@@ -3737,6 +3748,8 @@ impl Window {
             .copied()
             .collect();
         hidden.sort_unstable();
+        // Panes the user hid, in the order they were hidden.
+        hidden.extend(self.ws.hidden());
         let panes = self
             .ws
             .tabs
@@ -3815,12 +3828,14 @@ impl Window {
             if p.log.enabled {
                 notes.push("logging");
             }
-            if tab.is_none() {
+            let user_hid = self.ws.is_hidden(id);
+            if tab.is_none() && !user_hid {
                 notes.push("script run");
             }
             out.push(LiveSession {
                 pane: id,
                 tab,
+                hidden: user_hid,
                 kind,
                 target,
                 name: p.name.clone(),
@@ -3843,10 +3858,15 @@ impl Window {
                     self.reveal_launch(id);
                     return None;
                 }
+                if self.ws.is_hidden(id) {
+                    self.show_hidden(id);
+                    return None;
+                }
                 self.focus_pane(id);
                 self.focus_terminal();
                 None
             }
+            LiveAction::Hide(id) => self.hide_pane(id),
             LiveAction::Close(id) => {
                 let s = self.open_sessions().into_iter().find(|s| s.pane == id)?;
                 let in_tabs: usize = self.ws.tabs.iter().map(|t| t.root.panes().len()).sum();
@@ -6522,6 +6542,15 @@ impl Window {
         }
         if self.launch_hidden.contains(&id) {
             self.check_launch(id);
+        }
+        // A hidden pane whose login asks for something shows again.
+        if self.ws.is_hidden(id)
+            && matches!(
+                self.panes.get(&id).map(|p| &p.host),
+                Some(Host::Ssh(s)) if s.prompt_asks().is_some()
+            )
+        {
+            self.show_hidden(id);
         }
         // A WinRM session closed with its shell open: keep sealing for
         // the worker's goodbye after the pane moves on.
@@ -12683,6 +12712,49 @@ impl Window {
         self.update_menu_checks();
     }
 
+    /// Window > Hide pane: pane `id` leaves its tab, the others taking
+    /// its space, and runs on. The session manager lists it, to show it
+    /// again. A tmux pane's window stays hidden in the saved layout.
+    fn hide_pane(&mut self, id: PaneId) -> Option<Command> {
+        if self.locked(id) {
+            return Some(Command::Notice(
+                "This tmux session uses tmux's own layout, so its panes cannot be hidden. \
+                 Session > tmux > One window per pane lets them hide."
+                    .into(),
+            ));
+        }
+        if !self.ws.hide(id) {
+            return Some(Command::Notice(
+                "The window's last pane cannot be hidden.".into(),
+            ));
+        }
+        if self.mouse.pane == Some(id) {
+            self.mouse.pane = None;
+        }
+        self.after_structure_change();
+        self.refresh_chrome();
+        None
+    }
+
+    /// Shows hidden pane `id` again where it was (in a tab of its own when
+    /// the panes around it went), with the keyboard.
+    fn show_hidden(&mut self, id: PaneId) {
+        let before = self.focused_id();
+        if !self.ws.show(id) {
+            return;
+        }
+        if before != id {
+            self.last_pane = Some(before);
+        }
+        if let Some(p) = self.panes.get_mut(&id) {
+            p.bell = false;
+            p.grid.mark_all_dirty();
+        }
+        self.after_structure_change();
+        self.focus_terminal();
+        self.refresh_chrome();
+    }
+
     /// Closes a pane; the last one closes the window. A tmux pane is
     /// closed in tmux, and goes when tmux says it went.
     fn close_pane(&mut self, id: PaneId) -> Option<Command> {
@@ -12697,6 +12769,17 @@ impl Window {
         self.workspace_tmux.remove(&id);
         self.workspace_waiting.forget(id);
         self.release_workspace_panes(id, false);
+        if self.ws.forget_hidden(id) {
+            // A hidden pane: no tab changes.
+            self.end_host(id);
+            self.panes.remove(&id);
+            if self.mouse.pane == Some(id) {
+                self.mouse.pane = None;
+            }
+            self.refresh_chrome();
+            self.update_menu_checks();
+            return None;
+        }
         match self.ws.close(id) {
             Some(Closed::Window) => return Some(Command::Destroy),
             Some(_) => {}
@@ -13742,6 +13825,12 @@ impl Window {
                     self.after_structure_change();
                 }
             }
+            cmd::HIDE_PANE => return self.hide_pane(pane),
+            cmd::SHOW_HIDDEN => {
+                if let Some(&last) = self.ws.hidden().last() {
+                    self.show_hidden(last);
+                }
+            }
             cmd::JOIN_TAB => {
                 let next = if self.ws.active == 0 {
                     1
@@ -14457,6 +14546,11 @@ impl Window {
             (cmd::TAB_RIGHT, tabs),
             (cmd::JOIN_TAB, tabs),
             (cmd::PANE_TO_TAB, split),
+            (
+                cmd::HIDE_PANE,
+                self.ws.all_panes().len() > 1 && !self.locked(pane),
+            ),
+            (cmd::SHOW_HIDDEN, !self.ws.hidden().is_empty()),
         ];
         for i in 0..4 {
             out.push((cmd::FOCUS + i, split));
@@ -15688,7 +15782,11 @@ impl Window {
                 .get(i)
                 .map(|t| t.root.panes())
                 .unwrap_or_default(),
-            None => self.ws.all_panes(),
+            None => {
+                let mut all = self.ws.all_panes();
+                all.extend(self.ws.hidden());
+                all
+            }
         };
         // Leaving the window only detaches tmux; closing a tab closes its
         // tmux windows.
@@ -16906,6 +17004,7 @@ fn live_event(hwnd: HWND, event: live_panel::Event) {
         Event::Close(pane) => {
             with_window(|w| w.live_action(Some(LiveAction::Close(pane)))).flatten()
         }
+        Event::Hide(pane) => with_window(|w| w.live_action(Some(LiveAction::Hide(pane)))).flatten(),
         Event::Rename(pane, text) => {
             with_window(|w| {
                 w.live_view.cancel_rename();

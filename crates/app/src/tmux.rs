@@ -954,6 +954,20 @@ impl Tmux {
         let saved = self.saved.take().unwrap_or_default();
         let mut used: BTreeSet<WindowId> = BTreeSet::new();
         let mut active_tab = 0;
+        // Windows the user hid stay hidden, out of the tabs.
+        let mut hidden: Vec<Node> = Vec::new();
+        if self.mode == Mode::Ferossh {
+            for w in &saved.hidden {
+                if !infos.contains_key(w) || !used.insert(*w) {
+                    continue;
+                }
+                if let Some(tree) =
+                    self.expand(ws, &saved::Node::Window(*w), &mut infos, &saved, out)
+                {
+                    hidden.push(tree);
+                }
+            }
+        }
         if self.mode == Mode::Ferossh {
             for (i, tab) in saved.tabs.iter().enumerate() {
                 let root = tab
@@ -986,7 +1000,22 @@ impl Tmux {
             }
         }
         if made.is_empty() {
+            // Nothing else to show: the hidden ones show after all.
+            made = hidden
+                .drain(..)
+                .map(|tree| {
+                    let focus = tree.panes().first().copied().unwrap_or(0);
+                    (tree, focus)
+                })
+                .collect();
+        }
+        if made.is_empty() {
             return;
+        }
+        for tree in hidden {
+            for native in tree.panes() {
+                ws.add_hidden(native);
+            }
         }
         // The new tabs go where the gateway or the old panes were.
         let mut place: Vec<Native> = self.stale.clone();
@@ -1601,6 +1630,18 @@ impl Tmux {
                 saved.tabs.push(saved::Tab { root, focus });
             }
         }
+        if self.mode == Mode::Ferossh {
+            let shown: BTreeSet<WindowId> =
+                saved.tabs.iter().flat_map(|t| t.root.windows()).collect();
+            for n in ws.hidden() {
+                if let Some(w) = window_of(n)
+                    && !shown.contains(&w)
+                    && !saved.hidden.contains(&w)
+                {
+                    saved.hidden.push(w);
+                }
+            }
+        }
         for p in self.panes.values() {
             saved
                 .looks
@@ -1873,6 +1914,41 @@ mod tests {
         assert!(w.contains(&"set-option -q @ferossh-mode ferossh".to_owned()));
         assert!(w.contains(&"capture-pane -p -e -q -t %3 -S -100".to_owned()));
         assert_eq!(t.mode(), Mode::Ferossh);
+    }
+
+    #[test]
+    fn hidden_windows_stay_hidden_and_are_saved() {
+        let panes = [
+            pane_line(0, 0, 80, 24, "b25f,80x24,0,0,0"),
+            pane_line(1, 1, 80, 24, "b25f,80x24,0,0,1"),
+            pane_line(2, 2, 80, 24, "b25f,80x24,0,0,2"),
+        ];
+        let saved = "ferossh1 active=0 tab=r500(@0,@1)/@0 hidden=@2";
+        let (mut t, mut ws, _) = attached(None, Some(saved), &panes);
+        let [n0, n1, n2] = [0, 1, 2].map(|p| t.native_of(p).unwrap());
+        assert_eq!(ws.all_panes(), [n0, n1]);
+        assert_eq!(ws.hidden(), [n2]);
+        let look = |_| Look::default();
+        let w = writes(&t.sync_saved(&ws, &look));
+        assert!(w[0].contains("tab=r500(@0,@1)/@0 hidden=@2 look="), "{w:?}");
+        // Hiding another and showing the first saves that.
+        assert!(ws.hide(n1));
+        assert!(ws.show(n2));
+        let w = writes(&t.sync_saved(&ws, &look));
+        assert!(w[0].contains("hidden=@1 look="), "{w:?}");
+        assert!(!w[0].contains("hidden=@2"), "{w:?}");
+        // A hidden pane's window closing forgets it.
+        let a = t.feed(&mut ws, b"%window-close @1\n");
+        assert!(a.contains(&Action::Remove { native: n1 }));
+        assert!(ws.hidden().is_empty());
+    }
+
+    #[test]
+    fn hidden_windows_show_when_nothing_else_would() {
+        let panes = [pane_line(0, 0, 80, 24, "b25f,80x24,0,0,0")];
+        let (t, ws, _) = attached(None, Some("ferossh1 active=0 hidden=@0"), &panes);
+        assert_eq!(ws.all_panes(), [t.native_of(0).unwrap()]);
+        assert!(ws.hidden().is_empty());
     }
 
     #[test]

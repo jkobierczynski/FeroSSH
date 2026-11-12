@@ -231,6 +231,66 @@ impl Node {
         }
     }
 
+    /// Puts the tree `new` on side `side` of the smallest part of the tree
+    /// holding all of `members`, with `ratio` the first child's share.
+    /// `false` if `members` is empty or not all in the tree.
+    pub fn wrap(&mut self, members: &[PaneId], new: Node, side: Dir, ratio: f32) -> bool {
+        if members.is_empty() || !members.iter().all(|m| self.contains(*m)) {
+            return false;
+        }
+        if let Node::Split { first, second, .. } = self {
+            if members.iter().all(|m| first.contains(*m)) {
+                return first.wrap(members, new, side, ratio);
+            }
+            if members.iter().all(|m| second.contains(*m)) {
+                return second.wrap(members, new, side, ratio);
+            }
+        }
+        let old = Box::new(std::mem::replace(self, Node::Leaf(0)));
+        let fresh = Box::new(new);
+        let (first, second) = if side.forward() {
+            (old, fresh)
+        } else {
+            (fresh, old)
+        };
+        *self = Node::Split {
+            axis: side.axis(),
+            ratio: ratio.clamp(MIN_RATIO, 1.0 - MIN_RATIO),
+            first,
+            second,
+        };
+        true
+    }
+
+    /// Where leaf `id` sits next to the rest of its split: the panes on
+    /// the other side, which side of them it is on, and the split's
+    /// share. `None` when `id` is the whole tree or not in it.
+    fn place_of(&self, id: PaneId) -> Option<(Vec<PaneId>, Dir, f32)> {
+        let Node::Split {
+            axis,
+            ratio,
+            first,
+            second,
+        } = self
+        else {
+            return None;
+        };
+        let row = *axis == Axis::Row;
+        if **first == Node::Leaf(id) {
+            let side = if row { Dir::Left } else { Dir::Up };
+            return Some((second.panes(), side, *ratio));
+        }
+        if **second == Node::Leaf(id) {
+            let side = if row { Dir::Right } else { Dir::Down };
+            return Some((first.panes(), side, *ratio));
+        }
+        if first.contains(id) {
+            first.place_of(id)
+        } else {
+            second.place_of(id)
+        }
+    }
+
     /// Exchanges two panes' places.
     pub fn swap(&mut self, a: PaneId, b: PaneId) {
         match self {
@@ -444,12 +504,35 @@ pub enum Closed {
     Window,
 }
 
+/// Where a hidden pane goes back to when it shows again.
+#[derive(Clone, Debug, PartialEq)]
+enum Back {
+    /// Next to these panes (those of them still there), on this side,
+    /// with the split's first child's share.
+    Beside {
+        near: Vec<PaneId>,
+        side: Dir,
+        ratio: f32,
+    },
+    /// In a tab of its own at this place.
+    Tab(usize),
+}
+
+/// A pane taken out of the tabs that keeps running.
+#[derive(Clone, Debug, PartialEq)]
+struct Hidden {
+    id: PaneId,
+    back: Back,
+}
+
 /// The window's tabs.
 #[derive(Clone, Debug)]
 pub struct Workspace {
     pub tabs: Vec<Tab>,
     pub active: usize,
     next_id: PaneId,
+    /// Hidden panes, in the order they were hidden.
+    hidden: Vec<Hidden>,
 }
 
 impl Workspace {
@@ -462,6 +545,7 @@ impl Workspace {
             }],
             active: 0,
             next_id: 2,
+            hidden: Vec::new(),
         };
         (ws, 1)
     }
@@ -490,6 +574,9 @@ impl Workspace {
     /// Takes pane `id` out of the layout, its tab too if it was the tab's
     /// only pane. `false` if it is not there or is the window's last pane.
     pub fn remove_pane(&mut self, id: PaneId) -> bool {
+        if self.forget_hidden(id) {
+            return true;
+        }
         if self.tab_of(id).is_none() || self.all_panes() == [id] {
             return false;
         }
@@ -507,9 +594,29 @@ impl Workspace {
             .collect();
         let focus = new.panes().first().copied().unwrap_or(0);
         let Some((&keep, rest)) = present.split_first() else {
+            // Hidden members: the new panes stay hidden in their place.
+            if let Some((at, back)) = self
+                .hidden
+                .iter()
+                .enumerate()
+                .find(|(_, h)| members.contains(&h.id))
+                .map(|(i, h)| (i, h.back.clone()))
+            {
+                self.hidden.retain(|h| !members.contains(&h.id));
+                let at = at.min(self.hidden.len());
+                for (i, id) in new.panes().into_iter().enumerate() {
+                    self.hidden.retain(|h| h.id != id);
+                    let back = back.clone();
+                    self.hidden
+                        .insert((at + i).min(self.hidden.len()), Hidden { id, back });
+                }
+                return;
+            }
             self.tabs.push(Tab { root: new, focus });
             return;
         };
+        let shown = new.panes();
+        self.hidden.retain(|h| !shown.contains(&h.id));
         for m in rest {
             self.detach(*m);
         }
@@ -730,6 +837,93 @@ impl Workspace {
             return false;
         };
         self.join_tab(from, target, Dir::Right)
+    }
+
+    /// Takes pane `id` out of its tab without closing it; the other panes
+    /// take its space. `false` if it is not in a tab or is the only pane
+    /// left in the tabs.
+    pub fn hide(&mut self, id: PaneId) -> bool {
+        let Some(i) = self.tab_of(id) else {
+            return false;
+        };
+        if self.all_panes() == [id] {
+            return false;
+        }
+        let back = match self.tabs.get(i).and_then(|t| t.root.place_of(id)) {
+            Some((near, side, ratio)) => Back::Beside { near, side, ratio },
+            None => Back::Tab(i),
+        };
+        self.detach(id);
+        self.hidden.push(Hidden { id, back });
+        true
+    }
+
+    /// Adds pane `id`, in no tab, as hidden: it shows in a tab of its own
+    /// at the end.
+    pub fn add_hidden(&mut self, id: PaneId) {
+        if self.tab_of(id).is_none() && !self.is_hidden(id) {
+            self.hidden.push(Hidden {
+                id,
+                back: Back::Tab(usize::MAX),
+            });
+        }
+    }
+
+    /// Shows hidden pane `id` again where it was, as far as the panes
+    /// around it are still there, and focuses it.
+    pub fn show(&mut self, id: PaneId) -> bool {
+        let Some(at) = self.hidden.iter().position(|h| h.id == id) else {
+            return false;
+        };
+        let h = self.hidden.remove(at);
+        let placed = match &h.back {
+            Back::Beside { near, side, ratio } => {
+                let present: Vec<PaneId> = near
+                    .iter()
+                    .copied()
+                    .filter(|p| self.tab_of(*p).is_some())
+                    .collect();
+                match present.first().and_then(|p| self.tab_of(*p)) {
+                    Some(t) => {
+                        let members: Vec<PaneId> = present
+                            .iter()
+                            .copied()
+                            .filter(|p| self.tab_of(*p) == Some(t))
+                            .collect();
+                        self.tabs.get_mut(t).is_some_and(|tab| {
+                            tab.root.wrap(&members, Node::Leaf(id), *side, *ratio)
+                        })
+                    }
+                    None => false,
+                }
+            }
+            Back::Tab(_) => false,
+        };
+        if !placed {
+            let at = match h.back {
+                Back::Tab(i) => i.min(self.tabs.len()),
+                Back::Beside { .. } => self.tabs.len(),
+            };
+            self.insert_tab(at, Node::Leaf(id), id);
+        }
+        self.focus(id)
+    }
+
+    /// Whether pane `id` is hidden.
+    pub fn is_hidden(&self, id: PaneId) -> bool {
+        self.hidden.iter().any(|h| h.id == id)
+    }
+
+    /// The hidden panes, in the order they were hidden.
+    pub fn hidden(&self) -> Vec<PaneId> {
+        self.hidden.iter().map(|h| h.id).collect()
+    }
+
+    /// Drops pane `id` from the hidden panes; `false` if it was not one.
+    pub fn forget_hidden(&mut self, id: PaneId) -> bool {
+        let before = self.hidden.len();
+        self.hidden.retain(|h| h.id != id);
+        self.hidden.len() != before
     }
 
     /// Moves pane `id` into a tab of its own, after its current tab.
@@ -959,5 +1153,84 @@ mod tests {
         assert_eq!(ws.focused(), d);
         assert!(!ws.join_neighbour(), "nothing left to join");
         assert_eq!(ws.all_panes().len(), 4);
+    }
+
+    /// A tab of a | (b over c), with b focused.
+    fn three() -> Workspace {
+        let (mut ws, a) = Workspace::new();
+        let b = ws.split(Dir::Right).unwrap();
+        let c = ws.split(Dir::Down).unwrap();
+        ws.focus(b);
+        assert_eq!(ws.tabs[0].root.panes(), [a, b, c]);
+        ws
+    }
+
+    #[test]
+    fn a_hidden_pane_leaves_its_space_and_comes_back_where_it_was() {
+        let mut ws = three();
+        let before = ws.tabs[0].root.clone();
+        assert!(ws.hide(2));
+        assert_eq!(ws.tabs[0].root.panes(), [1, 3]);
+        assert_eq!(ws.focused(), 1);
+        assert!(ws.is_hidden(2));
+        assert_eq!(ws.hidden(), [2]);
+        assert!(ws.tab_of(2).is_none());
+        assert!(!ws.all_panes().contains(&2));
+        assert!(ws.show(2));
+        assert_eq!(ws.tabs[0].root, before);
+        assert_eq!(ws.focused(), 2);
+        assert!(ws.hidden().is_empty());
+    }
+
+    #[test]
+    fn a_pane_beside_a_split_comes_back_beside_all_of_it() {
+        let mut ws = three();
+        let before = ws.tabs[0].root.clone();
+        assert!(ws.hide(1));
+        assert_eq!(ws.tabs[0].root.panes(), [2, 3]);
+        assert!(ws.show(1));
+        assert_eq!(ws.tabs[0].root, before);
+    }
+
+    #[test]
+    fn the_last_pane_cannot_hide_and_a_lone_tab_comes_back_in_place() {
+        let (mut ws, a) = Workspace::new();
+        assert!(!ws.hide(a));
+        let b = ws.new_tab();
+        let c = ws.new_tab();
+        assert!(ws.hide(b));
+        assert_eq!(ws.tabs.len(), 2);
+        assert_eq!(ws.focused(), c);
+        // Its neighbours gone, it gets a tab of its own where its tab was.
+        assert!(ws.show(b));
+        assert_eq!(ws.tab_of(b), Some(1));
+        assert_eq!(ws.focused(), b);
+        assert!(!ws.show(b));
+    }
+
+    #[test]
+    fn a_hidden_pane_whose_neighbours_closed_gets_its_own_tab() {
+        let mut ws = three();
+        assert!(ws.hide(2));
+        assert_eq!(ws.close(3), Some(Closed::Pane));
+        assert!(ws.show(2));
+        assert_eq!(ws.tabs.len(), 2);
+        assert_eq!(ws.tab_of(2), Some(1));
+    }
+
+    #[test]
+    fn removing_or_replacing_hidden_panes_keeps_them_hidden() {
+        let mut ws = three();
+        assert!(ws.hide(3));
+        // tmux remade the pane's window with two panes: both stay hidden.
+        ws.replace_group(&[3], Node::Leaf(9).clone());
+        assert_eq!(ws.hidden(), [9]);
+        assert_eq!(ws.tabs[0].root.panes(), [1, 2]);
+        assert!(ws.remove_pane(9));
+        assert!(ws.hidden().is_empty());
+        ws.add_hidden(7);
+        assert!(ws.is_hidden(7));
+        assert!(ws.show(7));
+        assert_eq!(ws.tab_of(7), Some(1));
     }
 }

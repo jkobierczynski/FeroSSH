@@ -98,6 +98,8 @@ pub struct LiveSession {
     /// The tab it is in, from 0; `None` for a snippet run's session that
     /// no tab shows.
     pub tab: Option<usize>,
+    /// Hidden by the user (Window > Hide pane): in no tab, running on.
+    pub hidden: bool,
     pub kind: Kind,
     /// `user@host[:port]`, the COM port, or the tmux pane's host.
     pub target: String,
@@ -132,6 +134,7 @@ impl LiveSession {
     fn detail(&self) -> String {
         let mut parts = vec![match self.tab {
             Some(i) => format!("tab {}", i + 1),
+            None if self.hidden => "hidden".to_owned(),
             None => "no tab".to_owned(),
         }];
         parts.push(self.state.name().to_owned());
@@ -151,6 +154,8 @@ impl LiveSession {
 pub enum LiveAction {
     /// Show the session: its tab and pane, with the keyboard.
     Show(PaneId),
+    /// Take the session's pane out of its tab; it runs on, listed here.
+    Hide(PaneId),
     /// Close the session's pane, after asking.
     Close(PaneId),
     /// Give the session this name; `None` clears it.
@@ -536,6 +541,7 @@ impl LiveView {
                     kind: s.kind.name(),
                     tab: match s.tab {
                         Some(i) => (i + 1).to_string(),
+                        None if s.hidden => "hidden".to_owned(),
                         None => "-".to_owned(),
                     },
                     state: s.state.name(),
@@ -557,6 +563,7 @@ mod tests {
         LiveSession {
             pane,
             tab,
+            hidden: false,
             kind: Kind::Ssh,
             target: target.into(),
             name: None,
@@ -596,6 +603,10 @@ mod tests {
         assert_eq!(rows[1].state, "connecting");
         assert_eq!(rows[3].tab, "-");
         assert!(rows[2].focused);
+        // A pane the user hid says so instead of a tab.
+        all[3].hidden = true;
+        assert_eq!(v.rows(&all)[3].tab, "hidden");
+        assert!(all[3].detail().starts_with("hidden · "));
         v.set_query("db");
         let rows = v.rows(&all);
         assert_eq!(rows.len(), 1);
