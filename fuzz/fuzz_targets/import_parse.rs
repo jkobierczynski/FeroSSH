@@ -7,13 +7,16 @@
 //! SecureCRT button bars, MobaXterm macros, text files): every line they
 //! make must be a plain line or a valid step, and a snippet's file must
 //! read back as the same lines.
+//!
+//! Workspace files are user files too: one that reads must read back the
+//! same once written.
 
 #![no_main]
 
 use ferossh_config::import::{self, Client};
 use ferossh_config::login::line_step;
 use ferossh_config::{
-    mobaxterm, mremoteng, putty, saved, securecrt, snippet_import, snippet_store, winscp,
+    mobaxterm, mremoteng, putty, saved, securecrt, snippet_import, snippet_store, winscp, workspace,
 };
 use libfuzzer_sys::fuzz_target;
 
@@ -61,5 +64,10 @@ fuzz_target!(|data: &[u8]| {
         assert_eq!(b.hostname, s.host.hostname);
         assert_eq!(b.port, s.host.port);
         assert_eq!(b.forwards, s.host.forwards);
+    }
+    if let Ok(ws) = workspace::parse(&text) {
+        assert!(workspace::fits(&ws));
+        let back = workspace::parse(&workspace::to_text(&ws)).unwrap();
+        assert_eq!(back, ws);
     }
 });

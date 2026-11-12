@@ -84,6 +84,8 @@ mod highlight;
 #[cfg(windows)]
 mod history_store;
 #[cfg(windows)]
+mod import_panel;
+#[cfg(windows)]
 mod import_reg;
 #[cfg_attr(not(windows), allow(dead_code))]
 mod import_view;
@@ -174,6 +176,8 @@ mod win;
 #[cfg_attr(not(windows), allow(dead_code))]
 mod winrm;
 #[cfg_attr(not(windows), allow(dead_code))]
+mod workspaces;
+#[cfg_attr(not(windows), allow(dead_code))]
 mod zmodem;
 
 /// What the command line asks for.
@@ -193,6 +197,8 @@ enum Launch {
     },
     /// A local shell (milestone 2's test host).
     Local(String),
+    /// Open a saved workspace: its name, or a workspace file's path.
+    Workspace { name: String, sandbox: bool },
     /// Make a security key file.
     NewSecurityKey(newkey::NewKey),
     /// Start the sandboxed processes, check that they run, and report.
@@ -224,6 +230,7 @@ fn parse_args(args: &[String]) -> Result<Launch, String> {
     let mut port: Option<String> = None;
     let mut user: Option<String> = None;
     let mut sandbox = true;
+    let mut workspace: Option<String> = None;
     while let Some(arg) = iter.next() {
         match arg.as_str() {
             "--worker" => {
@@ -254,12 +261,25 @@ fn parse_args(args: &[String]) -> Result<Launch, String> {
             }
             "--check-sandbox" => return Ok(Launch::CheckSandbox),
             "--no-sandbox" => sandbox = false,
+            "--workspace" => {
+                workspace = Some(
+                    iter.next()
+                        .ok_or("--workspace needs a workspace's name")?
+                        .clone(),
+                );
+            }
             "-p" => port = Some(iter.next().ok_or("-p needs a port")?.clone()),
             "-l" => user = Some(iter.next().ok_or("-l needs a user name")?.clone()),
             a if a.starts_with('-') => return Err(format!("unknown option {a}")),
             a if destination.is_none() => destination = Some(a.to_owned()),
             a => return Err(format!("unexpected argument {a}")),
         }
+    }
+    if let Some(name) = workspace {
+        if destination.is_some() || port.is_some() || user.is_some() {
+            return Err("--workspace opens its own connections: give no host".into());
+        }
+        return Ok(Launch::Workspace { name, sandbox });
     }
     let destination = match destination {
         Some(mut d) => {
@@ -371,6 +391,15 @@ mod tests {
             Ok(Launch::NewSecurityKey(k)) if k.hello
         ));
         assert_eq!(parse(&["--check-sandbox"]), Ok(Launch::CheckSandbox));
+        assert_eq!(
+            parse(&["--workspace", "Web servers", "--no-sandbox"]),
+            Ok(Launch::Workspace {
+                name: "Web servers".into(),
+                sandbox: false
+            })
+        );
+        assert!(parse(&["--workspace"]).is_err());
+        assert!(parse(&["--workspace", "w", "host"]).is_err());
         assert!(parse(&["-x"]).is_err());
         assert!(parse(&["a", "b"]).is_err());
         assert!(parse(&["-p", "22"]).is_err());

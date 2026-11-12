@@ -397,10 +397,19 @@ fn selected_item() -> Option<Item> {
     item(selected(handles()?.tree)?)
 }
 
+/// The selected host's name; none for a folder or a workspace.
 fn selected_host() -> Option<String> {
     match selected_item()? {
-        Item::Host(h) => Some(h.name),
-        Item::Folder(_) => None,
+        Item::Host(h) if !h.workspace => Some(h.name),
+        Item::Host(_) | Item::Folder(_) => None,
+    }
+}
+
+/// The selected workspace's name.
+fn selected_workspace() -> Option<String> {
+    match selected_item()? {
+        Item::Host(h) if h.workspace => Some(h.name),
+        Item::Host(_) | Item::Folder(_) => None,
     }
 }
 
@@ -588,6 +597,9 @@ fn open_selected(h: Handles, from_search: bool) {
         return;
     }
     match selected_item() {
+        Some(Item::Host(host)) if host.workspace => {
+            emit(Event::Action(SideAction::OpenWorkspace(host.name)));
+        }
         Some(Item::Host(host)) => emit(Event::Action(SideAction::Open {
             host: host.name,
             split,
@@ -631,8 +643,13 @@ fn command(h: Handles, id: usize, code: u32) {
                 }
             }
         }
-        (ID_CONNECT, BN_CLICKED) => open_selected(h, selected_host().is_none()),
+        (ID_CONNECT, BN_CLICKED) => open_selected(
+            h,
+            selected_host().is_none() && selected_workspace().is_none(),
+        ),
         (ID_NEW, BN_CLICKED) => emit(Event::Action(SideAction::New)),
+        // A workspace is edited by saving the layout again.
+        (ID_EDIT, BN_CLICKED) if selected_workspace().is_some() => {}
         (ID_EDIT, BN_CLICKED) => emit(Event::Action(match selected_host() {
             Some(host) => SideAction::Edit(host),
             None => SideAction::New,
@@ -733,7 +750,7 @@ fn notify(h: Handles, lparam: LPARAM) -> LRESULT {
                 };
             }
             NM_DBLCLK => {
-                if selected_host().is_some() {
+                if selected_host().is_some() || selected_workspace().is_some() {
                     open_selected(h, false);
                     return LRESULT(1);
                 }
@@ -764,8 +781,8 @@ fn notify(h: Handles, lparam: LPARAM) -> LRESULT {
                 let host = item_index(h.tree, hit_item)
                     .and_then(item)
                     .and_then(|i| match i {
-                        Item::Host(h) => Some(h.name),
-                        Item::Folder(_) => None,
+                        Item::Host(h) if !h.workspace => Some(h.name),
+                        Item::Host(_) | Item::Folder(_) => None,
                     });
                 emit(Event::Menu(host));
                 return LRESULT(1);
@@ -775,11 +792,14 @@ fn notify(h: Handles, lparam: LPARAM) -> LRESULT {
                 let vk = key.wVKey;
                 let ctrl = key_down(VK_CONTROL.0);
                 let action = match vk {
+                    v if v == VK_F2.0 && selected_workspace().is_some() => None,
                     v if v == VK_F2.0 => Some(match selected_host() {
                         Some(host) => SideAction::Edit(host),
                         None => SideAction::New,
                     }),
-                    v if v == VK_DELETE.0 => selected_host().map(SideAction::Delete),
+                    v if v == VK_DELETE.0 => selected_workspace()
+                        .map(SideAction::DeleteWorkspace)
+                        .or_else(|| selected_host().map(SideAction::Delete)),
                     v if v == VK_INSERT.0 => Some(SideAction::New),
                     v if v == u16::from(b'D') && ctrl => {
                         selected_host().map(SideAction::ToggleFavourite)

@@ -32,6 +32,7 @@ pub mod snippet_store;
 pub mod ssh_config;
 pub mod trigger;
 pub mod winscp;
+pub mod workspace;
 
 pub use forward::{ForwardKind, ForwardSpec};
 pub use highlight::{HighlightColour, HighlightRule};
