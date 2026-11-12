@@ -72,6 +72,7 @@ if o && kill -0 $x 2>/dev/null; then break; fi;
 kill $x 2>/dev/null; x=; n=$((n+1));
 done;
 [ -n "$x" ] || { echo "FEROSSH-VD error the X server did not start: $(tail -n 2 "$d/xvfb.log" | tr -s "[:space:]" " ")"; exit 6; };
+if [ "$b" = xvnc ]; then i=0; while [ $i -lt 50 ]; do grep -q "Listening for VNC connections" "$d/xvfb.log" 2>/dev/null && break; sleep 0.1; i=$((i+1)); done; fi;
 DISPLAY=:$n; XAUTHORITY="$d/auth"; export DISPLAY XAUTHORITY;
 unset WAYLAND_DISPLAY SESSION_MANAGER DBUS_SESSION_BUS_ADDRESS;
 if [ -z "$prog" ]; then
