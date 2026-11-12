@@ -17336,6 +17336,12 @@ fn run_command(hwnd: HWND, command: Command) {
             want,
             others,
         } => {
+            // Queued output can switch or end the session before this
+            // runs: ask only about the session still attached.
+            let current = with_window(|w| w.tmux.get(&gateway).and_then(|t| t.session_id()));
+            if current.flatten() != Some(session) {
+                return;
+            }
             let clients = if others == 1 {
                 "Another tmux client is".to_owned()
             } else {

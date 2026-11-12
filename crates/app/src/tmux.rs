@@ -492,6 +492,14 @@ impl Tmux {
         self.mode
     }
 
+    /// The id of the session attached, while in control mode.
+    pub fn session_id(&self) -> Option<SessionId> {
+        self.client
+            .is_control()
+            .then_some(self.session.as_ref().map(|(id, _)| *id))
+            .flatten()
+    }
+
     /// The session attached, once tmux has said.
     pub fn session_name(&self) -> Option<&str> {
         self.session.as_ref().map(|(_, name)| name.as_str())
@@ -2111,6 +2119,11 @@ mod tests {
         assert!(w[1].starts_with("display-message -p -t $0:@0 "));
         answer(&mut t, &mut ws, &[]);
         let a = answer(&mut t, &mut ws, &["90 30 2".into()]);
+        assert!(!a.iter().any(|a| matches!(a, Action::Crowded { .. })));
+        // A manual size is not the other clients' doing: no question.
+        assert_eq!(writes(&t.sync_sizes(&ws, &|_| Some((110, 35)))).len(), 2);
+        answer(&mut t, &mut ws, &[]);
+        let a = answer(&mut t, &mut ws, &["90 30 2 manual".into()]);
         assert!(!a.iter().any(|a| matches!(a, Action::Crowded { .. })));
         // A smaller window with other clients attached: asked once.
         assert_eq!(writes(&t.sync_sizes(&ws, &|_| Some((120, 40)))).len(), 2);
