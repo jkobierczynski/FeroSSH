@@ -237,7 +237,7 @@ In the Local and Remote lists:
 
 In a path box, Enter goes to the folder typed. In the queue, Del cancels a transfer and the right-click menu pauses, resumes, retries and clears the finished ones. When a file already exists, Overwrite, Skip and Keep both answer above the queue; For all answers the same for the rest.
 
-Click a column header (Name, Size or Modified) to sort both lists on it, and again to reverse it; the arrow in the header shows which way. The right-click menu's Sort by items do the same. Folders always stay above files.
+Click a column header (Name, Size or Modified) to sort that list on it, and again to reverse it (each list keeps its own sort); the arrow in the header shows which way. The right-click menu's Sort by items do the same. Folders always stay above files.
 
 The arrow buttons between the lists move the selection across, and the gap between them drags to share the room differently. ★ Bookmarks ▾ opens, adds, renames and deletes bookmarks; in its name box Enter saves and Escape cancels. ↻ Refresh reads both lists again (F5 outside the lists). ⇆ Sync turns on Sync browsing, so opening a folder or going up in one list does the same in the other. Layout ▾ arranges the lists side by side or stacked, swaps them, and has Choose local folder, Upload files and Open local folder in Explorer.
 

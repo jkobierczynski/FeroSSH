@@ -607,8 +607,8 @@ pub struct Settings {
     /// such as `side 50` or `stacked swapped 40`; side by side, Local
     /// first, when unset.
     pub transfer_layout: Option<String>,
-    /// How the file transfer pane sorts both lists, such as `size
-    /// descending`; by name, A to Z, when unset.
+    /// How the file transfer pane sorts each list, such as `local name
+    /// ascending remote size descending`; by name, A to Z, when unset.
     pub transfer_sort: Option<String>,
     /// File transfer's named folder pairs, in the order made.
     pub bookmarks: Vec<Bookmark>,
@@ -1723,7 +1723,7 @@ AutoReconnect no
 ParallelTransfers 20
 FollowDirectory no
 TransferLayout stacked swapped 40
-TransferSort size descending
+TransferSort local name ascending remote size descending
 Bookmark "nginx config" "C:\Users\j\Documents" /etc/nginx "web01.prod"
 Bookmark logs "" /var/log ""
 Bookmark empty "" "" ""
@@ -1859,7 +1859,10 @@ NewKeyword later
         assert_eq!(s.parallel_transfers, Some(8));
         assert!(!s.follow_directory);
         assert_eq!(s.transfer_layout.as_deref(), Some("stacked swapped 40"));
-        assert_eq!(s.transfer_sort.as_deref(), Some("size descending"));
+        assert_eq!(
+            s.transfer_sort.as_deref(),
+            Some("local name ascending remote size descending")
+        );
         assert_eq!(
             s.bookmarks,
             [

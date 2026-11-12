@@ -15041,7 +15041,7 @@ impl Window {
                 .settings
                 .transfer_sort
                 .as_deref()
-                .map(files::Sort::parse)
+                .map(files::Sorts::parse)
                 .unwrap_or_default(),
             bookmarks: self.settings.bookmarks.clone(),
             local_start: alias

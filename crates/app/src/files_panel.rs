@@ -69,8 +69,8 @@ use windows::Win32::UI::WindowsAndMessaging::{
 use windows::core::{PCWSTR, PWSTR, w};
 
 use crate::files::{
-    self, Arrange, BackStep, FileRow, Follow, LocalPane, QueueRow, Sort, SyncLocal, SyncPending,
-    SyncStep, filtered, local_rows,
+    self, Arrange, BackStep, FileRow, Follow, LocalPane, QueueRow, Sort, Sorts, SyncLocal,
+    SyncPending, SyncStep, filtered, local_rows,
 };
 use crate::layout::Rect;
 use crate::native::{fonts, key_down, pass_edge, scale, search_text, set_font, wide};
@@ -102,8 +102,8 @@ pub struct View {
     /// Downloads finished so far, to read the Local list again.
     pub landed: usize,
     pub arrange: Arrange,
-    /// How both lists are sorted (the `TransferSort` setting).
-    pub sort: Sort,
+    /// How each list is sorted (the `TransferSort` setting).
+    pub sort: Sorts,
     /// Every bookmark; the menu leaves out those for other hosts.
     pub bookmarks: Vec<Bookmark>,
     /// The connection the Remote list shows, to match bookmarks to.
@@ -183,8 +183,8 @@ pub enum Event {
     OpenLocal(PathBuf),
     ToggleFollow,
     Arrange(Arrange),
-    /// Both lists are sorted this way now.
-    Sort(Sort),
+    /// The lists are sorted this way now (one of them just changed).
+    Sort(Sorts),
     /// Delete these local files and folders (to the Recycle Bin), once
     /// the user says yes.
     DeleteLocal(Vec<PathBuf>),
@@ -349,7 +349,7 @@ struct State {
     select_remote: Option<Vec<u8>>,
     filter: String,
     arrange: Arrange,
-    sort: Sort,
+    sort: Sorts,
     /// The panel's size as laid out, the lists' area and the gap.
     size: (i32, i32),
     /// How much of the panel's width the terminal leaves uncovered: the
@@ -759,7 +759,7 @@ pub fn create(main: HWND, handler: Handler, dpi: u32) -> windows::core::Result<(
                 select_remote: None,
                 filter: String::new(),
                 arrange: Arrange::default(),
-                sort: Sort::default(),
+                sort: Sorts::default(),
                 size: (0, 0),
                 visible: 0,
                 lists: Rect::default(),
@@ -1548,7 +1548,7 @@ fn refresh_local(h: &Handles, reread: bool) {
             s.local.reload();
         }
         let mut rows = local_rows(&s.local.listing, &s.filter);
-        s.sort.apply(&mut rows);
+        s.sort.local.apply(&mut rows);
         let dir = s.local.dir().map(PathBuf::from);
         let new_folder = dir != s.local_dir;
         if rows == s.local_shown && !new_folder {
@@ -1587,7 +1587,7 @@ fn refresh_remote(h: &Handles) {
     let Some((rows, old, new_folder, pick, mut icons, dir)) = with(|s| {
         let v = s.view.as_ref()?;
         let mut rows = filtered(&v.remote_rows, &s.filter);
-        s.sort.apply(&mut rows);
+        s.sort.remote.apply(&mut rows);
         // Another queue is another host: nothing selected carries over,
         // even when its folder and names are the same.
         let new_queue = v.key != s.remote_key;
@@ -2839,7 +2839,7 @@ fn context_menu(h: &Handles, list: HWND, lparam: LPARAM) {
     let one_file = one && rows.first().is_some_and(|r| !r.dir);
     let host = remote_dir().is_some();
     let can = |id: u32, on: bool| if on { id } else { u32::MAX };
-    let sort = with(|s| s.sort).unwrap_or_default();
+    let sort = with(|s| s.sort.get(remote)).unwrap_or_default();
     let sorted = [
         (0, "", false),
         (SORT_NAME, "Sort by &name", sort.by == files::SortBy::Name),
@@ -2901,7 +2901,7 @@ fn context_menu(h: &Handles, list: HWND, lparam: LPARAM) {
             // The column picked again turns around, as a header click does.
             let column = (chosen - SORT_NAME) as usize;
             if let Some(next) = sort.clicked(column) {
-                set_sort(h, next);
+                set_sort(h, remote, next);
             }
         }
         EDIT => edit_locally(h),
@@ -2922,24 +2922,33 @@ fn context_menu(h: &Handles, list: HWND, lparam: LPARAM) {
     }
 }
 
-/// Sorts both lists this way, and remembers it.
-fn set_sort(h: &Handles, sort: Sort) {
-    if with(|s| std::mem::replace(&mut s.sort, sort)) == Some(sort) {
-        return;
-    }
-    show_sort(h);
-    refresh_local(h, false);
-    refresh_remote(h);
-    emit(Event::Sort(sort));
-}
-
-/// Puts the sort arrow on the sorted column's header in both lists, and
-/// takes it off the others.
-fn show_sort(h: &Handles) {
-    let Some(sort) = with(|s| s.sort) else {
+/// Sorts the Remote list (`remote`) or the Local list this way, and
+/// remembers it.
+fn set_sort(h: &Handles, remote: bool, sort: Sort) {
+    let Some(all) = with(|s| {
+        let was = s.sort.get(remote);
+        s.sort.set(remote, sort);
+        (was != sort).then_some(s.sort)
+    })
+    .flatten() else {
         return;
     };
-    for list in [h.local.list, h.remote.list] {
+    show_sort(h);
+    if remote {
+        refresh_remote(h);
+    } else {
+        refresh_local(h, false);
+    }
+    emit(Event::Sort(all));
+}
+
+/// Puts the sort arrow on the sorted column's header in each list, and
+/// takes it off the others.
+fn show_sort(h: &Handles) {
+    let Some(sorts) = with(|s| s.sort) else {
+        return;
+    };
+    for (list, sort) in [(h.local.list, sorts.local), (h.remote.list, sorts.remote)] {
         // SAFETY: our own controls; each struct lives through its call.
         unsafe {
             let header = HWND(SendMessageW(list, LVM_GETHEADER, None, None).0 as *mut _);
@@ -3237,8 +3246,9 @@ fn notify(h: &Handles, lparam: LPARAM) -> LRESULT {
             }
             LVN_COLUMNCLICK if is_list => {
                 let click = &*(lparam.0 as *const NMLISTVIEW);
-                if let Some(sort) = with(|s| s.sort.clicked(click.iSubItem as usize)).flatten() {
-                    set_sort(h, sort);
+                let column = click.iSubItem as usize;
+                if let Some(sort) = with(|s| s.sort.get(remote).clicked(column)).flatten() {
+                    set_sort(h, remote, sort);
                 }
             }
             LVN_BEGINDRAG if is_list => {

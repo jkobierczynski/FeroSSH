@@ -517,6 +517,61 @@ impl Sort {
     }
 }
 
+/// How each list is sorted: the Local and Remote lists keep their own.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Sorts {
+    pub local: Sort,
+    pub remote: Sort,
+}
+
+impl Sorts {
+    /// The `TransferSort` setting: `local` and `remote`, each followed by
+    /// its sort, such as `local name ascending remote size descending`.
+    /// Words before either name are for both lists.
+    pub fn parse(text: &str) -> Self {
+        let lower = text.to_ascii_lowercase();
+        let mut both = String::new();
+        let mut local = String::new();
+        let mut remote = String::new();
+        let mut into = &mut both;
+        for word in lower.split_whitespace() {
+            match word {
+                "local" => into = &mut local,
+                "remote" => into = &mut remote,
+                w => {
+                    into.push(' ');
+                    into.push_str(w);
+                }
+            }
+        }
+        let side = |own: &str| Sort::parse(&format!("{both} {own}"));
+        Self {
+            local: side(&local),
+            remote: side(&remote),
+        }
+    }
+
+    pub fn to_setting(self) -> String {
+        format!(
+            "local {} remote {}",
+            self.local.to_setting(),
+            self.remote.to_setting()
+        )
+    }
+
+    pub fn get(self, remote: bool) -> Sort {
+        if remote { self.remote } else { self.local }
+    }
+
+    pub fn set(&mut self, remote: bool, sort: Sort) {
+        if remote {
+            self.remote = sort;
+        } else {
+            self.local = sort;
+        }
+    }
+}
+
 /// The smallest share either list gets.
 pub const MIN_SPLIT: u8 = 15;
 
@@ -1072,6 +1127,38 @@ mod tests {
         assert_eq!(size.clicked(0), Some(Sort::default()));
         assert_eq!(s.clicked(3), None);
         assert_eq!(size.column(), 1);
+    }
+
+    #[test]
+    fn each_list_keeps_its_own_sort() {
+        let both = Sorts {
+            local: Sort::default(),
+            remote: Sort {
+                by: SortBy::Size,
+                descending: true,
+            },
+        };
+        let text = both.to_setting();
+        assert_eq!(text, "local name ascending remote size descending");
+        assert_eq!(Sorts::parse(&text), both);
+        // One sort for both, from before the lists had their own.
+        let old = Sorts::parse("modified descending");
+        assert_eq!(old.local, old.remote);
+        assert_eq!(old.local.by, SortBy::Modified);
+        assert_eq!(
+            Sorts::parse("Remote Size"),
+            Sorts {
+                local: Sort::default(),
+                remote: Sort {
+                    by: SortBy::Size,
+                    descending: false
+                },
+            }
+        );
+        let mut s = Sorts::default();
+        s.set(true, both.remote);
+        assert_eq!(s, both);
+        assert_eq!(s.get(false), Sort::default());
     }
 
     #[test]
