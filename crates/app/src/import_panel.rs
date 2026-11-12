@@ -32,18 +32,20 @@ use windows::Win32::UI::Controls::{
     LVM_SETITEMSTATE, LVM_SETITEMTEXTW, LVN_ITEMCHANGED, LVN_ITEMCHANGING, LVNI_SELECTED,
     LVS_EX_CHECKBOXES, LVS_EX_DOUBLEBUFFER, LVS_EX_FULLROWSELECT, LVS_EX_LABELTIP,
     LVS_NOSORTHEADER, LVS_REPORT, LVS_SHOWSELALWAYS, LVS_SINGLESEL, NM_CUSTOMDRAW, NM_DBLCLK,
-    NM_SETFOCUS, NMHDR, NMLISTVIEW, NMLVCUSTOMDRAW, SetWindowTheme, WC_BUTTONW, WC_LISTVIEWW,
+    NM_SETFOCUS, NMHDR, NMLISTVIEW, NMLVCUSTOMDRAW, SetWindowTheme, WC_BUTTONW, WC_EDITW,
+    WC_LISTVIEWW,
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     EnableWindow, GetFocus, SetFocus, VK_BACK, VK_CONTROL, VK_ESCAPE, VK_RETURN, VK_SHIFT,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     BN_CLICKED, BS_DEFPUSHBUTTON, BS_PUSHBUTTON, CS_HREDRAW, CS_VREDRAW, CreateWindowExW,
-    GetClientRect, HMENU, IDC_ARROW, IDCANCEL, IDOK, IsChild, IsDialogMessageW, IsWindowVisible,
-    LoadCursorW, MSG, MoveWindow, RegisterClassW, SW_HIDE, SW_SHOWNA, SendMessageW, SetWindowTextW,
-    ShowWindow, WINDOW_EX_STYLE, WINDOW_STYLE, WM_COMMAND, WM_ERASEBKGND, WM_KEYDOWN, WM_NOTIFY,
-    WM_PAINT, WM_SYSCHAR, WM_SYSKEYDOWN, WM_SYSKEYUP, WNDCLASSW, WS_CHILD, WS_CLIPCHILDREN,
-    WS_CLIPSIBLINGS, WS_EX_CONTROLPARENT, WS_TABSTOP,
+    ES_AUTOVSCROLL, ES_MULTILINE, ES_READONLY, GetClientRect, HMENU, IDC_ARROW, IDCANCEL, IDOK,
+    IsChild, IsDialogMessageW, IsWindowVisible, LoadCursorW, MSG, MoveWindow, RegisterClassW,
+    SW_HIDE, SW_SHOWNA, SendMessageW, SetWindowTextW, ShowWindow, WINDOW_EX_STYLE, WINDOW_STYLE,
+    WM_COMMAND, WM_ERASEBKGND, WM_KEYDOWN, WM_NOTIFY, WM_PAINT, WM_SYSCHAR, WM_SYSKEYDOWN,
+    WM_SYSKEYUP, WNDCLASSW, WS_BORDER, WS_CHILD, WS_CLIPCHILDREN, WS_CLIPSIBLINGS,
+    WS_EX_CONTROLPARENT, WS_TABSTOP, WS_VSCROLL,
 };
 use windows::core::{PCWSTR, PWSTR, w};
 
@@ -85,6 +87,7 @@ const ID_ALL: usize = 913;
 const ID_NONE: usize = 914;
 const ID_IMPORT: usize = 915;
 const ID_BACK: usize = 916;
+const ID_PROBLEMS: usize = 917;
 
 /// The list of sources' columns and their widths at 96 DPI.
 const SOURCE_COLUMNS: [(&str, i32); 3] = [("Program", 110), ("Found", 90), ("Where", 220)];
@@ -117,11 +120,14 @@ struct Handles {
     none: HWND,
     import: HWND,
     back: HWND,
+    /// What could not be read, in a read-only box that scrolls.
+    problems: HWND,
 }
 
 impl Handles {
-    fn controls(&self) -> [HWND; 9] {
+    fn controls(&self) -> [HWND; 10] {
         [
+            self.problems,
             self.sources,
             self.items,
             self.open,
@@ -155,7 +161,6 @@ struct State {
     /// While the lists are filled: their changes are not the user's.
     filling: bool,
     help_at: RECT,
-    notes_at: RECT,
     hint_at: RECT,
     footer_at: RECT,
 }
@@ -176,12 +181,22 @@ fn filling() -> bool {
     with(|s| s.filling).unwrap_or(true)
 }
 
-fn preview() -> Option<Vec<NativeItem>> {
+/// Whether the preview's item `i` is taken (its name is in use).
+fn taken(i: usize) -> bool {
     with(|s| match s.shown.as_ref().map(|v| &v.page) {
-        Some(NativePage::Preview { items, .. }) => Some(items.clone()),
-        _ => None,
+        Some(NativePage::Preview { items, .. }) => items.get(i).is_some_and(|it| it.taken),
+        _ => false,
     })
-    .flatten()
+    .unwrap_or(false)
+}
+
+/// Whether the list of sources has problems to show.
+fn has_problems() -> bool {
+    with(|s| match s.shown.as_ref().map(|v| &v.page) {
+        Some(NativePage::Sources { problems, .. }) => !problems.is_empty(),
+        _ => false,
+    })
+    .unwrap_or(false)
 }
 
 fn on_preview() -> bool {
@@ -293,6 +308,12 @@ pub fn create(main: HWND, handler: Handler, dpi: u32) -> windows::core::Result<(
             ID_IMPORT,
         )?;
         let back = child(WC_BUTTONW, w!("&Back"), push, ID_BACK)?;
+        let problems = child(
+            WC_EDITW,
+            w!(""),
+            WS_BORDER.0 | WS_VSCROLL.0 | (ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL) as u32,
+            ID_PROBLEMS,
+        )?;
         let h = Handles {
             main,
             panel,
@@ -305,6 +326,7 @@ pub fn create(main: HWND, handler: Handler, dpi: u32) -> windows::core::Result<(
             none,
             import,
             back,
+            problems,
         };
         let (font, title_font) = fonts(dpi);
         for c in h.controls() {
@@ -321,7 +343,6 @@ pub fn create(main: HWND, handler: Handler, dpi: u32) -> windows::core::Result<(
                 columns: None,
                 filling: false,
                 help_at: RECT::default(),
-                notes_at: RECT::default(),
                 hint_at: RECT::default(),
                 footer_at: RECT::default(),
             });
@@ -382,19 +403,36 @@ pub fn place(at: Option<Rect>, width: i32, dpi: u32) {
     let inner = (width - 2 * pad).max(0);
     let help_h = 2 * line;
     let list_y = title + help_h + gap;
-    let buttons_y = (at.h - pad - button).max(list_y + 4 * button);
-    // Sources: problems under the list, then From a file and its hint.
+    // The buttons stay at the bottom, inside the panel however short it
+    // is; the lists shrink first, then the hint and problems go.
+    let buttons_y = (at.h - pad - button).max(0);
+    let room = buttons_y - gap - list_y;
+    // Sources: what could not be read under the list, then From a file
+    // and its hint.
+    let problems_h = if has_problems() { 3 * line } else { 0 };
     let hint_h = 3 * line;
-    let hint_y = buttons_y - gap - hint_h;
+    let sources_need = |extra: i32| extra + button + gap + 2 * button;
+    let (hint_h, problems_h) = if room >= sources_need(hint_h + problems_h + 2 * gap) {
+        (hint_h, problems_h)
+    } else if room >= sources_need(problems_h + gap) {
+        (0, problems_h)
+    } else {
+        (0, 0)
+    };
+    let hint_y = buttons_y - if hint_h > 0 { gap + hint_h } else { 0 };
     let file_y = hint_y - gap - button;
-    let notes_h = 2 * line;
-    let notes_y = file_y - gap - notes_h;
-    let sources_h = (notes_y - gap - list_y).max(button);
+    let problems_y = file_y - gap - problems_h;
+    let sources_end = if problems_h > 0 { problems_y } else { file_y };
+    let sources_h = (sources_end - gap - list_y).max(0);
     // Preview: Select all and Clear all, then where it is saved.
-    let footer_h = 2 * line;
-    let footer_y = buttons_y - gap - footer_h;
+    let footer_h = if room >= 2 * line + gap + 3 * button {
+        2 * line
+    } else {
+        0
+    };
+    let footer_y = buttons_y - if footer_h > 0 { gap + footer_h } else { 0 };
     let picks_y = footer_y - gap - button;
-    let items_h = (picks_y - gap - list_y).max(button);
+    let items_h = (picks_y - gap - list_y).max(0);
     let button_w = scale(80, dpi);
     let wide_w = scale(112, dpi);
     let rect = |y: i32, h: i32| RECT {
@@ -405,7 +443,6 @@ pub fn place(at: Option<Rect>, width: i32, dpi: u32) {
     };
     with(|s| {
         s.help_at = rect(title, help_h);
-        s.notes_at = rect(notes_y, notes_h);
         s.hint_at = rect(hint_y, hint_h);
         s.footer_at = rect(footer_y, footer_h);
     });
@@ -413,6 +450,15 @@ pub fn place(at: Option<Rect>, width: i32, dpi: u32) {
     unsafe {
         let _ = MoveWindow(h.panel, at.x, at.y, at.w, at.h, true);
         let _ = MoveWindow(h.sources, pad, list_y, inner, sources_h, true);
+        let _ = MoveWindow(h.problems, pad, problems_y, inner, problems_h, true);
+        let _ = ShowWindow(
+            h.problems,
+            if problems_h > 0 && !on_preview() {
+                SW_SHOWNA
+            } else {
+                SW_HIDE
+            },
+        );
         let _ = MoveWindow(h.file, pad, file_y, wide_w, button, true);
         let _ = MoveWindow(h.open, pad, buttons_y, button_w, button, true);
         let x = pad + button_w + gap;
@@ -468,9 +514,19 @@ pub fn set_view(view: NativeImport) {
     with(|s| s.filling = true);
     let had_focus = has_focus();
     match &view.page {
-        NativePage::Sources { sources, last, .. } => {
+        NativePage::Sources {
+            sources,
+            last,
+            problems,
+            ..
+        } => {
             if fresh || before.as_ref().map(|b| &b.page) != Some(&view.page) {
                 fill_sources(&h, sources, *last);
+                let text = wide(&problems.join("\r\n"));
+                // SAFETY: our own control; the text lives through the call.
+                unsafe {
+                    let _ = SetWindowTextW(h.problems, PCWSTR(text.as_ptr()));
+                }
             }
             show_page(&h, false);
         }
@@ -506,9 +562,21 @@ pub fn set_view(view: NativeImport) {
             // SAFETY: our own controls; the text lives through the call.
             unsafe {
                 let _ = SetWindowTextW(h.import, PCWSTR(label.as_ptr()));
-                let _ = EnableWindow(h.import, *chosen > 0);
-                let _ = EnableWindow(h.all, *chosen < *importable);
-                let _ = EnableWindow(h.none, *chosen > 0);
+                let enable = [
+                    (h.import, *chosen > 0),
+                    (h.all, *chosen < *importable),
+                    (h.none, *chosen > 0),
+                ];
+                // A button about to be disabled hands the keyboard to the
+                // list first (Clear all pressed with Space), or it would
+                // be left with nothing.
+                let focus = GetFocus();
+                if enable.iter().any(|&(b, on)| !on && b == focus) {
+                    let _ = SetFocus(Some(h.items));
+                }
+                for (b, on) in enable {
+                    let _ = EnableWindow(b, on);
+                }
             }
             show_page(&h, true);
         }
@@ -842,10 +910,7 @@ fn notify(h: Handles, lparam: LPARAM) -> LRESULT {
                 }
                 if stage == CDDS_ITEMPREPAINT || stage.0 == CDDS_ITEMPREPAINT.0 | CDDS_SUBITEM.0 {
                     let i = usize::try_from(cd.nmcd.lItemlParam.0).unwrap_or(usize::MAX);
-                    let taken = preview()
-                        .and_then(|all| all.get(i).map(|it| it.taken))
-                        .unwrap_or(false);
-                    if taken {
+                    if taken(i) {
                         cd.clrText = COLORREF(crate::ui_theme::sys_color(COLOR_GRAYTEXT));
                     }
                     return LRESULT(if stage == CDDS_ITEMPREPAINT {
@@ -862,12 +927,8 @@ fn notify(h: Handles, lparam: LPARAM) -> LRESULT {
                 let mask = LVIS_STATEIMAGEMASK.0;
                 let changes_box = (nm.uChanged.0 & LVIF_STATE.0) != 0
                     && (nm.uOldState & mask) != (nm.uNewState & mask);
-                let taken = usize::try_from(nm.lParam.0).ok().is_some_and(|i| {
-                    preview()
-                        .and_then(|all| all.get(i).map(|it| it.taken))
-                        .unwrap_or(false)
-                });
-                return LRESULT(isize::from(changes_box && taken));
+                let is_taken = usize::try_from(nm.lParam.0).is_ok_and(taken);
+                return LRESULT(isize::from(changes_box && is_taken));
             }
             LVN_ITEMCHANGED if items => {
                 let nm = &*(lparam.0 as *const NMLISTVIEW);
@@ -891,14 +952,13 @@ fn notify(h: Handles, lparam: LPARAM) -> LRESULT {
 }
 
 fn paint(h: Handles) {
-    let Some((title_font, font, dpi, view, help_at, notes_at, hint_at, footer_at)) = with(|s| {
+    let Some((title_font, font, dpi, view, help_at, hint_at, footer_at)) = with(|s| {
         (
             s.title_font,
             s.font,
             s.dpi,
             s.shown.clone(),
             s.help_at,
-            s.notes_at,
             s.hint_at,
             s.footer_at,
         )
@@ -959,7 +1019,7 @@ fn paint(h: Handles) {
             "connections"
         };
         match &view.page {
-            NativePage::Sources { problems, hint, .. } => {
+            NativePage::Sources { hint, .. } => {
                 draw(
                     &format!(
                         "Programs on this account with saved {what}. Open one to pick \
@@ -968,11 +1028,6 @@ fn paint(h: Handles) {
                     help_at,
                     block,
                 );
-                if !problems.is_empty() {
-                    SetTextColor(dc, text_colour);
-                    draw(&problems.join("\n"), notes_at, block);
-                    SetTextColor(dc, grey);
-                }
                 draw(hint, hint_at, block);
             }
             NativePage::Preview { footer, .. } => {
