@@ -60,13 +60,15 @@ pub fn write(target: &str, user: &str, password: &str) -> Result<(), String> {
     os_write(target, user, password)
 }
 
-/// Forgets the password under `target`, in the vault and here.
-pub fn delete(target: &str) {
-    crate::vault::delete_secret(target);
+/// Forgets the password under `target`, in the vault and here. An error
+/// when the vault could not be saved: the password is still in it.
+pub fn delete(target: &str) -> Result<(), String> {
+    let vault = crate::vault::delete_secret(target);
     // The PC's own passwords are not a portable FeroSSH's to delete.
     if !crate::portable::is_portable() {
         os_delete(target);
     }
+    vault.map_err(|e| format!("The saved password could not be forgotten: {e}"))
 }
 
 /// The password under `target` in the Credential Manager alone.

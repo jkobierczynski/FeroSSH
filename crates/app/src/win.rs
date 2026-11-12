@@ -5950,8 +5950,11 @@ impl Window {
                     self.show(id, &format!("\x1b[0;90m{note}\x1b[0m\r\n"));
                 }
                 Effect::ForgetProxyPassword { proxy } => {
-                    if let Some(user) = proxy.user.as_deref() {
-                        credman::delete(&credman::proxy_target(user, &proxy.host, proxy.port));
+                    if let Some(user) = proxy.user.as_deref()
+                        && let Err(e) =
+                            credman::delete(&credman::proxy_target(user, &proxy.host, proxy.port))
+                    {
+                        self.show(id, &format!("\x1b[0;90m{e}\x1b[0m\r\n"));
                     }
                 }
                 Effect::Connected
@@ -10613,8 +10616,9 @@ impl Window {
                 }
                 if let Some(old) = old_target
                     && (!still_windows || self.saved_password_target(&name).as_ref() != Some(&old))
+                    && let Err(e) = credman::delete(&old)
                 {
-                    credman::delete(&old);
+                    self.queued.push(Command::Notice(e));
                 }
                 self.side.form = None;
                 self.reload_sessions(Some(&name));
@@ -10663,8 +10667,9 @@ impl Window {
             .profile(name)
             .is_some_and(|p| p.password == PasswordSource::Windows)
             && let Some(target) = self.saved_password_target(name)
+            && let Err(e) = credman::delete(&target)
         {
-            credman::delete(&target);
+            self.queued.push(Command::Notice(e));
         }
         let mut hosts = load_saved();
         session_form::delete(name, &mut hosts, &mut self.settings);

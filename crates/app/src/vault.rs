@@ -190,6 +190,19 @@ impl Vault {
         self.save().inspect_err(|_| self.bundle = before)
     }
 
+    /// Writes the vault to `to` (whose lock the caller holds) and removes
+    /// the old file once the new one is written.
+    fn move_locked(&mut self, to: &Path) -> Result<(), String> {
+        self.refresh()?;
+        let from = std::mem::replace(&mut self.path, to.to_path_buf());
+        if let Err(e) = self.save() {
+            self.path = from;
+            return Err(e);
+        }
+        let _ = std::fs::remove_file(&from);
+        Ok(())
+    }
+
     /// Takes in what another PC wrote since we last looked. An error
     /// when the file is there but this key no longer opens it (the
     /// master password was changed elsewhere), so nothing overwrites it.
@@ -330,16 +343,23 @@ pub fn change_passphrase(passphrase: &str) -> Result<(), String> {
 pub fn move_to(to: &Path) -> Result<(), String> {
     with(|v| {
         let v = v.as_mut().ok_or("No vault is open.")?;
+        if to != v.path {
+            // The destination's lock too, and checked again under it: two
+            // windows moving vaults to one place never overwrite each other.
+            let dest = ProcessLock::take(to, 500);
+            if dest.is_none() && cfg!(windows) {
+                return Err(format!(
+                    "{} is busy in another FeroSSH window; the vault was not moved.",
+                    to.display()
+                ));
+            }
+            if to.exists() {
+                return Err(format!("There is already a file at {}.", to.display()));
+            }
+            return v.move_locked(to);
+        }
         v.refresh()?;
-        let from = std::mem::replace(&mut v.path, to.to_path_buf());
-        if let Err(e) = v.save() {
-            v.path = from;
-            return Err(e);
-        }
-        if from != v.path {
-            let _ = std::fs::remove_file(&from);
-        }
-        Ok(())
+        v.save()
     })
 }
 
@@ -437,16 +457,19 @@ pub fn set_secret(target: &str, user: &str, password: &str) -> Result<(), String
     })
 }
 
-pub fn delete_secret(target: &str) {
+/// Forgets the password under `target`. An error, with the password kept
+/// (in memory too), when that cannot be saved.
+pub fn delete_secret(target: &str) -> Result<(), String> {
     with(|v| {
-        if let Some(v) = v.as_mut()
-            && v.refresh().is_ok()
-            && v.bundle.secret(target).is_some()
-        {
-            // Kept, in memory too, when it cannot be saved.
-            let _ = v.change(|b| b.remove_secret(target));
+        let Some(v) = v.as_mut() else {
+            return Ok(());
+        };
+        v.refresh()?;
+        if v.bundle.secret(target).is_none() {
+            return Ok(());
         }
-    });
+        v.change(|b| b.remove_secret(target))
+    })
 }
 
 /// How good a new passphrase is: why not, for one too short or two that
@@ -518,9 +541,16 @@ mod tests {
         lock();
         assert!(unlock(&path, "master pass").is_err());
         unlock(&path, "new master").unwrap();
-        delete_secret("FeroSSH:me@a:22");
+        delete_secret("FeroSSH:me@a:22").unwrap();
         assert!(secret("FeroSSH:me@a:22").is_none());
         let moved = d.join("sync").join("v.vault");
+        // Never over a file already there (another window's vault, say).
+        std::fs::create_dir_all(moved.parent().unwrap()).unwrap();
+        std::fs::write(&moved, "theirs").unwrap();
+        assert!(move_to(&moved).is_err());
+        assert_eq!(std::fs::read_to_string(&moved).unwrap(), "theirs");
+        assert!(path.exists());
+        std::fs::remove_file(&moved).unwrap();
         move_to(&moved).unwrap();
         assert!(!path.exists() && moved.exists());
         assert!(verify("new master") && !verify("master pass"));
@@ -581,9 +611,9 @@ mod tests {
         FAIL_SAVES.store(true, std::sync::atomic::Ordering::Relaxed);
         let wrote = write("sessions.conf", "Host b\n");
         let set = set_secret("FeroSSH:me@b:22", "me", "lost");
-        delete_secret("FeroSSH:me@a:22");
+        let deleted = delete_secret("FeroSSH:me@a:22");
         FAIL_SAVES.store(false, std::sync::atomic::Ordering::Relaxed);
-        assert!(wrote.is_err() && set.is_err());
+        assert!(wrote.is_err() && set.is_err() && deleted.is_err());
         assert_eq!(read("sessions.conf"), None);
         assert!(secret("FeroSSH:me@b:22").is_none());
         assert!(secret("FeroSSH:me@a:22").is_some());
