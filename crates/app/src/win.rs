@@ -1199,8 +1199,9 @@ struct Window {
     winrm_closing: HashMap<ChannelId, WinrmCloser>,
     /// Tools > New SSH key making the key in the background.
     keygen: Option<std::sync::mpsc::Receiver<(PathBuf, std::result::Result<String, String>)>>,
-    /// The question about other tmux clients, while another dialog is open.
-    crowded_waiting: Option<CrowdedOffer>,
+    /// Questions about other tmux clients, while another dialog is open:
+    /// one per gateway and session, asked in order.
+    crowded_waiting: Vec<CrowdedOffer>,
     /// The pane whose host the remote app picker (the palette) runs on.
     app_pane: Option<PaneId>,
     /// Programs run as remote apps lately, latest first.
@@ -2160,7 +2161,7 @@ fn create_and_run(launch: Launch, theme: Option<String>) -> Result<()> {
                 stats: HashMap::new(),
                 winrm_closing: HashMap::new(),
                 keygen: None,
-                crowded_waiting: None,
+                crowded_waiting: Vec::new(),
                 app_pane: None,
                 recent_apps: Vec::new(),
                 app_clip_limits: HashMap::new(),
@@ -3434,6 +3435,19 @@ impl Window {
 
     /// Session > tmux > Detach other clients, as answered in the dialog.
     /// Skipped when another session is attached by now.
+    /// Keeps a question about other tmux clients for when no dialog is
+    /// open, replacing an earlier one about the same gateway and session.
+    fn wait_crowded(&mut self, offer: CrowdedOffer) {
+        match self
+            .crowded_waiting
+            .iter_mut()
+            .find(|o| o.gateway == offer.gateway && o.session == offer.session)
+        {
+            Some(o) => *o = offer,
+            None => self.crowded_waiting.push(offer),
+        }
+    }
+
     fn detach_other_tmux(&mut self, gateway: PaneId, session: ferossh_tmuxcc::SessionId) {
         let Some(t) = self.tmux.get_mut(&gateway).filter(|t| t.active()) else {
             return;
@@ -17340,7 +17354,7 @@ fn run_command(hwnd: HWND, command: Command) {
         Command::TmuxCrowded(offer) => {
             if DIALOG_OPEN.get() {
                 // Another dialog is open: ask once it has closed.
-                with_window(|w| w.crowded_waiting = Some(offer));
+                with_window(|w| w.wait_crowded(offer));
                 // SAFETY: our window; replaces any earlier timer with this id.
                 unsafe { SetTimer(Some(hwnd), TIMER_CROWDED, 500, None) };
                 return;
@@ -17386,7 +17400,7 @@ fn run_command(hwnd: HWND, command: Command) {
                 Some(_) => {}
                 // Another dialog opened meanwhile: ask once it has closed.
                 None => {
-                    with_window(|w| w.crowded_waiting = Some(offer.clone()));
+                    with_window(|w| w.wait_crowded(offer.clone()));
                     // SAFETY: our window; replaces any earlier timer.
                     unsafe { SetTimer(Some(hwnd), TIMER_CROWDED, 500, None) };
                 }
@@ -18848,7 +18862,10 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
             }
             WM_TIMER if wparam.0 == TIMER_CROWDED => {
                 let _ = KillTimer(Some(hwnd), TIMER_CROWDED);
-                if let Some(offer) = with_window(|w| w.crowded_waiting.take()).flatten() {
+                // Each question is modal, so they come one after another;
+                // one that meets another open dialog waits again.
+                let waiting = with_window(|w| std::mem::take(&mut w.crowded_waiting));
+                for offer in waiting.into_iter().flatten() {
                     run_command(hwnd, Command::TmuxCrowded(offer));
                 }
                 LRESULT(0)
