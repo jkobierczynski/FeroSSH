@@ -450,6 +450,11 @@ impl Tmux {
         self.mode
     }
 
+    /// The session attached, once tmux has said.
+    pub fn session_name(&self) -> Option<&str> {
+        self.session.as_ref().map(|(_, name)| name.as_str())
+    }
+
     /// Per-window sizes, so FeroSSH layout works.
     fn window_sizes(&self) -> bool {
         self.version.is_some_and(|v| v >= WINDOW_SIZES_VERSION)
