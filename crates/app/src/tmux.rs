@@ -111,6 +111,14 @@ pub enum Action {
     Picker(Vec<String>),
     /// Tell the user, in the gateway pane.
     Notice(String),
+    /// Other clients attached to the session keep a window smaller than
+    /// the native panes (tmux sizes a window to its smallest client):
+    /// offer to detach them. Asked once per attach.
+    Crowded {
+        have: (u16, u16),
+        want: (u16, u16),
+        others: u32,
+    },
     /// The directory a pane is in, asked for by [`Tmux::ask_dir`]: save it
     /// as the host's start directory.
     StartDir(String),
@@ -153,6 +161,9 @@ enum Tag {
     NewSession,
     /// The prefix keys and base index, for tmux keybindings.
     Keys,
+    /// The size tmux gave a window after we asked for this one, and how
+    /// many clients the session has.
+    SizeCheck(WindowId, (u16, u16)),
     /// The reply does not matter.
     Ignore,
 }
@@ -353,6 +364,8 @@ pub struct Tmux {
     sent_sizes: BTreeMap<WindowId, (u16, u16)>,
     sent_client_size: Option<(u16, u16)>,
     sent_layouts: BTreeMap<WindowId, String>,
+    /// Other clients were found keeping a window small (asked once).
+    crowded_asked: bool,
     saved_text: Option<String>,
     /// The session to attach again after a reconnect.
     pub reattach: Option<String>,
@@ -363,6 +376,15 @@ pub struct Tmux {
     /// Where new windows and panes start unless a split asks for its
     /// pane's directory: the host's start directory, from its profile.
     pub start_dir: Option<String>,
+}
+
+/// A window's size and its session's client count, for [`Tag::SizeCheck`].
+const SIZE_FORMAT: &str = "#{window_width} #{window_height} #{session_attached}";
+
+fn parse_size_check(text: &str) -> Option<((u16, u16), u32)> {
+    let mut it = text.split_whitespace().map(str::parse::<u32>);
+    let (w, h, n) = (it.next()?.ok()?, it.next()?.ok()?, it.next()?.ok()?);
+    Some(((u16::try_from(w).ok()?, u16::try_from(h).ok()?), n))
 }
 
 fn win_of(text: &[u8]) -> Option<WindowId> {
@@ -433,6 +455,7 @@ impl Tmux {
             sent_sizes: BTreeMap::new(),
             sent_client_size: None,
             sent_layouts: BTreeMap::new(),
+            crowded_asked: false,
             saved_text: None,
             reattach: None,
             keys_wanted: false,
@@ -592,6 +615,7 @@ impl Tmux {
         self.sent_sizes.clear();
         self.sent_client_size = None;
         self.sent_layouts.clear();
+        self.crowded_asked = false;
         self.saved_text = None;
         self.restoring = true;
         self.send("display-message -p '#{version}'", Tag::Version, out);
@@ -804,6 +828,28 @@ impl Tmux {
                 }
             }
             Tag::Keys => self.keys = ok.then(first).filter(|k| !k.is_empty()),
+            Tag::SizeCheck(w, want) => {
+                // Only the latest size asked for counts.
+                let current = if self.window_sizes() {
+                    self.sent_sizes.get(&w) == Some(&want)
+                } else {
+                    self.sent_client_size == Some(want)
+                };
+                if !ok || !current || self.crowded_asked {
+                    return;
+                }
+                if let Some((have, clients)) = parse_size_check(&first())
+                    && (have.0 < want.0 || have.1 < want.1)
+                    && clients > 1
+                {
+                    self.crowded_asked = true;
+                    out.push(Action::Crowded {
+                        have,
+                        want,
+                        others: clients - 1,
+                    });
+                }
+            }
             Tag::Ignore => {}
         }
     }
@@ -1346,6 +1392,16 @@ impl Tmux {
     }
 
     /// Leaves tmux running and the gateway at its shell.
+    /// Detaches every other client from the session, so that tmux sizes
+    /// its windows to FeroSSH's panes again.
+    pub fn detach_others(&mut self) -> Vec<Action> {
+        let mut out = Vec::new();
+        if self.client.is_control() {
+            self.send("detach-client -a", Tag::Ignore, &mut out);
+        }
+        out
+    }
+
     pub fn detach(&mut self) -> Vec<Action> {
         let mut out = Vec::new();
         self.reattach = None;
@@ -1398,16 +1454,27 @@ impl Tmux {
             .and_then(|p| self.panes.get(&p))
             .map(|p| p.window);
         for (w, size, layout) in wanted {
-            if self.window_sizes() {
+            let sent = if self.window_sizes() {
                 if self.sent_sizes.get(&w) != Some(&size) {
                     self.sent_sizes.insert(w, size);
                     let line = format!("refresh-client -C @{w}:{}x{}", size.0, size.1);
                     self.send(&line, Tag::Ignore, &mut out);
+                    true
+                } else {
+                    false
                 }
             } else if focused == Some(w) && self.sent_client_size != Some(size) {
                 self.sent_client_size = Some(size);
                 let line = format!("refresh-client -C {}x{}", size.0, size.1);
                 self.send(&line, Tag::Ignore, &mut out);
+                true
+            } else {
+                false
+            };
+            if sent && !self.crowded_asked {
+                // tmux resizes at once: did it give the window that size?
+                let line = format!("display-message -p -t @{w} {}", command::quote(SIZE_FORMAT));
+                self.send(&line, Tag::SizeCheck(w, size), &mut out);
             }
             if let Some(layout) = layout {
                 let current = self
@@ -1799,9 +1866,15 @@ mod tests {
         assert!(a.contains(&Action::Focus { native: n9 }));
         // Each window gets its pane's size; the layout and looks are saved.
         let w = writes(&t.sync_sizes(&ws, &|n| Some(if n == a0 { (100, 20) } else { (60, 10) })));
+        let check = |w: u32| format!("display-message -p -t @{w} {}", command::quote(SIZE_FORMAT));
         assert_eq!(
             w,
-            ["refresh-client -C @0:100x20", "refresh-client -C @4:60x10"]
+            [
+                "refresh-client -C @0:100x20".to_owned(),
+                check(0),
+                "refresh-client -C @4:60x10".to_owned(),
+                check(4)
+            ]
         );
         assert!(
             writes(&t.sync_sizes(&ws, &|_| Some((100, 20))))
@@ -1942,6 +2015,42 @@ mod tests {
     }
 
     #[test]
+    fn other_clients_keeping_a_window_small_are_offered_to_detach() {
+        let panes = [pane_line(0, 0, 80, 24, "b25f,80x24,0,0,0")];
+        let (mut t, mut ws, a) = attached(None, None, &panes);
+        let mut n = 4;
+        let mut answer = |t: &mut Tmux, ws: &mut Workspace, lines: &[String]| {
+            n += 1;
+            t.feed(ws, &reply(n, lines))
+        };
+        for _ in writes(&a) {
+            answer(&mut t, &mut ws, &[]);
+        }
+        // tmux gives the window the size asked for: nothing to say.
+        let w = writes(&t.sync_sizes(&ws, &|_| Some((90, 30))));
+        assert_eq!(w.len(), 2, "{w:?}");
+        assert!(w[1].starts_with("display-message -p -t @0 "));
+        answer(&mut t, &mut ws, &[]);
+        let a = answer(&mut t, &mut ws, &["90 30 2".into()]);
+        assert!(!a.iter().any(|a| matches!(a, Action::Crowded { .. })));
+        // A smaller window with other clients attached: asked once.
+        assert_eq!(writes(&t.sync_sizes(&ws, &|_| Some((120, 40)))).len(), 2);
+        answer(&mut t, &mut ws, &[]);
+        let a = answer(&mut t, &mut ws, &["100 30 3".into()]);
+        assert!(a.contains(&Action::Crowded {
+            have: (100, 30),
+            want: (120, 40),
+            others: 2
+        }));
+        let w = writes(&t.sync_sizes(&ws, &|_| Some((121, 40))));
+        assert_eq!(w, ["refresh-client -C @0:121x40"]);
+        assert_eq!(writes(&t.detach_others()), ["detach-client -a"]);
+        // Smaller but alone (tmux clamps the size itself): no question.
+        assert_eq!(parse_size_check("100 30 1"), Some(((100, 30), 1)));
+        assert_eq!(parse_size_check("100 x 1"), None);
+    }
+
+    #[test]
     fn tmux_layout_follows_tmux_splits() {
         let panes = [pane_line(0, 0, 80, 24, "b25f,80x24,0,0,0")];
         let (mut t, mut ws, _) = attached(Some("tmux"), None, &panes);
@@ -1974,11 +2083,12 @@ mod tests {
         assert_eq!(ws.focused(), n1);
         // Native sizes go back as the window's size plus a layout.
         let w = writes(&t.sync_sizes(&ws, &|n| Some(if n == a0 { (50, 30) } else { (49, 31) })));
-        assert_eq!(w.len(), 2);
+        assert_eq!(w.len(), 3);
         assert_eq!(w[0], "refresh-client -C @0:100x30");
+        assert!(w[1].starts_with("display-message -p -t @0 "));
         assert!(
-            w[1].starts_with("select-layout -t @0 '")
-                && w[1].ends_with(",100x30,0,0{50x30,0,0,0,49x30,51,0,1}'")
+            w[2].starts_with("select-layout -t @0 '")
+                && w[2].ends_with(",100x30,0,0{50x30,0,0,0,49x30,51,0,1}'")
         );
         // tmux resizes: the native terminals follow, the tree stays.
         let a = t.feed(

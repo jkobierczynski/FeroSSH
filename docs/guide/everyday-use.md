@@ -460,6 +460,8 @@ Session > Attach tmux types `tmux -CC new-session -A -s main` at the pane's shel
 
 Session > Detach tmux, closing FeroSSH or losing the network leaves everything running on the server. Attach again, from this PC or another, and the tabs, splits, fonts and themes come back; after a dropped connection it reattaches by itself. Session > Switch tmux session lists the other sessions on the server (also offered right after attaching).
 
+tmux makes a window only as big as the smallest client attached to it. If another client (another PC, or one left behind by a dropped connection) keeps a window smaller than the pane, part of the pane stays empty; FeroSSH notices and offers to detach the other clients, and Session > Detach other tmux clients does the same later.
+
 There are two layouts, kept per session:
 
 - **One window per pane** (the default; tmux 3.3 or later): every native pane is its own tmux window, so each pane can have its own font, text size and theme. FeroSSH keeps the splits and looks in the session. A plain tmux client shows the panes as separate windows.

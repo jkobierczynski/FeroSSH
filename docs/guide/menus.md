@@ -137,6 +137,7 @@ Font, theme and text size apply to the focused pane only. Session > Save font an
 | Attach tmux | Types `tmux -CC new-session -A -s main` in the pane and turns tmux windows and panes into native tabs and panes (see [tmux](everyday-use.md#tmux)). |
 | Switch tmux session... | Lists the other tmux sessions on the server and switches to one. |
 | Detach tmux | Leaves tmux, and everything running in it, on the server. Attach again later from this PC or another. |
+| Detach other tmux clients | Detaches every other client from this tmux session, such as one left behind by a dropped connection. tmux makes a window only as big as its smallest client, so another client can leave part of the pane empty; FeroSSH offers this itself when it sees that. |
 | tmux: one window per pane (own fonts) | ✓ on: each native pane is its own tmux window, so each can have its own font. Off: tmux's own splits are the panes. |
 | Use tmux keybindings for tabs and panes | ✓ on: in a pane of a tmux session, your tmux prefix then `c`, `%`, `"`, `n`, `p`, an arrow and the other window and pane keys work the tabs and panes; the prefix then `?` lists them (see [tmux](everyday-use.md#tmux)). Off by default. |
 | Send break (serial) | Holds a serial line in break for 300 ms (Cisco ROM monitor, Linux SysRq). |

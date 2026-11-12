@@ -553,6 +553,8 @@ mod cmd {
     /// Session > Record this pane (asciicast), and Play a recording.
     pub const RECORD_CAST: u32 = 641;
     pub const PLAY_CAST: u32 = 642;
+    /// Session > Detach other tmux clients.
+    pub const TMUX_DETACH_OTHERS: u32 = 643;
     pub const TMUX_ATTACH: u32 = 610;
     pub const TMUX_DETACH: u32 = 611;
     pub const TMUX_PICK: u32 = 612;
@@ -2419,6 +2421,11 @@ fn build_menu() -> Result<HMENU> {
         item(session, cmd::TMUX_DETACH, "&Detach tmux")?;
         item(
             session,
+            cmd::TMUX_DETACH_OTHERS,
+            "Detach other tmux clients",
+        )?;
+        item(
+            session,
             cmd::TMUX_LAYOUT,
             "tmux: one &window per pane (own fonts)",
         )?;
@@ -3265,6 +3272,14 @@ impl Window {
                 tmux::Action::Picker(names) => {
                     self.queued.push(Command::TmuxPicker { gateway, names });
                 }
+                tmux::Action::Crowded { have, want, others } => {
+                    self.queued.push(Command::TmuxCrowded {
+                        gateway,
+                        have,
+                        want,
+                        others,
+                    });
+                }
                 tmux::Action::Notice(text) => {
                     let text = crate::ssh::sanitize(&text);
                     self.show(gateway, &format!("\x1b[0;90m{text}\x1b[0m\r\n"));
@@ -3369,6 +3384,15 @@ impl Window {
             actions.extend(t.sync_saved(&self.ws, &look_of));
             self.run_tmux(g, actions);
         }
+    }
+
+    /// Session > Detach other tmux clients, as answered in the dialog.
+    fn detach_other_tmux(&mut self, gateway: PaneId) {
+        let Some(t) = self.tmux.get_mut(&gateway).filter(|t| t.active()) else {
+            return;
+        };
+        let actions = t.detach_others();
+        self.run_tmux(gateway, actions);
     }
 
     /// SSH pane `id` lost its connection: if it ran tmux, its panes go
@@ -13681,7 +13705,7 @@ impl Window {
                     !self.settings.remote_app_share_selection;
                 self.apply_app_clipboard();
             }
-            cmd::TMUX_DETACH | cmd::TMUX_PICK | cmd::TMUX_LAYOUT => {
+            cmd::TMUX_DETACH | cmd::TMUX_DETACH_OTHERS | cmd::TMUX_PICK | cmd::TMUX_LAYOUT => {
                 let host = self.host_pane(pane);
                 let Some(t) = self.tmux.get_mut(&host).filter(|t| t.active()) else {
                     return Some(Command::Notice(
@@ -13692,6 +13716,7 @@ impl Window {
                 };
                 let actions = match id {
                     cmd::TMUX_DETACH => t.detach(),
+                    cmd::TMUX_DETACH_OTHERS => t.detach_others(),
                     cmd::TMUX_PICK => t.pick_session(),
                     _ => {
                         let mode = match t.mode() {
@@ -15752,6 +15777,14 @@ enum Command {
         pane: PaneId,
         channel: ChannelId,
     },
+    /// Other tmux clients keep gateway `gateway`'s windows small: offer
+    /// to detach them.
+    TmuxCrowded {
+        gateway: PaneId,
+        have: (u16, u16),
+        want: (u16, u16),
+        others: u32,
+    },
     /// A menu of tmux sessions to switch gateway `gateway`'s client to.
     TmuxPicker {
         gateway: PaneId,
@@ -17138,6 +17171,29 @@ fn run_command(hwnd: HWND, command: Command) {
             if dialog(hwnd, &text, MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2) == Some(IDYES) {
                 let problem = recycle(hwnd, &paths).err();
                 files_panel::local_deleted(problem);
+            }
+        }
+        Command::TmuxCrowded {
+            gateway,
+            have,
+            want,
+            others,
+        } => {
+            let clients = if others == 1 {
+                "Another tmux client is".to_owned()
+            } else {
+                format!("{others} other tmux clients are")
+            };
+            let text = format!(
+                "{clients} attached to this tmux session, and tmux makes a window only as \
+                 big as its smallest client. So it shows {}x{} instead of the {}x{} this pane \
+                 has room for, leaving part of the pane empty.\n\n\
+                 Often it is a client left behind by a dropped connection.\n\n\
+                 Detach the other clients? (Later: Session > Detach other tmux clients.)",
+                have.0, have.1, want.0, want.1
+            );
+            if dialog(hwnd, &text, MB_YESNO | MB_ICONQUESTION) == Some(IDYES) {
+                with_window(|w| w.detach_other_tmux(gateway));
             }
         }
         Command::TmuxPicker { gateway, names } => {
