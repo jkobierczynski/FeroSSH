@@ -15830,13 +15830,16 @@ enum Command {
 fn recycle(hwnd: HWND, paths: &[PathBuf]) -> std::result::Result<(), String> {
     use std::os::windows::ffi::OsStrExt;
     use windows::Win32::UI::Shell::{
-        FO_DELETE, FOF_ALLOWUNDO, FOF_NOCONFIRMATION, FOF_WANTNUKEWARNING, SHFILEOPSTRUCTW,
-        SHFileOperationW,
+        FO_DELETE, FOF_ALLOWUNDO, FOF_NO_CONNECTED_ELEMENTS, FOF_NOCONFIRMATION,
+        FOF_WANTNUKEWARNING, SHFILEOPSTRUCTW, SHFileOperationW,
     };
-    // Each path ends in a NUL, and the list in another.
+    // Each path ends in a NUL, and the list in another. Only a full path
+    // goes to the Recycle Bin (a relative one is deleted for good), and
+    // `absolute` keeps a link itself rather than what it points to.
     let mut from: Vec<u16> = Vec::new();
     for p in paths {
-        from.extend(p.as_os_str().encode_wide().filter(|&c| c != 0));
+        let full = std::path::absolute(p).map_err(|e| format!("Delete did not start ({e})."))?;
+        from.extend(full.as_os_str().encode_wide().filter(|&c| c != 0));
         from.push(0);
     }
     from.push(0);
@@ -15844,7 +15847,11 @@ fn recycle(hwnd: HWND, paths: &[PathBuf]) -> std::result::Result<(), String> {
         hwnd,
         wFunc: FO_DELETE,
         pFrom: PCWSTR(from.as_ptr()),
-        fFlags: (FOF_ALLOWUNDO.0 | FOF_NOCONFIRMATION.0 | FOF_WANTNUKEWARNING.0) as u16,
+        // Only what was asked about: not `page_files` with `page.html`.
+        fFlags: (FOF_ALLOWUNDO.0
+            | FOF_NOCONFIRMATION.0
+            | FOF_WANTNUKEWARNING.0
+            | FOF_NO_CONNECTED_ELEMENTS.0) as u16,
         ..Default::default()
     };
     // SAFETY: a valid, double-NUL-terminated list living through the
