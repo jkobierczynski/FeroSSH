@@ -1074,7 +1074,7 @@ struct Window {
     workspace_names: Vec<String>,
 }
 
-/// A workspace's tmux session, waiting for its first pane to log in.
+/// A workspace's tmux session, from opening until tmux shows its panes.
 struct WorkspaceTmux {
     /// The session's name.
     name: String,
@@ -2878,6 +2878,14 @@ impl Window {
 
     /// Carries out what gateway `gateway`'s tmux watcher decided.
     fn run_tmux(&mut self, gateway: PaneId, actions: Vec<tmux::Action>) {
+        // tmux shows the session's panes now: a workspace's plan for it
+        // has done its part.
+        if actions
+            .iter()
+            .any(|a| matches!(a, tmux::Action::Create { .. }))
+        {
+            self.workspace_tmux.remove(&gateway);
+        }
         let mut structure = false;
         for action in actions {
             match action {
@@ -3092,7 +3100,7 @@ impl Window {
             }
             return;
         }
-        self.workspace_tmux.remove(&id);
+        // The plan stays (saving keeps its panes) until tmux shows them.
         if let Some(line) = rebuild {
             self.send_host(id, line.as_bytes());
         }
