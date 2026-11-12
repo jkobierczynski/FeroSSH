@@ -38,6 +38,8 @@ pub enum Kind {
     Snippet(usize),
     /// Run this program as a remote app (Session > Remote apps).
     RemoteApp(String),
+    /// Open this saved workspace (Window > Workspaces).
+    Workspace(String),
 }
 
 /// One line of the palette.
@@ -133,6 +135,18 @@ impl Entry {
         }
     }
 
+    /// A saved workspace to open.
+    pub fn workspace(name: &str) -> Self {
+        Self {
+            prefix: "Open",
+            label: name.to_owned(),
+            hint: "workspace".into(),
+            extra: "workspace layout tabs panes".into(),
+            on: false,
+            kind: Kind::Workspace(name.to_owned()),
+        }
+    }
+
     /// What remembers it among the recent entries.
     fn key(&self) -> String {
         match &self.kind {
@@ -140,6 +154,7 @@ impl Entry {
             Kind::Session(name) => format!("s{name}"),
             Kind::Snippet(_) => format!("n{}", self.label),
             Kind::RemoteApp(p) => format!("r{p}"),
+            Kind::Workspace(w) => format!("w{w}"),
         }
     }
 
@@ -241,6 +256,8 @@ pub enum PalAction {
     Send { index: usize, enter: bool },
     /// Run this program (and arguments) as a remote app.
     RunApp(String),
+    /// Open this saved workspace.
+    OpenWorkspace(String),
     /// Back to the terminal.
     Leave,
 }
@@ -361,6 +378,7 @@ impl CommandPalette {
                 enter: !split,
             },
             Kind::RemoteApp(program) => PalAction::RunApp(program.clone()),
+            Kind::Workspace(name) => PalAction::OpenWorkspace(name.clone()),
         };
         self.recent.retain(|k| *k != key);
         self.recent.insert(0, key);

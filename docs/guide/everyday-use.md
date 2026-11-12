@@ -21,6 +21,33 @@ A split (Window > Split right or Split down) and a new tab (Ctrl+Shift+T) start 
 - A local shell starts in the folder its cmd (`C:\Users\me>`) or PowerShell (`PS C:\Users\me>`) prompt showed last; File > Open local shell does the same from a local pane.
 - When the directory is not known (a prompt FeroSSH does not read, a Telnet pane), the new shell starts in the host's start directory if it has one (below), else where it always starts.
 
+## Workspaces
+
+A workspace is a saved set of tabs and split panes, each pane on a connection, that opens again in one go: the three servers you always watch side by side, or a tab per customer.
+
+- Window > Workspaces > Save layout as workspace... saves the tabs you have open now under a name you give. Each pane keeps the connection it is on, the directory its shell is in, its session name, and its theme and font where you changed them from the host's own.
+- Open one from Window > Workspaces, from the *Workspaces* folder in the connection manager (Enter or a double click; Del deletes it), from the command palette (type its name), or from the command line with `ferossh.exe --workspace NAME`. Its tabs open next to the ones you have; a window that only waits at the connect prompt makes way for them.
+- Panes on the same SSH host log in once: the first pane logs in, and the others wait for it and open on its connection.
+- A workspace names connections; it never holds an address, user, key or password. Editing a connection changes every workspace that uses it, and a workspace file is safe to copy to another PC, keep in git or back up. Logins work as they do anywhere else: keys, the agent, the connection's password source and its login script.
+- A tmux session counts as one pane: tmux brings back its own windows and panes when it attaches again. Remote desktop tabs are left out.
+- Workspaces are files in `%APPDATA%\FeroSSH\workspaces` (Window > Workspaces > Open workspaces folder), one per workspace, in a plain text format you can also write by hand:
+
+```text
+Active 1
+Tab
+    Split right 60
+        Pane connection web1
+            Directory /var/log
+            Name logs
+        Split down 50
+            Pane connection db1
+            Pane local
+Tab
+    Pane prompt
+```
+
+`Split right` puts its two halves side by side and `Split down` one above the other, the number being the first half's share in percent; then come the two halves. A pane opens a `connection` (any name or address the connect prompt takes), a `local` shell or the connect `prompt`, and can have a `Directory`, `Name`, `Theme`, `Font`, `FontSize` and `Focus` (the tab's focused pane). `Active` is the tab shown first. Window > Workspaces > Open workspace file... opens one from anywhere.
+
 ## Connecting
 
 Ctrl+Shift+N (File > Connect to...) asks for a host in a new tab. It takes `user@host`, `host:2222`, a `Host` alias from `~/.ssh/config`, a saved connection's name, `sftp://user@host/folder` (file transfer only, see [SFTP-only connections](#sftp-only-connections)), `telnet://router`, `winrm://server`, `winrms://server` (WinRM over HTTPS) or a COM port such as `COM3:115200`. File > Reconnect (Ctrl+Shift+R) logs in again and File > Disconnect ends the connection.

@@ -43,6 +43,8 @@ enum Row {
 }
 
 const FAVOURITES: &str = "Favourites";
+/// The native tree's folder of saved workspaces.
+const WORKSPACES: &str = "Workspaces";
 /// Header lines above the rows: the title and the search line.
 const HEADER: usize = 2;
 
@@ -90,6 +92,10 @@ pub enum SideAction {
     Edit(String),
     /// Remove this saved session (the window asks first).
     Delete(String),
+    /// Open this saved workspace (the native tree's Workspaces folder).
+    OpenWorkspace(String),
+    /// Remove this saved workspace (the window asks first).
+    DeleteWorkspace(String),
     /// Give the keyboard back to the terminal.
     Leave,
 }
@@ -102,6 +108,8 @@ pub struct SessionList {
     collapsed: HashSet<String>,
     selected: usize,
     scroll: usize,
+    /// Saved workspaces for the native tree: name and what it holds.
+    workspaces: Vec<(String, String)>,
 }
 
 impl SessionList {
@@ -538,6 +546,8 @@ pub struct TreeHost {
     pub tip: String,
     /// `user@hostname:port`, shown dimmed after the label.
     pub detail: String,
+    /// A saved workspace, not a host: opening it opens its tabs.
+    pub workspace: bool,
 }
 
 /// A top-level entry of the native connection tree.
@@ -589,7 +599,31 @@ impl SessionList {
             label,
             tip,
             detail: h.detail.clone(),
+            workspace: false,
         })
+    }
+
+    /// Sets the saved workspaces the native tree shows: each one's name
+    /// and what it holds.
+    pub fn set_workspaces(&mut self, workspaces: Vec<(String, String)>) {
+        self.workspaces = workspaces;
+    }
+
+    /// The saved workspaces as tree items; while searching, only those
+    /// whose name matches.
+    fn tree_workspaces(&self) -> Vec<TreeHost> {
+        let query = self.query.trim().to_lowercase();
+        self.workspaces
+            .iter()
+            .filter(|(name, _)| query.is_empty() || name.to_lowercase().contains(&query))
+            .map(|(name, detail)| TreeHost {
+                name: name.clone(),
+                label: name.clone(),
+                tip: format!("Workspace \u{b7} {detail}: opens its tabs and panes"),
+                detail: detail.clone(),
+                workspace: true,
+            })
+            .collect()
     }
 
     /// The hosts as the native tree shows them: the same order and folders
@@ -598,8 +632,9 @@ impl SessionList {
     pub fn tree(&self) -> Vec<TreeNode> {
         let host = |i: usize| self.tree_host(i);
         if !self.query.trim().is_empty() {
-            // The drawn list's search rows: matches only, favourites first.
-            return self
+            // The drawn list's search rows: matches only, favourites
+            // first, then the workspaces that match.
+            let mut found: Vec<TreeNode> = self
                 .rows()
                 .into_iter()
                 .filter_map(|r| match r {
@@ -607,6 +642,8 @@ impl SessionList {
                     Row::Folder { .. } | Row::New => None,
                 })
                 .collect();
+            found.extend(self.tree_workspaces().into_iter().map(TreeNode::Host));
+            return found;
         }
         let mut out = Vec::new();
         let favs: Vec<TreeHost> = (0..self.hosts.len())
@@ -621,6 +658,13 @@ impl SessionList {
             out.push(TreeNode::Folder {
                 name: FAVOURITES.to_owned(),
                 hosts: favs,
+            });
+        }
+        let workspaces = self.tree_workspaces();
+        if !workspaces.is_empty() {
+            out.push(TreeNode::Folder {
+                name: WORKSPACES.to_owned(),
+                hosts: workspaces,
             });
         }
         out.extend(
@@ -658,7 +702,7 @@ impl SessionList {
     /// typed when nothing matches.
     pub fn first_match(&self) -> Option<String> {
         let tree = self.tree();
-        if let Some(h) = tree.iter().flat_map(TreeNode::hosts).next() {
+        if let Some(h) = tree.iter().flat_map(TreeNode::hosts).find(|h| !h.workspace) {
             return Some(h.name.clone());
         }
         let typed = self.query.trim();
@@ -788,6 +832,24 @@ mod tests {
         assert_eq!(l.first_match().as_deref(), Some("new.example.org"));
         l.set_query("");
         assert_eq!(l.first_match().as_deref(), Some("pi"));
+    }
+
+    #[test]
+    fn workspaces_get_a_folder_and_are_found_but_never_opened_as_hosts() {
+        let mut l = list();
+        l.set_workspaces(vec![("Web day".into(), "2 tabs, 3 panes".into())]);
+        let tree = l.tree();
+        assert!(matches!(&tree[1], TreeNode::Folder { name, .. } if name == "Workspaces"));
+        let w = &tree[1].hosts()[0];
+        assert!(w.workspace);
+        assert_eq!(w.detail, "2 tabs, 3 panes");
+        l.set_query("web");
+        let found = l.tree();
+        assert_eq!(found.len(), 2);
+        assert!(found[1].hosts()[0].workspace);
+        assert_eq!(l.first_match().as_deref(), Some("web"));
+        l.set_query("day");
+        assert_eq!(l.first_match().as_deref(), Some("day"));
     }
 
     #[test]

@@ -30,6 +30,7 @@ use ferossh_config::settings::{DEFAULT_DESKTOP_PORT, DEFAULT_MOSH_SERVER, DEFAUL
 use ferossh_config::snippet_import::{self, SnippetClient};
 use ferossh_config::snippet_store;
 use ferossh_config::trigger::{Fire, Watch};
+use ferossh_config::workspace::{self as wsfile, Open as WsOpen, PaneSpec};
 use ferossh_config::{
     ForwardSpec, SessionKind, Settings, WindowColours, mobaxterm, mremoteng, putty, securecrt,
     ssh_config, winscp,
@@ -165,6 +166,7 @@ use crate::ui_colours::{self, UiColours};
 use crate::ui_theme;
 use crate::vdesk;
 use crate::winrm::{WinrmCloser, WinrmSession, WinrmTarget};
+use crate::workspaces;
 use crate::zmodem;
 use ferossh_tmuxcc::saved as tmux_saved;
 use zeroize::Zeroizing;
@@ -482,12 +484,26 @@ mod cmd {
     /// into the windows listed when the menu opened.
     pub const STANDBY_OWN: u32 = 750;
     pub const STANDBY_TARGET: u32 = 751;
+    /// Window > Workspaces: save the layout, open a file, the folder.
+    pub const WORKSPACE_SAVE: u32 = 1100;
+    pub const WORKSPACE_BROWSE: u32 = 1101;
+    pub const WORKSPACE_FOLDER: u32 = 1102;
+    /// Plus the index into the workspaces listed when the menu opened, up
+    /// to [`WORKSPACE_END`].
+    pub const WORKSPACE_OPEN: u32 = 1110;
+    pub const WORKSPACE_END: u32 = 1200;
     pub const UPDATE_CHECK: u32 = 900;
     pub const UPDATE_WEEKLY: u32 = 901;
     pub const ABOUT: u32 = 902;
 }
 
 const DIRS: [Dir; 4] = [Dir::Left, Dir::Right, Dir::Up, Dir::Down];
+
+/// Workspaces Window > Workspaces lists (more open with Open workspace
+/// file).
+const MAX_MENU_WORKSPACES: usize = (cmd::WORKSPACE_END - cmd::WORKSPACE_OPEN) as usize;
+/// The items Window > Workspaces always has, before the list.
+const WORKSPACE_MENU_FIXED: i32 = 3;
 
 /// The frame around every pane that broadcast input reaches.
 const BROADCAST_FRAME: Rgb = Rgb::new(0xe5, 0x8e, 0x26);
@@ -1049,6 +1065,11 @@ struct Window {
     run_login: HashSet<PaneId>,
     /// The last line each of those showed: why a login failed.
     run_notes: HashMap<PaneId, String>,
+    /// A workspace's panes waiting for another pane on their host to log
+    /// in.
+    workspace_waiting: workspaces::Waiting,
+    /// The workspaces Window > Workspaces listed when it last opened.
+    workspace_names: Vec<String>,
 }
 
 /// A login script running in a pane.
@@ -1213,6 +1234,7 @@ pub fn run_error(problem: &str) -> Result<()> {
     let text = HSTRING::from(format!(
         "{problem}\n\nUsage:\n  ferossh [--theme NAME] [-l user] [-p port] [--no-sandbox] [user@]host[:port]\n  \
          ferossh [--theme NAME] --local [command]\n  \
+         ferossh [--theme NAME] --workspace NAME\n  \
          ferossh --new-security-key [--hello] [--ed25519] FILE"
     ));
     // SAFETY: plain message box with valid strings.
@@ -1319,6 +1341,30 @@ fn load_settings() -> Settings {
 /// The scripts folder: a file per script, a folder per category (see
 /// [`snippet_store`]). The `snippets` folder of an older FeroSSH is
 /// renamed to it the first time.
+/// Where workspaces are saved, one file each.
+fn workspaces_dir() -> PathBuf {
+    app_dir().join("workspaces")
+}
+
+/// The saved workspaces for the connection manager: each one's name and
+/// how many tabs and panes it opens.
+fn workspace_items() -> Vec<(String, String)> {
+    let dir = workspaces_dir();
+    wsfile::list(&dir)
+        .into_iter()
+        .map(|name| {
+            let detail = match wsfile::path_for(&dir, &name).map(|p| wsfile::read(&p)) {
+                Some(Ok(ws)) => {
+                    let (tabs, panes) = (ws.tabs.len(), ws.pane_count());
+                    format!("{tabs} tab{}, {panes} pane{}", plural(tabs), plural(panes))
+                }
+                _ => "cannot be read".to_owned(),
+            };
+            (name, detail)
+        })
+        .collect()
+}
+
 fn snippets_dir() -> PathBuf {
     snippet_store::move_old_folder(&app_dir().join("scripts"), &app_dir().join("snippets"))
 }
@@ -1751,7 +1797,10 @@ fn create_and_run(launch: Launch, theme: Option<String>) -> Result<()> {
                     Launch::Local(c) if !c.is_empty() => c.clone(),
                     _ => conpty::default_command(),
                 },
-                sandbox: !matches!(launch, Launch::Ssh { sandbox: false, .. }),
+                sandbox: !matches!(
+                    launch,
+                    Launch::Ssh { sandbox: false, .. } | Launch::Workspace { sandbox: false, .. }
+                ),
                 workers: HashMap::new(),
                 retiring: Vec::new(),
                 via: HashMap::new(),
@@ -1809,6 +1858,8 @@ fn create_and_run(launch: Launch, theme: Option<String>) -> Result<()> {
                 folders: None,
                 run_hidden: HashSet::new(),
                 run_login: HashSet::new(),
+                workspace_waiting: workspaces::Waiting::default(),
+                workspace_names: Vec::new(),
                 run_notes: HashMap::new(),
                 standby: Standby::new(),
             });
@@ -1880,6 +1931,15 @@ fn create_and_run(launch: Launch, theme: Option<String>) -> Result<()> {
                 destination: Some(d),
                 ..
             } => with_window(|w| w.connect(first, &d)),
+            Launch::Workspace { name, .. } => {
+                with_window(|w| w.ask_destination(first));
+                // The window waits at the connect prompt, so the workspace
+                // takes its place.
+                if let Some(next) = with_window(|w| w.open_workspace_named(&name)).flatten() {
+                    run_command(hwnd, next);
+                }
+                Some(())
+            }
             _ => with_window(|w| w.ask_destination(first)),
         };
         let _ = ShowWindow(hwnd, SW_SHOW);
@@ -2219,6 +2279,16 @@ fn build_menu() -> Result<HMENU> {
         let window = CreatePopupMenu()?;
         item(window, cmd::NEW_TAB, "Ne&w tab\tCtrl+Shift+T")?;
         item(window, cmd::RENAME, "Rena&me session...")?;
+        // The saved workspaces are added each time it opens.
+        let workspaces = CreatePopupMenu()?;
+        item(
+            workspaces,
+            cmd::WORKSPACE_SAVE,
+            "&Save layout as workspace...",
+        )?;
+        item(workspaces, cmd::WORKSPACE_BROWSE, "&Open workspace file...")?;
+        item(workspaces, cmd::WORKSPACE_FOLDER, "Open workspaces &folder")?;
+        AppendMenuW(window, MF_POPUP, workspaces.0 as usize, w!("Wor&kspaces"))?;
         let standby = CreatePopupMenu()?;
         item(
             standby,
@@ -5936,9 +6006,11 @@ impl Window {
                         self.tmux_after_login(id);
                     }
                     self.desktop_after_login(id);
+                    self.release_workspace_panes(id, true);
                 }
                 Effect::Reconnect => self.schedule_reconnect(id),
                 Effect::Ended => {
+                    self.release_workspace_panes(id, false);
                     if !self.run_login.contains(&id)
                         && let Some(row) =
                             self.snippets_view.report_mut().and_then(|r| r.row_mut(id))
@@ -9210,6 +9282,8 @@ impl Window {
                     },
                 );
             }
+            Some(SideAction::OpenWorkspace(name)) => out = self.open_workspace_named(&name),
+            Some(SideAction::DeleteWorkspace(name)) => out = Some(Command::DeleteWorkspace(name)),
             Some(SideAction::Leave) => self.focus_terminal(),
             None => {}
         }
@@ -9316,7 +9390,13 @@ impl Window {
         // palette shows them.
         self.update_menu_checks();
         let mut entries = menu_entries(self.menu);
-        entries.retain(|e| e.kind != palette::Kind::Action(cmd::PALETTE));
+        // The workspaces Window > Workspaces listed are offered fresh below.
+        entries.retain(|e| match e.kind {
+            palette::Kind::Action(id) => {
+                id != cmd::PALETTE && !(cmd::WORKSPACE_OPEN..cmd::WORKSPACE_END).contains(&id)
+            }
+            _ => true,
+        });
         let env = ssh_env();
         entries.extend(
             host_items(&env, &self.settings)
@@ -9331,6 +9411,11 @@ impl Window {
                 .enumerate()
                 .filter(|(_, s)| s.applies(place.as_ref()))
                 .map(|(i, s)| palette::Entry::snippet(i, &s.name, &s.lines)),
+        );
+        entries.extend(
+            wsfile::list(&workspaces_dir())
+                .iter()
+                .map(|n| palette::Entry::workspace(n)),
         );
         self.palette.open(entries);
         // Snippets that only peeked go with the palette.
@@ -9369,6 +9454,7 @@ impl Window {
             PalAction::Run(id) if is_side_pane(id) => self.toggle_side(id, true),
             PalAction::Run(id) => return Some(Command::Id(id)),
             PalAction::Open { host, split } => self.open_host(&host, split),
+            PalAction::OpenWorkspace(name) => return self.open_workspace_named(&name),
             PalAction::Send { index, enter } => {
                 let s = self.settings.snippets.get(index)?.clone();
                 return self.send_snippet(&s.name, &s.lines, enter);
@@ -10954,6 +11040,465 @@ impl Window {
         }
     }
 
+    /// What pane `id` opens, for a saved workspace; `None` leaves it out
+    /// (a remote desktop, or a tmux pane whose session another pane
+    /// already stands for). `tmux` collects the tmux sessions seen.
+    fn workspace_pane(&self, id: PaneId, tmux: &mut HashSet<PaneId>) -> Option<PaneSpec> {
+        let p = self.panes.get(&id)?;
+        // A tmux session is one pane in the workspace: tmux restores its
+        // windows and their layout when it attaches again.
+        let gateway = p
+            .gateway()
+            .or_else(|| self.tmux.get(&id).filter(|t| t.active()).map(|_| id));
+        let (from, in_tmux) = match gateway {
+            Some(g) => {
+                if !tmux.insert(g) {
+                    return None;
+                }
+                (self.panes.get(&g)?, true)
+            }
+            None => (p, false),
+        };
+        let bracket = |h: &str| {
+            if h.contains(':') {
+                format!("[{h}]")
+            } else {
+                h.to_owned()
+            }
+        };
+        let kind = |alias: &str| self.settings.profile(alias).map(|p| p.kind);
+        let (open, dir, host) = match &from.host {
+            Host::Ask(_) => (WsOpen::Prompt, None, None),
+            Host::Local { .. } => (WsOpen::Local, from.local_cwd.clone(), None),
+            Host::Ssh(s) => {
+                let t = &s.target;
+                let dest = if t.sftp_only
+                    && kind(&t.alias) != Some(SessionKind::Sftp)
+                    && !t.alias.to_ascii_lowercase().starts_with("sftp://")
+                {
+                    format!("sftp://{}", t.alias)
+                } else {
+                    t.alias.clone()
+                };
+                let dir = (!in_tmux)
+                    .then(|| {
+                        from.cwd
+                            .as_deref()
+                            .map(|d| String::from_utf8_lossy(d).into_owned())
+                    })
+                    .flatten();
+                (
+                    WsOpen::Connection(dest),
+                    dir,
+                    Some((t.alias.clone(), t.hostname.clone(), t.tag.clone())),
+                )
+            }
+            Host::Telnet(s) => {
+                let t = &s.target;
+                let dest = if kind(&t.alias) == Some(SessionKind::Telnet) {
+                    t.alias.clone()
+                } else {
+                    format!("telnet://{}:{}", bracket(&t.hostname), t.port)
+                };
+                (
+                    WsOpen::Connection(dest),
+                    None,
+                    Some((t.alias.clone(), t.hostname.clone(), t.tag.clone())),
+                )
+            }
+            Host::Winrm(s) => {
+                let t = &s.target;
+                let dest = if kind(&t.alias) == Some(SessionKind::WinRm) {
+                    t.alias.clone()
+                } else {
+                    let scheme = if t.https { "winrms" } else { "winrm" };
+                    let user = t
+                        .user
+                        .as_deref()
+                        .map(|u| format!("{u}@"))
+                        .unwrap_or_default();
+                    format!("{scheme}://{user}{}:{}", bracket(&t.hostname), t.port)
+                };
+                (
+                    WsOpen::Connection(dest),
+                    None,
+                    Some((t.alias.clone(), t.hostname.clone(), t.tag.clone())),
+                )
+            }
+            Host::Serial {
+                target, session, ..
+            } => {
+                let dest = session.clone().unwrap_or_else(|| target.to_string());
+                let alias = session.clone().unwrap_or_else(|| target.port.clone());
+                (
+                    WsOpen::Connection(dest),
+                    None,
+                    Some((alias, target.port.clone(), None)),
+                )
+            }
+            Host::Tmux { .. } | Host::Desktop { .. } => return None,
+        };
+        let mut spec = PaneSpec::new(open);
+        spec.dir = dir.filter(|d| !d.is_empty());
+        if !in_tmux {
+            spec.name = p.name.clone();
+        }
+        // The look is kept only where it differs from what the host (or
+        // a new pane) gets anyway, so changing a host's look later still
+        // reaches the workspace. A Production or Staging warning colour
+        // is never overridden.
+        let (font, theme) = match &host {
+            Some((alias, hostname, tag)) => look::for_host(
+                &self.settings,
+                alias,
+                hostname,
+                tag.as_deref(),
+                &FontSpec::default(),
+                &self.default_theme,
+            ),
+            None => (FontSpec::default(), self.default_theme.clone()),
+        };
+        if p.theme.name != theme.name
+            && theme.group() != ThemeGroup::Warning
+            && p.theme.group() != ThemeGroup::Warning
+        {
+            spec.theme = Some(p.theme.name.to_owned());
+        }
+        if !p.font.family.eq_ignore_ascii_case(&font.family) {
+            spec.font = Some(p.font.family.clone());
+        }
+        if (p.font.size_pt - font.size_pt).abs() > 0.01 {
+            spec.font_size = Some(p.font.size_pt);
+        }
+        Some(spec)
+    }
+
+    /// The window's tabs as a workspace; `None` when no pane can be
+    /// saved. Also says how many panes were left out (remote desktops).
+    fn workspace_now(&self) -> (Option<wsfile::Workspace>, usize) {
+        let mut tmux = HashSet::new();
+        let mut skipped = 0;
+        let ws = workspaces::capture(&self.ws.tabs, self.ws.active, &mut |id| {
+            let spec = self.workspace_pane(id, &mut tmux);
+            if spec.is_none()
+                && matches!(
+                    self.panes.get(&id).map(|p| &p.host),
+                    Some(Host::Desktop { .. })
+                )
+            {
+                skipped += 1;
+            }
+            spec
+        });
+        (ws, skipped)
+    }
+
+    /// Window > Workspaces > Save layout as workspace, to `path`.
+    fn save_workspace(&mut self, path: &Path) -> std::result::Result<String, String> {
+        let (ws, skipped) = self.workspace_now();
+        let ws = ws.ok_or_else(|| {
+            "There is nothing to save: remote desktops are not kept in workspaces.".to_owned()
+        })?;
+        if !wsfile::fits(&ws) {
+            return Err(format!(
+                "A workspace holds at most {} tabs and {} panes.",
+                wsfile::MAX_TABS,
+                wsfile::MAX_PANES
+            ));
+        }
+        wsfile::write(path, &ws).map_err(|e| format!("Could not save {}: {e}", path.display()))?;
+        let name = path
+            .file_stem()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let (tabs, panes) = (ws.tabs.len(), ws.pane_count());
+        let mut text = format!(
+            "Saved the workspace {name}: {tabs} tab{} with {panes} pane{}. \
+             Window > Workspaces opens it again.",
+            plural(tabs),
+            plural(panes),
+        );
+        if skipped > 0 {
+            text.push_str(&format!(
+                " {skipped} pane{} left out: workspaces do not keep remote desktops.",
+                plural(skipped)
+            ));
+        }
+        Ok(text)
+    }
+
+    /// Opens the workspace called `name` in the workspaces folder, or the
+    /// file `name` names.
+    fn open_workspace_named(&mut self, name: &str) -> Option<Command> {
+        let path = if name.contains(['\\', '/'])
+            || name
+                .rsplit_once('.')
+                .is_some_and(|(_, e)| e.eq_ignore_ascii_case(wsfile::EXTENSION))
+        {
+            PathBuf::from(name)
+        } else {
+            match wsfile::path_for(&workspaces_dir(), name) {
+                Some(p) => p,
+                None => return Some(Command::Notice(format!("There is no workspace {name}."))),
+            }
+        };
+        match wsfile::read(&path) {
+            Ok(ws) => {
+                self.open_workspace(&ws);
+                None
+            }
+            Err(e) => Some(Command::Notice(e)),
+        }
+    }
+
+    /// Opens `ws` as new tabs; a window that only waits at the connect
+    /// prompt gives its tab up to it. Panes on one SSH host log in once:
+    /// the first logs in, the others wait for it and open on its
+    /// connection.
+    fn open_workspace(&mut self, ws: &wsfile::Workspace) {
+        let all = self.ws.all_panes();
+        let idle = match all.as_slice() {
+            [only] => matches!(
+                self.panes.get(only).map(|p| &p.host),
+                Some(Host::Ask(t)) if t.is_empty()
+            )
+            .then_some(*only),
+            _ => None,
+        };
+        let mut opened: Vec<(PaneId, PaneSpec)> = Vec::new();
+        let mut focus_of_active = None;
+        for (i, tab) in ws.tabs.iter().enumerate() {
+            let mut panes = Vec::new();
+            let ids = &mut self.ws;
+            let root = workspaces::node_of(&tab.root, &mut || ids.alloc_id(), &mut panes);
+            let Some(focus) = panes
+                .get(tab.focus)
+                .or_else(|| panes.first())
+                .map(|(id, _)| *id)
+            else {
+                continue;
+            };
+            let at = self.ws.tabs.len();
+            self.ws.insert_tab(at, root, focus);
+            for (id, _) in &panes {
+                self.add_pane(*id);
+            }
+            if i == ws.active || focus_of_active.is_none() {
+                focus_of_active = Some(focus);
+            }
+            opened.extend(panes);
+        }
+        let Some(focus) = focus_of_active else {
+            return;
+        };
+        if let Some(old) = idle
+            && self.ws.remove_pane(old)
+        {
+            self.end_host(old);
+            self.panes.remove(&old);
+        }
+        self.focus_pane(focus);
+        self.focus_terminal();
+        // Laid out first, so each shell starts with its pane's size.
+        self.after_structure_change();
+        let mut leads: HashMap<String, PaneId> = HashMap::new();
+        for (id, spec) in opened {
+            self.open_workspace_pane(id, &spec, &mut leads);
+            self.workspace_look(id, &spec);
+            if let Some(name) = spec.name.clone() {
+                self.rename_session(id, Some(name));
+            }
+        }
+        self.update_title();
+        self.refresh_chrome();
+        self.request_full_redraw();
+    }
+
+    /// Opens what a workspace's pane `id` opens. An SSH host another pane
+    /// of the workspace already logs in to waits for that login.
+    fn open_workspace_pane(
+        &mut self,
+        id: PaneId,
+        spec: &PaneSpec,
+        leads: &mut HashMap<String, PaneId>,
+    ) {
+        let dest = match &spec.open {
+            WsOpen::Prompt => {
+                self.ask_destination(id);
+                return;
+            }
+            WsOpen::Local => {
+                self.start_shell_in(id, spec.dir.as_deref());
+                return;
+            }
+            WsOpen::Connection(d) => d.clone(),
+        };
+        let kind = self.settings.profile(&dest).map(|p| p.kind);
+        match kind {
+            Some(SessionKind::Serial) => {
+                let line = self
+                    .settings
+                    .profile(&dest)
+                    .and_then(|p| p.serial)
+                    .unwrap_or_default();
+                let hostname = Target::resolve(&dest, &ssh_env()).map(|t| t.hostname);
+                match hostname
+                    .as_deref()
+                    .and_then(serial::port_name)
+                    .or_else(|| serial::port_name(&dest))
+                {
+                    Some(port) => self.open_serial(
+                        id,
+                        SerialTarget {
+                            port,
+                            settings: line,
+                        },
+                        Some(&dest),
+                    ),
+                    None => {
+                        self.show(
+                            id,
+                            &format!(
+                                "\x1b[0;31mThe connection {} has no COM port.\x1b[0m\r\n",
+                                crate::ssh::sanitize(&dest)
+                            ),
+                        );
+                        self.ask_destination(id);
+                    }
+                }
+                return;
+            }
+            Some(
+                SessionKind::Rdp | SessionKind::Vnc | SessionKind::Xvfb | SessionKind::RemoteApp,
+            ) => {
+                self.show(
+                    id,
+                    &format!(
+                        "\x1b[0;90m{} is a remote desktop or app connection: open it from the \
+                         Connection manager. Workspaces keep terminal panes.\x1b[0m\r\n",
+                        crate::ssh::sanitize(&dest)
+                    ),
+                );
+                self.ask_destination(id);
+                return;
+            }
+            _ => {}
+        }
+        let shares = workspaces::shares_login(&dest, kind.map(|k| k == SessionKind::Ssh));
+        let key = dest.to_ascii_lowercase();
+        if shares
+            && let Some(&lead) = leads.get(&key)
+            && matches!(self.panes.get(&lead).map(|p| &p.host), Some(Host::Ssh(_)))
+        {
+            self.show(
+                id,
+                &format!(
+                    "\x1b[0;90mWaiting for {} to log in in another pane; this pane then opens \
+                     on the same connection.\x1b[0m\r\n",
+                    crate::ssh::sanitize(&dest)
+                ),
+            );
+            self.workspace_waiting.add(id, lead, dest, spec.clone());
+            return;
+        }
+        self.connect_with_dir(id, &dest, spec.dir.as_deref());
+        if shares && matches!(self.panes.get(&id).map(|p| &p.host), Some(Host::Ssh(_))) {
+            leads.insert(key, id);
+        }
+    }
+
+    /// Connects pane `id` to `dest`; an SSH shell goes to `dir` once
+    /// logged in.
+    fn connect_with_dir(&mut self, id: PaneId, dest: &str, dir: Option<&str>) {
+        self.connect(id, dest);
+        if let Some(p) = self.panes.get_mut(&id)
+            && matches!(p.host, Host::Ssh(_))
+            && let Some(dir) = dir
+        {
+            p.start_dir = Some(dir.as_bytes().to_vec());
+        }
+    }
+
+    /// A workspace pane's own look, over its host's: never over a
+    /// Production or Staging warning colour.
+    fn workspace_look(&mut self, id: PaneId, spec: &PaneSpec) {
+        let Some(p) = self.panes.get(&id) else {
+            return;
+        };
+        if let Some(theme) = spec.theme.as_deref().and_then(Theme::by_name)
+            && p.theme.group() != ThemeGroup::Warning
+            && theme.group() != ThemeGroup::Warning
+        {
+            self.set_theme(id, theme);
+        }
+        let Some(p) = self.panes.get(&id) else {
+            return;
+        };
+        if spec.font.is_some() || spec.font_size.is_some() {
+            let mut font = p.font.clone();
+            if let Some(family) = &spec.font {
+                font.family.clone_from(family);
+            }
+            if let Some(size) = spec.font_size {
+                font.size_pt = size.clamp(FontSpec::MIN_PT, FontSpec::MAX_PT);
+            }
+            self.set_font(id, font);
+        }
+    }
+
+    /// The panes of a workspace that waited for pane `lead` to log in.
+    /// Logged in (`ok`): they open on its connection. Failed: the first of
+    /// them logs in itself, and the rest wait for that one.
+    fn release_workspace_panes(&mut self, lead: PaneId, ok: bool) {
+        if self.workspace_waiting.is_empty() {
+            return;
+        }
+        let mut new_lead: Option<PaneId> = None;
+        for (pane, dest, spec) in self.workspace_waiting.take(lead) {
+            // The user may have typed a destination of their own meanwhile.
+            let free = matches!(
+                self.panes.get(&pane).map(|p| &p.host),
+                Some(Host::Ask(t)) if t.is_empty()
+            );
+            if !free {
+                continue;
+            }
+            match new_lead {
+                Some(l) if !ok => self.workspace_waiting.add(pane, l, dest, spec),
+                _ => {
+                    self.connect_with_dir(pane, &dest, spec.dir.as_deref());
+                    // Its host's look came with the login: the workspace's
+                    // goes over it again.
+                    self.workspace_look(pane, &spec);
+                    if !ok && matches!(self.panes.get(&pane).map(|p| &p.host), Some(Host::Ssh(_))) {
+                        new_lead = Some(pane);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Window > Workspaces, as it opens: the saved workspaces after the
+    /// first items.
+    fn fill_workspaces(&mut self, menu: HMENU) {
+        self.workspace_names = wsfile::list(&workspaces_dir());
+        self.workspace_names.truncate(MAX_MENU_WORKSPACES);
+        // SAFETY: our popup menu; it is being opened, when changing it is
+        // allowed. Only the items after the fixed ones are replaced.
+        unsafe {
+            while GetMenuItemCount(Some(menu)) > WORKSPACE_MENU_FIXED {
+                let _ = DeleteMenu(menu, WORKSPACE_MENU_FIXED as u32, MF_BYPOSITION);
+            }
+            if !self.workspace_names.is_empty() {
+                let _ = AppendMenuW(menu, MF_SEPARATOR, 0, None);
+            }
+            for (id, name) in (cmd::WORKSPACE_OPEN..).zip(&self.workspace_names) {
+                let label = name.replace('&', "&&");
+                let _ = AppendMenuW(menu, MF_STRING, id as usize, &HSTRING::from(label));
+            }
+        }
+    }
+
     /// Connect to...: asks for a destination in `pane` if it is already
     /// waiting at the connect prompt, else in a new tab, so the shells
     /// already open keep running.
@@ -11018,6 +11563,7 @@ impl Window {
                     host_items(&env, &self.settings),
                     self.settings.favourites.clone(),
                 );
+                self.side.list.set_workspaces(workspace_items());
             }
             SideView::Files => {
                 // Opening the view lists the focused pane's directory.
@@ -11186,6 +11732,8 @@ impl Window {
             return None;
         }
         self.reattach.remove(&id);
+        self.workspace_waiting.forget(id);
+        self.release_workspace_panes(id, false);
         match self.ws.close(id) {
             Some(Closed::Window) => return Some(Command::Destroy),
             Some(_) => {}
@@ -12016,6 +12564,16 @@ impl Window {
             cmd::EXIT => return Some(Command::Exit),
             cmd::CLOSE_TAB => return Some(Command::CloseTab(self.ws.active)),
             cmd::RENAME => self.start_rename(pane),
+            cmd::WORKSPACE_SAVE => return Some(Command::SaveWorkspace),
+            cmd::WORKSPACE_BROWSE => return Some(Command::OpenWorkspaceFile),
+            cmd::WORKSPACE_FOLDER => return Some(Command::OpenFolder(workspaces_dir())),
+            id if (cmd::WORKSPACE_OPEN..cmd::WORKSPACE_END).contains(&id) => {
+                let name = self
+                    .workspace_names
+                    .get((id - cmd::WORKSPACE_OPEN) as usize)
+                    .cloned()?;
+                return self.open_workspace_named(&name);
+            }
             cmd::STANDBY_STATUS => {
                 let what = self.standby_what();
                 return Some(Command::Notice(
@@ -14219,6 +14777,10 @@ enum BrokerFor {
 
 enum Command {
     Id(u32),
+    /// Window > Workspaces > Save layout as workspace: asks for a name.
+    SaveWorkspace,
+    /// Window > Workspaces > Open workspace file: asks which.
+    OpenWorkspaceFile,
     /// Tools > New SSH key: the window that asks what to make.
     NewKey,
     /// The new key is made, or why not; `host` is what the pane it was
@@ -14316,6 +14878,8 @@ enum Command {
     TabMenu(usize),
     /// Ask, then remove this saved session.
     DeleteSession(String),
+    /// Ask, then remove this saved workspace's file.
+    DeleteWorkspace(String),
     /// The session manager's Delete: ask (when it is still open, or the
     /// last pane), then close the session's pane.
     CloseSession {
@@ -15472,6 +16036,15 @@ fn run_command(hwnd: HWND, command: Command) {
         }
         Command::ReplaceHostKey => replace_host_key(hwnd),
         Command::NewKey => new_key(hwnd),
+        Command::SaveWorkspace => save_workspace_as(hwnd),
+        Command::OpenWorkspaceFile => {
+            if let Some(path) = pick_workspace(hwnd, false)
+                && let Some(next) =
+                    with_window(|w| w.open_workspace_named(&path.to_string_lossy())).flatten()
+            {
+                run_command(hwnd, next);
+            }
+        }
         Command::KeyMade {
             path,
             result,
@@ -15720,6 +16293,28 @@ fn run_command(hwnd: HWND, command: Command) {
                     });
                 }
             });
+        }
+        Command::DeleteWorkspace(name) => {
+            let text = format!(
+                "Delete the workspace {name}? Its connections stay as they are.\n\n\
+                 This cannot be undone."
+            );
+            if dialog(hwnd, &text, MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2) == Some(IDYES)
+                && let Some(path) = wsfile::path_for(&workspaces_dir(), &name)
+            {
+                if let Err(e) = std::fs::remove_file(&path) {
+                    dialog(
+                        hwnd,
+                        &format!("Could not delete {}: {e}", path.display()),
+                        MB_OK | MB_ICONERROR,
+                    );
+                }
+                with_window(|w| {
+                    if w.side.visible && w.side.view == SideView::Sessions {
+                        w.show_side(SideView::Sessions, w.side.focused);
+                    }
+                });
+            }
         }
         Command::DeleteSession(name) => {
             let text = format!(
@@ -16302,6 +16897,83 @@ fn read_import_file(path: &std::path::Path) -> std::result::Result<ImportSource,
 /// behind two confirmations, then reconnect.
 /// Tools > New SSH key: asks what to make, then makes it in the
 /// background.
+/// The save or open dialog for a workspace file, starting in the
+/// workspaces folder.
+fn pick_workspace(hwnd: HWND, save: bool) -> Option<PathBuf> {
+    use windows::Win32::UI::Controls::Dialogs::{GetSaveFileNameW, OFN_OVERWRITEPROMPT};
+    if DIALOG_OPEN.get() {
+        return None;
+    }
+    let dir = workspaces_dir();
+    let _ = std::fs::create_dir_all(&dir);
+    let dir = crate::native::wide(&dir.display().to_string());
+    let mut buf = vec![0u16; 4096];
+    let filter: Vec<u16> = "FeroSSH workspaces (*.workspace)\0*.workspace\0All files\0*.*\0\0"
+        .encode_utf16()
+        .collect();
+    let mut ofn = OPENFILENAMEW {
+        lStructSize: std::mem::size_of::<OPENFILENAMEW>() as u32,
+        hwndOwner: hwnd,
+        lpstrFilter: PCWSTR(filter.as_ptr()),
+        lpstrFile: PWSTR(buf.as_mut_ptr()),
+        nMaxFile: (buf.len() - 1) as u32,
+        lpstrInitialDir: PCWSTR(dir.as_ptr()),
+        lpstrDefExt: w!("workspace"),
+        lpstrTitle: if save {
+            w!("Save the layout as a workspace")
+        } else {
+            w!("Open a workspace")
+        },
+        Flags: OFN_EXPLORER
+            | OFN_PATHMUSTEXIST
+            | OFN_NOCHANGEDIR
+            | if save {
+                OFN_OVERWRITEPROMPT
+            } else {
+                OFN_FILEMUSTEXIST
+            },
+        ..Default::default()
+    };
+    DIALOG_OPEN.set(true);
+    // SAFETY: the struct is filled in as documented; `buf`, `dir` and
+    // `filter` outlive the call; the dialog's modal loop holds no state
+    // borrow.
+    let ok = unsafe {
+        if save {
+            GetSaveFileNameW(&mut ofn)
+        } else {
+            GetOpenFileNameW(&mut ofn)
+        }
+    }
+    .as_bool();
+    DIALOG_OPEN.set(false);
+    if !ok {
+        return None;
+    }
+    let len = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
+    let picked = String::from_utf16_lossy(buf.get(..len).unwrap_or_default());
+    (!picked.is_empty()).then(|| PathBuf::from(picked))
+}
+
+/// Window > Workspaces > Save layout as workspace: asks for a name, saves
+/// and says what was saved.
+fn save_workspace_as(hwnd: HWND) {
+    if with_window(|w| w.workspace_now().0.is_none()) == Some(true) {
+        let text = "There is nothing to save: remote desktops are not kept in workspaces.";
+        dialog(hwnd, text, MB_OK | MB_ICONINFORMATION);
+        return;
+    }
+    let Some(path) = pick_workspace(hwnd, true) else {
+        return;
+    };
+    let (text, icon) = match with_window(|w| w.save_workspace(&path)) {
+        Some(Ok(text)) => (text, MB_ICONINFORMATION),
+        Some(Err(text)) => (text, MB_ICONERROR),
+        None => return,
+    };
+    dialog(hwnd, &text, MB_OK | icon);
+}
+
 fn new_key(hwnd: HWND) {
     if DIALOG_OPEN.get() {
         return;
@@ -16956,8 +17628,14 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
             WM_INITMENUPOPUP => {
                 let popup = HMENU(wparam.0 as *mut c_void);
                 // SAFETY: the menu Windows is opening.
-                if GetMenuItemID(popup, 0) == cmd::STANDBY_OWN {
-                    with_window(|w| w.fill_standby_targets(popup));
+                match GetMenuItemID(popup, 0) {
+                    cmd::STANDBY_OWN => {
+                        with_window(|w| w.fill_standby_targets(popup));
+                    }
+                    cmd::WORKSPACE_SAVE => {
+                        with_window(|w| w.fill_workspaces(popup));
+                    }
+                    _ => {}
                 }
                 DefWindowProcW(hwnd, msg, wparam, lparam)
             }

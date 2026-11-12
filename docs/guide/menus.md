@@ -79,6 +79,10 @@ Font, theme and text size apply to the focused pane only. Session > Save font an
 | Item | Shortcut | What it does |
 | --- | --- | --- |
 | New tab | Ctrl+Shift+T | A new tab on the focused pane's host, as a new channel on the same connection, so there is no second login. |
+| Workspaces > Save layout as workspace... | | Saves the open tabs and split panes, each with its connection, directory, session name and own look, as a workspace under the name you give. See [Workspaces](everyday-use.md#workspaces). |
+| Workspaces > Open workspace file... | | Opens a workspace file from any folder as new tabs. |
+| Workspaces > Open workspaces folder | | Opens `%APPDATA%\FeroSSH\workspaces` in Explorer. |
+| Workspaces > (a workspace) | | Opens that workspace's tabs next to the open ones; a window that only waits at the connect prompt makes way for them. |
 | Standby window (hotkey) > Status | | Says whether the standby hotkey is active, and for which window: on, off, or turned on but taken by another program. Click it for the details. See [Standby window](everyday-use.md#standby-window). |
 | Standby window (hotkey) > Standby hotkey on | | Turns the standby hotkey on, or off. ✓ while this FeroSSH window holds the hotkey. Turning it off shows a hidden window again. `Standby`. Off by default. |
 | Standby window (hotkey) > Window to show and hide | | This FeroSSH window, or one of the open windows of other programs (listed with their program, such as `notepad.exe`). Picking one turns standby on. FeroSSH remembers the program, so after a restart it uses that program's front window. `StandbyWindow`. |
