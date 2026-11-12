@@ -16314,7 +16314,7 @@ fn run_command(hwnd: HWND, command: Command) {
                  This cannot be undone."
             );
             if dialog(hwnd, &text, MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2) == Some(IDYES)
-                && let Some(path) = wsfile::existing(&workspaces_dir(), &name)
+                && let Some(path) = wsfile::listed(&workspaces_dir(), &name)
             {
                 if let Err(e) = std::fs::remove_file(&path) {
                     dialog(
@@ -16932,7 +16932,6 @@ fn pick_workspace(hwnd: HWND, save: bool) -> Option<PathBuf> {
         lpstrFile: PWSTR(buf.as_mut_ptr()),
         nMaxFile: (buf.len() - 1) as u32,
         lpstrInitialDir: PCWSTR(dir.as_ptr()),
-        lpstrDefExt: w!("workspace"),
         lpstrTitle: if save {
             w!("Save the layout as a workspace")
         } else {
@@ -16977,9 +16976,29 @@ fn save_workspace_as(hwnd: HWND) {
         dialog(hwnd, text, MB_OK | MB_ICONINFORMATION);
         return;
     }
-    let Some(path) = pick_workspace(hwnd, true) else {
+    let Some(mut path) = pick_workspace(hwnd, true) else {
         return;
     };
+    // The dialog appends only three characters of a default extension,
+    // so `.workspace` is added here, and an overwrite asked about here.
+    if !path
+        .extension()
+        .is_some_and(|e| e.eq_ignore_ascii_case(wsfile::EXTENSION))
+    {
+        let mut name = path.into_os_string();
+        name.push(".");
+        name.push(wsfile::EXTENSION);
+        path = PathBuf::from(name);
+        if path.exists() {
+            let text = format!(
+                "{} already exists. Replace it?",
+                path.file_name().unwrap_or_default().to_string_lossy()
+            );
+            if dialog(hwnd, &text, MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2) != Some(IDYES) {
+                return;
+            }
+        }
+    }
     let (text, icon) = match with_window(|w| w.save_workspace(&path)) {
         Some(Ok(text)) => (text, MB_ICONINFORMATION),
         Some(Err(text)) => (text, MB_ICONERROR),

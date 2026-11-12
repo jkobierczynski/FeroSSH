@@ -457,16 +457,20 @@ pub fn path_for(dir: &Path, name: &str) -> Option<PathBuf> {
     (!part.is_empty()).then(|| dir.join(format!("{part}.{EXTENSION}")))
 }
 
+/// The file of workspace `name` exactly as [`list`] gave it, or `None`
+/// when that file is not there: never another file (deleting uses it).
+pub fn listed(dir: &Path, name: &str) -> Option<PathBuf> {
+    if name.is_empty() || name.contains(['/', '\\', ':']) || name == "." || name == ".." {
+        return None;
+    }
+    let exact = dir.join(format!("{name}.{EXTENSION}"));
+    exact.is_file().then_some(exact)
+}
+
 /// The file of workspace `name` as [`list`] gave it: that exact file
 /// when it is there, else the one [`path_for`] names.
 pub fn existing(dir: &Path, name: &str) -> Option<PathBuf> {
-    if !name.is_empty() && !name.contains(['/', '\\', ':']) && name != "." && name != ".." {
-        let exact = dir.join(format!("{name}.{EXTENSION}"));
-        if exact.is_file() {
-            return Some(exact);
-        }
-    }
-    path_for(dir, name)
+    listed(dir, name).or_else(|| path_for(dir, name))
 }
 
 /// The workspace in file `path`.
@@ -663,6 +667,10 @@ mod tests {
             existing(&dir, ".prod").unwrap().file_name().unwrap(),
             ".prod.workspace"
         );
+        // Deleting a listed name never reaches another file.
+        assert!(listed(&dir, ".gone").is_none());
+        assert!(listed(&dir, "../alpha").is_none());
+        assert!(listed(&dir, "alpha").is_some());
         // Too big to read back: refused, the file stays.
         let mut big = sample();
         let mut p = PaneSpec::new(Open::Local);
