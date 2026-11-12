@@ -591,8 +591,9 @@ struct Replay {
     player: Player,
     /// The file's name, for the tab.
     name: String,
-    /// The second of the recording the tab's clock last showed.
-    shown: Option<u64>,
+    /// What the tab last showed: the second of the recording, paused,
+    /// ended.
+    shown: Option<(u64, bool, bool)>,
 }
 
 impl Replay {
@@ -7336,9 +7337,13 @@ impl Window {
                 grid.mark_all_dirty();
                 fed_panes.push(*id);
             }
-            let second = r.player.position(now) as u64;
-            if r.shown != Some(second) {
-                r.shown = Some(second);
+            let shown = (
+                r.player.position(now) as u64,
+                r.player.paused(),
+                r.player.ended(),
+            );
+            if r.shown != Some(shown) {
+                r.shown = Some(shown);
                 chrome = true;
             }
             if let Some(wait) = r.player.wait(now) {
@@ -7364,6 +7369,8 @@ impl Window {
         }
         if chrome {
             self.refresh_chrome();
+            // The window title is the focused pane's label too.
+            self.update_title();
         }
     }
 
@@ -7405,6 +7412,8 @@ impl Window {
         }
         r.shown = None;
         self.replay_tick();
+        // Scrolling feeds nothing, so the tick may not have redrawn it.
+        self.refresh(id);
         self.refresh_chrome();
         true
     }
