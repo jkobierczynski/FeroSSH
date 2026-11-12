@@ -937,6 +937,15 @@ pub(super) fn remove(hwnd: HWND) {
     {
         problems.push(format!("Could not forget where the vault is: {e}"));
     }
+    // Only FeroSSH's own vault file is deleted; one the user chose (in
+    // OneDrive, say) stays for the other PCs that use it. One that cannot
+    // be deleted would be opened again at the next start.
+    if problems.is_empty()
+        && file == default_vault_path()
+        && let Err(e) = std::fs::remove_file(&file)
+    {
+        problems.push(format!("Could not delete the vault file: {e}"));
+    }
     if !problems.is_empty() {
         // The vault stays in use, now and at the next start, so nothing
         // changed from here on goes to plain files the vault would hide.
@@ -944,26 +953,13 @@ pub(super) fn remove(hwnd: HWND) {
     }
     after_change();
     let text = if problems.is_empty() {
-        // Only FeroSSH's own vault file is deleted; one the user chose
-        // (in OneDrive, say) stays for the other PCs that use it.
-        if file == default_vault_path()
-            && let Err(e) = std::fs::remove_file(&file)
-        {
-            format!(
-                "The master password could not be fully removed: the old vault file {} could \
-                 not be deleted ({e}). Delete it to finish; until then FeroSSH asks for the \
-                 master password at each start.",
-                file.display()
-            )
-        } else {
-            "The master password is removed.".to_owned()
-        }
+        "The master password is removed.".to_owned()
     } else {
         // Nothing is lost: the vault stays, and FeroSSH opens it again
         // at the next start.
         format!(
-            "Not everything could be written out, so the vault {} is kept and FeroSSH asks \
-             for its master password again when it next starts:\n\n{}",
+            "The master password is not removed: the vault {} is kept, and FeroSSH goes on \
+             using it and asks for its master password when it next starts.\n\n{}",
             file.display(),
             problems.join("\n")
         )
