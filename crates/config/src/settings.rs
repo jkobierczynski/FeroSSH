@@ -1017,7 +1017,7 @@ impl Settings {
                     for dest in args {
                         if s.recent.len() < MAX_RECENT
                             && !dest.is_empty()
-                            && !s.recent.iter().any(|r| r.eq_ignore_ascii_case(&dest))
+                            && !s.recent.contains(&dest)
                         {
                             s.recent.push(dest);
                         }
@@ -1755,7 +1755,8 @@ impl Settings {
         if destination.is_empty() {
             return;
         }
-        self.recent.retain(|r| !r.eq_ignore_ascii_case(destination));
+        // Exact: a user name or an sftp:// folder may differ only in case.
+        self.recent.retain(|r| r != destination);
         self.recent.insert(0, destination.to_owned());
         self.recent.truncate(MAX_RECENT);
     }
@@ -2460,18 +2461,30 @@ DesktopShareSelection yes
         for i in 0..10 {
             s.note_recent(&format!("host{i}"));
         }
-        s.note_recent(" HOST5 ");
+        s.note_recent(" host5 ");
         assert_eq!(s.recent.len(), MAX_RECENT);
-        assert_eq!(s.recent[0], "HOST5");
+        assert_eq!(s.recent[0], "host5");
         assert_eq!(s.recent[1], "host9");
-        assert!(!s.recent.iter().any(|r| r == "host5"));
+        assert_eq!(s.recent.iter().filter(|r| *r == "host5").count(), 1);
         s.note_recent("  ");
-        assert_eq!(s.recent[0], "HOST5");
+        assert_eq!(s.recent[0], "host5");
+        // Case can matter in a user name or an sftp:// folder.
+        s.note_recent("sftp://h/Reports");
+        s.note_recent("sftp://h/reports");
+        s.note_recent("Admin@h");
+        s.note_recent("admin@h");
+        assert_eq!(
+            &s.recent[..4],
+            ["admin@h", "Admin@h", "sftp://h/reports", "sftp://h/Reports"]
+        );
         let back = Settings::parse(&s.to_text());
         assert_eq!(back.recent, s.recent);
         s.recent.push("user@db one".into());
         let back = Settings::parse(&s.to_text());
         assert_eq!(back.recent.len(), MAX_RECENT);
-        assert_eq!(Settings::parse("Recent a A \"b c\"\n").recent, ["a", "b c"]);
+        assert_eq!(
+            Settings::parse("Recent a A a \"b c\"\n").recent,
+            ["a", "A", "b c"]
+        );
     }
 }
