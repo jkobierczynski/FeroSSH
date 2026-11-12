@@ -107,7 +107,9 @@ use windows::Win32::UI::WindowsAndMessaging::{
     WM_SYSCHAR, WM_SYSCOLORCHANGE, WM_SYSDEADCHAR, WM_SYSKEYDOWN, WM_SYSKEYUP, WM_TIMER, WNDCLASSW,
     WS_CLIPCHILDREN, WS_EX_APPWINDOW, WS_OVERLAPPEDWINDOW,
 };
-use windows::Win32::UI::WindowsAndMessaging::{DeleteMenu, ShowWindowAsync, WM_INITMENUPOPUP};
+use windows::Win32::UI::WindowsAndMessaging::{
+    DeleteMenu, InsertMenuW, ShowWindowAsync, WM_INITMENU, WM_INITMENUPOPUP,
+};
 use windows::core::{HSTRING, PCWSTR, PWSTR, Result, w};
 
 use crate::Launch;
@@ -453,11 +455,11 @@ mod cmd {
     pub const DOWNLOADS: u32 = 109;
     pub const AUTO_RECONNECT: u32 = 110;
     pub const IMPORT_SNIPPETS: u32 = 111;
-    /// File > Export connections (an encrypted file).
+    /// File > Import and export > Export connections (an encrypted file).
     pub const EXPORT: u32 = 112;
-    /// File > Import encrypted connections.
+    /// File > Import and export > Import encrypted connections.
     pub const IMPORT_SEALED: u32 = 113;
-    /// File > Master password > Set, Use a vault file, Move, Change, Remove.
+    /// Settings > Master password > Set, Use a vault file, Move, Change, Remove.
     pub const VAULT_SET: u32 = 114;
     pub const VAULT_USE: u32 = 115;
     pub const VAULT_MOVE: u32 = 116;
@@ -527,7 +529,7 @@ mod cmd {
     pub const TMUX_KEYS: u32 = 621;
     /// Session > Start new tabs and panes in this directory.
     pub const START_DIR: u32 = 622;
-    /// Session > Open virtual desktop (Xvfb and x11vnc on the server).
+    /// Session > Remote desktop > Open virtual desktop (Xvfb and x11vnc on the server).
     pub const VDESK: u32 = 623;
     pub const VDESK_STOP: u32 = 624;
     pub const REMOTE_APP: u32 = 625;
@@ -540,7 +542,7 @@ mod cmd {
     pub const REMOTE_APP_CLIP_LAST: u32 = 632;
     /// ... > Share mouse selections from the host.
     pub const REMOTE_APP_SELECTION: u32 = 633;
-    /// Session > Desktop clipboard: the same four ways, for remote and
+    /// Session > Remote desktop > Clipboard: the same four ways, for remote and
     /// virtual desktops.
     pub const DESKTOP_CLIP: u32 = 634;
     pub const DESKTOP_CLIP_LAST: u32 = 637;
@@ -550,10 +552,10 @@ mod cmd {
     pub const NEW_KEY: u32 = 639;
     /// Session > Copy public key to this server.
     pub const COPY_ID: u32 = 640;
-    /// Session > Record this pane (asciicast), and Play a recording.
+    /// Session > Logs and recordings > Record this pane (asciicast), and Play a recording.
     pub const RECORD_CAST: u32 = 641;
     pub const PLAY_CAST: u32 = 642;
-    /// Session > Detach other tmux clients.
+    /// Session > tmux > Detach other clients.
     pub const TMUX_DETACH_OTHERS: u32 = 643;
     pub const TMUX_ATTACH: u32 = 610;
     pub const TMUX_DETACH: u32 = 611;
@@ -603,6 +605,11 @@ mod cmd {
     /// to [`WORKSPACE_END`].
     pub const WORKSPACE_OPEN: u32 = 1110;
     pub const WORKSPACE_END: u32 = 1200;
+    /// File > Recent connections: plus the index into the recent ones,
+    /// up to [`RECENT_END`].
+    pub const RECENT: u32 = 1200;
+    pub const RECENT_END: u32 = 1210;
+    pub const RECENT_CLEAR: u32 = 1210;
     pub const UPDATE_CHECK: u32 = 900;
     pub const UPDATE_WEEKLY: u32 = 901;
     pub const ABOUT: u32 = 902;
@@ -673,7 +680,7 @@ enum Host {
     /// A WinRM shell (PowerShell or cmd on Windows), run by a worker of
     /// its own.
     Winrm(Box<WinrmSession>),
-    /// A session recording playing back (Session > Play a recording):
+    /// A session recording playing back (Session > Logs and recordings > Play a recording):
     /// nothing goes to a host, and keys control the playing.
     Replay(Box<Replay>),
 }
@@ -744,7 +751,7 @@ struct Logging {
     path: Option<PathBuf>,
 }
 
-/// Session > Record this pane: the pane's output with its timing, as an
+/// Session > Logs and recordings > Record this pane: the pane's output with its timing, as an
 /// asciicast file in the log folder, sealed like a log. Only what the
 /// host sent goes in, never what was typed, so a password typed at a
 /// prompt (which the host does not echo) is not in it either. Dropping it
@@ -783,7 +790,7 @@ struct Pane {
     cursor: Option<Cursor>,
     host: Host,
     log: Logging,
-    /// Session > Record this pane, while it records.
+    /// Session > Logs and recordings > Record this pane, while it records.
     cast: Option<Recording>,
     font: FontSpec,
     theme: Theme,
@@ -1076,7 +1083,7 @@ struct Window {
     full_redraw: bool,
     high_surrogate: Option<u16>,
     /// The tmux prefix was typed in this pane: the next key is a tmux
-    /// window or pane key (Session > Use tmux keybindings).
+    /// window or pane key (Session > tmux > Use tmux keybindings).
     tmux_armed: Option<PaneId>,
     /// Edit > Suggest commands as you type: each host's history, read
     /// when the host is first typed into.
@@ -1249,7 +1256,7 @@ struct Window {
     palette_return: Option<SideView>,
     /// Auto-response watches, by pane.
     watches: HashMap<PaneId, Watch>,
-    /// Edit > Record keystrokes as snippet: the pane and what it typed.
+    /// Session > Scripts > Record keystrokes as script: the pane and what it typed.
     recording: Option<(PaneId, Recorder)>,
     /// Session folders by session name, for snippets kept to folders,
     /// and when they were read.
@@ -1384,7 +1391,7 @@ struct KeyCopy {
     status: Option<u32>,
 }
 
-/// Session > Open virtual desktop: Xvfb and x11vnc on the server, run by
+/// Session > Remote desktop > Open virtual desktop: Xvfb and x11vnc on the server, run by
 /// [`vdesk::command`] on an exec channel of `connection`.
 struct VirtualDesk {
     connection: ChannelId,
@@ -1901,7 +1908,7 @@ fn add_to_log_index(name: &str, sealed: &ferossh_term::Sealed) -> std::io::Resul
         .write_all(line.as_bytes())
 }
 
-/// Session > Check a log: the log against its chain and the log index.
+/// Session > Logs and recordings > Check a log: the log against its chain and the log index.
 /// `true` when nothing was found wrong.
 fn check_log(path: &Path) -> (String, bool) {
     let name = path
@@ -2202,7 +2209,7 @@ fn create_and_run(launch: Launch, theme: Option<String>) -> Result<()> {
         let _ = live_panel::create(hwnd, live_event, dpi);
         // The connection form's, likewise.
         let _ = form_view::create(hwnd, form_event, dpi);
-        // The import page's (File > Import connections), likewise.
+        // The import page's (File > Import and export > Import connections), likewise.
         let _ = import_panel::create(hwnd, import_event, dpi);
         // The file transfer pane's, likewise.
         let _ = files_panel::create(hwnd, files_event, dpi);
@@ -2366,101 +2373,88 @@ fn build_menu() -> Result<HMENU> {
         item(file, cmd::RECONNECT, "&Reconnect\tCtrl+Shift+R")?;
         item(file, cmd::DISCONNECT, "&Disconnect")?;
         item(file, cmd::AUTO_RECONNECT, "Reconnect &automatically")?;
-        item(file, cmd::CLOSE_PANE, "Close &pane\tCtrl+Shift+W")?;
+        // Filled with the recent connections each time it opens.
+        let recent = CreatePopupMenu()?;
+        item(recent, cmd::RECENT_CLEAR, "&Clear this list")?;
+        AppendMenuW(file, MF_POPUP, recent.0 as usize, w!("Recen&t connections"))?;
+        separator(file)?;
+        item(file, cmd::LOCAL_SHELL, "Open &local shell")?;
         separator(file)?;
         item(file, cmd::UPLOAD, "&Upload files...\tCtrl+Shift+U")?;
         item(file, cmd::DOWNLOADS, "Open do&wnload folder")?;
         separator(file)?;
-        item(file, cmd::LOCAL_SHELL, "Open &local shell")?;
-        item(file, cmd::IMPORT, "&Import connections...")?;
-        item(file, cmd::IMPORT_SNIPPETS, "Import sc&ripts...")?;
-        separator(file)?;
-        item(file, cmd::EXPORT, "Expor&t connections...")?;
-        item(file, cmd::IMPORT_SEALED, "Import encr&ypted connections...")?;
-        let vault = CreatePopupMenu()?;
-        item(vault, cmd::VAULT_SET, "&Set a master password...")?;
-        item(vault, cmd::VAULT_USE, "&Use a vault file...")?;
-        item(vault, cmd::VAULT_MOVE, "&Move the vault file...")?;
-        item(vault, cmd::VAULT_CHANGE, "&Change master password...")?;
-        item(vault, cmd::VAULT_REMOVE, "&Remove master password...")?;
-        AppendMenuW(file, MF_POPUP, vault.0 as usize, w!("&Master password"))?;
+        let transfer = CreatePopupMenu()?;
+        item(transfer, cmd::IMPORT, "&Import connections...")?;
+        item(transfer, cmd::IMPORT_SNIPPETS, "Import sc&ripts...")?;
+        separator(transfer)?;
+        item(transfer, cmd::EXPORT, "&Export connections...")?;
+        item(
+            transfer,
+            cmd::IMPORT_SEALED,
+            "Import encr&ypted connections...",
+        )?;
+        AppendMenuW(
+            file,
+            MF_POPUP,
+            transfer.0 as usize,
+            w!("&Import and export"),
+        )?;
         separator(file)?;
         item(file, cmd::EXIT, "E&xit\tAlt+F4")?;
 
         let session = CreatePopupMenu()?;
         item(session, cmd::LOG_TOGGLE, "&Log to file")?;
-        item(session, cmd::LOG_RAW, "Log &raw output (keep escape codes)")?;
-        item(session, cmd::LOG_TIMESTAMPS, "&Timestamp each log line")?;
-        item(session, cmd::SAVE_PANE, "Save this pane's &output to a log")?;
-        item(session, cmd::SAVE_ALL, "Save output of all pa&nes to logs")?;
-        item(session, cmd::LOG_FOLDER, "Open log &folder")?;
-        item(session, cmd::LOG_VERIFY, "C&heck a log for changes...")?;
-        item(session, cmd::RECORD_CAST, "Re&cord this pane (asciicast)")?;
-        item(session, cmd::PLAY_CAST, "&Play a recording...")?;
-        separator(session)?;
-        item(
+        let logs = CreatePopupMenu()?;
+        item(logs, cmd::LOG_RAW, "Log &raw output (keep escape codes)")?;
+        item(logs, cmd::LOG_TIMESTAMPS, "&Timestamp each log line")?;
+        separator(logs)?;
+        item(logs, cmd::SAVE_PANE, "Save this pane's &output to a log")?;
+        item(logs, cmd::SAVE_ALL, "Save output of all pa&nes to logs")?;
+        separator(logs)?;
+        item(logs, cmd::RECORD_CAST, "Re&cord this pane (asciicast)")?;
+        item(logs, cmd::PLAY_CAST, "&Play a recording...")?;
+        separator(logs)?;
+        item(logs, cmd::LOG_FOLDER, "Open log &folder")?;
+        item(logs, cmd::LOG_VERIFY, "C&heck a log for changes...")?;
+        AppendMenuW(
             session,
-            cmd::SAVE_LOOK,
-            "&Save font and theme for this host",
+            MF_POPUP,
+            logs.0 as usize,
+            w!("Logs and &recordings"),
         )?;
-        item(
-            session,
-            cmd::START_DIR,
-            "Start new tabs and panes in this director&y",
-        )?;
         separator(session)?;
-        item(session, cmd::REPLACE_KEY, "Replace host &key...")?;
-        item(session, cmd::COPY_ID, "Copy public key to this ser&ver...")?;
-        separator(session)?;
-        item(session, cmd::VERIFY, "&Verify transfers (SHA-256)")?;
-        item(session, cmd::ZMODEM, "&ZMODEM: answer rz and sz")?;
-        item(session, cmd::HIGHLIGHT, "Hi&ghlight keywords")?;
-        separator(session)?;
-        item(session, cmd::TMUX_ATTACH, "&Attach tmux")?;
-        item(session, cmd::TMUX_PICK, "S&witch tmux session...")?;
-        item(session, cmd::TMUX_DETACH, "&Detach tmux")?;
+        let tmux = CreatePopupMenu()?;
+        item(tmux, cmd::TMUX_ATTACH, "&Attach tmux")?;
+        item(tmux, cmd::TMUX_PICK, "S&witch tmux session...")?;
+        item(tmux, cmd::TMUX_DETACH, "&Detach tmux")?;
+        item(tmux, cmd::TMUX_DETACH_OTHERS, "Detach &other clients")?;
+        separator(tmux)?;
+        item(tmux, cmd::TMUX_LAYOUT, "One window per &pane (own fonts)")?;
         item(
-            session,
-            cmd::TMUX_DETACH_OTHERS,
-            "Detach other tmux clients",
-        )?;
-        item(
-            session,
-            cmd::TMUX_LAYOUT,
-            "tmux: one &window per pane (own fonts)",
-        )?;
-        item(
-            session,
+            tmux,
             cmd::TMUX_KEYS,
             "Use tmux ke&ybindings for tabs and panes",
         )?;
-        separator(session)?;
-        item(session, cmd::SERIAL_BREAK, "Send &break (serial)")?;
-        item(session, cmd::RUN_SCRIPT, "Run &login script again")?;
-        item(session, cmd::AUTO_RESPONSES, "A&uto-responses from scripts")?;
-        item(
-            session,
-            cmd::CONFIRM_PRODUCTION,
-            "Confirm scripts on &Production hosts",
-        )?;
-        separator(session)?;
-        item(session, cmd::DESKTOP, "Open remote &desktop\tCtrl+Shift+D")?;
+        AppendMenuW(session, MF_POPUP, tmux.0 as usize, w!("&tmux"))?;
+        let desktop = CreatePopupMenu()?;
+        item(desktop, cmd::DESKTOP, "Open remote &desktop\tCtrl+Shift+D")?;
         if cfg!(feature = "rdp-viewer") {
             item(
-                session,
+                desktop,
                 cmd::DESKTOP_TAB_RDP,
                 "Open remote desktop in a &tab (RDP)",
             )?;
         }
         if cfg!(feature = "vnc-viewer") {
             item(
-                session,
+                desktop,
                 cmd::DESKTOP_TAB,
                 "Open remote desktop in a tab (&VNC)",
             )?;
         }
-        item(session, cmd::VDESK, "Open virtual d&esktop (Xvfb)")?;
-        item(session, cmd::VDESK_STOP, "Stop v&irtual desktop")?;
+        item(desktop, cmd::VDESK, "Open virtual d&esktop (Xvfb)")?;
+        item(desktop, cmd::VDESK_STOP, "Stop v&irtual desktop")?;
+        separator(desktop)?;
         let desk_clip = CreatePopupMenu()?;
         item(desk_clip, cmd::DESKTOP_CLIP, "&Both ways")?;
         item(desk_clip, cmd::DESKTOP_CLIP + 1, "Only &Windows to host")?;
@@ -2472,12 +2466,8 @@ fn build_menu() -> Result<HMENU> {
             cmd::DESKTOP_SELECTION,
             "Also share &mouse selections from virtual desktops",
         )?;
-        AppendMenuW(
-            session,
-            MF_POPUP,
-            desk_clip.0 as usize,
-            w!("Desktop c&lipboard"),
-        )?;
+        AppendMenuW(desktop, MF_POPUP, desk_clip.0 as usize, w!("C&lipboard"))?;
+        AppendMenuW(session, MF_POPUP, desktop.0 as usize, w!("Remote &desktop"))?;
         let apps = CreatePopupMenu()?;
         item(apps, cmd::REMOTE_APP, "&Run remote app...")?;
         item(apps, cmd::REMOTE_APP_ATTACH, "Re&attach remote app")?;
@@ -2502,6 +2492,37 @@ fn build_menu() -> Result<HMENU> {
             apps.0 as usize,
             w!("Remote a&pps (native windows)"),
         )?;
+        let scripts = CreatePopupMenu()?;
+        item(scripts, cmd::RUN_SCRIPT, "Run &login script again")?;
+        item(scripts, cmd::RECORD_SNIPPET, "&Record keystrokes as script")?;
+        separator(scripts)?;
+        item(scripts, cmd::AUTO_RESPONSES, "&Auto-responses from scripts")?;
+        item(
+            scripts,
+            cmd::CONFIRM_PRODUCTION,
+            "Confirm scripts on &Production hosts",
+        )?;
+        AppendMenuW(session, MF_POPUP, scripts.0 as usize, w!("&Scripts"))?;
+        separator(session)?;
+        item(session, cmd::REPLACE_KEY, "Replace host &key...")?;
+        item(session, cmd::COPY_ID, "Copy public key to this ser&ver...")?;
+        separator(session)?;
+        item(session, cmd::VERIFY, "Verify trans&fers (SHA-256)")?;
+        item(session, cmd::ZMODEM, "&ZMODEM: answer rz and sz")?;
+        item(session, cmd::HIGHLIGHT, "Hi&ghlight keywords")?;
+        separator(session)?;
+        item(
+            session,
+            cmd::SAVE_LOOK,
+            "Save font and theme for t&his host",
+        )?;
+        item(
+            session,
+            cmd::START_DIR,
+            "Start new tabs and panes in this director&y",
+        )?;
+        separator(session)?;
+        item(session, cmd::SERIAL_BREAK, "Send &break (serial)")?;
 
         let edit = CreatePopupMenu()?;
         item(edit, cmd::COPY, "&Copy\tCtrl+Shift+C")?;
@@ -2516,7 +2537,6 @@ fn build_menu() -> Result<HMENU> {
         )?;
         item(edit, cmd::CLEAR_SCROLLBACK, "C&lear scrollback")?;
         item(edit, cmd::SAVE_SNIPPET, "Sa&ve selection as script...")?;
-        item(edit, cmd::RECORD_SNIPPET, "Rec&ord keystrokes as script")?;
         separator(edit)?;
         item(edit, cmd::COPY_ON_SELECT, "Copy on &select")?;
         item(edit, cmd::RIGHT_CLICK_PASTE, "&Right-click pastes")?;
@@ -2631,10 +2651,61 @@ fn build_menu() -> Result<HMENU> {
         item(view, cmd::FULL_SCREEN_KEY, "F11 switches full scree&n")?;
         separator(view)?;
         item(view, cmd::KEY_BINDINGS, "Key bin&dings...")?;
+        let vault = CreatePopupMenu()?;
+        item(vault, cmd::VAULT_SET, "&Set a master password...")?;
+        item(vault, cmd::VAULT_USE, "&Use a vault file...")?;
+        item(vault, cmd::VAULT_MOVE, "&Move the vault file...")?;
+        item(vault, cmd::VAULT_CHANGE, "&Change master password...")?;
+        item(vault, cmd::VAULT_REMOVE, "&Remove master password...")?;
+        AppendMenuW(view, MF_POPUP, vault.0 as usize, w!("&Master password"))?;
 
         let window = CreatePopupMenu()?;
         item(window, cmd::NEW_TAB, "Ne&w tab\tCtrl+Shift+T")?;
         item(window, cmd::RENAME, "Rena&me session...")?;
+        item(window, cmd::NEXT_TAB, "&Next tab\tCtrl+Tab")?;
+        item(window, cmd::PREV_TAB, "&Previous tab\tCtrl+Shift+Tab")?;
+        item(window, cmd::TAB_LEFT, "Move tab &left\tCtrl+Shift+PgUp")?;
+        item(window, cmd::TAB_RIGHT, "Move tab ri&ght\tCtrl+Shift+PgDn")?;
+        separator(window)?;
+        item(window, cmd::SPLIT_RIGHT, "Split &right\tAlt+Shift+=")?;
+        item(window, cmd::SPLIT_DOWN, "Split &down\tAlt+Shift+-")?;
+        item(window, cmd::PANE_TO_TAB, "Move pane to its own &tab")?;
+        item(
+            window,
+            cmd::JOIN_TAB,
+            "&Join tab into the tab before it\tCtrl+Shift+J",
+        )?;
+        separator(window)?;
+        item(
+            window,
+            cmd::BROADCAST_TAB,
+            "&Broadcast input to this tab's panes\tCtrl+Shift+B",
+        )?;
+        item(window, cmd::BROADCAST_ALL, "Broadcast input to &all tabs")?;
+        item(
+            window,
+            cmd::BROADCAST_SKIP,
+            "Leave this pane &out of broadcast",
+        )?;
+        separator(window)?;
+        let names = ["left", "right", "up", "down"];
+        let keys = ["Left", "Right", "Up", "Down"];
+        for (i, (name, key)) in names.iter().zip(keys).enumerate() {
+            item(
+                window,
+                cmd::FOCUS + i as u32,
+                &format!("Focus pane {name}\tAlt+{key}"),
+            )?;
+        }
+        separator(window)?;
+        for (i, (name, key)) in names.iter().zip(keys).enumerate() {
+            item(
+                window,
+                cmd::RESIZE + i as u32,
+                &format!("Grow pane {name}\tAlt+Shift+{key}"),
+            )?;
+        }
+        separator(window)?;
         // The saved workspaces are added each time it opens.
         let workspaces = CreatePopupMenu()?;
         item(
@@ -2673,50 +2744,6 @@ fn build_menu() -> Result<HMENU> {
             standby.0 as usize,
             w!("Standb&y window (hotkey)"),
         )?;
-        separator(window)?;
-        item(window, cmd::SPLIT_RIGHT, "Split &right\tAlt+Shift+=")?;
-        item(window, cmd::SPLIT_DOWN, "Split &down\tAlt+Shift+-")?;
-        item(window, cmd::PANE_TO_TAB, "Move pane to its own &tab")?;
-        item(
-            window,
-            cmd::JOIN_TAB,
-            "&Join tab into the tab before it\tCtrl+Shift+J",
-        )?;
-        separator(window)?;
-        item(
-            window,
-            cmd::BROADCAST_TAB,
-            "&Broadcast input to this tab's panes\tCtrl+Shift+B",
-        )?;
-        item(window, cmd::BROADCAST_ALL, "Broadcast input to &all tabs")?;
-        item(
-            window,
-            cmd::BROADCAST_SKIP,
-            "Leave this pane &out of broadcast",
-        )?;
-        separator(window)?;
-        item(window, cmd::NEXT_TAB, "&Next tab\tCtrl+Tab")?;
-        item(window, cmd::PREV_TAB, "&Previous tab\tCtrl+Shift+Tab")?;
-        item(window, cmd::TAB_LEFT, "Move tab &left\tCtrl+Shift+PgUp")?;
-        item(window, cmd::TAB_RIGHT, "Move tab ri&ght\tCtrl+Shift+PgDn")?;
-        separator(window)?;
-        let names = ["left", "right", "up", "down"];
-        let keys = ["Left", "Right", "Up", "Down"];
-        for (i, (name, key)) in names.iter().zip(keys).enumerate() {
-            item(
-                window,
-                cmd::FOCUS + i as u32,
-                &format!("Focus pane {name}\tAlt+{key}"),
-            )?;
-        }
-        separator(window)?;
-        for (i, (name, key)) in names.iter().zip(keys).enumerate() {
-            item(
-                window,
-                cmd::RESIZE + i as u32,
-                &format!("Grow pane {name}\tAlt+Shift+{key}"),
-            )?;
-        }
         separator(window)?;
         item(window, cmd::CLOSE_PANE, "&Close pane\tCtrl+Shift+W")?;
         item(window, cmd::CLOSE_TAB, "Clos&e tab\tCtrl+F4")?;
@@ -3392,7 +3419,7 @@ impl Window {
         }
     }
 
-    /// Session > Detach other tmux clients, as answered in the dialog.
+    /// Session > tmux > Detach other clients, as answered in the dialog.
     /// Skipped when another session is attached by now.
     fn detach_other_tmux(&mut self, gateway: PaneId, session: ferossh_tmuxcc::SessionId) {
         let Some(t) = self.tmux.get_mut(&gateway).filter(|t| t.active()) else {
@@ -4113,7 +4140,7 @@ impl Window {
         }
     }
 
-    /// Session > Open remote desktop: asks the forwarding engine for a
+    /// Session > Remote desktop > Open remote desktop: asks the forwarding engine for a
     /// tunnel to the host's RDP port (or, for the built-in viewer in a
     /// tab, its RDP or VNC port); [`Self::desktop_events`] opens the
     /// viewer once it listens.
@@ -4556,7 +4583,7 @@ impl Window {
         })
     }
 
-    /// Session > Open virtual desktop: runs [`vdesk::command`] on an exec
+    /// Session > Remote desktop > Open virtual desktop: runs [`vdesk::command`] on an exec
     /// channel of the pane's connection; [`Self::on_vdesk`] opens a viewer
     /// once x11vnc listens. A second ask on the same connection opens
     /// another viewer on the running one.
@@ -4845,7 +4872,7 @@ impl Window {
         })
     }
 
-    /// Session > Stop virtual desktop: ends the virtual desktops on the
+    /// Session > Remote desktop > Stop virtual desktop: ends the virtual desktops on the
     /// pane's connection, which stops Xvfb, x11vnc and the program there.
     fn stop_virtual_desktop(&mut self, pane: PaneId) -> Option<Command> {
         let connection = self.pane_connection(pane);
@@ -5033,7 +5060,7 @@ impl Window {
                     &format!(
                         "\x1b[0;90mVirtual desktop {display} runs on the server; opening it \
                          through the SSH tunnel. It stops when its viewer tab closes, with \
-                         Session > Stop virtual desktop, or with this connection.{fixed_note}\x1b[0m\r\n"
+                         Session > Remote desktop > Stop virtual desktop, or with this connection.{fixed_note}\x1b[0m\r\n"
                     ),
                 );
                 self.refresh(pane);
@@ -6847,7 +6874,7 @@ impl Window {
         true
     }
 
-    /// Session > Run login script again, in the focused pane.
+    /// Session > Scripts > Run login script again, in the focused pane.
     fn rerun_script(&mut self, id: PaneId) -> Option<Command> {
         let alias = match self.panes.get(&id).map(|p| &p.host) {
             Some(Host::Ssh(s)) if s.state() == State::Connected => Some(s.target.alias.clone()),
@@ -7260,7 +7287,7 @@ impl Window {
         }
     }
 
-    /// Session > Save output: each pane's scrollback and screen, as plain
+    /// Session > Logs and recordings > Save output: each pane's scrollback and screen, as plain
     /// text, to a log file of its own. Returns what to tell the user.
     fn save_output(&self, panes: &[PaneId]) -> String {
         let mut saved = Vec::new();
@@ -7341,7 +7368,7 @@ impl Window {
         }
     }
 
-    /// Session > Record this pane: starts recording the pane's output with
+    /// Session > Logs and recordings > Record this pane: starts recording the pane's output with
     /// its timing, or ends the recording and says where it is.
     fn toggle_record(&mut self, id: PaneId) {
         let Some(p) = self.panes.get_mut(&id) else {
@@ -7398,7 +7425,7 @@ impl Window {
         self.refresh(id);
     }
 
-    /// Session > Play a recording: opens `path` in a new replay tab, or
+    /// Session > Logs and recordings > Play a recording: opens `path` in a new replay tab, or
     /// says why it cannot.
     fn open_replay(&mut self, path: &Path) -> std::result::Result<(), String> {
         let shown = path.display();
@@ -7666,6 +7693,7 @@ impl Window {
                     if destination.trim().is_empty() {
                         self.show(id, CONNECT_PROMPT);
                     } else {
+                        self.note_recent(destination.trim());
                         self.connect(id, destination.trim());
                     }
                 } else if let [0x7f] | [0x08] = bytes.as_slice() {
@@ -8780,7 +8808,7 @@ impl Window {
             && self.side.import.is_none()
     }
 
-    /// Whether the import page (File > Import connections or scripts)
+    /// Whether the import page (File > Import and export > Import connections or scripts)
     /// shows as native controls.
     fn import_native(&self) -> bool {
         self.side.visible
@@ -10169,7 +10197,9 @@ impl Window {
         // The workspaces Window > Workspaces listed are offered fresh below.
         entries.retain(|e| match e.kind {
             palette::Kind::Action(id) => {
-                id != cmd::PALETTE && !(cmd::WORKSPACE_OPEN..cmd::WORKSPACE_END).contains(&id)
+                id != cmd::PALETTE
+                    && !(cmd::WORKSPACE_OPEN..cmd::WORKSPACE_END).contains(&id)
+                    && !(cmd::RECENT..cmd::RECENT_END).contains(&id)
             }
             _ => true,
         });
@@ -11046,7 +11076,7 @@ impl Window {
         }
     }
 
-    /// Edit > Record keystrokes as snippet: starts recording the focused
+    /// Session > Scripts > Record keystrokes as script: starts recording the focused
     /// pane's typing, or stops and opens the recording in the snippets
     /// view to name and check.
     fn toggle_recording(&mut self) -> Option<Command> {
@@ -11073,7 +11103,7 @@ impl Window {
         self.recording = Some((id, Recorder::default()));
         self.show(
             id,
-            "\x1b[0;90m[Recording keystrokes as a script. Edit > Record keystrokes as script \
+            "\x1b[0;90m[Recording keystrokes as a script. Session > Scripts > Record keystrokes as script \
              again stops it.]\x1b[0m\r\n",
         );
         self.refresh(id);
@@ -11115,7 +11145,7 @@ impl Window {
         self.settings.snippets = snippet_store::load(&dir).0;
     }
 
-    /// File > Import snippets: the import page, on what other programs
+    /// File > Import and export > Import scripts: the import page, on what other programs
     /// on this account have.
     fn open_snippet_import(&mut self, found: Vec<SnippetSource>, problems: Vec<String>) {
         let list = found
@@ -11165,7 +11195,7 @@ impl Window {
         text
     }
 
-    /// File > Import connections: the import page, on what the clients
+    /// File > Import and export > Import connections: the import page, on what the clients
     /// on this account have saved.
     fn open_import(&mut self, sessions: Vec<ImportSource>, problems: Vec<String>) {
         let list = sessions
@@ -11787,6 +11817,7 @@ impl Window {
     /// waiting at the connect prompt, else in a new tab (or a split).
     fn open_host(&mut self, host: &str, split: bool) {
         self.pull_vault_settings();
+        self.note_recent(host);
         if let Some(p) = self.settings.profile(host)
             && p.kind == SessionKind::Serial
         {
@@ -12352,6 +12383,55 @@ impl Window {
                 let _ = AppendMenuW(menu, MF_STRING, id as usize, &HSTRING::from(label));
             }
         }
+    }
+
+    /// File > Recent connections, as it opens: the recent ones, newest
+    /// first, then Clear this list.
+    fn fill_recent(&mut self, menu: HMENU) {
+        self.pull_vault_settings();
+        let recent = self.settings.recent.clone();
+        // SAFETY: our popup menu; it is being opened, when changing it is
+        // allowed. Everything before Clear this list is replaced.
+        unsafe {
+            while GetMenuItemCount(Some(menu)) > 1 {
+                let _ = DeleteMenu(menu, 0, MF_BYPOSITION);
+            }
+            let flags = MF_BYPOSITION | MF_STRING;
+            if recent.is_empty() {
+                let _ = InsertMenuW(menu, 0, flags | MF_GRAYED, 0, w!("(none yet)"));
+            }
+            for (i, (id, dest)) in (cmd::RECENT..cmd::RECENT_END).zip(&recent).enumerate() {
+                // An access key for the first nine: &1 to &9.
+                let label = format!("&{} {}", i + 1, dest.replace('&', "&&"));
+                let _ = InsertMenuW(menu, i as u32, flags, id as usize, &HSTRING::from(label));
+            }
+            let _ = InsertMenuW(
+                menu,
+                recent.len().max(1) as u32,
+                MF_BYPOSITION | MF_SEPARATOR,
+                0,
+                None,
+            );
+            let _ = EnableMenuItem(
+                menu,
+                cmd::RECENT_CLEAR,
+                MF_BYCOMMAND
+                    | if recent.is_empty() {
+                        MF_GRAYED
+                    } else {
+                        MF_ENABLED
+                    },
+            );
+        }
+    }
+
+    /// Puts `destination` first in File > Recent connections.
+    fn note_recent(&mut self, destination: &str) {
+        if self.settings.recent.first().map(String::as_str) == Some(destination.trim()) {
+            return;
+        }
+        self.settings.note_recent(destination);
+        self.save_settings();
     }
 
     /// Connect to...: asks for a destination in `pane` if it is already
@@ -13438,6 +13518,18 @@ impl Window {
             cmd::WORKSPACE_SAVE => return Some(Command::SaveWorkspace),
             cmd::WORKSPACE_BROWSE => return Some(Command::OpenWorkspaceFile),
             cmd::WORKSPACE_FOLDER => return Some(Command::OpenFolder(workspaces_dir())),
+            id if (cmd::RECENT..cmd::RECENT_END).contains(&id) => {
+                let dest = self
+                    .settings
+                    .recent
+                    .get((id - cmd::RECENT) as usize)
+                    .cloned()?;
+                self.open_host(&dest, false);
+            }
+            cmd::RECENT_CLEAR => {
+                self.settings.recent.clear();
+                self.save_settings();
+            }
             id if (cmd::WORKSPACE_OPEN..cmd::WORKSPACE_END).contains(&id) => {
                 let name = self
                     .workspace_names
@@ -13528,7 +13620,7 @@ impl Window {
                 }
                 if on && !self.tmux.values().any(Tmux::active) {
                     return Some(Command::Notice(
-                        "tmux keybindings work in panes of a tmux session: Session > Attach \
+                        "tmux keybindings work in panes of a tmux session: Session > tmux > Attach \
                          tmux starts one. Then press the tmux prefix (Ctrl+B unless tmux is set \
                          up with another) and c, %, \", n, p, o, x, d or another window or pane \
                          key; the prefix and ? lists them."
@@ -13716,7 +13808,7 @@ impl Window {
                 let host = self.host_pane(pane);
                 let Some(t) = self.tmux.get_mut(&host).filter(|t| t.active()) else {
                     return Some(Command::Notice(
-                        "This pane is not showing a tmux session. Session > Attach tmux \
+                        "This pane is not showing a tmux session. Session > tmux > Attach tmux \
                          starts one."
                             .into(),
                     ));
@@ -14298,10 +14390,52 @@ impl Window {
                 (cmd::VAULT_MOVE, open),
                 (cmd::VAULT_CHANGE, open),
                 (cmd::VAULT_REMOVE, open),
-            ] {
+            ]
+            .into_iter()
+            .chain(self.menu_applies())
+            {
                 let _ = EnableMenuItem(self.menu, id, MF_BYCOMMAND | grey(on));
             }
         }
+    }
+
+    /// Menu items greyed out while they cannot do anything for the
+    /// focused pane: on when they can. The command palette leaves greyed
+    /// items out; their shortcuts work as before.
+    fn menu_applies(&self) -> Vec<(u32, bool)> {
+        let pane = self.focused_id();
+        let host = self.host_pane(pane);
+        let tmux = self.tmux.get(&host).is_some_and(|t| t.active());
+        let connection = self.pane_connection(pane);
+        let vdesk = connection.is_some()
+            && self
+                .vdesks
+                .values()
+                .any(|v| Some(v.connection) == connection);
+        let serial = matches!(
+            self.panes.get(&pane).map(|p| &p.host),
+            Some(Host::Serial { port: Some(_), .. })
+        );
+        let tabs = self.ws.tabs.len() > 1;
+        let split = self.ws.tab().is_some_and(|t| t.root.panes().len() > 1);
+        let mut out = vec![
+            (cmd::TMUX_PICK, tmux),
+            (cmd::TMUX_DETACH, tmux),
+            (cmd::TMUX_LAYOUT, tmux),
+            (cmd::VDESK_STOP, vdesk),
+            (cmd::SERIAL_BREAK, serial),
+            (cmd::NEXT_TAB, tabs),
+            (cmd::PREV_TAB, tabs),
+            (cmd::TAB_LEFT, tabs),
+            (cmd::TAB_RIGHT, tabs),
+            (cmd::JOIN_TAB, tabs),
+            (cmd::PANE_TO_TAB, split),
+        ];
+        for i in 0..4 {
+            out.push((cmd::FOCUS + i, split));
+            out.push((cmd::RESIZE + i, split));
+        }
+        out
     }
 
     /// The hotkey the standby window uses (or would use).
@@ -15693,7 +15827,7 @@ enum Command {
     NewKey,
     /// Settings > Key bindings: the window that changes them.
     KeyBindings,
-    /// File > Export connections, Import encrypted connections and the
+    /// File > Import and export > Export connections, Import encrypted connections and the
     /// Master password items, by menu id.
     Vault(u32),
     /// The new key is made, or why not; `host` is what the pane it was
@@ -15747,13 +15881,13 @@ enum Command {
     },
     /// The tab strip's close mark: asks first when sessions are open.
     CloseTab(usize),
-    /// File > Import connections: the side pane's import page.
+    /// File > Import and export > Import connections: the side pane's import page.
     ImportSessions,
-    /// File > Import snippets: the side pane's import page for snippets.
+    /// File > Import and export > Import scripts: the side pane's import page for snippets.
     ImportSnippets,
-    /// Session > Check a log: the file picker, then the chain check.
+    /// Session > Logs and recordings > Check a log: the file picker, then the chain check.
     VerifyLog,
-    /// Session > Play a recording: pick a `.cast` file.
+    /// Session > Logs and recordings > Play a recording: pick a `.cast` file.
     PlayCast,
     /// The import page's file picker.
     PickImportFile,
@@ -15936,7 +16070,7 @@ fn run_commands(hwnd: HWND, commands: Vec<Command>) {
     }
 }
 
-/// Session > Attach tmux on a pane that is not at a logged-in shell.
+/// Session > tmux > Attach tmux on a pane that is not at a logged-in shell.
 const NOT_IN_SHELL: &str = "Log in to an SSH host in this pane first; Attach tmux types \
                             `tmux -CC new-session -A -s main` at its shell (the session name \
                             comes from the host's Tmux setting in ferossh.conf).";
@@ -15947,7 +16081,7 @@ fn desktop_size(rect: Rect) -> (u16, u16) {
     (side(rect.w), side(rect.h))
 }
 
-/// Session > Open virtual desktop on a pane that is not logged in.
+/// Session > Remote desktop > Open virtual desktop on a pane that is not logged in.
 const NO_COPY_HOST: &str = "Log in to an SSH host in this pane first. Copy public key to this \
                             server adds a key to ~/.ssh/authorized_keys on that host, so it \
                             can log in with the key next time.";
@@ -15986,7 +16120,7 @@ fn remote_app_note(what: &str, label: &str, end: &ferostream_client::win32::End)
     Some(text)
 }
 
-/// Session > Open remote desktop on a pane that is not logged in.
+/// Session > Remote desktop > Open remote desktop on a pane that is not logged in.
 const NO_DESKTOP_HOST: &str = "Log in to an SSH host in this pane first. Open remote desktop \
                                tunnels the host's Remote Desktop (RDP) port over that \
                                connection and opens Remote Desktop Connection on it.";
@@ -17199,7 +17333,8 @@ fn run_command(hwnd: HWND, command: Command) {
                  big as its smallest client. So it shows {}x{} instead of the {}x{} this pane \
                  has room for, leaving part of the pane empty.\n\n\
                  Often it is a client left behind by a dropped connection.\n\n\
-                 Detach the other clients? (Later: Session > Detach other tmux clients.)",
+                 Detach the other clients of this session? (Later: Session > tmux > \
+                 Detach other clients.)",
                 have.0, have.1, want.0, want.1
             );
             match dialog(hwnd, &text, MB_YESNO | MB_ICONQUESTION) {
@@ -18845,6 +18980,16 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                     }
                     _ => {}
                 }
+                // File > Recent connections ends with Clear this list.
+                let count = GetMenuItemCount(Some(popup));
+                if count > 0 && GetMenuItemID(popup, count - 1) == cmd::RECENT_CLEAR {
+                    with_window(|w| w.fill_recent(popup));
+                }
+                DefWindowProcW(hwnd, msg, wparam, lparam)
+            }
+            WM_INITMENU => {
+                // Check marks, and greyed items, as things are now.
+                with_window(Window::update_menu_checks);
                 DefWindowProcW(hwnd, msg, wparam, lparam)
             }
             WM_HOTKEY if wparam.0 == standby::HOTKEY_ID as usize => {

@@ -37,7 +37,7 @@ Some antivirus products flag new exes that few people have run yet, by file repu
 
 ## Scripts or login scripts type at the wrong moment
 
-`expect` and `@expect` wait for text exactly as the host prints it, up to 15 seconds unless a `timeout` step says otherwise. Look at what the host really prints (a prompt may end in a space) and expect less of it, for example `assword:`. A slow device needs more time: `timeout 60` (`@timeout 60` in a script) makes the steps after it wait a minute, and `timeout 60 goto slow` goes to a label instead of stopping. Pressing any key stops a login script; Session > Run login script again restarts it.
+`expect` and `@expect` wait for text exactly as the host prints it, up to 15 seconds unless a `timeout` step says otherwise. Look at what the host really prints (a prompt may end in a space) and expect less of it, for example `assword:`. A slow device needs more time: `timeout 60` (`@timeout 60` in a script) makes the steps after it wait a minute, and `timeout 60 goto slow` goes to a label instead of stopping. Pressing any key stops a login script; Session > Scripts > Run login script again restarts it.
 
 ## A log says it was changed
 

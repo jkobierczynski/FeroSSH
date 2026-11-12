@@ -6,6 +6,8 @@ Settings > Key bindings changes the shortcuts, and gives one to any item that ha
 
 Items with a check mark are switches: picking them turns the setting on or off, and FeroSSH remembers it in `ferossh.conf` (see [Settings](settings.md)).
 
+Items that can do nothing for the focused pane are greyed out, and the command palette leaves them out: the tmux items other than Attach while the pane shows no tmux session, Stop virtual desktop while none runs, Send break outside a serial console, the tab items with one tab and the pane items with one pane. Their shortcuts work as before.
+
 ## File
 
 | Item | Shortcut | What it does |
@@ -14,19 +16,15 @@ Items with a check mark are switches: picking them turns the setting on or off, 
 | Reconnect | Ctrl+Shift+R | Logs in again on the focused pane's connection. While FeroSSH is already waiting to reconnect, it tries at once instead. |
 | Disconnect | | Ends the focused pane's connection, or stops the retries while it is reconnecting. |
 | Reconnect automatically | ✓ on | Logs in again by itself when a connection drops (see [When the connection drops](everyday-use.md#when-the-connection-drops)). `AutoReconnect`. |
-| Close pane | Ctrl+Shift+W | Closes the focused pane and ends its session. In tmux it closes the tmux pane. |
+| Recent connections > (a connection) | | The last eight hosts you connected to, from Connect to... or the connection manager, newest first: picking one connects again, as a double click in the connection manager does. Kept in `ferossh.conf` (`Recent` lines), so a master password vault holds them too. |
+| Recent connections > Clear this list | | Forgets them. |
+| Open local shell | | Opens a Windows command prompt (`%COMSPEC%`, usually `cmd.exe`) in a new tab. To start another program, use `ferossh.exe --local wsl -d Ubuntu` and the like. |
 | Upload files... | Ctrl+Shift+U | Picks files on your PC and uploads them over SFTP to the folder the file view shows, or the shell's current folder. |
 | Open download folder | | Opens the folder downloads go to in Explorer. |
-| Open local shell | | Opens a Windows command prompt (`%COMSPEC%`, usually `cmd.exe`) in a new tab. To start another program, use `ferossh.exe --local wsl -d Ubuntu` and the like. |
-| Import connections... | | Brings saved sessions over from PuTTY, KiTTY, WinSCP, MobaXterm, mRemoteNG and SecureCRT (see [Imports](everyday-use.md#importing-from-other-clients)). |
-| Import scripts... | | Brings scripts over from Windows Terminal (`sendInput` actions and `.wt.json` scripts), SecureCRT button bars and MobaXterm macros, or makes one from a text file (see [Importing scripts](everyday-use.md#importing-scripts)). |
-| Export connections... | | Writes your saved and imported connections and their settings to a `.ferossh` file encrypted with a passphrase, with the saved passwords only if you tick it (see [Backup and sync](everyday-use.md#backup-and-sync-between-pcs)). |
-| Import encrypted connections... | | Opens such a file, asks its passphrase, says what it would add and replace, and imports it. Your other connections stay. |
-| Master password > Set a master password... | | Moves your connections, settings and (if ticked) saved passwords into an encrypted vault, `connections.vault`. FeroSSH then asks for the master password when it starts. |
-| Master password > Use a vault file... | | Uses a vault another PC made, in a shared folder such as OneDrive, and adds this PC's connections to it. |
-| Master password > Move the vault file... | | Moves the vault, for example into a OneDrive folder to share it between PCs. |
-| Master password > Change master password... | | Asks for the current master password, then a new one. |
-| Master password > Remove master password... | | Asks for the current master password, then writes the connections and settings back as plain files and the passwords back to the Windows Credential Manager. A portable FeroSSH drops the saved passwords instead (export them first to keep them). A vault in a shared folder stays there for the other PCs. |
+| Import and export > Import connections... | | Brings saved sessions over from PuTTY, KiTTY, WinSCP, MobaXterm, mRemoteNG and SecureCRT (see [Imports](everyday-use.md#importing-from-other-clients)). |
+| Import and export > Import scripts... | | Brings scripts over from Windows Terminal (`sendInput` actions and `.wt.json` scripts), SecureCRT button bars and MobaXterm macros, or makes one from a text file (see [Importing scripts](everyday-use.md#importing-scripts)). |
+| Import and export > Export connections... | | Writes your saved and imported connections and their settings to a `.ferossh` file encrypted with a passphrase, with the saved passwords only if you tick it (see [Backup and sync](everyday-use.md#backup-and-sync-between-pcs)). |
+| Import and export > Import encrypted connections... | | Opens such a file, asks its passphrase, says what it would add and replace, and imports it. Your other connections stay. |
 | Exit | Alt+F4 | Closes FeroSSH. tmux sessions keep running on their servers. |
 
 ## Edit
@@ -40,7 +38,6 @@ Items with a check mark are switches: picking them turns the setting on or off, 
 | Follow new output | Ctrl+Shift+End (or Shift+End while scrolled back or stopped) | Goes back to the bottom and follows the output again. End or any key typed does too. |
 | Clear scrollback | | Forgets the pane's scrollback. The screen stays. |
 | Save selection as script... | | Opens the script editor with the selected text as the script's lines. |
-| Record keystrokes as script | ✓ while recording | Records what you type in the focused pane until you pick it again, then opens the result in the script editor (see [Recording](everyday-use.md#recording-a-script)). |
 | Copy on select | ✓ off | Copies a selection as soon as you make it, as PuTTY does. `CopyOnSelect`. |
 | Right-click pastes | ✓ off | A right click pastes, as in PuTTY. `RightClickPaste`. |
 | Suggest commands as you type | ✓ off | Shows an earlier command on this host (or a common one) greyed after the cursor; Right arrow or End types it (see [Command suggestions](everyday-use.md#command-suggestions)). `CommandSuggestions`. |
@@ -68,6 +65,11 @@ Items with a check mark are switches: picking them turns the setting on or off, 
 | Full screen | F11 | ✓ while on. The window drops its title bar, frame and menu bar and covers the whole monitor, taskbar too. F11 again (or this item) puts it back as it was, maximized or not. Alt still shows the menu bar; it hides again once a menu closes. |
 | F11 switches full screen | ✓ on | Off, F11 goes to the terminal like the other function keys, for programs that use it; Full screen stays in this menu and the command palette. With another key for Full screen (Key bindings), the item names that key. `FullScreenKey`. |
 | Key bindings... | | A window listing every action of the menus with its shortcuts and its default ones: change them, add a second key, take a key away, or reset one action or all of them. See [Key bindings](#key-bindings). `KeyBinding`. |
+| Master password > Set a master password... | | Moves your connections, settings and (if ticked) saved passwords into an encrypted vault, `connections.vault`. FeroSSH then asks for the master password when it starts. |
+| Master password > Use a vault file... | | Uses a vault another PC made, in a shared folder such as OneDrive, and adds this PC's connections to it. |
+| Master password > Move the vault file... | | Moves the vault, for example into a OneDrive folder to share it between PCs. |
+| Master password > Change master password... | | Asks for the current master password, then a new one. |
+| Master password > Remove master password... | | Asks for the current master password, then writes the connections and settings back as plain files and the passwords back to the Windows Credential Manager. A portable FeroSSH drops the saved passwords instead (export them first to keep them). A vault in a shared folder stays there for the other PCs. |
 
 Font, theme and text size apply to the focused pane only. Session > Save font and theme for this host keeps them for that host.
 
@@ -89,6 +91,20 @@ Font, theme and text size apply to the focused pane only. Session > Save font an
 | Item | Shortcut | What it does |
 | --- | --- | --- |
 | New tab | Ctrl+Shift+T | A new tab on the focused pane's host, as a new channel on the same connection, so there is no second login. |
+| Rename session... | | Names the focused session in place on its tab (F2 in the session manager does the same); an empty name gives the tab its title back. In tmux the name goes to the tmux window too. |
+| Next tab | Ctrl+Tab | |
+| Previous tab | Ctrl+Shift+Tab | |
+| Move tab left | Ctrl+Shift+PgUp | |
+| Move tab right | Ctrl+Shift+PgDn | |
+| Split right | Alt+Shift+= | Splits the focused pane, the new one on the right, on the same connection and in the same directory (see [New tabs and panes start in the same directory](everyday-use.md#new-tabs-and-panes-start-in-the-same-directory)). |
+| Split down | Alt+Shift+- | The same, the new pane below. |
+| Move pane to its own tab | | Takes the focused pane out of its tab into a new one. |
+| Join tab into the tab before it | Ctrl+Shift+J | Puts this tab's panes into the tab to its left. |
+| Focus pane left, right, up, down | Alt+arrows | Moves the focus to the pane in that direction. |
+| Grow pane left, right, up, down | Alt+Shift+arrows | Moves the focused pane's edge that way. |
+| Broadcast input to this tab's panes | Ctrl+Shift+B | What you type and paste goes to every pane of the tab (see [Broadcast input](everyday-use.md#broadcast-input)). |
+| Broadcast input to all tabs | | The same, to every pane in every tab. |
+| Leave this pane out of broadcast | | Keeps the focused pane to itself while broadcast is on. |
 | Workspaces > Save layout as workspace... | | Saves the open tabs and split panes, each with its connection, directory, session name and own look, as a workspace under the name you give. See [Workspaces](everyday-use.md#workspaces). |
 | Workspaces > Open workspace file... | | Opens a workspace file from any folder as new tabs. |
 | Workspaces > Open workspaces folder | | Opens `%APPDATA%\FeroSSH\workspaces` in Explorer. |
@@ -98,19 +114,6 @@ Font, theme and text size apply to the focused pane only. Session > Save font an
 | Standby window (hotkey) > Window to show and hide | | This FeroSSH window, or one of the open windows of other programs (listed with their program, such as `notepad.exe`). Picking one turns standby on. FeroSSH remembers the program, so after a restart it uses that program's front window. `StandbyWindow`. |
 | Standby window (hotkey) > Press a new hotkey... | | After OK, the next key you press with Ctrl, Alt or Win becomes the hotkey, and standby turns on. Esc cancels. `StandbyHotkey`. |
 | Standby window (hotkey) > Win+` … Pause | | Picks one of five hotkeys and turns standby on: Win or Ctrl with the key below Esc (shown as your keyboard prints it), Ctrl+Alt+Space, Scroll Lock or Pause. The one in use is marked. |
-| Split right | Alt+Shift+= | Splits the focused pane, the new one on the right, on the same connection and in the same directory (see [New tabs and panes start in the same directory](everyday-use.md#new-tabs-and-panes-start-in-the-same-directory)). |
-| Split down | Alt+Shift+- | The same, the new pane below. |
-| Move pane to its own tab | | Takes the focused pane out of its tab into a new one. |
-| Join tab into the tab before it | Ctrl+Shift+J | Puts this tab's panes into the tab to its left. |
-| Broadcast input to this tab's panes | Ctrl+Shift+B | What you type and paste goes to every pane of the tab (see [Broadcast input](everyday-use.md#broadcast-input)). |
-| Broadcast input to all tabs | | The same, to every pane in every tab. |
-| Leave this pane out of broadcast | | Keeps the focused pane to itself while broadcast is on. |
-| Next tab | Ctrl+Tab | |
-| Previous tab | Ctrl+Shift+Tab | |
-| Move tab left | Ctrl+Shift+PgUp | |
-| Move tab right | Ctrl+Shift+PgDn | |
-| Focus pane left, right, up, down | Alt+arrows | Moves the focus to the pane in that direction. |
-| Grow pane left, right, up, down | Alt+Shift+arrows | Moves the focused pane's edge that way. |
 | Close pane | Ctrl+Shift+W | |
 | Close tab | Ctrl+F4 | Closes every pane in the tab, after asking when it has more than one open SSH session. |
 
@@ -119,44 +122,45 @@ Font, theme and text size apply to the focused pane only. Session > Save font an
 | Item | What it does |
 | --- | --- |
 | Log to file | Writes what the focused tab receives to a log file. ✓ while logging. See [Logs](logs.md). |
-| Log raw output (keep escape codes) | Logs every byte as received, so the log replays with `cat`. ✓ |
-| Timestamp each log line | Puts the time each line started in front of it, in plain logs. ✓ `LogTimestamps`. |
-| Save this pane's output to a log | Writes everything the pane still holds, scrollback and screen, to a new log file. |
-| Save output of all panes to logs | The same for every pane in every tab, one file each. |
-| Open log folder | Opens `%LOCALAPPDATA%\FeroSSH\logs` in Explorer. |
-| Check a log for changes... | Picks a log and says whether it is intact, or where it was changed, cut short or added to. |
-| Record this pane (asciicast) | Records what the focused pane shows, with its timing, to a `.cast` file in the log folder, until you choose it again. Only the host's output goes in, never your keystrokes: what you type is in it only as the host echoes it, so a password typed at a prompt that does not echo stays out, but a secret the host echoes or prints (such as `mysql -pSecret` on a command line) is recorded. Off by default; ✓ while recording. See [Recording a pane](logs.md#recording-a-pane-and-playing-it-back). |
-| Play a recording... | Picks a `.cast` file and plays it in a new tab: Space pauses, Left and Right go 5 seconds back and on (Shift: 30), Up and Down change the speed, Home starts again, End goes to the end. |
-| Save font and theme for this host | Keeps the focused pane's font, text size and theme in the host's profile. |
-| Start new tabs and panes in this directory | Keeps the focused pane's directory as the host's start directory (Start dir in the connection form): new tabs, panes and tmux windows on that host start there when the directory of the pane they come from is not known, also after a restart. |
-| Replace host key... | After a host key change you know the reason for, trusts the new key. It asks twice. |
-| Copy public key to this server... | Like `ssh-copy-id`: adds a `.pub` file's key to `~/.ssh/authorized_keys` on the focused pane's host, unless it is there already (see [Making a key](everyday-use.md#making-a-key-and-putting-it-on-a-server)). |
-| Verify transfers (SHA-256) | Compares SHA-256 sums on both ends after each SFTP transfer (the server needs `sha256sum` and `xargs`). ✓ `VerifyTransfers`. |
-| ZMODEM: answer rz and sz | Answers `rz` and `sz` in the terminal (see [ZMODEM](everyday-use.md#zmodem)). ✓ `ZModem`. |
-| Highlight keywords | Colours errors, warnings, success words and addresses in the output, and your own `HighlightRule`s (see [Highlighting and following output](everyday-use.md#highlighting-and-following-output)). ✓ on. `Highlight`. |
-| Attach tmux | Types `tmux -CC new-session -A -s main` in the pane and turns tmux windows and panes into native tabs and panes (see [tmux](everyday-use.md#tmux)). |
-| Switch tmux session... | Lists the other tmux sessions on the server and switches to one. |
-| Detach tmux | Leaves tmux, and everything running in it, on the server. Attach again later from this PC or another. |
-| Detach other tmux clients | Detaches every other client from this tmux session, such as one left behind by a dropped connection. tmux makes a window only as big as its smallest client, so another client can leave part of the pane empty; FeroSSH offers this itself when it sees that. |
-| tmux: one window per pane (own fonts) | ✓ on: each native pane is its own tmux window, so each can have its own font. Off: tmux's own splits are the panes. |
-| Use tmux keybindings for tabs and panes | ✓ on: in a pane of a tmux session, your tmux prefix then `c`, `%`, `"`, `n`, `p`, an arrow and the other window and pane keys work the tabs and panes; the prefix then `?` lists them (see [tmux](everyday-use.md#tmux)). Off by default. |
-| Send break (serial) | Holds a serial line in break for 300 ms (Cisco ROM monitor, Linux SysRq). |
-| Run login script again | Runs the connection's login script from the start. |
-| Auto-responses from scripts | ✓ on: scripts with a *When* text answer by themselves. Off turns all of them off. `AutoResponses`. |
-| Confirm scripts on Production hosts | ✓ on: a script about to be typed into a pane with the Production theme asks first. `ConfirmProduction`. |
-| Open remote desktop | Ctrl+Shift+D. Tunnels the host's RDP port through SSH and opens Windows' Remote Desktop Connection on it (see [Remote desktops](everyday-use.md#remote-desktops)). |
-| Open remote desktop in a tab (RDP) | Only in `ferossh-desktop.exe`: the desktop in a FeroSSH tab. |
-| Open remote desktop in a tab (VNC) | Only in `ferossh-desktop.exe`: a VNC desktop in a FeroSSH tab. |
-| Open virtual desktop (Xvfb) | Starts Xvfb and x11vnc on the server and shows that headless desktop through SSH: in a tab in `ferossh-desktop.exe`, else in the VNC viewer on this PC (see [Virtual desktops](everyday-use.md#virtual-desktops-xvfb)). Again while one runs: another viewer on it. |
-| Stop virtual desktop | Stops the virtual desktop on this connection, and everything running in it. |
-| Desktop clipboard > Both ways, Only Windows to host, Only host to Windows, Off | Which way copied text goes between remote and virtual desktops and Windows; changes the desktops already open at once. Remote Desktop Connection can only share both ways or none. Off by default. `DesktopClipboard` (see [Desktop clipboard](everyday-use.md#desktop-clipboard)). |
-| Desktop clipboard > Also share mouse selections from virtual desktops | ✓ on: text you only select with the mouse in a virtual desktop also goes to the Windows clipboard; for virtual desktops started after the change. Off by default. `DesktopShareSelection`. |
+| Logs and recordings > Log raw output (keep escape codes) | Logs every byte as received, so the log replays with `cat`. ✓ |
+| Logs and recordings > Timestamp each log line | Puts the time each line started in front of it, in plain logs. ✓ `LogTimestamps`. |
+| Logs and recordings > Save this pane's output to a log | Writes everything the pane still holds, scrollback and screen, to a new log file. |
+| Logs and recordings > Save output of all panes to logs | The same for every pane in every tab, one file each. |
+| Logs and recordings > Record this pane (asciicast) | Records what the focused pane shows, with its timing, to a `.cast` file in the log folder, until you choose it again. Only the host's output goes in, never your keystrokes: what you type is in it only as the host echoes it, so a password typed at a prompt that does not echo stays out, but a secret the host echoes or prints (such as `mysql -pSecret` on a command line) is recorded. Off by default; ✓ while recording. See [Recording a pane](logs.md#recording-a-pane-and-playing-it-back). |
+| Logs and recordings > Play a recording... | Picks a `.cast` file and plays it in a new tab: Space pauses, Left and Right go 5 seconds back and on (Shift: 30), Up and Down change the speed, Home starts again, End goes to the end. |
+| Logs and recordings > Open log folder | Opens `%LOCALAPPDATA%\FeroSSH\logs` in Explorer. |
+| Logs and recordings > Check a log for changes... | Picks a log and says whether it is intact, or where it was changed, cut short or added to. |
+| tmux > Attach tmux | Types `tmux -CC new-session -A -s main` in the pane and turns tmux windows and panes into native tabs and panes (see [tmux](everyday-use.md#tmux)). |
+| tmux > Switch tmux session... | Lists the other tmux sessions on the server and switches to one. |
+| tmux > Detach tmux | Leaves tmux, and everything running in it, on the server. Attach again later from this PC or another. |
+| tmux > Detach other clients | Detaches the other clients of this tmux session, such as one left behind by a dropped connection; clients of other sessions stay. tmux makes a window only as big as its smallest client, so another client can leave part of the pane empty; FeroSSH offers this itself when it sees that. |
+| tmux > One window per pane (own fonts) | ✓ on: each native pane is its own tmux window, so each can have its own font. Off: tmux's own splits are the panes. |
+| tmux > Use tmux keybindings for tabs and panes | ✓ on: in a pane of a tmux session, your tmux prefix then `c`, `%`, `"`, `n`, `p`, an arrow and the other window and pane keys work the tabs and panes; the prefix then `?` lists them (see [tmux](everyday-use.md#tmux)). Off by default. |
+| Remote desktop > Open remote desktop | Ctrl+Shift+D. Tunnels the host's RDP port through SSH and opens Windows' Remote Desktop Connection on it (see [Remote desktops](everyday-use.md#remote-desktops)). |
+| Remote desktop > Open remote desktop in a tab (RDP) | Only in `ferossh-desktop.exe`: the desktop in a FeroSSH tab. |
+| Remote desktop > Open remote desktop in a tab (VNC) | Only in `ferossh-desktop.exe`: a VNC desktop in a FeroSSH tab. |
+| Remote desktop > Open virtual desktop (Xvfb) | Starts Xvfb and x11vnc on the server and shows that headless desktop through SSH: in a tab in `ferossh-desktop.exe`, else in the VNC viewer on this PC (see [Virtual desktops](everyday-use.md#virtual-desktops-xvfb)). Again while one runs: another viewer on it. |
+| Remote desktop > Stop virtual desktop | Stops the virtual desktop on this connection, and everything running in it. |
+| Remote desktop > Clipboard > Both ways, Only Windows to host, Only host to Windows, Off | Which way copied text goes between remote and virtual desktops and Windows; changes the desktops already open at once. Remote Desktop Connection can only share both ways or none. Off by default. `DesktopClipboard` (see [Desktop clipboard](everyday-use.md#desktop-clipboard)). |
+| Remote desktop > Clipboard > Also share mouse selections from virtual desktops | ✓ on: text you only select with the mouse in a virtual desktop also goes to the Windows clipboard; for virtual desktops started after the change. Off by default. `DesktopShareSelection`. |
 | Remote apps > Run remote app... | Runs a Linux program on the pane's host and shows its windows as native windows here, over the same SSH connection (see [Remote apps](everyday-use.md#remote-apps-native-windows)). |
 | Remote apps > Reattach remote app | Brings back the windows of the newest remote app still running on the host. |
 | Remote apps > Copy the agent to hosts | ✓ on (the default): copies the FeroStream agent to a host that lacks it. `RemoteAppCopyAgent`. |
 | Remote apps > Remove the agent when done | ✓ on: the agent deletes itself from the host when its last program ends. Off by default. `RemoteAppRemoveAgent`. |
 | Remote apps > Clipboard > Both ways, Only Windows to host, Only host to Windows, Off | Which way copied text goes between remote apps and Windows; changes the remote apps already running at once. Off by default. `RemoteAppClipboard`. |
 | Remote apps > Clipboard > Also share mouse selections from the host | ✓ on: text you only select with the mouse in a remote app (how xterm copies) also goes to the Windows clipboard. Off by default, so a selection does not replace what you copied on Windows. `RemoteAppShareSelection`. |
+| Scripts > Run login script again | Runs the connection's login script from the start. |
+| Scripts > Record keystrokes as script | Records what you type in the focused pane until you pick it again, then opens the result in the script editor (see [Recording](everyday-use.md#recording-a-script)). ✓ while recording. |
+| Scripts > Auto-responses from scripts | ✓ on: scripts with a *When* text answer by themselves. Off turns all of them off. `AutoResponses`. |
+| Scripts > Confirm scripts on Production hosts | ✓ on: a script about to be typed into a pane with the Production theme asks first. `ConfirmProduction`. |
+| Replace host key... | After a host key change you know the reason for, trusts the new key. It asks twice. |
+| Copy public key to this server... | Like `ssh-copy-id`: adds a `.pub` file's key to `~/.ssh/authorized_keys` on the focused pane's host, unless it is there already (see [Making a key](everyday-use.md#making-a-key-and-putting-it-on-a-server)). |
+| Verify transfers (SHA-256) | Compares SHA-256 sums on both ends after each SFTP transfer (the server needs `sha256sum` and `xargs`). ✓ `VerifyTransfers`. |
+| ZMODEM: answer rz and sz | Answers `rz` and `sz` in the terminal (see [ZMODEM](everyday-use.md#zmodem)). ✓ `ZModem`. |
+| Highlight keywords | Colours errors, warnings, success words and addresses in the output, and your own `HighlightRule`s (see [Highlighting and following output](everyday-use.md#highlighting-and-following-output)). ✓ on. `Highlight`. |
+| Save font and theme for this host | Keeps the focused pane's font, text size and theme in the host's profile. |
+| Start new tabs and panes in this directory | Keeps the focused pane's directory as the host's start directory (Start dir in the connection form): new tabs, panes and tmux windows on that host start there when the directory of the pane they come from is not known, also after a restart. |
+| Send break (serial) | Holds a serial line in break for 300 ms (Cisco ROM monitor, Linux SysRq). |
 
 ## Help
 

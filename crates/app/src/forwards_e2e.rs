@@ -626,7 +626,7 @@ fn on_path(program: &str) -> bool {
         .is_some_and(|p| std::env::split_paths(&p).any(|d| d.join(program).is_file()))
 }
 
-/// Session > Open virtual desktop end to end, at a fixed size: the
+/// Session > Remote desktop > Open virtual desktop end to end, at a fixed size: the
 /// script runs on an exec channel of a real login, starts Xvfb and x11vnc
 /// there, and says where x11vnc listens; a desktop tunnel to that port
 /// reaches a VNC server that asks for a password and listens on loopback

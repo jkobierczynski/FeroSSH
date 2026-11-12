@@ -29,7 +29,7 @@ A workspace is a saved set of tabs and split panes, each pane on a connection, t
 - Open one from Window > Workspaces, from the *Workspaces* folder in the connection manager (Enter or a double click; Del deletes it), from the command palette (type its name), or from the command line with `ferossh.exe --workspace NAME`. Its tabs open next to the ones you have; a window that only waits at the connect prompt makes way for them.
 - Panes on the same SSH host log in once: the first pane logs in, and the others wait for it and open on its connection.
 - A workspace names connections; it never holds an address, user, key or password. Editing a connection changes every workspace that uses it, and a workspace file is safe to copy to another PC, keep in git or back up. Logins work as they do anywhere else: keys, the agent, the connection's password source and its login script.
-- tmux panes are kept like any other, each with its split, directory, name and look, and marked with their tmux session. Opening the workspace logs in once and attaches that session: if it still runs on the server you get it as it is now, and if it is gone (after a reboot, say) FeroSSH first makes it again with the saved windows, each in its directory, laid out as saved. With Session > tmux: one window per pane turned off, tmux keeps the splits itself and a session is saved as one pane. Remote desktop tabs are left out.
+- tmux panes are kept like any other, each with its split, directory, name and look, and marked with their tmux session. Opening the workspace logs in once and attaches that session: if it still runs on the server you get it as it is now, and if it is gone (after a reboot, say) FeroSSH first makes it again with the saved windows, each in its directory, laid out as saved. With Session > tmux > One window per pane turned off, tmux keeps the splits itself and a session is saved as one pane. Remote desktop tabs are left out.
 - Workspaces are files in `%APPDATA%\FeroSSH\workspaces` (Window > Workspaces > Open workspaces folder), one per workspace, in a plain text format you can also write by hand:
 
 ```text
@@ -136,7 +136,7 @@ A command runs without a shell, a window or any input, for at most 60 seconds, a
 
 ### Importing from other clients
 
-File > Import connections lists the clients that have saved sessions on your account: PuTTY and KiTTY (from the registry), WinSCP (registry or `WinSCP.ini`), MobaXterm (`MobaXterm.ini`), mRemoteNG (`confCons.xml`) and SecureCRT (its `Config\Sessions` folder). Pick one to see its sessions, untick what you don't want, and choose Import. *From a file...* reads the same files from a portable install or an export.
+File > Import and export > Import connections lists the clients that have saved sessions on your account: PuTTY and KiTTY (from the registry), WinSCP (registry or `WinSCP.ini`), MobaXterm (`MobaXterm.ini`), mRemoteNG (`confCons.xml`) and SecureCRT (its `Config\Sessions` folder). Pick one to see its sessions, untick what you don't want, and choose Import. *From a file...* reads the same files from a portable install or an export.
 
 Host, user, port, key file, folders, PuTTY and KiTTY port forwards, jump hosts and the SOCKS 5 and HTTP proxies of PuTTY, KiTTY and WinSCP come over, and so do Telnet sessions and (from MobaXterm and mRemoteNG) RDP and VNC sessions. **Passwords never come over**: the preview marks the sessions that had one, so you can give them a password source. The preview also says what else does not come over. Imports go to `%APPDATA%\FeroSSH\imported-<client>.conf`, in a folder named after the client, and importing again from the same client replaces that file. A name already in use is left out.
 
@@ -144,9 +144,9 @@ Host, user, port, key file, folders, PuTTY and KiTTY port forwards, jump hosts a
 
 FeroSSH has no cloud of its own. Your connections travel in an encrypted file that you keep where you like: OneDrive, Dropbox, a git repository or a USB stick.
 
-**Export and import.** File > Export connections writes your saved and imported connections, with their FeroSSH settings (type, look, extras, login script), to one `.ferossh` file encrypted with a passphrase you choose. Saved passwords go in only when you tick *Include saved passwords*. On the other PC, File > Import encrypted connections asks for the passphrase and says what it would change before it does anything: connections it does not have are added, ones with the same name are replaced by the file's, and the rest of yours stay. Hosts from `~/.ssh/config` are not in the file; copy that file as it is.
+**Export and import.** File > Import and export > Export connections writes your saved and imported connections, with their FeroSSH settings (type, look, extras, login script), to one `.ferossh` file encrypted with a passphrase you choose. Saved passwords go in only when you tick *Include saved passwords*. On the other PC, File > Import and export > Import encrypted connections asks for the passphrase and says what it would change before it does anything: connections it does not have are added, ones with the same name are replaced by the file's, and the rest of yours stay. Hosts from `~/.ssh/config` are not in the file; copy that file as it is.
 
-**A master password.** File > Master password > Set a master password moves your connections, `ferossh.conf` and (if you tick it) the passwords saved in the Windows Credential Manager into one encrypted file, `connections.vault`, and removes the plain files. From then on FeroSSH asks for the master password when it starts, and passwords it saves go into the vault. Change master password and Remove master password (which writes the plain files back) ask for the current one first. There is no way to recover a forgotten master password, so keep an export somewhere safe too.
+**A master password.** Settings > Master password > Set a master password moves your connections, `ferossh.conf` and (if you tick it) the passwords saved in the Windows Credential Manager into one encrypted file, `connections.vault`, and removes the plain files. From then on FeroSSH asks for the master password when it starts, and passwords it saves go into the vault. Change master password and Remove master password (which writes the plain files back) ask for the current one first. There is no way to recover a forgotten master password, so keep an export somewhere safe too.
 
 **Sync.** Master password > Move the vault file puts the vault in a folder you choose, for example in OneDrive. On a second PC, Master password > Use a vault file opens that same file, adds that PC's own connections to it and uses it from then on; where both have a connection of the same name, the vault's wins, so export this PC's connections first if you want to keep its versions. Both PCs now read and write one vault: a change on one shows on the other the next time it reads its connections, once the sync client has brought the file over, and host settings another PC changed meanwhile are kept when this one saves. Changes made on two PCs before the file synced, or at the same moment, can still overwrite each other (the last save wins), so let OneDrive finish syncing before you edit connections on another PC. Window settings (fonts, menus) are in the vault too and follow the PC that saved last. If you change the master password on one PC, the other asks for the new one when it next starts.
 
@@ -229,7 +229,7 @@ Some devices want answers after the login: a second user name, `enable`, `termin
 
 A login script can use the logic steps of a script, without the `@`: `on`, `goto`, `if`, `timeout` and the others below (see [Logic](#logic-expect-style)), so one script can answer an `enable` password or a second login only when the device asks. It types into its own pane only, so `pane` and `tab` moves are for scripts, a line to type needs `send` in front, and variables such as `${host}` are not filled in.
 
-The script runs once after an SSH or Telnet login, or when a serial port opens; tmux attaches after it. Pressing any key stops it, and Session > Run login script again starts it over. What it types is never broadcast.
+The script runs once after an SSH or Telnet login, or when a serial port opens; tmux attaches after it. Pressing any key stops it, and Session > Scripts > Run login script again starts it over. What it types is never broadcast.
 
 Secrets are never written to a FeroSSH file. The first time, the pane asks for the secret (without echo) and keeps it in Windows Credential Manager as `FeroSSH secret:<name>`. Or a `Secret` block in `ferossh.conf` names a password manager command for it (see [Settings](settings.md#secrets)).
 
@@ -332,11 +332,11 @@ Each host logs in in a session of its own that no tab shows, with its own sandbo
 
 ### Auto-responses
 
-A script's *When* text makes it answer by itself whenever the host prints that text, on the hosts it is kept to: for example `@key space` when `--More--` appears, or `@key enter` on `[confirm]`. An auto-response only types lines and keys you wrote, never a password, a secret, the clipboard or arguments, and after 20 answers in one second it pauses until you type. Session > Auto-responses from scripts turns them all off.
+A script's *When* text makes it answer by itself whenever the host prints that text, on the hosts it is kept to: for example `@key space` when `--More--` appears, or `@key enter` on `[confirm]`. An auto-response only types lines and keys you wrote, never a password, a secret, the clipboard or arguments, and after 20 answers in one second it pauses until you type. Session > Scripts > Auto-responses from scripts turns them all off.
 
 ### Production guard
 
-A script about to be typed into a pane with the red Production theme asks first, listing the hosts and the lines. Session > Confirm scripts on Production hosts turns that off.
+A script about to be typed into a pane with the red Production theme asks first, listing the hosts and the lines. Session > Scripts > Confirm scripts on Production hosts turns that off.
 
 ### The scripts folder
 
@@ -357,7 +357,7 @@ To take scripts to another PC, copy the files or folders into that PC's scripts 
 
 ### Importing scripts
 
-File > Import scripts lists what other programs on this PC have, with a box per script and its first lines, so you can check them before anything is written. Imported scripts get a file each in the scripts folder; one whose name is already taken in its category is left out.
+File > Import and export > Import scripts lists what other programs on this PC have, with a box per script and its first lines, so you can check them before anything is written. Imported scripts get a file each in the scripts folder; one whose name is already taken in its category is left out.
 
 | From | What comes over |
 | --- | --- |
@@ -370,7 +370,7 @@ Keystrokes come over as steps: text without an Enter becomes `@type`, Tab, Escap
 
 ### Recording a script
 
-Edit > Record keystrokes as script records what you type in the focused pane until you pick it again, then opens it in the script editor to name and check. Backspace, Ctrl+U and Ctrl+W edit lines as a shell does, Tab and Ctrl+ keys are kept as `@key` steps so tab completion replays, and a line the host did not echo (a password) is recorded as `@password`, never as its text.
+Session > Scripts > Record keystrokes as script records what you type in the focused pane until you pick it again, then opens it in the script editor to name and check. Backspace, Ctrl+U and Ctrl+W edit lines as a shell does, Tab and Ctrl+ keys are kept as `@key` steps so tab completion replays, and a line the host did not echo (a password) is recorded as `@password`, never as its text.
 
 ## Standby window
 
@@ -456,36 +456,36 @@ Changes last through the tab's reconnects; the saved connection is left as it wa
 
 ## tmux
 
-Session > Attach tmux types `tmux -CC new-session -A -s main` at the pane's shell (typing `tmux -CC` yourself works too). tmux's windows and panes become native FeroSSH tabs and panes: no status bar, no prefix key, and native scrollback (with tmux's history in it), copy, paste and search. Splits, new tabs and closing panes go to tmux.
+Session > tmux > Attach tmux types `tmux -CC new-session -A -s main` at the pane's shell (typing `tmux -CC` yourself works too). tmux's windows and panes become native FeroSSH tabs and panes: no status bar, no prefix key, and native scrollback (with tmux's history in it), copy, paste and search. Splits, new tabs and closing panes go to tmux.
 
-Session > Detach tmux, closing FeroSSH or losing the network leaves everything running on the server. Attach again, from this PC or another, and the tabs, splits, fonts and themes come back; after a dropped connection it reattaches by itself. Session > Switch tmux session lists the other sessions on the server (also offered right after attaching).
+Session > tmux > Detach tmux, closing FeroSSH or losing the network leaves everything running on the server. Attach again, from this PC or another, and the tabs, splits, fonts and themes come back; after a dropped connection it reattaches by itself. Session > tmux > Switch tmux session lists the other sessions on the server (also offered right after attaching).
 
-tmux makes a window only as big as the smallest client attached to it. If another client (another PC, or one left behind by a dropped connection) keeps a window smaller than the pane, part of the pane stays empty; FeroSSH notices and offers to detach the other clients, and Session > Detach other tmux clients does the same later.
+tmux makes a window only as big as the smallest client attached to it. If another client (another PC, or one left behind by a dropped connection) keeps a window smaller than the pane, part of the pane stays empty; FeroSSH notices and offers to detach the other clients, and Session > tmux > Detach other clients does the same later.
 
 There are two layouts, kept per session:
 
 - **One window per pane** (the default; tmux 3.3 or later): every native pane is its own tmux window, so each pane can have its own font, text size and theme. FeroSSH keeps the splits and looks in the session. A plain tmux client shows the panes as separate windows.
-- **tmux's own splits** (untick Session > tmux: one window per pane, or older tmux): each tmux window is a tab and tmux's splits are its panes, one font per window.
+- **tmux's own splits** (untick Session > tmux > One window per pane, or older tmux): each tmux window is a tab and tmux's splits are its panes, one font per window.
 
 tmux is never started unless you ask. To attach on every login to a host, set `Tmux` (and optionally `TmuxLayout`) in its profile, or switch tmux on in the connection form's Extras (click it, or press Left or Right) and optionally give a tmux name (`main` when left empty). GNU screen has no control mode and runs as an ordinary terminal.
 
 To have a host's shells start in one server directory, `cd` there and use Session > Start new tabs and panes in this directory (or fill in Start dir in the connection form's Extras). FeroSSH types the `cd` after every login and uses it for the first window of a new tmux session. New tabs and panes opened from a pane follow that pane's directory instead, and use the start directory only when that one is not known. Clear Start dir in the form to go back to the home folder.
 
-If your fingers know tmux's keys, tick Session > Use tmux keybindings for tabs and panes. In a pane of a tmux session, your tmux prefix (Ctrl+B unless your tmux config sets another; FeroSSH asks tmux) followed by `c`, `%`, `"`, `n`, `p`, `0`-`9`, `o`, an arrow, `x`, `&`, `!`, `d` or `s` works the native tabs and panes, which are tmux windows and panes. Arrows, Ctrl or Alt+arrows (resize), `[`, PageUp and PageDown repeat as in tmux: after the first one, press them again without the prefix within tmux's `repeat-time` (half a second unless your tmux config sets another), or hold the key down. Press the prefix twice to send it to the program, and the prefix then `?` for the full list. It is off unless you turn it on.
+If your fingers know tmux's keys, tick Session > tmux > Use tmux keybindings for tabs and panes. In a pane of a tmux session, your tmux prefix (Ctrl+B unless your tmux config sets another; FeroSSH asks tmux) followed by `c`, `%`, `"`, `n`, `p`, `0`-`9`, `o`, an arrow, `x`, `&`, `!`, `d` or `s` works the native tabs and panes, which are tmux windows and panes. Arrows, Ctrl or Alt+arrows (resize), `[`, PageUp and PageDown repeat as in tmux: after the first one, press them again without the prefix within tmux's `repeat-time` (half a second unless your tmux config sets another), or hold the key down. Press the prefix twice to send it to the program, and the prefix then `?` for the full list. It is off unless you turn it on.
 
 ## Remote desktops
 
-Session > Open remote desktop (Ctrl+Shift+D) shows the Linux desktop (X11 or Wayland) of the host you are logged in to. The server needs an RDP server: xrdp (`sudo apt install xrdp`) or GNOME Remote Desktop. FeroSSH checks that something answers on the server's RDP port (3389, or `DesktopPort`), forwards a loopback port to it through SSH (33900 to 33999, the same for the same host each time) and opens Windows' Remote Desktop Connection there. The server's RDP port can stay closed on its firewall, and the tunnel closes with the connection.
+Session > Remote desktop > Open remote desktop (Ctrl+Shift+D) shows the Linux desktop (X11 or Wayland) of the host you are logged in to. The server needs an RDP server: xrdp (`sudo apt install xrdp`) or GNOME Remote Desktop. FeroSSH checks that something answers on the server's RDP port (3389, or `DesktopPort`), forwards a loopback port to it through SSH (33900 to 33999, the same for the same host each time) and opens Windows' Remote Desktop Connection there. The server's RDP port can stay closed on its firewall, and the tunnel closes with the connection.
 
 A saved connection of type *Remote desktop (RDP)* without *Via SSH* opens Remote Desktop Connection straight to the machine, for Windows PCs and servers. With *Via SSH* set to another saved connection, FeroSSH logs in there first and tunnels the desktop through it.
 
 Saved desktop and remote app connections (types *Remote desktop (RDP)*, *VNC desktop*, *Virtual desktop (Xvfb)* and *Remote app* with *Via SSH*) open on their own: you get only the desktop or the program's windows, no terminal tab. The SSH login to the *Via* host runs out of sight; its terminal shows in a tab only when the login needs you (a password, a new or changed host key, a failure), and closes once the desktop or program is up. The connection stays while the desktop tab, Remote Desktop Connection or the program runs, and ends with the last of them. Until then the Session manager lists the login and can show it.
 
-`ferossh-desktop.exe` adds Session > Open remote desktop in a tab (RDP) and (VNC), which show the desktop in a FeroSSH tab or split, keyboard and mouse included. For RDP the tab asks for the user name and password; for VNC the server needs a VNC server such as x11vnc, TigerVNC or wayvnc. The viewer runs in a sandbox with no network access of its own and only connects through the SSH tunnel. The built-in RDP viewer only opens desktops on the SSH server itself; a saved RDP connection to another machine behind it opens in Remote Desktop Connection, which checks that machine's certificate. When a VNC server takes a password, FeroSSH uses it even if the server would also let it in without one; a VNC server that asks for none gets a warning in the tab, and a virtual desktop's, which FeroSSH started with a password, is not opened at all, since something between may have removed the password from its offer. A saved VNC connection whose *Host* is another machine than its *Via* SSH server asks before it opens, once each time FeroSSH runs and again when its host, port or SSH server changes: SSH encrypts only the way to the SSH server, and VNC travels unencrypted from there. The desktop takes the size of its pane where the server can change it, and is scaled otherwise.
+`ferossh-desktop.exe` adds Session > Remote desktop > Open remote desktop in a tab (RDP) and (VNC), which show the desktop in a FeroSSH tab or split, keyboard and mouse included. For RDP the tab asks for the user name and password; for VNC the server needs a VNC server such as x11vnc, TigerVNC or wayvnc. The viewer runs in a sandbox with no network access of its own and only connects through the SSH tunnel. The built-in RDP viewer only opens desktops on the SSH server itself; a saved RDP connection to another machine behind it opens in Remote Desktop Connection, which checks that machine's certificate. When a VNC server takes a password, FeroSSH uses it even if the server would also let it in without one; a VNC server that asks for none gets a warning in the tab, and a virtual desktop's, which FeroSSH started with a password, is not opened at all, since something between may have removed the password from its offer. A saved VNC connection whose *Host* is another machine than its *Via* SSH server asks before it opens, once each time FeroSSH runs and again when its host, port or SSH server changes: SSH encrypts only the way to the SSH server, and VNC travels unencrypted from there. The desktop takes the size of its pane where the server can change it, and is scaled otherwise.
 
 #### Desktop clipboard
 
-Copied text can go both ways between remote desktops and Windows, text only, up to 1 MiB: what you copy on the desktop lands on the Windows clipboard, and what you copy on Windows reaches the desktop when you click or type in its tab (only the desktop you are working in sees it). It is **off until you turn it on**: copied text can carry passwords and other secrets, and a desktop can hand Windows anything, so choose *Both ways* or one way in Session > Desktop clipboard. The change applies at once to the desktops already open; a saved connection can narrow it further, never widen it, with *Desk clip* in the connection form (`DesktopClipboard`). It covers:
+Copied text can go both ways between remote desktops and Windows, text only, up to 1 MiB: what you copy on the desktop lands on the Windows clipboard, and what you copy on Windows reaches the desktop when you click or type in its tab (only the desktop you are working in sees it). It is **off until you turn it on**: copied text can carry passwords and other secrets, and a desktop can hand Windows anything, so choose *Both ways* or one way in Session > Remote desktop > Clipboard. The change applies at once to the desktops already open; a saved connection can narrow it further, never widen it, with *Desk clip* in the connection form (`DesktopClipboard`). It covers:
 
 - **Desktops in a tab** (`ferossh-desktop.exe`): RDP over the clipboard channel (plain Unicode text, no files or pictures), VNC as the protocol has it (Latin-1: other characters arrive as `?`). The sandboxed viewer reads what the server sends; the window takes text only the ways the setting allows.
 - **Virtual desktops**: the server is told too (x11vnc `-seldir`/`-nosel`, Xvnc `-AcceptCutText`/`-SendCutText`), so it holds back what should not leave it, whatever viewer you use. *Also share mouse selections from virtual desktops* in the same menu (off by default) sends text you only select there too (how xterm copies). TigerVNC's Xvnc, which a virtual desktop that follows its pane uses, shares the clipboard reliably both ways; x11vnc's own clipboard handling is less dependable.
@@ -494,7 +494,7 @@ Copied text can go both ways between remote desktops and Windows, text only, up 
 
 ### Virtual desktops (Xvfb)
 
-Session > Open virtual desktop (Xvfb) gives you a graphical desktop on a server that has no screen and no RDP server: a headless box, a VM, a build machine. Over the SSH connection FeroSSH starts Xvfb (a virtual X display that exists only in memory) and x11vnc on the server, runs a desktop session in that display, and shows it through the SSH tunnel. Nothing is installed or left behind on your PC, and no X server runs on Windows.
+Session > Remote desktop > Open virtual desktop (Xvfb) gives you a graphical desktop on a server that has no screen and no RDP server: a headless box, a VM, a build machine. Over the SSH connection FeroSSH starts Xvfb (a virtual X display that exists only in memory) and x11vnc on the server, runs a desktop session in that display, and shows it through the SSH tunnel. Nothing is installed or left behind on your PC, and no X server runs on Windows.
 
 The server needs `Xvfb`, `x11vnc` and `xauth`. If one is missing, FeroSSH says which and how to install it (Debian and Ubuntu: `sudo apt install xvfb x11vnc xauth`; Fedora: `sudo dnf install xorg-x11-server-Xvfb x11vnc xorg-x11-xauth`, with EPEL on RHEL; Arch: `sudo pacman -S xorg-server-xvfb x11vnc xorg-xauth`).
 
@@ -504,7 +504,7 @@ A virtual desktop can also be a saved connection: in the Connection manager, mak
 
 It is locked down on the server too: the display has its own random cookie, so other users there cannot draw on it or read its keys; x11vnc listens on the server's loopback only and asks for a fresh random password, which FeroSSH gives it on its standard input, so it never shows in `ps`. In `ferossh-desktop.exe` the desktop opens in a FeroSSH tab and the password is sent for you. In the standard `ferossh.exe` FeroSSH opens the VNC viewer installed on your PC (TigerVNC, TightVNC, RealVNC or UltraVNC) on the tunnel and prints the password in the terminal for you to type; without a viewer it prints the address and password.
 
-The virtual desktop stops, and Xvfb, x11vnc and everything started in the display end, when you close its tab, choose Session > Stop virtual desktop, close the connection, or end the desktop session (log out, or close the one program). Choosing Open virtual desktop again while one runs opens another viewer on the same desktop.
+The virtual desktop stops, and Xvfb, x11vnc and everything started in the display end, when you close its tab, choose Session > Remote desktop > Stop virtual desktop, close the connection, or end the desktop session (log out, or close the one program). Choosing Open virtual desktop again while one runs opens another viewer on the same desktop.
 
 ### Remote apps (native windows)
 
@@ -593,7 +593,7 @@ Patterns are regular expressions in [Rust's syntax](https://docs.rs/regex/latest
 
 ## Logs
 
-Session > Log to file writes what a tab receives to `%LOCALAPPDATA%\FeroSSH\logs`, one file per tab, optionally with a timestamp on each line, and Session > Save this pane's output to a log saves what a pane already holds. Every log is sealed with a chain file, and Session > Check a log for changes tells you whether it was changed later. Session > Record this pane keeps what a pane shows with its timing, as an asciicast `.cast` file, and Session > Play a recording plays one back in a tab, with pause, seeking and speed. [Logs](logs.md) explains all of this, including what the `.chain` files are.
+Session > Log to file writes what a tab receives to `%LOCALAPPDATA%\FeroSSH\logs`, one file per tab, optionally with a timestamp on each line, and Session > Logs and recordings > Save this pane's output to a log saves what a pane already holds. Every log is sealed with a chain file, and Session > Logs and recordings > Check a log for changes tells you whether it was changed later. Session > Logs and recordings > Record this pane keeps what a pane shows with its timing, as an asciicast `.cast` file, and Session > Logs and recordings > Play a recording plays one back in a tab, with pause, seeking and speed. [Logs](logs.md) explains all of this, including what the `.chain` files are.
 
 ## Making a key and putting it on a server
 

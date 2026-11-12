@@ -1,4 +1,4 @@
-//! Session > Run remote app: a Linux program on the host, its windows as
+//! Session > Remote apps > Run remote app: a Linux program on the host, its windows as
 //! native windows here, through FeroStream.
 //!
 //! No second login: the agent (`ferostream-agent --stdio`) runs on an
