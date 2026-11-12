@@ -457,6 +457,18 @@ pub fn path_for(dir: &Path, name: &str) -> Option<PathBuf> {
     (!part.is_empty()).then(|| dir.join(format!("{part}.{EXTENSION}")))
 }
 
+/// The file of workspace `name` as [`list`] gave it: that exact file
+/// when it is there, else the one [`path_for`] names.
+pub fn existing(dir: &Path, name: &str) -> Option<PathBuf> {
+    if !name.is_empty() && !name.contains(['/', '\\', ':']) && name != "." && name != ".." {
+        let exact = dir.join(format!("{name}.{EXTENSION}"));
+        if exact.is_file() {
+            return Some(exact);
+        }
+    }
+    path_for(dir, name)
+}
+
 /// The workspace in file `path`.
 pub fn read(path: &Path) -> Result<Workspace, String> {
     let shown = path.display();
@@ -471,15 +483,36 @@ pub fn read(path: &Path) -> Result<Workspace, String> {
     parse(&String::from_utf8_lossy(&bytes)).map_err(|e| format!("{shown}: {e}"))
 }
 
-/// Writes `ws` to `path` through a temporary file, so a crash never
-/// leaves half a file.
+/// Writes `ws` to `path` through a temporary file of its own, so a crash
+/// never leaves half a file and two windows saving at once never mix
+/// theirs. A workspace too big to read back is refused, leaving the file
+/// as it was.
 pub fn write(path: &Path, ws: &Workspace) -> io::Result<()> {
+    use std::io::Write as _;
+    use std::sync::atomic::{AtomicU32, Ordering};
+    static SAVES: AtomicU32 = AtomicU32::new(0);
+    let text = to_text(ws);
+    if text.len() as u64 > MAX_FILE_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "the workspace is too big to save: use shorter directories or fewer panes",
+        ));
+    }
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    let tmp = path.with_extension("workspace-tmp");
-    std::fs::write(&tmp, to_text(ws))?;
-    std::fs::rename(&tmp, path)
+    let n = SAVES.fetch_add(1, Ordering::Relaxed);
+    let tmp = path.with_extension(format!("workspace-{}-{n}.tmp", std::process::id()));
+    let written = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&tmp)
+        .and_then(|mut f| f.write_all(text.as_bytes()));
+    if let Err(e) = written.and_then(|()| std::fs::rename(&tmp, path)) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e);
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -623,6 +656,37 @@ mod tests {
         );
         assert_eq!(read(&path).unwrap(), sample());
         assert!(path_for(&dir, "..").is_none());
+        // A listed name opens its own file, even one path_for would change.
+        std::fs::write(dir.join(".prod.workspace"), to_text(&sample())).unwrap();
+        assert!(list(&dir).contains(&".prod".to_owned()));
+        assert_eq!(
+            existing(&dir, ".prod").unwrap().file_name().unwrap(),
+            ".prod.workspace"
+        );
+        // Too big to read back: refused, the file stays.
+        let mut big = sample();
+        let mut p = PaneSpec::new(Open::Local);
+        p.dir = Some("d".repeat(512));
+        big.tabs = (0..MAX_TABS)
+            .map(|_| TabSpec {
+                root: Layout::Split {
+                    down: false,
+                    ratio: 0.5,
+                    first: Box::new(Layout::Pane(p.clone())),
+                    second: Box::new(Layout::Split {
+                        down: true,
+                        ratio: 0.5,
+                        first: Box::new(Layout::Pane(p.clone())),
+                        second: Box::new(Layout::Pane(p.clone())),
+                    }),
+                },
+                focus: 0,
+            })
+            .collect();
+        assert!(fits(&big));
+        assert!(write(&path, &big).is_err());
+        assert_eq!(read(&path).unwrap(), sample());
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 4);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

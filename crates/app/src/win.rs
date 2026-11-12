@@ -1353,7 +1353,7 @@ fn workspace_items() -> Vec<(String, String)> {
     wsfile::list(&dir)
         .into_iter()
         .map(|name| {
-            let detail = match wsfile::path_for(&dir, &name).map(|p| wsfile::read(&p)) {
+            let detail = match wsfile::existing(&dir, &name).map(|p| wsfile::read(&p)) {
                 Some(Ok(ws)) => {
                     let (tabs, panes) = (ws.tabs.len(), ws.pane_count());
                     format!("{tabs} tab{}, {panes} pane{}", plural(tabs), plural(panes))
@@ -11067,19 +11067,38 @@ impl Window {
             }
         };
         let kind = |alias: &str| self.settings.profile(alias).map(|p| p.kind);
+        // A workspace pane still waiting for its host's login is saved as
+        // what it is about to open.
+        if let Some(mut spec) = self.workspace_waiting.pending(id) {
+            spec.name = p.name.clone();
+            return Some(spec);
+        }
         let (open, dir, host) = match &from.host {
             Host::Ask(_) => (WsOpen::Prompt, None, None),
             Host::Local { .. } => (WsOpen::Local, from.local_cwd.clone(), None),
             Host::Ssh(s) => {
                 let t = &s.target;
-                let dest = if t.sftp_only
-                    && kind(&t.alias) != Some(SessionKind::Sftp)
-                    && !t.alias.to_ascii_lowercase().starts_with("sftp://")
+                // `alias` is the host part of what was typed: a user or
+                // port typed with it is added back when the name alone
+                // would resolve to another.
+                let plain = Target::resolve(&t.alias, &ssh_env());
+                let mut dest = if plain
+                    .as_ref()
+                    .is_some_and(|b| b.user == t.user && b.port == t.port)
                 {
-                    format!("sftp://{}", t.alias)
-                } else {
                     t.alias.clone()
+                } else {
+                    format!("{}@{}:{}", t.user, bracket(&t.alias), t.port)
                 };
+                if t.sftp_only && kind(&t.alias) != Some(SessionKind::Sftp) {
+                    let folder = t
+                        .sftp_folder
+                        .as_deref()
+                        .filter(|f| !f.is_empty())
+                        .map(|f| format!("/{}", f.trim_start_matches('/')))
+                        .unwrap_or_default();
+                    dest = format!("sftp://{dest}{folder}");
+                }
                 let dir = (!in_tmux)
                     .then(|| {
                         from.cwd
@@ -11237,7 +11256,7 @@ impl Window {
         {
             PathBuf::from(name)
         } else {
-            match wsfile::path_for(&workspaces_dir(), name) {
+            match wsfile::existing(&workspaces_dir(), name) {
                 Some(p) => p,
                 None => return Some(Command::Notice(format!("There is no workspace {name}."))),
             }
@@ -16300,7 +16319,7 @@ fn run_command(hwnd: HWND, command: Command) {
                  This cannot be undone."
             );
             if dialog(hwnd, &text, MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2) == Some(IDYES)
-                && let Some(path) = wsfile::path_for(&workspaces_dir(), &name)
+                && let Some(path) = wsfile::existing(&workspaces_dir(), &name)
             {
                 if let Err(e) = std::fs::remove_file(&path) {
                     dialog(

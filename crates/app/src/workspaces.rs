@@ -131,6 +131,15 @@ impl Waiting {
         self.by_pane.is_empty()
     }
 
+    /// What pane `pane` waits to open, if it waits.
+    pub fn pending(&self, pane: PaneId) -> Option<PaneSpec> {
+        self.by_pane.get(&pane).map(|(_, dest, spec)| {
+            let mut spec = spec.clone();
+            spec.open = ferossh_config::workspace::Open::Connection(dest.clone());
+            spec
+        })
+    }
+
     /// Forgets a pane that closed, as a waiting pane.
     pub fn forget(&mut self, pane: PaneId) {
         self.by_pane.remove(&pane);
@@ -261,6 +270,8 @@ mod tests {
         w.add(6, 2, "db1".into(), web());
         w.add(7, 2, "db1".into(), web());
         w.forget(6);
+        assert_eq!(w.pending(5).unwrap().dir.as_deref(), Some("/tmp"));
+        assert!(w.pending(6).is_none());
         assert_eq!(
             w.take(1),
             vec![(4, "web1".into(), web()), (5, "web1".into(), tmp)]

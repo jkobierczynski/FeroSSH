@@ -643,7 +643,10 @@ fn command(h: Handles, id: usize, code: u32) {
                 }
             }
         }
-        (ID_CONNECT, BN_CLICKED) => open_selected(h, selected_host().is_none()),
+        (ID_CONNECT, BN_CLICKED) => open_selected(
+            h,
+            selected_host().is_none() && selected_workspace().is_none(),
+        ),
         (ID_NEW, BN_CLICKED) => emit(Event::Action(SideAction::New)),
         // A workspace is edited by saving the layout again.
         (ID_EDIT, BN_CLICKED) if selected_workspace().is_some() => {}
@@ -747,7 +750,7 @@ fn notify(h: Handles, lparam: LPARAM) -> LRESULT {
                 };
             }
             NM_DBLCLK => {
-                if selected_host().is_some() {
+                if selected_host().is_some() || selected_workspace().is_some() {
                     open_selected(h, false);
                     return LRESULT(1);
                 }
