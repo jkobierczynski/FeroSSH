@@ -23,13 +23,13 @@ use windows::Win32::Graphics::Gdi::{
     SetBkMode, SetTextColor, TRANSPARENT,
 };
 use windows::Win32::UI::Controls::{
-    EM_SETCUEBANNER, EM_SETSEL, LIST_VIEW_ITEM_STATE_FLAGS, LVCF_TEXT, LVCF_WIDTH, LVCOLUMNW,
-    LVIF_PARAM, LVIF_TEXT, LVIS_FOCUSED, LVIS_SELECTED, LVITEMW, LVM_DELETEALLITEMS,
+    EM_LIMITTEXT, EM_SETCUEBANNER, EM_SETSEL, LIST_VIEW_ITEM_STATE_FLAGS, LVCF_TEXT, LVCF_WIDTH,
+    LVCOLUMNW, LVIF_PARAM, LVIF_TEXT, LVIS_FOCUSED, LVIS_SELECTED, LVITEMW, LVM_DELETEALLITEMS,
     LVM_ENSUREVISIBLE, LVM_GETCOUNTPERPAGE, LVM_GETITEMCOUNT, LVM_GETNEXTITEM, LVM_INSERTCOLUMNW,
     LVM_INSERTITEMW, LVM_SETCOLUMNWIDTH, LVM_SETEXTENDEDLISTVIEWSTYLE, LVM_SETITEMSTATE,
     LVM_SETITEMTEXTW, LVNI_SELECTED, LVS_EX_DOUBLEBUFFER, LVS_EX_FULLROWSELECT, LVS_EX_LABELTIP,
     LVS_NOSORTHEADER, LVS_REPORT, LVS_SHOWSELALWAYS, LVS_SINGLESEL, NM_DBLCLK, NM_SETFOCUS, NMHDR,
-    SetWindowTheme, WC_BUTTONW, WC_EDITW, WC_LISTVIEWW,
+    NMITEMACTIVATE, SetWindowTheme, WC_BUTTONW, WC_EDITW, WC_LISTVIEWW,
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     EnableWindow, GetFocus, SetFocus, VK_CONTROL, VK_DOWN, VK_NEXT, VK_PRIOR, VK_SHIFT, VK_UP,
@@ -171,6 +171,14 @@ pub fn create(main: HWND, handler: Handler, dpi: u32) -> windows::core::Result<(
             WS_BORDER.0 | ES_AUTOHSCROLL as u32,
             ID_SEARCH,
         )?;
+        // No longer than the palette keeps, so what shows is what runs (a
+        // remote app's command line).
+        SendMessageW(
+            search,
+            EM_LIMITTEXT,
+            Some(WPARAM(crate::palette::MAX_FILTER)),
+            None,
+        );
         let list = child(
             WC_LISTVIEWW,
             w!(""),
@@ -317,11 +325,32 @@ pub fn place(at: Option<Rect>, width: i32, dpi: u32) {
         let _ = MoveWindow(h.panel, at.x, at.y, at.w, at.h, true);
         let _ = MoveWindow(h.search, pad, title, inner, field, true);
         let _ = MoveWindow(h.list, pad, list_y, inner, list_h, true);
+        fit_columns(h.list, inner, dpi);
         let w = scale(72, dpi);
         let _ = MoveWindow(h.run, pad, buttons_y, w, button, true);
         let _ = MoveWindow(h.close, pad + w + gap, buttons_y, w, button, true);
         let _ = ShowWindow(h.panel, SW_SHOWNA);
         let _ = InvalidateRect(Some(h.panel), None, false);
+    }
+}
+
+/// The columns over the list's `width`: From and the shortcut keep a
+/// readable width while there is room, and Name takes the rest.
+fn fit_columns(list: HWND, width: i32, dpi: u32) {
+    let room = (width - scale(24, dpi)).max(0);
+    let from = scale(COLUMNS[2].1, dpi).min(room / 5);
+    let hint = scale(COLUMNS[1].1, dpi).min(room * 3 / 10);
+    let name = (room - from - hint).max(scale(60, dpi));
+    for (i, w) in [name, hint, from].into_iter().enumerate() {
+        // SAFETY: our own control.
+        unsafe {
+            SendMessageW(
+                list,
+                LVM_SETCOLUMNWIDTH,
+                Some(WPARAM(i)),
+                Some(LPARAM(w as isize)),
+            );
+        }
     }
 }
 
@@ -387,7 +416,11 @@ pub fn set_view(view: NativePalette) {
             );
         }
     }
-    let same_rows = before.as_ref().is_some_and(|b| b.rows == view.rows) && !fresh;
+    // A new search starts on its first row, even with the same rows.
+    let same_rows = before
+        .as_ref()
+        .is_some_and(|b| b.rows == view.rows && b.filter == view.filter)
+        && !fresh;
     if !same_rows {
         fill(&h, &view.rows);
     }
@@ -556,14 +589,10 @@ pub fn pre_translate(msg: &MSG) -> bool {
         }
         match msg.message {
             WM_KEYDOWN => {
+                // The window's own shortcuts were sent to it by the
+                // message loop already; other Ctrl+Shift keys (selecting
+                // words in the search box) stay here.
                 let vk = msg.wParam.0 as u16;
-                if key_down(VK_CONTROL.0) && key_down(VK_SHIFT.0) {
-                    let mut m = *msg;
-                    m.hwnd = h.main;
-                    let _ = windows::Win32::UI::WindowsAndMessaging::TranslateMessage(&m);
-                    windows::Win32::UI::WindowsAndMessaging::DispatchMessageW(&m);
-                    return true;
-                }
                 if msg.hwnd == h.search && [VK_UP.0, VK_DOWN.0, VK_PRIOR.0, VK_NEXT.0].contains(&vk)
                 {
                     move_selection(&h, vk);
@@ -618,7 +647,13 @@ fn notify(h: Handles, lparam: LPARAM) -> LRESULT {
         }
         match hdr.code {
             NM_SETFOCUS => emit(Event::Focused),
-            NM_DBLCLK => run(&h),
+            NM_DBLCLK => {
+                // Only on a row: blank space under the rows runs nothing.
+                let item = &*(lparam.0 as *const NMITEMACTIVATE);
+                if item.iItem >= 0 {
+                    run(&h);
+                }
+            }
             _ => {}
         }
     }

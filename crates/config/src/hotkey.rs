@@ -227,6 +227,16 @@ impl Hotkey {
         types_text(self.vk)
     }
 
+    /// Whether, as a key binding, this would stop typing: no Ctrl or Alt
+    /// (and no Win) on a key that types a character (the number pad's
+    /// digits and operators too) or edits a line (Enter, Tab, Backspace,
+    /// Esc). Such a key is never bound, whatever a settings file says.
+    pub fn types_alone(&self) -> bool {
+        let pad = matches!(self.vk, 0x60..=0x6F);
+        let editing = matches!(self.vk, 0x08 | 0x09 | 0x0D | 0x1B);
+        !self.ctrl && !self.alt && !self.win && (types_text(self.vk) || pad || editing)
+    }
+
     /// Whether this works as a hotkey that does not get in the way of
     /// typing: it needs Ctrl, Alt or Win, except on keys nothing else
     /// uses (F13 to F24, Pause, Scroll Lock). Ctrl+Alt with a character

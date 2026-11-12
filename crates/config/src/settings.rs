@@ -1077,15 +1077,21 @@ impl Settings {
                 "keybinding" => {
                     block = Block::Top;
                     // `KeyBinding <id> [key...]`; a key FeroSSH does not
-                    // know is left out, the others kept.
+                    // know, or one that would stop typing (Win too), is
+                    // left out and the others kept. A line whose keys are
+                    // all left out keeps the default; one with no keys
+                    // takes the action's keys away.
                     if let Some(id) = first.and_then(|a| a.parse::<u32>().ok()) {
-                        let keys = args
+                        let named = args.len() > 1;
+                        let keys: Vec<Hotkey> = args
                             .iter()
                             .skip(1)
                             .filter_map(|k| Hotkey::parse_key(k).ok())
-                            .filter(|k| !k.win)
+                            .filter(|k| !k.win && !k.types_alone())
                             .collect();
-                        s.key_bindings.insert(id, keys);
+                        if !named || !keys.is_empty() {
+                            s.key_bindings.insert(id, keys);
+                        }
                     }
                 }
                 "standbywindow" => {
@@ -2226,7 +2232,8 @@ DesktopShareSelection yes
         assert!(Settings::default().key_bindings.is_empty());
         let s = Settings::parse(
             "KeyBinding 213 Ctrl+K Ctrl+Shift+A\nKeyBinding 500\nKeyBinding 501 Bogus+Q F5\n\
-             KeyBinding x Ctrl+A\n",
+             KeyBinding x Ctrl+A\nKeyBinding 502 Bogus+Q\nKeyBinding 503 A Num1 Enter\n\
+             KeyBinding 504 Shift+PageUp F11 Shift+A\n",
         );
         let key = |t| Hotkey::parse_key(t).unwrap();
         assert_eq!(
@@ -2237,7 +2244,14 @@ DesktopShareSelection yes
         assert_eq!(s.key_bindings.get(&500), Some(&vec![]));
         // An unknown key is left out, the others kept.
         assert_eq!(s.key_bindings.get(&501), Some(&vec![key("F5")]));
-        assert_eq!(s.key_bindings.len(), 3);
+        // Keys all unknown or typing keys: the default stays.
+        assert!(!s.key_bindings.contains_key(&502));
+        assert!(!s.key_bindings.contains_key(&503));
+        assert_eq!(
+            s.key_bindings.get(&504),
+            Some(&vec![key("Shift+PageUp"), key("F11")])
+        );
+        assert_eq!(s.key_bindings.len(), 4);
         assert_eq!(Settings::parse(&s.to_text()).key_bindings, s.key_bindings);
     }
 

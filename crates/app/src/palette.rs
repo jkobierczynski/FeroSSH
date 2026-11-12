@@ -24,7 +24,7 @@ const HEADER: usize = 2;
 /// Lines under the list: the key help.
 const FOOTER: usize = 1;
 /// Longest search one can type.
-const MAX_FILTER: usize = 60;
+pub const MAX_FILTER: usize = 60;
 /// Recently run entries kept at the top of the unfiltered list.
 const RECENT: usize = 5;
 

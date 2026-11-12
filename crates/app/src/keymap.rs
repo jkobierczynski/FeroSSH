@@ -235,13 +235,12 @@ pub enum Check {
 /// the key as people read it; `tmux_prefix` the prefix of the tmux
 /// sessions open now, if FeroSSH knows one (Ctrl+B otherwise).
 pub fn check(k: Hotkey, label: &str, tmux_prefix: Option<Hotkey>) -> Check {
-    let editing = matches!(k.vk, 0x08 | 0x09 | 0x0D | 0x1B);
     if k.win {
         return Check::Refuse(format!(
             "{label} goes to Windows, not to FeroSSH. Pick a key without Win."
         ));
     }
-    if !k.ctrl && !k.alt && (k.types_text() || editing) {
+    if k.types_alone() {
         return Check::Refuse(format!(
             "{label} types in the terminal and in every box. Add Ctrl or Alt."
         ));
@@ -254,6 +253,11 @@ pub fn check(k: Hotkey, label: &str, tmux_prefix: Option<Hotkey>) -> Check {
     }
     if k.vk == 0x1B {
         return Check::Refuse(format!("{label} closes boxes and menus. Pick another key."));
+    }
+    if k.alt && !k.ctrl && !k.shift && k.vk == 0x73 {
+        return Check::Refuse(format!(
+            "{label} always closes the window. Pick another key."
+        ));
     }
     let prefix = tmux_prefix.unwrap_or(chord(u16::from(b'B'), true, false, false));
     if k == prefix {
@@ -406,6 +410,10 @@ mod tests {
         assert!(matches!(c("Enter"), Check::Refuse(_)));
         assert!(matches!(c("Ctrl+Alt+Q"), Check::Refuse(_)));
         assert!(matches!(c("Win+A"), Check::Refuse(_)));
+        assert!(matches!(c("Num1"), Check::Refuse(_)));
+        assert!(matches!(c("NumPlus"), Check::Refuse(_)));
+        assert!(matches!(c("Alt+F4"), Check::Refuse(_)));
+        assert!(matches!(c("Ctrl+Num1"), Check::Warn(_)));
         assert_eq!(c("Ctrl+Shift+K"), Check::Fine);
         let warn = |c: Check| match c {
             Check::Warn(why) => why,

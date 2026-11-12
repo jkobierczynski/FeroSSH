@@ -390,18 +390,25 @@ fn plan(incoming: &Bundle, current: &Settings) -> Plan {
 
 /// Takes in the key bindings `incoming` changed: an action it gives
 /// other keys than ours gets its keys (taken from any action of ours
-/// that has them). How many actions changed.
+/// that has them). How many actions' keys changed, those that lost a
+/// key to another action included.
 fn merge_keys(local: &mut Settings, incoming: &Settings) -> usize {
-    let mut map = Keymap::new(KEY_DEFAULTS, &local.key_bindings);
-    let mut changed = 0;
+    let before = Keymap::new(KEY_DEFAULTS, &local.key_bindings);
+    let mut map = before.clone();
     for (id, keys) in &incoming.key_bindings {
         if map.keys(*id) != keys.as_slice() {
             map.set(*id, keys.clone());
-            changed += 1;
         }
     }
     local.key_bindings = map.changed();
-    changed
+    let mut ids: Vec<u32> = before.changed().into_keys().collect();
+    ids.extend(map.changed().into_keys());
+    ids.extend(incoming.key_bindings.keys());
+    ids.sort_unstable();
+    ids.dedup();
+    ids.iter()
+        .filter(|id| before.keys(**id) != map.keys(**id))
+        .count()
 }
 
 /// File > Import encrypted connections: the file, its passphrase, what
