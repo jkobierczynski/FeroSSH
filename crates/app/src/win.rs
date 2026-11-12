@@ -45,6 +45,7 @@ use ferossh_render::{
     ThemeGroup,
 };
 use ferossh_sftp::{Remote, names};
+use ferossh_term::cast::{Cast, CastHeader, CastWriter, Play, Player, clock_text};
 use ferossh_term::{
     Action, Clock, Key, LogWriter, Mods, MouseButton, MouseEvent, SelectionKind,
     Settings as TermSettings, Terminal, WorkingDir, chain, check_link, clipboard_preview,
@@ -244,6 +245,10 @@ const TIMER_EDIT: usize = 9;
 const TIMER_AGENT_ASK: usize = 10;
 /// Looks again for the new key once another dialog has closed.
 const TIMER_KEYGEN: usize = 11;
+/// Plays the next part of the recordings that play in replay tabs.
+const TIMER_REPLAY: usize = 12;
+/// How often a playing replay's tab updates its clock, at most.
+const REPLAY_TICK_MS: u64 = 250;
 const LAUNCH_TICK_MS: u32 = 1000;
 /// How long a launch's login session may stay hidden with nothing
 /// holding its connection before it is shown.
@@ -455,6 +460,9 @@ mod cmd {
     pub const NEW_KEY: u32 = 639;
     /// Session > Copy public key to this server.
     pub const COPY_ID: u32 = 640;
+    /// Session > Record this pane (asciicast), and Play a recording.
+    pub const RECORD_CAST: u32 = 641;
+    pub const PLAY_CAST: u32 = 642;
     pub const TMUX_ATTACH: u32 = 610;
     pub const TMUX_DETACH: u32 = 611;
     pub const TMUX_PICK: u32 = 612;
@@ -573,6 +581,43 @@ enum Host {
     /// A WinRM shell (PowerShell or cmd on Windows), run by a worker of
     /// its own.
     Winrm(Box<WinrmSession>),
+    /// A session recording playing back (Session > Play a recording):
+    /// nothing goes to a host, and keys control the playing.
+    Replay(Box<Replay>),
+}
+
+/// A recording playing in a replay tab.
+struct Replay {
+    player: Player,
+    /// The file's name, for the tab.
+    name: String,
+    /// The second of the recording the tab's clock last showed.
+    shown: Option<u64>,
+}
+
+impl Replay {
+    /// What the tab says: the file, playing or paused, where it stands and
+    /// the speed.
+    fn label(&self, now: Instant) -> String {
+        let p = &self.player;
+        let state = if !p.paused() {
+            "\u{25b6}"
+        } else if p.ended() {
+            "\u{25a0}"
+        } else {
+            "\u{2016}"
+        };
+        let speed = match p.speed() {
+            s if (s - 1.0).abs() < f64::EPSILON => String::new(),
+            s => format!(" {s}\u{d7}"),
+        };
+        format!(
+            "{} {state} {} / {}{speed}",
+            self.name,
+            clock_text(p.position(now)),
+            clock_text(p.cast().duration())
+        )
+    }
 }
 
 /// A worker process, the pipes to it, and the forwarding engine that
@@ -606,6 +651,36 @@ struct Logging {
     path: Option<PathBuf>,
 }
 
+/// Session > Record this pane: the pane's output with its timing, as an
+/// asciicast file in the log folder, sealed like a log. Only what the
+/// host sent goes in, never what was typed, so a password typed at a
+/// prompt (which the host does not echo) is not in it either. Dropping it
+/// (the pane closed, FeroSSH ended) ends and seals the file.
+struct Recording {
+    writer: Option<CastWriter<File>>,
+    path: PathBuf,
+}
+
+impl Recording {
+    /// Ends the file, seals it and adds it to the log index.
+    fn finish(&mut self) -> std::io::Result<()> {
+        let Some(writer) = self.writer.take() else {
+            return Ok(());
+        };
+        let sealed = writer.finish_sealed()?;
+        if let (Some(sealed), Some(name)) = (sealed, self.path.file_name()) {
+            add_to_log_index(&name.to_string_lossy(), &sealed)?;
+        }
+        Ok(())
+    }
+}
+
+impl std::ops::Drop for Recording {
+    fn drop(&mut self) {
+        let _ = self.finish();
+    }
+}
+
 /// One terminal pane with its own font and colour theme.
 struct Pane {
     id: PaneId,
@@ -615,6 +690,8 @@ struct Pane {
     cursor: Option<Cursor>,
     host: Host,
     log: Logging,
+    /// Session > Record this pane, while it records.
+    cast: Option<Recording>,
     font: FontSpec,
     theme: Theme,
     metrics: CellMetrics,
@@ -705,6 +782,9 @@ impl Pane {
     /// What the tab strip and window title call this pane: the name the
     /// user gave it, else the title the host set, else the host.
     fn label(&self) -> String {
+        if let Host::Replay(r) = &self.host {
+            return r.label(Instant::now());
+        }
         if let Some(n) = &self.name {
             return n.clone();
         }
@@ -724,6 +804,16 @@ impl Pane {
             Host::Serial { target, .. } => target.label(),
             Host::Telnet(s) => s.target.label(),
             Host::Winrm(s) => s.target.label(),
+            Host::Replay(r) => r.name.clone(),
+        }
+    }
+
+    /// Notes the terminal's new size in the pane's recording.
+    fn record_resize(&mut self) {
+        let (cols, rows) = (clamp16(self.term.cols()), clamp16(self.term.rows()));
+        if let Some(w) = self.cast.as_mut().and_then(|r| r.writer.as_mut()) {
+            // A failed write shows with the next output.
+            let _ = w.resize(cols, rows);
         }
     }
 
@@ -1637,6 +1727,16 @@ fn new_log_file(
     id: PaneId,
     suffix: &str,
 ) -> std::io::Result<(File, File, PathBuf, String)> {
+    new_log_file_ext(label, id, suffix, "log")
+}
+
+/// Like [`new_log_file`], with the ending `ext` (`cast` for recordings).
+fn new_log_file_ext(
+    label: &str,
+    id: PaneId,
+    suffix: &str,
+    ext: &str,
+) -> std::io::Result<(File, File, PathBuf, String)> {
     let host = label.rsplit('@').next().unwrap_or(label);
     let dir = log_dir();
     let name = log_file_name(host, id as usize, local_time());
@@ -1646,9 +1746,9 @@ fn new_log_file(
     let mut n = 1;
     loop {
         let name = if n == 1 {
-            format!("{stem}{suffix}.log")
+            format!("{stem}{suffix}.{ext}")
         } else {
-            format!("{stem}{suffix}-{n}.log")
+            format!("{stem}{suffix}-{n}.{ext}")
         };
         let path = dir.join(&name);
         let new = |path: &Path| {
@@ -1762,6 +1862,24 @@ fn log_line_time() -> String {
         "{:04}-{:02}-{:02} {:02}:{:02}:{:02}.{:03}",
         t.wYear, t.wMonth, t.wDay, t.wHour, t.wMinute, t.wSecond, t.wMilliseconds
     )
+}
+
+/// An empty terminal of a recording's size, in a replay pane's look.
+fn replay_terminal(
+    cols: u16,
+    rows: u16,
+    scrollback: Option<usize>,
+    theme: &Theme,
+    metrics: CellMetrics,
+) -> Terminal {
+    let mut t = Terminal::new(
+        usize::from(cols),
+        usize::from(rows),
+        &term_settings(scrollback),
+    );
+    t.set_theme(theme);
+    t.set_cell_size(metrics.width, metrics.height);
+    t
 }
 
 fn term_settings(lines: Option<usize>) -> TermSettings {
@@ -2108,6 +2226,7 @@ fn new_pane(
         cursor: None,
         host: Host::Ask(String::new()),
         log: Logging::default(),
+        cast: None,
         font,
         theme,
         metrics,
@@ -2174,6 +2293,8 @@ fn build_menu() -> Result<HMENU> {
         item(session, cmd::SAVE_ALL, "Save output of all pa&nes to logs")?;
         item(session, cmd::LOG_FOLDER, "Open log &folder")?;
         item(session, cmd::LOG_VERIFY, "C&heck a log for changes...")?;
+        item(session, cmd::RECORD_CAST, "Re&cord this pane (asciicast)")?;
+        item(session, cmd::PLAY_CAST, "&Play a recording...")?;
         separator(session)?;
         item(
             session,
@@ -3016,6 +3137,7 @@ impl Window {
                     if let Some(p) = self.panes.get_mut(&native) {
                         p.term.resize(usize::from(cols), usize::from(rows));
                         p.grid.mark_all_dirty();
+                        p.record_resize();
                     }
                 }
                 tmux::Action::Remove { native } => {
@@ -3438,7 +3560,7 @@ impl Window {
             };
             let mut notes = Vec::new();
             let (kind, target, mut st) = match &p.host {
-                Host::Ask(_) => continue,
+                Host::Ask(_) | Host::Replay(_) => continue,
                 Host::Ssh(s) => {
                     if self.via.get(&s.connection).is_some_and(|v| !v.is_empty())
                         || self.proxies.contains_key(&s.connection)
@@ -7062,7 +7184,233 @@ impl Window {
         }
     }
 
+    /// Writes host output to the pane's recording, if it records.
+    fn record(&mut self, id: PaneId, bytes: &[u8]) {
+        let Some(p) = self.panes.get_mut(&id) else {
+            return;
+        };
+        let Some(writer) = p.cast.as_mut().and_then(|r| r.writer.as_mut()) else {
+            return;
+        };
+        if let Err(e) = writer.output(bytes) {
+            // Dropping it seals what was written.
+            p.cast = None;
+            self.show(
+                id,
+                &format!("\r\n\x1b[0;31mRecording stopped: {e}\x1b[0m\r\n"),
+            );
+            self.update_menu_checks();
+        }
+    }
+
+    /// Session > Record this pane: starts recording the pane's output with
+    /// its timing, or ends the recording and says where it is.
+    fn toggle_record(&mut self, id: PaneId) {
+        let Some(p) = self.panes.get_mut(&id) else {
+            return;
+        };
+        if let Some(mut rec) = p.cast.take() {
+            let text = match rec.finish() {
+                Ok(()) => format!(
+                    "\x1b[0;90mRecording saved to {}\x1b[0m\r\n",
+                    rec.path.display()
+                ),
+                Err(e) => format!(
+                    "\x1b[0;31mCould not finish the recording {}: {e}\x1b[0m\r\n",
+                    rec.path.display()
+                ),
+            };
+            self.show(id, &text);
+        } else if matches!(p.host, Host::Replay(_) | Host::Desktop { .. }) {
+            return;
+        } else {
+            let label = p.host_label();
+            let header = CastHeader {
+                cols: clamp16(p.term.cols()),
+                rows: clamp16(p.term.rows()),
+                timestamp: SystemTime::now()
+                    .duration_since(SystemTime::UNIX_EPOCH)
+                    .map_or(0, |d| d.as_secs()),
+                title: format!("FeroSSH recording of {label}"),
+            };
+            let opened =
+                new_log_file_ext(&label, id, "", "cast").and_then(|(f, chain, path, name)| {
+                    Ok((CastWriter::sealed(f, chain, &name, &header)?, path))
+                });
+            let text = match opened {
+                Ok((writer, path)) => {
+                    let text = format!(
+                        "\x1b[0;90mRecording this pane to {} (what the host shows, not what you type)\x1b[0m\r\n",
+                        path.display()
+                    );
+                    p.cast = Some(Recording {
+                        writer: Some(writer),
+                        path,
+                    });
+                    text
+                }
+                Err(e) => format!(
+                    "\x1b[0;31mCould not start a recording in {}: {e}\x1b[0m\r\n",
+                    log_dir().display()
+                ),
+            };
+            self.show(id, &text);
+        }
+        self.update_menu_checks();
+        self.refresh(id);
+    }
+
+    /// Session > Play a recording: opens `path` in a new replay tab, or
+    /// says why it cannot.
+    fn open_replay(&mut self, path: &Path) -> std::result::Result<(), String> {
+        let shown = path.display();
+        let too_big = std::fs::metadata(path)
+            .map_err(|e| format!("Could not read {shown}: {e}"))?
+            .len()
+            > ferossh_term::cast::MAX_FILE as u64;
+        let cast = if too_big {
+            Err(ferossh_term::cast::CastError::TooBig)
+        } else {
+            let bytes = std::fs::read(path).map_err(|e| format!("Could not read {shown}: {e}"))?;
+            Cast::parse(&bytes)
+        }
+        .map_err(|e| format!("Could not play {shown}: {e}."))?;
+        // Without `.cast`: the tab has little room.
+        let name = path.file_stem().map_or_else(
+            || "recording".to_owned(),
+            |n| n.to_string_lossy().into_owned(),
+        );
+        let (cols, rows) = (cast.cols, cast.rows);
+        let id = self.new_tab_pane();
+        let scrollback = self.settings.scrollback;
+        let Some(p) = self.panes.get_mut(&id) else {
+            return Ok(());
+        };
+        p.term = replay_terminal(cols, rows, scrollback, &p.theme, p.metrics);
+        p.grid.mark_all_dirty();
+        p.host = Host::Replay(Box::new(Replay {
+            player: Player::new(cast, Instant::now()),
+            name,
+            shown: None,
+        }));
+        self.focus_terminal();
+        self.replay_tick();
+        self.refresh_chrome();
+        self.request_full_redraw();
+        Ok(())
+    }
+
+    /// Plays what is due in every replay tab, and sets the timer for what
+    /// comes next.
+    fn replay_tick(&mut self) {
+        let now = Instant::now();
+        let scrollback = self.settings.scrollback;
+        let mut next: Option<Duration> = None;
+        let mut chrome = false;
+        let mut fed_panes = Vec::new();
+        for (id, p) in &mut self.panes {
+            let Pane {
+                host: Host::Replay(r),
+                term,
+                grid,
+                theme,
+                metrics,
+                ..
+            } = p
+            else {
+                continue;
+            };
+            let mut fed = false;
+            for play in r.player.due(now) {
+                fed = true;
+                match play {
+                    // Going back: from an empty terminal again.
+                    Play::Reset(cols, rows) => {
+                        *term = replay_terminal(cols, rows, scrollback, theme, *metrics);
+                    }
+                    Play::Output(text) => term.feed(text.as_bytes()),
+                    Play::Resize(cols, rows) => term.resize(usize::from(cols), usize::from(rows)),
+                }
+            }
+            if fed {
+                grid.mark_all_dirty();
+                fed_panes.push(*id);
+            }
+            let second = r.player.position(now) as u64;
+            if r.shown != Some(second) {
+                r.shown = Some(second);
+                chrome = true;
+            }
+            if let Some(wait) = r.player.wait(now) {
+                let wait = wait.min(Duration::from_millis(REPLAY_TICK_MS));
+                next = Some(next.map_or(wait, |n| n.min(wait)));
+            }
+        }
+        for id in fed_panes {
+            self.refresh(id);
+        }
+        match next {
+            Some(wait) => {
+                let ms = u32::try_from(wait.as_millis()).unwrap_or(u32::MAX).max(1);
+                // SAFETY: our window; replaces any earlier timer with this id.
+                unsafe { SetTimer(Some(self.hwnd), TIMER_REPLAY, ms, None) };
+            }
+            None => {
+                // SAFETY: our window and timer.
+                unsafe {
+                    let _ = KillTimer(Some(self.hwnd), TIMER_REPLAY);
+                }
+            }
+        }
+        if chrome {
+            self.refresh_chrome();
+        }
+    }
+
+    fn on_replay_timer(&mut self) -> Vec<Command> {
+        self.replay_tick();
+        self.after_feed()
+    }
+
+    /// A key in replay pane `id`: Space pauses and plays, Left and Right go
+    /// 5 seconds back and on, Up and Down change the speed, Home starts
+    /// again and End goes to the end. Other keys do nothing (there is no
+    /// host to send them to). `true` when the pane is a replay pane.
+    fn replay_key(&mut self, id: PaneId, vk: VIRTUAL_KEY, mods: Mods) -> bool {
+        let now = Instant::now();
+        let Some(p) = self.panes.get_mut(&id) else {
+            return false;
+        };
+        let Host::Replay(r) = &mut p.host else {
+            return false;
+        };
+        if mods.ctrl || mods.alt {
+            // Shortcuts not taken before this (copy, scrolling) carry on.
+            return false;
+        }
+        let player = &mut r.player;
+        let step = if mods.shift { 30.0 } else { 5.0 };
+        match vk {
+            VK_SPACE => player.toggle_pause(now),
+            VK_LEFT => player.seek(player.position(now) - step, now),
+            VK_RIGHT => player.seek(player.position(now) + step, now),
+            VK_UP => player.change_speed(true, now),
+            VK_DOWN => player.change_speed(false, now),
+            VK_HOME => player.seek(0.0, now),
+            VK_END => player.seek(f64::MAX, now),
+            // Page Up and Down scroll back through the recording's output.
+            VK_PRIOR => p.term.scroll_pages(1),
+            VK_NEXT => p.term.scroll_pages(-1),
+            _ => {}
+        }
+        r.shown = None;
+        self.replay_tick();
+        self.refresh_chrome();
+        true
+    }
+
     fn log(&mut self, id: PaneId, bytes: &[u8]) {
+        self.record(id, bytes);
         let Some(p) = self.panes.get_mut(&id) else {
             return;
         };
@@ -7163,8 +7511,8 @@ impl Window {
                 self.send(id, bytes);
             }
             // Typing reaches the desktop before this; the pane only shows
-            // messages once it ended.
-            Host::Desktop { .. } => {}
+            // messages once it ended. A recording has no host.
+            Host::Desktop { .. } | Host::Replay(_) => {}
             Host::Ask(text) => {
                 if enter {
                     let destination = std::mem::take(text);
@@ -7268,7 +7616,7 @@ impl Window {
                 s.target.hostname.to_ascii_lowercase(),
                 s.target.port
             ),
-            Host::Ask(_) | Host::Desktop { .. } => return None,
+            Host::Ask(_) | Host::Desktop { .. } | Host::Replay(_) => return None,
         })
     }
 
@@ -7972,7 +8320,13 @@ impl Window {
             let Some(p) = self.panes.get_mut(&id) else {
                 continue;
             };
-            let actions = p.term.take_actions();
+            let mut actions = p.term.take_actions();
+            let replay = matches!(p.host, Host::Replay(_));
+            if replay {
+                // A recording plays to the screen only: it cannot write
+                // the clipboard or move the file view, and nothing answers.
+                actions.retain(|a| matches!(a, Action::Title(_) | Action::Bell));
+            }
             if let Some(d) = p.term.sync_deadline() {
                 deadline = Some(deadline.map_or(d, |old| old.min(d)));
             }
@@ -8007,6 +8361,9 @@ impl Window {
                         }
                     }
                 }
+            }
+            if replay {
+                continue;
             }
             if self.read_prompt(id) {
                 chrome = true;
@@ -8690,12 +9047,22 @@ impl Window {
                 p.term.set_cell_size(m.width, m.height);
                 continue;
             }
+            if matches!(p.host, Host::Replay(_)) {
+                // A recording keeps the size it was made at.
+                let m = p.metrics;
+                p.term.set_cell_size(m.width, m.height);
+                continue;
+            }
             let m = p.metrics;
             let cols = ((rect.w - 2 * pad).max(0) / m.width.max(1) as i32).max(1) as usize;
             let rows = ((rect.h - 2 * pad).max(0) / m.height.max(1) as i32).max(1) as usize;
+            let before = (p.term.cols(), p.term.rows());
             p.term.resize(cols, rows);
             p.term.set_cell_size(m.width, m.height);
             let (cols, rows) = (p.term.cols(), p.term.rows());
+            if before != (cols, rows) {
+                p.record_resize();
+            }
             let effect = match &p.host {
                 Host::Local {
                     shell: Some(shell), ..
@@ -9317,6 +9684,10 @@ impl Window {
         };
         if p.term.search_active() {
             return self.search_key(id, vk, mods);
+        }
+        if self.replay_key(id, vk, mods) {
+            drop_pending_char(self.hwnd);
+            return KeyOutcome::Handled;
         }
         if let Some(key) = terminal_key(vk) {
             drop_pending_char(self.hwnd);
@@ -11348,7 +11719,7 @@ impl Window {
                     Some((alias, target.port.clone(), None)),
                 )
             }
-            Host::Tmux { .. } | Host::Desktop { .. } => return None,
+            Host::Tmux { .. } | Host::Desktop { .. } | Host::Replay(_) => return None,
         };
         let mut spec = PaneSpec::new(open);
         spec.dir = dir.filter(|d| !d.is_empty() && d != ".");
@@ -13329,6 +13700,8 @@ impl Window {
             }
             cmd::LOG_FOLDER => return Some(Command::OpenFolder(log_dir())),
             cmd::LOG_VERIFY => return Some(Command::VerifyLog),
+            cmd::RECORD_CAST => self.toggle_record(pane),
+            cmd::PLAY_CAST => return Some(Command::PlayCast),
             cmd::SERIAL_BREAK => {
                 let pane = self.focused_id();
                 match self.panes.get(&pane).map(|p| &p.host) {
@@ -13578,6 +13951,7 @@ impl Window {
             .and_then(|p| Theme::builtin().iter().position(|t| t.name == p.theme.name))
             .map_or(u32::MAX, |i| cmd::THEME + i as u32);
         let (log, raw) = p.map_or((false, false), |p| (p.log.enabled, p.log.raw));
+        let recording = p.is_some_and(|p| p.cast.is_some());
         let last_font = cmd::FONT + FONT_CHOICES.len() as u32 - 1;
         let last_theme = cmd::THEME + Theme::builtin().len() as u32 - 1;
         let check = |on: bool| if on { MF_CHECKED } else { MF_UNCHECKED };
@@ -13634,6 +14008,7 @@ impl Window {
                 (cmd::LOG_TOGGLE, log),
                 (cmd::LOG_RAW, raw),
                 (cmd::LOG_TIMESTAMPS, s.log_timestamps),
+                (cmd::RECORD_CAST, recording),
                 (cmd::AUTO_RESPONSES, s.auto_responses),
                 (cmd::REMOTE_APP_COPY, s.remote_app_copy_agent),
                 (cmd::REMOTE_APP_REMOVE, s.remote_app_remove_agent),
@@ -15137,6 +15512,8 @@ enum Command {
     ImportSnippets,
     /// Session > Check a log: the file picker, then the chain check.
     VerifyLog,
+    /// Session > Play a recording: pick a `.cast` file.
+    PlayCast,
     /// The import page's file picker.
     PickImportFile,
     SaveLook,
@@ -16555,6 +16932,13 @@ fn run_command(hwnd: HWND, command: Command) {
         }
         Command::SessionMenu(host) => session_menu(hwnd, host),
         Command::TabMenu(tab) => tab_menu(hwnd, tab),
+        Command::PlayCast => {
+            if let Some(path) = pick_file(hwnd, w!("Play a recording"), &log_dir())
+                && let Some(Err(text)) = with_window(|w| w.open_replay(&path))
+            {
+                dialog(hwnd, &text, MB_OK | MB_ICONWARNING);
+            }
+        }
         Command::VerifyLog => {
             if let Some(path) = pick_file(hwnd, w!("Check a log for changes"), &log_dir()) {
                 let (text, ok) = check_log(&path);
@@ -17888,6 +18272,12 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
             }
             WM_DROPFILES => {
                 drop_files(hwnd, HDROP(wparam.0 as *mut c_void));
+                LRESULT(0)
+            }
+            WM_TIMER if wparam.0 == TIMER_REPLAY => {
+                if let Some(commands) = with_window(Window::on_replay_timer) {
+                    run_commands(hwnd, commands);
+                }
                 LRESULT(0)
             }
             WM_TIMER if wparam.0 == TIMER_SYNC => {

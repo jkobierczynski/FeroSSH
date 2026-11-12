@@ -170,6 +170,13 @@ doc = false
 bench = false
 
 [[bin]]
+name = "cast_parse"
+path = "fuzz_targets/cast_parse.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
 name = "sanitize"
 path = "fuzz_targets/sanitize.rs"
 test = false

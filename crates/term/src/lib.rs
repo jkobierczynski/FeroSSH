@@ -18,12 +18,14 @@
 //! OSC 7 working-directory reports come out as
 //! [`Action::WorkingDirectory`], for the file view to follow.
 //!
-//! [`LogWriter`] writes a tab's session log, as plain text or raw bytes.
+//! [`LogWriter`] writes a tab's session log, as plain text or raw bytes;
+//! [`cast`] records a pane's output with its timing and plays it back.
 //!
 //! It also encodes keys and mouse events the way xterm does, honouring the
 //! modes the host has set. Everything here is platform-neutral and tested
 //! on any host.
 
+pub mod cast;
 pub mod chain;
 mod cwd;
 pub mod highlight;

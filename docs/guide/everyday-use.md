@@ -586,7 +586,7 @@ Patterns are regular expressions in [Rust's syntax](https://docs.rs/regex/latest
 
 ## Logs
 
-Session > Log to file writes what a tab receives to `%LOCALAPPDATA%\FeroSSH\logs`, one file per tab, optionally with a timestamp on each line, and Session > Save this pane's output to a log saves what a pane already holds. Every log is sealed with a chain file, and Session > Check a log for changes tells you whether it was changed later. [Logs](logs.md) explains all of this, including what the `.chain` files are.
+Session > Log to file writes what a tab receives to `%LOCALAPPDATA%\FeroSSH\logs`, one file per tab, optionally with a timestamp on each line, and Session > Save this pane's output to a log saves what a pane already holds. Every log is sealed with a chain file, and Session > Check a log for changes tells you whether it was changed later. Session > Record this pane keeps what a pane shows with its timing, as an asciicast `.cast` file, and Session > Play a recording plays one back in a tab, with pause, seeking and speed. [Logs](logs.md) explains all of this, including what the `.chain` files are.
 
 ## Making a key and putting it on a server
 
