@@ -2112,6 +2112,8 @@ fn build_menu() -> Result<HMENU> {
             }
             last = Some(group);
         }
+        // Windows' dark menus skip menus with columns: drawn here then.
+        ui_theme::own_columns(themes);
 
         let tools = CreatePopupMenu()?;
         item(tools, cmd::SESSIONS, "&Connection manager\tCtrl+Shift+S")?;

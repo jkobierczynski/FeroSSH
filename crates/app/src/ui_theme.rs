@@ -33,11 +33,12 @@ use windows::Win32::Graphics::Dwm::{
 use windows::Win32::Graphics::Gdi::{
     BeginPaint, COLOR_BTNFACE, COLOR_GRAYTEXT, COLOR_MENU, COLOR_MENUBAR, COLOR_MENUTEXT,
     COLOR_WINDOW, COLOR_WINDOWTEXT, CreateFontIndirectW, CreateSolidBrush, DT_CENTER,
-    DT_HIDEPREFIX, DT_SINGLELINE, DT_VCENTER, DeleteObject, DrawFocusRect, DrawTextW, EndPaint,
-    FillRect, GetSysColor, GetSysColorBrush, GetWindowDC, HBRUSH, HDC, HFONT, HGDIOBJ,
-    InvalidateRect, MapWindowPoints, OffsetRect, PAINTSTRUCT, RDW_ALLCHILDREN, RDW_ERASE,
-    RDW_FRAME, RDW_INVALIDATE, RedrawWindow, ReleaseDC, SYS_COLOR_INDEX, SelectObject, SetBkColor,
-    SetBkMode, SetTextColor, TRANSPARENT,
+    DT_HIDEPREFIX, DT_LEFT, DT_SINGLELINE, DT_VCENTER, DeleteObject, DrawFocusRect, DrawTextW,
+    Ellipse, EndPaint, FillRect, GetDC, GetStockObject, GetSysColor, GetSysColorBrush,
+    GetTextExtentPoint32W, GetWindowDC, HBRUSH, HDC, HFONT, HGDIOBJ, InvalidateRect,
+    MapWindowPoints, NULL_PEN, OffsetRect, PAINTSTRUCT, RDW_ALLCHILDREN, RDW_ERASE, RDW_FRAME,
+    RDW_INVALIDATE, RedrawWindow, ReleaseDC, SYS_COLOR_INDEX, SelectObject, SetBkColor, SetBkMode,
+    SetTextColor, TRANSPARENT,
 };
 use windows::Win32::System::LibraryLoader::{
     GetProcAddress, LOAD_LIBRARY_SEARCH_SYSTEM32, LoadLibraryExW,
@@ -47,20 +48,24 @@ use windows::Win32::System::Registry::{
 };
 use windows::Win32::UI::Controls::{
     CDDS_ITEMPREPAINT, CDDS_PREPAINT, CDRF_DODEFAULT, CDRF_NOTIFYITEMDRAW, DRAWITEMSTRUCT,
-    LVM_GETHEADER, LVM_SETBKCOLOR, LVM_SETTEXTBKCOLOR, LVM_SETTEXTCOLOR, NM_CUSTOMDRAW,
-    NMCUSTOMDRAW, NMHDR, ODS_DISABLED, ODS_GRAYED, ODS_HOTLIGHT, ODS_INACTIVE, ODS_NOACCEL,
-    ODS_SELECTED, SetWindowTheme, TCIF_TEXT, TCITEMW, TCM_GETCURSEL, TCM_GETITEMCOUNT,
-    TCM_GETITEMRECT, TCM_GETITEMW, TVM_SETBKCOLOR, TVM_SETTEXTCOLOR,
+    LVM_GETHEADER, LVM_SETBKCOLOR, LVM_SETTEXTBKCOLOR, LVM_SETTEXTCOLOR, MEASUREITEMSTRUCT,
+    NM_CUSTOMDRAW, NMCUSTOMDRAW, NMHDR, ODS_CHECKED, ODS_DISABLED, ODS_GRAYED, ODS_HOTLIGHT,
+    ODS_INACTIVE, ODS_NOACCEL, ODS_SELECTED, ODT_MENU, SetWindowTheme, TCIF_TEXT, TCITEMW,
+    TCM_GETCURSEL, TCM_GETITEMCOUNT, TCM_GETITEMRECT, TCM_GETITEMW, TVM_SETBKCOLOR,
+    TVM_SETTEXTCOLOR,
 };
 use windows::Win32::UI::HiDpi::{GetDpiForWindow, SystemParametersInfoForDpi};
 use windows::Win32::UI::Input::KeyboardAndMouse::GetFocus;
 use windows::Win32::UI::Shell::{DefSubclassProc, SetWindowSubclass};
 use windows::Win32::UI::WindowsAndMessaging::{
     DefWindowProcW, DrawMenuBar, EnumChildWindows, GWL_STYLE, GetClassNameW, GetClientRect,
-    GetMenuBarInfo, GetMenuItemInfoW, GetWindowLongPtrW, GetWindowRect, MENUBARINFO, MENUITEMINFOW,
-    MIIM_STRING, NONCLIENTMETRICSW, OBJID_MENU, SPI_GETNONCLIENTMETRICS, SendMessageW,
-    WM_CTLCOLORBTN, WM_CTLCOLOREDIT, WM_CTLCOLORLISTBOX, WM_CTLCOLORSTATIC, WM_ERASEBKGND,
-    WM_GETFONT, WM_NCACTIVATE, WM_NCPAINT, WM_NOTIFY, WM_PAINT,
+    GetMenuBarInfo, GetMenuItemCount, GetMenuItemInfoW, GetWindowLongPtrW, GetWindowRect, HMENU,
+    MENU_ITEM_TYPE, MENUBARINFO, MENUINFO, MENUITEMINFOW, MFT_MENUBARBREAK, MFT_MENUBREAK,
+    MFT_OWNERDRAW, MFT_SEPARATOR, MFT_STRING, MIIM_DATA, MIIM_FTYPE, MIIM_STRING, MIM_BACKGROUND,
+    NONCLIENTMETRICSW, OBJID_MENU, SPI_GETNONCLIENTMETRICS, SendMessageW, SetMenuInfo,
+    SetMenuItemInfoW, WM_CTLCOLORBTN, WM_CTLCOLOREDIT, WM_CTLCOLORLISTBOX, WM_CTLCOLORSTATIC,
+    WM_DRAWITEM, WM_ERASEBKGND, WM_GETFONT, WM_MEASUREITEM, WM_NCACTIVATE, WM_NCPAINT, WM_NOTIFY,
+    WM_PAINT,
 };
 use windows::core::{BOOL, PCSTR, PCWSTR, PWSTR, w};
 
@@ -280,6 +285,7 @@ pub fn apply(main: HWND, c: UiColours) {
         unsafe { f() };
     }
     allow_dark(main, c.custom && c.dark);
+    sync_columns();
     title_bar(main, &c);
     restyle(main);
     // SAFETY: our own window.
@@ -703,9 +709,13 @@ fn paint_tabs(hwnd: HWND) {
     }
 }
 
-/// The menu bar and the line under it, in our colours; `None` leaves the
+/// The menu bar and the line under it, and the owner-drawn items of
+/// [`own_columns`] menus, in our colours; `None` leaves the
 /// message to the window procedure. The main window calls it first.
 pub fn frame_message(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> Option<LRESULT> {
+    if matches!(msg, WM_MEASUREITEM | WM_DRAWITEM) {
+        return own_menu_message(hwnd, msg, lparam);
+    }
     if !matches!(
         msg,
         WM_UAHDRAWMENU | WM_UAHDRAWMENUITEM | WM_NCPAINT | WM_NCACTIVATE
@@ -881,6 +891,330 @@ fn cover_bar_line(hwnd: HWND) {
         if !dc.is_invalid() {
             FillRect(dc, &line, bar);
             ReleaseDC(Some(hwnd), dc);
+        }
+    }
+}
+
+// Multi-column popup menus.
+//
+// Windows draws a popup menu with columns (`MF_MENUBARBREAK`, the
+// Settings > Theme menu) in its classic light style even when menus are
+// dark: its dark menus skip such menus. While menus are dark the items of
+// the menus given to [`own_columns`] are owner-drawn here instead, in the
+// colours Windows uses for its dark menus, and the menu's background
+// (between the columns, round the items) is filled with the same grey.
+
+/// Windows' dark popup menu colours (as measured on Windows 11).
+const MENU_BACK: Rgb = Rgb::new(0x2B, 0x2B, 0x2B);
+const MENU_HOT: Rgb = Rgb::new(0x35, 0x35, 0x35);
+const MENU_TEXT: Rgb = Rgb::new(0xFF, 0xFF, 0xFF);
+const MENU_GRAY: Rgb = Rgb::new(0x6D, 0x6D, 0x6D);
+const MENU_LINE: Rgb = Rgb::new(0x3C, 0x3C, 0x3C);
+
+/// Item data of our owner-drawn items: this tag, the menu's index in
+/// `OWN` (bits 16..24) and the item's position plus one (bits 0..16).
+const OWN_TAG: usize = 0x5E00_0000;
+
+/// One item of an owned menu, as it was built.
+struct OwnItem {
+    text: Vec<u16>,
+    separator: bool,
+    /// Starts a new column (with a bar in Windows' drawing).
+    breaks: bool,
+    /// The column it is in, from 0.
+    column: u32,
+}
+
+struct OwnMenu {
+    menu: HMENU,
+    items: Vec<OwnItem>,
+    /// Owner-drawn now.
+    drawn: bool,
+}
+
+thread_local! {
+    static OWN: RefCell<Vec<OwnMenu>> = const { RefCell::new(Vec::new()) };
+    static MENU_BACK_BRUSH: std::cell::Cell<Option<HBRUSH>> = const { std::cell::Cell::new(None) };
+}
+
+/// Menus are drawn dark by Windows right now.
+fn dark_menus() -> bool {
+    let c = colours();
+    c.custom && c.dark && ux().set_preferred_app_mode.is_some()
+}
+
+/// Draws the multi-column popup `menu` here while menus are dark. Call it
+/// once the menu is built; its items' texts and columns are taken then.
+pub fn own_columns(menu: HMENU) {
+    let mut items = Vec::new();
+    let mut column = 0;
+    // SAFETY: a menu we built; sized struct and buffer for each item.
+    unsafe {
+        let count = GetMenuItemCount(Some(menu));
+        for pos in 0..count.max(0) as u32 {
+            let mut buf = [0u16; 256];
+            let mut mii = MENUITEMINFOW {
+                cbSize: size_of::<MENUITEMINFOW>() as u32,
+                fMask: MIIM_FTYPE | MIIM_STRING,
+                dwTypeData: PWSTR(buf.as_mut_ptr()),
+                cch: buf.len() as u32 - 1,
+                ..Default::default()
+            };
+            if GetMenuItemInfoW(menu, pos, true, &mut mii).is_err() {
+                return;
+            }
+            let breaks = mii.fType.0 & (MFT_MENUBARBREAK.0 | MFT_MENUBREAK.0) != 0;
+            if breaks && pos > 0 {
+                column += 1;
+            }
+            let n = (mii.cch as usize).min(buf.len());
+            items.push(OwnItem {
+                text: buf.get(..n).unwrap_or_default().to_vec(),
+                separator: mii.fType.0 & MFT_SEPARATOR.0 != 0,
+                breaks,
+                column,
+            });
+        }
+    }
+    let dark = dark_menus();
+    OWN.with(|own| {
+        let Ok(mut own) = own.try_borrow_mut() else {
+            return;
+        };
+        own.push(OwnMenu {
+            menu,
+            items,
+            drawn: false,
+        });
+        let index = own.len() - 1;
+        if let Some(m) = own.last_mut() {
+            set_drawn(m, index, dark);
+        }
+    });
+}
+
+/// Owner-draws the owned menus while menus are dark, and gives them back
+/// to Windows otherwise.
+fn sync_columns() {
+    let dark = dark_menus();
+    OWN.with(|own| {
+        let Ok(mut own) = own.try_borrow_mut() else {
+            return;
+        };
+        for (index, m) in own.iter_mut().enumerate() {
+            set_drawn(m, index, dark);
+        }
+    });
+}
+
+fn menu_back_brush() -> HBRUSH {
+    MENU_BACK_BRUSH.with(|b| {
+        b.get().unwrap_or_else(|| {
+            // SAFETY: a plain brush, kept for the program's life.
+            let brush = unsafe { CreateSolidBrush(colorref(MENU_BACK)) };
+            b.set(Some(brush));
+            brush
+        })
+    })
+}
+
+fn set_drawn(m: &mut OwnMenu, index: usize, on: bool) {
+    if m.drawn == on {
+        return;
+    }
+    // SAFETY: a menu we built; each item's text is a buffer that outlives
+    // the call (Windows copies it).
+    unsafe {
+        for (pos, item) in m.items.iter_mut().enumerate() {
+            let mut mii = MENUITEMINFOW {
+                cbSize: size_of::<MENUITEMINFOW>() as u32,
+                fMask: MIIM_FTYPE,
+                ..Default::default()
+            };
+            if GetMenuItemInfoW(m.menu, pos as u32, true, &mut mii).is_err() {
+                continue;
+            }
+            // Keeps the radio check style CheckMenuRadioItem set.
+            let mut ty = mii.fType.0
+                & !(MFT_OWNERDRAW.0 | MFT_MENUBARBREAK.0 | MFT_MENUBREAK.0 | MFT_STRING.0);
+            let mut text = item.text.clone();
+            text.push(0);
+            mii.fMask = MIIM_FTYPE | MIIM_DATA;
+            if on {
+                // Our own line between the columns instead of Windows'
+                // light one.
+                ty |= MFT_OWNERDRAW.0 | if item.breaks { MFT_MENUBREAK.0 } else { 0 };
+                mii.dwItemData = OWN_TAG | (index << 16) | (pos + 1);
+            } else {
+                ty |= if item.breaks { MFT_MENUBARBREAK.0 } else { 0 };
+                mii.dwItemData = 0;
+                if !item.separator {
+                    // The text again, in case Windows let it go.
+                    mii.fMask |= MIIM_STRING;
+                    mii.dwTypeData = PWSTR(text.as_mut_ptr());
+                }
+            }
+            mii.fType = MENU_ITEM_TYPE(ty);
+            let _ = SetMenuItemInfoW(m.menu, pos as u32, true, &mii);
+        }
+        let info = MENUINFO {
+            cbSize: size_of::<MENUINFO>() as u32,
+            fMask: MIM_BACKGROUND,
+            hbrBack: if on {
+                menu_back_brush()
+            } else {
+                HBRUSH::default()
+            },
+            ..Default::default()
+        };
+        let _ = SetMenuInfo(m.menu, &info);
+    }
+    m.drawn = on;
+}
+
+/// Our item behind owner-draw item data, with a copy of what drawing it
+/// needs.
+fn own_item(data: usize) -> Option<(bool, u32, Vec<u16>)> {
+    if data & !0x00FF_FFFF != OWN_TAG {
+        return None;
+    }
+    let index = (data >> 16) & 0xFF;
+    let pos = (data & 0xFFFF).checked_sub(1)?;
+    OWN.with(|own| {
+        let own = own.try_borrow().ok()?;
+        let item = own.get(index)?.items.get(pos)?;
+        Some((item.separator, item.column, item.text.clone()))
+    })
+}
+
+/// The window's DPI as a scale for sizes given at 96 DPI.
+fn scaled(hwnd: HWND, px: i32) -> i32 {
+    // SAFETY: plain query.
+    let dpi = unsafe { GetDpiForWindow(hwnd) }.max(96) as i32;
+    px * dpi / 96
+}
+
+/// `WM_MEASUREITEM` and `WM_DRAWITEM` for our owner-drawn menu items;
+/// `None` for anything else.
+fn own_menu_message(hwnd: HWND, msg: u32, lparam: LPARAM) -> Option<LRESULT> {
+    match msg {
+        WM_MEASUREITEM => {
+            // SAFETY: Windows passes a MEASUREITEMSTRUCT with this message.
+            let mis = unsafe { &mut *(lparam.0 as *mut MEASUREITEMSTRUCT) };
+            if mis.CtlType != ODT_MENU {
+                return None;
+            }
+            let (separator, _, text) = own_item(mis.itemData)?;
+            if separator {
+                mis.itemWidth = 0;
+                mis.itemHeight = scaled(hwnd, 7) as u32;
+                return Some(LRESULT(1));
+            }
+            let mut size = windows::Win32::Foundation::SIZE::default();
+            // SAFETY: a window DC, released after use; the font is
+            // selected back out.
+            unsafe {
+                let dc = GetDC(Some(hwnd));
+                let old = menu_font(hwnd).map(|f| SelectObject(dc, HGDIOBJ(f.0)));
+                let _ = GetTextExtentPoint32W(dc, &text, &mut size);
+                if let Some(old) = old {
+                    SelectObject(dc, old);
+                }
+                ReleaseDC(Some(hwnd), dc);
+            }
+            mis.itemWidth = (size.cx + scaled(hwnd, GUTTER + 16)).max(0) as u32;
+            mis.itemHeight = (size.cy + scaled(hwnd, 6)).max(0) as u32;
+            Some(LRESULT(1))
+        }
+        WM_DRAWITEM => {
+            // SAFETY: Windows passes a DRAWITEMSTRUCT with this message.
+            let dis = unsafe { &*(lparam.0 as *const DRAWITEMSTRUCT) };
+            if dis.CtlType != ODT_MENU {
+                return None;
+            }
+            let (separator, column, mut text) = own_item(dis.itemData)?;
+            draw_own_item(hwnd, dis, separator, column, &mut text);
+            Some(LRESULT(1))
+        }
+        _ => None,
+    }
+}
+
+/// The space left of an item's text, where the radio bullet goes (96 DPI).
+const GUTTER: i32 = 28;
+
+fn draw_own_item(hwnd: HWND, dis: &DRAWITEMSTRUCT, separator: bool, column: u32, text: &mut [u16]) {
+    let state = dis.itemState.0;
+    let off = state & (ODS_GRAYED.0 | ODS_DISABLED.0) != 0;
+    let lit = state & ODS_SELECTED.0 != 0 && !off && !separator;
+    let dc = dis.hDC;
+    let r = dis.rcItem;
+    // SAFETY: the DC Windows passed for the item; brushes we make are
+    // deleted after use, the font and pen are selected back out.
+    unsafe {
+        let fill = |rect: &RECT, c: Rgb| {
+            let b = CreateSolidBrush(colorref(c));
+            FillRect(dc, rect, b);
+            let _ = DeleteObject(HGDIOBJ(b.0));
+        };
+        fill(&r, if lit { MENU_HOT } else { MENU_BACK });
+        if column > 0 {
+            // The line between the columns.
+            fill(
+                &RECT {
+                    right: r.left + 1,
+                    ..r
+                },
+                MENU_LINE,
+            );
+        }
+        if separator {
+            let mid = (r.top + r.bottom) / 2;
+            fill(
+                &RECT {
+                    left: r.left + scaled(hwnd, 4),
+                    top: mid,
+                    right: r.right - scaled(hwnd, 4),
+                    bottom: mid + 1,
+                },
+                MENU_LINE,
+            );
+            return;
+        }
+        let colour = if off { MENU_GRAY } else { MENU_TEXT };
+        if state & ODS_CHECKED.0 != 0 {
+            // The radio bullet, centred in the gutter.
+            let d = scaled(hwnd, 6);
+            let cx = r.left + scaled(hwnd, GUTTER) / 2;
+            let cy = (r.top + r.bottom) / 2;
+            let brush = CreateSolidBrush(colorref(colour));
+            let old_brush = SelectObject(dc, HGDIOBJ(brush.0));
+            let old_pen = SelectObject(dc, GetStockObject(NULL_PEN));
+            let _ = Ellipse(
+                dc,
+                cx - d / 2,
+                cy - d / 2,
+                cx - d / 2 + d + 1,
+                cy - d / 2 + d + 1,
+            );
+            SelectObject(dc, old_pen);
+            SelectObject(dc, old_brush);
+            let _ = DeleteObject(HGDIOBJ(brush.0));
+        }
+        let old = menu_font(hwnd).map(|f| SelectObject(dc, HGDIOBJ(f.0)));
+        SetBkMode(dc, TRANSPARENT);
+        SetTextColor(dc, colorref(colour));
+        let mut flags = DT_LEFT | DT_VCENTER | DT_SINGLELINE;
+        if state & ODS_NOACCEL.0 != 0 {
+            flags |= DT_HIDEPREFIX;
+        }
+        let mut tr = RECT {
+            left: r.left + scaled(hwnd, GUTTER),
+            ..r
+        };
+        DrawTextW(dc, text, &mut tr, flags);
+        if let Some(old) = old {
+            SelectObject(dc, old);
         }
     }
 }
