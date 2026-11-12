@@ -73,6 +73,12 @@ pub fn local_name(remote: &[u8]) -> Option<String> {
             stem.pop();
         }
         name = stem + &ext;
+        // The cut may end the name in a dot or space, which Windows drops
+        // (`aaa…a b` cut to `aaa…a `): one more `_`, as above.
+        let kept = name.trim_end_matches(['.', ' ']).len();
+        let trailing = name.len() - kept;
+        name.truncate(kept);
+        name.extend(std::iter::repeat_n('_', trailing));
     }
     Some(name)
 }
@@ -220,6 +226,18 @@ mod tests {
         let name = local_name(long.as_bytes()).unwrap_or_default();
         assert_eq!(name.encode_utf16().count(), 255);
         assert!(name.ends_with("x.gz"));
+    }
+
+    #[test]
+    fn a_cut_name_does_not_end_in_a_dot_or_space() {
+        // Found by the remote_names fuzz target: the cut landed on a space,
+        // which Windows would drop from the name.
+        for gap in [" ", ".", " . "] {
+            let long = format!("{}{gap}bbbbbbb", "a".repeat(254));
+            let name = local_name(long.as_bytes()).unwrap_or_default();
+            assert_eq!(name.encode_utf16().count(), 255, "{gap:?}");
+            assert!(!name.ends_with(['.', ' ']), "{gap:?}");
+        }
     }
 
     #[test]

@@ -35,6 +35,10 @@ use tokio::sync::{mpsc, oneshot};
 use zeroize::Zeroize;
 
 pub use session::Params;
+
+/// The forwarded agent channel's reading, for the fuzzer.
+#[doc(hidden)]
+pub use agent::fuzz_stream as fuzz_agent_stream;
 use session::{Connections, Route, SessionGuard};
 
 /// Messages queued in each direction before the sender waits.

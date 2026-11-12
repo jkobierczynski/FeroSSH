@@ -4,10 +4,12 @@
 //! request for that user and key, with an algorithm FeroSSH allows: the
 //! accepted bytes are rebuilt from the parts and must match. The check
 //! for a forwarded agent's sign requests reads the same bytes and must
-//! not panic either.
+//! not panic either, nor may the check of what a Kerberos (gssapi-with-mic)
+//! MIC signs, which must accept only that request for that user.
 
 #![no_main]
 
+use ferossh_auth::gss::check_mic_data;
 use ferossh_auth::userauth::{allowed_algorithms, check, check_forwarded, key_type};
 use libfuzzer_sys::fuzz_target;
 
@@ -68,6 +70,29 @@ fuzz_target!(|data: &[u8]| {
         d
     };
     let _ = check_forwarded(&request, &key, u32::from(mode >> 6) << 1);
+    // The same bytes as data a Kerberos MIC would sign: accepted only
+    // when it is exactly a gssapi-with-mic request for this user.
+    let mut mic = request.clone();
+    if mode & 4 == 0 && mode & 64 != 0 {
+        // Built the same way, with gssapi-with-mic in place of the rest.
+        mic.clear();
+        string(&mut mic, p.get(2).copied().unwrap_or(&[7; 32]));
+        mic.push(if mode & 8 != 0 { 50 } else { mode });
+        string(&mut mic, if mode & 16 != 0 { user.as_bytes() } else { p.get(3).copied().unwrap_or_default() });
+        string(&mut mic, b"ssh-connection");
+        string(&mut mic, p.get(4).copied().unwrap_or(b"gssapi-with-mic"));
+        mic.extend_from_slice(p.get(6).copied().unwrap_or_default());
+    }
+    if check_mic_data(&mic, user).is_ok() {
+        let id_len = u32::from_be_bytes(mic[..4].try_into().unwrap_or_default()) as usize;
+        assert!((20..=64).contains(&id_len));
+        let mut rebuilt = mic[..4 + id_len].to_vec();
+        rebuilt.push(50);
+        string(&mut rebuilt, user.as_bytes());
+        string(&mut rebuilt, b"ssh-connection");
+        string(&mut rebuilt, b"gssapi-with-mic");
+        assert_eq!(rebuilt, mic);
+    }
     let Ok(target) = check(&request, user, &key) else {
         return;
     };
