@@ -53,6 +53,8 @@ git checkout v1.0.0
 pwsh scripts/build-release.ps1
 ```
 
+For the ARM64 exes, run `pwsh scripts/build-release.ps1 -Arch arm64` on an ARM64 PC. It also needs Visual Studio's ARM64 build tools and clang (LLVM, or Visual Studio's "C++ Clang Compiler for Windows"), because ring compiles its C code for ARM64 with clang. CI checks these exes the same way, on ARM64 runners. Cross-compiling from an x64 PC with the same command should work too, but only the native ARM64 build is checked against the release.
+
 The script prints the SHA-256 of each exe it built. They must equal the `sha256_unsigned` values in that release's `BUILD-MANIFEST.json`. They differ from `SHA256SUMS.txt` only when the release is code-signed, because the signature is added to the exe after it is built.
 
 The script builds with the toolchain pinned in `rust-toolchain.toml` (rustup installs it), the dependencies pinned in `Cargo.lock`, `/Brepro` so the exe holds no timestamps, and `--remap-path-prefix` so the folder you build in does not end up in the exe.

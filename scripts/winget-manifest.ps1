@@ -5,9 +5,9 @@
 #   pwsh scripts/winget-manifest.ps1 -Version 1.0.0 -Sums dist/SHA256SUMS.txt
 #
 # The release workflow runs it and uploads the result as the
-# winget-manifests artifact. winget installs ferossh.exe as a portable app:
-# it downloads the exe, checks its SHA-256 and puts a `ferossh` command on
-# the PATH.
+# winget-manifests artifact. winget installs ferossh.exe (ferossh-arm64.exe
+# on Windows on ARM) as a portable app: it downloads the exe, checks its
+# SHA-256 and puts a `ferossh` command on the PATH.
 
 param(
     [Parameter(Mandatory)] [string]$Version,
@@ -22,9 +22,11 @@ $id = "jkobierczynski.FeroSSH"
 $schema = "1.9.0"
 
 $sha = $null
+$shaArm = $null
 foreach ($line in Get-Content $Sums) {
     $hash, $name = $line -split "\s+", 2
     if ($name -eq "ferossh.exe") { $sha = $hash.ToUpper() }
+    if ($name -eq "ferossh-arm64.exe") { $shaArm = $hash.ToUpper() }
 }
 if (-not $sha) { throw "ferossh.exe is not listed in $Sums" }
 
@@ -44,6 +46,23 @@ DefaultLocale: en-US
 
 "@
 
+# Windows on ARM gets the native ferossh-arm64.exe when the release has
+# one; winget installs it under the same `ferossh` command.
+$installers = @"
+- Architecture: x64
+  InstallerUrl: $repoUrl/releases/download/v$Version/ferossh.exe
+  InstallerSha256: $sha
+
+"@
+if ($shaArm) {
+    $installers += @"
+- Architecture: arm64
+  InstallerUrl: $repoUrl/releases/download/v$Version/ferossh-arm64.exe
+  InstallerSha256: $shaArm
+
+"@
+}
+
 Write-Manifest "$id.installer.yaml" "installer" @"
 MinimumOSVersion: 10.0.18362.0
 InstallerType: portable
@@ -51,10 +70,7 @@ Commands:
 - ferossh
 ReleaseDate: $(Get-Date -Format yyyy-MM-dd)
 Installers:
-- Architecture: x64
-  InstallerUrl: $repoUrl/releases/download/v$Version/ferossh.exe
-  InstallerSha256: $sha
-
+$installers
 "@
 
 Write-Manifest "$id.locale.en-US.yaml" "defaultLocale" @"

@@ -28,8 +28,10 @@
 $ReleaseWorkflowPath = ".github/workflows/release.yml"
 # The exes CI builds and the workflow artifacts the release run keeps them in.
 $ReleaseExeArtifacts = [ordered]@{
-    "ferossh.exe"         = "ferossh-exe"
-    "ferossh-desktop.exe" = "ferossh-desktop-viewer-exe"
+    "ferossh.exe"               = "ferossh-exe"
+    "ferossh-desktop.exe"       = "ferossh-desktop-viewer-exe"
+    "ferossh-arm64.exe"         = "arm64-ferossh-exe"
+    "ferossh-desktop-arm64.exe" = "arm64-ferossh-desktop-viewer-exe"
 }
 $ReleaseManifestArtifact = "build-manifest"
 
