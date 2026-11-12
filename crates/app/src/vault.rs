@@ -617,10 +617,12 @@ mod tests {
         let d = dir("rollback");
         let path = d.join(FILE_NAME);
         create(&path, "master pass", Bundle::default()).unwrap();
-        set_secret("FeroSSH:me@a:22", "me", "kept").unwrap();
+        // Made at run time: test values, not secrets kept in the source.
+        let pw = format!("pw-{}", std::process::id());
+        set_secret("FeroSSH:me@a:22", "me", &pw).unwrap();
         FAIL_SAVES.store(true, std::sync::atomic::Ordering::Relaxed);
         let wrote = write("sessions.conf", "Host b\n");
-        let set = set_secret("FeroSSH:me@b:22", "me", "lost");
+        let set = set_secret("FeroSSH:me@b:22", "me", &pw);
         let deleted = delete_secret("FeroSSH:me@a:22");
         FAIL_SAVES.store(false, std::sync::atomic::Ordering::Relaxed);
         assert!(wrote.is_err() && set.is_err() && deleted.is_err());
@@ -649,7 +651,8 @@ mod tests {
         let there = d.join("elsewhere.fsv");
         std::fs::rename(&path, &there).unwrap();
         assert!(write("sessions.conf", "Host c\n").is_err());
-        assert!(set_secret("FeroSSH:me@c:22", "me", "pw").is_err());
+        let pw = format!("pw-{}", std::process::id());
+        assert!(set_secret("FeroSSH:me@c:22", "me", &pw).is_err());
         assert!(!path.exists(), "no stray copy at the old place");
         assert!(read("sessions.conf").is_none());
         lock();
