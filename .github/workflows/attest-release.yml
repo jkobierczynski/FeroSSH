@@ -72,7 +72,7 @@ jobs:
           if ($tag -notmatch '^v\d+\.\d+\.\d+(-[0-9A-Za-z.]+)?$') { throw "$tag is not a release tag" }
 
           gh release download $tag -R $repo -D files `
-            -p ferossh.exe -p ferossh-desktop.exe -p SHA256SUMS.txt -p BUILD-MANIFEST.json `
+            -p ferossh.exe -p ferossh-desktop.exe -p ferossh-arm64.exe -p ferossh-desktop-arm64.exe -p SHA256SUMS.txt -p BUILD-MANIFEST.json `
             -p 'ferostream-agent*'
           if ($LASTEXITCODE) { throw "could not download release $tag" }
           $files = (Resolve-Path files).Path
@@ -122,6 +122,8 @@ jobs:
           subject-path: |
             files/ferossh.exe
             files/ferossh-desktop.exe
+            files/ferossh-arm64.exe
+            files/ferossh-desktop-arm64.exe
             files/ferostream-agent*
             files/SHA256SUMS.txt
             files/BUILD-MANIFEST.json
