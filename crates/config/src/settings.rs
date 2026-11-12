@@ -607,6 +607,9 @@ pub struct Settings {
     /// such as `side 50` or `stacked swapped 40`; side by side, Local
     /// first, when unset.
     pub transfer_layout: Option<String>,
+    /// How the file transfer pane sorts both lists, such as `size
+    /// descending`; by name, A to Z, when unset.
+    pub transfer_sort: Option<String>,
     /// File transfer's named folder pairs, in the order made.
     pub bookmarks: Vec<Bookmark>,
     /// The X server forwarded X11 goes to (`DISPLAY` syntax); the `DISPLAY`
@@ -723,6 +726,7 @@ impl Default for Settings {
             zmodem: false,
             follow_directory: true,
             transfer_layout: None,
+            transfer_sort: None,
             bookmarks: Vec::new(),
             x11_display: None,
             update_check_weekly: false,
@@ -1037,6 +1041,10 @@ impl Settings {
                 "transferlayout" => {
                     block = Block::Top;
                     s.transfer_layout = Some(joined).filter(|f| !f.is_empty());
+                }
+                "transfersort" => {
+                    block = Block::Top;
+                    s.transfer_sort = Some(joined).filter(|f| !f.is_empty());
                 }
                 "followdirectory" => {
                     block = Block::Top;
@@ -1461,6 +1469,9 @@ impl Settings {
         if let Some(l) = &self.transfer_layout {
             let _ = writeln!(out, "TransferLayout {}", arg(l));
         }
+        if let Some(l) = &self.transfer_sort {
+            let _ = writeln!(out, "TransferSort {}", arg(l));
+        }
         for b in &self.bookmarks {
             let quoted = |t: &str| format!("\"{}\"", clean(t).replace('"', ""));
             let opt = |t: &Option<String>| quoted(t.as_deref().unwrap_or_default());
@@ -1712,6 +1723,7 @@ AutoReconnect no
 ParallelTransfers 20
 FollowDirectory no
 TransferLayout stacked swapped 40
+TransferSort size descending
 Bookmark "nginx config" "C:\Users\j\Documents" /etc/nginx "web01.prod"
 Bookmark logs "" /var/log ""
 Bookmark empty "" "" ""
@@ -1847,6 +1859,7 @@ NewKeyword later
         assert_eq!(s.parallel_transfers, Some(8));
         assert!(!s.follow_directory);
         assert_eq!(s.transfer_layout.as_deref(), Some("stacked swapped 40"));
+        assert_eq!(s.transfer_sort.as_deref(), Some("size descending"));
         assert_eq!(
             s.bookmarks,
             [
