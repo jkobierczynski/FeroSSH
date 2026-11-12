@@ -3,8 +3,9 @@
   SignPath artifact configuration for FeroSSH releases. Paste it into the
   project's default artifact configuration on signpath.io.
 
-  The release workflow uploads ferossh.exe and ferossh-desktop.exe as one
-  GitHub artifact, which arrives as a zip. Both exes are Authenticode
+  The release workflow uploads ferossh.exe and ferossh-desktop.exe, and
+  their ARM64 builds ferossh-arm64.exe and ferossh-desktop-arm64.exe, as
+  one GitHub artifact, which arrives as a zip. All four exes are Authenticode
   signed, and SignPath refuses them unless their version resource names
   the product FeroSSH (crates/app/build.rs writes it).
 -->
@@ -14,6 +15,12 @@
       <authenticode-sign />
     </pe-file>
     <pe-file path="ferossh-desktop.exe" product-name="FeroSSH">
+      <authenticode-sign />
+    </pe-file>
+    <pe-file path="ferossh-arm64.exe" product-name="FeroSSH">
+      <authenticode-sign />
+    </pe-file>
+    <pe-file path="ferossh-desktop-arm64.exe" product-name="FeroSSH">
       <authenticode-sign />
     </pe-file>
   </zip-file>

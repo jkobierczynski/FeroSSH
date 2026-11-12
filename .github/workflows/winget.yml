@@ -34,6 +34,7 @@ jobs:
     timeout-minutes: 15
     env:
       WINGET_TOKEN: ${{ secrets.WINGET_TOKEN }}
+      GH_TOKEN: ${{ github.token }}
       TAG: ${{ github.event_name == 'release' && github.event.release.tag_name || inputs.tag }}
     steps:
       - name: Submit to winget
@@ -53,13 +54,33 @@ jobs:
             throw "wingetcreate.exe is not signed by Microsoft: $($sig.Status) $($sig.SignerCertificate.Subject)"
           }
 
-          # Only the signed exe goes to winget.
-          $bin = Join-Path $env:RUNNER_TEMP "ferossh.exe"
-          Invoke-WebRequest $url -OutFile $bin
-          $own = Get-AuthenticodeSignature $bin
-          if ($own.Status -ne "Valid") { throw "ferossh.exe in $env:TAG is not signed: $($own.Status)" }
+          # Windows on ARM gets ferossh-arm64.exe. `wingetcreate update`
+          # can only replace installers winget already has, so the ARM64
+          # one goes along once winget's manifest has an arm64 installer;
+          # the first time, submit the winget manifests sign-release.ps1
+          # wrote (both installers) by hand with `wingetcreate submit`.
+          $urls = @($url)
+          $assets = gh release view $env:TAG -R "${{ github.repository }}" --json assets --jq '.assets[].name'
+          if ($LASTEXITCODE) { throw "could not read release $env:TAG" }
+          if ($assets -contains "ferossh-arm64.exe") {
+            $current = (& $exe show jkobierczynski.FeroSSH --installer-manifest 2>&1) -join "`n"
+            if ($current -match 'Architecture:\s*arm64') {
+              $urls += "https://github.com/${{ github.repository }}/releases/download/$env:TAG/ferossh-arm64.exe"
+            } else {
+              "::warning::winget has no arm64 installer for FeroSSH yet: this update sends ferossh.exe only. Submit the winget manifests scripts/sign-release.ps1 wrote for this release once by hand (wingetcreate submit) to add ferossh-arm64.exe."
+            }
+          }
 
-          & $exe update jkobierczynski.FeroSSH --version $version --urls $url `
+          # Only signed exes go to winget.
+          foreach ($u in $urls) {
+            $name = Split-Path $u -Leaf
+            $bin = Join-Path $env:RUNNER_TEMP $name
+            Invoke-WebRequest $u -OutFile $bin
+            $own = Get-AuthenticodeSignature $bin
+            if ($own.Status -ne "Valid") { throw "$name in $env:TAG is not signed: $($own.Status)" }
+          }
+
+          & $exe update jkobierczynski.FeroSSH --version $version --urls @urls `
             --release-notes-url "https://github.com/${{ github.repository }}/releases/tag/$env:TAG" `
             --token $env:WINGET_TOKEN --submit
           if ($LASTEXITCODE -ne 0) { throw "wingetcreate failed ($LASTEXITCODE)" }

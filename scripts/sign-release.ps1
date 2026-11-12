@@ -15,7 +15,7 @@
 #      never trusted because another file in the draft vouches for it;
 #   2. checks the Linux agents in the draft the same way (they are
 #      published as CI built them);
-#   3. signs both exes with signtool and the code signing certificate whose
+#   3. signs the exes (x64 and ARM64) with signtool and the code signing certificate whose
 #      subject contains -Subject (a Certum card, or SimplySign Desktop
 #      logged in), with an RFC 3161 timestamp from Certum, and checks each
 #      signed exe is its attested unsigned exe plus the signature;
@@ -146,8 +146,12 @@ $manifest | ConvertTo-Json -Depth 5 | Set-Content -Encoding utf8NoBOM $manifestP
 Get-Content $sums
 
 Write-Host "Uploading the signed files to the draft"
-Invoke-Native gh @("release", "upload", $Tag, "-R", $Repository, "--clobber",
-    (Join-Path $out "ferossh.exe"), (Join-Path $out "ferossh-desktop.exe"), $sums, $manifestPath)
+$upload = [Collections.Generic.List[string]]::new()
+$upload.AddRange([string[]]@("release", "upload", $Tag, "-R", $Repository, "--clobber"))
+foreach ($exe in $exes) { $upload.Add((Join-Path $out $exe)) }
+$upload.Add($sums)
+$upload.Add($manifestPath)
+Invoke-Native gh $upload
 
 Write-Host "Attesting the signed files"
 # A fresh id in the run's name, so this waits for the run it started and

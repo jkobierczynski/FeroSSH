@@ -8,8 +8,8 @@
 //! the first call into it. The sandboxed worker and viewer, the same exe,
 //! never call them, so they never load user32 or anything that pulls it
 //! in, and can run with Win32k lockdown (see sandbox.rs). The exe is also
-//! marked compatible with CET shadow stacks; Control Flow Guard is a
-//! rustc flag (.cargo/config.toml).
+//! marked compatible with CET shadow stacks (x64 only); Control Flow
+//! Guard is a rustc flag (.cargo/config.toml).
 
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
@@ -19,7 +19,23 @@ fn main() {
     let msvc = std::env::var("CARGO_CFG_TARGET_ENV").is_ok_and(|env| env == "msvc");
     if windows && msvc {
         let dir = std::env::var("CARGO_MANIFEST_DIR").unwrap_or_default();
-        let manifest = std::path::Path::new(&dir).join("ferossh.manifest");
+        let out = std::env::var("OUT_DIR").unwrap_or_default();
+        let arch = std::env::var("CARGO_CFG_TARGET_ARCH").unwrap_or_default();
+        // The manifest names the exe's processor architecture: amd64 as
+        // written, arm64 for the Windows on ARM build.
+        let mut manifest = std::path::Path::new(&dir).join("ferossh.manifest");
+        if arch == "aarch64" {
+            let text = std::fs::read_to_string(&manifest).unwrap_or_default();
+            let arm = std::path::Path::new(&out).join("ferossh.manifest");
+            let text = text.replacen(
+                "processorArchitecture=\"amd64\"",
+                "processorArchitecture=\"arm64\"",
+                1,
+            );
+            if std::fs::write(&arm, text).is_ok() {
+                manifest = arm;
+            }
+        }
         println!("cargo:rustc-link-arg-bins=/MANIFEST:EMBED");
         println!(
             "cargo:rustc-link-arg-bins=/MANIFESTINPUT:{}",
@@ -35,12 +51,14 @@ fn main() {
         // A DLL on the list that the exe ends up not importing is not an
         // error (LNK4199), just a note.
         println!("cargo:rustc-link-arg-bins=/IGNORE:4199");
-        println!("cargo:rustc-link-arg-bins=/CETCOMPAT");
+        // CET shadow stacks are x64 only; ARM64 has no such mark.
+        if arch == "x86_64" {
+            println!("cargo:rustc-link-arg-bins=/CETCOMPAT");
+        }
 
         // link.exe takes a compiled .res file as an input of its own, so
         // the resources are written here byte for byte: no rc.exe, and the
         // same bytes on every machine.
-        let out = std::env::var("OUT_DIR").unwrap_or_default();
         let res = std::path::Path::new(&out).join("ferossh.res");
         let version = env!("CARGO_PKG_VERSION");
         let number = [

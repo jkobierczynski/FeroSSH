@@ -1,0 +1,43 @@
+name: Rust and clang on Windows ARM64
+description: >
+  Makes sure an ARM64 Windows runner has rustup (the toolchain itself comes
+  from rust-toolchain.toml) and clang on the PATH, which ring needs to
+  compile its C code for ARM64.
+
+runs:
+  using: composite
+  steps:
+    - name: rustup
+      shell: pwsh
+      run: |
+        if (Get-Command rustup -ErrorAction SilentlyContinue) {
+          "rustup is installed: $(rustup --version 2>$null)"
+          exit 0
+        }
+        $init = Join-Path $env:RUNNER_TEMP "rustup-init.exe"
+        Invoke-WebRequest https://static.rust-lang.org/rustup/dist/aarch64-pc-windows-msvc/rustup-init.exe -OutFile $init
+        & $init -y --default-toolchain none --profile minimal --no-modify-path
+        if ($LASTEXITCODE) { throw "rustup-init failed ($LASTEXITCODE)" }
+        $bin = Join-Path $env:USERPROFILE ".cargo\bin"
+        $bin >> $env:GITHUB_PATH
+        & (Join-Path $bin "rustup.exe") --version
+    - name: clang
+      shell: pwsh
+      run: |
+        $clang = Get-Command clang -ErrorAction SilentlyContinue
+        if (-not $clang) {
+          # LLVM's own install, else the one in Visual Studio ("C++ Clang
+          # Compiler for Windows").
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $candidates = @("$env:ProgramFiles\LLVM\bin\clang.exe")
+          if (Test-Path $vswhere) {
+            $candidates += @(& $vswhere -latest -products * -find 'VC\Tools\Llvm\ARM64\bin\clang.exe')
+            $candidates += @(& $vswhere -latest -products * -find 'VC\Tools\Llvm\bin\clang.exe')
+          }
+          $found = $candidates | Where-Object { $_ -and (Test-Path $_) } | Select-Object -First 1
+          if (-not $found) { throw "clang not found: install LLVM on the runner" }
+          Split-Path $found >> $env:GITHUB_PATH
+          $clang = $found
+        }
+        "clang: $clang"
+        & $clang --version

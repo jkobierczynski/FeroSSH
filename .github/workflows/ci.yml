@@ -157,25 +157,122 @@ jobs:
           name: ferossh-desktop-viewer-exe
           path: dist/ferossh-desktop.exe
 
+  # The same exes for Windows on ARM (ferossh-arm64.exe and the rest),
+  # built and tested natively on an ARM64 runner, so the tests and the
+  # sandbox check run on real ARM64 Windows. Not a required check, but a
+  # release waits for it like every other job here.
+  windows-arm64:
+    name: Build and test (Windows ARM64)
+    needs: changes
+    if: ${{ !cancelled() && needs.changes.outputs.code != 'false' }}
+    runs-on: windows-11-arm
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/windows-arm64
+      - run: rustup show active-toolchain
+      - if: env.USE_CACHE == 'true'
+        uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+      # Lints and tests as on x64, with the desktop viewer too (ring's and
+      # zlib's C code through clang, as in the release build).
+      - run: cargo clippy --workspace --all-targets --locked -- -D warnings
+        env:
+          CC_aarch64_pc_windows_msvc: clang
+      - run: cargo test --workspace --locked
+        env:
+          CC_aarch64_pc_windows_msvc: clang
+      - run: cargo test -p ferossh --features desktop-viewer --locked
+        env:
+          CC_aarch64_pc_windows_msvc: clang
+      - run: pwsh scripts/build-release.ps1 -Arch arm64
+      - name: Check the sandbox
+        shell: pwsh
+        run: |
+          foreach ($exe in 'ferossh-arm64', 'ferossh-vnc-arm64', 'ferossh-desktop-arm64') {
+            $p = Start-Process -FilePath "dist/$exe.exe" -ArgumentList '--check-sandbox' `
+              -Wait -PassThru -NoNewWindow -RedirectStandardOutput "check-$exe.txt"
+            "${exe}.exe --check-sandbox (exit $($p.ExitCode)):" | Tee-Object -Append $env:GITHUB_STEP_SUMMARY
+            Get-Content "check-$exe.txt" | Tee-Object -Append $env:GITHUB_STEP_SUMMARY
+            if ($p.ExitCode -ne 0) { throw "$exe.exe --check-sandbox exited with $($p.ExitCode)" }
+          }
+      - name: Check the exe's machine type, imports and CFG
+        shell: pwsh
+        run: |
+          # As on x64, minus CET, which ARM64 does not have.
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $dumpbin = @(& $vswhere -latest -products * -find 'VC\Tools\MSVC\**\bin\Hostarm64\arm64\dumpbin.exe') +
+            @(& $vswhere -latest -products * -find 'VC\Tools\MSVC\**\bin\Hostx64\x64\dumpbin.exe') |
+            Where-Object { $_ } | Select-Object -First 1
+          if (-not $dumpbin) { throw "dumpbin.exe not found" }
+          $ui = 'user32|gdi32|imm32|comctl32|comdlg32|shell32|ole32|oleaut32|shcore|uxtheme|dwmapi|d2d1|dwrite|winhttp|webauthn|userenv|crypt32'
+          foreach ($exe in 'ferossh-arm64', 'ferossh-vnc-arm64', 'ferossh-desktop-arm64') {
+            $deps = & $dumpbin /nologo /dependents "dist/$exe.exe"
+            $static = ($deps -join "`n") -split 'delay load dependencies' | Select-Object -First 1
+            $loaded = $static -split "`n" | Where-Object { $_ -match '^\s+\S+\.dll\s*$' } | ForEach-Object { $_.Trim() }
+            "${exe}.exe loads at start: $($loaded -join ', ')" | Tee-Object -Append $env:GITHUB_STEP_SUMMARY
+            $bad = $loaded | Where-Object { $_ -match "^($ui)\.dll$" }
+            if ($bad) { throw "$exe.exe imports $($bad -join ', ') directly" }
+            $headers = (& $dumpbin /nologo /headers "dist/$exe.exe") -join "`n"
+            if ($headers -notmatch 'AA64 machine \(ARM64\)') { throw "$exe.exe is not an ARM64 exe" }
+            if ($headers -notmatch 'Control Flow Guard') { throw "$exe.exe is not built with CFG" }
+          }
+      - name: Report exe sizes
+        shell: pwsh
+        run: |
+          foreach ($exe in Get-ChildItem dist/*-arm64.exe | Sort-Object Name) {
+            "$($exe.Name): $([math]::Round($exe.Length / 1KB)) KB" | Tee-Object -Append $env:GITHUB_STEP_SUMMARY
+          }
+      # Named arm64-*, so the x64 reproducible build's ferossh-*exe pattern
+      # does not pick them up.
+      - uses: actions/upload-artifact@v4
+        with:
+          name: arm64-ferossh-exe
+          path: dist/ferossh-arm64.exe
+      - uses: actions/upload-artifact@v4
+        with:
+          name: arm64-ferossh-vnc-viewer-exe
+          path: dist/ferossh-vnc-arm64.exe
+      - uses: actions/upload-artifact@v4
+        with:
+          name: arm64-ferossh-desktop-viewer-exe
+          path: dist/ferossh-desktop-arm64.exe
+
   # Rebuilds the exes on a fresh runner, in another folder and with another
-  # CARGO_HOME, and fails unless the bytes match the Windows job's exes.
+  # CARGO_HOME, and fails unless the bytes match the Windows jobs' exes:
+  # x64 on an x64 runner, ARM64 on an ARM64 runner.
   reproducible:
-    name: Reproducible build (Windows)
-    needs: windows
-    # Not a required check, and it waits for the Windows job and then
+    name: ${{ matrix.name }}
+    needs: [windows, windows-arm64]
+    # Not a required check, and it waits for the Windows jobs and then
     # builds all three exes again from nothing (~9 minutes), so pull
     # requests skip it. It runs on every push to main and before every
     # release.
     if: github.event_name != 'pull_request'
-    runs-on: windows-latest
-    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Reproducible build (Windows)
+            arch: x64
+            runner: windows-latest
+            artifacts: ferossh-*exe
+          - name: Reproducible build (Windows ARM64)
+            arch: arm64
+            runner: windows-11-arm
+            artifacts: arm64-ferossh-*exe
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 40
     steps:
       - uses: actions/checkout@v4
         with:
           path: elsewhere/ferossh
+      - if: matrix.arch == 'arm64'
+        uses: ./elsewhere/ferossh/.github/actions/windows-arm64
       - uses: actions/download-artifact@v4
         with:
-          pattern: ferossh-*exe
+          pattern: ${{ matrix.artifacts }}
           path: first
           merge-multiple: true
       - name: Rebuild
@@ -185,7 +282,7 @@ jobs:
         working-directory: elsewhere/ferossh
         run: |
           rustup show active-toolchain
-          pwsh scripts/build-release.ps1
+          pwsh scripts/build-release.ps1 -Arch ${{ matrix.arch }}
       - name: Compare with the Windows job's exes
         shell: pwsh
         run: |
