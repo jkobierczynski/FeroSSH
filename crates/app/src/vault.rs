@@ -208,6 +208,16 @@ impl Vault {
     /// master password was changed elsewhere), so nothing overwrites it.
     fn refresh(&mut self) -> Result<(), String> {
         let now = stamp(&self.path);
+        if now.is_none() && self.seen.is_some() {
+            // Moved or deleted since (another FeroSSH window's Move the
+            // vault file, say): a save would make a stray copy that nothing
+            // reads, so nothing is saved.
+            return Err(format!(
+                "The vault {} is no longer there (moved or deleted, perhaps in another FeroSSH \
+                 window); nothing was saved. Restart FeroSSH to open it where it is now.",
+                self.path.display()
+            ));
+        }
         if now.is_none() || now == self.seen {
             return Ok(());
         }
@@ -624,6 +634,24 @@ mod tests {
         assert_eq!(read("sessions.conf"), None);
         assert!(secret("FeroSSH:me@b:22").is_none());
         assert!(secret("FeroSSH:me@a:22").is_some());
+        lock();
+    }
+
+    #[test]
+    fn a_vault_moved_by_another_window_is_not_written_again() {
+        let _g = SERIAL
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let d = dir("moved-away");
+        let path = d.join(FILE_NAME);
+        create(&path, "master pass", Bundle::default()).unwrap();
+        // Another window moves it.
+        let there = d.join("elsewhere.fsv");
+        std::fs::rename(&path, &there).unwrap();
+        assert!(write("sessions.conf", "Host c\n").is_err());
+        assert!(set_secret("FeroSSH:me@c:22", "me", "pw").is_err());
+        assert!(!path.exists(), "no stray copy at the old place");
+        assert!(read("sessions.conf").is_none());
         lock();
     }
 
