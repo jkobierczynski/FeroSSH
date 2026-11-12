@@ -796,7 +796,7 @@ pub(super) fn use_file(hwnd: HWND) {
     if let Some(t) = vault::read("ferossh.conf") {
         note_settings(&t);
     }
-    with_window(|w| {
+    let saved = with_window(|w| {
         if let Some(s) = &shared {
             // A profile in both takes the vault's.
             let mut merged = w.settings.clone();
@@ -804,8 +804,12 @@ pub(super) fn use_file(hwnd: HWND) {
             w.settings.profiles = merged.profiles;
             w.settings.favourites = merged.favourites;
         }
-        w.save_settings();
-    });
+        w.try_save_settings()
+    })
+    .unwrap_or_else(|| Err("Could not save the settings.".to_owned()));
+    if let Err(e) = saved {
+        problems.push(e);
+    }
     if answer.option {
         for s in &os_secrets {
             if vault::secret(&s.target).is_none() {
@@ -893,7 +897,11 @@ pub(super) fn remove(hwnd: HWND) {
         }
     }
     // The window's settings are written out as they are now.
-    with_window(|w| w.save_settings());
+    let saved = with_window(|w| w.try_save_settings())
+        .unwrap_or_else(|| Err("Could not save the settings.".to_owned()));
+    if let Err(e) = saved {
+        problems.push(e);
+    }
     after_change();
     if problems.is_empty()
         && let Err(e) = set_pointer(&default_vault_path())
@@ -907,8 +915,9 @@ pub(super) fn remove(hwnd: HWND) {
             && let Err(e) = std::fs::remove_file(&file)
         {
             format!(
-                "The master password is removed, but the old vault file {} could not be \
-                 deleted: {e}",
+                "The master password could not be fully removed: the old vault file {} could \
+                 not be deleted ({e}). Delete it to finish; until then FeroSSH asks for the \
+                 master password at each start.",
                 file.display()
             )
         } else {

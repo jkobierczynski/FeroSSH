@@ -12076,23 +12076,32 @@ impl Window {
         }
     }
 
+    /// Writes the settings; a failure is shown in the focused pane.
     fn save_settings(&mut self) {
+        let _ = self.try_save_settings();
+    }
+
+    /// [`Self::save_settings`], with the failure also returned, for callers
+    /// that must not go on without the settings saved.
+    fn try_save_settings(&mut self) -> std::result::Result<(), String> {
         vault_ui::sync_settings(&mut self.settings);
         let text = self.settings.to_text();
         let written = write_app_file(&settings_path(), &text);
-        if written.is_ok() {
-            vault_ui::note_settings(&text);
-        }
-        if let Err(e) = written {
-            let id = self.focused_id();
-            self.show(
-                id,
-                &format!(
-                    "\r\n\x1b[0;31mCould not save settings to {}: {e}\x1b[0m\r\n",
+        match written {
+            Ok(()) => {
+                vault_ui::note_settings(&text);
+                Ok(())
+            }
+            Err(e) => {
+                let e = format!(
+                    "Could not save settings to {}: {e}",
                     settings_path().display()
-                ),
-            );
-            self.refresh(id);
+                );
+                let id = self.focused_id();
+                self.show(id, &format!("\r\n\x1b[0;31m{e}\x1b[0m\r\n"));
+                self.refresh(id);
+                Err(e)
+            }
         }
     }
 
