@@ -679,21 +679,25 @@ pub(super) fn move_file(hwnd: HWND) {
         );
         return;
     }
-    let done = vault::move_to(&to).and_then(|()| {
-        set_pointer(&to).map_err(|e| {
-            // Without the pointer the next start would not find the vault:
-            // put it back where FeroSSH looks.
-            let why = format!("where it is could not be remembered ({e})");
-            match vault::move_to(&now) {
-                Ok(()) => why,
-                Err(back) => format!(
-                    "{why}, and it could not be moved back ({back}). It is now {}: \
-                     after a restart, pick Master password > Use a vault file and choose it.",
-                    to.display()
-                ),
-            }
-        })
-    });
+    let done = vault::move_to(&to)
+        .map_err(|e| format!("The vault was not moved: {e}"))
+        .and_then(|()| {
+            set_pointer(&to).map_err(|e| {
+                // Without the pointer the next start would not find the
+                // vault: put it back where FeroSSH looks.
+                match vault::move_to(&now) {
+                    Ok(()) => format!(
+                        "The vault was not moved: where it is could not be remembered ({e})."
+                    ),
+                    Err(back) => format!(
+                        "The vault was moved to {}, but where it is could not be remembered \
+                         ({e}) and it could not be moved back ({back}). After a restart, pick \
+                         Master password > Use a vault file and choose it.",
+                        to.display()
+                    ),
+                }
+            })
+        });
     match done {
         Ok(()) => {
             dialog(
@@ -707,11 +711,7 @@ pub(super) fn move_file(hwnd: HWND) {
             );
         }
         Err(e) => {
-            dialog(
-                hwnd,
-                &format!("The vault was not moved: {e}"),
-                MB_OK | MB_ICONERROR,
-            );
+            dialog(hwnd, &e, MB_OK | MB_ICONERROR);
         }
     }
 }
