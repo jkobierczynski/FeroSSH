@@ -32,7 +32,10 @@
 //! the connect `prompt`. A pane's `Directory` is where its shell starts,
 //! `Name` the session's name, `Theme`, `Font` and `FontSize` its look
 //! where it differs from its host's, and `Focus` marks the tab's focused
-//! pane. `Active` is the tab shown first, counted from 1.
+//! pane. `Tmux NAME` marks a pane as a window of tmux session `NAME` on
+//! its connection: the session's panes open as that session, attached
+//! again or, when it is gone, made again with these panes. `Active` is
+//! the tab shown first, counted from 1.
 //!
 //! Unknown keywords are skipped, so a newer FeroSSH's workspace still
 //! opens here.
@@ -83,6 +86,8 @@ pub struct PaneSpec {
     pub font: Option<String>,
     /// A font size in points other than its host's.
     pub font_size: Option<f32>,
+    /// The tmux session on its connection that the pane is a window of.
+    pub tmux: Option<String>,
 }
 
 impl PaneSpec {
@@ -94,6 +99,7 @@ impl PaneSpec {
             theme: None,
             font: None,
             font_size: None,
+            tmux: None,
         }
     }
 }
@@ -232,6 +238,7 @@ fn write_layout(out: &mut String, l: &Layout, level: usize, focus: usize, index:
                 ("Name", p.name.as_deref()),
                 ("Theme", p.theme.as_deref()),
                 ("Font", p.font.as_deref()),
+                ("Tmux", p.tmux.as_deref()),
             ];
             for (key, value) in fields {
                 if let Some(v) = value.and_then(clean) {
@@ -333,7 +340,7 @@ pub fn parse(text: &str) -> Result<Workspace, String> {
                 };
                 tab.push(Item::Pane(PaneSpec::new(open), false));
             }
-            "directory" | "name" | "theme" | "font" | "fontsize" | "focus" => {
+            "directory" | "name" | "theme" | "font" | "fontsize" | "focus" | "tmux" => {
                 let Some(Item::Pane(p, focus)) = tabs.last_mut().and_then(|t| t.last_mut()) else {
                     return Err(format!("Line {at}: {key} belongs right after a Pane."));
                 };
@@ -355,6 +362,7 @@ pub fn parse(text: &str) -> Result<Workspace, String> {
                             "directory" => p.dir = Some(v),
                             "name" => p.name = Some(v),
                             "theme" => p.theme = Some(v),
+                            "tmux" => p.tmux = Some(v),
                             _ => p.font = Some(v),
                         }
                     }
@@ -558,6 +566,7 @@ mod tests {
         logs.theme = Some("Dracula".into());
         logs.font = Some("Cascadia Mono".into());
         logs.font_size = Some(11.5);
+        logs.tmux = Some("main".into());
         Workspace {
             tabs: vec![
                 TabSpec {

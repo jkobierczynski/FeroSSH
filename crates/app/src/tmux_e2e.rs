@@ -563,3 +563,124 @@ fn real_tmux_new_tab_follows_the_pane_not_the_start_directory() {
     });
     let _ = tmux_cmd(&server, &["run-shell", &format!("rmdir '{dir}'")]);
 }
+
+#[test]
+fn real_tmux_workspace_makes_a_gone_session_again() {
+    use ferossh_config::workspace::{Layout, Open, PaneSpec, TabSpec};
+
+    use crate::workspaces::{TmuxPlan, tmux_rebuild};
+
+    // The rebuild runs a local `sh`; the containers are covered by the
+    // attach tests.
+    let container = std::env::var_os("FEROSSH_TMUX_CONTAINER").is_some_and(|v| !v.is_empty());
+    if container || !tmux_available() || version() < WINDOW_SIZES_VERSION {
+        return;
+    }
+    let id = std::process::id();
+    let server = Server {
+        socket: format!("ferossh-e2e-ws-{id}"),
+    };
+    let base = std::env::temp_dir().join(format!("ferossh ws {id}"));
+    let (left, right) = (base.join("it's left"), base.join("right #1"));
+    std::fs::create_dir_all(&left).unwrap();
+    std::fs::create_dir_all(&right).unwrap();
+    // `tmux` on the PATH is this test's server.
+    let real = Command::new("sh")
+        .args(["-c", "command -v tmux"])
+        .output()
+        .unwrap();
+    let real = String::from_utf8_lossy(&real.stdout).trim().to_owned();
+    let shim = base.join("bin");
+    std::fs::create_dir_all(&shim).unwrap();
+    std::fs::write(
+        shim.join("tmux"),
+        format!(
+            "#!/bin/sh\nexec '{real}' -L '{}' -f /dev/null \"$@\"\n",
+            server.socket
+        ),
+    )
+    .unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(shim.join("tmux"), std::fs::Permissions::from_mode(0o755))
+            .unwrap();
+    }
+    let pane = |dir: Option<&std::path::Path>, name: Option<&str>| {
+        let mut p = PaneSpec::new(Open::Connection("web1".into()));
+        p.tmux = Some("e2e".into());
+        p.dir = dir.map(|d| d.to_string_lossy().into_owned());
+        p.name = name.map(Into::into);
+        Layout::Pane(p)
+    };
+    let plan = TmuxPlan {
+        destination: "web1".into(),
+        session: "e2e".into(),
+        tabs: vec![TabSpec {
+            root: Layout::Split {
+                down: false,
+                ratio: 0.3,
+                first: Box::new(pane(Some(&left), Some("logs"))),
+                second: Box::new(Layout::Split {
+                    down: true,
+                    ratio: 0.5,
+                    first: Box::new(pane(Some(&right), None)),
+                    second: Box::new(pane(None, None)),
+                }),
+            },
+            focus: 1,
+        }],
+        active: 0,
+    };
+    let line = tmux_rebuild(&plan).unwrap();
+    let path = format!(
+        "{}:{}",
+        shim.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    let run = || {
+        let status = Command::new("sh")
+            .args(["-c", &format!("{line}true")])
+            .env("PATH", &path)
+            .env("SHELL", "/bin/sh")
+            .env("PS1", "$ ")
+            .status()
+            .unwrap();
+        assert!(status.success());
+    };
+    run();
+    assert_eq!(
+        tmux_cmd(&server, &["list-windows", "-t", "e2e"])
+            .lines()
+            .count(),
+        3
+    );
+    // The session is there now: nothing more is made.
+    run();
+    assert_eq!(
+        tmux_cmd(&server, &["list-windows", "-t", "e2e"])
+            .lines()
+            .count(),
+        3
+    );
+
+    let mut a = Harness::attach(&server, Mode::Ferossh);
+    a.until("the three panes", |h| h.shown() == 3 && h.panes.len() == 3);
+    assert_eq!(a.ws.tabs.len(), 1);
+    let panes = a.ws.tabs[0].root.panes();
+    match &a.ws.tabs[0].root {
+        crate::layout::Node::Split { axis, ratio, .. } => {
+            assert_eq!(*axis, crate::layout::Axis::Row);
+            assert!((ratio - 0.3).abs() < 0.01, "{ratio}");
+        }
+        other => panic!("not a split: {other:?}"),
+    }
+    assert_eq!(a.names.get(&panes[0]).map(String::as_str), Some("logs"));
+    for (native, dir) in [(panes[0], &left), (panes[1], &right)] {
+        let actions = a.tmux.input(native, b"echo \"at:$(pwd):\"\r");
+        a.apply(actions);
+        let want = format!("at:{}:", dir.display());
+        a.until("the pane's directory", |h| h.text(native).contains(&want));
+    }
+    let _ = std::fs::remove_dir_all(&base);
+}

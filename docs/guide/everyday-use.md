@@ -29,7 +29,7 @@ A workspace is a saved set of tabs and split panes, each pane on a connection, t
 - Open one from Window > Workspaces, from the *Workspaces* folder in the connection manager (Enter or a double click; Del deletes it), from the command palette (type its name), or from the command line with `ferossh.exe --workspace NAME`. Its tabs open next to the ones you have; a window that only waits at the connect prompt makes way for them.
 - Panes on the same SSH host log in once: the first pane logs in, and the others wait for it and open on its connection.
 - A workspace names connections; it never holds an address, user, key or password. Editing a connection changes every workspace that uses it, and a workspace file is safe to copy to another PC, keep in git or back up. Logins work as they do anywhere else: keys, the agent, the connection's password source and its login script.
-- A tmux session counts as one pane: tmux brings back its own windows and panes when it attaches again. Remote desktop tabs are left out.
+- tmux panes are kept like any other, each with its split, directory, name and look, and marked with their tmux session. Opening the workspace logs in once and attaches that session: if it still runs on the server you get it as it is now, and if it is gone (after a reboot, say) FeroSSH first makes it again with the saved windows, each in its directory, laid out as saved. With Session > tmux: one window per pane turned off, tmux keeps the splits itself and a session is saved as one pane. Remote desktop tabs are left out.
 - Workspaces are files in `%APPDATA%\FeroSSH\workspaces` (Window > Workspaces > Open workspaces folder), one per workspace, in a plain text format you can also write by hand:
 
 ```text
@@ -46,7 +46,7 @@ Tab
     Pane prompt
 ```
 
-`Split right` puts its two halves side by side and `Split down` one above the other, the number being the first half's share in percent; then come the two halves. A pane opens a `connection` (any name or address the connect prompt takes), a `local` shell or the connect `prompt`, and can have a `Directory`, `Name`, `Theme`, `Font`, `FontSize` and `Focus` (the tab's focused pane). `Active` is the tab shown first. Window > Workspaces > Open workspace file... opens one from anywhere.
+`Split right` puts its two halves side by side and `Split down` one above the other, the number being the first half's share in percent; then come the two halves. A pane opens a `connection` (any name or address the connect prompt takes), a `local` shell or the connect `prompt`, and can have a `Directory`, `Name`, `Theme`, `Font`, `FontSize`, `Tmux` (the tmux session it is a window of) and `Focus` (the tab's focused pane). `Active` is the tab shown first. Window > Workspaces > Open workspace file... opens one from anywhere.
 
 ## Connecting
 
