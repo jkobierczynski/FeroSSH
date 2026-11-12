@@ -251,6 +251,8 @@ const TIMER_AGENT_ASK: usize = 10;
 const TIMER_KEYGEN: usize = 11;
 /// Plays the next part of the recordings that play in replay tabs.
 const TIMER_REPLAY: usize = 12;
+/// Asks about other tmux clients once another dialog has closed.
+const TIMER_CROWDED: usize = 13;
 /// How often a playing replay's tab updates its clock, at most.
 const REPLAY_TICK_MS: u64 = 250;
 const LAUNCH_TICK_MS: u32 = 1000;
@@ -555,6 +557,8 @@ mod cmd {
     /// Session > Logs and recordings > Record this pane (asciicast), and Play a recording.
     pub const RECORD_CAST: u32 = 641;
     pub const PLAY_CAST: u32 = 642;
+    /// Session > tmux > Detach other clients.
+    pub const TMUX_DETACH_OTHERS: u32 = 643;
     pub const TMUX_ATTACH: u32 = 610;
     pub const TMUX_DETACH: u32 = 611;
     pub const TMUX_PICK: u32 = 612;
@@ -1195,6 +1199,9 @@ struct Window {
     winrm_closing: HashMap<ChannelId, WinrmCloser>,
     /// Tools > New SSH key making the key in the background.
     keygen: Option<std::sync::mpsc::Receiver<(PathBuf, std::result::Result<String, String>)>>,
+    /// Questions about other tmux clients, while another dialog is open:
+    /// one per gateway and session, asked in order.
+    crowded_waiting: Vec<CrowdedOffer>,
     /// The pane whose host the remote app picker (the palette) runs on.
     app_pane: Option<PaneId>,
     /// Programs run as remote apps lately, latest first.
@@ -2154,6 +2161,7 @@ fn create_and_run(launch: Launch, theme: Option<String>) -> Result<()> {
                 stats: HashMap::new(),
                 winrm_closing: HashMap::new(),
                 keygen: None,
+                crowded_waiting: Vec::new(),
                 app_pane: None,
                 recent_apps: Vec::new(),
                 app_clip_limits: HashMap::new(),
@@ -2425,6 +2433,7 @@ fn build_menu() -> Result<HMENU> {
         item(tmux, cmd::TMUX_ATTACH, "&Attach tmux")?;
         item(tmux, cmd::TMUX_PICK, "S&witch tmux session...")?;
         item(tmux, cmd::TMUX_DETACH, "&Detach tmux")?;
+        item(tmux, cmd::TMUX_DETACH_OTHERS, "Detach &other clients")?;
         separator(tmux)?;
         item(tmux, cmd::TMUX_LAYOUT, "One window per &pane (own fonts)")?;
         item(
@@ -3296,6 +3305,28 @@ impl Window {
                 tmux::Action::Picker(names) => {
                     self.queued.push(Command::TmuxPicker { gateway, names });
                 }
+                tmux::Action::Crowded {
+                    session,
+                    have,
+                    want,
+                    others,
+                } => {
+                    let name = self
+                        .tmux
+                        .get(&gateway)
+                        .and_then(|t| t.session_name())
+                        .unwrap_or_default()
+                        .to_owned();
+                    self.queued.push(Command::TmuxCrowded(CrowdedOffer {
+                        gateway,
+                        host: self.key_host(gateway).unwrap_or_default(),
+                        name,
+                        session,
+                        have,
+                        want,
+                        others,
+                    }));
+                }
                 tmux::Action::Notice(text) => {
                     let text = crate::ssh::sanitize(&text);
                     self.show(gateway, &format!("\x1b[0;90m{text}\x1b[0m\r\n"));
@@ -3400,6 +3431,29 @@ impl Window {
             actions.extend(t.sync_saved(&self.ws, &look_of));
             self.run_tmux(g, actions);
         }
+    }
+
+    /// Session > tmux > Detach other clients, as answered in the dialog.
+    /// Skipped when another session is attached by now.
+    /// Keeps a question about other tmux clients for when no dialog is
+    /// open, replacing an earlier one about the same gateway and session.
+    fn wait_crowded(&mut self, offer: CrowdedOffer) {
+        match self
+            .crowded_waiting
+            .iter_mut()
+            .find(|o| o.gateway == offer.gateway && o.session == offer.session)
+        {
+            Some(o) => *o = offer,
+            None => self.crowded_waiting.push(offer),
+        }
+    }
+
+    fn detach_other_tmux(&mut self, gateway: PaneId, session: ferossh_tmuxcc::SessionId) {
+        let Some(t) = self.tmux.get_mut(&gateway).filter(|t| t.active()) else {
+            return;
+        };
+        let actions = t.detach_others(Some(session));
+        self.run_tmux(gateway, actions);
     }
 
     /// SSH pane `id` lost its connection: if it ran tmux, its panes go
@@ -13777,7 +13831,7 @@ impl Window {
                     !self.settings.remote_app_share_selection;
                 self.apply_app_clipboard();
             }
-            cmd::TMUX_DETACH | cmd::TMUX_PICK | cmd::TMUX_LAYOUT => {
+            cmd::TMUX_DETACH | cmd::TMUX_DETACH_OTHERS | cmd::TMUX_PICK | cmd::TMUX_LAYOUT => {
                 let host = self.host_pane(pane);
                 let Some(t) = self.tmux.get_mut(&host).filter(|t| t.active()) else {
                     return Some(Command::Notice(
@@ -13788,6 +13842,7 @@ impl Window {
                 };
                 let actions = match id {
                     cmd::TMUX_DETACH => t.detach(),
+                    cmd::TMUX_DETACH_OTHERS => t.detach_others(None),
                     cmd::TMUX_PICK => t.pick_session(),
                     _ => {
                         let mode = match t.mode() {
@@ -15789,6 +15844,21 @@ enum BrokerFor {
     Agent(crate::agent_fwd::For),
 }
 
+/// Other tmux clients keep a gateway's windows small: the question to
+/// ask, kept while another dialog is open.
+#[derive(Debug, Clone)]
+struct CrowdedOffer {
+    gateway: PaneId,
+    /// The tmux session asked about, its name and its host, for the
+    /// question (it may be another tab's connection).
+    session: ferossh_tmuxcc::SessionId,
+    name: String,
+    host: String,
+    have: (u16, u16),
+    want: (u16, u16),
+    others: u32,
+}
+
 enum Command {
     Id(u32),
     /// Window > Workspaces > Save layout as workspace: asks for a name.
@@ -15890,6 +15960,9 @@ enum Command {
         pane: PaneId,
         channel: ChannelId,
     },
+    /// Other tmux clients keep gateway `gateway`'s windows small: offer
+    /// to detach them.
+    TmuxCrowded(CrowdedOffer),
     /// A menu of tmux sessions to switch gateway `gateway`'s client to.
     TmuxPicker {
         gateway: PaneId,
@@ -17276,6 +17349,61 @@ fn run_command(hwnd: HWND, command: Command) {
             if dialog(hwnd, &text, MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2) == Some(IDYES) {
                 let problem = recycle(hwnd, &paths).err();
                 files_panel::local_deleted(problem);
+            }
+        }
+        Command::TmuxCrowded(offer) => {
+            if DIALOG_OPEN.get() {
+                // Another dialog is open: ask once it has closed.
+                with_window(|w| w.wait_crowded(offer));
+                // SAFETY: our window; replaces any earlier timer with this id.
+                unsafe { SetTimer(Some(hwnd), TIMER_CROWDED, 500, None) };
+                return;
+            }
+            let CrowdedOffer {
+                gateway,
+                session,
+                ref name,
+                ref host,
+                have,
+                want,
+                others,
+            } = offer;
+            // Queued output can switch or end the session before this
+            // runs: ask only about the session still attached.
+            let current = with_window(|w| w.tmux.get(&gateway).and_then(|t| t.session_id()));
+            if current.flatten() != Some(session) {
+                return;
+            }
+            let clients = if others == 1 {
+                "Another tmux client is".to_owned()
+            } else {
+                format!("{others} other tmux clients are")
+            };
+            let text = format!(
+                "{clients} attached to tmux session \"{}\" on {}, and tmux makes a window only as \
+                 big as its smallest client. So it shows {}x{} instead of the {}x{} this pane \
+                 has room for, leaving part of the pane empty.\n\n\
+                 Often it is a client left behind by a dropped connection.\n\n\
+                 Detach the other clients of this session? (Later: Session > tmux > \
+                 Detach other clients.)",
+                crate::ssh::sanitize(name),
+                crate::ssh::sanitize(host),
+                have.0,
+                have.1,
+                want.0,
+                want.1
+            );
+            match dialog(hwnd, &text, MB_YESNO | MB_ICONQUESTION | MB_DEFBUTTON2) {
+                Some(IDYES) => {
+                    with_window(|w| w.detach_other_tmux(gateway, session));
+                }
+                Some(_) => {}
+                // Another dialog opened meanwhile: ask once it has closed.
+                None => {
+                    with_window(|w| w.wait_crowded(offer.clone()));
+                    // SAFETY: our window; replaces any earlier timer.
+                    unsafe { SetTimer(Some(hwnd), TIMER_CROWDED, 500, None) };
+                }
             }
         }
         Command::TmuxPicker { gateway, names } => {
@@ -18729,6 +18857,16 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
             WM_SHELL_OUTPUT => {
                 if let Some(commands) = with_window(Window::on_output) {
                     run_commands(hwnd, commands);
+                }
+                LRESULT(0)
+            }
+            WM_TIMER if wparam.0 == TIMER_CROWDED => {
+                let _ = KillTimer(Some(hwnd), TIMER_CROWDED);
+                // Each question is modal, so they come one after another;
+                // one that meets another open dialog waits again.
+                let waiting = with_window(|w| std::mem::take(&mut w.crowded_waiting));
+                for offer in waiting.into_iter().flatten() {
+                    run_command(hwnd, Command::TmuxCrowded(offer));
                 }
                 LRESULT(0)
             }

@@ -133,6 +133,7 @@ Font, theme and text size apply to the focused pane only. Session > Save font an
 | tmux > Attach tmux | Types `tmux -CC new-session -A -s main` in the pane and turns tmux windows and panes into native tabs and panes (see [tmux](everyday-use.md#tmux)). |
 | tmux > Switch tmux session... | Lists the other tmux sessions on the server and switches to one. |
 | tmux > Detach tmux | Leaves tmux, and everything running in it, on the server. Attach again later from this PC or another. |
+| tmux > Detach other clients | Detaches the other clients of this tmux session, such as one left behind by a dropped connection; clients of other sessions stay. tmux makes a window only as big as its smallest client, so another client can leave part of the pane empty; FeroSSH offers this itself when it sees that. |
 | tmux > One window per pane (own fonts) | ✓ on: each native pane is its own tmux window, so each can have its own font. Off: tmux's own splits are the panes. |
 | tmux > Use tmux keybindings for tabs and panes | ✓ on: in a pane of a tmux session, your tmux prefix then `c`, `%`, `"`, `n`, `p`, an arrow and the other window and pane keys work the tabs and panes; the prefix then `?` lists them (see [tmux](everyday-use.md#tmux)). Off by default. |
 | Remote desktop > Open remote desktop | Ctrl+Shift+D. Tunnels the host's RDP port through SSH and opens Windows' Remote Desktop Connection on it (see [Remote desktops](everyday-use.md#remote-desktops)). |

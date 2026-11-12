@@ -38,6 +38,9 @@ impl Drop for Server {
     }
 }
 
+/// An offer to detach other clients: (have, want, others).
+type Crowded = ((u16, u16), (u16, u16), u32);
+
 /// A control client and what the window would hold.
 struct Harness {
     child: Child,
@@ -52,6 +55,8 @@ struct Harness {
     names: BTreeMap<Native, String>,
     pickers: Vec<Vec<String>>,
     notices: Vec<String>,
+    /// Offers to detach other clients: (have, want, others).
+    crowded: Vec<Crowded>,
 }
 
 impl Drop for Harness {
@@ -132,6 +137,7 @@ impl Harness {
             names: BTreeMap::new(),
             pickers: Vec::new(),
             notices: Vec::new(),
+            crowded: Vec::new(),
         };
         // What `tmux -CC` writes before its first line.
         let actions = h.tmux.feed(&mut h.ws, b"\x1bP1000p");
@@ -173,6 +179,11 @@ impl Harness {
                 Action::ShowGateway => self.gateway_shown = true,
                 Action::Picker(names) => self.pickers.push(names),
                 Action::Notice(text) => self.notices.push(text),
+                Action::Crowded {
+                    have, want, others, ..
+                } => {
+                    self.crowded.push((have, want, others));
+                }
                 _ => {}
             }
         }
@@ -496,6 +507,52 @@ fn too_old_tmux_is_refused() {
         tmux_cmd(&server, &["list-clients", "-F", "#{client_name}"]).is_empty()
     });
     assert!(tmux_cmd(&server, &["list-sessions", "-F", "#{session_name}"]).contains("e2e"));
+}
+
+#[test]
+fn real_tmux_other_client_keeping_the_window_small_is_detached() {
+    if !tmux_available() || version() < WINDOW_SIZES_VERSION {
+        return;
+    }
+    let server = Server {
+        socket: format!("ferossh-e2e-crowd-{}", std::process::id()),
+    };
+    // A client left behind (another PC, or a dropped connection) asked
+    // for a small window.
+    let mut old = Harness::attach(&server, Mode::Ferossh);
+    old.until("the old client's pane", |h| !h.panes.is_empty());
+    old.sizes(|_| (60, 20));
+    old.until("the small size", |h| {
+        h.panes.values().any(|p| p.0 == (60, 20)) && h.crowded.is_empty()
+    });
+
+    // A client of another session, which must stay.
+    let _ = tmux_cmd(&server, &["new-session", "-d", "-s", "other"]);
+    let mut bystander = tmux()
+        .args(["-L", &server.socket, "-C", "attach", "-t", "other"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+
+    let mut b = Harness::attach(&server, Mode::Ferossh);
+    b.until("the pane", |h| !h.panes.is_empty());
+    b.sizes(|_| (100, 30));
+    // tmux keeps the window at the smallest client's size; FeroSSH asks.
+    b.until("the offer to detach", |h| !h.crowded.is_empty());
+    assert_eq!(b.crowded, [((60, 20), (100, 30), 1)]);
+    let actions = b.tmux.detach_others(None);
+    b.apply(actions);
+    b.until("the full size", |h| {
+        h.panes.values().all(|p| p.0 == (100, 30))
+    });
+    let clients = tmux_cmd(&server, &["list-clients", "-F", "#{session_name}"]);
+    let mut clients: Vec<&str> = clients.lines().collect();
+    clients.sort_unstable();
+    assert_eq!(clients, ["e2e", "other"]);
+    let _ = bystander.kill();
+    let _ = bystander.wait();
 }
 
 #[test]
