@@ -48,49 +48,84 @@ fn with<T>(f: impl FnOnce(&mut Option<Vault>) -> T) -> T {
     // Other FeroSSH processes on this PC wait too, so a read, change and
     // write of the vault never interleaves with theirs. (Other PCs, via a
     // sync client, cannot be locked out: there the last save wins.)
-    let lock = ProcessLock::take();
+    let path = guard.as_ref().map(|v| v.path.clone());
+    let _lock = path.map(|p| hold(&p));
+    f(&mut guard)
+}
+
+/// Takes the lock of the vault at `path` for the rest of the caller's
+/// [`with`], and records whether it was had.
+fn hold(path: &Path) -> Option<ProcessLock> {
+    let lock = ProcessLock::take(path, 500);
     LOCKED.store(
         lock.is_some() || cfg!(not(windows)),
         std::sync::atomic::Ordering::Relaxed,
     );
-    f(&mut guard)
+    lock
 }
 
-/// Whether the [`with`] running now holds `vault.lock`: a vault is only
-/// written while it does, so two FeroSSH processes never interleave.
+/// Whether the [`with`] running now holds the vault's lock: a vault is
+/// only written while it does, so two FeroSSH processes never interleave.
 static LOCKED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
-/// An exclusive open of `vault.lock` in FeroSSH's local folder, which
-/// every FeroSSH process takes the same way; released when dropped. None
-/// when it cannot be had within five seconds: reads go on, but nothing is
-/// written (see [`Vault::save`]) rather than hang.
+/// An exclusive open of a lock file named after the vault file, in the
+/// Windows temporary folder: every FeroSSH on this PC that uses this vault
+/// takes the same one, portable or not. Released, and the file deleted,
+/// when dropped. None when it cannot be had in `tries` tries 10 ms apart:
+/// reads go on, but nothing is written (see [`Vault::save`]) rather than
+/// hang.
 struct ProcessLock(#[allow(dead_code)] std::fs::File);
 
 impl ProcessLock {
+    /// The lock file of the vault at `vault`: the same for every spelling
+    /// of its path that Windows resolves to the same file.
+    #[cfg(any(windows, test))]
+    fn path(vault: &Path) -> PathBuf {
+        let full = std::fs::canonicalize(vault).unwrap_or_else(|_| {
+            // A vault not made yet: its folder resolved, its name as is.
+            match (vault.parent(), vault.file_name()) {
+                (Some(dir), Some(name)) => std::fs::canonicalize(dir)
+                    .map_or_else(|_| vault.to_path_buf(), |d| d.join(name)),
+                _ => vault.to_path_buf(),
+            }
+        });
+        // FNV-1a over the path, case folded as Windows compares names.
+        let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+        for b in full.to_string_lossy().to_lowercase().bytes() {
+            h ^= u64::from(b);
+            h = h.wrapping_mul(0x0100_0000_01b3);
+        }
+        std::env::temp_dir().join(format!("ferossh-vault-{h:016x}.lock"))
+    }
+
     #[cfg(windows)]
-    fn take() -> Option<Self> {
+    fn take(vault: &Path, tries: u32) -> Option<Self> {
         use std::os::windows::fs::OpenOptionsExt;
-        let dir = crate::portable::local_dir()?;
-        std::fs::create_dir_all(&dir).ok()?;
-        let path = dir.join("vault.lock");
-        for _ in 0..500 {
+        const GENERIC_READ: u32 = 0x8000_0000;
+        const GENERIC_WRITE: u32 = 0x4000_0000;
+        const DELETE: u32 = 0x0001_0000;
+        const FILE_FLAG_DELETE_ON_CLOSE: u32 = 0x0400_0000;
+        let path = Self::path(vault);
+        for i in 0..tries {
             if let Ok(f) = std::fs::OpenOptions::new()
-                .read(true)
-                .write(true)
+                .access_mode(GENERIC_READ | GENERIC_WRITE | DELETE)
                 .create(true)
                 .truncate(false)
                 .share_mode(0)
+                .custom_flags(FILE_FLAG_DELETE_ON_CLOSE)
                 .open(&path)
             {
                 return Some(Self(f));
             }
-            std::thread::sleep(std::time::Duration::from_millis(10));
+            if i + 1 < tries {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
         }
         None
     }
 
     #[cfg(not(windows))]
-    fn take() -> Option<Self> {
+    fn take(_vault: &Path, _tries: u32) -> Option<Self> {
         None
     }
 }
@@ -142,7 +177,19 @@ fn write_file(path: &Path, text: &str) -> std::io::Result<()> {
     written
 }
 
+#[cfg(test)]
+static FAIL_SAVES: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 impl Vault {
+    /// Refreshes, applies `f` and saves; the change is undone in memory
+    /// too when the save fails, so nothing unsaved is read or saved later.
+    fn change(&mut self, f: impl FnOnce(&mut Bundle)) -> Result<(), String> {
+        self.refresh()?;
+        let before = self.bundle.clone();
+        f(&mut self.bundle);
+        self.save().inspect_err(|_| self.bundle = before)
+    }
+
     /// Takes in what another PC wrote since we last looked. An error
     /// when the file is there but this key no longer opens it (the
     /// master password was changed elsewhere), so nothing overwrites it.
@@ -172,6 +219,10 @@ impl Vault {
     }
 
     fn save(&mut self) -> Result<(), String> {
+        #[cfg(test)]
+        if FAIL_SAVES.load(std::sync::atomic::Ordering::Relaxed) {
+            return Err("save failed (test)".to_owned());
+        }
         if !LOCKED.load(std::sync::atomic::Ordering::Relaxed) {
             return Err(format!(
                 "The vault {} is busy in another FeroSSH window; nothing was saved. \
@@ -256,6 +307,7 @@ pub fn create(path: &Path, passphrase: &str, bundle: Bundle) -> Result<(), Strin
         seen: None,
     };
     with(|v| {
+        let _lock = hold(path);
         vault.save()?;
         *v = Some(vault);
         Ok(())
@@ -349,9 +401,7 @@ pub fn read(name: &str) -> Option<String> {
 pub fn write(name: &str, text: &str) -> Result<(), String> {
     with(|v| {
         let v = v.as_mut().ok_or("No vault is open.")?;
-        v.refresh()?;
-        v.bundle.set_file(name, text.to_owned());
-        v.save()
+        v.change(|b| b.set_file(name, text.to_owned()))
     })
 }
 
@@ -377,13 +427,13 @@ pub fn secrets() -> Vec<Secret> {
 pub fn set_secret(target: &str, user: &str, password: &str) -> Result<(), String> {
     with(|v| {
         let v = v.as_mut().ok_or("No vault is open.")?;
-        v.refresh()?;
-        v.bundle.set_secret(Secret {
-            target: target.to_owned(),
-            user: user.to_owned(),
-            password: Zeroizing::new(password.to_owned()),
-        });
-        v.save()
+        v.change(|b| {
+            b.set_secret(Secret {
+                target: target.to_owned(),
+                user: user.to_owned(),
+                password: Zeroizing::new(password.to_owned()),
+            });
+        })
     })
 }
 
@@ -393,8 +443,8 @@ pub fn delete_secret(target: &str) {
             && v.refresh().is_ok()
             && v.bundle.secret(target).is_some()
         {
-            v.bundle.remove_secret(target);
-            let _ = v.save();
+            // Kept, in memory too, when it cannot be saved.
+            let _ = v.change(|b| b.remove_secret(target));
         }
     });
 }
@@ -517,6 +567,60 @@ mod tests {
         assert!(unlock(&path, "other pass").is_ok());
         lock();
         let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn a_failed_save_leaves_nothing_behind_in_memory() {
+        let _g = SERIAL
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let d = dir("rollback");
+        let path = d.join(FILE_NAME);
+        create(&path, "master pass", Bundle::default()).unwrap();
+        set_secret("FeroSSH:me@a:22", "me", "kept").unwrap();
+        FAIL_SAVES.store(true, std::sync::atomic::Ordering::Relaxed);
+        let wrote = write("sessions.conf", "Host b\n");
+        let set = set_secret("FeroSSH:me@b:22", "me", "lost");
+        delete_secret("FeroSSH:me@a:22");
+        FAIL_SAVES.store(false, std::sync::atomic::Ordering::Relaxed);
+        assert!(wrote.is_err() && set.is_err());
+        assert_eq!(read("sessions.conf"), None);
+        assert!(secret("FeroSSH:me@b:22").is_none());
+        assert!(secret("FeroSSH:me@a:22").is_some());
+        // A later save writes none of them either.
+        write("ferossh.conf", "x\n").unwrap();
+        lock();
+        unlock(&path, "master pass").unwrap();
+        assert_eq!(read("sessions.conf"), None);
+        assert!(secret("FeroSSH:me@b:22").is_none());
+        assert!(secret("FeroSSH:me@a:22").is_some());
+        lock();
+    }
+
+    #[test]
+    fn every_spelling_of_a_vault_shares_one_lock() {
+        let d = dir("lockpath");
+        let path = d.join(FILE_NAME);
+        std::fs::write(&path, "x").unwrap();
+        let other = d.join(".").join(FILE_NAME);
+        assert_eq!(ProcessLock::path(&path), ProcessLock::path(&other));
+        // Portable or not, the lock is in the temporary folder.
+        assert!(ProcessLock::path(&path).starts_with(std::env::temp_dir()));
+        assert_ne!(
+            ProcessLock::path(&path),
+            ProcessLock::path(&d.join("other.fsv"))
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn the_lock_is_exclusive_and_released_on_drop() {
+        let d = dir("lockheld");
+        let path = d.join(FILE_NAME);
+        let held = ProcessLock::take(&path, 1).unwrap();
+        assert!(ProcessLock::take(&path, 1).is_none());
+        drop(held);
+        assert!(ProcessLock::take(&path, 50).is_some());
     }
 
     #[test]
