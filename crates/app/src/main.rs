@@ -55,6 +55,8 @@ mod live_panel;
 #[cfg(windows)]
 mod native;
 #[cfg(windows)]
+mod palette_panel;
+#[cfg(windows)]
 mod passphrase_view;
 #[cfg(windows)]
 mod script_args;

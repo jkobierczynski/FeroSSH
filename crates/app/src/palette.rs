@@ -54,6 +54,9 @@ pub struct Entry {
     pub hint: String,
     /// More words the search finds it by (the menu it is in).
     pub extra: String,
+    /// Where it comes from, for the native list's last column: the menu
+    /// it is in ("Window"), or "Connection", "Script", "Workspace".
+    pub group: String,
     /// A menu item with a check mark.
     pub on: bool,
     pub kind: Kind,
@@ -73,11 +76,13 @@ impl Entry {
             None => text,
         };
         let extra = path.iter().map(|p| plain(p)).collect::<Vec<_>>().join(" ");
+        let group = path.first().map(|p| plain(p)).unwrap_or_default();
         Self {
             prefix: "",
             label,
             hint: shortcut.trim().to_owned(),
             extra,
+            group,
             on,
             kind: Kind::Action(id),
         }
@@ -106,6 +111,7 @@ impl Entry {
             label: name.to_owned(),
             hint: detail.to_owned(),
             extra: format!("{prefix} connection {tag}"),
+            group: "Connection".into(),
             on: false,
             kind: Kind::Session(name.to_owned()),
         }
@@ -118,6 +124,7 @@ impl Entry {
             label: name.to_owned(),
             hint: first.to_owned(),
             extra: format!("send script {}", lines.join(" ")),
+            group: "Script".into(),
             on: false,
             kind: Kind::Snippet(index),
         }
@@ -130,6 +137,7 @@ impl Entry {
             label: program.to_owned(),
             hint: hint.to_owned(),
             extra: "remote app".into(),
+            group: "Remote app".into(),
             on: false,
             kind: Kind::RemoteApp(program.to_owned()),
         }
@@ -142,6 +150,7 @@ impl Entry {
             label: name.to_owned(),
             hint: "workspace".into(),
             extra: "workspace layout tabs panes".into(),
+            group: "Workspace".into(),
             on: false,
             kind: Kind::Workspace(name.to_owned()),
         }
@@ -262,8 +271,38 @@ pub enum PalAction {
     Leave,
 }
 
+/// One row of the native palette's list.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NativeRow {
+    /// The prefix, the label and a check mark: "Connect core-sw1",
+    /// "Copy on select ✓".
+    pub name: String,
+    /// The shortcut, the session's `user@host` or the script's first line.
+    pub hint: String,
+    /// Where it comes from: the menu, or "Connection", "Script"...
+    pub group: String,
+}
+
+/// What the native palette shows.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NativePalette {
+    /// Counts the times the palette opened: a new one starts with an
+    /// empty search box and the first row selected.
+    pub serial: u64,
+    /// Picking a program to run as a remote app, not the plain palette.
+    pub apps: bool,
+    /// The search as the palette has it.
+    pub filter: String,
+    /// The entries the search keeps, best first.
+    pub rows: Vec<NativeRow>,
+    /// All entries, for the "12 of 230" count.
+    pub total: usize,
+}
+
 #[derive(Debug, Default)]
 pub struct CommandPalette {
+    /// Counts the opens ([`NativePalette::serial`]).
+    serial: u64,
     entries: Vec<Entry>,
     filter: String,
     /// The entries the filter keeps, best first.
@@ -286,6 +325,7 @@ impl CommandPalette {
 
     /// Starts afresh on `entries` with an empty search.
     pub fn open(&mut self, entries: Vec<Entry>) {
+        self.serial += 1;
         self.entries = entries;
         self.apps = false;
         self.typed = false;
@@ -301,6 +341,60 @@ impl CommandPalette {
         self.open(entries);
         self.apps = true;
         self.update();
+    }
+
+    /// The search typed in the native palette's box.
+    pub fn set_filter(&mut self, text: &str) {
+        let text: String = text.chars().take(MAX_FILTER).collect();
+        if text == self.filter {
+            return;
+        }
+        self.filter = text;
+        self.selected = 0;
+        self.scroll = 0;
+        self.update();
+    }
+
+    /// What the native palette shows.
+    pub fn native(&self) -> NativePalette {
+        let rows = self
+            .shown
+            .iter()
+            .filter_map(|&i| self.entries.get(i))
+            .map(|e| {
+                let mut name = String::new();
+                if !e.prefix.is_empty() {
+                    name.push_str(e.prefix);
+                    name.push(' ');
+                }
+                name.push_str(&e.label);
+                if e.on {
+                    name.push_str(" \u{2713}");
+                }
+                NativeRow {
+                    name,
+                    hint: e.hint.clone(),
+                    group: e.group.clone(),
+                }
+            })
+            .collect();
+        NativePalette {
+            serial: self.serial,
+            apps: self.apps,
+            filter: self.filter.clone(),
+            rows,
+            total: self.entries.len() - usize::from(self.typed),
+        }
+    }
+
+    /// Runs the native list's row `row` (a place among the rows shown);
+    /// `split` as Shift+Enter.
+    pub fn run_row(&mut self, row: usize, split: bool) -> Option<PalAction> {
+        if row >= self.shown.len() {
+            return None;
+        }
+        self.selected = row;
+        self.pick(split)
     }
 
     /// Works out which entries show, and in what order.
@@ -631,6 +725,41 @@ mod tests {
                     .to_owned()
             })
             .collect()
+    }
+
+    #[test]
+    fn native_rows_follow_the_search_and_run_by_row() {
+        let mut p = CommandPalette::default();
+        p.open(entries());
+        let first = p.native();
+        assert_eq!(first.rows.len(), first.total);
+        assert_eq!(first.rows[0].name, "New tab");
+        assert_eq!(first.rows[0].hint, "Ctrl+Shift+T");
+        assert_eq!(first.rows[0].group, "Window");
+        assert!(
+            first
+                .rows
+                .iter()
+                .any(|r| r.name == "Copy on select \u{2713}" && r.group == "Edit")
+        );
+        assert!(
+            first
+                .rows
+                .iter()
+                .any(|r| r.name == "Connect core-sw1" && r.group == "Connection")
+        );
+        p.set_filter("splr");
+        let view = p.native();
+        assert_eq!(view.filter, "splr");
+        assert_eq!(view.rows[0].name, "Split right");
+        assert!(view.rows.len() < view.total);
+        assert_eq!(p.run_row(0, false), Some(PalAction::Run(700)));
+        assert_eq!(p.run_row(99, false), None);
+        // Opening again starts a new palette: the box empties.
+        p.open(entries());
+        let again = p.native();
+        assert!(again.serial > view.serial);
+        assert!(again.filter.is_empty());
     }
 
     #[test]

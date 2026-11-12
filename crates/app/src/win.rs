@@ -137,6 +137,7 @@ use crate::live_panel;
 use crate::login_script::{self, Need, Outcome, Runner};
 use crate::look;
 use crate::palette::{self, CommandPalette, PalAction};
+use crate::palette_panel;
 use crate::pattern;
 use crate::proxycmd::ProxyRun;
 use crate::pwcommand;
@@ -1992,6 +1993,8 @@ fn create_and_run(launch: Launch, theme: Option<String>) -> Result<()> {
         let _ = import_panel::create(hwnd, import_event, dpi);
         // The file transfer pane's, likewise.
         let _ = files_panel::create(hwnd, files_event, dpi);
+        // The command palette's, likewise.
+        let _ = palette_panel::create(hwnd, palette_event, dpi);
         // The port forwards pane's, likewise.
         let _ = fwd_panel::create(hwnd, fwd_event, dpi);
         // The scripts pane's, likewise.
@@ -2074,6 +2077,7 @@ fn create_and_run(launch: Launch, theme: Option<String>) -> Result<()> {
                 || live_panel::pre_translate(&msg)
                 || form_view::pre_translate(&msg)
                 || import_panel::pre_translate(&msg)
+                || palette_panel::pre_translate(&msg)
                 || files_panel::pre_translate(&msg)
                 || fwd_panel::pre_translate(&msg)
                 || scripts_panel::pre_translate(&msg)
@@ -8214,6 +8218,11 @@ impl Window {
         self.side.visible && self.side.view == SideView::Live
     }
 
+    /// Whether the command palette shows as native controls.
+    fn palette_native(&self) -> bool {
+        self.side.visible && self.side.view == SideView::Palette
+    }
+
     /// Whether port forwards show as native controls.
     fn fwd_native(&self) -> bool {
         self.side.visible && self.side.view == SideView::Forwards
@@ -8306,6 +8315,8 @@ impl Window {
             conn_view::has_focus()
         } else if self.live_native() {
             live_panel::has_focus()
+        } else if self.palette_native() {
+            palette_panel::has_focus()
         } else if self.files_visible() {
             files_panel::has_focus()
         } else if self.fwd_native() {
@@ -8343,6 +8354,12 @@ impl Window {
             live_panel::place(self.areas.side, self.areas.side_width, self.dpi);
         } else {
             live_panel::place(None, 0, self.dpi);
+        }
+        if self.palette_native() {
+            palette_panel::set_view(self.palette.native());
+            palette_panel::place(self.areas.side, self.areas.side_width, self.dpi);
+        } else {
+            palette_panel::place(None, 0, self.dpi);
         }
         // The focused pane's host first, so the view never shows the
         // host the pane had before.
@@ -8453,6 +8470,7 @@ impl Window {
     fn wants_tools_focus(&self) -> bool {
         (self.conn_native()
             || self.live_native()
+            || self.palette_native()
             || self.form_native()
             || self.import_native()
             || self.files_visible()
@@ -15714,12 +15732,43 @@ fn conn_event(hwnd: HWND, event: conn_view::Event) {
     }
 }
 
+/// Carries out what the user did in the command palette.
+fn palette_event(hwnd: HWND, event: palette_panel::Event) {
+    use palette_panel::Event;
+    let command = match event {
+        Event::Query(text) => {
+            with_window(|w| {
+                w.palette.set_filter(&text);
+                w.refresh_chrome();
+            });
+            None
+        }
+        Event::Run { row, split } => with_window(|w| {
+            let action = w.palette.run_row(row, split);
+            w.palette_action(action)
+        })
+        .flatten(),
+        Event::Leave => {
+            with_window(|w| w.palette_action(Some(PalAction::Leave)));
+            None
+        }
+        Event::Focused => {
+            tools_focused();
+            None
+        }
+    };
+    if let Some(command) = command {
+        run_command(hwnd, command);
+    }
+}
+
 /// One of the native tools' controls has the keyboard.
 fn tools_have_focus() -> bool {
     conn_view::has_focus()
         || live_panel::has_focus()
         || form_view::has_focus()
         || import_panel::has_focus()
+        || palette_panel::has_focus()
         || files_panel::has_focus()
         || fwd_panel::has_focus()
         || scripts_panel::has_focus()
@@ -18082,6 +18131,9 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                     1 if want && form => form_view::focus_first(),
                     1 if want && with_window(|w| w.import_native()) == Some(true) => {
                         import_panel::focus_first();
+                    }
+                    1 if want && with_window(|w| w.palette_native()) == Some(true) => {
+                        palette_panel::focus_first();
                     }
                     1 if want && conn => conn_view::focus_tree(),
                     1 if want && live => live_panel::focus_list(),
