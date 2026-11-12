@@ -528,12 +528,37 @@ pub enum WindowColours {
     /// default, a light window around the terminal.
     #[default]
     Light,
+    /// A neutral, very light grey (Windows 11's light window grey).
+    SoftGrey,
+    /// A neutral light grey.
+    Silver,
+    /// A neutral middle grey with black text.
+    MidGrey,
+    /// A neutral darker grey with white text.
+    Steel,
+    /// A neutral dark grey, lighter than `Dark`.
+    Graphite,
     /// A neutral dark grey.
     Dark,
+    /// A neutral near black.
+    Black,
 }
 
 impl WindowColours {
-    pub const ALL: [Self; 4] = [Self::Theme, Self::System, Self::Light, Self::Dark];
+    /// In menu order: the two that follow something, then the fixed looks
+    /// from light to dark. At most ten (the menu ids' room).
+    pub const ALL: [Self; 10] = [
+        Self::Theme,
+        Self::System,
+        Self::Light,
+        Self::SoftGrey,
+        Self::Silver,
+        Self::MidGrey,
+        Self::Steel,
+        Self::Graphite,
+        Self::Dark,
+        Self::Black,
+    ];
 
     /// The word in the settings file.
     pub fn name(self) -> &'static str {
@@ -541,7 +566,13 @@ impl WindowColours {
             Self::Theme => "theme",
             Self::System => "windows",
             Self::Light => "light",
+            Self::SoftGrey => "softgrey",
+            Self::Silver => "silver",
+            Self::MidGrey => "midgrey",
+            Self::Steel => "steel",
+            Self::Graphite => "graphite",
             Self::Dark => "dark",
+            Self::Black => "black",
         }
     }
 
@@ -2241,6 +2272,15 @@ DesktopShareSelection yes
             Settings::parse("WindowColours Dark\n").window_colours,
             WindowColours::Dark
         );
+        assert_eq!(
+            Settings::parse("WindowColours midgrey\n").window_colours,
+            WindowColours::MidGrey
+        );
+        // Every look has its own word.
+        let mut names: Vec<_> = WindowColours::ALL.iter().map(|c| c.name()).collect();
+        names.sort_unstable();
+        names.dedup();
+        assert_eq!(names.len(), WindowColours::ALL.len());
     }
 
     #[test]
