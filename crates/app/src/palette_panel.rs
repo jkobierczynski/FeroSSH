@@ -241,8 +241,8 @@ pub fn create(main: HWND, handler: Handler, dpi: u32) -> windows::core::Result<(
     Ok(())
 }
 
-/// Puts the panel over `at`, laid out for the tool's whole `width`;
-/// `None` hides it.
+/// Puts the panel over `at`, the part of the tool the terminal leaves
+/// uncovered (the tool is `width` wide); `None` hides it.
 pub fn place(at: Option<Rect>, width: i32, dpi: u32) {
     let Some(h) = handles() else {
         return;
@@ -295,7 +295,11 @@ pub fn place(at: Option<Rect>, width: i32, dpi: u32) {
     let button = scale(28, dpi);
     let gap = scale(6, dpi);
     let line = scale(18, dpi);
-    let inner = (width - 2 * pad).max(0);
+    // Keep to the part the sliding terminal leaves uncovered, so the
+    // shortcut and From columns and the scroll bar stay in view; below a
+    // narrow floor the list keeps its width and is clipped instead.
+    let shown = at.w.min(width).max(scale(240, dpi).min(width));
+    let inner = (shown - 2 * pad).max(0);
     let buttons_y = (at.h - pad - button).max(title + field + gap);
     // Two lines of key help over the buttons, while there is room for
     // some of the list too.
