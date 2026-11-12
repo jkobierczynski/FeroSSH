@@ -17379,7 +17379,7 @@ fn run_command(hwnd: HWND, command: Command) {
                 want.0,
                 want.1
             );
-            match dialog(hwnd, &text, MB_YESNO | MB_ICONQUESTION) {
+            match dialog(hwnd, &text, MB_YESNO | MB_ICONQUESTION | MB_DEFBUTTON2) {
                 Some(IDYES) => {
                     with_window(|w| w.detach_other_tmux(gateway, session));
                 }
