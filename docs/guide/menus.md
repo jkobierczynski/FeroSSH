@@ -18,6 +18,13 @@ Items with a check mark are switches: picking them turns the setting on or off, 
 | Open local shell | | Opens a Windows command prompt (`%COMSPEC%`, usually `cmd.exe`) in a new tab. To start another program, use `ferossh.exe --local wsl -d Ubuntu` and the like. |
 | Import connections... | | Brings saved sessions over from PuTTY, KiTTY, WinSCP, MobaXterm, mRemoteNG and SecureCRT (see [Imports](everyday-use.md#importing-from-other-clients)). |
 | Import scripts... | | Brings scripts over from Windows Terminal (`sendInput` actions and `.wt.json` scripts), SecureCRT button bars and MobaXterm macros, or makes one from a text file (see [Importing scripts](everyday-use.md#importing-scripts)). |
+| Export connections... | | Writes your saved and imported connections and their settings to a `.ferossh` file encrypted with a passphrase, with the saved passwords only if you tick it (see [Backup and sync](everyday-use.md#backup-and-sync-between-pcs)). |
+| Import encrypted connections... | | Opens such a file, asks its passphrase, says what it would add and replace, and imports it. Your other connections stay. |
+| Master password > Set a master password... | | Moves your connections, settings and (if ticked) saved passwords into an encrypted vault, `connections.vault`. FeroSSH then asks for the master password when it starts. |
+| Master password > Use a vault file... | | Uses a vault another PC made, in a shared folder such as OneDrive, and adds this PC's connections to it. |
+| Master password > Move the vault file... | | Moves the vault, for example into a OneDrive folder to share it between PCs. |
+| Master password > Change master password... | | Asks for the current master password, then a new one. |
+| Master password > Remove master password... | | Asks for the current master password, then writes the connections and settings back as plain files and the passwords back to the Windows Credential Manager. A portable FeroSSH drops the saved passwords instead (export them first to keep them). A vault in a shared folder stays there for the other PCs. |
 | Exit | Alt+F4 | Closes FeroSSH. tmux sessions keep running on their servers. |
 
 ## Edit

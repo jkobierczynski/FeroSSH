@@ -54,6 +54,7 @@ jobs:
           - mosh_screen
           - winrm_reply
           - stats_feed
+          - sealed_bundle
     steps:
       - uses: actions/checkout@v4
       - run: rustup toolchain install "$FUZZ_TOOLCHAIN" --profile minimal

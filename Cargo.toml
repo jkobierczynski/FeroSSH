@@ -64,3 +64,9 @@ overflow-checks = false
 # outlast its deadline; build sha2 optimised in debug and test builds.
 [profile.dev.package.sha2]
 opt-level = 3
+
+# Argon2id stretches the passphrase of an encrypted connections file;
+# unoptimised it takes many seconds, so build it optimised in debug and
+# test builds too.
+[profile.dev.package.argon2]
+opt-level = 3

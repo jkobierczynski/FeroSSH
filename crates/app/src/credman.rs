@@ -2,15 +2,21 @@
 //! the user's Windows sign-in (DPAPI). Each is a generic credential named
 //! `FeroSSH:user@host:port`, kept on this PC only (not roamed), and shown
 //! under Windows Credentials in Control Panel, where it can be removed.
+//!
+//! With a master password vault unlocked ([`crate::vault`]), passwords
+//! are kept in the vault instead; ones saved before it are still read
+//! from here. A portable FeroSSH never writes here, so a PC it ran on
+//! keeps no password of it.
 
 #![allow(unsafe_code)]
 
+use ferossh_config::bundle::{Secret, is_secret_target};
 use windows::Win32::Foundation::ERROR_NOT_FOUND;
 use windows::Win32::Security::Credentials::{
-    CRED_PERSIST_LOCAL_MACHINE, CRED_TYPE_GENERIC, CREDENTIALW, CredDeleteW, CredFree, CredReadW,
-    CredWriteW,
+    CRED_PERSIST_LOCAL_MACHINE, CRED_TYPE_GENERIC, CREDENTIALW, CredDeleteW, CredEnumerateW,
+    CredFree, CredReadW, CredWriteW,
 };
-use windows::core::{HSTRING, PWSTR};
+use windows::core::{HSTRING, PWSTR, w};
 use zeroize::{Zeroize, Zeroizing};
 
 /// The credential's name for a login.
@@ -26,6 +32,47 @@ pub fn proxy_target(user: &str, host: &str, port: u16) -> String {
 
 /// The password kept under `target`; `Ok(None)` when there is none.
 pub fn read(target: &str) -> Result<Option<Zeroizing<String>>, String> {
+    if let Some(s) = crate::vault::secret(target) {
+        return Ok(Some(s.password));
+    }
+    // A portable FeroSSH uses only its own vault: the PC's saved passwords
+    // are not for connection settings that came on a USB stick.
+    if crate::portable::is_portable() {
+        return Ok(None);
+    }
+    os_read(target)
+}
+
+/// Keeps `password` under `target`, replacing what was there: in the
+/// vault when one is unlocked, else in the Credential Manager (never on
+/// a portable FeroSSH).
+pub fn write(target: &str, user: &str, password: &str) -> Result<(), String> {
+    if crate::vault::is_open() {
+        return crate::vault::set_secret(target, user, password);
+    }
+    if crate::portable::is_portable() {
+        return Err(
+            "A portable FeroSSH keeps passwords only in a master password vault \
+                    (File > Master password), so none is left on this PC."
+                .into(),
+        );
+    }
+    os_write(target, user, password)
+}
+
+/// Forgets the password under `target`, in the vault and here. An error
+/// when the vault could not be saved: the password is still in it.
+pub fn delete(target: &str) -> Result<(), String> {
+    let vault = crate::vault::delete_secret(target);
+    // The PC's own passwords are not a portable FeroSSH's to delete.
+    if !crate::portable::is_portable() {
+        os_delete(target);
+    }
+    vault.map_err(|e| format!("The saved password could not be forgotten: {e}"))
+}
+
+/// The password under `target` in the Credential Manager alone.
+pub fn os_read(target: &str) -> Result<Option<Zeroizing<String>>, String> {
     let name = HSTRING::from(target);
     let mut cred: *mut CREDENTIALW = std::ptr::null_mut();
     // SAFETY: valid name; on success `cred` points at a block the system
@@ -60,8 +107,8 @@ pub fn read(target: &str) -> Result<Option<Zeroizing<String>>, String> {
     }
 }
 
-/// Keeps `password` under `target`, replacing what was there.
-pub fn write(target: &str, user: &str, password: &str) -> Result<(), String> {
+/// Keeps `password` under `target` in the Credential Manager.
+pub fn os_write(target: &str, user: &str, password: &str) -> Result<(), String> {
     let mut name: Vec<u16> = target.encode_utf16().chain(Some(0)).collect();
     let mut user: Vec<u16> = user.encode_utf16().chain(Some(0)).collect();
     let mut blob = Zeroizing::new(
@@ -86,10 +133,61 @@ pub fn write(target: &str, user: &str, password: &str) -> Result<(), String> {
     })
 }
 
-/// Forgets the password under `target`, if there is one.
-pub fn delete(target: &str) {
+/// Forgets the password under `target` in the Credential Manager.
+pub fn os_delete(target: &str) {
     let name = HSTRING::from(target);
     // SAFETY: valid name; a missing credential is not an error worth
     // reporting.
     let _ = unsafe { CredDeleteW(&name, CRED_TYPE_GENERIC, None) };
+}
+
+/// Every password FeroSSH saved in the Credential Manager (logins,
+/// proxies and named secrets), for an export or a move into the vault.
+pub fn os_list() -> Vec<Secret> {
+    let mut count = 0u32;
+    let mut creds: *mut *mut CREDENTIALW = std::ptr::null_mut();
+    // SAFETY: on success `creds` points at `count` credential pointers
+    // the system allocated, read here and freed once with CredFree.
+    unsafe {
+        if CredEnumerateW(w!("FeroSSH*"), None, &mut count, &mut creds).is_err() {
+            return Vec::new();
+        }
+        let mut out = Vec::new();
+        for i in 0..count as usize {
+            let c = &**creds.add(i);
+            if c.Type != CRED_TYPE_GENERIC || c.TargetName.is_null() {
+                continue;
+            }
+            let Ok(target) = c.TargetName.to_string() else {
+                continue;
+            };
+            if !is_secret_target(&target) {
+                continue;
+            }
+            let user = if c.UserName.is_null() {
+                String::new()
+            } else {
+                c.UserName.to_string().unwrap_or_default()
+            };
+            let mut blob = Zeroizing::new(if c.CredentialBlob.is_null() {
+                Vec::new()
+            } else {
+                std::slice::from_raw_parts(c.CredentialBlob, c.CredentialBlobSize as usize).to_vec()
+            });
+            let mut units: Vec<u16> = blob
+                .chunks_exact(2)
+                .filter_map(|b| <[u8; 2]>::try_from(b).ok().map(u16::from_le_bytes))
+                .collect();
+            blob.zeroize();
+            let password = Zeroizing::new(String::from_utf16_lossy(&units));
+            units.zeroize();
+            out.push(Secret {
+                target,
+                user,
+                password,
+            });
+        }
+        CredFree(creds as *const _);
+        out
+    }
 }

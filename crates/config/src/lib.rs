@@ -5,6 +5,7 @@
 //! OpenSSH host patterns and ssh_config's `Tag`; FeroSSH's own settings
 //! (session profiles, favourites, theme rules) use ssh_config's syntax.
 
+pub mod bundle;
 pub mod forward;
 pub mod highlight;
 mod host_theme;
@@ -22,6 +23,7 @@ pub mod proxy;
 pub mod putty;
 pub mod record;
 pub mod saved;
+pub mod sealed;
 pub mod securecrt;
 pub mod serial;
 pub mod settings;

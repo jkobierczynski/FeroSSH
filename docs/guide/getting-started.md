@@ -10,7 +10,7 @@ Every release on the [Releases page](https://github.com/jkobierczynski/FeroSSH/r
 | `ferossh-desktop.exe` | You also want to see Linux desktops (RDP or VNC) inside a FeroSSH tab. It is the same client plus a sandboxed desktop viewer, and about 2.6 MB larger. |
 | `ferossh-arm64.exe`, `ferossh-desktop-arm64.exe` | The same two for Windows on ARM (Snapdragon laptops, Surface Pro X, Windows in a VM on an Apple silicon Mac). They run natively, so faster and with less battery than the x64 exe under emulation. |
 
-There is no installer. Put the exe wherever you like, for example `%LOCALAPPDATA%\Programs\FeroSSH`, and pin it to the Start menu or taskbar. It runs on Windows 10 1903 or later and Windows 11, on x64, and on ARM64 with the `-arm64` exes.
+There is no installer. Put the exe wherever you like, for example `%LOCALAPPDATA%\Programs\FeroSSH`, and pin it to the Start menu or taskbar. It runs on Windows 10 1903 or later and Windows 11, on x64, and on ARM64 with the `-arm64` exes. To carry it on a USB stick, make a folder named `FeroSSH-data` next to the exe: FeroSSH then keeps its settings, connections and other data in that folder, though Windows itself may still keep some traces on the PC (see [Portable use](everyday-use.md#portable-use)).
 
 Before you run a download, you can check that it is the one the project built: see [Verifying a download](verifying-downloads.md).
 

@@ -128,7 +128,7 @@ Keys and agents need no password at all. The Windows OpenSSH agent pipe also ser
 For servers that want a password, the form's Password field picks where it comes from:
 
 - **ask every time** (the default): you type it.
-- **Windows Credential Manager**: saved the first time a login with it works, as `FeroSSH:user@host:port`, protected by your Windows sign-in, and filled in from then on.
+- **Windows Credential Manager**: saved the first time a login with it works, as `FeroSSH:user@host:port`, protected by your Windows sign-in, and filled in from then on. With a master password set, these passwords are kept in the vault instead (see [Backup and sync between PCs](#backup-and-sync-between-pcs)).
 - **1Password**, **Bitwarden** or **KeePassXC**: fills in a command for that tool's command line (`op`, `bw`, `keepassxc-cli`) that you can edit.
 - **a command of my own**: `%n` is the connection's name, `%h` the host, `%u` the user, `%p` the port.
 
@@ -139,6 +139,22 @@ A command runs without a shell, a window or any input, for at most 60 seconds, a
 File > Import connections lists the clients that have saved sessions on your account: PuTTY and KiTTY (from the registry), WinSCP (registry or `WinSCP.ini`), MobaXterm (`MobaXterm.ini`), mRemoteNG (`confCons.xml`) and SecureCRT (its `Config\Sessions` folder). Pick one to see its sessions, untick what you don't want, and choose Import. *From a file...* reads the same files from a portable install or an export.
 
 Host, user, port, key file, folders, PuTTY and KiTTY port forwards, jump hosts and the SOCKS 5 and HTTP proxies of PuTTY, KiTTY and WinSCP come over, and so do Telnet sessions and (from MobaXterm and mRemoteNG) RDP and VNC sessions. **Passwords never come over**: the preview marks the sessions that had one, so you can give them a password source. The preview also says what else does not come over. Imports go to `%APPDATA%\FeroSSH\imported-<client>.conf`, in a folder named after the client, and importing again from the same client replaces that file. A name already in use is left out.
+
+### Backup and sync between PCs
+
+FeroSSH has no cloud of its own. Your connections travel in an encrypted file that you keep where you like: OneDrive, Dropbox, a git repository or a USB stick.
+
+**Export and import.** File > Export connections writes your saved and imported connections, with their FeroSSH settings (type, look, extras, login script), to one `.ferossh` file encrypted with a passphrase you choose. Saved passwords go in only when you tick *Include saved passwords*. On the other PC, File > Import encrypted connections asks for the passphrase and says what it would change before it does anything: connections it does not have are added, ones with the same name are replaced by the file's, and the rest of yours stay. Hosts from `~/.ssh/config` are not in the file; copy that file as it is.
+
+**A master password.** File > Master password > Set a master password moves your connections, `ferossh.conf` and (if you tick it) the passwords saved in the Windows Credential Manager into one encrypted file, `connections.vault`, and removes the plain files. From then on FeroSSH asks for the master password when it starts, and passwords it saves go into the vault. Change master password and Remove master password (which writes the plain files back) ask for the current one first. There is no way to recover a forgotten master password, so keep an export somewhere safe too.
+
+**Sync.** Master password > Move the vault file puts the vault in a folder you choose, for example in OneDrive. On a second PC, Master password > Use a vault file opens that same file, adds that PC's own connections to it and uses it from then on; where both have a connection of the same name, the vault's wins, so export this PC's connections first if you want to keep its versions. Both PCs now read and write one vault: a change on one shows on the other the next time it reads its connections, once the sync client has brought the file over, and host settings another PC changed meanwhile are kept when this one saves. Changes made on two PCs before the file synced, or at the same moment, can still overwrite each other (the last save wins), so let OneDrive finish syncing before you edit connections on another PC. Window settings (fonts, menus) are in the vault too and follow the PC that saved last. If you change the master password on one PC, the other asks for the new one when it next starts.
+
+The encryption: the passphrase is stretched with Argon2id (64 MiB, 3 passes) into a 256-bit key, and the file is sealed with ChaCha20-Poly1305, so a wrong passphrase or a changed byte is refused rather than half read. The file is text (base64), so git and OneDrive handle it like any other file. Scripts in the scripts folder are not in the vault or the export.
+
+### Portable use
+
+To run FeroSSH from a USB stick on a PC you don't own, make a folder named `FeroSSH-data` next to `ferossh.exe`. FeroSSH then keeps everything it writes in that folder: settings, connections, `known_hosts`, logs, command history and the vault. It saves no passwords in the PC's Credential Manager (set a master password to keep them, in the vault on the stick), it asks again in each run before a password or proxy command runs (approvals are not kept in a folder that travels), and as it quits it removes the AppContainer profiles Windows keeps for its sandbox. It still reads the PC user's `~/.ssh/config`, and Windows itself may keep traces such as recent-files lists and the temporary copy of a file opened with *Edit locally*.
 
 ## The session manager
 

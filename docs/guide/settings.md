@@ -8,8 +8,10 @@ Other files in the same folder:
 | --- | --- |
 | `sessions.conf` | Connections saved with the connection form, in ssh_config syntax. |
 | `imported-<client>.conf`, `putty-sessions.conf` | Connections imported from other clients. Importing again replaces the file. |
+| `connections.vault` | With a master password set: all of the files above, and saved passwords, in one encrypted file. The plain files are then gone. |
+| `vault-location.txt` | Where the vault is, when it was moved (to a OneDrive folder, say). |
 
-FeroSSH reads `~/.ssh/config` and `~/.ssh/known_hosts` too, and writes only to `known_hosts` (when you trust a new host).
+FeroSSH reads `~/.ssh/config` and `~/.ssh/known_hosts` too, and writes only to `known_hosts` (when you trust a new host). A portable FeroSSH (a `FeroSSH-data` folder next to the exe) keeps all of these, and its own `known_hosts`, in that folder instead.
 
 ## Window and terminal
 

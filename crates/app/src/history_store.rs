@@ -1,5 +1,6 @@
 //! Command history on disk: one file per host in
-//! `%LOCALAPPDATA%\FeroSSH\history` (on this PC only, never roamed),
+//! `%LOCALAPPDATA%\FeroSSH\history` (on this PC only, never roamed; in
+//! the data folder when FeroSSH is portable),
 //! encrypted with DPAPI under the user's Windows sign-in, so another
 //! account on the PC, or the file copied elsewhere, reads nothing. The
 //! file name is a hash of the host, so a listing does not name hosts.
@@ -22,9 +23,26 @@ use crate::suggest::History;
 /// not open each other.
 const ENTROPY: &[u8] = b"FeroSSH command history";
 
-/// The folder the histories are kept in.
+/// The folder the histories are kept in. A portable FeroSSH keeps one
+/// per PC and Windows account: each file is sealed for one account on one
+/// PC (DPAPI), so another PC could not read it and would replace it.
 pub fn dir() -> Option<PathBuf> {
-    std::env::var_os("LOCALAPPDATA").map(|d| PathBuf::from(d).join("FeroSSH").join("history"))
+    let dir = crate::portable::local_dir()?.join("history");
+    if !crate::portable::is_portable() {
+        return Some(dir);
+    }
+    let var = |k: &str| std::env::var(k).unwrap_or_default();
+    let who: String = format!("{}-{}", var("COMPUTERNAME"), var("USERNAME"))
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    Some(dir.join(who))
 }
 
 fn file(key: &str) -> Option<PathBuf> {
@@ -47,15 +65,26 @@ pub fn modified(key: &str) -> Option<SystemTime> {
 /// there is none, or it cannot be read (another user's, damaged).
 pub fn load(key: &str) -> (History, Option<SystemTime>) {
     let stamp = modified(key);
-    let history = file(key)
-        .and_then(|path| std::fs::read(path).ok())
-        .and_then(|blob| unprotect(&blob))
+    let history = read(key)
+        .ok()
+        .flatten()
+        .unwrap_or_else(|| History::new(key));
+    (history, stamp)
+}
+
+/// The history kept for `key`: `Ok(None)` when there is no file, `Err`
+/// when there is one this account on this PC cannot read.
+fn read(key: &str) -> Result<Option<History>, ()> {
+    let Some(blob) = file(key).and_then(|path| std::fs::read(path).ok()) else {
+        return Ok(None);
+    };
+    unprotect(&blob)
         .and_then(|plain| {
             let text = std::str::from_utf8(&plain).ok()?;
             History::parse(text, key)
         })
-        .unwrap_or_else(|| History::new(key));
-    (history, stamp)
+        .map(Some)
+        .ok_or(())
 }
 
 /// A history with its file's time when read.
@@ -95,15 +124,32 @@ fn lock() -> Result<Lock, String> {
 /// and writes it back when `change` changed it, all under [`lock`]: so two
 /// windows typing on the same host keep each other's commands, and a clear
 /// in one holds. On an error the history comes back as changed but not
-/// saved, with the file's time from before.
+/// saved, with the file's time from before. `kept` is what this window
+/// holds already: an unreadable file is changed from it rather than from
+/// nothing, so unsaved commands add up instead of replacing each other.
 pub fn update(
     key: &str,
+    kept: Option<&History>,
     change: impl FnOnce(&mut History) -> bool,
 ) -> Result<Stamped, (Stamped, String)> {
     let guard = lock();
-    let (mut history, stamp) = load(key);
+    let stamp = modified(key);
+    let found = read(key);
+    // A portable folder travels: a file another PC or account sealed (two
+    // PCs can share a name) is left alone rather than replaced.
+    let unreadable = found.is_err() && crate::portable::is_portable();
+    let mut history = match found {
+        Ok(found) => found.unwrap_or_else(|| History::new(key)),
+        Err(()) => kept.cloned().unwrap_or_else(|| History::new(key)),
+    };
     if !change(&mut history) {
         return Ok((history, stamp));
+    }
+    if unreadable {
+        let e = "This host's command history was saved by another PC or Windows account, so \
+                 it is kept and not replaced."
+            .to_owned();
+        return Err(((history, stamp), e));
     }
     let saved = guard.and_then(|_guard| save(&history));
     match saved {
