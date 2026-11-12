@@ -411,13 +411,18 @@ pub fn place(at: Option<Rect>, width: i32, dpi: u32) {
     // and its hint.
     let problems_h = if has_problems() { 3 * line } else { 0 };
     let hint_h = 3 * line;
-    let sources_need = |extra: i32| extra + button + gap + 2 * button;
-    let (hint_h, problems_h) = if room >= sources_need(hint_h + problems_h + 2 * gap) {
-        (hint_h, problems_h)
-    } else if room >= sources_need(problems_h + gap) {
-        (0, problems_h)
+    // From a file and at least one row of list; what could not be read
+    // comes before the hint, which only says what From a file reads.
+    let sources_need = |extra: i32| extra + button + gap + button;
+    let problems_h = if room >= sources_need(problems_h + gap) {
+        problems_h
     } else {
-        (0, 0)
+        0
+    };
+    let hint_h = if room >= sources_need(problems_h + gap + hint_h + gap) {
+        hint_h
+    } else {
+        0
     };
     let hint_y = buttons_y - if hint_h > 0 { gap + hint_h } else { 0 };
     let file_y = hint_y - gap - button;
@@ -425,7 +430,9 @@ pub fn place(at: Option<Rect>, width: i32, dpi: u32) {
     let sources_end = if problems_h > 0 { problems_y } else { file_y };
     let sources_h = (sources_end - gap - list_y).max(0);
     // Preview: Select all and Clear all, then where it is saved.
-    let footer_h = if room >= 2 * line + gap + 3 * button {
+    // Where the import goes (and that it replaces an earlier one) stays
+    // as long as Select all and one row of list fit.
+    let footer_h = if room >= 2 * line + gap + button + gap + button {
         2 * line
     } else {
         0
