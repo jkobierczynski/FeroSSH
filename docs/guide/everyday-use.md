@@ -11,6 +11,7 @@ The window starts as one pane, with no tab strip. Ctrl+Shift+T opens a tab and t
 - Ctrl+Shift+drag a pane onto another pane's edge to move it there, or onto its middle to swap the two.
 - To merge a tab back in as a pane, drag the tab down out of the strip onto a pane of the tab that appears, or use Window > Join tab into the tab before it (Ctrl+Shift+J). Window > Move pane to its own tab, or dropping a pane on the tab strip, makes it a tab again.
 - Ctrl+Shift+W closes the pane, Ctrl+F4 the tab.
+- Ctrl+Shift+H (Window > Hide pane) hides the focused pane without closing it: the other panes take its space and its session keeps running. The [session manager](#the-session-manager) lists it as *hidden*; Show there (or Window > Show last hidden pane) puts it back where it was, or in a tab of its own when the surrounding panes have closed. A hidden pane whose login, or login script, asks for a password, secret or host key shows again by itself. Closing the last pane in the tabs shows the pane hidden last instead of closing the window. In tmux the hidden pane stays hidden when you attach again, from any PC with this FeroSSH version or later (older ones show it as a tab; if every window of the session is hidden, they all show as tabs). Saved workspaces leave hidden panes out.
 
 ### New tabs and panes start in the same directory
 
@@ -158,7 +159,7 @@ To run FeroSSH from a USB stick on a PC you don't own, make a folder named `Fero
 
 ## The session manager
 
-Ctrl+Shift+L lists the sessions that are open right now, in every tab: their host, kind (SSH, Mosh, SFTP, WinRM, Telnet, serial, tmux, desktop or local shell), tab and state (connected, connecting, reconnecting or ended), with notes such as tmux, forwards, logging or a jump host. It also shows the hidden sessions of a [multi-host script run](#runs-on-many-hosts). It is a Windows list with columns (session, kind, tab, state, details) and updates as sessions connect, drop and reconnect. Type to filter, Enter or a double-click goes to the session's tab and pane, F2 renames it in place, and Del closes it after asking. The Show, Rename and Close buttons below the list, and a right-click on a session, do the same.
+Ctrl+Shift+L lists the sessions that are open right now, in every tab: their host, kind (SSH, Mosh, SFTP, WinRM, Telnet, serial, tmux, desktop or local shell), tab and state (connected, connecting, reconnecting or ended), with notes such as tmux, forwards, logging or a jump host. It also shows the panes you hid (Window > Hide pane), with *hidden* as their tab, and the hidden sessions of a [multi-host script run](#runs-on-many-hosts). It is a Windows list with columns (session, kind, tab, state, details) and updates as sessions connect, drop and reconnect. Type to filter, Enter or a double-click goes to the session's tab and pane, F2 renames it in place, and Del closes it after asking. The Show, Rename and Close buttons below the list, and a right-click on a session, do the same; the right-click menu can also hide a session's pane.
 
 The connection manager is for the hosts you *can* connect to; the session manager for the ones you *are* connected to.
 
