@@ -1068,11 +1068,23 @@ struct Window {
     /// A workspace's panes waiting for another pane on their host to log
     /// in.
     workspace_waiting: workspaces::Waiting,
-    /// A workspace's panes that open a tmux session once logged in: its
-    /// name, and what makes it again first when it is gone.
-    workspace_tmux: HashMap<PaneId, (String, Option<String>)>,
+    /// A workspace's panes that open a tmux session once logged in.
+    workspace_tmux: HashMap<PaneId, WorkspaceTmux>,
     /// The workspaces Window > Workspaces listed when it last opened.
     workspace_names: Vec<String>,
+}
+
+/// A workspace's tmux session, waiting for its first pane to log in.
+struct WorkspaceTmux {
+    /// The session's name.
+    name: String,
+    /// The session's panes as saved, so saving again meanwhile keeps them.
+    plan: workspaces::TmuxPlan,
+    /// What makes the session again first, when it is gone.
+    rebuild: Option<String>,
+    /// The host the pane logged in to for it (its queue key), once it
+    /// connects there; a pane connected anywhere else drops the session.
+    key: Option<String>,
 }
 
 /// A login script running in a pane.
@@ -2946,10 +2958,12 @@ impl Window {
         };
         let mut font = g.font.clone();
         let mut metrics = g.metrics;
+        // A saved look never overrides a Production or Staging colour.
         let theme = look
             .theme
             .as_deref()
             .and_then(Theme::by_name)
+            .filter(|t| g.theme.group() != ThemeGroup::Warning && t.group() != ThemeGroup::Warning)
             .unwrap_or_else(|| g.theme.clone());
         if look.font.is_some() || look.size.is_some() {
             let wanted = FontSpec::new(
@@ -3041,24 +3055,48 @@ impl Window {
             .settings
             .profile(&s.target.alias)
             .and_then(|p| p.tmux.clone());
-        // A workspace's tmux session, once: made again first if gone.
-        let (name, rebuild) = match (self.reattach.remove(&id), self.workspace_tmux.remove(&id)) {
-            (Some((k, name)), _) if k == key => (name, None),
-            (_, Some((name, rebuild))) => (name, rebuild),
-            _ => match profile {
-                Some(name) => (name, None),
-                None => return,
+        // A workspace's tmux session, on the host it was saved on: made
+        // again first if gone.
+        let workspace = self
+            .workspace_tmux
+            .get(&id)
+            .is_some_and(|w| w.key.as_deref() == Some(key.as_str()));
+        if !workspace {
+            self.workspace_tmux.remove(&id);
+        }
+        let (name, rebuild) = match self.reattach.remove(&id) {
+            Some((k, name)) if k == key => (name, None),
+            _ => match self.workspace_tmux.get(&id) {
+                Some(w) => (w.name.clone(), w.rebuild.clone()),
+                None => match profile {
+                    Some(name) => (name, None),
+                    None => return,
+                },
             },
         };
         let busy = self.tmux.iter().any(|(g, t)| {
             *g != id && t.active() && self.pane_sftp_key(*g).as_deref() == Some(key.as_str())
         });
-        if !busy {
-            if let Some(line) = rebuild {
-                self.send_host(id, line.as_bytes());
+        if busy {
+            // Only one pane per host shows tmux. A workspace's session
+            // stays wanted, and kept when saving, until this pane closes.
+            if workspace {
+                self.show(
+                    id,
+                    &format!(
+                        "\x1b[0;90mAnother pane already shows tmux on this host, so the \
+                         workspace's tmux session {} is not attached here.\x1b[0m\r\n",
+                        crate::ssh::sanitize(&name)
+                    ),
+                );
             }
-            self.attach_tmux(id, &name, false);
+            return;
         }
+        self.workspace_tmux.remove(&id);
+        if let Some(line) = rebuild {
+            self.send_host(id, line.as_bytes());
+        }
+        self.attach_tmux(id, &name, false);
     }
 
     /// Types the `cd` to the directory of the pane a new tab or pane was
@@ -11212,7 +11250,16 @@ impl Window {
     fn workspace_now(&self) -> (Option<wsfile::Workspace>, usize) {
         let mut tmux = HashSet::new();
         let mut skipped = 0;
+        let mut more_tabs = Vec::new();
         let ws = workspaces::capture(&self.ws.tabs, self.ws.active, &mut |id| {
+            // A workspace's tmux session not attached yet: its saved panes
+            // stand in for its first one.
+            if let Some(w) = self.workspace_tmux.get(&id)
+                && let Some((first, rest)) = w.plan.tabs.split_first()
+            {
+                more_tabs.extend(rest.iter().cloned());
+                return Some(first.root.clone());
+            }
             let spec = self.workspace_pane(id, &mut tmux);
             if spec.is_none()
                 && matches!(
@@ -11222,7 +11269,11 @@ impl Window {
             {
                 skipped += 1;
             }
-            spec
+            spec.map(wsfile::Layout::Pane)
+        });
+        let ws = ws.map(|mut ws| {
+            ws.tabs.extend(more_tabs);
+            ws
         });
         (ws, skipped)
     }
@@ -11301,13 +11352,11 @@ impl Window {
         };
         // A tmux session opens from its first pane; tmux shows the rest.
         let mut ws = ws.clone();
-        let rebuilds: HashMap<(String, String), Option<String>> = workspaces::take_tmux(&mut ws)
-            .into_iter()
-            .map(|plan| {
-                let line = workspaces::tmux_rebuild(&plan);
-                ((plan.destination, plan.session), line)
-            })
-            .collect();
+        let mut plans: HashMap<(String, String), workspaces::TmuxPlan> =
+            workspaces::take_tmux(&mut ws)
+                .into_iter()
+                .map(|plan| ((plan.destination.clone(), plan.session.clone()), plan))
+                .collect();
         let mut opened: Vec<(PaneId, PaneSpec)> = Vec::new();
         let mut focus_of_active = None;
         for (i, tab) in ws.tabs.iter().enumerate() {
@@ -11348,11 +11397,18 @@ impl Window {
         for (id, spec) in opened {
             if let (WsOpen::Connection(dest), Some(name)) = (&spec.open, &spec.tmux) {
                 let name = ferossh_tmuxcc::command::session_name(name);
-                let rebuild = rebuilds
-                    .get(&(dest.trim().to_owned(), name.clone()))
-                    .cloned()
-                    .flatten();
-                self.workspace_tmux.insert(id, (name, rebuild));
+                if let Some(plan) = plans.remove(&(dest.trim().to_owned(), name.clone())) {
+                    let rebuild = workspaces::tmux_rebuild(&plan);
+                    self.workspace_tmux.insert(
+                        id,
+                        WorkspaceTmux {
+                            name,
+                            plan,
+                            rebuild,
+                            key: None,
+                        },
+                    );
+                }
             }
             self.open_workspace_pane(id, &spec, &mut leads);
             self.workspace_look(id, &spec);
@@ -11463,10 +11519,15 @@ impl Window {
     fn connect_with_dir(&mut self, id: PaneId, dest: &str, dir: Option<&str>) {
         self.connect(id, dest);
         if let Some(p) = self.panes.get_mut(&id)
-            && matches!(p.host, Host::Ssh(_))
-            && let Some(dir) = dir
+            && let Host::Ssh(s) = &p.host
         {
-            p.start_dir = Some(dir.as_bytes().to_vec());
+            // The host a workspace's tmux session is attached on.
+            if let Some(w) = self.workspace_tmux.get_mut(&id) {
+                w.key = Some(sftp_key(&s.target));
+            }
+            if let Some(dir) = dir {
+                p.start_dir = Some(dir.as_bytes().to_vec());
+            }
         }
     }
 

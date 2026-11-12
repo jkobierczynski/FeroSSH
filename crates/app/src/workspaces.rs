@@ -12,13 +12,14 @@ use ferossh_config::workspace::{Layout, Open, PaneSpec, TabSpec, Workspace};
 
 use crate::layout::{Axis, Node, PaneId, Tab};
 
-/// The tabs as a workspace. `spec` says what each pane opens; a pane it
-/// gives `None` for is left out, its neighbour taking its place, and a
-/// tab left with no pane goes. `None` when no pane is left at all.
+/// The tabs as a workspace. `spec` says what each pane opens, as a pane
+/// or a split tree standing in for it; a pane it gives `None` for is left
+/// out, its neighbour taking its place, and a tab left with no pane goes.
+/// `None` when no pane is left at all.
 pub fn capture(
     tabs: &[Tab],
     active: usize,
-    spec: &mut impl FnMut(PaneId) -> Option<PaneSpec>,
+    spec: &mut impl FnMut(PaneId) -> Option<Layout>,
 ) -> Option<Workspace> {
     let mut out = Workspace::default();
     for (i, tab) in tabs.iter().enumerate() {
@@ -29,22 +30,29 @@ pub fn capture(
         if i == active {
             out.active = out.tabs.len();
         }
-        let focus = kept.iter().position(|&id| id == tab.focus).unwrap_or(0);
+        // The focused pane's first saved pane, counting stand-in trees.
+        let focus = kept
+            .iter()
+            .find(|(id, _, _)| *id == tab.focus)
+            .map_or(0, |(_, at, _)| *at);
         out.tabs.push(TabSpec { root, focus });
     }
     (!out.tabs.is_empty()).then_some(out)
 }
 
+/// `kept` gets each pane kept, with the index of its first saved pane
+/// and how many it saved.
 fn layout_of(
     node: &Node,
-    spec: &mut impl FnMut(PaneId) -> Option<PaneSpec>,
-    kept: &mut Vec<PaneId>,
+    spec: &mut impl FnMut(PaneId) -> Option<Layout>,
+    kept: &mut Vec<(PaneId, usize, usize)>,
 ) -> Option<Layout> {
     match node {
         Node::Leaf(id) => {
-            let p = spec(*id)?;
-            kept.push(*id);
-            Some(Layout::Pane(p))
+            let l = spec(*id)?;
+            let at = kept.last().map_or(0, |(_, start, n)| start + n);
+            kept.push((*id, at, l.panes().len()));
+            Some(l)
         }
         Node::Split {
             axis,
@@ -469,7 +477,7 @@ mod tests {
             },
         ];
         let ws = capture(&tabs, 1, &mut |id| {
-            Some(plain(Open::Connection(format!("host{id}"))))
+            Some(Layout::Pane(plain(Open::Connection(format!("host{id}")))))
         })
         .unwrap();
         assert_eq!(ws.active, 1);
@@ -512,12 +520,41 @@ mod tests {
             },
         ];
         // Pane 2 (a desktop, say) and the whole second tab are left out.
-        let ws = capture(&tabs, 1, &mut |id| (id == 1).then(|| plain(Open::Local))).unwrap();
+        let ws = capture(&tabs, 1, &mut |id| {
+            (id == 1).then(|| Layout::Pane(plain(Open::Local)))
+        })
+        .unwrap();
         assert_eq!(ws.tabs.len(), 1);
         assert_eq!(ws.active, 0);
         assert_eq!(ws.tabs[0].focus, 0);
         assert_eq!(ws.tabs[0].root, Layout::Pane(plain(Open::Local)));
         assert!(capture(&tabs, 0, &mut |_| None).is_none());
+    }
+
+    #[test]
+    fn a_pane_can_stand_for_a_tree() {
+        // Pane 1 stands for two saved panes; the focus on pane 2 counts
+        // them.
+        let tabs = vec![Tab {
+            root: split(Axis::Row, Node::Leaf(1), Node::Leaf(2)),
+            focus: 2,
+        }];
+        let two = || Layout::Split {
+            down: true,
+            ratio: 0.5,
+            first: Box::new(Layout::Pane(plain(Open::Local))),
+            second: Box::new(Layout::Pane(plain(Open::Prompt))),
+        };
+        let ws = capture(&tabs, 0, &mut |id| {
+            Some(if id == 1 {
+                two()
+            } else {
+                Layout::Pane(plain(Open::Local))
+            })
+        })
+        .unwrap();
+        assert_eq!(ws.tabs[0].root.panes().len(), 3);
+        assert_eq!(ws.tabs[0].focus, 2);
     }
 
     #[test]

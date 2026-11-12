@@ -580,10 +580,21 @@ fn real_tmux_workspace_makes_a_gone_session_again() {
     let server = Server {
         socket: format!("ferossh-e2e-ws-{id}"),
     };
-    let base = std::env::temp_dir().join(format!("ferossh ws {id}"));
+    // A folder of the test's own, gone when the test ends however it
+    // ends.
+    struct Scratch(std::path::PathBuf);
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+    let scratch = Scratch(std::env::temp_dir().join(format!("ferossh ws {id}")));
+    let _ = std::fs::remove_dir_all(&scratch.0);
+    std::fs::create_dir(&scratch.0).unwrap();
+    let base = &scratch.0;
     let (left, right) = (base.join("it's left"), base.join("right #1"));
-    std::fs::create_dir_all(&left).unwrap();
-    std::fs::create_dir_all(&right).unwrap();
+    std::fs::create_dir(&left).unwrap();
+    std::fs::create_dir(&right).unwrap();
     // `tmux` on the PATH is this test's server.
     let real = Command::new("sh")
         .args(["-c", "command -v tmux"])
@@ -591,7 +602,7 @@ fn real_tmux_workspace_makes_a_gone_session_again() {
         .unwrap();
     let real = String::from_utf8_lossy(&real.stdout).trim().to_owned();
     let shim = base.join("bin");
-    std::fs::create_dir_all(&shim).unwrap();
+    std::fs::create_dir(&shim).unwrap();
     std::fs::write(
         shim.join("tmux"),
         format!(
@@ -682,5 +693,4 @@ fn real_tmux_workspace_makes_a_gone_session_again() {
         let want = format!("at:{}:", dir.display());
         a.until("the pane's directory", |h| h.text(native).contains(&want));
     }
-    let _ = std::fs::remove_dir_all(&base);
 }
