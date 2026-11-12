@@ -201,6 +201,65 @@ pub struct ImportView {
     scroll: usize,
     button: usize,
     button_cols: Vec<(usize, usize)>,
+    /// Counts page changes (a preview opened, Back), so the native page
+    /// knows when to start over.
+    serial: u64,
+    /// The source last previewed, selected again on the list of sources.
+    last: Option<usize>,
+}
+
+/// One item on the native preview page.
+#[derive(Clone, Debug, PartialEq)]
+pub struct NativeItem {
+    pub name: String,
+    /// Where it connects to (a session) or its category (a script).
+    pub detail: String,
+    /// The notes under it, on one line.
+    pub notes: String,
+    /// Its name is in use, so it cannot be imported.
+    pub taken: bool,
+    pub checked: bool,
+}
+
+/// One place something was found, on the native list of sources.
+#[derive(Clone, Debug, PartialEq)]
+pub struct NativeSource {
+    pub program: String,
+    /// "3 sessions".
+    pub what: String,
+    /// "Registry" or a file's path.
+    pub origin: String,
+}
+
+/// What the native page shows.
+#[derive(Clone, Debug, PartialEq)]
+pub enum NativePage {
+    /// Where something was found; `last` is the source to select.
+    Sources {
+        sources: Vec<NativeSource>,
+        /// Nothing found, and files that could not be read.
+        problems: Vec<String>,
+        /// What "From a file" reads, and what happens to passwords.
+        hint: String,
+        last: Option<usize>,
+    },
+    /// One source's items, each with a tick box.
+    Preview {
+        items: Vec<NativeItem>,
+        chosen: usize,
+        importable: usize,
+        /// Where the import is written.
+        footer: String,
+    },
+}
+
+/// The import page as the native controls show it.
+#[derive(Clone, Debug, PartialEq)]
+pub struct NativeImport {
+    pub title: String,
+    pub snippets: bool,
+    pub page: NativePage,
+    pub serial: u64,
 }
 
 impl ImportView {
@@ -229,6 +288,8 @@ impl ImportView {
             scroll: 0,
             button: IMPORT,
             button_cols: Vec::new(),
+            serial: 0,
+            last: None,
         };
         v.focus_first();
         v
@@ -248,6 +309,8 @@ impl ImportView {
         };
         self.checked = (0..f.len()).map(|s| !f.taken(s)).collect();
         self.open = Some(i);
+        self.last = Some(i);
+        self.serial += 1;
         self.scroll = 0;
         self.button = IMPORT;
         self.focus_first();
@@ -255,6 +318,7 @@ impl ImportView {
 
     fn back(&mut self) {
         let was = self.open.take();
+        self.serial += 1;
         self.scroll = 0;
         self.focus = self
             .rows()
@@ -430,33 +494,150 @@ impl ImportView {
                 self.back();
                 None
             }
-            Row::Buttons => {
-                let f = self.current()?;
-                match &f.items {
-                    Items::Sessions(client, all) => {
-                        let sessions: Vec<Session> = all
-                            .iter()
-                            .zip(&self.checked)
-                            .filter(|(_, c)| **c)
-                            .map(|(s, _)| s.clone())
-                            .collect();
-                        (!sessions.is_empty()).then_some(ImportAction::Import {
-                            client: *client,
-                            sessions,
+            Row::Buttons => self.import(),
+            Row::Note(_) | Row::Blank => None,
+        }
+    }
+
+    /// The chosen items as an import; `None` with none chosen.
+    pub fn import(&self) -> Option<ImportAction> {
+        let f = self.current()?;
+        match &f.items {
+            Items::Sessions(client, all) => {
+                let sessions: Vec<Session> = all
+                    .iter()
+                    .zip(&self.checked)
+                    .filter(|(_, c)| **c)
+                    .map(|(s, _)| s.clone())
+                    .collect();
+                (!sessions.is_empty()).then_some(ImportAction::Import {
+                    client: *client,
+                    sessions,
+                })
+            }
+            Items::Snippets(_, all) => {
+                let snippets: Vec<Snippet> = all
+                    .iter()
+                    .zip(&self.checked)
+                    .filter(|(_, c)| **c)
+                    .map(|(s, _)| s.clone())
+                    .collect();
+                (!snippets.is_empty()).then_some(ImportAction::ImportSnippets(snippets))
+            }
+        }
+    }
+
+    /// Opens source `i`'s preview (the native list of sources).
+    pub fn open(&mut self, i: usize) {
+        self.open_source(i);
+    }
+
+    /// From a preview back to the list of sources; `false` when that list
+    /// shows already.
+    pub fn go_back(&mut self) -> bool {
+        if self.open.is_none() {
+            return false;
+        }
+        self.back();
+        true
+    }
+
+    /// Ticks or clears item `i` of the preview; taken items stay clear.
+    pub fn check(&mut self, i: usize, on: bool) {
+        let taken = self.current().is_none_or(|f| f.taken(i));
+        if let Some(c) = self.checked.get_mut(i) {
+            *c = on && !taken;
+        }
+    }
+
+    /// Ticks or clears every item that can be imported.
+    pub fn check_all(&mut self, on: bool) {
+        let Some(f) = self.current() else {
+            return;
+        };
+        let taken: Vec<bool> = (0..f.len()).map(|i| f.taken(i)).collect();
+        for (c, t) in self.checked.iter_mut().zip(taken) {
+            *c = on && !t;
+        }
+    }
+
+    /// The page as the native controls show it.
+    pub fn native(&self) -> NativeImport {
+        let title = match self.current() {
+            Some(f) => format!("Import from {}", f.name()),
+            None if self.snippets => "Import scripts".to_owned(),
+            None => "Import connections".to_owned(),
+        };
+        let page = match self.current() {
+            None => {
+                let mut problems = Vec::new();
+                if self.found.is_empty() {
+                    problems.push(
+                        if self.snippets {
+                            "No other program has scripts here."
+                        } else {
+                            "No other SSH client has sessions here."
+                        }
+                        .to_owned(),
+                    );
+                }
+                problems.extend(self.problems.iter().cloned());
+                NativePage::Sources {
+                    sources: self
+                        .found
+                        .iter()
+                        .map(|f| NativeSource {
+                            program: f.name().to_owned(),
+                            what: f.what(),
+                            origin: if f.origin == "registry" {
+                                "Registry".to_owned()
+                            } else {
+                                f.origin.clone()
+                            },
                         })
+                        .collect(),
+                    problems,
+                    hint: if self.snippets {
+                        "From a file reads Windows Terminal settings.json or .wt.json, \
+                         SecureCRT ButtonBarV5.ini, MobaXterm.ini, a .script or .snippet \
+                         file, or a text file as one script. Each becomes a file in the \
+                         scripts folder."
+                    } else {
+                        "From a file reads WinSCP.ini, MobaXterm.ini, confCons.xml, or a \
+                         SecureCRT or KiTTY session file. Passwords are never imported."
                     }
-                    Items::Snippets(_, all) => {
-                        let snippets: Vec<Snippet> = all
-                            .iter()
-                            .zip(&self.checked)
-                            .filter(|(_, c)| **c)
-                            .map(|(s, _)| s.clone())
-                            .collect();
-                        (!snippets.is_empty()).then_some(ImportAction::ImportSnippets(snippets))
-                    }
+                    .to_owned(),
+                    last: self.last.filter(|&i| i < self.found.len()),
                 }
             }
-            Row::Note(_) | Row::Blank => None,
+            Some(f) => NativePage::Preview {
+                items: (0..f.len())
+                    .map(|i| NativeItem {
+                        name: f.label(i),
+                        detail: f.detail(i),
+                        notes: f.notes(i).join("; "),
+                        taken: f.taken(i),
+                        checked: self.checked.get(i).copied().unwrap_or(false),
+                    })
+                    .collect(),
+                chosen: self.chosen(),
+                importable: f.importable(),
+                footer: match &f.items {
+                    Items::Sessions(client, _) => format!(
+                        "Saved to {}, replacing an earlier {} import. Passwords are never \
+                         imported.",
+                        client.file_name(),
+                        client.name()
+                    ),
+                    Items::Snippets(..) => "Added to the scripts folder, by category.".to_owned(),
+                },
+            },
+        };
+        NativeImport {
+            title,
+            snippets: self.snippets,
+            page,
+            serial: self.serial,
         }
     }
 
@@ -782,6 +963,87 @@ mod tests {
         let back = t[y].find("Back").unwrap();
         v.click(back, y, 16);
         assert_eq!(texts(&mut v)[1], r" ▸ KiTTY  2 sessions, D:\kitty\Sessions");
+    }
+
+    #[test]
+    fn native_pages_open_tick_and_go_back() {
+        let mut v = view();
+        let n = v.native();
+        assert_eq!(n.title, "Import connections");
+        let NativePage::Sources { sources, last, .. } = &n.page else {
+            panic!("{n:?}");
+        };
+        assert_eq!(
+            sources[0],
+            NativeSource {
+                program: "WinSCP".into(),
+                what: "3 sessions".into(),
+                origin: "Registry".into(),
+            }
+        );
+        assert_eq!(*last, None);
+        assert!(!v.go_back());
+        v.open(0);
+        let n = v.native();
+        assert_eq!(n.title, "Import from WinSCP");
+        assert_ne!(n.serial, 0);
+        let NativePage::Preview {
+            items,
+            chosen,
+            importable,
+            footer,
+        } = &n.page
+        else {
+            panic!("{n:?}");
+        };
+        assert_eq!((*chosen, *importable), (2, 2));
+        assert_eq!(items[0].detail, "me@web.lan SFTP");
+        assert_eq!(items[0].notes, "its saved password stays behind");
+        assert!(items[1].taken && !items[1].checked);
+        assert_eq!(items[1].notes, "db is already a host");
+        assert!(footer.starts_with("Saved to imported-winscp.conf"));
+        // A taken item stays clear.
+        v.check(1, true);
+        v.check(0, false);
+        let names = |v: &ImportView| match v.import() {
+            Some(ImportAction::Import { sessions, .. }) => {
+                sessions.into_iter().map(|s| s.name).collect::<Vec<_>>()
+            }
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(names(&v), ["files"]);
+        v.check_all(false);
+        assert_eq!(v.import(), None);
+        v.check_all(true);
+        assert_eq!(names(&v), ["Work/web", "files"]);
+        let serial = v.native().serial;
+        assert!(v.go_back());
+        let n = v.native();
+        assert!(n.serial > serial);
+        assert!(matches!(n.page, NativePage::Sources { last: Some(0), .. }));
+    }
+
+    #[test]
+    fn native_sources_say_what_was_not_found() {
+        let v = ImportView::new(Vec::new(), vec!["confCons.xml is encrypted".into()]);
+        let NativePage::Sources {
+            sources,
+            problems,
+            hint,
+            ..
+        } = v.native().page
+        else {
+            panic!();
+        };
+        assert!(sources.is_empty());
+        assert_eq!(
+            problems,
+            [
+                "No other SSH client has sessions here.",
+                "confCons.xml is encrypted"
+            ]
+        );
+        assert!(hint.contains("Passwords are never imported."));
     }
 
     #[test]

@@ -126,6 +126,7 @@ use crate::forwards::{
 use crate::fwd_panel;
 use crate::fwdview::{ForwardsView, FwdAction};
 use crate::highlight;
+use crate::import_panel;
 use crate::import_reg;
 use crate::import_view::{Found, ImportAction, ImportView, Items};
 use crate::layout::{self, Axis, Closed, Dir, Drop, PaneId, Rect, Workspace};
@@ -1833,6 +1834,8 @@ fn create_and_run(launch: Launch, theme: Option<String>) -> Result<()> {
         let _ = live_panel::create(hwnd, live_event, dpi);
         // The connection form's, likewise.
         let _ = form_view::create(hwnd, form_event, dpi);
+        // The import page's (File > Import connections), likewise.
+        let _ = import_panel::create(hwnd, import_event, dpi);
         // The file transfer pane's, likewise.
         let _ = files_panel::create(hwnd, files_event, dpi);
         // The port forwards pane's, likewise.
@@ -1907,6 +1910,7 @@ fn create_and_run(launch: Launch, theme: Option<String>) -> Result<()> {
             if conn_view::pre_translate(&msg)
                 || live_panel::pre_translate(&msg)
                 || form_view::pre_translate(&msg)
+                || import_panel::pre_translate(&msg)
                 || files_panel::pre_translate(&msg)
                 || fwd_panel::pre_translate(&msg)
                 || scripts_panel::pre_translate(&msg)
@@ -7968,7 +7972,8 @@ impl Window {
     }
 
     /// Whether the connection manager shows as native controls: its list
-    /// is open (not the session form or the import page, still drawn).
+    /// is open (not the session form or the import page, which have
+    /// their own).
     fn conn_native(&self) -> bool {
         self.side.visible
             && self.side.view == SideView::Sessions
@@ -8031,13 +8036,21 @@ impl Window {
             && !self.snippets_view.reporting()
     }
 
-    /// Whether the connection form shows as native controls (the import
-    /// page is still drawn).
+    /// Whether the connection form shows as native controls.
     fn form_native(&self) -> bool {
         self.side.visible
             && self.side.view == SideView::Sessions
             && self.side.form.is_some()
             && self.side.import.is_none()
+    }
+
+    /// Whether the import page (File > Import connections or scripts)
+    /// shows as native controls.
+    fn import_native(&self) -> bool {
+        self.side.visible
+            && self.side.view == SideView::Sessions
+            && self.side.form.is_none()
+            && self.side.import.is_some()
     }
 
     /// The connection form as the native controls show it.
@@ -8059,6 +8072,8 @@ impl Window {
     fn active_tool_has_focus(&self) -> bool {
         if self.form_native() {
             form_view::has_focus()
+        } else if self.import_native() {
+            import_panel::has_focus()
         } else if self.conn_native() {
             conn_view::has_focus()
         } else if self.live_native() {
@@ -8177,6 +8192,12 @@ impl Window {
         } else {
             form_view::place(None, 0, self.dpi);
         }
+        if let Some(view) = self.side.import.as_ref().filter(|_| self.import_native()) {
+            import_panel::set_view(view.native());
+            import_panel::place(self.areas.side, self.areas.side_width, self.dpi);
+        } else {
+            import_panel::place(None, 0, self.dpi);
+        }
         let want = self.wants_tools_focus();
         let to = if want && self.focused && self.live_native() && self.wants_name_edit() {
             Some(2)
@@ -8205,6 +8226,7 @@ impl Window {
         (self.conn_native()
             || self.live_native()
             || self.form_native()
+            || self.import_native()
             || self.files_visible()
             || self.fwd_native()
             || self.scripts_native()
@@ -14858,6 +14880,7 @@ fn tools_have_focus() -> bool {
     conn_view::has_focus()
         || live_panel::has_focus()
         || form_view::has_focus()
+        || import_panel::has_focus()
         || files_panel::has_focus()
         || fwd_panel::has_focus()
         || scripts_panel::has_focus()
@@ -15114,6 +15137,52 @@ fn form_event(hwnd: HWND, event: form_view::Event) {
             None
         }
     };
+    if let Some(command) = command {
+        run_command(hwnd, command);
+    }
+}
+
+/// Carries out what the user did on the import page's controls.
+fn import_event(hwnd: HWND, event: import_panel::Event) {
+    use import_panel::Event;
+    let command = with_window(|w| {
+        let action = match (event, &mut w.side.import) {
+            (Event::Focused, _) => {
+                if w.side.focused {
+                    return None;
+                }
+                w.side.focused = true;
+                None
+            }
+            (_, None) => return None,
+            (Event::Open(i), Some(view)) => {
+                view.open(i);
+                None
+            }
+            (Event::Check(i, on), Some(view)) => {
+                view.check(i, on);
+                None
+            }
+            (Event::CheckAll(on), Some(view)) => {
+                view.check_all(on);
+                None
+            }
+            (Event::Back, Some(view)) => {
+                // Back on the list of sources closes, as Escape does.
+                if view.go_back() {
+                    None
+                } else {
+                    Some(ImportAction::Close)
+                }
+            }
+            (Event::FromFile, Some(_)) => Some(ImportAction::FromFile),
+            (Event::Import, Some(view)) => view.import(),
+            (Event::Close, Some(_)) => Some(ImportAction::Close),
+        };
+        // `import_action` refreshes the page.
+        w.import_action(action)
+    })
+    .flatten();
     if let Some(command) = command {
         run_command(hwnd, command);
     }
@@ -17027,6 +17096,9 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                         None => live_panel::focus_list(),
                     },
                     1 if want && form => form_view::focus_first(),
+                    1 if want && with_window(|w| w.import_native()) == Some(true) => {
+                        import_panel::focus_first();
+                    }
                     1 if want && conn => conn_view::focus_tree(),
                     1 if want && live => live_panel::focus_list(),
                     1 if want && files => files_panel::focus_first(),
