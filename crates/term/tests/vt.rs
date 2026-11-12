@@ -710,3 +710,158 @@ fn all_text_joins_wrapped_lines_and_keeps_wide_characters() {
     assert_eq!(t.all_text(), vec!["one", "", "two"]);
     assert!(term(10, 4).all_text().is_empty());
 }
+
+#[test]
+fn input_line_reads_what_was_typed_after_the_prompt() {
+    let mut t = term(20, 5);
+    t.feed(b"total 0\r\nuser@h:~$ ");
+    let mut mark = t.input_mark().unwrap();
+    assert_eq!(mark.prompt(), "user@h:~$ ");
+    t.feed(b"git st");
+    let line = t.input_line(&mut mark).unwrap();
+    assert_eq!(line.before, "git st");
+    assert_eq!(line.after, "");
+    // Left arrow: the cursor is inside the line.
+    t.feed(b"\x08\x08");
+    let line = t.input_line(&mut mark).unwrap();
+    assert_eq!(line.before, "git ");
+    assert_eq!(line.after, "st");
+    // A line that wraps onto the next row.
+    t.feed(b"\x1b[Kstatus --short --branch");
+    let line = t.input_line(&mut mark).unwrap();
+    assert_eq!(line.before, "git status --short --branch");
+    // Output moves the cursor off the line.
+    t.feed(b"\r\n## main\r\n");
+    assert_eq!(t.input_line(&mut mark), None);
+}
+
+#[test]
+fn input_line_follows_a_prompt_redrawn_elsewhere() {
+    let mut t = term(30, 6);
+    t.feed(b"a\r\nb\r\n$ ");
+    let mut mark = t.input_mark().unwrap();
+    t.feed(b"ls -l");
+    // Ctrl+L: the screen is cleared and the prompt drawn at the top.
+    t.feed(b"\x1b[H\x1b[2J$ ls -l");
+    assert_eq!(t.input_line(&mut mark).unwrap().before, "ls -l");
+    t.feed(b"a");
+    assert_eq!(t.input_line(&mut mark).unwrap().before, "ls -la");
+}
+
+#[test]
+fn input_line_stops_at_a_right_hand_prompt() {
+    let mut t = term(40, 3);
+    // zsh draws the right-hand prompt with the prompt, before typing.
+    t.feed(b"% \x1b[34G[main]\x1b[3G");
+    let mut mark = t.input_mark().unwrap();
+    t.feed(b"make");
+    let line = t.input_line(&mut mark).unwrap();
+    assert_eq!(line.before, "make");
+    assert_eq!(line.after, "");
+}
+
+#[test]
+fn input_mark_is_none_on_the_alternate_screen() {
+    let mut t = term(20, 5);
+    t.feed(b"$ ");
+    let mut mark = t.input_mark().unwrap();
+    t.feed(b"\x1b[?1049h");
+    assert!(t.input_mark().is_none());
+    assert_eq!(t.input_line(&mut mark), None);
+}
+
+#[test]
+fn input_text_reads_the_line_after_enter() {
+    let mut t = term(20, 5);
+    t.feed(b"$ ");
+    let mark = t.input_mark().unwrap();
+    t.feed(b"echo one two three four");
+    t.feed(b"\r\none two three four\r\n$ ");
+    assert_eq!(
+        t.input_text(&mark).as_deref(),
+        Some("echo one two three four")
+    );
+}
+
+#[test]
+fn a_gap_inside_a_command_is_not_a_right_hand_prompt() {
+    let mut t = term(40, 4);
+    t.feed(b"$ ");
+    let mut mark = t.input_mark().unwrap();
+    t.feed(b"echo \"a   b\"");
+    assert_eq!(t.input_line(&mut mark).unwrap().before, "echo \"a   b\"");
+    // The cursor before the gap: text still follows it.
+    t.feed(b"\x1b[5D");
+    let line = t.input_line(&mut mark).unwrap();
+    assert_eq!(line.after, "   b\"");
+    t.feed(b"\r\na   b\r\n$ ");
+    assert_eq!(t.input_text(&mark).as_deref(), Some("echo \"a   b\""));
+}
+
+#[test]
+fn a_gap_inside_a_command_at_the_edge_is_not_a_right_hand_prompt() {
+    // `echo "a   b"` leaves two blank cells on a 16-column row.
+    let mut t = term(16, 4);
+    t.feed(b"$ ");
+    let mut mark = t.input_mark().unwrap();
+    t.feed(b"echo \"a   b\"");
+    t.feed(b"\x1b[5D");
+    let line = t.input_line(&mut mark).unwrap();
+    assert_eq!(line.before, "echo \"a");
+    assert_eq!(line.after, "   b\"");
+    t.feed(b"\r\na   b\r\n$ ");
+    assert_eq!(t.input_text(&mark).as_deref(), Some("echo \"a   b\""));
+}
+
+#[test]
+fn a_right_hand_prompt_one_cell_from_the_edge_is_cut() {
+    let mut t = term(40, 3);
+    // zsh's RPROMPT, one cell in from the edge.
+    t.feed(b"% \x1b[34G[main]\x1b[3G");
+    let mark = t.input_mark().unwrap();
+    t.feed(b"make\r\n");
+    assert_eq!(t.input_text(&mark).as_deref(), Some("make"));
+}
+
+#[test]
+fn input_line_follows_a_command_wrapped_over_many_rows() {
+    // 350 characters on 20 columns: 18 rows.
+    let mut t = term(20, 30);
+    t.feed(b"$ ");
+    let mut mark = t.input_mark().unwrap();
+    let cmd = "x".repeat(350);
+    t.feed(cmd.as_bytes());
+    assert_eq!(t.input_line(&mut mark).unwrap().before, cmd);
+    assert!(t.input_here(&mark));
+    t.feed(b"\r\n$ ");
+    assert_eq!(t.input_text(&mark).as_deref(), Some(cmd.as_str()));
+}
+
+#[test]
+fn input_text_is_none_for_a_line_longer_than_any_kept() {
+    let mut t = term(20, 200);
+    t.feed(b"$ ");
+    let mark = t.input_mark().unwrap();
+    t.feed(b"echo safe");
+    t.feed(" ".repeat(2200).as_bytes());
+    t.feed(b"other\r\n$ ");
+    assert_eq!(t.input_text(&mark), None);
+}
+
+#[test]
+fn input_line_follows_a_long_line_of_wide_characters() {
+    // 550 double-width characters on 20 columns: 55 rows.
+    let mut t = term(20, 80);
+    t.feed(b"$ ");
+    let mut mark = t.input_mark().unwrap();
+    let cmd = "\u{754c}".repeat(550);
+    t.feed(cmd.as_bytes());
+    assert_eq!(t.input_line(&mut mark).unwrap().before, cmd);
+    // An odd width leaves a blank cell at each row's end.
+    let mut t = term(19, 130);
+    t.feed(b"$ ");
+    let mut mark = t.input_mark().unwrap();
+    let cmd = "\u{754c}".repeat(1024);
+    t.feed(cmd.as_bytes());
+    assert_eq!(t.input_line(&mut mark).unwrap().before, cmd);
+}

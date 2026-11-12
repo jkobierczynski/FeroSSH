@@ -149,6 +149,75 @@ struct Stop {
     last_hit: Option<u64>,
 }
 
+/// Where typing on a command line started: from [`Terminal::input_mark`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct InputMark {
+    /// The row, counted from the oldest line kept.
+    line: usize,
+    col: usize,
+    /// The text before the mark on its row.
+    prompt: String,
+    /// A right-hand prompt the row showed when the mark was made (what
+    /// followed the cursor before anything was typed), or empty.
+    right: String,
+}
+
+impl InputMark {
+    /// The text before the mark on its row: the shell's prompt, or a
+    /// program's question such as `Password: `.
+    pub fn prompt(&self) -> &str {
+        &self.prompt
+    }
+}
+
+/// The command line typed since an [`InputMark`].
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct InputLine {
+    /// From the mark to the cursor.
+    pub before: String,
+    /// After the cursor, without a right-hand prompt at the row's end,
+    /// trailing blanks dropped.
+    pub after: String,
+}
+
+/// Where the command line ends on a row that goes on with a right-hand
+/// prompt.
+const INPUT_GAP: &str = "   ";
+
+/// Blank cells a right-hand prompt may leave at the row's end (zsh leaves
+/// one, `ZLE_RPROMPT_INDENT`).
+const RIGHT_PROMPT_INDENT: usize = 2;
+
+/// `text` (whole rows, to the right edge) without the right-hand prompt
+/// `right` its row showed before typing started: when `text` ends with it,
+/// after a gap of [`INPUT_GAP`], at the right edge. Only a prompt seen
+/// there before typing is cut, so a gap inside a command (`echo "a   b"`)
+/// stays, even when it ends at the edge.
+fn without_right_prompt<'a>(text: &'a str, right: &str) -> &'a str {
+    if right.is_empty() {
+        return text;
+    }
+    let t = text.trim_end();
+    if text.len() - t.len() > RIGHT_PROMPT_INDENT {
+        return text;
+    }
+    match t.strip_suffix(right) {
+        Some(head) if head.ends_with(INPUT_GAP) => head,
+        _ => text,
+    }
+}
+
+/// The longest command line [`Terminal::input_line`] follows, in
+/// characters (the longest a history keeps).
+const MAX_INPUT_CHARS: usize = 1024;
+
+/// The most rows a command line of [`MAX_INPUT_CHARS`] spans on rows of
+/// `cols` columns, with the prompt: wide characters take two cells, and
+/// one that does not fit at a row's end leaves that cell blank.
+fn max_input_rows(cols: usize) -> usize {
+    MAX_INPUT_CHARS / (cols / 2).max(1) + 2
+}
+
 /// One terminal: the emulator, its parser and the pane's search state.
 pub struct Terminal {
     term: Term<Events>,
@@ -183,6 +252,9 @@ pub struct Terminal {
     /// While the alternate screen is up: the title from before it, and
     /// whether the app on it set another.
     alt_title: Option<(Option<String>, bool)>,
+    /// Feeds of host output so far, to tell whether the host answered
+    /// something typed.
+    fed: u64,
 }
 
 impl std::fmt::Debug for Terminal {
@@ -224,6 +296,7 @@ impl Terminal {
             reported: Vec::new(),
             title: None,
             alt_title: None,
+            fed: 0,
         }
     }
 
@@ -357,6 +430,7 @@ impl Terminal {
 
     /// Processes output from the host. Call [`Self::take_actions`] after.
     pub fn feed(&mut self, bytes: &[u8]) {
+        self.fed = self.fed.wrapping_add(1);
         let found = self.cwd.scan(bytes);
         // Only the last report of a burst matters.
         if let Some(last) = found.into_iter().last() {
@@ -1004,6 +1078,235 @@ impl Terminal {
             text.push(cell.c);
         }
         Some(text)
+    }
+
+    /// Where typing on the command line starts: the cursor, with the
+    /// text before it on its row (the prompt). `None` while a full-screen
+    /// program shows the alternate screen. Read the line typed since with
+    /// [`Self::input_line`].
+    pub fn input_mark(&self) -> Option<InputMark> {
+        if self.term.mode().contains(TermMode::ALT_SCREEN) {
+            return None;
+        }
+        let grid = self.term.grid();
+        let at = grid.cursor.point;
+        let col = at.column.0.min(grid.columns());
+        Some(InputMark {
+            line: self.absolute(at.line)?,
+            col,
+            prompt: self.row_text(at.line, 0, col),
+            right: self
+                .row_text(at.line, col, grid.columns())
+                .trim()
+                .to_owned(),
+        })
+    }
+
+    /// The command line typed since `mark`: the text from the mark to the
+    /// cursor, rows the line wrapped onto included, and what follows the
+    /// cursor on it. When output moved the mark's row (Ctrl+L, a redrawn
+    /// prompt), the mark follows a row that starts with the same prompt
+    /// on the cursor's line. `None` on the alternate screen, or when the
+    /// cursor is no longer on the mark's line.
+    pub fn input_line(&self, mark: &mut InputMark) -> Option<InputLine> {
+        if self.term.mode().contains(TermMode::ALT_SCREEN) {
+            return None;
+        }
+        let grid = self.term.grid();
+        let cursor = grid.cursor.point;
+        let cols = grid.columns();
+        // Rows the cursor's line wrapped from, nearest first.
+        let mut starts = vec![cursor.line];
+        let mut l = cursor.line;
+        while l > grid.topmost_line()
+            && grid[l - 1i32][Column(cols - 1)]
+                .flags
+                .contains(TermFlags::WRAPLINE)
+            && starts.len() < max_input_rows(cols)
+        {
+            l -= 1i32;
+            starts.push(l);
+        }
+        let kept = self
+            .relative(mark.line)
+            .filter(|l| self.row_text(*l, 0, mark.col) == mark.prompt);
+        let start = match kept {
+            Some(l) if starts.contains(&l) => l,
+            // The prompt was drawn again elsewhere (Ctrl+L): find it on
+            // the cursor's line.
+            _ if mark.prompt.trim().is_empty() => return None,
+            _ => starts
+                .iter()
+                .copied()
+                .find(|l| self.row_text(*l, 0, mark.col) == mark.prompt)?,
+        };
+        mark.line = self.absolute(start)?;
+        if start == cursor.line && cursor.column.0 < mark.col {
+            return None;
+        }
+        // The cursor's column; past the last one when the next character
+        // wraps.
+        let cursor_col = if grid.cursor.input_needs_wrap {
+            cols
+        } else {
+            cursor.column.0
+        };
+        let mut before = String::new();
+        let mut line = start;
+        let mut from = mark.col;
+        while line < cursor.line {
+            before.push_str(&self.row_text(line, from, cols));
+            from = 0;
+            line += 1i32;
+        }
+        before.push_str(&self.row_text(cursor.line, from, cursor_col));
+        // What follows the cursor, up to a wide gap (a right-hand prompt).
+        let mut rest = self.row_text(cursor.line, cursor_col, cols);
+        let mut l = cursor.line;
+        while l < grid.bottommost_line()
+            && grid[l][Column(cols - 1)]
+                .flags
+                .contains(TermFlags::WRAPLINE)
+        {
+            l += 1i32;
+            rest.push_str(&self.row_text(l, 0, cols));
+        }
+        Some(InputLine {
+            before,
+            after: without_right_prompt(&rest, &mark.right)
+                .trim_end()
+                .to_owned(),
+        })
+    }
+
+    /// How many times host output was fed in: a change means the host
+    /// answered (echoed) what was typed before.
+    pub fn output_count(&self) -> u64 {
+        self.fed
+    }
+
+    /// Whether the cursor waits at the end of a full row: the next
+    /// character goes on the next row, not where the cursor is drawn.
+    pub fn wrap_pending(&self) -> bool {
+        self.term.grid().cursor.input_needs_wrap
+    }
+
+    /// Whether the cursor is still on the line `mark` starts, where it
+    /// started (no looking for the prompt elsewhere): after Enter, whether
+    /// the host has answered yet.
+    pub fn input_here(&self, mark: &InputMark) -> bool {
+        if self.term.mode().contains(TermMode::ALT_SCREEN) {
+            return false;
+        }
+        let grid = self.term.grid();
+        let Some(start) = self
+            .relative(mark.line)
+            .filter(|l| self.row_text(*l, 0, mark.col) == mark.prompt)
+        else {
+            return false;
+        };
+        let cols = grid.columns();
+        let mut l = grid.cursor.point.line;
+        for _ in 0..max_input_rows(cols) {
+            if l == start {
+                return true;
+            }
+            if l <= grid.topmost_line()
+                || !grid[l - 1i32][Column(cols - 1)]
+                    .flags
+                    .contains(TermFlags::WRAPLINE)
+            {
+                return false;
+            }
+            l -= 1i32;
+        }
+        false
+    }
+
+    /// The whole command line at `mark`, wherever the cursor is: from the
+    /// mark to the end of the line (rows it wrapped onto included), up to
+    /// a right-hand prompt. For reading a line once Enter moved past it.
+    /// `None` on the alternate screen or when the mark's row no longer
+    /// starts with its prompt.
+    pub fn input_text(&self, mark: &InputMark) -> Option<String> {
+        if self.term.mode().contains(TermMode::ALT_SCREEN) {
+            return None;
+        }
+        let grid = self.term.grid();
+        let cols = grid.columns();
+        let mut line = self.relative(mark.line)?;
+        if self.row_text(line, 0, mark.col) != mark.prompt {
+            return None;
+        }
+        let mut text = self.row_text(line, mark.col, cols);
+        let mut rows = 1;
+        while line < grid.bottommost_line()
+            && rows < max_input_rows(cols)
+            && grid[line][Column(cols - 1)]
+                .flags
+                .contains(TermFlags::WRAPLINE)
+        {
+            line += 1i32;
+            rows += 1;
+            text.push_str(&self.row_text(line, 0, cols));
+        }
+        // Longer than any command kept: not cut to a prefix.
+        if line < grid.bottommost_line()
+            && grid[line][Column(cols - 1)]
+                .flags
+                .contains(TermFlags::WRAPLINE)
+        {
+            return None;
+        }
+        Some(
+            without_right_prompt(&text, &mark.right)
+                .trim_end()
+                .to_owned(),
+        )
+    }
+
+    /// The text of grid line `line` from column `from` to before `to`,
+    /// wide-character spacers left out, tabs as spaces.
+    fn row_text(&self, line: Line, from: usize, to: usize) -> String {
+        let grid = self.term.grid();
+        if line < grid.topmost_line() || line > grid.bottommost_line() {
+            return String::new();
+        }
+        let row = &grid[line];
+        let to = to.min(grid.columns());
+        let mut text = String::new();
+        for c in from..to {
+            let cell = &row[Column(c)];
+            if cell
+                .flags
+                .intersects(TermFlags::WIDE_CHAR_SPACER | TermFlags::LEADING_WIDE_CHAR_SPACER)
+            {
+                continue;
+            }
+            text.push(if cell.c == '\t' || cell.c.is_control() {
+                ' '
+            } else {
+                cell.c
+            });
+            if let Some(extra) = cell.zerowidth() {
+                text.extend(extra);
+            }
+        }
+        text
+    }
+
+    /// A grid line counted from the oldest line kept, which stays put as
+    /// output scrolls (until the history is full).
+    fn absolute(&self, line: Line) -> Option<usize> {
+        usize::try_from(i64::from(line.0) + self.term.grid().history_size() as i64).ok()
+    }
+
+    /// The grid line of an absolute line, if it is still kept.
+    fn relative(&self, line: usize) -> Option<Line> {
+        let grid = self.term.grid();
+        let l = i64::try_from(line).ok()? - grid.history_size() as i64;
+        let l = Line(i32::try_from(l).ok()?);
+        (l >= grid.topmost_line() && l <= grid.bottommost_line()).then_some(l)
     }
 
     /// The raw OSC 8 link target of a viewport cell, if it has one. Check

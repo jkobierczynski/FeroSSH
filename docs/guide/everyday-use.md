@@ -511,6 +511,28 @@ While it is on, FeroSSH runs one small read-only command per server on a channel
 
 While you are scrolled back, a thin bar at the right edge shows where you are. Edit > Copy on select and Edit > Right-click pastes turn on the PuTTY habits. Scrollback is 10,000 lines unless you change it (`Scrollback`); Edit > Clear scrollback forgets it.
 
+## Command suggestions
+
+Edit > Suggest commands as you type (off until you turn it on) shows, greyed after the cursor, the most recent command you ran on this host that starts with what you have typed. When the host has none yet, a short list of common commands (`git status`, `systemctl status `, `docker compose up -d` and so on) fills in after two characters.
+
+| To | Press |
+| --- | --- |
+| Type the whole suggestion | Right arrow or End |
+| Type its next word | Ctrl+Right |
+| See another match | Ctrl+Up, Ctrl+Down |
+| Forget the one shown (a built-in one until FeroSSH restarts) | Shift+Delete |
+
+Any other key goes to the host as usual, and typing on simply changes or hides the suggestion. A command you forgot with Shift+Delete comes back once you run it again. On a slow link, editing keys (Backspace, Tab, arrows) pressed before the host has answered the previous key turn suggestions off for the rest of that line, since FeroSSH can no longer tell which line is final. Nothing shows while you are scrolled back, in a full-screen program such as vim or less, or when the shell already shows its own suggestion after the cursor (fish, zsh-autosuggestions, PowerShell's PSReadLine).
+
+FeroSSH reads the command from the screen, from the end of the prompt to the end of the line, once Enter runs it, so Tab completion, the shell's own history and editing keys all count. It keeps it in a history for that host (user, host and port; a tmux pane shares its connection's), up to 1,000 commands. What it never keeps:
+
+- anything the host does not echo, such as a password typed at `Password:`, since it never appears on the screen;
+- lines typed at a prompt that asks for a password, passphrase, PIN, token or code, even when they are echoed;
+- commands that match common secret patterns: `PASSWORD=...`, `password = '...'`, `--token x`, `api_key: ...`, `mysql -pSecret`, `curl -u user:pass`, `sshpass -p`, `https://user:pass@host` (a secret in another form, such as a bare argument, can still be kept: start such a line with a space);
+- lines that start with a space, as bash's `ignorespace` does.
+
+The histories stay on this PC in `%LOCALAPPDATA%\FeroSSH\history`, one file per host, encrypted with your Windows sign-in (DPAPI): another Windows account, or the files copied to another PC, cannot read them. Edit > Clear command history for this host, or for all hosts, deletes them. Turning suggestions off stops reading what you type straight away.
+
 ## Highlighting and following output
 
 Keywords in the output show in colour, as in MobaXterm: errors and failures in red, warnings in yellow, success in green, IP addresses in cyan and MAC addresses in magenta. Only plain text is recoloured, so a program's own colours win, and full-screen programs such as vim and mc are left alone. Session > Highlight keywords turns it off and on; `Highlight no` in a host's `Profile` turns it off for that host only. Your own rules (`HighlightRule` in [Settings](settings.md#highlight-rules)) take a list of words or a regular expression, a colour, bold or underline, and the hosts they are for. They come before the standard set, which `HighlightStandard no` drops.
