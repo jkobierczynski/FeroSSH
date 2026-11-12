@@ -36,6 +36,32 @@ web1_tab1_2026-10-24_2215_saved.log
 
 Session > Save output of all panes to logs does that for every pane in every tab, one file each. A message lists the files it wrote. How much there is depends on the scrollback (10,000 lines unless you set `Scrollback`).
 
+## Recording a pane and playing it back
+
+A log keeps the text. A recording keeps the session as it happened, with its timing, so you can watch it again later: for an audit, to show someone how something was done, or for a demo.
+
+**Recording.** Session > Record this pane (asciicast) starts recording the focused pane; choose it again to stop. It is off until you turn it on, and the menu shows ✓ while the pane records. The file goes to the log folder, named like a log but ending in `.cast`:
+
+```
+web1_tab1_2026-11-12_0935.cast
+```
+
+It holds what the host sent and when, and the size of the terminal whenever it changed. It never holds your keystrokes: what you type is in it only as far as the host echoes it back to the screen, and hosts do not echo passwords, so passwords typed at a `sudo` or login prompt are not in it. A secret the host does show is: one typed as part of a command line (`mysql -pSecret`) or printed by a program. FeroSSH's own prompts (the connect prompt, password and passphrase questions) and messages are left out too. A recording starts from an empty screen, so turn it on before the part you want; it keeps going across a reconnect and ends when you stop it, close the pane or quit FeroSSH. Recordings are sealed with a chain file and go into the log index like logs (see below), so Session > Check a log for changes works on them too.
+
+The format is asciicast version 2, the format of [asciinema](https://asciinema.org): you can also play a FeroSSH recording with `asciinema play`, put it on a web page with the asciinema player, or play recordings made by asciinema in FeroSSH.
+
+**Playing.** Session > Play a recording... asks for a `.cast` file and plays it in a new tab, at the size it was recorded at. The tab shows the file, ▶ while playing (‖ paused, ■ at the end), where it stands and how long it is, and the speed when it is not normal.
+
+| Key | What it does |
+| --- | --- |
+| Space | Pause, or play on. At the end, play again from the start. |
+| Left, Right | 5 seconds back or on (with Shift: 30 seconds). |
+| Up, Down | Faster or slower: ¼×, ½×, 1×, 1½×, 2×, 4×, 8×, 16×, 32×. |
+| Home, End | Back to the start, or to the end. |
+| Page Up, Page Down | Scroll back through the output; the mouse wheel does too. |
+
+Other keys do nothing: a replay tab has no host to type to. Copying text works as in any pane. A recording only ever reaches the screen: it cannot write your clipboard, and FeroSSH does not answer the queries in it. A recording that sets its own pause limit (`idle_time_limit`) plays with long pauses shortened to it. Lines in a file that cannot be read, such as a last line cut off when a PC crashed, are skipped, and input events in asciinema files are never played.
+
 ## Sealed logs and chain files
 
 Every log FeroSSH writes, plain, raw or saved, gets a **chain file** next to it, with the same name plus `.chain`:

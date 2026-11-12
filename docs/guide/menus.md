@@ -122,6 +122,8 @@ Font, theme and text size apply to the focused pane only. Session > Save font an
 | Save output of all panes to logs | The same for every pane in every tab, one file each. |
 | Open log folder | Opens `%LOCALAPPDATA%\FeroSSH\logs` in Explorer. |
 | Check a log for changes... | Picks a log and says whether it is intact, or where it was changed, cut short or added to. |
+| Record this pane (asciicast) | Records what the focused pane shows, with its timing, to a `.cast` file in the log folder, until you choose it again. Only the host's output goes in, never your keystrokes: what you type is in it only as the host echoes it, so a password typed at a prompt that does not echo stays out, but a secret the host echoes or prints (such as `mysql -pSecret` on a command line) is recorded. Off by default; ✓ while recording. See [Recording a pane](logs.md#recording-a-pane-and-playing-it-back). |
+| Play a recording... | Picks a `.cast` file and plays it in a new tab: Space pauses, Left and Right go 5 seconds back and on (Shift: 30), Up and Down change the speed, Home starts again, End goes to the end. |
 | Save font and theme for this host | Keeps the focused pane's font, text size and theme in the host's profile. |
 | Start new tabs and panes in this directory | Keeps the focused pane's directory as the host's start directory (Start dir in the connection form): new tabs, panes and tmux windows on that host start there when the directory of the pane they come from is not known, also after a restart. |
 | Replace host key... | After a host key change you know the reason for, trusts the new key. It asks twice. |
