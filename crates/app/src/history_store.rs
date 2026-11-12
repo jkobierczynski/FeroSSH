@@ -65,15 +65,26 @@ pub fn modified(key: &str) -> Option<SystemTime> {
 /// there is none, or it cannot be read (another user's, damaged).
 pub fn load(key: &str) -> (History, Option<SystemTime>) {
     let stamp = modified(key);
-    let history = file(key)
-        .and_then(|path| std::fs::read(path).ok())
-        .and_then(|blob| unprotect(&blob))
+    let history = read(key)
+        .ok()
+        .flatten()
+        .unwrap_or_else(|| History::new(key));
+    (history, stamp)
+}
+
+/// The history kept for `key`: `Ok(None)` when there is no file, `Err`
+/// when there is one this account on this PC cannot read.
+fn read(key: &str) -> Result<Option<History>, ()> {
+    let Some(blob) = file(key).and_then(|path| std::fs::read(path).ok()) else {
+        return Ok(None);
+    };
+    unprotect(&blob)
         .and_then(|plain| {
             let text = std::str::from_utf8(&plain).ok()?;
             History::parse(text, key)
         })
-        .unwrap_or_else(|| History::new(key));
-    (history, stamp)
+        .map(Some)
+        .ok_or(())
 }
 
 /// A history with its file's time when read.
@@ -119,9 +130,20 @@ pub fn update(
     change: impl FnOnce(&mut History) -> bool,
 ) -> Result<Stamped, (Stamped, String)> {
     let guard = lock();
-    let (mut history, stamp) = load(key);
+    let stamp = modified(key);
+    let found = read(key);
+    // A portable folder travels: a file another PC or account sealed (two
+    // PCs can share a name) is left alone rather than replaced.
+    let unreadable = found.is_err() && crate::portable::is_portable();
+    let mut history = found.ok().flatten().unwrap_or_else(|| History::new(key));
     if !change(&mut history) {
         return Ok((history, stamp));
+    }
+    if unreadable {
+        let e = "This host's command history was saved by another PC or Windows account, so \
+                 it is kept and not replaced."
+            .to_owned();
+        return Err(((history, stamp), e));
     }
     let saved = guard.and_then(|_guard| save(&history));
     match saved {
