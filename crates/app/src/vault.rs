@@ -107,7 +107,11 @@ impl ProcessLock {
         const FILE_FLAG_DELETE_ON_CLOSE: u32 = 0x0400_0000;
         let path = Self::path(vault);
         for i in 0..tries {
+            // `write` too: std refuses `create` without it, though the
+            // access mode below is what Windows is asked for.
             if let Ok(f) = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
                 .access_mode(GENERIC_READ | GENERIC_WRITE | DELETE)
                 .create(true)
                 .truncate(false)
