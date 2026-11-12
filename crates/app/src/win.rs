@@ -3305,8 +3305,16 @@ impl Window {
                     want,
                     others,
                 } => {
+                    let name = self
+                        .tmux
+                        .get(&gateway)
+                        .and_then(|t| t.session_name())
+                        .unwrap_or_default()
+                        .to_owned();
                     self.queued.push(Command::TmuxCrowded {
                         gateway,
+                        host: self.key_host(gateway).unwrap_or_default(),
+                        name,
                         session,
                         have,
                         want,
@@ -15922,8 +15930,11 @@ enum Command {
     /// to detach them.
     TmuxCrowded {
         gateway: PaneId,
-        /// The tmux session asked about.
+        /// The tmux session asked about, its name and its host, for the
+        /// question (it may be another tab's connection).
         session: ferossh_tmuxcc::SessionId,
+        name: String,
+        host: String,
         have: (u16, u16),
         want: (u16, u16),
         others: u32,
@@ -17319,6 +17330,8 @@ fn run_command(hwnd: HWND, command: Command) {
         Command::TmuxCrowded {
             gateway,
             session,
+            name,
+            host,
             have,
             want,
             others,
@@ -17329,13 +17342,18 @@ fn run_command(hwnd: HWND, command: Command) {
                 format!("{others} other tmux clients are")
             };
             let text = format!(
-                "{clients} attached to this tmux session, and tmux makes a window only as \
+                "{clients} attached to tmux session \"{}\" on {}, and tmux makes a window only as \
                  big as its smallest client. So it shows {}x{} instead of the {}x{} this pane \
                  has room for, leaving part of the pane empty.\n\n\
                  Often it is a client left behind by a dropped connection.\n\n\
                  Detach the other clients of this session? (Later: Session > tmux > \
                  Detach other clients.)",
-                have.0, have.1, want.0, want.1
+                crate::ssh::sanitize(&name),
+                crate::ssh::sanitize(&host),
+                have.0,
+                have.1,
+                want.0,
+                want.1
             );
             match dialog(hwnd, &text, MB_YESNO | MB_ICONQUESTION) {
                 Some(IDYES) => {

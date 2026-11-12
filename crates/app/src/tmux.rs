@@ -1537,9 +1537,17 @@ impl Tmux {
             } else {
                 false
             };
-            if sent && !self.crowded_asked {
+            if sent
+                && !self.crowded_asked
+                && let Some((session, _)) = self.session
+            {
                 // tmux resizes at once: did it give the window that size?
-                let line = format!("display-message -p -t @{w} {}", command::quote(SIZE_FORMAT));
+                // The session too, so a window linked into another
+                // session counts this one's clients.
+                let line = format!(
+                    "display-message -p -t ${session}:@{w} {}",
+                    command::quote(SIZE_FORMAT)
+                );
                 self.send(&line, Tag::SizeCheck(w, size), &mut out);
             }
             if let Some(layout) = layout {
@@ -1932,7 +1940,12 @@ mod tests {
         assert!(a.contains(&Action::Focus { native: n9 }));
         // Each window gets its pane's size; the layout and looks are saved.
         let w = writes(&t.sync_sizes(&ws, &|n| Some(if n == a0 { (100, 20) } else { (60, 10) })));
-        let check = |w: u32| format!("display-message -p -t @{w} {}", command::quote(SIZE_FORMAT));
+        let check = |w: u32| {
+            format!(
+                "display-message -p -t $0:@{w} {}",
+                command::quote(SIZE_FORMAT)
+            )
+        };
         assert_eq!(
             w,
             [
@@ -2095,7 +2108,7 @@ mod tests {
         // tmux gives the window the size asked for: nothing to say.
         let w = writes(&t.sync_sizes(&ws, &|_| Some((90, 30))));
         assert_eq!(w.len(), 2, "{w:?}");
-        assert!(w[1].starts_with("display-message -p -t @0 "));
+        assert!(w[1].starts_with("display-message -p -t $0:@0 "));
         answer(&mut t, &mut ws, &[]);
         let a = answer(&mut t, &mut ws, &["90 30 2".into()]);
         assert!(!a.iter().any(|a| matches!(a, Action::Crowded { .. })));
@@ -2179,7 +2192,7 @@ mod tests {
         let w = writes(&t.sync_sizes(&ws, &|n| Some(if n == a0 { (50, 30) } else { (49, 31) })));
         assert_eq!(w.len(), 3);
         assert_eq!(w[0], "refresh-client -C @0:100x30");
-        assert!(w[1].starts_with("display-message -p -t @0 "));
+        assert!(w[1].starts_with("display-message -p -t $0:@0 "));
         assert!(
             w[2].starts_with("select-layout -t @0 '")
                 && w[2].ends_with(",100x30,0,0{50x30,0,0,0,49x30,51,0,1}'")
