@@ -10394,9 +10394,11 @@ impl Window {
     }
 
     /// Back to the terminal from the snippets: the side pane hides again
-    /// when Ctrl+Shift+Space showed it.
+    /// when Ctrl+Shift+Space only peeked it, but a pinned pane stays open
+    /// (the user asked for it to stay), so leaving just returns focus to
+    /// the terminal.
     fn leave_snippets(&mut self) {
-        if self.snippets_peek {
+        if self.snippets_peek && !self.settings.tools_pinned {
             self.hide_side();
         } else {
             self.focus_terminal();
@@ -14043,6 +14045,10 @@ impl Window {
             }
             cmd::TOOLS_PIN => {
                 self.settings.tools_pinned = !self.settings.tools_pinned;
+                // Pinning means the pane stays by choice, not a peek.
+                if self.settings.tools_pinned {
+                    self.snippets_peek = false;
+                }
                 self.save_settings();
                 self.update_menu_checks();
                 self.refresh_chrome();
