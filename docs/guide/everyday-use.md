@@ -368,7 +368,7 @@ FeroSSH comes with a few hundred ready scripts, under a `Library` folder in the 
 - **Hacking** — standard recon, enumeration and listener commands for penetration tests, CTFs and lab practice, to run only on systems you are allowed to test.
 - **Networking** — addresses, ports, DNS, path and packet tools, TLS, bandwidth, scanning and a few Cisco commands.
 
-The library scripts work like any other: run one, edit it, pick a category, or use its `$1`, `${1:default}` arguments and `${host}` style variables. They are written into the scripts folder so **your changes stay yours**: edit a library script and your version is kept, delete one and it stays gone, and a FeroSSH upgrade only refreshes the library scripts you have not touched while adding any new ones. To start from a library script without changing it, select it and use Insert or New to make a copy in a category of your own. The library is built into `ferossh.exe`, so there is nothing to download.
+The library scripts work like any other: run one, edit it, pick a category, or use its `$1`, `${1:default}` arguments and `${host}` style variables. They are written into the scripts folder so **your changes stay yours**: edit a library script and your version is kept, delete one and it stays gone, and a FeroSSH upgrade only refreshes the library scripts you have not touched while adding any new ones. To keep the shipped version untouched, make your own script with New and paste the library script's lines into the editor (the lines box takes pasted text), or copy its file in the scripts folder into a category of your own; New on its own starts an empty script, it does not copy the selected one. The library is built into `ferossh.exe`, so there is nothing to download.
 
 ### Importing scripts
 

@@ -45,7 +45,7 @@ Snippet "Files - duplicate files by checksum"
     Line find ${1:.} -type f -size +0 -exec md5sum {} + | sort | uniq -w32 -dD
 
 Snippet "Files - replace text in files"
-    Line grep -rlI -- '${1:old}' ${3:.} | xargs -r sed -i 's/${1:old}/${2:new}/g'
+    Line grep -rlIZ -- '${1:old}' ${3:.} | xargs -0 -r sed -i 's/${1:old}/${2:new}/g'
 
 Snippet "Processes - top CPU users"
     Line ps -eo pid,user,%cpu,%mem,etime,cmd --sort=-%cpu | head -n 15

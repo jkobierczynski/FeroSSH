@@ -81,7 +81,7 @@ Snippet "TLS - certificate of a server"
     Line echo | openssl s_client -connect ${1:example.com}:${2:443} -servername ${1:example.com} 2>/dev/null | openssl x509 -noout -subject -issuer -dates -ext subjectAltName
 
 Snippet "TLS - days until a certificate expires"
-    Line echo | openssl s_client -connect ${1:example.com}:${2:443} -servername ${1:example.com} 2>/dev/null | openssl x509 -noout -enddate
+    Line d=$$(echo | openssl s_client -connect ${1:example.com}:${2:443} -servername ${1:example.com} 2>/dev/null | openssl x509 -noout -enddate | cut -d= -f2); echo "$$d"; echo "days left: $$(( ( $$(date -d "$$d" +%s) - $$(date +%s) ) / 86400 ))"
 
 Snippet "TLS - read a certificate file"
     Line openssl x509 -in ${1:cert.pem} -noout -text | less

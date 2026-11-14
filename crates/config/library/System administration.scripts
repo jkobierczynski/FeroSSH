@@ -45,7 +45,7 @@ Snippet "Packages - recently installed (Debian, Ubuntu)"
     Line grep -h ' install ' /var/log/dpkg.log* | sort | tail -n 30
 
 Snippet "Packages - is a reboot needed"
-    Line [ -f /var/run/reboot-required ] && cat /var/run/reboot-required* || (command -v needs-restarting >/dev/null && sudo needs-restarting -r) || echo 'No reboot needed'
+    Line if [ -f /var/run/reboot-required ]; then cat /var/run/reboot-required*; elif command -v needs-restarting >/dev/null; then sudo needs-restarting -r; else echo 'Cannot tell: no reboot-required file and no needs-restarting'; fi
 
 Snippet "Users - add a user with sudo"
     Line sudo useradd -m -s /bin/bash -G ${2:sudo} ${1:name} && sudo passwd ${1:name}

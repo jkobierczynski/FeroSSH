@@ -14,6 +14,7 @@
 //! folder is `Library`, keeping the shipped set apart from the user's
 //! own categories.
 
+use std::io;
 use std::path::{Path, PathBuf};
 
 use crate::login::Snippet;
@@ -155,13 +156,16 @@ pub fn sync(scripts_dir: &Path) {
             continue;
         };
         let new_hash = hash(text.as_bytes());
-        let on_disk = std::fs::read(&path).ok();
-        let write = match &on_disk {
+        let write = match std::fs::read(&path) {
             // There: refresh only one the user has left untouched since we
             // wrote it.
-            Some(bytes) => shipped.get(&rel).is_some_and(|h| *h == hash(bytes)),
+            Ok(bytes) => shipped.get(&rel).is_some_and(|h| *h == hash(&bytes)),
             // Missing: a new script, unless the user deleted one we shipped.
-            None => !shipped.contains_key(&rel),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => !shipped.contains_key(&rel),
+            // Some other trouble reading it (a lock, a permission): leave
+            // the folder as it is rather than writing a manifest that would
+            // later read an untouched file as the user's own edit.
+            Err(_) => return,
         };
         if write && write_file(&path, &text).is_err() {
             return;
@@ -190,7 +194,24 @@ mod tests {
     use super::*;
     use crate::snippet_store::EXTENSION;
 
-    fn temp(name: &str) -> PathBuf {
+    /// A temporary directory that cleans itself up when the test ends,
+    /// pass or fail. Derefs to its path, so `sync(&dir)` works.
+    struct TempDir(PathBuf);
+
+    impl std::ops::Deref for TempDir {
+        type Target = Path;
+        fn deref(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn temp(name: &str) -> TempDir {
         let dir = std::env::temp_dir().join(format!(
             "ferossh-library-test-{}-{}",
             std::process::id(),
@@ -198,7 +219,7 @@ mod tests {
         ));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        dir
+        TempDir(dir)
     }
 
     fn count_files(dir: &Path) -> usize {
@@ -275,28 +296,36 @@ mod tests {
     #[test]
     fn an_edited_script_survives_an_upgrade_but_an_untouched_one_refreshes() {
         let dir = temp("upgrade");
-        // Pretend an older FeroSSH wrote the library: a manifest of a
-        // different version, with the files it shipped.
-        sync(&dir);
-        let manifest = std::fs::read_to_string(manifest_path(&dir)).unwrap();
-        let older = manifest.replacen(VERSION, "0.0.0-old", 1);
-        std::fs::write(manifest_path(&dir), &older).unwrap();
-
         let all = scripts();
         let edited_rel = file_for(&all[0]);
         let untouched_rel = file_for(&all[1]);
         let edited = under(&dir, &edited_rel).unwrap();
         let untouched = under(&dir, &untouched_rel).unwrap();
-        // The user edits the first; the second stays exactly as shipped.
+
+        // Pretend an older FeroSSH shipped both scripts with OLDER text,
+        // and recorded that text's hashes in the manifest.
+        let old_text = "Snippet \"Was here\"\n    Line echo old\n";
+        write_file(&edited, old_text).unwrap();
+        write_file(&untouched, old_text).unwrap();
+        let old_hash = hash(old_text.as_bytes());
+        let manifest = format!(
+            "# ferossh-library 0.0.0-old\n{old_hash}\t{edited_rel}\n{old_hash}\t{untouched_rel}\n"
+        );
+        write_file(&manifest_path(&dir), &manifest).unwrap();
+
+        // The user edits the first; the second they leave as shipped.
         std::fs::write(&edited, "Snippet \"Changed\"\n    Line echo hi\n").unwrap();
 
         sync(&dir);
-        // The edit is kept.
+
+        // The edit is kept, not overwritten by this version's text.
         assert_eq!(
             std::fs::read_to_string(&edited).unwrap(),
             "Snippet \"Changed\"\n    Line echo hi\n"
         );
-        // The untouched one is the shipped text.
+        // The untouched one is refreshed from the old text to this
+        // version's shipped text.
+        assert_ne!(old_text, file_text(&all[1]));
         assert_eq!(
             std::fs::read_to_string(&untouched).unwrap(),
             file_text(&all[1])
