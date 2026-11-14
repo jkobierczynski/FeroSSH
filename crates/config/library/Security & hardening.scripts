@@ -46,7 +46,7 @@ Snippet "fail2ban - unban an address"
     Line sudo fail2ban-client set ${1:sshd} unbanip ${2:10.0.0.5}
 
 Snippet "Permissions - SUID and SGID files"
-    Line sudo find / -xdev \( -path /proc -o -path /sys \) -prune -o -perm -4000 -o -perm -2000 -type f -print 2>/dev/null
+    Line sudo find / -xdev \( -path /proc -o -path /sys \) -prune -o -type f \( -perm -4000 -o -perm -2000 \) -print 2>/dev/null
 
 Snippet "Permissions - world-writable files outside home"
     Line sudo find / \( -path /proc -o -path /sys -o -path /dev -o -path /run \) -prune -o \( -perm -0002 -type f -not -path "$$HOME/*" -print \) 2>/dev/null | head -n 50
@@ -64,4 +64,4 @@ Snippet "SSH - effective sshd settings"
     Line sudo sshd -T 2>/dev/null | grep -E '^(permitrootlogin|passwordauthentication|pubkeyauthentication|x11forwarding|port) '
 
 Snippet "Updates - security updates waiting (apt)"
-    Line apt-get -s upgrade 2>/dev/null | grep -i security | wc -l
+    Line apt-get -s upgrade 2>/dev/null | grep '^Inst ' | grep -ic security

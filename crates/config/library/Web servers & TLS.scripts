@@ -36,7 +36,7 @@ Snippet "TLS - read a certificate file"
     Line openssl x509 -in ${1:cert.pem} -noout -text | less
 
 Snippet "TLS - does a key match a certificate"
-    Line diff <(openssl x509 -noout -modulus -in ${1:cert.pem} | openssl md5) <(openssl rsa -noout -modulus -in ${2:key.pem} | openssl md5) && echo "match" || echo "do NOT match"
+    Line c=$$(openssl x509 -noout -modulus -in ${1:cert.pem} 2>/dev/null) && k=$$(openssl rsa -noout -modulus -in ${2:key.pem} 2>/dev/null) && [ -n "$$c" ] && [ -n "$$k" ] && { [ "$$c" = "$$k" ] && echo match || echo "do NOT match"; } || echo "could not read the certificate or key"
 
 Snippet "TLS - full chain a server sends"
     Line openssl s_client -connect ${1:example.com}:443 -servername ${1:example.com} -showcerts </dev/null 2>/dev/null | grep -E 'subject=|issuer='

@@ -30,7 +30,7 @@ Snippet "Azure - account and subscription"
     Line az account show -o table
 
 Snippet "Azure - pick a subscription"
-    Line az account set --subscription ${1:name-or-id}
+    Line az account set --subscription "${1:name-or-id}"
 
 Snippet "Azure - virtual machines with state"
     Line az vm list -d -o table

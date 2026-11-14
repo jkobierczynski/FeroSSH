@@ -43,7 +43,7 @@ Snippet "virsh - edit a guest's XML"
     Line sudo virsh edit ${1:vmname}
 
 Snippet "virsh - snapshot a guest"
-    Line sudo virsh snapshot-create-as ${1:vmname} ${2:snap-${stamp}} --atomic
+    Line sudo virsh snapshot-create-as ${1:vmname} ${2:snap}-${stamp} --atomic
 
 Snippet "virsh - storage pools and volumes"
     Line sudo virsh pool-list --all; sudo virsh vol-list ${1:default}

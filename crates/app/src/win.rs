@@ -570,7 +570,7 @@ mod cmd {
     pub const RUN_SCRIPT: u32 = 617;
     pub const AUTO_RESPONSES: u32 = 618;
     pub const CONFIRM_PRODUCTION: u32 = 619;
-    pub const WRITE_LIBRARY: u32 = 630;
+    pub const WRITE_LIBRARY: u32 = 644;
     /// Plus the index in the session picker's list; the one past the
     /// last is "New connection".
     pub const TMUX_SESSION: u32 = 800;
@@ -16859,15 +16859,6 @@ fn scripts_event(hwnd: HWND, event: scripts_panel::Event) {
             w.side_key(key)
         })
         .flatten(),
-        scripts_panel::Event::Folds(open) => {
-            with_window(|w| {
-                if w.settings.expanded_script_cats != open {
-                    w.settings.expanded_script_cats = open;
-                    w.save_settings();
-                }
-            });
-            None
-        }
     };
     if let Some(command) = command {
         run_command(hwnd, command);
@@ -19300,6 +19291,19 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                 for event in files_panel::take_deferred() {
                     files_event(hwnd, event);
                 }
+                LRESULT(0)
+            }
+            scripts_panel::WM_SCRIPTS_FOLDS => {
+                // The scripts pane folded or opened a category: save which
+                // are open. Posted, so the WINDOW borrow that may have been
+                // held while the fold was set is gone by now.
+                let open = scripts_panel::current_folds();
+                with_window(|w| {
+                    if w.settings.expanded_script_cats != open {
+                        w.settings.expanded_script_cats = open;
+                        w.save_settings();
+                    }
+                });
                 LRESULT(0)
             }
             WM_TOOLS_FOCUS => {

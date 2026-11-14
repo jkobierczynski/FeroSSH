@@ -73,9 +73,6 @@ pub enum Event {
     /// first: Enter runs, F2 edits, New, Delete, Refresh (on hosts),
     /// Escape leaves.
     Key(Option<usize>, SideKey),
-    /// The user folded or opened a category: the categories now open, in
-    /// ASCII lower case, to save so the next launch matches.
-    Folds(Vec<String>),
 }
 
 /// Carries out an [`Event`]; `HWND` is the main window.
@@ -952,31 +949,49 @@ pub fn seed_folds(expanded: Vec<String>) {
     });
 }
 
-/// Hands the window the categories now open, to save.
-fn save_folds(h: &Handles) {
-    let (handler, open) = match with(|s| {
-        let mut open: Vec<String> = s.expanded.iter().cloned().collect();
+/// Posted to the main window when the open categories changed, so they
+/// are saved once the message loop is clear of any `WINDOW` borrow held
+/// while a fold was set (reading [`current_folds`]).
+pub const WM_SCRIPTS_FOLDS: u32 =
+    windows::Win32::UI::WindowsAndMessaging::WM_APP + 42;
+
+/// The categories now open, sorted, for saving. The empty "No category"
+/// key is tracked in memory but never saved as a real category.
+pub fn current_folds() -> Vec<String> {
+    with(|s| {
+        let mut open: Vec<String> = s.expanded.iter().filter(|k| !k.is_empty()).cloned().collect();
         open.sort();
-        (s.handler, open)
-    }) {
-        Some(v) => v,
-        None => return,
-    };
-    handler(h.main, Event::Folds(open));
+        open
+    })
+    .unwrap_or_default()
+}
+
+/// Asks the window to save the open categories. Posted, not called, so it
+/// still works when a fold is set from inside a `WINDOW` borrow (Left or
+/// Right opening a folded category through `set_view`).
+fn save_folds(h: &Handles) {
+    // SAFETY: posting to our own main window.
+    unsafe {
+        let _ = windows::Win32::UI::WindowsAndMessaging::PostMessageW(
+            Some(h.main),
+            WM_SCRIPTS_FOLDS,
+            WPARAM(0),
+            LPARAM(0),
+        );
+    }
 }
 
 /// Folds category `id` away (`true`) or opens it, and saves which
-/// categories are open so the next launch starts the same way.
+/// categories are open so the next launch starts the same way. The empty
+/// "No category" key is tracked too, so toggling it closes and opens
+/// consistently; it is dropped only when the open set is saved.
 fn set_folded(h: &Handles, id: usize, fold: bool) {
     let changed = with(|s| {
         let Some(k) = s.group_keys.get(id).cloned() else {
             return false;
         };
-        // "" (the "No category" heading) is never saved as a real name.
         if fold {
             s.expanded.remove(&k)
-        } else if k.is_empty() {
-            false
         } else {
             s.expanded.insert(k)
         }

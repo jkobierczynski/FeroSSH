@@ -36,25 +36,25 @@ Snippet "ZFS - scrub a pool"
     Line sudo zpool scrub ${1:pool}; zpool status ${1:pool}
 
 Snippet "rsync - mirror a folder (dry run first)"
-    Line rsync -aHAX --delete --dry-run ${1:src/} ${2:dst/}
+    Line rsync -aHAX --delete --dry-run "${1:src/}" "${2:dst/}"
 
 Snippet "rsync - copy over SSH, resumable, with progress"
-    Line rsync -aAX --partial --info=progress2 -e ssh ${1:src/} ${2:user@host:/dst/}
+    Line rsync -aAX --partial --info=progress2 -e ssh "${1:src/}" "${2:user@host:/dst/}"
 
 Snippet "rsync - back up, keeping changed files"
-    Line rsync -aAX --delete --backup --backup-dir=../changed-${stamp} ${1:src/} ${2:dst/}
+    Line rsync -aAX --delete --backup --backup-dir="../changed-${stamp}" "${1:src/}" "${2:dst/}"
 
 Snippet "tar - compressed archive of a folder"
-    Line tar -I 'zstd -19 -T0' -cvf ${2:backup-${stamp}.tar.zst} ${1:folder}
+    Line tar -I 'zstd -19 -T0' -cvf "${2:backup}-${stamp}.tar.zst" "${1:folder}"
 
 Snippet "tar - gzip archive (portable)"
-    Line tar -czvf ${2:backup-${stamp}.tar.gz} ${1:folder}
+    Line tar -czvf "${2:backup}-${stamp}.tar.gz" "${1:folder}"
 
 Snippet "tar - list an archive without extracting"
-    Line tar -tvf ${1:archive.tar.gz} | less
+    Line tar -tvf "${1:archive.tar.gz}" | less
 
 Snippet "tar - extract into a named folder"
-    Line mkdir -p ${2:out} && tar -xvf ${1:archive.tar.gz} -C ${2:out}
+    Line mkdir -p "${2:out}" && tar -xvf "${1:archive.tar.gz}" -C "${2:out}"
 
 Snippet "Backup - a database dump folder, kept 7 days"
     Line find ${1:/backups} -name '*.sql.gz' -mtime +7 -print -delete
