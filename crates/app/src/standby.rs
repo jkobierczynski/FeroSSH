@@ -52,6 +52,12 @@ pub fn return_to(foreground: Option<isize>, target: isize) -> Option<isize> {
     foreground.filter(|&f| f != 0 && f != target)
 }
 
+/// The window to give the keyboard back to now that `target` hid: the
+/// one saved when `target` itself was shown, not another standby window.
+pub fn back_for(before: Option<(isize, isize)>, target: isize) -> Option<isize> {
+    before.filter(|&(shown, _)| shown == target).map(|(_, b)| b)
+}
+
 /// What a key pressed while picking a hotkey means.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Picked {
@@ -159,8 +165,10 @@ pub struct Standby {
     pub candidates: Vec<Candidate>,
     /// The window that was in front when the hotkey brought the standby
     /// window up (often a FeroSSH window, with the pane being typed in):
-    /// hiding the standby window again gives it back the keyboard.
-    pub before: Option<isize>,
+    /// hiding the standby window again gives it back the keyboard. Kept
+    /// as (the window shown, the window in front), so a change of standby
+    /// window in between does not use it.
+    pub before: Option<(isize, isize)>,
 }
 
 impl Standby {
@@ -412,6 +420,10 @@ mod tests {
         assert_eq!(return_to(Some(9), 9), None);
         assert_eq!(return_to(Some(0), 9), None);
         assert_eq!(return_to(None, 9), None);
+        // Saved for another standby window: not used.
+        assert_eq!(back_for(Some((9, 7)), 9), Some(7));
+        assert_eq!(back_for(Some((5, 7)), 9), None);
+        assert_eq!(back_for(None, 9), None);
     }
 
     #[test]
