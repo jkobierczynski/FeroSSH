@@ -39,6 +39,7 @@ FeroSSH reads `~/.ssh/config` and `~/.ssh/known_hosts` too, and writes only to `
 | Keyword | Default | Meaning |
 | --- | --- | --- |
 | `DownloadFolder "D:\Transfers"` | your Downloads folder | Where downloads go. |
+| `ScriptsExpanded "linux" "library/databases"` | none (all folded) | Which script categories are open in the scripts pane; the rest start folded. Set by folding and opening categories there. |
 | `TransferSort local name ascending remote size descending` | both by name, A to Z | How File transfer sorts each list: after `local` and `remote`, `name`, `size` or `modified`, then `ascending` or `descending`. Folders always come first. Clicking a column header sets it for that list. |
 | `TransferLayout "stacked swapped 40"` | side by side, Local first, half each | How File transfer arranges its lists: `side` or `stacked`, `swapped` for Remote first, and the first list's share in percent. Layout ▾ and dragging the gap set it. |
 | `Bookmark "web" "D:\Sites\web" "/var/www/web" "web1"` | none | A File transfer bookmark: its name, Local folder, Remote folder and the connection it is for, `""` for none (one folder at least). One line per bookmark; ★ Bookmarks ▾ adds, renames and deletes them. |

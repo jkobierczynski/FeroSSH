@@ -570,6 +570,7 @@ mod cmd {
     pub const RUN_SCRIPT: u32 = 617;
     pub const AUTO_RESPONSES: u32 = 618;
     pub const CONFIRM_PRODUCTION: u32 = 619;
+    pub const WRITE_LIBRARY: u32 = 644;
     /// Plus the index in the session picker's list; the one past the
     /// last is "New connection".
     pub const TMUX_SESSION: u32 = 800;
@@ -2505,6 +2506,11 @@ fn build_menu() -> Result<HMENU> {
         let scripts = CreatePopupMenu()?;
         item(scripts, cmd::RUN_SCRIPT, "Run &login script again")?;
         item(scripts, cmd::RECORD_SNIPPET, "&Record keystrokes as script")?;
+        item(
+            scripts,
+            cmd::WRITE_LIBRARY,
+            "&Write built-in scripts to the library...",
+        )?;
         separator(scripts)?;
         item(scripts, cmd::AUTO_RESPONSES, "&Auto-responses from scripts")?;
         item(
@@ -8972,6 +8978,7 @@ impl Window {
             fwd_panel::place(None, 0, self.dpi);
         }
         if self.scripts_native() {
+            scripts_panel::seed_folds(self.settings.expanded_script_cats.clone());
             let all = &self.settings.snippets;
             scripts_panel::set_view(
                 self.snippets_view.native_rows(all),
@@ -9000,6 +9007,11 @@ impl Window {
         {
             script_args::set_ask(ask);
             script_args::place(self.areas.side, self.areas.side_width, self.dpi);
+            // A script with arguments just opened the page: the first
+            // argument gets the keyboard, so the user can type at once.
+            if script_args::take_focus_pending() {
+                script_args::focus_first();
+            }
         } else {
             script_args::place(None, 0, self.dpi);
         }
@@ -10382,9 +10394,11 @@ impl Window {
     }
 
     /// Back to the terminal from the snippets: the side pane hides again
-    /// when Ctrl+Shift+Space showed it.
+    /// when Ctrl+Shift+Space only peeked it, but a pinned pane stays open
+    /// (the user asked for it to stay), so leaving just returns focus to
+    /// the terminal.
     fn leave_snippets(&mut self) {
-        if self.snippets_peek {
+        if self.snippets_peek && !self.settings.tools_pinned {
             self.hide_side();
         } else {
             self.focus_terminal();
@@ -13790,6 +13804,7 @@ impl Window {
             cmd::IMPORT => return Some(Command::ImportSessions),
             cmd::IMPORT_SNIPPETS => return Some(Command::ImportSnippets),
             cmd::SNIPPET_FOLDER => return Some(Command::OpenFolder(snippets_dir())),
+            cmd::WRITE_LIBRARY => return Some(Command::WriteLibrary),
             cmd::LOCAL_SHELL => self.local_shell_in_new_tab(pane),
             cmd::CONNECT => self.connect_in_new_tab(pane),
             cmd::RECONNECT => {
@@ -14030,6 +14045,10 @@ impl Window {
             }
             cmd::TOOLS_PIN => {
                 self.settings.tools_pinned = !self.settings.tools_pinned;
+                // Pinning means the pane stays by choice, not a peek.
+                if self.settings.tools_pinned {
+                    self.snippets_peek = false;
+                }
                 self.save_settings();
                 self.update_menu_checks();
                 self.refresh_chrome();
@@ -16041,6 +16060,9 @@ enum Command {
     ImportSessions,
     /// File > Import and export > Import scripts: the side pane's import page for snippets.
     ImportSnippets,
+    /// Session > Scripts > Write built-in scripts: asks, then writes the
+    /// library into the scripts folder (see config::library).
+    WriteLibrary,
     /// Session > Logs and recordings > Check a log: the file picker, then the chain check.
     VerifyLog,
     /// Session > Logs and recordings > Play a recording: pick a `.cast` file.
@@ -17165,6 +17187,85 @@ fn plural(n: usize) -> &'static str {
     if n == 1 { "" } else { "s" }
 }
 
+/// Session > Scripts > Write built-in scripts: asks what to do, then
+/// writes the library into the scripts folder. New scripts are always
+/// added; scripts already there are overwritten only when the user says
+/// so, so their own edits are never lost without asking.
+fn write_library(hwnd: HWND) {
+    let dir = snippets_dir();
+    let status = ferossh_config::library::status(&dir);
+    let (missing, present, total) = (status.missing, status.present, status.total());
+
+    let overwrite = if present == 0 {
+        let text = format!(
+            "Write {total} built-in script{} into the Library folder?\n\nThey go under \
+             scripts\\Library, one folder per category. Your own scripts are left alone.",
+            plural(total)
+        );
+        if dialog(hwnd, &text, MB_YESNO | MB_ICONQUESTION) != Some(IDYES) {
+            return;
+        }
+        false
+    } else if missing == 0 {
+        let text = format!(
+            "All {present} built-in script{} are already in the Library folder.\n\nOverwrite \
+             them with the built-in versions? Any changes you made to them will be lost.",
+            plural(present)
+        );
+        if dialog(hwnd, &text, MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2) != Some(IDYES) {
+            return;
+        }
+        true
+    } else {
+        let text = format!(
+            "Write built-in scripts into the Library folder?\n\n{missing} new script{} will be \
+             added. {present} are already there.\n\nYes also overwrites those {present} with the \
+             built-in versions (losing any changes you made to them). No adds only the {missing} \
+             new one{}. Cancel does nothing.",
+            plural(missing),
+            plural(missing)
+        );
+        match dialog(hwnd, &text, MB_YESNOCANCEL | MB_ICONQUESTION) {
+            Some(IDYES) => true,
+            Some(IDCANCEL) | None => return,
+            _ => false,
+        }
+    };
+
+    match ferossh_config::library::write(&dir, overwrite) {
+        Ok(done) => {
+            with_window(|w| {
+                w.reload_snippets();
+                w.refresh_chrome();
+            });
+            let text = if done.written == 0 {
+                "Every built-in script is already in the Library folder; nothing was written."
+                    .to_owned()
+            } else if done.kept > 0 {
+                format!(
+                    "Wrote {} built-in script{} into the Library folder, and left your {} \
+                     changed one{} alone.",
+                    done.written,
+                    plural(done.written),
+                    done.kept,
+                    plural(done.kept)
+                )
+            } else {
+                format!(
+                    "Wrote {} built-in script{} into the Library folder.",
+                    done.written,
+                    plural(done.written)
+                )
+            };
+            dialog(hwnd, &text, MB_OK | MB_ICONINFORMATION);
+        }
+        Err(e) => {
+            let text = format!("Could not write the built-in scripts: {e}");
+            dialog(hwnd, &text, MB_OK | MB_ICONWARNING);
+        }
+    }
+}
+
 fn run_command(hwnd: HWND, command: Command) {
     match command {
         Command::Id(id) => {
@@ -17395,6 +17496,7 @@ fn run_command(hwnd: HWND, command: Command) {
         Command::Notice(text) => {
             dialog(hwnd, &text, MB_OK | MB_ICONINFORMATION);
         }
+        Command::WriteLibrary => write_library(hwnd),
         Command::PickStandbyHotkey => {
             let text = "After OK, press the hotkey you want for the standby window, such as \
                         Win+` or Ctrl+Alt+Space. Esc cancels.\n\nIt needs Ctrl, Alt or Win \
@@ -19195,6 +19297,19 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                 for event in files_panel::take_deferred() {
                     files_event(hwnd, event);
                 }
+                LRESULT(0)
+            }
+            scripts_panel::WM_SCRIPTS_FOLDS => {
+                // The scripts pane folded or opened a category: save which
+                // are open. Posted, so the WINDOW borrow that may have been
+                // held while the fold was set is gone by now.
+                let open = scripts_panel::current_folds();
+                with_window(|w| {
+                    if w.settings.expanded_script_cats != open {
+                        w.settings.expanded_script_cats = open;
+                        w.save_settings();
+                    }
+                });
                 LRESULT(0)
             }
             WM_TOOLS_FOCUS => {

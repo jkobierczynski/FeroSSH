@@ -1,0 +1,123 @@
+# FeroSSH script library: system administration (mostly Linux servers).
+# Each Snippet block becomes one file in
+# %APPDATA%\FeroSSH\scripts\Library\System administration.
+
+Snippet "Services - failed units"
+    Line systemctl --failed
+
+Snippet "Services - status of a service"
+    Line systemctl status ${1:sshd} --no-pager -l
+
+Snippet "Services - restart and show status"
+    Line sudo systemctl restart ${1:nginx} && systemctl status ${1:nginx} --no-pager
+
+Snippet "Services - enabled at boot"
+    Line systemctl list-unit-files --type=service --state=enabled --no-pager
+
+Snippet "Services - timers and when they run next"
+    Line systemctl list-timers --all --no-pager
+
+Snippet "Logs - errors since this boot"
+    Line journalctl -b -p err --no-pager | tail -n 50
+
+Snippet "Logs - follow a service"
+    Line journalctl -fu ${1:sshd}
+
+Snippet "Logs - service log for the last hour"
+    Line journalctl -u ${1:sshd} --since '-1h' --no-pager
+
+Snippet "Logs - journal disk use and trim to 500 MB"
+    Line journalctl --disk-usage && sudo journalctl --vacuum-size=${1:500M}
+
+Snippet "Logs - failed SSH logins by address"
+    Line sudo journalctl -u ssh -u sshd --since '-1d' --no-pager | grep -oP 'Failed password.* from \K[0-9a-f.:]+' | sort | uniq -c | sort -rn | head -n 20
+
+Snippet "Packages - upgrade (Debian, Ubuntu)"
+    Line sudo apt update && sudo apt full-upgrade -y && sudo apt autoremove -y
+
+Snippet "Packages - upgrade (RHEL, Fedora, Rocky)"
+    Line sudo dnf upgrade -y
+
+Snippet "Packages - which package owns a file"
+    Line dpkg -S ${1:/usr/bin/ssh} 2>/dev/null || rpm -qf ${1:/usr/bin/ssh}
+
+Snippet "Packages - recently installed (Debian, Ubuntu)"
+    Line grep -h ' install ' /var/log/dpkg.log* | sort | tail -n 30
+
+Snippet "Packages - is a reboot needed"
+    Line if [ -f /var/run/reboot-required ]; then cat /var/run/reboot-required*; elif command -v needs-restarting >/dev/null; then sudo needs-restarting -r; else echo 'Cannot tell: no reboot-required file and no needs-restarting'; fi
+
+Snippet "Users - add a user with sudo"
+    Line sudo useradd -m -s /bin/bash -G ${2:sudo} ${1:name} && sudo passwd ${1:name}
+
+Snippet "Users - lock an account"
+    Line sudo usermod -L -e 1 ${1:name}
+
+Snippet "Users - password ageing"
+    Line sudo chage -l ${1:$USER}
+
+Snippet "Users - sudo commands run today"
+    Line sudo journalctl _COMM=sudo --since today --no-pager | grep COMMAND
+
+Snippet "Cron - every user's crontab"
+    Line for u in $$(cut -d: -f1 /etc/passwd); do sudo crontab -l -u "$$u" 2>/dev/null | sed "s/^/$$u: /"; done; ls /etc/cron.*
+
+Snippet "Cron - edit my crontab"
+    Line crontab -e
+
+Snippet "Time - clock and NTP sync"
+    Line timedatectl; chronyc tracking 2>/dev/null || timedatectl timesync-status
+
+Snippet "Time - set the time zone"
+    Line sudo timedatectl set-timezone ${1:Europe/Brussels}
+
+Snippet "Storage - grow an LVM volume and its file system"
+    Line sudo lvextend -r -L +${2:10G} ${1:/dev/vg0/root}
+
+Snippet "Storage - LVM overview"
+    Line sudo pvs; sudo vgs; sudo lvs
+
+Snippet "Storage - SMART health of a disk"
+    Line sudo smartctl -H -A ${1:/dev/sda}
+
+Snippet "Storage - mount options in use"
+    Line findmnt -o TARGET,SOURCE,FSTYPE,OPTIONS -t ext4,xfs,btrfs,nfs,nfs4,cifs
+
+Snippet "Storage - check fstab before rebooting"
+    Line sudo findmnt --verify --verbose
+
+Snippet "Security - listening ports and their programs"
+    Line sudo ss -tulpn
+
+Snippet "Security - firewall rules"
+    Line sudo nft list ruleset 2>/dev/null || sudo iptables -S; sudo ufw status verbose 2>/dev/null
+
+Snippet "Security - SUID files"
+    Line sudo find / -xdev -perm -4000 -type f -exec ls -l {} + 2>/dev/null
+
+Snippet "Security - SSH server settings in effect"
+    Line sudo sshd -T | grep -Ei '^(permitrootlogin|passwordauthentication|pubkeyauthentication|port|kexalgorithms|ciphers|macs) '
+
+Snippet "Security - SELinux or AppArmor state"
+    Line getenforce 2>/dev/null; sudo aa-status 2>/dev/null | head -n 5
+
+Snippet "Security - fail2ban jails"
+    Line sudo fail2ban-client status ${1:sshd}
+
+Snippet "Backup - copy a folder to another host"
+    Line rsync -aHAX --info=progress2 ${1:/srv/data/} ${2:backup@host:/backup/data/}
+
+Snippet "Backup - copy a config with today's date"
+    Line sudo cp -a ${1:/etc/ssh/sshd_config} ${1:/etc/ssh/sshd_config}.${date}
+
+Snippet "Health - quick server check"
+    Line uptime; free -h; df -h -x tmpfs -x devtmpfs -x squashfs; systemctl --failed --no-legend
+
+Snippet "Health - pressure stall (CPU, memory, I/O)"
+    Line grep -H . /proc/pressure/*
+
+Snippet "Health - disk I/O per device"
+    Line iostat -xz 2 3 2>/dev/null || vmstat 2 5
+
+Snippet "Health - open files limit for a process"
+    Line grep 'open files' /proc/${1:pid}/limits

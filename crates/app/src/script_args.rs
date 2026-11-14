@@ -76,6 +76,9 @@ struct State {
     dpi: u32,
     /// The run shown, to fill the boxes only for another one.
     shown: Option<NativeAsk>,
+    /// A newly shown run wants the keyboard on its first box, taken once
+    /// the panel is placed (see [`take_focus_pending`]).
+    focus_pending: bool,
     /// While the boxes are filled: their changes are not the user's.
     filling: bool,
     /// Where the `$n` labels, the help and the preview are painted.
@@ -190,6 +193,7 @@ pub fn create(main: HWND, handler: Handler, dpi: u32) -> windows::core::Result<(
                 title_font,
                 dpi,
                 shown: None,
+                focus_pending: false,
                 filling: false,
                 labels: Vec::new(),
                 help_at: RECT::default(),
@@ -344,6 +348,12 @@ pub fn focus_first() {
     }
 }
 
+/// Whether a run just opened the page and its first box should take the
+/// keyboard; clears the flag, so it fires only once per run.
+pub fn take_focus_pending() -> bool {
+    with(|s| std::mem::take(&mut s.focus_pending)).unwrap_or(false)
+}
+
 fn focus_box(h: &Handles, i: usize) {
     let Some(b) = h.boxes.get(i) else {
         return;
@@ -364,7 +374,12 @@ pub fn set_ask(ask: NativeAsk) {
     let before = with(|s| s.shown.replace(ask.clone())).flatten();
     let refill = before.as_ref().is_none_or(|b| b.serial != ask.serial);
     if refill {
-        with(|s| s.filling = true);
+        // A run just opened this page: put the keyboard on the first
+        // argument once it is placed.
+        with(|s| {
+            s.focus_pending = true;
+            s.filling = true;
+        });
         // SAFETY: our own controls; each text lives through its call.
         unsafe {
             for (i, b) in h.boxes.iter().enumerate() {

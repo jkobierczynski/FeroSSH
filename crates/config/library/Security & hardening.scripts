@@ -1,0 +1,67 @@
+# FeroSSH script library: security and hardening (firewalls, SELinux,
+# auditd, fail2ban, file permissions). Mostly Linux; many need root. Each
+# Snippet block becomes one file in
+# %APPDATA%\FeroSSH\scripts\Library\Security & hardening.
+
+Snippet "Firewall - nftables ruleset"
+    Line sudo nft list ruleset
+
+Snippet "Firewall - iptables rules with counters"
+    Line sudo iptables -L -n -v --line-numbers
+
+Snippet "Firewall - ufw status"
+    Line sudo ufw status verbose
+
+Snippet "Firewall - firewalld zones and services"
+    Line sudo firewall-cmd --list-all-zones
+
+Snippet "Firewall - open a port with firewalld (permanent)"
+    Line sudo firewall-cmd --permanent --add-port=${1:443}/${2:tcp} && sudo firewall-cmd --reload
+
+Snippet "SELinux - current mode and policy"
+    Line sestatus
+
+Snippet "SELinux - recent denials, readable"
+    Line sudo ausearch -m avc -ts recent 2>/dev/null | audit2why 2>/dev/null | tail -n 40
+
+Snippet "SELinux - context of a file"
+    Line ls -Z ${1:/path/to/file}
+
+Snippet "SELinux - restore default contexts on a path"
+    Line sudo restorecon -Rv ${1:/path}
+
+Snippet "auditd - who changed a file"
+    Line sudo ausearch -f ${1:/etc/passwd} -i 2>/dev/null | tail -n 40
+
+Snippet "auditd - watch a file for changes"
+    Line sudo auditctl -w ${1:/etc/shadow} -p wa -k ${2:watch-shadow}
+
+Snippet "auditd - summary report of today"
+    Line sudo aureport --start today --summary 2>/dev/null
+
+Snippet "fail2ban - jails and their status"
+    Line sudo fail2ban-client status; for j in $$(sudo fail2ban-client status | sed -n 's/.*Jail list:\s*//p' | tr ',' ' '); do sudo fail2ban-client status "$$j"; done
+
+Snippet "fail2ban - unban an address"
+    Line sudo fail2ban-client set ${1:sshd} unbanip ${2:10.0.0.5}
+
+Snippet "Permissions - SUID and SGID files"
+    Line sudo find / -xdev \( -path /proc -o -path /sys \) -prune -o -type f \( -perm -4000 -o -perm -2000 \) -print 2>/dev/null
+
+Snippet "Permissions - world-writable files outside home"
+    Line sudo find / \( -path /proc -o -path /sys -o -path /dev -o -path /run \) -prune -o \( -perm -0002 -type f -not -path "$$HOME/*" -print \) 2>/dev/null | head -n 50
+
+Snippet "Permissions - files with no owner or group"
+    Line sudo find / -xdev \( -path /proc -o -path /sys \) -prune -o \( -nouser -o -nogroup \) -print 2>/dev/null | head -n 50
+
+Snippet "Accounts - users who can log in"
+    Line getent passwd | awk -F: '$$7 !~ /(nologin|false)$$/ {print $$1, $$7}'
+
+Snippet "Accounts - empty passwords"
+    Line sudo awk -F: '($$2 == "") {print $$1}' /etc/shadow
+
+Snippet "SSH - effective sshd settings"
+    Line sudo sshd -T 2>/dev/null | grep -E '^(permitrootlogin|passwordauthentication|pubkeyauthentication|x11forwarding|port) '
+
+Snippet "Updates - security updates waiting (apt)"
+    Line apt-get -s upgrade 2>/dev/null | grep '^Inst ' | grep -ic security

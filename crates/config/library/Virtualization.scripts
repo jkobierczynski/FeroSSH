@@ -1,0 +1,64 @@
+# FeroSSH script library: virtualization (Proxmox VE, KVM/libvirt via
+# virsh, VMware ESXi). Run these on the hypervisor host. Each Snippet
+# block becomes one file in
+# %APPDATA%\FeroSSH\scripts\Library\Virtualization.
+
+Snippet "Proxmox - cluster status"
+    Line pvecm status
+
+Snippet "Proxmox - virtual machines and containers"
+    Line qm list; echo; pct list
+
+Snippet "Proxmox - start, stop or reboot a VM"
+    Line qm ${2:start} ${1:100}
+
+Snippet "Proxmox - a VM's configuration"
+    Line qm config ${1:100}
+
+Snippet "Proxmox - storage and free space"
+    Line pvesm status
+
+Snippet "Proxmox - back up a VM now"
+    Line vzdump ${1:100} --storage ${2:local} --mode snapshot --compress zstd
+
+Snippet "Proxmox - node resource use"
+    Line pvesh get /nodes/${1:$(hostname)}/status --output-format yaml 2>/dev/null | grep -E 'cpu|memory|uptime'
+
+Snippet "virsh - running and defined guests"
+    Line sudo virsh list --all
+
+Snippet "virsh - start, shutdown or reboot a guest"
+    Line sudo virsh ${2:start} ${1:vmname}
+
+Snippet "virsh - CPU and memory of a guest"
+    Line sudo virsh dominfo ${1:vmname}
+
+Snippet "virsh - a guest's block devices and networks"
+    Line sudo virsh domblklist ${1:vmname}; sudo virsh domiflist ${1:vmname}
+
+Snippet "virsh - host capacity"
+    Line sudo virsh nodeinfo; sudo virsh freecell --all
+
+Snippet "virsh - edit a guest's XML"
+    Line sudo virsh edit ${1:vmname}
+
+Snippet "virsh - snapshot a guest"
+    Line sudo virsh snapshot-create-as ${1:vmname} ${2:snap}-${stamp} --atomic
+
+Snippet "virsh - storage pools and volumes"
+    Line sudo virsh pool-list --all; sudo virsh vol-list ${1:default}
+
+Snippet "ESXi - virtual machines and their power state"
+    Line vim-cmd vmsvc/getallvms
+
+Snippet "ESXi - power on or off a VM by id"
+    Line vim-cmd vmsvc/power.${2:on} ${1:1}
+
+Snippet "ESXi - host hardware and uptime"
+    Line esxcli hardware platform get; esxcli system stats uptime get
+
+Snippet "ESXi - datastores and free space"
+    Line esxcli storage filesystem list
+
+Snippet "ESXi - physical NICs and links"
+    Line esxcli network nic list

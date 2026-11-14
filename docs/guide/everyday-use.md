@@ -356,6 +356,33 @@ Scripts used to be called snippets. The first time this version starts, it renam
 
 To take scripts to another PC, copy the files or folders into that PC's scripts folder; FeroSSH reads the folder again each time the scripts pane opens. The files are plain text (see [Settings](settings.md#scripts)), so they can go in git or be shared with a team. Scripts an older FeroSSH kept in `ferossh.conf` move to the folder by themselves at the first start, and a copy of the old file stays as `ferossh.conf.before-snippets-folder`.
 
+### The built-in library
+
+FeroSSH comes with a few hundred ready scripts, built into `ferossh.exe`, that you can write into your scripts folder whenever you want them. They land under a `Library` folder in the scripts pane, grouped by category:
+
+- **Linux** — disk, files, processes, memory, users and the shell.
+- **System administration** — services, logs, packages, cron, storage, backups and health checks for a Linux server.
+- **Windows** — PowerShell one-liners for system, disk, services, events, network, files, repair and security (use them in a local PowerShell tab, a WinRM session, or over SSH to a Windows host whose shell is PowerShell).
+- **Networking** — addresses, ports, DNS, path and packet tools, TLS, bandwidth and scanning.
+- **Network devices** — Cisco IOS and Juniper Junos show commands, for serial and SSH sessions to switches, routers and firewalls.
+- **Security & hardening** — firewalls, SELinux, auditd, fail2ban and file-permission checks.
+- **Monitoring & logs** — journalctl, process and I/O stats and log-grep recipes.
+- **Storage & backup** — LVM, ZFS, rsync and tar.
+- **Databases** — MySQL/MariaDB, PostgreSQL, Redis and MongoDB queries, sizes and dumps.
+- **Web servers & TLS** — nginx, Apache and openssl certificate checks.
+- **Containers & Kubernetes** — Docker, Podman, Compose, kubectl and Helm.
+- **DevOps** — Terraform, Ansible, CI helpers and systemd service units.
+- **Cloud** — the AWS, Azure and Google Cloud command lines.
+- **Virtualization** — Proxmox, KVM/libvirt (virsh) and VMware ESXi.
+- **Development** — git, Python, Node, Rust, Go, build tools, debugging and data wrangling.
+- **Hacking** — standard recon, enumeration and listener commands for penetration tests, CTFs and lab practice, to run only on systems you are allowed to test.
+
+The library scripts work like any other: run one, edit it, pick a category, or use its `$1`, `${1:default}` arguments and `${host}` style variables.
+
+**Writing the library.** It is not written until you ask. Session > Scripts > Write built-in scripts to the library writes the shipped scripts into your scripts folder. Any that are not there yet are added; any already there are left exactly as you have them, unless you choose to overwrite them. So **your changes stay yours**: edit a library script and your version is kept, delete one and it stays gone, and writing the library again never touches what you have unless you say so. Run it again after an upgrade to pick up new scripts a release added. To keep a shipped script and still change it, copy its lines into a script of your own with New (the lines box takes pasted text); New on its own starts an empty script, it does not copy the selected one.
+
+**Folded categories.** In the scripts pane the categories start folded, so the list is short; click a category heading to open it, and FeroSSH remembers which you leave open for next time.
+
 ### Importing scripts
 
 File > Import and export > Import scripts lists what other programs on this PC have, with a box per script and its first lines, so you can check them before anything is written. Imported scripts get a file each in the scripts folder; one whose name is already taken in its category is left out.

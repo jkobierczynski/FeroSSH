@@ -129,9 +129,13 @@ struct State {
     /// Each heading's category in ASCII lower case (as the groups are
     /// matched), by group id.
     group_keys: Vec<String>,
-    /// The categories folded away, in ASCII lower case ("" for none);
-    /// kept while FeroSSH runs.
-    collapsed: HashSet<String>,
+    /// The categories the user has opened, in ASCII lower case; every
+    /// other category starts folded away. Seeded once from the saved
+    /// settings, then kept in step with them as the user folds and opens.
+    expanded: HashSet<String>,
+    /// Whether [`seed_folds`] has run: the saved fold state is taken once,
+    /// after which this record is the one that counts.
+    seeded: bool,
     /// The list was last filled for a search.
     searching: bool,
 }
@@ -275,7 +279,8 @@ pub fn create(main: HWND, handler: Handler, dpi: u32) -> windows::core::Result<(
                 details_at: RECT::default(),
                 groups: Vec::new(),
                 group_keys: Vec::new(),
-                collapsed: HashSet::new(),
+                expanded: HashSet::new(),
+                seeded: false,
                 searching: false,
             });
         });
@@ -451,7 +456,7 @@ pub fn set_view(rows: Vec<NativeScript>, selected: usize, filter: &str, total: u
                 s.group_keys
                     .iter()
                     .position(|k| *k == key)
-                    .filter(|_| s.collapsed.contains(&key))
+                    .filter(|_| !s.expanded.contains(&key))
             })
             .flatten();
             if let Some(id) = id
@@ -495,7 +500,7 @@ fn fill_list(h: &Handles, rows: &[NativeScript], searching: bool) {
         s.groups = headings;
         s.group_keys = keys.clone();
         keys.iter()
-            .map(|k| !searching && s.collapsed.contains(k))
+            .map(|k| !searching && !s.expanded.contains(k))
             .collect()
     })
     .unwrap_or_default();
@@ -922,7 +927,7 @@ fn toggle(h: &Handles, id: usize) {
     let mine = with(|s| {
         s.group_keys
             .get(id)
-            .is_some_and(|k| s.collapsed.contains(k))
+            .is_some_and(|k| !s.expanded.contains(k))
     })
     .unwrap_or(false);
     // The list folds a heading itself when its own button is clicked:
@@ -930,17 +935,75 @@ fn toggle(h: &Handles, id: usize) {
     set_folded(h, id, if now == mine { !now } else { now });
 }
 
-/// Folds category `id` away (`true`) or opens it.
-fn set_folded(h: &Handles, id: usize, fold: bool) {
+/// Seeds the open/folded state from the saved settings, the first time
+/// only; after that the panel's own record is what counts.
+pub fn seed_folds(expanded: Vec<String>) {
     with(|s| {
-        if let Some(k) = s.group_keys.get(id) {
-            if fold {
-                s.collapsed.insert(k.clone());
-            } else {
-                s.collapsed.remove(k);
-            }
+        if !s.seeded {
+            s.expanded = expanded
+                .into_iter()
+                .map(|c| c.to_ascii_lowercase())
+                .collect();
+            s.seeded = true;
         }
     });
+}
+
+/// Posted to the main window when the open categories changed, so they
+/// are saved once the message loop is clear of any `WINDOW` borrow held
+/// while a fold was set (reading [`current_folds`]).
+pub const WM_SCRIPTS_FOLDS: u32 = windows::Win32::UI::WindowsAndMessaging::WM_APP + 42;
+
+/// The categories now open, sorted, for saving. The empty "No category"
+/// key is tracked in memory but never saved as a real category.
+pub fn current_folds() -> Vec<String> {
+    with(|s| {
+        let mut open: Vec<String> = s
+            .expanded
+            .iter()
+            .filter(|k| !k.is_empty())
+            .cloned()
+            .collect();
+        open.sort();
+        open
+    })
+    .unwrap_or_default()
+}
+
+/// Asks the window to save the open categories. Posted, not called, so it
+/// still works when a fold is set from inside a `WINDOW` borrow (Left or
+/// Right opening a folded category through `set_view`).
+fn save_folds(h: &Handles) {
+    // SAFETY: posting to our own main window.
+    unsafe {
+        let _ = windows::Win32::UI::WindowsAndMessaging::PostMessageW(
+            Some(h.main),
+            WM_SCRIPTS_FOLDS,
+            WPARAM(0),
+            LPARAM(0),
+        );
+    }
+}
+
+/// Folds category `id` away (`true`) or opens it, and saves which
+/// categories are open so the next launch starts the same way. The empty
+/// "No category" key is tracked too, so toggling it closes and opens
+/// consistently; it is dropped only when the open set is saved.
+fn set_folded(h: &Handles, id: usize, fold: bool) {
+    let changed = with(|s| {
+        let Some(k) = s.group_keys.get(id).cloned() else {
+            return false;
+        };
+        if fold {
+            s.expanded.remove(&k)
+        } else {
+            s.expanded.insert(k)
+        }
+    })
+    .unwrap_or(false);
+    if changed {
+        save_folds(h);
+    }
     let group = LVGROUP {
         cbSize: size_of::<LVGROUP>() as u32,
         mask: LVGF_STATE,

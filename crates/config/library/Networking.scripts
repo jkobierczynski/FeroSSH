@@ -1,0 +1,108 @@
+# FeroSSH script library: networking (Linux unless the name says
+# otherwise). Each Snippet block becomes one file in
+# %APPDATA%\FeroSSH\scripts\Library\Networking.
+
+Snippet "Addresses - interfaces, short"
+    Line ip -br -c addr
+
+Snippet "Addresses - routes"
+    Line ip -c route; ip -c -6 route
+
+Snippet "Addresses - which route a destination takes"
+    Line ip route get ${1:8.8.8.8}
+
+Snippet "Addresses - neighbours (ARP and NDP)"
+    Line ip -c neigh
+
+Snippet "Addresses - my public IP"
+    Line curl -s https://ifconfig.me; echo
+
+Snippet "Ports - listening sockets"
+    Line ss -tulpn
+
+Snippet "Ports - established connections per remote address"
+    Line ss -Htn state established | awk '{print $$4}' | sed 's/:[0-9]*$$//' | sort | uniq -c | sort -rn | head -n 20
+
+Snippet "Ports - who uses a port"
+    Line sudo ss -tulpn 'sport = :${1:443}'
+
+Snippet "Ports - test a TCP port"
+    Line nc -zv -w 3 ${1:host} ${2:22}
+
+Snippet "Ports - test a TCP port without nc"
+    Line timeout 3 bash -c '</dev/tcp/${1:host}/${2:22}' && echo open || echo closed
+
+Snippet "DNS - lookup with short answers"
+    Line dig +short ${1:example.com} ${2:A}
+
+Snippet "DNS - full lookup from one server"
+    Line dig @${2:1.1.1.1} ${1:example.com} ${3:A} +noall +answer
+
+Snippet "DNS - trace the delegation"
+    Line dig +trace ${1:example.com}
+
+Snippet "DNS - reverse lookup"
+    Line dig +short -x ${1:8.8.8.8}
+
+Snippet "DNS - which resolver is used"
+    Line resolvectl status 2>/dev/null || cat /etc/resolv.conf
+
+Snippet "Path - traceroute with loss per hop"
+    Line mtr -rwc ${2:20} ${1:example.com}
+
+Snippet "Path - traceroute over TCP"
+    Line sudo traceroute -T -p ${2:443} ${1:example.com}
+
+Snippet "Path - largest packet that gets through (MTU)"
+    Line ping -c 3 -M do -s ${2:1472} ${1:example.com}
+
+Snippet "Path - ping with timestamps"
+    Line ping -D ${1:example.com}
+
+Snippet "Capture - packets on a port"
+    Line sudo tcpdump -ni ${1:any} -c ${3:100} port ${2:443}
+
+Snippet "Capture - write a pcap for Wireshark"
+    Line sudo tcpdump -ni ${1:any} -w ~/capture-${stamp}.pcap ${2:port 53}
+
+Snippet "Capture - DNS queries live"
+    Line sudo tcpdump -lni any -c 50 udp port 53
+
+Snippet "HTTP - headers only"
+    Line curl -sSI ${1:https://example.com}
+
+Snippet "HTTP - timing of each phase"
+    Line curl -so /dev/null -w 'dns %{time_namelookup}  connect %{time_connect}  tls %{time_appconnect}  first byte %{time_starttransfer}  total %{time_total}  code %{http_code}\n' ${1:https://example.com}
+
+Snippet "HTTP - follow redirects"
+    Line curl -sSL -o /dev/null -w '%{url_effective} %{http_code}\n' ${1:http://example.com}
+
+Snippet "TLS - certificate of a server"
+    Line echo | openssl s_client -connect ${1:example.com}:${2:443} -servername ${1:example.com} 2>/dev/null | openssl x509 -noout -subject -issuer -dates -ext subjectAltName
+
+Snippet "TLS - days until a certificate expires"
+    Line d=$$(echo | openssl s_client -connect ${1:example.com}:${2:443} -servername ${1:example.com} 2>/dev/null | openssl x509 -noout -enddate | cut -d= -f2); if [ -z "$$d" ] || ! e=$$(date -d "$$d" +%s 2>/dev/null); then echo "could not read the certificate"; else echo "$$d"; echo "days left: $$(( (e - $$(date +%s)) / 86400 ))"; fi
+
+Snippet "TLS - read a certificate file"
+    Line openssl x509 -in ${1:cert.pem} -noout -text | less
+
+Snippet "Bandwidth - iperf3 server"
+    Line iperf3 -s
+
+Snippet "Bandwidth - iperf3 client"
+    Line iperf3 -c ${1:server} -t 10 ${2:-R}
+
+Snippet "Bandwidth - traffic per interface"
+    Line column -t /proc/net/dev
+
+Snippet "Interfaces - link speed and errors"
+    Line ethtool ${1:eth0} | grep -E 'Speed|Duplex|Link detected'; ip -s link show ${1:eth0}
+
+Snippet "Interfaces - NetworkManager connections"
+    Line nmcli -p device status; nmcli connection show
+
+Snippet "Scan - hosts that answer ping on a subnet"
+    Line nmap -sn ${1:192.168.1.0/24}
+
+Snippet "Scan - ping sweep without nmap"
+    Line for i in $$(seq 1 254); do (ping -c1 -W1 ${1:192.168.1}.$$i >/dev/null && echo ${1:192.168.1}.$$i up) & done; wait

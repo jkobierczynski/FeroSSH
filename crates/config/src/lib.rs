@@ -14,6 +14,7 @@ pub mod hotkey;
 pub mod import;
 mod json;
 pub mod known_hosts;
+pub mod library;
 pub mod login;
 pub mod mobaxterm;
 pub mod mremoteng;

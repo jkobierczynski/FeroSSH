@@ -626,6 +626,10 @@ pub struct Settings {
     pub log_timestamps: bool,
     /// Lines of scrollback for panes without a profile that sets it.
     pub scrollback: Option<usize>,
+    /// Script categories the user has expanded in the Scripts pane; the
+    /// rest start collapsed. Empty (the default) means every category is
+    /// collapsed. Keys are the category name in ASCII lower case.
+    pub expanded_script_cats: Vec<String>,
     /// Where downloads go; the user's Downloads folder when unset.
     pub download_folder: Option<String>,
     /// Compare SHA-256 on both sides after each transfer.
@@ -757,6 +761,7 @@ impl Default for Settings {
             right_click_paste: false,
             log_timestamps: false,
             scrollback: None,
+            expanded_script_cats: Vec::new(),
             download_folder: None,
             verify_transfers: false,
             auto_reconnect: true,
@@ -1065,6 +1070,15 @@ impl Settings {
                 "downloadfolder" => {
                     block = Block::Top;
                     s.download_folder = Some(joined).filter(|f| !f.is_empty());
+                }
+                "scriptsexpanded" => {
+                    block = Block::Top;
+                    for cat in args {
+                        let cat = cat.to_ascii_lowercase();
+                        if !cat.is_empty() && !s.expanded_script_cats.contains(&cat) {
+                            s.expanded_script_cats.push(cat);
+                        }
+                    }
                 }
                 "verifytransfers" => {
                     block = Block::Top;
@@ -1466,6 +1480,10 @@ impl Settings {
         }
         if let Some(d) = &self.download_folder {
             let _ = writeln!(out, "DownloadFolder {}", arg(d));
+        }
+        if !self.expanded_script_cats.is_empty() {
+            let cats: Vec<String> = self.expanded_script_cats.iter().map(|c| arg(c)).collect();
+            let _ = writeln!(out, "ScriptsExpanded {}", cats.join(" "));
         }
         let _ = writeln!(out, "VerifyTransfers {}", flag(self.verify_transfers));
         let _ = writeln!(out, "AutoReconnect {}", flag(self.auto_reconnect));

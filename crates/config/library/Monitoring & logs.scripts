@@ -1,0 +1,60 @@
+# FeroSSH script library: monitoring and logs (journalctl, process and
+# I/O stats, log-grep recipes). Mostly Linux. Each Snippet block becomes
+# one file in %APPDATA%\FeroSSH\scripts\Library\Monitoring & logs.
+
+Snippet "journald - errors since boot"
+    Line journalctl -p err -b --no-pager | tail -n 60
+
+Snippet "journald - follow one unit"
+    Line journalctl -u ${1:nginx} -f
+
+Snippet "journald - a unit since a time"
+    Line journalctl -u ${1:ssh} --since "${2:1 hour ago}" --no-pager
+
+Snippet "journald - disk used by the journal"
+    Line journalctl --disk-usage
+
+Snippet "journald - kernel messages this boot"
+    Line journalctl -k -b --no-pager | tail -n 60
+
+Snippet "Processes - top CPU and memory users"
+    Line ps -eo pid,comm,%cpu,%mem --sort=-%cpu | head -n 15
+
+Snippet "Processes - live view, batch snapshot"
+    Line top -b -n 1 | head -n 20
+
+Snippet "Processes - what holds a file or port open"
+    Line sudo lsof ${1:/var/log/syslog}
+
+Snippet "CPU - per-core load, twice"
+    Line mpstat -P ALL 1 2 2>/dev/null || top -b -n 1 | grep -E '^%?Cpu'
+
+Snippet "Disk - I/O per device"
+    Line iostat -xz 1 3 2>/dev/null || vmstat 1 3
+
+Snippet "Disk - space and inodes"
+    Line df -hT -x tmpfs -x devtmpfs; echo; df -i -x tmpfs -x devtmpfs
+
+Snippet "Disk - biggest directories here"
+    Line du -xh --max-depth=1 ${1:.} 2>/dev/null | sort -h | tail -n 20
+
+Snippet "Memory - usage and biggest consumers"
+    Line free -h; echo; ps -eo pid,comm,%mem --sort=-%mem | head -n 10
+
+Snippet "Load - uptime and last reboots"
+    Line uptime; last -x reboot shutdown 2>/dev/null | head -n 10
+
+Snippet "Logs - top client IPs in an access log"
+    Line awk '{print $$1}' ${1:/var/log/nginx/access.log} | sort | uniq -c | sort -rn | head -n 20
+
+Snippet "Logs - count HTTP status codes"
+    Line awk '{print $$9}' ${1:/var/log/nginx/access.log} | sort | uniq -c | sort -rn
+
+Snippet "Logs - errors across rotated files"
+    Line find ${1:/var/log} -maxdepth 1 -name '${2:*.log}' -print0 | xargs -0 grep -iE 'error|fail|critical' 2>/dev/null | tail -n 60
+
+Snippet "Logs - lines in a time window (since boot)"
+    Line journalctl --since "${1:09:00}" --until "${2:10:00}" --no-pager | tail -n 100
+
+Snippet "Watch - re-run a command every 2 seconds"
+    Line watch -n ${1:2} '${2:df -h}'

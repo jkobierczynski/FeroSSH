@@ -1,0 +1,46 @@
+# FeroSSH script library: DevOps (infrastructure as code, configuration
+# management, CI, service units). Containers and Kubernetes live in their
+# own category, and cloud CLIs in Cloud. Each Snippet block becomes one
+# file in %APPDATA%\FeroSSH\scripts\Library\DevOps.
+
+Snippet "Terraform - format, validate, plan"
+    Line terraform fmt -recursive && terraform validate && terraform plan -out=tfplan
+
+Snippet "Terraform - apply a saved plan"
+    Line terraform apply tfplan
+
+Snippet "Terraform - resources in the state"
+    Line terraform state list
+
+Snippet "Terraform - show one resource's attributes"
+    Line terraform state show ${1:aws_instance.web}
+
+Snippet "Ansible - ping every host"
+    Line ansible ${1:all} -i ${2:inventory} -m ping
+
+Snippet "Ansible - dry run a playbook with diff"
+    Line ansible-playbook -i ${2:inventory} ${1:site.yml} --check --diff
+
+Snippet "Ansible - run a playbook, limited to some hosts"
+    Line ansible-playbook -i ${2:inventory} ${1:site.yml} --limit ${3:webservers}
+
+Snippet "Ansible - facts of a host"
+    Line ansible ${1:host} -i ${2:inventory} -m setup | less
+
+Snippet "Ansible - decrypt view of a vault file"
+    Line ansible-vault view ${1:group_vars/all/vault.yml}
+
+Snippet "Git - what changed since the last tag"
+    Line git log $$(git describe --tags --abbrev=0)..HEAD --oneline
+
+Snippet "CI - wait until a URL answers 200"
+    Line until [ "$$(curl -s -o /dev/null -w '%{http_code}' ${1:http://localhost:8080/health})" = 200 ]; do sleep 2; done; echo up
+
+Snippet "CI - retry a command a few times"
+    Line ( n=0; until ${1:make deploy}; do n=$$((n+1)); [ "$$n" -ge ${2:3} ] && { echo failed; exit 1; }; echo "retry $$n"; sleep ${3:5}; done )
+
+Snippet "Systemd - write a simple service unit"
+    Line printf '[Unit]\nDescription=%s\nAfter=network-online.target\n\n[Service]\nExecStart=%s\nRestart=on-failure\n\n[Install]\nWantedBy=multi-user.target\n' '${1:myapp}' '${2:/usr/local/bin/myapp}' | sudo tee /etc/systemd/system/${1:myapp}.service && sudo systemctl daemon-reload
+
+Snippet "Systemd - enable and start a service now"
+    Line sudo systemctl enable --now ${1:myapp}; systemctl status ${1:myapp} --no-pager
