@@ -409,7 +409,7 @@ A hotkey can hide a window and bring it back, so a terminal (or any other progra
 - **See whether it is active.** The first line of the menu says *on* and for which window, *off*, or *not active, … is taken* when another program (or another FeroSSH window) already has that hotkey. Click it for the details. Standby hotkey on is ticked while this FeroSSH window holds the hotkey.
 - **Turn it off.** Click Standby hotkey on again; the hotkey is released at once.
 
-Pressing the hotkey hides the window when it is in front, and brings it to the front when it is hidden, minimised or behind another window. While hidden it has no taskbar button and only the hotkey brings it back; it keeps running. Another program's window is never left hidden: FeroSSH shows it again when you turn standby off, pick another window, or close FeroSSH, and at its next start if it ended without doing so. Windows does not let FeroSSH hide a program run as administrator unless FeroSSH runs as administrator too; FeroSSH says so when that happens.
+Pressing the hotkey hides the window when it is in front, and brings it to the front when it is hidden, minimised or behind another window. Hiding it gives the keyboard back to the window that was in front when the hotkey brought it up, such as the FeroSSH pane you were typing in. While hidden it has no taskbar button and only the hotkey brings it back; it keeps running. Another program's window is never left hidden: FeroSSH shows it again when you turn standby off, pick another window, or close FeroSSH, and at its next start if it ended without doing so. Windows does not let FeroSSH hide a program run as administrator unless FeroSSH runs as administrator too; FeroSSH says so when that happens.
 
 ## Full screen
 
