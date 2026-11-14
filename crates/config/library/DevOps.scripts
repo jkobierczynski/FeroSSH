@@ -57,7 +57,7 @@ Snippet "Kubernetes - describe a pod"
     Line kubectl describe pod ${1:pod} -n ${2:default} | less
 
 Snippet "Kubernetes - logs of a pod, previous run too"
-    Line kubectl logs ${1:pod} -n ${2:default} --all-containers --prefix --tail 100; kubectl logs ${1:pod} -n ${2:default} --all-containers --prefix --previous --tail 50 2>/dev/null
+    Line kubectl logs ${1:pod} -n ${2:default} --all-containers --prefix --tail 100; kubectl logs ${1:pod} -n ${2:default} --all-containers --prefix --previous --tail 50 --ignore-errors=true 2>/dev/null
 
 Snippet "Kubernetes - shell in a pod"
     Line kubectl exec -it ${1:pod} -n ${2:default} -- sh

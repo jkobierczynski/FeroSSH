@@ -87,7 +87,7 @@ Snippet "Enum - cron jobs and timers"
     Line cat /etc/crontab 2>/dev/null; ls -la /etc/cron.* 2>/dev/null; systemctl list-timers --all --no-pager 2>/dev/null
 
 Snippet "Enum - world-writable files outside home"
-    Line find / -perm -0002 -type f -not -path '/proc/*' -not -path '/sys/*' -not -path '/dev/*' -not -path '/run/*' -not -path "$$HOME/*" 2>/dev/null | head -n 50
+    Line find / \( -path /proc -o -path /sys -o -path /dev -o -path /run \) -prune -o \( -perm -0002 -type f -not -path "$$HOME/*" -print \) 2>/dev/null | head -n 50
 
 Snippet "Enum - Windows user, groups and privileges"
     Line whoami /all
