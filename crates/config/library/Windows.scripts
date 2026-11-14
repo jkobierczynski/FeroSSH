@@ -1,0 +1,130 @@
+# FeroSSH script library: Windows, for PowerShell (a local PowerShell
+# tab, a WinRM session or SSH to a Windows host whose shell is
+# PowerShell). Each Snippet block becomes one file in
+# %APPDATA%\FeroSSH\scripts\Library\Windows.
+
+Snippet "System - version and uptime"
+    Line Get-CimInstance Win32_OperatingSystem | Select-Object Caption, Version, BuildNumber, LastBootUpTime, @{n='Uptime';e={(Get-Date) - $_.LastBootUpTime}}
+
+Snippet "System - computer info"
+    Line Get-ComputerInfo -Property CsName, WindowsProductName, OsVersion, CsProcessors, CsTotalPhysicalMemory, BiosSMBIOSBIOSVersion
+
+Snippet "System - pending reboot"
+    Line 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\RebootPending','HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update\RebootRequired' | ForEach-Object { "$_ : $(Test-Path $_)" }
+
+Snippet "System - environment, sorted"
+    Line Get-ChildItem Env: | Sort-Object Name | Format-Table -AutoSize
+
+Snippet "System - PowerShell version"
+    Line $PSVersionTable
+
+Snippet "Disk - free space per drive"
+    Line Get-Volume | Where-Object DriveLetter | Select-Object DriveLetter, FileSystemLabel, @{n='SizeGB';e={[math]::Round($_.Size/1GB,1)}}, @{n='FreeGB';e={[math]::Round($_.SizeRemaining/1GB,1)}} | Format-Table -AutoSize
+
+Snippet "Disk - biggest files below a folder"
+    Line Get-ChildItem -Path '${1:C:\Users}' -Recurse -File -ErrorAction SilentlyContinue | Sort-Object Length -Descending | Select-Object -First 20 FullName, @{n='MB';e={[math]::Round($_.Length/1MB,1)}}
+
+Snippet "Disk - folder sizes"
+    Line Get-ChildItem '${1:.}' -Directory | ForEach-Object { [pscustomobject]@{ Folder = $_.Name; MB = [math]::Round(((Get-ChildItem $_.FullName -Recurse -File -ErrorAction SilentlyContinue | Measure-Object Length -Sum).Sum)/1MB,1) } } | Sort-Object MB -Descending
+
+Snippet "Disk - physical disk health"
+    Line Get-PhysicalDisk | Select-Object FriendlyName, MediaType, HealthStatus, OperationalStatus, @{n='SizeGB';e={[math]::Round($_.Size/1GB)}}
+
+Snippet "Processes - top CPU users"
+    Line Get-Process | Sort-Object CPU -Descending | Select-Object -First 15 Id, ProcessName, CPU, @{n='MemMB';e={[math]::Round($_.WorkingSet64/1MB)}}
+
+Snippet "Processes - top memory users"
+    Line Get-Process | Sort-Object WorkingSet64 -Descending | Select-Object -First 15 Id, ProcessName, @{n='MemMB';e={[math]::Round($_.WorkingSet64/1MB)}}, Path
+
+Snippet "Processes - command lines"
+    Line Get-CimInstance Win32_Process -Filter "Name like '%${1:powershell}%'" | Select-Object ProcessId, ParentProcessId, CommandLine | Format-List
+
+Snippet "Processes - stop by name"
+    Line Get-Process -Name '${1:notepad}' | Stop-Process -Confirm
+
+Snippet "Services - running services"
+    Line Get-Service | Where-Object Status -eq Running | Sort-Object DisplayName | Format-Table -AutoSize Name, DisplayName
+
+Snippet "Services - automatic services that are stopped"
+    Line Get-CimInstance Win32_Service -Filter "StartMode='Auto' and State<>'Running'" | Select-Object Name, DisplayName, State, ExitCode
+
+Snippet "Services - restart a service"
+    Line Restart-Service -Name '${1:Spooler}' -PassThru
+
+Snippet "Events - errors in the last 24 hours"
+    Line Get-WinEvent -FilterHashtable @{LogName='System','Application'; Level=1,2; StartTime=(Get-Date).AddDays(-1)} -MaxEvents 50 | Format-Table TimeCreated, LogName, ProviderName, Id, Message -Wrap
+
+Snippet "Events - unexpected shutdowns and reboots"
+    Line Get-WinEvent -FilterHashtable @{LogName='System'; Id=41,1074,6008} -MaxEvents 20 | Format-Table TimeCreated, Id, Message -Wrap
+
+Snippet "Events - failed logons (4625)"
+    Line Get-WinEvent -FilterHashtable @{LogName='Security'; Id=4625} -MaxEvents 30 | Select-Object TimeCreated, @{n='User';e={$_.Properties[5].Value}}, @{n='From';e={$_.Properties[19].Value}}
+
+Snippet "Updates - installed hotfixes"
+    Line Get-HotFix | Sort-Object InstalledOn -Descending | Select-Object -First 20
+
+Snippet "Software - installed programs"
+    Line Get-ItemProperty HKLM:\Software\Microsoft\Windows\CurrentVersion\Uninstall\*, HKLM:\Software\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\* | Where-Object DisplayName | Sort-Object DisplayName | Select-Object DisplayName, DisplayVersion, Publisher
+
+Snippet "Software - upgrade everything with winget"
+    Line winget upgrade --all --accept-source-agreements --accept-package-agreements
+
+Snippet "Users - local users and admins"
+    Line Get-LocalUser | Format-Table Name, Enabled, LastLogon; Get-LocalGroupMember Administrators
+
+Snippet "Users - who am I, with groups and privileges"
+    Line whoami /all
+
+Snippet "Users - logged-on sessions"
+    Line quser 2>$null; query session
+
+Snippet "Network - IP configuration"
+    Line Get-NetIPConfiguration | Format-List InterfaceAlias, IPv4Address, IPv6Address, IPv4DefaultGateway, DNSServer
+
+Snippet "Network - listening ports and their programs"
+    Line Get-NetTCPConnection -State Listen | Sort-Object LocalPort | Select-Object LocalAddress, LocalPort, OwningProcess, @{n='Process';e={(Get-Process -Id $_.OwningProcess).ProcessName}}
+
+Snippet "Network - test a TCP port"
+    Line Test-NetConnection -ComputerName ${1:example.com} -Port ${2:443}
+
+Snippet "Network - DNS lookup"
+    Line Resolve-DnsName ${1:example.com} -Type ${2:A}
+
+Snippet "Network - flush DNS cache"
+    Line Clear-DnsClientCache; ipconfig /flushdns
+
+Snippet "Network - firewall rules that allow inbound"
+    Line Get-NetFirewallRule -Direction Inbound -Action Allow -Enabled True | Select-Object DisplayName, Profile | Sort-Object DisplayName
+
+Snippet "Network - Wi-Fi profiles"
+    Line netsh wlan show profiles
+
+Snippet "Files - find text in files"
+    Line Get-ChildItem -Path '${2:.}' -Recurse -File -ErrorAction SilentlyContinue | Select-String -Pattern '${1:pattern}' | Select-Object -First 100 Path, LineNumber, Line
+
+Snippet "Files - files changed today"
+    Line Get-ChildItem -Path '${1:.}' -Recurse -File -ErrorAction SilentlyContinue | Where-Object LastWriteTime -gt (Get-Date).Date | Sort-Object LastWriteTime -Descending | Select-Object -First 50 LastWriteTime, FullName
+
+Snippet "Files - SHA-256 of a file"
+    Line Get-FileHash -Algorithm SHA256 '${1:file}'
+
+Snippet "Files - follow a log file"
+    Line Get-Content -Path '${1:C:\Windows\Logs\CBS\CBS.log}' -Tail 50 -Wait
+
+Snippet "Files - zip a folder"
+    Line Compress-Archive -Path '${1:.\folder}' -DestinationPath '${1:.\folder}-${stamp}.zip'
+
+Snippet "Repair - system file check and DISM"
+    Line DISM /Online /Cleanup-Image /RestoreHealth; sfc /scannow
+
+Snippet "Repair - scheduled tasks that failed"
+    Line Get-ScheduledTask | Where-Object State -ne Disabled | Get-ScheduledTaskInfo | Where-Object { $_.LastTaskResult -ne 0 -and $_.LastRunTime -gt '2000-01-01' } | Select-Object TaskName, LastRunTime, LastTaskResult
+
+Snippet "Security - Defender status and quick scan"
+    Line Get-MpComputerStatus | Select-Object AMServiceEnabled, RealTimeProtectionEnabled, AntivirusSignatureLastUpdated; Start-MpScan -ScanType QuickScan
+
+Snippet "Security - BitLocker status"
+    Line Get-BitLockerVolume | Select-Object MountPoint, VolumeStatus, ProtectionStatus, EncryptionPercentage
+
+Snippet "Security - is this signed"
+    Line Get-AuthenticodeSignature '${1:C:\path\program.exe}' | Format-List Status, SignerCertificate

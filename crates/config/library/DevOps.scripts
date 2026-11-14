@@ -1,0 +1,120 @@
+# FeroSSH script library: DevOps (containers, Kubernetes, cloud,
+# infrastructure as code). Each Snippet block becomes one file in
+# %APPDATA%\FeroSSH\scripts\Library\DevOps.
+
+Snippet "Docker - running containers"
+    Line docker ps --format 'table {{.Names}}\t{{.Image}}\t{{.Status}}\t{{.Ports}}'
+
+Snippet "Docker - shell in a container"
+    Line docker exec -it ${1:container} sh -c 'command -v bash >/dev/null && exec bash || exec sh'
+
+Snippet "Docker - follow a container's log"
+    Line docker logs -f --tail ${2:100} ${1:container}
+
+Snippet "Docker - CPU and memory per container"
+    Line docker stats --no-stream
+
+Snippet "Docker - disk use"
+    Line docker system df
+
+Snippet "Docker - remove stopped containers and dangling images"
+    Line docker container prune -f && docker image prune -f
+
+Snippet "Docker - IP address of a container"
+    Line docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}} {{end}}' ${1:container}
+
+Snippet "Docker - environment of a container"
+    Line docker inspect -f '{{range .Config.Env}}{{println .}}{{end}}' ${1:container}
+
+Snippet "Docker - image layers and sizes"
+    Line docker history --no-trunc --format 'table {{.Size}}\t{{.CreatedBy}}' ${1:image} | less -S
+
+Snippet "Compose - start, rebuilt"
+    Line docker compose up -d --build
+
+Snippet "Compose - status and logs"
+    Line docker compose ps; docker compose logs -f --tail 50
+
+Snippet "Compose - pull new images and restart"
+    Line docker compose pull && docker compose up -d
+
+Snippet "Kubernetes - current context and namespace"
+    Line kubectl config get-contexts
+
+Snippet "Kubernetes - switch namespace"
+    Line kubectl config set-context --current --namespace=${1:default}
+
+Snippet "Kubernetes - pods that are not running"
+    Line kubectl get pods -A --field-selector=status.phase!=Running,status.phase!=Succeeded
+
+Snippet "Kubernetes - pods with restarts"
+    Line kubectl get pods -A --sort-by='.status.containerStatuses[0].restartCount' | tail -n 15
+
+Snippet "Kubernetes - recent events"
+    Line kubectl get events -A --sort-by=.lastTimestamp | tail -n 30
+
+Snippet "Kubernetes - describe a pod"
+    Line kubectl describe pod ${1:pod} -n ${2:default} | less
+
+Snippet "Kubernetes - logs of a pod, previous run too"
+    Line kubectl logs ${1:pod} -n ${2:default} --all-containers --tail 100; kubectl logs ${1:pod} -n ${2:default} --previous --tail 50
+
+Snippet "Kubernetes - shell in a pod"
+    Line kubectl exec -it ${1:pod} -n ${2:default} -- sh
+
+Snippet "Kubernetes - CPU and memory per pod"
+    Line kubectl top pods -A --sort-by=memory | head -n 20
+
+Snippet "Kubernetes - node overview"
+    Line kubectl get nodes -o wide; kubectl top nodes
+
+Snippet "Kubernetes - restart a deployment"
+    Line kubectl rollout restart deployment/${1:name} -n ${2:default} && kubectl rollout status deployment/${1:name} -n ${2:default}
+
+Snippet "Kubernetes - forward a service port"
+    Line kubectl port-forward -n ${2:default} svc/${1:service} ${3:8080}:${4:80}
+
+Snippet "Kubernetes - decode a secret"
+    Line kubectl get secret ${1:name} -n ${2:default} -o go-template='{{range $$k,$$v := .data}}{{$$k}}: {{$$v | base64decode}}{{"\n"}}{{end}}'
+
+Snippet "Kubernetes - images in use"
+    Line kubectl get pods -A -o jsonpath='{range .items[*]}{range .spec.containers[*]}{.image}{"\n"}{end}{end}' | sort | uniq -c | sort -rn
+
+Snippet "Helm - releases and their status"
+    Line helm list -A
+
+Snippet "Terraform - format, validate, plan"
+    Line terraform fmt -recursive && terraform validate && terraform plan -out=tfplan
+
+Snippet "Terraform - resources in the state"
+    Line terraform state list
+
+Snippet "Ansible - ping every host"
+    Line ansible ${1:all} -i ${2:inventory} -m ping
+
+Snippet "Ansible - dry run a playbook with diff"
+    Line ansible-playbook -i ${2:inventory} ${1:site.yml} --check --diff
+
+Snippet "Ansible - facts of a host"
+    Line ansible ${1:host} -i ${2:inventory} -m setup | less
+
+Snippet "AWS - who am I"
+    Line aws sts get-caller-identity
+
+Snippet "AWS - running EC2 instances"
+    Line aws ec2 describe-instances --filters Name=instance-state-name,Values=running --query 'Reservations[].Instances[].[InstanceId,InstanceType,PrivateIpAddress,Tags[?Key==`Name`]|[0].Value]' --output table
+
+Snippet "Azure - account and subscription"
+    Line az account show -o table
+
+Snippet "Azure - virtual machines with state"
+    Line az vm list -d -o table
+
+Snippet "GCP - project and compute instances"
+    Line gcloud config list && gcloud compute instances list
+
+Snippet "CI - wait until a URL answers 200"
+    Line until [ "$$(curl -s -o /dev/null -w '%{http_code}' ${1:http://localhost:8080/health})" = 200 ]; do sleep 2; done; echo up
+
+Snippet "Systemd - write a simple service unit"
+    Line printf '[Unit]\nDescription=%s\nAfter=network-online.target\n\n[Service]\nExecStart=%s\nRestart=on-failure\n\n[Install]\nWantedBy=multi-user.target\n' '${1:myapp}' '${2:/usr/local/bin/myapp}' | sudo tee /etc/systemd/system/${1:myapp}.service && sudo systemctl daemon-reload

@@ -1,0 +1,126 @@
+# FeroSSH script library: Linux. Each Snippet block becomes one file in
+# %APPDATA%\FeroSSH\scripts\Library\Linux. $1..$9 and ${1:default} are
+# asked for when the script runs; $$ types a plain $.
+
+Snippet "Disk - free space on every file system"
+    Line df -hT -x tmpfs -x devtmpfs -x squashfs
+
+Snippet "Disk - biggest folders here"
+    Line du -xh --max-depth=1 ${1:.} 2>/dev/null | sort -rh | head -n 20
+
+Snippet "Disk - biggest files below a folder"
+    Line find ${1:.} -xdev -type f -printf '%s\t%p\n' 2>/dev/null | sort -rn | head -n 20 | numfmt --field=1 --to=iec
+
+Snippet "Disk - block devices and mounts"
+    Line lsblk -o NAME,SIZE,TYPE,FSTYPE,MOUNTPOINTS,MODEL
+
+Snippet "Disk - inode use"
+    Line df -ih -x tmpfs -x devtmpfs -x squashfs
+
+Snippet "Disk - deleted files still holding space"
+    Line sudo lsof -nP +L1 2>/dev/null | head -n 30
+
+Snippet "Files - find files changed in the last N minutes"
+    Line find ${1:.} -xdev -type f -mmin -${2:60} 2>/dev/null | head -n 100
+
+Snippet "Files - find text in files"
+    Line grep -rnI --color=always -- '${1:pattern}' ${2:.} | head -n 100
+
+Snippet "Files - count files by extension"
+    Line find ${1:.} -type f | sed -n 's/.*\.\([^./]*\)$$/\1/p' | sort | uniq -c | sort -rn | head -n 20
+
+Snippet "Files - tree two levels deep"
+    Line find ${1:.} -maxdepth 2 -not -path '*/.git*' | sort | sed -e 's;[^/]*/;|  ;g;s;|  \([^|]\);+- \1;'
+
+Snippet "Files - pack a folder into a dated tar.gz"
+    Line tar -czf "${1:backup}-${stamp}.tar.gz" ${2:.}
+
+Snippet "Files - list what is in a tar.gz"
+    Line tar -tzvf ${1:archive.tar.gz} | less
+
+Snippet "Files - sha256 of every file here"
+    Line find ${1:.} -maxdepth 1 -type f -exec sha256sum {} +
+
+Snippet "Files - duplicate files by checksum"
+    Line find ${1:.} -type f -size +0 -exec md5sum {} + | sort | uniq -w32 -dD
+
+Snippet "Files - replace text in files"
+    Line grep -rlI -- '${1:old}' ${3:.} | xargs -r sed -i 's/${1:old}/${2:new}/g'
+
+Snippet "Processes - top CPU users"
+    Line ps -eo pid,user,%cpu,%mem,etime,cmd --sort=-%cpu | head -n 15
+
+Snippet "Processes - top memory users"
+    Line ps -eo pid,user,%mem,rss,etime,cmd --sort=-rss | head -n 15
+
+Snippet "Processes - process tree"
+    Line ps -ef --forest | less -S
+
+Snippet "Processes - find by name"
+    Line pgrep -af '${1:name}'
+
+Snippet "Processes - what a process has open"
+    Line sudo ls -l /proc/${1:pid}/fd | head -n 50
+
+Snippet "Processes - zombie processes"
+    Line ps -eo stat,pid,ppid,cmd | awk '$$1 ~ /^Z/'
+
+Snippet "Memory - free and swap"
+    Line free -h && swapon --show
+
+Snippet "Memory - swap use per process"
+    Line for f in /proc/[0-9]*/status; do awk '/^Name/{n=$$2} /^Pid/{p=$$2} /^VmSwap/{if ($$2>0) print $$2" kB", p, n}' "$$f"; done 2>/dev/null | sort -rn | head -n 15
+
+Snippet "System - what this machine is"
+    Line hostnamectl 2>/dev/null || (uname -a; cat /etc/os-release)
+
+Snippet "System - uptime, load and users"
+    Line uptime; who
+
+Snippet "System - CPU and memory overview"
+    Line lscpu | grep -E 'Model name|^CPU\(s\)|Thread|Socket|MHz'; free -h
+
+Snippet "System - kernel messages, errors only"
+    Line sudo dmesg --level=err,warn -T | tail -n 50
+
+Snippet "System - last reboots"
+    Line last -x reboot shutdown | head -n 10
+
+Snippet "System - environment, sorted"
+    Line env | sort
+
+Snippet "Users - who logged in recently"
+    Line last -a | head -n 20
+
+Snippet "Users - accounts with a login shell"
+    Line awk -F: '$$7 !~ /(nologin|false)$$/ {print $$1, $$6, $$7}' /etc/passwd
+
+Snippet "Users - my groups and sudo rights"
+    Line id; sudo -l
+
+Snippet "Text - most common lines in a file"
+    Line sort ${1:file} | uniq -c | sort -rn | head -n 20
+
+Snippet "Text - follow a log, highlight a word"
+    Line tail -F ${1:/var/log/syslog} | grep --line-buffered --color=always -E '${2:error|fail}|$$'
+
+Snippet "Text - show a file without comments or blank lines"
+    Line grep -vE '^\s*(#|;|$$)' ${1:file}
+
+Snippet "Text - pretty print JSON"
+    Line python3 -m json.tool ${1:file.json}
+
+Snippet "Shell - history, most used commands"
+    Line history | awk '{print $$2}' | sort | uniq -c | sort -rn | head -n 20
+
+Snippet "Shell - repeat a command every 2 seconds"
+    Line watch -n ${2:2} -d '${1:uptime}'
+
+Snippet "Shell - run something after logout (nohup)"
+    Line nohup ${1:command} > ${2:nohup.out} 2>&1 &
+
+Snippet "Shell - sane terminal after a garbled screen"
+    Line stty sane; reset
+
+Snippet "Shell - make vim behave (nocompatible, no mouse)"
+    Line printf 'set nocompatible\nset mouse=\nsyntax on\n' >> ~/.vimrc

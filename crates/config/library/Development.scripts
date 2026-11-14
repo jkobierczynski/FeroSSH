@@ -1,0 +1,122 @@
+# FeroSSH script library: development. Each Snippet block becomes one
+# file in %APPDATA%\FeroSSH\scripts\Library\Development.
+
+Snippet "Git - short status with branch"
+    Line git status -sb
+
+Snippet "Git - pretty log graph"
+    Line git log --graph --oneline --decorate --all -n ${1:40}
+
+Snippet "Git - what changed in the last commit"
+    Line git show --stat HEAD
+
+Snippet "Git - branches by last commit"
+    Line git for-each-ref --sort=-committerdate refs/heads --format='%(committerdate:short) %(refname:short) %(subject)'
+
+Snippet "Git - undo the last commit, keep the changes"
+    Line git reset --soft HEAD~1
+
+Snippet "Git - discard changes to a file"
+    Line git restore -- ${1:file}
+
+Snippet "Git - delete merged local branches"
+    Line git branch --merged | grep -vE '^\*|main|master|develop' | xargs -r git branch -d
+
+Snippet "Git - who changed each line"
+    Line git blame -w -C ${1:file} | less -S
+
+Snippet "Git - find the commit that added a text"
+    Line git log -S '${1:text}' --oneline
+
+Snippet "Git - stash with a name"
+    Line git stash push -m '${1:work in progress}'
+
+Snippet "Git - update branch on main"
+    Line git fetch origin && git rebase origin/${1:main}
+
+Snippet "Git - biggest files in history"
+    Line git rev-list --objects --all | git cat-file --batch-check='%(objecttype) %(objectname) %(objectsize) %(rest)' | awk '$$1=="blob"' | sort -k3 -rn | head -n 20
+
+Snippet "Git - contributors by commits"
+    Line git shortlog -sne --all | head -n 20
+
+Snippet "Code - files per extension"
+    Line git ls-files | sed -n 's/.*\.\([^./]*\)$$/\1/p' | sort | uniq -c | sort -rn | head -n 15
+
+Snippet "Code - TODO and FIXME notes"
+    Line grep -rnI --exclude-dir={.git,node_modules,target,vendor} -E 'TODO|FIXME|XXX' ${1:.}
+
+Snippet "Code - serve this folder over HTTP"
+    Line python3 -m http.server ${1:8000} --bind ${2:127.0.0.1}
+
+Snippet "Python - make and enter a venv"
+    Line python3 -m venv .venv && . .venv/bin/activate && python -m pip install -U pip
+
+Snippet "Python - install requirements"
+    Line python -m pip install -r ${1:requirements.txt}
+
+Snippet "Python - outdated packages"
+    Line python -m pip list --outdated
+
+Snippet "Python - run tests, stop at the first failure"
+    Line python -m pytest -x -q
+
+Snippet "Node - install exactly what the lock file says"
+    Line npm ci
+
+Snippet "Node - outdated packages and audit"
+    Line npm outdated; npm audit --omit=dev
+
+Snippet "Node - which package pulled this in"
+    Line npm ls ${1:package}
+
+Snippet "Rust - check, lint and test"
+    Line cargo fmt --check && cargo clippy --all-targets -- -D warnings && cargo test
+
+Snippet "Rust - dependency tree for a crate"
+    Line cargo tree -i ${1:crate}
+
+Snippet "Rust - build size by crate"
+    Line cargo bloat --release --crates -n 20
+
+Snippet "Go - build, vet and test"
+    Line go build ./... && go vet ./... && go test ./...
+
+Snippet "Java - threads of a JVM"
+    Line jcmd ${1:pid} Thread.print | less
+
+Snippet "Build - make with every core"
+    Line make -j$$(nproc)
+
+Snippet "Build - CMake configure and build"
+    Line cmake -S . -B build -DCMAKE_BUILD_TYPE=${1:Release} && cmake --build build -j
+
+Snippet "Debug - attach strace to a process"
+    Line sudo strace -f -tt -p ${1:pid} -e trace=${2:%file,%network}
+
+Snippet "Debug - missing shared libraries"
+    Line ldd ${1:/usr/bin/program} | grep -E 'not found|=>'
+
+Snippet "Debug - core dumps"
+    Line coredumpctl list --no-pager | tail -n 10
+
+Snippet "Debug - what a program writes"
+    Line strace -f -e trace=write -s 200 ${1:command}
+
+Snippet "Data - JSON key paths with jq"
+    Line jq -r 'paths | map(tostring) | join(".")' ${1:file.json} | head -n 50
+
+Snippet "Data - CSV as a table"
+    Line column -s, -t < ${1:file.csv} | less -S
+
+Snippet "Data - base64 encode and decode"
+    Line echo -n '${1:text}' | base64; echo -n '${1:text}' | base64 | base64 -d; echo
+
+Snippet "Data - random password"
+    Line openssl rand -base64 ${1:24}
+
+Snippet "Data - UUID"
+    Line cat /proc/sys/kernel/random/uuid
+
+Snippet "Data - Unix time to a date"
+    Line date -d @${1:1700000000}

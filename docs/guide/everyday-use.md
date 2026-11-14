@@ -356,6 +356,20 @@ Scripts used to be called snippets. The first time this version starts, it renam
 
 To take scripts to another PC, copy the files or folders into that PC's scripts folder; FeroSSH reads the folder again each time the scripts pane opens. The files are plain text (see [Settings](settings.md#scripts)), so they can go in git or be shared with a team. Scripts an older FeroSSH kept in `ferossh.conf` move to the folder by themselves at the first start, and a copy of the old file stays as `ferossh.conf.before-snippets-folder`.
 
+### The built-in library
+
+FeroSSH comes with a few hundred ready scripts, under a `Library` folder in the scripts pane, grouped by category:
+
+- **Linux** — disk, files, processes, memory, users and the shell.
+- **System administration** — services, logs, packages, cron, storage, backups and health checks for a Linux server.
+- **Windows** — PowerShell one-liners for system, disk, services, events, network, files, repair and security (use them in a local PowerShell tab, a WinRM session, or over SSH to a Windows host whose shell is PowerShell).
+- **DevOps** — Docker, Docker Compose, Kubernetes, Helm, Terraform, Ansible and the AWS, Azure and GCP command lines.
+- **Development** — git, Python, Node, Rust, Go, build tools, debugging and data wrangling.
+- **Hacking** — standard recon, enumeration and listener commands for penetration tests, CTFs and lab practice, to run only on systems you are allowed to test.
+- **Networking** — addresses, ports, DNS, path and packet tools, TLS, bandwidth, scanning and a few Cisco commands.
+
+The library scripts work like any other: run one, edit it, pick a category, or use its `$1`, `${1:default}` arguments and `${host}` style variables. They are written into the scripts folder so **your changes stay yours**: edit a library script and your version is kept, delete one and it stays gone, and a FeroSSH upgrade only refreshes the library scripts you have not touched while adding any new ones. To start from a library script without changing it, select it and use Insert or New to make a copy in a category of your own. The library is built into `ferossh.exe`, so there is nothing to download.
+
 ### Importing scripts
 
 File > Import and export > Import scripts lists what other programs on this PC have, with a box per script and its first lines, so you can check them before anything is written. Imported scripts get a file each in the scripts folder; one whose name is already taken in its category is left out.

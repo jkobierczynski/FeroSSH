@@ -1641,7 +1641,12 @@ fn workspace_items() -> Vec<(String, String)> {
 }
 
 fn snippets_dir() -> PathBuf {
-    snippet_store::move_old_folder(&app_dir().join("scripts"), &app_dir().join("snippets"))
+    let dir =
+        snippet_store::move_old_folder(&app_dir().join("scripts"), &app_dir().join("snippets"));
+    // Write (or refresh) the scripts that ship with FeroSSH, keeping the
+    // user's own edits and deletions (see config::library).
+    ferossh_config::library::sync(&dir);
+    dir
 }
 
 /// Reads the snippets folder into `settings`. Snippets an older FeroSSH
