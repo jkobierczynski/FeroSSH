@@ -18804,6 +18804,17 @@ fn standby_toggle(hwnd: HWND) {
         match standby::toggle(visible, minimised, front) {
             Toggle::Hide => {
                 show(SW_HIDE);
+                // Hidden (a hung program's window hides later, on its
+                // own): the keyboard goes back to the window that was in
+                // front before the hotkey brought this one up, such as
+                // the FeroSSH window and its pane. Left to itself Windows
+                // picks the next window in line, or none.
+                if hung || !IsWindowVisible(target).as_bool() {
+                    let back = with_window(|w| w.standby.before.take()).flatten();
+                    if let Some(b) = back.filter(|&b| standby::sys::can_return_to(b)) {
+                        let _ = SetForegroundWindow(standby::sys::hwnd(b));
+                    }
+                }
                 if !own {
                     if IsWindowVisible(target).as_bool() && !hung {
                         // Windows refuses this for a program run as
@@ -18823,6 +18834,9 @@ fn standby_toggle(hwnd: HWND) {
                 }
             }
             Toggle::Show => {
+                let before =
+                    standby::return_to(Some(GetForegroundWindow().0 as isize), target.0 as isize);
+                with_window(|w| w.standby.before = before);
                 show(if minimised { SW_RESTORE } else { SW_SHOW });
                 let _ = SetForegroundWindow(target);
                 if !own {

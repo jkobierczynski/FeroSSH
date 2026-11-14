@@ -45,6 +45,13 @@ pub fn toggle(visible: bool, minimised: bool, foreground: bool) -> Toggle {
     }
 }
 
+/// The window that was in front before showing `target`, worth giving
+/// the keyboard back to when `target` hides: none when nothing was in
+/// front or `target` itself was.
+pub fn return_to(foreground: Option<isize>, target: isize) -> Option<isize> {
+    foreground.filter(|&f| f != 0 && f != target)
+}
+
 /// What a key pressed while picking a hotkey means.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Picked {
@@ -150,6 +157,10 @@ pub struct Standby {
     pub hidden: Option<isize>,
     /// What Window to show and hide listed when it last opened.
     pub candidates: Vec<Candidate>,
+    /// The window that was in front when the hotkey brought the standby
+    /// window up (often a FeroSSH window, with the pane being typed in):
+    /// hiding the standby window again gives it back the keyboard.
+    pub before: Option<isize>,
 }
 
 impl Standby {
@@ -161,6 +172,7 @@ impl Standby {
             target: None,
             hidden: None,
             candidates: Vec::new(),
+            before: None,
         }
     }
 
@@ -217,8 +229,8 @@ pub mod sys {
     };
     use windows::Win32::UI::WindowsAndMessaging::{
         EnumWindows, GW_OWNER, GWL_EXSTYLE, GetClassNameW, GetWindow, GetWindowLongPtrW,
-        GetWindowTextW, GetWindowThreadProcessId, IsHungAppWindow, IsWindow, IsWindowVisible,
-        SW_SHOW, ShowWindowAsync, WS_EX_TOOLWINDOW,
+        GetWindowTextW, GetWindowThreadProcessId, IsHungAppWindow, IsIconic, IsWindow,
+        IsWindowVisible, SW_SHOW, ShowWindowAsync, WS_EX_TOOLWINDOW,
     };
     use windows::core::{BOOL, PWSTR};
 
@@ -361,6 +373,19 @@ pub mod sys {
         }
     }
 
+    /// Whether window `v` can take the keyboard back after the standby
+    /// window hides: still a window, shown, not minimised, answering.
+    pub fn can_return_to(v: isize) -> bool {
+        let h = hwnd(v);
+        // SAFETY: plain queries; IsWindow takes any value.
+        unsafe {
+            IsWindow(Some(h)).as_bool()
+                && IsWindowVisible(h).as_bool()
+                && !IsIconic(h).as_bool()
+                && !IsHungAppWindow(h).as_bool()
+        }
+    }
+
     /// Whether the program behind `h` is not answering.
     pub fn hung(h: HWND) -> bool {
         // SAFETY: a plain query.
@@ -379,6 +404,14 @@ mod tests {
         assert_eq!(toggle(true, true, false), Toggle::Show);
         assert_eq!(toggle(true, true, true), Toggle::Show);
         assert_eq!(toggle(true, false, false), Toggle::Show);
+    }
+
+    #[test]
+    fn returns_to_the_window_that_was_in_front() {
+        assert_eq!(return_to(Some(7), 9), Some(7));
+        assert_eq!(return_to(Some(9), 9), None);
+        assert_eq!(return_to(Some(0), 9), None);
+        assert_eq!(return_to(None, 9), None);
     }
 
     #[test]
