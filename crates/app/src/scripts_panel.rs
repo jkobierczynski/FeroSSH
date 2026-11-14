@@ -952,14 +952,18 @@ pub fn seed_folds(expanded: Vec<String>) {
 /// Posted to the main window when the open categories changed, so they
 /// are saved once the message loop is clear of any `WINDOW` borrow held
 /// while a fold was set (reading [`current_folds`]).
-pub const WM_SCRIPTS_FOLDS: u32 =
-    windows::Win32::UI::WindowsAndMessaging::WM_APP + 42;
+pub const WM_SCRIPTS_FOLDS: u32 = windows::Win32::UI::WindowsAndMessaging::WM_APP + 42;
 
 /// The categories now open, sorted, for saving. The empty "No category"
 /// key is tracked in memory but never saved as a real category.
 pub fn current_folds() -> Vec<String> {
     with(|s| {
-        let mut open: Vec<String> = s.expanded.iter().filter(|k| !k.is_empty()).cloned().collect();
+        let mut open: Vec<String> = s
+            .expanded
+            .iter()
+            .filter(|k| !k.is_empty())
+            .cloned()
+            .collect();
         open.sort();
         open
     })
