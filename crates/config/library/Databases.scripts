@@ -13,7 +13,7 @@ Snippet "MySQL - who is connected and what they run"
     Line mysql -u ${1:root} -p -e "SHOW FULL PROCESSLIST;"
 
 Snippet "MySQL - dump one database (gzip)"
-    Line ( set -o pipefail; f="${2:dbname}-${stamp}.sql.gz"; mysqldump -u ${1:root} -p --single-transaction --routines --triggers ${2:dbname} | gzip > "$$f.part" && mv "$$f.part" "$$f" && echo "wrote $$f" || { rm -f "$$f.part"; echo "dump failed, nothing written"; } )
+    Line ( set -o pipefail; f="${2:dbname}-${stamp}.sql.gz"; mysqldump -u ${1:root} -p --single-transaction --routines --triggers ${2:dbname} | gzip > "$$f.part" && mv "$$f.part" "$$f" && echo "wrote $$f" || { rm -f "$$f.part"; echo "dump failed, nothing written" >&2; exit 1; } )
 
 Snippet "MySQL - restore from a gzip dump"
     Line gunzip -c ${1:dump.sql.gz} | mysql -u ${2:root} -p ${3:dbname}
