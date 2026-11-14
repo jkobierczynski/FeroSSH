@@ -73,6 +73,9 @@ pub enum Event {
     /// first: Enter runs, F2 edits, New, Delete, Refresh (on hosts),
     /// Escape leaves.
     Key(Option<usize>, SideKey),
+    /// The user folded or opened a category: the categories now open, in
+    /// ASCII lower case, to save so the next launch matches.
+    Folds(Vec<String>),
 }
 
 /// Carries out an [`Event`]; `HWND` is the main window.
@@ -129,9 +132,13 @@ struct State {
     /// Each heading's category in ASCII lower case (as the groups are
     /// matched), by group id.
     group_keys: Vec<String>,
-    /// The categories folded away, in ASCII lower case ("" for none);
-    /// kept while FeroSSH runs.
-    collapsed: HashSet<String>,
+    /// The categories the user has opened, in ASCII lower case; every
+    /// other category starts folded away. Seeded once from the saved
+    /// settings, then kept in step with them as the user folds and opens.
+    expanded: HashSet<String>,
+    /// Whether [`seed_folds`] has run: the saved fold state is taken once,
+    /// after which this record is the one that counts.
+    seeded: bool,
     /// The list was last filled for a search.
     searching: bool,
 }
@@ -275,7 +282,8 @@ pub fn create(main: HWND, handler: Handler, dpi: u32) -> windows::core::Result<(
                 details_at: RECT::default(),
                 groups: Vec::new(),
                 group_keys: Vec::new(),
-                collapsed: HashSet::new(),
+                expanded: HashSet::new(),
+                seeded: false,
                 searching: false,
             });
         });
@@ -451,7 +459,7 @@ pub fn set_view(rows: Vec<NativeScript>, selected: usize, filter: &str, total: u
                 s.group_keys
                     .iter()
                     .position(|k| *k == key)
-                    .filter(|_| s.collapsed.contains(&key))
+                    .filter(|_| !s.expanded.contains(&key))
             })
             .flatten();
             if let Some(id) = id
@@ -495,7 +503,7 @@ fn fill_list(h: &Handles, rows: &[NativeScript], searching: bool) {
         s.groups = headings;
         s.group_keys = keys.clone();
         keys.iter()
-            .map(|k| !searching && s.collapsed.contains(k))
+            .map(|k| !searching && !s.expanded.contains(k))
             .collect()
     })
     .unwrap_or_default();
@@ -922,7 +930,7 @@ fn toggle(h: &Handles, id: usize) {
     let mine = with(|s| {
         s.group_keys
             .get(id)
-            .is_some_and(|k| s.collapsed.contains(k))
+            .is_some_and(|k| !s.expanded.contains(k))
     })
     .unwrap_or(false);
     // The list folds a heading itself when its own button is clicked:
@@ -930,17 +938,53 @@ fn toggle(h: &Handles, id: usize) {
     set_folded(h, id, if now == mine { !now } else { now });
 }
 
-/// Folds category `id` away (`true`) or opens it.
-fn set_folded(h: &Handles, id: usize, fold: bool) {
+/// Seeds the open/folded state from the saved settings, the first time
+/// only; after that the panel's own record is what counts.
+pub fn seed_folds(expanded: Vec<String>) {
     with(|s| {
-        if let Some(k) = s.group_keys.get(id) {
-            if fold {
-                s.collapsed.insert(k.clone());
-            } else {
-                s.collapsed.remove(k);
-            }
+        if !s.seeded {
+            s.expanded = expanded
+                .into_iter()
+                .map(|c| c.to_ascii_lowercase())
+                .collect();
+            s.seeded = true;
         }
     });
+}
+
+/// Hands the window the categories now open, to save.
+fn save_folds(h: &Handles) {
+    let (handler, open) = match with(|s| {
+        let mut open: Vec<String> = s.expanded.iter().cloned().collect();
+        open.sort();
+        (s.handler, open)
+    }) {
+        Some(v) => v,
+        None => return,
+    };
+    handler(h.main, Event::Folds(open));
+}
+
+/// Folds category `id` away (`true`) or opens it, and saves which
+/// categories are open so the next launch starts the same way.
+fn set_folded(h: &Handles, id: usize, fold: bool) {
+    let changed = with(|s| {
+        let Some(k) = s.group_keys.get(id).cloned() else {
+            return false;
+        };
+        // "" (the "No category" heading) is never saved as a real name.
+        if fold {
+            s.expanded.remove(&k)
+        } else if k.is_empty() {
+            false
+        } else {
+            s.expanded.insert(k)
+        }
+    })
+    .unwrap_or(false);
+    if changed {
+        save_folds(h);
+    }
     let group = LVGROUP {
         cbSize: size_of::<LVGROUP>() as u32,
         mask: LVGF_STATE,

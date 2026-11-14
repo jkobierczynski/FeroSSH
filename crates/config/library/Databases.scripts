@@ -1,0 +1,64 @@
+# FeroSSH script library: databases (MySQL/MariaDB, PostgreSQL, Redis,
+# MongoDB). Most prompt for a password rather than taking it on the
+# command line. Each Snippet block becomes one file in
+# %APPDATA%\FeroSSH\scripts\Library\Databases.
+
+Snippet "MySQL - log in"
+    Line mysql -u ${1:root} -p -h ${2:localhost}
+
+Snippet "MySQL - databases and their size"
+    Line mysql -u ${1:root} -p -e "SELECT table_schema AS db, ROUND(SUM(data_length+index_length)/1024/1024,1) AS mb FROM information_schema.tables GROUP BY table_schema ORDER BY mb DESC;"
+
+Snippet "MySQL - who is connected and what they run"
+    Line mysql -u ${1:root} -p -e "SHOW FULL PROCESSLIST;"
+
+Snippet "MySQL - dump one database (gzip)"
+    Line mysqldump -u ${1:root} -p --single-transaction --routines --triggers ${2:dbname} | gzip > ${2:dbname}-${stamp}.sql.gz
+
+Snippet "MySQL - restore from a gzip dump"
+    Line gunzip -c ${1:dump.sql.gz} | mysql -u ${2:root} -p ${3:dbname}
+
+Snippet "MySQL - table sizes in a database"
+    Line mysql -u ${1:root} -p -e "SELECT table_name, ROUND((data_length+index_length)/1024/1024,1) AS mb FROM information_schema.tables WHERE table_schema='${2:dbname}' ORDER BY mb DESC;"
+
+Snippet "PostgreSQL - log in"
+    Line psql -U ${1:postgres} -h ${2:localhost} ${3:postgres}
+
+Snippet "PostgreSQL - databases and their size"
+    Line psql -U ${1:postgres} -c "SELECT datname, pg_size_pretty(pg_database_size(datname)) FROM pg_database ORDER BY pg_database_size(datname) DESC;"
+
+Snippet "PostgreSQL - active queries"
+    Line psql -U ${1:postgres} -c "SELECT pid, now()-query_start AS runtime, state, query FROM pg_stat_activity WHERE state <> 'idle' ORDER BY runtime DESC;"
+
+Snippet "PostgreSQL - largest tables in a database"
+    Line psql -U ${1:postgres} -d ${2:dbname} -c "SELECT relname, pg_size_pretty(pg_total_relation_size(relid)) FROM pg_catalog.pg_statio_user_tables ORDER BY pg_total_relation_size(relid) DESC LIMIT 20;"
+
+Snippet "PostgreSQL - dump one database (custom format)"
+    Line pg_dump -U ${1:postgres} -Fc ${2:dbname} > ${2:dbname}-${stamp}.dump
+
+Snippet "PostgreSQL - restore a custom-format dump"
+    Line pg_restore -U ${1:postgres} -d ${2:dbname} --clean --if-exists ${3:dump}
+
+Snippet "Redis - ping and server info"
+    Line redis-cli -h ${1:127.0.0.1} ping; redis-cli -h ${1:127.0.0.1} info server | head -n 20
+
+Snippet "Redis - memory and keyspace"
+    Line redis-cli -h ${1:127.0.0.1} info memory | grep -E 'used_memory_human|maxmemory_human'; redis-cli -h ${1:127.0.0.1} info keyspace
+
+Snippet "Redis - scan keys by pattern (no KEYS)"
+    Line redis-cli -h ${1:127.0.0.1} --scan --pattern '${2:*}' | head -n 100
+
+Snippet "Redis - slow queries"
+    Line redis-cli -h ${1:127.0.0.1} slowlog get 10
+
+Snippet "MongoDB - shell"
+    Line mongosh "${1:mongodb://localhost:27017}"
+
+Snippet "MongoDB - databases and their size"
+    Line mongosh --quiet --eval 'db.adminCommand("listDatabases").databases.forEach(d => print(d.name, (d.sizeOnDisk/1048576).toFixed(1)+" MB"))'
+
+Snippet "MongoDB - dump a database"
+    Line mongodump --uri="${1:mongodb://localhost:27017}" --db=${2:dbname} --gzip --archive=${2:dbname}-${stamp}.archive.gz
+
+Snippet "MongoDB - restore a gzip archive"
+    Line mongorestore --uri="${1:mongodb://localhost:27017}" --gzip --archive=${2:archive.gz}

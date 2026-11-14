@@ -1,0 +1,69 @@
+# FeroSSH script library: network devices (Cisco IOS and Juniper Junos
+# show commands), for serial and SSH sessions to switches, routers and
+# firewalls. Each Snippet block becomes one file in
+# %APPDATA%\FeroSSH\scripts\Library\Network devices.
+
+Snippet "Cisco - turn off paging for this session"
+    Line terminal length 0
+
+Snippet "Cisco - interfaces, short"
+    Line show ip interface brief
+
+Snippet "Cisco - interface status and errors"
+    Line show interfaces status
+    Line show interfaces counters errors
+
+Snippet "Cisco - VLANs and the MAC address table"
+    Line show vlan brief
+    Line show mac address-table
+
+Snippet "Cisco - routing table"
+    Line show ip route
+
+Snippet "Cisco - neighbours (CDP and LLDP)"
+    Line show cdp neighbors detail
+    Line show lldp neighbors
+
+Snippet "Cisco - running config, or one section"
+    Line show running-config
+    Line show running-config interface ${1:GigabitEthernet0/1}
+
+Snippet "Cisco - save the running config"
+    Line copy running-config startup-config
+
+Snippet "Cisco - version and uptime"
+    Line show version
+
+Snippet "Cisco - logs"
+    Line show logging
+
+Snippet "Cisco ASA - firewall connections and xlate"
+    Line show conn count
+    Line show xlate count
+
+Snippet "Juniper - interfaces, short"
+    Line show interfaces terse
+
+Snippet "Juniper - interface detail and errors"
+    Line show interfaces ${1:ge-0/0/0} extensive | match "error|drop|input|output"
+
+Snippet "Juniper - routing table summary"
+    Line show route summary
+    Line show route ${1:0.0.0.0/0}
+
+Snippet "Juniper - neighbours (LLDP)"
+    Line show lldp neighbors
+
+Snippet "Juniper - configuration, set format"
+    Line show configuration | display set | no-more
+
+Snippet "Juniper - compare and commit a change"
+    Line show | compare
+    Line commit confirmed ${1:5}
+
+Snippet "Juniper - chassis, version and alarms"
+    Line show version
+    Line show chassis alarms
+
+Snippet "Juniper - log file tail"
+    Line show log messages | last ${1:40}

@@ -1,0 +1,57 @@
+# FeroSSH script library: web servers and TLS (nginx, Apache, openssl
+# certificate checks). Mostly Linux. Each Snippet block becomes one file
+# in %APPDATA%\FeroSSH\scripts\Library\Web servers & TLS.
+
+Snippet "nginx - test the configuration"
+    Line sudo nginx -t
+
+Snippet "nginx - reload after a config change"
+    Line sudo nginx -t && sudo systemctl reload nginx
+
+Snippet "nginx - show the running configuration"
+    Line sudo nginx -T 2>/dev/null | less
+
+Snippet "nginx - which site serves a hostname"
+    Line sudo nginx -T 2>/dev/null | grep -nE 'server_name|listen|root' | less
+
+Snippet "nginx - busiest URLs in the access log"
+    Line awk '{print $$7}' ${1:/var/log/nginx/access.log} | sort | uniq -c | sort -rn | head -n 20
+
+Snippet "Apache - test the configuration"
+    Line sudo apachectl configtest
+
+Snippet "Apache - reload gracefully"
+    Line sudo apachectl configtest && sudo apachectl graceful
+
+Snippet "Apache - enabled modules and virtual hosts"
+    Line apache2ctl -M 2>/dev/null || httpd -M; echo; apache2ctl -S 2>/dev/null || httpd -S
+
+Snippet "TLS - certificate a server presents"
+    Line echo | openssl s_client -connect ${1:example.com}:${2:443} -servername ${1:example.com} 2>/dev/null | openssl x509 -noout -subject -issuer -dates -ext subjectAltName
+
+Snippet "TLS - days until a certificate expires"
+    Line d=$$(echo | openssl s_client -connect ${1:example.com}:${2:443} -servername ${1:example.com} 2>/dev/null | openssl x509 -noout -enddate | cut -d= -f2); if [ -z "$$d" ] || ! e=$$(date -d "$$d" +%s 2>/dev/null); then echo "could not read the certificate"; else echo "$$d"; echo "days left: $$(( (e - $$(date +%s)) / 86400 ))"; fi
+
+Snippet "TLS - read a certificate file"
+    Line openssl x509 -in ${1:cert.pem} -noout -text | less
+
+Snippet "TLS - does a key match a certificate"
+    Line diff <(openssl x509 -noout -modulus -in ${1:cert.pem} | openssl md5) <(openssl rsa -noout -modulus -in ${2:key.pem} | openssl md5) && echo "match" || echo "do NOT match"
+
+Snippet "TLS - full chain a server sends"
+    Line openssl s_client -connect ${1:example.com}:443 -servername ${1:example.com} -showcerts </dev/null 2>/dev/null | grep -E 'subject=|issuer='
+
+Snippet "TLS - which protocols and ciphers are offered"
+    Line nmap --script ssl-enum-ciphers -p ${2:443} ${1:example.com}
+
+Snippet "TLS - a self-signed certificate for testing"
+    Line openssl req -x509 -newkey rsa:2048 -nodes -keyout ${1:key.pem} -out ${2:cert.pem} -days ${3:365} -subj "/CN=${4:localhost}"
+
+Snippet "HTTP - headers and final status"
+    Line curl -sSI -L ${1:https://example.com}
+
+Snippet "HTTP - test a virtual host by Host header"
+    Line curl -skI -H 'Host: ${2:example.com}' https://${1:10.0.0.10}/
+
+Snippet "Certbot - certificates and their expiry"
+    Line sudo certbot certificates

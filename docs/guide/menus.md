@@ -153,6 +153,7 @@ Font, theme and text size apply to the focused pane only. Session > Save font an
 | Remote apps > Clipboard > Also share mouse selections from the host | ✓ on: text you only select with the mouse in a remote app (how xterm copies) also goes to the Windows clipboard. Off by default, so a selection does not replace what you copied on Windows. `RemoteAppShareSelection`. |
 | Scripts > Run login script again | Runs the connection's login script from the start. |
 | Scripts > Record keystrokes as script | Records what you type in the focused pane until you pick it again, then opens the result in the script editor (see [Recording](everyday-use.md#recording-a-script)). ✓ while recording. |
+| Scripts > Write built-in scripts to the library | Writes FeroSSH's built-in scripts into your scripts folder, under `Library`. Adds the ones not there yet and asks before overwriting any you already have (see [The built-in library](everyday-use.md#the-built-in-library)). |
 | Scripts > Auto-responses from scripts | ✓ on: scripts with a *When* text answer by themselves. Off turns all of them off. `AutoResponses`. |
 | Scripts > Confirm scripts on Production hosts | ✓ on: a script about to be typed into a pane with the Production theme asks first. `ConfirmProduction`. |
 | Replace host key... | After a host key change you know the reason for, trusts the new key. It asks twice. |

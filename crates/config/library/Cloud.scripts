@@ -1,0 +1,60 @@
+# FeroSSH script library: cloud (AWS, Azure and Google Cloud command
+# lines). You need the matching CLI installed and signed in. Each Snippet
+# block becomes one file in %APPDATA%\FeroSSH\scripts\Library\Cloud.
+
+Snippet "AWS - who am I"
+    Line aws sts get-caller-identity
+
+Snippet "AWS - set the region for this shell"
+    Line export AWS_REGION=${1:eu-west-1} AWS_DEFAULT_REGION=${1:eu-west-1}
+
+Snippet "AWS - running EC2 instances"
+    Line aws ec2 describe-instances --filters Name=instance-state-name,Values=running --query 'Reservations[].Instances[].[InstanceId,InstanceType,PrivateIpAddress,Tags[?Key==`Name`]|[0].Value]' --output table
+
+Snippet "AWS - a shell on an instance over SSM (no SSH)"
+    Line aws ssm start-session --target ${1:i-0123456789abcdef0}
+
+Snippet "AWS - S3 buckets and a bucket's size"
+    Line aws s3 ls; aws s3 ls --summarize --human-readable --recursive s3://${1:bucket} | tail -n 2
+
+Snippet "AWS - tail a CloudWatch log group"
+    Line aws logs tail ${1:/aws/lambda/my-func} --follow --since ${2:10m}
+
+Snippet "AWS - read a secret"
+    Line aws secretsmanager get-secret-value --secret-id ${1:name} --query SecretString --output text
+
+Snippet "AWS - cost so far this month"
+    Line aws ce get-cost-and-usage --time-period Start=$$(date -u +%Y-%m-01),End=$$(date -u +%Y-%m-%d) --granularity MONTHLY --metrics UnblendedCost --query 'ResultsByTime[0].Total.UnblendedCost' --output table
+
+Snippet "Azure - account and subscription"
+    Line az account show -o table
+
+Snippet "Azure - pick a subscription"
+    Line az account set --subscription ${1:name-or-id}
+
+Snippet "Azure - virtual machines with state"
+    Line az vm list -d -o table
+
+Snippet "Azure - credentials for an AKS cluster"
+    Line az aks get-credentials -g ${1:resource-group} -n ${2:cluster}
+
+Snippet "Azure - storage accounts and a secret"
+    Line az storage account list -o table; az keyvault secret show --vault-name ${1:vault} -n ${2:name} --query value -o tsv
+
+Snippet "GCP - project, account and region"
+    Line gcloud config list
+
+Snippet "GCP - set the active project"
+    Line gcloud config set project ${1:my-project}
+
+Snippet "GCP - compute instances"
+    Line gcloud compute instances list
+
+Snippet "GCP - credentials for a GKE cluster"
+    Line gcloud container clusters get-credentials ${1:cluster} --region ${2:europe-west1}
+
+Snippet "GCP - buckets and their size"
+    Line gcloud storage ls; gcloud storage du -s gs://${1:bucket}
+
+Snippet "GCP - tail a service's logs"
+    Line gcloud logging read "resource.labels.service_name=${1:service}" --limit ${2:50} --freshness ${3:1h}

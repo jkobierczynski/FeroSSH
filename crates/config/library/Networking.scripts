@@ -106,19 +106,3 @@ Snippet "Scan - hosts that answer ping on a subnet"
 
 Snippet "Scan - ping sweep without nmap"
     Line for i in $$(seq 1 254); do (ping -c1 -W1 ${1:192.168.1}.$$i >/dev/null && echo ${1:192.168.1}.$$i up) & done; wait
-
-Snippet "Cisco - interfaces, short"
-    Line show ip interface brief
-
-Snippet "Cisco - save the running config"
-    Line copy running-config startup-config
-
-Snippet "Cisco - no paging"
-    Line terminal length 0
-
-Snippet "Cisco - neighbours (CDP and LLDP)"
-    Line show cdp neighbors
-    Line show lldp neighbors
-
-Snippet "Cisco - errors on interfaces"
-    Line show interfaces counters errors

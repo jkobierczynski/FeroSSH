@@ -1,18 +1,19 @@
 //! The command library that ships inside FeroSSH: a few hundred ready
 //! one-liners and scripts for Linux, system administration, Windows,
-//! DevOps, development, hacking and networking, laid out as ordinary
-//! script files under `scripts\Library` so they read, run, copy and
-//! change like any other script (see [`crate::snippet_store`]).
+//! networking, databases, containers, the cloud, security, hacking and
+//! more, laid out as ordinary script files under `scripts\Library` so
+//! they read, run, copy and change like any other script (see
+//! [`crate::snippet_store`]).
 //!
 //! The library is embedded in the exe (as a handful of bundle files, one
-//! per category), so there is nothing to install and the exe stays
-//! small. [`sync`] writes it into the scripts folder, and keeps the
-//! user's own changes: a library script the user has edited is left as
-//! they left it, one the user has deleted stays gone, and only scripts
-//! the user has not touched are refreshed when FeroSSH is upgraded, so a
-//! new release's new or improved library scripts still arrive. The top
-//! folder is `Library`, keeping the shipped set apart from the user's
-//! own categories.
+//! per category), so there is nothing to install and the exe stays small.
+//! It is not written automatically: the user asks for it from
+//! Session > Scripts > Write built-in scripts, which calls [`write`]. A
+//! script that is not in the folder yet is written; a script already
+//! there is left as the user has it unless they choose to overwrite. So
+//! the user's own edits and deletions are never disturbed behind their
+//! back. The top folder is `Library`, keeping the shipped set apart from
+//! the user's own categories.
 
 use std::io;
 use std::path::{Path, PathBuf};
@@ -24,12 +25,6 @@ use crate::snippet_store::{file_for, file_text};
 /// The folder, below the scripts folder, the library is written into.
 pub const FOLDER: &str = "Library";
 
-/// Bumped whenever the embedded library changes, so [`sync`] knows to
-/// look the folder over again; otherwise it leaves a folder it has
-/// already written for this version alone. The crate version does, so an
-/// upgrade always re-syncs.
-const VERSION: &str = env!("CARGO_PKG_VERSION");
-
 /// The bundles built into the exe: a category name and its file, each
 /// file holding one `Snippet` block per script.
 const BUNDLES: &[(&str, &str)] = &[
@@ -39,13 +34,43 @@ const BUNDLES: &[(&str, &str)] = &[
         include_str!("../library/System administration.scripts"),
     ),
     ("Windows", include_str!("../library/Windows.scripts")),
+    ("Networking", include_str!("../library/Networking.scripts")),
+    (
+        "Network devices",
+        include_str!("../library/Network devices.scripts"),
+    ),
+    (
+        "Security & hardening",
+        include_str!("../library/Security & hardening.scripts"),
+    ),
+    (
+        "Monitoring & logs",
+        include_str!("../library/Monitoring & logs.scripts"),
+    ),
+    (
+        "Storage & backup",
+        include_str!("../library/Storage & backup.scripts"),
+    ),
+    ("Databases", include_str!("../library/Databases.scripts")),
+    (
+        "Web servers & TLS",
+        include_str!("../library/Web servers & TLS.scripts"),
+    ),
+    (
+        "Containers & Kubernetes",
+        include_str!("../library/Containers & Kubernetes.scripts"),
+    ),
     ("DevOps", include_str!("../library/DevOps.scripts")),
+    ("Cloud", include_str!("../library/Cloud.scripts")),
+    (
+        "Virtualization",
+        include_str!("../library/Virtualization.scripts"),
+    ),
     (
         "Development",
         include_str!("../library/Development.scripts"),
     ),
     ("Hacking", include_str!("../library/Hacking.scripts")),
-    ("Networking", include_str!("../library/Networking.scripts")),
 ];
 
 /// Every library script, each with its category set to `Library/<name>`.
@@ -73,17 +98,6 @@ fn wanted() -> Vec<(String, String)> {
         .collect()
 }
 
-/// A 64-bit FNV-1a hash of `bytes`, as hex: enough to tell a file the
-/// user has changed from one they have not.
-fn hash(bytes: &[u8]) -> String {
-    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
-    for b in bytes {
-        h ^= u64::from(*b);
-        h = h.wrapping_mul(0x0000_0100_0000_01b3);
-    }
-    format!("{h:016x}")
-}
-
 /// `rel` (with `/` between parts) as a path under `dir`, if it stays
 /// within it.
 fn under(dir: &Path, rel: &str) -> Option<PathBuf> {
@@ -98,7 +112,7 @@ fn under(dir: &Path, rel: &str) -> Option<PathBuf> {
 }
 
 /// Writes `text` to `path` through a temporary file, making its folders.
-fn write_file(path: &Path, text: &str) -> std::io::Result<()> {
+fn write_file(path: &Path, text: &str) -> io::Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
@@ -107,77 +121,70 @@ fn write_file(path: &Path, text: &str) -> std::io::Result<()> {
     std::fs::rename(&tmp, path)
 }
 
-/// The manifest file, which records the version last written and the
-/// hash of every script as it was shipped. It has no script extension,
-/// so the loader passes over it.
-fn manifest_path(dir: &Path) -> PathBuf {
-    dir.join(FOLDER).join(".manifest")
+/// How the built-in library stands against the scripts folder, so the
+/// menu can tell the user what writing it would do.
+#[derive(Debug)]
+pub struct Status {
+    /// Library scripts not in the folder yet (a fresh [`write`] adds them).
+    pub missing: usize,
+    /// Library scripts already in the folder (left alone unless the user
+    /// chooses to overwrite).
+    pub present: usize,
 }
 
-/// The shipped hash of each library file at the last sync, by relative
-/// path, and the version written then.
-fn read_manifest(dir: &Path) -> (String, std::collections::HashMap<String, String>) {
-    let mut version = String::new();
-    let mut map = std::collections::HashMap::new();
-    let Ok(text) = std::fs::read_to_string(manifest_path(dir)) else {
-        return (version, map);
-    };
-    for line in text.lines() {
-        if let Some(v) = line.strip_prefix("# ferossh-library ") {
-            version = v.trim().to_owned();
-        } else if let Some((h, rel)) = line.split_once('\t') {
-            map.insert(rel.to_owned(), h.to_owned());
+impl Status {
+    /// The whole library, however it is split between on disk and not.
+    pub fn total(&self) -> usize {
+        self.missing + self.present
+    }
+}
+
+/// Looks over the scripts folder without changing anything.
+pub fn status(scripts_dir: &Path) -> Status {
+    let mut missing = 0;
+    let mut present = 0;
+    for (rel, _) in wanted() {
+        match under(scripts_dir, &rel) {
+            Some(path) if path.exists() => present += 1,
+            Some(_) => missing += 1,
+            None => {}
         }
     }
-    (version, map)
+    Status { missing, present }
 }
 
-/// Brings `scripts_dir/Library` in line with the library built into this
-/// FeroSSH, without disturbing the user's own work:
+/// What a [`write`] did.
+#[derive(Debug)]
+pub struct Written {
+    /// Scripts written (new ones, plus overwritten ones when asked).
+    pub written: usize,
+    /// Scripts left as the user had them (already there, not overwriting).
+    pub kept: usize,
+}
+
+/// Writes the built-in library into the scripts folder.
 ///
-/// * a script the folder has never held is written;
-/// * a script still exactly as FeroSSH last wrote it is refreshed to the
-///   new version (the user had not changed it);
-/// * a script the user has edited is left as it is;
-/// * a script the user has deleted (shipped before, now gone) stays gone.
-///
-/// Does nothing when the folder was already written by this version, so
-/// opening the scripts view again is free. A folder that cannot be
-/// written (read-only, say) is left alone.
-pub fn sync(scripts_dir: &Path) {
-    let (old_version, shipped) = read_manifest(scripts_dir);
-    if old_version == VERSION {
-        return;
-    }
-    let mut manifest = format!("# ferossh-library {VERSION}\n");
-    let mut lines: Vec<String> = Vec::new();
+/// A script that is not there yet is always written. A script that is
+/// already there is overwritten only when `overwrite` is true; otherwise
+/// it is left exactly as the user has it and counted as kept. Returns how
+/// many were written and how many kept, or the first write error (the
+/// folder is read-only, say), with whatever was written so far left in
+/// place.
+pub fn write(scripts_dir: &Path, overwrite: bool) -> io::Result<Written> {
+    let mut written = 0;
+    let mut kept = 0;
     for (rel, text) in wanted() {
         let Some(path) = under(scripts_dir, &rel) else {
             continue;
         };
-        let new_hash = hash(text.as_bytes());
-        let write = match std::fs::read(&path) {
-            // There: refresh only one the user has left untouched since we
-            // wrote it.
-            Ok(bytes) => shipped.get(&rel).is_some_and(|h| *h == hash(&bytes)),
-            // Missing: a new script, unless the user deleted one we shipped.
-            Err(e) if e.kind() == io::ErrorKind::NotFound => !shipped.contains_key(&rel),
-            // Some other trouble reading it (a lock, a permission): leave
-            // the folder as it is rather than writing a manifest that would
-            // later read an untouched file as the user's own edit.
-            Err(_) => return,
-        };
-        if write && write_file(&path, &text).is_err() {
-            return;
+        if path.exists() && !overwrite {
+            kept += 1;
+            continue;
         }
-        lines.push(format!("{new_hash}\t{rel}"));
+        write_file(&path, &text)?;
+        written += 1;
     }
-    lines.sort();
-    for l in lines {
-        manifest.push_str(&l);
-        manifest.push('\n');
-    }
-    let _ = write_file(&manifest_path(scripts_dir), &manifest);
+    Ok(Written { written, kept })
 }
 
 /// Whether `rel` (a script's file, `/` between parts) is one of the
@@ -195,7 +202,7 @@ mod tests {
     use crate::snippet_store::EXTENSION;
 
     /// A temporary directory that cleans itself up when the test ends,
-    /// pass or fail. Derefs to its path, so `sync(&dir)` works.
+    /// pass or fail. Derefs to its path, so `write(&dir, ..)` works.
     struct TempDir(PathBuf);
 
     impl std::ops::Deref for TempDir {
@@ -241,7 +248,7 @@ mod tests {
     #[test]
     fn library_parses_and_has_every_category() {
         let scripts = scripts();
-        assert!(scripts.len() > 150, "only {} scripts", scripts.len());
+        assert!(scripts.len() > 200, "only {} scripts", scripts.len());
         for (category, _) in BUNDLES {
             let want = format!("{FOLDER}/{category}");
             assert!(
@@ -268,91 +275,72 @@ mod tests {
     }
 
     #[test]
-    fn sync_writes_the_whole_library_then_loads_it() {
+    fn write_puts_the_whole_library_down_then_loads_it() {
         let dir = temp("write");
-        sync(&dir);
-        assert_eq!(count_files(&dir), scripts().len());
+        let n = scripts().len();
+        let before = status(&dir);
+        assert_eq!(before.missing, n);
+        assert_eq!(before.present, 0);
+
+        let done = write(&dir, false).unwrap();
+        assert_eq!(done.written, n);
+        assert_eq!(done.kept, 0);
+        assert_eq!(count_files(&dir), n);
+
         let (loaded, problems) = crate::snippet_store::load(&dir);
         assert!(problems.is_empty(), "problems: {problems:?}");
-        assert_eq!(loaded.len(), scripts().len());
+        assert_eq!(loaded.len(), n);
         assert!(loaded.iter().all(|s| s.category.starts_with(FOLDER)));
+
+        // Now everything is present.
+        let after = status(&dir);
+        assert_eq!(after.missing, 0);
+        assert_eq!(after.present, n);
     }
 
     #[test]
-    fn sync_is_cheap_the_second_time() {
-        let dir = temp("again");
-        sync(&dir);
-        // A library file, edited by hand.
+    fn without_overwrite_an_edited_script_is_kept() {
+        let dir = temp("keep");
+        write(&dir, false).unwrap();
         let edited = under(&dir, &file_for(&scripts()[0])).unwrap();
+        let mine = "Snippet \"Mine\"\n    Line echo mine\n";
+        std::fs::write(&edited, mine).unwrap();
+
+        // A second write without overwrite leaves the edit and writes nothing.
+        let done = write(&dir, false).unwrap();
+        assert_eq!(done.written, 0);
+        assert_eq!(done.kept, scripts().len());
+        assert_eq!(std::fs::read_to_string(&edited).unwrap(), mine);
+    }
+
+    #[test]
+    fn with_overwrite_an_edited_script_is_replaced() {
+        let dir = temp("overwrite");
+        write(&dir, false).unwrap();
+        let first = &scripts()[0];
+        let edited = under(&dir, &file_for(first)).unwrap();
         std::fs::write(&edited, "Snippet \"Mine\"\n    Line echo mine\n").unwrap();
-        // Same version: sync leaves everything, including the edit.
-        sync(&dir);
-        assert_eq!(
-            std::fs::read_to_string(&edited).unwrap(),
-            "Snippet \"Mine\"\n    Line echo mine\n"
-        );
+
+        // Overwriting restores the shipped text for every script.
+        let done = write(&dir, true).unwrap();
+        assert_eq!(done.written, scripts().len());
+        assert_eq!(done.kept, 0);
+        assert_eq!(std::fs::read_to_string(&edited).unwrap(), file_text(first));
     }
 
     #[test]
-    fn an_edited_script_survives_an_upgrade_but_an_untouched_one_refreshes() {
-        let dir = temp("upgrade");
-        let all = scripts();
-        let edited_rel = file_for(&all[0]);
-        let untouched_rel = file_for(&all[1]);
-        let edited = under(&dir, &edited_rel).unwrap();
-        let untouched = under(&dir, &untouched_rel).unwrap();
-
-        // Pretend an older FeroSSH shipped both scripts with OLDER text,
-        // and recorded that text's hashes in the manifest.
-        let old_text = "Snippet \"Was here\"\n    Line echo old\n";
-        write_file(&edited, old_text).unwrap();
-        write_file(&untouched, old_text).unwrap();
-        let old_hash = hash(old_text.as_bytes());
-        let manifest = format!(
-            "# ferossh-library 0.0.0-old\n{old_hash}\t{edited_rel}\n{old_hash}\t{untouched_rel}\n"
-        );
-        write_file(&manifest_path(&dir), &manifest).unwrap();
-
-        // The user edits the first; the second they leave as shipped.
-        std::fs::write(&edited, "Snippet \"Changed\"\n    Line echo hi\n").unwrap();
-
-        sync(&dir);
-
-        // The edit is kept, not overwritten by this version's text.
-        assert_eq!(
-            std::fs::read_to_string(&edited).unwrap(),
-            "Snippet \"Changed\"\n    Line echo hi\n"
-        );
-        // The untouched one is refreshed from the old text to this
-        // version's shipped text.
-        assert_ne!(old_text, file_text(&all[1]));
-        assert_eq!(
-            std::fs::read_to_string(&untouched).unwrap(),
-            file_text(&all[1])
-        );
-        // The manifest now records this version.
-        assert!(
-            std::fs::read_to_string(manifest_path(&dir))
-                .unwrap()
-                .contains(VERSION)
-        );
-    }
-
-    #[test]
-    fn a_deleted_library_script_stays_deleted_on_the_next_run() {
+    fn a_deleted_script_comes_back_only_on_the_next_write() {
         let dir = temp("delete");
-        sync(&dir);
-        let gone_rel = file_for(&scripts()[0]);
-        let gone = under(&dir, &gone_rel).unwrap();
+        write(&dir, false).unwrap();
+        let gone = under(&dir, &file_for(&scripts()[0])).unwrap();
         std::fs::remove_file(&gone).unwrap();
-        // A new version comes along.
-        let manifest = std::fs::read_to_string(manifest_path(&dir)).unwrap();
-        std::fs::write(
-            manifest_path(&dir),
-            manifest.replacen(VERSION, "0.0.0-old", 1),
-        )
-        .unwrap();
-        sync(&dir);
-        assert!(!gone.exists(), "a deleted library script came back");
+
+        // status counts it as missing again.
+        assert_eq!(status(&dir).missing, 1);
+
+        // Writing (even without overwrite) puts the one missing file back.
+        let done = write(&dir, false).unwrap();
+        assert_eq!(done.written, 1);
+        assert!(gone.exists());
     }
 }
