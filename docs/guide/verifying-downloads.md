@@ -44,7 +44,7 @@ run on an exe you rebuilt with the steps below (it has the unsigned hash), or on
 
 ## Rebuilding a release yourself
 
-FeroSSH's builds are reproducible: the same source gives the same bytes, wherever it is built. CI checks this for every change by building twice, on two machines and in two folders, and comparing. To rebuild a release on your own PC you need Git, rustup, Visual Studio Build Tools with the MSVC toolchain, and the Windows SDK. Then:
+FeroSSH's builds are reproducible: the same source gives the same bytes, wherever it is built. CI checks this for every change by building twice, on two machines and in two folders, and comparing. To rebuild a release on your own PC you need Git, rustup, Visual Studio or its Build Tools with the MSVC v14.44 toolset, and Windows SDK 10.0.26100. v14.44 is the default toolset of Visual Studio 2022 17.14; in Visual Studio 2026 add it in the Visual Studio Installer under Individual components ("MSVC v143 - VS 2022 C++ x64/x86 build tools (v14.44)", or the ARM64/ARM64EC one for the ARM64 exes). The script uses that toolset even when a newer one is installed, because the linker and the C runtime it links in change with every Visual Studio update. Then:
 
 ```powershell
 git clone https://github.com/jkobierczynski/FeroSSH
@@ -57,7 +57,7 @@ For the ARM64 exes, check out the tag of a release that has them, and run `pwsh 
 
 The script prints the SHA-256 of each exe it built. Those of the published exes must equal the `sha256_unsigned` values in that release's `BUILD-MANIFEST.json`. (`ferossh-vnc.exe` and `ferossh-vnc-arm64.exe` are built but not published.) They differ from `SHA256SUMS.txt` only when the release is code-signed, because the signature is added to the exe after it is built.
 
-The script builds with the toolchain pinned in `rust-toolchain.toml` (rustup installs it), the dependencies pinned in `Cargo.lock`, `/Brepro` so the exe holds no timestamps, and `--remap-path-prefix` so the folder you build in does not end up in the exe.
+The script builds with the toolchain pinned in `rust-toolchain.toml` (rustup installs it), the dependencies pinned in `Cargo.lock`, the MSVC toolset and Windows SDK pinned in the script (it writes the versions it used to `dist\build-tools-x64.txt` or `-arm64.txt`), `/Brepro` so the exe holds no timestamps, and `--remap-path-prefix` so the folder you build in does not end up in the exe.
 
 ## The FeroStream agents
 

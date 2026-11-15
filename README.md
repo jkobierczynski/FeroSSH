@@ -242,7 +242,7 @@ Profile web1
 
 ## Building
 
-Requirements: Rust via rustup (the pinned toolchain in `rust-toolchain.toml` installs itself), Visual Studio Build Tools with the MSVC toolchain, and the Windows SDK. No CMake, NASM or extra C toolchain.
+Requirements: Rust via rustup (the pinned toolchain in `rust-toolchain.toml` installs itself), Visual Studio Build Tools with the MSVC toolchain, and the Windows SDK. No CMake, NASM or extra C toolchain. `scripts/build-release.ps1`, which builds the release exes byte for byte, also needs the MSVC v14.44 toolset (an extra component in Visual Studio 2026) and Windows SDK 10.0.26100; see [Rebuilding a release yourself](docs/guide/verifying-downloads.md#rebuilding-a-release-yourself).
 
 ```
 cargo build --release -p ferossh
