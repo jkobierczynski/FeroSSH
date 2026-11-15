@@ -595,7 +595,7 @@ Edit > Suggest commands as you type (off until you turn it on) shows, greyed aft
 
 | To | Press |
 | --- | --- |
-| Type the whole suggestion | Right arrow or End |
+| Type the whole suggestion | Right arrow, End, Ctrl+E or Ctrl+F |
 | Type its next word | Ctrl+Right |
 | See another match | Ctrl+Up, Ctrl+Down |
 | Forget the one shown (a built-in one until FeroSSH restarts) | Shift+Delete |

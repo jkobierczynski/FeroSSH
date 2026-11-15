@@ -8026,7 +8026,8 @@ impl Window {
     }
 
     /// A key that works on the suggestion showing in pane `id`: Right or
-    /// End types the rest, Ctrl+Right its next word, Ctrl+Up and
+    /// End types the rest (Ctrl+E and Ctrl+F: `ghost_accept_key`),
+    /// Ctrl+Right its next word, Ctrl+Up and
     /// Ctrl+Down show another, Shift+Delete forgets it. `false` when the
     /// key is not one, or no suggestion shows: it goes to the host.
     fn ghost_key(&mut self, id: PaneId, key: Key, mods: Mods) -> bool {
@@ -8069,6 +8070,37 @@ impl Window {
             }
             _ => return false,
         }
+        true
+    }
+
+    /// Ctrl+E or Ctrl+F (control code `code`) in pane `id`: types the
+    /// rest of the suggestion showing there, unless no suggestion shows or
+    /// the key belongs to tmux (it is the prefix, or comes after it).
+    fn ghost_accept_key(&mut self, id: PaneId, code: u8, mods: Mods) -> bool {
+        let ctrl = Mods {
+            ctrl: true,
+            ..Mods::NONE
+        };
+        if mods != ctrl || self.tmux_armed == Some(id) {
+            return false;
+        }
+        let prefix = tmux_keys::Prefix {
+            ch: char::from(code),
+            alt: false,
+        };
+        if self.tmux_keys_of(id).is_some_and(|k| k.is_prefix(prefix)) {
+            return false;
+        }
+        let Some(rest) = self
+            .ghost
+            .as_ref()
+            .filter(|g| g.pane == id)
+            .map(|g| g.rest.clone())
+        else {
+            return false;
+        };
+        self.tmux_repeat = None;
+        self.type_ghost(id, &rest);
         true
     }
 
@@ -9986,6 +10018,17 @@ impl Window {
                 self.input(id, bytes);
             }
             self.send_typed(&targets, &Typed::Key(key, mods));
+            return KeyOutcome::Handled;
+        }
+        // Ctrl+E (end of line) and Ctrl+F (forward a character) take a
+        // suggestion, as in fish and zsh-autosuggestions. Sent to the
+        // host instead, they hid it: the cursor already sits at the end,
+        // so the shell echoes nothing and the suggestion waits for an
+        // answer that never comes.
+        if (vk == VIRTUAL_KEY(0x45) || vk == VIRTUAL_KEY(0x46))
+            && self.ghost_accept_key(id, if vk == VIRTUAL_KEY(0x45) { 0x05 } else { 0x06 }, mods)
+        {
+            drop_pending_char(self.hwnd);
             return KeyOutcome::Handled;
         }
         // Control codes that have no character on most layouts. AltGr
@@ -14294,7 +14337,7 @@ impl Window {
                 if on {
                     return Some(Command::Notice(
                         "Earlier commands on this host, and a few common ones, now show greyed \
-                         after the cursor as you type. Right arrow or End types the rest, \
+                         after the cursor as you type. Right arrow, End or Ctrl+E types the rest, \
                          Ctrl+Right its next word, Ctrl+Up and Ctrl+Down show other matches, and \
                          Shift+Delete forgets the one shown. Commands are kept per host, \
                          encrypted with your Windows sign-in, on this PC only; nothing typed at a \

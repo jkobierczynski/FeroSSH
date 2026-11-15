@@ -40,7 +40,7 @@ Items that can do nothing for the focused pane are greyed out, and the command p
 | Save selection as script... | | Opens the script editor with the selected text as the script's lines. |
 | Copy on select | ✓ off | Copies a selection as soon as you make it, as PuTTY does. `CopyOnSelect`. |
 | Right-click pastes | ✓ off | A right click pastes, as in PuTTY. `RightClickPaste`. |
-| Suggest commands as you type | ✓ off | Shows an earlier command on this host (or a common one) greyed after the cursor; Right arrow or End types it (see [Command suggestions](everyday-use.md#command-suggestions)). `CommandSuggestions`. |
+| Suggest commands as you type | ✓ off | Shows an earlier command on this host (or a common one) greyed after the cursor; Right arrow, End or Ctrl+E types it (see [Command suggestions](everyday-use.md#command-suggestions)). `CommandSuggestions`. |
 | Clear command history for this host | | Forgets the commands kept for the focused pane's host. |
 | Clear command history for all hosts... | | Asks, then forgets the commands kept for every host. |
 
