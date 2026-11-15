@@ -8058,12 +8058,20 @@ impl Window {
         if self.tmux_armed == Some(id) {
             return false;
         }
-        // Ctrl with a letter is a control code, which may be the prefix.
-        if mods.ctrl && (0x41..=0x5A).contains(&vk.0) {
-            let prefix = tmux_keys::Prefix {
-                ch: char::from(u8::try_from(vk.0 - 0x40).unwrap_or(0)),
-                alt: mods.alt,
-            };
+        // Ctrl with a letter, Space, 2, 6 or / is a control code (as
+        // `on_key_down` sends it), which may be the prefix.
+        let control = match vk {
+            _ if !mods.ctrl => None,
+            VK_SPACE | VIRTUAL_KEY(0x32) => Some('\x00'),
+            VIRTUAL_KEY(0x36) => Some('\x1e'),
+            VK_OEM_2 => Some('\x1f'),
+            _ if (0x41..=0x5A).contains(&vk.0) => {
+                Some(char::from(u8::try_from(vk.0 - 0x40).unwrap_or(0)))
+            }
+            _ => None,
+        };
+        if let Some(ch) = control {
+            let prefix = tmux_keys::Prefix { ch, alt: mods.alt };
             if self.tmux_keys_of(id).is_some_and(|k| k.is_prefix(prefix)) {
                 return false;
             }
