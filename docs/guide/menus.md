@@ -290,14 +290,14 @@ A standard Windows page in the tools pane: a search box over a list with each en
 
 ## Key bindings
 
-Settings > Key bindings opens a window with every action of the menus, greyed ones too, plus the scroll keys, which are in no menu. Each row shows the action, its shortcuts now and its default ones; a dot marks the ones you changed. The search box finds an action by name or by key (`ctrl+shift+n`).
+Settings > Key bindings opens a window with every action of the menus, greyed ones too, plus the scroll keys and the command suggestion keys, which are in no menu. Each row shows the action, its shortcuts now and its default ones; a dot marks the ones you changed. The search box finds an action by name or by key (`ctrl+shift+n`).
 
 - **Change...** (Enter or a double click on a row) waits for a key: press it with Ctrl, Alt or Shift as you want it, and it becomes the action's only shortcut. Esc cancels. **Add key...** adds a second one instead.
 - **No shortcut** takes the action's keys away. **Reset to default** gives it its default keys back, and **Reset all** every action.
 - A key that another action has moves to this one, after asking. A key that would stop typing working (a letter, Enter, Tab, Shift with a letter, AltGr with a letter) is refused. A key that programs in the terminal use is taken only after a warning: Ctrl with a letter (Ctrl+C stops a program, Ctrl+R searches the shell's history), Alt with a letter (Meta in shells and editors, and the menu letters), plain function keys and the like. Keys with Ctrl+Shift are the safest.
 - Nothing changes until OK. The new keys work at once, show in the menus, the palette and the rail, and are saved in `ferossh.conf` as `KeyBinding` lines for the actions you changed.
 
-Some keys only work in some places, whatever they are: the tab keys (Next tab, Previous tab, Move tab, Join tab) while the window has more than one tab, the pane keys (Focus pane, Grow pane) while the tab has more than one pane. Elsewhere those keys go to the terminal, as before. Shift+End also follows new output while the view is scrolled back, and Alt+F4 always closes the window.
+Some keys only work in some places, whatever they are: the tab keys (Next tab, Previous tab, Move tab, Join tab) while the window has more than one tab, the pane keys (Focus pane, Grow pane) while the tab has more than one pane, and the Suggestions keys (Type the whole suggestion, Type its next word, Show the next or previous match, Forget the one shown) while a command suggestion shows greyed after the cursor. Elsewhere those keys go to the terminal, as before. Since a Suggestions key leaves the terminal alone the rest of the time, the window gives one without the terminal-key warning; the tmux prefix still goes to tmux while tmux keybindings are on. Shift+End also follows new output while the view is scrolled back, and Alt+F4 always closes the window.
 
 In the tools pane's search boxes and lists, a key bound to an action runs it when it has Ctrl+Shift, is a function key, or is Ctrl or Alt with a key the control does not use itself; Ctrl+C, Ctrl+V, Ctrl+A, Ctrl+arrows, Shift+Insert and Alt with a button's letter stay with the control.
 

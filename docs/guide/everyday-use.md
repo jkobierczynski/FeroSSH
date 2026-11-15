@@ -600,6 +600,8 @@ Edit > Suggest commands as you type (off until you turn it on) shows, greyed aft
 | See another match | Ctrl+Up, Ctrl+Down |
 | Forget the one shown (a built-in one until FeroSSH restarts) | Shift+Delete |
 
+These are the default keys: Settings > Key bindings lists them under Suggestions, where you can change, add or take away keys. They only work while a suggestion shows; the rest of the time the same keys go to the host as usual (End and Ctrl+E still move to the end of the line).
+
 Any other key goes to the host as usual, and typing on simply changes or hides the suggestion. A command you forgot with Shift+Delete comes back once you run it again. On a slow link, editing keys (Backspace, Tab, arrows) pressed before the host has answered the previous key turn suggestions off for the rest of that line, since FeroSSH can no longer tell which line is final. Nothing shows while you are scrolled back, in a full-screen program such as vim or less, or when the shell already shows its own suggestion after the cursor (fish, zsh-autosuggestions, PowerShell's PSReadLine).
 
 FeroSSH reads the command from the screen, from the end of the prompt to the end of the line, once Enter runs it, so Tab completion, the shell's own history and editing keys all count. It keeps it in a history for that host (user, host and port; a tmux pane shares its connection's), up to 1,000 commands. What it never keeps:
