@@ -571,6 +571,11 @@ fn show_selected() {
                 " Its keys work while the tab has more than one pane; with one, they go to \
                  the terminal.",
             ),
+            When::Suggestion => text.push_str(
+                " Its keys work while a command suggestion shows greyed after the cursor \
+                 (Edit > Suggest commands as you type); the rest of the time they go to the \
+                 terminal.",
+            ),
         }
         if !s.keys.is_default(id) {
             let default = s.keys.default_keys(id);
@@ -681,7 +686,7 @@ fn take(id: u32, add: bool, key: Hotkey) {
             label.clone(),
             name_of(s, id),
             owner.map(|o| name_of(s, o)),
-            keymap::check(key, &label, s.ctx.tmux_prefix),
+            keymap::check(key, &label, s.ctx.tmux_prefix, s.keys.when(id)),
             s.ctx.standby == Some(key),
         )
     }) else {

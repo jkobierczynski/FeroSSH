@@ -4,8 +4,8 @@
 //! where typing started (the end of the prompt) to the cursor. When the
 //! host's echo shows it and Enter runs it, the line goes into this host's
 //! history. While typing, the most recent earlier command that starts
-//! with what is typed so far shows greyed after the cursor; Right arrow
-//! or End types the rest of it, Ctrl+Right its next word, Ctrl+Up and
+//! with what is typed so far shows greyed after the cursor; Right arrow,
+//! End, Ctrl+E or Ctrl+F type the rest of it, Ctrl+Right its next word, Ctrl+Up and
 //! Ctrl+Down go through the other matches, and Shift+Delete forgets it.
 //! When history has nothing, a short built-in list of common commands
 //! fills in.

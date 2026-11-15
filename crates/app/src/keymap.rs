@@ -24,6 +24,11 @@ pub enum When {
     Tabs,
     /// With more than one pane in the tab.
     Split,
+    /// While a command suggestion shows (Edit > Suggest commands as you
+    /// type); otherwise the key goes to the terminal. Never a shortcut:
+    /// [`Keymap::lookup`] leaves these out, [`Keymap::suggestion`] finds
+    /// them.
+    Suggestion,
 }
 
 /// An action's default keys, as the settings file spells them.
@@ -96,7 +101,14 @@ impl Keymap {
             When::Always => Some(id),
             When::Tabs => tabs.then_some(id),
             When::Split => split.then_some(id),
+            When::Suggestion => None,
         }
+    }
+
+    /// The suggestion action `k` runs while a suggestion shows.
+    pub fn suggestion(&self, k: Hotkey) -> Option<u32> {
+        self.owner(k)
+            .filter(|id| self.when(*id) == When::Suggestion)
     }
 
     /// The action that has key `k`, wherever it works.
@@ -234,7 +246,7 @@ pub enum Check {
 /// What giving key `k` to an action would get in the way of. `label` is
 /// the key as people read it; `tmux_prefix` the prefix of the tmux
 /// sessions open now, if FeroSSH knows one (Ctrl+B otherwise).
-pub fn check(k: Hotkey, label: &str, tmux_prefix: Option<Hotkey>) -> Check {
+pub fn check(k: Hotkey, label: &str, tmux_prefix: Option<Hotkey>, when: When) -> Check {
     if k.win {
         return Check::Refuse(format!(
             "{label} goes to Windows, not to FeroSSH. Pick a key without Win."
@@ -258,6 +270,11 @@ pub fn check(k: Hotkey, label: &str, tmux_prefix: Option<Hotkey>) -> Check {
         return Check::Refuse(format!(
             "{label} always closes the window. Pick another key."
         ));
+    }
+    // A suggestion key takes the key only while a suggestion shows (and
+    // never the tmux prefix): the terminal gets it the rest of the time.
+    if when == When::Suggestion {
+        return Check::Fine;
     }
     let prefix = tmux_prefix.unwrap_or(chord(u16::from(b'B'), true, false, false));
     if k == prefix {
@@ -403,8 +420,32 @@ mod tests {
     }
 
     #[test]
+    fn suggestion_keys_are_never_shortcuts() {
+        const TAKE: u32 = 517;
+        let defaults = [KeyDefault {
+            id: TAKE,
+            when: When::Suggestion,
+            keys: &["Right", "Ctrl+E"],
+        }];
+        let mut m = Keymap::new(&defaults, &BTreeMap::new());
+        assert_eq!(m.lookup(k("Ctrl+E"), true, true), None);
+        assert_eq!(m.suggestion(k("Ctrl+E")), Some(TAKE));
+        assert_eq!(m.suggestion(k("Right")), Some(TAKE));
+        // Given to a shortcut, the key is no longer a suggestion key.
+        m.set(PALETTE, vec![k("Ctrl+E")]);
+        assert_eq!(m.suggestion(k("Ctrl+E")), None);
+        assert_eq!(m.lookup(k("Ctrl+E"), false, false), Some(PALETTE));
+        // Taking a suggestion warns about nothing, but typing keys are
+        // still refused.
+        let c = |t: &str| check(k(t), t, None, When::Suggestion);
+        assert_eq!(c("Ctrl+E"), Check::Fine);
+        assert_eq!(c("Right"), Check::Fine);
+        assert!(matches!(c("A"), Check::Refuse(_)));
+    }
+
+    #[test]
     fn checks_refuse_typing_and_warn_about_terminal_keys() {
-        let c = |t: &str| check(k(t), t, None);
+        let c = |t: &str| check(k(t), t, None, When::Always);
         assert!(matches!(c("A"), Check::Refuse(_)));
         assert!(matches!(c("Shift+A"), Check::Refuse(_)));
         assert!(matches!(c("Enter"), Check::Refuse(_)));
@@ -421,7 +462,12 @@ mod tests {
         };
         assert!(warn(c("Ctrl+B")).contains("is the tmux prefix"));
         // Another prefix: Ctrl+B is then an ordinary Ctrl key.
-        let other = warn(check(k("Ctrl+B"), "Ctrl+B", Some(k("Ctrl+A"))));
+        let other = warn(check(
+            k("Ctrl+B"),
+            "Ctrl+B",
+            Some(k("Ctrl+A")),
+            When::Always,
+        ));
         assert!(other.starts_with("Programs in the terminal"), "{other}");
         assert!(matches!(c("Ctrl+K"), Check::Warn(_)));
         assert!(matches!(c("Alt+K"), Check::Warn(_)));

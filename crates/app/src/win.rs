@@ -360,7 +360,7 @@ fn font_page(family: &str) -> Option<&'static str> {
 /// The shortcuts every action has until Settings > Key bindings changes
 /// them, the main one (shown in the menus) first.
 const KEY_DEFAULTS: &[KeyDefault] = {
-    use keymap::When::{Always, Split, Tabs};
+    use keymap::When::{Always, Split, Suggestion, Tabs};
     const fn d(id: u32, when: keymap::When, keys: &'static [&'static str]) -> KeyDefault {
         KeyDefault { id, when, keys }
     }
@@ -424,6 +424,17 @@ const KEY_DEFAULTS: &[KeyDefault] = {
         d(cmd::RESIZE + 1, Split, &["Alt+Shift+Right"]),
         d(cmd::RESIZE + 2, Split, &["Alt+Shift+Up"]),
         d(cmd::RESIZE + 3, Split, &["Alt+Shift+Down"]),
+        // As fish and zsh-autosuggestions take a suggestion: End and
+        // Ctrl+E (end of line), Right and Ctrl+F (forward a character).
+        d(
+            cmd::SUGGEST_TAKE,
+            Suggestion,
+            &["Right", "End", "Ctrl+E", "Ctrl+F"],
+        ),
+        d(cmd::SUGGEST_WORD, Suggestion, &["Ctrl+Right"]),
+        d(cmd::SUGGEST_NEXT, Suggestion, &["Ctrl+Up"]),
+        d(cmd::SUGGEST_PREV, Suggestion, &["Ctrl+Down"]),
+        d(cmd::SUGGEST_FORGET, Suggestion, &["Shift+Delete"]),
     ]
 };
 
@@ -518,6 +529,14 @@ mod cmd {
     pub const SUGGEST: u32 = 514;
     pub const CLEAR_HISTORY: u32 = 515;
     pub const CLEAR_ALL_HISTORY: u32 = 516;
+    /// Keys that work on a command suggestion while one shows: type all
+    /// of it, its next word, show the next or previous match, forget it.
+    /// In no menu; Settings > Key bindings changes their keys.
+    pub const SUGGEST_TAKE: u32 = 517;
+    pub const SUGGEST_WORD: u32 = 518;
+    pub const SUGGEST_NEXT: u32 = 519;
+    pub const SUGGEST_PREV: u32 = 520;
+    pub const SUGGEST_FORGET: u32 = 521;
     pub const LOG_TOGGLE: u32 = 600;
     pub const LOG_RAW: u32 = 601;
     pub const LOG_FOLDER: u32 = 602;
@@ -8025,32 +8044,44 @@ impl Window {
         }
     }
 
-    /// A key that works on the suggestion showing in pane `id`: Right or
-    /// End types the rest, Ctrl+Right its next word, Ctrl+Up and
-    /// Ctrl+Down show another, Shift+Delete forgets it. `false` when the
-    /// key is not one, or no suggestion shows: it goes to the host.
-    fn ghost_key(&mut self, id: PaneId, key: Key, mods: Mods) -> bool {
+    /// Suggestion key `action` (a `cmd::SUGGEST_*`, by Settings > Key
+    /// bindings) pressed in pane `id`: types the rest of the suggestion
+    /// showing there or its next word, shows another match, or forgets
+    /// it. `false` when no suggestion shows, there is no other match, or
+    /// the key belongs to tmux (it is the prefix, or comes after it): it
+    /// goes on to the terminal.
+    fn ghost_key(&mut self, id: PaneId, action: u32, vk: VIRTUAL_KEY, mods: Mods) -> bool {
         let Some(g) = self.ghost.as_ref().filter(|g| g.pane == id) else {
             return false;
         };
         let (rest, line, count) = (g.rest.clone(), g.line.clone(), g.count);
-        let plain = mods == Mods::NONE;
-        let ctrl = mods
-            == Mods {
-                ctrl: true,
-                ..Mods::NONE
-            };
-        let shift = mods
-            == Mods {
-                shift: true,
-                ..Mods::NONE
-            };
-        match key {
-            Key::Right | Key::End if plain => self.type_ghost(id, &rest),
-            Key::Right if ctrl => self.type_ghost(id, suggest::next_word(&rest)),
-            Key::Up | Key::Down if ctrl && count > 1 => {
+        if self.tmux_armed == Some(id) {
+            return false;
+        }
+        // Ctrl with a letter, Space, 2, 6 or / is a control code (as
+        // `on_key_down` sends it), which may be the prefix.
+        let control = match vk {
+            _ if !mods.ctrl => None,
+            VK_SPACE | VIRTUAL_KEY(0x32) => Some('\x00'),
+            VIRTUAL_KEY(0x36) => Some('\x1e'),
+            VK_OEM_2 => Some('\x1f'),
+            _ if (0x41..=0x5A).contains(&vk.0) => {
+                Some(char::from(u8::try_from(vk.0 - 0x40).unwrap_or(0)))
+            }
+            _ => None,
+        };
+        if let Some(ch) = control {
+            let prefix = tmux_keys::Prefix { ch, alt: mods.alt };
+            if self.tmux_keys_of(id).is_some_and(|k| k.is_prefix(prefix)) {
+                return false;
+            }
+        }
+        match action {
+            cmd::SUGGEST_TAKE => self.type_ghost(id, &rest),
+            cmd::SUGGEST_WORD => self.type_ghost(id, suggest::next_word(&rest)),
+            cmd::SUGGEST_NEXT | cmd::SUGGEST_PREV if count > 1 => {
                 if let Some(p) = self.panes.get_mut(&id) {
-                    p.typing.choice = if key == Key::Up {
+                    p.typing.choice = if action == cmd::SUGGEST_NEXT {
                         (p.typing.choice + 1) % count
                     } else {
                         (p.typing.choice + count - 1) % count
@@ -8058,7 +8089,7 @@ impl Window {
                 }
                 self.refresh(id);
             }
-            Key::Delete if shift => {
+            cmd::SUGGEST_FORGET => {
                 // A built-in command is not in the history: it stays out of
                 // the suggestions until FeroSSH restarts.
                 if let Some(k) = self.history_key(id) {
@@ -9973,11 +10004,18 @@ impl Window {
             drop_pending_char(self.hwnd);
             return KeyOutcome::Handled;
         }
+        // A suggestion key (Settings > Key bindings) while a suggestion
+        // shows: Right, End, Ctrl+E, Ctrl+F and the rest by default.
+        if let Some(action) = self
+            .keymap
+            .suggestion(keymap::chord(vk.0, mods.ctrl, mods.alt, mods.shift))
+            && self.ghost_key(id, action, vk, mods)
+        {
+            drop_pending_char(self.hwnd);
+            return KeyOutcome::Handled;
+        }
         if let Some(key) = terminal_key(vk) {
             drop_pending_char(self.hwnd);
-            if self.ghost_key(id, key, mods) {
-                return KeyOutcome::Handled;
-            }
             let targets = self.broadcast_targets(id);
             let Some(p) = self.panes.get_mut(&id) else {
                 return KeyOutcome::Handled;
@@ -14294,9 +14332,10 @@ impl Window {
                 if on {
                     return Some(Command::Notice(
                         "Earlier commands on this host, and a few common ones, now show greyed \
-                         after the cursor as you type. Right arrow or End types the rest, \
-                         Ctrl+Right its next word, Ctrl+Up and Ctrl+Down show other matches, and \
-                         Shift+Delete forgets the one shown. Commands are kept per host, \
+                         after the cursor as you type. Right arrow, End, Ctrl+E or Ctrl+F types \
+                         the rest, Ctrl+Right its next word, Ctrl+Up and Ctrl+Down show other \
+                         matches, and Shift+Delete forgets the one shown (Settings > Key bindings \
+                         changes these keys). Commands are kept per host, \
                          encrypted with your Windows sign-in, on this PC only; nothing typed at a \
                          password prompt is kept, nor lines that start with a space."
                             .into(),
@@ -18578,6 +18617,11 @@ fn unlisted_action(id: u32) -> &'static str {
         cmd::SCROLL_PAGE_DOWN => "Edit: Scroll down a page",
         cmd::SCROLL_TOP => "Edit: Scroll to the top",
         cmd::SCROLL_BOTTOM => "Edit: Follow new output",
+        cmd::SUGGEST_TAKE => "Suggestions: Type the whole suggestion",
+        cmd::SUGGEST_WORD => "Suggestions: Type its next word",
+        cmd::SUGGEST_NEXT => "Suggestions: Show the next match",
+        cmd::SUGGEST_PREV => "Suggestions: Show the previous match",
+        cmd::SUGGEST_FORGET => "Suggestions: Forget the one shown",
         _ => "Other action",
     }
 }
@@ -19548,5 +19592,20 @@ mod tests {
             Some(cmd::SPLIT_RIGHT)
         );
         assert_eq!(keys.lookup(k("Ctrl+Tab"), false, true), None);
+        // Suggestion keys are only for a suggestion, never shortcuts.
+        for (t, id) in [
+            ("Right", cmd::SUGGEST_TAKE),
+            ("End", cmd::SUGGEST_TAKE),
+            ("Ctrl+E", cmd::SUGGEST_TAKE),
+            ("Ctrl+F", cmd::SUGGEST_TAKE),
+            ("Ctrl+Right", cmd::SUGGEST_WORD),
+            ("Ctrl+Up", cmd::SUGGEST_NEXT),
+            ("Ctrl+Down", cmd::SUGGEST_PREV),
+            ("Shift+Delete", cmd::SUGGEST_FORGET),
+        ] {
+            assert_eq!(keys.suggestion(k(t)), Some(id), "{t}");
+            assert_eq!(keys.lookup(k(t), true, true), None, "{t}");
+            assert_ne!(unlisted_action(id), "Other action", "{t}");
+        }
     }
 }
