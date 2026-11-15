@@ -7,5 +7,10 @@
 rustflags = [
     "-C", "target-feature=+crt-static",
     "-C", "link-arg=/Brepro",
+    # No "Rich" header: it lists the build number of link.exe and of every
+    # MSVC tool that made the C runtime's objects, so a servicing update of
+    # the same MSVC toolset (14.44.35229 -> 14.44.35230) changed the exe's
+    # bytes without changing any code in it.
+    "-C", "link-arg=/emittoolversioninfo:no",
     "-C", "control-flow-guard",
 ]
