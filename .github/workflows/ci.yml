@@ -271,7 +271,8 @@ jobs:
     # builds all three exes again from nothing (~9 minutes), so pull
     # requests skip it. It runs on every push to main and before every
     # release.
-    if: github.event_name != 'pull_request'
+    # TEMPORARY: runs on this pull request, three ARM64 rebuilds to land on both runner images.
+    if: ${{ !cancelled() }}
     strategy:
       fail-fast: false
       matrix:
@@ -281,6 +282,14 @@ jobs:
             runner: windows-latest
             artifacts: ferossh-*exe
           - name: Reproducible build (Windows ARM64)
+            arch: arm64
+            runner: windows-11-arm
+            artifacts: arm64-ferossh-*exe
+          - name: Reproducible build (Windows ARM64) 2
+            arch: arm64
+            runner: windows-11-arm
+            artifacts: arm64-ferossh-*exe
+          - name: Reproducible build (Windows ARM64) 3
             arch: arm64
             runner: windows-11-arm
             artifacts: arm64-ferossh-*exe
