@@ -29,6 +29,9 @@
 # - /Brepro for the linker and the C compiler (ring's C code), which
 #   replaces the timestamps in the exe with a hash of its contents
 #   (.cargo/config.toml and CFLAGS below);
+# - no Rich header (/emittoolversioninfo:no in .cargo/config.toml), which
+#   would record the exact build of link.exe and the C runtime's tools, so
+#   a servicing update of the pinned toolset does not change the exe;
 # - --remap-path-prefix, which turns the checkout folder and CARGO_HOME
 #   into fixed names in panic messages, so the folder you build in does not
 #   matter.
@@ -173,6 +176,13 @@ try {
         & cargo build --release --locked -p ferossh --config $remap @targetArgs @features
         if ($LASTEXITCODE) { exit $LASTEXITCODE }
         Copy-Item $built (Join-Path $dist $name) -Force
+        # No Rich header (link-arg /emittoolversioninfo:no in
+        # .cargo/config.toml): it would hold link.exe's build number.
+        $bytes = [IO.File]::ReadAllBytes((Join-Path $dist $name))
+        $peAt = [BitConverter]::ToInt32($bytes, 0x3C)
+        if ([Text.Encoding]::ASCII.GetString($bytes, 0, $peAt).Contains("Rich")) {
+            throw "$name has a Rich header (does this link.exe know /emittoolversioninfo:no?)"
+        }
     }
 
     $variants.Keys | ForEach-Object { Get-Item (Join-Path $dist $_) } | ForEach-Object {

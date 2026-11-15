@@ -312,12 +312,45 @@ jobs:
       - name: Compare with the Windows job's exes
         shell: pwsh
         run: |
+          # Where in the exe two builds differ: the DOS stub and Rich
+          # header, the PE headers, or which section, in bytes.
+          function Show-Difference($first, $second) {
+            $x = [IO.File]::ReadAllBytes($first)
+            $y = [IO.File]::ReadAllBytes($second)
+            if ($x.Length -ne $y.Length) { "  sizes differ: $($x.Length) / $($y.Length) bytes" }
+            $pe = [BitConverter]::ToInt32($x, 0x3C)
+            $count = [BitConverter]::ToUInt16($x, $pe + 6)
+            $table = $pe + 24 + [BitConverter]::ToUInt16($x, $pe + 20)
+            $regions = @(@{ name = "DOS stub and Rich header"; start = 0; end = $pe },
+              @{ name = "PE headers"; start = $pe; end = $table + 40 * $count })
+            for ($i = 0; $i -lt $count; $i++) {
+              $o = $table + 40 * $i
+              $name = [Text.Encoding]::ASCII.GetString($x, $o, 8).TrimEnd([char]0)
+              $raw = [BitConverter]::ToInt32($x, $o + 20)
+              $regions += @{ name = "section $name"; start = $raw; end = $raw + [BitConverter]::ToInt32($x, $o + 16) }
+            }
+            $diff = @{}
+            for ($i = 0; $i -lt [math]::Min($x.Length, $y.Length); $i++) {
+              if ($x[$i] -ne $y[$i]) {
+                $r = ($regions | Where-Object { $i -ge $_.start -and $i -lt $_.end } | Select-Object -First 1).name
+                if (-not $r) { $r = "outside the sections" }
+                $diff[$r] = 1 + $diff[$r]
+              }
+            }
+            foreach ($k in $diff.Keys | Sort-Object) { "  $k`: $($diff[$k]) bytes differ" }
+          }
           $failed = $false
           foreach ($exe in Get-ChildItem first\*.exe | Sort-Object Name) {
+            $rebuilt = "elsewhere\ferossh\dist\$($exe.Name)"
             $a = (Get-FileHash $exe.FullName -Algorithm SHA256).Hash.ToLower()
-            $b = (Get-FileHash "elsewhere\ferossh\dist\$($exe.Name)" -Algorithm SHA256).Hash.ToLower()
-            $line = if ($a -eq $b) { "same    $a  $($exe.Name)" } else { $failed = $true; "DIFFERS $a / $b  $($exe.Name)" }
-            $line | Tee-Object -Append $env:GITHUB_STEP_SUMMARY
+            $b = (Get-FileHash $rebuilt -Algorithm SHA256).Hash.ToLower()
+            if ($a -eq $b) {
+              "same    $a  $($exe.Name)" | Tee-Object -Append $env:GITHUB_STEP_SUMMARY
+            } else {
+              $failed = $true
+              "DIFFERS $a / $b  $($exe.Name)" | Tee-Object -Append $env:GITHUB_STEP_SUMMARY
+              Show-Difference $exe.FullName $rebuilt | Tee-Object -Append $env:GITHUB_STEP_SUMMARY
+            }
           }
           # Show what each build used (scripts/build-release.ps1 pins the
           # MSVC toolset and SDK, but not clang or the runner image).
