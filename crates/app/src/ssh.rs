@@ -1847,13 +1847,22 @@ impl SshSession {
             return Ok(());
         };
         let (host, port) = self.target.key_host();
-        // The old key goes from every file that is read, not only the
-        // one the new key goes to, or it would still be trusted. Kept
-        // until all are written, so a failed attempt can be tried again.
+        // The new key is written first, so a failed step never leaves the
+        // host with no pin at all (which `accept-new` would then fill
+        // without asking). Then the old key goes from every other file
+        // that is read, or it would still be trusted; a file that is the
+        // first one under another name is left alone, or its new key
+        // would go too. The offered key is kept until all of this
+        // succeeds, so a failed attempt can be tried again.
+        known_hosts::replace(first, host, port, key)?;
+        let real = |p: &std::path::Path| std::fs::canonicalize(p).ok();
+        let first_real = real(first);
         for file in others {
+            if file == first || (first_real.is_some() && real(file) == first_real) {
+                continue;
+            }
             known_hosts::forget(file, host, port)?;
         }
-        known_hosts::replace(first, host, port, key)?;
         self.changed_key = None;
         Ok(())
     }
@@ -2842,6 +2851,34 @@ mod tests {
         assert_eq!(kh.check("host", 22, &ed25519_blob()), Status::Trusted);
         assert!(!matches!(kh.check("host", 22, &rsa), Status::Trusted));
         assert_eq!(kh.key_types("host", 22), vec!["ssh-ed25519".to_owned()]);
+    }
+
+    #[test]
+    fn replacing_a_key_keeps_it_when_a_file_is_listed_twice() {
+        let dir = temp("keytype-alias");
+        let mut e = env(&dir);
+        let first = dir.join("first");
+        let alias = dir.join(".").join("first");
+        e.config = format!(
+            "Host host\n  UserKnownHostsFile \"{}\" \"{}\"\n",
+            first.display(),
+            alias.display()
+        );
+        let mut rsa = vec![0, 0, 0, 7];
+        rsa.extend_from_slice(b"ssh-rsa");
+        rsa.extend_from_slice(&[0, 0, 0, 3, 1, 0, 1, 0, 0, 0, 1, 9]);
+        known_hosts::add(&first, "host", 22, &rsa).unwrap();
+        let mut s = SshSession::new(1, Target::resolve("host", &e).unwrap(), e.known_hosts());
+        s.start(80, 24);
+        s.on_worker(Message::HostKey {
+            channel: 1,
+            key: ed25519_blob(),
+        });
+        assert_eq!(s.state(), State::Blocked);
+        s.replace_host_key().unwrap();
+        let kh = KnownHosts::parse(&std::fs::read_to_string(&first).unwrap());
+        assert_eq!(kh.check("host", 22, &ed25519_blob()), Status::Trusted);
+        assert!(!matches!(kh.check("host", 22, &rsa), Status::Trusted));
     }
 
     /// A session to "inner" through "bastion", then "edge" (as

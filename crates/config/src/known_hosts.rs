@@ -360,9 +360,11 @@ fn rewrite(path: &Path, host: &str, port: u16, key: Option<&[u8]>) -> io::Result
     };
     let token = host_token(host, port);
     let mut out = String::with_capacity(text.len() + 128);
+    let mut changed = false;
     for (i, line) in text.lines().enumerate() {
         let entry = parse_line(i + 1, line)
             .filter(|e| e.marker.is_none() && host_matches(&e.hosts, &token));
+        changed |= entry.is_some();
         match entry.map(|e| e.hosts) {
             None => out.push_str(line),
             // One host per hashed line: it goes.
@@ -379,6 +381,10 @@ fn rewrite(path: &Path, host: &str, port: u16, key: Option<&[u8]>) -> io::Result
             },
         }
         out.push('\n');
+    }
+    // Nothing to forget here: leave the file (and its folder) untouched.
+    if key.is_none() && !changed {
+        return Ok(());
     }
     if let Some(key) = key {
         out.push_str(&hashed_line(host, port, key)?);
@@ -566,6 +572,21 @@ mod tests {
         assert!(matches!(kh.check("h", 22, &old), Status::Changed { .. }));
         assert_eq!(kh.check("other", 22, &keep), Status::Trusted);
         assert!(fs::read_to_string(&path).unwrap().starts_with("# mine\n"));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn forgetting_a_host_a_file_does_not_name_never_writes_it() {
+        let dir = std::env::temp_dir().join(format!("ferossh-kh-noop-{}", std::process::id()));
+        let path = dir.join("known_hosts");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let text = format!("{}\n", line("other", &blob("ssh-rsa", b"o")));
+        fs::write(&path, &text).unwrap();
+        // Any write would fail: the temporary file's name is a folder.
+        fs::create_dir_all(path.with_extension("ferossh-tmp")).unwrap();
+        forget(&path, "h", 22).unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap(), text);
         let _ = fs::remove_dir_all(&dir);
     }
 
