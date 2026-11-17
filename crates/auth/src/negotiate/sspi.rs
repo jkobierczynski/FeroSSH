@@ -1,7 +1,7 @@
 //! Negotiate through Windows' SSPI: Kerberos with the logon's tickets or
 //! the typed credentials, NTLM where Kerberos cannot be used (a host
-//! named by address, a PC outside the domain), and WinRM's message
-//! encryption with the context's keys.
+//! named by address, a PC outside the domain) and the connection allows
+//! it, and WinRM's message encryption with the context's keys.
 
 #![allow(unsafe_code)]
 
@@ -13,18 +13,21 @@ use windows::Win32::Security::Authentication::Identity::{
     FreeContextBuffer, FreeCredentialsHandle, ISC_REQ_ALLOCATE_MEMORY, ISC_REQ_CONFIDENTIALITY,
     ISC_REQ_FLAGS, ISC_REQ_INTEGRITY, ISC_REQ_MUTUAL_AUTH, ISC_REQ_REPLAY_DETECT,
     ISC_REQ_SEQUENCE_DETECT, ISC_RET_CONFIDENTIALITY, ISC_RET_INTEGRITY, ISC_RET_MUTUAL_AUTH,
-    InitializeSecurityContextW, QueryContextAttributesW, SECBUFFER_CHANNEL_BINDINGS,
-    SECBUFFER_DATA, SECBUFFER_PADDING, SECBUFFER_TOKEN, SECBUFFER_VERSION,
-    SECPKG_ATTR_NEGOTIATION_INFO, SECPKG_ATTR_SIZES, SECPKG_CRED_OUTBOUND, SECQOP_WRAP_NO_ENCRYPT,
-    SECURITY_NATIVE_DREP, SecBuffer, SecBufferDesc, SecPkgContext_NegotiationInfoW,
-    SecPkgContext_Sizes,
+    InitializeSecurityContextW, QueryContextAttributesW, SEC_WINNT_AUTH_IDENTITY_EXW,
+    SEC_WINNT_AUTH_IDENTITY_VERSION, SECBUFFER_CHANNEL_BINDINGS, SECBUFFER_DATA, SECBUFFER_PADDING,
+    SECBUFFER_TOKEN, SECBUFFER_VERSION, SECPKG_ATTR_NEGOTIATION_INFO, SECPKG_ATTR_SIZES,
+    SECPKG_CRED_OUTBOUND, SECQOP_WRAP_NO_ENCRYPT, SECURITY_NATIVE_DREP, SecBuffer, SecBufferDesc,
+    SecPkgContext_NegotiationInfoW, SecPkgContext_Sizes,
 };
 use windows::Win32::Security::Credentials::SecHandle;
 use windows::Win32::System::Rpc::{SEC_WINNT_AUTH_IDENTITY_UNICODE, SEC_WINNT_AUTH_IDENTITY_W};
 use windows::core::w;
-use zeroize::Zeroize;
+use zeroize::Zeroizing;
 
 use super::{ContextStep, Credentials, NegotiateContext, NegotiateProvider};
+
+/// A user name, domain and password as SSPI takes them (UTF-16).
+type Wide = (Vec<u16>, Vec<u16>, Zeroizing<Vec<u16>>);
 
 /// SSPI's Negotiate package.
 #[derive(Debug, Clone, Copy, Default)]
@@ -48,59 +51,118 @@ impl NegotiateProvider for Sspi {
         host: &str,
         credentials: Option<&Credentials>,
         bindings: Option<&[u8]>,
+        ntlm: bool,
     ) -> Result<Box<dyn NegotiateContext>, String> {
         let mut cred = SecHandle::default();
-        let result = match credentials {
-            None => {
-                // SAFETY: plain out-parameter call; the handle is freed on
-                // drop.
-                unsafe {
-                    AcquireCredentialsHandleW(
-                        None,
-                        w!("Negotiate"),
-                        SECPKG_CRED_OUTBOUND,
-                        None,
-                        None,
-                        None,
-                        None,
-                        &mut cred,
-                        None,
-                    )
-                }
-            }
-            Some(c) => {
-                let (user, domain) = c.split();
-                let mut user = utf16(user);
-                let mut domain = utf16(domain);
-                let mut password: Vec<u16> = c.password.encode_utf16().collect();
-                let identity = SEC_WINNT_AUTH_IDENTITY_W {
-                    User: user.as_mut_ptr(),
-                    UserLength: len32(&user)?,
-                    Domain: domain.as_mut_ptr(),
-                    DomainLength: len32(&domain)?,
-                    Password: password.as_mut_ptr(),
-                    PasswordLength: len32(&password)?,
-                    Flags: SEC_WINNT_AUTH_IDENTITY_UNICODE,
-                };
-                // SAFETY: the identity and the strings it points at live
-                // through the call; SSPI copies what it keeps.
-                let r = unsafe {
-                    AcquireCredentialsHandleW(
-                        None,
-                        w!("Negotiate"),
-                        SECPKG_CRED_OUTBOUND,
-                        None,
-                        Some((&identity as *const SEC_WINNT_AUTH_IDENTITY_W).cast::<c_void>()),
-                        None,
-                        None,
-                        &mut cred,
-                        None,
-                    )
-                };
-                password.zeroize();
-                r
+        // The typed user, domain and password; none for the Windows logon.
+        let mut parts: Option<Wide> = credentials.map(|c| {
+            let (user, domain) = c.split();
+            (
+                utf16(user),
+                utf16(domain),
+                Zeroizing::new(c.password.encode_utf16().collect()),
+            )
+        });
+        let empty = |v: &mut Vec<u16>| -> *mut u16 {
+            if v.is_empty() {
+                std::ptr::null_mut()
+            } else {
+                v.as_mut_ptr()
             }
         };
+        // Without NTLM, Negotiate gets a package list that leaves it out,
+        // so only Kerberos can answer the server.
+        let mut packages = utf16("!ntlm");
+        let result = if !ntlm {
+            let (user, domain, password) = match parts.as_mut() {
+                Some((u, d, p)) => (
+                    (empty(u), len32(u)?),
+                    (empty(d), len32(d)?),
+                    (empty(p), len32(p)?),
+                ),
+                None => (
+                    (std::ptr::null_mut(), 0),
+                    (std::ptr::null_mut(), 0),
+                    (std::ptr::null_mut(), 0),
+                ),
+            };
+            let identity = SEC_WINNT_AUTH_IDENTITY_EXW {
+                Version: SEC_WINNT_AUTH_IDENTITY_VERSION,
+                Length: u32::try_from(std::mem::size_of::<SEC_WINNT_AUTH_IDENTITY_EXW>())
+                    .unwrap_or(u32::MAX),
+                User: user.0,
+                UserLength: user.1,
+                Domain: domain.0,
+                DomainLength: domain.1,
+                Password: password.0,
+                PasswordLength: password.1,
+                Flags: SEC_WINNT_AUTH_IDENTITY_UNICODE.0,
+                PackageList: packages.as_mut_ptr(),
+                PackageListLength: len32(&packages)?,
+            };
+            // SAFETY: the identity and the strings it points at live
+            // through the call; SSPI copies what it keeps.
+            unsafe {
+                AcquireCredentialsHandleW(
+                    None,
+                    w!("Negotiate"),
+                    SECPKG_CRED_OUTBOUND,
+                    None,
+                    Some((&identity as *const SEC_WINNT_AUTH_IDENTITY_EXW).cast::<c_void>()),
+                    None,
+                    None,
+                    &mut cred,
+                    None,
+                )
+            }
+        } else {
+            match parts.as_mut() {
+                None => {
+                    // SAFETY: plain out-parameter call; the handle is freed
+                    // on drop.
+                    unsafe {
+                        AcquireCredentialsHandleW(
+                            None,
+                            w!("Negotiate"),
+                            SECPKG_CRED_OUTBOUND,
+                            None,
+                            None,
+                            None,
+                            None,
+                            &mut cred,
+                            None,
+                        )
+                    }
+                }
+                Some((user, domain, password)) => {
+                    let identity = SEC_WINNT_AUTH_IDENTITY_W {
+                        User: user.as_mut_ptr(),
+                        UserLength: len32(user)?,
+                        Domain: domain.as_mut_ptr(),
+                        DomainLength: len32(domain)?,
+                        Password: (**password).as_mut_ptr(),
+                        PasswordLength: len32(password)?,
+                        Flags: SEC_WINNT_AUTH_IDENTITY_UNICODE,
+                    };
+                    // SAFETY: the identity and the strings it points at
+                    // live through the call; SSPI copies what it keeps.
+                    unsafe {
+                        AcquireCredentialsHandleW(
+                            None,
+                            w!("Negotiate"),
+                            SECPKG_CRED_OUTBOUND,
+                            None,
+                            Some((&identity as *const SEC_WINNT_AUTH_IDENTITY_W).cast::<c_void>()),
+                            None,
+                            None,
+                            &mut cred,
+                            None,
+                        )
+                    }
+                }
+            }
+        };
+        drop(parts);
         result.map_err(|e| format!("no credentials to log in with ({})", e.message()))?;
         let target: Vec<u16> = format!("HTTP/{host}")
             .encode_utf16()

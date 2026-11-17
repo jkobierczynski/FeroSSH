@@ -53,7 +53,7 @@ jobs:
     steps:
       # The workflow's own ref (main): the checks come from there, not from
       # anything in the release.
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           persist-credentials: false
       - name: Check the release files against CI's build
@@ -117,7 +117,7 @@ jobs:
           foreach ($name in $expected) {
             if ($sums[$name] -ne (Get-Sha256 (Join-Path $files $name))) { throw "SHA256SUMS.txt does not match $name" }
           }
-      - uses: actions/attest-build-provenance@v2
+      - uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2
         with:
           subject-path: |
             files/ferossh.exe

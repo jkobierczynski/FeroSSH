@@ -219,6 +219,10 @@ pub struct Profile {
     /// For a WinRM session: HTTPS (port [`DEFAULT_WINRM_HTTPS_PORT`])
     /// instead of HTTP with encrypted messages.
     pub winrm_https: bool,
+    /// For a WinRM session over HTTP: NTLM may be used where Kerberos
+    /// cannot. Off, only Kerberos logs in over HTTP, because NTLM there
+    /// does not prove who answers and its login can be taken or relayed.
+    pub winrm_ntlm: bool,
 }
 
 /// The ways copied text can travel, as the clipboard settings spell
@@ -513,6 +517,7 @@ impl Profile {
             && self.mosh_predict.is_none()
             && self.winrm_command.is_none()
             && !self.winrm_https
+            && !self.winrm_ntlm
     }
 }
 
@@ -1371,6 +1376,9 @@ impl Settings {
                                 p.winrm_https =
                                     first.is_some_and(|v| v.eq_ignore_ascii_case("yes"));
                             }
+                            "winrmntlm" => {
+                                p.winrm_ntlm = first.is_some_and(|v| v.eq_ignore_ascii_case("yes"));
+                            }
                             "tmuxlayout" => {
                                 p.tmux_layout = first
                                     .map(|l| l.to_ascii_lowercase())
@@ -1704,6 +1712,9 @@ impl Settings {
             }
             if p.winrm_https {
                 let _ = writeln!(out, "    WinrmHttps yes");
+            }
+            if p.winrm_ntlm {
+                let _ = writeln!(out, "    WinrmNtlm yes");
             }
             match &p.password {
                 PasswordSource::Ask => {}
@@ -2110,7 +2121,7 @@ Profile lab
     #[test]
     fn winrm_settings() {
         let s = Settings::parse(
-            "Profile a\n    Type winrm\n    WinrmCommand cmd /k \"echo hi\"\n    WinrmHttps yes\nProfile b\n    Type WinRM\n",
+            "Profile a\n    Type winrm\n    WinrmCommand cmd /k \"echo hi\"\n    WinrmHttps yes\nProfile b\n    Type WinRM\n    WinrmNtlm yes\n",
         );
         let a = s.profile("a").unwrap();
         assert_eq!(a.kind, SessionKind::WinRm);
@@ -2118,6 +2129,7 @@ Profile lab
         assert!(a.winrm_https);
         let b = s.profile("b").unwrap();
         assert!(!b.winrm_https);
+        assert!(b.winrm_ntlm && !a.winrm_ntlm);
         assert_eq!(
             (b.kind, b.winrm_command.as_deref()),
             (SessionKind::WinRm, None)

@@ -72,6 +72,8 @@ async fn run(command: &str, line: &str, want: &str, https: bool) -> (Option<u32>
                         conn,
                         host: "localhost".into(),
                         credentials: None,
+                        // A login to this PC itself.
+                        ntlm: true,
                         op,
                     },
                 );
