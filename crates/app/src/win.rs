@@ -5221,6 +5221,22 @@ impl Window {
             )));
             return;
         }
+        // Without the SSH host to key it by, the certificate could not be
+        // checked: do not open the desktop at all.
+        let pins = if protocol == Protocol::Rdp {
+            let Some(pins) = self.rdp_pin_store(connection, port) else {
+                self.queued.push(Command::Notice(
+                    "The SSH session this desktop would go through has closed, so its \
+                     certificate cannot be checked. Connect again and open the desktop from \
+                     there."
+                        .into(),
+                ));
+                return;
+            };
+            Some(pins)
+        } else {
+            None
+        };
         let id = self.new_tab_pane();
         // The server draws the desktop at the size of the tab, when it
         // can, unless a size was set.
@@ -5240,7 +5256,7 @@ impl Window {
             fixed: size.is_some(),
             clipboard: self.desktop_clip(clip_limit),
             clipboard_limit: clip_limit,
-            pins: self.rdp_pin_store(connection, port),
+            pins,
         };
         let script = vdesk.map(|(_, channel)| channel);
         // From here its tab decides: closing it, or a viewer that never
@@ -5286,10 +5302,12 @@ impl Window {
     /// (as its host key names it) and port.
     #[cfg(feature = "viewer")]
     fn rdp_pin_store(&self, connection: ChannelId, port: u16) -> Option<crate::desktop::PinStore> {
-        let pane = self.pane_of_channel(connection)?;
-        let Host::Ssh(s) = &self.panes.get(&pane)?.host else {
-            return None;
-        };
+        // Any pane on the connection names the same SSH host, also after
+        // the pane that opened it has closed.
+        let s = self.panes.values().find_map(|p| match &p.host {
+            Host::Ssh(s) if s.connection == connection => Some(s),
+            _ => None,
+        })?;
         let (host, ssh_port) = s.target.key_host();
         Some(crate::desktop::PinStore {
             path: app_dir().join("rdp_certs"),
