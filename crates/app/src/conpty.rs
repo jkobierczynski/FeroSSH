@@ -14,7 +14,6 @@
 #![allow(unsafe_code)]
 
 use std::ffi::c_void;
-use std::path::PathBuf;
 use std::sync::mpsc::{Receiver, Sender, SyncSender, channel, sync_channel};
 use std::thread;
 
@@ -86,19 +85,6 @@ pub fn default_command() -> String {
         Ok(c) => c,
         Err(_) => "cmd.exe".to_owned(),
     }
-}
-
-/// Folders a bare program name is looked for in: System32 and Windows
-/// first, then `PATH` (whose relative entries [`program::resolve`] skips).
-/// Never FeroSSH's own folder or the current one.
-fn search_dirs() -> Vec<PathBuf> {
-    let root =
-        PathBuf::from(std::env::var_os("SystemRoot").unwrap_or_else(|| "C:\\Windows".into()));
-    let mut dirs = vec![root.join("System32"), root];
-    if let Some(path) = std::env::var_os("PATH") {
-        dirs.extend(std::env::split_paths(&path));
-    }
-    dirs
 }
 
 fn coord(cols: usize, rows: usize) -> COORD {
@@ -221,7 +207,7 @@ fn start_process(command: &str, dir: Option<&str>, console: HPCON) -> Result<Own
 
         // The program by its full path, so Windows does not look for it
         // in FeroSSH's folder or the current one first.
-        let app = program::resolve(command, &search_dirs())
+        let app = program::resolve(command, &program::search_dirs())
             .map(|p| HSTRING::from(p.as_path()))
             .ok_or_else(|| Error::from(ERROR_FILE_NOT_FOUND.to_hresult()))?;
         let mut cmdline: Vec<u16> = command.encode_utf16().chain([0]).collect();
