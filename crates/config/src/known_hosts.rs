@@ -351,36 +351,64 @@ pub fn replace(path: &Path, host: &str, port: u16, key: &[u8]) -> io::Result<()>
 /// exist. Other read errors are returned.
 pub fn read(path: &Path) -> io::Result<String> {
     match fs::read(path) {
-        Ok(bytes) => Ok(decode(&bytes)),
+        Ok(bytes) => decode(&bytes),
         Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(String::new()),
         Err(e) => Err(e),
     }
 }
 
-/// known_hosts text from raw bytes, never failing. Entries are ASCII, so
-/// UTF-16 (what Windows PowerShell 5.1's `>` and `>>` write, also appended
-/// to a UTF-8 file) is read by dropping its zero bytes and byte order
-/// marks; any other invalid byte becomes U+FFFD, and the line parser then
-/// skips just that line instead of the whole file being lost.
-pub fn decode(bytes: &[u8]) -> String {
-    let mut clean = Vec::with_capacity(bytes.len());
-    let mut rest = bytes;
-    while let Some((&b, tail)) = rest.split_first() {
-        if let Some(t) = tail.strip_prefix(&[0xBB, 0xBF][..]).filter(|_| b == 0xEF) {
-            rest = t;
-            continue;
+/// known_hosts text from raw bytes. A UTF-8 file is read as it is; a
+/// UTF-16LE part (what Windows PowerShell 5.1's `>` writes, or `>>`
+/// appends to a UTF-8 file) is decoded as UTF-16, from the start of the
+/// line holding its first zero byte; byte order marks are dropped.
+///
+/// A line that is not a comment and does not decode cleanly is an error
+/// naming that line, not a line to skip: skipping it could drop a
+/// `@revoked` marker or a `!host` exclusion and so trust more than the
+/// file says. Comment lines may hold anything.
+pub fn decode(bytes: &[u8]) -> io::Result<String> {
+    let (utf8, utf16) = match bytes.iter().position(|&b| b == 0) {
+        None => (bytes, None),
+        Some(nul) => {
+            // The UTF-16 part starts after the last line end before its
+            // first code unit (a `\n` there may itself be UTF-16).
+            let first = nul.saturating_sub(1);
+            let start = bytes
+                .get(..first)
+                .and_then(|b| b.iter().rposition(|&b| b == b'\n'))
+                .map_or(0, |i| i + 1);
+            let (head, tail) = bytes.split_at(start);
+            (head, Some(tail))
         }
-        if (b == 0xFF && tail.first() == Some(&0xFE)) || (b == 0xFE && tail.first() == Some(&0xFF))
-        {
-            rest = tail.get(1..).unwrap_or_default();
-            continue;
+    };
+    let utf8 = utf8.strip_prefix(&[0xEF, 0xBB, 0xBF][..]).unwrap_or(utf8);
+    let mut text = String::from_utf8_lossy(utf8).into_owned();
+    if let Some(tail) = utf16 {
+        let tail = tail.strip_prefix(&[0xFF, 0xFE][..]).unwrap_or(tail);
+        let (pairs, odd) = (tail.chunks_exact(2), tail.len() % 2 == 1);
+        let units = pairs.map(|p| <[u8; 2]>::try_from(p).map_or(0xFFFD, u16::from_le_bytes));
+        text.extend(
+            char::decode_utf16(units)
+                .map(|c| c.unwrap_or(char::REPLACEMENT_CHARACTER))
+                .filter(|&c| c != '\u{feff}'),
+        );
+        if odd {
+            text.push(char::REPLACEMENT_CHARACTER);
         }
-        if b != 0 {
-            clean.push(b);
-        }
-        rest = tail;
     }
-    String::from_utf8_lossy(&clean).into_owned()
+    for (n, line) in text.lines().enumerate() {
+        let entry = line.trim_start();
+        if !entry.starts_with('#') && entry.contains(char::REPLACEMENT_CHARACTER) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "line {} is not valid text; fix or remove it so no entry is lost",
+                    n + 1
+                ),
+            ));
+        }
+    }
+    Ok(text)
 }
 
 #[cfg(test)]
@@ -568,7 +596,7 @@ mod tests {
         for u in format!("{}\r\n", line("b", &b)).encode_utf16() {
             bytes.extend_from_slice(&u.to_le_bytes());
         }
-        let kh = KnownHosts::parse(&decode(&bytes));
+        let kh = KnownHosts::parse(&decode(&bytes).unwrap());
         assert_eq!(kh.check("a", 22, &a), Status::Trusted);
         assert_eq!(kh.check("b", 22, &b), Status::Trusted);
         assert!(matches!(kh.check("a", 22, &c), Status::Changed { .. }));
@@ -576,9 +604,54 @@ mod tests {
         let mut bom = vec![0xEF, 0xBB, 0xBF];
         bom.extend_from_slice(line("c", &c).as_bytes());
         assert_eq!(
-            KnownHosts::parse(&decode(&bom)).check("c", 22, &c),
+            KnownHosts::parse(&decode(&bom).unwrap()).check("c", 22, &c),
             Status::Trusted
         );
+    }
+
+    fn utf16(text: &str) -> Vec<u8> {
+        let mut bytes = vec![0xFF, 0xFE];
+        for u in text.encode_utf16() {
+            bytes.extend_from_slice(&u.to_le_bytes());
+        }
+        bytes
+    }
+
+    #[test]
+    fn utf16_characters_never_become_line_ends() {
+        // U+200A is 0A 20 in UTF-16LE: dropping zero bytes would turn
+        // it into a new line and wake the commented-out key.
+        let a = blob("ssh-ed25519", b"a");
+        let b = blob("ssh-ed25519", b"b");
+        let text = format!("# \u{200A}{}\r\n{}\r\n", line("a", &a), line("b", &b));
+        let kh = KnownHosts::parse(&decode(&utf16(&text)).unwrap());
+        assert!(matches!(kh.check("a", 22, &a), Status::Unknown { .. }));
+        assert_eq!(kh.check("b", 22, &b), Status::Trusted);
+        // The same after a UTF-8 part, without a byte order mark.
+        let mut bytes = format!("{}\n", line("b", &b)).into_bytes();
+        bytes.extend_from_slice(utf16(&text).get(2..).unwrap());
+        let kh = KnownHosts::parse(&decode(&bytes).unwrap());
+        assert!(matches!(kh.check("a", 22, &a), Status::Unknown { .. }));
+        assert_eq!(kh.check("b", 22, &b), Status::Trusted);
+    }
+
+    #[test]
+    fn a_damaged_entry_line_is_an_error_not_skipped() {
+        let ca = blob("ssh-ed25519", b"ca");
+        let mut bytes = b"@cert-authority *.example.org,!\xFFprod.example.org ".to_vec();
+        bytes.extend_from_slice(line("x", &ca).split_once(' ').unwrap().1.as_bytes());
+        let e = decode(&bytes).unwrap_err();
+        assert_eq!(e.kind(), io::ErrorKind::InvalidData);
+        assert!(e.to_string().contains("line 1"), "{e}");
+        // An unpaired surrogate on a UTF-16 entry line, and an odd byte.
+        let mut bad = utf16("host ssh-ed25519 AAAA\r\n");
+        bad.splice(4..4, [0x00, 0xD8]);
+        assert!(decode(&bad).is_err());
+        let mut odd = utf16("# fine\r\n");
+        odd.push(b'h');
+        assert!(decode(&odd).is_err());
+        // Anything goes in a comment.
+        assert!(decode(b"# caf\xe9\n").is_ok());
     }
 
     #[test]

@@ -2726,7 +2726,7 @@ mod tests {
         let mut e = env(&dir);
         // A folder where known_hosts should be: it cannot be read.
         e.config = format!(
-            "Host host\n  StrictHostKeyChecking accept-new\n  UserKnownHostsFile {}\n",
+            "Host host\n  StrictHostKeyChecking accept-new\n  UserKnownHostsFile \"{}\"\n",
             dir.display()
         );
         let mut s = SshSession::new(1, Target::resolve("host", &e).unwrap(), e.known_hosts());
