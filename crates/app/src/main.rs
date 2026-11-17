@@ -114,6 +114,8 @@ mod palette;
 #[cfg_attr(not(windows), allow(dead_code))]
 mod pattern;
 #[cfg_attr(not(windows), allow(dead_code))]
+mod peer_owner;
+#[cfg_attr(not(windows), allow(dead_code))]
 mod portable;
 #[cfg_attr(not(windows), allow(dead_code))]
 mod program;

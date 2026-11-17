@@ -47,6 +47,9 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const X11_SETUP_TIMEOUT: Duration = Duration::from_secs(30);
 /// Open connections listed per forward in the view.
 const LISTED_STREAMS: usize = 8;
+/// Accepted sockets that may wait for the owner check on one forward;
+/// more wait in the kernel's listen backlog.
+const PENDING_SOCKETS: usize = 64;
 /// Remote desktop tunnels listen on a port in this range, picked from the
 /// host's name so the same host gets the same port each time (Remote
 /// Desktop Connection remembers certificates and sign-ins by address). A
@@ -531,6 +534,13 @@ enum Internal {
         socket: TcpStream,
         peer: SocketAddr,
     },
+    /// A connection from another Windows session, or from a program that
+    /// could not be found, was closed unused.
+    Refused {
+        owner: Owner,
+        peer: SocketAddr,
+        verdict: crate::peer_owner::Verdict,
+    },
     /// A stream ended on this side; `why` when it failed.
     Ended {
         channel: ChannelId,
@@ -995,6 +1005,26 @@ impl Engine {
                 socket,
                 peer,
             } => self.accepted(owner, socket, peer),
+            Internal::Refused {
+                owner,
+                peer,
+                verdict,
+            } => self.note_error(
+                owner,
+                if verdict == crate::peer_owner::Verdict::OtherSession {
+                    format!(
+                        "Refused a connection from {peer}: it came from a program of another \
+                         Windows session (another user signed in to this PC, or a service), \
+                         not from yours."
+                    )
+                } else {
+                    format!(
+                        "Refused a connection from {peer}: Windows did not say which program \
+                         made it (it may have closed already), so it could not be checked to \
+                         be one of yours."
+                    )
+                },
+            ),
             Internal::Ended { channel, why } => {
                 if let Some(s) = self.streams.remove(&channel) {
                     // The worker may still think it open.
@@ -1385,7 +1415,7 @@ async fn listen(
         owner,
         addrs: addrs.join(", "),
     });
-    let (tx, mut rx) = mpsc::unbounded_channel();
+    let (tx, mut rx) = mpsc::channel(PENDING_SOCKETS);
     let mut accepting = AbortOnDrop(Vec::new());
     for l in listeners {
         let tx = tx.clone();
@@ -1393,7 +1423,7 @@ async fn listen(
             loop {
                 match l.accept().await {
                     Ok(conn) => {
-                        if tx.send(conn).is_err() {
+                        if tx.send(conn).await.is_err() {
                             return;
                         }
                     }
@@ -1408,6 +1438,29 @@ async fn listen(
     // Removing the forward aborts this task, which drops `accepting`: the
     // accept tasks end and the ports are free again.
     while let Some((socket, peer)) = rx.recv().await {
+        // Only this session's programs, on loopback: see `peer_owner`. The
+        // lookup reads the whole TCP table, so it runs off this runtime's
+        // one thread, where the other forwards' streams run too.
+        let verdict = match socket.local_addr() {
+            Ok(local) => tokio::task::spawn_blocking(move || crate::peer_owner::check(local, peer))
+                .await
+                .unwrap_or(crate::peer_owner::Verdict::Unknown),
+            Err(_) => crate::peer_owner::Verdict::Unknown,
+        };
+        if verdict != crate::peer_owner::Verdict::Allowed {
+            drop(socket);
+            if events
+                .send(Internal::Refused {
+                    owner,
+                    peer,
+                    verdict,
+                })
+                .is_err()
+            {
+                return;
+            }
+            continue;
+        }
         let _ = socket.set_nodelay(true);
         if events
             .send(Internal::Accepted {
