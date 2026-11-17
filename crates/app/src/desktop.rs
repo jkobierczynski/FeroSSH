@@ -210,7 +210,10 @@ impl PinStore {
             Err(e) => return Err(format!("{} ({e})", self.path.display())),
         };
         let Some(hex) = text.lines().find_map(|l| {
-            let (k, sha) = l.trim().split_once(' ')?;
+            // A line with the key and nothing after it is a damaged one,
+            // not a missing one.
+            let l = l.trim();
+            let (k, sha) = l.split_once(char::is_whitespace).unwrap_or((l, ""));
             k.eq_ignore_ascii_case(&self.key)
                 .then(|| sha.trim().to_owned())
         }) else {
@@ -1141,10 +1144,15 @@ mod tests {
         assert!(e.to_string().contains("pins could not be read"), "{e}");
         std::fs::remove_dir_all(&store.path).unwrap();
         // A line for this desktop that is not a SHA-256.
-        for bad in ["abc", &"zz".repeat(32), &"0".repeat(66)] {
+        for bad in ["abc", &"zz".repeat(32), &"0".repeat(66), "", "   "] {
             std::fs::write(&store.path, format!("{} {bad}\n", store.key)).unwrap();
-            assert!(store.pin().is_err(), "{bad}");
+            assert!(store.pin().is_err(), "{bad:?}");
         }
+        // The key alone, and with a tab before the fingerprint.
+        std::fs::write(&store.path, format!("{}\n", store.key)).unwrap();
+        assert!(store.pin().is_err(), "key alone");
+        std::fs::write(&store.path, format!("{}\t{}\n", store.key, "ab".repeat(32))).unwrap();
+        assert_eq!(store.pin(), Ok(Some([0xab; 32])));
         // Other desktops' lines do not matter.
         std::fs::write(&store.path, "[other]:22/rdp:3389 abc\n").unwrap();
         assert_eq!(store.pin(), Ok(None));
