@@ -6084,8 +6084,20 @@ impl Window {
         // split copies: NTLM over HTTP is allowed only while the saved
         // connection still says so.
         // Only for the saved connection itself: a typed address that
-        // happens to share its name is another endpoint.
-        target.ntlm = target.saved && !target.https && profile.is_some_and(|p| p.winrm_ntlm);
+        // happens to share its name is another endpoint, and so is the
+        // old address a reconnect or split carries after the connection
+        // was edited to point elsewhere.
+        let same_endpoint = || {
+            self.saved_winrm_target(&target.alias).is_some_and(|now| {
+                !now.https
+                    && now.port == target.port
+                    && now.hostname.eq_ignore_ascii_case(&target.hostname)
+            })
+        };
+        target.ntlm = target.saved
+            && !target.https
+            && profile.is_some_and(|p| p.winrm_ntlm)
+            && same_endpoint();
         let source = profile.map(|p| p.password.clone()).unwrap_or_default();
         let mut session = WinrmSession::new(channel, target);
         session.password_source = source != PasswordSource::Ask && !ask;
@@ -11592,6 +11604,16 @@ impl Window {
         out
     }
 
+    /// Saved WinRM connection `name` as the settings describe it now: its
+    /// current host, port and transport.
+    fn saved_winrm_target(&self, name: &str) -> Option<WinrmTarget> {
+        let saved = load_saved()
+            .into_iter()
+            .find(|h| h.alias.eq_ignore_ascii_case(name));
+        let https = self.settings.profile(name).is_some_and(|p| p.winrm_https);
+        WinrmTarget::resolve(name, &ssh_env(), None, https, saved.as_ref())
+    }
+
     /// The Credential Manager entry of saved connection `name`'s password:
     /// its WinRM or SSH login, as the settings now describe it.
     fn saved_password_target(&self, name: &str) -> Option<String> {
@@ -11600,11 +11622,7 @@ impl Window {
             .profile(name)
             .is_some_and(|p| p.kind == SessionKind::WinRm)
         {
-            let saved = load_saved()
-                .into_iter()
-                .find(|h| h.alias.eq_ignore_ascii_case(name));
-            let https = self.settings.profile(name).is_some_and(|p| p.winrm_https);
-            let t = WinrmTarget::resolve(name, &ssh_env(), None, https, saved.as_ref())?;
+            let t = self.saved_winrm_target(name)?;
             return Some(credman::target(t.user.as_deref()?, &t.hostname, t.port));
         }
         let t = Target::resolve(name, &ssh_env())?;
@@ -12109,7 +12127,9 @@ impl Window {
             }
             Host::Winrm(s) => {
                 let t = &s.target;
-                let dest = if kind(&t.alias) == Some(SessionKind::WinRm) {
+                // A typed address stays typed, even when a saved
+                // connection shares its name.
+                let dest = if t.saved && kind(&t.alias) == Some(SessionKind::WinRm) {
                     t.alias.clone()
                 } else {
                     let scheme = if t.https { "winrms" } else { "winrm" };
