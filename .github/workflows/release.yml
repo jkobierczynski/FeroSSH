@@ -25,6 +25,10 @@ jobs:
   version:
     name: Tag matches Cargo.toml
     runs-on: ubuntu-latest
+    # Whether the update signing key is set, without the key itself: the
+    # signer is only compiled when it will be used.
+    env:
+      HAS_UPDATE_KEY: ${{ secrets.UPDATE_SIGNING_KEY != '' }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - name: Compare the tag with the workspace version and look for notes
@@ -47,6 +51,7 @@ jobs:
       # proc macros run while compiling, and none of them should be able
       # to read the secret. The step that has it only runs the binary.
       - name: Build the update signer
+        if: env.HAS_UPDATE_KEY == 'true'
         run: cargo build --locked -q -p ferossh-update --example sign
       - name: Check the update signing key
         env:
@@ -79,6 +84,10 @@ jobs:
       # instance with this workflow's identity.
       id-token: write
       attestations: write
+    # Whether the update signing key is set, without the key itself: the
+    # signer is only compiled when it will be used.
+    env:
+      HAS_UPDATE_KEY: ${{ secrets.UPDATE_SIGNING_KEY != '' }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
@@ -284,6 +293,7 @@ jobs:
       # become "latest", so they are not offered as updates.
       # Compiled without the key in reach; only the built signer sees it.
       - name: Build the update signer
+        if: env.HAS_UPDATE_KEY == 'true'
         shell: pwsh
         run: cargo build --locked -q -p ferossh-update --example sign
       - name: Update file
