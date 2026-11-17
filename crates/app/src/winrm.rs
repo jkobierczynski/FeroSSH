@@ -1046,7 +1046,7 @@ impl WinrmSession {
 }
 
 /// The fingerprint kept for `key` (`host:port`) in `path`.
-fn known_cert(path: &Path, key: &str) -> Option<String> {
+pub(crate) fn known_cert(path: &Path, key: &str) -> Option<String> {
     let text = std::fs::read_to_string(path).ok()?;
     text.lines().find_map(|l| {
         let (k, sha) = l.trim().split_once(' ')?;
@@ -1056,7 +1056,7 @@ fn known_cert(path: &Path, key: &str) -> Option<String> {
 
 /// Keeps `sha256` as the certificate of `key` in `path`, replacing an
 /// older one.
-fn remember_cert(path: &Path, key: &str, sha256: &str) -> Result<(), String> {
+pub(crate) fn remember_cert(path: &Path, key: &str, sha256: &str) -> Result<(), String> {
     let old = std::fs::read_to_string(path).unwrap_or_default();
     let mut text: String = old
         .lines()
