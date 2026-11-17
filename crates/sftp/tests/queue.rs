@@ -1005,3 +1005,70 @@ fn two_names_for_one_local_name_never_share_a_part_file() {
     got.sort_by_key(Vec::len);
     assert_eq!(got, vec![two, one]);
 }
+
+#[test]
+fn names_that_differ_only_in_case_never_share_a_part_file() {
+    let s = Scratch::new("case");
+    let one = pattern(300_000);
+    let two: Vec<u8> = pattern(250_000).iter().map(|b| b ^ 0x33).collect();
+    // One file on Windows, two here: treated as one either way.
+    fs::write(s.remote().join("README"), &one).unwrap();
+    fs::write(s.remote().join("readme"), &two).unwrap();
+    let (mut remote, mut fake) = connected(&s.remote());
+    remote.parallel = 2;
+    remote
+        .download(&entry(&remote, "README"), &s.local())
+        .unwrap();
+    remote
+        .download(&entry(&remote, "readme"), &s.local())
+        .unwrap();
+    assert!(run(&mut remote, &mut fake));
+    assert_eq!(fs::read(s.local().join("README")).unwrap(), one);
+    assert_eq!(fs::read(s.local().join("readme (2)")).unwrap(), two);
+}
+
+#[test]
+fn a_numbered_download_keeps_its_name_across_a_reconnect_and_cancel() {
+    let s = Scratch::new("collide-drop");
+    let one = pattern(2_000_000);
+    let two: Vec<u8> = pattern(1_500_000).iter().map(|b| b ^ 0x55).collect();
+    fs::write(s.remote().join("a:b"), &one).unwrap();
+    fs::write(s.remote().join("a_b"), &two).unwrap();
+    let (mut remote, mut fake) = connected(&s.remote());
+    remote.parallel = 2;
+    remote.download(&entry(&remote, "a:b"), &s.local()).unwrap();
+    remote.download(&entry(&remote, "a_b"), &s.local()).unwrap();
+    fake.drop_after = Some(fake.answered + 40);
+    assert!(!run(&mut remote, &mut fake));
+    let numbered = s.local().join("a_b (2).part");
+    let part = fs::metadata(&numbered).unwrap().len();
+    assert!(part > 0, "{part}");
+    // Back again: each job goes on with its own part file, from where it
+    // was; nothing starts over under a third name.
+    remote.attach(CHANNEL + 1, 2);
+    assert!(run(&mut remote, &mut fake));
+    for job in remote.jobs() {
+        assert_eq!(job.state, State::Done, "{:?}", job.note);
+    }
+    assert_eq!(fs::read(s.local().join("a_b")).unwrap(), one);
+    assert_eq!(fs::read(s.local().join("a_b (2)")).unwrap(), two);
+    assert!(!s.local().join("a_b (3)").exists());
+
+    // Cancelling the numbered one removes its own part file only.
+    let s = Scratch::new("collide-cancel");
+    fs::write(s.remote().join("a:b"), &one).unwrap();
+    fs::write(s.remote().join("a_b"), &two).unwrap();
+    let (mut remote, mut fake) = connected(&s.remote());
+    remote.parallel = 2;
+    remote.download(&entry(&remote, "a:b"), &s.local()).unwrap();
+    let second = remote.download(&entry(&remote, "a_b"), &s.local()).unwrap();
+    fake.drop_after = Some(fake.answered + 40);
+    assert!(!run(&mut remote, &mut fake));
+    assert!(s.local().join("a_b.part").exists());
+    remote.cancel(second);
+    assert!(!s.local().join("a_b (2).part").exists());
+    assert!(s.local().join("a_b.part").exists());
+    remote.attach(CHANNEL + 1, 2);
+    assert!(run(&mut remote, &mut fake));
+    assert_eq!(fs::read(s.local().join("a_b")).unwrap(), one);
+}

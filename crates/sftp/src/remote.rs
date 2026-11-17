@@ -122,6 +122,10 @@ pub struct Job {
     /// Bumped whenever the job restarts, so replies to an earlier run are
     /// told apart and dropped.
     generation: u32,
+    /// The numbered local name a download was given when `local` was
+    /// taken, kept across pause and reconnect so the job goes on with its
+    /// own part file, and cancel removes that one.
+    dest: Option<PathBuf>,
     run: Run,
     speed: Speed,
 }
@@ -430,6 +434,12 @@ fn with_suffix(path: &Path, suffix: &str) -> PathBuf {
     let mut s = path.as_os_str().to_owned();
     s.push(suffix);
     PathBuf::from(s)
+}
+
+/// `path` as a key that ignores case, for telling whether two downloads
+/// would share a file on a file system that ignores it.
+fn fold(path: &Path) -> String {
+    path.to_string_lossy().to_lowercase()
 }
 
 /// A local name not taken yet: `name (2).ext`, `name (3).ext`, ...
@@ -777,6 +787,7 @@ impl Remote {
             choice: None,
             put_back: None,
             generation: 0,
+            dest: None,
             run: Run::Idle,
             speed: Speed::default(),
         });
@@ -915,7 +926,8 @@ impl Remote {
         job.state = State::Cancelled;
         job.run = Run::Idle;
         if job.kind == Kind::Download {
-            let _ = std::fs::remove_file(with_suffix(&job.local, ".part"));
+            let own = job.dest.take().unwrap_or_else(|| job.local.clone());
+            let _ = std::fs::remove_file(with_suffix(&own, ".part"));
         }
         if let Some(path) = part {
             self.request(SftpOp::Remove { path }, Purpose::Ignore);
@@ -1480,13 +1492,14 @@ impl Remote {
         // Part files other downloads are writing right now: two remote
         // names can map to one local name (`a:b` and `a_b`), and the
         // second must not take the first's part file for its own.
-        let busy: Vec<PathBuf> = self
+        // Compared without case: Windows file names ignore it.
+        let busy: Vec<String> = self
             .jobs
             .iter()
             .enumerate()
             .filter(|(k, _)| *k != i)
             .filter_map(|(_, j)| match &j.run {
-                Run::Down(d) => Some(d.part.clone()),
+                Run::Down(d) => Some(fold(&d.part)),
                 _ => None,
             })
             .collect();
@@ -1494,7 +1507,7 @@ impl Remote {
             return;
         };
         job.size = attrs.size;
-        let mut target = job.local.clone();
+        let mut target = job.dest.clone().unwrap_or_else(|| job.local.clone());
         if target.exists() {
             match job.choice {
                 None => return self.ask(i),
@@ -1506,7 +1519,7 @@ impl Remote {
                 Some(Choice::Overwrite) => {}
             }
         }
-        if busy.contains(&with_suffix(&target, ".part")) {
+        if busy.contains(&fold(&with_suffix(&target, ".part"))) {
             match free_local(&target) {
                 Some(t) => target = t,
                 None => return self.fail(i, "No free name next to another download.".into()),
@@ -1534,6 +1547,7 @@ impl Remote {
             Err(e) => return self.fail(i, format!("{}: {e}", part.display())),
         };
         job.done = resume;
+        job.dest = (target != job.local).then(|| target.clone());
         let remote = job.remote.clone();
         job.run = Run::Down(Box::new(Down {
             phase: Phase::Opening,
