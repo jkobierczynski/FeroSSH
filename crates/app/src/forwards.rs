@@ -531,6 +531,11 @@ enum Internal {
         socket: TcpStream,
         peer: SocketAddr,
     },
+    /// A connection from another Windows session was closed unused.
+    Refused {
+        owner: Owner,
+        peer: SocketAddr,
+    },
     /// A stream ended on this side; `why` when it failed.
     Ended {
         channel: ChannelId,
@@ -995,6 +1000,14 @@ impl Engine {
                 socket,
                 peer,
             } => self.accepted(owner, socket, peer),
+            Internal::Refused { owner, peer } => self.note_error(
+                owner,
+                format!(
+                    "Refused a connection from {peer}: it came from a program of another \
+                     Windows session (another user signed in to this PC, or a service), not \
+                     from yours."
+                ),
+            ),
             Internal::Ended { channel, why } => {
                 if let Some(s) = self.streams.remove(&channel) {
                     // The worker may still think it open.
@@ -1408,6 +1421,17 @@ async fn listen(
     // Removing the forward aborts this task, which drops `accepting`: the
     // accept tasks end and the ports are free again.
     while let Some((socket, peer)) = rx.recv().await {
+        // Only this session's programs, on loopback: see `peer_owner`.
+        let ours = socket
+            .local_addr()
+            .is_ok_and(|local| crate::peer_owner::allowed(local, peer));
+        if !ours {
+            drop(socket);
+            if events.send(Internal::Refused { owner, peer }).is_err() {
+                return;
+            }
+            continue;
+        }
         let _ = socket.set_nodelay(true);
         if events
             .send(Internal::Accepted {
