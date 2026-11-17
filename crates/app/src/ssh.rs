@@ -1322,6 +1322,11 @@ impl SshSession {
             && self.target.hostname.eq_ignore_ascii_case(&target.hostname)
             && self.target.port == target.port
             && self.target.user == target.user
+            // The host key, and the RDP certificates behind it, are kept
+            // under the HostKeyAlias: panes with another one get their own
+            // connection, so every pane on one names the same entries.
+            && self.target.host_key_alias.as_deref().map(str::to_ascii_lowercase)
+                == target.host_key_alias.as_deref().map(str::to_ascii_lowercase)
             // Agent requests on a connection go to one agent, asked about
             // under one setting: panes that differ get their own.
             && self.target.forward_agent == target.forward_agent
@@ -2716,6 +2721,9 @@ mod tests {
         assert!(first.can_share(&same));
         assert!(!first.can_share(&Target::resolve("root@prod.example.org:2200", &e).unwrap()));
         assert!(!first.can_share(&Target::resolve("admin@prod.example.org", &e).unwrap()));
+        let mut aliased = same.clone();
+        aliased.host_key_alias = Some("production".into());
+        assert!(!first.can_share(&aliased), "another HostKeyAlias");
 
         let mut second = SshSession::new(2, same, e.known_hosts());
         let fx = second.start_on(first.connection, 100, 30);
