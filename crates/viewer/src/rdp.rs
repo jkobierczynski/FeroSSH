@@ -93,6 +93,36 @@ struct Pipe<'a, W: Write> {
     bad: bool,
 }
 
+impl<W: Write> Pipe<'_, W> {
+    /// Waits for the window to pin `sha`: server bytes that come meanwhile
+    /// are kept for TLS, other input for later.
+    fn wait_for_pin(&mut self, sha: [u8; 32]) -> Result<(), Failure> {
+        loop {
+            match self.from.recv() {
+                Ok(Item::Msg(ToViewer::PinnedFingerprint(p))) if p == sha => return Ok(()),
+                Ok(Item::Msg(ToViewer::PinnedFingerprint(_))) => {
+                    return Err("The window pinned another RDP certificate.".into());
+                }
+                Ok(Item::Msg(ToViewer::Net(bytes))) => self.inbox.extend(bytes),
+                Ok(Item::Msg(ToViewer::Closed)) => {
+                    self.closed = true;
+                    return Err("The RDP server closed the connection.".into());
+                }
+                Ok(Item::Msg(other)) => self.pending.push(other),
+                Ok(Item::Bad) => {
+                    self.bad = true;
+                    self.closed = true;
+                    return Err("The window sent the viewer nonsense.".into());
+                }
+                Ok(Item::End) | Err(_) => {
+                    self.closed = true;
+                    return Err("The window closed the viewer.".into());
+                }
+            }
+        }
+    }
+}
+
 impl<W: Write> Read for Pipe<'_, W> {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         loop {
@@ -384,8 +414,11 @@ fn run<W: Write>(
     let sha = check_pin(cert, pin)?;
     let server_key =
         server_public_key(cert).ok_or("The RDP server's TLS certificate has no usable key.")?;
-    if pin != Some(sha) {
+    if pin.is_none() {
+        // First time: the window pins it, unless another tab pinned
+        // another one meanwhile. Nothing is sent before it answers.
         send(tls.sock.out, &FromViewer::Fingerprint(sha)).map_err(|e| io_failure(&e))?;
+        tls.sock.wait_for_pin(sha)?;
     }
     let upgraded = ironrdp_blocking::mark_as_upgraded(should_upgrade, &mut connector);
     let mut framed = Framed::new(tls);
@@ -1282,6 +1315,10 @@ mod tests {
             match fb.apply(FromViewer::decode(&frame).unwrap()).unwrap() {
                 Applied::Drawn => drawn += 1,
                 Applied::Other(FromViewer::Net(b)) => tcp_out.write_all(&b).unwrap(),
+                // First time: the window pins it and lets the login go on.
+                Applied::Other(FromViewer::Fingerprint(sha)) => {
+                    tell(ToViewer::PinnedFingerprint(sha));
+                }
                 Applied::Other(FromViewer::NeedPassword) => {
                     tell(ToViewer::User(user.clone()));
                     tell(ToViewer::Password(crate::pipe::Secret::new(

@@ -199,14 +199,39 @@ pub struct PinStore {
 }
 
 impl PinStore {
-    /// The pinned SHA-256, if one is.
-    fn pin(&self) -> Option<[u8; 32]> {
-        let hex = crate::winrm::known_cert(&self.path, &self.key)?;
-        let bytes: Vec<u8> = (0..hex.len())
+    /// The pinned SHA-256: `None` only when the file or this desktop's
+    /// line is not there. A file that cannot be read, or a line that is
+    /// not a SHA-256, is an error: taken as no pin, it would trust any
+    /// certificate as a first one.
+    fn pin(&self) -> Result<Option<[u8; 32]>, String> {
+        let text = match std::fs::read_to_string(&self.path) {
+            Ok(t) => t,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(format!("{} ({e})", self.path.display())),
+        };
+        let Some(hex) = text.lines().find_map(|l| {
+            let (k, sha) = l.trim().split_once(' ')?;
+            k.eq_ignore_ascii_case(&self.key)
+                .then(|| sha.trim().to_owned())
+        }) else {
+            return Ok(None);
+        };
+        let bad = || {
+            format!(
+                "{}: the line for {} is not a SHA-256 fingerprint",
+                self.path.display(),
+                self.key
+            )
+        };
+        if hex.len() != 64 {
+            return Err(bad());
+        }
+        let bytes: Vec<u8> = (0..64)
             .step_by(2)
             .map(|i| u8::from_str_radix(hex.get(i..i + 2)?, 16).ok())
-            .collect::<Option<_>>()?;
-        bytes.try_into().ok()
+            .collect::<Option<_>>()
+            .ok_or_else(bad)?;
+        bytes.try_into().map(Some).map_err(|_| bad())
     }
 }
 
@@ -294,6 +319,19 @@ impl Desktop {
         process: Box<dyn Send>,
         notify: impl Fn() + Send + Clone + 'static,
     ) -> std::io::Result<Self> {
+        // Read first: without them nothing connects.
+        let pins = match (session.protocol, session.pins.clone()) {
+            (Protocol::Rdp, Some(store)) => {
+                let pin = store.pin().map_err(|why| {
+                    std::io::Error::other(format!(
+                        "the RDP certificate pins could not be read: {why}. Fix or remove \
+                         that file; FeroSSH does not connect without them"
+                    ))
+                })?;
+                Some((store, pin))
+            }
+            _ => None,
+        };
         let tunnel = TcpStream::connect(addr)?;
         let _ = tunnel.set_nodelay(true);
         let (tx, queue) = mpsc::channel::<ToViewer>();
@@ -305,13 +343,6 @@ impl Desktop {
             layout: session.layout,
             user: session.user.clone(),
         });
-        let pins = match session.protocol {
-            Protocol::Rdp => session.pins.clone().map(|c| {
-                let pin = c.pin();
-                (c, pin)
-            }),
-            Protocol::Vnc => None,
-        };
         // Before the password, which the viewer waits for to log in.
         if let Some(pin) = pins.as_ref().and_then(|(_, p)| *p) {
             let _ = tx.send(ToViewer::PinnedFingerprint(pin));
@@ -437,14 +468,33 @@ impl Desktop {
     }
 
     /// The RDP server's certificate, as the viewer saw it before logging
-    /// in: pinned the first time. The viewer refuses a server whose
-    /// certificate is not the pinned one; the window checks again.
+    /// in. The viewer refuses a server whose certificate is not the pin it
+    /// was given; without one it waits for this side's answer before it
+    /// logs in. The pins are read again here, so a desktop pinned
+    /// meanwhile (by another tab) is checked against that pin rather than
+    /// overwritten: the first certificate wins.
     fn fingerprint(&mut self, sha: [u8; 32], out: &mut Vec<Update>) {
         let Some((store, pin)) = self.pins.as_mut() else {
+            // Nowhere to pin it (no SSH host to name it by): the viewer
+            // goes on as before pinning, on the SSH host key alone.
+            self.send(ToViewer::PinnedFingerprint(sha));
             return;
         };
-        match *pin {
-            Some(p) if p == sha => {}
+        let now = match store.pin() {
+            Ok(now) => now.or(*pin),
+            Err(why) => {
+                let why = format!("The RDP certificate pins could not be read: {why}.");
+                return self.end(why, out);
+            }
+        };
+        match now {
+            Some(p) if p == sha => {
+                // The viewer waits for this only when it had no pin.
+                if pin.is_none() {
+                    *pin = Some(sha);
+                    self.send(ToViewer::PinnedFingerprint(sha));
+                }
+            }
             Some(_) => self.end(
                 "The RDP server's certificate is not the one it had the first time this \
                  desktop was opened."
@@ -453,7 +503,7 @@ impl Desktop {
             ),
             None => {
                 *pin = Some(sha);
-                out.push(Update::Note(
+                let note = Update::Note(
                     match crate::winrm::remember_cert(&store.path, &store.key, &hex(&sha)) {
                         Ok(()) => format!(
                             "First time on this desktop: its RDP certificate (SHA-256 {}) is \
@@ -466,7 +516,10 @@ impl Desktop {
                             hex(&sha)
                         ),
                     },
-                ));
+                );
+                out.push(note);
+                // Lets the viewer log in.
+                self.send(ToViewer::PinnedFingerprint(sha));
             }
         }
     }
@@ -918,10 +971,21 @@ mod tests {
         assert!(!d.running());
     }
 
-    /// Plays the viewer: reads the window's messages up to the first
-    /// `ClipboardRules`, then says the server's certificate is `sha`.
-    /// Gives back whether the window sent a pin, and which.
-    fn rdp_with_fingerprint(store: &PinStore, sha: [u8; 32]) -> (Option<[u8; 32]>, Vec<Update>) {
+    /// The window's side of one RDP desktop, with the test playing the
+    /// viewer: what the window sent before the password and what it did
+    /// with the viewer reporting the server's certificate as `sha`.
+    struct Seen {
+        /// The pin the window gave before the password.
+        pin: Option<[u8; 32]>,
+        /// What the window showed.
+        updates: Vec<Update>,
+        /// Whether the window let the viewer log in (it pinned `sha`).
+        accepted: bool,
+    }
+
+    /// Opens a desktop with `store`'s pins; `meanwhile` runs after the
+    /// window gave its pin and before the certificate comes.
+    fn rdp_with_fingerprint(store: &PinStore, sha: [u8; 32], meanwhile: impl FnOnce()) -> Seen {
         let l = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = l.local_addr().unwrap().to_string();
         std::thread::spawn(move || {
@@ -954,57 +1018,136 @@ mod tests {
                 _ => {}
             }
         }
+        meanwhile();
         write_frame(&mut viewer_out, &FromViewer::Fingerprint(sha).encode()).unwrap();
         // A bell after it shows the certificate was dealt with.
         write_frame(&mut viewer_out, &FromViewer::Bell.encode()).unwrap();
         let deadline = Instant::now() + Duration::from_secs(10);
-        let mut seen = Vec::new();
-        while !seen
+        let mut updates = Vec::new();
+        while !updates
             .iter()
             .any(|u| matches!(u, Update::Bell | Update::Ended(_)))
         {
             assert!(Instant::now() < deadline);
-            seen.extend(d.poll());
+            updates.extend(d.poll());
             std::thread::sleep(Duration::from_millis(5));
         }
-        seen.retain(|u| *u != Update::Bell);
-        (pin, seen)
+        updates.retain(|u| *u != Update::Bell);
+        // Everything else the window sent, up to the pipe's end.
+        drop(d);
+        let mut accepted = false;
+        while let Ok(Some(frame)) = read_frame(&mut viewer_in) {
+            if ToViewer::decode(&frame) == Some(ToViewer::PinnedFingerprint(sha)) {
+                accepted = true;
+            }
+        }
+        Seen {
+            pin,
+            updates,
+            accepted,
+        }
+    }
+
+    fn ended(seen: &Seen) -> bool {
+        seen.updates.iter().any(|u| matches!(u, Update::Ended(_)))
+    }
+
+    fn pin_store(name: &str) -> (std::path::PathBuf, PinStore) {
+        let dir = std::env::temp_dir().join(format!("ferossh-rdp-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = PinStore {
+            path: dir.join("rdp_certs"),
+            key: "[srv.lan]:22/rdp:3389".into(),
+        };
+        (dir, store)
     }
 
     #[test]
     fn an_rdp_fingerprint_is_pinned_the_first_time_and_checked_after() {
-        let dir = std::env::temp_dir().join(format!("ferossh-rdp-pin-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        let store = PinStore {
-            path: dir.join("rdp_certs"),
-            key: "srv.lan:22/rdp:3389".into(),
-        };
+        let (dir, store) = pin_store("pin");
         let (first, other) = ([1u8; 32], [2u8; 32]);
-        // First time: no pin given, the certificate is kept.
-        let (pin, seen) = rdp_with_fingerprint(&store, first);
-        assert_eq!(pin, None);
-        assert!(matches!(seen.first(), Some(Update::Note(n)) if n.contains("now pinned")));
-        assert_eq!(store.pin(), Some(first));
+        // First time: no pin given; the certificate is kept, and only
+        // then may the viewer log in.
+        let seen = rdp_with_fingerprint(&store, first, || {});
+        assert_eq!(seen.pin, None);
+        assert!(seen.accepted);
+        assert!(matches!(seen.updates.first(), Some(Update::Note(n)) if n.contains("now pinned")));
+        assert_eq!(store.pin(), Ok(Some(first)));
         // Next time: the pin goes to the viewer before the password, and
-        // the same certificate is fine.
-        let (pin, seen) = rdp_with_fingerprint(&store, first);
-        assert_eq!(pin, Some(first));
-        assert!(
-            !seen
-                .iter()
-                .any(|u| matches!(u, Update::Ended(_) | Update::Note(_)))
-        );
+        // the same certificate is fine without another answer.
+        let seen = rdp_with_fingerprint(&store, first, || {});
+        assert_eq!(seen.pin, Some(first));
+        assert!(!ended(&seen) && seen.updates.is_empty());
         // Another certificate ends the session, and the pin stays.
-        let (pin, seen) = rdp_with_fingerprint(&store, other);
-        assert_eq!(pin, Some(first));
-        assert!(matches!(seen.first(), Some(Update::Ended(why)) if why.contains("certificate")));
-        assert_eq!(store.pin(), Some(first));
+        let seen = rdp_with_fingerprint(&store, other, || {});
+        assert_eq!(seen.pin, Some(first));
+        assert!(ended(&seen) && !seen.accepted);
+        assert_eq!(store.pin(), Ok(Some(first)));
         // Another desktop has its own pin.
         let elsewhere = PinStore {
-            key: "srv.lan:22/rdp:3390".into(),
+            key: "[srv.lan]:22/rdp:3390".into(),
             ..store.clone()
         };
-        assert_eq!(elsewhere.pin(), None);
+        assert_eq!(elsewhere.pin(), Ok(None));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_pin_saved_meanwhile_by_another_tab_wins() {
+        let (dir, store) = pin_store("race");
+        let (first, other) = ([1u8; 32], [2u8; 32]);
+        // This tab started with no pin; another tab pins `first` before
+        // this one's server shows `other`.
+        let seen = rdp_with_fingerprint(&store, other, || {
+            crate::winrm::remember_cert(&store.path, &store.key, &hex(&first)).unwrap();
+        });
+        assert_eq!(seen.pin, None);
+        assert!(ended(&seen) && !seen.accepted);
+        assert_eq!(store.pin(), Ok(Some(first)));
+        // The same certificate as the other tab's is let in.
+        std::fs::remove_file(&store.path).unwrap();
+        let seen = rdp_with_fingerprint(&store, first, || {
+            crate::winrm::remember_cert(&store.path, &store.key, &hex(&first)).unwrap();
+        });
+        assert!(seen.accepted && !ended(&seen));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn unreadable_or_damaged_pins_never_count_as_a_first_time() {
+        let (dir, store) = pin_store("bad");
+        let start = |store: &PinStore| {
+            let session = Session {
+                protocol: Protocol::Rdp,
+                width: 800,
+                height: 600,
+                layout: 0,
+                user: String::new(),
+                password: None,
+                fixed: false,
+                clipboard: (false, false),
+                clipboard_limit: (false, false),
+                pins: Some(store.clone()),
+            };
+            let (_r, w) = std::io::pipe().unwrap();
+            let (r, _w) = std::io::pipe().unwrap();
+            Desktop::start("127.0.0.1:9", session, w, r, Box::new(()), || {}).map(|_| ())
+        };
+        // A folder where the file should be.
+        std::fs::create_dir_all(&store.path).unwrap();
+        assert!(store.pin().is_err());
+        let e = start(&store).unwrap_err();
+        assert!(e.to_string().contains("pins could not be read"), "{e}");
+        std::fs::remove_dir_all(&store.path).unwrap();
+        // A line for this desktop that is not a SHA-256.
+        for bad in ["abc", &"zz".repeat(32), &"0".repeat(66)] {
+            std::fs::write(&store.path, format!("{} {bad}\n", store.key)).unwrap();
+            assert!(store.pin().is_err(), "{bad}");
+        }
+        // Other desktops' lines do not matter.
+        std::fs::write(&store.path, "[other]:22/rdp:3389 abc\n").unwrap();
+        assert_eq!(store.pin(), Ok(None));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
