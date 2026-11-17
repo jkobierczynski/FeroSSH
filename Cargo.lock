@@ -998,6 +998,7 @@ dependencies = [
  "ironrdp-svc",
  "miniz_oxide 0.8.9",
  "rustls",
+ "sha2",
  "x509-cert",
  "zeroize",
 ]
