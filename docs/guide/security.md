@@ -42,6 +42,8 @@ X11 forwarding is off unless a host turns it on, because X programs on the serve
 
 Telnet sends everything in the clear, passwords included. FeroSSH offers it only for old gear that has nothing better: the pane says so when it connects and the tab carries a red **⚠ telnet** badge. The Telnet connection runs in a sandboxed worker like SSH, agrees to only a handful of options, and never sends your user name or environment.
 
+Files downloaded over SFTP or ZMODEM get Windows' *Mark-of-the-Web* (a `Zone.Identifier` stream saying they came from the Internet), as a browser's downloads do: SmartScreen checks a downloaded program before it runs, Office opens downloaded documents in Protected View, and Explorer offers *Unblock* under Properties. A ZMODEM receive starts only after you say yes.
+
 ## WinRM
 
 A WinRM connection's password and its login (Kerberos or NTLM, through Windows' SSPI) stay in the FeroSSH window. The sandboxed worker that talks to the server only passes the login's tokens along and asks the window to encrypt each request and decrypt each reply, so it never sees the password or the keys. The login tokens travel in the HTTP `Authorization` header, as WinRM over HTTP sends them; after the login every shell request and reply is encrypted with the login's keys, and a reply that is not is refused, whatever it says. The HTTP, encryption framing, SOAP and XML parsers run in the worker and are fuzz-tested; the XML reader accepts no DTDs. NTLM, which Windows falls back to outside a domain or for a server named by address, does not prove the server's identity: the pane says so. FeroSSH never delegates your credentials to the server (no CredSSP).

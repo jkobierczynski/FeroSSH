@@ -500,7 +500,11 @@ fn keep(folder: &Path, incoming: Incoming) -> Result<PathBuf, String> {
             )
         })?;
     std::fs::rename(&part, &target)
-        .map(|()| target)
+        .map(|()| {
+            // From the server, so marked as a download (Mark-of-the-Web).
+            ferossh_sftp::motw::mark(&target, "about:internet");
+            target
+        })
         .map_err(|e| format!("ZMODEM: cannot rename {}: {e}.", part.display()))
 }
 

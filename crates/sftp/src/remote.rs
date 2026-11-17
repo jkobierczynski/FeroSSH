@@ -1816,6 +1816,10 @@ impl Remote {
             let why = format!("{}: {e}", d.target.display());
             return self.fail(i, why);
         }
+        // Downloaded from elsewhere, as a browser's download would be.
+        if let Some(job) = self.jobs.get(i) {
+            crate::motw::mark(&d.target, &crate::motw::sftp_url(&self.label, &job.remote));
+        }
         self.finish(i, note);
     }
 
