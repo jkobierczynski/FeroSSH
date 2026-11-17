@@ -31,6 +31,9 @@ mod short_scalar;
 pub enum KeyFileError {
     /// The file is missing or unreadable.
     Unreadable(String),
+    /// The path is on a network share (`\\server\share\…`), which is
+    /// never opened: Windows would log in to that server as the user.
+    NetworkPath,
     /// Not an OpenSSH or PuTTY private key.
     Malformed,
     /// A key type FeroSSH does not use from a file.
@@ -49,6 +52,12 @@ impl fmt::Display for KeyFileError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Unreadable(e) => write!(f, "cannot read it ({e})"),
+            Self::NetworkPath => write!(
+                f,
+                "it is on a network share, which FeroSSH does not open for keys: Windows \
+                 would log in to that server with your Windows account. Copy the key to \
+                 this PC, or use a mapped drive letter"
+            ),
             Self::Malformed => f.write_str("it is not an OpenSSH or PuTTY private key"),
             Self::Unsupported(kind) => {
                 write!(f, "{kind} keys are only used through the agent or Pageant")
@@ -175,6 +184,9 @@ impl KeyFile {
     }
 
     pub fn load(path: &Path) -> Result<Self, KeyFileError> {
+        if is_network_path(path) {
+            return Err(KeyFileError::NetworkPath);
+        }
         let text = Zeroizing::new(
             std::fs::read_to_string(path).map_err(|e| KeyFileError::Unreadable(e.to_string()))?,
         );
@@ -254,10 +266,74 @@ impl KeyFile {
     }
 }
 
+/// Whether opening `path` would go to another computer: a UNC path
+/// (`\\server\share`, `//server/share`, `\\?\UNC\…`) or a
+/// Win32 device path other than a local drive (`\\.\pipe\…`).
+/// Opening a UNC path makes Windows log in to that server with the
+/// user's account (an NTLM exchange an attacker's server can capture or
+/// relay), so key and certificate paths that came from someone else's
+/// session file must never be opened. `\\?\C:\…` is a local
+/// path. Mapped drive letters are the user's own choice and are local
+/// paths here.
+pub fn is_network_path(path: &Path) -> bool {
+    let text = path.to_string_lossy();
+    let mut chars = text
+        .trim_start()
+        .chars()
+        .map(|c| if c == '/' { '\\' } else { c });
+    if !(chars.next() == Some('\\') && chars.next() == Some('\\')) {
+        return false;
+    }
+    let rest: String = chars.collect();
+    match rest
+        .strip_prefix("?\\")
+        .or_else(|| rest.strip_prefix(".\\"))
+    {
+        // A device path: local only when it names a drive.
+        Some(device) => {
+            let mut d = device.chars();
+            !(d.next().is_some_and(|c| c.is_ascii_alphabetic())
+                && d.next() == Some(':')
+                && matches!(d.next(), None | Some('\\')))
+        }
+        None => true,
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn network_paths_are_told_apart_from_local_ones() {
+        for remote in [
+            r"\\203.0.113.5\x\id.ppk",
+            "//server/share/id_ed25519",
+            r"\\?\UNC\server\share\k",
+            r"\\.\UNC\server\share\k",
+            r"\\.\pipe\agent",
+            r"\\?\Volume{0}\k",
+            r"/\server\k",
+        ] {
+            assert!(is_network_path(Path::new(remote)), "{remote}");
+        }
+        for local in [
+            r"C:\Keys\id.ppk",
+            r"\\?\C:\Keys\id.ppk",
+            r"\\.\D:",
+            r"H:\keys\id",
+            "id_ed25519",
+            r"~\.ssh\id_ed25519",
+            "/home/me/.ssh/id",
+        ] {
+            assert!(!is_network_path(Path::new(local)), "{local}");
+        }
+        assert!(matches!(
+            KeyFile::load(Path::new(r"\\nowhere.invalid\x\id")),
+            Err(KeyFileError::NetworkPath)
+        ));
+    }
     use getrandom::SysRng;
     use getrandom::rand_core::UnwrapErr;
     use russh::keys::signature::Verifier;

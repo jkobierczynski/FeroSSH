@@ -16,6 +16,23 @@ use crate::session_form::Line;
 use crate::sessions::SideKey;
 use crate::tabstrip::{Palette, fit};
 
+/// Leaves out key files on network shares: a session file from someone
+/// else could point one at their server, which Windows would then log in
+/// to as the user on connect. The connection keeps a note why.
+pub fn drop_network_keys(sessions: &mut [Session]) {
+    for s in sessions {
+        if s.host
+            .identity_file
+            .as_deref()
+            .is_some_and(|f| ferossh_auth::keyfile::is_network_path(std::path::Path::new(f)))
+        {
+            s.host.identity_file = None;
+            s.notes
+                .push("its key file on a network share is not imported".into());
+        }
+    }
+}
+
 /// What was found in one place.
 #[derive(Clone, Debug)]
 pub enum Items {
@@ -838,6 +855,28 @@ mod tests {
         s.host.user = Some("me".into());
         assert_eq!(s.kind, SessionKind::Ssh);
         s
+    }
+
+    #[test]
+    fn key_files_on_network_shares_are_not_imported() {
+        let with_key = |key: &str| {
+            let key = key.to_owned();
+            winscp::session("s", move |k| match k {
+                "HostName" => Some(Value::Text("h.lan".into())),
+                "PublicKeyFile" => Some(Value::Text(key.clone())),
+                _ => None,
+            })
+            .unwrap()
+        };
+        let mut s = vec![
+            with_key(r"\\203.0.113.5\x\id.ppk"),
+            with_key(r"C:\Keys\id.ppk"),
+        ];
+        drop_network_keys(&mut s);
+        assert_eq!(s[0].host.identity_file, None);
+        assert!(s[0].notes.iter().any(|n| n.contains("network share")));
+        assert_eq!(s[1].host.identity_file.as_deref(), Some(r"C:\Keys\id.ppk"));
+        assert!(s[1].notes.is_empty());
     }
 
     fn view() -> ImportView {
