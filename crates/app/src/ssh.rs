@@ -1839,14 +1839,18 @@ impl SshSession {
         {
             return h.session.replace_host_key();
         }
-        let Some(key) = self.changed_key.take() else {
+        let Some(key) = self.changed_key.as_deref() else {
             return Ok(());
         };
         let Some(file) = self.known_file() else {
             return Ok(());
         };
         let (host, port) = self.target.key_host();
-        known_hosts::replace(&file, host, port, &key)
+        // Kept until the file is written, so a failed attempt can be tried
+        // again.
+        known_hosts::replace(&file, host, port, key)?;
+        self.changed_key = None;
+        Ok(())
     }
 
     pub fn on_broker(&mut self, reply: Reply) -> Vec<Effect> {

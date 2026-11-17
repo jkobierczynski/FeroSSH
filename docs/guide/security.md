@@ -17,7 +17,7 @@ Windows does not let AppContainers connect to 127.0.0.1, so for an SSH server on
 
 ## Host keys
 
-A new host shows its SHA-256 fingerprint; check it before you type `yes`. A changed host key fills the window with a warning and cannot be clicked away. So does a key of another type than the ones `known_hosts` holds for the host: FeroSSH asks the server for the trusted type first, so a server that offers another one has lost its old key or is not the server you trusted. (OpenSSH asks *yes/no* in that case.) If you know why it changed (the server was reinstalled), Session > Replace host key... replaces it after asking twice. Host certificates (`@cert-authority` in `known_hosts`) and `@revoked` keys work as in OpenSSH.
+A new host shows its SHA-256 fingerprint; check it before you type `yes`. A changed host key fills the window with a warning and cannot be clicked away. So does a key of another type than the ones `known_hosts` holds for the host: FeroSSH asks the server for the trusted type first, so a server that offers another one has lost its old key or is not the server you trusted. (OpenSSH asks *yes/no* in that case.) If you know why it changed (the server was reinstalled), Session > Replace host key... replaces it after asking twice. Only that host's entries change: on a line shared with other hosts it is taken out of the list, and a wildcard line that covered it gets a `!host` exclusion, so the other hosts keep their keys. Host certificates (`@cert-authority` in `known_hosts`) and `@revoked` keys work as in OpenSSH.
 
 ## Keys and passwords
 

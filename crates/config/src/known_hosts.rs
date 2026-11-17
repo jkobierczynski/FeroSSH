@@ -349,12 +349,24 @@ pub fn replace(path: &Path, host: &str, port: u16, key: &[u8]) -> io::Result<()>
     let token = host_token(host, port);
     let mut out = String::with_capacity(text.len() + 128);
     for (i, line) in text.lines().enumerate() {
-        let drop = parse_line(i + 1, line)
-            .is_some_and(|e| e.marker.is_none() && host_matches(&e.hosts, &token));
-        if !drop {
-            out.push_str(line);
-            out.push('\n');
+        let entry = parse_line(i + 1, line)
+            .filter(|e| e.marker.is_none() && host_matches(&e.hosts, &token));
+        match entry.map(|e| e.hosts) {
+            None => out.push_str(line),
+            // One host per hashed line: it goes.
+            Some(Hosts::Hashed { .. }) => continue,
+            Some(Hosts::Patterns(list)) => match without_host(&list, &token) {
+                Some(rest) => {
+                    // The other hosts keep their key: only the list changes.
+                    let fields = line.trim_start();
+                    let tail = fields.get(list.len()..).unwrap_or_default();
+                    out.push_str(&rest);
+                    out.push_str(tail);
+                }
+                None => continue,
+            },
         }
+        out.push('\n');
     }
     out.push_str(&hashed_line(host, port, key)?);
     out.push('\n');
@@ -364,6 +376,26 @@ pub fn replace(path: &Path, host: &str, port: u16, key: &[u8]) -> io::Result<()>
     let tmp = path.with_extension("ferossh-tmp");
     fs::write(&tmp, out)?;
     fs::rename(&tmp, path)
+}
+
+/// A plain host list with `token` taken out, for a line that keeps the
+/// other hosts' trust; `None` when nothing else is left. A name written
+/// out is removed; a wildcard that still covers `token` stays, with a
+/// `!token` added so it no longer does.
+fn without_host(list: &str, token: &str) -> Option<String> {
+    let kept: Vec<&str> = list
+        .split(',')
+        .filter(|p| !p.eq_ignore_ascii_case(token))
+        .collect();
+    if !kept.iter().any(|p| !p.starts_with('!') && !p.is_empty()) {
+        return None;
+    }
+    let mut rest = kept.join(",");
+    if match_pattern_list(&rest, token) {
+        rest.push_str(",!");
+        rest.push_str(token);
+    }
+    Some(rest)
 }
 
 #[cfg(test)]
@@ -520,6 +552,46 @@ mod tests {
         assert!(matches!(kh.check("h", 22, &old), Status::Changed { .. }));
         assert_eq!(kh.check("other", 22, &keep), Status::Trusted);
         assert!(fs::read_to_string(&path).unwrap().starts_with("# mine\n"));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn replace_keeps_the_other_hosts_on_a_shared_line() {
+        let dir = std::env::temp_dir().join(format!("ferossh-kh-share-{}", std::process::id()));
+        let path = dir.join("known_hosts");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let rsa = blob("ssh-rsa", b"shared");
+        let wild = blob("ssh-ed25519", b"wild");
+        let new = blob("ssh-ed25519", b"new");
+        fs::write(
+            &path,
+            format!(
+                "{}\n{}\n{} # only h\n",
+                line("a,H,[b]:2222", &rsa),
+                line("*.lan,!x.lan", &wild),
+                line("h", &rsa)
+            ),
+        )
+        .unwrap();
+        replace(&path, "h", 22, &new).unwrap();
+        replace(&path, "srv.lan", 22, &new).unwrap();
+        let kh = KnownHosts::load(&path).unwrap();
+        // The replaced hosts have only the new key.
+        for h in ["h", "srv.lan"] {
+            assert_eq!(kh.check(h, 22, &new), Status::Trusted);
+            assert!(!matches!(kh.check(h, 22, &rsa), Status::Trusted));
+            assert!(!matches!(kh.check(h, 22, &wild), Status::Trusted));
+        }
+        // Everyone else on those lines keeps theirs.
+        assert_eq!(kh.check("a", 22, &rsa), Status::Trusted);
+        assert_eq!(kh.check("b", 2222, &rsa), Status::Trusted);
+        assert_eq!(kh.check("other.lan", 22, &wild), Status::Trusted);
+        assert!(!matches!(kh.check("x.lan", 22, &wild), Status::Trusted));
+        let text = fs::read_to_string(&path).unwrap();
+        assert!(text.contains("a,[b]:2222 ssh-rsa"), "{text}");
+        assert!(text.contains("*.lan,!x.lan,!srv.lan ssh-ed25519"), "{text}");
+        assert!(!text.contains("# only h"), "{text}");
         let _ = fs::remove_dir_all(&dir);
     }
 }
