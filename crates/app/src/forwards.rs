@@ -47,6 +47,9 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const X11_SETUP_TIMEOUT: Duration = Duration::from_secs(30);
 /// Open connections listed per forward in the view.
 const LISTED_STREAMS: usize = 8;
+/// Accepted sockets that may wait for the owner check on one forward;
+/// more wait in the kernel's listen backlog.
+const PENDING_SOCKETS: usize = 64;
 /// Remote desktop tunnels listen on a port in this range, picked from the
 /// host's name so the same host gets the same port each time (Remote
 /// Desktop Connection remembers certificates and sign-ins by address). A
@@ -1412,7 +1415,7 @@ async fn listen(
         owner,
         addrs: addrs.join(", "),
     });
-    let (tx, mut rx) = mpsc::unbounded_channel();
+    let (tx, mut rx) = mpsc::channel(PENDING_SOCKETS);
     let mut accepting = AbortOnDrop(Vec::new());
     for l in listeners {
         let tx = tx.clone();
@@ -1420,7 +1423,7 @@ async fn listen(
             loop {
                 match l.accept().await {
                     Ok(conn) => {
-                        if tx.send(conn).is_err() {
+                        if tx.send(conn).await.is_err() {
                             return;
                         }
                     }
