@@ -1163,33 +1163,42 @@ fn a_part_file_never_takes_another_downloads_final_name() {
 
 #[test]
 fn a_numbered_long_name_still_fits_with_its_part_file() {
-    let s = Scratch::new("collide-long");
+    // 248 bytes locally: with " (2)" and ".part" it would be 257.
+    long_collision("collide-long", &"a".repeat(247), "");
+    // Nearly all extension: that has to be cut too.
+    long_collision("collide-long-ext", "a", &format!(".{}", "x".repeat(247)));
+}
+
+/// Downloads `{stem}:{ext}` and `{stem}_{ext}`, which land on one local
+/// name, and checks the second's numbered name and part file fit.
+fn long_collision(scratch: &str, stem: &str, ext: &str) {
+    let s = Scratch::new(scratch);
     let one = pattern(100_000);
     let two: Vec<u8> = pattern(90_000).iter().map(|b| b ^ 0x44).collect();
-    // 248 bytes locally: with " (2)" and ".part" it would be 257.
-    let stem = "a".repeat(247);
-    fs::write(s.remote().join(format!("{stem}:")), &one).unwrap();
-    fs::write(s.remote().join(format!("{stem}_")), &two).unwrap();
+    let (colon, under) = (format!("{stem}:{ext}"), format!("{stem}_{ext}"));
+    fs::write(s.remote().join(&colon), &one).unwrap();
+    fs::write(s.remote().join(&under), &two).unwrap();
     let (mut remote, mut fake) = connected(&s.remote());
     remote.parallel = 2;
     remote
-        .download(&entry(&remote, &format!("{stem}:")), &s.local())
+        .download(&entry(&remote, &colon), &s.local())
         .unwrap();
     remote
-        .download(&entry(&remote, &format!("{stem}_")), &s.local())
+        .download(&entry(&remote, &under), &s.local())
         .unwrap();
     assert!(run(&mut remote, &mut fake));
     for job in remote.jobs() {
         assert_eq!(job.state, State::Done, "{:?}", job.note);
     }
-    assert_eq!(fs::read(s.local().join(format!("{stem}_"))).unwrap(), one);
+    assert_eq!(fs::read(s.local().join(&under)).unwrap(), one);
     let numbered: Vec<_> = fs::read_dir(s.local())
         .unwrap()
         .map(|e| e.unwrap().file_name().into_string().unwrap())
-        .filter(|n| n.ends_with(" (2)"))
+        .filter(|n| *n != under)
         .collect();
     assert_eq!(numbered.len(), 1, "{numbered:?}");
     let name = numbered.first().unwrap();
+    assert!(name.contains(" (2)"), "{name}");
     assert!(name.len() + ".part".len() <= 255, "{}", name.len());
     assert_eq!(fs::read(s.local().join(name)).unwrap(), two);
 }

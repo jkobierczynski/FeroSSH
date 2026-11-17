@@ -473,6 +473,12 @@ fn numbered_within(name: &str, n: u32, max: usize) -> String {
         ),
         _ => (name, ""),
     };
+    // An extension too long to keep is cut like the rest of the name.
+    let (stem, ext) = if format!(" ({n}){ext}").len() > max {
+        (name, "")
+    } else {
+        (stem, ext)
+    };
     let tail = format!(" ({n}){ext}");
     let mut keep = max.saturating_sub(tail.len()).min(stem.len());
     while keep > 0 && !stem.is_char_boundary(keep) {
