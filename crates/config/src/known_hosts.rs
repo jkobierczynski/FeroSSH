@@ -312,6 +312,19 @@ pub fn add(path: &Path, host: &str, port: u16, key: &[u8]) -> io::Result<()> {
         Err(e) if e.kind() == io::ErrorKind::NotFound => Vec::new(),
         Err(e) => return Err(e),
     };
+    if existing.contains(&0) {
+        // UTF-16 (PowerShell 5.1's `>`): UTF-8 appended to it would not
+        // read back, so the whole file is rewritten as UTF-8 first.
+        let mut text = decode(&existing)?;
+        if !text.is_empty() && !text.ends_with('\n') {
+            text.push('\n');
+        }
+        text.push_str(&line);
+        text.push('\n');
+        let tmp = path.with_extension("ferossh-tmp");
+        fs::write(&tmp, text)?;
+        return fs::rename(&tmp, path);
+    }
     let mut file = fs::OpenOptions::new()
         .create(true)
         .append(true)
@@ -396,9 +409,14 @@ pub fn decode(bytes: &[u8]) -> io::Result<String> {
             text.push(char::REPLACEMENT_CHARACTER);
         }
     }
+    // Where the UTF-16 part starts, in lines: entries there are ASCII, so
+    // anything else on an entry line means it was not UTF-16 after all
+    // (a stray zero byte in a UTF-8 file), and lines would be lost.
+    let utf8_lines = String::from_utf8_lossy(utf8).lines().count();
     for (n, line) in text.lines().enumerate() {
         let entry = line.trim_start();
-        if !entry.starts_with('#') && entry.contains(char::REPLACEMENT_CHARACTER) {
+        let foreign = utf16.is_some() && n >= utf8_lines && !entry.is_ascii();
+        if !entry.starts_with('#') && (foreign || entry.contains(char::REPLACEMENT_CHARACTER)) {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!(
@@ -652,6 +670,33 @@ mod tests {
         assert!(decode(&odd).is_err());
         // Anything goes in a comment.
         assert!(decode(b"# caf\xe9\n").is_ok());
+    }
+
+    #[test]
+    fn a_stray_zero_byte_in_utf8_is_an_error_not_lost_lines() {
+        // A zero byte in a UTF-8 comment must not turn the rest of the
+        // file, a @revoked line included, into one unparsable line.
+        let k = blob("ssh-ed25519", b"k");
+        let text = format!("{}\n# \x00\n@revoked {}\n", line("host", &k), line("*", &k));
+        let e = decode(text.as_bytes()).unwrap_err();
+        assert_eq!(e.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn adding_to_a_utf16_file_keeps_it_readable() {
+        let dir = std::env::temp_dir().join(format!("ferossh-kh-add16-{}", std::process::id()));
+        let path = dir.join("known_hosts");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let a = blob("ssh-ed25519", b"a");
+        let b = blob("ssh-ed25519", b"b");
+        fs::write(&path, utf16(&format!("{}\r\n", line("a", &a)))).unwrap();
+        add(&path, "b", 22, &b).unwrap();
+        let kh = KnownHosts::load(&path).unwrap();
+        assert_eq!(kh.check("a", 22, &a), Status::Trusted);
+        assert_eq!(kh.check("b", 22, &b), Status::Trusted);
+        assert!(!fs::read(&path).unwrap().contains(&0));
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
