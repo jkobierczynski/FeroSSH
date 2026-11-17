@@ -18175,6 +18175,7 @@ fn taken_aliases(client: Client) -> Vec<String> {
 /// What the import page shows for sessions read from `origin`: distinct
 /// names, and the ones a host elsewhere already has marked.
 fn found(client: Client, origin: String, mut sessions: Vec<import::Session>) -> Found {
+    crate::import_view::drop_network_keys(&mut sessions);
     import::distinct(&mut sessions);
     let taken = taken_aliases(client);
     let taken = sessions
