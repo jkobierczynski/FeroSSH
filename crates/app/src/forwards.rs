@@ -531,10 +531,12 @@ enum Internal {
         socket: TcpStream,
         peer: SocketAddr,
     },
-    /// A connection from another Windows session was closed unused.
+    /// A connection from another Windows session, or from a program that
+    /// could not be found, was closed unused.
     Refused {
         owner: Owner,
         peer: SocketAddr,
+        verdict: crate::peer_owner::Verdict,
     },
     /// A stream ended on this side; `why` when it failed.
     Ended {
@@ -1000,13 +1002,25 @@ impl Engine {
                 socket,
                 peer,
             } => self.accepted(owner, socket, peer),
-            Internal::Refused { owner, peer } => self.note_error(
+            Internal::Refused {
                 owner,
-                format!(
-                    "Refused a connection from {peer}: it came from a program of another \
-                     Windows session (another user signed in to this PC, or a service), not \
-                     from yours."
-                ),
+                peer,
+                verdict,
+            } => self.note_error(
+                owner,
+                if verdict == crate::peer_owner::Verdict::OtherSession {
+                    format!(
+                        "Refused a connection from {peer}: it came from a program of another \
+                         Windows session (another user signed in to this PC, or a service), \
+                         not from yours."
+                    )
+                } else {
+                    format!(
+                        "Refused a connection from {peer}: Windows did not say which program \
+                         made it (it may have closed already), so it could not be checked to \
+                         be one of yours."
+                    )
+                },
             ),
             Internal::Ended { channel, why } => {
                 if let Some(s) = self.streams.remove(&channel) {
@@ -1421,13 +1435,25 @@ async fn listen(
     // Removing the forward aborts this task, which drops `accepting`: the
     // accept tasks end and the ports are free again.
     while let Some((socket, peer)) = rx.recv().await {
-        // Only this session's programs, on loopback: see `peer_owner`.
-        let ours = socket
-            .local_addr()
-            .is_ok_and(|local| crate::peer_owner::allowed(local, peer));
-        if !ours {
+        // Only this session's programs, on loopback: see `peer_owner`. The
+        // lookup reads the whole TCP table, so it runs off this runtime's
+        // one thread, where the other forwards' streams run too.
+        let verdict = match socket.local_addr() {
+            Ok(local) => tokio::task::spawn_blocking(move || crate::peer_owner::check(local, peer))
+                .await
+                .unwrap_or(crate::peer_owner::Verdict::Unknown),
+            Err(_) => crate::peer_owner::Verdict::Unknown,
+        };
+        if verdict != crate::peer_owner::Verdict::Allowed {
             drop(socket);
-            if events.send(Internal::Refused { owner, peer }).is_err() {
+            if events
+                .send(Internal::Refused {
+                    owner,
+                    peer,
+                    verdict,
+                })
+                .is_err()
+            {
                 return;
             }
             continue;

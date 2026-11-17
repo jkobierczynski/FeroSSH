@@ -6,16 +6,31 @@
 //! for no password, as in OpenSSH. So a connection from loopback is
 //! taken only from a program in this Windows session: Windows' TCP table
 //! names the process that holds the other end, and that process's
-//! session must be ours. A connection from another machine (a forward
+//! session must be ours. A connection from another machine (to a forward
 //! bound to other addresses, which takes them on purpose) is not checked.
+//!
+//! The lookup reads the whole TCP table, so callers on an async runtime
+//! run it with `spawn_blocking`.
 
 use std::net::SocketAddr;
 
+/// What became of the check of one connection.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Verdict {
+    /// Ours, or from another machine.
+    Allowed,
+    /// From a program in another Windows session.
+    OtherSession,
+    /// From loopback, but its program could not be found (it may have
+    /// closed already). Refused too.
+    Unknown,
+}
+
 /// Whether the connection from `peer` to our `local` end may use the
 /// forward. A loopback connection whose owner cannot be found is refused.
-pub fn allowed(local: SocketAddr, peer: SocketAddr) -> bool {
+pub fn check(local: SocketAddr, peer: SocketAddr) -> Verdict {
     if !peer.ip().to_canonical().is_loopback() {
-        return true;
+        return Verdict::Allowed;
     }
     #[cfg(windows)]
     {
@@ -24,7 +39,7 @@ pub fn allowed(local: SocketAddr, peer: SocketAddr) -> bool {
     #[cfg(not(windows))]
     {
         let _ = local;
-        true
+        Verdict::Allowed
     }
 }
 
@@ -155,7 +170,8 @@ mod win {
         Some(id)
     }
 
-    pub fn in_this_session(local: SocketAddr, peer: SocketAddr) -> bool {
+    pub fn in_this_session(local: SocketAddr, peer: SocketAddr) -> super::Verdict {
+        use super::Verdict;
         let owner = if peer.is_ipv4() || peer.ip().to_canonical().is_ipv4() {
             table(AF_INET).and_then(|t| super::owner_in(&t, 24, super::row_v4, peer, local))
         } else {
@@ -164,12 +180,20 @@ mod win {
         .or_else(|| {
             table(AF_INET6).and_then(|t| super::owner_in(&t, 56, super::row_v6, peer, local))
         });
-        let Some(pid) = owner else {
-            return false;
+        // Pid 0 is the idle process: a connection that is closing.
+        let Some(pid) = owner.filter(|&pid| pid != 0) else {
+            return Verdict::Unknown;
         };
         // SAFETY: no arguments.
         let me = unsafe { GetCurrentProcessId() };
-        pid == me || (session(pid).is_some() && session(pid) == session(me))
+        if pid == me {
+            return Verdict::Allowed;
+        }
+        match (session(pid), session(me)) {
+            (Some(theirs), Some(ours)) if theirs == ours => Verdict::Allowed,
+            (Some(_), Some(_)) => Verdict::OtherSession,
+            _ => Verdict::Unknown,
+        }
     }
 }
 
@@ -250,6 +274,9 @@ mod tests {
     #[test]
     fn other_machines_are_not_checked() {
         let local: SocketAddr = "192.0.2.1:1080".parse().unwrap();
-        assert!(allowed(local, "192.0.2.7:50000".parse().unwrap()));
+        assert_eq!(
+            check(local, "192.0.2.7:50000".parse().unwrap()),
+            Verdict::Allowed
+        );
     }
 }
