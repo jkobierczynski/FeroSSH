@@ -3,6 +3,7 @@
 //! directory listing ([`remote`]), and the rules that keep a server's
 //! file names from doing harm on Windows ([`names`]).
 
+pub mod motw;
 pub mod names;
 pub mod remote;
 pub mod wire;

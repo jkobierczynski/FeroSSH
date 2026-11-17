@@ -6692,9 +6692,20 @@ impl Window {
                 self.queued.push(Command::PickZmodem { pane: id, channel });
                 Vec::new()
             } else {
-                let (transfer, effects) = zmodem::Transfer::receive(channel, self.download_dir());
-                self.zmodem.insert(id, transfer);
-                effects
+                // Files only come in once the user said yes: any output
+                // (a MOTD, a `cat` of someone's file) can start a send.
+                let host = self
+                    .panes
+                    .get(&id)
+                    .map(Pane::host_label)
+                    .unwrap_or_default();
+                self.queued.push(Command::ConfirmZmodemReceive {
+                    pane: id,
+                    channel,
+                    host,
+                    folder: self.download_dir(),
+                });
+                Vec::new()
             };
             self.apply(id, effects);
             return;
@@ -6711,6 +6722,29 @@ impl Window {
 
     /// The user picked `paths` (or nothing) for the server's `rz` in pane
     /// `pane`.
+    /// The user's answer to the server's `sz` in pane `pane`: receive into
+    /// `folder`, or decline.
+    fn zmodem_receive(&mut self, pane: PaneId, channel: ChannelId, folder: Option<PathBuf>) {
+        let alive = match self.panes.get(&pane).map(|p| &p.host) {
+            Some(Host::Ssh(s)) => s.channel == channel,
+            Some(Host::Telnet(s)) => s.channel == channel,
+            _ => false,
+        };
+        if !alive || self.zmodem.contains_key(&pane) {
+            return;
+        }
+        let effects = match folder {
+            Some(folder) => {
+                let (transfer, effects) = zmodem::Transfer::receive(channel, folder);
+                self.zmodem.insert(pane, transfer);
+                effects
+            }
+            None => vec![zmodem::refuse(channel, false)],
+        };
+        self.apply(pane, effects);
+        self.refresh_visible();
+    }
+
     fn zmodem_send(&mut self, pane: PaneId, channel: ChannelId, paths: &[PathBuf]) {
         let alive = match self.panes.get(&pane).map(|p| &p.host) {
             Some(Host::Ssh(s)) => s.channel == channel,
@@ -16211,6 +16245,14 @@ enum Command {
         pane: PaneId,
         channel: ChannelId,
     },
+    /// Asks whether to take the files the server's `sz` in pane `pane`
+    /// (connected to `host`) sends, into `folder`.
+    ConfirmZmodemReceive {
+        pane: PaneId,
+        channel: ChannelId,
+        host: String,
+        folder: PathBuf,
+    },
     /// Other tmux clients keep gateway `gateway`'s windows small: offer
     /// to detach them.
     TmuxCrowded(CrowdedOffer),
@@ -17788,6 +17830,23 @@ fn run_command(hwnd: HWND, command: Command) {
             if let Some(dir) = pick_folder(hwnd, w!("Local PC folder for file transfers"), &start) {
                 with_window(|w| w.set_download_dir(&dir));
             }
+        }
+        Command::ConfirmZmodemReceive {
+            pane,
+            channel,
+            host,
+            folder,
+        } => {
+            let text = format!(
+                "{} wants to send files with ZMODEM (sz).\n\nReceive them into {}?\n\n\
+                 Only say yes if you started the send yourself. Files never replace one \
+                 already there, and Windows marks them as downloaded.",
+                crate::ssh::sanitize_line(&host),
+                crate::ssh::sanitize_line(&folder.display().to_string())
+            );
+            let yes =
+                dialog(hwnd, &text, MB_YESNO | MB_ICONQUESTION | MB_DEFBUTTON2) == Some(IDYES);
+            with_window(|w| w.zmodem_receive(pane, channel, yes.then_some(folder)));
         }
         Command::PickZmodem { pane, channel } => {
             let picked = pick_files(hwnd, w!("Send files to the server's rz"));
