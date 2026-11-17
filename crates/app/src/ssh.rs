@@ -1733,33 +1733,13 @@ impl SshSession {
                 self.verdict(false),
             ],
             Status::Changed { lines } => {
-                self.state = State::Blocked;
-                self.changed_key = Some(key);
-                let lines: Vec<String> = lines.iter().map(usize::to_string).collect();
-                let text = format!(
-                    "\x1b[0m\x1b[2J\x1b[H\x1b[1;37;41m{:^60}\x1b[0m\r\n\r\n\
-                     {BOLD}The host key of {host} has changed.{RESET}\r\n\r\n\
-                     Someone could be intercepting the connection (a man-in-the-middle \
-                     attack), or the server was reinstalled or its key replaced.\r\n\r\n\
-                     The key it offers now:\r\n    {} {} {}\r\n\r\n\
-                     known_hosts ({}) holds a different key on line {}.\r\n\r\n\
-                     FeroSSH did not connect. If you know why the key changed, check the \
-                     new fingerprint with the server's administrator, then use \
-                     Session > Replace host key.\r\n",
-                    "WARNING: HOST KEY CHANGED",
-                    desc.kind,
-                    desc.bits,
-                    desc.fingerprint,
-                    self.known_files()
-                        .iter()
-                        .map(|f| f.display().to_string())
-                        .collect::<Vec<_>>()
-                        .join(", "),
-                    lines.join(", "),
-                );
-                vec![Effect::Show(text), self.verdict(false)]
+                self.block_changed_key(key, &host, &desc, "a different key", &lines)
             }
-            Status::Unknown { other_types } => {
+            Status::TypeChanged { types, lines } => {
+                let held = format!("only a {} key", types.join(" and a "));
+                self.block_changed_key(key, &host, &desc, &held, &lines)
+            }
+            Status::Unknown => {
                 match self.target.strict {
                     StrictHostKeyChecking::Yes => {
                         return vec![
@@ -1772,9 +1752,9 @@ impl SshSession {
                             self.verdict(false),
                         ];
                     }
-                    // Only when nothing in known_hosts says otherwise: a
-                    // host that changed its key type still asks.
-                    StrictHostKeyChecking::AcceptNew if other_types.is_empty() => {
+                    // Only for a host known_hosts has nothing on: one
+                    // listed with another key type is blocked above.
+                    StrictHostKeyChecking::AcceptNew => {
                         let mut effects = vec![Effect::Show(dim(&sanitize(&format!(
                             "Trusting the new {} key {} of {host} without asking \
                              (StrictHostKeyChecking accept-new).",
@@ -1793,14 +1773,6 @@ impl SshSession {
                         format!("port {port} on ")
                     }
                 );
-                if !other_types.is_empty() {
-                    text.push_str(&format!(
-                        "{RED}known_hosts holds a {} key for this host, but the server now \
-                         offers a {} key instead.{RESET}\r\n",
-                        other_types.join(", "),
-                        desc.kind
-                    ));
-                }
                 text.push_str(&format!(
                     "{} key fingerprint is {BOLD}{}{RESET}\r\n{}\r\n\
                      Type {BOLD}yes{RESET} to trust this key and connect: ",
@@ -1816,6 +1788,44 @@ impl SshSession {
                 vec![Effect::Show(text)]
             }
         }
+    }
+
+    /// Blocks a host key that differs from what known_hosts holds for the
+    /// host (`held`, on `lines`): the full-window warning, no prompt.
+    /// Session > Replace host key is the only way on.
+    fn block_changed_key(
+        &mut self,
+        key: Vec<u8>,
+        host: &str,
+        desc: &hostkey::KeyDescription,
+        held: &str,
+        lines: &[usize],
+    ) -> Vec<Effect> {
+        self.state = State::Blocked;
+        self.changed_key = Some(key);
+        let lines: Vec<String> = lines.iter().map(usize::to_string).collect();
+        let text = format!(
+            "\x1b[0m\x1b[2J\x1b[H\x1b[1;37;41m{:^60}\x1b[0m\r\n\r\n\
+             {BOLD}The host key of {host} has changed.{RESET}\r\n\r\n\
+             Someone could be intercepting the connection (a man-in-the-middle \
+             attack), or the server was reinstalled or its key replaced.\r\n\r\n\
+             The key it offers now:\r\n    {} {} {}\r\n\r\n\
+             known_hosts ({}) holds {held} on line {}.\r\n\r\n\
+             FeroSSH did not connect. If you know why the key changed, check the \
+             new fingerprint with the server's administrator, then use \
+             Session > Replace host key.\r\n",
+            "WARNING: HOST KEY CHANGED",
+            desc.kind,
+            desc.bits,
+            desc.fingerprint,
+            self.known_files()
+                .iter()
+                .map(|f| f.display().to_string())
+                .collect::<Vec<_>>()
+                .join(", "),
+            lines.join(", "),
+        );
+        vec![Effect::Show(text), self.verdict(false)]
     }
 
     /// After the user confirmed twice: store the key that blocked the
@@ -2757,6 +2767,42 @@ mod tests {
             kh.check("host", 22, &other),
             Status::Changed { .. }
         ));
+    }
+
+    #[test]
+    fn other_key_type_blocks_like_a_changed_key() {
+        let dir = temp("keytype");
+        let mut e = env(&dir);
+        // Even accept-new does not take a key of another type.
+        e.config = "Host host\n  StrictHostKeyChecking accept-new\n".into();
+        let mut rsa = vec![0, 0, 0, 7];
+        rsa.extend_from_slice(b"ssh-rsa");
+        rsa.extend_from_slice(&[0, 0, 0, 3, 1, 0, 1, 0, 0, 0, 1, 9]);
+        known_hosts::add(&e.known_hosts(), "host", 22, &rsa).unwrap();
+
+        let mut s = SshSession::new(1, Target::resolve("host", &e).unwrap(), e.known_hosts());
+        s.start(80, 24);
+        let fx = s.on_worker(Message::HostKey {
+            channel: 1,
+            key: ed25519_blob(),
+        });
+        assert_eq!(
+            sent(&fx),
+            vec![&Message::HostKeyVerdict {
+                channel: 1,
+                accept: false
+            }]
+        );
+        assert!(shown(&fx).contains("HOST KEY CHANGED"), "{}", shown(&fx));
+        assert!(shown(&fx).contains("only a ssh-rsa key"), "{}", shown(&fx));
+        assert_eq!(s.state(), State::Blocked);
+        assert!(!s.prompt_active());
+
+        // Replacing it drops the old type's line too.
+        s.replace_host_key().unwrap();
+        let kh = KnownHosts::load(&e.known_hosts()).unwrap();
+        assert_eq!(kh.check("host", 22, &ed25519_blob()), Status::Trusted);
+        assert_eq!(kh.key_types("host", 22), vec!["ssh-ed25519".to_owned()]);
     }
 
     /// A session to "inner" through "bastion", then "edge" (as

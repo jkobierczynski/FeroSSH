@@ -24,12 +24,19 @@ const SALT_LEN: usize = 20;
 pub enum Status {
     /// The key is listed for this host.
     Trusted,
-    /// The host is not listed with a key of this type. `other_types` names
-    /// the key types it is listed with, if any.
-    Unknown { other_types: Vec<String> },
+    /// The host is not listed.
+    Unknown,
     /// The host is listed with a different key of the same type: a possible
     /// man-in-the-middle. `lines` are the 1-based lines holding the old key.
     Changed { lines: Vec<usize> },
+    /// The host is listed only with keys of other types (`types`, on
+    /// `lines`). A server offers the type already trusted first, so a
+    /// switch of type is as suspect as a changed key: a man-in-the-middle
+    /// with a key of another type, or a server that lost the old one.
+    TypeChanged {
+        types: Vec<String>,
+        lines: Vec<usize>,
+    },
     /// The key is marked `@revoked`.
     Revoked,
 }
@@ -131,12 +138,19 @@ impl KnownHosts {
         if !changed.is_empty() {
             return Status::Changed { lines: changed };
         }
-        let mut other_types: Vec<String> = listed
+        if listed.is_empty() {
+            return Status::Unknown;
+        }
+        let mut types: Vec<String> = listed
             .iter()
             .filter_map(|e| key_type(&e.key).map(str::to_owned))
             .collect();
-        other_types.dedup();
-        Status::Unknown { other_types }
+        types.sort();
+        types.dedup();
+        Status::TypeChanged {
+            types,
+            lines: listed.iter().map(|e| e.line).collect(),
+        }
     }
 
     /// Whether `key` (a host key or a CA) is marked `@revoked`.
@@ -393,12 +407,7 @@ mod tests {
         assert!(kh.is_revoked(&blob("ssh-ed25519", b"gone")));
         assert!(!kh.is_revoked(&ca));
         // A CA line never trusts the CA key as a plain host key.
-        assert_eq!(
-            kh.check("web.example.org", 22, &ca),
-            Status::Unknown {
-                other_types: vec![]
-            }
-        );
+        assert_eq!(kh.check("web.example.org", 22, &ca), Status::Unknown);
     }
 
     #[test]
@@ -416,22 +425,18 @@ mod tests {
             kh.check("example.org", 2222, &ed),
             Status::Changed { lines: vec![3] }
         );
-        assert_eq!(
-            kh.check("other.org", 22, &ed),
-            Status::Unknown {
-                other_types: vec![]
-            }
-        );
+        assert_eq!(kh.check("other.org", 22, &ed), Status::Unknown);
     }
 
     #[test]
-    fn other_key_type_is_unknown_not_changed() {
+    fn other_key_type_is_a_type_change() {
         let rsa = blob("ssh-rsa", b"r");
-        let kh = KnownHosts::parse(&line("h", &rsa));
+        let kh = KnownHosts::parse(&format!("# mine\n{}", line("h", &rsa)));
         assert_eq!(
             kh.check("h", 22, &blob("ssh-ed25519", b"e")),
-            Status::Unknown {
-                other_types: vec!["ssh-rsa".into()]
+            Status::TypeChanged {
+                types: vec!["ssh-rsa".into()],
+                lines: vec![2]
             }
         );
         assert_eq!(kh.key_types("h", 22), vec!["ssh-rsa".to_owned()]);
@@ -442,10 +447,7 @@ mod tests {
         let ed = blob("ssh-ed25519", b"k");
         let kh = KnownHosts::parse(&hashed_line("srv.example", 2200, &ed).unwrap());
         assert_eq!(kh.check("srv.example", 2200, &ed), Status::Trusted);
-        assert!(matches!(
-            kh.check("srv.example", 22, &ed),
-            Status::Unknown { .. }
-        ));
+        assert!(matches!(kh.check("srv.example", 22, &ed), Status::Unknown));
     }
 
     #[test]
@@ -456,10 +458,7 @@ mod tests {
         let key = Base64::decode_vec("AAAAC3NzaC1lZDI1NTE5AAAAIHZvbmU=").unwrap();
         let kh = KnownHosts::parse(text);
         assert_eq!(kh.check("localhost", 22, &key), Status::Trusted);
-        assert!(matches!(
-            kh.check("localhost2", 22, &key),
-            Status::Unknown { .. }
-        ));
+        assert!(matches!(kh.check("localhost2", 22, &key), Status::Unknown));
     }
 
     #[test]
@@ -486,7 +485,7 @@ mod tests {
         let ca = format!("@cert-authority {}\n", line("h", &ed));
         assert!(matches!(
             KnownHosts::parse(&ca).check("h", 22, &ed),
-            Status::Unknown { .. }
+            Status::Unknown
         ));
     }
 
@@ -496,7 +495,7 @@ mod tests {
         let text = format!("h ssh-rsa {}\n", Base64::encode_string(&ed));
         assert!(matches!(
             KnownHosts::parse(&text).check("h", 22, &ed),
-            Status::Unknown { .. }
+            Status::Unknown
         ));
     }
 
