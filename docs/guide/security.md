@@ -44,7 +44,7 @@ Telnet sends everything in the clear, passwords included. FeroSSH offers it only
 
 Files downloaded over SFTP or ZMODEM get Windows' *Mark-of-the-Web* (a `Zone.Identifier` stream saying they came from the Internet), as a browser's downloads do: SmartScreen checks a downloaded program before it runs, Office opens downloaded documents in Protected View, and Explorer offers *Unblock* under Properties. A ZMODEM receive starts only after you say yes.
 
-Key and certificate files are never opened from a network share (`\\server\share\...`, `//server/...`): opening one makes Windows log in to that server with your Windows account, so a session file from someone else could otherwise point a key path at their server and capture that login. Imports leave such key paths out with a note, and a key path that still names a share is skipped with a message. Keys you keep on a share work through a mapped drive letter, which you set up yourself.
+Key and certificate files, and `known_hosts` files named by `UserKnownHostsFile`, are never opened from a network share (`\\server\share\...`, `//server/...`): opening one makes Windows log in to that server with your Windows account, so a session file from someone else could otherwise point a key path at their server and capture that login. Imports leave such key paths out with a note, a key path that still names a share is skipped with a message, and a `UserKnownHostsFile` on a share stops the connection at the host key, as an unreadable `known_hosts` does. Keys you keep on a share work through a mapped drive letter, which you set up yourself.
 
 ## WinRM
 

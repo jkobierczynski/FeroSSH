@@ -930,11 +930,31 @@ impl SshSession {
     fn known(&self) -> Result<KnownHosts, String> {
         let mut text = String::new();
         for f in &self.known_files() {
+            if let Some(why) = self.on_share(f) {
+                return Err(format!("{} ({why})", f.display()));
+            }
             let t = known_hosts::read(f).map_err(|e| format!("{} ({e})", f.display()))?;
             text.push_str(&t);
             text.push('\n');
         }
         Ok(KnownHosts::parse(&text))
+    }
+
+    /// Why a `UserKnownHostsFile` path is never opened: on a network
+    /// share (`\\server\share\...`), opening it makes Windows log in to
+    /// that server with the user's Windows account, as for key files. The
+    /// usual file, under the user's own profile, is not checked.
+    fn on_share(&self, file: &std::path::Path) -> Option<&'static str> {
+        let configured = self
+            .target
+            .known_hosts_files
+            .as_ref()
+            .is_some_and(|files| files.iter().any(|f| f == file));
+        (configured && ferossh_auth::keyfile::is_network_path(file)).then_some(
+            "it is on a network share, which FeroSSH does not open: Windows would log in \
+             to that server with your Windows account. Copy it to this PC, or use a \
+             mapped drive letter",
+        )
     }
 
     /// Refuses the host key because known_hosts could not be read.
@@ -956,6 +976,13 @@ impl SshSession {
         let (host, port) = (host.to_owned(), port);
         let mut effects = Vec::new();
         match self.known_file() {
+            Some(file) if self.on_share(&file).is_some() => {
+                effects.push(Effect::Show(dim(&sanitize(&format!(
+                    "Not saving the key to {}: it is on a network share. Trusting it for \
+                     this connection only.",
+                    file.display()
+                )))));
+            }
             Some(file) => match known_hosts::add(&file, &host, port, key) {
                 Ok(()) => effects.push(Effect::Show(dim(&sanitize(&format!(
                     "Added {host} to {}.",
@@ -1866,6 +1893,12 @@ impl SshSession {
         let Some((first, others)) = files.split_first() else {
             return Ok(());
         };
+        if let Some(why) = files.iter().find_map(|f| self.on_share(f)) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                why,
+            ));
+        }
         let (host, port) = self.target.key_host();
         // The new key is written first, so a failed step never leaves the
         // host with no pin at all (which `accept-new` would then fill
@@ -2776,6 +2809,36 @@ mod tests {
             shown(&fx)
         );
         assert!(s.prompt.is_none());
+    }
+
+    #[test]
+    fn a_known_hosts_file_on_a_network_share_is_never_opened() {
+        let dir = temp("unc");
+        for share in [
+            r"\\203.0.113.5\x\known_hosts",
+            "//203.0.113.5/x/known_hosts",
+        ] {
+            let mut e = env(&dir);
+            e.config = format!(
+                "Host host\n  StrictHostKeyChecking accept-new\n  UserKnownHostsFile \"{}\" \"{}\"\n",
+                e.known_hosts().display(),
+                share
+            );
+            let mut s = SshSession::new(1, Target::resolve("host", &e).unwrap(), e.known_hosts());
+            s.start(80, 24);
+            let fx = s.on_worker(Message::HostKey {
+                channel: 1,
+                key: ed25519_blob(),
+            });
+            assert_eq!(
+                sent(&fx),
+                vec![&Message::HostKeyVerdict {
+                    channel: 1,
+                    accept: false
+                }]
+            );
+            assert!(shown(&fx).contains("network share"), "{}", shown(&fx));
+        }
     }
 
     #[test]
