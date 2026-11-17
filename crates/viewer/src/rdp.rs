@@ -9,7 +9,12 @@
 //! tunnel ends on the server itself, whose SSH host key FeroSSH already
 //! checked, and xrdp and Windows use self-signed certificates anyway. TLS
 //! still verifies that the server holds the certificate's key, and NLA
-//! binds the login to that key. That holds only for a desktop on the SSH
+//! binds the login to that key. The certificate is pinned on first use:
+//! the window gives its SHA-256 from the last time ([`ToViewer::CertPin`])
+//! and a server with another one is not logged in to, so another program
+//! listening on the server's RDP port while the real service is down
+//! gets no login. Each new certificate goes back to the window
+//! ([`FromViewer::Certificate`]) before the login starts. That holds only for a desktop on the SSH
 //! server (`localhost` or a loopback address there), so the window opens
 //! this viewer for no other RDP host (`forwards::on_ssh_host`); a desktop
 //! on another machine behind the SSH server goes to Remote Desktop
@@ -168,9 +173,11 @@ pub(crate) fn session(
     send(&mut output, &FromViewer::NeedPassword)?;
     let (mut user, mut width, mut height) = (user, width, height);
     let mut clip = Clip::default();
+    let mut pin = None;
     let password = loop {
         match from.recv() {
             Ok(Item::Msg(ToViewer::User(u))) => user = u,
+            Ok(Item::Msg(ToViewer::CertPin(sha))) => pin = Some(sha),
             Ok(Item::Msg(ToViewer::ClipboardRules { to_host, from_host })) => {
                 (clip.to_host, clip.from_host) = (to_host, from_host);
             }
@@ -207,7 +214,7 @@ pub(crate) fn session(
     };
     let (width, height) = desktop_size(width, height);
     let size = DesktopSize { width, height };
-    let result = run(&mut pipe, config(user, password, size, layout), clip);
+    let result = run(&mut pipe, config(user, password, size, layout), clip, pin);
     let bad = pipe.bad;
     drop(pipe);
     match result {
@@ -340,6 +347,7 @@ fn run<W: Write>(
     pipe: &mut Pipe<'_, W>,
     config: ironrdp_connector::Config,
     clip: Clip,
+    pin: Option<[u8; 32]>,
 ) -> Result<(), Failure> {
     let client_addr = std::net::SocketAddr::from(([127, 0, 0, 1], 0));
     // Display Control lets the desktop follow the pane's size.
@@ -368,12 +376,17 @@ fn run<W: Write>(
     let mut tls = rustls::StreamOwned::new(tls, stream);
     // Finishes the handshake, which brings the server's certificate.
     tls.flush().map_err(|e| io_failure(&e))?;
-    let server_key = tls
+    let cert = tls
         .conn
         .peer_certificates()
         .and_then(|c| c.first())
-        .and_then(|cert| server_public_key(cert))
-        .ok_or("The RDP server's TLS certificate has no usable key.")?;
+        .ok_or("The RDP server sent no TLS certificate.")?;
+    let sha = check_pin(cert, pin)?;
+    let server_key =
+        server_public_key(cert).ok_or("The RDP server's TLS certificate has no usable key.")?;
+    if pin != Some(sha) {
+        send(tls.sock.out, &FromViewer::Certificate(sha)).map_err(|e| io_failure(&e))?;
+    }
     let upgraded = ironrdp_blocking::mark_as_upgraded(should_upgrade, &mut connector);
     let mut framed = Framed::new(tls);
     let outcome = ironrdp_blocking::connect_finalize(
@@ -420,6 +433,29 @@ fn finalization_pdu(pdu: &[u8], io_channel: u16) -> bool {
             | ShareDataPdu::MonitorLayout(_)
             | ShareDataPdu::FontMap(_)
     )
+}
+
+/// The certificate's SHA-256, unless the window pinned another one:
+/// then nothing more is sent, the login least of all.
+fn check_pin(cert: &[u8], pin: Option<[u8; 32]>) -> Result<[u8; 32], Failure> {
+    use sha2::Digest as _;
+    let sha: [u8; 32] = sha2::Sha256::digest(cert).into();
+    match pin {
+        Some(p) if p != sha => Err(format!(
+            "The RDP server's certificate is not the one it had the first time this desktop \
+             was opened, so FeroSSH did not log in: another program may be listening on the \
+             server's RDP port. Its SHA-256 fingerprint is now {}. If the server got a new \
+             certificate, remove this desktop's line from rdp_certs in FeroSSH's settings \
+             folder.",
+            hex(&sha)
+        )),
+        _ => Ok(sha),
+    }
+}
+
+/// Lower-case hex.
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
 /// TLS on ring, accepting the server's certificate as it is (see the
@@ -1167,6 +1203,18 @@ mod tests {
     use std::net::TcpStream;
     use std::sync::Mutex;
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn a_pinned_certificate_must_match() {
+        use sha2::Digest as _;
+        let cert = b"certificate bytes";
+        let sha: [u8; 32] = sha2::Sha256::digest(cert).into();
+        assert_eq!(check_pin(cert, None), Ok(sha));
+        assert_eq!(check_pin(cert, Some(sha)), Ok(sha));
+        let why = check_pin(cert, Some([0; 32])).unwrap_err();
+        assert!(why.contains(&hex(&sha)), "{why}");
+        assert!(why.contains("did not log in"), "{why}");
+    }
 
     #[test]
     fn an_xrdp_without_tls_says_how_to_fix_it() {

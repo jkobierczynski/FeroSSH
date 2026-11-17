@@ -186,6 +186,33 @@ pub struct Session {
     /// The most the connection allows, which later changes of the global
     /// setting stay within.
     pub clipboard_limit: (bool, bool),
+    /// Where an RDP desktop's certificate is pinned.
+    pub cert: Option<CertStore>,
+}
+
+/// Where an RDP server's certificate is pinned on first use: a file of
+/// `key sha256` lines (as for WinRM's), and this desktop's key in it.
+#[derive(Clone, Debug)]
+pub struct CertStore {
+    pub path: std::path::PathBuf,
+    pub key: String,
+}
+
+impl CertStore {
+    /// The pinned SHA-256, if one is.
+    fn pin(&self) -> Option<[u8; 32]> {
+        let hex = crate::winrm::known_cert(&self.path, &self.key)?;
+        let bytes: Vec<u8> = (0..hex.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(hex.get(i..i + 2)?, 16).ok())
+            .collect::<Option<_>>()?;
+        bytes.try_into().ok()
+    }
+}
+
+/// Lower-case hex.
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
 /// Everything but the password.
@@ -200,6 +227,7 @@ impl std::fmt::Debug for Session {
             .field("fixed", &self.fixed)
             .field("clipboard", &self.clipboard)
             .field("clipboard_limit", &self.clipboard_limit)
+            .field("cert", &self.cert)
             .finish()
     }
 }
@@ -233,6 +261,9 @@ pub struct Desktop {
     clip_out: Option<String>,
     /// The picture just came up: this PC's clipboard may go to it now.
     fresh: bool,
+    /// Where the RDP certificate is pinned, and the pin given to the
+    /// viewer (none the first time).
+    cert: Option<(CertStore, Option<[u8; 32]>)>,
     /// Keeps the viewer process alive; dropping it ends the process.
     _process: Box<dyn Send>,
 }
@@ -274,6 +305,17 @@ impl Desktop {
             layout: session.layout,
             user: session.user.clone(),
         });
+        let cert = match session.protocol {
+            Protocol::Rdp => session.cert.clone().map(|c| {
+                let pin = c.pin();
+                (c, pin)
+            }),
+            Protocol::Vnc => None,
+        };
+        // Before the password, which the viewer waits for to log in.
+        if let Some(pin) = cert.as_ref().and_then(|(_, p)| *p) {
+            let _ = tx.send(ToViewer::CertPin(pin));
+        }
         let (to_host, from_host) = session.clipboard;
         let _ = tx.send(ToViewer::ClipboardRules { to_host, from_host });
 
@@ -389,8 +431,44 @@ impl Desktop {
             clip_in: None,
             clip_out: None,
             fresh: false,
+            cert,
             _process: process,
         })
+    }
+
+    /// The RDP server's certificate, as the viewer saw it before logging
+    /// in: pinned the first time. The viewer refuses a server whose
+    /// certificate is not the pinned one; the window checks again.
+    fn certificate(&mut self, sha: [u8; 32], out: &mut Vec<Update>) {
+        let Some((store, pin)) = self.cert.as_mut() else {
+            return;
+        };
+        match *pin {
+            Some(p) if p == sha => {}
+            Some(_) => self.end(
+                "The RDP server's certificate is not the one it had the first time this \
+                 desktop was opened."
+                    .into(),
+                out,
+            ),
+            None => {
+                *pin = Some(sha);
+                out.push(Update::Note(
+                    match crate::winrm::remember_cert(&store.path, &store.key, &hex(&sha)) {
+                        Ok(()) => format!(
+                            "First time on this desktop: its RDP certificate (SHA-256 {}) is \
+                             now pinned, and a server with another one is not logged in to.",
+                            hex(&sha)
+                        ),
+                        Err(e) => format!(
+                            "The RDP certificate (SHA-256 {}) could not be pinned ({e}); it \
+                             is trusted for this session only.",
+                            hex(&sha)
+                        ),
+                    },
+                ));
+            }
+        }
     }
 
     fn send(&self, msg: ToViewer) {
@@ -456,6 +534,7 @@ impl Desktop {
                     self.clip_in = Some(plain);
                     out.push(Update::Clipboard(text));
                 }
+                Ok(Applied::Other(FromViewer::Certificate(sha))) => self.certificate(sha, &mut out),
                 Ok(Applied::Other(FromViewer::NeedPassword)) => match self.protocol {
                     Protocol::Vnc if self.preset.is_some() => {
                         if let Some(pw) = self.preset.take() {
@@ -792,6 +871,7 @@ mod tests {
             fixed: false,
             clipboard: (true, true),
             clipboard_limit: (true, true),
+            cert: None,
         };
         let mut d =
             Desktop::start(&addr, session, window_out, window_in, Box::new(()), || {}).unwrap();
@@ -836,6 +916,103 @@ mod tests {
             std::thread::sleep(Duration::from_millis(5));
         }
         assert!(!d.running());
+    }
+
+    /// Plays the viewer: reads the window's messages up to the first
+    /// `ClipboardRules`, then says the server's certificate is `sha`.
+    /// Gives back whether the window sent a pin, and which.
+    fn rdp_with_certificate(store: &CertStore, sha: [u8; 32]) -> (Option<[u8; 32]>, Vec<Update>) {
+        let l = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = l.local_addr().unwrap().to_string();
+        std::thread::spawn(move || {
+            let (s, _) = l.accept().unwrap();
+            std::thread::sleep(Duration::from_secs(2));
+            drop(s);
+        });
+        let (mut viewer_in, window_out) = std::io::pipe().unwrap();
+        let (window_in, mut viewer_out) = std::io::pipe().unwrap();
+        let session = Session {
+            protocol: Protocol::Rdp,
+            width: 800,
+            height: 600,
+            layout: 0,
+            user: "me".into(),
+            password: None,
+            fixed: false,
+            clipboard: (false, false),
+            clipboard_limit: (false, false),
+            cert: Some(store.clone()),
+        };
+        let mut d =
+            Desktop::start(&addr, session, window_out, window_in, Box::new(()), || {}).unwrap();
+        let mut pin = None;
+        loop {
+            let frame = read_frame(&mut viewer_in).unwrap().unwrap();
+            match ToViewer::decode(&frame).unwrap() {
+                ToViewer::CertPin(p) => pin = Some(p),
+                ToViewer::ClipboardRules { .. } => break,
+                _ => {}
+            }
+        }
+        write_frame(&mut viewer_out, &FromViewer::Certificate(sha).encode()).unwrap();
+        // A bell after it shows the certificate was dealt with.
+        write_frame(&mut viewer_out, &FromViewer::Bell.encode()).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut seen = Vec::new();
+        while !seen
+            .iter()
+            .any(|u| matches!(u, Update::Bell | Update::Ended(_)))
+        {
+            assert!(Instant::now() < deadline, "{seen:?}");
+            seen.extend(d.poll());
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        seen.retain(|u| *u != Update::Bell);
+        (pin, seen)
+    }
+
+    #[test]
+    fn an_rdp_certificate_is_pinned_the_first_time_and_checked_after() {
+        let dir = std::env::temp_dir().join(format!("ferossh-rdp-pin-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = CertStore {
+            path: dir.join("rdp_certs"),
+            key: "srv.lan:22/rdp:3389".into(),
+        };
+        let (first, other) = ([1u8; 32], [2u8; 32]);
+        // First time: no pin given, the certificate is kept.
+        let (pin, seen) = rdp_with_certificate(&store, first);
+        assert_eq!(pin, None);
+        assert!(
+            matches!(seen.first(), Some(Update::Note(n)) if n.contains("now pinned")),
+            "{seen:?}"
+        );
+        assert_eq!(store.pin(), Some(first));
+        // Next time: the pin goes to the viewer before the password, and
+        // the same certificate is fine.
+        let (pin, seen) = rdp_with_certificate(&store, first);
+        assert_eq!(pin, Some(first));
+        assert!(
+            !seen
+                .iter()
+                .any(|u| matches!(u, Update::Ended(_) | Update::Note(_))),
+            "{seen:?}"
+        );
+        // Another certificate ends the session, and the pin stays.
+        let (pin, seen) = rdp_with_certificate(&store, other);
+        assert_eq!(pin, Some(first));
+        assert!(
+            matches!(seen.first(), Some(Update::Ended(why)) if why.contains("certificate")),
+            "{seen:?}"
+        );
+        assert_eq!(store.pin(), Some(first));
+        // Another desktop has its own pin.
+        let elsewhere = CertStore {
+            key: "srv.lan:22/rdp:3390".into(),
+            ..store.clone()
+        };
+        assert_eq!(elsewhere.pin(), None);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -884,6 +1061,7 @@ mod tests {
             fixed: true,
             clipboard: (false, false),
             clipboard_limit: (true, true),
+            cert: None,
         };
         let mut d =
             Desktop::start(&addr, session, window_out, window_in, Box::new(()), || {}).unwrap();
@@ -919,6 +1097,7 @@ mod tests {
             fixed: true,
             clipboard: (false, false),
             clipboard_limit: (true, true),
+            cert: None,
         };
         let mut d =
             Desktop::start(&addr, session, window_out, window_in, Box::new(()), || {}).unwrap();
@@ -988,6 +1167,7 @@ mod tests {
             fixed: true,
             clipboard: (true, true),
             clipboard_limit: (true, true),
+            cert: None,
         };
         let mut d =
             Desktop::start(&addr, session, window_out, window_in, Box::new(()), || {}).unwrap();

@@ -4362,7 +4362,7 @@ impl Window {
                         self.refresh(pane);
                     }
                     Some(DesktopWant::Tab(want)) => {
-                        self.desktop_tab(connection, want, &host, &addr);
+                        self.desktop_tab(connection, want, &host, port, &addr);
                     }
                     Some(DesktopWant::Vnc {
                         pane,
@@ -5194,7 +5194,14 @@ impl Window {
     /// Opens the built-in viewer on the tunnel at `addr` in a new tab;
     /// `host` is the desktop server as the SSH server reaches it.
     #[cfg(feature = "viewer")]
-    fn desktop_tab(&mut self, connection: ChannelId, want: TabWant, host: &str, addr: &str) {
+    fn desktop_tab(
+        &mut self,
+        connection: ChannelId,
+        want: TabWant,
+        host: &str,
+        port: u16,
+        addr: &str,
+    ) {
         let TabWant {
             label,
             user,
@@ -5233,6 +5240,7 @@ impl Window {
             fixed: size.is_some(),
             clipboard: self.desktop_clip(clip_limit),
             clipboard_limit: clip_limit,
+            cert: self.rdp_cert_store(connection, port),
         };
         let script = vdesk.map(|(_, channel)| channel);
         // From here its tab decides: closing it, or a viewer that never
@@ -5273,8 +5281,36 @@ impl Window {
         self.update_title();
     }
 
+    /// Where the certificate of the RDP server on port `port` of
+    /// connection `connection`'s SSH server is pinned: one per SSH host
+    /// (as its host key names it) and port.
+    #[cfg(feature = "viewer")]
+    fn rdp_cert_store(
+        &self,
+        connection: ChannelId,
+        port: u16,
+    ) -> Option<crate::desktop::CertStore> {
+        let pane = self.pane_of_channel(connection)?;
+        let Host::Ssh(s) = &self.panes.get(&pane)?.host else {
+            return None;
+        };
+        let (host, ssh_port) = s.target.key_host();
+        Some(crate::desktop::CertStore {
+            path: app_dir().join("rdp_certs"),
+            key: format!("[{}]:{ssh_port}/rdp:{port}", host.to_ascii_lowercase()),
+        })
+    }
+
     #[cfg(not(feature = "viewer"))]
-    fn desktop_tab(&mut self, _connection: ChannelId, _want: TabWant, _host: &str, _addr: &str) {}
+    fn desktop_tab(
+        &mut self,
+        _connection: ChannelId,
+        _want: TabWant,
+        _host: &str,
+        _port: u16,
+        _addr: &str,
+    ) {
+    }
 
     /// Gives each remote desktop its pane's size, after the layout
     /// settled.
