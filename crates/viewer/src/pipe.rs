@@ -110,7 +110,7 @@ pub enum ToViewer {
     /// The SHA-256 of the RDP server's TLS certificate as it was the first
     /// time: a server with another one is not logged in to. Sent before
     /// [`ToViewer::Password`]; none means this is the first time.
-    CertPin([u8; 32]),
+    PinnedFingerprint([u8; 32]),
 }
 
 /// Viewer to window.
@@ -148,7 +148,7 @@ pub enum FromViewer {
     /// The SHA-256 of the RDP server's TLS certificate, once the
     /// handshake is done and before the login starts: the window keeps it
     /// as the pin for the next time.
-    Certificate([u8; 32]),
+    Fingerprint([u8; 32]),
 }
 
 /// Writes one frame. The body is not copied, so a password in it leaves
@@ -367,7 +367,7 @@ impl ToViewer {
             ToViewer::ClipboardRules { to_host, from_host } => {
                 v.extend([12, u8::from(*to_host), u8::from(*from_host)]);
             }
-            ToViewer::CertPin(sha) => {
+            ToViewer::PinnedFingerprint(sha) => {
                 v.push(13);
                 v.extend(sha);
             }
@@ -425,7 +425,7 @@ impl ToViewer {
                 to_host: f.flag()?,
                 from_host: f.flag()?,
             },
-            13 => ToViewer::CertPin(f.take(32)?.try_into().ok()?),
+            13 => ToViewer::PinnedFingerprint(f.take(32)?.try_into().ok()?),
             _ => return None,
         };
         f.end()?;
@@ -494,7 +494,7 @@ impl FromViewer {
                 v.extend(clip_bytes(text));
             }
             FromViewer::NoPassword => v.push(10),
-            FromViewer::Certificate(sha) => {
+            FromViewer::Fingerprint(sha) => {
                 v.push(11);
                 v.extend(sha);
             }
@@ -549,7 +549,7 @@ impl FromViewer {
             8 => FromViewer::Failed(f.text()?),
             9 => FromViewer::Clipboard(f.clip()?),
             10 => FromViewer::NoPassword,
-            11 => FromViewer::Certificate(f.take(32)?.try_into().ok()?),
+            11 => FromViewer::Fingerprint(f.take(32)?.try_into().ok()?),
             _ => return None,
         };
         f.end()?;
@@ -611,7 +611,7 @@ mod tests {
                 to_host: true,
                 from_host: false,
             },
-            ToViewer::CertPin([7; 32]),
+            ToViewer::PinnedFingerprint([7; 32]),
         ] {
             assert_eq!(ToViewer::decode(&m.encode()), Some(m));
         }
@@ -642,7 +642,7 @@ mod tests {
             FromViewer::NoPassword,
             FromViewer::Failed("no".into()),
             FromViewer::Clipboard("line\nnext".into()),
-            FromViewer::Certificate([9; 32]),
+            FromViewer::Fingerprint([9; 32]),
         ] {
             assert_eq!(FromViewer::decode(&m.encode()), Some(m));
         }

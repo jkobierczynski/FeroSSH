@@ -5240,7 +5240,7 @@ impl Window {
             fixed: size.is_some(),
             clipboard: self.desktop_clip(clip_limit),
             clipboard_limit: clip_limit,
-            cert: self.rdp_cert_store(connection, port),
+            pins: self.rdp_pin_store(connection, port),
         };
         let script = vdesk.map(|(_, channel)| channel);
         // From here its tab decides: closing it, or a viewer that never
@@ -5285,17 +5285,13 @@ impl Window {
     /// connection `connection`'s SSH server is pinned: one per SSH host
     /// (as its host key names it) and port.
     #[cfg(feature = "viewer")]
-    fn rdp_cert_store(
-        &self,
-        connection: ChannelId,
-        port: u16,
-    ) -> Option<crate::desktop::CertStore> {
+    fn rdp_pin_store(&self, connection: ChannelId, port: u16) -> Option<crate::desktop::PinStore> {
         let pane = self.pane_of_channel(connection)?;
         let Host::Ssh(s) = &self.panes.get(&pane)?.host else {
             return None;
         };
         let (host, ssh_port) = s.target.key_host();
-        Some(crate::desktop::CertStore {
+        Some(crate::desktop::PinStore {
             path: app_dir().join("rdp_certs"),
             key: format!("[{}]:{ssh_port}/rdp:{port}", host.to_ascii_lowercase()),
         })

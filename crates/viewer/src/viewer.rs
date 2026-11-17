@@ -188,7 +188,7 @@ fn vnc_session(
             ToViewer::ClipboardRules { to_host, from_host } => {
                 client.clipboard_rules(to_host, from_host);
             }
-            ToViewer::Start { .. } | ToViewer::User(_) | ToViewer::CertPin(_) => {}
+            ToViewer::Start { .. } | ToViewer::User(_) | ToViewer::PinnedFingerprint(_) => {}
         }
         flush(&mut client, &mut output)?;
         if client.failed() {

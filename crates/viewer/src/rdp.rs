@@ -10,11 +10,11 @@
 //! checked, and xrdp and Windows use self-signed certificates anyway. TLS
 //! still verifies that the server holds the certificate's key, and NLA
 //! binds the login to that key. The certificate is pinned on first use:
-//! the window gives its SHA-256 from the last time ([`ToViewer::CertPin`])
+//! the window gives its SHA-256 from the last time ([`ToViewer::PinnedFingerprint`])
 //! and a server with another one is not logged in to, so another program
 //! listening on the server's RDP port while the real service is down
 //! gets no login. Each new certificate goes back to the window
-//! ([`FromViewer::Certificate`]) before the login starts. That holds only for a desktop on the SSH
+//! ([`FromViewer::Fingerprint`]) before the login starts. That holds only for a desktop on the SSH
 //! server (`localhost` or a loopback address there), so the window opens
 //! this viewer for no other RDP host (`forwards::on_ssh_host`); a desktop
 //! on another machine behind the SSH server goes to Remote Desktop
@@ -177,7 +177,7 @@ pub(crate) fn session(
     let password = loop {
         match from.recv() {
             Ok(Item::Msg(ToViewer::User(u))) => user = u,
-            Ok(Item::Msg(ToViewer::CertPin(sha))) => pin = Some(sha),
+            Ok(Item::Msg(ToViewer::PinnedFingerprint(sha))) => pin = Some(sha),
             Ok(Item::Msg(ToViewer::ClipboardRules { to_host, from_host })) => {
                 (clip.to_host, clip.from_host) = (to_host, from_host);
             }
@@ -385,7 +385,7 @@ fn run<W: Write>(
     let server_key =
         server_public_key(cert).ok_or("The RDP server's TLS certificate has no usable key.")?;
     if pin != Some(sha) {
-        send(tls.sock.out, &FromViewer::Certificate(sha)).map_err(|e| io_failure(&e))?;
+        send(tls.sock.out, &FromViewer::Fingerprint(sha)).map_err(|e| io_failure(&e))?;
     }
     let upgraded = ironrdp_blocking::mark_as_upgraded(should_upgrade, &mut connector);
     let mut framed = Framed::new(tls);
@@ -1205,7 +1205,7 @@ mod tests {
     use std::time::{Duration, Instant};
 
     #[test]
-    fn a_pinned_certificate_must_match() {
+    fn a_pinned_fingerprint_must_match() {
         use sha2::Digest as _;
         let cert = b"certificate bytes";
         let sha: [u8; 32] = sha2::Sha256::digest(cert).into();
