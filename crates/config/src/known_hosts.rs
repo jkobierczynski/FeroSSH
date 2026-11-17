@@ -321,9 +321,7 @@ pub fn add(path: &Path, host: &str, port: u16, key: &[u8]) -> io::Result<()> {
         }
         text.push_str(&line);
         text.push('\n');
-        let tmp = path.with_extension("ferossh-tmp");
-        fs::write(&tmp, text)?;
-        return fs::rename(&tmp, path);
+        return replace_file(path, text.as_bytes());
     }
     let mut file = fs::OpenOptions::new()
         .create(true)
@@ -355,9 +353,38 @@ pub fn replace(path: &Path, host: &str, port: u16, key: &[u8]) -> io::Result<()>
     if let Some(dir) = path.parent() {
         fs::create_dir_all(dir)?;
     }
-    let tmp = path.with_extension("ferossh-tmp");
-    fs::write(&tmp, out)?;
-    fs::rename(&tmp, path)
+    replace_file(path, out.as_bytes())
+}
+
+/// Writes `data` to `path` through a fresh temporary file next to it,
+/// then renames it into place. The temporary file is created new, never
+/// opened over an existing one, so it can never be another file the
+/// user named (a second known_hosts called `pin.ferossh-tmp`, say).
+fn replace_file(path: &Path, data: &[u8]) -> io::Result<()> {
+    let name = path.file_name().unwrap_or_default().to_string_lossy();
+    for n in 0u32..1000 {
+        let tmp = path.with_file_name(format!(".{name}.{}-{n}.ferossh-tmp", std::process::id()));
+        let mut file = match fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&tmp)
+        {
+            Ok(f) => f,
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e),
+        };
+        let written = file.write_all(data).and_then(|()| file.sync_all());
+        drop(file);
+        if let Err(e) = written.and_then(|()| fs::rename(&tmp, path)) {
+            let _ = fs::remove_file(&tmp);
+            return Err(e);
+        }
+        return Ok(());
+    }
+    Err(io::Error::new(
+        io::ErrorKind::AlreadyExists,
+        "no free temporary file name next to the known_hosts file",
+    ))
 }
 
 /// The text of the known_hosts file at `path`; empty when it does not
