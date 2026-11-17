@@ -35,7 +35,7 @@ use ferossh_config::{
     ForwardSpec, SessionKind, Settings, WindowColours, mobaxterm, mremoteng, putty, securecrt,
     ssh_config, winscp,
 };
-use ferossh_forward::x11::{Display, find_cookie, xauth_entries};
+use ferossh_forward::x11::{Display, MIT_COOKIE, find_cookie, xauth_entries};
 use ferossh_ipc::{
     ChannelId, DirEntry, FORWARD_IDS, Message, MoshOptions, MoshPredict, ServerStats, SftpReply,
     X11Auth,
@@ -125,7 +125,7 @@ use crate::files::{self, Arrange, Follow};
 use crate::files_panel;
 use crate::form_view;
 use crate::forwards::{
-    ConnView, DesktopEvent, Forwarder, FwdView, Setup as ForwardSetup, desktop_port_for,
+    ConnView, DesktopEvent, Forwarder, FwdView, Setup as ForwardSetup, X11Setup, desktop_port_for,
 };
 use crate::fwd_panel;
 use crate::fwdview::{ForwardsView, FwdAction};
@@ -4004,10 +4004,12 @@ impl Window {
         Display::parse(&text).ok_or(text)
     }
 
-    /// X11 forwarding for a new shell in pane `id`: the screen and the
-    /// cookie the X server expects, from `XAUTHORITY` or `~/.Xauthority`
-    /// (none, for an X server without access control).
-    fn x11_auth(&mut self, id: PaneId) -> Option<X11Auth> {
+    /// X11 forwarding for a new shell in pane `id`, on connection `shared`
+    /// when it shares one: the screen and the fake cookie the server gets.
+    /// The real cookie never goes to the worker: the forwards engine swaps
+    /// it in (see [`X11Setup`]). A shared connection keeps the fake cookie
+    /// its first shell got, as the worker does.
+    fn x11_auth(&mut self, id: PaneId, shared: Option<ChannelId>) -> Option<X11Auth> {
         let display = match self.x11_display() {
             Ok(d) => d,
             Err(text) => {
@@ -4020,18 +4022,36 @@ impl Window {
                 return None;
             }
         };
+        let earlier = shared.and_then(|conn| {
+            self.panes.values().find_map(|p| match &p.host {
+                Host::Ssh(s) if s.connection == conn && s.channel == conn => {
+                    s.x11.as_ref().map(|a| a.cookie.clone())
+                }
+                _ => None,
+            })
+        });
+        let cookie = match earlier {
+            Some(c) => c,
+            None => X11Setup::new_fake()?.to_vec(),
+        };
+        Some(X11Auth {
+            screen: display.screen,
+            protocol: MIT_COOKIE.to_owned(),
+            cookie,
+        })
+    }
+
+    /// The authorisation the X server at `display` expects, from
+    /// `XAUTHORITY` or `~/.Xauthority` (none, for an X server without
+    /// access control).
+    fn x11_real_auth(display: &Display) -> (String, Vec<u8>) {
         let file = std::env::var_os("XAUTHORITY")
             .map(PathBuf::from)
             .unwrap_or_else(|| home().join(".Xauthority"));
         let entries = std::fs::read(file)
             .map(|b| xauth_entries(&b))
             .unwrap_or_default();
-        let (protocol, cookie) = find_cookie(&entries, &display).unwrap_or_default();
-        Some(X11Auth {
-            screen: display.screen,
-            protocol,
-            cookie,
-        })
+        find_cookie(&entries, display).unwrap_or_default()
     }
 
     /// A fresh login in pane `id`: starts the connection's forwards (an
@@ -4045,13 +4065,28 @@ impl Window {
         }
         let target = s.target.clone();
         let connection = s.connection;
+        // The fake cookie the worker gave the server.
+        let fake = s
+            .x11
+            .as_ref()
+            .and_then(|a| <[u8; 16]>::try_from(a.cookie.as_slice()).ok());
         let x11 = target
             .forward_x11
             .then(|| self.x11_display().ok())
-            .flatten();
+            .flatten()
+            .zip(fake)
+            .map(|(display, fake)| {
+                let (real_name, real_data) = Self::x11_real_auth(&display);
+                X11Setup {
+                    display,
+                    fake,
+                    real_name,
+                    real_data: Zeroizing::new(real_data),
+                }
+            });
         let mut notes: Vec<String> = target.forwards.iter().map(ToString::to_string).collect();
-        if let Some(d) = &x11 {
-            notes.push(format!("X11 to {d}"));
+        if let Some(x) = &x11 {
+            notes.push(format!("X11 to {}", x.display));
         }
         let Some(w) = self.workers.get(&connection) else {
             return;
@@ -5899,7 +5934,10 @@ impl Window {
             );
         }
         self.apply_look(id, &target.alias, &target.hostname, target.tag.as_deref());
-        let x11 = target.forward_x11.then(|| self.x11_auth(id)).flatten();
+        let x11 = target
+            .forward_x11
+            .then(|| self.x11_auth(id, shared))
+            .flatten();
         let legacy = self
             .settings
             .profile(&target.alias)

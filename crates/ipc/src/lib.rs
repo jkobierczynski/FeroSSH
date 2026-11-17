@@ -290,10 +290,14 @@ impl Default for Timing {
     }
 }
 
+/// X11 forwarding for a shell: the screen, and the fake cookie the
+/// server gets in the `x11-req` (a 16-byte `MIT-MAGIC-COOKIE-1`). The real
+/// cookie stays in the window, which checks each X connection's setup for
+/// the fake one and swaps in the real one itself.
 #[derive(Clone, PartialEq, Eq, Default)]
 pub struct X11Auth {
     pub screen: u32,
-    /// Usually `MIT-MAGIC-COOKIE-1`.
+    /// `MIT-MAGIC-COOKIE-1`.
     pub protocol: String,
     pub cookie: Vec<u8>,
 }

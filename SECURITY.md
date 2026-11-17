@@ -70,6 +70,13 @@ The window treats both as if an attacker had taken them over:
   worker cannot use your keys to sign anything else. Host keys are
   checked against `known_hosts` in the window.
 - Forwarded connections must stay within their flow-control window.
+- The real X11 cookie never reaches the worker. The worker gets only the
+  fake cookie the server gets, and the window checks each X connection's
+  setup for that fake cookie itself, and puts the real one in its place,
+  before it connects to the X server. A taken-over worker can still open
+  X connections with the fake cookie, as the server can: X11 forwarding
+  trusts the server with your X display, which is why it is off unless a
+  host turns it on.
 - Text from the server or the viewer (banners, prompts, titles) is
   stripped of control and bidirectional-override characters before it is
   shown.

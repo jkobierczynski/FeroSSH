@@ -11,16 +11,16 @@
 //!
 //! Untrusted bytes are parsed here, inside the sandbox: SOCKS requests
 //! from local programs, and X11 connection setups from the server, where
-//! the fake cookie the server was given is checked and swapped for the
-//! real one.
+//! the fake cookie the server was given is checked. The real cookie never
+//! comes here: the UI checks the setup again and swaps it in.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use ferossh_forward::socks::{self, Handshake, Step};
-use ferossh_forward::x11::{MAX_SETUP, Setup, swap_cookie};
-use ferossh_ipc::{ChannelId, MAX_DATA_CHUNK, Message, STREAM_WINDOW, X11Auth};
+use ferossh_forward::x11::{MAX_SETUP, MIT_COOKIE, Setup, swap_cookie};
+use ferossh_ipc::{ChannelId, MAX_DATA_CHUNK, Message, STREAM_WINDOW};
 use russh::client::Msg;
 use russh::{Channel, ChannelMsg};
 use tokio::sync::mpsc;
@@ -47,7 +47,6 @@ pub(crate) enum Incoming {
     X11 {
         connection: ChannelId,
         fake: [u8; 16],
-        real: X11Auth,
         origin: (String, u32),
     },
 }
@@ -429,11 +428,9 @@ pub(crate) async fn incoming(
         Incoming::X11 {
             connection,
             fake,
-            real,
             origin,
         } => {
-            let setup =
-                tokio::time::timeout(HANDSHAKE_TIMEOUT, x11_setup(&mut channel, &fake, &real));
+            let setup = tokio::time::timeout(HANDSHAKE_TIMEOUT, x11_setup(&mut channel, &fake));
             match setup.await {
                 Ok(Some(bytes)) => (connection, true, origin, bytes),
                 // A wrong cookie, junk, or too slow: the X server never
@@ -462,9 +459,11 @@ pub(crate) async fn incoming(
     finish(id, result, &out, &connections).await;
 }
 
-/// Reads an X client's connection setup and returns it with the real
-/// authorisation, or `None` for a wrong cookie.
-async fn x11_setup(channel: &mut Channel<Msg>, fake: &[u8], real: &X11Auth) -> Option<Vec<u8>> {
+/// Reads an X client's connection setup and returns it as it is, or
+/// `None` for a wrong cookie. The UI checks it again and swaps in the real
+/// authorisation, which this process never has: this check only keeps
+/// junk and wrong guesses from the server off the pipe.
+async fn x11_setup(channel: &mut Channel<Msg>, fake: &[u8]) -> Option<Vec<u8>> {
     let mut buf = Vec::new();
     loop {
         match channel.wait().await? {
@@ -472,7 +471,7 @@ async fn x11_setup(channel: &mut Channel<Msg>, fake: &[u8], real: &X11Auth) -> O
             ChannelMsg::Eof | ChannelMsg::Close => return None,
             _ => continue,
         }
-        match swap_cookie(&buf, fake, &real.protocol, &real.cookie) {
+        match swap_cookie(&buf, fake, MIT_COOKIE, fake) {
             Setup::Ready(bytes) => return Some(bytes),
             Setup::Refuse => return None,
             Setup::More if buf.len() > MAX_SETUP => return None,
