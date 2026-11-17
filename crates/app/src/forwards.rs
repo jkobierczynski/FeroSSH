@@ -5,8 +5,11 @@
 //! The sandboxed worker cannot use loopback, so every socket on this PC is
 //! here; the worker holds the SSH channels, and each forwarded connection
 //! is a stream channel on the pipe between them, with credit-based flow
-//! control (see the `ipc` crate). This side never parses what flows
-//! through: SOCKS requests and X11 setups go to the worker as they are.
+//! control (see the `ipc` crate). This side parses one thing that flows
+//! through: an X client's connection setup, whose fake cookie it checks
+//! and swaps for the real one before anything reaches the X server (see
+//! [`X11Setup`]). Everything else, SOCKS requests included, goes to the
+//! worker as it is.
 //!
 //! [`Forwarder`] runs on its own thread with a small tokio runtime, so a
 //! busy forward never slows the window. The window starts and stops a
@@ -29,16 +32,19 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use ferossh_config::{ForwardKind, ForwardSpec};
-use ferossh_forward::x11::Display;
+use ferossh_forward::x11::{Display, MAX_SETUP, Setup as XSetup, swap_cookie};
 use ferossh_ipc::{ChannelId, FORWARD_IDS, MAX_DATA_CHUNK, Message, STREAM_WINDOW, WORKER_IDS};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 use tokio::task::AbortHandle;
+use zeroize::Zeroizing;
 
 /// How long connecting to a remote forward's target or the X server may
 /// take.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+/// How long an X client's connection setup may take to arrive.
+const X11_SETUP_TIMEOUT: Duration = Duration::from_secs(30);
 /// Open connections listed per forward in the view.
 const LISTED_STREAMS: usize = 8;
 /// Remote desktop tunnels listen on a port in this range, picked from the
@@ -114,8 +120,52 @@ pub struct Setup {
     /// `GatewayPorts yes`: local listeners without an address listen on
     /// every interface.
     pub gateway_ports: bool,
-    /// X11 forwarding to this display.
-    pub x11: Option<Display>,
+    /// X11 forwarding.
+    pub x11: Option<X11Setup>,
+}
+
+/// X11 forwarding for a connection.
+///
+/// The worker only ever learns `fake`, which it hands the server in the
+/// `x11-req`. The real authorisation stays in this process: each X stream
+/// the worker opens must start with a setup carrying `fake`, which is
+/// swapped for the real one here, so a taken-over worker can neither read
+/// the X server's cookie nor reach the X server with a setup of its own
+/// making. It still can with `fake`, as the server can: that is what
+/// forwarding X11 to a server means.
+#[derive(Clone)]
+pub struct X11Setup {
+    pub display: Display,
+    /// The cookie the server got.
+    pub fake: [u8; 16],
+    /// The X server's authorisation protocol and data, both empty for an X
+    /// server without access control.
+    pub real_name: String,
+    pub real_data: Zeroizing<Vec<u8>>,
+}
+
+impl X11Setup {
+    /// A fresh fake cookie, for the `X11Auth` the worker gets.
+    pub fn new_fake() -> Option<[u8; 16]> {
+        let mut fake = [0u8; 16];
+        getrandom::fill(&mut fake).ok()?;
+        Some(fake)
+    }
+
+    /// The setup with the fake cookie swapped for the real authorisation,
+    /// or `Refuse`.
+    fn check(&self, buf: &[u8]) -> XSetup {
+        swap_cookie(buf, &self.fake, &self.real_name, &self.real_data)
+    }
+}
+
+impl std::fmt::Debug for X11Setup {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("X11Setup")
+            .field("display", &self.display)
+            .field("real_name", &self.real_name)
+            .finish_non_exhaustive()
+    }
 }
 
 /// Where a forward stands.
@@ -432,7 +482,7 @@ struct Fwd {
 }
 
 struct X11 {
-    display: Display,
+    setup: Arc<X11Setup>,
     total: u64,
     error: Option<String>,
 }
@@ -589,8 +639,8 @@ impl Engine {
                         label,
                         gateway_ports: setup.gateway_ports,
                         forwards: Vec::new(),
-                        x11: setup.x11.map(|display| X11 {
-                            display,
+                        x11: setup.x11.map(|setup| X11 {
+                            setup: Arc::new(setup),
                             total: 0,
                             error: None,
                         }),
@@ -1008,6 +1058,7 @@ impl Engine {
         tokio::spawn(relay(
             id,
             Ok(socket),
+            None,
             (rx, unwritten),
             self.to_worker.clone(),
             self.internal.clone(),
@@ -1126,23 +1177,25 @@ impl Engine {
             self.conns.get_mut(&listener).and_then(|c| {
                 let x = c.x11.as_mut()?;
                 x.total += 1;
+                let d = &x.setup.display;
                 Some((
                     Owner::X11(listener),
-                    (x.display.host.clone(), x.display.port()),
+                    (d.host.clone(), d.port()),
+                    Some(x.setup.clone()),
                 ))
             })
         } else {
             self.conns.iter_mut().find_map(|(conn, c)| {
                 let f = c.forwards.iter_mut().find(|f| f.remote == Some(listener))?;
                 f.total += 1;
-                Some((Owner::Fwd(*conn, f.key), f.spec.target.clone()?))
+                Some((Owner::Fwd(*conn, f.key), f.spec.target.clone()?, None))
             })
         };
-        let Some((owner, (host, port))) = found else {
+        let Some((owner, (host, port), x11)) = found else {
             self.send(Message::Close { channel });
             return;
         };
-        let (tx, rx) = mpsc::unbounded_channel();
+        let (tx, mut rx) = mpsc::unbounded_channel();
         let unwritten = Arc::new(AtomicU32::new(0));
         let label = format!(
             "{} → {}",
@@ -1170,8 +1223,28 @@ impl Engine {
         };
         let (to_worker, internal) = (self.to_worker.clone(), self.internal.clone());
         tokio::spawn(async move {
+            // An X stream connects only once its setup carried the fake
+            // cookie: the worker's word that it did is not enough.
+            let first = match x11 {
+                Some(x) => {
+                    match tokio::time::timeout(X11_SETUP_TIMEOUT, x11_setup(&mut rx, &x)).await {
+                        Ok(Some(first)) => Some(first),
+                        _ => {
+                            let _ = internal.send(Internal::Ended {
+                                channel,
+                                why: Some(
+                                    "An X11 connection without the right cookie was refused."
+                                        .to_owned(),
+                                ),
+                            });
+                            return;
+                        }
+                    }
+                }
+                None => None,
+            };
             let socket = connect.await;
-            relay(channel, socket, (rx, unwritten), to_worker, internal).await;
+            relay(channel, socket, first, (rx, unwritten), to_worker, internal).await;
         });
     }
 
@@ -1214,7 +1287,7 @@ impl Engine {
                     })
                     .collect(),
                 x11: c.x11.as_ref().map(|x| X11View {
-                    display: x.display.to_string(),
+                    display: x.setup.display.to_string(),
                     open: open.get(&Owner::X11(connection)).map_or(0, |(n, _)| *n),
                     total: x.total,
                     error: x.error.clone(),
@@ -1349,12 +1422,40 @@ async fn listen(
     }
 }
 
+/// Reads an X client's connection setup from the worker's first data on
+/// stream, checks its cookie, and returns the setup with the real
+/// authorisation (and whatever followed it) and how many bytes of the
+/// worker's it stands for; `None` for a wrong cookie, junk, or a stream
+/// that ends first.
+async fn x11_setup(
+    from_worker: &mut UnboundedReceiver<ToSocket>,
+    x11: &X11Setup,
+) -> Option<(Vec<u8>, u32)> {
+    let mut buf = Vec::new();
+    loop {
+        match from_worker.recv().await? {
+            ToSocket::Data(bytes) => buf.extend_from_slice(&bytes),
+            // Credit for the other way: nothing went that way yet.
+            ToSocket::Window(_) => continue,
+            ToSocket::Eof | ToSocket::Close => return None,
+        }
+        match x11.check(&buf) {
+            XSetup::Ready(bytes) => return Some((bytes, u32::try_from(buf.len()).ok()?)),
+            XSetup::Refuse => return None,
+            XSetup::More if buf.len() > MAX_SETUP => return None,
+            XSetup::More => {}
+        }
+    }
+}
+
 /// Moves one stream's bytes between its socket and the worker, within the
-/// stream windows. Ends when the worker ends the stream or the socket
-/// fails.
+/// stream windows; `first` is written before anything else, and stands
+/// for that many of the worker's bytes. Ends when the worker ends the
+/// stream or the socket fails.
 async fn relay(
     channel: ChannelId,
     socket: Result<TcpStream, String>,
+    first: Option<(Vec<u8>, u32)>,
     (mut from_worker, unwritten): (UnboundedReceiver<ToSocket>, Arc<AtomicU32>),
     to_worker: ToWorker,
     events: UnboundedSender<Internal>,
@@ -1373,16 +1474,20 @@ async fn relay(
     let (mut read, mut write) = socket.into_split();
     // Writes wait for the program at the other end; they run in their own
     // task so reading goes on meanwhile. Credit goes back once written.
-    let (wtx, mut wrx) = mpsc::unbounded_channel::<Option<Vec<u8>>>();
+    // Each write carries the worker's bytes it stands for: the same
+    // number, except for an X setup with its cookie swapped.
+    let (wtx, mut wrx) = mpsc::unbounded_channel::<Option<(Vec<u8>, u32)>>();
+    if let Some(first) = first {
+        let _ = wtx.send(Some(first));
+    }
     let tw = to_worker.clone();
     let writer = tokio::spawn(async move {
         while let Some(item) = wrx.recv().await {
             match item {
-                Some(bytes) => {
+                Some((bytes, n)) => {
                     if write.write_all(&bytes).await.is_err() {
                         return false;
                     }
-                    let n = u32::try_from(bytes.len()).unwrap_or(u32::MAX);
                     unwritten.fetch_sub(n.min(unwritten.load(Ordering::SeqCst)), Ordering::SeqCst);
                     tw(Message::Window { channel, bytes: n });
                 }
@@ -1416,7 +1521,8 @@ async fn relay(
             },
             msg = from_worker.recv() => match msg {
                 Some(ToSocket::Data(bytes)) => {
-                    if wtx.send(Some(bytes)).is_err() {
+                    let n = u32::try_from(bytes.len()).unwrap_or(u32::MAX);
+                    if wtx.send(Some((bytes, n))).is_err() {
                         break None;
                     }
                 }
@@ -1438,6 +1544,7 @@ async fn relay(
 #[allow(clippy::unwrap_used, clippy::indexing_slicing, clippy::panic)]
 mod tests {
     use super::*;
+    use ferossh_forward::x11::{MIT_COOKIE, X11_BASE_PORT as X11_BASE};
 
     #[test]
     fn only_loopback_desktops_are_on_the_ssh_host() {
@@ -1760,6 +1867,159 @@ mod tests {
         let error = view[0].forwards[0].error.clone().unwrap_or_default();
         assert!(error.contains("stream window"), "{view:?}");
         assert_eq!(view[0].forwards[0].open, 0);
+    }
+
+    const FAKE: [u8; 16] = [7; 16];
+    const REAL: [u8; 16] = [9; 16];
+
+    /// An X client's connection setup, little-endian.
+    fn x_setup(name: &[u8], data: &[u8]) -> Vec<u8> {
+        let pad = |v: &mut Vec<u8>| v.resize(v.len().next_multiple_of(4), 0);
+        let mut b = vec![b'l', 0, 11, 0, 0, 0];
+        b.extend_from_slice(&u16::try_from(name.len()).unwrap().to_le_bytes());
+        b.extend_from_slice(&u16::try_from(data.len()).unwrap().to_le_bytes());
+        b.extend_from_slice(&[0, 0]);
+        b.extend_from_slice(name);
+        pad(&mut b);
+        b.extend_from_slice(data);
+        pad(&mut b);
+        b
+    }
+
+    /// An engine with X11 on for connection 1, to a listener that stands
+    /// for the X server.
+    fn x11_engine() -> (Forwarder, Arc<Mutex<Vec<Message>>>, std::net::TcpListener) {
+        let (listener, number) = (100..400)
+            .find_map(|n| {
+                std::net::TcpListener::bind(("127.0.0.1", X11_BASE + n))
+                    .ok()
+                    .map(|l| (l, n))
+            })
+            .unwrap();
+        let (fwd, sent) = engine();
+        fwd.start(
+            1,
+            "me@box".into(),
+            Setup {
+                x11: Some(X11Setup {
+                    display: Display::parse(&format!("127.0.0.1:{number}")).unwrap(),
+                    fake: FAKE,
+                    real_name: MIT_COOKIE.into(),
+                    real_data: REAL.to_vec().into(),
+                }),
+                ..Setup::default()
+            },
+        );
+        (fwd, sent, listener)
+    }
+
+    fn x11_incoming(fwd: &Forwarder, channel: ChannelId) {
+        fwd.sink()(Message::ForwardIncoming {
+            channel,
+            listener: 1,
+            x11: true,
+            origin_host: "h".into(),
+            origin_port: 1,
+        });
+    }
+
+    fn closed(sent: &Mutex<Vec<Message>>, channel: ChannelId) {
+        wait_for(|| {
+            sent.lock()
+                .unwrap()
+                .iter()
+                .any(|m| *m == Message::Close { channel })
+                .then_some(())
+        });
+    }
+
+    #[test]
+    fn x11_setups_from_the_worker_are_checked_here() {
+        let (fwd, sent, x_server) = x11_engine();
+        x_server.set_nonblocking(true).unwrap();
+        // A taken-over worker vouches for setups without the fake cookie:
+        // none, the real cookie guessed, or junk. None reaches the X
+        // server.
+        let bad = [
+            x_setup(b"", b""),
+            x_setup(MIT_COOKIE.as_bytes(), &REAL),
+            x_setup(MIT_COOKIE.as_bytes(), &FAKE[..15]),
+            x_setup(b"XDM-AUTHORIZATION-1", &FAKE),
+            b"GET / HTTP/1.1\r\n\r\n".to_vec(),
+        ];
+        for (i, setup) in bad.into_iter().enumerate() {
+            let channel = WORKER_IDS + u32::try_from(i).unwrap();
+            x11_incoming(&fwd, channel);
+            fwd.sink()(Message::Data {
+                channel,
+                bytes: setup,
+            });
+            closed(&sent, channel);
+        }
+        // So is a stream that ends before its setup is complete.
+        let channel = WORKER_IDS + 10;
+        x11_incoming(&fwd, channel);
+        fwd.sink()(Message::Data {
+            channel,
+            bytes: x_setup(MIT_COOKIE.as_bytes(), &FAKE)[..20].to_vec(),
+        });
+        fwd.sink()(Message::Eof { channel });
+        closed(&sent, channel);
+        std::thread::sleep(Duration::from_millis(100));
+        assert_eq!(
+            x_server.accept().map(|_| ()).unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock,
+            "a refused X stream reached the X server"
+        );
+        let view = fwd.view();
+        let error = view[0]
+            .x11
+            .as_ref()
+            .unwrap()
+            .error
+            .clone()
+            .unwrap_or_default();
+        assert!(error.contains("cookie"), "{view:?}");
+    }
+
+    #[test]
+    fn x11_setups_get_the_real_cookie_here() {
+        let (fwd, sent, x_server) = x11_engine();
+        let channel = WORKER_IDS;
+        x11_incoming(&fwd, channel);
+        // The setup in two pieces, with the client's first request after it.
+        let mut setup = x_setup(MIT_COOKIE.as_bytes(), &FAKE);
+        setup.extend_from_slice(b"next");
+        let (a, b) = setup.split_at(17);
+        fwd.sink()(Message::Data {
+            channel,
+            bytes: a.to_vec(),
+        });
+        fwd.sink()(Message::Data {
+            channel,
+            bytes: b.to_vec(),
+        });
+        let (mut s, _) = x_server.accept().unwrap();
+        s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let mut want = x_setup(MIT_COOKIE.as_bytes(), &REAL);
+        want.extend_from_slice(b"next");
+        let mut got = vec![0u8; want.len()];
+        std::io::Read::read_exact(&mut s, &mut got).unwrap();
+        assert_eq!(got, want);
+        // The worker gets credit for what it sent, whatever was written.
+        let n = u32::try_from(setup.len()).unwrap();
+        wait_for(|| {
+            let credit: u32 = sent
+                .lock()
+                .unwrap()
+                .iter()
+                .filter_map(|m| match m {
+                    Message::Window { channel: c, bytes } if *c == channel => Some(*bytes),
+                    _ => None,
+                })
+                .sum();
+            (credit == n).then_some(())
+        });
     }
 
     #[test]

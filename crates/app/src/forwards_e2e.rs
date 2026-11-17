@@ -28,7 +28,7 @@ use ferossh_config::ForwardKind;
 use ferossh_forward::x11::{Display, MIT_COOKIE};
 use ferossh_ipc::X11Auth;
 
-use crate::forwards::{DesktopEvent, Forwarder, FwdState, Setup};
+use crate::forwards::{DesktopEvent, Forwarder, FwdState, Setup, X11Setup};
 use crate::link::{Link, LinkEvent};
 use crate::ssh::{Effect, Env, SshSession, State, Target};
 use crate::ssh_e2e::{local_user, start_sshd};
@@ -36,6 +36,8 @@ use ferossh_ipc::ChannelId;
 
 const XAUTH: &str = "/usr/bin/xauth";
 const REAL_COOKIE: [u8; 16] = [0x5a; 16];
+/// What the worker gets; the server gets it from the worker.
+const FAKE_COOKIE: [u8; 16] = [0xa5; 16];
 
 fn free_port() -> u16 {
     TcpListener::bind("127.0.0.1:0")
@@ -234,13 +236,19 @@ fn local_remote_dynamic_and_x11_forwards() {
         session.x11 = Some(X11Auth {
             screen: 0,
             protocol: MIT_COOKIE.into(),
-            cookie: REAL_COOKIE.to_vec(),
+            cookie: FAKE_COOKIE.to_vec(),
         });
     }
+    // The real cookie goes only to this side's engine, never the worker.
     let setup = Setup {
         forwards: target.forwards.clone(),
         gateway_ports: false,
-        x11: x11.then(|| display.clone()),
+        x11: x11.then(|| X11Setup {
+            display: display.clone(),
+            fake: FAKE_COOKIE,
+            real_name: MIT_COOKIE.into(),
+            real_data: REAL_COOKIE.to_vec().into(),
+        }),
     };
     let x_check = if x11 {
         // The client on the server sends a setup with the fake cookie

@@ -36,7 +36,7 @@ Only modern algorithms are offered: post-quantum hybrid `mlkem768x25519-sha256` 
 
 ## X11 and forwarding
 
-X11 forwarding is off unless a host turns it on, because X programs on the server can see and type into your other X windows. The server only ever gets a fake X cookie. A tab shows `⇄` when its connection forwards ports, in amber when the server can connect back into your PC.
+X11 forwarding is off unless a host turns it on, because X programs on the server can see and type into your other X windows. The server only ever gets a fake X cookie, and the sandboxed worker never sees the real one: the window checks each X connection's fake cookie itself and swaps in the real one. A tab shows `⇄` when its connection forwards ports, in amber when the server can connect back into your PC.
 
 ## Telnet
 

@@ -2,10 +2,12 @@
 //! file, and the cookie swap in a client's connection setup.
 //!
 //! The server gets a fake cookie. When an X program on the server
-//! connects, the worker reads the connection setup, checks that it carries
-//! that fake cookie, and puts the real one (or none, for an X server that
-//! needs none) in its place before anything reaches the X server on this
-//! PC, as OpenSSH does. A connection with any other cookie is closed.
+//! connects, the worker reads the connection setup and checks that it
+//! carries that fake cookie; then the window checks it again and puts the
+//! real one (or none, for an X server that needs none) in its place before
+//! anything reaches the X server on this PC, as OpenSSH does. A connection
+//! with any other cookie is closed. The real cookie stays in the window:
+//! the sandboxed worker never learns it.
 //!
 //! FeroSSH ships no X server; this is for one running on Windows, such as
 //! VcXsrv or X410, listening on TCP.

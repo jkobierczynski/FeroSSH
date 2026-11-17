@@ -275,8 +275,9 @@ pub(crate) struct ConnForwards {
     /// Remote forwards the server listens for: address and port as asked
     /// (the port the server chose, for port 0), and the UI's listener.
     remote: Mutex<Vec<(String, u32, ChannelId)>>,
-    /// The fake cookie the server got, and the real authorisation.
-    x11: Mutex<Option<([u8; 16], X11Auth)>>,
+    /// The fake cookie the server got. The UI keeps the real one and swaps
+    /// it in itself: a worker that is taken over must not learn it.
+    x11: Mutex<Option<[u8; 16]>>,
     /// Changes (fails) when the connection's handler is gone.
     alive: watch::Receiver<()>,
     /// A shell asked for agent forwarding, so the server may open agent
@@ -322,25 +323,25 @@ impl ConnForwards {
         }
     }
 
-    /// The fake cookie for an `x11-req`: one per connection, made with the
-    /// first request. The latest real authorisation is kept.
-    fn x11_cookie(&self, real: X11Auth) -> Option<[u8; 16]> {
+    /// The fake cookie for an `x11-req`: one per connection, the one the
+    /// UI gave with the first request; `None` for one that is not a
+    /// 16-byte MIT-MAGIC-COOKIE-1.
+    fn x11_cookie(&self, auth: &X11Auth) -> Option<[u8; 16]> {
         let mut x = self.x11.lock().ok()?;
-        let fake = match x.as_ref() {
-            Some((fake, _)) => *fake,
-            None => {
-                let mut fake = [0u8; 16];
-                getrandom::fill(&mut fake).ok()?;
-                fake
-            }
-        };
-        *x = Some((fake, real));
+        if let Some(fake) = *x {
+            return Some(fake);
+        }
+        if auth.protocol != MIT_COOKIE {
+            return None;
+        }
+        let fake = <[u8; 16]>::try_from(auth.cookie.as_slice()).ok()?;
+        *x = Some(fake);
         Some(fake)
     }
 
-    /// The fake cookie and the real authorisation, once X11 was asked for.
-    pub(crate) fn x11(&self) -> Option<([u8; 16], X11Auth)> {
-        self.x11.lock().ok()?.clone()
+    /// The fake cookie, once X11 was asked for.
+    pub(crate) fn x11(&self) -> Option<[u8; 16]> {
+        *self.x11.lock().ok()?
     }
 }
 
@@ -565,14 +566,13 @@ impl client::Handler for Client {
     ) -> Result<(), Failure> {
         // Only after a shell asked for X11 forwarding.
         match self.forwards.x11() {
-            Some((fake, real)) => {
+            Some(fake) => {
                 reply.accept().await;
                 self.incoming(
                     channel,
                     Incoming::X11 {
                         connection: self.forwards.connection,
                         fake,
-                        real,
                         origin: (originator_address.to_owned(), originator_port),
                     },
                 );
@@ -1353,9 +1353,9 @@ async fn pump(
     let channel = drive(conn.channel_open_session(), inbox, ctx).await??;
     // X11 first: its reply is then the first one back.
     let mut x11_reply = false;
-    if let Some(real) = ctx.x11.take() {
-        let screen = real.screen;
-        if let Some(fake) = ctx.forwards.as_ref().and_then(|f| f.x11_cookie(real)) {
+    if let Some(auth) = ctx.x11.take() {
+        let screen = auth.screen;
+        if let Some(fake) = ctx.forwards.as_ref().and_then(|f| f.x11_cookie(&auth)) {
             channel
                 .request_x11(true, false, MIT_COOKIE, hex(&fake), screen)
                 .await?;
