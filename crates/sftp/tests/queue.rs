@@ -1135,3 +1135,61 @@ fn a_failed_downloads_part_file_is_kept_for_its_retry() {
     assert_eq!(fs::metadata(&part).unwrap().len(), have);
     assert_eq!(fs::read(s.local().join("a_b (2)")).unwrap(), b"other");
 }
+
+#[test]
+fn a_part_file_never_takes_another_downloads_final_name() {
+    let s = Scratch::new("collide-target");
+    let one = pattern(400_000);
+    let two: Vec<u8> = pattern(300_000).iter().map(|b| b ^ 0x11).collect();
+    let three: Vec<u8> = pattern(350_000).iter().map(|b| b ^ 0x22).collect();
+    // The third maps onto the first's name; its first numbered name's
+    // part file, `a_b (2).part`, is the second's final name.
+    fs::write(s.remote().join("a:b"), &one).unwrap();
+    fs::write(s.remote().join("a_b (2).part"), &two).unwrap();
+    fs::write(s.remote().join("a_b"), &three).unwrap();
+    let (mut remote, mut fake) = connected(&s.remote());
+    remote.parallel = 3;
+    for name in ["a:b", "a_b (2).part", "a_b"] {
+        remote.download(&entry(&remote, name), &s.local()).unwrap();
+    }
+    assert!(run(&mut remote, &mut fake));
+    for job in remote.jobs() {
+        assert_eq!(job.state, State::Done, "{:?}", job.note);
+    }
+    assert_eq!(fs::read(s.local().join("a_b")).unwrap(), one);
+    assert_eq!(fs::read(s.local().join("a_b (2).part")).unwrap(), two);
+    assert_eq!(fs::read(s.local().join("a_b (3)")).unwrap(), three);
+}
+
+#[test]
+fn a_numbered_long_name_still_fits_with_its_part_file() {
+    let s = Scratch::new("collide-long");
+    let one = pattern(100_000);
+    let two: Vec<u8> = pattern(90_000).iter().map(|b| b ^ 0x44).collect();
+    // 248 bytes locally: with " (2)" and ".part" it would be 257.
+    let stem = "a".repeat(247);
+    fs::write(s.remote().join(format!("{stem}:")), &one).unwrap();
+    fs::write(s.remote().join(format!("{stem}_")), &two).unwrap();
+    let (mut remote, mut fake) = connected(&s.remote());
+    remote.parallel = 2;
+    remote
+        .download(&entry(&remote, &format!("{stem}:")), &s.local())
+        .unwrap();
+    remote
+        .download(&entry(&remote, &format!("{stem}_")), &s.local())
+        .unwrap();
+    assert!(run(&mut remote, &mut fake));
+    for job in remote.jobs() {
+        assert_eq!(job.state, State::Done, "{:?}", job.note);
+    }
+    assert_eq!(fs::read(s.local().join(format!("{stem}_"))).unwrap(), one);
+    let numbered: Vec<_> = fs::read_dir(s.local())
+        .unwrap()
+        .map(|e| e.unwrap().file_name().into_string().unwrap())
+        .filter(|n| n.ends_with(" (2)"))
+        .collect();
+    assert_eq!(numbered.len(), 1, "{numbered:?}");
+    let name = numbered.first().unwrap();
+    assert!(name.len() + ".part".len() <= 255, "{}", name.len());
+    assert_eq!(fs::read(s.local().join(name)).unwrap(), two);
+}

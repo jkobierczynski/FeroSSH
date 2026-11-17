@@ -444,12 +444,48 @@ fn fold(path: &Path) -> String {
 }
 
 /// A local name not taken yet: `name (2).ext`, `name (3).ext`, ...
-fn free_local(path: &Path) -> Option<PathBuf> {
+fn free_local(path: &Path, busy: &[String]) -> Option<PathBuf> {
     let dir = path.parent()?;
     let name = path.file_name()?.to_string_lossy().into_owned();
     (2..=MAX_NUMBERED)
-        .map(|n| dir.join(names::numbered(&name, n)))
-        .find(|p| !p.exists() && !with_suffix(p, ".part").exists())
+        .map(|n| dir.join(numbered_within(&name, n, MAX_NAME - ".part".len())))
+        .find(|p| {
+            let part = with_suffix(p, ".part");
+            !p.exists() && !part.exists() && !taken(p, busy)
+        })
+}
+
+/// Longest file name most file systems take, in bytes.
+const MAX_NAME: usize = 255;
+
+/// `names::numbered`, with the stem shortened (at a character boundary)
+/// so the result fits in `max` bytes: room for ` (n)` and, from the
+/// caller, `.part`.
+fn numbered_within(name: &str, n: u32, max: usize) -> String {
+    let full = names::numbered(name, n);
+    if full.len() <= max {
+        return full;
+    }
+    let (stem, ext) = match name.rfind('.') {
+        Some(i) if i > 0 => (
+            name.get(..i).unwrap_or(name),
+            name.get(i..).unwrap_or_default(),
+        ),
+        _ => (name, ""),
+    };
+    let tail = format!(" ({n}){ext}");
+    let mut keep = max.saturating_sub(tail.len()).min(stem.len());
+    while keep > 0 && !stem.is_char_boundary(keep) {
+        keep -= 1;
+    }
+    format!("{}{tail}", stem.get(..keep).unwrap_or_default())
+}
+
+/// Whether `target` or its part file is a name another download holds
+/// (its final name or its part file), compared without case.
+fn taken(target: &Path, busy: &[String]) -> bool {
+    let (t, p) = (fold(target), fold(&with_suffix(target, ".part")));
+    busy.iter().any(|b| *b == t || *b == p)
 }
 
 fn remote_numbered(path: &[u8], n: u32) -> Vec<u8> {
@@ -1498,7 +1534,7 @@ impl Remote {
         }
     }
 
-    /// The part files downloads other than job `i` hold (running,
+    /// The names (final and part file) downloads other than job `i` hold (running,
     /// paused, waiting or failed, so a retry can resume), compared without
     /// case: Windows file names ignore it.
     fn busy_parts(&self, i: usize) -> Vec<String> {
@@ -1510,10 +1546,13 @@ impl Remote {
                 *k != i && !matches!(j.state, State::Done | State::Cancelled | State::Skipped)
             })
             .filter_map(|(_, j)| match &j.run {
-                Run::Down(d) => Some(fold(&d.part)),
+                Run::Down(d) => Some(d.target.clone()),
                 // Started before a pause or a dropped connection.
-                _ => j.dest.as_ref().map(|t| fold(&with_suffix(t, ".part"))),
+                _ => j.dest.clone(),
             })
+            // Both its final name and its part file: a part file named
+            // like another download's final name would be renamed over.
+            .flat_map(|t| [fold(&t), fold(&with_suffix(&t, ".part"))])
             .collect()
     }
 
@@ -1534,15 +1573,15 @@ impl Remote {
             match job.choice {
                 None => return self.ask(i),
                 Some(Choice::Skip) => return self.skip(i),
-                Some(Choice::KeepBoth) => match free_local(&target) {
+                Some(Choice::KeepBoth) => match free_local(&target, &busy) {
                     Some(t) => target = t,
                     None => return self.fail(i, "No free name to keep both.".into()),
                 },
                 Some(Choice::Overwrite) => {}
             }
         }
-        if busy.contains(&fold(&with_suffix(&target, ".part"))) {
-            match free_local(&target) {
+        if taken(&target, &busy) {
+            match free_local(&target, &busy) {
                 Some(t) => target = t,
                 None => return self.fail(i, "No free name next to another download.".into()),
             }
