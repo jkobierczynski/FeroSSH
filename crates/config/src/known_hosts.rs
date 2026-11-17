@@ -407,10 +407,16 @@ pub fn decode(bytes: &[u8]) -> io::Result<String> {
         // this part was not UTF-16 at all (a stray one in a UTF-8 file),
         // and reading on would hide the lines after it, a @revoked one
         // among them.
-        if units.iter().any(|&u| u > 0xFF && u != 0xFEFF) {
+        if let Some(bad) = units.iter().position(|&u| u > 0xFF && u != 0xFEFF) {
+            let before = units.get(..bad).unwrap_or_default();
+            let line = utf8.iter().filter(|&&b| b == b'\n').count()
+                + before.iter().filter(|&&u| u == 0x0A).count()
+                + 1;
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                "a zero byte where the file is not UTF-16; fix or remove that line so no entry is lost",
+                format!(
+                    "line {line} has a zero byte where the file is not UTF-16; fix or remove it so no entry is lost"
+                ),
             ));
         }
         text.extend(
@@ -694,11 +700,13 @@ mod tests {
         let text = format!("{}\n# \x00\n@revoked {}\n", line("host", &k), line("*", &k));
         let e = decode(text.as_bytes()).unwrap_err();
         assert_eq!(e.kind(), io::ErrorKind::InvalidData);
+        assert!(e.to_string().starts_with("line 2 "), "{e}");
         // Also right after the `#`, where the rest would read as one
         // UTF-16 comment line.
         let text = format!("{}\n#\x00\n@revoked {}\n", line("host", &k), line("*", &k));
         let e = decode(text.as_bytes()).unwrap_err();
         assert_eq!(e.kind(), io::ErrorKind::InvalidData);
+        assert!(e.to_string().starts_with("line 2 "), "{e}");
     }
 
     #[test]
