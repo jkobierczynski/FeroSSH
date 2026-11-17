@@ -109,17 +109,30 @@ mod tests {
         // Planted in the current folder itself.
         let name = format!("planted-ferossh-tool-{}", std::process::id());
         let here = std::env::current_dir().unwrap();
-        std::fs::write(here.join(&name), b"").unwrap();
+        let file = here.join(&name);
+        // Our own file only: never overwrite or later delete someone else's.
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&file)
+            .unwrap();
+        struct Cleanup(PathBuf);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_file(&self.0);
+            }
+        }
+        let _cleanup = Cleanup(file.clone());
         // It is there to be found: by its folder's absolute path...
-        let found = find(&name, std::slice::from_ref(&here));
-        // ...but not as "." nor by locate, which FeroSSH uses.
-        let dot = find(&name, &[PathBuf::from(".")]);
-        let located = locate(&name);
-        let _ = std::fs::remove_file(here.join(&name));
-        assert_eq!(found, Some(here.join(&name)));
-        assert!(dot.is_none());
-        let e = located.unwrap_err();
-        assert!(e.to_string().contains("give the full path"), "{e}");
+        assert_eq!(find(&name, std::slice::from_ref(&here)), Some(file));
+        // ...but not as "."...
+        assert!(find(&name, &[PathBuf::from(".")]).is_none());
+        // ...nor by locate, which FeroSSH uses, unless PATH itself names
+        // this folder by its absolute path (then finding it is correct).
+        if !search_dirs().contains(&here) {
+            let e = locate(&name).unwrap_err();
+            assert!(e.to_string().contains("give the full path"), "{e}");
+        }
     }
 
     #[test]
