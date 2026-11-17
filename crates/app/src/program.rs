@@ -132,7 +132,11 @@ mod tests {
         // Compared resolved, so an alias such as `/x/../project` counts.
         let real = |d: &PathBuf| std::fs::canonicalize(d).ok();
         let here_real = real(&here);
-        if !search_dirs().iter().any(|d| real(d) == here_real) {
+        // Only absolute entries: `find` skips relative ones such as `.`.
+        let named = search_dirs()
+            .iter()
+            .any(|d| d.is_absolute() && real(d) == here_real);
+        if !named {
             let e = locate(&name).unwrap_err();
             assert!(e.to_string().contains("give the full path"), "{e}");
         }
