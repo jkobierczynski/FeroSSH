@@ -89,13 +89,12 @@ impl KnownHosts {
         Self { entries }
     }
 
-    /// Reads `path`; a missing file is an empty list.
+    /// Reads `path`; a missing file is an empty list. Any other read
+    /// error is returned: an unreadable file must never pass for an empty
+    /// one, or every pinned key would turn into an unknown one. Text that
+    /// is not valid UTF-8 is read as well as it can be (see [`decode`]).
     pub fn load(path: &Path) -> io::Result<Self> {
-        match fs::read_to_string(path) {
-            Ok(text) => Ok(Self::parse(&text)),
-            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(Self::default()),
-            Err(e) => Err(e),
-        }
+        Ok(Self::parse(&read(path)?))
     }
 
     fn for_host<'a>(&'a self, token: &'a str) -> impl Iterator<Item = &'a Entry> + 'a {
@@ -327,11 +326,7 @@ pub fn add(path: &Path, host: &str, port: u16, key: &[u8]) -> io::Result<()> {
 /// `ssh-keygen -R` followed by a fresh accept would. The file is rewritten
 /// through a temporary file so a crash never leaves it half written.
 pub fn replace(path: &Path, host: &str, port: u16, key: &[u8]) -> io::Result<()> {
-    let text = match fs::read_to_string(path) {
-        Ok(t) => t,
-        Err(e) if e.kind() == io::ErrorKind::NotFound => String::new(),
-        Err(e) => return Err(e),
-    };
+    let text = read(path)?;
     let token = host_token(host, port);
     let mut out = String::with_capacity(text.len() + 128);
     for (i, line) in text.lines().enumerate() {
@@ -350,6 +345,42 @@ pub fn replace(path: &Path, host: &str, port: u16, key: &[u8]) -> io::Result<()>
     let tmp = path.with_extension("ferossh-tmp");
     fs::write(&tmp, out)?;
     fs::rename(&tmp, path)
+}
+
+/// The text of the known_hosts file at `path`; empty when it does not
+/// exist. Other read errors are returned.
+pub fn read(path: &Path) -> io::Result<String> {
+    match fs::read(path) {
+        Ok(bytes) => Ok(decode(&bytes)),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(String::new()),
+        Err(e) => Err(e),
+    }
+}
+
+/// known_hosts text from raw bytes, never failing. Entries are ASCII, so
+/// UTF-16 (what Windows PowerShell 5.1's `>` and `>>` write, also appended
+/// to a UTF-8 file) is read by dropping its zero bytes and byte order
+/// marks; any other invalid byte becomes U+FFFD, and the line parser then
+/// skips just that line instead of the whole file being lost.
+pub fn decode(bytes: &[u8]) -> String {
+    let mut clean = Vec::with_capacity(bytes.len());
+    let mut rest = bytes;
+    while let Some((&b, tail)) = rest.split_first() {
+        if let Some(t) = tail.strip_prefix(&[0xBB, 0xBF][..]).filter(|_| b == 0xEF) {
+            rest = t;
+            continue;
+        }
+        if (b == 0xFF && tail.first() == Some(&0xFE)) || (b == 0xFE && tail.first() == Some(&0xFF))
+        {
+            rest = tail.get(1..).unwrap_or_default();
+            continue;
+        }
+        if b != 0 {
+            clean.push(b);
+        }
+        rest = tail;
+    }
+    String::from_utf8_lossy(&clean).into_owned()
 }
 
 #[cfg(test)]
@@ -521,6 +552,49 @@ mod tests {
         assert!(matches!(kh.check("h", 22, &old), Status::Changed { .. }));
         assert_eq!(kh.check("other", 22, &keep), Status::Trusted);
         assert!(fs::read_to_string(&path).unwrap().starts_with("# mine\n"));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn utf16_and_bad_bytes_keep_the_other_entries() {
+        let a = blob("ssh-ed25519", b"a");
+        let b = blob("ssh-ed25519", b"b");
+        let c = blob("ssh-ed25519", b"c");
+        // A UTF-8 file, a Latin-1 comment, then a line appended by
+        // PowerShell 5.1's `>>` (UTF-16LE with a byte order mark).
+        let mut bytes = format!("{}\n# caf\u{e9}\n", line("a", &a)).into_bytes();
+        bytes.extend_from_slice(b"# caf\xe9 latin-1\n");
+        bytes.extend_from_slice(&[0xFF, 0xFE]);
+        for u in format!("{}\r\n", line("b", &b)).encode_utf16() {
+            bytes.extend_from_slice(&u.to_le_bytes());
+        }
+        let kh = KnownHosts::parse(&decode(&bytes));
+        assert_eq!(kh.check("a", 22, &a), Status::Trusted);
+        assert_eq!(kh.check("b", 22, &b), Status::Trusted);
+        assert!(matches!(kh.check("a", 22, &c), Status::Changed { .. }));
+        // A whole UTF-8 file with a byte order mark.
+        let mut bom = vec![0xEF, 0xBB, 0xBF];
+        bom.extend_from_slice(line("c", &c).as_bytes());
+        assert_eq!(
+            KnownHosts::parse(&decode(&bom)).check("c", 22, &c),
+            Status::Trusted
+        );
+    }
+
+    #[test]
+    fn an_unreadable_file_is_an_error_not_an_empty_list() {
+        let dir = std::env::temp_dir().join(format!("ferossh-kh-err-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        // Missing: empty. A folder where the file should be: an error.
+        assert!(
+            KnownHosts::load(&dir.join("missing"))
+                .unwrap()
+                .entries
+                .is_empty()
+        );
+        assert!(KnownHosts::load(&dir).is_err());
+        assert!(read(&dir).is_err());
         let _ = fs::remove_dir_all(&dir);
     }
 }
