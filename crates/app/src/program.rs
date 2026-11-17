@@ -106,16 +106,20 @@ mod tests {
 
     #[test]
     fn locate_never_looks_in_the_current_folder() {
-        let dir = std::env::temp_dir().join(format!("ferossh-locate-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join("planted-ferossh-tool"), b"").unwrap();
+        // Planted in the current folder itself.
+        let name = format!("planted-ferossh-tool-{}", std::process::id());
         let here = std::env::current_dir().unwrap();
-        // Not even when FeroSSH runs in the folder that holds it.
-        assert!(find("planted-ferossh-tool", &[PathBuf::from(".")]).is_none());
-        let e = locate("planted-ferossh-tool").unwrap_err();
+        std::fs::write(here.join(&name), b"").unwrap();
+        // It is there to be found: by its folder's absolute path...
+        let found = find(&name, std::slice::from_ref(&here));
+        // ...but not as "." nor by locate, which FeroSSH uses.
+        let dot = find(&name, &[PathBuf::from(".")]);
+        let located = locate(&name);
+        let _ = std::fs::remove_file(here.join(&name));
+        assert_eq!(found, Some(here.join(&name)));
+        assert!(dot.is_none());
+        let e = located.unwrap_err();
         assert!(e.to_string().contains("give the full path"), "{e}");
-        assert_eq!(std::env::current_dir().unwrap(), here);
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
