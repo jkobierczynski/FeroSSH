@@ -89,13 +89,12 @@ impl KnownHosts {
         Self { entries }
     }
 
-    /// Reads `path`; a missing file is an empty list.
+    /// Reads `path`; a missing file is an empty list. Any other read
+    /// error is returned: an unreadable file must never pass for an empty
+    /// one, or every pinned key would turn into an unknown one. Text that
+    /// is not valid UTF-8 is read as well as it can be (see [`decode`]).
     pub fn load(path: &Path) -> io::Result<Self> {
-        match fs::read_to_string(path) {
-            Ok(text) => Ok(Self::parse(&text)),
-            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(Self::default()),
-            Err(e) => Err(e),
-        }
+        Ok(Self::parse(&read(path)?))
     }
 
     fn for_host<'a>(&'a self, token: &'a str) -> impl Iterator<Item = &'a Entry> + 'a {
@@ -313,6 +312,17 @@ pub fn add(path: &Path, host: &str, port: u16, key: &[u8]) -> io::Result<()> {
         Err(e) if e.kind() == io::ErrorKind::NotFound => Vec::new(),
         Err(e) => return Err(e),
     };
+    if existing.contains(&0) {
+        // UTF-16 (PowerShell 5.1's `>`): UTF-8 appended to it would not
+        // read back, so the whole file is rewritten as UTF-8 first.
+        let mut text = decode(&existing)?;
+        if !text.is_empty() && !text.ends_with('\n') {
+            text.push('\n');
+        }
+        text.push_str(&line);
+        text.push('\n');
+        return replace_file(path, text.as_bytes());
+    }
     let mut file = fs::OpenOptions::new()
         .create(true)
         .append(true)
@@ -327,11 +337,7 @@ pub fn add(path: &Path, host: &str, port: u16, key: &[u8]) -> io::Result<()> {
 /// `ssh-keygen -R` followed by a fresh accept would. The file is rewritten
 /// through a temporary file so a crash never leaves it half written.
 pub fn replace(path: &Path, host: &str, port: u16, key: &[u8]) -> io::Result<()> {
-    let text = match fs::read_to_string(path) {
-        Ok(t) => t,
-        Err(e) if e.kind() == io::ErrorKind::NotFound => String::new(),
-        Err(e) => return Err(e),
-    };
+    let text = read(path)?;
     let token = host_token(host, port);
     let mut out = String::with_capacity(text.len() + 128);
     for (i, line) in text.lines().enumerate() {
@@ -347,9 +353,121 @@ pub fn replace(path: &Path, host: &str, port: u16, key: &[u8]) -> io::Result<()>
     if let Some(dir) = path.parent() {
         fs::create_dir_all(dir)?;
     }
-    let tmp = path.with_extension("ferossh-tmp");
-    fs::write(&tmp, out)?;
-    fs::rename(&tmp, path)
+    replace_file(path, out.as_bytes())
+}
+
+/// Writes `data` to `path` through a fresh temporary file next to it,
+/// then renames it into place. The temporary file is created new, never
+/// opened over an existing one, so it can never be another file the
+/// user named (a second known_hosts called `pin.ferossh-tmp`, say).
+fn replace_file(path: &Path, data: &[u8]) -> io::Result<()> {
+    let name = path.file_name().unwrap_or_default().to_string_lossy();
+    for n in 0u32..1000 {
+        let tmp = path.with_file_name(format!(".{name}.{}-{n}.ferossh-tmp", std::process::id()));
+        let mut file = match fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&tmp)
+        {
+            Ok(f) => f,
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e),
+        };
+        let written = file.write_all(data).and_then(|()| file.sync_all());
+        drop(file);
+        if let Err(e) = written.and_then(|()| fs::rename(&tmp, path)) {
+            let _ = fs::remove_file(&tmp);
+            return Err(e);
+        }
+        return Ok(());
+    }
+    Err(io::Error::new(
+        io::ErrorKind::AlreadyExists,
+        "no free temporary file name next to the known_hosts file",
+    ))
+}
+
+/// The text of the known_hosts file at `path`; empty when it does not
+/// exist. Other read errors are returned.
+pub fn read(path: &Path) -> io::Result<String> {
+    match fs::read(path) {
+        Ok(bytes) => decode(&bytes),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(String::new()),
+        Err(e) => Err(e),
+    }
+}
+
+/// known_hosts text from raw bytes. A UTF-8 file is read as it is; a
+/// UTF-16LE part (what Windows PowerShell 5.1's `>` writes, or `>>`
+/// appends to a UTF-8 file) is decoded as UTF-16, from the start of the
+/// line holding its first zero byte; byte order marks are dropped.
+///
+/// A line that is not a comment and does not decode cleanly is an error
+/// naming that line, not a line to skip: skipping it could drop a
+/// `@revoked` marker or a `!host` exclusion and so trust more than the
+/// file says. Comment lines may hold anything.
+pub fn decode(bytes: &[u8]) -> io::Result<String> {
+    let (utf8, utf16) = match bytes.iter().position(|&b| b == 0) {
+        None => (bytes, None),
+        Some(nul) => {
+            // The UTF-16 part starts after the last line end before its
+            // first code unit (a `\n` there may itself be UTF-16).
+            let first = nul.saturating_sub(1);
+            let start = bytes
+                .get(..first)
+                .and_then(|b| b.iter().rposition(|&b| b == b'\n'))
+                .map_or(0, |i| i + 1);
+            let (head, tail) = bytes.split_at(start);
+            (head, Some(tail))
+        }
+    };
+    let utf8 = utf8.strip_prefix(&[0xEF, 0xBB, 0xBF][..]).unwrap_or(utf8);
+    let mut text = String::from_utf8_lossy(utf8).into_owned();
+    if let Some(tail) = utf16 {
+        let tail = tail.strip_prefix(&[0xFF, 0xFE][..]).unwrap_or(tail);
+        let (pairs, odd) = (tail.chunks_exact(2), tail.len() % 2 == 1);
+        let units: Vec<u16> = pairs
+            .map(|p| <[u8; 2]>::try_from(p).map_or(0xFFFD, u16::from_le_bytes))
+            .collect();
+        // What PowerShell writes for known_hosts is Latin text: every
+        // high byte zero. Anything else means the zero byte that started
+        // this part was not UTF-16 at all (a stray one in a UTF-8 file),
+        // and reading on would hide the lines after it, a @revoked one
+        // among them.
+        if let Some(bad) = units.iter().position(|&u| u > 0xFF && u != 0xFEFF) {
+            let before = units.get(..bad).unwrap_or_default();
+            let line = utf8.iter().filter(|&&b| b == b'\n').count()
+                + before.iter().filter(|&&u| u == 0x0A).count()
+                + 1;
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "line {line} is not UTF-8 or the Latin-only UTF-16 PowerShell writes; save the file as UTF-8 or fix that line so no entry is lost"
+                ),
+            ));
+        }
+        text.extend(
+            char::decode_utf16(units)
+                .map(|c| c.unwrap_or(char::REPLACEMENT_CHARACTER))
+                .filter(|&c| c != '\u{feff}'),
+        );
+        if odd {
+            text.push(char::REPLACEMENT_CHARACTER);
+        }
+    }
+    for (n, line) in text.lines().enumerate() {
+        let entry = line.trim_start();
+        if !entry.starts_with('#') && entry.contains(char::REPLACEMENT_CHARACTER) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "line {} is not valid text; fix or remove it so no entry is lost",
+                    n + 1
+                ),
+            ));
+        }
+    }
+    Ok(text)
 }
 
 #[cfg(test)]
@@ -521,6 +639,134 @@ mod tests {
         assert!(matches!(kh.check("h", 22, &old), Status::Changed { .. }));
         assert_eq!(kh.check("other", 22, &keep), Status::Trusted);
         assert!(fs::read_to_string(&path).unwrap().starts_with("# mine\n"));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn utf16_and_bad_bytes_keep_the_other_entries() {
+        let a = blob("ssh-ed25519", b"a");
+        let b = blob("ssh-ed25519", b"b");
+        let c = blob("ssh-ed25519", b"c");
+        // A UTF-8 file, a Latin-1 comment, then a line appended by
+        // PowerShell 5.1's `>>` (UTF-16LE with a byte order mark).
+        let mut bytes = format!("{}\n# caf\u{e9}\n", line("a", &a)).into_bytes();
+        bytes.extend_from_slice(b"# caf\xe9 latin-1\n");
+        bytes.extend_from_slice(&[0xFF, 0xFE]);
+        for u in format!("{}\r\n", line("b", &b)).encode_utf16() {
+            bytes.extend_from_slice(&u.to_le_bytes());
+        }
+        let kh = KnownHosts::parse(&decode(&bytes).unwrap());
+        assert_eq!(kh.check("a", 22, &a), Status::Trusted);
+        assert_eq!(kh.check("b", 22, &b), Status::Trusted);
+        assert!(matches!(kh.check("a", 22, &c), Status::Changed { .. }));
+        // A whole UTF-8 file with a byte order mark.
+        let mut bom = vec![0xEF, 0xBB, 0xBF];
+        bom.extend_from_slice(line("c", &c).as_bytes());
+        assert_eq!(
+            KnownHosts::parse(&decode(&bom).unwrap()).check("c", 22, &c),
+            Status::Trusted
+        );
+    }
+
+    fn utf16(text: &str) -> Vec<u8> {
+        let mut bytes = vec![0xFF, 0xFE];
+        for u in text.encode_utf16() {
+            bytes.extend_from_slice(&u.to_le_bytes());
+        }
+        bytes
+    }
+
+    #[test]
+    fn utf16_characters_never_become_line_ends() {
+        // U+200A is 0A 20 in UTF-16LE: dropping zero bytes would turn
+        // it into a new line and wake the commented-out key. Beyond
+        // Latin-1 the file is refused instead.
+        let a = blob("ssh-ed25519", b"a");
+        let b = blob("ssh-ed25519", b"b");
+        let text = format!("# \u{200A}{}\r\n{}\r\n", line("a", &a), line("b", &b));
+        assert!(decode(&utf16(&text)).is_err());
+        let mut bytes = format!("{}\n", line("b", &b)).into_bytes();
+        bytes.extend_from_slice(utf16(&text).get(2..).unwrap());
+        assert!(decode(&bytes).is_err());
+        // A Latin-1 comment is fine, and stays a comment, with or
+        // without a UTF-8 part before it.
+        let text = format!("# caf\u{e9} {}\r\n{}\r\n", line("a", &a), line("b", &b));
+        let mut bytes = format!("{}\n", line("b", &b)).into_bytes();
+        bytes.extend_from_slice(utf16(&text).get(2..).unwrap());
+        for file in [utf16(&text), bytes] {
+            let kh = KnownHosts::parse(&decode(&file).unwrap());
+            assert!(matches!(kh.check("a", 22, &a), Status::Unknown { .. }));
+            assert_eq!(kh.check("b", 22, &b), Status::Trusted);
+        }
+    }
+
+    #[test]
+    fn a_damaged_entry_line_is_an_error_not_skipped() {
+        let ca = blob("ssh-ed25519", b"ca");
+        let mut bytes = b"@cert-authority *.example.org,!\xFFprod.example.org ".to_vec();
+        bytes.extend_from_slice(line("x", &ca).split_once(' ').unwrap().1.as_bytes());
+        let e = decode(&bytes).unwrap_err();
+        assert_eq!(e.kind(), io::ErrorKind::InvalidData);
+        assert!(e.to_string().contains("line 1"), "{e}");
+        // An unpaired surrogate on a UTF-16 entry line, and an odd byte.
+        let mut bad = utf16("host ssh-ed25519 AAAA\r\n");
+        bad.splice(4..4, [0x00, 0xD8]);
+        assert!(decode(&bad).is_err());
+        let mut odd = utf16("# fine\r\n");
+        odd.push(b'h');
+        assert!(decode(&odd).is_err());
+        // Anything goes in a comment.
+        assert!(decode(b"# caf\xe9\n").is_ok());
+    }
+
+    #[test]
+    fn a_stray_zero_byte_in_utf8_is_an_error_not_lost_lines() {
+        // A zero byte in a UTF-8 comment must not turn the rest of the
+        // file, a @revoked line included, into one unparsable line.
+        let k = blob("ssh-ed25519", b"k");
+        let text = format!("{}\n# \x00\n@revoked {}\n", line("host", &k), line("*", &k));
+        let e = decode(text.as_bytes()).unwrap_err();
+        assert_eq!(e.kind(), io::ErrorKind::InvalidData);
+        assert!(e.to_string().starts_with("line 2 "), "{e}");
+        // Also right after the `#`, where the rest would read as one
+        // UTF-16 comment line.
+        let text = format!("{}\n#\x00\n@revoked {}\n", line("host", &k), line("*", &k));
+        let e = decode(text.as_bytes()).unwrap_err();
+        assert_eq!(e.kind(), io::ErrorKind::InvalidData);
+        assert!(e.to_string().starts_with("line 2 "), "{e}");
+    }
+
+    #[test]
+    fn adding_to_a_utf16_file_keeps_it_readable() {
+        let dir = std::env::temp_dir().join(format!("ferossh-kh-add16-{}", std::process::id()));
+        let path = dir.join("known_hosts");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let a = blob("ssh-ed25519", b"a");
+        let b = blob("ssh-ed25519", b"b");
+        fs::write(&path, utf16(&format!("{}\r\n", line("a", &a)))).unwrap();
+        add(&path, "b", 22, &b).unwrap();
+        let kh = KnownHosts::load(&path).unwrap();
+        assert_eq!(kh.check("a", 22, &a), Status::Trusted);
+        assert_eq!(kh.check("b", 22, &b), Status::Trusted);
+        assert!(!fs::read(&path).unwrap().contains(&0));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_unreadable_file_is_an_error_not_an_empty_list() {
+        let dir = std::env::temp_dir().join(format!("ferossh-kh-err-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        // Missing: empty. A folder where the file should be: an error.
+        assert!(
+            KnownHosts::load(&dir.join("missing"))
+                .unwrap()
+                .entries
+                .is_empty()
+        );
+        assert!(KnownHosts::load(&dir).is_err());
+        assert!(read(&dir).is_err());
         let _ = fs::remove_dir_all(&dir);
     }
 }

@@ -923,19 +923,30 @@ impl SshSession {
         self.known_files().into_iter().next()
     }
 
-    fn known(&self) -> KnownHosts {
-        let files = self.known_files();
-        if let [one] = files.as_slice() {
-            return KnownHosts::load(one).unwrap_or_default();
-        }
+    /// What the known_hosts files say. A missing file adds nothing, but
+    /// one that cannot be read is an error: taken as empty, it would turn
+    /// every pinned key into an unknown one that is merely asked about
+    /// (or, with accept-new, trusted). The error names the file.
+    fn known(&self) -> Result<KnownHosts, String> {
         let mut text = String::new();
-        for f in &files {
-            if let Ok(t) = std::fs::read_to_string(f) {
-                text.push_str(&t);
-                text.push('\n');
-            }
+        for f in &self.known_files() {
+            let t = known_hosts::read(f).map_err(|e| format!("{} ({e})", f.display()))?;
+            text.push_str(&t);
+            text.push('\n');
         }
-        KnownHosts::parse(&text)
+        Ok(KnownHosts::parse(&text))
+    }
+
+    /// Refuses the host key because known_hosts could not be read.
+    fn unreadable_known_hosts(&mut self, why: &str) -> Vec<Effect> {
+        vec![
+            Effect::Show(sanitize(&format!(
+                "{RED}FeroSSH could not read the known_hosts file {why}, so it cannot tell \
+                 whether this is the host key you trusted. Not connecting. Fix the file's \
+                 permissions, or move it aside to start a new one.{RESET}\r\n"
+            ))),
+            self.verdict(false),
+        ]
     }
 
     /// Trusts a new host key: adds it to known_hosts, or says why it is
@@ -1038,7 +1049,9 @@ impl SshSession {
     fn connect_message(&self) -> Effect {
         let t = &self.target;
         let (key_host, key_port) = t.key_host();
-        let known = self.known();
+        // Only the order of the host key types asked for: a file that
+        // cannot be read refuses the key once it arrives.
+        let known = self.known().unwrap_or_default();
         let mut host_key_algs = known.key_types(key_host, key_port);
         if known.has_authority(key_host, key_port) {
             host_key_algs.push(crypto_policy::CERT_AUTHORITY.to_owned());
@@ -1661,7 +1674,10 @@ impl SshSession {
         else {
             return vec![self.verdict(false)];
         };
-        let known = self.known();
+        let known = match self.known() {
+            Ok(k) => k,
+            Err(why) => return self.unreadable_known_hosts(&why),
+        };
         let problem = if known.is_revoked(&cert.ca) {
             Some(format!(
                 "its CA key {} is marked as revoked",
@@ -1722,7 +1738,11 @@ impl SshSession {
         let Some(desc) = hostkey::describe(&key) else {
             return vec![self.verdict(false)];
         };
-        match self.known().check(&host, port, &key) {
+        let known = match self.known() {
+            Ok(k) => k,
+            Err(why) => return self.unreadable_known_hosts(&why),
+        };
+        match known.check(&host, port, &key) {
             Status::Trusted => vec![self.verdict(true)],
             Status::Revoked => vec![
                 Effect::Show(format!(
@@ -2698,6 +2718,61 @@ mod tests {
                 accept: true
             }]
         );
+    }
+
+    #[test]
+    fn unreadable_known_hosts_refuses_instead_of_asking() {
+        let dir = temp("unreadable");
+        let mut e = env(&dir);
+        // A folder where known_hosts should be: it cannot be read.
+        e.config = format!(
+            "Host host\n  StrictHostKeyChecking accept-new\n  UserKnownHostsFile \"{}\"\n",
+            dir.display()
+        );
+        let mut s = SshSession::new(1, Target::resolve("host", &e).unwrap(), e.known_hosts());
+        s.start(80, 24);
+        let fx = s.on_worker(Message::HostKey {
+            channel: 1,
+            key: ed25519_blob(),
+        });
+        assert_eq!(
+            sent(&fx),
+            vec![&Message::HostKeyVerdict {
+                channel: 1,
+                accept: false
+            }]
+        );
+        assert!(
+            shown(&fx).contains("could not read the known_hosts file"),
+            "{}",
+            shown(&fx)
+        );
+        assert!(s.prompt.is_none());
+    }
+
+    #[test]
+    fn known_hosts_written_as_utf16_still_pins() {
+        let dir = temp("utf16");
+        let e = env(&dir);
+        let mut other = vec![0, 0, 0, 11];
+        other.extend_from_slice(b"ssh-ed25519");
+        other.extend_from_slice(&[0, 0, 0, 32]);
+        other.extend_from_slice(&[7; 32]);
+        known_hosts::add(&e.known_hosts(), "host", 22, &other).unwrap();
+        // What PowerShell 5.1 leaves: the same text as UTF-16LE.
+        let text = std::fs::read_to_string(e.known_hosts()).unwrap();
+        let mut bytes = vec![0xFF, 0xFE];
+        for u in text.encode_utf16() {
+            bytes.extend_from_slice(&u.to_le_bytes());
+        }
+        std::fs::write(e.known_hosts(), bytes).unwrap();
+        let mut s = SshSession::new(1, Target::resolve("host", &e).unwrap(), e.known_hosts());
+        s.start(80, 24);
+        let fx = s.on_worker(Message::HostKey {
+            channel: 1,
+            key: ed25519_blob(),
+        });
+        assert!(shown(&fx).contains("HOST KEY CHANGED"), "{}", shown(&fx));
     }
 
     #[test]
