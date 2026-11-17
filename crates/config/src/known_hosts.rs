@@ -24,12 +24,19 @@ const SALT_LEN: usize = 20;
 pub enum Status {
     /// The key is listed for this host.
     Trusted,
-    /// The host is not listed with a key of this type. `other_types` names
-    /// the key types it is listed with, if any.
-    Unknown { other_types: Vec<String> },
+    /// The host is not listed.
+    Unknown,
     /// The host is listed with a different key of the same type: a possible
     /// man-in-the-middle. `lines` are the 1-based lines holding the old key.
     Changed { lines: Vec<usize> },
+    /// The host is listed only with keys of other types (`types`, on
+    /// `lines`). A server offers the type already trusted first, so a
+    /// switch of type is as suspect as a changed key: a man-in-the-middle
+    /// with a key of another type, or a server that lost the old one.
+    TypeChanged {
+        types: Vec<String>,
+        lines: Vec<usize>,
+    },
     /// The key is marked `@revoked`.
     Revoked,
 }
@@ -130,12 +137,19 @@ impl KnownHosts {
         if !changed.is_empty() {
             return Status::Changed { lines: changed };
         }
-        let mut other_types: Vec<String> = listed
+        if listed.is_empty() {
+            return Status::Unknown;
+        }
+        let mut types: Vec<String> = listed
             .iter()
             .filter_map(|e| key_type(&e.key).map(str::to_owned))
             .collect();
-        other_types.dedup();
-        Status::Unknown { other_types }
+        types.sort();
+        types.dedup();
+        Status::TypeChanged {
+            types,
+            lines: listed.iter().map(|e| e.line).collect(),
+        }
     }
 
     /// Whether `key` (a host key or a CA) is marked `@revoked`.
@@ -337,19 +351,50 @@ pub fn add(path: &Path, host: &str, port: u16, key: &[u8]) -> io::Result<()> {
 /// `ssh-keygen -R` followed by a fresh accept would. The file is rewritten
 /// through a temporary file so a crash never leaves it half written.
 pub fn replace(path: &Path, host: &str, port: u16, key: &[u8]) -> io::Result<()> {
+    rewrite(path, host, port, Some(key))
+}
+
+/// Removes every plain entry for a host, as `ssh-keygen -R` does, from
+/// a file other than the one the new key goes to. A missing file is
+/// left missing.
+pub fn forget(path: &Path, host: &str, port: u16) -> io::Result<()> {
+    rewrite(path, host, port, None)
+}
+
+fn rewrite(path: &Path, host: &str, port: u16, key: Option<&[u8]>) -> io::Result<()> {
     let text = read(path)?;
     let token = host_token(host, port);
     let mut out = String::with_capacity(text.len() + 128);
+    let mut changed = false;
     for (i, line) in text.lines().enumerate() {
-        let drop = parse_line(i + 1, line)
-            .is_some_and(|e| e.marker.is_none() && host_matches(&e.hosts, &token));
-        if !drop {
-            out.push_str(line);
-            out.push('\n');
+        let entry = parse_line(i + 1, line)
+            .filter(|e| e.marker.is_none() && host_matches(&e.hosts, &token));
+        changed |= entry.is_some();
+        match entry.map(|e| e.hosts) {
+            None => out.push_str(line),
+            // One host per hashed line: it goes.
+            Some(Hosts::Hashed { .. }) => continue,
+            Some(Hosts::Patterns(list)) => match without_host(&list, &token) {
+                Some(rest) => {
+                    // The other hosts keep their key: only the list changes.
+                    let fields = line.trim_start();
+                    let tail = fields.get(list.len()..).unwrap_or_default();
+                    out.push_str(&rest);
+                    out.push_str(tail);
+                }
+                None => continue,
+            },
         }
+        out.push('\n');
     }
-    out.push_str(&hashed_line(host, port, key)?);
-    out.push('\n');
+    // Nothing to forget here: leave the file (and its folder) untouched.
+    if key.is_none() && !changed {
+        return Ok(());
+    }
+    if let Some(key) = key {
+        out.push_str(&hashed_line(host, port, key)?);
+        out.push('\n');
+    }
     if let Some(dir) = path.parent() {
         fs::create_dir_all(dir)?;
     }
@@ -385,6 +430,26 @@ fn replace_file(path: &Path, data: &[u8]) -> io::Result<()> {
         io::ErrorKind::AlreadyExists,
         "no free temporary file name next to the known_hosts file",
     ))
+}
+
+/// A plain host list with `token` taken out, for a line that keeps the
+/// other hosts' trust; `None` when nothing else is left. A name written
+/// out is removed; a wildcard that still covers `token` stays, with a
+/// `!token` added so it no longer does.
+fn without_host(list: &str, token: &str) -> Option<String> {
+    let kept: Vec<&str> = list
+        .split(',')
+        .filter(|p| !p.eq_ignore_ascii_case(token))
+        .collect();
+    if !kept.iter().any(|p| !p.starts_with('!') && !p.is_empty()) {
+        return None;
+    }
+    let mut rest = kept.join(",");
+    if match_pattern_list(&rest, token) {
+        rest.push_str(",!");
+        rest.push_str(token);
+    }
+    Some(rest)
 }
 
 /// The text of the known_hosts file at `path`; empty when it does not
@@ -511,12 +576,7 @@ mod tests {
         assert!(kh.is_revoked(&blob("ssh-ed25519", b"gone")));
         assert!(!kh.is_revoked(&ca));
         // A CA line never trusts the CA key as a plain host key.
-        assert_eq!(
-            kh.check("web.example.org", 22, &ca),
-            Status::Unknown {
-                other_types: vec![]
-            }
-        );
+        assert_eq!(kh.check("web.example.org", 22, &ca), Status::Unknown);
     }
 
     #[test]
@@ -534,22 +594,18 @@ mod tests {
             kh.check("example.org", 2222, &ed),
             Status::Changed { lines: vec![3] }
         );
-        assert_eq!(
-            kh.check("other.org", 22, &ed),
-            Status::Unknown {
-                other_types: vec![]
-            }
-        );
+        assert_eq!(kh.check("other.org", 22, &ed), Status::Unknown);
     }
 
     #[test]
-    fn other_key_type_is_unknown_not_changed() {
+    fn other_key_type_is_a_type_change() {
         let rsa = blob("ssh-rsa", b"r");
-        let kh = KnownHosts::parse(&line("h", &rsa));
+        let kh = KnownHosts::parse(&format!("# mine\n{}", line("h", &rsa)));
         assert_eq!(
             kh.check("h", 22, &blob("ssh-ed25519", b"e")),
-            Status::Unknown {
-                other_types: vec!["ssh-rsa".into()]
+            Status::TypeChanged {
+                types: vec!["ssh-rsa".into()],
+                lines: vec![2]
             }
         );
         assert_eq!(kh.key_types("h", 22), vec!["ssh-rsa".to_owned()]);
@@ -560,10 +616,7 @@ mod tests {
         let ed = blob("ssh-ed25519", b"k");
         let kh = KnownHosts::parse(&hashed_line("srv.example", 2200, &ed).unwrap());
         assert_eq!(kh.check("srv.example", 2200, &ed), Status::Trusted);
-        assert!(matches!(
-            kh.check("srv.example", 22, &ed),
-            Status::Unknown { .. }
-        ));
+        assert!(matches!(kh.check("srv.example", 22, &ed), Status::Unknown));
     }
 
     #[test]
@@ -574,10 +627,7 @@ mod tests {
         let key = Base64::decode_vec("AAAAC3NzaC1lZDI1NTE5AAAAIHZvbmU=").unwrap();
         let kh = KnownHosts::parse(text);
         assert_eq!(kh.check("localhost", 22, &key), Status::Trusted);
-        assert!(matches!(
-            kh.check("localhost2", 22, &key),
-            Status::Unknown { .. }
-        ));
+        assert!(matches!(kh.check("localhost2", 22, &key), Status::Unknown));
     }
 
     #[test]
@@ -604,7 +654,7 @@ mod tests {
         let ca = format!("@cert-authority {}\n", line("h", &ed));
         assert!(matches!(
             KnownHosts::parse(&ca).check("h", 22, &ed),
-            Status::Unknown { .. }
+            Status::Unknown
         ));
     }
 
@@ -614,7 +664,7 @@ mod tests {
         let text = format!("h ssh-rsa {}\n", Base64::encode_string(&ed));
         assert!(matches!(
             KnownHosts::parse(&text).check("h", 22, &ed),
-            Status::Unknown { .. }
+            Status::Unknown
         ));
     }
 
@@ -639,6 +689,56 @@ mod tests {
         assert!(matches!(kh.check("h", 22, &old), Status::Changed { .. }));
         assert_eq!(kh.check("other", 22, &keep), Status::Trusted);
         assert!(fs::read_to_string(&path).unwrap().starts_with("# mine\n"));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn forgetting_a_host_a_file_does_not_name_never_writes_it() {
+        let dir = std::env::temp_dir().join(format!("ferossh-kh-noop-{}", std::process::id()));
+        let path = dir.join("known_hosts");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let text = format!("{}\n", line("other", &blob("ssh-rsa", b"o")));
+        fs::write(&path, &text).unwrap();
+        let before = fs::metadata(&path).unwrap();
+        forget(&path, "h", 22).unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap(), text);
+        // Not even rewritten with the same text: a rewrite renames a new
+        // file into place.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            assert_eq!(fs::metadata(&path).unwrap().ino(), before.ino());
+        }
+        let _ = before;
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn rewriting_never_writes_over_a_file_named_like_its_temporary() {
+        let dir = std::env::temp_dir().join(format!("ferossh-kh-tmpname-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let pin = dir.join("pin");
+        // Every name the old code (and a plain extension) would use.
+        let others = [
+            pin.with_extension("ferossh-tmp"),
+            dir.join(".pin.ferossh-tmp"),
+        ];
+        let k = blob("ssh-ed25519", b"k");
+        let text = format!("{}\n", line("h", &k));
+        for o in &others {
+            fs::write(o, &text).unwrap();
+        }
+        fs::write(&pin, &text).unwrap();
+        forget(&pin, "h", 22).unwrap();
+        for o in &others {
+            assert_eq!(fs::read_to_string(o).unwrap(), text, "{}", o.display());
+        }
+        assert_eq!(fs::read_to_string(&pin).unwrap(), "");
+        // No temporary file is left behind.
+        let left = fs::read_dir(&dir).unwrap().count();
+        assert_eq!(left, others.len() + 1);
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -695,7 +795,7 @@ mod tests {
         bytes.extend_from_slice(utf16(&text).get(2..).unwrap());
         for file in [utf16(&text), bytes] {
             let kh = KnownHosts::parse(&decode(&file).unwrap());
-            assert!(matches!(kh.check("a", 22, &a), Status::Unknown { .. }));
+            assert!(matches!(kh.check("a", 22, &a), Status::Unknown));
             assert_eq!(kh.check("b", 22, &b), Status::Trusted);
         }
     }
@@ -750,6 +850,46 @@ mod tests {
         assert_eq!(kh.check("a", 22, &a), Status::Trusted);
         assert_eq!(kh.check("b", 22, &b), Status::Trusted);
         assert!(!fs::read(&path).unwrap().contains(&0));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn replace_keeps_the_other_hosts_on_a_shared_line() {
+        let dir = std::env::temp_dir().join(format!("ferossh-kh-share-{}", std::process::id()));
+        let path = dir.join("known_hosts");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let rsa = blob("ssh-rsa", b"shared");
+        let wild = blob("ssh-ed25519", b"wild");
+        let new = blob("ssh-ed25519", b"new");
+        fs::write(
+            &path,
+            format!(
+                "{}\n{}\n{} # only h\n",
+                line("a,H,[b]:2222", &rsa),
+                line("*.lan,!x.lan", &wild),
+                line("h", &rsa)
+            ),
+        )
+        .unwrap();
+        replace(&path, "h", 22, &new).unwrap();
+        replace(&path, "srv.lan", 22, &new).unwrap();
+        let kh = KnownHosts::load(&path).unwrap();
+        // The replaced hosts have only the new key.
+        for h in ["h", "srv.lan"] {
+            assert_eq!(kh.check(h, 22, &new), Status::Trusted);
+            assert!(!matches!(kh.check(h, 22, &rsa), Status::Trusted));
+            assert!(!matches!(kh.check(h, 22, &wild), Status::Trusted));
+        }
+        // Everyone else on those lines keeps theirs.
+        assert_eq!(kh.check("a", 22, &rsa), Status::Trusted);
+        assert_eq!(kh.check("b", 2222, &rsa), Status::Trusted);
+        assert_eq!(kh.check("other.lan", 22, &wild), Status::Trusted);
+        assert!(!matches!(kh.check("x.lan", 22, &wild), Status::Trusted));
+        let text = fs::read_to_string(&path).unwrap();
+        assert!(text.contains("a,[b]:2222 ssh-rsa"), "{text}");
+        assert!(text.contains("*.lan,!x.lan,!srv.lan ssh-ed25519"), "{text}");
+        assert!(!text.contains("# only h"), "{text}");
         let _ = fs::remove_dir_all(&dir);
     }
 
