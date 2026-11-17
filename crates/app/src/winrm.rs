@@ -740,9 +740,10 @@ impl WinrmSession {
                     conn,
                     host: self.target.hostname.clone(),
                     credentials: credentials.filter(|_| matches!(op, SspiOp::Start)),
-                    // Over HTTPS the login is inside the accepted TLS
-                    // connection; over HTTP only when allowed.
-                    ntlm: self.target.https || self.target.ntlm,
+                    // Over HTTP only when allowed. Over HTTPS the broker
+                    // allows it itself, and only while that connection's
+                    // TLS is up: a flag here would outlive a TLS failure.
+                    ntlm: self.target.ntlm && !self.target.https,
                     op,
                 }))]
             }
@@ -850,6 +851,13 @@ impl WinrmSession {
         }
         if let Some(cert) = output.cert {
             return self.check_cert(conn, cert, output.result);
+        }
+        if matches!(output.result, SspiResult::Failed(_)) {
+            // The broker dropped that connection's TLS: no login on it
+            // until a new handshake is accepted.
+            if let Some(ok) = self.tls_approved.get_mut(usize::from(conn)) {
+                *ok = false;
+            }
         }
         vec![self.reply(conn, output.result)]
     }
@@ -1335,6 +1343,37 @@ mod tests {
             windows,
             current: true,
         }
+    }
+
+    #[test]
+    fn a_failed_tls_reply_withdraws_the_approval() {
+        let mut s = https_session(None);
+        handshake_done(&mut s, 0, cert("AA", Ok(())));
+        let start = |s: &mut WinrmSession| {
+            s.on_worker(Message::SspiRequest {
+                channel: 5,
+                conn: 0,
+                op: SspiOp::Start,
+            })
+        };
+        let job = |fx: &[Effect]| {
+            fx.iter().find_map(|e| match e {
+                Effect::Broker(Job::Sspi(j)) => Some(j.ntlm),
+                _ => None,
+            })
+        };
+        // Over HTTPS the broker, not the job, allows NTLM.
+        assert_eq!(job(&start(&mut s)), Some(false));
+        s.on_broker(ferossh_auth::Reply::Sspi {
+            login: 5,
+            conn: 0,
+            output: SspiOutput {
+                result: SspiResult::Failed("tls broke".into()),
+                package: None,
+                cert: None,
+            },
+        });
+        assert_eq!(job(&start(&mut s)), None);
     }
 
     #[test]

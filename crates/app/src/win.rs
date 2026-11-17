@@ -5805,10 +5805,6 @@ impl Window {
                     p.winrm_https,
                     saved.as_ref(),
                 )
-                .map(|mut t| {
-                    t.ntlm = p.winrm_ntlm;
-                    t
-                })
             }
             _ => WinrmTarget::typed(destination),
         };
@@ -6063,7 +6059,7 @@ impl Window {
 
     /// Opens WinRM session `target` in pane `id`; `ask` skips the
     /// connection's password source (it just failed) and asks.
-    fn connect_winrm_with(&mut self, id: PaneId, target: WinrmTarget, ask: bool) {
+    fn connect_winrm_with(&mut self, id: PaneId, mut target: WinrmTarget, ask: bool) {
         self.end_host(id);
         if let Some(p) = self.panes.get_mut(&id) {
             p.term.scroll_to_bottom();
@@ -6080,12 +6076,15 @@ impl Window {
             );
         }
         self.apply_look(id, &target.alias, &target.hostname, target.tag.as_deref());
-        let source = self
+        let profile = self
             .settings
             .profile(&target.alias)
-            .filter(|p| p.kind == SessionKind::WinRm)
-            .map(|p| p.password.clone())
-            .unwrap_or_default();
+            .filter(|p| p.kind == SessionKind::WinRm);
+        // Read now, not carried over from the session a reconnect or a
+        // split copies: NTLM over HTTP is allowed only while the saved
+        // connection still says so.
+        target.ntlm = !target.https && profile.is_some_and(|p| p.winrm_ntlm);
+        let source = profile.map(|p| p.password.clone()).unwrap_or_default();
         let mut session = WinrmSession::new(channel, target);
         session.password_source = source != PasswordSource::Ask && !ask;
         session.remember_password = source == PasswordSource::Windows;
