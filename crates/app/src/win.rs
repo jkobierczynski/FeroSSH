@@ -6677,9 +6677,15 @@ impl Window {
             } else {
                 // Files only come in once the user said yes: any output
                 // (a MOTD, a `cat` of someone's file) can start a send.
+                let host = self
+                    .panes
+                    .get(&id)
+                    .map(Pane::host_label)
+                    .unwrap_or_default();
                 self.queued.push(Command::ConfirmZmodemReceive {
                     pane: id,
                     channel,
+                    host,
                     folder: self.download_dir(),
                 });
                 Vec::new()
@@ -16202,10 +16208,11 @@ enum Command {
         channel: ChannelId,
     },
     /// Asks whether to take the files the server's `sz` in pane `pane`
-    /// sends, into `folder`.
+    /// (connected to `host`) sends, into `folder`.
     ConfirmZmodemReceive {
         pane: PaneId,
         channel: ChannelId,
+        host: String,
         folder: PathBuf,
     },
     /// Other tmux clients keep gateway `gateway`'s windows small: offer
@@ -17789,12 +17796,14 @@ fn run_command(hwnd: HWND, command: Command) {
         Command::ConfirmZmodemReceive {
             pane,
             channel,
+            host,
             folder,
         } => {
             let text = format!(
-                "The server wants to send files with ZMODEM (sz).\n\nReceive them into {}?\n\n\
+                "{} wants to send files with ZMODEM (sz).\n\nReceive them into {}?\n\n\
                  Only say yes if you started the send yourself. Files never replace one \
                  already there, and Windows marks them as downloaded.",
+                crate::ssh::sanitize_line(&host),
                 crate::ssh::sanitize_line(&folder.display().to_string())
             );
             let yes =
