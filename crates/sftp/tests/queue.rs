@@ -1072,3 +1072,34 @@ fn a_numbered_download_keeps_its_name_across_a_reconnect_and_cancel() {
     assert!(run(&mut remote, &mut fake));
     assert_eq!(fs::read(s.local().join("a_b")).unwrap(), one);
 }
+
+#[test]
+fn cancelling_a_download_that_never_started_leaves_the_others_part_alone() {
+    let s = Scratch::new("collide-queued");
+    let one = pattern(2_000_000);
+    fs::write(s.remote().join("a:b"), &one).unwrap();
+    fs::write(s.remote().join("a_b"), b"other").unwrap();
+    let (mut remote, mut fake) = connected(&s.remote());
+    remote.parallel = 1;
+    remote.download(&entry(&remote, "a:b"), &s.local()).unwrap();
+    let second = remote.download(&entry(&remote, "a_b"), &s.local()).unwrap();
+    // The first is part way through (and paused by the dropped
+    // connection); the second never started.
+    fake.drop_after = Some(fake.answered + 20);
+    assert!(!run(&mut remote, &mut fake));
+    let part = s.local().join("a_b.part");
+    let have = fs::metadata(&part).unwrap().len();
+    assert!(have > 0);
+    remote.cancel(second);
+    assert_eq!(fs::metadata(&part).unwrap().len(), have);
+    remote.attach(CHANNEL + 1, 2);
+    fake.reads.clear();
+    assert!(run(&mut remote, &mut fake));
+    assert_eq!(fs::read(s.local().join("a_b")).unwrap(), one);
+    // It carried on from its part file instead of starting over.
+    assert!(
+        fake.reads.first().is_some_and(|&r| r > 0),
+        "{:?}",
+        fake.reads.first()
+    );
+}

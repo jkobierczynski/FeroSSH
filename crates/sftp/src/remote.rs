@@ -122,9 +122,10 @@ pub struct Job {
     /// Bumped whenever the job restarts, so replies to an earlier run are
     /// told apart and dropped.
     generation: u32,
-    /// The numbered local name a download was given when `local` was
-    /// taken, kept across pause and reconnect so the job goes on with its
-    /// own part file, and cancel removes that one.
+    /// The local name a download started writing to (`local`, or a
+    /// numbered name when that was taken), kept across pause and
+    /// reconnect so the job goes on with its own part file, and cancel
+    /// removes that one and no other job's.
     dest: Option<PathBuf>,
     run: Run,
     speed: Speed,
@@ -920,14 +921,22 @@ impl Remote {
             _ => None,
         };
         self.drop_run(i);
+        // Part files other downloads are writing: never this job's to
+        // remove, even when it has not started and shares their name.
+        let busy = self.busy_parts(i);
         let Some(job) = self.jobs.get_mut(i) else {
             return;
         };
         job.state = State::Cancelled;
         job.run = Run::Idle;
         if job.kind == Kind::Download {
-            let own = job.dest.take().unwrap_or_else(|| job.local.clone());
-            let _ = std::fs::remove_file(with_suffix(&own, ".part"));
+            let own = with_suffix(
+                &job.dest.take().unwrap_or_else(|| job.local.clone()),
+                ".part",
+            );
+            if !busy.contains(&fold(&own)) {
+                let _ = std::fs::remove_file(own);
+            }
         }
         if let Some(path) = part {
             self.request(SftpOp::Remove { path }, Purpose::Ignore);
@@ -1485,6 +1494,21 @@ impl Remote {
         }
     }
 
+    /// The part files downloads other than job `i` are writing, compared
+    /// without case: Windows file names ignore it.
+    fn busy_parts(&self, i: usize) -> Vec<String> {
+        self.jobs
+            .iter()
+            .enumerate()
+            .filter(|(k, j)| *k != i && !j.state.finished())
+            .filter_map(|(_, j)| match &j.run {
+                Run::Down(d) => Some(fold(&d.part)),
+                // Started before a pause or a dropped connection.
+                _ => j.dest.as_ref().map(|t| fold(&with_suffix(t, ".part"))),
+            })
+            .collect()
+    }
+
     fn download_stat(&mut self, i: usize, attrs: FileAttrs) {
         if attrs.is_dir() {
             return self.fail(i, "It is a folder now.".into());
@@ -1492,17 +1516,7 @@ impl Remote {
         // Part files other downloads are writing right now: two remote
         // names can map to one local name (`a:b` and `a_b`), and the
         // second must not take the first's part file for its own.
-        // Compared without case: Windows file names ignore it.
-        let busy: Vec<String> = self
-            .jobs
-            .iter()
-            .enumerate()
-            .filter(|(k, _)| *k != i)
-            .filter_map(|(_, j)| match &j.run {
-                Run::Down(d) => Some(fold(&d.part)),
-                _ => None,
-            })
-            .collect();
+        let busy = self.busy_parts(i);
         let Some(job) = self.jobs.get_mut(i) else {
             return;
         };
@@ -1547,7 +1561,7 @@ impl Remote {
             Err(e) => return self.fail(i, format!("{}: {e}", part.display())),
         };
         job.done = resume;
-        job.dest = (target != job.local).then(|| target.clone());
+        job.dest = Some(target.clone());
         let remote = job.remote.clone();
         job.run = Run::Down(Box::new(Down {
             phase: Phase::Opening,
