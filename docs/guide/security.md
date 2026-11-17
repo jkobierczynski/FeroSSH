@@ -4,7 +4,7 @@ FeroSSH is built so that a bug in the code that reads network data cannot reach 
 
 ## Separate processes
 
-- **The window** draws the terminal, reads your keyboard, holds your settings and talks to the key agents. It never parses data from the network.
+- **The window** draws the terminal, reads your keyboard, holds your settings and talks to the key agents. It never parses data from the network, with one exception: it checks the connection setup of each forwarded X11 connection for the fake cookie, a short fixed-format header, before it swaps in the real cookie and connects to your X server.
 - **The SSH worker** speaks SSH to the server. It runs in a Windows AppContainer that allows network access and nothing else: it cannot read your files, your registry or your private keys. When the server wants a signature, the worker asks the window, and the window asks your agent, Pageant, the key file or your security key. Each SSH connection has a worker process of its own (tabs that share a login share it too), so a server that took over its worker still cannot see your sessions on other servers.
 
 Every sandboxed process also runs in a job object (it dies with the window, cannot start other programs, is capped at 1 GiB of memory and cannot touch the clipboard or other windows) and starts with Windows' exploit mitigations turned on: no Win32k system calls, Control Flow Guard, CET shadow stacks where the CPU has them, no dynamic code and mandatory ASLR. `ferossh.exe --check-sandbox | more` shows what your Windows allows.

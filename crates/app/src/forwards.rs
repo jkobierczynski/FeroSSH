@@ -1889,6 +1889,14 @@ mod tests {
     /// An engine with X11 on for connection 1, to a listener that stands
     /// for the X server.
     fn x11_engine() -> (Forwarder, Arc<Mutex<Vec<Message>>>, std::net::TcpListener) {
+        x11_engine_with(MIT_COOKIE, &REAL)
+    }
+
+    /// The same, for an X server with this authorisation.
+    fn x11_engine_with(
+        real_name: &str,
+        real_data: &[u8],
+    ) -> (Forwarder, Arc<Mutex<Vec<Message>>>, std::net::TcpListener) {
         let (listener, number) = (100..400)
             .find_map(|n| {
                 std::net::TcpListener::bind(("127.0.0.1", X11_BASE + n))
@@ -1904,8 +1912,8 @@ mod tests {
                 x11: Some(X11Setup {
                     display: Display::parse(&format!("127.0.0.1:{number}")).unwrap(),
                     fake: FAKE,
-                    real_name: MIT_COOKIE.into(),
-                    real_data: REAL.to_vec().into(),
+                    real_name: real_name.into(),
+                    real_data: real_data.to_vec().into(),
                 }),
                 ..Setup::default()
             },
@@ -1984,7 +1992,18 @@ mod tests {
 
     #[test]
     fn x11_setups_get_the_real_cookie_here() {
-        let (fwd, sent, x_server) = x11_engine();
+        x11_setup_swapped(MIT_COOKIE, &REAL);
+    }
+
+    #[test]
+    fn x11_setups_lose_the_cookie_for_an_open_x_server() {
+        // A shorter setup goes out: the credit must still be for what the
+        // worker sent.
+        x11_setup_swapped("", b"");
+    }
+
+    fn x11_setup_swapped(real_name: &str, real_data: &[u8]) {
+        let (fwd, sent, x_server) = x11_engine_with(real_name, real_data);
         let channel = WORKER_IDS;
         x11_incoming(&fwd, channel);
         // The setup in two pieces, with the client's first request after it.
@@ -2001,7 +2020,7 @@ mod tests {
         });
         let (mut s, _) = x_server.accept().unwrap();
         s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
-        let mut want = x_setup(MIT_COOKIE.as_bytes(), &REAL);
+        let mut want = x_setup(real_name.as_bytes(), real_data);
         want.extend_from_slice(b"next");
         let mut got = vec![0u8; want.len()];
         std::io::Read::read_exact(&mut s, &mut got).unwrap();
