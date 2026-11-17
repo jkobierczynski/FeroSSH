@@ -442,7 +442,7 @@ pub fn decode(bytes: &[u8]) -> io::Result<String> {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!(
-                    "line {line} has a zero byte where the file is not UTF-16; fix or remove it so no entry is lost"
+                    "line {line} is not UTF-8 or the Latin-only UTF-16 PowerShell writes; save the file as UTF-8 or fix that line so no entry is lost"
                 ),
             ));
         }
