@@ -61,6 +61,12 @@ pub struct WinrmTarget {
     /// HTTPS (TLS through SChannel) instead of HTTP with encrypted
     /// messages.
     pub https: bool,
+    /// Over HTTP, NTLM may log in where Kerberos cannot (`WinrmNtlm yes`).
+    /// Off, an HTTP login is Kerberos only.
+    pub ntlm: bool,
+    /// Made from a saved connection (`resolve`), not typed: only then
+    /// do that connection's settings, such as `WinrmNtlm`, apply.
+    pub saved: bool,
 }
 
 fn valid_user(user: &str) -> bool {
@@ -106,6 +112,8 @@ impl WinrmTarget {
             tag: None,
             connect_timeout: Timing::default().connect_timeout,
             https,
+            ntlm: false,
+            saved: false,
         })
     }
 
@@ -151,6 +159,8 @@ impl WinrmTarget {
                 .connect_timeout
                 .unwrap_or(Timing::default().connect_timeout),
             https,
+            ntlm: false,
+            saved: true,
         })
     }
 
@@ -296,6 +306,7 @@ impl WinrmCloser {
                     conn,
                     host: self.host.clone(),
                     credentials: None,
+                    ntlm: false,
                     op,
                 }))],
                 false,
@@ -734,6 +745,10 @@ impl WinrmSession {
                     conn,
                     host: self.target.hostname.clone(),
                     credentials: credentials.filter(|_| matches!(op, SspiOp::Start)),
+                    // Over HTTP only when allowed. Over HTTPS the broker
+                    // allows it itself, and only while that connection's
+                    // TLS is up: a flag here would outlive a TLS failure.
+                    ntlm: self.target.ntlm && !self.target.https,
                     op,
                 }))]
             }
@@ -752,6 +767,7 @@ impl WinrmSession {
                     conn,
                     host: self.target.hostname.clone(),
                     credentials: None,
+                    ntlm: false,
                     op,
                 }))]
             }
@@ -840,6 +856,13 @@ impl WinrmSession {
         }
         if let Some(cert) = output.cert {
             return self.check_cert(conn, cert, output.result);
+        }
+        if matches!(output.result, SspiResult::Failed(_)) {
+            // The broker dropped that connection's TLS: no login on it
+            // until a new handshake is accepted.
+            if let Some(ok) = self.tls_approved.get_mut(usize::from(conn)) {
+                *ok = false;
+            }
         }
         vec![self.reply(conn, output.result)]
     }
@@ -1269,6 +1292,27 @@ mod tests {
         })
     }
 
+    #[test]
+    fn ntlm_over_http_only_when_the_connection_allows_it() {
+        let ntlm_of = |t: WinrmTarget| {
+            let mut s = WinrmSession::new(5, t);
+            s.start();
+            let fx = s.on_worker(Message::SspiRequest {
+                channel: 5,
+                conn: 0,
+                op: SspiOp::Start,
+            });
+            match &fx[..] {
+                [Effect::Broker(Job::Sspi(j))] => j.ntlm,
+                other => panic!("{other:?}"),
+            }
+        };
+        assert!(!ntlm_of(WinrmTarget::typed("winrm://srv").unwrap()));
+        let mut allowed = WinrmTarget::typed("winrm://srv").unwrap();
+        allowed.ntlm = true;
+        assert!(ntlm_of(allowed));
+    }
+
     fn https_session(store: Option<PathBuf>) -> WinrmSession {
         let mut s = WinrmSession::new(5, WinrmTarget::typed("winrms://srv").unwrap());
         s.cert_store = store;
@@ -1304,6 +1348,37 @@ mod tests {
             windows,
             current: true,
         }
+    }
+
+    #[test]
+    fn a_failed_tls_reply_withdraws_the_approval() {
+        let mut s = https_session(None);
+        handshake_done(&mut s, 0, cert("AA", Ok(())));
+        let start = |s: &mut WinrmSession| {
+            s.on_worker(Message::SspiRequest {
+                channel: 5,
+                conn: 0,
+                op: SspiOp::Start,
+            })
+        };
+        let job = |fx: &[Effect]| {
+            fx.iter().find_map(|e| match e {
+                Effect::Broker(Job::Sspi(j)) => Some(j.ntlm),
+                _ => None,
+            })
+        };
+        // Over HTTPS the broker, not the job, allows NTLM.
+        assert_eq!(job(&start(&mut s)), Some(false));
+        s.on_broker(ferossh_auth::Reply::Sspi {
+            login: 5,
+            conn: 0,
+            output: SspiOutput {
+                result: SspiResult::Failed("tls broke".into()),
+                package: None,
+                cert: None,
+            },
+        });
+        assert_eq!(job(&start(&mut s)), None);
     }
 
     #[test]
@@ -1467,6 +1542,10 @@ mod tests {
         assert_eq!(t.user.as_deref(), Some("LAB\\admin"));
         assert_eq!(t.command, "cmd");
         assert_eq!(t.tag.as_deref(), Some("production"));
+        // Only a saved connection's own target takes its settings; one
+        // typed with the same name does not.
+        assert!(t.saved);
+        assert!(!WinrmTarget::typed("winrm://dc:8080").unwrap().saved);
         let t = WinrmTarget::resolve("dc", &env, Some("  "), false, None).unwrap();
         assert_eq!(t.command, DEFAULT_WINRM_COMMAND);
         // A saved connection keeps its own user and port over an SSH
