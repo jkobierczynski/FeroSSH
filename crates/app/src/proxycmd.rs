@@ -61,7 +61,8 @@ impl ProxyRun {
         input: Receiver<Message>,
         to_worker: impl Fn(Message) + Send + Sync + 'static,
     ) -> std::io::Result<Self> {
-        let mut command = Command::new(program);
+        // By its full path: never a program planted next to FeroSSH.
+        let mut command = Command::new(crate::program::locate(program)?);
         command
             .args(args)
             .stdin(Stdio::piped())

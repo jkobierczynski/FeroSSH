@@ -169,7 +169,7 @@ To reach a host that is only reachable through another one, give it a jump host:
 
 Each jump host logs in as if you connected to it, with its own host key check and its own key or password, in a sandboxed worker of its own. The host behind it is then reached through that login, encrypted end to end, so a jump host never sees what you type on the target. If a jump host cannot reach the next one, the pane says which one and why.
 
-`ProxyCommand` in your ssh_config runs a local program (for example `corkscrew proxy.example.org 8080 %h %p`) and sends the connection through it. FeroSSH asks once before it runs a command line it has not run before, and shows what the program printed when it fails. `ProxyJump none` or `ProxyCommand none` turns either off for a host.
+`ProxyCommand` in your ssh_config runs a local program (for example `corkscrew proxy.example.org 8080 %h %p`) and sends the connection through it. FeroSSH asks once before it runs a command line it has not run before, and shows what the program printed when it fails. A program given by name alone (`nc`, `corkscrew`) is looked for in the Windows folders and the folders on `PATH` only, never in FeroSSH's own folder or the current one, so a file that landed next to `ferossh.exe` (in Downloads, say) cannot stand in for it; give the full path for a program elsewhere. Password commands are found the same way. `ProxyJump none` or `ProxyCommand none` turns either off for a host.
 
 ## Proxies
 

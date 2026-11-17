@@ -16,7 +16,9 @@ const MAX_OUTPUT: u64 = 64 * 1024;
 
 /// Runs `program` with `args` and returns the first line it printed.
 pub fn run(program: &str, args: &[String], timeout: Duration) -> Result<Zeroizing<String>, String> {
-    let mut command = Command::new(program);
+    // By its full path: never a program planted next to FeroSSH.
+    let path = crate::program::locate(program).map_err(|e| format!("{e}."))?;
+    let mut command = Command::new(path);
     command
         .args(args)
         .stdin(Stdio::null())
@@ -113,7 +115,7 @@ mod tests {
         let e = run("sh", &sh("true"), TIMEOUT).unwrap_err();
         assert!(e.contains("printed no password"), "{e}");
         let e = run("no-such-program-ferossh", &[], TIMEOUT).unwrap_err();
-        assert!(e.contains("did not start"), "{e}");
+        assert!(e.contains("is not in the Windows folders"), "{e}");
     }
 
     #[test]
