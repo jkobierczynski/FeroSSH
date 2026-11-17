@@ -26,7 +26,7 @@ jobs:
     name: Tag matches Cargo.toml
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - name: Compare the tag with the workspace version and look for notes
         if: github.event_name == 'push'
         run: |
@@ -43,6 +43,11 @@ jobs:
       # Signs a throwaway update file, so a secret that does not match
       # crates/update/update-key.pub (or a missing public key) fails here,
       # not after the half-hour build.
+      # Built in a step of its own, without the key: build scripts and
+      # proc macros run while compiling, and none of them should be able
+      # to read the secret. The step that has it only runs the binary.
+      - name: Build the update signer
+        run: cargo build --locked -q -p ferossh-update --example sign
       - name: Check the update signing key
         env:
           UPDATE_SIGNING_KEY: ${{ secrets.UPDATE_SIGNING_KEY }}
@@ -51,7 +56,7 @@ jobs:
             echo "No UPDATE_SIGNING_KEY secret: the release will have no update file."
             exit 0
           fi
-          if ! cargo run --locked -q -p ferossh-update --example sign -- 0.0.0 2000-01-01 "$RUNNER_TEMP" > /dev/null; then
+          if ! target/debug/examples/sign 0.0.0 2000-01-01 "$RUNNER_TEMP" > /dev/null; then
             echo "::error::UPDATE_SIGNING_KEY and crates/update/update-key.pub do not go together; commit the public key from keygen, or fix the secret"
             exit 1
           fi
@@ -75,29 +80,29 @@ jobs:
       id-token: write
       attestations: write
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/download-artifact@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           name: ferossh-exe
           path: dist
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           name: ferossh-desktop-viewer-exe
           path: dist
       # The same two for Windows on ARM: ferossh-arm64.exe and
       # ferossh-desktop-arm64.exe, built on an ARM64 runner.
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           name: arm64-ferossh-exe
           path: dist
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           name: arm64-ferossh-desktop-viewer-exe
           path: dist
       # The Linux agents Run remote app copies to hosts: they go next to
       # ferossh.exe. Not code signed (Authenticode is for Windows files);
       # SHA256SUMS.txt and the attestation cover them.
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           name: ferostream-agents
           path: dist
@@ -142,7 +147,7 @@ jobs:
           } else {
             "SignPath is not configured: the exes are not signed." | Tee-Object -Append $env:GITHUB_STEP_SUMMARY
           }
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         id: unsigned
         if: steps.signpath.outputs.enabled == 'true'
         with:
@@ -152,7 +157,7 @@ jobs:
             dist/ferossh-desktop.exe
             dist/ferossh-arm64.exe
             dist/ferossh-desktop-arm64.exe
-      - uses: signpath/github-action-submit-signing-request@v3
+      - uses: signpath/github-action-submit-signing-request@f6d04783b4569d051e0c80105fe66e82819d0092 # v3
         if: steps.signpath.outputs.enabled == 'true'
         with:
           api-token: ${{ secrets.SIGNPATH_API_TOKEN }}
@@ -234,13 +239,13 @@ jobs:
       # signed release" workflow take this manifest and the unsigned exes
       # from the run's artifacts, not from the draft release, and check them
       # against the attestation below before signing or attesting anything.
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: build-manifest
           path: dist/BUILD-MANIFEST.json
 
       # Verify with: gh attestation verify ferossh.exe -R jkobierczynski/FeroSSH
-      - uses: actions/attest-build-provenance@v2
+      - uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2
         if: github.event_name == 'push'
         with:
           subject-path: |
@@ -260,12 +265,12 @@ jobs:
         env:
           TAG: ${{ github.event_name == 'push' && github.ref_name || 'v0.0.0-dry-run' }}
         run: pwsh scripts/winget-manifest.ps1 -Version $env:TAG.TrimStart("v") -Sums dist/SHA256SUMS.txt -OutDir winget
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: winget-manifests
           path: winget
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         if: github.event_name != 'push'
         with:
           name: release-dry-run
@@ -277,6 +282,10 @@ jobs:
       # `cargo run -p ferossh-update --example keygen`; without it the
       # release has no update file and checks say so. Pre-releases never
       # become "latest", so they are not offered as updates.
+      # Compiled without the key in reach; only the built signer sees it.
+      - name: Build the update signer
+        shell: pwsh
+        run: cargo build --locked -q -p ferossh-update --example sign
       - name: Update file
         shell: pwsh
         env:
@@ -288,7 +297,7 @@ jobs:
             exit 0
           }
           $released = (Get-Date).ToUniversalTime().ToString("yyyy-MM-dd")
-          cargo run --locked -q -p ferossh-update --example sign -- $env:TAG.TrimStart("v") $released dist
+          & target\debug\examples\sign.exe $env:TAG.TrimStart("v") $released dist
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
 
       # The gh arguments are built on every run, so a dry run shows exactly
