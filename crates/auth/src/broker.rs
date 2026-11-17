@@ -192,6 +192,17 @@ fn certificates_for(kf: &KeyFile, choice: &KeyChoice, notes: &mut Vec<String>) -
     let beside = PathBuf::from(beside);
     let mut out: Vec<Vec<u8>> = Vec::new();
     for path in choice.certificates.iter().chain(std::iter::once(&beside)) {
+        // Not even looked at: opening a share logs in to its server.
+        if crate::keyfile::is_network_path(path) {
+            if path != &beside {
+                notes.push(format!(
+                    "Skipping certificate {}: it is on a network share, which FeroSSH \
+                     does not open.",
+                    path.display()
+                ));
+            }
+            continue;
+        }
         let Some(cert) = read_certificate(path) else {
             if path != &beside && path.exists() {
                 notes.push(format!(
