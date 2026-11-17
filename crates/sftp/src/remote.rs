@@ -929,11 +929,12 @@ impl Remote {
         };
         job.state = State::Cancelled;
         job.run = Run::Idle;
-        if job.kind == Kind::Download {
-            let own = with_suffix(
-                &job.dest.take().unwrap_or_else(|| job.local.clone()),
-                ".part",
-            );
+        // Only a download that started has a part file of its own; one
+        // still queued never touches the name it would have used.
+        if job.kind == Kind::Download
+            && let Some(dest) = job.dest.take()
+        {
+            let own = with_suffix(&dest, ".part");
             if !busy.contains(&fold(&own)) {
                 let _ = std::fs::remove_file(own);
             }
@@ -1494,13 +1495,17 @@ impl Remote {
         }
     }
 
-    /// The part files downloads other than job `i` are writing, compared
-    /// without case: Windows file names ignore it.
+    /// The part files downloads other than job `i` hold (running,
+    /// paused, waiting or failed, so a retry can resume), compared without
+    /// case: Windows file names ignore it.
     fn busy_parts(&self, i: usize) -> Vec<String> {
         self.jobs
             .iter()
             .enumerate()
-            .filter(|(k, j)| *k != i && !j.state.finished())
+            // A failed job keeps its part file for a retry.
+            .filter(|(k, j)| {
+                *k != i && !matches!(j.state, State::Done | State::Cancelled | State::Skipped)
+            })
             .filter_map(|(_, j)| match &j.run {
                 Run::Down(d) => Some(fold(&d.part)),
                 // Started before a pause or a dropped connection.

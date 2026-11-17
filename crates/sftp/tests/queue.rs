@@ -1103,3 +1103,35 @@ fn cancelling_a_download_that_never_started_leaves_the_others_part_alone() {
         fake.reads.first()
     );
 }
+
+#[test]
+fn a_failed_downloads_part_file_is_kept_for_its_retry() {
+    let s = Scratch::new("collide-failed");
+    let one = pattern(2_000_000);
+    fs::write(s.remote().join("a:b"), &one).unwrap();
+    fs::write(s.remote().join("a_b"), b"other").unwrap();
+    let (mut remote, mut fake) = connected(&s.remote());
+    remote.parallel = 1;
+    let first = remote.download(&entry(&remote, "a:b"), &s.local()).unwrap();
+    let second = remote.download(&entry(&remote, "a_b"), &s.local()).unwrap();
+    fake.drop_after = Some(fake.answered + 20);
+    assert!(!run(&mut remote, &mut fake));
+    let part = s.local().join("a_b.part");
+    let have = fs::metadata(&part).unwrap().len();
+    assert!(have > 0);
+    // Cancelling the namesake that never started touches nothing.
+    remote.cancel(second);
+    assert_eq!(fs::metadata(&part).unwrap().len(), have);
+    // The source is gone when the connection is back: the first fails,
+    // keeping its part file for a retry.
+    fs::rename(s.remote().join("a:b"), s.remote().join("moved")).unwrap();
+    remote.attach(CHANNEL + 1, 2);
+    assert!(run(&mut remote, &mut fake));
+    assert_eq!(remote.job_state(first), Some(State::Failed));
+    assert_eq!(fs::metadata(&part).unwrap().len(), have);
+    // A new download of the same local name does not take it over.
+    remote.download(&entry(&remote, "a_b"), &s.local()).unwrap();
+    assert!(run(&mut remote, &mut fake));
+    assert_eq!(fs::metadata(&part).unwrap().len(), have);
+    assert_eq!(fs::read(s.local().join("a_b (2)")).unwrap(), b"other");
+}
