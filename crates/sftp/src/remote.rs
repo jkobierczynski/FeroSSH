@@ -929,12 +929,15 @@ impl Remote {
         };
         job.state = State::Cancelled;
         job.run = Run::Idle;
-        // Only a download that started has a part file of its own; one
-        // still queued never touches the name it would have used.
-        if job.kind == Kind::Download
-            && let Some(dest) = job.dest.take()
-        {
-            let own = with_suffix(&dest, ".part");
+        // A started download removes its own part file; one that never
+        // started may still clear a part left by an earlier session, as
+        // long as no other job here holds that name (running, paused,
+        // waiting or failed).
+        if job.kind == Kind::Download {
+            let own = with_suffix(
+                &job.dest.take().unwrap_or_else(|| job.local.clone()),
+                ".part",
+            );
             if !busy.contains(&fold(&own)) {
                 let _ = std::fs::remove_file(own);
             }
