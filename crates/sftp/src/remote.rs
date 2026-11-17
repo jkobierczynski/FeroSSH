@@ -122,6 +122,11 @@ pub struct Job {
     /// Bumped whenever the job restarts, so replies to an earlier run are
     /// told apart and dropped.
     generation: u32,
+    /// The local name a download started writing to (`local`, or a
+    /// numbered name when that was taken), kept across pause and
+    /// reconnect so the job goes on with its own part file, and cancel
+    /// removes that one and no other job's.
+    dest: Option<PathBuf>,
     run: Run,
     speed: Speed,
 }
@@ -432,13 +437,61 @@ fn with_suffix(path: &Path, suffix: &str) -> PathBuf {
     PathBuf::from(s)
 }
 
+/// `path` as a key that ignores case, for telling whether two downloads
+/// would share a file on a file system that ignores it.
+fn fold(path: &Path) -> String {
+    path.to_string_lossy().to_lowercase()
+}
+
 /// A local name not taken yet: `name (2).ext`, `name (3).ext`, ...
-fn free_local(path: &Path) -> Option<PathBuf> {
+fn free_local(path: &Path, busy: &[String]) -> Option<PathBuf> {
     let dir = path.parent()?;
     let name = path.file_name()?.to_string_lossy().into_owned();
     (2..=MAX_NUMBERED)
-        .map(|n| dir.join(names::numbered(&name, n)))
-        .find(|p| !p.exists() && !with_suffix(p, ".part").exists())
+        .map(|n| dir.join(numbered_within(&name, n, MAX_NAME - ".part".len())))
+        .find(|p| {
+            let part = with_suffix(p, ".part");
+            !p.exists() && !part.exists() && !taken(p, busy)
+        })
+}
+
+/// Longest file name most file systems take, in bytes.
+const MAX_NAME: usize = 255;
+
+/// `names::numbered`, with the stem shortened (at a character boundary)
+/// so the result fits in `max` bytes: room for ` (n)` and, from the
+/// caller, `.part`.
+fn numbered_within(name: &str, n: u32, max: usize) -> String {
+    let full = names::numbered(name, n);
+    if full.len() <= max {
+        return full;
+    }
+    let (stem, ext) = match name.rfind('.') {
+        Some(i) if i > 0 => (
+            name.get(..i).unwrap_or(name),
+            name.get(i..).unwrap_or_default(),
+        ),
+        _ => (name, ""),
+    };
+    // An extension too long to keep is cut like the rest of the name.
+    let (stem, ext) = if format!(" ({n}){ext}").len() > max {
+        (name, "")
+    } else {
+        (stem, ext)
+    };
+    let tail = format!(" ({n}){ext}");
+    let mut keep = max.saturating_sub(tail.len()).min(stem.len());
+    while keep > 0 && !stem.is_char_boundary(keep) {
+        keep -= 1;
+    }
+    format!("{}{tail}", stem.get(..keep).unwrap_or_default())
+}
+
+/// Whether `target` or its part file is a name another download holds
+/// (its final name or its part file), compared without case.
+fn taken(target: &Path, busy: &[String]) -> bool {
+    let (t, p) = (fold(target), fold(&with_suffix(target, ".part")));
+    busy.iter().any(|b| *b == t || *b == p)
 }
 
 fn remote_numbered(path: &[u8], n: u32) -> Vec<u8> {
@@ -777,6 +830,7 @@ impl Remote {
             choice: None,
             put_back: None,
             generation: 0,
+            dest: None,
             run: Run::Idle,
             speed: Speed::default(),
         });
@@ -909,13 +963,26 @@ impl Remote {
             _ => None,
         };
         self.drop_run(i);
+        // Part files other downloads are writing: never this job's to
+        // remove, even when it has not started and shares their name.
+        let busy = self.busy_parts(i);
         let Some(job) = self.jobs.get_mut(i) else {
             return;
         };
         job.state = State::Cancelled;
         job.run = Run::Idle;
+        // A started download removes its own part file; one that never
+        // started may still clear a part left by an earlier session, as
+        // long as no other job here holds that name (running, paused,
+        // waiting or failed).
         if job.kind == Kind::Download {
-            let _ = std::fs::remove_file(with_suffix(&job.local, ".part"));
+            let own = with_suffix(
+                &job.dest.take().unwrap_or_else(|| job.local.clone()),
+                ".part",
+            );
+            if !busy.contains(&fold(&own)) {
+                let _ = std::fs::remove_file(own);
+            }
         }
         if let Some(path) = part {
             self.request(SftpOp::Remove { path }, Purpose::Ignore);
@@ -1473,24 +1540,56 @@ impl Remote {
         }
     }
 
+    /// The names (final and part file) downloads other than job `i` hold (running,
+    /// paused, waiting or failed, so a retry can resume), compared without
+    /// case: Windows file names ignore it.
+    fn busy_parts(&self, i: usize) -> Vec<String> {
+        self.jobs
+            .iter()
+            .enumerate()
+            // A failed job keeps its part file for a retry.
+            .filter(|(k, j)| {
+                *k != i && !matches!(j.state, State::Done | State::Cancelled | State::Skipped)
+            })
+            .filter_map(|(_, j)| match &j.run {
+                Run::Down(d) => Some(d.target.clone()),
+                // Started before a pause or a dropped connection.
+                _ => j.dest.clone(),
+            })
+            // Both its final name and its part file: a part file named
+            // like another download's final name would be renamed over.
+            .flat_map(|t| [fold(&t), fold(&with_suffix(&t, ".part"))])
+            .collect()
+    }
+
     fn download_stat(&mut self, i: usize, attrs: FileAttrs) {
         if attrs.is_dir() {
             return self.fail(i, "It is a folder now.".into());
         }
+        // Part files other downloads are writing right now: two remote
+        // names can map to one local name (`a:b` and `a_b`), and the
+        // second must not take the first's part file for its own.
+        let busy = self.busy_parts(i);
         let Some(job) = self.jobs.get_mut(i) else {
             return;
         };
         job.size = attrs.size;
-        let mut target = job.local.clone();
+        let mut target = job.dest.clone().unwrap_or_else(|| job.local.clone());
         if target.exists() {
             match job.choice {
                 None => return self.ask(i),
                 Some(Choice::Skip) => return self.skip(i),
-                Some(Choice::KeepBoth) => match free_local(&target) {
+                Some(Choice::KeepBoth) => match free_local(&target, &busy) {
                     Some(t) => target = t,
                     None => return self.fail(i, "No free name to keep both.".into()),
                 },
                 Some(Choice::Overwrite) => {}
+            }
+        }
+        if taken(&target, &busy) {
+            match free_local(&target, &busy) {
+                Some(t) => target = t,
+                None => return self.fail(i, "No free name next to another download.".into()),
             }
         }
         let part = with_suffix(&target, ".part");
@@ -1515,6 +1614,7 @@ impl Remote {
             Err(e) => return self.fail(i, format!("{}: {e}", part.display())),
         };
         job.done = resume;
+        job.dest = Some(target.clone());
         let remote = job.remote.clone();
         job.run = Run::Down(Box::new(Down {
             phase: Phase::Opening,

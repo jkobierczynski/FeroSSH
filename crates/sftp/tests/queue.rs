@@ -980,3 +980,225 @@ fn a_failed_chmod_leaves_the_original_in_place() {
     assert_eq!(remote.job_state(id), Some(State::Failed));
     assert_eq!(fs::read_to_string(&script).unwrap(), "echo old\n");
 }
+
+#[test]
+fn two_names_for_one_local_name_never_share_a_part_file() {
+    let s = Scratch::new("collide");
+    let one = pattern(300_000);
+    let two: Vec<u8> = pattern(250_000).iter().map(|b| b ^ 0x55).collect();
+    // Both become `a_b` on Windows-safe local names.
+    fs::write(s.remote().join("a:b"), &one).unwrap();
+    fs::write(s.remote().join("a_b"), &two).unwrap();
+    let (mut remote, mut fake) = connected(&s.remote());
+    remote.parallel = 2;
+    let (e1, e2) = (entry(&remote, "a:b"), entry(&remote, "a_b"));
+    remote.download(&e1, &s.local()).unwrap();
+    remote.download(&e2, &s.local()).unwrap();
+    assert!(run(&mut remote, &mut fake));
+    for job in remote.jobs() {
+        assert_eq!(job.state, State::Done, "{:?}", job.note);
+    }
+    let mut got: Vec<Vec<u8>> = fs::read_dir(s.local())
+        .unwrap()
+        .map(|e| fs::read(e.unwrap().path()).unwrap())
+        .collect();
+    got.sort_by_key(Vec::len);
+    assert_eq!(got, vec![two, one]);
+}
+
+#[test]
+fn names_that_differ_only_in_case_never_share_a_part_file() {
+    let s = Scratch::new("case");
+    let one = pattern(300_000);
+    let two: Vec<u8> = pattern(250_000).iter().map(|b| b ^ 0x33).collect();
+    // One file on Windows, two here: treated as one either way.
+    fs::write(s.remote().join("README"), &one).unwrap();
+    fs::write(s.remote().join("readme"), &two).unwrap();
+    let (mut remote, mut fake) = connected(&s.remote());
+    remote.parallel = 2;
+    remote
+        .download(&entry(&remote, "README"), &s.local())
+        .unwrap();
+    remote
+        .download(&entry(&remote, "readme"), &s.local())
+        .unwrap();
+    assert!(run(&mut remote, &mut fake));
+    assert_eq!(fs::read(s.local().join("README")).unwrap(), one);
+    assert_eq!(fs::read(s.local().join("readme (2)")).unwrap(), two);
+}
+
+#[test]
+fn a_numbered_download_keeps_its_name_across_a_reconnect_and_cancel() {
+    let s = Scratch::new("collide-drop");
+    let one = pattern(2_000_000);
+    let two: Vec<u8> = pattern(1_500_000).iter().map(|b| b ^ 0x55).collect();
+    fs::write(s.remote().join("a:b"), &one).unwrap();
+    fs::write(s.remote().join("a_b"), &two).unwrap();
+    let (mut remote, mut fake) = connected(&s.remote());
+    remote.parallel = 2;
+    remote.download(&entry(&remote, "a:b"), &s.local()).unwrap();
+    remote.download(&entry(&remote, "a_b"), &s.local()).unwrap();
+    fake.drop_after = Some(fake.answered + 40);
+    assert!(!run(&mut remote, &mut fake));
+    let numbered = s.local().join("a_b (2).part");
+    let part = fs::metadata(&numbered).unwrap().len();
+    assert!(part > 0, "{part}");
+    // Back again: each job goes on with its own part file, from where it
+    // was; nothing starts over under a third name.
+    remote.attach(CHANNEL + 1, 2);
+    assert!(run(&mut remote, &mut fake));
+    for job in remote.jobs() {
+        assert_eq!(job.state, State::Done, "{:?}", job.note);
+    }
+    assert_eq!(fs::read(s.local().join("a_b")).unwrap(), one);
+    assert_eq!(fs::read(s.local().join("a_b (2)")).unwrap(), two);
+    assert!(!s.local().join("a_b (3)").exists());
+
+    // Cancelling the numbered one removes its own part file only.
+    let s = Scratch::new("collide-cancel");
+    fs::write(s.remote().join("a:b"), &one).unwrap();
+    fs::write(s.remote().join("a_b"), &two).unwrap();
+    let (mut remote, mut fake) = connected(&s.remote());
+    remote.parallel = 2;
+    remote.download(&entry(&remote, "a:b"), &s.local()).unwrap();
+    let second = remote.download(&entry(&remote, "a_b"), &s.local()).unwrap();
+    fake.drop_after = Some(fake.answered + 40);
+    assert!(!run(&mut remote, &mut fake));
+    assert!(s.local().join("a_b.part").exists());
+    remote.cancel(second);
+    assert!(!s.local().join("a_b (2).part").exists());
+    assert!(s.local().join("a_b.part").exists());
+    remote.attach(CHANNEL + 1, 2);
+    assert!(run(&mut remote, &mut fake));
+    assert_eq!(fs::read(s.local().join("a_b")).unwrap(), one);
+}
+
+#[test]
+fn cancelling_a_download_that_never_started_leaves_the_others_part_alone() {
+    let s = Scratch::new("collide-queued");
+    let one = pattern(2_000_000);
+    fs::write(s.remote().join("a:b"), &one).unwrap();
+    fs::write(s.remote().join("a_b"), b"other").unwrap();
+    let (mut remote, mut fake) = connected(&s.remote());
+    remote.parallel = 1;
+    remote.download(&entry(&remote, "a:b"), &s.local()).unwrap();
+    let second = remote.download(&entry(&remote, "a_b"), &s.local()).unwrap();
+    // The first is part way through (and paused by the dropped
+    // connection); the second never started.
+    fake.drop_after = Some(fake.answered + 20);
+    assert!(!run(&mut remote, &mut fake));
+    let part = s.local().join("a_b.part");
+    let have = fs::metadata(&part).unwrap().len();
+    assert!(have > 0);
+    remote.cancel(second);
+    assert_eq!(fs::metadata(&part).unwrap().len(), have);
+    remote.attach(CHANNEL + 1, 2);
+    fake.reads.clear();
+    assert!(run(&mut remote, &mut fake));
+    assert_eq!(fs::read(s.local().join("a_b")).unwrap(), one);
+    // It carried on from its part file instead of starting over.
+    assert!(
+        fake.reads.first().is_some_and(|&r| r > 0),
+        "{:?}",
+        fake.reads.first()
+    );
+}
+
+#[test]
+fn a_failed_downloads_part_file_is_kept_for_its_retry() {
+    let s = Scratch::new("collide-failed");
+    let one = pattern(2_000_000);
+    fs::write(s.remote().join("a:b"), &one).unwrap();
+    fs::write(s.remote().join("a_b"), b"other").unwrap();
+    let (mut remote, mut fake) = connected(&s.remote());
+    remote.parallel = 1;
+    let first = remote.download(&entry(&remote, "a:b"), &s.local()).unwrap();
+    let second = remote.download(&entry(&remote, "a_b"), &s.local()).unwrap();
+    fake.drop_after = Some(fake.answered + 20);
+    assert!(!run(&mut remote, &mut fake));
+    let part = s.local().join("a_b.part");
+    let have = fs::metadata(&part).unwrap().len();
+    assert!(have > 0);
+    // Cancelling the namesake that never started touches nothing.
+    remote.cancel(second);
+    assert_eq!(fs::metadata(&part).unwrap().len(), have);
+    // The source is gone when the connection is back: the first fails,
+    // keeping its part file for a retry.
+    fs::rename(s.remote().join("a:b"), s.remote().join("moved")).unwrap();
+    remote.attach(CHANNEL + 1, 2);
+    assert!(run(&mut remote, &mut fake));
+    assert_eq!(remote.job_state(first), Some(State::Failed));
+    assert_eq!(fs::metadata(&part).unwrap().len(), have);
+    // A new download of the same local name does not take it over.
+    remote.download(&entry(&remote, "a_b"), &s.local()).unwrap();
+    assert!(run(&mut remote, &mut fake));
+    assert_eq!(fs::metadata(&part).unwrap().len(), have);
+    assert_eq!(fs::read(s.local().join("a_b (2)")).unwrap(), b"other");
+}
+
+#[test]
+fn a_part_file_never_takes_another_downloads_final_name() {
+    let s = Scratch::new("collide-target");
+    let one = pattern(400_000);
+    let two: Vec<u8> = pattern(300_000).iter().map(|b| b ^ 0x11).collect();
+    let three: Vec<u8> = pattern(350_000).iter().map(|b| b ^ 0x22).collect();
+    // The third maps onto the first's name; its first numbered name's
+    // part file, `a_b (2).part`, is the second's final name.
+    fs::write(s.remote().join("a:b"), &one).unwrap();
+    fs::write(s.remote().join("a_b (2).part"), &two).unwrap();
+    fs::write(s.remote().join("a_b"), &three).unwrap();
+    let (mut remote, mut fake) = connected(&s.remote());
+    remote.parallel = 3;
+    for name in ["a:b", "a_b (2).part", "a_b"] {
+        remote.download(&entry(&remote, name), &s.local()).unwrap();
+    }
+    assert!(run(&mut remote, &mut fake));
+    for job in remote.jobs() {
+        assert_eq!(job.state, State::Done, "{:?}", job.note);
+    }
+    assert_eq!(fs::read(s.local().join("a_b")).unwrap(), one);
+    assert_eq!(fs::read(s.local().join("a_b (2).part")).unwrap(), two);
+    assert_eq!(fs::read(s.local().join("a_b (3)")).unwrap(), three);
+}
+
+#[test]
+fn a_numbered_long_name_still_fits_with_its_part_file() {
+    // 248 bytes locally: with " (2)" and ".part" it would be 257.
+    long_collision("collide-long", &"a".repeat(247), "");
+    // Nearly all extension: that has to be cut too.
+    long_collision("collide-long-ext", "a", &format!(".{}", "x".repeat(247)));
+}
+
+/// Downloads `{stem}:{ext}` and `{stem}_{ext}`, which land on one local
+/// name, and checks the second's numbered name and part file fit.
+fn long_collision(scratch: &str, stem: &str, ext: &str) {
+    let s = Scratch::new(scratch);
+    let one = pattern(100_000);
+    let two: Vec<u8> = pattern(90_000).iter().map(|b| b ^ 0x44).collect();
+    let (colon, under) = (format!("{stem}:{ext}"), format!("{stem}_{ext}"));
+    fs::write(s.remote().join(&colon), &one).unwrap();
+    fs::write(s.remote().join(&under), &two).unwrap();
+    let (mut remote, mut fake) = connected(&s.remote());
+    remote.parallel = 2;
+    remote
+        .download(&entry(&remote, &colon), &s.local())
+        .unwrap();
+    remote
+        .download(&entry(&remote, &under), &s.local())
+        .unwrap();
+    assert!(run(&mut remote, &mut fake));
+    for job in remote.jobs() {
+        assert_eq!(job.state, State::Done, "{:?}", job.note);
+    }
+    assert_eq!(fs::read(s.local().join(&under)).unwrap(), one);
+    let numbered: Vec<_> = fs::read_dir(s.local())
+        .unwrap()
+        .map(|e| e.unwrap().file_name().into_string().unwrap())
+        .filter(|n| *n != under)
+        .collect();
+    assert_eq!(numbered.len(), 1, "{numbered:?}");
+    let name = numbered.first().unwrap();
+    assert!(name.contains(" (2)"), "{name}");
+    assert!(name.len() + ".part".len() <= 255, "{}", name.len());
+    assert_eq!(fs::read(s.local().join(name)).unwrap(), two);
+}

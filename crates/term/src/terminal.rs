@@ -86,6 +86,20 @@ const MAX_CLIPBOARD_REQUEST: usize = 1 << 20;
 const MAX_QUEUED_EVENTS: usize = 1024;
 /// Combining-mark clusters a grid may collect before they are reset.
 const MAX_CLUSTERS: usize = 4096;
+/// The largest grid, more than any screen shows (8K at a 5-pixel font is
+/// about 1,500 x 540). A size from elsewhere, such as a tmux server's
+/// pane size, is clamped to it, so a hostile one cannot make FeroSSH
+/// allocate gigabytes and abort with every tab.
+pub const MAX_COLS: usize = 2048;
+pub const MAX_ROWS: usize = 1024;
+
+/// `cols` x `rows` within what a grid may be.
+fn grid_size(cols: usize, rows: usize) -> Size {
+    Size {
+        cols: cols.clamp(2, MAX_COLS),
+        rows: rows.clamp(1, MAX_ROWS),
+    }
+}
 
 /// Collects the emulator's events for `take_actions`.
 #[derive(Clone, Debug, Default)]
@@ -270,10 +284,7 @@ impl std::fmt::Debug for Terminal {
 impl Terminal {
     pub fn new(cols: usize, rows: usize, settings: &Settings) -> Self {
         let events = Events::default();
-        let size = Size {
-            cols: cols.max(2),
-            rows: rows.max(1),
-        };
+        let size = grid_size(cols, rows);
         let term = Term::new(config(settings), &size, events.clone());
         Self {
             term,
@@ -414,10 +425,7 @@ impl Terminal {
 
     /// Resizes the screen; lines reflow and the scrollback is kept.
     pub fn resize(&mut self, cols: usize, rows: usize) {
-        let size = Size {
-            cols: cols.max(2),
-            rows: rows.max(1),
-        };
+        let size = grid_size(cols, rows);
         if size.cols != self.cols() || size.rows != self.rows() {
             self.term.resize(size);
             self.drop_lone_spacers();

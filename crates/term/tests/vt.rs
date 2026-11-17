@@ -4,7 +4,10 @@
 #![allow(clippy::unwrap_used, clippy::indexing_slicing, clippy::panic)]
 
 use ferossh_render::{Cell, Color, CursorShape, Flags, Grid, Rgb, Theme};
-use ferossh_term::{Action, Key, Mods, MouseButton, MouseEvent, SelectionKind, Settings, Terminal};
+use ferossh_term::{
+    Action, Key, MAX_COLS, MAX_ROWS, Mods, MouseButton, MouseEvent, SelectionKind, Settings,
+    Terminal,
+};
 
 fn term(cols: usize, rows: usize) -> Terminal {
     Terminal::new(cols, rows, &Settings::default())
@@ -864,4 +867,16 @@ fn input_line_follows_a_long_line_of_wide_characters() {
     let cmd = "\u{754c}".repeat(1024);
     t.feed(cmd.as_bytes());
     assert_eq!(t.input_line(&mut mark).unwrap().before, cmd);
+}
+
+/// A size from a hostile tmux server (up to 10,000 x 10,000) is clamped
+/// instead of allocating gigabytes.
+#[test]
+fn grid_size_is_capped() {
+    let mut t = Terminal::new(10_000, 10_000, &Settings::default());
+    assert_eq!((t.cols(), t.rows()), (MAX_COLS, MAX_ROWS));
+    t.resize(80, 24);
+    assert_eq!((t.cols(), t.rows()), (80, 24));
+    t.resize(usize::MAX, usize::MAX);
+    assert_eq!((t.cols(), t.rows()), (MAX_COLS, MAX_ROWS));
 }
