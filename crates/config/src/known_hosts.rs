@@ -399,7 +399,20 @@ pub fn decode(bytes: &[u8]) -> io::Result<String> {
     if let Some(tail) = utf16 {
         let tail = tail.strip_prefix(&[0xFF, 0xFE][..]).unwrap_or(tail);
         let (pairs, odd) = (tail.chunks_exact(2), tail.len() % 2 == 1);
-        let units = pairs.map(|p| <[u8; 2]>::try_from(p).map_or(0xFFFD, u16::from_le_bytes));
+        let units: Vec<u16> = pairs
+            .map(|p| <[u8; 2]>::try_from(p).map_or(0xFFFD, u16::from_le_bytes))
+            .collect();
+        // What PowerShell writes for known_hosts is Latin text: every
+        // high byte zero. Anything else means the zero byte that started
+        // this part was not UTF-16 at all (a stray one in a UTF-8 file),
+        // and reading on would hide the lines after it, a @revoked one
+        // among them.
+        if units.iter().any(|&u| u > 0xFF && u != 0xFEFF) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "a zero byte where the file is not UTF-16; fix or remove that line so no entry is lost",
+            ));
+        }
         text.extend(
             char::decode_utf16(units)
                 .map(|c| c.unwrap_or(char::REPLACEMENT_CHARACTER))
@@ -409,14 +422,9 @@ pub fn decode(bytes: &[u8]) -> io::Result<String> {
             text.push(char::REPLACEMENT_CHARACTER);
         }
     }
-    // Where the UTF-16 part starts, in lines: entries there are ASCII, so
-    // anything else on an entry line means it was not UTF-16 after all
-    // (a stray zero byte in a UTF-8 file), and lines would be lost.
-    let utf8_lines = String::from_utf8_lossy(utf8).lines().count();
     for (n, line) in text.lines().enumerate() {
         let entry = line.trim_start();
-        let foreign = utf16.is_some() && n >= utf8_lines && !entry.is_ascii();
-        if !entry.starts_with('#') && (foreign || entry.contains(char::REPLACEMENT_CHARACTER)) {
+        if !entry.starts_with('#') && entry.contains(char::REPLACEMENT_CHARACTER) {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!(
@@ -638,19 +646,25 @@ mod tests {
     #[test]
     fn utf16_characters_never_become_line_ends() {
         // U+200A is 0A 20 in UTF-16LE: dropping zero bytes would turn
-        // it into a new line and wake the commented-out key.
+        // it into a new line and wake the commented-out key. Beyond
+        // Latin-1 the file is refused instead.
         let a = blob("ssh-ed25519", b"a");
         let b = blob("ssh-ed25519", b"b");
         let text = format!("# \u{200A}{}\r\n{}\r\n", line("a", &a), line("b", &b));
-        let kh = KnownHosts::parse(&decode(&utf16(&text)).unwrap());
-        assert!(matches!(kh.check("a", 22, &a), Status::Unknown { .. }));
-        assert_eq!(kh.check("b", 22, &b), Status::Trusted);
-        // The same after a UTF-8 part, without a byte order mark.
+        assert!(decode(&utf16(&text)).is_err());
         let mut bytes = format!("{}\n", line("b", &b)).into_bytes();
         bytes.extend_from_slice(utf16(&text).get(2..).unwrap());
-        let kh = KnownHosts::parse(&decode(&bytes).unwrap());
-        assert!(matches!(kh.check("a", 22, &a), Status::Unknown { .. }));
-        assert_eq!(kh.check("b", 22, &b), Status::Trusted);
+        assert!(decode(&bytes).is_err());
+        // A Latin-1 comment is fine, and stays a comment, with or
+        // without a UTF-8 part before it.
+        let text = format!("# caf\u{e9} {}\r\n{}\r\n", line("a", &a), line("b", &b));
+        let mut bytes = format!("{}\n", line("b", &b)).into_bytes();
+        bytes.extend_from_slice(utf16(&text).get(2..).unwrap());
+        for file in [utf16(&text), bytes] {
+            let kh = KnownHosts::parse(&decode(&file).unwrap());
+            assert!(matches!(kh.check("a", 22, &a), Status::Unknown { .. }));
+            assert_eq!(kh.check("b", 22, &b), Status::Trusted);
+        }
     }
 
     #[test]
@@ -678,6 +692,11 @@ mod tests {
         // file, a @revoked line included, into one unparsable line.
         let k = blob("ssh-ed25519", b"k");
         let text = format!("{}\n# \x00\n@revoked {}\n", line("host", &k), line("*", &k));
+        let e = decode(text.as_bytes()).unwrap_err();
+        assert_eq!(e.kind(), io::ErrorKind::InvalidData);
+        // Also right after the `#`, where the rest would read as one
+        // UTF-16 comment line.
+        let text = format!("{}\n#\x00\n@revoked {}\n", line("host", &k), line("*", &k));
         let e = decode(text.as_bytes()).unwrap_err();
         assert_eq!(e.kind(), io::ErrorKind::InvalidData);
     }
