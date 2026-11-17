@@ -393,9 +393,38 @@ fn rewrite(path: &Path, host: &str, port: u16, key: Option<&[u8]>) -> io::Result
     if let Some(dir) = path.parent() {
         fs::create_dir_all(dir)?;
     }
-    let tmp = path.with_extension("ferossh-tmp");
-    fs::write(&tmp, out)?;
-    fs::rename(&tmp, path)
+    replace_file(path, out.as_bytes())
+}
+
+/// Writes `data` to `path` through a fresh temporary file next to it,
+/// then renames it into place. The temporary file is created new, never
+/// opened over an existing one, so it can never be another file the
+/// user named (a second known_hosts called `pin.ferossh-tmp`, say).
+fn replace_file(path: &Path, data: &[u8]) -> io::Result<()> {
+    let name = path.file_name().unwrap_or_default().to_string_lossy();
+    for n in 0u32..1000 {
+        let tmp = path.with_file_name(format!(".{name}.{}-{n}.ferossh-tmp", std::process::id()));
+        let mut file = match fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&tmp)
+        {
+            Ok(f) => f,
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e),
+        };
+        let written = file.write_all(data).and_then(|()| file.sync_all());
+        drop(file);
+        if let Err(e) = written.and_then(|()| fs::rename(&tmp, path)) {
+            let _ = fs::remove_file(&tmp);
+            return Err(e);
+        }
+        return Ok(());
+    }
+    Err(io::Error::new(
+        io::ErrorKind::AlreadyExists,
+        "no free temporary file name next to the known_hosts file",
+    ))
 }
 
 /// A plain host list with `token` taken out, for a line that keeps the
@@ -583,10 +612,45 @@ mod tests {
         fs::create_dir_all(&dir).unwrap();
         let text = format!("{}\n", line("other", &blob("ssh-rsa", b"o")));
         fs::write(&path, &text).unwrap();
-        // Any write would fail: the temporary file's name is a folder.
-        fs::create_dir_all(path.with_extension("ferossh-tmp")).unwrap();
+        let before = fs::metadata(&path).unwrap();
         forget(&path, "h", 22).unwrap();
         assert_eq!(fs::read_to_string(&path).unwrap(), text);
+        // Not even rewritten with the same text: a rewrite renames a new
+        // file into place.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            assert_eq!(fs::metadata(&path).unwrap().ino(), before.ino());
+        }
+        let _ = before;
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn rewriting_never_writes_over_a_file_named_like_its_temporary() {
+        let dir = std::env::temp_dir().join(format!("ferossh-kh-tmpname-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let pin = dir.join("pin");
+        // Every name the old code (and a plain extension) would use.
+        let others = [
+            pin.with_extension("ferossh-tmp"),
+            dir.join(".pin.ferossh-tmp"),
+        ];
+        let k = blob("ssh-ed25519", b"k");
+        let text = format!("{}\n", line("h", &k));
+        for o in &others {
+            fs::write(o, &text).unwrap();
+        }
+        fs::write(&pin, &text).unwrap();
+        forget(&pin, "h", 22).unwrap();
+        for o in &others {
+            assert_eq!(fs::read_to_string(o).unwrap(), text, "{}", o.display());
+        }
+        assert_eq!(fs::read_to_string(&pin).unwrap(), "");
+        // No temporary file is left behind.
+        let left = fs::read_dir(&dir).unwrap().count();
+        assert_eq!(left, others.len() + 1);
         let _ = fs::remove_dir_all(&dir);
     }
 
