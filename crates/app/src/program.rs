@@ -129,7 +129,10 @@ mod tests {
         assert!(find(&name, &[PathBuf::from(".")]).is_none());
         // ...nor by locate, which FeroSSH uses, unless PATH itself names
         // this folder by its absolute path (then finding it is correct).
-        if !search_dirs().contains(&here) {
+        // Compared resolved, so an alias such as `/x/../project` counts.
+        let real = |d: &PathBuf| std::fs::canonicalize(d).ok();
+        let here_real = real(&here);
+        if !search_dirs().iter().any(|d| real(d) == here_real) {
             let e = locate(&name).unwrap_err();
             assert!(e.to_string().contains("give the full path"), "{e}");
         }
