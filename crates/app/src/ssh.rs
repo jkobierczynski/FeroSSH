@@ -2854,6 +2854,48 @@ mod tests {
     }
 
     #[test]
+    fn a_failed_replacement_keeps_a_pin_and_the_offered_key() {
+        let dir = temp("keytype-fail");
+        let mut e = env(&dir);
+        let (first, second) = (dir.join("first"), dir.join("second"));
+        e.config = format!(
+            "Host host\n  UserKnownHostsFile \"{}\" \"{}\"\n",
+            first.display(),
+            second.display()
+        );
+        let mut rsa = vec![0, 0, 0, 7];
+        rsa.extend_from_slice(b"ssh-rsa");
+        rsa.extend_from_slice(&[0, 0, 0, 3, 1, 0, 1, 0, 0, 0, 1, 9]);
+        // The old key is pinned in the second file only.
+        known_hosts::add(&second, "host", 22, &rsa).unwrap();
+        let mut s = SshSession::new(1, Target::resolve("host", &e).unwrap(), e.known_hosts());
+        s.start(80, 24);
+        s.on_worker(Message::HostKey {
+            channel: 1,
+            key: ed25519_blob(),
+        });
+        assert_eq!(s.state(), State::Blocked);
+        // The second file cannot be rewritten now: it is a folder.
+        std::fs::remove_file(&second).unwrap();
+        std::fs::create_dir(&second).unwrap();
+        assert!(s.replace_host_key().is_err());
+        // Still blocked with the offered key, so the caller does not
+        // reconnect and the user can try again.
+        assert_eq!(s.state(), State::Blocked);
+        assert_eq!(s.changed_key(), Some(&ed25519_blob()[..]));
+        // And the host still has a pin: the new key went in first.
+        let kh = KnownHosts::parse(&std::fs::read_to_string(&first).unwrap());
+        assert_eq!(kh.check("host", 22, &ed25519_blob()), Status::Trusted);
+        // Once the file can be written again, the retry finishes the job.
+        std::fs::remove_dir(&second).unwrap();
+        known_hosts::add(&second, "host", 22, &rsa).unwrap();
+        s.replace_host_key().unwrap();
+        assert_eq!(s.changed_key(), None);
+        let kh = KnownHosts::parse(&std::fs::read_to_string(&second).unwrap());
+        assert!(!matches!(kh.check("host", 22, &rsa), Status::Trusted));
+    }
+
+    #[test]
     fn replacing_a_key_keeps_it_when_a_file_is_listed_twice() {
         let dir = temp("keytype-alias");
         let mut e = env(&dir);
