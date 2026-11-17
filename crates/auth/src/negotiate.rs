@@ -116,12 +116,14 @@ pub trait TlsContext: Send {
 pub trait NegotiateProvider: Send {
     /// A context for the `HTTP` service on `host`. Over HTTPS,
     /// `bindings` are the TLS connection's channel bindings, which tie the
-    /// login to it (Extended Protection for Authentication).
+    /// login to it (Extended Protection for Authentication). Without
+    /// `ntlm`, Negotiate is kept to Kerberos.
     fn start(
         &self,
         host: &str,
         credentials: Option<&Credentials>,
         bindings: Option<&[u8]>,
+        ntlm: bool,
     ) -> Result<Box<dyn NegotiateContext>, String>;
 
     /// A TLS connection to `host`.
@@ -140,6 +142,7 @@ impl NegotiateProvider for Unavailable {
         _host: &str,
         _credentials: Option<&Credentials>,
         _bindings: Option<&[u8]>,
+        _ntlm: bool,
     ) -> Result<Box<dyn NegotiateContext>, String> {
         Err("WinRM logins need Windows".into())
     }
@@ -162,7 +165,28 @@ pub struct SspiJob {
     pub host: String,
     /// Used when `op` starts a context.
     pub credentials: Option<Credentials>,
+    /// NTLM may log in where Kerberos cannot. Over plain HTTP NTLM does
+    /// not prove the server's identity and its answer can be cracked or
+    /// relayed, so only a connection that allows it says yes. Inside a
+    /// TLS connection whose certificate was accepted (bound to it with
+    /// channel bindings) NTLM is always allowed.
+    pub ntlm: bool,
     pub op: SspiOp,
+}
+
+/// Why a login over plain HTTP was stopped before NTLM answered.
+pub const NTLM_REFUSED: &str = "This login would use NTLM, which over plain HTTP does not prove \
+     who answers: a machine in the middle could take or relay it. Use HTTPS (winrms://), the \
+     server's domain name so Kerberos is used, or a saved connection whose Transport is \
+     \"HTTP, Kerberos or NTLM\".";
+
+/// The NTLMSSP signature that every NTLM message starts with, bare or
+/// inside SPNEGO.
+const NTLMSSP: &[u8] = b"NTLMSSP\0";
+
+/// Whether `token` carries an NTLM message.
+fn is_ntlm(token: &[u8]) -> bool {
+    token.windows(NTLMSSP.len()).any(|w| w == NTLMSSP)
 }
 
 /// What a [`SspiJob`] gave: the answer for the worker, the package once
@@ -308,11 +332,6 @@ impl Contexts {
         ) {
             return self.tls_step(provider, key, job);
         }
-        let plain = |result| SspiOutput {
-            result,
-            package: None,
-            cert: None,
-        };
         if matches!(job.op, SspiOp::Start) {
             self.open.remove(&key);
             if self.open.len() + self.tls.len() >= MAX_CONTEXTS {
@@ -324,10 +343,35 @@ impl Contexts {
                 Some(_) => return Err("a login before the TLS handshake".into()),
                 None => None,
             };
-            let ctx = provider.start(&job.host, job.credentials.as_ref(), bindings.as_deref())?;
+            let ntlm = job.ntlm || bindings.is_some();
+            let ctx = provider.start(
+                &job.host,
+                job.credentials.as_ref(),
+                bindings.as_deref(),
+                ntlm,
+            )?;
             self.open.insert(key, ctx);
         }
+        // Checked here too, whatever the provider did: no NTLM message
+        // leaves for a server whose identity nothing proves.
+        let ntlm = job.ntlm || self.tls.get(&key).is_some_and(|t| t.ready);
         let ctx = self.open.get_mut(&key).ok_or("the login was not started")?;
+        let out = Self::negotiate_step(ctx.as_mut(), job)?;
+        if !ntlm
+            && let SspiResult::Continue(t) | SspiResult::Done(t) = &out.result
+            && is_ntlm(t)
+        {
+            return Err(NTLM_REFUSED.into());
+        }
+        Ok(out)
+    }
+
+    fn negotiate_step(ctx: &mut dyn NegotiateContext, job: &SspiJob) -> Result<SspiOutput, String> {
+        let plain = |result| SspiOutput {
+            result,
+            package: None,
+            cert: None,
+        };
         Ok(match &job.op {
             SspiOp::Start => match ctx.step(None)? {
                 ContextStep::Continue(t) => plain(SspiResult::Continue(t)),
@@ -402,6 +446,7 @@ pub(crate) mod tests {
             host: &str,
             _c: Option<&Credentials>,
             _b: Option<&[u8]>,
+            _n: bool,
         ) -> Result<Box<dyn NegotiateContext>, String> {
             if host == "nowhere" {
                 return Err("no such host".into());
@@ -410,12 +455,79 @@ pub(crate) mod tests {
         }
     }
 
+    /// A context that answers with NTLM messages, as Negotiate does where
+    /// Kerberos cannot be used, whatever it was asked for.
+    struct NtlmOnly;
+
+    impl NegotiateContext for NtlmOnly {
+        fn step(&mut self, input: Option<&[u8]>) -> Result<ContextStep, String> {
+            let mut t = b"\xa1\x81spnego NTLMSSP\0".to_vec();
+            t.push(if input.is_some() { 3 } else { 1 });
+            Ok(match input {
+                None => ContextStep::Continue(t),
+                Some(_) => ContextStep::Done(t),
+            })
+        }
+        fn seal(&mut self, d: &[u8]) -> Result<(Vec<u8>, Vec<u8>), String> {
+            Ok((Vec::new(), d.to_vec()))
+        }
+        fn unseal(&mut self, _h: &[u8], d: &[u8]) -> Result<Vec<u8>, String> {
+            Ok(d.to_vec())
+        }
+        fn package(&self) -> String {
+            "NTLM".into()
+        }
+    }
+
+    /// Records whether NTLM was allowed when the context started.
+    struct NtlmProvider(std::sync::Mutex<Vec<bool>>);
+
+    impl NegotiateProvider for NtlmProvider {
+        fn start(
+            &self,
+            _h: &str,
+            _c: Option<&Credentials>,
+            _b: Option<&[u8]>,
+            ntlm: bool,
+        ) -> Result<Box<dyn NegotiateContext>, String> {
+            self.0.lock().unwrap().push(ntlm);
+            Ok(Box::new(NtlmOnly))
+        }
+    }
+
+    #[test]
+    fn ntlm_over_http_only_when_the_connection_allows_it() {
+        let p = NtlmProvider(std::sync::Mutex::new(Vec::new()));
+        let mut c = Contexts::default();
+        let mut j = job(0, SspiOp::Start);
+        j.ntlm = false;
+        assert_eq!(c.run(&p, j).result, SspiResult::Failed(NTLM_REFUSED.into()));
+        // The context is gone: no later step can answer the challenge.
+        let mut j = job(0, SspiOp::Step(b"challenge".to_vec()));
+        j.ntlm = false;
+        assert!(matches!(c.run(&p, j).result, SspiResult::Failed(_)));
+        assert!(c.open.is_empty());
+        // Allowed: the login goes on.
+        assert!(matches!(
+            c.run(&p, job(0, SspiOp::Start)).result,
+            SspiResult::Continue(_)
+        ));
+        assert!(matches!(
+            c.run(&p, job(0, SspiOp::Step(b"challenge".to_vec())))
+                .result,
+            SspiResult::Done(_)
+        ));
+        assert_eq!(*p.0.lock().unwrap(), vec![false, true]);
+        assert!(is_ntlm(b"NTLMSSP\0\x01") && !is_ntlm(b"NTLMSSP"));
+    }
+
     fn job(conn: u8, op: SspiOp) -> SspiJob {
         SspiJob {
             login: 7,
             conn,
             host: "srv".into(),
             credentials: None,
+            ntlm: true,
             op,
         }
     }

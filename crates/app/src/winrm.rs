@@ -61,6 +61,9 @@ pub struct WinrmTarget {
     /// HTTPS (TLS through SChannel) instead of HTTP with encrypted
     /// messages.
     pub https: bool,
+    /// Over HTTP, NTLM may log in where Kerberos cannot (`WinrmNtlm yes`).
+    /// Off, an HTTP login is Kerberos only.
+    pub ntlm: bool,
 }
 
 fn valid_user(user: &str) -> bool {
@@ -106,6 +109,7 @@ impl WinrmTarget {
             tag: None,
             connect_timeout: Timing::default().connect_timeout,
             https,
+            ntlm: false,
         })
     }
 
@@ -151,6 +155,7 @@ impl WinrmTarget {
                 .connect_timeout
                 .unwrap_or(Timing::default().connect_timeout),
             https,
+            ntlm: false,
         })
     }
 
@@ -296,6 +301,7 @@ impl WinrmCloser {
                     conn,
                     host: self.host.clone(),
                     credentials: None,
+                    ntlm: false,
                     op,
                 }))],
                 false,
@@ -734,6 +740,9 @@ impl WinrmSession {
                     conn,
                     host: self.target.hostname.clone(),
                     credentials: credentials.filter(|_| matches!(op, SspiOp::Start)),
+                    // Over HTTPS the login is inside the accepted TLS
+                    // connection; over HTTP only when allowed.
+                    ntlm: self.target.https || self.target.ntlm,
                     op,
                 }))]
             }
@@ -752,6 +761,7 @@ impl WinrmSession {
                     conn,
                     host: self.target.hostname.clone(),
                     credentials: None,
+                    ntlm: false,
                     op,
                 }))]
             }
@@ -1267,6 +1277,27 @@ mod tests {
             Effect::Send(Message::SspiReply { result, .. }) => Some(result),
             _ => None,
         })
+    }
+
+    #[test]
+    fn ntlm_over_http_only_when_the_connection_allows_it() {
+        let ntlm_of = |t: WinrmTarget| {
+            let mut s = WinrmSession::new(5, t);
+            s.start();
+            let fx = s.on_worker(Message::SspiRequest {
+                channel: 5,
+                conn: 0,
+                op: SspiOp::Start,
+            });
+            match &fx[..] {
+                [Effect::Broker(Job::Sspi(j))] => j.ntlm,
+                other => panic!("{other:?}"),
+            }
+        };
+        assert!(!ntlm_of(WinrmTarget::typed("winrm://srv").unwrap()));
+        let mut allowed = WinrmTarget::typed("winrm://srv").unwrap();
+        allowed.ntlm = true;
+        assert!(ntlm_of(allowed));
     }
 
     fn https_session(store: Option<PathBuf>) -> WinrmSession {

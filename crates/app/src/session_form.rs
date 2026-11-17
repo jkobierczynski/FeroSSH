@@ -99,6 +99,8 @@ pub struct Values {
     pub legacy: bool,
     /// WinRM over HTTPS (`WinrmHttps yes`).
     pub winrm_https: bool,
+    /// WinRM over HTTP may log in with NTLM (`WinrmNtlm yes`).
+    pub winrm_ntlm: bool,
     /// Let the server use the agent's keys (`ForwardAgent yes`).
     pub forward_agent: bool,
     /// Kerberos login (`GSSAPIAuthentication`): FeroSSH's choice when
@@ -248,6 +250,7 @@ impl Values {
         self.mosh_server = p.mosh_server.clone().unwrap_or_default();
         self.winrm_command = p.winrm_command.clone().unwrap_or_default();
         self.winrm_https = p.winrm_https;
+        self.winrm_ntlm = p.winrm_ntlm;
         self.mosh_predict = p.mosh_predict.clone().unwrap_or_default();
         self.mosh_ports = p
             .mosh_ports
@@ -989,10 +992,10 @@ impl SessionForm {
             }
             .to_owned(),
             Field::Legacy => if v.legacy { "allowed" } else { "off" }.to_owned(),
-            Field::WinrmHttps => if v.winrm_https {
-                "HTTPS (5986)"
-            } else {
-                "HTTP, encrypted messages (5985)"
+            Field::WinrmHttps => match (v.winrm_https, v.winrm_ntlm) {
+                (true, _) => "HTTPS (5986)",
+                (false, false) => "HTTP, Kerberos only (5985)",
+                (false, true) => "HTTP, Kerberos or NTLM (5985)",
             }
             .to_owned(),
             Field::ForwardAgent => if v.forward_agent {
@@ -1092,7 +1095,15 @@ impl SessionForm {
                 };
             }
             Field::Legacy => v.legacy = !v.legacy,
-            Field::WinrmHttps => v.winrm_https = !v.winrm_https,
+            // HTTP Kerberos only, HTTP with NTLM, HTTPS, and round.
+            Field::WinrmHttps => {
+                const ORDER: [(bool, bool); 3] = [(false, false), (false, true), (true, false)];
+                let now = (v.winrm_https, v.winrm_ntlm && !v.winrm_https);
+                let i = ORDER.iter().position(|o| *o == now).unwrap_or(0);
+                let next = if forward { i + 1 } else { i + ORDER.len() - 1 };
+                (v.winrm_https, v.winrm_ntlm) =
+                    ORDER.get(next % ORDER.len()).copied().unwrap_or_default();
+            }
             Field::ForwardAgent => v.forward_agent = !v.forward_agent,
             Field::Kerberos => v.kerberos = tri(v.kerberos, forward),
             Field::KerberosDelegate => v.kerberos_delegate = !v.kerberos_delegate,
@@ -2159,6 +2170,7 @@ impl SessionForm {
         p.winrm_command = ferossh_config::settings::virtual_desktop(&v.winrm_command)
             .filter(|c| v.kind == SessionKind::WinRm && c != ferossh_config::DEFAULT_WINRM_COMMAND);
         p.winrm_https = v.kind == SessionKind::WinRm && v.winrm_https;
+        p.winrm_ntlm = v.kind == SessionKind::WinRm && !v.winrm_https && v.winrm_ntlm;
         p.serial = is_serial.then(|| {
             let mut line = LineSettings {
                 flow: v.flow,
@@ -2745,11 +2757,17 @@ mod tests {
             t.iter()
                 .any(|l| l.contains("Transport") && l.contains("5985"))
         );
+        assert!(t.iter().any(|l| l.contains("Kerberos only")));
+        f.values.winrm_ntlm = true;
+        f.apply(&mut hosts, &mut settings);
+        assert!(settings.profile("win-srv").unwrap().winrm_ntlm);
         f.values.winrm_https = true;
         let t = texts(&mut f);
         assert!(t.iter().any(|l| l.contains("Port") && l.contains("5986")));
         f.apply(&mut hosts, &mut settings);
         assert!(settings.profile("win-srv").unwrap().winrm_https);
+        // NTLM is an HTTP choice only.
+        assert!(!settings.profile("win-srv").unwrap().winrm_ntlm);
         f.values.winrm_https = false;
         // The default command is not written out.
         f.values.winrm_command = ferossh_config::DEFAULT_WINRM_COMMAND.into();

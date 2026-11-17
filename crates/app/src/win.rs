@@ -5805,6 +5805,10 @@ impl Window {
                     p.winrm_https,
                     saved.as_ref(),
                 )
+                .map(|mut t| {
+                    t.ntlm = p.winrm_ntlm;
+                    t
+                })
             }
             _ => WinrmTarget::typed(destination),
         };
