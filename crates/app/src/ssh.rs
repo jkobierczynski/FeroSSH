@@ -1842,13 +1842,18 @@ impl SshSession {
         let Some(key) = self.changed_key.as_deref() else {
             return Ok(());
         };
-        let Some(file) = self.known_file() else {
+        let files = self.known_files();
+        let Some((first, others)) = files.split_first() else {
             return Ok(());
         };
         let (host, port) = self.target.key_host();
-        // Kept until the file is written, so a failed attempt can be tried
-        // again.
-        known_hosts::replace(&file, host, port, key)?;
+        // The old key goes from every file that is read, not only the
+        // one the new key goes to, or it would still be trusted. Kept
+        // until all are written, so a failed attempt can be tried again.
+        for file in others {
+            known_hosts::forget(file, host, port)?;
+        }
+        known_hosts::replace(first, host, port, key)?;
         self.changed_key = None;
         Ok(())
     }
@@ -2806,6 +2811,36 @@ mod tests {
         s.replace_host_key().unwrap();
         let kh = KnownHosts::load(&e.known_hosts()).unwrap();
         assert_eq!(kh.check("host", 22, &ed25519_blob()), Status::Trusted);
+        assert_eq!(kh.key_types("host", 22), vec!["ssh-ed25519".to_owned()]);
+    }
+
+    #[test]
+    fn replacing_a_key_forgets_it_in_every_known_hosts_file() {
+        let dir = temp("keytype-files");
+        let mut e = env(&dir);
+        let (first, second) = (dir.join("first"), dir.join("second"));
+        e.config = format!(
+            "Host host\n  UserKnownHostsFile \"{}\" \"{}\"\n",
+            first.display(),
+            second.display()
+        );
+        let mut rsa = vec![0, 0, 0, 7];
+        rsa.extend_from_slice(b"ssh-rsa");
+        rsa.extend_from_slice(&[0, 0, 0, 3, 1, 0, 1, 0, 0, 0, 1, 9]);
+        // The old key is pinned in the second file only.
+        known_hosts::add(&second, "host", 22, &rsa).unwrap();
+        let mut s = SshSession::new(1, Target::resolve("host", &e).unwrap(), e.known_hosts());
+        s.start(80, 24);
+        s.on_worker(Message::HostKey {
+            channel: 1,
+            key: ed25519_blob(),
+        });
+        assert_eq!(s.state(), State::Blocked);
+        s.replace_host_key().unwrap();
+        let both = |path: &std::path::Path| std::fs::read_to_string(path).unwrap_or_default();
+        let kh = KnownHosts::parse(&format!("{}\n{}", both(&first), both(&second)));
+        assert_eq!(kh.check("host", 22, &ed25519_blob()), Status::Trusted);
+        assert!(!matches!(kh.check("host", 22, &rsa), Status::Trusted));
         assert_eq!(kh.key_types("host", 22), vec!["ssh-ed25519".to_owned()]);
     }
 

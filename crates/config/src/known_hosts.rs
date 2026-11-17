@@ -341,8 +341,20 @@ pub fn add(path: &Path, host: &str, port: u16, key: &[u8]) -> io::Result<()> {
 /// `ssh-keygen -R` followed by a fresh accept would. The file is rewritten
 /// through a temporary file so a crash never leaves it half written.
 pub fn replace(path: &Path, host: &str, port: u16, key: &[u8]) -> io::Result<()> {
+    rewrite(path, host, port, Some(key))
+}
+
+/// Removes every plain entry for a host, as `ssh-keygen -R` does, from
+/// a file other than the one the new key goes to. A missing file is
+/// left missing.
+pub fn forget(path: &Path, host: &str, port: u16) -> io::Result<()> {
+    rewrite(path, host, port, None)
+}
+
+fn rewrite(path: &Path, host: &str, port: u16, key: Option<&[u8]>) -> io::Result<()> {
     let text = match fs::read_to_string(path) {
         Ok(t) => t,
+        Err(e) if e.kind() == io::ErrorKind::NotFound && key.is_none() => return Ok(()),
         Err(e) if e.kind() == io::ErrorKind::NotFound => String::new(),
         Err(e) => return Err(e),
     };
@@ -368,8 +380,10 @@ pub fn replace(path: &Path, host: &str, port: u16, key: &[u8]) -> io::Result<()>
         }
         out.push('\n');
     }
-    out.push_str(&hashed_line(host, port, key)?);
-    out.push('\n');
+    if let Some(key) = key {
+        out.push_str(&hashed_line(host, port, key)?);
+        out.push('\n');
+    }
     if let Some(dir) = path.parent() {
         fs::create_dir_all(dir)?;
     }
