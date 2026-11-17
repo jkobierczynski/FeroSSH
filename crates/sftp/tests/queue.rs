@@ -980,3 +980,28 @@ fn a_failed_chmod_leaves_the_original_in_place() {
     assert_eq!(remote.job_state(id), Some(State::Failed));
     assert_eq!(fs::read_to_string(&script).unwrap(), "echo old\n");
 }
+
+#[test]
+fn two_names_for_one_local_name_never_share_a_part_file() {
+    let s = Scratch::new("collide");
+    let one = pattern(300_000);
+    let two: Vec<u8> = pattern(250_000).iter().map(|b| b ^ 0x55).collect();
+    // Both become `a_b` on Windows-safe local names.
+    fs::write(s.remote().join("a:b"), &one).unwrap();
+    fs::write(s.remote().join("a_b"), &two).unwrap();
+    let (mut remote, mut fake) = connected(&s.remote());
+    remote.parallel = 2;
+    let (e1, e2) = (entry(&remote, "a:b"), entry(&remote, "a_b"));
+    remote.download(&e1, &s.local()).unwrap();
+    remote.download(&e2, &s.local()).unwrap();
+    assert!(run(&mut remote, &mut fake));
+    for job in remote.jobs() {
+        assert_eq!(job.state, State::Done, "{:?}", job.note);
+    }
+    let mut got: Vec<Vec<u8>> = fs::read_dir(s.local())
+        .unwrap()
+        .map(|e| fs::read(e.unwrap().path()).unwrap())
+        .collect();
+    got.sort_by_key(Vec::len);
+    assert_eq!(got, vec![two, one]);
+}

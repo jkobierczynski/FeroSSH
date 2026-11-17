@@ -1477,6 +1477,19 @@ impl Remote {
         if attrs.is_dir() {
             return self.fail(i, "It is a folder now.".into());
         }
+        // Part files other downloads are writing right now: two remote
+        // names can map to one local name (`a:b` and `a_b`), and the
+        // second must not take the first's part file for its own.
+        let busy: Vec<PathBuf> = self
+            .jobs
+            .iter()
+            .enumerate()
+            .filter(|(k, _)| *k != i)
+            .filter_map(|(_, j)| match &j.run {
+                Run::Down(d) => Some(d.part.clone()),
+                _ => None,
+            })
+            .collect();
         let Some(job) = self.jobs.get_mut(i) else {
             return;
         };
@@ -1491,6 +1504,12 @@ impl Remote {
                     None => return self.fail(i, "No free name to keep both.".into()),
                 },
                 Some(Choice::Overwrite) => {}
+            }
+        }
+        if busy.contains(&with_suffix(&target, ".part")) {
+            match free_local(&target) {
+                Some(t) => target = t,
+                None => return self.fail(i, "No free name next to another download.".into()),
             }
         }
         let part = with_suffix(&target, ".part");

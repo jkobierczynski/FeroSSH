@@ -8641,6 +8641,19 @@ impl Window {
                 // the clipboard or move the file view, and nothing answers.
                 actions.retain(|a| matches!(a, Action::Title(_) | Action::Bell));
             }
+            // One clipboard question per burst of output: the last request
+            // wins, so a flood of OSC 52 cannot line up a dialog for each.
+            if let Some(last) = actions
+                .iter()
+                .rposition(|a| matches!(a, Action::ClipboardRequest(_)))
+            {
+                let mut i = 0;
+                actions.retain(|a| {
+                    let keep = i == last || !matches!(a, Action::ClipboardRequest(_));
+                    i += 1;
+                    keep
+                });
+            }
             if let Some(d) = p.term.sync_deadline() {
                 deadline = Some(deadline.map_or(d, |old| old.min(d)));
             }
@@ -17829,7 +17842,7 @@ fn run_command(hwnd: HWND, command: Command) {
                     Step::Send(t) | Step::Type(t) => t.clone(),
                     other => format!("@{other}"),
                 })
-                .map(|l| l.chars().filter(|c| !c.is_control()).take(100).collect())
+                .map(|l| crate::ssh::sanitize_line(&l).chars().take(100).collect())
                 .collect();
             let more = if steps.len() > 8 { "\n..." } else { "" };
             let text = format!(
@@ -17882,7 +17895,7 @@ fn run_command(hwnd: HWND, command: Command) {
                 "FeroSSH will run this command to get {what}, and type the first line it \
                  prints:\n\n{}\n\nIt runs without a shell, a window or any input. Run it now \
                  and from now on?",
-                line.chars().filter(|c| !c.is_control()).collect::<String>()
+                crate::ssh::sanitize_line(&line)
             );
             let yes =
                 dialog(hwnd, &text, MB_YESNO | MB_ICONQUESTION | MB_DEFBUTTON2) == Some(IDYES);
@@ -17933,7 +17946,7 @@ fn run_command(hwnd: HWND, command: Command) {
                 "FeroSSH will run this command to get the login password, and type the first \
                  line it prints as the password:\n\n{}\n\nIt runs without a shell, a window \
                  or any input. Run it now and from now on?",
-                line.chars().filter(|c| !c.is_control()).collect::<String>()
+                crate::ssh::sanitize_line(&line)
             );
             let yes =
                 dialog(hwnd, &text, MB_YESNO | MB_ICONQUESTION | MB_DEFBUTTON2) == Some(IDYES);
@@ -17980,7 +17993,9 @@ fn run_command(hwnd: HWND, command: Command) {
             command,
             input,
         } => {
-            let line: String = command.line.chars().filter(|c| !c.is_control()).collect();
+            // No bidirectional overrides: they could show one program's
+            // name while another runs.
+            let line = crate::ssh::sanitize_line(&command.line);
             let text = format!(
                 "The SSH config says to reach this host through a program (ProxyCommand):\n\n\
                  {line}\n\nFeroSSH runs it with your rights, outside the sandbox, without a \
