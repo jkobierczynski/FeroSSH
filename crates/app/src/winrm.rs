@@ -64,6 +64,9 @@ pub struct WinrmTarget {
     /// Over HTTP, NTLM may log in where Kerberos cannot (`WinrmNtlm yes`).
     /// Off, an HTTP login is Kerberos only.
     pub ntlm: bool,
+    /// Made from a saved connection (`resolve`), not typed: only then
+    /// do that connection's settings, such as `WinrmNtlm`, apply.
+    pub saved: bool,
 }
 
 fn valid_user(user: &str) -> bool {
@@ -110,6 +113,7 @@ impl WinrmTarget {
             connect_timeout: Timing::default().connect_timeout,
             https,
             ntlm: false,
+            saved: false,
         })
     }
 
@@ -156,6 +160,7 @@ impl WinrmTarget {
                 .unwrap_or(Timing::default().connect_timeout),
             https,
             ntlm: false,
+            saved: true,
         })
     }
 
@@ -1537,6 +1542,10 @@ mod tests {
         assert_eq!(t.user.as_deref(), Some("LAB\\admin"));
         assert_eq!(t.command, "cmd");
         assert_eq!(t.tag.as_deref(), Some("production"));
+        // Only a saved connection's own target takes its settings; one
+        // typed with the same name does not.
+        assert!(t.saved);
+        assert!(!WinrmTarget::typed("winrm://dc:8080").unwrap().saved);
         let t = WinrmTarget::resolve("dc", &env, Some("  "), false, None).unwrap();
         assert_eq!(t.command, DEFAULT_WINRM_COMMAND);
         // A saved connection keeps its own user and port over an SSH

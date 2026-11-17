@@ -6083,7 +6083,9 @@ impl Window {
         // Read now, not carried over from the session a reconnect or a
         // split copies: NTLM over HTTP is allowed only while the saved
         // connection still says so.
-        target.ntlm = !target.https && profile.is_some_and(|p| p.winrm_ntlm);
+        // Only for the saved connection itself: a typed address that
+        // happens to share its name is another endpoint.
+        target.ntlm = target.saved && !target.https && profile.is_some_and(|p| p.winrm_ntlm);
         let source = profile.map(|p| p.password.clone()).unwrap_or_default();
         let mut session = WinrmSession::new(channel, target);
         session.password_source = source != PasswordSource::Ask && !ask;
