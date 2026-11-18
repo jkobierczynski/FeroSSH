@@ -578,6 +578,18 @@ Settings > Server status bar adds one quiet row under the panes with the load of
 
 While it is on, FeroSSH runs one small read-only command per server on a channel of its own (no terminal, nothing in your shell's history): every 2 seconds it reads `/proc/stat`, `/proc/meminfo`, `/proc/net/dev` and `/proc/uptime` and runs `df -kP /`. The sandboxed worker reads that output and passes on only the numbers. Linux servers show everything; a server without `/proc` (macOS, the BSDs) shows only its disk, and one that cannot run `sh` (a Windows server, an SFTP-only account) says it does not report its load. Turning the bar off stops the command on every server.
 
+## Notifications (coding agents and long jobs)
+
+Settings > Desktop notifications lets a pane tell you when it wants you, so you can leave a coding agent (Claude Code, Codex, aider) or a long build running in a tab and work elsewhere. It is off unless you turn it on. When a pane asks for attention and you are not looking at it, its tab gets an amber diamond (◆) until you go to it, and unless the pane is in sight in the window in front, Windows shows a notification with the pane's name and the message. Click it to bring FeroSSH forward on that pane. The FeroSSH icon stays in the notification area while something waits for you, so a notification you missed is still in Windows' notification centre; it goes when you come back to FeroSSH. One pane raises at most one notification every 10 seconds.
+
+A pane asks for attention when:
+
+- The host sends a notification escape sequence: OSC 9 (iTerm2's, used by Codex CLI and by Claude Code), OSC 777 `notify` (Ghostty's and urxvt's) or OSC 99 (kitty's). Claude Code sends one when its notification channel is iTerm2: run `/config` in Claude Code and set Notifications to iTerm2 (the `preferredNotifChannel` setting, value `iterm2`). Codex sends one when its notification method is OSC 9, since it does not recognise FeroSSH by itself: in `~/.codex/config.toml`, under `[tui]`, set `notification_method = "osc9"` (and leave `notifications` on, its default). A shell hook can send one too: `printf '\e]777;notify;Build;done\a'`. With FeroSSH's tmux integration these reach FeroSSH from every tmux pane; inside tmux run by hand, tmux keeps them to itself by default (its `allow-passthrough` option can let some through), so use the bell or the quiet watch there.
+- The bell rings (Settings > Notify on the bell too, on by default while notifications are on).
+- Its output goes quiet (Session > Notify when this pane goes quiet, per pane): after at least 8 seconds of output, 5 seconds of silence mean the job ended or is waiting for an answer. This catches an agent or a script that sends nothing. What you type starts the watch over, so your own typing does not count.
+
+The message is the host's text, shown as plain text: control and hidden formatting characters are taken out and it is cut at 256 characters. Notifications use Windows' notification-area balloons, which Windows 10 and 11 show as notifications, so nothing has to be installed or registered. Windows' Do not disturb (Focus assist) holds them back like any other notification.
+
 ## Selecting, copying and scrollback
 
 | To | Do |

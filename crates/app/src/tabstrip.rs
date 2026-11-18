@@ -55,6 +55,9 @@ pub struct TabLabel {
     pub health: Health,
     /// Output or a bell arrived while the tab was in the background.
     pub bell: bool,
+    /// A pane in the tab asked for attention and was not looked at yet
+    /// (Settings > Desktop notifications): an amber diamond.
+    pub attention: bool,
     pub forwarding: Forwarding,
     /// The connection uses the opt-in legacy algorithms: `⚠`, in amber.
     pub legacy: bool,
@@ -68,6 +71,8 @@ pub const LEGACY_BADGE: &str = " ⚠";
 pub const UNENCRYPTED_BADGE: &str = " ⚠ telnet";
 
 const AMBER: Rgb = Rgb::new(0xe5, 0xb5, 0x3b);
+/// The least contrast of a mark with its tab (WCAG for graphics).
+const MARK_CONTRAST: f32 = 3.0;
 const RED: Rgb = Rgb::new(0xe0, 0x5c, 0x5c);
 
 /// What a click on the strip hit.
@@ -205,6 +210,28 @@ impl Palette {
     }
 }
 
+/// The attention mark's amber on `bg`, moved toward `text` where it would
+/// not stand out (light and grey strips): at least 3:1, as a graphic.
+/// When even `text` falls short (system colours can be close), black or
+/// white, whichever stands out more.
+fn attention_colour(bg: Rgb, text: Rgb) -> Rgb {
+    let mut amount = 0.0_f32;
+    let mut c = AMBER;
+    while amount < 1.0 && contrast(c, bg) < MARK_CONTRAST {
+        amount = (amount + 0.1).min(1.0);
+        c = mix(AMBER, text, amount);
+    }
+    if contrast(c, bg) >= MARK_CONTRAST {
+        return c;
+    }
+    let (black, white) = (Rgb::new(0, 0, 0), Rgb::new(0xff, 0xff, 0xff));
+    if contrast(black, bg) >= contrast(white, bg) {
+        black
+    } else {
+        white
+    }
+}
+
 /// Cuts `text` to `max` cells, ending in `…` when cut.
 pub fn fit(text: &str, max: usize) -> String {
     let mut out = String::new();
@@ -283,7 +310,14 @@ pub fn draw(grid: &mut Grid, tabs: &[TabLabel], active: usize, palette: &Palette
             Health::Idle => palette.dim,
         };
         row.put("  ", fg, bg, Flags::empty());
-        row.put(if tab.bell { "◆" } else { "●" }, dot, bg, Flags::empty());
+        let (mark, dot) = if tab.attention {
+            ("◆", attention_colour(bg, palette.text))
+        } else if tab.bell {
+            ("◆", dot)
+        } else {
+            ("●", dot)
+        };
+        row.put(mark, dot, bg, Flags::empty());
         row.put(" ", fg, bg, Flags::empty());
         let flags = if i == active {
             Flags::BOLD
@@ -353,6 +387,7 @@ mod tests {
             title: title.into(),
             health: Health::Connected,
             bell: false,
+            attention: false,
             forwarding: Forwarding::None,
             legacy: false,
             unencrypted: false,
@@ -378,6 +413,21 @@ mod tests {
                 assert!(c >= floor - 0.01, "{}: {c:.2}", theme.name);
             }
         }
+    }
+
+    #[test]
+    fn attention_mark_stands_out_on_every_theme() {
+        for theme in Theme::builtin() {
+            let p = Palette::of(theme);
+            for bg in [p.strip, p.active] {
+                let c = contrast(attention_colour(bg, p.text), bg);
+                assert!(c >= MARK_CONTRAST, "{}: {c:.3}", theme.name);
+            }
+        }
+        // System colours with text close to the strip: still 3:1.
+        let (bg, text) = (Rgb::new(0x88, 0x88, 0x88), Rgb::new(0x99, 0x99, 0x99));
+        let c = contrast(attention_colour(bg, text), bg);
+        assert!(c >= MARK_CONTRAST, "{c:.2}");
     }
 
     #[test]

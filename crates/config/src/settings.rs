@@ -625,6 +625,13 @@ pub struct Settings {
     /// focused pane's server) under the panes. Off unless turned on: it
     /// runs a command on the server every few seconds.
     pub status_bar: bool,
+    /// Windows notifications and tab badges when a pane asks for
+    /// attention: OSC 9, 777 and 99, the bell, a pane's quiet watch
+    /// (Settings > Desktop notifications). Off unless turned on.
+    pub notifications: bool,
+    /// The bell counts as asking for attention (Settings > Notify on the
+    /// bell too). On unless turned off; only matters with notifications.
+    pub notify_bell: bool,
     pub copy_on_select: bool,
     pub right_click_paste: bool,
     /// Put the time in front of each line of plain session logs.
@@ -771,6 +778,8 @@ impl Default for Settings {
             window_colours: WindowColours::default(),
             tab_strip: true,
             status_bar: false,
+            notifications: false,
+            notify_bell: true,
             copy_on_select: false,
             right_click_paste: false,
             log_timestamps: false,
@@ -1070,6 +1079,14 @@ impl Settings {
                 "statusbar" => {
                     block = Block::Top;
                     s.status_bar = yes(&args).unwrap_or(false);
+                }
+                "notifications" => {
+                    block = Block::Top;
+                    s.notifications = yes(&args).unwrap_or(false);
+                }
+                "notifybell" => {
+                    block = Block::Top;
+                    s.notify_bell = yes(&args).unwrap_or(true);
                 }
                 "copyonselect" => {
                     block = Block::Top;
@@ -1499,6 +1516,8 @@ impl Settings {
         let _ = writeln!(out, "WindowColours {}", self.window_colours.name());
         let _ = writeln!(out, "TabStrip {}", flag(self.tab_strip));
         let _ = writeln!(out, "StatusBar {}", flag(self.status_bar));
+        let _ = writeln!(out, "Notifications {}", flag(self.notifications));
+        let _ = writeln!(out, "NotifyBell {}", flag(self.notify_bell));
         let _ = writeln!(out, "CopyOnSelect {}", flag(self.copy_on_select));
         let _ = writeln!(out, "RightClickPaste {}", flag(self.right_click_paste));
         let _ = writeln!(out, "LogTimestamps {}", flag(self.log_timestamps));
@@ -2322,6 +2341,15 @@ DesktopShareSelection yes
         assert!(old.tools_rail && old.tools_pinned);
         let s = Settings::parse("ToolsRail no\nToolsPinned no\n");
         assert!(!s.tools_rail && !s.tools_pinned);
+        assert_eq!(Settings::parse(&s.to_text()), s);
+    }
+
+    #[test]
+    fn notifications_are_off_unless_turned_on() {
+        let d = Settings::default();
+        assert!(!d.notifications && d.notify_bell);
+        let s = Settings::parse("Notifications yes\nNotifyBell no\n");
+        assert!(s.notifications && !s.notify_bell);
         assert_eq!(Settings::parse(&s.to_text()), s);
     }
 

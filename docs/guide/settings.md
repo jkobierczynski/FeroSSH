@@ -20,6 +20,8 @@ FeroSSH reads `~/.ssh/config` and `~/.ssh/known_hosts` too, and writes only to `
 | `SidePane right` | left | Shows the connection manager and file view on the right. |
 | `TabStrip no` | yes | Hides the tab strip. |
 | `StatusBar yes` | no | Shows the server status bar under the panes. Settings > Server status bar. |
+| `Notifications yes` | no | Tab badges and Windows notifications when a pane asks for attention. Settings > Desktop notifications. |
+| `NotifyBell no` | yes | Whether the bell counts as asking for attention. Settings > Notify on the bell too. |
 | `FullScreenKey no` | yes | Whether F11 switches full screen (Settings > F11 switches full screen). Off, F11 goes to the terminal. |
 | `KeyBinding 213 Ctrl+K` | | The keys of one action, by its menu command number, written by Settings > Key bindings for the actions you changed: none after the number means no shortcut. Keys are spelled as for `StandbyHotkey` (`Ctrl+Shift+PageUp`, `Alt+Shift+OemPlus`); Win is not allowed. Actions with no `KeyBinding` line keep their default keys. |
 | `WindowColours dark` | light | Where the menu bar, menus, title bar, tab strip and tools pane take their colours: `theme` (the focused pane's colour theme), `windows` (Windows' light or dark app mode), `light` (Windows' usual light look), or a neutral grey: `softgrey`, `silver`, `midgrey`, `steel`, `graphite`, `dark` or `black`. Settings > Window colours. |

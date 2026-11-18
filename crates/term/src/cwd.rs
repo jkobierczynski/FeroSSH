@@ -1,9 +1,15 @@
 //! OSC 7, the working directory a shell reports (`ESC ] 7 ; file://host/path
 //! BEL`). The parser underneath drops it, so the host's output is watched
-//! for it on the side; the side pane's file view follows it.
+//! for it on the side; the side pane's file view follows it. The same
+//! watch finds the notifications of [`crate::notify`].
 
-/// Longest OSC 7 text kept; longer ones are ignored.
+use crate::notify::{self, Kitty, Notification};
+
+/// Longest OSC text kept; longer ones are ignored.
 const MAX_LEN: usize = 4096;
+/// Room for a kitty notification's `99;metadata;` on top of its payload,
+/// which may be [`MAX_LEN`] bytes on its own.
+const MAX_KITTY_META: usize = 1024;
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 enum State {
@@ -19,11 +25,20 @@ enum State {
     SkipEsc,
 }
 
-/// Finds OSC 7 in a byte stream fed in arbitrary pieces.
+/// Finds OSC 7 and notifications in a byte stream fed in arbitrary
+/// pieces.
 #[derive(Debug, Default)]
 pub(crate) struct CwdScanner {
     state: State,
     buf: Vec<u8>,
+    kitty: Kitty,
+}
+
+/// What [`CwdScanner::scan`] found.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum Found {
+    Dir(WorkingDir),
+    Notify(Notification),
 }
 
 /// A reported working directory.
@@ -37,8 +52,9 @@ pub struct WorkingDir {
 }
 
 impl CwdScanner {
-    /// Scans `bytes`; returns the directories reported in them, in order.
-    pub(crate) fn scan(&mut self, bytes: &[u8]) -> Vec<WorkingDir> {
+    /// Scans `bytes`; returns the directories and notifications reported
+    /// in them, in order.
+    pub(crate) fn scan(&mut self, bytes: &[u8]) -> Vec<Found> {
         let mut found = Vec::new();
         for &b in bytes {
             self.state = match (self.state, b) {
@@ -53,17 +69,17 @@ impl CwdScanner {
                 (State::Esc, 0x1b) => State::Esc,
                 (State::Esc, _) => State::Ground,
                 (State::Osc, 0x07) => {
-                    found.extend(parse(&self.buf));
+                    found.extend(self.found());
                     State::Ground
                 }
                 (State::Osc, 0x1b) => State::OscEsc,
-                (State::Osc, _) if self.buf.len() >= MAX_LEN => State::Skip,
+                (State::Osc, _) if self.buf.len() >= self.limit() => State::Skip,
                 (State::Osc, _) => {
                     self.buf.push(b);
                     State::Osc
                 }
                 (State::OscEsc, b'\\') => {
-                    found.extend(parse(&self.buf));
+                    found.extend(self.found());
                     State::Ground
                 }
                 // An ESC that starts something else ends the OSC unfinished.
@@ -81,6 +97,24 @@ impl CwdScanner {
             self.buf.clear();
         }
         found
+    }
+}
+
+impl CwdScanner {
+    /// The longest the OSC being collected may grow.
+    fn limit(&self) -> usize {
+        if self.buf.starts_with(b"99;") {
+            MAX_LEN + MAX_KITTY_META
+        } else {
+            MAX_LEN
+        }
+    }
+
+    fn found(&mut self) -> Option<Found> {
+        if let Some(dir) = parse(&self.buf) {
+            return Some(Found::Dir(dir));
+        }
+        notify::parse(&self.buf, &mut self.kitty).map(Found::Notify)
     }
 }
 
@@ -185,11 +219,11 @@ mod tests {
         assert_eq!(d(""), None);
     }
 
-    fn dir(host: &str, path: &[u8]) -> WorkingDir {
-        WorkingDir {
+    fn dir(host: &str, path: &[u8]) -> Found {
+        Found::Dir(WorkingDir {
             host: host.into(),
             path: path.to_vec(),
-        }
+        })
     }
 
     #[test]
@@ -226,5 +260,47 @@ mod tests {
         assert_eq!(s.scan(&long), []);
         // And it still works afterwards.
         assert_eq!(s.scan(b"\x1b]7;file://h/ok\x07"), [dir("h", b"/ok")]);
+    }
+
+    #[test]
+    fn a_full_size_kitty_payload_fits() {
+        let mut s = CwdScanner::default();
+        let osc = [&b"\x1b]99;i=1:e=1;"[..], &[b'Q'; MAX_LEN], b"\x07"].concat();
+        assert_eq!(s.scan(&osc).len(), 1);
+        // A long header (an application name) does not cost payload: the
+        // whole text arrives, its last group too. "AAAA" decodes to NULs,
+        // which are cleaned away; "QUFB" is "AAA".
+        let header = format!("\x1b]99;i=2:e=1:f={}:t=build;", "QUFB".repeat(150));
+        let mut body = b"AAAA".repeat(MAX_LEN / 4 - 1);
+        body.extend_from_slice(b"QUFB");
+        let osc = [header.as_bytes(), &body, b"\x07"].concat();
+        let found = s.scan(&osc);
+        let title = match found.as_slice() {
+            [Found::Notify(n)] => n.title.clone().unwrap_or_default(),
+            _ => String::new(),
+        };
+        assert_eq!(title, "AAA", "{found:?}");
+        // OSC 7 keeps its own limit.
+        let long = [&b"\x1b]7;file://h/"[..], &[b'a'; MAX_LEN], b"\x07"].concat();
+        assert_eq!(s.scan(&long), []);
+    }
+
+    #[test]
+    fn finds_notifications_between_directories() {
+        let mut s = CwdScanner::default();
+        let mut got = Vec::new();
+        for b in b"\x1b]7;file://h/a\x07\x1b]9;Waiting for you\x1b\\\x1b]9;4;1;5\x07\x07" {
+            got.extend(s.scan(&[*b]));
+        }
+        assert_eq!(
+            got,
+            [
+                dir("h", b"/a"),
+                Found::Notify(Notification {
+                    title: None,
+                    body: "Waiting for you".into()
+                })
+            ]
+        );
     }
 }

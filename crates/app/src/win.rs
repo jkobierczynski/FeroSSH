@@ -223,6 +223,11 @@ const WM_TOOLS_FOCUS: u32 = WM_APP + 40;
 /// Fires when a synchronized update must be shown even though it has not
 /// ended.
 const TIMER_SYNC: usize = 1;
+/// Checks the panes with a quiet watch (Session > Notify when this pane
+/// goes quiet) once a second, while there are any.
+const TIMER_QUIET: usize = 20;
+/// Windows notifications waiting their turn whose pane is remembered.
+const MAX_TOAST_QUEUE: usize = 8;
 /// Updates the transfer queue's progress while files move.
 const TIMER_TRANSFER: usize = 2;
 const TRANSFER_TICK_MS: u32 = 250;
@@ -593,6 +598,11 @@ mod cmd {
     pub const AUTO_RESPONSES: u32 = 618;
     pub const CONFIRM_PRODUCTION: u32 = 619;
     pub const WRITE_LIBRARY: u32 = 644;
+    /// Settings > Desktop notifications, and Notify on the bell too.
+    pub const NOTIFY: u32 = 650;
+    pub const NOTIFY_BELL: u32 = 651;
+    /// Session > Notify when this pane goes quiet.
+    pub const NOTIFY_QUIET: u32 = 652;
     /// Plus the index in the session picker's list; the one past the
     /// last is "New connection".
     pub const TMUX_SESSION: u32 = 800;
@@ -837,6 +847,13 @@ struct Pane {
     name: Option<String>,
     /// A bell rang while the pane was out of sight.
     bell: bool,
+    /// The pane asked for attention (a notification, the bell, or quiet
+    /// after work) and has not been looked at since: its tab's badge.
+    attention: bool,
+    /// Session > Notify when this pane goes quiet.
+    quiet: Option<crate::attention::Watch>,
+    /// Spaces out this pane's Windows notifications.
+    throttle: crate::attention::Throttle,
     /// The remote working directory the shell last reported (OSC 7), or
     /// showed in its prompt when it does not report it.
     cwd: Option<Vec<u8>>,
@@ -1210,6 +1227,12 @@ struct Window {
     /// SSH panes whose connection dropped while tmux ran: the host's
     /// queue key and the session to attach again after the next login.
     reattach: HashMap<PaneId, (String, String)>,
+    /// The pane of the Windows notification on screen (or last on
+    /// screen): clicking it shows that pane.
+    toast_pane: Option<PaneId>,
+    /// The panes of the notifications asked for and not on screen yet,
+    /// oldest first; Windows shows them one after the other.
+    toast_queue: VecDeque<PaneId>,
     /// SSH panes reconnecting after their connection dropped.
     retries: HashMap<PaneId, Retry>,
     /// Commands decided outside a handler that returns them; the next
@@ -2302,6 +2325,8 @@ fn create_and_run(launch: Launch, theme: Option<String>) -> Result<()> {
                 live_view: LiveView::default(),
                 tmux: HashMap::new(),
                 reattach: HashMap::new(),
+                toast_pane: None,
+                toast_queue: VecDeque::new(),
                 retries: HashMap::new(),
                 queued: Vec::new(),
                 desktops: HashMap::new(),
@@ -2513,6 +2538,9 @@ fn new_pane(
         title: None,
         name: None,
         bell: false,
+        attention: false,
+        quiet: None,
+        throttle: crate::attention::Throttle::default(),
         cwd: None,
         cwd_host: None,
         cwd_reported: false,
@@ -2591,6 +2619,11 @@ fn build_menu() -> Result<HMENU> {
             MF_POPUP,
             logs.0 as usize,
             w!("Logs and &recordings"),
+        )?;
+        item(
+            session,
+            cmd::NOTIFY_QUIET,
+            "Notify when this pane goes &quiet",
         )?;
         separator(session)?;
         let tmux = CreatePopupMenu()?;
@@ -2779,6 +2812,8 @@ fn build_menu() -> Result<HMENU> {
         item(view, cmd::TOOLS_PIN, "&Keep tools open")?;
         item(view, cmd::TAB_STRIP, "Ta&b strip")?;
         item(view, cmd::STATUS_BAR, "Server stat&us bar")?;
+        item(view, cmd::NOTIFY, "Desktop &notifications")?;
+        item(view, cmd::NOTIFY_BELL, "Notify on the &bell too")?;
         separator(view)?;
         item(view, cmd::ZOOM_IN, "&Larger text\tCtrl+=")?;
         item(view, cmd::ZOOM_OUT, "&Smaller text\tCtrl+-")?;
@@ -6663,7 +6698,9 @@ impl Window {
                     if let Some(p) = self.panes.get_mut(&id) {
                         p.term.feed(&bytes);
                     }
-                    self.log(id, &bytes);
+                    // Local echo of the user's typing: logged, but not
+                    // work for the quiet watch.
+                    self.log_bytes(id, &bytes, false);
                 }
                 Effect::Output(bytes)
                     if matches!(self.panes.get(&id).map(|p| &p.host), Some(Host::Winrm(_))) =>
@@ -8045,10 +8082,20 @@ impl Window {
     }
 
     fn log(&mut self, id: PaneId, bytes: &[u8]) {
+        self.log_bytes(id, bytes, true);
+    }
+
+    /// [`Self::log`]; `live` when the host sent `bytes` (not local echo),
+    /// which the quiet watch counts as work.
+    fn log_bytes(&mut self, id: PaneId, bytes: &[u8], live: bool) {
         self.record(id, bytes);
         let Some(p) = self.panes.get_mut(&id) else {
             return;
         };
+        // Every live output passes here (not FeroSSH's own notices).
+        if live && let Some(w) = p.quiet.as_mut() {
+            w.output(Instant::now());
+        }
         let Some(writer) = &mut p.log.writer else {
             return;
         };
@@ -8125,6 +8172,10 @@ impl Window {
         // Typing starts paused auto-responses again, and is recorded.
         if let Some(w) = self.watches.get_mut(&id) {
             w.resume();
+        }
+        // What comes next answers the typing: a quiet watch starts over.
+        if let Some(w) = self.panes.get_mut(&id).and_then(|p| p.quiet.as_mut()) {
+            w.typed();
         }
         if let Some((pane, rec)) = &mut self.recording
             && *pane == id
@@ -9004,6 +9055,7 @@ impl Window {
             if let Some(d) = p.term.sync_deadline() {
                 deadline = Some(deadline.map_or(d, |old| old.min(d)));
             }
+            let notified = actions.iter().any(|a| matches!(a, Action::Notify(_)));
             for action in actions {
                 match action {
                     // tmux answered its panes' queries already.
@@ -9028,6 +9080,14 @@ impl Window {
                         if !self.focused {
                             commands.push(Command::Bell);
                         }
+                        // A notification in the same output says more than
+                        // the bell that often comes with it.
+                        if self.settings.notify_bell && !replay && !notified {
+                            chrome |= self.alert(id, None, "The bell rang.".into());
+                        }
+                    }
+                    Action::Notify(n) => {
+                        chrome |= self.alert(id, n.title, n.body);
                     }
                     Action::WorkingDirectory(dir) => {
                         if self.on_working_dir(id, dir) {
@@ -9062,6 +9122,179 @@ impl Window {
         }
         commands.append(&mut self.queued);
         commands
+    }
+
+    /// Pane `id` asks for attention: a notification the host sent (with
+    /// its heading `what`), the bell, or quiet after work. Unless the user
+    /// is looking at it, its tab gets a badge, and unless it is in sight
+    /// in the window in front, a Windows notification goes up (at most
+    /// one per pane every few seconds). Only with Settings > Desktop
+    /// notifications on. Returns whether the tab strip must redraw.
+    fn alert(&mut self, id: PaneId, what: Option<String>, body: String) -> bool {
+        if !self.settings.notifications {
+            return false;
+        }
+        // SAFETY: plain query.
+        let front = unsafe { GetForegroundWindow() } == self.hwnd;
+        let visible = self.is_visible(id);
+        if front && visible && self.focused_id() == id {
+            return false;
+        }
+        let now = Instant::now();
+        let Some(p) = self.panes.get_mut(&id) else {
+            return false;
+        };
+        let badge = !std::mem::replace(&mut p.attention, true);
+        if (front && visible) || !p.throttle.allow(now) {
+            return badge;
+        }
+        // Each balloon is paired with its pane in order: with too many
+        // waiting, this one keeps only its badge.
+        if self.toast_queue.len() >= MAX_TOAST_QUEUE {
+            return badge;
+        }
+        let pane = p.label();
+        let title = crate::attention::heading(what.as_deref(), &pane);
+        self.toast_queue.push_back(id);
+        let waiting = self.panes.values().filter(|p| p.attention).count();
+        self.queued.push(Command::Toast {
+            pane: id,
+            title,
+            body,
+            waiting: match waiting {
+                1 => "FeroSSH: a pane wants you".to_owned(),
+                n => format!("FeroSSH: {n} panes want you"),
+            },
+        });
+        badge
+    }
+
+    /// Whether pane `id` still wants the user and is out of their sight,
+    /// so its queued Windows notification should go up.
+    fn still_wants(&self, id: PaneId) -> bool {
+        // SAFETY: plain query.
+        let front = unsafe { GetForegroundWindow() } == self.hwnd;
+        self.settings.notifications
+            && self.panes.get(&id).is_some_and(|p| p.attention)
+            && !(front && self.is_visible(id))
+    }
+
+    /// Pane `id`'s balloon did not go up: it is not waiting its turn.
+    fn toast_dropped(&mut self, id: PaneId) {
+        if let Some(i) = self.toast_queue.iter().rposition(|&p| p == id) {
+            self.toast_queue.remove(i);
+        }
+    }
+
+    /// Explorer made the taskbar anew: balloons asked for before are gone.
+    fn toasts_lost(&mut self) {
+        self.toast_queue.clear();
+        self.toast_pane = None;
+    }
+
+    /// Session > Notify when this pane goes quiet: on or off for pane `id`.
+    fn toggle_quiet(&mut self, id: PaneId) {
+        let notifications = self.settings.notifications;
+        if let Some(p) = self.panes.get_mut(&id) {
+            p.quiet = match p.quiet.take() {
+                Some(_) => None,
+                // A shortcut works while the menu item is greyed.
+                None if !notifications || !quiet_watchable(p) => None,
+                None => Some(crate::attention::Watch::new()),
+            };
+        }
+        self.update_quiet_timer();
+        self.update_menu_checks();
+    }
+
+    /// Runs the once-a-second check while any pane has a quiet watch.
+    fn update_quiet_timer(&self) {
+        let any = self.panes.values().any(|p| p.quiet.is_some());
+        // SAFETY: our window and timer id.
+        unsafe {
+            if any {
+                SetTimer(Some(self.hwnd), TIMER_QUIET, 1000, None);
+            } else {
+                let _ = KillTimer(Some(self.hwnd), TIMER_QUIET);
+            }
+        }
+    }
+
+    /// The quiet watches' tick: a pane whose stretch of output just ended
+    /// asks for attention.
+    fn on_quiet_timer(&mut self) -> Vec<Command> {
+        // A pane that reconnected as SFTP-only has no shell left to watch.
+        let mut dropped = false;
+        for p in self.panes.values_mut() {
+            if p.quiet.is_some() && !quiet_watchable(p) {
+                p.quiet = None;
+                dropped = true;
+            }
+        }
+        if dropped {
+            self.update_menu_checks();
+        }
+        // Stops once the last watched pane closed.
+        if !self.panes.values().any(|p| p.quiet.is_some()) {
+            self.update_quiet_timer();
+        }
+        let now = Instant::now();
+        let mut quiet = Vec::new();
+        for (id, p) in &mut self.panes {
+            if let Some(worked) = p.quiet.as_mut().and_then(|w| w.tick(now)) {
+                quiet.push((*id, worked));
+            }
+        }
+        let mut chrome = false;
+        for (id, worked) in quiet {
+            let body = format!(
+                "Output stopped after {} of work: done, or waiting for you.",
+                crate::attention::spoken(worked)
+            );
+            chrome |= self.alert(id, None, body);
+        }
+        if chrome {
+            self.refresh_chrome();
+        }
+        std::mem::take(&mut self.queued)
+    }
+
+    /// A Windows notification came on screen: the oldest one asked for.
+    fn on_toast_shown(&mut self) {
+        if let Some(id) = self.toast_queue.pop_front() {
+            self.toast_pane = Some(id);
+        }
+    }
+
+    /// The pane a click on a notification (or the icon) is for: the one
+    /// on screen, or, clicked later from the notification centre, which
+    /// does not say which one, or on the icon: a pane that still wants
+    /// the user. Decided before FeroSSH comes forward, which takes the
+    /// badge off the pane that has the keyboard.
+    fn toast_target(&self) -> Option<PaneId> {
+        let wants = |id: PaneId| self.panes.get(&id).is_some_and(|p| p.attention);
+        self.toast_pane.filter(|&id| wants(id)).or_else(|| {
+            self.panes
+                .iter()
+                .find(|(_, p)| p.attention)
+                .map(|(&id, _)| id)
+        })
+    }
+
+    /// The user clicked a notification and FeroSSH came forward: pane
+    /// `target` ([`Self::toast_target`]) comes forward with the keyboard.
+    fn on_toast_click(&mut self, target: Option<PaneId>) -> Vec<Command> {
+        if let Some(id) = target {
+            if self.toast_pane == Some(id) {
+                self.toast_pane = None;
+            }
+            if self.panes.contains_key(&id)
+                && let Some(c) = self.live_action(Some(LiveAction::Show(id)))
+            {
+                self.queued.push(c);
+            }
+        }
+        std::mem::take(&mut self.queued)
     }
 
     /// Starts Help > Check for updates in the background, unless one is
@@ -9550,6 +9783,11 @@ impl Window {
                             .panes()
                             .iter()
                             .any(|id| self.panes.get(id).is_some_and(|p| p.bell));
+                    let attention = t
+                        .root
+                        .panes()
+                        .iter()
+                        .any(|id| self.panes.get(id).is_some_and(|p| p.attention));
                     TabLabel {
                         title: pane.map(Pane::label).unwrap_or_default(),
                         // A pane waiting to reconnect shows as connecting.
@@ -9559,6 +9797,7 @@ impl Window {
                             pane.map_or(Health::Idle, Pane::health)
                         },
                         bell,
+                        attention,
                         forwarding: self.forwarding(&views, t.focus),
                         legacy: self.legacy_in_use(t.focus),
                         unencrypted: self.unencrypted(t.focus),
@@ -13539,8 +13778,14 @@ impl Window {
 
     /// After tabs or panes changed: lay out, redraw, retitle.
     fn after_structure_change(&mut self) {
+        let looking = self.focused;
         if let Some(p) = self.panes.get_mut(&self.ws.focused()) {
             p.bell = false;
+            // Seen only while FeroSSH is in front: a layout change in the
+            // background (a tmux pane closing) leaves the badge.
+            if looking {
+                p.attention = false;
+            }
         }
         self.layout();
         self.update_title();
@@ -13581,8 +13826,12 @@ impl Window {
         if before != id {
             self.last_pane = Some(before);
         }
+        let looking = self.focused;
         if let Some(p) = self.panes.get_mut(&id) {
             p.bell = false;
+            if looking {
+                p.attention = false;
+            }
             p.grid.mark_all_dirty();
         }
         self.after_structure_change();
@@ -13656,8 +13905,14 @@ impl Window {
         if before == id && tab_before == self.ws.active && !was_side {
             return;
         }
+        // Seen only while FeroSSH is in front: a script moving focus in
+        // the background leaves the badge.
+        let looking = self.focused;
         if let Some(p) = self.panes.get_mut(&id) {
             p.bell = false;
+            if looking {
+                p.attention = false;
+            }
         }
         for pid in [before, id] {
             if let Some(p) = self.panes.get_mut(&pid)
@@ -14896,6 +15151,26 @@ impl Window {
                 self.update_menu_checks();
                 self.layout();
             }
+            cmd::NOTIFY => {
+                self.settings.notifications = !self.settings.notifications;
+                self.save_settings();
+                self.update_menu_checks();
+                if !self.settings.notifications {
+                    for p in self.panes.values_mut() {
+                        p.attention = false;
+                    }
+                    // The icon goes, and with it any balloon still waiting.
+                    self.toasts_lost();
+                    self.refresh_chrome();
+                    return Some(Command::HideToast);
+                }
+            }
+            cmd::NOTIFY_BELL => {
+                self.settings.notify_bell = !self.settings.notify_bell;
+                self.save_settings();
+                self.update_menu_checks();
+            }
+            cmd::NOTIFY_QUIET => self.toggle_quiet(pane),
             cmd::STATUS_BAR => {
                 self.settings.status_bar = !self.settings.status_bar;
                 self.save_settings();
@@ -15361,6 +15636,9 @@ impl Window {
                 (cmd::TOOLS_PIN, s.tools_pinned),
                 (cmd::TAB_STRIP, s.tab_strip),
                 (cmd::STATUS_BAR, s.status_bar),
+                (cmd::NOTIFY, s.notifications),
+                (cmd::NOTIFY_BELL, s.notify_bell),
+                (cmd::NOTIFY_QUIET, p.is_some_and(|p| p.quiet.is_some())),
                 (cmd::TMUX_LAYOUT, own_layout),
                 (cmd::BROADCAST_TAB, self.broadcast == broadcast::Scope::Tab),
                 (cmd::BROADCAST_ALL, self.broadcast == broadcast::Scope::All),
@@ -15426,6 +15704,15 @@ impl Window {
                 self.ws.all_panes().len() > 1 && !self.locked(pane),
             ),
             (cmd::SHOW_HIDDEN, !self.ws.hidden().is_empty()),
+            (cmd::NOTIFY_BELL, self.settings.notifications),
+            (
+                cmd::NOTIFY_QUIET,
+                // A watch can always be taken off; a new one needs
+                // notifications on and a shell to watch.
+                self.panes.get(&pane).is_some_and(|p| {
+                    p.quiet.is_some() || (self.settings.notifications && quiet_watchable(p))
+                }),
+            ),
         ];
         for i in 0..4 {
             out.push((cmd::FOCUS + i, split));
@@ -15648,6 +15935,12 @@ impl Window {
 
     fn set_focus(&mut self, focused: bool) {
         self.focused = focused;
+        // Back at the pane that asked for attention: it has it (the tab
+        // strip redraws below).
+        let here = self.focused_id();
+        if focused && let Some(p) = self.panes.get_mut(&here) {
+            p.attention = false;
+        }
         // The clipboard may change while away: a desktop gets it again.
         self.clip_pane = None;
         let id = self.focused_id();
@@ -16921,6 +17214,16 @@ struct CrowdedOffer {
 
 enum Command {
     Id(u32),
+    /// A Windows notification about a pane ([`crate::toast`]).
+    Toast {
+        /// The pane that wants the user.
+        pane: PaneId,
+        title: String,
+        body: String,
+        waiting: String,
+    },
+    /// The notification icon goes: the user is back.
+    HideToast,
     /// Window > Workspaces > Save layout as workspace: asks for a name.
     SaveWorkspace,
     /// Window > Workspaces > Open workspace file: asks which.
@@ -17188,6 +17491,24 @@ fn dialog(hwnd: HWND, text: &str, style: MESSAGEBOX_STYLE) -> Option<MESSAGEBOX_
     let result = unsafe { MessageBoxW(Some(hwnd), &HSTRING::from(text), w!("FeroSSH"), style) };
     DIALOG_OPEN.set(false);
     Some(result)
+}
+
+/// Puts the window in front, shown and restored, for a click on its
+/// notification.
+/// Brings the window to the front; whether it is there now.
+fn bring_forward(hwnd: HWND) -> bool {
+    // SAFETY: our window. Windows lets the window the user clicked a
+    // notification of come forward.
+    unsafe {
+        if !IsWindowVisible(hwnd).as_bool() {
+            let _ = ShowWindow(hwnd, SW_SHOW);
+        }
+        if IsIconic(hwnd).as_bool() {
+            let _ = ShowWindow(hwnd, SW_RESTORE);
+        }
+        let _ = SetForegroundWindow(hwnd);
+        GetForegroundWindow() == hwnd
+    }
 }
 
 fn run_commands(hwnd: HWND, commands: Vec<Command>) {
@@ -19141,6 +19462,21 @@ fn run_command(hwnd: HWND, command: Command) {
                 );
             }
         }
+        Command::Toast {
+            pane,
+            title,
+            body,
+            waiting,
+        } => {
+            // Something that ran first (a clipboard question, say) may
+            // have brought the user to the pane meanwhile.
+            let shown = with_window(|w| w.still_wants(pane)).unwrap_or(false)
+                && crate::toast::show(hwnd, &title, &body, &waiting);
+            if !shown {
+                with_window(|w| w.toast_dropped(pane));
+            }
+        }
+        Command::HideToast => crate::toast::hide(hwnd),
         Command::Bell => {
             let info = FLASHWINFO {
                 cbSize: std::mem::size_of::<FLASHWINFO>() as u32,
@@ -20267,6 +20603,42 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                 }
                 LRESULT(0)
             }
+            WM_TIMER if wparam.0 == TIMER_QUIET => {
+                if let Some(commands) = with_window(Window::on_quiet_timer) {
+                    run_commands(hwnd, commands);
+                }
+                LRESULT(0)
+            }
+            crate::toast::WM_NOTIFY_ICON => {
+                match crate::toast::event(lparam.0) {
+                    crate::toast::Event::Shown => {
+                        with_window(Window::on_toast_shown);
+                    }
+                    // The icon goes once FeroSSH is in front (WM_ACTIVATE);
+                    // if Windows did not let it come forward, the icon and
+                    // its pane stay for another click.
+                    crate::toast::Event::Clicked => {
+                        let target = with_window(|w| w.toast_target()).flatten();
+                        if bring_forward(hwnd)
+                            && let Some(commands) = with_window(|w| w.on_toast_click(target))
+                        {
+                            run_commands(hwnd, commands);
+                        }
+                    }
+                    _ => {}
+                }
+                LRESULT(0)
+            }
+            windows::Win32::UI::WindowsAndMessaging::WM_ACTIVATE => {
+                // Back in FeroSSH: the notifications have done their job.
+                if wparam.0 & 0xffff != 0 {
+                    // Balloons not shown yet go with the icon; the click
+                    // path has already taken its target.
+                    with_window(|w| w.toast_queue.clear());
+                    crate::toast::hide(hwnd);
+                }
+                DefWindowProcW(hwnd, msg, wparam, lparam)
+            }
             WM_TIMER if wparam.0 == TIMER_SYNC => {
                 if let Some(commands) = with_window(Window::on_sync_timer) {
                     run_commands(hwnd, commands);
@@ -20513,6 +20885,7 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                 LRESULT(0)
             }
             WM_DESTROY => {
+                crate::toast::hide(hwnd);
                 // Dropping the window closes the shells' consoles, finishes
                 // the logs and closes the worker's job, which ends it.
                 with_window(|w| {
@@ -20541,6 +20914,12 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                 PostQuitMessage(0);
                 LRESULT(0)
             }
+            // Explorer restarted: its notification area lost the icon.
+            _ if msg == crate::toast::taskbar_created() => {
+                with_window(Window::toasts_lost);
+                crate::toast::restore(hwnd);
+                DefWindowProcW(hwnd, msg, wparam, lparam)
+            }
             _ => DefWindowProcW(hwnd, msg, wparam, lparam),
         }
     }
@@ -20556,6 +20935,14 @@ fn capture(hwnd: HWND, on: bool) {
             let _ = ReleaseCapture();
         }
     }
+}
+
+/// Whether a quiet watch can see pane `p`'s work: a recording has no live
+/// output, a remote desktop's updates (or a closed one's nothing) are not
+/// terminal output, and an SFTP-only connection has no shell.
+fn quiet_watchable(p: &Pane) -> bool {
+    let sftp_only = matches!(&p.host, Host::Ssh(s) if s.target.sftp_only);
+    !matches!(p.host, Host::Replay(_) | Host::Desktop { .. }) && p.desktop.is_none() && !sftp_only
 }
 
 #[cfg(test)]

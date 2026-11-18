@@ -49,6 +49,12 @@ fuzz_target!(|data: &[u8]| {
                     assert!(!dir.path.contains(&0));
                     assert!(dir.path.len() <= 4096);
                 }
+                Action::Notify(n) => {
+                    for text in n.title.iter().chain([&n.body]) {
+                        assert!(!text.chars().any(char::is_control));
+                        assert!(text.chars().count() <= ferossh_term::MAX_NOTIFICATION);
+                    }
+                }
             }
         }
         // Vary the size and view now and then, driven by the input.
