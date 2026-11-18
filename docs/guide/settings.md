@@ -54,6 +54,7 @@ FeroSSH reads `~/.ssh/config` and `~/.ssh/known_hosts` too, and writes only to `
 | `PortPreviews yes` | no | A web server's address on the host in a pane's output (`http://localhost:5173/`) shows a bar offering to forward the port and open it in the browser (Session > Coding agents > Offer to forward and open web servers on the host). |
 | `KittyKeyboard yes` | no | Programs may turn on the kitty keyboard protocol's first level (disambiguate escape codes) (Session > Coding agents > Kitty keyboard protocol for programs that ask for it). |
 | `ShiftEnter enter\|esc-enter\|csi-u` | `enter` | What Shift+Enter sends to a program without the kitty keyboard protocol: as Enter, `ESC CR` (a new line in coding agents; Session > Coding agents > Shift+Enter types a new line), or `ESC [13;2u`. |
+| `AgentAudit yes` | no | Coding agent panes are logged and recorded (sealed) by themselves from when they open, as an audit trail (Session > Coding agents > Log and record agent panes). |
 | `Standby yes` | no | A global hotkey hides the FeroSSH window and brings it back (Window > Standby window). The first window that opens takes the hotkey. |
 | `StandbyHotkey Ctrl+Alt+Space` | `Win+Oem3` | The standby window's hotkey: Ctrl, Alt, Shift and Win joined by `+` to a key. Keys are letters, digits, `F1` to `F24`, `Space`, `Esc`, `Pause`, `ScrollLock`, `Num0` to `Num9`, the arrows and the like, and the punctuation keys by code (`Oem3` is the key below Esc on a US keyboard). |
 | `StandbyWindow notepad.exe` | this FeroSSH window | The program whose window the standby hotkey shows and hides, by file name (Window > Standby window > Window to show and hide). |
@@ -64,7 +65,7 @@ FeroSSH reads `~/.ssh/config` and `~/.ssh/known_hosts` too, and writes only to `
 
 | Keyword | Default | Meaning |
 | --- | --- | --- |
-| `ConfirmProduction no` | yes | Whether a script typed into a pane with the Production theme asks first (Session > Scripts > Confirm scripts on Production hosts). |
+| `ConfirmProduction no` | yes | Whether a script typed into a pane with the Production theme asks first, and starting a coding agent there or pasting or dropping into an agent's pane there (Session > Scripts > Confirm scripts and agents on Production hosts). |
 | `AutoResponses no` | yes | Whether scripts with a `When` text answer by themselves (Session > Scripts > Auto-responses from scripts). |
 | `RunParallel 8` | 4 | How many hosts a multi-host script run logs in to at once, 1 to 16. |
 

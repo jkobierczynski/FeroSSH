@@ -1,6 +1,6 @@
 # Plan: FeroSSH for coding agents on remote hosts
 
-More and more work over SSH is a coding agent (Claude Code, Codex CLI, aider and the like) running in a terminal on a remote machine for minutes or hours at a time. This plan lists six features that would make FeroSSH a good home for that, what FeroSSH already has for each, and what is left to build. Features 1, 2 and 3 are built; the others follow when the maintainer picks them.
+More and more work over SSH is a coding agent (Claude Code, Codex CLI, aider and the like) running in a terminal on a remote machine for minutes or hours at a time. This plan lists six features that would make FeroSSH a good home for that, what FeroSSH already has for each, and what is left to build. All six features are built.
 
 Written 18 November 2026, against `main` at 3d28477.
 
@@ -59,7 +59,9 @@ Built on 18 November 2026 as Session > Coding agents > Kitty keyboard protocol f
 - **Kitty keyboard protocol** (progressive enhancement, at least the "disambiguate" level), which Claude Code, Codex and others use when the terminal answers the query. It is off in the emulator today.
 - Check OSC 133 prompt marks and OSC 9;4 progress (shown as a progress bar in the tab and taskbar).
 
-## 6. Safety for agent input
+## 6. Safety for agent input (built)
+
+Built on 19 November 2026: the Production confirmation (Session > Scripts > Confirm scripts and agents on Production hosts) also asks before an agent starts on a Production host and before text, images or files are pasted or dropped into an agent's pane there; Session > Coding agents > Log and record agent panes (audit trail) (`AgentAudit`, off by default) logs and records every agent pane, sealed, in files named after the host and the agent. The folder is not in the name: FeroSSH does not know it when the pane opens. The optional warning for agent forwarding and the clipboard is left for later. See [Coding agents on Production hosts](../guide/everyday-use.md#coding-agents-on-production-hosts).
 
 **What FeroSSH has.** Production and Staging themes by host rule or ssh_config `Tag`, a confirmation before scripts run on Production hosts, sealed (tamper-evident) session logs, and asciicast recordings of a pane's output.
 

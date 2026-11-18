@@ -12,6 +12,7 @@
 //! UploadAndTypePath yes
 //! PortPreviews yes
 //! KittyKeyboard yes
+//! AgentAudit yes
 //! ShiftEnter esc-enter
 //! AutoReconnect yes
 //! RemoteAppCopyAgent yes
@@ -715,6 +716,10 @@ pub struct Settings {
     pub kitty_keyboard: bool,
     /// What Shift+Enter sends without the kitty keyboard protocol.
     pub shift_enter: ShiftEnterKey,
+    /// Coding agent panes are logged and recorded by themselves, sealed,
+    /// as an audit trail of what the agent did on the host. Off unless
+    /// turned on.
+    pub agent_audit: bool,
     /// The file view follows the shell's working directory (OSC 7).
     pub follow_directory: bool,
     /// How the file transfer pane arranges its Local and Remote lists,
@@ -855,6 +860,7 @@ impl Default for Settings {
             upload_type_path: false,
             port_previews: false,
             kitty_keyboard: false,
+            agent_audit: false,
             shift_enter: ShiftEnterKey::Enter,
             follow_directory: true,
             transfer_layout: None,
@@ -1219,6 +1225,10 @@ impl Settings {
                 "kittykeyboard" => {
                     block = Block::Top;
                     s.kitty_keyboard = yes(&args).unwrap_or(false);
+                }
+                "agentaudit" => {
+                    block = Block::Top;
+                    s.agent_audit = yes(&args).unwrap_or(false);
                 }
                 "shiftenter" => {
                     block = Block::Top;
@@ -1655,6 +1665,7 @@ impl Settings {
         let _ = writeln!(out, "PortPreviews {}", flag(self.port_previews));
         let _ = writeln!(out, "KittyKeyboard {}", flag(self.kitty_keyboard));
         let _ = writeln!(out, "ShiftEnter {}", self.shift_enter.name());
+        let _ = writeln!(out, "AgentAudit {}", flag(self.agent_audit));
         let _ = writeln!(
             out,
             "RemoteAppCopyAgent {}",
@@ -1969,6 +1980,7 @@ ZModem yes
 UploadAndTypePath yes
 PortPreviews yes
 KittyKeyboard yes
+AgentAudit yes
 ShiftEnter csi-u
 AutoReconnect no
 ParallelTransfers 20
@@ -2112,6 +2124,8 @@ NewKeyword later
         assert!(!Settings::default().port_previews, "off unless turned on");
         assert!(s.kitty_keyboard);
         assert!(!Settings::default().kitty_keyboard, "off unless turned on");
+        assert!(s.agent_audit);
+        assert!(!Settings::default().agent_audit, "off unless turned on");
         assert_eq!(s.shift_enter, ShiftEnterKey::CsiU);
         assert_eq!(Settings::default().shift_enter, ShiftEnterKey::Enter);
         assert_eq!(
