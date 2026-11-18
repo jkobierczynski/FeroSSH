@@ -447,6 +447,7 @@ const KEY_DEFAULTS: &[KeyDefault] = {
 fn bindable(id: u32) -> bool {
     let lists = [
         cmd::WINDOW_COLOURS..cmd::STATUS_BAR,
+        cmd::AGENT_START..cmd::AGENT_END,
         cmd::FONT..cmd::COPY,
         cmd::REMOTE_APP_CLIP..cmd::REMOTE_APP_CLIP_LAST + 1,
         cmd::DESKTOP_CLIP..cmd::DESKTOP_CLIP_LAST + 1,
@@ -598,6 +599,12 @@ mod cmd {
     pub const NOTIFY_BELL: u32 = 651;
     /// Session > Notify when this pane goes quiet.
     pub const NOTIFY_QUIET: u32 = 652;
+    /// Session > Coding agents > Show agents; the menu's first item.
+    pub const AGENTS_SHOW: u32 = 653;
+    /// Session > Coding agents: plus the index into the commands listed
+    /// when the menu opened, up to [`AGENT_END`].
+    pub const AGENT_START: u32 = 660;
+    pub const AGENT_END: u32 = 676;
     /// Plus the index in the session picker's list; the one past the
     /// last is "New connection".
     pub const TMUX_SESSION: u32 = 800;
@@ -1221,6 +1228,8 @@ struct Window {
     /// The pane the last Windows notification was about: clicking it
     /// shows that pane.
     toast_pane: Option<PaneId>,
+    /// The coding agents' states the Session manager last showed.
+    agent_states: Vec<(PaneId, &'static str)>,
     /// SSH panes reconnecting after their connection dropped.
     retries: HashMap<PaneId, Retry>,
     /// Commands decided outside a handler that returns them; the next
@@ -2196,6 +2205,7 @@ fn create_and_run(launch: Launch, theme: Option<String>) -> Result<()> {
                 tmux: HashMap::new(),
                 reattach: HashMap::new(),
                 toast_pane: None,
+                agent_states: Vec::new(),
                 retries: HashMap::new(),
                 queued: Vec::new(),
                 desktops: HashMap::new(),
@@ -2479,6 +2489,13 @@ fn build_menu() -> Result<HMENU> {
             cmd::NOTIFY_QUIET,
             "Notify when this pane goes &quiet",
         )?;
+        let agents = CreatePopupMenu()?;
+        item(
+            agents,
+            cmd::AGENTS_SHOW,
+            "&Show agents in the Session manager",
+        )?;
+        AppendMenuW(session, MF_POPUP, agents.0 as usize, w!("Coding a&gents"))?;
         separator(session)?;
         let tmux = CreatePopupMenu()?;
         item(tmux, cmd::TMUX_ATTACH, "&Attach tmux")?;
@@ -3340,7 +3357,10 @@ impl Window {
                     cols,
                     rows,
                     ..
-                } => self.add_tmux_pane(gateway, native, &look, cols, rows),
+                } => {
+                    self.add_tmux_pane(gateway, native, &look, cols, rows);
+                    self.watch_agent(gateway, native);
+                }
                 tmux::Action::Feed { native, bytes } => {
                     if let Some(p) = self.panes.get_mut(&native) {
                         p.term.feed(&bytes);
@@ -3817,6 +3837,7 @@ impl Window {
             State::Blocked | State::Ended => LiveState::Ended,
         };
         let mut out = Vec::new();
+        let now = Instant::now();
         for (tab, id) in panes {
             let Some(p) = self.panes.get(&id) else {
                 continue;
@@ -3886,11 +3907,24 @@ impl Window {
             if tab.is_none() && !user_hid {
                 notes.push("script run");
             }
+            let agent = self.agent_of(id).map(|name| {
+                let state = p
+                    .quiet
+                    .as_ref()
+                    .map_or(crate::attention::State::Idle, |w| w.state(now));
+                let (what, since) = crate::agents::status(p.attention, state, now);
+                live::Agent {
+                    name: name.to_owned(),
+                    state: what,
+                    since: since.map(crate::attention::spoken),
+                }
+            });
             out.push(LiveSession {
                 pane: id,
                 tab,
                 hidden: user_hid,
                 kind,
+                agent,
                 target,
                 name: p.name.clone(),
                 title: p.title.clone().filter(|t| !t.is_empty()),
@@ -8862,6 +8896,101 @@ impl Window {
         commands
     }
 
+    /// Session > Coding agents, as it opens: Show agents, then a Start
+    /// item for each agent command.
+    fn fill_agents(&mut self, menu: HMENU) {
+        let commands = crate::agents::commands(&self.settings.agent_commands);
+        // SAFETY: our popup menu; it is being opened, when changing it is
+        // allowed. Everything after Show agents is replaced.
+        unsafe {
+            while GetMenuItemCount(Some(menu)) > 1 {
+                let _ = DeleteMenu(menu, 1, MF_BYPOSITION);
+            }
+            let _ = AppendMenuW(menu, MF_SEPARATOR, 0, None);
+            for (id, c) in (cmd::AGENT_START..cmd::AGENT_END).zip(&commands) {
+                let label = format!("Start {} in tmux", c.replace('&', "&&"));
+                let _ = AppendMenuW(menu, MF_STRING, id as usize, &HSTRING::from(label));
+            }
+        }
+    }
+
+    /// Starts coding agent `command` from pane `id`, in tmux on its server
+    /// (see [`crate::agents`]): in a new window of the tmux session that
+    /// shows on that host, or else in session `agents`, attached here.
+    fn start_agent(&mut self, id: PaneId, command: &str) -> Option<Command> {
+        const HOW: &str = "A coding agent starts in tmux on a server: use it from a pane \
+            that is logged in to one over SSH.";
+        // A tmux pane: a new window in its own session.
+        if let Some(g) = self.panes.get(&id).and_then(Pane::gateway) {
+            let actions = self
+                .tmux
+                .get_mut(&g)
+                .filter(|t| t.active())
+                .map(|t| t.start_agent(id, command))?;
+            self.run_tmux(g, actions);
+            return None;
+        }
+        let Some(Host::Ssh(s)) = self.panes.get(&id).map(|p| &p.host) else {
+            return Some(Command::Notice(HOW.into()));
+        };
+        if s.state() != State::Connected || s.target.sftp_only {
+            return Some(Command::Notice(HOW.into()));
+        }
+        if s.target.mosh.is_some() {
+            return Some(Command::Notice(
+                "tmux integration needs an SSH shell: it does not work over Mosh, so coding \
+                 agents cannot start from a Mosh pane."
+                    .into(),
+            ));
+        }
+        // tmux already shows on this host (only one pane per host may):
+        // the agent joins that session.
+        let key = self.pane_sftp_key(id);
+        let shown = self
+            .tmux
+            .iter()
+            .find(|(_, t)| t.active())
+            .map(|(g, _)| *g)
+            .filter(|g| key.is_some() && self.pane_sftp_key(*g) == key);
+        if let Some(g) = shown {
+            let next_to = self.tmux.get(&g).and_then(|t| t.natives().first().copied());
+            let actions = match (self.tmux.get_mut(&g), next_to) {
+                (Some(t), Some(n)) => t.start_agent(n, command),
+                _ => Vec::new(),
+            };
+            self.run_tmux(g, actions);
+            return None;
+        }
+        let line = crate::agents::start_line(command);
+        self.send_host(id, line.as_bytes());
+        self.attach_tmux(id, crate::agents::SESSION, false);
+        None
+    }
+
+    /// A tmux pane just appeared: if its window runs a coding agent, its
+    /// output is watched, for its state in the Session manager and, with
+    /// notifications on, to say when it goes quiet.
+    fn watch_agent(&mut self, gateway: PaneId, native: PaneId) {
+        let agent = self
+            .tmux
+            .get(&gateway)
+            .and_then(|t| t.agent_of(native))
+            .is_some();
+        if let Some(p) = self.panes.get_mut(&native)
+            && agent
+            && p.quiet.is_none()
+        {
+            p.quiet = Some(crate::attention::Watch::new(p.term.fed()));
+            self.update_quiet_timer();
+        }
+    }
+
+    /// The coding agent pane `id` runs, by name, if it runs one.
+    fn agent_of(&self, id: PaneId) -> Option<&str> {
+        let g = self.panes.get(&id).and_then(Pane::gateway)?;
+        self.tmux.get(&g)?.agent_of(id)
+    }
+
     /// Pane `id` asks for attention: a notification the host sent (with
     /// its heading `what`), the bell, or quiet after work. Unless the user
     /// is looking at it, its tab gets a badge, and unless it is in sight
@@ -8940,7 +9069,26 @@ impl Window {
                 quiet.push((*id, worked));
             }
         }
+        // The Session manager shows each agent's state: keep it current.
         let mut chrome = false;
+        if self.side.visible && self.side.view == SideView::Live {
+            let states: Vec<(PaneId, &'static str)> = self
+                .panes
+                .iter()
+                .filter(|(id, _)| self.agent_of(**id).is_some())
+                .map(|(id, p)| {
+                    let state = p
+                        .quiet
+                        .as_ref()
+                        .map_or(crate::attention::State::Idle, |w| w.state(now));
+                    (*id, crate::agents::status(p.attention, state, now).0)
+                })
+                .collect();
+            if states != self.agent_states {
+                self.agent_states = states;
+                chrome = true;
+            }
+        }
         for (id, worked) in quiet {
             let body = format!(
                 "Output stopped after {} of work: done, or waiting for you.",
@@ -14432,6 +14580,18 @@ impl Window {
                 self.update_menu_checks();
             }
             cmd::NOTIFY_QUIET => self.toggle_quiet(pane),
+            cmd::AGENTS_SHOW => {
+                self.show_side(SideView::Live, true);
+                self.live_view.set_query("agent");
+                self.refresh_chrome();
+            }
+            id if (cmd::AGENT_START..cmd::AGENT_END).contains(&id) => {
+                let i = (id - cmd::AGENT_START) as usize;
+                let command = crate::agents::commands(&self.settings.agent_commands)
+                    .get(i)
+                    .cloned()?;
+                return self.start_agent(pane, &command);
+            }
             cmd::STATUS_BAR => {
                 self.settings.status_bar = !self.settings.status_bar;
                 self.save_settings();
@@ -19847,6 +20007,9 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                     }
                     cmd::WORKSPACE_SAVE => {
                         with_window(|w| w.fill_workspaces(popup));
+                    }
+                    cmd::AGENTS_SHOW => {
+                        with_window(|w| w.fill_agents(popup));
                     }
                     _ => {}
                 }

@@ -588,6 +588,9 @@ impl WindowColours {
     }
 }
 
+/// How many `AgentCommand` lines are kept.
+pub const MAX_AGENT_COMMANDS: usize = 16;
+
 /// How many recent connections File > Recent connections keeps.
 pub const MAX_RECENT: usize = 8;
 
@@ -632,6 +635,10 @@ pub struct Settings {
     /// The bell counts as asking for attention (Settings > Notify on the
     /// bell too). On unless turned off; only matters with notifications.
     pub notify_bell: bool,
+    /// The coding agents Session > Coding agents offers to start, as
+    /// command lines (`AgentCommand claude --model opus`, one line each,
+    /// in menu order). Empty: the built-in list.
+    pub agent_commands: Vec<String>,
     pub copy_on_select: bool,
     pub right_click_paste: bool,
     /// Put the time in front of each line of plain session logs.
@@ -771,6 +778,7 @@ impl Default for Settings {
             status_bar: false,
             notifications: false,
             notify_bell: true,
+            agent_commands: Vec::new(),
             copy_on_select: false,
             right_click_paste: false,
             log_timestamps: false,
@@ -1076,6 +1084,21 @@ impl Settings {
                 "notifybell" => {
                     block = Block::Top;
                     s.notify_bell = yes(&args).unwrap_or(true);
+                }
+                "agentcommand" => {
+                    block = Block::Top;
+                    // The rest of the line as written: a command line for
+                    // the server's shell, quotes and all.
+                    let rest = line
+                        .trim()
+                        .split_once(|c: char| c.is_whitespace() || c == '=')
+                        .map_or("", |(_, r)| r.trim_start_matches([' ', '\t', '=']).trim());
+                    if !rest.is_empty()
+                        && !rest.chars().any(char::is_control)
+                        && s.agent_commands.len() < MAX_AGENT_COMMANDS
+                    {
+                        s.agent_commands.push(rest.to_owned());
+                    }
                 }
                 "copyonselect" => {
                     block = Block::Top;
@@ -1499,6 +1522,11 @@ impl Settings {
         let _ = writeln!(out, "StatusBar {}", flag(self.status_bar));
         let _ = writeln!(out, "Notifications {}", flag(self.notifications));
         let _ = writeln!(out, "NotifyBell {}", flag(self.notify_bell));
+        for c in &self.agent_commands {
+            if !c.chars().any(char::is_control) {
+                let _ = writeln!(out, "AgentCommand {}", c.trim());
+            }
+        }
         let _ = writeln!(out, "CopyOnSelect {}", flag(self.copy_on_select));
         let _ = writeln!(out, "RightClickPaste {}", flag(self.right_click_paste));
         let _ = writeln!(out, "LogTimestamps {}", flag(self.log_timestamps));
@@ -2325,6 +2353,23 @@ DesktopShareSelection yes
         assert!(!d.notifications && d.notify_bell);
         let s = Settings::parse("Notifications yes\nNotifyBell no\n");
         assert!(s.notifications && !s.notify_bell);
+        assert_eq!(Settings::parse(&s.to_text()), s);
+    }
+
+    #[test]
+    fn agent_commands_keep_their_lines() {
+        assert!(Settings::default().agent_commands.is_empty());
+        let s = Settings::parse(
+            "AgentCommand claude --append-system-prompt \"be brief\" # not a comment\n\
+             AgentCommand=codex\nAgentCommand\n",
+        );
+        assert_eq!(
+            s.agent_commands,
+            [
+                "claude --append-system-prompt \"be brief\" # not a comment",
+                "codex"
+            ]
+        );
         assert_eq!(Settings::parse(&s.to_text()), s);
     }
 

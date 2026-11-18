@@ -751,3 +751,118 @@ fn real_tmux_workspace_makes_a_gone_session_again() {
         a.until("the pane's directory", |h| h.text(native).contains(&want));
     }
 }
+
+#[test]
+fn real_tmux_agent_window_is_marked_and_found_again() {
+    if !tmux_available() || version() < MIN_VERSION {
+        return;
+    }
+    let server = Server {
+        socket: format!("ferossh-e2e-agent-{}", std::process::id()),
+    };
+    let mut a = Harness::attach(&server, Mode::Ferossh);
+    a.until("the first pane", |h| h.shown() == 1 && !h.panes.is_empty());
+    let first = a.ws.all_panes()[0];
+    // The agent is whatever the command line runs: here a printf, typed
+    // at the new window's shell.
+    let actions = a.tmux.start_agent(first, "printf 'agent-%s\\n' $((40+2))");
+    a.apply(actions);
+    a.until("the agent's tab", |h| h.ws.all_panes().len() == 2);
+    let agent = *a.ws.all_panes().iter().find(|&&p| p != first).unwrap();
+    a.until("the agent's output", |h| h.text(agent).contains("agent-42"));
+    assert_eq!(a.tmux.agent_of(agent), Some("printf"));
+    assert_eq!(a.tmux.agent_of(first), None);
+    // The shell stays when the agent's command ends.
+    let actions = a.tmux.input(agent, b"echo still-$((1+1))\r");
+    a.apply(actions);
+    a.until("the shell after the agent", |h| {
+        h.text(agent).contains("still-2")
+    });
+    drop(a);
+
+    // Attached again (a reconnect, another PC): still an agent's window.
+    let mut b = Harness::attach(&server, Mode::Ferossh);
+    b.until("both panes again", |h| h.ws.all_panes().len() == 2);
+    let agents: Vec<_> =
+        b.ws.all_panes()
+            .into_iter()
+            .filter_map(|p| b.tmux.agent_of(p))
+            .collect();
+    assert_eq!(agents, ["printf"]);
+}
+
+#[test]
+fn real_tmux_agent_start_line_makes_the_session_then_adds_to_it() {
+    // The line runs a local `sh`; the containers are covered by the
+    // attach tests.
+    let container = std::env::var_os("FEROSSH_TMUX_CONTAINER").is_some_and(|v| !v.is_empty());
+    if container || !tmux_available() || version() < MIN_VERSION {
+        return;
+    }
+    let id = std::process::id();
+    let server = Server {
+        socket: format!("ferossh-e2e-agents-{id}"),
+    };
+    struct Scratch(std::path::PathBuf);
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+    let scratch = Scratch(std::env::temp_dir().join(format!("ferossh agents {id}")));
+    let _ = std::fs::remove_dir_all(&scratch.0);
+    let shim = scratch.0.join("bin");
+    std::fs::create_dir_all(&shim).unwrap();
+    let real = Command::new("sh")
+        .args(["-c", "command -v tmux"])
+        .output()
+        .unwrap();
+    let real = String::from_utf8_lossy(&real.stdout).trim().to_owned();
+    std::fs::write(
+        shim.join("tmux"),
+        format!(
+            "#!/bin/sh\nexec '{real}' -L '{}' -f /dev/null \"$@\"\n",
+            server.socket
+        ),
+    )
+    .unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(shim.join("tmux"), std::fs::Permissions::from_mode(0o755))
+            .unwrap();
+    }
+    let path = format!(
+        "{}:{}",
+        shim.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    let run = |command: &str| {
+        let line = crate::agents::start_line(command);
+        let status = Command::new("sh")
+            .args(["-c", &format!("{line}true")])
+            .current_dir(&scratch.0)
+            .env("PATH", &path)
+            .env("SHELL", "/bin/sh")
+            .env("PS1", "$ ")
+            .status()
+            .unwrap();
+        assert!(status.success());
+    };
+    // First the session is made, then a second agent joins it.
+    run("echo first-agent");
+    run("echo 'second agent'");
+    let windows = tmux_cmd(
+        &server,
+        &[
+            "list-windows",
+            "-t",
+            "=agents",
+            "-F",
+            "#{window_name} #{@ferossh-agent} #{pane_current_path}",
+        ],
+    );
+    let dir = scratch.0.canonicalize().unwrap();
+    let dir = dir.display();
+    assert_eq!(windows.trim(), format!("echo echo {dir}\necho echo {dir}"));
+}

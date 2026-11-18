@@ -135,6 +135,8 @@ Font, theme and text size apply to the focused pane only. Session > Save font an
 | Logs and recordings > Open log folder | Opens `%LOCALAPPDATA%\FeroSSH\logs` in Explorer. |
 | Logs and recordings > Check a log for changes... | Picks a log and says whether it is intact, or where it was changed, cut short or added to. |
 | Notify when this pane goes quiet | Watches the focused pane: when its output stops for 5 seconds after at least 8 seconds of output, it asks for attention. For coding agents and long jobs that send no notification of their own. ✓ while watching; greyed out while Settings > Desktop notifications is off. |
+| Coding agents > Show agents in the Session manager | Opens the Session manager filtered to the coding agents, with what each is doing (working, needs you, quiet, idle) and for how long. |
+| Coding agents > Start ... in tmux | Starts that agent command in a new tmux window on the focused pane's server, in the pane's directory: in the tmux session shown for that host, or in session `agents`, attached here. It keeps running when the connection drops. See [Coding agents in tmux](everyday-use.md#coding-agents-in-tmux). The commands are `claude`, `codex` and `aider` unless `AgentCommand` lines list others. |
 | tmux > Attach tmux | Types `tmux -CC new-session -A -s main` in the pane and turns tmux windows and panes into native tabs and panes (see [tmux](everyday-use.md#tmux)). |
 | tmux > Switch tmux session... | Lists the other tmux sessions on the server and switches to one. |
 | tmux > Detach tmux | Leaves tmux, and everything running in it, on the server. Attach again later from this PC or another. |
@@ -219,7 +221,7 @@ The buttons at the bottom do the same, and a saved connection has a Delete butto
 
 | Key | Action |
 | --- | --- |
-| Typing | Goes to the search box and filters by host, name, title or kind (SSH, Mosh, SFTP, WinRM, Telnet, serial, tmux, desktop, local). |
+| Typing | Goes to the search box and filters by host, name, title or kind (SSH, Mosh, SFTP, WinRM, Telnet, serial, tmux, desktop, local), or by `agent`, an agent's name or its state. Coding agents are listed first. |
 | Down (in the search box) | Moves into the list. |
 | Tab | Moves between the search box, the list and the buttons. |
 | Enter or double-click | Goes to the session's tab and pane (from the search box, the first one listed). A pane you hid comes back where it was; a hidden script-run session, or the login of a desktop or remote app connection, is shown in a tab. |
