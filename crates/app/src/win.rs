@@ -17214,9 +17214,10 @@ fn sftp_key(t: &Target) -> String {
 fn route_key(t: &Target) -> String {
     let jumps: Vec<String> = t.jumps.iter().map(route_key).collect();
     format!(
-        "{} {} [{}] {:?} {:?}",
+        "{} {} {:?} [{}] {:?} {:?}",
         sftp_key(t),
         t.alias,
+        t.host_key_alias.as_deref().map(str::to_ascii_lowercase),
         jumps.join(", "),
         t.proxy_command,
         t.proxy_server
@@ -20372,6 +20373,35 @@ fn quiet_watchable(p: &Pane) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn agent_route_tells_host_key_aliases_apart() {
+        let env = crate::ssh::Env {
+            home: std::env::temp_dir(),
+            local_user: "me".into(),
+            vars: Vec::new(),
+            config: "Host prod\n  HostName prod.example.org\n".into(),
+        };
+        let Some(a) = crate::ssh::Target::resolve("prod", &env) else {
+            unreachable!("prod resolves");
+        };
+        let mut b = a.clone();
+        assert_eq!(route_key(&a), route_key(&b));
+        b.host_key_alias = Some("other".into());
+        assert_ne!(route_key(&a), route_key(&b));
+        // The same alias in another case is the same host key.
+        let mut c = a.clone();
+        c.host_key_alias = Some("OTHER".into());
+        assert_eq!(route_key(&b), route_key(&c));
+        // And a jump host's alias counts too.
+        let mut d = a.clone();
+        let mut e = a.clone();
+        d.jumps = vec![a.clone()];
+        let mut hop = a.clone();
+        hop.host_key_alias = Some("bastion".into());
+        e.jumps = vec![hop];
+        assert_ne!(route_key(&d), route_key(&e));
+    }
 
     #[test]
     fn every_free_font_has_an_https_download_page() {
