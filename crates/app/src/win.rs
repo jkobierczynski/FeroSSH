@@ -18312,7 +18312,12 @@ fn run_command(hwnd: HWND, command: Command) {
                 }
                 false
             };
-            with_window(|w| w.open_workspace(&ws, run));
+            let next = with_window(|w| {
+                w.open_workspace(&ws, run);
+                std::mem::take(&mut w.queued)
+            })
+            .unwrap_or_default();
+            run_commands(hwnd, next);
         }
         Command::ConfirmWorkspaceStart {
             pane,
@@ -20006,7 +20011,15 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                 LRESULT(0)
             }
             WM_TIMER if wparam.0 == TIMER_SCRIPT => {
-                with_window(Window::on_script_timer);
+                // A script that ends on a pause may queue a question (a
+                // workspace's Production pane), with no output to come
+                // that would bring it up: ask now.
+                let next = with_window(|w| {
+                    w.on_script_timer();
+                    std::mem::take(&mut w.queued)
+                })
+                .unwrap_or_default();
+                run_commands(hwnd, next);
                 LRESULT(0)
             }
             WM_TIMER if wparam.0 == TIMER_RECONNECT => {
