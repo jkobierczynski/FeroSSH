@@ -22,7 +22,7 @@ use ferossh_render::{Cell, Color, Cursor, CursorShape, Flags, Grid, Rgb, Theme};
 
 use crate::cwd::{CwdScanner, Found, WorkingDir};
 use crate::highlight::{self, Highlighter};
-use crate::input::{self, Key, Mods, MouseButton, MouseEvent};
+use crate::input::{self, Key, KeyOptions, Mods, MouseButton, MouseEvent};
 use crate::notify::Notification;
 use crate::sanitize::{Paste, prepare_paste, sanitize_title};
 
@@ -32,6 +32,8 @@ use crate::sanitize::{Paste, prepare_paste, sanitize_title};
 pub struct Settings {
     /// Lines of scrollback kept above the screen.
     pub scrollback: usize,
+    /// The kitty keyboard protocol and Shift+Enter.
+    pub keys: KeyOptions,
 }
 
 impl Settings {
@@ -42,6 +44,7 @@ impl Settings {
     pub fn new(scrollback: usize) -> Self {
         Self {
             scrollback: scrollback.min(Self::MAX_SCROLLBACK),
+            keys: KeyOptions::default(),
         }
     }
 }
@@ -248,6 +251,8 @@ pub struct Terminal {
     cell_px: (u16, u16),
     search: Option<Search>,
     scrollback: usize,
+    /// How keys are sent beyond what xterm does.
+    keys: KeyOptions,
     highlighter: Option<Rc<Highlighter>>,
     highlight_cache: RefCell<Option<highlight::Cache>>,
     /// Stop patterns from the settings; with the one typed into the stop
@@ -303,6 +308,7 @@ impl Terminal {
             cell_px: (8, 16),
             search: None,
             scrollback: settings.scrollback.min(Settings::MAX_SCROLLBACK),
+            keys: settings.keys,
             highlighter: None,
             highlight_cache: RefCell::new(None),
             stop_rules: Vec::new(),
@@ -323,7 +329,23 @@ impl Terminal {
 
     pub fn set_settings(&mut self, settings: &Settings) {
         self.scrollback = settings.scrollback.min(Settings::MAX_SCROLLBACK);
+        self.keys = settings.keys;
         self.term.set_options(config(settings));
+    }
+
+    /// Changes only how keys are sent (the kitty keyboard protocol and
+    /// Shift+Enter). Turning the protocol off ends it for a program that
+    /// had it on.
+    pub fn set_keys(&mut self, keys: KeyOptions) {
+        if keys == self.keys {
+            return;
+        }
+        self.keys = keys;
+        let settings = Settings {
+            scrollback: self.scrollback,
+            keys,
+        };
+        self.term.set_options(config(&settings));
     }
 
     /// The keyword highlighting rules for this pane, or none.
@@ -757,7 +779,7 @@ impl Terminal {
 
     fn action(&self, event: Event) -> Option<Action> {
         Some(match event {
-            Event::PtyWrite(text) => Action::Reply(text.into_bytes()),
+            Event::PtyWrite(text) => Action::Reply(keyboard_report(text).into_bytes()),
             Event::Title(title) => Action::Title(Some(sanitize_title(&title))),
             Event::ResetTitle => Action::Title(None),
             Event::ClipboardStore(ClipboardType::Clipboard, text)
@@ -814,12 +836,12 @@ impl Terminal {
 
     /// Bytes for a non-text key, in the current keyboard modes.
     pub fn key(&self, key: Key, mods: Mods) -> Option<Vec<u8>> {
-        input::encode_key(key, mods, self.mode())
+        input::encode_key(key, mods, self.mode(), self.keys)
     }
 
     /// Bytes for a typed character; `alt` adds the ESC prefix.
     pub fn text(&self, ch: char, alt: bool) -> Vec<u8> {
-        input::encode_char(ch, alt)
+        input::encode_char(ch, alt, self.mode())
     }
 
     /// A paste, cleaned and bracketed if the host asked for it.
@@ -1557,13 +1579,30 @@ fn alt_switch_ends(bytes: &[u8]) -> impl Iterator<Item = usize> + '_ {
     })
 }
 
+/// The answer to `CSI ? u` (which kitty keyboard flags are on) says only
+/// the flag this terminal carries out, "disambiguate escape codes" (1):
+/// the emulator would report every flag the program asked for. Any other
+/// reply is passed as it is.
+fn keyboard_report(text: String) -> String {
+    let flags = text
+        .strip_prefix("\x1b[?")
+        .and_then(|t| t.strip_suffix('u'))
+        .filter(|f| !f.is_empty() && f.bytes().all(|b| b.is_ascii_digit()))
+        .and_then(|f| f.parse::<u32>().ok());
+    match flags {
+        Some(flags) => format!("\x1b[?{}u", flags & 1),
+        None => text,
+    }
+}
+
 fn config(settings: &Settings) -> Config {
     Config {
         scrolling_history: settings.scrollback.min(Settings::MAX_SCROLLBACK),
         // Copy requests reach the UI, which asks first; pastes are never
         // handed to the host.
         osc52: Osc52::OnlyCopy,
-        kitty_keyboard: false,
+        // Programs may turn it on (`CSI > flags u`) when this is set.
+        kitty_keyboard: settings.keys.kitty,
         ..Config::default()
     }
 }

@@ -47,7 +47,9 @@ Built on 18 November 2026 as Session > Coding agents > Offer to forward and open
 
 **What to build.** Recognise `http://localhost:PORT` and `127.0.0.1:PORT` in a pane's output and show a small bar: "Port 5173 is listening on build-box. Forward and open". One click adds a local forward to a free local port and opens the browser on it; the forward is listed like any other and goes with the session. Off by default, and never automatic: each port is a click.
 
-## 5. Rendering for agent TUIs
+## 5. Rendering for agent TUIs (built)
+
+Built on 18 November 2026 as Session > Coding agents > Kitty keyboard protocol for programs that ask for it (`KittyKeyboard`) and Shift+Enter types a new line (`ShiftEnter`), both off by default. Synchronized output and OSC 8 links were already there. OSC 133 prompt marks and OSC 9;4 progress are left for later. See [Keys and drawing for agent interfaces](../guide/everyday-use.md#keys-and-drawing-for-agent-interfaces).
 
 **What FeroSSH has.** Synchronized output (DEC mode 2026), OSC 8 links with the real target shown before opening, bracketed paste, true colour, OSC 52 clipboard with a prompt, and fast redraws.
 

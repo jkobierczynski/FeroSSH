@@ -28,6 +28,32 @@ impl Mods {
     }
 }
 
+/// What Shift+Enter sends while the program has not turned on the kitty
+/// keyboard protocol (with it, Shift+Enter is always `ESC [13;2u`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ShiftEnter {
+    /// The same as Enter, as xterm does.
+    #[default]
+    Enter,
+    /// `ESC CR`, as Alt+Enter: coding agents (Claude Code, Codex and
+    /// others) read it as a new line in their input box, and it passes
+    /// through tmux.
+    EscCr,
+    /// `ESC [13;2u`, the kitty keyboard protocol's Shift+Enter.
+    CsiU,
+}
+
+/// How keys are sent beyond what xterm does.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct KeyOptions {
+    /// Programs may turn on the kitty keyboard protocol (`CSI > 1 u`).
+    /// Its first level, "disambiguate escape codes", is what is sent:
+    /// Escape, and Enter, Tab and Backspace with a modifier, and Ctrl or
+    /// Alt with a character, as `CSI code ; modifiers u`.
+    pub kitty: bool,
+    pub shift_enter: ShiftEnter,
+}
+
 /// Keys that do not produce text by themselves. Text arrives as characters
 /// from the keyboard layout (see [`crate::Terminal::text`]), which is what
 /// keeps AltGr, dead keys and IME input correct.
@@ -51,9 +77,48 @@ pub enum Key {
     Escape,
 }
 
+/// `CSI code u`, or `CSI code ; m u` with modifiers `m` (the kitty
+/// keyboard protocol's form).
+fn csi_u(code: u32, m: u8) -> Vec<u8> {
+    if m > 1 {
+        format!("\x1b[{code};{m}u").into_bytes()
+    } else {
+        format!("\x1b[{code}u").into_bytes()
+    }
+}
+
 /// The bytes a key sends, or `None` for keys xterm has no sequence for.
-pub(crate) fn encode_key(key: Key, mods: Mods, mode: TermMode) -> Option<Vec<u8>> {
+pub(crate) fn encode_key(
+    key: Key,
+    mods: Mods,
+    mode: TermMode,
+    opts: KeyOptions,
+) -> Option<Vec<u8>> {
     let m = mods.param();
+    if mode.contains(TermMode::DISAMBIGUATE_ESC_CODES) {
+        // The kitty keyboard protocol, level 1: Escape always, and Enter,
+        // Tab and Backspace with a modifier, as CSI u; the other keys as
+        // xterm sends them.
+        match key {
+            Key::Escape => return Some(csi_u(27, m)),
+            Key::Enter if m > 1 => return Some(csi_u(13, m)),
+            Key::Tab if m > 1 => return Some(csi_u(9, m)),
+            Key::Backspace if m > 1 => return Some(csi_u(127, m)),
+            _ => {}
+        }
+    } else if key == Key::Enter
+        && mods
+            == (Mods {
+                shift: true,
+                ..Mods::NONE
+            })
+    {
+        match opts.shift_enter {
+            ShiftEnter::Enter => {}
+            ShiftEnter::EscCr => return Some(b"\x1b\r".to_vec()),
+            ShiftEnter::CsiU => return Some(csi_u(13, m)),
+        }
+    }
     let app_cursor = mode.contains(TermMode::APP_CURSOR);
     // Cursor-style keys: ESC [ A, or ESC O A in application mode, or
     // ESC [ 1 ; m A with modifiers.
@@ -110,8 +175,35 @@ pub(crate) fn encode_key(key: Key, mods: Mods, mode: TermMode) -> Option<Vec<u8>
     Some(seq.into_bytes())
 }
 
-/// A typed character; Alt sends it with an ESC prefix.
-pub(crate) fn encode_char(ch: char, alt: bool) -> Vec<u8> {
+/// A typed character; Alt sends it with an ESC prefix. With the kitty
+/// keyboard protocol on, a Ctrl or Alt character goes as `CSI code ; m u`
+/// instead: the control codes Ctrl+letter types (and Ctrl+[ \\ ]) by
+/// their key, and an Alt character by its lower case with Shift.
+pub(crate) fn encode_char(ch: char, alt: bool, mode: TermMode) -> Vec<u8> {
+    if mode.contains(TermMode::DISAMBIGUATE_ESC_CODES) {
+        let ctrl_key = match ch {
+            '\x01'..='\x1a' => Some(u32::from(ch) + 0x60),
+            '\x1b'..='\x1d' => Some(u32::from(ch) + 0x40),
+            _ => None,
+        };
+        let (code, ctrl, shift) = match ctrl_key {
+            Some(code) => (Some(code), true, false),
+            None if alt && !ch.is_control() => {
+                let shift = ch.is_uppercase();
+                let lower = if shift {
+                    ch.to_lowercase().next().unwrap_or(ch)
+                } else {
+                    ch
+                };
+                (Some(u32::from(lower)), false, shift)
+            }
+            None => (None, false, false),
+        };
+        if let Some(code) = code {
+            let m = Mods { shift, alt, ctrl }.param();
+            return csi_u(code, m);
+        }
+    }
     let mut buf = [0u8; 4];
     let mut out = Vec::with_capacity(5);
     if alt {
@@ -215,7 +307,7 @@ mod tests {
     use super::*;
 
     fn key(k: Key, mods: Mods, mode: TermMode) -> String {
-        String::from_utf8(encode_key(k, mods, mode).unwrap()).unwrap()
+        String::from_utf8(encode_key(k, mods, mode, KeyOptions::default()).unwrap()).unwrap()
     }
 
     const CTRL: Mods = Mods {
@@ -255,7 +347,7 @@ mod tests {
         assert_eq!(key(Key::F(4), ALT, normal), "\x1b[1;3S");
         assert_eq!(key(Key::F(5), Mods::NONE, normal), "\x1b[15~");
         assert_eq!(key(Key::F(12), CTRL, normal), "\x1b[24;5~");
-        assert!(encode_key(Key::F(13), Mods::NONE, normal).is_none());
+        assert!(encode_key(Key::F(13), Mods::NONE, normal, KeyOptions::default()).is_none());
     }
 
     #[test]
@@ -275,8 +367,8 @@ mod tests {
 
     #[test]
     fn characters_with_alt() {
-        assert_eq!(encode_char('é', false), "é".as_bytes());
-        assert_eq!(encode_char('b', true), b"\x1bb");
+        assert_eq!(encode_char('é', false, TermMode::empty()), "é".as_bytes());
+        assert_eq!(encode_char('b', true, TermMode::empty()), b"\x1bb");
     }
 
     #[test]
@@ -362,5 +454,78 @@ mod tests {
         let out = encode_mouse(utf8, press, 300, 0, Mods::NONE).unwrap();
         assert_eq!(&out[..4], b"\x1b[M\x21");
         assert_eq!(std::str::from_utf8(&out[4..6]).unwrap(), "\u{14d}");
+    }
+
+    #[test]
+    fn shift_enter_sends_what_the_setting_says() {
+        let normal = TermMode::empty();
+        let with = |shift_enter| {
+            let opts = KeyOptions {
+                shift_enter,
+                ..KeyOptions::default()
+            };
+            String::from_utf8(encode_key(Key::Enter, SHIFT, normal, opts).unwrap()).unwrap()
+        };
+        assert_eq!(with(ShiftEnter::Enter), "\r");
+        assert_eq!(with(ShiftEnter::EscCr), "\x1b\r");
+        assert_eq!(with(ShiftEnter::CsiU), "\x1b[13;2u");
+        // Only Shift+Enter: Enter and Ctrl+Shift+Enter are as before.
+        let opts = KeyOptions {
+            shift_enter: ShiftEnter::CsiU,
+            ..KeyOptions::default()
+        };
+        let plain = encode_key(Key::Enter, Mods::NONE, normal, opts).unwrap();
+        assert_eq!(plain, b"\r");
+        let ctrl_shift = Mods {
+            shift: true,
+            ..CTRL
+        };
+        assert_eq!(
+            encode_key(Key::Enter, ctrl_shift, normal, opts).unwrap(),
+            b"\r"
+        );
+    }
+
+    #[test]
+    fn the_kitty_protocol_disambiguates_escape_and_modified_keys() {
+        let kitty = TermMode::DISAMBIGUATE_ESC_CODES;
+        assert_eq!(key(Key::Escape, Mods::NONE, kitty), "\x1b[27u");
+        assert_eq!(key(Key::Escape, ALT, kitty), "\x1b[27;3u");
+        assert_eq!(key(Key::Enter, Mods::NONE, kitty), "\r");
+        assert_eq!(key(Key::Enter, SHIFT, kitty), "\x1b[13;2u");
+        assert_eq!(key(Key::Enter, ALT, kitty), "\x1b[13;3u");
+        assert_eq!(key(Key::Tab, Mods::NONE, kitty), "\t");
+        assert_eq!(key(Key::Tab, SHIFT, kitty), "\x1b[9;2u");
+        assert_eq!(key(Key::Backspace, Mods::NONE, kitty), "\x7f");
+        assert_eq!(key(Key::Backspace, CTRL, kitty), "\x1b[127;5u");
+        // The other keys are as xterm sends them.
+        assert_eq!(key(Key::Up, CTRL, kitty), "\x1b[1;5A");
+        assert_eq!(key(Key::F(5), Mods::NONE, kitty), "\x1b[15~");
+        // The Shift+Enter setting gives way to the protocol.
+        let opts = KeyOptions {
+            kitty: true,
+            shift_enter: ShiftEnter::EscCr,
+        };
+        assert_eq!(
+            encode_key(Key::Enter, SHIFT, kitty, opts).unwrap(),
+            b"\x1b[13;2u"
+        );
+    }
+
+    #[test]
+    fn the_kitty_protocol_sends_ctrl_and_alt_characters_by_key() {
+        let kitty = TermMode::DISAMBIGUATE_ESC_CODES;
+        assert_eq!(encode_char('\x03', false, kitty), b"\x1b[99;5u");
+        assert_eq!(encode_char('\x01', false, kitty), b"\x1b[97;5u");
+        assert_eq!(encode_char('\x1b', false, kitty), b"\x1b[91;5u");
+        assert_eq!(encode_char('\x03', true, kitty), b"\x1b[99;7u");
+        assert_eq!(encode_char('b', true, kitty), b"\x1b[98;3u");
+        assert_eq!(encode_char('B', true, kitty), b"\x1b[98;4u");
+        assert_eq!(encode_char('é', true, kitty), "\x1b[233;3u".as_bytes());
+        // Plain text stays text.
+        assert_eq!(encode_char('a', false, kitty), b"a");
+        assert_eq!(encode_char('A', false, kitty), b"A");
+        // Without the protocol, as before.
+        assert_eq!(encode_char('\x03', false, TermMode::empty()), b"\x03");
     }
 }

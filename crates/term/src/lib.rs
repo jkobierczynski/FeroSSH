@@ -37,7 +37,7 @@ mod sanitize;
 mod terminal;
 
 pub use cwd::{WorkingDir, prompt_dir};
-pub use input::{Key, Mods, MouseButton, MouseEvent};
+pub use input::{Key, KeyOptions, Mods, MouseButton, MouseEvent, ShiftEnter};
 pub use log::{Clock, LogWriter, Sealed, log_file_name};
 pub use notify::{MAX_NOTIFICATION, Notification};
 pub use sanitize::{Paste, check_link, clipboard_preview, prepare_paste, sanitize_title};

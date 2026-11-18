@@ -534,6 +534,15 @@ Click **Forward and open** to forward a port on this PC's loopback to that port 
 
 Nothing is forwarded without a click. Addresses inside links and window titles are not offered, nor other hosts' addresses. It works on panes logged in over SSH, including tmux panes. It is off unless you turn it on (`PortPreviews`).
 
+### Keys and drawing for agent interfaces
+
+Coding agents draw full-screen interfaces that redraw often. FeroSSH shows each redraw whole: a program that brackets its redraws with synchronized output (mode 2026) is drawn once per redraw, never half done, and a program that asks whether this is supported is told it is. Links a program marks with OSC 8 open with Ctrl+click, after showing where they really go.
+
+Two options in Session > Coding agents make the keys work as these programs expect. Both are off unless you turn them on.
+
+- **Shift+Enter types a new line (sends Esc Enter).** Agents read Enter as "send" and need another key for a new line in their input box. With this on, Shift+Enter sends `Esc Enter`, which Claude Code, Codex and others take as a new line, and which reaches them through tmux too. `ShiftEnter csi-u` in `ferossh.conf` sends `ESC [13;2u` instead.
+- **Kitty keyboard protocol for programs that ask for it.** A program can then turn on the kitty keyboard protocol's first level ("disambiguate escape codes"), as many agents do when the terminal has it. While it is on, Escape, Shift+Enter, Ctrl+Enter, Alt+Enter, Shift+Tab, Ctrl+Backspace and Ctrl or Alt with a letter come as unambiguous `CSI … u` codes, so Escape is never mistaken for the start of a key, and Shift+Enter is always `ESC [13;2u`. It ends when the program exits, and at once if you turn the option off. A program asking for more of the protocol is told only this level is on. tmux does not pass the protocol on, so programs inside tmux get xterm's keys and the Shift+Enter option.
+
 ## Remote desktops
 
 Session > Remote desktop > Open remote desktop (Ctrl+Shift+D) shows the Linux desktop (X11 or Wayland) of the host you are logged in to. The server needs an RDP server: xrdp (`sudo apt install xrdp`) or GNOME Remote Desktop. FeroSSH checks that something answers on the server's RDP port (3389, or `DesktopPort`), forwards a loopback port to it through SSH (33900 to 33999, the same for the same host each time) and opens Windows' Remote Desktop Connection there. The server's RDP port can stay closed on its firewall, and the tunnel closes with the connection.

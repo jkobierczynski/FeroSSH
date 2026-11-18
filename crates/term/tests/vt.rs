@@ -5,8 +5,8 @@
 
 use ferossh_render::{Cell, Color, CursorShape, Flags, Grid, Rgb, Theme};
 use ferossh_term::{
-    Action, Key, MAX_COLS, MAX_ROWS, Mods, MouseButton, MouseEvent, SelectionKind, Settings,
-    Terminal,
+    Action, Key, KeyOptions, MAX_COLS, MAX_ROWS, Mods, MouseButton, MouseEvent, SelectionKind,
+    Settings, ShiftEnter, Terminal,
 };
 
 fn term(cols: usize, rows: usize) -> Terminal {
@@ -200,6 +200,44 @@ fn keys_follow_cursor_key_mode() {
     assert_eq!(t.key(Key::Up, Mods::NONE).unwrap(), b"\x1bOA");
     t.feed(b"\x1b[20h");
     assert_eq!(t.key(Key::Enter, Mods::NONE).unwrap(), b"\r\n");
+}
+
+#[test]
+fn the_kitty_keyboard_protocol_is_there_only_when_allowed() {
+    let shift = Mods {
+        shift: true,
+        ..Mods::NONE
+    };
+    // Off: the query is not answered and the push does nothing, so the
+    // program keeps to xterm's keys.
+    let mut t = term(10, 3);
+    t.feed(b"\x1b[?u\x1b[>1u");
+    assert!(replies(&mut t).is_empty());
+    assert_eq!(t.key(Key::Escape, Mods::NONE).unwrap(), b"\x1b");
+    // On: the program asks for it and gets it.
+    t.set_keys(KeyOptions {
+        kitty: true,
+        shift_enter: ShiftEnter::EscCr,
+    });
+    t.feed(b"\x1b[?u");
+    assert_eq!(replies(&mut t), ["\x1b[?0u"]);
+    assert_eq!(t.key(Key::Enter, shift).unwrap(), b"\x1b\r");
+    // Every flag asked for; only "disambiguate" is said to be on.
+    t.feed(b"\x1b[>31u\x1b[?u");
+    assert_eq!(replies(&mut t), ["\x1b[?1u"]);
+    assert_eq!(t.key(Key::Escape, Mods::NONE).unwrap(), b"\x1b[27u");
+    assert_eq!(t.key(Key::Enter, shift).unwrap(), b"\x1b[13;2u");
+    assert_eq!(t.text('\x03', false), b"\x1b[99;5u");
+    assert_eq!(t.text('x', false), b"x");
+    // The program pops it when it exits: xterm's keys again.
+    t.feed(b"\x1b[<u");
+    assert_eq!(t.key(Key::Escape, Mods::NONE).unwrap(), b"\x1b");
+    assert_eq!(t.text('\x03', false), b"\x03");
+    // Turned off while a program has it on: it ends.
+    t.feed(b"\x1b[>1u");
+    t.set_keys(KeyOptions::default());
+    assert_eq!(t.key(Key::Escape, Mods::NONE).unwrap(), b"\x1b");
+    assert_eq!(t.key(Key::Enter, shift).unwrap(), b"\r");
 }
 
 #[test]

@@ -32,8 +32,8 @@ use ferossh_config::snippet_store;
 use ferossh_config::trigger::{Fire, Watch};
 use ferossh_config::workspace::{self as wsfile, Open as WsOpen, PaneSpec};
 use ferossh_config::{
-    ForwardKind, ForwardSpec, SessionKind, Settings, WindowColours, mobaxterm, mremoteng, putty,
-    securecrt, ssh_config, winscp,
+    ForwardKind, ForwardSpec, SessionKind, Settings, ShiftEnterKey, WindowColours, mobaxterm,
+    mremoteng, putty, securecrt, ssh_config, winscp,
 };
 use ferossh_forward::x11::{Display, MIT_COOKIE, find_cookie, xauth_entries};
 use ferossh_ipc::{
@@ -47,9 +47,9 @@ use ferossh_render::{
 use ferossh_sftp::{Remote, names};
 use ferossh_term::cast::{Cast, CastHeader, CastWriter, Play, Player, clock_text};
 use ferossh_term::{
-    Action, Clock, Key, LogWriter, Mods, MouseButton, MouseEvent, SelectionKind,
-    Settings as TermSettings, Terminal, WorkingDir, chain, check_link, clipboard_preview,
-    log_file_name, prompt_dir,
+    Action, Clock, Key, KeyOptions, LogWriter, Mods, MouseButton, MouseEvent, SelectionKind,
+    Settings as TermSettings, ShiftEnter, Terminal, WorkingDir, chain, check_link,
+    clipboard_preview, log_file_name, prompt_dir,
 };
 use windows::Win32::Foundation::E_FAIL;
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, SIZE, WPARAM};
@@ -621,6 +621,10 @@ mod cmd {
     /// Session > Coding agents > Offer to forward and open web servers;
     /// the menu's third item.
     pub const PORT_PREVIEWS: u32 = 655;
+    /// Session > Coding agents > Kitty keyboard protocol; the fourth item.
+    pub const KITTY_KEYBOARD: u32 = 656;
+    /// Session > Coding agents > Shift+Enter types a new line; the fifth.
+    pub const SHIFT_ENTER: u32 = 657;
     /// Session > Coding agents: plus the index into the commands listed
     /// when the menu opened, up to [`AGENT_END`].
     pub const AGENT_START: u32 = 660;
@@ -1579,6 +1583,9 @@ thread_local! {
     // A confirmation dialog is open. Requests that would open another one
     // meanwhile are dropped.
     static DIALOG_OPEN: StdCell<bool> = const { StdCell::new(false) };
+    // How new terminals send keys (the kitty keyboard protocol and
+    // Shift+Enter), from the settings.
+    static KEY_OPTIONS: StdCell<KeyOptions> = StdCell::new(KeyOptions::default());
 }
 
 /// Runs `f` on the window state, or returns `None` before the window is set
@@ -2223,7 +2230,21 @@ fn replay_terminal(
 }
 
 fn term_settings(lines: Option<usize>) -> TermSettings {
-    lines.map_or_else(TermSettings::default, TermSettings::new)
+    let mut settings = lines.map_or_else(TermSettings::default, TermSettings::new);
+    settings.keys = KEY_OPTIONS.get();
+    settings
+}
+
+/// How terminals send keys, from Session > Coding agents' settings.
+fn key_options(settings: &Settings) -> KeyOptions {
+    KeyOptions {
+        kitty: settings.kitty_keyboard,
+        shift_enter: match settings.shift_enter {
+            ShiftEnterKey::Enter => ShiftEnter::Enter,
+            ShiftEnterKey::EscCr => ShiftEnter::EscCr,
+            ShiftEnterKey::CsiU => ShiftEnter::CsiU,
+        },
+    }
 }
 
 fn create_and_run(launch: Launch, theme: Option<String>) -> Result<()> {
@@ -2272,6 +2293,7 @@ fn create_and_run(launch: Launch, theme: Option<String>) -> Result<()> {
         let dpi = GetDpiForWindow(hwnd);
         let mut settings = load_settings();
         load_snippets(&mut settings);
+        KEY_OPTIONS.set(key_options(&settings));
         let font = FontSpec::default();
         // An unknown theme name falls back to the default (Nord).
         let default_theme = theme.and_then(|n| Theme::by_name(&n)).unwrap_or_default();
@@ -2707,6 +2729,16 @@ fn build_menu() -> Result<HMENU> {
             agents,
             cmd::PORT_PREVIEWS,
             "Offer to &forward and open web servers on the host",
+        )?;
+        item(
+            agents,
+            cmd::KITTY_KEYBOARD,
+            "&Kitty keyboard protocol for programs that ask for it",
+        )?;
+        item(
+            agents,
+            cmd::SHIFT_ENTER,
+            "Shift+&Enter types a new line (sends Esc Enter)",
         )?;
         AppendMenuW(session, MF_POPUP, agents.0 as usize, w!("Coding a&gents"))?;
         separator(session)?;
@@ -9237,12 +9269,11 @@ impl Window {
     fn fill_agents(&mut self, menu: HMENU) {
         let commands = crate::agents::commands(&self.settings.agent_commands);
         // SAFETY: our popup menu; it is being opened, when changing it is
-        // allowed. Everything after Show agents, the paste option and the
-        // previews option is
+        // allowed. Everything after Show agents and the four options is
         // replaced.
         unsafe {
-            while GetMenuItemCount(Some(menu)) > 3 {
-                let _ = DeleteMenu(menu, 3, MF_BYPOSITION);
+            while GetMenuItemCount(Some(menu)) > 5 {
+                let _ = DeleteMenu(menu, 5, MF_BYPOSITION);
             }
             let _ = AppendMenuW(menu, MF_SEPARATOR, 0, None);
             for (id, c) in (cmd::AGENT_START..cmd::AGENT_END).zip(&commands) {
@@ -12041,6 +12072,16 @@ impl Window {
             ));
         }
         vars
+    }
+
+    /// Every terminal sends keys as the settings now say; turning the
+    /// kitty keyboard protocol off ends it for programs that had it on.
+    fn apply_keys(&mut self) {
+        let keys = key_options(&self.settings);
+        KEY_OPTIONS.set(keys);
+        for p in self.panes.values_mut() {
+            p.term.set_keys(keys);
+        }
     }
 
     /// Looks for a web server's address in what pane `id`'s host printed
@@ -15786,6 +15827,22 @@ impl Window {
                 self.save_settings();
                 self.update_menu_checks();
             }
+            cmd::KITTY_KEYBOARD => {
+                self.settings.kitty_keyboard = !self.settings.kitty_keyboard;
+                self.save_settings();
+                self.update_menu_checks();
+                self.apply_keys();
+            }
+            cmd::SHIFT_ENTER => {
+                self.settings.shift_enter = if self.settings.shift_enter == ShiftEnterKey::Enter {
+                    ShiftEnterKey::EscCr
+                } else {
+                    ShiftEnterKey::Enter
+                };
+                self.save_settings();
+                self.update_menu_checks();
+                self.apply_keys();
+            }
             cmd::PORT_PREVIEWS => {
                 self.settings.port_previews = !self.settings.port_previews;
                 self.save_settings();
@@ -16233,6 +16290,8 @@ impl Window {
                 (cmd::ZMODEM, s.zmodem),
                 (cmd::UPLOAD_TYPE_PATH, s.upload_type_path),
                 (cmd::PORT_PREVIEWS, s.port_previews),
+                (cmd::KITTY_KEYBOARD, s.kitty_keyboard),
+                (cmd::SHIFT_ENTER, s.shift_enter != ShiftEnterKey::Enter),
                 (cmd::HIGHLIGHT, s.highlight),
                 (cmd::AUTO_RECONNECT, s.auto_reconnect),
                 (cmd::SIDE_RIGHT, s.side_pane_right),

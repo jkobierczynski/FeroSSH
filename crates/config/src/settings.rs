@@ -11,6 +11,8 @@
 //! ZModem yes
 //! UploadAndTypePath yes
 //! PortPreviews yes
+//! KittyKeyboard yes
+//! ShiftEnter esc-enter
 //! AutoReconnect yes
 //! RemoteAppCopyAgent yes
 //! RemoteAppRemoveAgent no
@@ -523,6 +525,39 @@ impl Profile {
     }
 }
 
+/// What Shift+Enter sends to a program that has not turned on the kitty
+/// keyboard protocol (Session > Coding agents > Shift+Enter types a new
+/// line).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ShiftEnterKey {
+    /// The same as Enter, as xterm does.
+    #[default]
+    Enter,
+    /// `ESC CR`, as Alt+Enter, which coding agents read as a new line.
+    EscCr,
+    /// `ESC [13;2u`, the kitty keyboard protocol's Shift+Enter.
+    CsiU,
+}
+
+impl ShiftEnterKey {
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Enter => "enter",
+            Self::EscCr => "esc-enter",
+            Self::CsiU => "csi-u",
+        }
+    }
+
+    pub fn parse(word: &str) -> Option<Self> {
+        Some(match word.to_ascii_lowercase().as_str() {
+            "enter" | "no" | "off" => Self::Enter,
+            "esc-enter" | "esc" | "yes" | "on" => Self::EscCr,
+            "csi-u" | "csiu" => Self::CsiU,
+            _ => return None,
+        })
+    }
+}
+
 /// Where the window's own colours (menu bar, menus, title bar, tab strip
 /// and tools pane) come from: Settings > Window colours.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -674,6 +709,12 @@ pub struct Settings {
     /// port and open it in the browser here. Off unless turned on; each
     /// forward is a click.
     pub port_previews: bool,
+    /// Programs that ask for the kitty keyboard protocol get its first
+    /// level, as coding agents' full-screen interfaces do to tell
+    /// Shift+Enter, Ctrl+Enter and Escape apart. Off unless turned on.
+    pub kitty_keyboard: bool,
+    /// What Shift+Enter sends without the kitty keyboard protocol.
+    pub shift_enter: ShiftEnterKey,
     /// The file view follows the shell's working directory (OSC 7).
     pub follow_directory: bool,
     /// How the file transfer pane arranges its Local and Remote lists,
@@ -813,6 +854,8 @@ impl Default for Settings {
             zmodem: false,
             upload_type_path: false,
             port_previews: false,
+            kitty_keyboard: false,
+            shift_enter: ShiftEnterKey::Enter,
             follow_directory: true,
             transfer_layout: None,
             transfer_sort: None,
@@ -1172,6 +1215,17 @@ impl Settings {
                 "portpreviews" => {
                     block = Block::Top;
                     s.port_previews = yes(&args).unwrap_or(false);
+                }
+                "kittykeyboard" => {
+                    block = Block::Top;
+                    s.kitty_keyboard = yes(&args).unwrap_or(false);
+                }
+                "shiftenter" => {
+                    block = Block::Top;
+                    s.shift_enter = first
+                        .as_deref()
+                        .and_then(ShiftEnterKey::parse)
+                        .unwrap_or_default();
                 }
                 "bookmark" => {
                     block = Block::Top;
@@ -1599,6 +1653,8 @@ impl Settings {
         let _ = writeln!(out, "ZModem {}", flag(self.zmodem));
         let _ = writeln!(out, "UploadAndTypePath {}", flag(self.upload_type_path));
         let _ = writeln!(out, "PortPreviews {}", flag(self.port_previews));
+        let _ = writeln!(out, "KittyKeyboard {}", flag(self.kitty_keyboard));
+        let _ = writeln!(out, "ShiftEnter {}", self.shift_enter.name());
         let _ = writeln!(
             out,
             "RemoteAppCopyAgent {}",
@@ -1912,6 +1968,8 @@ VerifyTransfers yes
 ZModem yes
 UploadAndTypePath yes
 PortPreviews yes
+KittyKeyboard yes
+ShiftEnter csi-u
 AutoReconnect no
 ParallelTransfers 20
 FollowDirectory no
@@ -2052,6 +2110,18 @@ NewKeyword later
         );
         assert!(s.port_previews);
         assert!(!Settings::default().port_previews, "off unless turned on");
+        assert!(s.kitty_keyboard);
+        assert!(!Settings::default().kitty_keyboard, "off unless turned on");
+        assert_eq!(s.shift_enter, ShiftEnterKey::CsiU);
+        assert_eq!(Settings::default().shift_enter, ShiftEnterKey::Enter);
+        assert_eq!(
+            Settings::parse("ShiftEnter esc-enter\n").shift_enter,
+            ShiftEnterKey::EscCr
+        );
+        assert_eq!(
+            Settings::parse("ShiftEnter sideways\n").shift_enter,
+            ShiftEnterKey::Enter
+        );
         assert!(s.verify_transfers);
         assert!(!s.auto_reconnect);
         assert_eq!(web.auto_reconnect, Some(true));
