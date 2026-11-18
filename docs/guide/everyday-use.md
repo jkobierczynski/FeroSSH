@@ -583,7 +583,7 @@ While it is on, FeroSSH runs one small read-only command per server on a channel
 
 ## Notifications (coding agents and long jobs)
 
-Settings > Desktop notifications lets a pane tell you when it wants you, so you can leave a coding agent (Claude Code, Codex, aider) or a long build running in a tab and work elsewhere. It is off unless you turn it on. When a pane asks for attention and you are not looking at it, its tab gets an amber diamond (◆) until you go to it, and unless the pane is in sight in the window in front, Windows shows a notification with the pane's name and the message. Click it to bring FeroSSH forward on that pane. The FeroSSH icon stays in the notification area while something waits for you, so a notification you missed is still in Windows' notification centre; it goes when you come back to FeroSSH. One pane raises at most one notification every 10 seconds.
+Settings > Desktop notifications lets a pane tell you when it wants you, so you can leave a coding agent (Claude Code, Codex, aider) or a long build running in a tab and work elsewhere. It is off unless you turn it on. When a pane asks for attention and you are not looking at it, its tab gets an amber diamond (◆) until you go to it, and unless the pane is in sight in the window in front, Windows shows a notification with the pane's name and the message. Click it to bring FeroSSH forward on that pane. The FeroSSH icon stays in the notification area while something waits for you; clicking it goes to a pane that wants you, and it goes when you come back to FeroSSH. Windows 10 also keeps missed notifications in its notification centre; Windows 11 may not keep them once they time out, so look for the tab badges there. One pane raises at most one notification every 10 seconds.
 
 A pane asks for attention when:
 
@@ -591,7 +591,7 @@ A pane asks for attention when:
 - The bell rings (Settings > Notify on the bell too, on by default while notifications are on).
 - Its output goes quiet (Session > Notify when this pane goes quiet, per pane): after at least 8 seconds of output, 5 seconds of silence mean the job ended or is waiting for an answer. This catches an agent or a script that sends nothing. What you type starts the watch over, so your own typing does not count.
 
-The message is the host's text, shown as plain text: control and hidden formatting characters are taken out and it is cut at 256 characters. Notifications use Windows' notification-area balloons, which Windows 10 and 11 show as notifications, so nothing has to be installed or registered. Windows' Do not disturb (Focus assist) holds them back like any other notification.
+The message is the host's text, shown as plain text: control and hidden formatting characters are taken out and it is cut at 256 characters (Windows may shorten a long message a little more, and a long heading too). Notifications use Windows' notification-area balloons, which Windows 10 and 11 show as notifications, so nothing has to be installed or registered. Windows' Do not disturb (Focus assist) holds them back like any other notification.
 
 ## Selecting, copying and scrollback
 

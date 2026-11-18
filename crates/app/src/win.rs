@@ -1231,7 +1231,7 @@ struct Window {
     /// screen): clicking it shows that pane.
     toast_pane: Option<PaneId>,
     /// The coding agents' states the Session manager last showed.
-    agent_states: Vec<(PaneId, &'static str)>,
+    agent_states: Vec<(PaneId, &'static str, Option<String>)>,
     /// The panes of the notifications asked for and not on screen yet,
     /// oldest first; Windows shows them one after the other.
     toast_queue: VecDeque<PaneId>,
@@ -8952,15 +8952,29 @@ impl Window {
                     .into(),
             ));
         }
-        // tmux already shows on this host (only one pane per host may):
-        // the agent joins that session.
-        let key = self.pane_sftp_key(id);
+        // A RemoteCommand runs instead of the shell: nothing would read
+        // the line that starts tmux.
+        if s.target.command.is_some() {
+            return Some(Command::Notice(
+                "This connection runs a RemoteCommand instead of a shell, so a coding agent \
+                 cannot start from it."
+                    .into(),
+            ));
+        }
+        // tmux already shows on this host (only one pane per host may),
+        // reached the same way: the agent joins that session.
+        let route = route_key(&s.target);
         let shown = self
             .tmux
             .iter()
-            .find(|(_, t)| t.active())
-            .map(|(g, _)| *g)
-            .filter(|g| key.is_some() && self.pane_sftp_key(*g) == key);
+            .find(|(g, t)| {
+                t.active()
+                    && matches!(
+                        self.panes.get(g).map(|p| &p.host),
+                        Some(Host::Ssh(other)) if route_key(&other.target) == route
+                    )
+            })
+            .map(|(g, _)| *g);
         if let Some(g) = shown {
             let next_to = self.tmux.get(&g).and_then(|t| t.natives().first().copied());
             let actions = match (self.tmux.get_mut(&g), next_to) {
@@ -9032,6 +9046,7 @@ impl Window {
         self.toast_queue.push_back(id);
         let waiting = self.panes.values().filter(|p| p.attention).count();
         self.queued.push(Command::Toast {
+            pane: id,
             title,
             body,
             waiting: match waiting {
@@ -9040,6 +9055,16 @@ impl Window {
             },
         });
         badge
+    }
+
+    /// Whether pane `id` still wants the user and is out of their sight,
+    /// so its queued Windows notification should go up.
+    fn still_wants(&self, id: PaneId) -> bool {
+        // SAFETY: plain query.
+        let front = unsafe { GetForegroundWindow() } == self.hwnd;
+        self.settings.notifications
+            && self.panes.get(&id).is_some_and(|p| p.attention)
+            && !(front && self.is_visible(id))
     }
 
     /// Session > Notify when this pane goes quiet: on or off for pane `id`.
@@ -9086,7 +9111,9 @@ impl Window {
         // The Session manager shows each agent's state: keep it current.
         let mut chrome = false;
         if self.side.visible && self.side.view == SideView::Live {
-            let states: Vec<(PaneId, &'static str)> = self
+            // As the rows say it: the state and how long, so "quiet 5 s"
+            // does not stay while it is a minute.
+            let states: Vec<(PaneId, &'static str, Option<String>)> = self
                 .panes
                 .iter()
                 .filter(|(id, _)| self.agent_of(**id).is_some())
@@ -9095,7 +9122,8 @@ impl Window {
                         .quiet
                         .as_ref()
                         .map_or(crate::attention::State::Idle, |w| w.state(now));
-                    (*id, crate::agents::status(p.attention, state, now).0)
+                    let (what, since) = crate::agents::status(p.attention, state, now);
+                    (*id, what, since.map(crate::attention::spoken))
                 })
                 .collect();
             if states != self.agent_states {
@@ -13261,9 +13289,14 @@ impl Window {
 
     /// After tabs or panes changed: lay out, redraw, retitle.
     fn after_structure_change(&mut self) {
+        let looking = self.focused;
         if let Some(p) = self.panes.get_mut(&self.ws.focused()) {
             p.bell = false;
-            p.attention = false;
+            // Seen only while FeroSSH is in front: a layout change in the
+            // background (a tmux pane closing) leaves the badge.
+            if looking {
+                p.attention = false;
+            }
         }
         self.layout();
         self.update_title();
@@ -14616,7 +14649,7 @@ impl Window {
             cmd::NOTIFY_QUIET => self.toggle_quiet(pane),
             cmd::AGENTS_SHOW => {
                 self.show_side(SideView::Live, true);
-                self.live_view.set_query("agent");
+                self.live_view.set_query(crate::live::AGENTS_ONLY);
                 self.refresh_chrome();
             }
             id if (cmd::AGENT_START..cmd::AGENT_END).contains(&id) => {
@@ -16669,6 +16702,8 @@ enum Command {
     Id(u32),
     /// A Windows notification about a pane ([`crate::toast`]).
     Toast {
+        /// The pane that wants the user.
+        pane: PaneId,
         title: String,
         body: String,
         waiting: String,
@@ -17109,6 +17144,21 @@ fn rdp_file(addr: &str, size: Option<(u16, u16)>) -> String {
 /// The key of a host's transfer queue: one per user, host name and port.
 fn sftp_key(t: &Target) -> String {
     format!("{}@{}:{}", t.user, t.hostname.to_ascii_lowercase(), t.port)
+}
+
+/// Who `t` reaches and how: its [`sftp_key`], the name it was opened by
+/// and the hops on the way. Two connections with the same key may still
+/// reach different machines through different jump hosts.
+fn route_key(t: &Target) -> String {
+    let jumps: Vec<String> = t.jumps.iter().map(route_key).collect();
+    format!(
+        "{} {} [{}] {:?} {:?}",
+        sftp_key(t),
+        t.alias,
+        jumps.join(", "),
+        t.proxy_command,
+        t.proxy_server
+    )
 }
 
 /// The paths of files dropped from Explorer, and where they were dropped.
@@ -18792,10 +18842,17 @@ fn run_command(hwnd: HWND, command: Command) {
             }
         }
         Command::Toast {
+            pane,
             title,
             body,
             waiting,
-        } => crate::toast::show(hwnd, &title, &body, &waiting),
+        } => {
+            // Something that ran first (a clipboard question, say) may
+            // have brought the user to the pane meanwhile.
+            if with_window(|w| w.still_wants(pane)).unwrap_or(false) {
+                crate::toast::show(hwnd, &title, &body, &waiting);
+            }
+        }
         Command::HideToast => crate::toast::hide(hwnd),
         Command::Bell => {
             let info = FLASHWINFO {

@@ -137,9 +137,17 @@ pub struct LiveSession {
     pub focused: bool,
 }
 
+/// The filter that lists the coding agents only.
+pub const AGENTS_ONLY: &str = "is:agent";
+
 impl LiveSession {
     fn matches(&self, query: &str) -> bool {
         let q = query.trim().to_lowercase();
+        // Session > Coding agents > Show agents: the agents only, not a
+        // host that happens to have "agent" in its name.
+        if q == AGENTS_ONLY {
+            return self.agent.is_some();
+        }
         q.is_empty()
             || self.target.to_lowercase().contains(&q)
             || self
@@ -651,6 +659,15 @@ mod tests {
         assert_eq!(v.rows(&all).len(), 1);
         v.set_query("claude");
         assert_eq!(v.rows(&all).len(), 1);
+        // A host named like an agent shows for the text, not for the
+        // agents-only filter.
+        all.push(session(5, Some(2), "me@agent-build", LiveState::Connected));
+        v.set_query("agent");
+        assert_eq!(v.rows(&all).len(), 2);
+        v.set_query(AGENTS_ONLY);
+        let rows = v.rows(&all);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].pane, 3);
     }
 
     #[test]

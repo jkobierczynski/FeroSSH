@@ -19,7 +19,7 @@
 //! [`Action`]s. It edits the [`Workspace`] itself, so it is tested here
 //! with no window, against scripted tmux output and a real tmux.
 
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet};
 
 use ferossh_tmuxcc::layout::{self as tl, Cell, Kind, Shape};
 use ferossh_tmuxcc::saved::{self, Look, Saved};
@@ -163,9 +163,9 @@ enum Placement {
 enum Split {
     /// A window placed next to a native pane (FeroSSH layout).
     Window(Placement),
-    /// A coding agent's window, placed like [`Split::Window`]; its command
-    /// waits in [`Tmux::agents_waiting`].
-    Agent(Placement),
+    /// A coding agent's window, placed like [`Split::Window`]; its name
+    /// and command wait in [`Tmux::agents_waiting`] under this number.
+    Agent(Placement, u32),
     /// A tmux split of `pane` (tmux layout).
     Pane { pane: PaneId, flags: &'static str },
 }
@@ -183,7 +183,7 @@ enum Tag {
     CaptureAlternate(PaneId),
     NewWindow(Placement),
     /// The window and pane a coding agent was started in.
-    AgentWindow(Placement),
+    AgentWindow(Placement, u32),
     SplitPane,
     /// A pane's directory, to open a split there.
     SplitHere(Split),
@@ -240,9 +240,10 @@ struct PaneLine {
 
 fn parse_pane_line(line: &[u8]) -> Option<PaneLine> {
     let text = std::str::from_utf8(line).ok()?;
-    let mut f: Vec<&str> = text.split(' ').collect();
-    // The agent option comes last; the tests' lines may leave it out. Its
-    // value is ours, with no spaces.
+    // The agent option comes last, whole even if someone set it to a
+    // value with spaces (then it is not ours and is ignored); the tests'
+    // lines may leave it out.
+    let mut f: Vec<&str> = text.splitn(22, ' ').collect();
     let agent = match f.len() {
         22 => f.pop().and_then(agent_name_of_option),
         _ => None,
@@ -421,9 +422,11 @@ pub struct Tmux {
     /// Where new windows and panes start unless a split asks for its
     /// pane's directory: the host's start directory, from its profile.
     pub start_dir: Option<String>,
-    /// Coding agents asked for, in order, until tmux answers with their
-    /// windows: name and command line.
-    agents_waiting: VecDeque<(String, String)>,
+    /// Coding agents asked for, until tmux answers with their windows:
+    /// name and command line, by request number.
+    agents_waiting: BTreeMap<u32, (String, String)>,
+    /// The number of the last coding agent asked for.
+    agent_seq: u32,
     /// The windows that run a coding agent, by [`AGENT_OPTION`].
     agents: BTreeMap<WindowId, String>,
 }
@@ -531,7 +534,8 @@ impl Tmux {
             keys_wanted: false,
             keys: None,
             start_dir: None,
-            agents_waiting: VecDeque::new(),
+            agents_waiting: BTreeMap::new(),
+            agent_seq: 0,
             agents: BTreeMap::new(),
         }
     }
@@ -861,8 +865,8 @@ impl Tmux {
                     }
                 }
             }
-            Tag::AgentWindow(placement) => {
-                let Some((name, line)) = self.agents_waiting.pop_front() else {
+            Tag::AgentWindow(placement, n) => {
+                let Some((name, line)) = self.agents_waiting.remove(&n) else {
                     return;
                 };
                 let text = first();
@@ -1530,18 +1534,18 @@ impl Tmux {
                 Tag::NewWindow(placement),
                 out,
             ),
-            Split::Agent(placement) => {
+            Split::Agent(placement, n) => {
                 let name = self
                     .agents_waiting
-                    .front()
-                    .map(|(n, _)| n.clone())
+                    .get(&n)
+                    .map(|(name, _)| name.clone())
                     .unwrap_or_default();
                 self.send(
                     &format!(
                         "new-window -d{cwd} -n {} -P -F '#{{window_id}} #{{pane_id}}'",
                         command::quote(&name)
                     ),
-                    Tag::AgentWindow(placement),
+                    Tag::AgentWindow(placement, n),
                     out,
                 );
             }
@@ -1563,10 +1567,20 @@ impl Tmux {
         if !self.active() || command.trim().is_empty() {
             return out;
         }
+        self.agent_seq = self.agent_seq.wrapping_add(1);
+        let n = self.agent_seq;
+        // A connection that never answers keeps only a few.
+        while self.agents_waiting.len() >= 16 {
+            self.agents_waiting.pop_first();
+        }
         self.agents_waiting
-            .push_back((agent_name(command), command.trim().to_owned()));
+            .insert(n, (agent_name(command), command.trim().to_owned()));
         let p = self.pane_of(native);
-        self.open_here(p, Split::Agent(Placement::Tab { after: native }), &mut out);
+        self.open_here(
+            p,
+            Split::Agent(Placement::Tab { after: native }, n),
+            &mut out,
+        );
         out
     }
 

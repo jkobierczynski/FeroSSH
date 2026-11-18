@@ -809,7 +809,8 @@ fn real_tmux_agent_start_line_makes_the_session_then_adds_to_it() {
             let _ = std::fs::remove_dir_all(&self.0);
         }
     }
-    let scratch = Scratch(std::env::temp_dir().join(format!("ferossh agents {id}")));
+    // A `#` in the directory must not be read as a tmux format.
+    let scratch = Scratch(std::env::temp_dir().join(format!("ferossh #agents {id}")));
     let _ = std::fs::remove_dir_all(&scratch.0);
     let shim = scratch.0.join("bin");
     std::fs::create_dir_all(&shim).unwrap();
@@ -839,8 +840,9 @@ fn real_tmux_agent_start_line_makes_the_session_then_adds_to_it() {
     );
     let run = |command: &str| {
         let line = crate::agents::start_line(command);
+        // The line's own status: the last tmux call's.
         let status = Command::new("sh")
-            .args(["-c", &format!("{line}true")])
+            .args(["-c", &line])
             .current_dir(&scratch.0)
             .env("PATH", &path)
             .env("SHELL", "/bin/sh")
@@ -849,9 +851,10 @@ fn real_tmux_agent_start_line_makes_the_session_then_adds_to_it() {
             .unwrap();
         assert!(status.success());
     };
-    // First the session is made, then a second agent joins it.
-    run("echo first-agent");
-    run("echo 'second agent'");
+    // First the session is made, then a second agent joins it. What the
+    // commands print differs from what is typed, so it shows they ran.
+    run("printf 'out-%s\\n' first");
+    run("printf 'out-%s\\n' 'second agent'");
     let windows = tmux_cmd(
         &server,
         &[
@@ -864,5 +867,20 @@ fn real_tmux_agent_start_line_makes_the_session_then_adds_to_it() {
     );
     let dir = scratch.0.canonicalize().unwrap();
     let dir = dir.display();
-    assert_eq!(windows.trim(), format!("echo echo {dir}\necho echo {dir}"));
+    assert_eq!(
+        windows.trim(),
+        format!("printf printf {dir}\nprintf printf {dir}")
+    );
+    for (window, want) in [("0", "out-first"), ("1", "out-second agent")] {
+        let target = format!("=agents:{window}");
+        let mut screen = String::new();
+        for _ in 0..50 {
+            screen = tmux_cmd(&server, &["capture-pane", "-p", "-t", &target]);
+            if screen.lines().any(|l| l.trim() == want) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        assert!(screen.lines().any(|l| l.trim() == want), "{screen}");
+    }
 }

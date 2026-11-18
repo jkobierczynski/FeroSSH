@@ -61,11 +61,15 @@ pub fn start_line(command: &str) -> String {
     let session = sh_quote(SESSION);
     let target = sh_quote(&format!("={SESSION}:"));
     let exact = sh_quote(&format!("={SESSION}"));
+    // tmux expands formats in `-c`: a `#` in the directory is doubled.
+    // When another client made the session meanwhile, new-session fails
+    // and the window goes into that one.
     let script = format!(
-        "if tmux has-session -t {exact} 2>/dev/null; \
-         then w=$(tmux new-window -d -t {target} -c \"$PWD\" -n {name} -P -F '#{{window_id}}'); \
-         else w=$(tmux new-session -d -s {session} -c \"$PWD\" -n {name} -P -F '#{{window_id}}'); \
-         fi && tmux set-option -w -t \"$w\" {AGENT_OPTION} {name} \
+        "d=$(printf %s \"$PWD\" | sed \"s/#/##/g\"); w=; \
+         tmux has-session -t {exact} 2>/dev/null || \
+         w=$(tmux new-session -d -s {session} -c \"$d\" -n {name} -P -F '#{{window_id}}' 2>/dev/null); \
+         [ -n \"$w\" ] || w=$(tmux new-window -d -t {target} -c \"$d\" -n {name} -P -F '#{{window_id}}'); \
+         [ -n \"$w\" ] && tmux set-option -w -t \"$w\" {AGENT_OPTION} {name} \
          && tmux send-keys -t \"$w\" -l {line} && tmux send-keys -t \"$w\" Enter"
     );
     format!(" sh -c {}; ", sh_quote(&script))
@@ -99,46 +103,99 @@ mod tests {
         assert_eq!(commands(&mine), ["claude --model opus", "gemini"]);
     }
 
+    /// Runs `start_line(command)` through a real sh in `cwd`, with a
+    /// stand-in tmux (`fake`, a shell script) that logs its arguments
+    /// next to itself; what it logged.
+    #[cfg(unix)]
+    fn run_start_line(command: &str, fake: &str, cwd: &std::path::Path) -> Option<String> {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!(
+            "ferossh-agents-{}-{}",
+            std::process::id(),
+            fake.len()
+        ));
+        std::fs::create_dir_all(&dir).ok()?;
+        let tmux = dir.join("tmux");
+        std::fs::write(&tmux, fake).ok()?;
+        std::fs::set_permissions(&tmux, std::fs::Permissions::from_mode(0o755)).ok()?;
+        let path = std::env::join_paths(std::iter::once(dir.clone()).chain(std::env::split_paths(
+            &std::env::var_os("PATH").unwrap_or_default(),
+        )))
+        .ok()?;
+        let ran = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(format!("{} true", start_line(command)))
+            .env("PATH", path)
+            .current_dir(cwd)
+            .output()
+            .is_ok();
+        let log = std::fs::read_to_string(dir.join("log")).ok();
+        let _ = std::fs::remove_dir_all(&dir);
+        ran.then_some(log).flatten()
+    }
+
+    /// Logs each argument in brackets, a line per call.
+    #[cfg(unix)]
+    const PRINT: &str = "#!/bin/sh\nlog=\"$(dirname \"$0\")/log\"\n\
+        for a in \"$@\"; do printf '[%s]' \"$a\" >>\"$log\"; done; echo >>\"$log\"\n";
+
     #[test]
     fn start_line_quotes_everything() {
         let line = start_line("claude --append-system-prompt 'it''s'");
         assert!(line.starts_with(" sh -c '"), "{line}");
         assert!(line.ends_with("; "), "{line}");
-        if !cfg!(unix) {
+        #[cfg(unix)]
+        {
+            let fake = format!(
+                "{PRINT}[ \"$1\" = has-session ] && exit 1\n[ \"$1\" = new-session ] && echo @7\nexit 0\n"
+            );
+            let Some(text) = run_start_line(
+                "claude --append-system-prompt 'it''s'",
+                &fake,
+                std::path::Path::new("/"),
+            ) else {
+                return;
+            };
+            assert_eq!(
+                text,
+                "[has-session][-t][=agents]\n\
+                 [new-session][-d][-s][agents][-c][/][-n][claude][-P][-F][#{window_id}]\n\
+                 [set-option][-w][-t][@7][@ferossh-agent][claude]\n\
+                 [send-keys][-t][@7][-l][claude --append-system-prompt 'it''s']\n\
+                 [send-keys][-t][@7][Enter]\n"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[allow(clippy::indexing_slicing)]
+    fn start_line_escapes_formats_and_survives_a_race() {
+        // Another client made the session between has-session and
+        // new-session: the window goes into that session.
+        let fake = format!(
+            "{PRINT}[ \"$1\" = has-session ] && exit 1\n[ \"$1\" = new-session ] && exit 1\n\
+             [ \"$1\" = new-window ] && echo @8\nexit 0\n"
+        );
+        let dir = std::env::temp_dir().join(format!("ferossh #{{pane_id}} {}", std::process::id()));
+        if std::fs::create_dir_all(&dir).is_err() {
             return;
         }
-        // Run the script through a real sh with a stand-in tmux that
-        // prints its arguments, to check the quoting end to end.
-        let dir = std::env::temp_dir().join(format!("ferossh-agents-{}", std::process::id()));
-        let _ = std::fs::create_dir_all(&dir);
-        let fake = dir.join("tmux");
-        std::fs::write(
-            &fake,
-            "#!/bin/sh\nfor a in \"$@\"; do printf '[%s]' \"$a\" >&2; done; echo >&2\n\
-             [ \"$1\" = has-session ] && exit 1\n[ \"$1\" = new-session ] && echo @7\nexit 0\n",
-        )
-        .ok();
-        let Ok(out) = std::process::Command::new("sh")
-            .arg("-c")
-            .arg(format!(
-                "chmod +x {0}/tmux; cd /; PATH={0}:$PATH; {1} true",
-                dir.display(),
-                line
-            ))
-            .output()
-        else {
+        let Some(text) = run_start_line("codex", &fake, &dir) else {
             return;
         };
-        let text = String::from_utf8_lossy(&out.stderr);
-        assert_eq!(
-            text,
-            // has-session's own output goes to /dev/null.
-            "[new-session][-d][-s][agents][-c][/][-n][claude][-P][-F][#{window_id}]\n\
-             [set-option][-w][-t][@7][@ferossh-agent][claude]\n\
-             [send-keys][-t][@7][-l][claude --append-system-prompt 'it''s']\n\
-             [send-keys][-t][@7][Enter]\n"
-        );
         let _ = std::fs::remove_dir_all(&dir);
+        let shown = dir.display().to_string().replace('#', "##");
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines.len(), 6, "{text}");
+        assert!(lines[1].starts_with("[new-session]"), "{text}");
+        assert_eq!(
+            lines[2],
+            format!(
+                "[new-window][-d][-t][=agents:][-c][{shown}][-n][codex][-P][-F][#{{window_id}}]"
+            )
+        );
+        assert_eq!(lines[3], "[set-option][-w][-t][@8][@ferossh-agent][codex]");
     }
 
     #[test]
