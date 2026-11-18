@@ -8935,7 +8935,7 @@ impl Window {
                 .tmux
                 .get_mut(&g)
                 .filter(|t| t.active())
-                .map(|t| t.start_agent(id, command))?;
+                .map(|t| t.start_agent(id, command, None))?;
             self.run_tmux(g, actions);
             return None;
         }
@@ -8976,9 +8976,18 @@ impl Window {
             })
             .map(|(g, _)| *g);
         if let Some(g) = shown {
+            // In this shell's directory, when it is known as an absolute
+            // path; otherwise the tmux pane's.
+            let dir = self
+                .panes
+                .get(&id)
+                .and_then(|p| p.cwd.as_deref())
+                .and_then(|d| std::str::from_utf8(d).ok())
+                .filter(|d| d.starts_with('/'))
+                .map(str::to_owned);
             let next_to = self.tmux.get(&g).and_then(|t| t.natives().first().copied());
             let actions = match (self.tmux.get_mut(&g), next_to) {
-                (Some(t), Some(n)) => t.start_agent(n, command),
+                (Some(t), Some(n)) => t.start_agent(n, command, dir.as_deref()),
                 _ => Vec::new(),
             };
             self.run_tmux(g, actions);

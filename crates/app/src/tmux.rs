@@ -1562,7 +1562,9 @@ impl Tmux {
     /// [`AGENT_OPTION`], and the command is typed at its shell, so the
     /// shell stays when the agent exits. tmux keeps it running whatever
     /// happens to the connection.
-    pub fn start_agent(&mut self, native: Native, command: &str) -> Vec<Action> {
+    /// `dir`, when given, is the directory to start in instead of
+    /// `native`'s (an SSH shell outside tmux that asked for the agent).
+    pub fn start_agent(&mut self, native: Native, command: &str, dir: Option<&str>) -> Vec<Action> {
         let mut out = Vec::new();
         if !self.active() || command.trim().is_empty() {
             return out;
@@ -1575,12 +1577,14 @@ impl Tmux {
         }
         self.agents_waiting
             .insert(n, (agent_name(command), command.trim().to_owned()));
-        let p = self.pane_of(native);
-        self.open_here(
-            p,
-            Split::Agent(Placement::Tab { after: native }, n),
-            &mut out,
-        );
+        let split = Split::Agent(Placement::Tab { after: native }, n);
+        match dir.map(same_dir::tmux_cwd).filter(|c| !c.is_empty()) {
+            Some(cwd) => self.open_split(split, &cwd, &mut out),
+            None => {
+                let p = self.pane_of(native);
+                self.open_here(p, split, &mut out);
+            }
+        }
         out
     }
 
@@ -2327,7 +2331,7 @@ mod tests {
         assert_eq!(t.agent_of(a0), None);
         // Its pane's directory first, as for a new tab.
         assert_eq!(
-            writes(&t.start_agent(a0, "  claude --resume ")),
+            writes(&t.start_agent(a0, "  claude --resume ", None)),
             ["display-message -p -t %0 '#{pane_current_path}'"]
         );
         // Replies 5 and 6 were the captures.
@@ -2367,6 +2371,17 @@ mod tests {
             .unwrap();
         assert_eq!(t.agent_of(native), Some("claude"));
         assert_eq!(t.agent_of(a0), None);
+    }
+
+    #[test]
+    fn an_agent_from_a_shell_starts_in_that_shells_directory() {
+        let panes = [pane_line(0, 0, 80, 24, "b25f,80x24,0,0,0")];
+        let (mut t, _ws, _) = attached(Some("ferossh"), None, &panes);
+        let a0 = t.native_of(0).unwrap();
+        assert_eq!(
+            writes(&t.start_agent(a0, "codex", Some("/srv/api #1"))),
+            ["new-window -d -c '/srv/api ##1' -n 'codex' -P -F '#{window_id} #{pane_id}'"]
+        );
     }
 
     #[test]

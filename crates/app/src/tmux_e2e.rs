@@ -765,7 +765,9 @@ fn real_tmux_agent_window_is_marked_and_found_again() {
     let first = a.ws.all_panes()[0];
     // The agent is whatever the command line runs: here a printf, typed
     // at the new window's shell.
-    let actions = a.tmux.start_agent(first, "printf 'agent-%s\\n' $((40+2))");
+    let actions = a
+        .tmux
+        .start_agent(first, "printf 'agent-%s\\n' $((40+2))", None);
     a.apply(actions);
     a.until("the agent's tab", |h| h.ws.all_panes().len() == 2);
     let agent = *a.ws.all_panes().iter().find(|&&p| p != first).unwrap();
