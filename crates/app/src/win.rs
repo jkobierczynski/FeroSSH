@@ -12542,6 +12542,15 @@ impl Window {
             return;
         }
         let path = last_layout_path();
+        // Turned off meanwhile in another FeroSSH window: its settings
+        // file says so, and nothing is kept.
+        let still_on = app_read(&settings_path())
+            .map(|t| Settings::parse(&t).restore_layout)
+            .unwrap_or(true);
+        if !still_on {
+            let _ = std::fs::remove_file(&path);
+            return;
+        }
         let ws = self.workspace_now().0.filter(|ws| {
             wsfile::fits(ws)
                 && ws
