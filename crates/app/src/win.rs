@@ -5953,21 +5953,23 @@ impl Window {
     /// A workspace pane connected anywhere else than its own destination
     /// is a pane like any other: it runs nothing of the workspace's.
     fn workspace_elsewhere(&mut self, id: PaneId, destination: &str) {
-        // One waiting for another pane's login waits no more: it is
-        // saved, and kept, as what it now opens.
-        if self
-            .workspace_waiting
-            .destination(id)
-            .is_some_and(|d| !d.trim().eq_ignore_ascii_case(destination.trim()))
-        {
+        let other = |d: &str| !d.trim().eq_ignore_ascii_case(destination.trim());
+        // One waiting for another pane's login waits no more, and its
+        // tmux plan is not its own any more: it is saved, and kept, as
+        // what it now opens.
+        let waiting = self.workspace_waiting.destination(id).is_some_and(other);
+        let extra = self
+            .workspace_extra
+            .get(&id)
+            .is_some_and(|e| !e.dest.as_deref().is_some_and(|d| !other(d)));
+        if waiting {
             self.workspace_waiting.forget(id);
         }
-        if self.workspace_extra.get(&id).is_some_and(|e| {
-            !e.dest
-                .as_deref()
-                .is_some_and(|d| d.trim().eq_ignore_ascii_case(destination.trim()))
-        }) {
+        if extra {
             self.workspace_extra.remove(&id);
+        }
+        if waiting || extra {
+            self.workspace_tmux.remove(&id);
         }
     }
 
