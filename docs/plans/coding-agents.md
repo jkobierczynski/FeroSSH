@@ -27,7 +27,7 @@ Written 18 November 2026, against `main` at 3d28477.
 **What to build.**
 
 - Session > Start a coding agent: Claude Code, Codex, aider, or your own commands (setting `AgentCommand`). It starts the agent in its own tmux window in the pane's directory, in tmux session `agents` (or the session already attached on that host), and marks the window as an agent with the tmux window option `@ferossh-agent`, so it is recognised again after a reattach or from another PC. The shell stays when the agent exits, so it can be restarted in place.
-- The quiet watch from feature 1 is on for agent panes, so every agent can raise a notification without setup.
+- The quiet watch from feature 1 is on for agent panes, so every agent can raise a notification without setup of its own. Settings > Desktop notifications must be on (it is off by default); with it off, agent panes show their state in the dashboard but raise no badge or notification.
 - The Session manager gets a **Coding agents** group: each agent with its host, folder, state (working, waiting for you, quiet) and how long it has been in that state. Enter shows it.
 - Nothing runs unless you start it; no setting changes for anyone who does not use it. The SSH side stays in the sandboxed worker: everything is typed at the shell or sent as tmux control commands, as tmux integration does today.
 
