@@ -16992,7 +16992,10 @@ impl Window {
                         JobOp::Retry => r.retry(id),
                     }
                 }
-                None
+                // A cancel can end a paste's last job with nothing left
+                // moving to tick the timer.
+                self.flush_sftp();
+                self.settle_pastes()
             }
             Event::ClearFinished => {
                 if let Some(r) = key.as_ref().and_then(|k| self.sftp.get_mut(k)) {
@@ -17203,8 +17206,10 @@ impl Window {
             }
         }
         if !jobs.is_empty() {
+            let connection = self.typing_connection(id);
             self.pastes.push(PasteBatch {
                 pane: id,
+                connection,
                 queue: key,
                 results: vec![None; jobs.len()],
                 jobs,
@@ -17297,10 +17302,26 @@ impl Window {
                 continue;
             }
             let text = crate::paste_upload::typed(&landed);
-            let Some(paste) = self.panes.get(&batch.pane).map(|p| p.term.paste(&text)) else {
-                continue;
-            };
-            self.input(batch.pane, paste.bytes);
+            // Only into the same logged-in session: after a reconnect the
+            // pane may be at a login prompt.
+            let same = batch.connection.is_some()
+                && self.typing_connection(batch.pane) == batch.connection;
+            let paste = self
+                .panes
+                .get(&batch.pane)
+                .filter(|_| same)
+                .map(|p| p.term.paste(&text));
+            match paste {
+                Some(paste) => self.input(batch.pane, paste.bytes),
+                None => {
+                    let shown: Vec<String> = landed.iter().map(|p| names::display(p)).collect();
+                    failures.push(format!(
+                        "The pane's session ended before the upload finished, so these \
+                         paths were not typed:\n{}",
+                        shown.join("\n")
+                    ));
+                }
+            }
         }
         if failures.is_empty() {
             return None;
@@ -17310,6 +17331,15 @@ impl Window {
              shows the transfer queue of that host, where you can retry them.",
             failures.join("\n")
         )))
+    }
+
+    /// The connection of pane `id`'s logged-in SSH session (its tmux
+    /// gateway's for a tmux pane), which typed paths must still be on.
+    fn typing_connection(&self, id: PaneId) -> Option<ChannelId> {
+        match self.panes.get(&self.host_pane(id)).map(|p| &p.host) {
+            Some(Host::Ssh(s)) if s.state() == State::Connected => Some(s.connection),
+            _ => None,
+        }
     }
 
     /// Whether files dropped at client point (`x`, `y`) go up with their
@@ -18060,6 +18090,9 @@ fn route_key(t: &Target) -> String {
 /// their paths are typed there, in order, once all are done.
 struct PasteBatch {
     pane: PaneId,
+    /// The pane's session when the paste began: paths are typed only
+    /// while it is still the one logged in.
+    connection: Option<ChannelId>,
     queue: String,
     jobs: Vec<ferossh_sftp::JobId>,
     /// Each job's outcome once it finished: where it landed, or the

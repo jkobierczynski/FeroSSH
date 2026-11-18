@@ -1941,10 +1941,13 @@ impl Remote {
         if numbered > 0 {
             return self.try_numbered(i, numbered + 1);
         }
-        if attrs.is_dir() {
+        let choice = self.jobs.get(i).and_then(|j| j.choice);
+        // Keeping both steps around a folder too; anything else would
+        // replace it.
+        if attrs.is_dir() && choice != Some(Choice::KeepBoth) {
             return self.fail(i, "A folder of that name is in the way.".into());
         }
-        match self.jobs.get(i).and_then(|j| j.choice) {
+        match choice {
             None => self.ask(i),
             Some(Choice::Skip) => self.skip(i),
             Some(Choice::KeepBoth) => self.try_numbered(i, 2),

@@ -1453,3 +1453,16 @@ fn a_numbered_name_another_upload_is_writing_is_skipped() {
     );
     assert_eq!(fs::read_to_string(dir.join("shot (3).png")).unwrap(), "new");
 }
+
+#[test]
+fn a_pasted_file_steps_around_a_folder_of_its_name() {
+    let s = Scratch::new("into-home-folder");
+    fs::create_dir_all(s.remote().join("paste/shot.png")).unwrap();
+    fs::write(s.local().join("shot.png"), "png").unwrap();
+    let (mut remote, mut fake) = connected(&s.remote());
+    let id = remote
+        .upload_into_home(&s.local().join("shot.png"), b"paste")
+        .unwrap();
+    assert!(run(&mut remote, &mut fake));
+    assert_eq!(remote.landed(id), Some(&b"/paste/shot (2).png"[..]));
+}
