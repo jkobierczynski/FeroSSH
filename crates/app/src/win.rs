@@ -15659,6 +15659,60 @@ impl Window {
                 }
                 None
             }
+            Event::DragOut { keys, into, ticket } => {
+                let mut guard = ticket.borrow_mut();
+                let t = &mut *guard;
+                // Only while the pane still waits for it.
+                let waiting = t.outcome.is_none() && t.queue.is_none();
+                match key.as_ref().and_then(|k| Some((k, self.sftp.get_mut(k)?))) {
+                    _ if !waiting => {}
+                    Some((queue, r)) => {
+                        r.notice = None;
+                        for entry in files::entries_named(&r.listing, &keys) {
+                            match r.download(&entry, &into) {
+                                Ok(id) => t.jobs.push(id),
+                                Err(e) => {
+                                    t.outcome = Some(Err(e));
+                                    break;
+                                }
+                            }
+                        }
+                        t.queue = Some(queue.clone());
+                        if t.jobs.is_empty() && t.outcome.is_none() {
+                            t.outcome = crate::drag_out::outcome([]);
+                        }
+                    }
+                    None => t.outcome = Some(Err(DRAG_GONE.into())),
+                }
+                None
+            }
+            Event::DragCheck { ticket, cancel } => {
+                let mut guard = ticket.borrow_mut();
+                let t = &mut *guard;
+                let remote = t.queue.as_ref().and_then(|q| self.sftp.get_mut(q));
+                match remote {
+                    Some(r) if cancel => {
+                        for &id in &t.jobs {
+                            r.cancel(id);
+                        }
+                    }
+                    Some(r) if t.outcome.is_none() => {
+                        t.outcome = if crate::drag_out::asking_under(r.jobs(), &t.jobs) {
+                            Some(Err(
+                                "Two files for the drop have the same name on Windows: \
+                                 the drop was cancelled."
+                                    .into(),
+                            ))
+                        } else {
+                            crate::drag_out::outcome(t.jobs.iter().map(|&id| r.job_state(id)))
+                        };
+                    }
+                    Some(_) => {}
+                    None if t.outcome.is_none() => t.outcome = Some(Err(DRAG_GONE.into())),
+                    None => {}
+                }
+                None
+            }
             Event::Upload { paths, dir } => {
                 if let Some(key) = key {
                     self.upload_files(&key, &paths, &dir);
@@ -17121,6 +17175,10 @@ fn files_event(hwnd: HWND, event: files_panel::Event) {
         run_command(hwnd, command);
     }
 }
+
+/// Why files dragged out to Explorer were not dropped: their connection's
+/// file transfer closed.
+const DRAG_GONE: &str = "The file transfer for these files closed.";
 
 /// Opens a file downloaded for editing in an editor: the file type's
 /// Edit verb, else Notepad. Never its Open verb, which runs a script or

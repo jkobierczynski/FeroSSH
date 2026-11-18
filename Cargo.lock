@@ -886,6 +886,7 @@ dependencies = [
  "tokio",
  "unicode-width",
  "windows",
+ "windows-core",
  "zeroize",
 ]
 

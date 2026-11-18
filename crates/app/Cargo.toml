@@ -64,6 +64,7 @@ windows = { version = "0.62", features = [
     "Win32_System_Registry",
     "Win32_System_RemoteDesktop",
     "Win32_System_SystemInformation",
+    "Win32_System_SystemServices",
     "Win32_System_Threading",
     "Win32_System_Time",
     "Win32_UI_HiDpi",
@@ -75,6 +76,9 @@ windows = { version = "0.62", features = [
     "Win32_UI_Shell_Common",
     "Win32_UI_WindowsAndMessaging",
 ] }
+# The `implement` macro (the drag source for files dragged out to
+# Explorer) names this crate; it is already in the build through `windows`.
+windows-core = "0.62"
 
 [dev-dependencies]
 ferossh-auth = { workspace = true, features = ["soft-authenticator"] }
