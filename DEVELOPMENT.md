@@ -238,7 +238,7 @@ The maintainer asked whether a single remote app could appear as a local window.
 
 ### CI, builds and releases
 
-- Each release is submitted to winget automatically [#98](https://github.com/jkobierczynski/FeroSSH/pull/98).
+- A workflow that sends each later full release to winget by itself [#98](https://github.com/jkobierczynski/FeroSSH/pull/98). It skips pre-releases, needs the `WINGET_TOKEN` secret and does nothing without it, and only works once the first release has been submitted to winget by hand.
 - CI cancels superseded runs, caches dependencies and fuzzes in parallel, which cut a pull request run from about 25 minutes to about 10 [#151](https://github.com/jkobierczynski/FeroSSH/pull/151), [#152](https://github.com/jkobierczynski/FeroSSH/pull/152).
 - Build provenance is verified before local signing [#163](https://github.com/jkobierczynski/FeroSSH/pull/163). Signing needs GitHub CLI 2.93 or later because of a security advisory for older versions.
 - The MSVC toolset is pinned [#212](https://github.com/jkobierczynski/FeroSSH/pull/212) and the linker's Rich header is left out [#215](https://github.com/jkobierczynski/FeroSSH/pull/215), because two runner images carried different builds of the same linker and that number ended up in the exes.
