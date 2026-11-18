@@ -649,7 +649,9 @@ fn command(h: Handles, id: usize, code: u32) {
         ),
         (ID_NEW, BN_CLICKED) => emit(Event::Action(SideAction::New)),
         // A workspace is edited by saving the layout again.
-        (ID_EDIT, BN_CLICKED) if selected_workspace().is_some() => {}
+        (ID_EDIT, BN_CLICKED) if let Some(name) = selected_workspace() => {
+            emit(Event::Action(SideAction::EditWorkspace(name)));
+        }
         (ID_EDIT, BN_CLICKED) => emit(Event::Action(match selected_host() {
             Some(host) => SideAction::Edit(host),
             None => SideAction::New,

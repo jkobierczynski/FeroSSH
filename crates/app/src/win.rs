@@ -1312,6 +1312,9 @@ struct Window {
     /// This is the FeroSSH whose layout is kept for the next start (the
     /// first one running): see [`claim_last_layout`].
     layout_owner: bool,
+    /// A workspace pane's command, typed once its script's run (by number)
+    /// in that pane is over.
+    workspace_after: HashMap<PaneId, (u64, String)>,
     /// The workspaces Window > Workspaces listed when it last opened.
     workspace_names: Vec<String>,
 }
@@ -1328,6 +1331,8 @@ struct WorkspaceExtra {
     /// The script and command have yet to run: once, not again after a
     /// reconnect.
     pending: bool,
+    /// Log in automatically was on when the workspace opened.
+    login: bool,
 }
 
 /// A workspace's tmux session, from opening until tmux shows its panes.
@@ -2305,6 +2310,7 @@ fn create_and_run(launch: Launch, theme: Option<String>) -> Result<()> {
                 workspace_tmux: HashMap::new(),
                 workspace_extra: HashMap::new(),
                 layout_owner: claim_last_layout(),
+                workspace_after: HashMap::new(),
                 workspace_names: Vec::new(),
                 run_notes: HashMap::new(),
                 standby: Standby::new(),
@@ -3622,9 +3628,10 @@ impl Window {
     /// After a login on SSH pane `id`: attach tmux again after a dropped
     /// connection, or when the host's profile asks for it. Only one pane
     /// per host runs tmux, so a second tab on the host stays a shell.
-    fn tmux_after_login(&mut self, id: PaneId) {
+    /// Returns whether it attaches tmux.
+    fn tmux_after_login(&mut self, id: PaneId) -> bool {
         let Some(Host::Ssh(s)) = self.panes.get(&id).map(|p| &p.host) else {
-            return;
+            return false;
         };
         let key = sftp_key(&s.target);
         let profile = self
@@ -3646,7 +3653,7 @@ impl Window {
                 Some(w) => (w.name.clone(), w.rebuild.clone()),
                 None => match profile {
                     Some(name) => (name, None),
-                    None => return,
+                    None => return false,
                 },
             },
         };
@@ -3666,13 +3673,14 @@ impl Window {
                     ),
                 );
             }
-            return;
+            return false;
         }
         // The plan stays (saving keeps its panes) until tmux shows them.
         if let Some(line) = rebuild {
             self.send_host(id, line.as_bytes());
         }
         self.attach_tmux(id, &name, false);
+        true
     }
 
     /// Types the `cd` to the directory of the pane a new tab or pane was
@@ -3784,6 +3792,9 @@ impl Window {
                     exited: false,
                 };
                 self.start_log(id);
+                // A workspace's local pane runs its script once its shell
+                // runs (also when it starts only on a retry).
+                self.workspace_start(id, true);
             }
             Err(e) => {
                 let text = format!(
@@ -6695,6 +6706,7 @@ impl Window {
                     // no login script: the line goes whole on Enter.
                     self.start_log(id);
                     self.refresh_chrome();
+                    self.workspace_start(id, false);
                 }
                 Effect::Connected if self.unencrypted(id) => {
                     // Nothing of SSH (SFTP, forwards, tmux, desktops)
@@ -6746,8 +6758,9 @@ impl Window {
                     );
                     if !command && !self.start_script(id, &alias, true) {
                         self.cd_after_login(id);
-                        self.tmux_after_login(id);
-                        self.workspace_start(id);
+                        if !self.tmux_after_login(id) {
+                            self.workspace_start(id, false);
+                        }
                     }
                     self.desktop_after_login(id);
                     self.release_workspace_panes(id, true);
@@ -7043,6 +7056,7 @@ impl Window {
             let source = self
                 .settings
                 .profile(&t.alias)
+                .filter(|p| p.kind == SessionKind::WinRm)
                 .map(|p| p.password.clone())
                 .unwrap_or_default();
             if source == PasswordSource::Ask && self.workspace_login(id) {
@@ -7336,10 +7350,24 @@ impl Window {
                                 _ => RowState::Done,
                             };
                         }
+                        // A workspace's script and command follow only a
+                        // login script that finished.
+                        let finished = !matches!(
+                            run.runner.outcome(),
+                            Some(Outcome::Failed(_) | Outcome::Stopped)
+                        );
                         if run.tmux {
                             self.cd_after_login(id);
-                            self.tmux_after_login(id);
-                            self.workspace_start(id);
+                            if !self.tmux_after_login(id) && finished {
+                                self.workspace_start(id, false);
+                            }
+                        }
+                        // A workspace's command waited for its script.
+                        if let Some((after, line)) = self.workspace_after.remove(&id)
+                            && after == run.run
+                            && finished
+                        {
+                            self.workspace_type(id, &line);
                         }
                         if run.report {
                             self.pump_run();
@@ -8498,6 +8526,8 @@ impl Window {
                             p.term.feed(&data);
                         }
                         self.log(id, &data);
+                        // A script waiting for the shell's answer.
+                        self.script_output(id, &data);
                     }
                     Output::Exited(code) => {
                         self.stop_log(id);
@@ -12519,9 +12549,14 @@ impl Window {
                     .iter()
                     .any(|t| t.root.panes().iter().any(|p| p.open != WsOpen::Prompt))
         });
-        let kept = ws.is_some_and(|ws| wsfile::write(&path, &ws).is_ok());
-        if !kept {
-            let _ = std::fs::remove_file(&path);
+        match ws {
+            // One that cannot be written (too big) leaves the last one kept.
+            Some(ws) => {
+                let _ = wsfile::write(&path, &ws);
+            }
+            None => {
+                let _ = std::fs::remove_file(&path);
+            }
         }
     }
 
@@ -12575,12 +12610,16 @@ impl Window {
     /// Opens workspace `ws` (from file `path`), after asking when it runs
     /// something this PC has not allowed yet.
     fn open_workspace_checked(&mut self, ws: wsfile::Workspace, path: &Path) -> Option<Command> {
-        let lines: Vec<String> = wsfile::commands(&ws)
+        let lines: Vec<(String, String)> = wsfile::commands(&ws)
             .into_iter()
-            .filter(|l| !workspace_line_approved(l))
+            .map(|l| {
+                let key = self.approval_key(&l);
+                (l, key)
+            })
+            .filter(|(_, key)| !workspace_line_approved(key))
             .collect();
         if lines.is_empty() {
-            self.open_workspace(&ws);
+            self.open_workspace(&ws, true);
             return None;
         }
         let name = path
@@ -12594,11 +12633,29 @@ impl Window {
         })
     }
 
+    /// What allowing a workspace's line (see [`wsfile::commands`])
+    /// keeps: a script's line together with what the script holds now,
+    /// so a script changed since asks again.
+    fn approval_key(&self, line: &str) -> String {
+        let Some(name) = line.strip_prefix("Script ") else {
+            return line.to_owned();
+        };
+        match self
+            .settings
+            .snippets
+            .iter()
+            .find(|s| s.name.eq_ignore_ascii_case(name.trim()))
+        {
+            Some(s) => format!("{line}\t{}", s.lines.join("\t")),
+            None => line.to_owned(),
+        }
+    }
+
     /// Opens `ws` as new tabs; a window that only waits at the connect
     /// prompt gives its tab up to it. Panes on one SSH host log in once:
     /// the first logs in, the others wait for it and open on its
     /// connection.
-    fn open_workspace(&mut self, ws: &wsfile::Workspace) {
+    fn open_workspace(&mut self, ws: &wsfile::Workspace, run: bool) {
         let all = self.ws.all_panes();
         let idle = match all.as_slice() {
             [only] => matches!(
@@ -12680,7 +12737,8 @@ impl Window {
                         dest,
                         script: spec.script.clone(),
                         command: spec.command.clone(),
-                        pending: spec.runs(),
+                        pending: run && spec.runs(),
+                        login: self.settings.workspace_auto_login,
                     },
                 );
             }
@@ -12710,7 +12768,6 @@ impl Window {
             }
             WsOpen::Local => {
                 self.start_shell_in(id, spec.dir.as_deref());
-                self.workspace_start(id);
                 return;
             }
             WsOpen::Connection(d) => d.clone(),
@@ -12810,11 +12867,13 @@ impl Window {
     /// pane: Window > Workspaces > Log in automatically is on and the
     /// pane still shows the connection the workspace opened.
     fn workspace_login(&self, id: PaneId) -> bool {
+        // Also on when the workspace opened: turning it on later does not
+        // reach panes already open, and turning it off reaches them all.
         self.settings.workspace_auto_login
             && self
                 .workspace_extra
                 .get(&id)
-                .is_some_and(|e| e.dest.is_some())
+                .is_some_and(|e| e.login && e.dest.is_some())
     }
 
     /// The password source of pane `id`'s login to connection `alias`:
@@ -12836,11 +12895,16 @@ impl Window {
     }
 
     /// Runs what workspace pane `id` runs once its shell is ready (logged
-    /// in, its login script done and in its directory): its script, then
-    /// its command. Once: a reconnect runs neither again. Not in a pane
-    /// that shows tmux, which keeps its programs running itself.
-    fn workspace_start(&mut self, id: PaneId) {
-        let Some(e) = self.workspace_extra.get_mut(&id).filter(|e| e.pending) else {
+    /// in, its login script done and in its directory; for a `local`
+    /// pane, its shell started): its script, then its command. Once: a
+    /// reconnect runs neither again. A pane with the Production theme asks
+    /// first when Confirm scripts on Production hosts is on.
+    fn workspace_start(&mut self, id: PaneId, local: bool) {
+        let Some(e) = self
+            .workspace_extra
+            .get_mut(&id)
+            .filter(|e| e.pending && e.dest.is_none() == local)
+        else {
             return;
         };
         e.pending = false;
@@ -12848,8 +12912,8 @@ impl Window {
         if script.is_none() && command.is_none() {
             return;
         }
-        // tmux was just attached here (or is shown already).
-        if self.tmux.contains_key(&id) {
+        // tmux keeps its programs running itself.
+        if self.tmux.get(&id).is_some_and(Tmux::active) {
             self.show(
                 id,
                 "\x1b[0;90mThis pane shows tmux, so the workspace's script and command \
@@ -12857,18 +12921,64 @@ impl Window {
             );
             return;
         }
-        let mut lines = Vec::new();
-        let mut name = "the workspace's command".to_owned();
-        if let Some(script) = &script {
-            match self
+        if self.settings.confirm_production
+            && self
+                .panes
+                .get(&id)
+                .is_some_and(|p| p.theme.name == "Production")
+        {
+            let label = self.pane_label(id);
+            self.queued.push(Command::ConfirmWorkspaceStart {
+                pane: id,
+                label,
+                script,
+                command,
+            });
+            return;
+        }
+        self.workspace_run(id, script.as_deref(), command);
+    }
+
+    /// Runs workspace pane `id`'s script from the scripts folder, then
+    /// types its command as written once the script is over.
+    fn workspace_run(&mut self, id: PaneId, script: Option<&str>, command: Option<String>) {
+        if let Some(script) = script {
+            let found = self
                 .settings
                 .snippets
                 .iter()
                 .find(|s| s.name.eq_ignore_ascii_case(script.trim()))
-            {
-                Some(s) => {
-                    lines.clone_from(&s.lines);
-                    name.clone_from(&s.name);
+                .map(|s| (s.name.clone(), s.lines.clone()));
+            let allowed =
+                workspace_line_approved(&self.approval_key(&format!("Script {}", script.trim())));
+            match found {
+                Some((name, _)) if !allowed => self.show(
+                    id,
+                    &format!(
+                        "\x1b[0;31mThe script {} changed since this workspace was allowed to \
+                         run it, so it is not run. Open the workspace again to allow it.\x1b[0m\r\n",
+                        crate::ssh::sanitize(&name)
+                    ),
+                ),
+                Some((name, lines)) => {
+                    // Arguments take their defaults: nobody is asked as it
+                    // opens.
+                    let args = login::args(&lines);
+                    let vars = self.vars(id, &lines, false);
+                    let steps = login::expand(
+                        &lines,
+                        true,
+                        |n| {
+                            args.iter()
+                                .find(|a| a.number == n)
+                                .map(|a| a.default.clone())
+                                .unwrap_or_default()
+                        },
+                        |n| snippets_view::var(&vars, n),
+                    );
+                    if let Some(Command::Notice(text)) = self.run_snippet(&name, steps, &[id]) {
+                        self.show(id, &format!("\x1b[0;31m{text}\x1b[0m\r\n"));
+                    }
                 }
                 None => self.show(
                     id,
@@ -12880,29 +12990,25 @@ impl Window {
                 ),
             }
         }
-        if let Some(command) = command {
-            lines.push(command);
-        }
-        if lines.is_empty() {
+        let Some(command) = command else {
             return;
+        };
+        // A script still running in the pane (one that waits) goes first;
+        // the command follows in this pane once it is over.
+        match self.scripts.get(&id) {
+            Some(run) => {
+                self.workspace_after.insert(id, (run.run, command));
+            }
+            None => self.workspace_type(id, &command),
         }
-        // Arguments take their defaults: nobody is asked as it opens.
-        let args = login::args(&lines);
-        let vars = self.vars(id, &lines, false);
-        let steps = login::expand(
-            &lines,
-            true,
-            |n| {
-                args.iter()
-                    .find(|a| a.number == n)
-                    .map(|a| a.default.clone())
-                    .unwrap_or_default()
-            },
-            |n| snippets_view::var(&vars, n),
-        );
-        if let Some(Command::Notice(text)) = self.run_snippet(&name, steps, &[id]) {
-            self.show(id, &format!("\x1b[0;31m{text}\x1b[0m\r\n"));
-        }
+    }
+
+    /// Types a workspace's `Command` line at pane `id` as written, then
+    /// Enter.
+    fn workspace_type(&mut self, id: PaneId, line: &str) {
+        let mut bytes = line.as_bytes().to_vec();
+        bytes.push(b'\r');
+        self.input(id, bytes);
     }
 
     /// A workspace pane's own look, over its host's: never over a
@@ -13312,6 +13418,7 @@ impl Window {
         self.reattach.remove(&id);
         self.workspace_tmux.remove(&id);
         self.workspace_extra.remove(&id);
+        self.workspace_after.remove(&id);
         self.workspace_waiting.forget(id);
         self.release_workspace_panes(id, false);
         // The last pane in the tabs closing while others are hidden: the
@@ -16638,10 +16745,19 @@ enum Command {
     ConfirmWorkspace {
         name: String,
         ws: Box<wsfile::Workspace>,
-        lines: Vec<String>,
+        /// Each line as shown, and what allowing it keeps.
+        lines: Vec<(String, String)>,
     },
     /// The Connection manager's F2 on a workspace: its file in the editor.
     EditWorkspace(String),
+    /// A workspace's pane with the Production theme is about to run its
+    /// script and command: ask first.
+    ConfirmWorkspaceStart {
+        pane: PaneId,
+        label: String,
+        script: Option<String>,
+        command: Option<String>,
+    },
     /// Tools > New SSH key: the window that asks what to make.
     NewKey,
     /// Settings > Key bindings: the window that changes them.
@@ -18152,29 +18268,63 @@ fn run_command(hwnd: HWND, command: Command) {
             }
         }
         Command::ConfirmWorkspace { name, ws, lines } => {
-            const SHOWN: usize = 12;
-            let mut list: String = lines
-                .iter()
-                .take(SHOWN)
-                .map(|l| format!("    {}\n", l.chars().take(200).collect::<String>()))
-                .collect();
-            if lines.len() > SHOWN {
-                list.push_str(&format!("    and {} more\n", lines.len() - SHOWN));
-            }
+            // Every line is shown whole before it can be allowed; too many
+            // to show can only open without running.
+            const MOST_LINES: usize = 20;
+            const MOST_CHARS: usize = 4000;
+            let list: String = lines.iter().map(|(l, _)| format!("    {l}\n")).collect();
+            let run = if lines.len() <= MOST_LINES && list.chars().count() <= MOST_CHARS {
+                let text = format!(
+                    "The workspace {name} runs this in its panes once they are logged in:\n\n\
+                     {list}\n\
+                     Yes opens it and runs them; FeroSSH will not ask about these again.\n\
+                     No opens it without running anything.\n\
+                     Cancel does not open it."
+                );
+                match dialog(hwnd, &text, MB_YESNOCANCEL | MB_ICONWARNING | MB_DEFBUTTON2) {
+                    Some(IDYES) => {
+                        let keys: Vec<String> = lines.iter().map(|(_, k)| k.clone()).collect();
+                        approve_workspace_lines(&keys);
+                        true
+                    }
+                    Some(IDNO) => false,
+                    _ => return,
+                }
+            } else {
+                let text = format!(
+                    "The workspace {name} runs {} scripts and commands in its panes, too many \
+                     to show here. Look them over in its file first (F2 on it in the \
+                     connection manager).\n\n\
+                     OK opens it without running anything. Cancel does not open it.",
+                    lines.len()
+                );
+                if dialog(hwnd, &text, MB_OKCANCEL | MB_ICONWARNING) != Some(IDOK) {
+                    return;
+                }
+                false
+            };
+            with_window(|w| w.open_workspace(&ws, run));
+        }
+        Command::ConfirmWorkspaceStart {
+            pane,
+            label,
+            script,
+            command,
+        } => {
+            let what: Vec<String> = [
+                script.as_deref().map(|s| format!("the script {s}")),
+                command.as_deref().map(|c| format!("the command {c}")),
+            ]
+            .into_iter()
+            .flatten()
+            .collect();
             let text = format!(
-                "The workspace {name} runs this in its panes once they are logged in:\n\n\
-                 {list}\n\
-                 Yes opens it and runs them; FeroSSH will not ask about these again.\n\
-                 No opens it without running anything.\n\
-                 Cancel does not open it."
+                "{label} has the Production theme. Run the workspace's {} there?",
+                what.join(" and ")
             );
-            let mut ws = *ws;
-            match dialog(hwnd, &text, MB_YESNOCANCEL | MB_ICONWARNING | MB_DEFBUTTON2) {
-                Some(IDYES) => approve_workspace_lines(&lines),
-                Some(IDNO) => workspaces::run_nothing(&mut ws),
-                _ => return,
+            if dialog(hwnd, &text, MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2) == Some(IDYES) {
+                with_window(|w| w.workspace_run(pane, script.as_deref(), command));
             }
-            with_window(|w| w.open_workspace(&ws));
         }
         Command::EditWorkspace(name) => {
             if let Some(path) = wsfile::listed(&workspaces_dir(), &name) {

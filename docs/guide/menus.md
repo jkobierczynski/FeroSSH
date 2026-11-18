@@ -111,7 +111,7 @@ Font, theme and text size apply to the focused pane only. Session > Save font an
 | Workspaces > Open workspace file... | | Opens a workspace file from any folder as new tabs. |
 | Workspaces > Open workspaces folder | | Opens `%APPDATA%\FeroSSH\workspaces` in Explorer. |
 | Workspaces > Log in automatically | | On (a check mark): a workspace's panes keep the password of a connection that would ask for it, in the vault or the Windows Credential Manager, so it is asked once. Off unless you turn it on. See [Workspaces](everyday-use.md#workspaces). |
-| Workspaces > Reopen the last layout at start | | On (a check mark): the tabs and panes open when FeroSSH closes open again at the next start. Off unless you turn it on. |
+| Workspaces > Reopen the last layout at start | | On (a check mark): the tabs and panes open when FeroSSH closes open again at the next start without a host, local shell or workspace on the command line. Only the first FeroSSH running keeps and reopens its layout; a second one opened meanwhile does neither. Off unless you turn it on. |
 | Workspaces > (a workspace) | | Opens that workspace's tabs next to the open ones; a window that only waits at the connect prompt makes way for them. |
 | Standby window (hotkey) > Status | | Says whether the standby hotkey is active, and for which window: on, off, or turned on but taken by another program. Click it for the details. See [Standby window](everyday-use.md#standby-window). |
 | Standby window (hotkey) > Standby hotkey on | | Turns the standby hotkey on, or off. ✓ while this FeroSSH window holds the hotkey. Turning it off shows a hidden window again. `Standby`. Off by default. |
