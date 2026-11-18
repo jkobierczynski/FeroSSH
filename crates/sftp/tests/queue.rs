@@ -1507,3 +1507,48 @@ fn a_paused_numbered_upload_keeps_its_name_from_a_file_called_that() {
     let dir = s.remote().join("paste");
     assert_eq!(fs::read(dir.join("shot (2).png")).unwrap(), big);
 }
+
+#[test]
+fn a_resumed_numbered_upload_keeps_its_name_while_queued() {
+    let s = Scratch::new("into-home-resumed");
+    fs::create_dir_all(s.remote().join("paste")).unwrap();
+    fs::write(s.remote().join("paste/shot.png"), "old").unwrap();
+    let big = pattern(4 << 20);
+    fs::write(s.local().join("shot.png"), &big).unwrap();
+    fs::write(s.local().join("shot (2).png"), "named two").unwrap();
+    let (mut remote, mut fake) = connected(&s.remote());
+    // Queued first, then cancelled: it comes back later by Retry.
+    let named = remote
+        .upload_into_home(&s.local().join("shot (2).png"), b"paste")
+        .unwrap();
+    remote.cancel(named);
+    let _ = remote.take_outbox();
+    let kept = remote
+        .upload_into_home(&s.local().join("shot.png"), b"paste")
+        .unwrap();
+    let part = s.remote().join("paste/shot (2).png.filepart");
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while !part.exists() {
+        assert!(Instant::now() < deadline, "never started writing");
+        for msg in remote.take_outbox() {
+            if let Message::SftpRequest { channel, id, op } = msg {
+                for reply in fake.serve(op) {
+                    remote.on_message(Message::SftpReply { channel, id, reply });
+                }
+            }
+        }
+    }
+    remote.pause(kept);
+    remote.retry(named);
+    // Resumed, the numbered upload is queued behind the earlier job.
+    remote.resume(kept);
+    assert!(run(&mut remote, &mut fake));
+    assert_eq!(remote.landed(kept), Some(&b"/paste/shot (2).png"[..]));
+    assert_eq!(remote.landed(named), Some(&b"/paste/shot (2) (2).png"[..]));
+    let dir = s.remote().join("paste");
+    assert_eq!(fs::read(dir.join("shot (2).png")).unwrap(), big);
+    assert_eq!(
+        fs::read_to_string(dir.join("shot (2) (2).png")).unwrap(),
+        "named two"
+    );
+}

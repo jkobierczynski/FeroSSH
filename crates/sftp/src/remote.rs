@@ -1039,14 +1039,17 @@ impl Remote {
     }
 
     /// Whether an upload other than job `i` owns remote file `path`: it
-    /// is running or paused with that as its target, or has taken it as
-    /// the numbered name to keep both.
+    /// is running or paused with that as its target, or, not finished,
+    /// has taken it as the numbered name to keep both.
     fn claimed(&self, i: usize, path: &[u8]) -> bool {
         self.jobs.iter().enumerate().any(|(k, other)| {
             k != i
                 && other.kind == Kind::Upload
-                && matches!(other.state, State::Running | State::Paused)
-                && (*self.target_of(other) == *path || other.taken.as_deref() == Some(path))
+                && ((matches!(other.state, State::Running | State::Paused)
+                    && *self.target_of(other) == *path)
+                    // A numbered name stays taken until the job ends,
+                    // queued again after a resume included.
+                    || (!other.state.finished() && other.taken.as_deref() == Some(path)))
         })
     }
 
