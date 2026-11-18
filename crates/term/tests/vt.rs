@@ -300,10 +300,13 @@ fn thousands_of_kitty_keyboard_pushes_do_not_crash() {
 #[test]
 fn pushes_held_back_while_the_protocol_is_off_do_not_crash_once_it_is_on() {
     let pushes = b"\x1b[>1u".repeat(5000);
-    for whole in [true, false] {
+    // 2500 stay held back until the setter runs; 5000 reach the guard's
+    // limit while the protocol is still off.
+    for (whole, held) in [(true, 2500), (false, 2500), (true, 5000), (false, 5000)] {
         let mut t = term(10, 3);
         t.feed(b"\x1b[?2026h");
-        t.feed(&pushes);
+        t.feed(&pushes[..held * 5]);
+        assert_eq!(t.sync_deadline().is_some(), held < 4000);
         let mut settings = Settings::new(100);
         settings.keys.kitty = true;
         if whole {
