@@ -25,11 +25,11 @@ use windows::Win32::UI::Controls::{
     EM_SETCUEBANNER, EM_SETSEL, LIST_VIEW_ITEM_STATE_FLAGS, LVCF_TEXT, LVCF_WIDTH, LVCOLUMNW,
     LVIF_PARAM, LVIF_TEXT, LVIS_FOCUSED, LVIS_SELECTED, LVITEMW, LVM_DELETEALLITEMS,
     LVM_EDITLABELW, LVM_ENSUREVISIBLE, LVM_GETEDITCONTROL, LVM_GETITEMW, LVM_GETNEXTITEM,
-    LVM_INSERTCOLUMNW, LVM_INSERTITEMW, LVM_SETCOLUMNWIDTH, LVM_SETEXTENDEDLISTVIEWSTYLE,
-    LVM_SETITEMSTATE, LVM_SETITEMTEXTW, LVN_ENDLABELEDITW, LVN_KEYDOWN, LVNI_SELECTED,
-    LVS_EDITLABELS, LVS_EX_DOUBLEBUFFER, LVS_EX_FULLROWSELECT, LVS_NOSORTHEADER, LVS_REPORT,
-    LVS_SHOWSELALWAYS, LVS_SINGLESEL, NM_DBLCLK, NM_SETFOCUS, NMHDR, NMLVDISPINFOW, NMLVKEYDOWN,
-    SetWindowTheme, WC_BUTTONW, WC_EDITW, WC_LISTVIEWW,
+    LVM_INSERTCOLUMNW, LVM_INSERTITEMW, LVM_SETCOLUMNW, LVM_SETCOLUMNWIDTH,
+    LVM_SETEXTENDEDLISTVIEWSTYLE, LVM_SETITEMSTATE, LVM_SETITEMTEXTW, LVN_ENDLABELEDITW,
+    LVN_KEYDOWN, LVNI_SELECTED, LVS_EDITLABELS, LVS_EX_DOUBLEBUFFER, LVS_EX_FULLROWSELECT,
+    LVS_NOSORTHEADER, LVS_REPORT, LVS_SHOWSELALWAYS, LVS_SINGLESEL, NM_DBLCLK, NM_SETFOCUS, NMHDR,
+    NMLVDISPINFOW, NMLVKEYDOWN, SetWindowTheme, WC_BUTTONW, WC_EDITW, WC_LISTVIEWW,
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     GetFocus, SetFocus, VK_CONTROL, VK_DELETE, VK_DOWN, VK_F2, VK_SHIFT,
@@ -92,6 +92,9 @@ const COLUMNS: [(&str, i32); 5] = [
     ("Details", 220),
 ];
 
+/// The column titles in the agent dashboard (the `is:agent` filter).
+const DASHBOARD: [&str; 5] = ["Host", "Agent", "Tab", "State", "For \u{b7} last line"];
+
 #[derive(Clone, Copy)]
 struct Handles {
     main: HWND,
@@ -111,6 +114,8 @@ struct State {
     rows: Option<Vec<LiveRow>>,
     /// All open sessions (the title's count).
     total: usize,
+    /// The columns show the agent dashboard.
+    dashboard: bool,
     /// A name edit that ended, waiting for `WM_EDITED`: `None` inside
     /// when it was cancelled.
     edited: Option<(PaneId, Option<String>)>,
@@ -238,6 +243,7 @@ pub fn create(main: HWND, handler: Handler, dpi: u32) -> windows::core::Result<(
                 dpi,
                 rows: None,
                 total: 0,
+                dashboard: false,
                 edited: None,
             });
         });
@@ -417,7 +423,9 @@ fn index_of(pane: PaneId) -> Option<i32> {
 /// Shows `rows` (of `total` open sessions), unless it shows them already.
 /// The selection stays on its session; with none, it starts on the
 /// focused pane's.
-pub fn set_rows(rows: Vec<LiveRow>, total: usize) {
+/// `dashboard`: the rows are the agent dashboard's ([`LiveView::dashboard`]),
+/// whose columns have their own titles.
+pub fn set_rows(rows: Vec<LiveRow>, total: usize, dashboard: bool) {
     let Some(h) = handles() else {
         return;
     };
@@ -429,17 +437,39 @@ pub fn set_rows(rows: Vec<LiveRow>, total: usize) {
     let changed = STATE.with(|s| {
         let mut s = s.try_borrow_mut().ok()?;
         let s = s.as_mut()?;
-        let title = s.total != total;
+        let switched = s.dashboard != dashboard;
+        let title = s.total != total || switched;
         s.total = total;
-        if s.rows.as_ref() == Some(&rows) {
-            return Some((false, title));
+        s.dashboard = dashboard;
+        if s.rows.as_ref() == Some(&rows) && !switched {
+            return Some((false, title, false));
         }
         s.rows = Some(rows.clone());
-        Some((true, title))
+        Some((true, title, switched))
     });
-    let Some((rebuild, title)) = changed else {
+    let Some((rebuild, title, switched)) = changed else {
         return;
     };
+    if switched {
+        for (i, (plain, agents)) in COLUMNS.iter().zip(DASHBOARD).enumerate() {
+            let mut text = wide(if dashboard { agents } else { plain.0 });
+            let col = LVCOLUMNW {
+                mask: LVCF_TEXT,
+                pszText: PWSTR(text.as_mut_ptr()),
+                ..Default::default()
+            };
+            // SAFETY: our list view; the struct and its text live through
+            // the call, which copies them.
+            unsafe {
+                SendMessageW(
+                    h.list,
+                    LVM_SETCOLUMNW,
+                    Some(WPARAM(i)),
+                    Some(LPARAM(&raw const col as isize)),
+                );
+            }
+        }
+    }
     // SAFETY: our own windows; each struct and its text live through the
     // call, which copies them.
     unsafe {
@@ -466,7 +496,8 @@ pub fn set_rows(rows: Vec<LiveRow>, total: usize) {
                 Some(LPARAM(&raw const item as isize)),
             )
             .0;
-            for (sub, text) in [r.kind, &r.tab, r.state, &r.details].iter().enumerate() {
+            let kind = if dashboard { r.agent.as_str() } else { r.kind };
+            for (sub, text) in [kind, &r.tab, r.state, &r.details].iter().enumerate() {
                 let mut text = wide(text);
                 let item = LVITEMW {
                     iSubItem: sub as i32 + 1,
@@ -803,11 +834,11 @@ fn context_menu(h: Handles, lparam: LPARAM) {
 }
 
 fn paint(h: Handles) {
-    let Some((title_font, dpi, total)) = STATE.with(|s| {
+    let Some((title_font, dpi, total, dashboard)) = STATE.with(|s| {
         s.try_borrow()
             .ok()?
             .as_ref()
-            .map(|s| (s.title_font, s.dpi, s.total))
+            .map(|s| (s.title_font, s.dpi, s.total, s.dashboard))
     }) else {
         return;
     };
@@ -832,7 +863,12 @@ fn paint(h: Handles) {
             dc,
             windows::Win32::Foundation::COLORREF(crate::ui_theme::sys_color(COLOR_WINDOWTEXT)),
         );
-        let mut text: Vec<u16> = "Sessions".encode_utf16().collect();
+        let heading = if dashboard {
+            "Agent dashboard"
+        } else {
+            "Sessions"
+        };
+        let mut text: Vec<u16> = heading.encode_utf16().collect();
         DrawTextW(
             dc,
             &mut text,

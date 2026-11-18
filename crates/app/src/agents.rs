@@ -91,15 +91,55 @@ fn hex_keys(bytes: &[u8]) -> String {
 }
 
 /// What the session manager says an agent is doing, and since when.
-pub fn status(wants_you: bool, state: State, now: Instant) -> (&'static str, Option<Duration>) {
-    if wants_you {
-        return ("needs you", None);
+pub fn status(
+    wants_you: Option<Instant>,
+    state: State,
+    now: Instant,
+) -> (&'static str, Option<Duration>) {
+    if let Some(since) = wants_you {
+        return ("needs you", Some(now.saturating_duration_since(since)));
     }
     match state {
         State::Working(since) => ("working", Some(now.saturating_duration_since(since))),
         State::Quiet(since) => ("quiet", Some(now.saturating_duration_since(since))),
         State::Idle => ("idle", None),
     }
+}
+
+/// The longest a last line is shown.
+const LAST_LINE: usize = 160;
+
+/// What an agent last said, for the dashboard: from the bottom of its
+/// screen up, the first line with some words in it, without the frames
+/// and rules agents draw around their input box (box-drawing characters,
+/// `│ >` prompts) and their key hints. Agents draw their own screens, so
+/// this is a good guess, not a reading of what they mean.
+pub fn last_line(screen: &[String]) -> Option<String> {
+    screen.iter().rev().find_map(|line| {
+        let text: String = line
+            .chars()
+            .map(|c| {
+                if ('\u{2500}'..='\u{259f}').contains(&c) || c.is_control() {
+                    ' '
+                } else {
+                    c
+                }
+            })
+            .collect();
+        let text = text
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+            .trim_start_matches([
+                '>', '\u{276f}', '$', '#', '%', '*', '\u{2022}', '\u{25cf}', '\u{23fa}', ' ',
+            ])
+            .to_owned();
+        let words = text.chars().filter(|c| c.is_alphanumeric()).count();
+        let hint = text.starts_with("? for shortcuts")
+            || text.starts_with("esc to interrupt")
+            || text.contains("for shortcuts");
+        (words >= 3 && !hint).then(|| text.chars().take(LAST_LINE).collect())
+    })
 }
 
 #[cfg(test)]
@@ -235,12 +275,52 @@ mod tests {
     fn says_what_an_agent_does() {
         let now = Instant::now();
         let ago = now - Duration::from_secs(90);
-        assert_eq!(status(true, State::Working(ago), now), ("needs you", None));
+        let asked = now - Duration::from_secs(30);
         assert_eq!(
-            status(false, State::Working(ago), now),
+            status(Some(asked), State::Working(ago), now),
+            ("needs you", Some(Duration::from_secs(30)))
+        );
+        assert_eq!(
+            status(None, State::Working(ago), now),
             ("working", Some(Duration::from_secs(90)))
         );
-        assert_eq!(status(false, State::Quiet(ago), now).0, "quiet");
-        assert_eq!(status(false, State::Idle, now), ("idle", None));
+        assert_eq!(status(None, State::Quiet(ago), now).0, "quiet");
+        assert_eq!(status(None, State::Idle, now), ("idle", None));
+    }
+
+    fn screen(lines: &[&str]) -> Vec<String> {
+        lines.iter().map(|l| (*l).to_owned()).collect()
+    }
+
+    #[test]
+    fn finds_what_an_agent_last_said() {
+        // Claude Code style: the answer, then the input box and its hints.
+        let shown = screen(&[
+            "\u{23fa} I updated src/main.rs and the tests pass.",
+            "",
+            "\u{256d}\u{2500}\u{2500}\u{2500}\u{2500}\u{256e}",
+            "\u{2502} >                \u{2502}",
+            "\u{2570}\u{2500}\u{2500}\u{2500}\u{2500}\u{256f}",
+            "  ? for shortcuts",
+            "",
+        ]);
+        assert_eq!(
+            last_line(&shown).as_deref(),
+            Some("I updated src/main.rs and the tests pass.")
+        );
+        // A question in the box is what it last said.
+        let asked = screen(&[
+            "\u{2502} Do you want to run npm test?  \u{2502}",
+            "\u{2502} 1. Yes \u{2502}",
+        ]);
+        assert_eq!(last_line(&asked).as_deref(), Some("1. Yes"));
+        // Nothing with words: nothing.
+        assert_eq!(last_line(&screen(&["", "> ", "\u{2500}\u{2500}"])), None);
+        // Long lines are cut.
+        let long = "word ".repeat(100);
+        assert_eq!(
+            last_line(&[long]).map(|l| l.chars().count()),
+            Some(LAST_LINE)
+        );
     }
 }

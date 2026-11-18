@@ -100,6 +100,10 @@ pub struct Agent {
     pub state: &'static str,
     /// For how long, spoken: `3 min`.
     pub since: Option<String>,
+    /// How long it has waited for you, while it needs you.
+    pub waited: Option<std::time::Duration>,
+    /// What it last said ([`crate::agents::last_line`]).
+    pub last: Option<String>,
 }
 
 impl Agent {
@@ -143,10 +147,14 @@ pub const AGENTS_ONLY: &str = "is:agent";
 impl LiveSession {
     fn matches(&self, query: &str) -> bool {
         let q = query.trim().to_lowercase();
-        // Session > Coding agents > Show agents: the agents only, not a
+        // Session > Coding agents > Agent dashboard: the agents only, not a
         // host that happens to have "agent" in its name.
         if q == AGENTS_ONLY {
             return self.agent.is_some();
+        }
+        if let Some(rest) = q.strip_prefix(AGENTS_ONLY) {
+            let rest = rest.trim();
+            return self.agent.is_some() && (rest.is_empty() || self.matches(rest));
         }
         q.is_empty()
             || self.target.to_lowercase().contains(&q)
@@ -230,7 +238,13 @@ impl LiveView {
     /// The sessions that match the filter, coding agents first.
     fn shown<'a>(&self, all: &'a [LiveSession]) -> Vec<&'a LiveSession> {
         let mut shown: Vec<&LiveSession> = all.iter().filter(|s| s.matches(&self.query)).collect();
-        shown.sort_by_key(|s| s.agent.is_none());
+        // Agents first; the dashboard puts the ones waiting for you on
+        // top, the longest waiting first.
+        if self.dashboard() {
+            shown.sort_by_key(|s| std::cmp::Reverse(s.agent.as_ref().and_then(|a| a.waited)));
+        } else {
+            shown.sort_by_key(|s| s.agent.is_none());
+        }
         shown
     }
 
@@ -518,6 +532,15 @@ impl LiveView {
     }
 }
 
+/// The Tab column: the tab's number, `hidden` or `-`.
+fn tab_text(s: &LiveSession) -> String {
+    match s.tab {
+        Some(i) => (i + 1).to_string(),
+        None if s.hidden => "hidden".to_owned(),
+        None => "-".to_owned(),
+    }
+}
+
 /// A session as the native list view shows it: one row, in columns.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LiveRow {
@@ -525,6 +548,8 @@ pub struct LiveRow {
     /// The name, or the target.
     pub label: String,
     pub kind: &'static str,
+    /// The coding agent it runs, by name, or empty.
+    pub agent: String,
     pub tab: String,
     pub state: &'static str,
     /// The target when the session has a name, the notes and the title.
@@ -562,8 +587,45 @@ impl LiveView {
         self.rename.as_ref().map(|r| r.pane)
     }
 
+    /// Whether the filter lists the coding agents only (Session > Coding
+    /// agents > Agent dashboard): then the rows show each agent's host,
+    /// name, state and last line, the ones waiting for you first.
+    pub fn dashboard(&self) -> bool {
+        self.query.trim().to_lowercase().starts_with(AGENTS_ONLY)
+    }
+
     /// The sessions that match the filter, as native list rows.
     pub fn rows(&self, all: &[LiveSession]) -> Vec<LiveRow> {
+        if self.dashboard() {
+            return self
+                .shown(all)
+                .into_iter()
+                .filter_map(|s| {
+                    let a = s.agent.as_ref()?;
+                    Some(LiveRow {
+                        pane: s.pane,
+                        label: s.name.clone().unwrap_or_else(|| s.target.clone()),
+                        kind: "agent",
+                        agent: a.name.clone(),
+                        tab: tab_text(s),
+                        state: if s.state == LiveState::Connected {
+                            a.state
+                        } else {
+                            s.state.name()
+                        },
+                        details: match (&a.since, s.state) {
+                            (Some(t), LiveState::Connected) => {
+                                format!("{t} \u{b7} {}", a.last.as_deref().unwrap_or(""))
+                            }
+                            _ => a.last.clone().unwrap_or_default(),
+                        }
+                        .trim_end_matches([' ', '\u{b7}'])
+                        .to_owned(),
+                        focused: s.focused,
+                    })
+                })
+                .collect();
+        }
         self.shown(all)
             .into_iter()
             .map(|s| {
@@ -586,11 +648,8 @@ impl LiveView {
                     } else {
                         s.kind.name()
                     },
-                    tab: match s.tab {
-                        Some(i) => (i + 1).to_string(),
-                        None if s.hidden => "hidden".to_owned(),
-                        None => "-".to_owned(),
-                    },
+                    agent: s.agent.as_ref().map(|a| a.name.clone()).unwrap_or_default(),
+                    tab: tab_text(s),
                     state: match &s.agent {
                         Some(a) if s.state == LiveState::Connected => a.state,
                         _ => s.state.name(),
@@ -648,6 +707,8 @@ mod tests {
             name: "claude".into(),
             state: "needs you",
             since: None,
+            waited: None,
+            last: None,
         });
         let mut v = LiveView::default();
         let rows = v.rows(&all);
@@ -668,6 +729,49 @@ mod tests {
         let rows = v.rows(&all);
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].pane, 3);
+    }
+
+    #[test]
+    fn the_dashboard_shows_who_waits_longest_first() {
+        let mut all = sample();
+        let agent = |name: &str, state, since: &str, waited: Option<u64>, last: &str| Agent {
+            name: name.into(),
+            state,
+            since: Some(since.into()),
+            waited: waited.map(std::time::Duration::from_secs),
+            last: Some(last.into()),
+        };
+        all[0].agent = Some(agent("codex", "working", "2 min", None, "Running tests"));
+        all[1].agent = Some(agent(
+            "claude",
+            "needs you",
+            "30 s",
+            Some(30),
+            "Run npm test?",
+        ));
+        all[1].state = LiveState::Connected;
+        all[2].agent = Some(agent(
+            "aider",
+            "needs you",
+            "5 min",
+            Some(300),
+            "Apply edit?",
+        ));
+        let mut v = LiveView::default();
+        v.set_query(AGENTS_ONLY);
+        assert!(v.dashboard());
+        let rows = v.rows(&all);
+        let panes: Vec<_> = rows.iter().map(|r| r.pane).collect();
+        assert_eq!(panes, [3, 2, 1], "waiting longest first, then the rest");
+        assert_eq!(rows[0].agent, "aider");
+        assert_eq!(rows[0].state, "needs you");
+        assert_eq!(rows[0].details, "5 min \u{b7} Apply edit?");
+        assert_eq!(rows[2].details, "2 min \u{b7} Running tests");
+        // A word after the filter narrows it.
+        v.set_query("is:agent web");
+        assert_eq!(v.rows(&all).len(), 1);
+        v.set_query("agent");
+        assert!(!v.dashboard());
     }
 
     #[test]

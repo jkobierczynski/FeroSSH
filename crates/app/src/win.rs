@@ -613,7 +613,7 @@ mod cmd {
     pub const NOTIFY_BELL: u32 = 651;
     /// Session > Notify when this pane goes quiet.
     pub const NOTIFY_QUIET: u32 = 652;
-    /// Session > Coding agents > Show agents; the menu's first item.
+    /// Session > Coding agents > Agent dashboard; the menu's first item.
     pub const AGENTS_SHOW: u32 = 653;
     /// Session > Coding agents > Paste and drop files: upload and type
     /// the path; the menu's second item.
@@ -855,6 +855,10 @@ impl std::ops::Drop for Recording {
     }
 }
 
+/// A coding agent's row as the Session manager last showed it: its pane,
+/// state, for how long, and its last line.
+type AgentShown = (PaneId, &'static str, Option<String>, Option<String>);
+
 /// One terminal pane with its own font and colour theme.
 struct Pane {
     id: PaneId,
@@ -881,6 +885,8 @@ struct Pane {
     /// The pane asked for attention (a notification, the bell, or quiet
     /// after work) and has not been looked at since: its tab's badge.
     attention: bool,
+    /// When `attention` last came on: how long the pane has waited.
+    attention_since: Option<Instant>,
     /// Session > Notify when this pane goes quiet.
     quiet: Option<crate::attention::Watch>,
     /// Spaces out this pane's Windows notifications.
@@ -1264,7 +1270,7 @@ struct Window {
     /// screen): clicking it shows that pane.
     toast_pane: Option<PaneId>,
     /// The coding agents' states the Session manager last showed.
-    agent_states: Vec<(PaneId, &'static str, Option<String>)>,
+    agent_states: Vec<AgentShown>,
     /// The panes of the notifications asked for and not on screen yet,
     /// oldest first; Windows shows them one after the other.
     toast_queue: VecDeque<PaneId>,
@@ -2640,6 +2646,7 @@ fn new_pane(
         name: None,
         bell: false,
         attention: false,
+        attention_since: None,
         quiet: None,
         throttle: crate::attention::Throttle::default(),
         cwd: None,
@@ -2730,7 +2737,7 @@ fn build_menu() -> Result<HMENU> {
         item(
             agents,
             cmd::AGENTS_SHOW,
-            "&Show agents in the Session manager",
+            "Agent &dashboard (who waits for you)",
         )?;
         item(
             agents,
@@ -4192,11 +4199,14 @@ impl Window {
                     .quiet
                     .as_ref()
                     .map_or(crate::attention::State::Idle, |w| w.state(now));
-                let (what, since) = crate::agents::status(p.attention, state, now);
+                let asked = p.attention_since.filter(|_| p.attention);
+                let (what, since) = crate::agents::status(asked, state, now);
                 live::Agent {
                     name: name.to_owned(),
                     state: what,
                     since: since.map(crate::attention::spoken),
+                    waited: asked.map(|_| since.unwrap_or_default()),
+                    last: crate::agents::last_line(&p.term.screen_text()),
                 }
             });
             out.push(LiveSession {
@@ -9311,12 +9321,12 @@ impl Window {
         commands
     }
 
-    /// Session > Coding agents, as it opens: Show agents, then a Start
+    /// Session > Coding agents, as it opens: Agent dashboard, then a Start
     /// item for each agent command.
     fn fill_agents(&mut self, menu: HMENU) {
         let commands = crate::agents::commands(&self.settings.agent_commands);
         // SAFETY: our popup menu; it is being opened, when changing it is
-        // allowed. Everything after Show agents and the five options is
+        // allowed. Everything after Agent dashboard and the five options is
         // replaced.
         unsafe {
             while GetMenuItemCount(Some(menu)) > 6 {
@@ -9513,6 +9523,9 @@ impl Window {
             return false;
         };
         let badge = !std::mem::replace(&mut p.attention, true);
+        if badge {
+            p.attention_since = Some(Instant::now());
+        }
         if (front && visible) || !p.throttle.allow(now) {
             return badge;
         }
@@ -9618,7 +9631,7 @@ impl Window {
         if self.side.visible && self.side.view == SideView::Live {
             // As the rows say it: the state and how long, so "quiet 5 s"
             // does not stay while it is a minute.
-            let states: Vec<(PaneId, &'static str, Option<String>)> = self
+            let states: Vec<AgentShown> = self
                 .panes
                 .iter()
                 .filter(|(id, _)| self.agent_of(**id).is_some())
@@ -9627,8 +9640,14 @@ impl Window {
                         .quiet
                         .as_ref()
                         .map_or(crate::attention::State::Idle, |w| w.state(now));
-                    let (what, since) = crate::agents::status(p.attention, state, now);
-                    (*id, what, since.map(crate::attention::spoken))
+                    let asked = p.attention_since.filter(|_| p.attention);
+                    let (what, since) = crate::agents::status(asked, state, now);
+                    (
+                        *id,
+                        what,
+                        since.map(crate::attention::spoken),
+                        crate::agents::last_line(&p.term.screen_text()),
+                    )
                 })
                 .collect();
             if states != self.agent_states {
@@ -10000,7 +10019,11 @@ impl Window {
         if self.live_native() {
             let all = self.open_sessions();
             live_panel::set_search(self.live_view.query());
-            live_panel::set_rows(self.live_view.rows(&all), all.len());
+            let rows = self.live_view.rows(&all);
+            let dashboard = self.live_view.dashboard();
+            // The dashboard counts its agents; the list, every session.
+            let total = if dashboard { rows.len() } else { all.len() };
+            live_panel::set_rows(rows, total, dashboard);
             live_panel::place(self.areas.side, self.areas.side_width, self.dpi);
         } else {
             live_panel::place(None, 0, self.dpi);
