@@ -5947,10 +5947,9 @@ impl Window {
         }
     }
 
-    /// Connects pane `id` to `destination` (`[user@]host[:port]` or a
-    /// Host from ssh_config).
-    fn connect(&mut self, id: PaneId, destination: &str) {
-        // A workspace pane connected anywhere else is a pane like any other.
+    /// A workspace pane connected anywhere else than its own destination
+    /// is a pane like any other: it runs nothing of the workspace's.
+    fn workspace_elsewhere(&mut self, id: PaneId, destination: &str) {
         if self.workspace_extra.get(&id).is_some_and(|e| {
             !e.dest
                 .as_deref()
@@ -5958,6 +5957,12 @@ impl Window {
         }) {
             self.workspace_extra.remove(&id);
         }
+    }
+
+    /// Connects pane `id` to `destination` (`[user@]host[:port]` or a
+    /// Host from ssh_config).
+    fn connect(&mut self, id: PaneId, destination: &str) {
+        self.workspace_elsewhere(id, destination);
         if let Some(target) = serial::parse_target(destination) {
             self.open_serial(id, target, None);
             return;
@@ -7401,19 +7406,26 @@ impl Window {
                         };
                         if let Some(line) = after
                             && finished
+                            && !self.tmux.get(&id).is_some_and(Tmux::active)
                         {
                             self.workspace_type(id, &line);
                         }
                         if run.tmux {
                             self.cd_after_login(id);
-                            if self.tmux_after_login(id) {
+                            if self.tmux_after_login(id) || !finished {
+                                // tmux took the shell, or the login did
+                                // not finish: the workspace's part is over.
                                 self.workspace_drop(id);
-                            } else if finished {
+                            } else {
                                 self.workspace_start(id, false);
                             }
-                        } else if run.login && finished {
+                        } else if run.login {
                             // Telnet and serial: no tmux, no start folder.
-                            self.workspace_start(id, false);
+                            if finished {
+                                self.workspace_start(id, false);
+                            } else {
+                                self.workspace_drop(id);
+                            }
                         }
                         if run.report {
                             self.pump_run();
@@ -12314,6 +12326,7 @@ impl Window {
                             port,
                             settings: line,
                         };
+                        self.workspace_elsewhere(id, host);
                         self.open_serial(id, target, Some(host));
                     }
                 }
@@ -12987,12 +13000,16 @@ impl Window {
                 .is_some_and(|p| p.theme.name == "Production")
         {
             let label = self.pane_label(id);
-            self.queued.push(Command::ConfirmWorkspaceStart {
+            // Asked from its own timer: whatever brought the pane here
+            // (output, a timer, opening the workspace) may not ask now.
+            self.workspace_asks.push(Command::ConfirmWorkspaceStart {
                 pane: id,
                 label,
                 script,
                 command,
             });
+            // SAFETY: our window; replaces any earlier timer with this id.
+            unsafe { SetTimer(Some(self.hwnd), TIMER_WORKSPACE_ASK, 50, None) };
             return;
         }
         self.workspace_run(id, script.as_deref(), command);
@@ -18395,7 +18412,7 @@ fn run_command(hwnd: HWND, command: Command) {
                                 hwnd,
                                 "FeroSSH could not keep these as allowed (its file in \
                                  %LOCALAPPDATA%\\FeroSSH could not be written). They run \
-                                 now, and FeroSSH asks again next time.",
+                                 now, and FeroSSH asks again after it restarts.",
                                 MB_OK | MB_ICONWARNING,
                             );
                         }
