@@ -3679,8 +3679,7 @@ impl Window {
         if let Some(line) = rebuild {
             self.send_host(id, line.as_bytes());
         }
-        self.attach_tmux(id, &name, false);
-        true
+        self.attach_tmux(id, &name, false)
     }
 
     /// Types the `cd` to the directory of the pane a new tab or pane was
@@ -3701,7 +3700,8 @@ impl Window {
 
     /// Types the line that starts tmux in control mode at pane `id`'s
     /// shell.
-    fn attach_tmux(&mut self, id: PaneId, name: &str, pick: bool) {
+    /// Whether tmux was started: not over Mosh.
+    fn attach_tmux(&mut self, id: PaneId, name: &str, pick: bool) -> bool {
         // Mosh sends screens, not the byte stream tmux control mode needs.
         if let Some(Host::Ssh(s)) = self.panes.get(&id).map(|p| &p.host)
             && s.target.mosh.is_some()
@@ -3711,17 +3711,18 @@ impl Window {
                 "\x1b[0;90mtmux integration needs an SSH shell: it does not work over Mosh. \
                  Run tmux in the pane as usual.\x1b[0m\r\n",
             );
-            return;
+            return false;
         }
         if !self.tmux.contains_key(&id) {
             let t = self.new_tmux(id);
             self.tmux.insert(id, t);
         }
         let Some(t) = self.tmux.get_mut(&id) else {
-            return;
+            return false;
         };
         let line = t.attach(name, pick);
         self.send_host(id, &line);
+        true
     }
 
     /// Feeds local text (not from the host) to a pane's terminal.
@@ -12552,16 +12553,18 @@ impl Window {
             return;
         }
         let ws = self.workspace_now().0.filter(|ws| {
-            wsfile::fits(ws)
-                && ws
-                    .tabs
-                    .iter()
-                    .any(|t| t.root.panes().iter().any(|p| p.open != WsOpen::Prompt))
+            ws.tabs
+                .iter()
+                .any(|t| t.root.panes().iter().any(|p| p.open != WsOpen::Prompt))
         });
         match ws {
-            // One that cannot be written (too big) leaves the last one kept.
+            // One too big for a workspace file, or one that fails to be
+            // written, leaves the last one kept. FeroSSH is closing, so
+            // there is no window left to say so in.
             Some(ws) => {
-                let _ = wsfile::write(&path, &ws);
+                if wsfile::fits(&ws) {
+                    let _ = wsfile::write(&path, &ws);
+                }
             }
             None => {
                 let _ = std::fs::remove_file(&path);
@@ -14557,7 +14560,7 @@ impl Window {
                     }
                     _ => return Some(Command::Notice(NOT_IN_SHELL.into())),
                 };
-                self.attach_tmux(pane, &name, true);
+                let _ = self.attach_tmux(pane, &name, true);
             }
             cmd::DESKTOP => return self.open_desktop(pane, None),
             cmd::DESKTOP_TAB => return self.open_desktop(pane, Some(Protocol::Vnc)),
