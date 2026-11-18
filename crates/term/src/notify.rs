@@ -62,9 +62,17 @@ impl Text {
     /// Adds a chunk; `None` when its base64 is not.
     fn push(&mut self, chunk: &[u8], base64: bool) -> Option<()> {
         if base64 {
-            if !chunk
-                .iter()
-                .all(|c| c.is_ascii_alphanumeric() || matches!(c, b'+' | b'/' | b'='))
+            // Padding only at the end, at most two.
+            let data = chunk.iter().take_while(|&&c| c != b'=').count();
+            let pad = chunk.len() - data;
+            if pad > 2
+                || chunk
+                    .get(data..)
+                    .is_some_and(|p| p.iter().any(|&c| c != b'='))
+                || !chunk
+                    .iter()
+                    .take(data)
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, b'+' | b'/'))
             {
                 return None;
             }
@@ -336,6 +344,9 @@ mod tests {
         // Chunks each with their own padding: "Hi" then "!".
         assert_eq!(parse(b"99;i=y:d=0:e=1;SGk=", &mut k), None);
         assert_eq!(parse(b"99;i=y:e=1;IQ==", &mut k), n(Some("Hi!"), ""));
+        // Padding inside a chunk is not base64.
+        assert_eq!(parse(b"99;i=z:e=1;SG=k=", &mut k), None);
+        assert_eq!(parse(b"99;i=z:e=1;SGk===", &mut k), None);
     }
 
     #[test]
