@@ -10,6 +10,7 @@
 //! VerifyTransfers yes
 //! ZModem yes
 //! UploadAndTypePath yes
+//! PortPreviews yes
 //! AutoReconnect yes
 //! RemoteAppCopyAgent yes
 //! RemoteAppRemoveAgent no
@@ -668,6 +669,11 @@ pub struct Settings {
     /// such as coding agents that take files by path. Off unless turned
     /// on: drops then upload to the pane's folder after asking.
     pub upload_type_path: bool,
+    /// A web server's address on the host in a pane's output
+    /// (`http://localhost:5173/`) shows a bar offering to forward its
+    /// port and open it in the browser here. Off unless turned on; each
+    /// forward is a click.
+    pub port_previews: bool,
     /// The file view follows the shell's working directory (OSC 7).
     pub follow_directory: bool,
     /// How the file transfer pane arranges its Local and Remote lists,
@@ -806,6 +812,7 @@ impl Default for Settings {
             parallel_transfers: None,
             zmodem: false,
             upload_type_path: false,
+            port_previews: false,
             follow_directory: true,
             transfer_layout: None,
             transfer_sort: None,
@@ -1161,6 +1168,10 @@ impl Settings {
                 "uploadandtypepath" => {
                     block = Block::Top;
                     s.upload_type_path = yes(&args).unwrap_or(false);
+                }
+                "portpreviews" => {
+                    block = Block::Top;
+                    s.port_previews = yes(&args).unwrap_or(false);
                 }
                 "bookmark" => {
                     block = Block::Top;
@@ -1587,6 +1598,7 @@ impl Settings {
         }
         let _ = writeln!(out, "ZModem {}", flag(self.zmodem));
         let _ = writeln!(out, "UploadAndTypePath {}", flag(self.upload_type_path));
+        let _ = writeln!(out, "PortPreviews {}", flag(self.port_previews));
         let _ = writeln!(
             out,
             "RemoteAppCopyAgent {}",
@@ -1899,6 +1911,7 @@ DownloadFolder "D:\My Transfers"
 VerifyTransfers yes
 ZModem yes
 UploadAndTypePath yes
+PortPreviews yes
 AutoReconnect no
 ParallelTransfers 20
 FollowDirectory no
@@ -2037,6 +2050,8 @@ NewKeyword later
             !Settings::default().upload_type_path,
             "off unless turned on"
         );
+        assert!(s.port_previews);
+        assert!(!Settings::default().port_previews, "off unless turned on");
         assert!(s.verify_transfers);
         assert!(!s.auto_reconnect);
         assert_eq!(web.auto_reconnect, Some(true));

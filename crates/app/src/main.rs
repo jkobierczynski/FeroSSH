@@ -128,6 +128,8 @@ mod peer_owner;
 #[cfg_attr(not(windows), allow(dead_code))]
 mod portable;
 #[cfg_attr(not(windows), allow(dead_code))]
+mod preview;
+#[cfg_attr(not(windows), allow(dead_code))]
 mod program;
 #[cfg_attr(not(windows), allow(dead_code))]
 mod proxycmd;

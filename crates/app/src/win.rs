@@ -32,8 +32,8 @@ use ferossh_config::snippet_store;
 use ferossh_config::trigger::{Fire, Watch};
 use ferossh_config::workspace::{self as wsfile, Open as WsOpen, PaneSpec};
 use ferossh_config::{
-    ForwardSpec, SessionKind, Settings, WindowColours, mobaxterm, mremoteng, putty, securecrt,
-    ssh_config, winscp,
+    ForwardKind, ForwardSpec, SessionKind, Settings, WindowColours, mobaxterm, mremoteng, putty,
+    securecrt, ssh_config, winscp,
 };
 use ferossh_forward::x11::{Display, MIT_COOKIE, find_cookie, xauth_entries};
 use ferossh_ipc::{
@@ -88,24 +88,24 @@ use windows::Win32::UI::WindowsAndMessaging::{
     DispatchMessageW, EnableMenuItem, FLASHW_TIMERNOFG, FLASHW_TRAY, FLASHWINFO, FlashWindowEx,
     GWL_STYLE, GetClientRect, GetCursorPos, GetForegroundWindow, GetMenuItemCount, GetMenuItemID,
     GetMenuState, GetMenuStringW, GetMessageW, GetSubMenu, GetWindowLongPtrW, GetWindowPlacement,
-    HCURSOR, HMENU, HTCLIENT, HWND_TOP, IDC_ARROW, IDC_IBEAM, IDC_SIZEALL, IDC_SIZENS, IDC_SIZEWE,
-    IDCANCEL, IDNO, IDOK, IDYES, IsChild, IsIconic, IsWindowVisible, KillTimer, LoadCursorW,
-    LoadIconW, MB_DEFBUTTON2, MB_ICONERROR, MB_ICONINFORMATION, MB_ICONQUESTION, MB_ICONWARNING,
-    MB_OK, MB_OKCANCEL, MB_YESNO, MB_YESNOCANCEL, MESSAGEBOX_RESULT, MESSAGEBOX_STYLE,
-    MF_BYCOMMAND, MF_BYPOSITION, MF_CHECKED, MF_DISABLED, MF_ENABLED, MF_GRAYED, MF_MENUBARBREAK,
-    MF_POPUP, MF_SEPARATOR, MF_STRING, MF_UNCHECKED, MSG, MessageBoxW, ModifyMenuW, PM_REMOVE,
-    PeekMessageW, PostMessageW, PostQuitMessage, RegisterClassW, SIZE_MINIMIZED, SW_HIDE,
-    SW_RESTORE, SW_SHOW, SW_SHOWNORMAL, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE,
-    SWP_NOOWNERZORDER, SWP_NOSIZE, SWP_NOZORDER, SetCursor, SetForegroundWindow, SetMenu, SetTimer,
-    SetWindowLongPtrW, SetWindowPlacement, SetWindowPos, SetWindowTextW, ShowWindow, TPM_NONOTIFY,
-    TPM_RETURNCMD, TrackPopupMenu, TranslateMessage, WINDOW_EX_STYLE, WINDOW_STYLE,
-    WINDOWPLACEMENT, WM_APP, WM_CHAR, WM_CLIPBOARDUPDATE, WM_CLOSE, WM_COMMAND, WM_DEADCHAR,
-    WM_DESTROY, WM_DPICHANGED, WM_DROPFILES, WM_ERASEBKGND, WM_EXITMENULOOP, WM_GETDPISCALEDSIZE,
-    WM_HOTKEY, WM_IME_COMPOSITION, WM_IME_STARTCOMPOSITION, WM_KEYDOWN, WM_KEYUP, WM_KILLFOCUS,
-    WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL,
-    WM_PAINT, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SETCURSOR, WM_SETFOCUS, WM_SETTINGCHANGE, WM_SIZE,
-    WM_SYSCHAR, WM_SYSCOLORCHANGE, WM_SYSDEADCHAR, WM_SYSKEYDOWN, WM_SYSKEYUP, WM_TIMER, WNDCLASSW,
-    WS_CLIPCHILDREN, WS_EX_APPWINDOW, WS_OVERLAPPEDWINDOW,
+    HCURSOR, HMENU, HTCLIENT, HWND_TOP, IDC_ARROW, IDC_HAND, IDC_IBEAM, IDC_SIZEALL, IDC_SIZENS,
+    IDC_SIZEWE, IDCANCEL, IDNO, IDOK, IDYES, IsChild, IsIconic, IsWindowVisible, KillTimer,
+    LoadCursorW, LoadIconW, MB_DEFBUTTON2, MB_ICONERROR, MB_ICONINFORMATION, MB_ICONQUESTION,
+    MB_ICONWARNING, MB_OK, MB_OKCANCEL, MB_YESNO, MB_YESNOCANCEL, MESSAGEBOX_RESULT,
+    MESSAGEBOX_STYLE, MF_BYCOMMAND, MF_BYPOSITION, MF_CHECKED, MF_DISABLED, MF_ENABLED, MF_GRAYED,
+    MF_MENUBARBREAK, MF_POPUP, MF_SEPARATOR, MF_STRING, MF_UNCHECKED, MSG, MessageBoxW,
+    ModifyMenuW, PM_REMOVE, PeekMessageW, PostMessageW, PostQuitMessage, RegisterClassW,
+    SIZE_MINIMIZED, SW_HIDE, SW_RESTORE, SW_SHOW, SW_SHOWNORMAL, SWP_FRAMECHANGED, SWP_NOACTIVATE,
+    SWP_NOMOVE, SWP_NOOWNERZORDER, SWP_NOSIZE, SWP_NOZORDER, SetCursor, SetForegroundWindow,
+    SetMenu, SetTimer, SetWindowLongPtrW, SetWindowPlacement, SetWindowPos, SetWindowTextW,
+    ShowWindow, TPM_NONOTIFY, TPM_RETURNCMD, TrackPopupMenu, TranslateMessage, WINDOW_EX_STYLE,
+    WINDOW_STYLE, WINDOWPLACEMENT, WM_APP, WM_CHAR, WM_CLIPBOARDUPDATE, WM_CLOSE, WM_COMMAND,
+    WM_DEADCHAR, WM_DESTROY, WM_DPICHANGED, WM_DROPFILES, WM_ERASEBKGND, WM_EXITMENULOOP,
+    WM_GETDPISCALEDSIZE, WM_HOTKEY, WM_IME_COMPOSITION, WM_IME_STARTCOMPOSITION, WM_KEYDOWN,
+    WM_KEYUP, WM_KILLFOCUS, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP,
+    WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_PAINT, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SETCURSOR, WM_SETFOCUS,
+    WM_SETTINGCHANGE, WM_SIZE, WM_SYSCHAR, WM_SYSCOLORCHANGE, WM_SYSDEADCHAR, WM_SYSKEYDOWN,
+    WM_SYSKEYUP, WM_TIMER, WNDCLASSW, WS_CLIPCHILDREN, WS_EX_APPWINDOW, WS_OVERLAPPEDWINDOW,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     DeleteMenu, InsertMenuW, ShowWindowAsync, WM_INITMENU, WM_INITMENUPOPUP,
@@ -125,7 +125,8 @@ use crate::files::{self, Arrange, Follow};
 use crate::files_panel;
 use crate::form_view;
 use crate::forwards::{
-    ConnView, DesktopEvent, Forwarder, FwdView, Setup as ForwardSetup, X11Setup, desktop_port_for,
+    ConnView, DesktopEvent, Forwarder, FwdState, FwdView, Setup as ForwardSetup, X11Setup,
+    desktop_port_for,
 };
 use crate::fwd_panel;
 use crate::fwdview::{ForwardsView, FwdAction};
@@ -261,6 +262,14 @@ const TIMER_CROWDED: usize = 13;
 /// Asks a Production workspace pane's question once another dialog has
 /// closed.
 const TIMER_WORKSPACE_ASK: usize = 14;
+/// Hides port-forward previews nobody clicked.
+const TIMER_PREVIEW: usize = 15;
+const PREVIEW_TICK_MS: u32 = 5000;
+/// How long a port-forward preview's bar shows.
+const PREVIEW_SHOWN: Duration = Duration::from_secs(60);
+/// How long a forward added from a preview may take to listen before
+/// it is given up on (its connection went meanwhile).
+const PREVIEW_WAIT: Duration = Duration::from_secs(30);
 /// How often a playing replay's tab updates its clock, at most.
 const REPLAY_TICK_MS: u64 = 250;
 const LAUNCH_TICK_MS: u32 = 1000;
@@ -609,6 +618,9 @@ mod cmd {
     /// Session > Coding agents > Paste and drop files: upload and type
     /// the path; the menu's second item.
     pub const UPLOAD_TYPE_PATH: u32 = 654;
+    /// Session > Coding agents > Offer to forward and open web servers;
+    /// the menu's third item.
+    pub const PORT_PREVIEWS: u32 = 655;
     /// Session > Coding agents: plus the index into the commands listed
     /// when the menu opened, up to [`AGENT_END`].
     pub const AGENT_START: u32 = 660;
@@ -1255,6 +1267,16 @@ struct Window {
     /// Remote desktops asked for and not yet open, by connection and
     /// desktop server (host as the SSH server sees it, and port).
     desktops: HashMap<(ChannelId, String, u16), DesktopWant>,
+    /// Port-forward previews showing, by pane (Session > Coding agents >
+    /// Offer to forward and open web servers).
+    previews: HashMap<PaneId, Preview>,
+    /// Each pane's watch for web server addresses while previews are on.
+    preview_scans: HashMap<PaneId, crate::preview::Scanner>,
+    /// Ports forwarded or turned down from a bar, by connection: not
+    /// offered again.
+    preview_done: HashSet<(ChannelId, u16)>,
+    /// Forwards added from a bar that do not listen yet.
+    preview_waiting: Vec<PreviewWait>,
     /// Virtual desktops by their script's exec channel.
     vdesks: HashMap<ChannelId, VirtualDesk>,
     /// Session > Copy public key to this server, by its exec channel.
@@ -1477,6 +1499,29 @@ struct TabWant {
     size: Option<(u16, u16)>,
     /// The connection's limit on the clipboard: to and from the host.
     clip_limit: (bool, bool),
+}
+
+/// A port-forward preview's bar over a pane: a web server's address
+/// seen in the pane's output, on the host of `connection`.
+struct Preview {
+    url: crate::preview::Url,
+    /// The host, as the user knows it.
+    host: String,
+    connection: ChannelId,
+    since: Instant,
+    grid: Grid,
+    /// Where the bar is drawn; empty while it does not fit or the pane
+    /// does not show.
+    rect: Rect,
+}
+
+/// A forward added from a preview's bar, waiting to listen before the
+/// browser opens on it.
+struct PreviewWait {
+    connection: ChannelId,
+    spec: ForwardSpec,
+    url: crate::preview::Url,
+    since: Instant,
 }
 
 /// The server status bar's samples of one connection's server.
@@ -2346,6 +2391,10 @@ fn create_and_run(launch: Launch, theme: Option<String>) -> Result<()> {
                 retries: HashMap::new(),
                 queued: Vec::new(),
                 desktops: HashMap::new(),
+                previews: HashMap::new(),
+                preview_scans: HashMap::new(),
+                preview_done: HashSet::new(),
+                preview_waiting: Vec::new(),
                 vdesks: HashMap::new(),
                 key_copies: HashMap::new(),
                 stats: HashMap::new(),
@@ -2651,6 +2700,11 @@ fn build_menu() -> Result<HMENU> {
             agents,
             cmd::UPLOAD_TYPE_PATH,
             "&Paste and drop files: upload and type the path",
+        )?;
+        item(
+            agents,
+            cmd::PORT_PREVIEWS,
+            "Offer to &forward and open web servers on the host",
         )?;
         AppendMenuW(session, MF_POPUP, agents.0 as usize, w!("Coding a&gents"))?;
         separator(session)?;
@@ -8862,6 +8916,7 @@ impl Window {
         {
             self.refresh_chrome();
             self.update_title();
+            self.settle_previews();
         }
         if more && !self.output_pending.swap(true, Ordering::AcqRel) {
             // Let the window paint, then carry on.
@@ -9178,11 +9233,12 @@ impl Window {
     fn fill_agents(&mut self, menu: HMENU) {
         let commands = crate::agents::commands(&self.settings.agent_commands);
         // SAFETY: our popup menu; it is being opened, when changing it is
-        // allowed. Everything after Show agents and the paste option is
+        // allowed. Everything after Show agents, the paste option and the
+        // previews option is
         // replaced.
         unsafe {
-            while GetMenuItemCount(Some(menu)) > 2 {
-                let _ = DeleteMenu(menu, 2, MF_BYPOSITION);
+            while GetMenuItemCount(Some(menu)) > 3 {
+                let _ = DeleteMenu(menu, 3, MF_BYPOSITION);
             }
             let _ = AppendMenuW(menu, MF_SEPARATOR, 0, None);
             for (id, c) in (cmd::AGENT_START..cmd::AGENT_END).zip(&commands) {
@@ -10369,6 +10425,7 @@ impl Window {
     }
 
     fn paint(&mut self, update: RECT) {
+        self.place_previews();
         // Rows Windows wants repainted (e.g. after a restore) join the
         // grids' own dirty rows; anything outside a pane's rows means
         // everything.
@@ -10430,6 +10487,22 @@ impl Window {
                 cursor: p.cursor,
                 full,
                 image: p.image(),
+            });
+        }
+        // Port-forward previews, over their panes' top right corner.
+        for id in &ids {
+            let Some(pv) = self.previews.get(id).filter(|pv| pv.rect.w > 0) else {
+                continue;
+            };
+            views.push(PaneView {
+                grid: &pv.grid,
+                font: &self.strip_font,
+                theme: &strip_theme,
+                rect: pixel(pv.rect),
+                origin: (pv.rect.x + cpad, pv.rect.y + spad),
+                cursor: None,
+                full: true,
+                image: None,
             });
         }
         if let Some(s) = self.areas.strip {
@@ -11966,8 +12039,264 @@ impl Window {
         vars
     }
 
+    /// Looks for a web server's address in what pane `id`'s host printed
+    /// and offers to forward its port (Session > Coding agents > Offer
+    /// to forward and open web servers). Only SSH panes, logged in, can
+    /// forward; a port forwarded or turned down is not offered again on
+    /// that connection.
+    fn scan_preview(&mut self, id: PaneId, bytes: &[u8]) {
+        if !self.settings.port_previews {
+            return;
+        }
+        let found = self.preview_scans.entry(id).or_default().feed(bytes);
+        if found.is_empty() {
+            return;
+        }
+        let host_id = self.host_pane(id);
+        let (Some(connection), Some(Host::Ssh(s))) = (
+            self.pane_connection(id),
+            self.panes.get(&host_id).map(|p| &p.host),
+        ) else {
+            return;
+        };
+        if s.target.sftp_only || !self.workers.contains_key(&connection) {
+            return;
+        }
+        let host = s.target.label();
+        let Some(url) = found
+            .into_iter()
+            .rev()
+            .find(|u| !self.preview_done.contains(&(connection, u.port)))
+        else {
+            return;
+        };
+        let since = Instant::now();
+        if let Some(pv) = self.previews.get_mut(&id)
+            && pv.connection == connection
+            && pv.url == url
+        {
+            // Printed again: it shows for longer.
+            pv.since = since;
+            return;
+        }
+        self.previews.insert(
+            id,
+            Preview {
+                url,
+                host,
+                connection,
+                since,
+                grid: Grid::new(1, 1),
+                rect: Rect::default(),
+            },
+        );
+        self.preview_moved(id);
+        // SAFETY: our window and timer id.
+        unsafe {
+            SetTimer(Some(self.hwnd), TIMER_PREVIEW, PREVIEW_TICK_MS, None);
+        }
+    }
+
+    /// Pane `id`'s bar came, went or changed: the pane is drawn again
+    /// under it.
+    fn preview_moved(&mut self, id: PaneId) {
+        if let Some(p) = self.panes.get_mut(&id) {
+            p.grid.mark_all_dirty();
+            let r = p.rect;
+            // SAFETY: valid window and rect.
+            unsafe {
+                let _ = InvalidateRect(Some(self.hwnd), Some(&win_rect(r)), false);
+            }
+        }
+    }
+
+    /// Takes pane `id`'s bar away; `done` keeps its port from being
+    /// offered again on that connection.
+    fn drop_preview(&mut self, id: PaneId, done: bool) -> Option<Preview> {
+        let pv = self.previews.remove(&id)?;
+        if done {
+            self.preview_done.insert((pv.connection, pv.url.port));
+        }
+        self.preview_moved(id);
+        Some(pv)
+    }
+
+    /// Fits each bar into its pane's top right corner and draws it; a bar
+    /// that does not fit, or whose pane does not show, is not drawn.
+    fn place_previews(&mut self) {
+        if self.previews.is_empty() {
+            return;
+        }
+        self.previews.retain(|id, _| self.panes.contains_key(id));
+        let visible: HashSet<PaneId> = self.visible_ids().into_iter().collect();
+        let pad = padding(self.dpi);
+        let cpad = scale(CHROME_PADDING_DIP, self.dpi);
+        let spad = scale(STRIP_PAD_DIP, self.dpi);
+        let cw = self.strip_metrics.width.max(1) as i32;
+        let ch = self.strip_metrics.height as i32 + 2 * spad;
+        let palette = self.strip_palette();
+        for (id, pv) in &mut self.previews {
+            pv.rect = Rect::default();
+            let Some(p) = self.panes.get(id).filter(|_| visible.contains(id)) else {
+                continue;
+            };
+            let r = p.rect;
+            let room = ((r.w - 2 * pad - 2 * cpad) / cw).max(0) as usize;
+            let cols = crate::preview::width(&pv.url, &pv.host, room);
+            // Too small a pane: the bar would cover it.
+            if cols < 24 || ch * 3 > r.h {
+                continue;
+            }
+            let w = cols as i32 * cw + 2 * cpad;
+            pv.rect = Rect::new(r.right() - pad - w, r.y + pad, w, ch);
+            if pv.grid.cols() != cols {
+                pv.grid.resize(cols, 1);
+            }
+            crate::preview::draw(&mut pv.grid, &pv.url, &pv.host, &palette);
+        }
+    }
+
+    /// What a click at (`x`, `y`) on pane `id`'s bar does, if it is on it.
+    fn preview_hit(&self, id: PaneId, x: i32, y: i32) -> Option<crate::preview::Hit> {
+        let pv = self.previews.get(&id)?;
+        if pv.rect.w <= 0 || !pv.rect.contains(x, y) {
+            return None;
+        }
+        let cpad = scale(CHROME_PADDING_DIP, self.dpi);
+        let cw = self.strip_metrics.width.max(1) as i32;
+        let col = ((x - pv.rect.x - cpad).max(0) / cw) as usize;
+        Some(crate::preview::hit(col, pv.grid.cols()))
+    }
+
+    /// A click on pane `id`'s bar: the close button takes it away; the
+    /// rest forwards the port to a free one here (the same number when
+    /// it is free) and opens the browser once it listens. The forward is
+    /// listed in Tools > Port forwards like any other, and a reconnect
+    /// starts it again.
+    fn preview_click(&mut self, id: PaneId, hit: crate::preview::Hit) -> Option<Command> {
+        let pv = self.drop_preview(id, true)?;
+        if hit == crate::preview::Hit::Dismiss {
+            return None;
+        }
+        let url = pv.url;
+        let target = (url.target().to_owned(), url.port);
+        let view = self.forward_view();
+        if !view.iter().any(|v| v.connection == pv.connection) {
+            return Some(Command::Notice(format!(
+                "{} is not logged in any more, so port {} cannot be forwarded.",
+                pv.host, url.port
+            )));
+        }
+        // A forward that already goes there serves.
+        if let Some(f) = forwards_of(&view, pv.connection)
+            .find(|f| f.spec.kind == ForwardKind::Local && f.spec.target.as_ref() == Some(&target))
+        {
+            match &f.state {
+                FwdState::Listening(addrs) => {
+                    return url
+                        .local(addrs.split(", ").next().unwrap_or_default())
+                        .map(Command::OpenPreview);
+                }
+                FwdState::Starting => {
+                    self.preview_waiting.push(PreviewWait {
+                        connection: pv.connection,
+                        spec: f.spec.clone(),
+                        url,
+                        since: Instant::now(),
+                    });
+                    return None;
+                }
+                // A failed one is left as it is; a new one is tried.
+                FwdState::Failed(_) => {}
+            }
+        }
+        let Some(local) = free_local_port(url.port) else {
+            return Some(Command::Notice(
+                "No local port is free to forward to.".into(),
+            ));
+        };
+        let spec = ForwardSpec {
+            kind: ForwardKind::Local,
+            bind: Some("127.0.0.1".into()),
+            port: local,
+            target: Some(target),
+        };
+        let w = self.workers.get(&pv.connection)?;
+        w.forwarder.add(pv.connection, spec.clone());
+        self.keep_forwards(pv.connection, |list| {
+            if !list.contains(&spec) {
+                list.push(spec.clone());
+            }
+        });
+        self.preview_waiting.push(PreviewWait {
+            connection: pv.connection,
+            spec,
+            url,
+            since: Instant::now(),
+        });
+        None
+    }
+
+    /// Opens the browser on the forwards from a bar that listen now, and
+    /// says why the ones that failed did.
+    fn settle_previews(&mut self) {
+        if self.preview_waiting.is_empty() {
+            return;
+        }
+        let view = self.forward_view();
+        let mut out = Vec::new();
+        self.preview_waiting.retain(|w| {
+            let state = forwards_of(&view, w.connection)
+                .find(|f| f.spec == w.spec)
+                .map(|f| &f.state);
+            match state {
+                Some(FwdState::Listening(addrs)) => {
+                    if let Some(url) = w.url.local(addrs.split(", ").next().unwrap_or_default()) {
+                        out.push(Command::OpenPreview(url));
+                    }
+                    false
+                }
+                Some(FwdState::Failed(why)) => {
+                    out.push(Command::Notice(format!(
+                        "Port {} could not be forwarded to this PC: {why}",
+                        w.url.port
+                    )));
+                    false
+                }
+                Some(FwdState::Starting) => true,
+                None => w.since.elapsed() < PREVIEW_WAIT,
+            }
+        });
+        self.queued.extend(out);
+    }
+
+    /// Takes away the bars nobody clicked, and the watches of panes that
+    /// are gone; a port whose bar went this way is offered again when it
+    /// is printed again.
+    fn on_preview_timer(&mut self) {
+        let old: Vec<PaneId> = self
+            .previews
+            .iter()
+            .filter(|(id, pv)| !self.panes.contains_key(id) || pv.since.elapsed() >= PREVIEW_SHOWN)
+            .map(|(id, _)| *id)
+            .collect();
+        for id in old {
+            self.drop_preview(id, false);
+        }
+        self.preview_scans
+            .retain(|id, _| self.panes.contains_key(id));
+        self.settle_previews();
+        if self.previews.is_empty() && self.preview_waiting.is_empty() {
+            // SAFETY: our window and timer id.
+            unsafe {
+                let _ = KillTimer(Some(self.hwnd), TIMER_PREVIEW);
+            }
+        }
+    }
+
     /// What pane `id`'s host printed, for auto-responses and a recording.
     fn watch_output(&mut self, id: PaneId, bytes: &[u8]) {
+        self.scan_preview(id, bytes);
         if let Some((pane, rec)) = &mut self.recording
             && *pane == id
         {
@@ -14208,6 +14537,7 @@ impl Window {
             Spot::SideEdge => IDC_SIZEWE,
             Spot::Divider(d) if d.axis == Axis::Row => IDC_SIZEWE,
             Spot::Divider(_) => IDC_SIZENS,
+            Spot::Pane(id) if self.preview_hit(id, x, y).is_some() => IDC_HAND,
             Spot::Pane(_) => IDC_IBEAM,
             _ => IDC_ARROW,
         }
@@ -14261,6 +14591,12 @@ impl Window {
             // does. The click only does that, since everything moves.
             self.hide_side();
             return None;
+        }
+        if button == MouseButton::Left
+            && let Spot::Pane(id) = spot
+            && let Some(hit) = self.preview_hit(id, x, y)
+        {
+            return self.preview_click(id, hit);
         }
         match spot {
             Spot::SideEdge if button == MouseButton::Left => {
@@ -15408,6 +15744,18 @@ impl Window {
                 self.save_settings();
                 self.update_menu_checks();
             }
+            cmd::PORT_PREVIEWS => {
+                self.settings.port_previews = !self.settings.port_previews;
+                self.save_settings();
+                self.update_menu_checks();
+                if !self.settings.port_previews {
+                    self.preview_scans.clear();
+                    let shown: Vec<PaneId> = self.previews.keys().copied().collect();
+                    for id in shown {
+                        self.drop_preview(id, false);
+                    }
+                }
+            }
             cmd::VERIFY => {
                 self.settings.verify_transfers = !self.settings.verify_transfers;
                 for remote in self.sftp.values_mut() {
@@ -15842,6 +16190,7 @@ impl Window {
                 (cmd::VERIFY, s.verify_transfers),
                 (cmd::ZMODEM, s.zmodem),
                 (cmd::UPLOAD_TYPE_PATH, s.upload_type_path),
+                (cmd::PORT_PREVIEWS, s.port_previews),
                 (cmd::HIGHLIGHT, s.highlight),
                 (cmd::AUTO_RECONNECT, s.auto_reconnect),
                 (cmd::SIDE_RIGHT, s.side_pane_right),
@@ -17684,6 +18033,9 @@ enum Command {
     ClipboardWrite(String),
     /// Ctrl+click on an OSC 8 link; the target is unchecked.
     OpenLink(String),
+    /// A port-forward preview's address, forwarded here: opened in the
+    /// browser without asking, as the user just clicked for it.
+    OpenPreview(String),
     UpdateTitle,
     Bell,
     /// Session > Replace host key: two confirmations, then replace.
@@ -19254,6 +19606,22 @@ fn run_command(hwnd: HWND, command: Command) {
                 clipboard::set_text(hwnd, &text);
             }
         }
+        Command::OpenPreview(url) => {
+            if let Some(uri) = check_link(&url) {
+                // SAFETY: a checked http(s) URL on this PC's loopback,
+                // handed to the default browser.
+                unsafe {
+                    ShellExecuteW(
+                        Some(hwnd),
+                        w!("open"),
+                        &HSTRING::from(uri),
+                        None,
+                        None,
+                        SW_SHOWNORMAL,
+                    );
+                }
+            }
+        }
         Command::OpenLink(raw) => match check_link(&raw) {
             Some(uri) => {
                 let prompt = format!("Open this link in your browser?\n\n{uri}");
@@ -20749,6 +21117,18 @@ fn replace_host_key(hwnd: HWND) {
 }
 
 /// The forwards of `connection` in the forwards view.
+/// A port free on this PC's loopback: `want` if it is, else any.
+fn free_local_port(want: u16) -> Option<u16> {
+    if std::net::TcpListener::bind(("127.0.0.1", want)).is_ok() {
+        return Some(want);
+    }
+    std::net::TcpListener::bind(("127.0.0.1", 0))
+        .ok()?
+        .local_addr()
+        .ok()
+        .map(|a| a.port())
+}
+
 fn forwards_of(view: &[ConnView], connection: ChannelId) -> impl Iterator<Item = &FwdView> {
     view.iter()
         .filter(move |v| v.connection == connection)
@@ -21133,6 +21513,15 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                 if let Some(commands) = with_window(Window::on_replay_timer) {
                     run_commands(hwnd, commands);
                 }
+                LRESULT(0)
+            }
+            WM_TIMER if wparam.0 == TIMER_PREVIEW => {
+                let next = with_window(|w| {
+                    w.on_preview_timer();
+                    std::mem::take(&mut w.queued)
+                })
+                .unwrap_or_default();
+                run_commands(hwnd, next);
                 LRESULT(0)
             }
             WM_TIMER if wparam.0 == TIMER_QUIET => {

@@ -39,7 +39,9 @@ Built on 18 November 2026 as Session > Coding agents > Paste and drop files: upl
 
 **What to build.** Pasting an image (a screenshot on the clipboard) or dropping a file uploads it to a temporary folder on the host (`~/.cache/ferossh/paste/`), then types its quoted path at the cursor, which is how agents take images. An option chooses between "upload and type the path" and today's "upload to the pane's folder". The upload uses the existing SFTP queue; nothing new runs in the window process.
 
-## 4. Port-forward previews
+## 4. Port-forward previews (built)
+
+Built on 18 November 2026 as Session > Coding agents > Offer to forward and open web servers on the host (setting `PortPreviews`, off by default). See [Opening a web server on the host](../guide/everyday-use.md#opening-a-web-server-on-the-host).
 
 **What FeroSSH has.** Local, remote and dynamic forwards, editable while connected (Tools > Port forwards). Links are opened with Ctrl+click only when the host marks them with OSC 8; plain `http://localhost:5173` text is not a link.
 
