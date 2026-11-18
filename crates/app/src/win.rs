@@ -5953,7 +5953,8 @@ impl Window {
     /// A workspace pane connected anywhere else than its own destination
     /// is a pane like any other: it runs nothing of the workspace's.
     fn workspace_elsewhere(&mut self, id: PaneId, destination: &str) {
-        let other = |d: &str| !d.trim().eq_ignore_ascii_case(destination.trim());
+        // As written: user names differ by case (and so do some hosts).
+        let other = |d: &str| d.trim() != destination.trim();
         // One waiting for another pane's login waits no more, and its
         // tmux plan is not its own any more: it is saved, and kept, as
         // what it now opens.
@@ -8606,6 +8607,7 @@ impl Window {
                         self.script_output(id, &data);
                     }
                     Output::Exited(code) => {
+                        self.workspace_shell_gone(id);
                         self.stop_log(id);
                         if let Some(p) = self.panes.get_mut(&id) {
                             p.host = Host::Local {
@@ -13330,6 +13332,17 @@ impl Window {
             _ => None,
         });
         let id = if idle { pane } else { self.new_tab_pane() };
+        // A workspace pane waiting for its SSH login is a local shell now.
+        if self
+            .workspace_extra
+            .get(&id)
+            .is_some_and(|e| e.dest.is_some())
+            || self.workspace_waiting.destination(id).is_some()
+        {
+            self.workspace_extra.remove(&id);
+            self.workspace_waiting.forget(id);
+            self.workspace_tmux.remove(&id);
+        }
         self.focus_terminal();
         self.start_shell_in(id, dir.as_deref());
     }
