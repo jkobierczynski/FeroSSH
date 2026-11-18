@@ -700,6 +700,9 @@ const BROADCAST_FRAME: Rgb = Rgb::new(0xe5, 0x8e, 0x26);
 enum Typed {
     Char(char, bool),
     Key(Key, Mods),
+    /// Ctrl+Space, Ctrl+2, Ctrl+6 or Ctrl+/: the key's character and the
+    /// control code xterm sends for it.
+    Ctrl(char, u8, Mods),
     Bytes(Vec<u8>),
     Paste(String),
 }
@@ -2227,6 +2230,13 @@ fn replay_terminal(
     t.set_theme(theme);
     t.set_cell_size(metrics.width, metrics.height);
     t
+}
+
+/// Whether `bytes` are a plain Escape key: ESC, or `CSI 27 u` while a
+/// program has the kitty keyboard protocol on (the pane keeps its mode
+/// after the connection drops).
+fn is_escape(bytes: &[u8]) -> bool {
+    bytes == b"\x1b" || bytes == b"\x1b[27u"
 }
 
 fn term_settings(lines: Option<usize>) -> TermSettings {
@@ -8365,7 +8375,7 @@ impl Window {
             }
             Host::Ssh(session)
                 if session.state() == State::Connecting
-                    && bytes == b"\x1b"
+                    && is_escape(&bytes)
                     && self.retries.contains_key(&id) =>
             {
                 self.stop_reconnecting(id);
@@ -8374,7 +8384,7 @@ impl Window {
                 if self.retries.contains_key(&id) {
                     if enter {
                         self.retry_now(id);
-                    } else if bytes == b"\x1b" {
+                    } else if is_escape(&bytes) {
                         self.stop_reconnecting(id);
                     }
                 } else if enter {
@@ -8725,6 +8735,7 @@ impl Window {
             let bytes = match typed {
                 Typed::Char(ch, alt) => Some(p.term.text(*ch, *alt)),
                 Typed::Key(key, mods) => p.term.key(*key, *mods),
+                Typed::Ctrl(key, code, mods) => Some(p.term.ctrl_key(*key, *code, *mods)),
                 Typed::Bytes(b) => Some(b.clone()),
                 Typed::Paste(text) => Some(p.term.paste(text).bytes),
             };
@@ -10970,21 +10981,22 @@ impl Window {
         // (Ctrl+Alt) is left alone.
         if mods.ctrl && !mods.alt {
             let code = match vk {
-                VK_SPACE => Some(0x00),
-                VIRTUAL_KEY(0x32) => Some(0x00), // Ctrl+2, as in xterm
-                VIRTUAL_KEY(0x36) => Some(0x1E), // Ctrl+6
-                VK_OEM_2 => Some(0x1F),          // Ctrl+/
+                VK_SPACE => Some((' ', 0x00)),
+                VIRTUAL_KEY(0x32) => Some(('2', 0x00)), // Ctrl+2, as in xterm
+                VIRTUAL_KEY(0x36) => Some(('6', 0x1E)), // Ctrl+6
+                VK_OEM_2 => Some(('/', 0x1F)),          // Ctrl+/
                 _ => None,
             };
-            if let Some(code) = code {
+            if let Some((key, code)) = code {
                 drop_pending_char(self.hwnd);
                 // Ctrl+Space can be the tmux prefix (C-Space).
                 if let Some(command) = self.tmux_char(id, char::from(code), false) {
                     return command.map_or(KeyOutcome::Handled, KeyOutcome::Run);
                 }
                 let targets = self.broadcast_targets(id);
-                self.input(id, vec![code]);
-                self.send_typed(&targets, &Typed::Bytes(vec![code]));
+                let typed = Typed::Ctrl(key, code, mods);
+                self.send_typed(&[id], &typed);
+                self.send_typed(&targets, &typed);
                 return KeyOutcome::Handled;
             }
         }

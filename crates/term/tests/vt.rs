@@ -240,6 +240,71 @@ fn the_kitty_keyboard_protocol_is_there_only_when_allowed() {
     assert_eq!(t.key(Key::Enter, shift).unwrap(), b"\r");
 }
 
+fn kitty_term() -> Terminal {
+    let mut t = term(10, 3);
+    t.set_keys(KeyOptions {
+        kitty: true,
+        shift_enter: ShiftEnter::Enter,
+    });
+    t
+}
+
+#[test]
+fn thousands_of_kitty_keyboard_pushes_do_not_crash() {
+    // alacritty_terminal 0.26 panics on a push onto a full keyboard mode
+    // stack (4096 modes); the stacks are emptied before that.
+    let pushes = b"\x1b[>1u".repeat(5000);
+    let mut t = kitty_term();
+    t.feed(&pushes);
+    t.feed(b"\x1b[?u");
+    assert_eq!(replies(&mut t), ["\x1b[?1u"]);
+    // Popping everything gets xterm's keys back.
+    t.feed(b"\x1b[<9999u\x1b[?u");
+    assert_eq!(replies(&mut t), ["\x1b[?0u"]);
+    assert_eq!(t.key(Key::Escape, Mods::NONE).unwrap(), b"\x1b");
+
+    // A byte at a time, with a saved title (which alacritty trims
+    // instead of the keyboard stack, so it would grow without end), on
+    // both screens, and held back by a synchronized update.
+    let mut t = kitty_term();
+    let mut output = b"\x1b]0;t\x07\x1b[22t".to_vec();
+    output.extend_from_slice(&pushes);
+    output.extend_from_slice(b"\x1b[?1049h");
+    output.extend_from_slice(&pushes);
+    output.extend_from_slice(b"\x1b[?1049l\x1b[?2026h");
+    output.extend_from_slice(&pushes);
+    for byte in &output {
+        t.feed(std::slice::from_ref(byte));
+    }
+    t.flush_sync();
+    t.feed(&pushes);
+    t.feed(b"\x1b[?u");
+    assert_eq!(replies(&mut t), ["\x1b[?1u"]);
+}
+
+#[test]
+fn the_kitty_keyboard_protocol_stays_on_past_a_watched_screen_switch() {
+    let mut t = kitty_term();
+    t.set_stop_pattern(Some("boom")).unwrap();
+    t.feed(b"line\r\n\x1b[?1049h");
+    t.feed(b"\x1b[>1u\x1b[?u");
+    assert_eq!(replies(&mut t), ["\x1b[?1u"]);
+    assert_eq!(t.key(Key::Escape, Mods::NONE).unwrap(), b"\x1b[27u");
+}
+
+#[test]
+fn ctrl_chords_without_a_character_use_the_kitty_form_when_asked() {
+    let ctrl = Mods {
+        ctrl: true,
+        ..Mods::NONE
+    };
+    let mut t = kitty_term();
+    assert_eq!(t.ctrl_key(' ', 0, ctrl), b"\0");
+    t.feed(b"\x1b[>1u");
+    assert_eq!(t.ctrl_key(' ', 0, ctrl), b"\x1b[32;5u");
+    assert_eq!(t.ctrl_key('/', 0x1f, ctrl), b"\x1b[47;5u");
+}
+
 #[test]
 fn device_queries_get_fixed_replies() {
     let mut t = term(80, 24);

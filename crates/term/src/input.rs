@@ -213,6 +213,17 @@ pub(crate) fn encode_char(ch: char, alt: bool, mode: TermMode) -> Vec<u8> {
     out
 }
 
+/// Bytes for a Ctrl chord whose control code has no character of its
+/// own on most layouts (Ctrl+Space, Ctrl+2, Ctrl+6, Ctrl+/): `legacy`, as
+/// xterm sends it, or with the kitty keyboard protocol `CSI u` for `key`,
+/// the key's own character.
+pub(crate) fn encode_ctrl(key: char, legacy: u8, mods: Mods, mode: TermMode) -> Vec<u8> {
+    if mode.contains(TermMode::DISAMBIGUATE_ESC_CODES) {
+        return csi_u(u32::from(key), mods.param());
+    }
+    vec![legacy]
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MouseButton {
     Left,
