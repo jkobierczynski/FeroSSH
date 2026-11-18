@@ -137,18 +137,29 @@ pub fn png_from_dib(dib: &[u8]) -> Result<Vec<u8>, String> {
         }
         _ => return Err("The clipboard image is compressed in a way FeroSSH cannot read.".into()),
     };
-    let palette_len = match bpp {
-        1 | 4 | 8 if colours_used == 0 => 1usize << bpp,
-        1 | 4 | 8 => (colours_used as usize).min(1 << bpp),
+    let palette = match bpp {
+        1 | 4 | 8 => {
+            let len = if colours_used == 0 {
+                1usize << bpp
+            } else {
+                (colours_used as usize).min(1 << bpp)
+            };
+            let table = dib.get(data..data + len * 4).ok_or_else(bad)?.to_vec();
+            data += len * 4;
+            table
+        }
         // A table is allowed at higher depths too (as a hint for
-        // palette displays); the pixels come after it.
-        _ => (colours_used as usize).min(256),
+        // palette displays) and may be any size; skip all of it, the
+        // pixels come after.
+        _ => {
+            data = (colours_used as usize)
+                .checked_mul(4)
+                .and_then(|n| data.checked_add(n))
+                .filter(|&end| end <= dib.len())
+                .ok_or_else(bad)?;
+            Vec::new()
+        }
     };
-    let palette = dib
-        .get(data..data + palette_len * 4)
-        .ok_or_else(bad)?
-        .to_vec();
-    data += palette_len * 4;
     if !matches!(bpp, 1 | 4 | 8 | 16 | 24 | 32) || (bpp == 16 && masks.is_none()) {
         return Err(format!(
             "FeroSSH cannot read {bpp}-bit clipboard images; copy it as a PNG or another depth."
@@ -409,6 +420,22 @@ mod tests {
         }
         let (_, _, _, raw) = decode(&png_from_dib(&d).unwrap_or_default());
         assert_eq!(raw, [0, 255, 0, 0]);
+    }
+
+    #[test]
+    fn a_colour_table_of_any_size_at_24_bits_is_skipped() {
+        // 257 black table entries, then a red pixel.
+        let mut d = dib(1, 1, 24, 0, &[0; 257 * 4], &[0, 0, 255, 0]);
+        if let Some(used) = d.get_mut(32..36) {
+            used.copy_from_slice(&257u32.to_le_bytes());
+        }
+        let (_, _, _, raw) = decode(&png_from_dib(&d).unwrap_or_default());
+        assert_eq!(raw, [0, 255, 0, 0]);
+        // A table that runs past the end is refused, not read as pixels.
+        if let Some(used) = d.get_mut(32..36) {
+            used.copy_from_slice(&u32::MAX.to_le_bytes());
+        }
+        assert!(png_from_dib(&d).is_err());
     }
 
     #[test]
