@@ -8995,7 +8995,12 @@ impl Window {
             let next_to = self.tmux.get(&g).and_then(|t| t.natives().first().copied());
             let actions = match (self.tmux.get_mut(&g), next_to) {
                 (Some(t), Some(n)) => t.start_agent(n, command, dir.as_deref()),
-                _ => Vec::new(),
+                // Still bringing its windows back.
+                _ => {
+                    return Some(Command::Notice(
+                        "tmux on this host is still starting; try again in a moment.".into(),
+                    ));
+                }
             };
             self.run_tmux(g, actions);
             return None;

@@ -877,12 +877,9 @@ fn real_tmux_agent_start_line_makes_the_session_then_adds_to_it() {
         let target = format!("=agents:{window}");
         let mut screen = String::new();
         // The keys can arrive before the shell's first prompt, which then
-        // lands in front of the output: `$ out-first`.
-        let shown = |screen: &str| {
-            screen
-                .lines()
-                .any(|l| l.trim().trim_start_matches("$ ").trim() == want)
-        };
+        // lands in front of the output (`$ out-first`, `# out-first`); the
+        // typed line itself ends differently.
+        let shown = |screen: &str| screen.lines().any(|l| l.trim_end().ends_with(want));
         for _ in 0..50 {
             screen = tmux_cmd(&server, &["capture-pane", "-p", "-t", &target]);
             if shown(&screen) {

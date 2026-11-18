@@ -239,15 +239,22 @@ struct PaneLine {
 }
 
 fn parse_pane_line(line: &[u8]) -> Option<PaneLine> {
-    let text = std::str::from_utf8(line).ok()?;
     // The agent option comes last, whole even if someone set it to a
-    // value with spaces (then it is not ours and is ignored); the tests'
-    // lines may leave it out.
-    let mut f: Vec<&str> = text.splitn(22, ' ').collect();
-    let agent = match f.len() {
-        22 => f.pop().and_then(agent_name_of_option),
+    // value with spaces or bytes that are not UTF-8 (then it is not ours
+    // and is ignored, and the pane still counts); the tests' lines may
+    // leave it out.
+    let mut parts: Vec<&[u8]> = line.splitn(22, |&b| b == b' ').collect();
+    let agent = match parts.len() {
+        22 => parts
+            .pop()
+            .and_then(|m| std::str::from_utf8(m).ok())
+            .and_then(agent_name_of_option),
         _ => None,
     };
+    let f: Vec<&str> = parts
+        .into_iter()
+        .map(|p| std::str::from_utf8(p).ok())
+        .collect::<Option<_>>()?;
     let [
         pane,
         window,
@@ -1392,6 +1399,7 @@ impl Tmux {
 
     fn remove_window(&mut self, ws: &mut Workspace, w: WindowId, out: &mut Vec<Action>) {
         self.windows.remove(&w);
+        self.agents.remove(&w);
         self.sent_sizes.remove(&w);
         self.sent_layouts.remove(&w);
         let gone: Vec<PaneId> = self
@@ -1569,17 +1577,26 @@ impl Tmux {
         if !self.active() || command.trim().is_empty() {
             return out;
         }
+        // A connection that never answers keeps only a few; the ones it
+        // accepted still finish.
+        if self.agents_waiting.len() >= 16 {
+            out.push(Action::Notice(
+                "tmux has not answered the last agent starts yet; try again in a moment.".into(),
+            ));
+            return out;
+        }
         self.agent_seq = self.agent_seq.wrapping_add(1);
         let n = self.agent_seq;
-        // A connection that never answers keeps only a few.
-        while self.agents_waiting.len() >= 16 {
-            self.agents_waiting.pop_first();
-        }
         self.agents_waiting
             .insert(n, (agent_name(command), command.trim().to_owned()));
         let split = Split::Agent(Placement::Tab { after: native }, n);
-        match dir.map(same_dir::tmux_cwd).filter(|c| !c.is_empty()) {
-            Some(cwd) => self.open_split(split, &cwd, &mut out),
+        match dir {
+            // The asking shell's directory, or tmux's default when it cannot
+            // be given to tmux: never another pane's.
+            Some(dir) => {
+                let cwd = same_dir::tmux_cwd(dir);
+                self.open_split(split, &cwd, &mut out);
+            }
             None => {
                 let p = self.pane_of(native);
                 self.open_here(p, split, &mut out);
@@ -2404,6 +2421,10 @@ mod tests {
         );
         line.push_str("$x");
         assert_eq!(parse_pane_line(line.as_bytes()).unwrap().agent, None);
+        // A marker that is not UTF-8 costs the agent name, not the pane.
+        let mut bytes = pane_line(3, 1, 80, 24, "b25f,80x24,0,0,3").into_bytes();
+        bytes.extend_from_slice(b" gem\xffini");
+        assert_eq!(parse_pane_line(&bytes).unwrap().agent, None);
     }
 
     #[test]
@@ -2438,7 +2459,7 @@ mod tests {
         assert_eq!(writes(&t.split(a0, Dir::Down)).len(), 1);
         let mut input = reply(10, &[]);
         input.extend(reply(11, &[]));
-        input.extend(reply(12, &["/tmp/it's".into()]));
+        input.extend(reply(12, &["/tmp/a\tb".into()]));
         assert_eq!(
             writes(&t.feed(&mut ws, &input)),
             ["new-window -d -P -F '#{window_id}'"]
