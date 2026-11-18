@@ -17239,10 +17239,13 @@ impl Window {
             // finished transfers meanwhile loses nothing.
             for (k, &j) in batch.jobs.iter().enumerate() {
                 let state = remote.and_then(|r| r.job_state(j));
-                if let Some(slot) = batch.results.get_mut(k)
-                    && slot.is_none()
-                    && state.is_none_or(ferossh_sftp::State::finished)
-                {
+                let Some(slot) = batch.results.get_mut(k) else {
+                    continue;
+                };
+                // Retried after it failed: wait for the new outcome.
+                if state.is_some_and(|s| !s.finished()) {
+                    *slot = None;
+                } else if slot.is_none() {
                     let landed = remote.and_then(|r| r.landed(j)).map(<[u8]>::to_vec);
                     let note = remote
                         .and_then(|r| r.jobs().iter().find(|x| x.id == j))
@@ -17270,8 +17273,8 @@ impl Window {
                     let _ = std::fs::remove_file(t);
                 }
             } else {
-                // A failed image stays for Retry in the queue; old ones are
-                // swept on a later paste.
+                // A failed image stays for Retry in the queue; old ones no
+                // transfer needs are swept on a later paste.
                 let host = batch
                     .queue
                     .rsplit_once(':')
@@ -17280,10 +17283,15 @@ impl Window {
                     .flatten()
                     .map(|n| format!(": {n}"))
                     .unwrap_or_else(|| ".".into());
-                failures.push(format!(
+                let text = format!(
                     "{missed} pasted file{} did not upload to {host}{reason}",
                     plural(missed)
-                ));
+                );
+                // Kept on the queue too, in case another dialog is open.
+                if let Some(r) = self.sftp.get_mut(&batch.queue) {
+                    r.notice = Some(format!("Path not typed: {text}"));
+                }
+                failures.push(text);
             }
             if landed.is_empty() {
                 continue;
@@ -18155,7 +18163,17 @@ fn paste_files(hwnd: HWND) {
                 None => return,
             },
         };
-        match png.and_then(|png| save_pasted_image(&png)) {
+        // Images an unfinished transfer still reads are never swept.
+        let needed = with_window(|w| {
+            w.sftp
+                .values()
+                .flat_map(Remote::jobs)
+                .filter(|j| !j.state.finished())
+                .map(|j| j.local.clone())
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+        match png.and_then(|png| save_pasted_image(&png, &needed)) {
             Ok(path) => (vec![path.clone()], vec![path]),
             Err(why) => {
                 dialog(hwnd, &why, MB_OK | MB_ICONINFORMATION);
@@ -18181,7 +18199,7 @@ fn paste_files(hwnd: HWND) {
 
 /// Saves a pasted image as a PNG in FeroSSH's temporary folder, under a
 /// name from the local time, for uploading.
-fn save_pasted_image(png: &[u8]) -> std::result::Result<PathBuf, String> {
+fn save_pasted_image(png: &[u8], needed: &[PathBuf]) -> std::result::Result<PathBuf, String> {
     let dir = std::env::temp_dir().join("FeroSSH-paste");
     std::fs::create_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
     // Images whose upload failed stay for Retry; after a day they go.
@@ -18194,7 +18212,7 @@ fn save_pasted_image(png: &[u8]) -> std::result::Result<PathBuf, String> {
                 .ok()
                 .and_then(|t| t.elapsed().ok())
                 .is_some_and(|age| age > day);
-            if old {
+            if old && !needed.contains(&e.path()) {
                 let _ = std::fs::remove_file(e.path());
             }
         }

@@ -1034,6 +1034,19 @@ impl Remote {
         }
     }
 
+    /// Whether an upload other than job `i` owns remote file `path`: it
+    /// is running or paused with that as its target, or (running) has
+    /// taken it as the numbered name to keep both.
+    fn claimed(&self, i: usize, path: &[u8]) -> bool {
+        self.jobs.iter().enumerate().any(|(k, other)| {
+            k != i
+                && other.kind == Kind::Upload
+                && matches!(other.state, State::Running | State::Paused)
+                && (*self.target_of(other) == *path
+                    || matches!(&other.run, Run::Up(u) if u.target == path))
+        })
+    }
+
     fn index(&self, id: JobId) -> Option<usize> {
         self.jobs.iter().position(|j| j.id == id)
     }
@@ -1367,14 +1380,7 @@ impl Remote {
             }
             // One upload at a time owns a target's part file: a second
             // save of the same edited file waits for the first.
-            if job.kind == Kind::Upload
-                && self.jobs.iter().enumerate().any(|(k, other)| {
-                    k != i
-                        && other.kind == Kind::Upload
-                        && self.target_of(other) == self.target_of(job)
-                        && matches!(other.state, State::Running | State::Paused)
-                })
-            {
+            if job.kind == Kind::Upload && self.claimed(i, &self.target_of(job)) {
                 continue;
             }
             if file {
@@ -1951,7 +1957,17 @@ impl Remote {
         }
     }
 
-    fn try_numbered(&mut self, i: usize, n: u32) {
+    fn try_numbered(&mut self, i: usize, mut n: u32) {
+        // A numbered name another upload has taken meanwhile is skipped,
+        // so two never write one part file.
+        while n <= MAX_NUMBERED
+            && self
+                .jobs
+                .get(i)
+                .is_some_and(|j| self.claimed(i, &remote_numbered(&j.remote, n)))
+        {
+            n += 1;
+        }
         if n > MAX_NUMBERED {
             return self.fail(i, "No free name to keep both.".into());
         }

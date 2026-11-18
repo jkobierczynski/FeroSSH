@@ -1426,3 +1426,30 @@ fn a_retried_paste_upload_still_keeps_both() {
     let dir = s.remote().join("paste");
     assert_eq!(fs::read_to_string(dir.join("shot.png")).unwrap(), "old");
 }
+
+#[test]
+fn a_numbered_name_another_upload_is_writing_is_skipped() {
+    let s = Scratch::new("into-home-numbered");
+    fs::create_dir_all(s.remote().join("paste")).unwrap();
+    fs::write(s.remote().join("paste/shot.png"), "old").unwrap();
+    fs::write(s.local().join("shot.png"), "new").unwrap();
+    fs::write(s.local().join("shot (2).png"), "named two").unwrap();
+    let (mut remote, mut fake) = connected(&s.remote());
+    remote.parallel = 4;
+    // Both start at once: the first must not pick the second's name.
+    let named = remote
+        .upload_into_home(&s.local().join("shot (2).png"), b"paste")
+        .unwrap();
+    let kept = remote
+        .upload_into_home(&s.local().join("shot.png"), b"paste")
+        .unwrap();
+    assert!(run(&mut remote, &mut fake));
+    assert_eq!(remote.landed(named), Some(&b"/paste/shot (2).png"[..]));
+    assert_eq!(remote.landed(kept), Some(&b"/paste/shot (3).png"[..]));
+    let dir = s.remote().join("paste");
+    assert_eq!(
+        fs::read_to_string(dir.join("shot (2).png")).unwrap(),
+        "named two"
+    );
+    assert_eq!(fs::read_to_string(dir.join("shot (3).png")).unwrap(), "new");
+}
