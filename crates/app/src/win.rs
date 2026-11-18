@@ -20345,9 +20345,10 @@ fn capture(hwnd: HWND, on: bool) {
 }
 
 /// Whether a quiet watch can see pane `p`'s work: a recording has no live
-/// output, and a remote desktop's updates are not terminal output.
+/// output, and a remote desktop's updates (or a closed one's nothing) are
+/// not terminal output.
 fn quiet_watchable(p: &Pane) -> bool {
-    !matches!(p.host, Host::Replay(_)) && p.desktop.is_none()
+    !matches!(p.host, Host::Replay(_) | Host::Desktop { .. }) && p.desktop.is_none()
 }
 
 #[cfg(test)]
