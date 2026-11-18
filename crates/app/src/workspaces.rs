@@ -420,6 +420,11 @@ impl Waiting {
         })
     }
 
+    /// Where waiting pane `pane` is to connect.
+    pub fn destination(&self, pane: PaneId) -> Option<&str> {
+        self.by_pane.get(&pane).map(|(_, dest, _)| dest.as_str())
+    }
+
     /// Forgets a pane that closed, as a waiting pane.
     pub fn forget(&mut self, pane: PaneId) {
         self.by_pane.remove(&pane);
@@ -441,10 +446,49 @@ impl Waiting {
     }
 }
 
+/// What is allowed when a workspace's `Script NAME` line is allowed: the
+/// line with the script's own lines, so a changed script asks again. One
+/// line of text that no other list of lines gives: their count, each line
+/// escaped, and an end mark the approvals file's trimming cannot reach.
+pub fn script_key(line: &str, lines: &[String]) -> String {
+    let mut key = format!("{line}\t{}", lines.len());
+    for l in lines {
+        key.push('\t');
+        for c in l.chars() {
+            match c {
+                '\\' => key.push_str("\\\\"),
+                '\t' => key.push_str("\\t"),
+                '\r' => key.push_str("\\r"),
+                '\n' => key.push_str("\\n"),
+                c => key.push(c),
+            }
+        }
+    }
+    key.push_str("\t.");
+    key
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::indexing_slicing)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_script_key_changes_with_any_change_to_the_script() {
+        let lines = |v: &[&str]| v.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>();
+        let key = |v: &[&str]| script_key("Script s", &lines(v));
+        let base = key(&["Line @type echo approved"]);
+        // An empty line added (Enter), or spaces, still differ once trimmed.
+        assert_ne!(base, key(&["Line @type echo approved", "Line"]));
+        assert_ne!(base, key(&["Line @type echo approved", ""]));
+        assert_ne!(base.trim(), key(&["Line @type echo approved "]).trim());
+        // Where one line ends and the next begins cannot be moved.
+        assert_ne!(key(&["a\tb", "c"]), key(&["a", "b\tc"]));
+        assert_ne!(key(&["a\\", "tb"]), key(&["a\tb"]));
+        // A key is one line of the approvals file.
+        assert!(!key(&["a\nb", "c\r"]).contains(['\n', '\r']));
+        assert_eq!(base, key(&["Line @type echo approved"]));
+    }
     use ferossh_config::workspace::Open;
 
     fn plain(open: Open) -> PaneSpec {

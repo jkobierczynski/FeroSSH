@@ -419,7 +419,11 @@ pub fn set_nodes(nodes: Vec<TreeNode>) {
     let Some(h) = handles() else {
         return;
     };
-    let keep = selected_host();
+    // The same kind too: a host and a workspace may share a name.
+    let keep = match selected_item() {
+        Some(Item::Host(h)) => Some((h.name, h.workspace)),
+        _ => None,
+    };
     let built = STATE.with(|s| {
         let mut s = s.try_borrow_mut().ok()?;
         let s = s.as_mut()?;
@@ -488,7 +492,10 @@ pub fn set_nodes(nodes: Vec<TreeNode>) {
     let mut host = |parent: HTREEITEM, t: &TreeHost, index: &mut usize| {
         let made = insert(parent, &t.label, false, *index);
         *index += 1;
-        if keep.as_deref() == Some(t.name.as_str()) {
+        if keep
+            .as_ref()
+            .is_some_and(|(n, w)| *n == t.name && *w == t.workspace)
+        {
             reselect = Some(made);
         }
     };
@@ -649,7 +656,9 @@ fn command(h: Handles, id: usize, code: u32) {
         ),
         (ID_NEW, BN_CLICKED) => emit(Event::Action(SideAction::New)),
         // A workspace is edited by saving the layout again.
-        (ID_EDIT, BN_CLICKED) if selected_workspace().is_some() => {}
+        (ID_EDIT, BN_CLICKED) if let Some(name) = selected_workspace() => {
+            emit(Event::Action(SideAction::EditWorkspace(name)));
+        }
         (ID_EDIT, BN_CLICKED) => emit(Event::Action(match selected_host() {
             Some(host) => SideAction::Edit(host),
             None => SideAction::New,
@@ -792,7 +801,9 @@ fn notify(h: Handles, lparam: LPARAM) -> LRESULT {
                 let vk = key.wVKey;
                 let ctrl = key_down(VK_CONTROL.0);
                 let action = match vk {
-                    v if v == VK_F2.0 && selected_workspace().is_some() => None,
+                    v if v == VK_F2.0 && selected_workspace().is_some() => {
+                        selected_workspace().map(SideAction::EditWorkspace)
+                    }
                     v if v == VK_F2.0 => Some(match selected_host() {
                         Some(host) => SideAction::Edit(host),
                         None => SideAction::New,
