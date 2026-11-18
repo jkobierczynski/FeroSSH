@@ -1024,6 +1024,29 @@ fn a_failed_chmod_leaves_the_original_in_place() {
 }
 
 #[test]
+fn a_file_named_like_another_files_part_file_survives_in_a_folder() {
+    let s = Scratch::new("partname");
+    let tree = s.remote().join("d");
+    fs::create_dir_all(&tree).unwrap();
+    let big = pattern(300_000);
+    let small: Vec<u8> = pattern(1_000).iter().map(|b| b ^ 0x55).collect();
+    // `a|` becomes `a_`, which downloads through `a_.part`.
+    fs::write(tree.join("a_.part"), &big).unwrap();
+    fs::write(tree.join("a|"), &small).unwrap();
+    let (mut remote, mut fake) = connected(&s.remote());
+    remote.parallel = 1;
+    let folder = remote.download(&entry(&remote, "d"), &s.local()).unwrap();
+    assert!(run(&mut remote, &mut fake));
+    assert!(remote.whole(folder));
+    let mut got: Vec<Vec<u8>> = fs::read_dir(s.local().join("d"))
+        .unwrap()
+        .map(|e| fs::read(e.unwrap().path()).unwrap())
+        .collect();
+    got.sort_by_key(Vec::len);
+    assert_eq!(got, vec![small, big]);
+}
+
+#[test]
 fn two_names_for_one_local_name_never_share_a_part_file() {
     let s = Scratch::new("collide");
     let one = pattern(300_000);

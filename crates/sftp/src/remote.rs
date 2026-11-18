@@ -2066,7 +2066,9 @@ impl Remote {
     }
 
     /// `dir/name` for folder job `i`, numbered (`name (2)`) when another
-    /// remote name already became the same local name.
+    /// remote name already became the same local name. A name's part file
+    /// counts too: `a_` (from `a|`) downloads through `a_.part`, so a file
+    /// really called `a_.part` must not land there.
     fn claim(&mut self, i: usize, dir: &Path, name: &str) -> Option<PathBuf> {
         let Some(Run::Fetch(f)) = self.jobs.get_mut(i).map(|j| &mut j.run) else {
             return Some(dir.join(name));
@@ -2074,8 +2076,11 @@ impl Remote {
         let key = |p: &Path| p.to_string_lossy().to_lowercase();
         let path = std::iter::once(dir.join(name))
             .chain((2..=MAX_NUMBERED).map(|n| dir.join(names::numbered(name, n))))
-            .find(|p| !f.claimed.contains(&key(p)))?;
+            .find(|p| {
+                !f.claimed.contains(&key(p)) && !f.claimed.contains(&key(&with_suffix(p, ".part")))
+            })?;
         f.claimed.insert(key(&path));
+        f.claimed.insert(key(&with_suffix(&path, ".part")));
         Some(path)
     }
 
