@@ -1047,7 +1047,8 @@ impl Remote {
                 || job.state == State::Done
                     && job.kind == Kind::Download
                     && job.parent.is_some()
-                    && !job.local.exists())
+                    // Where it was saved: a kept-both copy has its own name.
+                    && !job.dest.as_ref().unwrap_or(&job.local).exists())
         {
             job.state = if ready { State::Queued } else { State::Waiting };
             job.note = None;
@@ -2038,6 +2039,11 @@ impl Remote {
 
     fn scanned(&mut self, i: usize, dir: &[u8], local: &Path, entries: Vec<DirEntry>, last: bool) {
         for e in entries {
+            // Devices, sockets and pipes are not files to copy: they hold
+            // no name.
+            if !(e.attrs.is_dir() || e.attrs.is_symlink() || e.attrs.is_file()) {
+                continue;
+            }
             let Some(name) = names::local_name(&e.name) else {
                 if let Some(Run::Fetch(f)) = self.jobs.get_mut(i).map(|j| &mut j.run) {
                     f.names_skipped += 1;
@@ -2072,7 +2078,6 @@ impl Remote {
             } else if e.attrs.is_file() {
                 self.add_child(i, Kind::Download, remote, into, e.attrs.size);
             }
-            // Devices, sockets and pipes are not files to copy.
         }
         if last {
             if let Some(Run::Fetch(f)) = self.jobs.get_mut(i).map(|j| &mut j.run) {

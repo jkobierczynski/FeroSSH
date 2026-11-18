@@ -3658,10 +3658,9 @@ impl EscWatch {
 }
 
 /// Runs the window's messages for up to a tenth of a second, all but the
-/// keyboard and the mouse (the drop stays where it was let go): false on
-/// Escape, or when FeroSSH is closing.
+/// keyboard and the mouse (the drop stays where it was let go): false
+/// when FeroSSH is closing (Esc is [`EscWatch`]'s, whatever has focus).
 fn pump_while_waiting() -> bool {
-    use windows::Win32::UI::Input::KeyboardAndMouse::VK_ESCAPE;
     use windows::Win32::UI::WindowsAndMessaging::{
         DispatchMessageW, MsgWaitForMultipleObjects, PM_REMOVE, PeekMessageW, PostQuitMessage,
         QS_ALLINPUT, TranslateMessage, WM_KEYFIRST, WM_KEYLAST, WM_MOUSEFIRST, WM_MOUSELAST,
@@ -3672,13 +3671,14 @@ fn pump_while_waiting() -> bool {
     unsafe {
         MsgWaitForMultipleObjects(None, false, 100, QS_ALLINPUT);
         let mut msg = MSG::default();
-        while PeekMessageW(&mut msg, None, 0, 0, PM_REMOVE).as_bool() {
+        // Bounded: a message that posts itself again (output arriving
+        // faster than it is drawn) must not keep the wait from its checks.
+        let mut left = 256;
+        while left > 0 && PeekMessageW(&mut msg, None, 0, 0, PM_REMOVE).as_bool() {
+            left -= 1;
             let m = msg.message;
             if m == WM_QUIT {
                 PostQuitMessage(msg.wParam.0 as i32);
-                return false;
-            }
-            if m == WM_KEYDOWN && msg.wParam.0 == usize::from(VK_ESCAPE.0) {
                 return false;
             }
             let input = (WM_KEYFIRST..=WM_KEYLAST).contains(&m)
