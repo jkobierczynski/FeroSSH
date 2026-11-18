@@ -8608,6 +8608,16 @@ impl Window {
                     }
                     Output::Exited(code) => {
                         self.workspace_shell_gone(id);
+                        // A script typing into the shell is over with it,
+                        // and nothing waits for it: Enter starts a new shell.
+                        if let Some(run) = self.scripts.remove(&id) {
+                            self.snippet_next.remove(&id);
+                            self.workspace_after.remove(&id);
+                            self.arm_script_timer();
+                            if run.report {
+                                self.fail_run_row(id, "the shell exited".into());
+                            }
+                        }
                         self.stop_log(id);
                         if let Some(p) = self.panes.get_mut(&id) {
                             p.host = Host::Local {
