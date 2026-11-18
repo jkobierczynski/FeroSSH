@@ -3662,14 +3662,15 @@ impl EscWatch {
 /// when FeroSSH is closing (Esc is [`EscWatch`]'s, whatever has focus).
 fn pump_while_waiting() -> bool {
     use windows::Win32::UI::WindowsAndMessaging::{
-        DispatchMessageW, MsgWaitForMultipleObjects, PM_REMOVE, PeekMessageW, PostQuitMessage,
-        QS_ALLINPUT, TranslateMessage, WM_KEYFIRST, WM_KEYLAST, WM_MOUSEFIRST, WM_MOUSELAST,
-        WM_NCMOUSEMOVE, WM_NCXBUTTONDBLCLK, WM_QUIT,
+        DispatchMessageW, MWMO_INPUTAVAILABLE, MsgWaitForMultipleObjectsEx, PM_REMOVE,
+        PeekMessageW, PostQuitMessage, QS_ALLINPUT, TranslateMessage, WM_KEYFIRST, WM_KEYLAST,
+        WM_MOUSEFIRST, WM_MOUSELAST, WM_NCMOUSEMOVE, WM_NCXBUTTONDBLCLK, WM_QUIT,
     };
     // SAFETY: the thread's own message queue; each message is the one
     // just taken from it.
     unsafe {
-        MsgWaitForMultipleObjects(None, false, 100, QS_ALLINPUT);
+        // Returns at once while messages are left from a capped pass.
+        MsgWaitForMultipleObjectsEx(None, 100, QS_ALLINPUT, MWMO_INPUTAVAILABLE);
         let mut msg = MSG::default();
         // Bounded: a message that posts itself again (output arriving
         // faster than it is drawn) must not keep the wait from its checks.
