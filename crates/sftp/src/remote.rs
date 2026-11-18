@@ -127,6 +127,9 @@ pub struct Job {
     /// reconnect so the job goes on with its own part file, and cancel
     /// removes that one and no other job's.
     dest: Option<PathBuf>,
+    /// A folder download left something in it behind: a folder or link
+    /// it could not read, or a name it could not give a file.
+    missed: bool,
     run: Run,
     speed: Speed,
 }
@@ -831,6 +834,7 @@ impl Remote {
             put_back: None,
             generation: 0,
             dest: None,
+            missed: false,
             run: Run::Idle,
             speed: Speed::default(),
         });
@@ -899,6 +903,45 @@ impl Remote {
 
     fn index(&self, id: JobId) -> Option<usize> {
         self.jobs.iter().position(|j| j.id == id)
+    }
+
+    /// Job `id` is done and brought down everything: for a folder, every
+    /// file in it done and nothing in it left behind (unreadable, or a
+    /// name it could not give a file). A folder download otherwise counts
+    /// as done with a note saying what it missed. Links skipped by design
+    /// (leading out of the folder, or to a folder) do not count.
+    pub fn whole(&self, id: JobId) -> bool {
+        self.all_whole(&[id])
+    }
+
+    /// [`Self::whole`] for every job in `ids` (none: false), indexing the
+    /// list once however many there are.
+    pub fn all_whole(&self, ids: &[JobId]) -> bool {
+        let mut kids: HashMap<JobId, Vec<&Job>> = HashMap::new();
+        let mut by_id: HashMap<JobId, &Job> = HashMap::new();
+        for j in &self.jobs {
+            by_id.insert(j.id, j);
+            if let Some(p) = j.parent {
+                kids.entry(p).or_default().push(j);
+            }
+        }
+        let mut stack = Vec::with_capacity(ids.len());
+        for id in ids {
+            match by_id.get(id) {
+                Some(j) => stack.push(*j),
+                None => return false,
+            }
+        }
+        if stack.is_empty() {
+            return false;
+        }
+        while let Some(j) = stack.pop() {
+            if j.state != State::Done || j.missed {
+                return false;
+            }
+            stack.extend(kids.get(&j.id).into_iter().flatten());
+        }
+        true
     }
 
     fn children(&self, id: JobId) -> Vec<JobId> {
@@ -997,10 +1040,26 @@ impl Remote {
         }
         let ready = self.is_ready();
         if let Some(job) = self.jobs.iter_mut().find(|j| j.id == id)
-            && matches!(job.state, State::Failed | State::Cancelled | State::Skipped)
+            && (matches!(job.state, State::Failed | State::Cancelled | State::Skipped)
+                // A folder's file that came down but is gone from disk
+                // (its folder swept, say) comes down again with the rest:
+                // the folder is not done without it.
+                || job.state == State::Done
+                    && job.kind == Kind::Download
+                    && job.parent.is_some()
+                    // Where it was saved: a kept-both copy has its own name.
+                    && !job.dest.as_ref().unwrap_or(&job.local).exists())
         {
             job.state = if ready { State::Queued } else { State::Waiting };
             job.note = None;
+            // The folder it downloads into may have gone meanwhile (a
+            // drag's folder under %TEMP% is swept after a day): asked to
+            // try again, it comes back.
+            if matches!(job.kind, Kind::Download | Kind::FetchFolder)
+                && let Some(parent) = job.local.parent()
+            {
+                let _ = std::fs::create_dir_all(parent);
+            }
             // An edited file put back always replaces the original.
             job.choice = job.put_back.map(|_| Choice::Overwrite);
         }
@@ -1980,6 +2039,11 @@ impl Remote {
 
     fn scanned(&mut self, i: usize, dir: &[u8], local: &Path, entries: Vec<DirEntry>, last: bool) {
         for e in entries {
+            // Devices, sockets and pipes are not files to copy: they hold
+            // no name.
+            if !(e.attrs.is_dir() || e.attrs.is_symlink() || e.attrs.is_file()) {
+                continue;
+            }
             let Some(name) = names::local_name(&e.name) else {
                 if let Some(Run::Fetch(f)) = self.jobs.get_mut(i).map(|j| &mut j.run) {
                     f.names_skipped += 1;
@@ -1987,7 +2051,8 @@ impl Remote {
                 continue;
             };
             let remote = names::join(dir, &e.name);
-            let Some(into) = self.claim(i, local, &name) else {
+            // A folder has no part file; a link may lead to a file.
+            let Some(into) = self.claim(i, local, &name, !e.attrs.is_dir()) else {
                 if let Some(Run::Fetch(f)) = self.jobs.get_mut(i).map(|j| &mut j.run) {
                     f.names_skipped += 1;
                 }
@@ -2013,7 +2078,6 @@ impl Remote {
             } else if e.attrs.is_file() {
                 self.add_child(i, Kind::Download, remote, into, e.attrs.size);
             }
-            // Devices, sockets and pipes are not files to copy.
         }
         if last {
             if let Some(Run::Fetch(f)) = self.jobs.get_mut(i).map(|j| &mut j.run) {
@@ -2024,16 +2088,31 @@ impl Remote {
     }
 
     /// `dir/name` for folder job `i`, numbered (`name (2)`) when another
-    /// remote name already became the same local name.
-    fn claim(&mut self, i: usize, dir: &Path, name: &str) -> Option<PathBuf> {
+    /// remote name already became the same local name. A file's part file
+    /// counts too (`scratch`): `a_` (from `a|`) downloads through
+    /// `a_.part`, so nothing really called `a_.part` may land there, and a
+    /// numbered name leaves room for `.part`. A folder has no part file,
+    /// so `assets` and `assets.part` folders both keep their names.
+    fn claim(&mut self, i: usize, dir: &Path, name: &str, scratch: bool) -> Option<PathBuf> {
         let Some(Run::Fetch(f)) = self.jobs.get_mut(i).map(|j| &mut j.run) else {
             return Some(dir.join(name));
         };
         let key = |p: &Path| p.to_string_lossy().to_lowercase();
+        let max = if scratch {
+            MAX_NAME - ".part".len()
+        } else {
+            MAX_NAME
+        };
         let path = std::iter::once(dir.join(name))
-            .chain((2..=MAX_NUMBERED).map(|n| dir.join(names::numbered(name, n))))
-            .find(|p| !f.claimed.contains(&key(p)))?;
+            .chain((2..=MAX_NUMBERED).map(|n| dir.join(numbered_within(name, n, max))))
+            .find(|p| {
+                !f.claimed.contains(&key(p))
+                    && !(scratch && f.claimed.contains(&key(&with_suffix(p, ".part"))))
+            })?;
         f.claimed.insert(key(&path));
+        if scratch {
+            f.claimed.insert(key(&with_suffix(&path, ".part")));
+        }
         Some(path)
     }
 
@@ -2149,6 +2228,7 @@ impl Remote {
                 _ => (false, Vec::new()),
             };
             let unreadable = matches!(&job.run, Run::Fetch(f) if f.errors > 0);
+            let missed = unreadable || matches!(&job.run, Run::Fetch(f) if f.names_skipped > 0);
             let (mut done, mut size, mut count, mut failed, mut open) = (0, 0, 0, 0, 0);
             for c in self.jobs.iter().filter(|j| j.parent == Some(id)) {
                 done += c.done;
@@ -2175,6 +2255,7 @@ impl Remote {
                 job.state = State::Done;
             }
             job.note = Some(notes.join("; "));
+            job.missed = missed;
             job.run = Run::Idle;
         }
     }

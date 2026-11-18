@@ -9,6 +9,8 @@
 //! back as an [`Event`]. Files are dragged from one list to the other (or
 //! onto a folder in it), and dropped from Explorer onto the Remote list
 //! (the main window gets those, and asks [`drop_at`] where they landed).
+//! Remote files dragged off FeroSSH go on as an OLE drag, out to Explorer
+//! or wherever they are let go (see [`crate::drag_out`]).
 //! Keys work as in the other native tools: [`pre_translate`] passes
 //! Ctrl+Shift shortcuts on to the main window and gives Tab, Enter and
 //! Escape their dialog meaning.
@@ -57,13 +59,13 @@ use windows::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, BM_GETCHECK, BM_SETCHECK, BN_CLICKED, BS_AUTOCHECKBOX, BS_CHECKBOX, BS_PUSHBUTTON,
     BS_PUSHLIKE, CS_HREDRAW, CS_VREDRAW, CreatePopupMenu, CreateWindowExW, DefWindowProcW,
     DestroyMenu, EN_CHANGE, EN_SETFOCUS, ES_AUTOHSCROLL, GetClientRect, GetCursorPos, HMENU,
-    IDC_ARROW, IDC_HAND, IDC_NO, IDC_SIZENS, IDC_SIZEWE, IDCANCEL, IDOK, IsChild, IsDialogMessageW,
-    IsWindowVisible, LoadCursorW, MF_CHECKED, MF_GRAYED, MF_POPUP, MF_SEPARATOR, MF_STRING, MSG,
-    MoveWindow, RegisterClassW, SW_HIDE, SW_SHOWNA, SendMessageW, SetCursor, SetWindowTextW,
-    ShowWindow, TPM_NONOTIFY, TPM_RETURNCMD, TrackPopupMenu, WINDOW_EX_STYLE, WINDOW_STYLE,
-    WM_CAPTURECHANGED, WM_COMMAND, WM_CONTEXTMENU, WM_ERASEBKGND, WM_KEYDOWN, WM_LBUTTONDOWN,
-    WM_LBUTTONUP, WM_MOUSEMOVE, WM_NOTIFY, WM_PAINT, WM_SETCURSOR, WM_SYSCHAR, WM_SYSKEYDOWN,
-    WM_SYSKEYUP, WNDCLASSW, WS_BORDER, WS_CHILD, WS_CLIPCHILDREN, WS_CLIPSIBLINGS,
+    IDC_ARROW, IDC_HAND, IDC_NO, IDC_SIZENS, IDC_SIZEWE, IDC_WAIT, IDCANCEL, IDOK, IsChild,
+    IsDialogMessageW, IsWindowVisible, LoadCursorW, MF_CHECKED, MF_GRAYED, MF_POPUP, MF_SEPARATOR,
+    MF_STRING, MSG, MoveWindow, RegisterClassW, SW_HIDE, SW_SHOWNA, SendMessageW, SetCursor,
+    SetWindowTextW, ShowWindow, TPM_NONOTIFY, TPM_RETURNCMD, TrackPopupMenu, WINDOW_EX_STYLE,
+    WINDOW_STYLE, WM_CAPTURECHANGED, WM_COMMAND, WM_CONTEXTMENU, WM_ERASEBKGND, WM_KEYDOWN,
+    WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_NOTIFY, WM_PAINT, WM_SETCURSOR, WM_SYSCHAR,
+    WM_SYSKEYDOWN, WM_SYSKEYUP, WNDCLASSW, WS_BORDER, WS_CHILD, WS_CLIPCHILDREN, WS_CLIPSIBLINGS,
     WS_EX_CONTROLPARENT, WS_EX_TOPMOST, WS_POPUP, WS_TABSTOP, WS_VISIBLE, WindowFromPoint,
 };
 use windows::core::{PCWSTR, PWSTR, w};
@@ -136,6 +138,22 @@ pub enum Event {
     Download {
         keys: Vec<Vec<u8>>,
         into: PathBuf,
+    },
+    /// Download these entries of the listed remote folder into `into`
+    /// for files dragged out to Explorer; `ticket` follows them.
+    DragOut {
+        /// The queue and remote folder the drag started on: if the
+        /// Remote list moved since, nothing is downloaded.
+        queue: Option<String>,
+        dir: Vec<u8>,
+        keys: Vec<Vec<u8>>,
+        into: PathBuf,
+        ticket: crate::drag_out::Ticket,
+    },
+    /// Note in `ticket` how its downloads are getting on, or cancel them.
+    DragCheck {
+        ticket: crate::drag_out::Ticket,
+        cancel: bool,
     },
     /// Upload these local files and folders into remote folder `dir`.
     Upload {
@@ -383,6 +401,8 @@ struct State {
     deferred: Vec<Event>,
     /// A Sync go-back waiting for the Remote list to settle.
     going_back: Option<files::SyncBack>,
+    /// Files dragged out wait for their downloads: the line says so.
+    dropping: Option<String>,
 }
 
 /// Posted to the main window when events wait in `deferred`: it hands
@@ -776,6 +796,7 @@ pub fn create(main: HWND, handler: Handler, dpi: u32) -> windows::core::Result<(
                 in_view: false,
                 deferred: Vec::new(),
                 going_back: None,
+                dropping: None,
                 shown_host: None,
             });
         });
@@ -970,7 +991,9 @@ fn layout(h: &Handles) {
                 s.arrange,
                 s.queue_shown.len() as i32,
                 s.view.as_ref().is_some_and(|v| v.question.is_some()),
-                s.local_error.is_some() || s.view.as_ref().is_some_and(|v| v.status.is_some()),
+                s.dropping.is_some()
+                    || s.local_error.is_some()
+                    || s.view.as_ref().is_some_and(|v| v.status.is_some()),
                 s.naming.is_some(),
                 matches!(s.naming, Some(Naming::Bookmark(_))),
             )
@@ -1525,8 +1548,9 @@ pub fn set_view(view: View) {
 fn refresh_status(h: &Handles) {
     let Some((text, show)) = with(|s| {
         let t = s
-            .local_error
+            .dropping
             .clone()
+            .or_else(|| s.local_error.clone())
             .or_else(|| s.view.as_ref().and_then(|v| v.status.clone()).map(|v| v.0));
         let show = t.is_some();
         (t.unwrap_or_default(), show)
@@ -3347,9 +3371,23 @@ fn drag_move(h: &Handles, drag: Drag, x: i32, y: i32) {
         }
         Drag::Files { remote } => {
             let mut pt = POINT { x, y };
-            // SAFETY: plain conversions and cursor changes.
+            // SAFETY: a plain conversion.
             unsafe {
                 let _ = ClientToScreen(h.panel, &mut pt);
+            }
+            if remote && !ours(h, pt) {
+                // Off FeroSSH: on to Explorer, or wherever it is let go.
+                with(|s| s.drag = None);
+                light(None);
+                // SAFETY: we hold the capture while dragging.
+                unsafe {
+                    let _ = ReleaseCapture();
+                }
+                drag_out(h);
+                return;
+            }
+            // SAFETY: plain queries and cursor changes.
+            unsafe {
                 let target = target_at(h, pt).filter(|t| t.0 != remote);
                 let list = if remote { h.local.list } else { h.remote.list };
                 light(target.and_then(|t| t.1).map(|i| (list, i as i32)));
@@ -3366,6 +3404,294 @@ fn drag_move(h: &Handles, drag: Drag, x: i32, y: i32) {
             }
         }
     }
+}
+
+/// Screen point `pt` is on one of FeroSSH's own windows (the main window,
+/// this pane, a tooltip), not another program's in front of them.
+fn ours(h: &Handles, pt: POINT) -> bool {
+    use windows::Win32::UI::WindowsAndMessaging::{GA_ROOTOWNER, GetAncestor};
+    // SAFETY: plain queries.
+    unsafe {
+        let under = WindowFromPoint(pt);
+        !under.is_invalid() && GetAncestor(under, GA_ROOTOWNER) == GetAncestor(h.main, GA_ROOTOWNER)
+    }
+}
+
+/// The selected remote rows dragged off FeroSSH: an OLE drag of stand-ins
+/// in a fresh folder, downloaded for real when let go over a place that
+/// takes them (see [`crate::drag_out`]).
+fn drag_out(h: &Handles) {
+    use crate::drag_out;
+    let rows = picked(h, true);
+    let Some(dir) = remote_dir() else {
+        return;
+    };
+    if rows.is_empty() {
+        return;
+    }
+    let source = Source {
+        queue: shown_queue(),
+        dir,
+        keys: rows.iter().map(|r| r.key.clone()).collect(),
+    };
+    let folder = match drag_out::folder() {
+        Ok(f) => f,
+        Err(e) => {
+            local_problem(format!("Could not make a folder to drag from: {e}"));
+            return;
+        }
+    };
+    let entries: Vec<(Vec<u8>, bool)> = rows.iter().map(|r| (r.key.clone(), r.dir)).collect();
+    let stand = match drag_out::stand_ins(&folder, &entries) {
+        Ok(s) if !s.paths.is_empty() => s,
+        Ok(s) => {
+            drag_out::discard(&folder, &s.paths);
+            local_problem("Windows cannot hold files with these names.".into());
+            return;
+        }
+        Err(e) => {
+            // Some stand-ins may be made: only empty ones go.
+            let made = std::fs::read_dir(&folder)
+                .map(|d| {
+                    d.filter_map(|e| e.ok().map(|e| e.path()))
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            drag_out::discard(&folder, &made);
+            local_problem(format!("{}: {e}", folder.display()));
+            return;
+        }
+    };
+    let ticket = drag_out::Ticket::default();
+    let on_drop = {
+        let (h, folder, keys) = (*h, folder.clone(), stand.keys);
+        let ticket = ticket.clone();
+        ticket.borrow_mut().paths = stand.paths.clone();
+        Box::new(move |taken| let_go(&h, &source, &folder, keys, &ticket, taken))
+    };
+    let dragged = drag_out::drag(h.main, &stand.paths, on_drop);
+    let (dropped, queued) = {
+        let t = ticket.borrow();
+        (matches!(t.outcome, Some(Ok(()))), !t.jobs.is_empty())
+    };
+    // Downloads that were queued stay listed (Retry included), so their
+    // folder stays too, until a later drag sweeps it.
+    // Never remove_dir_all: a stand-in that was in the way (written to
+    // by another program) keeps what it holds.
+    if !dropped && !queued {
+        drag_out::discard(&folder, &stand.paths);
+    }
+    if let Err(e) = dragged {
+        local_problem(format!("Could not drag the files out: {}", e.message()));
+    } else if dropped && stand.left_out > 0 {
+        local_problem(format!(
+            "{} left out: Windows cannot hold their names next to the others.",
+            stand.left_out
+        ));
+    }
+}
+
+/// The drag out was let go (true lets the drop through). Over FeroSSH
+/// itself it does what the drag inside the pane would; over a place that
+/// `taken` the files, they are downloaded first.
+fn let_go(
+    h: &Handles,
+    source: &Source,
+    folder: &Path,
+    keys: Vec<Vec<u8>>,
+    ticket: &crate::drag_out::Ticket,
+    taken: bool,
+) -> bool {
+    let mut pt = POINT::default();
+    // SAFETY: a plain query.
+    unsafe {
+        let _ = GetCursorPos(&mut pt);
+    }
+    if ours(h, pt) {
+        if let Some((false, at)) = target_at(h, pt) {
+            let into = at
+                .and_then(|i| with(|s| s.local_shown.get(i).and_then(|r| r.local.clone())))
+                .flatten()
+                .or_else(|| with(|s| s.local.dir().map(PathBuf::from)).flatten());
+            // The files the drag started with, if the Remote list still
+            // shows their folder.
+            let same = shown_queue() == source.queue && remote_dir().as_ref() == Some(&source.dir);
+            match into {
+                // All of them: a name Windows cannot hold twice was left
+                // out of the stand-ins, not of a download into the list.
+                Some(into) if same => emit(Event::Download {
+                    keys: source.keys.clone(),
+                    into,
+                }),
+                Some(_) => local_problem(MOVED.into()),
+                None => local_problem("Choose a folder in the Local list to download into.".into()),
+            }
+        }
+        return false;
+    }
+    if !taken {
+        return false;
+    }
+    let paths = ticket.borrow().paths.clone();
+    // A stand-in still in the way (open in another program, say) would
+    // be what the target gets: no drop then.
+    if let Err(e) = crate::drag_out::remove_stand_ins(&paths) {
+        local_problem(format!("Could not make room for the download: {e}"));
+        return false;
+    }
+    emit(Event::DragOut {
+        queue: source.queue.clone(),
+        dir: source.dir.clone(),
+        keys,
+        into: folder.to_path_buf(),
+        ticket: ticket.clone(),
+    });
+    {
+        let mut t = ticket.borrow_mut();
+        if t.queue.is_none() && t.outcome.is_none() {
+            t.outcome = Some(Err("FeroSSH was busy: drag the files again.".into()));
+        }
+    }
+    wait_for_drop(h, ticket)
+}
+
+/// The Remote list a drag out started on.
+struct Source {
+    queue: Option<String>,
+    dir: Vec<u8>,
+    /// Every remote row selected.
+    keys: Vec<Vec<u8>>,
+}
+
+/// Why a drag out did nothing: the Remote list moved meanwhile.
+const MOVED: &str = "The Remote list moved to another folder: drag the files again.";
+
+/// Waits, running the window's messages, until the drop's downloads are
+/// done (true), one fails, or Escape cancels them.
+fn wait_for_drop(h: &Handles, ticket: &crate::drag_out::Ticket) -> bool {
+    use std::time::{Duration, Instant};
+    const CHECK: Duration = Duration::from_millis(100);
+    with(|s| s.dropping = Some("Downloading for the drop. Esc cancels it.".into()));
+    refresh_status(h);
+    // SAFETY: a plain cursor change.
+    unsafe {
+        if let Ok(c) = LoadCursorW(None, IDC_WAIT) {
+            SetCursor(Some(c));
+        }
+    }
+    let mut checked: Option<Instant> = None;
+    let mut esc = EscWatch::new();
+    let result = loop {
+        let outcome = ticket.borrow().outcome.clone();
+        match outcome {
+            Some(Ok(())) => {
+                // Each where the target was told it is.
+                let missing = ticket.borrow().paths.iter().any(|p| !p.exists());
+                if missing {
+                    break Err(Some(
+                        "A file for the drop went missing: drag the files again.".into(),
+                    ));
+                }
+                break Ok(());
+            }
+            Some(Err(e)) => break Err(Some(e)),
+            None => {}
+        }
+        if !pump_while_waiting() || esc.pressed() {
+            break Err(None);
+        }
+        if checked.is_none_or(|t| t.elapsed() >= CHECK) {
+            checked = Some(Instant::now());
+            emit(Event::DragCheck {
+                ticket: ticket.clone(),
+                cancel: false,
+            });
+        }
+    };
+    let ok = result.is_ok();
+    if !ok {
+        emit(Event::DragCheck {
+            ticket: ticket.clone(),
+            cancel: true,
+        });
+    }
+    with(|s| {
+        s.dropping = None;
+        if let Err(Some(e)) = result {
+            s.local_error = Some(e);
+        }
+    });
+    refresh_status(h);
+    ok
+}
+
+/// Esc pressed while a drop waits, whichever window has the keyboard
+/// (the drop's target may have it): a new press only, not one already
+/// held when the wait began.
+struct EscWatch {
+    held: bool,
+}
+
+impl EscWatch {
+    fn new() -> Self {
+        // The first read also clears the "pressed since" bit.
+        Self {
+            held: Self::read().0,
+        }
+    }
+
+    /// (down now, pressed since the last read)
+    fn read() -> (bool, bool) {
+        use windows::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, VK_ESCAPE};
+        // SAFETY: a plain query.
+        let s = unsafe { GetAsyncKeyState(i32::from(VK_ESCAPE.0)) };
+        (s < 0, s & 1 != 0)
+    }
+
+    fn pressed(&mut self) -> bool {
+        let (down, since) = Self::read();
+        let new = down && !self.held || since && !self.held;
+        // A key held from before counts once it has been let go.
+        self.held = down && self.held;
+        new
+    }
+}
+
+/// Runs the window's messages for up to a tenth of a second, all but the
+/// keyboard and the mouse (the drop stays where it was let go): false
+/// when FeroSSH is closing (Esc is [`EscWatch`]'s, whatever has focus).
+fn pump_while_waiting() -> bool {
+    use windows::Win32::UI::WindowsAndMessaging::{
+        DispatchMessageW, MWMO_INPUTAVAILABLE, MsgWaitForMultipleObjectsEx, PM_REMOVE,
+        PeekMessageW, PostQuitMessage, QS_ALLINPUT, TranslateMessage, WM_KEYFIRST, WM_KEYLAST,
+        WM_MOUSEFIRST, WM_MOUSELAST, WM_NCMOUSEMOVE, WM_NCXBUTTONDBLCLK, WM_QUIT,
+    };
+    // SAFETY: the thread's own message queue; each message is the one
+    // just taken from it.
+    unsafe {
+        // Returns at once while messages are left from a capped pass.
+        MsgWaitForMultipleObjectsEx(None, 100, QS_ALLINPUT, MWMO_INPUTAVAILABLE);
+        let mut msg = MSG::default();
+        // Bounded: a message that posts itself again (output arriving
+        // faster than it is drawn) must not keep the wait from its checks.
+        let mut left = 256;
+        while left > 0 && PeekMessageW(&mut msg, None, 0, 0, PM_REMOVE).as_bool() {
+            left -= 1;
+            let m = msg.message;
+            if m == WM_QUIT {
+                PostQuitMessage(msg.wParam.0 as i32);
+                return false;
+            }
+            let input = (WM_KEYFIRST..=WM_KEYLAST).contains(&m)
+                || (WM_MOUSEFIRST..=WM_MOUSELAST).contains(&m)
+                || (WM_NCMOUSEMOVE..=WM_NCXBUTTONDBLCLK).contains(&m);
+            if !input {
+                let _ = TranslateMessage(&msg);
+                DispatchMessageW(&msg);
+            }
+        }
+    }
+    true
 }
 
 /// Screen point `pt` in the main window but off this pane: where, in the

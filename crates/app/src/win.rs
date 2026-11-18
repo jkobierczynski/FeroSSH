@@ -15659,6 +15659,93 @@ impl Window {
                 }
                 None
             }
+            Event::DragOut {
+                queue,
+                dir,
+                keys,
+                into,
+                ticket,
+            } => {
+                let mut guard = ticket.borrow_mut();
+                let t = &mut *guard;
+                // Only while the pane still waits for it.
+                let waiting = t.outcome.is_none() && t.queue.is_none();
+                match key.as_ref().and_then(|k| Some((k, self.sftp.get_mut(k)?))) {
+                    _ if !waiting => {}
+                    // Only the files the drag offered: the Remote list may
+                    // have moved (Follow terminal) while it went on.
+                    Some((k, r)) if queue.as_ref() != Some(k) || r.listing.path != dir => {
+                        t.outcome = Some(Err(DRAG_MOVED.into()));
+                    }
+                    Some((_, r)) if files::entries_named(&r.listing, &keys).len() != keys.len() => {
+                        t.outcome = Some(Err(DRAG_MOVED.into()));
+                    }
+                    // Not connected: the jobs would only wait, and nobody
+                    // can reconnect while the drop waits.
+                    Some((_, r)) if !r.is_ready() => t.outcome = Some(Err(DRAG_LOST.into())),
+                    Some((k, r)) => {
+                        r.notice = None;
+                        for entry in files::entries_named(&r.listing, &keys) {
+                            match r.download(&entry, &into) {
+                                Ok(id) => t.jobs.push(id),
+                                Err(e) => {
+                                    t.outcome = Some(Err(e));
+                                    break;
+                                }
+                            }
+                        }
+                        t.queue = Some(k.clone());
+                        if t.jobs.is_empty() && t.outcome.is_none() {
+                            t.outcome = crate::drag_out::outcome([]);
+                        }
+                    }
+                    None => t.outcome = Some(Err(DRAG_GONE.into())),
+                }
+                None
+            }
+            Event::DragCheck { ticket, cancel } => {
+                let mut guard = ticket.borrow_mut();
+                let t = &mut *guard;
+                let remote = t.queue.as_ref().and_then(|q| self.sftp.get_mut(q));
+                match remote {
+                    Some(r) if cancel => {
+                        for &id in &t.jobs {
+                            r.cancel(id);
+                        }
+                    }
+                    Some(r) if t.outcome.is_none() => {
+                        t.outcome = if !r.is_ready() {
+                            Some(Err(DRAG_LOST.into()))
+                        } else if crate::drag_out::asking_under(r.jobs(), &t.jobs) {
+                            Some(Err(
+                                "Two files for the drop have the same name on Windows: \
+                                 the drop was cancelled."
+                                    .into(),
+                            ))
+                        } else {
+                            // Indexed once: a drop can hold thousands of files.
+                            let states: std::collections::HashMap<_, _> =
+                                r.jobs().iter().map(|j| (j.id, j.state)).collect();
+                            match crate::drag_out::outcome(
+                                t.jobs.iter().map(|id| states.get(id).copied()),
+                            ) {
+                                // A folder must have come down whole, not
+                                // done with a note of what it missed.
+                                Some(Ok(())) if !r.all_whole(&t.jobs) => {
+                                    Some(Err("Part of a folder could not be downloaded \
+                                              (the queue says what): the drop was cancelled."
+                                        .into()))
+                                }
+                                other => other,
+                            }
+                        };
+                    }
+                    Some(_) => {}
+                    None if t.outcome.is_none() => t.outcome = Some(Err(DRAG_GONE.into())),
+                    None => {}
+                }
+                None
+            }
             Event::Upload { paths, dir } => {
                 if let Some(key) = key {
                     self.upload_files(&key, &paths, &dir);
@@ -17121,6 +17208,17 @@ fn files_event(hwnd: HWND, event: files_panel::Event) {
         run_command(hwnd, command);
     }
 }
+
+/// Why files dragged out to Explorer were not dropped: their connection's
+/// file transfer closed.
+const DRAG_GONE: &str = "The file transfer for these files closed.";
+
+/// Why files dragged out were not dropped: the connection dropped.
+const DRAG_LOST: &str = "The connection dropped: the drop was cancelled.";
+
+/// Why files dragged out were not dropped: the Remote list moved to
+/// another folder or host while they were dragged.
+const DRAG_MOVED: &str = "The Remote list moved to another folder: drag the files again.";
 
 /// Opens a file downloaded for editing in an editor: the file type's
 /// Edit verb, else Notepad. Never its Open verb, which runs a script or

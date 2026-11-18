@@ -212,6 +212,12 @@ impl Edits {
 /// A fresh folder for one edit under `root`, and the edit folders there
 /// older than [`KEEP`] removed.
 pub fn edit_folder(root: &Path) -> std::io::Result<PathBuf> {
+    fresh_folder(root, KEEP)
+}
+
+/// A fresh folder under `root`, and the folders there older than `keep`
+/// removed.
+pub fn fresh_folder(root: &Path, keep: Duration) -> std::io::Result<PathBuf> {
     std::fs::create_dir_all(root)?;
     let now = SystemTime::now();
     if let Ok(rd) = std::fs::read_dir(root) {
@@ -221,7 +227,7 @@ pub fn edit_folder(root: &Path) -> std::io::Result<PathBuf> {
                 .and_then(|m| m.modified())
                 .ok()
                 .and_then(|t| now.duration_since(t).ok())
-                .is_some_and(|age| age > KEEP);
+                .is_some_and(|age| age > keep);
             if old && entry.file_type().is_ok_and(|t| t.is_dir()) {
                 let _ = std::fs::remove_dir_all(entry.path());
             }
@@ -239,7 +245,7 @@ pub fn edit_folder(root: &Path) -> std::io::Result<PathBuf> {
             Err(e) => return Err(e),
         }
     }
-    Err(std::io::Error::other("no free edit folder"))
+    Err(std::io::Error::other("no free folder"))
 }
 
 #[cfg(test)]

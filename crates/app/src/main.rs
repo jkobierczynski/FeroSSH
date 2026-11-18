@@ -74,6 +74,8 @@ mod scripts_panel;
 #[cfg_attr(not(windows), allow(dead_code))]
 mod copy_id;
 #[cfg_attr(not(windows), allow(dead_code))]
+mod drag_out;
+#[cfg_attr(not(windows), allow(dead_code))]
 mod edit_local;
 #[cfg_attr(not(windows), allow(dead_code))]
 mod files;
