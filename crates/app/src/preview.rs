@@ -39,15 +39,23 @@ impl Url {
     }
 
     /// The address to open here once the forward listens at `addr`
-    /// (`127.0.0.1:port`): the same scheme and path, and `localhost` kept
-    /// where the host printed it (cookies and sign-in callbacks are often
-    /// set for that name).
+    /// (`127.0.0.1:port`, `[::1]:port`): the same scheme and path. A
+    /// listener on 127.0.0.1 is opened as `localhost` where the host
+    /// printed that name (cookies and sign-in callbacks are often set for
+    /// it), and one on every interface on loopback; any other address is
+    /// opened as it is.
     pub fn local(&self, addr: &str) -> Option<String> {
-        let port = addr.rsplit(':').next()?.parse::<u16>().ok()?;
-        let host = if self.host == "localhost" {
-            "localhost"
-        } else {
-            "127.0.0.1"
+        use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+        let at: SocketAddr = addr.trim().parse().ok()?;
+        let port = at.port();
+        let named = self.host == "localhost";
+        let host = match at.ip() {
+            IpAddr::V4(ip) if ip == Ipv4Addr::LOCALHOST || ip.is_unspecified() => {
+                if named { "localhost" } else { "127.0.0.1" }.to_owned()
+            }
+            IpAddr::V4(ip) => ip.to_string(),
+            IpAddr::V6(ip) if ip.is_unspecified() => "[::1]".to_owned(),
+            IpAddr::V6(ip) => format!("[{ip}]"),
         };
         let scheme = if self.https { "https" } else { "http" };
         Some(format!("{scheme}://{host}:{port}{}", self.path))
@@ -143,9 +151,22 @@ pub fn parse(word: &str) -> Option<Url> {
     } else {
         String::new()
     };
-    // Punctuation that ends a sentence or closes a bracket around the
-    // address is not part of it.
-    while path.ends_with(['.', ',', ';', ':', '!', '?', ')', ']', '\'']) {
+    // Punctuation that ends a sentence is not part of it, nor a bracket
+    // or quote closing one around the address: a closing bracket only
+    // when the path opens none, a quote only when one came before the
+    // address.
+    let quoted = before.ends_with(['\'', '"']);
+    while let Some(last) = path.chars().next_back() {
+        let strip = match last {
+            '.' | ',' | ';' | ':' | '!' | '?' => true,
+            ')' => path.matches('(').count() < path.matches(')').count(),
+            ']' => path.matches('[').count() < path.matches(']').count(),
+            '\'' => quoted,
+            _ => false,
+        };
+        if !strip {
+            break;
+        }
         path.pop();
     }
     if path.len() > MAX_PATH {
@@ -417,6 +438,15 @@ mod tests {
             parse("'http://localhost:3000/'"),
             Some(url("localhost", 3000, "/"))
         );
+        // Brackets and quotes that belong to the path stay.
+        assert_eq!(
+            parse("http://localhost:3000/wiki/A_(b)"),
+            Some(url("localhost", 3000, "/wiki/A_(b)"))
+        );
+        assert_eq!(
+            parse("http://localhost:3000/it's"),
+            Some(url("localhost", 3000, "/it's"))
+        );
     }
 
     #[test]
@@ -446,6 +476,27 @@ mod tests {
             u.local("127.0.0.1:18888").as_deref(),
             Some("http://localhost:18888/lab?token=x")
         );
+        // An existing forward listening elsewhere is opened there.
+        assert_eq!(
+            u.local("[::1]:18000").as_deref(),
+            Some("http://[::1]:18000/lab?token=x")
+        );
+        assert_eq!(
+            u.local("127.0.0.2:18000").as_deref(),
+            Some("http://127.0.0.2:18000/lab?token=x")
+        );
+        assert_eq!(
+            u.local("0.0.0.0:18000").as_deref(),
+            Some("http://localhost:18000/lab?token=x")
+        );
+        assert_eq!(
+            parse("http://127.0.0.1:80/")
+                .unwrap()
+                .local("[::]:81")
+                .as_deref(),
+            Some("http://[::1]:81/")
+        );
+        assert_eq!(u.local("server port 80"), None);
         let u = parse("https://0.0.0.0:3000").unwrap();
         assert_eq!(u.target(), "127.0.0.1");
         assert_eq!(

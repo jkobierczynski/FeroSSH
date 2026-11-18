@@ -1271,7 +1271,9 @@ struct Window {
     /// Offer to forward and open web servers).
     previews: HashMap<PaneId, Preview>,
     /// Each pane's watch for web server addresses while previews are on.
-    preview_scans: HashMap<PaneId, crate::preview::Scanner>,
+    /// The connection each watch reads, so that one never runs on into
+    /// the next connection's output.
+    preview_scans: HashMap<PaneId, (ChannelId, crate::preview::Scanner)>,
     /// Ports forwarded or turned down from a bar, by connection: not
     /// offered again.
     preview_done: HashSet<(ChannelId, u16)>,
@@ -3891,6 +3893,7 @@ impl Window {
 
     /// Ends whatever the pane is connected to.
     fn end_host(&mut self, id: PaneId) {
+        self.forget_preview_scans(id);
         self.scripts.remove(&id);
         self.zmodem.remove(&id);
         self.retries.remove(&id);
@@ -6974,6 +6977,7 @@ impl Window {
                     self.scripts.remove(&id);
                     self.zmodem.remove(&id);
                     self.pending_desktops.remove(&id);
+                    self.forget_preview_scans(id);
                     self.tmux_lost(id);
                     // A pane that reconnects keeps writing the same log.
                     if !self.retries.get(&id).is_some_and(Retry::waiting) {
@@ -12048,15 +12052,23 @@ impl Window {
         if !self.settings.port_previews {
             return;
         }
-        let found = self.preview_scans.entry(id).or_default().feed(bytes);
+        let Some(connection) = self.pane_connection(id) else {
+            self.preview_scans.remove(&id);
+            return;
+        };
+        let scan = self
+            .preview_scans
+            .entry(id)
+            .or_insert_with(|| (connection, crate::preview::Scanner::default()));
+        if scan.0 != connection {
+            *scan = (connection, crate::preview::Scanner::default());
+        }
+        let found = scan.1.feed(bytes);
         if found.is_empty() {
             return;
         }
         let host_id = self.host_pane(id);
-        let (Some(connection), Some(Host::Ssh(s))) = (
-            self.pane_connection(id),
-            self.panes.get(&host_id).map(|p| &p.host),
-        ) else {
+        let Some(Host::Ssh(s)) = self.panes.get(&host_id).map(|p| &p.host) else {
             return;
         };
         if s.target.sftp_only || !self.workers.contains_key(&connection) {
@@ -12114,11 +12126,33 @@ impl Window {
     /// offered again on that connection.
     fn drop_preview(&mut self, id: PaneId, done: bool) -> Option<Preview> {
         let pv = self.previews.remove(&id)?;
-        if done {
-            self.preview_done.insert((pv.connection, pv.url.port));
-        }
         self.preview_moved(id);
+        if done {
+            let key = (pv.connection, pv.url.port);
+            self.preview_done.insert(key);
+            // Other panes' bars for the same port go too: it is offered
+            // once per connection.
+            let same: Vec<PaneId> = self
+                .previews
+                .iter()
+                .filter(|(_, o)| (o.connection, o.url.port) == key)
+                .map(|(id, _)| *id)
+                .collect();
+            for other in same {
+                self.previews.remove(&other);
+                self.preview_moved(other);
+            }
+        }
         Some(pv)
+    }
+
+    /// Pane `id`'s connection ended: its watch, and those of its tmux
+    /// panes, start afresh with the next one, so text cut off at the end
+    /// is not read with what comes next.
+    fn forget_preview_scans(&mut self, id: PaneId) {
+        let panes = &self.panes;
+        self.preview_scans
+            .retain(|p, _| *p != id && panes.get(p).and_then(Pane::gateway) != Some(id));
     }
 
     /// Fits each bar into its pane's top right corner and draws it; a bar
@@ -12259,6 +12293,14 @@ impl Window {
                 Some(FwdState::Failed(why)) => {
                     out.push(Command::Notice(format!(
                         "Port {} could not be forwarded to this PC: {why}",
+                        w.url.port
+                    )));
+                    false
+                }
+                Some(FwdState::Starting) if w.since.elapsed() >= PREVIEW_WAIT => {
+                    out.push(Command::Notice(format!(
+                        "The forward of port {} did not start listening on this PC, so the \
+                         browser was not opened. Tools > Port forwards shows it.",
                         w.url.port
                     )));
                     false
