@@ -15680,6 +15680,9 @@ impl Window {
                     Some((_, r)) if files::entries_named(&r.listing, &keys).len() != keys.len() => {
                         t.outcome = Some(Err(DRAG_MOVED.into()));
                     }
+                    // Not connected: the jobs would only wait, and nobody
+                    // can reconnect while the drop waits.
+                    Some((_, r)) if !r.is_ready() => t.outcome = Some(Err(DRAG_LOST.into())),
                     Some((k, r)) => {
                         r.notice = None;
                         for entry in files::entries_named(&r.listing, &keys) {
@@ -15711,7 +15714,9 @@ impl Window {
                         }
                     }
                     Some(r) if t.outcome.is_none() => {
-                        t.outcome = if crate::drag_out::asking_under(r.jobs(), &t.jobs) {
+                        t.outcome = if !r.is_ready() {
+                            Some(Err(DRAG_LOST.into()))
+                        } else if crate::drag_out::asking_under(r.jobs(), &t.jobs) {
                             Some(Err(
                                 "Two files for the drop have the same name on Windows: \
                                  the drop was cancelled."
@@ -17203,6 +17208,9 @@ fn files_event(hwnd: HWND, event: files_panel::Event) {
 /// Why files dragged out to Explorer were not dropped: their connection's
 /// file transfer closed.
 const DRAG_GONE: &str = "The file transfer for these files closed.";
+
+/// Why files dragged out were not dropped: the connection dropped.
+const DRAG_LOST: &str = "The connection dropped: the drop was cancelled.";
 
 /// Why files dragged out were not dropped: the Remote list moved to
 /// another folder or host while they were dragged.

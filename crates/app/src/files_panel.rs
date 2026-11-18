@@ -991,7 +991,9 @@ fn layout(h: &Handles) {
                 s.arrange,
                 s.queue_shown.len() as i32,
                 s.view.as_ref().is_some_and(|v| v.question.is_some()),
-                s.local_error.is_some() || s.view.as_ref().is_some_and(|v| v.status.is_some()),
+                s.dropping.is_some()
+                    || s.local_error.is_some()
+                    || s.view.as_ref().is_some_and(|v| v.status.is_some()),
                 s.naming.is_some(),
                 matches!(s.naming, Some(Naming::Bookmark(_))),
             )
@@ -3430,6 +3432,7 @@ fn drag_out(h: &Handles) {
     let source = Source {
         queue: shown_queue(),
         dir,
+        keys: rows.iter().map(|r| r.key.clone()).collect(),
     };
     let folder = match drag_out::folder() {
         Ok(f) => f,
@@ -3505,7 +3508,12 @@ fn let_go(
             // shows their folder.
             let same = shown_queue() == source.queue && remote_dir().as_ref() == Some(&source.dir);
             match into {
-                Some(into) if same => emit(Event::Download { keys, into }),
+                // All of them: a name Windows cannot hold twice was left
+                // out of the stand-ins, not of a download into the list.
+                Some(into) if same => emit(Event::Download {
+                    keys: source.keys.clone(),
+                    into,
+                }),
                 Some(_) => local_problem(MOVED.into()),
                 None => local_problem("Choose a folder in the Local list to download into.".into()),
             }
@@ -3516,7 +3524,12 @@ fn let_go(
         return false;
     }
     let paths = ticket.borrow().paths.clone();
-    crate::drag_out::remove_stand_ins(&paths);
+    // A stand-in still in the way (open in another program, say) would
+    // be what the target gets: no drop then.
+    if let Err(e) = crate::drag_out::remove_stand_ins(&paths) {
+        local_problem(format!("Could not make room for the download: {e}"));
+        return false;
+    }
     emit(Event::DragOut {
         queue: source.queue.clone(),
         dir: source.dir.clone(),
@@ -3537,6 +3550,8 @@ fn let_go(
 struct Source {
     queue: Option<String>,
     dir: Vec<u8>,
+    /// Every remote row selected.
+    keys: Vec<Vec<u8>>,
 }
 
 /// Why a drag out did nothing: the Remote list moved meanwhile.

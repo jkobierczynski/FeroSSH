@@ -75,19 +75,27 @@ pub fn stand_ins(folder: &Path, entries: &[(Vec<u8>, bool)]) -> std::io::Result<
 }
 
 /// Removes the stand-ins, so the downloads find nothing in their way.
-/// Only what is still empty: never anything with content.
-pub fn remove_stand_ins(paths: &[PathBuf]) {
+/// Only what is still empty: never anything with content, which is an
+/// error, as is one that cannot be removed.
+pub fn remove_stand_ins(paths: &[PathBuf]) -> std::io::Result<()> {
+    let mut first = Ok(());
     for p in paths {
-        match std::fs::symlink_metadata(p) {
-            Ok(m) if m.is_dir() => {
-                let _ = std::fs::remove_dir(p);
-            }
-            Ok(m) if m.is_file() && m.len() == 0 => {
-                let _ = std::fs::remove_file(p);
-            }
-            _ => {}
+        let done = match std::fs::symlink_metadata(p) {
+            Ok(m) if m.is_dir() => std::fs::remove_dir(p),
+            Ok(m) if m.is_file() && m.len() == 0 => std::fs::remove_file(p),
+            Ok(_) => Err(std::io::Error::other(format!(
+                "{} is no longer empty",
+                p.display()
+            ))),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(e),
+        };
+        if first.is_ok() {
+            first =
+                done.map_err(|e| std::io::Error::new(e.kind(), format!("{}: {e}", p.display())));
         }
     }
+    first
 }
 
 /// The downloads for one drag, shared by the file pane (which waits for
@@ -324,9 +332,9 @@ mod tests {
         assert_eq!(s.left_out, 2);
         assert_eq!(std::fs::metadata(&s.paths[0]).unwrap().len(), 0);
 
-        // A real download landed in one; the others go.
+        // Something landed in one: it stays, and says so; the others go.
         std::fs::write(&s.paths[2], b"data").unwrap();
-        remove_stand_ins(&s.paths);
+        assert!(remove_stand_ins(&s.paths).is_err());
         assert!(!s.paths[0].exists());
         assert!(!s.paths[1].exists());
         assert_eq!(std::fs::read(&s.paths[2]).unwrap(), b"data");
@@ -337,7 +345,7 @@ mod tests {
         let dir = Dir::new("full");
         let s = stand_ins(dir.path(), &[(b"d".to_vec(), true)]).unwrap();
         std::fs::write(s.paths[0].join("x"), b"x").unwrap();
-        remove_stand_ins(&s.paths);
+        assert!(remove_stand_ins(&s.paths).is_err());
         assert!(s.paths[0].join("x").exists());
     }
 

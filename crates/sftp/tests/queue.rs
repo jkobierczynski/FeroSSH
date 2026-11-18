@@ -157,9 +157,9 @@ impl Fake {
                 }
             }
             SftpOp::List { path }
-                if self
-                    .unlistable
-                    .is_some_and(|n| path.ends_with(n.as_bytes())) =>
+                if self.unlistable.is_some_and(|n| {
+                    path == n.as_bytes() || path.ends_with(format!("/{n}").as_bytes())
+                }) =>
             {
                 one(failed(sftp_code::PERMISSION_DENIED))
             }

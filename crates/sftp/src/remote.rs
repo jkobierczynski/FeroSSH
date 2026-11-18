@@ -127,8 +127,9 @@ pub struct Job {
     /// reconnect so the job goes on with its own part file, and cancel
     /// removes that one and no other job's.
     dest: Option<PathBuf>,
-    /// A folder download left a folder or link in it unreadable.
-    unreadable: bool,
+    /// A folder download left something in it behind: a folder or link
+    /// it could not read, or a name it could not give a file.
+    missed: bool,
     run: Run,
     speed: Speed,
 }
@@ -833,7 +834,7 @@ impl Remote {
             put_back: None,
             generation: 0,
             dest: None,
-            unreadable: false,
+            missed: false,
             run: Run::Idle,
             speed: Speed::default(),
         });
@@ -905,17 +906,33 @@ impl Remote {
     }
 
     /// Job `id` is done and brought down everything: for a folder, every
-    /// file in it done and no folder in it left unreadable. (A folder
-    /// download otherwise counts as done with a note saying what it
-    /// missed.)
+    /// file in it done and nothing in it left behind (unreadable, or a
+    /// name it could not give a file). A folder download otherwise counts
+    /// as done with a note saying what it missed. Links skipped by design
+    /// (leading out of the folder, or to a folder) do not count.
     pub fn whole(&self, id: JobId) -> bool {
-        let Some(job) = self.jobs.iter().find(|j| j.id == id) else {
-            return false;
-        };
-        if job.state != State::Done || job.unreadable {
+        // One pass to index the tree, then a walk down from `id`.
+        let mut kids: HashMap<JobId, Vec<&Job>> = HashMap::new();
+        let mut top = None;
+        for j in &self.jobs {
+            if j.id == id {
+                top = Some(j);
+            }
+            if let Some(p) = j.parent {
+                kids.entry(p).or_default().push(j);
+            }
+        }
+        let mut stack: Vec<&Job> = top.into_iter().collect();
+        if stack.is_empty() {
             return false;
         }
-        self.children(id).into_iter().all(|c| self.whole(c))
+        while let Some(j) = stack.pop() {
+            if j.state != State::Done || j.missed {
+                return false;
+            }
+            stack.extend(kids.get(&j.id).into_iter().flatten());
+        }
+        true
     }
 
     fn children(&self, id: JobId) -> Vec<JobId> {
@@ -2166,6 +2183,7 @@ impl Remote {
                 _ => (false, Vec::new()),
             };
             let unreadable = matches!(&job.run, Run::Fetch(f) if f.errors > 0);
+            let missed = unreadable || matches!(&job.run, Run::Fetch(f) if f.names_skipped > 0);
             let (mut done, mut size, mut count, mut failed, mut open) = (0, 0, 0, 0, 0);
             for c in self.jobs.iter().filter(|j| j.parent == Some(id)) {
                 done += c.done;
@@ -2192,7 +2210,7 @@ impl Remote {
                 job.state = State::Done;
             }
             job.note = Some(notes.join("; "));
-            job.unreadable = unreadable;
+            job.missed = missed;
             job.run = Run::Idle;
         }
     }
