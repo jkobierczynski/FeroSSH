@@ -419,7 +419,11 @@ pub fn set_nodes(nodes: Vec<TreeNode>) {
     let Some(h) = handles() else {
         return;
     };
-    let keep = selected_host();
+    // The same kind too: a host and a workspace may share a name.
+    let keep = match selected_item() {
+        Some(Item::Host(h)) => Some((h.name, h.workspace)),
+        _ => None,
+    };
     let built = STATE.with(|s| {
         let mut s = s.try_borrow_mut().ok()?;
         let s = s.as_mut()?;
@@ -488,7 +492,10 @@ pub fn set_nodes(nodes: Vec<TreeNode>) {
     let mut host = |parent: HTREEITEM, t: &TreeHost, index: &mut usize| {
         let made = insert(parent, &t.label, false, *index);
         *index += 1;
-        if keep.as_deref() == Some(t.name.as_str()) {
+        if keep
+            .as_ref()
+            .is_some_and(|(n, w)| *n == t.name && *w == t.workspace)
+        {
             reselect = Some(made);
         }
     };
