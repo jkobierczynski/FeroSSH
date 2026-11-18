@@ -14520,6 +14520,8 @@ impl Window {
                     for p in self.panes.values_mut() {
                         p.attention = false;
                     }
+                    // The icon goes, and with it any balloon still waiting.
+                    self.toasts_lost();
                     self.refresh_chrome();
                     return Some(Command::HideToast);
                 }
