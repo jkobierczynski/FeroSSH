@@ -6517,7 +6517,9 @@ impl Window {
                     if let Some(p) = self.panes.get_mut(&id) {
                         p.term.feed(&bytes);
                     }
-                    self.log(id, &bytes);
+                    // Local echo of the user's typing: logged, but not
+                    // work for the quiet watch.
+                    self.log_bytes(id, &bytes, false);
                 }
                 Effect::Output(bytes)
                     if matches!(self.panes.get(&id).map(|p| &p.host), Some(Host::Winrm(_))) =>
@@ -7847,13 +7849,18 @@ impl Window {
     }
 
     fn log(&mut self, id: PaneId, bytes: &[u8]) {
+        self.log_bytes(id, bytes, true);
+    }
+
+    /// [`Self::log`]; `live` when the host sent `bytes` (not local echo),
+    /// which the quiet watch counts as work.
+    fn log_bytes(&mut self, id: PaneId, bytes: &[u8], live: bool) {
         self.record(id, bytes);
         let Some(p) = self.panes.get_mut(&id) else {
             return;
         };
-        // Every live output passes here (not FeroSSH's own notices): the
-        // quiet watch counts it as work.
-        if let Some(w) = p.quiet.as_mut() {
+        // Every live output passes here (not FeroSSH's own notices).
+        if live && let Some(w) = p.quiet.as_mut() {
             w.output(Instant::now());
         }
         let Some(writer) = &mut p.log.writer else {
@@ -8895,14 +8902,17 @@ impl Window {
         if (front && visible) || !p.throttle.allow(now) {
             return badge;
         }
+        // Each balloon is paired with its pane in order: with too many
+        // waiting, this one keeps only its badge.
+        if self.toast_queue.len() >= MAX_TOAST_QUEUE {
+            return badge;
+        }
         let pane = p.label();
         let title = crate::attention::heading(what.as_deref(), &pane);
-        if self.toast_queue.len() >= MAX_TOAST_QUEUE {
-            self.toast_queue.pop_front();
-        }
         self.toast_queue.push_back(id);
         let waiting = self.panes.values().filter(|p| p.attention).count();
         self.queued.push(Command::Toast {
+            pane: id,
             title,
             body,
             waiting: match waiting {
@@ -8911,6 +8921,29 @@ impl Window {
             },
         });
         badge
+    }
+
+    /// Whether pane `id` still wants the user and is out of their sight,
+    /// so its queued Windows notification should go up.
+    fn still_wants(&self, id: PaneId) -> bool {
+        // SAFETY: plain query.
+        let front = unsafe { GetForegroundWindow() } == self.hwnd;
+        self.settings.notifications
+            && self.panes.get(&id).is_some_and(|p| p.attention)
+            && !(front && self.is_visible(id))
+    }
+
+    /// Pane `id`'s balloon did not go up: it is not waiting its turn.
+    fn toast_dropped(&mut self, id: PaneId) {
+        if let Some(i) = self.toast_queue.iter().rposition(|&p| p == id) {
+            self.toast_queue.remove(i);
+        }
+    }
+
+    /// Explorer made the taskbar anew: balloons asked for before are gone.
+    fn toasts_lost(&mut self) {
+        self.toast_queue.clear();
+        self.toast_pane = None;
     }
 
     /// Session > Notify when this pane goes quiet: on or off for pane `id`.
@@ -8975,27 +9008,33 @@ impl Window {
         }
     }
 
-    /// The user clicked a notification (or the icon) and FeroSSH came
-    /// forward: the pane the notification was about comes forward with
-    /// the keyboard. Clicked later from the notification centre, which
+    /// The pane a click on a notification (or the icon) is for: the one
+    /// on screen, or, clicked later from the notification centre, which
     /// does not say which one, or on the icon: a pane that still wants
-    /// the user.
-    fn on_toast_click(&mut self) -> Vec<Command> {
-        let wants = |w: &Self, id: PaneId| w.panes.get(&id).is_some_and(|p| p.attention);
-        let target = self
-            .toast_pane
-            .take()
-            .filter(|&id| wants(self, id))
-            .or_else(|| {
-                self.panes
-                    .iter()
-                    .find(|(_, p)| p.attention)
-                    .map(|(&id, _)| id)
-            });
-        if let Some(id) = target
-            && let Some(c) = self.live_action(Some(LiveAction::Show(id)))
-        {
-            self.queued.push(c);
+    /// the user. Decided before FeroSSH comes forward, which takes the
+    /// badge off the pane that has the keyboard.
+    fn toast_target(&self) -> Option<PaneId> {
+        let wants = |id: PaneId| self.panes.get(&id).is_some_and(|p| p.attention);
+        self.toast_pane.filter(|&id| wants(id)).or_else(|| {
+            self.panes
+                .iter()
+                .find(|(_, p)| p.attention)
+                .map(|(&id, _)| id)
+        })
+    }
+
+    /// The user clicked a notification and FeroSSH came forward: pane
+    /// `target` ([`Self::toast_target`]) comes forward with the keyboard.
+    fn on_toast_click(&mut self, target: Option<PaneId>) -> Vec<Command> {
+        if let Some(id) = target {
+            if self.toast_pane == Some(id) {
+                self.toast_pane = None;
+            }
+            if self.panes.contains_key(&id)
+                && let Some(c) = self.live_action(Some(LiveAction::Show(id)))
+            {
+                self.queued.push(c);
+            }
         }
         std::mem::take(&mut self.queued)
     }
@@ -13113,9 +13152,14 @@ impl Window {
 
     /// After tabs or panes changed: lay out, redraw, retitle.
     fn after_structure_change(&mut self) {
+        let looking = self.focused;
         if let Some(p) = self.panes.get_mut(&self.ws.focused()) {
             p.bell = false;
-            p.attention = false;
+            // Seen only while FeroSSH is in front: a layout change in the
+            // background (a tmux pane closing) leaves the badge.
+            if looking {
+                p.attention = false;
+            }
         }
         self.layout();
         self.update_title();
@@ -16509,6 +16553,8 @@ enum Command {
     Id(u32),
     /// A Windows notification about a pane ([`crate::toast`]).
     Toast {
+        /// The pane that wants the user.
+        pane: PaneId,
         title: String,
         body: String,
         waiting: String,
@@ -18632,10 +18678,19 @@ fn run_command(hwnd: HWND, command: Command) {
             }
         }
         Command::Toast {
+            pane,
             title,
             body,
             waiting,
-        } => crate::toast::show(hwnd, &title, &body, &waiting),
+        } => {
+            // Something that ran first (a clipboard question, say) may
+            // have brought the user to the pane meanwhile.
+            let shown = with_window(|w| w.still_wants(pane)).unwrap_or(false)
+                && crate::toast::show(hwnd, &title, &body, &waiting);
+            if !shown {
+                with_window(|w| w.toast_dropped(pane));
+            }
+        }
         Command::HideToast => crate::toast::hide(hwnd),
         Command::Bell => {
             let info = FLASHWINFO {
@@ -19763,8 +19818,11 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                     // The icon goes once FeroSSH is in front (WM_ACTIVATE);
                     // if Windows did not let it come forward, the icon and
                     // its pane stay for another click.
-                    crate::toast::Event::Clicked if bring_forward(hwnd) => {
-                        if let Some(commands) = with_window(Window::on_toast_click) {
+                    crate::toast::Event::Clicked => {
+                        let target = with_window(|w| w.toast_target()).flatten();
+                        if bring_forward(hwnd)
+                            && let Some(commands) = with_window(|w| w.on_toast_click(target))
+                        {
                             run_commands(hwnd, commands);
                         }
                     }
@@ -20050,6 +20108,7 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
             }
             // Explorer restarted: its notification area lost the icon.
             _ if msg == crate::toast::taskbar_created() => {
+                with_window(Window::toasts_lost);
                 crate::toast::restore(hwnd);
                 DefWindowProcW(hwnd, msg, wparam, lparam)
             }

@@ -85,9 +85,10 @@ fn data(hwnd: HWND) -> NOTIFYICONDATAW {
 }
 
 /// Shows a notification headed `title`, saying `body`; `waiting` is the
-/// icon's tooltip. Call it outside the window's state borrow: the shell
-/// may send the window messages meanwhile.
-pub fn show(hwnd: HWND, title: &str, body: &str, waiting: &str) {
+/// icon's tooltip. Whether the shell took it. Call it outside the
+/// window's state borrow: the shell may send the window messages
+/// meanwhile.
+pub fn show(hwnd: HWND, title: &str, body: &str, waiting: &str) -> bool {
     let mut d = data(hwnd);
     // SAFETY: our window; the class icon is the exe's, kept for the
     // window's lifetime.
@@ -104,9 +105,9 @@ pub fn show(hwnd: HWND, title: &str, body: &str, waiting: &str) {
     // SAFETY: `d` is filled in as documented and lives over the calls.
     unsafe {
         if SHOWN.get() && Shell_NotifyIconW(NIM_MODIFY, &d).as_bool() {
-            return;
+            return true;
         }
-        add(d);
+        add(d)
     }
 }
 
@@ -114,7 +115,7 @@ pub fn show(hwnd: HWND, title: &str, body: &str, waiting: &str) {
 ///
 /// # Safety
 /// `d` is filled in as documented.
-unsafe fn add(mut d: NOTIFYICONDATAW) {
+unsafe fn add(mut d: NOTIFYICONDATAW) -> bool {
     // SAFETY: as the caller promises.
     unsafe {
         let added = Shell_NotifyIconW(NIM_ADD, &d).as_bool();
@@ -125,6 +126,7 @@ unsafe fn add(mut d: NOTIFYICONDATAW) {
             };
             let _ = Shell_NotifyIconW(NIM_SETVERSION, &d);
         }
+        added
     }
 }
 
@@ -154,7 +156,9 @@ pub fn restore(hwnd: HWND) {
     d.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP | NIF_SHOWTIP;
     TIP.with_borrow(|t| fill(&mut d.szTip, t));
     // SAFETY: `d` is filled in as documented.
-    unsafe { add(d) };
+    unsafe {
+        add(d);
+    }
 }
 
 /// Takes the icon, and with it its notifications, away.
