@@ -9134,6 +9134,17 @@ impl Window {
     /// The quiet watches' tick: a pane whose stretch of output just ended
     /// asks for attention.
     fn on_quiet_timer(&mut self) -> Vec<Command> {
+        // A pane that reconnected as SFTP-only has no shell left to watch.
+        let mut dropped = false;
+        for p in self.panes.values_mut() {
+            if p.quiet.is_some() && !quiet_watchable(p) {
+                p.quiet = None;
+                dropped = true;
+            }
+        }
+        if dropped {
+            self.update_menu_checks();
+        }
         // Stops once the last watched pane closed.
         if !self.panes.values().any(|p| p.quiet.is_some()) {
             self.update_quiet_timer();
@@ -15244,7 +15255,11 @@ impl Window {
             (cmd::NOTIFY_BELL, self.settings.notifications),
             (
                 cmd::NOTIFY_QUIET,
-                self.settings.notifications && self.panes.get(&pane).is_some_and(quiet_watchable),
+                // A watch can always be taken off; a new one needs
+                // notifications on and a shell to watch.
+                self.panes.get(&pane).is_some_and(|p| {
+                    p.quiet.is_some() || (self.settings.notifications && quiet_watchable(p))
+                }),
             ),
         ];
         for i in 0..4 {

@@ -56,6 +56,9 @@ struct Parts {
 struct Text {
     plain: Vec<u8>,
     base64: Vec<u8>,
+    /// Base64 characters of the current encoding, all of them (the ones
+    /// past the cap too), modulo four: where its padding has to fall.
+    group: usize,
 }
 
 impl Text {
@@ -77,9 +80,10 @@ impl Text {
                 return None;
             }
             // Padding fills the last group of four exactly.
-            if pad > 0 && (self.base64.len() + data) % 4 + pad != 4 {
+            if pad > 0 && (self.group + data) % 4 + pad != 4 {
                 return None;
             }
+            self.group = (self.group + data) % 4;
             let room = MAX_PART_BYTES.saturating_sub(self.base64.len());
             self.base64
                 .extend(chunk.iter().filter(|&&c| c != b'=').take(room));
@@ -97,6 +101,7 @@ impl Text {
 
     /// Decodes the base64 kept so far.
     fn flush(&mut self) -> Option<()> {
+        self.group = 0;
         if !self.base64.is_empty() {
             let decoded = decode_base64(&self.base64)?;
             self.base64.clear();
@@ -353,6 +358,22 @@ mod tests {
         assert_eq!(parse(b"99;i=z:e=1;SGk===", &mut k), None);
         // One `=` too many for its group.
         assert_eq!(parse(b"99;i=z:e=1;SGk==", &mut k), None);
+    }
+
+    #[test]
+    fn kitty_padding_counts_base64_past_the_cap() {
+        // The cap keeps a whole number of groups; the one extra `A` past
+        // it still decides where the padding falls.
+        let mut t = Text::default();
+        let full = vec![b'Q'; MAX_PART_BYTES + 1];
+        assert_eq!(t.push(&full, true), Some(()));
+        assert_eq!(t.base64.len(), MAX_PART_BYTES);
+        assert_eq!(t.push(b"AA=", true), Some(()));
+        assert!(t.base64.is_empty());
+        // And a stray `=` is still refused after it.
+        let mut t = Text::default();
+        assert_eq!(t.push(&full, true), Some(()));
+        assert_eq!(t.push(b"AA==", true), None);
     }
 
     #[test]

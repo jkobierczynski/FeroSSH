@@ -744,7 +744,9 @@ impl Terminal {
         self.term.scroll_display(Scroll::Delta(want - offset));
     }
 
-    /// What the host's output asked the UI to do, in order.
+    /// What the host's output asked the UI to do: the parser's requests in
+    /// order, then the last working directory, then the notifications in
+    /// order (these two are independent, so they need no shared order).
     pub fn take_actions(&mut self) -> Vec<Action> {
         let events = std::mem::take(&mut *self.events.0.borrow_mut());
         let mut actions: Vec<Action> = events.into_iter().filter_map(|e| self.action(e)).collect();
