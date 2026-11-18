@@ -876,13 +876,20 @@ fn real_tmux_agent_start_line_makes_the_session_then_adds_to_it() {
     for (window, want) in [("0", "out-first"), ("1", "out-second agent")] {
         let target = format!("=agents:{window}");
         let mut screen = String::new();
+        // The keys can arrive before the shell's first prompt, which then
+        // lands in front of the output: `$ out-first`.
+        let shown = |screen: &str| {
+            screen
+                .lines()
+                .any(|l| l.trim().trim_start_matches("$ ").trim() == want)
+        };
         for _ in 0..50 {
             screen = tmux_cmd(&server, &["capture-pane", "-p", "-t", &target]);
-            if screen.lines().any(|l| l.trim() == want) {
+            if shown(&screen) {
                 break;
             }
             std::thread::sleep(std::time::Duration::from_millis(100));
         }
-        assert!(screen.lines().any(|l| l.trim() == want), "{screen}");
+        assert!(shown(&screen), "{screen}");
     }
 }
