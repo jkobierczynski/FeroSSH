@@ -157,6 +157,9 @@ pub(crate) fn encode_key(
         Key::Delete => tilde(3),
         Key::PageUp => tilde(5),
         Key::PageDown => tilde(6),
+        // The kitty protocol sends F3 as CSI 13 ~: CSI 1 ; m R reads as a
+        // cursor position report.
+        Key::F(3) if mode.contains(TermMode::DISAMBIGUATE_ESC_CODES) => tilde(13),
         Key::F(n @ 1..=4) => letter(char::from(b'P' + n - 1), true),
         Key::F(n @ 5..=12) => {
             const CODES: [u8; 8] = [15, 17, 18, 19, 20, 21, 23, 24];

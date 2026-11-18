@@ -345,6 +345,11 @@ impl Terminal {
             return;
         }
         if keys.kitty != self.keys.kitty {
+            // Pushes held back by a synchronized update count already, so
+            // they go in before the stacks are emptied.
+            if self.sync_deadline().is_some() {
+                self.flush_sync();
+            }
             // Turning the protocol on or off empties both stacks.
             self.pushes.depth = 0;
         }

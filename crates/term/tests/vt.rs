@@ -229,6 +229,9 @@ fn the_kitty_keyboard_protocol_is_there_only_when_allowed() {
     assert_eq!(t.key(Key::Enter, shift).unwrap(), b"\x1b[13;2u");
     assert_eq!(t.text('\x03', false), b"\x1b[99;5u");
     assert_eq!(t.text('x', false), b"x");
+    assert_eq!(t.key(Key::F(3), Mods::NONE).unwrap(), b"\x1b[13~");
+    assert_eq!(t.key(Key::F(3), shift).unwrap(), b"\x1b[13;2~");
+    assert_eq!(t.key(Key::F(1), Mods::NONE).unwrap(), b"\x1bOP");
     // The program pops it when it exits: xterm's keys again.
     t.feed(b"\x1b[<u");
     assert_eq!(t.key(Key::Escape, Mods::NONE).unwrap(), b"\x1b");
@@ -278,6 +281,18 @@ fn thousands_of_kitty_keyboard_pushes_do_not_crash() {
     }
     t.flush_sync();
     t.feed(&pushes);
+    // Turned off and on with pushes held back by a synchronized update:
+    // they go in before the count starts again.
+    t.feed(b"\x1b[?2026h");
+    t.feed(&pushes[..pushes.len() / 2]);
+    t.set_keys(KeyOptions::default());
+    t.set_keys(KeyOptions {
+        kitty: true,
+        shift_enter: ShiftEnter::Enter,
+    });
+    t.feed(b"\x1b[?2026h");
+    t.feed(&pushes);
+    t.flush_sync();
     t.feed(b"\x1b[?u");
     assert_eq!(replies(&mut t), ["\x1b[?1u"]);
 }
