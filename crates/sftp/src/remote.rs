@@ -133,6 +133,9 @@ pub struct Job {
     /// A folder under the home folder an upload makes, with its parents,
     /// before it starts: the folder [`Remote::upload_into_home`] was given.
     make: Option<Vec<u8>>,
+    /// The numbered name an upload took to keep both; it stays the job's
+    /// (with its part file) while paused, until it picks a name again.
+    taken: Option<Vec<u8>>,
     /// Where an upload ended up once done: its target, or the numbered
     /// name it took to keep both.
     pub landed: Option<Vec<u8>>,
@@ -864,6 +867,7 @@ impl Remote {
             dest: None,
             missed: false,
             make: None,
+            taken: None,
             landed: None,
             run: Run::Idle,
             speed: Speed::default(),
@@ -1035,15 +1039,14 @@ impl Remote {
     }
 
     /// Whether an upload other than job `i` owns remote file `path`: it
-    /// is running or paused with that as its target, or (running) has
-    /// taken it as the numbered name to keep both.
+    /// is running or paused with that as its target, or has taken it as
+    /// the numbered name to keep both.
     fn claimed(&self, i: usize, path: &[u8]) -> bool {
         self.jobs.iter().enumerate().any(|(k, other)| {
             k != i
                 && other.kind == Kind::Upload
                 && matches!(other.state, State::Running | State::Paused)
-                && (*self.target_of(other) == *path
-                    || matches!(&other.run, Run::Up(u) if u.target == path))
+                && (*self.target_of(other) == *path || other.taken.as_deref() == Some(path))
         })
     }
 
@@ -1982,6 +1985,7 @@ impl Remote {
         };
         u.numbered = n;
         u.target = remote_numbered(&job.remote, n);
+        job.taken = Some(u.target.clone());
         let path = u.target.clone();
         self.job_request(
             i,

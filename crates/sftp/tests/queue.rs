@@ -1466,3 +1466,44 @@ fn a_pasted_file_steps_around_a_folder_of_its_name() {
     assert!(run(&mut remote, &mut fake));
     assert_eq!(remote.landed(id), Some(&b"/paste/shot (2).png"[..]));
 }
+
+#[test]
+fn a_paused_numbered_upload_keeps_its_name_from_a_file_called_that() {
+    let s = Scratch::new("into-home-paused");
+    fs::create_dir_all(s.remote().join("paste")).unwrap();
+    fs::write(s.remote().join("paste/shot.png"), "old").unwrap();
+    let big = pattern(4 << 20);
+    fs::write(s.local().join("shot.png"), &big).unwrap();
+    fs::write(s.local().join("shot (2).png"), "named two").unwrap();
+    let (mut remote, mut fake) = connected(&s.remote());
+    let kept = remote
+        .upload_into_home(&s.local().join("shot.png"), b"paste")
+        .unwrap();
+    // Step until it writes its numbered part file, then pause it.
+    let part = s.remote().join("paste/shot (2).png.filepart");
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while !part.exists() {
+        assert!(Instant::now() < deadline, "never started writing");
+        for msg in remote.take_outbox() {
+            if let Message::SftpRequest { channel, id, op } = msg {
+                for reply in fake.serve(op) {
+                    remote.on_message(Message::SftpReply { channel, id, reply });
+                }
+            }
+        }
+    }
+    remote.pause(kept);
+    assert_eq!(remote.job_state(kept), Some(State::Paused));
+    // A file named like the paused one's numbered name must wait.
+    let named = remote
+        .upload_into_home(&s.local().join("shot (2).png"), b"paste")
+        .unwrap();
+    assert!(run(&mut remote, &mut fake));
+    assert_eq!(remote.job_state(named), Some(State::Queued));
+    remote.resume(kept);
+    assert!(run(&mut remote, &mut fake));
+    assert_eq!(remote.landed(kept), Some(&b"/paste/shot (2).png"[..]));
+    assert_eq!(remote.landed(named), Some(&b"/paste/shot (2) (2).png"[..]));
+    let dir = s.remote().join("paste");
+    assert_eq!(fs::read(dir.join("shot (2).png")).unwrap(), big);
+}
