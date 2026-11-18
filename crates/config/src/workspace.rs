@@ -34,8 +34,11 @@
 //! where it differs from its host's, and `Focus` marks the tab's focused
 //! pane. `Tmux NAME` marks a pane as a window of tmux session `NAME` on
 //! its connection: the session's panes open as that session, attached
-//! again or, when it is gone, made again with these panes. `Active` is
-//! the tab shown first, counted from 1.
+//! again or, when it is gone, made again with these panes. `Script NAME`
+//! runs a script from the scripts folder in the pane once it is logged in
+//! (and in its directory), and `Command TEXT` types one line there and
+//! presses Enter; FeroSSH asks before the first time a workspace runs one
+//! (see [`commands`]). `Active` is the tab shown first, counted from 1.
 //!
 //! Unknown keywords are skipped, so a newer FeroSSH's workspace still
 //! opens here.
@@ -88,6 +91,10 @@ pub struct PaneSpec {
     pub font_size: Option<f32>,
     /// The tmux session on its connection that the pane is a window of.
     pub tmux: Option<String>,
+    /// A script from the scripts folder to run once the pane is logged in.
+    pub script: Option<String>,
+    /// A command to type once the pane is logged in (after the script).
+    pub command: Option<String>,
 }
 
 impl PaneSpec {
@@ -100,7 +107,14 @@ impl PaneSpec {
             font: None,
             font_size: None,
             tmux: None,
+            script: None,
+            command: None,
         }
+    }
+
+    /// Whether the pane runs something of its own once it opens.
+    pub fn runs(&self) -> bool {
+        self.script.is_some() || self.command.is_some()
     }
 }
 
@@ -239,6 +253,8 @@ fn write_layout(out: &mut String, l: &Layout, level: usize, focus: usize, index:
                 ("Theme", p.theme.as_deref()),
                 ("Font", p.font.as_deref()),
                 ("Tmux", p.tmux.as_deref()),
+                ("Script", p.script.as_deref()),
+                ("Command", p.command.as_deref()),
             ];
             for (key, value) in fields {
                 if let Some(v) = value.and_then(clean) {
@@ -340,7 +356,8 @@ pub fn parse(text: &str) -> Result<Workspace, String> {
                 };
                 tab.push(Item::Pane(PaneSpec::new(open), false));
             }
-            "directory" | "name" | "theme" | "font" | "fontsize" | "focus" | "tmux" => {
+            "directory" | "name" | "theme" | "font" | "fontsize" | "focus" | "tmux" | "script"
+            | "command" => {
                 let Some(Item::Pane(p, focus)) = tabs.last_mut().and_then(|t| t.last_mut()) else {
                     return Err(format!("Line {at}: {key} belongs right after a Pane."));
                 };
@@ -363,6 +380,8 @@ pub fn parse(text: &str) -> Result<Workspace, String> {
                             "name" => p.name = Some(v),
                             "theme" => p.theme = Some(v),
                             "tmux" => p.tmux = Some(v),
+                            "script" => p.script = Some(v),
+                            "command" => p.command = Some(v),
                             _ => p.font = Some(v),
                         }
                     }
@@ -428,6 +447,30 @@ fn build(
             })
         }
     }
+}
+
+/// What workspace `ws` runs by itself as it opens, one line each
+/// (`Script NAME` or `Command TEXT`), each once, in the order of its
+/// panes. A workspace file may come from anywhere, so FeroSSH asks before
+/// running a line it has not run before.
+pub fn commands(ws: &Workspace) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for tab in &ws.tabs {
+        for p in tab.root.panes() {
+            let lines = [
+                p.script.as_deref().map(|s| format!("Script {}", s.trim())),
+                p.command
+                    .as_deref()
+                    .map(|c| format!("Command {}", c.trim())),
+            ];
+            for line in lines.into_iter().flatten() {
+                if !out.contains(&line) {
+                    out.push(line);
+                }
+            }
+        }
+    }
+    out
 }
 
 /// Whether `ws` stays within the limits [`parse`] keeps, so it reads back.
@@ -567,6 +610,9 @@ mod tests {
         logs.font = Some("Cascadia Mono".into());
         logs.font_size = Some(11.5);
         logs.tmux = Some("main".into());
+        let mut db = PaneSpec::new(Open::Connection("admin@db1:2222".into()));
+        db.script = Some("Check disks".into());
+        db.command = Some("tail -f /var/log/syslog | grep -i error".into());
         Workspace {
             tabs: vec![
                 TabSpec {
@@ -577,7 +623,7 @@ mod tests {
                         second: Box::new(Layout::Split {
                             down: true,
                             ratio: 0.5,
-                            first: Box::new(pane(Open::Connection("admin@db1:2222".into()))),
+                            first: Box::new(Layout::Pane(db)),
                             second: Box::new(pane(Open::Local)),
                         }),
                     },
@@ -600,6 +646,25 @@ mod tests {
         assert!(text.contains("Split right 60"), "{text}");
         assert!(text.contains("Pane connection admin@db1:2222"), "{text}");
         assert!(text.contains("Active 2"), "{text}");
+        assert!(text.contains("Script Check disks\n"), "{text}");
+    }
+
+    #[test]
+    fn what_a_workspace_runs_is_listed_once() {
+        let mut ws = sample();
+        ws.tabs.push(ws.tabs[0].clone());
+        assert_eq!(
+            commands(&ws),
+            vec![
+                "Script Check disks".to_owned(),
+                "Command tail -f /var/log/syslog | grep -i error".to_owned(),
+            ]
+        );
+        ws.tabs.truncate(1);
+        ws.tabs[0].root = pane(Open::Local);
+        assert!(commands(&ws).is_empty());
+        // Only right after a pane.
+        assert!(parse("Tab\nCommand ls\nPane local\n").is_err());
     }
 
     #[test]
@@ -656,7 +721,7 @@ mod tests {
 
     #[test]
     fn unknown_keywords_are_skipped_and_ratios_clamped() {
-        let ws = parse("Tab\nScript later\nSplit down 99\nPane local\nColour red\nPane prompt\n")
+        let ws = parse("Tab\nStartup later\nSplit down 99\nPane local\nColour red\nPane prompt\n")
             .unwrap();
         let Layout::Split { down, ratio, .. } = &ws.tabs[0].root else {
             unreachable!("not a split");

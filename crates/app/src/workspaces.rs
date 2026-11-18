@@ -223,6 +223,26 @@ fn retain_tabs(
     (tabs, active)
 }
 
+/// Leaves out what `ws` runs as it opens (its scripts and commands):
+/// opened as asked without them.
+pub fn run_nothing(ws: &mut Workspace) {
+    fn clear(l: &mut Layout) {
+        match l {
+            Layout::Pane(p) => {
+                p.script = None;
+                p.command = None;
+            }
+            Layout::Split { first, second, .. } => {
+                clear(first);
+                clear(second);
+            }
+        }
+    }
+    for tab in &mut ws.tabs {
+        clear(&mut tab.root);
+    }
+}
+
 /// Takes the tmux sessions out of `ws`. A session's first pane (its
 /// lead) stays and opens the session; its other panes leave the
 /// workspace, as tmux shows them once attached. The plans, by session.
@@ -719,5 +739,28 @@ mod tests {
         assert!(!w.is_empty());
         assert_eq!(w.take(2).len(), 1);
         assert!(w.is_empty());
+    }
+
+    #[test]
+    fn a_workspace_can_open_without_running_anything() {
+        let mut p = PaneSpec::new(Open::Local);
+        p.script = Some("Deploy".into());
+        p.command = Some("htop".into());
+        let mut ws = Workspace {
+            tabs: vec![TabSpec {
+                root: Layout::Split {
+                    down: true,
+                    ratio: 0.5,
+                    first: Box::new(Layout::Pane(p.clone())),
+                    second: Box::new(Layout::Pane(p)),
+                },
+                focus: 0,
+            }],
+            active: 0,
+        };
+        assert_eq!(ferossh_config::workspace::commands(&ws).len(), 2);
+        run_nothing(&mut ws);
+        assert!(ferossh_config::workspace::commands(&ws).is_empty());
+        assert_eq!(ws.pane_count(), 2);
     }
 }

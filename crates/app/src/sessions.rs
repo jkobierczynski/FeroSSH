@@ -96,6 +96,8 @@ pub enum SideAction {
     OpenWorkspace(String),
     /// Remove this saved workspace (the window asks first).
     DeleteWorkspace(String),
+    /// Open this saved workspace's file in the text editor (F2).
+    EditWorkspace(String),
     /// Give the keyboard back to the terminal.
     Leave,
 }

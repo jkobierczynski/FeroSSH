@@ -792,7 +792,9 @@ fn notify(h: Handles, lparam: LPARAM) -> LRESULT {
                 let vk = key.wVKey;
                 let ctrl = key_down(VK_CONTROL.0);
                 let action = match vk {
-                    v if v == VK_F2.0 && selected_workspace().is_some() => None,
+                    v if v == VK_F2.0 && selected_workspace().is_some() => {
+                        selected_workspace().map(SideAction::EditWorkspace)
+                    }
                     v if v == VK_F2.0 => Some(match selected_host() {
                         Some(host) => SideAction::Edit(host),
                         None => SideAction::New,

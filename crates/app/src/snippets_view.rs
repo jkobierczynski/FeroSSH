@@ -65,7 +65,7 @@ pub const HEAD_HINTS: [&str; HEAD] = [
 /// [`ferossh_config::login::VARIABLES`]); a missing one is empty.
 pub type Vars = Vec<(&'static str, String)>;
 
-fn var(vars: &Vars, name: &str) -> String {
+pub fn var(vars: &Vars, name: &str) -> String {
     vars.iter()
         .find(|(k, _)| *k == name)
         .map(|(_, v)| v.clone())

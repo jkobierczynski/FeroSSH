@@ -679,6 +679,15 @@ pub struct Settings {
     /// F11 switches full screen (Settings > F11 switches full screen). On
     /// unless turned off; off, F11 goes to the terminal as before.
     pub full_screen_key: bool,
+    /// Panes a workspace opens keep their login passwords like a
+    /// connection set to the Windows Credential Manager (or the vault):
+    /// read from there, and saved there once typed and the login works
+    /// (Window > Workspaces > Log in automatically). Off unless turned on.
+    pub workspace_auto_login: bool,
+    /// The window's layout is kept when FeroSSH closes and opens again at
+    /// the next start (Window > Workspaces > Reopen the last layout at
+    /// start). Off unless turned on.
+    pub restore_layout: bool,
     /// Snippets with a `When` text answer the host by themselves. On
     /// unless turned off.
     pub auto_responses: bool,
@@ -782,6 +791,8 @@ impl Default for Settings {
             snippets: Vec::new(),
             confirm_production: true,
             full_screen_key: true,
+            workspace_auto_login: false,
+            restore_layout: false,
             auto_responses: true,
             run_parallel: None,
             tmux_keys: false,
@@ -1125,6 +1136,14 @@ impl Settings {
                 "confirmproduction" => {
                     block = Block::Top;
                     s.confirm_production = yes(&args).unwrap_or(true);
+                }
+                "workspaceautologin" => {
+                    block = Block::Top;
+                    s.workspace_auto_login = yes(&args).unwrap_or(false);
+                }
+                "restorelayout" => {
+                    block = Block::Top;
+                    s.restore_layout = yes(&args).unwrap_or(false);
                 }
                 "fullscreenkey" => {
                     block = Block::Top;
@@ -1562,6 +1581,12 @@ impl Settings {
         let _ = writeln!(out, "ConfirmProduction {}", flag(self.confirm_production));
         let _ = writeln!(out, "AutoResponses {}", flag(self.auto_responses));
         let _ = writeln!(out, "FullScreenKey {}", flag(self.full_screen_key));
+        if self.workspace_auto_login {
+            let _ = writeln!(out, "WorkspaceAutoLogin yes");
+        }
+        if self.restore_layout {
+            let _ = writeln!(out, "RestoreLayout yes");
+        }
         let _ = writeln!(out, "TmuxKeybindings {}", flag(self.tmux_keys));
         let _ = writeln!(out, "CommandSuggestions {}", flag(self.command_suggestions));
         let _ = writeln!(out, "Standby {}", flag(self.standby));
@@ -2444,6 +2469,20 @@ DesktopShareSelection yes
             ..Settings::default()
         };
         assert!(!Settings::parse(&s.to_text()).full_screen_key);
+    }
+
+    #[test]
+    fn workspace_login_and_last_layout_are_off_unless_turned_on() {
+        let s = Settings::parse("");
+        assert!(!s.workspace_auto_login && !s.restore_layout);
+        assert!(!Settings::default().to_text().contains("RestoreLayout"));
+        let s = Settings {
+            workspace_auto_login: true,
+            restore_layout: true,
+            ..Settings::default()
+        };
+        let back = Settings::parse(&s.to_text());
+        assert!(back.workspace_auto_login && back.restore_layout);
     }
 
     #[test]
