@@ -176,6 +176,9 @@ impl Fake {
                                 attrs: attrs_of(&m),
                             });
                         }
+                        // In name order, so tests that depend on which
+                        // name is claimed first are deterministic.
+                        entries.sort_by(|a, b| a.name.cmp(&b.name));
                         // Two chunks, as a server sends them.
                         let half = entries.len() / 2;
                         let rest = entries.split_off(half);
@@ -1030,7 +1033,8 @@ fn a_file_named_like_another_files_part_file_survives_in_a_folder() {
     fs::create_dir_all(&tree).unwrap();
     let big = pattern(300_000);
     let small: Vec<u8> = pattern(1_000).iter().map(|b| b ^ 0x55).collect();
-    // `a|` becomes `a_`, which downloads through `a_.part`.
+    // `a|` becomes `a_`, which downloads through `a_.part`. The fake lists
+    // in name order, so `a_.part` is claimed first: the order that collides.
     fs::write(tree.join("a_.part"), &big).unwrap();
     fs::write(tree.join("a|"), &small).unwrap();
     let (mut remote, mut fake) = connected(&s.remote());
@@ -1044,6 +1048,52 @@ fn a_file_named_like_another_files_part_file_survives_in_a_folder() {
         .collect();
     got.sort_by_key(Vec::len);
     assert_eq!(got, vec![small, big]);
+}
+
+#[test]
+fn folders_named_like_part_files_keep_their_names() {
+    let s = Scratch::new("partdirs");
+    let tree = s.remote().join("d");
+    fs::create_dir_all(tree.join("assets")).unwrap();
+    fs::create_dir_all(tree.join("assets.part")).unwrap();
+    fs::write(tree.join("assets/a"), b"a").unwrap();
+    fs::write(tree.join("assets.part/b"), b"b").unwrap();
+    let (mut remote, mut fake) = connected(&s.remote());
+    let folder = remote.download(&entry(&remote, "d"), &s.local()).unwrap();
+    assert!(run(&mut remote, &mut fake));
+    assert!(remote.whole(folder));
+    let d = s.local().join("d");
+    assert_eq!(fs::read(d.join("assets/a")).unwrap(), b"a");
+    assert_eq!(fs::read(d.join("assets.part/b")).unwrap(), b"b");
+}
+
+#[test]
+fn retrying_a_folder_brings_back_a_done_file_that_went_missing() {
+    let s = Scratch::new("retrygone");
+    let tree = s.remote().join("d");
+    fs::create_dir_all(&tree).unwrap();
+    let big = pattern(2_000_000);
+    fs::write(tree.join("x"), b"small").unwrap();
+    fs::write(tree.join("y"), &big).unwrap();
+    let (mut remote, mut fake) = connected(&s.remote());
+    remote.parallel = 1;
+    let folder = remote.download(&entry(&remote, "d"), &s.local()).unwrap();
+    fake.drop_after = Some(fake.answered + 30);
+    assert!(!run(&mut remote, &mut fake));
+    assert_eq!(fs::read(s.local().join("d/x")).unwrap(), b"small");
+    // `y` is gone when the connection is back: the folder fails.
+    fs::rename(tree.join("y"), s.remote().join("y")).unwrap();
+    remote.attach(CHANNEL + 1, 2);
+    assert!(run(&mut remote, &mut fake));
+    assert_eq!(remote.job_state(folder), Some(State::Failed));
+    // The download folder is swept; `y` is back; Retry brings both.
+    fs::remove_dir_all(s.local().join("d")).unwrap();
+    fs::rename(s.remote().join("y"), tree.join("y")).unwrap();
+    remote.retry(folder);
+    assert!(run(&mut remote, &mut fake));
+    assert!(remote.whole(folder));
+    assert_eq!(fs::read(s.local().join("d/x")).unwrap(), b"small");
+    assert_eq!(fs::read(s.local().join("d/y")).unwrap(), big);
 }
 
 #[test]

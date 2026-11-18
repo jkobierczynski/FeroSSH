@@ -911,18 +911,27 @@ impl Remote {
     /// as done with a note saying what it missed. Links skipped by design
     /// (leading out of the folder, or to a folder) do not count.
     pub fn whole(&self, id: JobId) -> bool {
-        // One pass to index the tree, then a walk down from `id`.
+        self.all_whole(&[id])
+    }
+
+    /// [`Self::whole`] for every job in `ids` (none: false), indexing the
+    /// list once however many there are.
+    pub fn all_whole(&self, ids: &[JobId]) -> bool {
         let mut kids: HashMap<JobId, Vec<&Job>> = HashMap::new();
-        let mut top = None;
+        let mut by_id: HashMap<JobId, &Job> = HashMap::new();
         for j in &self.jobs {
-            if j.id == id {
-                top = Some(j);
-            }
+            by_id.insert(j.id, j);
             if let Some(p) = j.parent {
                 kids.entry(p).or_default().push(j);
             }
         }
-        let mut stack: Vec<&Job> = top.into_iter().collect();
+        let mut stack = Vec::with_capacity(ids.len());
+        for id in ids {
+            match by_id.get(id) {
+                Some(j) => stack.push(*j),
+                None => return false,
+            }
+        }
         if stack.is_empty() {
             return false;
         }
@@ -1031,7 +1040,14 @@ impl Remote {
         }
         let ready = self.is_ready();
         if let Some(job) = self.jobs.iter_mut().find(|j| j.id == id)
-            && matches!(job.state, State::Failed | State::Cancelled | State::Skipped)
+            && (matches!(job.state, State::Failed | State::Cancelled | State::Skipped)
+                // A folder's file that came down but is gone from disk
+                // (its folder swept, say) comes down again with the rest:
+                // the folder is not done without it.
+                || job.state == State::Done
+                    && job.kind == Kind::Download
+                    && job.parent.is_some()
+                    && !job.local.exists())
         {
             job.state = if ready { State::Queued } else { State::Waiting };
             job.note = None;
@@ -2029,7 +2045,8 @@ impl Remote {
                 continue;
             };
             let remote = names::join(dir, &e.name);
-            let Some(into) = self.claim(i, local, &name) else {
+            // A folder has no part file; a link may lead to a file.
+            let Some(into) = self.claim(i, local, &name, !e.attrs.is_dir()) else {
                 if let Some(Run::Fetch(f)) = self.jobs.get_mut(i).map(|j| &mut j.run) {
                     f.names_skipped += 1;
                 }
@@ -2066,21 +2083,31 @@ impl Remote {
     }
 
     /// `dir/name` for folder job `i`, numbered (`name (2)`) when another
-    /// remote name already became the same local name. A name's part file
-    /// counts too: `a_` (from `a|`) downloads through `a_.part`, so a file
-    /// really called `a_.part` must not land there.
-    fn claim(&mut self, i: usize, dir: &Path, name: &str) -> Option<PathBuf> {
+    /// remote name already became the same local name. A file's part file
+    /// counts too (`scratch`): `a_` (from `a|`) downloads through
+    /// `a_.part`, so nothing really called `a_.part` may land there, and a
+    /// numbered name leaves room for `.part`. A folder has no part file,
+    /// so `assets` and `assets.part` folders both keep their names.
+    fn claim(&mut self, i: usize, dir: &Path, name: &str, scratch: bool) -> Option<PathBuf> {
         let Some(Run::Fetch(f)) = self.jobs.get_mut(i).map(|j| &mut j.run) else {
             return Some(dir.join(name));
         };
         let key = |p: &Path| p.to_string_lossy().to_lowercase();
+        let max = if scratch {
+            MAX_NAME - ".part".len()
+        } else {
+            MAX_NAME
+        };
         let path = std::iter::once(dir.join(name))
-            .chain((2..=MAX_NUMBERED).map(|n| dir.join(names::numbered(name, n))))
+            .chain((2..=MAX_NUMBERED).map(|n| dir.join(numbered_within(name, n, max))))
             .find(|p| {
-                !f.claimed.contains(&key(p)) && !f.claimed.contains(&key(&with_suffix(p, ".part")))
+                !f.claimed.contains(&key(p))
+                    && !(scratch && f.claimed.contains(&key(&with_suffix(p, ".part"))))
             })?;
         f.claimed.insert(key(&path));
-        f.claimed.insert(key(&with_suffix(&path, ".part")));
+        if scratch {
+            f.claimed.insert(key(&with_suffix(&path, ".part")));
+        }
         Some(path)
     }
 

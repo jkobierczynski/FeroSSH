@@ -15723,11 +15723,15 @@ impl Window {
                                     .into(),
                             ))
                         } else {
-                            match crate::drag_out::outcome(t.jobs.iter().map(|&id| r.job_state(id)))
-                            {
+                            // Indexed once: a drop can hold thousands of files.
+                            let states: std::collections::HashMap<_, _> =
+                                r.jobs().iter().map(|j| (j.id, j.state)).collect();
+                            match crate::drag_out::outcome(
+                                t.jobs.iter().map(|id| states.get(id).copied()),
+                            ) {
                                 // A folder must have come down whole, not
                                 // done with a note of what it missed.
-                                Some(Ok(())) if !t.jobs.iter().all(|&id| r.whole(id)) => {
+                                Some(Ok(())) if !r.all_whole(&t.jobs) => {
                                     Some(Err("Part of a folder could not be downloaded \
                                               (the queue says what): the drop was cancelled."
                                         .into()))

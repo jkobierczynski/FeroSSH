@@ -3580,6 +3580,7 @@ fn wait_for_drop(h: &Handles, ticket: &crate::drag_out::Ticket) -> bool {
         }
     }
     let mut checked: Option<Instant> = None;
+    let mut esc = EscWatch::new();
     let result = loop {
         let outcome = ticket.borrow().outcome.clone();
         match outcome {
@@ -3596,7 +3597,7 @@ fn wait_for_drop(h: &Handles, ticket: &crate::drag_out::Ticket) -> bool {
             Some(Err(e)) => break Err(Some(e)),
             None => {}
         }
-        if !pump_while_waiting() {
+        if !pump_while_waiting() || esc.pressed() {
             break Err(None);
         }
         if checked.is_none_or(|t| t.elapsed() >= CHECK) {
@@ -3622,6 +3623,38 @@ fn wait_for_drop(h: &Handles, ticket: &crate::drag_out::Ticket) -> bool {
     });
     refresh_status(h);
     ok
+}
+
+/// Esc pressed while a drop waits, whichever window has the keyboard
+/// (the drop's target may have it): a new press only, not one already
+/// held when the wait began.
+struct EscWatch {
+    held: bool,
+}
+
+impl EscWatch {
+    fn new() -> Self {
+        // The first read also clears the "pressed since" bit.
+        Self {
+            held: Self::read().0,
+        }
+    }
+
+    /// (down now, pressed since the last read)
+    fn read() -> (bool, bool) {
+        use windows::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, VK_ESCAPE};
+        // SAFETY: a plain query.
+        let s = unsafe { GetAsyncKeyState(i32::from(VK_ESCAPE.0)) };
+        (s < 0, s & 1 != 0)
+    }
+
+    fn pressed(&mut self) -> bool {
+        let (down, since) = Self::read();
+        let new = down && !self.held || since && !self.held;
+        // A key held from before counts once it has been let go.
+        self.held = down && self.held;
+        new
+    }
 }
 
 /// Runs the window's messages for up to a tenth of a second, all but the

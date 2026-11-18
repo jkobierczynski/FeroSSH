@@ -156,6 +156,9 @@ pub fn outcome(states: impl IntoIterator<Item = Option<State>>) -> Option<Result
 /// overwrite (two names the same on Windows): nobody can answer while
 /// the drop waits, so it is cancelled instead.
 pub fn asking_under(jobs: &[ferossh_sftp::Job], ours: &[JobId]) -> bool {
+    let ours: std::collections::HashSet<JobId> = ours.iter().copied().collect();
+    let parent: std::collections::HashMap<JobId, Option<JobId>> =
+        jobs.iter().map(|j| (j.id, j.parent)).collect();
     jobs.iter().filter(|j| j.state == State::Asking).any(|j| {
         let mut at = Some(j.id);
         // Bounded, in case of a loop.
@@ -166,7 +169,7 @@ pub fn asking_under(jobs: &[ferossh_sftp::Job], ours: &[JobId]) -> bool {
             if ours.contains(&id) {
                 return true;
             }
-            at = jobs.iter().find(|p| p.id == id).and_then(|p| p.parent);
+            at = parent.get(&id).copied().flatten();
         }
         false
     })
