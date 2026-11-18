@@ -51,6 +51,7 @@ FeroSSH reads `~/.ssh/config` and `~/.ssh/known_hosts` too, and writes only to `
 | `FollowDirectory no` | yes | Whether the file view follows the shell's `cd` (OSC 7). |
 | `ZModem yes` | no | Answers `rz` and `sz` in the terminal with ZMODEM (Session > ZMODEM: answer rz and sz). |
 | `UploadAndTypePath yes` | no | Pasting an image or copied files, or dropping files on a pane, uploads them to `~/.cache/ferossh/paste/` on its host and types their paths at the cursor (Session > Coding agents > Paste and drop files: upload and type the path). Off, drops upload to the shell's folder after asking. |
+| `PortPreviews yes` | no | A web server's address on the host in a pane's output (`http://localhost:5173/`) shows a bar offering to forward the port and open it in the browser (Session > Coding agents > Offer to forward and open web servers on the host). |
 | `Standby yes` | no | A global hotkey hides the FeroSSH window and brings it back (Window > Standby window). The first window that opens takes the hotkey. |
 | `StandbyHotkey Ctrl+Alt+Space` | `Win+Oem3` | The standby window's hotkey: Ctrl, Alt, Shift and Win joined by `+` to a key. Keys are letters, digits, `F1` to `F24`, `Space`, `Esc`, `Pause`, `ScrollLock`, `Num0` to `Num9`, the arrows and the like, and the punctuation keys by code (`Oem3` is the key below Esc on a US keyboard). |
 | `StandbyWindow notepad.exe` | this FeroSSH window | The program whose window the standby hotkey shows and hides, by file name (Window > Standby window > Window to show and hide). |

@@ -526,6 +526,14 @@ Files go to `~/.cache/ferossh/paste/` on the pane's host, made when needed; a na
 
 It works on panes logged in over SSH, including tmux panes; local shells, Telnet and serial panes have nowhere to upload to. It is off unless you turn it on: dropping on a pane then asks and uploads to the shell's folder, and pasting an image does nothing.
 
+### Opening a web server on the host
+
+Development servers and agents print where they listen, such as `http://localhost:5173/`, but that address is on the server, not on your PC. Tick Session > Coding agents > Offer to forward and open web servers on the host, and when a pane's output shows the address of a web server on the host itself (`http://` or `https://` with `localhost`, `127.0.0.1`, `0.0.0.0`, `[::1]` or `[::]` and a port), a small bar appears in the pane's top right corner: *localhost:5173 is listening on user@build-box.* **Forward and open**.
+
+Click **Forward and open** to forward a port on this PC's loopback to that port on the host (the same number when it is free here, else any free one) and open your browser on it, with the address's path, so `http://localhost:8888/lab?token=…` opens with its token. The forward is listed in Tools > Port forwards like any you add there: stop it there, and a reconnect starts it again. If the host already has a forward to that port, the browser opens on it. Click ✕ to turn the offer down. A port forwarded or turned down is not offered again on that connection; a bar nobody clicks goes after a minute, and comes back if the address is printed again.
+
+Nothing is forwarded without a click. Addresses inside links and window titles are not offered, nor other hosts' addresses. It works on panes logged in over SSH, including tmux panes. It is off unless you turn it on (`PortPreviews`).
+
 ## Remote desktops
 
 Session > Remote desktop > Open remote desktop (Ctrl+Shift+D) shows the Linux desktop (X11 or Wayland) of the host you are logged in to. The server needs an RDP server: xrdp (`sudo apt install xrdp`) or GNOME Remote Desktop. FeroSSH checks that something answers on the server's RDP port (3389, or `DesktopPort`), forwards a loopback port to it through SSH (33900 to 33999, the same for the same host each time) and opens Windows' Remote Desktop Connection there. The server's RDP port can stay closed on its firewall, and the tunnel closes with the connection.
