@@ -1338,6 +1338,9 @@ struct WorkspaceExtra {
     pending: bool,
     /// Log in automatically was on when the workspace opened.
     login: bool,
+    /// How many times its shell ended: a Production question answered
+    /// after a reconnect is for a shell that is gone.
+    shell: u64,
 }
 
 /// A workspace's tmux session, from opening until tmux shows its panes.
@@ -6813,8 +6816,12 @@ impl Window {
                     self.desktop_after_login(id);
                     self.release_workspace_panes(id, true);
                 }
-                Effect::Reconnect => self.schedule_reconnect(id),
+                Effect::Reconnect => {
+                    self.workspace_shell_gone(id);
+                    self.schedule_reconnect(id);
+                }
                 Effect::Ended => {
+                    self.workspace_shell_gone(id);
                     self.release_workspace_panes(id, false);
                     if !self.run_login.contains(&id)
                         && let Some(row) =
@@ -12727,7 +12734,7 @@ impl Window {
             .iter()
             .find(|s| s.name.eq_ignore_ascii_case(name.trim()))
         {
-            Some(s) => format!("{line}\t{}", s.lines.join("\t")),
+            Some(s) => workspaces::script_key(line, &s.lines),
             None => line.to_owned(),
         }
     }
@@ -12820,6 +12827,7 @@ impl Window {
                         command: spec.command.clone(),
                         pending: run && spec.runs(),
                         login: self.settings.workspace_auto_login,
+                        shell: 0,
                     },
                 );
             }
@@ -13009,6 +13017,7 @@ impl Window {
                 .is_some_and(|p| p.theme.name == "Production")
         {
             let label = self.pane_label(id);
+            let shell = self.workspace_extra.get(&id).map_or(0, |e| e.shell);
             // Asked from its own timer: whatever brought the pane here
             // (output, a timer, opening the workspace) may not ask now.
             self.workspace_asks.push(Command::ConfirmWorkspaceStart {
@@ -13016,12 +13025,20 @@ impl Window {
                 label,
                 script,
                 command,
+                shell,
             });
             // SAFETY: our window; replaces any earlier timer with this id.
             unsafe { SetTimer(Some(self.hwnd), TIMER_WORKSPACE_ASK, 50, None) };
             return;
         }
         self.workspace_run(id, script.as_deref(), command);
+    }
+
+    /// Workspace pane `id`'s shell ended (or is reconnecting).
+    fn workspace_shell_gone(&mut self, id: PaneId) {
+        if let Some(e) = self.workspace_extra.get_mut(&id) {
+            e.shell += 1;
+        }
     }
 
     /// Forgets what workspace pane `id` would run: tmux took its shell, and
@@ -13114,16 +13131,27 @@ impl Window {
     /// Runs what workspace pane `id` runs after Yes on Production: unless
     /// its shell went meanwhile (reconnecting, its login script running
     /// again, or tmux in it).
-    fn workspace_confirmed(&mut self, id: PaneId, script: Option<&str>, command: Option<String>) {
-        let ready = match self.panes.get(&id).map(|p| &p.host) {
-            Some(Host::Ssh(s)) => s.state() == State::Connected,
-            Some(_) => true,
-            None => false,
-        };
+    fn workspace_confirmed(
+        &mut self,
+        id: PaneId,
+        shell: u64,
+        script: Option<&str>,
+        command: Option<String>,
+    ) {
+        let same = self
+            .workspace_extra
+            .get(&id)
+            .is_some_and(|e| e.shell == shell);
+        let ready = same
+            && match self.panes.get(&id).map(|p| &p.host) {
+                Some(Host::Ssh(s)) => s.state() == State::Connected,
+                Some(_) => true,
+                None => false,
+            };
         let busy = self.scripts.get(&id).is_some_and(|r| r.login)
             || self.tmux.get(&id).is_some_and(Tmux::active);
         if !ready || busy {
-            if ready {
+            if self.panes.contains_key(&id) {
                 self.show(
                     id,
                     "\x1b[0;90mThe workspace's script and command are not run: this \
@@ -16889,6 +16917,8 @@ enum Command {
         label: String,
         script: Option<String>,
         command: Option<String>,
+        /// Which shell of the pane it was asked for.
+        shell: u64,
     },
     /// Tools > New SSH key: the window that asks what to make.
     NewKey,
@@ -18455,6 +18485,7 @@ fn run_command(hwnd: HWND, command: Command) {
             label,
             script,
             command,
+            shell,
         } => {
             let what: Vec<String> = [
                 script.as_deref().map(|s| format!("the script {s}")),
@@ -18470,7 +18501,7 @@ fn run_command(hwnd: HWND, command: Command) {
             match dialog(hwnd, &text, MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2) {
                 Some(IDYES) => {
                     let next = with_window(|w| {
-                        w.workspace_confirmed(pane, script.as_deref(), command);
+                        w.workspace_confirmed(pane, shell, script.as_deref(), command);
                         std::mem::take(&mut w.queued)
                     })
                     .unwrap_or_default();
@@ -18485,6 +18516,7 @@ fn run_command(hwnd: HWND, command: Command) {
                             label,
                             script,
                             command,
+                            shell,
                         });
                     });
                     // SAFETY: our window; replaces any earlier timer with this id.
