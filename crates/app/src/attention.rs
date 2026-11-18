@@ -28,55 +28,67 @@ pub enum State {
 }
 
 /// Watches one pane's output for the quiet after work.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub struct Watch {
-    /// The terminal's feed count last seen, to notice new output.
-    seen: u64,
     /// When the current stretch of output began, and its last output.
     burst: Option<(Instant, Instant)>,
     /// When the last stretch long enough to count ended.
     quiet: Option<Instant>,
+    /// A stretch that went quiet but was not told yet, because output
+    /// came again before the next tick: how long it lasted.
+    untold: Option<Duration>,
 }
 
 impl Watch {
-    pub fn new(fed: u64) -> Self {
-        Self {
-            seen: fed,
-            burst: None,
-            quiet: None,
-        }
+    pub fn new() -> Self {
+        Self::default()
     }
 
-    /// The terminal has been fed `fed` times by `now`.
-    pub fn output(&mut self, fed: u64, now: Instant) {
-        if fed == self.seen {
-            return;
-        }
-        self.seen = fed;
+    /// The host sent output at `now` (live output only, not FeroSSH's own
+    /// notices).
+    pub fn output(&mut self, now: Instant) {
         self.burst = Some(match self.burst {
             Some((start, last)) if now.saturating_duration_since(last) < QUIET_AFTER => {
                 (start, now)
             }
-            _ => (now, now),
+            // The stretch before went quiet between two ticks: it still
+            // counts, once.
+            Some(_) => {
+                if let Some(worked) = self.ended() {
+                    self.untold = Some(worked);
+                }
+                (now, now)
+            }
+            None => (now, now),
         });
         self.quiet = None;
     }
 
     /// The user typed in the pane: what comes next is an answer to that,
-    /// so a new stretch starts with it.
-    pub fn typed(&mut self, now: Instant) {
-        self.burst = self.burst.map(|_| (now, now));
+    /// so the stretch so far is not work that went quiet.
+    pub fn typed(&mut self) {
+        self.burst = None;
         self.quiet = None;
+        self.untold = None;
     }
 
     /// Called about once a second: once, when a stretch of work has just
     /// gone quiet, how long that stretch lasted.
     pub fn tick(&mut self, now: Instant) -> Option<Duration> {
-        let (start, last) = self.burst?;
+        if let Some(worked) = self.untold.take() {
+            return Some(worked);
+        }
+        let (_, last) = self.burst?;
         if now.saturating_duration_since(last) < QUIET_AFTER {
             return None;
         }
-        self.burst = None;
+        self.ended()
+    }
+
+    /// Ends the current stretch, quiet since its last output; how long it
+    /// lasted if that was long enough to count.
+    fn ended(&mut self) -> Option<Duration> {
+        let (start, last) = self.burst.take()?;
         let worked = last.saturating_duration_since(start);
         if worked < MIN_WORK {
             return None;
@@ -127,10 +139,11 @@ pub fn spoken(d: Duration) -> String {
     }
 }
 
-/// The notification's heading: what asked, and where.
+/// The notification's heading: where, then what asked. The pane comes
+/// first because Windows cuts a long heading short.
 pub fn heading(what: Option<&str>, pane: &str) -> String {
     match what {
-        Some(w) if !w.is_empty() && w != pane => format!("{w} · {pane}"),
+        Some(w) if !w.is_empty() && w != pane => format!("{pane} · {w}"),
         _ => pane.to_owned(),
     }
 }
@@ -146,48 +159,65 @@ mod tests {
     #[test]
     fn quiet_after_work_fires_once() {
         let t0 = Instant::now();
-        let mut w = Watch::new(0);
+        let mut w = Watch::new();
         assert_eq!(w.tick(at(t0, 1)), None);
-        // Ten seconds of output, a feed every two seconds.
-        for (i, s) in (0..=10).step_by(2).enumerate() {
-            w.output(i as u64 + 1, at(t0, s));
+        // Ten seconds of output, every two seconds.
+        for s in (0..=10).step_by(2) {
+            w.output(at(t0, s));
         }
         assert_eq!(w.state(at(t0, 11)), State::Working(t0));
         assert_eq!(w.tick(at(t0, 12)), None);
         assert_eq!(w.tick(at(t0, 15)), Some(Duration::from_secs(10)));
         assert_eq!(w.tick(at(t0, 16)), None);
         assert_eq!(w.state(at(t0, 16)), State::Quiet(at(t0, 10)));
-        // The same feed count is not new output.
-        w.output(6, at(t0, 30));
-        assert_eq!(w.state(at(t0, 30)), State::Quiet(at(t0, 10)));
+    }
+
+    #[test]
+    fn quiet_between_two_ticks_still_counts() {
+        let t0 = Instant::now();
+        let mut w = Watch::new();
+        for s in 0..=10 {
+            w.output(at(t0, s));
+        }
+        assert_eq!(w.tick(at(t0, 14)), None);
+        // Output again just after five quiet seconds, before the tick.
+        w.output(at(t0, 15) + Duration::from_millis(100));
+        assert_eq!(w.tick(at(t0, 16)), Some(Duration::from_secs(10)));
+        assert_eq!(w.tick(at(t0, 17)), None);
+        assert_eq!(
+            w.state(at(t0, 17)),
+            State::Working(at(t0, 15) + Duration::from_millis(100))
+        );
     }
 
     #[test]
     fn short_bursts_and_typing_do_not_count() {
         let t0 = Instant::now();
-        let mut w = Watch::new(0);
-        w.output(1, t0);
-        w.output(2, at(t0, 3));
+        let mut w = Watch::new();
+        w.output(t0);
+        w.output(at(t0, 3));
         assert_eq!(w.tick(at(t0, 9)), None);
         assert_eq!(w.state(at(t0, 9)), State::Idle);
-        // Long output, then the user types: the stretch starts again.
+        // Long output, then the user types: the stretch is over.
         for s in 0..10 {
-            w.output(10 + s, at(t0, 20 + s));
+            w.output(at(t0, 20 + s));
         }
-        w.typed(at(t0, 29));
-        w.output(30, at(t0, 30));
+        w.typed();
+        assert_eq!(w.state(at(t0, 29)), State::Idle);
+        w.output(at(t0, 30));
         assert_eq!(w.tick(at(t0, 36)), None);
     }
 
     #[test]
     fn a_gap_ends_a_stretch() {
         let t0 = Instant::now();
-        let mut w = Watch::new(0);
-        w.output(1, t0);
-        w.output(2, at(t0, 4));
+        let mut w = Watch::new();
+        w.output(t0);
+        w.output(at(t0, 4));
         // Six seconds later: a new stretch, not the old one going on.
-        w.output(3, at(t0, 10));
+        w.output(at(t0, 10));
         assert_eq!(w.state(at(t0, 10)), State::Working(at(t0, 10)));
+        assert_eq!(w.tick(at(t0, 11)), None);
     }
 
     #[test]
@@ -205,7 +235,7 @@ mod tests {
         assert_eq!(spoken(Duration::from_secs(185)), "3 min");
         assert_eq!(spoken(Duration::from_secs(7200)), "2 h");
         assert_eq!(spoken(Duration::from_secs(7500)), "2 h 5 min");
-        assert_eq!(heading(Some("Codex"), "web-1"), "Codex · web-1");
+        assert_eq!(heading(Some("Codex"), "web-1"), "web-1 · Codex");
         assert_eq!(heading(None, "web-1"), "web-1");
         assert_eq!(heading(Some(""), "web-1"), "web-1");
     }

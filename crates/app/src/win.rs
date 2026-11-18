@@ -226,6 +226,8 @@ const TIMER_SYNC: usize = 1;
 /// Checks the panes with a quiet watch (Session > Notify when this pane
 /// goes quiet) once a second, while there are any.
 const TIMER_QUIET: usize = 20;
+/// Windows notifications waiting their turn whose pane is remembered.
+const MAX_TOAST_QUEUE: usize = 8;
 /// Updates the transfer queue's progress while files move.
 const TIMER_TRANSFER: usize = 2;
 const TRANSFER_TICK_MS: u32 = 250;
@@ -1225,11 +1227,14 @@ struct Window {
     /// SSH panes whose connection dropped while tmux ran: the host's
     /// queue key and the session to attach again after the next login.
     reattach: HashMap<PaneId, (String, String)>,
-    /// The pane the last Windows notification was about: clicking it
-    /// shows that pane.
+    /// The pane of the Windows notification on screen (or last on
+    /// screen): clicking it shows that pane.
     toast_pane: Option<PaneId>,
     /// The coding agents' states the Session manager last showed.
     agent_states: Vec<(PaneId, &'static str)>,
+    /// The panes of the notifications asked for and not on screen yet,
+    /// oldest first; Windows shows them one after the other.
+    toast_queue: VecDeque<PaneId>,
     /// SSH panes reconnecting after their connection dropped.
     retries: HashMap<PaneId, Retry>,
     /// Commands decided outside a handler that returns them; the next
@@ -2206,6 +2211,7 @@ fn create_and_run(launch: Launch, theme: Option<String>) -> Result<()> {
                 reattach: HashMap::new(),
                 toast_pane: None,
                 agent_states: Vec::new(),
+                toast_queue: VecDeque::new(),
                 retries: HashMap::new(),
                 queued: Vec::new(),
                 desktops: HashMap::new(),
@@ -7879,6 +7885,11 @@ impl Window {
         let Some(p) = self.panes.get_mut(&id) else {
             return;
         };
+        // Every live output passes here (not FeroSSH's own notices): the
+        // quiet watch counts it as work.
+        if let Some(w) = p.quiet.as_mut() {
+            w.output(Instant::now());
+        }
         let Some(writer) = &mut p.log.writer else {
             return;
         };
@@ -7958,7 +7969,7 @@ impl Window {
         }
         // What comes next answers the typing: a quiet watch starts over.
         if let Some(w) = self.panes.get_mut(&id).and_then(|p| p.quiet.as_mut()) {
-            w.typed(Instant::now());
+            w.typed();
         }
         if let Some((pane, rec)) = &mut self.recording
             && *pane == id
@@ -8825,6 +8836,7 @@ impl Window {
             if let Some(d) = p.term.sync_deadline() {
                 deadline = Some(deadline.map_or(d, |old| old.min(d)));
             }
+            let notified = actions.iter().any(|a| matches!(a, Action::Notify(_)));
             for action in actions {
                 match action {
                     // tmux answered its panes' queries already.
@@ -8849,7 +8861,9 @@ impl Window {
                         if !self.focused {
                             commands.push(Command::Bell);
                         }
-                        if self.settings.notify_bell && !replay {
+                        // A notification in the same output says more than
+                        // the bell that often comes with it.
+                        if self.settings.notify_bell && !replay && !notified {
                             chrome |= self.alert(id, None, "The bell rang.".into());
                         }
                     }
@@ -8865,11 +8879,6 @@ impl Window {
             }
             if replay {
                 continue;
-            }
-            if let Some(p) = self.panes.get_mut(&id)
-                && let Some(w) = p.quiet.as_mut()
-            {
-                w.output(p.term.fed(), Instant::now());
             }
             if self.read_prompt(id) {
                 chrome = true;
@@ -8980,7 +8989,7 @@ impl Window {
             && agent
             && p.quiet.is_none()
         {
-            p.quiet = Some(crate::attention::Watch::new(p.term.fed()));
+            p.quiet = Some(crate::attention::Watch::new());
             self.update_quiet_timer();
         }
     }
@@ -9017,7 +9026,10 @@ impl Window {
         }
         let pane = p.label();
         let title = crate::attention::heading(what.as_deref(), &pane);
-        self.toast_pane = Some(id);
+        if self.toast_queue.len() >= MAX_TOAST_QUEUE {
+            self.toast_queue.pop_front();
+        }
+        self.toast_queue.push_back(id);
         let waiting = self.panes.values().filter(|p| p.attention).count();
         self.queued.push(Command::Toast {
             title,
@@ -9035,7 +9047,9 @@ impl Window {
         if let Some(p) = self.panes.get_mut(&id) {
             p.quiet = match p.quiet.take() {
                 Some(_) => None,
-                None => Some(crate::attention::Watch::new(p.term.fed())),
+                // A recording has no live output to watch.
+                None if matches!(p.host, Host::Replay(_)) => None,
+                None => Some(crate::attention::Watch::new()),
             };
         }
         self.update_quiet_timer();
@@ -9102,11 +9116,31 @@ impl Window {
         std::mem::take(&mut self.queued)
     }
 
-    /// The user clicked a notification (or the icon): the pane it was
-    /// about comes forward with the keyboard.
+    /// A Windows notification came on screen: the oldest one asked for.
+    fn on_toast_shown(&mut self) {
+        if let Some(id) = self.toast_queue.pop_front() {
+            self.toast_pane = Some(id);
+        }
+    }
+
+    /// The user clicked a notification (or the icon) and FeroSSH came
+    /// forward: the pane the notification was about comes forward with
+    /// the keyboard. Clicked later from the notification centre, which
+    /// does not say which one, or on the icon: a pane that still wants
+    /// the user.
     fn on_toast_click(&mut self) -> Vec<Command> {
-        if let Some(id) = self.toast_pane.take()
-            && self.panes.contains_key(&id)
+        let wants = |w: &Self, id: PaneId| w.panes.get(&id).is_some_and(|p| p.attention);
+        let target = self
+            .toast_pane
+            .take()
+            .filter(|&id| wants(self, id))
+            .or_else(|| {
+                self.panes
+                    .iter()
+                    .find(|(_, p)| p.attention)
+                    .map(|(&id, _)| id)
+            });
+        if let Some(id) = target
             && let Some(c) = self.live_action(Some(LiveAction::Show(id)))
         {
             self.queued.push(c);
@@ -15124,7 +15158,14 @@ impl Window {
             ),
             (cmd::SHOW_HIDDEN, !self.ws.hidden().is_empty()),
             (cmd::NOTIFY_BELL, self.settings.notifications),
-            (cmd::NOTIFY_QUIET, self.settings.notifications),
+            (
+                cmd::NOTIFY_QUIET,
+                self.settings.notifications
+                    && !matches!(
+                        self.panes.get(&pane).map(|p| &p.host),
+                        Some(Host::Replay(_))
+                    ),
+            ),
         ];
         for i in 0..4 {
             out.push((cmd::FOCUS + i, split));
@@ -15347,13 +15388,11 @@ impl Window {
 
     fn set_focus(&mut self, focused: bool) {
         self.focused = focused;
-        // Back at the pane that asked for attention: it has it.
+        // Back at the pane that asked for attention: it has it (the tab
+        // strip redraws below).
         let here = self.focused_id();
-        if focused
-            && let Some(p) = self.panes.get_mut(&here)
-            && std::mem::take(&mut p.attention)
-        {
-            self.refresh_chrome();
+        if focused && let Some(p) = self.panes.get_mut(&here) {
+            p.attention = false;
         }
         // The clipboard may change while away: a desktop gets it again.
         self.clip_pane = None;
@@ -16887,7 +16926,8 @@ fn dialog(hwnd: HWND, text: &str, style: MESSAGEBOX_STYLE) -> Option<MESSAGEBOX_
 
 /// Puts the window in front, shown and restored, for a click on its
 /// notification.
-fn bring_forward(hwnd: HWND) {
+/// Brings the window to the front; whether it is there now.
+fn bring_forward(hwnd: HWND) -> bool {
     // SAFETY: our window. Windows lets the window the user clicked a
     // notification of come forward.
     unsafe {
@@ -16898,6 +16938,7 @@ fn bring_forward(hwnd: HWND) {
             let _ = ShowWindow(hwnd, SW_RESTORE);
         }
         let _ = SetForegroundWindow(hwnd);
+        GetForegroundWindow() == hwnd
     }
 }
 
@@ -19875,12 +19916,19 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                 LRESULT(0)
             }
             crate::toast::WM_NOTIFY_ICON => {
-                if crate::toast::clicked(lparam.0) {
-                    crate::toast::hide(hwnd);
-                    bring_forward(hwnd);
-                    if let Some(commands) = with_window(Window::on_toast_click) {
-                        run_commands(hwnd, commands);
+                match crate::toast::event(lparam.0) {
+                    crate::toast::Event::Shown => {
+                        with_window(Window::on_toast_shown);
                     }
+                    // The icon goes once FeroSSH is in front (WM_ACTIVATE);
+                    // if Windows did not let it come forward, the icon and
+                    // its pane stay for another click.
+                    crate::toast::Event::Clicked if bring_forward(hwnd) => {
+                        if let Some(commands) = with_window(Window::on_toast_click) {
+                            run_commands(hwnd, commands);
+                        }
+                    }
+                    _ => {}
                 }
                 LRESULT(0)
             }
@@ -20162,6 +20210,11 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                 drop(window);
                 PostQuitMessage(0);
                 LRESULT(0)
+            }
+            // Explorer restarted: its notification area lost the icon.
+            _ if msg == crate::toast::taskbar_created() => {
+                crate::toast::restore(hwnd);
+                DefWindowProcW(hwnd, msg, wparam, lparam)
             }
             _ => DefWindowProcW(hwnd, msg, wparam, lparam),
         }

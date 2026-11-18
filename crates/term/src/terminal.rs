@@ -446,12 +446,6 @@ impl Terminal {
         }
     }
 
-    /// How many times host output was fed so far (wrapping): a change
-    /// means new output.
-    pub fn fed(&self) -> u64 {
-        self.fed
-    }
-
     /// Processes output from the host. Call [`Self::take_actions`] after.
     pub fn feed(&mut self, bytes: &[u8]) {
         self.fed = self.fed.wrapping_add(1);

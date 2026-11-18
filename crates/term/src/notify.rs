@@ -2,9 +2,9 @@
 //! coding agents and shell hooks send when a task ends or input is
 //! wanted:
 //!
-//! - OSC 9 (iTerm2): `ESC ] 9 ; text BEL`. ConEmu's `OSC 9 ; N ; ...`
-//!   commands (progress, `9;4`, and the rest) start with a number and are
-//!   not notifications.
+//! - OSC 9 (iTerm2): `ESC ] 9 ; text BEL`. ConEmu's commands, `OSC 9 ; N`
+//!   or `OSC 9 ; N ; ...` with N from 1 to 12 (progress is `9;4`), are not
+//!   notifications.
 //! - OSC 777 (urxvt, Ghostty, WezTerm): `ESC ] 777 ; notify ; title ; body BEL`.
 //! - OSC 99 (kitty): `ESC ] 99 ; metadata ; payload BEL`, with `p=title`
 //!   or `p=body`, `d=0` for a part with more to come and `e=1` for a
@@ -29,11 +29,77 @@ pub struct Notification {
     pub body: String,
 }
 
+/// Notifications sent in parts kept at once; the oldest goes for a new
+/// one.
+const MAX_PENDING: usize = 4;
+/// Bytes kept of a title or body sent in parts, before decoding.
+const MAX_PART_BYTES: usize = 4 * MAX_NOTIFICATION * 4;
+
 /// Collects kitty's notifications sent in parts.
 #[derive(Debug, Default)]
 pub(crate) struct Kitty {
-    /// The parts so far of a notification with `d=0`.
-    pending: Option<(String, Notification)>,
+    /// The notifications with parts still to come (`d=0`), by id, oldest
+    /// first.
+    pending: Vec<(String, Parts)>,
+}
+
+/// A kitty notification's title and body so far.
+#[derive(Debug, Default)]
+struct Parts {
+    title: Text,
+    body: Text,
+}
+
+/// Text sent in parts: what is decoded, and base64 not decoded yet (a
+/// chunk need not end on a whole group of four).
+#[derive(Debug, Default)]
+struct Text {
+    plain: Vec<u8>,
+    base64: Vec<u8>,
+}
+
+impl Text {
+    /// Adds a chunk; `None` when its base64 is not.
+    fn push(&mut self, chunk: &[u8], base64: bool) -> Option<()> {
+        if base64 {
+            if !chunk
+                .iter()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, b'+' | b'/' | b'='))
+            {
+                return None;
+            }
+            let room = MAX_PART_BYTES.saturating_sub(self.base64.len());
+            self.base64
+                .extend(chunk.iter().filter(|&&c| c != b'=').take(room));
+            // Padding ends a whole encoding: what follows is a new one.
+            if chunk.ends_with(b"=") {
+                self.flush()?;
+            }
+        } else {
+            self.flush()?;
+            let room = MAX_PART_BYTES.saturating_sub(self.plain.len());
+            self.plain.extend(chunk.iter().take(room));
+        }
+        Some(())
+    }
+
+    /// Decodes the base64 kept so far.
+    fn flush(&mut self) -> Option<()> {
+        if !self.base64.is_empty() {
+            let decoded = decode_base64(&self.base64)?;
+            self.base64.clear();
+            let room = MAX_PART_BYTES.saturating_sub(self.plain.len());
+            self.plain.extend(decoded.into_iter().take(room));
+        }
+        Some(())
+    }
+
+    fn finish(mut self) -> String {
+        if self.flush().is_none() {
+            return String::new();
+        }
+        clean(&self.plain)
+    }
 }
 
 fn clean(bytes: &[u8]) -> String {
@@ -51,7 +117,12 @@ pub(crate) fn parse(osc: &[u8], kitty: &mut Kitty) -> Option<Notification> {
     if let Some(text) = osc.strip_prefix(b"9;") {
         // ConEmu: `9;4;1;50` (progress), `9;1;100` (sleep) and the rest.
         let digits = text.iter().take_while(|b| b.is_ascii_digit()).count();
-        if digits > 0 && matches!(text.get(digits), None | Some(b';')) {
+        let command = std::str::from_utf8(text.get(..digits)?)
+            .ok()
+            .and_then(|n| n.parse::<u32>().ok());
+        if command.is_some_and(|n| (1..=12).contains(&n))
+            && matches!(text.get(digits), None | Some(b';'))
+        {
             return None;
         }
         let body = clean(text);
@@ -85,48 +156,53 @@ impl Kitty {
             None => (rest, &[][..]),
         };
         let meta = String::from_utf8_lossy(meta);
-        let (mut id, mut done, mut base64, mut body) = (String::new(), true, false, false);
+        let (mut id, mut done, mut base64) = (String::new(), true, false);
+        // `None`: a part with nothing to show (icon, buttons, a query).
+        let mut body = Some(false);
         for kv in meta.split(':') {
             match kv.split_once('=') {
                 Some(("i", v)) => id = v.chars().take(64).collect(),
                 Some(("d", v)) => done = v != "0",
                 Some(("e", v)) => base64 = v == "1",
-                Some(("p", v)) => match v {
-                    "title" => body = false,
-                    "body" => body = true,
-                    // Icons, buttons, queries: nothing to show.
-                    _ => return None,
-                },
+                Some(("p", v)) => {
+                    body = match v {
+                        "title" => Some(false),
+                        "body" => Some(true),
+                        _ => None,
+                    }
+                }
                 _ => {}
             }
         }
-        let decoded;
-        let payload = if base64 {
-            decoded = decode_base64(payload)?;
-            &decoded[..]
-        } else {
-            payload
+        let at = self.pending.iter().position(|(p, _)| *p == id);
+        let mut parts = match at {
+            Some(i) => self.pending.remove(i).1,
+            // A part with nothing to show starts nothing.
+            None if body.is_none() => return None,
+            None => Parts::default(),
         };
-        let text = clean(payload);
-        let mut n = match self.pending.take() {
-            Some((pending_id, n)) if pending_id == id => n,
-            _ => Notification::default(),
-        };
-        if body {
-            if n.body.chars().count() < MAX_NOTIFICATION {
-                n.body.push_str(&text);
-                n.body = clean(n.body.as_bytes());
-            }
-        } else if !text.is_empty() {
-            let mut title = n.title.take().unwrap_or_default();
-            title.push_str(&text);
-            n.title = Some(clean(title.as_bytes()));
+        if let Some(body) = body {
+            let text = if body {
+                &mut parts.body
+            } else {
+                &mut parts.title
+            };
+            // Bad base64 drops the whole notification.
+            text.push(payload, base64)?;
         }
         if !done {
-            self.pending = Some((id, n));
+            if self.pending.len() >= MAX_PENDING {
+                self.pending.remove(0);
+            }
+            self.pending.push((id, parts));
             return None;
         }
-        (n.title.is_some() || !n.body.is_empty()).then_some(n)
+        let title = parts.title.finish();
+        let body = parts.body.finish();
+        (!title.is_empty() || !body.is_empty()).then(|| Notification {
+            title: (!title.is_empty()).then_some(title),
+            body,
+        })
     }
 }
 
@@ -176,6 +252,9 @@ mod tests {
         );
         assert_eq!(parse(b"9;4;1;50", &mut k), None);
         assert_eq!(parse(b"9;12", &mut k), None);
+        // Not a ConEmu command: the number is the message.
+        assert_eq!(parse(b"9;42", &mut k), n(None, "42"));
+        assert_eq!(parse(b"9;0", &mut k), n(None, "0"));
         assert_eq!(parse(b"9;", &mut k), None);
         // A number that is the message itself, not a ConEmu command.
         assert_eq!(
@@ -208,6 +287,51 @@ mod tests {
         assert_eq!(parse(b"99;e=1:p=body;RG9uZQ==", &mut k), n(None, "Done"));
         assert_eq!(parse(b"99;e=1;!!", &mut k), None);
         assert_eq!(parse(b"99;p=icon;abc", &mut k), None);
+    }
+
+    #[test]
+    fn kitty_parts_keep_their_spaces_and_ids() {
+        let mut k = Kitty::default();
+        assert_eq!(parse(b"99;i=a:d=0;Build ", &mut k), None);
+        assert_eq!(parse(b"99;i=b:d=0;Deploy", &mut k), None);
+        assert_eq!(parse(b"99;i=a:d=0;finished", &mut k), None);
+        assert_eq!(parse(b"99;i=b:p=body;ok", &mut k), n(Some("Deploy"), "ok"));
+        // An icon part ends a notification too.
+        assert_eq!(
+            parse(b"99;i=a:p=icon;abc", &mut k),
+            n(Some("Build finished"), "")
+        );
+        // An icon alone is nothing.
+        assert_eq!(parse(b"99;i=c:p=icon;abc", &mut k), None);
+    }
+
+    #[test]
+    fn kitty_base64_may_split_anywhere() {
+        let mut k = Kitty::default();
+        // "Hello there" is SGVsbG8gdGhlcmU=, cut mid-group.
+        assert_eq!(parse(b"99;i=x:d=0:e=1;SGVsb", &mut k), None);
+        assert_eq!(
+            parse(b"99;i=x:e=1;G8gdGhlcmU=", &mut k),
+            n(Some("Hello there"), "")
+        );
+        // Chunks each with their own padding: "Hi" then "!".
+        assert_eq!(parse(b"99;i=y:d=0:e=1;SGk=", &mut k), None);
+        assert_eq!(parse(b"99;i=y:e=1;IQ==", &mut k), n(Some("Hi!"), ""));
+    }
+
+    #[test]
+    fn many_pending_kitty_parts_stay_bounded() {
+        let mut k = Kitty::default();
+        for i in 0..100 {
+            let osc = format!("99;i={i}:d=0;{}", "x".repeat(5000));
+            assert_eq!(parse(osc.as_bytes(), &mut k), None);
+        }
+        assert_eq!(k.pending.len(), MAX_PENDING);
+        assert!(
+            k.pending
+                .iter()
+                .all(|(_, p)| p.title.plain.len() <= MAX_PART_BYTES)
+        );
     }
 
     #[test]

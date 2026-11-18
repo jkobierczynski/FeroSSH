@@ -5,8 +5,11 @@
 
 use crate::notify::{self, Kitty, Notification};
 
-/// Longest OSC 7 text kept; longer ones are ignored.
+/// Longest OSC text kept; longer ones are ignored.
 const MAX_LEN: usize = 4096;
+/// Room for a kitty notification's `99;metadata;` on top of its payload,
+/// which may be [`MAX_LEN`] bytes on its own.
+const MAX_KITTY_META: usize = 256;
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 enum State {
@@ -70,7 +73,7 @@ impl CwdScanner {
                     State::Ground
                 }
                 (State::Osc, 0x1b) => State::OscEsc,
-                (State::Osc, _) if self.buf.len() >= MAX_LEN => State::Skip,
+                (State::Osc, _) if self.buf.len() >= self.limit() => State::Skip,
                 (State::Osc, _) => {
                     self.buf.push(b);
                     State::Osc
@@ -98,6 +101,15 @@ impl CwdScanner {
 }
 
 impl CwdScanner {
+    /// The longest the OSC being collected may grow.
+    fn limit(&self) -> usize {
+        if self.buf.starts_with(b"99;") {
+            MAX_LEN + MAX_KITTY_META
+        } else {
+            MAX_LEN
+        }
+    }
+
     fn found(&mut self) -> Option<Found> {
         if let Some(dir) = parse(&self.buf) {
             return Some(Found::Dir(dir));
@@ -248,6 +260,16 @@ mod tests {
         assert_eq!(s.scan(&long), []);
         // And it still works afterwards.
         assert_eq!(s.scan(b"\x1b]7;file://h/ok\x07"), [dir("h", b"/ok")]);
+    }
+
+    #[test]
+    fn a_full_size_kitty_payload_fits() {
+        let mut s = CwdScanner::default();
+        let osc = [&b"\x1b]99;i=1:e=1;"[..], &[b'Q'; MAX_LEN], b"\x07"].concat();
+        assert_eq!(s.scan(&osc).len(), 1);
+        // OSC 7 keeps its own limit.
+        let long = [&b"\x1b]7;file://h/"[..], &[b'a'; MAX_LEN], b"\x07"].concat();
+        assert_eq!(s.scan(&long), []);
     }
 
     #[test]

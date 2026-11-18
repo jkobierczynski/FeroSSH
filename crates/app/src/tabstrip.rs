@@ -71,6 +71,8 @@ pub const LEGACY_BADGE: &str = " ⚠";
 pub const UNENCRYPTED_BADGE: &str = " ⚠ telnet";
 
 const AMBER: Rgb = Rgb::new(0xe5, 0xb5, 0x3b);
+/// The least contrast of a mark with its tab (WCAG for graphics).
+const MARK_CONTRAST: f32 = 3.0;
 const RED: Rgb = Rgb::new(0xe0, 0x5c, 0x5c);
 
 /// What a click on the strip hit.
@@ -208,6 +210,18 @@ impl Palette {
     }
 }
 
+/// The attention mark's amber on `bg`, moved toward `text` where it would
+/// not stand out (light and grey strips): at least 3:1, as a graphic.
+fn attention_colour(bg: Rgb, text: Rgb) -> Rgb {
+    let mut amount = 0.0_f32;
+    let mut c = AMBER;
+    while amount < 1.0 && contrast(c, bg) < MARK_CONTRAST {
+        amount = (amount + 0.1).min(1.0);
+        c = mix(AMBER, text, amount);
+    }
+    c
+}
+
 /// Cuts `text` to `max` cells, ending in `…` when cut.
 pub fn fit(text: &str, max: usize) -> String {
     let mut out = String::new();
@@ -287,7 +301,7 @@ pub fn draw(grid: &mut Grid, tabs: &[TabLabel], active: usize, palette: &Palette
         };
         row.put("  ", fg, bg, Flags::empty());
         let (mark, dot) = if tab.attention {
-            ("◆", AMBER)
+            ("◆", attention_colour(bg, palette.text))
         } else if tab.bell {
             ("◆", dot)
         } else {
@@ -386,6 +400,18 @@ mod tests {
             let floor = DIM_CONTRAST.min(contrast(p.text, p.strip));
             for bg in [p.strip, p.active] {
                 let c = contrast(p.dim, bg);
+                assert!(c >= floor - 0.01, "{}: {c:.2}", theme.name);
+            }
+        }
+    }
+
+    #[test]
+    fn attention_mark_stands_out_on_every_theme() {
+        for theme in Theme::builtin() {
+            let p = Palette::of(theme);
+            for bg in [p.strip, p.active] {
+                let floor = MARK_CONTRAST.min(contrast(p.text, bg));
+                let c = contrast(attention_colour(bg, p.text), bg);
                 assert!(c >= floor - 0.01, "{}: {c:.2}", theme.name);
             }
         }
