@@ -62,10 +62,11 @@ pub fn start_line(command: &str) -> String {
     let target = sh_quote(&format!("={SESSION}:"));
     let exact = sh_quote(&format!("={SESSION}"));
     // tmux expands formats in `-c`: a `#` in the directory is doubled.
+    // The `_` keeps newlines at the end of the name from `$(…)`.
     // When another client made the session meanwhile, new-session fails
     // and the window goes into that one.
     let script = format!(
-        "d=$(printf %s \"$PWD\" | sed \"s/#/##/g\"); w=; \
+        "d=$(printf %s_ \"$PWD\" | sed \"s/#/##/g\"); d=${{d%_}}; w=; \
          tmux has-session -t {exact} 2>/dev/null || \
          w=$(tmux new-session -d -s {session} -c \"$d\" -n {name} -P -F '#{{window_id}}' 2>/dev/null); \
          [ -n \"$w\" ] || w=$(tmux new-window -d -t {target} -c \"$d\" -n {name} -P -F '#{{window_id}}'); \
@@ -177,7 +178,8 @@ mod tests {
             "{PRINT}[ \"$1\" = has-session ] && exit 1\n[ \"$1\" = new-session ] && exit 1\n\
              [ \"$1\" = new-window ] && echo @8\nexit 0\n"
         );
-        let dir = std::env::temp_dir().join(format!("ferossh #{{pane_id}} {}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("ferossh #{{pane_id}} {}\n\n", std::process::id()));
         if std::fs::create_dir_all(&dir).is_err() {
             return;
         }
@@ -185,17 +187,18 @@ mod tests {
             return;
         };
         let _ = std::fs::remove_dir_all(&dir);
+        // The name ends in newlines, which reach tmux as they are.
         let shown = dir.display().to_string().replace('#', "##");
-        let lines: Vec<&str> = text.lines().collect();
-        assert_eq!(lines.len(), 6, "{text}");
-        assert!(lines[1].starts_with("[new-session]"), "{text}");
+        let calls: Vec<&str> = text.split_terminator("]\n").collect();
+        assert_eq!(calls.len(), 6, "{text:?}");
+        assert!(calls[1].starts_with("[new-session]"), "{text:?}");
         assert_eq!(
-            lines[2],
+            calls[2],
             format!(
-                "[new-window][-d][-t][=agents:][-c][{shown}][-n][codex][-P][-F][#{{window_id}}]"
+                "[new-window][-d][-t][=agents:][-c][{shown}][-n][codex][-P][-F][#{{window_id}}"
             )
         );
-        assert_eq!(lines[3], "[set-option][-w][-t][@8][@ferossh-agent][codex]");
+        assert_eq!(calls[3], "[set-option][-w][-t][@8][@ferossh-agent][codex");
     }
 
     #[test]
