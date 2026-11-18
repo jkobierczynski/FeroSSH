@@ -5950,6 +5950,15 @@ impl Window {
     /// A workspace pane connected anywhere else than its own destination
     /// is a pane like any other: it runs nothing of the workspace's.
     fn workspace_elsewhere(&mut self, id: PaneId, destination: &str) {
+        // One waiting for another pane's login waits no more: it is
+        // saved, and kept, as what it now opens.
+        if self
+            .workspace_waiting
+            .destination(id)
+            .is_some_and(|d| !d.trim().eq_ignore_ascii_case(destination.trim()))
+        {
+            self.workspace_waiting.forget(id);
+        }
         if self.workspace_extra.get(&id).is_some_and(|e| {
             !e.dest
                 .as_deref()

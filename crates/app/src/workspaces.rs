@@ -420,6 +420,11 @@ impl Waiting {
         })
     }
 
+    /// Where waiting pane `pane` is to connect.
+    pub fn destination(&self, pane: PaneId) -> Option<&str> {
+        self.by_pane.get(&pane).map(|(_, dest, _)| dest.as_str())
+    }
+
     /// Forgets a pane that closed, as a waiting pane.
     pub fn forget(&mut self, pane: PaneId) {
         self.by_pane.remove(&pane);
