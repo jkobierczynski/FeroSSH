@@ -130,6 +130,15 @@ pub struct Job {
     /// A folder download left something in it behind: a folder or link
     /// it could not read, or a name it could not give a file.
     missed: bool,
+    /// A folder under the home folder an upload makes, with its parents,
+    /// before it starts: the folder [`Remote::upload_into_home`] was given.
+    make: Option<Vec<u8>>,
+    /// The numbered name an upload took to keep both; it stays the job's
+    /// (with its part file) while paused, until it picks a name again.
+    taken: Option<Vec<u8>>,
+    /// Where an upload ended up once done: its target, or the numbered
+    /// name it took to keep both.
+    pub landed: Option<Vec<u8>>,
     run: Run,
     speed: Speed,
 }
@@ -326,10 +335,15 @@ enum Purpose {
 enum Step {
     StatSource,
     Open,
-    Read { offset: u64, len: u32 },
+    Read {
+        offset: u64,
+        len: u32,
+    },
     StatTarget,
     StatPart,
-    Write { len: u64 },
+    Write {
+        len: u64,
+    },
     CloseWritten,
     // Gives the part file the edited file's mode; the rename waits
     // for it so a failure never replaces the original.
@@ -337,11 +351,28 @@ enum Step {
     Rename,
     Checksum,
     RootPath,
-    ListDir { remote: Vec<u8>, local: PathBuf },
-    LinkPath { local: PathBuf },
-    LinkStat { remote: Vec<u8>, local: PathBuf },
-    Mkdir { path: Vec<u8> },
+    ListDir {
+        remote: Vec<u8>,
+        local: PathBuf,
+    },
+    LinkPath {
+        local: PathBuf,
+    },
+    LinkStat {
+        remote: Vec<u8>,
+        local: PathBuf,
+    },
+    Mkdir {
+        path: Vec<u8>,
+    },
     MkdirCheck,
+    /// A folder an upload into the home folder makes before it starts.
+    MakeDir {
+        path: Vec<u8>,
+    },
+    MakeDirCheck {
+        path: Vec<u8>,
+    },
 }
 
 /// The directory the side pane shows.
@@ -835,6 +866,9 @@ impl Remote {
             generation: 0,
             dest: None,
             missed: false,
+            make: None,
+            taken: None,
+            landed: None,
             run: Run::Idle,
             speed: Speed::default(),
         });
@@ -899,6 +933,124 @@ impl Remote {
         }
         self.pump();
         Ok(id)
+    }
+
+    /// Queues local file `local` for folder `into`, a path under the home
+    /// folder (such as `.cache/ferossh/paste`), which the upload makes
+    /// first along with its parents. A name already taken there is kept
+    /// and the new file numbered; [`Self::landed`] says where it went.
+    pub fn upload_into_home(&mut self, local: &Path, into: &[u8]) -> Result<JobId, String> {
+        if into.is_empty()
+            || into.starts_with(b"/")
+            || into
+                .split(|&b| b == b'/')
+                .any(|part| part.is_empty() || part == b"." || part == b"..")
+        {
+            return Err("The upload folder must be a plain path under the home folder.".into());
+        }
+        let meta = std::fs::metadata(local).map_err(|e| format!("{}: {e}", local.display()))?;
+        if !meta.is_file() {
+            return Err(format!("{} is not a file.", local.display()));
+        }
+        let name = local
+            .file_name()
+            .and_then(|n| n.to_str())
+            .map(str::to_owned)
+            .ok_or_else(|| format!("{} has no usable file name.", local.display()))?;
+        let remote = names::join(into, name.as_bytes());
+        let id = self.add(Kind::Upload, name, remote, local.to_path_buf());
+        if let Some(job) = self.jobs.last_mut() {
+            job.size = Some(meta.len());
+            job.choice = Some(Choice::KeepBoth);
+            job.make = Some(into.to_vec());
+        }
+        self.pump();
+        Ok(id)
+    }
+
+    /// Where finished upload `id` ended up on the server.
+    pub fn landed(&self, id: JobId) -> Option<&[u8]> {
+        let job = self.jobs.get(self.index(id)?)?;
+        job.landed.as_deref().filter(|_| job.state == State::Done)
+    }
+
+    /// The folders upload `i` makes, in order: each part of its `make`
+    /// folder under the home folder.
+    fn make_dirs(&self, i: usize) -> Vec<Vec<u8>> {
+        let (Some(home), Some(make)) = (
+            self.home.as_deref(),
+            self.jobs.get(i).and_then(|j| j.make.as_deref()),
+        ) else {
+            return Vec::new();
+        };
+        let mut dir = home.to_vec();
+        make.split(|&b| b == b'/')
+            .map(|part| {
+                dir = names::join(&dir, part);
+                dir.clone()
+            })
+            .collect()
+    }
+
+    /// Makes the folder after `made` (the first one for none) for upload
+    /// `i`, or looks at its target once they all exist.
+    fn make_next(&mut self, i: usize, made: Option<&[u8]>) {
+        let dirs = self.make_dirs(i);
+        if dirs.is_empty() {
+            return self.fail(i, "The server did not say which is the home folder.".into());
+        }
+        let next = match made {
+            None => dirs.first(),
+            Some(m) => dirs
+                .iter()
+                .position(|d| d.as_slice() == m)
+                .and_then(|k| dirs.get(k + 1)),
+        };
+        if let Some(path) = next.cloned() {
+            let step = Step::MakeDir { path: path.clone() };
+            return self.job_request(i, SftpOp::Mkdir { path }, step);
+        }
+        let Some(job) = self.jobs.get_mut(i) else {
+            return;
+        };
+        let Run::Up(u) = &mut job.run else {
+            return;
+        };
+        let path = u.target.clone();
+        self.job_request(
+            i,
+            SftpOp::Stat {
+                path,
+                follow: false,
+            },
+            Step::StatTarget,
+        );
+    }
+
+    /// Job `job`'s remote path, with an upload into the home folder that
+    /// has not started yet placed there already.
+    fn target_of<'a>(&self, job: &'a Job) -> std::borrow::Cow<'a, [u8]> {
+        match &self.home {
+            Some(home) if job.make.is_some() && !job.remote.starts_with(b"/") => {
+                std::borrow::Cow::Owned(names::join(home, &job.remote))
+            }
+            _ => std::borrow::Cow::Borrowed(&job.remote),
+        }
+    }
+
+    /// Whether an upload other than job `i` owns remote file `path`: it
+    /// is running or paused with that as its target, or, not finished,
+    /// has taken it as the numbered name to keep both.
+    fn claimed(&self, i: usize, path: &[u8]) -> bool {
+        self.jobs.iter().enumerate().any(|(k, other)| {
+            k != i
+                && other.kind == Kind::Upload
+                && ((matches!(other.state, State::Running | State::Paused)
+                    && *self.target_of(other) == *path)
+                    // A numbered name stays taken until the job ends,
+                    // queued again after a resume included.
+                    || (!other.state.finished() && other.taken.as_deref() == Some(path)))
+        })
     }
 
     fn index(&self, id: JobId) -> Option<usize> {
@@ -1060,8 +1212,13 @@ impl Remote {
             {
                 let _ = std::fs::create_dir_all(parent);
             }
-            // An edited file put back always replaces the original.
-            job.choice = job.put_back.map(|_| Choice::Overwrite);
+            // An edited file put back always replaces the original; a
+            // pasted file never replaces anything.
+            job.choice = if job.make.is_some() {
+                Some(Choice::KeepBoth)
+            } else {
+                job.put_back.map(|_| Choice::Overwrite)
+            };
         }
         self.pump();
     }
@@ -1182,6 +1339,9 @@ impl Remote {
 
     fn finish(&mut self, i: usize, note: Option<String>) {
         if let Some(job) = self.jobs.get_mut(i) {
+            if let Run::Up(u) = &job.run {
+                job.landed = Some(u.target.clone());
+            }
             job.state = State::Done;
             job.note = note;
             job.run = Run::Idle;
@@ -1226,14 +1386,7 @@ impl Remote {
             }
             // One upload at a time owns a target's part file: a second
             // save of the same edited file waits for the first.
-            if job.kind == Kind::Upload
-                && self.jobs.iter().enumerate().any(|(k, other)| {
-                    k != i
-                        && other.kind == Kind::Upload
-                        && other.remote == job.remote
-                        && matches!(other.state, State::Running | State::Paused)
-                })
-            {
+            if job.kind == Kind::Upload && self.claimed(i, &self.target_of(job)) {
                 continue;
             }
             if file {
@@ -1251,6 +1404,7 @@ impl Remote {
 
     fn start(&mut self, i: usize) {
         let always = self.always;
+        let home = self.home.clone();
         let Some(job) = self.jobs.get_mut(i) else {
             return;
         };
@@ -1259,6 +1413,14 @@ impl Remote {
         job.note = None;
         if job.choice.is_none() {
             job.choice = always;
+        }
+        // An upload into the home folder learns where that is once the
+        // channel is open.
+        if job.make.is_some()
+            && !job.remote.starts_with(b"/")
+            && let Some(home) = home
+        {
+            job.remote = names::join(&home, &job.remote);
         }
         let remote = job.remote.clone();
         match job.kind {
@@ -1294,6 +1456,9 @@ impl Remote {
                     check: Check::default(),
                     resumed: false,
                 }));
+                if job.make.is_some() {
+                    return self.make_next(i, None);
+                }
                 self.job_request(
                     i,
                     SftpOp::Stat {
@@ -1562,6 +1727,14 @@ impl Remote {
                 self.advance(i);
             }
             (Step::Mkdir { .. }, SftpReply::Done) => self.made_dir(i),
+            (Step::MakeDir { path }, SftpReply::Done) => self.make_next(i, Some(&path)),
+            (Step::MakeDirCheck { path }, SftpReply::Attrs(a)) => {
+                if a.is_dir() {
+                    self.make_next(i, Some(&path));
+                } else {
+                    self.fail(i, "A file is in the way of a folder.".into());
+                }
+            }
             (Step::MkdirCheck, SftpReply::Attrs(a)) => {
                 if a.is_dir() {
                     self.made_dir(i);
@@ -1585,6 +1758,13 @@ impl Remote {
             // The folder may exist already.
             Step::Mkdir { path } => {
                 self.job_request(i, SftpOp::Stat { path, follow: true }, Step::MkdirCheck)
+            }
+            Step::MakeDir { path } => {
+                let op = SftpOp::Stat {
+                    path: path.clone(),
+                    follow: true,
+                };
+                self.job_request(i, op, Step::MakeDirCheck { path });
             }
             Step::Checksum => self.set_remote_sum(i, Err(failed_text(code, message))),
             // One unreadable folder or link does not stop the rest.
@@ -1767,10 +1947,13 @@ impl Remote {
         if numbered > 0 {
             return self.try_numbered(i, numbered + 1);
         }
-        if attrs.is_dir() {
+        let choice = self.jobs.get(i).and_then(|j| j.choice);
+        // Keeping both steps around a folder too; anything else would
+        // replace it.
+        if attrs.is_dir() && choice != Some(Choice::KeepBoth) {
             return self.fail(i, "A folder of that name is in the way.".into());
         }
-        match self.jobs.get(i).and_then(|j| j.choice) {
+        match choice {
             None => self.ask(i),
             Some(Choice::Skip) => self.skip(i),
             Some(Choice::KeepBoth) => self.try_numbered(i, 2),
@@ -1783,7 +1966,17 @@ impl Remote {
         }
     }
 
-    fn try_numbered(&mut self, i: usize, n: u32) {
+    fn try_numbered(&mut self, i: usize, mut n: u32) {
+        // A numbered name another upload has taken meanwhile is skipped,
+        // so two never write one part file.
+        while n <= MAX_NUMBERED
+            && self
+                .jobs
+                .get(i)
+                .is_some_and(|j| self.claimed(i, &remote_numbered(&j.remote, n)))
+        {
+            n += 1;
+        }
         if n > MAX_NUMBERED {
             return self.fail(i, "No free name to keep both.".into());
         }
@@ -1795,6 +1988,7 @@ impl Remote {
         };
         u.numbered = n;
         u.target = remote_numbered(&job.remote, n);
+        job.taken = Some(u.target.clone());
         let path = u.target.clone();
         self.job_request(
             i,

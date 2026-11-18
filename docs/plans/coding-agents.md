@@ -1,10 +1,10 @@
 # Plan: FeroSSH for coding agents on remote hosts
 
-More and more work over SSH is a coding agent (Claude Code, Codex CLI, aider and the like) running in a terminal on a remote machine for minutes or hours at a time. This plan lists six features that would make FeroSSH a good home for that, what FeroSSH already has for each, and what is left to build. Features 1 and 2 are being built first; the others follow when the maintainer picks them.
+More and more work over SSH is a coding agent (Claude Code, Codex CLI, aider and the like) running in a terminal on a remote machine for minutes or hours at a time. This plan lists six features that would make FeroSSH a good home for that, what FeroSSH already has for each, and what is left to build. Features 1, 2 and 3 are built; the others follow when the maintainer picks them.
 
 Written 18 November 2026, against `main` at 3d28477.
 
-## 1. Attention alerts (building now)
+## 1. Attention alerts (built)
 
 **What it is.** When an agent stops to ask a question or finishes its task, the tab gets a badge and Windows shows a notification, so you can work elsewhere and come back when it needs you.
 
@@ -18,7 +18,7 @@ Written 18 November 2026, against `main` at 3d28477.
 - **Off by default.** Settings > Desktop notifications turns them on; Session > Notify when this pane goes quiet turns on the quiet watch per pane. The bell keeps its current behaviour, and counts as a notification too unless Settings > Notify on the bell too is turned off.
 - Security: the text is the host's, so it is shown as plain text, cut short and stripped of control and bidi characters; it can never run anything. Notifications use the shell's own balloon API (`Shell_NotifyIcon`), which Windows 10 and 11 show as notifications without an install or AppUserModelID.
 
-## 2. Persistent agent sessions (building now)
+## 2. Persistent agent sessions (built)
 
 **What it is.** One click starts an agent in tmux on the server, so it keeps working when the laptop sleeps or the network drops, and comes back by itself when FeroSSH reconnects. A dashboard shows every agent and whether it is working, waiting for you or done.
 
@@ -31,7 +31,9 @@ Written 18 November 2026, against `main` at 3d28477.
 - The Session manager gets a **Coding agents** group: each agent with its host, folder, state (working, waiting for you, quiet) and how long it has been in that state. Enter shows it.
 - Nothing runs unless you start it; no setting changes for anyone who does not use it. The SSH side stays in the sandboxed worker: everything is typed at the shell or sent as tmux control commands, as tmux integration does today.
 
-## 3. Paste and drop images and files into the remote
+## 3. Paste and drop images and files into the remote (built)
+
+Built on 18 November 2026 as Session > Coding agents > Paste and drop files: upload and type the path (setting `UploadAndTypePath`, off by default). See [Pasting screenshots and files for an agent](../guide/everyday-use.md#pasting-screenshots-and-files-for-an-agent).
 
 **What FeroSSH has.** Dropping files from Explorer (or from File transfer's Local list) on a terminal pane asks, then uploads them over SFTP to that pane's directory. Ctrl+V pastes text only, bracketed and sanitised.
 

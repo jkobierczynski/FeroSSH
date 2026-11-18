@@ -606,6 +606,9 @@ mod cmd {
     pub const NOTIFY_QUIET: u32 = 652;
     /// Session > Coding agents > Show agents; the menu's first item.
     pub const AGENTS_SHOW: u32 = 653;
+    /// Session > Coding agents > Paste and drop files: upload and type
+    /// the path; the menu's second item.
+    pub const UPLOAD_TYPE_PATH: u32 = 654;
     /// Session > Coding agents: plus the index into the commands listed
     /// when the menu opened, up to [`AGENT_END`].
     pub const AGENT_START: u32 = 660;
@@ -1227,6 +1230,8 @@ struct Window {
     /// Server files being edited locally, put back on each save.
     edits: crate::edit_local::Edits,
     edit_timer: bool,
+    /// Files pasted or dropped whose paths are typed once they are up.
+    pastes: Vec<PasteBatch>,
     forwards_view: ForwardsView,
     live_view: LiveView,
     /// tmux control mode, per SSH pane that has run `tmux -CC`.
@@ -2330,6 +2335,7 @@ fn create_and_run(launch: Launch, theme: Option<String>) -> Result<()> {
                 transfer_timer: false,
                 edits: crate::edit_local::Edits::default(),
                 edit_timer: false,
+                pastes: Vec::new(),
                 forwards_view: ForwardsView::default(),
                 live_view: LiveView::default(),
                 tmux: HashMap::new(),
@@ -2640,6 +2646,11 @@ fn build_menu() -> Result<HMENU> {
             agents,
             cmd::AGENTS_SHOW,
             "&Show agents in the Session manager",
+        )?;
+        item(
+            agents,
+            cmd::UPLOAD_TYPE_PATH,
+            "&Paste and drop files: upload and type the path",
         )?;
         AppendMenuW(session, MF_POPUP, agents.0 as usize, w!("Coding a&gents"))?;
         separator(session)?;
@@ -8825,7 +8836,9 @@ impl Window {
                 break;
             }
         }
+        let mut pasted = None;
         if transfers {
+            pasted = self.settle_pastes();
             self.flush_sftp();
             if self.files_visible() {
                 self.refresh_chrome();
@@ -8857,7 +8870,9 @@ impl Window {
                 let _ = PostMessageW(Some(self.hwnd), WM_SHELL_OUTPUT, WPARAM(0), LPARAM(0));
             }
         }
-        self.after_feed()
+        let mut commands = self.after_feed();
+        commands.extend(pasted);
+        commands
     }
 
     /// Handles what the worker of the connection `connection` sent, and
@@ -9163,10 +9178,11 @@ impl Window {
     fn fill_agents(&mut self, menu: HMENU) {
         let commands = crate::agents::commands(&self.settings.agent_commands);
         // SAFETY: our popup menu; it is being opened, when changing it is
-        // allowed. Everything after Show agents is replaced.
+        // allowed. Everything after Show agents and the paste option is
+        // replaced.
         unsafe {
-            while GetMenuItemCount(Some(menu)) > 1 {
-                let _ = DeleteMenu(menu, 1, MF_BYPOSITION);
+            while GetMenuItemCount(Some(menu)) > 2 {
+                let _ = DeleteMenu(menu, 2, MF_BYPOSITION);
             }
             let _ = AppendMenuW(menu, MF_SEPARATOR, 0, None);
             for (id, c) in (cmd::AGENT_START..cmd::AGENT_END).zip(&commands) {
@@ -15387,6 +15403,11 @@ impl Window {
                 self.save_settings();
                 self.update_menu_checks();
             }
+            cmd::UPLOAD_TYPE_PATH => {
+                self.settings.upload_type_path = !self.settings.upload_type_path;
+                self.save_settings();
+                self.update_menu_checks();
+            }
             cmd::VERIFY => {
                 self.settings.verify_transfers = !self.settings.verify_transfers;
                 for remote in self.sftp.values_mut() {
@@ -15820,6 +15841,7 @@ impl Window {
                 (cmd::FOLLOW_CD, s.follow_directory),
                 (cmd::VERIFY, s.verify_transfers),
                 (cmd::ZMODEM, s.zmodem),
+                (cmd::UPLOAD_TYPE_PATH, s.upload_type_path),
                 (cmd::HIGHLIGHT, s.highlight),
                 (cmd::AUTO_RECONNECT, s.auto_reconnect),
                 (cmd::SIDE_RIGHT, s.side_pane_right),
@@ -16374,14 +16396,16 @@ impl Window {
         }
     }
 
-    fn on_transfer_timer(&mut self) {
+    fn on_transfer_timer(&mut self) -> Option<Command> {
         for remote in self.sftp.values_mut() {
             remote.poll();
         }
+        let pasted = self.settle_pastes();
         self.flush_sftp();
         if self.files_visible() {
             self.refresh_chrome();
         }
+        pasted
     }
 
     /// Points the file view at the focused pane's host when focus moved
@@ -16968,7 +16992,10 @@ impl Window {
                         JobOp::Retry => r.retry(id),
                     }
                 }
-                None
+                // A cancel can end a paste's last job with nothing left
+                // moving to tick the timer.
+                self.flush_sftp();
+                self.settle_pastes()
             }
             Event::ClearFinished => {
                 if let Some(r) = key.as_ref().and_then(|k| self.sftp.get_mut(k)) {
@@ -17153,6 +17180,178 @@ impl Window {
             self.refresh_chrome();
         }
         open
+    }
+
+    /// Uploads `paths` to `~/.cache/ferossh/paste/` on pane `id`'s host
+    /// and types their paths there once they are up (UploadAndTypePath).
+    /// `temp` are local copies made for this upload, removed after it;
+    /// the caller removes them on an error. Folders are left out.
+    fn upload_and_type(
+        &mut self,
+        id: PaneId,
+        paths: &[PathBuf],
+        temp: Vec<PathBuf>,
+    ) -> std::result::Result<(), String> {
+        const ON_A_PANE: &str = "Paste or drop files on a pane that is logged in to an SSH host \
+            to upload them there and type their paths.";
+        self.ensure_sftp(id);
+        let key = self.files_target(id).ok_or(ON_A_PANE)?;
+        let remote = self.sftp.get_mut(&key).ok_or(ON_A_PANE)?;
+        let mut jobs = Vec::new();
+        let mut left_out = Vec::new();
+        for path in paths {
+            match remote.upload_into_home(path, crate::paste_upload::FOLDER) {
+                Ok(job) => jobs.push(job),
+                Err(e) => left_out.push(e),
+            }
+        }
+        if !jobs.is_empty() {
+            let connection = self.typing_connection(id);
+            self.pastes.push(PasteBatch {
+                pane: id,
+                connection,
+                queue: key,
+                results: vec![None; jobs.len()],
+                jobs,
+                temp,
+            });
+        }
+        self.flush_sftp();
+        if self.files_visible() {
+            self.refresh_chrome();
+        }
+        if left_out.is_empty() {
+            Ok(())
+        } else {
+            Err(format!(
+                "Only files are uploaded and their paths typed; use File transfer for \
+                 folders. Left out:\n\n{}",
+                left_out.join("\n")
+            ))
+        }
+    }
+
+    /// Types the paths of pasted files whose uploads have all finished;
+    /// shows the queue when one of them did not make it.
+    fn settle_pastes(&mut self) -> Option<Command> {
+        if self.pastes.is_empty() {
+            return None;
+        }
+        let mut failures = Vec::new();
+        for mut batch in std::mem::take(&mut self.pastes) {
+            let remote = self.sftp.get(&batch.queue);
+            // Each result is kept as its job finishes, so clearing the
+            // finished transfers meanwhile loses nothing.
+            for (k, &j) in batch.jobs.iter().enumerate() {
+                let state = remote.and_then(|r| r.job_state(j));
+                let Some(slot) = batch.results.get_mut(k) else {
+                    continue;
+                };
+                // Retried after it failed: wait for the new outcome.
+                if state.is_some_and(|s| !s.finished()) {
+                    *slot = None;
+                } else if slot.is_none() {
+                    let landed = remote.and_then(|r| r.landed(j)).map(<[u8]>::to_vec);
+                    let note = remote
+                        .and_then(|r| r.jobs().iter().find(|x| x.id == j))
+                        .and_then(|x| x.note.clone());
+                    *slot = Some(landed.ok_or(note));
+                }
+            }
+            if batch.results.iter().any(Option::is_none) {
+                self.pastes.push(batch);
+                continue;
+            }
+            let mut landed = Vec::new();
+            let mut why = None;
+            for result in batch.results.iter().flatten() {
+                match result {
+                    Ok(path) => landed.push(path.clone()),
+                    Err(note) => {
+                        why = why.or_else(|| Some(note.clone()));
+                    }
+                }
+            }
+            let missed = batch.jobs.len() - landed.len();
+            if missed == 0 {
+                for t in &batch.temp {
+                    let _ = std::fs::remove_file(t);
+                }
+            } else {
+                // A failed image stays for Retry in the queue; old ones no
+                // transfer needs are swept on a later paste.
+                let host = batch
+                    .queue
+                    .rsplit_once(':')
+                    .map_or(batch.queue.as_str(), |(h, _)| h);
+                let reason = why
+                    .flatten()
+                    .map(|n| format!(": {n}"))
+                    .unwrap_or_else(|| ".".into());
+                let text = format!(
+                    "{missed} pasted file{} did not upload to {host}{reason}",
+                    plural(missed)
+                );
+                // Kept on the queue too, in case another dialog is open.
+                if let Some(r) = self.sftp.get_mut(&batch.queue) {
+                    r.notice = Some(format!("Path not typed: {text}"));
+                }
+                failures.push(text);
+            }
+            if landed.is_empty() {
+                continue;
+            }
+            let text = crate::paste_upload::typed(&landed);
+            // Only into the same logged-in session: after a reconnect the
+            // pane may be at a login prompt.
+            let same = batch.connection.is_some()
+                && self.typing_connection(batch.pane) == batch.connection;
+            let paste = self
+                .panes
+                .get(&batch.pane)
+                .filter(|_| same)
+                .map(|p| p.term.paste(&text));
+            match paste {
+                Some(paste) => self.input(batch.pane, paste.bytes),
+                None => {
+                    let shown: Vec<String> = landed.iter().map(|p| names::display(p)).collect();
+                    failures.push(format!(
+                        "The pane's session ended before the upload finished, so these \
+                         paths were not typed:\n{}",
+                        shown.join("\n")
+                    ));
+                }
+            }
+        }
+        if failures.is_empty() {
+            return None;
+        }
+        Some(Command::Notice(format!(
+            "{}\n\nThe paths of files that did not upload were not typed. File transfer \
+             shows the transfer queue of that host, where you can retry them.",
+            failures.join("\n")
+        )))
+    }
+
+    /// The connection of pane `id`'s logged-in SSH session (its tmux
+    /// gateway's for a tmux pane), which typed paths must still be on.
+    fn typing_connection(&self, id: PaneId) -> Option<ChannelId> {
+        match self.panes.get(&self.host_pane(id)).map(|p| &p.host) {
+            Some(Host::Ssh(s)) if s.state() == State::Connected => Some(s.connection),
+            _ => None,
+        }
+    }
+
+    /// Whether files dropped at client point (`x`, `y`) go up with their
+    /// paths typed: UploadAndTypePath is on and they landed on a pane.
+    fn drop_types_path(&self, x: i32, y: i32) -> Option<PaneId> {
+        if !self.settings.upload_type_path {
+            return None;
+        }
+        match self.spot(x, y) {
+            Spot::Pane(id) => Some(id),
+            _ => None,
+        }
     }
 
     /// Queues uploads and shows the queue.
@@ -17887,6 +18086,23 @@ fn route_key(t: &Target) -> String {
     )
 }
 
+/// Files pasted or dropped on a pane together, uploading to its host:
+/// their paths are typed there, in order, once all are done.
+struct PasteBatch {
+    pane: PaneId,
+    /// The pane's session when the paste began: paths are typed only
+    /// while it is still the one logged in.
+    connection: Option<ChannelId>,
+    queue: String,
+    jobs: Vec<ferossh_sftp::JobId>,
+    /// Each job's outcome once it finished: where it landed, or the
+    /// queue's note on why not.
+    results: Vec<Option<std::result::Result<Vec<u8>, Option<String>>>>,
+    /// Pasted images saved to a local file for the upload, removed once
+    /// it succeeded.
+    temp: Vec<PathBuf>,
+}
+
 /// The paths of files dropped from Explorer, and where they were dropped.
 fn dropped_files(drop: HDROP) -> (Vec<PathBuf>, POINT) {
     let mut paths = Vec::new();
@@ -17924,6 +18140,15 @@ fn upload_dropped(hwnd: HWND, paths: &[PathBuf], at: POINT) {
     if paths.is_empty() {
         return;
     }
+    // UploadAndTypePath: on a pane, no question; the paths are typed.
+    if let Some(id) = with_window(|w| w.drop_types_path(at.x, at.y)).flatten() {
+        let done = with_window(|w| w.upload_and_type(id, paths, Vec::new()))
+            .unwrap_or(Err("FeroSSH is busy; drop the files again.".into()));
+        if let Err(why) = done {
+            dialog(hwnd, &why, MB_OK | MB_ICONINFORMATION);
+        }
+        return;
+    }
     let target = with_window(|w| w.drop_target(at.x, at.y))
         .unwrap_or(Err("FeroSSH is busy; drop the files again."));
     let (key, dir) = match target {
@@ -17947,6 +18172,103 @@ fn upload_dropped(hwnd: HWND, paths: &[PathBuf], at: POINT) {
     if dialog(hwnd, &text, MB_YESNO | MB_ICONQUESTION) == Some(IDYES) {
         with_window(|w| w.upload_files(&key, paths, &dir));
     }
+}
+
+/// Paste with no text on the clipboard, when UploadAndTypePath is on:
+/// files copied in Explorer, or else an image, go up to the focused
+/// pane's host and their paths are typed there.
+fn paste_files(hwnd: HWND) {
+    // Not while a side pane has the keyboard: it takes text only.
+    if with_window(|w| w.settings.upload_type_path && !(w.side.visible && w.side.focused))
+        != Some(true)
+    {
+        return;
+    }
+    let Some(id) = with_window(|w| w.focused_id()) else {
+        return;
+    };
+    let files = clipboard::get_files(hwnd);
+    let (paths, temp) = if files.is_empty() {
+        let png = match clipboard::get_png(hwnd) {
+            Some(png) => Ok(png),
+            None => match clipboard::get_dib(hwnd) {
+                Some(dib) => crate::paste_upload::png_from_dib(&dib),
+                None => return,
+            },
+        };
+        // Images an unfinished transfer still reads are never swept.
+        let needed = with_window(|w| {
+            w.sftp
+                .values()
+                .flat_map(Remote::jobs)
+                .filter(|j| !j.state.finished())
+                .map(|j| j.local.clone())
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+        match png.and_then(|png| save_pasted_image(&png, &needed)) {
+            Ok(path) => (vec![path.clone()], vec![path]),
+            Err(why) => {
+                dialog(hwnd, &why, MB_OK | MB_ICONINFORMATION);
+                return;
+            }
+        }
+    } else {
+        (files, Vec::new())
+    };
+    let done = with_window(|w| w.upload_and_type(id, &paths, temp.clone()))
+        .unwrap_or(Err("FeroSSH is busy; paste again.".into()));
+    if let Err(why) = done {
+        // Nothing queued keeps a local copy.
+        let queued = with_window(|w| w.pastes.iter().any(|b| b.temp == temp)).unwrap_or(false);
+        if !queued {
+            for t in &temp {
+                let _ = std::fs::remove_file(t);
+            }
+        }
+        dialog(hwnd, &why, MB_OK | MB_ICONINFORMATION);
+    }
+}
+
+/// Saves a pasted image as a PNG in FeroSSH's temporary folder, under a
+/// name from the local time, for uploading.
+fn save_pasted_image(png: &[u8], needed: &[PathBuf]) -> std::result::Result<PathBuf, String> {
+    let dir = std::env::temp_dir().join("FeroSSH-paste");
+    std::fs::create_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+    // Images whose upload failed stay for Retry; after a day they go.
+    if let Ok(entries) = std::fs::read_dir(&dir) {
+        let day = std::time::Duration::from_secs(24 * 60 * 60);
+        for e in entries.flatten() {
+            let old = e
+                .metadata()
+                .and_then(|m| m.modified())
+                .ok()
+                .and_then(|t| t.elapsed().ok())
+                .is_some_and(|age| age > day);
+            if old && !needed.contains(&e.path()) {
+                let _ = std::fs::remove_file(e.path());
+            }
+        }
+    }
+    let name = crate::paste_upload::image_name(local_time());
+    let path = dir.join(&name);
+    // Two pastes in one second: the later one gets a number.
+    let path = if path.exists() {
+        (2..100)
+            .map(|n| {
+                dir.join(
+                    names::numbered(&name, n)
+                        .replace(' ', "-")
+                        .replace(['(', ')'], ""),
+                )
+            })
+            .find(|p| !p.exists())
+            .ok_or_else(|| format!("{}: too many pasted images this second.", dir.display()))?
+    } else {
+        path
+    };
+    std::fs::write(&path, png).map_err(|e| format!("{}: {e}", path.display()))?;
+    Ok(path)
 }
 
 /// File > Upload files (and ZMODEM): the system file picker, several
@@ -18875,6 +19197,7 @@ fn run_command(hwnd: HWND, command: Command) {
         }
         Command::Paste => {
             let Some(text) = clipboard::get_text(hwnd) else {
+                paste_files(hwnd);
                 return;
             };
             if with_window(|w| w.paste_side(&text)) == Some(true) {
@@ -20765,7 +21088,9 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                 LRESULT(0)
             }
             WM_TIMER if wparam.0 == TIMER_TRANSFER => {
-                with_window(Window::on_transfer_timer);
+                if let Some(c) = with_window(Window::on_transfer_timer).flatten() {
+                    run_command(hwnd, c);
+                }
                 LRESULT(0)
             }
             WM_TIMER if wparam.0 == TIMER_SCRIPT => {

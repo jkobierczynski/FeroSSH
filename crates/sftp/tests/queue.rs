@@ -1317,3 +1317,238 @@ fn long_collision(scratch: &str, stem: &str, ext: &str) {
     assert!(name.len() + ".part".len() <= 255, "{}", name.len());
     assert_eq!(fs::read(s.local().join(name)).unwrap(), two);
 }
+
+#[test]
+fn uploads_into_a_home_folder_it_makes_and_numbers_taken_names() {
+    let s = Scratch::new("into-home");
+    let shot = s.local().join("shot.png");
+    fs::write(&shot, "png").unwrap();
+    // Queued before the channel is open, so before the home folder is known.
+    let mut remote = Remote::new("me@host");
+    remote.attach(CHANNEL, 1);
+    let mut fake = Fake::new(s.remote());
+    let first = remote
+        .upload_into_home(&shot, b".cache/ferossh/paste")
+        .unwrap();
+    assert!(run(&mut remote, &mut fake));
+    assert_eq!(remote.job_state(first), Some(State::Done));
+    assert_eq!(
+        remote.landed(first),
+        Some(&b"/.cache/ferossh/paste/shot.png"[..])
+    );
+    // Again, with the folders there: no question, a numbered name.
+    let second = remote
+        .upload_into_home(&shot, b".cache/ferossh/paste")
+        .unwrap();
+    assert!(run(&mut remote, &mut fake));
+    assert_eq!(remote.job_state(second), Some(State::Done));
+    assert_eq!(
+        remote.landed(second),
+        Some(&b"/.cache/ferossh/paste/shot (2).png"[..])
+    );
+    let dir = s.remote().join(".cache/ferossh/paste");
+    assert_eq!(fs::read_to_string(dir.join("shot.png")).unwrap(), "png");
+    assert_eq!(fs::read_to_string(dir.join("shot (2).png")).unwrap(), "png");
+}
+
+#[test]
+fn an_upload_into_the_home_folder_stops_at_a_file_in_the_way() {
+    let s = Scratch::new("into-home-file");
+    let shot = s.local().join("shot.png");
+    fs::write(&shot, "png").unwrap();
+    fs::write(s.remote().join(".cache"), "not a folder").unwrap();
+    let (mut remote, mut fake) = connected(&s.remote());
+    let id = remote.upload_into_home(&shot, b".cache/ferossh").unwrap();
+    assert!(run(&mut remote, &mut fake));
+    assert_eq!(remote.job_state(id), Some(State::Failed));
+    assert_eq!(remote.landed(id), None);
+}
+
+#[test]
+fn an_upload_into_the_home_folder_takes_only_a_plain_path_and_a_file() {
+    let s = Scratch::new("into-home-plain");
+    let shot = s.local().join("shot.png");
+    fs::write(&shot, "png").unwrap();
+    let (mut remote, _) = connected(&s.remote());
+    for bad in [&b""[..], b"/tmp", b"../up", b"a//b", b"a/./b", b"a/"] {
+        assert!(remote.upload_into_home(&shot, bad).is_err(), "{bad:?}");
+    }
+    assert!(remote.upload_into_home(&s.local(), b"paste").is_err());
+    assert!(remote.jobs().is_empty());
+}
+
+#[test]
+fn two_pasted_files_of_one_name_never_share_a_part_file() {
+    let s = Scratch::new("into-home-same");
+    fs::create_dir_all(s.local().join("a")).unwrap();
+    fs::create_dir_all(s.local().join("b")).unwrap();
+    fs::write(s.local().join("a/shot.png"), "first").unwrap();
+    fs::write(s.local().join("b/shot.png"), "second").unwrap();
+    let (mut remote, mut fake) = connected(&s.remote());
+    let a = remote
+        .upload_into_home(&s.local().join("a/shot.png"), b"paste")
+        .unwrap();
+    let b = remote
+        .upload_into_home(&s.local().join("b/shot.png"), b"paste")
+        .unwrap();
+    assert!(run(&mut remote, &mut fake));
+    assert_eq!(remote.landed(a), Some(&b"/paste/shot.png"[..]));
+    assert_eq!(remote.landed(b), Some(&b"/paste/shot (2).png"[..]));
+    let dir = s.remote().join("paste");
+    assert_eq!(fs::read_to_string(dir.join("shot.png")).unwrap(), "first");
+    assert_eq!(
+        fs::read_to_string(dir.join("shot (2).png")).unwrap(),
+        "second"
+    );
+}
+
+#[test]
+fn a_retried_paste_upload_still_keeps_both() {
+    let s = Scratch::new("into-home-retry");
+    let shot = s.local().join("shot.png");
+    fs::write(&shot, "new").unwrap();
+    fs::create_dir_all(s.remote().join("paste")).unwrap();
+    fs::write(s.remote().join("paste/shot.png"), "old").unwrap();
+    let (mut remote, mut fake) = connected(&s.remote());
+    // "Overwrite all" chosen for another transfer earlier.
+    let other = s.local().join("other.txt");
+    fs::write(&other, "x").unwrap();
+    fs::write(s.remote().join("other.txt"), "y").unwrap();
+    let o = remote.upload(&other, b"/").unwrap();
+    assert!(run(&mut remote, &mut fake));
+    remote.answer(o, Choice::Overwrite, true);
+    assert!(run(&mut remote, &mut fake));
+    let id = remote.upload_into_home(&shot, b"paste").unwrap();
+    remote.cancel(id);
+    remote.retry(id);
+    assert!(run(&mut remote, &mut fake));
+    assert_eq!(remote.landed(id), Some(&b"/paste/shot (2).png"[..]));
+    let dir = s.remote().join("paste");
+    assert_eq!(fs::read_to_string(dir.join("shot.png")).unwrap(), "old");
+}
+
+#[test]
+fn a_numbered_name_another_upload_is_writing_is_skipped() {
+    let s = Scratch::new("into-home-numbered");
+    fs::create_dir_all(s.remote().join("paste")).unwrap();
+    fs::write(s.remote().join("paste/shot.png"), "old").unwrap();
+    fs::write(s.local().join("shot.png"), "new").unwrap();
+    fs::write(s.local().join("shot (2).png"), "named two").unwrap();
+    let (mut remote, mut fake) = connected(&s.remote());
+    remote.parallel = 4;
+    // Both start at once: the first must not pick the second's name.
+    let named = remote
+        .upload_into_home(&s.local().join("shot (2).png"), b"paste")
+        .unwrap();
+    let kept = remote
+        .upload_into_home(&s.local().join("shot.png"), b"paste")
+        .unwrap();
+    assert!(run(&mut remote, &mut fake));
+    assert_eq!(remote.landed(named), Some(&b"/paste/shot (2).png"[..]));
+    assert_eq!(remote.landed(kept), Some(&b"/paste/shot (3).png"[..]));
+    let dir = s.remote().join("paste");
+    assert_eq!(
+        fs::read_to_string(dir.join("shot (2).png")).unwrap(),
+        "named two"
+    );
+    assert_eq!(fs::read_to_string(dir.join("shot (3).png")).unwrap(), "new");
+}
+
+#[test]
+fn a_pasted_file_steps_around_a_folder_of_its_name() {
+    let s = Scratch::new("into-home-folder");
+    fs::create_dir_all(s.remote().join("paste/shot.png")).unwrap();
+    fs::write(s.local().join("shot.png"), "png").unwrap();
+    let (mut remote, mut fake) = connected(&s.remote());
+    let id = remote
+        .upload_into_home(&s.local().join("shot.png"), b"paste")
+        .unwrap();
+    assert!(run(&mut remote, &mut fake));
+    assert_eq!(remote.landed(id), Some(&b"/paste/shot (2).png"[..]));
+}
+
+#[test]
+fn a_paused_numbered_upload_keeps_its_name_from_a_file_called_that() {
+    let s = Scratch::new("into-home-paused");
+    fs::create_dir_all(s.remote().join("paste")).unwrap();
+    fs::write(s.remote().join("paste/shot.png"), "old").unwrap();
+    let big = pattern(4 << 20);
+    fs::write(s.local().join("shot.png"), &big).unwrap();
+    fs::write(s.local().join("shot (2).png"), "named two").unwrap();
+    let (mut remote, mut fake) = connected(&s.remote());
+    let kept = remote
+        .upload_into_home(&s.local().join("shot.png"), b"paste")
+        .unwrap();
+    // Step until it writes its numbered part file, then pause it.
+    let part = s.remote().join("paste/shot (2).png.filepart");
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while !part.exists() {
+        assert!(Instant::now() < deadline, "never started writing");
+        for msg in remote.take_outbox() {
+            if let Message::SftpRequest { channel, id, op } = msg {
+                for reply in fake.serve(op) {
+                    remote.on_message(Message::SftpReply { channel, id, reply });
+                }
+            }
+        }
+    }
+    remote.pause(kept);
+    assert_eq!(remote.job_state(kept), Some(State::Paused));
+    // A file named like the paused one's numbered name must wait.
+    let named = remote
+        .upload_into_home(&s.local().join("shot (2).png"), b"paste")
+        .unwrap();
+    assert!(run(&mut remote, &mut fake));
+    assert_eq!(remote.job_state(named), Some(State::Queued));
+    remote.resume(kept);
+    assert!(run(&mut remote, &mut fake));
+    assert_eq!(remote.landed(kept), Some(&b"/paste/shot (2).png"[..]));
+    assert_eq!(remote.landed(named), Some(&b"/paste/shot (2) (2).png"[..]));
+    let dir = s.remote().join("paste");
+    assert_eq!(fs::read(dir.join("shot (2).png")).unwrap(), big);
+}
+
+#[test]
+fn a_resumed_numbered_upload_keeps_its_name_while_queued() {
+    let s = Scratch::new("into-home-resumed");
+    fs::create_dir_all(s.remote().join("paste")).unwrap();
+    fs::write(s.remote().join("paste/shot.png"), "old").unwrap();
+    let big = pattern(4 << 20);
+    fs::write(s.local().join("shot.png"), &big).unwrap();
+    fs::write(s.local().join("shot (2).png"), "named two").unwrap();
+    let (mut remote, mut fake) = connected(&s.remote());
+    // Queued first, then cancelled: it comes back later by Retry.
+    let named = remote
+        .upload_into_home(&s.local().join("shot (2).png"), b"paste")
+        .unwrap();
+    remote.cancel(named);
+    let _ = remote.take_outbox();
+    let kept = remote
+        .upload_into_home(&s.local().join("shot.png"), b"paste")
+        .unwrap();
+    let part = s.remote().join("paste/shot (2).png.filepart");
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while !part.exists() {
+        assert!(Instant::now() < deadline, "never started writing");
+        for msg in remote.take_outbox() {
+            if let Message::SftpRequest { channel, id, op } = msg {
+                for reply in fake.serve(op) {
+                    remote.on_message(Message::SftpReply { channel, id, reply });
+                }
+            }
+        }
+    }
+    remote.pause(kept);
+    remote.retry(named);
+    // Resumed, the numbered upload is queued behind the earlier job.
+    remote.resume(kept);
+    assert!(run(&mut remote, &mut fake));
+    assert_eq!(remote.landed(kept), Some(&b"/paste/shot (2).png"[..]));
+    assert_eq!(remote.landed(named), Some(&b"/paste/shot (2) (2).png"[..]));
+    let dir = s.remote().join("paste");
+    assert_eq!(fs::read(dir.join("shot (2).png")).unwrap(), big);
+    assert_eq!(
+        fs::read_to_string(dir.join("shot (2) (2).png")).unwrap(),
+        "named two"
+    );
+}

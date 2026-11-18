@@ -882,6 +882,7 @@ dependencies = [
  "ferostream-client",
  "ferostream-proto",
  "getrandom 0.4.3",
+ "miniz_oxide 0.9.1",
  "russh",
  "tokio",
  "unicode-width",
