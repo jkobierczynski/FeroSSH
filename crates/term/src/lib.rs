@@ -16,7 +16,8 @@
 //!   answered.
 //!
 //! OSC 7 working-directory reports come out as
-//! [`Action::WorkingDirectory`], for the file view to follow.
+//! [`Action::WorkingDirectory`], for the file view to follow, and the
+//! desktop notifications of OSC 9, 777 and 99 as [`Action::Notify`].
 //!
 //! [`LogWriter`] writes a tab's session log, as plain text or raw bytes;
 //! [`cast`] records a pane's output with its timing and plays it back.
@@ -31,12 +32,14 @@ mod cwd;
 pub mod highlight;
 mod input;
 mod log;
+mod notify;
 mod sanitize;
 mod terminal;
 
 pub use cwd::{WorkingDir, prompt_dir};
 pub use input::{Key, Mods, MouseButton, MouseEvent};
 pub use log::{Clock, LogWriter, Sealed, log_file_name};
+pub use notify::{MAX_NOTIFICATION, Notification};
 pub use sanitize::{Paste, check_link, clipboard_preview, prepare_paste, sanitize_title};
 pub use terminal::{
     Action, InputLine, InputMark, MAX_COLS, MAX_ROWS, SelectionKind, Settings, Terminal,

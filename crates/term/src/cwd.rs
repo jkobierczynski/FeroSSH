@@ -1,6 +1,9 @@
 //! OSC 7, the working directory a shell reports (`ESC ] 7 ; file://host/path
 //! BEL`). The parser underneath drops it, so the host's output is watched
-//! for it on the side; the side pane's file view follows it.
+//! for it on the side; the side pane's file view follows it. The same
+//! watch finds the notifications of [`crate::notify`].
+
+use crate::notify::{self, Kitty, Notification};
 
 /// Longest OSC 7 text kept; longer ones are ignored.
 const MAX_LEN: usize = 4096;
@@ -19,11 +22,20 @@ enum State {
     SkipEsc,
 }
 
-/// Finds OSC 7 in a byte stream fed in arbitrary pieces.
+/// Finds OSC 7 and notifications in a byte stream fed in arbitrary
+/// pieces.
 #[derive(Debug, Default)]
 pub(crate) struct CwdScanner {
     state: State,
     buf: Vec<u8>,
+    kitty: Kitty,
+}
+
+/// What [`CwdScanner::scan`] found.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum Found {
+    Dir(WorkingDir),
+    Notify(Notification),
 }
 
 /// A reported working directory.
@@ -37,8 +49,9 @@ pub struct WorkingDir {
 }
 
 impl CwdScanner {
-    /// Scans `bytes`; returns the directories reported in them, in order.
-    pub(crate) fn scan(&mut self, bytes: &[u8]) -> Vec<WorkingDir> {
+    /// Scans `bytes`; returns the directories and notifications reported
+    /// in them, in order.
+    pub(crate) fn scan(&mut self, bytes: &[u8]) -> Vec<Found> {
         let mut found = Vec::new();
         for &b in bytes {
             self.state = match (self.state, b) {
@@ -53,7 +66,7 @@ impl CwdScanner {
                 (State::Esc, 0x1b) => State::Esc,
                 (State::Esc, _) => State::Ground,
                 (State::Osc, 0x07) => {
-                    found.extend(parse(&self.buf));
+                    found.extend(self.found());
                     State::Ground
                 }
                 (State::Osc, 0x1b) => State::OscEsc,
@@ -63,7 +76,7 @@ impl CwdScanner {
                     State::Osc
                 }
                 (State::OscEsc, b'\\') => {
-                    found.extend(parse(&self.buf));
+                    found.extend(self.found());
                     State::Ground
                 }
                 // An ESC that starts something else ends the OSC unfinished.
@@ -81,6 +94,15 @@ impl CwdScanner {
             self.buf.clear();
         }
         found
+    }
+}
+
+impl CwdScanner {
+    fn found(&mut self) -> Option<Found> {
+        if let Some(dir) = parse(&self.buf) {
+            return Some(Found::Dir(dir));
+        }
+        notify::parse(&self.buf, &mut self.kitty).map(Found::Notify)
     }
 }
 
@@ -185,11 +207,11 @@ mod tests {
         assert_eq!(d(""), None);
     }
 
-    fn dir(host: &str, path: &[u8]) -> WorkingDir {
-        WorkingDir {
+    fn dir(host: &str, path: &[u8]) -> Found {
+        Found::Dir(WorkingDir {
             host: host.into(),
             path: path.to_vec(),
-        }
+        })
     }
 
     #[test]
@@ -226,5 +248,24 @@ mod tests {
         assert_eq!(s.scan(&long), []);
         // And it still works afterwards.
         assert_eq!(s.scan(b"\x1b]7;file://h/ok\x07"), [dir("h", b"/ok")]);
+    }
+
+    #[test]
+    fn finds_notifications_between_directories() {
+        let mut s = CwdScanner::default();
+        let mut got = Vec::new();
+        for b in b"\x1b]7;file://h/a\x07\x1b]9;Waiting for you\x1b\\\x1b]9;4;1;5\x07\x07" {
+            got.extend(s.scan(&[*b]));
+        }
+        assert_eq!(
+            got,
+            [
+                dir("h", b"/a"),
+                Found::Notify(Notification {
+                    title: None,
+                    body: "Waiting for you".into()
+                })
+            ]
+        );
     }
 }

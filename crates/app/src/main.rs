@@ -24,6 +24,8 @@
 #[cfg_attr(not(windows), allow(dead_code))]
 mod agent_fwd;
 #[cfg_attr(not(windows), allow(dead_code))]
+mod attention;
+#[cfg_attr(not(windows), allow(dead_code))]
 mod batch;
 #[cfg_attr(not(windows), allow(dead_code))]
 mod broadcast;
@@ -70,6 +72,8 @@ mod script_hosts;
 mod script_report;
 #[cfg(windows)]
 mod scripts_panel;
+#[cfg(windows)]
+mod toast;
 // Platform-neutral, tested everywhere; only the Windows build uses them.
 #[cfg_attr(not(windows), allow(dead_code))]
 mod copy_id;

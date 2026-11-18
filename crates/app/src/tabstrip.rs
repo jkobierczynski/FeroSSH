@@ -55,6 +55,9 @@ pub struct TabLabel {
     pub health: Health,
     /// Output or a bell arrived while the tab was in the background.
     pub bell: bool,
+    /// A pane in the tab asked for attention and was not looked at yet
+    /// (Settings > Desktop notifications): an amber diamond.
+    pub attention: bool,
     pub forwarding: Forwarding,
     /// The connection uses the opt-in legacy algorithms: `⚠`, in amber.
     pub legacy: bool,
@@ -283,7 +286,14 @@ pub fn draw(grid: &mut Grid, tabs: &[TabLabel], active: usize, palette: &Palette
             Health::Idle => palette.dim,
         };
         row.put("  ", fg, bg, Flags::empty());
-        row.put(if tab.bell { "◆" } else { "●" }, dot, bg, Flags::empty());
+        let (mark, dot) = if tab.attention {
+            ("◆", AMBER)
+        } else if tab.bell {
+            ("◆", dot)
+        } else {
+            ("●", dot)
+        };
+        row.put(mark, dot, bg, Flags::empty());
         row.put(" ", fg, bg, Flags::empty());
         let flags = if i == active {
             Flags::BOLD
@@ -353,6 +363,7 @@ mod tests {
             title: title.into(),
             health: Health::Connected,
             bell: false,
+            attention: false,
             forwarding: Forwarding::None,
             legacy: false,
             unencrypted: false,

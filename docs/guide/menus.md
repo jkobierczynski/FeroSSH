@@ -54,6 +54,8 @@ Items that can do nothing for the focused pane are greyed out, and the command p
 | Keep tools open | ✓ on | Off, an opened tool is a peek: clicking in the terminal, Esc, or connecting covers it again. Also the pin at the bottom of the rail. `ToolsPinned`. |
 | Tab strip | ✓ on | Shows the tab strip once there are two tabs. `TabStrip`. |
 | Server status bar | ✓ off | A row under the panes with the CPU, memory, root disk and network use of the server the focused pane is logged in to, sampled every 2 seconds on a channel of its own. `StatusBar`. |
+| Desktop notifications | ✓ off | A tab badge and a Windows notification when a pane wants you: a notification the host sends (OSC 9, 777 or 99), the bell, or quiet after work. See [Notifications](everyday-use.md#notifications-coding-agents-and-long-jobs). `Notifications`. |
+| Notify on the bell too | ✓ on | The bell counts as asking for attention. Greyed out while notifications are off. `NotifyBell`. |
 | Larger text | Ctrl+= (or Ctrl+wheel up) | Makes the focused pane's text bigger. |
 | Smaller text | Ctrl+- (or Ctrl+wheel down) | Makes it smaller. |
 | Reset text size | Ctrl+0 | Back to the pane's normal size. |
@@ -132,6 +134,7 @@ Font, theme and text size apply to the focused pane only. Session > Save font an
 | Logs and recordings > Play a recording... | Picks a `.cast` file and plays it in a new tab: Space pauses, Left and Right go 5 seconds back and on (Shift: 30), Up and Down change the speed, Home starts again, End goes to the end. |
 | Logs and recordings > Open log folder | Opens `%LOCALAPPDATA%\FeroSSH\logs` in Explorer. |
 | Logs and recordings > Check a log for changes... | Picks a log and says whether it is intact, or where it was changed, cut short or added to. |
+| Notify when this pane goes quiet | Watches the focused pane: when its output stops for 5 seconds after at least 8 seconds of output, it asks for attention. For coding agents and long jobs that send no notification of their own. ✓ while watching; greyed out while Settings > Desktop notifications is off. |
 | tmux > Attach tmux | Types `tmux -CC new-session -A -s main` in the pane and turns tmux windows and panes into native tabs and panes (see [tmux](everyday-use.md#tmux)). |
 | tmux > Switch tmux session... | Lists the other tmux sessions on the server and switches to one. |
 | tmux > Detach tmux | Leaves tmux, and everything running in it, on the server. Attach again later from this PC or another. |

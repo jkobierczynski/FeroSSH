@@ -20,9 +20,10 @@ use alacritty_terminal::vte::ansi::{
 };
 use ferossh_render::{Cell, Color, Cursor, CursorShape, Flags, Grid, Rgb, Theme};
 
-use crate::cwd::{CwdScanner, WorkingDir};
+use crate::cwd::{CwdScanner, Found, WorkingDir};
 use crate::highlight::{self, Highlighter};
 use crate::input::{self, Key, Mods, MouseButton, MouseEvent};
+use crate::notify::Notification;
 use crate::sanitize::{Paste, prepare_paste, sanitize_title};
 
 /// Per-session terminal settings, from the window's settings file and the
@@ -64,6 +65,9 @@ pub enum Action {
     Bell,
     /// The shell reported its working directory (OSC 7).
     WorkingDirectory(WorkingDir),
+    /// The host asked for a desktop notification (OSC 9, 777 or 99), with
+    /// its text sanitised.
+    Notify(Notification),
 }
 
 /// How a mouse selection grows.
@@ -84,6 +88,8 @@ const MAX_CLIPBOARD_REQUEST: usize = 1 << 20;
 /// Events kept between two `take_actions` calls; a host that floods
 /// queries gets the excess dropped rather than growing memory.
 const MAX_QUEUED_EVENTS: usize = 1024;
+/// Notifications kept between two `take_actions` calls.
+const MAX_NOTIFICATIONS: usize = 8;
 /// Combining-mark clusters a grid may collect before they are reset.
 const MAX_CLUSTERS: usize = 4096;
 /// The largest grid, more than any screen shows (8K at a 5-pixel font is
@@ -261,6 +267,9 @@ pub struct Terminal {
     cwd: CwdScanner,
     /// Working directories reported since the last `take_actions`.
     reported: Vec<WorkingDir>,
+    /// Notifications asked for since the last `take_actions`, at most
+    /// [`MAX_NOTIFICATIONS`].
+    notifications: Vec<Notification>,
     /// The title the host last set, as the UI was told.
     title: Option<String>,
     /// While the alternate screen is up: the title from before it, and
@@ -305,6 +314,7 @@ impl Terminal {
             scroll_scan: ScrollScan::default(),
             cwd: CwdScanner::default(),
             reported: Vec::new(),
+            notifications: Vec::new(),
             title: None,
             alt_title: None,
             fed: 0,
@@ -436,12 +446,27 @@ impl Terminal {
         }
     }
 
+    /// How many times host output was fed so far (wrapping): a change
+    /// means new output.
+    pub fn fed(&self) -> u64 {
+        self.fed
+    }
+
     /// Processes output from the host. Call [`Self::take_actions`] after.
     pub fn feed(&mut self, bytes: &[u8]) {
         self.fed = self.fed.wrapping_add(1);
-        let found = self.cwd.scan(bytes);
+        let mut last = None;
+        for found in self.cwd.scan(bytes) {
+            match found {
+                Found::Dir(dir) => last = Some(dir),
+                Found::Notify(n) if self.notifications.len() < MAX_NOTIFICATIONS => {
+                    self.notifications.push(n);
+                }
+                Found::Notify(_) => {}
+            }
+        }
         // Only the last report of a burst matters.
-        if let Some(last) = found.into_iter().last() {
+        if let Some(last) = last {
             self.reported.clear();
             self.reported.push(last);
         }
@@ -730,6 +755,7 @@ impl Terminal {
         let events = std::mem::take(&mut *self.events.0.borrow_mut());
         let mut actions: Vec<Action> = events.into_iter().filter_map(|e| self.action(e)).collect();
         actions.extend(self.reported.drain(..).map(Action::WorkingDirectory));
+        actions.extend(self.notifications.drain(..).map(Action::Notify));
         actions
     }
 
