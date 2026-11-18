@@ -76,6 +76,10 @@ impl Text {
             {
                 return None;
             }
+            // Padding fills the last group of four exactly.
+            if pad > 0 && (self.base64.len() + data) % 4 + pad != 4 {
+                return None;
+            }
             let room = MAX_PART_BYTES.saturating_sub(self.base64.len());
             self.base64
                 .extend(chunk.iter().filter(|&&c| c != b'=').take(room));
@@ -347,6 +351,8 @@ mod tests {
         // Padding inside a chunk is not base64.
         assert_eq!(parse(b"99;i=z:e=1;SG=k=", &mut k), None);
         assert_eq!(parse(b"99;i=z:e=1;SGk===", &mut k), None);
+        // One `=` too many for its group.
+        assert_eq!(parse(b"99;i=z:e=1;SGk==", &mut k), None);
     }
 
     #[test]
