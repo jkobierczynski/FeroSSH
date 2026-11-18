@@ -127,6 +127,8 @@ pub struct Job {
     /// reconnect so the job goes on with its own part file, and cancel
     /// removes that one and no other job's.
     dest: Option<PathBuf>,
+    /// A folder download left a folder or link in it unreadable.
+    unreadable: bool,
     run: Run,
     speed: Speed,
 }
@@ -831,6 +833,7 @@ impl Remote {
             put_back: None,
             generation: 0,
             dest: None,
+            unreadable: false,
             run: Run::Idle,
             speed: Speed::default(),
         });
@@ -899,6 +902,20 @@ impl Remote {
 
     fn index(&self, id: JobId) -> Option<usize> {
         self.jobs.iter().position(|j| j.id == id)
+    }
+
+    /// Job `id` is done and brought down everything: for a folder, every
+    /// file in it done and no folder in it left unreadable. (A folder
+    /// download otherwise counts as done with a note saying what it
+    /// missed.)
+    pub fn whole(&self, id: JobId) -> bool {
+        let Some(job) = self.jobs.iter().find(|j| j.id == id) else {
+            return false;
+        };
+        if job.state != State::Done || job.unreadable {
+            return false;
+        }
+        self.children(id).into_iter().all(|c| self.whole(c))
     }
 
     fn children(&self, id: JobId) -> Vec<JobId> {
@@ -2175,6 +2192,7 @@ impl Remote {
                 job.state = State::Done;
             }
             job.note = Some(notes.join("; "));
+            job.unreadable = unreadable;
             job.run = Run::Idle;
         }
     }

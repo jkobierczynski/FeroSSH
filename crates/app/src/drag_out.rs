@@ -97,6 +97,9 @@ pub struct Wait {
     /// The transfer queue they run on, once queued.
     pub queue: Option<String>,
     pub jobs: Vec<JobId>,
+    /// Where the drag told the target the files are: each must be there
+    /// before the drop goes through.
+    pub paths: Vec<PathBuf>,
     /// `Ok` once every one is done; why not, when one failed, was
     /// cancelled or could not start.
     pub outcome: Option<Result<(), String>>,
@@ -114,6 +117,9 @@ pub fn outcome(states: impl IntoIterator<Item = Option<State>>) -> Option<Result
         match state {
             None | Some(State::Cancelled | State::Skipped) => {
                 return Some(Err("The download for the drop was cancelled.".into()));
+            }
+            Some(State::Waiting) => {
+                return Some(Err("The connection dropped: the drop was cancelled.".into()));
             }
             Some(State::Failed) => {
                 return Some(Err(
@@ -193,7 +199,8 @@ mod ole {
             if keys.0 & MK_LBUTTON.0 != 0 {
                 return S_OK;
             }
-            let taken = self.effect.get() != DROPEFFECT_NONE;
+            // Copy offered (perhaps with scrolling), not just scrolling.
+            let taken = self.effect.get().0 & DROPEFFECT_COPY.0 != 0;
             let on_drop = self.on_drop.borrow_mut().take();
             if on_drop.is_some_and(|f| f(taken)) {
                 DRAGDROP_S_DROP
@@ -338,7 +345,6 @@ mod tests {
     fn the_drop_waits_for_every_download() {
         use State::*;
         assert_eq!(outcome([Some(Done), Some(Running)]), None);
-        assert_eq!(outcome([Some(Queued), Some(Waiting)]), None);
         assert_eq!(outcome([Some(Done), Some(Done)]), Some(Ok(())));
         assert!(matches!(outcome([Some(Done), Some(Failed)]), Some(Err(_))));
         assert!(matches!(
@@ -346,6 +352,8 @@ mod tests {
             Some(Err(_))
         ));
         assert!(matches!(outcome([Some(Running), None]), Some(Err(_))));
+        // A lost connection ends the wait; nobody can reconnect meanwhile.
+        assert!(matches!(outcome([Some(Done), Some(Waiting)]), Some(Err(_))));
         assert!(matches!(outcome([]), Some(Err(_))));
     }
 }

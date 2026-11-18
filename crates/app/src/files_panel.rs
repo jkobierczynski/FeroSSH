@@ -142,6 +142,10 @@ pub enum Event {
     /// Download these entries of the listed remote folder into `into`
     /// for files dragged out to Explorer; `ticket` follows them.
     DragOut {
+        /// The queue and remote folder the drag started on: if the
+        /// Remote list moved since, nothing is downloaded.
+        queue: Option<String>,
+        dir: Vec<u8>,
         keys: Vec<Vec<u8>>,
         into: PathBuf,
         ticket: crate::drag_out::Ticket,
@@ -397,6 +401,8 @@ struct State {
     deferred: Vec<Event>,
     /// A Sync go-back waiting for the Remote list to settle.
     going_back: Option<files::SyncBack>,
+    /// Files dragged out wait for their downloads: the line says so.
+    dropping: Option<String>,
 }
 
 /// Posted to the main window when events wait in `deferred`: it hands
@@ -790,6 +796,7 @@ pub fn create(main: HWND, handler: Handler, dpi: u32) -> windows::core::Result<(
                 in_view: false,
                 deferred: Vec::new(),
                 going_back: None,
+                dropping: None,
                 shown_host: None,
             });
         });
@@ -1539,8 +1546,9 @@ pub fn set_view(view: View) {
 fn refresh_status(h: &Handles) {
     let Some((text, show)) = with(|s| {
         let t = s
-            .local_error
+            .dropping
             .clone()
+            .or_else(|| s.local_error.clone())
             .or_else(|| s.view.as_ref().and_then(|v| v.status.clone()).map(|v| v.0));
         let show = t.is_some();
         (t.unwrap_or_default(), show)
@@ -3413,9 +3421,16 @@ fn ours(h: &Handles, pt: POINT) -> bool {
 fn drag_out(h: &Handles) {
     use crate::drag_out;
     let rows = picked(h, true);
-    if rows.is_empty() || remote_dir().is_none() {
+    let Some(dir) = remote_dir() else {
+        return;
+    };
+    if rows.is_empty() {
         return;
     }
+    let source = Source {
+        queue: shown_queue(),
+        dir,
+    };
     let folder = match drag_out::folder() {
         Ok(f) => f,
         Err(e) => {
@@ -3439,13 +3454,19 @@ fn drag_out(h: &Handles) {
     };
     let ticket = drag_out::Ticket::default();
     let on_drop = {
-        let (h, folder, paths, keys) = (*h, folder.clone(), stand.paths.clone(), stand.keys);
+        let (h, folder, keys) = (*h, folder.clone(), stand.keys);
         let ticket = ticket.clone();
-        Box::new(move |taken| let_go(&h, &folder, &paths, keys, &ticket, taken))
+        ticket.borrow_mut().paths = stand.paths.clone();
+        Box::new(move |taken| let_go(&h, &source, &folder, keys, &ticket, taken))
     };
     let dragged = drag_out::drag(h.main, &stand.paths, on_drop);
-    let dropped = matches!(ticket.borrow().outcome, Some(Ok(())));
-    if !dropped {
+    let (dropped, queued) = {
+        let t = ticket.borrow();
+        (matches!(t.outcome, Some(Ok(()))), !t.jobs.is_empty())
+    };
+    // Downloads that were queued stay listed (Retry included), so their
+    // folder stays too, until a later drag sweeps it.
+    if !dropped && !queued {
         let _ = std::fs::remove_dir_all(&folder);
     }
     if let Err(e) = dragged {
@@ -3463,8 +3484,8 @@ fn drag_out(h: &Handles) {
 /// `taken` the files, they are downloaded first.
 fn let_go(
     h: &Handles,
+    source: &Source,
     folder: &Path,
-    paths: &[PathBuf],
     keys: Vec<Vec<u8>>,
     ticket: &crate::drag_out::Ticket,
     taken: bool,
@@ -3478,16 +3499,27 @@ fn let_go(
         if let Some((false, at)) = target_at(h, pt) {
             let into = at
                 .and_then(|i| with(|s| s.local_shown.get(i).and_then(|r| r.local.clone())))
-                .flatten();
-            download(h, into);
+                .flatten()
+                .or_else(|| with(|s| s.local.dir().map(PathBuf::from)).flatten());
+            // The files the drag started with, if the Remote list still
+            // shows their folder.
+            let same = shown_queue() == source.queue && remote_dir().as_ref() == Some(&source.dir);
+            match into {
+                Some(into) if same => emit(Event::Download { keys, into }),
+                Some(_) => local_problem(MOVED.into()),
+                None => local_problem("Choose a folder in the Local list to download into.".into()),
+            }
         }
         return false;
     }
     if !taken {
         return false;
     }
-    crate::drag_out::remove_stand_ins(paths);
+    let paths = ticket.borrow().paths.clone();
+    crate::drag_out::remove_stand_ins(&paths);
     emit(Event::DragOut {
+        queue: source.queue.clone(),
+        dir: source.dir.clone(),
         keys,
         into: folder.to_path_buf(),
         ticket: ticket.clone(),
@@ -3501,12 +3533,21 @@ fn let_go(
     wait_for_drop(h, ticket)
 }
 
+/// The Remote list a drag out started on.
+struct Source {
+    queue: Option<String>,
+    dir: Vec<u8>,
+}
+
+/// Why a drag out did nothing: the Remote list moved meanwhile.
+const MOVED: &str = "The Remote list moved to another folder: drag the files again.";
+
 /// Waits, running the window's messages, until the drop's downloads are
 /// done (true), one fails, or Escape cancels them.
 fn wait_for_drop(h: &Handles, ticket: &crate::drag_out::Ticket) -> bool {
     use std::time::{Duration, Instant};
     const CHECK: Duration = Duration::from_millis(100);
-    with(|s| s.local_error = Some("Downloading for the drop. Esc cancels it.".into()));
+    with(|s| s.dropping = Some("Downloading for the drop. Esc cancels it.".into()));
     refresh_status(h);
     // SAFETY: a plain cursor change.
     unsafe {
@@ -3518,7 +3559,16 @@ fn wait_for_drop(h: &Handles, ticket: &crate::drag_out::Ticket) -> bool {
     let result = loop {
         let outcome = ticket.borrow().outcome.clone();
         match outcome {
-            Some(Ok(())) => break Ok(()),
+            Some(Ok(())) => {
+                // Each where the target was told it is.
+                let missing = ticket.borrow().paths.iter().any(|p| !p.exists());
+                if missing {
+                    break Err(Some(
+                        "A file for the drop went missing: drag the files again.".into(),
+                    ));
+                }
+                break Ok(());
+            }
             Some(Err(e)) => break Err(Some(e)),
             None => {}
         }
@@ -3540,7 +3590,12 @@ fn wait_for_drop(h: &Handles, ticket: &crate::drag_out::Ticket) -> bool {
             cancel: true,
         });
     }
-    with(|s| s.local_error = result.err().flatten());
+    with(|s| {
+        s.dropping = None;
+        if let Err(Some(e)) = result {
+            s.local_error = Some(e);
+        }
+    });
     refresh_status(h);
     ok
 }

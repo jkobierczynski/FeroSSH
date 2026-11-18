@@ -70,6 +70,8 @@ struct Fake {
     short_reads: bool,
     /// Refuse every chmod.
     chmod_fails: bool,
+    /// Refuse to list folders with this name.
+    unlistable: Option<&'static str>,
 }
 
 fn attrs_of(meta: &fs::Metadata) -> FileAttrs {
@@ -102,6 +104,7 @@ impl Fake {
             checksum_unavailable: false,
             short_reads: false,
             chmod_fails: false,
+            unlistable: None,
         }
     }
 
@@ -152,6 +155,13 @@ impl Fake {
                     Ok(m) => one(SftpReply::Attrs(attrs_of(&m))),
                     Err(e) => one(Self::io(&e)),
                 }
+            }
+            SftpOp::List { path }
+                if self
+                    .unlistable
+                    .is_some_and(|n| path.ends_with(n.as_bytes())) =>
+            {
+                one(failed(sftp_code::PERMISSION_DENIED))
             }
             SftpOp::List { path } => {
                 let p = self.path(&path);
@@ -635,6 +645,38 @@ fn folder_download_sanitises_names_and_keeps_links_inside() {
     assert!(!got.join("outside-link").exists());
     assert!(!got.join("up-link").exists());
     assert!(!got.join("dir-link").exists());
+}
+
+#[test]
+fn a_folder_with_an_unreadable_folder_in_it_is_done_but_not_whole() {
+    let s = Scratch::new("whole");
+    for name in ["full", "part"] {
+        let tree = s.remote().join(name);
+        fs::create_dir_all(tree.join("locked")).unwrap();
+        fs::write(tree.join("a"), "a").unwrap();
+        fs::write(tree.join("locked/b"), "b").unwrap();
+    }
+    fs::create_dir_all(s.remote().join("empty")).unwrap();
+    let (mut remote, mut fake) = connected(&s.remote());
+    let full = remote
+        .download(&entry(&remote, "full"), &s.local())
+        .unwrap();
+    let empty = remote
+        .download(&entry(&remote, "empty"), &s.local())
+        .unwrap();
+    assert!(run(&mut remote, &mut fake));
+    assert!(remote.whole(full));
+    assert!(remote.whole(empty));
+
+    fake.unlistable = Some("part/locked");
+    let part = remote
+        .download(&entry(&remote, "part"), &s.local())
+        .unwrap();
+    assert!(run(&mut remote, &mut fake));
+    // As a download it is done, with a note of what it missed; whole it
+    // is not.
+    assert_eq!(remote.job_state(part), Some(State::Done));
+    assert!(!remote.whole(part));
 }
 
 #[test]
