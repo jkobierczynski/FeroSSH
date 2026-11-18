@@ -266,7 +266,7 @@ How a release is made: a pull request bumps the version in `Cargo.toml` and adds
 
 Update this file in the same pull request that bumps the version and adds the release notes, so the history is always as current as the latest release:
 
-1. Add a row to [Releases at a glance](#releases-at-a-glance) and to the table under [Releases](#releases), with the range of pull requests merged since the previous tag (`git log <previous tag>..HEAD --merges --oneline`).
+1. Add a row to [Releases at a glance](#releases-at-a-glance) and to the table under [Releases](#releases), with the range of pull requests merged since the previous tag (`git log --first-parent --oneline <previous tag>..HEAD`, leaving out direct commits that aren't pull requests). The version bump pull request isn't merged yet when you write this, so add its own number by hand, and check the range again before tagging.
 2. Add each new feature, fix or security change as a line under its area in [After 1.0, by area](#after-10-by-area) or [Security reviews and hardening](#security-reviews-and-hardening), with its pull request number. Start a new area when nothing fits.
 3. Change "Last updated for" at the top to the new version and date.
 
