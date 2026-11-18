@@ -9105,10 +9105,12 @@ impl Window {
 
     /// Session > Notify when this pane goes quiet: on or off for pane `id`.
     fn toggle_quiet(&mut self, id: PaneId) {
+        let notifications = self.settings.notifications;
         if let Some(p) = self.panes.get_mut(&id) {
             p.quiet = match p.quiet.take() {
                 Some(_) => None,
-                None if !quiet_watchable(p) => None,
+                // A shortcut works while the menu item is greyed.
+                None if !notifications || !quiet_watchable(p) => None,
                 None => Some(crate::attention::Watch::new()),
             };
         }
@@ -20345,10 +20347,11 @@ fn capture(hwnd: HWND, on: bool) {
 }
 
 /// Whether a quiet watch can see pane `p`'s work: a recording has no live
-/// output, and a remote desktop's updates (or a closed one's nothing) are
-/// not terminal output.
+/// output, a remote desktop's updates (or a closed one's nothing) are not
+/// terminal output, and an SFTP-only connection has no shell.
 fn quiet_watchable(p: &Pane) -> bool {
-    !matches!(p.host, Host::Replay(_) | Host::Desktop { .. }) && p.desktop.is_none()
+    let sftp_only = matches!(&p.host, Host::Ssh(s) if s.target.sftp_only);
+    !matches!(p.host, Host::Replay(_) | Host::Desktop { .. }) && p.desktop.is_none() && !sftp_only
 }
 
 #[cfg(test)]
