@@ -1035,6 +1035,14 @@ impl Remote {
         {
             job.state = if ready { State::Queued } else { State::Waiting };
             job.note = None;
+            // The folder it downloads into may have gone meanwhile (a
+            // drag's folder under %TEMP% is swept after a day): asked to
+            // try again, it comes back.
+            if matches!(job.kind, Kind::Download | Kind::FetchFolder)
+                && let Some(parent) = job.local.parent()
+            {
+                let _ = std::fs::create_dir_all(parent);
+            }
             // An edited file put back always replaces the original.
             job.choice = job.put_back.map(|_| Choice::Overwrite);
         }
