@@ -333,6 +333,9 @@ impl Terminal {
 
     pub fn set_settings(&mut self, settings: &Settings) {
         self.scrollback = settings.scrollback.min(Settings::MAX_SCROLLBACK);
+        if settings.keys.kitty != self.keys.kitty {
+            self.keyboard_stacks_emptied();
+        }
         self.keys = settings.keys;
         self.term.set_options(config(settings));
     }
@@ -345,13 +348,7 @@ impl Terminal {
             return;
         }
         if keys.kitty != self.keys.kitty {
-            // Pushes held back by a synchronized update count already, so
-            // they go in before the stacks are emptied.
-            if self.sync_deadline().is_some() {
-                self.flush_sync();
-            }
-            // Turning the protocol on or off empties both stacks.
-            self.pushes.depth = 0;
+            self.keyboard_stacks_emptied();
         }
         self.keys = keys;
         let settings = Settings {
@@ -525,7 +522,7 @@ impl Terminal {
     fn shorten_keyboard_stacks(&mut self) {
         if !self.keys.kitty {
             // Off, alacritty keeps no stacks.
-            self.pushes.depth = 0;
+            self.keyboard_stacks_emptied();
             return;
         }
         // Pushes held back by a synchronized update count already, so
@@ -553,6 +550,17 @@ impl Terminal {
             self.term.push_keyboard_mode(top);
             self.pushes.depth = 1;
         }
+    }
+
+    /// Starts the push count again, for when the kitty protocol is turned
+    /// on or off (which empties both stacks) or is off (when alacritty
+    /// keeps none). Pushes held back by a synchronized update count
+    /// already, so they go in first, under the setting they came under.
+    fn keyboard_stacks_emptied(&mut self) {
+        if self.sync_deadline().is_some() {
+            self.flush_sync();
+        }
+        self.pushes.depth = 0;
     }
 
     /// Hands output to the emulator.
@@ -1707,7 +1715,16 @@ fn keyboard_modes(mode: TermMode) -> KeyboardModes {
 /// they were last emptied, so the pushes counted since then are always at
 /// least as many as either stack holds, whatever pops, screen switches
 /// and resets did. When the count gets near the limit, [`Terminal`]
-/// empties the stacks.
+/// empties the stacks and keeps the mode in force.
+///
+/// Pops are not counted: which stack a pop shortens, and by how much,
+/// cannot be known without mirroring alacritty exactly, and a count that
+/// is too low would let the panic through. So the stacks are also emptied
+/// after 4000 pushes that were popped again, and a mode saved beneath the
+/// one in force at that moment is lost: when the program on top pops,
+/// the one beneath gets xterm's keys until it pushes again. A program
+/// pushes once when it starts, so this takes thousands of programs
+/// started in one pane.
 ///
 /// The counting runs the same `vte` state machine over the same bytes as
 /// the emulator, so it sees every push the emulator does. It counts a

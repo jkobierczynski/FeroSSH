@@ -298,6 +298,27 @@ fn thousands_of_kitty_keyboard_pushes_do_not_crash() {
 }
 
 #[test]
+fn pushes_held_back_while_the_protocol_is_off_do_not_crash_once_it_is_on() {
+    let pushes = b"\x1b[>1u".repeat(5000);
+    for whole in [true, false] {
+        let mut t = term(10, 3);
+        t.feed(b"\x1b[?2026h");
+        t.feed(&pushes);
+        let mut settings = Settings::new(100);
+        settings.keys.kitty = true;
+        if whole {
+            t.set_settings(&settings);
+        } else {
+            t.set_keys(settings.keys);
+        }
+        t.flush_sync();
+        t.feed(&pushes);
+        t.feed(b"\x1b[?u");
+        assert_eq!(replies(&mut t), ["\x1b[?1u"]);
+    }
+}
+
+#[test]
 fn the_kitty_keyboard_protocol_stays_on_past_a_watched_screen_switch() {
     let mut t = kitty_term();
     t.set_stop_pattern(Some("boom")).unwrap();
