@@ -15,14 +15,14 @@ use alacritty_terminal::term::{
     ClipboardType, Config, Osc52, Term, TermMode, point_to_viewport, viewport_to_point,
 };
 use alacritty_terminal::vte::ansi::{
-    Color as TermColor, CursorShape as TermCursorShape, Handler, NamedColor, Processor,
-    Rgb as TermRgb,
+    Color as TermColor, CursorShape as TermCursorShape, Handler, KeyboardModes, NamedColor,
+    Processor, Rgb as TermRgb,
 };
 use ferossh_render::{Cell, Color, Cursor, CursorShape, Flags, Grid, Rgb, Theme};
 
 use crate::cwd::{CwdScanner, Found, WorkingDir};
 use crate::highlight::{self, Highlighter};
-use crate::input::{self, Key, Mods, MouseButton, MouseEvent};
+use crate::input::{self, Key, KeyOptions, Mods, MouseButton, MouseEvent};
 use crate::notify::Notification;
 use crate::sanitize::{Paste, prepare_paste, sanitize_title};
 
@@ -32,6 +32,8 @@ use crate::sanitize::{Paste, prepare_paste, sanitize_title};
 pub struct Settings {
     /// Lines of scrollback kept above the screen.
     pub scrollback: usize,
+    /// The kitty keyboard protocol and Shift+Enter.
+    pub keys: KeyOptions,
 }
 
 impl Settings {
@@ -42,6 +44,7 @@ impl Settings {
     pub fn new(scrollback: usize) -> Self {
         Self {
             scrollback: scrollback.min(Self::MAX_SCROLLBACK),
+            keys: KeyOptions::default(),
         }
     }
 }
@@ -248,6 +251,11 @@ pub struct Terminal {
     cell_px: (u16, u16),
     search: Option<Search>,
     scrollback: usize,
+    /// How keys are sent beyond what xterm does.
+    keys: KeyOptions,
+    /// Keeps the kitty keyboard mode stacks clear of the depth where
+    /// alacritty_terminal 0.26 panics.
+    pushes: PushGuard,
     highlighter: Option<Rc<Highlighter>>,
     highlight_cache: RefCell<Option<highlight::Cache>>,
     /// Stop patterns from the settings; with the one typed into the stop
@@ -303,6 +311,8 @@ impl Terminal {
             cell_px: (8, 16),
             search: None,
             scrollback: settings.scrollback.min(Settings::MAX_SCROLLBACK),
+            keys: settings.keys,
+            pushes: PushGuard::default(),
             highlighter: None,
             highlight_cache: RefCell::new(None),
             stop_rules: Vec::new(),
@@ -323,7 +333,29 @@ impl Terminal {
 
     pub fn set_settings(&mut self, settings: &Settings) {
         self.scrollback = settings.scrollback.min(Settings::MAX_SCROLLBACK);
+        if settings.keys.kitty != self.keys.kitty {
+            self.keyboard_stacks_emptied();
+        }
+        self.keys = settings.keys;
         self.term.set_options(config(settings));
+    }
+
+    /// Changes only how keys are sent (the kitty keyboard protocol and
+    /// Shift+Enter). Turning the protocol off ends it for a program that
+    /// had it on.
+    pub fn set_keys(&mut self, keys: KeyOptions) {
+        if keys == self.keys {
+            return;
+        }
+        if keys.kitty != self.keys.kitty {
+            self.keyboard_stacks_emptied();
+        }
+        self.keys = keys;
+        let settings = Settings {
+            scrollback: self.scrollback,
+            keys,
+        };
+        self.term.set_options(config(&settings));
     }
 
     /// The keyword highlighting rules for this pane, or none.
@@ -463,6 +495,78 @@ impl Terminal {
         if let Some(last) = last {
             self.reported.clear();
             self.reported.push(last);
+        }
+        // Each push onto the kitty keyboard stack is fed on its own once
+        // the stacks could be getting deep, see [`PushGuard`].
+        let mut from = 0;
+        for at in self.pushes.scan(bytes) {
+            if let Some(piece) = bytes.get(from..at) {
+                self.feed_screen(piece);
+            }
+            if self.pushes.depth >= PushGuard::LIMIT {
+                self.shorten_keyboard_stacks();
+            }
+            self.pushes.depth += 1;
+            from = at;
+        }
+        if let Some(rest) = bytes.get(from..) {
+            self.feed_screen(rest);
+        }
+    }
+
+    /// Empties both kitty keyboard mode stacks (the main and the
+    /// alternate screen's), then puts the mode in force back as the only
+    /// entry, so a program that pops it after gets the keys it expects.
+    /// Only a program that pushed thousands of modes without popping them
+    /// gets here.
+    fn shorten_keyboard_stacks(&mut self) {
+        if !self.keys.kitty {
+            // Off, alacritty keeps no stacks.
+            self.keyboard_stacks_emptied();
+            return;
+        }
+        // Pushes held back by a synchronized update count already, so
+        // they go in before the stacks are emptied.
+        if self.sync_deadline().is_some() {
+            self.flush_sync();
+        }
+        let mode = *self.term.mode();
+        let queued = self.events.0.borrow().len();
+        let off = KeyOptions {
+            kitty: false,
+            ..self.keys
+        };
+        for keys in [off, self.keys] {
+            self.term.set_options(config(&Settings {
+                scrollback: self.scrollback,
+                keys,
+            }));
+        }
+        // Setting the options says the title again.
+        self.events.0.borrow_mut().truncate(queued);
+        let top = keyboard_modes(mode);
+        self.pushes.depth = 0;
+        if !top.is_empty() {
+            self.term.push_keyboard_mode(top);
+            self.pushes.depth = 1;
+        }
+    }
+
+    /// Starts the push count again, for when the kitty protocol is turned
+    /// on or off (which empties both stacks) or is off (when alacritty
+    /// keeps none). Pushes held back by a synchronized update count
+    /// already, so they go in first, under the setting they came under.
+    fn keyboard_stacks_emptied(&mut self) {
+        if self.sync_deadline().is_some() {
+            self.flush_sync();
+        }
+        self.pushes.depth = 0;
+    }
+
+    /// Hands output to the emulator.
+    fn feed_screen(&mut self, bytes: &[u8]) {
+        if bytes.is_empty() {
+            return;
         }
         // Fed in pieces that end at alternate screen switches, so the
         // titles set on it are told apart from the ones around it.
@@ -644,8 +748,10 @@ impl Terminal {
             // The main screen went away mid-way; set its limit back
             // through the options (which also say the title again).
             let queued = self.events.0.borrow().len();
-            self.term
-                .set_options(config(&Settings::new(self.scrollback)));
+            self.term.set_options(config(&Settings {
+                scrollback: self.scrollback,
+                keys: self.keys,
+            }));
             self.events.0.borrow_mut().truncate(queued);
             return;
         }
@@ -757,7 +863,7 @@ impl Terminal {
 
     fn action(&self, event: Event) -> Option<Action> {
         Some(match event {
-            Event::PtyWrite(text) => Action::Reply(text.into_bytes()),
+            Event::PtyWrite(text) => Action::Reply(keyboard_report(text).into_bytes()),
             Event::Title(title) => Action::Title(Some(sanitize_title(&title))),
             Event::ResetTitle => Action::Title(None),
             Event::ClipboardStore(ClipboardType::Clipboard, text)
@@ -814,12 +920,19 @@ impl Terminal {
 
     /// Bytes for a non-text key, in the current keyboard modes.
     pub fn key(&self, key: Key, mods: Mods) -> Option<Vec<u8>> {
-        input::encode_key(key, mods, self.mode())
+        input::encode_key(key, mods, self.mode(), self.keys)
     }
 
     /// Bytes for a typed character; `alt` adds the ESC prefix.
     pub fn text(&self, ch: char, alt: bool) -> Vec<u8> {
-        input::encode_char(ch, alt)
+        input::encode_char(ch, alt, self.mode())
+    }
+
+    /// Bytes for Ctrl+Space, Ctrl+2, Ctrl+6 or Ctrl+/: `legacy` (the
+    /// control code xterm sends), or the kitty protocol's form for `key`
+    /// (space, 2, 6 or /) when the program asked for it.
+    pub fn ctrl_key(&self, key: char, legacy: u8, mods: Mods) -> Vec<u8> {
+        input::encode_ctrl(key, legacy, mods, self.mode())
     }
 
     /// A paste, cleaned and bracketed if the host asked for it.
@@ -1557,13 +1670,146 @@ fn alt_switch_ends(bytes: &[u8]) -> impl Iterator<Item = usize> + '_ {
     })
 }
 
+/// The answer to `CSI ? u` (which kitty keyboard flags are on) says only
+/// the flag this terminal carries out, "disambiguate escape codes" (1):
+/// the emulator would report every flag the program asked for. Any other
+/// reply is passed as it is.
+/// The kitty keyboard flags in force in `mode`.
+fn keyboard_modes(mode: TermMode) -> KeyboardModes {
+    let mut modes = KeyboardModes::NO_MODE;
+    for (term, keyboard) in [
+        (
+            TermMode::DISAMBIGUATE_ESC_CODES,
+            KeyboardModes::DISAMBIGUATE_ESC_CODES,
+        ),
+        (
+            TermMode::REPORT_EVENT_TYPES,
+            KeyboardModes::REPORT_EVENT_TYPES,
+        ),
+        (
+            TermMode::REPORT_ALTERNATE_KEYS,
+            KeyboardModes::REPORT_ALTERNATE_KEYS,
+        ),
+        (
+            TermMode::REPORT_ALL_KEYS_AS_ESC,
+            KeyboardModes::REPORT_ALL_KEYS_AS_ESC,
+        ),
+        (
+            TermMode::REPORT_ASSOCIATED_TEXT,
+            KeyboardModes::REPORT_ASSOCIATED_TEXT,
+        ),
+    ] {
+        if mode.contains(term) {
+            modes |= keyboard;
+        }
+    }
+    modes
+}
+
+/// Counts the pushes onto the kitty keyboard mode stack (`CSI > flags u`)
+/// in the host's output. alacritty_terminal 0.26 panics on a push once a
+/// stack holds 4096 modes (it trims the title stack instead of the
+/// keyboard one, and that one is mostly empty), so a host could close
+/// FeroSSH with a few kilobytes of output. Every mode on either stack
+/// (the main screen's and the alternate one's) came from a push since
+/// they were last emptied, so the pushes counted since then are always at
+/// least as many as either stack holds, whatever pops, screen switches
+/// and resets did. When the count gets near the limit, [`Terminal`]
+/// empties the stacks and keeps the mode in force.
+///
+/// Pops are not counted: which stack a pop shortens, and by how much,
+/// cannot be known without mirroring alacritty exactly, and a count that
+/// is too low would let the panic through. So the stacks are also emptied
+/// after 4000 pushes that were popped again, and a mode saved beneath the
+/// one in force at that moment is lost: when the program on top pops,
+/// the one beneath gets xterm's keys until it pushes again. A program
+/// pushes once when it starts, so this takes thousands of programs
+/// started in one pane.
+///
+/// The counting runs the same `vte` state machine over the same bytes as
+/// the emulator, so it sees every push the emulator does. It counts a
+/// sequence the emulator would ignore too, which only makes the count
+/// higher.
+struct PushGuard {
+    parser: alacritty_terminal::vte::Parser,
+    /// Pushes since the stacks were last emptied.
+    depth: usize,
+}
+
+impl Default for PushGuard {
+    fn default() -> Self {
+        Self {
+            parser: alacritty_terminal::vte::Parser::new(),
+            depth: 0,
+        }
+    }
+}
+
+impl PushGuard {
+    /// The count at which the stacks are emptied, below alacritty's 4096.
+    const LIMIT: usize = 4000;
+
+    /// Looks at the next output. Far from the limit it only counts; near
+    /// it, it returns where each push ends (the offset of its final byte)
+    /// for [`Terminal::feed`] to count it there, emptying the stacks first
+    /// when needed.
+    fn scan(&mut self, bytes: &[u8]) -> Vec<usize> {
+        let mut count = PushCount(0);
+        // A push takes four bytes at least, and one may have started in
+        // the output before.
+        if self.depth + bytes.len() / 4 + 1 < Self::LIMIT {
+            self.parser.advance(&mut count, bytes);
+            self.depth += count.0;
+            return Vec::new();
+        }
+        let mut ends = Vec::new();
+        for (at, byte) in bytes.iter().enumerate() {
+            self.parser.advance(&mut count, std::slice::from_ref(byte));
+            if count.0 > 0 {
+                count.0 = 0;
+                ends.push(at);
+            }
+        }
+        ends
+    }
+}
+
+struct PushCount(usize);
+
+impl alacritty_terminal::vte::Perform for PushCount {
+    fn csi_dispatch(
+        &mut self,
+        _params: &alacritty_terminal::vte::Params,
+        intermediates: &[u8],
+        _ignore: bool,
+        action: char,
+    ) {
+        if action == 'u' && intermediates.first() == Some(&b'>') {
+            self.0 += 1;
+        }
+    }
+}
+
+fn keyboard_report(text: String) -> String {
+    let flags = text
+        .strip_prefix("\x1b[?")
+        .and_then(|t| t.strip_suffix('u'))
+        .filter(|f| !f.is_empty() && f.bytes().all(|b| b.is_ascii_digit()))
+        .and_then(|f| f.parse::<u32>().ok());
+    match flags {
+        Some(flags) => format!("\x1b[?{}u", flags & 1),
+        None => text,
+    }
+}
+
 fn config(settings: &Settings) -> Config {
     Config {
         scrolling_history: settings.scrollback.min(Settings::MAX_SCROLLBACK),
         // Copy requests reach the UI, which asks first; pastes are never
         // handed to the host.
         osc52: Osc52::OnlyCopy,
-        kitty_keyboard: false,
+        // Programs may turn it on (`CSI > flags u`) when this is set.
+        kitty_keyboard: settings.keys.kitty,
         ..Config::default()
     }
 }

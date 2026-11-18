@@ -3,13 +3,17 @@
 //! between. It must never panic, titles must come out sanitised, and
 //! replies to the host must be plain ASCII escape sequences, never echoes
 //! of host-chosen text. Half the runs also watch for a stop pattern and
-//! highlight keywords, which count and hold lines as output scrolls.
+//! highlight keywords, which count and hold lines as output scrolls, and
+//! half have the kitty keyboard protocol on.
 
 #![no_main]
 
 use ferossh_render::Grid;
 use ferossh_term::highlight::{Highlighter, Rule, Style};
-use ferossh_term::{Action, Key, Mods, MouseButton, MouseEvent, SelectionKind, Settings, Terminal};
+use ferossh_term::{
+    Action, Key, KeyOptions, Mods, MouseButton, MouseEvent, SelectionKind, Settings, ShiftEnter,
+    Terminal,
+};
 use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|data: &[u8]| {
@@ -28,6 +32,12 @@ fuzz_target!(|data: &[u8]| {
             },
         }]);
         t.set_highlighter(h.map(std::rc::Rc::new));
+    }
+    if split & 2 == 2 {
+        t.set_keys(KeyOptions {
+            kitty: true,
+            shift_enter: ShiftEnter::CsiU,
+        });
     }
     let mut grid = Grid::new(1, 1);
     for (i, chunk) in stream.chunks(usize::from(split % 64).max(1)).enumerate() {

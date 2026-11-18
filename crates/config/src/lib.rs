@@ -43,5 +43,5 @@ pub use pattern::{match_host, match_pattern};
 pub use proxy::{ProxyKind, ProxyServer};
 pub use settings::{
     Bookmark, DEFAULT_TELNET_PORT, DEFAULT_WINRM_COMMAND, DEFAULT_WINRM_HTTPS_PORT,
-    DEFAULT_WINRM_PORT, Profile, SessionKind, Settings, WindowColours,
+    DEFAULT_WINRM_PORT, Profile, SessionKind, Settings, ShiftEnterKey, WindowColours,
 };

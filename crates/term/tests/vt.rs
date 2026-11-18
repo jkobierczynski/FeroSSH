@@ -5,8 +5,8 @@
 
 use ferossh_render::{Cell, Color, CursorShape, Flags, Grid, Rgb, Theme};
 use ferossh_term::{
-    Action, Key, MAX_COLS, MAX_ROWS, Mods, MouseButton, MouseEvent, SelectionKind, Settings,
-    Terminal,
+    Action, Key, KeyOptions, MAX_COLS, MAX_ROWS, Mods, MouseButton, MouseEvent, SelectionKind,
+    Settings, ShiftEnter, Terminal,
 };
 
 fn term(cols: usize, rows: usize) -> Terminal {
@@ -200,6 +200,148 @@ fn keys_follow_cursor_key_mode() {
     assert_eq!(t.key(Key::Up, Mods::NONE).unwrap(), b"\x1bOA");
     t.feed(b"\x1b[20h");
     assert_eq!(t.key(Key::Enter, Mods::NONE).unwrap(), b"\r\n");
+}
+
+#[test]
+fn the_kitty_keyboard_protocol_is_there_only_when_allowed() {
+    let shift = Mods {
+        shift: true,
+        ..Mods::NONE
+    };
+    // Off: the query is not answered and the push does nothing, so the
+    // program keeps to xterm's keys.
+    let mut t = term(10, 3);
+    t.feed(b"\x1b[?u\x1b[>1u");
+    assert!(replies(&mut t).is_empty());
+    assert_eq!(t.key(Key::Escape, Mods::NONE).unwrap(), b"\x1b");
+    // On: the program asks for it and gets it.
+    t.set_keys(KeyOptions {
+        kitty: true,
+        shift_enter: ShiftEnter::EscCr,
+    });
+    t.feed(b"\x1b[?u");
+    assert_eq!(replies(&mut t), ["\x1b[?0u"]);
+    assert_eq!(t.key(Key::Enter, shift).unwrap(), b"\x1b\r");
+    // Every flag asked for; only "disambiguate" is said to be on.
+    t.feed(b"\x1b[>31u\x1b[?u");
+    assert_eq!(replies(&mut t), ["\x1b[?1u"]);
+    assert_eq!(t.key(Key::Escape, Mods::NONE).unwrap(), b"\x1b[27u");
+    assert_eq!(t.key(Key::Enter, shift).unwrap(), b"\x1b[13;2u");
+    assert_eq!(t.text('\x03', false), b"\x1b[99;5u");
+    assert_eq!(t.text('x', false), b"x");
+    assert_eq!(t.key(Key::F(3), Mods::NONE).unwrap(), b"\x1b[13~");
+    assert_eq!(t.key(Key::F(3), shift).unwrap(), b"\x1b[13;2~");
+    assert_eq!(t.key(Key::F(1), Mods::NONE).unwrap(), b"\x1bOP");
+    // The program pops it when it exits: xterm's keys again.
+    t.feed(b"\x1b[<u");
+    assert_eq!(t.key(Key::Escape, Mods::NONE).unwrap(), b"\x1b");
+    assert_eq!(t.text('\x03', false), b"\x03");
+    // Turned off while a program has it on: it ends.
+    t.feed(b"\x1b[>1u");
+    t.set_keys(KeyOptions::default());
+    assert_eq!(t.key(Key::Escape, Mods::NONE).unwrap(), b"\x1b");
+    assert_eq!(t.key(Key::Enter, shift).unwrap(), b"\r");
+}
+
+fn kitty_term() -> Terminal {
+    let mut t = term(10, 3);
+    t.set_keys(KeyOptions {
+        kitty: true,
+        shift_enter: ShiftEnter::Enter,
+    });
+    t
+}
+
+#[test]
+fn thousands_of_kitty_keyboard_pushes_do_not_crash() {
+    // alacritty_terminal 0.26 panics on a push onto a full keyboard mode
+    // stack (4096 modes); the stacks are emptied before that.
+    let pushes = b"\x1b[>1u".repeat(5000);
+    let mut t = kitty_term();
+    t.feed(&pushes);
+    t.feed(b"\x1b[?u");
+    assert_eq!(replies(&mut t), ["\x1b[?1u"]);
+    // Popping everything gets xterm's keys back.
+    t.feed(b"\x1b[<9999u\x1b[?u");
+    assert_eq!(replies(&mut t), ["\x1b[?0u"]);
+    assert_eq!(t.key(Key::Escape, Mods::NONE).unwrap(), b"\x1b");
+
+    // A byte at a time, with a saved title (which alacritty trims
+    // instead of the keyboard stack, so it would grow without end), on
+    // both screens, and held back by a synchronized update.
+    let mut t = kitty_term();
+    let mut output = b"\x1b]0;t\x07\x1b[22t".to_vec();
+    output.extend_from_slice(&pushes);
+    output.extend_from_slice(b"\x1b[?1049h");
+    output.extend_from_slice(&pushes);
+    output.extend_from_slice(b"\x1b[?1049l\x1b[?2026h");
+    output.extend_from_slice(&pushes);
+    for byte in &output {
+        t.feed(std::slice::from_ref(byte));
+    }
+    t.flush_sync();
+    t.feed(&pushes);
+    // Turned off and on with pushes held back by a synchronized update:
+    // they go in before the count starts again.
+    t.feed(b"\x1b[?2026h");
+    t.feed(&pushes[..pushes.len() / 2]);
+    t.set_keys(KeyOptions::default());
+    t.set_keys(KeyOptions {
+        kitty: true,
+        shift_enter: ShiftEnter::Enter,
+    });
+    t.feed(b"\x1b[?2026h");
+    t.feed(&pushes);
+    t.flush_sync();
+    t.feed(b"\x1b[?u");
+    assert_eq!(replies(&mut t), ["\x1b[?1u"]);
+}
+
+#[test]
+fn pushes_held_back_while_the_protocol_is_off_do_not_crash_once_it_is_on() {
+    let pushes = b"\x1b[>1u".repeat(5000);
+    // 2500 stay held back until the setter runs; 5000 reach the guard's
+    // limit while the protocol is still off.
+    for (whole, held) in [(true, 2500), (false, 2500), (true, 5000), (false, 5000)] {
+        let mut t = term(10, 3);
+        t.feed(b"\x1b[?2026h");
+        t.feed(&pushes[..held * 5]);
+        assert_eq!(t.sync_deadline().is_some(), held < 4000);
+        let mut settings = Settings::new(100);
+        settings.keys.kitty = true;
+        if whole {
+            t.set_settings(&settings);
+        } else {
+            t.set_keys(settings.keys);
+        }
+        t.flush_sync();
+        t.feed(&pushes);
+        t.feed(b"\x1b[?u");
+        assert_eq!(replies(&mut t), ["\x1b[?1u"]);
+    }
+}
+
+#[test]
+fn the_kitty_keyboard_protocol_stays_on_past_a_watched_screen_switch() {
+    let mut t = kitty_term();
+    t.set_stop_pattern(Some("boom")).unwrap();
+    t.feed(b"line\r\n\x1b[?1049h");
+    t.feed(b"\x1b[>1u\x1b[?u");
+    assert_eq!(replies(&mut t), ["\x1b[?1u"]);
+    assert_eq!(t.key(Key::Escape, Mods::NONE).unwrap(), b"\x1b[27u");
+}
+
+#[test]
+fn ctrl_chords_without_a_character_use_the_kitty_form_when_asked() {
+    let ctrl = Mods {
+        ctrl: true,
+        ..Mods::NONE
+    };
+    let mut t = kitty_term();
+    assert_eq!(t.ctrl_key(' ', 0, ctrl), b"\0");
+    t.feed(b"\x1b[>1u");
+    assert_eq!(t.ctrl_key(' ', 0, ctrl), b"\x1b[32;5u");
+    assert_eq!(t.ctrl_key('/', 0x1f, ctrl), b"\x1b[47;5u");
 }
 
 #[test]
