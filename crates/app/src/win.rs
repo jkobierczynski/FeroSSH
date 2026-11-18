@@ -90,19 +90,19 @@ use windows::Win32::UI::WindowsAndMessaging::{
     GetMenuState, GetMenuStringW, GetMessageW, GetSubMenu, GetWindowLongPtrW, GetWindowPlacement,
     HCURSOR, HMENU, HTCLIENT, HWND_TOP, IDC_ARROW, IDC_HAND, IDC_IBEAM, IDC_SIZEALL, IDC_SIZENS,
     IDC_SIZEWE, IDCANCEL, IDNO, IDOK, IDYES, IsChild, IsIconic, IsWindowVisible, KillTimer,
-    LoadCursorW, LoadIconW, MB_DEFBUTTON2, MB_ICONERROR, MB_ICONINFORMATION, MB_ICONQUESTION,
-    MB_ICONWARNING, MB_OK, MB_OKCANCEL, MB_YESNO, MB_YESNOCANCEL, MESSAGEBOX_RESULT,
-    MESSAGEBOX_STYLE, MF_BYCOMMAND, MF_BYPOSITION, MF_CHECKED, MF_DISABLED, MF_ENABLED, MF_GRAYED,
-    MF_MENUBARBREAK, MF_POPUP, MF_SEPARATOR, MF_STRING, MF_UNCHECKED, MSG, MessageBoxW,
-    ModifyMenuW, PM_REMOVE, PeekMessageW, PostMessageW, PostQuitMessage, RegisterClassW,
-    SIZE_MINIMIZED, SW_HIDE, SW_RESTORE, SW_SHOW, SW_SHOWNORMAL, SWP_FRAMECHANGED, SWP_NOACTIVATE,
-    SWP_NOMOVE, SWP_NOOWNERZORDER, SWP_NOSIZE, SWP_NOZORDER, SetCursor, SetForegroundWindow,
-    SetMenu, SetTimer, SetWindowLongPtrW, SetWindowPlacement, SetWindowPos, SetWindowTextW,
-    ShowWindow, TPM_NONOTIFY, TPM_RETURNCMD, TrackPopupMenu, TranslateMessage, WINDOW_EX_STYLE,
-    WINDOW_STYLE, WINDOWPLACEMENT, WM_APP, WM_CHAR, WM_CLIPBOARDUPDATE, WM_CLOSE, WM_COMMAND,
-    WM_DEADCHAR, WM_DESTROY, WM_DPICHANGED, WM_DROPFILES, WM_ERASEBKGND, WM_EXITMENULOOP,
-    WM_GETDPISCALEDSIZE, WM_HOTKEY, WM_IME_COMPOSITION, WM_IME_STARTCOMPOSITION, WM_KEYDOWN,
-    WM_KEYUP, WM_KILLFOCUS, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP,
+    LoadCursorW, LoadIconW, MB_DEFBUTTON2, MB_DEFBUTTON3, MB_ICONERROR, MB_ICONINFORMATION,
+    MB_ICONQUESTION, MB_ICONWARNING, MB_OK, MB_OKCANCEL, MB_YESNO, MB_YESNOCANCEL,
+    MESSAGEBOX_RESULT, MESSAGEBOX_STYLE, MF_BYCOMMAND, MF_BYPOSITION, MF_CHECKED, MF_DISABLED,
+    MF_ENABLED, MF_GRAYED, MF_MENUBARBREAK, MF_POPUP, MF_SEPARATOR, MF_STRING, MF_UNCHECKED, MSG,
+    MessageBoxW, ModifyMenuW, PM_REMOVE, PeekMessageW, PostMessageW, PostQuitMessage,
+    RegisterClassW, SIZE_MINIMIZED, SW_HIDE, SW_RESTORE, SW_SHOW, SW_SHOWNORMAL, SWP_FRAMECHANGED,
+    SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOOWNERZORDER, SWP_NOSIZE, SWP_NOZORDER, SetCursor,
+    SetForegroundWindow, SetMenu, SetTimer, SetWindowLongPtrW, SetWindowPlacement, SetWindowPos,
+    SetWindowTextW, ShowWindow, TPM_NONOTIFY, TPM_RETURNCMD, TrackPopupMenu, TranslateMessage,
+    WINDOW_EX_STYLE, WINDOW_STYLE, WINDOWPLACEMENT, WM_APP, WM_CHAR, WM_CLIPBOARDUPDATE, WM_CLOSE,
+    WM_COMMAND, WM_DEADCHAR, WM_DESTROY, WM_DPICHANGED, WM_DROPFILES, WM_ERASEBKGND,
+    WM_EXITMENULOOP, WM_GETDPISCALEDSIZE, WM_HOTKEY, WM_IME_COMPOSITION, WM_IME_STARTCOMPOSITION,
+    WM_KEYDOWN, WM_KEYUP, WM_KILLFOCUS, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP,
     WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_PAINT, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SETCURSOR, WM_SETFOCUS,
     WM_SETTINGCHANGE, WM_SIZE, WM_SYSCHAR, WM_SYSCOLORCHANGE, WM_SYSDEADCHAR, WM_SYSKEYDOWN,
     WM_SYSKEYUP, WM_TIMER, WNDCLASSW, WS_CLIPCHILDREN, WS_EX_APPWINDOW, WS_OVERLAPPEDWINDOW,
@@ -627,6 +627,9 @@ mod cmd {
     pub const SHIFT_ENTER: u32 = 657;
     /// Session > Coding agents > Log and record agent panes; the sixth.
     pub const AGENT_AUDIT: u32 = 658;
+    /// Session > Coding agents > Answer yes-or-no questions from the
+    /// notification; the seventh.
+    pub const ANSWER_TOASTS: u32 = 659;
     /// Session > Coding agents: plus the index into the commands listed
     /// when the menu opened, up to [`AGENT_END`].
     pub const AGENT_START: u32 = 660;
@@ -2763,6 +2766,11 @@ fn build_menu() -> Result<HMENU> {
             agents,
             cmd::AGENT_AUDIT,
             "&Log and record agent panes (audit trail)",
+        )?;
+        item(
+            agents,
+            cmd::ANSWER_TOASTS,
+            "&Answer yes-or-no questions from the notification",
         )?;
         AppendMenuW(session, MF_POPUP, agents.0 as usize, w!("Coding a&gents"))?;
         separator(session)?;
@@ -9326,11 +9334,11 @@ impl Window {
     fn fill_agents(&mut self, menu: HMENU) {
         let commands = crate::agents::commands(&self.settings.agent_commands);
         // SAFETY: our popup menu; it is being opened, when changing it is
-        // allowed. Everything after Agent dashboard and the five options is
+        // allowed. Everything after Agent dashboard and the six options is
         // replaced.
         unsafe {
-            while GetMenuItemCount(Some(menu)) > 6 {
-                let _ = DeleteMenu(menu, 6, MF_BYPOSITION);
+            while GetMenuItemCount(Some(menu)) > 7 {
+                let _ = DeleteMenu(menu, 7, MF_BYPOSITION);
             }
             let _ = AppendMenuW(menu, MF_SEPARATOR, 0, None);
             for (id, c) in (cmd::AGENT_START..cmd::AGENT_END).zip(&commands) {
@@ -9479,6 +9487,47 @@ impl Window {
         self.update_menu_checks();
     }
 
+    /// The yes-or-no question coding agent pane `id` shows, while Session >
+    /// Coding agents > Answer yes-or-no questions from the notification
+    /// is on.
+    fn agent_question(&self, id: PaneId) -> Option<crate::agents::Question> {
+        if !self.settings.answer_from_notification {
+            return None;
+        }
+        self.agent_of(id)?;
+        crate::agents::question(&self.panes.get(&id)?.term.screen_text())
+    }
+
+    /// Answers the question agent pane `id` showed (`asked`), yes or no,
+    /// if it still shows it: the agent may have moved on, or been
+    /// answered in its pane, since the notification. Returns what to tell
+    /// the user when it was not answered.
+    fn answer_agent(
+        &mut self,
+        id: PaneId,
+        asked: &crate::agents::Question,
+        yes: bool,
+    ) -> Option<Command> {
+        let now = self
+            .agent_of(id)
+            .and_then(|_| self.panes.get(&id))
+            .and_then(|p| crate::agents::question(&p.term.screen_text()));
+        if now.as_ref() != Some(asked) {
+            return Some(Command::Notice(format!(
+                "The agent no longer asks \"{}\", so nothing was typed. Its pane shows \
+                 what it does now.",
+                asked.text
+            )));
+        }
+        let keys = if yes { &asked.yes } else { &asked.no };
+        self.input(id, keys.clone());
+        if let Some(p) = self.panes.get_mut(&id) {
+            p.attention = false;
+        }
+        self.refresh_chrome();
+        None
+    }
+
     /// The Production-themed panes among `panes` that run a coding agent,
     /// as "agent on host", while Confirm scripts and agents on Production
     /// hosts is on: input for them asks first.
@@ -9536,6 +9585,10 @@ impl Window {
         }
         let pane = p.label();
         let title = crate::attention::heading(what.as_deref(), &pane);
+        let body = match self.agent_question(id) {
+            Some(q) => format!("{}\nClick to answer yes or no.", q.text),
+            None => body,
+        };
         self.toast_queue.push_back(id);
         let waiting = self.panes.values().filter(|p| p.attention).count();
         self.queued.push(Command::Toast {
@@ -9692,12 +9745,24 @@ impl Window {
 
     /// The user clicked a notification and FeroSSH came forward: pane
     /// `target` ([`Self::toast_target`]) comes forward with the keyboard.
+    /// With Session > Coding agents > Answer yes-or-no questions from the
+    /// notification on, a coding agent that asks one is answered from a
+    /// dialog instead, and its tab is not switched to.
     fn on_toast_click(&mut self, target: Option<PaneId>) -> Vec<Command> {
         if let Some(id) = target {
             if self.toast_pane == Some(id) {
                 self.toast_pane = None;
             }
-            if self.panes.contains_key(&id)
+            if let Some(question) = self.agent_question(id) {
+                let p = self.panes.get(&id);
+                self.queued.push(Command::AnswerAgent {
+                    pane: id,
+                    agent: self.agent_of(id).unwrap_or("agent").to_owned(),
+                    host: p.map(Pane::host_label).unwrap_or_default(),
+                    production: p.is_some_and(|p| p.theme.name == "Production"),
+                    question,
+                });
+            } else if self.panes.contains_key(&id)
                 && let Some(c) = self.live_action(Some(LiveAction::Show(id)))
             {
                 self.queued.push(c);
@@ -15971,6 +16036,11 @@ impl Window {
                 self.update_menu_checks();
                 self.apply_keys();
             }
+            cmd::ANSWER_TOASTS => {
+                self.settings.answer_from_notification = !self.settings.answer_from_notification;
+                self.save_settings();
+                self.update_menu_checks();
+            }
             cmd::AGENT_AUDIT => {
                 self.settings.agent_audit = !self.settings.agent_audit;
                 self.save_settings();
@@ -16438,6 +16508,7 @@ impl Window {
                 (cmd::KITTY_KEYBOARD, s.kitty_keyboard),
                 (cmd::SHIFT_ENTER, s.shift_enter != ShiftEnterKey::Enter),
                 (cmd::AGENT_AUDIT, s.agent_audit),
+                (cmd::ANSWER_TOASTS, s.answer_from_notification),
                 (cmd::HIGHLIGHT, s.highlight),
                 (cmd::AUTO_RECONNECT, s.auto_reconnect),
                 (cmd::SIDE_RIGHT, s.side_pane_right),
@@ -18376,6 +18447,15 @@ enum Command {
     CloseTabNow(usize),
     /// Ask, then remove the snippet at this index.
     DeleteSnippet(usize),
+    /// The user clicked the notification of a coding agent asking a
+    /// yes-or-no question: asks them for the answer.
+    AnswerAgent {
+        pane: PaneId,
+        agent: String,
+        host: String,
+        production: bool,
+        question: crate::agents::Question,
+    },
     /// A coding agent is about to start from a pane with the Production
     /// theme: asks first.
     ConfirmAgent {
@@ -20335,6 +20415,40 @@ fn run_command(hwnd: HWND, command: Command) {
                     MB_ICONWARNING
                 };
                 dialog(hwnd, &text, MB_OK | icon);
+            }
+        }
+        Command::AnswerAgent {
+            pane,
+            agent,
+            host,
+            production,
+            question,
+        } => {
+            let red = if production {
+                "\n\nThis host has the Production theme."
+            } else {
+                ""
+            };
+            let text = format!(
+                "The coding agent {agent} on {host} asks:\n\n{}{red}\n\nYes and No answer it; \
+                 Cancel shows its pane.",
+                crate::ssh::sanitize_line(&question.text),
+            );
+            let answer = match dialog(
+                hwnd,
+                &text,
+                MB_YESNOCANCEL | MB_ICONQUESTION | MB_DEFBUTTON3,
+            ) {
+                Some(IDYES) => Some(true),
+                Some(IDNO) => Some(false),
+                _ => None,
+            };
+            let next = match answer {
+                Some(yes) => with_window(|w| w.answer_agent(pane, &question, yes)).flatten(),
+                None => with_window(|w| w.live_action(Some(LiveAction::Show(pane)))).flatten(),
+            };
+            if let Some(next) = next {
+                run_command(hwnd, next);
             }
         }
         Command::ConfirmAgent {

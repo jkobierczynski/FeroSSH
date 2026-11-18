@@ -116,24 +116,7 @@ const LAST_LINE: usize = 160;
 /// this is a good guess, not a reading of what they mean.
 pub fn last_line(screen: &[String]) -> Option<String> {
     screen.iter().rev().find_map(|line| {
-        let text: String = line
-            .chars()
-            .map(|c| {
-                if ('\u{2500}'..='\u{259f}').contains(&c) || c.is_control() {
-                    ' '
-                } else {
-                    c
-                }
-            })
-            .collect();
-        let text = text
-            .split_whitespace()
-            .collect::<Vec<_>>()
-            .join(" ")
-            .trim_start_matches([
-                '>', '\u{276f}', '$', '#', '%', '*', '\u{2022}', '\u{25cf}', '\u{23fa}', ' ',
-            ])
-            .to_owned();
+        let text = clean(line);
         let words = text.chars().filter(|c| c.is_alphanumeric()).count();
         let hint = text.starts_with("? for shortcuts")
             || text.starts_with("esc to interrupt")
@@ -142,7 +125,107 @@ pub fn last_line(screen: &[String]) -> Option<String> {
     })
 }
 
+/// A screen line without the frames agents draw (box-drawing characters),
+/// with its spaces closed up and the marks before a prompt or an answer
+/// (`>`, `❯`, `●`, `⏺`, `$`) taken off.
+fn clean(line: &str) -> String {
+    let text: String = line
+        .chars()
+        .map(|c| {
+            if ('\u{2500}'..='\u{259f}').contains(&c) || c.is_control() {
+                ' '
+            } else {
+                c
+            }
+        })
+        .collect();
+    text.split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .trim_start_matches([
+            '>', '\u{276f}', '$', '#', '%', '*', '\u{2022}', '\u{25cf}', '\u{23fa}', ' ',
+        ])
+        .to_owned()
+}
+
+/// A yes-or-no question an agent shows at the bottom of its screen, with
+/// the keys that answer it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Question {
+    /// The question as shown, at most [`LAST_LINE`] characters.
+    pub text: String,
+    /// What to type for yes, and for no.
+    pub yes: Vec<u8>,
+    pub no: Vec<u8>,
+}
+
+/// How far up from the bottom of the screen a question is looked for.
+const QUESTION_LINES: usize = 16;
+
+/// The yes-or-no question agent `screen` shows, if it shows one, in one of
+/// the two forms agents ask in:
+///
+/// - a numbered choice (Claude Code, Codex): a line `1. Yes…` and a line
+///   `2. No…` or `3. No…`; the number of each answers, as typing it there
+///   does. The question is the line with words above the first choice.
+/// - a prompt line ending in `[y/n]`, `[Y/n]`, `[y/N]`, `(y/n)` or
+///   `(Y)es/(N)o` (aider and most command-line tools): `y` or `n` and
+///   Enter.
+///
+/// Only the bottom of the screen counts, where an agent waits for the
+/// answer; a question it scrolled past is not one.
+pub fn question(screen: &[String]) -> Option<Question> {
+    let bottom: Vec<String> = screen
+        .iter()
+        .map(|l| clean(l))
+        .filter(|l| !l.is_empty())
+        .collect();
+    let bottom = bottom.get(bottom.len().saturating_sub(QUESTION_LINES)..)?;
+    // A numbered choice.
+    let choice = |line: &str| -> Option<(u8, String)> {
+        let (n, rest) = line.split_once(". ")?;
+        let n: u8 = n.trim().parse().ok().filter(|n| (1..=9).contains(n))?;
+        Some((n, rest.trim().to_lowercase()))
+    };
+    let first = bottom.iter().position(|l| choice(l).is_some());
+    if let Some(first) = first {
+        let (above, from) = bottom.split_at(first);
+        let options: Vec<(u8, String)> = from.iter().filter_map(|l| choice(l)).collect();
+        let yes = options
+            .iter()
+            .find(|(_, t)| t == "yes" || t.starts_with("yes,") || t.starts_with("yes "))
+            .map(|(n, _)| *n);
+        let no = options
+            .iter()
+            .find(|(_, t)| t == "no" || t.starts_with("no,") || t.starts_with("no "))
+            .map(|(n, _)| *n);
+        if let (Some(yes), Some(no)) = (yes, no) {
+            let text = above
+                .iter()
+                .rev()
+                .find(|l| l.chars().filter(|c| c.is_alphanumeric()).count() >= 3)?;
+            return Some(Question {
+                text: text.chars().take(LAST_LINE).collect(),
+                yes: vec![b'0' + yes],
+                no: vec![b'0' + no],
+            });
+        }
+    }
+    // A y/n prompt on the last line.
+    let last = bottom.last()?;
+    let lower = last.to_lowercase();
+    let asks = ["[y/n]", "(y/n)", "(y)es/(n)o", "[yes/no]", "(yes/no)"]
+        .iter()
+        .any(|m| lower.trim_end_matches([' ', ':', '?']).contains(m));
+    asks.then(|| Question {
+        text: last.chars().take(LAST_LINE).collect(),
+        yes: b"y\r".to_vec(),
+        no: b"n\r".to_vec(),
+    })
+}
+
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
 
@@ -290,6 +373,43 @@ mod tests {
 
     fn screen(lines: &[&str]) -> Vec<String> {
         lines.iter().map(|l| (*l).to_owned()).collect()
+    }
+
+    #[test]
+    fn finds_a_question_and_how_to_answer_it() {
+        // Claude Code: a numbered choice in a box.
+        let claude = screen(&[
+            "\u{23fa} Bash(npm test)",
+            "\u{256d}\u{2500}\u{2500}\u{256e}",
+            "\u{2502} Bash command                                   \u{2502}",
+            "\u{2502}   npm test                                     \u{2502}",
+            "\u{2502} Do you want to proceed?                        \u{2502}",
+            "\u{2502} \u{276f} 1. Yes                                   \u{2502}",
+            "\u{2502}   2. Yes, and don't ask again for npm commands \u{2502}",
+            "\u{2502}   3. No, and tell Claude what to do differently (esc) \u{2502}",
+            "\u{2570}\u{2500}\u{2500}\u{256f}",
+        ]);
+        let q = question(&claude).unwrap();
+        assert_eq!(q.text, "Do you want to proceed?");
+        assert_eq!((q.yes.as_slice(), q.no.as_slice()), (&b"1"[..], &b"3"[..]));
+        // aider: a y/n prompt.
+        let aider = screen(&["Add file to the chat? (Y)es/(N)o [Yes]: "]);
+        let q = question(&aider).unwrap();
+        assert_eq!(q.text, "Add file to the chat? (Y)es/(N)o [Yes]:");
+        assert_eq!(
+            (q.yes.as_slice(), q.no.as_slice()),
+            (&b"y\r"[..], &b"n\r"[..])
+        );
+        let apt = screen(&["Do you want to continue? [Y/n] "]);
+        assert_eq!(question(&apt).unwrap().no, b"n\r");
+        // A numbered list that is not yes or no, an answer with no
+        // question, and a question long scrolled up are not questions.
+        assert_eq!(question(&screen(&["Pick one:", "1. Red", "2. Blue"])), None);
+        assert_eq!(question(&screen(&["1. Yes", "2. No"])), None);
+        let mut old = screen(&["Overwrite? [y/n] y"]);
+        old.extend((0..20).map(|i| format!("line {i} of output")));
+        assert_eq!(question(&old), None);
+        assert_eq!(question(&screen(&["All done.", "> "])), None);
     }
 
     #[test]
