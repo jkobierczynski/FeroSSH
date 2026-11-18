@@ -421,7 +421,7 @@ mod tests {
             let p = Palette::of(theme);
             for bg in [p.strip, p.active] {
                 let c = contrast(attention_colour(bg, p.text), bg);
-                assert!(c >= MARK_CONTRAST - 0.01, "{}: {c:.2}", theme.name);
+                assert!(c >= MARK_CONTRAST, "{}: {c:.3}", theme.name);
             }
         }
         // System colours with text close to the strip: still 3:1.
