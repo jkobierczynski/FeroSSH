@@ -46,7 +46,33 @@ const PANE_FORMAT: &str = "#{pane_id} #{window_id} #{pane_width} #{pane_height} 
     #{cursor_x} #{cursor_y} #{alternate_on} #{cursor_flag} #{keypad_cursor_flag} \
     #{keypad_flag} #{mouse_standard_flag} #{mouse_button_flag} #{mouse_all_flag} \
     #{mouse_sgr_flag} #{mouse_utf8_flag} #{origin_flag} #{insert_flag} #{wrap_flag} #{scroll_region_upper} \
-    #{scroll_region_lower} #{window_layout}";
+    #{scroll_region_lower} #{window_layout} #{@ferossh-agent}";
+
+/// The window option that marks a coding agent's window, holding the
+/// agent's name ([`agent_name`]); it is read back on every attach, from
+/// any PC.
+pub const AGENT_OPTION: &str = "@ferossh-agent";
+
+/// The short name a coding agent's window is known by: the program of its
+/// command line (`claude` for `claude --resume`, `aider` for
+/// `/opt/bin/aider`), letters, digits, `.`, `_` and `-` only, at most 32.
+pub fn agent_name(command: &str) -> String {
+    let program = command
+        .split_whitespace()
+        .find(|w| !w.contains('='))
+        .unwrap_or("agent");
+    let program = program.rsplit('/').next().unwrap_or(program);
+    let name: String = program
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+        .take(32)
+        .collect();
+    if name.is_empty() {
+        "agent".to_owned()
+    } else {
+        name
+    }
+}
 
 /// How a session's windows map to native panes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -137,6 +163,9 @@ enum Placement {
 enum Split {
     /// A window placed next to a native pane (FeroSSH layout).
     Window(Placement),
+    /// A coding agent's window, placed like [`Split::Window`]; its name
+    /// and command wait in [`Tmux::agents_waiting`] under this number.
+    Agent(Placement, u32),
     /// A tmux split of `pane` (tmux layout).
     Pane { pane: PaneId, flags: &'static str },
 }
@@ -153,6 +182,8 @@ enum Tag {
     Capture(PaneId),
     CaptureAlternate(PaneId),
     NewWindow(Placement),
+    /// The window and pane a coding agent was started in.
+    AgentWindow(Placement, u32),
     SplitPane,
     /// A pane's directory, to open a split there.
     SplitHere(Split),
@@ -203,11 +234,27 @@ struct PaneLine {
     window: WindowId,
     state: PaneState,
     layout: String,
+    /// The window's [`AGENT_OPTION`], when it has one.
+    agent: Option<String>,
 }
 
 fn parse_pane_line(line: &[u8]) -> Option<PaneLine> {
-    let text = std::str::from_utf8(line).ok()?;
-    let f: Vec<&str> = text.split(' ').collect();
+    // The agent option comes last, whole even if someone set it to a
+    // value with spaces or bytes that are not UTF-8 (then it is not ours
+    // and is ignored, and the pane still counts); the tests' lines may
+    // leave it out.
+    let mut parts: Vec<&[u8]> = line.splitn(22, |&b| b == b' ').collect();
+    let agent = match parts.len() {
+        22 => parts
+            .pop()
+            .and_then(|m| std::str::from_utf8(m).ok())
+            .and_then(agent_name_of_option),
+        _ => None,
+    };
+    let f: Vec<&str> = parts
+        .into_iter()
+        .map(|p| std::str::from_utf8(p).ok())
+        .collect::<Option<_>>()?;
     let [
         pane,
         window,
@@ -239,6 +286,7 @@ fn parse_pane_line(line: &[u8]) -> Option<PaneLine> {
     Some(PaneLine {
         pane: pane.strip_prefix('%')?.parse().ok()?,
         window: window.strip_prefix('@')?.parse().ok()?,
+        agent,
         state: PaneState {
             width: n(width).max(1),
             height: n(height).max(1),
@@ -381,6 +429,13 @@ pub struct Tmux {
     /// Where new windows and panes start unless a split asks for its
     /// pane's directory: the host's start directory, from its profile.
     pub start_dir: Option<String>,
+    /// Coding agents asked for, until tmux answers with their windows:
+    /// name and command line, by request number.
+    agents_waiting: BTreeMap<u32, (String, String)>,
+    /// The number of the last coding agent asked for.
+    agent_seq: u32,
+    /// The windows that run a coding agent, by [`AGENT_OPTION`].
+    agents: BTreeMap<WindowId, String>,
 }
 
 /// A window's size and its session's client count, for [`Tag::SizeCheck`].
@@ -404,6 +459,12 @@ fn parse_size_check(text: &str) -> Option<SizeCheck> {
         clients,
         manual,
     })
+}
+
+/// An [`AGENT_OPTION`] value as read back: only what [`agent_name`]
+/// writes, so a value set by hand cannot put anything odd on the screen.
+fn agent_name_of_option(value: &str) -> Option<String> {
+    (!value.is_empty() && agent_name(value) == value).then(|| value.to_owned())
 }
 
 fn win_of(text: &[u8]) -> Option<WindowId> {
@@ -480,6 +541,9 @@ impl Tmux {
             keys_wanted: false,
             keys: None,
             start_dir: None,
+            agents_waiting: BTreeMap::new(),
+            agent_seq: 0,
+            agents: BTreeMap::new(),
         }
     }
 
@@ -638,6 +702,7 @@ impl Tmux {
         self.windows.clear();
         self.orphans.clear();
         self.discovering.clear();
+        self.agents.clear();
         self.placements.clear();
         self.sent_sizes.clear();
         self.sent_client_size = None;
@@ -807,6 +872,39 @@ impl Tmux {
                     }
                 }
             }
+            Tag::AgentWindow(placement, n) => {
+                let Some((name, line)) = self.agents_waiting.remove(&n) else {
+                    return;
+                };
+                let text = first();
+                let mut ids = text.split(' ');
+                let w = ids.next().and_then(|t| win_of(t.as_bytes()));
+                let p: Option<PaneId> = ids.next().and_then(|t| t.strip_prefix('%')?.parse().ok());
+                let (Some(w), Some(p), true) = (w, p, ok) else {
+                    out.push(Action::Notice(format!(
+                        "tmux could not open a window for {name}: {text}"
+                    )));
+                    return;
+                };
+                self.agents.insert(w, name.clone());
+                self.send(
+                    &format!(
+                        "set-option -w -t @{w} {AGENT_OPTION} {}",
+                        command::quote(&name)
+                    ),
+                    Tag::Ignore,
+                    out,
+                );
+                let mut keys = line.into_bytes();
+                keys.push(b'\r');
+                for c in command::send_keys(p, &keys) {
+                    self.send(&c, Tag::Ignore, out);
+                }
+                self.placements.insert(w, placement);
+                if !self.windows.contains_key(&w) {
+                    self.discover(w, out);
+                }
+            }
             Tag::SplitHere(split) => {
                 // A pane that went meanwhile, or a path tmux cannot take:
                 // the start directory, or where tmux starts shells.
@@ -942,6 +1040,9 @@ impl Tmux {
         let mut order: Vec<WindowId> = Vec::new();
         let mut infos: BTreeMap<WindowId, Vec<PaneLine>> = BTreeMap::new();
         for line in lines.iter().filter_map(|l| parse_pane_line(l)) {
+            if let Some(a) = &line.agent {
+                self.agents.insert(line.window, a.clone());
+            }
             if !infos.contains_key(&line.window) {
                 if order.len() >= MAX_WINDOWS {
                     continue;
@@ -1175,6 +1276,9 @@ impl Tmux {
         if lines.is_empty() {
             return;
         }
+        if let Some(a) = lines.iter().find_map(|l| l.agent.clone()) {
+            self.agents.insert(w, a);
+        }
         let known = self.windows.contains_key(&w);
         if !known && self.windows.len() >= MAX_WINDOWS {
             return;
@@ -1295,6 +1399,7 @@ impl Tmux {
 
     fn remove_window(&mut self, ws: &mut Workspace, w: WindowId, out: &mut Vec<Action>) {
         self.windows.remove(&w);
+        self.agents.remove(&w);
         self.sent_sizes.remove(&w);
         self.sent_layouts.remove(&w);
         let gone: Vec<PaneId> = self
@@ -1339,10 +1444,12 @@ impl Tmux {
             ws.remove_pane(native);
             out.push(Action::Remove { native });
         }
+        self.agents_waiting.clear();
         self.panes.clear();
         self.windows.clear();
         self.orphans.clear();
         self.discovering.clear();
+        self.agents.clear();
         self.placements.clear();
         self.session = None;
         self.restoring = false;
@@ -1435,12 +1542,75 @@ impl Tmux {
                 Tag::NewWindow(placement),
                 out,
             ),
+            Split::Agent(placement, n) => {
+                let name = self
+                    .agents_waiting
+                    .get(&n)
+                    .map(|(name, _)| name.clone())
+                    .unwrap_or_default();
+                self.send(
+                    &format!(
+                        "new-window -d{cwd} -n {} -P -F '#{{window_id}} #{{pane_id}}'",
+                        command::quote(&name)
+                    ),
+                    Tag::AgentWindow(placement, n),
+                    out,
+                );
+            }
             Split::Pane { pane, flags } => self.send(
                 &format!("split-window {flags}{cwd} -t %{pane} -P -F '#{{pane_id}}'"),
                 Tag::SplitPane,
                 out,
             ),
         }
+    }
+
+    /// Starts coding agent `command` in a new tmux window, a tab after
+    /// `native`'s, in its directory: the window is named and marked with
+    /// [`AGENT_OPTION`], and the command is typed at its shell, so the
+    /// shell stays when the agent exits. tmux keeps it running whatever
+    /// happens to the connection.
+    /// `dir`, when given, is the directory to start in instead of
+    /// `native`'s (an SSH shell outside tmux that asked for the agent).
+    pub fn start_agent(&mut self, native: Native, command: &str, dir: Option<&str>) -> Vec<Action> {
+        let mut out = Vec::new();
+        if !self.active() || command.trim().is_empty() {
+            return out;
+        }
+        // A connection that never answers keeps only a few; the ones it
+        // accepted still finish.
+        if self.agents_waiting.len() >= 16 {
+            out.push(Action::Notice(
+                "tmux has not answered the last agent starts yet; try again in a moment.".into(),
+            ));
+            return out;
+        }
+        self.agent_seq = self.agent_seq.wrapping_add(1);
+        let n = self.agent_seq;
+        self.agents_waiting
+            .insert(n, (agent_name(command), command.trim().to_owned()));
+        let split = Split::Agent(Placement::Tab { after: native }, n);
+        match dir {
+            // The asking shell's directory, or tmux's default when it cannot
+            // be given to tmux: never another pane's.
+            Some(dir) => {
+                let cwd = same_dir::tmux_cwd(dir);
+                self.open_split(split, &cwd, &mut out);
+            }
+            None => {
+                let p = self.pane_of(native);
+                self.open_here(p, split, &mut out);
+            }
+        }
+        out
+    }
+
+    /// The coding agent native pane `native` runs, by its name, if its
+    /// tmux window is an agent's.
+    pub fn agent_of(&self, native: Native) -> Option<&str> {
+        let p = self.pane_of(native)?;
+        let w = self.panes.get(&p)?.window;
+        self.agents.get(&w).map(String::as_str)
     }
 
     /// A new tmux window as a tab after `native`'s, in its directory.
@@ -2171,6 +2341,93 @@ mod tests {
     }
 
     #[test]
+    fn agents_get_a_marked_window_and_their_command_typed() {
+        let panes = [pane_line(0, 0, 80, 24, "b25f,80x24,0,0,0")];
+        let (mut t, mut ws, _) = attached(Some("ferossh"), None, &panes);
+        let a0 = t.native_of(0).unwrap();
+        assert_eq!(t.agent_of(a0), None);
+        // Its pane's directory first, as for a new tab.
+        assert_eq!(
+            writes(&t.start_agent(a0, "  claude --resume ", None)),
+            ["display-message -p -t %0 '#{pane_current_path}'"]
+        );
+        // Replies 5 and 6 were the captures.
+        let mut input = reply(5, &[]);
+        input.extend(reply(6, &[]));
+        input.extend(reply(7, &["/srv/app".into()]));
+        let a = t.feed(&mut ws, &input);
+        assert_eq!(
+            writes(&a),
+            ["new-window -d -c '/srv/app' -n 'claude' -P -F '#{window_id} #{pane_id}'"]
+        );
+        let a = t.feed(&mut ws, &reply(8, &["@4 %9".into()]));
+        let w = writes(&a);
+        assert_eq!(w[0], "set-option -w -t @4 @ferossh-agent 'claude'");
+        // "claude --resume" and Enter, as hex: nothing read as a key name.
+        assert!(
+            w[1].starts_with("send-keys -t %9 -H 63 6c 61 75 64 65 20 2d 2d"),
+            "{w:?}"
+        );
+        assert!(w[1].ends_with(" 0d"), "{w:?}");
+        assert!(w[2].starts_with("list-panes -t @4 -F"), "{w:?}");
+        let mut line = pane_line(9, 4, 80, 24, "b25f,80x24,0,0,9");
+        line.push_str(" claude");
+        // 9 and 10 were the option and the keys.
+        let mut input = reply(9, &[]);
+        input.extend(reply(10, &[]));
+        input.extend(reply(11, &[line]));
+        let a = t.feed(&mut ws, &input);
+        let native = a
+            .iter()
+            .find_map(|a| match a {
+                Action::Create {
+                    native, pane: 9, ..
+                } => Some(*native),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(t.agent_of(native), Some("claude"));
+        assert_eq!(t.agent_of(a0), None);
+    }
+
+    #[test]
+    fn an_agent_from_a_shell_starts_in_that_shells_directory() {
+        let panes = [pane_line(0, 0, 80, 24, "b25f,80x24,0,0,0")];
+        let (mut t, _ws, _) = attached(Some("ferossh"), None, &panes);
+        let a0 = t.native_of(0).unwrap();
+        assert_eq!(
+            writes(&t.start_agent(a0, "codex", Some("/srv/api #1"))),
+            ["new-window -d -c '/srv/api ##1' -n 'codex' -P -F '#{window_id} #{pane_id}'"]
+        );
+    }
+
+    #[test]
+    fn agent_names_are_plain() {
+        assert_eq!(agent_name("claude --resume"), "claude");
+        assert_eq!(agent_name("FOO=1 /opt/bin/aider --model x"), "aider");
+        assert_eq!(agent_name("codex"), "codex");
+        assert_eq!(agent_name("$(evil)"), "evil");
+        assert_eq!(agent_name("'"), "agent");
+        assert_eq!(agent_name(""), "agent");
+        // Read back only as written.
+        assert_eq!(agent_name_of_option("claude"), Some("claude".into()));
+        assert_eq!(agent_name_of_option("bad\u{202e}x"), None);
+        assert_eq!(agent_name_of_option(""), None);
+        let mut line = pane_line(3, 1, 80, 24, "b25f,80x24,0,0,3");
+        line.push_str(" gemini");
+        assert_eq!(
+            parse_pane_line(line.as_bytes()).unwrap().agent.as_deref(),
+            Some("gemini")
+        );
+        line.push_str("$x");
+        assert_eq!(parse_pane_line(line.as_bytes()).unwrap().agent, None);
+        // A marker that is not UTF-8 costs the agent name, not the pane.
+        let mut bytes = pane_line(3, 1, 80, 24, "b25f,80x24,0,0,3").into_bytes();
+        bytes.extend_from_slice(b" gem\xffini");
+        assert_eq!(parse_pane_line(&bytes).unwrap().agent, None);
+    }
+
+    #[test]
     fn splits_in_the_same_directory_ask_tmux_first() {
         let panes = [pane_line(0, 0, 80, 24, "b25f,80x24,0,0,0")];
         let (mut t, mut ws, _) = attached(Some("ferossh"), None, &panes);
@@ -2202,7 +2459,7 @@ mod tests {
         assert_eq!(writes(&t.split(a0, Dir::Down)).len(), 1);
         let mut input = reply(10, &[]);
         input.extend(reply(11, &[]));
-        input.extend(reply(12, &["/tmp/it's".into()]));
+        input.extend(reply(12, &["/tmp/a\tb".into()]));
         assert_eq!(
             writes(&t.feed(&mut ws, &input)),
             ["new-window -d -P -F '#{window_id}'"]

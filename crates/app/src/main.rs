@@ -24,6 +24,8 @@
 #[cfg_attr(not(windows), allow(dead_code))]
 mod agent_fwd;
 #[cfg_attr(not(windows), allow(dead_code))]
+mod agents;
+#[cfg_attr(not(windows), allow(dead_code))]
 mod attention;
 #[cfg_attr(not(windows), allow(dead_code))]
 mod batch;

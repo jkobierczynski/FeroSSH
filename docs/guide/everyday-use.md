@@ -506,6 +506,14 @@ To have a host's shells start in one server directory, `cd` there and use Sessio
 
 If your fingers know tmux's keys, tick Session > tmux > Use tmux keybindings for tabs and panes. In a pane of a tmux session, your tmux prefix (Ctrl+B unless your tmux config sets another; FeroSSH asks tmux) followed by `c`, `%`, `"`, `n`, `p`, `0`-`9`, `o`, an arrow, `x`, `&`, `!`, `d` or `s` works the native tabs and panes, which are tmux windows and panes. Arrows, Ctrl or Alt+arrows (resize), `[`, PageUp and PageDown repeat as in tmux: after the first one, press them again without the prefix within tmux's `repeat-time` (half a second unless your tmux config sets another), or hold the key down. Press the prefix twice to send it to the program, and the prefix then `?` for the full list. It is off unless you turn it on.
 
+### Coding agents in tmux
+
+Session > Coding agents starts a coding agent (Claude Code, Codex, aider, or your own command) in tmux on the server the focused pane is logged in to, so it keeps working when your PC sleeps or the network drops, and comes back by itself when FeroSSH reconnects. Each agent gets a tmux window of its own, a new tab in the pane's directory, named after the agent; FeroSSH types the agent's command at that window's shell, so the shell stays when the agent exits and you can start it again in place. When tmux already shows on that host, the agent joins that session; otherwise it goes into a tmux session named `agents`, made when needed, which FeroSSH then attaches. The agent's window is marked in tmux (the window option `@ferossh-agent`), so it is recognised again after a reconnect or from another PC. It needs an SSH pane with tmux on the server; Mosh and SFTP-only connections cannot start one.
+
+Show agents in the Session manager (the menu's first item) lists the agents first, with what each is doing: *working* while it prints, *needs you* when it asked for attention, *quiet* once its output stopped after a stretch of work, or *idle*, and for how long. Every agent pane has the quiet watch of [Notifications](#notifications-coding-agents-and-long-jobs) on, so with Settings > Desktop notifications on you are told when an agent stops, even one that sends no notification of its own.
+
+The menu offers `claude`, `codex` and `aider` until you list your own: one `AgentCommand` line each in `ferossh.conf`, such as `AgentCommand claude --model opus` (see [Settings](settings.md)). The line is typed at the server's shell exactly as written.
+
 ## Remote desktops
 
 Session > Remote desktop > Open remote desktop (Ctrl+Shift+D) shows the Linux desktop (X11 or Wayland) of the host you are logged in to. The server needs an RDP server: xrdp (`sudo apt install xrdp`) or GNOME Remote Desktop. FeroSSH checks that something answers on the server's RDP port (3389, or `DesktopPort`), forwards a loopback port to it through SSH (33900 to 33999, the same for the same host each time) and opens Windows' Remote Desktop Connection there. The server's RDP port can stay closed on its firewall, and the tunnel closes with the connection.
@@ -580,7 +588,7 @@ While it is on, FeroSSH runs one small read-only command per server on a channel
 
 ## Notifications (coding agents and long jobs)
 
-Settings > Desktop notifications lets a pane tell you when it wants you, so you can leave a coding agent (Claude Code, Codex, aider) or a long build running in a tab and work elsewhere. It is off unless you turn it on. When a pane asks for attention and you are not looking at it, its tab gets an amber diamond (◆) until you go to it, and unless the pane is in sight in the window in front, Windows shows a notification with the pane's name and the message. Click it to bring FeroSSH forward on that pane. The FeroSSH icon stays in the notification area while something waits for you, so a notification you missed is still in Windows' notification centre; it goes when you come back to FeroSSH. One pane raises at most one notification every 10 seconds.
+Settings > Desktop notifications lets a pane tell you when it wants you, so you can leave a coding agent (Claude Code, Codex, aider) or a long build running in a tab and work elsewhere. It is off unless you turn it on. When a pane asks for attention and you are not looking at it, its tab gets an amber diamond (◆) until you go to it, and unless the pane is in sight in the window in front, Windows shows a notification with the pane's name and the message. Click it to bring FeroSSH forward on that pane. The FeroSSH icon stays in the notification area while something waits for you; clicking it goes to a pane that wants you, and it goes when you come back to FeroSSH. Windows 10 also keeps missed notifications in its notification centre; Windows 11 may not keep them once they time out, so look for the tab badges there. One pane raises at most one notification every 10 seconds.
 
 A pane asks for attention when:
 
@@ -588,7 +596,7 @@ A pane asks for attention when:
 - The bell rings (Settings > Notify on the bell too, on by default while notifications are on).
 - Its output goes quiet (Session > Notify when this pane goes quiet, per pane): after at least 8 seconds of output, 5 seconds of silence mean the job ended or is waiting for an answer. This catches an agent or a script that sends nothing. What you type starts the watch over, so your own typing does not count.
 
-The message is the host's text, shown as plain text: control and hidden formatting characters are taken out and it is cut at 256 characters. Notifications use Windows' notification-area balloons, which Windows 10 and 11 show as notifications, so nothing has to be installed or registered. Windows' Do not disturb (Focus assist) holds them back like any other notification.
+The message is the host's text, shown as plain text: control and hidden formatting characters are taken out and it is cut at 256 characters (Windows may shorten a long message a little more, and a long heading too). Notifications use Windows' notification-area balloons, which Windows 10 and 11 show as notifications, so nothing has to be installed or registered. Windows' Do not disturb (Focus assist) holds them back like any other notification.
 
 ## Selecting, copying and scrollback
 

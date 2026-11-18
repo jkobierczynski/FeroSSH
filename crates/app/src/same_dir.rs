@@ -25,13 +25,14 @@ pub fn cd_line(dir: &[u8]) -> Option<Vec<u8>> {
 
 /// The tmux `-c` option for `dir`, as tmux's pane_current_path gave it;
 /// empty when there is none or it cannot be quoted for tmux safely. tmux
-/// expands formats in `-c`, so a `#` is doubled.
+/// expands formats in `-c`, so a `#` is doubled. A `'` ends the quotes
+/// and comes back as `\'`, which tmux (3.0 and later) joins up.
 pub fn tmux_cwd(dir: &str) -> String {
     let dir = dir.trim_end_matches(['\r', '\n']);
-    if dir.is_empty() || dir.chars().any(|c| c == '\'' || c.is_control()) {
+    if dir.is_empty() || dir.chars().any(char::is_control) {
         return String::new();
     }
-    format!(" -c '{}'", dir.replace('#', "##"))
+    format!(" -c '{}'", dir.replace('#', "##").replace('\'', "'\\''"))
 }
 
 /// The folder in a cmd (`C:\Users\me>`) or PowerShell
@@ -102,7 +103,7 @@ mod tests {
     fn tmux_option() {
         assert_eq!(tmux_cwd("/srv/www\n"), " -c '/srv/www'");
         assert_eq!(tmux_cwd(""), "");
-        assert_eq!(tmux_cwd("/tmp/it's"), "");
+        assert_eq!(tmux_cwd("/tmp/it's"), " -c '/tmp/it'\\''s'");
         assert_eq!(tmux_cwd("/tmp/#{x}"), " -c '/tmp/##{x}'");
     }
 }

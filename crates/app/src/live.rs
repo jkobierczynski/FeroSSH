@@ -91,6 +91,27 @@ impl LiveState {
     }
 }
 
+/// A coding agent running in a session (Session > Coding agents).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Agent {
+    /// Its name, such as `claude`.
+    pub name: String,
+    /// What it does: working, needs you, quiet or idle.
+    pub state: &'static str,
+    /// For how long, spoken: `3 min`.
+    pub since: Option<String>,
+}
+
+impl Agent {
+    /// `claude · working 3 min`.
+    fn describe(&self) -> String {
+        match &self.since {
+            Some(t) => format!("{} \u{b7} {} {t}", self.name, self.state),
+            None => format!("{} \u{b7} {}", self.name, self.state),
+        }
+    }
+}
+
 /// One open session, as the window sees it now.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LiveSession {
@@ -101,6 +122,8 @@ pub struct LiveSession {
     /// Hidden by the user (Window > Hide pane): in no tab, running on.
     pub hidden: bool,
     pub kind: Kind,
+    /// The coding agent it runs, if it is one's tmux window.
+    pub agent: Option<Agent>,
     /// `user@host[:port]`, the COM port, or the tmux pane's host.
     pub target: String,
     /// The name the user gave the session, shown instead of the target.
@@ -114,9 +137,17 @@ pub struct LiveSession {
     pub focused: bool,
 }
 
+/// The filter that lists the coding agents only.
+pub const AGENTS_ONLY: &str = "is:agent";
+
 impl LiveSession {
     fn matches(&self, query: &str) -> bool {
         let q = query.trim().to_lowercase();
+        // Session > Coding agents > Show agents: the agents only, not a
+        // host that happens to have "agent" in its name.
+        if q == AGENTS_ONLY {
+            return self.agent.is_some();
+        }
         q.is_empty()
             || self.target.to_lowercase().contains(&q)
             || self
@@ -128,6 +159,9 @@ impl LiveSession {
                 .as_deref()
                 .is_some_and(|t| t.to_lowercase().contains(&q))
             || self.kind.name().to_lowercase().contains(&q)
+            || self.agent.as_ref().is_some_and(|a| {
+                "agent".contains(&q) || a.name.to_lowercase().contains(&q) || a.state.contains(&q)
+            })
     }
 
     /// The second line: where it is, its state and the notes.
@@ -138,6 +172,9 @@ impl LiveSession {
             None => "no tab".to_owned(),
         }];
         parts.push(self.state.name().to_owned());
+        if let Some(a) = &self.agent {
+            parts.push(a.describe());
+        }
         if self.name.is_some() {
             parts.push(self.target.clone());
         }
@@ -190,8 +227,11 @@ impl LiveView {
         (rows.saturating_sub(HEADER) / LINES).max(1)
     }
 
+    /// The sessions that match the filter, coding agents first.
     fn shown<'a>(&self, all: &'a [LiveSession]) -> Vec<&'a LiveSession> {
-        all.iter().filter(|s| s.matches(&self.query)).collect()
+        let mut shown: Vec<&LiveSession> = all.iter().filter(|s| s.matches(&self.query)).collect();
+        shown.sort_by_key(|s| s.agent.is_none());
+        shown
     }
 
     /// Puts the selection back on its pane, or on the session now at its
@@ -528,6 +568,9 @@ impl LiveView {
             .into_iter()
             .map(|s| {
                 let mut details: Vec<String> = Vec::new();
+                if let Some(a) = &s.agent {
+                    details.push(a.describe());
+                }
                 if s.name.is_some() {
                     details.push(s.target.clone());
                 }
@@ -538,13 +581,20 @@ impl LiveView {
                 LiveRow {
                     pane: s.pane,
                     label: s.name.clone().unwrap_or_else(|| s.target.clone()),
-                    kind: s.kind.name(),
+                    kind: if s.agent.is_some() {
+                        "agent"
+                    } else {
+                        s.kind.name()
+                    },
                     tab: match s.tab {
                         Some(i) => (i + 1).to_string(),
                         None if s.hidden => "hidden".to_owned(),
                         None => "-".to_owned(),
                     },
-                    state: s.state.name(),
+                    state: match &s.agent {
+                        Some(a) if s.state == LiveState::Connected => a.state,
+                        _ => s.state.name(),
+                    },
                     details: details.join(" \u{b7} "),
                     focused: s.focused,
                 }
@@ -565,6 +615,7 @@ mod tests {
             tab,
             hidden: false,
             kind: Kind::Ssh,
+            agent: None,
             target: target.into(),
             name: None,
             title: None,
@@ -587,6 +638,36 @@ mod tests {
             com,
             session(4, None, "me@core", LiveState::Ended),
         ]
+    }
+
+    #[test]
+    fn agents_come_first_with_their_state() {
+        let mut all = sample();
+        all[2].kind = Kind::Tmux;
+        all[2].agent = Some(Agent {
+            name: "claude".into(),
+            state: "needs you",
+            since: None,
+        });
+        let mut v = LiveView::default();
+        let rows = v.rows(&all);
+        assert_eq!(rows[0].pane, 3);
+        assert_eq!(rows[0].kind, "agent");
+        assert_eq!(rows[0].state, "needs you");
+        assert!(rows[0].details.starts_with("claude \u{b7} needs you"));
+        v.set_query("agent");
+        assert_eq!(v.rows(&all).len(), 1);
+        v.set_query("claude");
+        assert_eq!(v.rows(&all).len(), 1);
+        // A host named like an agent shows for the text, not for the
+        // agents-only filter.
+        all.push(session(5, Some(2), "me@agent-build", LiveState::Connected));
+        v.set_query("agent");
+        assert_eq!(v.rows(&all).len(), 2);
+        v.set_query(AGENTS_ONLY);
+        let rows = v.rows(&all);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].pane, 3);
     }
 
     #[test]
