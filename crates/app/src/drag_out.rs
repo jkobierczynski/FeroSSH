@@ -98,6 +98,14 @@ pub fn remove_stand_ins(paths: &[PathBuf]) -> std::io::Result<()> {
     first
 }
 
+/// Removes a drag's folder when nothing came of the drag: the stand-ins
+/// that are still empty, then the folder if that leaves it empty. Anything
+/// with content stays where it is, for the sweep of a later drag.
+pub fn discard(folder: &Path, paths: &[PathBuf]) {
+    let _ = remove_stand_ins(paths);
+    let _ = std::fs::remove_dir(folder);
+}
+
 /// The downloads for one drag, shared by the file pane (which waits for
 /// them) and the main window (which queues them).
 #[derive(Debug, Default)]
@@ -338,6 +346,24 @@ mod tests {
         assert!(!s.paths[0].exists());
         assert!(!s.paths[1].exists());
         assert_eq!(std::fs::read(&s.paths[2]).unwrap(), b"data");
+    }
+
+    #[test]
+    fn discarding_a_drag_keeps_anything_with_content() {
+        let dir = Dir::new("discard");
+        let folder = dir.path().join("drag");
+        std::fs::create_dir(&folder).unwrap();
+        let entries = vec![(b"a".to_vec(), false), (b"b".to_vec(), false)];
+        let s = stand_ins(&folder, &entries).unwrap();
+        std::fs::write(&s.paths[1], b"data").unwrap();
+        discard(&folder, &s.paths);
+        assert!(!s.paths[0].exists());
+        assert_eq!(std::fs::read(&s.paths[1]).unwrap(), b"data");
+
+        // Once all are empty, the folder goes too.
+        std::fs::write(&s.paths[1], b"").unwrap();
+        discard(&folder, &s.paths);
+        assert!(!folder.exists());
     }
 
     #[test]

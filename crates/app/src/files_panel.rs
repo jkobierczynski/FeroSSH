@@ -3444,13 +3444,20 @@ fn drag_out(h: &Handles) {
     let entries: Vec<(Vec<u8>, bool)> = rows.iter().map(|r| (r.key.clone(), r.dir)).collect();
     let stand = match drag_out::stand_ins(&folder, &entries) {
         Ok(s) if !s.paths.is_empty() => s,
-        Ok(_) => {
-            let _ = std::fs::remove_dir_all(&folder);
+        Ok(s) => {
+            drag_out::discard(&folder, &s.paths);
             local_problem("Windows cannot hold files with these names.".into());
             return;
         }
         Err(e) => {
-            let _ = std::fs::remove_dir_all(&folder);
+            // Some stand-ins may be made: only empty ones go.
+            let made = std::fs::read_dir(&folder)
+                .map(|d| {
+                    d.filter_map(|e| e.ok().map(|e| e.path()))
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            drag_out::discard(&folder, &made);
             local_problem(format!("{}: {e}", folder.display()));
             return;
         }
@@ -3469,8 +3476,10 @@ fn drag_out(h: &Handles) {
     };
     // Downloads that were queued stay listed (Retry included), so their
     // folder stays too, until a later drag sweeps it.
+    // Never remove_dir_all: a stand-in that was in the way (written to
+    // by another program) keeps what it holds.
     if !dropped && !queued {
-        let _ = std::fs::remove_dir_all(&folder);
+        drag_out::discard(&folder, &stand.paths);
     }
     if let Err(e) = dragged {
         local_problem(format!("Could not drag the files out: {}", e.message()));
