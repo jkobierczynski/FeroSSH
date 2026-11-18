@@ -272,16 +272,15 @@ mod tests {
         let header = format!("\x1b]99;i=2:e=1:f={}:t=build;", "QUFB".repeat(150));
         let body = b"QUFB".repeat(MAX_LEN / 4);
         let osc = [header.as_bytes(), &body, b"\x07"].concat();
-        match s.scan(&osc).as_slice() {
-            [Found::Notify(n)] => {
-                let title = n.title.as_deref().unwrap_or_default();
-                assert!(
-                    title.len() > 100 && title.chars().all(|c| c == 'A'),
-                    "{n:?}"
-                );
-            }
-            other => panic!("{other:?}"),
-        }
+        let found = s.scan(&osc);
+        let title = match found.as_slice() {
+            [Found::Notify(n)] => n.title.clone().unwrap_or_default(),
+            _ => String::new(),
+        };
+        assert!(
+            title.len() > 100 && title.chars().all(|c| c == 'A'),
+            "{found:?}"
+        );
         // OSC 7 keeps its own limit.
         let long = [&b"\x1b]7;file://h/"[..], &[b'a'; MAX_LEN], b"\x07"].concat();
         assert_eq!(s.scan(&long), []);
