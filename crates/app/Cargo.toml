@@ -34,6 +34,9 @@ ferostream-proto.workspace = true
 # The forwarding engine's sockets; the worker already links tokio.
 tokio = { version = "1.54", features = ["rt", "net", "time", "sync", "macros", "io-util"] }
 getrandom = "0.4"
+# Clipboard bitmaps become PNGs; already in the build through
+# ferostream-proto and ferossh-mosh.
+miniz_oxide = { version = "0.9", default-features = false, features = ["with-alloc"] }
 unicode-width = "0.2"
 zeroize = "1.9"
 

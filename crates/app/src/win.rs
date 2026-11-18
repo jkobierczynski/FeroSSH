@@ -606,6 +606,9 @@ mod cmd {
     pub const NOTIFY_QUIET: u32 = 652;
     /// Session > Coding agents > Show agents; the menu's first item.
     pub const AGENTS_SHOW: u32 = 653;
+    /// Session > Coding agents > Paste and drop files: upload and type
+    /// the path; the menu's second item.
+    pub const UPLOAD_TYPE_PATH: u32 = 654;
     /// Session > Coding agents: plus the index into the commands listed
     /// when the menu opened, up to [`AGENT_END`].
     pub const AGENT_START: u32 = 660;
@@ -1227,6 +1230,8 @@ struct Window {
     /// Server files being edited locally, put back on each save.
     edits: crate::edit_local::Edits,
     edit_timer: bool,
+    /// Files pasted or dropped whose paths are typed once they are up.
+    pastes: Vec<PasteBatch>,
     forwards_view: ForwardsView,
     live_view: LiveView,
     /// tmux control mode, per SSH pane that has run `tmux -CC`.
@@ -2330,6 +2335,7 @@ fn create_and_run(launch: Launch, theme: Option<String>) -> Result<()> {
                 transfer_timer: false,
                 edits: crate::edit_local::Edits::default(),
                 edit_timer: false,
+                pastes: Vec::new(),
                 forwards_view: ForwardsView::default(),
                 live_view: LiveView::default(),
                 tmux: HashMap::new(),
@@ -2640,6 +2646,11 @@ fn build_menu() -> Result<HMENU> {
             agents,
             cmd::AGENTS_SHOW,
             "&Show agents in the Session manager",
+        )?;
+        item(
+            agents,
+            cmd::UPLOAD_TYPE_PATH,
+            "&Paste and drop files: upload and type the path",
         )?;
         AppendMenuW(session, MF_POPUP, agents.0 as usize, w!("Coding a&gents"))?;
         separator(session)?;
@@ -8826,6 +8837,7 @@ impl Window {
             }
         }
         if transfers {
+            self.settle_pastes();
             self.flush_sftp();
             if self.files_visible() {
                 self.refresh_chrome();
@@ -9163,10 +9175,11 @@ impl Window {
     fn fill_agents(&mut self, menu: HMENU) {
         let commands = crate::agents::commands(&self.settings.agent_commands);
         // SAFETY: our popup menu; it is being opened, when changing it is
-        // allowed. Everything after Show agents is replaced.
+        // allowed. Everything after Show agents and the paste option is
+        // replaced.
         unsafe {
-            while GetMenuItemCount(Some(menu)) > 1 {
-                let _ = DeleteMenu(menu, 1, MF_BYPOSITION);
+            while GetMenuItemCount(Some(menu)) > 2 {
+                let _ = DeleteMenu(menu, 2, MF_BYPOSITION);
             }
             let _ = AppendMenuW(menu, MF_SEPARATOR, 0, None);
             for (id, c) in (cmd::AGENT_START..cmd::AGENT_END).zip(&commands) {
@@ -15387,6 +15400,11 @@ impl Window {
                 self.save_settings();
                 self.update_menu_checks();
             }
+            cmd::UPLOAD_TYPE_PATH => {
+                self.settings.upload_type_path = !self.settings.upload_type_path;
+                self.save_settings();
+                self.update_menu_checks();
+            }
             cmd::VERIFY => {
                 self.settings.verify_transfers = !self.settings.verify_transfers;
                 for remote in self.sftp.values_mut() {
@@ -15820,6 +15838,7 @@ impl Window {
                 (cmd::FOLLOW_CD, s.follow_directory),
                 (cmd::VERIFY, s.verify_transfers),
                 (cmd::ZMODEM, s.zmodem),
+                (cmd::UPLOAD_TYPE_PATH, s.upload_type_path),
                 (cmd::HIGHLIGHT, s.highlight),
                 (cmd::AUTO_RECONNECT, s.auto_reconnect),
                 (cmd::SIDE_RIGHT, s.side_pane_right),
@@ -16378,6 +16397,7 @@ impl Window {
         for remote in self.sftp.values_mut() {
             remote.poll();
         }
+        self.settle_pastes();
         self.flush_sftp();
         if self.files_visible() {
             self.refresh_chrome();
@@ -17155,6 +17175,120 @@ impl Window {
         open
     }
 
+    /// Uploads `paths` to `~/.cache/ferossh/paste/` on pane `id`'s host
+    /// and types their paths there once they are up (UploadAndTypePath).
+    /// `temp` are local copies made for this upload, removed after it;
+    /// the caller removes them on an error. Folders are left out.
+    fn upload_and_type(
+        &mut self,
+        id: PaneId,
+        paths: &[PathBuf],
+        temp: Vec<PathBuf>,
+    ) -> std::result::Result<(), String> {
+        const ON_A_PANE: &str = "Paste or drop files on a pane that is logged in to an SSH host \
+            to upload them there and type their paths.";
+        self.ensure_sftp(id);
+        let key = self.files_target(id).ok_or(ON_A_PANE)?;
+        let remote = self.sftp.get_mut(&key).ok_or(ON_A_PANE)?;
+        let mut jobs = Vec::new();
+        let mut left_out = Vec::new();
+        for path in paths {
+            match remote.upload_into_home(path, crate::paste_upload::FOLDER) {
+                Ok(job) => jobs.push(job),
+                Err(e) => left_out.push(e),
+            }
+        }
+        if !jobs.is_empty() {
+            self.pastes.push(PasteBatch {
+                pane: id,
+                queue: key,
+                jobs,
+                temp,
+            });
+        }
+        self.flush_sftp();
+        if self.files_visible() {
+            self.refresh_chrome();
+        }
+        if left_out.is_empty() {
+            Ok(())
+        } else {
+            Err(format!(
+                "Only files are uploaded and their paths typed; use File transfer for \
+                 folders. Left out:\n\n{}",
+                left_out.join("\n")
+            ))
+        }
+    }
+
+    /// Types the paths of pasted files whose uploads have all finished;
+    /// shows the queue when one of them did not make it.
+    fn settle_pastes(&mut self) {
+        if self.pastes.is_empty() {
+            return;
+        }
+        let mut failed = false;
+        for batch in std::mem::take(&mut self.pastes) {
+            let remote = self.sftp.get(&batch.queue);
+            let running = remote.is_some_and(|r| {
+                batch
+                    .jobs
+                    .iter()
+                    .any(|&j| r.job_state(j).is_some_and(|s| !s.finished()))
+            });
+            if running {
+                self.pastes.push(batch);
+                continue;
+            }
+            let landed: Vec<Vec<u8>> = batch
+                .jobs
+                .iter()
+                .filter_map(|&j| remote.and_then(|r| r.landed(j)).map(<[u8]>::to_vec))
+                .collect();
+            for t in &batch.temp {
+                let _ = std::fs::remove_file(t);
+            }
+            let missed = batch.jobs.len() - landed.len();
+            if missed > 0 {
+                failed = true;
+                if let Some(r) = self.sftp.get_mut(&batch.queue) {
+                    r.notice = Some(format!(
+                        "{missed} pasted file{} did not upload, so {} not typed.",
+                        plural(missed),
+                        if missed == 1 {
+                            "its path was"
+                        } else {
+                            "their paths were"
+                        }
+                    ));
+                }
+            }
+            if landed.is_empty() {
+                continue;
+            }
+            let text = crate::paste_upload::typed(&landed);
+            let Some(paste) = self.panes.get(&batch.pane).map(|p| p.term.paste(&text)) else {
+                continue;
+            };
+            self.input(batch.pane, paste.bytes);
+        }
+        if failed && !self.files_visible() {
+            self.show_side(SideView::Files, false);
+        }
+    }
+
+    /// Whether files dropped at client point (`x`, `y`) go up with their
+    /// paths typed: UploadAndTypePath is on and they landed on a pane.
+    fn drop_types_path(&self, x: i32, y: i32) -> Option<PaneId> {
+        if !self.settings.upload_type_path {
+            return None;
+        }
+        match self.spot(x, y) {
+            Spot::Pane(id) => Some(id),
+            _ => None,
+        }
+    }
+
     /// Queues uploads and shows the queue.
     fn upload_files(&mut self, key: &str, paths: &[PathBuf], dir: &[u8]) {
         let Some(remote) = self.sftp.get_mut(key) else {
@@ -17887,6 +18021,16 @@ fn route_key(t: &Target) -> String {
     )
 }
 
+/// Files pasted or dropped on a pane together, uploading to its host:
+/// their paths are typed there, in order, once all are done.
+struct PasteBatch {
+    pane: PaneId,
+    queue: String,
+    jobs: Vec<ferossh_sftp::JobId>,
+    /// Pasted images saved to a local file for the upload, removed after.
+    temp: Vec<PathBuf>,
+}
+
 /// The paths of files dropped from Explorer, and where they were dropped.
 fn dropped_files(drop: HDROP) -> (Vec<PathBuf>, POINT) {
     let mut paths = Vec::new();
@@ -17924,6 +18068,15 @@ fn upload_dropped(hwnd: HWND, paths: &[PathBuf], at: POINT) {
     if paths.is_empty() {
         return;
     }
+    // UploadAndTypePath: on a pane, no question; the paths are typed.
+    if let Some(id) = with_window(|w| w.drop_types_path(at.x, at.y)).flatten() {
+        let done = with_window(|w| w.upload_and_type(id, paths, Vec::new()))
+            .unwrap_or(Err("FeroSSH is busy; drop the files again.".into()));
+        if let Err(why) = done {
+            dialog(hwnd, &why, MB_OK | MB_ICONINFORMATION);
+        }
+        return;
+    }
     let target = with_window(|w| w.drop_target(at.x, at.y))
         .unwrap_or(Err("FeroSSH is busy; drop the files again."));
     let (key, dir) = match target {
@@ -17947,6 +18100,78 @@ fn upload_dropped(hwnd: HWND, paths: &[PathBuf], at: POINT) {
     if dialog(hwnd, &text, MB_YESNO | MB_ICONQUESTION) == Some(IDYES) {
         with_window(|w| w.upload_files(&key, paths, &dir));
     }
+}
+
+/// Paste with no text on the clipboard, when UploadAndTypePath is on:
+/// files copied in Explorer, or else an image, go up to the focused
+/// pane's host and their paths are typed there.
+fn paste_files(hwnd: HWND) {
+    // Not while a side pane has the keyboard: it takes text only.
+    if with_window(|w| w.settings.upload_type_path && !(w.side.visible && w.side.focused))
+        != Some(true)
+    {
+        return;
+    }
+    let Some(id) = with_window(|w| w.focused_id()) else {
+        return;
+    };
+    let files = clipboard::get_files(hwnd);
+    let (paths, temp) = if files.is_empty() {
+        let png = match clipboard::get_png(hwnd) {
+            Some(png) => Ok(png),
+            None => match clipboard::get_dib(hwnd) {
+                Some(dib) => crate::paste_upload::png_from_dib(&dib),
+                None => return,
+            },
+        };
+        match png.and_then(|png| save_pasted_image(&png)) {
+            Ok(path) => (vec![path.clone()], vec![path]),
+            Err(why) => {
+                dialog(hwnd, &why, MB_OK | MB_ICONINFORMATION);
+                return;
+            }
+        }
+    } else {
+        (files, Vec::new())
+    };
+    let done = with_window(|w| w.upload_and_type(id, &paths, temp.clone()))
+        .unwrap_or(Err("FeroSSH is busy; paste again.".into()));
+    if let Err(why) = done {
+        // Nothing queued keeps a local copy.
+        let queued = with_window(|w| w.pastes.iter().any(|b| b.temp == temp)).unwrap_or(false);
+        if !queued {
+            for t in &temp {
+                let _ = std::fs::remove_file(t);
+            }
+        }
+        dialog(hwnd, &why, MB_OK | MB_ICONINFORMATION);
+    }
+}
+
+/// Saves a pasted image as a PNG in FeroSSH's temporary folder, under a
+/// name from the local time, for uploading.
+fn save_pasted_image(png: &[u8]) -> std::result::Result<PathBuf, String> {
+    let dir = std::env::temp_dir().join("FeroSSH-paste");
+    std::fs::create_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+    let name = crate::paste_upload::image_name(local_time());
+    let path = dir.join(&name);
+    // Two pastes in one second: the later one gets a number.
+    let path = if path.exists() {
+        (2..100)
+            .map(|n| {
+                dir.join(
+                    names::numbered(&name, n)
+                        .replace(' ', "-")
+                        .replace(['(', ')'], ""),
+                )
+            })
+            .find(|p| !p.exists())
+            .ok_or_else(|| format!("{}: too many pasted images this second.", dir.display()))?
+    } else {
+        path
+    };
+    std::fs::write(&path, png).map_err(|e| format!("{}: {e}", path.display()))?;
+    Ok(path)
 }
 
 /// File > Upload files (and ZMODEM): the system file picker, several
@@ -18875,6 +19100,7 @@ fn run_command(hwnd: HWND, command: Command) {
         }
         Command::Paste => {
             let Some(text) = clipboard::get_text(hwnd) else {
+                paste_files(hwnd);
                 return;
             };
             if with_window(|w| w.paste_side(&text)) == Some(true) {

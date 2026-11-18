@@ -9,6 +9,7 @@
 //! DownloadFolder "D:\Transfers"
 //! VerifyTransfers yes
 //! ZModem yes
+//! UploadAndTypePath yes
 //! AutoReconnect yes
 //! RemoteAppCopyAgent yes
 //! RemoteAppRemoveAgent no
@@ -661,6 +662,12 @@ pub struct Settings {
     /// Answer `rz` and `sz` in the terminal with ZMODEM; off unless turned
     /// on, so their output shows as it is.
     pub zmodem: bool,
+    /// Files pasted (an image on the clipboard, or files copied in
+    /// Explorer) or dropped on a pane go to `~/.cache/ferossh/paste/` on
+    /// its host and their paths are typed at the cursor, for programs
+    /// such as coding agents that take files by path. Off unless turned
+    /// on: drops then upload to the pane's folder after asking.
+    pub upload_type_path: bool,
     /// The file view follows the shell's working directory (OSC 7).
     pub follow_directory: bool,
     /// How the file transfer pane arranges its Local and Remote lists,
@@ -798,6 +805,7 @@ impl Default for Settings {
             auto_reconnect: true,
             parallel_transfers: None,
             zmodem: false,
+            upload_type_path: false,
             follow_directory: true,
             transfer_layout: None,
             transfer_sort: None,
@@ -1149,6 +1157,10 @@ impl Settings {
                 "zmodem" => {
                     block = Block::Top;
                     s.zmodem = yes(&args).unwrap_or(false);
+                }
+                "uploadandtypepath" => {
+                    block = Block::Top;
+                    s.upload_type_path = yes(&args).unwrap_or(false);
                 }
                 "bookmark" => {
                     block = Block::Top;
@@ -1574,6 +1586,7 @@ impl Settings {
             let _ = writeln!(out, "ParallelTransfers {n}");
         }
         let _ = writeln!(out, "ZModem {}", flag(self.zmodem));
+        let _ = writeln!(out, "UploadAndTypePath {}", flag(self.upload_type_path));
         let _ = writeln!(
             out,
             "RemoteAppCopyAgent {}",
@@ -1885,6 +1898,7 @@ Scrollback 50000
 DownloadFolder "D:\My Transfers"
 VerifyTransfers yes
 ZModem yes
+UploadAndTypePath yes
 AutoReconnect no
 ParallelTransfers 20
 FollowDirectory no
@@ -2018,6 +2032,11 @@ NewKeyword later
         assert_eq!(s.download_folder.as_deref(), Some("D:\\My Transfers"));
         assert!(s.zmodem);
         assert!(!Settings::default().zmodem);
+        assert!(s.upload_type_path);
+        assert!(
+            !Settings::default().upload_type_path,
+            "off unless turned on"
+        );
         assert!(s.verify_transfers);
         assert!(!s.auto_reconnect);
         assert_eq!(web.auto_reconnect, Some(true));

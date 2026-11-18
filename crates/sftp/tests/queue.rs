@@ -1317,3 +1317,62 @@ fn long_collision(scratch: &str, stem: &str, ext: &str) {
     assert!(name.len() + ".part".len() <= 255, "{}", name.len());
     assert_eq!(fs::read(s.local().join(name)).unwrap(), two);
 }
+
+#[test]
+fn uploads_into_a_home_folder_it_makes_and_numbers_taken_names() {
+    let s = Scratch::new("into-home");
+    let shot = s.local().join("shot.png");
+    fs::write(&shot, "png").unwrap();
+    // Queued before the channel is open, so before the home folder is known.
+    let mut remote = Remote::new("me@host");
+    remote.attach(CHANNEL, 1);
+    let mut fake = Fake::new(s.remote());
+    let first = remote
+        .upload_into_home(&shot, b".cache/ferossh/paste")
+        .unwrap();
+    assert!(run(&mut remote, &mut fake));
+    assert_eq!(remote.job_state(first), Some(State::Done));
+    assert_eq!(
+        remote.landed(first),
+        Some(&b"/.cache/ferossh/paste/shot.png"[..])
+    );
+    // Again, with the folders there: no question, a numbered name.
+    let second = remote
+        .upload_into_home(&shot, b".cache/ferossh/paste")
+        .unwrap();
+    assert!(run(&mut remote, &mut fake));
+    assert_eq!(remote.job_state(second), Some(State::Done));
+    assert_eq!(
+        remote.landed(second),
+        Some(&b"/.cache/ferossh/paste/shot (2).png"[..])
+    );
+    let dir = s.remote().join(".cache/ferossh/paste");
+    assert_eq!(fs::read_to_string(dir.join("shot.png")).unwrap(), "png");
+    assert_eq!(fs::read_to_string(dir.join("shot (2).png")).unwrap(), "png");
+}
+
+#[test]
+fn an_upload_into_the_home_folder_stops_at_a_file_in_the_way() {
+    let s = Scratch::new("into-home-file");
+    let shot = s.local().join("shot.png");
+    fs::write(&shot, "png").unwrap();
+    fs::write(s.remote().join(".cache"), "not a folder").unwrap();
+    let (mut remote, mut fake) = connected(&s.remote());
+    let id = remote.upload_into_home(&shot, b".cache/ferossh").unwrap();
+    assert!(run(&mut remote, &mut fake));
+    assert_eq!(remote.job_state(id), Some(State::Failed));
+    assert_eq!(remote.landed(id), None);
+}
+
+#[test]
+fn an_upload_into_the_home_folder_takes_only_a_plain_path_and_a_file() {
+    let s = Scratch::new("into-home-plain");
+    let shot = s.local().join("shot.png");
+    fs::write(&shot, "png").unwrap();
+    let (mut remote, _) = connected(&s.remote());
+    for bad in [&b""[..], b"/tmp", b"../up", b"a//b", b"a/./b", b"a/"] {
+        assert!(remote.upload_into_home(&shot, bad).is_err(), "{bad:?}");
+    }
+    assert!(remote.upload_into_home(&s.local(), b"paste").is_err());
+    assert!(remote.jobs().is_empty());
+}
