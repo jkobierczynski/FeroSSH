@@ -8951,8 +8951,7 @@ impl Window {
         if let Some(p) = self.panes.get_mut(&id) {
             p.quiet = match p.quiet.take() {
                 Some(_) => None,
-                // A recording has no live output to watch.
-                None if matches!(p.host, Host::Replay(_)) => None,
+                None if !quiet_watchable(p) => None,
                 None => Some(crate::attention::Watch::new()),
             };
         }
@@ -13200,9 +13199,12 @@ impl Window {
         if before != id {
             self.last_pane = Some(before);
         }
+        let looking = self.focused;
         if let Some(p) = self.panes.get_mut(&id) {
             p.bell = false;
-            p.attention = false;
+            if looking {
+                p.attention = false;
+            }
             p.grid.mark_all_dirty();
         }
         self.after_structure_change();
@@ -13274,9 +13276,14 @@ impl Window {
         if before == id && tab_before == self.ws.active && !was_side {
             return;
         }
+        // Seen only while FeroSSH is in front: a script moving focus in
+        // the background leaves the badge.
+        let looking = self.focused;
         if let Some(p) = self.panes.get_mut(&id) {
             p.bell = false;
-            p.attention = false;
+            if looking {
+                p.attention = false;
+            }
         }
         for pid in [before, id] {
             if let Some(p) = self.panes.get_mut(&pid)
@@ -15044,11 +15051,7 @@ impl Window {
             (cmd::NOTIFY_BELL, self.settings.notifications),
             (
                 cmd::NOTIFY_QUIET,
-                self.settings.notifications
-                    && !matches!(
-                        self.panes.get(&pane).map(|p| &p.host),
-                        Some(Host::Replay(_))
-                    ),
+                self.settings.notifications && self.panes.get(&pane).is_some_and(quiet_watchable),
             ),
         ];
         for i in 0..4 {
@@ -19833,6 +19836,9 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
             windows::Win32::UI::WindowsAndMessaging::WM_ACTIVATE => {
                 // Back in FeroSSH: the notifications have done their job.
                 if wparam.0 & 0xffff != 0 {
+                    // Balloons not shown yet go with the icon; the click
+                    // path has already taken its target.
+                    with_window(|w| w.toast_queue.clear());
                     crate::toast::hide(hwnd);
                 }
                 DefWindowProcW(hwnd, msg, wparam, lparam)
@@ -20127,6 +20133,12 @@ fn capture(hwnd: HWND, on: bool) {
             let _ = ReleaseCapture();
         }
     }
+}
+
+/// Whether a quiet watch can see pane `p`'s work: a recording has no live
+/// output, and a remote desktop's updates are not terminal output.
+fn quiet_watchable(p: &Pane) -> bool {
+    !matches!(p.host, Host::Replay(_)) && p.desktop.is_none()
 }
 
 #[cfg(test)]
