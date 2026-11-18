@@ -1023,6 +1023,17 @@ impl Remote {
         );
     }
 
+    /// Job `job`'s remote path, with an upload into the home folder that
+    /// has not started yet placed there already.
+    fn target_of<'a>(&self, job: &'a Job) -> std::borrow::Cow<'a, [u8]> {
+        match &self.home {
+            Some(home) if job.make.is_some() && !job.remote.starts_with(b"/") => {
+                std::borrow::Cow::Owned(names::join(home, &job.remote))
+            }
+            _ => std::borrow::Cow::Borrowed(&job.remote),
+        }
+    }
+
     fn index(&self, id: JobId) -> Option<usize> {
         self.jobs.iter().position(|j| j.id == id)
     }
@@ -1182,8 +1193,13 @@ impl Remote {
             {
                 let _ = std::fs::create_dir_all(parent);
             }
-            // An edited file put back always replaces the original.
-            job.choice = job.put_back.map(|_| Choice::Overwrite);
+            // An edited file put back always replaces the original; a
+            // pasted file never replaces anything.
+            job.choice = if job.make.is_some() {
+                Some(Choice::KeepBoth)
+            } else {
+                job.put_back.map(|_| Choice::Overwrite)
+            };
         }
         self.pump();
     }
@@ -1355,7 +1371,7 @@ impl Remote {
                 && self.jobs.iter().enumerate().any(|(k, other)| {
                     k != i
                         && other.kind == Kind::Upload
-                        && other.remote == job.remote
+                        && self.target_of(other) == self.target_of(job)
                         && matches!(other.state, State::Running | State::Paused)
                 })
             {

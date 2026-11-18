@@ -8836,8 +8836,9 @@ impl Window {
                 break;
             }
         }
+        let mut pasted = None;
         if transfers {
-            self.settle_pastes();
+            pasted = self.settle_pastes();
             self.flush_sftp();
             if self.files_visible() {
                 self.refresh_chrome();
@@ -8869,7 +8870,9 @@ impl Window {
                 let _ = PostMessageW(Some(self.hwnd), WM_SHELL_OUTPUT, WPARAM(0), LPARAM(0));
             }
         }
-        self.after_feed()
+        let mut commands = self.after_feed();
+        commands.extend(pasted);
+        commands
     }
 
     /// Handles what the worker of the connection `connection` sent, and
@@ -16393,15 +16396,16 @@ impl Window {
         }
     }
 
-    fn on_transfer_timer(&mut self) {
+    fn on_transfer_timer(&mut self) -> Option<Command> {
         for remote in self.sftp.values_mut() {
             remote.poll();
         }
-        self.settle_pastes();
+        let pasted = self.settle_pastes();
         self.flush_sftp();
         if self.files_visible() {
             self.refresh_chrome();
         }
+        pasted
     }
 
     /// Points the file view at the focused pane's host when focus moved
@@ -17202,6 +17206,7 @@ impl Window {
             self.pastes.push(PasteBatch {
                 pane: id,
                 queue: key,
+                results: vec![None; jobs.len()],
                 jobs,
                 temp,
             });
@@ -17223,45 +17228,62 @@ impl Window {
 
     /// Types the paths of pasted files whose uploads have all finished;
     /// shows the queue when one of them did not make it.
-    fn settle_pastes(&mut self) {
+    fn settle_pastes(&mut self) -> Option<Command> {
         if self.pastes.is_empty() {
-            return;
+            return None;
         }
-        let mut failed = false;
-        for batch in std::mem::take(&mut self.pastes) {
+        let mut failures = Vec::new();
+        for mut batch in std::mem::take(&mut self.pastes) {
             let remote = self.sftp.get(&batch.queue);
-            let running = remote.is_some_and(|r| {
-                batch
-                    .jobs
-                    .iter()
-                    .any(|&j| r.job_state(j).is_some_and(|s| !s.finished()))
-            });
-            if running {
+            // Each result is kept as its job finishes, so clearing the
+            // finished transfers meanwhile loses nothing.
+            for (k, &j) in batch.jobs.iter().enumerate() {
+                let state = remote.and_then(|r| r.job_state(j));
+                if let Some(slot) = batch.results.get_mut(k)
+                    && slot.is_none()
+                    && state.is_none_or(ferossh_sftp::State::finished)
+                {
+                    let landed = remote.and_then(|r| r.landed(j)).map(<[u8]>::to_vec);
+                    let note = remote
+                        .and_then(|r| r.jobs().iter().find(|x| x.id == j))
+                        .and_then(|x| x.note.clone());
+                    *slot = Some(landed.ok_or(note));
+                }
+            }
+            if batch.results.iter().any(Option::is_none) {
                 self.pastes.push(batch);
                 continue;
             }
-            let landed: Vec<Vec<u8>> = batch
-                .jobs
-                .iter()
-                .filter_map(|&j| remote.and_then(|r| r.landed(j)).map(<[u8]>::to_vec))
-                .collect();
-            for t in &batch.temp {
-                let _ = std::fs::remove_file(t);
+            let mut landed = Vec::new();
+            let mut why = None;
+            for result in batch.results.iter().flatten() {
+                match result {
+                    Ok(path) => landed.push(path.clone()),
+                    Err(note) => {
+                        why = why.or_else(|| Some(note.clone()));
+                    }
+                }
             }
             let missed = batch.jobs.len() - landed.len();
-            if missed > 0 {
-                failed = true;
-                if let Some(r) = self.sftp.get_mut(&batch.queue) {
-                    r.notice = Some(format!(
-                        "{missed} pasted file{} did not upload, so {} not typed.",
-                        plural(missed),
-                        if missed == 1 {
-                            "its path was"
-                        } else {
-                            "their paths were"
-                        }
-                    ));
+            if missed == 0 {
+                for t in &batch.temp {
+                    let _ = std::fs::remove_file(t);
                 }
+            } else {
+                // A failed image stays for Retry in the queue; old ones are
+                // swept on a later paste.
+                let host = batch
+                    .queue
+                    .rsplit_once(':')
+                    .map_or(batch.queue.as_str(), |(h, _)| h);
+                let reason = why
+                    .flatten()
+                    .map(|n| format!(": {n}"))
+                    .unwrap_or_else(|| ".".into());
+                failures.push(format!(
+                    "{missed} pasted file{} did not upload to {host}{reason}",
+                    plural(missed)
+                ));
             }
             if landed.is_empty() {
                 continue;
@@ -17272,9 +17294,14 @@ impl Window {
             };
             self.input(batch.pane, paste.bytes);
         }
-        if failed && !self.files_visible() {
-            self.show_side(SideView::Files, false);
+        if failures.is_empty() {
+            return None;
         }
+        Some(Command::Notice(format!(
+            "{}\n\nThe paths of files that did not upload were not typed. File transfer \
+             shows the transfer queue of that host, where you can retry them.",
+            failures.join("\n")
+        )))
     }
 
     /// Whether files dropped at client point (`x`, `y`) go up with their
@@ -18027,7 +18054,11 @@ struct PasteBatch {
     pane: PaneId,
     queue: String,
     jobs: Vec<ferossh_sftp::JobId>,
-    /// Pasted images saved to a local file for the upload, removed after.
+    /// Each job's outcome once it finished: where it landed, or the
+    /// queue's note on why not.
+    results: Vec<Option<std::result::Result<Vec<u8>, Option<String>>>>,
+    /// Pasted images saved to a local file for the upload, removed once
+    /// it succeeded.
     temp: Vec<PathBuf>,
 }
 
@@ -18153,6 +18184,21 @@ fn paste_files(hwnd: HWND) {
 fn save_pasted_image(png: &[u8]) -> std::result::Result<PathBuf, String> {
     let dir = std::env::temp_dir().join("FeroSSH-paste");
     std::fs::create_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+    // Images whose upload failed stay for Retry; after a day they go.
+    if let Ok(entries) = std::fs::read_dir(&dir) {
+        let day = std::time::Duration::from_secs(24 * 60 * 60);
+        for e in entries.flatten() {
+            let old = e
+                .metadata()
+                .and_then(|m| m.modified())
+                .ok()
+                .and_then(|t| t.elapsed().ok())
+                .is_some_and(|age| age > day);
+            if old {
+                let _ = std::fs::remove_file(e.path());
+            }
+        }
+    }
     let name = crate::paste_upload::image_name(local_time());
     let path = dir.join(&name);
     // Two pastes in one second: the later one gets a number.
@@ -20991,7 +21037,9 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                 LRESULT(0)
             }
             WM_TIMER if wparam.0 == TIMER_TRANSFER => {
-                with_window(Window::on_transfer_timer);
+                if let Some(c) = with_window(Window::on_transfer_timer).flatten() {
+                    run_command(hwnd, c);
+                }
                 LRESULT(0)
             }
             WM_TIMER if wparam.0 == TIMER_SCRIPT => {

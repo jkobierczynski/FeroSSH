@@ -140,7 +140,9 @@ pub fn png_from_dib(dib: &[u8]) -> Result<Vec<u8>, String> {
     let palette_len = match bpp {
         1 | 4 | 8 if colours_used == 0 => 1usize << bpp,
         1 | 4 | 8 => (colours_used as usize).min(1 << bpp),
-        _ => 0,
+        // A table is allowed at higher depths too (as a hint for
+        // palette displays); the pixels come after it.
+        _ => (colours_used as usize).min(256),
     };
     let palette = dib
         .get(data..data + palette_len * 4)
@@ -204,8 +206,9 @@ pub fn png_from_dib(dib: &[u8]) -> Result<Vec<u8>, String> {
             rgba.extend_from_slice(&px);
         }
     }
-    // Most programs leave the fourth byte of a plain 32-bit bitmap at 0:
-    // with no pixel using it, the image is opaque.
+    // Most programs leave the fourth byte of a 32-bit bitmap at 0, some
+    // even with an alpha mask declared: with no pixel using it, the image
+    // is opaque (a wholly transparent paste would show nothing anyway).
     let alpha = rgba.chunks_exact(4).any(|p| p.get(3) != Some(&0));
     let alpha_used = alpha && rgba.chunks_exact(4).any(|p| p.get(3) != Some(&255));
     if !alpha {
@@ -395,6 +398,17 @@ mod tests {
         }
         let (_, _, _, raw) = decode(&png_from_dib(&d).unwrap_or_default());
         assert_eq!(raw, [0, 255, 255, 255, 0, 0, 0]);
+    }
+
+    #[test]
+    fn a_colour_table_at_24_bits_is_skipped() {
+        // One black table entry, then a red pixel.
+        let mut d = dib(1, 1, 24, 0, &[0, 0, 0, 0], &[0, 0, 255, 0]);
+        if let Some(used) = d.get_mut(32..36) {
+            used.copy_from_slice(&1u32.to_le_bytes());
+        }
+        let (_, _, _, raw) = decode(&png_from_dib(&d).unwrap_or_default());
+        assert_eq!(raw, [0, 255, 0, 0]);
     }
 
     #[test]

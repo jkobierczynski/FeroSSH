@@ -1376,3 +1376,53 @@ fn an_upload_into_the_home_folder_takes_only_a_plain_path_and_a_file() {
     assert!(remote.upload_into_home(&s.local(), b"paste").is_err());
     assert!(remote.jobs().is_empty());
 }
+
+#[test]
+fn two_pasted_files_of_one_name_never_share_a_part_file() {
+    let s = Scratch::new("into-home-same");
+    fs::create_dir_all(s.local().join("a")).unwrap();
+    fs::create_dir_all(s.local().join("b")).unwrap();
+    fs::write(s.local().join("a/shot.png"), "first").unwrap();
+    fs::write(s.local().join("b/shot.png"), "second").unwrap();
+    let (mut remote, mut fake) = connected(&s.remote());
+    let a = remote
+        .upload_into_home(&s.local().join("a/shot.png"), b"paste")
+        .unwrap();
+    let b = remote
+        .upload_into_home(&s.local().join("b/shot.png"), b"paste")
+        .unwrap();
+    assert!(run(&mut remote, &mut fake));
+    assert_eq!(remote.landed(a), Some(&b"/paste/shot.png"[..]));
+    assert_eq!(remote.landed(b), Some(&b"/paste/shot (2).png"[..]));
+    let dir = s.remote().join("paste");
+    assert_eq!(fs::read_to_string(dir.join("shot.png")).unwrap(), "first");
+    assert_eq!(
+        fs::read_to_string(dir.join("shot (2).png")).unwrap(),
+        "second"
+    );
+}
+
+#[test]
+fn a_retried_paste_upload_still_keeps_both() {
+    let s = Scratch::new("into-home-retry");
+    let shot = s.local().join("shot.png");
+    fs::write(&shot, "new").unwrap();
+    fs::create_dir_all(s.remote().join("paste")).unwrap();
+    fs::write(s.remote().join("paste/shot.png"), "old").unwrap();
+    let (mut remote, mut fake) = connected(&s.remote());
+    // "Overwrite all" chosen for another transfer earlier.
+    let other = s.local().join("other.txt");
+    fs::write(&other, "x").unwrap();
+    fs::write(s.remote().join("other.txt"), "y").unwrap();
+    let o = remote.upload(&other, b"/").unwrap();
+    assert!(run(&mut remote, &mut fake));
+    remote.answer(o, Choice::Overwrite, true);
+    assert!(run(&mut remote, &mut fake));
+    let id = remote.upload_into_home(&shot, b"paste").unwrap();
+    remote.cancel(id);
+    remote.retry(id);
+    assert!(run(&mut remote, &mut fake));
+    assert_eq!(remote.landed(id), Some(&b"/paste/shot (2).png"[..]));
+    let dir = s.remote().join("paste");
+    assert_eq!(fs::read_to_string(dir.join("shot.png")).unwrap(), "old");
+}
