@@ -161,14 +161,19 @@ impl Kitty {
         let mut body = Some(false);
         for kv in meta.split(':') {
             match kv.split_once('=') {
-                Some(("i", v)) => id = v.chars().take(64).collect(),
+                Some(("i", v)) => id = v.to_owned(),
                 Some(("d", v)) => done = v != "0",
                 Some(("e", v)) => base64 = v == "1",
                 Some(("p", v)) => {
                     body = match v {
                         "title" => Some(false),
                         "body" => Some(true),
-                        _ => None,
+                        // Parts of a notification with nothing to show
+                        // here; the last one still ends it.
+                        "icon" | "buttons" => None,
+                        // Queries and requests (`?`, `alive`, `close`):
+                        // not part of any notification.
+                        _ => return None,
                     }
                 }
                 _ => {}
@@ -303,6 +308,20 @@ mod tests {
         );
         // An icon alone is nothing.
         assert_eq!(parse(b"99;i=c:p=icon;abc", &mut k), None);
+        // A query does not end a notification in parts.
+        assert_eq!(parse(b"99;i=q:d=0;Pending", &mut k), None);
+        assert_eq!(parse(b"99;i=q:p=?;", &mut k), None);
+        assert_eq!(parse(b"99;i=q:p=alive;", &mut k), None);
+        assert_eq!(
+            parse(b"99;i=q:p=body;now", &mut k),
+            n(Some("Pending"), "now")
+        );
+        // Ids are told apart in full.
+        let long = "x".repeat(70);
+        let a = format!("99;i={long}a:d=0;First");
+        let b = format!("99;i={long}b;Second");
+        assert_eq!(parse(a.as_bytes(), &mut k), None);
+        assert_eq!(parse(b.as_bytes(), &mut k), n(Some("Second"), ""));
     }
 
     #[test]
