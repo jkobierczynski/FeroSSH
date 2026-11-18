@@ -17,8 +17,6 @@ pub const MIN_WORK: Duration = Duration::from_secs(8);
 pub const NOTIFY_EVERY: Duration = Duration::from_secs(10);
 
 /// What a watched pane is doing.
-// Read by the Session manager's coding agents (the next pull request).
-#[allow(dead_code)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum State {
     /// Nothing seen yet since the watch started or the user typed.
@@ -87,7 +85,6 @@ impl Watch {
         Some(worked)
     }
 
-    #[allow(dead_code)]
     pub fn state(&self, now: Instant) -> State {
         match (self.burst, self.quiet) {
             (Some((start, last)), _) if now.saturating_duration_since(last) < QUIET_AFTER => {
