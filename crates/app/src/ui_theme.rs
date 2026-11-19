@@ -1069,22 +1069,39 @@ pub fn own_popup(menu: HMENU) {
             if GetMenuItemInfoW(menu, pos, true, &mut mii).is_err() {
                 // Unread: it may still hold old data, so the old record
                 // stays; a stand-in keeps the positions in step.
+                // The stand-in copies the old item there, so its access
+                // key and text still answer while it is open.
                 failed = true;
-                items.push(OwnItem::new(Vec::new()));
+                let mut stand_in = OwnItem::new(Vec::new());
+                if let Some(o) = old.as_ref().and_then(|m| m.items.get(pos as usize)) {
+                    stand_in.set_text(Some(without_nul(&o.text)));
+                    stand_in.separator = o.separator;
+                    stand_in.breaks = o.breaks;
+                    stand_in.column = o.column;
+                    stand_in.radio = o.radio;
+                    column = o.column;
+                }
+                items.push(stand_in);
                 continue;
             }
             let ty = mii.fType.0;
             let n = (mii.cch as usize).min(buf.len());
-            // Windows may keep no text for an owner-drawn item: ours then.
-            // Found by its data, wherever the item has moved to.
-            let kept = old
-                .as_ref()
-                .and_then(|m| {
-                    m.items
-                        .iter()
-                        .find(|i| (&raw const *i.msaa) as usize == mii.dwItemData)
+            // Windows may keep no text for an owner-drawn item: ours then,
+            // found by its data wherever the item has moved to, in this
+            // menu's last record or one kept after an earlier failed read.
+            let data = mii.dwItemData;
+            let find = |m: &OwnMenu| {
+                m.items
+                    .iter()
+                    .find(|i| (&raw const *i.msaa) as usize == data)
+                    .map(|i| without_nul(&i.text).to_vec())
+            };
+            let kept = old.as_ref().and_then(find).or_else(|| {
+                OWN.with(|own| {
+                    let own = own.try_borrow().ok()?;
+                    own.iter().filter(|m| m.menu == menu).find_map(find)
                 })
-                .map(|i| without_nul(&i.text).to_vec());
+            });
             let text = match kept {
                 Some(k) if n == 0 => k,
                 _ => buf.get(..n).unwrap_or_default().to_vec(),
