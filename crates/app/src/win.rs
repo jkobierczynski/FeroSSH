@@ -3699,6 +3699,11 @@ impl Window {
                         others,
                     }));
                 }
+                tmux::Action::AgentMarked(natives) => {
+                    for native in natives {
+                        self.watch_agent(gateway, native);
+                    }
+                }
                 tmux::Action::Notice(text) => {
                     let text = crate::ssh::sanitize(&text);
                     self.show(gateway, &format!("\x1b[0;90m{text}\x1b[0m\r\n"));
@@ -9487,6 +9492,19 @@ impl Window {
         };
         let record = p.cast.is_none();
         p.log.enabled = true;
+        // An ordinary log opened before the pane was known to run an agent
+        // ends, and the agent's own log follows it.
+        let suffix = format!("-{agent}");
+        let ordinary = p.log.writer.is_some()
+            && !p
+                .log
+                .path
+                .as_deref()
+                .and_then(Path::file_name)
+                .is_some_and(|n| n.to_string_lossy().contains(&suffix));
+        if ordinary {
+            self.stop_log(id);
+        }
         self.start_log_as(id, Some(&agent));
         if record {
             let text = self.start_recording(id, Some(&agent));
@@ -9650,8 +9668,12 @@ impl Window {
     }
 
     /// Runs the once-a-second check while any pane has a quiet watch.
+    /// Also runs while the Session manager is shown with an agent pane
+    /// open, so each agent's state and last line there stay current.
     fn update_quiet_timer(&self) {
-        let any = self.panes.values().any(|p| p.quiet.is_some());
+        let shown = self.side.visible && self.side.view == SideView::Live;
+        let any = self.panes.values().any(|p| p.quiet.is_some())
+            || (shown && self.panes.keys().any(|id| self.agent_of(*id).is_some()));
         // SAFETY: our window and timer id.
         unsafe {
             if any {
@@ -9676,10 +9698,9 @@ impl Window {
         if dropped {
             self.update_menu_checks();
         }
-        // Stops once the last watched pane closed.
-        if !self.panes.values().any(|p| p.quiet.is_some()) {
-            self.update_quiet_timer();
-        }
+        // Stops once the last watched pane closed and the Session manager
+        // has no agent to keep current.
+        self.update_quiet_timer();
         let now = Instant::now();
         let mut quiet = Vec::new();
         for (id, p) in &mut self.panes {
@@ -14468,6 +14489,7 @@ impl Window {
         self.side.focused = focus;
         self.layout();
         self.update_menu_checks();
+        self.update_quiet_timer();
     }
 
     /// Tools > Connection manager, Session manager, File transfer,
@@ -14508,6 +14530,7 @@ impl Window {
         self.side.focused = false;
         self.layout();
         self.update_menu_checks();
+        self.update_quiet_timer();
     }
 
     /// A pane for a new tab, with the default look.

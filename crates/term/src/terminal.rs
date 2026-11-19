@@ -1214,7 +1214,15 @@ impl Terminal {
                     ) {
                         continue;
                     }
+                    // Concealed text stays blank, as on the screen.
+                    if cell.flags.contains(TermFlags::HIDDEN) {
+                        text.push(' ');
+                        continue;
+                    }
                     text.push(if cell.c == '\t' { ' ' } else { cell.c });
+                    if let Some(extra) = cell.zerowidth() {
+                        text.extend(extra);
+                    }
                 }
                 text.trim_end().to_owned()
             })
