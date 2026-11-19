@@ -16678,6 +16678,23 @@ impl Window {
             return;
         };
         let pane = p.pane;
+        // A look changed from elsewhere meanwhile (a reconnect applying the
+        // host's look) becomes what a cancelled preview goes back to.
+        if let Some(now) = self.panes.get(&pane) {
+            let expected_font = p.font_shown.as_ref().unwrap_or(&p.font);
+            if now.font != *expected_font {
+                p.font = now.font.clone();
+                p.font_by = None;
+                p.font_shown = None;
+            }
+            let expected_theme = p.theme_shown.as_ref().unwrap_or(&p.theme);
+            if now.theme != *expected_theme {
+                p.theme = now.theme.clone();
+                p.theme_by = None;
+                p.theme_shown = None;
+            }
+        }
+        let keep_name = (p.theme.group() == ThemeGroup::Warning).then_some(p.theme.name);
         // A family alone keeps the size the pane had before the menu.
         let size = p.font.size_pt;
         let (mut font, mut theme, mut colours) = (None, None, None);
@@ -16754,7 +16771,13 @@ impl Window {
                 p.font_shown = Some(f);
             }
         }
-        if let Some(t) = theme {
+        if let Some(mut t) = theme {
+            // Over Production or Staging, a preview shows only colours: the
+            // pane keeps the warning theme's name, which its confirmations
+            // check, until a theme is picked.
+            if let Some(name) = keep_name {
+                t.name = name;
+            }
             self.set_theme(pane, t.clone());
             if let Some(p) = &mut self.look_preview {
                 p.theme_by = Some(id);
@@ -21927,6 +21950,7 @@ fn save_theme_as(hwnd: HWND) {
     }
     let end = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
     let mut path = PathBuf::from(String::from_utf16_lossy(buf.get(..end).unwrap_or_default()));
+    let picked = path.clone();
     // The dialog appends only three characters of a default extension
     // ("Dusk.the"): end the name in .theme here.
     match path
@@ -21942,6 +21966,16 @@ fn save_theme_as(hwnd: HWND) {
             name.push(".");
             name.push(custom_theme::EXTENSION);
             path = PathBuf::from(name);
+        }
+    }
+    // The dialog asked about replacing the file it returned, not this one.
+    if path != picked && path.exists() {
+        let text = format!(
+            "{} already exists. Replace it?",
+            path.file_name().unwrap_or_default().to_string_lossy()
+        );
+        if dialog(hwnd, &text, MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2) != Some(IDYES) {
+            return;
         }
     }
     let (text, icon) = match with_window(|w| w.save_theme(&path)) {
