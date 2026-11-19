@@ -21,7 +21,7 @@
 //! WindowAccent     #8C5A1E
 //! ```
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use ferossh_config::WindowColours;
 use ferossh_render::{Rgb, Theme};
@@ -33,6 +33,9 @@ pub const EXTENSION: &str = "theme";
 
 /// The most themes the menu lists (its ids' room).
 pub const MAX: usize = 50;
+
+/// The least contrast of the window accent with the window (a graphic).
+const ACCENT_CONTRAST: f32 = 3.0;
 
 /// The longest theme name, in characters.
 const MAX_NAME: usize = 40;
@@ -108,6 +111,11 @@ pub fn clean_name(name: &str) -> Result<String, String> {
     if name.chars().any(char::is_control) {
         return Err("its name has control characters".into());
     }
+    // '#' starts a comment in a theme file and '"' quotes in the settings
+    // file, so a name with them would not read back the same.
+    if name.contains(['#', '"']) {
+        return Err("its name has a # or a \"".into());
+    }
     if Theme::is_builtin(name) {
         return Err(format!("{name} is a built-in theme's name"));
     }
@@ -141,9 +149,13 @@ pub fn parse(text: &str, fallback: &str) -> Result<CustomTheme, String> {
         };
         match key.to_ascii_lowercase().as_str() {
             "name" => name = Some(value.to_owned()),
-            "base" => match Theme::by_name(value) {
-                Some(t) => base = t,
-                None => warnings.push(format!("no theme named {value}; Nord used")),
+            // Built-in themes only: another custom theme may not be read yet.
+            "base" => match Theme::builtin()
+                .iter()
+                .find(|t| t.name.eq_ignore_ascii_case(value))
+            {
+                Some(t) => base = t.clone(),
+                None => warnings.push(format!("no built-in theme named {value}; Nord used")),
             },
             "font" if !value.is_empty() => font = Some(value.to_owned()),
             "fontsize" => match value.parse::<f32>() {
@@ -196,13 +208,25 @@ pub fn parse(text: &str, fallback: &str) -> Result<CustomTheme, String> {
     }
     let window = match (look, window) {
         (_, [Some(bg), Some(text), accent]) => {
-            if contrast(text, bg) < DIM_CONTRAST {
+            // The selected tab's line is a graphic: 3:1 on the window.
+            let accent = match accent {
+                Some(a) if contrast(a, bg) < ACCENT_CONTRAST => {
+                    warnings
+                        .push("window accent below 3:1 on its background; text colour used".into());
+                    text
+                }
+                a => a.unwrap_or(text),
+            };
+            // Text must read on every part made from these colours: the
+            // window, the menu bar, a highlighted item, edit boxes, tabs.
+            if crate::ui_colours::all_readable(&crate::ui_colours::custom(bg, text, accent)) {
+                Some(WindowSpec::Colours(bg, text, accent))
+            } else {
                 warnings.push(
-                    "window text below 4.5:1 on its background; window colours left out".into(),
+                    "window text below 4.5:1 on the window, bar or tabs; window colours left out"
+                        .into(),
                 );
                 None
-            } else {
-                Some(WindowSpec::Colours(bg, text, accent.unwrap_or(text)))
             }
         }
         (Some(c), [None, None, None]) => Some(WindowSpec::Look(c)),
@@ -287,26 +311,51 @@ pub fn file_name(name: &str) -> String {
         })
         .collect();
     let stem = stem.trim_end_matches(['.', ' ']);
+    // Windows' device names stay devices even with an extension.
+    let device = stem.split('.').next().is_some_and(|base| {
+        let base = base.trim_end().to_ascii_uppercase();
+        matches!(base.as_str(), "CON" | "PRN" | "AUX" | "NUL")
+            || ((base.starts_with("COM") || base.starts_with("LPT"))
+                && base.len() == 4
+                && base.ends_with(|c: char| ('1'..='9').contains(&c)))
+    });
+    let stem = if device {
+        format!("_{stem}")
+    } else {
+        stem.to_owned()
+    };
     format!(
         "{}.{EXTENSION}",
-        if stem.is_empty() { "theme" } else { stem }
+        if stem.is_empty() { "theme" } else { &stem }
     )
 }
 
+/// The themes [`load`] read: the usable ones, sorted by name, and the
+/// files it could not use.
+pub type Loaded = (Vec<CustomTheme>, Vec<Broken>);
+
 /// Reads every theme file in `dir`, sorted by name; at most [`MAX`]. A
-/// second file with a name already read is broken.
-pub fn load(dir: &Path) -> (Vec<CustomTheme>, Vec<Broken>) {
-    let mut paths: Vec<PathBuf> = std::fs::read_dir(dir)
-        .map(|d| {
-            d.flatten()
-                .map(|e| e.path())
-                .filter(|p| {
-                    p.extension()
-                        .is_some_and(|e| e.eq_ignore_ascii_case(EXTENSION))
-                })
-                .collect()
-        })
-        .unwrap_or_default();
+/// second file with a name already read is broken. A missing folder has
+/// no themes; one that cannot be read is an error, so the caller keeps
+/// what it had.
+pub fn load(dir: &Path) -> Result<Loaded, String> {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(d) => d,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok((Vec::new(), Vec::new())),
+        Err(e) => return Err(format!("the themes folder cannot be read: {e}")),
+    };
+    let mut paths = Vec::new();
+    for entry in entries {
+        let path = entry
+            .map_err(|e| format!("the themes folder cannot be read: {e}"))?
+            .path();
+        if path
+            .extension()
+            .is_some_and(|e| e.eq_ignore_ascii_case(EXTENSION))
+        {
+            paths.push(path);
+        }
+    }
     paths.sort();
     let mut themes: Vec<CustomTheme> = Vec::new();
     let mut broken = Vec::new();
@@ -344,7 +393,7 @@ pub fn load(dir: &Path) -> (Vec<CustomTheme>, Vec<Broken>) {
         }
     }
     themes.sort_by_key(|t| t.theme.name.to_lowercase());
-    (themes, broken)
+    Ok((themes, broken))
 }
 
 #[cfg(test)]
@@ -395,6 +444,8 @@ mod tests {
         );
         assert!(parse("Color16 #123456\n", "x").is_err());
         assert!(parse("Name Nord\n", "x").unwrap_err().contains("built-in"));
+        assert!(parse("", "Night #2").is_err());
+        assert!(parse("", "Night \"Blue\"").is_err());
         assert!(parse("", "  ").is_err());
         let t = parse("FontSize 200\nWindow purple\nFoo bar\n", "x").expect("reads");
         assert_eq!(t.warnings.len(), 3, "{:?}", t.warnings);
@@ -406,6 +457,22 @@ mod tests {
         let t = parse(text, "x").expect("reads");
         assert_eq!(t.window, None);
         assert_eq!(t.warnings.len(), 1);
+        // 4.54:1 on the window, but not on the bar made from it.
+        let text = "WindowBackground #FFFFFF\nWindowText #767676\n";
+        assert_eq!(parse(text, "x").expect("reads").window, None);
+        // An accent that would vanish on the window becomes the text colour.
+        let text = "WindowBackground #000000\nWindowText #FFFFFF\nWindowAccent #000000\n";
+        let t = parse(text, "x").expect("reads");
+        let white = Rgb::hex(0xFFFFFF);
+        assert_eq!(
+            t.window,
+            Some(WindowSpec::Colours(Rgb::hex(0), white, white))
+        );
+        // Base takes built-in themes only.
+        assert_eq!(
+            parse("Base My Own\n", "x").expect("reads").warnings.len(),
+            1
+        );
         let low = "Foreground #333333\nBackground #2E3440\n";
         assert_eq!(parse(low, "x").expect("reads").warnings.len(), 1);
     }
@@ -414,23 +481,38 @@ mod tests {
     fn file_names_are_safe() {
         assert_eq!(file_name("Sand / Night?"), "Sand _ Night_.theme");
         assert_eq!(file_name(" .. "), "theme.theme");
+        assert_eq!(file_name("nul"), "_nul.theme");
+        assert_eq!(file_name("COM1"), "_COM1.theme");
+        assert_eq!(file_name("Console"), "Console.theme");
     }
 
     #[test]
     fn the_folder_is_read_sorted_with_duplicates_and_junk_reported() {
-        let dir = std::env::temp_dir().join(format!("ferossh-themes-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).expect("dir");
+        /// A folder only this test made, removed even when it fails.
+        struct Dir(std::path::PathBuf);
+        impl Drop for Dir {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_nanos());
+        let dir =
+            std::env::temp_dir().join(format!("ferossh-themes-{}-{nanos}", std::process::id()));
+        std::fs::create_dir(&dir).expect("a new folder");
+        let guard = Dir(dir.clone());
         let put = |f: &str, t: &str| std::fs::write(dir.join(f), t).expect("write");
         put("b.theme", "Name Zed\n");
         put("a.theme", "Name alpha\n");
         put("c.theme", "Name ZED\n");
         put("d.theme", "Background nope\n");
         put("notes.txt", "Name Ignored\n");
-        let (themes, broken) = load(&dir);
+        let (themes, broken) = load(&dir).expect("reads");
         let names: Vec<_> = themes.iter().map(|t| t.theme.name).collect();
         assert_eq!(names, ["alpha", "Zed"]);
         assert_eq!(broken.len(), 2);
-        let _ = std::fs::remove_dir_all(&dir);
+        drop(guard);
+        assert_eq!(load(&dir), Ok((Vec::new(), Vec::new())), "missing is empty");
     }
 }

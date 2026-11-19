@@ -150,6 +150,27 @@ pub fn custom(background: Rgb, text: Rgb, accent: Rgb) -> UiColours {
     from_colours(background, text, accent)
 }
 
+/// Whether text reads at 4.5:1 or better on every part painted with `c`:
+/// the window, edit boxes, the menu bar, a highlighted item, the tabs;
+/// secondary text and errors too.
+pub fn all_readable(c: &UiColours) -> bool {
+    [
+        (c.text, c.window),
+        (c.text, c.control),
+        (c.text, c.bar),
+        (c.text, c.hot),
+        (c.dim, c.window),
+        (c.dim, c.bar),
+        (c.error, c.window),
+        (c.strip.text, c.strip.strip),
+        (c.strip.dim, c.strip.strip),
+        (c.strip.text, c.strip.active),
+    ]
+    .iter()
+    .all(|&(fg, bg)| contrast(fg, bg) >= DIM_CONTRAST)
+        && c.hot != c.bar
+}
+
 /// Our own colours from a background, a text colour and an accent.
 fn from_colours(background: Rgb, foreground: Rgb, accent: Rgb) -> UiColours {
     let strip = Palette::from_colours(background, foreground, accent);
@@ -382,6 +403,7 @@ mod tests {
             // The accent marks the selected tab: a graphic, 3:1.
             assert!(contrast(accent, background) >= 3.0, "{name} accent");
             assert!(c.hot != c.bar, "{name}: a hot item shows");
+            assert!(all_readable(&c), "{name}");
             assert_eq!(c.dark, luminance(background) < 0.18, "{name} dark");
             // The menu lists the light ones first.
             assert!(c.dark || !seen_dark, "{name} out of order");

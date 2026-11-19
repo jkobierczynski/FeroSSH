@@ -1584,6 +1584,10 @@ struct LookPreview {
     font_by: Option<u32>,
     theme_by: Option<u32>,
     colours_by: Option<u32>,
+    /// What the preview put on the pane, so that a change from elsewhere
+    /// meanwhile (a reconnect applying the host's look) is not undone.
+    font_shown: Option<FontSpec>,
+    theme_shown: Option<Theme>,
 }
 
 struct PreviewWait {
@@ -1841,10 +1845,44 @@ fn themes_dir() -> PathBuf {
 }
 
 /// Reads the themes folder and hands its themes to `Theme::by_name`.
-fn load_custom_themes() -> (Vec<CustomTheme>, Vec<custom_theme::Broken>) {
-    let (themes, broken) = custom_theme::load(&themes_dir());
+/// Whether `theme` is a warning theme (Production, Staging), whose name
+/// other checks look for.
+fn p_warning(theme: Option<&Theme>) -> bool {
+    theme.is_some_and(|t| t.group() == ThemeGroup::Warning)
+}
+
+/// A folder that cannot be read is an error, and the themes known
+/// before stay.
+fn load_custom_themes() -> std::result::Result<custom_theme::Loaded, String> {
+    let (themes, broken) = custom_theme::load(&themes_dir())?;
     Theme::set_user(themes.iter().map(|t| t.theme.clone()).collect());
-    (themes, broken)
+    Ok((themes, broken))
+}
+
+/// Settings > Custom themes in menu `bar`: the popup that ends with Open
+/// themes folder.
+fn custom_themes_menu(bar: HMENU) -> Option<HMENU> {
+    // SAFETY: menus we built; GetSubMenu gives a null handle for an item
+    // without a popup.
+    unsafe {
+        for i in 0..GetMenuItemCount(Some(bar)).max(0) {
+            let top = GetSubMenu(bar, i);
+            if top.is_invalid() {
+                continue;
+            }
+            for j in 0..GetMenuItemCount(Some(top)).max(0) {
+                let sub = GetSubMenu(top, j);
+                if sub.is_invalid() {
+                    continue;
+                }
+                let n = GetMenuItemCount(Some(sub));
+                if n > 0 && GetMenuItemID(sub, n - 1) == cmd::THEMES_FOLDER {
+                    return Some(sub);
+                }
+            }
+        }
+    }
+    None
 }
 
 /// The saved workspaces for the connection manager: each one's name and
@@ -2378,7 +2416,7 @@ fn create_and_run(launch: Launch, theme: Option<String>) -> Result<()> {
         KEY_OPTIONS.set(key_options(&settings));
         let font = FontSpec::default();
         // Read first, so `--theme` and saved looks can name them.
-        let (custom_themes, _) = load_custom_themes();
+        let custom_themes = load_custom_themes().map(|(t, _)| t).unwrap_or_default();
         // An unknown theme name falls back to the default (Nord).
         let default_theme = theme.and_then(|n| Theme::by_name(&n)).unwrap_or_default();
         let mut renderer = Renderer::new(hwnd, 1, 1)?;
@@ -2603,6 +2641,12 @@ fn create_and_run(launch: Launch, theme: Option<String>) -> Result<()> {
             }
         });
         with_window(Window::update_menu_checks);
+        // Custom themes in their menu now, for the command palette too.
+        with_window(|w| {
+            if let Some(menu) = custom_themes_menu(w.menu) {
+                w.fill_custom_themes(menu);
+            }
+        });
         with_window(|w| w.apply_key_labels());
         // Sends WM_SIZE, which sizes the terminal before the shell starts.
         SetWindowPos(
@@ -15640,7 +15684,17 @@ impl Window {
     /// that must not go on without the settings saved.
     fn try_save_settings(&mut self) -> std::result::Result<(), String> {
         vault_ui::sync_settings(&mut self.settings);
+        // Window colours shown by a menu preview are not saved.
+        let shown = self.settings.window_colours;
+        if let Some(p) = self
+            .look_preview
+            .as_ref()
+            .filter(|p| p.colours_by.is_some())
+        {
+            self.settings.window_colours = p.colours;
+        }
         let text = self.settings.to_text();
+        self.settings.window_colours = shown;
         let written = write_app_file(&settings_path(), &text);
         match written {
             Ok(()) => {
@@ -16596,6 +16650,8 @@ impl Window {
                 font_by: None,
                 theme_by: None,
                 colours_by: None,
+                font_shown: None,
+                theme_shown: None,
             });
         }
         if let Some(p) = &mut self.look_preview {
@@ -16622,10 +16678,8 @@ impl Window {
             return;
         };
         let pane = p.pane;
-        let size = self
-            .panes
-            .get(&pane)
-            .map_or(p.font.size_pt, |p| p.font.size_pt);
+        // A family alone keeps the size the pane had before the menu.
+        let size = p.font.size_pt;
         let (mut font, mut theme, mut colours) = (None, None, None);
         if let Some(family) = id
             .checked_sub(cmd::FONT)
@@ -16694,15 +16748,17 @@ impl Window {
             }
         }
         if let Some(f) = font {
-            self.set_font(pane, f);
+            self.set_font(pane, f.clone());
             if let Some(p) = &mut self.look_preview {
                 p.font_by = Some(id);
+                p.font_shown = Some(f);
             }
         }
         if let Some(t) = theme {
-            self.set_theme(pane, t);
+            self.set_theme(pane, t.clone());
             if let Some(p) = &mut self.look_preview {
                 p.theme_by = Some(id);
+                p.theme_shown = Some(t);
             }
         }
         if let Some(c) = colours {
@@ -16727,12 +16783,19 @@ impl Window {
             return;
         };
         let back = |by: Option<u32>| by.is_some() && by != chosen;
+        // Only what the preview itself shows goes back.
+        let (font_now, theme_now) = self
+            .panes
+            .get(&p.pane)
+            .map_or((None, None), |x| (Some(&x.font), Some(&x.theme)));
+        let font_back = back(p.font_by) && font_now == p.font_shown.as_ref();
+        let theme_back = back(p.theme_by) && theme_now == p.theme_shown.as_ref();
         let mut changed = false;
-        if back(p.font_by) {
+        if font_back {
             self.set_font(p.pane, p.font);
             changed = true;
         }
-        if back(p.theme_by) {
+        if theme_back {
             self.set_theme(p.pane, p.theme);
             changed = true;
         }
@@ -16750,8 +16813,17 @@ impl Window {
     /// Settings > Custom themes, as it opens: the themes folder read again,
     /// a radio item per theme, and a greyed one per file that is wrong.
     fn fill_custom_themes(&mut self, menu: HMENU) {
-        let (themes, broken) = load_custom_themes();
-        self.custom_themes = themes;
+        let broken = match load_custom_themes() {
+            Ok((themes, broken)) => {
+                self.custom_themes = themes;
+                broken
+            }
+            // The themes known before stay usable.
+            Err(reason) => vec![custom_theme::Broken {
+                file: "themes folder".into(),
+                reason,
+            }],
+        };
         let current = self
             .panes
             .get(&self.focused_id())
@@ -16881,16 +16953,43 @@ impl Window {
         }
         std::fs::write(path, text)
             .map_err(|e| format!("The theme could not be saved to {}: {e}", path.display()))?;
-        let (themes, _) = load_custom_themes();
-        self.custom_themes = themes;
-        if let Some(t) = self.custom_named(&name).map(|c| c.theme.clone()) {
+        let saved = path.display();
+        let dir = themes_dir();
+        let reason = match load_custom_themes() {
+            Ok((themes, broken)) => {
+                self.custom_themes = themes;
+                let file = path.file_name().map(|f| f.to_string_lossy().into_owned());
+                broken
+                    .into_iter()
+                    .find(|b| Some(&b.file) == file.as_ref())
+                    .map(|b| b.reason)
+            }
+            Err(e) => Some(e),
+        };
+        // The menu (and the command palette, which reads it) matches the
+        // list again.
+        if let Some(menu) = custom_themes_menu(self.menu) {
+            self.fill_custom_themes(menu);
+        }
+        let listed = path.parent() == Some(dir.as_path()) && self.custom_named(&name).is_some();
+        if !listed {
+            let why = reason.map(|r| format!(" ({r})")).unwrap_or_default();
+            return Err(format!(
+                "Saved {saved}, but it is not in Settings > Custom themes{why}. \
+                 Custom themes are read from {}: copy the file there.",
+                dir.display()
+            ));
+        }
+        // A warning theme (Production, Staging) stays on the pane, so its
+        // confirmations keep working; the saved copy is in the menu.
+        let warning = p_warning(self.panes.get(&pane).map(|p| &p.theme));
+        if !warning && let Some(t) = self.custom_named(&name).map(|c| c.theme.clone()) {
             self.set_theme(pane, t);
             self.sync_tmux();
         }
         Ok(format!(
-            "Saved the theme {name}. It is in Settings > Custom themes; edit {} in any \
-             text editor to change it (the menu reads it again each time it opens).",
-            path.display()
+            "Saved the theme {name}. It is in Settings > Custom themes; edit {saved} in any \
+             text editor to change it (the menu reads it again each time it opens)."
         ))
     }
 
@@ -21827,7 +21926,24 @@ fn save_theme_as(hwnd: HWND) {
         return;
     }
     let end = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
-    let path = PathBuf::from(String::from_utf16_lossy(buf.get(..end).unwrap_or_default()));
+    let mut path = PathBuf::from(String::from_utf16_lossy(buf.get(..end).unwrap_or_default()));
+    // The dialog appends only three characters of a default extension
+    // ("Dusk.the"): end the name in .theme here.
+    match path
+        .extension()
+        .map(|e| e.to_string_lossy().to_ascii_lowercase())
+    {
+        Some(e) if e == custom_theme::EXTENSION => {}
+        Some(e) if e == "the" => {
+            path.set_extension(custom_theme::EXTENSION);
+        }
+        _ => {
+            let mut name = path.into_os_string();
+            name.push(".");
+            name.push(custom_theme::EXTENSION);
+            path = PathBuf::from(name);
+        }
+    }
     let (text, icon) = match with_window(|w| w.save_theme(&path)) {
         Some(Ok(text)) => (text, MB_ICONINFORMATION),
         Some(Err(text)) => (text, MB_ICONWARNING),

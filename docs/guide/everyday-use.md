@@ -626,9 +626,9 @@ Resting the mouse on a font, a theme, a custom theme or a window colour in these
 
 ### Custom themes
 
-Settings > Custom themes lists your own themes. **Save this look as a theme...** writes the focused pane's colours, font and size, and the window colours (unless they follow the terminal or Windows), to a file in the `themes` folder next to the settings; the file name is the theme's name. Picking a custom theme gives the focused pane its colours, its font if it names one that is installed, and its window colours if it has some. Host rules, `Profile` themes and `--theme` can name a custom theme like a built-in one.
+Settings > Custom themes lists your own themes. **Save this look as a theme...** writes the focused pane's colours, font and size to a file in the `themes` folder next to the settings; the file name is the theme's name (without `#` or `"`). The window colours go in too when they are one of the fixed looks (a grey or a tinted one); with Light or Follow Windows none are saved, and with Follow the terminal theme only a custom theme's own window colours are. Picking a custom theme gives the focused pane its colours, its font if it names one that is installed, and its window colours if it has some. Host rules, `Profile` themes and `--theme` can name a custom theme like a built-in one; they give the pane its colours and font, and its own window colours (`WindowBackground` and the rest) show while Window colours follow the terminal theme, but a `Window sand` line only takes effect when you pick the theme from the menu. Saving a pane that has the Production or Staging theme keeps that theme on the pane, so its warnings stay.
 
-Each theme is a small text file you can change in any editor; the menu reads the folder again each time it opens. Every line is optional except that it needs a name (the file name serves):
+Each theme is a small text file you can change in any editor; the menu reads the folder again each time it opens. Every line is optional except that it needs a name (the file name serves). `Base` names a built-in theme:
 
 ```
 Name       Sandstorm
@@ -646,7 +646,7 @@ WindowText       #2A241C
 WindowAccent     #8C5A1E
 ```
 
-A file with a mistake shows greyed in the menu with the reason. Window colours whose text reads below 4.5:1 on their background are left out, and the menu marks a theme that had such a problem with "(see file)".
+A file that cannot be used at all (a colour that is not `#RRGGBB`, a name that is taken) shows greyed in the menu with the reason. A smaller mistake (an unknown line, a font size outside 6 to 72) leaves the theme selectable but marked "(see file)", with the mistaken line ignored. Window colours whose text reads below 4.5:1 on the window, the menu bar or the tabs are left out, and an accent below 3:1 is replaced by the text colour; both also mark the theme "(see file)".
 
 ## Server status bar
 
