@@ -1570,23 +1570,21 @@ struct Preview {
 
 /// A forward added from a preview's bar, waiting to listen before the
 /// browser opens on it.
-/// Settings > Font, Theme, Custom themes and Window colours show the item
-/// under the mouse: what was there before, to put back, and which item
-/// shows in each part now.
+/// Settings > Theme, Custom themes and Window colours show the item under
+/// the mouse: what was there before, to put back, and which item shows in
+/// each part now. Fonts are not previewed, because a new font size would
+/// resize the remote terminal; a custom theme's font applies when picked.
 struct LookPreview {
     pane: PaneId,
-    font: FontSpec,
     theme: Theme,
     colours: WindowColours,
     /// The item under the mouse, waiting for `TIMER_LOOK`.
     pending: Option<u32>,
     /// The item each part shows, if not the original.
-    font_by: Option<u32>,
     theme_by: Option<u32>,
     colours_by: Option<u32>,
     /// What the preview put on the pane, so that a change from elsewhere
     /// meanwhile (a reconnect applying the host's look) is not undone.
-    font_shown: Option<FontSpec>,
     theme_shown: Option<Theme>,
 }
 
@@ -6713,15 +6711,12 @@ impl Window {
         }
         self.apply_highlight(id, true);
         self.set_theme(id, theme.clone());
-        self.set_font(id, font.clone());
+        self.set_font(id, font);
         // A menu preview on this pane now goes back to the host's look,
         // not to the one from before (a reconnect during the preview).
         if let Some(p) = self.look_preview.as_mut().filter(|p| p.pane == id) {
-            p.font = font;
             p.theme = theme;
-            p.font_by = None;
             p.theme_by = None;
-            p.font_shown = None;
             p.theme_shown = None;
         }
     }
@@ -16623,13 +16618,11 @@ impl Window {
     /// Whether menu id `id` picks a font, a theme or window colours: the
     /// items a menu shows live while the mouse is on them.
     fn is_look_item(&self, id: u32) -> bool {
-        let fonts = cmd::FONT..cmd::FONT + FONT_CHOICES.len() as u32;
+        // Fonts are not previewed: a new font size would resize the
+        // remote terminal while the mouse only passes over it.
         let themes = cmd::THEME..cmd::THEME + Theme::builtin().len() as u32;
         let colours = cmd::WINDOW_COLOURS..cmd::WINDOW_COLOURS + WindowColours::ALL.len() as u32;
-        fonts.contains(&id)
-            || themes.contains(&id)
-            || colours.contains(&id)
-            || self.custom_at(id).is_some()
+        themes.contains(&id) || colours.contains(&id) || self.custom_at(id).is_some()
     }
 
     /// `WM_MENUSELECT`: the menu item under the mouse (or keyboard) is
@@ -16653,14 +16646,11 @@ impl Window {
             };
             self.look_preview = Some(LookPreview {
                 pane,
-                font: p.font.clone(),
                 theme: p.theme.clone(),
                 colours: self.settings.window_colours,
                 pending: None,
-                font_by: None,
                 theme_by: None,
                 colours_by: None,
-                font_shown: None,
                 theme_shown: None,
             });
         }
@@ -16691,12 +16681,6 @@ impl Window {
         // A look changed from elsewhere meanwhile (a reconnect applying the
         // host's look) becomes what a cancelled preview goes back to.
         if let Some(now) = self.panes.get(&pane) {
-            let expected_font = p.font_shown.as_ref().unwrap_or(&p.font);
-            if now.font != *expected_font {
-                p.font = now.font.clone();
-                p.font_by = None;
-                p.font_shown = None;
-            }
             let expected_theme = p.theme_shown.as_ref().unwrap_or(&p.theme);
             if now.theme != *expected_theme {
                 p.theme = now.theme.clone();
@@ -16705,18 +16689,8 @@ impl Window {
             }
         }
         let committed = (p.theme.name, p.theme.group() == ThemeGroup::Warning);
-        // A family alone keeps the size the pane had before the menu.
-        let size = p.font.size_pt;
-        let (mut font, mut theme, mut colours) = (None, None, None);
-        if let Some(family) = id
-            .checked_sub(cmd::FONT)
-            .and_then(|i| FONT_CHOICES.get(i as usize))
-            .filter(|_| id < cmd::THEME)
-        {
-            if self.renderer.has_family(family) {
-                font = Some(FontSpec::new(family, size));
-            }
-        } else if let Some(t) = id
+        let (mut theme, mut colours) = (None, None);
+        if let Some(t) = id
             .checked_sub(cmd::THEME)
             .and_then(|i| Theme::builtin().get(i as usize))
         {
@@ -16729,14 +16703,6 @@ impl Window {
             colours = Some(*c);
         } else if let Some(c) = self.custom_at(id) {
             theme = Some(c.theme.clone());
-            // A size alone keeps the pane's font family.
-            let family = c.font.clone().or_else(|| {
-                c.size
-                    .and(self.panes.get(&pane).map(|p| p.font.family.clone()))
-            });
-            font = family
-                .filter(|f| self.renderer.has_family(f))
-                .map(|f| FontSpec::new(&f, c.size.unwrap_or(size)));
             colours = match c.window {
                 Some(custom_theme::WindowSpec::Look(l)) => Some(l),
                 Some(custom_theme::WindowSpec::Colours(..)) => Some(WindowColours::Theme),
@@ -16746,21 +16712,14 @@ impl Window {
         // Parts that a custom theme shown before set, and this item does
         // not, go back.
         let by_custom = |by: Option<u32>| by.is_some_and(|by| self.custom_at(by).is_some());
-        let (font_back, theme_back, colours_back) = match &self.look_preview {
+        let (theme_back, colours_back) = match &self.look_preview {
             Some(p) => (
-                (font.is_none() && by_custom(p.font_by)).then(|| p.font.clone()),
                 (theme.is_none() && by_custom(p.theme_by)).then(|| p.theme.clone()),
                 (colours.is_none() && by_custom(p.colours_by)).then_some(p.colours),
             ),
-            None => (None, None, None),
+            None => (None, None),
         };
         {
-            if let Some(f) = font_back {
-                self.set_font(pane, f);
-                if let Some(p) = &mut self.look_preview {
-                    p.font_by = None;
-                }
-            }
             if let Some(t) = theme_back {
                 self.set_theme(pane, t);
                 if let Some(p) = &mut self.look_preview {
@@ -16772,13 +16731,6 @@ impl Window {
                 if let Some(p) = &mut self.look_preview {
                     p.colours_by = None;
                 }
-            }
-        }
-        if let Some(f) = font {
-            self.set_font(pane, f.clone());
-            if let Some(p) = &mut self.look_preview {
-                p.font_by = Some(id);
-                p.font_shown = Some(f);
             }
         }
         if let Some(mut t) = theme {
@@ -16818,17 +16770,9 @@ impl Window {
         };
         let back = |by: Option<u32>| by.is_some() && by != chosen;
         // Only what the preview itself shows goes back.
-        let (font_now, theme_now) = self
-            .panes
-            .get(&p.pane)
-            .map_or((None, None), |x| (Some(&x.font), Some(&x.theme)));
-        let font_back = back(p.font_by) && font_now == p.font_shown.as_ref();
+        let theme_now = self.panes.get(&p.pane).map(|x| &x.theme);
         let theme_back = back(p.theme_by) && theme_now == p.theme_shown.as_ref();
         let mut changed = false;
-        if font_back {
-            self.set_font(p.pane, p.font);
-            changed = true;
-        }
         if theme_back {
             self.set_theme(p.pane, p.theme);
             changed = true;

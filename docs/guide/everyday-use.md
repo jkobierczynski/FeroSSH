@@ -622,7 +622,7 @@ There are forty-two themes, in three columns of Settings > Theme. The dark ones 
 
 The window around the panes (the menu bar and its menus, the title bar, the tab strip, the tools rail and the tools pane: Connection manager, Session manager, the connection form, File transfer, Port forwards, Scripts) has Windows' light look unless you pick something else in Settings > Window colours: the focused pane's colours (dark for a dark theme, red for Production), Windows' own light or dark mode, one of seven neutral greys from Soft grey to Black, or one of eight tinted neutrals that are not grey: Sand, Sage, Mist and Taupe (light), Slate, Moss, Espresso and Heather (dark). Dark menus, buttons and scroll bars need Windows 10 version 1903 or later; the title bar takes the theme's colour on Windows 11.
 
-Resting the mouse on a font, a theme, a custom theme or a window colour in these menus shows it right away, in the focused pane and the window around it. Pick it to keep it; close the menu without a choice (Esc, or a click elsewhere) and the old look comes back. A font shown this way changes the pane's rows and columns like any font change.
+Resting the mouse on a theme, a custom theme or a window colour in these menus shows it right away, in the focused pane and the window around it. Pick it to keep it; close the menu without a choice (Esc, or a click elsewhere) and the old look comes back. Fonts are not shown this way, because a new font size would resize the remote terminal; a font, and a custom theme's font, change when you pick them.
 
 ### Custom themes
 
