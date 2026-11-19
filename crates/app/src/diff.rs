@@ -605,7 +605,14 @@ pub fn render(diff: &Diff, cols: usize, look: &Look, notes: &[String]) -> Render
     if diff.files.is_empty() && notes.is_empty() && !diff.failed {
         out.push("No changes: the files are as in the last commit.".to_owned());
     }
+    // Every push below checks the row limit first, so a diff with many
+    // files or one huge line stops at MAX_ROWS (plus one note).
+    let mut over = false;
     for f in &diff.files {
+        if out.len() >= MAX_ROWS {
+            over = true;
+            break;
+        }
         let (letter, colour) = f.kind.letter();
         let counts = format!("  +{} -{}", f.added, f.removed);
         let (name, _) = fit(f.name(), cols.saturating_sub(4 + counts.len()));
@@ -614,6 +621,14 @@ pub fn render(diff: &Diff, cols: usize, look: &Look, notes: &[String]) -> Render
         ));
     }
     'files: for f in &diff.files {
+        if over {
+            break;
+        }
+        // A blank row, the header bar and maybe a note.
+        if out.len() + 3 > MAX_ROWS {
+            over = true;
+            break;
+        }
         out.push(String::new());
         files.push(out.len());
         let (letter, _) = f.kind.letter();
@@ -654,23 +669,30 @@ pub fn render(diff: &Diff, cols: usize, look: &Look, notes: &[String]) -> Render
                 h.new_start,
                 h.heading
             );
+            if out.len() >= MAX_ROWS {
+                over = true;
+                break 'files;
+            }
             out.push(format!("{DIM}{}{RESET}", fit(&at, cols).0));
             for r in &h.rows {
                 let budget = MAX_ROWS.saturating_sub(out.len());
-                row(&mut out, r, cols, nw, look, budget);
-                if out.len() >= MAX_ROWS {
-                    out.push(format!(
-                        "\x1b[0;33m{}{RESET}",
-                        fit(
-                            "FeroSSH shows no more lines here: there are too many.",
-                            cols
-                        )
-                        .0
-                    ));
+                if budget == 0 {
+                    over = true;
                     break 'files;
                 }
+                row(&mut out, r, cols, nw, look, budget);
             }
         }
+    }
+    if over || out.len() >= MAX_ROWS {
+        out.push(format!(
+            "\x1b[0;33m{}{RESET}",
+            fit(
+                "FeroSSH shows no more lines here: there are too many.",
+                cols
+            )
+            .0
+        ));
     }
     Rendered {
         text: out.join("\r\n"),
@@ -680,7 +702,7 @@ pub fn render(diff: &Diff, cols: usize, look: &Look, notes: &[String]) -> Render
 
 /// One row, side by side when there is room: `nw` columns of line
 /// number, a space, the text; a bar between the two sides.
-/// At most `budget` rows; a longer line is cut there.
+/// At most `budget` rows (at least 1); a longer line is cut there.
 fn row(out: &mut Vec<String>, r: &Row, cols: usize, nw: usize, look: &Look, budget: usize) {
     let bg = |rgb: [u8; 3]| format!("\x1b[48;2;{};{};{}m", rgb[0], rgb[1], rgb[2]);
     let half = (cols - 1) / 2;
@@ -693,6 +715,9 @@ fn row(out: &mut Vec<String>, r: &Row, cols: usize, nw: usize, look: &Look, budg
             |out: &mut Vec<String>, side: &(usize, String), mark: char, colour: Option<[u8; 3]>| {
                 let colour = colour.map(bg).unwrap_or_default();
                 let room = budget.saturating_sub(out.len() - start);
+                if room == 0 {
+                    return;
+                }
                 for (k, (piece, used)) in wrap(&side.1, tw, room).into_iter().enumerate() {
                     let num = if k == 0 {
                         side.0.to_string()
@@ -1094,10 +1119,44 @@ diff --git a/x b/x\n--- a/x\n+++ b/x\n@@ -1 +1 @@\n-\x1b[2Jold\n+\u{202e}new\u{9
         let d = changes(&out);
         let r = render(&d, 20, &LOOK, &[]);
         let rows = r.text.split("\r\n").count();
-        assert!(rows <= MAX_ROWS + 2, "{rows}");
+        assert!(rows <= MAX_ROWS + 1, "{rows}");
         assert!(plain(&r.text).contains("FeroSSH shows"));
         assert_eq!(wrap(&tabs, 10, 3).len(), 3);
         assert_eq!(wrap("", 10, 3), [(String::new(), 0)]);
+    }
+
+    #[test]
+    fn a_long_removed_then_added_line_stops_at_the_row_limit() {
+        let tabs = "\t".repeat(2_000_000);
+        let out = format!(
+            "@ferossh-diff top /r\ndiff --git a/a b/a\n--- a/a\n+++ b/a\n@@ -1 +1 @@\n-{tabs}\n+{tabs}\n"
+        );
+        let d = changes(&out);
+        // 20 columns stacks the sides; 200 puts them side by side.
+        for cols in [20, 200] {
+            let r = render(&d, cols, &LOOK, &[]);
+            let rows = r.text.split("\r\n").count();
+            assert!(rows <= MAX_ROWS + 1, "{cols}: {rows}");
+            // Wide, the line fits in fewer rows than the limit.
+            assert_eq!(plain(&r.text).contains("FeroSSH shows"), cols == 20);
+        }
+    }
+
+    #[test]
+    fn many_files_without_lines_stop_at_the_row_limit() {
+        let mut out = String::from("@ferossh-diff top /r\n");
+        for i in 0..(MAX_ROWS / 2) {
+            out.push_str(&format!(
+                "diff --git a/f{i} b/f{i}\nold mode 100644\nnew mode 100755\n"
+            ));
+        }
+        let d = changes(&out);
+        assert_eq!(d.files.len(), MAX_ROWS / 2);
+        let r = render(&d, 80, &LOOK, &[]);
+        let rows = r.text.split("\r\n").count();
+        assert!(rows <= MAX_ROWS + 1, "{rows}");
+        assert!(plain(&r.text).contains("FeroSSH shows"));
+        assert!(r.files.iter().all(|&at| at < rows));
     }
 
     #[test]
