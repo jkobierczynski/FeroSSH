@@ -83,6 +83,8 @@ pub struct Cell {
     /// Combining marks drawn with `ch`, as an index into the grid's cluster
     /// table plus one; 0 means none.
     pub cluster: u16,
+    /// Part of a picture the host printed, drawn over the cell.
+    pub picture: Option<crate::PictureCell>,
 }
 
 impl Cell {
@@ -92,6 +94,7 @@ impl Cell {
         bg: Color::Default,
         flags: Flags::empty(),
         cluster: 0,
+        picture: None,
     };
 
     /// A cell with no combining marks.
@@ -102,6 +105,7 @@ impl Cell {
             bg,
             flags,
             cluster: 0,
+            picture: None,
         }
     }
 

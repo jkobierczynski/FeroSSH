@@ -173,6 +173,7 @@ Font, theme and text size apply to the focused pane only. Session > Save font an
 | Copy public key to this server... | Like `ssh-copy-id`: adds a `.pub` file's key to `~/.ssh/authorized_keys` on the focused pane's host, unless it is there already (see [Making a key](everyday-use.md#making-a-key-and-putting-it-on-a-server)). |
 | Verify transfers (SHA-256) | Compares SHA-256 sums on both ends after each SFTP transfer (the server needs `sha256sum` and `xargs`). ✓ `VerifyTransfers`. |
 | ZMODEM: answer rz and sz | Answers `rz` and `sz` in the terminal (see [ZMODEM](everyday-use.md#zmodem)). ✓ `ZModem`. |
+| Show images the host prints (Sixel, kitty, iTerm2) | Shows pictures programs on the host print, such as `img2sixel`, `kitten icat` and `imgcat` (see [Images in the terminal](everyday-use.md#images-in-the-terminal)). ✓ `InlineImages`; off by default. |
 | Highlight keywords | Colours errors, warnings, success words and addresses in the output, and your own `HighlightRule`s (see [Highlighting and following output](everyday-use.md#highlighting-and-following-output)). ✓ on. `Highlight`. |
 | Save font and theme for this host | Keeps the focused pane's font, text size and theme in the host's profile. |
 | Start new tabs and panes in this directory | Keeps the focused pane's directory as the host's start directory (Start dir in the connection form): new tabs, panes and tmux windows on that host start there when the directory of the pane they come from is not known, also after a restart. |

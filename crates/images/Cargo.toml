@@ -1,0 +1,17 @@
+[package]
+name = "ferossh-images"
+description = "FeroSSH: bounded decoders for inline terminal images (Sixel, kitty graphics, iTerm2)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+# zlib for PNG and kitty's compressed payloads; already in the exe
+# through the clipboard's PNG writer, ferostream-proto and ferossh-mosh.
+miniz_oxide = { version = "0.9", default-features = false, features = ["with-alloc"] }
+
+[lints]
+workspace = true

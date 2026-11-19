@@ -14,6 +14,7 @@ publish = false
 ferossh-auth = { path = "crates/auth" }
 ferossh-config = { path = "crates/config" }
 ferossh-forward = { path = "crates/forward" }
+ferossh-images = { path = "crates/images" }
 ferossh-ipc = { path = "crates/ipc" }
 ferossh-mosh = { path = "crates/mosh" }
 ferossh-render = { path = "crates/render" }

@@ -1,5 +1,6 @@
 //! A fixed-size grid of cells with per-row dirty tracking.
 
+use crate::Picture;
 use crate::cell::Cell;
 
 /// The cells a pane shows, plus which rows changed since the last draw.
@@ -11,6 +12,8 @@ pub struct Grid {
     dirty: Vec<bool>,
     /// Combining marks for cells whose `cluster` is non-zero.
     clusters: Vec<String>,
+    /// The pictures the cells show parts of, by key.
+    pictures: Vec<Picture>,
 }
 
 impl Grid {
@@ -24,6 +27,7 @@ impl Grid {
             cells: vec![Cell::BLANK; cols * rows],
             dirty: vec![true; rows],
             clusters: Vec::new(),
+            pictures: Vec::new(),
         }
     }
 
@@ -111,6 +115,21 @@ impl Grid {
             .checked_sub(1)
             .and_then(|i| self.clusters.get(i))
             .map_or("", String::as_str)
+    }
+
+    /// Sets the pictures the cells show; a cell whose picture is not
+    /// among them draws as a blank.
+    pub fn set_pictures(&mut self, pictures: Vec<Picture>) {
+        self.pictures = pictures;
+    }
+
+    pub fn pictures(&self) -> &[Picture] {
+        &self.pictures
+    }
+
+    /// The picture with `key`, if the grid has it.
+    pub fn picture(&self, key: u32) -> Option<&Picture> {
+        self.pictures.iter().find(|p| p.key == key)
     }
 
     /// Blanks every cell of one row.

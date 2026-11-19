@@ -26,6 +26,8 @@ use crate::input::{self, Key, KeyOptions, Mods, MouseButton, MouseEvent};
 use crate::notify::Notification;
 use crate::sanitize::{Paste, prepare_paste, sanitize_title};
 
+mod place;
+
 /// Per-session terminal settings, from the window's settings file and the
 /// host's session profile.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -34,6 +36,8 @@ pub struct Settings {
     pub scrollback: usize,
     /// The kitty keyboard protocol and Shift+Enter.
     pub keys: KeyOptions,
+    /// Show pictures the host prints (Sixel, kitty graphics, iTerm2).
+    pub images: bool,
 }
 
 impl Settings {
@@ -45,6 +49,7 @@ impl Settings {
         Self {
             scrollback: scrollback.min(Self::MAX_SCROLLBACK),
             keys: KeyOptions::default(),
+            images: false,
         }
     }
 }
@@ -286,6 +291,8 @@ pub struct Terminal {
     /// Feeds of host output so far, to tell whether the host answered
     /// something typed.
     fed: u64,
+    /// Inline images, while they are on.
+    images: Option<place::Images>,
 }
 
 impl std::fmt::Debug for Terminal {
@@ -328,6 +335,7 @@ impl Terminal {
             title: None,
             alt_title: None,
             fed: 0,
+            images: settings.images.then(place::Images::default),
         }
     }
 
@@ -337,6 +345,7 @@ impl Terminal {
             self.keyboard_stacks_emptied();
         }
         self.keys = settings.keys;
+        self.set_images(settings.images);
         self.term.set_options(config(settings));
     }
 
@@ -354,6 +363,7 @@ impl Terminal {
         let settings = Settings {
             scrollback: self.scrollback,
             keys,
+            images: self.images.is_some(),
         };
         self.term.set_options(config(&settings));
     }
@@ -481,6 +491,11 @@ impl Terminal {
     /// Processes output from the host. Call [`Self::take_actions`] after.
     pub fn feed(&mut self, bytes: &[u8]) {
         self.fed = self.fed.wrapping_add(1);
+        self.feed_with_images(bytes);
+    }
+
+    /// Processes output that is not a picture.
+    fn feed_text(&mut self, bytes: &[u8]) {
         let mut last = None;
         for found in self.cwd.scan(bytes) {
             match found {
@@ -540,6 +555,7 @@ impl Terminal {
             self.term.set_options(config(&Settings {
                 scrollback: self.scrollback,
                 keys,
+                images: self.images.is_some(),
             }));
         }
         // Setting the options says the title again.
@@ -751,6 +767,7 @@ impl Terminal {
             self.term.set_options(config(&Settings {
                 scrollback: self.scrollback,
                 keys: self.keys,
+                images: self.images.is_some(),
             }));
             self.events.0.borrow_mut().truncate(queued);
             return;
@@ -858,11 +875,17 @@ impl Terminal {
         let mut actions: Vec<Action> = events.into_iter().filter_map(|e| self.action(e)).collect();
         actions.extend(self.reported.drain(..).map(Action::WorkingDirectory));
         actions.extend(self.notifications.drain(..).map(Action::Notify));
+        actions.extend(self.take_image_replies().into_iter().map(Action::Reply));
         actions
     }
 
     fn action(&self, event: Event) -> Option<Action> {
         Some(match event {
+            // With pictures on, device attributes say Sixel too, which is
+            // how programs such as chafa and lsix look for it.
+            Event::PtyWrite(text) if self.images.is_some() && text == "\x1b[?6c" => {
+                Action::Reply(b"\x1b[?62;4;22c".to_vec())
+            }
             Event::PtyWrite(text) => Action::Reply(keyboard_report(text).into_bytes()),
             Event::Title(title) => Action::Title(Some(sanitize_title(&title))),
             Event::ResetTitle => Action::Title(None),
@@ -1490,6 +1513,7 @@ impl Terminal {
         let point = self.grid_point(col, row);
         self.term.grid()[point]
             .hyperlink()
+            .filter(|h| h.id() != crate::images::MARKER_ID)
             .map(|h| h.uri().to_owned())
     }
 
@@ -1633,6 +1657,7 @@ impl Terminal {
             .zip(cache.as_mut())
             .filter(|_| !alt);
         let mut row_cells = Vec::with_capacity(cols);
+        let mut pictures: Vec<ferossh_render::Picture> = Vec::new();
         for y in 0..rows {
             row_cells.clear();
             let line = Line(y as i32 - offset as i32);
@@ -1642,6 +1667,12 @@ impl Terminal {
                 let mut out = convert_cell(cell, colors);
                 if let Some(marks) = cell.zerowidth() {
                     out.cluster = grid.add_cluster(&marks.iter().collect::<String>());
+                }
+                if let Some((at, picture)) = self.picture_cell(cell, x) {
+                    out.picture = Some(at);
+                    if !pictures.iter().any(|p| p.key == at.key) {
+                        pictures.push(picture.clone());
+                    }
                 }
                 row_cells.push(out);
             }
@@ -1661,6 +1692,7 @@ impl Terminal {
             grid.set_row(y, row_cells.iter().copied());
         }
         drop(cache);
+        grid.set_pictures(pictures);
 
         if let Some(search) = &self.search {
             let (bar, cursor_x) = search_bar(search, cols);
