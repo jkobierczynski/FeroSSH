@@ -6712,8 +6712,18 @@ impl Window {
             p.hl_host = Some((alias.to_owned(), hostname.to_owned()));
         }
         self.apply_highlight(id, true);
-        self.set_theme(id, theme);
-        self.set_font(id, font);
+        self.set_theme(id, theme.clone());
+        self.set_font(id, font.clone());
+        // A menu preview on this pane now goes back to the host's look,
+        // not to the one from before (a reconnect during the preview).
+        if let Some(p) = self.look_preview.as_mut().filter(|p| p.pane == id) {
+            p.font = font;
+            p.theme = theme;
+            p.font_by = None;
+            p.theme_by = None;
+            p.font_shown = None;
+            p.theme_shown = None;
+        }
     }
 
     /// Gives a pane the keyword highlighting and stop patterns its host's
