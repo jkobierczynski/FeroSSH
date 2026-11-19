@@ -3745,7 +3745,15 @@ impl Window {
         pane.log.raw = self.panes.get(&gateway).is_some_and(|g| g.log.raw);
         self.panes.insert(native, pane);
         self.apply_highlight(native, false);
-        self.start_log(native);
+        // With the audit trail on, an agent pane's first log is already
+        // named after its agent.
+        let agent = self
+            .settings
+            .agent_audit
+            .then(|| self.tmux.get(&gateway).and_then(|t| t.agent_of(native)))
+            .flatten()
+            .map(str::to_owned);
+        self.start_log_as(native, agent.as_deref());
     }
 
     /// Tells each tmux session its panes' sizes, and saves its layout and
@@ -19838,6 +19846,16 @@ fn run_command(hwnd: HWND, command: Command) {
                 )
             };
             if !production.is_empty() {
+                let breaks = paste.line_breaks;
+                let others = if !targets.is_empty() && breaks > 0 {
+                    format!(
+                        "{others} The {breaks} line break{s} in this paste act as Enter in the \
+                         other panes, so their shells run each line as soon as it arrives.",
+                        s = plural(breaks),
+                    )
+                } else {
+                    others.clone()
+                };
                 let text = format!(
                     "Paste this into the coding agent {}, which {} the Production theme?{others}\n\n{}",
                     production.join(", "),
