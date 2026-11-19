@@ -13,6 +13,7 @@ publish.workspace = true
 # event-loop modules are compiled in but never used: the host connection
 # is FeroSSH's.
 alacritty_terminal = { version = "0.26", default-features = false }
+ferossh-images.workspace = true
 ferossh-render.workspace = true
 # Keyword highlighting and stop patterns: the lazy DFA alacritty_terminal
 # already links for its search, so no new code comes in.

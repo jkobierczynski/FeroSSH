@@ -50,6 +50,7 @@ FeroSSH reads `~/.ssh/config` and `~/.ssh/known_hosts` too, and writes only to `
 | `ParallelTransfers 4` | 3 | Files that move at once, 1 to 8. |
 | `FollowDirectory no` | yes | Whether the file view follows the shell's `cd` (OSC 7). |
 | `ZModem yes` | no | Answers `rz` and `sz` in the terminal with ZMODEM (Session > ZMODEM: answer rz and sz). |
+| `InlineImages yes` | no | Shows pictures the host prints with Sixel, the kitty graphics protocol or iTerm2 inline images (Session > Show images the host prints). |
 | `UploadAndTypePath yes` | no | Pasting an image or copied files, or dropping files on a pane, uploads them to `~/.cache/ferossh/paste/` on its host and types their paths at the cursor (Session > Coding agents > Paste and drop files: upload and type the path). Off, drops upload to the shell's folder after asking. |
 | `PortPreviews yes` | no | A web server's address on the host in a pane's output (`http://localhost:5173/`) shows a bar offering to forward the port and open it in the browser (Session > Coding agents > Offer to forward and open web servers on the host). |
 | `KittyKeyboard yes` | no | Programs may turn on the kitty keyboard protocol's first level (disambiguate escape codes) (Session > Coding agents > Kitty keyboard protocol for programs that ask for it). |

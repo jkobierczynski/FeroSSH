@@ -20,8 +20,9 @@ use windows::Win32::Graphics::Direct2D::Common::{
     D2D1_COLOR_F, D2D1_PIXEL_FORMAT,
 };
 use windows::Win32::Graphics::Direct2D::{
-    D2D1_ANTIALIAS_MODE_ALIASED, D2D1_COMPATIBLE_RENDER_TARGET_OPTIONS_NONE,
-    D2D1_DRAW_TEXT_OPTIONS_CLIP, D2D1_FACTORY_TYPE_SINGLE_THREADED, D2D1_FEATURE_LEVEL_DEFAULT,
+    D2D1_ANTIALIAS_MODE_ALIASED, D2D1_BITMAP_INTERPOLATION_MODE_LINEAR, D2D1_BITMAP_PROPERTIES,
+    D2D1_COMPATIBLE_RENDER_TARGET_OPTIONS_NONE, D2D1_DRAW_TEXT_OPTIONS_CLIP,
+    D2D1_FACTORY_TYPE_SINGLE_THREADED, D2D1_FEATURE_LEVEL_DEFAULT,
     D2D1_HWND_RENDER_TARGET_PROPERTIES, D2D1_OPACITY_MASK_CONTENT_TEXT_NATURAL,
     D2D1_PRESENT_OPTIONS_RETAIN_CONTENTS, D2D1_RENDER_TARGET_PROPERTIES,
     D2D1_RENDER_TARGET_TYPE_DEFAULT, D2D1_RENDER_TARGET_USAGE_NONE,
@@ -171,6 +172,8 @@ struct Target {
     /// Pictures on the GPU by key, with their size.
     #[cfg(feature = "images")]
     images: HashMap<u64, (ID2D1Bitmap, u32, u32)>,
+    /// Pictures the host printed into panes, on the GPU by key.
+    pictures: HashMap<u32, ID2D1Bitmap>,
 }
 
 /// Draws panes of terminal cells into one window.
@@ -356,6 +359,7 @@ impl Renderer {
         target
             .images
             .retain(|k, _| panes.iter().any(|p| p.image.is_some_and(|i| i.key == *k)));
+        upload_pictures(rt, &mut target.pictures, panes)?;
         for p in panes {
             #[cfg(feature = "images")]
             if let Some(image) = &p.image {
@@ -364,7 +368,15 @@ impl Renderer {
             }
             let key = FontKey::new(p.font, dpi);
             if let (Some(font), Some(atlas)) = (self.fonts.get(&key), target.atlases.get(&key)) {
-                draw_pane(rt, &target.brush, atlas, &font.metrics, p, fresh);
+                draw_pane(
+                    rt,
+                    &target.brush,
+                    atlas,
+                    &target.pictures,
+                    &font.metrics,
+                    p,
+                    fresh,
+                );
             }
         }
         for (r, c) in fills {
@@ -416,6 +428,7 @@ impl Renderer {
                 atlases: HashMap::new(),
                 #[cfg(feature = "images")]
                 images: HashMap::new(),
+                pictures: HashMap::new(),
             })
         }
     }
@@ -628,9 +641,6 @@ fn draw_image(
     fresh: bool,
 ) -> Result<()> {
     use windows::Win32::Graphics::Direct2D::Common::D2D_RECT_U;
-    use windows::Win32::Graphics::Direct2D::{
-        D2D1_BITMAP_INTERPOLATION_MODE_LINEAR, D2D1_BITMAP_PROPERTIES,
-    };
     let (w, h) = (image.width, image.height);
     let needed = (w as usize).saturating_mul(h as usize);
     if w == 0 || h == 0 || image.pixels.len() < needed {
@@ -724,10 +734,99 @@ fn draw_image(
     Ok(())
 }
 
+/// Keeps on the GPU exactly the pictures the panes' grids show, creating
+/// the new ones.
+fn upload_pictures(
+    rt: &ID2D1RenderTarget,
+    bitmaps: &mut HashMap<u32, ID2D1Bitmap>,
+    panes: &[PaneView<'_>],
+) -> Result<()> {
+    bitmaps.retain(|k, _| panes.iter().any(|p| p.grid.picture(*k).is_some()));
+    for picture in panes.iter().flat_map(|p| p.grid.pictures()) {
+        let (w, h) = (picture.width, picture.height);
+        let needed = (w as usize).saturating_mul(h as usize);
+        if bitmaps.contains_key(&picture.key) || w == 0 || h == 0 || picture.pixels.len() < needed {
+            continue;
+        }
+        let props = D2D1_BITMAP_PROPERTIES {
+            pixelFormat: D2D1_PIXEL_FORMAT {
+                format: DXGI_FORMAT_B8G8R8A8_UNORM,
+                alphaMode: D2D1_ALPHA_MODE_PREMULTIPLIED,
+            },
+            dpiX: 96.0,
+            dpiY: 96.0,
+        };
+        // SAFETY: `pixels` holds at least w*h u32s (checked above), read
+        // with a pitch of one row.
+        let created = unsafe {
+            rt.CreateBitmap(
+                D2D_SIZE_U {
+                    width: w,
+                    height: h,
+                },
+                Some(picture.pixels.as_ptr().cast()),
+                w * 4,
+                &props,
+            )
+        };
+        // A picture the GPU cannot take (larger than its largest texture)
+        // is left out; its cells show as blanks.
+        if let Ok(bitmap) = created {
+            bitmaps.insert(picture.key, bitmap);
+        }
+    }
+    Ok(())
+}
+
+/// Draws the parts of pictures in `row`, a run of neighbouring cells of
+/// one picture at a time.
+fn draw_pictures(
+    rt: &ID2D1RenderTarget,
+    bitmaps: &HashMap<u32, ID2D1Bitmap>,
+    grid: &Grid,
+    row: &[Cell],
+    (ox, top, cw, ch): (f32, f32, f32, f32),
+) {
+    let mut x = 0;
+    while x < row.len() {
+        let Some(first) = row.get(x).and_then(|c| c.picture) else {
+            x += 1;
+            continue;
+        };
+        let mut last = first;
+        let mut end = x + 1;
+        while let Some(next) = row.get(end).and_then(|c| c.picture)
+            && last.continues_with(&next)
+        {
+            last = next;
+            end += 1;
+        }
+        if let (Some(bitmap), Some(picture)) = (bitmaps.get(&first.key), grid.picture(first.key)) {
+            let (l, t, _, _) = first.source(picture.width, picture.height);
+            let (_, _, r, b) = last.source(picture.width, picture.height);
+            let src = rect(l, t, r, b);
+            let left = ox + x as f32 * cw;
+            let dst = rect(left, top, ox + end as f32 * cw, top + ch);
+            // SAFETY: drawing call inside the caller's BeginDraw.
+            unsafe {
+                rt.DrawBitmap(
+                    bitmap,
+                    Some(&dst),
+                    1.0,
+                    D2D1_BITMAP_INTERPOLATION_MODE_LINEAR,
+                    Some(&src),
+                );
+            }
+        }
+        x = end;
+    }
+}
+
 fn draw_pane(
     rt: &ID2D1RenderTarget,
     brush: &ID2D1SolidColorBrush,
     atlas: &Atlas,
+    pictures: &HashMap<u32, ID2D1Bitmap>,
     m: &CellMetrics,
     pane: &PaneView<'_>,
     force: bool,
@@ -791,6 +890,27 @@ fn draw_pane(
             if bg != theme.background {
                 let left = ox + x as f32 * cw;
                 fill(&rect(left, top, left + cw, top + ch), bg);
+            }
+        }
+        draw_pictures(rt, pictures, pane.grid, row, (ox, top, cw, ch));
+        // A picture covers its cells' backgrounds: a selection over it
+        // shows as a tint, and a block cursor on it is drawn again.
+        for (x, cell) in row.iter().enumerate() {
+            if cell.picture.is_none() {
+                continue;
+            }
+            let left = ox + x as f32 * cw;
+            let r = rect(left, top, left + cw, top + ch);
+            if block_at(x, cell) {
+                fill(&r, theme.cursor);
+            } else if cell.flags.contains(Flags::INVERSE) {
+                // SAFETY: drawing calls inside the caller's BeginDraw.
+                unsafe {
+                    brush.SetColor(&color(theme.foreground));
+                    brush.SetOpacity(0.35);
+                    rt.FillRectangle(&r, brush);
+                    brush.SetOpacity(1.0);
+                }
             }
         }
         for (x, cell) in row.iter().enumerate() {

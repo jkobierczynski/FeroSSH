@@ -9,6 +9,7 @@
 //! DownloadFolder "D:\Transfers"
 //! VerifyTransfers yes
 //! ZModem yes
+//! InlineImages yes
 //! UploadAndTypePath yes
 //! PortPreviews yes
 //! KittyKeyboard yes
@@ -733,6 +734,10 @@ pub struct Settings {
     /// Answer `rz` and `sz` in the terminal with ZMODEM; off unless turned
     /// on, so their output shows as it is.
     pub zmodem: bool,
+    /// Pictures a host prints into the terminal (Sixel, the kitty
+    /// graphics protocol, iTerm2 inline images) are shown. Off unless
+    /// turned on: each is a parser of host data more.
+    pub inline_images: bool,
     /// Files pasted (an image on the clipboard, or files copied in
     /// Explorer) or dropped on a pane go to `~/.cache/ferossh/paste/` on
     /// its host and their paths are typed at the cursor, for programs
@@ -895,6 +900,7 @@ impl Default for Settings {
             auto_reconnect: true,
             parallel_transfers: None,
             zmodem: false,
+            inline_images: false,
             upload_type_path: false,
             port_previews: false,
             kitty_keyboard: false,
@@ -1252,6 +1258,10 @@ impl Settings {
                 "zmodem" => {
                     block = Block::Top;
                     s.zmodem = yes(&args).unwrap_or(false);
+                }
+                "inlineimages" => {
+                    block = Block::Top;
+                    s.inline_images = yes(&args).unwrap_or(false);
                 }
                 "uploadandtypepath" => {
                     block = Block::Top;
@@ -1704,6 +1714,7 @@ impl Settings {
             let _ = writeln!(out, "ParallelTransfers {n}");
         }
         let _ = writeln!(out, "ZModem {}", flag(self.zmodem));
+        let _ = writeln!(out, "InlineImages {}", flag(self.inline_images));
         let _ = writeln!(out, "UploadAndTypePath {}", flag(self.upload_type_path));
         let _ = writeln!(out, "PortPreviews {}", flag(self.port_previews));
         let _ = writeln!(out, "KittyKeyboard {}", flag(self.kitty_keyboard));
@@ -2025,6 +2036,7 @@ Scrollback 50000
 DownloadFolder "D:\My Transfers"
 VerifyTransfers yes
 ZModem yes
+InlineImages yes
 UploadAndTypePath yes
 PortPreviews yes
 KittyKeyboard yes
@@ -2164,6 +2176,8 @@ NewKeyword later
         assert_eq!(s.download_folder.as_deref(), Some("D:\\My Transfers"));
         assert!(s.zmodem);
         assert!(!Settings::default().zmodem);
+        assert!(s.inline_images);
+        assert!(!Settings::default().inline_images, "off unless turned on");
         assert!(s.upload_type_path);
         assert!(
             !Settings::default().upload_type_path,

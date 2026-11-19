@@ -620,6 +620,8 @@ mod cmd {
     pub const AUTO_RESPONSES: u32 = 618;
     pub const CONFIRM_PRODUCTION: u32 = 619;
     pub const WRITE_LIBRARY: u32 = 644;
+    /// Session > Show images (Sixel, kitty, iTerm2).
+    pub const INLINE_IMAGES: u32 = 645;
     /// Settings > Desktop notifications, and Notify on the bell too.
     pub const NOTIFY: u32 = 650;
     pub const NOTIFY_BELL: u32 = 651;
@@ -1653,6 +1655,9 @@ thread_local! {
     // How new terminals send keys (the kitty keyboard protocol and
     // Shift+Enter), from the settings.
     static KEY_OPTIONS: StdCell<KeyOptions> = StdCell::new(KeyOptions::default());
+    // Whether new terminals show pictures the host prints, from the
+    // settings.
+    static INLINE_IMAGES: StdCell<bool> = const { StdCell::new(false) };
 }
 
 /// Runs `f` on the window state, or returns `None` before the window is set
@@ -2352,6 +2357,7 @@ fn is_escape(bytes: &[u8]) -> bool {
 fn term_settings(lines: Option<usize>) -> TermSettings {
     let mut settings = lines.map_or_else(TermSettings::default, TermSettings::new);
     settings.keys = KEY_OPTIONS.get();
+    settings.images = INLINE_IMAGES.get();
     settings
 }
 
@@ -2414,6 +2420,7 @@ fn create_and_run(launch: Launch, theme: Option<String>) -> Result<()> {
         let mut settings = load_settings();
         load_snippets(&mut settings);
         KEY_OPTIONS.set(key_options(&settings));
+        INLINE_IMAGES.set(settings.inline_images);
         let mut font = FontSpec::default();
         // Read first, so `--theme` and saved looks can name them.
         let custom_themes = load_custom_themes().map(|(t, _)| t).unwrap_or_default();
@@ -2985,6 +2992,11 @@ fn build_menu() -> Result<HMENU> {
         separator(session)?;
         item(session, cmd::VERIFY, "Verify trans&fers (SHA-256)")?;
         item(session, cmd::ZMODEM, "&ZMODEM: answer rz and sz")?;
+        item(
+            session,
+            cmd::INLINE_IMAGES,
+            "Show i&mages the host prints (Sixel, kitty, iTerm2)",
+        )?;
         item(session, cmd::HIGHLIGHT, "Hi&ghlight keywords")?;
         separator(session)?;
         item(
@@ -9425,7 +9437,7 @@ impl Window {
                     // tmux answered its panes' queries already.
                     Action::Reply(_)
                         if self.panes.get(&id).is_some_and(|p| p.gateway().is_some()) => {}
-                    Action::Reply(bytes) => self.send(id, bytes),
+                    Action::Reply(bytes) | Action::ImageReply(bytes) => self.send(id, bytes),
                     Action::Title(title) => {
                         if let Some(p) = self.panes.get_mut(&id) {
                             p.title = title;
@@ -16251,6 +16263,21 @@ impl Window {
                 self.save_settings();
                 self.update_menu_checks();
             }
+            cmd::INLINE_IMAGES => {
+                self.settings.inline_images = !self.settings.inline_images;
+                self.save_settings();
+                self.update_menu_checks();
+                let on = self.settings.inline_images;
+                INLINE_IMAGES.set(on);
+                let ids: Vec<PaneId> = self.panes.keys().copied().collect();
+                for id in ids {
+                    if let Some(p) = self.panes.get_mut(&id) {
+                        p.term.set_images(on);
+                    }
+                    // Pictures on the screen go when images are turned off.
+                    self.refresh(id);
+                }
+            }
             cmd::UPLOAD_TYPE_PATH => {
                 self.settings.upload_type_path = !self.settings.upload_type_path;
                 self.save_settings();
@@ -17120,6 +17147,7 @@ impl Window {
                 (cmd::FOLLOW_CD, s.follow_directory),
                 (cmd::VERIFY, s.verify_transfers),
                 (cmd::ZMODEM, s.zmodem),
+                (cmd::INLINE_IMAGES, s.inline_images),
                 (cmd::UPLOAD_TYPE_PATH, s.upload_type_path),
                 (cmd::PORT_PREVIEWS, s.port_previews),
                 (cmd::KITTY_KEYBOARD, s.kitty_keyboard),
