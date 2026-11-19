@@ -137,6 +137,9 @@ pub enum Action {
     Picker(Vec<String>),
     /// Tell the user, in the gateway pane.
     Notice(String),
+    /// These panes, made before their window was known to run a coding
+    /// agent, turn out to be one's: watch them as agent panes now.
+    AgentMarked(Vec<Native>),
     /// Other clients attached to the session keep a window smaller than
     /// the native panes (tmux sizes a window to its smallest client):
     /// offer to detach them. Asked once per attach.
@@ -886,7 +889,7 @@ impl Tmux {
                     )));
                     return;
                 };
-                self.agents.insert(w, name.clone());
+                self.mark_agent(w, name.clone(), out);
                 self.send(
                     &format!(
                         "set-option -w -t @{w} {AGENT_OPTION} {}",
@@ -1277,7 +1280,7 @@ impl Tmux {
             return;
         }
         if let Some(a) = lines.iter().find_map(|l| l.agent.clone()) {
-            self.agents.insert(w, a);
+            self.mark_agent(w, a, out);
         }
         let known = self.windows.contains_key(&w);
         if !known && self.windows.len() >= MAX_WINDOWS {
@@ -1603,6 +1606,24 @@ impl Tmux {
             }
         }
         out
+    }
+
+    /// Records that window `w` runs coding agent `name`. Panes of `w`
+    /// made before that was known are told of in an
+    /// [`Action::AgentMarked`], so they are watched as agent panes too.
+    fn mark_agent(&mut self, w: WindowId, name: String, out: &mut Vec<Action>) {
+        if self.agents.insert(w, name).is_some() {
+            return;
+        }
+        let natives: Vec<Native> = self
+            .panes
+            .values()
+            .filter(|p| p.window == w)
+            .map(|p| p.native)
+            .collect();
+        if !natives.is_empty() {
+            out.push(Action::AgentMarked(natives));
+        }
     }
 
     /// The coding agent native pane `native` runs, by its name, if its
@@ -2388,6 +2409,28 @@ mod tests {
             .unwrap();
         assert_eq!(t.agent_of(native), Some("claude"));
         assert_eq!(t.agent_of(a0), None);
+    }
+
+    #[test]
+    fn a_window_marked_later_turns_its_panes_into_agent_panes() {
+        let panes = [pane_line(0, 0, 80, 24, "b25f,80x24,0,0,0")];
+        let (mut t, mut ws, _) = attached(Some("ferossh"), None, &panes);
+        let a0 = t.native_of(0).unwrap();
+        // Replies 5 and 6 were the captures.
+        let mut input = reply(5, &[]);
+        input.extend(reply(6, &[]));
+        input.extend(b"%layout-change @0 x,80x24,0,0{40x24,0,0,0,39x24,41,0,1} x *\n");
+        let a = t.feed(&mut ws, &input);
+        assert_eq!(writes(&a).len(), 1, "asks for the window's panes");
+        let mut line = pane_line(0, 0, 80, 24, "b25f,80x24,0,0,0");
+        line.push_str(" claude");
+        let a = t.feed(&mut ws, &reply(7, &[line]));
+        assert!(
+            a.iter()
+                .any(|a| matches!(a, Action::AgentMarked(n) if n == &[a0])),
+            "{a:?}"
+        );
+        assert_eq!(t.agent_of(a0), Some("claude"));
     }
 
     #[test]
