@@ -3691,6 +3691,11 @@ impl Window {
                         others,
                     }));
                 }
+                tmux::Action::AgentMarked(natives) => {
+                    for native in natives {
+                        self.watch_agent(gateway, native);
+                    }
+                }
                 tmux::Action::Notice(text) => {
                     let text = crate::ssh::sanitize(&text);
                     self.show(gateway, &format!("\x1b[0;90m{text}\x1b[0m\r\n"));
@@ -9479,6 +9484,19 @@ impl Window {
         };
         let record = p.cast.is_none();
         p.log.enabled = true;
+        // An ordinary log opened before the pane was known to run an agent
+        // ends, and the agent's own log follows it.
+        let suffix = format!("-{agent}");
+        let ordinary = p.log.writer.is_some()
+            && !p
+                .log
+                .path
+                .as_deref()
+                .and_then(Path::file_name)
+                .is_some_and(|n| n.to_string_lossy().contains(&suffix));
+        if ordinary {
+            self.stop_log(id);
+        }
         self.start_log_as(id, Some(&agent));
         if record {
             let text = self.start_recording(id, Some(&agent));
