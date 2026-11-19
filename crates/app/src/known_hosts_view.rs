@@ -356,6 +356,20 @@ impl KnownHostsView {
 /// share, which Windows would log in to). `~` and `%d` are `home`.
 pub fn files_to_list(default: &Path, config: &str, home: &Path) -> Vec<PathBuf> {
     let mut files = vec![default.to_path_buf()];
+    files.extend(config_files(config, home));
+    // The final paths, `default` and expanded `~` included: none on
+    // another computer is ever opened (see `is_network_path`).
+    let mut out: Vec<PathBuf> = Vec::new();
+    for f in files {
+        if !ferossh_auth::keyfile::is_network_path(&f) && !out.contains(&f) {
+            out.push(f);
+        }
+    }
+    out
+}
+
+fn config_files(config: &str, home: &Path) -> Vec<PathBuf> {
+    let mut files = Vec::new();
     let home_text = home.display().to_string();
     for line in config.lines() {
         let line = line.trim();
@@ -381,10 +395,7 @@ pub fn files_to_list(default: &Path, config: &str, home: &Path) -> Vec<PathBuf> 
                 }
                 _ => PathBuf::from(&arg),
             };
-            let network = arg.starts_with("\\\\") || arg.starts_with("//");
-            if !network && !files.contains(&path) {
-                files.push(path);
-            }
+            files.push(path);
         }
     }
     files
@@ -629,6 +640,18 @@ mod tests {
                 PathBuf::from("/home/me/.ssh/kh_a"),
                 PathBuf::from("/keys/with space"),
             ]
+        );
+        // A home folder on a share: `~` paths there are not opened either,
+        // nor is the default file under it.
+        let unc_home = Path::new(r"\\server\home\me");
+        let unc_default = unc_home.join("known_hosts");
+        assert_eq!(
+            files_to_list(
+                &unc_default,
+                "UserKnownHostsFile ~/kh /local/kh\n",
+                unc_home
+            ),
+            vec![PathBuf::from("/local/kh")]
         );
     }
 }
