@@ -36,11 +36,15 @@ pub fn command() -> Vec<u8> {
         "t=$(git rev-parse --show-toplevel 2>/dev/null) || { echo @ferossh-diff norepo; exit 0; }"
             .to_owned(),
         "cd -- \"$t\" || exit 2".to_owned(),
-        "printf \"@ferossh-diff top %s\\n\" \"$t\"".to_owned(),
+        "printf \"@ferossh-diff top %s\\n\" \"$t\"; e=0".to_owned(),
+        // The commit is looked up once: one an agent makes meanwhile
+        // neither renames the heading nor moves what is compared.
         format!(
-            "if h=$(git log -1 --format=%h%x20%s 2>/dev/null); then \
-             printf \"@ferossh-diff head %s\\n\" \"$h\"; {git} diff {opts} -M HEAD --; \
-             else echo @ferossh-diff nohead; {git} diff {opts} --cached --; {git} diff {opts} --; fi"
+            "if c=$(git rev-parse -q --verify HEAD^{{commit}}); then \
+             h=$(git log -1 --format=%h%x20%s \"$c\" --) || e=1; \
+             printf \"@ferossh-diff head %s\\n\" \"$h\"; {git} diff {opts} -M \"$c\" -- || e=1; \
+             else echo @ferossh-diff nohead; {git} diff {opts} --cached -- || e=1; \
+             {git} diff {opts} -- || e=1; fi"
         ),
         // A name git had to quote (a line break or a quote in it) is left
         // out: it could not be read back here.
@@ -49,8 +53,11 @@ pub fn command() -> Vec<u8> {
              while IFS= read -r f; do case $f in \\\"*) continue;; esac; \
              [ -f \"$f\" ] || continue; \
              if [ \"$(wc -c < \"$f\")\" -gt {BIG} ]; then printf \"@ferossh-diff big %s\\n\" \"$f\"; \
-             else {git} diff {opts} --no-index -- /dev/null \"$f\"; fi; done"
+             else {git} diff {opts} --no-index -- /dev/null \"$f\"; \
+             [ $? -le 1 ] || echo @ferossh-diff failed; fi; done"
         ),
+        // git diff --no-index says 1 for "they differ"; more is an error.
+        "[ $e = 0 ] || echo @ferossh-diff failed".to_owned(),
         "exit 0".to_owned(),
     ]
     .join("; ");
@@ -89,6 +96,8 @@ pub struct Diff {
     /// before the first commit.
     pub head: Option<String>,
     pub files: Vec<File>,
+    /// A git command failed: what shows may be missing files.
+    pub failed: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -244,6 +253,7 @@ pub fn parse(out: &[u8]) -> Outcome {
                 "norepo" => return Outcome::NoRepo,
                 "top" => diff.top = clean(arg),
                 "head" => diff.head = Some(clean(arg)),
+                "failed" => diff.failed = true,
                 "big" => {
                     flush(&mut diff, &mut file);
                     let mut f = File::new(String::new(), clean(arg));
@@ -466,41 +476,45 @@ fn visible(c: char) -> char {
     }
 }
 
-/// One line of file text as shown: tabs to the next stop of [`TAB`],
-/// everything else made visible.
-fn expand(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    let mut col = 0;
-    for c in s.chars() {
-        if c == '\t' {
-            let n = TAB - col % TAB;
-            out.extend(std::iter::repeat_n(' ', n));
-            col += n;
-        } else {
-            let c = visible(c);
-            out.push(c);
-            col += c.width().unwrap_or(0);
-        }
-    }
-    out
-}
-
-/// `s` cut into pieces at most `width` columns wide (a character wider
-/// than that gets a piece of its own); at least one piece.
-fn wrap(s: &str, width: usize) -> Vec<(String, usize)> {
+/// One line of file text as shown, cut into pieces at most `width`
+/// columns wide (a character wider than that gets a piece of its own):
+/// tabs go to the next stop of [`TAB`], everything else is made
+/// visible. At least one piece and at most `most`; work stops there, so
+/// a huge line costs no more than what shows of it.
+fn wrap(s: &str, width: usize, most: usize) -> Vec<(String, usize)> {
     let width = width.max(1);
+    let most = most.max(1);
     let mut out = Vec::new();
-    let (mut piece, mut used) = (String::new(), 0);
-    for c in s.chars() {
-        let w = c.width().unwrap_or(0);
+    let (mut piece, mut used, mut col) = (String::new(), 0, 0);
+    let mut push = |c: char, w: usize, out: &mut Vec<(String, usize)>| {
         if used + w > width && used > 0 {
             out.push((std::mem::take(&mut piece), used));
             used = 0;
         }
-        piece.push(c);
-        used += w;
+        if out.len() < most {
+            piece.push(c);
+            used += w;
+        }
+    };
+    for c in s.chars() {
+        if out.len() >= most {
+            break;
+        }
+        if c == '\t' {
+            for _ in 0..TAB - col % TAB {
+                push(' ', 1, &mut out);
+            }
+            col += TAB - col % TAB;
+        } else {
+            let c = visible(c);
+            let w = c.width().unwrap_or(0);
+            push(c, w, &mut out);
+            col += w;
+        }
     }
-    out.push((piece, used));
+    if out.len() < most {
+        out.push((piece, used));
+    }
     out
 }
 
@@ -549,7 +563,9 @@ const RESET: &str = "\x1b[0m";
 
 /// Lays `diff` out `cols` columns wide: a summary, then each file with
 /// its lines side by side (stacked when the pane is narrow).
-pub fn render(diff: &Diff, cols: usize, look: &Look, partial: bool) -> Rendered {
+/// `notes` are shown in amber under the summary (why only part may
+/// show).
+pub fn render(diff: &Diff, cols: usize, look: &Look, notes: &[String]) -> Rendered {
     let cols = cols.max(20);
     let mut out: Vec<String> = Vec::new();
     let mut files = Vec::new();
@@ -579,18 +595,14 @@ pub fn render(diff: &Diff, cols: usize, look: &Look, partial: bool) -> Rendered 
         )
         .0
     ));
-    if partial {
-        out.push(format!(
-            "\x1b[0;33m{}{RESET}",
-            fit(
-                "Only part of the changes: there was too much to show.",
-                cols
-            )
-            .0
-        ));
+    let failed = diff
+        .failed
+        .then(|| "git reported an error, so files may be missing here.".to_owned());
+    for note in notes.iter().chain(&failed) {
+        out.push(format!("\x1b[0;33m{}{RESET}", fit(note, cols).0));
     }
     out.push(String::new());
-    if diff.files.is_empty() {
+    if diff.files.is_empty() && notes.is_empty() && !diff.failed {
         out.push("No changes: the files are as in the last commit.".to_owned());
     }
     for f in &diff.files {
@@ -644,7 +656,8 @@ pub fn render(diff: &Diff, cols: usize, look: &Look, partial: bool) -> Rendered 
             );
             out.push(format!("{DIM}{}{RESET}", fit(&at, cols).0));
             for r in &h.rows {
-                row(&mut out, r, cols, nw, look);
+                let budget = MAX_ROWS.saturating_sub(out.len());
+                row(&mut out, r, cols, nw, look, budget);
                 if out.len() >= MAX_ROWS {
                     out.push(format!(
                         "\x1b[0;33m{}{RESET}",
@@ -667,17 +680,20 @@ pub fn render(diff: &Diff, cols: usize, look: &Look, partial: bool) -> Rendered 
 
 /// One row, side by side when there is room: `nw` columns of line
 /// number, a space, the text; a bar between the two sides.
-fn row(out: &mut Vec<String>, r: &Row, cols: usize, nw: usize, look: &Look) {
+/// At most `budget` rows; a longer line is cut there.
+fn row(out: &mut Vec<String>, r: &Row, cols: usize, nw: usize, look: &Look, budget: usize) {
     let bg = |rgb: [u8; 3]| format!("\x1b[48;2;{};{};{}m", rgb[0], rgb[1], rgb[2]);
     let half = (cols - 1) / 2;
     let side_text = half.saturating_sub(nw + 1);
     if side_text < 12 {
         // Too narrow: the old line above the new one, a whole row each.
+        let start = out.len();
         let tw = cols.saturating_sub(nw + 2).max(1);
         let one =
             |out: &mut Vec<String>, side: &(usize, String), mark: char, colour: Option<[u8; 3]>| {
                 let colour = colour.map(bg).unwrap_or_default();
-                for (k, (piece, used)) in wrap(&expand(&side.1), tw).into_iter().enumerate() {
+                let room = budget.saturating_sub(out.len() - start);
+                for (k, (piece, used)) in wrap(&side.1, tw, room).into_iter().enumerate() {
                     let num = if k == 0 {
                         side.0.to_string()
                     } else {
@@ -705,7 +721,7 @@ fn row(out: &mut Vec<String>, r: &Row, cols: usize, nw: usize, look: &Look) {
     }
     let right_text = (cols - 1 - half).saturating_sub(nw + 1);
     let cells = |side: &Option<(usize, String)>, width: usize| match side {
-        Some((n, t)) => (Some(*n), wrap(&expand(t), width)),
+        Some((n, t)) => (Some(*n), wrap(t, width, budget)),
         None => (None, Vec::new()),
     };
     let (ln, lp) = cells(&r.left, side_text);
@@ -910,7 +926,7 @@ mod tests {
         let out = "@ferossh-diff top /r\x1b]0;evil\x07\n\
 diff --git a/x b/x\n--- a/x\n+++ b/x\n@@ -1 +1 @@\n-\x1b[2Jold\n+\u{202e}new\u{9b}1m\n";
         let d = changes(out);
-        let r = render(&d, 100, &LOOK, false);
+        let r = render(&d, 100, &LOOK, &[]);
         // The only escapes are FeroSSH's own colours: CSI ... m.
         for (i, _) in r.text.match_indices('\x1b') {
             let rest = &r.text[i + 1..];
@@ -933,14 +949,14 @@ diff --git a/x b/x\n--- a/x\n+++ b/x\n@@ -1 +1 @@\n-\x1b[2Jold\n+\u{202e}new\u{9
         );
         let d = changes(&out);
         for cols in [20, 33, 60, 80, 81, 200] {
-            let r = render(&d, cols, &LOOK, true);
+            let r = render(&d, cols, &LOOK, &["Only part shows.".to_owned()]);
             for line in r.text.split("\r\n") {
                 let w: usize = plain(line).chars().map(|c| c.width().unwrap_or(0)).sum();
                 assert!(w <= cols, "{cols}: {w} {line:?}");
             }
         }
         // Long lines wrap rather than being cut: all 300 x's are shown.
-        let r = render(&d, 100, &LOOK, false);
+        let r = render(&d, 100, &LOOK, &[]);
         assert_eq!(plain(&r.text).matches('z').count(), 300);
         assert!(plain(&r.text).contains("    Tab"));
     }
@@ -948,7 +964,7 @@ diff --git a/x b/x\n--- a/x\n+++ b/x\n@@ -1 +1 @@\n-\x1b[2Jold\n+\u{202e}new\u{9
     #[test]
     fn file_headings_are_where_n_and_p_go() {
         let d = changes(SAMPLE);
-        let r = render(&d, 120, &LOOK, false);
+        let r = render(&d, 120, &LOOK, &[]);
         let lines: Vec<_> = r.text.split("\r\n").collect();
         assert_eq!(r.files.len(), d.files.len());
         assert!(plain(lines[r.files[0]]).contains("src/main.rs"));
@@ -1039,6 +1055,8 @@ diff --git a/x b/x\n--- a/x\n+++ b/x\n@@ -1 +1 @@\n-\x1b[2Jold\n+\u{202e}new\u{9
             panic!()
         };
         assert!(d.top.ends_with("my repo's"), "{}", d.top);
+        // The untracked files' "they differ" (status 1) is no failure.
+        assert!(!d.failed);
         assert!(d.head.as_deref().unwrap().ends_with(" first"));
         let names: Vec<_> = d.files.iter().map(|f| (f.name(), f.kind)).collect();
         assert_eq!(
@@ -1058,9 +1076,34 @@ diff --git a/x b/x\n--- a/x\n+++ b/x\n@@ -1 +1 @@\n-\x1b[2Jold\n+\u{202e}new\u{9
     }
 
     #[test]
+    fn a_failed_git_is_never_no_changes() {
+        let d =
+            changes("@ferossh-diff top /r\n@ferossh-diff head abc Init\n@ferossh-diff failed\n");
+        assert!(d.failed);
+        let text = plain(&render(&d, 80, &LOOK, &[]).text);
+        assert!(text.contains("git reported an error"));
+        assert!(!text.contains("No changes"));
+    }
+
+    #[test]
+    fn a_huge_line_stops_at_the_row_limit() {
+        let tabs = "\t".repeat(2_000_000);
+        let out = format!(
+            "@ferossh-diff top /r\ndiff --git a/a b/a\n--- a/a\n+++ b/a\n@@ -1 +1 @@\n-x\n+{tabs}\n"
+        );
+        let d = changes(&out);
+        let r = render(&d, 20, &LOOK, &[]);
+        let rows = r.text.split("\r\n").count();
+        assert!(rows <= MAX_ROWS + 2, "{rows}");
+        assert!(plain(&r.text).contains("FeroSSH shows"));
+        assert_eq!(wrap(&tabs, 10, 3).len(), 3);
+        assert_eq!(wrap("", 10, 3), [(String::new(), 0)]);
+    }
+
+    #[test]
     fn no_changes_says_so() {
         let d = changes("@ferossh-diff top /r\n@ferossh-diff head abc Init\n");
-        let r = render(&d, 80, &LOOK, false);
+        let r = render(&d, 80, &LOOK, &[]);
         assert!(plain(&r.text).contains("No changes"));
         assert!(r.files.is_empty());
     }

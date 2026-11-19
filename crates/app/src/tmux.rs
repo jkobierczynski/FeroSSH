@@ -934,7 +934,12 @@ impl Tmux {
                 }
             }
             Tag::DiffDirHere(native) => {
-                let dir = first();
+                // Spaces are part of a folder's name: only the line end
+                // goes.
+                let dir = lines
+                    .first()
+                    .map(|l| String::from_utf8_lossy(l).into_owned())
+                    .unwrap_or_default();
                 let dir = dir.trim_end_matches(['\r', '\n']);
                 if ok && !dir.is_empty() {
                     out.push(Action::DiffDir {
@@ -2399,13 +2404,13 @@ mod tests {
         // 11 and 12 were the new windows above.
         let mut input = reply(11, &[]);
         input.extend(reply(12, &[]));
-        input.extend(reply(13, &["/home/me/app".into()]));
+        input.extend(reply(13, &["/home/me/app ".into()]));
         input.extend(reply(14, &[]));
         let a = t.feed(&mut ws, &input);
         assert!(
             a.contains(&Action::DiffDir {
                 native: a0,
-                dir: "/home/me/app".into()
+                dir: "/home/me/app ".into()
             }),
             "{a:?}"
         );

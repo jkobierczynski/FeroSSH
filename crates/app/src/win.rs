@@ -788,6 +788,11 @@ struct DiffTab {
     status: Option<u32>,
     /// There was more than [`crate::diff::KEEP`]: only part shows.
     partial: bool,
+    /// The run ended before git did (the connection dropped): why.
+    interrupted: Option<String>,
+    /// The pane it was opened from: after that pane reconnects, r runs
+    /// git over its new connection.
+    from: PaneId,
     outcome: Option<crate::diff::Outcome>,
     /// The line each file's heading is on, as last laid out.
     files: Vec<usize>,
@@ -9518,6 +9523,8 @@ impl Window {
                 err: Vec::new(),
                 status: None,
                 partial: false,
+                interrupted: None,
+                from,
                 outcome: None,
                 files: Vec::new(),
             }));
@@ -9542,17 +9549,29 @@ impl Window {
     fn run_diff(&mut self, id: PaneId) {
         self.stop_diff(id);
         let channel = self.new_channel();
+        // The connection it came from, or the one the pane it was opened
+        // from has now (after a reconnect).
+        let from = match self.panes.get(&id).map(|p| &p.host) {
+            Some(Host::Diff(d)) if !self.workers.contains_key(&d.connection) => {
+                self.pane_connection(d.from)
+            }
+            _ => None,
+        };
         let Some(Host::Diff(d)) = self.panes.get_mut(&id).map(|p| &mut p.host) else {
             return;
         };
+        if let Some(c) = from {
+            d.connection = c;
+        }
         let (Some(w), Some(input)) = (self.workers.get(&d.connection), crate::diff::input(&d.dir))
         else {
             let label = crate::ssh::sanitize(&d.label);
             self.show(
                 id,
                 &format!(
-                    "\r\n\x1b[0;31mThe connection to {label} is closed: reconnect, then press r \
-                     here.\x1b[0m"
+                    "\r\n\x1b[0;31mThe connection to {label} is closed. Reconnect the pane this \
+                     was opened from, then press r here; or open it again from a pane logged in \
+                     there.\x1b[0m"
                 ),
             );
             self.refresh(id);
@@ -9574,6 +9593,7 @@ impl Window {
         d.err.clear();
         d.status = None;
         d.partial = false;
+        d.interrupted = None;
         let first = d.outcome.is_none();
         let dir = crate::diff::clean(&String::from_utf8_lossy(&d.dir));
         let label = crate::diff::clean(&d.label);
@@ -9637,7 +9657,13 @@ impl Window {
                 d.status = Some(code);
                 false
             }
-            Message::Disconnected { .. } => true,
+            Message::Disconnected { reason, .. } => {
+                // git's exit status comes first when it ran to its end.
+                if d.status.is_none() && !d.partial {
+                    d.interrupted = Some(reason);
+                }
+                true
+            }
             _ => false,
         };
         if !done {
@@ -9682,6 +9708,14 @@ impl Window {
             Some(crate::diff::Outcome::NoRepo) => say(&format!(
                 "{dir} is not in a git repository, so there is nothing to compare with."
             )),
+            Some(crate::diff::Outcome::Changes(diff))
+                if diff.top.is_empty() && d.interrupted.is_some() =>
+            {
+                say(&format!(
+                    "The connection dropped before git answered ({}). Press r to try again.",
+                    d.interrupted.as_deref().unwrap_or("")
+                ))
+            }
             Some(crate::diff::Outcome::Changes(diff)) if diff.top.is_empty() => {
                 let err = String::from_utf8_lossy(&d.err);
                 let why = err
@@ -9699,7 +9733,17 @@ impl Window {
                 ))
             }
             Some(crate::diff::Outcome::Changes(diff)) => {
-                let r = crate::diff::render(diff, cols, &look, d.partial);
+                let mut notes = Vec::new();
+                if d.partial {
+                    notes.push("Only part of the changes: there was too much to show.".to_owned());
+                }
+                if let Some(why) = &d.interrupted {
+                    notes.push(format!(
+                        "git stopped before it finished ({}), so files may be missing here.",
+                        crate::diff::clean(why)
+                    ));
+                }
+                let r = crate::diff::render(diff, cols, &look, &notes);
                 d.files = r.files;
                 r.text
             }
