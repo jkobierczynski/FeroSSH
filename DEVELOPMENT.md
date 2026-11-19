@@ -4,7 +4,7 @@ This file records how FeroSSH was built. It covers the roadmap milestones that l
 
 > **Kept up to date with each release.** The pull request that bumps the version and adds a new tag's release notes also adds that release here: a row in [Releases at a glance](#releases-at-a-glance), a row under [Releases](#releases) listing the pull requests it covers, and a line under the matching area in [After 1.0, by area](#after-10-by-area) for anything new. See [Updating this file](#updating-this-file).
 
-Dates are the day a pull request was merged, in Central European time. Pull request numbers link to GitHub. Last updated for **v1.4.2** (17 November 2026).
+Dates are the day a pull request was merged, in Central European time. Pull request numbers link to GitHub. Last updated for **v1.5.0** (19 November 2026).
 
 ## Contents
 
@@ -34,6 +34,7 @@ Dates are the day a pull request was merged, in Central European time. Pull requ
 | [v1.4.0](docs/releases/v1.4.0.md) | 2026-11-12 | Mosh, WinRM, SFTP-only, proxies, Kerberos, agent forwarding, workspaces, vault, recordings, ARM64 |
 | [v1.4.1](docs/releases/v1.4.1.md) | 2026-11-15 | Built-in script library, Ctrl+E/Ctrl+F suggestion keys, standby focus fix |
 | [v1.4.2](docs/releases/v1.4.2.md) | 2026-11-17 | Security release closing the findings of a full code base audit |
+| [v1.5.0](docs/releases/v1.5.0.md) | 2026-11-19 | Coding agents on remote hosts, images in the terminal, tinted window colours and custom themes |
 
 ## How FeroSSH is built
 
@@ -175,7 +176,7 @@ After milestone 7, the maintainer asked which features network engineers and pen
 - **Mosh** connections [#182](https://github.com/jkobierczynski/FeroSSH/pull/182), about 115 KB of exe. The first version's screen code had been translated closely from mosh's GPL-3 source, which doesn't fit FeroSSH's licence. It was found before any release and rewritten from scratch [#183](https://github.com/jkobierczynski/FeroSSH/pull/183). Local echo for slow links followed [#190](https://github.com/jkobierczynski/FeroSSH/pull/190).
 - SFTP-only connections for accounts without a shell [#184](https://github.com/jkobierczynski/FeroSSH/pull/184), and SOCKS 5 and HTTP proxies for the connection itself, about 10 to 25 KB [#186](https://github.com/jkobierczynski/FeroSSH/pull/186).
 - **WinRM** sessions (PowerShell or cmd over WS-Management, in line mode, about 100 to 150 KB) [#185](https://github.com/jkobierczynski/FeroSSH/pull/185), with password sources and HTTPS [#188](https://github.com/jkobierczynski/FeroSSH/pull/188). Full PowerShell Remoting was left out as two to three times larger.
-- Workspaces: save tabs and split panes and open them again [#196](https://github.com/jkobierczynski/FeroSSH/pull/196). A workspace is a small layout file that points to saved connections.
+- Workspaces: save tabs and split panes and open them again [#196](https://github.com/jkobierczynski/FeroSSH/pull/196). A workspace is a small layout file that points to saved connections. Logging in automatically, a script or command per pane and reopening the last layout at start followed [#231](https://github.com/jkobierczynski/FeroSSH/pull/231). A pane's lines run only after this PC has approved them, and a changed script asks again, because a workspace file can come from someone else.
 - Encrypted connection export and import, a master password vault, and portable mode [#195](https://github.com/jkobierczynski/FeroSSH/pull/195). These were the two most requested features missing compared with Termius, Tabby, Royal TS, SecureCRT and MobaXterm. Sync goes through a file the user keeps in OneDrive or git, with no FeroSSH cloud. Portable mode keeps everything in a `FeroSSH-data` folder next to the exe, for example on a USB stick.
 
 ### Terminal and tmux
@@ -189,6 +190,8 @@ After milestone 7, the maintainer asked which features network engineers and pen
 - An empty band at the bottom of the terminal came from an old tmux client left behind by a reconnect, which kept the window small. FeroSSH now offers to detach other clients [#206](https://github.com/jkobierczynski/FeroSSH/pull/206).
 - Hide a pane without closing it, so it stays listed in the Session manager [#208](https://github.com/jkobierczynski/FeroSSH/pull/208).
 - Full screen on F11 [#176](https://github.com/jkobierczynski/FeroSSH/pull/176).
+- Desktop notifications when a pane wants attention: OSC 9, 777 and 99, the bell, or quiet after work [#232](https://github.com/jkobierczynski/FeroSSH/pull/232). They are notification-area balloons rather than Windows toasts, because toasts need an installed app identity and FeroSSH is one portable exe.
+- **Images in the terminal**: Sixel, the kitty graphics protocol and iTerm2 inline images [#240](https://github.com/jkobierczynski/FeroSSH/pull/240), with fixes from a second review [#243](https://github.com/jkobierczynski/FeroSSH/pull/243). FeroSSH has its own small decoders in a new crate with no `unsafe` instead of an image library, to keep the exe small, and it is off by default because every picture is host data to decode. A host can never make it read a local file.
 
 ### Windows, menus and looks
 
@@ -199,7 +202,19 @@ After milestone 7, the maintainer asked which features network engineers and pen
 - Window colours: dark menus, title bar and tools pane, because the bright Windows UI was painful next to a dark terminal [#157](https://github.com/jkobierczynski/FeroSSH/pull/157), and neutral greys [#204](https://github.com/jkobierczynski/FeroSSH/pull/204). The mockups' look (Nord, Cascadia Mono, light window colours) became the default.
 - A native command palette and configurable key bindings, each with a reset to its default [#199](https://github.com/jkobierczynski/FeroSSH/pull/199), [#201](https://github.com/jkobierczynski/FeroSSH/pull/201), and a native Import connections page [#197](https://github.com/jkobierczynski/FeroSSH/pull/197). After these, no drawn panes are left. Prompts inside the terminal, the Find bar and the tab strip stay drawn on purpose.
 - Tidier menus with Session submenus, Recent connections and greyed items [#205](https://github.com/jkobierczynski/FeroSSH/pull/205). This came from an outside proposal, checked against the real menus. A View menu and menu icons were left out.
+- Eight tinted window colours, live preview of themes and window colours from the menus, custom `.theme` files, and menus drawn in the menu bar's colours [#241](https://github.com/jkobierczynski/FeroSSH/pull/241). Fonts are not previewed, at the maintainer's choice, because a new text size resizes the remote terminal. Menus lost their names when the colours were switched back off, found on Windows the same day [#244](https://github.com/jkobierczynski/FeroSSH/pull/244).
 - Native Windows ARM64 exes, checked on a real ARM64 runner with the sandbox working [#194](https://github.com/jkobierczynski/FeroSSH/pull/194).
+
+### Coding agents
+
+The maintainer asked what would make FeroSSH good for coding agents such as Claude Code, Codex and aider running on remote hosts. A plan of six features came first ([docs/plans/coding-agents.md](docs/plans/coding-agents.md)), and the maintainer asked for all six, then an agent dashboard, answers from the notification and a diff viewer. Everything is off by default, and nothing new runs in the sandboxed worker: commands are typed at the shell or sent to tmux, as tmux integration already did.
+
+- Attention alerts and quiet watches [#232](https://github.com/jkobierczynski/FeroSSH/pull/232), then agents started in tmux so they outlive a dropped connection, listed in the Session manager [#233](https://github.com/jkobierczynski/FeroSSH/pull/233).
+- Pasted screenshots and dropped files uploaded to the host with their paths typed for the agent [#234](https://github.com/jkobierczynski/FeroSSH/pull/234), and an offer to forward and open a web server seen in the output, one click per forward [#235](https://github.com/jkobierczynski/FeroSSH/pull/235).
+- The kitty keyboard protocol (level 1 only) and Shift+Enter as a new line [#236](https://github.com/jkobierczynski/FeroSSH/pull/236). tmux doesn't pass the kitty protocol on, so Shift+Enter has its own setting.
+- The Production guard covers starting agents and pasting into their panes, and an optional sealed audit trail of every agent pane [#237](https://github.com/jkobierczynski/FeroSSH/pull/237).
+- An agent dashboard in the Session manager, waiting agents first, with each agent's last line read from its screen [#238](https://github.com/jkobierczynski/FeroSSH/pull/238), and yes-or-no answers from the notification [#239](https://github.com/jkobierczynski/FeroSSH/pull/239). Notification balloons have no buttons, so the click opens a dialog, and the answer is typed only if the same question is still showing.
+- A side-by-side git diff of what an agent changed, in a tab [#242](https://github.com/jkobierczynski/FeroSSH/pull/242). Git runs from a fixed script on its own channel, the folder goes in on stdin, and the output is shown as plain text only.
 
 ### Scripts (formerly snippets)
 
@@ -215,6 +230,7 @@ After milestone 7, the maintainer asked which features network engineers and pen
 - **Native two-list file transfer** with arrow buttons and drag and drop [#150](https://github.com/jkobierczynski/FeroSSH/pull/150), named bookmarks, synchronized browsing (as in WinSCP) and saved folders per connection [#154](https://github.com/jkobierczynski/FeroSSH/pull/154), with the arrows kept centred in the visible part [#164](https://github.com/jkobierczynski/FeroSSH/pull/164). Bookmarks that didn't always open and a missing Refresh button were found on Windows [#159](https://github.com/jkobierczynski/FeroSSH/pull/159).
 - A resume integrity check [#158](https://github.com/jkobierczynski/FeroSSH/pull/158), and file names kept off the remote checksum command line [#165](https://github.com/jkobierczynski/FeroSSH/pull/165), [#166](https://github.com/jkobierczynski/FeroSSH/pull/166).
 - Sorting by name, size or date modified, and deleting local files to the Recycle Bin rather than for good [#202](https://github.com/jkobierczynski/FeroSSH/pull/202).
+- Drag remote files and folders out to Explorer [#230](https://github.com/jkobierczynski/FeroSSH/pull/230). The drag offers empty stand-ins in a temporary folder that the normal queue fills on release, rather than streaming file contents to Explorer, so Mark of the Web is kept, folders work and the window never blocks on a COM stream.
 
 ### Logs and recordings
 
@@ -235,6 +251,7 @@ The maintainer asked whether a single remote app could appear as a local window.
 - The fuzzing nightly is pinned to a known-good toolchain [#95](https://github.com/jkobierczynski/FeroSSH/pull/95).
 - New fuzz targets for agent forwarding, Mosh start-up, remote names and command history [#200](https://github.com/jkobierczynski/FeroSSH/pull/200), [#203](https://github.com/jkobierczynski/FeroSSH/pull/203). A 6-hour campaign on them found no FeroSSH bugs. Its 66 crashes came from a mistake in the new test.
 - Viewer tests take turns on the shared Xvnc [#153](https://github.com/jkobierczynski/FeroSSH/pull/153).
+- Fuzz targets for the picture decoders and the terminal with pictures on [#240](https://github.com/jkobierczynski/FeroSSH/pull/240).
 
 ### CI, builds and releases
 
@@ -246,7 +263,7 @@ The maintainer asked whether a single remote app could appear as a local window.
 
 ### Documentation
 
-- README and SECURITY.md for 1.0 [#89](https://github.com/jkobierczynski/FeroSSH/pull/89), a user guide that covers every feature, menu by menu [#102](https://github.com/jkobierczynski/FeroSSH/pull/102), the README regrouped by feature with FeroStream agent build docs [#207](https://github.com/jkobierczynski/FeroSSH/pull/207), and five new screenshots [#209](https://github.com/jkobierczynski/FeroSSH/pull/209).
+- README and SECURITY.md for 1.0 [#89](https://github.com/jkobierczynski/FeroSSH/pull/89), a user guide that covers every feature, menu by menu [#102](https://github.com/jkobierczynski/FeroSSH/pull/102), the README regrouped by feature with FeroStream agent build docs [#207](https://github.com/jkobierczynski/FeroSSH/pull/207), and five new screenshots [#209](https://github.com/jkobierczynski/FeroSSH/pull/209). This development history was added at the maintainer's request [#229](https://github.com/jkobierczynski/FeroSSH/pull/229) and is kept current with each release.
 
 ## Security reviews and hardening
 
@@ -288,7 +305,7 @@ A fresh audit of the whole code base led to the v1.4.2 security release. Its [re
 
 CI runs on Windows, but nothing in it clicks through the UI. Trying each build on a real PC found bugs that no test caught, and settled several questions:
 
-- **Fixed after trying a build:** stray mouse reports after reattaching tmux and leaving htop [#12](https://github.com/jkobierczynski/FeroSSH/pull/12), a forwards panel that lost its pane when typed into [#13](https://github.com/jkobierczynski/FeroSSH/pull/13), hidden bottom rows [#18](https://github.com/jkobierczynski/FeroSSH/pull/18), a stale tab title after Midnight Commander [#23](https://github.com/jkobierczynski/FeroSSH/pull/23), a multi-host run that never typed its command [#76](https://github.com/jkobierczynski/FeroSSH/pull/76), Open local shell ending the pane's tmux session [#77](https://github.com/jkobierczynski/FeroSSH/pull/77), tmux "off" read as a session name [#109](https://github.com/jkobierczynski/FeroSSH/pull/109), tmux keys that didn't repeat [#107](https://github.com/jkobierczynski/FeroSSH/pull/107), a Bookmarks button that didn't always open [#159](https://github.com/jkobierczynski/FeroSSH/pull/159), renaming that stopped after one character [#177](https://github.com/jkobierczynski/FeroSSH/pull/177), and the empty band from an old tmux client [#206](https://github.com/jkobierczynski/FeroSSH/pull/206).
+- **Fixed after trying a build:** stray mouse reports after reattaching tmux and leaving htop [#12](https://github.com/jkobierczynski/FeroSSH/pull/12), a forwards panel that lost its pane when typed into [#13](https://github.com/jkobierczynski/FeroSSH/pull/13), hidden bottom rows [#18](https://github.com/jkobierczynski/FeroSSH/pull/18), a stale tab title after Midnight Commander [#23](https://github.com/jkobierczynski/FeroSSH/pull/23), a multi-host run that never typed its command [#76](https://github.com/jkobierczynski/FeroSSH/pull/76), Open local shell ending the pane's tmux session [#77](https://github.com/jkobierczynski/FeroSSH/pull/77), tmux "off" read as a session name [#109](https://github.com/jkobierczynski/FeroSSH/pull/109), tmux keys that didn't repeat [#107](https://github.com/jkobierczynski/FeroSSH/pull/107), a Bookmarks button that didn't always open [#159](https://github.com/jkobierczynski/FeroSSH/pull/159), renaming that stopped after one character [#177](https://github.com/jkobierczynski/FeroSSH/pull/177), the empty band from an old tmux client [#206](https://github.com/jkobierczynski/FeroSSH/pull/206), and menus without names after switching window colours off [#244](https://github.com/jkobierczynski/FeroSSH/pull/244).
 - **Not FeroSSH bugs:**
   - "A" and "B" lines on arrow keys in vim come from Debian's `vim.tiny`, which runs in vi-compatible mode. `set nocompatible` or the full vim fixes it.
   - Selecting text with the mouse entering visual mode is full vim's `mouse=a`. Shift+drag selects locally.
@@ -315,6 +332,7 @@ Each release's notes are in [docs/releases](docs/releases). The pull requests ea
 | [v1.4.0](docs/releases/v1.4.0.md) | 2026-11-12 | [#176](https://github.com/jkobierczynski/FeroSSH/pull/176) to [#209](https://github.com/jkobierczynski/FeroSSH/pull/209) (notes [#207](https://github.com/jkobierczynski/FeroSSH/pull/207)) |
 | [v1.4.1](docs/releases/v1.4.1.md) | 2026-11-15 | [#210](https://github.com/jkobierczynski/FeroSSH/pull/210) to [#214](https://github.com/jkobierczynski/FeroSSH/pull/214) (notes [#214](https://github.com/jkobierczynski/FeroSSH/pull/214)) |
 | [v1.4.2](docs/releases/v1.4.2.md) | 2026-11-17 | [#215](https://github.com/jkobierczynski/FeroSSH/pull/215) to [#228](https://github.com/jkobierczynski/FeroSSH/pull/228) (notes [#228](https://github.com/jkobierczynski/FeroSSH/pull/228)) |
+| [v1.5.0](docs/releases/v1.5.0.md) | 2026-11-19 | [#229](https://github.com/jkobierczynski/FeroSSH/pull/229) to [#245](https://github.com/jkobierczynski/FeroSSH/pull/245) (notes [#245](https://github.com/jkobierczynski/FeroSSH/pull/245)) |
 
 How a release is made: a pull request bumps the version in `Cargo.toml`, adds `docs/releases/<tag>.md` and updates this file. After it merges, the maintainer tags the merge commit with git. [`release.yml`](.github/workflows/release.yml) then builds and attests the exes, and `scripts/sign-release.ps1 -Tag <tag>` signs and publishes them. See [Checks and releases](README.md#checks-and-releases) in the README.
 
