@@ -682,7 +682,15 @@ fn commit(tmp: &Path, path: &Path, existed: bool) -> io::Result<()> {
             None,
         )
     }
-    .map_err(|e| io::Error::other(format!("{}: {e}", path.display())))
+    .or_else(|e| {
+        // ERROR_UNABLE_TO_MOVE_REPLACEMENT: the old file is gone but the
+        // new one is still at its temporary name; move it into place
+        // rather than leave no known_hosts at all.
+        if e.code() == windows::core::HRESULT::from_win32(1176) {
+            return fs::rename(tmp, path);
+        }
+        Err(io::Error::other(format!("{}: {e}", path.display())))
+    })
 }
 
 #[cfg(not(windows))]
