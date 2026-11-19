@@ -790,8 +790,8 @@ struct DiffTab {
     partial: bool,
     /// The run ended before git did (the connection dropped): why.
     interrupted: Option<String>,
-    /// The pane it was opened from: after that pane reconnects, r runs
-    /// git over its new connection.
+    /// The pane it was opened from (for a tmux pane, its gateway): after
+    /// that pane reconnects, r runs git over its new connection.
     from: PaneId,
     outcome: Option<crate::diff::Outcome>,
     /// The line each file's heading is on, as last laid out.
@@ -9491,6 +9491,9 @@ impl Window {
     /// Opens a tab showing what changed in the git repository folder `dir`
     /// is in, on pane `from`'s connection, and starts git there.
     fn open_diff(&mut self, from: PaneId, dir: Vec<u8>) -> Option<Command> {
+        // A tmux pane gets a new id when its gateway reconnects; the
+        // gateway keeps its own, so r follows that one.
+        let source = self.host_pane(from);
         let Some(connection) = self.pane_connection(from) else {
             return Some(Command::Notice(DIFF_HOW.into()));
         };
@@ -9524,7 +9527,7 @@ impl Window {
                 status: None,
                 partial: false,
                 interrupted: None,
-                from,
+                from: source,
                 outcome: None,
                 files: Vec::new(),
             }));

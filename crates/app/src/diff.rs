@@ -48,8 +48,10 @@ pub fn command() -> Vec<u8> {
         ),
         // A name git had to quote (a line break or a quote in it) is left
         // out: it could not be read back here.
+        // The list is read first so that a failing ls-files counts.
         format!(
-            "{git} ls-files --others --exclude-standard | head -n {UNTRACKED} | \
+            "u=$({git} ls-files --others --exclude-standard) || {{ u=; e=1; }}; \
+             [ -z \"$u\" ] || printf \"%s\\n\" \"$u\" | head -n {UNTRACKED} | \
              while IFS= read -r f; do case $f in \\\"*) continue;; esac; \
              [ -f \"$f\" ] || continue; \
              if [ \"$(wc -c < \"$f\")\" -gt {BIG} ]; then printf \"@ferossh-diff big %s\\n\" \"$f\"; \
@@ -1014,8 +1016,21 @@ diff --git a/x b/x\n--- a/x\n+++ b/x\n@@ -1 +1 @@\n-\x1b[2Jold\n+\u{202e}new\u{9
     /// Runs the command as a login shell would, in a scratch repository.
     #[cfg(unix)]
     fn run(dir: &std::path::Path) -> Outcome {
+        run_with(dir, None)
+    }
+
+    /// Runs the script with `bin` first on the PATH.
+    #[cfg(unix)]
+    fn run_with(dir: &std::path::Path, bin: Option<&std::path::Path>) -> Outcome {
         use std::io::Write;
-        let mut child = std::process::Command::new("sh")
+        let mut sh = std::process::Command::new("sh");
+        if let Some(bin) = bin {
+            let path = std::env::var_os("PATH").unwrap_or_default();
+            let mut dirs = vec![bin.to_path_buf()];
+            dirs.extend(std::env::split_paths(&path));
+            sh.env("PATH", std::env::join_paths(dirs).unwrap());
+        }
+        let mut child = sh
             .arg("-c")
             .arg(String::from_utf8(command()).unwrap())
             .stdin(std::process::Stdio::piped())
@@ -1097,6 +1112,37 @@ diff --git a/x b/x\n--- a/x\n+++ b/x\n@@ -1 +1 @@\n-\x1b[2Jold\n+\u{202e}new\u{9
             d.files[2].hunks[0].rows[0].right,
             Some((1, "hello".to_owned()))
         );
+        // A git whose ls-files fails: the tab says files may be missing,
+        // never "No changes".
+        git(&["add", "-A"]);
+        git(&["commit", "-q", "-m", "second"]);
+        let real = std::process::Command::new("sh")
+            .args(["-c", "command -v git"])
+            .output()
+            .unwrap()
+            .stdout;
+        let real = String::from_utf8(real).unwrap().trim().to_owned();
+        let bin = tmp.join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let fake = bin.join("git");
+        std::fs::write(
+            &fake,
+            format!(
+                "#!/bin/sh\nfor a; do [ \"$a\" = ls-files ] && exit 128; done\nexec '{real}' \"$@\"\n"
+            ),
+        )
+        .unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let Outcome::Changes(d) = run(&repo) else {
+            panic!()
+        };
+        assert!(!d.failed && d.files.is_empty());
+        let Outcome::Changes(d) = run_with(&repo, Some(&bin)) else {
+            panic!()
+        };
+        assert!(d.failed);
+        assert!(!plain(&render(&d, 80, &LOOK, &[]).text).contains("No changes"));
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
