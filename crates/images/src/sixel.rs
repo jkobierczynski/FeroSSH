@@ -76,9 +76,10 @@ struct Canvas {
     cap_h: u32,
     pixels: Vec<u32>,
     limits: Limits,
-    /// Pixel writes left: drawing over the same pixels again and again
-    /// (`$` and repeats) is cut off at a few times the picture's pixels,
-    /// so a short sequence cannot keep the window busy.
+    /// Pixel writes left, counting each new canvas as written: drawing
+    /// over the same pixels again and again (`$` and repeats) or making
+    /// the canvas over and over is cut off at a few times the picture's
+    /// pixels, so a short sequence cannot keep the window busy.
     budget: usize,
 }
 
@@ -120,9 +121,13 @@ impl Canvas {
             let fit_h = (self.limits.max_pixels / w as usize).min(h as usize) as u32;
             (w, fit_h.max(need_h))
         };
-        if (w as usize) * (h as usize) > self.limits.max_pixels {
+        let size = (w as usize) * (h as usize);
+        // A new canvas is work too: charge it, so trading spare width for
+        // height band after band near the limit cannot go on and on.
+        if size > self.limits.max_pixels || size > self.budget {
             return false;
         }
+        self.budget -= size;
         // Everything outside `width` x `height` is still blank, so a
         // smaller side keeps all that was drawn.
         let mut pixels = vec![0u32; w as usize * h as usize];
@@ -358,5 +363,20 @@ mod tests {
         data.extend_from_slice(b"!2048~~-@");
         let p = decode(&data, &Limits::DEFAULT).ok();
         assert_eq!(p.map(|p| (p.width, p.height)), Some((2049, 1537)));
+    }
+
+    #[test]
+    fn making_the_canvas_again_and_again_stops() {
+        // A wide blank run, then one pixel per band: past the pixel limit
+        // each band would trade spare width for height with a new 16 MB
+        // canvas. New canvases are charged, so this stops early and keeps
+        // the part drawn.
+        let mut data = b"!512??".to_vec();
+        for _ in 0..1400 {
+            data.extend_from_slice(b"-@");
+        }
+        let p = decode(&data, &Limits::DEFAULT).ok();
+        let h = p.map(|p| p.height).unwrap_or_default();
+        assert!(h > 4096 && h < 6000, "height {h}");
     }
 }
