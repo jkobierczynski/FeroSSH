@@ -200,7 +200,8 @@ pub fn question(screen: &[String]) -> Option<Question> {
     let context = raw
         .get(raw.len().saturating_sub(QUESTION_LINES)..)?
         .to_vec();
-    numbered(bottom, &context).or_else(|| yes_no(bottom, context))
+    // A y/n prompt on the last line is the newest question there is.
+    yes_no(bottom, context.clone()).or_else(|| numbered(bottom, &context))
 }
 
 /// A numbered choice line: its number and its words, lower case.
@@ -498,6 +499,11 @@ mod tests {
             "2. Blue",
         ]);
         assert_eq!(question(&two), None);
+        // A y/n prompt below an older menu is the question.
+        let mixed = screen(&["Run command?", "1. Yes", "2. No", "Overwrite? [y/n]"]);
+        let q = question(&mixed).unwrap();
+        assert_eq!(q.text, "Overwrite? [y/n]");
+        assert_eq!(q.yes, b"y\r");
         // The same words about another command are another question.
         let push = screen(&[
             "Bash(git push)",
