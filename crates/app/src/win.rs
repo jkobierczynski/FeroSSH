@@ -625,6 +625,8 @@ mod cmd {
     pub const KITTY_KEYBOARD: u32 = 656;
     /// Session > Coding agents > Shift+Enter types a new line; the fifth.
     pub const SHIFT_ENTER: u32 = 657;
+    /// Session > Coding agents > Log and record agent panes; the sixth.
+    pub const AGENT_AUDIT: u32 = 658;
     /// Session > Coding agents: plus the index into the commands listed
     /// when the menu opened, up to [`AGENT_END`].
     pub const AGENT_START: u32 = 660;
@@ -821,7 +823,23 @@ struct Logging {
     raw: bool,
     writer: Option<LogWriter<File>>,
     path: Option<PathBuf>,
+    /// The coding agent the open log is named after, if it is an agent's.
+    agent: Option<String>,
 }
+
+/// A paste's receiver as confirmed: its pane, the coding agent it runs,
+/// whether it has the Production theme, its connection
+/// ([`Window::link_of`]), whether a login script's secret prompt in it
+/// would take the paste instead, and the bytes the paste is for it
+/// (bracketed or not, as its program asked).
+type Receiver = (
+    PaneId,
+    Option<String>,
+    bool,
+    Option<(ChannelId, bool)>,
+    bool,
+    Vec<u8>,
+);
 
 /// Session > Logs and recordings > Record this pane: the pane's output with its timing, as an
 /// asciicast file in the log folder, sealed like a log. Only what the
@@ -2750,6 +2768,11 @@ fn build_menu() -> Result<HMENU> {
             cmd::SHIFT_ENTER,
             "Shift+&Enter types a new line (sends Esc Enter)",
         )?;
+        item(
+            agents,
+            cmd::AGENT_AUDIT,
+            "&Log and record agent panes (audit trail)",
+        )?;
         AppendMenuW(session, MF_POPUP, agents.0 as usize, w!("Coding a&gents"))?;
         separator(session)?;
         let tmux = CreatePopupMenu()?;
@@ -2834,7 +2857,7 @@ fn build_menu() -> Result<HMENU> {
         item(
             scripts,
             cmd::CONFIRM_PRODUCTION,
-            "Confirm scripts on &Production hosts",
+            "Confirm scripts and agents on &Production hosts",
         )?;
         AppendMenuW(session, MF_POPUP, scripts.0 as usize, w!("&Scripts"))?;
         separator(session)?;
@@ -3677,6 +3700,11 @@ impl Window {
                         others,
                     }));
                 }
+                tmux::Action::AgentMarked(natives) => {
+                    for native in natives {
+                        self.watch_agent(gateway, native);
+                    }
+                }
                 tmux::Action::Notice(text) => {
                     let text = crate::ssh::sanitize(&text);
                     self.show(gateway, &format!("\x1b[0;90m{text}\x1b[0m\r\n"));
@@ -3738,7 +3766,15 @@ impl Window {
         pane.log.raw = self.panes.get(&gateway).is_some_and(|g| g.log.raw);
         self.panes.insert(native, pane);
         self.apply_highlight(native, false);
-        self.start_log(native);
+        // With the audit trail on, an agent pane's first log is already
+        // named after its agent.
+        let agent = self
+            .settings
+            .agent_audit
+            .then(|| self.tmux.get(&gateway).and_then(|t| t.agent_of(native)))
+            .flatten()
+            .map(str::to_owned);
+        self.start_log_as(native, agent.as_deref());
     }
 
     /// Tells each tmux session its panes' sizes, and saves its layout and
@@ -7872,6 +7908,12 @@ impl Window {
 
     /// Opens the pane's log if logging is on and the pane has a host.
     fn start_log(&mut self, id: PaneId) {
+        self.start_log_as(id, None);
+    }
+
+    /// [`Self::start_log`]; for a coding agent's pane, `agent` names it in
+    /// the file's name and heading.
+    fn start_log_as(&mut self, id: PaneId, agent: Option<&str>) {
         let Some(p) = self.panes.get(&id) else {
             return;
         };
@@ -7893,8 +7935,13 @@ impl Window {
         };
         let raw = p.log.raw;
         let dir = log_dir();
-        let opened = new_log_file(&label, id, "");
-        let header = format!("FeroSSH log of {label}, started {}", timestamp());
+        let suffix = agent.map(|a| format!("-{a}")).unwrap_or_default();
+        let opened = new_log_file(&label, id, &suffix);
+        let what = match agent {
+            Some(a) => format!("coding agent {a} on {label}"),
+            None => label.clone(),
+        };
+        let header = format!("FeroSSH log of {what}, started {}", timestamp());
         let stamps = self
             .settings
             .log_timestamps
@@ -7913,6 +7960,7 @@ impl Window {
                 if let Some(p) = self.panes.get_mut(&id) {
                     p.log.writer = Some(writer);
                     p.log.path = Some(path);
+                    p.log.agent = agent.map(str::to_owned);
                 }
             }
             Err(e) => {
@@ -8033,40 +8081,58 @@ impl Window {
         } else if matches!(p.host, Host::Replay(_) | Host::Desktop { .. }) {
             return;
         } else {
-            let label = p.host_label();
-            let header = CastHeader {
-                cols: clamp16(p.term.cols()),
-                rows: clamp16(p.term.rows()),
-                timestamp: SystemTime::now()
-                    .duration_since(SystemTime::UNIX_EPOCH)
-                    .map_or(0, |d| d.as_secs()),
-                title: format!("FeroSSH recording of {label}"),
-            };
-            let opened =
-                new_log_file_ext(&label, id, "", "cast").and_then(|(f, chain, path, name)| {
-                    Ok((CastWriter::sealed(f, chain, &name, &header)?, path))
-                });
-            let text = match opened {
-                Ok((writer, path)) => {
-                    let text = format!(
-                        "\x1b[0;90mRecording this pane to {} (what the host shows, not what you type)\x1b[0m\r\n",
-                        path.display()
-                    );
-                    p.cast = Some(Recording {
-                        writer: Some(writer),
-                        path,
-                    });
-                    text
-                }
-                Err(e) => format!(
-                    "\x1b[0;31mCould not start a recording in {}: {e}\x1b[0m\r\n",
-                    log_dir().display()
-                ),
-            };
+            let text = self.start_recording(id, None);
             self.show(id, &text);
         }
         self.update_menu_checks();
         self.refresh(id);
+    }
+
+    /// Starts recording pane `id` (not a replay or a desktop); for a
+    /// coding agent's pane, `agent` names it in the file's name and title.
+    /// Returns what to show in the pane.
+    fn start_recording(&mut self, id: PaneId, agent: Option<&str>) -> String {
+        let Some(p) = self.panes.get_mut(&id) else {
+            return String::new();
+        };
+        if matches!(p.host, Host::Replay(_) | Host::Desktop { .. }) {
+            return String::new();
+        }
+        let label = p.host_label();
+        let title = match agent {
+            Some(a) => format!("FeroSSH recording of coding agent {a} on {label}"),
+            None => format!("FeroSSH recording of {label}"),
+        };
+        let header = CastHeader {
+            cols: clamp16(p.term.cols()),
+            rows: clamp16(p.term.rows()),
+            timestamp: SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .map_or(0, |d| d.as_secs()),
+            title,
+        };
+        let suffix = agent.map(|a| format!("-{a}")).unwrap_or_default();
+        let opened =
+            new_log_file_ext(&label, id, &suffix, "cast").and_then(|(f, chain, path, name)| {
+                Ok((CastWriter::sealed(f, chain, &name, &header)?, path))
+            });
+        match opened {
+            Ok((writer, path)) => {
+                let text = format!(
+                    "\x1b[0;90mRecording this pane to {} (what the host shows, not what you type)\x1b[0m\r\n",
+                    path.display()
+                );
+                p.cast = Some(Recording {
+                    writer: Some(writer),
+                    path,
+                });
+                text
+            }
+            Err(e) => format!(
+                "\x1b[0;31mCould not start a recording in {}: {e}\x1b[0m\r\n",
+                log_dir().display()
+            ),
+        }
     }
 
     /// Session > Logs and recordings > Play a recording: opens `path` in a new replay tab, or
@@ -9280,11 +9346,11 @@ impl Window {
     fn fill_agents(&mut self, menu: HMENU) {
         let commands = crate::agents::commands(&self.settings.agent_commands);
         // SAFETY: our popup menu; it is being opened, when changing it is
-        // allowed. Everything after Show agents and the four options is
+        // allowed. Everything after Show agents and the five options is
         // replaced.
         unsafe {
-            while GetMenuItemCount(Some(menu)) > 5 {
-                let _ = DeleteMenu(menu, 5, MF_BYPOSITION);
+            while GetMenuItemCount(Some(menu)) > 6 {
+                let _ = DeleteMenu(menu, 6, MF_BYPOSITION);
             }
             let _ = AppendMenuW(menu, MF_SEPARATOR, 0, None);
             for (id, c) in (cmd::AGENT_START..cmd::AGENT_END).zip(&commands) {
@@ -9297,7 +9363,24 @@ impl Window {
     /// Starts coding agent `command` from pane `id`, in tmux on its server
     /// (see [`crate::agents`]): in a new window of the tmux session that
     /// shows on that host, or else in session `agents`, attached here.
+    /// A pane with the Production theme asks first, while Session >
+    /// Scripts > Confirm scripts and agents on Production hosts is on.
     fn start_agent(&mut self, id: PaneId, command: &str) -> Option<Command> {
+        if self.settings.confirm_production
+            && let Some(p) = self.panes.get(&id)
+            && p.theme.name == "Production"
+        {
+            return Some(Command::ConfirmAgent {
+                pane: id,
+                command: command.to_owned(),
+                host: p.host_label(),
+            });
+        }
+        self.start_agent_now(id, command)
+    }
+
+    /// [`Self::start_agent`], asked already where it asks.
+    fn start_agent_now(&mut self, id: PaneId, command: &str) -> Option<Command> {
         const HOW: &str = "A coding agent starts in tmux on a server: use it from a pane \
             that is logged in to one over SSH.";
         // A tmux pane: a new window in its own session.
@@ -9391,6 +9474,86 @@ impl Window {
             p.quiet = Some(crate::attention::Watch::new());
             self.update_quiet_timer();
         }
+        if agent && self.settings.agent_audit {
+            self.audit_agent(native);
+        }
+    }
+
+    /// Session > Coding agents > Log and record agent panes: starts the
+    /// sealed log and the recording of agent pane `id`, unless they run
+    /// already. Their files are named after the host and the agent.
+    fn audit_agent(&mut self, id: PaneId) {
+        let Some(agent) = self.agent_of(id).map(str::to_owned) else {
+            return;
+        };
+        let Some(p) = self.panes.get_mut(&id) else {
+            return;
+        };
+        let record = p.cast.is_none();
+        p.log.enabled = true;
+        // An ordinary log opened before the pane was known to run an agent
+        // ends, and the agent's own log follows it.
+        if p.log.writer.is_some() && p.log.agent.as_deref() != Some(agent.as_str()) {
+            self.stop_log(id);
+        }
+        self.start_log_as(id, Some(&agent));
+        if record {
+            let text = self.start_recording(id, Some(&agent));
+            self.show(id, &text);
+        }
+        self.update_menu_checks();
+    }
+
+    /// Each of `panes` that is still open, with the coding agent it runs
+    /// and whether it has the Production theme: what a paste was confirmed
+    /// for.
+    fn receivers(&self, panes: &[PaneId], text: &str) -> Vec<Receiver> {
+        panes
+            .iter()
+            .filter_map(|id| {
+                let p = self.panes.get(id)?;
+                Some((
+                    *id,
+                    self.agent_of(*id).map(str::to_owned),
+                    p.theme.name == "Production",
+                    self.link_of(*id),
+                    self.scripts.get(id).is_some_and(|r| r.runner.prompting()),
+                    p.term.paste(text).bytes,
+                ))
+            })
+            .collect()
+    }
+
+    /// Which SSH connection pane `id` types into, and whether it is logged
+    /// in: each connection has a channel of its own, so a reconnect (or a
+    /// login prompt) is not the shell a paste was confirmed for. A tmux
+    /// pane types into its gateway's connection.
+    fn link_of(&self, id: PaneId) -> Option<(ChannelId, bool)> {
+        match &self.panes.get(&id)?.host {
+            Host::Ssh(s) => Some((
+                s.channel,
+                s.state() == State::Connected && !s.prompt_active(),
+            )),
+            Host::Tmux { gateway, .. } => self.link_of(*gateway),
+            _ => None,
+        }
+    }
+
+    /// The Production-themed panes among `panes` that run a coding agent,
+    /// as "agent on host", while Confirm scripts and agents on Production
+    /// hosts is on: input for them asks first.
+    fn production_agents(&self, panes: &[PaneId]) -> Vec<String> {
+        if !self.settings.confirm_production {
+            return Vec::new();
+        }
+        panes
+            .iter()
+            .filter_map(|id| {
+                let p = self.panes.get(id)?;
+                let agent = self.agent_of(*id)?;
+                (p.theme.name == "Production").then(|| format!("{agent} on {}", p.host_label()))
+            })
+            .collect()
     }
 
     /// The coding agent pane `id` runs, by name, if it runs one.
@@ -13859,7 +14022,7 @@ impl Window {
     /// in, its login script done and in its directory; for a `local`
     /// pane, its shell started): its script, then its command. Once: a
     /// reconnect runs neither again. A pane with the Production theme asks
-    /// first when Confirm scripts on Production hosts is on.
+    /// first when Confirm scripts and agents on Production hosts is on.
     fn workspace_start(&mut self, id: PaneId, local: bool) {
         let Some(e) = self
             .workspace_extra
@@ -15855,6 +16018,23 @@ impl Window {
                 self.update_menu_checks();
                 self.apply_keys();
             }
+            cmd::AGENT_AUDIT => {
+                self.settings.agent_audit = !self.settings.agent_audit;
+                self.save_settings();
+                if self.settings.agent_audit {
+                    // The agents running now are kept from here on.
+                    let agents: Vec<PaneId> = self
+                        .panes
+                        .keys()
+                        .copied()
+                        .filter(|id| self.agent_of(*id).is_some())
+                        .collect();
+                    for id in agents {
+                        self.audit_agent(id);
+                    }
+                }
+                self.update_menu_checks();
+            }
             cmd::PORT_PREVIEWS => {
                 self.settings.port_previews = !self.settings.port_previews;
                 self.save_settings();
@@ -16304,6 +16484,7 @@ impl Window {
                 (cmd::PORT_PREVIEWS, s.port_previews),
                 (cmd::KITTY_KEYBOARD, s.kitty_keyboard),
                 (cmd::SHIFT_ENTER, s.shift_enter != ShiftEnterKey::Enter),
+                (cmd::AGENT_AUDIT, s.agent_audit),
                 (cmd::HIGHLIGHT, s.highlight),
                 (cmd::AUTO_RECONNECT, s.auto_reconnect),
                 (cmd::SIDE_RIGHT, s.side_pane_right),
@@ -18242,6 +18423,13 @@ enum Command {
     CloseTabNow(usize),
     /// Ask, then remove the snippet at this index.
     DeleteSnippet(usize),
+    /// A coding agent is about to start from a pane with the Production
+    /// theme: asks first.
+    ConfirmAgent {
+        pane: PaneId,
+        command: String,
+        host: String,
+    },
     /// A snippet is about to go to a pane with the Production theme: asks
     /// first.
     ConfirmSnippet {
@@ -18607,6 +18795,9 @@ fn upload_dropped(hwnd: HWND, paths: &[PathBuf], at: POINT) {
     }
     // UploadAndTypePath: on a pane, no question; the paths are typed.
     if let Some(id) = with_window(|w| w.drop_types_path(at.x, at.y)).flatten() {
+        if !confirm_agent_files(hwnd, id, paths.len()) {
+            return;
+        }
         let done = with_window(|w| w.upload_and_type(id, paths, Vec::new()))
             .unwrap_or(Err("FeroSSH is busy; drop the files again.".into()));
         if let Err(why) = done {
@@ -18681,6 +18872,12 @@ fn paste_files(hwnd: HWND) {
     } else {
         (files, Vec::new())
     };
+    if !confirm_agent_files(hwnd, id, paths.len()) {
+        for t in &temp {
+            let _ = std::fs::remove_file(t);
+        }
+        return;
+    }
     let done = with_window(|w| w.upload_and_type(id, &paths, temp.clone()))
         .unwrap_or(Err("FeroSSH is busy; paste again.".into()));
     if let Err(why) = done {
@@ -18693,6 +18890,24 @@ fn paste_files(hwnd: HWND) {
         }
         dialog(hwnd, &why, MB_OK | MB_ICONINFORMATION);
     }
+}
+
+/// Pasted or dropped files are about to go up and have their paths typed
+/// into pane `id`: when it runs a coding agent on a Production host (and
+/// Confirm scripts and agents on Production hosts is on), asks first.
+/// Returns whether to go on.
+fn confirm_agent_files(hwnd: HWND, id: PaneId, count: usize) -> bool {
+    let production = with_window(|w| w.production_agents(&[id])).unwrap_or_default();
+    let Some(agent) = production.first() else {
+        return true;
+    };
+    let text = format!(
+        "Upload {count} file{} and give {} to the coding agent {agent}, which has the \
+         Production theme?",
+        plural(count),
+        if count == 1 { "it" } else { "them" },
+    );
+    dialog(hwnd, &text, MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2) == Some(IDYES)
 }
 
 /// Saves a pasted image as a PNG in FeroSSH's temporary folder, under a
@@ -19680,6 +19895,12 @@ fn run_command(hwnd: HWND, command: Command) {
                 return;
             };
             let targets = with_window(|w| w.broadcast_targets(id)).unwrap_or_default();
+            let mut all = vec![id];
+            all.extend(&targets);
+            let production = with_window(|w| w.production_agents(&all)).unwrap_or_default();
+            // Which panes get it and which agent each runs, to check again
+            // once asked: the labels above only name them.
+            let receivers = with_window(|w| w.receivers(&all, &text)).unwrap_or_default();
             let others = if targets.is_empty() {
                 String::new()
             } else {
@@ -19689,7 +19910,27 @@ fn run_command(hwnd: HWND, command: Command) {
                     plural(targets.len())
                 )
             };
-            if paste.needs_confirmation() || (!targets.is_empty() && paste.line_breaks > 0) {
+            if !production.is_empty() {
+                let breaks = paste.line_breaks;
+                let others = if !targets.is_empty() && breaks > 0 {
+                    format!(
+                        "{others} The {breaks} line break{s} in this paste act as Enter in the \
+                         other panes, so their shells run each line as soon as it arrives.",
+                        s = plural(breaks),
+                    )
+                } else {
+                    others.clone()
+                };
+                let text = format!(
+                    "Paste this into the coding agent {}, which {} the Production theme?{others}\n\n{}",
+                    production.join(", "),
+                    if production.len() == 1 { "has" } else { "have" },
+                    clipboard_preview(&text, PREVIEW_CHARS),
+                );
+                if dialog(hwnd, &text, MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2) != Some(IDYES) {
+                    return;
+                }
+            } else if paste.needs_confirmation() || (!targets.is_empty() && paste.line_breaks > 0) {
                 let lines = paste.line_breaks;
                 let text = format!(
                     "The text you are pasting contains {lines} line break{s}. Each one acts as \
@@ -19703,7 +19944,20 @@ fn run_command(hwnd: HWND, command: Command) {
                     return;
                 }
             }
+            // The dialogs let messages run: the pane may have closed, its
+            // agent gone, or its paste mode changed meanwhile (an agent that
+            // quit to its shell turns bracketed paste off, and the line
+            // breaks would run there). What was asked about is sent, or
+            // nothing.
             with_window(|w| {
+                // Every receiver's bytes, the broadcast targets' too.
+                if w.receivers(&all, &text) != receivers {
+                    w.show(
+                        id,
+                        "\x1b[0;90mNot pasted: the panes changed while FeroSSH asked.\x1b[0m\r\n",
+                    );
+                    return;
+                }
                 w.input(id, paste.bytes);
                 w.send_typed(&targets, &Typed::Paste(text));
             });
@@ -20154,6 +20408,25 @@ fn run_command(hwnd: HWND, command: Command) {
                     MB_ICONWARNING
                 };
                 dialog(hwnd, &text, MB_OK | icon);
+            }
+        }
+        Command::ConfirmAgent {
+            pane,
+            command,
+            host,
+        } => {
+            let text = format!(
+                "Start the coding agent {} on {host}, which has the Production theme?\n\n\
+                 It runs there with your login's rights.",
+                crate::ssh::sanitize_line(&command)
+                    .chars()
+                    .take(100)
+                    .collect::<String>(),
+            );
+            if dialog(hwnd, &text, MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2) == Some(IDYES)
+                && let Some(next) = with_window(|w| w.start_agent_now(pane, &command)).flatten()
+            {
+                run_command(hwnd, next);
             }
         }
         Command::ConfirmSnippet {
