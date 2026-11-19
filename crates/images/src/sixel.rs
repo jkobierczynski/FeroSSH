@@ -102,29 +102,37 @@ impl Canvas {
             (y + 1).max(self.cap_h * 2).max(6)
         };
         let (w, h) = (w.min(self.limits.max_side), h.min(self.limits.max_side));
-        // Past the pixel budget, grow each side only as far as the budget
-        // allows for the other, but never by less than needed: growing a
-        // column at a time would copy the whole canvas for each.
+        // Past the pixel budget, size the canvas to what fits around the
+        // part drawn so far plus the new pixel. Unused room from earlier
+        // growth is given back rather than counted, and each side still
+        // grows as far as the budget allows: growing a column at a time
+        // would copy the whole canvas for each.
         let (w, h) = if (w as usize) * (h as usize) <= self.limits.max_pixels {
             (w, h)
         } else {
-            let need_h = self.cap_h.max(y + 1);
-            let fit_w = (self.limits.max_pixels / need_h.max(1) as usize).min(w as usize) as u32;
-            let w = fit_w.max(self.cap_w).max(x + 1);
-            let need_w = w;
-            let fit_h = (self.limits.max_pixels / need_w.max(1) as usize).min(h as usize) as u32;
+            let need_w = self.width.max(x + 1);
+            let need_h = self.height.max(y + 1);
+            if (need_w as usize) * (need_h as usize) > self.limits.max_pixels {
+                return false;
+            }
+            let fit_w = (self.limits.max_pixels / need_h as usize).min(w as usize) as u32;
+            let w = fit_w.max(need_w);
+            let fit_h = (self.limits.max_pixels / w as usize).min(h as usize) as u32;
             (w, fit_h.max(need_h))
         };
         if (w as usize) * (h as usize) > self.limits.max_pixels {
             return false;
         }
+        // Everything outside `width` x `height` is still blank, so a
+        // smaller side keeps all that was drawn.
         let mut pixels = vec![0u32; w as usize * h as usize];
-        for row in 0..self.cap_h as usize {
+        let keep = self.cap_w.min(w) as usize;
+        for row in 0..self.cap_h.min(h) as usize {
             let from = row * self.cap_w as usize;
             let to = row * w as usize;
             if let (Some(src), Some(dst)) = (
-                self.pixels.get(from..from + self.cap_w as usize),
-                pixels.get_mut(to..to + self.cap_w as usize),
+                self.pixels.get(from..from + keep),
+                pixels.get_mut(to..to + keep),
             ) {
                 dst.copy_from_slice(src);
             }
@@ -340,5 +348,15 @@ mod tests {
         assert_eq!(p.map(|p| p.height), Some(6));
         let p = decode(b"~-@", &small).ok();
         assert_eq!(p.map(|p| p.height), Some(7));
+    }
+
+    #[test]
+    fn spare_room_is_given_back_near_the_limit() {
+        // Doubling the width to 2730 leaves no room for row 1536, though
+        // the 2049 x 1537 picture fits the pixel limit.
+        let mut data = vec![b'-'; 255];
+        data.extend_from_slice(b"!2048~~-@");
+        let p = decode(&data, &Limits::DEFAULT).ok();
+        assert_eq!(p.map(|p| (p.width, p.height)), Some((2049, 1537)));
     }
 }

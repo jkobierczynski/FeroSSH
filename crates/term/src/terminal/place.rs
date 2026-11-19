@@ -19,7 +19,11 @@ const MAX_REPLIES: usize = 64;
 pub(super) struct Images {
     scanner: Scanner,
     pub store: Store,
-    pub replies: Vec<Vec<u8>>,
+    /// Kitty answers, each with how many emulator events were queued
+    /// before it, so `take_actions` keeps them in the order the host
+    /// asked (a kitty query and then device attributes is how programs
+    /// look for kitty graphics).
+    pub replies: Vec<(usize, Vec<u8>)>,
 }
 
 /// Where the cursor goes after a picture.
@@ -268,7 +272,8 @@ impl Terminal {
         if let (Some(images), Some(reply)) = (&mut self.images, cmd.reply(result))
             && images.replies.len() < MAX_REPLIES
         {
-            images.replies.push(reply);
+            let queued = self.events.0.borrow().len();
+            images.replies.push((queued, reply));
         }
     }
 
@@ -460,8 +465,9 @@ impl Terminal {
         self.images.is_some()
     }
 
-    /// Replies to kitty graphics commands since the last call.
-    pub(super) fn take_image_replies(&mut self) -> Vec<Vec<u8>> {
+    /// Replies to kitty graphics commands since the last call, each with
+    /// its place among the emulator's events.
+    pub(super) fn take_image_replies(&mut self) -> Vec<(usize, Vec<u8>)> {
         self.images
             .as_mut()
             .map(|i| std::mem::take(&mut i.replies))

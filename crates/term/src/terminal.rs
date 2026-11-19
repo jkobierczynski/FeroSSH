@@ -871,19 +871,23 @@ impl Terminal {
         self.term.scroll_display(Scroll::Delta(want - offset));
     }
 
-    /// What the host's output asked the UI to do: the parser's requests in
-    /// order, then the last working directory, then the notifications in
-    /// order (these two are independent, so they need no shared order).
+    /// What the host's output asked the UI to do: the parser's requests and
+    /// kitty graphics answers in order, then the last working directory,
+    /// then the notifications in order (these two are independent, so
+    /// they need no shared order).
     pub fn take_actions(&mut self) -> Vec<Action> {
         let events = std::mem::take(&mut *self.events.0.borrow_mut());
-        let mut actions: Vec<Action> = events.into_iter().filter_map(|e| self.action(e)).collect();
+        let mut replies = self.take_image_replies().into_iter().peekable();
+        let mut actions = Vec::with_capacity(events.len() + replies.len());
+        for (at, event) in events.into_iter().enumerate() {
+            while let Some((_, reply)) = replies.next_if(|(queued, _)| *queued <= at) {
+                actions.push(Action::ImageReply(reply));
+            }
+            actions.extend(self.action(event));
+        }
+        actions.extend(replies.map(|(_, reply)| Action::ImageReply(reply)));
         actions.extend(self.reported.drain(..).map(Action::WorkingDirectory));
         actions.extend(self.notifications.drain(..).map(Action::Notify));
-        actions.extend(
-            self.take_image_replies()
-                .into_iter()
-                .map(Action::ImageReply),
-        );
         actions
     }
 
