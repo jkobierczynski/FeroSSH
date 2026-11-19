@@ -157,7 +157,7 @@ pub struct Question {
     /// What to type for yes, and for no.
     pub yes: Vec<u8>,
     pub no: Vec<u8>,
-    /// The bottom of the screen it was read from, whole: what it asks
+    /// The bottom of the screen it was read from, uncleaned: what it asks
     /// about (the command, the file) is part of which question it is, so
     /// a later question with the same words is not taken for it.
     pub context: Vec<String>,
@@ -191,7 +191,15 @@ pub fn question(screen: &[String]) -> Option<Question> {
         .filter(|l| !l.is_empty())
         .collect();
     let bottom = bottom.get(bottom.len().saturating_sub(QUESTION_LINES)..)?;
-    let context = bottom.to_vec();
+    // As the screen shows it, spaces and all: `rm 'a  b'` is not `rm 'a b'`.
+    let raw: Vec<String> = screen
+        .iter()
+        .map(|l| l.trim_end().to_owned())
+        .filter(|l| !clean(l).is_empty())
+        .collect();
+    let context = raw
+        .get(raw.len().saturating_sub(QUESTION_LINES)..)?
+        .to_vec();
     numbered(bottom, &context).or_else(|| yes_no(bottom, context))
 }
 
@@ -506,6 +514,17 @@ mod tests {
         let (push, test) = (question(&push).unwrap(), question(&test).unwrap());
         assert_eq!(push.text, test.text);
         assert_ne!(push, test);
+        // Spaces count too.
+        let ask = |cmd: &str| {
+            question(&screen(&[
+                cmd,
+                "Do you want to proceed?",
+                "1. Yes",
+                "2. No",
+            ]))
+        };
+        assert_ne!(ask("Bash(rm 'a  b')"), ask("Bash(rm 'a b')"));
+        assert_eq!(ask("Bash(rm 'a b')"), ask("Bash(rm 'a b')"));
     }
 
     #[test]
