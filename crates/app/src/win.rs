@@ -18835,11 +18835,13 @@ fn menu_key_labels(menu: HMENU, text: &dyn Fn(u32) -> MenuText) {
         // SAFETY: our menu and a position in it.
         let (state, sub) =
             unsafe { (GetMenuState(menu, at, MF_BYPOSITION), GetSubMenu(menu, pos)) };
-        if state & MF_SEPARATOR.0 != 0 {
-            continue;
-        }
+        // A submenu first: its state carries its item count in the high
+        // byte, which can look like the separator flag.
         if !sub.is_invalid() {
             menu_key_labels(sub, text);
+            continue;
+        }
+        if state & MF_SEPARATOR.0 != 0 {
             continue;
         }
         // SAFETY: as above.
@@ -18902,14 +18904,16 @@ fn menu_items(menu: HMENU, greyed: bool) -> Vec<palette::Entry> {
             // SAFETY: our menu and a position in it.
             let (state, sub) =
                 unsafe { (GetMenuState(menu, at, MF_BYPOSITION), GetSubMenu(menu, pos)) };
-            if state & MF_SEPARATOR.0 != 0 {
-                continue;
-            }
             let text = menu_text(menu, at);
+            // A submenu first: its state carries its item count in the
+            // high byte, which can look like the separator flag.
             if !sub.is_invalid() {
                 path.push(text);
                 walk(sub, path, out, greyed);
                 path.pop();
+                continue;
+            }
+            if state & MF_SEPARATOR.0 != 0 {
                 continue;
             }
             if !greyed && state & (MF_GRAYED.0 | MF_DISABLED.0) != 0 {
