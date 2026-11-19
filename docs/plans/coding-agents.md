@@ -81,3 +81,4 @@ Picked on 19 November 2026:
 
 - **Agent dashboard (built).** Session > Coding agents > Agent dashboard turns the Session manager into one view of every agent on every connected host: its state, for how long, the last line it showed, those waiting for you first.
 - **Answer from the notification (built).** Session > Coding agents > Answer yes-or-no questions from the notification: the notification of an agent stopped at a numbered Yes/No choice or a `[y/n]` prompt shows the question, and clicking it answers from a dialog without switching tabs. A notification with buttons of its own would need a Start menu shortcut with an app id, which a portable exe does not have.
+- **Diff viewer (built).** Session > Coding agents > Show what changed here: `git diff` against HEAD (plus untracked files) over the pane's SSH connection, in the agent's folder (from tmux), shown side by side in a tab of its own.

@@ -608,6 +608,9 @@ mod cmd {
     pub const AUTO_RESPONSES: u32 = 618;
     pub const CONFIRM_PRODUCTION: u32 = 619;
     pub const WRITE_LIBRARY: u32 = 644;
+    /// Session > Coding agents > Show what changed (side-by-side git
+    /// diff); the menu's second item.
+    pub const AGENT_DIFF: u32 = 645;
     /// Settings > Desktop notifications, and Notify on the bell too.
     pub const NOTIFY: u32 = 650;
     pub const NOTIFY_BELL: u32 = 651;
@@ -760,6 +763,32 @@ enum Host {
     /// A session recording playing back (Session > Logs and recordings > Play a recording):
     /// nothing goes to a host, and keys control the playing.
     Replay(Box<Replay>),
+    /// Session > Coding agents > Show what changed: the changes in a
+    /// git repository on a server, side by side; keys look again and move
+    /// about.
+    Diff(Box<DiffTab>),
+}
+
+/// A tab showing what changed in a git repository on a server
+/// ([`crate::diff`]).
+struct DiffTab {
+    /// The SSH connection git runs on, and the host as the user knows it.
+    connection: ChannelId,
+    label: String,
+    /// The folder asked about, as the pane's shell or tmux gave it.
+    dir: Vec<u8>,
+    /// The exec channel while git runs.
+    channel: Option<ChannelId>,
+    out: Vec<u8>,
+    /// The end of what went to standard error, for when nothing else
+    /// came.
+    err: Vec<u8>,
+    status: Option<u32>,
+    /// There was more than [`crate::diff::KEEP`]: only part shows.
+    partial: bool,
+    outcome: Option<crate::diff::Outcome>,
+    /// The line each file's heading is on, as last laid out.
+    files: Vec<usize>,
 }
 
 /// A recording playing in a replay tab.
@@ -991,6 +1020,12 @@ impl Pane {
         if let Host::Replay(r) = &self.host {
             return r.label(Instant::now());
         }
+        if let Host::Diff(d) = &self.host {
+            let dir = String::from_utf8_lossy(&d.dir);
+            let base = dir.trim_end_matches('/').rsplit('/').next().unwrap_or("");
+            let base = if base.is_empty() { dir.as_ref() } else { base };
+            return crate::diff::clean(&format!("Changes in {base}"));
+        }
         if let Some(n) = &self.name {
             return n.clone();
         }
@@ -1011,6 +1046,7 @@ impl Pane {
             Host::Telnet(s) => s.target.label(),
             Host::Winrm(s) => s.target.label(),
             Host::Replay(r) => r.name.clone(),
+            Host::Diff(d) => d.label.clone(),
         }
     }
 
@@ -1317,6 +1353,8 @@ struct Window {
     vdesks: HashMap<ChannelId, VirtualDesk>,
     /// Session > Copy public key to this server, by its exec channel.
     key_copies: HashMap<ChannelId, KeyCopy>,
+    /// Show what changed: each running git's channel, and its tab.
+    diffs: HashMap<ChannelId, PaneId>,
     /// The server status bar's samples, by their channel: one per
     /// connection shown while the bar is on.
     stats: HashMap<ChannelId, StatsFeed>,
@@ -2458,6 +2496,7 @@ fn create_and_run(launch: Launch, theme: Option<String>) -> Result<()> {
                 preview_waiting: Vec::new(),
                 vdesks: HashMap::new(),
                 key_copies: HashMap::new(),
+                diffs: HashMap::new(),
                 stats: HashMap::new(),
                 winrm_closing: HashMap::new(),
                 keygen: None,
@@ -2757,6 +2796,11 @@ fn build_menu() -> Result<HMENU> {
             agents,
             cmd::AGENTS_SHOW,
             "Agent &dashboard (who waits for you)",
+        )?;
+        item(
+            agents,
+            cmd::AGENT_DIFF,
+            "Show what &changed here (side-by-side git diff)",
         )?;
         item(
             agents,
@@ -3729,6 +3773,11 @@ impl Window {
                         self.queued.push(command);
                     }
                 }
+                tmux::Action::DiffDir { native, dir } => {
+                    if let Some(command) = self.open_diff(native, dir.into_bytes()) {
+                        self.queued.push(command);
+                    }
+                }
             }
         }
         if structure {
@@ -3996,6 +4045,7 @@ impl Window {
             let actions = t.connection_lost(&mut self.ws);
             self.run_tmux(id, actions);
         }
+        self.stop_diff(id);
         let effects = match self.panes.get_mut(&id).map(|p| &mut p.host) {
             Some(Host::Ssh(session)) => session.close(),
             Some(Host::Telnet(session)) => session.close(),
@@ -4168,7 +4218,7 @@ impl Window {
             };
             let mut notes = Vec::new();
             let (kind, target, mut st) = match &p.host {
-                Host::Ask(_) | Host::Replay(_) => continue,
+                Host::Ask(_) | Host::Replay(_) | Host::Diff(_) => continue,
                 Host::Ssh(s) => {
                     if self.via.get(&s.connection).is_some_and(|v| !v.is_empty())
                         || self.proxies.contains_key(&s.connection)
@@ -8096,7 +8146,10 @@ impl Window {
                 ),
             };
             self.show(id, &text);
-        } else if matches!(p.host, Host::Replay(_) | Host::Desktop { .. }) {
+        } else if matches!(
+            p.host,
+            Host::Replay(_) | Host::Desktop { .. } | Host::Diff(_)
+        ) {
             return;
         } else {
             let text = self.start_recording(id, None);
@@ -8113,7 +8166,10 @@ impl Window {
         let Some(p) = self.panes.get_mut(&id) else {
             return String::new();
         };
-        if matches!(p.host, Host::Replay(_) | Host::Desktop { .. }) {
+        if matches!(
+            p.host,
+            Host::Replay(_) | Host::Desktop { .. } | Host::Diff(_)
+        ) {
             return String::new();
         }
         let label = p.host_label();
@@ -8380,6 +8436,10 @@ impl Window {
         let Some(p) = self.panes.get_mut(&id) else {
             return;
         };
+        if matches!(p.host, Host::Diff(_)) {
+            self.diff_key(id, &bytes);
+            return;
+        }
         if p.term.display_offset() != 0 || p.term.stopped() {
             p.term.scroll_to_bottom();
             self.refresh(id);
@@ -8427,7 +8487,7 @@ impl Window {
             }
             // Typing reaches the desktop before this; the pane only shows
             // messages once it ended. A recording has no host.
-            Host::Desktop { .. } | Host::Replay(_) => {}
+            Host::Desktop { .. } | Host::Replay(_) | Host::Diff(_) => {}
             Host::Ask(text) => {
                 if enter {
                     let destination = std::mem::take(text);
@@ -8532,7 +8592,7 @@ impl Window {
                 s.target.hostname.to_ascii_lowercase(),
                 s.target.port
             ),
-            Host::Ask(_) | Host::Desktop { .. } | Host::Replay(_) => return None,
+            Host::Ask(_) | Host::Desktop { .. } | Host::Replay(_) | Host::Diff(_) => return None,
         })
     }
 
@@ -9108,6 +9168,10 @@ impl Window {
                     self.on_key_copy(c, msg);
                     return false;
                 }
+                if self.diff_on(c) == Some(connection) {
+                    self.on_diff(c, msg);
+                    return false;
+                }
                 if self
                     .stats
                     .get(&c)
@@ -9196,6 +9260,21 @@ impl Window {
                         },
                     );
                 }
+                let lost: Vec<ChannelId> = self
+                    .diffs
+                    .keys()
+                    .copied()
+                    .filter(|&c| self.diff_on(c) == Some(connection))
+                    .collect();
+                for c in lost {
+                    self.on_diff(
+                        c,
+                        Message::Disconnected {
+                            channel: c,
+                            reason: why.clone(),
+                        },
+                    );
+                }
                 let mut orphaned = Vec::new();
                 for (key, remote) in &mut self.sftp {
                     if remote.connection() == Some(connection) {
@@ -9268,7 +9347,7 @@ impl Window {
                 continue;
             };
             let mut actions = p.term.take_actions();
-            let replay = matches!(p.host, Host::Replay(_));
+            let replay = matches!(p.host, Host::Replay(_) | Host::Diff(_));
             if replay {
                 // A recording plays to the screen only: it cannot write
                 // the clipboard or move the file view, and nothing answers.
@@ -9361,14 +9440,317 @@ impl Window {
 
     /// Session > Coding agents, as it opens: Agent dashboard, then a Start
     /// item for each agent command.
+    /// Session > Coding agents > Show what changed here: the changes in
+    /// the git repository pane `pane` is in, side by side in a new tab. A
+    /// tmux pane's folder comes from tmux (an agent there reports none);
+    /// another pane's from its shell (OSC 7 or the prompt).
+    fn show_changes(&mut self, pane: PaneId) -> Option<Command> {
+        if self.pane_connection(pane).is_none() {
+            return Some(Command::Notice(DIFF_HOW.into()));
+        }
+        if let Some(g) = self.panes.get(&pane).and_then(Pane::gateway) {
+            let actions = self
+                .tmux
+                .get_mut(&g)
+                .filter(|t| t.active())
+                .map(|t| t.ask_diff_dir(pane))
+                .unwrap_or_default();
+            if !actions.is_empty() {
+                self.run_tmux(g, actions);
+                return None;
+            }
+        }
+        let Some(dir) = self.panes.get(&pane).and_then(|p| p.cwd.clone()) else {
+            return Some(Command::Notice(
+                "FeroSSH does not know which folder this pane is in: its shell has not \
+                 said (by OSC 7, or in a prompt FeroSSH can read). Run the agent in tmux, \
+                 or use this from a shell in the project's folder."
+                    .into(),
+            ));
+        };
+        self.open_diff(pane, dir)
+    }
+
+    /// Opens a tab showing what changed in the git repository folder `dir`
+    /// is in, on pane `from`'s connection, and starts git there.
+    fn open_diff(&mut self, from: PaneId, dir: Vec<u8>) -> Option<Command> {
+        let Some(connection) = self.pane_connection(from) else {
+            return Some(Command::Notice(DIFF_HOW.into()));
+        };
+        if crate::diff::input(&dir).is_none() {
+            return Some(Command::Notice(
+                "That folder's name has a line break in it; FeroSSH cannot ask git about it."
+                    .into(),
+            ));
+        }
+        let (label, theme) = self.panes.get(&from).map_or_else(
+            || (String::new(), self.default_theme.clone()),
+            |p| (p.host_label(), p.theme.clone()),
+        );
+        let id = self.new_tab_pane();
+        if let Some(p) = self.panes.get_mut(&id) {
+            // The host's look (a Production host stays red), room for the
+            // longest diff shown, and never part of a broadcast.
+            p.term.set_theme(&theme);
+            p.theme = theme;
+            p.term.set_settings(&term_settings(Some(
+                crate::diff::MAX_ROWS + DIFF_SPARE_ROWS,
+            )));
+            p.no_broadcast = true;
+            p.host = Host::Diff(Box::new(DiffTab {
+                connection,
+                label,
+                dir,
+                channel: None,
+                out: Vec::new(),
+                err: Vec::new(),
+                status: None,
+                partial: false,
+                outcome: None,
+                files: Vec::new(),
+            }));
+        }
+        self.run_diff(id);
+        self.refresh_chrome();
+        self.request_full_redraw();
+        None
+    }
+
+    /// Which connection the git of diff channel `channel` runs on.
+    fn diff_on(&self, channel: ChannelId) -> Option<ChannelId> {
+        let id = self.diffs.get(&channel)?;
+        match &self.panes.get(id)?.host {
+            Host::Diff(d) if d.channel == Some(channel) => Some(d.connection),
+            _ => None,
+        }
+    }
+
+    /// Runs git for diff tab `id` (again): what it shows now stays until
+    /// the answer is in.
+    fn run_diff(&mut self, id: PaneId) {
+        self.stop_diff(id);
+        let channel = self.new_channel();
+        let Some(Host::Diff(d)) = self.panes.get_mut(&id).map(|p| &mut p.host) else {
+            return;
+        };
+        let (Some(w), Some(input)) = (self.workers.get(&d.connection), crate::diff::input(&d.dir))
+        else {
+            let label = crate::ssh::sanitize(&d.label);
+            self.show(
+                id,
+                &format!(
+                    "\r\n\x1b[0;31mThe connection to {label} is closed: reconnect, then press r \
+                     here.\x1b[0m"
+                ),
+            );
+            self.refresh(id);
+            return;
+        };
+        w.link.send(Message::Exec {
+            channel,
+            connection: d.connection,
+            command: crate::diff::command(),
+            split_stderr: true,
+        });
+        w.link.send(Message::Data {
+            channel,
+            bytes: input,
+        });
+        w.link.send(Message::Eof { channel });
+        d.channel = Some(channel);
+        d.out.clear();
+        d.err.clear();
+        d.status = None;
+        d.partial = false;
+        let first = d.outcome.is_none();
+        let dir = crate::diff::clean(&String::from_utf8_lossy(&d.dir));
+        let label = crate::diff::clean(&d.label);
+        self.diffs.insert(channel, id);
+        if first {
+            self.show(
+                id,
+                &format!(
+                    "\x1b[?25l\x1b[0;90mAsking git on {label} what changed in {dir}...\x1b[0m"
+                ),
+            );
+            self.refresh(id);
+        }
+    }
+
+    /// Stops diff tab `id`'s git, if it runs.
+    fn stop_diff(&mut self, id: PaneId) {
+        let Some(Host::Diff(d)) = self.panes.get_mut(&id).map(|p| &mut p.host) else {
+            return;
+        };
+        if let Some(channel) = d.channel.take() {
+            self.diffs.remove(&channel);
+            if let Some(w) = self.workers.get(&d.connection) {
+                w.link.send(Message::Close { channel });
+            }
+        }
+    }
+
+    /// What git said for a diff tab, or that it ended.
+    fn on_diff(&mut self, channel: ChannelId, msg: Message) {
+        /// Of standard error, the end is enough to say what went wrong.
+        const ERR: usize = 4096;
+        let Some(&id) = self.diffs.get(&channel) else {
+            return;
+        };
+        let Some(Host::Diff(d)) = self.panes.get_mut(&id).map(|p| &mut p.host) else {
+            self.diffs.remove(&channel);
+            return;
+        };
+        let done = match msg {
+            Message::Data { bytes, .. } => {
+                let room = crate::diff::KEEP.saturating_sub(d.out.len());
+                if let Some(part) = bytes.get(..room).filter(|_| bytes.len() > room) {
+                    d.out.extend_from_slice(part);
+                    d.partial = true;
+                    true
+                } else {
+                    d.out.extend_from_slice(&bytes);
+                    false
+                }
+            }
+            Message::ExecStderr { bytes, .. } => {
+                d.err.extend_from_slice(&bytes);
+                if d.err.len() > ERR {
+                    let cut = d.err.len() - ERR;
+                    d.err.drain(..cut);
+                }
+                false
+            }
+            Message::ExitStatus { code, .. } => {
+                d.status = Some(code);
+                false
+            }
+            Message::Disconnected { .. } => true,
+            _ => false,
+        };
+        if !done {
+            return;
+        }
+        if d.partial {
+            // Enough: the part read so far shows.
+            if let Some(w) = self.workers.get(&d.connection) {
+                w.link.send(Message::Close { channel });
+            }
+        }
+        self.diffs.remove(&channel);
+        d.channel = None;
+        let out = std::mem::take(&mut d.out);
+        d.outcome = Some(crate::diff::parse(&out));
+        self.render_diff(id);
+    }
+
+    /// Lays diff tab `id` out again at its width: the whole text is
+    /// written anew, from its top.
+    fn render_diff(&mut self, id: PaneId) {
+        let Some(p) = self.panes.get_mut(&id) else {
+            return;
+        };
+        let cols = p.term.cols();
+        let look = crate::diff::Look {
+            removed: rgb(mix(p.theme.background, Rgb::new(220, 50, 50), 0.22)),
+            added: rgb(mix(p.theme.background, Rgb::new(50, 180, 70), 0.2)),
+        };
+        let Host::Diff(d) = &mut p.host else {
+            return;
+        };
+        let say = |text: &str| format!("{}\x1b[0m", crate::diff::clean(text));
+        let dir = crate::diff::clean(&String::from_utf8_lossy(&d.dir));
+        let text = match &d.outcome {
+            None => return,
+            Some(crate::diff::Outcome::NoGit) => say(&format!("{} has no git command.", d.label)),
+            Some(crate::diff::Outcome::NoDir) => say(&format!(
+                "The folder {dir} is not on {} any more, or cannot be entered.",
+                d.label
+            )),
+            Some(crate::diff::Outcome::NoRepo) => say(&format!(
+                "{dir} is not in a git repository, so there is nothing to compare with."
+            )),
+            Some(crate::diff::Outcome::Changes(diff)) if diff.top.is_empty() => {
+                let err = String::from_utf8_lossy(&d.err);
+                let why = err
+                    .lines()
+                    .rev()
+                    .find(|l| !l.trim().is_empty())
+                    .unwrap_or("");
+                let status = d
+                    .status
+                    .map(|c| format!(" (exit status {c})"))
+                    .unwrap_or_default();
+                say(&format!(
+                    "The server could not run git for this{status}: {why}. It needs sh and \
+                     git, as Linux and macOS servers have."
+                ))
+            }
+            Some(crate::diff::Outcome::Changes(diff)) => {
+                let r = crate::diff::render(diff, cols, &look, d.partial);
+                d.files = r.files;
+                r.text
+            }
+        };
+        // Plain messages wrap; the diff fits its width already.
+        p.term.feed(b"\x1b[?25l\x1b[?7h\x1b[0m\x1b[2J\x1b[3J\x1b[H");
+        p.term.clear_scrollback();
+        p.term.feed(text.as_bytes());
+        p.term.scroll_to_top();
+        p.grid.mark_all_dirty();
+        self.refresh(id);
+    }
+
+    /// A key in a diff tab: r looks again, n and p go to the next and
+    /// previous file, and the usual keys scroll. Nothing goes to a host.
+    fn diff_key(&mut self, id: PaneId, bytes: &[u8]) {
+        let Some(p) = self.panes.get_mut(&id) else {
+            return;
+        };
+        let page = i32::try_from(p.term.rows().saturating_sub(1).max(1)).unwrap_or(1);
+        match bytes {
+            b"r" | b"R" => {
+                self.run_diff(id);
+                return;
+            }
+            b"n" | b"p" | b"N" | b"P" => {
+                let Host::Diff(d) = &p.host else {
+                    return;
+                };
+                let history = p.term.history_len();
+                let top = history - p.term.display_offset().min(history);
+                let target = if bytes.eq_ignore_ascii_case(b"n") {
+                    d.files.iter().copied().find(|&r| r > top)
+                } else {
+                    d.files.iter().rev().copied().find(|&r| r < top)
+                };
+                let Some(row) = target else {
+                    return;
+                };
+                p.term.scroll_to_bottom();
+                p.term
+                    .scroll_lines(i32::try_from(history.saturating_sub(row)).unwrap_or(i32::MAX));
+            }
+            b"\x1b[A" | b"\x1bOA" | b"k" => p.term.scroll_lines(1),
+            b"\x1b[B" | b"\x1bOB" | b"j" | b"\r" => p.term.scroll_lines(-1),
+            b"\x1b[5~" | b"b" => p.term.scroll_lines(page),
+            b"\x1b[6~" | b" " => p.term.scroll_lines(-page),
+            b"\x1b[H" | b"\x1bOH" | b"\x1b[1~" | b"g" => p.term.scroll_to_top(),
+            b"\x1b[F" | b"\x1bOF" | b"\x1b[4~" | b"G" => p.term.scroll_to_bottom(),
+            _ => return,
+        }
+        p.grid.mark_all_dirty();
+        self.refresh(id);
+    }
+
     fn fill_agents(&mut self, menu: HMENU) {
         let commands = crate::agents::commands(&self.settings.agent_commands);
         // SAFETY: our popup menu; it is being opened, when changing it is
-        // allowed. Everything after Agent dashboard and the six options is
-        // replaced.
+        // allowed. Everything after Agent dashboard, Show what changed and
+        // the six options is replaced.
         unsafe {
-            while GetMenuItemCount(Some(menu)) > 7 {
-                let _ = DeleteMenu(menu, 7, MF_BYPOSITION);
+            while GetMenuItemCount(Some(menu)) > 8 {
+                let _ = DeleteMenu(menu, 8, MF_BYPOSITION);
             }
             let _ = AppendMenuW(menu, MF_SEPARATOR, 0, None);
             for (id, c) in (cmd::AGENT_START..cmd::AGENT_END).zip(&commands) {
@@ -10514,6 +10896,7 @@ impl Window {
         // Every tab, so background shells know their size too.
         let pad = padding(self.dpi);
         let g = gap(self.dpi);
+        let mut relaid = Vec::new();
         let placed: Vec<(PaneId, Rect)> = self
             .ws
             .tabs
@@ -10546,6 +10929,9 @@ impl Window {
             let (cols, rows) = (p.term.cols(), p.term.rows());
             if before != (cols, rows) {
                 p.record_resize();
+                if matches!(p.host, Host::Diff(_)) && before.0 != cols {
+                    relaid.push(id);
+                }
             }
             let effect = match &p.host {
                 Host::Local {
@@ -10561,6 +10947,9 @@ impl Window {
             if let Some(e) = effect {
                 self.apply(id, vec![e]);
             }
+        }
+        for id in relaid {
+            self.render_diff(id);
         }
         if self.panes.values().any(|p| p.desktop.is_some()) {
             // SAFETY: our window; replaces any earlier timer with this id.
@@ -13618,7 +14007,9 @@ impl Window {
                     Some((alias, target.port.clone(), None)),
                 )
             }
-            Host::Tmux { .. } | Host::Desktop { .. } | Host::Replay(_) => return None,
+            Host::Tmux { .. } | Host::Desktop { .. } | Host::Replay(_) | Host::Diff(_) => {
+                return None;
+            }
         };
         let mut spec = PaneSpec::new(open);
         spec.dir = dir.filter(|d| !d.is_empty() && d != ".");
@@ -16055,6 +16446,7 @@ impl Window {
                 self.update_menu_checks();
             }
             cmd::NOTIFY_QUIET => self.toggle_quiet(pane),
+            cmd::AGENT_DIFF => return self.show_changes(pane),
             cmd::AGENTS_SHOW => {
                 self.show_side(SideView::Live, true);
                 self.live_view.set_query(crate::live::AGENTS_ONLY);
@@ -18682,6 +19074,17 @@ fn desktop_size(rect: Rect) -> (u16, u16) {
 }
 
 /// Session > Remote desktop > Open virtual desktop on a pane that is not logged in.
+/// Where Show what changed works.
+const DIFF_HOW: &str = "Show what changed works in a pane logged in to a server over SSH (or \
+     a tmux pane there), in a folder of a git repository.";
+/// Scrollback a diff tab keeps beyond [`crate::diff::MAX_ROWS`].
+const DIFF_SPARE_ROWS: usize = 1000;
+
+/// A colour as the diff view's red and green take it.
+fn rgb(c: Rgb) -> [u8; 3] {
+    [c.r, c.g, c.b]
+}
+
 const NO_COPY_HOST: &str = "Log in to an SSH host in this pane first. Copy public key to this \
                             server adds a key to ~/.ssh/authorized_keys on that host, so it \
                             can log in with the key next time.";
@@ -22396,7 +22799,11 @@ fn capture(hwnd: HWND, on: bool) {
 /// terminal output, and an SFTP-only connection has no shell.
 fn quiet_watchable(p: &Pane) -> bool {
     let sftp_only = matches!(&p.host, Host::Ssh(s) if s.target.sftp_only);
-    !matches!(p.host, Host::Replay(_) | Host::Desktop { .. }) && p.desktop.is_none() && !sftp_only
+    !matches!(
+        p.host,
+        Host::Replay(_) | Host::Desktop { .. } | Host::Diff(_)
+    ) && p.desktop.is_none()
+        && !sftp_only
 }
 
 #[cfg(test)]
