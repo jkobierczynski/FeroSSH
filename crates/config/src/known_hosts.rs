@@ -537,17 +537,25 @@ pub fn remove_lines(path: &Path, lines: &[(usize, String)]) -> io::Result<usize>
     let raw = fs::read(path)?;
     let text = decode(&raw)?;
     check_lines(path, &text, lines)?;
-    let mut out = String::with_capacity(text.len());
+    let mut out: Vec<u8> = Vec::with_capacity(raw.len());
     let mut removed = 0;
-    // Kept lines are copied as they are, line ends (CRLF too) included.
-    for (i, line) in text.split_inclusive('\n').enumerate() {
+    // Kept lines are copied byte for byte, line ends (CRLF too) and
+    // bytes that are not UTF-8 in comments included. A file with UTF-16
+    // in it is rewritten as UTF-8, as adding a key does.
+    let utf16 = raw.contains(&0);
+    let parts: Vec<&[u8]> = if utf16 {
+        text.split_inclusive('\n').map(str::as_bytes).collect()
+    } else {
+        raw.split_inclusive(|&b| b == b'\n').collect()
+    };
+    for (i, line) in parts.into_iter().enumerate() {
         if lines.iter().any(|(n, _)| *n == i + 1) {
             removed += 1;
             continue;
         }
-        out.push_str(line);
+        out.extend_from_slice(line);
     }
-    write_over(path, out.as_bytes(), Some(&raw))?;
+    write_over(path, &out, Some(&raw))?;
     Ok(removed)
 }
 
@@ -841,6 +849,18 @@ mod tests {
         let after = fs::read_to_string(&path).unwrap();
         // Kept lines keep their own line ends.
         assert_eq!(after, format!("# keep me\r\n{}\n", line("b", &b)));
+        // ...and their bytes, even ones that are not UTF-8 in a comment.
+        let mut raw = b"# caf\xe9\r\n".to_vec();
+        raw.extend_from_slice(format!("{}\n", line("a", &a)).as_bytes());
+        fs::write(&path, &raw).unwrap();
+        let l = list(&read(&path).unwrap());
+        let a_line = l.iter().find(|x| x.kind == LineKind::HostKey).unwrap();
+        assert_eq!(
+            remove_lines(&path, &[(a_line.line, a_line.text.clone())]).unwrap(),
+            1
+        );
+        assert_eq!(fs::read(&path).unwrap(), b"# caf\xe9\r\n");
+        fs::write(&path, &after).unwrap();
         let kh = KnownHosts::parse(&after);
         assert_eq!(kh.check("a", 22, &a), Status::Unknown);
         assert_eq!(kh.check("b", 22, &b), Status::Trusted);
