@@ -910,6 +910,7 @@ dependencies = [
  "ferossh-auth",
  "ferossh-config",
  "ferossh-forward",
+ "ferossh-images",
  "ferossh-ipc",
  "ferossh-mosh",
  "ferossh-render",
@@ -923,6 +924,13 @@ dependencies = [
  "russh",
  "tokio",
  "zeroize",
+]
+
+[[package]]
+name = "ferossh-images"
+version = "1.4.2"
+dependencies = [
+ "miniz_oxide 0.9.1",
 ]
 
 [[package]]
@@ -964,6 +972,7 @@ name = "ferossh-term"
 version = "1.4.2"
 dependencies = [
  "alacritty_terminal",
+ "ferossh-images",
  "ferossh-render",
  "regex-automata",
  "sha2",
