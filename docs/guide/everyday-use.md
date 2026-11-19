@@ -640,11 +640,18 @@ Background #2E3440
 Cursor     #88C0D0
 CursorText #2E3440
 Color0     #3B4252          # Color0 to Color15: the ANSI colours
-Window     sand             # one of the Window colours names, or your own:
+Window     sand             # a grey or tinted look: softgrey ... black, sand ... heather
+```
+
+Instead of `Window`, a theme can give its own window colours:
+
+```
 WindowBackground #ECE5D8
 WindowText       #2A241C
-WindowAccent     #8C5A1E
+WindowAccent     #8C5A1E          # optional; the text colour when left out
 ```
+
+`Window` takes only the fixed looks (the seven greys and eight tints), not `light`, `windows` or `theme`. When a file has both, `WindowBackground` and `WindowText` win over `Window`.
 
 A file that cannot be used at all (a colour that is not `#RRGGBB`, a name that is taken) shows greyed in the menu with the reason. A smaller mistake (an unknown line, a font size outside 6 to 72) leaves the theme selectable but marked "(see file)", with the mistaken line ignored. Window colours whose text reads below 4.5:1 on the window, the menu bar or the tabs are left out, and an accent below 3:1 is replaced by the text colour; both also mark the theme "(see file)".
 

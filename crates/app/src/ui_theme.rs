@@ -34,8 +34,8 @@ use windows::Win32::Graphics::Gdi::{
     BeginPaint, COLOR_BTNFACE, COLOR_GRAYTEXT, COLOR_MENU, COLOR_MENUBAR, COLOR_MENUTEXT,
     COLOR_WINDOW, COLOR_WINDOWTEXT, CreateFontIndirectW, CreatePen, CreateSolidBrush, DT_CENTER,
     DT_HIDEPREFIX, DT_LEFT, DT_NOPREFIX, DT_RIGHT, DT_SINGLELINE, DT_VCENTER, DeleteObject,
-    DrawFocusRect, DrawTextW, Ellipse, EndPaint, ExcludeClipRect, FillRect, GetDC, GetStockObject,
-    GetSysColor, GetSysColorBrush, GetTextExtentPoint32W, GetWindowDC, HBRUSH, HDC, HFONT, HGDIOBJ,
+    DrawFocusRect, DrawTextW, Ellipse, EndPaint, FillRect, GetDC, GetStockObject, GetSysColor,
+    GetSysColorBrush, GetTextExtentPoint32W, GetWindowDC, HBRUSH, HDC, HFONT, HGDIOBJ,
     InvalidateRect, MapWindowPoints, NULL_PEN, OffsetRect, PAINTSTRUCT, PS_SOLID, Polyline,
     RDW_ALLCHILDREN, RDW_ERASE, RDW_FRAME, RDW_INVALIDATE, RedrawWindow, ReleaseDC,
     SYS_COLOR_INDEX, SelectObject, SetBkColor, SetBkMode, SetTextColor, TRANSPARENT,
@@ -60,13 +60,14 @@ use windows::Win32::UI::Input::KeyboardAndMouse::GetFocus;
 use windows::Win32::UI::Shell::{DefSubclassProc, SetWindowSubclass};
 use windows::Win32::UI::WindowsAndMessaging::{
     DefWindowProcW, DrawMenuBar, EnumChildWindows, EnumThreadWindows, GWL_STYLE, GetClassNameW,
-    GetClientRect, GetMenuBarInfo, GetMenuItemCount, GetMenuItemInfoW, GetWindowLongPtrW,
-    GetWindowRect, HMENU, IsMenu, MENU_ITEM_TYPE, MENUBARINFO, MENUINFO, MENUITEMINFOW,
-    MFT_MENUBARBREAK, MFT_MENUBREAK, MFT_OWNERDRAW, MFT_RADIOCHECK, MFT_SEPARATOR, MFT_STRING,
-    MIIM_DATA, MIIM_FTYPE, MIIM_STRING, MIIM_SUBMENU, MIM_BACKGROUND, NONCLIENTMETRICSW,
-    OBJID_MENU, SPI_GETNONCLIENTMETRICS, SendMessageW, SetMenuInfo, SetMenuItemInfoW,
-    WM_CTLCOLORBTN, WM_CTLCOLOREDIT, WM_CTLCOLORLISTBOX, WM_CTLCOLORSTATIC, WM_DRAWITEM,
-    WM_ERASEBKGND, WM_GETFONT, WM_MEASUREITEM, WM_NCACTIVATE, WM_NCPAINT, WM_NOTIFY, WM_PAINT,
+    GetClientRect, GetMenuBarInfo, GetMenuItemCount, GetMenuItemInfoW, GetMenuState,
+    GetWindowLongPtrW, GetWindowRect, HMENU, IsMenu, MENU_ITEM_TYPE, MENUBARINFO, MENUINFO,
+    MENUITEMINFOW, MF_BYPOSITION, MF_DISABLED, MF_GRAYED, MF_HILITE, MFT_MENUBARBREAK,
+    MFT_MENUBREAK, MFT_OWNERDRAW, MFT_RADIOCHECK, MFT_SEPARATOR, MFT_STRING, MIIM_DATA, MIIM_FTYPE,
+    MIIM_STRING, MIM_BACKGROUND, NONCLIENTMETRICSW, OBJID_MENU, SPI_GETNONCLIENTMETRICS,
+    SendMessageW, SetMenuInfo, SetMenuItemInfoW, WM_CTLCOLORBTN, WM_CTLCOLOREDIT,
+    WM_CTLCOLORLISTBOX, WM_CTLCOLORSTATIC, WM_DRAWITEM, WM_ERASEBKGND, WM_GETFONT, WM_MEASUREITEM,
+    WM_MENUCHAR, WM_NCACTIVATE, WM_NCPAINT, WM_NOTIFY, WM_PAINT,
 };
 use windows::core::{BOOL, PCSTR, PCWSTR, PWSTR, w};
 
@@ -717,6 +718,9 @@ pub fn frame_message(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> Op
     if matches!(msg, WM_MEASUREITEM | WM_DRAWITEM) {
         return own_menu_message(hwnd, msg, lparam);
     }
+    if msg == WM_MENUCHAR {
+        return menu_char(wparam, lparam);
+    }
     if !matches!(
         msg,
         WM_UAHDRAWMENU | WM_UAHDRAWMENUITEM | WM_NCPAINT | WM_NCACTIVATE
@@ -929,8 +933,6 @@ struct OwnItem {
     breaks: bool,
     /// The column it is in, from 0.
     column: u32,
-    /// Opens a submenu: drawn with an arrow.
-    sub: bool,
     /// Checked with a bullet rather than a tick.
     radio: bool,
 }
@@ -947,7 +949,6 @@ impl OwnItem {
             separator: false,
             breaks: false,
             column: 0,
-            sub: false,
             radio: false,
         };
         item.set_text(None);
@@ -1041,9 +1042,9 @@ pub fn own_popup(menu: HMENU) {
             own.retain(|m| unsafe { IsMenu(m.menu) }.as_bool());
         }
     });
-    let mut old = OWN.with(|own| {
+    let old = OWN.with(|own| {
         let mut own = own.try_borrow_mut().ok()?;
-        let at = own.iter().position(|m| m.menu == menu)?;
+        let at = own.iter().rposition(|m| m.menu == menu)?;
         Some(own.remove(at))
     });
     if !on && old.is_none() {
@@ -1051,6 +1052,7 @@ pub fn own_popup(menu: HMENU) {
     }
     let mut items = Vec::new();
     let mut column = 0;
+    let mut failed = false;
     // SAFETY: a menu Windows is opening; sized struct and buffer for each
     // item; every text lives through the call that copies it.
     unsafe {
@@ -1059,7 +1061,7 @@ pub fn own_popup(menu: HMENU) {
             let mut buf = [0u16; 256];
             let mut mii = MENUITEMINFOW {
                 cbSize: size_of::<MENUITEMINFOW>() as u32,
-                fMask: MIIM_FTYPE | MIIM_STRING | MIIM_DATA | MIIM_SUBMENU,
+                fMask: MIIM_FTYPE | MIIM_STRING | MIIM_DATA,
                 dwTypeData: PWSTR(buf.as_mut_ptr()),
                 cch: buf.len() as u32 - 1,
                 ..Default::default()
@@ -1070,11 +1072,15 @@ pub fn own_popup(menu: HMENU) {
             let ty = mii.fType.0;
             let n = (mii.cch as usize).min(buf.len());
             // Windows may keep no text for an owner-drawn item: ours then.
+            // Found by its data, wherever the item has moved to.
             let kept = old
-                .as_mut()
-                .and_then(|m| m.items.get_mut(pos as usize))
-                .filter(|i| (&raw const *i.msaa) as usize == mii.dwItemData)
-                .map(|i| std::mem::take(&mut i.text));
+                .as_ref()
+                .and_then(|m| {
+                    m.items
+                        .iter()
+                        .find(|i| (&raw const *i.msaa) as usize == mii.dwItemData)
+                })
+                .map(|i| without_nul(&i.text).to_vec());
             let text = match kept {
                 Some(k) if n == 0 => k,
                 _ => buf.get(..n).unwrap_or_default().to_vec(),
@@ -1086,7 +1092,6 @@ pub fn own_popup(menu: HMENU) {
                 column += 1;
             }
             item.column = column;
-            item.sub = !mii.hSubMenu.is_invalid();
             item.radio = ty & MFT_RADIOCHECK.0 != 0;
             // Keeps the radio check style CheckMenuRadioItem set.
             let mut ty =
@@ -1109,7 +1114,9 @@ pub fn own_popup(menu: HMENU) {
                 set.dwTypeData = PWSTR(item.text.as_mut_ptr());
             }
             set.fType = MENU_ITEM_TYPE(ty);
-            let _ = SetMenuItemInfoW(menu, pos, true, &set);
+            if SetMenuItemInfoW(menu, pos, true, &set).is_err() {
+                failed = true;
+            }
             item.set_text(None);
             items.push(item);
         }
@@ -1124,8 +1131,16 @@ pub fn own_popup(menu: HMENU) {
     } else {
         set_back(menu, HBRUSH::default());
     }
-    // The old items' data is no longer in any item: dropped only now.
-    drop(old);
+    // The old items' data is no longer in any item once every item took
+    // its new data; otherwise an item may still point at it, so it is kept
+    // (and still drawn) until the menu is destroyed.
+    if let Some(old) = old.filter(|_| failed) {
+        OWN.with(|own| {
+            if let Ok(mut own) = own.try_borrow_mut() {
+                own.insert(0, old);
+            }
+        });
+    }
 }
 
 /// Repaints open owned menus in the colours now in use (a window colour
@@ -1160,7 +1175,6 @@ fn repaint_popups() {
 struct DrawnItem {
     separator: bool,
     column: u32,
-    sub: bool,
     radio: bool,
     text: Vec<u16>,
 }
@@ -1175,7 +1189,6 @@ fn own_item(data: usize) -> Option<DrawnItem> {
         Some(DrawnItem {
             separator: item.separator,
             column: item.column,
-            sub: item.sub,
             radio: item.radio,
             text: without_nul(&item.text).to_vec(),
         })
@@ -1193,6 +1206,7 @@ pub fn owned_text(menu: HMENU, pos: u32) -> Option<String> {
         let own = own.try_borrow().ok()?;
         let item = own
             .iter()
+            .rev()
             .find(|m| m.menu == menu)?
             .items
             .get(pos as usize)?;
@@ -1208,6 +1222,7 @@ pub fn note_text(menu: HMENU, pos: u32, text: &str) {
         if let Ok(mut own) = own.try_borrow_mut()
             && let Some(item) = own
                 .iter_mut()
+                .rev()
                 .find(|m| m.menu == menu)
                 .and_then(|m| m.items.get_mut(pos as usize))
         {
@@ -1297,7 +1312,8 @@ fn own_menu_message(hwnd: HWND, msg: u32, lparam: LPARAM) -> Option<LRESULT> {
 
 /// The space left of an item's text, where the check mark goes (96 DPI).
 const GUTTER: i32 = 28;
-/// The space right of an item, where a submenu's arrow goes (96 DPI).
+/// The space right of an item, where Windows draws a submenu's arrow
+/// (96 DPI).
 const ARROW_ROOM: i32 = 24;
 /// The least space between an item's text and its shortcut (96 DPI).
 const KEY_GAP: i32 = 32;
@@ -1413,25 +1429,61 @@ fn draw_own_item(hwnd: HWND, dis: &DRAWITEMSTRUCT, item: &mut DrawnItem) {
         if let Some(old) = old {
             SelectObject(dc, old);
         }
-        if item.sub {
-            // Our own arrow; the clip keeps Windows from drawing its own
-            // (in its colours) over the item afterwards.
-            let ax = r.right - s(ARROW_ROOM) / 2;
-            line(&[
-                POINT {
-                    x: ax - s(2),
-                    y: cy - s(4),
-                },
-                POINT {
-                    x: ax + s(2),
-                    y: cy,
-                },
-                POINT {
-                    x: ax - s(2),
-                    y: cy + s(4),
-                },
-            ]);
-            let _ = ExcludeClipRect(dc, r.left, r.top, r.right, r.bottom);
+    }
+}
+
+/// `WM_MENUCHAR`: Windows matches access keys (`&1`) only in items it
+/// draws itself; in an owned menu the item with that key is chosen here,
+/// or, with several, the next one after the selected item is selected.
+fn menu_char(wparam: WPARAM, lparam: LPARAM) -> Option<LRESULT> {
+    const MNC_EXECUTE: u32 = 2;
+    const MNC_SELECT: u32 = 3;
+    let menu = HMENU(lparam.0 as *mut core::ffi::c_void);
+    let key = char::from_u32(u32::from(wparam.0 as u16))?
+        .to_lowercase()
+        .next()?;
+    let matches: Vec<u32> = OWN.with(|own| {
+        let own = own.try_borrow().ok()?;
+        let m = own.iter().rev().find(|m| m.menu == menu)?;
+        Some(
+            m.items
+                .iter()
+                .enumerate()
+                .filter(|(_, i)| !i.separator && access_key(without_nul(&i.text)) == Some(key))
+                .map(|(pos, _)| pos as u32)
+                .filter(|pos| {
+                    // SAFETY: plain query on a menu of ours.
+                    let state = unsafe { GetMenuState(menu, *pos, MF_BYPOSITION) };
+                    state & (MF_GRAYED.0 | MF_DISABLED.0) == 0
+                })
+                .collect(),
+        )
+    })?;
+    let first = *matches.first()?;
+    if matches.len() == 1 {
+        return Some(LRESULT((first | (MNC_EXECUTE << 16)) as isize));
+    }
+    // SAFETY: plain queries on a menu of ours.
+    let selected = (0..unsafe { GetMenuItemCount(Some(menu)) }.max(0) as u32)
+        .find(|pos| unsafe { GetMenuState(menu, *pos, MF_BYPOSITION) } & MF_HILITE.0 != 0);
+    let next = selected
+        .and_then(|sel| matches.iter().copied().find(|pos| *pos > sel))
+        .unwrap_or(first);
+    Some(LRESULT((next | (MNC_SELECT << 16)) as isize))
+}
+
+/// The character after an item text's single `&` (not `&&`), lower case.
+fn access_key(text: &[u16]) -> Option<char> {
+    let label = split_tab(text).0;
+    let text = String::from_utf16_lossy(label);
+    let mut chars = text.chars();
+    while let Some(c) = chars.next() {
+        if c == '&' {
+            match chars.next()? {
+                '&' => continue,
+                k => return k.to_lowercase().next(),
+            }
         }
     }
+    None
 }
