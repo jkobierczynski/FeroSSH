@@ -19934,19 +19934,20 @@ fn run_command(hwnd: HWND, command: Command) {
                 }
             }
             // The dialogs let messages run: the pane may have closed, its
-            // agent gone, or its paste mode changed meanwhile.
+            // agent gone, or its paste mode changed meanwhile (an agent that
+            // quit to its shell turns bracketed paste off, and the line
+            // breaks would run there). What was asked about is sent, or
+            // nothing.
             with_window(|w| {
-                if w.receivers(&all) != receivers {
+                let now = w.panes.get(&id).map(|p| p.term.paste(&text).bytes);
+                if w.receivers(&all) != receivers || now.as_ref() != Some(&paste.bytes) {
                     w.show(
                         id,
                         "\x1b[0;90mNot pasted: the panes changed while FeroSSH asked.\x1b[0m\r\n",
                     );
                     return;
                 }
-                let Some(bytes) = w.panes.get(&id).map(|p| p.term.paste(&text).bytes) else {
-                    return;
-                };
-                w.input(id, bytes);
+                w.input(id, paste.bytes);
                 w.send_typed(&targets, &Typed::Paste(text));
             });
         }
