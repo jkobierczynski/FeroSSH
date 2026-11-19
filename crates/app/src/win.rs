@@ -827,6 +827,11 @@ struct Logging {
     agent: Option<String>,
 }
 
+/// A paste's receiver as confirmed: its pane, the coding agent it runs,
+/// whether it has the Production theme, and its connection
+/// ([`Window::link_of`]).
+type Receiver = (PaneId, Option<String>, bool, Option<(ChannelId, bool)>);
+
 /// Session > Logs and recordings > Record this pane: the pane's output with its timing, as an
 /// asciicast file in the log folder, sealed like a log. Only what the
 /// host sent goes in, never what was typed, so a password typed at a
@@ -9493,7 +9498,7 @@ impl Window {
     /// Each of `panes` that is still open, with the coding agent it runs
     /// and whether it has the Production theme: what a paste was confirmed
     /// for.
-    fn receivers(&self, panes: &[PaneId]) -> Vec<(PaneId, Option<String>, bool)> {
+    fn receivers(&self, panes: &[PaneId]) -> Vec<Receiver> {
         panes
             .iter()
             .filter_map(|id| {
@@ -9502,9 +9507,25 @@ impl Window {
                     *id,
                     self.agent_of(*id).map(str::to_owned),
                     p.theme.name == "Production",
+                    self.link_of(*id),
                 ))
             })
             .collect()
+    }
+
+    /// Which SSH connection pane `id` types into, and whether it is logged
+    /// in: each connection has a channel of its own, so a reconnect (or a
+    /// login prompt) is not the shell a paste was confirmed for. A tmux
+    /// pane types into its gateway's connection.
+    fn link_of(&self, id: PaneId) -> Option<(ChannelId, bool)> {
+        match &self.panes.get(&id)?.host {
+            Host::Ssh(s) => Some((
+                s.channel,
+                s.state() == State::Connected && !s.prompt_active(),
+            )),
+            Host::Tmux { gateway, .. } => self.link_of(*gateway),
+            _ => None,
+        }
     }
 
     /// The Production-themed panes among `panes` that run a coding agent,
