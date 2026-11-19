@@ -893,6 +893,7 @@ dependencies = [
  "ring",
  "russh",
  "sha1",
+ "windows",
  "zeroize",
 ]
 
