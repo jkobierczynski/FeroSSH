@@ -16,6 +16,9 @@ use unicode_width::UnicodeWidthChar;
 pub const KEEP: usize = 8 * 1024 * 1024;
 /// Rows shown at most, well within the terminal's scrollback.
 pub const MAX_ROWS: usize = 200_000;
+/// Cells (rows times columns) shown at most, so a wide pane holds no
+/// more than a narrow one: MAX_ROWS rows at 80 columns.
+const MAX_CELLS: usize = MAX_ROWS * 80;
 /// Columns a tab advances to.
 const TAB: usize = 4;
 /// Untracked files shown at most, and the largest shown (bytes).
@@ -61,8 +64,9 @@ pub fn command() -> Vec<u8> {
              case $f in \\\"*) continue;; esac; \
              [ -f \"$f\" ] || [ -L \"$f\" ] || continue; \
              if [ -L \"$f\" ]; then l=$(readlink -- \"$f\") || echo @ferossh-diff failed; \
-             printf \"diff --git a/%s b/%s\\nnew file mode 120000\\n--- /dev/null\\n+++ b/%s\\n@@ -0,0 +1 @@\\n+%s\\n\" \
-             \"$f\" \"$f\" \"$f\" \"$l\"; \
+             n=$(printf \"%s\\n\" \"$l\" | wc -l); \
+             printf \"diff --git a/%s b/%s\\nnew file mode 120000\\n--- /dev/null\\n+++ b/%s\\n@@ -0,0 +1,%s @@\\n\" \
+             \"$f\" \"$f\" \"$f\" $n; printf \"%s\\n\" \"$l\" | sed \"s/^/+/\"; \
              elif [ \"$(wc -c < \"$f\")\" -gt {BIG} ]; then printf \"@ferossh-diff big %s\\n\" \"$f\"; \
              else {git} diff {opts} --no-index -- /dev/null \"$f\"; \
              [ $? -le 1 ] || echo @ferossh-diff failed; fi; done",
@@ -582,6 +586,7 @@ const RESET: &str = "\x1b[0m";
 /// show).
 pub fn render(diff: &Diff, cols: usize, look: &Look, notes: &[String]) -> Rendered {
     let cols = cols.max(20);
+    let limit = MAX_ROWS.min(MAX_CELLS / cols);
     let mut out: Vec<String> = Vec::new();
     let mut files = Vec::new();
     let (added, removed) = diff
@@ -624,10 +629,10 @@ pub fn render(diff: &Diff, cols: usize, look: &Look, notes: &[String]) -> Render
         out.push("No changes: the files are as in the last commit.".to_owned());
     }
     // Every push below checks the row limit first, so a diff with many
-    // files or one huge line stops at MAX_ROWS (plus one note).
+    // files or one huge line stops at the limit (plus one note).
     let mut over = false;
     for f in &diff.files {
-        if out.len() >= MAX_ROWS {
+        if out.len() >= limit {
             over = true;
             break;
         }
@@ -643,7 +648,7 @@ pub fn render(diff: &Diff, cols: usize, look: &Look, notes: &[String]) -> Render
             break;
         }
         // A blank row, the header bar and maybe a note.
-        if out.len() + 3 > MAX_ROWS {
+        if out.len() + 3 > limit {
             over = true;
             break;
         }
@@ -687,13 +692,13 @@ pub fn render(diff: &Diff, cols: usize, look: &Look, notes: &[String]) -> Render
                 h.new_start,
                 h.heading
             );
-            if out.len() >= MAX_ROWS {
+            if out.len() >= limit {
                 over = true;
                 break 'files;
             }
             out.push(format!("{DIM}{}{RESET}", fit(&at, cols).0));
             for r in &h.rows {
-                let budget = MAX_ROWS.saturating_sub(out.len());
+                let budget = limit.saturating_sub(out.len());
                 if budget == 0 {
                     over = true;
                     break 'files;
@@ -702,7 +707,7 @@ pub fn render(diff: &Diff, cols: usize, look: &Look, notes: &[String]) -> Render
             }
         }
     }
-    if over || out.len() >= MAX_ROWS {
+    if over || out.len() >= limit {
         out.push(format!(
             "\x1b[0;33m{}{RESET}",
             fit(
@@ -1184,16 +1189,24 @@ diff --git a/x b/x\n--- a/x\n+++ b/x\n@@ -1 +1 @@\n-\x1b[2Jold\n+\u{202e}new\u{9
         // A link to a folder and one to nothing are both new files.
         std::os::unix::fs::symlink("d", tmp.join("to-dir")).unwrap();
         std::os::unix::fs::symlink("gone", tmp.join("to-nothing")).unwrap();
+        // A target with a line break shows as two lines, not as markers.
+        std::os::unix::fs::symlink("x\n@ferossh-diff norepo", tmp.join("odd")).unwrap();
         let Outcome::Changes(d) = run(&tmp) else {
             panic!()
         };
         let names: Vec<_> = d.files.iter().map(|f| (f.name(), f.kind)).collect();
         assert_eq!(
             names,
-            [("to-dir", Kind::Added), ("to-nothing", Kind::Added)]
+            [
+                ("odd", Kind::Added),
+                ("to-dir", Kind::Added),
+                ("to-nothing", Kind::Added)
+            ]
         );
+        assert_eq!(d.files[0].added, 2);
+        assert_eq!(d.files[1].hunks[0].rows[0].right, Some((1, "d".to_owned())));
         assert!(!d.more && !d.failed);
-        for i in 0..UNTRACKED - 2 {
+        for i in 0..UNTRACKED - 3 {
             std::fs::write(tmp.join(format!("f{i}")), "x\n").unwrap();
         }
         let Outcome::Changes(d) = run(&tmp) else {
@@ -1246,9 +1259,9 @@ diff --git a/x b/x\n--- a/x\n+++ b/x\n@@ -1 +1 @@\n-\x1b[2Jold\n+\u{202e}new\u{9
         for cols in [20, 200] {
             let r = render(&d, cols, &LOOK, &[]);
             let rows = r.text.split("\r\n").count();
-            assert!(rows <= MAX_ROWS + 1, "{cols}: {rows}");
-            // Wide, the line fits in fewer rows than the limit.
-            assert_eq!(plain(&r.text).contains("FeroSSH shows"), cols == 20);
+            // Wide, fewer rows: the same number of cells.
+            assert!(rows <= MAX_ROWS.min(MAX_CELLS / cols) + 1, "{cols}: {rows}");
+            assert!(plain(&r.text).contains("FeroSSH shows"));
         }
     }
 
