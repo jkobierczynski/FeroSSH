@@ -287,7 +287,8 @@ fn draw(canvas: &mut Canvas, x: u32, y: u32, bits: u8, n: u32, colour: u32, clip
     // with only its top pixels.
     let bottom = y.saturating_add(7 - bits.leading_zeros());
     let cost = (n as usize).saturating_mul(bits.count_ones() as usize);
-    if canvas.budget < cost || !canvas.reach(last, bottom) {
+    // `reach` may charge a new canvas, so the cost is checked again.
+    if canvas.budget < cost || !canvas.reach(last, bottom) || canvas.budget < cost {
         // Past the limits: the rest is dropped, the part drawn stays.
         *clipped = true;
         return;
@@ -353,6 +354,13 @@ mod tests {
         assert_eq!(p.map(|p| p.height), Some(6));
         let p = decode(b"~-@", &small).ok();
         assert_eq!(p.map(|p| p.height), Some(7));
+        // A new canvas that uses up the budget leaves none for its pixel.
+        let mut last = b"@".to_vec();
+        for _ in 0..10 {
+            last.extend_from_slice(b"$!10~");
+        }
+        last.extend_from_slice(b"$!6~$!3@-@");
+        assert!(decode(&last, &small).is_ok());
     }
 
     #[test]

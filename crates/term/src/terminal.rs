@@ -735,12 +735,15 @@ impl Terminal {
 
     /// Ends a pending synchronized update and shows what it buffered.
     pub fn flush_sync(&mut self) {
+        let queued = self.events.0.borrow().len();
         if self.stop.is_some() {
             self.watched(|t| t.parser.stop_sync(&mut t.term));
         } else {
             self.parser.stop_sync(&mut self.term);
         }
         self.repair();
+        // Titles that were held back count like ones fed directly.
+        self.follow_title(queued);
     }
 
     /// Runs `process` (which hands output to the emulator) while counting

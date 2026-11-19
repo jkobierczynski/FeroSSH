@@ -237,6 +237,26 @@ fn kitty_query_answers_before_device_attributes() {
 }
 
 #[test]
+fn title_set_in_a_flushed_update_is_given_back() {
+    // A full-screen app sets its title inside a synchronized update and
+    // asks a kitty query, which lets the update out early; leaving the
+    // alternate screen still brings back the shell's title.
+    let mut t = term(20, 6);
+    t.feed(b"\x1b]2;bash\x07\x1b[?1049h");
+    t.feed(b"\x1b[?2026h\x1b]0;app\x07\x1b_Gi=33,s=1,v=1,a=q,t=d,f=24;AAAA\x1b\\\x1b[?2026l");
+    t.feed(b"\x1b[?1049l");
+    let titles: Vec<_> = t
+        .take_actions()
+        .into_iter()
+        .filter_map(|a| match a {
+            Action::Title(t) => Some(t),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(titles.last(), Some(&Some("bash".to_owned())));
+}
+
+#[test]
 fn links_are_not_pictures() {
     let mut t = term(20, 6);
     t.feed(b"\x1bPq!10~\x1b\\");
