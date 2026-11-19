@@ -9308,7 +9308,7 @@ impl Window {
                     // tmux answered its panes' queries already.
                     Action::Reply(_)
                         if self.panes.get(&id).is_some_and(|p| p.gateway().is_some()) => {}
-                    Action::Reply(bytes) => self.send(id, bytes),
+                    Action::Reply(bytes) | Action::ImageReply(bytes) => self.send(id, bytes),
                     Action::Title(title) => {
                         if let Some(p) = self.panes.get_mut(&id) {
                             p.title = title;

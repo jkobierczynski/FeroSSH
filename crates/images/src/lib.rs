@@ -4,7 +4,10 @@
 //! Everything a host sends is untrusted. Every decoder here is safe Rust
 //! (`unsafe` is forbidden in this crate), checks sizes before it
 //! allocates, and stops at [`Limits`]: a picture larger than allowed is
-//! refused, never truncated into a huge allocation. Nothing here reads a
+//! refused, never truncated into a huge allocation. Sixel is the one
+//! exception: it has no size up front (its raster attributes need not be
+//! true), so a Sixel picture that grows past the limits keeps the part
+//! drawn within them, as terminals with a fixed Sixel canvas do. Nothing here reads a
 //! file, opens a socket or answers the host with anything but a fixed
 //! status; the kitty protocol's file and shared-memory transmissions
 //! are refused outright.
@@ -154,7 +157,10 @@ pub fn from_raw(
     }
     let bpp = if alpha { 4 } else { 3 };
     let n = w as usize * h as usize;
-    let data = data.get(..n * bpp).ok_or(Error::Invalid)?;
+    // Exactly the pixels the size says: more or less is malformed.
+    if Some(data.len()) != n.checked_mul(bpp) {
+        return Err(Error::Invalid);
+    }
     let pixels = data
         .chunks_exact(bpp)
         .map(|p| match *p {
@@ -200,6 +206,11 @@ mod tests {
         assert_eq!(
             from_raw(&[1, 2], 2, 1, false, &Limits::DEFAULT),
             Err(Error::Invalid)
+        );
+        assert_eq!(
+            from_raw(&[1, 2, 3, 4], 1, 1, false, &Limits::DEFAULT),
+            Err(Error::Invalid),
+            "a byte too many"
         );
         assert_eq!(
             from_raw(&[], 9000, 1, false, &Limits::DEFAULT),

@@ -120,6 +120,9 @@ pub fn decode(data: &[u8], limits: &Limits) -> Result<Picture, Error> {
                 compressed.extend_from_slice(chunk);
             }
             b"IEND" => break,
+            // An unknown chunk the picture depends on (upper-case first
+            // letter): it cannot be shown right.
+            [first, ..] if first.is_ascii_uppercase() => return Err(Error::Unsupported),
             _ => {}
         }
     }
@@ -404,6 +407,10 @@ mod tests {
         assert_eq!(decode(b"nope", &Limits::DEFAULT), Err(Error::Invalid));
         let big = png(100_000, 1, 8, 0, 0, &[0], &[]);
         assert_eq!(decode(&big, &Limits::DEFAULT), Err(Error::TooLarge));
+        let odd = png(1, 1, 8, 0, 0, &[0, 7], &[(b"ZZZZ", b"")]);
+        assert_eq!(decode(&odd, &Limits::DEFAULT), Err(Error::Unsupported));
+        let fine = png(1, 1, 8, 0, 0, &[0, 7], &[(b"tEXt", b"a\0b")]);
+        assert!(decode(&fine, &Limits::DEFAULT).is_ok());
         let short = png(4, 4, 8, 0, 0, &[0, 1], &[]);
         assert_eq!(decode(&short, &Limits::DEFAULT), Err(Error::Invalid));
     }

@@ -102,11 +102,18 @@ impl Canvas {
             (y + 1).max(self.cap_h * 2).max(6)
         };
         let (w, h) = (w.min(self.limits.max_side), h.min(self.limits.max_side));
-        // Within the pixel budget, grow only as far as needed.
+        // Past the pixel budget, grow each side only as far as the budget
+        // allows for the other, but never by less than needed: growing a
+        // column at a time would copy the whole canvas for each.
         let (w, h) = if (w as usize) * (h as usize) <= self.limits.max_pixels {
             (w, h)
         } else {
-            (self.cap_w.max(x + 1), self.cap_h.max(y + 1))
+            let need_h = self.cap_h.max(y + 1);
+            let fit_w = (self.limits.max_pixels / need_h.max(1) as usize).min(w as usize) as u32;
+            let w = fit_w.max(self.cap_w).max(x + 1);
+            let need_w = w;
+            let fit_h = (self.limits.max_pixels / need_w.max(1) as usize).min(h as usize) as u32;
+            (w, fit_h.max(need_h))
         };
         if (w as usize) * (h as usize) > self.limits.max_pixels {
             return false;
@@ -263,7 +270,9 @@ fn draw(canvas: &mut Canvas, x: u32, y: u32, bits: u8, n: u32, colour: u32, clip
         return;
     }
     let last = x.saturating_add(n - 1);
-    let bottom = y.saturating_add(5);
+    // The lowest pixel actually set: a band may reach past the bottom
+    // with only its top pixels.
+    let bottom = y.saturating_add(7 - bits.leading_zeros());
     let cost = (n as usize).saturating_mul(bits.count_ones() as usize);
     if canvas.budget < cost || !canvas.reach(last, bottom) {
         // Past the limits: the rest is dropped, the part drawn stays.
@@ -326,8 +335,10 @@ mod tests {
         }
         let p = decode(&over, &small).ok();
         assert_eq!(p.map(|p| p.width), Some(10), "the part drawn stays");
-        // Bands past the bottom stop.
+        // Bands past the bottom stop; a band whose set pixels fit draws.
         let p = decode(b"~-~-~-~", &small).ok();
         assert_eq!(p.map(|p| p.height), Some(6));
+        let p = decode(b"~-@", &small).ok();
+        assert_eq!(p.map(|p| p.height), Some(7));
     }
 }

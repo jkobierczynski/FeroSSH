@@ -45,7 +45,7 @@ fuzz_target!(|data: &[u8]| {
         }
         2 => {
             let (keys, payload) = match rest.iter().position(|&b| b == b';') {
-                Some(at) => rest.split_at(at),
+                Some(at) => (&rest[..at], &rest[at + 1..]),
                 None => (rest, &[][..]),
             };
             let cmd = Command::parse(keys);

@@ -8,7 +8,7 @@ use alacritty_terminal::vte::ansi::Handler;
 use ferossh_images::kitty::Command;
 use ferossh_images::{Error, Limits, iterm};
 
-use super::{MAX_COLS, MAX_ROWS, Terminal};
+use super::{MAX_COLS, MAX_ROWS, Terminal, WATCH_BUMP};
 use crate::images::{MARKER_ID, Marker, Piece, Scanner, Sequence, Store};
 
 /// Replies to kitty graphics commands kept between two `take_actions`.
@@ -139,64 +139,86 @@ impl Terminal {
                 let result = cmd.decode(&payload, &limits).map(|_| ());
                 self.reply(&cmd, result);
             }
-            b't' | b'T' => {
-                let decoded = cmd.decode(&payload, &limits).and_then(|p| crop(&cmd, p));
-                match decoded {
-                    Ok(p) => {
-                        let show = cmd.action == b'T';
-                        let cells = self.kitty_cells(&cmd, p.width, p.height);
-                        let key = self.add_and_place(p, cells, after(&cmd, show));
-                        if let (Some(images), Some(key)) = (&mut self.images, key)
-                            && cmd.id != 0
-                        {
+            b't' | b'T' => match cmd.decode(&payload, &limits) {
+                Ok(p) => {
+                    // The whole picture is kept; a crop is the placement's.
+                    let Some(key) = self.add_and_place(p, (1, 1), None) else {
+                        return;
+                    };
+                    let picture = self.images.as_mut().and_then(|images| {
+                        if cmd.id != 0 {
                             images.store.set_kitty(cmd.id, key);
                         }
-                        self.reply(&cmd, Ok(()));
-                    }
-                    Err(e) => self.reply(&cmd, Err(e)),
+                        images.store.get(key).cloned()
+                    });
+                    let result = match picture {
+                        Some(picture) if cmd.action == b'T' => self.kitty_show(&cmd, &picture),
+                        _ => Ok(()),
+                    };
+                    self.reply(&cmd, result);
                 }
-            }
+                Err(e) => self.reply(&cmd, Err(e)),
+            },
             b'p' => {
                 let found = self
                     .images
                     .as_ref()
                     .and_then(|i| i.store.kitty(cmd.id))
                     .cloned();
-                let Some(picture) = found else {
-                    self.reply(&cmd, Err(Error::NotFound));
-                    return;
+                let result = match found {
+                    Some(picture) => self.kitty_show(&cmd, &picture),
+                    None => Err(Error::NotFound),
                 };
-                let cropped = cmd.src_x | cmd.src_y | cmd.src_w | cmd.src_h != 0;
-                if cropped {
-                    let whole = ferossh_images::Picture {
-                        width: picture.width,
-                        height: picture.height,
-                        pixels: picture.pixels.to_vec(),
-                    };
-                    match crop(&cmd, whole) {
-                        Ok(p) => {
-                            let cells = self.kitty_cells(&cmd, p.width, p.height);
-                            self.add_and_place(p, cells, after(&cmd, true));
-                        }
-                        Err(e) => {
-                            self.reply(&cmd, Err(e));
-                            return;
-                        }
-                    }
-                } else {
-                    let cells = self.kitty_cells(&cmd, picture.width, picture.height);
-                    let after = if cmd.cursor_stays {
-                        After::Stay
-                    } else {
-                        After::Right
-                    };
-                    self.place(picture.key, cells, after);
-                }
-                self.reply(&cmd, Ok(()));
+                self.reply(&cmd, result);
             }
             b'd' => self.kitty_delete(&cmd),
             _ => self.reply(&cmd, Err(Error::Unsupported)),
         }
+    }
+
+    /// Places a kept kitty picture as `cmd` says: the part `x`, `y`, `w`
+    /// and `h` pick (a copy, noted as the image's), over `c` x `r` cells.
+    fn kitty_show(
+        &mut self,
+        cmd: &Command,
+        picture: &ferossh_render::Picture,
+    ) -> Result<(), Error> {
+        let after = if cmd.cursor_stays {
+            After::Stay
+        } else {
+            After::Right
+        };
+        if cmd.src_x | cmd.src_y | cmd.src_w | cmd.src_h == 0 {
+            let cells = self.kitty_cells(cmd, picture.width, picture.height);
+            self.place(picture.key, cells, after);
+            return Ok(());
+        }
+        let w = if cmd.src_w == 0 {
+            picture.width
+        } else {
+            cmd.src_w
+        };
+        let h = if cmd.src_h == 0 {
+            picture.height
+        } else {
+            cmd.src_h
+        };
+        let whole = ferossh_images::Picture {
+            width: picture.width,
+            height: picture.height,
+            pixels: picture.pixels.to_vec(),
+        };
+        let part = whole
+            .crop(cmd.src_x, cmd.src_y, w, h)
+            .ok_or(Error::Invalid)?;
+        let cells = self.kitty_cells(cmd, part.width, part.height);
+        let key = self.add_and_place(part, cells, Some(after));
+        if let (Some(images), Some(key)) = (&mut self.images, key)
+            && cmd.id != 0
+        {
+            images.store.derive_kitty(cmd.id, key);
+        }
+        Ok(())
     }
 
     /// `a=d`: lower case removes pictures from the screen, upper case
@@ -208,10 +230,13 @@ impl Terminal {
         let free = cmd.delete.is_ascii_uppercase();
         let which = match cmd.delete.to_ascii_lowercase() {
             b'a' => None,
-            b'i' => match images.store.kitty_key(cmd.id) {
-                Some(key) => Some(key),
-                None => return,
-            },
+            b'i' => {
+                let keys = images.store.kitty_keys(cmd.id);
+                if keys.is_empty() {
+                    return;
+                }
+                Some(keys)
+            }
             // Deleting by position, z-index or animation frame: nothing
             // FeroSSH keeps apart, so nothing to do.
             _ => return,
@@ -231,7 +256,7 @@ impl Terminal {
                     .hyperlink()
                     .filter(|h| h.id() == MARKER_ID)
                     .and_then(|h| Marker::parse(h.uri()))
-                    .is_some_and(|m| which.is_none_or(|k| k == m.key));
+                    .is_some_and(|m| which.as_ref().is_none_or(|k| k.contains(&m.key)));
                 if hit {
                     *cell = TermCell::default();
                 }
@@ -327,12 +352,21 @@ impl Terminal {
 
     /// Lays picture `key` over `cols` x `rows` cells from the cursor,
     /// scrolling as needed, and moves the cursor `after` it.
-    fn place(&mut self, key: u32, (cols, rows): (usize, usize), after: After) {
+    fn place(&mut self, key: u32, cells: (usize, usize), after: After) {
         // Output held back by a synchronized update goes in first, so the
         // picture lands where the host meant.
         if self.sync_deadline().is_some() {
             self.flush_sync();
         }
+        // Lines a picture scrolls count for a stop pattern as text does.
+        if self.stop.is_some() && after != After::Stay {
+            self.watched(|t| t.lay_out(key, cells, after));
+        } else {
+            self.lay_out(key, cells, after);
+        }
+    }
+
+    fn lay_out(&mut self, key: u32, (cols, rows): (usize, usize), after: After) {
         let (cols, rows) = (cols.clamp(1, MAX_COLS), rows.clamp(1, MAX_ROWS));
         let width = self.term.columns();
         let screen = self.term.screen_lines();
@@ -342,7 +376,8 @@ impl Terminal {
         // At most two screens of it: more could not be seen at once, and
         // a host asking for a huge size should not cost more than
         // clearing the screen does. The rest is cut off, not squeezed.
-        let laid = rows.min(screen * 2);
+        // (and within what a watched feed may scroll).
+        let laid = rows.min(screen * 2).min(screen + WATCH_BUMP - 1);
         for j in 0..laid {
             let line = if after == After::Stay {
                 let l = start.line.0 + j as i32;
@@ -432,23 +467,4 @@ impl Terminal {
             .map(|i| std::mem::take(&mut i.replies))
             .unwrap_or_default()
     }
-}
-
-/// Where the cursor goes after a kitty picture, if it is shown.
-fn after(cmd: &Command, show: bool) -> Option<After> {
-    show.then_some(if cmd.cursor_stays {
-        After::Stay
-    } else {
-        After::Right
-    })
-}
-
-/// The part of `p` kitty's `x`, `y`, `w` and `h` ask for.
-fn crop(cmd: &Command, p: ferossh_images::Picture) -> Result<ferossh_images::Picture, Error> {
-    if cmd.src_x | cmd.src_y | cmd.src_w | cmd.src_h == 0 {
-        return Ok(p);
-    }
-    let w = if cmd.src_w == 0 { p.width } else { cmd.src_w };
-    let h = if cmd.src_h == 0 { p.height } else { cmd.src_h };
-    p.crop(cmd.src_x, cmd.src_y, w, h).ok_or(Error::Invalid)
 }

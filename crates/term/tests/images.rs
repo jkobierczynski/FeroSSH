@@ -42,7 +42,7 @@ fn replies(t: &mut Terminal) -> Vec<Vec<u8>> {
     t.take_actions()
         .into_iter()
         .filter_map(|a| match a {
-            Action::Reply(r) => Some(r),
+            Action::Reply(r) | Action::ImageReply(r) => Some(r),
             _ => None,
         })
         .collect()
@@ -222,4 +222,24 @@ fn links_are_not_pictures() {
     let mut t = term(20, 6);
     t.feed(b"\x1bPq!10~\x1b\\");
     assert_eq!(t.link_at(0, 0), None);
+}
+
+#[test]
+fn kitty_crop_is_per_placement() {
+    let mut t = term(20, 6);
+    // Red then green, shown cropped to the green pixel.
+    let data = encode(&[255, 0, 0, 0, 255, 0]);
+    t.feed(format!("\x1b_Ga=T,f=24,s=2,v=1,i=7,x=1,w=1,q=2;{data}\x1b\\").as_bytes());
+    let (g, _) = grid(&t);
+    let key = pic(&g, 0, 0).unwrap().key;
+    assert_eq!(&g.picture(key).unwrap().pixels[..], &[0xFF00_FF00]);
+    // Placed again uncropped: both pixels are still kept.
+    t.feed(b"\r\n\x1b_Ga=p,i=7,q=2\x1b\\");
+    let (g, _) = grid(&t);
+    let whole = pic(&g, 0, 1).unwrap().key;
+    assert_eq!(g.picture(whole).unwrap().width, 2);
+    // Deleting the image removes the cropped placement too.
+    t.feed(b"\x1b_Ga=d,d=i,i=7\x1b\\");
+    let (g, _) = grid(&t);
+    assert!(g.pictures().is_empty());
 }

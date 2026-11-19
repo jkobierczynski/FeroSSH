@@ -25,6 +25,8 @@ const MAX_HELD: usize = 64;
 /// Encoded bytes taken for one picture: the limit plus room for the
 /// sequence's own keys.
 const MAX_PAYLOAD: usize = Limits::DEFAULT.max_encoded + 4096;
+/// Bytes of a kitty command's keys kept to answer one that was too long.
+const MAX_KEYS: usize = 256;
 
 /// Picture keys, unique across every terminal in the process so the
 /// renderer can keep each on the GPU under its key.
@@ -295,12 +297,22 @@ impl Scanner {
     }
 
     fn push_body(&mut self, bytes: &[u8]) {
-        if self.body.len() + bytes.len() > MAX_PAYLOAD {
+        if !self.overflow && self.body.len() + bytes.len() > MAX_PAYLOAD {
             self.overflow = true;
-            // Kitty's keys come first; keep them to answer.
+            // Kitty's keys come first; keep them (from what came before
+            // and this slice) to answer, at most a few hundred bytes.
+            let room = MAX_KEYS.saturating_sub(self.body.len());
             self.body
-                .truncate(self.body.iter().position(|&c| c == b';').unwrap_or(0));
+                .extend_from_slice(bytes.get(..room.min(bytes.len())).unwrap_or(&[]));
+            let keys = self
+                .body
+                .iter()
+                .position(|&c| c == b';')
+                .unwrap_or(0)
+                .min(MAX_KEYS);
+            self.body.truncate(keys);
             self.body.shrink_to_fit();
+            return;
         }
         if !self.overflow {
             self.body.extend_from_slice(bytes);
@@ -359,6 +371,9 @@ pub(crate) struct Store {
     bytes: usize,
     /// Kitty image ids to keys.
     kitty: HashMap<u32, u32>,
+    /// Cropped copies made for placements of a kitty image, by its id,
+    /// so deleting the image deletes them too.
+    derived: HashMap<u32, Vec<u32>>,
     /// A kitty transmission whose chunks are still coming: its first
     /// chunk's keys and the payload so far.
     pub chunks: Option<(Vec<u8>, Vec<u8>)>,
@@ -399,6 +414,22 @@ impl Store {
         }
         self.order.retain(|k| *k != key);
         self.kitty.retain(|_, k| *k != key);
+        for keys in self.derived.values_mut() {
+            keys.retain(|k| *k != key);
+        }
+        self.derived.retain(|_, keys| !keys.is_empty());
+    }
+
+    /// Notes that `key` is a cropped copy of kitty image `id`.
+    pub fn derive_kitty(&mut self, id: u32, key: u32) {
+        self.derived.entry(id).or_default().push(key);
+    }
+
+    /// Every key kitty image `id` shows under: its own and its copies'.
+    pub fn kitty_keys(&self, id: u32) -> Vec<u32> {
+        let mut keys: Vec<u32> = self.kitty.get(&id).copied().into_iter().collect();
+        keys.extend(self.derived.get(&id).into_iter().flatten().copied());
+        keys
     }
 
     pub fn set_kitty(&mut self, id: u32, key: u32) {
@@ -414,15 +445,16 @@ impl Store {
         self.get(*self.kitty.get(&id)?)
     }
 
-    pub fn kitty_key(&self, id: u32) -> Option<u32> {
-        self.kitty.get(&id).copied()
-    }
-
     /// Forgets kitty image `id`'s data, or every kitty image's.
     pub fn free_kitty(&mut self, id: Option<u32>) {
         let keys: Vec<u32> = match id {
-            Some(id) => self.kitty.get(&id).copied().into_iter().collect(),
-            None => self.kitty.values().copied().collect(),
+            Some(id) => self.kitty_keys(id),
+            None => self
+                .kitty
+                .values()
+                .chain(self.derived.values().flatten())
+                .copied()
+                .collect(),
         };
         for key in keys {
             self.remove(key);
@@ -499,6 +531,19 @@ mod tests {
     }
 
     #[test]
+    fn too_long_keeps_kitty_keys() {
+        let mut s = Scanner::default();
+        let mut big = b"\x1b_Gi=42,a=q;".to_vec();
+        big.resize(MAX_PAYLOAD + 10, b'A');
+        big.extend_from_slice(b"\x1b\\");
+        let pieces = s.scan(&big);
+        assert_eq!(
+            pieces,
+            vec![Piece::Image(Sequence::TooLong(Some(b"i=42,a=q".to_vec())))]
+        );
+    }
+
+    #[test]
     fn markers_round_trip() {
         let m = Marker {
             key: 9,
@@ -530,7 +575,9 @@ mod tests {
         assert!(s.get(a).is_none(), "oldest dropped");
         assert!(s.get(b).is_some() && s.get(c).is_some());
         s.set_kitty(5, b);
-        assert_eq!(s.kitty_key(5), Some(b));
+        assert_eq!(s.kitty_keys(5), vec![b]);
+        s.derive_kitty(5, c);
+        assert_eq!(s.kitty_keys(5), vec![b, c]);
         s.free_kitty(Some(5));
         assert!(s.get(b).is_none());
     }

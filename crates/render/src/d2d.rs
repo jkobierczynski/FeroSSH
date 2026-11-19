@@ -893,6 +893,26 @@ fn draw_pane(
             }
         }
         draw_pictures(rt, pictures, pane.grid, row, (ox, top, cw, ch));
+        // A picture covers its cells' backgrounds: a selection over it
+        // shows as a tint, and a block cursor on it is drawn again.
+        for (x, cell) in row.iter().enumerate() {
+            if cell.picture.is_none() {
+                continue;
+            }
+            let left = ox + x as f32 * cw;
+            let r = rect(left, top, left + cw, top + ch);
+            if block_at(x, cell) {
+                fill(&r, theme.cursor);
+            } else if cell.flags.contains(Flags::INVERSE) {
+                // SAFETY: drawing calls inside the caller's BeginDraw.
+                unsafe {
+                    brush.SetColor(&color(theme.foreground));
+                    brush.SetOpacity(0.35);
+                    rt.FillRectangle(&r, brush);
+                    brush.SetOpacity(1.0);
+                }
+            }
+        }
         for (x, cell) in row.iter().enumerate() {
             let left = ox + x as f32 * cw;
             let (fg, _) = colours(x, cell);

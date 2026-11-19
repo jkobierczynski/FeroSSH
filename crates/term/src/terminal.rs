@@ -65,6 +65,10 @@ impl Default for Settings {
 pub enum Action {
     /// Bytes to send to the host: answers to its queries.
     Reply(Vec<u8>),
+    /// An answer to a kitty graphics command. Unlike [`Action::Reply`] it
+    /// goes to a pane of an integrated tmux session too: tmux answers its
+    /// panes' other queries itself, but not these.
+    ImageReply(Vec<u8>),
     /// The host set the window title (already sanitised), or reset it.
     Title(Option<String>),
     /// The host wants this text on the clipboard (OSC 52). The UI asks the
@@ -875,7 +879,11 @@ impl Terminal {
         let mut actions: Vec<Action> = events.into_iter().filter_map(|e| self.action(e)).collect();
         actions.extend(self.reported.drain(..).map(Action::WorkingDirectory));
         actions.extend(self.notifications.drain(..).map(Action::Notify));
-        actions.extend(self.take_image_replies().into_iter().map(Action::Reply));
+        actions.extend(
+            self.take_image_replies()
+                .into_iter()
+                .map(Action::ImageReply),
+        );
         actions
     }
 

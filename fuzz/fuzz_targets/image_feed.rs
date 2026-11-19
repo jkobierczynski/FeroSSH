@@ -24,7 +24,7 @@ fuzz_target!(|data: &[u8]| {
     for (i, chunk) in stream.chunks(usize::from(split % 64).max(1)).enumerate() {
         t.feed(chunk);
         for action in t.take_actions() {
-            if let Action::Reply(bytes) = action {
+            if let Action::Reply(bytes) | Action::ImageReply(bytes) = action {
                 assert!(
                     bytes
                         .iter()
