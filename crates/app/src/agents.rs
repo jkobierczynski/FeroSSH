@@ -157,20 +157,30 @@ pub struct Question {
     /// What to type for yes, and for no.
     pub yes: Vec<u8>,
     pub no: Vec<u8>,
+    /// The bottom of the screen it was read from, whole: what it asks
+    /// about (the command, the file) is part of which question it is, so
+    /// a later question with the same words is not taken for it.
+    pub context: Vec<String>,
 }
 
 /// How far up from the bottom of the screen a question is looked for.
 const QUESTION_LINES: usize = 16;
+
+/// Lines that may follow the last choice of a numbered choice: hints such
+/// as "Esc to cancel", the bottom of a box.
+const AFTER_CHOICES: usize = 3;
 
 /// The yes-or-no question agent `screen` shows, if it shows one, in one of
 /// the two forms agents ask in:
 ///
 /// - a numbered choice (Claude Code, Codex): a line `1. Yes…` and a line
 ///   `2. No…` or `3. No…`; the number of each answers, as typing it there
-///   does. The question is the line with words above the first choice.
+///   does. The question is the line with words above choice 1. Only the
+///   last choice list counts, and only when little follows it.
 /// - a prompt line ending in `[y/n]`, `[Y/n]`, `[y/N]`, `(y/n)` or
-///   `(Y)es/(N)o` (aider and most command-line tools): `y` or `n` and
-///   Enter.
+///   `(Y)es/(N)o` (aider and most command-line tools), with at most a
+///   default such as `[Yes]` after it: `y` or `n` and Enter. A line with
+///   an answer typed after it was answered already.
 ///
 /// Only the bottom of the screen counts, where an agent waits for the
 /// answer; a question it scrolled past is not one.
@@ -181,46 +191,98 @@ pub fn question(screen: &[String]) -> Option<Question> {
         .filter(|l| !l.is_empty())
         .collect();
     let bottom = bottom.get(bottom.len().saturating_sub(QUESTION_LINES)..)?;
-    // A numbered choice.
-    let choice = |line: &str| -> Option<(u8, String)> {
-        let (n, rest) = line.split_once(". ")?;
-        let n: u8 = n.trim().parse().ok().filter(|n| (1..=9).contains(n))?;
-        Some((n, rest.trim().to_lowercase()))
-    };
-    let first = bottom.iter().position(|l| choice(l).is_some());
-    if let Some(first) = first {
-        let (above, from) = bottom.split_at(first);
-        let options: Vec<(u8, String)> = from.iter().filter_map(|l| choice(l)).collect();
-        let yes = options
-            .iter()
-            .find(|(_, t)| t == "yes" || t.starts_with("yes,") || t.starts_with("yes "))
-            .map(|(n, _)| *n);
-        let no = options
-            .iter()
-            .find(|(_, t)| t == "no" || t.starts_with("no,") || t.starts_with("no "))
-            .map(|(n, _)| *n);
-        if let (Some(yes), Some(no)) = (yes, no) {
-            let text = above
-                .iter()
-                .rev()
-                .find(|l| l.chars().filter(|c| c.is_alphanumeric()).count() >= 3)?;
-            return Some(Question {
-                text: text.chars().take(LAST_LINE).collect(),
-                yes: vec![b'0' + yes],
-                no: vec![b'0' + no],
-            });
+    let context = bottom.to_vec();
+    numbered(bottom, &context).or_else(|| yes_no(bottom, context))
+}
+
+/// A numbered choice line: its number and its words, lower case.
+fn choice(line: &str) -> Option<(u8, String)> {
+    let (n, rest) = line.split_once(". ")?;
+    let n: u8 = n.trim().parse().ok().filter(|n| (1..=9).contains(n))?;
+    Some((n, rest.trim().to_lowercase()))
+}
+
+/// [`question`]'s numbered choice: the last list of choices, counted up
+/// from its last one to choice 1 (a long choice may wrap onto a line of
+/// its own between them).
+fn numbered(bottom: &[String], context: &[String]) -> Option<Question> {
+    let last = bottom.iter().rposition(|l| choice(l).is_some())?;
+    if bottom.len() - 1 - last > AFTER_CHOICES {
+        return None;
+    }
+    let mut options: Vec<(u8, String)> = Vec::new();
+    let mut first = None;
+    let mut gap = 0;
+    for i in (0..=last).rev() {
+        let Some(line) = bottom.get(i) else {
+            break;
+        };
+        match choice(line) {
+            Some((n, words)) => {
+                let wanted = options.last().map_or(n, |(m, _)| m.saturating_sub(1));
+                if n != wanted {
+                    break;
+                }
+                gap = 0;
+                options.push((n, words));
+                if n == 1 {
+                    first = Some(i);
+                    break;
+                }
+            }
+            None if gap == 0 && !options.is_empty() => gap = 1,
+            None => break,
         }
     }
-    // A y/n prompt on the last line.
+    let first = first?;
+    // In order, so the first "Yes…" wins.
+    options.reverse();
+    let find = |word: &str| {
+        options
+            .iter()
+            .find(|(_, t)| {
+                t == word
+                    || t.starts_with(&format!("{word},"))
+                    || t.starts_with(&format!("{word} "))
+            })
+            .map(|(n, _)| *n)
+    };
+    let (yes, no) = (find("yes")?, find("no")?);
+    let text = bottom
+        .get(..first)?
+        .iter()
+        .rev()
+        .find(|l| l.chars().filter(|c| c.is_alphanumeric()).count() >= 3)?;
+    Some(Question {
+        text: text.chars().take(LAST_LINE).collect(),
+        yes: vec![b'0' + yes],
+        no: vec![b'0' + no],
+        context: context.to_vec(),
+    })
+}
+
+/// [`question`]'s y/n prompt, on the last line.
+fn yes_no(bottom: &[String], context: Vec<String>) -> Option<Question> {
     let last = bottom.last()?;
     let lower = last.to_lowercase();
-    let asks = ["[y/n]", "(y/n)", "(y)es/(n)o", "[yes/no]", "(yes/no)"]
+    let (at, marker) = ["[y/n]", "(y/n)", "(y)es/(n)o", "[yes/no]", "(yes/no)"]
         .iter()
-        .any(|m| lower.trim_end_matches([' ', ':', '?']).contains(m));
-    asks.then(|| Question {
+        .filter_map(|m| lower.rfind(m).map(|at| (at, *m)))
+        .max_by_key(|(at, _)| *at)?;
+    // After it, only punctuation and a default, never an answer.
+    let rest = lower
+        .get(at + marker.len()..)?
+        .trim_matches([' ', ':', '?']);
+    let rest = ["[yes]", "[no]", "[y]", "[n]"]
+        .iter()
+        .find_map(|d| rest.strip_prefix(d))
+        .unwrap_or(rest)
+        .trim_matches([' ', ':', '?']);
+    rest.is_empty().then(|| Question {
         text: last.chars().take(LAST_LINE).collect(),
         yes: b"y\r".to_vec(),
         no: b"n\r".to_vec(),
+        context,
     })
 }
 
@@ -410,6 +472,40 @@ mod tests {
         old.extend((0..20).map(|i| format!("line {i} of output")));
         assert_eq!(question(&old), None);
         assert_eq!(question(&screen(&["All done.", "> "])), None);
+        // An answer typed after the prompt, or words after it, answered it.
+        assert_eq!(question(&screen(&["Overwrite? [y/n] y"])), None);
+        assert_eq!(
+            question(&screen(&["Answer with [y/n] when asked. Done."])),
+            None
+        );
+        assert!(question(&screen(&["Overwrite? [y/N]: "])).is_some());
+        // Only the last menu counts: an older one above a new list is not
+        // answered by the new list's numbers.
+        let two = screen(&[
+            "Do you want to proceed?",
+            "1. Yes",
+            "2. No",
+            "Pick a colour:",
+            "1. Red",
+            "2. Blue",
+        ]);
+        assert_eq!(question(&two), None);
+        // The same words about another command are another question.
+        let push = screen(&[
+            "Bash(git push)",
+            "Do you want to proceed?",
+            "1. Yes",
+            "2. No",
+        ]);
+        let test = screen(&[
+            "Bash(npm test)",
+            "Do you want to proceed?",
+            "1. Yes",
+            "2. No",
+        ]);
+        let (push, test) = (question(&push).unwrap(), question(&test).unwrap());
+        assert_eq!(push.text, test.text);
+        assert_ne!(push, test);
     }
 
     #[test]
