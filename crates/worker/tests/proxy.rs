@@ -156,6 +156,7 @@ async fn connect(proxy: ProxyServer, host_port: u16) -> Vec<Message> {
             family: Default::default(),
             gssapi: false,
             proxy: Some(proxy),
+            sshfp: None,
         },
     ] {
         to_worker.send(msg).await.unwrap();

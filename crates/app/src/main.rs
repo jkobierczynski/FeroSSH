@@ -86,6 +86,8 @@ mod custom_theme;
 #[cfg_attr(not(windows), allow(dead_code))]
 mod diff;
 #[cfg_attr(not(windows), allow(dead_code))]
+mod dns_servers;
+#[cfg_attr(not(windows), allow(dead_code))]
 mod drag_out;
 #[cfg_attr(not(windows), allow(dead_code))]
 mod edit_local;

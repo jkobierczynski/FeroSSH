@@ -78,8 +78,19 @@ Besides `HostName`, `User`, `Port`, `IdentityFile`, `Tag`, `ProxyJump`, `ProxyCo
 | `StrictHostKeyChecking` | `yes` refuses unknown hosts; `accept-new` (or `no`) trusts a new host without asking. A changed key is always refused. |
 | `UserKnownHostsFile` | Other known_hosts files, in place of `~/.ssh/known_hosts`. |
 | `HostKeyAlias` | Looks the host key up under this name instead of the host's. |
+| `VerifyHostKeyDNS` | Also checks the host key against the host's SSHFP records in DNS (see [Host keys in DNS](#host-keys-in-dns-sshfp)). |
 | `AddressFamily` | `inet` for IPv4 only, `inet6` for IPv6 only. |
 | `ProxyServer` | FeroSSH's own: a SOCKS 5 or HTTP proxy to go through (see [Proxies](#proxies)). OpenSSH does not know it, so put `IgnoreUnknown ProxyServer` above it in a file OpenSSH reads too. |
+
+### Host keys in DNS (SSHFP)
+
+`VerifyHostKeyDNS ask` or `yes` makes FeroSSH look up the host's SSHFP records (what `ssh-keygen -r host` prints, published in the host's DNS zone) while it connects, and compare them with the key the server offers. The question goes from the connection's sandboxed worker to the DNS servers Windows uses, asking for DNSSEC; an IP address is never looked up.
+
+- A new host shows what DNS said under its fingerprint: the key matches a record (validated with DNSSEC or not), DNS has no record for it, the records name another key (in red), or the lookup failed.
+- With `yes`, a key that matches a record the DNS server validated with DNSSEC (the AD bit) is trusted without asking, as in OpenSSH, and is not added to `known_hosts`, so DNS is asked again each time. A match that was not validated, and every match with `ask`, still asks.
+- A key DNS contradicts is never trusted on its own: `StrictHostKeyChecking accept-new` asks instead. A key `known_hosts` already trusts still connects, with the warning, and a changed key is still refused, with what DNS says on the warning page.
+
+The AD bit is only as trustworthy as the way to the DNS server: anyone between your PC and that server could set it. Use `yes` only with a DNSSEC-validating resolver you trust on a network you trust; `ask` is safe anywhere. The sandbox cannot reach a resolver on this PC (`127.0.0.1`), so with one of those the lookup fails unless FeroSSH runs with `--no-sandbox`.
 
 ### Agent forwarding
 
