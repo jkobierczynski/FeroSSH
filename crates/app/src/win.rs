@@ -11452,6 +11452,8 @@ impl Window {
             None => self.hide_side(),
         }
         self.update_menu_checks();
+        // The Session manager may be back, with agents to keep current.
+        self.update_quiet_timer();
     }
 
     /// Carries out what the palette picked, once it is closed, so what
