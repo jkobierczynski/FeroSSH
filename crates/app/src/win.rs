@@ -3046,8 +3046,6 @@ fn build_menu() -> Result<HMENU> {
             }
             last = Some(group);
         }
-        // Windows' dark menus skip menus with columns: drawn here then.
-        ui_theme::own_columns(themes);
 
         let tools = CreatePopupMenu()?;
         item(tools, cmd::SESSIONS, "&Connection manager\tCtrl+Shift+S")?;
@@ -18747,11 +18745,7 @@ fn menu_key_labels(menu: HMENU, text: &dyn Fn(u32) -> MenuText) {
         if id == u32::MAX || !bindable(id) {
             continue;
         }
-        let mut buf = [0u16; 256];
-        // SAFETY: our menu, a position in it and a local buffer.
-        let len = unsafe { GetMenuStringW(menu, at, Some(&mut buf), MF_BYPOSITION) };
-        let len = usize::try_from(len).unwrap_or(0).min(buf.len());
-        let now = String::from_utf16_lossy(buf.get(..len).unwrap_or_default());
+        let now = menu_text(menu, at);
         let base = now.split_once('\t').map_or(now.as_str(), |(b, _)| b);
         let new = match text(id) {
             MenuText::Key(Some(k)) => format!("{base}\t{k}"),
@@ -18772,6 +18766,20 @@ fn menu_key_labels(menu: HMENU, text: &dyn Fn(u32) -> MenuText) {
         unsafe {
             let _ = SetMenuItemInfoW(menu, at, true, &mii);
         }
+        ui_theme::note_text(menu, at, &new);
+    }
+}
+
+/// The text of the item at `pos` of `menu`, also while it is owner-drawn
+/// in our colours (Windows may then report none).
+fn menu_text(menu: HMENU, pos: u32) -> String {
+    let mut buf = [0u16; 256];
+    // SAFETY: our menu, a position in it and a local buffer.
+    let len = unsafe { GetMenuStringW(menu, pos, Some(&mut buf), MF_BYPOSITION) };
+    let len = usize::try_from(len).unwrap_or(0).min(buf.len());
+    match ui_theme::owned_text(menu, pos) {
+        Some(kept) if len == 0 => kept,
+        _ => String::from_utf16_lossy(buf.get(..len).unwrap_or_default()),
     }
 }
 
@@ -18789,24 +18797,13 @@ fn menu_items(menu: HMENU, greyed: bool) -> Vec<palette::Entry> {
         let count = unsafe { GetMenuItemCount(Some(menu)) };
         for pos in 0..count.max(0) {
             let at = pos as u32;
-            let mut buf = [0u16; 256];
-            // SAFETY: our menu, a position in it and a local buffer.
-            let (len, state, sub) = unsafe {
-                (
-                    GetMenuStringW(menu, at, Some(&mut buf), MF_BYPOSITION),
-                    GetMenuState(menu, at, MF_BYPOSITION),
-                    GetSubMenu(menu, pos),
-                )
-            };
+            // SAFETY: our menu and a position in it.
+            let (state, sub) =
+                unsafe { (GetMenuState(menu, at, MF_BYPOSITION), GetSubMenu(menu, pos)) };
             if state & MF_SEPARATOR.0 != 0 {
                 continue;
             }
-            let len = usize::try_from(len).unwrap_or(0).min(buf.len());
-            let text = match ui_theme::owned_text(menu, at) {
-                // Owner-drawn (dark Theme menu) items may report no text.
-                Some(kept) if len == 0 => kept,
-                _ => String::from_utf16_lossy(buf.get(..len).unwrap_or_default()),
-            };
+            let text = menu_text(menu, at);
             if !sub.is_invalid() {
                 path.push(text);
                 walk(sub, path, out, greyed);
@@ -22862,6 +22859,10 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                 }
                 if count > 0 && GetMenuItemID(popup, count - 1) == cmd::RECENT_CLEAR {
                     with_window(|w| w.fill_recent(popup));
+                }
+                // Drawn in the menu bar's colours (not the window menu).
+                if hiword(lparam.0 as usize) == 0 {
+                    ui_theme::own_popup(popup);
                 }
                 DefWindowProcW(hwnd, msg, wparam, lparam)
             }
