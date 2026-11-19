@@ -17063,7 +17063,11 @@ impl Window {
         if let Some(menu) = custom_themes_menu(self.menu) {
             self.fill_custom_themes(menu);
         }
-        let listed = path.parent() == Some(dir.as_path()) && self.custom_named(&name).is_some();
+        // The saved file itself loaded (not another file's theme of the
+        // same name, which makes this one a duplicate).
+        let listed = path.parent() == Some(dir.as_path())
+            && reason.is_none()
+            && self.custom_named(&name).is_some();
         if !listed {
             let why = reason.map(|r| format!(" ({r})")).unwrap_or_default();
             return Err(format!(
