@@ -645,6 +645,17 @@ fn write_over(path: &Path, data: &[u8], unchanged: Option<&[u8]>) -> io::Result<
             })
             .and_then(|()| commit(&tmp, path, old_perms.is_some()));
         if let Err(e) = done {
+            // A file that was there and is gone now (a replace that failed
+            // halfway): the temporary file holds the only copy, so it stays
+            // and the error names it.
+            if old_perms.is_some() && fs::symlink_metadata(path).is_err() {
+                return Err(io::Error::other(format!(
+                    "{e}. {} is missing now; its new contents are in {}: rename that file to {} to restore it.",
+                    path.display(),
+                    tmp.display(),
+                    name
+                )));
+            }
             let _ = fs::remove_file(&tmp);
             return Err(e);
         }
