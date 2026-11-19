@@ -4617,6 +4617,26 @@ impl Window {
             }
             self.proxies.remove(&c);
         }
+        // A diff tab does not keep its connection; git running there now
+        // ends as a dropped connection would, with r to try again.
+        let dropped: Vec<ChannelId> = self
+            .diffs
+            .keys()
+            .copied()
+            .filter(|&ch| {
+                self.diff_on(ch)
+                    .is_some_and(|c| !self.workers.contains_key(&c))
+            })
+            .collect();
+        for channel in dropped {
+            self.on_diff(
+                channel,
+                Message::Disconnected {
+                    channel,
+                    reason: "the connection was closed".into(),
+                },
+            );
+        }
         let workers = &self.workers;
         self.sftp_routes.retain(|_, c| workers.contains_key(c));
         self.via.retain(|c, _| workers.contains_key(c));
@@ -9543,6 +9563,8 @@ impl Window {
             }));
         }
         self.run_diff(id);
+        // Keys go to the new tab, not to a tools pane that had them.
+        self.focus_terminal();
         self.refresh_chrome();
         self.request_full_redraw();
         None

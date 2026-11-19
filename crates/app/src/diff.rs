@@ -48,13 +48,14 @@ pub fn command() -> Vec<u8> {
         ),
         // A name git had to quote (a line break or a quote in it) is left
         // out: it could not be read back here.
-        // The list is read first so that a failing ls-files counts; one
+        // The list streams (the rest is read and dropped, so ls-files
+        // sees no broken pipe) and a failing ls-files still counts; one
         // name past the limit says some are left out. A symbolic link
         // shows as its target's path, as git shows one, whatever it
         // points at (git diff --no-index would follow a folder's).
         format!(
-            "u=$({git} ls-files --others --exclude-standard) || {{ u=; e=1; }}; \
-             [ -z \"$u\" ] || printf \"%s\\n\" \"$u\" | head -n {more} | \
+            "exec 3>&1; {{ {git} ls-files --others --exclude-standard || echo @ferossh-diff failed >&3; }} | \
+             {{ head -n {more}; cat >/dev/null; }} | \
              while IFS= read -r f; do i=$((i+1)); \
              [ $i -le {UNTRACKED} ] || {{ echo @ferossh-diff more; break; }}; \
              case $f in \\\"*) continue;; esac; \
