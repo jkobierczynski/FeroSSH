@@ -16704,7 +16704,7 @@ impl Window {
                 p.theme_shown = None;
             }
         }
-        let keep_name = (p.theme.group() == ThemeGroup::Warning).then_some(p.theme.name);
+        let committed = (p.theme.name, p.theme.group() == ThemeGroup::Warning);
         // A family alone keeps the size the pane had before the menu.
         let size = p.font.size_pt;
         let (mut font, mut theme, mut colours) = (None, None, None);
@@ -16782,11 +16782,12 @@ impl Window {
             }
         }
         if let Some(mut t) = theme {
-            // Over Production or Staging, a preview shows only colours: the
-            // pane keeps the warning theme's name, which its confirmations
-            // check, until a theme is picked.
-            if let Some(name) = keep_name {
-                t.name = name;
+            // A preview over Production or Staging, or of Production or
+            // Staging, shows only colours: the pane keeps its committed
+            // theme's name, which confirmations check, until a theme is
+            // picked.
+            if committed.1 || t.group() == ThemeGroup::Warning {
+                t.name = committed.0;
             }
             self.set_theme(pane, t.clone());
             if let Some(p) = &mut self.look_preview {
