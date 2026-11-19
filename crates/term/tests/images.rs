@@ -218,6 +218,45 @@ fn device_attributes_say_sixel() {
 }
 
 #[test]
+fn kitty_query_answers_before_device_attributes() {
+    // How programs look for kitty graphics: a query, then device
+    // attributes; the first answer to arrive decides.
+    let mut t = term(20, 6);
+    t.feed(b"\x1b[c\x1b_Gi=31,s=1,v=1,a=q,t=d,f=24;AAAA\x1b\\\x1b[c");
+    let got = replies(&mut t);
+    assert_eq!(got.len(), 3);
+    assert_eq!(got.first(), Some(&b"\x1b[?62;4;22c".to_vec()));
+    assert!(got.get(1).is_some_and(|r| r.starts_with(b"\x1b_Gi=31;")));
+    assert_eq!(got.get(2), Some(&b"\x1b[?62;4;22c".to_vec()));
+    // The same inside a synchronized update.
+    t.feed(b"\x1b[?2026h\x1b[c\x1b_Gi=32,s=1,v=1,a=q,t=d,f=24;AAAA\x1b\\\x1b[c\x1b[?2026l");
+    let got = replies(&mut t);
+    assert_eq!(got.len(), 3);
+    assert_eq!(got.first(), Some(&b"\x1b[?62;4;22c".to_vec()));
+    assert!(got.get(1).is_some_and(|r| r.starts_with(b"\x1b_Gi=32;")));
+}
+
+#[test]
+fn title_set_in_a_flushed_update_is_given_back() {
+    // A full-screen app sets its title inside a synchronized update and
+    // asks a kitty query, which lets the update out early; leaving the
+    // alternate screen still brings back the shell's title.
+    let mut t = term(20, 6);
+    t.feed(b"\x1b]2;bash\x07\x1b[?1049h");
+    t.feed(b"\x1b[?2026h\x1b]0;app\x07\x1b_Gi=33,s=1,v=1,a=q,t=d,f=24;AAAA\x1b\\\x1b[?2026l");
+    t.feed(b"\x1b[?1049l");
+    let titles: Vec<_> = t
+        .take_actions()
+        .into_iter()
+        .filter_map(|a| match a {
+            Action::Title(t) => Some(t),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(titles.last(), Some(&Some("bash".to_owned())));
+}
+
+#[test]
 fn links_are_not_pictures() {
     let mut t = term(20, 6);
     t.feed(b"\x1bPq!10~\x1b\\");
