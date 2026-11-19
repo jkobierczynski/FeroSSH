@@ -829,13 +829,15 @@ struct Logging {
 
 /// A paste's receiver as confirmed: its pane, the coding agent it runs,
 /// whether it has the Production theme, its connection
-/// ([`Window::link_of`]) and the bytes the paste is for it (bracketed or
-/// not, as its program asked).
+/// ([`Window::link_of`]), whether a login script's secret prompt in it
+/// would take the paste instead, and the bytes the paste is for it
+/// (bracketed or not, as its program asked).
 type Receiver = (
     PaneId,
     Option<String>,
     bool,
     Option<(ChannelId, bool)>,
+    bool,
     Vec<u8>,
 );
 
@@ -9525,6 +9527,7 @@ impl Window {
                     self.agent_of(*id).map(str::to_owned),
                     p.theme.name == "Production",
                     self.link_of(*id),
+                    self.scripts.get(id).is_some_and(|r| r.runner.prompting()),
                     p.term.paste(text).bytes,
                 ))
             })
