@@ -40,7 +40,7 @@ fn percent(v: u32) -> u8 {
 fn hls(h: u32, l: u32, s: u32) -> (u8, u8, u8) {
     let (l, s) = (f64::from(l.min(100)) / 100.0, f64::from(s.min(100)) / 100.0);
     // DEC's hue 0 is blue; the usual formula has red there.
-    let h = f64::from((h + 240) % 360) / 360.0;
+    let h = f64::from((h % 360 + 240) % 360) / 360.0;
     if s == 0.0 {
         let v = (l * 255.0).round() as u8;
         return (v, v, v);
@@ -303,6 +303,8 @@ mod tests {
         assert_eq!(hls(120, 50, 100), (255, 0, 0));
         assert_eq!(hls(0, 50, 100), (0, 0, 255));
         assert_eq!(hls(0, 100, 0), (255, 255, 255));
+        // Found by fuzzing: a huge hue overflowed.
+        assert_eq!(hls(u32::MAX, 50, 100), hls(u32::MAX % 360, 50, 100));
     }
 
     #[test]
