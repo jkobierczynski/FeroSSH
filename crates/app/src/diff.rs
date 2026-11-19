@@ -51,16 +51,20 @@ pub fn command() -> Vec<u8> {
         ),
         // A name git had to quote (a line break or a quote in it) is left
         // out: it could not be read back here.
-        // The list streams (the rest is read and dropped, so ls-files
-        // sees no broken pipe) and a failing ls-files still counts; one
-        // name past the limit says some are left out. A symbolic link
+        // The list streams; awk keeps the first names and reads the rest
+        // (no broken pipe), then passes on ls-files' status as a last
+        // line "/N", which no name git lists can be. The loop takes it
+        // after the files, so the failure marker never lands inside one.
+        // One name past the limit says some are left out. A symbolic link
         // shows as its target's path, as git shows one, whatever it
         // points at (git diff --no-index would follow a folder's).
         format!(
-            "exec 3>&1; {{ {git} ls-files --others --exclude-standard || echo @ferossh-diff failed >&3; }} | \
-             {{ head -n {more}; cat >/dev/null; }} | \
-             while IFS= read -r f; do i=$((i+1)); \
-             [ $i -le {UNTRACKED} ] || {{ echo @ferossh-diff more; break; }}; \
+            "{{ {git} ls-files --others --exclude-standard; echo /$?; }} | \
+             awk \"/^\\//{{s=\\$0;next}} n<{more}{{n++;print}} END{{print s}}\" | \
+             while IFS= read -r f; do \
+             case $f in /0) continue;; /*) echo @ferossh-diff failed; continue;; esac; \
+             i=$((i+1)); \
+             [ $i -le {UNTRACKED} ] || {{ echo @ferossh-diff more; continue; }}; \
              case $f in \\\"*) continue;; esac; \
              [ -f \"$f\" ] || [ -L \"$f\" ] || continue; \
              if [ -L \"$f\" ]; then l=$(readlink -- \"$f\") || echo @ferossh-diff failed; \
@@ -1149,7 +1153,7 @@ diff --git a/x b/x\n--- a/x\n+++ b/x\n@@ -1 +1 @@\n-\x1b[2Jold\n+\u{202e}new\u{9
         std::fs::write(
             &fake,
             format!(
-                "#!/bin/sh\nfor a; do [ \"$a\" = ls-files ] && exit 128; done\nexec '{real}' \"$@\"\n"
+                "#!/bin/sh\nfor a; do [ \"$a\" = ls-files ] && {{ '{real}' \"$@\"; exit 128; }}; done\nexec '{real}' \"$@\"\n"
             ),
         )
         .unwrap();
@@ -1159,10 +1163,14 @@ diff --git a/x b/x\n--- a/x\n+++ b/x\n@@ -1 +1 @@\n-\x1b[2Jold\n+\u{202e}new\u{9
             panic!()
         };
         assert!(!d.failed && d.files.is_empty());
+        // It fails after listing a name: that file still shows whole.
+        std::fs::write(repo.join("late.txt"), "one\ntwo\n").unwrap();
         let Outcome::Changes(d) = run_with(&repo, Some(&bin)) else {
             panic!()
         };
         assert!(d.failed);
+        assert_eq!(d.files.len(), 1);
+        assert_eq!((d.files[0].name(), d.files[0].added), ("late.txt", 2));
         assert!(!plain(&render(&d, 80, &LOOK, &[]).text).contains("No changes"));
         let _ = std::fs::remove_dir_all(&tmp);
     }
