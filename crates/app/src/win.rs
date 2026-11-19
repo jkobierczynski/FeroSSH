@@ -19925,8 +19925,20 @@ fn run_command(hwnd: HWND, command: Command) {
                     return;
                 }
             }
+            // The dialogs let messages run: the pane may have closed, its
+            // agent gone, or its paste mode changed meanwhile.
             with_window(|w| {
-                w.input(id, paste.bytes);
+                if w.production_agents(&all) != production {
+                    w.show(
+                        id,
+                        "\x1b[0;90mNot pasted: the panes changed while FeroSSH asked.\x1b[0m\r\n",
+                    );
+                    return;
+                }
+                let Some(bytes) = w.panes.get(&id).map(|p| p.term.paste(&text).bytes) else {
+                    return;
+                };
+                w.input(id, bytes);
                 w.send_typed(&targets, &Typed::Paste(text));
             });
         }
