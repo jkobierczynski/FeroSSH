@@ -9490,6 +9490,23 @@ impl Window {
         self.update_menu_checks();
     }
 
+    /// Each of `panes` that is still open, with the coding agent it runs
+    /// and whether it has the Production theme: what a paste was confirmed
+    /// for.
+    fn receivers(&self, panes: &[PaneId]) -> Vec<(PaneId, Option<String>, bool)> {
+        panes
+            .iter()
+            .filter_map(|id| {
+                let p = self.panes.get(id)?;
+                Some((
+                    *id,
+                    self.agent_of(*id).map(str::to_owned),
+                    p.theme.name == "Production",
+                ))
+            })
+            .collect()
+    }
+
     /// The Production-themed panes among `panes` that run a coding agent,
     /// as "agent on host", while Confirm scripts and agents on Production
     /// hosts is on: input for them asks first.
@@ -19849,6 +19866,9 @@ fn run_command(hwnd: HWND, command: Command) {
             let mut all = vec![id];
             all.extend(&targets);
             let production = with_window(|w| w.production_agents(&all)).unwrap_or_default();
+            // Which panes get it and which agent each runs, to check again
+            // once asked: the labels above only name them.
+            let receivers = with_window(|w| w.receivers(&all)).unwrap_or_default();
             let others = if targets.is_empty() {
                 String::new()
             } else {
@@ -19895,7 +19915,7 @@ fn run_command(hwnd: HWND, command: Command) {
             // The dialogs let messages run: the pane may have closed, its
             // agent gone, or its paste mode changed meanwhile.
             with_window(|w| {
-                if w.production_agents(&all) != production {
+                if w.receivers(&all) != receivers {
                     w.show(
                         id,
                         "\x1b[0;90mNot pasted: the panes changed while FeroSSH asked.\x1b[0m\r\n",
