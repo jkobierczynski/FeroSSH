@@ -831,9 +831,16 @@ struct Logging {
 }
 
 /// A paste's receiver as confirmed: its pane, the coding agent it runs,
-/// whether it has the Production theme, and its connection
-/// ([`Window::link_of`]).
-type Receiver = (PaneId, Option<String>, bool, Option<(ChannelId, bool)>);
+/// whether it has the Production theme, its connection
+/// ([`Window::link_of`]) and the bytes the paste is for it (bracketed or
+/// not, as its program asked).
+type Receiver = (
+    PaneId,
+    Option<String>,
+    bool,
+    Option<(ChannelId, bool)>,
+    Vec<u8>,
+);
 
 /// Session > Logs and recordings > Record this pane: the pane's output with its timing, as an
 /// asciicast file in the log folder, sealed like a log. Only what the
@@ -9557,7 +9564,7 @@ impl Window {
     /// Each of `panes` that is still open, with the coding agent it runs
     /// and whether it has the Production theme: what a paste was confirmed
     /// for.
-    fn receivers(&self, panes: &[PaneId]) -> Vec<Receiver> {
+    fn receivers(&self, panes: &[PaneId], text: &str) -> Vec<Receiver> {
         panes
             .iter()
             .filter_map(|id| {
@@ -9567,6 +9574,7 @@ impl Window {
                     self.agent_of(*id).map(str::to_owned),
                     p.theme.name == "Production",
                     self.link_of(*id),
+                    p.term.paste(text).bytes,
                 ))
             })
             .collect()
@@ -19999,7 +20007,7 @@ fn run_command(hwnd: HWND, command: Command) {
             let production = with_window(|w| w.production_agents(&all)).unwrap_or_default();
             // Which panes get it and which agent each runs, to check again
             // once asked: the labels above only name them.
-            let receivers = with_window(|w| w.receivers(&all)).unwrap_or_default();
+            let receivers = with_window(|w| w.receivers(&all, &text)).unwrap_or_default();
             let others = if targets.is_empty() {
                 String::new()
             } else {
@@ -20049,8 +20057,8 @@ fn run_command(hwnd: HWND, command: Command) {
             // breaks would run there). What was asked about is sent, or
             // nothing.
             with_window(|w| {
-                let now = w.panes.get(&id).map(|p| p.term.paste(&text).bytes);
-                if w.receivers(&all) != receivers || now.as_ref() != Some(&paste.bytes) {
+                // Every receiver's bytes, the broadcast targets' too.
+                if w.receivers(&all, &text) != receivers {
                     w.show(
                         id,
                         "\x1b[0;90mNot pasted: the panes changed while FeroSSH asked.\x1b[0m\r\n",
