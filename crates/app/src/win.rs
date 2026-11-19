@@ -1852,6 +1852,13 @@ fn themes_dir() -> PathBuf {
 /// Reads the themes folder and hands its themes to `Theme::by_name`.
 /// Whether `theme` is a warning theme (Production, Staging), whose name
 /// other checks look for.
+/// A pane's look taken when Save this look as a theme opens.
+struct SavedLook {
+    pane: PaneId,
+    theme: Theme,
+    font: (String, f32),
+}
+
 fn p_warning(theme: Option<&Theme>) -> bool {
     theme.is_some_and(|t| t.group() == ThemeGroup::Warning)
 }
@@ -16992,10 +16999,22 @@ impl Window {
         })
     }
 
-    /// Writes the focused pane's look (colours, font, and the window
-    /// colours unless they follow something) to theme file `path`, and
-    /// gives the pane that theme.
-    fn save_theme(&mut self, pane: PaneId, path: &Path) -> std::result::Result<String, String> {
+    /// The look of `pane` as it is now, for a theme saved from it later.
+    fn look_of(&self, pane: PaneId) -> Option<SavedLook> {
+        let p = self.panes.get(&pane)?;
+        Some(SavedLook {
+            pane,
+            theme: p.theme.clone(),
+            font: (p.font.family.clone(), p.font.size_pt),
+        })
+    }
+
+    /// Writes a pane's look as it was when the dialog opened (colours,
+    /// font, and the window colours unless they follow something) to
+    /// theme file `path`, and gives the pane that theme unless its look
+    /// changed meanwhile.
+    fn save_theme(&mut self, look: &SavedLook, path: &Path) -> std::result::Result<String, String> {
+        let pane = look.pane;
         let stem = path
             .file_stem()
             .map(|s| s.to_string_lossy().into_owned())
@@ -17003,19 +17022,15 @@ impl Window {
         let name = custom_theme::clean_name(&stem).map_err(|e| {
             format!("A theme cannot be saved as {stem}: {e}. Pick another file name.")
         })?;
-        let p = self
-            .panes
-            .get(&pane)
-            .ok_or_else(|| "The pane closed before the theme was saved.".to_owned())?;
         let window = match self.settings.window_colours {
-            WindowColours::Theme => self.custom_named(p.theme.name).and_then(|c| c.window),
+            WindowColours::Theme => self.custom_named(look.theme.name).and_then(|c| c.window),
             WindowColours::System | WindowColours::Light => None,
             look => Some(custom_theme::WindowSpec::Look(look)),
         };
         let text = custom_theme::write(
             &name,
-            &p.theme,
-            Some((&p.font.family, p.font.size_pt)),
+            &look.theme,
+            Some((&look.font.0, look.font.1)),
             window,
         );
         if let Some(dir) = path.parent() {
@@ -17059,8 +17074,17 @@ impl Window {
         }
         // A warning theme (Production, Staging) stays on the pane, so its
         // confirmations keep working; the saved copy is in the menu.
-        let warning = p_warning(self.panes.get(&pane).map(|p| &p.theme));
-        if !warning && let Some(t) = self.custom_named(&name).map(|c| c.theme.clone()) {
+        // A pane that closed, or whose look changed while the dialog was
+        // open (a reconnect), keeps what it has now.
+        let unchanged = self
+            .panes
+            .get(&pane)
+            .is_some_and(|p| p.theme.name == look.theme.name);
+        let warning = p_warning(Some(&look.theme));
+        if unchanged
+            && !warning
+            && let Some(t) = self.custom_named(&name).map(|c| c.theme.clone())
+        {
             self.set_theme(pane, t);
             self.sync_tmux();
         }
@@ -21964,18 +21988,19 @@ fn save_theme_as(hwnd: HWND) {
     }
     let dir = themes_dir();
     let _ = std::fs::create_dir_all(&dir);
-    // The pane whose look is saved: the focused one now, whatever has
-    // focus when the dialog closes.
-    let Some((pane, suggested)) = with_window(|w| {
-        let pane = w.focused_id();
-        let name = w.panes.get(&pane).map_or("", |p| p.theme.name);
+    // The pane whose look is saved, and that look, as they are now,
+    // whatever happens while the dialog is open.
+    let Some((look, suggested)) = with_window(|w| {
+        let look = w.look_of(w.focused_id())?;
+        let name = look.theme.name;
         let suggested = if Theme::is_builtin(name) {
             format!("My {name}")
         } else {
             name.to_owned()
         };
-        (pane, suggested)
-    }) else {
+        Some((look, suggested))
+    })
+    .flatten() else {
         return;
     };
     let dir_w = crate::native::wide(&dir.display().to_string());
@@ -22041,7 +22066,7 @@ fn save_theme_as(hwnd: HWND) {
             return;
         }
     }
-    let (text, icon) = match with_window(|w| w.save_theme(pane, &path)) {
+    let (text, icon) = match with_window(|w| w.save_theme(&look, &path)) {
         Some(Ok(text)) => (text, MB_ICONINFORMATION),
         Some(Err(text)) => (text, MB_ICONWARNING),
         None => return,
