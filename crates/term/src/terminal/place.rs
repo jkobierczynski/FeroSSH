@@ -269,6 +269,11 @@ impl Terminal {
     }
 
     fn reply(&mut self, cmd: &Command, result: Result<(), Error>) {
+        // Queries held back by a synchronized update answer first, as
+        // they were asked first.
+        if self.sync_deadline().is_some() {
+            self.flush_sync();
+        }
         if let (Some(images), Some(reply)) = (&mut self.images, cmd.reply(result))
             && images.replies.len() < MAX_REPLIES
         {

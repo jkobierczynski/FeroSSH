@@ -228,6 +228,12 @@ fn kitty_query_answers_before_device_attributes() {
     assert_eq!(got.first(), Some(&b"\x1b[?62;4;22c".to_vec()));
     assert!(got.get(1).is_some_and(|r| r.starts_with(b"\x1b_Gi=31;")));
     assert_eq!(got.get(2), Some(&b"\x1b[?62;4;22c".to_vec()));
+    // The same inside a synchronized update.
+    t.feed(b"\x1b[?2026h\x1b[c\x1b_Gi=32,s=1,v=1,a=q,t=d,f=24;AAAA\x1b\\\x1b[c\x1b[?2026l");
+    let got = replies(&mut t);
+    assert_eq!(got.len(), 3);
+    assert_eq!(got.first(), Some(&b"\x1b[?62;4;22c".to_vec()));
+    assert!(got.get(1).is_some_and(|r| r.starts_with(b"\x1b_Gi=32;")));
 }
 
 #[test]
