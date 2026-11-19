@@ -469,24 +469,11 @@ fn picked_rows() -> Vec<Row> {
         .collect()
 }
 
-/// Whether `new` is the same entry as `old`: same place and same key,
-/// so a line that moved or was replaced in the file is not picked again.
+/// Whether `new` is the same entry as `old`: the same line of the same
+/// file, with exactly the same text, so a line that moved or changed in
+/// the file is never picked again on its own.
 fn same_entry(old: &Row, new: &Row) -> bool {
-    (
-        old.file,
-        old.line,
-        old.kind,
-        &old.key,
-        &old.fingerprint,
-        &old.comment,
-    ) == (
-        new.file,
-        new.line,
-        new.kind,
-        &new.key,
-        &new.fingerprint,
-        &new.comment,
-    )
+    (old.line, &old.path, &old.text) == (new.line, &new.path, &new.text)
 }
 
 /// Shows `rows` (of `total` entries), unless it shows them already, and
@@ -565,7 +552,9 @@ pub fn set_rows(rows: Vec<Row>, total: usize, note: String) {
             any = true;
         }
     }
-    if !any && !rows.is_empty() {
+    // The first row is picked only when nothing was: a pick that went
+    // stale stays unpicked.
+    if !any && keep.is_empty() && !rows.is_empty() {
         set_state(h.list, 0, true);
     }
 }

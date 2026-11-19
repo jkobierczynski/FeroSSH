@@ -35,6 +35,10 @@ pub struct Row {
     /// `known_hosts:12`.
     pub place: String,
     pub comment: String,
+    /// The whole file path and the line exactly as it is in the file,
+    /// which tell one entry from another across a reload.
+    pub path: String,
+    pub text: String,
 }
 
 struct Entry {
@@ -191,6 +195,11 @@ impl KnownHostsView {
             fingerprint: e.fingerprint.clone(),
             place: format!("{name}:{}", l.line),
             comment: l.comment.clone(),
+            path: self
+                .files
+                .get(e.file)
+                .map_or_else(String::new, |f| f.display().to_string()),
+            text: l.text.clone(),
         }
     }
 
