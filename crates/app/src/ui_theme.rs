@@ -1047,9 +1047,8 @@ pub fn own_popup(menu: HMENU) {
         let at = own.iter().rposition(|m| m.menu == menu)?;
         Some(own.remove(at))
     });
-    if !on && old.is_none() {
-        return;
-    }
+    // With the colours off, an owner-drawn item without a record (it
+    // should not happen, but nothing would draw it) is still given back.
     let mut items = Vec::new();
     let mut column = 0;
     let mut failed = false;
@@ -1086,6 +1085,10 @@ pub fn own_popup(menu: HMENU) {
             }
             let ty = mii.fType.0;
             let n = (mii.cch as usize).min(buf.len());
+            if !on && ty & MFT_OWNERDRAW.0 == 0 {
+                // Windows' own already: left as it is.
+                continue;
+            }
             // Windows may keep no text for an owner-drawn item: ours then,
             // found by its data wherever the item has moved to, in this
             // menu's last record or one kept after an earlier failed read.
@@ -1129,13 +1132,24 @@ pub fn own_popup(menu: HMENU) {
             } else {
                 ty |= if item.breaks { MFT_MENUBARBREAK.0 } else { 0 };
             }
-            if !item.separator {
-                // The text again, in case Windows let it go.
-                set.fMask |= MIIM_STRING;
-                set.dwTypeData = PWSTR(item.text.as_mut_ptr());
-            }
             set.fType = MENU_ITEM_TYPE(ty);
+            // The text again, in case Windows let it go, set apart from
+            // the type: Windows drops a text given to an item that is
+            // owner-drawn at that moment, so it goes in while the item is
+            // Windows' own (before owner-drawing it, after giving it back).
+            let text = MENUITEMINFOW {
+                cbSize: size_of::<MENUITEMINFOW>() as u32,
+                fMask: MIIM_STRING,
+                dwTypeData: PWSTR(item.text.as_mut_ptr()),
+                ..Default::default()
+            };
+            if !item.separator && on {
+                let _ = SetMenuItemInfoW(menu, pos, true, &text);
+            }
             if SetMenuItemInfoW(menu, pos, true, &set).is_err() {
+                failed = true;
+            }
+            if !item.separator && !on && SetMenuItemInfoW(menu, pos, true, &text).is_err() {
                 failed = true;
             }
             item.set_text(None);
