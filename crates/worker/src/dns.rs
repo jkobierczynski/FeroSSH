@@ -24,6 +24,8 @@ use tokio::net::{TcpStream, UdpSocket};
 /// The DNS type of SSHFP records.
 pub const TYPE_SSHFP: u16 = 44;
 const TYPE_CNAME: u16 = 5;
+/// The most CNAME records read and followed in one answer.
+const MAX_CNAMES: usize = 8;
 const TYPE_OPT: u16 = 41;
 const CLASS_IN: u16 = 1;
 
@@ -242,12 +244,20 @@ pub fn parse(msg: &[u8], id: u16, name: &[u8]) -> Result<Answer, Bad> {
         }
         code => return Err(Bad::Failed(code)),
     }
-    let mut owner = lower;
-    let mut records = Vec::new();
+    // A truncated answer is asked again over TCP: its records are not
+    // read, as the last one may be cut off.
+    if truncated {
+        return Ok(Answer {
+            authenticated,
+            truncated,
+            ..Answer::default()
+        });
+    }
+    // Every record first, then the CNAME chain from the name asked, so
+    // the order of the answer section does not matter.
+    let mut cnames: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+    let mut found: Vec<(Vec<u8>, Sshfp)> = Vec::new();
     for _ in 0..an {
-        if truncated && r.at >= msg.len() {
-            break;
-        }
         let rr_name = r.name()?;
         let rtype = r.u16()?;
         let class = r.u16()?;
@@ -255,35 +265,50 @@ pub fn parse(msg: &[u8], id: u16, name: &[u8]) -> Result<Answer, Bad> {
         let len = usize::from(r.u16()?);
         let start = r.at;
         let data = r.take(len)?;
-        if class != CLASS_IN || rr_name != owner {
+        if class != CLASS_IN {
             continue;
         }
         match rtype {
-            TYPE_CNAME => {
-                // The name the records are under now; it must lie
-                // within this record's data.
+            TYPE_CNAME if cnames.len() < MAX_CNAMES => {
+                // The target must lie within this record's data.
                 let (target, end) = read_name(msg, start)?;
                 if end != start + len {
                     return Err(Bad::Malformed);
                 }
-                owner = target;
+                cnames.push((rr_name, target));
             }
-            TYPE_SSHFP if records.len() < MAX_RECORDS => {
+            TYPE_SSHFP if found.len() < MAX_RECORDS * 4 => {
                 let [algorithm, fp_type, digest @ ..] = data else {
                     return Err(Bad::Malformed);
                 };
                 if digest.is_empty() || digest.len() > MAX_DIGEST {
                     continue;
                 }
-                records.push(Sshfp {
-                    algorithm: *algorithm,
-                    fp_type: *fp_type,
-                    digest: digest.to_vec(),
-                });
+                found.push((
+                    rr_name,
+                    Sshfp {
+                        algorithm: *algorithm,
+                        fp_type: *fp_type,
+                        digest: digest.to_vec(),
+                    },
+                ));
             }
             _ => {}
         }
     }
+    let mut owner = lower;
+    for _ in 0..MAX_CNAMES {
+        match cnames.iter().find(|(from, _)| *from == owner) {
+            Some((_, to)) => owner = to.clone(),
+            None => break,
+        }
+    }
+    let records: Vec<Sshfp> = found
+        .into_iter()
+        .filter(|(n, _)| *n == owner)
+        .map(|(_, rec)| rec)
+        .take(MAX_RECORDS)
+        .collect();
     Ok(Answer {
         records,
         authenticated,
@@ -474,6 +499,21 @@ mod tests {
         );
         let a = parse(&msg, 1, &name).unwrap();
         assert_eq!(a.records.len(), 1);
+        // The same with the record before the CNAME that leads to it.
+        let msg = answer(
+            1,
+            0x8180,
+            &name,
+            &[
+                (b"\x01b\x07example\x00", TYPE_SSHFP, sshfp(4, 2, &[3; 32])),
+                (&name, TYPE_CNAME, b"\x01b\x07example\x00".to_vec()),
+                // A record for a name the chain does not reach is left out.
+                (b"\x01c\x07example\x00", TYPE_SSHFP, sshfp(4, 2, &[4; 32])),
+            ],
+        );
+        let a = parse(&msg, 1, &name).unwrap();
+        assert_eq!(a.records.len(), 1);
+        assert_eq!(a.records[0].digest, vec![3; 32]);
     }
 
     #[test]
@@ -491,6 +531,16 @@ mod tests {
         assert_eq!(parse(&nx, 1, &name).unwrap().records, vec![]);
         let tc = answer(1, 0x8380, &name, &[]);
         assert!(parse(&tc, 1, &name).unwrap().truncated);
+        // Truncated inside a record: still "ask over TCP", not an error.
+        let mut cut = answer(
+            1,
+            0x8380,
+            &name,
+            &[(&name, TYPE_SSHFP, sshfp(4, 2, &[3; 32]))],
+        );
+        cut.truncate(cut.len() - 10);
+        let a = parse(&cut, 1, &name).unwrap();
+        assert!(a.truncated && a.records.is_empty());
     }
 
     #[test]

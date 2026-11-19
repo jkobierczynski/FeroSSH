@@ -643,7 +643,7 @@ fn write_over(path: &Path, data: &[u8], unchanged: Option<&[u8]>) -> io::Result<
                 ))),
                 _ => Ok(()),
             })
-            .and_then(|()| fs::rename(&tmp, path));
+            .and_then(|()| commit(&tmp, path, old_perms.is_some()));
         if let Err(e) = done {
             let _ = fs::remove_file(&tmp);
             return Err(e);
@@ -654,6 +654,40 @@ fn write_over(path: &Path, data: &[u8], unchanged: Option<&[u8]>) -> io::Result<
         io::ErrorKind::AlreadyExists,
         "no free temporary file name next to the known_hosts file",
     ))
+}
+
+/// Puts `tmp` in `path`'s place. On Windows an existing file is replaced
+/// with `ReplaceFileW`, which keeps the old file's security descriptor
+/// (its ACL, which may be stricter than the folder's) and attributes; a
+/// plain rename would give the new file the folder's inherited ACL.
+#[cfg(windows)]
+#[allow(unsafe_code)]
+fn commit(tmp: &Path, path: &Path, existed: bool) -> io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows::Win32::Storage::FileSystem::{REPLACE_FILE_FLAGS, ReplaceFileW};
+    use windows::core::PCWSTR;
+    if !existed {
+        return fs::rename(tmp, path);
+    }
+    let wide = |p: &Path| -> Vec<u16> { p.as_os_str().encode_wide().chain([0]).collect() };
+    let (to, from) = (wide(path), wide(tmp));
+    // SAFETY: both names are NUL-terminated and live through the call.
+    unsafe {
+        ReplaceFileW(
+            PCWSTR(to.as_ptr()),
+            PCWSTR(from.as_ptr()),
+            PCWSTR::null(),
+            REPLACE_FILE_FLAGS(0),
+            None,
+            None,
+        )
+    }
+    .map_err(|e| io::Error::other(format!("{}: {e}", path.display())))
+}
+
+#[cfg(not(windows))]
+fn commit(tmp: &Path, path: &Path, _existed: bool) -> io::Result<()> {
+    fs::rename(tmp, path)
 }
 
 /// A plain host list with `token` taken out, for a line that keeps the

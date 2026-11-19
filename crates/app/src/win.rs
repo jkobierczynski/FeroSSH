@@ -12313,6 +12313,11 @@ impl Window {
 
     /// Pastes into the snippets view when it has the keyboard; `false`
     /// when the paste is for the terminal.
+    /// Whether a paste is for the Known hosts tool.
+    fn known_hosts_paste(&self) -> bool {
+        self.side.visible && self.side.focused && self.side.view == SideView::KnownHosts
+    }
+
     fn paste_side(&mut self, text: &str) -> bool {
         if self.side.visible
             && self.side.focused
@@ -12323,10 +12328,11 @@ impl Window {
             self.refresh_chrome();
             return true;
         }
-        // The search box takes it; the list has nowhere to paste into,
-        // and the terminal behind must not get it either.
-        if self.side.visible && self.side.focused && self.side.view == SideView::KnownHosts {
-            known_hosts_panel::paste(text);
+        // The search box takes it (see `Command::Paste`: the box's change
+        // event needs the window, so the paste comes after this borrow);
+        // the list has nowhere to paste into, and the terminal behind must
+        // not get it either.
+        if self.known_hosts_paste() {
             return true;
         }
         if !(self.side.visible && self.side.focused && self.side.view == SideView::Snippets) {
@@ -21284,6 +21290,9 @@ fn run_command(hwnd: HWND, command: Command) {
                 return;
             };
             if with_window(|w| w.paste_side(&text)) == Some(true) {
+                if with_window(|w| w.known_hosts_paste()) == Some(true) {
+                    known_hosts_panel::paste(&text);
+                }
                 return;
             }
             let Some(id) = with_window(|w| w.focused_id()) else {
