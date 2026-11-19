@@ -152,6 +152,9 @@ pub enum Action {
     /// The directory a pane is in, asked for by [`Tmux::ask_dir`]: save it
     /// as the host's start directory.
     StartDir(String),
+    /// The directory native pane `native` is in, asked for by
+    /// [`Tmux::ask_diff_dir`]: show what changed in its git repository.
+    DiffDir { native: Native, dir: String },
 }
 
 /// Where a window made from a native action goes.
@@ -192,6 +195,8 @@ enum Tag {
     SplitHere(Split),
     /// A pane's directory, to start new windows and panes in.
     StartDirHere,
+    /// A pane's directory, to show what changed there.
+    DiffDirHere(Native),
     Sessions,
     NewSession,
     /// The prefix keys and base index, for tmux keybindings.
@@ -928,6 +933,25 @@ impl Tmux {
                     out.push(Action::StartDir(dir.to_owned()));
                 }
             }
+            Tag::DiffDirHere(native) => {
+                // Spaces are part of a folder's name: only the line end
+                // goes.
+                let dir = lines
+                    .first()
+                    .map(|l| String::from_utf8_lossy(l).into_owned())
+                    .unwrap_or_default();
+                let dir = dir.trim_end_matches(['\r', '\n']);
+                if ok && !dir.is_empty() {
+                    out.push(Action::DiffDir {
+                        native,
+                        dir: dir.to_owned(),
+                    });
+                } else {
+                    out.push(Action::Notice(
+                        "tmux did not say which folder that pane is in.".into(),
+                    ));
+                }
+            }
             Tag::SplitPane => {
                 self.focus_next = std::str::from_utf8(lines.first().map_or(&[][..], |l| l))
                     .ok()
@@ -1531,6 +1555,20 @@ impl Tmux {
             self.send(
                 &format!("display-message -p -t %{p} '#{{pane_current_path}}'"),
                 Tag::StartDirHere,
+                &mut out,
+            );
+        }
+        out
+    }
+
+    /// Asks tmux which directory native pane `native` is in, to show what
+    /// changed there; the answer comes back as [`Action::DiffDir`].
+    pub fn ask_diff_dir(&mut self, native: Native) -> Vec<Action> {
+        let mut out = Vec::new();
+        if let Some(p) = self.pane_of(native) {
+            self.send(
+                &format!("display-message -p -t %{p} '#{{pane_current_path}}'"),
+                Tag::DiffDirHere(native),
                 &mut out,
             );
         }
@@ -2359,6 +2397,25 @@ mod tests {
             "{a:?}"
         );
         assert!(t.ask_dir(999).is_empty());
+        // Show what changed asks the same, for that pane; an empty answer
+        // is said rather than dropped.
+        assert_eq!(writes(&t.ask_diff_dir(a0)), ask);
+        assert_eq!(writes(&t.ask_diff_dir(a0)), ask);
+        // 11 and 12 were the new windows above.
+        let mut input = reply(11, &[]);
+        input.extend(reply(12, &[]));
+        input.extend(reply(13, &["/home/me/app ".into()]));
+        input.extend(reply(14, &[]));
+        let a = t.feed(&mut ws, &input);
+        assert!(
+            a.contains(&Action::DiffDir {
+                native: a0,
+                dir: "/home/me/app ".into()
+            }),
+            "{a:?}"
+        );
+        assert!(a.iter().any(|x| matches!(x, Action::Notice(_))), "{a:?}");
+        assert!(t.ask_diff_dir(999).is_empty());
     }
 
     #[test]

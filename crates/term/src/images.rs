@@ -432,13 +432,16 @@ impl Store {
         keys
     }
 
+    /// Makes `key` kitty image `id`. Sending an id again replaces the
+    /// image and its placements, so the old data and every cropped copy
+    /// of it go, also when the old data was already pushed out.
     pub fn set_kitty(&mut self, id: u32, key: u32) {
-        if let Some(old) = self.kitty.insert(id, key)
-            && old != key
-        {
-            self.remove(old);
-            self.kitty.insert(id, key);
+        let mut old = self.derived.remove(&id).unwrap_or_default();
+        old.extend(self.kitty.insert(id, key));
+        for stale in old.into_iter().filter(|k| *k != key) {
+            self.remove(stale);
         }
+        self.kitty.insert(id, key);
     }
 
     pub fn kitty(&self, id: u32) -> Option<&Picture> {
@@ -580,5 +583,13 @@ mod tests {
         assert_eq!(s.kitty_keys(5), vec![b, c]);
         s.free_kitty(Some(5));
         assert!(s.get(b).is_none());
+        // Sending id 5 again drops the copies made for the old image.
+        let d = s.add(pic(4)).key;
+        let e = s.add(pic(2)).key;
+        s.set_kitty(5, c);
+        s.derive_kitty(5, d);
+        s.set_kitty(5, e);
+        assert_eq!(s.kitty_keys(5), vec![e]);
+        assert!(s.get(c).is_none() && s.get(d).is_none());
     }
 }

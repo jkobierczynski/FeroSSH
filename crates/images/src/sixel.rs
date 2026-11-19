@@ -76,9 +76,10 @@ struct Canvas {
     cap_h: u32,
     pixels: Vec<u32>,
     limits: Limits,
-    /// Pixel writes left: drawing over the same pixels again and again
-    /// (`$` and repeats) is cut off at a few times the picture's pixels,
-    /// so a short sequence cannot keep the window busy.
+    /// Pixel writes left, counting each new canvas as written: drawing
+    /// over the same pixels again and again (`$` and repeats) or making
+    /// the canvas over and over is cut off at a few times the picture's
+    /// pixels, so a short sequence cannot keep the window busy.
     budget: usize,
 }
 
@@ -102,29 +103,41 @@ impl Canvas {
             (y + 1).max(self.cap_h * 2).max(6)
         };
         let (w, h) = (w.min(self.limits.max_side), h.min(self.limits.max_side));
-        // Past the pixel budget, grow each side only as far as the budget
-        // allows for the other, but never by less than needed: growing a
-        // column at a time would copy the whole canvas for each.
+        // Past the pixel budget, size the canvas to what fits around the
+        // part drawn so far plus the new pixel. Unused room from earlier
+        // growth is given back rather than counted, and each side still
+        // grows as far as the budget allows: growing a column at a time
+        // would copy the whole canvas for each.
         let (w, h) = if (w as usize) * (h as usize) <= self.limits.max_pixels {
             (w, h)
         } else {
-            let need_h = self.cap_h.max(y + 1);
-            let fit_w = (self.limits.max_pixels / need_h.max(1) as usize).min(w as usize) as u32;
-            let w = fit_w.max(self.cap_w).max(x + 1);
-            let need_w = w;
-            let fit_h = (self.limits.max_pixels / need_w.max(1) as usize).min(h as usize) as u32;
+            let need_w = self.width.max(x + 1);
+            let need_h = self.height.max(y + 1);
+            if (need_w as usize) * (need_h as usize) > self.limits.max_pixels {
+                return false;
+            }
+            let fit_w = (self.limits.max_pixels / need_h as usize).min(w as usize) as u32;
+            let w = fit_w.max(need_w);
+            let fit_h = (self.limits.max_pixels / w as usize).min(h as usize) as u32;
             (w, fit_h.max(need_h))
         };
-        if (w as usize) * (h as usize) > self.limits.max_pixels {
+        let size = (w as usize) * (h as usize);
+        // A new canvas is work too: charge it, so trading spare width for
+        // height band after band near the limit cannot go on and on.
+        if size > self.limits.max_pixels || size > self.budget {
             return false;
         }
+        self.budget -= size;
+        // Everything outside `width` x `height` is still blank, so a
+        // smaller side keeps all that was drawn.
         let mut pixels = vec![0u32; w as usize * h as usize];
-        for row in 0..self.cap_h as usize {
+        let keep = self.cap_w.min(w) as usize;
+        for row in 0..self.cap_h.min(h) as usize {
             let from = row * self.cap_w as usize;
             let to = row * w as usize;
             if let (Some(src), Some(dst)) = (
-                self.pixels.get(from..from + self.cap_w as usize),
-                pixels.get_mut(to..to + self.cap_w as usize),
+                self.pixels.get(from..from + keep),
+                pixels.get_mut(to..to + keep),
             ) {
                 dst.copy_from_slice(src);
             }
@@ -274,7 +287,8 @@ fn draw(canvas: &mut Canvas, x: u32, y: u32, bits: u8, n: u32, colour: u32, clip
     // with only its top pixels.
     let bottom = y.saturating_add(7 - bits.leading_zeros());
     let cost = (n as usize).saturating_mul(bits.count_ones() as usize);
-    if canvas.budget < cost || !canvas.reach(last, bottom) {
+    // `reach` may charge a new canvas, so the cost is checked again.
+    if canvas.budget < cost || !canvas.reach(last, bottom) || canvas.budget < cost {
         // Past the limits: the rest is dropped, the part drawn stays.
         *clipped = true;
         return;
@@ -340,5 +354,37 @@ mod tests {
         assert_eq!(p.map(|p| p.height), Some(6));
         let p = decode(b"~-@", &small).ok();
         assert_eq!(p.map(|p| p.height), Some(7));
+        // A new canvas that uses up the budget leaves none for its pixel.
+        let mut last = b"@".to_vec();
+        for _ in 0..10 {
+            last.extend_from_slice(b"$!10~");
+        }
+        last.extend_from_slice(b"$!6~$!3@-@");
+        assert!(decode(&last, &small).is_ok());
+    }
+
+    #[test]
+    fn spare_room_is_given_back_near_the_limit() {
+        // Doubling the width to 2730 leaves no room for row 1536, though
+        // the 2049 x 1537 picture fits the pixel limit.
+        let mut data = vec![b'-'; 255];
+        data.extend_from_slice(b"!2048~~-@");
+        let p = decode(&data, &Limits::DEFAULT).ok();
+        assert_eq!(p.map(|p| (p.width, p.height)), Some((2049, 1537)));
+    }
+
+    #[test]
+    fn making_the_canvas_again_and_again_stops() {
+        // A wide blank run, then one pixel per band: past the pixel limit
+        // each band would trade spare width for height with a new 16 MB
+        // canvas. New canvases are charged, so this stops early and keeps
+        // the part drawn.
+        let mut data = b"!512??".to_vec();
+        for _ in 0..1400 {
+            data.extend_from_slice(b"-@");
+        }
+        let p = decode(&data, &Limits::DEFAULT).ok();
+        let h = p.map(|p| p.height).unwrap_or_default();
+        assert!(h > 4096 && h < 6000, "height {h}");
     }
 }
