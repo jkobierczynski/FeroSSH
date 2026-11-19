@@ -44,7 +44,7 @@ fuzz_target!(|data: &[u8]| {
         t.feed(chunk);
         for action in t.take_actions() {
             match action {
-                Action::Reply(bytes) => assert!(
+                Action::Reply(bytes) | Action::ImageReply(bytes) => assert!(
                     bytes
                         .iter()
                         .all(|b| (0x20..0x7f).contains(b) || *b == 0x1b || *b == 0x07),

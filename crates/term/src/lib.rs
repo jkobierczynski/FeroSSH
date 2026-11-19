@@ -30,6 +30,7 @@ pub mod cast;
 pub mod chain;
 mod cwd;
 pub mod highlight;
+mod images;
 mod input;
 mod log;
 mod notify;

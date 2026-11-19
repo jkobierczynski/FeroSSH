@@ -642,6 +642,22 @@ A pane asks for attention when:
 
 The message is the host's text, shown as plain text: control and hidden formatting characters are taken out and it is cut at 256 characters (Windows may shorten a long message a little more, and a long heading too). Notifications use Windows' notification-area balloons, which Windows 10 and 11 show as notifications, so nothing has to be installed or registered. Windows' Do not disturb (Focus assist) holds them back like any other notification.
 
+## Images in the terminal
+
+Programs on the host can print pictures straight into the terminal: plots, thumbnails and previews from tools such as `img2sixel`, `chafa`, `timg`, `kitten icat`, `imgcat`, gnuplot's `sixelgd` terminal or matplotlib's sixel and kitty backends. Turn it on with Session > Show images the host prints (`InlineImages yes` in `ferossh.conf`); it is off by default, and then such output is ignored as before.
+
+FeroSSH understands three ways of sending a picture:
+
+- **Sixel** (`img2sixel`, `chafa -f sixel`, `lsix`, gnuplot). With images on, FeroSSH says it has Sixel when a program asks (device attributes), which is how `chafa` and `lsix` find out.
+- **The kitty graphics protocol** (`kitten icat`, `timg -pk`, `chafa -f kitty`): pictures sent in the escape sequence, raw or as PNG, compressed or not, in chunks; shown at once or kept by id and placed later, cropped or scaled to a number of cells, and deleted again. FeroSSH never reads a file on your PC that the host names: transmission by file, temporary file or shared memory is refused, and `kitten icat` then sends the data itself.
+- **iTerm2 inline images** (`imgcat`, `timg -pi`): PNG only, with the width and height in cells, pixels or percent. A file the host offers for download (`inline=0`) is ignored.
+
+A picture covers the cells under it, from the cursor: it scrolls with the text, goes into the scrollback, and text written over it replaces that part, as in xterm. A new font size keeps a picture on its cells, so it scales with them.
+
+Inside FeroSSH's tmux integration pictures arrive too, since tmux passes a pane's output on unchanged; programs that wrap them for tmux (`ESC P tmux;`) are unwrapped. Restoring a tmux session later shows only its text.
+
+Each picture is decoded by FeroSSH's own small decoders, in safe Rust and fuzz-tested, and is limited to 8192 pixels a side, 4 million pixels and 24 MB of encoded data; a terminal keeps 64 MB of pictures at most, dropping the oldest first. A picture over the limits is refused, never cut down from a huge allocation.
+
 ## Selecting, copying and scrollback
 
 | To | Do |

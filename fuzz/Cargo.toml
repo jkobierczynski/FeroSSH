@@ -13,6 +13,7 @@ libfuzzer-sys = "0.4"
 ferossh-auth = { path = "../crates/auth" }
 ferossh-config = { path = "../crates/config" }
 ferossh-forward = { path = "../crates/forward" }
+ferossh-images = { path = "../crates/images" }
 ferossh-ipc = { path = "../crates/ipc" }
 ferossh-mosh = { path = "../crates/mosh" }
 ferossh-render = { path = "../crates/render" }
@@ -242,6 +243,20 @@ bench = false
 [[bin]]
 name = "command_history"
 path = "fuzz_targets/command_history.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "image_decode"
+path = "fuzz_targets/image_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "image_feed"
+path = "fuzz_targets/image_feed.rs"
 test = false
 doc = false
 bench = false

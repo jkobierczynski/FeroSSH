@@ -59,6 +59,8 @@ jobs:
           - mosh_bootstrap
           - remote_names
           - command_history
+          - image_decode
+          - image_feed
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - run: rustup toolchain install "$FUZZ_TOOLCHAIN" --profile minimal

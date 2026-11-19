@@ -38,6 +38,10 @@ Only modern algorithms are offered: post-quantum hybrid `mlkem768x25519-sha256` 
 
 X11 forwarding is off unless a host turns it on, because X programs on the server can see and type into your other X windows. The server only ever gets a fake X cookie, and the sandboxed worker never sees the real one: the window checks each X connection's fake cookie itself and swaps in the real one. A tab shows `⇄` when its connection forwards ports, in amber when the server can connect back into your PC. A local (`-L`) or dynamic (`-D`, SOCKS) forward on loopback takes connections only from programs in your own Windows session: one from another user signed in to the same PC, or from a service, is closed unused and the forward shows why. (SOCKS asks for no password, as in OpenSSH, so on a shared PC anyone else could otherwise use your SSH connection.) A connection from another machine, to a forward you bind to other addresses, is not checked: that forward takes them on purpose. (A loopback connection to such a forward is still checked.)
 
+## Images in the terminal
+
+Showing pictures the host prints (Session > Show images the host prints) is off by default, because every picture is host data to decode. When it is on, Sixel, kitty graphics and PNG data are decoded by FeroSSH's own decoders in a crate that forbids `unsafe` code, with every size checked before anything is allocated (8192 pixels a side, 4 million pixels, 24 MB encoded, 64 MB kept per terminal), and two fuzz targets run on them in CI. The kitty protocol's file, temporary-file and shared-memory transmissions are refused, so a host can never make FeroSSH read a file on your PC, and iTerm2 file downloads are ignored. Replies to the host are fixed status strings with the host's numeric ids.
+
 ## Telnet
 
 Telnet sends everything in the clear, passwords included. FeroSSH offers it only for old gear that has nothing better: the pane says so when it connects and the tab carries a red **⚠ telnet** badge. The Telnet connection runs in a sandboxed worker like SSH, agrees to only a handful of options, and never sends your user name or environment.
