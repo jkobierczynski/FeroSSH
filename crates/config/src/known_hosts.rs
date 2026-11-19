@@ -543,6 +543,15 @@ pub fn remove_lines(path: &Path, lines: &[(usize, String)]) -> io::Result<usize>
     // bytes that are not UTF-8 in comments included. A file with UTF-16
     // in it is rewritten as UTF-8, as adding a key does.
     let utf16 = raw.contains(&0);
+    if utf16 && text.contains('\u{FFFD}') {
+        // Rewriting it as UTF-8 would turn bytes it could not read in a
+        // comment into U+FFFD: nothing is written instead.
+        return Err(io::Error::other(format!(
+            "{} mixes UTF-16 with bytes that are not text; nothing was removed. \
+             Save it as UTF-8 (or remove the line in an editor) and try again.",
+            path.display()
+        )));
+    }
     let parts: Vec<&[u8]> = if utf16 {
         text.split_inclusive('\n').map(str::as_bytes).collect()
     } else {
@@ -860,6 +869,16 @@ mod tests {
             1
         );
         assert_eq!(fs::read(&path).unwrap(), b"# caf\xe9\r\n");
+        // Such a byte before a UTF-16 part cannot be kept: nothing is written.
+        let mut mixed = b"# caf\xe9\n".to_vec();
+        for u in format!("{}\n", line("a", &a)).encode_utf16() {
+            mixed.extend_from_slice(&u.to_le_bytes());
+        }
+        fs::write(&path, &mixed).unwrap();
+        let l = list(&read(&path).unwrap());
+        let a_line = l.iter().find(|x| x.kind == LineKind::HostKey).unwrap();
+        assert!(remove_lines(&path, &[(a_line.line, a_line.text.clone())]).is_err());
+        assert_eq!(fs::read(&path).unwrap(), mixed);
         fs::write(&path, &after).unwrap();
         let kh = KnownHosts::parse(&after);
         assert_eq!(kh.check("a", 22, &a), Status::Unknown);
