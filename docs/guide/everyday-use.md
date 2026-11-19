@@ -620,7 +620,33 @@ The font menu lists eighteen monospace fonts. Cascadia Mono, Cascadia Code, Cons
 
 There are forty-two themes, in three columns of Settings > Theme. The dark ones are Nord (the default), Ayu Mirage, Carbonfox, Catppuccin Frappé, Macchiato and Mocha, Dracula, Everforest, GitHub Dark, Gruvbox Dark, Gruvbox Material, Kanagawa Dragon and Wave, Monokai, Night Owl, Nightfox, One Dark, Rosé Pine and Rosé Pine Moon, Snazzy, Solarized Dark, Tokyo Night and Tokyo Night Storm, Tomorrow Night and Tomorrow Night Eighties. The light ones are Ayu Light, Catppuccin Latte, Dawnfox, Everforest Light, GitHub Light, Gruvbox Light, Kanagawa Lotus, Rosé Pine Dawn, Solarized Light, Tokyo Night Day and Tomorrow. The classics are Campbell, One Half Dark, One Half Light, Tango Dark and Tango Light from Windows Terminal, and PuTTY's own colours. Every theme's text reads at 4.5:1 contrast or better. Two more are warnings: **Production** (red) and **Staging** (amber). Rules pick the theme by host pattern or ssh_config `Tag`, so production servers always look like production; hosts tagged `production`, `staging` or `development` get Production, Staging or Nord without any rule. `ferossh.exe --theme Production prod-db` opens a session in a theme, handy for desktop shortcuts. See `ThemeRule` and `Profile` in [Settings](settings.md).
 
-The window around the panes (the menu bar and its menus, the title bar, the tab strip, the tools rail and the tools pane: Connection manager, Session manager, the connection form, File transfer, Port forwards, Scripts) has Windows' light look unless you pick something else in Settings > Window colours: the focused pane's colours (dark for a dark theme, red for Production), Windows' own light or dark mode, or one of seven neutral greys from Soft grey to Black. Dark menus, buttons and scroll bars need Windows 10 version 1903 or later; the title bar takes the theme's colour on Windows 11.
+The window around the panes (the menu bar and its menus, the title bar, the tab strip, the tools rail and the tools pane: Connection manager, Session manager, the connection form, File transfer, Port forwards, Scripts) has Windows' light look unless you pick something else in Settings > Window colours: the focused pane's colours (dark for a dark theme, red for Production), Windows' own light or dark mode, one of seven neutral greys from Soft grey to Black, or one of eight tinted neutrals that are not grey: Sand, Sage, Mist and Taupe (light), Slate, Moss, Espresso and Heather (dark). Dark menus, buttons and scroll bars need Windows 10 version 1903 or later; the title bar takes the theme's colour on Windows 11.
+
+Resting the mouse on a font, a theme, a custom theme or a window colour in these menus shows it right away, in the focused pane and the window around it. Pick it to keep it; close the menu without a choice (Esc, or a click elsewhere) and the old look comes back. A font shown this way changes the pane's rows and columns like any font change.
+
+### Custom themes
+
+Settings > Custom themes lists your own themes. **Save this look as a theme...** writes the focused pane's colours, font and size, and the window colours (unless they follow the terminal or Windows), to a file in the `themes` folder next to the settings; the file name is the theme's name. Picking a custom theme gives the focused pane its colours, its font if it names one that is installed, and its window colours if it has some. Host rules, `Profile` themes and `--theme` can name a custom theme like a built-in one.
+
+Each theme is a small text file you can change in any editor; the menu reads the folder again each time it opens. Every line is optional except that it needs a name (the file name serves):
+
+```
+Name       Sandstorm
+Base       Nord             # start from a built-in theme
+Font       Cascadia Mono
+FontSize   11
+Foreground #D8DEE9
+Background #2E3440
+Cursor     #88C0D0
+CursorText #2E3440
+Color0     #3B4252          # Color0 to Color15: the ANSI colours
+Window     sand             # one of the Window colours names, or your own:
+WindowBackground #ECE5D8
+WindowText       #2A241C
+WindowAccent     #8C5A1E
+```
+
+A file with a mistake shows greyed in the menu with the reason. Window colours whose text reads below 4.5:1 on their background are left out, and the menu marks a theme that had such a problem with "(see file)".
 
 ## Server status bar
 

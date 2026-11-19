@@ -1,6 +1,11 @@
 //! Colour themes. Each pane holds its own theme.
 
+use std::sync::{PoisonError, RwLock};
+
 use crate::cell::{Color, Rgb};
+
+/// The user's own themes, read from the themes folder.
+static USER: RwLock<Vec<Theme>> = RwLock::new(Vec::new());
 
 /// The colours a pane draws with.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -56,12 +61,55 @@ impl Theme {
         &BUILTIN
     }
 
-    /// A built-in theme by name, ignoring case.
+    /// A built-in or user theme by name, ignoring case; a built-in one
+    /// wins.
     pub fn by_name(name: &str) -> Option<Theme> {
         BUILTIN
             .iter()
             .find(|t| t.name.eq_ignore_ascii_case(name))
             .cloned()
+            .or_else(|| {
+                USER.read()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .iter()
+                    .find(|t| t.name.eq_ignore_ascii_case(name))
+                    .cloned()
+            })
+    }
+
+    /// Whether `name` is a built-in theme's, ignoring case.
+    pub fn is_builtin(name: &str) -> bool {
+        BUILTIN.iter().any(|t| t.name.eq_ignore_ascii_case(name))
+    }
+
+    /// The user's own themes (the themes folder), as last set.
+    pub fn user() -> Vec<Theme> {
+        USER.read().unwrap_or_else(PoisonError::into_inner).clone()
+    }
+
+    /// Replaces the user's own themes, which [`Theme::by_name`] finds
+    /// after the built-in ones.
+    pub fn set_user(themes: Vec<Theme>) {
+        *USER.write().unwrap_or_else(PoisonError::into_inner) = themes;
+    }
+
+    /// A theme from its parts: a user theme read from a file.
+    pub fn custom(
+        name: &'static str,
+        foreground: Rgb,
+        background: Rgb,
+        cursor: Rgb,
+        cursor_text: Rgb,
+        ansi: [Rgb; 16],
+    ) -> Self {
+        Self {
+            name,
+            foreground,
+            background,
+            cursor,
+            cursor_text,
+            ansi,
+        }
     }
 
     /// Which menu group this theme belongs to.
@@ -660,6 +708,27 @@ static BUILTIN: [Theme; 44] = [
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn user_themes_are_found_after_the_built_in_ones() {
+        let mut mine = Theme::nord();
+        mine.name = "Registry Test Theme";
+        mine.background = Rgb::new(1, 2, 3);
+        let mut clash = Theme::nord();
+        clash.name = "Dracula";
+        Theme::set_user(vec![mine.clone(), clash]);
+        assert_eq!(Theme::by_name("registry test theme"), Some(mine));
+        // A built-in name keeps its built-in theme.
+        assert_eq!(
+            Theme::by_name("Dracula").map(|t| t.background),
+            BUILTIN
+                .iter()
+                .find(|t| t.name == "Dracula")
+                .map(|t| t.background)
+        );
+        assert!(Theme::is_builtin("nord") && !Theme::is_builtin("Registry Test Theme"));
+        Theme::set_user(Vec::new());
+    }
+
     use super::*;
 
     #[test]

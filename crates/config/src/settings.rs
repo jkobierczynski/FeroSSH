@@ -586,12 +586,29 @@ pub enum WindowColours {
     Dark,
     /// A neutral near black.
     Black,
+    /// Tinted neutrals, not grey, from light to dark: a warm light sand.
+    Sand,
+    /// A light green-grey.
+    Sage,
+    /// A light cool blue-grey.
+    Mist,
+    /// A warm middle taupe with black text.
+    Taupe,
+    /// A dark blue-grey.
+    Slate,
+    /// A dark green-grey.
+    Moss,
+    /// A dark warm brown.
+    Espresso,
+    /// A dark muted violet.
+    Heather,
 }
 
 impl WindowColours {
-    /// In menu order: the two that follow something, then the fixed looks
-    /// from light to dark. At most ten (the menu ids' room).
-    pub const ALL: [Self; 10] = [
+    /// In menu order: the two that follow something, then the fixed looks:
+    /// the greys and then the tinted ones, each from light to dark. At
+    /// most sixty (the menu ids' room).
+    pub const ALL: [Self; 18] = [
         Self::Theme,
         Self::System,
         Self::Light,
@@ -602,6 +619,14 @@ impl WindowColours {
         Self::Graphite,
         Self::Dark,
         Self::Black,
+        Self::Sand,
+        Self::Sage,
+        Self::Mist,
+        Self::Taupe,
+        Self::Slate,
+        Self::Moss,
+        Self::Espresso,
+        Self::Heather,
     ];
 
     /// The word in the settings file.
@@ -617,6 +642,14 @@ impl WindowColours {
             Self::Graphite => "graphite",
             Self::Dark => "dark",
             Self::Black => "black",
+            Self::Sand => "sand",
+            Self::Sage => "sage",
+            Self::Mist => "mist",
+            Self::Taupe => "taupe",
+            Self::Slate => "slate",
+            Self::Moss => "moss",
+            Self::Espresso => "espresso",
+            Self::Heather => "heather",
         }
     }
 
