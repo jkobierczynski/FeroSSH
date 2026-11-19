@@ -613,14 +613,20 @@ impl LiveView {
                         } else {
                             s.state.name()
                         },
-                        details: match (&a.since, s.state) {
-                            (Some(t), LiveState::Connected) => {
-                                format!("{t} \u{b7} {}", a.last.as_deref().unwrap_or(""))
-                            }
-                            _ => a.last.clone().unwrap_or_default(),
-                        }
-                        .trim_end_matches([' ', '\u{b7}'])
-                        .to_owned(),
+                        details: {
+                            // A named session's host is still told.
+                            let host = s.name.as_ref().map(|_| s.target.as_str());
+                            let since = a
+                                .since
+                                .as_deref()
+                                .filter(|_| s.state == LiveState::Connected);
+                            [host, since, a.last.as_deref()]
+                                .into_iter()
+                                .flatten()
+                                .filter(|t| !t.is_empty())
+                                .collect::<Vec<_>>()
+                                .join(" \u{b7} ")
+                        },
                         focused: s.focused,
                     })
                 })
@@ -767,6 +773,14 @@ mod tests {
         assert_eq!(rows[0].state, "needs you");
         assert_eq!(rows[0].details, "5 min \u{b7} Apply edit?");
         assert_eq!(rows[2].details, "2 min \u{b7} Running tests");
+        // A named session keeps its host in sight.
+        all[2].name = Some("Build".into());
+        let rows = v.rows(&all);
+        assert_eq!(rows[0].label, "Build");
+        assert_eq!(
+            rows[0].details,
+            format!("{} \u{b7} 5 min \u{b7} Apply edit?", all[2].target)
+        );
         // A word after the filter narrows it.
         v.set_query("is:agent web");
         assert_eq!(v.rows(&all).len(), 1);

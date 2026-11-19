@@ -351,6 +351,10 @@ fn the_screen_text_is_what_the_host_left_there() {
     assert_eq!(t.screen_text(), ["one", "two", "\u{4e2d}!"]);
     t.feed(b"\r\nfour");
     assert_eq!(t.screen_text(), ["two", "\u{4e2d}!", "four"]);
+    // Concealed text stays blank; combining marks stay with their letter.
+    let mut t = term(20, 2);
+    t.feed(b"pw: \x1b[8msecret\x1b[28m ok\r\ne\xcc\x81t\xc3\xa9");
+    assert_eq!(t.screen_text(), ["pw:        ok", "e\u{301}t\u{e9}"]);
 }
 
 #[test]

@@ -9615,8 +9615,12 @@ impl Window {
     }
 
     /// Runs the once-a-second check while any pane has a quiet watch.
+    /// Also runs while the Session manager is shown with an agent pane
+    /// open, so each agent's state and last line there stay current.
     fn update_quiet_timer(&self) {
-        let any = self.panes.values().any(|p| p.quiet.is_some());
+        let shown = self.side.visible && self.side.view == SideView::Live;
+        let any = self.panes.values().any(|p| p.quiet.is_some())
+            || (shown && self.panes.keys().any(|id| self.agent_of(*id).is_some()));
         // SAFETY: our window and timer id.
         unsafe {
             if any {
@@ -9641,10 +9645,9 @@ impl Window {
         if dropped {
             self.update_menu_checks();
         }
-        // Stops once the last watched pane closed.
-        if !self.panes.values().any(|p| p.quiet.is_some()) {
-            self.update_quiet_timer();
-        }
+        // Stops once the last watched pane closed and the Session manager
+        // has no agent to keep current.
+        self.update_quiet_timer();
         let now = Instant::now();
         let mut quiet = Vec::new();
         for (id, p) in &mut self.panes {
@@ -14421,6 +14424,7 @@ impl Window {
         self.side.focused = focus;
         self.layout();
         self.update_menu_checks();
+        self.update_quiet_timer();
     }
 
     /// Tools > Connection manager, Session manager, File transfer,
@@ -14461,6 +14465,7 @@ impl Window {
         self.side.focused = false;
         self.layout();
         self.update_menu_checks();
+        self.update_quiet_timer();
     }
 
     /// A pane for a new tab, with the default look.
