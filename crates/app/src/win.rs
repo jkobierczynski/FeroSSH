@@ -1234,6 +1234,8 @@ struct Window {
     settings: Settings,
     /// The theme panes start with (`--theme`, or Nord).
     default_theme: Theme,
+    /// New panes' font: the default, or `--theme`'s custom theme's font.
+    default_font: FontSpec,
     /// The user's own themes (Settings > Custom themes), as last read.
     custom_themes: Vec<CustomTheme>,
     /// What a font, theme or window colours item under the mouse shows
@@ -2412,12 +2414,22 @@ fn create_and_run(launch: Launch, theme: Option<String>) -> Result<()> {
         let mut settings = load_settings();
         load_snippets(&mut settings);
         KEY_OPTIONS.set(key_options(&settings));
-        let font = FontSpec::default();
+        let mut font = FontSpec::default();
         // Read first, so `--theme` and saved looks can name them.
         let custom_themes = load_custom_themes().map(|(t, _)| t).unwrap_or_default();
         // An unknown theme name falls back to the default (Nord).
         let default_theme = theme.and_then(|n| Theme::by_name(&n)).unwrap_or_default();
         let mut renderer = Renderer::new(hwnd, 1, 1)?;
+        // A custom `--theme` brings its font and size, when installed.
+        if let Some(c) = custom_themes
+            .iter()
+            .find(|c| c.theme.name == default_theme.name)
+        {
+            let family = c.font.clone().unwrap_or_else(|| font.family.clone());
+            if renderer.has_family(&family) {
+                font = FontSpec::new(&family, c.size.unwrap_or(font.size_pt));
+            }
+        }
         for (id, family) in (cmd::FONT..).zip(FONT_CHOICES) {
             if renderer.has_family(family) {
                 continue;
@@ -2444,7 +2456,7 @@ fn create_and_run(launch: Launch, theme: Option<String>) -> Result<()> {
         let (ws, first) = Workspace::new();
         let pane = new_pane(
             first,
-            font,
+            font.clone(),
             default_theme.clone(),
             metrics,
             settings.scrollback,
@@ -2497,6 +2509,7 @@ fn create_and_run(launch: Launch, theme: Option<String>) -> Result<()> {
                 keymap: Keymap::new(KEY_DEFAULTS, &settings.key_bindings),
                 settings,
                 default_theme,
+                default_font: font,
                 custom_themes,
                 look_preview: None,
                 command: match &launch {
@@ -6408,7 +6421,7 @@ impl Window {
             &alias,
             &target.port,
             None,
-            &FontSpec::default(),
+            &self.default_font,
             &self.default_theme,
         );
         let scrollback = self
@@ -6695,7 +6708,7 @@ impl Window {
             alias,
             hostname,
             tag,
-            &FontSpec::default(),
+            &self.default_font,
             &self.default_theme,
         );
         let scrollback = self
@@ -10090,9 +10103,20 @@ impl Window {
             .get(&self.focused_id())
             .map_or(&self.default_theme, |p| &p.theme);
         let mode = self.settings.window_colours;
+        // A theme previewed on this pane may carry the committed theme's
+        // name: its own window colours come from the item shown.
+        let previewed = self
+            .look_preview
+            .as_ref()
+            .filter(|p| p.pane == self.focused_id())
+            .and_then(|p| p.theme_by);
+        let custom = match previewed {
+            Some(id) => self.custom_at(id),
+            None => self.custom_named(theme.name),
+        };
         if mode == WindowColours::Theme
             && let Some(custom_theme::WindowSpec::Colours(bg, text, accent)) =
-                self.custom_named(theme.name).and_then(|c| c.window)
+                custom.and_then(|c| c.window)
         {
             return ui_colours::custom(bg, text, accent);
         }
@@ -12074,7 +12098,7 @@ impl Window {
                     &h.session,
                     &h.host,
                     tag.as_deref(),
-                    &FontSpec::default(),
+                    &self.default_font,
                     &self.default_theme,
                 );
                 theme.name == "Production"
@@ -13775,10 +13799,10 @@ impl Window {
                 alias,
                 hostname,
                 tag.as_deref(),
-                &FontSpec::default(),
+                &self.default_font,
                 &self.default_theme,
             ),
-            None => (FontSpec::default(), self.default_theme.clone()),
+            None => (self.default_font.clone(), self.default_theme.clone()),
         };
         if p.theme.name != theme.name
             && theme.group() != ThemeGroup::Warning
@@ -14710,7 +14734,7 @@ impl Window {
     }
 
     fn add_pane(&mut self, id: PaneId) {
-        let font = FontSpec::default();
+        let font = self.default_font.clone();
         let metrics = self
             .renderer
             .metrics(&font, self.dpi)
@@ -16766,6 +16790,9 @@ impl Window {
         let Some(p) = self.look_preview.take() else {
             return;
         };
+        // A choice applies to the focused pane: a preview on another one
+        // (focus moved meanwhile) goes back.
+        let chosen = chosen.filter(|_| self.focused_id() == p.pane);
         let back = |by: Option<u32>| by.is_some() && by != chosen;
         // Only what the preview itself shows goes back.
         let theme_now = self.panes.get(&p.pane).map(|x| &x.theme);
