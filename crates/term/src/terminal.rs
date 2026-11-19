@@ -1197,6 +1197,38 @@ impl Terminal {
         lines
     }
 
+    /// The lines of the screen as the host left it (not where the view
+    /// is scrolled back to), top first, trailing blanks dropped. Read cell
+    /// by cell, as [`Self::all_text`] is.
+    pub fn screen_text(&self) -> Vec<String> {
+        let grid = self.term.grid();
+        let last = grid.last_column();
+        (0..grid.screen_lines())
+            .map(|line| {
+                let row = &grid[Line(line as i32)];
+                let mut text = String::new();
+                for col in 0..=last.0 {
+                    let cell = &row[Column(col)];
+                    if cell.flags.intersects(
+                        TermFlags::WIDE_CHAR_SPACER | TermFlags::LEADING_WIDE_CHAR_SPACER,
+                    ) {
+                        continue;
+                    }
+                    // Concealed text stays blank, as on the screen.
+                    if cell.flags.contains(TermFlags::HIDDEN) {
+                        text.push(' ');
+                        continue;
+                    }
+                    text.push(if cell.c == '\t' { ' ' } else { cell.c });
+                    if let Some(extra) = cell.zerowidth() {
+                        text.extend(extra);
+                    }
+                }
+                text.trim_end().to_owned()
+            })
+            .collect()
+    }
+
     /// The text before the cursor on its line, when the main screen is
     /// shown (full-screen programs draw no prompt). Shells that do not
     /// report their directory with OSC 7 often show it in the prompt;

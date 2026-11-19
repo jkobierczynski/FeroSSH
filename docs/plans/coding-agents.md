@@ -74,3 +74,10 @@ Built on 19 November 2026: the Production confirmation (Session > Scripts > Conf
 ## Order
 
 1 and 2 first, as two pull requests (2 builds on the quiet watch from 1). Then 5 (small, high value for daily agent use), 3, 4 and 6.
+
+## After the six
+
+Picked on 19 November 2026:
+
+- **Agent dashboard (built).** Session > Coding agents > Agent dashboard turns the Session manager into one view of every agent on every connected host: its state, for how long, the last line it showed, those waiting for you first.
+- **Answer from the notification.** Answer an agent's yes/no question from the Windows notification without switching tabs.

@@ -345,6 +345,19 @@ fn ctrl_chords_without_a_character_use_the_kitty_form_when_asked() {
 }
 
 #[test]
+fn the_screen_text_is_what_the_host_left_there() {
+    let mut t = term(10, 3);
+    t.feed(b"one\r\ntwo  \r\n\xe4\xb8\xad!");
+    assert_eq!(t.screen_text(), ["one", "two", "\u{4e2d}!"]);
+    t.feed(b"\r\nfour");
+    assert_eq!(t.screen_text(), ["two", "\u{4e2d}!", "four"]);
+    // Concealed text stays blank; combining marks stay with their letter.
+    let mut t = term(20, 2);
+    t.feed(b"pw: \x1b[8msecret\x1b[28m ok\r\ne\xcc\x81t\xc3\xa9");
+    assert_eq!(t.screen_text(), ["pw:        ok", "e\u{301}t\u{e9}"]);
+}
+
+#[test]
 fn device_queries_get_fixed_replies() {
     let mut t = term(80, 24);
     t.feed(b"\x1b[3;7H\x1b[6n\x1b[c\x1b[5n");
