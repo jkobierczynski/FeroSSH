@@ -112,11 +112,16 @@ pub fn item_rect(item: RailItem, rail: i32, height: i32) -> Rect {
 /// buttons that would overlap the top ones (a very short window) give
 /// way to them.
 pub fn item_at(x: i32, y: i32, rail: i32, height: i32) -> Option<RailItem> {
+    RailItem::ALL
+        .into_iter()
+        .find(|&i| item_shown(i, rail, height) && item_rect(i, rail, height).contains(x, y))
+}
+
+/// Whether a rail button is shown: a bottom one gives way when it would
+/// overlap the top ones. Painting, clicks and tooltips all go by this.
+pub fn item_shown(item: RailItem, rail: i32, height: i32) -> bool {
     let top_end = item_rect(RailItem::KnownHosts, rail, height).bottom();
-    RailItem::ALL.into_iter().find(|&i| {
-        let r = item_rect(i, rail, height);
-        r.contains(x, y) && (!i.at_bottom() || r.y >= top_end)
-    })
+    !item.at_bottom() || item_rect(item, rail, height).y >= top_end
 }
 
 /// What the layout needs to know.

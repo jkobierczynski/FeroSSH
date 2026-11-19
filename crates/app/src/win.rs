@@ -12323,6 +12323,12 @@ impl Window {
             self.refresh_chrome();
             return true;
         }
+        // The search box takes it; the list has nowhere to paste into,
+        // and the terminal behind must not get it either.
+        if self.side.visible && self.side.focused && self.side.view == SideView::KnownHosts {
+            known_hosts_panel::paste(text);
+            return true;
+        }
         if !(self.side.visible && self.side.focused && self.side.view == SideView::Snippets) {
             return false;
         }
@@ -20539,6 +20545,7 @@ fn tools_have_focus() -> bool {
         || script_args::has_focus()
         || script_hosts::has_focus()
         || script_report::has_focus()
+        || known_hosts_panel::has_focus()
 }
 
 /// Carries out what the user did on a script run's report: its keys go
@@ -20704,14 +20711,15 @@ fn known_hosts_event(hwnd: HWND, event: known_hosts_panel::Event) {
         Event::Remove(picks) => remove_known_hosts(hwnd, &picks),
         Event::CopyFingerprint((file, line)) => {
             let text = with_window(|w| w.known_hosts_view.fingerprint(file, line)).flatten();
+            // The user asked for it here: no remote-copy prompt.
             if let Some(text) = text {
-                run_command(hwnd, Command::ClipboardWrite(text));
+                clipboard::set_text(hwnd, &text);
             }
         }
         Event::CopyLine((file, line)) => {
             let text = with_window(|w| w.known_hosts_view.line_text(file, line)).flatten();
             if let Some(text) = text {
-                run_command(hwnd, Command::ClipboardWrite(text));
+                clipboard::set_text(hwnd, &text);
             }
         }
         Event::Reload => {

@@ -22,8 +22,8 @@ use windows::Win32::Graphics::Gdi::{
     PAINTSTRUCT, SelectObject, SetBkMode, SetTextColor, TRANSPARENT,
 };
 use windows::Win32::UI::Controls::{
-    EM_SETCUEBANNER, EM_SETSEL, LIST_VIEW_ITEM_STATE_FLAGS, LVCF_TEXT, LVCF_WIDTH, LVCOLUMNW,
-    LVIF_PARAM, LVIF_TEXT, LVIS_FOCUSED, LVIS_SELECTED, LVITEMW, LVM_DELETEALLITEMS,
+    EM_LIMITTEXT, EM_SETCUEBANNER, EM_SETSEL, LIST_VIEW_ITEM_STATE_FLAGS, LVCF_TEXT, LVCF_WIDTH,
+    LVCOLUMNW, LVIF_PARAM, LVIF_TEXT, LVIS_FOCUSED, LVIS_SELECTED, LVITEMW, LVM_DELETEALLITEMS,
     LVM_ENSUREVISIBLE, LVM_GETITEMW, LVM_GETNEXTITEM, LVM_INSERTCOLUMNW, LVM_INSERTITEMW,
     LVM_SETCOLUMNWIDTH, LVM_SETEXTENDEDLISTVIEWSTYLE, LVM_SETITEMSTATE, LVM_SETITEMTEXTW,
     LVN_KEYDOWN, LVNI_SELECTED, LVS_EX_DOUBLEBUFFER, LVS_EX_FULLROWSELECT, LVS_EX_LABELTIP,
@@ -188,6 +188,9 @@ pub fn create(main: HWND, handler: Handler, dpi: u32) -> windows::core::Result<(
             WS_BORDER.0 | ES_AUTOHSCROLL as u32,
             ID_SEARCH,
         )?;
+        // The view reads at most 200 characters of the query; the box
+        // takes no more, so what is shown is what is searched for.
+        SendMessageW(search, EM_LIMITTEXT, Some(WPARAM(200)), None);
         let cue = wide("Search, or type a host name");
         SendMessageW(
             search,
@@ -348,6 +351,28 @@ pub fn has_focus() -> bool {
     }
 }
 
+/// Pastes `text` (as one line) into the search box when it has the
+/// keyboard; elsewhere in the tool it goes nowhere.
+pub fn paste(text: &str) {
+    let Some(h) = handles() else {
+        return;
+    };
+    // SAFETY: a plain query and a message to our own control; the text
+    // lives through the call.
+    unsafe {
+        if GetFocus() != h.search {
+            return;
+        }
+        let text = wide(&text.lines().collect::<Vec<_>>().join(" "));
+        SendMessageW(
+            h.search,
+            windows::Win32::UI::Controls::EM_REPLACESEL,
+            Some(WPARAM(1)),
+            Some(LPARAM(text.as_ptr() as isize)),
+        );
+    }
+}
+
 fn set_state(list: HWND, index: i32, on: bool) {
     let state = LIST_VIEW_ITEM_STATE_FLAGS(LVIS_SELECTED.0 | LVIS_FOCUSED.0);
     let item = LVITEMW {
@@ -389,7 +414,8 @@ fn selected_indexes(list: HWND) -> Vec<i32> {
             )
         }
         .0 as i32;
-        if i < 0 || out.contains(&i) {
+        // The indexes come in rising order; anything else ends the walk.
+        if i < 0 || out.last().is_some_and(|&last| i <= last) {
             return out;
         }
         out.push(i);
@@ -400,6 +426,11 @@ fn selected_indexes(list: HWND) -> Vec<i32> {
 /// The row shown at list index `index` (its lParam is the row's place in
 /// the rows given).
 fn pick_at(list: HWND, index: i32) -> Option<Pick> {
+    row_at(list, index).map(|r| (r.file, r.line))
+}
+
+/// The row shown at list index `index`, as it was given.
+fn row_at(list: HWND, index: i32) -> Option<Row> {
     let mut item = LVITEMW {
         mask: LVIF_PARAM,
         iItem: index,
@@ -420,19 +451,42 @@ fn pick_at(list: HWND, index: i32) -> Option<Pick> {
     let at = usize::try_from(item.lParam.0).ok()?;
     STATE.with(|s| {
         let s = s.try_borrow().ok()?;
-        let row = s.as_ref()?.rows.as_ref()?.get(at)?;
-        Some((row.file, row.line))
+        s.as_ref()?.rows.as_ref()?.get(at).cloned()
     })
 }
 
 fn picked() -> Vec<Pick> {
+    picked_rows().iter().map(|r| (r.file, r.line)).collect()
+}
+
+fn picked_rows() -> Vec<Row> {
     let Some(h) = handles() else {
         return Vec::new();
     };
     selected_indexes(h.list)
         .into_iter()
-        .filter_map(|i| pick_at(h.list, i))
+        .filter_map(|i| row_at(h.list, i))
         .collect()
+}
+
+/// Whether `new` is the same entry as `old`: same place and same key,
+/// so a line that moved or was replaced in the file is not picked again.
+fn same_entry(old: &Row, new: &Row) -> bool {
+    (
+        old.file,
+        old.line,
+        old.kind,
+        &old.key,
+        &old.fingerprint,
+        &old.comment,
+    ) == (
+        new.file,
+        new.line,
+        new.kind,
+        &new.key,
+        &new.fingerprint,
+        &new.comment,
+    )
 }
 
 /// Shows `rows` (of `total` entries), unless it shows them already, and
@@ -443,7 +497,7 @@ pub fn set_rows(rows: Vec<Row>, total: usize, note: String) {
     let Some(h) = handles() else {
         return;
     };
-    let keep = picked();
+    let keep = picked_rows();
     let changed = STATE.with(|s| {
         let mut s = s.try_borrow_mut().ok()?;
         let s = s.as_mut()?;
@@ -506,7 +560,7 @@ pub fn set_rows(rows: Vec<Row>, total: usize, note: String) {
     }
     let mut any = false;
     for (i, r) in rows.iter().enumerate() {
-        if keep.contains(&(r.file, r.line)) {
+        if keep.iter().any(|k| same_entry(k, r)) {
             set_state(h.list, i as i32, true);
             any = true;
         }
@@ -522,8 +576,7 @@ pub fn set_search(query: &str) {
     let Some(h) = handles() else {
         return;
     };
-    let shown: String = search_text(h.search).chars().take(200).collect();
-    if shown != query {
+    if search_text(h.search) != query {
         let text = wide(query);
         // SAFETY: our own control; the text lives through the call.
         unsafe {

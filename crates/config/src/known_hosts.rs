@@ -534,7 +534,26 @@ pub fn remove_lines(path: &Path, lines: &[(usize, String)]) -> io::Result<usize>
     if lines.is_empty() {
         return Ok(0);
     }
-    let text = read(path)?;
+    let raw = fs::read(path)?;
+    let text = decode(&raw)?;
+    check_lines(path, &text, lines)?;
+    let mut out = String::with_capacity(text.len());
+    let mut removed = 0;
+    // Kept lines are copied as they are, line ends (CRLF too) included.
+    for (i, line) in text.split_inclusive('\n').enumerate() {
+        if lines.iter().any(|(n, _)| *n == i + 1) {
+            removed += 1;
+            continue;
+        }
+        out.push_str(line);
+    }
+    write_over(path, out.as_bytes(), Some(&raw))?;
+    Ok(removed)
+}
+
+/// Checks, before anything is written, that each listed line of `path`
+/// is still the text that was shown.
+pub fn check_lines(path: &Path, text: &str, lines: &[(usize, String)]) -> io::Result<()> {
     let all: Vec<&str> = text.lines().collect();
     for (n, expected) in lines {
         let found = n
@@ -542,25 +561,18 @@ pub fn remove_lines(path: &Path, lines: &[(usize, String)]) -> io::Result<usize>
             .and_then(|i| all.get(i))
             .is_some_and(|l| l == expected);
         if !found {
-            return Err(io::Error::other(format!(
-                "{} changed since it was listed (line {n} is not what was shown). \
-                 The list was read again; check it and try once more.",
-                path.display()
-            )));
+            return Err(changed_error(path, *n));
         }
     }
-    let mut out = String::with_capacity(text.len());
-    let mut removed = 0;
-    for (i, line) in all.iter().enumerate() {
-        if lines.iter().any(|(n, _)| *n == i + 1) {
-            removed += 1;
-            continue;
-        }
-        out.push_str(line);
-        out.push('\n');
-    }
-    replace_file(path, out.as_bytes())?;
-    Ok(removed)
+    Ok(())
+}
+
+fn changed_error(path: &Path, n: usize) -> io::Error {
+    io::Error::other(format!(
+        "{} changed since it was listed (line {n} is not what was shown). \
+         The list was read again; check it and try once more.",
+        path.display()
+    ))
 }
 
 /// Writes `data` to `path` through a fresh temporary file next to it,
@@ -568,21 +580,54 @@ pub fn remove_lines(path: &Path, lines: &[(usize, String)]) -> io::Result<usize>
 /// opened over an existing one, so it can never be another file the
 /// user named (a second known_hosts called `pin.ferossh-tmp`, say).
 fn replace_file(path: &Path, data: &[u8]) -> io::Result<()> {
+    write_over(path, data, None)
+}
+
+/// [`replace_file`], with two more guards. A symbolic link is followed,
+/// so the file it points at is rewritten and the link stays a link. When
+/// `unchanged` is given, the file is read again just before the rename
+/// and nothing is replaced if it no longer holds those bytes (another
+/// program wrote to it meanwhile). The new file gets the old one's
+/// permissions; on Unix it is created owner-only first.
+fn write_over(path: &Path, data: &[u8], unchanged: Option<&[u8]>) -> io::Result<()> {
+    let real = match fs::symlink_metadata(path) {
+        Ok(m) if m.file_type().is_symlink() => fs::canonicalize(path)?,
+        _ => path.to_path_buf(),
+    };
+    let path = real.as_path();
+    let old_perms = fs::metadata(path).ok().map(|m| m.permissions());
     let name = path.file_name().unwrap_or_default().to_string_lossy();
     for n in 0u32..1000 {
         let tmp = path.with_file_name(format!(".{name}.{}-{n}.ferossh-tmp", std::process::id()));
-        let mut file = match fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&tmp)
+        let mut opts = fs::OpenOptions::new();
+        opts.write(true).create_new(true);
+        #[cfg(unix)]
         {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(0o600);
+        }
+        let mut file = match opts.open(&tmp) {
             Ok(f) => f,
             Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
             Err(e) => return Err(e),
         };
         let written = file.write_all(data).and_then(|()| file.sync_all());
         drop(file);
-        if let Err(e) = written.and_then(|()| fs::rename(&tmp, path)) {
+        let done = written
+            .and_then(|()| match &old_perms {
+                Some(p) => fs::set_permissions(&tmp, p.clone()),
+                None => Ok(()),
+            })
+            .and_then(|()| match unchanged {
+                Some(before) if fs::read(path)? != before => Err(io::Error::other(format!(
+                    "{} was changed by another program just now; nothing was removed. \
+                     The list was read again; check it and try once more.",
+                    path.display()
+                ))),
+                _ => Ok(()),
+            })
+            .and_then(|()| fs::rename(&tmp, path));
+        if let Err(e) = done {
             let _ = fs::remove_file(&tmp);
             return Err(e);
         }
@@ -794,12 +839,48 @@ mod tests {
         ];
         assert_eq!(remove_lines(&path, &both).unwrap(), 2);
         let after = fs::read_to_string(&path).unwrap();
-        assert_eq!(after, format!("# keep me\n{}\n", line("b", &b)));
+        // Kept lines keep their own line ends.
+        assert_eq!(after, format!("# keep me\r\n{}\n", line("b", &b)));
         let kh = KnownHosts::parse(&after);
         assert_eq!(kh.check("a", 22, &a), Status::Unknown);
         assert_eq!(kh.check("b", 22, &b), Status::Trusted);
         // No temporary file is left behind.
         assert_eq!(fs::read_dir(&dir).unwrap().count(), 1);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn removing_lines_keeps_links_and_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("ferossh-kh-link-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let real = dir.join("real_hosts");
+        let link = dir.join("known_hosts");
+        let a = blob("ssh-ed25519", b"a");
+        let b = blob("ssh-ed25519", b"b");
+        fs::write(&real, format!("{}\n{}\n", line("a", &a), line("b", &b))).unwrap();
+        fs::set_permissions(&real, fs::Permissions::from_mode(0o640)).unwrap();
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let l = list(&read(&link).unwrap());
+        assert_eq!(
+            remove_lines(&link, &[(l[0].line, l[0].text.clone())]).unwrap(),
+            1
+        );
+        assert!(
+            fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(
+            fs::read_to_string(&real).unwrap(),
+            format!("{}\n", line("b", &b))
+        );
+        assert_eq!(
+            fs::metadata(&real).unwrap().permissions().mode() & 0o777,
+            0o640
+        );
         fs::remove_dir_all(&dir).unwrap();
     }
 

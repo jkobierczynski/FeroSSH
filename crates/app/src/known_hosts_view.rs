@@ -66,7 +66,7 @@ pub fn search_host(query: &str) -> Option<(String, u16)> {
     if let Some(rest) = q.strip_prefix('[') {
         let (host, tail) = rest.split_once(']')?;
         let port = match tail.strip_prefix(':') {
-            Some(p) => p.parse().ok()?,
+            Some(p) => p.parse().ok().filter(|&p| p != 0)?,
             None if tail.is_empty() => 22,
             None => return None,
         };
@@ -181,11 +181,7 @@ impl KnownHostsView {
             }
             (None, None) => "(hashed)".to_owned(),
         };
-        let name = self
-            .files
-            .get(e.file)
-            .and_then(|f| f.file_name())
-            .map_or_else(String::new, |n| n.to_string_lossy().into_owned());
+        let name = self.file_label(e.file);
         Row {
             file: e.file,
             line: l.line,
@@ -195,6 +191,24 @@ impl KnownHostsView {
             fingerprint: e.fingerprint.clone(),
             place: format!("{name}:{}", l.line),
             comment: l.comment.clone(),
+        }
+    }
+
+    /// How a file is named in the list: its name, or its whole path when
+    /// another listed file has the same name.
+    fn file_label(&self, file: usize) -> String {
+        let Some(path) = self.files.get(file) else {
+            return String::new();
+        };
+        let name = path.file_name();
+        let shared = self
+            .files
+            .iter()
+            .enumerate()
+            .any(|(i, f)| i != file && f.file_name() == name);
+        match name {
+            Some(n) if !shared => n.to_string_lossy().into_owned(),
+            _ => path.display().to_string(),
         }
     }
 
@@ -211,11 +225,19 @@ impl KnownHostsView {
         let row = self.row(first, None);
         let what = match (picked.len(), first.listing.kind) {
             (1, LineKind::HostKey) => format!(
-                "Remove the {} host key of {}?\n\n{}\n\nThe next connection to {} asks \
-                 about its key again, as for a host never seen before.",
+                "Remove the {} host key of {}?\n\n{}\n{}\n\nOnly this line goes. If no \
+                 other line holds a key for {}, the next connection asks about its key \
+                 again, as for a host never seen before.",
                 row.key,
                 row.hosts,
                 row.fingerprint,
+                self.files
+                    .get(first.file)
+                    .map_or_else(String::new, |f| format!(
+                        "{}, line {}",
+                        f.display(),
+                        row.line
+                    )),
                 if first.listing.hosts.is_some() {
                     "these hosts"
                 } else {
@@ -224,12 +246,14 @@ impl KnownHostsView {
             ),
             (1, LineKind::CertAuthority) => format!(
                 "Remove the certificate authority for {}?\n\n{} {}\n\nHost certificates \
-                 it signed are no longer accepted for these hosts.",
+                 it signed are no longer accepted for these hosts, unless another \
+                 @cert-authority line still trusts it.",
                 row.hosts, row.key, row.fingerprint
             ),
             (1, LineKind::Revoked) => format!(
-                "Remove the @revoked line for {}?\n\n{} {}\n\nThis key will no longer be \
-                 refused: a host offering it is checked like any other key again.",
+                "Remove the @revoked line for {}?\n\n{} {}\n\nUnless another \
+                 @revoked line lists it too, this key will no longer be refused: a host \
+                 offering it is checked like any other key again.",
                 row.hosts, row.key, row.fingerprint
             ),
             (1, LineKind::Unreadable) => format!(
@@ -240,7 +264,22 @@ impl KnownHostsView {
                     .get(first.file)
                     .map_or_else(String::new, |f| f.display().to_string())
             ),
-            (n, _) => format!("Remove these {n} known_hosts entries?"),
+            (n, _) => {
+                let mut files: Vec<String> = Vec::new();
+                for e in &picked {
+                    if let Some(f) = self.files.get(e.file) {
+                        let f = f.display().to_string();
+                        if !files.contains(&f) {
+                            files.push(f);
+                        }
+                    }
+                }
+                format!(
+                    "Remove these {n} known_hosts entries?\n\nFrom: {}\n\nOnly these lines \
+                     go; other lines for the same hosts stay.",
+                    files.join(", ")
+                )
+            }
         };
         Some(what)
     }
@@ -257,8 +296,14 @@ impl KnownHostsView {
     /// reads the files again; the error names the file that failed. Lines
     /// that changed since they were listed are never removed.
     pub fn remove(&mut self, rows: &[(usize, usize)]) -> Result<usize, String> {
-        let mut removed = 0;
-        let mut result = Ok(());
+        let result = self.remove_now(rows);
+        let files = std::mem::take(&mut self.files);
+        self.reload(files);
+        result
+    }
+
+    fn remove_now(&self, rows: &[(usize, usize)]) -> Result<usize, String> {
+        let mut plan: Vec<(&Path, Vec<(usize, String)>)> = Vec::new();
         for (i, path) in self.files.iter().enumerate() {
             let lines: Vec<(usize, String)> = rows
                 .iter()
@@ -266,20 +311,30 @@ impl KnownHostsView {
                 .filter_map(|&(f, l)| self.entry(f, l))
                 .map(|e| (e.listing.line, e.listing.text.clone()))
                 .collect();
-            if lines.is_empty() {
-                continue;
+            if !lines.is_empty() {
+                plan.push((path, lines));
             }
-            match known_hosts::remove_lines(path, &lines) {
+        }
+        // Every file is checked before any is written, so a file that
+        // changed since it was listed stops the whole removal.
+        for (path, lines) in &plan {
+            known_hosts::read(path)
+                .and_then(|text| known_hosts::check_lines(path, &text, lines))
+                .map_err(|e| e.to_string())?;
+        }
+        let mut removed = 0;
+        for (path, lines) in &plan {
+            match known_hosts::remove_lines(path, lines) {
                 Ok(n) => removed += n,
+                Err(e) if removed == 0 => return Err(e.to_string()),
                 Err(e) => {
-                    result = Err(e.to_string());
-                    break;
+                    return Err(format!(
+                        "{removed} entries were removed, then this failed: {e}"
+                    ));
                 }
             }
         }
-        let files = std::mem::take(&mut self.files);
-        self.reload(files);
-        result.map(|()| removed)
+        Ok(removed)
     }
 
     /// The fingerprint of an entry, for Copy fingerprint.
@@ -412,6 +467,9 @@ mod tests {
         assert_eq!(search_host("web"), Some(("web".into(), 22)));
         assert_eq!(search_host(" web:2222 "), Some(("web".into(), 2222)));
         assert_eq!(search_host("[web]:2222"), Some(("web".into(), 2222)));
+        // Brackets make a dotless name a host search.
+        assert_eq!(search_host("[web01]"), Some(("web01".into(), 22)));
+        assert!(looks_like_host("[web01]") && !looks_like_host("web01"));
         assert_eq!(search_host("[::1]"), Some(("::1".into(), 22)));
         assert_eq!(search_host("fe80::1"), Some(("fe80::1".into(), 22)));
         assert_eq!(search_host("web:x"), None);
@@ -474,11 +532,13 @@ mod tests {
         v.set_query("[secret.example]:2222");
         assert_eq!(v.rows().len(), 2);
         v.set_query("secret.example");
+        let rows = v.rows();
         assert!(
-            v.rows()
-                .iter()
-                .all(|r| r.hosts != "[secret.example]:2222 (hashed)")
+            rows.iter()
+                .all(|r| (r.file, r.line) != (all[1].file, all[1].line)),
+            "{rows:?}"
         );
+        assert!(rows.iter().any(|r| r.kind == "Revoked"));
         v.set_query("db.corp");
         assert_eq!(v.rows().iter().filter(|r| r.kind == "CA").count(), 1);
         fs::remove_dir_all(&d).unwrap();
@@ -524,6 +584,32 @@ mod tests {
         fs::write(&path, format!("{}\n", line("beta", &ed25519(2)))).unwrap();
         assert!(v.remove(&[stale]).is_err());
         assert_eq!(v.rows()[0].hosts, "beta");
+        // Two files: when the second changed, the first is left alone too.
+        // Files with the same name are told apart by their whole path.
+        let other = d.join("sub");
+        fs::create_dir_all(&other).unwrap();
+        let path2 = other.join("known_hosts");
+        let first = format!(
+            "{}\r\n{}\r\n",
+            line("gamma", &ed25519(4)),
+            line("keep", &ed25519(6))
+        );
+        fs::write(&path, &first).unwrap();
+        fs::write(&path2, format!("{}\n", line("delta", &ed25519(5)))).unwrap();
+        v.reload(vec![path.clone(), path2.clone()]);
+        let rows = v.rows();
+        assert_eq!(rows[0].place, format!("{}:1", path.display()));
+        let both = [(rows[0].file, rows[0].line), (rows[2].file, rows[2].line)];
+        fs::write(&path2, "# changed\n").unwrap();
+        assert!(v.remove(&both).is_err());
+        assert_eq!(fs::read_to_string(&path).unwrap(), first);
+        // Lines kept by a removal keep their CRLF ends.
+        let gamma = (v.rows()[0].file, v.rows()[0].line);
+        assert_eq!(v.remove(&[gamma]), Ok(1));
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            format!("{}\r\n", line("keep", &ed25519(6)))
+        );
         fs::remove_dir_all(&d).unwrap();
     }
 

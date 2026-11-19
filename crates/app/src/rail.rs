@@ -36,7 +36,7 @@ use windows::core::{PCWSTR, PWSTR, w};
 const WM_MOUSELEAVE: u32 = 0x02A3;
 
 use crate::layout::Rect;
-use crate::toolpane::{RailItem, item_at, item_rect};
+use crate::toolpane::{RailItem, item_at, item_rect, item_shown};
 
 /// What the rail shows; the main window sets it.
 #[derive(Clone, Debug, PartialEq)]
@@ -213,11 +213,16 @@ fn update_tips(hwnd: HWND, tooltip: HWND, w: i32, h: i32, pinned: bool) {
     }
     for (index, item) in RailItem::ALL.into_iter().enumerate() {
         let r = item_rect(item, w, h);
-        let rect = RECT {
-            left: r.x,
-            top: r.y,
-            right: r.right(),
-            bottom: r.bottom(),
+        // A hidden button has no tooltip area.
+        let rect = if item_shown(item, w, h) {
+            RECT {
+                left: r.x,
+                top: r.y,
+                right: r.right(),
+                bottom: r.bottom(),
+            }
+        } else {
+            RECT::default()
         };
         let key = RAIL.with(|r| {
             r.try_borrow()
@@ -354,14 +359,11 @@ fn paint(hwnd: HWND) {
         );
         let old = SelectObject(dc, HGDIOBJ(font.0));
         SetBkMode(dc, TRANSPARENT);
-        let top_end = item_rect(RailItem::KnownHosts, w, h).bottom();
         for item in RailItem::ALL {
             let r = item_rect(item, w, h);
-            if item == RailItem::Palette || item == RailItem::Pin {
-                // A window too short for both groups: the tools win.
-                if r.y < top_end {
-                    continue;
-                }
+            // A window too short for both groups: the tools win.
+            if !item_shown(item, w, h) {
+                continue;
             }
             let active = look.active == Some(item);
             let on = active || (item == RailItem::Pin && look.pinned);
