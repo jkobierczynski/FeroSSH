@@ -116,24 +116,7 @@ const LAST_LINE: usize = 160;
 /// this is a good guess, not a reading of what they mean.
 pub fn last_line(screen: &[String]) -> Option<String> {
     screen.iter().rev().find_map(|line| {
-        let text: String = line
-            .chars()
-            .map(|c| {
-                if ('\u{2500}'..='\u{259f}').contains(&c) || c.is_control() {
-                    ' '
-                } else {
-                    c
-                }
-            })
-            .collect();
-        let text = text
-            .split_whitespace()
-            .collect::<Vec<_>>()
-            .join(" ")
-            .trim_start_matches([
-                '>', '\u{276f}', '$', '#', '%', '*', '\u{2022}', '\u{25cf}', '\u{23fa}', ' ',
-            ])
-            .to_owned();
+        let text = clean(line);
         let words = text.chars().filter(|c| c.is_alphanumeric()).count();
         let hint = text.starts_with("? for shortcuts")
             || text.starts_with("esc to interrupt")
@@ -142,7 +125,178 @@ pub fn last_line(screen: &[String]) -> Option<String> {
     })
 }
 
+/// A screen line without the frames agents draw (box-drawing characters),
+/// with its spaces closed up and the marks before a prompt or an answer
+/// (`>`, `❯`, `●`, `⏺`, `$`) taken off.
+fn clean(line: &str) -> String {
+    let text: String = line
+        .chars()
+        .map(|c| {
+            if ('\u{2500}'..='\u{259f}').contains(&c) || c.is_control() {
+                ' '
+            } else {
+                c
+            }
+        })
+        .collect();
+    text.split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .trim_start_matches([
+            '>', '\u{276f}', '$', '#', '%', '*', '\u{2022}', '\u{25cf}', '\u{23fa}', ' ',
+        ])
+        .to_owned()
+}
+
+/// A yes-or-no question an agent shows at the bottom of its screen, with
+/// the keys that answer it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Question {
+    /// The question as shown, at most [`LAST_LINE`] characters.
+    pub text: String,
+    /// What to type for yes, and for no.
+    pub yes: Vec<u8>,
+    pub no: Vec<u8>,
+    /// The bottom of the screen it was read from, uncleaned: what it asks
+    /// about (the command, the file) is part of which question it is, so
+    /// a later question with the same words is not taken for it.
+    pub context: Vec<String>,
+}
+
+/// How far up from the bottom of the screen a question is looked for.
+const QUESTION_LINES: usize = 16;
+
+/// Lines that may follow the last choice of a numbered choice: hints such
+/// as "Esc to cancel", the bottom of a box.
+const AFTER_CHOICES: usize = 3;
+
+/// The yes-or-no question agent `screen` shows, if it shows one, in one of
+/// the two forms agents ask in:
+///
+/// - a numbered choice (Claude Code, Codex): a line `1. Yes…` and a line
+///   `2. No…` or `3. No…`; the number of each answers, as typing it there
+///   does. The question is the line with words above choice 1. Only the
+///   last choice list counts, and only when little follows it.
+/// - a prompt line ending in `[y/n]`, `[Y/n]`, `[y/N]`, `(y/n)` or
+///   `(Y)es/(N)o` (aider and most command-line tools), with at most a
+///   default such as `[Yes]` after it: `y` or `n` and Enter. A line with
+///   an answer typed after it was answered already.
+///
+/// Only the bottom of the screen counts, where an agent waits for the
+/// answer; a question it scrolled past is not one.
+pub fn question(screen: &[String]) -> Option<Question> {
+    let bottom: Vec<String> = screen
+        .iter()
+        .map(|l| clean(l))
+        .filter(|l| !l.is_empty())
+        .collect();
+    let bottom = bottom.get(bottom.len().saturating_sub(QUESTION_LINES)..)?;
+    // As the screen shows it, spaces and all: `rm 'a  b'` is not `rm 'a b'`.
+    let raw: Vec<String> = screen
+        .iter()
+        .map(|l| l.trim_end().to_owned())
+        .filter(|l| !clean(l).is_empty())
+        .collect();
+    let context = raw
+        .get(raw.len().saturating_sub(QUESTION_LINES)..)?
+        .to_vec();
+    // A y/n prompt on the last line is the newest question there is.
+    yes_no(bottom, context.clone()).or_else(|| numbered(bottom, &context))
+}
+
+/// A numbered choice line: its number and its words, lower case.
+fn choice(line: &str) -> Option<(u8, String)> {
+    let (n, rest) = line.split_once(". ")?;
+    let n: u8 = n.trim().parse().ok().filter(|n| (1..=9).contains(n))?;
+    Some((n, rest.trim().to_lowercase()))
+}
+
+/// [`question`]'s numbered choice: the last list of choices, counted up
+/// from its last one to choice 1 (a long choice may wrap onto a line of
+/// its own between them).
+fn numbered(bottom: &[String], context: &[String]) -> Option<Question> {
+    let last = bottom.iter().rposition(|l| choice(l).is_some())?;
+    if bottom.len() - 1 - last > AFTER_CHOICES {
+        return None;
+    }
+    let mut options: Vec<(u8, String)> = Vec::new();
+    let mut first = None;
+    let mut gap = 0;
+    for i in (0..=last).rev() {
+        let Some(line) = bottom.get(i) else {
+            break;
+        };
+        match choice(line) {
+            Some((n, words)) => {
+                let wanted = options.last().map_or(n, |(m, _)| m.saturating_sub(1));
+                if n != wanted {
+                    break;
+                }
+                gap = 0;
+                options.push((n, words));
+                if n == 1 {
+                    first = Some(i);
+                    break;
+                }
+            }
+            None if gap == 0 && !options.is_empty() => gap = 1,
+            None => break,
+        }
+    }
+    let first = first?;
+    // In order, so the first "Yes…" wins.
+    options.reverse();
+    let find = |word: &str| {
+        options
+            .iter()
+            .find(|(_, t)| {
+                t == word
+                    || t.starts_with(&format!("{word},"))
+                    || t.starts_with(&format!("{word} "))
+            })
+            .map(|(n, _)| *n)
+    };
+    let (yes, no) = (find("yes")?, find("no")?);
+    let text = bottom
+        .get(..first)?
+        .iter()
+        .rev()
+        .find(|l| l.chars().filter(|c| c.is_alphanumeric()).count() >= 3)?;
+    Some(Question {
+        text: text.chars().take(LAST_LINE).collect(),
+        yes: vec![b'0' + yes],
+        no: vec![b'0' + no],
+        context: context.to_vec(),
+    })
+}
+
+/// [`question`]'s y/n prompt, on the last line.
+fn yes_no(bottom: &[String], context: Vec<String>) -> Option<Question> {
+    let last = bottom.last()?;
+    let lower = last.to_lowercase();
+    let (at, marker) = ["[y/n]", "(y/n)", "(y)es/(n)o", "[yes/no]", "(yes/no)"]
+        .iter()
+        .filter_map(|m| lower.rfind(m).map(|at| (at, *m)))
+        .max_by_key(|(at, _)| *at)?;
+    // After it, only punctuation and a default, never an answer.
+    let rest = lower
+        .get(at + marker.len()..)?
+        .trim_matches([' ', ':', '?']);
+    let rest = ["[yes]", "[no]", "[y]", "[n]"]
+        .iter()
+        .find_map(|d| rest.strip_prefix(d))
+        .unwrap_or(rest)
+        .trim_matches([' ', ':', '?']);
+    rest.is_empty().then(|| Question {
+        text: last.chars().take(LAST_LINE).collect(),
+        yes: b"y\r".to_vec(),
+        no: b"n\r".to_vec(),
+        context,
+    })
+}
+
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
 
@@ -290,6 +444,93 @@ mod tests {
 
     fn screen(lines: &[&str]) -> Vec<String> {
         lines.iter().map(|l| (*l).to_owned()).collect()
+    }
+
+    #[test]
+    fn finds_a_question_and_how_to_answer_it() {
+        // Claude Code: a numbered choice in a box.
+        let claude = screen(&[
+            "\u{23fa} Bash(npm test)",
+            "\u{256d}\u{2500}\u{2500}\u{256e}",
+            "\u{2502} Bash command                                   \u{2502}",
+            "\u{2502}   npm test                                     \u{2502}",
+            "\u{2502} Do you want to proceed?                        \u{2502}",
+            "\u{2502} \u{276f} 1. Yes                                   \u{2502}",
+            "\u{2502}   2. Yes, and don't ask again for npm commands \u{2502}",
+            "\u{2502}   3. No, and tell Claude what to do differently (esc) \u{2502}",
+            "\u{2570}\u{2500}\u{2500}\u{256f}",
+        ]);
+        let q = question(&claude).unwrap();
+        assert_eq!(q.text, "Do you want to proceed?");
+        assert_eq!((q.yes.as_slice(), q.no.as_slice()), (&b"1"[..], &b"3"[..]));
+        // aider: a y/n prompt.
+        let aider = screen(&["Add file to the chat? (Y)es/(N)o [Yes]: "]);
+        let q = question(&aider).unwrap();
+        assert_eq!(q.text, "Add file to the chat? (Y)es/(N)o [Yes]:");
+        assert_eq!(
+            (q.yes.as_slice(), q.no.as_slice()),
+            (&b"y\r"[..], &b"n\r"[..])
+        );
+        let apt = screen(&["Do you want to continue? [Y/n] "]);
+        assert_eq!(question(&apt).unwrap().no, b"n\r");
+        // A numbered list that is not yes or no, an answer with no
+        // question, and a question long scrolled up are not questions.
+        assert_eq!(question(&screen(&["Pick one:", "1. Red", "2. Blue"])), None);
+        assert_eq!(question(&screen(&["1. Yes", "2. No"])), None);
+        let mut old = screen(&["Overwrite? [y/n] y"]);
+        old.extend((0..20).map(|i| format!("line {i} of output")));
+        assert_eq!(question(&old), None);
+        assert_eq!(question(&screen(&["All done.", "> "])), None);
+        // An answer typed after the prompt, or words after it, answered it.
+        assert_eq!(question(&screen(&["Overwrite? [y/n] y"])), None);
+        assert_eq!(
+            question(&screen(&["Answer with [y/n] when asked. Done."])),
+            None
+        );
+        assert!(question(&screen(&["Overwrite? [y/N]: "])).is_some());
+        // Only the last menu counts: an older one above a new list is not
+        // answered by the new list's numbers.
+        let two = screen(&[
+            "Do you want to proceed?",
+            "1. Yes",
+            "2. No",
+            "Pick a colour:",
+            "1. Red",
+            "2. Blue",
+        ]);
+        assert_eq!(question(&two), None);
+        // A y/n prompt below an older menu is the question.
+        let mixed = screen(&["Run command?", "1. Yes", "2. No", "Overwrite? [y/n]"]);
+        let q = question(&mixed).unwrap();
+        assert_eq!(q.text, "Overwrite? [y/n]");
+        assert_eq!(q.yes, b"y\r");
+        // The same words about another command are another question.
+        let push = screen(&[
+            "Bash(git push)",
+            "Do you want to proceed?",
+            "1. Yes",
+            "2. No",
+        ]);
+        let test = screen(&[
+            "Bash(npm test)",
+            "Do you want to proceed?",
+            "1. Yes",
+            "2. No",
+        ]);
+        let (push, test) = (question(&push).unwrap(), question(&test).unwrap());
+        assert_eq!(push.text, test.text);
+        assert_ne!(push, test);
+        // Spaces count too.
+        let ask = |cmd: &str| {
+            question(&screen(&[
+                cmd,
+                "Do you want to proceed?",
+                "1. Yes",
+                "2. No",
+            ]))
+        };
+        assert_ne!(ask("Bash(rm 'a  b')"), ask("Bash(rm 'a b')"));
+        assert_eq!(ask("Bash(rm 'a b')"), ask("Bash(rm 'a b')"));
     }
 
     #[test]

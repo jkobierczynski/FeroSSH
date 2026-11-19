@@ -13,6 +13,7 @@
 //! PortPreviews yes
 //! KittyKeyboard yes
 //! AgentAudit yes
+//! AnswerFromNotification yes
 //! ShiftEnter esc-enter
 //! AutoReconnect yes
 //! RemoteAppCopyAgent yes
@@ -720,6 +721,10 @@ pub struct Settings {
     /// as an audit trail of what the agent did on the host. Off unless
     /// turned on.
     pub agent_audit: bool,
+    /// Clicking the Windows notification of a coding agent that asks a
+    /// yes-or-no question answers it from a small dialog, without
+    /// switching tabs. Off unless turned on.
+    pub answer_from_notification: bool,
     /// The file view follows the shell's working directory (OSC 7).
     pub follow_directory: bool,
     /// How the file transfer pane arranges its Local and Remote lists,
@@ -861,6 +866,7 @@ impl Default for Settings {
             port_previews: false,
             kitty_keyboard: false,
             agent_audit: false,
+            answer_from_notification: false,
             shift_enter: ShiftEnterKey::Enter,
             follow_directory: true,
             transfer_layout: None,
@@ -1229,6 +1235,10 @@ impl Settings {
                 "agentaudit" => {
                     block = Block::Top;
                     s.agent_audit = yes(&args).unwrap_or(false);
+                }
+                "answerfromnotification" => {
+                    block = Block::Top;
+                    s.answer_from_notification = yes(&args).unwrap_or(false);
                 }
                 "shiftenter" => {
                     block = Block::Top;
@@ -1668,6 +1678,11 @@ impl Settings {
         let _ = writeln!(out, "AgentAudit {}", flag(self.agent_audit));
         let _ = writeln!(
             out,
+            "AnswerFromNotification {}",
+            flag(self.answer_from_notification)
+        );
+        let _ = writeln!(
+            out,
             "RemoteAppCopyAgent {}",
             flag(self.remote_app_copy_agent)
         );
@@ -1981,6 +1996,7 @@ UploadAndTypePath yes
 PortPreviews yes
 KittyKeyboard yes
 AgentAudit yes
+AnswerFromNotification yes
 ShiftEnter csi-u
 AutoReconnect no
 ParallelTransfers 20
@@ -2126,6 +2142,11 @@ NewKeyword later
         assert!(!Settings::default().kitty_keyboard, "off unless turned on");
         assert!(s.agent_audit);
         assert!(!Settings::default().agent_audit, "off unless turned on");
+        assert!(s.answer_from_notification);
+        assert!(
+            !Settings::default().answer_from_notification,
+            "off unless turned on"
+        );
         assert_eq!(s.shift_enter, ShiftEnterKey::CsiU);
         assert_eq!(Settings::default().shift_enter, ShiftEnterKey::Enter);
         assert_eq!(
