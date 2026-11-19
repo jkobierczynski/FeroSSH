@@ -823,6 +823,8 @@ struct Logging {
     raw: bool,
     writer: Option<LogWriter<File>>,
     path: Option<PathBuf>,
+    /// The coding agent the open log is named after, if it is an agent's.
+    agent: Option<String>,
 }
 
 /// Session > Logs and recordings > Record this pane: the pane's output with its timing, as an
@@ -7944,6 +7946,7 @@ impl Window {
                 if let Some(p) = self.panes.get_mut(&id) {
                     p.log.writer = Some(writer);
                     p.log.path = Some(path);
+                    p.log.agent = agent.map(str::to_owned);
                 }
             }
             Err(e) => {
@@ -9476,15 +9479,7 @@ impl Window {
         p.log.enabled = true;
         // An ordinary log opened before the pane was known to run an agent
         // ends, and the agent's own log follows it.
-        let suffix = format!("-{agent}");
-        let ordinary = p.log.writer.is_some()
-            && !p
-                .log
-                .path
-                .as_deref()
-                .and_then(Path::file_name)
-                .is_some_and(|n| n.to_string_lossy().contains(&suffix));
-        if ordinary {
+        if p.log.writer.is_some() && p.log.agent.as_deref() != Some(agent.as_str()) {
             self.stop_log(id);
         }
         self.start_log_as(id, Some(&agent));
