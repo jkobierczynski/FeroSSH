@@ -232,6 +232,15 @@ pub fn parse(msg: &[u8], id: u16, name: &[u8]) -> Result<Answer, Bad> {
     if r.name()? != lower || r.u16()? != TYPE_SSHFP || r.u16()? != CLASS_IN {
         return Err(Bad::NotOurs);
     }
+    // A truncated answer is asked again over TCP: its records are not
+    // read, as the last one may be cut off, nor its response code.
+    if truncated {
+        return Ok(Answer {
+            authenticated,
+            truncated,
+            ..Answer::default()
+        });
+    }
     match rcode {
         0 => {}
         // NXDOMAIN: no such name, so no records.
@@ -243,15 +252,6 @@ pub fn parse(msg: &[u8], id: u16, name: &[u8]) -> Result<Answer, Bad> {
             });
         }
         code => return Err(Bad::Failed(code)),
-    }
-    // A truncated answer is asked again over TCP: its records are not
-    // read, as the last one may be cut off.
-    if truncated {
-        return Ok(Answer {
-            authenticated,
-            truncated,
-            ..Answer::default()
-        });
     }
     // Every record first, then the CNAME chain from the name asked, so
     // the order of the answer section does not matter.
@@ -541,6 +541,9 @@ mod tests {
         cut.truncate(cut.len() - 10);
         let a = parse(&cut, 1, &name).unwrap();
         assert!(a.truncated && a.records.is_empty());
+        // Truncated with an error code: asked again over TCP too.
+        let tc_fail = answer(1, 0x8382, &name, &[]);
+        assert!(parse(&tc_fail, 1, &name).unwrap().truncated);
     }
 
     #[test]
