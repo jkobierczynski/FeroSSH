@@ -85,6 +85,7 @@ Font, theme and text size apply to the focused pane only. Session > Save font an
 | File transfer | Ctrl+Shift+E | Shows the focused pane's host over SFTP in the side pane (see [File transfer](everyday-use.md#file-transfer)). |
 | Port forwards | Ctrl+Shift+P | Lists, adds, changes and stops port forwards on live connections (see [Port forwards](everyday-use.md#port-forwards)). |
 | Scripts | Ctrl+Shift+Space | Lists your scripts by category, to type one into the pane or edit them (see [Scripts](everyday-use.md#scripts)). |
+| Known hosts | Ctrl+Shift+K | Lists the host keys in `known_hosts` to search, copy and remove, `@cert-authority` and `@revoked` lines and hashed host names included (see [Known hosts](everyday-use.md#known-hosts)). |
 | Open scripts folder | | Opens `%APPDATA%\FeroSSH\scripts` in Explorer: one file per script, a folder per category, to copy to another PC or back up (see [The scripts folder](everyday-use.md#the-scripts-folder)). |
 | Command palette | Ctrl+Shift+A | One search box over every menu item, connection and script (see [Command palette](everyday-use.md#the-command-palette)). |
 | New SSH key... | | Makes an Ed25519 key file (with or without a passphrase) or a security key or Windows Hello key, and offers to copy it to the focused pane's host (see [Making a key](everyday-use.md#making-a-key-and-putting-it-on-a-server)). |
@@ -171,7 +172,7 @@ Font, theme and text size apply to the focused pane only. Session > Save font an
 | Scripts > Write built-in scripts to the library | Writes FeroSSH's built-in scripts into your scripts folder, under `Library`. Adds the ones not there yet and asks before overwriting any you already have (see [The built-in library](everyday-use.md#the-built-in-library)). |
 | Scripts > Auto-responses from scripts | ✓ on: scripts with a *When* text answer by themselves. Off turns all of them off. `AutoResponses`. |
 | Scripts > Confirm scripts and agents on Production hosts | ✓ on: a script about to be typed into a pane with the Production theme asks first, and so do starting a coding agent there and pasting or dropping into an agent's pane there. `ConfirmProduction`. |
-| Replace host key... | After a host key change you know the reason for, trusts the new key. It asks twice. |
+| Replace host key... | After a host key change you know the reason for, trusts the new key. It asks twice. To look through or remove stored keys without connecting, use Tools > Known hosts. |
 | Copy public key to this server... | Like `ssh-copy-id`: adds a `.pub` file's key to `~/.ssh/authorized_keys` on the focused pane's host, unless it is there already (see [Making a key](everyday-use.md#making-a-key-and-putting-it-on-a-server)). |
 | Verify transfers (SHA-256) | Compares SHA-256 sums on both ends after each SFTP transfer (the server needs `sha256sum` and `xargs`). ✓ `VerifyTransfers`. |
 | ZMODEM: answer rz and sz | Answers `rz` and `sz` in the terminal (see [ZMODEM](everyday-use.md#zmodem)). ✓ `ZModem`. |
@@ -276,6 +277,18 @@ The arrow buttons between the lists move the selection across, and the gap betwe
 | Del or Stop | Stops the selected forward. |
 | Right click or Shift+F10 | Edit, Retry and Stop for the forward. |
 | Esc | Ends a change or clears the form, then leaves. |
+
+### Known hosts (Ctrl+Shift+K)
+
+| Key | Action |
+| --- | --- |
+| Typing | Searches hosts, kinds, key types, fingerprints, comments and files (in the list it goes to the search box; Down there moves to the list). A host name (`web.example`, `web:2222`, `[10.0.0.5]:2222`) also finds the lines for that host the way a connection looks them up: hashed names, wildcards and `!` exclusions. |
+| Shift or Ctrl with a click, Ctrl+A | Picks several entries. |
+| Del or Remove... | Removes the picked entries, after asking (twice for a `@revoked` line). |
+| Ctrl+C or Copy fingerprint | Copies the entry's SHA-256 fingerprint. |
+| F5 or Reload | Reads the files again. |
+| Right click or Shift+F10 | Copy fingerprint, Copy line and Remove for the entry. |
+| Escape | Clears the search; with none, gives the keyboard back to the terminal. |
 
 ### Scripts (Ctrl+Shift+Space)
 

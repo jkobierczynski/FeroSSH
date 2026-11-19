@@ -401,6 +401,168 @@ fn rewrite(path: &Path, host: &str, port: u16, key: Option<&[u8]>) -> io::Result
     replace_file(path, out.as_bytes())
 }
 
+/// What a known_hosts line is, as the known hosts manager lists it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LineKind {
+    /// A trusted host key.
+    HostKey,
+    /// `@cert-authority`: a CA trusted to sign host certificates.
+    CertAuthority,
+    /// `@revoked`: a key that is always refused.
+    Revoked,
+    /// A line OpenSSH and FeroSSH skip: an unknown `@` marker, a key that
+    /// does not decode, or one whose type disagrees with the line's.
+    Unreadable,
+}
+
+impl LineKind {
+    pub fn label(self) -> &'static str {
+        match self {
+            LineKind::HostKey => "Host key",
+            LineKind::CertAuthority => "CA",
+            LineKind::Revoked => "Revoked",
+            LineKind::Unreadable => "Unreadable",
+        }
+    }
+}
+
+/// One line of a known_hosts file that is not blank or a comment.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Listing {
+    /// 1-based.
+    pub line: usize,
+    /// The line as it is in the file, so a removal can check it is still
+    /// there.
+    pub text: String,
+    pub kind: LineKind,
+    /// The host patterns as written; `None` for a hashed name
+    /// (`|1|salt|hash`), which only a host name typed in can match.
+    pub hosts: Option<String>,
+    /// The key type the line names (`ssh-ed25519`, ...).
+    pub key_type: String,
+    /// The key in SSH wire format; empty for an unreadable line.
+    pub key: Vec<u8>,
+    /// Whatever follows the key.
+    pub comment: String,
+    hashed: Option<(Vec<u8>, Vec<u8>)>,
+}
+
+impl Listing {
+    /// Whether the line is for `host` on `port`, the way a connection
+    /// looks it up: a hashed name is checked against the name, a pattern
+    /// list matched with its wildcards and `!` negations.
+    pub fn matches_host(&self, host: &str, port: u16) -> bool {
+        let token = host_token(host, port);
+        match (&self.hashed, &self.hosts) {
+            (Some((salt, hash)), _) => host_matches(
+                &Hosts::Hashed {
+                    salt: salt.clone(),
+                    hash: hash.clone(),
+                },
+                &token,
+            ),
+            (None, Some(list)) => match_pattern_list(list, &token),
+            (None, None) => false,
+        }
+    }
+}
+
+/// Every line of known_hosts text that is not blank or a comment, in
+/// order, unreadable ones included so they can be found and removed.
+pub fn list(text: &str) -> Vec<Listing> {
+    text.lines()
+        .enumerate()
+        .filter_map(|(i, line)| list_line(i + 1, line))
+        .collect()
+}
+
+fn list_line(line_no: usize, line: &str) -> Option<Listing> {
+    let mut fields = line.split_ascii_whitespace();
+    let first = fields.next()?;
+    if first.starts_with('#') {
+        return None;
+    }
+    let mut unknown_marker = false;
+    let host_field = match first {
+        "@cert-authority" | "@revoked" => fields.next(),
+        m if m.starts_with('@') => {
+            unknown_marker = true;
+            fields.next()
+        }
+        _ => Some(first),
+    };
+    let key_type = fields.next().unwrap_or_default().to_owned();
+    let _key_field = fields.next();
+    let comment = fields.collect::<Vec<_>>().join(" ");
+    let parsed = (!unknown_marker)
+        .then(|| parse_line(line_no, line))
+        .flatten();
+    let hosts_text = host_field.unwrap_or_default();
+    let hashed = match parsed.as_ref().map(|e| &e.hosts) {
+        Some(Hosts::Hashed { salt, hash }) => Some((salt.clone(), hash.clone())),
+        _ => None,
+    };
+    let hosts = if hashed.is_some() || hosts_text.starts_with("|1|") {
+        None
+    } else {
+        Some(hosts_text.to_owned())
+    };
+    let kind = match parsed.as_ref().map(|e| e.marker) {
+        None => LineKind::Unreadable,
+        Some(None) => LineKind::HostKey,
+        Some(Some(Marker::CertAuthority)) => LineKind::CertAuthority,
+        Some(Some(Marker::Revoked)) => LineKind::Revoked,
+    };
+    Some(Listing {
+        line: line_no,
+        text: line.to_owned(),
+        kind,
+        hosts,
+        key_type,
+        key: parsed.map(|e| e.key).unwrap_or_default(),
+        comment,
+        hashed,
+    })
+}
+
+/// Removes whole lines from the known_hosts file at `path`: each given
+/// by its 1-based number and its text as listed. Nothing is written when
+/// any of them is no longer there as listed (the file changed since):
+/// the error says so, and the caller lists the file again. Returns how
+/// many lines went. The file is rewritten through a temporary file.
+pub fn remove_lines(path: &Path, lines: &[(usize, String)]) -> io::Result<usize> {
+    if lines.is_empty() {
+        return Ok(0);
+    }
+    let text = read(path)?;
+    let all: Vec<&str> = text.lines().collect();
+    for (n, expected) in lines {
+        let found = n
+            .checked_sub(1)
+            .and_then(|i| all.get(i))
+            .is_some_and(|l| l == expected);
+        if !found {
+            return Err(io::Error::other(format!(
+                "{} changed since it was listed (line {n} is not what was shown). \
+                 The list was read again; check it and try once more.",
+                path.display()
+            )));
+        }
+    }
+    let mut out = String::with_capacity(text.len());
+    let mut removed = 0;
+    for (i, line) in all.iter().enumerate() {
+        if lines.iter().any(|(n, _)| *n == i + 1) {
+            removed += 1;
+            continue;
+        }
+        out.push_str(line);
+        out.push('\n');
+    }
+    replace_file(path, out.as_bytes())?;
+    Ok(removed)
+}
+
 /// Writes `data` to `path` through a fresh temporary file next to it,
 /// then renames it into place. The temporary file is created new, never
 /// opened over an existing one, so it can never be another file the
@@ -553,6 +715,92 @@ mod tests {
             key_type(key).unwrap(),
             Base64::encode_string(key)
         )
+    }
+
+    #[test]
+    fn listing_shows_every_kind_of_line() {
+        let host = blob("ssh-ed25519", b"host");
+        let ca = blob("ssh-ed25519", b"ca");
+        let gone = blob("ssh-rsa", b"gone");
+        let hashed = hashed_line("secret.example", 2222, &host).unwrap();
+        let text = format!(
+            "# a comment\n\n{} me@pc\n@cert-authority {}\n@revoked {}\n{hashed}\n\
+             @weird host ssh-ed25519 AAAA\nbad ssh-ed25519 !!!\n",
+            line("a.example,10.0.0.1", &host),
+            line("*.example", &ca),
+            line("*", &gone),
+        );
+        let l = list(&text);
+        assert_eq!(l.len(), 6);
+        assert_eq!(l[0].line, 3);
+        assert_eq!(l[0].kind, LineKind::HostKey);
+        assert_eq!(l[0].hosts.as_deref(), Some("a.example,10.0.0.1"));
+        assert_eq!(l[0].key_type, "ssh-ed25519");
+        assert_eq!(l[0].key, host);
+        assert_eq!(l[0].comment, "me@pc");
+        assert!(l[0].matches_host("A.example", 22));
+        assert!(!l[0].matches_host("a.example", 2200));
+        assert_eq!(l[1].kind, LineKind::CertAuthority);
+        assert!(l[1].matches_host("web.example", 22));
+        assert_eq!(l[2].kind, LineKind::Revoked);
+        assert_eq!(l[2].key_type, "ssh-rsa");
+        // A hashed name shows no host; only the right name and port match.
+        assert_eq!(l[3].hosts, None);
+        assert!(l[3].matches_host("secret.example", 2222));
+        assert!(!l[3].matches_host("secret.example", 22));
+        assert!(!l[3].matches_host("other.example", 2222));
+        // Lines a lookup skips are listed so they can be removed.
+        assert_eq!(l[4].kind, LineKind::Unreadable);
+        assert_eq!(l[4].hosts.as_deref(), Some("host"));
+        assert_eq!(l[5].kind, LineKind::Unreadable);
+        assert!(l[5].key.is_empty());
+        // Still found by its host, to be removed.
+        assert!(l[5].matches_host("bad", 22));
+        // Each keeps its text for a checked removal.
+        for e in &l {
+            assert_eq!(text.lines().nth(e.line - 1), Some(e.text.as_str()));
+        }
+    }
+
+    #[test]
+    fn removing_lines_checks_they_are_unchanged() {
+        let dir = std::env::temp_dir().join(format!("ferossh-kh-rm-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("known_hosts");
+        let a = blob("ssh-ed25519", b"a");
+        let b = blob("ssh-ed25519", b"b");
+        let text = format!(
+            "# keep me\r\n{}\r\n{}\n@revoked {}\n",
+            line("a", &a),
+            line("b", &b),
+            line("*", &a)
+        );
+        fs::write(&path, &text).unwrap();
+        let l = list(&read(&path).unwrap());
+        // A line that is not what was listed: nothing is written.
+        let stale = vec![
+            (l[0].line, l[0].text.clone()),
+            (l[1].line, "b x y".to_owned()),
+        ];
+        assert!(remove_lines(&path, &stale).is_err());
+        assert_eq!(fs::read_to_string(&path).unwrap(), text);
+        let past_end = vec![(99, l[0].text.clone())];
+        assert!(remove_lines(&path, &past_end).is_err());
+        assert_eq!(remove_lines(&path, &[]).unwrap(), 0);
+        // The right lines go; the rest stay, comments included.
+        let both = vec![
+            (l[0].line, l[0].text.clone()),
+            (l[2].line, l[2].text.clone()),
+        ];
+        assert_eq!(remove_lines(&path, &both).unwrap(), 2);
+        let after = fs::read_to_string(&path).unwrap();
+        assert_eq!(after, format!("# keep me\n{}\n", line("b", &b)));
+        let kh = KnownHosts::parse(&after);
+        assert_eq!(kh.check("a", 22, &a), Status::Unknown);
+        assert_eq!(kh.check("b", 22, &b), Status::Trusted);
+        // No temporary file is left behind.
+        assert_eq!(fs::read_dir(&dir).unwrap().count(), 1);
+        fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
