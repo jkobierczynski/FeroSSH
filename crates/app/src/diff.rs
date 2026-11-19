@@ -36,7 +36,7 @@ pub fn command() -> Vec<u8> {
         "t=$(git rev-parse --show-toplevel 2>/dev/null) || { echo @ferossh-diff norepo; exit 0; }"
             .to_owned(),
         "cd -- \"$t\" || exit 2".to_owned(),
-        "printf \"@ferossh-diff top %s\\n\" \"$t\"; e=0".to_owned(),
+        "printf \"@ferossh-diff top %s\\n\" \"$t\"; e=0; i=0".to_owned(),
         // The commit is looked up once: one an agent makes meanwhile
         // neither renames the heading nor moves what is compared.
         format!(
@@ -48,15 +48,24 @@ pub fn command() -> Vec<u8> {
         ),
         // A name git had to quote (a line break or a quote in it) is left
         // out: it could not be read back here.
-        // The list is read first so that a failing ls-files counts.
+        // The list is read first so that a failing ls-files counts; one
+        // name past the limit says some are left out. A symbolic link
+        // shows as its target's path, as git shows one, whatever it
+        // points at (git diff --no-index would follow a folder's).
         format!(
             "u=$({git} ls-files --others --exclude-standard) || {{ u=; e=1; }}; \
-             [ -z \"$u\" ] || printf \"%s\\n\" \"$u\" | head -n {UNTRACKED} | \
-             while IFS= read -r f; do case $f in \\\"*) continue;; esac; \
-             [ -f \"$f\" ] || continue; \
-             if [ \"$(wc -c < \"$f\")\" -gt {BIG} ]; then printf \"@ferossh-diff big %s\\n\" \"$f\"; \
+             [ -z \"$u\" ] || printf \"%s\\n\" \"$u\" | head -n {more} | \
+             while IFS= read -r f; do i=$((i+1)); \
+             [ $i -le {UNTRACKED} ] || {{ echo @ferossh-diff more; break; }}; \
+             case $f in \\\"*) continue;; esac; \
+             [ -f \"$f\" ] || [ -L \"$f\" ] || continue; \
+             if [ -L \"$f\" ]; then l=$(readlink -- \"$f\") || echo @ferossh-diff failed; \
+             printf \"diff --git a/%s b/%s\\nnew file mode 120000\\n--- /dev/null\\n+++ b/%s\\n@@ -0,0 +1 @@\\n+%s\\n\" \
+             \"$f\" \"$f\" \"$f\" \"$l\"; \
+             elif [ \"$(wc -c < \"$f\")\" -gt {BIG} ]; then printf \"@ferossh-diff big %s\\n\" \"$f\"; \
              else {git} diff {opts} --no-index -- /dev/null \"$f\"; \
-             [ $? -le 1 ] || echo @ferossh-diff failed; fi; done"
+             [ $? -le 1 ] || echo @ferossh-diff failed; fi; done",
+            more = UNTRACKED + 1
         ),
         // git diff --no-index says 1 for "they differ"; more is an error.
         "[ $e = 0 ] || echo @ferossh-diff failed".to_owned(),
@@ -100,6 +109,8 @@ pub struct Diff {
     pub files: Vec<File>,
     /// A git command failed: what shows may be missing files.
     pub failed: bool,
+    /// There were more than [`UNTRACKED`] new files: the rest are left out.
+    pub more: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -256,6 +267,7 @@ pub fn parse(out: &[u8]) -> Outcome {
                 "top" => diff.top = clean(arg),
                 "head" => diff.head = Some(clean(arg)),
                 "failed" => diff.failed = true,
+                "more" => diff.more = true,
                 "big" => {
                     flush(&mut diff, &mut file);
                     let mut f = File::new(String::new(), clean(arg));
@@ -600,11 +612,14 @@ pub fn render(diff: &Diff, cols: usize, look: &Look, notes: &[String]) -> Render
     let failed = diff
         .failed
         .then(|| "git reported an error, so files may be missing here.".to_owned());
-    for note in notes.iter().chain(&failed) {
+    let more = diff
+        .more
+        .then(|| format!("Only the first {UNTRACKED} new files are listed here."));
+    for note in notes.iter().chain(&failed).chain(&more) {
         out.push(format!("\x1b[0;33m{}{RESET}", fit(note, cols).0));
     }
     out.push(String::new());
-    if diff.files.is_empty() && notes.is_empty() && !diff.failed {
+    if diff.files.is_empty() && notes.is_empty() && !diff.failed && !diff.more {
         out.push("No changes: the files are as in the last commit.".to_owned());
     }
     // Every push below checks the row limit first, so a diff with many
@@ -1143,6 +1158,54 @@ diff --git a/x b/x\n--- a/x\n+++ b/x\n@@ -1 +1 @@\n-\x1b[2Jold\n+\u{202e}new\u{9
         };
         assert!(d.failed);
         assert!(!plain(&render(&d, 80, &LOOK, &[]).text).contains("No changes"));
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn new_links_show_and_too_many_new_files_say_so() {
+        let ok = |dir: &std::path::Path, args: &[&str]| {
+            std::process::Command::new("git")
+                .args(["-c", "user.name=t", "-c", "user.email=t@t"])
+                .args(["-c", "commit.gpgsign=false"])
+                .args(args)
+                .current_dir(dir)
+                .output()
+                .is_ok_and(|o| o.status.success())
+        };
+        let tmp = std::env::temp_dir().join(format!("ferossh-diff-more-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(tmp.join("d")).unwrap();
+        if !ok(&tmp, &["init", "-q"]) {
+            return;
+        }
+        assert!(ok(&tmp, &["commit", "-q", "--allow-empty", "-m", "first"]));
+        // A link to a folder and one to nothing are both new files.
+        std::os::unix::fs::symlink("d", tmp.join("to-dir")).unwrap();
+        std::os::unix::fs::symlink("gone", tmp.join("to-nothing")).unwrap();
+        let Outcome::Changes(d) = run(&tmp) else {
+            panic!()
+        };
+        let names: Vec<_> = d.files.iter().map(|f| (f.name(), f.kind)).collect();
+        assert_eq!(
+            names,
+            [("to-dir", Kind::Added), ("to-nothing", Kind::Added)]
+        );
+        assert!(!d.more && !d.failed);
+        for i in 0..UNTRACKED - 2 {
+            std::fs::write(tmp.join(format!("f{i}")), "x\n").unwrap();
+        }
+        let Outcome::Changes(d) = run(&tmp) else {
+            panic!()
+        };
+        assert_eq!((d.files.len(), d.more), (UNTRACKED, false));
+        std::fs::write(tmp.join("one-more"), "x\n").unwrap();
+        let Outcome::Changes(d) = run(&tmp) else {
+            panic!()
+        };
+        assert_eq!((d.files.len(), d.more), (UNTRACKED, true));
+        let text = plain(&render(&d, 80, &LOOK, &[]).text);
+        assert!(text.contains("Only the first 500 new files"));
         let _ = std::fs::remove_dir_all(&tmp);
     }
 

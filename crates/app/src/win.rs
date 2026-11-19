@@ -793,9 +793,19 @@ struct DiffTab {
     /// The pane it was opened from (for a tmux pane, its gateway): after
     /// that pane reconnects, r runs git over its new connection.
     from: PaneId,
-    outcome: Option<crate::diff::Outcome>,
+    /// The last finished run, as shown; r leaves it until the next ends.
+    shown: Option<Shown>,
     /// The line each file's heading is on, as last laid out.
     files: Vec<usize>,
+}
+
+/// A finished git run of a diff tab, with what its notes need.
+struct Shown {
+    outcome: crate::diff::Outcome,
+    partial: bool,
+    interrupted: Option<String>,
+    err: Vec<u8>,
+    status: Option<u32>,
 }
 
 /// A recording playing in a replay tab.
@@ -9528,7 +9538,7 @@ impl Window {
                 partial: false,
                 interrupted: None,
                 from: source,
-                outcome: None,
+                shown: None,
                 files: Vec::new(),
             }));
         }
@@ -9572,11 +9582,16 @@ impl Window {
             self.show(
                 id,
                 &format!(
-                    "\r\n\x1b[0;31mThe connection to {label} is closed. Reconnect the pane this \
-                     was opened from, then press r here; or open it again from a pane logged in \
-                     there.\x1b[0m"
+                    "\x1b[?7h\r\n\x1b[0;31mThe connection to {label} is closed. Reconnect the \
+                     pane this was opened from, then press r here; or open it again from a pane \
+                     logged in there.\x1b[0m"
                 ),
             );
+            // Below a long diff: brought into view.
+            if let Some(p) = self.panes.get_mut(&id) {
+                p.term.scroll_to_bottom();
+                p.grid.mark_all_dirty();
+            }
             self.refresh(id);
             return;
         };
@@ -9597,7 +9612,7 @@ impl Window {
         d.status = None;
         d.partial = false;
         d.interrupted = None;
-        let first = d.outcome.is_none();
+        let first = d.shown.is_none();
         let dir = crate::diff::clean(&String::from_utf8_lossy(&d.dir));
         let label = crate::diff::clean(&d.label);
         self.diffs.insert(channel, id);
@@ -9681,7 +9696,13 @@ impl Window {
         self.diffs.remove(&channel);
         d.channel = None;
         let out = std::mem::take(&mut d.out);
-        d.outcome = Some(crate::diff::parse(&out));
+        d.shown = Some(Shown {
+            outcome: crate::diff::parse(&out),
+            partial: d.partial,
+            interrupted: d.interrupted.take(),
+            err: std::mem::take(&mut d.err),
+            status: d.status,
+        });
         self.render_diff(id);
     }
 
@@ -9701,32 +9722,35 @@ impl Window {
         };
         let say = |text: &str| format!("{}\x1b[0m", crate::diff::clean(text));
         let dir = crate::diff::clean(&String::from_utf8_lossy(&d.dir));
-        let text = match &d.outcome {
-            None => return,
-            Some(crate::diff::Outcome::NoGit) => say(&format!("{} has no git command.", d.label)),
-            Some(crate::diff::Outcome::NoDir) => say(&format!(
+        let Some(shown) = &d.shown else {
+            return;
+        };
+        let mut wrap = true;
+        let text = match &shown.outcome {
+            crate::diff::Outcome::NoGit => say(&format!("{} has no git command.", d.label)),
+            crate::diff::Outcome::NoDir => say(&format!(
                 "The folder {dir} is not on {} any more, or cannot be entered.",
                 d.label
             )),
-            Some(crate::diff::Outcome::NoRepo) => say(&format!(
+            crate::diff::Outcome::NoRepo => say(&format!(
                 "{dir} is not in a git repository, so there is nothing to compare with."
             )),
-            Some(crate::diff::Outcome::Changes(diff))
-                if diff.top.is_empty() && d.interrupted.is_some() =>
+            crate::diff::Outcome::Changes(diff)
+                if diff.top.is_empty() && shown.interrupted.is_some() =>
             {
                 say(&format!(
                     "The connection dropped before git answered ({}). Press r to try again.",
-                    d.interrupted.as_deref().unwrap_or("")
+                    shown.interrupted.as_deref().unwrap_or("")
                 ))
             }
-            Some(crate::diff::Outcome::Changes(diff)) if diff.top.is_empty() => {
-                let err = String::from_utf8_lossy(&d.err);
+            crate::diff::Outcome::Changes(diff) if diff.top.is_empty() => {
+                let err = String::from_utf8_lossy(&shown.err);
                 let why = err
                     .lines()
                     .rev()
                     .find(|l| !l.trim().is_empty())
                     .unwrap_or("");
-                let status = d
+                let status = shown
                     .status
                     .map(|c| format!(" (exit status {c})"))
                     .unwrap_or_default();
@@ -9735,12 +9759,12 @@ impl Window {
                      git, as Linux and macOS servers have."
                 ))
             }
-            Some(crate::diff::Outcome::Changes(diff)) => {
+            crate::diff::Outcome::Changes(diff) => {
                 let mut notes = Vec::new();
-                if d.partial {
+                if shown.partial {
                     notes.push("Only part of the changes: there was too much to show.".to_owned());
                 }
-                if let Some(why) = &d.interrupted {
+                if let Some(why) = &shown.interrupted {
                     notes.push(format!(
                         "git stopped before it finished ({}), so files may be missing here.",
                         crate::diff::clean(why)
@@ -9748,11 +9772,22 @@ impl Window {
                 }
                 let r = crate::diff::render(diff, cols, &look, &notes);
                 d.files = r.files;
+                // Laid out at least 20 columns wide: a narrower pane cuts
+                // the rows instead of wrapping them, so each stays one
+                // line and n/p find the headings.
+                wrap = false;
                 r.text
             }
         };
-        // Plain messages wrap; the diff fits its width already.
-        p.term.feed(b"\x1b[?25l\x1b[?7h\x1b[0m\x1b[2J\x1b[3J\x1b[H");
+        if wrap {
+            d.files.clear();
+        }
+        // Plain messages wrap.
+        p.term.feed(if wrap {
+            b"\x1b[?25l\x1b[?7h\x1b[0m\x1b[2J\x1b[3J\x1b[H"
+        } else {
+            b"\x1b[?25l\x1b[?7l\x1b[0m\x1b[2J\x1b[3J\x1b[H"
+        });
         p.term.clear_scrollback();
         p.term.feed(text.as_bytes());
         p.term.scroll_to_top();
