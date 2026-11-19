@@ -61,8 +61,8 @@ const DARK_TEXT: Rgb = Rgb::new(0xE8, 0xE8, 0xE8);
 const DARK_ACCENT: Rgb = Rgb::new(0x4C, 0xC2, 0xFF);
 const LIGHT_ACCENT: Rgb = Rgb::new(0x00, 0x5F, 0xB8);
 
-/// The fixed neutral looks: pure greys (no tint) from light to dark, as
-/// background, text and accent. `None` for the looks that follow
+/// The fixed looks: pure greys (no tint) from light to dark, then the
+/// tinted ones, as background, text and accent. `None` for the looks that follow
 /// something (the terminal theme, Windows, Windows' light look).
 fn neutral(mode: WindowColours) -> Option<(Rgb, Rgb, Rgb)> {
     let grey = |v: u8| Rgb::new(v, v, v);
@@ -75,6 +75,57 @@ fn neutral(mode: WindowColours) -> Option<(Rgb, Rgb, Rgb)> {
         WindowColours::Graphite => (grey(0x38), grey(0xEA), DARK_ACCENT),
         WindowColours::Dark => (DARK_BACKGROUND, DARK_TEXT, DARK_ACCENT),
         WindowColours::Black => (grey(0x0C), grey(0xE0), DARK_ACCENT),
+        _ => return tinted(mode),
+    })
+}
+
+/// The tinted neutral looks: soft warm or cool colours that are not grey,
+/// light to dark, as background, text and accent. Each text colour is
+/// the background's own hue, nearly black or white.
+fn tinted(mode: WindowColours) -> Option<(Rgb, Rgb, Rgb)> {
+    let c = Rgb::new;
+    Some(match mode {
+        WindowColours::Sand => (
+            c(0xEC, 0xE5, 0xD8),
+            c(0x2A, 0x24, 0x1C),
+            c(0x8C, 0x5A, 0x1E),
+        ),
+        WindowColours::Sage => (
+            c(0xE1, 0xE8, 0xDD),
+            c(0x1E, 0x26, 0x1F),
+            c(0x3D, 0x6B, 0x47),
+        ),
+        WindowColours::Mist => (
+            c(0xE0, 0xE7, 0xEF),
+            c(0x1B, 0x24, 0x30),
+            c(0x2D, 0x5F, 0x92),
+        ),
+        WindowColours::Taupe => (
+            c(0xCB, 0xC1, 0xB5),
+            c(0x1C, 0x18, 0x14),
+            c(0x5E, 0x3F, 0x24),
+        ),
+        WindowColours::Slate => (
+            c(0x2A, 0x32, 0x3E),
+            c(0xE2, 0xE8, 0xF0),
+            c(0x8D, 0xB6, 0xE0),
+        ),
+        WindowColours::Moss => (
+            c(0x2A, 0x31, 0x28),
+            c(0xE0, 0xE7, 0xDA),
+            c(0xA8, 0xC9, 0x8E),
+        ),
+        WindowColours::Espresso => (
+            c(0x2F, 0x29, 0x25),
+            c(0xEE, 0xE5, 0xDB),
+            c(0xE0, 0xAA, 0x6E),
+        ),
+        WindowColours::Heather => (
+            c(0x2E, 0x2A, 0x35),
+            c(0xE8, 0xE2, 0xF0),
+            c(0xB9, 0xA3, 0xDC),
+        ),
+        _ => return None,
     })
 }
 
@@ -92,6 +143,32 @@ pub fn resolve(mode: WindowColours, theme: &Theme, system: &System) -> UiColours
         WindowColours::System if system.dark => resolve(WindowColours::Dark, theme, system),
         _ => light(system),
     }
+}
+
+/// A custom theme's own window colours (Settings > Custom themes).
+pub fn custom(background: Rgb, text: Rgb, accent: Rgb) -> UiColours {
+    from_colours(background, text, accent)
+}
+
+/// Whether text reads at 4.5:1 or better on every part painted with `c`:
+/// the window, edit boxes, the menu bar, a highlighted item, the tabs;
+/// secondary text and errors too.
+pub fn all_readable(c: &UiColours) -> bool {
+    [
+        (c.text, c.window),
+        (c.text, c.control),
+        (c.text, c.bar),
+        (c.text, c.hot),
+        (c.dim, c.window),
+        (c.dim, c.bar),
+        (c.error, c.window),
+        (c.strip.text, c.strip.strip),
+        (c.strip.dim, c.strip.strip),
+        (c.strip.text, c.strip.active),
+    ]
+    .iter()
+    .all(|&(fg, bg)| contrast(fg, bg) >= DIM_CONTRAST)
+        && c.hot != c.bar
 }
 
 /// Our own colours from a background, a text colour and an accent.
@@ -247,6 +324,9 @@ mod tests {
             let Some((background, ..)) = neutral(mode) else {
                 continue;
             };
+            if tinted(mode).is_some() {
+                continue;
+            }
             let name = mode.name();
             let c = resolve(mode, &nord, &system(false));
             assert!(c.custom, "{name}");
@@ -287,6 +367,51 @@ mod tests {
             let other = Theme::builtin().last().cloned().unwrap_or_default();
             assert_eq!(resolve(mode, &other, &system(true)), c, "{name}");
         }
+    }
+
+    #[test]
+    fn tinted_looks_are_not_grey_readable_and_ordered() {
+        let nord = Theme::default();
+        let mut seen_dark = false;
+        let mut count = 0;
+        for mode in WindowColours::ALL {
+            let Some((background, text, accent)) = tinted(mode) else {
+                continue;
+            };
+            count += 1;
+            let name = mode.name();
+            let c = resolve(mode, &nord, &system(false));
+            assert!(c.custom, "{name}");
+            assert_eq!(c.window, background, "{name}");
+            assert_eq!(c.text, text, "{name}");
+            // Neutral but not grey: a visible tint, kept soft.
+            let spread = |x: Rgb| x.r.max(x.g).max(x.b) - x.r.min(x.g).min(x.b);
+            assert!((6..=24).contains(&spread(background)), "{name} tint");
+            for (part, fg, bg) in [
+                ("text", c.text, c.window),
+                ("edit", c.text, c.control),
+                ("bar", c.text, c.bar),
+                ("hot", c.text, c.hot),
+                ("dim", c.dim, c.window),
+                ("dim on bar", c.dim, c.bar),
+                ("error", c.error, c.window),
+                ("tab", c.strip.text, c.strip.strip),
+                ("dim tab", c.strip.dim, c.strip.strip),
+            ] {
+                assert!(contrast(fg, bg) >= DIM_CONTRAST, "{name} {part}");
+            }
+            // The accent marks the selected tab: a graphic, 3:1.
+            assert!(contrast(accent, background) >= 3.0, "{name} accent");
+            assert!(c.hot != c.bar, "{name}: a hot item shows");
+            assert!(all_readable(&c), "{name}");
+            assert_eq!(c.dark, luminance(background) < 0.18, "{name} dark");
+            // The menu lists the light ones first.
+            assert!(c.dark || !seen_dark, "{name} out of order");
+            seen_dark |= c.dark;
+            let other = Theme::builtin().last().cloned().unwrap_or_default();
+            assert_eq!(resolve(mode, &other, &system(true)), c, "{name}");
+        }
+        assert_eq!(count, 8);
     }
 
     #[test]

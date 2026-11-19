@@ -622,7 +622,40 @@ The font menu lists eighteen monospace fonts. Cascadia Mono, Cascadia Code, Cons
 
 There are forty-two themes, in three columns of Settings > Theme. The dark ones are Nord (the default), Ayu Mirage, Carbonfox, Catppuccin Frappé, Macchiato and Mocha, Dracula, Everforest, GitHub Dark, Gruvbox Dark, Gruvbox Material, Kanagawa Dragon and Wave, Monokai, Night Owl, Nightfox, One Dark, Rosé Pine and Rosé Pine Moon, Snazzy, Solarized Dark, Tokyo Night and Tokyo Night Storm, Tomorrow Night and Tomorrow Night Eighties. The light ones are Ayu Light, Catppuccin Latte, Dawnfox, Everforest Light, GitHub Light, Gruvbox Light, Kanagawa Lotus, Rosé Pine Dawn, Solarized Light, Tokyo Night Day and Tomorrow. The classics are Campbell, One Half Dark, One Half Light, Tango Dark and Tango Light from Windows Terminal, and PuTTY's own colours. Every theme's text reads at 4.5:1 contrast or better. Two more are warnings: **Production** (red) and **Staging** (amber). Rules pick the theme by host pattern or ssh_config `Tag`, so production servers always look like production; hosts tagged `production`, `staging` or `development` get Production, Staging or Nord without any rule. `ferossh.exe --theme Production prod-db` opens a session in a theme, handy for desktop shortcuts. See `ThemeRule` and `Profile` in [Settings](settings.md).
 
-The window around the panes (the menu bar and its menus, the title bar, the tab strip, the tools rail and the tools pane: Connection manager, Session manager, the connection form, File transfer, Port forwards, Scripts) has Windows' light look unless you pick something else in Settings > Window colours: the focused pane's colours (dark for a dark theme, red for Production), Windows' own light or dark mode, or one of seven neutral greys from Soft grey to Black. Dark menus, buttons and scroll bars need Windows 10 version 1903 or later; the title bar takes the theme's colour on Windows 11.
+The window around the panes (the menu bar and its menus, the title bar, the tab strip, the tools rail and the tools pane: Connection manager, Session manager, the connection form, File transfer, Port forwards, Scripts) has Windows' light look unless you pick something else in Settings > Window colours: the focused pane's colours (dark for a dark theme, red for Production), Windows' own light or dark mode, one of seven neutral greys from Soft grey to Black, or one of eight tinted neutrals that are not grey: Sand, Sage, Mist and Taupe (light), Slate, Moss, Espresso and Heather (dark). The menus and their submenus take the menu bar's colours. Dark buttons and scroll bars need Windows 10 version 1903 or later; the title bar takes the theme's colour on Windows 11.
+
+Resting the mouse on a theme, a custom theme or a window colour in these menus shows it right away, in the focused pane and the window around it. Pick it to keep it; close the menu without a choice (Esc, or a click elsewhere) and the old look comes back. Fonts are not shown this way, because a new font size would resize the remote terminal; a font, and a custom theme's font, change when you pick them.
+
+### Custom themes
+
+Settings > Custom themes lists your own themes. **Save this look as a theme...** writes the focused pane's colours, font and size to a file in the `themes` folder next to the settings; the file name is the theme's name (without `#` or `"`). The window colours go in too when they are one of the fixed looks (a grey or a tinted one); with Light or Follow Windows none are saved, and with Follow the terminal theme only a custom theme's own window colours are. Picking a custom theme gives the focused pane its colours, its font if it names one that is installed, and its window colours if it has some. Host rules, `Profile` themes and `--theme` can name a custom theme like a built-in one; they give the pane its colours and font, and its own window colours (`WindowBackground` and the rest) show while Window colours follow the terminal theme, but a `Window sand` line only takes effect when you pick the theme from the menu. Saving a pane that has the Production or Staging theme keeps that theme on the pane, so its warnings stay.
+
+Each theme is a small text file you can change in any editor; the menu reads the folder again each time it opens. Every line is optional except that it needs a name (the file name serves). `Base` names a built-in theme:
+
+```
+Name       Sandstorm
+Base       Nord             # start from a built-in theme
+Font       Cascadia Mono
+FontSize   11
+Foreground #D8DEE9
+Background #2E3440
+Cursor     #88C0D0
+CursorText #2E3440
+Color0     #3B4252          # Color0 to Color15: the ANSI colours
+Window     sand             # a grey or tinted look: softgrey ... black, sand ... heather
+```
+
+Instead of `Window`, a theme can give its own window colours:
+
+```
+WindowBackground #ECE5D8
+WindowText       #2A241C
+WindowAccent     #8C5A1E          # optional; the text colour when left out
+```
+
+`Window` takes only the fixed looks (the seven greys and eight tints), not `light`, `windows` or `theme`. When a file has both, `WindowBackground` and `WindowText` win over `Window`.
+
+A file that cannot be used at all (a colour that is not `#RRGGBB`, a name that is taken) shows greyed in the menu with the reason. A smaller mistake (an unknown line, a font size outside 6 to 72) leaves the theme selectable but marked "(see file)", with the mistaken line ignored. Window colours whose text reads below 4.5:1 on the window, the menu bar or the tabs are left out, and an accent below 3:1 is replaced by the text colour; both also mark the theme "(see file)".
 
 ## Server status bar
 

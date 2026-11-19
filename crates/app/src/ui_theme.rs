@@ -25,20 +25,20 @@ use std::cell::RefCell;
 use std::sync::OnceLock;
 
 use ferossh_render::Rgb;
-use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, RECT, WPARAM};
+use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows::Win32::Graphics::Dwm::{
     DWMWA_CAPTION_COLOR, DWMWA_TEXT_COLOR, DWMWA_USE_IMMERSIVE_DARK_MODE, DWMWINDOWATTRIBUTE,
     DwmSetWindowAttribute,
 };
 use windows::Win32::Graphics::Gdi::{
     BeginPaint, COLOR_BTNFACE, COLOR_GRAYTEXT, COLOR_MENU, COLOR_MENUBAR, COLOR_MENUTEXT,
-    COLOR_WINDOW, COLOR_WINDOWTEXT, CreateFontIndirectW, CreateSolidBrush, DT_CENTER,
-    DT_HIDEPREFIX, DT_LEFT, DT_SINGLELINE, DT_VCENTER, DeleteObject, DrawFocusRect, DrawTextW,
-    Ellipse, EndPaint, FillRect, GetDC, GetStockObject, GetSysColor, GetSysColorBrush,
-    GetTextExtentPoint32W, GetWindowDC, HBRUSH, HDC, HFONT, HGDIOBJ, InvalidateRect,
-    MapWindowPoints, NULL_PEN, OffsetRect, PAINTSTRUCT, RDW_ALLCHILDREN, RDW_ERASE, RDW_FRAME,
-    RDW_INVALIDATE, RedrawWindow, ReleaseDC, SYS_COLOR_INDEX, SelectObject, SetBkColor, SetBkMode,
-    SetTextColor, TRANSPARENT,
+    COLOR_WINDOW, COLOR_WINDOWTEXT, CreateFontIndirectW, CreatePen, CreateSolidBrush, DT_CENTER,
+    DT_HIDEPREFIX, DT_LEFT, DT_NOPREFIX, DT_RIGHT, DT_SINGLELINE, DT_VCENTER, DeleteObject,
+    DrawFocusRect, DrawTextW, Ellipse, EndPaint, FillRect, GetDC, GetStockObject, GetSysColor,
+    GetSysColorBrush, GetTextExtentPoint32W, GetWindowDC, HBRUSH, HDC, HFONT, HGDIOBJ,
+    InvalidateRect, MapWindowPoints, NULL_PEN, OffsetRect, PAINTSTRUCT, PS_SOLID, Polyline,
+    RDW_ALLCHILDREN, RDW_ERASE, RDW_FRAME, RDW_INVALIDATE, RedrawWindow, ReleaseDC,
+    SYS_COLOR_INDEX, SelectObject, SetBkColor, SetBkMode, SetTextColor, TRANSPARENT,
 };
 use windows::Win32::System::LibraryLoader::{
     GetProcAddress, LOAD_LIBRARY_SEARCH_SYSTEM32, LoadLibraryExW,
@@ -46,6 +46,7 @@ use windows::Win32::System::LibraryLoader::{
 use windows::Win32::System::Registry::{
     HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE, RRF_RT_REG_DWORD, RRF_RT_REG_SZ, RegGetValueW,
 };
+use windows::Win32::System::Threading::GetCurrentThreadId;
 use windows::Win32::UI::Controls::{
     CDDS_ITEMPREPAINT, CDDS_PREPAINT, CDRF_DODEFAULT, CDRF_NOTIFYITEMDRAW, DRAWITEMSTRUCT,
     LVM_GETHEADER, LVM_SETBKCOLOR, LVM_SETTEXTBKCOLOR, LVM_SETTEXTCOLOR, MEASUREITEMSTRUCT,
@@ -58,14 +59,15 @@ use windows::Win32::UI::HiDpi::{GetDpiForWindow, SystemParametersInfoForDpi};
 use windows::Win32::UI::Input::KeyboardAndMouse::GetFocus;
 use windows::Win32::UI::Shell::{DefSubclassProc, SetWindowSubclass};
 use windows::Win32::UI::WindowsAndMessaging::{
-    DefWindowProcW, DrawMenuBar, EnumChildWindows, GWL_STYLE, GetClassNameW, GetClientRect,
-    GetMenuBarInfo, GetMenuItemCount, GetMenuItemInfoW, GetWindowLongPtrW, GetWindowRect, HMENU,
-    MENU_ITEM_TYPE, MENUBARINFO, MENUINFO, MENUITEMINFOW, MFT_MENUBARBREAK, MFT_MENUBREAK,
-    MFT_OWNERDRAW, MFT_SEPARATOR, MFT_STRING, MIIM_DATA, MIIM_FTYPE, MIIM_STRING, MIM_BACKGROUND,
-    NONCLIENTMETRICSW, OBJID_MENU, SPI_GETNONCLIENTMETRICS, SendMessageW, SetMenuInfo,
-    SetMenuItemInfoW, WM_CTLCOLORBTN, WM_CTLCOLOREDIT, WM_CTLCOLORLISTBOX, WM_CTLCOLORSTATIC,
-    WM_DRAWITEM, WM_ERASEBKGND, WM_GETFONT, WM_MEASUREITEM, WM_NCACTIVATE, WM_NCPAINT, WM_NOTIFY,
-    WM_PAINT,
+    DefWindowProcW, DrawMenuBar, EnumChildWindows, EnumThreadWindows, GWL_STYLE, GetClassNameW,
+    GetClientRect, GetMenuBarInfo, GetMenuItemCount, GetMenuItemInfoW, GetMenuState,
+    GetWindowLongPtrW, GetWindowRect, HMENU, IsMenu, MENU_ITEM_TYPE, MENUBARINFO, MENUINFO,
+    MENUITEMINFOW, MF_BYPOSITION, MF_DISABLED, MF_GRAYED, MF_HILITE, MFT_MENUBARBREAK,
+    MFT_MENUBREAK, MFT_OWNERDRAW, MFT_RADIOCHECK, MFT_SEPARATOR, MFT_STRING, MIIM_DATA, MIIM_FTYPE,
+    MIIM_STRING, MIM_BACKGROUND, NONCLIENTMETRICSW, OBJID_MENU, SPI_GETNONCLIENTMETRICS,
+    SendMessageW, SetMenuInfo, SetMenuItemInfoW, WM_CTLCOLORBTN, WM_CTLCOLOREDIT,
+    WM_CTLCOLORLISTBOX, WM_CTLCOLORSTATIC, WM_DRAWITEM, WM_ERASEBKGND, WM_GETFONT, WM_MEASUREITEM,
+    WM_MENUCHAR, WM_NCACTIVATE, WM_NCPAINT, WM_NOTIFY, WM_PAINT,
 };
 use windows::core::{BOOL, PCSTR, PCWSTR, PWSTR, w};
 
@@ -285,7 +287,7 @@ pub fn apply(main: HWND, c: UiColours) {
         unsafe { f() };
     }
     allow_dark(main, c.custom && c.dark);
-    sync_columns();
+    repaint_popups();
     title_bar(main, &c);
     restyle(main);
     // SAFETY: our own window.
@@ -710,11 +712,14 @@ fn paint_tabs(hwnd: HWND) {
 }
 
 /// The menu bar and the line under it, and the owner-drawn items of
-/// [`own_columns`] menus, in our colours; `None` leaves the
+/// menus given to [`own_popup`], in our colours; `None` leaves the
 /// message to the window procedure. The main window calls it first.
 pub fn frame_message(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> Option<LRESULT> {
     if matches!(msg, WM_MEASUREITEM | WM_DRAWITEM) {
         return own_menu_message(hwnd, msg, lparam);
+    }
+    if msg == WM_MENUCHAR {
+        return menu_char(wparam, lparam);
     }
     if !matches!(
         msg,
@@ -895,21 +900,15 @@ fn cover_bar_line(hwnd: HWND) {
     }
 }
 
-// Multi-column popup menus.
+// Popup menus.
 //
-// Windows draws a popup menu with columns (`MF_MENUBARBREAK`, the
-// Settings > Theme menu) in its classic light style even when menus are
-// dark: its dark menus skip such menus. While menus are dark the items of
-// the menus given to [`own_columns`] are owner-drawn here instead, in the
-// colours Windows uses for its dark menus, and the menu's background
-// (between the columns, round the items) is filled with the same grey.
-
-/// Windows' dark popup menu colours (as measured on Windows 11).
-const MENU_BACK: Rgb = Rgb::new(0x2B, 0x2B, 0x2B);
-const MENU_HOT: Rgb = Rgb::new(0x35, 0x35, 0x35);
-const MENU_TEXT: Rgb = Rgb::new(0xFF, 0xFF, 0xFF);
-const MENU_GRAY: Rgb = Rgb::new(0x6D, 0x6D, 0x6D);
-const MENU_LINE: Rgb = Rgb::new(0x3C, 0x3C, 0x3C);
+// Windows draws popup menus in its own light or dark grey, whatever the
+// window colours, and its dark menus skip menus with columns (the
+// Settings > Theme menu). While our colours are on, each menu the main
+// window opens (the menu bar's menus and their submenus) is owner-drawn
+// here instead, in the menu bar's colours, with its background (round the
+// items, between the columns) filled in the same colour. Turning our
+// colours off gives the items back to Windows the next time they open.
 
 /// `MSAAMENUINFO`: an owner-drawn item's data starts with this, so that
 /// screen readers still get the item's name.
@@ -923,187 +922,297 @@ struct MsaaMenuInfo {
 /// `MSAA_MENU_SIG`.
 const MSAA_MENU_SIG: u32 = 0xAA0D_F00D;
 
-/// One item of an owned menu, as it was built.
+/// One item of an owned menu, as it was when the menu opened.
 struct OwnItem {
     /// Ends with a nul (not counted in [`MsaaMenuInfo::chars`]).
     text: Vec<u16>,
-    /// The owner-drawn item's data; points into `text`, which never
-    /// changes once built.
+    /// The owner-drawn item's data; points into `text`.
     msaa: Box<MsaaMenuInfo>,
     separator: bool,
     /// Starts a new column (with a bar in Windows' drawing).
     breaks: bool,
     /// The column it is in, from 0.
     column: u32,
+    /// Checked with a bullet rather than a tick.
+    radio: bool,
+}
+
+impl OwnItem {
+    fn new(text: Vec<u16>) -> Self {
+        let mut item = OwnItem {
+            text,
+            msaa: Box::new(MsaaMenuInfo {
+                signature: MSAA_MENU_SIG,
+                chars: 0,
+                text: std::ptr::null(),
+            }),
+            separator: false,
+            breaks: false,
+            column: 0,
+            radio: false,
+        };
+        item.set_text(None);
+        item
+    }
+
+    /// Takes `text` (without a nul), or points the data at the text kept.
+    fn set_text(&mut self, text: Option<&[u16]>) {
+        if let Some(t) = text {
+            self.text = t.to_vec();
+        }
+        if self.text.last() != Some(&0) {
+            self.text.push(0);
+        }
+        self.msaa.chars = (self.text.len() - 1) as u32;
+        self.msaa.text = self.text.as_ptr();
+    }
 }
 
 struct OwnMenu {
     menu: HMENU,
     items: Vec<OwnItem>,
-    /// Owner-drawn now.
-    drawn: bool,
 }
 
 thread_local! {
     static OWN: RefCell<Vec<OwnMenu>> = const { RefCell::new(Vec::new()) };
-    static MENU_BACK_BRUSH: std::cell::Cell<Option<HBRUSH>> = const { std::cell::Cell::new(None) };
+    /// The owned menus' background brush and the colour it was made in.
+    static POPUP_BACK: std::cell::Cell<Option<(Rgb, HBRUSH)>> = const { std::cell::Cell::new(None) };
 }
 
-/// Menus are drawn dark by Windows right now.
-fn dark_menus() -> bool {
-    let c = colours();
-    c.custom && c.dark && ux().set_preferred_app_mode.is_some()
+/// A line between columns or a separator: the text colour, faint.
+fn faint(c: &UiColours) -> Rgb {
+    let mix = |a: u8, b: u8| ((u16::from(a) * 4 + u16::from(b)) / 5) as u8;
+    Rgb::new(
+        mix(c.bar.r, c.text.r),
+        mix(c.bar.g, c.text.g),
+        mix(c.bar.b, c.text.b),
+    )
 }
 
-/// Draws the multi-column popup `menu` here while menus are dark. Call it
-/// once the menu is built; its items' texts and columns are taken then.
-pub fn own_columns(menu: HMENU) {
+/// The owned menus' background brush in the bar colour now; a new one is
+/// given to every owned menu before the old one goes.
+fn popup_brush() -> HBRUSH {
+    let bar = colours().bar;
+    if let Some((at, brush)) = POPUP_BACK.get()
+        && at == bar
+    {
+        return brush;
+    }
+    // SAFETY: a plain brush; the old one is deleted once no owned menu
+    // uses it any more.
+    unsafe {
+        let brush = CreateSolidBrush(colorref(bar));
+        let old = POPUP_BACK.replace(Some((bar, brush)));
+        OWN.with(|own| {
+            if let Ok(own) = own.try_borrow() {
+                for m in own.iter() {
+                    set_back(m.menu, brush);
+                }
+            }
+        });
+        if let Some((_, b)) = old {
+            let _ = DeleteObject(HGDIOBJ(b.0));
+        }
+        brush
+    }
+}
+
+fn set_back(menu: HMENU, brush: HBRUSH) {
+    let info = MENUINFO {
+        cbSize: size_of::<MENUINFO>() as u32,
+        fMask: MIM_BACKGROUND,
+        hbrBack: brush,
+        ..Default::default()
+    };
+    // SAFETY: a menu of ours (checked live by the caller or just opened).
+    unsafe {
+        let _ = SetMenuInfo(menu, &info);
+    }
+}
+
+/// `WM_INITMENUPOPUP` of the main window, once the menu is filled: owner-
+/// draws `menu` in our colours while they are on, or gives an owned menu
+/// back to Windows when they are off.
+pub fn own_popup(menu: HMENU) {
+    let on = custom();
+    // Menus since destroyed (context menus) are forgotten.
+    OWN.with(|own| {
+        if let Ok(mut own) = own.try_borrow_mut() {
+            // SAFETY: plain query.
+            own.retain(|m| unsafe { IsMenu(m.menu) }.as_bool());
+        }
+    });
+    let old = OWN.with(|own| {
+        let mut own = own.try_borrow_mut().ok()?;
+        let at = own.iter().rposition(|m| m.menu == menu)?;
+        Some(own.remove(at))
+    });
+    if !on && old.is_none() {
+        return;
+    }
     let mut items = Vec::new();
     let mut column = 0;
-    // SAFETY: a menu we built; sized struct and buffer for each item.
+    let mut failed = false;
+    // SAFETY: a menu Windows is opening; sized struct and buffer for each
+    // item; every text lives through the call that copies it.
     unsafe {
-        let count = GetMenuItemCount(Some(menu));
-        for pos in 0..count.max(0) as u32 {
+        let count = GetMenuItemCount(Some(menu)).max(0) as u32;
+        for pos in 0..count {
             let mut buf = [0u16; 256];
             let mut mii = MENUITEMINFOW {
                 cbSize: size_of::<MENUITEMINFOW>() as u32,
-                fMask: MIIM_FTYPE | MIIM_STRING,
+                fMask: MIIM_FTYPE | MIIM_STRING | MIIM_DATA,
                 dwTypeData: PWSTR(buf.as_mut_ptr()),
                 cch: buf.len() as u32 - 1,
                 ..Default::default()
             };
             if GetMenuItemInfoW(menu, pos, true, &mut mii).is_err() {
-                return;
-            }
-            let breaks = mii.fType.0 & (MFT_MENUBARBREAK.0 | MFT_MENUBREAK.0) != 0;
-            if breaks && pos > 0 {
-                column += 1;
-            }
-            let n = (mii.cch as usize).min(buf.len());
-            let mut text = buf.get(..n).unwrap_or_default().to_vec();
-            text.push(0);
-            let msaa = Box::new(MsaaMenuInfo {
-                signature: MSAA_MENU_SIG,
-                chars: n as u32,
-                text: text.as_ptr(),
-            });
-            items.push(OwnItem {
-                text,
-                msaa,
-                separator: mii.fType.0 & MFT_SEPARATOR.0 != 0,
-                breaks,
-                column,
-            });
-        }
-    }
-    let dark = dark_menus();
-    OWN.with(|own| {
-        let Ok(mut own) = own.try_borrow_mut() else {
-            return;
-        };
-        own.push(OwnMenu {
-            menu,
-            items,
-            drawn: false,
-        });
-        if let Some(m) = own.last_mut() {
-            set_drawn(m, dark);
-        }
-    });
-}
-
-/// Owner-draws the owned menus while menus are dark, and gives them back
-/// to Windows otherwise.
-fn sync_columns() {
-    let dark = dark_menus();
-    OWN.with(|own| {
-        let Ok(mut own) = own.try_borrow_mut() else {
-            return;
-        };
-        for m in own.iter_mut() {
-            set_drawn(m, dark);
-        }
-    });
-}
-
-fn menu_back_brush() -> HBRUSH {
-    MENU_BACK_BRUSH.with(|b| {
-        b.get().unwrap_or_else(|| {
-            // SAFETY: a plain brush, kept for the program's life.
-            let brush = unsafe { CreateSolidBrush(colorref(MENU_BACK)) };
-            b.set(Some(brush));
-            brush
-        })
-    })
-}
-
-fn set_drawn(m: &mut OwnMenu, on: bool) {
-    if m.drawn == on {
-        return;
-    }
-    // SAFETY: a menu we built; each item's text is a buffer that outlives
-    // the call (Windows copies it).
-    unsafe {
-        for (pos, item) in m.items.iter().enumerate() {
-            let mut mii = MENUITEMINFOW {
-                cbSize: size_of::<MENUITEMINFOW>() as u32,
-                fMask: MIIM_FTYPE,
-                ..Default::default()
-            };
-            if GetMenuItemInfoW(m.menu, pos as u32, true, &mut mii).is_err() {
+                // Unread: it may still hold old data, so the old record
+                // stays; a stand-in keeps the positions in step.
+                // The stand-in copies the old item there, so its access
+                // key and text still answer while it is open.
+                failed = true;
+                let mut stand_in = OwnItem::new(Vec::new());
+                if let Some(o) = old.as_ref().and_then(|m| m.items.get(pos as usize)) {
+                    stand_in.set_text(Some(without_nul(&o.text)));
+                    stand_in.separator = o.separator;
+                    stand_in.breaks = o.breaks;
+                    stand_in.column = o.column;
+                    stand_in.radio = o.radio;
+                    column = o.column;
+                }
+                items.push(stand_in);
                 continue;
             }
+            let ty = mii.fType.0;
+            let n = (mii.cch as usize).min(buf.len());
+            // Windows may keep no text for an owner-drawn item: ours then,
+            // found by its data wherever the item has moved to, in this
+            // menu's last record or one kept after an earlier failed read.
+            let data = mii.dwItemData;
+            let find = |m: &OwnMenu| {
+                m.items
+                    .iter()
+                    .find(|i| (&raw const *i.msaa) as usize == data)
+                    .map(|i| without_nul(&i.text).to_vec())
+            };
+            let kept = old.as_ref().and_then(find).or_else(|| {
+                OWN.with(|own| {
+                    let own = own.try_borrow().ok()?;
+                    own.iter().filter(|m| m.menu == menu).find_map(find)
+                })
+            });
+            let text = match kept {
+                Some(k) if n == 0 => k,
+                _ => buf.get(..n).unwrap_or_default().to_vec(),
+            };
+            let mut item = OwnItem::new(text);
+            item.separator = ty & MFT_SEPARATOR.0 != 0;
+            item.breaks = ty & (MFT_MENUBARBREAK.0 | MFT_MENUBREAK.0) != 0;
+            if item.breaks && pos > 0 {
+                column += 1;
+            }
+            item.column = column;
+            item.radio = ty & MFT_RADIOCHECK.0 != 0;
             // Keeps the radio check style CheckMenuRadioItem set.
-            let mut ty = mii.fType.0
-                & !(MFT_OWNERDRAW.0 | MFT_MENUBARBREAK.0 | MFT_MENUBREAK.0 | MFT_STRING.0);
-            let mut text = item.text.clone();
-            mii.fMask = MIIM_FTYPE | MIIM_DATA;
+            let mut ty =
+                ty & !(MFT_OWNERDRAW.0 | MFT_MENUBARBREAK.0 | MFT_MENUBREAK.0 | MFT_STRING.0);
+            let mut set = MENUITEMINFOW {
+                cbSize: size_of::<MENUITEMINFOW>() as u32,
+                fMask: MIIM_FTYPE | MIIM_DATA,
+                ..Default::default()
+            };
             if on {
-                // Our own line between the columns instead of Windows'
-                // light one.
+                // Our own line between the columns instead of Windows'.
                 ty |= MFT_OWNERDRAW.0 | if item.breaks { MFT_MENUBREAK.0 } else { 0 };
-                mii.dwItemData = (&raw const *item.msaa) as usize;
+                set.dwItemData = (&raw const *item.msaa) as usize;
             } else {
                 ty |= if item.breaks { MFT_MENUBARBREAK.0 } else { 0 };
-                mii.dwItemData = 0;
-                if !item.separator {
-                    // The text again, in case Windows let it go.
-                    mii.fMask |= MIIM_STRING;
-                    mii.dwTypeData = PWSTR(text.as_mut_ptr());
-                }
             }
-            mii.fType = MENU_ITEM_TYPE(ty);
-            let _ = SetMenuItemInfoW(m.menu, pos as u32, true, &mii);
+            if !item.separator {
+                // The text again, in case Windows let it go.
+                set.fMask |= MIIM_STRING;
+                set.dwTypeData = PWSTR(item.text.as_mut_ptr());
+            }
+            set.fType = MENU_ITEM_TYPE(ty);
+            if SetMenuItemInfoW(menu, pos, true, &set).is_err() {
+                failed = true;
+            }
+            item.set_text(None);
+            items.push(item);
         }
-        let info = MENUINFO {
-            cbSize: size_of::<MENUINFO>() as u32,
-            fMask: MIM_BACKGROUND,
-            hbrBack: if on {
-                menu_back_brush()
-            } else {
-                HBRUSH::default()
-            },
-            ..Default::default()
-        };
-        let _ = SetMenuInfo(m.menu, &info);
     }
-    m.drawn = on;
+    if on {
+        set_back(menu, popup_brush());
+        OWN.with(|own| {
+            if let Ok(mut own) = own.try_borrow_mut() {
+                own.push(OwnMenu { menu, items });
+            }
+        });
+    } else {
+        set_back(menu, HBRUSH::default());
+    }
+    // The old items' data is no longer in any item once every item took
+    // its new data; otherwise an item may still point at it, so it is kept
+    // (and still drawn) until the menu is destroyed.
+    if let Some(old) = old.filter(|_| failed) {
+        OWN.with(|own| {
+            if let Ok(mut own) = own.try_borrow_mut() {
+                own.insert(0, old);
+            }
+        });
+    }
+}
+
+/// Repaints open owned menus in the colours now in use (a window colour
+/// shown while the menu is open).
+fn repaint_popups() {
+    let any = OWN.with(|own| own.try_borrow().is_ok_and(|o| !o.is_empty()));
+    if !any {
+        return;
+    }
+    let _ = popup_brush();
+    unsafe extern "system" fn each(hwnd: HWND, _: LPARAM) -> BOOL {
+        let mut class = [0u16; 16];
+        // SAFETY: a window of this thread and a local buffer.
+        let n = unsafe { GetClassNameW(hwnd, &mut class) };
+        let menu_class: Vec<u16> = "#32768".encode_utf16().collect();
+        if class.get(..n.max(0) as usize) == Some(&menu_class[..]) {
+            // SAFETY: as above.
+            unsafe {
+                let _ = InvalidateRect(Some(hwnd), None, true);
+            }
+        }
+        true.into()
+    }
+    // SAFETY: a callback that only reads class names and invalidates.
+    unsafe {
+        let _ = EnumThreadWindows(GetCurrentThreadId(), Some(each), LPARAM(0));
+    }
 }
 
 /// Our item behind owner-draw item data, with a copy of what drawing it
 /// needs.
-fn own_item(data: usize) -> Option<(bool, u32, Vec<u16>)> {
+struct DrawnItem {
+    separator: bool,
+    column: u32,
+    radio: bool,
+    text: Vec<u16>,
+}
+
+fn own_item(data: usize) -> Option<DrawnItem> {
     OWN.with(|own| {
         let own = own.try_borrow().ok()?;
         let item = own
             .iter()
             .flat_map(|m| &m.items)
             .find(|i| (&raw const *i.msaa) as usize == data)?;
-        Some((
-            item.separator,
-            item.column,
-            without_nul(&item.text).to_vec(),
-        ))
+        Some(DrawnItem {
+            separator: item.separator,
+            column: item.column,
+            radio: item.radio,
+            text: without_nul(&item.text).to_vec(),
+        })
     })
 }
 
@@ -1111,13 +1220,14 @@ fn without_nul(text: &[u16]) -> &[u16] {
     text.strip_suffix(&[0]).unwrap_or(text)
 }
 
-/// The text of the item at `pos` of a menu given to [`own_columns`]
-/// (Windows may report none while it is owner-drawn).
+/// The text of the item at `pos` of an owned menu (Windows may report
+/// none while it is owner-drawn).
 pub fn owned_text(menu: HMENU, pos: u32) -> Option<String> {
     OWN.with(|own| {
         let own = own.try_borrow().ok()?;
         let item = own
             .iter()
+            .rev()
             .find(|m| m.menu == menu)?
             .items
             .get(pos as usize)?;
@@ -1125,11 +1235,39 @@ pub fn owned_text(menu: HMENU, pos: u32) -> Option<String> {
     })
 }
 
+/// The new text of the item at `pos` of `menu`, for an owned menu's
+/// drawing until it opens again.
+pub fn note_text(menu: HMENU, pos: u32, text: &str) {
+    let wide: Vec<u16> = text.encode_utf16().collect();
+    OWN.with(|own| {
+        if let Ok(mut own) = own.try_borrow_mut()
+            && let Some(item) = own
+                .iter_mut()
+                .rev()
+                .find(|m| m.menu == menu)
+                .and_then(|m| m.items.get_mut(pos as usize))
+        {
+            item.set_text(Some(&wide));
+        }
+    });
+}
+
 /// The window's DPI as a scale for sizes given at 96 DPI.
 fn scaled(hwnd: HWND, px: i32) -> i32 {
     // SAFETY: plain query.
     let dpi = unsafe { GetDpiForWindow(hwnd) }.max(96) as i32;
     px * dpi / 96
+}
+
+/// An item's text before and after its tab (the shortcut).
+fn split_tab(text: &[u16]) -> (&[u16], &[u16]) {
+    match text.iter().position(|c| *c == u16::from(b'\t')) {
+        Some(at) => (
+            text.get(..at).unwrap_or_default(),
+            text.get(at + 1..).unwrap_or_default(),
+        ),
+        None => (text, &[]),
+    }
 }
 
 /// `WM_MEASUREITEM` and `WM_DRAWITEM` for our owner-drawn menu items;
@@ -1142,26 +1280,41 @@ fn own_menu_message(hwnd: HWND, msg: u32, lparam: LPARAM) -> Option<LRESULT> {
             if mis.CtlType != ODT_MENU {
                 return None;
             }
-            let (separator, _, text) = own_item(mis.itemData)?;
-            if separator {
+            let item = own_item(mis.itemData)?;
+            if item.separator {
                 mis.itemWidth = 0;
-                mis.itemHeight = scaled(hwnd, 7) as u32;
+                mis.itemHeight = scaled(hwnd, 9) as u32;
                 return Some(LRESULT(1));
             }
-            let mut size = windows::Win32::Foundation::SIZE::default();
+            let (label, key) = split_tab(&item.text);
+            let extent = |dc: HDC, t: &[u16]| {
+                let mut size = windows::Win32::Foundation::SIZE::default();
+                if !t.is_empty() {
+                    // SAFETY: a DC of ours and a text slice.
+                    let _ = unsafe { GetTextExtentPoint32W(dc, t, &mut size) };
+                }
+                size
+            };
             // SAFETY: a window DC, released after use; the font is
             // selected back out.
-            unsafe {
+            let (l, k, height) = unsafe {
                 let dc = GetDC(Some(hwnd));
                 let old = menu_font(hwnd).map(|f| SelectObject(dc, HGDIOBJ(f.0)));
-                let _ = GetTextExtentPoint32W(dc, &text, &mut size);
+                let (l, k) = (extent(dc, label), extent(dc, key));
+                let height = extent(dc, &[u16::from(b'X')]).cy;
                 if let Some(old) = old {
                     SelectObject(dc, old);
                 }
                 ReleaseDC(Some(hwnd), dc);
-            }
-            mis.itemWidth = (size.cx + scaled(hwnd, GUTTER + 16)).max(0) as u32;
-            mis.itemHeight = (size.cy + scaled(hwnd, 6)).max(0) as u32;
+                (l, k, height)
+            };
+            let key_room = if key.is_empty() {
+                0
+            } else {
+                k.cx + scaled(hwnd, KEY_GAP)
+            };
+            mis.itemWidth = (l.cx + key_room + scaled(hwnd, GUTTER + ARROW_ROOM)).max(0) as u32;
+            mis.itemHeight = (height + scaled(hwnd, 10)).max(0) as u32;
             Some(LRESULT(1))
         }
         WM_DRAWITEM => {
@@ -1170,89 +1323,188 @@ fn own_menu_message(hwnd: HWND, msg: u32, lparam: LPARAM) -> Option<LRESULT> {
             if dis.CtlType != ODT_MENU {
                 return None;
             }
-            let (separator, column, mut text) = own_item(dis.itemData)?;
-            draw_own_item(hwnd, dis, separator, column, &mut text);
+            let mut item = own_item(dis.itemData)?;
+            draw_own_item(hwnd, dis, &mut item);
             Some(LRESULT(1))
         }
         _ => None,
     }
 }
 
-/// The space left of an item's text, where the radio bullet goes (96 DPI).
+/// The space left of an item's text, where the check mark goes (96 DPI).
 const GUTTER: i32 = 28;
+/// The space right of an item, where Windows draws a submenu's arrow
+/// (96 DPI).
+const ARROW_ROOM: i32 = 24;
+/// The least space between an item's text and its shortcut (96 DPI).
+const KEY_GAP: i32 = 32;
 
-fn draw_own_item(hwnd: HWND, dis: &DRAWITEMSTRUCT, separator: bool, column: u32, text: &mut [u16]) {
+fn draw_own_item(hwnd: HWND, dis: &DRAWITEMSTRUCT, item: &mut DrawnItem) {
+    let c = colours();
     let state = dis.itemState.0;
     let off = state & (ODS_GRAYED.0 | ODS_DISABLED.0) != 0;
-    let lit = state & ODS_SELECTED.0 != 0 && !off && !separator;
+    let lit = state & ODS_SELECTED.0 != 0 && !off && !item.separator;
     let dc = dis.hDC;
     let r = dis.rcItem;
-    // SAFETY: the DC Windows passed for the item; brushes we make are
-    // deleted after use, the font and pen are selected back out.
+    // SAFETY: the DC Windows passed for the item; brushes and pens we make
+    // are deleted after use, the font, brush and pen are selected back out.
     unsafe {
-        let fill = |rect: &RECT, c: Rgb| {
-            let b = CreateSolidBrush(colorref(c));
+        let fill = |rect: &RECT, colour: Rgb| {
+            let b = CreateSolidBrush(colorref(colour));
             FillRect(dc, rect, b);
             let _ = DeleteObject(HGDIOBJ(b.0));
         };
-        fill(&r, if lit { MENU_HOT } else { MENU_BACK });
-        if column > 0 {
+        fill(&r, if lit { c.hot } else { c.bar });
+        if item.column > 0 {
             // The line between the columns.
             fill(
                 &RECT {
                     right: r.left + 1,
                     ..r
                 },
-                MENU_LINE,
+                faint(&c),
             );
         }
-        if separator {
+        if item.separator {
             let mid = (r.top + r.bottom) / 2;
             fill(
                 &RECT {
-                    left: r.left + scaled(hwnd, 4),
+                    left: r.left + scaled(hwnd, 8),
                     top: mid,
-                    right: r.right - scaled(hwnd, 4),
+                    right: r.right - scaled(hwnd, 8),
                     bottom: mid + 1,
                 },
-                MENU_LINE,
+                faint(&c),
             );
             return;
         }
-        let colour = if off { MENU_GRAY } else { MENU_TEXT };
+        let colour = if off { c.dim } else { c.text };
+        let cx = r.left + scaled(hwnd, GUTTER) / 2;
+        let cy = (r.top + r.bottom) / 2;
+        let s = |px: i32| scaled(hwnd, px);
+        // A line through `points`, in the text colour.
+        let line = |points: &[POINT]| {
+            let pen = CreatePen(PS_SOLID, s(1).max(1) + s(1) / 2, colorref(colour));
+            let old = SelectObject(dc, HGDIOBJ(pen.0));
+            let _ = Polyline(dc, points);
+            SelectObject(dc, old);
+            let _ = DeleteObject(HGDIOBJ(pen.0));
+        };
         if state & ODS_CHECKED.0 != 0 {
-            // The radio bullet, centred in the gutter.
-            let d = scaled(hwnd, 6);
-            let cx = r.left + scaled(hwnd, GUTTER) / 2;
-            let cy = (r.top + r.bottom) / 2;
-            let brush = CreateSolidBrush(colorref(colour));
-            let old_brush = SelectObject(dc, HGDIOBJ(brush.0));
-            let old_pen = SelectObject(dc, GetStockObject(NULL_PEN));
-            let _ = Ellipse(
-                dc,
-                cx - d / 2,
-                cy - d / 2,
-                cx - d / 2 + d + 1,
-                cy - d / 2 + d + 1,
-            );
-            SelectObject(dc, old_pen);
-            SelectObject(dc, old_brush);
-            let _ = DeleteObject(HGDIOBJ(brush.0));
+            if item.radio {
+                // The radio bullet, centred in the gutter.
+                let d = s(6);
+                let brush = CreateSolidBrush(colorref(colour));
+                let old_brush = SelectObject(dc, HGDIOBJ(brush.0));
+                let old_pen = SelectObject(dc, GetStockObject(NULL_PEN));
+                let _ = Ellipse(
+                    dc,
+                    cx - d / 2,
+                    cy - d / 2,
+                    cx - d / 2 + d + 1,
+                    cy - d / 2 + d + 1,
+                );
+                SelectObject(dc, old_pen);
+                SelectObject(dc, old_brush);
+                let _ = DeleteObject(HGDIOBJ(brush.0));
+            } else {
+                line(&[
+                    POINT {
+                        x: cx - s(5),
+                        y: cy,
+                    },
+                    POINT {
+                        x: cx - s(2),
+                        y: cy + s(3),
+                    },
+                    POINT {
+                        x: cx + s(5),
+                        y: cy - s(4),
+                    },
+                ]);
+            }
         }
         let old = menu_font(hwnd).map(|f| SelectObject(dc, HGDIOBJ(f.0)));
         SetBkMode(dc, TRANSPARENT);
         SetTextColor(dc, colorref(colour));
-        let mut flags = DT_LEFT | DT_VCENTER | DT_SINGLELINE;
+        let mut flags = DT_VCENTER | DT_SINGLELINE;
         if state & ODS_NOACCEL.0 != 0 {
             flags |= DT_HIDEPREFIX;
         }
+        let (label, key) = split_tab(&item.text);
+        let (mut label, mut key) = (label.to_vec(), key.to_vec());
         let mut tr = RECT {
-            left: r.left + scaled(hwnd, GUTTER),
+            left: r.left + s(GUTTER),
+            right: r.right - s(ARROW_ROOM),
             ..r
         };
-        DrawTextW(dc, text, &mut tr, flags);
+        DrawTextW(dc, &mut label, &mut tr, flags | DT_LEFT);
+        if !key.is_empty() {
+            let mut kr = RECT {
+                left: r.left + s(GUTTER),
+                right: r.right - s(ARROW_ROOM),
+                ..r
+            };
+            DrawTextW(dc, &mut key, &mut kr, flags | DT_RIGHT | DT_NOPREFIX);
+        }
         if let Some(old) = old {
             SelectObject(dc, old);
         }
     }
+}
+
+/// `WM_MENUCHAR`: Windows matches access keys (`&1`) only in items it
+/// draws itself; in an owned menu the item with that key is chosen here,
+/// or, with several, the next one after the selected item is selected.
+fn menu_char(wparam: WPARAM, lparam: LPARAM) -> Option<LRESULT> {
+    const MNC_EXECUTE: u32 = 2;
+    const MNC_SELECT: u32 = 3;
+    let menu = HMENU(lparam.0 as *mut core::ffi::c_void);
+    let key = char::from_u32(u32::from(wparam.0 as u16))?
+        .to_lowercase()
+        .next()?;
+    let matches: Vec<u32> = OWN.with(|own| {
+        let own = own.try_borrow().ok()?;
+        let m = own.iter().rev().find(|m| m.menu == menu)?;
+        Some(
+            m.items
+                .iter()
+                .enumerate()
+                .filter(|(_, i)| !i.separator && access_key(without_nul(&i.text)) == Some(key))
+                .map(|(pos, _)| pos as u32)
+                .filter(|pos| {
+                    // SAFETY: plain query on a menu of ours.
+                    let state = unsafe { GetMenuState(menu, *pos, MF_BYPOSITION) };
+                    state & (MF_GRAYED.0 | MF_DISABLED.0) == 0
+                })
+                .collect(),
+        )
+    })?;
+    let first = *matches.first()?;
+    if matches.len() == 1 {
+        return Some(LRESULT((first | (MNC_EXECUTE << 16)) as isize));
+    }
+    // SAFETY: plain queries on a menu of ours.
+    let selected = (0..unsafe { GetMenuItemCount(Some(menu)) }.max(0) as u32)
+        .find(|pos| unsafe { GetMenuState(menu, *pos, MF_BYPOSITION) } & MF_HILITE.0 != 0);
+    let next = selected
+        .and_then(|sel| matches.iter().copied().find(|pos| *pos > sel))
+        .unwrap_or(first);
+    Some(LRESULT((next | (MNC_SELECT << 16)) as isize))
+}
+
+/// The character after an item text's single `&` (not `&&`), lower case.
+fn access_key(text: &[u16]) -> Option<char> {
+    let label = split_tab(text).0;
+    let text = String::from_utf16_lossy(label);
+    let mut chars = text.chars();
+    while let Some(c) = chars.next() {
+        if c == '&' {
+            match chars.next()? {
+                '&' => continue,
+                k => return k.to_lowercase().next(),
+            }
+        }
+    }
+    None
 }
