@@ -17075,11 +17075,11 @@ impl Window {
         // A warning theme (Production, Staging) stays on the pane, so its
         // confirmations keep working; the saved copy is in the menu.
         // A pane that closed, or whose look changed while the dialog was
-        // open (a reconnect), keeps what it has now.
-        let unchanged = self
-            .panes
-            .get(&pane)
-            .is_some_and(|p| p.theme.name == look.theme.name);
+        // open (a reconnect, maybe with a reloaded theme of the same
+        // name), keeps what it has now.
+        let unchanged = self.look_of(pane).is_some_and(|now| {
+            now.theme == look.theme && now.font.0 == look.font.0 && now.font.1 == look.font.1
+        });
         let warning = p_warning(Some(&look.theme));
         if unchanged
             && !warning
