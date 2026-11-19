@@ -1067,6 +1067,10 @@ pub fn own_popup(menu: HMENU) {
                 ..Default::default()
             };
             if GetMenuItemInfoW(menu, pos, true, &mut mii).is_err() {
+                // Unread: it may still hold old data, so the old record
+                // stays; a stand-in keeps the positions in step.
+                failed = true;
+                items.push(OwnItem::new(Vec::new()));
                 continue;
             }
             let ty = mii.fType.0;
