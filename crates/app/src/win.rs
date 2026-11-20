@@ -7337,7 +7337,10 @@ impl Window {
         if let Some(mut target) = target {
             // A credential changed since counts.
             let env = ssh_env();
-            target.refresh_login(&env);
+            if let Err(why) = target.refresh_login(&env) {
+                self.show(id, &login_refused(&why));
+                return;
+            }
             self.connect_to(id, target, &env);
         }
     }
@@ -16331,7 +16334,10 @@ impl Window {
         match like {
             Like::Ssh(mut target) => {
                 let env = ssh_env();
-                target.refresh_login(&env);
+                if let Err(why) = target.refresh_login(&env) {
+                    self.show(id, &login_refused(&why));
+                    return;
+                }
                 self.connect_to(id, *target, &env);
                 if let Some(p) = self.panes.get_mut(&id) {
                     p.start_dir = cwd;
@@ -22202,6 +22208,16 @@ fn session_menu(hwnd: HWND, host: Option<String>, search: Option<String>) {
     if let Some(Some(command)) = with_window(|w| w.side_action(Some(action))) {
         run_command(hwnd, command);
     }
+}
+
+/// A reconnect or split refused because the way there no longer
+/// resolves, in red.
+fn login_refused(why: &str) -> String {
+    format!(
+        "\x1b[0;31mNot connecting again: {} Check ~/.ssh/config, then connect from the \
+         connection manager.\x1b[0m\r\n",
+        crate::ssh::sanitize(why)
+    )
 }
 
 /// The named credentials: a menu of them and New credential; picking one

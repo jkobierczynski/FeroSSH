@@ -409,8 +409,10 @@ impl Target {
     /// The login (user, key files, certificates, agent) as ssh_config and
     /// the named credentials give it now, for a reconnect or a split: a
     /// credential changed since the first login counts. A user or port
-    /// typed in the address still wins; the rest of the target stays.
-    pub fn refresh_login(&mut self, env: &Env) {
+    /// typed in the address still wins; the rest of the target stays. An
+    /// error when a ProxyCommand cannot be filled in again (the way there
+    /// no longer resolves): it is not run with the old user.
+    pub fn refresh_login(&mut self, env: &Env) -> Result<(), String> {
         if let Some(fresh) = Self::resolve_host(&self.typed, env) {
             self.user = fresh.user;
             self.key_files = fresh.key_files;
@@ -421,14 +423,13 @@ impl Target {
         // A ProxyCommand's %r was filled in with the old user: take it as
         // the config now gives it, filled in for the new one. One taken out
         // of the config since is not run again with the old user.
-        if self.proxy_command.is_some()
-            && let Ok(fresh) = Self::resolve_route(&self.typed, env)
-        {
-            self.proxy_command = fresh.proxy_command;
+        if self.proxy_command.is_some() {
+            self.proxy_command = Self::resolve_route(&self.typed, env)?.proxy_command;
         }
         for j in &mut self.jumps {
-            j.refresh_login(env);
+            j.refresh_login(env)?;
         }
+        Ok(())
     }
 
     /// What the shell's channel asks for. Jump hosts open no shell.
@@ -4561,8 +4562,8 @@ mod tests {
             e.config
         );
         t.port = 2201;
-        t.refresh_login(&e);
-        typed.refresh_login(&e);
+        t.refresh_login(&e).unwrap();
+        typed.refresh_login(&e).unwrap();
         assert_eq!(t.user, "ops");
         assert!(t.key_files[0].path.ends_with("ops_key"));
         assert_eq!(t.port, 2201, "the rest of the target stays");
@@ -4572,27 +4573,29 @@ mod tests {
     #[test]
     fn a_reconnect_fills_in_a_proxy_command_for_the_new_user() {
         let dir = temp("refresh-proxy");
+        let first = "Host web\n  User alice\n  ProxyCommand ssh -W %h:%p %r@gw\n";
         let mut e = Env {
-            config: "Host web\n  User alice\n  ProxyCommand ssh -W %h:%p %r@gw\n".into(),
+            config: first.into(),
             ..env(&dir)
         };
         let mut t = Target::resolve("web", &e).unwrap();
-        assert!(
-            t.proxy_command
-                .as_ref()
-                .unwrap()
-                .args
-                .contains(&"alice@gw".to_owned())
-        );
-        e.config = format!("Match originalhost web\n  User bob\n{}", e.config);
-        t.refresh_login(&e);
+        let args = |t: &Target| t.proxy_command.as_ref().unwrap().args.clone();
+        assert!(args(&t).contains(&"alice@gw".to_owned()));
+        e.config = format!("Match originalhost web\n  User bob\n{first}");
+        t.refresh_login(&e).unwrap();
         assert_eq!(t.user, "bob");
-        let args = &t.proxy_command.as_ref().unwrap().args;
-        assert!(args.contains(&"bob@gw".to_owned()), "{args:?}"); // The ProxyCommand taken out of the config: not run with alice.
+        assert!(args(&t).contains(&"bob@gw".to_owned()), "{:?}", args(&t));
+        // The ProxyCommand taken out of the config: not run with alice.
         e.config = "Match originalhost web\n  User carol\nHost web\n  User alice\n".into();
-        t.refresh_login(&e);
+        t.refresh_login(&e).unwrap();
         assert_eq!(t.user, "carol");
         assert!(t.proxy_command.is_none());
+        // The way there no longer resolves (web jumps through itself):
+        // refused, rather than run with the old user.
+        e.config = first.into();
+        let mut t = Target::resolve("web", &e).unwrap();
+        e.config = "Host web\n  User bob\n  ProxyJump web\n".into();
+        assert!(t.refresh_login(&e).is_err());
     }
 
     #[test]
