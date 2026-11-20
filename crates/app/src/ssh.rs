@@ -2225,9 +2225,11 @@ impl SshSession {
         let (Some(used), Some(file)) = (self.pinned_key.clone(), self.known_file()) else {
             return Vec::new();
         };
-        let revoked = self
-            .known()
-            .map_or(true, |k| proven.iter().any(|key| k.is_revoked(key)));
+        // Neither the key the login used nor a new one may have been
+        // revoked meanwhile.
+        let revoked = self.known().map_or(true, |k| {
+            k.is_revoked(&used) || proven.iter().any(|key| k.is_revoked(key))
+        });
         if self.on_share(&file).is_some() || self.listed_elsewhere(&file, &host, port) || revoked {
             return Vec::new();
         }
