@@ -34,6 +34,13 @@ pub fn is_ferossh_command(command: &str) -> bool {
         && command.ends_with(" --url \"%1\"")
 }
 
+/// Whether the mark FeroSSH left on a scheme key (the command it
+/// installed there) still matches the key's command, so the key is
+/// still FeroSSH's to replace or delete.
+pub fn marks_command(mark: &str, command: &str) -> bool {
+    is_ferossh_command(mark) && mark.trim().eq_ignore_ascii_case(command.trim())
+}
+
 /// Whether `link` is one FeroSSH opens from the command line: an
 /// `ssh://` or `sftp://` address that parses.
 pub fn valid_link(link: &str) -> bool {
@@ -77,7 +84,7 @@ mod reg {
     use windows::Win32::UI::Shell::{SHCNE_ASSOCCHANGED, SHCNF_IDLIST, SHChangeNotify};
     use windows::core::HSTRING;
 
-    use super::{Registered, SCHEMES, command, is_ferossh_command, prog_id};
+    use super::{Registered, SCHEMES, command, marks_command, prog_id};
 
     /// The longest value read, in UTF-16 units.
     const MAX_UNITS: usize = 32 * 1024;
@@ -138,16 +145,20 @@ mod reg {
     }
 
     /// Whether the scheme key FeroSSH may have written is still its own:
-    /// marked, and still opening links with a FeroSSH command (from this
-    /// exe or one moved since), not one another program put there.
+    /// the mark holds the exact command FeroSSH installed (from this exe
+    /// or one moved since), and the key still opens links with it. A
+    /// handler another program put there since, even one shaped like
+    /// FeroSSH's, has a different command and is left alone.
     fn own_scheme_key(key: &str) -> bool {
-        read(HKEY_CURRENT_USER, key, MARK).is_some()
-            && read(
-                HKEY_CURRENT_USER,
-                &format!("{key}\\shell\\open\\command"),
-                "",
-            )
-            .is_some_and(|c| is_ferossh_command(&c))
+        let Some(mark) = read(HKEY_CURRENT_USER, key, MARK) else {
+            return false;
+        };
+        read(
+            HKEY_CURRENT_USER,
+            &format!("{key}\\shell\\open\\command"),
+            "",
+        )
+        .is_some_and(|c| marks_command(&mark, &c))
     }
 
     fn write(key: &str, name: &str, value: &str) -> Result<(), String> {
@@ -268,7 +279,7 @@ mod reg {
         .filter(|p| *p != prog);
         let result = if ours || other.is_none() {
             write_handler(&own, &format!("URL:{upper} link"), &exe)?;
-            write(&own, MARK, "1")?;
+            write(&own, MARK, &command(&exe))?;
             if choice.is_some() {
                 Registered::ChooseInSettings(None)
             } else {
@@ -321,6 +332,18 @@ mod tests {
         assert!(!is_ferossh_command("\"C:\\PuTTY\\putty.exe\" \"%1\""));
         assert!(!is_ferossh_command(" --url \"%1\""));
         assert!(!is_ferossh_command("x --url \"%1\""));
+    }
+
+    #[test]
+    fn only_the_installed_command_is_ours() {
+        let ours = command("D:\\Old\\ferossh.exe");
+        assert!(marks_command(&ours, &ours));
+        assert!(marks_command(&ours, &ours.to_ascii_uppercase()));
+        // Another program that copied FeroSSH's shape keeps its handler.
+        assert!(!marks_command(&ours, &command("C:\\Other\\handler.exe")));
+        // A mark that is not a FeroSSH command never makes a key ours.
+        assert!(!marks_command("1", "1"));
+        assert!(!marks_command("", ""));
     }
 
     #[test]
