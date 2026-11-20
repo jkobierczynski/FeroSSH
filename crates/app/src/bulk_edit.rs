@@ -186,6 +186,8 @@ pub fn shared(
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Change {
     pub name: String,
+    /// A WinRM connection: a password source there needs a user.
+    pub winrm: bool,
     pub from: String,
     pub to: String,
 }
@@ -354,23 +356,11 @@ pub fn plan(
             {
                 Some("they go through jump hosts; clear them first")
             }
-            // WinRM with no user logs in as yourself with no password, so
-            // a password source needs a user there, as in the form.
-            EditField::Password
+            EditField::Password | EditField::User
                 if t.kind == SessionKind::WinRm
-                    && value != "ask"
-                    && host.is_none_or(|h| h.user.as_deref().is_none_or(str::is_empty)) =>
+                    && winrm_without_user(field, &value, host, settings, &t.name) =>
             {
-                Some("WinRM needs a user for that password source; set the user first")
-            }
-            EditField::User
-                if t.kind == SessionKind::WinRm
-                    && value.is_empty()
-                    && settings
-                        .profile(&t.name)
-                        .is_some_and(|p| p.password != PasswordSource::Ask) =>
-            {
-                Some("WinRM with a password source needs a user")
+                Some("WinRM needs a user with that password source")
             }
             _ => None,
         };
@@ -382,6 +372,7 @@ pub fn plan(
         if from != value {
             changes.push(Change {
                 name: t.name.clone(),
+                winrm: t.kind == SessionKind::WinRm,
                 from,
                 to: value.clone(),
             });
@@ -395,29 +386,54 @@ pub fn plan(
     })
 }
 
-/// The planned hosts that `saved`, read again, now gives a proxy (for
-/// jump hosts) or jump hosts (for a proxy): [`apply`] leaves them alone,
-/// as a connection never holds both.
-pub fn conflicts(plan: &Plan, saved: &[SavedHost]) -> Vec<String> {
+/// WinRM with no user logs in as yourself with no password, so a
+/// password source needs a user there, as in the form: whether setting
+/// `field` to `value` on `name` would leave one without.
+fn winrm_without_user(
+    field: EditField,
+    value: &str,
+    host: Option<&SavedHost>,
+    settings: &Settings,
+    name: &str,
+) -> bool {
+    match field {
+        EditField::Password => {
+            value != "ask" && host.is_none_or(|h| h.user.as_deref().is_none_or(str::is_empty))
+        }
+        EditField::User => {
+            value.is_empty()
+                && settings
+                    .profile(name)
+                    .is_some_and(|p| p.password != PasswordSource::Ask)
+        }
+        _ => false,
+    }
+}
+
+/// The planned hosts that may no longer change, with `saved` read again
+/// and `settings` as they are now: one that now has a proxy (for jump
+/// hosts) or jump hosts (for a proxy), as a connection never holds both,
+/// or a WinRM one that would be left with a password source and no
+/// user. [`apply`] leaves them alone.
+pub fn conflicts(plan: &Plan, saved: &[SavedHost], settings: &Settings) -> Vec<String> {
     plan.changes
         .iter()
-        .filter(|c| {
-            saved
-                .iter()
-                .find(|h| h.alias.eq_ignore_ascii_case(&c.name))
-                .is_some_and(|h| conflicting(plan, h))
-        })
+        .filter(|c| conflicting(plan, c, saved, settings))
         .map(|c| c.name.clone())
         .collect()
 }
 
-fn conflicting(plan: &Plan, h: &SavedHost) -> bool {
+fn conflicting(plan: &Plan, c: &Change, saved: &[SavedHost], settings: &Settings) -> bool {
+    let host = saved.iter().find(|h| h.alias.eq_ignore_ascii_case(&c.name));
+    if c.winrm && winrm_without_user(plan.field, &plan.value, host, settings, &c.name) {
+        return true;
+    }
     !plan.value.is_empty()
-        && match plan.field {
+        && host.is_some_and(|h| match plan.field {
             EditField::Jump => h.proxy_server.is_some(),
             EditField::Proxy => h.proxy_jump.is_some(),
             _ => false,
-        }
+        })
 }
 
 /// Makes the changes in `plan`. Returns whether `sessions.conf` (the
@@ -425,8 +441,12 @@ fn conflicting(plan: &Plan, h: &SavedHost) -> bool {
 /// in [`conflicts`] are left alone.
 pub fn apply(plan: &Plan, saved: &mut [SavedHost], settings: &mut Settings) -> bool {
     let value = Some(plan.value.clone()).filter(|v| !v.is_empty());
+    let skip = conflicts(plan, saved, settings);
     let mut saved_changed = false;
     for c in &plan.changes {
+        if skip.contains(&c.name) {
+            continue;
+        }
         if plan.field.saved_only() {
             let Some(h) = saved
                 .iter_mut()
@@ -434,9 +454,6 @@ pub fn apply(plan: &Plan, saved: &mut [SavedHost], settings: &mut Settings) -> b
             else {
                 continue;
             };
-            if conflicting(plan, h) {
-                continue;
-            }
             let slot = match plan.field {
                 EditField::User => &mut h.user,
                 EditField::Key => &mut h.identity_file,
@@ -704,7 +721,7 @@ mod tests {
         // sessions.conf, read again, now gives web a proxy.
         let mut fresh = saved.clone();
         fresh[0].proxy_server = Some("socks5://proxy:1080".into());
-        assert_eq!(conflicts(&p, &fresh), ["web"]);
+        assert_eq!(conflicts(&p, &fresh, &Settings::default()), ["web"]);
         let mut settings = Settings::default();
         assert!(apply(&p, &mut fresh, &mut settings));
         assert_eq!(fresh[0].proxy_jump, None);
@@ -742,5 +759,31 @@ mod tests {
         let p = plan(EditField::User, "", &t[1..], &saved, &settings, &[]).unwrap();
         assert!(p.changes.is_empty());
         assert_eq!(p.skipped.len(), 1, "a password source needs a user");
+    }
+
+    #[test]
+    fn a_winrm_user_cleared_since_the_preview_is_left_alone() {
+        let saved = vec![saved_host("win", Some("admin"))];
+        let t = [target("win", SessionKind::WinRm)];
+        let p = plan(
+            EditField::Password,
+            "windows",
+            &t,
+            &saved,
+            &Settings::default(),
+            &[],
+        )
+        .unwrap();
+        assert_eq!(p.changes.len(), 1);
+        let mut fresh = saved.clone();
+        fresh[0].user = None;
+        let mut settings = Settings::default();
+        assert_eq!(conflicts(&p, &fresh, &settings), ["win"]);
+        apply(&p, &mut fresh, &mut settings);
+        assert!(
+            settings
+                .profile("win")
+                .is_none_or(|p| p.password == PasswordSource::Ask)
+        );
     }
 }
