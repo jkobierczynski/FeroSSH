@@ -374,6 +374,11 @@ fn parse_args(args: &[String]) -> Result<Launch, String> {
                 d = format!("{u}@{d}");
             }
             if let Some(p) = port {
+                if ferossh_config::ssh_config::parse_destination(&d)
+                    .is_some_and(|(_, _, p)| p.is_some())
+                {
+                    return Err("-p and a port in the host: give the port once".into());
+                }
                 d = format!("{d}:{p}");
             }
             Some(d)
@@ -544,6 +549,8 @@ mod tests {
             parse(&["-l", "bob", "-p", "2222", "ssh://web1/"]),
             Ok(Launch::Ssh { destination: Some(d), .. }) if d == "bob@web1:2222"
         ));
+        assert!(parse(&["-p", "2222", "ssh://web1:22"]).is_err());
+        assert!(parse(&["-p", "2222", "web1:22"]).is_err());
     }
 
     #[test]

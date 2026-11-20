@@ -7358,6 +7358,8 @@ impl Window {
                     // A desktop through this host opens now, and panes
                     // waiting for this login go on (to log in on their
                     // own: a tunnel-only connection is never shared).
+                    // A transfer queue opened on this host carries on.
+                    self.sftp_connected(id);
                     self.desktop_after_login(id);
                     self.release_workspace_panes(id, true);
                     self.refresh_chrome();
