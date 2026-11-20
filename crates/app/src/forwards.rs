@@ -1,6 +1,7 @@
 //! The UI process's half of port and X11 forwarding: listeners for local
 //! and dynamic forwards, and connections to the targets of remote forwards
-//! and to the X server.
+//! and to the X server. Either may be a Unix socket instead of a port
+//! (see [`crate::local_socket`]).
 //!
 //! The sandboxed worker cannot use loopback, so every socket on this PC is
 //! here; the worker holds the SSH channels, and each forwarded connection
@@ -9,7 +10,10 @@
 //! through: an X client's connection setup, whose fake cookie it checks
 //! and swaps for the real one before anything reaches the X server (see
 //! [`X11Setup`]). Everything else, SOCKS requests included, goes to the
-//! worker as it is.
+//! worker as it is. A remote forward without a target (`-R 1080`) has
+//! the server speak SOCKS: the worker reads each request and names the
+//! target, which this side checks is a plain host name or address before
+//! connecting to it.
 //!
 //! [`Forwarder`] runs on its own thread with a small tokio runtime, so a
 //! busy forward never slows the window. The window starts and stops a
@@ -31,14 +35,19 @@ use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use ferossh_config::forward::Target;
 use ferossh_config::{ForwardKind, ForwardSpec};
 use ferossh_forward::x11::{Display, MAX_SETUP, Setup as XSetup, swap_cookie};
-use ferossh_ipc::{ChannelId, FORWARD_IDS, MAX_DATA_CHUNK, Message, STREAM_WINDOW, WORKER_IDS};
+use ferossh_ipc::{
+    ChannelId, FORWARD_IDS, ForwardTarget, MAX_DATA_CHUNK, Message, STREAM_WINDOW, WORKER_IDS,
+};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 use tokio::task::AbortHandle;
 use zeroize::Zeroizing;
+
+use crate::local_socket::{self, BoxSock};
 
 /// How long connecting to a remote forward's target or the X server may
 /// take.
@@ -536,10 +545,11 @@ enum Internal {
         owner: Owner,
         why: String,
     },
+    /// A program connected; `peer` is `None` on a Unix socket.
     Accepted {
         owner: Owner,
-        socket: TcpStream,
-        peer: SocketAddr,
+        socket: BoxSock,
+        peer: Option<SocketAddr>,
     },
     /// A connection from another Windows session, or from a program that
     /// could not be found, was closed unused.
@@ -804,8 +814,13 @@ impl Engine {
         let Some(f) = conn.forwards.get_mut(index) else {
             return;
         };
-        let same_listener =
-            f.spec.kind == new.kind && f.spec.bind == new.bind && f.spec.port == new.port;
+        // The worker reads SOCKS for a remote forward without a target
+        // from the start, so turning that on or off starts it again.
+        let same_listener = f.spec.kind == new.kind
+            && f.spec.bind == new.bind
+            && f.spec.port == new.port
+            && f.spec.socket == new.socket
+            && f.spec.remote_dynamic() == new.remote_dynamic();
         let running = !matches!(f.state, FwdState::Failed(_));
         if same_listener && running {
             // Only where connections go changes, which this side decides
@@ -850,6 +865,11 @@ impl Engine {
             desktop,
         };
         match spec.kind {
+            ForwardKind::Local | ForwardKind::Dynamic if spec.socket.is_some() => {
+                let path = spec.socket.clone().unwrap_or_default();
+                let task = tokio::spawn(listen_socket(path, owner, self.internal.clone()));
+                fwd.listeners.push(task.abort_handle());
+            }
             ForwardKind::Local | ForwardKind::Dynamic => {
                 let hosts = bind_hosts(spec.bind.as_deref(), conn.gateway_ports);
                 let task = tokio::spawn(listen(
@@ -869,6 +889,8 @@ impl Engine {
                     connection,
                     bind: remote_bind(spec.bind.as_deref()),
                     port: spec.port,
+                    socket: spec.socket.clone(),
+                    socks: spec.remote_dynamic(),
                 });
             }
         }
@@ -901,7 +923,7 @@ impl Engine {
         self.send(Message::ForwardOpen {
             channel: id,
             connection,
-            target: Some((host, port)),
+            target: Some(ForwardTarget::Tcp(host, port)),
             origin_host: "127.0.0.1".into(),
             origin_port: 0,
             keep: false,
@@ -1067,18 +1089,23 @@ impl Engine {
         }
     }
 
-    fn accepted(&mut self, owner: Owner, socket: TcpStream, peer: SocketAddr) {
+    fn accepted(&mut self, owner: Owner, socket: BoxSock, peer: Option<SocketAddr>) {
         let Some(fwd) = self.fwd_mut(owner) else {
             return;
         };
         fwd.total += 1;
-        let target = fwd.spec.target.clone();
+        let target = fwd.spec.target.clone().map(|t| match t {
+            Target::Tcp(host, port) => ForwardTarget::Tcp(host, port),
+            Target::Unix(path) => ForwardTarget::Unix(path),
+        });
         // A remote desktop keeps its connection open after the terminal
         // closed; the window ends it with the desktop.
         let keep = fwd.desktop.is_some();
+        let from = peer.map_or_else(|| "socket".to_owned(), |p| p.to_string());
         let label = match &target {
-            Some((h, p)) => format!("{peer} → {}", host_port(h, *p)),
-            None => format!("{peer} → SOCKS"),
+            Some(ForwardTarget::Tcp(h, p)) => format!("{from} → {}", host_port(h, *p)),
+            Some(ForwardTarget::Unix(path)) => format!("{from} → {path}"),
+            None => format!("{from} → SOCKS"),
         };
         let id = self.new_id();
         let (tx, rx) = mpsc::unbounded_channel();
@@ -1096,8 +1123,8 @@ impl Engine {
             channel: id,
             connection: owner.connection(),
             target,
-            origin_host: peer.ip().to_string(),
-            origin_port: peer.port(),
+            origin_host: peer.map_or_else(|| "127.0.0.1".to_owned(), |p| p.ip().to_string()),
+            origin_port: peer.map_or(0, |p| p.port()),
             keep,
         });
         tokio::spawn(relay(
@@ -1153,7 +1180,12 @@ impl Engine {
                 Message::Window { bytes, .. } => ToSocket::Window(bytes),
                 Message::ForwardOpened { host, port, .. } => {
                     if let Some((from, _)) = s.label.split_once(" → ") {
-                        s.label = format!("{from} → {}", host_port(&host, port));
+                        let to = if port == 0 {
+                            host
+                        } else {
+                            host_port(&host, port)
+                        };
+                        s.label = format!("{from} → {to}");
                     }
                     return;
                 }
@@ -1174,7 +1206,11 @@ impl Engine {
         match msg {
             Message::ForwardListening { port, .. } => {
                 if let Some(f) = self.remote_fwd(channel) {
-                    f.state = FwdState::Listening(format!("server port {port}"));
+                    f.state = FwdState::Listening(match &f.spec.socket {
+                        Some(path) => format!("server socket {path}"),
+                        None if f.spec.remote_dynamic() => format!("server port {port}, SOCKS"),
+                        None => format!("server port {port}"),
+                    });
                 }
             }
             Message::Disconnected { reason, .. } => {
@@ -1192,9 +1228,11 @@ impl Engine {
                 x11,
                 origin_host,
                 origin_port,
+                target,
                 ..
             } if channel >= WORKER_IDS => {
-                self.incoming(channel, listener, x11, &origin_host, origin_port);
+                let origin = (origin_host.as_str(), origin_port);
+                self.incoming(channel, listener, x11, origin, target);
             }
             // A stream this side already closed.
             _ => {}
@@ -1208,45 +1246,64 @@ impl Engine {
             .find(|f| f.remote == Some(channel))
     }
 
-    /// The server opened a stream: connect it to the forward's target or
-    /// the X server.
+    /// The server opened a stream: connect it to the forward's target,
+    /// to where its SOCKS client asked (`asked`, for a remote forward
+    /// without a target), or to the X server.
     fn incoming(
         &mut self,
         channel: ChannelId,
         listener: ChannelId,
         x11: bool,
-        origin_host: &str,
-        origin_port: u16,
+        (origin_host, origin_port): (&str, u16),
+        asked: Option<(String, u16)>,
     ) {
         let found = if x11 {
-            self.conns.get_mut(&listener).and_then(|c| {
-                let x = c.x11.as_mut()?;
-                x.total += 1;
-                let d = &x.setup.display;
-                Some((
-                    Owner::X11(listener),
-                    (d.host.clone(), d.port()),
-                    Some(x.setup.clone()),
-                ))
-            })
+            self.conns
+                .get_mut(&listener)
+                .and_then(|c| {
+                    let x = c.x11.as_mut()?;
+                    x.total += 1;
+                    let d = &x.setup.display;
+                    Some((
+                        Owner::X11(listener),
+                        Target::Tcp(d.host.clone(), d.port()),
+                        Some(x.setup.clone()),
+                    ))
+                })
+                .filter(|_| asked.is_none())
         } else {
             self.conns.iter_mut().find_map(|(conn, c)| {
                 let f = c.forwards.iter_mut().find(|f| f.remote == Some(listener))?;
+                // Only a forward without a target of its own lets the
+                // SOCKS client choose, and only a plain host name or
+                // address: the worker read the request, and a worker
+                // that was taken over must not pick targets otherwise.
+                let target = match (&f.spec.target, asked.clone()) {
+                    (Some(t), None) => t.clone(),
+                    (None, Some((host, port)))
+                        if port != 0 && ferossh_forward::socks::valid_host(&host) =>
+                    {
+                        Target::Tcp(host, port)
+                    }
+                    _ => return None,
+                };
                 f.total += 1;
-                Some((Owner::Fwd(*conn, f.key), f.spec.target.clone()?, None))
+                Some((Owner::Fwd(*conn, f.key), target, None))
             })
         };
-        let Some((owner, (host, port), x11)) = found else {
+        let Some((owner, target, x11)) = found else {
             self.send(Message::Close { channel });
             return;
         };
+        let socks = asked.is_some();
         let (tx, mut rx) = mpsc::unbounded_channel();
         let unwritten = Arc::new(AtomicU32::new(0));
-        let label = format!(
-            "{} → {}",
-            host_port(origin_host, origin_port),
-            host_port(&host, port)
-        );
+        let from = if origin_port == 0 {
+            origin_host.to_owned()
+        } else {
+            host_port(origin_host, origin_port)
+        };
+        let label = format!("{from} → {target}");
         self.streams.insert(
             channel,
             StreamRef {
@@ -1257,10 +1314,27 @@ impl Engine {
             },
         );
         let connect = async move {
-            let what = host_port(&host, port);
-            match tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect((host.as_str(), port)))
+            let what = target.to_string();
+            let connected = match &target {
+                Target::Tcp(host, port) => tokio::time::timeout(
+                    CONNECT_TIMEOUT,
+                    TcpStream::connect((host.as_str(), *port)),
+                )
                 .await
-            {
+                .map(|r| {
+                    r.map(|s| {
+                        let _ = s.set_nodelay(true);
+                        Box::new(s) as BoxSock
+                    })
+                }),
+                Target::Unix(path) => match local_socket::check_path(path) {
+                    Ok(()) => {
+                        tokio::time::timeout(CONNECT_TIMEOUT, local_socket::connect(path)).await
+                    }
+                    Err(why) => return Err(why),
+                },
+            };
+            match connected {
                 Ok(Ok(s)) => Ok(s),
                 Ok(Err(e)) => Err(format!("Could not connect to {what}: {e}.")),
                 Err(_) => Err(format!("Timed out connecting to {what}.")),
@@ -1289,6 +1363,9 @@ impl Engine {
                 None => None,
             };
             let socket = connect.await;
+            if socks && socket.is_ok() {
+                to_worker(Message::ForwardConnected { channel });
+            }
             relay(channel, socket, first, (rx, unwritten), to_worker, internal).await;
         });
     }
@@ -1349,7 +1426,8 @@ fn desktop_spec(local: u16, (host, port): &(String, u16)) -> ForwardSpec {
         kind: ForwardKind::Local,
         bind: Some("127.0.0.1".into()),
         port: local,
-        target: Some((host.clone(), *port)),
+        socket: None,
+        target: Some(Target::Tcp(host.clone(), *port)),
     }
 }
 
@@ -1480,12 +1558,51 @@ async fn listen(
         if events
             .send(Internal::Accepted {
                 owner,
-                socket,
-                peer,
+                socket: Box::new(socket),
+                peer: Some(peer),
             })
             .is_err()
         {
             return;
+        }
+    }
+}
+
+/// Listens on the Unix socket at `path` and accepts connections until
+/// aborted, then removes the socket file.
+async fn listen_socket(path: String, owner: Owner, events: UnboundedSender<Internal>) {
+    if let Err(why) = local_socket::check_path(&path) {
+        let _ = events.send(Internal::ListenFailed { owner, why });
+        return;
+    }
+    let listener = match local_socket::bind(&path) {
+        Ok(l) => l,
+        Err(e) => {
+            let why = format!("Could not listen on {path}: {e}.");
+            let _ = events.send(Internal::ListenFailed { owner, why });
+            return;
+        }
+    };
+    // Dropped when the forward stops, which aborts this task.
+    let _unlink = local_socket::Unlink::new(path.clone());
+    let _ = events.send(Internal::Listening {
+        owner,
+        addrs: path.clone(),
+    });
+    loop {
+        match local_socket::accept(&listener).await {
+            Ok(socket) => {
+                let accepted = Internal::Accepted {
+                    owner,
+                    socket,
+                    peer: None,
+                };
+                if events.send(accepted).is_err() {
+                    return;
+                }
+            }
+            // Out of sockets or the like: try again shortly.
+            Err(_) => tokio::time::sleep(Duration::from_millis(100)).await,
         }
     }
 }
@@ -1522,7 +1639,7 @@ async fn x11_setup(
 /// stream or the socket fails.
 async fn relay(
     channel: ChannelId,
-    socket: Result<TcpStream, String>,
+    socket: Result<BoxSock, String>,
     first: Option<(Vec<u8>, u32)>,
     (mut from_worker, unwritten): (UnboundedReceiver<ToSocket>, Arc<AtomicU32>),
     to_worker: ToWorker,
@@ -1538,8 +1655,7 @@ async fn relay(
             return;
         }
     };
-    let _ = socket.set_nodelay(true);
-    let (mut read, mut write) = socket.into_split();
+    let (mut read, mut write) = tokio::io::split(socket);
     // Writes wait for the program at the other end; they run in their own
     // task so reading goes on meanwhile. Credit goes back once written.
     // Each write carries the worker's bytes it stands for: the same
@@ -1692,7 +1808,7 @@ mod tests {
         wait(&|v| first(v).is_some_and(|f| f.open == 1));
         assert!(sent.lock().unwrap().iter().any(|m| matches!(
             m,
-            Message::ForwardOpen { connection: 1, target: Some((h, 5432)), .. } if h == "db"
+            Message::ForwardOpen { connection: 1, target: Some(ForwardTarget::Tcp(h, 5432)), .. } if h == "db"
         )));
         fwd.remove_spec(1, spec, false);
         wait(&|v| v.first().is_some_and(|c| c.forwards.is_empty()));
@@ -1785,7 +1901,7 @@ mod tests {
                 .unwrap()
                 .iter()
                 .any(|m| {
-                    matches!(m, Message::ForwardOpen { target: Some((h, 6432)), .. } if h == "db")
+                    matches!(m, Message::ForwardOpen { target: Some(ForwardTarget::Tcp(h, 6432)), .. } if h == "db")
                 })
                 .then_some(())
         });
@@ -1881,7 +1997,7 @@ mod tests {
             sent.lock().unwrap().iter().find_map(|m| match m {
                 Message::ForwardOpen {
                     channel,
-                    target: Some((h, p)),
+                    target: Some(ForwardTarget::Tcp(h, p)),
                     ..
                 } if h == "localhost" && *p == port => Some(*channel),
                 _ => None,
@@ -1996,6 +2112,7 @@ mod tests {
             x11: true,
             origin_host: "h".into(),
             origin_port: 1,
+            target: None,
         });
     }
 
@@ -2120,6 +2237,7 @@ mod tests {
             x11: true,
             origin_host: "h".into(),
             origin_port: 1,
+            target: None,
         });
         // A real worker id for a connection without X11 is closed.
         fwd.sink()(Message::ForwardIncoming {
@@ -2128,6 +2246,7 @@ mod tests {
             x11: true,
             origin_host: "h".into(),
             origin_port: 1,
+            target: None,
         });
         wait_for(|| {
             sent.lock()
@@ -2144,6 +2263,88 @@ mod tests {
             == Message::Close {
                 channel: FORWARD_IDS
             }));
+    }
+
+    /// The worker's id for a remote forward's listener, from what it sent.
+    fn remote_listener(sent: &Mutex<Vec<Message>>) -> (ChannelId, bool) {
+        wait_for(|| {
+            sent.lock().unwrap().iter().find_map(|m| match m {
+                Message::RemoteForward { channel, socks, .. } => Some((*channel, *socks)),
+                _ => None,
+            })
+        })
+    }
+
+    fn incoming_to(
+        fwd: &Forwarder,
+        channel: ChannelId,
+        listener: ChannelId,
+        target: Option<(&str, u16)>,
+    ) {
+        fwd.sink()(Message::ForwardIncoming {
+            channel,
+            listener,
+            x11: false,
+            origin_host: "127.0.0.1".into(),
+            origin_port: 40000,
+            target: target.map(|(h, p)| (h.to_owned(), p)),
+        });
+    }
+
+    #[test]
+    fn remote_socks_connects_only_where_a_plain_target_was_asked() {
+        let target = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = target.local_addr().unwrap().port();
+        let (fwd, sent) = engine();
+        fwd.start(
+            1,
+            "me@box".into(),
+            Setup {
+                forwards: vec![spec("-R 1080")],
+                ..Setup::default()
+            },
+        );
+        let (listener, socks) = remote_listener(&sent);
+        assert!(socks, "the worker must read SOCKS for -R 1080");
+        // Junk for a host, and no target at all: closed unconnected.
+        incoming_to(&fwd, WORKER_IDS, listener, Some(("bad host", port)));
+        incoming_to(&fwd, WORKER_IDS + 1, listener, None);
+        incoming_to(&fwd, WORKER_IDS + 2, listener, Some(("127.0.0.1", 0)));
+        for c in [WORKER_IDS, WORKER_IDS + 1, WORKER_IDS + 2] {
+            closed(&sent, c);
+        }
+        // A plain one connects, and the worker hears so.
+        incoming_to(&fwd, WORKER_IDS + 3, listener, Some(("127.0.0.1", port)));
+        let _accepted = target.accept().unwrap();
+        wait_for(|| {
+            sent.lock()
+                .unwrap()
+                .contains(&Message::ForwardConnected {
+                    channel: WORKER_IDS + 3,
+                })
+                .then_some(())
+        });
+        assert!(!sent.lock().unwrap().iter().any(|m| matches!(
+            m,
+            Message::ForwardConnected { channel } if *channel != WORKER_IDS + 3
+        )));
+    }
+
+    #[test]
+    fn a_remote_forward_with_a_target_ignores_one_the_worker_names() {
+        let (fwd, sent) = engine();
+        fwd.start(
+            1,
+            "me@box".into(),
+            Setup {
+                forwards: vec![spec("-R 9000:localhost:3000")],
+                ..Setup::default()
+            },
+        );
+        let (listener, socks) = remote_listener(&sent);
+        assert!(!socks);
+        incoming_to(&fwd, WORKER_IDS, listener, Some(("evil.example", 22)));
+        closed(&sent, WORKER_IDS);
     }
 
     #[test]
@@ -2211,12 +2412,12 @@ mod tests {
             panic!("{view:?}");
         };
         assert!(f.desktop);
-        assert_eq!(f.spec.target, Some(("localhost".into(), 3390)));
+        assert_eq!(f.spec.target, Some(Target::Tcp("localhost".into(), 3390)));
         // A connection to the tunnel goes to the server's RDP port.
         let _c = std::net::TcpStream::connect(at).unwrap();
         wait_for(|| {
             sent.lock().unwrap().iter().any(|m| {
-                matches!(m, Message::ForwardOpen { channel: c, target: Some((_, 3390)), .. } if *c != channel)
+                matches!(m, Message::ForwardOpen { channel: c, target: Some(ForwardTarget::Tcp(_, 3390)), .. } if *c != channel)
             }).then_some(())
         });
         // Asking again probes again and reuses the tunnel.

@@ -535,6 +535,8 @@ mod cmd {
     pub const FULL_SCREEN_KEY: u32 = 219;
     /// Tools > Known hosts.
     pub const KNOWN_HOSTS: u32 = 220;
+    /// Settings > Font ligatures.
+    pub const FONT_LIGATURES: u32 = 221;
     /// Settings > Server status bar.
     pub const STATUS_BAR: u32 = 230;
     /// Settings > Key bindings.
@@ -3191,6 +3193,7 @@ fn build_menu() -> Result<HMENU> {
         item(view, cmd::ZOOM_RESET, "&Reset text size\tCtrl+0")?;
         separator(view)?;
         AppendMenuW(view, MF_POPUP, fonts.0 as usize, w!("&Font (this pane)"))?;
+        item(view, cmd::FONT_LIGATURES, "Font li&gatures (-> != ===)")?;
         AppendMenuW(view, MF_POPUP, themes.0 as usize, w!("&Theme (this pane)"))?;
         // Filled from the themes folder each time it opens (`fill_custom_themes`).
         let custom = CreatePopupMenu()?;
@@ -11795,6 +11798,7 @@ impl Window {
                 cursor: p.cursor,
                 full,
                 image: p.image(),
+                ligatures: self.settings.font_ligatures,
             });
         }
         // Port-forward previews, over their panes' top right corner.
@@ -11811,6 +11815,7 @@ impl Window {
                 cursor: None,
                 full: true,
                 image: None,
+                ligatures: false,
             });
         }
         if let Some(s) = self.areas.strip {
@@ -11823,6 +11828,7 @@ impl Window {
                 cursor: None,
                 full: true,
                 image: None,
+                ligatures: false,
             });
         }
         if let Some(s) = self.areas.status {
@@ -11835,6 +11841,7 @@ impl Window {
                 cursor: None,
                 full: true,
                 image: None,
+                ligatures: false,
             });
         }
         if let Some(s) = self.areas.side {
@@ -11847,6 +11854,7 @@ impl Window {
                 cursor: None,
                 full,
                 image: None,
+                ligatures: false,
             });
         }
         let result = self.renderer.draw(&views, &fills, self.dpi);
@@ -13565,7 +13573,7 @@ impl Window {
             return None;
         }
         let url = pv.url;
-        let target = (url.target().to_owned(), url.port);
+        let target = ferossh_config::forward::Target::Tcp(url.target().to_owned(), url.port);
         let view = self.forward_view();
         if !view.iter().any(|v| v.connection == pv.connection) {
             return Some(Command::Notice(format!(
@@ -13574,9 +13582,12 @@ impl Window {
             )));
         }
         // A forward that already goes there serves.
-        if let Some(f) = forwards_of(&view, pv.connection)
-            .find(|f| f.spec.kind == ForwardKind::Local && f.spec.target.as_ref() == Some(&target))
-        {
+        if let Some(f) = forwards_of(&view, pv.connection).find(|f| {
+            // A socket listener has no address a browser could open.
+            f.spec.kind == ForwardKind::Local
+                && f.spec.socket.is_none()
+                && f.spec.target.as_ref() == Some(&target)
+        }) {
             match &f.state {
                 FwdState::Listening(addrs) => {
                     return url
@@ -13605,6 +13616,7 @@ impl Window {
             kind: ForwardKind::Local,
             bind: Some("127.0.0.1".into()),
             port: local,
+            socket: None,
             target: Some(target),
         };
         let w = self.workers.get(&pv.connection)?;
@@ -16759,6 +16771,12 @@ impl Window {
                 self.save_settings();
                 self.update_menu_checks();
             }
+            cmd::FONT_LIGATURES => {
+                self.settings.font_ligatures = !self.settings.font_ligatures;
+                self.save_settings();
+                self.update_menu_checks();
+                self.request_full_redraw();
+            }
             cmd::COPY => return Some(Command::Copy),
             cmd::PASTE => return Some(Command::Paste),
             cmd::RECORD_SNIPPET => return self.toggle_recording(),
@@ -18098,6 +18116,7 @@ impl Window {
                 (cmd::WORKSPACE_RESTORE, s.restore_layout),
                 (cmd::FULL_SCREEN, self.full_screen.is_some()),
                 (cmd::FULL_SCREEN_KEY, s.full_screen_key),
+                (cmd::FONT_LIGATURES, s.font_ligatures),
                 (cmd::TMUX_KEYS, s.tmux_keys),
                 (cmd::RECORD_SNIPPET, self.recording.is_some()),
                 (
@@ -19809,16 +19828,17 @@ fn menu_key_labels(menu: HMENU, text: &dyn Fn(u32) -> MenuText) {
 }
 
 /// The text of the item at `pos` of `menu`, also while it is owner-drawn
-/// in our colours (Windows may then report none).
+/// by us: then the recorded name, which is what the menu shows (Windows
+/// may report none, or an older one).
 fn menu_text(menu: HMENU, pos: u32) -> String {
+    if let Some(kept) = ui_theme::owned_text(menu, pos).filter(|t| !t.is_empty()) {
+        return kept;
+    }
     let mut buf = [0u16; 256];
     // SAFETY: our menu, a position in it and a local buffer.
     let len = unsafe { GetMenuStringW(menu, pos, Some(&mut buf), MF_BYPOSITION) };
     let len = usize::try_from(len).unwrap_or(0).min(buf.len());
-    match ui_theme::owned_text(menu, pos) {
-        Some(kept) if len == 0 => kept,
-        _ => String::from_utf16_lossy(buf.get(..len).unwrap_or_default()),
-    }
+    String::from_utf16_lossy(buf.get(..len).unwrap_or_default())
 }
 
 /// The command palette's actions: every item of `menu` and its submenus

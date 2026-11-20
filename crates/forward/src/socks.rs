@@ -88,10 +88,22 @@ fn until_nul(b: &[u8], from: usize) -> Option<(&[u8], usize)> {
 /// A host name a client may ask for: printable ASCII without spaces, so
 /// that it cannot smuggle anything into the server's request or a log.
 fn host_name(bytes: &[u8]) -> Option<String> {
-    if bytes.is_empty() || bytes.len() > 255 || !bytes.iter().all(|b| b.is_ascii_graphic()) {
+    if !valid_host_bytes(bytes) {
         return None;
     }
     String::from_utf8(bytes.to_vec()).ok()
+}
+
+fn valid_host_bytes(bytes: &[u8]) -> bool {
+    !bytes.is_empty() && bytes.len() <= 255 && bytes.iter().all(|b| b.is_ascii_graphic())
+}
+
+/// Whether `host` is a target [`Handshake`] could have named: what the
+/// UI checks again before it connects where a SOCKS client on the server
+/// asked, since the worker that read the request may have been taken
+/// over.
+pub fn valid_host(host: &str) -> bool {
+    valid_host_bytes(host.as_bytes())
 }
 
 fn v4_reply(ok: bool) -> Vec<u8> {
