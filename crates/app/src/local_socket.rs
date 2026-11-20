@@ -85,6 +85,11 @@ fn remove_stale(path: &str) {
     let Ok(probe) = Socket::new(Domain::UNIX, Type::STREAM, None) else {
         return;
     };
+    // Non-blocking: a live listener with a full backlog must not hold up
+    // the forwarding thread. Only a refusal says nothing listens.
+    if probe.set_nonblocking(true).is_err() {
+        return;
+    }
     if matches!(probe.connect(&addr), Err(e) if e.kind() == io::ErrorKind::ConnectionRefused) {
         let _ = std::fs::remove_file(path);
     }
@@ -100,14 +105,47 @@ pub fn bind(path: &str) -> io::Result<Socket> {
     Ok(socket)
 }
 
+/// What tells one file from another at the same path: device and inode
+/// on Unix, the creation time on Windows.
+fn file_id(path: &str) -> Option<(u64, u64)> {
+    let meta = std::fs::symlink_metadata(path).ok()?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        Some((meta.dev(), meta.ino()))
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        Some((meta.creation_time(), 0))
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = meta;
+        None
+    }
+}
+
 /// Removes the socket file of a listener when dropped, as the listener's
-/// task is when its forward stops.
-pub struct Unlink(pub String);
+/// task is when its forward stops: only the file it made, never one
+/// something else put at that path since.
+pub struct Unlink {
+    path: String,
+    id: Option<(u64, u64)>,
+}
+
+impl Unlink {
+    /// For the socket just bound at `path`.
+    pub fn new(path: String) -> Self {
+        let id = file_id(&path);
+        Self { path, id }
+    }
+}
 
 impl Drop for Unlink {
     fn drop(&mut self) {
-        if is_socket_file(&self.0) {
-            let _ = std::fs::remove_file(&self.0);
+        if self.id.is_some() && file_id(&self.path) == self.id && is_socket_file(&self.path) {
+            let _ = std::fs::remove_file(&self.path);
         }
     }
 }
@@ -126,16 +164,36 @@ pub async fn accept(listener: &Socket) -> io::Result<BoxSock> {
     }
 }
 
-/// Connects to the socket at `path`.
+/// Whether a `connect` error means the connection is under way (or the
+/// listener's backlog is full, on Linux): try again shortly.
+fn connect_pending(e: &io::Error) -> bool {
+    // EALREADY and EINPROGRESS on Linux, WSAEALREADY and WSAEINPROGRESS
+    // on Windows.
+    e.kind() == io::ErrorKind::WouldBlock
+        || e.kind() == io::ErrorKind::Interrupted
+        || matches!(e.raw_os_error(), Some(114 | 115 | 10036 | 10037))
+}
+
+/// Whether a `connect` error means an earlier attempt already connected:
+/// EISCONN on Linux, WSAEISCONN on Windows.
+fn already_connected(e: &io::Error) -> bool {
+    matches!(e.raw_os_error(), Some(106 | 10056))
+}
+
+/// Connects to the socket at `path`. Non-blocking all the way, so a
+/// caller's timeout drops the socket and nothing is left waiting.
 pub async fn connect(path: &str) -> io::Result<BoxSock> {
     let addr = SockAddr::unix(path)?;
-    let socket = tokio::task::spawn_blocking(move || {
-        let socket = Socket::new(Domain::UNIX, Type::STREAM, None)?;
-        socket.connect(&addr)?;
-        Ok::<_, io::Error>(socket)
-    })
-    .await
-    .map_err(io::Error::other)??;
+    let socket = Socket::new(Domain::UNIX, Type::STREAM, None)?;
+    socket.set_nonblocking(true)?;
+    loop {
+        match socket.connect(&addr) {
+            Ok(()) => break,
+            Err(e) if already_connected(&e) => break,
+            Err(e) if connect_pending(&e) => tokio::time::sleep(ACCEPT_POLL).await,
+            Err(e) => return Err(e),
+        }
+    }
     into_tokio(socket)
 }
 
@@ -169,7 +227,7 @@ mod tests {
     async fn listens_accepts_connects_and_cleans_up() {
         let path = temp_path("roundtrip");
         let listener = bind(&path).unwrap();
-        let unlink = Unlink(path.clone());
+        let unlink = Unlink::new(path.clone());
         let server = async {
             let mut s = accept(&listener).await.unwrap();
             let mut buf = [0u8; 5];
@@ -211,5 +269,29 @@ mod tests {
     fn relative_paths_are_refused() {
         assert!(check_path("/tmp/x.sock").is_ok());
         assert!(check_path("x/y.sock").is_err());
+    }
+
+    #[test]
+    fn a_socket_put_in_its_place_is_left_alone() {
+        let path = temp_path("replaced");
+        let first = bind(&path).unwrap();
+        let unlink = Unlink::new(path.clone());
+        drop(first);
+        // Moved away, not removed, so its inode is not reused.
+        let aside = format!("{path}.old");
+        std::fs::rename(&path, &aside).unwrap();
+        let second = bind(&path).unwrap();
+        drop(unlink);
+        assert!(is_socket_file(&path), "the replacement was removed");
+        drop(second);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(&aside);
+    }
+
+    #[tokio::test]
+    async fn connecting_where_nothing_listens_fails() {
+        let path = temp_path("nobody");
+        let _ = std::fs::remove_file(&path);
+        assert!(connect(&path).await.is_err());
     }
 }

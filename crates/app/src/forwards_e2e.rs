@@ -764,7 +764,11 @@ fn remote_socks_and_unix_socket_forwards() {
         s.set_read_timeout(Some(Duration::from_secs(20))).unwrap();
         s.write_all(b"GET / HTTP/1.0\r\n\r\n").unwrap();
         let mut rest = Vec::new();
-        let _ = s.read_to_end(&mut rest);
+        match s.read_to_end(&mut rest) {
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::ConnectionReset => {}
+            Err(e) => panic!("the connection stayed open: {e}"),
+        }
         assert!(rest.is_empty(), "{rest:?}");
 
         // A socket here to a port there, a port here to a socket there.

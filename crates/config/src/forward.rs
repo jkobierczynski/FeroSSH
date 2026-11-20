@@ -256,7 +256,8 @@ fn from_fields(kind: ForwardKind, f: &[String]) -> Option<ForwardSpec> {
         [b, p] => (Some(bind_field(b)?), port(p)?, None),
         _ => return None,
     };
-    if socket.is_some() && kind == ForwardKind::Dynamic {
+    // A dynamic forward goes where each SOCKS client asks: no target.
+    if kind == ForwardKind::Dynamic && (socket.is_some() || target.is_some()) {
         return None;
     }
     // A local listener on port 0 would move every time: refuse it, as ssh
@@ -554,6 +555,7 @@ mod tests {
         let long = format!("/{}", "a".repeat(MAX_SOCKET_PATH));
         assert_eq!(parse_option(&format!("-L 80:{long}")), None);
         assert_eq!(parse_option("-D /tmp/s"), None);
+        assert_eq!(parse_option("-D 1080:/tmp/s"), None);
         assert_eq!(parse_option("-R /tmp/s"), None);
     }
 

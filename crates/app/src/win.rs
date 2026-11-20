@@ -13251,9 +13251,12 @@ impl Window {
             )));
         }
         // A forward that already goes there serves.
-        if let Some(f) = forwards_of(&view, pv.connection)
-            .find(|f| f.spec.kind == ForwardKind::Local && f.spec.target.as_ref() == Some(&target))
-        {
+        if let Some(f) = forwards_of(&view, pv.connection).find(|f| {
+            // A socket listener has no address a browser could open.
+            f.spec.kind == ForwardKind::Local
+                && f.spec.socket.is_none()
+                && f.spec.target.as_ref() == Some(&target)
+        }) {
             match &f.state {
                 FwdState::Listening(addrs) => {
                     return url

@@ -1569,7 +1569,7 @@ async fn listen_socket(path: String, owner: Owner, events: UnboundedSender<Inter
         }
     };
     // Dropped when the forward stops, which aborts this task.
-    let _unlink = local_socket::Unlink(path.clone());
+    let _unlink = local_socket::Unlink::new(path.clone());
     let _ = events.send(Internal::Listening {
         owner,
         addrs: path.clone(),
