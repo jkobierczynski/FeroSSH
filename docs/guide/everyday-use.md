@@ -224,7 +224,7 @@ A security rule limits every connection with a tag, in a folder, or matching a h
 
 The OS and kernel columns are filled for SSH connections that ask for it: **Inventory** in the connection form's Extras, `SystemInfo yes` in the profile, or **Change a field** > **Inventory: OS and kernel** for many. After each login FeroSSH then runs one fixed, read-only command on a channel of its own (`uname -sr`, then `/etc/os-release`, or `sw_vers` on macOS) and keeps the OS name and kernel; nothing is typed into your shell. A login to a server without `sh`, such as Windows, reads nothing new: the columns stay empty, or keep what an earlier login read.
 
-The inventory is kept on this PC only, in `inventory.conf` in `%LOCALAPPDATA%\FeroSSH` (in the data folder when FeroSSH is portable). Only connections in the connection manager are kept, not hosts typed at Connect to...; a renamed connection keeps its row and a deleted one loses it.
+The inventory is kept on this PC only, in `inventory.conf` in `%LOCALAPPDATA%\FeroSSH` (in the data folder when FeroSSH is portable). Only connections in the connection manager are kept, not hosts typed at Connect to...; Telnet and WinRM connections are listed, but only SSH logins are recorded, so their last-connected column stays empty; a renamed connection keeps its row and a deleted one loses it.
 
 ### Importing from other clients
 

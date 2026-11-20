@@ -103,6 +103,8 @@ struct State {
     /// What the line above the buttons says: the summary, or where Save
     /// CSV wrote.
     status: String,
+    /// Where the summary line ends: just above the buttons (see `place`).
+    status_bottom: i32,
     /// Where Save CSV writes.
     save_dir: PathBuf,
 }
@@ -211,8 +213,8 @@ pub fn create(main: HWND, handler: Handler, dpi: u32) -> windows::core::Result<(
             );
         }
         let buttons = [
-            child(WC_BUTTONW, w!("C&onnect"), BS_PUSHBUTTON as u32, ID_CONNECT)?,
-            child(WC_BUTTONW, w!("Save &CSV"), BS_PUSHBUTTON as u32, ID_CSV)?,
+            child(WC_BUTTONW, w!("Connect"), BS_PUSHBUTTON as u32, ID_CONNECT)?,
+            child(WC_BUTTONW, w!("Save CSV"), BS_PUSHBUTTON as u32, ID_CSV)?,
             child(WC_BUTTONW, w!("Reload"), BS_PUSHBUTTON as u32, ID_RELOAD)?,
         ];
         let (font, title_font) = fonts(dpi);
@@ -237,6 +239,7 @@ pub fn create(main: HWND, handler: Handler, dpi: u32) -> windows::core::Result<(
                 sort: Column::Name,
                 descending: false,
                 status: String::new(),
+                status_bottom: 0,
                 save_dir: PathBuf::new(),
             });
         });
@@ -302,18 +305,32 @@ pub fn place(at: Option<Rect>, width: i32, dpi: u32) {
     let status = scale(STATUS_DIP, dpi);
     let inner = (width - 2 * pad).max(0);
     let list_y = title + field + gap;
-    let buttons_y = (at.h - pad - button).max(list_y);
+    // The buttons in a row, wrapped onto more rows when the tool is too
+    // narrow for one.
+    let mut spots = Vec::with_capacity(BUTTONS.len());
+    let (mut x, mut row) = (pad, 0);
+    for w in BUTTONS {
+        let w = scale(w, dpi);
+        if x > pad && x + w > pad + inner {
+            row += 1;
+            x = pad;
+        }
+        spots.push((x, row, w));
+        x += w + gap;
+    }
+    let rows = row + 1;
+    let block = rows * button + (rows - 1) * gap;
+    let buttons_y = (at.h - pad - block).max(list_y);
     let list_h = (buttons_y - gap - status - list_y).max(0);
+    with(|s| s.status_bottom = buttons_y - gap);
     // SAFETY: moving our own windows.
     unsafe {
         let _ = MoveWindow(h.panel, at.x, at.y, at.w, at.h, true);
         let _ = MoveWindow(h.search, pad, title, inner, field, true);
         let _ = MoveWindow(h.list, pad, list_y, inner, list_h, true);
-        let mut x = pad;
-        for (b, w) in h.buttons.iter().zip(BUTTONS) {
-            let w = scale(w, dpi);
-            let _ = MoveWindow(*b, x, buttons_y, w, button, true);
-            x += w + gap;
+        for (b, (x, row, w)) in h.buttons.iter().zip(spots) {
+            let y = buttons_y + row * (button + gap);
+            let _ = MoveWindow(*b, x, y, w, button, true);
         }
         let _ = ShowWindow(h.panel, SW_SHOWNA);
     }
@@ -401,6 +418,20 @@ fn focus_list() {
 /// A time as the list shows it: local date and time.
 fn local(secs: u64) -> String {
     crate::files_panel::when(i64::try_from(secs).ok())
+}
+
+/// Shows `text` on the line above the buttons until the list is filled
+/// again (a file that could not be read).
+pub fn set_status(text: String) {
+    if let Some(h) = with(|s| {
+        s.status = text;
+        s.h
+    }) {
+        // SAFETY: our own window.
+        unsafe {
+            let _ = InvalidateRect(Some(h.panel), None, false);
+        }
+    }
 }
 
 fn set_state(list: HWND, index: usize) {
@@ -703,11 +734,17 @@ fn notify(h: Handles, lparam: LPARAM) -> LRESULT {
 }
 
 fn paint(h: Handles) {
-    let Some((title_font, font, dpi, total, status)) = STATE.with(|s| {
-        s.try_borrow()
-            .ok()?
-            .as_ref()
-            .map(|s| (s.title_font, s.font, s.dpi, s.rows.len(), s.status.clone()))
+    let Some((title_font, font, dpi, total, status, bottom)) = STATE.with(|s| {
+        s.try_borrow().ok()?.as_ref().map(|s| {
+            (
+                s.title_font,
+                s.font,
+                s.dpi,
+                s.rows.len(),
+                s.status.clone(),
+                s.status_bottom,
+            )
+        })
     }) else {
         return;
     };
@@ -751,7 +788,6 @@ fn paint(h: Handles) {
         }
         if !status.is_empty() {
             // Between the list and the buttons (see `place`).
-            let bottom = rc.bottom - scale(8 + 28 + 6, dpi);
             let mut sr = RECT {
                 left: pad,
                 top: bottom - scale(STATUS_DIP, dpi),

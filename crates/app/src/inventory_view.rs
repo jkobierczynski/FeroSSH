@@ -17,15 +17,10 @@ fn store_path() -> Option<std::path::PathBuf> {
     Some(crate::portable::local_dir()?.join("inventory.conf"))
 }
 
-/// The inventory as kept; empty when there is none yet, or when it cannot
-/// be read (for showing only: [`update`] never writes over such a file).
-pub fn load() -> Inventory {
-    read().unwrap_or_default()
-}
-
 /// The inventory as kept: empty when there is no file yet, an error when
-/// there is one that cannot be read.
-fn read() -> std::io::Result<Inventory> {
+/// there is one that cannot be read ([`update`] never writes over such a
+/// file either).
+pub fn read() -> std::io::Result<Inventory> {
     let Some(path) = store_path() else {
         return Ok(Inventory::default());
     };

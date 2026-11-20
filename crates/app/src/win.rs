@@ -12155,8 +12155,16 @@ impl Window {
     /// Reads the inventory and the connections again for Tools >
     /// Inventory, and shows them.
     fn reload_inventory(&mut self) {
+        // A file that cannot be read leaves what the list showed, and
+        // says why: a reload never blanks the login history.
+        let inventory = match crate::inventory_view::read() {
+            Ok(inventory) => inventory,
+            Err(e) => {
+                inventory_panel::set_status(format!("Could not read the inventory: {e}"));
+                return;
+            }
+        };
         let items = host_items(&ssh_env(), &self.settings);
-        let inventory = crate::inventory_view::load();
         let rows = crate::inventory_view::rows(&items, &inventory, &self.settings);
         inventory_panel::set_rows(rows, self.download_dir());
     }
@@ -12453,6 +12461,7 @@ impl Window {
             || self.files_visible()
             || self.fwd_native()
             || self.known_hosts_native()
+            || self.inventory_native()
             || self.scripts_native()
             || self.script_editor_native()
             || self.script_args_native()
@@ -13852,7 +13861,7 @@ impl Window {
         // event needs the window, so the paste comes after this borrow);
         // the list has nowhere to paste into, and the terminal behind must
         // not get it either.
-        if self.known_hosts_paste() {
+        if self.known_hosts_paste() || self.inventory_paste() {
             return true;
         }
         if !(self.side.visible && self.side.focused && self.side.view == SideView::Snippets) {
