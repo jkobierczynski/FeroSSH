@@ -14523,7 +14523,10 @@ impl Window {
             Some(FormAction::Cancel) => self.side.form = None,
             Some(FormAction::Save { connect }) => {
                 // Checked against the credentials as they are now, not as
-                // they were when the form opened.
+                // they were when the form opened: another PC's changes to
+                // a shared vault taken in first, before either file is
+                // written (the save merges again and keeps what is ours).
+                vault_ui::sync_settings(&mut self.settings);
                 let credentials = self.settings.credentials.clone();
                 if !self.side.form.as_mut()?.recheck_with(&credentials) {
                     self.refresh_chrome();
