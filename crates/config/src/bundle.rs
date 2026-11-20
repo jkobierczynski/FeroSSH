@@ -556,18 +556,12 @@ pub fn merge_logins3(
         if has(&credentials, name) {
             continue;
         }
-        if let Some((_, new)) = renames
-            .iter()
-            .find(|(o, n)| o.eq_ignore_ascii_case(name) && has(&credentials, n))
-        {
-            p.credential = Some(new.clone());
-            continue;
-        }
-        // The credential is gone from the merge and was not renamed: the
-        // field merges on its own, as the profile does (the side that
-        // left it as in base takes the other's), and one that still
-        // names a missing credential falls back to the connection's own
-        // login rather than a credential neither side gave it.
+        // The credential is gone from the merge. First the field merges
+        // on its own, as the profile does (a side that left it as in base
+        // takes the other's): a side that took it off or picked another
+        // is followed. Only a name still missing then follows a rename,
+        // and one with none falls back to the connection's own login,
+        // never a credential neither side gave it.
         let field = |list: &[crate::Profile]| {
             list.iter()
                 .find(|q| q.host.eq_ignore_ascii_case(&p.host))
@@ -578,14 +572,15 @@ pub fn merge_logins3(
             field(&ours.profiles),
             field(&theirs.profiles),
         );
-        let merged = if o == b {
-            t
-        } else if t == b {
-            o
-        } else {
-            None
+        let merged = if o == b { t } else { o };
+        p.credential = match merged {
+            Some(n) if has(&credentials, &n) => Some(n),
+            Some(n) => renames
+                .iter()
+                .find(|(old, new)| old.eq_ignore_ascii_case(&n) && has(&credentials, new))
+                .map(|(_, new)| new.clone()),
+            None => None,
         };
-        p.credential = merged.filter(|n| has(&credentials, n));
     }
     (profiles, credentials)
 }
@@ -794,6 +789,42 @@ mod tests {
         // db: credential as they left it (none), font size as we did.
         assert_eq!(get("db").credential, None);
         assert_eq!(get("db").font_size, Some(12.0));
+    }
+
+    #[test]
+    fn a_new_credential_on_the_other_pc_is_not_a_rename_for_a_profile_taken_off() {
+        let base = Settings::parse(
+            "Credential ops\n    User o\nProfile web\n    Credential ops\nProfile db\n    \
+             Credential ops\n    FontSize 10\n",
+        );
+        // Here: only db's font size changed.
+        let ours = Settings::parse(
+            "Credential ops\n    User o\nProfile web\n    Credential ops\nProfile db\n    \
+             Credential ops\n    FontSize 12\n",
+        );
+        // There: ops removed, a new lab made for web, db taken off.
+        let theirs = Settings::parse(
+            "Credential lab\n    User l\nProfile web\n    Credential lab\nProfile db\n    \
+             FontSize 10\n",
+        );
+        let (profiles, _) = merge_logins3(&base, &ours, &theirs);
+        let get = |h: &str| profiles.iter().find(|p| p.host == h).unwrap();
+        assert_eq!(get("web").credential.as_deref(), Some("lab"));
+        assert_eq!(get("db").credential, None);
+        assert_eq!(get("db").font_size, Some(12.0));
+        // A profile only we made, naming ops: follows the rename to lab.
+        let ours = Settings::parse(
+            "Credential ops\n    User o\nProfile web\n    Credential ops\nProfile db\n    \
+             Credential ops\n    FontSize 10\nProfile new\n    Credential ops\n",
+        );
+        let theirs = Settings::parse(
+            "Credential lab\n    User o\nProfile web\n    Credential lab\nProfile db\n    \
+             Credential lab\n    FontSize 10\n",
+        );
+        let (profiles, _) = merge_logins3(&base, &ours, &theirs);
+        let get = |h: &str| profiles.iter().find(|p| p.host == h).unwrap();
+        assert_eq!(get("new").credential.as_deref(), Some("lab"));
+        assert_eq!(get("db").credential.as_deref(), Some("lab"));
     }
 
     #[test]
