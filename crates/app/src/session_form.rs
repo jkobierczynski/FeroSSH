@@ -48,6 +48,8 @@ pub struct Hints {
 pub struct Values {
     pub name: String,
     pub folder: String,
+    /// The connection's own tags, separated by spaces or commas.
+    pub tags: String,
     pub kind: SessionKind,
     pub host: String,
     pub user: String,
@@ -216,6 +218,7 @@ impl Values {
             return self;
         };
         self.kind = p.kind;
+        self.tags = p.tags.join(" ");
         self.via = p.via.clone().unwrap_or_default();
         self.theme = p.theme.clone().unwrap_or_default();
         self.font = p.font.clone().unwrap_or_default();
@@ -269,6 +272,7 @@ impl Values {
 enum Field {
     Name,
     Folder,
+    Tags,
     Type,
     Host,
     User,
@@ -319,6 +323,7 @@ impl Field {
         match self {
             Field::Name => "Name",
             Field::Folder => "Folder",
+            Field::Tags => "Tags",
             Field::Type => "Type",
             Field::Host => "Host",
             Field::User => "User",
@@ -600,7 +605,7 @@ impl SessionForm {
                     out.push(Item::Note(format!("Saves a copy; {file} stays.")));
                 }
             }
-            out.extend([Field::Folder, Field::Type].map(Item::Field));
+            out.extend([Field::Folder, Field::Tags, Field::Type].map(Item::Field));
             // A virtual desktop or remote app runs on its Via SSH host:
             // no address.
             if !matches!(kind, SessionKind::Xvfb | SessionKind::RemoteApp) {
@@ -843,6 +848,7 @@ impl SessionForm {
         Some(match f {
             Field::Name => &v.name,
             Field::Folder => &v.folder,
+            Field::Tags => &v.tags,
             Field::Host => &v.host,
             Field::User => &v.user,
             Field::Port => &v.port,
@@ -896,6 +902,7 @@ impl SessionForm {
         Some(match f {
             Field::Name => &mut v.name,
             Field::Folder => &mut v.folder,
+            Field::Tags => &mut v.tags,
             Field::Host => &mut v.host,
             Field::User => &mut v.user,
             Field::Port => &mut v.port,
@@ -1177,6 +1184,7 @@ impl SessionForm {
         match f {
             Field::Name => "required, e.g. web-prod".into(),
             Field::Folder => "none".into(),
+            Field::Tags => "none, or e.g. prod web eu".into(),
             Field::Host if v.kind == SessionKind::Serial => "COM port, e.g. COM3".into(),
             Field::Host
                 if !matches!(
@@ -1580,6 +1588,7 @@ impl SessionForm {
         {
             return Err("tmux session names use letters, digits, . _ and - only.".into());
         }
+        ferossh_config::settings::parse_tags(&v.tags)?;
         if v.start_dir.contains('"') || v.start_dir.chars().any(char::is_control) {
             return Err("The start directory cannot hold \" or control characters.".into());
         }
@@ -2139,6 +2148,7 @@ impl SessionForm {
                 SessionKind::Rdp | SessionKind::Vnc | SessionKind::Xvfb | SessionKind::RemoteApp
             )
         });
+        p.tags = ferossh_config::settings::parse_tags(&v.tags).unwrap_or_default();
         p.theme = trimmed(&v.theme);
         p.font = trimmed(&v.font);
         p.font_size = v.font_size.trim().parse().ok();
@@ -2400,19 +2410,19 @@ mod tests {
         assert_eq!(t[1], " ▾ Connection");
         assert!(t[2].starts_with(" Name        ▏required"), "{:?}", t[2]);
         assert!(
-            t[6].contains("User") && t[6].contains("jurgen"),
+            t[7].contains("User") && t[7].contains("jurgen"),
             "{:?}",
-            t[6]
+            t[7]
         );
-        assert!(t[7].contains("22"));
-        assert!(t[8].contains("default keys and agent"));
-        assert_eq!(t[9].trim(), "Browse…");
-        assert!(t[10].contains("ask every time"));
-        assert!(t[11].contains("Jump host") && t[11].contains("none, or e.g. bastion"));
-        assert!(t[12].contains("Proxy") && t[12].contains("socks5://"));
-        assert_eq!(t[13], " ▸ Look");
-        assert_eq!(t[14], " ▸ Extras");
-        assert!(t[15].contains("Save") && t[15].contains("Connect") && !t[15].contains("Delete"));
+        assert!(t[8].contains("22"));
+        assert!(t[9].contains("default keys and agent"));
+        assert_eq!(t[10].trim(), "Browse…");
+        assert!(t[11].contains("ask every time"));
+        assert!(t[12].contains("Jump host") && t[12].contains("none, or e.g. bastion"));
+        assert!(t[13].contains("Proxy") && t[13].contains("socks5://"));
+        assert_eq!(t[14], " ▸ Look");
+        assert_eq!(t[15], " ▸ Extras");
+        assert!(t[16].contains("Save") && t[16].contains("Connect") && !t[16].contains("Delete"));
 
         assert_eq!(f.key(SideKey::Enter { split: false }, 30), None);
         assert!(
@@ -2421,9 +2431,9 @@ mod tests {
                 .any(|l| l.contains("Give the connection a name"))
         );
         typed(&mut f, "db");
-        down(&mut f, 3);
+        down(&mut f, 4);
         typed(&mut f, "10.0.0.5");
-        assert!(texts(&mut f)[5].contains("10.0.0.5▏"));
+        assert!(texts(&mut f)[6].contains("10.0.0.5▏"));
         assert_eq!(
             f.key(SideKey::Enter { split: true }, 30),
             Some(FormAction::Save { connect: true })
@@ -2638,33 +2648,33 @@ mod tests {
     fn desktop_sessions_have_no_terminal_sections() {
         let mut f = new_form();
         typed(&mut f, "office");
-        down(&mut f, 2);
+        down(&mut f, 3);
         f.key(SideKey::Right, 30);
         let t = texts(&mut f);
-        assert!(t[4].contains("‹ Remote desktop (RDP) ›"), "{:?}", t[4]);
-        assert!(t[7].contains("3389"));
-        assert!(t[8].contains("Via SSH") && t[8].contains("connect directly"));
+        assert!(t[5].contains("‹ Remote desktop (RDP) ›"), "{:?}", t[5]);
+        assert!(t[8].contains("3389"));
+        assert!(t[9].contains("Via SSH") && t[9].contains("connect directly"));
         assert!(!t.iter().any(|l| l.contains("Look") || l.contains("Extras")));
         f.key(SideKey::Char(' '), 30);
-        assert!(texts(&mut f)[6].contains("asked by the server"));
+        assert!(texts(&mut f)[7].contains("asked by the server"));
     }
 
     #[test]
     fn serial_sessions_save_the_port_and_line() {
         let mut f = new_form();
         typed(&mut f, "core");
-        down(&mut f, 2);
+        down(&mut f, 3);
         // Type: SSH -> RDP -> VNC -> Telnet -> Serial.
         f.key(SideKey::Left, 30);
         let t = texts(&mut f);
-        assert!(t[4].contains("‹ Serial console ›"), "{:?}", t[4]);
+        assert!(t[5].contains("‹ Serial console ›"), "{:?}", t[5]);
         assert!(
-            t[5].contains("COM port") && t[5].contains("e.g. COM3"),
+            t[6].contains("COM port") && t[6].contains("e.g. COM3"),
             "{:?}",
-            t[5]
+            t[6]
         );
-        assert!(t[6].contains("Speed") && t[6].contains("9600"));
-        assert!(t[7].contains("8N1") && t[8].contains("none"));
+        assert!(t[7].contains("Speed") && t[7].contains("9600"));
+        assert!(t[8].contains("8N1") && t[9].contains("none"));
         assert!(
             !t.iter()
                 .any(|l| l.contains("User") || l.contains("Forward"))
@@ -2702,13 +2712,13 @@ mod tests {
     fn telnet_sessions_save_a_host_and_port_and_warn() {
         let mut f = new_form();
         typed(&mut f, "router");
-        down(&mut f, 2);
+        down(&mut f, 3);
         // Type: SSH -> Serial -> Telnet, going back.
         f.key(SideKey::Left, 30);
         f.key(SideKey::Left, 30);
         let t = texts(&mut f);
-        assert!(t[4].contains("‹ Telnet (unencrypted) ›"), "{:?}", t[4]);
-        assert!(t[6].contains("Port") && t[6].contains("23"), "{:?}", t[6]);
+        assert!(t[5].contains("‹ Telnet (unencrypted) ›"), "{:?}", t[5]);
+        assert!(t[7].contains("Port") && t[7].contains("23"), "{:?}", t[7]);
         assert!(t.iter().any(|l| l.contains("Unencrypted")));
         assert!(!t.iter().any(|l| l.contains("User")));
         // Look, and Extras for the login script.
@@ -2739,14 +2749,14 @@ mod tests {
     fn winrm_sessions_save_a_host_user_port_and_command() {
         let mut f = new_form();
         typed(&mut f, "win-srv");
-        down(&mut f, 2);
+        down(&mut f, 3);
         // Type: SSH -> Serial -> Telnet -> WinRM, going back.
         for _ in 0..3 {
             f.key(SideKey::Left, 30);
         }
         assert_eq!(f.values.kind, SessionKind::WinRm);
         let t = texts(&mut f);
-        assert!(t[4].contains("‹ WinRM (PowerShell, cmd) ›"), "{:?}", t[4]);
+        assert!(t[5].contains("‹ WinRM (PowerShell, cmd) ›"), "{:?}", t[5]);
         assert!(t.iter().any(|l| l.contains("Port") && l.contains("5985")));
         assert!(
             t.iter()
@@ -2829,7 +2839,7 @@ mod tests {
     fn mosh_sessions_log_in_like_ssh_without_tmux() {
         let mut f = new_form();
         typed(&mut f, "laptop");
-        down(&mut f, 2);
+        down(&mut f, 3);
         // Type: SSH -> Serial -> Telnet -> WinRM -> tunnels -> SFTP -> Mosh,
         // going back.
         for _ in 0..6 {
@@ -2837,7 +2847,7 @@ mod tests {
         }
         assert_eq!(f.values.kind, SessionKind::Mosh);
         let t = texts(&mut f);
-        assert!(t[4].contains("‹ Mosh terminal (SSH + UDP) ›"), "{:?}", t[4]);
+        assert!(t[5].contains("‹ Mosh terminal (SSH + UDP) ›"), "{:?}", t[5]);
         assert!(t.iter().any(|l| l.contains("Key file")));
         assert!(
             t.iter()
@@ -2888,7 +2898,7 @@ mod tests {
     fn tunnel_sessions_hold_forwards_without_a_shell() {
         let mut f = new_form();
         typed(&mut f, "db-tunnel");
-        down(&mut f, 2);
+        down(&mut f, 3);
         // Type: SSH -> Serial -> Telnet -> WinRM -> tunnels, going back.
         for _ in 0..4 {
             f.key(SideKey::Left, 30);
@@ -2896,9 +2906,9 @@ mod tests {
         assert_eq!(f.values.kind, SessionKind::Tunnel);
         let t = texts(&mut f);
         assert!(
-            t[4].contains("‹ SSH tunnels only (no shell) ›"),
+            t[5].contains("‹ SSH tunnels only (no shell) ›"),
             "{:?}",
-            t[4]
+            t[5]
         );
         assert!(t.iter().any(|l| l.contains("ssh -N")));
         let rows = f.native_rows();
@@ -2930,7 +2940,7 @@ mod tests {
     fn sftp_sessions_log_in_without_a_terminal() {
         let mut f = new_form();
         typed(&mut f, "uploads");
-        down(&mut f, 2);
+        down(&mut f, 3);
         // Type: SSH -> Serial -> Telnet -> WinRM -> tunnels -> SFTP, going
         // back.
         for _ in 0..5 {
@@ -2938,7 +2948,7 @@ mod tests {
         }
         assert_eq!(f.values.kind, SessionKind::Sftp);
         let t = texts(&mut f);
-        assert!(t[4].contains("‹ SFTP file transfer only ›"), "{:?}", t[4]);
+        assert!(t[5].contains("‹ SFTP file transfer only ›"), "{:?}", t[5]);
         assert!(t.iter().any(|l| l.contains("Key file")));
         assert!(t.iter().any(|l| l.contains("opens File transfer")));
         let rows = f.native_rows();
@@ -2972,9 +2982,9 @@ mod tests {
     fn forwards_grow_a_new_line() {
         let mut f = new_form();
         typed(&mut f, "web2");
-        // Open Extras: Name, Folder, Type, Host, User, Port, Key, Browse,
+        // Open Extras: Name, Folder, Tags, Type, Host, User, Port, Key, Browse,
         // Password, Jump host, Proxy, Look, Extras.
-        down(&mut f, 12);
+        down(&mut f, 13);
         f.key(SideKey::Enter { split: false }, 30);
         // tmux, tmux panes, Start dir, Local folder, Remote folder.
         down(&mut f, 6);
@@ -3005,7 +3015,7 @@ mod tests {
     fn login_steps_are_checked_and_saved_in_the_profile() {
         let mut f = new_form();
         typed(&mut f, "sw1");
-        down(&mut f, 12);
+        down(&mut f, 13);
         f.key(SideKey::Enter { split: false }, 30);
         // tmux, tmux panes, Start dir, Local folder, Remote folder,
         // Forward 1, RDP port, VNC port, Virtual desk, Desk size, Desk
@@ -3040,6 +3050,34 @@ mod tests {
         );
         let v = Values::from_saved(&hosts[0]).with_profile(Some(p));
         assert_eq!(v.login_script, ["expect >", "secret enable"]);
+    }
+
+    #[test]
+    fn tags_are_checked_saved_and_read_back() {
+        let mut f = new_form();
+        f.values = Values {
+            name: "tagged".into(),
+            host: "web.example".into(),
+            tags: "#prod, web  Prod eu".into(),
+            forwards: vec![String::new()],
+            ..Values::default()
+        };
+        assert!(f.items().contains(&Item::Field(Field::Tags)));
+        assert_eq!(f.check(), Ok(()));
+        let mut hosts = Vec::new();
+        let mut settings = Settings::default();
+        f.apply(&mut hosts, &mut settings);
+        assert_eq!(
+            settings.profile("tagged").unwrap().tags,
+            ["prod", "web", "eu"]
+        );
+        let again = Settings::parse(&settings.to_text());
+        assert_eq!(
+            Values::default().with_profile(again.profile("tagged")).tags,
+            "prod web eu"
+        );
+        f.values.tags = "ok not\"ok".into();
+        assert!(f.check().unwrap_err().contains("cannot be a tag"));
     }
 
     #[test]
@@ -3098,9 +3136,9 @@ mod tests {
     fn tmux_is_switched_on_and_off_not_typed() {
         let mut f = new_form();
         typed(&mut f, "web2");
-        // Open Extras: Name, Folder, Type, Host, User, Port, Key, Browse,
+        // Open Extras: Name, Folder, Tags, Type, Host, User, Port, Key, Browse,
         // Password, Jump host, Proxy, Look, Extras.
-        down(&mut f, 12);
+        down(&mut f, 13);
         f.key(SideKey::Enter { split: false }, 30);
         f.key(SideKey::Down, 30);
         assert_eq!(f.focused_field(), Some(Field::Tmux));
@@ -3152,8 +3190,8 @@ mod tests {
         );
         let t = texts(&mut f);
         assert!(t[3].contains("From ~/.ssh/config: read-only."));
-        // Folder, host, user, port cannot change.
-        down(&mut f, 3);
+        // Folder, host, user, port cannot change; tags can, past them.
+        down(&mut f, 4);
         assert_eq!(f.focused_field(), Some(Field::Host));
         typed(&mut f, "x");
         assert_eq!(f.values.host, "web.example.org");
@@ -3180,7 +3218,7 @@ mod tests {
         f.key(SideKey::End, 30);
         typed(&mut f, "-copy");
         assert!(texts(&mut f)[3].contains("Saves a copy"));
-        down(&mut f, 3);
+        down(&mut f, 4);
         f.key(SideKey::End, 30);
         f.key(SideKey::Backspace, 30);
         typed(&mut f, "g.lan");
@@ -3319,16 +3357,16 @@ mod tests {
     fn password_sources_offer_templates() {
         let mut f = new_form();
         typed(&mut f, "web3");
-        // Name, Folder, Type, Host, User, Port, Key, Browse, Password.
-        down(&mut f, 8);
+        // Name, Folder, Tags, Type, Host, User, Port, Key, Browse, Password.
+        down(&mut f, 9);
         assert_eq!(f.focused_field(), Some(Field::Password));
-        assert!(texts(&mut f)[10].contains("‹ ask every time ›"));
+        assert!(texts(&mut f)[11].contains("‹ ask every time ›"));
         f.key(SideKey::Right, 30);
         let t = texts(&mut f);
-        assert!(t[10].contains("Windows Credential Manager"));
-        assert!(t[11].contains("Saved after a login that works."));
+        assert!(t[11].contains("Windows Credential Manager"));
+        assert!(t[12].contains("Saved after a login that works."));
         f.key(SideKey::Right, 30);
-        assert!(texts(&mut f)[10].contains("1Password"));
+        assert!(texts(&mut f)[11].contains("1Password"));
         assert_eq!(f.values.password_command, TEMPLATES[0].command);
         let mut settings = Settings::default();
         assert_eq!(f.check(), Ok(()));

@@ -2055,7 +2055,12 @@ fn host_items(env: &Env, settings: &Settings) -> Vec<HostItem> {
                 // As connect() resolves it: the saved user and port.
                 let own = saved.iter().find(|s| s.alias.eq_ignore_ascii_case(&h.name));
                 let https = settings.profile(&h.name).is_some_and(|p| p.winrm_https);
-                let detail = WinrmTarget::resolve(&h.name, env, None, https, own)
+                let target = WinrmTarget::resolve(&h.name, env, None, https, own);
+                let tags = ferossh_config::settings::host_tags(
+                    target.as_ref().and_then(|t| t.tag.as_deref()),
+                    settings.profile(&h.name),
+                );
+                let detail = target
                     .map(|t| {
                         let mut d = match &t.user {
                             Some(u) => format!("{u}@{}", t.hostname),
@@ -2075,9 +2080,15 @@ fn host_items(env: &Env, settings: &Settings) -> Vec<HostItem> {
                     folder: h.folder,
                     detail,
                     kind,
+                    tags,
                 };
             }
-            let detail = Target::resolve(&h.name, env)
+            let target = Target::resolve(&h.name, env);
+            let tags = ferossh_config::settings::host_tags(
+                target.as_ref().and_then(|t| t.tag.as_deref()),
+                settings.profile(&h.name),
+            );
+            let detail = target
                 .map(|t| {
                     let mut d = format!("{}@{}", t.user, t.hostname);
                     if t.port != 22 {
@@ -2095,6 +2106,7 @@ fn host_items(env: &Env, settings: &Settings) -> Vec<HostItem> {
                 folder: h.folder,
                 detail,
                 kind,
+                tags,
             }
         })
         .collect()
@@ -12895,7 +12907,7 @@ impl Window {
         entries.extend(
             host_items(&env, &self.settings)
                 .iter()
-                .map(|h| palette::Entry::session(&h.name, &h.detail, h.kind)),
+                .map(|h| palette::Entry::session(&h.name, &h.detail_with_tags(), h.kind)),
         );
         let place = self.place(self.focused_id()).map(|p| p.0);
         entries.extend(
@@ -13273,6 +13285,7 @@ impl Window {
             .into_iter()
             .filter(|h| h.kind == SessionKind::Ssh)
             .map(|h| {
+                let detail = h.detail_with_tags();
                 let host = Target::resolve(&h.name, &env)
                     .map(|t| t.hostname)
                     .unwrap_or_default();
@@ -13284,7 +13297,7 @@ impl Window {
                 let picked = !snippet.everywhere() && snippet.applies(Some(&place));
                 PickHost {
                     place,
-                    detail: h.detail,
+                    detail,
                     picked,
                 }
             })

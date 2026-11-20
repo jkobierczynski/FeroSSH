@@ -1,6 +1,6 @@
 //! How a pane connected to a host looks: its session profile first, then
-//! the colour theme rules (host patterns and ssh_config `Tag`), then the
-//! defaults.
+//! the colour theme rules (host patterns, ssh_config `Tag` and the
+//! connection's own `Tags`), then the defaults.
 
 use ferossh_config::Settings;
 use ferossh_render::{FontSpec, Rgb, Theme};
@@ -25,7 +25,8 @@ pub fn for_host(
             .and_then(|p| p.font_size)
             .unwrap_or(default_font.size_pt),
     );
-    let tags: Vec<&str> = tag.into_iter().collect();
+    let all = ferossh_config::settings::host_tags(tag, profile);
+    let tags: Vec<&str> = all.iter().map(String::as_str).collect();
     let rules = settings.host_themes();
     let theme = profile
         .and_then(|p| p.theme.as_deref())
@@ -95,5 +96,27 @@ Profile db
             &Theme::default(),
         );
         assert_eq!(t.name, "Production");
+    }
+
+    #[test]
+    fn the_connections_own_tags_pick_a_theme() {
+        let s = Settings::parse("Profile box\n    Tags web prod\n");
+        let theme = |tag| {
+            for_host(
+                &s,
+                "box",
+                "10.0.0.9",
+                tag,
+                &FontSpec::default(),
+                &Theme::default(),
+            )
+            .1
+        };
+        assert_eq!(theme(None).name, "Production");
+        assert_eq!(
+            theme(Some("staging")).name,
+            "Production",
+            "the first rule matching any tag wins, as with Tag alone"
+        );
     }
 }
