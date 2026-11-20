@@ -923,7 +923,7 @@ impl Tmux {
         }
         let access = match access {
             Access::Stopped => "Stopped sharing: tmux confirms no other account may connect \
-                                to your shared tmux server. FeroSSH also set its socket back \
+                                to your shared tmux server. FeroSSH also tried to set its socket back \
                                 to private (tmux does not say whether that worked; the access \
                                 list is what keeps others out)."
                 .to_owned(),
