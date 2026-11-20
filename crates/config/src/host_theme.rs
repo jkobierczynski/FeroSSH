@@ -51,7 +51,12 @@ impl ThemeRule {
         let by_tag = self
             .tags
             .iter()
-            .any(|p| tags.iter().any(|t| match_pattern(t, p)));
+            // Case folded in any alphabet, as tags are compared
+            // elsewhere (`settings::same_tag`); host patterns stay ASCII.
+            .any(|p| {
+                let p = p.to_lowercase();
+                tags.iter().any(|t| match_pattern(&t.to_lowercase(), &p))
+            });
         by_tag || match_host(host, self.hosts.iter().map(String::as_str))
     }
 }
@@ -102,6 +107,13 @@ mod tests {
 
     fn theme<'a>(t: &'a HostThemes, host: &str, tags: &[&str]) -> Option<&'a str> {
         t.rule_for(host, tags).map(|r| r.theme.as_str())
+    }
+
+    #[test]
+    fn tags_match_whatever_their_case_in_any_alphabet() {
+        let mut t = HostThemes::new();
+        t.push(ThemeRule::new("Dracula").tags(&["équipe*"]));
+        assert_eq!(theme(&t, "box", &["ÉQUIPE-1"]), Some("Dracula"));
     }
 
     #[test]
