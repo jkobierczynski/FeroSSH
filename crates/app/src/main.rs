@@ -57,6 +57,8 @@ mod keygen_view;
 #[cfg(windows)]
 mod keys_view;
 #[cfg(windows)]
+mod known_hosts_panel;
+#[cfg(windows)]
 mod live_panel;
 #[cfg(windows)]
 mod native;
@@ -84,6 +86,8 @@ mod custom_theme;
 #[cfg_attr(not(windows), allow(dead_code))]
 mod diff;
 #[cfg_attr(not(windows), allow(dead_code))]
+mod dns_servers;
+#[cfg_attr(not(windows), allow(dead_code))]
 mod drag_out;
 #[cfg_attr(not(windows), allow(dead_code))]
 mod edit_local;
@@ -107,6 +111,8 @@ mod import_reg;
 mod import_view;
 #[cfg_attr(not(windows), allow(dead_code))]
 mod keymap;
+#[cfg_attr(not(windows), allow(dead_code))]
+mod known_hosts_view;
 #[cfg_attr(not(windows), allow(dead_code))]
 mod layout;
 #[cfg_attr(not(windows), allow(dead_code))]

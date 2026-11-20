@@ -5,12 +5,14 @@
 //! The first line also goes to the `sftp://` address parser. None may
 //! panic or blow up, a key known_hosts trusts is never also revoked, and
 //! an `sftp://` address yields a destination that parses and an absolute
-//! folder without control characters.
+//! folder without control characters. The known hosts manager's listing
+//! keeps each line's text and agrees with the lookup: a listed host key
+//! line for the host with this key means the key is trusted (or revoked).
 
 #![no_main]
 
 use ferossh_config::hostkey;
-use ferossh_config::known_hosts::{KnownHosts, Status};
+use ferossh_config::known_hosts::{self, KnownHosts, LineKind, Status};
 use ferossh_config::ssh_config::{self, Includes};
 use libfuzzer_sys::fuzz_target;
 
@@ -51,6 +53,14 @@ fuzz_target!(|data: &[u8]| {
         assert!(!kh.is_revoked(key));
     }
     let _ = kh.key_types(host, port);
+    let lines: Vec<&str> = text.lines().collect();
+    for l in known_hosts::list(&text) {
+        assert_eq!(lines.get(l.line - 1).copied(), Some(l.text.as_str()));
+        let _ = hostkey::describe(&l.key);
+        if l.kind == LineKind::HostKey && l.key == key && l.matches_host(host, port) {
+            assert!(matches!(status, Status::Trusted | Status::Revoked));
+        }
+    }
     let _ = kh.is_authority_for(host, port, key);
     let _ = hostkey::describe(key);
     let _ = hostkey::describe_certificate(key);

@@ -14,6 +14,7 @@
 
 mod agent;
 pub mod crypto_policy;
+pub mod dns;
 mod exec;
 mod forward;
 mod mosh;
@@ -248,6 +249,7 @@ pub async fn serve(mut inbox: mpsc::Receiver<Message>, out: mpsc::Sender<Message
                 family,
                 gssapi,
                 proxy,
+                sshfp,
             } => {
                 // The tunnel's stream first: the UI may send its bytes
                 // right behind this message.
@@ -283,6 +285,7 @@ pub async fn serve(mut inbox: mpsc::Receiver<Message>, out: mpsc::Sender<Message
                     family,
                     gssapi,
                     proxy,
+                    sshfp,
                 };
                 guard.track(tokio::spawn(session::run(
                     channel,
