@@ -1039,7 +1039,7 @@ fn set_back(menu: HMENU, brush: HBRUSH) {
 /// draws `menu` in our colours while they are on, or gives an owned menu
 /// back to Windows when they are off.
 pub fn own_popup(menu: HMENU) {
-    let on = custom();
+    let custom = custom();
     // Menus since destroyed (context menus) are forgotten.
     OWN.with(|own| {
         if let Ok(mut own) = own.try_borrow_mut() {
@@ -1058,8 +1058,11 @@ pub fn own_popup(menu: HMENU) {
         let at = own.iter().rposition(|m| m.menu == menu)?;
         Some(own.remove(at))
     });
-    // With the colours off, an owner-drawn item without a record (it
-    // should not happen, but nothing would draw it) is still given back.
+    // A menu drawn in our colours once stays ours, drawn in the colours
+    // in use (Windows' light ones too): giving owner-drawn items back to
+    // Windows loses their names on some systems. A menu never drawn by us
+    // stays Windows' own while the colours are off.
+    let on = custom || old.is_some() || has_owner_drawn(menu);
     let mut items = Vec::new();
     let mut column = 0;
     let mut failed = false;
@@ -1219,6 +1222,23 @@ pub fn own_popup(menu: HMENU) {
                 own.insert(0, old);
             }
         });
+    }
+}
+
+/// Whether any item of `menu` is owner-drawn.
+fn has_owner_drawn(menu: HMENU) -> bool {
+    // SAFETY: a menu Windows is opening; a sized struct for each item.
+    unsafe {
+        let count = GetMenuItemCount(Some(menu)).max(0) as u32;
+        (0..count).any(|pos| {
+            let mut mii = MENUITEMINFOW {
+                cbSize: size_of::<MENUITEMINFOW>() as u32,
+                fMask: MIIM_FTYPE,
+                ..Default::default()
+            };
+            GetMenuItemInfoW(menu, pos, true, &mut mii).is_ok()
+                && mii.fType.0 & MFT_OWNERDRAW.0 != 0
+        })
     }
 }
 
@@ -1448,7 +1468,19 @@ fn draw_own_item(hwnd: HWND, dis: &DRAWITEMSTRUCT, item: &mut DrawnItem) {
             FillRect(dc, rect, b);
             let _ = DeleteObject(HGDIOBJ(b.0));
         };
-        fill(&r, if lit { c.hot } else { c.bar });
+        // Windows' light look marks the item under the mouse with a light
+        // grey, not with its (blue) highlight colour.
+        let hot = if c.custom {
+            c.hot
+        } else {
+            let mix = |a: u8, b: u8| ((u16::from(a) * 9 + u16::from(b)) / 10) as u8;
+            Rgb::new(
+                mix(c.bar.r, c.text.r),
+                mix(c.bar.g, c.text.g),
+                mix(c.bar.b, c.text.b),
+            )
+        };
+        fill(&r, if lit { hot } else { c.bar });
         if item.column > 0 {
             // The line between the columns.
             fill(
