@@ -44,6 +44,10 @@ A remote forward without a target (`-R 1080`, SOCKS on the server) lets any prog
 
 Showing pictures the host prints (Session > Show images the host prints) is off by default, because every picture is host data to decode. When it is on, Sixel, kitty graphics and PNG data are decoded by FeroSSH's own decoders in a crate that forbids `unsafe` code, with every size checked before anything is allocated (8192 pixels a side, 4 million pixels, 24 MB encoded, 64 MB kept per terminal), and two fuzz targets run on them in CI. The kitty protocol's file, temporary-file and shared-memory transmissions are refused, so a host can never make FeroSSH read a file on your PC, and iTerm2 file downloads are ignored. Replies to the host are fixed status strings with the host's numeric ids.
 
+## Shared tmux sessions
+
+Sharing a tmux session with another account gives that account a connection to your tmux server. tmux 3.3 added an access list, so only the accounts you name can connect, but up to tmux 3.8 a read-only account can still send commands through control mode (`tmux -C`), including typing into your panes and `run-shell`, which runs as you. tmux's own source fixed this after 3.8. So FeroSSH shares watch-only with other accounts only on tmux 3.9 and later; on older tmux it shares only when you choose to let them type, and the dialog says that this lets them run commands as you. Sharing with your own account adds nothing anyone logged in as you could not already do. The shared server's socket lives in `/tmp/ferossh-share-ACCOUNT`, which FeroSSH checks is a real directory owned by that account with mode 0711 before starting or joining, so nobody can plant a server of their own there. Stop sharing takes everyone else off the list and makes the socket private again.
+
 ## Telnet
 
 Telnet sends everything in the clear, passwords included. FeroSSH offers it only for old gear that has nothing better: the pane says so when it connects and the tab carries a red **⚠ telnet** badge. The Telnet connection runs in a sandboxed worker like SSH, agrees to only a handful of options, and never sends your user name or environment.

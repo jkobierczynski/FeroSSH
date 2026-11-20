@@ -106,9 +106,25 @@ fn tmux_available() -> bool {
 
 impl Harness {
     fn attach(server: &Server, preferred: Mode) -> Self {
+        Self::start(
+            server,
+            preferred,
+            &["new-session", "-A", "-s", "e2e", "-x", "80", "-y", "24"],
+            |_| {},
+        )
+    }
+
+    /// A control client running tmux command `args`; `prep` is done to
+    /// the controller first (what was typed before tmux started).
+    fn start(
+        server: &Server,
+        preferred: Mode,
+        args: &[&str],
+        prep: impl FnOnce(&mut Tmux),
+    ) -> Self {
         let mut child = tmux()
             .args(["-L", &server.socket, "-f", "/dev/null", "-C"])
-            .args(["new-session", "-A", "-s", "e2e", "-x", "80", "-y", "24"])
+            .args(args)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
@@ -139,6 +155,7 @@ impl Harness {
             notices: Vec::new(),
             crowded: Vec::new(),
         };
+        prep(&mut h.tmux);
         // What `tmux -CC` writes before its first line.
         let actions = h.tmux.feed(&mut h.ws, b"\x1bP1000p");
         h.apply(actions);
@@ -889,4 +906,77 @@ fn real_tmux_agent_start_line_makes_the_session_then_adds_to_it() {
         }
         assert!(shown(&screen), "{screen}");
     }
+}
+
+#[test]
+fn real_tmux_watcher_sees_but_changes_nothing() {
+    // attach-session -f arrived in tmux 3.2.
+    if !tmux_available() || version() < WINDOW_SIZES_VERSION {
+        return;
+    }
+    let server = Server {
+        socket: format!("ferossh-e2e-watch-{}", std::process::id()),
+    };
+    let mut owner = Harness::attach(&server, Mode::Ferossh);
+    owner.until("the owner's pane", |h| !h.panes.is_empty());
+    owner.sizes(|_| (100, 30));
+    owner.until("the owner's size", |h| {
+        h.panes.values().all(|p| p.0 == (100, 30))
+    });
+
+    // What Join a shared session types, for this account's own tmux.
+    let mut watcher = Harness::start(
+        &server,
+        Mode::Ferossh,
+        &[
+            "attach-session",
+            "-f",
+            "read-only,ignore-size",
+            "-t",
+            "=e2e",
+        ],
+        |t| {
+            let typed = t.join(None, Some("e2e"), false);
+            assert!(matches!(&typed[..], [Action::Write(_)]));
+        },
+    );
+    watcher.until("the watcher's pane", |h| !h.panes.is_empty());
+    assert_eq!(watcher.tmux.joined(), Some(false));
+    // The watcher sees the owner's size and output, and its own size
+    // changes nothing.
+    assert!(watcher.panes.values().all(|p| p.0 == (100, 30)));
+    watcher.sizes(|_| (60, 20));
+    let owner_pane = *owner.panes.keys().next().unwrap();
+    let typed = owner.tmux.input(owner_pane, b"echo shared-$((6*7))\r");
+    owner.apply(typed);
+    watcher.until("the owner's output", |h| {
+        h.panes.keys().any(|n| h.text(*n).contains("shared-42"))
+    });
+    let watcher_pane = *watcher.panes.keys().next().unwrap();
+    let typed = watcher.tmux.input(watcher_pane, b"echo nope-$((6*7))\r");
+    assert!(!typed.iter().any(|a| matches!(a, Action::Write(_))));
+    watcher.apply(typed);
+    let flags = tmux_cmd(&server, &["list-clients", "-F", "#{client_readonly}"]);
+    let mut flags: Vec<&str> = flags.lines().collect();
+    flags.sort_unstable();
+    assert_eq!(flags, ["0", "1"]);
+    // Closing the watcher's pane leaves; the owner's window stays, at
+    // the owner's size.
+    let actions = watcher.tmux.close(watcher_pane);
+    watcher.apply(actions);
+    watcher.until("the watcher to leave", |h| !h.tmux.active());
+    let windows = tmux_cmd(
+        &server,
+        &[
+            "list-windows",
+            "-t",
+            "e2e",
+            "-F",
+            "#{window_width}x#{window_height}",
+        ],
+    );
+    assert_eq!(windows, "100x30");
+    let screen = tmux_cmd(&server, &["capture-pane", "-p", "-t", "e2e"]);
+    assert!(!screen.contains("nope-42"), "{screen}");
+    assert!(screen.contains("shared-42"), "{screen}");
 }

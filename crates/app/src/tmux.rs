@@ -137,6 +137,9 @@ pub enum Action {
     Picker(Vec<String>),
     /// Tell the user, in the gateway pane.
     Notice(String),
+    /// Tell the user in a message box: the gateway is hidden while
+    /// attached.
+    Tell(String),
     /// These panes, made before their window was known to run a coding
     /// agent, turn out to be one's: watch them as agent panes now.
     AgentMarked(Vec<Native>),
@@ -208,8 +211,37 @@ enum Tag {
     OwnClient(SessionId),
     /// The clients of session `.0` to detach, all but ours (`.1`).
     DetachOthers(SessionId, String),
+    /// The server's socket, before opening it to the accounts asked for.
+    ShareSocket(Share),
+    /// Access given to account `.0`: an error is told.
+    ShareAdd(String),
+    /// The server's socket, before stopping sharing.
+    UnshareSocket,
+    /// Who may connect, to take everyone else off.
+    ShareList,
+    /// The session's read-only clients, to detach when sharing stops.
+    Watchers(SessionId),
     /// The reply does not matter.
     Ignore,
+}
+
+/// The first tmux with an access list (`server-access`): older ones let
+/// anyone who can open the socket in.
+pub const ACCESS_LIST_VERSION: Version = Version { major: 3, minor: 3 };
+
+/// The first tmux that keeps a read-only account read-only in control
+/// mode too. Before it, a read-only client running `tmux -C` can still
+/// type into panes and run commands as the server's owner (`run-shell`),
+/// so read-only access for another account would be a promise tmux
+/// does not keep.
+pub const READ_ONLY_VERSION: Version = Version { major: 3, minor: 9 };
+
+/// Sharing asked for: the accounts that may join, and whether they may
+/// type.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Share {
+    pub accounts: Vec<String>,
+    pub can_type: bool,
 }
 
 /// A pane's terminal state, from [`PANE_FORMAT`].
@@ -444,6 +476,24 @@ pub struct Tmux {
     agent_seq: u32,
     /// The windows that run a coding agent, by [`AGENT_OPTION`].
     agents: BTreeMap<WindowId, String>,
+    /// Set while this client watches (`false`) or joins to type
+    /// (`true`) someone's session: FeroSSH then changes nothing of
+    /// theirs (layout, sizes, windows, options) and closing leaves.
+    joined: Option<bool>,
+    /// [`Tmux::join`] typed its line: the next control mode is joined.
+    join_pending: Option<bool>,
+    /// "Read-only" was told once this attach.
+    told_read_only: bool,
+    /// Joining was told once this attach (not again on session switches).
+    told_joined: bool,
+    /// [`Tmux::share`] typed its line: open the next control mode's
+    /// server to these accounts once its version is known.
+    share_pending: Option<Share>,
+    /// Typed at the shell once control mode has ended (share or join
+    /// asked for while attached).
+    after_detach: Option<Vec<u8>>,
+    /// Told once the session is read (how others join it).
+    notice_after_attach: Option<String>,
 }
 
 /// A window's size and its session's client count, for [`Tag::SizeCheck`].
@@ -552,6 +602,13 @@ impl Tmux {
             agents_waiting: BTreeMap::new(),
             agent_seq: 0,
             agents: BTreeMap::new(),
+            joined: None,
+            join_pending: None,
+            told_read_only: false,
+            told_joined: false,
+            share_pending: None,
+            after_detach: None,
+            notice_after_attach: None,
         }
     }
 
@@ -602,7 +659,151 @@ impl Tmux {
     /// other sessions are offered once attached when `pick` is set.
     pub fn attach(&mut self, name: &str, pick: bool) -> Vec<u8> {
         self.pick_after_attach = pick;
+        self.join_pending = None;
+        self.share_pending = None;
         command::attach_line(name).into_bytes()
+    }
+
+    /// Whether this client watches (`Some(false)`) or joined to type
+    /// (`Some(true)`) someone else's session.
+    pub fn joined(&self) -> Option<bool> {
+        self.joined.filter(|_| self.client.is_control())
+    }
+
+    /// Bytes to type at the gateway's shell now, or once control mode
+    /// has ended when attached (detaching first).
+    fn type_line(&mut self, line: String) -> Vec<Action> {
+        let mut out = Vec::new();
+        if self.client.is_control() {
+            self.after_detach = Some(line.into_bytes());
+            self.reattach = None;
+            self.send("detach-client", Tag::Ignore, &mut out);
+        } else {
+            out.push(Action::Write(line.into_bytes()));
+        }
+        out
+    }
+
+    /// Session > tmux > Join a shared session: watch (or, with
+    /// `can_type`, join to type) session `session` (tmux's most recent
+    /// for `None`, the others offered once attached) that account
+    /// `owner` shares, or of this account's own tmux for `None`. `owner`
+    /// must be a [`command::account_name`].
+    pub fn join(
+        &mut self,
+        owner: Option<&str>,
+        session: Option<&str>,
+        can_type: bool,
+    ) -> Vec<Action> {
+        self.pick_after_attach = session.is_none();
+        self.share_pending = None;
+        self.join_pending = Some(can_type);
+        self.type_line(command::join_line(owner, session, can_type))
+    }
+
+    /// Session > tmux > Share this session, for other accounts: session
+    /// `name` on this account's shared tmux server (started if needed),
+    /// open to `share.accounts` once tmux's version says it can keep the
+    /// promise.
+    pub fn share(&mut self, name: &str, share: Share) -> Vec<Action> {
+        self.pick_after_attach = false;
+        self.join_pending = None;
+        self.share_pending = Some(share);
+        self.type_line(command::share_line(name))
+    }
+
+    /// Session > tmux > Share this session, for this account only: the
+    /// session needs nothing changed, so say how to join it, now or once
+    /// attached.
+    pub fn share_same_account(&mut self, text: String) -> Vec<Action> {
+        if self.client.is_control() && !self.restoring {
+            vec![Action::Tell(text)]
+        } else {
+            self.notice_after_attach = Some(text);
+            Vec::new()
+        }
+    }
+
+    /// Session > tmux > Stop sharing: takes every other account off the
+    /// server's access list (which detaches them), makes its socket
+    /// private again, and detaches this session's read-only clients.
+    pub fn unshare(&mut self) -> Vec<Action> {
+        let mut out = Vec::new();
+        if !self.client.is_control() || self.joined.is_some() {
+            return out;
+        }
+        self.send(
+            "display-message -p '#{socket_path}'",
+            Tag::UnshareSocket,
+            &mut out,
+        );
+        if let Some((session, _)) = self.session {
+            self.send(
+                &format!("list-clients -t ${session} -F '#{{client_name}} #{{client_readonly}}'"),
+                Tag::Watchers(session),
+                &mut out,
+            );
+        }
+        out
+    }
+
+    /// Opens the shared server to `share.accounts`, once it is known to
+    /// be the shared server (`socket`) and its tmux keeps the promise.
+    fn open_share(&mut self, socket: &str, share: Share, out: &mut Vec<Action>) {
+        if !command::is_share_socket(socket) {
+            return;
+        }
+        let version = self.version;
+        let Some(v) = version.filter(|v| *v >= ACCESS_LIST_VERSION) else {
+            out.push(Action::Tell(format!(
+                "tmux {} cannot limit which accounts connect (tmux {ACCESS_LIST_VERSION}                  can), so this session stays private.",
+                version.map_or_else(|| "here".to_owned(), |v| v.to_string())
+            )));
+            return;
+        };
+        if !share.can_type && v < READ_ONLY_VERSION {
+            out.push(Action::Tell(format!(
+                "tmux {v} does not keep another account read-only: through tmux control                  mode it can still type and run commands as you (fixed in tmux                  {READ_ONLY_VERSION}). So this session stays private. Share it with \"Let                  them type\" only with someone you trust with your account."
+            )));
+            return;
+        }
+        let access = if share.can_type { "-w" } else { "-r" };
+        for account in &share.accounts {
+            let a = command::quote(account);
+            self.send(
+                &format!("server-access -a {a}"),
+                Tag::ShareAdd(account.clone()),
+                out,
+            );
+            self.send(&format!("server-access {access} {a}"), Tag::Ignore, out);
+        }
+        // tmux turns away every account not on the list, so the socket
+        // itself may be open now.
+        self.send(
+            &format!(
+                "run-shell {}",
+                command::quote(&format!("chmod 666 {socket}"))
+            ),
+            Tag::Ignore,
+            out,
+        );
+        let owner = socket
+            .strip_prefix(command::SHARE_DIR_PREFIX)
+            .and_then(|r| r.strip_suffix("/default"))
+            .unwrap_or_default();
+        let name = self.session_name().unwrap_or("main");
+        out.push(Action::Tell(format!(
+            "Sharing tmux session {name} with {} ({}). They join with Session > tmux > Join a \
+             shared session, shared by account {owner}, or: tmux -S {socket} attach{} -t {name}. \
+             Session > tmux > Stop sharing ends it.",
+            share.accounts.join(", "),
+            if share.can_type {
+                "they can type, and so run commands as you"
+            } else {
+                "watch only"
+            },
+            if share.can_type { "" } else { " -r" },
+        )));
     }
 
     fn send(&mut self, line: &str, tag: Tag, out: &mut Vec<Action>) {
@@ -620,6 +821,9 @@ impl Tmux {
                 Event::Started => {
                     self.session = None;
                     self.version = None;
+                    self.joined = self.join_pending.take();
+                    self.told_read_only = false;
+                    self.told_joined = false;
                 }
                 Event::Notify(n) => self.on_notification(ws, n, &mut out),
                 Event::ReplyStarted(tag) => self.on_reply_started(&tag),
@@ -635,8 +839,13 @@ impl Tmux {
     pub fn connection_lost(&mut self, ws: &mut Workspace) -> Vec<Action> {
         let mut out = Vec::new();
         if self.client.is_control() {
-            self.reattach = self.session.as_ref().map(|(_, n)| n.clone());
+            self.reattach = self
+                .session
+                .as_ref()
+                .filter(|_| self.joined.is_none())
+                .map(|(_, n)| n.clone());
             self.client.reset();
+            self.after_detach = None;
             self.teardown(ws, &mut out);
         }
         out
@@ -791,6 +1000,9 @@ impl Tmux {
                 Tag::Ignore,
                 &mut out,
             ),
+            None if self.joined().is_some() => {
+                self.refuse_joined(&mut out);
+            }
             None => self.send(
                 &format!(
                     "new-session -d{} -P -F '#{{session_name}}'",
@@ -839,7 +1051,82 @@ impl Tmux {
                 .unwrap_or_default()
         };
         match tag {
-            Tag::Version => self.version = ok.then(|| Version::parse(&first())).flatten(),
+            Tag::Version => {
+                self.version = ok.then(|| Version::parse(&first())).flatten();
+                if let Some(share) = self.share_pending.take() {
+                    self.send(
+                        "display-message -p '#{socket_path}'",
+                        Tag::ShareSocket(share),
+                        out,
+                    );
+                }
+            }
+            Tag::ShareSocket(share) => {
+                if ok {
+                    self.open_share(&first(), share, out);
+                }
+            }
+            Tag::ShareAdd(account) => {
+                let why = first();
+                if !ok && !why.contains("already added") {
+                    out.push(Action::Tell(format!(
+                        "tmux did not let {account} in: {why}"
+                    )));
+                }
+            }
+            Tag::UnshareSocket => {
+                let socket = first();
+                if ok && command::is_share_socket(&socket) {
+                    self.send("server-access -l", Tag::ShareList, out);
+                    self.send(
+                        &format!(
+                            "run-shell {}",
+                            command::quote(&format!("chmod 600 {socket}"))
+                        ),
+                        Tag::Ignore,
+                        out,
+                    );
+                }
+            }
+            Tag::ShareList => {
+                let mut gone = Vec::new();
+                for line in &lines {
+                    let text = String::from_utf8_lossy(line);
+                    let Some(account) = text
+                        .split_whitespace()
+                        .next()
+                        .and_then(command::account_name)
+                    else {
+                        continue;
+                    };
+                    // tmux refuses to take off the owner and root; the
+                    // owner's refusal is ignored.
+                    if account != "root" {
+                        gone.push(account);
+                    }
+                }
+                for account in &gone {
+                    let line = format!("server-access -d {}", command::quote(account));
+                    self.send(&line, Tag::Ignore, out);
+                }
+            }
+            Tag::Watchers(session) => {
+                if !ok || self.session.as_ref().map(|(s, _)| *s) != Some(session) {
+                    return;
+                }
+                for line in &lines {
+                    let text = String::from_utf8_lossy(line);
+                    if let Some(name) = text.trim().strip_suffix(" 1") {
+                        let line = format!("detach-client -t {}", command::quote(name));
+                        self.send(&line, Tag::Ignore, out);
+                    }
+                }
+                out.push(Action::Tell(
+                    "Stopped sharing: other accounts are off this tmux server and watchers \
+                     were detached."
+                        .into(),
+                ));
+            }
             Tag::ModeOption => self.mode_option = ok.then(first).filter(|m| !m.is_empty()),
             Tag::LayoutOption => {
                 self.saved = ok.then(|| Saved::parse(&first())).flatten();
@@ -1059,7 +1346,7 @@ impl Tmux {
                  layout, one font per window.",
                 self.version.unwrap_or(MIN_VERSION)
             )));
-        } else if stored.is_none() {
+        } else if stored.is_none() && self.joined.is_none() {
             let line = format!("set-option -q {} {}", saved::MODE_OPTION, self.mode.name());
             self.send(&line, Tag::Ignore, out);
         }
@@ -1183,6 +1470,23 @@ impl Tmux {
             out.push(Action::Focus {
                 native: ws.focused(),
             });
+        }
+        let name = self.session_name().unwrap_or_default().to_owned();
+        match self
+            .joined
+            .filter(|_| !std::mem::replace(&mut self.told_joined, true))
+        {
+            Some(false) => out.push(Action::Tell(format!(
+                "Watching tmux session {name} read-only. Session > tmux > Detach tmux leaves it."
+            ))),
+            Some(true) => out.push(Action::Tell(format!(
+                "Joined tmux session {name}: what you type goes to its owner's panes. Session > \
+                 tmux > Detach tmux leaves it."
+            ))),
+            None => {}
+        }
+        if let Some(text) = self.notice_after_attach.take() {
+            out.push(Action::Tell(text));
         }
         out.push(Action::Structure);
     }
@@ -1480,12 +1784,42 @@ impl Tmux {
         self.placements.clear();
         self.session = None;
         self.restoring = false;
+        self.joined = None;
         out.push(Action::Structure);
+        // A share or join asked for while attached: type it at the shell
+        // that is back now.
+        if let Some(line) = self.after_detach.take() {
+            out.push(Action::Write(line));
+        }
+    }
+
+    /// Refuses a change while watching or joined to someone's session:
+    /// `true` (and a notice) when it must not happen.
+    fn refuse_joined(&mut self, out: &mut Vec<Action>) -> bool {
+        if self.joined().is_none() {
+            return false;
+        }
+        out.push(Action::Tell(
+            "This is someone else's shared session: FeroSSH leaves its windows, panes and \
+             layout to them."
+                .into(),
+        ));
+        true
     }
 
     /// Typed or pasted bytes for a native pane.
     pub fn input(&mut self, native: Native, bytes: &[u8]) -> Vec<Action> {
         let mut out = Vec::new();
+        if self.joined() == Some(false) {
+            if !std::mem::replace(&mut self.told_read_only, true) {
+                out.push(Action::Tell(
+                    "You are watching this session read-only: what you type is not sent. \
+                     Session > tmux > Detach tmux leaves it."
+                        .into(),
+                ));
+            }
+            return out;
+        }
         if let Some(p) = self.pane_of(native) {
             for line in command::send_keys(p, bytes) {
                 self.send(&line, Tag::Ignore, &mut out);
@@ -1498,6 +1832,9 @@ impl Tmux {
     /// layout, a tmux split in tmux layout, in the pane's directory.
     pub fn split(&mut self, native: Native, dir: Dir) -> Vec<Action> {
         let mut out = Vec::new();
+        if self.refuse_joined(&mut out) {
+            return out;
+        }
         let Some(p) = self.pane_of(native) else {
             return out;
         };
@@ -1615,7 +1952,7 @@ impl Tmux {
     /// `native`'s (an SSH shell outside tmux that asked for the agent).
     pub fn start_agent(&mut self, native: Native, command: &str, dir: Option<&str>) -> Vec<Action> {
         let mut out = Vec::new();
-        if !self.active() || command.trim().is_empty() {
+        if !self.active() || command.trim().is_empty() || self.refuse_joined(&mut out) {
             return out;
         }
         // A connection that never answers keeps only a few; the ones it
@@ -1675,6 +2012,9 @@ impl Tmux {
     /// A new tmux window as a tab after `native`'s, in its directory.
     pub fn new_tab(&mut self, native: Native) -> Vec<Action> {
         let mut out = Vec::new();
+        if self.refuse_joined(&mut out) {
+            return out;
+        }
         let p = self.pane_of(native);
         self.open_here(p, Split::Window(Placement::Tab { after: native }), &mut out);
         out
@@ -1687,6 +2027,10 @@ impl Tmux {
         let Some(p) = self.pane_of(native) else {
             return out;
         };
+        // Someone else's windows stay: closing leaves their session.
+        if self.joined().is_some() {
+            return self.detach();
+        }
         let window = self.panes.get(&p).map(|x| x.window);
         let alone =
             window.is_some_and(|w| self.panes.values().filter(|x| x.window == w).count() == 1);
@@ -1705,6 +2049,9 @@ impl Tmux {
     /// look by [`Tmux::sync_saved`], which brings it back on attach.
     pub fn rename(&mut self, native: Native, name: Option<&str>) -> Vec<Action> {
         let mut out = Vec::new();
+        if self.refuse_joined(&mut out) {
+            return out;
+        }
         let Some(w) = self
             .pane_of(native)
             .and_then(|p| self.panes.get(&p))
@@ -1732,6 +2079,9 @@ impl Tmux {
         let Some((current, _)) = self.session else {
             return out;
         };
+        if self.refuse_joined(&mut out) {
+            return out;
+        }
         if !self.client.is_control() || session.is_some_and(|s| s != current) {
             return out;
         }
@@ -1753,7 +2103,7 @@ impl Tmux {
     /// Switches the session's layout mode and reads it again.
     pub fn set_mode(&mut self, mode: Mode) -> Vec<Action> {
         let mut out = Vec::new();
-        if !self.client.is_control() || mode == self.mode {
+        if !self.client.is_control() || mode == self.mode || self.refuse_joined(&mut out) {
             return out;
         }
         if mode == Mode::Ferossh && !self.window_sizes() {
@@ -1774,7 +2124,9 @@ impl Tmux {
     /// Tells tmux how big each window's native panes are.
     pub fn sync_sizes(&mut self, ws: &Workspace, cells: CellsOf<'_>) -> Vec<Action> {
         let mut out = Vec::new();
-        if !self.client.is_control() || self.restoring {
+        // Someone else's session keeps its sizes and layout: this client
+        // joined with ignore-size and shows the owner's sizes.
+        if !self.client.is_control() || self.restoring || self.joined.is_some() {
             return out;
         }
         let mut wanted: Vec<(WindowId, (u16, u16), Option<String>)> = Vec::new();
@@ -1849,7 +2201,11 @@ impl Tmux {
     /// Writes the layout and looks to the session when they changed.
     pub fn sync_saved(&mut self, ws: &Workspace, look_of: LookOf<'_>) -> Vec<Action> {
         let mut out = Vec::new();
-        if !self.client.is_control() || self.restoring || self.panes.is_empty() {
+        if !self.client.is_control()
+            || self.restoring
+            || self.panes.is_empty()
+            || self.joined.is_some()
+        {
             return out;
         }
         let window_of = |n: Native| {
@@ -2011,6 +2367,194 @@ mod tests {
                 _ => None,
             })
             .collect()
+    }
+
+    /// A session attached after `prep` (a join or share typed first);
+    /// tmux says it is `version` with one pane.
+    fn attached_after(
+        version: &str,
+        prep: impl FnOnce(&mut Tmux) -> Vec<Action>,
+    ) -> (Tmux, Workspace, Vec<Action>, Vec<Action>) {
+        let (mut ws, gateway) = Workspace::new();
+        let mut t = Tmux::new(gateway, Mode::Ferossh, 100);
+        let typed = prep(&mut t);
+        t.feed(&mut ws, START);
+        let mut input = reply(1, &[version.into()]);
+        input.extend(reply(2, &[]));
+        input.extend(reply(3, &[]));
+        input.extend(reply(4, &[pane_line(0, 0, 80, 24, "b25f,80x24,0,0,0")]));
+        let actions = t.feed(&mut ws, &input);
+        (t, ws, typed, actions)
+    }
+
+    fn tells(actions: &[Action]) -> Vec<String> {
+        actions
+            .iter()
+            .filter_map(|a| match a {
+                Action::Tell(t) => Some(t.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn watching_changes_nothing_of_the_owners() {
+        let (mut t, ws, typed, a) = attached_after("3.4", |t| t.join(None, Some("pair"), false));
+        assert_eq!(
+            writes(&typed),
+            ["tmux -CC attach-session -f read-only,ignore-size -t =pair"]
+        );
+        assert_eq!(t.joined(), Some(false));
+        // No mode option written into their session; told once.
+        assert!(
+            !writes(&a).iter().any(|w| w.contains("set-option")),
+            "{a:?}"
+        );
+        assert_eq!(tells(&a).len(), 1);
+        let n = ws.focused();
+        let a = t.input(n, b"ls\r");
+        assert!(writes(&a).is_empty());
+        assert_eq!(tells(&a).len(), 1);
+        assert!(tells(&t.input(n, b"x")).is_empty());
+        for a in [
+            t.split(n, Dir::Right),
+            t.new_tab(n),
+            t.rename(n, Some("x")),
+            t.set_mode(Mode::Tmux),
+            t.detach_others(None),
+            t.switch_session(None),
+            t.start_agent(n, "claude", None),
+        ] {
+            assert!(writes(&a).is_empty(), "{a:?}");
+        }
+        // Closing leaves, never kills their window.
+        assert_eq!(writes(&t.close(n)), ["detach-client"]);
+        assert!(t.unshare().is_empty());
+    }
+
+    #[test]
+    fn joining_to_type_sends_keys_but_keeps_their_layout() {
+        let (mut t, ws, typed, _) = attached_after("3.4", |t| t.join(None, None, true));
+        assert_eq!(writes(&typed), ["tmux -CC attach-session -f ignore-size"]);
+        assert_eq!(t.joined(), Some(true));
+        let n = ws.focused();
+        assert_eq!(writes(&t.input(n, b"a")), ["send-keys -t %0 -H 61"]);
+        assert!(writes(&t.split(n, Dir::Down)).is_empty());
+        assert_eq!(writes(&t.close(n)), ["detach-client"]);
+    }
+
+    #[test]
+    fn a_plain_attach_after_a_join_is_ones_own_again() {
+        let (mut ws, gateway) = Workspace::new();
+        let mut t = Tmux::new(gateway, Mode::Ferossh, 100);
+        t.join(None, None, false);
+        t.attach("main", false);
+        t.feed(&mut ws, START);
+        assert_eq!(t.joined(), None);
+    }
+
+    fn share(accounts: &[&str], can_type: bool) -> Share {
+        Share {
+            accounts: accounts.iter().map(|a| (*a).to_owned()).collect(),
+            can_type,
+        }
+    }
+
+    /// Shares as `bob` on tmux `version`; returns what was written and
+    /// told once tmux gave `socket`.
+    fn shared(version: &str, can_type: bool, socket: &str) -> (Vec<String>, Vec<String>) {
+        let (mut t, mut ws, typed, a) =
+            attached_after(version, |t| t.share("pair", share(&["bob"], can_type)));
+        assert_eq!(writes(&typed), [command::share_line("pair").trim_end()]);
+        assert!(writes(&a).contains(&"display-message -p '#{socket_path}'".to_owned()));
+        let a = t.feed(&mut ws, &reply(5, &[socket.into()]));
+        (writes(&a), tells(&a))
+    }
+
+    #[test]
+    fn sharing_watch_only_needs_a_tmux_that_enforces_it() {
+        let socket = "/tmp/ferossh-share-alice/default";
+        let (w, told) = shared("3.4", false, socket);
+        assert!(w.is_empty(), "{w:?}");
+        assert!(told[0].contains("stays private"), "{told:?}");
+        let (w, _) = shared("next-3.9", false, socket);
+        assert_eq!(
+            w,
+            [
+                "server-access -a 'bob'",
+                "server-access -r 'bob'",
+                "run-shell 'chmod 666 /tmp/ferossh-share-alice/default'",
+            ]
+        );
+    }
+
+    #[test]
+    fn sharing_to_type_is_offered_from_access_lists_on() {
+        let socket = "/tmp/ferossh-share-alice/default";
+        let (w, told) = shared("3.4", true, socket);
+        assert_eq!(w[1], "server-access -w 'bob'");
+        assert!(told[0].contains("run commands as you"), "{told:?}");
+        // No access list: nothing opens.
+        let (w, told) = shared("3.2", true, socket);
+        assert!(w.is_empty());
+        assert!(told[0].contains("cannot limit"));
+        // Not the shared server (the line failed and tmux was started some
+        // other way): nothing opens.
+        let (w, _) = shared("3.4", true, "/tmp/tmux-1000/default");
+        assert!(w.is_empty());
+    }
+
+    #[test]
+    fn share_while_attached_detaches_then_types() {
+        let (mut t, mut ws, _) =
+            attached(None, None, &[pane_line(0, 0, 80, 24, "b25f,80x24,0,0,0")]);
+        let a = t.share("pair", share(&["bob"], true));
+        assert_eq!(writes(&a), ["detach-client"]);
+        let a = t.feed(&mut ws, b"%exit detached\n\x1b\\[detached]\r\n");
+        assert_eq!(writes(&a), [command::share_line("pair").trim_end()]);
+        assert!(t.reattach.is_none());
+    }
+
+    #[test]
+    fn unsharing_takes_other_accounts_off_and_detaches_watchers() {
+        let (mut t, mut ws, a) =
+            attached(None, None, &[pane_line(0, 0, 80, 24, "b25f,80x24,0,0,0")]);
+        // The restore's own commands are answered first.
+        let mut n = 4;
+        for _ in writes(&a) {
+            n += 1;
+            t.feed(&mut ws, &reply(n, &[]));
+        }
+        let a = t.unshare();
+        assert_eq!(
+            writes(&a),
+            [
+                "display-message -p '#{socket_path}'",
+                "list-clients -t $0 -F '#{client_name} #{client_readonly}'"
+            ]
+        );
+        let mut input = reply(n + 1, &["/tmp/ferossh-share-alice/default".into()]);
+        input.extend(reply(n + 2, &["/dev/pts/3 0".into(), "client-9 1".into()]));
+        let a = t.feed(&mut ws, &input);
+        assert_eq!(
+            writes(&a),
+            [
+                "server-access -l",
+                "run-shell 'chmod 600 /tmp/ferossh-share-alice/default'",
+                "detach-client -t 'client-9'",
+            ]
+        );
+        let a = t.feed(
+            &mut ws,
+            &reply(
+                n + 3,
+                &["alice (W)".into(), "bob (R)".into(), "root (W)".into()],
+            ),
+        );
+        assert_eq!(
+            writes(&a),
+            ["server-access -d 'alice'", "server-access -d 'bob'"]
+        );
     }
 
     /// Attaches to a session with the given panes and saved layout; returns

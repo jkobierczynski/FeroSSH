@@ -571,6 +571,19 @@ To have a host's shells start in one server directory, `cd` there and use Sessio
 
 If your fingers know tmux's keys, tick Session > tmux > Use tmux keybindings for tabs and panes. In a pane of a tmux session, your tmux prefix (Ctrl+B unless your tmux config sets another; FeroSSH asks tmux) followed by `c`, `%`, `"`, `n`, `p`, `0`-`9`, `o`, an arrow, `x`, `&`, `!`, `d` or `s` works the native tabs and panes, which are tmux windows and panes. Arrows, Ctrl or Alt+arrows (resize), `[`, PageUp and PageDown repeat as in tmux: after the first one, press them again without the prefix within tmux's `repeat-time` (half a second unless your tmux config sets another), or hold the key down. Press the prefix twice to send it to the program, and the prefix then `?` for the full list. It is off unless you turn it on.
 
+### Shared sessions
+
+A colleague can watch your tmux session live, or join it to type along. Session > tmux > Share this session asks for the session and, optionally, other accounts:
+
+- **Same account** (leave Accounts empty): anyone who logs in to the host as you can already reach your tmux, so nothing changes on the server. FeroSSH tells you how they join: Session > tmux > Join a shared session with the session's name, or `tmux attach -r -t NAME`.
+- **Other accounts** (tmux 3.3 or later): FeroSSH starts the session on a tmux server of its own, at `/tmp/ferossh-share-YOU/default` (a directory only you can write to, which FeroSSH checks is yours before using it), and lets only the accounts you name connect. tmux 3.9 and later keeps them watch-only. Older tmux does not: through tmux's control mode a "read-only" account can still type and run commands as you. So on older tmux FeroSSH shares with other accounts only when you tick **Let them type**, which means trusting them with your account. A session already running on your private tmux cannot move: sharing it with other accounts starts a new session of that name on the shared server.
+
+Session > tmux > Join a shared session asks whose session (empty for your own account) and which one (empty to pick). FeroSSH joins read-only unless you tick **Type into it too**, never changes the owner's window sizes, layout, splits or options, and closing a pane of a shared session only leaves it. It checks that `/tmp/ferossh-share-OWNER` really belongs to that account before connecting, so nobody else can pose as them.
+
+Session > tmux > Stop sharing takes every other account off the shared server (which detaches them), makes its socket private again, and detaches whoever watches your session read-only.
+
+Sharing and joining type a short POSIX shell line at the pane's shell (bash, zsh, dash and similar; not fish or csh).
+
 ### Coding agents in tmux
 
 Session > Coding agents starts a coding agent (Claude Code, Codex, aider, or your own command) in tmux on the server the focused pane is logged in to, so it keeps working when your PC sleeps or the network drops, and comes back by itself when FeroSSH reconnects. Each agent gets a tmux window of its own, a new tab in the pane's directory, named after the agent; FeroSSH types the agent's command at that window's shell, so the shell stays when the agent exits and you can start it again in place. When tmux already shows on that host, the agent joins that session; otherwise it goes into a tmux session named `agents`, made when needed, which FeroSSH then attaches. The agent's window is marked in tmux (the window option `@ferossh-agent`), so it is recognised again after a reconnect or from another PC. It needs an SSH pane with tmux on the server; Mosh and SFTP-only connections cannot start one.

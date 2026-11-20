@@ -53,6 +53,8 @@ mod desktop;
 #[path = "desktop_off.rs"]
 mod desktop;
 #[cfg(windows)]
+mod fields_view;
+#[cfg(windows)]
 mod files_panel;
 #[cfg(windows)]
 mod form_view;
