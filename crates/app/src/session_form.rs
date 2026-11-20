@@ -43,6 +43,8 @@ pub struct Hints {
     pub scrollback: usize,
     /// The named credentials a connection can use.
     pub credentials: Vec<String>,
+    /// What those credentials hold, for the checks.
+    pub credential_logins: Vec<ferossh_config::settings::Credential>,
 }
 
 /// What the form holds, as typed.
@@ -1726,7 +1728,19 @@ impl SessionForm {
         {
             return Err("Fill in the password manager's command, or pick another source.".into());
         }
-        if v.kind == SessionKind::WinRm && v.password != PASSWORD_ASK && v.user.trim().is_empty() {
+        // What the login will be: a credential's user and source win.
+        let credential = self
+            .hints
+            .credential_logins
+            .iter()
+            .find(|c| c.name.eq_ignore_ascii_case(v.credential.trim()))
+            .filter(|_| !v.credential.trim().is_empty());
+        let has_user = !v.user.trim().is_empty() || credential.is_some_and(|c| c.user.is_some());
+        let asks = match credential {
+            Some(c) if c.password != PasswordSource::Ask => false,
+            _ => v.password == PASSWORD_ASK,
+        };
+        if v.kind == SessionKind::WinRm && !asks && !has_user {
             return Err(
                 "A password source needs a user: without one, WinRM logs in as yourself \
                  with no password."
@@ -2427,6 +2441,7 @@ mod tests {
             font_size: 11.0,
             scrollback: 10_000,
             credentials: Vec::new(),
+            credential_logins: Vec::new(),
         }
     }
 
@@ -2866,6 +2881,21 @@ mod tests {
         );
         f.values.user.clear();
         assert!(f.check().unwrap_err().contains("needs a user"));
+        // A credential's user counts; one without a user does not.
+        f.hints.credential_logins = Settings::parse(
+            "Credential ops\n    User ops\n    PasswordSource windows\nCredential nouser\n    \
+             PasswordSource windows\n",
+        )
+        .credentials;
+        f.values.credential = "ops".into();
+        assert_eq!(f.check(), Ok(()));
+        f.values.credential = "nouser".into();
+        f.values.password = PASSWORD_ASK;
+        assert!(
+            f.check().unwrap_err().contains("needs a user"),
+            "its source wins"
+        );
+        f.values.credential.clear();
         f.values.user = "LAB\\admin".into();
         f.values.password = PASSWORD_ASK;
         // HTTPS: shown, saved, and its port the default.

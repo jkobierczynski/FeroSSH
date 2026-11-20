@@ -14435,6 +14435,7 @@ impl Window {
                 .iter()
                 .map(|c| c.name.clone())
                 .collect(),
+            credential_logins: self.settings.credentials.clone(),
         };
         let themes: Vec<String> = Theme::builtin().iter().map(|t| t.name.to_owned()).collect();
         let form = match host {
@@ -14550,11 +14551,11 @@ impl Window {
                 if let Err(e) = self.try_save_settings() {
                     return Some(Command::Notice(e));
                 }
+                // Unless another connection keeps its password there too.
                 if let Some(old) = old_target
                     && (!still_windows || self.saved_password_target(&name).as_ref() != Some(&old))
-                    && let Err(e) = credman::delete(&old)
                 {
-                    self.queued.push(Command::Notice(e));
+                    self.forget_unused_passwords(vec![old]);
                 }
                 self.side.form = None;
                 self.reload_sessions(Some(&name));
@@ -14619,7 +14620,13 @@ impl Window {
         let env = ssh_env();
         names
             .iter()
-            .filter(|n| self.settings.password_source(n) == PasswordSource::Windows)
+            .filter(|n| match self.settings.password_source(n) {
+                PasswordSource::Windows => true,
+                // A workspace that logs in by itself keeps an asking
+                // connection's password there too.
+                PasswordSource::Ask => self.settings.workspace_auto_login,
+                PasswordSource::Command(_) => false,
+            })
             .filter_map(|n| self.saved_password_target_in(n, &env))
             .collect()
     }
@@ -14675,11 +14682,8 @@ impl Window {
             return;
         }
         self.settings = settings;
-        for target in targets {
-            if let Err(e) = credman::delete(&target) {
-                self.queued.push(Command::Notice(e));
-            }
-        }
+        // Unless another connection keeps its password there too.
+        self.forget_unused_passwords(targets);
         self.save_settings();
         self.side.form = None;
         self.reload_sessions(None);

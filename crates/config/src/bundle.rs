@@ -508,6 +508,61 @@ pub fn merge_credentials3(
         .collect()
 }
 
+/// Host profiles and credentials after two PCs changed them from the same
+/// `base` ([`merge_profiles3`], [`merge_credentials3`]), with references
+/// kept whole: when one side renamed a credential (its profiles moved
+/// from the old name to the new one, and the old name is gone there) and
+/// the other changed something else in a profile that still names the
+/// old one, that profile follows the rename.
+pub fn merge_logins3(
+    base: &crate::Settings,
+    ours: &crate::Settings,
+    theirs: &crate::Settings,
+) -> (Vec<crate::Profile>, Vec<crate::settings::Credential>) {
+    let mut profiles = merge_profiles3(&base.profiles, &ours.profiles, &theirs.profiles);
+    let credentials = merge_credentials3(&base.credentials, &ours.credentials, &theirs.credentials);
+    let has = |list: &[crate::settings::Credential], n: &str| {
+        list.iter().any(|c| c.name.eq_ignore_ascii_case(n))
+    };
+    // Old name -> new name, as either side renamed.
+    let mut renames: Vec<(String, String)> = Vec::new();
+    for side in [ours, theirs] {
+        for b in &base.profiles {
+            let Some(old) = &b.credential else {
+                continue;
+            };
+            let new = side
+                .profiles
+                .iter()
+                .find(|p| p.host.eq_ignore_ascii_case(&b.host))
+                .and_then(|p| p.credential.clone());
+            if let Some(new) = new
+                && !new.eq_ignore_ascii_case(old)
+                && !has(&side.credentials, old)
+                && has(&side.credentials, &new)
+                && !renames.iter().any(|(o, _)| o.eq_ignore_ascii_case(old))
+            {
+                renames.push((old.clone(), new));
+            }
+        }
+    }
+    for p in &mut profiles {
+        let Some(name) = &p.credential else {
+            continue;
+        };
+        if has(&credentials, name) {
+            continue;
+        }
+        if let Some((_, new)) = renames
+            .iter()
+            .find(|(o, n)| o.eq_ignore_ascii_case(name) && has(&credentials, n))
+        {
+            p.credential = Some(new.clone());
+        }
+    }
+    (profiles, credentials)
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::indexing_slicing)]
 mod tests {
@@ -661,6 +716,31 @@ mod tests {
             }
         );
         assert_eq!(local.profiles.len(), 3);
+    }
+
+    #[test]
+    fn a_profile_follows_a_credential_renamed_on_the_other_pc() {
+        let base = Settings::parse(
+            "Credential ops\n    User o\nProfile web\n    Credential ops\n    FontSize 10\n",
+        );
+        // Here: only the font size changed.
+        let ours = Settings::parse(
+            "Credential ops\n    User o\nProfile web\n    Credential ops\n    FontSize 12\n",
+        );
+        // There: ops renamed to prod, with its connection.
+        let theirs = Settings::parse(
+            "Credential prod\n    User o\nProfile web\n    Credential prod\n    FontSize 10\n",
+        );
+        // Both changed the profile: as always, the side merging keeps its
+        // own, but never a name the credentials no longer hold.
+        for (a, b, size) in [(&ours, &theirs, 12.0), (&theirs, &ours, 10.0)] {
+            let (profiles, credentials) = merge_logins3(&base, a, b);
+            assert_eq!(credentials.len(), 1);
+            assert_eq!(credentials[0].name, "prod");
+            let web = profiles.iter().find(|p| p.host == "web").unwrap();
+            assert_eq!(web.credential.as_deref(), Some("prod"));
+            assert_eq!(web.font_size, Some(size));
+        }
     }
 
     #[test]

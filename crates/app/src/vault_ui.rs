@@ -1187,14 +1187,11 @@ fn merge_theirs(settings: &mut Settings, theirs: &str) -> bool {
     }
     let base = base.map(|b| Settings::parse(&b)).unwrap_or_default();
     let parsed = Settings::parse(theirs);
-    settings.profiles =
-        bundle::merge_profiles3(&base.profiles, &settings.profiles, &parsed.profiles);
-    // Credentials too: ours where we changed them, else theirs.
-    settings.credentials = bundle::merge_credentials3(
-        &base.credentials,
-        &settings.credentials,
-        &parsed.credentials,
-    );
+    // Credentials too: ours where we changed them, else theirs, and a
+    // profile follows a credential renamed on either side.
+    let (profiles, credentials) = bundle::merge_logins3(&base, settings, &parsed);
+    settings.profiles = profiles;
+    settings.credentials = credentials;
     true
 }
 

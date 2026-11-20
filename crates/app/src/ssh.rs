@@ -418,6 +418,14 @@ impl Target {
             self.identities_only = fresh.identities_only;
             self.agent = fresh.agent;
         }
+        // A ProxyCommand's %r was filled in with the old user: fill it in
+        // again for the new one.
+        if self.proxy_command.is_some()
+            && let Ok(fresh) = Self::resolve_route(&self.typed, env)
+            && fresh.proxy_command.is_some()
+        {
+            self.proxy_command = fresh.proxy_command;
+        }
         for j in &mut self.jumps {
             j.refresh_login(env);
         }
@@ -4559,6 +4567,28 @@ mod tests {
         assert!(t.key_files[0].path.ends_with("ops_key"));
         assert_eq!(t.port, 2201, "the rest of the target stays");
         assert_eq!(typed.user, "root");
+    }
+
+    #[test]
+    fn a_reconnect_fills_in_a_proxy_command_for_the_new_user() {
+        let dir = temp("refresh-proxy");
+        let mut e = Env {
+            config: "Host web\n  User alice\n  ProxyCommand ssh -W %h:%p %r@gw\n".into(),
+            ..env(&dir)
+        };
+        let mut t = Target::resolve("web", &e).unwrap();
+        assert!(
+            t.proxy_command
+                .as_ref()
+                .unwrap()
+                .args
+                .contains(&"alice@gw".to_owned())
+        );
+        e.config = format!("Match originalhost web\n  User bob\n{}", e.config);
+        t.refresh_login(&e);
+        assert_eq!(t.user, "bob");
+        let args = &t.proxy_command.as_ref().unwrap().args;
+        assert!(args.contains(&"bob@gw".to_owned()), "{args:?}");
     }
 
     #[test]
