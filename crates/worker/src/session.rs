@@ -646,9 +646,10 @@ impl client::Handler for Client {
             .filter(|k| check_key_size(k.key_data(), "host key").is_ok())
             .filter_map(|k| k.to_bytes().ok())
             .filter(|k| !k.is_empty())
-            .take(MAX_HOST_KEYS)
             .collect();
-        if keys.is_empty() {
+        // A cut list would look as if the keys left off had been retired,
+        // so a list too long to send is not sent at all.
+        if keys.is_empty() || keys.len() > MAX_HOST_KEYS {
             return Ok(());
         }
         let msg = Message::HostKeysAnnounced {
@@ -848,7 +849,7 @@ struct Ctx {
     forwards: Option<Arc<ConnForwards>>,
     /// Requests for the connection ([`ConnTasks`]) that came while a
     /// login step was running, for the channel's loop to take.
-    deferred: Vec<Message>,
+    deferred: Requests,
 }
 
 impl Ctx {
@@ -907,9 +908,7 @@ async fn drive<T>(
                     // The server may list its host keys while the shell
                     // is still opening, and the UI answer at once.
                     Some(m @ (Message::HostKeysProve { .. } | Message::Rekey { .. })) => {
-                        if ctx.deferred.len() < ConnTasks::MAX_QUEUED {
-                            ctx.deferred.push(m);
-                        }
+                        ctx.deferred.take(m);
                     }
                     // Typing before the shell is open goes nowhere, as in ssh.
                     Some(_) => {}
@@ -944,7 +943,7 @@ pub async fn run(
         x11: params.x11.clone(),
         options: params.options.clone(),
         forwards: None,
-        deferred: Vec::new(),
+        deferred: Requests::default(),
     };
     let result = session(&params, &mut inbox, tunnel, &mut ctx, &connections).await;
     let server_said = with(&shared, |s| s.server_said.take()).flatten();
@@ -1029,7 +1028,7 @@ pub async fn open(
         x11,
         options,
         forwards: None,
-        deferred: Vec::new(),
+        deferred: Requests::default(),
     };
     let result = match connections.get(connection) {
         Some((conn, names, forwards)) => {
@@ -1451,65 +1450,100 @@ async fn shell(
 /// A request's work, borrowing the connection.
 type Task<'a> = Pin<Box<dyn Future<Output = Option<Message>> + Send + 'a>>;
 
-/// What the UI asks of the connection itself rather than of a channel:
-/// `~R`'s new key exchange, and the proof of host keys the server
-/// announced (UpdateHostKeys). It runs beside a channel's loop, one
-/// request at a time, and borrows the connection that loop holds, so it
-/// never keeps the connection open after its last channel.
-struct ConnTasks<'a> {
-    conn: &'a Connection,
-    queue: VecDeque<Message>,
-    busy: Option<Task<'a>>,
+/// The requests for the connection itself that wait their turn:
+/// proofs of host keys, one at a time, and whether `~R` asked for a new
+/// key exchange. Every proof request gets an answer, a refusal when too
+/// many wait.
+#[derive(Default)]
+struct Requests {
+    proofs: VecDeque<Message>,
+    rekey: bool,
+    /// Answers ready to go back to the UI.
+    answers: VecDeque<Message>,
 }
 
-impl<'a> ConnTasks<'a> {
-    /// Requests that may wait their turn; more are dropped (the UI sends
-    /// one proof request per login, and `~R` is typed).
+impl Requests {
+    /// Proof requests that may wait their turn (the UI sends one per
+    /// login). One more is refused at once; past that many refusals,
+    /// requests are dropped, which only a broken UI would cause.
     const MAX_QUEUED: usize = 4;
-
-    fn new(conn: &'a Connection, deferred: Vec<Message>) -> Self {
-        let mut tasks = Self {
-            conn,
-            queue: VecDeque::new(),
-            busy: None,
-        };
-        for m in deferred {
-            tasks.take(m);
-        }
-        tasks
-    }
 
     /// Queues `msg` if it is a request for the connection; any other
     /// message is handed back.
     fn take(&mut self, msg: Message) -> Option<Message> {
         match msg {
-            Message::Rekey { .. } | Message::HostKeysProve { .. } => {
-                if self.queue.len() < Self::MAX_QUEUED {
-                    self.queue.push_back(msg);
+            Message::Rekey { .. } => self.rekey = true,
+            Message::HostKeysProve { channel, keys } => {
+                if self.proofs.len() < Self::MAX_QUEUED {
+                    self.proofs
+                        .push_back(Message::HostKeysProve { channel, keys });
+                } else if self.answers.len() < Self::MAX_QUEUED {
+                    self.answers.push_back(Message::HostKeysProven {
+                        channel,
+                        keys,
+                        error: "too many requests to prove host keys".to_owned(),
+                    });
                 }
-                None
             }
-            other => Some(other),
+            other => return Some(other),
+        }
+        None
+    }
+}
+
+/// What the UI asks of the connection itself rather than of a channel:
+/// `~R`'s new key exchange, and the proof of host keys the server
+/// announced (UpdateHostKeys). It runs beside a channel's loop and
+/// borrows the connection that loop holds, so it never keeps the
+/// connection open after its last channel. Proofs run one at a time; a
+/// key exchange is started while one waits.
+struct ConnTasks<'a> {
+    conn: &'a Connection,
+    requests: Requests,
+    proving: Option<Task<'a>>,
+    rekeying: Option<Task<'a>>,
+}
+
+impl<'a> ConnTasks<'a> {
+    fn new(conn: &'a Connection, requests: Requests) -> Self {
+        Self {
+            conn,
+            requests,
+            proving: None,
+            rekeying: None,
         }
     }
 
+    /// Queues `msg` if it is a request for the connection; any other
+    /// message is handed back.
+    fn take(&mut self, msg: Message) -> Option<Message> {
+        self.requests.take(msg)
+    }
+
     /// Runs the queued requests; resolves with the next answer for the
-    /// UI. Pending while there is nothing to do. Cancel-safe: the running
-    /// request is kept across calls.
+    /// UI. Pending while there is nothing to do. Cancel-safe: running
+    /// requests are kept across calls.
     async fn next(&mut self) -> Message {
         loop {
-            if self.busy.is_none() {
-                match self.queue.pop_front() {
-                    Some(m) => self.busy = Some(self.start(m)),
-                    None => std::future::pending::<()>().await,
-                }
+            if let Some(answer) = self.requests.answers.pop_front() {
+                return answer;
             }
-            if let Some(task) = &mut self.busy {
-                let answer = task.await;
-                self.busy = None;
-                if let Some(answer) = answer {
-                    return answer;
+            if self.proving.is_none()
+                && let Some(m) = self.requests.proofs.pop_front()
+            {
+                self.proving = Some(self.start(m));
+            }
+            if self.rekeying.is_none() && std::mem::take(&mut self.requests.rekey) {
+                self.rekeying = Some(self.start(Message::Rekey { channel: 0 }));
+            }
+            tokio::select! {
+                answer = run_task(&mut self.proving) => {
+                    self.proving = None;
+                    if let Some(answer) = answer {
+                        return answer;
+                    }
                 }
+                _ = run_task(&mut self.rekeying) => self.rekeying = None,
             }
         }
     }
@@ -1547,6 +1581,14 @@ impl<'a> ConnTasks<'a> {
             }),
             _ => Box::pin(async { None }),
         }
+    }
+}
+
+/// Waits for `task`; pending forever when there is none.
+async fn run_task(task: &mut Option<Task<'_>>) -> Option<Message> {
+    match task {
+        Some(task) => task.await,
+        None => std::future::pending().await,
     }
 }
 
@@ -2190,6 +2232,31 @@ async fn password(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn every_proof_request_gets_an_answer() {
+        let mut r = Requests::default();
+        assert!(r.take(Message::Rekey { channel: 1 }).is_none());
+        assert!(r.take(Message::Rekey { channel: 1 }).is_none());
+        assert!(r.rekey);
+        let prove = |n: u8| Message::HostKeysProve {
+            channel: 1,
+            keys: vec![vec![n]],
+        };
+        for n in 0..=Requests::MAX_QUEUED as u8 {
+            assert!(r.take(prove(n)).is_none());
+        }
+        assert_eq!(r.proofs.len(), Requests::MAX_QUEUED);
+        assert!(matches!(
+            &r.answers.front(),
+            Some(Message::HostKeysProven { error, .. }) if !error.is_empty()
+        ));
+        let data = Message::Data {
+            channel: 1,
+            bytes: b"x".to_vec(),
+        };
+        assert!(r.take(data).is_some());
+    }
 
     #[test]
     fn host_certificates_reject_critical_options_but_allow_extensions()

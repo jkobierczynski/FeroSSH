@@ -2736,9 +2736,17 @@ impl<'a> Reader<'a> {
     /// A [`Message::HostKeysAnnounced`]-style list: at most
     /// [`MAX_HOST_KEYS`] keys, none of them empty.
     fn host_keys(&mut self) -> Result<Vec<Vec<u8>>, Error> {
-        let keys = self.list(|r| r.path())?;
-        if keys.len() > MAX_HOST_KEYS || keys.iter().any(Vec::is_empty) {
+        let count = self.u32()? as usize;
+        if count > MAX_HOST_KEYS {
             return Err(Error::Invalid);
+        }
+        let mut keys = Vec::with_capacity(count);
+        for _ in 0..count {
+            let key = self.path()?;
+            if key.is_empty() {
+                return Err(Error::Invalid);
+            }
+            keys.push(key);
         }
         Ok(keys)
     }

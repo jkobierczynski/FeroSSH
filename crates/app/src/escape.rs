@@ -132,7 +132,9 @@ impl Escapes {
         if let Some(line) = &mut self.command {
             return match typed {
                 Typed::Char(c) if !c.is_control() => {
-                    if line.len() + c.len_utf8() > MAX_COMMAND {
+                    // One character past the limit is kept, so the line
+                    // is refused as too long rather than run cut short.
+                    if line.len() > MAX_COMMAND {
                         return Outcome::Taken;
                     }
                     line.push(c);
@@ -239,6 +241,11 @@ pub enum CommandLine {
 
 /// Reads a `~C` command line.
 pub fn parse_command(line: &str) -> CommandLine {
+    if line.len() > MAX_COMMAND {
+        return CommandLine::Bad(format!(
+            "The command is longer than {MAX_COMMAND} characters."
+        ));
+    }
     let line = line.trim();
     if line.is_empty() {
         return CommandLine::Nothing;
@@ -398,7 +405,15 @@ mod tests {
             .into_iter()
             .filter(|o| matches!(o, Outcome::Echo(_)))
             .count();
-        assert_eq!(echoed, MAX_COMMAND);
+        assert_eq!(echoed, MAX_COMMAND + 1);
+        let Outcome::Command(line) = e.key(TILDE, Typed::Enter) else {
+            unreachable!("Enter runs the line");
+        };
+        assert!(matches!(parse_command(&line), CommandLine::Bad(_)));
+        // A command that fits exactly still runs.
+        let fits = format!("-L 8080:db:5432{}", " ".repeat(MAX_COMMAND - 15));
+        assert_eq!(fits.len(), MAX_COMMAND);
+        assert!(matches!(parse_command(&fits), CommandLine::Add(_)));
     }
 
     #[test]

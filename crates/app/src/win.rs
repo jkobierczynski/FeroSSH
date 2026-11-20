@@ -6280,11 +6280,11 @@ impl Window {
                 }
             }
             Some(FwdAction::Remove { connection, index }) => {
-                if let Some(w) = self.workers.get(&connection) {
-                    w.forwarder.remove(connection, index);
-                }
                 if let Some(f) = forwards_of(&view, connection).nth(index) {
                     let spec = f.spec.clone();
+                    if let Some(w) = self.workers.get(&connection) {
+                        w.forwarder.remove_spec(connection, spec.clone(), f.desktop);
+                    }
                     self.keep_forwards(connection, |list| list.retain(|s| *s != spec));
                 }
             }
@@ -6352,18 +6352,19 @@ impl Window {
         view: &[ConnView],
     ) -> std::result::Result<ForwardSpec, String> {
         let c = self.forward_connection(connection, view)?;
-        let matching: Vec<(usize, &ForwardSpec)> = forwards_of(view, c)
-            .enumerate()
-            .filter(|(_, f)| !f.desktop && cancel.cancels(&f.spec))
-            .map(|(i, f)| (i, &f.spec))
+        let matching: Vec<&ForwardSpec> = forwards_of(view, c)
+            .filter(|f| !f.desktop && cancel.cancels(&f.spec))
+            .map(|f| &f.spec)
             .collect();
-        let (index, spec) = match &matching[..] {
-            [(i, spec)] => (*i, (*spec).clone()),
+        let spec = match &matching[..] {
+            [spec] => (*spec).clone(),
             [] => return Err("No forward listens there.".to_owned()),
             _ => return Err("More than one forward listens there: add the address.".to_owned()),
         };
+        // By spec, not by place in the list: one cancelled just before
+        // may not have left the view yet.
         if let Some(w) = self.workers.get(&c) {
-            w.forwarder.remove(c, index);
+            w.forwarder.remove_spec(c, spec.clone(), false);
         }
         self.keep_forwards(c, |list| list.retain(|s| *s != spec));
         Ok(spec)
@@ -8630,6 +8631,7 @@ impl Window {
     /// Sends the terminal's answers and other non-user bytes to the host.
     /// They never go into a local prompt.
     fn send(&mut self, id: PaneId, bytes: Vec<u8>) {
+        let bytes = self.escape_sent(id, bytes);
         if let Some(gateway) = self.panes.get(&id).and_then(Pane::gateway) {
             let actions = self
                 .tmux
@@ -8698,6 +8700,9 @@ impl Window {
         if let Some(w) = self.panes.get_mut(&id).and_then(|p| p.quiet.as_mut()) {
             w.typed();
         }
+        // An escape character held back goes first, so the recording
+        // holds what the shell gets.
+        let bytes = self.escape_sent_held(id, bytes);
         if let Some((pane, rec)) = &mut self.recording
             && *pane == id
         {
@@ -8792,7 +8797,6 @@ impl Window {
             | Host::Serial { .. }
             | Host::Telnet(_)
             | Host::Winrm(_) => {
-                let bytes = self.escape_sent(id, bytes);
                 self.track_typing(id, &bytes);
                 self.send(id, bytes);
             }
@@ -8802,21 +8806,30 @@ impl Window {
     /// Bytes for the host of pane `id` pass the SSH escape state: an
     /// escape character still held back goes first (a paste or a script
     /// came after it, not a command key), and whether the next key is
-    /// first on a line follows what went.
-    fn escape_sent(&mut self, id: PaneId, mut bytes: Vec<u8>) -> Vec<u8> {
+    /// first on a line follows what went. Everything that goes to the
+    /// host passes here, as everything ssh reads passes its escape check.
+    fn escape_sent(&mut self, id: PaneId, bytes: Vec<u8>) -> Vec<u8> {
+        let bytes = self.escape_sent_held(id, bytes);
+        if let Some(p) = self.panes.get_mut(&id)
+            && matches!(p.host, Host::Ssh(_) | Host::Tmux { .. })
+        {
+            p.escapes.sent(&bytes);
+        }
+        bytes
+    }
+
+    /// `bytes` after the escape character pane `id` holds back, if any.
+    fn escape_sent_held(&mut self, id: PaneId, mut bytes: Vec<u8>) -> Vec<u8> {
         let held = self.escape_char_of(id);
         let Some(p) = self.panes.get_mut(&id) else {
             return bytes;
         };
-        if !matches!(p.host, Host::Ssh(_) | Host::Tmux { .. }) {
-            return bytes;
-        }
-        if p.escapes.take_pending()
+        if matches!(p.host, Host::Ssh(_) | Host::Tmux { .. })
+            && p.escapes.take_pending()
             && let Some(e) = held
         {
             bytes.insert(0, e);
         }
-        p.escapes.sent(&bytes);
         bytes
     }
 
@@ -8828,7 +8841,8 @@ impl Window {
         let p = self.panes.get(&id)?;
         match &p.host {
             Host::Ssh(s)
-                if s.state() == State::Connected
+                if self.settings.escapes
+                    && s.state() == State::Connected
                     && !s.prompt_active()
                     && s.target.mosh.is_none()
                     && !s.target.sftp_only =>
@@ -8854,7 +8868,13 @@ impl Window {
         }
         let esc = self.escape_char_of(id);
         let p = self.panes.get_mut(&id)?;
-        if esc.is_none() && !p.escapes.in_command() && !p.escapes.pending() {
+        // The shell ended, or escapes were turned off: a `~C` line or a
+        // held character left open goes, and keys go on as usual (Enter
+        // reconnects).
+        if esc.is_none() {
+            if p.escapes.in_command() || p.escapes.pending() {
+                p.escapes.reset();
+            }
             return None;
         }
         let outcome = p.escapes.key(esc, typed);
@@ -8988,13 +9008,25 @@ impl Window {
     /// Runs what was typed on the `~C` command line of pane `id`.
     fn escape_command(&mut self, id: PaneId, line: &str) {
         self.show(id, "\r\n");
-        let connection = self.pane_connection(id);
+        // This pane's own connection, never another one's.
         let view = self.forward_view();
+        let connection = self
+            .pane_connection(id)
+            .ok_or_else(|| "Not connected.".to_owned())
+            .and_then(|c| {
+                if view.iter().any(|v| v.connection == c) && self.workers.contains_key(&c) {
+                    Ok(c)
+                } else {
+                    Err(
+                        "This connection's forwards are not ready yet; try again in a moment."
+                            .to_owned(),
+                    )
+                }
+            });
         let text = match escape::parse_command(line) {
             CommandLine::Nothing => String::new(),
             CommandLine::Help => escape::COMMAND_HELP.to_owned(),
             CommandLine::Add(spec) => match connection
-                .ok_or_else(|| "Not connected.".to_owned())
                 .and_then(|c| self.add_forward(Some(c), &spec, &view))
             {
                 Ok(_) => {
@@ -9002,13 +9034,12 @@ impl Window {
                 }
                 Err(why) => why,
             },
-            CommandLine::Cancel(cancel) => match connection
-                .ok_or_else(|| "Not connected.".to_owned())
-                .and_then(|c| self.cancel_forward(Some(c), &cancel, &view))
-            {
-                Ok(spec) => format!("Cancelled {spec}."),
-                Err(why) => why,
-            },
+            CommandLine::Cancel(cancel) => {
+                match connection.and_then(|c| self.cancel_forward(Some(c), &cancel, &view)) {
+                    Ok(spec) => format!("Cancelled {spec}."),
+                    Err(why) => why,
+                }
+            }
             CommandLine::Bad(why) => why,
         };
         if !text.is_empty() {
@@ -9349,6 +9380,16 @@ impl Window {
             && run.runner.prompting()
         {
             run.runner.prompt_paste(text);
+            return true;
+        }
+        // The `~C` command line takes a paste's first line, without
+        // running it: Enter does.
+        if self.panes.get(&id).is_some_and(|p| p.escapes.in_command()) {
+            for c in text.chars().take_while(|c| !matches!(c, '\r' | '\n')) {
+                if !c.is_control() {
+                    self.escape_typed(id, escape::Typed::Char(c));
+                }
+            }
             return true;
         }
         let Some(p) = self.panes.get_mut(&id) else {
@@ -12225,7 +12266,9 @@ impl Window {
                 if let Some(command) = self.tmux_char(id, char::from(code), false) {
                     return command.map_or(KeyOutcome::Handled, KeyOutcome::Run);
                 }
-                if let Some(command) = self.escape_typed(id, escape::Typed::Other) {
+                // `EscapeChar ^@` or `^_` starts an escape on these keys.
+                if let Some(command) = self.escape_typed(id, escape::Typed::Char(char::from(code)))
+                {
                     return command.map_or(KeyOutcome::Handled, KeyOutcome::Run);
                 }
                 let targets = self.broadcast_targets(id);
@@ -17361,11 +17404,12 @@ impl Window {
                 self.update_menu_checks();
             }
             cmd::ESCAPES => {
-                self.settings.escape_char = if self.settings.escape_char == EscapeChar::None {
-                    EscapeChar::DEFAULT
-                } else {
-                    EscapeChar::None
-                };
+                // Off keeps the character (`EscapeChar %` stays `%`).
+                let on = !(self.settings.escapes && self.settings.escape_char != EscapeChar::None);
+                self.settings.escapes = on;
+                if on && self.settings.escape_char == EscapeChar::None {
+                    self.settings.escape_char = EscapeChar::DEFAULT;
+                }
                 self.save_settings();
                 self.update_menu_checks();
             }
@@ -18069,7 +18113,7 @@ impl Window {
                 (cmd::VERIFY, s.verify_transfers),
                 (cmd::ZMODEM, s.zmodem),
                 (cmd::INLINE_IMAGES, s.inline_images),
-                (cmd::ESCAPES, s.escape_char != EscapeChar::None),
+                (cmd::ESCAPES, s.escapes && s.escape_char != EscapeChar::None),
                 (cmd::UPLOAD_TYPE_PATH, s.upload_type_path),
                 (cmd::PORT_PREVIEWS, s.port_previews),
                 (cmd::KITTY_KEYBOARD, s.kitty_keyboard),

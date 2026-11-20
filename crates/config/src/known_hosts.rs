@@ -501,13 +501,20 @@ fn plan_lines(
 
 /// Carries out UpdateHostKeys in the known_hosts file at `path`: the
 /// lines holding keys the server no longer has go, and each key in
-/// `proven` the file lacks is added with a hashed hostname. The changes
-/// are worked out again from the file as it is now ([`plan_host_keys`]);
-/// nothing is written when that would add a key the server has not
-/// proven (the file changed meanwhile), or when the file changes while it
-/// is written. Kept lines stay byte for byte. Returns what changed.
+/// `proven` the file lacks is added with a hashed hostname. `seen` is
+/// the file's text when the changes were worked out ([`plan_host_keys`]);
+/// nothing is written when the file no longer reads so (someone edited
+/// it meanwhile), when the changes would add a key the server has not
+/// proven, or when the file changes while it is written. Kept lines stay
+/// byte for byte. Returns what changed.
+///
+/// The check that the file did not change and the rename that replaces
+/// it are two steps, as in every known_hosts writer here: an edit saved
+/// by another program in the moment between them is lost.
+#[allow(clippy::too_many_arguments)]
 pub fn update_host_keys(
     path: &Path,
+    seen: &str,
     host: &str,
     port: u16,
     used: &[u8],
@@ -516,6 +523,12 @@ pub fn update_host_keys(
 ) -> io::Result<HostKeyChanges> {
     let raw = fs::read(path)?;
     let text = decode(&raw)?;
+    if text != seen {
+        return Err(io::Error::other(format!(
+            "{} changed while the server proved its keys; nothing was written",
+            path.display()
+        )));
+    }
     let (changes, gone) =
         plan_lines(&text, host, port, used, announced).map_err(io::Error::other)?;
     if changes.add.iter().any(|k| !proven.contains(k)) {
@@ -550,7 +563,7 @@ pub fn update_host_keys(
             out.extend_from_slice(line);
         }
     }
-    if !out.is_empty() && !out.ends_with(b"\n") {
+    if !changes.add.is_empty() && !out.is_empty() && !out.ends_with(b"\n") {
         out.extend_from_slice(eol);
     }
     for key in &changes.add {
@@ -1098,10 +1111,16 @@ mod tests {
         fs::write(&path, &text).unwrap();
         let announced = vec![ed.clone(), ecdsa.clone()];
         // Not proven: nothing is written.
-        assert!(update_host_keys(&path, "web", 22, &ed, &announced, &[]).is_err());
+        assert!(update_host_keys(&path, &text, "web", 22, &ed, &announced, &[]).is_err());
+        assert_eq!(fs::read_to_string(&path).unwrap(), text);
+        // The file changed since it was read: nothing is written.
+        let stale = format!("{text}\r\n");
+        let proven = std::slice::from_ref(&ecdsa);
+        assert!(update_host_keys(&path, &stale, "web", 22, &ed, &announced, proven).is_err());
         assert_eq!(fs::read_to_string(&path).unwrap(), text);
         let done = update_host_keys(
             &path,
+            &text,
             "web",
             22,
             &ed,
@@ -1126,6 +1145,7 @@ mod tests {
         // Run again: nothing left to do, the file stays as it is.
         let again = update_host_keys(
             &path,
+            &after,
             "web",
             22,
             &ed,
@@ -1135,6 +1155,13 @@ mod tests {
         .unwrap();
         assert!(again.is_empty());
         assert_eq!(fs::read_to_string(&path).unwrap(), after);
+        // Only removing: a last line without a line end keeps it so.
+        let text = format!("{}\n{}", line("web", &old), line("web", &ed));
+        fs::write(&path, &text).unwrap();
+        let only_ed = std::slice::from_ref(&ed);
+        let done = update_host_keys(&path, &text, "web", 22, &ed, only_ed, &[]).unwrap();
+        assert_eq!(done.remove, vec![old.clone()]);
+        assert_eq!(fs::read_to_string(&path).unwrap(), line("web", &ed));
         fs::remove_dir_all(&dir).unwrap();
     }
 

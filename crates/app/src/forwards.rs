@@ -234,9 +234,10 @@ enum Cmd {
         connection: ChannelId,
         spec: ForwardSpec,
     },
-    Remove {
+    RemoveSpec {
         connection: ChannelId,
-        index: usize,
+        spec: ForwardSpec,
+        desktop: bool,
     },
     Replace {
         connection: ChannelId,
@@ -324,9 +325,15 @@ impl Forwarder {
         self.cmd(Cmd::Add { connection, spec });
     }
 
-    /// Stops the connection's `index`th forward and its connections.
-    pub fn remove(&self, connection: ChannelId, index: usize) {
-        self.cmd(Cmd::Remove { connection, index });
+    /// Stops the connection's forward `spec` (a remote desktop tunnel when
+    /// `desktop`) and its connections. Unlike an index, the spec still
+    /// names the same forward after others stopped meanwhile.
+    pub fn remove_spec(&self, connection: ChannelId, spec: ForwardSpec, desktop: bool) {
+        self.cmd(Cmd::RemoveSpec {
+            connection,
+            spec,
+            desktop,
+        });
     }
 
     /// Changes the connection's forward `old` into `new` without
@@ -662,11 +669,19 @@ impl Engine {
                 }
             }
             Cmd::Add { connection, spec } => self.add(connection, spec),
-            Cmd::Remove { connection, index } => {
+            Cmd::RemoveSpec {
+                connection,
+                spec,
+                desktop,
+            } => {
                 let Some(conn) = self.conns.get_mut(&connection) else {
                     return;
                 };
-                if index < conn.forwards.len() {
+                if let Some(index) = conn
+                    .forwards
+                    .iter()
+                    .position(|f| f.spec == spec && f.desktop.is_some() == desktop)
+                {
                     let fwd = conn.forwards.remove(index);
                     self.end_fwd(connection, fwd);
                 }
@@ -1656,7 +1671,7 @@ mod tests {
             1,
             "me@db".into(),
             Setup {
-                forwards: vec![spec],
+                forwards: vec![spec.clone()],
                 ..Setup::default()
             },
         );
@@ -1679,7 +1694,7 @@ mod tests {
             m,
             Message::ForwardOpen { connection: 1, target: Some((h, 5432)), .. } if h == "db"
         )));
-        fwd.remove(1, 0);
+        fwd.remove_spec(1, spec, false);
         wait(&|v| v.first().is_some_and(|c| c.forwards.is_empty()));
         let mut freed = false;
         for _ in 0..100 {
