@@ -187,7 +187,7 @@ For Claude Code, Codex, aider and other coding agents that run on a server. Ever
 | Shift+PgUp / Shift+PgDn | Scroll back a page, forward a page (Ctrl+Shift+Home/End: top, bottom) |
 | Mouse drag, double-click, triple-click | Select characters, words, lines; Alt+drag selects a block |
 | Shift+drag | Select even when the program has mouse reporting on |
-| Ctrl+click | Open a link (OSC 8) after showing its real target |
+| Ctrl+click | Open a link (OSC 8 or plain text) after showing its real target; `ssh://` and `sftp://` open in a new tab |
 | Ctrl+= / Ctrl+- / Ctrl+0, Ctrl+wheel | Larger, smaller, default text size |
 | Ctrl+Shift+M | Hide the menu bar (Alt shows it again) |
 | F11 | Full screen on and off (Settings > F11 switches full screen turns the key off, so F11 reaches the terminal) |

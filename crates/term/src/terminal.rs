@@ -1532,6 +1532,37 @@ impl Terminal {
             .map(|h| h.uri().to_owned())
     }
 
+    /// A link written as plain text at a viewport cell (see
+    /// [`crate::text_link`]), for Ctrl+click on text no OSC 8 marks.
+    pub fn text_link_at(&self, col: usize, row: usize) -> Option<String> {
+        let point = self.grid_point(col, row);
+        let grid = self.term.grid();
+        let cells = &grid[point.line];
+        let mut chars = Vec::new();
+        let mut at = None;
+        for c in 0..=grid.last_column().0 {
+            let cell = &cells[Column(c)];
+            if c == point.column.0 {
+                // A wide character's spacer is the character before it.
+                at = Some(chars.len().saturating_sub(usize::from(
+                    cell.flags.contains(TermFlags::WIDE_CHAR_SPACER),
+                )));
+            }
+            if cell
+                .flags
+                .intersects(TermFlags::WIDE_CHAR_SPACER | TermFlags::LEADING_WIDE_CHAR_SPACER)
+            {
+                continue;
+            }
+            chars.push(if cell.flags.contains(TermFlags::HIDDEN) {
+                ' '
+            } else {
+                cell.c
+            });
+        }
+        crate::text_link(&chars, at?)
+    }
+
     /// Opens the search bar (or keeps it open).
     pub fn search_open(&mut self) {
         if self.search.as_ref().is_some_and(|s| s.stop) {

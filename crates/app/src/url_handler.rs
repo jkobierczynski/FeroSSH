@@ -48,6 +48,14 @@ pub fn valid_link(link: &str) -> bool {
     ssh_url(link).is_some() || sftp_url(link).is_some()
 }
 
+/// Whether `link` is of a kind FeroSSH opens itself (`ssh://`, `sftp://`),
+/// valid or not.
+pub fn is_ferossh_link(link: &str) -> bool {
+    SCHEMES
+        .iter()
+        .any(|s| ferossh_config::ssh_config::has_scheme(link, &format!("{s}://")))
+}
+
 /// The ProgID FeroSSH registers for `scheme`.
 pub fn prog_id(scheme: &str) -> String {
     format!("FeroSSH.{scheme}")
@@ -355,5 +363,7 @@ mod tests {
         assert!(!valid_link("ssh://-oProxyCommand=calc"));
         assert!(!valid_link("--local"));
         assert!(!valid_link("web1.lan"));
+        assert!(is_ferossh_link("SFTP://h") && is_ferossh_link("ssh://-x"));
+        assert!(!is_ferossh_link("https://h") && !is_ferossh_link("sshx://h"));
     }
 }

@@ -97,6 +97,8 @@ The AD bit is only as trustworthy as the way to the DNS server: anyone between y
 
 `ssh://[user@]host[:port]` logs in like `user@host:port`, at the connect prompt or on the command line. To have links on web pages, in wikis, inventories or chat open in FeroSSH, turn on Settings > Open links > Open ssh:// links with FeroSSH (and the sftp:// one for [SFTP links](#sftp-only-connections)). FeroSSH has nothing to install, so this is off until you turn it on, and it is written for your Windows account only (under `HKEY_CURRENT_USER`); the same item turns it off again and takes out what it wrote. If you move `ferossh.exe`, turn it on again from the new place.
 
+In a terminal, Ctrl+click an `ssh://` or `sftp://` link, written as plain text (`echo ssh://user@host`) or marked by a program, to open it in a new FeroSSH tab after you confirm. This works without the Settings item, and such a link never goes through Windows. Plain-text `http://` and `https://` links open the same way, in your browser.
+
 A link only ever names a host: a path, a query, options, a second host, a user starting with `-` or anything a shell would read as more is refused, and FeroSSH starts from a link only as `ferossh.exe --url "<link>"`, which takes that one valid link and nothing else. The usual host key check applies, so a link to a host you have never used shows its fingerprint first. When another program already opens links of that kind, FeroSSH leaves it in place and offers itself in Windows Settings > Apps > Default apps, where you pick it; Windows may also ask the first time which program to use.
 
 ### Agent forwarding
@@ -735,7 +737,7 @@ Each picture is decoded by FeroSSH's own small decoders, in safe Rust and fuzz-t
 | Select a block | Alt+drag |
 | Select while a program uses the mouse | Shift+drag |
 | Copy / paste | Ctrl+Shift+C / Ctrl+Shift+V (or Ctrl+Insert / Shift+Insert) |
-| Open a link | Ctrl+click (FeroSSH shows its real target first) |
+| Open a link | Ctrl+click on a marked or plain-text link (FeroSSH shows its real target first; `ssh://` and `sftp://` open in a new tab) |
 | Scroll back / forward a page | Shift+PgUp / Shift+PgDn |
 | Jump to the top / bottom | Ctrl+Shift+Home / Ctrl+Shift+End |
 | Find in scrollback | Ctrl+Shift+F, then Enter for older, Shift+Enter for newer |

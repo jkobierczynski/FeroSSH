@@ -16236,7 +16236,10 @@ impl Window {
         match button {
             MouseButton::Left => {
                 if mods.ctrl
-                    && let Some(link) = p.term.link_at(col, row)
+                    && let Some(link) = p
+                        .term
+                        .link_at(col, row)
+                        .or_else(|| p.term.text_link_at(col, row))
                 {
                     return Some(Command::OpenLink(link));
                 }
@@ -21562,6 +21565,27 @@ fn run_command(hwnd: HWND, command: Command) {
                         SW_SHOWNORMAL,
                     );
                 }
+            }
+        }
+        // An ssh:// or sftp:// link opens in a new tab here, never through
+        // Windows (which may hand it to another program).
+        Command::OpenLink(raw) if crate::url_handler::is_ferossh_link(&raw) => {
+            if crate::url_handler::valid_link(&raw) && raw.chars().all(|c| c.is_ascii_graphic()) {
+                let prompt = format!("Open this link in a new FeroSSH tab?\n\n{raw}");
+                if dialog(hwnd, &prompt, MB_YESNO | MB_ICONQUESTION) == Some(IDYES) {
+                    with_window(|w| {
+                        let id = w.new_tab_pane();
+                        w.focus_terminal();
+                        w.connect(id, &raw);
+                    });
+                }
+            } else {
+                let text = format!(
+                    "FeroSSH does not open this link. An ssh:// link names only \
+                     [user@]host[:port], and an sftp:// link may add a folder.\n\n{}",
+                    clipboard_preview(&raw, PREVIEW_CHARS)
+                );
+                dialog(hwnd, &text, MB_OK | MB_ICONWARNING);
             }
         }
         Command::OpenLink(raw) => match check_link(&raw) {
