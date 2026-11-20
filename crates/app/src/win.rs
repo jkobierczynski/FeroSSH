@@ -7523,14 +7523,19 @@ impl Window {
             self.policy_of(&j.alias, Some(&j.hostname), j.tag.as_deref())
                 .keys_only
         });
-        let shared = (!rules.keys_only && !hops_keys_only)
+        // The connection to share, and the host key it was checked with
+        // (the shared login sees no key of its own).
+        let shared_with = (!rules.keys_only && !hops_keys_only)
             .then(|| {
                 self.panes.values().find_map(|p| match &p.host {
-                    Host::Ssh(s) if p.id != id && s.can_share(&target) => Some(s.connection),
+                    Host::Ssh(s) if p.id != id && s.can_share(&target) => {
+                        Some((s.connection, s.host_key_seen.clone()))
+                    }
                     _ => None,
                 })
             })
             .flatten();
+        let shared = shared_with.as_ref().map(|(c, _)| *c);
         let channel = self.new_channel();
         // A new login runs in a worker of its own; a shared connection's
         // shell in that connection's.
@@ -7562,6 +7567,9 @@ impl Window {
             .unwrap_or(self.settings.auto_reconnect);
         let mut session = SshSession::new(channel, target, env.known_hosts());
         session.auto_reconnect = auto_reconnect;
+        if let Some((_, key)) = shared_with {
+            session.host_key_seen = key;
+        }
         // A saved proxy password is read only where no rule on the way
         // forbids saved passwords.
         let mut proxy_rules = policy;
