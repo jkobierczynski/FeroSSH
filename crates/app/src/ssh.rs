@@ -418,11 +418,11 @@ impl Target {
             self.identities_only = fresh.identities_only;
             self.agent = fresh.agent;
         }
-        // A ProxyCommand's %r was filled in with the old user: fill it in
-        // again for the new one.
+        // A ProxyCommand's %r was filled in with the old user: take it as
+        // the config now gives it, filled in for the new one. One taken out
+        // of the config since is not run again with the old user.
         if self.proxy_command.is_some()
             && let Ok(fresh) = Self::resolve_route(&self.typed, env)
-            && fresh.proxy_command.is_some()
         {
             self.proxy_command = fresh.proxy_command;
         }
@@ -4588,7 +4588,11 @@ mod tests {
         t.refresh_login(&e);
         assert_eq!(t.user, "bob");
         let args = &t.proxy_command.as_ref().unwrap().args;
-        assert!(args.contains(&"bob@gw".to_owned()), "{args:?}");
+        assert!(args.contains(&"bob@gw".to_owned()), "{args:?}"); // The ProxyCommand taken out of the config: not run with alice.
+        e.config = "Match originalhost web\n  User carol\nHost web\n  User alice\n".into();
+        t.refresh_login(&e);
+        assert_eq!(t.user, "carol");
+        assert!(t.proxy_command.is_none());
     }
 
     #[test]
