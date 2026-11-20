@@ -24,6 +24,24 @@ pub struct HostItem {
     pub detail: String,
     /// What opening it does; anything but SSH is tagged in the list.
     pub kind: SessionKind,
+    /// Its tags: ssh_config's `Tag`, then the connection's own `Tags`.
+    pub tags: Vec<String>,
+}
+
+impl HostItem {
+    /// The detail with the tags after it, `#` before each:
+    /// `me@web.example  #prod #web`.
+    pub fn detail_with_tags(&self) -> String {
+        if self.tags.is_empty() {
+            return self.detail.clone();
+        }
+        let tags: Vec<String> = self.tags.iter().map(|t| format!("#{t}")).collect();
+        if self.detail.is_empty() {
+            tags.join(" ")
+        } else {
+            format!("{}  {}", self.detail, tags.join(" "))
+        }
+    }
 }
 
 /// A visible row.
@@ -184,6 +202,10 @@ impl SessionList {
         q.split_whitespace().all(|word| {
             h.name.to_lowercase().contains(word)
                 || h.detail.to_lowercase().contains(word)
+                || h.tags.iter().any(|t| {
+                    let t = t.to_lowercase();
+                    t.contains(word) || format!("#{t}").contains(word)
+                })
                 || h.folder
                     .as_deref()
                     .is_some_and(|f| f.to_lowercase().contains(word))
@@ -513,10 +535,11 @@ impl SessionList {
                     // The kind and detail, dimmed and to the right, where
                     // there is room after the name.
                     let used = 3 + indent.len() + h.name.chars().count() + 2;
+                    let shown = h.detail_with_tags();
                     let detail = match h.kind {
-                        SessionKind::Ssh => h.detail.clone(),
-                        kind if h.detail.is_empty() => kind.name().to_owned(),
-                        kind => format!("{} · {}", kind.name(), h.detail),
+                        SessionKind::Ssh => shown,
+                        kind if shown.is_empty() => kind.name().to_owned(),
+                        kind => format!("{} · {shown}", kind.name()),
                     };
                     put_right(&mut cells, &detail, used, palette.dim, row_bg);
                     cells
@@ -591,16 +614,22 @@ impl SessionList {
             SessionKind::Ssh => format!("{star}{}", h.name),
             kind => format!("{star}{} ({})", h.name, kind.name()),
         };
-        let tip = match h.kind {
+        let mut tip = match h.kind {
             SessionKind::Ssh => h.detail.clone(),
             kind if h.detail.is_empty() => kind.name().to_owned(),
             kind => format!("{} \u{b7} {}", kind.name(), h.detail),
         };
+        if !h.tags.is_empty() {
+            if !tip.is_empty() {
+                tip.push('\n');
+            }
+            tip.push_str(&format!("Tags: {}", h.tags.join(", ")));
+        }
         Some(TreeHost {
             name: h.name.clone(),
             label,
             tip,
-            detail: h.detail.clone(),
+            detail: h.detail_with_tags(),
             workspace: false,
         })
     }
@@ -759,7 +788,30 @@ mod tests {
             folder: folder.map(Into::into),
             detail: format!("me@{name}.example"),
             kind: SessionKind::Ssh,
+            tags: Vec::new(),
         }
+    }
+
+    #[test]
+    fn tags_show_after_the_detail_and_are_searched() {
+        let mut web = item("web", None);
+        web.tags = vec!["prod".into(), "eu".into()];
+        let mut l = SessionList::new(vec![web, item("db1", Some("Work"))], Vec::new());
+        let tree = l.tree();
+        let h = &tree[0].hosts()[0];
+        assert_eq!(h.detail, "me@web.example  #prod #eu");
+        assert_eq!(h.tip, "me@web.example\nTags: prod, eu");
+        for q in ["prod", "#prod", "#eu web"] {
+            l.set_query(q);
+            let names: Vec<String> = l
+                .tree()
+                .iter()
+                .flat_map(|n| n.hosts().iter().map(|h| h.name.clone()).collect::<Vec<_>>())
+                .collect();
+            assert_eq!(names, ["web"], "{q}");
+        }
+        l.set_query("#work");
+        assert!(l.tree().is_empty(), "a folder is no tag");
     }
 
     fn list() -> SessionList {

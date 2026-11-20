@@ -51,7 +51,13 @@ impl ThemeRule {
         let by_tag = self
             .tags
             .iter()
-            .any(|p| tags.iter().any(|t| match_pattern(t, p)));
+            // Case folded in any alphabet, as tags are compared
+            // elsewhere (`settings::same_tag`); host patterns stay ASCII.
+            .any(|p| {
+                let p = crate::settings::fold_tag(p);
+                tags.iter()
+                    .any(|t| match_pattern(&crate::settings::fold_tag(t), &p))
+            });
         by_tag || match_host(host, self.hosts.iter().map(String::as_str))
     }
 }
@@ -102,6 +108,24 @@ mod tests {
 
     fn theme<'a>(t: &'a HostThemes, host: &str, tags: &[&str]) -> Option<&'a str> {
         t.rule_for(host, tags).map(|r| r.theme.as_str())
+    }
+
+    #[test]
+    fn tags_match_whatever_their_case_in_any_alphabet() {
+        let mut t = HostThemes::new();
+        t.push(ThemeRule::new("Dracula").tags(&["équipe*"]));
+        assert_eq!(theme(&t, "box", &["ÉQUIPE-1"]), Some("Dracula"));
+        // ? stays one character, even where lower case would make two.
+        let mut t = HostThemes::new();
+        t.push(ThemeRule::new("Dracula").tags(&["?"]));
+        assert_eq!(theme(&t, "box", &["İ"]), Some("Dracula"));
+        // Final sigma is the same letter as sigma.
+        let mut t = HostThemes::new();
+        t.push(ThemeRule::new("Dracula").tags(&["ος"]));
+        assert_eq!(theme(&t, "box", &["ΟΣ"]), Some("Dracula"));
+        let mut t = HostThemes::new();
+        t.push(ThemeRule::new("Dracula").tags(&["S?"]));
+        assert_eq!(theme(&t, "box", &["ſİ"]), Some("Dracula"));
     }
 
     #[test]

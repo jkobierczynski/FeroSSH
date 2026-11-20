@@ -234,6 +234,10 @@ pub struct Profile {
     /// cannot. Off, only Kerberos logs in over HTTP, because NTLM there
     /// does not prove who answers and its login can be taken or relayed.
     pub winrm_ntlm: bool,
+    /// The connection's own tags (`Tags prod web eu`), on top of the one
+    /// ssh_config's `Tag` may give it: searched for in the connection
+    /// manager and matched by the colour theme rules. See [`parse_tags`].
+    pub tags: Vec<String>,
 }
 
 /// The ways copied text can travel, as the clipboard settings spell
@@ -444,6 +448,89 @@ pub fn start_dir(dir: &str) -> Option<String> {
     (!dir.is_empty() && !dir.chars().any(|c| c.is_control() || c == '"')).then(|| dir.to_owned())
 }
 
+/// The most tags one connection keeps.
+pub const MAX_TAGS: usize = 16;
+/// The longest tag, in characters.
+pub const MAX_TAG_LEN: usize = 32;
+
+/// Whether two tags are the same one: case does not matter, in any
+/// alphabet (`équipe` and `ÉQUIPE` are one tag).
+pub fn same_tag(a: &str, b: &str) -> bool {
+    a == b || fold_tag(a) == fold_tag(b)
+}
+
+/// A tag with its case folded for comparing, one character for one, so
+/// `?` in a tag pattern still stands for one character (`İ` folds to
+/// `i`, not to the two characters `str::to_lowercase` gives). Each
+/// character goes to upper case and back, so letters with two lower-case
+/// forms fold together: `ς` and `σ` (both `Σ`), `ſ` and `s` (both `S`),
+/// `µ` and `μ` (both `Μ`).
+pub fn fold_tag(tag: &str) -> String {
+    tag.chars().map(fold_char).collect()
+}
+
+fn fold_char(c: char) -> char {
+    let mut up = c.to_uppercase();
+    let base = match (up.next(), up.next()) {
+        (Some(u), None) => u,
+        // `ß` and the like become two letters in upper case: keep the
+        // character itself.
+        _ => c,
+    };
+    base.to_lowercase().next().unwrap_or(base)
+}
+
+/// Whether `tag` can be a connection's tag: 1 to [`MAX_TAG_LEN`] letters,
+/// digits, `-`, `_`, `.`, `/` and `:`, so it never needs quoting and reads
+/// the same in `tag:` searches.
+pub fn valid_tag(tag: &str) -> bool {
+    !tag.is_empty()
+        && tag.chars().count() <= MAX_TAG_LEN
+        && tag
+            .chars()
+            .all(|c| c.is_alphanumeric() || matches!(c, '-' | '_' | '.' | '/' | ':'))
+}
+
+/// Tags as typed in the connection form: separated by spaces or commas,
+/// a leading `#` dropped, repeats (in any case) kept once, in the order
+/// typed. An error names the first tag that cannot be one.
+pub fn parse_tags(text: &str) -> Result<Vec<String>, String> {
+    let mut out: Vec<String> = Vec::new();
+    for word in text.split(|c: char| c.is_whitespace() || c == ',') {
+        let tag = word.trim_start_matches('#');
+        if tag.is_empty() {
+            continue;
+        }
+        if !valid_tag(tag) {
+            let shown: String = tag.chars().filter(|c| !c.is_control()).take(40).collect();
+            return Err(format!(
+                "\"{shown}\" cannot be a tag: use up to {MAX_TAG_LEN} letters, digits, - _ . / and :."
+            ));
+        }
+        if !out.iter().any(|t| same_tag(t, tag)) {
+            out.push(tag.to_owned());
+        }
+    }
+    if out.len() > MAX_TAGS {
+        return Err(format!("A connection keeps at most {MAX_TAGS} tags."));
+    }
+    Ok(out)
+}
+
+/// A connection's tags: ssh_config's `Tag` first, then its profile's
+/// own, each kept once whatever its case.
+pub fn host_tags(ssh_tag: Option<&str>, profile: Option<&Profile>) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let own = profile.map(|p| p.tags.as_slice()).unwrap_or_default();
+    for t in ssh_tag.into_iter().chain(own.iter().map(String::as_str)) {
+        let t = t.trim();
+        if !t.is_empty() && !out.iter().any(|o| same_tag(o, t)) {
+            out.push(t.to_owned());
+        }
+    }
+    out
+}
+
 /// A named pair of folders for File transfer: one on this PC, one on a
 /// server (either may be missing), for one host or (`host` unset) any.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -534,6 +621,7 @@ impl Profile {
             && self.winrm_command.is_none()
             && !self.winrm_https
             && !self.winrm_ntlm
+            && self.tags.is_empty()
     }
 }
 
@@ -1614,6 +1702,21 @@ impl Settings {
                                 p.winrm_https =
                                     first.is_some_and(|v| v.eq_ignore_ascii_case("yes"));
                             }
+                            // Bad tags in a hand-edited file are left out,
+                            // the good ones kept.
+                            "tags" => {
+                                for word in &args {
+                                    for t in word.split(',') {
+                                        let t = t.trim_start_matches('#');
+                                        if valid_tag(t)
+                                            && p.tags.len() < MAX_TAGS
+                                            && !p.tags.iter().any(|o| same_tag(o, t))
+                                        {
+                                            p.tags.push(t.to_owned());
+                                        }
+                                    }
+                                }
+                            }
                             "winrmntlm" => {
                                 p.winrm_ntlm = first.is_some_and(|v| v.eq_ignore_ascii_case("yes"));
                             }
@@ -1983,6 +2086,15 @@ impl Settings {
             }
             if p.winrm_ntlm {
                 let _ = writeln!(out, "    WinrmNtlm yes");
+            }
+            let tags: Vec<&str> = p
+                .tags
+                .iter()
+                .map(String::as_str)
+                .filter(|t| valid_tag(t))
+                .collect();
+            if !tags.is_empty() {
+                let _ = writeln!(out, "    Tags {}", tags.join(" "));
             }
             match &p.password {
                 PasswordSource::Ask => {}
@@ -2435,6 +2547,51 @@ Profile lab
         }
         assert!(Settings::parse(&moved.to_text()).snippets.is_empty());
         assert_eq!(Settings::parse(""), Settings::default());
+    }
+
+    #[test]
+    fn tags_round_trip_and_bad_ones_are_left_out() {
+        let s = Settings::parse(
+            "Profile web\n    Tags prod #web eu,de PROD x;y\nProfile db\n    Tags\n",
+        );
+        let web = s.profile("web").unwrap();
+        assert_eq!(web.tags, ["prod", "web", "eu", "de"]);
+        assert!(s.profile("db").is_none_or(|p| p.tags.is_empty()));
+        let back = Settings::parse(&s.to_text());
+        assert_eq!(back.profile("web").unwrap().tags, web.tags);
+        assert!(s.to_text().contains("    Tags prod web eu de\n"));
+    }
+
+    #[test]
+    fn tags_as_typed() {
+        assert_eq!(
+            parse_tags(" #prod, web  eu/de team:ops Prod ").unwrap(),
+            ["prod", "web", "eu/de", "team:ops"]
+        );
+        assert_eq!(parse_tags("").unwrap(), Vec::<String>::new());
+        assert!(parse_tags("a\"b").is_err());
+        assert!(parse_tags(&"x".repeat(MAX_TAG_LEN + 1)).is_err());
+        let many: Vec<String> = (0..=MAX_TAGS).map(|i| format!("t{i}")).collect();
+        assert!(parse_tags(&many.join(" ")).is_err());
+        assert!(valid_tag("équipe"));
+        assert_eq!(parse_tags("équipe ÉQUIPE").unwrap(), ["équipe"]);
+        assert_eq!(fold_tag("İÉ").chars().count(), 2);
+        assert_eq!(parse_tags("ΟΣ ος").unwrap(), ["ΟΣ"]);
+        assert!(same_tag("ος", "ΟΣ"));
+        assert_eq!(parse_tags("ſ S").unwrap(), ["ſ"]);
+        assert!(same_tag("µ", "Μ"));
+        assert_eq!(fold_tag("ßİ").chars().count(), 2);
+        assert_eq!(host_tags(Some("ÉQUIPE"), None), ["ÉQUIPE"]);
+    }
+
+    #[test]
+    fn host_tags_put_the_ssh_config_tag_first_once() {
+        let s = Settings::parse("Profile web\n    Tags web Production\n");
+        assert_eq!(
+            host_tags(Some("production"), s.profile("web")),
+            ["production", "web"]
+        );
+        assert_eq!(host_tags(None, None), Vec::<String>::new());
     }
 
     #[test]
