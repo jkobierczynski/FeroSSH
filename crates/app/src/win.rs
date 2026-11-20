@@ -12817,6 +12817,7 @@ impl Window {
                     .set_saved_searches(self.settings.saved_searches.clone());
                 self.save_settings();
             }
+            Some(SideAction::Bulk(action)) => self.bulk_action(action),
             Some(SideAction::New) => self.open_form(None),
             Some(SideAction::Edit(host)) => self.open_form(Some(host)),
             Some(SideAction::Delete(host)) => {
@@ -14558,6 +14559,59 @@ impl Window {
         self.side.form = None;
         self.reload_sessions(None);
         self.refresh_chrome();
+    }
+
+    /// Carries out a change to several connections from the connection
+    /// manager's menu.
+    fn bulk_action(&mut self, action: crate::bulk::BulkAction) {
+        use crate::bulk::BulkAction;
+        match action {
+            BulkAction::OpenAll(names) => {
+                for name in &names {
+                    self.open_host(name, false);
+                }
+            }
+            BulkAction::AddTag(names, tag) => {
+                crate::bulk::add_tag(&mut self.settings, &names, &tag);
+                self.save_settings();
+                self.reload_sessions(None);
+            }
+            BulkAction::RemoveTag(names, tag) => {
+                crate::bulk::remove_tag(&mut self.settings, &names, &tag);
+                self.save_settings();
+                self.reload_sessions(None);
+            }
+            BulkAction::MoveTo(names, folder) => {
+                let mut hosts = load_saved();
+                let out = crate::bulk::move_to_folder(&mut hosts, &names, folder.as_deref());
+                if out.changed > 0 {
+                    if let Err(e) = write_app_file(&sessions_path(), &saved::to_text(&hosts)) {
+                        self.queued.push(Command::Notice(format!(
+                            "Could not save {}: {e}",
+                            sessions_path().display()
+                        )));
+                        return;
+                    }
+                    self.reload_sessions(None);
+                }
+                if !out.skipped.is_empty() {
+                    self.queued.push(Command::Notice(format!(
+                        "Left in their folders: {}. They come from ~/.ssh/config or an \
+                         import, which FeroSSH does not change.",
+                        crate::bulk::name_list(&out.skipped)
+                    )));
+                }
+            }
+        }
+        conn_view::clear_marks();
+        self.refresh_chrome();
+    }
+
+    /// Deletes the saved connections among `names` (asked first).
+    fn delete_sessions(&mut self, names: &[String]) {
+        for name in names {
+            self.delete_session(name);
+        }
     }
 
     /// Reads the hosts again after a session was saved or deleted.
@@ -16428,6 +16482,7 @@ impl Window {
                     return Some(Command::SessionMenu(
                         self.side.list.selected_host(),
                         self.side.list.selected_saved_search(),
+                        Vec::new(),
                     ));
                 }
                 if button != MouseButton::Left {
@@ -20567,7 +20622,8 @@ enum Command {
     /// The connection manager's right-click menu, on this host if any.
     /// The connection manager's right-click menu: on this host, or on
     /// this saved search's smart folder.
-    SessionMenu(Option<String>, Option<String>),
+    /// With two or more hosts selected, the menu acts on them all.
+    SessionMenu(Option<String>, Option<String>, Vec<String>),
     /// A tab's right-click menu.
     TabMenu(usize),
     /// Ask, then remove this saved session.
@@ -21335,7 +21391,15 @@ fn conn_event(hwnd: HWND, event: conn_view::Event) {
             w.side_action(Some(SideAction::Open { host, split }))
         })
         .flatten(),
-        Event::Menu { host, search } => Some(Command::SessionMenu(host, search)),
+        Event::Menu {
+            host,
+            search,
+            marked,
+        } => Some(Command::SessionMenu(host, search, marked)),
+        Event::DeleteMany(names) => {
+            delete_many(hwnd, names);
+            None
+        }
         Event::Command(id) => Some(Command::Id(id)),
         Event::Query(query) => {
             with_window(|w| {
@@ -21949,6 +22013,191 @@ fn session_menu(hwnd: HWND, host: Option<String>, search: Option<String>) {
     };
     if let Some(Some(command)) = with_window(|w| w.side_action(Some(action))) {
         run_command(hwnd, command);
+    }
+}
+
+/// The connection manager's right-click menu with several hosts
+/// selected: connect to them all, tag them, move them, delete them.
+fn bulk_menu(hwnd: HWND, names: Vec<String>) {
+    use crate::bulk::{BulkAction, MAX_CHOICES};
+    use crate::native::wide;
+    const CONNECT_ALL: u32 = 1;
+    const DELETE: u32 = 2;
+    const CLEAR: u32 = 3;
+    const NO_FOLDER: u32 = 4;
+    const ADD_TAG: u32 = 100;
+    const REMOVE_TAG: u32 = 200;
+    const MOVE_TO: u32 = 300;
+    let Some((tags, folders)) = with_window(|w| {
+        let items = host_items(&ssh_env(), &w.settings);
+        let tags = crate::bulk::tag_choices(&items, &w.settings, &names);
+        (tags, crate::bulk::folder_choices(&load_saved()))
+    }) else {
+        return;
+    };
+    let n = names.len();
+    // SAFETY: popup menus of our own on our window; the submenus belong to
+    // the menu and go with it. TPM_RETURNCMD returns the picked id.
+    let picked = unsafe {
+        let Ok(menu) = CreatePopupMenu() else {
+            return;
+        };
+        let title = wide(&format!("{n} connections selected"));
+        let _ = AppendMenuW(menu, MF_STRING | MF_GRAYED, 0, PCWSTR(title.as_ptr()));
+        let _ = AppendMenuW(menu, MF_SEPARATOR, 0, None);
+        let connect = wide(&format!("&Connect to all {n}"));
+        let _ = AppendMenuW(
+            menu,
+            MF_STRING,
+            CONNECT_ALL as usize,
+            PCWSTR(connect.as_ptr()),
+        );
+        let _ = AppendMenuW(menu, MF_SEPARATOR, 0, None);
+        let sub = |label: &str, base: u32, list: &[String], empty: &str| {
+            let Ok(popup) = CreatePopupMenu() else {
+                return;
+            };
+            if list.is_empty() {
+                let text = wide(empty);
+                let _ = AppendMenuW(popup, MF_STRING | MF_GRAYED, 0, PCWSTR(text.as_ptr()));
+            }
+            for (i, entry) in list.iter().take(MAX_CHOICES).enumerate() {
+                // An & in a name would underline the next letter.
+                let text = wide(&entry.replace('&', "&&"));
+                let _ = AppendMenuW(
+                    popup,
+                    MF_STRING,
+                    (base + i as u32) as usize,
+                    PCWSTR(text.as_ptr()),
+                );
+            }
+            if base == MOVE_TO {
+                if !list.is_empty() {
+                    let _ = AppendMenuW(popup, MF_SEPARATOR, 0, None);
+                }
+                let _ = AppendMenuW(popup, MF_STRING, NO_FOLDER as usize, w!("No folder"));
+            }
+            let label = wide(label);
+            let _ = AppendMenuW(menu, MF_POPUP, popup.0 as usize, PCWSTR(label.as_ptr()));
+        };
+        sub(
+            "&Add tag",
+            ADD_TAG,
+            &tags.add,
+            "No other tags yet: give one connection a tag in its form (F2)",
+        );
+        sub(
+            "&Remove tag",
+            REMOVE_TAG,
+            &tags.remove,
+            "None of their own (ssh_config's Tag stays)",
+        );
+        sub("&Move to folder", MOVE_TO, &folders, "");
+        let _ = AppendMenuW(menu, MF_SEPARATOR, 0, None);
+        let delete = wide(&format!("&Delete {n} connections...\tDel"));
+        let _ = AppendMenuW(menu, MF_STRING, DELETE as usize, PCWSTR(delete.as_ptr()));
+        let _ = AppendMenuW(
+            menu,
+            MF_STRING,
+            CLEAR as usize,
+            w!("Clear the selection\tEsc"),
+        );
+        let mut pt = POINT::default();
+        let _ = GetCursorPos(&mut pt);
+        let chosen = TrackPopupMenu(
+            menu,
+            TPM_RETURNCMD | TPM_NONOTIFY,
+            pt.x,
+            pt.y,
+            None,
+            hwnd,
+            None,
+        );
+        let _ = DestroyMenu(menu);
+        u32::try_from(chosen.0).unwrap_or(0)
+    };
+    let pick = |base: u32, list: &[String]| {
+        picked
+            .checked_sub(base)
+            .and_then(|i| list.get(i as usize))
+            .cloned()
+    };
+    let action = match picked {
+        0 => return,
+        CLEAR => {
+            conn_view::clear_marks();
+            return;
+        }
+        DELETE => {
+            delete_many(hwnd, names);
+            return;
+        }
+        CONNECT_ALL => {
+            if n > 8
+                && dialog(
+                    hwnd,
+                    &format!("Connect to all {n} connections, a tab each?"),
+                    MB_YESNO | MB_ICONQUESTION | MB_DEFBUTTON2,
+                ) != Some(IDYES)
+            {
+                return;
+            }
+            BulkAction::OpenAll(names)
+        }
+        NO_FOLDER => BulkAction::MoveTo(names, None),
+        p if (MOVE_TO..MOVE_TO + 100).contains(&p) => match pick(MOVE_TO, &folders) {
+            Some(f) => BulkAction::MoveTo(names, Some(f)),
+            None => return,
+        },
+        p if (REMOVE_TAG..REMOVE_TAG + 100).contains(&p) => match pick(REMOVE_TAG, &tags.remove) {
+            Some(t) => BulkAction::RemoveTag(names, t),
+            None => return,
+        },
+        p if (ADD_TAG..ADD_TAG + 100).contains(&p) => match pick(ADD_TAG, &tags.add) {
+            Some(t) => BulkAction::AddTag(names, t),
+            None => return,
+        },
+        _ => return,
+    };
+    if let Some(Some(command)) = with_window(|w| w.side_action(Some(SideAction::Bulk(action)))) {
+        run_command(hwnd, command);
+    }
+}
+
+/// Delete with several connections selected: asks once, listing them,
+/// and deletes the saved ones; the others are named as left alone.
+fn delete_many(hwnd: HWND, names: Vec<String>) {
+    let (mine, others) = crate::bulk::saved_only(&load_saved(), &names);
+    if mine.is_empty() {
+        dialog(
+            hwnd,
+            &format!(
+                "None of these can be deleted here: {}. They come from ~/.ssh/config or an \
+                 import, which FeroSSH does not change.",
+                crate::bulk::name_list(&others)
+            ),
+            MB_OK | MB_ICONINFORMATION,
+        );
+        return;
+    }
+    let mut text = format!(
+        "Delete {} connection{}: {}? Their looks and extras in FeroSSH go with them.",
+        mine.len(),
+        plural(mine.len()),
+        crate::bulk::name_list(&mine)
+    );
+    if !others.is_empty() {
+        text.push_str(&format!(
+            "\n\nLeft alone, because FeroSSH does not change ~/.ssh/config or imports: {}.",
+            crate::bulk::name_list(&others)
+        ));
+    }
+    text.push_str("\n\nThis cannot be undone.");
+    if dialog(hwnd, &text, MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2) == Some(IDYES) {
+        with_window(|w| {
+            w.delete_sessions(&mine);
+            conn_view::clear_marks();
+        });
     }
 }
 
@@ -22788,7 +23037,8 @@ fn run_command(hwnd: HWND, command: Command) {
                 }
             }
         }
-        Command::SessionMenu(host, search) => session_menu(hwnd, host, search),
+        Command::SessionMenu(_, _, marked) if marked.len() > 1 => bulk_menu(hwnd, marked),
+        Command::SessionMenu(host, search, _) => session_menu(hwnd, host, search),
         Command::TabMenu(tab) => tab_menu(hwnd, tab),
         Command::PlayCast => {
             if let Some(path) = pick_file(hwnd, w!("Play a recording"), &log_dir())

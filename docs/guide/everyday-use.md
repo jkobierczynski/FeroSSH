@@ -175,6 +175,15 @@ Ctrl+Shift+S shows your hosts in the tools pane: those from `~/.ssh/config`, you
 
 **Saved searches.** Right-click the connection manager while a search is typed and choose *Save this search as a folder*. The search then shows as a folder named *Search: tag:prod* above the others, listing the connections it finds at that moment; it starts closed. Right-click that folder and choose *Remove this saved search* to drop it. Saved searches are kept in `ferossh.conf` (`SavedSearch`).
 
+**Several connections at once.** Ctrl+click connections to select several (the one already selected comes along), Shift+click to select a run of them, Ctrl+A to select every connection listed (a search narrows it first), and Ctrl+Space to add or take out the selected one. Selected connections are highlighted; a plain click or Escape clears the selection. Right-click one of them for a menu that acts on them all:
+
+- **Connect to all**: a tab each (FeroSSH asks first when there are more than eight).
+- **Add tag** and **Remove tag**: any tag already used by a connection can be added; a connection's own tags can be removed, while a tag from ssh_config's `Tag` stays. To use a brand-new tag, give it to one connection in its form first.
+- **Move to folder**: one of the folders your saved connections use, or *No folder*.
+- **Delete**: asks once, listing them (Del does the same).
+
+Moving and deleting change connections saved in FeroSSH only. Hosts from `~/.ssh/config` or an import are left as they are, and FeroSSH names them. Tags work on every host.
+
 ### Saved connections
 
 Insert or the New button opens the connection form in the tools pane; F2, the Edit button or a right click edits the selected connection. It is a Windows form of text boxes and drop-down lists, with a tab per section:
