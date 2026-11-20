@@ -106,24 +106,43 @@ pub fn bind(path: &str) -> io::Result<Socket> {
 }
 
 /// What tells one file from another at the same path: device and inode
-/// on Unix, the creation time on Windows.
+/// on Unix, volume serial number and file index on Windows.
+#[cfg(unix)]
 fn file_id(path: &str) -> Option<(u64, u64)> {
+    use std::os::unix::fs::MetadataExt;
     let meta = std::fs::symlink_metadata(path).ok()?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt;
-        Some((meta.dev(), meta.ino()))
-    }
-    #[cfg(windows)]
-    {
-        use std::os::windows::fs::MetadataExt;
-        Some((meta.creation_time(), 0))
-    }
-    #[cfg(not(any(unix, windows)))]
-    {
-        let _ = meta;
-        None
-    }
+    Some((meta.dev(), meta.ino()))
+}
+
+#[cfg(windows)]
+#[allow(unsafe_code)]
+fn file_id(path: &str) -> Option<(u64, u64)> {
+    use std::os::windows::fs::OpenOptionsExt;
+    use std::os::windows::io::AsRawHandle;
+    use windows::Win32::Foundation::HANDLE;
+    use windows::Win32::Storage::FileSystem::{
+        BY_HANDLE_FILE_INFORMATION, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
+        GetFileInformationByHandle,
+    };
+    // The socket file itself (a reparse point), opened only to ask
+    // about it: no read or write access.
+    let file = std::fs::OpenOptions::new()
+        .access_mode(0)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT.0 | FILE_FLAG_BACKUP_SEMANTICS.0)
+        .open(path)
+        .ok()?;
+    let mut info = BY_HANDLE_FILE_INFORMATION::default();
+    // SAFETY: a handle the File owns for the call, and our own struct.
+    unsafe { GetFileInformationByHandle(HANDLE(file.as_raw_handle()), &mut info) }.ok()?;
+    Some((
+        u64::from(info.dwVolumeSerialNumber),
+        (u64::from(info.nFileIndexHigh) << 32) | u64::from(info.nFileIndexLow),
+    ))
+}
+
+#[cfg(not(any(unix, windows)))]
+fn file_id(_path: &str) -> Option<(u64, u64)> {
+    None
 }
 
 /// Removes the socket file of a listener when dropped, as the listener's
@@ -271,9 +290,27 @@ mod tests {
         assert!(check_path("x/y.sock").is_err());
     }
 
+    #[tokio::test]
+    async fn connecting_where_nothing_listens_fails() {
+        let path = temp_path("nobody");
+        let _ = std::fs::remove_file(&path);
+        assert!(connect(&path).await.is_err());
+    }
+}
+
+/// Runs on Windows too, where CI has AF_UNIX.
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod identity_tests {
+    use super::*;
+
     #[test]
     fn a_socket_put_in_its_place_is_left_alone() {
-        let path = temp_path("replaced");
+        let dir =
+            std::env::temp_dir().join(format!("ferossh-sock-{}-replaced", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("s.sock").to_string_lossy().into_owned();
+        let _ = std::fs::remove_file(&path);
         let first = bind(&path).unwrap();
         let unlink = Unlink::new(path.clone());
         drop(first);
@@ -286,12 +323,5 @@ mod tests {
         drop(second);
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(&aside);
-    }
-
-    #[tokio::test]
-    async fn connecting_where_nothing_listens_fails() {
-        let path = temp_path("nobody");
-        let _ = std::fs::remove_file(&path);
-        assert!(connect(&path).await.is_err());
     }
 }
