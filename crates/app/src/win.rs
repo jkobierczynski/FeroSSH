@@ -22191,7 +22191,7 @@ fn edit_credential(hwnd: HWND, original: Option<String>) {
         .as_deref()
         .and_then(|o| with_window(|w| w.settings.credential(o).map(Typed::of)).flatten())
         .unwrap_or_else(|| Typed {
-            password: "ask".into(),
+            source: "ask".into(),
             ..Typed::default()
         });
     let users = original
@@ -22225,7 +22225,7 @@ fn edit_credential(hwnd: HWND, original: Option<String>) {
                     ("Name", &typed.name),
                     ("User", &typed.user),
                     ("Key file", &typed.key),
-                    ("Password", &typed.password),
+                    ("Password", &typed.source),
                 ],
                 option: original.as_ref().map(|_| ("Delete this credential", false)),
                 ok: "Save",
@@ -22241,7 +22241,7 @@ fn edit_credential(hwnd: HWND, original: Option<String>) {
             name: f.next().unwrap_or_default(),
             user: f.next().unwrap_or_default(),
             key: f.next().unwrap_or_default(),
-            password: f.next().unwrap_or_default(),
+            source: f.next().unwrap_or_default(),
         };
         if answer.option
             && let Some(o) = &original

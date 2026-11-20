@@ -36,7 +36,9 @@ pub struct Typed {
     pub name: String,
     pub user: String,
     pub key: String,
-    pub password: String,
+    /// The password source as typed (see [`password_text`]), never a
+    /// password.
+    pub source: String,
 }
 
 impl Typed {
@@ -45,7 +47,7 @@ impl Typed {
             name: c.name.clone(),
             user: c.user.clone().unwrap_or_default(),
             key: c.key.clone().unwrap_or_default(),
-            password: password_text(&c.password),
+            source: password_text(&c.password),
         }
     }
 }
@@ -76,10 +78,10 @@ pub fn save(
     if !key.is_empty() && !valid_key_path(key) {
         return Err("The key file's path cannot hold \" or control characters.".into());
     }
-    if typed.password.chars().any(char::is_control) {
+    if typed.source.chars().any(char::is_control) {
         return Err("The password command cannot hold control characters.".into());
     }
-    let password = password_from_text(&typed.password);
+    let password = password_from_text(&typed.source);
     if user.is_empty() && key.is_empty() && password == PasswordSource::Ask {
         return Err("Fill in a user, a key file or a password source.".into());
     }
@@ -163,12 +165,12 @@ pub fn label(settings: &Settings, c: &Credential) -> String {
 mod tests {
     use super::*;
 
-    fn typed(name: &str, user: &str, key: &str, password: &str) -> Typed {
+    fn typed(name: &str, user: &str, key: &str, source: &str) -> Typed {
         Typed {
             name: name.into(),
             user: user.into(),
             key: key.into(),
-            password: password.into(),
+            source: source.into(),
         }
     }
 
@@ -203,7 +205,7 @@ mod tests {
         assert_eq!(s.credential_users("ops-admin"), ["web", "db"]);
         let c = s.credential("ops-admin").unwrap();
         assert_eq!(c.key.as_deref(), Some("C:\\Keys\\ops"));
-        assert_eq!(Typed::of(c).password, "op read x");
+        assert_eq!(Typed::of(c).source, "op read x");
         assert_eq!(
             label(&s, c),
             "ops-admin: ops, key file, password manager (2 connections)"
