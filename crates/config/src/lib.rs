@@ -8,6 +8,7 @@
 pub mod bundle;
 pub mod forward;
 pub mod highlight;
+pub mod host_policy;
 pub mod host_query;
 mod host_theme;
 pub mod hostkey;

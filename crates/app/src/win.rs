@@ -19,6 +19,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant, SystemTime};
 
 use ferossh_auth::Broker;
+use ferossh_config::host_policy::{Policy, Subject};
 use ferossh_config::hotkey::Hotkey;
 use ferossh_config::import::{self, Client};
 use ferossh_config::login::{self, Place, Snippet, Step};
@@ -879,6 +880,33 @@ impl Replay {
 /// over one worker reaches only its own connection: the shells, SFTP and
 /// forwards on it, never another host's.
 /// The login a password source answers, from [`Window::password_login`].
+/// A connection waiting for the answer to a security rule's question.
+struct PendingConnect {
+    /// The question's number: an answer to an older one is ignored.
+    token: u64,
+    /// Where the connection goes, as asked about.
+    endpoint: String,
+    /// What the request that connected does once the answer is Yes.
+    after: AfterConfirm,
+}
+
+/// What a connection that waited for a security rule's answer still has
+/// to do.
+#[derive(Default)]
+enum AfterConfirm {
+    /// Nothing more: a connection typed or picked.
+    #[default]
+    Plain,
+    /// A multi-host run's row: its login is watched, or the row fails.
+    Run,
+    /// A workspace's pane: its start directory, and its look over the
+    /// host's.
+    Workspace {
+        dir: Option<String>,
+        spec: Option<Box<PaneSpec>>,
+    },
+}
+
 struct PasswordLogin {
     /// The saved connection's name, whose profile names the source.
     alias: String,
@@ -888,6 +916,8 @@ struct PasswordLogin {
     channel: ChannelId,
     /// An SSH login (a multi-host run's password can answer it).
     ssh: bool,
+    /// ssh_config's `Tag`, for the security rules.
+    tag: Option<String>,
 }
 
 struct WorkerConn {
@@ -905,6 +935,9 @@ struct Logging {
     path: Option<PathBuf>,
     /// The coding agent the open log is named after, if it is an agent's.
     agent: Option<String>,
+    /// Log to file as the user had it before a security rule turned it
+    /// on: it goes back to that once the connection ends.
+    before_rule: Option<bool>,
 }
 
 /// A paste's receiver as confirmed: its pane, the coding agent it runs,
@@ -964,6 +997,8 @@ struct Pane {
     cursor: Option<Cursor>,
     host: Host,
     log: Logging,
+    /// What the security rules forbid on this pane's connection.
+    policy: Policy,
     /// Session > Logs and recordings > Record this pane, while it records.
     cast: Option<Recording>,
     font: FontSpec,
@@ -1516,6 +1551,15 @@ struct Window {
     workspace_after: HashMap<PaneId, (u64, String)>,
     /// Production workspace questions that met another open dialog.
     workspace_asks: Vec<Command>,
+    /// Panes whose next connection a security rule's question already
+    /// allowed, with the endpoint the answer was for.
+    connect_confirmed: HashMap<PaneId, String>,
+    /// Panes waiting for an answer to a security rule's question; no
+    /// other request takes them meanwhile.
+    connect_pending: HashMap<PaneId, PendingConnect>,
+    /// Numbers the security rules' questions, so a late answer is told
+    /// from the current one.
+    connect_asked: u64,
     /// The workspaces Window > Workspaces listed when it last opened.
     workspace_names: Vec<String>,
 }
@@ -2758,6 +2802,9 @@ fn create_and_run(launch: Launch, theme: Option<String>) -> Result<()> {
                 layout_owner: claim_last_layout(),
                 workspace_after: HashMap::new(),
                 workspace_asks: Vec::new(),
+                connect_confirmed: HashMap::new(),
+                connect_pending: HashMap::new(),
+                connect_asked: 0,
                 workspace_names: Vec::new(),
                 run_notes: HashMap::new(),
                 standby: Standby::new(),
@@ -2931,6 +2978,7 @@ fn new_pane(
         cursor: None,
         host: Host::Ask(String::new()),
         log: Logging::default(),
+        policy: Policy::default(),
         cast: None,
         font,
         theme,
@@ -4112,6 +4160,12 @@ impl Window {
         pane.name = look.name.as_deref().and_then(live::clean_name);
         pane.log.enabled = self.panes.get(&gateway).is_some_and(|g| g.log.enabled);
         pane.log.raw = self.panes.get(&gateway).is_some_and(|g| g.log.raw);
+        // The connection's security rules hold for each of its windows.
+        pane.policy = self
+            .panes
+            .get(&gateway)
+            .map(|g| g.policy)
+            .unwrap_or_default();
         self.panes.insert(native, pane);
         self.apply_highlight(native, false);
         // With the audit trail on, an agent pane's first log is already
@@ -4533,6 +4587,17 @@ impl Window {
 
     /// Ends whatever the pane is connected to.
     fn end_host(&mut self, id: PaneId) {
+        // Another connection takes the pane: an answer still to come is
+        // for one no longer wanted.
+        self.connect_pending.remove(&id);
+        // The rules were the old connection's: Log to file goes back to
+        // the user's own setting.
+        if let Some(p) = self.panes.get_mut(&id) {
+            p.policy = Policy::default();
+            if let Some(before) = p.log.before_rule.take() {
+                p.log.enabled = before;
+            }
+        }
         self.forget_preview_scans(id);
         self.scripts.remove(&id);
         self.zmodem.remove(&id);
@@ -6840,6 +6905,9 @@ impl Window {
             return;
         }
         let env = ssh_env();
+        if !self.connect_allowed(id, destination, extras, &env) {
+            return;
+        }
         if let Some((destination, folder)) = ferossh_config::ssh_config::sftp_url(destination) {
             match Target::resolve_route(&destination, &env) {
                 Ok(mut target) => {
@@ -6916,6 +6984,241 @@ impl Window {
         };
         extras.apply(&mut target);
         self.connect_to(id, target, &env);
+    }
+
+    /// What the security rules forbid for connection `alias` (reaching
+    /// `hostname`, with ssh_config's `Tag` `tag`).
+    fn policy_of(&self, alias: &str, hostname: Option<&str>, tag: Option<&str>) -> Policy {
+        if self.settings.security_rules.is_empty() {
+            return Policy::default();
+        }
+        let tags = ferossh_config::settings::host_tags(tag, self.settings.profile(alias));
+        // The folder the Connection manager shows it in: a FeroSSH
+        // connection's own, else the one its ssh_config (an import's
+        // file) gives it.
+        let folder = load_saved()
+            .into_iter()
+            .find(|h| h.alias.eq_ignore_ascii_case(alias))
+            .and_then(|h| h.folder)
+            .or_else(|| {
+                let env = ssh_env();
+                let includes = ssh_config::DirIncludes {
+                    home: env.home.clone(),
+                };
+                ssh_config::hosts(&env.config, &includes)
+                    .into_iter()
+                    .find(|h| h.name.eq_ignore_ascii_case(alias))
+                    .and_then(|h| h.folder)
+            });
+        self.settings.policy(&Subject {
+            name: alias,
+            hostname,
+            tags: &tags,
+            folder: folder.as_deref(),
+        })
+    }
+
+    /// Whether pane `id` may connect to `destination` now. A security
+    /// rule that asks first, for the host or a jump host on the way,
+    /// queues the question (asked once no state is borrowed) and the
+    /// connection waits for it.
+    fn connect_allowed(
+        &mut self,
+        id: PaneId,
+        destination: &str,
+        extras: &Extras,
+        env: &Env,
+    ) -> bool {
+        if self.settings.security_rules.is_empty() {
+            self.connect_confirmed.remove(&id);
+            return true;
+        }
+        let (alias, endpoint, confirm) = self.connect_subject(destination, env);
+        // A Yes holds for the endpoint it was given for: one that changed
+        // meanwhile (an edited HostName) is asked about again.
+        if self.connect_confirmed.remove(&id).as_deref() == Some(endpoint.as_str()) || !confirm {
+            return true;
+        }
+        self.show(
+            id,
+            &format!(
+                "\x1b[0;90mA security rule asks before connecting to {}.\x1b[0m\r\n",
+                crate::ssh::sanitize_line(&alias)
+            ),
+        );
+        self.connect_asked += 1;
+        let token = self.connect_asked;
+        self.connect_pending.insert(
+            id,
+            PendingConnect {
+                token,
+                endpoint: endpoint.clone(),
+                after: AfterConfirm::Plain,
+            },
+        );
+        self.workspace_asks.push(Command::ConfirmConnect {
+            pane: id,
+            token,
+            destination: destination.to_owned(),
+            endpoint,
+            extras: extras.clone(),
+        });
+        // SAFETY: our window; replaces any earlier timer with this id.
+        unsafe { SetTimer(Some(self.hwnd), TIMER_WORKSPACE_ASK, 50, None) };
+        false
+    }
+
+    /// The connection `destination` names, as the security rules see
+    /// it: its name, where it goes (user, host and port, and the jump
+    /// hosts on the way) and whether a rule for it or for one of its
+    /// jump hosts asks first.
+    fn connect_subject(&self, destination: &str, env: &Env) -> (String, String, bool) {
+        let saved_kind = self.settings.profile(destination).map(|p| p.kind);
+        if saved_kind.is_none() {
+            if let Some(t) = TelnetTarget::typed(destination) {
+                let policy = self.policy_of(&t.alias, Some(&t.hostname), t.tag.as_deref());
+                let endpoint = format!("telnet {}:{}", t.hostname, t.port);
+                return (t.alias, endpoint, policy.confirm_connect);
+            }
+            if let Some(t) = WinrmTarget::typed(destination) {
+                let policy = self.policy_of(&t.alias, Some(&t.hostname), t.tag.as_deref());
+                let endpoint = format!(
+                    "winrm {}{}:{}",
+                    t.user
+                        .as_deref()
+                        .map(|u| format!("{u}@"))
+                        .unwrap_or_default(),
+                    t.hostname,
+                    t.port
+                );
+                return (t.alias, endpoint, policy.confirm_connect);
+            }
+        }
+        let lookup = ferossh_config::ssh_config::sftp_url(destination)
+            .map_or_else(|| destination.to_owned(), |(d, _)| d);
+        let Some(target) = Target::resolve(&lookup, env) else {
+            let policy = self.policy_of(&lookup, None, None);
+            return (lookup.clone(), lookup, policy.confirm_connect);
+        };
+        let mut confirm = self
+            .policy_of(&target.alias, Some(&target.hostname), target.tag.as_deref())
+            .confirm_connect;
+        let mut endpoint = format!("{}@{}:{}", target.user, target.hostname, target.port);
+        for (i, hop) in target.jumps.iter().enumerate() {
+            confirm |= self
+                .policy_of(&hop.alias, Some(&hop.hostname), hop.tag.as_deref())
+                .confirm_connect;
+            endpoint.push_str(if i == 0 { " via " } else { ", " });
+            endpoint.push_str(&format!("{}@{}:{}", hop.user, hop.hostname, hop.port));
+        }
+        (target.alias, endpoint, confirm)
+    }
+
+    /// The answer to security rule question `token` before connecting
+    /// pane `id` to `destination`. An answer to a question the pane no
+    /// longer waits for (another connection took it) changes nothing.
+    fn connect_answered(
+        &mut self,
+        id: PaneId,
+        token: u64,
+        destination: &str,
+        extras: &Extras,
+        yes: bool,
+    ) {
+        if !self.panes.contains_key(&id)
+            || self
+                .connect_pending
+                .get(&id)
+                .is_none_or(|p| p.token != token)
+        {
+            return;
+        }
+        let Some(pending) = self.connect_pending.remove(&id) else {
+            return;
+        };
+        if yes {
+            self.connect_confirmed.insert(id, pending.endpoint);
+            match pending.after {
+                AfterConfirm::Plain => self.connect_with(id, destination, extras),
+                AfterConfirm::Run => {
+                    self.connect_with(id, destination, extras);
+                    if self.confirm_pending(id) {
+                        self.after_confirm(id, AfterConfirm::Run);
+                    } else {
+                        self.run_connected(id);
+                    }
+                }
+                AfterConfirm::Workspace { dir, spec } => {
+                    self.connect_with_dir(id, destination, dir.as_deref());
+                    if let Some(spec) = spec {
+                        if self.confirm_pending(id) {
+                            self.confirmed_look(id, &spec);
+                        } else {
+                            self.workspace_look(id, &spec);
+                        }
+                    }
+                }
+            }
+            // Asked again (the endpoint changed): no Yes left over.
+            if self.connect_pending.contains_key(&id) {
+                self.connect_confirmed.remove(&id);
+            }
+        } else {
+            self.connect_confirmed.remove(&id);
+            if matches!(pending.after, AfterConfirm::Run) {
+                self.fail_run_row(id, "not confirmed".into());
+            }
+            self.end_host(id);
+            self.show(id, "\x1b[0;90mNot connected.\x1b[0m\r\n");
+            self.ask_destination(id);
+            self.refresh(id);
+        }
+    }
+
+    /// Whether pane `id` waits for the answer to a security rule's
+    /// question: it is not free for another request.
+    fn confirm_pending(&self, id: PaneId) -> bool {
+        self.connect_pending.contains_key(&id)
+    }
+
+    /// What pane `id`'s request does once a security rule's question
+    /// it waits for is answered Yes.
+    fn after_confirm(&mut self, id: PaneId, after: AfterConfirm) {
+        if let Some(p) = self.connect_pending.get_mut(&id) {
+            p.after = after;
+        }
+    }
+
+    /// Puts the security rules' limits for a connection on pane `id`:
+    /// a forced session log and no clipboard writes. Returns them, and
+    /// says which apply.
+    fn apply_policy(
+        &mut self,
+        id: PaneId,
+        alias: &str,
+        hostname: &str,
+        tag: Option<&str>,
+    ) -> Policy {
+        let policy = self.policy_of(alias, Some(hostname), tag);
+        let Some(p) = self.panes.get_mut(&id) else {
+            return policy;
+        };
+        p.policy = policy;
+        if policy.log_session {
+            p.log.before_rule.get_or_insert(p.log.enabled);
+            p.log.enabled = true;
+        } else if let Some(before) = p.log.before_rule.take() {
+            p.log.enabled = before;
+        }
+        if !policy.is_empty() {
+            let text = format!(
+                "\x1b[0;90mSecurity rules: {}.\x1b[0m\r\n",
+                policy.describe().join(", ")
+            );
+            self.show(id, &text);
+            self.update_menu_checks();
+        }
+        policy
     }
 
     /// Whether `destination` logs in over SSH: not a serial port, a
@@ -7032,10 +7335,26 @@ impl Window {
         if let Some(p) = self.panes.get_mut(&id) {
             p.term.scroll_to_bottom();
         }
-        let shared = self.panes.values().find_map(|p| match &p.host {
-            Host::Ssh(s) if p.id != id && s.can_share(&target) => Some(s.connection),
-            _ => None,
-        });
+        // The rules first: they change what the login may use, and so
+        // which connections it may share.
+        let rules = self.policy_of(&target.alias, Some(&target.hostname), target.tag.as_deref());
+        if rules.no_agent_forwarding {
+            target.forward_agent = false;
+        }
+        if rules.keys_only {
+            // A Kerberos ticket is no key either.
+            target.gssapi = false;
+        }
+        // A keys-only login never rides on a connection another pane may
+        // have logged in to with a password.
+        let shared = (!rules.keys_only)
+            .then(|| {
+                self.panes.values().find_map(|p| match &p.host {
+                    Host::Ssh(s) if p.id != id && s.can_share(&target) => Some(s.connection),
+                    _ => None,
+                })
+            })
+            .flatten();
         let channel = self.new_channel();
         // A new login runs in a worker of its own; a shared connection's
         // shell in that connection's.
@@ -7050,6 +7369,7 @@ impl Window {
             );
         }
         self.apply_look(id, &target.alias, &target.hostname, target.tag.as_deref());
+        let policy = self.apply_policy(id, &target.alias, &target.hostname, target.tag.as_deref());
         let x11 = target
             .forward_x11
             .then(|| self.x11_auth(id, shared))
@@ -7066,6 +7386,9 @@ impl Window {
             .unwrap_or(self.settings.auto_reconnect);
         let mut session = SshSession::new(channel, target, env.known_hosts());
         session.auto_reconnect = auto_reconnect;
+        // A saved proxy password is read only where no rule on the way
+        // forbids saved passwords.
+        let mut proxy_rules = policy;
         if shared.is_none() {
             // Each jump host logs in in a worker of its own.
             session = session.with_route(&mut || self.new_channel());
@@ -7084,22 +7407,41 @@ impl Window {
             if !hops.is_empty() {
                 self.via.insert(channel, hops);
             }
-            for hop in session.hops_mut() {
+            let hop_policies: Vec<Policy> = session
+                .hops_mut()
+                .map(|hop| {
+                    let t = &hop.target;
+                    (t.alias.clone(), t.hostname.clone(), t.tag.clone())
+                })
+                .collect::<Vec<_>>()
+                .into_iter()
+                .map(|(a, h, t)| self.policy_of(&a, Some(&h), t.as_deref()))
+                .collect();
+            for (hop, hop_policy) in session.hops_mut().zip(hop_policies) {
+                proxy_rules.tighten(&hop_policy);
+                if hop_policy.keys_only {
+                    hop.target.gssapi = false;
+                }
                 let profile = self.settings.profile(&hop.target.alias);
-                let source = self.login_source(id, &hop.target.alias);
+                let source = hop_policy.allow_source(self.login_source(id, &hop.target.alias));
                 hop.legacy = profile.is_some_and(|p| p.legacy_algorithms);
+                hop.keys_only = hop_policy.keys_only;
                 hop.password_source = source != PasswordSource::Ask;
                 hop.remember_password = source == PasswordSource::Windows;
             }
         }
-        if let Some(p) = session.proxy_login()
+        if !proxy_rules.no_saved_password
+            && !proxy_rules.keys_only
+            && let Some(p) = session.proxy_login()
             && let Some(user) = p.user.as_deref()
             && let Ok(Some(password)) = credman::read(&credman::proxy_target(user, &p.host, p.port))
         {
             session.set_proxy_password(password);
         }
+        let source = policy.allow_source(source);
         session.x11 = x11;
         session.legacy = legacy;
+        session.keys_only = policy.keys_only;
         session.password_source = source != PasswordSource::Ask;
         session.remember_password = source == PasswordSource::Windows;
         if self.run_login.contains(&id) {
@@ -7110,9 +7452,9 @@ impl Window {
             session.auto_reconnect = false;
             session.remember_password = false;
             let typed = self.run_password().is_some();
-            session.password_source |= typed;
+            session.password_source |= typed && !session.keys_only;
             for hop in session.hops_mut() {
-                hop.password_source |= typed;
+                hop.password_source |= typed && !hop.keys_only;
                 hop.remember_password = false;
             }
         }
@@ -7150,6 +7492,7 @@ impl Window {
             );
         }
         self.apply_look(id, &target.alias, &target.hostname, target.tag.as_deref());
+        self.apply_policy(id, &target.alias, &target.hostname, target.tag.as_deref());
         let mut session = TelnetSession::new(channel, target);
         let Some(p) = self.panes.get_mut(&id) else {
             return;
@@ -7188,6 +7531,12 @@ impl Window {
             );
         }
         self.apply_look(id, &target.alias, &target.hostname, target.tag.as_deref());
+        let policy = self
+            .apply_policy(id, &target.alias, &target.hostname, target.tag.as_deref())
+            .without_keys_only();
+        if let Some(p) = self.panes.get_mut(&id) {
+            p.policy = policy;
+        }
         let profile = self
             .settings
             .profile(&target.alias)
@@ -7214,6 +7563,7 @@ impl Window {
         if source == PasswordSource::Ask && self.workspace_login(id) {
             source = PasswordSource::Windows;
         }
+        let source = policy.allow_source(source);
         let mut session = WinrmSession::new(channel, target);
         session.password_source = source != PasswordSource::Ask && !ask;
         session.remember_password = source == PasswordSource::Windows;
@@ -7630,6 +7980,13 @@ impl Window {
                     let Some(user) = proxy.user.as_deref() else {
                         continue;
                     };
+                    if self
+                        .panes
+                        .get(&id)
+                        .is_some_and(|p| p.policy.no_saved_password || p.policy.keys_only)
+                    {
+                        continue;
+                    }
                     let Some(password) = password.0.first() else {
                         continue;
                     };
@@ -8042,6 +8399,7 @@ impl Window {
                     port: t.port,
                     channel: s.channel,
                     ssh: true,
+                    tag: t.tag.clone(),
                 })
             }
             Host::Winrm(s) => Some(PasswordLogin {
@@ -8051,6 +8409,7 @@ impl Window {
                 port: s.target.port,
                 channel: s.channel,
                 ssh: false,
+                tag: s.target.tag.clone(),
             }),
             _ => None,
         }
@@ -8077,6 +8436,19 @@ impl Window {
                 source
             }
         };
+        // The rules of the host logging in now (a jump host's own), as
+        // the session started with them.
+        let rules = self.policy_of(&t.alias, Some(&t.hostname), t.tag.as_deref());
+        let rules = if t.ssh {
+            rules
+        } else {
+            rules.without_keys_only()
+        };
+        if rules.keys_only {
+            self.password_result(id, Err(String::new()), "");
+            return;
+        }
+        let source = rules.allow_source(source);
         if t.ssh
             && self.run_login.contains(&id)
             && let Some(password) = self.run_password()
@@ -8496,6 +8868,10 @@ impl Window {
                 } else {
                     PasswordSource::Ask
                 };
+                // The connection's rules hold for its scripts too: no
+                // saved password read where they forbid it.
+                let rules = self.panes.get(&id).map(|p| p.policy).unwrap_or_default();
+                let source = rules.allow_source(source);
                 let ask = "\r\nLogin password, for the login script: ";
                 match source {
                     PasswordSource::Ask => self.with_script(id, |r| r.ask(ask, None)),
@@ -8709,6 +9085,9 @@ impl Window {
                 );
                 if let Some(p) = self.panes.get_mut(&id) {
                     p.log.enabled = false;
+                    if p.policy.log_session {
+                        self.queued.push(Command::LogRequired(id));
+                    }
                 }
                 self.update_menu_checks();
             }
@@ -9038,6 +9417,65 @@ impl Window {
         self.log_bytes(id, bytes, true);
     }
 
+    /// Session > Disconnect, for pane `pane`'s connection (a native
+    /// tmux pane's, its gateway's), saying `note` (grey) once closed; a
+    /// connection that waits to reconnect stops waiting.
+    fn disconnect(&mut self, pane: PaneId, note: &str) {
+        let pane = self.host_pane(pane);
+        if self.retries.contains_key(&pane) {
+            self.stop_reconnecting(pane);
+            return;
+        }
+        self.tmux_lost(pane);
+        let effects = match self.panes.get_mut(&pane).map(|p| &mut p.host) {
+            Some(Host::Ssh(session))
+                if matches!(session.state(), State::Connecting | State::Connected) =>
+            {
+                session.close()
+            }
+            Some(Host::Telnet(session))
+                if matches!(session.state(), State::Connecting | State::Connected) =>
+            {
+                session.close()
+            }
+            Some(Host::Winrm(session))
+                if matches!(session.state(), State::Connecting | State::Connected) =>
+            {
+                session.close()
+            }
+            _ => return,
+        };
+        self.apply(pane, effects);
+        self.stop_log(pane);
+        self.show(pane, &format!("\r\n\x1b[0;90m{note}\x1b[0m\r\n"));
+        self.refresh_chrome();
+        self.refresh(pane);
+    }
+
+    /// A security rule wants pane `id`'s session logged, and its log
+    /// could not be opened or written: the session ends, rather than go
+    /// on unlogged. Asked through [`Command::LogRequired`], once no state
+    /// is borrowed.
+    fn log_required_failed(&mut self, id: PaneId) {
+        let Some(p) = self.panes.get(&id) else {
+            return;
+        };
+        if !p.policy.log_session || p.log.writer.is_some() {
+            return;
+        }
+        if let Some(p) = self.panes.get_mut(&id) {
+            // On again for the next connection, which then tries anew.
+            p.log.enabled = true;
+        }
+        self.update_menu_checks();
+        let note = format!(
+            "[Disconnected: a security rule requires this session's log, and it could not be \
+             written. Make sure {} can be written to, then press Enter to connect again.]",
+            log_dir().display()
+        );
+        self.disconnect(id, &note);
+    }
+
     /// [`Self::log`]; `live` when the host sent `bytes` (not local echo),
     /// which the quiet watch counts as work.
     fn log_bytes(&mut self, id: PaneId, bytes: &[u8], live: bool) {
@@ -9055,6 +9493,9 @@ impl Window {
         if let Err(e) = writer.write(bytes) {
             p.log.writer = None;
             p.log.enabled = false;
+            if p.policy.log_session {
+                self.queued.push(Command::LogRequired(id));
+            }
             self.show(
                 id,
                 &format!("\r\n\x1b[0;31mLogging stopped: {e}\x1b[0m\r\n"),
@@ -10320,6 +10761,10 @@ impl Window {
                         }
                         chrome = true;
                     }
+                    // A security rule may keep the server off this PC's
+                    // clipboard.
+                    Action::ClipboardRequest(_)
+                        if self.panes.get(&id).is_some_and(|p| p.policy.no_clipboard) => {}
                     Action::ClipboardRequest(text) => commands.push(Command::ClipboardWrite(text)),
                     Action::Bell => {
                         if !visible && let Some(p) = self.panes.get_mut(&id) {
@@ -13516,19 +13961,30 @@ impl Window {
                 row.pane = Some(id);
             }
             self.connect(id, &session);
-            if self
-                .panes
-                .get(&id)
-                .is_some_and(|p| matches!(p.host, Host::Ask(_)))
-            {
-                let why = self.run_notes.get(&id).cloned();
-                self.fail_run_row(id, why.unwrap_or_else(|| "could not connect".into()));
+            if self.confirm_pending(id) {
+                // The row waits for the security rule's answer.
+                self.after_confirm(id, AfterConfirm::Run);
             } else {
-                self.check_run_login(id);
+                self.run_connected(id);
             }
         }
         self.arm_run_timer();
         self.refresh_chrome();
+    }
+
+    /// A run's host that was just asked to connect: its row fails if it
+    /// did not, else its login is watched.
+    fn run_connected(&mut self, id: PaneId) {
+        if self
+            .panes
+            .get(&id)
+            .is_some_and(|p| matches!(p.host, Host::Ask(_)))
+        {
+            let why = self.run_notes.get(&id).cloned();
+            self.fail_run_row(id, why.unwrap_or_else(|| "could not connect".into()));
+        } else {
+            self.check_run_login(id);
+        }
     }
 
     /// A run's host that is logging in: its row fails when the login
@@ -15166,7 +15622,7 @@ impl Window {
         let idle = matches!(
             self.panes.get(&focused).map(|p| &p.host),
             Some(Host::Ask(t)) if t.is_empty()
-        );
+        ) && !self.confirm_pending(focused);
         if split {
             self.split(Dir::Right)
         } else if idle {
@@ -15601,10 +16057,10 @@ impl Window {
     fn open_workspace(&mut self, ws: &wsfile::Workspace, run: bool) {
         let all = self.ws.all_panes();
         let idle = match all.as_slice() {
-            [only] => matches!(
+            [only] => (matches!(
                 self.panes.get(only).map(|p| &p.host),
                 Some(Host::Ask(t)) if t.is_empty()
-            )
+            ) && !self.confirm_pending(*only))
             .then_some(*only),
             _ => None,
         };
@@ -15785,6 +16241,7 @@ impl Window {
             return;
         }
         self.connect_with_dir(id, &dest, spec.dir.as_deref());
+        self.confirmed_look(id, spec);
         if shares && matches!(self.panes.get(&id).map(|p| &p.host), Some(Host::Ssh(_))) {
             leads.insert(key, id);
         }
@@ -15794,6 +16251,17 @@ impl Window {
     /// logged in.
     fn connect_with_dir(&mut self, id: PaneId, dest: &str, dir: Option<&str>) {
         self.connect(id, dest);
+        if self.confirm_pending(id) {
+            // Set up once the security rule's question is answered Yes.
+            self.after_confirm(
+                id,
+                AfterConfirm::Workspace {
+                    dir: dir.map(str::to_owned),
+                    spec: None,
+                },
+            );
+            return;
+        }
         if let Some(p) = self.panes.get_mut(&id)
             && let Host::Ssh(s) = &p.host
         {
@@ -15804,6 +16272,18 @@ impl Window {
             if let Some(dir) = dir {
                 p.start_dir = Some(dir.as_bytes().to_vec());
             }
+        }
+    }
+
+    /// Workspace pane `id` waiting for a security rule's answer gets the
+    /// workspace's look once the login comes, over its host's.
+    fn confirmed_look(&mut self, id: PaneId, spec: &PaneSpec) {
+        if let Some(PendingConnect {
+            after: AfterConfirm::Workspace { spec: s, .. },
+            ..
+        }) = self.connect_pending.get_mut(&id)
+        {
+            *s = Some(Box::new(spec.clone()));
         }
     }
 
@@ -16063,7 +16543,7 @@ impl Window {
             let free = matches!(
                 self.panes.get(&pane).map(|p| &p.host),
                 Some(Host::Ask(t)) if t.is_empty()
-            );
+            ) && !self.confirm_pending(pane);
             if !free {
                 continue;
             }
@@ -16074,6 +16554,7 @@ impl Window {
                     // Its host's look came with the login: the workspace's
                     // goes over it again.
                     self.workspace_look(pane, &spec);
+                    self.confirmed_look(pane, &spec);
                     if !ok && matches!(self.panes.get(&pane).map(|p| &p.host), Some(Host::Ssh(_))) {
                         new_lead = Some(pane);
                     }
@@ -16159,7 +16640,7 @@ impl Window {
         let idle = matches!(
             self.panes.get(&pane).map(|p| &p.host),
             Some(Host::Ask(t)) if t.is_empty()
-        );
+        ) && !self.confirm_pending(pane);
         let id = if idle { pane } else { self.new_tab_pane() };
         self.focus_terminal();
         self.ask_destination(id);
@@ -17986,41 +18467,17 @@ impl Window {
             }
             cmd::FOLLOW_CD => self.toggle_follow(),
             cmd::DISCONNECT => {
-                let pane = self.host_pane(pane);
-                if self.retries.contains_key(&pane) {
-                    self.stop_reconnecting(pane);
-                    return None;
-                }
-                self.tmux_lost(pane);
-                let effects = match self.panes.get_mut(&pane).map(|p| &mut p.host) {
-                    Some(Host::Ssh(session))
-                        if matches!(session.state(), State::Connecting | State::Connected) =>
-                    {
-                        session.close()
-                    }
-                    Some(Host::Telnet(session))
-                        if matches!(session.state(), State::Connecting | State::Connected) =>
-                    {
-                        session.close()
-                    }
-                    Some(Host::Winrm(session))
-                        if matches!(session.state(), State::Connecting | State::Connected) =>
-                    {
-                        session.close()
-                    }
-                    _ => return None,
-                };
-                self.apply(pane, effects);
-                self.stop_log(pane);
-                self.show(
-                    pane,
-                    "\r\n\x1b[0;90m[Disconnected. Press Enter to reconnect.]\x1b[0m\r\n",
-                );
-                self.refresh_chrome();
-                self.refresh(pane);
+                self.disconnect(pane, "[Disconnected. Press Enter to reconnect.]");
             }
             cmd::LOG_TOGGLE => {
                 let p = self.panes.get_mut(&pane)?;
+                if p.log.enabled && p.policy.log_session {
+                    self.show(
+                        pane,
+                        "\x1b[0;90mA security rule keeps this session's log on.\x1b[0m\r\n",
+                    );
+                    return None;
+                }
                 p.log.enabled = !p.log.enabled;
                 if p.log.enabled {
                     self.start_log(pane);
@@ -20721,6 +21178,18 @@ enum Command {
         /// Which shell of the pane it was asked for.
         shell: u64,
     },
+    /// A security rule asks before pane `pane` connects to `destination`.
+    ConfirmConnect {
+        pane: PaneId,
+        /// The question's number, so a late answer is told apart.
+        token: u64,
+        destination: String,
+        /// Where it goes, as resolved when asked.
+        endpoint: String,
+        extras: Extras,
+    },
+    /// A security rule requires pane `0`'s session log, which failed.
+    LogRequired(PaneId),
     /// Tools > New SSH key: the window that asks what to make.
     NewKey,
     /// Settings > Key bindings: the window that changes them.
@@ -23167,6 +23636,14 @@ fn run_command(hwnd: HWND, command: Command) {
             with_window(|w| w.update_title());
         }
         Command::ReplaceHostKey => replace_host_key(hwnd),
+        Command::LogRequired(pane) => {
+            let next = with_window(|w| {
+                w.log_required_failed(pane);
+                std::mem::take(&mut w.queued)
+            })
+            .unwrap_or_default();
+            run_commands(hwnd, next);
+        }
         Command::NewKey => new_key(hwnd),
         Command::KeyBindings => key_bindings(hwnd),
         Command::Vault(id) => match id {
@@ -23275,6 +23752,43 @@ fn run_command(hwnd: HWND, command: Command) {
                             script,
                             command,
                             shell,
+                        });
+                    });
+                    // SAFETY: our window; replaces any earlier timer with this id.
+                    unsafe { SetTimer(Some(hwnd), TIMER_WORKSPACE_ASK, 500, None) };
+                }
+            }
+        }
+        Command::ConfirmConnect {
+            pane,
+            token,
+            destination,
+            endpoint,
+            extras,
+        } => {
+            let text = format!(
+                "A security rule asks before connecting to {} ({}). Connect now?",
+                crate::ssh::sanitize_line(&destination),
+                crate::ssh::sanitize_line(&endpoint)
+            );
+            match dialog(hwnd, &text, MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2) {
+                Some(answer) => {
+                    let next = with_window(|w| {
+                        w.connect_answered(pane, token, &destination, &extras, answer == IDYES);
+                        std::mem::take(&mut w.queued)
+                    })
+                    .unwrap_or_default();
+                    run_commands(hwnd, next);
+                }
+                None => {
+                    // Another dialog is open: ask once it has closed.
+                    with_window(|w| {
+                        w.workspace_asks.push(Command::ConfirmConnect {
+                            pane,
+                            token,
+                            destination,
+                            endpoint,
+                            extras,
                         });
                     });
                     // SAFETY: our window; replaces any earlier timer with this id.

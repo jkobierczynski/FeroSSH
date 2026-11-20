@@ -675,6 +675,9 @@ pub struct SshSession {
     pub password_source: bool,
     /// Keep a typed password that worked (the Windows Credential Manager).
     pub remember_password: bool,
+    /// A security rule allows keys, the agent or a security key only: a
+    /// password prompt ends the login.
+    pub keys_only: bool,
     /// The kind of the server prompt being answered.
     prompt_kind: Option<PromptKind>,
     /// The source was asked once; a second password prompt is typed.
@@ -816,6 +819,18 @@ fn is_password_prompt(kind: PromptKind, fields: &[PromptField]) -> bool {
     }
 }
 
+/// Whether a server prompt asks for a password among its fields, with
+/// others or alone: what a keys-only login refuses. A one-time code is
+/// not a password.
+fn asks_any_password(kind: PromptKind, fields: &[PromptField]) -> bool {
+    match kind {
+        PromptKind::Password => true,
+        PromptKind::KeyboardInteractive => fields
+            .iter()
+            .any(|f| !f.echo && f.text.to_ascii_lowercase().contains("password")),
+    }
+}
+
 /// The key files in `~/.ssh` tried, in order, when the config names
 /// none, as OpenSSH does.
 pub const DEFAULT_KEYS: [&str; 4] = ["id_ed25519", "id_ecdsa", "id_ecdsa_sk", "id_ed25519_sk"];
@@ -885,6 +900,7 @@ impl SshSession {
             legacy_in_use: false,
             password_source: false,
             remember_password: false,
+            keys_only: false,
             prompt_kind: None,
             source_tried: false,
             source_used: false,
@@ -2696,6 +2712,15 @@ impl SshSession {
         let mut effects = Vec::new();
         self.prompt_kind = Some(kind);
         let asks_password = is_password_prompt(kind, &fields);
+        if self.keys_only && asks_any_password(kind, &fields) {
+            effects.push(Effect::Show(format!(
+                "\x1b[0;31mA security rule allows only a key, the agent or a security key \
+                 for {}: no password. Not logged in.\x1b[0m\r\n",
+                sanitize_line(&self.target.alias)
+            )));
+            effects.extend(self.close());
+            return effects;
+        }
         if asks_password && self.source_used {
             self.source_used = false;
             effects.push(Effect::Show(dim(
@@ -4653,6 +4678,54 @@ mod tests {
         t.refresh_login(&e).unwrap();
         let args = t.proxy_command.as_ref().unwrap().args.clone();
         assert!(args.contains(&"2300".to_owned()), "{args:?}");
+    }
+
+    #[test]
+    fn keys_only_ends_the_login_at_a_password_prompt() {
+        let dir = temp("keys-only");
+        let e = env(&dir);
+        let mut s = SshSession::new(1, Target::resolve("host", &e).unwrap(), e.known_hosts());
+        trusted(&mut s);
+        s.keys_only = true;
+        s.password_source = true;
+        let fx = s.on_worker(password_prompt(1));
+        assert!(shown(&fx).contains("only a key"));
+        assert!(matches!(sent(&fx)[..], [Message::Close { channel: 1 }]));
+        assert!(!s.prompt_active() && !s.fetching_password());
+        // A one-time code is not a password: still asked.
+        let mut s = SshSession::new(1, Target::resolve("host", &e).unwrap(), e.known_hosts());
+        trusted(&mut s);
+        s.keys_only = true;
+        let fx = s.on_worker(Message::Prompt {
+            channel: 1,
+            kind: PromptKind::KeyboardInteractive,
+            name: String::new(),
+            instructions: String::new(),
+            fields: vec![PromptField {
+                text: "Verification code: ".into(),
+                echo: false,
+            }],
+        });
+        assert!(shown(&fx).contains("Verification code"));
+        assert!(s.prompt_active());
+        // A password asked for beside a code: refused all the same.
+        let mut s = SshSession::new(1, Target::resolve("host", &e).unwrap(), e.known_hosts());
+        trusted(&mut s);
+        s.keys_only = true;
+        let field = |text: &str| PromptField {
+            text: text.into(),
+            echo: false,
+        };
+        let fx = s.on_worker(Message::Prompt {
+            channel: 1,
+            kind: PromptKind::KeyboardInteractive,
+            name: String::new(),
+            instructions: String::new(),
+            fields: vec![field("Password: "), field("Code: ")],
+        });
+        assert!(shown(&fx).contains("only a key"));
+        assert!(matches!(sent(&fx)[..], [Message::Close { channel: 1 }]));
+        assert!(!s.prompt_active());
     }
 
     #[test]

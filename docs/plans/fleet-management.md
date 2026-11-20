@@ -12,8 +12,8 @@ Already built, so not listed: folders (`# folder:` comments), favourites, search
 | 2 | Search by field, and saved searches | Done (#255) |
 | 3 | Select several connections and act on them all | Done (#256) |
 | 4 | Change one field on many connections at once | Done (#257) |
-| 5 | Named credentials shared by many connections | Built |
-| 6 | Credential and security rules by tag or folder | To do |
+| 5 | Named credentials shared by many connections | Done (#258) |
+| 6 | Credential and security rules by tag or folder | Built |
 | 7 | Inventory columns with CSV export | To do |
 | 8 | Run a script or broadcast to a tag or saved search | To do |
 | 9 | A shared, read-only connection library for a team | To do |
@@ -71,11 +71,17 @@ Fields that need the whole form (host, port, forwards, login script) stay one co
 - **Precedence:** what a credential sets wins over the connection's own login, and a user typed in the address still wins. This works for SSH, Mosh, SFTP, tunnels, jump hosts and WinRM. The user and key file come through the ssh_config resolution (a `Match originalhost` block placed first). The password source comes from `Settings::password_source`.
 - **Secrets stay where they are today.** A Windows-saved password is still kept per connection. One shared password saved once for all is a possible follow-up.
 
-## 6. Credential and security rules by tag or folder
+## 6. Credential and security rules by tag or folder (built)
 
-**What FeroSSH has.** Separate per-host switches: the Production confirmation for scripts, old crypto per host, agent-forwarding confirmation.
+**What FeroSSH had.** Separate per-host switches: the Production confirmation for scripts, old crypto per host, agent-forwarding confirmation.
 
-**What to build.** Rules like theme rules, matched by tag, folder or host pattern: require a key, agent or security key (no password); never save a password; no agent forwarding; no clipboard; confirm before connecting; log the session. A rule can only tighten what a connection asks for.
+**What was built.** `SecurityRule` blocks in `ferossh.conf`, matched by tag, connection manager folder (and the folders inside it) or host pattern, like theme rules. A rule can only tighten: every match adds its limits.
+
+- `KeysOnly yes`: a password prompt ends the SSH login (one-time codes are still asked); no GSSAPI and no shared connection. WinRM is not affected.
+- `SavePassword no`: no Windows Credential Manager password, read or kept.
+- `ForwardAgent no`, `Clipboard no` (OSC 52), `ConfirmConnect yes` (asked once per connect, also for a matching jump host, bound to the endpoint asked about; not on reconnect or split), `LogSession yes` (the log cannot be turned off; a log that fails disconnects).
+- Each hop of a jump route gets its own rules. A connection prints the limits that apply.
+- Rules are edited in the file for now, like theme rules. A rules page in Settings is a possible follow-up.
 
 ## 7. Inventory columns with CSV export
 
