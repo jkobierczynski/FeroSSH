@@ -4277,6 +4277,12 @@ impl Window {
                  connection has none (file transfer or tunnel only, or a RemoteCommand)."
                     .into(),
             ),
+            // A login script would type its next line into tmux.
+            Some(Host::Ssh(_)) if self.scripts.contains_key(&id) => Err(
+                "A script is still running in this pane. Let it finish, or stop it, then try \
+                 again."
+                    .into(),
+            ),
             Some(Host::Ssh(s)) if s.state() == State::Connected && !s.prompt_active() => Ok(()),
             _ => Err(NOT_IN_SHELL.into()),
         }
@@ -4342,7 +4348,7 @@ impl Window {
                     "Anyone logged in to this host as {user} can watch tmux session {session}: \
                      in FeroSSH with Session > tmux > Join a shared session (Shared by account \
                      {user}, Session {session}), or with: tmux -S \
-                     {}{user}/default attach -r -t {session}\n\n\
+                     {}{user}/default attach -E -r -t {session}\n\n\
                      Session > tmux > Stop sharing detaches those watching.",
                     ferossh_tmuxcc::command::SHARE_DIR_PREFIX
                 )
@@ -4350,7 +4356,7 @@ impl Window {
                 format!(
                     "Anyone logged in to this host as {user} can watch tmux session {session}: \
                      in FeroSSH with Session > tmux > Join a shared session (Session \
-                     {session}), or with: tmux attach -r -t {session}\n\n\
+                     {session}), or with: tmux attach -E -r -t {session}\n\n\
                      Session > tmux > Stop sharing detaches those watching."
                 )
             };

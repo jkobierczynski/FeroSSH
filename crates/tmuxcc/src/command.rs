@@ -144,7 +144,8 @@ pub fn share_line(name: &str) -> String {
 /// What to type at the shell to join a shared session in control mode:
 /// session `session` (or tmux's most recent one) of the account `owner`
 /// shares, or of this account's own tmux for `None`. Read-only unless
-/// `can_type`; never sizing the owner's windows (`ignore-size`).
+/// `can_type`; never sizing the owner's windows (`ignore-size`) or changing
+/// the session's environment (`-E`, no update-environment).
 /// `owner` must be an [`account_name`]; its directory is checked to be
 /// its own before connecting, so nobody can pose as it.
 pub fn join_line(owner: Option<&str>, session: Option<&str>, can_type: bool) -> String {
@@ -157,10 +158,10 @@ pub fn join_line(owner: Option<&str>, session: Option<&str>, can_type: bool) -> 
         .map(|s| format!(" -t ={}", session_name(s)))
         .unwrap_or_default();
     match owner.and_then(account_name) {
-        None => format!("tmux -CC attach-session -f {flags}{target}\r"),
+        None => format!("tmux -CC attach-session -E -f {flags}{target}\r"),
         Some(owner) => format!(
             "sh -c 'FEROSSH_SHARE={SHARE_DIR_PREFIX}{owner}; if {}; then \
-             tmux -S \"$FEROSSH_SHARE/default\" -CC attach-session -f {flags}{target}; \
+             tmux -S \"$FEROSSH_SHARE/default\" -CC attach-session -E -f {flags}{target}; \
              else echo \"FeroSSH: {owner} is not sharing a tmux session on this host.\"; fi'\r",
             share_dir_ok(&owner)
         ),
@@ -232,17 +233,17 @@ mod tests {
     fn join_and_share_lines() {
         assert_eq!(
             join_line(None, Some("pair"), false),
-            "tmux -CC attach-session -f read-only,ignore-size -t =pair\r"
+            "tmux -CC attach-session -E -f read-only,ignore-size -t =pair\r"
         );
         assert_eq!(
             join_line(None, None, true),
-            "tmux -CC attach-session -f ignore-size\r"
+            "tmux -CC attach-session -E -f ignore-size\r"
         );
         let l = join_line(Some("alice"), Some("a b"), false);
         assert!(l.starts_with("sh -c 'FEROSSH_SHARE=/tmp/ferossh-share-alice; if [ -n "));
         assert!(l.ends_with("fi'\r"));
         assert!(l.contains("-user alice -perm 711"));
-        assert!(l.contains("-CC attach-session -f read-only,ignore-size -t =a_b;"));
+        assert!(l.contains("-CC attach-session -E -f read-only,ignore-size -t =a_b;"));
         // Only the sh -c wrapper's own quotes: nothing can close it early.
         assert_eq!(l.matches('\'').count(), 2);
         assert_eq!(
@@ -254,7 +255,7 @@ mod tests {
         // An owner that is no account name joins nothing of anyone's.
         assert_eq!(
             join_line(Some("x;y"), None, false),
-            "tmux -CC attach-session -f read-only,ignore-size\r"
+            "tmux -CC attach-session -E -f read-only,ignore-size\r"
         );
         let s = share_line("pair");
         assert!(s.contains("mkdir -m 711 \"$FEROSSH_SHARE\""));
