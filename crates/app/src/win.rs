@@ -14646,12 +14646,15 @@ impl Window {
         // a workspace may log in to any of them) and every profile.
         let mut names: Vec<String> = load_saved().into_iter().map(|h| h.alias).collect();
         names.extend(self.settings.profiles.iter().map(|p| p.host.clone()));
+        // With Log in automatically on, a workspace keeps passwords for
+        // what its panes open, as written there (`bob@web` included).
         if self.settings.workspace_auto_login {
             names.extend(
                 host_items(&ssh_env(), &self.settings)
                     .into_iter()
                     .map(|h| h.name),
             );
+            names.extend(ferossh_config::workspace::all_connections(&workspaces_dir()));
         }
         let in_use = self.windows_targets_of(&names);
         let mut done: Vec<String> = Vec::new();
