@@ -456,7 +456,16 @@ pub const MAX_TAG_LEN: usize = 32;
 /// Whether two tags are the same one: case does not matter, in any
 /// alphabet (`équipe` and `ÉQUIPE` are one tag).
 pub fn same_tag(a: &str, b: &str) -> bool {
-    a == b || a.to_lowercase() == b.to_lowercase()
+    a == b || fold_tag(a) == fold_tag(b)
+}
+
+/// A tag with its case folded for comparing, one character for one, so
+/// `?` in a tag pattern still stands for one character (`İ` folds to
+/// `i`, not to the two characters `str::to_lowercase` gives).
+pub fn fold_tag(tag: &str) -> String {
+    tag.chars()
+        .map(|c| c.to_lowercase().next().unwrap_or(c))
+        .collect()
 }
 
 /// Whether `tag` can be a connection's tag: 1 to [`MAX_TAG_LEN`] letters,
@@ -2554,6 +2563,7 @@ Profile lab
         assert!(parse_tags(&many.join(" ")).is_err());
         assert!(valid_tag("équipe"));
         assert_eq!(parse_tags("équipe ÉQUIPE").unwrap(), ["équipe"]);
+        assert_eq!(fold_tag("İÉ").chars().count(), 2);
         assert_eq!(host_tags(Some("ÉQUIPE"), None), ["ÉQUIPE"]);
     }
 
