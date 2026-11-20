@@ -7779,6 +7779,7 @@ impl Window {
         self.apply(id, effects);
         self.scripts.remove(&id);
         self.stop_log(id);
+        self.restore_log_setting(id);
         self.show(
             id,
             "\r\n\x1b[0;90m[Stopped reconnecting. Press Enter to reconnect.]\x1b[0m\r\n",
@@ -18579,6 +18580,11 @@ impl Window {
                     return None;
                 }
                 p.log.enabled = !p.log.enabled;
+                // A choice made while no session is live is the user's
+                // own: no rule's saved setting may undo it later.
+                if !live {
+                    p.log.before_rule = None;
+                }
                 if p.log.enabled {
                     self.start_log(pane);
                 } else {
