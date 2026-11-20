@@ -128,6 +128,8 @@ mod live;
 #[cfg_attr(not(windows), allow(dead_code))]
 mod local_dir;
 #[cfg_attr(not(windows), allow(dead_code))]
+mod local_socket;
+#[cfg_attr(not(windows), allow(dead_code))]
 mod login_script;
 #[cfg_attr(not(windows), allow(dead_code))]
 mod look;

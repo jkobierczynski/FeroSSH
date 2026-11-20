@@ -21,7 +21,7 @@ use std::time::Duration;
 
 use ferossh_auth::keyfile::KeyFile;
 use ferossh_auth::userauth;
-use ferossh_ipc::{Message, PROTOCOL_VERSION};
+use ferossh_ipc::{ForwardTarget, Message, PROTOCOL_VERSION};
 use russh::keys::PublicKey;
 use tokio::sync::mpsc;
 
@@ -1200,7 +1200,7 @@ async fn through(
                     .send(Message::ForwardOpen {
                         channel: tunnel(i),
                         connection: 1,
-                        target: Some((
+                        target: Some(ForwardTarget::Tcp(
                             "127.0.0.1".into(),
                             if i + 1 == hops {
                                 target_port

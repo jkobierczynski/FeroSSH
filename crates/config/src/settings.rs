@@ -820,6 +820,10 @@ pub struct Settings {
     /// In panes of a tmux session, the tmux prefix and a window or pane
     /// key work FeroSSH's tabs and panes. Off unless turned on.
     pub tmux_keys: bool,
+    /// Terminal panes join programming ligatures (`->`, `!=`, `===`) in
+    /// fonts that have them, such as Cascadia Code, Fira Code and
+    /// JetBrains Mono (Settings > Font ligatures). Off unless turned on.
+    pub font_ligatures: bool,
     /// Earlier commands on the host (and a few common ones) show greyed
     /// after the cursor while typing; Enter keeps echoed command lines in
     /// an encrypted per-host history. Off unless turned on.
@@ -929,6 +933,7 @@ impl Default for Settings {
             auto_responses: true,
             run_parallel: None,
             tmux_keys: false,
+            font_ligatures: false,
             command_suggestions: false,
             standby: false,
             standby_hotkey: None,
@@ -1343,6 +1348,10 @@ impl Settings {
                 "tmuxkeybindings" => {
                     block = Block::Top;
                     s.tmux_keys = yes(&args).unwrap_or(false);
+                }
+                "fontligatures" => {
+                    block = Block::Top;
+                    s.font_ligatures = yes(&args).unwrap_or(false);
                 }
                 "commandsuggestions" => {
                     block = Block::Top;
@@ -1793,6 +1802,9 @@ impl Settings {
             let _ = writeln!(out, "RestoreLayout yes");
         }
         let _ = writeln!(out, "TmuxKeybindings {}", flag(self.tmux_keys));
+        if self.font_ligatures {
+            let _ = writeln!(out, "FontLigatures yes");
+        }
         let _ = writeln!(out, "CommandSuggestions {}", flag(self.command_suggestions));
         let _ = writeln!(out, "Standby {}", flag(self.standby));
         if let Some(k) = self.standby_hotkey {
@@ -2699,6 +2711,19 @@ DesktopShareSelection yes
         assert_eq!(back.standby_target, s.standby_target);
         assert_eq!(back.standby_hidden, s.standby_hidden);
         assert_eq!(d.standby_target, None);
+    }
+
+    #[test]
+    fn font_ligatures_are_off_unless_turned_on() {
+        assert!(!Settings::default().font_ligatures);
+        assert!(Settings::parse("FontLigatures yes\n").font_ligatures);
+        assert!(!Settings::parse("FontLigatures maybe\n").font_ligatures);
+        assert!(!Settings::default().to_text().contains("FontLigatures"));
+        let s = Settings {
+            font_ligatures: true,
+            ..Settings::default()
+        };
+        assert!(Settings::parse(&s.to_text()).font_ligatures);
     }
 
     #[test]

@@ -276,12 +276,38 @@ impl Routes {
 
 /// What the connection set up for traffic the server opens back to this
 /// side, which [`Client`] checks every such channel against.
+/// One listener a remote forward asked the server for.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum RemoteListener {
+    /// A port: the address and port as asked (the port the server chose,
+    /// for port 0), whether its connections speak SOCKS, and the UI's
+    /// listener.
+    Port {
+        bind: String,
+        port: u32,
+        socks: bool,
+        listener: ChannelId,
+    },
+    /// A Unix socket on the server, by its path.
+    Socket { path: String, listener: ChannelId },
+}
+
+impl RemoteListener {
+    fn listener(&self) -> ChannelId {
+        match self {
+            RemoteListener::Port { listener, .. } | RemoteListener::Socket { listener, .. } => {
+                *listener
+            }
+        }
+    }
+}
+
 pub(crate) struct ConnForwards {
     /// The channel that made the connection; X11 streams name it.
     pub(crate) connection: ChannelId,
     /// Remote forwards the server listens for: address and port as asked
     /// (the port the server chose, for port 0), and the UI's listener.
-    remote: Mutex<Vec<(String, u32, ChannelId)>>,
+    remote: Mutex<Vec<RemoteListener>>,
     /// The fake cookie the server got. The UI keeps the real one and swaps
     /// it in itself: a worker that is taken over must not learn it.
     x11: Mutex<Option<[u8; 16]>>,
@@ -303,31 +329,53 @@ impl ConnForwards {
         self.alive.clone()
     }
 
-    pub(crate) fn add_remote(&self, bind: &str, port: u32, listener: ChannelId) {
+    pub(crate) fn add_remote(&self, listener: RemoteListener) {
         if let Ok(mut r) = self.remote.lock() {
-            r.push((bind.to_owned(), port, listener));
+            r.push(listener);
         }
     }
 
     pub(crate) fn remove_remote(&self, listener: ChannelId) {
         if let Ok(mut r) = self.remote.lock() {
-            r.retain(|(_, _, l)| *l != listener);
+            r.retain(|l| l.listener() != listener);
         }
     }
 
-    /// The listener a `forwarded-tcpip` channel belongs to: the address and
-    /// port as asked, or failing that the only forward on that port (some
-    /// servers report the address they actually bound).
-    fn remote_listener(&self, address: &str, port: u32) -> Option<ChannelId> {
+    /// The listener a `forwarded-tcpip` channel belongs to, and whether it
+    /// speaks SOCKS: the address and port as asked, or failing that the
+    /// only forward on that port (some servers report the address they
+    /// actually bound).
+    fn remote_listener(&self, address: &str, port: u32) -> Option<(ChannelId, bool)> {
         let r = self.remote.lock().ok()?;
-        if let Some((_, _, l)) = r.iter().find(|(a, p, _)| a == address && *p == port) {
-            return Some(*l);
+        let ports = || {
+            r.iter().filter_map(|l| match l {
+                RemoteListener::Port {
+                    bind,
+                    port,
+                    socks,
+                    listener,
+                } => Some((bind, *port, *socks, *listener)),
+                RemoteListener::Socket { .. } => None,
+            })
+        };
+        if let Some((.., socks, l)) = ports().find(|(a, p, ..)| *a == address && *p == port) {
+            return Some((l, socks));
         }
-        let mut on_port = r.iter().filter(|(_, p, _)| *p == port);
+        let mut on_port = ports().filter(|(_, p, ..)| *p == port);
         match (on_port.next(), on_port.next()) {
-            (Some((_, _, l)), None) => Some(*l),
+            (Some((.., socks, l)), None) => Some((l, socks)),
             _ => None,
         }
+    }
+
+    /// The listener a `forwarded-streamlocal` channel belongs to: only a
+    /// socket this connection asked the server to listen on.
+    fn socket_listener(&self, path: &str) -> Option<ChannelId> {
+        let r = self.remote.lock().ok()?;
+        r.iter().find_map(|l| match l {
+            RemoteListener::Socket { path: p, listener } if p == path => Some(*listener),
+            _ => None,
+        })
     }
 
     /// The fake cookie for an `x11-req`: one per connection, the one the
@@ -551,12 +599,13 @@ impl client::Handler for Client {
             .forwards
             .remote_listener(connected_address, connected_port)
         {
-            Some(listener) => {
+            Some((listener, socks)) => {
                 reply.accept().await;
                 self.incoming(
                     channel,
                     Incoming::Remote {
                         listener,
+                        socks,
                         origin: (originator_address.to_owned(), originator_port),
                     },
                 );
@@ -567,6 +616,79 @@ impl client::Handler for Client {
                     .await
             }
         }
+        Ok(())
+    }
+
+    async fn server_channel_open_forwarded_streamlocal(
+        &mut self,
+        channel: Channel<client::Msg>,
+        socket_path: &str,
+        reply: client::ChannelOpenHandle,
+        _session: &mut client::Session,
+    ) -> Result<(), Failure> {
+        // Only sockets this connection asked the server to listen on;
+        // russh would accept any.
+        match self.forwards.socket_listener(socket_path) {
+            Some(listener) => {
+                reply.accept().await;
+                self.incoming(
+                    channel,
+                    Incoming::Remote {
+                        listener,
+                        socks: false,
+                        origin: (socket_path.to_owned(), 0),
+                    },
+                );
+            }
+            None => {
+                reply
+                    .reject(ChannelOpenFailure::AdministrativelyProhibited)
+                    .await
+            }
+        }
+        Ok(())
+    }
+
+    // A client never serves these: russh's defaults would accept them and
+    // leave the channels open with nobody reading.
+    async fn server_channel_open_direct_streamlocal(
+        &mut self,
+        _channel: Channel<client::Msg>,
+        _socket_path: &str,
+        reply: client::ChannelOpenHandle,
+        _session: &mut client::Session,
+    ) -> Result<(), Failure> {
+        reply
+            .reject(ChannelOpenFailure::AdministrativelyProhibited)
+            .await;
+        Ok(())
+    }
+
+    async fn server_channel_open_session(
+        &mut self,
+        _channel: Channel<client::Msg>,
+        reply: client::ChannelOpenHandle,
+        _session: &mut client::Session,
+    ) -> Result<(), Failure> {
+        reply
+            .reject(ChannelOpenFailure::AdministrativelyProhibited)
+            .await;
+        Ok(())
+    }
+
+    async fn server_channel_open_direct_tcpip(
+        &mut self,
+        _channel: Channel<client::Msg>,
+        _host_to_connect: &str,
+        _port_to_connect: u32,
+        _originator_address: &str,
+        _originator_port: u32,
+        reply: client::ChannelOpenHandle,
+        _session: &mut client::Session,
+    ) -> Result<(), Failure> {
+        reply
+            .reject(ChannelOpenFailure::AdministrativelyProhibited)
+            .await;
         Ok(())
     }
 

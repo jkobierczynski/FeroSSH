@@ -884,6 +884,7 @@ dependencies = [
  "getrandom 0.4.3",
  "miniz_oxide 0.9.1",
  "russh",
+ "socket2",
  "tokio",
  "unicode-width",
  "windows",
@@ -958,6 +959,8 @@ name = "ferossh-render"
 version = "1.5.0"
 dependencies = [
  "windows",
+ "windows-core",
+ "windows-numerics",
 ]
 
 [[package]]

@@ -190,7 +190,7 @@ pub fn create(main: HWND, handler: Handler, dpi: u32) -> windows::core::Result<(
         };
         let combo = WS_VSCROLL.0 | (CBS_DROPDOWNLIST | CBS_HASSTRINGS) as u32;
         let kind = child(WC_COMBOBOXW, w!(""), combo, ID_KIND)?;
-        for (name, _) in KINDS {
+        for (name, ..) in KINDS {
             let text = wide(name);
             SendMessageW(
                 kind,
@@ -359,7 +359,8 @@ pub fn place(at: Option<Rect>, width: i32, dpi: u32) {
     let line = scale(20, dpi);
     let details = scale(52, dpi);
     let inner = (width - 2 * pad).max(0);
-    let kind_w = scale(112, dpi).min(inner / 2);
+    // Wide enough for "Server SOCKS (-R)".
+    let kind_w = scale(140, dpi).min(inner / 2);
     let button_w = scale(64, dpi);
     let drop = scale(160, dpi);
     let row2 = title + field + gap;
@@ -627,14 +628,15 @@ fn clear_form(h: &Handles) {
     }
 }
 
-/// The To box is for Local and Remote; a SOCKS forward goes anywhere.
+/// The To box is for Local and Remote; a SOCKS forward, here or on the
+/// server, goes anywhere.
 fn kind_changed(h: &Handles) {
     // SAFETY: plain messages to our own controls.
     unsafe {
         let kind = SendMessageW(h.kind, CB_GETCURSEL, None, None).0;
         let socks = KINDS
             .get(usize::try_from(kind).unwrap_or(0))
-            .is_some_and(|k| k.1 == ferossh_config::ForwardKind::Dynamic);
+            .is_some_and(|k| !k.2);
         let _ = EnableWindow(h.to, !socks);
     }
 }
