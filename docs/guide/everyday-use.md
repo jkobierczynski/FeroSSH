@@ -582,7 +582,7 @@ Session > tmux > Join a shared session asks whose session (empty for your own ac
 
 Session > tmux > Stop sharing takes every other account off the shared server (which detaches them), makes its socket private again, and detaches whoever watches your session read-only. It then asks tmux again who may connect, and says so plainly if any other account is still let in.
 
-Sharing and joining with another account type a short `sh -c '...'` script at the pane's shell, so they work from any login shell (fish and csh included). After a dropped connection, a session on the shared server is attached there again, and the accounts already let in keep their access until Stop sharing.
+Sharing and joining with another account type a short `sh -c '...'` script at the pane's shell, so they work from any login shell (fish and csh included). After a dropped connection, a session on the shared server is attached there again, and the accounts already let in keep their access until Stop sharing. A session you joined is not joined again after a dropped connection: the pane stays at the shell (it does not open your own tmux session instead), and you join again from the menu.
 
 ### Coding agents in tmux
 

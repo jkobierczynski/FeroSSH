@@ -541,6 +541,10 @@ pub struct Tmux {
     reattach_shared: Option<String>,
     /// Stop sharing, while its replies come in.
     unsharing: Option<Unsharing>,
+    /// After a dropped connection: the session lost was someone else's
+    /// or shared, and is not attached again, so no other session (such
+    /// as the profile's) takes its place either.
+    stay_at_shell: bool,
     /// tmux said it is a development build (`next-3.9`, `master`,
     /// `openbsd-7.6`): its version does not say which fixes it has.
     dev_build: bool,
@@ -663,6 +667,7 @@ impl Tmux {
             on_shared: false,
             reattach_shared: None,
             unsharing: None,
+            stay_at_shell: false,
             dev_build: false,
         }
     }
@@ -737,6 +742,12 @@ impl Tmux {
     /// server, as it was before the connection dropped.
     pub fn reattach_on_shared(&mut self, name: &str) {
         self.reattach_shared = Some(name.to_owned());
+    }
+
+    /// After a dropped connection: whether the login should stay at the
+    /// shell, attaching no tmux session at all (asked once).
+    pub fn take_stay_at_shell(&mut self) -> bool {
+        std::mem::take(&mut self.stay_at_shell)
     }
 
     /// The session attached runs on this account's shared server.
@@ -1043,6 +1054,8 @@ impl Tmux {
                 self.reattach = None;
                 self.reattach_shared = None;
             }
+            self.stay_at_shell =
+                self.reattach.is_none() && (self.joined.is_some() || self.on_shared);
             self.client.reset();
             self.after_detach = None;
             self.teardown(ws, &mut out);
@@ -2679,6 +2692,20 @@ mod tests {
     }
 
     #[test]
+    fn a_lost_join_leaves_the_login_at_the_shell() {
+        let (mut t, mut ws, _, _) = attached_after("3.4", |t| t.join(None, Some("pair"), false));
+        let _ = t.connection_lost(&mut ws);
+        assert_eq!(t.reattach, None);
+        assert!(t.take_stay_at_shell());
+        // One's own session lost: attached again, nothing withheld.
+        let (mut t, mut ws, _) =
+            attached(None, None, &[pane_line(0, 0, 80, 24, "b25f,80x24,0,0,0")]);
+        let _ = t.connection_lost(&mut ws);
+        assert!(t.reattach.is_some());
+        assert!(!t.take_stay_at_shell());
+    }
+
+    #[test]
     fn a_plain_attach_after_a_join_is_ones_own_again() {
         let (mut ws, gateway) = Workspace::new();
         let mut t = Tmux::new(gateway, Mode::Ferossh, 100);
@@ -2806,6 +2833,10 @@ mod tests {
         t.feed(&mut ws, b"%session-changed $3 x y\n");
         let _ = t.connection_lost(&mut ws);
         assert_eq!(t.reattach, None);
+        // Nor does the profile's session take its place: the login stays
+        // at the shell, once.
+        assert!(t.take_stay_at_shell());
+        assert!(!t.take_stay_at_shell());
     }
 
     #[test]

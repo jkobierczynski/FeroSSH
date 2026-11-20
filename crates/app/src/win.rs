@@ -1380,8 +1380,10 @@ struct Window {
     /// tmux control mode, per SSH pane that has run `tmux -CC`.
     tmux: HashMap<PaneId, Tmux>,
     /// SSH panes whose connection dropped while tmux ran: the host's
-    /// queue key and the session to attach again after the next login.
-    reattach: HashMap<PaneId, (String, String, bool)>,
+    /// queue key and the session to attach again after the next login
+    /// (whether on the shared server), or `None`: none, not even the
+    /// profile's, as the one lost was someone else's or shared.
+    reattach: HashMap<PaneId, (String, Option<(String, bool)>)>,
     /// The pane of the Windows notification on screen (or last on
     /// screen): clicking it shows that pane.
     toast_pane: Option<PaneId>,
@@ -4138,11 +4140,17 @@ impl Window {
             return;
         };
         let actions = t.connection_lost(&mut self.ws);
-        if let (Some(name), Some(key)) = (t.reattach.take(), key) {
-            // The pane's tmux watcher may be made anew before the login:
-            // whether the session was on the shared server goes along.
-            let shared = t.take_reattach_shared(&name);
-            self.reattach.insert(id, (key, name, shared));
+        if let Some(key) = key {
+            if let Some(name) = t.reattach.take() {
+                // The pane's tmux watcher may be made anew before the
+                // login: whether the session was on the shared server
+                // goes along.
+                let shared = t.take_reattach_shared(&name);
+                self.reattach.insert(id, (key, Some((name, shared))));
+            } else if t.take_stay_at_shell() {
+                // Not attached again: the login stays at the shell.
+                self.reattach.insert(id, (key, None));
+            }
         }
         self.run_tmux(id, actions);
     }
@@ -4171,10 +4179,11 @@ impl Window {
         }
         let mut shared = false;
         let (name, rebuild) = match self.reattach.remove(&id) {
-            Some((k, name, on_shared)) if k == key => {
+            Some((k, Some((name, on_shared)))) if k == key => {
                 shared = on_shared;
                 (name, None)
             }
+            Some((k, None)) if k == key => return false,
             _ => match self.workspace_tmux.get(&id) {
                 Some(w) => (w.name.clone(), w.rebuild.clone()),
                 None => match profile {
