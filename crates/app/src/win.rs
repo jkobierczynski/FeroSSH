@@ -7308,12 +7308,26 @@ impl Window {
             Some(Host::Winrm(s)) => {
                 let (mut target, ask) = (s.target.clone(), s.source_refused());
                 // A saved connection's credential may name another user now.
+                // Start again from the connection's own user, so a credential
+                // removed or replaced since leaves no user of its own behind.
                 if target.saved {
+                    let alias = target.alias.clone();
+                    let saved = load_saved()
+                        .into_iter()
+                        .find(|h| h.alias.eq_ignore_ascii_case(&alias));
+                    let own = WinrmTarget::resolve(
+                        &alias,
+                        &ssh_env(),
+                        None,
+                        target.https,
+                        saved.as_ref(),
+                    )
+                    .and_then(|t| t.user);
                     let user = self
                         .settings
-                        .credential_of(&target.alias)
+                        .credential_of(&alias)
                         .and_then(|c| c.user.clone());
-                    target = target.with_login_user(user.as_deref());
+                    target = target.with_login(own.as_deref(), user.as_deref());
                 }
                 self.connect_winrm_with(id, target, ask);
                 return;

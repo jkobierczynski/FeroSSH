@@ -173,6 +173,16 @@ impl WinrmTarget {
         self
     }
 
+    /// The target logging in as `own` (the saved connection's user as it
+    /// is now) unless a credential names a user, which wins. Unlike
+    /// [`Self::with_login_user`] it drops a user an earlier credential set,
+    /// so a reconnect after the credential is removed or replaced does not
+    /// keep it. The endpoint stays as it is.
+    pub fn with_login(mut self, own: Option<&str>, credential: Option<&str>) -> Self {
+        self.user = own.filter(|u| valid_user(u)).map(str::to_owned);
+        self.with_login_user(credential)
+    }
+
     /// `host`, or `host:port` off the WinRM port, for titles and logs.
     pub fn label(&self) -> String {
         if self.port == default_port(self.https) {
@@ -1821,6 +1831,26 @@ mod tests {
             op: SspiOp::Start,
         });
         assert_eq!(s.state(), State::Ended);
+    }
+
+    #[test]
+    fn a_reconnect_after_the_credential_goes_uses_the_connection_user() {
+        // Connected with credential user bob, on top of saved user alice.
+        let t = WinrmTarget::typed("winrm://alice@dc:5999")
+            .unwrap()
+            .with_login_user(Some("bob"));
+        assert_eq!(t.user.as_deref(), Some("bob"));
+        // The credential is removed: alice again, same endpoint.
+        let r = t.clone().with_login(Some("alice"), None);
+        assert_eq!(r.user.as_deref(), Some("alice"));
+        assert_eq!((r.hostname.as_str(), r.port), ("dc", 5999));
+        // Replaced by one without a user, on a connection with none.
+        assert_eq!(t.clone().with_login(None, None).user, None);
+        // Replaced by one with another user.
+        assert_eq!(
+            t.with_login(Some("alice"), Some("carol")).user.as_deref(),
+            Some("carol")
+        );
     }
 
     #[test]
