@@ -17405,7 +17405,7 @@ impl Window {
             }
             cmd::ESCAPES => {
                 // Off keeps the character (`EscapeChar %` stays `%`).
-                let on = !(self.settings.escapes && self.settings.escape_char != EscapeChar::None);
+                let on = !self.settings.escapes;
                 self.settings.escapes = on;
                 if on && self.settings.escape_char == EscapeChar::None {
                     self.settings.escape_char = EscapeChar::DEFAULT;
@@ -18113,7 +18113,7 @@ impl Window {
                 (cmd::VERIFY, s.verify_transfers),
                 (cmd::ZMODEM, s.zmodem),
                 (cmd::INLINE_IMAGES, s.inline_images),
-                (cmd::ESCAPES, s.escapes && s.escape_char != EscapeChar::None),
+                (cmd::ESCAPES, s.escapes),
                 (cmd::UPLOAD_TYPE_PATH, s.upload_type_path),
                 (cmd::PORT_PREVIEWS, s.port_previews),
                 (cmd::KITTY_KEYBOARD, s.kitty_keyboard),
