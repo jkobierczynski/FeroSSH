@@ -999,6 +999,9 @@ struct Pane {
     log: Logging,
     /// What the security rules forbid on this pane's connection.
     policy: Policy,
+    /// The same, added up over the jump hosts on the way too: what a
+    /// proxy's password may do.
+    route_policy: Policy,
     /// Session > Logs and recordings > Record this pane, while it records.
     cast: Option<Recording>,
     font: FontSpec,
@@ -2979,6 +2982,7 @@ fn new_pane(
         host: Host::Ask(String::new()),
         log: Logging::default(),
         policy: Policy::default(),
+        route_policy: Policy::default(),
         cast: None,
         font,
         theme,
@@ -4590,14 +4594,7 @@ impl Window {
         // Another connection takes the pane: an answer still to come is
         // for one no longer wanted.
         self.connect_pending.remove(&id);
-        // The rules were the old connection's: Log to file goes back to
-        // the user's own setting.
-        if let Some(p) = self.panes.get_mut(&id) {
-            p.policy = Policy::default();
-            if let Some(before) = p.log.before_rule.take() {
-                p.log.enabled = before;
-            }
-        }
+        self.drop_rules(id);
         self.forget_preview_scans(id);
         self.scripts.remove(&id);
         self.zmodem.remove(&id);
@@ -6934,42 +6931,11 @@ impl Window {
             self.ask_destination(id);
             return;
         }
-        let telnet = if self
-            .settings
-            .profile(destination)
-            .is_some_and(|p| p.kind == SessionKind::Telnet)
-        {
-            TelnetTarget::resolve(destination, &env)
-        } else {
-            TelnetTarget::typed(destination)
-        };
-        if let Some(target) = telnet {
+        if let Some(target) = self.telnet_target(destination, &env) {
             self.connect_telnet(id, target);
             return;
         }
-        let winrm = match self.settings.profile(destination) {
-            Some(p) if p.kind == SessionKind::WinRm => {
-                let saved = load_saved()
-                    .into_iter()
-                    .find(|h| h.alias.eq_ignore_ascii_case(destination));
-                WinrmTarget::resolve(
-                    destination,
-                    &env,
-                    p.winrm_command.as_deref(),
-                    p.winrm_https,
-                    saved.as_ref(),
-                )
-                .map(|t| {
-                    t.with_login_user(
-                        self.settings
-                            .credential_of(destination)
-                            .and_then(|c| c.user.as_deref()),
-                    )
-                })
-            }
-            _ => WinrmTarget::typed(destination),
-        };
-        if let Some(target) = winrm {
+        if let Some(target) = self.winrm_target(destination, &env) {
             self.connect_winrm(id, target);
             return;
         }
@@ -7034,10 +7000,14 @@ impl Window {
             return true;
         }
         let (alias, endpoint, confirm) = self.connect_subject(destination, env);
-        // A Yes holds for the endpoint it was given for: one that changed
-        // meanwhile (an edited HostName) is asked about again.
-        if self.connect_confirmed.remove(&id).as_deref() == Some(endpoint.as_str()) || !confirm {
-            return true;
+        // A Yes holds for the endpoint and route it was given for: one
+        // that changed meanwhile (an edited HostName, jump host or proxy)
+        // is asked about again, even if no rule matches it now.
+        match self.connect_confirmed.remove(&id) {
+            Some(approved) if approved == endpoint => return true,
+            Some(_) => {}
+            None if !confirm => return true,
+            None => {}
         }
         self.show(
             id,
@@ -7068,22 +7038,65 @@ impl Window {
         false
     }
 
+    /// `destination` as a Telnet session: a saved Telnet connection, or
+    /// a typed `telnet://` address.
+    fn telnet_target(&self, destination: &str, env: &Env) -> Option<TelnetTarget> {
+        if self
+            .settings
+            .profile(destination)
+            .is_some_and(|p| p.kind == SessionKind::Telnet)
+        {
+            TelnetTarget::resolve(destination, env)
+        } else {
+            TelnetTarget::typed(destination)
+        }
+    }
+
+    /// `destination` as a WinRM session: a saved WinRM connection (its
+    /// port, HTTPS and login user), or a typed `winrm://` address.
+    fn winrm_target(&self, destination: &str, env: &Env) -> Option<WinrmTarget> {
+        match self.settings.profile(destination) {
+            Some(p) if p.kind == SessionKind::WinRm => {
+                let saved = load_saved()
+                    .into_iter()
+                    .find(|h| h.alias.eq_ignore_ascii_case(destination));
+                WinrmTarget::resolve(
+                    destination,
+                    env,
+                    p.winrm_command.as_deref(),
+                    p.winrm_https,
+                    saved.as_ref(),
+                )
+                .map(|t| {
+                    t.with_login_user(
+                        self.settings
+                            .credential_of(destination)
+                            .and_then(|c| c.user.as_deref()),
+                    )
+                })
+            }
+            _ => WinrmTarget::typed(destination),
+        }
+    }
+
     /// The connection `destination` names, as the security rules see
     /// it: its name, where it goes (user, host and port, and the jump
     /// hosts on the way) and whether a rule for it or for one of its
     /// jump hosts asks first.
     fn connect_subject(&self, destination: &str, env: &Env) -> (String, String, bool) {
-        let saved_kind = self.settings.profile(destination).map(|p| p.kind);
-        if saved_kind.is_none() {
-            if let Some(t) = TelnetTarget::typed(destination) {
+        // As connect_with dispatches it, so the question names the port
+        // the protocol will use.
+        if ferossh_config::ssh_config::sftp_url(destination).is_none() {
+            if let Some(t) = self.telnet_target(destination, env) {
                 let policy = self.policy_of(&t.alias, Some(&t.hostname), t.tag.as_deref());
                 let endpoint = format!("telnet {}:{}", t.hostname, t.port);
                 return (t.alias, endpoint, policy.confirm_connect);
             }
-            if let Some(t) = WinrmTarget::typed(destination) {
+            if let Some(t) = self.winrm_target(destination, env) {
                 let policy = self.policy_of(&t.alias, Some(&t.hostname), t.tag.as_deref());
                 let endpoint = format!(
-                    "winrm {}{}:{}",
+                    "winrm{} {}{}:{}",
+                    if t.https { "s" } else { "" },
                     t.user
                         .as_deref()
                         .map(|u| format!("{u}@"))
@@ -7103,13 +7116,18 @@ impl Window {
         let mut confirm = self
             .policy_of(&target.alias, Some(&target.hostname), target.tag.as_deref())
             .confirm_connect;
-        let mut endpoint = format!("{}@{}:{}", target.user, target.hostname, target.port);
-        for (i, hop) in target.jumps.iter().enumerate() {
+        for hop in &target.jumps {
             confirm |= self
                 .policy_of(&hop.alias, Some(&hop.hostname), hop.tag.as_deref())
                 .confirm_connect;
-            endpoint.push_str(if i == 0 { " via " } else { ", " });
-            endpoint.push_str(&format!("{}@{}:{}", hop.user, hop.hostname, hop.port));
+        }
+        // The jump hosts as they resolve, and any proxy or command: a
+        // change to any of them is another route.
+        let mut endpoint = format!("{}@{}:{}", target.user, target.hostname, target.port);
+        let route = target.route_key();
+        if !route.is_empty() {
+            endpoint.push_str(" via ");
+            endpoint.push_str(&route.join(", "));
         }
         (target.alias, endpoint, confirm)
     }
@@ -7347,7 +7365,13 @@ impl Window {
         }
         // A keys-only login never rides on a connection another pane may
         // have logged in to with a password.
-        let shared = (!rules.keys_only)
+        // A jump host under KeysOnly may have logged in another way on a
+        // connection already open (its rule came later): log in afresh.
+        let hops_keys_only = target.jumps.iter().any(|j| {
+            self.policy_of(&j.alias, Some(&j.hostname), j.tag.as_deref())
+                .keys_only
+        });
+        let shared = (!rules.keys_only && !hops_keys_only)
             .then(|| {
                 self.panes.values().find_map(|p| match &p.host {
                     Host::Ssh(s) if p.id != id && s.can_share(&target) => Some(s.connection),
@@ -7429,6 +7453,9 @@ impl Window {
                 hop.password_source = source != PasswordSource::Ask;
                 hop.remember_password = source == PasswordSource::Windows;
             }
+        }
+        if let Some(p) = self.panes.get_mut(&id) {
+            p.route_policy = proxy_rules;
         }
         if !proxy_rules.no_saved_password
             && !proxy_rules.keys_only
@@ -7980,11 +8007,10 @@ impl Window {
                     let Some(user) = proxy.user.as_deref() else {
                         continue;
                     };
-                    if self
-                        .panes
-                        .get(&id)
-                        .is_some_and(|p| p.policy.no_saved_password || p.policy.keys_only)
-                    {
+                    if self.panes.get(&id).is_some_and(|p| {
+                        let r = p.policy.tightened(&p.route_policy);
+                        r.no_saved_password || r.keys_only
+                    }) {
                         continue;
                     }
                     let Some(password) = password.0.first() else {
@@ -8006,6 +8032,13 @@ impl Window {
                     {
                         self.show(id, &format!("\x1b[0;90m{e}\x1b[0m\r\n"));
                     }
+                }
+                Effect::Connected if self.required_log_failed(id) => {
+                    // A security rule wants this session logged and the log
+                    // would not open: nothing starts on it (no script,
+                    // forwards or tmux), and it is disconnected next.
+                    self.retries.remove(&id);
+                    self.refresh_chrome();
                 }
                 Effect::Connected
                     if self.run_login.contains(&id) || self.run_hidden.contains(&id) =>
@@ -8894,6 +8927,16 @@ impl Window {
                     self.script_command(id, line, Some(name));
                     return;
                 }
+                if self
+                    .panes
+                    .get(&id)
+                    .is_some_and(|p| p.policy.no_saved_password)
+                {
+                    // Typed each time: no Credential Manager read.
+                    let text = format!("\r\nSecret {name}, for the login script: ");
+                    self.with_script(id, |r| r.ask(&text, None));
+                    return;
+                }
                 match credman::read(&secret_target(&name)) {
                     Ok(Some(secret)) => self.with_script(id, |r| r.secret(&secret, now)),
                     Ok(None) => {
@@ -9008,6 +9051,13 @@ impl Window {
     /// Keeps a secret typed at a login script's prompt in the Windows
     /// Credential Manager.
     fn save_secret(&mut self, id: PaneId, name: &str, secret: &str) {
+        if self
+            .panes
+            .get(&id)
+            .is_some_and(|p| p.policy.no_saved_password)
+        {
+            return;
+        }
         let note = match credman::write(&secret_target(name), name, secret) {
             Ok(()) => format!(
                 "Saved the secret {name} in the Windows Credential Manager; remove it \
@@ -9447,9 +9497,35 @@ impl Window {
         };
         self.apply(pane, effects);
         self.stop_log(pane);
+        self.drop_rules(pane);
+        self.update_menu_checks();
         self.show(pane, &format!("\r\n\x1b[0;90m{note}\x1b[0m\r\n"));
         self.refresh_chrome();
         self.refresh(pane);
+    }
+
+    /// Whether a security rule wants pane `id`'s session logged and its
+    /// log will not open: tried here, before anything starts on the
+    /// session (the failure queues the disconnect).
+    fn required_log_failed(&mut self, id: PaneId) -> bool {
+        if !self.panes.get(&id).is_some_and(|p| p.policy.log_session) {
+            return false;
+        }
+        self.start_log(id);
+        self.panes.get(&id).is_some_and(|p| p.log.writer.is_none())
+    }
+
+    /// Pane `id`'s connection is over: its security rules go, and Log to
+    /// file goes back to the user's own setting. The next connection
+    /// puts its own rules on.
+    fn drop_rules(&mut self, id: PaneId) {
+        if let Some(p) = self.panes.get_mut(&id) {
+            p.policy = Policy::default();
+            p.route_policy = Policy::default();
+            if let Some(before) = p.log.before_rule.take() {
+                p.log.enabled = before;
+            }
+        }
     }
 
     /// A security rule wants pane `id`'s session logged, and its log
@@ -9463,11 +9539,6 @@ impl Window {
         if !p.policy.log_session || p.log.writer.is_some() {
             return;
         }
-        if let Some(p) = self.panes.get_mut(&id) {
-            // On again for the next connection, which then tries anew.
-            p.log.enabled = true;
-        }
-        self.update_menu_checks();
         let note = format!(
             "[Disconnected: a security rule requires this session's log, and it could not be \
              written. Make sure {} can be written to, then press Enter to connect again.]",
@@ -14188,6 +14259,15 @@ impl Window {
             self.scripts.remove(&p);
             self.run_login.remove(&p);
             self.run_notes.remove(&p);
+            // A row that timed out waiting for a security rule's answer
+            // is over: a late Yes no longer connects it.
+            if self
+                .connect_pending
+                .get(&p)
+                .is_some_and(|c| matches!(c.after, AfterConfirm::Run))
+            {
+                self.connect_pending.remove(&p);
+            }
         }
         self.pump_run();
     }
@@ -18471,7 +18551,14 @@ impl Window {
             }
             cmd::LOG_TOGGLE => {
                 let p = self.panes.get_mut(&pane)?;
-                if p.log.enabled && p.policy.log_session {
+                let live = match &p.host {
+                    Host::Ssh(s) => matches!(s.state(), State::Connecting | State::Connected),
+                    Host::Telnet(s) => matches!(s.state(), State::Connecting | State::Connected),
+                    Host::Winrm(s) => matches!(s.state(), State::Connecting | State::Connected),
+                    Host::Tmux { .. } => true,
+                    _ => false,
+                };
+                if p.log.enabled && p.policy.log_session && live {
                     self.show(
                         pane,
                         "\x1b[0;90mA security rule keeps this session's log on.\x1b[0m\r\n",

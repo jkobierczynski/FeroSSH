@@ -488,7 +488,7 @@ impl Target {
         self.hostname.eq_ignore_ascii_case(&other.hostname)
             && self.port == other.port
             && self.user == other.user
-            && self.route() == other.route()
+            && self.route_key() == other.route_key()
             && self.mosh.is_none()
             && other.mosh.is_none()
             && self.sftp_only == other.sftp_only
@@ -511,6 +511,23 @@ impl Target {
             .chain(self.proxy_server.iter().map(|p| format!("proxy {p}")))
             .collect();
         out.extend(self.jumps.iter().map(Target::label));
+        out
+    }
+
+    /// The way there as it resolves: [`Self::route`] and each jump
+    /// host's user, machine and port, so a jump host whose `HostName`
+    /// changed is another route even under the same name.
+    pub fn route_key(&self) -> Vec<String> {
+        let mut out = self.route();
+        for j in &self.jumps {
+            out.push(format!(
+                "{}@{}:{}",
+                j.user,
+                j.hostname.to_ascii_lowercase(),
+                j.port
+            ));
+            out.extend(j.route());
+        }
         out
     }
 
@@ -825,10 +842,29 @@ fn is_password_prompt(kind: PromptKind, fields: &[PromptField]) -> bool {
 fn asks_any_password(kind: PromptKind, fields: &[PromptField]) -> bool {
     match kind {
         PromptKind::Password => true,
-        PromptKind::KeyboardInteractive => fields
-            .iter()
-            .any(|f| !f.echo && f.text.to_ascii_lowercase().contains("password")),
+        PromptKind::KeyboardInteractive => {
+            fields.iter().any(|f| !f.echo && is_password_label(&f.text))
+        }
     }
+}
+
+/// Whether a hidden field's label asks for a password, and not for a
+/// one-time code that some servers also call one ("One-time password",
+/// "OTP password", "token password").
+fn is_password_label(label: &str) -> bool {
+    let l = label.to_ascii_lowercase();
+    l.contains("password")
+        && ![
+            "one-time",
+            "one time",
+            "onetime",
+            "otp",
+            "token",
+            "verification",
+            "authenticator",
+        ]
+        .iter()
+        .any(|code| l.contains(code))
 }
 
 /// The key files in `~/.ssh` tried, in order, when the config names
@@ -1602,7 +1638,7 @@ impl SshSession {
             && self.target.forward_agent == target.forward_agent
             && (!target.forward_agent || self.target.agent == target.agent)
             // The same name through other jump hosts can be another host.
-            && self.target.route() == target.route()
+            && self.target.route_key() == target.route_key()
             // A Mosh session is its connection's only shell.
             && self.target.mosh.is_none()
             && target.mosh.is_none()
@@ -4434,6 +4470,25 @@ mod tests {
     }
 
     #[test]
+    fn a_jump_host_moved_elsewhere_is_another_route() {
+        let dir = temp("route-key");
+        let at = |bastion: &str| {
+            let e = Env {
+                config: format!(
+                    "Host inner\n  ProxyJump bastion\nHost bastion\n  HostName {bastion}\n"
+                ),
+                ..env(&dir)
+            };
+            Target::resolve("inner", &e).unwrap()
+        };
+        let (a, b) = (at("10.0.0.1"), at("10.0.0.2"));
+        assert_eq!(a.route(), b.route());
+        assert_ne!(a.route_key(), b.route_key());
+        assert!(!a.same_login(&b));
+        assert_eq!(a.route_key(), at("10.0.0.1").route_key());
+    }
+
+    #[test]
     fn a_proxy_server_carries_the_first_login_and_its_password_is_asked_once() {
         let dir = temp("chain-proxy");
         let e = Env {
@@ -4726,6 +4781,25 @@ mod tests {
         assert!(shown(&fx).contains("only a key"));
         assert!(matches!(sent(&fx)[..], [Message::Close { channel: 1 }]));
         assert!(!s.prompt_active());
+        // A user name and a one-time password: a code, still asked.
+        let mut s = SshSession::new(1, Target::resolve("host", &e).unwrap(), e.known_hosts());
+        trusted(&mut s);
+        s.keys_only = true;
+        let fx = s.on_worker(Message::Prompt {
+            channel: 1,
+            kind: PromptKind::KeyboardInteractive,
+            name: String::new(),
+            instructions: String::new(),
+            fields: vec![
+                PromptField {
+                    text: "Username: ".into(),
+                    echo: true,
+                },
+                field("One-time password: "),
+            ],
+        });
+        assert!(!shown(&fx).contains("only a key"), "{}", shown(&fx));
+        assert!(s.prompt_active());
     }
 
     #[test]
