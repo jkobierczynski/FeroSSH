@@ -1951,6 +1951,27 @@ fn load_custom_themes() -> std::result::Result<custom_theme::Loaded, String> {
     Ok((themes, broken))
 }
 
+/// Whether `menu` is `root` or one of its popups, at any depth. Context
+/// menus reuse the menu bar's command ids, so a hover over one of their
+/// items must not be read as a menu bar item (Change a field once
+/// previewed themes).
+fn menu_within(root: HMENU, menu: HMENU) -> bool {
+    if root.is_invalid() || menu.is_invalid() {
+        return false;
+    }
+    if root == menu {
+        return true;
+    }
+    // SAFETY: menus we built; GetSubMenu gives a null handle for an item
+    // without a popup.
+    unsafe {
+        (0..GetMenuItemCount(Some(root)).max(0)).any(|i| {
+            let sub = GetSubMenu(root, i);
+            !sub.is_invalid() && menu_within(sub, menu)
+        })
+    }
+}
+
 /// Settings > Custom themes in menu `bar`: the popup that ends with Open
 /// themes folder.
 fn custom_themes_menu(bar: HMENU) -> Option<HMENU> {
@@ -24975,7 +24996,13 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                     && u32::from(flags)
                         & (MF_POPUP.0 | MF_GRAYED.0 | MF_DISABLED.0 | MF_SEPARATOR.0)
                         == 0;
-                with_window(|w| w.menu_hover(item.then_some(id)));
+                // Only the menu bar's own items preview a look: a context
+                // menu's ids can be the same numbers.
+                let from = HMENU(lparam.0 as *mut c_void);
+                with_window(|w| {
+                    let item = item && menu_within(w.menu, from);
+                    w.menu_hover(item.then_some(id));
+                });
                 DefWindowProcW(hwnd, msg, wparam, lparam)
             }
             WM_TIMER if wparam.0 == TIMER_LOOK => {
