@@ -1479,6 +1479,13 @@ impl SshSession {
             // it along.
             && !self.target.no_shell()
             && !target.no_shell()
+            // A shared connection starts no forwards of its own: share only
+            // one that already has all of them, so forwards from `-L`/`-R`/
+            // `-D` or changed mid-session survive a reconnect.
+            && target
+                .forwards
+                .iter()
+                .all(|f| self.target.forwards.contains(f))
     }
 
     /// Typed or pasted bytes for the host, once connected.
@@ -2969,6 +2976,21 @@ mod tests {
         let mut aliased = same.clone();
         aliased.host_key_alias = Some("production".into());
         assert!(!first.can_share(&aliased), "another HostKeyAlias");
+        // A forward the connection does not run would never start on a
+        // shared one (a reconnect of a `-L` tab, say).
+        let mut forwarding = same.clone();
+        Extras {
+            no_shell: false,
+            forwards: vec![
+                ferossh_config::forward::parse_config(
+                    ferossh_config::forward::ForwardKind::Local,
+                    &["8080:web:80".to_owned()],
+                )
+                .unwrap(),
+            ],
+        }
+        .apply(&mut forwarding);
+        assert!(!first.can_share(&forwarding), "a forward of its own");
 
         let mut second = SshSession::new(2, same, e.known_hosts());
         let fx = second.start_on(first.connection, 100, 30);
