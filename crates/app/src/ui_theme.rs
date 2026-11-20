@@ -1148,7 +1148,13 @@ pub fn own_popup(menu: HMENU) {
             // An owner-drawn item's text is ours: Windows may report none,
             // or not the one we gave it.
             let text = match kept {
-                Some(k) if read.is_empty() || ty & MFT_OWNERDRAW.0 != 0 => k,
+                // An empty record never hides a name found elsewhere.
+                Some(k)
+                    if !without_nul(&k).is_empty()
+                        && (read.is_empty() || ty & MFT_OWNERDRAW.0 != 0) =>
+                {
+                    k
+                }
                 _ if !read.is_empty() => read.to_vec(),
                 // No record has it either: the text seen last.
                 _ => seen_text(key).unwrap_or_default(),
