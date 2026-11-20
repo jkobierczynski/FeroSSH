@@ -14662,6 +14662,14 @@ impl Window {
                     .map(|h| h.name),
             );
             names.extend(ferossh_config::workspace::all_connections(&workspaces_dir()));
+            // And what the open workspace panes log in to, wherever their
+            // workspace file is (one opened from outside the folder too).
+            names.extend(
+                self.workspace_extra
+                    .values()
+                    .filter(|e| e.login)
+                    .filter_map(|e| e.dest.clone()),
+            );
         }
         let in_use = self.windows_targets_of(&names);
         let mut done: Vec<String> = Vec::new();
