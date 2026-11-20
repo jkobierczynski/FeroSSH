@@ -494,6 +494,20 @@ pub struct Tmux {
     after_detach: Option<Vec<u8>>,
     /// Told once the session is read (how others join it).
     notice_after_attach: Option<String>,
+    /// The last line typed starts the shared server (share or its
+    /// reattach): the next control mode is on it.
+    typed_shared: bool,
+    /// The session attached runs on this account's shared server, not
+    /// its private one.
+    on_shared: bool,
+    /// After a dropped connection: the session to attach again is this
+    /// one on the shared server, which keeps whom it lets in.
+    reattach_shared: Option<String>,
+    /// Stop sharing found the shared server and took others off it.
+    unshared: bool,
+    /// tmux said it is a development build (`next-3.9`, `master`,
+    /// `openbsd-7.6`): its version does not say which fixes it has.
+    dev_build: bool,
 }
 
 /// A window's size and its session's client count, for [`Tag::SizeCheck`].
@@ -609,6 +623,11 @@ impl Tmux {
             share_pending: None,
             after_detach: None,
             notice_after_attach: None,
+            typed_shared: false,
+            on_shared: false,
+            reattach_shared: None,
+            unshared: false,
+            dev_build: false,
         }
     }
 
@@ -661,7 +680,20 @@ impl Tmux {
         self.pick_after_attach = pick;
         self.join_pending = None;
         self.share_pending = None;
-        command::attach_line(name).into_bytes()
+        // A shared session comes back on the shared server, whose access
+        // list still holds: nothing is granted again.
+        let shared = self.reattach_shared.take().as_deref() == Some(name);
+        self.typed_shared = shared;
+        if shared {
+            command::share_line(name).into_bytes()
+        } else {
+            command::attach_line(name).into_bytes()
+        }
+    }
+
+    /// The session attached runs on this account's shared server.
+    pub fn on_shared_server(&self) -> bool {
+        self.on_shared && self.client.is_control()
     }
 
     /// Whether this client watches (`Some(false)`) or joined to type
@@ -697,6 +729,7 @@ impl Tmux {
     ) -> Vec<Action> {
         self.pick_after_attach = session.is_none();
         self.share_pending = None;
+        self.typed_shared = false;
         self.join_pending = Some(can_type);
         self.type_line(command::join_line(owner, session, can_type))
     }
@@ -709,6 +742,7 @@ impl Tmux {
         self.pick_after_attach = false;
         self.join_pending = None;
         self.share_pending = Some(share);
+        self.typed_shared = true;
         self.type_line(command::share_line(name))
     }
 
@@ -732,6 +766,7 @@ impl Tmux {
         if !self.client.is_control() || self.joined.is_some() {
             return out;
         }
+        self.unshared = false;
         self.send(
             "display-message -p '#{socket_path}'",
             Tag::UnshareSocket,
@@ -751,19 +786,31 @@ impl Tmux {
     /// be the shared server (`socket`) and its tmux keeps the promise.
     fn open_share(&mut self, socket: &str, share: Share, out: &mut Vec<Action>) {
         if !command::is_share_socket(socket) {
+            self.on_shared = false;
+            out.push(Action::Tell(
+                "This tmux is not FeroSSH's shared server for your account, so the session \
+                 stays private."
+                    .into(),
+            ));
             return;
         }
+        self.on_shared = true;
         let version = self.version;
         let Some(v) = version.filter(|v| *v >= ACCESS_LIST_VERSION) else {
             out.push(Action::Tell(format!(
-                "tmux {} cannot limit which accounts connect (tmux {ACCESS_LIST_VERSION}                  can), so this session stays private.",
+                "tmux {} cannot limit which accounts connect (tmux {ACCESS_LIST_VERSION} \
+                 can), so this session stays private.",
                 version.map_or_else(|| "here".to_owned(), |v| v.to_string())
             )));
             return;
         };
-        if !share.can_type && v < READ_ONLY_VERSION {
+        if !share.can_type && (v < READ_ONLY_VERSION || self.dev_build) {
             out.push(Action::Tell(format!(
-                "tmux {v} does not keep another account read-only: through tmux control                  mode it can still type and run commands as you (fixed in tmux                  {READ_ONLY_VERSION}). So this session stays private. Share it with \"Let                  them type\" only with someone you trust with your account."
+                "tmux {v} does not keep another account read-only: through tmux control \
+                 mode it can still type and run commands as you (fixed in tmux \
+                 {READ_ONLY_VERSION}; a development build may predate the fix). So this \
+                 session stays private. Share it with \"Let them type\" only with someone \
+                 you trust with your account."
             )));
             return;
         }
@@ -822,6 +869,7 @@ impl Tmux {
                     self.session = None;
                     self.version = None;
                     self.joined = self.join_pending.take();
+                    self.on_shared = std::mem::take(&mut self.typed_shared);
                     self.told_read_only = false;
                     self.told_joined = false;
                 }
@@ -844,6 +892,7 @@ impl Tmux {
                 .as_ref()
                 .filter(|_| self.joined.is_none())
                 .map(|(_, n)| n.clone());
+            self.reattach_shared = self.reattach.clone().filter(|_| self.on_shared);
             self.client.reset();
             self.after_detach = None;
             self.teardown(ws, &mut out);
@@ -1053,6 +1102,8 @@ impl Tmux {
         match tag {
             Tag::Version => {
                 self.version = ok.then(|| Version::parse(&first())).flatten();
+                // Releases are numbers ("3.4", "3.3a").
+                self.dev_build = !first().starts_with(|c: char| c.is_ascii_digit());
                 if let Some(share) = self.share_pending.take() {
                     self.send(
                         "display-message -p '#{socket_path}'",
@@ -1064,6 +1115,11 @@ impl Tmux {
             Tag::ShareSocket(share) => {
                 if ok {
                     self.open_share(&first(), share, out);
+                } else {
+                    out.push(Action::Tell(
+                        "tmux did not say which server this is, so the session stays private."
+                            .into(),
+                    ));
                 }
             }
             Tag::ShareAdd(account) => {
@@ -1077,6 +1133,7 @@ impl Tmux {
             Tag::UnshareSocket => {
                 let socket = first();
                 if ok && command::is_share_socket(&socket) {
+                    self.unshared = true;
                     self.send("server-access -l", Tag::ShareList, out);
                     self.send(
                         &format!(
@@ -1089,6 +1146,12 @@ impl Tmux {
                 }
             }
             Tag::ShareList => {
+                if !ok {
+                    out.push(Action::Tell(
+                        "tmux did not list who may connect; nobody was taken off.".into(),
+                    ));
+                    return;
+                }
                 let mut gone = Vec::new();
                 for line in &lines {
                     let text = String::from_utf8_lossy(line);
@@ -1114,18 +1177,31 @@ impl Tmux {
                 if !ok || self.session.as_ref().map(|(s, _)| *s) != Some(session) {
                     return;
                 }
+                let mut watchers = 0;
                 for line in &lines {
                     let text = String::from_utf8_lossy(line);
                     if let Some(name) = text.trim().strip_suffix(" 1") {
                         let line = format!("detach-client -t {}", command::quote(name));
                         self.send(&line, Tag::Ignore, out);
+                        watchers += 1;
                     }
                 }
-                out.push(Action::Tell(
-                    "Stopped sharing: other accounts are off this tmux server and watchers \
-                     were detached."
-                        .into(),
-                ));
+                let detached = match watchers {
+                    0 => "Nobody was watching read-only.".to_owned(),
+                    1 => "1 read-only watcher was detached.".to_owned(),
+                    n => format!("{n} read-only watchers were detached."),
+                };
+                out.push(Action::Tell(if std::mem::take(&mut self.unshared) {
+                    format!(
+                        "Stopped sharing: other accounts are off your shared tmux server and its \
+                         socket is private again. {detached}"
+                    )
+                } else {
+                    format!(
+                        "This session is on your private tmux, which other accounts cannot \
+                         reach. {detached}"
+                    )
+                }));
             }
             Tag::ModeOption => self.mode_option = ok.then(first).filter(|m| !m.is_empty()),
             Tag::LayoutOption => {
@@ -2477,7 +2553,7 @@ mod tests {
         let (w, told) = shared("3.4", false, socket);
         assert!(w.is_empty(), "{w:?}");
         assert!(told[0].contains("stays private"), "{told:?}");
-        let (w, _) = shared("next-3.9", false, socket);
+        let (w, _) = shared("3.9", false, socket);
         assert_eq!(
             w,
             [
@@ -2502,6 +2578,60 @@ mod tests {
         // other way): nothing opens.
         let (w, _) = shared("3.4", true, "/tmp/tmux-1000/default");
         assert!(w.is_empty());
+    }
+
+    #[test]
+    fn a_development_build_is_not_trusted_with_watch_only() {
+        let (w, told) = shared("next-3.9", false, "/tmp/ferossh-share-alice/default");
+        assert!(w.is_empty(), "{w:?}");
+        assert!(told[0].contains("development build"), "{told:?}");
+        let (w, _) = shared("next-3.9", true, "/tmp/ferossh-share-alice/default");
+        assert_eq!(w[1], "server-access -w 'bob'");
+    }
+
+    #[test]
+    fn a_shared_session_comes_back_on_the_shared_server() {
+        let (mut t, mut ws, _, _) =
+            attached_after("3.4", |t| t.share("pair", share(&["bob"], true)));
+        t.feed(
+            &mut ws,
+            &reply(5, &["/tmp/ferossh-share-alice/default".into()]),
+        );
+        assert!(t.on_shared_server());
+        let _ = t.connection_lost(&mut ws);
+        let name = t.reattach.clone().unwrap();
+        // Typed again on the shared server, granting nothing anew.
+        assert_eq!(
+            t.attach(&name, false),
+            command::share_line("main").into_bytes()
+        );
+        t.feed(&mut ws, START);
+        assert!(t.on_shared_server());
+        let a = t.feed(&mut ws, &reply(1, &["3.4".into()]));
+        assert!(writes(&a).is_empty(), "{a:?}");
+        // A later plain attach is the private server again.
+        let _ = t.connection_lost(&mut ws);
+        assert_eq!(
+            t.attach("other", false),
+            command::attach_line("other").into_bytes()
+        );
+    }
+
+    #[test]
+    fn stop_sharing_on_the_private_server_says_nobody_was_taken_off() {
+        let (mut t, mut ws, a) =
+            attached(None, None, &[pane_line(0, 0, 80, 24, "b25f,80x24,0,0,0")]);
+        let mut n = 4;
+        for _ in writes(&a) {
+            n += 1;
+            t.feed(&mut ws, &reply(n, &[]));
+        }
+        t.unshare();
+        let mut input = reply(n + 1, &["/tmp/tmux-1000/default".into()]);
+        input.extend(reply(n + 2, &["/dev/pts/3 0".into()]));
+        let a = t.feed(&mut ws, &input);
+        assert!(writes(&a).is_empty(), "{a:?}");
+        assert!(tells(&a)[0].contains("private tmux"), "{a:?}");
     }
 
     #[test]

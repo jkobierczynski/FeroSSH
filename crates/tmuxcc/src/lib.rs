@@ -39,9 +39,11 @@ pub struct Version {
 }
 
 impl Version {
-    /// Reads `#{version}`. Builds from tmux's main branch ("next-3.5",
-    /// "master") count as newer than any release; OpenBSD's base tmux
-    /// ("openbsd-7.4") is current too.
+    /// Reads `#{version}`. A build from tmux's main branch counts as the
+    /// release it leads to ("next-3.5" as 3.5), or as newer than any
+    /// ("master"); OpenBSD's base tmux ("openbsd-7.4") is current too.
+    /// Such builds may lack fixes of that release: callers that depend
+    /// on one check for a release number themselves.
     pub fn parse(text: &str) -> Option<Self> {
         let text = text.trim();
         if text == "master" || text.starts_with("openbsd-") {

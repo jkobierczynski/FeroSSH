@@ -620,9 +620,9 @@ mod cmd {
     pub const TMUX_DETACH_OTHERS: u32 = 643;
     /// Session > tmux > Share this session, Join a shared session, Stop
     /// sharing.
-    pub const TMUX_SHARE: u32 = 661;
-    pub const TMUX_JOIN: u32 = 662;
-    pub const TMUX_UNSHARE: u32 = 663;
+    pub const TMUX_SHARE: u32 = 677;
+    pub const TMUX_JOIN: u32 = 678;
+    pub const TMUX_UNSHARE: u32 = 679;
     pub const TMUX_ATTACH: u32 = 610;
     pub const TMUX_DETACH: u32 = 611;
     pub const TMUX_PICK: u32 = 612;
@@ -4254,6 +4254,13 @@ impl Window {
             Some(Host::Ssh(s)) if s.target.mosh.is_some() => {
                 Err("tmux integration needs an SSH shell: it does not work over Mosh.".into())
             }
+            // tmux is typed at a shell: not into a login without one, or
+            // into the program a RemoteCommand runs.
+            Some(Host::Ssh(s)) if s.target.no_shell() || s.target.command.is_some() => Err(
+                "Sharing and joining tmux type a command at the host's shell, and this \
+                 connection has none (file transfer or tunnel only, or a RemoteCommand)."
+                    .into(),
+            ),
             Some(Host::Ssh(s)) if s.state() == State::Connected && !s.prompt_active() => Ok(()),
             _ => Err(NOT_IN_SHELL.into()),
         }
@@ -4302,14 +4309,39 @@ impl Window {
         };
         let user = self.tmux_share_defaults(gateway).map(|(u, _)| u)?;
         if accounts.is_empty() {
-            let text = format!(
-                "Anyone logged in to this host as {user} can watch tmux session {session}: in \
-                 FeroSSH with Session > tmux > Join a shared session (Session {session}), or \
-                 with: tmux attach -r -t {session}\n\n\
-                 Session > tmux > Stop sharing detaches those watching."
-            );
-            let active = self.tmux.get(&gateway).is_some_and(Tmux::active);
-            if !active && !self.attach_tmux(gateway, &session, false) {
+            // Attached already: that session is the one shared, on the
+            // server it runs on.
+            let attached = self
+                .tmux
+                .get(&gateway)
+                .filter(|t| t.active())
+                .map(|t| (t.session_name().map(str::to_owned), t.on_shared_server()));
+            let is_attached = attached.is_some();
+            let (session, shared_server) = match attached {
+                Some((name, shared)) => (name.unwrap_or(session), shared),
+                None => (session, false),
+            };
+            let text = if shared_server {
+                format!(
+                    "Anyone logged in to this host as {user} can watch tmux session {session}: \
+                     in FeroSSH with Session > tmux > Join a shared session (Shared by account \
+                     {user}, Session {session}), or with: tmux -S \
+                     {}{user}/default attach -r -t {session}\n\n\
+                     Session > tmux > Stop sharing detaches those watching.",
+                    ferossh_tmuxcc::command::SHARE_DIR_PREFIX
+                )
+            } else {
+                format!(
+                    "Anyone logged in to this host as {user} can watch tmux session {session}: \
+                     in FeroSSH with Session > tmux > Join a shared session (Session \
+                     {session}), or with: tmux attach -r -t {session}\n\n\
+                     Session > tmux > Stop sharing detaches those watching."
+                )
+            };
+            if is_attached {
+                return Some(text);
+            }
+            if !self.attach_tmux(gateway, &session, false) {
                 return None;
             }
             let actions = self
@@ -4361,6 +4393,17 @@ impl Window {
             },
         };
         let session = Some(field(1)).filter(|s| !s.is_empty());
+        // A name is joined exactly as typed, never cleaned into another
+        // session's name.
+        if let Some(s) = session
+            && ferossh_tmuxcc::command::session_name(s) != s
+        {
+            return Some(format!(
+                "\"{}\" has characters FeroSSH does not type into a command line. Leave \
+                 Session empty to pick the session from the list instead.",
+                crate::ssh::sanitize(s)
+            ));
+        }
         if !self.tmux.contains_key(&gateway) {
             let t = self.new_tmux(gateway);
             self.tmux.insert(gateway, t);
@@ -22424,6 +22467,10 @@ fn run_command(hwnd: HWND, command: Command) {
                  from tmux 3.9 on; on older tmux they can only be let in to type, and then they \
                  can also run commands as {user}."
             );
+            if DIALOG_OPEN.get() {
+                return;
+            }
+            DIALOG_OPEN.set(true);
             let answer = crate::fields_view::ask(
                 hwnd,
                 &crate::fields_view::Ask {
@@ -22435,13 +22482,26 @@ fn run_command(hwnd: HWND, command: Command) {
                     cancel: "Cancel",
                 },
             );
-            if let Some(answer) = answer
-                && let Some(text) = with_window(|w| w.share_tmux(gateway, &answer)).flatten()
-            {
-                dialog(hwnd, &text, MB_OK | MB_ICONINFORMATION);
+            DIALOG_OPEN.set(false);
+            if let Some(answer) = answer {
+                let (text, next) = with_window(|w| {
+                    (
+                        w.share_tmux(gateway, &answer),
+                        std::mem::take(&mut w.queued),
+                    )
+                })
+                .unwrap_or_default();
+                if let Some(text) = text {
+                    dialog(hwnd, &text, MB_OK | MB_ICONINFORMATION);
+                }
+                run_commands(hwnd, next);
             }
         }
         Command::TmuxJoin(gateway) => {
+            if DIALOG_OPEN.get() {
+                return;
+            }
+            DIALOG_OPEN.set(true);
             let answer = crate::fields_view::ask(
                 hwnd,
                 &crate::fields_view::Ask {
@@ -22457,10 +22517,15 @@ fn run_command(hwnd: HWND, command: Command) {
                     cancel: "Cancel",
                 },
             );
-            if let Some(answer) = answer
-                && let Some(text) = with_window(|w| w.join_tmux(gateway, &answer)).flatten()
-            {
-                dialog(hwnd, &text, MB_OK | MB_ICONINFORMATION);
+            DIALOG_OPEN.set(false);
+            if let Some(answer) = answer {
+                let (text, next) =
+                    with_window(|w| (w.join_tmux(gateway, &answer), std::mem::take(&mut w.queued)))
+                        .unwrap_or_default();
+                if let Some(text) = text {
+                    dialog(hwnd, &text, MB_OK | MB_ICONINFORMATION);
+                }
+                run_commands(hwnd, next);
             }
         }
         Command::TmuxPicker { gateway, names } => {

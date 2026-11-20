@@ -115,6 +115,10 @@ fn share_dir_ok(owner: &str) -> String {
     )
 }
 
+/// The scripts below run in `sh -c '...'`, so that they work from any
+/// login shell (fish, csh); they hold no single quote, as session and
+/// account names never do.
+///
 /// What to type at the shell to start (or attach to) session `name` on
 /// this account's shared tmux server, in control mode. The directory is
 /// made first if missing, and nothing starts unless it is this
@@ -123,9 +127,9 @@ fn share_dir_ok(owner: &str) -> String {
 /// FeroSSH, once it knows the tmux version, has set who may connect.
 pub fn share_line(name: &str) -> String {
     format!(
-        "FEROSSH_SHARE={SHARE_DIR_PREFIX}$(id -un); mkdir -m 711 \"$FEROSSH_SHARE\" 2>/dev/null; \
+        "sh -c 'FEROSSH_SHARE={SHARE_DIR_PREFIX}$(id -un); mkdir -m 711 \"$FEROSSH_SHARE\" 2>/dev/null; \
          if {}; then tmux -S \"$FEROSSH_SHARE/default\" -CC new-session -A -s {}; \
-         else echo \"FeroSSH: $FEROSSH_SHARE is not yours, so nothing was shared.\"; fi\r",
+         else echo \"FeroSSH: $FEROSSH_SHARE is not yours, so nothing was shared.\"; fi'\r",
         share_dir_ok("\"$(id -un)\""),
         session_name(name)
     )
@@ -149,9 +153,9 @@ pub fn join_line(owner: Option<&str>, session: Option<&str>, can_type: bool) -> 
     match owner.and_then(account_name) {
         None => format!("tmux -CC attach-session -f {flags}{target}\r"),
         Some(owner) => format!(
-            "FEROSSH_SHARE={SHARE_DIR_PREFIX}{owner}; if {}; then \
+            "sh -c 'FEROSSH_SHARE={SHARE_DIR_PREFIX}{owner}; if {}; then \
              tmux -S \"$FEROSSH_SHARE/default\" -CC attach-session -f {flags}{target}; \
-             else echo \"FeroSSH: {owner} is not sharing a tmux session on this host.\"; fi\r",
+             else echo \"FeroSSH: {owner} is not sharing a tmux session on this host.\"; fi'\r",
             share_dir_ok(&owner)
         ),
     }
@@ -225,7 +229,8 @@ mod tests {
             "tmux -CC attach-session -f ignore-size\r"
         );
         let l = join_line(Some("alice"), Some("a b"), false);
-        assert!(l.starts_with("FEROSSH_SHARE=/tmp/ferossh-share-alice; if [ -n "));
+        assert!(l.starts_with("sh -c 'FEROSSH_SHARE=/tmp/ferossh-share-alice; if [ -n "));
+        assert!(l.ends_with("fi'\r"));
         assert!(l.contains("-user alice -perm 711"));
         assert!(l.contains("-CC attach-session -f read-only,ignore-size -t =a_b;"));
         // An owner that is no account name joins nothing of anyone's.
@@ -237,6 +242,8 @@ mod tests {
         assert!(s.contains("mkdir -m 711 \"$FEROSSH_SHARE\""));
         assert!(s.contains("-user \"$(id -un)\" -perm 711"));
         assert!(s.contains("-CC new-session -A -s pair;"));
-        assert!(s.ends_with("fi\r"));
+        assert!(s.starts_with("sh -c '"));
+        assert!(s.ends_with("fi'\r"));
+        assert_eq!(s.matches('\'').count(), 2);
     }
 }

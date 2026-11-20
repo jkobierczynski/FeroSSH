@@ -9,7 +9,7 @@ use std::cell::RefCell;
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{COLOR_WINDOW, DeleteObject, FillRect, HDC, HFONT, HGDIOBJ};
 use windows::Win32::UI::Controls::{BST_CHECKED, EM_LIMITTEXT, WC_BUTTONW, WC_EDITW, WC_STATICW};
-use windows::Win32::UI::HiDpi::{AdjustWindowRectExForDpi, GetDpiForSystem};
+use windows::Win32::UI::HiDpi::{AdjustWindowRectExForDpi, GetDpiForWindow};
 use windows::Win32::UI::Input::KeyboardAndMouse::{EnableWindow, SetFocus};
 use windows::Win32::UI::WindowsAndMessaging::{
     BM_GETCHECK, BM_SETCHECK, BS_AUTOCHECKBOX, BS_DEFPUSHBUTTON, BS_PUSHBUTTON, CS_HREDRAW,
@@ -69,8 +69,9 @@ fn with<T>(f: impl FnOnce(&mut State) -> T) -> Option<T> {
 
 /// Shows the window over `owner` and waits for OK or Cancel.
 pub fn ask(owner: HWND, ask: &Ask) -> Option<Answer> {
-    // SAFETY: plain query.
-    let dpi = unsafe { GetDpiForSystem() };
+    // SAFETY: plain query of our own window: the form takes the DPI of
+    // the monitor it opens on.
+    let dpi = unsafe { GetDpiForWindow(owner) }.max(96);
     // SAFETY: a class with valid static strings and a window procedure
     // of ours; the window and its controls are destroyed before return.
     let dlg = unsafe { create(owner, dpi, ask) }.ok()?;
@@ -196,6 +197,39 @@ unsafe fn create(owner: HWND, dpi: u32, ask: &Ask) -> windows::core::Result<HWND
             Some(instance.into()),
             None,
         )?;
+        let built = build(
+            dlg,
+            instance.into(),
+            dpi,
+            ask,
+            fields,
+            height,
+            intro_h,
+            fields_top,
+        );
+        if built.is_err() {
+            // Its controls go with it.
+            let _ = DestroyWindow(dlg);
+        }
+        built.map(|()| dlg)
+    }
+}
+
+/// The form's controls, in window `dlg`.
+#[allow(clippy::too_many_arguments)]
+unsafe fn build(
+    dlg: HWND,
+    instance: windows::Win32::Foundation::HINSTANCE,
+    dpi: u32,
+    ask: &Ask,
+    fields: &[(&str, &str)],
+    height: i32,
+    intro_h: i32,
+    fields_top: i32,
+) -> windows::core::Result<()> {
+    let s = |d: i32| scale(d, dpi);
+    // SAFETY: the caller's promise; see `ask`.
+    unsafe {
         let child = |class: PCWSTR, text: &str, style: u32, id: usize, at: (i32, i32, i32, i32)| {
             let text = wide(text);
             CreateWindowExW(
@@ -209,7 +243,7 @@ unsafe fn create(owner: HWND, dpi: u32, ask: &Ask) -> windows::core::Result<HWND
                 s(at.3),
                 Some(dlg),
                 Some(HMENU(id as *mut _)),
-                Some(instance.into()),
+                Some(instance),
                 None,
             )
         };
@@ -274,7 +308,7 @@ unsafe fn create(owner: HWND, dpi: u32, ask: &Ask) -> windows::core::Result<HWND
                 done: None,
             });
         });
-        Ok(dlg)
+        Ok(())
     }
 }
 
