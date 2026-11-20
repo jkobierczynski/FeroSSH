@@ -80,6 +80,8 @@ Besides `HostName`, `User`, `Port`, `IdentityFile`, `Tag`, `ProxyJump`, `ProxyCo
 | `UserKnownHostsFile` | Other known_hosts files, in place of `~/.ssh/known_hosts`. |
 | `HostKeyAlias` | Looks the host key up under this name instead of the host's. |
 | `VerifyHostKeyDNS` | Also checks the host key against the host's SSHFP records in DNS (see [Host keys in DNS](#host-keys-in-dns-sshfp)). |
+| `UpdateHostKeys` | `yes` (the default) keeps `known_hosts` up to date with the host keys the server lists after the login; `no` leaves it alone (see [New host keys from the server](#new-host-keys-from-the-server-updatehostkeys)). |
+| `EscapeChar` | The character that starts an escape sequence such as `~.`: another one (`%`, or `^]` for Ctrl+]), or `none` (see [Escape sequences](#escape-sequences-)). |
 | `AddressFamily` | `inet` for IPv4 only, `inet6` for IPv6 only. |
 | `ProxyServer` | FeroSSH's own: a SOCKS 5 or HTTP proxy to go through (see [Proxies](#proxies)). OpenSSH does not know it, so put `IgnoreUnknown ProxyServer` above it in a file OpenSSH reads too. |
 
@@ -100,6 +102,27 @@ The AD bit is only as trustworthy as the way to the DNS server: anyone between y
 In a terminal, Ctrl+click an `ssh://` or `sftp://` link, written as plain text (`echo ssh://user@host`) or marked by a program, to open it in a new FeroSSH tab after you confirm. This works without the Settings item, and such a link never goes through Windows. Plain-text `http://` and `https://` links open the same way, in your browser.
 
 A link only ever names a host: a path, a query, options, a second host, a user starting with `-` or anything a shell would read as more is refused, and FeroSSH starts from a link only as `ferossh.exe --url "<link>"`, which takes that one valid link and nothing else. The usual host key check applies, so a link to a host you have never used shows its fingerprint first. When another program already opens links of that kind, FeroSSH leaves it in place and offers itself in Windows Settings > Apps > Default apps, where you pick it; Windows may also ask the first time which program to use.
+
+### New host keys from the server (UpdateHostKeys)
+
+OpenSSH servers list all their host keys after the login (`hostkeys-00@openssh.com`). With `UpdateHostKeys yes`, the default as in OpenSSH, FeroSSH compares that list with `known_hosts`: a key the file lacks is added, hashed, once the server proved it holds it (it signs with each new key, and the sandboxed worker checks the signatures), and a key the file holds for the host that the server no longer has is taken out. One grey line in the terminal says what changed. This is how a server can move to a new key type, or retire an old key, without a single "host key changed" warning: the next connection already trusts the new key.
+
+Nothing changes unless the login was trusted through the first `known_hosts` file itself (a key it holds, or one you just typed `yes` for). FeroSSH leaves the files alone when the host was trusted another way (a host certificate, DNS, *for this connection only*), when `UserKnownHostsFile` is `none` or on a network share, when another `known_hosts` file read also holds keys for the host, when a line holding a key for the host also names other hosts or a wildcard, and for Mosh sessions. `@revoked` keys are never added. Lines for other hosts, comments and line ends stay as they were, and nothing is written if another program changed the file meanwhile. `UpdateHostKeys ask` says which keys are new and leaves the file as it is; FeroSSH does not ask in a running terminal.
+
+### Escape sequences (~)
+
+As in OpenSSH, `~` typed first on a line (right after Enter) in an SSH pane starts an escape sequence; the `~` is held back until the next key:
+
+| Keys | What it does |
+| --- | --- |
+| `~.` | Ends the connection, as Session > Disconnect does. |
+| `~C` | Opens an `ssh>` command line: `-L`, `-R` and `-D` add a forward, `-KL`, `-KR` and `-KD` cancel one (as in [Port forwards](#port-forwards)); `?` lists them, Escape leaves it. |
+| `~#` | Lists the connection's forwards and their open connections. |
+| `~R` | Asks the server for a new key exchange. |
+| `~?` | Lists the escape sequences. |
+| `~~` | Types one `~`. |
+
+Any other key after `~` sends both, so `~/` and `~x` type as usual. Only keys you type count, never a paste, a script or a suggestion, and the sequence is read before the key is encoded, so it works the same with the kitty keyboard protocol and in tmux panes (where `~.` ends the tmux connection). Telnet, WinRM, serial and local shells have none, and neither does Mosh, whose own keys these would clash with. `~B` (break), `~V` and `~v` (log level), `~&` and `~^Z` (background) only say why FeroSSH has no use for them. `EscapeChar` in your ssh_config changes the character for a host, `EscapeChar` in `ferossh.conf` for every host, and Session > SSH escape sequences turns them off and on.
 
 ### Agent forwarding
 

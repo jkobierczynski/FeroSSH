@@ -33,7 +33,8 @@ use ferossh_auth::{
 };
 use ferossh_config::known_hosts::{self, KnownHosts, Status};
 use ferossh_config::ssh_config::{
-    AddressFamily, RequestTty, SessionType, StrictHostKeyChecking, VerifyHostKeyDns,
+    AddressFamily, EscapeChar, RequestTty, SessionType, StrictHostKeyChecking, UpdateHostKeys,
+    VerifyHostKeyDns,
 };
 use ferossh_config::sshfp::{self, Verdict};
 use ferossh_config::{ForwardSpec, ProxyKind, ProxyServer, hostkey, ssh_config};
@@ -108,6 +109,12 @@ pub struct Target {
     pub strict: StrictHostKeyChecking,
     /// `VerifyHostKeyDNS`: also check the host key against SSHFP records.
     pub verify_dns: VerifyHostKeyDns,
+    /// `UpdateHostKeys`: learn the server's other host keys after the
+    /// login.
+    pub update_host_keys: UpdateHostKeys,
+    /// `EscapeChar`, when ssh_config sets it for the host; otherwise the
+    /// window's setting applies.
+    pub escape_char: Option<EscapeChar>,
     /// `UserKnownHostsFile`, expanded: read all, write the first. `None`
     /// for the usual `~/.ssh/known_hosts`; empty for `none`.
     pub known_hosts_files: Option<Vec<PathBuf>>,
@@ -353,6 +360,8 @@ impl Target {
                 .strict_host_key_checking
                 .unwrap_or(StrictHostKeyChecking::Ask),
             verify_dns: cfg.verify_host_key_dns.unwrap_or(VerifyHostKeyDns::No),
+            update_host_keys: cfg.update_host_keys.unwrap_or(UpdateHostKeys::Yes),
+            escape_char: cfg.escape_char,
             known_hosts_files: cfg
                 .user_known_hosts_files
                 .as_ref()
@@ -650,6 +659,28 @@ pub struct SshSession {
     /// yet said is gone: held until it says why, so the reason shows
     /// first. The two workers' messages come in any order.
     held: Option<Message>,
+    /// The host key this login was trusted with because the first
+    /// known_hosts file holds it (or it was just added there): the only
+    /// case in which UpdateHostKeys changes that file.
+    pinned_key: Option<Vec<u8>>,
+    /// UpdateHostKeys waiting for the server's proof.
+    host_keys: Option<ProvingKeys>,
+    /// The server's list of host keys, when it came before the shell
+    /// opened: looked at once the login is done.
+    early_host_keys: Option<Vec<Vec<u8>>>,
+}
+
+/// UpdateHostKeys waiting for the server's proof.
+#[derive(Debug)]
+struct ProvingKeys {
+    /// Every key the server listed.
+    announced: Vec<Vec<u8>>,
+    /// The new ones sent to be proven.
+    asked: Vec<Vec<u8>>,
+    /// The known_hosts file as it was when the proof was asked for: the
+    /// update is worked out from it, so a file changed meanwhile is left
+    /// alone.
+    seen: String,
 }
 
 /// A jump host on the way to the target: its login, and the stream its
@@ -684,6 +715,8 @@ struct Login {
     gss_steps: u32,
     /// The worker sent the SSHFP records.
     sshfp_told: bool,
+    /// The worker passed on the server's list of host keys.
+    host_keys_told: bool,
     /// The login worked.
     done: bool,
 }
@@ -760,6 +793,17 @@ fn dim(text: &str) -> String {
     format!("{DIM}{text}{RESET}\r\n")
 }
 
+/// `ECDSA SHA256:..., RSA SHA256:...` for a list of host keys.
+fn describe_keys(keys: &[Vec<u8>]) -> String {
+    keys.iter()
+        .map(|k| match hostkey::describe(k) {
+            Some(d) => format!("{} {}", d.kind, d.fingerprint),
+            None => "a key FeroSSH cannot read".to_owned(),
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 impl SshSession {
     pub fn new(channel: ChannelId, target: Target, known_hosts: PathBuf) -> Self {
         Self {
@@ -799,6 +843,9 @@ impl SshSession {
             jump: false,
             size: Cell::new((80, 24)),
             held: None,
+            pinned_key: None,
+            host_keys: None,
+            early_host_keys: None,
         }
     }
 
@@ -1054,10 +1101,13 @@ impl SshSession {
                 )))));
             }
             Some(file) => match known_hosts::add(&file, &host, port, key) {
-                Ok(()) => effects.push(Effect::Show(dim(&sanitize(&format!(
-                    "Added {host} to {}.",
-                    file.display()
-                ))))),
+                Ok(()) => {
+                    self.pinned_key = Some(key.to_vec());
+                    effects.push(Effect::Show(dim(&sanitize(&format!(
+                        "Added {host} to {}.",
+                        file.display()
+                    )))));
+                }
                 Err(e) => effects.push(Effect::Show(dim(&sanitize(&format!(
                     "Could not save the key to {} ({e}); trusting it for this \
                      connection only.",
@@ -1112,6 +1162,9 @@ impl SshSession {
             ..Login::default()
         };
         self.sshfp = None;
+        self.pinned_key = None;
+        self.host_keys = None;
+        self.early_host_keys = None;
         let mut effects = vec![Effect::Show(dim(&sanitize(&text)))];
         if let (Some(command), Some(tunnel)) = (&self.proxy, self.tunnel) {
             effects.push(Effect::ProxyCommand {
@@ -1525,6 +1578,9 @@ impl SshSession {
     pub fn close(&mut self) -> Vec<Effect> {
         self.prompt = None;
         self.held = None;
+        // A proof still on its way changes nothing once the tab let go.
+        self.host_keys = None;
+        self.early_host_keys = None;
         let mut effects = Vec::new();
         for h in &mut self.hops {
             effects.extend(h.session.close());
@@ -1573,6 +1629,19 @@ impl SshSession {
                     None
                 }
             }
+            Message::HostKeysAnnounced { .. } => {
+                if !login.started || !login.host_trusted {
+                    Some("a list of host keys outside a login")
+                } else if login.host_keys_told {
+                    Some("a second list of host keys")
+                } else {
+                    None
+                }
+            }
+            Message::HostKeysProven { keys, .. } => match &self.host_keys {
+                Some(p) if p.asked == *keys => None,
+                _ => Some("a host key proof it was not asked for"),
+            },
             Message::GssapiStep { .. } if !self.target.gssapi => {
                 Some("a Kerberos login this connection does not use")
             }
@@ -1634,6 +1703,15 @@ impl SshSession {
     }
 
     fn on_own(&mut self, msg: Message) -> Vec<Effect> {
+        // Host keys still on their way when the connection ended.
+        if self.state == State::Ended
+            && matches!(
+                msg,
+                Message::HostKeysAnnounced { .. } | Message::HostKeysProven { .. }
+            )
+        {
+            return Vec::new();
+        }
         if let Some(what) = self.out_of_turn(&msg) {
             let mut effects = vec![Effect::Show(format!(
                 "\r\n{RED}The SSH worker asked for {what}. That is not how a login goes, so \
@@ -1692,6 +1770,18 @@ impl SshSession {
                     .map_or(0, |d| d.as_secs());
                 self.on_host_cert(&cert, now)
             }
+            Message::HostKeysAnnounced { keys, .. } => {
+                self.login.host_keys_told = true;
+                // Nothing changes before the login is done: a list that
+                // came while the shell opened waits for it.
+                if self.state == State::Connected {
+                    self.on_host_keys(keys)
+                } else {
+                    self.early_host_keys = Some(keys);
+                    Vec::new()
+                }
+            }
+            Message::HostKeysProven { keys, error, .. } => self.on_host_keys_proven(&keys, &error),
             Message::Banner { text, .. } => vec![Effect::Show(sanitize(&text))],
             Message::Notice { text, .. } => vec![Effect::Show(dim(&sanitize(&text)))],
             Message::IdentitiesRequest { .. } => vec![Effect::Broker(Job::Identities(KeyChoice {
@@ -1762,6 +1852,9 @@ impl SshSession {
                         password: Secrets(vec![password.to_string()]),
                     });
                 }
+                if let Some(keys) = self.early_host_keys.take() {
+                    effects.extend(self.on_host_keys(keys));
+                }
                 effects.push(Effect::Connected);
                 effects
             }
@@ -1778,6 +1871,8 @@ impl SshSession {
             }
             Message::Disconnected { reason, .. } => {
                 self.prompt = None;
+                self.host_keys = None;
+                self.early_host_keys = None;
                 let was = self.state;
                 let was_blocked = self.state == State::Blocked;
                 self.state = if was_blocked {
@@ -1963,6 +2058,14 @@ impl SshSession {
         let mismatch = dns.as_ref().is_some_and(|d| d.verdict == Verdict::Mismatch);
         match known.check(&host, port, &key) {
             Status::Trusted => {
+                // UpdateHostKeys only for a key the file it writes holds.
+                self.pinned_key = self
+                    .known_file()
+                    .and_then(|f| known_hosts::read(&f).ok())
+                    .is_some_and(|t| {
+                        KnownHosts::parse(&t).check(&host, port, &key) == Status::Trusted
+                    })
+                    .then(|| key.clone());
                 // known_hosts wins; a record that disagrees is said.
                 let mut effects: Vec<Effect> =
                     dns_line(DIM).filter(|_| mismatch).into_iter().collect();
@@ -2065,6 +2168,167 @@ impl SshSession {
                 vec![Effect::Show(text)]
             }
         }
+    }
+
+    /// UpdateHostKeys: the server listed all its host keys after the
+    /// login. Keys the first known_hosts file lacks are added once the
+    /// server proved it holds them; keys it no longer has go. Only for a
+    /// login trusted through that file, with lines that name this host
+    /// alone, and never over a Mosh session (whose worker no longer reads
+    /// the login channel). Anything else leaves the file alone, without a
+    /// word, as OpenSSH does.
+    ///
+    /// The worker checks the proof, as it checks the key exchange: a
+    /// worker that lied could make this file trust keys for this host
+    /// only, which the server it is logged in to could do as well.
+    fn on_host_keys(&mut self, announced: Vec<Vec<u8>>) -> Vec<Effect> {
+        let (host, port) = self.target.key_host();
+        let (host, port) = (host.to_owned(), port);
+        if self.target.update_host_keys == UpdateHostKeys::No || self.target.mosh.is_some() {
+            return Vec::new();
+        }
+        let (Some(used), Some(file)) = (self.pinned_key.clone(), self.known_file()) else {
+            return Vec::new();
+        };
+        if self.on_share(&file).is_some() || self.listed_elsewhere(&file, &host, port) {
+            return Vec::new();
+        }
+        // Only keys FeroSSH reads (the worker already left out weak ones),
+        // and none that a known_hosts file marks @revoked: such a key is
+        // treated as not offered, so it is never added.
+        let Ok(known) = self.known() else {
+            return Vec::new();
+        };
+        let announced: Vec<Vec<u8>> = announced
+            .into_iter()
+            .filter(|k| hostkey::describe(k).is_some() && !known.is_revoked(k))
+            .collect();
+        let Ok(text) = known_hosts::read(&file) else {
+            return Vec::new();
+        };
+        let Ok(changes) = known_hosts::plan_host_keys(&text, &host, port, &used, &announced) else {
+            return Vec::new();
+        };
+        if changes.is_empty() {
+            return Vec::new();
+        }
+        if self.target.update_host_keys == UpdateHostKeys::Ask {
+            let text = format!(
+                "{host} has new host keys ({}){}. UpdateHostKeys is ask, which FeroSSH \
+                 does not ask about in a running session, so known_hosts was left as \
+                 it is.",
+                describe_keys(&changes.add),
+                if changes.remove.is_empty() {
+                    String::new()
+                } else {
+                    format!(" and no longer has {}", describe_keys(&changes.remove))
+                }
+            );
+            return vec![Effect::Show(dim(&sanitize(&text)))];
+        }
+        if changes.add.is_empty() {
+            return self.update_host_keys(&announced, &[], &text);
+        }
+        self.host_keys = Some(ProvingKeys {
+            announced,
+            asked: changes.add.clone(),
+            seen: text,
+        });
+        vec![Effect::Send(Message::HostKeysProve {
+            channel: self.channel,
+            keys: changes.add,
+        })]
+    }
+
+    /// The server's answer to the proof UpdateHostKeys asked for.
+    fn on_host_keys_proven(&mut self, keys: &[Vec<u8>], error: &str) -> Vec<Effect> {
+        let Some(ProvingKeys {
+            announced, seen, ..
+        }) = self.host_keys.take()
+        else {
+            return Vec::new();
+        };
+        if !error.is_empty() {
+            let (host, _) = self.target.key_host();
+            let text = format!(
+                "{host} listed new host keys but did not prove it holds them ({error}); \
+                 known_hosts was left as it is."
+            );
+            return vec![Effect::Show(dim(&sanitize(&text)))];
+        }
+        self.update_host_keys(&announced, keys, &seen)
+    }
+
+    /// Writes UpdateHostKeys' changes, worked out from the first
+    /// known_hosts file as it read `seen`, and says what changed. What
+    /// made the update allowed is checked again: the other files may have
+    /// changed while the server proved its keys.
+    fn update_host_keys(
+        &mut self,
+        announced: &[Vec<u8>],
+        proven: &[Vec<u8>],
+        seen: &str,
+    ) -> Vec<Effect> {
+        let (host, port) = self.target.key_host();
+        let (host, port) = (host.to_owned(), port);
+        let (Some(used), Some(file)) = (self.pinned_key.clone(), self.known_file()) else {
+            return Vec::new();
+        };
+        // Neither the key the login used nor a new one may have been
+        // revoked meanwhile.
+        let revoked = self.known().map_or(true, |k| {
+            k.is_revoked(&used) || proven.iter().any(|key| k.is_revoked(key))
+        });
+        if self.on_share(&file).is_some() || self.listed_elsewhere(&file, &host, port) || revoked {
+            return Vec::new();
+        }
+        let text =
+            match known_hosts::update_host_keys(&file, seen, &host, port, &used, announced, proven)
+            {
+                Ok(done) if done.is_empty() => return Vec::new(),
+                Ok(done) => {
+                    let mut parts = Vec::new();
+                    if !done.add.is_empty() {
+                        parts.push(format!("learned {}", describe_keys(&done.add)));
+                    }
+                    if !done.remove.is_empty() {
+                        parts.push(format!(
+                            "removed {}, which it no longer has",
+                            describe_keys(&done.remove)
+                        ));
+                    }
+                    format!(
+                        "Updated the host keys of {host} in {} (UpdateHostKeys): {}.",
+                        file.display(),
+                        parts.join("; ")
+                    )
+                }
+                Err(e) => format!(
+                    "Could not update the host keys of {host} in {} ({e}).",
+                    file.display()
+                ),
+            };
+        vec![Effect::Show(dim(&sanitize(&text)))]
+    }
+
+    /// Whether a known_hosts file read besides `first` holds keys for the
+    /// host: then UpdateHostKeys leaves everything alone, as OpenSSH does,
+    /// since a key it removed from `first` would still be trusted there.
+    fn listed_elsewhere(&self, first: &std::path::Path, host: &str, port: u16) -> bool {
+        let real = |p: &std::path::Path| std::fs::canonicalize(p).ok();
+        let first_real = real(first);
+        self.known_files().iter().any(|f| {
+            if f == first || (first_real.is_some() && real(f) == first_real) {
+                return false;
+            }
+            if self.on_share(f).is_some() {
+                return true;
+            }
+            match known_hosts::read(f) {
+                Ok(t) => !KnownHosts::parse(&t).key_types(host, port).is_empty(),
+                Err(_) => true,
+            }
+        })
     }
 
     /// Blocks a host key that differs from what known_hosts holds for the
@@ -2681,6 +2945,24 @@ mod tests {
         assert_eq!(s.state(), State::Connected);
     }
 
+    fn ecdsa_blob() -> Vec<u8> {
+        russh::keys::PublicKey::from_openssh(
+            "ecdsa-sha2-nistp256 AAAAE2VjZHNhLXNoYTItbmlzdHAyNTYAAAAIbmlzdHAyNTYAAABBBHwlcn5XYT/pMvb5rgkEVVrF/260tlW/09z+qlgSwfaOlfFujOT1CfYzo06rvRcea9hD9XkRbrU0l/5s2nRt/mg=",
+        )
+        .unwrap()
+        .to_bytes()
+        .unwrap()
+    }
+
+    fn other_ed25519_blob() -> Vec<u8> {
+        russh::keys::PublicKey::from_openssh(
+            "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIBFGIGauNdZoAvu2xZFwYN1sspsdCA6C3QeaVGKer61w",
+        )
+        .unwrap()
+        .to_bytes()
+        .unwrap()
+    }
+
     fn reconnects(fx: &[Effect]) -> bool {
         fx.iter().any(|e| matches!(e, Effect::Reconnect))
     }
@@ -3096,6 +3378,207 @@ mod tests {
             Message::HostKeyVerdict { accept, .. } => Some(*accept),
             _ => None,
         })
+    }
+
+    #[test]
+    fn update_host_keys_learns_proven_keys_and_drops_old_ones() {
+        let dir = temp("hostkeys");
+        let e = env(&dir);
+        let old = other_ed25519_blob();
+        let mut s = SshSession::new(1, Target::resolve("host", &e).unwrap(), e.known_hosts());
+        connected(&mut s);
+        // An old key of the host's, gone from the server since.
+        let kh = e.known_hosts();
+        let text = std::fs::read_to_string(&kh).unwrap();
+        let old_line = known_hosts::hashed_line("host", 22, &old).unwrap();
+        std::fs::write(&kh, format!("{text}{old_line}\n")).unwrap();
+        let fx = s.on_worker(Message::HostKeysAnnounced {
+            channel: 1,
+            keys: vec![ed25519_blob(), ecdsa_blob()],
+        });
+        assert_eq!(
+            sent(&fx),
+            vec![&Message::HostKeysProve {
+                channel: 1,
+                keys: vec![ecdsa_blob()],
+            }]
+        );
+        // Nothing changes before the proof.
+        let kh_text = std::fs::read_to_string(&kh).unwrap();
+        assert!(!matches!(
+            KnownHosts::parse(&kh_text).check("host", 22, &ecdsa_blob()),
+            Status::Trusted
+        ));
+        let fx = s.on_worker(Message::HostKeysProven {
+            channel: 1,
+            keys: vec![ecdsa_blob()],
+            error: String::new(),
+        });
+        let said = shown(&fx);
+        assert!(said.contains("learned ECDSA SHA256:"), "{said}");
+        assert!(said.contains("removed ED25519 SHA256:"), "{said}");
+        let after = KnownHosts::parse(&std::fs::read_to_string(&kh).unwrap());
+        assert_eq!(after.check("host", 22, &ecdsa_blob()), Status::Trusted);
+        assert_eq!(after.check("host", 22, &ed25519_blob()), Status::Trusted);
+        assert!(!matches!(after.check("host", 22, &old), Status::Trusted));
+        // A second list, or a proof nobody asked for, closes the
+        // connection: an honest worker sends neither.
+        let fx = s.on_worker(Message::HostKeysProven {
+            channel: 1,
+            keys: vec![ecdsa_blob()],
+            error: String::new(),
+        });
+        assert!(fx.iter().any(|e| matches!(e, Effect::Ended)));
+    }
+
+    #[test]
+    fn update_host_keys_needs_proof_and_a_known_hosts_pin() {
+        let dir = temp("hostkeys-refused");
+        let e = env(&dir);
+        let mut s = SshSession::new(1, Target::resolve("host", &e).unwrap(), e.known_hosts());
+        connected(&mut s);
+        s.on_worker(Message::HostKeysAnnounced {
+            channel: 1,
+            keys: vec![ed25519_blob(), ecdsa_blob()],
+        });
+        let fx = s.on_worker(Message::HostKeysProven {
+            channel: 1,
+            keys: vec![ecdsa_blob()],
+            error: "the server refused to prove it holds them".into(),
+        });
+        assert!(shown(&fx).contains("did not prove"));
+        let kh = KnownHosts::load(&e.known_hosts()).unwrap();
+        assert!(!matches!(
+            kh.check("host", 22, &ecdsa_blob()),
+            Status::Trusted
+        ));
+
+        // UpdateHostKeys no: nothing is asked.
+        let mut e = env(&temp("hostkeys-off"));
+        e.config.push_str("Host *\n  UpdateHostKeys no\n");
+        let mut s = SshSession::new(1, Target::resolve("host", &e).unwrap(), e.known_hosts());
+        connected(&mut s);
+        let fx = s.on_worker(Message::HostKeysAnnounced {
+            channel: 1,
+            keys: vec![ed25519_blob(), ecdsa_blob()],
+        });
+        assert!(fx.is_empty());
+
+        // Trusted for this connection only (UserKnownHostsFile none):
+        // there is no file to update.
+        let mut e = env(&temp("hostkeys-none"));
+        e.config.push_str("Host *\n  UserKnownHostsFile none\n");
+        let mut s = SshSession::new(1, Target::resolve("host", &e).unwrap(), e.known_hosts());
+        connected(&mut s);
+        let fx = s.on_worker(Message::HostKeysAnnounced {
+            channel: 1,
+            keys: vec![ed25519_blob(), ecdsa_blob()],
+        });
+        assert!(fx.is_empty());
+
+        // UpdateHostKeys ask: says what is new, changes nothing.
+        let mut e = env(&temp("hostkeys-ask"));
+        e.config.push_str("Host *\n  UpdateHostKeys ask\n");
+        let mut s = SshSession::new(1, Target::resolve("host", &e).unwrap(), e.known_hosts());
+        connected(&mut s);
+        let fx = s.on_worker(Message::HostKeysAnnounced {
+            channel: 1,
+            keys: vec![ed25519_blob(), ecdsa_blob()],
+        });
+        assert!(sent(&fx).is_empty());
+        assert!(shown(&fx).contains("UpdateHostKeys is ask"));
+    }
+
+    #[test]
+    fn update_host_keys_waits_for_the_login_and_a_still_file() {
+        // A list that comes while the shell opens waits for Connected.
+        let dir = temp("hostkeys-wait");
+        let e = env(&dir);
+        let mut s = SshSession::new(1, Target::resolve("host", &e).unwrap(), e.known_hosts());
+        trusted(&mut s);
+        let fx = s.on_worker(Message::HostKeysAnnounced {
+            channel: 1,
+            keys: vec![ed25519_blob(), ecdsa_blob()],
+        });
+        assert!(fx.is_empty());
+        let fx = s.on_worker(Message::Connected {
+            channel: 1,
+            kex: "mlkem768x25519-sha256".into(),
+            cipher: "aes256-gcm@openssh.com".into(),
+            host_key: "ssh-ed25519".into(),
+        });
+        assert!(sent(&fx).iter().any(|m| matches!(
+            m,
+            Message::HostKeysProve { keys, .. } if *keys == vec![ecdsa_blob()]
+        )));
+        // known_hosts changed while the server proved: left alone.
+        let kh = e.known_hosts();
+        let edited = format!("{}# edited\n", std::fs::read_to_string(&kh).unwrap());
+        std::fs::write(&kh, &edited).unwrap();
+        let fx = s.on_worker(Message::HostKeysProven {
+            channel: 1,
+            keys: vec![ecdsa_blob()],
+            error: String::new(),
+        });
+        assert!(shown(&fx).contains("changed while"));
+        assert_eq!(std::fs::read_to_string(&kh).unwrap(), edited);
+
+        // A proof that comes after the tab closed changes nothing.
+        let dir = temp("hostkeys-closed");
+        let e = env(&dir);
+        let mut s = SshSession::new(1, Target::resolve("host", &e).unwrap(), e.known_hosts());
+        connected(&mut s);
+        s.on_worker(Message::HostKeysAnnounced {
+            channel: 1,
+            keys: vec![ed25519_blob(), ecdsa_blob()],
+        });
+        s.close();
+        let fx = s.on_worker(Message::HostKeysProven {
+            channel: 1,
+            keys: vec![ecdsa_blob()],
+            error: String::new(),
+        });
+        assert!(fx.is_empty());
+        let kh = KnownHosts::load(&e.known_hosts()).unwrap();
+        assert!(!matches!(
+            kh.check("host", 22, &ecdsa_blob()),
+            Status::Trusted
+        ));
+
+        // A key revoked in another known_hosts file is never added.
+        let dir = temp("hostkeys-revoked");
+        let mut e = env(&dir);
+        let other = dir.join("revoked_hosts");
+        let ecdsa = russh::keys::PublicKey::from_bytes(&ecdsa_blob())
+            .unwrap()
+            .to_openssh()
+            .unwrap();
+        std::fs::write(&other, format!("@revoked * {ecdsa}\n")).unwrap();
+        e.config.push_str(&format!(
+            "Host *\n  UserKnownHostsFile {} {}\n",
+            e.known_hosts().display(),
+            other.display()
+        ));
+        let mut s = SshSession::new(1, Target::resolve("host", &e).unwrap(), e.known_hosts());
+        connected(&mut s);
+        let fx = s.on_worker(Message::HostKeysAnnounced {
+            channel: 1,
+            keys: vec![ed25519_blob(), ecdsa_blob()],
+        });
+        assert!(sent(&fx).is_empty());
+    }
+
+    #[test]
+    fn host_keys_before_the_host_key_close_the_connection() {
+        let dir = temp("hostkeys-early");
+        let e = env(&dir);
+        let mut s = SshSession::new(1, Target::resolve("host", &e).unwrap(), e.known_hosts());
+        s.start(80, 24);
+        let fx = s.on_worker(Message::HostKeysAnnounced {
+            channel: 1,
+            keys: vec![ecdsa_blob()],
+        });
+        assert!(shown(&fx).contains("list of host keys outside a login"));
     }
 
     #[test]

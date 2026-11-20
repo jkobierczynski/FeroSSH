@@ -29,6 +29,7 @@ use ferossh_config::serial::{self, SerialTarget};
 use ferossh_config::settings::{DEFAULT_DESKTOP_PORT, DEFAULT_MOSH_SERVER, DEFAULT_VNC_PORT};
 use ferossh_config::snippet_import::{self, SnippetClient};
 use ferossh_config::snippet_store;
+use ferossh_config::ssh_config::EscapeChar;
 use ferossh_config::trigger::{Fire, Watch};
 use ferossh_config::workspace::{self as wsfile, Open as WsOpen, PaneSpec};
 use ferossh_config::{
@@ -123,6 +124,7 @@ use crate::copy_id;
 use crate::credman;
 use crate::custom_theme::{self, CustomTheme};
 use crate::desktop::{Desktop, Protocol, Update as DesktopUpdate};
+use crate::escape::{self, CommandLine, Escape, Outcome as EscapeOutcome};
 use crate::files::{self, Arrange, Follow};
 use crate::files_panel;
 use crate::form_view;
@@ -629,6 +631,8 @@ mod cmd {
     pub const WRITE_LIBRARY: u32 = 644;
     /// Session > Show images (Sixel, kitty, iTerm2).
     pub const INLINE_IMAGES: u32 = 645;
+    /// Session > SSH escape sequences (~. ~C ~?).
+    pub const ESCAPES: u32 = 646;
     /// Session > Coding agents > Show what changed (side-by-side git
     /// diff); the menu's second item.
     pub const AGENT_DIFF: u32 = 649;
@@ -1009,6 +1013,8 @@ struct Pane {
     /// The command line being typed, for Edit > Suggest commands as you
     /// type.
     typing: suggest::Tracker,
+    /// SSH escape sequences (`~.`, `~C`) typed in this pane.
+    escapes: escape::Escapes,
 }
 
 /// A command suggestion showing greyed after the cursor in `pane`.
@@ -2871,6 +2877,7 @@ fn new_pane(
         local_cwd: None,
         hl_host: None,
         typing: suggest::Tracker::default(),
+        escapes: escape::Escapes::default(),
     }
 }
 
@@ -3074,6 +3081,11 @@ fn build_menu() -> Result<HMENU> {
         AppendMenuW(session, MF_POPUP, scripts.0 as usize, w!("&Scripts"))?;
         separator(session)?;
         item(session, cmd::REPLACE_KEY, "Replace host &key...")?;
+        item(
+            session,
+            cmd::ESCAPES,
+            "SSH escape seq&uences (~. ~C ~? after Enter)",
+        )?;
         item(session, cmd::COPY_ID, "Copy public key to this ser&ver...")?;
         separator(session)?;
         item(session, cmd::VERIFY, "Verify trans&fers (SHA-256)")?;
@@ -6277,30 +6289,16 @@ impl Window {
         let view = self.forward_view();
         match action {
             Some(FwdAction::Add { spec, connection }) => {
-                match self.forward_connection(connection, &view) {
-                    Err(why) => self.forwards_view.refuse(&spec, why),
-                    Ok(c) if forwards_of(&view, c).any(|f| f.spec == spec) => {
-                        self.forwards_view
-                            .refuse(&spec, "That forward is already there.".into());
-                    }
-                    Ok(c) => {
-                        if let Some(w) = self.workers.get(&c) {
-                            w.forwarder.add(c, spec.clone());
-                        }
-                        self.keep_forwards(c, |list| {
-                            if !list.contains(&spec) {
-                                list.push(spec.clone());
-                            }
-                        });
-                    }
+                if let Err(why) = self.add_forward(connection, &spec, &view) {
+                    self.forwards_view.refuse(&spec, why);
                 }
             }
             Some(FwdAction::Remove { connection, index }) => {
-                if let Some(w) = self.workers.get(&connection) {
-                    w.forwarder.remove(connection, index);
-                }
                 if let Some(f) = forwards_of(&view, connection).nth(index) {
                     let spec = f.spec.clone();
+                    if let Some(w) = self.workers.get(&connection) {
+                        w.forwarder.remove_spec(connection, spec.clone(), f.desktop);
+                    }
                     self.keep_forwards(connection, |list| list.retain(|s| *s != spec));
                 }
             }
@@ -6324,28 +6322,8 @@ impl Window {
                 }
             }
             Some(FwdAction::Cancel { cancel, connection }) => {
-                let found = self.forward_connection(connection, &view).and_then(|c| {
-                    let matching: Vec<(usize, &ForwardSpec)> = forwards_of(&view, c)
-                        .enumerate()
-                        .filter(|(_, f)| !f.desktop && cancel.cancels(&f.spec))
-                        .map(|(i, f)| (i, &f.spec))
-                        .collect();
-                    match &matching[..] {
-                        [(i, spec)] => Ok((c, *i, (*spec).clone())),
-                        [] => Err("No forward listens there.".to_owned()),
-                        _ => {
-                            Err("More than one forward listens there: add the address.".to_owned())
-                        }
-                    }
-                });
-                match found {
-                    Ok((c, index, spec)) => {
-                        if let Some(w) = self.workers.get(&c) {
-                            w.forwarder.remove(c, index);
-                        }
-                        self.keep_forwards(c, |list| list.retain(|s| *s != spec));
-                    }
-                    Err(why) => self.forwards_view.say(why),
+                if let Err(why) = self.cancel_forward(connection, &cancel, &view) {
+                    self.forwards_view.say(why);
                 }
             }
             Some(FwdAction::Leave) => self.focus_terminal(),
@@ -6353,6 +6331,57 @@ impl Window {
         }
         self.refresh_chrome();
         None
+    }
+
+    /// Adds `spec` to a running connection (see
+    /// [`Self::forward_connection`]) and to the forwards its reconnects
+    /// start; `Err` says why not.
+    fn add_forward(
+        &mut self,
+        connection: Option<ChannelId>,
+        spec: &ForwardSpec,
+        view: &[ConnView],
+    ) -> std::result::Result<ChannelId, String> {
+        let c = self.forward_connection(connection, view)?;
+        if forwards_of(view, c).any(|f| f.spec == *spec) {
+            return Err("That forward is already there.".into());
+        }
+        if let Some(w) = self.workers.get(&c) {
+            w.forwarder.add(c, spec.clone());
+        }
+        self.keep_forwards(c, |list| {
+            if !list.contains(spec) {
+                list.push(spec.clone());
+            }
+        });
+        Ok(c)
+    }
+
+    /// Stops the one forward `cancel` names (`-KL 8080`), as ssh's `~C`
+    /// does; returns it, or says why nothing stopped.
+    fn cancel_forward(
+        &mut self,
+        connection: Option<ChannelId>,
+        cancel: &ferossh_config::forward::CancelSpec,
+        view: &[ConnView],
+    ) -> std::result::Result<ForwardSpec, String> {
+        let c = self.forward_connection(connection, view)?;
+        let matching: Vec<&ForwardSpec> = forwards_of(view, c)
+            .filter(|f| !f.desktop && cancel.cancels(&f.spec))
+            .map(|f| &f.spec)
+            .collect();
+        let spec = match &matching[..] {
+            [spec] => (*spec).clone(),
+            [] => return Err("No forward listens there.".to_owned()),
+            _ => return Err("More than one forward listens there: add the address.".to_owned()),
+        };
+        // By spec, not by place in the list: one cancelled just before
+        // may not have left the view yet.
+        if let Some(w) = self.workers.get(&c) {
+            w.forwarder.remove_spec(c, spec.clone(), false);
+        }
+        self.keep_forwards(c, |list| list.retain(|s| *s != spec));
+        Ok(spec)
     }
 
     /// The connection a forward goes to: the one picked in the list, else
@@ -7177,6 +7206,11 @@ impl Window {
         // A run's row that ended: the next host may start.
         let mut pump = false;
         for effect in effects {
+            if matches!(effect, Effect::Connected)
+                && let Some(p) = self.panes.get_mut(&id)
+            {
+                p.escapes.reset();
+            }
             match effect {
                 Effect::Send(msg) => {
                     // Only to the worker of the login the channel is on.
@@ -8709,6 +8743,7 @@ impl Window {
     /// Sends the terminal's answers and other non-user bytes to the host.
     /// They never go into a local prompt.
     fn send(&mut self, id: PaneId, bytes: Vec<u8>) {
+        let bytes = self.escape_sent(id, bytes);
         if let Some(gateway) = self.panes.get(&id).and_then(Pane::gateway) {
             let actions = self
                 .tmux
@@ -8777,10 +8812,19 @@ impl Window {
         if let Some(w) = self.panes.get_mut(&id).and_then(|p| p.quiet.as_mut()) {
             w.typed();
         }
+        // An escape character held back goes first, so the recording
+        // holds what the shell gets. It is recorded on its own, so a
+        // bracketed paste after it still starts with its marker.
+        let typed = bytes.len();
+        let bytes = self.escape_sent_held(id, bytes);
         if let Some((pane, rec)) = &mut self.recording
             && *pane == id
         {
-            rec.input(&bytes);
+            let (held, rest) = bytes.split_at(bytes.len() - typed);
+            if !held.is_empty() {
+                rec.input(held);
+            }
+            rec.input(rest);
         }
         let enter = matches!(bytes.as_slice(), b"\r" | b"\r\n" | b"\n");
         let Some(p) = self.panes.get_mut(&id) else {
@@ -8875,6 +8919,251 @@ impl Window {
                 self.send(id, bytes);
             }
         }
+    }
+
+    /// Bytes for the host of pane `id` pass the SSH escape state: an
+    /// escape character still held back goes first (a paste or a script
+    /// came after it, not a command key), and whether the next key is
+    /// first on a line follows what went. Everything that goes to the
+    /// host passes here, as everything ssh reads passes its escape check.
+    fn escape_sent(&mut self, id: PaneId, bytes: Vec<u8>) -> Vec<u8> {
+        let bytes = self.escape_sent_held(id, bytes);
+        if let Some(p) = self.panes.get_mut(&id)
+            && matches!(p.host, Host::Ssh(_) | Host::Tmux { .. })
+        {
+            p.escapes.sent(&bytes);
+        }
+        bytes
+    }
+
+    /// `bytes` after the escape character pane `id` holds back, if any.
+    fn escape_sent_held(&mut self, id: PaneId, mut bytes: Vec<u8>) -> Vec<u8> {
+        let held = self.escape_char_of(id);
+        let Some(p) = self.panes.get_mut(&id) else {
+            return bytes;
+        };
+        if matches!(p.host, Host::Ssh(_) | Host::Tmux { .. })
+            && p.escapes.take_pending()
+            && let Some(e) = held
+        {
+            bytes.insert(0, e);
+        }
+        bytes
+    }
+
+    /// The SSH escape character of pane `id`: its host's `EscapeChar`, else
+    /// the window's setting. `None` when escapes are off, or the pane is
+    /// not a logged-in SSH shell (a prompt, a Mosh session with its own
+    /// keys, Telnet, a local shell), or a tmux pane of one.
+    fn escape_char_of(&self, id: PaneId) -> Option<u8> {
+        let p = self.panes.get(&id)?;
+        match &p.host {
+            Host::Ssh(s)
+                if self.settings.escapes
+                    && s.state() == State::Connected
+                    && !s.prompt_active()
+                    && s.target.mosh.is_none()
+                    && !s.target.sftp_only =>
+            {
+                match s.target.escape_char.unwrap_or(self.settings.escape_char) {
+                    EscapeChar::None => None,
+                    EscapeChar::Char(c) => Some(c),
+                }
+            }
+            Host::Tmux { gateway, .. } => self.escape_char_of(*gateway),
+            _ => None,
+        }
+    }
+
+    /// A key typed in pane `id`, for the SSH escape sequences, before it
+    /// is encoded or goes anywhere: `Some` when they took it, with what
+    /// to run; `None` when it goes on as usual (after the held escape
+    /// character, when no command followed it).
+    fn escape_typed(&mut self, id: PaneId, typed: escape::Typed) -> Option<Option<Command>> {
+        // A login script's secret prompt takes the typing.
+        if self.scripts.get(&id).is_some_and(|r| r.runner.prompting()) {
+            return None;
+        }
+        let esc = self.escape_char_of(id);
+        let p = self.panes.get_mut(&id)?;
+        // The shell ended, or escapes were turned off: a `~C` line or a
+        // held character left open goes, and keys go on as usual (Enter
+        // reconnects).
+        if esc.is_none() {
+            p.escapes.cancel();
+            return None;
+        }
+        let outcome = p.escapes.key(esc, typed);
+        let e = esc.unwrap_or(b'~');
+        match outcome {
+            EscapeOutcome::Pass => None,
+            EscapeOutcome::Taken => Some(None),
+            EscapeOutcome::EscapeThenPass => {
+                self.type_escape(id, e);
+                None
+            }
+            EscapeOutcome::SendEscape => {
+                self.type_escape(id, e);
+                Some(None)
+            }
+            EscapeOutcome::Echo(text) => {
+                self.show(id, &text);
+                self.refresh(id);
+                Some(None)
+            }
+            EscapeOutcome::Command(line) => {
+                self.escape_command(id, &line);
+                Some(None)
+            }
+            EscapeOutcome::Run(what) => Some(self.run_escape(id, what, e)),
+        }
+    }
+
+    /// Types the escape character itself, in pane `id` and the panes
+    /// broadcast input goes to.
+    fn type_escape(&mut self, id: PaneId, e: u8) {
+        let targets = self.broadcast_targets(id);
+        self.input(id, vec![e]);
+        self.send_typed(&targets, &Typed::Bytes(vec![e]));
+    }
+
+    /// Carries out an escape sequence typed in pane `id`.
+    fn run_escape(&mut self, id: PaneId, what: Escape, e: u8) -> Option<Command> {
+        let note = |text: &str| format!("\r\n\x1b[0;90m{text}\x1b[0m\r\n");
+        match what {
+            Escape::Disconnect => return Some(Command::Id(cmd::DISCONNECT)),
+            Escape::Help => self.show(id, &escape::help(&EscapeChar::Char(e).text())),
+            Escape::Forwards => {
+                let text = self.forwards_text(id);
+                self.show(id, &text);
+            }
+            Escape::CommandLine => self.show(id, "\r\nssh> "),
+            Escape::Rekey => {
+                let host = self.host_pane(id);
+                let channel = match self.panes.get(&host).map(|p| &p.host) {
+                    Some(Host::Ssh(s)) => Some(s.channel),
+                    _ => None,
+                };
+                if let Some(channel) = channel {
+                    self.apply(host, vec![Effect::Send(Message::Rekey { channel })]);
+                    self.show(id, &note("Asked the server for a new key exchange."));
+                }
+            }
+            Escape::Break => self.show(
+                id,
+                &note(
+                    "FeroSSH cannot send a BREAK over SSH. (Session > Send break is for \
+                     serial ports.)",
+                ),
+            ),
+            Escape::Verbosity => self.show(
+                id,
+                &note("FeroSSH has no log level to change. Session > Logs and recordings keeps the output."),
+            ),
+            Escape::Background => self.show(
+                id,
+                &note(
+                    "FeroSSH does not send a connection to the background: the tab keeps \
+                     it. Session > Disconnect ends it.",
+                ),
+            ),
+        }
+        self.refresh(id);
+        None
+    }
+
+    /// `~#`: the forwards of pane `id`'s connection and their open
+    /// connections.
+    fn forwards_text(&self, id: PaneId) -> String {
+        let Some(c) = self.pane_connection(id) else {
+            return "\r\nNot connected.\r\n".into();
+        };
+        let views = self.forward_view();
+        let mut out = String::from("\r\nForwards of this connection:\r\n");
+        let mut any = false;
+        if let Some(v) = views.iter().find(|v| v.connection == c) {
+            for f in &v.forwards {
+                any = true;
+                let state = match &f.state {
+                    FwdState::Starting => "starting".to_owned(),
+                    FwdState::Listening(at) => format!("listening on {at}"),
+                    FwdState::Failed(why) => format!("failed: {why}"),
+                };
+                let desktop = if f.desktop { " (remote desktop)" } else { "" };
+                out.push_str(&crate::ssh::sanitize_line(&format!(
+                    "  {}{desktop}  {state}; {} open, {} since it started",
+                    f.spec, f.open, f.total
+                )));
+                out.push_str("\r\n");
+                for stream in &f.streams {
+                    out.push_str(&crate::ssh::sanitize_line(&format!("      {stream}")));
+                    out.push_str("\r\n");
+                }
+                if let Some(e) = &f.error {
+                    out.push_str(&crate::ssh::sanitize_line(&format!(
+                        "      last error: {e}"
+                    )));
+                    out.push_str("\r\n");
+                }
+            }
+            if let Some(x) = &v.x11 {
+                any = true;
+                out.push_str(&crate::ssh::sanitize_line(&format!(
+                    "  X11 to {}  {} open, {} since it started",
+                    x.display, x.open, x.total
+                )));
+                out.push_str("\r\n");
+            }
+        }
+        if !any {
+            out.push_str("  none\r\n");
+        }
+        out
+    }
+
+    /// Runs what was typed on the `~C` command line of pane `id`.
+    fn escape_command(&mut self, id: PaneId, line: &str) {
+        self.show(id, "\r\n");
+        // This pane's own connection, never another one's.
+        let view = self.forward_view();
+        let connection = self
+            .pane_connection(id)
+            .ok_or_else(|| "Not connected.".to_owned())
+            .and_then(|c| {
+                if view.iter().any(|v| v.connection == c) && self.workers.contains_key(&c) {
+                    Ok(c)
+                } else {
+                    Err(
+                        "This connection's forwards are not ready yet; try again in a moment."
+                            .to_owned(),
+                    )
+                }
+            });
+        let text = match escape::parse_command(line) {
+            CommandLine::Nothing => String::new(),
+            CommandLine::Help => escape::COMMAND_HELP.to_owned(),
+            CommandLine::Add(spec) => match connection
+                .and_then(|c| self.add_forward(Some(c), &spec, &view))
+            {
+                Ok(_) => {
+                    format!("Forwarding {spec}. Tools > Port forwards shows whether it listens.")
+                }
+                Err(why) => why,
+            },
+            CommandLine::Cancel(cancel) => {
+                match connection.and_then(|c| self.cancel_forward(Some(c), &cancel, &view)) {
+                    Ok(spec) => format!("Cancelled {spec}."),
+                    Err(why) => why,
+                }
+            }
+            CommandLine::Bad(why) => why,
+        };
+        if !text.is_empty() {
+            let text = crate::ssh::sanitize(&text);
+            self.show(id, &format!("\x1b[0;90m{text}\x1b[0m\r\n"));
+        }
+        self.refresh_chrome();
+        self.refresh(id);
     }
 
     /// The history that pane `id`'s commands go in: per host (and user and
@@ -9207,6 +9496,18 @@ impl Window {
             && run.runner.prompting()
         {
             run.runner.prompt_paste(text);
+            return true;
+        }
+        // The `~C` command line takes a paste's first line, without
+        // running it: Enter does.
+        if self.escape_char_of(id).is_some()
+            && self.panes.get(&id).is_some_and(|p| p.escapes.in_command())
+        {
+            for c in text.chars().take_while(|c| !matches!(c, '\r' | '\n')) {
+                if !c.is_control() {
+                    self.escape_typed(id, escape::Typed::Char(c));
+                }
+            }
             return true;
         }
         let Some(p) = self.panes.get_mut(&id) else {
@@ -11723,6 +12024,14 @@ impl Window {
         if let Some(command) = self.tmux_char(id, ch, alt) {
             return command;
         }
+        let typed = if alt {
+            escape::Typed::Other
+        } else {
+            escape::Typed::Char(ch)
+        };
+        if let Some(command) = self.escape_typed(id, typed) {
+            return command;
+        }
         let p = self.panes.get_mut(&id)?;
         let bytes = p.term.text(ch, alt);
         // Who else gets it is decided first: the key may end a prompt.
@@ -12045,6 +12354,15 @@ impl Window {
         }
         if let Some(key) = terminal_key(vk) {
             drop_pending_char(self.hwnd);
+            let typed = match key {
+                Key::Enter => escape::Typed::Enter,
+                Key::Backspace => escape::Typed::Backspace,
+                Key::Escape => escape::Typed::Escape,
+                _ => escape::Typed::Other,
+            };
+            if let Some(command) = self.escape_typed(id, typed) {
+                return command.map_or(KeyOutcome::Handled, KeyOutcome::Run);
+            }
             let targets = self.broadcast_targets(id);
             let Some(p) = self.panes.get_mut(&id) else {
                 return KeyOutcome::Handled;
@@ -12069,6 +12387,11 @@ impl Window {
                 drop_pending_char(self.hwnd);
                 // Ctrl+Space can be the tmux prefix (C-Space).
                 if let Some(command) = self.tmux_char(id, char::from(code), false) {
+                    return command.map_or(KeyOutcome::Handled, KeyOutcome::Run);
+                }
+                // `EscapeChar ^@` or `^_` starts an escape on these keys.
+                if let Some(command) = self.escape_typed(id, escape::Typed::Char(char::from(code)))
+                {
                     return command.map_or(KeyOutcome::Handled, KeyOutcome::Run);
                 }
                 let targets = self.broadcast_targets(id);
@@ -17249,6 +17572,25 @@ impl Window {
                 self.save_settings();
                 self.update_menu_checks();
             }
+            cmd::ESCAPES => {
+                // Off keeps the character (`EscapeChar %` stays `%`).
+                let on = !self.settings.escapes;
+                self.settings.escapes = on;
+                if on && self.settings.escape_char == EscapeChar::None {
+                    self.settings.escape_char = EscapeChar::DEFAULT;
+                }
+                if !on {
+                    // Drop every pane's open `ssh>` line and held escape
+                    // character now, so a paste is not swallowed and a
+                    // held `~` cannot come back to life if escapes are
+                    // turned on again before the next key.
+                    for p in self.panes.values_mut() {
+                        p.escapes.cancel();
+                    }
+                }
+                self.save_settings();
+                self.update_menu_checks();
+            }
             cmd::SUGGEST => {
                 let on = !self.settings.command_suggestions;
                 self.settings.command_suggestions = on;
@@ -17962,6 +18304,7 @@ impl Window {
                 (cmd::VERIFY, s.verify_transfers),
                 (cmd::ZMODEM, s.zmodem),
                 (cmd::INLINE_IMAGES, s.inline_images),
+                (cmd::ESCAPES, s.escapes),
                 (cmd::UPLOAD_TYPE_PATH, s.upload_type_path),
                 (cmd::PORT_PREVIEWS, s.port_previews),
                 (cmd::KITTY_KEYBOARD, s.kitty_keyboard),
