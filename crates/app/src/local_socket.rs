@@ -5,10 +5,10 @@
 //! Windows has had `AF_UNIX` stream sockets since Windows 10 1803; tokio
 //! does not wrap them there, so the sockets come from socket2. An
 //! accepted or connected socket becomes a tokio stream: a `UnixStream`
-//! on Unix, and on Windows a `TcpStream`, which only reads and writes
-//! through the socket and never looks at its address family. Listening
-//! polls a non-blocking socket instead, because tokio's listener reads
-//! every peer's address as an IP address.
+//! on Unix. On Windows tokio cannot wait on an `AF_UNIX` socket at all,
+//! so two threads move its bytes with plain blocking calls, to and from
+//! an in-memory tokio pipe. Listening polls a non-blocking socket,
+//! because tokio's listener reads every peer's address as an IP address.
 //!
 //! Who may connect is up to the socket file's permissions, which it takes
 //! from its folder: the peer check of TCP listeners (`peer_owner`) does
@@ -85,9 +85,11 @@ fn remove_stale(path: &str) {
     let Ok(probe) = Socket::new(Domain::UNIX, Type::STREAM, None) else {
         return;
     };
-    // Non-blocking: a live listener with a full backlog must not hold up
-    // the forwarding thread. Only a refusal says nothing listens.
-    if probe.set_nonblocking(true).is_err() {
+    // Non-blocking on Unix: a live listener with a full backlog must not
+    // hold up the forwarding thread. Windows never waits on an AF_UNIX
+    // connect, and only a blocking one reports the refusal right away.
+    // Only a refusal says nothing listens.
+    if cfg!(unix) && probe.set_nonblocking(true).is_err() {
         return;
     }
     if matches!(probe.connect(&addr), Err(e) if e.kind() == io::ErrorKind::ConnectionRefused) {
@@ -257,6 +259,7 @@ pub async fn accept(listener: &Socket) -> io::Result<BoxSock> {
 
 /// Whether a `connect` error means the connection is under way (or the
 /// listener's backlog is full, on Linux): try again shortly.
+#[cfg(not(windows))]
 fn connect_pending(e: &io::Error) -> bool {
     // EALREADY and EINPROGRESS on Linux, WSAEALREADY and WSAEINPROGRESS
     // on Windows.
@@ -267,12 +270,14 @@ fn connect_pending(e: &io::Error) -> bool {
 
 /// Whether a `connect` error means an earlier attempt already connected:
 /// EISCONN on Linux, WSAEISCONN on Windows.
+#[cfg(not(windows))]
 fn already_connected(e: &io::Error) -> bool {
     matches!(e.raw_os_error(), Some(106 | 10056))
 }
 
 /// Connects to the socket at `path`. Non-blocking all the way, so a
 /// caller's timeout drops the socket and nothing is left waiting.
+#[cfg(not(windows))]
 pub async fn connect(path: &str) -> io::Result<BoxSock> {
     let addr = SockAddr::unix(path)?;
     let socket = Socket::new(Domain::UNIX, Type::STREAM, None)?;
@@ -288,21 +293,94 @@ pub async fn connect(path: &str) -> io::Result<BoxSock> {
     into_tokio(socket)
 }
 
-fn into_tokio(socket: Socket) -> io::Result<BoxSock> {
-    socket.set_nonblocking(true)?;
-    #[cfg(unix)]
-    {
-        let s: std::os::unix::net::UnixStream = socket.into();
-        Ok(Box::new(tokio::net::UnixStream::from_std(s)?))
-    }
-    #[cfg(not(unix))]
-    {
-        let s: std::net::TcpStream = socket.into();
-        Ok(Box::new(tokio::net::TcpStream::from_std(s)?))
-    }
+/// Connects to the socket at `path`. Windows answers an AF_UNIX connect
+/// at once (a full backlog is refused, not waited on), and a blocking
+/// one reports that answer plainly, so it runs on a blocking thread.
+#[cfg(windows)]
+pub async fn connect(path: &str) -> io::Result<BoxSock> {
+    let addr = SockAddr::unix(path)?;
+    let socket = tokio::task::spawn_blocking(move || {
+        let socket = Socket::new(Domain::UNIX, Type::STREAM, None)?;
+        socket.connect(&addr)?;
+        Ok::<_, io::Error>(socket)
+    })
+    .await
+    .map_err(io::Error::other)??;
+    into_tokio(socket)
 }
 
-#[cfg(all(test, unix))]
+#[cfg(unix)]
+fn into_tokio(socket: Socket) -> io::Result<BoxSock> {
+    socket.set_nonblocking(true)?;
+    let s: std::os::unix::net::UnixStream = socket.into();
+    Ok(Box::new(tokio::net::UnixStream::from_std(s)?))
+}
+
+/// Bytes a pump thread moves at a time, and what the pipe holds.
+#[cfg(windows)]
+const PUMP_BUFFER: usize = 64 * 1024;
+
+/// The socket as a tokio stream: one thread reads the socket into an
+/// in-memory pipe, another writes what comes out of the pipe to the
+/// socket. Each ends with its direction (the reader when the socket says
+/// end of file or the stream is dropped, the writer when the stream is
+/// shut down or dropped, half-closing the socket), and the socket closes
+/// when both have.
+#[cfg(windows)]
+fn into_tokio(socket: Socket) -> io::Result<BoxSock> {
+    use std::io::{Read, Write};
+    use std::sync::Arc;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    socket.set_nonblocking(false)?;
+    let socket = Arc::new(socket);
+    let (ours, theirs) = tokio::io::duplex(PUMP_BUFFER);
+    let (mut from_stream, mut to_stream) = tokio::io::split(theirs);
+    let runtime = tokio::runtime::Handle::current();
+
+    let reader = socket.clone();
+    let rt = runtime.clone();
+    std::thread::Builder::new()
+        .name("unix-socket-in".to_owned())
+        .spawn(move || {
+            let mut buf = vec![0u8; PUMP_BUFFER];
+            loop {
+                let n = match (&*reader).read(&mut buf) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => n,
+                };
+                let Some(bytes) = buf.get(..n) else { break };
+                if rt.block_on(to_stream.write_all(bytes)).is_err() {
+                    break;
+                }
+            }
+            let _ = rt.block_on(to_stream.shutdown());
+        })?;
+
+    std::thread::Builder::new()
+        .name("unix-socket-out".to_owned())
+        .spawn(move || {
+            let mut buf = vec![0u8; PUMP_BUFFER];
+            loop {
+                let n = match runtime.block_on(from_stream.read(&mut buf)) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => n,
+                };
+                let Some(bytes) = buf.get(..n) else { break };
+                if (&*socket).write_all(bytes).is_err() {
+                    break;
+                }
+            }
+            // The stream is done sending: tell the peer, which then
+            // usually closes and ends the reader too.
+            let _ = socket.shutdown(std::net::Shutdown::Write);
+        })?;
+
+    Ok(Box::new(ours))
+}
+
+/// Runs on Windows too, where CI has AF_UNIX.
+#[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
@@ -338,6 +416,36 @@ mod tests {
         assert!(!Path::new(&path).exists());
     }
 
+    /// A megabyte each way, then each side's end of file reaches the other.
+    #[tokio::test]
+    async fn moves_a_lot_both_ways_and_passes_end_of_file_on() {
+        let path = temp_path("bulk");
+        let listener = bind(&path).unwrap();
+        let unlink = Unlink::new(path.clone());
+        let data: Vec<u8> = (0..1_000_000u32).map(|i| (i % 251) as u8).collect();
+        let server = async {
+            let mut s = accept(&listener).await.unwrap();
+            let mut got = Vec::new();
+            s.read_to_end(&mut got).await.unwrap();
+            s.write_all(&got).await.unwrap();
+            s.shutdown().await.unwrap();
+            got
+        };
+        let client = async {
+            let mut c = connect(&path).await.unwrap();
+            c.write_all(&data).await.unwrap();
+            c.shutdown().await.unwrap();
+            let mut back = Vec::new();
+            c.read_to_end(&mut back).await.unwrap();
+            back
+        };
+        let (got, back) = tokio::join!(server, client);
+        assert!(got == data, "the server got {} bytes", got.len());
+        assert!(back == data, "the client got {} bytes back", back.len());
+        drop(listener);
+        drop(unlink);
+    }
+
     #[test]
     fn a_stale_socket_is_replaced_but_a_live_one_or_a_file_is_not() {
         let path = temp_path("stale");
@@ -358,7 +466,8 @@ mod tests {
 
     #[test]
     fn relative_paths_are_refused() {
-        assert!(check_path("/tmp/x.sock").is_ok());
+        let full = temp_path("full");
+        assert!(check_path(&full).is_ok());
         assert!(check_path("x/y.sock").is_err());
     }
 
