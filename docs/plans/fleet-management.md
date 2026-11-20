@@ -10,8 +10,8 @@ Already built, so not listed: folders (`# folder:` comments), favourites, search
 | --- | --- | --- |
 | 1 | Several tags per connection | Done (#254) |
 | 2 | Search by field, and saved searches | Done (#255) |
-| 3 | Select several connections and act on them all | Built |
-| 4 | Change one field on many connections at once | To do |
+| 3 | Select several connections and act on them all | Done (#256) |
+| 4 | Change one field on many connections at once | Built |
 | 5 | Named credentials shared by many connections | To do |
 | 6 | Credential and security rules by tag or folder | To do |
 | 7 | Inventory columns with CSV export | To do |
@@ -35,11 +35,30 @@ Already built, so not listed: folders (`# folder:` comments), favourites, search
 
 **What FeroSSH has.** The Connection manager and its right-click menu act on one connection at a time.
 
-**What was built.** Ctrl+click, Shift+click, Ctrl+A and Ctrl+Space select several connections in the tree, highlighted until a plain click or Escape. The right-click menu on them offers: connect to all (a tab each, asking above eight), add a tag already in use, remove a connection's own tag, move to a folder of the saved connections or to no folder, delete (one confirmation listing them; Del too), and clear the selection. Moving and deleting change saved connections only; hosts from `~/.ssh/config` or imports are named and left alone. Still open for later items: typing a brand-new tag for many (item 4), opening them as one tiled tab, and running a script on them (item 8).
+**What was built.** Ctrl+click, Shift+click, Ctrl+A and Ctrl+Space select several connections in the tree, highlighted until a plain click or Escape. The right-click menu on them offers: connect to all (a tab each, asking above eight), add a tag already in use, remove a connection's own tag, move to a folder of the saved connections or to no folder, delete (one confirmation listing them; Del too), and clear the selection. Moving and deleting change saved connections only; hosts from `~/.ssh/config` or imports are named and left alone. Still open for later items: typing a brand-new tag for many, opening them as one tiled tab, and running a script on them (item 8).
 
-## 4. Change one field on many connections at once
+## 4. Change one field on many connections at once (built)
 
-**What to build.** On a multi-selection, Edit opens the connection form with only the fields all of them can share: user, key file, jump host, proxy, password source, theme, font, tmux, start directory. Fields that differ show as "(several values)" and are left alone unless changed. A preview lists what will change before saving. Useful when a bastion or user name changes on forty hosts.
+**What FeroSSH had.** Since item 3: tags, folders and deletes on a selection. Every other field meant opening each connection's form.
+
+**What was built.** **Change a field** in the right-click menu on a selection. It covers:
+
+- **Login fields** (`sessions.conf`): user, key file, jump hosts, proxy.
+- **Profile fields** (`ferossh.conf`): password source, theme, font, font size, tmux session, start directory.
+
+How it works:
+
+- One box opens, starting with the value the connections share, or empty when they hold several. An empty box clears the field.
+- The value is checked as the connection form checks it.
+- **Preview** lists each connection's old and new value, and which connections are left alone and why. Nothing changes until you say yes.
+- Login fields change saved connections only. Profile fields change every host.
+- A connection is left alone when:
+  - its type has no such field
+  - a host would be its own jump host
+  - it already has a proxy and you set jump hosts, or the other way round
+  - the user has an `@` and it is not WinRM
+
+Fields that need the whole form (host, port, forwards, login script) stay one connection at a time. A shared password source by name is item 5.
 
 ## 5. Named credentials
 

@@ -14619,6 +14619,20 @@ impl Window {
                     )));
                 }
             }
+            BulkAction::Edit(plan) => {
+                let mut hosts = load_saved();
+                if crate::bulk_edit::apply(&plan, &mut hosts, &mut self.settings)
+                    && let Err(e) = write_app_file(&sessions_path(), &saved::to_text(&hosts))
+                {
+                    self.queued.push(Command::Notice(format!(
+                        "Could not save {}: {e}",
+                        sessions_path().display()
+                    )));
+                    return;
+                }
+                self.save_settings();
+                self.reload_sessions(None);
+            }
         }
         conn_view::clear_marks();
         self.refresh_chrome();
@@ -22038,6 +22052,8 @@ fn bulk_menu(hwnd: HWND, names: Vec<String>) {
     const ADD_TAG: u32 = 100;
     const REMOVE_TAG: u32 = 200;
     const MOVE_TO: u32 = 300;
+    const EDIT: u32 = 400;
+    let fields = crate::bulk_edit::EditField::ALL;
     let Some((tags, folders)) = with_window(|w| {
         let items = host_items(&ssh_env(), &w.settings);
         let tags = crate::bulk::tag_choices(&items, &w.settings, &names);
@@ -22103,6 +22119,18 @@ fn bulk_menu(hwnd: HWND, names: Vec<String>) {
             "None of their own (ssh_config's Tag stays)",
         );
         sub("&Move to folder", MOVE_TO, &folders, "");
+        if let Ok(popup) = CreatePopupMenu() {
+            for (i, f) in fields.iter().enumerate() {
+                let text = wide(&format!("{}...", f.label()));
+                let _ = AppendMenuW(
+                    popup,
+                    MF_STRING,
+                    (EDIT + i as u32) as usize,
+                    PCWSTR(text.as_ptr()),
+                );
+            }
+            let _ = AppendMenuW(menu, MF_POPUP, popup.0 as usize, w!("C&hange a field"));
+        }
         let _ = AppendMenuW(menu, MF_SEPARATOR, 0, None);
         let delete = wide(&format!("&Delete {n} connections...\tDel"));
         let _ = AppendMenuW(menu, MF_STRING, DELETE as usize, PCWSTR(delete.as_ptr()));
@@ -22155,6 +22183,12 @@ fn bulk_menu(hwnd: HWND, names: Vec<String>) {
             BulkAction::OpenAll(names)
         }
         NO_FOLDER => BulkAction::MoveTo(names, None),
+        p if (EDIT..EDIT + 100).contains(&p) => {
+            if let Some(&field) = fields.get((p - EDIT) as usize) {
+                edit_many(hwnd, names, field);
+            }
+            return;
+        }
         p if (MOVE_TO..MOVE_TO + 100).contains(&p) => match pick(MOVE_TO, &folders) {
             Some(f) => BulkAction::MoveTo(names, Some(f)),
             None => return,
@@ -22178,6 +22212,103 @@ fn bulk_menu(hwnd: HWND, names: Vec<String>) {
         run_command(hwnd, command);
     }
     run_commands(hwnd, queued);
+}
+
+/// Change a field with several connections selected: asks for the new
+/// value (starting with the one they share, if any), shows what will
+/// change, and changes it.
+fn edit_many(hwnd: HWND, names: Vec<String>, field: crate::bulk_edit::EditField) {
+    use crate::bulk_edit::{Target, plan, preview, shared};
+    let Some((targets, saved, themes, start)) = with_window(|w| {
+        let targets: Vec<Target> = host_items(&ssh_env(), &w.settings)
+            .into_iter()
+            .filter(|h| names.iter().any(|n| n.eq_ignore_ascii_case(&h.name)))
+            .fold(Vec::new(), |mut all: Vec<Target>, h| {
+                // Favourites list a host twice.
+                if !all.iter().any(|t| t.name.eq_ignore_ascii_case(&h.name)) {
+                    all.push(Target {
+                        name: h.name,
+                        kind: h.kind,
+                    });
+                }
+                all
+            });
+        let saved = load_saved();
+        let themes: Vec<String> = Theme::builtin().iter().map(|t| t.name.to_owned()).collect();
+        let start = shared(field, &targets, &saved, &w.settings);
+        (targets, saved, themes, start)
+    }) else {
+        return;
+    };
+    let n = targets.len();
+    let title = format!("Change {} on {n} connections", field.label());
+    let now = match &start {
+        Some(v) if v.is_empty() => "They all have it empty now.".to_owned(),
+        Some(v) => format!("They all have {v} now."),
+        None => "They have several values now; what you type replaces them all.".to_owned(),
+    };
+    let mut typed = start.unwrap_or_default();
+    loop {
+        if DIALOG_OPEN.get() {
+            return;
+        }
+        let intro = format!("{}\n\n{now}", field.hint());
+        DIALOG_OPEN.set(true);
+        let answer = crate::fields_view::ask(
+            hwnd,
+            &crate::fields_view::Ask {
+                title: &title,
+                intro: &intro,
+                fields: &[(field.label(), &typed)],
+                option: None,
+                ok: "Preview",
+                cancel: "Cancel",
+            },
+        );
+        DIALOG_OPEN.set(false);
+        let Some(answer) = answer else {
+            return;
+        };
+        typed = answer.fields.into_iter().next().unwrap_or_default();
+        let Some(result) =
+            with_window(|w| plan(field, &typed, &targets, &saved, &w.settings, &themes))
+        else {
+            return;
+        };
+        let plan = match result {
+            Ok(plan) => plan,
+            Err(e) => {
+                dialog(hwnd, &e, MB_OK | MB_ICONWARNING);
+                continue;
+            }
+        };
+        if plan.changes.is_empty() {
+            let mut text = format!(
+                "Nothing to change: they all have that {} already.",
+                field.label().to_lowercase()
+            );
+            if !plan.skipped.is_empty() {
+                text = preview(&plan);
+                text.insert_str(0, "Nothing to change.\n\n");
+            }
+            dialog(hwnd, &text, MB_OK | MB_ICONINFORMATION);
+            return;
+        }
+        let text = format!("{}\n\nChange them?", preview(&plan));
+        if dialog(hwnd, &text, MB_YESNO | MB_ICONQUESTION) == Some(IDYES) {
+            let (command, queued) = with_window(|w| {
+                let command =
+                    w.side_action(Some(SideAction::Bulk(crate::bulk::BulkAction::Edit(plan))));
+                (command, std::mem::take(&mut w.queued))
+            })
+            .unwrap_or_default();
+            if let Some(command) = command {
+                run_command(hwnd, command);
+            }
+            run_commands(hwnd, queued);
+        }
+        return;
+    }
 }
 
 /// Delete with several connections selected: asks once, listing them,

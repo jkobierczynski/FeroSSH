@@ -23,6 +23,8 @@ pub enum BulkAction {
     RemoveTag(Vec<String>, String),
     /// Into this folder (`None`: no folder); saved connections only.
     MoveTo(Vec<String>, Option<String>),
+    /// One field set on many, as previewed.
+    Edit(crate::bulk_edit::Plan),
 }
 
 /// The most entries a submenu lists.

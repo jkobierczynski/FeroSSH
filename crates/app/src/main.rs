@@ -39,6 +39,8 @@ mod batch;
 mod broadcast;
 #[cfg_attr(not(windows), allow(dead_code))]
 mod bulk;
+#[cfg_attr(not(windows), allow(dead_code))]
+mod bulk_edit;
 #[cfg(windows)]
 mod clipboard;
 #[cfg(windows)]
