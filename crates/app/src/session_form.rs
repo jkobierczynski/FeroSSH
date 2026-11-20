@@ -413,6 +413,18 @@ const BUTTONS: [&str; 4] = ["Save", "Connect", "Cancel", "Delete"];
 const LABEL: usize = 11;
 /// Longest value one can type.
 const MAX_TEXT: usize = 260;
+/// Longest Tags value: room for the most tags, each as long as allowed,
+/// with a `#` and a separator.
+const MAX_TAGS_TEXT: usize =
+    ferossh_config::settings::MAX_TAGS * (ferossh_config::settings::MAX_TAG_LEN + 2);
+
+/// The longest value field `f` keeps.
+fn max_text(f: Field) -> usize {
+    match f {
+        Field::Tags => MAX_TAGS_TEXT,
+        _ => MAX_TEXT,
+    }
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum Item {
@@ -1394,7 +1406,13 @@ impl SessionForm {
             return;
         }
         if let Some(t) = self.text_mut(field.0) {
-            *t = text.chars().take(MAX_TEXT).collect();
+            // One character over for tags, so the check refuses a list
+            // that is too long instead of saving part of it.
+            let keep = match field.0 {
+                Field::Tags => MAX_TAGS_TEXT + 1,
+                f => max_text(f),
+            };
+            *t = text.chars().take(keep).collect();
         }
         self.tidy_forwards();
     }
@@ -1587,6 +1605,9 @@ impl SessionForm {
                 .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.'))
         {
             return Err("tmux session names use letters, digits, . _ and - only.".into());
+        }
+        if v.tags.chars().count() > MAX_TAGS_TEXT {
+            return Err("The tags are too long: remove some.".into());
         }
         ferossh_config::settings::parse_tags(&v.tags)?;
         if v.start_dir.contains('"') || v.start_dir.chars().any(char::is_control) {
@@ -1791,8 +1812,9 @@ impl SessionForm {
             }
             SideKey::Char(c) if editable && !c.is_control() => {
                 let at = self.cursor;
+                let cap = field.map_or(MAX_TEXT, max_text);
                 if let Some(t) = field.and_then(|f| self.text_mut(f))
-                    && t.chars().count() < MAX_TEXT
+                    && t.chars().count() < cap
                 {
                     let byte = t.char_indices().nth(at).map_or(t.len(), |(b, _)| b);
                     t.insert(byte, c);
@@ -3078,6 +3100,18 @@ mod tests {
         );
         f.values.tags = "ok not\"ok".into();
         assert!(f.check().unwrap_err().contains("cannot be a tag"));
+        // The most tags, each as long as allowed, fit; more is refused,
+        // not cut short.
+        let full: Vec<String> = (0..ferossh_config::settings::MAX_TAGS)
+            .map(|i| format!("#{i:0>31}x"))
+            .collect();
+        f.set_text(FieldId(Field::Tags), &full.join(" "));
+        assert_eq!(f.check(), Ok(()));
+        f.set_text(
+            FieldId(Field::Tags),
+            &format!("{}{}", full.join(" "), " x".repeat(400)),
+        );
+        assert!(f.check().unwrap_err().contains("too long"));
     }
 
     #[test]

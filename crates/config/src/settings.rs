@@ -453,6 +453,12 @@ pub const MAX_TAGS: usize = 16;
 /// The longest tag, in characters.
 pub const MAX_TAG_LEN: usize = 32;
 
+/// Whether two tags are the same one: case does not matter, in any
+/// alphabet (`équipe` and `ÉQUIPE` are one tag).
+pub fn same_tag(a: &str, b: &str) -> bool {
+    a == b || a.to_lowercase() == b.to_lowercase()
+}
+
 /// Whether `tag` can be a connection's tag: 1 to [`MAX_TAG_LEN`] letters,
 /// digits, `-`, `_`, `.`, `/` and `:`, so it never needs quoting and reads
 /// the same in `tag:` searches.
@@ -480,7 +486,7 @@ pub fn parse_tags(text: &str) -> Result<Vec<String>, String> {
                 "\"{shown}\" cannot be a tag: use up to {MAX_TAG_LEN} letters, digits, - _ . / and :."
             ));
         }
-        if !out.iter().any(|t| t.eq_ignore_ascii_case(tag)) {
+        if !out.iter().any(|t| same_tag(t, tag)) {
             out.push(tag.to_owned());
         }
     }
@@ -497,7 +503,7 @@ pub fn host_tags(ssh_tag: Option<&str>, profile: Option<&Profile>) -> Vec<String
     let own = profile.map(|p| p.tags.as_slice()).unwrap_or_default();
     for t in ssh_tag.into_iter().chain(own.iter().map(String::as_str)) {
         let t = t.trim();
-        if !t.is_empty() && !out.iter().any(|o| o.eq_ignore_ascii_case(t)) {
+        if !t.is_empty() && !out.iter().any(|o| same_tag(o, t)) {
             out.push(t.to_owned());
         }
     }
@@ -1683,7 +1689,7 @@ impl Settings {
                                         let t = t.trim_start_matches('#');
                                         if valid_tag(t)
                                             && p.tags.len() < MAX_TAGS
-                                            && !p.tags.iter().any(|o| o.eq_ignore_ascii_case(t))
+                                            && !p.tags.iter().any(|o| same_tag(o, t))
                                         {
                                             p.tags.push(t.to_owned());
                                         }
@@ -2547,6 +2553,8 @@ Profile lab
         let many: Vec<String> = (0..=MAX_TAGS).map(|i| format!("t{i}")).collect();
         assert!(parse_tags(&many.join(" ")).is_err());
         assert!(valid_tag("équipe"));
+        assert_eq!(parse_tags("équipe ÉQUIPE").unwrap(), ["équipe"]);
+        assert_eq!(host_tags(Some("ÉQUIPE"), None), ["ÉQUIPE"]);
     }
 
     #[test]
