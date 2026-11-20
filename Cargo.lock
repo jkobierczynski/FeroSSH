@@ -959,6 +959,8 @@ name = "ferossh-render"
 version = "1.5.0"
 dependencies = [
  "windows",
+ "windows-core",
+ "windows-numerics",
 ]
 
 [[package]]

@@ -5,6 +5,10 @@
 //! own glyph atlas on the current render target. Glyphs are rasterised into
 //! the atlas once, in grayscale, and drawn per cell as an opacity mask in the
 //! cell's foreground colour, so one atlas serves every colour and theme.
+//!
+//! With ligatures on, runs of neighbouring cells are shaped together with
+//! DirectWrite's text analyzer (see [`crate::ligature`]); a ligature goes
+//! into the atlas as one glyph run that spans its cells.
 
 // Direct2D and DirectWrite are COM APIs; every unsafe block below is a direct
 // call on an interface this module created and owns.
@@ -32,19 +36,27 @@ use windows::Win32::Graphics::Direct2D::{
 use windows::Win32::Graphics::DirectWrite::{
     DWRITE_FACTORY_TYPE_SHARED, DWRITE_FONT_METRICS, DWRITE_FONT_STRETCH_NORMAL, DWRITE_FONT_STYLE,
     DWRITE_FONT_STYLE_ITALIC, DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_WEIGHT,
-    DWRITE_FONT_WEIGHT_BOLD, DWRITE_FONT_WEIGHT_NORMAL, DWRITE_GLYPH_METRICS,
-    DWRITE_LINE_SPACING_METHOD_UNIFORM, DWRITE_MEASURING_MODE_NATURAL,
-    DWRITE_WORD_WRAPPING_NO_WRAP, DWriteCreateFactory, IDWriteFactory, IDWriteFontCollection,
+    DWRITE_FONT_WEIGHT_BOLD, DWRITE_FONT_WEIGHT_NORMAL, DWRITE_GLYPH_METRICS, DWRITE_GLYPH_OFFSET,
+    DWRITE_GLYPH_RUN, DWRITE_LINE_BREAKPOINT, DWRITE_LINE_SPACING_METHOD_UNIFORM,
+    DWRITE_MEASURING_MODE_NATURAL, DWRITE_READING_DIRECTION,
+    DWRITE_READING_DIRECTION_LEFT_TO_RIGHT, DWRITE_SCRIPT_ANALYSIS,
+    DWRITE_SHAPING_GLYPH_PROPERTIES, DWRITE_SHAPING_TEXT_PROPERTIES, DWRITE_WORD_WRAPPING_NO_WRAP,
+    DWriteCreateFactory, IDWriteFactory, IDWriteFontCollection, IDWriteFontFace,
+    IDWriteNumberSubstitution, IDWriteTextAnalysisSink, IDWriteTextAnalysisSink_Impl,
+    IDWriteTextAnalysisSource, IDWriteTextAnalysisSource_Impl, IDWriteTextAnalyzer,
     IDWriteTextFormat,
 };
 use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_A8_UNORM, DXGI_FORMAT_B8G8R8A8_UNORM};
-use windows::core::{BOOL, Error, HSTRING, Result, w};
+use windows::core::{BOOL, Error, HSTRING, PCWSTR, Result, w};
+use windows_core::{ComObject, OutRef, Ref, implement};
+use windows_numerics::Vector2;
 
 use crate::atlas::{AtlasPacker, Slot};
 use crate::cell::{Cell, Flags, Rgb};
 use crate::cursor::{Cursor, CursorShape};
 use crate::font::{CellMetrics, DesignMetrics, FontSpec};
 use crate::grid::Grid;
+use crate::ligature::{self, Piece};
 use crate::theme::Theme;
 
 /// Monospace families tried, in order, when a pane's family is missing.
@@ -53,6 +65,9 @@ const FALLBACK_FAMILIES: [&str; 3] = ["Cascadia Mono", "Consolas", "Courier New"
 
 /// Atlas texture side, in pixels; 4 MB at one byte per pixel.
 const ATLAS_SIDE: u32 = 2048;
+
+/// Shaped runs remembered per font before the memory starts over.
+const SHAPED_MAX: usize = 4096;
 
 const TRANSPARENT: D2D1_COLOR_F = D2D1_COLOR_F {
     r: 0.0,
@@ -92,6 +107,9 @@ pub struct PaneView<'a> {
     /// A picture to show instead of the cells (with the `images` feature;
     /// without it the cells are drawn).
     pub image: Option<crate::Image<'a>>,
+    /// Join programming ligatures (`->`, `!=`, `===`) in fonts that have
+    /// them. Cells keep their places; see [`crate::ligature`].
+    pub ligatures: bool,
 }
 
 /// Result of a draw call.
@@ -128,31 +146,69 @@ struct GlyphKey {
     /// Index into `Font::formats`: bit 0 bold, bit 1 italic.
     style: u8,
     wide: bool,
+    /// A ligature: shaped glyphs spanning several cells, drawn instead of
+    /// `ch`.
+    piece: Option<Box<Piece>>,
 }
 
 impl GlyphKey {
     fn of(cell: &Cell, grid: &Grid) -> Self {
-        let mut style = 0;
-        if cell.flags.contains(Flags::BOLD) {
-            style |= 1;
-        }
-        if cell.flags.contains(Flags::ITALIC) {
-            style |= 2;
-        }
         Self {
             ch: cell.ch,
             marks: grid.cluster(cell).to_owned(),
-            style,
+            style: style_of(cell),
             wide: cell.flags.contains(Flags::WIDE),
+            piece: None,
+        }
+    }
+
+    /// A ligature's key. Its place in the run is left out, so the same
+    /// ligature anywhere shares one atlas slot; the row plan places it.
+    fn piece(style: u8, mut piece: Piece) -> Self {
+        piece.start = 0;
+        Self {
+            ch: ' ',
+            marks: String::new(),
+            style,
+            wide: false,
+            piece: Some(Box::new(piece)),
+        }
+    }
+
+    /// The cells the glyph covers.
+    fn cells(&self) -> u32 {
+        match &self.piece {
+            Some(p) => u32::try_from(p.width()).unwrap_or(1),
+            None if self.wide => 2,
+            None => 1,
         }
     }
 }
+
+/// Index into `Font::formats` and `Font::faces`: bit 0 bold, bit 1 italic.
+fn style_of(cell: &Cell) -> u8 {
+    let mut style = 0;
+    if cell.flags.contains(Flags::BOLD) {
+        style |= 1;
+    }
+    if cell.flags.contains(Flags::ITALIC) {
+        style |= 2;
+    }
+    style
+}
+
+/// The glyphs of one row, by the cell each starts at.
+type RowPlan = Vec<(usize, GlyphKey)>;
 
 /// Device-independent font resources.
 struct Font {
     /// Regular, bold, italic, bold italic.
     formats: [IDWriteTextFormat; 4],
+    /// The same four, as faces for shaping and glyph runs.
+    faces: [IDWriteFontFace; 4],
     metrics: CellMetrics,
+    /// Ligature pieces of runs shaped before, by style and text.
+    shaped: HashMap<(u8, String), Vec<Piece>>,
 }
 
 /// A glyph atlas for one font on the current render target.
@@ -184,6 +240,9 @@ pub struct Renderer {
     dwrite: IDWriteFactory,
     fonts: HashMap<FontKey, Font>,
     target: Option<Target>,
+    /// DirectWrite's shaper and how it names Latin script; `None` when
+    /// either is missing, and ligatures are then not drawn.
+    shaper: Option<(IDWriteTextAnalyzer, DWRITE_SCRIPT_ANALYSIS)>,
 }
 
 impl fmt::Debug for Renderer {
@@ -206,6 +265,10 @@ impl Renderer {
                 DWriteCreateFactory::<IDWriteFactory>(DWRITE_FACTORY_TYPE_SHARED)?,
             )
         };
+        // SAFETY: plain constructor on our own factory.
+        let shaper = unsafe { dwrite.CreateTextAnalyzer() }
+            .ok()
+            .and_then(|a| latin_script(&a).map(|s| (a, s)));
         Ok(Self {
             hwnd,
             size: (width, height),
@@ -213,6 +276,7 @@ impl Renderer {
             dwrite,
             fonts: HashMap::new(),
             target: None,
+            shaper,
         })
     }
 
@@ -313,6 +377,16 @@ impl Renderer {
         if fresh {
             self.target = Some(self.create_target()?);
         }
+
+        // The glyphs of every row this frame draws, ligatures included.
+        let mut plans: Vec<Vec<(usize, RowPlan)>> = Vec::with_capacity(panes.len());
+        for p in panes {
+            let key = FontKey::new(p.font, dpi);
+            let rows = rows_to_draw(p, fresh)
+                .map(|y| (y, self.plan_row(&key, p, y)))
+                .collect();
+            plans.push(rows);
+        }
         let Some(target) = self.target.as_mut() else {
             return Err(Error::from(E_FAIL));
         };
@@ -320,17 +394,11 @@ impl Renderer {
         // Rasterise every glyph this frame needs, per atlas, before drawing:
         // an atlas that fills up is cleared, which must not happen mid-frame.
         let mut needed: HashMap<FontKey, Vec<GlyphKey>> = HashMap::new();
-        for p in panes {
-            let keys = needed.entry(FontKey::new(p.font, dpi)).or_default();
-            for y in rows_to_draw(p, fresh) {
-                if let Some(row) = p.grid.row(y) {
-                    keys.extend(
-                        row.iter()
-                            .filter(|c| !c.is_empty_glyph())
-                            .map(|c| GlyphKey::of(c, p.grid)),
-                    );
-                }
-            }
+        for (p, rows) in panes.iter().zip(&plans) {
+            needed.entry(FontKey::new(p.font, dpi)).or_default().extend(
+                rows.iter()
+                    .flat_map(|(_, g)| g.iter().map(|(_, k)| k.clone())),
+            );
         }
         for (key, glyphs) in needed {
             let Some(font) = self.fonts.get(&key) else {
@@ -360,7 +428,7 @@ impl Renderer {
             .images
             .retain(|k, _| panes.iter().any(|p| p.image.is_some_and(|i| i.key == *k)));
         upload_pictures(rt, &mut target.pictures, panes)?;
-        for p in panes {
+        for (p, rows) in panes.iter().zip(&plans) {
             #[cfg(feature = "images")]
             if let Some(image) = &p.image {
                 draw_image(rt, &target.brush, &mut target.images, image, p, fresh)?;
@@ -375,7 +443,7 @@ impl Renderer {
                     &target.pictures,
                     &font.metrics,
                     p,
-                    fresh,
+                    (rows, fresh),
                 );
             }
         }
@@ -454,14 +522,20 @@ impl Renderer {
             }
             let (family_name, index) = found.ok_or_else(|| Error::from(E_FAIL))?;
 
-            let face = collection
-                .GetFontFamily(index)?
-                .GetFirstMatchingFont(
-                    DWRITE_FONT_WEIGHT_NORMAL,
-                    DWRITE_FONT_STRETCH_NORMAL,
-                    DWRITE_FONT_STYLE_NORMAL,
-                )?
-                .CreateFontFace()?;
+            let family = collection.GetFontFamily(index)?;
+            // A family without a bold or italic face gets a simulated one.
+            let face = |weight: DWRITE_FONT_WEIGHT, style: DWRITE_FONT_STYLE| {
+                family
+                    .GetFirstMatchingFont(weight, DWRITE_FONT_STRETCH_NORMAL, style)?
+                    .CreateFontFace()
+            };
+            let faces = [
+                face(DWRITE_FONT_WEIGHT_NORMAL, DWRITE_FONT_STYLE_NORMAL)?,
+                face(DWRITE_FONT_WEIGHT_BOLD, DWRITE_FONT_STYLE_NORMAL)?,
+                face(DWRITE_FONT_WEIGHT_NORMAL, DWRITE_FONT_STYLE_ITALIC)?,
+                face(DWRITE_FONT_WEIGHT_BOLD, DWRITE_FONT_STYLE_ITALIC)?,
+            ];
+            let [face, ..] = &faces;
             let mut fm = DWRITE_FONT_METRICS::default();
             face.GetMetrics(&mut fm);
             let zero = u32::from('0');
@@ -508,9 +582,274 @@ impl Renderer {
                     format(DWRITE_FONT_WEIGHT_NORMAL, DWRITE_FONT_STYLE_ITALIC)?,
                     format(DWRITE_FONT_WEIGHT_BOLD, DWRITE_FONT_STYLE_ITALIC)?,
                 ],
+                faces,
                 metrics,
+                shaped: HashMap::new(),
             })
         }
+    }
+
+    /// The glyphs to draw in row `y` of `pane`, by the cell each starts at.
+    /// With ligatures on, the cells of a ligature share one glyph run.
+    fn plan_row(&mut self, key: &FontKey, pane: &PaneView<'_>, y: usize) -> RowPlan {
+        let Some(row) = pane.grid.row(y) else {
+            return Vec::new();
+        };
+        let pieces = match (&self.shaper, self.fonts.get_mut(key)) {
+            (Some(shaper), Some(font)) if pane.ligatures => ligatures(shaper, font, pane, y, row),
+            _ => Vec::new(),
+        };
+        let mut out = Vec::new();
+        let mut pieces = pieces.into_iter().peekable();
+        let mut x = 0;
+        while let Some(cell) = row.get(x) {
+            if let Some((at, key)) = pieces.next_if(|(at, _)| *at == x) {
+                x += (key.cells() as usize).max(1);
+                out.push((at, key));
+                continue;
+            }
+            if !cell.is_empty_glyph() {
+                out.push((x, GlyphKey::of(cell, pane.grid)));
+            }
+            x += 1;
+        }
+        out
+    }
+}
+
+/// The ligatures in `row`, by the cell each starts at, in order.
+fn ligatures(
+    shaper: &(IDWriteTextAnalyzer, DWRITE_SCRIPT_ANALYSIS),
+    font: &mut Font,
+    pane: &PaneView<'_>,
+    y: usize,
+    row: &[Cell],
+) -> Vec<(usize, GlyphKey)> {
+    let cursor = pane.cursor.filter(|c| c.y == y);
+    // A run breaks at the cursor and wherever the style or colours change
+    // (a selection, a search match, a prompt's colours).
+    let runs = ligature::runs(row.len(), |x| {
+        let cell = row.get(x)?;
+        let plain = ligature::joins(cell.ch)
+            && cell.cluster == 0
+            && cell.picture.is_none()
+            && !cell.flags.contains(Flags::WIDE)
+            && !cell.flags.contains(Flags::WIDE_SPACER)
+            && cursor.is_none_or(|c| c.x != x);
+        plain.then(|| (style_of(cell), cell_colours(pane.theme, cursor, x, cell)))
+    });
+    let mut out = Vec::new();
+    for run in runs {
+        let Some(cells) = row.get(run.clone()) else {
+            continue;
+        };
+        let Some(style) = cells.first().map(style_of) else {
+            continue;
+        };
+        let text: String = cells.iter().map(|c| c.ch).collect();
+        if !font.shaped.contains_key(&(style, text.clone())) {
+            if font.shaped.len() >= SHAPED_MAX {
+                font.shaped.clear();
+            }
+            let pieces = font
+                .faces
+                .get(usize::from(style))
+                .map(|face| shape(shaper, face, &text))
+                .unwrap_or_default();
+            font.shaped.insert((style, text.clone()), pieces);
+        }
+        // A piece too wide for the atlas (huge text) stays plain cells.
+        let fits = |p: &Piece| {
+            u32::try_from(p.width()).is_ok_and(|w| w * font.metrics.width <= ATLAS_SIDE / 2)
+        };
+        if let Some(pieces) = font.shaped.get(&(style, text)) {
+            out.extend(
+                pieces
+                    .iter()
+                    .filter(|p| fits(p))
+                    .map(|p| (run.start + p.start, GlyphKey::piece(style, p.clone()))),
+            );
+        }
+    }
+    out
+}
+
+/// Shapes `text` (printable ASCII) with the font's default features and
+/// returns the pieces whose glyphs differ from the characters' own.
+fn shape(
+    (analyzer, script): &(IDWriteTextAnalyzer, DWRITE_SCRIPT_ANALYSIS),
+    face: &IDWriteFontFace,
+    text: &str,
+) -> Vec<Piece> {
+    let utf16: Vec<u16> = text.encode_utf16().collect();
+    let codepoints: Vec<u32> = text.chars().map(u32::from).collect();
+    let n = utf16.len();
+    let (Ok(len), true) = (u32::try_from(n), n == codepoints.len()) else {
+        return Vec::new();
+    };
+    let max = n * 3 / 2 + 16;
+    let mut plain = vec![0u16; n];
+    let mut map = vec![0u16; n];
+    let mut text_props = vec![DWRITE_SHAPING_TEXT_PROPERTIES::default(); n];
+    let mut glyphs = vec![0u16; max];
+    let mut glyph_props = vec![DWRITE_SHAPING_GLYPH_PROPERTIES::default(); max];
+    let mut count = 0u32;
+    // SAFETY: every buffer holds the counts passed with it: `n` for the
+    // text-sized ones, `max` for the glyph-sized ones. The script analysis
+    // and the strings outlive the calls.
+    let shaped = unsafe {
+        face.GetGlyphIndices(codepoints.as_ptr(), len, plain.as_mut_ptr())
+            .and_then(|()| {
+                analyzer.GetGlyphs(
+                    PCWSTR(utf16.as_ptr()),
+                    len,
+                    face,
+                    false,
+                    false,
+                    script,
+                    w!("en-us"),
+                    None::<&IDWriteNumberSubstitution>,
+                    None,
+                    None,
+                    0,
+                    max as u32,
+                    map.as_mut_ptr(),
+                    text_props.as_mut_ptr(),
+                    glyphs.as_mut_ptr(),
+                    glyph_props.as_mut_ptr(),
+                    &mut count,
+                )
+            })
+    };
+    // A character the font lacks would come from a fallback font; leave
+    // such runs (and any shaping failure) to the plain cell glyphs.
+    if shaped.is_err() || plain.contains(&0) {
+        return Vec::new();
+    }
+    glyphs.truncate(count as usize);
+    ligature::pieces(&plain, &glyphs, &map)
+}
+
+/// Asks DirectWrite which script analysis Latin text gets, which shaping
+/// needs. Every character a ligature can hold is Latin or common script.
+fn latin_script(analyzer: &IDWriteTextAnalyzer) -> Option<DWRITE_SCRIPT_ANALYSIS> {
+    let probe = ComObject::new(ScriptProbe {
+        text: "a".encode_utf16().collect(),
+        found: std::cell::Cell::new(None),
+    });
+    let source: IDWriteTextAnalysisSource = probe.to_interface();
+    let sink: IDWriteTextAnalysisSink = probe.to_interface();
+    // SAFETY: both interfaces belong to `probe`, alive for the call.
+    unsafe { analyzer.AnalyzeScript(&source, 0, 1, &sink) }.ok()?;
+    probe.found.get()
+}
+
+/// A tiny text for `AnalyzeScript`, which also takes its answer.
+#[implement(IDWriteTextAnalysisSource, IDWriteTextAnalysisSink)]
+struct ScriptProbe {
+    text: Vec<u16>,
+    found: std::cell::Cell<Option<DWRITE_SCRIPT_ANALYSIS>>,
+}
+
+impl ScriptProbe_Impl {
+    /// The text from `pos` on.
+    fn rest(&self, pos: u32) -> &[u16] {
+        self.text.get(pos as usize..).unwrap_or_default()
+    }
+}
+
+/// Hands DirectWrite a piece of text through its out-pointers.
+fn give(slice: &[u16], text: *mut *mut u16, len: *mut u32) -> Result<()> {
+    if text.is_null() || len.is_null() {
+        return Err(Error::from(E_FAIL));
+    }
+    // SAFETY: both pointers were checked and come from DirectWrite; the
+    // text lives in the probe, which outlives the analysis.
+    unsafe {
+        *text = if slice.is_empty() {
+            std::ptr::null_mut()
+        } else {
+            slice.as_ptr().cast_mut()
+        };
+        *len = u32::try_from(slice.len()).unwrap_or(0);
+    }
+    Ok(())
+}
+
+impl IDWriteTextAnalysisSource_Impl for ScriptProbe_Impl {
+    fn GetTextAtPosition(&self, pos: u32, text: *mut *mut u16, len: *mut u32) -> Result<()> {
+        give(self.rest(pos), text, len)
+    }
+
+    fn GetTextBeforePosition(&self, pos: u32, text: *mut *mut u16, len: *mut u32) -> Result<()> {
+        give(self.text.get(..pos as usize).unwrap_or_default(), text, len)
+    }
+
+    fn GetParagraphReadingDirection(&self) -> DWRITE_READING_DIRECTION {
+        DWRITE_READING_DIRECTION_LEFT_TO_RIGHT
+    }
+
+    fn GetLocaleName(&self, pos: u32, len: *mut u32, name: *mut *mut u16) -> Result<()> {
+        if len.is_null() || name.is_null() {
+            return Err(Error::from(E_FAIL));
+        }
+        // SAFETY: both pointers were checked; the name is a static string.
+        unsafe {
+            *len = u32::try_from(self.rest(pos).len()).unwrap_or(0);
+            *name = w!("en-us").as_ptr().cast_mut();
+        }
+        Ok(())
+    }
+
+    fn GetNumberSubstitution(
+        &self,
+        pos: u32,
+        len: *mut u32,
+        substitution: OutRef<IDWriteNumberSubstitution>,
+    ) -> Result<()> {
+        if len.is_null() {
+            return Err(Error::from(E_FAIL));
+        }
+        // SAFETY: the pointer was checked and comes from DirectWrite.
+        unsafe { *len = u32::try_from(self.rest(pos).len()).unwrap_or(0) };
+        substitution.write(None)
+    }
+}
+
+impl IDWriteTextAnalysisSink_Impl for ScriptProbe_Impl {
+    fn SetScriptAnalysis(
+        &self,
+        _pos: u32,
+        _len: u32,
+        analysis: *const DWRITE_SCRIPT_ANALYSIS,
+    ) -> Result<()> {
+        // SAFETY: DirectWrite passes a valid analysis or null.
+        if let Some(a) = unsafe { analysis.as_ref() } {
+            self.found.set(Some(*a));
+        }
+        Ok(())
+    }
+
+    fn SetLineBreakpoints(
+        &self,
+        _pos: u32,
+        _len: u32,
+        _breakpoints: *const DWRITE_LINE_BREAKPOINT,
+    ) -> Result<()> {
+        Ok(())
+    }
+
+    fn SetBidiLevel(&self, _pos: u32, _len: u32, _explicit: u8, _resolved: u8) -> Result<()> {
+        Ok(())
+    }
+
+    fn SetNumberSubstitution(
+        &self,
+        _pos: u32,
+        _len: u32,
+        _substitution: Ref<IDWriteNumberSubstitution>,
+    ) -> Result<()> {
+        Ok(())
     }
 }
 
@@ -583,7 +922,7 @@ impl Atlas {
                 if self.slots.contains_key(key) {
                     continue;
                 }
-                let width = if key.wide { cw * 2 } else { cw };
+                let width = cw * key.cells();
                 let slot = match self.packer.alloc(width, ch) {
                     Some(slot) => slot,
                     None if !evicted => {
@@ -602,7 +941,11 @@ impl Atlas {
                 self.rt
                     .PushAxisAlignedClip(&rect, D2D1_ANTIALIAS_MODE_ALIASED);
                 self.rt.Clear(Some(&TRANSPARENT));
-                if let Some(format) = font.formats.get(usize::from(key.style)) {
+                if let Some(piece) = &key.piece {
+                    if let Some(face) = font.faces.get(usize::from(key.style)) {
+                        self.draw_piece(face, &font.metrics, piece, &rect);
+                    }
+                } else if let Some(format) = font.formats.get(usize::from(key.style)) {
                     utf16.clear();
                     let mut unit = [0u16; 2];
                     utf16.extend_from_slice(key.ch.encode_utf16(&mut unit));
@@ -621,6 +964,43 @@ impl Atlas {
             }
             self.rt.EndDraw(None, None)
         }
+    }
+
+    /// Draws a ligature's glyphs into its slot, one cell per character.
+    fn draw_piece(
+        &self,
+        face: &IDWriteFontFace,
+        m: &CellMetrics,
+        piece: &Piece,
+        slot: &D2D_RECT_F,
+    ) {
+        let advances: Vec<f32> = piece
+            .cells
+            .iter()
+            .map(|c| f32::from(*c) * m.width as f32)
+            .collect();
+        let offsets = vec![DWRITE_GLYPH_OFFSET::default(); piece.glyphs.len()];
+        let run = DWRITE_GLYPH_RUN {
+            fontFace: std::mem::ManuallyDrop::new(Some(face.clone())),
+            fontEmSize: m.em_px,
+            glyphCount: u32::try_from(piece.glyphs.len()).unwrap_or(0),
+            glyphIndices: piece.glyphs.as_ptr(),
+            glyphAdvances: advances.as_ptr(),
+            glyphOffsets: offsets.as_ptr(),
+            isSideways: BOOL(0),
+            bidiLevel: 0,
+        };
+        let origin = Vector2 {
+            X: slot.left,
+            Y: slot.top + m.baseline,
+        };
+        // SAFETY: drawing call inside the caller's BeginDraw; the arrays
+        // hold `glyphCount` entries each and outlive the call.
+        unsafe {
+            self.rt
+                .DrawGlyphRun(origin, &run, &self.ink, DWRITE_MEASURING_MODE_NATURAL);
+        }
+        drop(std::mem::ManuallyDrop::into_inner(run.fontFace));
     }
 }
 
@@ -829,7 +1209,7 @@ fn draw_pane(
     pictures: &HashMap<u32, ID2D1Bitmap>,
     m: &CellMetrics,
     pane: &PaneView<'_>,
-    force: bool,
+    (rows, force): (&[(usize, RowPlan)], bool),
 ) {
     let theme = pane.theme;
     let (cw, ch) = (m.width as f32, m.height as f32);
@@ -853,32 +1233,15 @@ fn draw_pane(
     if pane.full || force {
         fill(&bounds, theme.background);
     }
-    for y in rows_to_draw(pane, force) {
+    for (y, glyphs) in rows {
+        let y = *y;
         let Some(row) = pane.grid.row(y) else {
             continue;
         };
         let top = oy + y as f32 * ch;
         let cursor = pane.cursor.filter(|c| c.y == y);
-        let block_at = |x: usize, cell: &Cell| {
-            cursor.is_some_and(|c| {
-                c.shape == CursorShape::Block
-                    && (c.x == x || (c.x + 1 == x && cell.flags.contains(Flags::WIDE_SPACER)))
-            })
-        };
-        let colours = |x: usize, cell: &Cell| {
-            if block_at(x, cell) {
-                return (theme.cursor_text, theme.cursor);
-            }
-            let (mut fg, bg) = (theme.fg(cell.fg), theme.bg(cell.bg));
-            if cell.flags.contains(Flags::DIM) {
-                fg = blend(fg, bg);
-            }
-            if cell.flags.contains(Flags::INVERSE) {
-                (bg, fg)
-            } else {
-                (fg, bg)
-            }
-        };
+        let block_at = |x: usize, cell: &Cell| block_cursor_at(cursor, x, cell);
+        let colours = |x: usize, cell: &Cell| cell_colours(theme, cursor, x, cell);
 
         // The row's full width, so that the side padding is repainted too.
         fill(
@@ -913,12 +1276,13 @@ fn draw_pane(
                 }
             }
         }
-        for (x, cell) in row.iter().enumerate() {
+        for (x, key) in glyphs {
+            let (x, Some(cell)) = (*x, row.get(*x)) else {
+                continue;
+            };
             let left = ox + x as f32 * cw;
             let (fg, _) = colours(x, cell);
-            if !cell.is_empty_glyph()
-                && let Some(slot) = atlas.slots.get(&GlyphKey::of(cell, pane.grid))
-            {
+            if let Some(slot) = atlas.slots.get(key) {
                 let src = slot_rect(slot);
                 let dst = rect(left, top, left + slot.w as f32, top + slot.h as f32);
                 // SAFETY: drawing call inside the caller's BeginDraw.
@@ -933,6 +1297,10 @@ fn draw_pane(
                     );
                 }
             }
+        }
+        for (x, cell) in row.iter().enumerate() {
+            let left = ox + x as f32 * cw;
+            let (fg, _) = colours(x, cell);
             if cell.flags.contains(Flags::UNDERLINE) {
                 let u = top + m.underline_top;
                 fill(&rect(left, u, left + cw, u + m.underline_thickness), fg);
@@ -991,6 +1359,32 @@ fn slot_rect(s: &Slot) -> D2D_RECT_F {
         (s.x + s.w) as f32,
         (s.y + s.h) as f32,
     )
+}
+
+/// Whether the block cursor covers `cell` at `x` (either half of a wide
+/// character). `cursor` is the cursor on this row, if any.
+fn block_cursor_at(cursor: Option<Cursor>, x: usize, cell: &Cell) -> bool {
+    cursor.is_some_and(|c| {
+        c.shape == CursorShape::Block
+            && (c.x == x || (c.x + 1 == x && cell.flags.contains(Flags::WIDE_SPACER)))
+    })
+}
+
+/// A cell's text and background colours as drawn: with dim, inverse and
+/// the block cursor applied.
+fn cell_colours(theme: &Theme, cursor: Option<Cursor>, x: usize, cell: &Cell) -> (Rgb, Rgb) {
+    if block_cursor_at(cursor, x, cell) {
+        return (theme.cursor_text, theme.cursor);
+    }
+    let (mut fg, bg) = (theme.fg(cell.fg), theme.bg(cell.bg));
+    if cell.flags.contains(Flags::DIM) {
+        fg = blend(fg, bg);
+    }
+    if cell.flags.contains(Flags::INVERSE) {
+        (bg, fg)
+    } else {
+        (fg, bg)
+    }
 }
 
 /// Halfway between two colours, for dim text.
