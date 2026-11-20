@@ -1750,12 +1750,17 @@ impl SessionForm {
         Ok(())
     }
 
+    /// Takes the credentials as they are now, for the next check.
+    pub fn set_credentials(&mut self, credentials: &[ferossh_config::settings::Credential]) {
+        self.hints.credentials = credentials.iter().map(|c| c.name.clone()).collect();
+        self.hints.credential_logins = credentials.to_vec();
+    }
+
     /// Takes the credentials as they are now (the vault or another window
     /// may have changed them since the form opened) and checks again; on a
     /// problem shows it, and the form stays open.
     pub fn recheck_with(&mut self, credentials: &[ferossh_config::settings::Credential]) -> bool {
-        self.hints.credentials = credentials.iter().map(|c| c.name.clone()).collect();
-        self.hints.credential_logins = credentials.to_vec();
+        self.set_credentials(credentials);
         match self.check() {
             Ok(()) => true,
             Err(e) => {

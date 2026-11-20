@@ -22013,7 +22013,13 @@ fn form_event(hwnd: HWND, event: form_view::Event) {
         }
         Event::Browse => with_window(|w| w.form_action(Some(FormAction::BrowseKey))).flatten(),
         Event::Save(connect) => with_window(|w| {
-            let action = w.side.form.as_mut()?.submit(connect);
+            // Checked against the credentials as they are now (a shared
+            // vault's changes taken in), not as when the form opened.
+            vault_ui::sync_settings(&mut w.settings);
+            let credentials = w.settings.credentials.clone();
+            let form = w.side.form.as_mut()?;
+            form.set_credentials(&credentials);
+            let action = form.submit(connect);
             // A problem shows in the form; nothing else happens.
             if action.is_none() {
                 w.refresh_chrome();
