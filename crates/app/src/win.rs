@@ -618,6 +618,11 @@ mod cmd {
     pub const PLAY_CAST: u32 = 642;
     /// Session > tmux > Detach other clients.
     pub const TMUX_DETACH_OTHERS: u32 = 643;
+    /// Session > tmux > Share this session, Join a shared session, Stop
+    /// sharing.
+    pub const TMUX_SHARE: u32 = 677;
+    pub const TMUX_JOIN: u32 = 678;
+    pub const TMUX_UNSHARE: u32 = 679;
     pub const TMUX_ATTACH: u32 = 610;
     pub const TMUX_DETACH: u32 = 611;
     pub const TMUX_PICK: u32 = 612;
@@ -1375,8 +1380,10 @@ struct Window {
     /// tmux control mode, per SSH pane that has run `tmux -CC`.
     tmux: HashMap<PaneId, Tmux>,
     /// SSH panes whose connection dropped while tmux ran: the host's
-    /// queue key and the session to attach again after the next login.
-    reattach: HashMap<PaneId, (String, String)>,
+    /// queue key and the session to attach again after the next login
+    /// (whether on the shared server), or `None`: none, not even the
+    /// profile's, as the one lost was someone else's or shared.
+    reattach: HashMap<PaneId, (String, Option<(String, bool)>)>,
     /// The pane of the Windows notification on screen (or last on
     /// screen): clicking it shows that pane.
     toast_pane: Option<PaneId>,
@@ -3000,6 +3007,10 @@ fn build_menu() -> Result<HMENU> {
         item(tmux, cmd::TMUX_DETACH, "&Detach tmux")?;
         item(tmux, cmd::TMUX_DETACH_OTHERS, "Detach &other clients")?;
         separator(tmux)?;
+        item(tmux, cmd::TMUX_SHARE, "S&hare this session...")?;
+        item(tmux, cmd::TMUX_JOIN, "&Join a shared session...")?;
+        item(tmux, cmd::TMUX_UNSHARE, "Stop sharin&g")?;
+        separator(tmux)?;
         item(tmux, cmd::TMUX_LAYOUT, "One window per &pane (own fonts)")?;
         item(
             tmux,
@@ -3959,6 +3970,10 @@ impl Window {
                         self.watch_agent(gateway, native);
                     }
                 }
+                tmux::Action::Tell(text) => {
+                    self.queued
+                        .push(Command::Notice(crate::ssh::sanitize(&text)));
+                }
                 tmux::Action::Notice(text) => {
                     let text = crate::ssh::sanitize(&text);
                     self.show(gateway, &format!("\x1b[0;90m{text}\x1b[0m\r\n"));
@@ -4125,8 +4140,17 @@ impl Window {
             return;
         };
         let actions = t.connection_lost(&mut self.ws);
-        if let (Some(name), Some(key)) = (t.reattach.take(), key) {
-            self.reattach.insert(id, (key, name));
+        if let Some(key) = key {
+            if let Some(name) = t.reattach.take() {
+                // The pane's tmux watcher may be made anew before the
+                // login: whether the session was on the shared server
+                // goes along.
+                let shared = t.take_reattach_shared(&name);
+                self.reattach.insert(id, (key, Some((name, shared))));
+            } else if t.take_stay_at_shell() {
+                // Not attached again: the login stays at the shell.
+                self.reattach.insert(id, (key, None));
+            }
         }
         self.run_tmux(id, actions);
     }
@@ -4153,8 +4177,13 @@ impl Window {
         if !workspace {
             self.workspace_tmux.remove(&id);
         }
+        let mut shared = false;
         let (name, rebuild) = match self.reattach.remove(&id) {
-            Some((k, name)) if k == key => (name, None),
+            Some((k, Some((name, on_shared)))) if k == key => {
+                shared = on_shared;
+                (name, None)
+            }
+            Some((k, None)) if k == key => return false,
             _ => match self.workspace_tmux.get(&id) {
                 Some(w) => (w.name.clone(), w.rebuild.clone()),
                 None => match profile {
@@ -4184,6 +4213,15 @@ impl Window {
         // The plan stays (saving keeps its panes) until tmux shows them.
         if let Some(line) = rebuild {
             self.send_host(id, line.as_bytes());
+        }
+        if shared {
+            if !self.tmux.contains_key(&id) {
+                let t = self.new_tmux(id);
+                self.tmux.insert(id, t);
+            }
+            if let Some(t) = self.tmux.get_mut(&id) {
+                t.reattach_on_shared(&name);
+            }
         }
         self.attach_tmux(id, &name, false)
     }
@@ -4229,6 +4267,186 @@ impl Window {
         let line = t.attach(name, pick);
         self.send_host(id, &line);
         true
+    }
+
+    /// Whether gateway pane `id` can start or join a tmux session: in
+    /// one already, or at a logged-in SSH shell (not over Mosh).
+    fn tmux_ready(&self, id: PaneId) -> std::result::Result<(), String> {
+        if self.tmux.get(&id).is_some_and(Tmux::active) {
+            return Ok(());
+        }
+        match self.panes.get(&id).map(|p| &p.host) {
+            Some(Host::Ssh(s)) if s.target.mosh.is_some() => {
+                Err("tmux integration needs an SSH shell: it does not work over Mosh.".into())
+            }
+            // tmux is typed at a shell: not into a login without one, or
+            // into the program a RemoteCommand runs.
+            Some(Host::Ssh(s)) if s.target.no_shell() || s.target.command.is_some() => Err(
+                "Sharing and joining tmux type a command at the host's shell, and this \
+                 connection has none (file transfer or tunnel only, or a RemoteCommand)."
+                    .into(),
+            ),
+            // A login script would type its next line into tmux.
+            Some(Host::Ssh(_)) if self.scripts.contains_key(&id) => Err(
+                "A script is still running in this pane. Let it finish, or stop it, then try \
+                 again."
+                    .into(),
+            ),
+            Some(Host::Ssh(s)) if s.state() == State::Connected && !s.prompt_active() => Ok(()),
+            _ => Err(NOT_IN_SHELL.into()),
+        }
+    }
+
+    /// The account gateway `id` logged in as and the session to offer
+    /// sharing: the one attached, or the host's tmux session.
+    fn tmux_share_defaults(&self, id: PaneId) -> Option<(String, String)> {
+        let Some(Host::Ssh(s)) = self.panes.get(&id).map(|p| &p.host) else {
+            return None;
+        };
+        let session = self
+            .tmux
+            .get(&id)
+            .filter(|t| t.active())
+            .and_then(|t| t.session_name().map(str::to_owned))
+            .or_else(|| {
+                self.settings
+                    .profile(&s.target.alias)
+                    .and_then(|p| p.tmux.clone())
+            })
+            .unwrap_or_else(|| "main".to_owned());
+        Some((crate::ssh::sanitize(&s.target.user), session))
+    }
+
+    /// Session > tmux > Share this session, as answered: fields Session
+    /// and Accounts. Returns a problem to show, if any.
+    fn share_tmux(
+        &mut self,
+        gateway: PaneId,
+        answer: &crate::fields_view::Answer,
+    ) -> Option<String> {
+        if let Err(why) = self.tmux_ready(gateway) {
+            return Some(why);
+        }
+        let field = |i: usize| answer.fields.get(i).map_or("", |f| f.trim());
+        let session = ferossh_tmuxcc::command::session_name(field(0));
+        let accounts = match ferossh_tmuxcc::command::account_names(field(1)) {
+            Ok(a) => a,
+            Err(bad) => {
+                return Some(format!(
+                    "\"{}\" is not an account name.",
+                    crate::ssh::sanitize(&bad)
+                ));
+            }
+        };
+        let user = self.tmux_share_defaults(gateway).map(|(u, _)| u)?;
+        if accounts.is_empty() {
+            // Attached already: that session is the one shared, on the
+            // server it runs on.
+            let attached = self
+                .tmux
+                .get(&gateway)
+                .filter(|t| t.active())
+                .map(|t| (t.session_name().map(str::to_owned), t.on_shared_server()));
+            let is_attached = attached.is_some();
+            let (session, shared_server) = match attached {
+                Some((name, shared)) => (name.unwrap_or(session), shared),
+                None => (session, false),
+            };
+            let text = if shared_server {
+                format!(
+                    "Anyone logged in to this host as {user} can watch tmux session {session}: \
+                     in FeroSSH with Session > tmux > Join a shared session (Shared by account \
+                     {user}, Session {session}), or with: tmux -S \
+                     {}{user}/default attach -E -r -t {session}\n\n\
+                     Session > tmux > Stop sharing detaches those watching.",
+                    ferossh_tmuxcc::command::SHARE_DIR_PREFIX
+                )
+            } else {
+                format!(
+                    "Anyone logged in to this host as {user} can watch tmux session {session}: \
+                     in FeroSSH with Session > tmux > Join a shared session (Session \
+                     {session}), or with: tmux attach -E -r -t {session}\n\n\
+                     Session > tmux > Stop sharing detaches those watching."
+                )
+            };
+            if is_attached {
+                return Some(text);
+            }
+            if !self.attach_tmux(gateway, &session, false) {
+                return None;
+            }
+            let actions = self
+                .tmux
+                .get_mut(&gateway)
+                .map(|t| t.share_same_account(text))
+                .unwrap_or_default();
+            self.run_tmux(gateway, actions);
+            return None;
+        }
+        if !self.tmux.contains_key(&gateway) {
+            let t = self.new_tmux(gateway);
+            self.tmux.insert(gateway, t);
+        }
+        let share = tmux::Share {
+            accounts,
+            can_type: answer.option,
+        };
+        let actions = self
+            .tmux
+            .get_mut(&gateway)
+            .map(|t| t.share(&session, share))
+            .unwrap_or_default();
+        self.run_tmux(gateway, actions);
+        None
+    }
+
+    /// Session > tmux > Join a shared session, as answered: fields Shared
+    /// by account and Session. Returns a problem to show, if any.
+    fn join_tmux(
+        &mut self,
+        gateway: PaneId,
+        answer: &crate::fields_view::Answer,
+    ) -> Option<String> {
+        if let Err(why) = self.tmux_ready(gateway) {
+            return Some(why);
+        }
+        let field = |i: usize| answer.fields.get(i).map_or("", |f| f.trim());
+        let owner = match field(0) {
+            "" => None,
+            text => match ferossh_tmuxcc::command::account_name(text) {
+                Some(a) => Some(a),
+                None => {
+                    return Some(format!(
+                        "\"{}\" is not an account name.",
+                        crate::ssh::sanitize(text)
+                    ));
+                }
+            },
+        };
+        // A name is joined exactly as typed (spaces too, which tmux
+        // allows), never cleaned into another session's name.
+        let raw = answer.fields.get(1).map_or("", String::as_str);
+        let session = Some(raw).filter(|s| !s.trim().is_empty());
+        if let Some(s) = session
+            && ferossh_tmuxcc::command::session_name(s) != s
+        {
+            return Some(format!(
+                "\"{}\" has characters FeroSSH does not type into a command line. Leave \
+                 Session empty to pick the session from the list instead.",
+                crate::ssh::sanitize(s)
+            ));
+        }
+        if !self.tmux.contains_key(&gateway) {
+            let t = self.new_tmux(gateway);
+            self.tmux.insert(gateway, t);
+        }
+        let actions = self
+            .tmux
+            .get_mut(&gateway)
+            .map(|t| t.join(owner.as_deref(), session, answer.option))
+            .unwrap_or_default();
+        self.run_tmux(gateway, actions);
+        None
     }
 
     /// Feeds local text (not from the host) to a pane's terminal.
@@ -14685,7 +14903,13 @@ impl Window {
                 if whole && !tmux.insert(g) {
                     return None;
                 }
-                let session = t.and_then(Tmux::session_name).map(str::to_owned);
+                // Someone else's session, or one on the shared server, is
+                // not attached again by name: that would find the private
+                // server's session of that name.
+                let session = t
+                    .filter(|t| t.joined().is_none() && !t.on_shared_server())
+                    .and_then(Tmux::session_name)
+                    .map(str::to_owned);
                 (self.panes.get(&g)?, Some((session, whole)))
             }
             None => (p, None),
@@ -17090,6 +17314,26 @@ impl Window {
                 };
                 let _ = self.attach_tmux(pane, &name, true);
             }
+            cmd::TMUX_SHARE | cmd::TMUX_JOIN => {
+                let gateway = self.host_pane(pane);
+                if let Err(why) = self.tmux_ready(gateway) {
+                    return Some(Command::Notice(why));
+                }
+                return Some(if id == cmd::TMUX_SHARE {
+                    Command::TmuxShare(gateway)
+                } else {
+                    Command::TmuxJoin(gateway)
+                });
+            }
+            cmd::TMUX_UNSHARE => {
+                let host = self.host_pane(pane);
+                let actions = self
+                    .tmux
+                    .get_mut(&host)
+                    .map(Tmux::unshare)
+                    .unwrap_or_default();
+                self.run_tmux(host, actions);
+            }
             cmd::DESKTOP => return self.open_desktop(pane, None),
             cmd::DESKTOP_TAB => return self.open_desktop(pane, Some(Protocol::Vnc)),
             cmd::DESKTOP_TAB_RDP => return self.open_desktop(pane, Some(Protocol::Rdp)),
@@ -18357,6 +18601,10 @@ impl Window {
         let pane = self.focused_id();
         let host = self.host_pane(pane);
         let tmux = self.tmux.get(&host).is_some_and(|t| t.active());
+        let own_tmux = self
+            .tmux
+            .get(&host)
+            .is_some_and(|t| t.active() && t.joined().is_none());
         let connection = self.pane_connection(pane);
         let vdesk = connection.is_some()
             && self
@@ -18372,6 +18620,7 @@ impl Window {
         let mut out = vec![
             (cmd::TMUX_PICK, tmux),
             (cmd::TMUX_DETACH, tmux),
+            (cmd::TMUX_UNSHARE, own_tmux),
             (cmd::TMUX_LAYOUT, tmux),
             (cmd::VDESK_STOP, vdesk),
             (cmd::SERIAL_BREAK, serial),
@@ -20234,6 +20483,10 @@ enum Command {
     /// Other tmux clients keep gateway `gateway`'s windows small: offer
     /// to detach them.
     TmuxCrowded(CrowdedOffer),
+    /// Session > tmux > Share this session, from gateway pane `.0`.
+    TmuxShare(PaneId),
+    /// Session > tmux > Join a shared session, from gateway pane `.0`.
+    TmuxJoin(PaneId),
     /// A menu of tmux sessions to switch gateway `gateway`'s client to.
     TmuxPicker {
         gateway: PaneId,
@@ -22237,6 +22490,80 @@ fn run_command(hwnd: HWND, command: Command) {
                     // SAFETY: our window; replaces any earlier timer.
                     unsafe { SetTimer(Some(hwnd), TIMER_CROWDED, 500, None) };
                 }
+            }
+        }
+        Command::TmuxShare(gateway) => {
+            let Some((user, session)) = with_window(|w| w.tmux_share_defaults(gateway)).flatten()
+            else {
+                return;
+            };
+            let intro = format!(
+                "Anyone who logs in to this host as {user} can watch this tmux session: \
+                 leave Accounts empty to see how they join it.\n\n\
+                 For other accounts, FeroSSH starts the session on a tmux server of its own \
+                 that only the accounts you name may connect to. tmux keeps them watch-only \
+                 from tmux 3.9 on; on older tmux they can only be let in to type, and then they \
+                 can also run commands as {user}."
+            );
+            if DIALOG_OPEN.get() {
+                return;
+            }
+            DIALOG_OPEN.set(true);
+            let answer = crate::fields_view::ask(
+                hwnd,
+                &crate::fields_view::Ask {
+                    title: "Share this session",
+                    intro: &intro,
+                    fields: &[("Session", &session), ("Accounts (optional)", "")],
+                    option: Some(("Let them type (they can also run commands as you)", false)),
+                    ok: "Share",
+                    cancel: "Cancel",
+                },
+            );
+            DIALOG_OPEN.set(false);
+            if let Some(answer) = answer {
+                let (text, next) = with_window(|w| {
+                    (
+                        w.share_tmux(gateway, &answer),
+                        std::mem::take(&mut w.queued),
+                    )
+                })
+                .unwrap_or_default();
+                if let Some(text) = text {
+                    dialog(hwnd, &text, MB_OK | MB_ICONINFORMATION);
+                }
+                run_commands(hwnd, next);
+            }
+        }
+        Command::TmuxJoin(gateway) => {
+            if DIALOG_OPEN.get() {
+                return;
+            }
+            DIALOG_OPEN.set(true);
+            let answer = crate::fields_view::ask(
+                hwnd,
+                &crate::fields_view::Ask {
+                    title: "Join a shared session",
+                    intro: "Watch a tmux session on this host: one of your own account's, \
+                            or one another account shares with you. FeroSSH joins read-only \
+                            unless you tick the box (and they let you type), and never \
+                            resizes, closes or rearranges their windows. Leave Session empty \
+                            to pick one.",
+                    fields: &[("Shared by account", ""), ("Session (optional)", "")],
+                    option: Some(("Type into it too", false)),
+                    ok: "Join",
+                    cancel: "Cancel",
+                },
+            );
+            DIALOG_OPEN.set(false);
+            if let Some(answer) = answer {
+                let (text, next) =
+                    with_window(|w| (w.join_tmux(gateway, &answer), std::mem::take(&mut w.queued)))
+                        .unwrap_or_default();
+                if let Some(text) = text {
+                    dialog(hwnd, &text, MB_OK | MB_ICONINFORMATION);
+                }
+                run_commands(hwnd, next);
             }
         }
         Command::TmuxPicker { gateway, names } => {
