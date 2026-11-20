@@ -101,12 +101,20 @@ impl Escapes {
         *self = Self::default();
     }
 
+    /// Drops a held escape character and an open `~C` line, keeping
+    /// whether the next key is first on a line.
+    pub fn cancel(&mut self) {
+        self.pending = false;
+        self.command = None;
+    }
+
     /// The `~C` command line is open: typing goes to it.
     pub fn in_command(&self) -> bool {
         self.command.is_some()
     }
 
     /// The escape character is held back, waiting for the next key.
+    #[cfg(test)]
     pub fn pending(&self) -> bool {
         self.pending
     }
@@ -301,6 +309,19 @@ mod tests {
             typed(&mut e, "~."),
             [Outcome::Taken, Outcome::Run(Escape::Disconnect)]
         );
+    }
+
+    #[test]
+    fn cancel_keeps_the_line_position() {
+        let mut e = Escapes::default();
+        e.sent(b"echo ");
+        e.cancel();
+        assert_eq!(e.key(TILDE, Typed::Char('~')), Outcome::Pass);
+        e.sent(b"\r");
+        assert_eq!(e.key(TILDE, Typed::Char('~')), Outcome::Taken);
+        e.cancel();
+        assert!(!e.pending());
+        assert_eq!(e.key(TILDE, Typed::Char('~')), Outcome::Taken);
     }
 
     #[test]

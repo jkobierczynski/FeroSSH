@@ -8878,9 +8878,7 @@ impl Window {
         // held character left open goes, and keys go on as usual (Enter
         // reconnects).
         if esc.is_none() {
-            if p.escapes.in_command() || p.escapes.pending() {
-                p.escapes.reset();
-            }
+            p.escapes.cancel();
             return None;
         }
         let outcome = p.escapes.key(esc, typed);
@@ -17424,7 +17422,7 @@ impl Window {
                     // held `~` cannot come back to life if escapes are
                     // turned on again before the next key.
                     for p in self.panes.values_mut() {
-                        p.escapes.reset();
+                        p.escapes.cancel();
                     }
                 }
                 self.save_settings();
