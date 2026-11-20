@@ -30,13 +30,13 @@ use windows::Win32::UI::Controls::{
     CDDS_ITEMPOSTPAINT, CDDS_ITEMPREPAINT, CDDS_PREPAINT, CDRF_DODEFAULT, CDRF_NEWFONT,
     CDRF_NOTIFYITEMDRAW, CDRF_NOTIFYPOSTPAINT, EM_SETCUEBANNER, EM_SETSEL, HTREEITEM, NM_CLICK,
     NM_CUSTOMDRAW, NM_DBLCLK, NM_RCLICK, NM_SETFOCUS, NMHDR, NMTREEVIEWW, NMTVCUSTOMDRAW,
-    NMTVGETINFOTIPW, NMTVKEYDOWN, SetWindowTheme, TVE_TOGGLE, TVGN_CARET, TVGN_ROOT, TVHITTESTINFO,
-    TVI_LAST, TVI_ROOT, TVIF_PARAM, TVIF_STATE, TVIF_TEXT, TVINSERTSTRUCTW, TVIS_EXPANDED, TVITEMW,
-    TVM_DELETEITEM, TVM_ENSUREVISIBLE, TVM_EXPAND, TVM_GETITEMRECT, TVM_GETITEMW, TVM_GETNEXTITEM,
-    TVM_HITTEST, TVM_INSERTITEMW, TVM_SELECTITEM, TVM_SETEXTENDEDSTYLE, TVN_GETINFOTIPW,
-    TVN_ITEMEXPANDEDW, TVN_KEYDOWN, TVS_EX_DOUBLEBUFFER, TVS_EX_FADEINOUTEXPANDOS,
-    TVS_FULLROWSELECT, TVS_HASBUTTONS, TVS_INFOTIP, TVS_LINESATROOT, TVS_SHOWSELALWAYS, WC_BUTTONW,
-    WC_EDITW, WC_TREEVIEWW,
+    NMTVGETINFOTIPW, NMTVKEYDOWN, SetWindowTheme, TVE_TOGGLE, TVGN_CARET, TVGN_NEXTVISIBLE,
+    TVGN_ROOT, TVHITTESTINFO, TVI_LAST, TVI_ROOT, TVIF_PARAM, TVIF_STATE, TVIF_TEXT,
+    TVINSERTSTRUCTW, TVIS_EXPANDED, TVITEMW, TVM_DELETEITEM, TVM_ENSUREVISIBLE, TVM_EXPAND,
+    TVM_GETITEMRECT, TVM_GETITEMW, TVM_GETNEXTITEM, TVM_HITTEST, TVM_INSERTITEMW, TVM_SELECTITEM,
+    TVM_SETEXTENDEDSTYLE, TVN_GETINFOTIPW, TVN_ITEMEXPANDEDW, TVN_KEYDOWN, TVS_EX_DOUBLEBUFFER,
+    TVS_EX_FADEINOUTEXPANDOS, TVS_FULLROWSELECT, TVS_HASBUTTONS, TVS_INFOTIP, TVS_LINESATROOT,
+    TVS_SHOWSELALWAYS, WC_BUTTONW, WC_EDITW, WC_TREEVIEWW,
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     GetFocus, SetFocus, VK_CONTROL, VK_DELETE, VK_DOWN, VK_F2, VK_F5, VK_INSERT, VK_SHIFT, VK_SPACE,
@@ -126,7 +126,7 @@ struct State {
     collapsed: HashSet<String>,
     /// Hosts selected with Ctrl+click, Shift+click or Ctrl+A, by name.
     marked: Vec<String>,
-    /// Where Shift+click selects from: a position in [`host_order`].
+    /// Where Shift+click selects from: the item index of a host.
     anchor: Option<usize>,
     /// The width the controls are laid out for (the tool's whole width).
     width: i32,
@@ -550,8 +550,51 @@ pub fn set_nodes(nodes: Vec<TreeNode>) {
     }
 }
 
-/// The hosts in the tree, in the order listed: item index and name.
-/// Workspaces are left out; a host listed twice is here twice.
+/// The hosts on screen in the tree (not those in a folded folder), in
+/// the order listed: item index and name. Workspaces are left out.
+fn visible_hosts(tree: HWND) -> Vec<(usize, String)> {
+    let items = STATE.with(|s| {
+        s.try_borrow()
+            .ok()
+            .and_then(|s| s.as_ref().map(|s| s.items.clone()))
+            .unwrap_or_default()
+    });
+    let mut out = Vec::new();
+    // SAFETY: our own control; plain queries.
+    let mut item = unsafe {
+        SendMessageW(
+            tree,
+            TVM_GETNEXTITEM,
+            Some(WPARAM(TVGN_ROOT as usize)),
+            None,
+        )
+    };
+    let mut guard = items.len() + 1;
+    while item.0 != 0 && guard > 0 {
+        guard -= 1;
+        let handle = HTREEITEM(item.0);
+        if let Some(i) = item_index(tree, handle)
+            && let Some(Item::Host(h)) = items.get(i)
+            && !h.workspace
+        {
+            out.push((i, h.name.clone()));
+        }
+        // SAFETY: as above.
+        item = unsafe {
+            SendMessageW(
+                tree,
+                TVM_GETNEXTITEM,
+                Some(WPARAM(TVGN_NEXTVISIBLE as usize)),
+                Some(LPARAM(handle.0)),
+            )
+        };
+    }
+    out
+}
+
+/// Every host in the tree, folded folders too, in the order listed:
+/// item index and name. Workspaces are left out; a host listed twice is
+/// here twice.
 fn host_order() -> Vec<(usize, String)> {
     STATE.with(|s| {
         s.try_borrow()
@@ -620,17 +663,20 @@ pub fn clear_marks() {
 /// changed the selection of several hosts (and the tree should not act on
 /// the click itself).
 fn mark_click(h: Handles, index: usize, hit: HTREEITEM, ctrl: bool, shift: bool) -> bool {
-    let order = host_order();
+    // A run of hosts is the one on screen: none from a folded folder.
+    let order = visible_hosts(h.tree);
     let Some(pos) = order.iter().position(|(i, _)| *i == index) else {
         return false;
     };
     let names: Vec<String> = order.iter().map(|(_, n)| n.clone()).collect();
     let current = selected(h.tree).and_then(|c| order.iter().position(|(i, _)| *i == c));
-    let anchor = STATE.with(|s| s.try_borrow().ok()?.as_ref()?.anchor);
+    let anchor = STATE
+        .with(|s| s.try_borrow().ok()?.as_ref()?.anchor)
+        .and_then(|a| order.iter().position(|(i, _)| *i == a));
     let (marks, anchor) =
         crate::bulk::click_marks(&names, &marked(), anchor, current, pos, ctrl, shift);
     select(h.tree, hit);
-    set_marked(marks, anchor);
+    set_marked(marks, anchor.and_then(|p| order.get(p)).map(|(i, _)| *i));
     true
 }
 
@@ -891,7 +937,9 @@ fn notify(h: Handles, lparam: LPARAM) -> LRESULT {
                 let ctrl = key_down(VK_CONTROL.0);
                 let shift = key_down(VK_SHIFT.0);
                 if !ctrl && !shift {
-                    clear_marks();
+                    // The anchor goes too, even with nothing selected: the
+                    // host clicked is where a Shift+click starts next.
+                    set_marked(Vec::new(), None);
                     return LRESULT(0);
                 }
                 let pos = GetMessagePos();
@@ -990,10 +1038,11 @@ fn notify(h: Handles, lparam: LPARAM) -> LRESULT {
                     return LRESULT(1);
                 }
                 if vk == VK_SPACE.0 && ctrl {
+                    let order = visible_hosts(h.tree);
                     if let Some(index) = selected(h.tree)
-                        && let Some(pos) = host_order().iter().position(|(i, _)| *i == index)
+                        && let Some(pos) = order.iter().position(|(i, _)| *i == index)
                     {
-                        let names: Vec<String> = host_order().into_iter().map(|(_, n)| n).collect();
+                        let names: Vec<String> = order.iter().map(|(_, n)| n.clone()).collect();
                         let (marks, anchor) = crate::bulk::click_marks(
                             &names,
                             &marked(),
@@ -1003,12 +1052,14 @@ fn notify(h: Handles, lparam: LPARAM) -> LRESULT {
                             true,
                             false,
                         );
-                        set_marked(marks, anchor);
+                        set_marked(marks, anchor.and_then(|p| order.get(p)).map(|(i, _)| *i));
                     }
                     return LRESULT(1);
                 }
                 let marks = marked();
-                if vk == VK_DELETE.0 && marks.len() > 1 {
+                // With hosts selected, Delete is about them, even one left
+                // after Ctrl+clicks, never the caret's host.
+                if vk == VK_DELETE.0 && !marks.is_empty() {
                     emit(Event::DeleteMany(marks));
                     return LRESULT(1);
                 }

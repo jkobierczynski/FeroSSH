@@ -14537,23 +14537,40 @@ impl Window {
 
     /// Removes saved session `name` (after the user said yes).
     fn delete_session(&mut self, name: &str) {
-        if self
-            .settings
-            .profile(name)
-            .is_some_and(|p| p.password == PasswordSource::Windows)
-            && let Some(target) = self.saved_password_target(name)
-            && let Err(e) = credman::delete(&target)
-        {
-            self.queued.push(Command::Notice(e));
-        }
+        self.delete_sessions(&[name.to_string()]);
+    }
+
+    /// Removes the saved sessions `names` (after the user said yes): the
+    /// file is written once, and settings change only once it is.
+    fn delete_sessions(&mut self, names: &[String]) {
+        // Where their Windows-stored passwords are, found while the
+        // connections are still saved; removed once they are gone.
+        let targets: Vec<String> = names
+            .iter()
+            .filter(|name| {
+                self.settings
+                    .profile(name)
+                    .is_some_and(|p| p.password == PasswordSource::Windows)
+            })
+            .filter_map(|name| self.saved_password_target(name))
+            .collect();
         let mut hosts = load_saved();
-        session_form::delete(name, &mut hosts, &mut self.settings);
+        let mut settings = self.settings.clone();
+        for name in names {
+            session_form::delete(name, &mut hosts, &mut settings);
+        }
         if let Err(e) = write_app_file(&sessions_path(), &saved::to_text(&hosts)) {
             self.queued.push(Command::Notice(format!(
                 "Could not save {}: {e}",
                 sessions_path().display()
             )));
             return;
+        }
+        self.settings = settings;
+        for target in targets {
+            if let Err(e) = credman::delete(&target) {
+                self.queued.push(Command::Notice(e));
+            }
         }
         self.save_settings();
         self.side.form = None;
@@ -14605,13 +14622,6 @@ impl Window {
         }
         conn_view::clear_marks();
         self.refresh_chrome();
-    }
-
-    /// Deletes the saved connections among `names` (asked first).
-    fn delete_sessions(&mut self, names: &[String]) {
-        for name in names {
-            self.delete_session(name);
-        }
     }
 
     /// Reads the hosts again after a session was saved or deleted.
@@ -22159,9 +22169,15 @@ fn bulk_menu(hwnd: HWND, names: Vec<String>) {
         },
         _ => return,
     };
-    if let Some(Some(command)) = with_window(|w| w.side_action(Some(SideAction::Bulk(action)))) {
+    let (command, queued) = with_window(|w| {
+        let command = w.side_action(Some(SideAction::Bulk(action)));
+        (command, std::mem::take(&mut w.queued))
+    })
+    .unwrap_or_default();
+    if let Some(command) = command {
         run_command(hwnd, command);
     }
+    run_commands(hwnd, queued);
 }
 
 /// Delete with several connections selected: asks once, listing them,
@@ -22194,10 +22210,13 @@ fn delete_many(hwnd: HWND, names: Vec<String>) {
     }
     text.push_str("\n\nThis cannot be undone.");
     if dialog(hwnd, &text, MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2) == Some(IDYES) {
-        with_window(|w| {
+        let queued = with_window(|w| {
             w.delete_sessions(&mine);
             conn_view::clear_marks();
-        });
+            std::mem::take(&mut w.queued)
+        })
+        .unwrap_or_default();
+        run_commands(hwnd, queued);
     }
 }
 
