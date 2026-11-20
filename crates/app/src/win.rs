@@ -14627,6 +14627,30 @@ impl Window {
                 vault_ui::sync_settings(&mut self.settings);
                 let mut hosts = load_saved();
                 let conflicts = crate::bulk_edit::conflicts(&plan, &hosts, &self.settings);
+                // As in the form: a password kept in the Windows Credential
+                // Manager goes once the connection is off it or its user
+                // changes the name it is kept under. Names are resolved
+                // before anything changes.
+                let old_targets: Vec<(String, String)> = if matches!(
+                    plan.field,
+                    crate::bulk_edit::EditField::User | crate::bulk_edit::EditField::Password
+                ) {
+                    plan.changes
+                        .iter()
+                        .filter(|c| !conflicts.contains(&c.name))
+                        .filter(|c| {
+                            self.settings
+                                .profile(&c.name)
+                                .is_some_and(|p| p.password == PasswordSource::Windows)
+                        })
+                        .filter_map(|c| {
+                            self.saved_password_target(&c.name)
+                                .map(|t| (c.name.clone(), t))
+                        })
+                        .collect()
+                } else {
+                    Vec::new()
+                };
                 if crate::bulk_edit::apply(&plan, &mut hosts, &mut self.settings)
                     && let Err(e) = write_app_file(&sessions_path(), &saved::to_text(&hosts))
                 {
@@ -14637,6 +14661,20 @@ impl Window {
                     return;
                 }
                 let saved_settings = self.try_save_settings();
+                if saved_settings.is_ok() {
+                    for (name, old) in old_targets {
+                        let still_windows = self
+                            .settings
+                            .profile(&name)
+                            .is_some_and(|p| p.password == PasswordSource::Windows);
+                        if (!still_windows
+                            || self.saved_password_target(&name).as_ref() != Some(&old))
+                            && let Err(e) = credman::delete(&old)
+                        {
+                            self.queued.push(Command::Notice(e));
+                        }
+                    }
+                }
                 self.reload_sessions(None);
                 if let Err(e) = saved_settings {
                     self.queued.push(Command::Notice(e));
@@ -22234,7 +22272,7 @@ fn bulk_menu(hwnd: HWND, names: Vec<String>) {
 /// change, and changes it.
 fn edit_many(hwnd: HWND, names: Vec<String>, field: crate::bulk_edit::EditField) {
     use crate::bulk_edit::{Target, plan, preview, shared};
-    let Some((targets, saved, themes, start)) = with_window(|w| {
+    let Some((targets, themes, start)) = with_window(|w| {
         let targets: Vec<Target> = host_items(&ssh_env(), &w.settings)
             .into_iter()
             .filter(|h| names.iter().any(|n| n.eq_ignore_ascii_case(&h.name)))
@@ -22251,7 +22289,7 @@ fn edit_many(hwnd: HWND, names: Vec<String>, field: crate::bulk_edit::EditField)
         let saved = load_saved();
         let themes: Vec<String> = Theme::builtin().iter().map(|t| t.name.to_owned()).collect();
         let start = shared(field, &targets, &saved, &w.settings);
-        (targets, saved, themes, start)
+        (targets, themes, start)
     }) else {
         return;
     };
@@ -22285,8 +22323,10 @@ fn edit_many(hwnd: HWND, names: Vec<String>, field: crate::bulk_edit::EditField)
             return;
         };
         typed = answer.fields.into_iter().next().unwrap_or_default();
+        // Read again for each preview: the connections may have changed
+        // while the dialog was open.
         let Some(result) =
-            with_window(|w| plan(field, &typed, &targets, &saved, &w.settings, &themes))
+            with_window(|w| plan(field, &typed, &targets, &load_saved(), &w.settings, &themes))
         else {
             return;
         };
