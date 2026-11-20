@@ -9384,7 +9384,9 @@ impl Window {
         }
         // The `~C` command line takes a paste's first line, without
         // running it: Enter does.
-        if self.panes.get(&id).is_some_and(|p| p.escapes.in_command()) {
+        if self.escape_char_of(id).is_some()
+            && self.panes.get(&id).is_some_and(|p| p.escapes.in_command())
+        {
             for c in text.chars().take_while(|c| !matches!(c, '\r' | '\n')) {
                 if !c.is_control() {
                     self.escape_typed(id, escape::Typed::Char(c));
@@ -17409,6 +17411,15 @@ impl Window {
                 self.settings.escapes = on;
                 if on && self.settings.escape_char == EscapeChar::None {
                     self.settings.escape_char = EscapeChar::DEFAULT;
+                }
+                if !on {
+                    // Drop every pane's open `ssh>` line and held escape
+                    // character now, so a paste is not swallowed and a
+                    // held `~` cannot come back to life if escapes are
+                    // turned on again before the next key.
+                    for p in self.panes.values_mut() {
+                        p.escapes.reset();
+                    }
                 }
                 self.save_settings();
                 self.update_menu_checks();
