@@ -14522,6 +14522,13 @@ impl Window {
         match action {
             Some(FormAction::Cancel) => self.side.form = None,
             Some(FormAction::Save { connect }) => {
+                // Checked against the credentials as they are now, not as
+                // they were when the form opened.
+                let credentials = self.settings.credentials.clone();
+                if !self.side.form.as_mut()?.recheck_with(&credentials) {
+                    self.refresh_chrome();
+                    return None;
+                }
                 let form = self.side.form.as_ref()?;
                 let mut hosts = load_saved();
                 let mut settings = self.settings.clone();

@@ -540,6 +540,9 @@ pub fn merge_logins3(
                 && !new.eq_ignore_ascii_case(old)
                 && !has(&side.credentials, old)
                 && has(&side.credentials, &new)
+                // A rename makes a new name: one already in base was
+                // there to pick, not what the old one became.
+                && !has(&base.credentials, &new)
                 && !renames.iter().any(|(o, _)| o.eq_ignore_ascii_case(old))
             {
                 renames.push((old.clone(), new));
@@ -558,7 +561,31 @@ pub fn merge_logins3(
             .find(|(o, n)| o.eq_ignore_ascii_case(name) && has(&credentials, n))
         {
             p.credential = Some(new.clone());
+            continue;
         }
+        // The credential is gone from the merge and was not renamed: the
+        // field merges on its own, as the profile does (the side that
+        // left it as in base takes the other's), and one that still
+        // names a missing credential falls back to the connection's own
+        // login rather than a credential neither side gave it.
+        let field = |list: &[crate::Profile]| {
+            list.iter()
+                .find(|q| q.host.eq_ignore_ascii_case(&p.host))
+                .and_then(|q| q.credential.clone())
+        };
+        let (b, o, t) = (
+            field(&base.profiles),
+            field(&ours.profiles),
+            field(&theirs.profiles),
+        );
+        let merged = if o == b {
+            t
+        } else if t == b {
+            o
+        } else {
+            None
+        };
+        p.credential = merged.filter(|n| has(&credentials, n));
     }
     (profiles, credentials)
 }
@@ -741,6 +768,32 @@ mod tests {
             assert_eq!(web.credential.as_deref(), Some("prod"));
             assert_eq!(web.font_size, Some(size));
         }
+    }
+
+    #[test]
+    fn a_merge_never_hands_a_profile_a_credential_neither_side_gave_it() {
+        let base = Settings::parse(
+            "Credential ops\n    User o\nCredential lab\n    User l\nProfile web\n    \
+             Credential ops\nProfile db\n    Credential ops\n    FontSize 10\n",
+        );
+        // Here: only db's font size changed.
+        let ours = Settings::parse(
+            "Credential ops\n    User o\nCredential lab\n    User l\nProfile web\n    \
+             Credential ops\nProfile db\n    Credential ops\n    FontSize 12\n",
+        );
+        // There: web moved to lab (already there), db's credential taken
+        // off, and ops removed. Not a rename of ops to lab.
+        let theirs = Settings::parse(
+            "Credential lab\n    User l\nProfile web\n    Credential lab\nProfile db\n    \
+             FontSize 10\n",
+        );
+        let (profiles, credentials) = merge_logins3(&base, &ours, &theirs);
+        assert_eq!(credentials.len(), 1);
+        let get = |h: &str| profiles.iter().find(|p| p.host == h).unwrap();
+        assert_eq!(get("web").credential.as_deref(), Some("lab"));
+        // db: credential as they left it (none), font size as we did.
+        assert_eq!(get("db").credential, None);
+        assert_eq!(get("db").font_size, Some(12.0));
     }
 
     #[test]

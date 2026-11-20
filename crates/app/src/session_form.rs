@@ -1750,6 +1750,21 @@ impl SessionForm {
         Ok(())
     }
 
+    /// Takes the credentials as they are now (the vault or another window
+    /// may have changed them since the form opened) and checks again; on a
+    /// problem shows it, and the form stays open.
+    pub fn recheck_with(&mut self, credentials: &[ferossh_config::settings::Credential]) -> bool {
+        self.hints.credentials = credentials.iter().map(|c| c.name.clone()).collect();
+        self.hints.credential_logins = credentials.to_vec();
+        match self.check() {
+            Ok(()) => true,
+            Err(e) => {
+                self.error = Some(e);
+                false
+            }
+        }
+    }
+
     /// Checks, and on a problem shows it and moves to its field.
     fn checked(&mut self, connect: bool) -> Option<FormAction> {
         match self.check() {
@@ -2889,6 +2904,16 @@ mod tests {
         .credentials;
         f.values.credential = "ops".into();
         assert_eq!(f.check(), Ok(()));
+        // The vault took the user off ops since the form opened: the save
+        // checks against the credentials as they are now.
+        let now = Settings::parse("Credential ops\n    PasswordSource windows\n").credentials;
+        assert!(!f.recheck_with(&now));
+        assert!(f.error.as_deref().unwrap_or("").contains("needs a user"));
+        f.hints.credential_logins = Settings::parse(
+            "Credential ops\n    User ops\n    PasswordSource windows\nCredential nouser\n    \
+             PasswordSource windows\n",
+        )
+        .credentials;
         f.values.credential = "nouser".into();
         f.values.password = PASSWORD_ASK;
         assert!(
