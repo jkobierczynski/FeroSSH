@@ -76,6 +76,13 @@ impl Policy {
         }
     }
 
+    /// These limits for a login that has only passwords (WinRM):
+    /// `KeysOnly` speaks of SSH logins and is left out.
+    pub fn without_keys_only(mut self) -> Self {
+        self.keys_only = false;
+        self
+    }
+
     /// The limits in words, for the line a connection shows.
     pub fn describe(&self) -> Vec<&'static str> {
         [

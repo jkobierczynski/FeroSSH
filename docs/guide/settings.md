@@ -296,11 +296,11 @@ SecurityRule
 | `Hosts PATTERN...` | ssh_config-style patterns, matched against the connection's name and the machine it reaches. |
 | `Tags TAG...` | Connections with this tag, from ssh_config's `Tag` or the profile's `Tags`. Patterns such as `prod*` work, in any case. |
 | `Folders FOLDER...` | Connections in this connection manager folder, or in any folder inside it. Patterns work. |
-| `KeysOnly yes` | SSH logins use a key, the agent or a security key. A password prompt ends the login. A one-time code is still asked. |
-| `SavePassword no` | No password is read from or kept in the Windows Credential Manager. A password manager command still works. |
+| `KeysOnly yes` | SSH logins use a key, the agent or a security key. A password prompt ends the login, also inside a keyboard-interactive round. A one-time code is still asked. Kerberos (GSSAPI) is not used, and the connection is never shared with another pane's login. WinRM, which only has passwords, is not affected. |
+| `SavePassword no` | No password is read from or kept in the Windows Credential Manager, for the login, a proxy or a login script. A password manager command still works. |
 | `ForwardAgent no` | No agent forwarding, even when the connection or ssh_config asks for it. |
 | `Clipboard no` | The server cannot set this PC's clipboard (OSC 52). |
-| `ConfirmConnect yes` | FeroSSH asks before connecting. A reconnect or a split of a connected pane does not ask again. |
-| `LogSession yes` | The session is logged, and Session > Log this session cannot turn it off. |
+| `ConfirmConnect yes` | FeroSSH asks before connecting, also when only a jump host on the way matches. The question names the user, host and port, and if those change before you answer, it asks again. A reconnect or a split of a connected pane does not ask again. |
+| `LogSession yes` | The session is logged, and Session > Log this session cannot turn it off. If the log cannot be opened or written, the session disconnects. Once the connection ends, Log this session goes back to how you had it. |
 
 A rule needs at least one of `Hosts`, `Tags` or `Folders`, and at least one limit. A connection shows the limits that apply when it starts. The limits cover SSH, Mosh, SFTP and tunnel connections, and the clipboard, confirmation and log limits cover Telnet and WinRM too.

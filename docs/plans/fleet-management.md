@@ -77,9 +77,9 @@ Fields that need the whole form (host, port, forwards, login script) stay one co
 
 **What was built.** `SecurityRule` blocks in `ferossh.conf`, matched by tag, connection manager folder (and the folders inside it) or host pattern, like theme rules. A rule can only tighten: every match adds its limits.
 
-- `KeysOnly yes`: a password prompt ends the SSH login (one-time codes are still asked).
+- `KeysOnly yes`: a password prompt ends the SSH login (one-time codes are still asked); no GSSAPI and no shared connection. WinRM is not affected.
 - `SavePassword no`: no Windows Credential Manager password, read or kept.
-- `ForwardAgent no`, `Clipboard no` (OSC 52), `ConfirmConnect yes` (asked once per connect, not on reconnect or split), `LogSession yes` (the log cannot be turned off).
+- `ForwardAgent no`, `Clipboard no` (OSC 52), `ConfirmConnect yes` (asked once per connect, also for a matching jump host, bound to the endpoint asked about; not on reconnect or split), `LogSession yes` (the log cannot be turned off; a log that fails disconnects).
 - Each hop of a jump route gets its own rules. A connection prints the limits that apply.
 - Rules are edited in the file for now, like theme rules. A rules page in Settings is a possible follow-up.
 

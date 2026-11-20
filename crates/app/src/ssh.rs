@@ -819,6 +819,18 @@ fn is_password_prompt(kind: PromptKind, fields: &[PromptField]) -> bool {
     }
 }
 
+/// Whether a server prompt asks for a password among its fields, with
+/// others or alone: what a keys-only login refuses. A one-time code is
+/// not a password.
+fn asks_any_password(kind: PromptKind, fields: &[PromptField]) -> bool {
+    match kind {
+        PromptKind::Password => true,
+        PromptKind::KeyboardInteractive => fields
+            .iter()
+            .any(|f| !f.echo && f.text.to_ascii_lowercase().contains("password")),
+    }
+}
+
 /// The key files in `~/.ssh` tried, in order, when the config names
 /// none, as OpenSSH does.
 pub const DEFAULT_KEYS: [&str; 4] = ["id_ed25519", "id_ecdsa", "id_ecdsa_sk", "id_ed25519_sk"];
@@ -2700,7 +2712,7 @@ impl SshSession {
         let mut effects = Vec::new();
         self.prompt_kind = Some(kind);
         let asks_password = is_password_prompt(kind, &fields);
-        if asks_password && self.keys_only {
+        if self.keys_only && asks_any_password(kind, &fields) {
             effects.push(Effect::Show(format!(
                 "\x1b[0;31mA security rule allows only a key, the agent or a security key \
                  for {}: no password. Not logged in.\x1b[0m\r\n",
@@ -4696,6 +4708,24 @@ mod tests {
         });
         assert!(shown(&fx).contains("Verification code"));
         assert!(s.prompt_active());
+        // A password asked for beside a code: refused all the same.
+        let mut s = SshSession::new(1, Target::resolve("host", &e).unwrap(), e.known_hosts());
+        trusted(&mut s);
+        s.keys_only = true;
+        let field = |text: &str| PromptField {
+            text: text.into(),
+            echo: false,
+        };
+        let fx = s.on_worker(Message::Prompt {
+            channel: 1,
+            kind: PromptKind::KeyboardInteractive,
+            name: String::new(),
+            instructions: String::new(),
+            fields: vec![field("Password: "), field("Code: ")],
+        });
+        assert!(shown(&fx).contains("only a key"));
+        assert!(matches!(sent(&fx)[..], [Message::Close { channel: 1 }]));
+        assert!(!s.prompt_active());
     }
 
     #[test]
