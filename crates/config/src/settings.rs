@@ -461,10 +461,14 @@ pub fn same_tag(a: &str, b: &str) -> bool {
 
 /// A tag with its case folded for comparing, one character for one, so
 /// `?` in a tag pattern still stands for one character (`İ` folds to
-/// `i`, not to the two characters `str::to_lowercase` gives).
+/// `i`, not to the two characters `str::to_lowercase` gives). Greek
+/// final sigma `ς` folds to `σ`, as `Σ` does, so `ΟΣ` and `ος` are one tag.
 pub fn fold_tag(tag: &str) -> String {
     tag.chars()
-        .map(|c| c.to_lowercase().next().unwrap_or(c))
+        .map(|c| match c.to_lowercase().next().unwrap_or(c) {
+            'ς' => 'σ',
+            l => l,
+        })
         .collect()
 }
 
@@ -2564,6 +2568,8 @@ Profile lab
         assert!(valid_tag("équipe"));
         assert_eq!(parse_tags("équipe ÉQUIPE").unwrap(), ["équipe"]);
         assert_eq!(fold_tag("İÉ").chars().count(), 2);
+        assert_eq!(parse_tags("ΟΣ ος").unwrap(), ["ΟΣ"]);
+        assert!(same_tag("ος", "ΟΣ"));
         assert_eq!(host_tags(Some("ÉQUIPE"), None), ["ÉQUIPE"]);
     }
 

@@ -119,6 +119,10 @@ mod tests {
         let mut t = HostThemes::new();
         t.push(ThemeRule::new("Dracula").tags(&["?"]));
         assert_eq!(theme(&t, "box", &["İ"]), Some("Dracula"));
+        // Final sigma is the same letter as sigma.
+        let mut t = HostThemes::new();
+        t.push(ThemeRule::new("Dracula").tags(&["ος"]));
+        assert_eq!(theme(&t, "box", &["ΟΣ"]), Some("Dracula"));
     }
 
     #[test]
