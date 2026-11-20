@@ -8701,12 +8701,18 @@ impl Window {
             w.typed();
         }
         // An escape character held back goes first, so the recording
-        // holds what the shell gets.
+        // holds what the shell gets. It is recorded on its own, so a
+        // bracketed paste after it still starts with its marker.
+        let typed = bytes.len();
         let bytes = self.escape_sent_held(id, bytes);
         if let Some((pane, rec)) = &mut self.recording
             && *pane == id
         {
-            rec.input(&bytes);
+            let (held, rest) = bytes.split_at(bytes.len() - typed);
+            if !held.is_empty() {
+                rec.input(held);
+            }
+            rec.input(rest);
         }
         let enter = matches!(bytes.as_slice(), b"\r" | b"\r\n" | b"\n");
         let Some(p) = self.panes.get_mut(&id) else {
