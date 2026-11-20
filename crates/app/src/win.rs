@@ -4408,9 +4408,10 @@ impl Window {
                 }
             },
         };
-        let session = Some(field(1)).filter(|s| !s.is_empty());
-        // A name is joined exactly as typed, never cleaned into another
-        // session's name.
+        // A name is joined exactly as typed (spaces too, which tmux
+        // allows), never cleaned into another session's name.
+        let raw = answer.fields.get(1).map_or("", String::as_str);
+        let session = Some(raw).filter(|s| !s.trim().is_empty());
         if let Some(s) = session
             && ferossh_tmuxcc::command::session_name(s) != s
         {
