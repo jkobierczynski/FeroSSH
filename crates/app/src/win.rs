@@ -14620,10 +14620,12 @@ impl Window {
                 }
             }
             BulkAction::Edit(plan) => {
-                let mut hosts = load_saved();
-                // sessions.conf, and profiles in a shared vault, may have
+                // Profiles in a shared vault, and sessions.conf, may have
                 // changed since the preview: take both in before checking.
+                // The vault refresh comes first, so the hosts read next
+                // are the ones written back.
                 vault_ui::sync_settings(&mut self.settings);
+                let mut hosts = load_saved();
                 let conflicts = crate::bulk_edit::conflicts(&plan, &hosts, &self.settings);
                 if crate::bulk_edit::apply(&plan, &mut hosts, &mut self.settings)
                     && let Err(e) = write_app_file(&sessions_path(), &saved::to_text(&hosts))
