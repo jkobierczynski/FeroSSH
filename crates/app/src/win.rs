@@ -13181,7 +13181,7 @@ impl Window {
             return None;
         }
         let url = pv.url;
-        let target = (url.target().to_owned(), url.port);
+        let target = ferossh_config::forward::Target::Tcp(url.target().to_owned(), url.port);
         let view = self.forward_view();
         if !view.iter().any(|v| v.connection == pv.connection) {
             return Some(Command::Notice(format!(
@@ -13221,6 +13221,7 @@ impl Window {
             kind: ForwardKind::Local,
             bind: Some("127.0.0.1".into()),
             port: local,
+            socket: None,
             target: Some(target),
         };
         let w = self.workers.get(&pv.connection)?;

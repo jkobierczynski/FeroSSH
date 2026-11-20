@@ -46,7 +46,7 @@ use std::fmt;
 use zeroize::Zeroize;
 
 /// Protocol version carried in every frame. Bump on any wire change.
-pub const PROTOCOL_VERSION: u8 = 22;
+pub const PROTOCOL_VERSION: u8 = 23;
 
 /// Largest frame body accepted, in bytes. Terminal and SFTP data is chunked
 /// below this, so anything larger is a bug or an attack.
@@ -518,6 +518,15 @@ impl ServerStats {
     pub const CPU_FULL: u16 = 1000;
 }
 
+/// Where a forwarded stream goes on the server's side.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ForwardTarget {
+    /// A `direct-tcpip` channel to a host and port.
+    Tcp(String, u16),
+    /// A `direct-streamlocal@openssh.com` channel to a Unix socket.
+    Unix(String),
+}
+
 /// A message on the UI/worker pipe.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Message {
@@ -773,7 +782,8 @@ pub enum Message {
 
     // Port forwarding and X11.
     /// UI to worker: a program connected to a local listener. Open a
-    /// `direct-tcpip` channel on `connection` to `target`; without a
+    /// `direct-tcpip` (or `direct-streamlocal`) channel on `connection`
+    /// to `target`; without a
     /// target the stream speaks SOCKS 4, 4a or 5 first and the worker
     /// opens the channel the client asks for. The worker answers with
     /// [`Message::ForwardOpened`], or with [`Message::Disconnected`].
@@ -782,7 +792,7 @@ pub enum Message {
     ForwardOpen {
         channel: ChannelId,
         connection: ChannelId,
-        target: Option<(String, u16)>,
+        target: Option<ForwardTarget>,
         origin_host: String,
         origin_port: u16,
         keep: bool,
@@ -793,15 +803,19 @@ pub enum Message {
         host: String,
         port: u16,
     },
-    /// UI to worker: ask the server to listen on `bind`:`port` and send
-    /// connections back. The worker answers with
-    /// [`Message::ForwardListening`], or with [`Message::Disconnected`];
-    /// [`Message::Close`] stops the listener.
+    /// UI to worker: ask the server to listen on `bind`:`port`, or on the
+    /// Unix socket `socket`, and send connections back. With `socks`
+    /// each connection speaks SOCKS first, read here, and
+    /// [`Message::ForwardIncoming`] names where it wants to go. The
+    /// worker answers with [`Message::ForwardListening`], or with
+    /// [`Message::Disconnected`]; [`Message::Close`] stops the listener.
     RemoteForward {
         channel: ChannelId,
         connection: ChannelId,
         bind: String,
         port: u16,
+        socket: Option<String>,
+        socks: bool,
     },
     /// Worker to UI: the server listens on `port` (the one it chose, when
     /// asked for port 0).
@@ -809,14 +823,20 @@ pub enum Message {
     /// Worker to UI: the server opened stream `channel` for remote forward
     /// `listener`, or for X11 when `x11` is set (`listener` is then the
     /// connection). The UI connects it to the forward's target, or closes
-    /// it.
+    /// it. For a remote forward that speaks SOCKS, `target` is where the
+    /// client asked to go; the UI answers [`Message::ForwardConnected`]
+    /// once connected there, and closes the stream when it could not.
     ForwardIncoming {
         channel: ChannelId,
         listener: ChannelId,
         x11: bool,
         origin_host: String,
         origin_port: u16,
+        target: Option<(String, u16)>,
     },
+    /// UI to worker: the SOCKS stream `channel` is connected to the target
+    /// it asked for, so the worker tells the client it succeeded.
+    ForwardConnected { channel: ChannelId },
     /// Either side: `bytes` more of the stream's data were delivered, so
     /// the other side may send that much more.
     Window { channel: ChannelId, bytes: u32 },
@@ -971,6 +991,7 @@ impl Message {
             Message::GssapiStep { .. } => 50,
             Message::GssapiReply { .. } => 51,
             Message::ProxyAuth { .. } => 52,
+            Message::ForwardConnected { .. } => 53,
             Message::WinrmConnect { .. } => 60,
             Message::SspiRequest { .. } => 61,
             Message::SspiReply { .. } => 62,
@@ -1011,6 +1032,7 @@ impl Message {
             | Message::Exec { .. }
             | Message::SftpRequest { .. }
             | Message::ForwardOpen { .. }
+            | Message::ForwardConnected { .. }
             | Message::RemoteForward { .. }
             | Message::ZmodemAnswer { .. }
             | Message::ZmodemFileAnswer { .. }
@@ -1070,6 +1092,7 @@ impl Message {
             | Message::Answers { channel, .. }
             | Message::HostKey { channel, .. }
             | Message::ProxyAuth { channel, .. }
+            | Message::ForwardConnected { channel }
             | Message::HostCert { channel, .. }
             | Message::Banner { channel, .. }
             | Message::IdentitiesRequest { channel }
@@ -1449,6 +1472,7 @@ pub fn encode(msg: &Message, out: &mut Vec<u8>) -> Result<(), Error> {
             w.u32(*channel);
             w.bool(*accepted);
         }
+        Message::ForwardConnected { channel } => w.u32(*channel),
         Message::TelnetConnect {
             channel,
             host,
@@ -1783,10 +1807,17 @@ pub fn encode(msg: &Message, out: &mut Vec<u8>) -> Result<(), Error> {
         } => {
             w.u32(*channel);
             w.u32(*connection);
-            w.bool(target.is_some());
-            if let Some((host, port)) = target {
-                w.str(host);
-                w.u16(*port);
+            match target {
+                None => w.u8(0),
+                Some(ForwardTarget::Tcp(host, port)) => {
+                    w.u8(1);
+                    w.str(host);
+                    w.u16(*port);
+                }
+                Some(ForwardTarget::Unix(path)) => {
+                    w.u8(2);
+                    w.str(path);
+                }
             }
             w.str(origin_host);
             w.u16(*origin_port);
@@ -1806,11 +1837,18 @@ pub fn encode(msg: &Message, out: &mut Vec<u8>) -> Result<(), Error> {
             connection,
             bind,
             port,
+            socket,
+            socks,
         } => {
             w.u32(*channel);
             w.u32(*connection);
             w.str(bind);
             w.u16(*port);
+            w.bool(socket.is_some());
+            if let Some(path) = socket {
+                w.str(path);
+            }
+            w.bool(*socks);
         }
         Message::ForwardListening { channel, port } => {
             w.u32(*channel);
@@ -1822,12 +1860,18 @@ pub fn encode(msg: &Message, out: &mut Vec<u8>) -> Result<(), Error> {
             x11,
             origin_host,
             origin_port,
+            target,
         } => {
             w.u32(*channel);
             w.u32(*listener);
             w.bool(*x11);
             w.str(origin_host);
             w.u16(*origin_port);
+            w.bool(target.is_some());
+            if let Some((host, port)) = target {
+                w.str(host);
+                w.u16(*port);
+            }
         }
         Message::Window { channel, bytes } => {
             w.u32(*channel);
@@ -2030,6 +2074,7 @@ fn decode_body(body: &[u8]) -> Result<Message, Error> {
             channel: r.u32()?,
             accepted: r.bool()?,
         },
+        53 => Message::ForwardConnected { channel: r.u32()? },
         5 => Message::HostKeyVerdict {
             channel: r.u32()?,
             accept: r.bool()?,
@@ -2207,7 +2252,12 @@ fn decode_body(body: &[u8]) -> Result<Message, Error> {
         23 => Message::ForwardOpen {
             channel: r.u32()?,
             connection: r.u32()?,
-            target: r.opt(|r| Ok((r.string()?, r.u16()?)))?,
+            target: match r.u8()? {
+                0 => None,
+                1 => Some(ForwardTarget::Tcp(r.string()?, r.u16()?)),
+                2 => Some(ForwardTarget::Unix(r.string()?)),
+                _ => return Err(Error::Invalid),
+            },
             origin_host: r.string()?,
             origin_port: r.u16()?,
             keep: r.bool()?,
@@ -2222,6 +2272,8 @@ fn decode_body(body: &[u8]) -> Result<Message, Error> {
             connection: r.u32()?,
             bind: r.string()?,
             port: r.u16()?,
+            socket: r.opt(Reader::string)?,
+            socks: r.bool()?,
         },
         26 => Message::ForwardListening {
             channel: r.u32()?,
@@ -2233,6 +2285,7 @@ fn decode_body(body: &[u8]) -> Result<Message, Error> {
             x11: r.bool()?,
             origin_host: r.string()?,
             origin_port: r.u16()?,
+            target: r.opt(|r| Ok((r.string()?, r.u16()?)))?,
         },
         28 => Message::Window {
             channel: r.u32()?,
@@ -2923,7 +2976,7 @@ mod tests {
             Message::ForwardOpen {
                 channel: FORWARD_IDS,
                 connection: 1,
-                target: Some(("db.internal".into(), 5432)),
+                target: Some(ForwardTarget::Tcp("db.internal".into(), 5432)),
                 origin_host: "127.0.0.1".into(),
                 origin_port: 50123,
                 keep: false,
@@ -2936,6 +2989,14 @@ mod tests {
                 origin_port: 1,
                 keep: true,
             },
+            Message::ForwardOpen {
+                channel: FORWARD_IDS + 3,
+                connection: 1,
+                target: Some(ForwardTarget::Unix("/var/run/docker.sock".into())),
+                origin_host: "127.0.0.1".into(),
+                origin_port: 2,
+                keep: false,
+            },
             Message::ForwardOpened {
                 channel: FORWARD_IDS,
                 host: "db.internal".into(),
@@ -2946,6 +3007,16 @@ mod tests {
                 connection: 1,
                 bind: "localhost".into(),
                 port: 0,
+                socket: None,
+                socks: true,
+            },
+            Message::RemoteForward {
+                channel: FORWARD_IDS + 4,
+                connection: 1,
+                bind: String::new(),
+                port: 0,
+                socket: Some("/tmp/app.sock".into()),
+                socks: false,
             },
             Message::ForwardListening {
                 channel: FORWARD_IDS + 2,
@@ -2957,6 +3028,18 @@ mod tests {
                 x11: false,
                 origin_host: "10.0.0.9".into(),
                 origin_port: 33000,
+                target: None,
+            },
+            Message::ForwardIncoming {
+                channel: WORKER_IDS + 1,
+                listener: FORWARD_IDS + 2,
+                x11: false,
+                origin_host: "127.0.0.1".into(),
+                origin_port: 33001,
+                target: Some(("intranet.lan".into(), 443)),
+            },
+            Message::ForwardConnected {
+                channel: WORKER_IDS + 1,
             },
             Message::Window {
                 channel: WORKER_IDS,
@@ -3219,9 +3302,10 @@ mod tests {
         tags.sort_unstable();
         tags.dedup();
         // ZMODEM starts at 40, leaving room below; Kerberos at 50, the
-        // proxy's verdict at 52, WinRM at 60, server stats at 70.
+        // proxy's verdict at 52, a remote SOCKS stream's connect at 53,
+        // WinRM at 60, server stats at 70.
         let want: Vec<u8> = (0..=38)
-            .chain(40..=52)
+            .chain(40..=53)
             .chain(60..=62)
             .chain(70..=71)
             .collect();

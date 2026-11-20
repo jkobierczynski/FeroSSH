@@ -9,6 +9,7 @@
 //! Drawn into a [`Grid`] like the connection manager; keys come in as
 //! [`SideKey`]s and what the user asked for goes out as a [`FwdAction`].
 
+use ferossh_config::forward::Target;
 use ferossh_config::forward::{CancelSpec, parse_cancel, parse_option};
 use ferossh_config::{ForwardKind, ForwardSpec};
 use ferossh_ipc::ChannelId;
@@ -99,17 +100,20 @@ fn describe(f: &FwdView) -> String {
     let target = s
         .target
         .as_ref()
-        .map(|(h, p)| host_port(h, *p))
+        .map(ToString::to_string)
         .unwrap_or_default();
     let place = match &f.state {
         FwdState::Listening(at) => at.clone(),
-        FwdState::Starting | FwdState::Failed(_) => match s.kind {
-            ForwardKind::Remote => format!("server port {}", s.port),
-            _ => format!("port {}", s.port),
+        FwdState::Starting | FwdState::Failed(_) => match (&s.socket, s.kind) {
+            (Some(path), ForwardKind::Remote) => format!("server socket {path}"),
+            (Some(path), _) => path.clone(),
+            (None, ForwardKind::Remote) => format!("server port {}", s.port),
+            (None, _) => format!("port {}", s.port),
         },
     };
     let mut text = match s.kind {
         ForwardKind::Local => format!("L {place} → {target}"),
+        ForwardKind::Remote if s.target.is_none() => format!("R {place} SOCKS"),
         ForwardKind::Remote => format!("R {place} → {target}"),
         ForwardKind::Dynamic => format!("D {place} SOCKS"),
     };
@@ -448,11 +452,13 @@ impl ForwardsView {
 
 // ---- The native pane's model -------------------------------------------
 
-/// The kinds the native pane's Type box offers, in its order.
-pub const KINDS: [(&str, ForwardKind); 3] = [
-    ("Local (-L)", ForwardKind::Local),
-    ("Remote (-R)", ForwardKind::Remote),
-    ("SOCKS (-D)", ForwardKind::Dynamic),
+/// The kinds the native pane's Type box offers, in its order, and
+/// whether each takes a To.
+pub const KINDS: [(&str, ForwardKind, bool); 4] = [
+    ("Local (-L)", ForwardKind::Local, true),
+    ("Remote (-R)", ForwardKind::Remote, true),
+    ("SOCKS (-D)", ForwardKind::Dynamic, false),
+    ("Server SOCKS (-R)", ForwardKind::Remote, false),
 ];
 
 /// One row of the native list: a forward, or a connection's X11.
@@ -482,6 +488,7 @@ pub fn native_rows(view: &[ConnView]) -> Vec<FwdRow> {
             let s = &f.spec;
             let kind = match s.kind {
                 ForwardKind::Local => "Local",
+                ForwardKind::Remote if s.target.is_none() => "Server SOCKS",
                 ForwardKind::Remote => "Remote",
                 ForwardKind::Dynamic => "SOCKS",
             };
@@ -489,18 +496,22 @@ pub fn native_rows(view: &[ConnView]) -> Vec<FwdRow> {
                 FwdState::Listening(at) => at.clone(),
                 FwdState::Starting | FwdState::Failed(_) => {
                     let port = s.port.to_string();
-                    match &s.bind {
-                        Some(b) => host_port(if b.is_empty() { "*" } else { b }, s.port),
-                        None if s.kind == ForwardKind::Remote => format!("server {port}"),
-                        None => port,
+                    match (&s.socket, &s.bind) {
+                        (Some(path), _) if s.kind == ForwardKind::Remote => {
+                            format!("server {path}")
+                        }
+                        (Some(path), _) => path.clone(),
+                        (None, Some(b)) => host_port(if b.is_empty() { "*" } else { b }, s.port),
+                        (None, None) if s.kind == ForwardKind::Remote => format!("server {port}"),
+                        (None, None) => port,
                     }
                 }
             };
-            let to = s
-                .target
-                .as_ref()
-                .map(|(h, p)| host_port(h, *p))
-                .unwrap_or_else(|| "anywhere".into());
+            let to = match (&s.target, s.kind) {
+                (Some(t), _) => t.to_string(),
+                (None, ForwardKind::Remote) => "anywhere from this PC".into(),
+                (None, _) => "anywhere".into(),
+            };
             let mut state = match &f.state {
                 FwdState::Starting => "Starting".to_owned(),
                 FwdState::Failed(_) => "Stopped".to_owned(),
@@ -584,51 +595,72 @@ pub fn form_input(kind: usize, listen: &str, to: &str) -> Result<FormInput, Stri
         if let Some(cancel) = parse_cancel(listen) {
             return Ok(FormInput::Cancel(cancel));
         }
-        return parse_option(listen)
-            .map(FormInput::Add)
-            .ok_or_else(|| "Try -L 8080:host:80, -R 9000:localhost:3000 or -D 1080.".into());
+        return parse_option(listen).map(FormInput::Add).ok_or_else(|| {
+            "Try -L 8080:host:80, -R 9000:localhost:3000, -D 1080, -R 1080 or \
+                 -L 2375:/var/run/docker.sock."
+                .into()
+        });
     }
-    let kind = KINDS.get(kind).map_or(ForwardKind::Local, |k| k.1);
+    let (_, kind, takes_to) = KINDS
+        .get(kind)
+        .copied()
+        .unwrap_or(("", ForwardKind::Local, true));
     if listen.is_empty() {
         return Err("Type the port to listen on, such as 8080.".into());
     }
-    let mut text = format!("-{} {listen}", kind.letter());
-    if kind != ForwardKind::Dynamic {
+    let mut text = format!("-{} {}", kind.letter(), bracket_path(listen));
+    if takes_to {
         if to.is_empty() {
             return Err("Type where it goes, such as db:5432.".into());
         }
         text.push(':');
-        text.push_str(to);
+        text.push_str(&bracket_path(to));
     }
     parse_option(&text).map(FormInput::Add).ok_or_else(|| {
-        if kind == ForwardKind::Dynamic {
-            "Listen takes a port, or an address and a port: 1080, 127.0.0.1:1080.".into()
+        if takes_to {
+            "Listen takes a port (8080), address:port or a socket path; To takes host:port \
+             (db:5432) or a socket path."
+                .into()
         } else {
-            "Listen takes a port (8080) or address:port; To takes host:port (db:5432).".into()
+            "Listen takes a port, or an address and a port: 1080, 127.0.0.1:1080.".into()
         }
     })
 }
 
+/// A socket path typed in a box of its own, bracketed when it holds a
+/// `:` (a Windows drive letter) so that it reads as one field.
+fn bracket_path(text: &str) -> String {
+    if text.contains(['/', '\\']) && text.contains(':') && !text.starts_with('[') {
+        format!("[{text}]")
+    } else {
+        text.to_owned()
+    }
+}
+
 /// The native form's boxes for `spec`: the Type index, Listen and To.
 pub fn form_fields(spec: &ForwardSpec) -> (usize, String, String) {
-    let kind = KINDS.iter().position(|k| k.1 == spec.kind).unwrap_or(0);
-    let listen = match &spec.bind {
-        Some(b) => {
+    let kind = KINDS
+        .iter()
+        .position(|k| k.1 == spec.kind && k.2 == spec.target.is_some())
+        .unwrap_or(0);
+    let listen = match (&spec.socket, &spec.bind) {
+        (Some(path), _) => path.clone(),
+        (None, Some(b)) => {
             let b = if b.is_empty() { "*" } else { b };
             host_port(b, spec.port)
         }
-        None => spec.port.to_string(),
+        (None, None) => spec.port.to_string(),
     };
-    let to = spec
-        .target
-        .as_ref()
-        .map(|(h, p)| host_port(h, *p))
-        .unwrap_or_default();
+    let to = match &spec.target {
+        Some(Target::Unix(path)) => path.clone(),
+        Some(t) => t.to_string(),
+        None => String::new(),
+    };
     (kind, listen, to)
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::indexing_slicing)]
+#[allow(clippy::unwrap_used, clippy::indexing_slicing, clippy::panic)]
 mod tests {
     use super::*;
     use crate::forwards::X11View;
@@ -937,5 +969,74 @@ mod tests {
         assert!(rows[1].bad && rows[1].details.contains("port in use"));
         assert!(rows[1].details.contains("Last error: refused"));
         assert_eq!((rows[2].forward, rows[2].cells[1].as_str()), (None, "X11"));
+    }
+
+    #[test]
+    fn the_form_takes_server_socks_and_socket_paths() {
+        let add = |kind: usize, listen: &str, to: &str| match form_input(kind, listen, to) {
+            Ok(FormInput::Add(spec)) => spec,
+            other => panic!("{listen} {to}: {other:?}"),
+        };
+        let r = add(3, "1080", "");
+        assert_eq!(r, parse_option("-R 1080").unwrap());
+        // The To box is not read for SOCKS on the server.
+        assert_eq!(add(3, "1080", "ignored:1"), r);
+        assert_eq!(
+            add(0, r"C:\Users\me\db.sock", "db:5432"),
+            parse_option(r"-L [C:\Users\me\db.sock]:db:5432").unwrap()
+        );
+        assert_eq!(
+            add(0, "2375", "/var/run/docker.sock"),
+            parse_option("-L 2375:/var/run/docker.sock").unwrap()
+        );
+        assert_eq!(
+            add(1, "/tmp/app.sock", "localhost:80"),
+            parse_option("-R /tmp/app.sock:localhost:80").unwrap()
+        );
+        assert!(form_input(1, "1080", "").is_err());
+        // Each spec fills the boxes it came from.
+        for text in [
+            "-L 8080:db:5432",
+            "-R 9000:localhost:3000",
+            "-D 1080",
+            "-R 1080",
+            "-L 2375:/var/run/docker.sock",
+            r"-L [C:\Users\me\db.sock]:db:5432",
+            "-R /tmp/app.sock:/run/app.sock",
+        ] {
+            let spec = parse_option(text).unwrap();
+            let (kind, listen, to) = form_fields(&spec);
+            assert_eq!(add(kind, &listen, &to), spec, "{text}");
+        }
+    }
+
+    #[test]
+    fn server_socks_and_sockets_read_well_in_the_list() {
+        let view = |text: &str, state: FwdState| ConnView {
+            connection: 1,
+            label: "me@db".into(),
+            forwards: vec![FwdView {
+                spec: parse_option(text).unwrap(),
+                state,
+                open: 0,
+                total: 0,
+                streams: Vec::new(),
+                error: None,
+                desktop: false,
+            }],
+            x11: None,
+        };
+        let rows = native_rows(&[view("-R 1080", FwdState::Starting)]);
+        assert_eq!(rows[0].cells[1], "Server SOCKS");
+        assert_eq!(rows[0].cells[2], "server 1080");
+        assert_eq!(rows[0].cells[3], "anywhere from this PC");
+        let rows = native_rows(&[view("-L 2375:/var/run/docker.sock", FwdState::Starting)]);
+        assert_eq!(rows[0].cells[3], "/var/run/docker.sock");
+        let rows = native_rows(&[view("-R /tmp/a.sock:db:80", FwdState::Starting)]);
+        assert_eq!(rows[0].cells[2], "server /tmp/a.sock");
+        assert_eq!(
+            describe(&view("-R 1080", FwdState::Starting).forwards[0]),
+            "R server port 1080 SOCKS · starting"
+        );
     }
 }

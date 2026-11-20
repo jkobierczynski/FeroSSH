@@ -269,7 +269,7 @@ The arrow buttons between the lists move the selection across, and the gap betwe
 
 | Key | Action |
 | --- | --- |
-| Enter in the form, or Add | Adds the forward the form describes (Type, Listen, To) on the connection in the On box. The Listen box also takes `-L 8080:db.internal:5432`, `-R 9000:localhost:3000`, `-D 1080`, or `-KL 8080`, `-KR 9000`, `-KD 1080` to stop one. |
+| Enter in the form, or Add | Adds the forward the form describes (Type, Listen, To) on the connection in the On box. The Type box has Local, Remote, SOCKS and Server SOCKS; Listen and To also take Unix socket paths. The Listen box also takes `-L 8080:db.internal:5432`, `-R 9000:localhost:3000`, `-D 1080`, `-R 1080`, `-L 2375:/var/run/docker.sock`, or `-KL 8080`, `-KR 9000`, `-KD 1080` to stop one. |
 | Up / Down in the list | Selects a forward; the line under the list shows its details. |
 | Enter, F2, a double click or Edit | Puts the selected forward in the form to change it; Save keeps the change. |
 | Retry | Starts a stopped forward again. |

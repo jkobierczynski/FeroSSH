@@ -5,8 +5,17 @@
 //! `-L [bind:]port:host:hostport`, `-R [bind:]port:host:hostport` and
 //! `-D [bind:]port`; in `ssh_config` the listening side and the target are
 //! two arguments (`LocalForward 8080 db:5432`). IPv6 addresses go in
-//! brackets. Unix sockets and remote dynamic forwards (`-R port` alone) are
-//! not supported.
+//! brackets.
+//!
+//! `-R [bind:]port` without a target is a remote dynamic forward
+//! (OpenSSH 7.6): the server listens and speaks SOCKS, and this PC
+//! connects wherever each client there asks.
+//!
+//! Either side may be a Unix socket instead of an address and a port,
+//! as in `-L 2375:/var/run/docker.sock` or `-R /tmp/app.sock:localhost:80`:
+//! a field with a `/` or a `\` in it is a socket path. A path with a `:`
+//! in it (a Windows drive letter) goes in brackets:
+//! `-L [C:\Users\me\db.sock]:db:5432`. Paths may not hold spaces.
 
 use std::fmt;
 
@@ -15,7 +24,8 @@ use std::fmt;
 pub enum ForwardKind {
     /// Listen on this PC; the server connects to the target.
     Local,
-    /// The server listens; this PC connects to the target.
+    /// The server listens; this PC connects to the target, or, without a
+    /// target, wherever the SOCKS client on the server asks.
     Remote,
     /// Listen on this PC as a SOCKS 4, 4a and 5 proxy; the server connects
     /// wherever each client asks.
@@ -33,21 +43,45 @@ impl ForwardKind {
     }
 }
 
+/// Where a forward's connections go.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum Target {
+    /// A host (or address) and a port.
+    Tcp(String, u16),
+    /// A Unix socket, by its path.
+    Unix(String),
+}
+
+impl fmt::Display for Target {
+    /// `db:5432`, `[::1]:80` or the socket's path.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Target::Tcp(host, port) => write!(f, "{}:{port}", host_text(host)),
+            Target::Unix(path) => f.write_str(&host_text(path)),
+        }
+    }
+}
+
 /// One forward.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct ForwardSpec {
     pub kind: ForwardKind,
     /// The listening address as written: `None` when left out, `Some("*")`
     /// for every interface (an empty address, as in `:8080`, reads as `*`,
-    /// so a spec reads back as written).
+    /// so a spec reads back as written). Always `None` for a socket.
     pub bind: Option<String>,
-    /// The listening port; 0 lets the listening side choose.
+    /// The listening port; 0 lets the listening side choose. 0 for a
+    /// socket.
     pub port: u16,
-    /// Where connections go; `None` for a dynamic forward.
-    pub target: Option<(String, u16)>,
+    /// The Unix socket the listening side listens on, instead of a port.
+    pub socket: Option<String>,
+    /// Where connections go; `None` for a dynamic forward, local or
+    /// remote.
+    pub target: Option<Target>,
 }
 
-/// Wraps an IPv6 address in brackets, as forward specs write it.
+/// Wraps an IPv6 address (or a path with a drive letter) in brackets, as
+/// forward specs write it.
 fn host_text(host: &str) -> String {
     if host.contains(':') {
         format!("[{host}]")
@@ -59,20 +93,35 @@ fn host_text(host: &str) -> String {
 impl fmt::Display for ForwardSpec {
     /// The command-line form: `-L 8080:db:5432`.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "-{} ", self.kind.letter())?;
-        if let Some(bind) = &self.bind {
-            let bind = if bind.is_empty() { "*" } else { bind };
-            write!(f, "{}:", host_text(bind))?;
-        }
-        write!(f, "{}", self.port)?;
-        if let Some((host, port)) = &self.target {
-            write!(f, ":{}:{port}", host_text(host))?;
+        write!(f, "-{} {}", self.kind.letter(), self.listen_text())?;
+        if let Some(target) = &self.target {
+            write!(f, ":{target}")?;
         }
         Ok(())
     }
 }
 
 impl ForwardSpec {
+    /// A remote forward without a target: the server speaks SOCKS.
+    pub fn remote_dynamic(&self) -> bool {
+        self.kind == ForwardKind::Remote && self.target.is_none()
+    }
+
+    /// The listening side as written: `8080`, `*:8080`, `[::1]:8080` or
+    /// a socket's path.
+    pub fn listen_text(&self) -> String {
+        if let Some(path) = &self.socket {
+            return host_text(path);
+        }
+        match &self.bind {
+            Some(bind) => {
+                let bind = if bind.is_empty() { "*" } else { bind };
+                format!("{}:{}", host_text(bind), self.port)
+            }
+            None => self.port.to_string(),
+        }
+    }
+
     /// The `ssh_config` line: `LocalForward 8080 db:5432`.
     pub fn config_line(&self) -> String {
         let keyword = match self.kind {
@@ -80,15 +129,9 @@ impl ForwardSpec {
             ForwardKind::Remote => "RemoteForward",
             ForwardKind::Dynamic => "DynamicForward",
         };
-        let mut out = format!("{keyword} ");
-        if let Some(bind) = &self.bind {
-            let bind = if bind.is_empty() { "*" } else { bind };
-            out.push_str(&host_text(bind));
-            out.push(':');
-        }
-        out.push_str(&self.port.to_string());
-        if let Some((host, port)) = &self.target {
-            out.push_str(&format!(" {}:{port}", host_text(host)));
+        let mut out = format!("{keyword} {}", self.listen_text());
+        if let Some(target) = &self.target {
+            out.push_str(&format!(" {target}"));
         }
         out
     }
@@ -133,6 +176,32 @@ fn valid_host(host: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_' | ':' | '%' | '*'))
 }
 
+/// The longest socket path: what fits in a `sockaddr_un` with its
+/// terminating zero, on Linux and on Windows.
+pub const MAX_SOCKET_PATH: usize = 107;
+
+/// Whether a field names a Unix socket rather than an address or a port.
+fn is_path(field: &str) -> bool {
+    field.contains(['/', '\\'])
+}
+
+/// A socket path as a forward may name it: printable, no spaces or
+/// quotes (so that an `ssh_config` line reads back the same), no
+/// brackets, nothing that
+/// reads as an option, and short enough for a socket address.
+pub fn valid_socket_path(path: &str) -> bool {
+    is_path(path)
+        && path.len() <= MAX_SOCKET_PATH
+        && !path.starts_with('-')
+        && path
+            .chars()
+            .all(|c| !c.is_control() && !c.is_whitespace() && !matches!(c, '[' | ']' | '"'))
+}
+
+fn socket_field(text: &str) -> Option<String> {
+    valid_socket_path(text).then(|| text.to_owned())
+}
+
 /// The listening address; empty means every interface, as `*` does, and
 /// reads as `*` so that writing the spec out and reading it back gives the
 /// same spec.
@@ -147,35 +216,59 @@ fn bind_field(text: &str) -> Option<String> {
 }
 
 /// Parses the listening side and the target, already split into fields:
-/// `[bind, port, host, hostport]` with the bind optional, or for a dynamic
-/// forward `[bind, port]` with the bind optional.
+/// `[bind, port, host, hostport]` with the bind optional, either side a
+/// socket path in one field, or for a dynamic forward `[bind, port]`
+/// with the bind optional.
 fn from_fields(kind: ForwardKind, f: &[String]) -> Option<ForwardSpec> {
-    let (bind, rest) = match (kind, f.len()) {
-        (ForwardKind::Dynamic, 1) | (ForwardKind::Local | ForwardKind::Remote, 3) => (None, f),
-        (ForwardKind::Dynamic, 2) | (ForwardKind::Local | ForwardKind::Remote, 4) => {
-            let (b, rest) = f.split_first()?;
-            (Some(bind_field(b)?), rest)
+    // The target, from the end.
+    let (listen, target) = match f.split_last() {
+        Some((last, head)) if is_path(last) && !head.is_empty() => {
+            (head, Some(Target::Unix(socket_field(last)?)))
         }
+        _ => {
+            let dynamic = match kind {
+                ForwardKind::Dynamic => true,
+                ForwardKind::Local => false,
+                // `-R [bind:]port` alone; a path alone has no target.
+                ForwardKind::Remote => f.len() <= 2 && !f.first().is_some_and(|p| is_path(p)),
+            };
+            if dynamic {
+                (f, None)
+            } else {
+                let at = f.len().checked_sub(2)?;
+                let (head, tail) = f.split_at(at);
+                let [host, p] = tail else {
+                    return None;
+                };
+                if !valid_host(host) || host.contains('*') {
+                    return None;
+                }
+                (
+                    head,
+                    Some(Target::Tcp(host.clone(), port(p).filter(|&p| p != 0)?)),
+                )
+            }
+        }
+    };
+    let (bind, listen, socket) = match listen {
+        [path] if is_path(path) => (None, 0, Some(socket_field(path)?)),
+        [p] => (None, port(p)?, None),
+        [b, p] => (Some(bind_field(b)?), port(p)?, None),
         _ => return None,
     };
-    let (listen, target) = rest.split_first()?;
-    let listen = port(listen)?;
-    let target = match target {
-        [] => None,
-        [host, p] if valid_host(host) && !host.contains('*') => {
-            Some((host.clone(), port(p).filter(|&p| p != 0)?))
-        }
-        _ => return None,
-    };
+    if socket.is_some() && kind == ForwardKind::Dynamic {
+        return None;
+    }
     // A local listener on port 0 would move every time: refuse it, as ssh
     // does for -L and -D. The server may choose a remote port.
-    if listen == 0 && kind != ForwardKind::Remote {
+    if socket.is_none() && listen == 0 && kind != ForwardKind::Remote {
         return None;
     }
     Some(ForwardSpec {
         kind,
         bind,
         port: listen,
+        socket,
         target,
     })
 }
@@ -215,12 +308,13 @@ pub fn parse_option(text: &str) -> Option<ForwardSpec> {
 
 /// What `-KL [bind:]port` and its `-KR`, `-KD` forms name, as `ssh`'s
 /// `~C` command line takes them to cancel a forward: the kind, the
-/// listening address if given, and the port.
+/// listening address if given, and the port; or a socket's path.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CancelSpec {
     pub kind: ForwardKind,
     pub bind: Option<String>,
     pub port: u16,
+    pub socket: Option<String>,
 }
 
 impl CancelSpec {
@@ -235,8 +329,13 @@ impl CancelSpec {
                 b.to_ascii_lowercase()
             }
         };
-        spec.kind == self.kind
-            && spec.port == self.port
+        if spec.kind != self.kind {
+            return false;
+        }
+        if self.socket.is_some() || spec.socket.is_some() {
+            return self.socket == spec.socket;
+        }
+        spec.port == self.port
             && match (&self.bind, &spec.bind) {
                 (None, _) => true,
                 (Some(want), Some(have)) => every(want) == every(have),
@@ -245,8 +344,8 @@ impl CancelSpec {
     }
 }
 
-/// Parses `-KL 8080`, `-KR 127.0.0.1:9000` or `-KD 1080` (the dash and the
-/// space are optional).
+/// Parses `-KL 8080`, `-KR 127.0.0.1:9000`, `-KD 1080` or
+/// `-KR /tmp/app.sock` (the dash and the space are optional).
 pub fn parse_cancel(text: &str) -> Option<CancelSpec> {
     let text = text.trim();
     let text = text.strip_prefix('-').unwrap_or(text);
@@ -262,6 +361,14 @@ pub fn parse_cancel(text: &str) -> Option<CancelSpec> {
     };
     let f = fields(chars.as_str().trim())?;
     let (bind, listen) = match &f[..] {
+        [p] if is_path(p) && kind != ForwardKind::Dynamic => {
+            return Some(CancelSpec {
+                kind,
+                bind: None,
+                port: 0,
+                socket: Some(socket_field(p)?),
+            });
+        }
         [p] => (None, p),
         [b, p] => (Some(bind_field(b)?), p),
         _ => return None,
@@ -270,6 +377,7 @@ pub fn parse_cancel(text: &str) -> Option<CancelSpec> {
         kind,
         bind,
         port: port(listen)?,
+        socket: None,
     })
 }
 
@@ -287,10 +395,10 @@ mod tests {
         let l = parse_config(ForwardKind::Local, &args("8080 db.internal:5432")).unwrap();
         assert_eq!(l.bind, None);
         assert_eq!(l.port, 8080);
-        assert_eq!(l.target, Some(("db.internal".into(), 5432)));
+        assert_eq!(l.target, Some(Target::Tcp("db.internal".into(), 5432)));
         let l = parse_config(ForwardKind::Local, &args("*:8080 [::1]:80")).unwrap();
         assert_eq!(l.bind.as_deref(), Some("*"));
-        assert_eq!(l.target, Some(("::1".into(), 80)));
+        assert_eq!(l.target, Some(Target::Tcp("::1".into(), 80)));
         let l = parse_config(ForwardKind::Local, &args("[::1]:8080 h:80")).unwrap();
         assert_eq!(l.bind.as_deref(), Some("::1"));
         let d = parse_config(ForwardKind::Dynamic, &args("1080")).unwrap();
@@ -313,7 +421,14 @@ mod tests {
             (ForwardKind::Local, "8080 -oProxy:80"),
             (ForwardKind::Local, "8080 [::1:80"),
             (ForwardKind::Local, "8080 *:80"),
-            (ForwardKind::Remote, "9000"),
+            (ForwardKind::Remote, "a:b:9000"),
+            (ForwardKind::Remote, "/tmp/s"),
+            (ForwardKind::Remote, "/tmp/s host"),
+            (ForwardKind::Dynamic, "/tmp/s"),
+            (ForwardKind::Local, "/tmp/s"),
+            (ForwardKind::Local, "8080 /tmp/a b"),
+            (ForwardKind::Local, "8080 -/x"),
+            (ForwardKind::Local, "8080 host:/x"),
             (ForwardKind::Dynamic, "1080 h:80"),
             (ForwardKind::Dynamic, "0"),
             (ForwardKind::Dynamic, "a b:1080"),
@@ -400,5 +515,125 @@ mod tests {
         assert_eq!(parse_option("-X 1"), None);
         assert_eq!(parse_option(""), None);
         assert_eq!(parse_option("-L"), None);
+    }
+
+    #[test]
+    fn parses_remote_dynamic_and_socket_forwards() {
+        let r = parse_option("-R 1080").unwrap();
+        assert!(r.remote_dynamic());
+        assert_eq!((r.bind.as_deref(), r.port), (None, 1080));
+        let r = parse_option("-R localhost:1080").unwrap();
+        assert_eq!(
+            (r.bind.as_deref(), r.port, r.target),
+            (Some("localhost"), 1080, None)
+        );
+        assert!(parse_option("-R 0").unwrap().remote_dynamic());
+        assert!(!parse_option("-R 9000:h:80").unwrap().remote_dynamic());
+
+        let l = parse_option("-L 2375:/var/run/docker.sock").unwrap();
+        assert_eq!(l.port, 2375);
+        assert_eq!(l.target, Some(Target::Unix("/var/run/docker.sock".into())));
+        let l = parse_option("-L 127.0.0.1:2375:/run/d.sock").unwrap();
+        assert_eq!(l.bind.as_deref(), Some("127.0.0.1"));
+        let l = parse_option("-L /tmp/db.sock:db:5432").unwrap();
+        assert_eq!(
+            (l.socket.as_deref(), l.port, l.bind),
+            (Some("/tmp/db.sock"), 0, None)
+        );
+        let l = parse_option(r"-L [C:\Users\me\db.sock]:/run/pg.sock").unwrap();
+        assert_eq!(l.socket.as_deref(), Some(r"C:\Users\me\db.sock"));
+        assert_eq!(l.target, Some(Target::Unix("/run/pg.sock".into())));
+        let r = parse_option("-R /tmp/app.sock:localhost:80").unwrap();
+        assert_eq!(r.socket.as_deref(), Some("/tmp/app.sock"));
+        assert_eq!(r.target, Some(Target::Tcp("localhost".into(), 80)));
+        let r = parse_config(
+            ForwardKind::Remote,
+            &args("/run/user/1000/gnupg/S.gpg-agent /tmp/x"),
+        );
+        assert!(r.is_some());
+        let long = format!("/{}", "a".repeat(MAX_SOCKET_PATH));
+        assert_eq!(parse_option(&format!("-L 80:{long}")), None);
+        assert_eq!(parse_option("-D /tmp/s"), None);
+        assert_eq!(parse_option("-R /tmp/s"), None);
+    }
+
+    #[test]
+    fn socket_and_remote_dynamic_specs_read_back() {
+        for text in [
+            "-R 1080",
+            "-R localhost:1080",
+            "-R *:1080",
+            "-L 2375:/var/run/docker.sock",
+            "-L /tmp/db.sock:db:5432",
+            "-L /tmp/a.sock:/tmp/b.sock",
+            r"-L [C:\Users\me\db.sock]:db:5432",
+            "-R /tmp/app.sock:localhost:80",
+            "-R /tmp/app.sock:/run/app.sock",
+        ] {
+            let spec = parse_option(text).unwrap();
+            assert_eq!(spec.to_string(), text);
+            let line = spec.config_line();
+            let (_, rest) = line.split_once(' ').unwrap();
+            assert_eq!(parse_config(spec.kind, &args(rest)), Some(spec), "{line}");
+        }
+    }
+
+    #[test]
+    fn cancels_socket_forwards() {
+        let s = parse_option("-R /tmp/app.sock:localhost:80").unwrap();
+        let c = parse_cancel("-KR /tmp/app.sock").unwrap();
+        assert!(c.cancels(&s));
+        assert!(!parse_cancel("-KR /tmp/other.sock").unwrap().cancels(&s));
+        assert!(!parse_cancel("-KR 0").unwrap().cancels(&s));
+        assert_eq!(parse_cancel("-KD /tmp/s"), None);
+    }
+
+    /// What the forward_parse fuzz target checks, over many generated
+    /// specs: whatever parses reads back the same, from both forms.
+    #[test]
+    fn generated_specs_read_back() {
+        const PARTS: [&str; 14] = [
+            "8080",
+            "0",
+            "1080",
+            "db",
+            "[::1]",
+            "*",
+            "",
+            "/tmp/s.sock",
+            r"[C:\x\a.sock]",
+            "localhost",
+            "/run/a b",
+            "-x",
+            "a/b",
+            "65536",
+        ];
+        let mut seed = 0x2545_f491_u32;
+        let mut next = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 17;
+            seed ^= seed << 5;
+            seed as usize
+        };
+        for _ in 0..50_000 {
+            let n = 1 + next() % 4;
+            let fields: Vec<&str> = (0..n).map(|_| PARTS[next() % PARTS.len()]).collect();
+            let letter = ["L", "R", "D"][next() % 3];
+            let text = format!("-{letter} {}", fields.join(":"));
+            let Some(spec) = parse_option(&text) else {
+                continue;
+            };
+            assert_eq!(
+                parse_option(&spec.to_string()).as_ref(),
+                Some(&spec),
+                "{text}"
+            );
+            let line = spec.config_line();
+            assert_eq!(
+                parse_config(spec.kind, &args(line.split_once(' ').unwrap().1)).as_ref(),
+                Some(&spec),
+                "{line}"
+            );
+        }
     }
 }
