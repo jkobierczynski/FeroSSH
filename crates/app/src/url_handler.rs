@@ -23,6 +23,17 @@ pub fn command(exe: &str) -> String {
     format!("\"{exe}\" --url \"%1\"")
 }
 
+/// Whether `command` is one [`command`] wrote, for this exe or another
+/// copy of FeroSSH: a quoted path, then `--url "%1"`.
+pub fn is_ferossh_command(command: &str) -> bool {
+    let command = command.trim();
+    command.starts_with('"')
+        && command
+            .get(..command.len().saturating_sub(" --url \"%1\"".len()))
+            .is_some_and(|exe| exe.ends_with('"') && exe.len() > 2)
+        && command.ends_with(" --url \"%1\"")
+}
+
 /// Whether `link` is one FeroSSH opens from the command line: an
 /// `ssh://` or `sftp://` address that parses.
 pub fn valid_link(link: &str) -> bool {
@@ -56,7 +67,9 @@ mod reg {
 
     use std::ffi::c_void;
 
-    use windows::Win32::Foundation::ERROR_SUCCESS;
+    use windows::Win32::Foundation::{
+        ERROR_FILE_NOT_FOUND, ERROR_MORE_DATA, ERROR_PATH_NOT_FOUND, ERROR_SUCCESS,
+    };
     use windows::Win32::System::Registry::{
         HKEY, HKEY_CLASSES_ROOT, HKEY_CURRENT_USER, REG_SZ, RRF_RT_REG_SZ, RegDeleteKeyValueW,
         RegDeleteKeyW, RegDeleteTreeW, RegGetValueW, RegSetKeyValueW,
@@ -64,7 +77,10 @@ mod reg {
     use windows::Win32::UI::Shell::{SHCNE_ASSOCCHANGED, SHCNF_IDLIST, SHChangeNotify};
     use windows::core::HSTRING;
 
-    use super::{Registered, SCHEMES, command, prog_id};
+    use super::{Registered, SCHEMES, command, is_ferossh_command, prog_id};
+
+    /// The longest value read, in UTF-16 units.
+    const MAX_UNITS: usize = 32 * 1024;
 
     const CLASSES: &str = "Software\\Classes";
     const CAPABILITIES: &str = "Software\\FeroSSH\\Capabilities";
@@ -80,28 +96,58 @@ mod reg {
             .map_err(|e| format!("Could not find FeroSSH's own exe: {e}"))
     }
 
-    fn read(root: HKEY, key: &str, name: &str) -> Option<String> {
-        let mut buf = vec![0u16; 2048];
-        let mut size = (buf.len() * 2) as u32;
-        // SAFETY: valid strings and a buffer of `size` bytes.
-        let status = unsafe {
-            RegGetValueW(
-                root,
-                &HSTRING::from(key),
-                &HSTRING::from(name),
-                RRF_RT_REG_SZ,
-                None,
-                Some(buf.as_mut_ptr().cast::<c_void>()),
-                Some(&mut size),
-            )
-        };
-        if status != ERROR_SUCCESS {
-            return None;
+    /// A text value: `Ok(None)` when the key or value is not there,
+    /// `Err` when it is but could not be read (not text, too long, no
+    /// access), which callers treat as there.
+    fn try_read(root: HKEY, key: &str, name: &str) -> Result<Option<String>, ()> {
+        let mut units = 2048usize;
+        loop {
+            let mut buf = vec![0u16; units];
+            let mut size = (buf.len() * 2) as u32;
+            // SAFETY: valid strings and a buffer of `size` bytes.
+            let status = unsafe {
+                RegGetValueW(
+                    root,
+                    &HSTRING::from(key),
+                    &HSTRING::from(name),
+                    RRF_RT_REG_SZ,
+                    None,
+                    Some(buf.as_mut_ptr().cast::<c_void>()),
+                    Some(&mut size),
+                )
+            };
+            if status == ERROR_MORE_DATA && units < MAX_UNITS {
+                units = (size as usize / 2 + 1).clamp(units + 1, MAX_UNITS);
+                continue;
+            }
+            if status == ERROR_FILE_NOT_FOUND || status == ERROR_PATH_NOT_FOUND {
+                return Ok(None);
+            }
+            if status != ERROR_SUCCESS {
+                return Err(());
+            }
+            let n = (size as usize / 2).min(buf.len());
+            let text = buf.get(..n).ok_or(())?;
+            let end = text.iter().position(|&u| u == 0).unwrap_or(text.len());
+            return Ok(Some(String::from_utf16_lossy(text.get(..end).ok_or(())?)));
         }
-        let units = (size as usize / 2).min(buf.len());
-        let text = buf.get(..units)?;
-        let end = text.iter().position(|&u| u == 0).unwrap_or(text.len());
-        Some(String::from_utf16_lossy(text.get(..end)?))
+    }
+
+    fn read(root: HKEY, key: &str, name: &str) -> Option<String> {
+        try_read(root, key, name).ok().flatten()
+    }
+
+    /// Whether the scheme key FeroSSH may have written is still its own:
+    /// marked, and still opening links with a FeroSSH command (from this
+    /// exe or one moved since), not one another program put there.
+    fn own_scheme_key(key: &str) -> bool {
+        read(HKEY_CURRENT_USER, key, MARK).is_some()
+            && read(
+                HKEY_CURRENT_USER,
+                &format!("{key}\\shell\\open\\command"),
+                "",
+            )
+            .is_some_and(|c| is_ferossh_command(&c))
     }
 
     fn write(key: &str, name: &str, value: &str) -> Result<(), String> {
@@ -200,14 +246,17 @@ mod reg {
         write(REGISTERED_APPS, "FeroSSH", CAPABILITIES)?;
 
         let own = format!("{CLASSES}\\{scheme}");
-        let ours = read(HKEY_CURRENT_USER, &own, MARK).is_some();
-        // What handles the links now, for this user or the whole PC.
-        let other = read(
+        let ours = own_scheme_key(&own);
+        // What handles the links now, for this user or the whole PC; one
+        // that cannot be read counts as there.
+        let other = match try_read(
             HKEY_CLASSES_ROOT,
             &format!("{scheme}\\shell\\open\\command"),
             "",
-        )
-        .filter(|c| !c.trim().is_empty());
+        ) {
+            Ok(c) => c.filter(|c| !c.trim().is_empty()).map(Some),
+            Err(()) => Some(None),
+        };
         // A choice made in Default apps wins over both.
         let choice = read(
             HKEY_CURRENT_USER,
@@ -226,7 +275,7 @@ mod reg {
                 Registered::Done
             }
         } else {
-            Registered::ChooseInSettings(other)
+            Registered::ChooseInSettings(other.flatten())
         };
         changed();
         Ok(result)
@@ -236,7 +285,7 @@ mod reg {
     /// FeroSSH's registration goes with the last kind.
     pub fn unregister(scheme: &str) {
         let own = format!("{CLASSES}\\{scheme}");
-        if read(HKEY_CURRENT_USER, &own, MARK).is_some() {
+        if own_scheme_key(&own) {
             delete_tree(&own);
         }
         delete_tree(&format!("{CLASSES}\\{}", prog_id(scheme)));
@@ -268,6 +317,10 @@ mod tests {
             "\"C:\\Tools\\ferossh.exe\" --url \"%1\""
         );
         assert_eq!(prog_id("ssh"), "FeroSSH.ssh");
+        assert!(is_ferossh_command(&command("D:\\Old\\ferossh.exe")));
+        assert!(!is_ferossh_command("\"C:\\PuTTY\\putty.exe\" \"%1\""));
+        assert!(!is_ferossh_command(" --url \"%1\""));
+        assert!(!is_ferossh_command("x --url \"%1\""));
     }
 
     #[test]

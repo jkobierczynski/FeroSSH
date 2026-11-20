@@ -361,6 +361,13 @@ fn parse_args(args: &[String]) -> Result<Launch, String> {
     }
     let destination = match destination {
         Some(mut d) => {
+            // `-l` and `-p` go on the host an `ssh://` link names, not on
+            // the link's text.
+            if (user.is_some() || port.is_some())
+                && let Some(host) = ferossh_config::ssh_config::ssh_url(&d)
+            {
+                d = host;
+            }
             if let Some(u) = user
                 && !d.contains('@')
             {
@@ -533,6 +540,10 @@ mod tests {
         assert!(parse(&["-L"]).is_err());
         assert!(parse(&["-N"]).is_err());
         assert!(parse(&["--workspace", "w", "-N"]).is_err());
+        assert!(matches!(
+            parse(&["-l", "bob", "-p", "2222", "ssh://web1/"]),
+            Ok(Launch::Ssh { destination: Some(d), .. }) if d == "bob@web1:2222"
+        ));
     }
 
     #[test]

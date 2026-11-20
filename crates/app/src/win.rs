@@ -7355,6 +7355,11 @@ impl Window {
                     if none && self.focused_id() == id {
                         self.show_side(SideView::Forwards, true);
                     }
+                    // A desktop through this host opens now, and panes
+                    // waiting for this login go on (to log in on their
+                    // own: a tunnel-only connection is never shared).
+                    self.desktop_after_login(id);
+                    self.release_workspace_panes(id, true);
                     self.refresh_chrome();
                 }
                 Effect::Connected if self.sftp_only(id) => {
@@ -14309,6 +14314,7 @@ impl Window {
                     | SessionKind::Telnet
                     | SessionKind::Mosh
                     | SessionKind::Sftp
+                    | SessionKind::Tunnel
                     | SessionKind::WinRm
             )
         {
