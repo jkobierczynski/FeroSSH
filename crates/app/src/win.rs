@@ -8187,9 +8187,11 @@ impl Window {
                     if !self.retries.get(&id).is_some_and(Retry::waiting) {
                         self.retries.remove(&id);
                         self.stop_log(id);
-                        // The rules go with the session, and the user's own
-                        // logging setting comes back.
-                        self.drop_rules(id);
+                        // The user's own logging setting comes back. The
+                        // rest of the rules stay until the pane connects or
+                        // closes, so output still in this batch (an OSC 52
+                        // clipboard request) is judged by them.
+                        self.restore_log_setting(id);
                     }
                     self.prune_sftp();
                     self.prune_forwards();
@@ -9525,9 +9527,17 @@ impl Window {
         if let Some(p) = self.panes.get_mut(&id) {
             p.policy = Policy::default();
             p.route_policy = Policy::default();
-            if let Some(before) = p.log.before_rule.take() {
-                p.log.enabled = before;
-            }
+        }
+        self.restore_log_setting(id);
+    }
+
+    /// Gives pane `id` back the logging setting its user chose, which a
+    /// `LogSession` rule overrode while the session was live.
+    fn restore_log_setting(&mut self, id: PaneId) {
+        if let Some(p) = self.panes.get_mut(&id)
+            && let Some(before) = p.log.before_rule.take()
+        {
+            p.log.enabled = before;
         }
     }
 
