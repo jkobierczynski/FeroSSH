@@ -862,19 +862,22 @@ impl Tmux {
             .iter()
             // Every entry counts, also names FeroSSH would not accept
             // typed in (spaces too): quoted, they can still be taken off.
-            // A line not in tmux's "NAME (R)" / "NAME (W)" form counts
-            // whole, so it is never mistaken for the owner and passed by.
+            // Only a line in tmux's "NAME (R)" / "NAME (W)" form can be
+            // the owner or root (whom tmux will not take off); any other
+            // line counts as still let in, so nothing unknown is passed by.
             .filter_map(|line| {
                 let text = String::from_utf8_lossy(line);
                 let text = text.trim_end();
-                let name = text
+                match text
                     .strip_suffix(" (R)")
                     .or_else(|| text.strip_suffix(" (W)"))
-                    .unwrap_or(text);
-                (!name.is_empty()).then(|| name.to_owned())
+                {
+                    Some(name) if name == "root" || Some(name) == owner => None,
+                    Some(name) if !name.is_empty() => Some(name.to_owned()),
+                    _ if text.is_empty() => None,
+                    _ => Some(text.to_owned()),
+                }
             })
-            // tmux will not take off the owner or root.
-            .filter(|a| a != "root" && Some(a.as_str()) != owner)
             .collect()
     }
 
@@ -3012,6 +3015,32 @@ mod tests {
         assert!(told[0].contains("did not detach 1"), "{told:?}");
         // Done: Stop sharing works again.
         assert_eq!(writes(&t.unshare()).len(), 2);
+    }
+
+    #[test]
+    fn stop_sharing_does_not_pass_by_a_line_it_cannot_read() {
+        let (mut t, mut ws, a) =
+            attached(None, None, &[pane_line(0, 0, 80, 24, "b25f,80x24,0,0,0")]);
+        let mut n = 4;
+        for _ in writes(&a) {
+            n += 1;
+            t.feed(&mut ws, &reply(n, &[]));
+        }
+        t.unshare();
+        let mut input = reply(n + 1, &["/tmp/ferossh-share-alice/default".into()]);
+        input.extend(reply(n + 2, &[]));
+        t.feed(&mut ws, &input);
+        // A bare "alice" (no mode) is not taken for the owner's entry.
+        let mut input = reply(n + 3, &[]);
+        input.extend(reply(n + 4, &["alice (W)".into()]));
+        let a = t.feed(&mut ws, &input);
+        assert_eq!(writes(&a), ["server-access -l"]);
+        let a = t.feed(
+            &mut ws,
+            &reply(n + 5, &["alice (W)".into(), "alice".into()]),
+        );
+        let told = tells(&a);
+        assert!(told[0].contains("NOT fully stopped"), "{told:?}");
     }
 
     #[test]
