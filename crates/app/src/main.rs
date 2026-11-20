@@ -11,7 +11,13 @@
 //! `ferossh.exe --worker <in> <out>` inside an AppContainer, where it runs
 //! the network side over two inherited pipes.
 //!
-//! Other options: `-p port`, `-l user`, `--no-sandbox` (run the worker
+//! `ferossh.exe ssh://[user@]host[:port]` logs in like `[user@]host[:port]`;
+//! `--url LINK` is how Windows hands over an `ssh://` or `sftp://` link
+//! (Settings > Open links, see `url_handler`), and takes nothing else.
+//!
+//! Other options: `-p port`, `-l user`, `-N` (no shell: the forwards
+//! only, like `ssh -N`), `-L`, `-R` and `-D` forwards as `ssh` writes
+//! them, `--no-sandbox` (run the worker
 //! without the AppContainer, for hosts on localhost), and
 //! `--local [command]`, which opens a local shell through ConPTY as
 //! milestone 2 did. `--theme NAME`, before the rest, picks the pane's
@@ -192,6 +198,8 @@ mod ui_theme;
 #[cfg(windows)]
 mod update;
 #[cfg_attr(not(windows), allow(dead_code))]
+mod url_handler;
+#[cfg_attr(not(windows), allow(dead_code))]
 mod vault;
 #[cfg_attr(not(windows), allow(dead_code))]
 mod vdesk;
@@ -203,6 +211,8 @@ mod winrm;
 mod workspaces;
 #[cfg_attr(not(windows), allow(dead_code))]
 mod zmodem;
+
+use ferossh_config::forward::{ForwardKind, parse_config};
 
 /// What the command line asks for.
 #[cfg_attr(not(windows), allow(dead_code))]
@@ -218,6 +228,8 @@ enum Launch {
     Ssh {
         destination: Option<String>,
         sandbox: bool,
+        /// `-N` and forwards, for an SSH login.
+        extras: ssh::Extras,
     },
     /// A local shell (milestone 2's test host).
     Local(String),
@@ -249,7 +261,29 @@ fn take_theme(args: &[String]) -> (Option<String>, &[String]) {
 
 #[cfg_attr(not(windows), allow(dead_code))]
 fn parse_args(args: &[String]) -> Result<Launch, String> {
+    // A link Windows hands over (see `url_handler`): exactly one valid
+    // address, so a link that breaks out of its quotes to add options
+    // (`--no-sandbox`, `--local ...`) is refused rather than run.
+    if args.first().is_some_and(|a| a == "--url") {
+        return match args {
+            [_, link] if url_handler::valid_link(link) => Ok(Launch::Ssh {
+                destination: Some(link.trim().to_owned()),
+                sandbox: true,
+                extras: ssh::Extras::default(),
+            }),
+            [_, link] => Err(format!(
+                "FeroSSH opens ssh://[user@]host[:port] and sftp:// links; \
+                 this one is not valid: {}",
+                link.chars()
+                    .filter(|c| !c.is_control())
+                    .take(200)
+                    .collect::<String>()
+            )),
+            _ => Err("--url takes one link and nothing else.".into()),
+        };
+    }
     let mut iter = args.iter();
+    let mut extras = ssh::Extras::default();
     let mut destination: Option<String> = None;
     let mut port: Option<String> = None;
     let mut user: Option<String> = None;
@@ -294,13 +328,27 @@ fn parse_args(args: &[String]) -> Result<Launch, String> {
             }
             "-p" => port = Some(iter.next().ok_or("-p needs a port")?.clone()),
             "-l" => user = Some(iter.next().ok_or("-l needs a user name")?.clone()),
+            "-N" => extras.no_shell = true,
+            a if forward_flag(a).is_some() => {
+                let (kind, attached) = forward_flag(a).unwrap_or((ForwardKind::Local, ""));
+                let spec = if attached.is_empty() {
+                    iter.next()
+                        .ok_or_else(|| format!("{a} needs a forward"))?
+                        .as_str()
+                } else {
+                    attached
+                };
+                let forward = parse_config(kind, &[spec.to_owned()])
+                    .ok_or_else(|| format!("{a} {spec} is not a forward"))?;
+                extras.forwards.push(forward);
+            }
             a if a.starts_with('-') => return Err(format!("unknown option {a}")),
             a if destination.is_none() => destination = Some(a.to_owned()),
             a => return Err(format!("unexpected argument {a}")),
         }
     }
     if let Some(name) = workspace {
-        if destination.is_some() || port.is_some() || user.is_some() {
+        if destination.is_some() || port.is_some() || user.is_some() || !extras.is_empty() {
             return Err("--workspace opens its own connections: give no host".into());
         }
         return Ok(Launch::Workspace { name, sandbox });
@@ -317,15 +365,30 @@ fn parse_args(args: &[String]) -> Result<Launch, String> {
             }
             Some(d)
         }
-        None if port.is_some() || user.is_some() => {
-            return Err("-p and -l need a host".into());
+        None if port.is_some() || user.is_some() || !extras.is_empty() => {
+            return Err("-p, -l, -N, -L, -R and -D need a host".into());
         }
         None => None,
     };
     Ok(Launch::Ssh {
         destination,
         sandbox,
+        extras,
     })
+}
+
+/// `-L`, `-R` or `-D`, with the forward written straight after it
+/// (`-L8080:db:80`) or not.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn forward_flag(arg: &str) -> Option<(ForwardKind, &str)> {
+    let rest = arg.strip_prefix('-')?;
+    let kind = match rest.get(..1)? {
+        "L" => ForwardKind::Local,
+        "R" => ForwardKind::Remote,
+        "D" => ForwardKind::Dynamic,
+        _ => return None,
+    };
+    Some((kind, rest.get(1..)?))
 }
 
 #[cfg(windows)]
@@ -392,14 +455,16 @@ mod tests {
             parse(&[]),
             Ok(Launch::Ssh {
                 destination: None,
-                sandbox: true
+                sandbox: true,
+                extras: ssh::Extras::default(),
             })
         );
         assert_eq!(
             parse(&["-l", "root", "-p", "2222", "host", "--no-sandbox"]),
             Ok(Launch::Ssh {
                 destination: Some("root@host:2222".into()),
-                sandbox: false
+                sandbox: false,
+                extras: ssh::Extras::default(),
             })
         );
         assert_eq!(
@@ -427,6 +492,66 @@ mod tests {
         assert!(parse(&["-x"]).is_err());
         assert!(parse(&["a", "b"]).is_err());
         assert!(parse(&["-p", "22"]).is_err());
+    }
+
+    #[test]
+    fn tunnels_on_the_command_line() {
+        let Ok(Launch::Ssh {
+            destination,
+            extras,
+            ..
+        }) = parse(&[
+            "-N",
+            "-L",
+            "5432:db:5432",
+            "-D1080",
+            "-R",
+            "9000:localhost:3000",
+            "jump",
+        ])
+        else {
+            unreachable!("parses");
+        };
+        assert_eq!(destination.as_deref(), Some("jump"));
+        assert!(extras.no_shell);
+        let kinds: Vec<_> = extras.forwards.iter().map(|f| f.kind).collect();
+        assert_eq!(
+            kinds,
+            [
+                ForwardKind::Local,
+                ForwardKind::Dynamic,
+                ForwardKind::Remote
+            ]
+        );
+        assert!(parse(&["-L", "nonsense", "h"]).is_err());
+        assert!(parse(&["-L"]).is_err());
+        assert!(parse(&["-N"]).is_err());
+        assert!(parse(&["--workspace", "w", "-N"]).is_err());
+    }
+
+    #[test]
+    fn links_take_one_valid_address() {
+        assert_eq!(
+            parse(&["--url", "ssh://admin@web1.lan:2222/"]),
+            Ok(Launch::Ssh {
+                destination: Some("ssh://admin@web1.lan:2222/".into()),
+                sandbox: true,
+                extras: ssh::Extras::default(),
+            })
+        );
+        assert!(matches!(
+            parse(&["--url", "sftp://up@files.lan/in"]),
+            Ok(Launch::Ssh { sandbox: true, .. })
+        ));
+        // A link that broke out of its quotes, or is not an address.
+        assert!(parse(&["--url", "ssh://h", "--no-sandbox"]).is_err());
+        assert!(parse(&["--url", "ssh://h", "--local", "calc"]).is_err());
+        assert!(parse(&["--url", "--local"]).is_err());
+        assert!(parse(&["--url", "ssh://-oProxyCommand=calc"]).is_err());
+        assert!(parse(&["--url", "telnet://h"]).is_err());
+        assert!(parse(&["--url"]).is_err());
+        // Not first: an ordinary unknown option.
+        assert!(parse(&["h", "--url", "ssh://h"]).is_err());
     }
 
     #[test]

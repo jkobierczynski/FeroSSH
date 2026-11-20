@@ -89,6 +89,8 @@
 //! Profile uploads
 //!     Type sftp
 //!     RemoteFolder /incoming
+//! Profile db-tunnel
+//!     Type tunnel
 //! Secret enable
 //!     PasswordCommand op read "op://Network/%n/password"
 //! ```
@@ -298,6 +300,9 @@ pub enum SessionKind {
     /// File transfer opens on the host, for SFTP-only accounts
     /// (`ForceCommand internal-sftp`).
     Sftp,
+    /// Port forwards only, like `ssh -N`: SSH logs in without asking for
+    /// a shell and the tab holds the connection's forwards open.
+    Tunnel,
 }
 
 /// How big a desktop is: as big as its pane, following it as it changes
@@ -392,6 +397,7 @@ impl SessionKind {
             SessionKind::Mosh => "mosh",
             SessionKind::WinRm => "winrm",
             SessionKind::Sftp => "sftp",
+            SessionKind::Tunnel => "tunnel",
         }
     }
 
@@ -407,6 +413,7 @@ impl SessionKind {
             "mosh" => Some(SessionKind::Mosh),
             "winrm" | "wsman" => Some(SessionKind::WinRm),
             "sftp" => Some(SessionKind::Sftp),
+            "tunnel" | "tunnels" | "forwards" => Some(SessionKind::Tunnel),
             _ => None,
         }
     }

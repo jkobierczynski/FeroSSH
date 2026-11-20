@@ -46,6 +46,8 @@ pub enum Kind {
     Mosh,
     /// An SFTP-only login: file transfer, no shell.
     Sftp,
+    /// A tunnel-only login (`ssh -N`): forwards, no shell.
+    Tunnel,
     Telnet,
     WinRm,
     Serial,
@@ -60,6 +62,7 @@ impl Kind {
             Kind::Ssh => "SSH",
             Kind::Mosh => "Mosh",
             Kind::Sftp => "SFTP",
+            Kind::Tunnel => "tunnels",
             Kind::Telnet => "Telnet",
             Kind::WinRm => "WinRM",
             Kind::Serial => "serial",

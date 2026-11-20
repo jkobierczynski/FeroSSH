@@ -51,6 +51,8 @@ Coming from PuTTY, KiTTY, WinSCP or another client? File > Import and export > I
 | `ferossh.exe` | Asks for a host. |
 | `ferossh.exe [user@]host[:port]` | Connects to a host. |
 | `ferossh.exe -l user -p port host` | The same, OpenSSH style. |
+| `ferossh.exe ssh://[user@]host[:port]` | Connects to a host written as a link. |
+| `ferossh.exe -N -L 5432:db:5432 host` | Logs in for the port forwards only, with no shell, like `ssh -N`. `-L`, `-R` and `-D` add forwards as `ssh` writes them (`-L8080:web:80` works too), with or without `-N`. See [Tunnel-only connections](everyday-use.md#tunnel-only-connections). |
 | `ferossh.exe COM3:115200` | Opens a serial console, optionally with speed, framing and flow control (`COM3:9600,7E1,xonxoff`). |
 | `ferossh.exe sftp://user@host[:port][/folder]` | Opens File transfer on the host without a shell, for SFTP-only accounts. |
 | `ferossh.exe telnet://host[:port]` | Opens a Telnet session (unencrypted; port 23 unless given). |
@@ -60,6 +62,8 @@ Coming from PuTTY, KiTTY, WinSCP or another client? File > Import and export > I
 | `ferossh.exe --workspace NAME` | Opens a saved workspace: its tabs and split panes, each on its connection (see [Workspaces](everyday-use.md#workspaces)). A path to a `.workspace` file works too. |
 | `ferossh.exe --local [command]` | Opens a local shell or command instead of SSH, for example `--local wsl -d Ubuntu`. |
 | `ferossh.exe --check-sandbox` | Reports what the sandbox can do on this PC. Pipe it through `more` to read it all. |
+
+To open `ssh://` and `sftp://` links on web pages, in wikis or in inventories with FeroSSH, turn on Settings > Open links (see [Opening ssh:// links](everyday-use.md#opening-ssh-links)).
 | `ferossh.exe --new-security-key [--hello] [--ed25519] FILE` | Makes a new FIDO2 key file, like `ssh-keygen -t ecdsa-sk`. `--hello` uses Windows Hello, so no hardware key is needed. |
 
 ## The first shortcuts to learn

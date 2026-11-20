@@ -32,7 +32,7 @@ use ferossh_auth::{
     AgentChoice, Identity, Job, KeyChoice, KeyFileSpec, Reply, SignError, Source, userauth,
 };
 use ferossh_config::known_hosts::{self, KnownHosts, Status};
-use ferossh_config::ssh_config::{AddressFamily, RequestTty, StrictHostKeyChecking};
+use ferossh_config::ssh_config::{AddressFamily, RequestTty, SessionType, StrictHostKeyChecking};
 use ferossh_config::{ForwardSpec, ProxyKind, ProxyServer, hostkey, ssh_config};
 use ferossh_ipc::{
     ChannelId, Family, GssReply, MAX_DATA_CHUNK, Message, MoshOptions, PromptField, PromptKind,
@@ -128,6 +128,35 @@ pub struct Target {
     /// Where File transfer starts on an SFTP-only login typed as an
     /// `sftp://` address with a path.
     pub sftp_folder: Option<String>,
+    /// Port forwards only, like `ssh -N` (`SessionType none`, the
+    /// connection type *SSH tunnels only*, or `-N` on the command line):
+    /// log in without asking for a shell. Never shares a connection, so
+    /// its forwards stay up whatever the shells do.
+    pub tunnel_only: bool,
+}
+
+/// What the command line adds to an SSH login: `-N` (no shell, the
+/// forwards only) and `-L`, `-R`, `-D` forwards.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Extras {
+    pub no_shell: bool,
+    pub forwards: Vec<ForwardSpec>,
+}
+
+impl Extras {
+    pub fn is_empty(&self) -> bool {
+        !self.no_shell && self.forwards.is_empty()
+    }
+
+    /// Adds these to `target`, after its config's.
+    pub fn apply(&self, target: &mut Target) {
+        target.tunnel_only |= self.no_shell;
+        for f in &self.forwards {
+            if !target.forwards.contains(f) {
+                target.forwards.push(f.clone());
+            }
+        }
+    }
 }
 
 /// A `ProxyCommand` to run: never through a shell.
@@ -329,6 +358,7 @@ impl Target {
             mosh: None,
             sftp_only: false,
             sftp_folder: None,
+            tunnel_only: cfg.session_type == Some(SessionType::None),
             family: match cfg.address_family {
                 Some(AddressFamily::Inet) => Family::V4,
                 Some(AddressFamily::Inet6) => Family::V6,
@@ -387,6 +417,13 @@ impl Target {
             && self.mosh.is_none()
             && other.mosh.is_none()
             && self.sftp_only == other.sftp_only
+            && self.tunnel_only == other.tunnel_only
+    }
+
+    /// Whether the login asks for no shell: file transfer or forwards
+    /// only.
+    pub fn no_shell(&self) -> bool {
+        self.sftp_only || self.tunnel_only
     }
 
     /// The way there, for the log and for telling routes apart: the
@@ -1114,7 +1151,7 @@ impl SshSession {
             legacy: self.legacy,
             timing: t.timing,
             tunnel: self.tunnel,
-            shell: !self.jump && !t.sftp_only,
+            shell: !self.jump && !t.no_shell(),
             options: if self.jump {
                 ShellOptions::default()
             } else {
@@ -1336,16 +1373,17 @@ impl SshSession {
             // A Mosh session is its connection's only shell.
             && self.target.mosh.is_none()
             && target.mosh.is_none()
-            // No shell opens on an SFTP-only login, and an SFTP-only tab
-            // logs in on its own so a shell's end does not take it along.
-            && !self.target.sftp_only
-            && !target.sftp_only
+            // No shell opens on an SFTP-only or tunnel-only login, and
+            // such a tab logs in on its own so a shell's end does not take
+            // it along.
+            && !self.target.no_shell()
+            && !target.no_shell()
     }
 
     /// Typed or pasted bytes for the host, once connected.
     pub fn input(&self, bytes: &[u8]) -> Vec<Effect> {
-        // An SFTP-only login has no shell to type into.
-        if self.state != State::Connected || self.target.sftp_only {
+        // An SFTP-only or tunnel-only login has no shell to type into.
+        if self.state != State::Connected || self.target.no_shell() {
             return Vec::new();
         }
         bytes
@@ -2465,6 +2503,36 @@ mod tests {
             channel: s.channel,
             reason: reason.into(),
         })
+    }
+
+    #[test]
+    fn a_tunnel_only_login_asks_for_no_shell() {
+        let dir = temp("tunnel-only");
+        let mut e = env(&dir);
+        e.config = "Host db\n  HostName db.lan\n  SessionType none\n  \
+                    LocalForward 5432 localhost:5432\n"
+            .into();
+        let t = Target::resolve("db", &e).unwrap();
+        assert!(t.tunnel_only && t.no_shell() && !t.sftp_only);
+        assert_eq!(t.forwards.len(), 1);
+        let mut plain = Target::resolve("db.lan", &e).unwrap();
+        assert!(!plain.tunnel_only);
+        plain.alias = t.alias.clone();
+        let shell = SshSession::new(2, plain, e.known_hosts());
+        let mut s = SshSession::new(1, t, e.known_hosts());
+        s.auto_reconnect = true;
+        let fx = s.start(80, 24);
+        assert!(
+            matches!(&sent(&fx)[..], [Message::Connect { shell: false, .. }]),
+            "{fx:?}"
+        );
+        assert!(!shell.can_share(&s.target));
+        assert!(!s.can_share(&shell.target));
+        assert!(!s.target.same_login(&shell.target));
+        connected(&mut s);
+        assert!(s.input(b"ls\r").is_empty(), "no shell to type into");
+        s.on_worker(Message::Lost { channel: 1 });
+        assert!(reconnects(&gone(&mut s, "The connection was lost.")));
     }
 
     #[test]

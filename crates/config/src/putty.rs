@@ -6,7 +6,8 @@
 //! session in a `Sessions` folder, with `Key\Value\` lines. Names are
 //! `%XX`-escaped. The window reads the values; this module makes them
 //! [`Session`]s. SSH and Telnet sessions are imported; serial and raw
-//! ones are not. Passwords (KiTTY can store one) are never read, only
+//! ones are not; an SSH session that starts no shell (`SshNoShell`)
+//! comes over as tunnels only. Passwords (KiTTY can store one) are never read, only
 //! noticed. A SOCKS 5 or HTTP proxy comes over without its password.
 
 use crate::forward::{ForwardKind, parse_config};
@@ -17,7 +18,7 @@ use crate::ssh_config::parse_destination;
 
 /// The values FeroSSH reads from each session. `Password` is only
 /// checked for being there.
-pub const VALUES: [&str; 14] = [
+pub const VALUES: [&str; 15] = [
     "Protocol",
     "HostName",
     "PortNumber",
@@ -32,6 +33,7 @@ pub const VALUES: [&str; 14] = [
     "ProxyHost",
     "ProxyPort",
     "ProxyUsername",
+    "SshNoShell",
 ];
 
 /// PuTTY's forwards: `L8080=db:5432,R2222=localhost:22,D1080`, each
@@ -97,8 +99,14 @@ pub fn session(raw_name: &str, get: impl Fn(&str) -> Option<Value>) -> Option<Se
     if s.host.alias.is_empty() {
         return None;
     }
-    s.kind = kind;
     s.host.port = port(kind, number("PortNumber"));
+    // Connection > SSH > "Don't start a shell or command at all": a
+    // tunnel-only session.
+    s.kind = if kind == SessionKind::Ssh && number("SshNoShell").is_some_and(|n| n != 0) {
+        SessionKind::Tunnel
+    } else {
+        kind
+    };
     s.font = text("Font");
     s.font_size = number("FontHeight")
         .map(|h| h as f32)
@@ -216,6 +224,27 @@ mod tests {
     }
 
     #[test]
+    fn sessions_without_a_shell_are_tunnels() {
+        let v = [
+            ("HostName", Value::Text("db.example.org".into())),
+            ("SshNoShell", Value::Number(1)),
+            (
+                "PortForwardings",
+                Value::Text("L5432=localhost:5432".into()),
+            ),
+        ];
+        let s = session("db", values(&v)).unwrap();
+        assert_eq!(s.kind, SessionKind::Tunnel);
+        assert_eq!(s.host.forwards.len(), 1);
+        let v = [
+            ("Protocol", Value::Text("telnet".into())),
+            ("HostName", Value::Text("switch".into())),
+            ("SshNoShell", Value::Number(1)),
+        ];
+        assert_eq!(session("sw", values(&v)).unwrap().kind, SessionKind::Telnet);
+    }
+
+    #[test]
     fn imports_ssh_sessions() {
         let v = [
             ("Protocol", Value::Text("ssh".into())),
@@ -233,6 +262,7 @@ mod tests {
             ),
         ];
         let s = session("Prod%20DB%20(main)", values(&v)).unwrap();
+        assert_eq!(s.kind, SessionKind::Ssh);
         assert_eq!(s.host.alias, "Prod-DB-main");
         assert_eq!(s.host.user.as_deref(), Some("admin"));
         assert_eq!(s.host.port, Some(2222));
