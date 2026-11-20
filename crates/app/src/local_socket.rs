@@ -106,13 +106,14 @@ pub fn bind(path: &str) -> io::Result<Socket> {
 }
 
 /// What tells one file from another at the same path on Unix: device,
-/// inode and change time (an inode freed by a delete can be reused at
-/// once, but not with the same change time to the nanosecond).
+/// inode and birth time where the file system keeps one (an inode freed
+/// by a delete can be reused at once, but not with the same birth time).
+/// Not the change time: a chmod of the socket changes that.
 #[cfg(unix)]
-fn file_id(path: &str) -> Option<(u64, u64, i64, i64)> {
+fn file_id(path: &str) -> Option<(u64, u64, Option<std::time::SystemTime>)> {
     use std::os::unix::fs::MetadataExt;
     let meta = std::fs::symlink_metadata(path).ok()?;
-    Some((meta.dev(), meta.ino(), meta.ctime(), meta.ctime_nsec()))
+    Some((meta.dev(), meta.ino(), meta.created().ok()))
 }
 
 /// The socket file itself (a reparse point), held open with only the
@@ -140,19 +141,41 @@ fn delete_by_handle(file: &std::fs::File) {
     use std::os::windows::io::AsRawHandle;
     use windows::Win32::Foundation::HANDLE;
     use windows::Win32::Storage::FileSystem::{
-        FILE_DISPOSITION_INFO, FileDispositionInfo, SetFileInformationByHandle,
+        FILE_DISPOSITION_FLAG_DELETE, FILE_DISPOSITION_FLAG_POSIX_SEMANTICS, FILE_DISPOSITION_INFO,
+        FILE_DISPOSITION_INFO_EX, FILE_DISPOSITION_INFO_EX_FLAGS, FileDispositionInfo,
+        FileDispositionInfoEx, SetFileInformationByHandle,
     };
-    let info = FILE_DISPOSITION_INFO { DeleteFile: true };
-    // SAFETY: a handle the File owns for the call, and our own struct
-    // with its exact size.
-    let _ = unsafe {
+    let handle = HANDLE(file.as_raw_handle());
+    // POSIX semantics free the name at once, even while someone else
+    // still has the file open, so the path can be bound again.
+    let posix = FILE_DISPOSITION_INFO_EX {
+        Flags: FILE_DISPOSITION_INFO_EX_FLAGS(
+            FILE_DISPOSITION_FLAG_DELETE.0 | FILE_DISPOSITION_FLAG_POSIX_SEMANTICS.0,
+        ),
+    };
+    // SAFETY: a handle the File owns for the call, and our own structs
+    // with their exact sizes.
+    let done = unsafe {
         SetFileInformationByHandle(
-            HANDLE(file.as_raw_handle()),
-            FileDispositionInfo,
-            std::ptr::from_ref(&info).cast(),
-            std::mem::size_of::<FILE_DISPOSITION_INFO>() as u32,
+            handle,
+            FileDispositionInfoEx,
+            std::ptr::from_ref(&posix).cast(),
+            std::mem::size_of::<FILE_DISPOSITION_INFO_EX>() as u32,
         )
     };
+    if done.is_err() {
+        // Older Windows or a file system without POSIX deletes.
+        let info = FILE_DISPOSITION_INFO { DeleteFile: true };
+        // SAFETY: as above.
+        let _ = unsafe {
+            SetFileInformationByHandle(
+                handle,
+                FileDispositionInfo,
+                std::ptr::from_ref(&info).cast(),
+                std::mem::size_of::<FILE_DISPOSITION_INFO>() as u32,
+            )
+        };
+    }
 }
 
 /// Removes the socket file of a listener when dropped, as the listener's
@@ -161,13 +184,13 @@ fn delete_by_handle(file: &std::fs::File) {
 ///
 /// On Windows it keeps a handle to the file it made and deletes through
 /// that handle, so a replacement at the path is never touched. Unix has
-/// no handle to a socket file, so it compares device, inode and change
+/// no handle to a socket file, so it compares device, inode and birth
 /// time just before removing.
 pub struct Unlink {
     #[cfg(unix)]
     path: String,
     #[cfg(unix)]
-    id: Option<(u64, u64, i64, i64)>,
+    id: Option<(u64, u64, Option<std::time::SystemTime>)>,
     #[cfg(windows)]
     file: Option<std::fs::File>,
 }
@@ -392,6 +415,9 @@ mod identity_tests {
         );
     }
 
+    /// Unix only: on Windows the guard's handle keeps the deleted name
+    /// until the guard goes, so nothing can be bound there before it.
+    #[cfg(unix)]
     #[test]
     fn a_socket_bound_after_a_delete_is_left_alone() {
         let dir = std::env::temp_dir().join(format!("ferossh-sock-{}-rebound", std::process::id()));
@@ -403,12 +429,33 @@ mod identity_tests {
         assert!(unlink.armed(), "no hold on the bound socket");
         drop(first);
         std::fs::remove_file(&path).unwrap();
-        // Change times come from a coarse clock: let it tick.
+        // Birth times come from a coarse clock: let it tick.
         std::thread::sleep(std::time::Duration::from_millis(20));
         let second = bind(&path).unwrap();
         drop(unlink);
         assert!(is_socket_file(&path), "the replacement was removed");
         drop(second);
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn its_own_socket_is_removed_after_a_chmod() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("ferossh-sock-{}-chmod", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("s.sock").to_string_lossy().into_owned();
+        let _ = std::fs::remove_file(&path);
+        let listener = bind(&path).unwrap();
+        let unlink = Unlink::new(path.clone());
+        assert!(unlink.armed(), "no hold on the bound socket");
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        drop(listener);
+        drop(unlink);
+        assert!(
+            !std::path::Path::new(&path).exists(),
+            "the socket file was left behind"
+        );
     }
 }
