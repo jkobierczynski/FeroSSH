@@ -153,70 +153,82 @@ pub fn create(main: HWND, handler: Handler, dpi: u32) -> windows::core::Result<(
             Some(instance.into()),
             None,
         )?;
-        let child = |class: PCWSTR, text: PCWSTR, style: u32, id: usize| {
-            CreateWindowExW(
-                WINDOW_EX_STYLE::default(),
-                class,
-                text,
-                WS_CHILD | WS_VISIBLE | WS_TABSTOP | WINDOW_STYLE(style),
-                0,
-                0,
-                0,
-                0,
-                Some(panel),
-                Some(HMENU(id as *mut _)),
-                Some(instance.into()),
-                None,
-            )
-        };
-        let search = child(
-            WC_EDITW,
-            w!(""),
-            WS_BORDER.0 | ES_AUTOHSCROLL as u32,
-            ID_SEARCH,
-        )?;
-        SendMessageW(search, EM_LIMITTEXT, Some(WPARAM(200)), None);
-        let cue = wide("Search: words, tag:prod, folder:db, -tag:legacy, an OS or a fingerprint");
-        SendMessageW(
-            search,
-            EM_SETCUEBANNER,
-            Some(WPARAM(1)),
-            Some(LPARAM(cue.as_ptr() as isize)),
-        );
-        let list = child(
-            WC_LISTVIEWW,
-            w!(""),
-            LVS_REPORT | LVS_SINGLESEL | LVS_SHOWSELALWAYS,
-            ID_LIST,
-        )?;
-        let _ = SetWindowTheme(list, w!("Explorer"), PCWSTR::null());
-        let ex = LVS_EX_FULLROWSELECT | LVS_EX_DOUBLEBUFFER | LVS_EX_LABELTIP;
-        SendMessageW(
-            list,
-            LVM_SETEXTENDEDLISTVIEWSTYLE,
-            Some(WPARAM(ex as usize)),
-            Some(LPARAM(ex as isize)),
-        );
-        for (i, c) in Column::ALL.iter().enumerate() {
-            let mut text = wide(c.title());
-            let col = LVCOLUMNW {
-                mask: LVCF_TEXT | LVCF_WIDTH,
-                cx: scale(c.width(), dpi),
-                pszText: PWSTR(text.as_mut_ptr()),
-                ..Default::default()
+        // A control that cannot be made takes the panel down with it.
+        let made = (|| -> windows::core::Result<(HWND, HWND, [HWND; 3])> {
+            let child = |class: PCWSTR, text: PCWSTR, style: u32, id: usize| {
+                CreateWindowExW(
+                    WINDOW_EX_STYLE::default(),
+                    class,
+                    text,
+                    WS_CHILD | WS_VISIBLE | WS_TABSTOP | WINDOW_STYLE(style),
+                    0,
+                    0,
+                    0,
+                    0,
+                    Some(panel),
+                    Some(HMENU(id as *mut _)),
+                    Some(instance.into()),
+                    None,
+                )
             };
+            let search = child(
+                WC_EDITW,
+                w!(""),
+                WS_BORDER.0 | ES_AUTOHSCROLL as u32,
+                ID_SEARCH,
+            )?;
+            SendMessageW(search, EM_LIMITTEXT, Some(WPARAM(200)), None);
+            let cue =
+                wide("Search: words, tag:prod, folder:db, -tag:legacy, an OS or a fingerprint");
+            SendMessageW(
+                search,
+                EM_SETCUEBANNER,
+                Some(WPARAM(1)),
+                Some(LPARAM(cue.as_ptr() as isize)),
+            );
+            let list = child(
+                WC_LISTVIEWW,
+                w!(""),
+                LVS_REPORT | LVS_SINGLESEL | LVS_SHOWSELALWAYS,
+                ID_LIST,
+            )?;
+            let _ = SetWindowTheme(list, w!("Explorer"), PCWSTR::null());
+            let ex = LVS_EX_FULLROWSELECT | LVS_EX_DOUBLEBUFFER | LVS_EX_LABELTIP;
             SendMessageW(
                 list,
-                LVM_INSERTCOLUMNW,
-                Some(WPARAM(i)),
-                Some(LPARAM(&raw const col as isize)),
+                LVM_SETEXTENDEDLISTVIEWSTYLE,
+                Some(WPARAM(ex as usize)),
+                Some(LPARAM(ex as isize)),
             );
-        }
-        let buttons = [
-            child(WC_BUTTONW, w!("Connect"), BS_PUSHBUTTON as u32, ID_CONNECT)?,
-            child(WC_BUTTONW, w!("Save CSV"), BS_PUSHBUTTON as u32, ID_CSV)?,
-            child(WC_BUTTONW, w!("Reload"), BS_PUSHBUTTON as u32, ID_RELOAD)?,
-        ];
+            for (i, c) in Column::ALL.iter().enumerate() {
+                let mut text = wide(c.title());
+                let col = LVCOLUMNW {
+                    mask: LVCF_TEXT | LVCF_WIDTH,
+                    cx: scale(c.width(), dpi),
+                    pszText: PWSTR(text.as_mut_ptr()),
+                    ..Default::default()
+                };
+                SendMessageW(
+                    list,
+                    LVM_INSERTCOLUMNW,
+                    Some(WPARAM(i)),
+                    Some(LPARAM(&raw const col as isize)),
+                );
+            }
+            let buttons = [
+                child(WC_BUTTONW, w!("Connect"), BS_PUSHBUTTON as u32, ID_CONNECT)?,
+                child(WC_BUTTONW, w!("Save CSV"), BS_PUSHBUTTON as u32, ID_CSV)?,
+                child(WC_BUTTONW, w!("Reload"), BS_PUSHBUTTON as u32, ID_RELOAD)?,
+            ];
+            Ok((search, list, buttons))
+        })();
+        let (search, list, buttons) = match made {
+            Ok(made) => made,
+            Err(e) => {
+                let _ = windows::Win32::UI::WindowsAndMessaging::DestroyWindow(panel);
+                return Err(e);
+            }
+        };
         let (font, title_font) = fonts(dpi);
         for c in [search, list].iter().chain(&buttons) {
             set_font(*c, font);
@@ -310,7 +322,8 @@ pub fn place(at: Option<Rect>, width: i32, dpi: u32) {
     let mut spots = Vec::with_capacity(BUTTONS.len());
     let (mut x, mut row) = (pad, 0);
     for w in BUTTONS {
-        let w = scale(w, dpi);
+        // Never wider than the tool: a very narrow one squeezes them.
+        let w = scale(w, dpi).min(inner.max(1));
         if x > pad && x + w > pad + inner {
             row += 1;
             x = pad;

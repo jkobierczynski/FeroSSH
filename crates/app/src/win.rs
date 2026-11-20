@@ -1466,6 +1466,9 @@ struct Window {
     /// their logins are kept under the name it has now. A pane opened
     /// after the rename keeps its own name.
     inventory_renames: HashMap<PaneId, String>,
+    /// Renames and deletes the inventory file could not take yet: done
+    /// first at its next change, so it follows the connections in the end.
+    inventory_pending: Vec<InventoryFix>,
     /// Show what changed: each running git's channel, and its tab.
     diffs: HashMap<ChannelId, PaneId>,
     /// The server status bar's samples, by their channel: one per
@@ -2792,6 +2795,7 @@ fn create_and_run(launch: Launch, theme: Option<String>) -> Result<()> {
                 key_copies: HashMap::new(),
                 system_reads: HashMap::new(),
                 inventory_renames: HashMap::new(),
+                inventory_pending: Vec::new(),
                 diffs: HashMap::new(),
                 stats: HashMap::new(),
                 winrm_closing: HashMap::new(),
@@ -5674,14 +5678,10 @@ impl Window {
         {
             return;
         }
-        if let Err(e) = crate::inventory_view::update(|inv| {
+        self.update_inventory(None, |inv| {
             let key = key.as_ref().map(|(k, f)| (k.as_str(), f.as_str()));
             inv.connected(&alias, crate::inventory_view::now(), key);
-        }) {
-            self.queued.push(Command::Notice(format!(
-                "Could not update the inventory: {e}"
-            )));
-        }
+        });
         if !self.settings.profile(&alias).is_some_and(|p| p.system_info) {
             return;
         }
@@ -5711,6 +5711,32 @@ impl Window {
         );
     }
 
+    /// Changes the inventory file with `fix` (a rename or delete that must
+    /// reach it in the end) and `change`, after what earlier failed writes
+    /// left to do. When the file cannot be written, the fixes wait for the
+    /// next change and the user is told; `change` (a login's time) is
+    /// dropped.
+    fn update_inventory(
+        &mut self,
+        fix: Option<InventoryFix>,
+        change: impl FnOnce(&mut ferossh_config::inventory::Inventory),
+    ) {
+        let mut fixes = std::mem::take(&mut self.inventory_pending);
+        fixes.extend(fix);
+        let result = crate::inventory_view::update(|inv| {
+            for f in &fixes {
+                f.apply(inv);
+            }
+            change(inv);
+        });
+        if let Err(e) = result {
+            self.inventory_pending = fixes;
+            self.queued.push(Command::Notice(format!(
+                "Could not update the inventory: {e}"
+            )));
+        }
+    }
+
     /// Connection `old` is called `new` now: its inventory row, and a read
     /// of its OS still under way, follow.
     fn inventory_renamed(&mut self, old: &str, new: &str) {
@@ -5734,11 +5760,10 @@ impl Window {
                 r.alias = new.to_owned();
             }
         }
-        if let Err(e) = crate::inventory_view::update(|inv| inv.rename(old, new)) {
-            self.queued.push(Command::Notice(format!(
-                "Could not update the inventory: {e}"
-            )));
-        }
+        self.update_inventory(
+            Some(InventoryFix::Rename(old.to_owned(), new.to_owned())),
+            |_| {},
+        );
     }
 
     /// What the inventory's system command printed, or that it ended.
@@ -5760,13 +5785,9 @@ impl Window {
                 let Some(info) = parse_system(&r.out) else {
                     return;
                 };
-                if let Err(e) = crate::inventory_view::update(|inv| {
+                self.update_inventory(None, |inv| {
                     inv.system(&r.alias, crate::inventory_view::now(), &info);
-                }) {
-                    self.queued.push(Command::Notice(format!(
-                        "Could not update the inventory: {e}"
-                    )));
-                }
+                });
             }
             _ => {}
         }
@@ -15509,15 +15530,7 @@ impl Window {
         // A read still under way for one of them keeps nothing.
         self.system_reads
             .retain(|_, r| !names.iter().any(|n| n.eq_ignore_ascii_case(&r.alias)));
-        if let Err(e) = crate::inventory_view::update(|inv| {
-            for name in names {
-                inv.remove(name);
-            }
-        }) {
-            self.queued.push(Command::Notice(format!(
-                "Could not update the inventory: {e}"
-            )));
-        }
+        self.update_inventory(Some(InventoryFix::Remove(names.to_vec())), |_| {});
         self.save_settings();
         self.side.form = None;
         self.reload_sessions(None);
@@ -23099,6 +23112,27 @@ fn inventory_window(hwnd: HWND) {
     });
     inventory_panel::set_search(&query);
     inventory_panel::focus_search();
+}
+
+/// A change the inventory file must get even when writing it fails at
+/// first: see [`Window::update_inventory`].
+#[derive(Debug, Clone)]
+enum InventoryFix {
+    Rename(String, String),
+    Remove(Vec<String>),
+}
+
+impl InventoryFix {
+    fn apply(&self, inv: &mut ferossh_config::inventory::Inventory) {
+        match self {
+            InventoryFix::Rename(old, new) => inv.rename(old, new),
+            InventoryFix::Remove(names) => {
+                for name in names {
+                    inv.remove(name);
+                }
+            }
+        }
+    }
 }
 
 /// Carries out what the user did in the inventory.
