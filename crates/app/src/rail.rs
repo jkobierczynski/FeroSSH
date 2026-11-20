@@ -62,10 +62,10 @@ struct State {
     pressed: Option<RailItem>,
     tracking: bool,
     /// The command each button sends, in `RailItem::ALL` order.
-    commands: [u32; 8],
+    commands: [u32; RailItem::ALL.len()],
     /// The shortcut of each button's command, as its tooltip says it
     /// (Settings > Key bindings); empty for none.
-    keys: [String; 8],
+    keys: [String; RailItem::ALL.len()],
 }
 
 thread_local! {
@@ -77,7 +77,11 @@ thread_local! {
 
 /// Creates the rail, hidden, as a child of `parent`. `commands` are the
 /// `WM_COMMAND` ids its buttons send, in `RailItem::ALL` order.
-pub fn create(parent: HWND, commands: [u32; 8], look: Look) -> windows::core::Result<HWND> {
+pub fn create(
+    parent: HWND,
+    commands: [u32; RailItem::ALL.len()],
+    look: Look,
+) -> windows::core::Result<HWND> {
     // SAFETY: registering a class and creating windows with valid,
     // static strings; the handles stay owned by `parent`.
     unsafe {
@@ -254,7 +258,7 @@ fn update_tips(hwnd: HWND, tooltip: HWND, w: i32, h: i32, pinned: bool) {
 }
 
 /// The buttons' shortcuts, in `RailItem::ALL` order, for their tooltips.
-pub fn set_keys(keys: [String; 8]) {
+pub fn set_keys(keys: [String; RailItem::ALL.len()]) {
     let changed = RAIL.with(|r| {
         let mut r = r.try_borrow_mut().ok()?;
         let s = r.as_mut()?;

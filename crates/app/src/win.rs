@@ -139,6 +139,7 @@ use crate::highlight;
 use crate::import_panel;
 use crate::import_reg;
 use crate::import_view::{Found, ImportAction, ImportView, Items};
+use crate::inventory_panel;
 use crate::keymap::{self, KeyDefault, Keymap};
 use crate::known_hosts_panel;
 use crate::known_hosts_view::{self, KnownHostsView};
@@ -415,6 +416,7 @@ const KEY_DEFAULTS: &[KeyDefault] = {
         d(cmd::FILES, Always, &["Ctrl+Shift+E"]),
         d(cmd::FORWARDS, Always, &["Ctrl+Shift+P"]),
         d(cmd::KNOWN_HOSTS, Always, &["Ctrl+Shift+K"]),
+        d(cmd::INVENTORY, Always, &["Ctrl+Shift+I"]),
         d(cmd::SNIPPETS, Always, &["Ctrl+Shift+Space"]),
         d(cmd::PALETTE, Always, &["Ctrl+Shift+A"]),
         d(
@@ -536,6 +538,8 @@ mod cmd {
     pub const FULL_SCREEN_KEY: u32 = 219;
     /// Tools > Known hosts.
     pub const KNOWN_HOSTS: u32 = 220;
+    /// Tools > Inventory.
+    pub const INVENTORY: u32 = 222;
     /// Settings > Font ligatures.
     pub const FONT_LIGATURES: u32 = 221;
     /// Settings > Server status bar.
@@ -1247,6 +1251,8 @@ enum SideView {
     Live,
     /// The known hosts manager (native controls only).
     KnownHosts,
+    /// The connection inventory (native controls only).
+    Inventory,
     /// The command palette, shown over whatever the side pane showed.
     Palette,
 }
@@ -2840,6 +2846,7 @@ fn create_and_run(launch: Launch, theme: Option<String>) -> Result<()> {
                 RailItem::Forwards => cmd::FORWARDS,
                 RailItem::Snippets => cmd::SNIPPETS,
                 RailItem::KnownHosts => cmd::KNOWN_HOSTS,
+                RailItem::Inventory => cmd::INVENTORY,
                 RailItem::Palette => cmd::PALETTE,
                 RailItem::Pin => cmd::TOOLS_PIN,
             });
@@ -2862,6 +2869,8 @@ fn create_and_run(launch: Launch, theme: Option<String>) -> Result<()> {
         let _ = fwd_panel::create(hwnd, fwd_event, dpi);
         // The known hosts manager's, likewise.
         let _ = known_hosts_panel::create(hwnd, known_hosts_event, dpi);
+        // The inventory's, likewise.
+        let _ = inventory_panel::create(hwnd, inventory_event, dpi);
         // The scripts pane's, likewise.
         let _ = scripts_panel::create(hwnd, scripts_event, dpi);
         // The script editor's, likewise.
@@ -2967,6 +2976,7 @@ fn create_and_run(launch: Launch, theme: Option<String>) -> Result<()> {
                 || files_panel::pre_translate(&msg)
                 || fwd_panel::pre_translate(&msg)
                 || known_hosts_panel::pre_translate(&msg)
+                || inventory_panel::pre_translate(&msg)
                 || scripts_panel::pre_translate(&msg)
                 || script_editor::pre_translate(&msg)
                 || script_args::pre_translate(&msg)
@@ -3328,6 +3338,7 @@ fn build_menu() -> Result<HMENU> {
         item(tools, cmd::FORWARDS, "&Port forwards\tCtrl+Shift+P")?;
         item(tools, cmd::SNIPPETS, "Sc&ripts\tCtrl+Shift+Space")?;
         item(tools, cmd::KNOWN_HOSTS, "Known &hosts\tCtrl+Shift+K")?;
+        item(tools, cmd::INVENTORY, "&Inventory\tCtrl+Shift+I")?;
         item(tools, cmd::SNIPPET_FOLDER, "Open scripts f&older")?;
         separator(tools)?;
         item(tools, cmd::NEW_KEY, "New SSH &key...")?;
@@ -12085,6 +12096,7 @@ impl Window {
             SideView::Forwards => RailItem::Forwards,
             SideView::Snippets => RailItem::Snippets,
             SideView::KnownHosts => RailItem::KnownHosts,
+            SideView::Inventory => RailItem::Inventory,
             SideView::Palette => RailItem::Palette,
         });
         rail::Look {
@@ -12130,6 +12142,20 @@ impl Window {
     /// Whether the known hosts manager shows (always native controls).
     fn known_hosts_native(&self) -> bool {
         self.side.visible && self.side.view == SideView::KnownHosts
+    }
+
+    /// Reads the inventory and the connections again for Tools >
+    /// Inventory, and shows them.
+    fn reload_inventory(&mut self) {
+        let items = host_items(&ssh_env(), &self.settings);
+        let inventory = crate::inventory_view::load();
+        let rows = crate::inventory_view::rows(&items, &inventory, &self.settings);
+        inventory_panel::set_rows(rows, self.download_dir());
+    }
+
+    /// Whether the inventory shows (always native controls).
+    fn inventory_native(&self) -> bool {
+        self.side.visible && self.side.view == SideView::Inventory
     }
 
     /// Whether port forwards show as native controls.
@@ -12232,6 +12258,8 @@ impl Window {
             fwd_panel::has_focus()
         } else if self.known_hosts_native() {
             known_hosts_panel::has_focus()
+        } else if self.inventory_native() {
+            inventory_panel::has_focus()
         } else if self.scripts_native() {
             scripts_panel::has_focus()
         } else if self.script_editor_native() {
@@ -12308,6 +12336,11 @@ impl Window {
             known_hosts_panel::place(self.areas.side, self.areas.side_width, self.dpi);
         } else {
             known_hosts_panel::place(None, 0, self.dpi);
+        }
+        if self.inventory_native() {
+            inventory_panel::place(self.areas.side, self.areas.side_width, self.dpi);
+        } else {
+            inventory_panel::place(None, 0, self.dpi);
         }
         if self.scripts_native() {
             scripts_panel::seed_folds(self.settings.expanded_script_cats.clone());
@@ -12512,8 +12545,9 @@ impl Window {
                         &self.settings.snippets,
                     );
                 }
-                // Native controls (`files_panel`, `known_hosts_panel`).
-                SideView::Files | SideView::KnownHosts => {}
+                // Native controls (`files_panel`, `known_hosts_panel`,
+                // `inventory_panel`).
+                SideView::Files | SideView::KnownHosts | SideView::Inventory => {}
             }
             self.invalidate_grid(side);
         }
@@ -13460,6 +13494,7 @@ impl Window {
                 RailItem::Forwards => cmd::FORWARDS,
                 RailItem::Snippets => cmd::SNIPPETS,
                 RailItem::KnownHosts => cmd::KNOWN_HOSTS,
+                RailItem::Inventory => cmd::INVENTORY,
                 RailItem::Palette => cmd::PALETTE,
                 RailItem::Pin => return String::new(),
             };
@@ -13788,6 +13823,11 @@ impl Window {
     /// Whether a paste is for the Known hosts tool.
     fn known_hosts_paste(&self) -> bool {
         self.side.visible && self.side.focused && self.side.view == SideView::KnownHosts
+    }
+
+    /// Whether a paste is for the Inventory tool.
+    fn inventory_paste(&self) -> bool {
+        self.side.visible && self.side.focused && self.side.view == SideView::Inventory
     }
 
     fn paste_side(&mut self, text: &str) -> bool {
@@ -16992,6 +17032,7 @@ impl Window {
             }
             SideView::Forwards | SideView::Palette => {}
             SideView::KnownHosts => self.reload_known_hosts(),
+            SideView::Inventory => self.reload_inventory(),
             SideView::Live => {
                 let all = self.open_sessions();
                 self.live_view.reset(&all);
@@ -17031,6 +17072,7 @@ impl Window {
             cmd::SNIPPETS => SideView::Snippets,
             cmd::LIVE => SideView::Live,
             cmd::KNOWN_HOSTS => SideView::KnownHosts,
+            cmd::INVENTORY => SideView::Inventory,
             _ => SideView::Sessions,
         };
         let open = self.side.visible && self.side.view == view;
@@ -19636,6 +19678,10 @@ impl Window {
                 (
                     cmd::KNOWN_HOSTS,
                     self.side.visible && self.side.view == SideView::KnownHosts,
+                ),
+                (
+                    cmd::INVENTORY,
+                    self.side.visible && self.side.view == SideView::Inventory,
                 ),
                 (cmd::FOLLOW_CD, s.follow_directory),
                 (cmd::VERIFY, s.verify_transfers),
@@ -22450,6 +22496,7 @@ fn tools_have_focus() -> bool {
         || script_hosts::has_focus()
         || script_report::has_focus()
         || known_hosts_panel::has_focus()
+        || inventory_panel::has_focus()
 }
 
 /// Carries out what the user did on a script run's report: its keys go
@@ -22949,7 +22996,7 @@ fn session_menu(hwnd: HWND, host: Option<String>, search: Option<String>) {
         }
         let _ = AppendMenuW(menu, MF_STRING, NEW as usize, w!("&New connection...\tIns"));
         let _ = AppendMenuW(menu, MF_STRING, CREDENTIALS as usize, w!("C&redentials..."));
-        let _ = AppendMenuW(menu, MF_STRING, INVENTORY as usize, w!("&Inventory..."));
+        let _ = AppendMenuW(menu, MF_STRING, INVENTORY as usize, w!("&Inventory"));
         if typed.is_some() || search.is_some() {
             let _ = AppendMenuW(menu, MF_SEPARATOR, 0, None);
         }
@@ -23022,25 +23069,42 @@ fn login_refused(why: &str) -> String {
     )
 }
 
-/// Connection manager > Inventory: every connection with its last login,
-/// host key, OS and kernel, searched as the connection manager is; Connect
-/// there opens the picked one.
+/// Connection manager > Inventory: Tools > Inventory, searched as the
+/// connection manager is.
 fn inventory_window(hwnd: HWND) {
-    let Some((rows, query, dir, dpi)) = with_window(|w| {
-        let items = host_items(&ssh_env(), &w.settings);
-        let inventory = crate::inventory_view::load();
-        let rows = crate::inventory_view::rows(&items, &inventory, &w.settings);
-        let query = w.side.list.query().trim().to_owned();
-        (rows, query, w.download_dir(), w.dpi)
-    }) else {
+    let Some(query) = with_window(|w| w.side.list.query().trim().to_owned()) else {
         return;
     };
-    let answer = crate::inventory_panel::show(hwnd, dpi, rows, &query, dir);
-    if let Some(crate::inventory_panel::Answer::Connect(host)) = answer
-        && let Some(Some(command)) =
-            with_window(|w| w.side_action(Some(SideAction::Open { host, split: false })))
-    {
-        run_command(hwnd, command);
+    let _ = hwnd;
+    with_window(|w| {
+        w.show_side(SideView::Inventory, true);
+        w.update_menu_checks();
+    });
+    inventory_panel::set_search(&query);
+    inventory_panel::focus_search();
+}
+
+/// Carries out what the user did in the inventory.
+fn inventory_event(hwnd: HWND, event: inventory_panel::Event) {
+    use inventory_panel::Event;
+    match event {
+        Event::Connect(host) => {
+            if let Some(Some(command)) =
+                with_window(|w| w.side_action(Some(SideAction::Open { host, split: false })))
+            {
+                run_command(hwnd, command);
+            }
+        }
+        Event::Reload => {
+            with_window(|w| {
+                w.reload_inventory();
+                w.refresh_chrome();
+            });
+        }
+        Event::Focused => tools_focused(),
+        Event::Leave => {
+            with_window(Window::focus_terminal);
+        }
     }
 }
 
@@ -23562,7 +23626,13 @@ fn delete_many(hwnd: HWND, names: Vec<String>) {
 fn is_side_pane(id: u32) -> bool {
     matches!(
         id,
-        cmd::SESSIONS | cmd::LIVE | cmd::FILES | cmd::FORWARDS | cmd::SNIPPETS | cmd::KNOWN_HOSTS
+        cmd::SESSIONS
+            | cmd::LIVE
+            | cmd::FILES
+            | cmd::FORWARDS
+            | cmd::SNIPPETS
+            | cmd::KNOWN_HOSTS
+            | cmd::INVENTORY
     )
 }
 
@@ -23787,6 +23857,9 @@ fn run_command(hwnd: HWND, command: Command) {
             if with_window(|w| w.paste_side(&text)) == Some(true) {
                 if with_window(|w| w.known_hosts_paste()) == Some(true) {
                     known_hosts_panel::paste(&text);
+                }
+                if with_window(|w| w.inventory_paste()) == Some(true) {
+                    inventory_panel::paste(&text);
                 }
                 return;
             }
@@ -26408,6 +26481,9 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                     1 if want && with_window(|w| w.known_hosts_native()) == Some(true) => {
                         known_hosts_panel::focus_search();
                     }
+                    1 if want && with_window(|w| w.inventory_native()) == Some(true) => {
+                        inventory_panel::focus_search();
+                    }
                     1 if want && scripts => scripts_panel::focus_first(),
                     1 if want && editor => script_editor::focus_first(),
                     1 if want && args => script_args::focus_first(),
@@ -26543,6 +26619,7 @@ mod tests {
             cmd::FORWARDS,
             cmd::SNIPPETS,
             cmd::KNOWN_HOSTS,
+            cmd::INVENTORY,
         ] {
             assert!(is_side_pane(id), "{id}");
         }
