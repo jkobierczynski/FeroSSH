@@ -8,6 +8,7 @@
 
 use std::collections::HashSet;
 
+use ferossh_config::host_query::{HostFacts, Query};
 use ferossh_config::settings::SessionKind;
 use ferossh_render::{Cell, Color, Flags, Grid, Rgb};
 
@@ -26,9 +27,28 @@ pub struct HostItem {
     pub kind: SessionKind,
     /// Its tags: ssh_config's `Tag`, then the connection's own `Tags`.
     pub tags: Vec<String>,
+    /// As connecting resolves them, for `user:`, `host:` and `port:`
+    /// searches; unknown when it does not resolve.
+    pub user: Option<String>,
+    pub hostname: Option<String>,
+    pub port: Option<u16>,
 }
 
 impl HostItem {
+    /// What a search looks at.
+    pub fn facts(&self) -> HostFacts<'_> {
+        HostFacts {
+            name: &self.name,
+            folder: self.folder.as_deref(),
+            user: self.user.as_deref(),
+            hostname: self.hostname.as_deref(),
+            port: self.port,
+            kind: self.kind.name(),
+            tags: &self.tags,
+            detail: &self.detail,
+        }
+    }
+
     /// The detail with the tags after it, `#` before each:
     /// `me@web.example  #prod #web`.
     pub fn detail_with_tags(&self) -> String {
@@ -61,6 +81,36 @@ enum Row {
 }
 
 const FAVOURITES: &str = "Favourites";
+/// What marks a saved search's smart folder: a control character, which
+/// no ordinary folder name holds ([`SessionList::set_hosts`] drops them),
+/// so a folder of one's own called `Search: x` stays an ordinary folder.
+const SEARCH_KEY: char = '\u{1}';
+/// What a smart folder is shown as: this, then the search.
+const SEARCH_LABEL: &str = "Search: ";
+
+/// The search behind a smart folder's key, if it is one.
+pub fn saved_search_of(folder: &str) -> Option<&str> {
+    folder.strip_prefix(SEARCH_KEY)
+}
+
+/// The smart folder key of a saved search.
+pub fn saved_search_folder(query: &str) -> String {
+    format!("{SEARCH_KEY}{query}")
+}
+
+/// How folder `name` is shown.
+pub fn folder_label(name: &str) -> String {
+    match saved_search_of(name) {
+        Some(q) => format!("{SEARCH_LABEL}{q}"),
+        None => name.to_owned(),
+    }
+}
+
+/// Whether a folder starts open: smart folders start closed, since they
+/// list hosts that are in their own folders too.
+pub fn open_by_default(folder: &str) -> bool {
+    saved_search_of(folder).is_none()
+}
 /// The native tree's folder of saved workspaces.
 const WORKSPACES: &str = "Workspaces";
 /// Header lines above the rows: the title and the search line.
@@ -116,6 +166,10 @@ pub enum SideAction {
     DeleteWorkspace(String),
     /// Open this saved workspace's file in the text editor (F2).
     EditWorkspace(String),
+    /// Keep this search as a smart folder.
+    SaveSearch(String),
+    /// Drop this saved search.
+    RemoveSearch(String),
     /// Give the keyboard back to the terminal.
     Leave,
 }
@@ -130,6 +184,8 @@ pub struct SessionList {
     scroll: usize,
     /// Saved workspaces for the native tree: name and what it holds.
     workspaces: Vec<(String, String)>,
+    /// Saved searches, shown as smart folders above the others.
+    saved_searches: Vec<String>,
 }
 
 impl SessionList {
@@ -144,8 +200,13 @@ impl SessionList {
 
     /// Replaces the hosts (after the config or an import changed), keeping
     /// the selection on the same host when it is still there.
-    pub fn set_hosts(&mut self, hosts: Vec<HostItem>, favourites: Vec<String>) {
+    pub fn set_hosts(&mut self, mut hosts: Vec<HostItem>, favourites: Vec<String>) {
         let keep = self.selected_host();
+        for h in &mut hosts {
+            if let Some(f) = &mut h.folder {
+                f.retain(|c| !c.is_control());
+            }
+        }
         self.hosts = hosts;
         self.favourites = favourites;
         self.selected = 0;
@@ -197,19 +258,50 @@ impl SessionList {
         self.favourites.iter().any(|f| f.eq_ignore_ascii_case(name))
     }
 
-    fn matches(&self, h: &HostItem) -> bool {
-        let q = self.query.to_lowercase();
-        q.split_whitespace().all(|word| {
-            h.name.to_lowercase().contains(word)
-                || h.detail.to_lowercase().contains(word)
-                || h.tags.iter().any(|t| {
-                    let t = t.to_lowercase();
-                    t.contains(word) || format!("#{t}").contains(word)
-                })
-                || h.folder
-                    .as_deref()
-                    .is_some_and(|f| f.to_lowercase().contains(word))
-        })
+    /// The search typed in the search box.
+    pub fn query(&self) -> &str {
+        &self.query
+    }
+
+    pub fn set_saved_searches(&mut self, searches: Vec<String>) {
+        self.saved_searches = searches;
+    }
+
+    /// Whether the search typed is one of the saved ones already.
+    pub fn query_saved(&self) -> bool {
+        let q = self.query.trim();
+        self.saved_searches
+            .iter()
+            .any(|s| s.eq_ignore_ascii_case(q))
+    }
+
+    /// The hosts a search finds, in file order.
+    fn found(&self, query: &str) -> Vec<usize> {
+        let q = Query::parse(query);
+        (0..self.hosts.len())
+            .filter(|&i| self.hosts.get(i).is_some_and(|h| q.matches(&h.facts())))
+            .collect()
+    }
+
+    /// Whether folder `name` shows its hosts.
+    fn is_open(&self, name: &str) -> bool {
+        open_by_default(name) != self.collapsed.contains(name)
+    }
+
+    fn set_open(&mut self, name: String, open: bool) {
+        if open == open_by_default(&name) {
+            self.collapsed.remove(&name);
+        } else {
+            self.collapsed.insert(name);
+        }
+    }
+
+    /// The saved search under the selection, if a smart folder is selected.
+    pub fn selected_saved_search(&self) -> Option<String> {
+        match self.rows().get(self.selected)? {
+            Row::Folder { name, .. } => saved_search_of(name).map(str::to_owned),
+            _ => None,
+        }
     }
 
     /// The rows as shown: favourites, hosts without a folder, then the
@@ -223,9 +315,7 @@ impl SessionList {
                 .is_some_and(|h| self.is_favourite(&h.name)),
         };
         if !self.query.trim().is_empty() {
-            let mut hits: Vec<usize> = (0..self.hosts.len())
-                .filter(|&i| self.hosts.get(i).is_some_and(|h| self.matches(h)))
-                .collect();
+            let mut hits = self.found(&self.query);
             // Favourites first, otherwise file order.
             hits.sort_by_key(|&i| {
                 !self
@@ -237,10 +327,11 @@ impl SessionList {
         }
         let mut rows = vec![Row::New];
         let group = |name: &str, members: Vec<usize>, rows: &mut Vec<Row>| {
-            if members.is_empty() {
+            // A smart folder stays when nothing matches, as in the tree.
+            if members.is_empty() && saved_search_of(name).is_none() {
                 return;
             }
-            let open = !self.collapsed.contains(name);
+            let open = self.is_open(name);
             rows.push(Row::Folder {
                 name: name.to_owned(),
                 open,
@@ -250,6 +341,9 @@ impl SessionList {
                 rows.extend(members.into_iter().map(host));
             }
         };
+        for q in &self.saved_searches {
+            group(&saved_search_folder(q), self.found(q), &mut rows);
+        }
         let favs: Vec<usize> = (0..self.hosts.len())
             .filter(|&i| {
                 self.hosts
@@ -326,13 +420,7 @@ impl SessionList {
             SideKey::Left | SideKey::Right => {
                 let open = key == SideKey::Right;
                 match current {
-                    Some(Row::Folder { name, .. }) => {
-                        if open {
-                            self.collapsed.remove(&name);
-                        } else {
-                            self.collapsed.insert(name);
-                        }
-                    }
+                    Some(Row::Folder { name, .. }) => self.set_open(name, open),
                     // Left on a host goes to its folder.
                     Some(Row::Host { .. }) if !open => {
                         if let Some(i) = rows
@@ -347,13 +435,7 @@ impl SessionList {
             }
             SideKey::Enter { split } => match current {
                 Some(Row::New) => return Some(SideAction::New),
-                Some(Row::Folder { name, open, .. }) => {
-                    if open {
-                        self.collapsed.insert(name);
-                    } else {
-                        self.collapsed.remove(&name);
-                    }
-                }
+                Some(Row::Folder { name, open, .. }) => self.set_open(name, !open),
                 Some(row) => {
                     let host = self.row_host(&row)?.clone();
                     return Some(SideAction::Open { host, split });
@@ -499,7 +581,8 @@ impl SessionList {
                     Flags::empty(),
                 ),
                 Some(Row::Folder { name, open, count }) => {
-                    let label = format!(" {} {name}", if *open { "▾" } else { "▸" });
+                    let label =
+                        format!(" {} {}", if *open { "▾" } else { "▸" }, folder_label(name));
                     let mut cells = line(&label, palette.text, row_bg, Flags::BOLD);
                     let used = label.chars().count() + 1;
                     put_right(&mut cells, &count.to_string(), used, palette.dim, row_bg);
@@ -677,6 +760,12 @@ impl SessionList {
             return found;
         }
         let mut out = Vec::new();
+        for q in &self.saved_searches {
+            out.push(TreeNode::Folder {
+                name: saved_search_folder(q),
+                hosts: self.found(q).into_iter().filter_map(host).collect(),
+            });
+        }
         let favs: Vec<TreeHost> = (0..self.hosts.len())
             .filter(|&i| {
                 self.hosts
@@ -789,7 +878,75 @@ mod tests {
             detail: format!("me@{name}.example"),
             kind: SessionKind::Ssh,
             tags: Vec::new(),
+            user: Some("me".into()),
+            hostname: Some(format!("{name}.example")),
+            port: Some(22),
         }
+    }
+
+    #[test]
+    fn field_searches_and_smart_folders() {
+        let mut web = item("web", None);
+        web.tags = vec!["prod".into()];
+        let mut db = item("db1", Some("Work"));
+        db.tags = vec!["prod".into(), "legacy".into()];
+        let mut l = SessionList::new(vec![web, db, item("pi", Some("Home"))], Vec::new());
+        l.set_query("tag:prod -tag:legacy");
+        let names = |l: &SessionList| {
+            l.tree()
+                .iter()
+                .flat_map(|n| n.hosts().iter().map(|h| h.name.clone()).collect::<Vec<_>>())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(names(&l), ["web"]);
+        assert!(!l.query_saved());
+        l.set_saved_searches(vec!["tag:prod".into()]);
+        l.set_query("TAG:prod ");
+        assert!(l.query_saved());
+        l.set_query("");
+        // The smart folder comes first, closed, and lists the matches.
+        let tree = l.tree();
+        assert!(
+            matches!(&tree[0], TreeNode::Folder { name, .. } if folder_label(name) == "Search: tag:prod")
+        );
+        assert_eq!(
+            tree[0]
+                .hosts()
+                .iter()
+                .map(|h| h.name.as_str())
+                .collect::<Vec<_>>(),
+            ["web", "db1"]
+        );
+        let t = texts(&mut l);
+        assert!(t[3].starts_with(" ▸ Search: tag:prod"), "{t:#?}");
+        assert!(t[5].contains("Work"), "closed at first: {t:#?}");
+        l.key(SideKey::Down, 8);
+        assert_eq!(l.selected_saved_search().as_deref(), Some("tag:prod"));
+        l.key(SideKey::Enter { split: false }, 8);
+        let t = texts(&mut l);
+        assert!(
+            t[4].contains("web") && t[5].contains("db1"),
+            "opened: {t:#?}"
+        );
+        // A folder of one's own called "Search: tag:prod" is no smart
+        // folder and keeps its own open state.
+        let mut own = item("own", Some("Search: tag:prod"));
+        own.tags = vec!["x".into()];
+        l.set_hosts(vec![own], Vec::new());
+        let tree = l.tree();
+        assert_eq!(tree.len(), 2, "{tree:#?}");
+        assert!(matches!(&tree[1], TreeNode::Folder { name, .. } if name == "Search: tag:prod"));
+        assert!(saved_search_of("Search: tag:prod").is_none());
+        // With nothing matching, the smart folder stays, and can be
+        // selected and removed.
+        let t = texts(&mut l);
+        assert!(
+            t[3].contains("Search: tag:prod") && t[3].ends_with('0'),
+            "{t:#?}"
+        );
+        l.key(SideKey::Home, 8);
+        l.key(SideKey::Down, 8);
+        assert_eq!(l.selected_saved_search().as_deref(), Some("tag:prod"));
     }
 
     #[test]

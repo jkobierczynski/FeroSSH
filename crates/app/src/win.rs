@@ -2060,6 +2060,10 @@ fn host_items(env: &Env, settings: &Settings) -> Vec<HostItem> {
                     target.as_ref().and_then(|t| t.tag.as_deref()),
                     settings.profile(&h.name),
                 );
+                let (user, hostname, port) = target
+                    .as_ref()
+                    .map(|t| (t.user.clone(), Some(t.hostname.clone()), Some(t.port)))
+                    .unwrap_or_default();
                 let detail = target
                     .map(|t| {
                         let mut d = match &t.user {
@@ -2081,6 +2085,9 @@ fn host_items(env: &Env, settings: &Settings) -> Vec<HostItem> {
                     detail,
                     kind,
                     tags,
+                    user,
+                    hostname,
+                    port,
                 };
             }
             let target = Target::resolve(&h.name, env);
@@ -2088,6 +2095,22 @@ fn host_items(env: &Env, settings: &Settings) -> Vec<HostItem> {
                 target.as_ref().and_then(|t| t.tag.as_deref()),
                 settings.profile(&h.name),
             );
+            let (user, hostname, mut port) = target
+                .as_ref()
+                .map(|t| (Some(t.user.clone()), Some(t.hostname.clone()), Some(t.port)))
+                .unwrap_or_default();
+            // The port the session opens, for port: searches: SSH's 22 is
+            // not Telnet's or a desktop's default.
+            let own_port = || ssh_config::resolve_in(&env.config, &h.name, &includes).port;
+            port = match kind {
+                SessionKind::Telnet => {
+                    Some(own_port().unwrap_or(ferossh_config::DEFAULT_TELNET_PORT))
+                }
+                SessionKind::Rdp => Some(own_port().unwrap_or(DEFAULT_DESKTOP_PORT)),
+                SessionKind::Vnc => Some(own_port().unwrap_or(DEFAULT_VNC_PORT)),
+                SessionKind::Serial | SessionKind::Xvfb | SessionKind::RemoteApp => None,
+                _ => port,
+            };
             let detail = target
                 .map(|t| {
                     let mut d = format!("{}@{}", t.user, t.hostname);
@@ -2107,6 +2130,9 @@ fn host_items(env: &Env, settings: &Settings) -> Vec<HostItem> {
                 detail,
                 kind,
                 tags,
+                user,
+                hostname,
+                port,
             }
         })
         .collect()
@@ -12767,6 +12793,30 @@ impl Window {
                     .set_favourites(self.settings.favourites.clone());
                 self.save_settings();
             }
+            Some(SideAction::SaveSearch(query)) => {
+                if let Some(q) = ferossh_config::host_query::saved_text(&query)
+                    && !self
+                        .settings
+                        .saved_searches
+                        .iter()
+                        .any(|s| s.eq_ignore_ascii_case(&q))
+                {
+                    self.settings.saved_searches.push(q);
+                    self.side
+                        .list
+                        .set_saved_searches(self.settings.saved_searches.clone());
+                    self.save_settings();
+                }
+            }
+            Some(SideAction::RemoveSearch(query)) => {
+                self.settings
+                    .saved_searches
+                    .retain(|s| !s.eq_ignore_ascii_case(&query));
+                self.side
+                    .list
+                    .set_saved_searches(self.settings.saved_searches.clone());
+                self.save_settings();
+            }
             Some(SideAction::New) => self.open_form(None),
             Some(SideAction::Edit(host)) => self.open_form(Some(host)),
             Some(SideAction::Delete(host)) => {
@@ -14525,6 +14575,9 @@ impl Window {
             host_items(&env, &self.settings),
             self.settings.favourites.clone(),
         );
+        self.side
+            .list
+            .set_saved_searches(self.settings.saved_searches.clone());
         if let Some(name) = select {
             self.side.list.select(name);
         }
@@ -15901,6 +15954,9 @@ impl Window {
                     self.settings.favourites.clone(),
                 );
                 self.side.list.set_workspaces(workspace_items());
+                self.side
+                    .list
+                    .set_saved_searches(self.settings.saved_searches.clone());
             }
             SideView::Files => {
                 // Opening the view lists the focused pane's directory.
@@ -16369,7 +16425,10 @@ impl Window {
                     let visible = SessionList::visible(self.side.grid.rows());
                     self.side.list.select_at(row, visible);
                     self.refresh_chrome();
-                    return Some(Command::SessionMenu(self.side.list.selected_host()));
+                    return Some(Command::SessionMenu(
+                        self.side.list.selected_host(),
+                        self.side.list.selected_saved_search(),
+                    ));
                 }
                 if button != MouseButton::Left {
                     self.refresh_chrome();
@@ -20506,7 +20565,9 @@ enum Command {
         names: Vec<String>,
     },
     /// The connection manager's right-click menu, on this host if any.
-    SessionMenu(Option<String>),
+    /// The connection manager's right-click menu: on this host, or on
+    /// this saved search's smart folder.
+    SessionMenu(Option<String>, Option<String>),
     /// A tab's right-click menu.
     TabMenu(usize),
     /// Ask, then remove this saved session.
@@ -21274,7 +21335,7 @@ fn conn_event(hwnd: HWND, event: conn_view::Event) {
             w.side_action(Some(SideAction::Open { host, split }))
         })
         .flatten(),
-        Event::Menu(host) => Some(Command::SessionMenu(host)),
+        Event::Menu { host, search } => Some(Command::SessionMenu(host, search)),
         Event::Command(id) => Some(Command::Id(id)),
         Event::Query(query) => {
             with_window(|w| {
@@ -21793,12 +21854,20 @@ fn live_event(hwnd: HWND, event: live_panel::Event) {
     }
 }
 
-fn session_menu(hwnd: HWND, host: Option<String>) {
+fn session_menu(hwnd: HWND, host: Option<String>, search: Option<String>) {
     const CONNECT: u32 = 1;
     const SPLIT: u32 = 2;
     const EDIT: u32 = 3;
     const DELETE: u32 = 4;
     const NEW: u32 = 5;
+    const SAVE_SEARCH: u32 = 6;
+    const REMOVE_SEARCH: u32 = 7;
+    // The search typed, when there is one to save.
+    let typed = with_window(|w| {
+        let q = w.side.list.query().trim().to_owned();
+        (!q.is_empty() && !w.side.list.query_saved()).then_some(q)
+    })
+    .flatten();
     // SAFETY: a popup menu of our own on our window, destroyed after use.
     // TPM_RETURNCMD returns the picked id, 0 for none.
     let picked = unsafe {
@@ -21829,6 +21898,25 @@ fn session_menu(hwnd: HWND, host: Option<String>) {
             let _ = AppendMenuW(menu, MF_SEPARATOR, 0, None);
         }
         let _ = AppendMenuW(menu, MF_STRING, NEW as usize, w!("&New connection...\tIns"));
+        if typed.is_some() || search.is_some() {
+            let _ = AppendMenuW(menu, MF_SEPARATOR, 0, None);
+        }
+        if typed.is_some() {
+            let _ = AppendMenuW(
+                menu,
+                MF_STRING,
+                SAVE_SEARCH as usize,
+                w!("Sa&ve this search as a folder"),
+            );
+        }
+        if search.is_some() {
+            let _ = AppendMenuW(
+                menu,
+                MF_STRING,
+                REMOVE_SEARCH as usize,
+                w!("&Remove this saved search"),
+            );
+        }
         let mut pt = POINT::default();
         let _ = GetCursorPos(&mut pt);
         let chosen = TrackPopupMenu(
@@ -21849,6 +21937,14 @@ fn session_menu(hwnd: HWND, host: Option<String>) {
         (EDIT, Some(host)) => SideAction::Edit(host),
         (DELETE, Some(host)) => SideAction::Delete(host),
         (NEW, _) => SideAction::New,
+        (SAVE_SEARCH, _) => match typed {
+            Some(q) => SideAction::SaveSearch(q),
+            None => return,
+        },
+        (REMOVE_SEARCH, _) => match search {
+            Some(q) => SideAction::RemoveSearch(q),
+            None => return,
+        },
         _ => return,
     };
     if let Some(Some(command)) = with_window(|w| w.side_action(Some(action))) {
@@ -22692,7 +22788,7 @@ fn run_command(hwnd: HWND, command: Command) {
                 }
             }
         }
-        Command::SessionMenu(host) => session_menu(hwnd, host),
+        Command::SessionMenu(host, search) => session_menu(hwnd, host, search),
         Command::TabMenu(tab) => tab_menu(hwnd, tab),
         Command::PlayCast => {
             if let Some(path) = pick_file(hwnd, w!("Play a recording"), &log_dir())

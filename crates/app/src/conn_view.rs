@@ -53,7 +53,9 @@ use windows::core::{PCWSTR, PWSTR, w};
 
 use crate::layout::Rect;
 use crate::native::{fonts, key_down, pass_edge, scale, search_text, set_font, wide};
-use crate::sessions::{SideAction, TreeHost, TreeNode};
+use crate::sessions::{
+    SideAction, TreeHost, TreeNode, folder_label, open_by_default, saved_search_of,
+};
 
 /// What the user did in the panel.
 #[derive(Debug)]
@@ -62,8 +64,12 @@ pub enum Event {
     Action(SideAction),
     /// Enter in the search box: open the first match, or what was typed.
     OpenFirst { split: bool },
-    /// A right click: the connection menu for this host (`None`: on no host).
-    Menu(Option<String>),
+    /// A right click: the connection menu for this host (`None`: on no
+    /// host), or on this saved search's smart folder.
+    Menu {
+        host: Option<String>,
+        search: Option<String>,
+    },
     /// Run this menu command (Import).
     Command(u32),
     /// The search text changed.
@@ -502,7 +508,8 @@ pub fn set_nodes(nodes: Vec<TreeNode>) {
     for n in &nodes {
         match n {
             TreeNode::Folder { name, hosts } => {
-                let folder = insert(TVI_ROOT, name, !collapsed.contains(name), index);
+                let open = open_by_default(name) != collapsed.contains(name);
+                let folder = insert(TVI_ROOT, &folder_label(name), open, index);
                 index += 1;
                 for t in hosts {
                     host(folder, t, &mut index);
@@ -787,13 +794,16 @@ fn notify(h: Handles, lparam: LPARAM) -> LRESULT {
                 if hit_item.0 != 0 {
                     select(h.tree, hit_item);
                 }
-                let host = item_index(h.tree, hit_item)
-                    .and_then(item)
-                    .and_then(|i| match i {
-                        Item::Host(h) if !h.workspace => Some(h.name),
-                        Item::Host(_) | Item::Folder(_) => None,
-                    });
-                emit(Event::Menu(host));
+                let hit = item_index(h.tree, hit_item).and_then(item);
+                let host = hit.clone().and_then(|i| match i {
+                    Item::Host(h) if !h.workspace => Some(h.name),
+                    Item::Host(_) | Item::Folder(_) => None,
+                });
+                let search = hit.and_then(|i| match i {
+                    Item::Folder(name) => saved_search_of(&name).map(str::to_owned),
+                    Item::Host(_) => None,
+                });
+                emit(Event::Menu { host, search });
                 return LRESULT(1);
             }
             TVN_KEYDOWN => {
@@ -835,7 +845,7 @@ fn notify(h: Handles, lparam: LPARAM) -> LRESULT {
                         && let Some(s) = s.as_mut()
                         && let Some(Item::Folder(name)) = s.items.get(index).cloned()
                     {
-                        if open {
+                        if open == open_by_default(&name) {
                             s.collapsed.remove(&name);
                         } else {
                             s.collapsed.insert(name);

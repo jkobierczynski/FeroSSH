@@ -43,6 +43,7 @@ FeroSSH reads `~/.ssh/config` and `~/.ssh/known_hosts` too, and writes only to `
 | Keyword | Default | Meaning |
 | --- | --- | --- |
 | `DownloadFolder "D:\Transfers"` | your Downloads folder | Where downloads go. |
+| `SavedSearch QUERY` | none | A connection manager search kept as a folder (one line each), for example `SavedSearch tag:prod -tag:legacy`. The search language is in [Everyday use](everyday-use.md#the-connection-manager). |
 | `ScriptsExpanded "linux" "library/databases"` | none (all folded) | Which script categories are open in the scripts pane; the rest start folded. Set by folding and opening categories there. |
 | `TransferSort local name ascending remote size descending` | both by name, A to Z | How File transfer sorts each list: after `local` and `remote`, `name`, `size` or `modified`, then `ascending` or `descending`. Folders always come first. Clicking a column header sets it for that list. |
 | `TransferLayout "stacked swapped 40"` | side by side, Local first, half each | How File transfer arranges its lists: `side` or `stacked`, `swapped` for Remote first, and the first list's share in percent. Layout ▾ and dragging the gap set it. |
