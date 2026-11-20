@@ -258,8 +258,10 @@ fn normalise(field: EditField, typed: &str, themes: &[String]) -> Result<String,
             }
         }
         EditField::Password => {
-            plain(v, "The password command")
-                .map_err(|_| "The password command cannot hold control characters.".to_owned())?;
+            // Quotes group a command's arguments, as in the form.
+            if v.chars().any(char::is_control) {
+                return Err("The password command cannot hold control characters.".to_owned());
+            }
             Ok(if v.is_empty() || v.eq_ignore_ascii_case("ask") {
                 "ask".into()
             } else if v.eq_ignore_ascii_case("windows") {
@@ -352,6 +354,24 @@ pub fn plan(
             {
                 Some("they go through jump hosts; clear them first")
             }
+            // WinRM with no user logs in as yourself with no password, so
+            // a password source needs a user there, as in the form.
+            EditField::Password
+                if t.kind == SessionKind::WinRm
+                    && value != "ask"
+                    && host.is_none_or(|h| h.user.as_deref().is_none_or(str::is_empty)) =>
+            {
+                Some("WinRM needs a user for that password source; set the user first")
+            }
+            EditField::User
+                if t.kind == SessionKind::WinRm
+                    && value.is_empty()
+                    && settings
+                        .profile(&t.name)
+                        .is_some_and(|p| p.password != PasswordSource::Ask) =>
+            {
+                Some("WinRM with a password source needs a user")
+            }
             _ => None,
         };
         if let Some(why) = why {
@@ -375,8 +395,34 @@ pub fn plan(
     })
 }
 
+/// The planned hosts that `saved`, read again, now gives a proxy (for
+/// jump hosts) or jump hosts (for a proxy): [`apply`] leaves them alone,
+/// as a connection never holds both.
+pub fn conflicts(plan: &Plan, saved: &[SavedHost]) -> Vec<String> {
+    plan.changes
+        .iter()
+        .filter(|c| {
+            saved
+                .iter()
+                .find(|h| h.alias.eq_ignore_ascii_case(&c.name))
+                .is_some_and(|h| conflicting(plan, h))
+        })
+        .map(|c| c.name.clone())
+        .collect()
+}
+
+fn conflicting(plan: &Plan, h: &SavedHost) -> bool {
+    !plan.value.is_empty()
+        && match plan.field {
+            EditField::Jump => h.proxy_server.is_some(),
+            EditField::Proxy => h.proxy_jump.is_some(),
+            _ => false,
+        }
+}
+
 /// Makes the changes in `plan`. Returns whether `sessions.conf` (the
-/// saved connections) changed; the profiles change in `settings`.
+/// saved connections) changed; the profiles change in `settings`. Hosts
+/// in [`conflicts`] are left alone.
 pub fn apply(plan: &Plan, saved: &mut [SavedHost], settings: &mut Settings) -> bool {
     let value = Some(plan.value.clone()).filter(|v| !v.is_empty());
     let mut saved_changed = false;
@@ -388,6 +434,9 @@ pub fn apply(plan: &Plan, saved: &mut [SavedHost], settings: &mut Settings) -> b
             else {
                 continue;
             };
+            if conflicting(plan, h) {
+                continue;
+            }
             let slot = match plan.field {
                 EditField::User => &mut h.user,
                 EditField::Key => &mut h.identity_file,
@@ -633,5 +682,65 @@ mod tests {
             .unwrap_err()
             .contains("no password")
         );
+    }
+
+    #[test]
+    fn a_proxy_added_since_the_preview_is_left_alone() {
+        let saved = vec![saved_host("web", None), saved_host("db", None)];
+        let t = [
+            target("web", SessionKind::Ssh),
+            target("db", SessionKind::Ssh),
+        ];
+        let p = plan(
+            EditField::Jump,
+            "bastion",
+            &t,
+            &saved,
+            &Settings::default(),
+            &[],
+        )
+        .unwrap();
+        assert_eq!(p.changes.len(), 2);
+        // sessions.conf, read again, now gives web a proxy.
+        let mut fresh = saved.clone();
+        fresh[0].proxy_server = Some("socks5://proxy:1080".into());
+        assert_eq!(conflicts(&p, &fresh), ["web"]);
+        let mut settings = Settings::default();
+        assert!(apply(&p, &mut fresh, &mut settings));
+        assert_eq!(fresh[0].proxy_jump, None);
+        assert_eq!(fresh[1].proxy_jump.as_deref(), Some("bastion"));
+    }
+
+    #[test]
+    fn password_commands_keep_quotes_and_winrm_needs_a_user() {
+        let saved = vec![saved_host("win", None), saved_host("named", Some("admin"))];
+        let t = [
+            target("win", SessionKind::WinRm),
+            target("named", SessionKind::WinRm),
+        ];
+        let settings = Settings::default();
+        let cmd = r#"op read "op://Vault/Item/password""#;
+        let p = plan(EditField::Password, cmd, &t, &saved, &settings, &[]).unwrap();
+        assert_eq!(p.value, cmd);
+        assert_eq!(p.changes.len(), 1);
+        assert_eq!(p.changes[0].name, "named");
+        assert_eq!(p.skipped.len(), 1, "win has no user");
+        assert!(plan(EditField::Password, "a\u{7}", &t, &saved, &settings, &[]).is_err());
+        // A stored Windows password needs one too.
+        let p = plan(
+            EditField::Password,
+            "windows",
+            &t[..1],
+            &saved,
+            &settings,
+            &[],
+        )
+        .unwrap();
+        assert!(p.changes.is_empty());
+        let mut settings = Settings::default();
+        settings.profile_mut("named").password = PasswordSource::Windows;
+        let p = plan(EditField::User, "", &t[1..], &saved, &settings, &[]).unwrap();
+        assert!(p.changes.is_empty());
+        assert_eq!(p.skipped.len(), 1, "a password source needs a user");
     }
 }

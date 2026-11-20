@@ -14621,6 +14621,8 @@ impl Window {
             }
             BulkAction::Edit(plan) => {
                 let mut hosts = load_saved();
+                // sessions.conf may have changed since the preview.
+                let conflicts = crate::bulk_edit::conflicts(&plan, &hosts);
                 if crate::bulk_edit::apply(&plan, &mut hosts, &mut self.settings)
                     && let Err(e) = write_app_file(&sessions_path(), &saved::to_text(&hosts))
                 {
@@ -14630,8 +14632,22 @@ impl Window {
                     )));
                     return;
                 }
-                self.save_settings();
+                let saved_settings = self.try_save_settings();
                 self.reload_sessions(None);
+                if let Err(e) = saved_settings {
+                    self.queued.push(Command::Notice(e));
+                }
+                if !conflicts.is_empty() {
+                    self.queued.push(Command::Notice(format!(
+                        "Left alone, because they now have {}: {}.",
+                        if plan.field == crate::bulk_edit::EditField::Jump {
+                            "a proxy"
+                        } else {
+                            "jump hosts"
+                        },
+                        crate::bulk::name_list(&conflicts)
+                    )));
+                }
             }
         }
         conn_view::clear_marks();
