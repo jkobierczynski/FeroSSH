@@ -14652,29 +14652,45 @@ impl Window {
         if old.is_empty() {
             return;
         }
-        // Every listed connection (saved, from ~/.ssh/config or imports:
-        // a workspace may log in to any of them) and every profile.
+        let env = ssh_env();
+        let targets = |names: Vec<String>, ask_too: bool| -> Vec<String> {
+            names
+                .iter()
+                .filter(|n| match self.settings.password_source(n) {
+                    PasswordSource::Windows => true,
+                    PasswordSource::Ask => ask_too,
+                    PasswordSource::Command(_) => false,
+                })
+                .filter_map(|n| self.saved_password_target_in(n, &env))
+                .collect()
+        };
+        // Every saved connection and profile set to the Windows
+        // Credential Manager (a named credential's source included).
         let mut names: Vec<String> = load_saved().into_iter().map(|h| h.alias).collect();
         names.extend(self.settings.profiles.iter().map(|p| p.host.clone()));
-        // With Log in automatically on, a workspace keeps passwords for
-        // what its panes open, as written there (`bob@web` included).
+        names.extend(host_items(&env, &self.settings).into_iter().map(|h| h.name));
+        let mut in_use = targets(names, false);
+        // With Log in automatically on, what the saved workspaces open, as
+        // written there (`bob@web` included), keeps its password when it
+        // would ask too; an asking connection no workspace opens does not.
         if self.settings.workspace_auto_login {
-            names.extend(
-                host_items(&ssh_env(), &self.settings)
-                    .into_iter()
-                    .map(|h| h.name),
-            );
-            names.extend(ferossh_config::workspace::all_connections(&workspaces_dir()));
-            // And what the open workspace panes log in to, wherever their
-            // workspace file is (one opened from outside the folder too).
-            names.extend(
-                self.workspace_extra
-                    .values()
-                    .filter(|e| e.login)
-                    .filter_map(|e| e.dest.clone()),
-            );
+            in_use.extend(targets(
+                ferossh_config::workspace::all_connections(&workspaces_dir()),
+                true,
+            ));
         }
-        let in_use = self.windows_targets_of(&names);
+        // Every open pane that keeps its login there: under the host, port
+        // and user it logs in to now, which a reconnect keeps even when
+        // the config has changed since (a workspace opened from outside
+        // the folder too).
+        for (&id, p) in &self.panes {
+            if let Host::Ssh(s) = &p.host
+                && self.login_source(id, &s.target.alias) == PasswordSource::Windows
+            {
+                let t = &s.target;
+                in_use.push(credman::target(&t.user, &t.hostname, t.port));
+            }
+        }
         let mut done: Vec<String> = Vec::new();
         for t in old {
             if in_use.contains(&t) || done.contains(&t) {
