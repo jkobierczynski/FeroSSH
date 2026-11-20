@@ -65,6 +65,12 @@ impl Policy {
         self.log_session |= other.log_session;
     }
 
+    /// These limits with `other`'s added.
+    pub fn tightened(mut self, other: &Policy) -> Self {
+        self.tighten(other);
+        self
+    }
+
     /// Password source `source`, as these limits allow it: none at all
     /// under `KeysOnly`, and no Windows Credential Manager under
     /// `SavePassword no`.
