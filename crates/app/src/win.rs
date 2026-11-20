@@ -8036,9 +8036,9 @@ impl Window {
                 Effect::Connected if self.required_log_failed(id) => {
                     // A security rule wants this session logged and the log
                     // would not open: nothing starts on it (no script,
-                    // forwards or tmux), and it is disconnected next.
+                    // forwards or tmux), and it is disconnected next, which
+                    // redraws the chrome (no stats asked for meanwhile).
                     self.retries.remove(&id);
-                    self.refresh_chrome();
                 }
                 Effect::Connected
                     if self.run_login.contains(&id) || self.run_hidden.contains(&id) =>
@@ -8187,6 +8187,9 @@ impl Window {
                     if !self.retries.get(&id).is_some_and(Retry::waiting) {
                         self.retries.remove(&id);
                         self.stop_log(id);
+                        // The rules go with the session, and the user's own
+                        // logging setting comes back.
+                        self.drop_rules(id);
                     }
                     self.prune_sftp();
                     self.prune_forwards();

@@ -829,9 +829,7 @@ impl std::fmt::Debug for SshSession {
 fn is_password_prompt(kind: PromptKind, fields: &[PromptField]) -> bool {
     match (kind, fields) {
         (PromptKind::Password, [_]) => true,
-        (PromptKind::KeyboardInteractive, [f]) => {
-            !f.echo && f.text.to_ascii_lowercase().contains("password")
-        }
+        (PromptKind::KeyboardInteractive, [f]) => !f.echo && is_password_label(&f.text),
         _ => false,
     }
 }
@@ -850,21 +848,33 @@ fn asks_any_password(kind: PromptKind, fields: &[PromptField]) -> bool {
 
 /// Whether a hidden field's label asks for a password, and not for a
 /// one-time code that some servers also call one ("One-time password",
-/// "OTP password", "token password").
+/// "OTP password", "token password"). Only the word or words right
+/// before "password" count, so a user or host name in the label
+/// ("(admin@token-host) Password:") makes it no less a password.
 fn is_password_label(label: &str) -> bool {
     let l = label.to_ascii_lowercase();
-    l.contains("password")
-        && ![
-            "one-time",
-            "one time",
-            "onetime",
-            "otp",
-            "token",
-            "verification",
-            "authenticator",
-        ]
-        .iter()
-        .any(|code| l.contains(code))
+    let Some(at) = l.rfind("password") else {
+        return false;
+    };
+    let before = l[..at].trim_end();
+    ![
+        "one-time",
+        "one time",
+        "onetime",
+        "otp",
+        "token",
+        "verification",
+        "authenticator",
+    ]
+    .iter()
+    .any(|code| {
+        before.strip_suffix(code).is_some_and(|rest| {
+            !rest
+                .chars()
+                .next_back()
+                .is_some_and(|c| c.is_alphanumeric() || matches!(c, '@' | '-' | '.' | '_'))
+        })
+    })
 }
 
 /// The key files in `~/.ssh` tried, in order, when the config names
@@ -4800,6 +4810,39 @@ mod tests {
         });
         assert!(!shown(&fx).contains("only a key"), "{}", shown(&fx));
         assert!(s.prompt_active());
+    }
+
+    #[test]
+    fn only_the_words_before_password_make_it_a_code() {
+        for code in [
+            "One-time password: ",
+            "OTP password:",
+            "Token Password:",
+            "Verification password:",
+        ] {
+            assert!(!is_password_label(code), "{code}");
+        }
+        for pw in [
+            "Password: ",
+            "(admin@token-host) Password:",
+            "otp-user's password:",
+            "Password for token:",
+        ] {
+            assert!(is_password_label(pw), "{pw}");
+        }
+        // A single hidden one-time password is a code: not fetched or kept.
+        let one = |text: &str| PromptField {
+            text: text.into(),
+            echo: false,
+        };
+        assert!(!is_password_prompt(
+            PromptKind::KeyboardInteractive,
+            &[one("One-time password:")]
+        ));
+        assert!(is_password_prompt(
+            PromptKind::KeyboardInteractive,
+            &[one("Password:")]
+        ));
     }
 
     #[test]
