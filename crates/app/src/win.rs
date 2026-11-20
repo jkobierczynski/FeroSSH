@@ -19,6 +19,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant, SystemTime};
 
 use ferossh_auth::Broker;
+use ferossh_config::host_policy::{Policy, Subject};
 use ferossh_config::hotkey::Hotkey;
 use ferossh_config::import::{self, Client};
 use ferossh_config::login::{self, Place, Snippet, Step};
@@ -964,6 +965,8 @@ struct Pane {
     cursor: Option<Cursor>,
     host: Host,
     log: Logging,
+    /// What the security rules forbid on this pane's connection.
+    policy: Policy,
     /// Session > Logs and recordings > Record this pane, while it records.
     cast: Option<Recording>,
     font: FontSpec,
@@ -1516,6 +1519,9 @@ struct Window {
     workspace_after: HashMap<PaneId, (u64, String)>,
     /// Production workspace questions that met another open dialog.
     workspace_asks: Vec<Command>,
+    /// Panes whose next connection a security rule's question already
+    /// allowed.
+    connect_confirmed: HashSet<PaneId>,
     /// The workspaces Window > Workspaces listed when it last opened.
     workspace_names: Vec<String>,
 }
@@ -2758,6 +2764,7 @@ fn create_and_run(launch: Launch, theme: Option<String>) -> Result<()> {
                 layout_owner: claim_last_layout(),
                 workspace_after: HashMap::new(),
                 workspace_asks: Vec::new(),
+                connect_confirmed: HashSet::new(),
                 workspace_names: Vec::new(),
                 run_notes: HashMap::new(),
                 standby: Standby::new(),
@@ -2931,6 +2938,7 @@ fn new_pane(
         cursor: None,
         host: Host::Ask(String::new()),
         log: Logging::default(),
+        policy: Policy::default(),
         cast: None,
         font,
         theme,
@@ -6840,6 +6848,9 @@ impl Window {
             return;
         }
         let env = ssh_env();
+        if !self.connect_allowed(id, destination, extras, &env) {
+            return;
+        }
         if let Some((destination, folder)) = ferossh_config::ssh_config::sftp_url(destination) {
             match Target::resolve_route(&destination, &env) {
                 Ok(mut target) => {
@@ -6916,6 +6927,115 @@ impl Window {
         };
         extras.apply(&mut target);
         self.connect_to(id, target, &env);
+    }
+
+    /// What the security rules forbid for connection `alias` (reaching
+    /// `hostname`, with ssh_config's `Tag` `tag`).
+    fn policy_of(&self, alias: &str, hostname: Option<&str>, tag: Option<&str>) -> Policy {
+        if self.settings.security_rules.is_empty() {
+            return Policy::default();
+        }
+        let tags = ferossh_config::settings::host_tags(tag, self.settings.profile(alias));
+        let folder = load_saved()
+            .into_iter()
+            .find(|h| h.alias.eq_ignore_ascii_case(alias))
+            .and_then(|h| h.folder);
+        self.settings.policy(&Subject {
+            name: alias,
+            hostname,
+            tags: &tags,
+            folder: folder.as_deref(),
+        })
+    }
+
+    /// Whether pane `id` may connect to `destination` now. A security
+    /// rule that asks first queues the question (asked once no state is
+    /// borrowed) and the connection waits for it.
+    fn connect_allowed(
+        &mut self,
+        id: PaneId,
+        destination: &str,
+        extras: &Extras,
+        env: &Env,
+    ) -> bool {
+        if self.connect_confirmed.remove(&id) || self.settings.security_rules.is_empty() {
+            return true;
+        }
+        let lookup = ferossh_config::ssh_config::sftp_url(destination)
+            .map_or_else(|| destination.to_owned(), |(d, _)| d);
+        let target = Target::resolve(&lookup, env);
+        let alias = target
+            .as_ref()
+            .map_or(lookup.as_str(), |t| t.alias.as_str());
+        let policy = self.policy_of(
+            alias,
+            target.as_ref().map(|t| t.hostname.as_str()),
+            target.as_ref().and_then(|t| t.tag.as_deref()),
+        );
+        if !policy.confirm_connect {
+            return true;
+        }
+        self.show(
+            id,
+            &format!(
+                "\x1b[0;90mA security rule asks before connecting to {}.\x1b[0m\r\n",
+                crate::ssh::sanitize_line(alias)
+            ),
+        );
+        self.workspace_asks.push(Command::ConfirmConnect {
+            pane: id,
+            destination: destination.to_owned(),
+            extras: extras.clone(),
+        });
+        // SAFETY: our window; replaces any earlier timer with this id.
+        unsafe { SetTimer(Some(self.hwnd), TIMER_WORKSPACE_ASK, 50, None) };
+        false
+    }
+
+    /// The answer to a security rule's question before connecting pane
+    /// `id` to `destination`.
+    fn connect_answered(&mut self, id: PaneId, destination: &str, extras: &Extras, yes: bool) {
+        if !self.panes.contains_key(&id) {
+            return;
+        }
+        if yes {
+            self.connect_confirmed.insert(id);
+            self.connect_with(id, destination, extras);
+        } else {
+            self.end_host(id);
+            self.show(id, "\x1b[0;90mNot connected.\x1b[0m\r\n");
+            self.ask_destination(id);
+            self.refresh(id);
+        }
+    }
+
+    /// Puts the security rules' limits for a connection on pane `id`:
+    /// a forced session log and no clipboard writes. Returns them, and
+    /// says which apply.
+    fn apply_policy(
+        &mut self,
+        id: PaneId,
+        alias: &str,
+        hostname: &str,
+        tag: Option<&str>,
+    ) -> Policy {
+        let policy = self.policy_of(alias, Some(hostname), tag);
+        let Some(p) = self.panes.get_mut(&id) else {
+            return policy;
+        };
+        p.policy = policy;
+        if policy.log_session {
+            p.log.enabled = true;
+        }
+        if !policy.is_empty() {
+            let text = format!(
+                "\x1b[0;90mSecurity rules: {}.\x1b[0m\r\n",
+                policy.describe().join(", ")
+            );
+            self.show(id, &text);
+            self.update_menu_checks();
+        }
+        policy
     }
 
     /// Whether `destination` logs in over SSH: not a serial port, a
@@ -7050,6 +7170,10 @@ impl Window {
             );
         }
         self.apply_look(id, &target.alias, &target.hostname, target.tag.as_deref());
+        let policy = self.apply_policy(id, &target.alias, &target.hostname, target.tag.as_deref());
+        if policy.no_agent_forwarding {
+            target.forward_agent = false;
+        }
         let x11 = target
             .forward_x11
             .then(|| self.x11_auth(id, shared))
@@ -7084,10 +7208,21 @@ impl Window {
             if !hops.is_empty() {
                 self.via.insert(channel, hops);
             }
-            for hop in session.hops_mut() {
+            let hop_policies: Vec<Policy> = session
+                .hops_mut()
+                .map(|hop| {
+                    let t = &hop.target;
+                    (t.alias.clone(), t.hostname.clone(), t.tag.clone())
+                })
+                .collect::<Vec<_>>()
+                .into_iter()
+                .map(|(a, h, t)| self.policy_of(&a, Some(&h), t.as_deref()))
+                .collect();
+            for (hop, hop_policy) in session.hops_mut().zip(hop_policies) {
                 let profile = self.settings.profile(&hop.target.alias);
-                let source = self.login_source(id, &hop.target.alias);
+                let source = hop_policy.allow_source(self.login_source(id, &hop.target.alias));
                 hop.legacy = profile.is_some_and(|p| p.legacy_algorithms);
+                hop.keys_only = hop_policy.keys_only;
                 hop.password_source = source != PasswordSource::Ask;
                 hop.remember_password = source == PasswordSource::Windows;
             }
@@ -7098,8 +7233,10 @@ impl Window {
         {
             session.set_proxy_password(password);
         }
+        let source = policy.allow_source(source);
         session.x11 = x11;
         session.legacy = legacy;
+        session.keys_only = policy.keys_only;
         session.password_source = source != PasswordSource::Ask;
         session.remember_password = source == PasswordSource::Windows;
         if self.run_login.contains(&id) {
@@ -7150,6 +7287,7 @@ impl Window {
             );
         }
         self.apply_look(id, &target.alias, &target.hostname, target.tag.as_deref());
+        self.apply_policy(id, &target.alias, &target.hostname, target.tag.as_deref());
         let mut session = TelnetSession::new(channel, target);
         let Some(p) = self.panes.get_mut(&id) else {
             return;
@@ -7188,6 +7326,7 @@ impl Window {
             );
         }
         self.apply_look(id, &target.alias, &target.hostname, target.tag.as_deref());
+        let policy = self.apply_policy(id, &target.alias, &target.hostname, target.tag.as_deref());
         let profile = self
             .settings
             .profile(&target.alias)
@@ -7214,6 +7353,7 @@ impl Window {
         if source == PasswordSource::Ask && self.workspace_login(id) {
             source = PasswordSource::Windows;
         }
+        let source = policy.allow_source(source);
         let mut session = WinrmSession::new(channel, target);
         session.password_source = source != PasswordSource::Ask && !ask;
         session.remember_password = source == PasswordSource::Windows;
@@ -10320,6 +10460,10 @@ impl Window {
                         }
                         chrome = true;
                     }
+                    // A security rule may keep the server off this PC's
+                    // clipboard.
+                    Action::ClipboardRequest(_)
+                        if self.panes.get(&id).is_some_and(|p| p.policy.no_clipboard) => {}
                     Action::ClipboardRequest(text) => commands.push(Command::ClipboardWrite(text)),
                     Action::Bell => {
                         if !visible && let Some(p) = self.panes.get_mut(&id) {
@@ -18021,6 +18165,13 @@ impl Window {
             }
             cmd::LOG_TOGGLE => {
                 let p = self.panes.get_mut(&pane)?;
+                if p.log.enabled && p.policy.log_session {
+                    self.show(
+                        pane,
+                        "\x1b[0;90mA security rule keeps this session's log on.\x1b[0m\r\n",
+                    );
+                    return None;
+                }
                 p.log.enabled = !p.log.enabled;
                 if p.log.enabled {
                     self.start_log(pane);
@@ -20721,6 +20872,12 @@ enum Command {
         /// Which shell of the pane it was asked for.
         shell: u64,
     },
+    /// A security rule asks before pane `pane` connects to `destination`.
+    ConfirmConnect {
+        pane: PaneId,
+        destination: String,
+        extras: Extras,
+    },
     /// Tools > New SSH key: the window that asks what to make.
     NewKey,
     /// Settings > Key bindings: the window that changes them.
@@ -23275,6 +23432,38 @@ fn run_command(hwnd: HWND, command: Command) {
                             script,
                             command,
                             shell,
+                        });
+                    });
+                    // SAFETY: our window; replaces any earlier timer with this id.
+                    unsafe { SetTimer(Some(hwnd), TIMER_WORKSPACE_ASK, 500, None) };
+                }
+            }
+        }
+        Command::ConfirmConnect {
+            pane,
+            destination,
+            extras,
+        } => {
+            let text = format!(
+                "A security rule asks before connecting to {}. Connect now?",
+                crate::ssh::sanitize_line(&destination)
+            );
+            match dialog(hwnd, &text, MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2) {
+                Some(answer) => {
+                    let next = with_window(|w| {
+                        w.connect_answered(pane, &destination, &extras, answer == IDYES);
+                        std::mem::take(&mut w.queued)
+                    })
+                    .unwrap_or_default();
+                    run_commands(hwnd, next);
+                }
+                None => {
+                    // Another dialog is open: ask once it has closed.
+                    with_window(|w| {
+                        w.workspace_asks.push(Command::ConfirmConnect {
+                            pane,
+                            destination,
+                            extras,
                         });
                     });
                     // SAFETY: our window; replaces any earlier timer with this id.

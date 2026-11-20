@@ -40,6 +40,10 @@
 //!     Tags production
 //!     Theme Production
 //!     Tint 800000 60
+//! SecurityRule
+//!     Tags production
+//!     KeysOnly yes
+//!     ForwardAgent no
 //! Profile web
 //!     Font "Cascadia Mono"
 //!     FontSize 12
@@ -128,6 +132,7 @@
 use std::fmt::Write as _;
 
 use crate::highlight::{HighlightColour, HighlightRule};
+use crate::host_policy::{Policy, SecurityRule, Subject, policy_for};
 use crate::host_theme::ThemeRule;
 use crate::hotkey::Hotkey;
 use crate::login::{SecretSource, Snippet, Step, parse_hotkey, valid_secret_name};
@@ -817,6 +822,8 @@ pub struct Settings {
     pub recent: Vec<String>,
     /// User theme rules, tried before the built-in tag rules.
     pub theme_rules: Vec<ThemeRule>,
+    /// Security rules by tag, folder or host; see [`crate::host_policy`].
+    pub security_rules: Vec<SecurityRule>,
     /// Keyword highlighting in terminal output (Session > Highlight
     /// keywords). On unless turned off.
     pub highlight: bool,
@@ -1033,6 +1040,7 @@ impl Default for Settings {
             saved_searches: Vec::new(),
             recent: Vec::new(),
             theme_rules: Vec::new(),
+            security_rules: Vec::new(),
             highlight: true,
             highlight_standard: true,
             highlight_rules: Vec::new(),
@@ -1108,6 +1116,7 @@ enum Block {
     Secret(usize),
     Snippet(usize),
     Credential(usize),
+    Security(usize),
 }
 
 fn yes(args: &[String]) -> Option<bool> {
@@ -1241,6 +1250,35 @@ fn highlight_block(r: &HighlightRule) -> String {
     out
 }
 
+/// A `SecurityRule` block, as written to the file.
+fn security_block(r: &SecurityRule) -> String {
+    let mut out = String::from("SecurityRule\n");
+    for (keyword, list) in [
+        ("Hosts", &r.hosts),
+        ("Tags", &r.tags),
+        ("Folders", &r.folders),
+    ] {
+        if !list.is_empty() {
+            let items: Vec<String> = list.iter().map(|x| arg(x)).collect();
+            let _ = writeln!(out, "    {keyword} {}", items.join(" "));
+        }
+    }
+    let l = &r.limits;
+    for (on, line) in [
+        (l.keys_only, "KeysOnly yes"),
+        (l.no_saved_password, "SavePassword no"),
+        (l.no_agent_forwarding, "ForwardAgent no"),
+        (l.no_clipboard, "Clipboard no"),
+        (l.confirm_connect, "ConfirmConnect yes"),
+        (l.log_session, "LogSession yes"),
+    ] {
+        if on {
+            let _ = writeln!(out, "    {line}");
+        }
+    }
+    out
+}
+
 impl Settings {
     pub fn parse(text: &str) -> Self {
         let mut s = Settings::default();
@@ -1321,6 +1359,10 @@ impl Settings {
                 "highlightstandard" => {
                     block = Block::Top;
                     s.highlight_standard = yes(&args).unwrap_or(true);
+                }
+                "securityrule" => {
+                    s.security_rules.push(SecurityRule::default());
+                    block = Block::Security(s.security_rules.len() - 1);
                 }
                 "themerule" => {
                     s.theme_rules.push(ThemeRule::new(""));
@@ -1843,6 +1885,26 @@ impl Settings {
                             _ => {}
                         }
                     }
+                    Block::Security(i) => {
+                        let Some(r) = s.security_rules.get_mut(i) else {
+                            continue;
+                        };
+                        // Each limit is on only when written as such: a
+                        // rule can only tighten.
+                        let on = yes(&args);
+                        match keyword.as_str() {
+                            "hosts" => r.hosts.extend(args),
+                            "tags" => r.tags.extend(args),
+                            "folders" => r.folders.extend(args),
+                            "keysonly" => r.limits.keys_only = on == Some(true),
+                            "savepassword" => r.limits.no_saved_password = on == Some(false),
+                            "forwardagent" => r.limits.no_agent_forwarding = on == Some(false),
+                            "clipboard" => r.limits.no_clipboard = on == Some(false),
+                            "confirmconnect" => r.limits.confirm_connect = on == Some(true),
+                            "logsession" => r.limits.log_session = on == Some(true),
+                            _ => {}
+                        }
+                    }
                     Block::Credential(i) => {
                         let Some(c) = s.credentials.get_mut(i) else {
                             continue;
@@ -1899,6 +1961,7 @@ impl Settings {
         }
         s.theme_rules
             .retain(|r| !r.theme.is_empty() && !(r.hosts.is_empty() && r.tags.is_empty()));
+        s.security_rules.retain(|r| !r.is_inert());
         s.highlight_rules
             .retain(|r| r.regex().is_some() && (r.styled() || r.stop));
         s.secrets.retain(|x| !x.command.is_empty());
@@ -2095,6 +2158,9 @@ impl Settings {
                 let _ = writeln!(out, "    Tint {red:02x}{green:02x}{blue:02x} {amount}");
             }
         }
+        for r in self.security_rules.iter().filter(|r| !r.is_inert()) {
+            out.push_str(&security_block(r));
+        }
         for p in self.profiles.iter().filter(|p| !p.is_empty()) {
             let _ = writeln!(out, "Profile {}", arg(&p.host));
             if let Some(f) = &p.font {
@@ -2263,6 +2329,11 @@ impl Settings {
             .credential
             .as_deref()
             .and_then(|n| self.credential(n))
+    }
+
+    /// The limits the security rules put on `subject`.
+    pub fn policy(&self, subject: &Subject<'_>) -> Policy {
+        policy_for(&self.security_rules, subject)
     }
 
     /// Where host `host`'s password comes from: its credential's source
@@ -3331,5 +3402,38 @@ DesktopShareSelection yes
             Settings::parse("Recent a A a \"b c\"\n").recent,
             ["a", "A", "b c"]
         );
+    }
+
+    #[test]
+    fn security_rules_round_trip_and_only_tighten() {
+        let text = "SecurityRule\n    Tags prod*\n    Folders \"Customers/Big one\"\n    \
+                    KeysOnly yes\n    SavePassword no\n    ForwardAgent no\n    Clipboard no\n    \
+                    ConfirmConnect yes\n    LogSession yes\n\
+                    SecurityRule\n    Hosts lab-*\n    KeysOnly no\n    ForwardAgent yes\n\
+                    SecurityRule\n    LogSession yes\n";
+        let s = Settings::parse(text);
+        // A rule that loosens, or names no host, does nothing and is dropped.
+        assert_eq!(s.security_rules.len(), 1);
+        let r = &s.security_rules[0];
+        assert_eq!(r.folders, ["Customers/Big one"]);
+        let l = r.limits;
+        assert!(l.keys_only && l.no_saved_password && l.no_agent_forwarding);
+        assert!(l.no_clipboard && l.confirm_connect && l.log_session);
+        let again = Settings::parse(&s.to_text());
+        assert_eq!(again.security_rules, s.security_rules);
+        let tags = vec!["Production".to_owned()];
+        let p = s.policy(&Subject {
+            name: "db",
+            tags: &tags,
+            ..Subject::default()
+        });
+        assert!(p.keys_only);
+        let p = s.policy(&Subject {
+            name: "db",
+            folder: Some("Customers/Big one/eu"),
+            ..Subject::default()
+        });
+        assert!(p.log_session);
+        assert!(s.policy(&Subject::default()).is_empty());
     }
 }

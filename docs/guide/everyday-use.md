@@ -214,6 +214,10 @@ A credential is a named login: a user, a key file and a password source, such as
 
 What a credential sets wins over the connection's own user, key file and password source; what it leaves empty does not. A user typed in the address (`root@web`) still wins. Change the credential, and every connection that uses it logs in the new way. Delete it, and they go back to their own login. Secrets stay where they are: the key file on disk, and passwords in the Windows Credential Manager (saved per connection, as before) or your password manager. Credentials live in `ferossh.conf`, so a vault and an encrypted export carry them.
 
+### Security rules by tag or folder
+
+A security rule limits every connection with a tag, in a folder, or matching a host pattern. It can allow keys only (no password login), keep passwords out of the Windows Credential Manager, turn off agent forwarding, keep the server off your clipboard, ask before connecting, or keep a session log that cannot be turned off. Rules only add limits, and a connection lists the ones that apply when it starts. Write them as `SecurityRule` blocks in `ferossh.conf`; see [Settings](settings.md#security-rules).
+
 ### Importing from other clients
 
 File > Import and export > Import connections lists the clients that have saved sessions on your account: PuTTY and KiTTY (from the registry), WinSCP (registry or `WinSCP.ini`), MobaXterm (`MobaXterm.ini`), mRemoteNG (`confCons.xml`) and SecureCRT (its `Config\Sessions` folder). Pick one to see its sessions, untick what you don't want, and choose Import. *From a file...* reads the same files from a portable install or an export.

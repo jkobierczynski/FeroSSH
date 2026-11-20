@@ -675,6 +675,9 @@ pub struct SshSession {
     pub password_source: bool,
     /// Keep a typed password that worked (the Windows Credential Manager).
     pub remember_password: bool,
+    /// A security rule allows keys, the agent or a security key only: a
+    /// password prompt ends the login.
+    pub keys_only: bool,
     /// The kind of the server prompt being answered.
     prompt_kind: Option<PromptKind>,
     /// The source was asked once; a second password prompt is typed.
@@ -885,6 +888,7 @@ impl SshSession {
             legacy_in_use: false,
             password_source: false,
             remember_password: false,
+            keys_only: false,
             prompt_kind: None,
             source_tried: false,
             source_used: false,
@@ -2696,6 +2700,15 @@ impl SshSession {
         let mut effects = Vec::new();
         self.prompt_kind = Some(kind);
         let asks_password = is_password_prompt(kind, &fields);
+        if asks_password && self.keys_only {
+            effects.push(Effect::Show(format!(
+                "\x1b[0;31mA security rule allows only a key, the agent or a security key \
+                 for {}: no password. Not logged in.\x1b[0m\r\n",
+                sanitize_line(&self.target.alias)
+            )));
+            effects.extend(self.close());
+            return effects;
+        }
         if asks_password && self.source_used {
             self.source_used = false;
             effects.push(Effect::Show(dim(
@@ -4653,6 +4666,39 @@ mod tests {
         t.refresh_login(&e).unwrap();
         let args = t.proxy_command.as_ref().unwrap().args.clone();
         assert!(args.contains(&"2300".to_owned()), "{args:?}");
+    }
+
+    #[test]
+    fn keys_only_ends_the_login_at_a_password_prompt() {
+        let dir = temp("keys-only");
+        let e = env(&dir);
+        let mut s = SshSession::new(1, Target::resolve("host", &e).unwrap(), e.known_hosts());
+        trusted(&mut s);
+        s.keys_only = true;
+        s.password_source = true;
+        let fx = s.on_worker(password_prompt(1));
+        assert!(shown(&fx).contains("only a key"), "{fx:?}");
+        assert!(
+            matches!(sent(&fx)[..], [Message::Close { channel: 1 }]),
+            "{fx:?}"
+        );
+        assert!(!s.prompt_active() && !s.fetching_password());
+        // A one-time code is not a password: still asked.
+        let mut s = SshSession::new(1, Target::resolve("host", &e).unwrap(), e.known_hosts());
+        trusted(&mut s);
+        s.keys_only = true;
+        let fx = s.on_worker(Message::Prompt {
+            channel: 1,
+            kind: PromptKind::KeyboardInteractive,
+            name: String::new(),
+            instructions: String::new(),
+            fields: vec![PromptField {
+                text: "Verification code: ".into(),
+                echo: false,
+            }],
+        });
+        assert!(shown(&fx).contains("Verification code"));
+        assert!(s.prompt_active());
     }
 
     #[test]
