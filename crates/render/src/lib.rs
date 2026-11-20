@@ -16,6 +16,8 @@ mod d2d;
 mod font;
 mod grid;
 mod image;
+#[cfg_attr(not(windows), allow(dead_code))]
+mod ligature;
 mod picture;
 mod theme;
 

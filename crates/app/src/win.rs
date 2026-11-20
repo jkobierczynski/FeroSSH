@@ -533,6 +533,8 @@ mod cmd {
     pub const FULL_SCREEN_KEY: u32 = 219;
     /// Tools > Known hosts.
     pub const KNOWN_HOSTS: u32 = 220;
+    /// Settings > Font ligatures.
+    pub const FONT_LIGATURES: u32 = 221;
     /// Settings > Server status bar.
     pub const STATUS_BAR: u32 = 230;
     /// Settings > Key bindings.
@@ -3179,6 +3181,7 @@ fn build_menu() -> Result<HMENU> {
         item(view, cmd::ZOOM_RESET, "&Reset text size\tCtrl+0")?;
         separator(view)?;
         AppendMenuW(view, MF_POPUP, fonts.0 as usize, w!("&Font (this pane)"))?;
+        item(view, cmd::FONT_LIGATURES, "Font li&gatures (-> != ===)")?;
         AppendMenuW(view, MF_POPUP, themes.0 as usize, w!("&Theme (this pane)"))?;
         // Filled from the themes folder each time it opens (`fill_custom_themes`).
         let custom = CreatePopupMenu()?;
@@ -11494,6 +11497,7 @@ impl Window {
                 cursor: p.cursor,
                 full,
                 image: p.image(),
+                ligatures: self.settings.font_ligatures,
             });
         }
         // Port-forward previews, over their panes' top right corner.
@@ -11510,6 +11514,7 @@ impl Window {
                 cursor: None,
                 full: true,
                 image: None,
+                ligatures: false,
             });
         }
         if let Some(s) = self.areas.strip {
@@ -11522,6 +11527,7 @@ impl Window {
                 cursor: None,
                 full: true,
                 image: None,
+                ligatures: false,
             });
         }
         if let Some(s) = self.areas.status {
@@ -11534,6 +11540,7 @@ impl Window {
                 cursor: None,
                 full: true,
                 image: None,
+                ligatures: false,
             });
         }
         if let Some(s) = self.areas.side {
@@ -11546,6 +11553,7 @@ impl Window {
                 cursor: None,
                 full,
                 image: None,
+                ligatures: false,
             });
         }
         let result = self.renderer.draw(&views, &fills, self.dpi);
@@ -16436,6 +16444,12 @@ impl Window {
                 self.save_settings();
                 self.update_menu_checks();
             }
+            cmd::FONT_LIGATURES => {
+                self.settings.font_ligatures = !self.settings.font_ligatures;
+                self.save_settings();
+                self.update_menu_checks();
+                self.request_full_redraw();
+            }
             cmd::COPY => return Some(Command::Copy),
             cmd::PASTE => return Some(Command::Paste),
             cmd::RECORD_SNIPPET => return self.toggle_recording(),
@@ -17756,6 +17770,7 @@ impl Window {
                 (cmd::WORKSPACE_RESTORE, s.restore_layout),
                 (cmd::FULL_SCREEN, self.full_screen.is_some()),
                 (cmd::FULL_SCREEN_KEY, s.full_screen_key),
+                (cmd::FONT_LIGATURES, s.font_ligatures),
                 (cmd::TMUX_KEYS, s.tmux_keys),
                 (cmd::RECORD_SNIPPET, self.recording.is_some()),
                 (
