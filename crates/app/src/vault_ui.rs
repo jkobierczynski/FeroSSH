@@ -456,6 +456,17 @@ pub(super) fn import(hwnd: HWND) {
         h.replaced,
         h.same,
     );
+    if plan.profiles.credentials > 0 {
+        question.push_str(&format!(
+            "\n\nIt also adds or changes {} (Credentials...), which replace yours of the same \
+             name.",
+            plural(
+                plan.profiles.credentials,
+                "named credential",
+                "named credentials"
+            )
+        ));
+    }
     if n_secrets > 0 {
         question.push_str(&if can_keep {
             format!(
@@ -498,6 +509,8 @@ pub(super) fn import(hwnd: HWND) {
         with_window(|w| {
             w.settings.profiles = s.profiles;
             w.settings.favourites = s.favourites;
+            // The credentials the imported profiles name came along.
+            w.settings.credentials = s.credentials;
             if plan.keys > 0 {
                 w.settings.key_bindings = s.key_bindings;
                 w.keymap = Keymap::new(KEY_DEFAULTS, &w.settings.key_bindings);
@@ -1174,8 +1187,11 @@ fn merge_theirs(settings: &mut Settings, theirs: &str) -> bool {
     }
     let base = base.map(|b| Settings::parse(&b)).unwrap_or_default();
     let parsed = Settings::parse(theirs);
-    settings.profiles =
-        bundle::merge_profiles3(&base.profiles, &settings.profiles, &parsed.profiles);
+    // Credentials too: ours where we changed them, else theirs, and a
+    // profile follows a credential renamed on either side.
+    let (profiles, credentials) = bundle::merge_logins3(&base, settings, &parsed);
+    settings.profiles = profiles;
+    settings.credentials = credentials;
     true
 }
 

@@ -575,12 +575,15 @@ mod tests {
 
     #[tokio::test]
     async fn looks_up_over_udp_and_falls_back_to_tcp() {
-        // The UDP port the system picks can be one Windows keeps from TCP
-        // (an excluded port range: WSAEACCES), so try a few.
+        // Windows keeps whole TCP port ranges (excluded ranges: WSAEACCES),
+        // and on some runners a UDP port the system picks falls in one
+        // nearly every time. So the TCP port is picked first, where the
+        // system knows those ranges, and UDP takes the same one; a few
+        // tries for one UDP already holds.
         let mut pair = None;
-        for _ in 0..20 {
-            let udp = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-            if let Ok(tcp) = tokio::net::TcpListener::bind(udp.local_addr().unwrap()).await {
+        for _ in 0..50 {
+            let tcp = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            if let Ok(udp) = UdpSocket::bind(tcp.local_addr().unwrap()).await {
                 pair = Some((udp, tcp));
                 break;
             }

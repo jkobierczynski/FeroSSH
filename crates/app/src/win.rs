@@ -1882,7 +1882,12 @@ fn load_saved() -> Vec<SavedHost> {
 /// imported hosts.
 fn ssh_env() -> Env {
     let home = home();
-    let mut config = std::fs::read_to_string(home.join(".ssh").join("config")).unwrap_or_default();
+    // Named credentials first: their user and key file win (see
+    // Settings::credential_config).
+    let mut config = app_read(&settings_path())
+        .map(|t| Settings::parse(&t).credential_config())
+        .unwrap_or_default();
+    config.push_str(&std::fs::read_to_string(home.join(".ssh").join("config")).unwrap_or_default());
     if let Ok(made) = app_read(&sessions_path()) {
         // A Host line first: the user's last block must not swallow it.
         config.push_str("\nHost !*\n");
@@ -2076,7 +2081,13 @@ fn host_items(env: &Env, settings: &Settings) -> Vec<HostItem> {
                 // As connect() resolves it: the saved user and port.
                 let own = saved.iter().find(|s| s.alias.eq_ignore_ascii_case(&h.name));
                 let https = settings.profile(&h.name).is_some_and(|p| p.winrm_https);
-                let target = WinrmTarget::resolve(&h.name, env, None, https, own);
+                let target = WinrmTarget::resolve(&h.name, env, None, https, own).map(|t| {
+                    t.with_login_user(
+                        settings
+                            .credential_of(&h.name)
+                            .and_then(|c| c.user.as_deref()),
+                    )
+                });
                 let tags = ferossh_config::settings::host_tags(
                     target.as_ref().and_then(|t| t.tag.as_deref()),
                     settings.profile(&h.name),
@@ -6880,6 +6891,13 @@ impl Window {
                     p.winrm_https,
                     saved.as_ref(),
                 )
+                .map(|t| {
+                    t.with_login_user(
+                        self.settings
+                            .credential_of(destination)
+                            .and_then(|c| c.user.as_deref()),
+                    )
+                })
             }
             _ => WinrmTarget::typed(destination),
         };
@@ -7192,7 +7210,7 @@ impl Window {
             && !target.https
             && profile.is_some_and(|p| p.winrm_ntlm)
             && same_endpoint();
-        let mut source = profile.map(|p| p.password.clone()).unwrap_or_default();
+        let mut source = self.settings.password_source(&target.alias);
         if source == PasswordSource::Ask && self.workspace_login(id) {
             source = PasswordSource::Windows;
         }
@@ -7288,14 +7306,42 @@ impl Window {
                 return;
             }
             Some(Host::Winrm(s)) => {
-                let (target, ask) = (s.target.clone(), s.source_refused());
+                let (mut target, ask) = (s.target.clone(), s.source_refused());
+                // A saved connection's credential may name another user now.
+                // Start again from the connection's own user, so a credential
+                // removed or replaced since leaves no user of its own behind.
+                if target.saved {
+                    let alias = target.alias.clone();
+                    let saved = load_saved()
+                        .into_iter()
+                        .find(|h| h.alias.eq_ignore_ascii_case(&alias));
+                    let own = WinrmTarget::resolve(
+                        &alias,
+                        &ssh_env(),
+                        None,
+                        target.https,
+                        saved.as_ref(),
+                    )
+                    .and_then(|t| t.user);
+                    let user = self
+                        .settings
+                        .credential_of(&alias)
+                        .and_then(|c| c.user.clone());
+                    target = target.with_login(own.as_deref(), user.as_deref());
+                }
                 self.connect_winrm_with(id, target, ask);
                 return;
             }
             _ => None,
         };
-        if let Some(target) = target {
-            self.connect_to(id, target, &ssh_env());
+        if let Some(mut target) = target {
+            // A credential changed since counts.
+            let env = ssh_env();
+            if let Err(why) = target.refresh_login(&env) {
+                self.show(id, &login_refused(&why));
+                return;
+            }
+            self.connect_to(id, target, &env);
         }
     }
 
@@ -8023,7 +8069,7 @@ impl Window {
                 .settings
                 .profile(&t.alias)
                 .filter(|p| p.kind == SessionKind::WinRm)
-                .map(|p| p.password.clone())
+                .map(|_| self.settings.password_source(&t.alias))
                 .unwrap_or_default();
             if source == PasswordSource::Ask && self.workspace_login(id) {
                 PasswordSource::Windows
@@ -14386,6 +14432,13 @@ impl Window {
                 .settings
                 .scrollback
                 .unwrap_or(TermSettings::DEFAULT_SCROLLBACK),
+            credentials: self
+                .settings
+                .credentials
+                .iter()
+                .map(|c| c.name.clone())
+                .collect(),
+            credential_logins: self.settings.credentials.clone(),
         };
         let themes: Vec<String> = Theme::builtin().iter().map(|t| t.name.to_owned()).collect();
         let form = match host {
@@ -14469,6 +14522,16 @@ impl Window {
         match action {
             Some(FormAction::Cancel) => self.side.form = None,
             Some(FormAction::Save { connect }) => {
+                // Checked against the credentials as they are now, not as
+                // they were when the form opened: another PC's changes to
+                // a shared vault taken in first, before either file is
+                // written (the save merges again and keeps what is ours).
+                vault_ui::sync_settings(&mut self.settings);
+                let credentials = self.settings.credentials.clone();
+                if !self.side.form.as_mut()?.recheck_with(&credentials) {
+                    self.refresh_chrome();
+                    return None;
+                }
                 let form = self.side.form.as_ref()?;
                 let mut hosts = load_saved();
                 let mut settings = self.settings.clone();
@@ -14476,14 +14539,11 @@ impl Window {
                 // Off the Windows Credential Manager, or to another user, host
                 // or port: the old saved password goes. Its name is resolved
                 // before the connection's settings change.
-                let was_windows = form.original.as_deref().is_some_and(|o| {
-                    self.settings
-                        .profile(o)
-                        .is_some_and(|p| p.password == PasswordSource::Windows)
-                });
-                let still_windows = settings
-                    .profile(&name)
-                    .is_some_and(|p| p.password == PasswordSource::Windows);
+                let was_windows = form
+                    .original
+                    .as_deref()
+                    .is_some_and(|o| self.settings.password_source(o) == PasswordSource::Windows);
+                let still_windows = settings.password_source(&name) == PasswordSource::Windows;
                 // A renamed read-only connection is saved as a copy: the
                 // original stays, and so does its password.
                 let old_target = was_windows
@@ -14504,11 +14564,11 @@ impl Window {
                 if let Err(e) = self.try_save_settings() {
                     return Some(Command::Notice(e));
                 }
+                // Unless another connection keeps its password there too.
                 if let Some(old) = old_target
                     && (!still_windows || self.saved_password_target(&name).as_ref() != Some(&old))
-                    && let Err(e) = credman::delete(&old)
                 {
-                    self.queued.push(Command::Notice(e));
+                    self.forget_unused_passwords(vec![old]);
                 }
                 self.side.form = None;
                 self.reload_sessions(Some(&name));
@@ -14538,12 +14598,23 @@ impl Window {
             .into_iter()
             .find(|h| h.alias.eq_ignore_ascii_case(name));
         let https = self.settings.profile(name).is_some_and(|p| p.winrm_https);
-        WinrmTarget::resolve(name, &ssh_env(), None, https, saved.as_ref())
+        WinrmTarget::resolve(name, &ssh_env(), None, https, saved.as_ref()).map(|t| {
+            t.with_login_user(
+                self.settings
+                    .credential_of(name)
+                    .and_then(|c| c.user.as_deref()),
+            )
+        })
     }
 
     /// The Credential Manager entry of saved connection `name`'s password:
     /// its WinRM or SSH login, as the settings now describe it.
     fn saved_password_target(&self, name: &str) -> Option<String> {
+        self.saved_password_target_in(name, &ssh_env())
+    }
+
+    /// [`Self::saved_password_target`] with ssh_config already read.
+    fn saved_password_target_in(&self, name: &str, env: &Env) -> Option<String> {
         if self
             .settings
             .profile(name)
@@ -14552,8 +14623,84 @@ impl Window {
             let t = self.saved_winrm_target(name)?;
             return Some(credman::target(t.user.as_deref()?, &t.hostname, t.port));
         }
-        let t = Target::resolve(name, &ssh_env())?;
+        let t = Target::resolve(name, env)?;
         Some(credman::target(&t.user, &t.hostname, t.port))
+    }
+
+    /// The Credential Manager entries `names` keep their Windows-stored
+    /// passwords under now, to compare after a change.
+    fn windows_targets_of(&self, names: &[String]) -> Vec<String> {
+        let env = ssh_env();
+        names
+            .iter()
+            .filter(|n| match self.settings.password_source(n) {
+                PasswordSource::Windows => true,
+                // A workspace that logs in by itself keeps an asking
+                // connection's password there too.
+                PasswordSource::Ask => self.settings.workspace_auto_login,
+                PasswordSource::Command(_) => false,
+            })
+            .filter_map(|n| self.saved_password_target_in(n, &env))
+            .collect()
+    }
+
+    /// Forgets the Windows-stored passwords under `old` that no saved
+    /// connection uses any more (as the settings are now): one moved off
+    /// the Windows Credential Manager, or kept under another name. One
+    /// another connection still uses stays. Failures become notices.
+    fn forget_unused_passwords(&mut self, old: Vec<String>) {
+        if old.is_empty() {
+            return;
+        }
+        let env = ssh_env();
+        let targets = |names: Vec<String>, ask_too: bool| -> Vec<String> {
+            names
+                .iter()
+                .filter(|n| match self.settings.password_source(n) {
+                    PasswordSource::Windows => true,
+                    PasswordSource::Ask => ask_too,
+                    PasswordSource::Command(_) => false,
+                })
+                .filter_map(|n| self.saved_password_target_in(n, &env))
+                .collect()
+        };
+        // Every saved connection and profile set to the Windows
+        // Credential Manager (a named credential's source included).
+        let mut names: Vec<String> = load_saved().into_iter().map(|h| h.alias).collect();
+        names.extend(self.settings.profiles.iter().map(|p| p.host.clone()));
+        names.extend(host_items(&env, &self.settings).into_iter().map(|h| h.name));
+        let mut in_use = targets(names, false);
+        // With Log in automatically on, what the saved workspaces open, as
+        // written there (`bob@web` included), keeps its password when it
+        // would ask too; an asking connection no workspace opens does not.
+        if self.settings.workspace_auto_login {
+            in_use.extend(targets(
+                ferossh_config::workspace::all_connections(&workspaces_dir()),
+                true,
+            ));
+        }
+        // Every open pane that keeps its login there: under the host, port
+        // and user it logs in to now, which a reconnect keeps even when
+        // the config has changed since (a workspace opened from outside
+        // the folder too).
+        for (&id, p) in &self.panes {
+            if let Host::Ssh(s) = &p.host
+                && self.login_source(id, &s.target.alias) == PasswordSource::Windows
+            {
+                let t = &s.target;
+                in_use.push(credman::target(&t.user, &t.hostname, t.port));
+            }
+        }
+        let mut done: Vec<String> = Vec::new();
+        for t in old {
+            if in_use.contains(&t) || done.contains(&t) {
+                continue;
+            }
+            if let Err(e) = credman::delete(&t) {
+                self.queued.push(Command::Notice(e));
+            }
+            done.push(t);
+        }
     }
 
     /// Removes saved session `name` (after the user said yes).
@@ -14568,11 +14715,7 @@ impl Window {
         // connections are still saved; removed once they are gone.
         let targets: Vec<String> = names
             .iter()
-            .filter(|name| {
-                self.settings
-                    .profile(name)
-                    .is_some_and(|p| p.password == PasswordSource::Windows)
-            })
+            .filter(|name| self.settings.password_source(name) == PasswordSource::Windows)
             .filter_map(|name| self.saved_password_target(name))
             .collect();
         let mut hosts = load_saved();
@@ -14588,11 +14731,8 @@ impl Window {
             return;
         }
         self.settings = settings;
-        for target in targets {
-            if let Err(e) = credman::delete(&target) {
-                self.queued.push(Command::Notice(e));
-            }
-        }
+        // Unless another connection keeps its password there too.
+        self.forget_unused_passwords(targets);
         self.save_settings();
         self.side.form = None;
         self.reload_sessions(None);
@@ -14652,23 +14792,19 @@ impl Window {
                 // Manager goes once the connection is off it or its user
                 // changes the name it is kept under. Names are resolved
                 // before anything changes.
-                let old_targets: Vec<(String, String)> = if matches!(
+                let old_targets: Vec<String> = if matches!(
                     plan.field,
-                    crate::bulk_edit::EditField::User | crate::bulk_edit::EditField::Password
+                    crate::bulk_edit::EditField::User
+                        | crate::bulk_edit::EditField::Password
+                        | crate::bulk_edit::EditField::Credential
                 ) {
-                    plan.changes
+                    let names: Vec<String> = plan
+                        .changes
                         .iter()
                         .filter(|c| !conflicts.contains(&c.name))
-                        .filter(|c| {
-                            self.settings
-                                .profile(&c.name)
-                                .is_some_and(|p| p.password == PasswordSource::Windows)
-                        })
-                        .filter_map(|c| {
-                            self.saved_password_target(&c.name)
-                                .map(|t| (c.name.clone(), t))
-                        })
-                        .collect()
+                        .map(|c| c.name.clone())
+                        .collect();
+                    self.windows_targets_of(&names)
                 } else {
                     Vec::new()
                 };
@@ -14683,18 +14819,7 @@ impl Window {
                 }
                 let saved_settings = self.try_save_settings();
                 if saved_settings.is_ok() {
-                    for (name, old) in old_targets {
-                        let still_windows = self
-                            .settings
-                            .profile(&name)
-                            .is_some_and(|p| p.password == PasswordSource::Windows);
-                        if (!still_windows
-                            || self.saved_password_target(&name).as_ref() != Some(&old))
-                            && let Err(e) = credman::delete(&old)
-                        {
-                            self.queued.push(Command::Notice(e));
-                        }
-                    }
+                    self.forget_unused_passwords(old_targets);
                 }
                 self.reload_sessions(None);
                 if let Err(e) = saved_settings {
@@ -15701,11 +15826,8 @@ impl Window {
     /// does (in the vault when one is open), when Log in automatically is
     /// on.
     fn login_source(&self, id: PaneId, alias: &str) -> PasswordSource {
-        let source = self
-            .settings
-            .profile(alias)
-            .map(|p| p.password.clone())
-            .unwrap_or_default();
+        // A named credential's source wins over the connection's own.
+        let source = self.settings.password_source(alias);
         if source == PasswordSource::Ask && self.workspace_login(id) {
             PasswordSource::Windows
         } else {
@@ -16247,8 +16369,13 @@ impl Window {
             _ => Like::Ask,
         };
         match like {
-            Like::Ssh(target) => {
-                self.connect_to(id, *target, &ssh_env());
+            Like::Ssh(mut target) => {
+                let env = ssh_env();
+                if let Err(why) = target.refresh_login(&env) {
+                    self.show(id, &login_refused(&why));
+                    return;
+                }
+                self.connect_to(id, *target, &env);
                 if let Some(p) = self.panes.get_mut(&id) {
                     p.start_dir = cwd;
                 }
@@ -21886,7 +22013,13 @@ fn form_event(hwnd: HWND, event: form_view::Event) {
         }
         Event::Browse => with_window(|w| w.form_action(Some(FormAction::BrowseKey))).flatten(),
         Event::Save(connect) => with_window(|w| {
-            let action = w.side.form.as_mut()?.submit(connect);
+            // Checked against the credentials as they are now (a shared
+            // vault's changes taken in), not as when the form opened.
+            vault_ui::sync_settings(&mut w.settings);
+            let credentials = w.settings.credentials.clone();
+            let form = w.side.form.as_mut()?;
+            form.set_credentials(&credentials);
+            let action = form.submit(connect);
             // A problem shows in the form; nothing else happens.
             if action.is_none() {
                 w.refresh_chrome();
@@ -22024,6 +22157,7 @@ fn session_menu(hwnd: HWND, host: Option<String>, search: Option<String>) {
     const NEW: u32 = 5;
     const SAVE_SEARCH: u32 = 6;
     const REMOVE_SEARCH: u32 = 7;
+    const CREDENTIALS: u32 = 8;
     // The search typed, when there is one to save.
     let typed = with_window(|w| {
         let q = w.side.list.query().trim().to_owned();
@@ -22060,6 +22194,7 @@ fn session_menu(hwnd: HWND, host: Option<String>, search: Option<String>) {
             let _ = AppendMenuW(menu, MF_SEPARATOR, 0, None);
         }
         let _ = AppendMenuW(menu, MF_STRING, NEW as usize, w!("&New connection...\tIns"));
+        let _ = AppendMenuW(menu, MF_STRING, CREDENTIALS as usize, w!("C&redentials..."));
         if typed.is_some() || search.is_some() {
             let _ = AppendMenuW(menu, MF_SEPARATOR, 0, None);
         }
@@ -22099,6 +22234,10 @@ fn session_menu(hwnd: HWND, host: Option<String>, search: Option<String>) {
         (EDIT, Some(host)) => SideAction::Edit(host),
         (DELETE, Some(host)) => SideAction::Delete(host),
         (NEW, _) => SideAction::New,
+        (CREDENTIALS, _) => {
+            credentials_menu(hwnd);
+            return;
+        }
         (SAVE_SEARCH, _) => match typed {
             Some(q) => SideAction::SaveSearch(q),
             None => return,
@@ -22111,6 +22250,215 @@ fn session_menu(hwnd: HWND, host: Option<String>, search: Option<String>) {
     };
     if let Some(Some(command)) = with_window(|w| w.side_action(Some(action))) {
         run_command(hwnd, command);
+    }
+}
+
+/// A reconnect or split refused because the way there no longer
+/// resolves, in red.
+fn login_refused(why: &str) -> String {
+    format!(
+        "\x1b[0;31mNot connecting again: {} Check ~/.ssh/config, then connect from the \
+         connection manager.\x1b[0m\r\n",
+        crate::ssh::sanitize(why)
+    )
+}
+
+/// The named credentials: a menu of them and New credential; picking one
+/// opens it to change or delete.
+fn credentials_menu(hwnd: HWND) {
+    use crate::native::wide;
+    const NEW: u32 = 1;
+    const FIRST: u32 = 100;
+    let Some(list) = with_window(|w| {
+        w.settings
+            .credentials
+            .iter()
+            .map(|c| (c.name.clone(), crate::credentials::label(&w.settings, c)))
+            .collect::<Vec<_>>()
+    }) else {
+        return;
+    };
+    // SAFETY: a popup menu of our own on our window; TPM_RETURNCMD
+    // returns the picked id.
+    let picked = unsafe {
+        let Ok(menu) = CreatePopupMenu() else {
+            return;
+        };
+        let _ = AppendMenuW(
+            menu,
+            MF_STRING | MF_GRAYED,
+            0,
+            w!("Credentials many connections share"),
+        );
+        let _ = AppendMenuW(menu, MF_SEPARATOR, 0, None);
+        for (i, (_, label)) in list.iter().take(100).enumerate() {
+            let text = wide(&label.replace('&', "&&"));
+            let _ = AppendMenuW(
+                menu,
+                MF_STRING,
+                (FIRST + i as u32) as usize,
+                PCWSTR(text.as_ptr()),
+            );
+        }
+        if !list.is_empty() {
+            let _ = AppendMenuW(menu, MF_SEPARATOR, 0, None);
+        }
+        let _ = AppendMenuW(menu, MF_STRING, NEW as usize, w!("&New credential..."));
+        let mut pt = POINT::default();
+        let _ = GetCursorPos(&mut pt);
+        let chosen = TrackPopupMenu(
+            menu,
+            TPM_RETURNCMD | TPM_NONOTIFY,
+            pt.x,
+            pt.y,
+            None,
+            hwnd,
+            None,
+        );
+        let _ = DestroyMenu(menu);
+        u32::try_from(chosen.0).unwrap_or(0)
+    };
+    let original = match picked {
+        NEW => None,
+        p if p >= FIRST => match list.get((p - FIRST) as usize) {
+            Some((name, _)) => Some(name.clone()),
+            None => return,
+        },
+        _ => return,
+    };
+    edit_credential(hwnd, original);
+}
+
+/// Opens credential `original` (or a new one) to change, rename or
+/// delete; saves what is typed once it checks out.
+fn edit_credential(hwnd: HWND, original: Option<String>) {
+    use crate::credentials::{Typed, remove, save};
+    let mut typed = original
+        .as_deref()
+        .and_then(|o| with_window(|w| w.settings.credential(o).map(Typed::of)).flatten())
+        .unwrap_or_else(|| Typed {
+            source: "ask".into(),
+            ..Typed::default()
+        });
+    let users = original
+        .as_deref()
+        .and_then(|o| with_window(|w| w.settings.credential_users(o)))
+        .unwrap_or_default();
+    let title = match &original {
+        Some(o) => format!("Credential {o}"),
+        None => "New credential".to_owned(),
+    };
+    let mut intro = "A user, a key file and a password source that many connections share. \
+                     Pick it in a connection's form (Credential), or for many at once with \
+                     Change a field. What it sets wins over each connection's own; what it \
+                     leaves empty does not. Password: ask, windows, or a password manager's \
+                     command (%n is the connection's name)."
+        .to_owned();
+    if !users.is_empty() {
+        intro.push_str(&format!("\n\nUsed by {}.", crate::bulk::name_list(&users)));
+    }
+    loop {
+        if DIALOG_OPEN.get() {
+            return;
+        }
+        DIALOG_OPEN.set(true);
+        let answer = crate::fields_view::ask(
+            hwnd,
+            &crate::fields_view::Ask {
+                title: &title,
+                intro: &intro,
+                fields: &[
+                    ("Name", &typed.name),
+                    ("User", &typed.user),
+                    ("Key file", &typed.key),
+                    ("Password", &typed.source),
+                ],
+                option: original.as_ref().map(|_| ("Delete this credential", false)),
+                ok: "Save",
+                cancel: "Cancel",
+            },
+        );
+        DIALOG_OPEN.set(false);
+        let Some(answer) = answer else {
+            return;
+        };
+        let mut f = answer.fields.into_iter();
+        typed = Typed {
+            name: f.next().unwrap_or_default(),
+            user: f.next().unwrap_or_default(),
+            key: f.next().unwrap_or_default(),
+            source: f.next().unwrap_or_default(),
+        };
+        if answer.option
+            && let Some(o) = &original
+        {
+            let mut text = format!("Delete credential {o}?");
+            if !users.is_empty() {
+                text.push_str(&format!(
+                    " {} go back to their own login.",
+                    crate::bulk::name_list(&users)
+                ));
+            }
+            if dialog(hwnd, &text, MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2) == Some(IDYES) {
+                let failed = with_window(|w| {
+                    let before = w.settings.clone();
+                    // Their logins change: a password kept for the old one
+                    // goes once nothing uses it.
+                    let old = w.windows_targets_of(&w.settings.credential_users(o));
+                    remove(&mut w.settings, o);
+                    match w.try_save_settings() {
+                        Ok(()) => {
+                            w.forget_unused_passwords(old);
+                            w.reload_sessions(None);
+                            None
+                        }
+                        Err(e) => {
+                            // Not on disk, so not here either.
+                            w.settings = before;
+                            Some(e)
+                        }
+                    }
+                })
+                .flatten();
+                let next = with_window(|w| std::mem::take(&mut w.queued)).unwrap_or_default();
+                run_commands(hwnd, next);
+                if let Some(e) = failed {
+                    dialog(hwnd, &e, MB_OK | MB_ICONWARNING);
+                }
+            }
+            return;
+        }
+        let Some(result) = with_window(|w| {
+            let before = w.settings.clone();
+            let old = original
+                .as_deref()
+                .map(|o| w.windows_targets_of(&w.settings.credential_users(o)))
+                .unwrap_or_default();
+            let saved = save(&mut w.settings, original.as_deref(), &typed)?;
+            match w.try_save_settings() {
+                Ok(()) => {
+                    w.forget_unused_passwords(old);
+                    w.reload_sessions(None);
+                    Ok(saved)
+                }
+                Err(e) => {
+                    // Not on disk, so not here either; the window stays
+                    // open with what was typed.
+                    w.settings = before;
+                    Err(e)
+                }
+            }
+        }) else {
+            return;
+        };
+        let next = with_window(|w| std::mem::take(&mut w.queued)).unwrap_or_default();
+        run_commands(hwnd, next);
+        match result {
+            Ok(_) => return,
+            Err(e) => {
+                dialog(hwnd, &e, MB_OK | MB_ICONWARNING);
+            }
+        }
     }
 }
 

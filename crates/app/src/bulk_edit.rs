@@ -21,6 +21,7 @@ pub enum EditField {
     Jump,
     Proxy,
     Password,
+    Credential,
     Theme,
     Font,
     FontSize,
@@ -33,12 +34,13 @@ const DEFAULT_TMUX: &str = "main";
 
 impl EditField {
     /// In menu order.
-    pub const ALL: [Self; 10] = [
+    pub const ALL: [Self; 11] = [
         Self::User,
         Self::Key,
         Self::Jump,
         Self::Proxy,
         Self::Password,
+        Self::Credential,
         Self::Theme,
         Self::Font,
         Self::FontSize,
@@ -53,6 +55,7 @@ impl EditField {
             Self::Jump => "Jump hosts",
             Self::Proxy => "Proxy",
             Self::Password => "Password source",
+            Self::Credential => "Credential",
             Self::Theme => "Theme",
             Self::Font => "Font",
             Self::FontSize => "Font size",
@@ -82,6 +85,10 @@ impl EditField {
                                manager's command; %n stands for the connection's name. Empty: \
                                ask."
             }
+            Self::Credential => {
+                "A named credential: its user, key file and password source win \
+                                 over each connection's own. Empty: their own login."
+            }
             Self::Theme => "A theme's name, as in View > Theme. Empty: the theme rules decide.",
             Self::Font => "A font's name, e.g. Cascadia Mono. Empty: the default font.",
             Self::FontSize => "In points, 4 to 96. Empty: the default size.",
@@ -108,7 +115,7 @@ impl EditField {
         match self {
             Self::User => login || kind == K::WinRm,
             Self::Key | Self::Jump | Self::Proxy => login,
-            Self::Password => login || kind == K::WinRm,
+            Self::Password | Self::Credential => login || kind == K::WinRm,
             Self::Tmux => kind == K::Ssh,
             Self::StartDir => matches!(kind, K::Ssh | K::Mosh),
             Self::Theme | Self::Font | Self::FontSize => !matches!(
@@ -142,6 +149,7 @@ pub fn current(field: EditField, name: &str, saved: &[SavedHost], settings: &Set
             Some(PasswordSource::Windows) => "windows".into(),
             Some(PasswordSource::Command(c)) => c.clone(),
         },
+        EditField::Credential => text(p.and_then(|p| p.credential.as_ref())),
         EditField::Theme => text(p.and_then(|p| p.theme.as_ref())),
         EditField::Font => text(p.and_then(|p| p.font.as_ref())),
         EditField::FontSize => p
@@ -211,7 +219,12 @@ fn plain(text: &str, what: &str) -> Result<(), String> {
 }
 
 /// Checks `typed` for `field` and gives the value as kept.
-fn normalise(field: EditField, typed: &str, themes: &[String]) -> Result<String, String> {
+fn normalise(
+    field: EditField,
+    typed: &str,
+    themes: &[String],
+    settings: &Settings,
+) -> Result<String, String> {
     let v = typed.trim();
     match field {
         EditField::User => {
@@ -272,6 +285,15 @@ fn normalise(field: EditField, typed: &str, themes: &[String]) -> Result<String,
                 v.into()
             })
         }
+        EditField::Credential => {
+            if v.is_empty() {
+                return Ok(String::new());
+            }
+            settings
+                .credential(v)
+                .map(|c| c.name.clone())
+                .ok_or_else(|| format!("There is no credential called {v}."))
+        }
         EditField::Theme => {
             if v.is_empty() {
                 return Ok(String::new());
@@ -326,7 +348,7 @@ pub fn plan(
     settings: &Settings,
     themes: &[String],
 ) -> Result<Plan, String> {
-    let value = normalise(field, typed, themes)?;
+    let value = normalise(field, typed, themes, settings)?;
     let mut changes = Vec::new();
     let mut skipped = Vec::new();
     for t in targets {
@@ -356,7 +378,7 @@ pub fn plan(
             {
                 Some("they go through jump hosts; clear them first")
             }
-            EditField::Password | EditField::User
+            EditField::Password | EditField::User | EditField::Credential
                 if t.kind == SessionKind::WinRm
                     && winrm_without_user(field, &value, host, settings, &t.name) =>
             {
@@ -396,18 +418,31 @@ fn winrm_without_user(
     settings: &Settings,
     name: &str,
 ) -> bool {
+    let profile = settings.profile(name);
+    let mut credential = profile.and_then(|p| p.credential.clone());
+    let mut own_user = host.and_then(|h| h.user.clone()).filter(|u| !u.is_empty());
+    let mut own_source = profile.map(|p| p.password.clone()).unwrap_or_default();
+    // The login after the change: the credential's user and source win,
+    // as when connecting.
     match field {
         EditField::Password => {
-            value != "ask" && host.is_none_or(|h| h.user.as_deref().is_none_or(str::is_empty))
+            own_source = match value {
+                "ask" => PasswordSource::Ask,
+                "windows" => PasswordSource::Windows,
+                cmd => PasswordSource::Command(cmd.to_owned()),
+            };
         }
-        EditField::User => {
-            value.is_empty()
-                && settings
-                    .profile(name)
-                    .is_some_and(|p| p.password != PasswordSource::Ask)
-        }
-        _ => false,
+        EditField::User => own_user = Some(value.to_owned()).filter(|v| !v.is_empty()),
+        EditField::Credential => credential = Some(value.to_owned()).filter(|v| !v.is_empty()),
+        _ => return false,
     }
+    let credential = credential.and_then(|n| settings.credential(&n));
+    let user = credential.and_then(|c| c.user.clone()).or(own_user);
+    let source = match credential {
+        Some(c) if c.password != PasswordSource::Ask => c.password.clone(),
+        _ => own_source,
+    };
+    user.is_none() && source != PasswordSource::Ask
 }
 
 /// The planned hosts that may no longer change, with `saved` read again
@@ -473,6 +508,7 @@ pub fn apply(plan: &Plan, saved: &mut [SavedHost], settings: &mut Settings) -> b
                     cmd => PasswordSource::Command(cmd.to_owned()),
                 };
             }
+            EditField::Credential => p.credential = value.clone(),
             EditField::Theme => p.theme = value.clone(),
             EditField::Font => p.font = value.clone(),
             EditField::FontSize => p.font_size = value.as_deref().and_then(|s| s.parse().ok()),
@@ -489,6 +525,7 @@ fn shown(field: EditField, value: &str) -> String {
     if value.is_empty() {
         return match field {
             EditField::Theme => "(by theme rules)".into(),
+            EditField::Credential => "(their own login)".into(),
             _ => "(empty)".into(),
         };
     }
@@ -675,6 +712,23 @@ mod tests {
     }
 
     #[test]
+    fn a_credential_is_named_for_many() {
+        let mut settings = Settings::parse("Credential ops-admin\n    User ops\n");
+        let t = [
+            target("web", SessionKind::Ssh),
+            target("com1", SessionKind::Serial),
+        ];
+        let p = plan(EditField::Credential, "OPS-ADMIN", &t, &[], &settings, &[]).unwrap();
+        assert_eq!(p.value, "ops-admin");
+        assert_eq!((p.changes.len(), p.skipped.len()), (1, 1));
+        apply(&p, &mut [], &mut settings);
+        assert_eq!(settings.credential_of("web").unwrap().name, "ops-admin");
+        assert!(plan(EditField::Credential, "nope", &t, &[], &settings, &[]).is_err());
+        let p = plan(EditField::Credential, "", &t, &[], &settings, &[]).unwrap();
+        assert!(preview(&p).contains("(their own login)"));
+    }
+
+    #[test]
     fn jump_hosts_and_proxies_are_checked_per_host() {
         let mut saved = vec![saved_host("bastion", None), saved_host("web", None)];
         saved[1].proxy_server = Some("socks5://proxy:1080".into());
@@ -759,6 +813,27 @@ mod tests {
         let p = plan(EditField::User, "", &t[1..], &saved, &settings, &[]).unwrap();
         assert!(p.changes.is_empty());
         assert_eq!(p.skipped.len(), 1, "a password source needs a user");
+    }
+
+    #[test]
+    fn a_credential_must_leave_winrm_a_user_for_its_password_source() {
+        let saved = vec![saved_host("win", None)];
+        let t = [target("win", SessionKind::WinRm)];
+        let settings = Settings::parse(
+            "Credential nouser\n    PasswordSource windows\nCredential ops\n    User ops\n    PasswordSource windows\n",
+        );
+        let p = plan(EditField::Credential, "nouser", &t, &saved, &settings, &[]).unwrap();
+        assert!(p.changes.is_empty());
+        assert_eq!(p.skipped.len(), 1);
+        let p = plan(EditField::Credential, "ops", &t, &saved, &settings, &[]).unwrap();
+        assert_eq!(p.changes.len(), 1);
+        // Taking the credential away leaves its own source without a user.
+        let mut settings = settings;
+        settings.profile_mut("win").credential = Some("ops".into());
+        settings.profile_mut("win").password = PasswordSource::Windows;
+        let p = plan(EditField::Credential, "", &t, &saved, &settings, &[]).unwrap();
+        assert!(p.changes.is_empty());
+        assert_eq!(p.skipped.len(), 1);
     }
 
     #[test]

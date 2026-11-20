@@ -178,6 +178,38 @@ impl Workspace {
     pub fn pane_count(&self) -> usize {
         self.tabs.iter().map(|t| t.root.panes().len()).sum()
     }
+
+    /// What its panes connect to, as written (`bob@web`, `web:2222`),
+    /// each once.
+    pub fn connections(&self) -> Vec<String> {
+        let mut out: Vec<String> = Vec::new();
+        for t in &self.tabs {
+            for p in t.root.panes() {
+                if let Open::Connection(c) = &p.open
+                    && !out.iter().any(|o| o.eq_ignore_ascii_case(c))
+                {
+                    out.push(c.clone());
+                }
+            }
+        }
+        out
+    }
+}
+
+/// What every workspace saved in `dir` connects to, each once.
+pub fn all_connections(dir: &Path) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for name in list(dir) {
+        let Some(ws) = listed(dir, &name).and_then(|p| read(&p).ok()) else {
+            continue;
+        };
+        for c in ws.connections() {
+            if !out.iter().any(|o| o.eq_ignore_ascii_case(&c)) {
+                out.push(c);
+            }
+        }
+    }
+    out
 }
 
 /// A split ratio as written: percent, 10 to 90.
@@ -739,6 +771,37 @@ mod tests {
         let many = "Tab\nPane local\n".repeat(MAX_TABS + 1);
         assert!(parse(&many).is_err());
         assert!(parse("Active 7\nTab\nPane local\n").unwrap().active == 0);
+    }
+
+    #[test]
+    fn connections_are_listed_as_written_once() {
+        let dir = std::env::temp_dir().join(format!("ferossh-ws-conn-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(all_connections(&dir).is_empty());
+        let tab = |root: Layout| TabSpec { root, focus: 0 };
+        let split = |first: Layout, second: Layout| Layout::Split {
+            down: false,
+            ratio: 0.5,
+            first: Box::new(first),
+            second: Box::new(second),
+        };
+        let conn = |c: &str| pane(Open::Connection(c.into()));
+        let a = Workspace {
+            tabs: vec![
+                tab(split(conn("bob@web"), pane(Open::Local))),
+                tab(conn("web:2222")),
+            ],
+            active: 0,
+        };
+        let b = Workspace {
+            tabs: vec![tab(split(conn("BOB@web"), conn("db")))],
+            active: 0,
+        };
+        assert_eq!(a.connections(), ["bob@web", "web:2222"]);
+        write(&path_for(&dir, "a").unwrap(), &a).unwrap();
+        write(&path_for(&dir, "b").unwrap(), &b).unwrap();
+        assert_eq!(all_connections(&dir), ["bob@web", "web:2222", "db"]);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

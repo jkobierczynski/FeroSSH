@@ -47,6 +47,8 @@ mod clipboard;
 mod conn_view;
 #[cfg(windows)]
 mod conpty;
+#[cfg_attr(not(windows), allow(dead_code))]
+mod credentials;
 #[cfg(windows)]
 mod credman;
 #[cfg(feature = "viewer")]
