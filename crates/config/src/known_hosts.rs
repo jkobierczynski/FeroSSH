@@ -401,26 +401,261 @@ fn rewrite(path: &Path, host: &str, port: u16, key: Option<&[u8]>) -> io::Result
     replace_file(path, out.as_bytes())
 }
 
+/// What a known_hosts line is, as the known hosts manager lists it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LineKind {
+    /// A trusted host key.
+    HostKey,
+    /// `@cert-authority`: a CA trusted to sign host certificates.
+    CertAuthority,
+    /// `@revoked`: a key that is always refused.
+    Revoked,
+    /// A line OpenSSH and FeroSSH skip: an unknown `@` marker, a key that
+    /// does not decode, or one whose type disagrees with the line's.
+    Unreadable,
+}
+
+impl LineKind {
+    pub fn label(self) -> &'static str {
+        match self {
+            LineKind::HostKey => "Host key",
+            LineKind::CertAuthority => "CA",
+            LineKind::Revoked => "Revoked",
+            LineKind::Unreadable => "Unreadable",
+        }
+    }
+}
+
+/// One line of a known_hosts file that is not blank or a comment.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Listing {
+    /// 1-based.
+    pub line: usize,
+    /// The line as it is in the file, so a removal can check it is still
+    /// there.
+    pub text: String,
+    pub kind: LineKind,
+    /// The host patterns as written; `None` for a hashed name
+    /// (`|1|salt|hash`), which only a host name typed in can match.
+    pub hosts: Option<String>,
+    /// The key type the line names (`ssh-ed25519`, ...).
+    pub key_type: String,
+    /// The key in SSH wire format; empty for an unreadable line.
+    pub key: Vec<u8>,
+    /// Whatever follows the key.
+    pub comment: String,
+    hashed: Option<(Vec<u8>, Vec<u8>)>,
+}
+
+impl Listing {
+    /// Whether the line is for `host` on `port`, the way a connection
+    /// looks it up: a hashed name is checked against the name, a pattern
+    /// list matched with its wildcards and `!` negations.
+    pub fn matches_host(&self, host: &str, port: u16) -> bool {
+        let token = host_token(host, port);
+        match (&self.hashed, &self.hosts) {
+            (Some((salt, hash)), _) => host_matches(
+                &Hosts::Hashed {
+                    salt: salt.clone(),
+                    hash: hash.clone(),
+                },
+                &token,
+            ),
+            (None, Some(list)) => match_pattern_list(list, &token),
+            (None, None) => false,
+        }
+    }
+}
+
+/// Every line of known_hosts text that is not blank or a comment, in
+/// order, unreadable ones included so they can be found and removed.
+pub fn list(text: &str) -> Vec<Listing> {
+    text.lines()
+        .enumerate()
+        .filter_map(|(i, line)| list_line(i + 1, line))
+        .collect()
+}
+
+fn list_line(line_no: usize, line: &str) -> Option<Listing> {
+    let mut fields = line.split_ascii_whitespace();
+    let first = fields.next()?;
+    if first.starts_with('#') {
+        return None;
+    }
+    let mut unknown_marker = false;
+    let host_field = match first {
+        "@cert-authority" | "@revoked" => fields.next(),
+        m if m.starts_with('@') => {
+            unknown_marker = true;
+            fields.next()
+        }
+        _ => Some(first),
+    };
+    let key_type = fields.next().unwrap_or_default().to_owned();
+    let _key_field = fields.next();
+    let comment = fields.collect::<Vec<_>>().join(" ");
+    let parsed = (!unknown_marker)
+        .then(|| parse_line(line_no, line))
+        .flatten();
+    let hosts_text = host_field.unwrap_or_default();
+    let hashed = match parsed.as_ref().map(|e| &e.hosts) {
+        Some(Hosts::Hashed { salt, hash }) => Some((salt.clone(), hash.clone())),
+        _ => None,
+    };
+    let hosts = if hashed.is_some() || hosts_text.starts_with("|1|") {
+        None
+    } else {
+        Some(hosts_text.to_owned())
+    };
+    let kind = match parsed.as_ref().map(|e| e.marker) {
+        None => LineKind::Unreadable,
+        Some(None) => LineKind::HostKey,
+        Some(Some(Marker::CertAuthority)) => LineKind::CertAuthority,
+        Some(Some(Marker::Revoked)) => LineKind::Revoked,
+    };
+    Some(Listing {
+        line: line_no,
+        text: line.to_owned(),
+        kind,
+        hosts,
+        key_type,
+        key: parsed.map(|e| e.key).unwrap_or_default(),
+        comment,
+        hashed,
+    })
+}
+
+/// Removes whole lines from the known_hosts file at `path`: each given
+/// by its 1-based number and its text as listed. Nothing is written when
+/// any of them is no longer there as listed (the file changed since):
+/// the error says so, and the caller lists the file again. Returns how
+/// many lines went. The file is rewritten through a temporary file.
+pub fn remove_lines(path: &Path, lines: &[(usize, String)]) -> io::Result<usize> {
+    if lines.is_empty() {
+        return Ok(0);
+    }
+    let raw = fs::read(path)?;
+    let text = decode(&raw)?;
+    check_lines(path, &text, lines)?;
+    let mut out: Vec<u8> = Vec::with_capacity(raw.len());
+    let mut removed = 0;
+    // Kept lines are copied byte for byte, line ends (CRLF too) and
+    // bytes that are not UTF-8 in comments included. A file with UTF-16
+    // in it is rewritten as UTF-8, as adding a key does.
+    let utf16 = raw.contains(&0);
+    if utf16 && text.contains('\u{FFFD}') {
+        // Rewriting it as UTF-8 would turn bytes it could not read in a
+        // comment into U+FFFD: nothing is written instead.
+        return Err(io::Error::other(format!(
+            "{} mixes UTF-16 with bytes that are not text; nothing was removed. \
+             Save it as UTF-8 (or remove the line in an editor) and try again.",
+            path.display()
+        )));
+    }
+    let parts: Vec<&[u8]> = if utf16 {
+        text.split_inclusive('\n').map(str::as_bytes).collect()
+    } else {
+        raw.split_inclusive(|&b| b == b'\n').collect()
+    };
+    for (i, line) in parts.into_iter().enumerate() {
+        if lines.iter().any(|(n, _)| *n == i + 1) {
+            removed += 1;
+            continue;
+        }
+        out.extend_from_slice(line);
+    }
+    write_over(path, &out, Some(&raw))?;
+    Ok(removed)
+}
+
+/// Checks, before anything is written, that each listed line of `path`
+/// is still the text that was shown.
+pub fn check_lines(path: &Path, text: &str, lines: &[(usize, String)]) -> io::Result<()> {
+    let all: Vec<&str> = text.lines().collect();
+    for (n, expected) in lines {
+        let found = n
+            .checked_sub(1)
+            .and_then(|i| all.get(i))
+            .is_some_and(|l| l == expected);
+        if !found {
+            return Err(changed_error(path, *n));
+        }
+    }
+    Ok(())
+}
+
+fn changed_error(path: &Path, n: usize) -> io::Error {
+    io::Error::other(format!(
+        "{} changed since it was listed (line {n} is not what was shown). \
+         The list was read again; check it and try once more.",
+        path.display()
+    ))
+}
+
 /// Writes `data` to `path` through a fresh temporary file next to it,
 /// then renames it into place. The temporary file is created new, never
 /// opened over an existing one, so it can never be another file the
 /// user named (a second known_hosts called `pin.ferossh-tmp`, say).
 fn replace_file(path: &Path, data: &[u8]) -> io::Result<()> {
+    write_over(path, data, None)
+}
+
+/// [`replace_file`], with two more guards. A symbolic link is followed,
+/// so the file it points at is rewritten and the link stays a link. When
+/// `unchanged` is given, the file is read again just before the rename
+/// and nothing is replaced if it no longer holds those bytes (another
+/// program wrote to it meanwhile). The new file gets the old one's
+/// permissions; on Unix it is created owner-only first.
+fn write_over(path: &Path, data: &[u8], unchanged: Option<&[u8]>) -> io::Result<()> {
+    let real = match fs::symlink_metadata(path) {
+        Ok(m) if m.file_type().is_symlink() => fs::canonicalize(path)?,
+        _ => path.to_path_buf(),
+    };
+    let path = real.as_path();
+    let old_perms = fs::metadata(path).ok().map(|m| m.permissions());
     let name = path.file_name().unwrap_or_default().to_string_lossy();
     for n in 0u32..1000 {
         let tmp = path.with_file_name(format!(".{name}.{}-{n}.ferossh-tmp", std::process::id()));
-        let mut file = match fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&tmp)
+        let mut opts = fs::OpenOptions::new();
+        opts.write(true).create_new(true);
+        #[cfg(unix)]
         {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(0o600);
+        }
+        let mut file = match opts.open(&tmp) {
             Ok(f) => f,
             Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
             Err(e) => return Err(e),
         };
         let written = file.write_all(data).and_then(|()| file.sync_all());
         drop(file);
-        if let Err(e) = written.and_then(|()| fs::rename(&tmp, path)) {
+        let done = written
+            .and_then(|()| match &old_perms {
+                Some(p) => fs::set_permissions(&tmp, p.clone()),
+                None => Ok(()),
+            })
+            .and_then(|()| match unchanged {
+                Some(before) if fs::read(path)? != before => Err(io::Error::other(format!(
+                    "{} was changed by another program just now; nothing was removed. \
+                     The list was read again; check it and try once more.",
+                    path.display()
+                ))),
+                _ => Ok(()),
+            })
+            .and_then(|()| commit(&tmp, path, old_perms.is_some()));
+        if let Err(e) = done {
+            // A file that was there and is gone now (a replace that failed
+            // halfway): the temporary file holds the only copy, so it stays
+            // and the error names it.
+            if old_perms.is_some() && fs::symlink_metadata(path).is_err() {
+                return Err(io::Error::other(format!(
+                    "{e}. {} is missing now; its new contents are in {}: rename that file to {} to restore it.",
+                    path.display(),
+                    tmp.display(),
+                    name
+                )));
+            }
             let _ = fs::remove_file(&tmp);
             return Err(e);
         }
@@ -430,6 +665,48 @@ fn replace_file(path: &Path, data: &[u8]) -> io::Result<()> {
         io::ErrorKind::AlreadyExists,
         "no free temporary file name next to the known_hosts file",
     ))
+}
+
+/// Puts `tmp` in `path`'s place. On Windows an existing file is replaced
+/// with `ReplaceFileW`, which keeps the old file's security descriptor
+/// (its ACL, which may be stricter than the folder's) and attributes; a
+/// plain rename would give the new file the folder's inherited ACL.
+#[cfg(windows)]
+#[allow(unsafe_code)]
+fn commit(tmp: &Path, path: &Path, existed: bool) -> io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows::Win32::Storage::FileSystem::{REPLACE_FILE_FLAGS, ReplaceFileW};
+    use windows::core::PCWSTR;
+    if !existed {
+        return fs::rename(tmp, path);
+    }
+    let wide = |p: &Path| -> Vec<u16> { p.as_os_str().encode_wide().chain([0]).collect() };
+    let (to, from) = (wide(path), wide(tmp));
+    // SAFETY: both names are NUL-terminated and live through the call.
+    unsafe {
+        ReplaceFileW(
+            PCWSTR(to.as_ptr()),
+            PCWSTR(from.as_ptr()),
+            PCWSTR::null(),
+            REPLACE_FILE_FLAGS(0),
+            None,
+            None,
+        )
+    }
+    .or_else(|e| {
+        // ERROR_UNABLE_TO_MOVE_REPLACEMENT: the old file is gone but the
+        // new one is still at its temporary name; move it into place
+        // rather than leave no known_hosts at all.
+        if e.code() == windows::core::HRESULT::from_win32(1176) {
+            return fs::rename(tmp, path);
+        }
+        Err(io::Error::other(format!("{}: {e}", path.display())))
+    })
+}
+
+#[cfg(not(windows))]
+fn commit(tmp: &Path, path: &Path, _existed: bool) -> io::Result<()> {
+    fs::rename(tmp, path)
 }
 
 /// A plain host list with `token` taken out, for a line that keeps the
@@ -553,6 +830,150 @@ mod tests {
             key_type(key).unwrap(),
             Base64::encode_string(key)
         )
+    }
+
+    #[test]
+    fn listing_shows_every_kind_of_line() {
+        let host = blob("ssh-ed25519", b"host");
+        let ca = blob("ssh-ed25519", b"ca");
+        let gone = blob("ssh-rsa", b"gone");
+        let hashed = hashed_line("secret.example", 2222, &host).unwrap();
+        let text = format!(
+            "# a comment\n\n{} me@pc\n@cert-authority {}\n@revoked {}\n{hashed}\n\
+             @weird host ssh-ed25519 AAAA\nbad ssh-ed25519 !!!\n",
+            line("a.example,10.0.0.1", &host),
+            line("*.example", &ca),
+            line("*", &gone),
+        );
+        let l = list(&text);
+        assert_eq!(l.len(), 6);
+        assert_eq!(l[0].line, 3);
+        assert_eq!(l[0].kind, LineKind::HostKey);
+        assert_eq!(l[0].hosts.as_deref(), Some("a.example,10.0.0.1"));
+        assert_eq!(l[0].key_type, "ssh-ed25519");
+        assert_eq!(l[0].key, host);
+        assert_eq!(l[0].comment, "me@pc");
+        assert!(l[0].matches_host("A.example", 22));
+        assert!(!l[0].matches_host("a.example", 2200));
+        assert_eq!(l[1].kind, LineKind::CertAuthority);
+        assert!(l[1].matches_host("web.example", 22));
+        assert_eq!(l[2].kind, LineKind::Revoked);
+        assert_eq!(l[2].key_type, "ssh-rsa");
+        // A hashed name shows no host; only the right name and port match.
+        assert_eq!(l[3].hosts, None);
+        assert!(l[3].matches_host("secret.example", 2222));
+        assert!(!l[3].matches_host("secret.example", 22));
+        assert!(!l[3].matches_host("other.example", 2222));
+        // Lines a lookup skips are listed so they can be removed.
+        assert_eq!(l[4].kind, LineKind::Unreadable);
+        assert_eq!(l[4].hosts.as_deref(), Some("host"));
+        assert_eq!(l[5].kind, LineKind::Unreadable);
+        assert!(l[5].key.is_empty());
+        // Still found by its host, to be removed.
+        assert!(l[5].matches_host("bad", 22));
+        // Each keeps its text for a checked removal.
+        for e in &l {
+            assert_eq!(text.lines().nth(e.line - 1), Some(e.text.as_str()));
+        }
+    }
+
+    #[test]
+    fn removing_lines_checks_they_are_unchanged() {
+        let dir = std::env::temp_dir().join(format!("ferossh-kh-rm-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("known_hosts");
+        let a = blob("ssh-ed25519", b"a");
+        let b = blob("ssh-ed25519", b"b");
+        let text = format!(
+            "# keep me\r\n{}\r\n{}\n@revoked {}\n",
+            line("a", &a),
+            line("b", &b),
+            line("*", &a)
+        );
+        fs::write(&path, &text).unwrap();
+        let l = list(&read(&path).unwrap());
+        // A line that is not what was listed: nothing is written.
+        let stale = vec![
+            (l[0].line, l[0].text.clone()),
+            (l[1].line, "b x y".to_owned()),
+        ];
+        assert!(remove_lines(&path, &stale).is_err());
+        assert_eq!(fs::read_to_string(&path).unwrap(), text);
+        let past_end = vec![(99, l[0].text.clone())];
+        assert!(remove_lines(&path, &past_end).is_err());
+        assert_eq!(remove_lines(&path, &[]).unwrap(), 0);
+        // The right lines go; the rest stay, comments included.
+        let both = vec![
+            (l[0].line, l[0].text.clone()),
+            (l[2].line, l[2].text.clone()),
+        ];
+        assert_eq!(remove_lines(&path, &both).unwrap(), 2);
+        let after = fs::read_to_string(&path).unwrap();
+        // Kept lines keep their own line ends.
+        assert_eq!(after, format!("# keep me\r\n{}\n", line("b", &b)));
+        // ...and their bytes, even ones that are not UTF-8 in a comment.
+        let mut raw = b"# caf\xe9\r\n".to_vec();
+        raw.extend_from_slice(format!("{}\n", line("a", &a)).as_bytes());
+        fs::write(&path, &raw).unwrap();
+        let l = list(&read(&path).unwrap());
+        let a_line = l.iter().find(|x| x.kind == LineKind::HostKey).unwrap();
+        assert_eq!(
+            remove_lines(&path, &[(a_line.line, a_line.text.clone())]).unwrap(),
+            1
+        );
+        assert_eq!(fs::read(&path).unwrap(), b"# caf\xe9\r\n");
+        // Such a byte before a UTF-16 part cannot be kept: nothing is written.
+        let mut mixed = b"# caf\xe9\n".to_vec();
+        for u in format!("{}\n", line("a", &a)).encode_utf16() {
+            mixed.extend_from_slice(&u.to_le_bytes());
+        }
+        fs::write(&path, &mixed).unwrap();
+        let l = list(&read(&path).unwrap());
+        let a_line = l.iter().find(|x| x.kind == LineKind::HostKey).unwrap();
+        assert!(remove_lines(&path, &[(a_line.line, a_line.text.clone())]).is_err());
+        assert_eq!(fs::read(&path).unwrap(), mixed);
+        fs::write(&path, &after).unwrap();
+        let kh = KnownHosts::parse(&after);
+        assert_eq!(kh.check("a", 22, &a), Status::Unknown);
+        assert_eq!(kh.check("b", 22, &b), Status::Trusted);
+        // No temporary file is left behind.
+        assert_eq!(fs::read_dir(&dir).unwrap().count(), 1);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn removing_lines_keeps_links_and_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("ferossh-kh-link-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let real = dir.join("real_hosts");
+        let link = dir.join("known_hosts");
+        let a = blob("ssh-ed25519", b"a");
+        let b = blob("ssh-ed25519", b"b");
+        fs::write(&real, format!("{}\n{}\n", line("a", &a), line("b", &b))).unwrap();
+        fs::set_permissions(&real, fs::Permissions::from_mode(0o640)).unwrap();
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let l = list(&read(&link).unwrap());
+        assert_eq!(
+            remove_lines(&link, &[(l[0].line, l[0].text.clone())]).unwrap(),
+            1
+        );
+        assert!(
+            fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(
+            fs::read_to_string(&real).unwrap(),
+            format!("{}\n", line("b", &b))
+        );
+        assert_eq!(
+            fs::metadata(&real).unwrap().permissions().mode() & 0o777,
+            0o640
+        );
+        fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

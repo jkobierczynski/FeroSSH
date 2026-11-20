@@ -260,3 +260,10 @@ path = "fuzz_targets/image_feed.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "dns_reply"
+path = "fuzz_targets/dns_reply.rs"
+test = false
+doc = false
+bench = false
