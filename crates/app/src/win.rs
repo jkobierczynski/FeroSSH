@@ -7047,6 +7047,9 @@ impl Window {
     /// Like [`Self::connect`], with the command line's `-N` and forwards
     /// for an SSH login.
     fn connect_with(&mut self, id: PaneId, destination: &str, extras: &Extras) {
+        // A connection picked anew, even one with the old name, is not the
+        // renamed one: only a reconnect follows a rename.
+        self.inventory_renames.remove(&id);
         // An `ssh://` link is the host it names; one that does not parse
         // is never read as a host name.
         let link;
