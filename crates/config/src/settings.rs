@@ -238,6 +238,45 @@ pub struct Profile {
     /// ssh_config's `Tag` may give it: searched for in the connection
     /// manager and matched by the colour theme rules. See [`parse_tags`].
     pub tags: Vec<String>,
+    /// The named login it uses (`Credential ops-admin`): its user, key
+    /// file and password source win over the connection's own.
+    pub credential: Option<String>,
+}
+
+/// A named login many connections share (`Credential ops-admin`): a
+/// user, a key file and a password source. Changing it changes every
+/// connection that names it. Secrets stay where they are: the key file
+/// on disk, passwords in the Windows Credential Manager or the password
+/// manager.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Credential {
+    pub name: String,
+    pub user: Option<String>,
+    pub key: Option<String>,
+    pub password: PasswordSource,
+}
+
+/// Whether `name` can name a credential: as a connection's name.
+pub fn valid_credential_name(name: &str) -> bool {
+    crate::saved::valid_alias(name)
+}
+
+/// Whether `user` can be a credential's user: no spaces, quotes or
+/// control characters (WinRM's `user@domain` is fine).
+pub fn valid_login_user(user: &str) -> bool {
+    !user.is_empty()
+        && user.chars().count() <= 128
+        && !user
+            .chars()
+            .any(|c| c.is_whitespace() || c.is_control() || matches!(c, '"' | '#'))
+}
+
+/// Whether `path` can be a credential's key file: no quotes or control
+/// characters.
+pub fn valid_key_path(path: &str) -> bool {
+    !path.is_empty()
+        && path.chars().count() <= 260
+        && !path.chars().any(|c| c.is_control() || c == '"')
 }
 
 /// The ways copied text can travel, as the clipboard settings spell
@@ -622,6 +661,7 @@ impl Profile {
             && !self.winrm_https
             && !self.winrm_ntlm
             && self.tags.is_empty()
+            && self.credential.is_none()
     }
 }
 
@@ -891,6 +931,8 @@ pub struct Settings {
     /// Password manager commands for login script secrets; the rest are
     /// in the Windows Credential Manager.
     pub secrets: Vec<SecretSource>,
+    /// Named logins connections share (`Credential` blocks).
+    pub credentials: Vec<Credential>,
     /// Command snippets. They live in the snippets folder, a file each
     /// (see [`crate::snippet_store`]); `Snippet` blocks read from this
     /// file are from an older FeroSSH, to be moved there. Until they are
@@ -1029,6 +1071,7 @@ impl Default for Settings {
             x11_display: None,
             update_check_weekly: false,
             secrets: Vec::new(),
+            credentials: Vec::new(),
             snippets: Vec::new(),
             confirm_production: true,
             full_screen_key: true,
@@ -1064,6 +1107,7 @@ enum Block {
     Highlight(usize),
     Secret(usize),
     Snippet(usize),
+    Credential(usize),
 }
 
 fn yes(args: &[String]) -> Option<bool> {
@@ -1219,6 +1263,21 @@ impl Settings {
                         ..Profile::default()
                     });
                     block = Block::Profile(s.profiles.len() - 1);
+                }
+                // Unindented: a credential of its own. Indented, inside a
+                // Profile, it names the one that host uses.
+                "credential" if !line.starts_with(char::is_whitespace) => {
+                    let Some(name) = first.filter(|n| valid_credential_name(n)) else {
+                        block = Block::Top;
+                        continue;
+                    };
+                    s.credentials
+                        .retain(|x| !x.name.eq_ignore_ascii_case(&name));
+                    s.credentials.push(Credential {
+                        name,
+                        ..Credential::default()
+                    });
+                    block = Block::Credential(s.credentials.len() - 1);
                 }
                 "secret" => {
                     let Some(name) = first.filter(|n| valid_secret_name(n)) else {
@@ -1716,6 +1775,9 @@ impl Settings {
                             }
                             // Bad tags in a hand-edited file are left out,
                             // the good ones kept.
+                            "credential" => {
+                                p.credential = first.filter(|n| valid_credential_name(n));
+                            }
                             "tags" => {
                                 for word in &args {
                                     for t in word.split(',') {
@@ -1778,6 +1840,36 @@ impl Settings {
                             "underline" => r.underline = yes(&args).unwrap_or(false),
                             "hosts" => r.hosts.extend(args),
                             "stop" => r.stop = yes(&args).unwrap_or(false),
+                            _ => {}
+                        }
+                    }
+                    Block::Credential(i) => {
+                        let Some(c) = s.credentials.get_mut(i) else {
+                            continue;
+                        };
+                        match keyword.as_str() {
+                            "user" => c.user = first.filter(|u| valid_login_user(u)),
+                            "identityfile" => {
+                                let path = raw_rest(line);
+                                let path = path.trim().trim_matches('"');
+                                c.key = valid_key_path(path).then(|| path.to_owned());
+                            }
+                            "passwordsource" => {
+                                c.password = match first.as_deref() {
+                                    Some(v) if v.eq_ignore_ascii_case("windows") => {
+                                        PasswordSource::Windows
+                                    }
+                                    _ => PasswordSource::Ask,
+                                };
+                            }
+                            "passwordcommand" => {
+                                let raw = raw_rest(line);
+                                c.password = if raw.is_empty() {
+                                    PasswordSource::Ask
+                                } else {
+                                    PasswordSource::Command(raw)
+                                };
+                            }
                             _ => {}
                         }
                     }
@@ -2115,11 +2207,35 @@ impl Settings {
             if !tags.is_empty() {
                 let _ = writeln!(out, "    Tags {}", tags.join(" "));
             }
+            if let Some(c) = p.credential.as_deref().filter(|c| valid_credential_name(c)) {
+                let _ = writeln!(out, "    Credential {c}");
+            }
             match &p.password {
                 PasswordSource::Ask => {}
                 PasswordSource::Windows => out.push_str("    PasswordSource windows\n"),
                 PasswordSource::Command(c) => {
                     let line: String = c.chars().filter(|c| !c.is_control()).collect();
+                    let _ = writeln!(out, "    PasswordCommand {}", line.trim());
+                }
+            }
+        }
+        for c in self
+            .credentials
+            .iter()
+            .filter(|c| valid_credential_name(&c.name))
+        {
+            let _ = writeln!(out, "Credential {}", c.name);
+            if let Some(u) = c.user.as_deref().filter(|u| valid_login_user(u)) {
+                let _ = writeln!(out, "    User {u}");
+            }
+            if let Some(k) = c.key.as_deref().filter(|k| valid_key_path(k)) {
+                let _ = writeln!(out, "    IdentityFile \"{k}\"");
+            }
+            match &c.password {
+                PasswordSource::Ask => {}
+                PasswordSource::Windows => out.push_str("    PasswordSource windows\n"),
+                PasswordSource::Command(cmd) => {
+                    let line: String = cmd.chars().filter(|c| !c.is_control()).collect();
                     let _ = writeln!(out, "    PasswordCommand {}", line.trim());
                 }
             }
@@ -2130,6 +2246,87 @@ impl Settings {
         }
         for snippet in self.snippets.iter().filter(|x| x.file.is_none()) {
             out.push_str(&snippet_block(snippet));
+        }
+        out
+    }
+
+    /// The credential named `name`.
+    pub fn credential(&self, name: &str) -> Option<&Credential> {
+        self.credentials
+            .iter()
+            .find(|c| c.name.eq_ignore_ascii_case(name))
+    }
+
+    /// The credential host `host` uses, if it names one that exists.
+    pub fn credential_of(&self, host: &str) -> Option<&Credential> {
+        self.profile(host)?
+            .credential
+            .as_deref()
+            .and_then(|n| self.credential(n))
+    }
+
+    /// Where host `host`'s password comes from: its credential's source
+    /// when that names one, else its own.
+    pub fn password_source(&self, host: &str) -> PasswordSource {
+        match self.credential_of(host) {
+            Some(c) if c.password != PasswordSource::Ask => c.password.clone(),
+            _ => self
+                .profile(host)
+                .map(|p| p.password.clone())
+                .unwrap_or_default(),
+        }
+    }
+
+    /// The connections that name credential `name`.
+    pub fn credential_users(&self, name: &str) -> Vec<String> {
+        self.profiles
+            .iter()
+            .filter(|p| {
+                p.credential
+                    .as_deref()
+                    .is_some_and(|c| c.eq_ignore_ascii_case(name))
+            })
+            .map(|p| p.host.clone())
+            .collect()
+    }
+
+    /// ssh_config lines that give each host its credential's user and
+    /// key file, to go before everything else: the first value wins, so
+    /// the credential's user wins and its key file is tried first. `Match
+    /// originalhost` blocks are not listed as hosts. Empty when no host
+    /// uses a credential with a user or key file.
+    pub fn credential_config(&self) -> String {
+        let mut out = String::new();
+        for p in &self.profiles {
+            let Some(c) = p.credential.as_deref().and_then(|n| self.credential(n)) else {
+                continue;
+            };
+            // A pattern character would match other hosts too.
+            if p.host.is_empty()
+                || p.host.contains(|ch: char| {
+                    ch.is_whitespace()
+                        || ch.is_control()
+                        || matches!(ch, '*' | '?' | '!' | ',' | '"' | '#')
+                })
+            {
+                continue;
+            }
+            let user = c.user.as_deref().filter(|u| valid_login_user(u));
+            let key = c.key.as_deref().filter(|k| valid_key_path(k));
+            if user.is_none() && key.is_none() {
+                continue;
+            }
+            let _ = writeln!(out, "Match originalhost {}", p.host);
+            if let Some(u) = user {
+                let _ = writeln!(out, "    User {u}");
+            }
+            if let Some(k) = key {
+                let _ = writeln!(out, "    IdentityFile \"{k}\"");
+            }
+        }
+        if !out.is_empty() {
+            // What follows applies to every host again.
+            out.push_str("Match all\n");
         }
         out
     }
@@ -2579,6 +2776,56 @@ Profile lab
         let back = Settings::parse(&s.to_text());
         assert_eq!(back.profile("web").unwrap().tags, web.tags);
         assert!(s.to_text().contains("    Tags prod web eu de\n"));
+    }
+
+    #[test]
+    fn credentials_round_trip_and_give_hosts_their_login() {
+        let text = "Credential ops-admin\n    User ops\n    IdentityFile \"C:\\Keys\\ops key\"\n    \
+                    PasswordSource windows\nCredential vault\n    PasswordCommand op read x\n\
+                    Profile web\n    Credential OPS-ADMIN\n    PasswordCommand mine\n\
+                    Profile db\n    Credential vault\nProfile pi\n    Credential gone\n\
+                    Credential b@d\n";
+        let s = Settings::parse(text);
+        assert_eq!(s.credentials.len(), 2);
+        let ops = s.credential("ops-admin").unwrap();
+        assert_eq!(ops.user.as_deref(), Some("ops"));
+        assert_eq!(ops.key.as_deref(), Some("C:\\Keys\\ops key"));
+        assert_eq!(Settings::parse(&s.to_text()), s);
+        // The credential's source wins; one it leaves as ask does not.
+        assert_eq!(s.password_source("web"), PasswordSource::Windows);
+        assert_eq!(
+            s.password_source("db"),
+            PasswordSource::Command("op read x".into())
+        );
+        assert_eq!(
+            s.password_source("pi"),
+            PasswordSource::Ask,
+            "no such credential"
+        );
+        assert_eq!(s.credential_users("ops-admin"), ["web"]);
+
+        // Through ssh_config: the credential's user wins, its key comes
+        // first, and other hosts keep the file's global lines.
+        let config = format!(
+            "{}User everyone\nIdentityFile ~/.ssh/id_rsa\nHost web\n    User root\n",
+            s.credential_config()
+        );
+        let web = crate::ssh_config::resolve(&config, "web");
+        assert_eq!(web.user.as_deref(), Some("ops"));
+        assert_eq!(
+            web.identity_files.first().map(String::as_str),
+            Some("C:\\Keys\\ops key")
+        );
+        let other = crate::ssh_config::resolve(&config, "other");
+        assert_eq!(other.user.as_deref(), Some("everyone"));
+        assert_eq!(other.identity_files, ["~/.ssh/id_rsa"]);
+        assert!(
+            crate::ssh_config::hosts(&config, &crate::ssh_config::NoIncludes)
+                .iter()
+                .all(|h| h.name == "web"),
+            "credentials list no hosts"
+        );
+        assert!(Settings::default().credential_config().is_empty());
     }
 
     #[test]

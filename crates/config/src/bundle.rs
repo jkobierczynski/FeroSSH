@@ -426,6 +426,17 @@ pub fn merge_profiles(local: &mut Settings, incoming: &Settings) -> Merged {
             local.favourites.push(f.clone());
         }
     }
+    // The named credentials the profiles point to come along.
+    for c in &incoming.credentials {
+        match local
+            .credentials
+            .iter_mut()
+            .find(|l| l.name.eq_ignore_ascii_case(&c.name))
+        {
+            Some(l) => *l = c.clone(),
+            None => local.credentials.push(c.clone()),
+        }
+    }
     merged
 }
 
@@ -609,5 +620,20 @@ mod tests {
             }
         );
         assert_eq!(local.profiles.len(), 3);
+    }
+
+    #[test]
+    fn credentials_come_with_the_profiles() {
+        let mut local = Settings::parse("Credential ops\n    User old\n");
+        let incoming = Settings::parse(
+            "Credential OPS\n    User new\nCredential lab\n    User pi\nProfile web\n    Credential lab\n",
+        );
+        merge_profiles(&mut local, &incoming);
+        assert_eq!(local.credentials.len(), 2);
+        assert_eq!(
+            local.credential("ops").unwrap().user.as_deref(),
+            Some("new")
+        );
+        assert_eq!(local.credential_of("web").unwrap().name, "lab");
     }
 }

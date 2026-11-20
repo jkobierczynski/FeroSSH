@@ -41,6 +41,8 @@ pub struct Hints {
     pub font: String,
     pub font_size: f32,
     pub scrollback: usize,
+    /// The named credentials a connection can use.
+    pub credentials: Vec<String>,
 }
 
 /// What the form holds, as typed.
@@ -50,6 +52,8 @@ pub struct Values {
     pub folder: String,
     /// The connection's own tags, separated by spaces or commas.
     pub tags: String,
+    /// The named credential it uses; empty for its own login.
+    pub credential: String,
     pub kind: SessionKind,
     pub host: String,
     pub user: String,
@@ -219,6 +223,7 @@ impl Values {
         };
         self.kind = p.kind;
         self.tags = p.tags.join(" ");
+        self.credential = p.credential.clone().unwrap_or_default();
         self.via = p.via.clone().unwrap_or_default();
         self.theme = p.theme.clone().unwrap_or_default();
         self.font = p.font.clone().unwrap_or_default();
@@ -308,6 +313,7 @@ enum Field {
     KerberosDelegate,
     Password,
     PasswordCommand,
+    Credential,
     Speed,
     Framing,
     Flow,
@@ -358,6 +364,7 @@ impl Field {
             Field::Kerberos => "Kerberos",
             Field::KerberosDelegate => "Fwd ticket",
             Field::Password => "Password",
+            Field::Credential => "Credential",
             Field::PasswordCommand => "Command",
             Field::Speed => "Speed",
             Field::Framing => "Framing",
@@ -388,6 +395,7 @@ impl Field {
                 | Field::Clipboard
                 | Field::DeskClipboard
                 | Field::Password
+                | Field::Credential
                 | Field::Framing
                 | Field::Flow
                 | Field::MoshPredict
@@ -556,6 +564,13 @@ impl SessionForm {
 
     /// The password source and what goes with it.
     fn password_items(&self, out: &mut Vec<Item>) {
+        // Only once there are credentials to pick (or one is picked).
+        if !self.hints.credentials.is_empty() || !self.values.credential.is_empty() {
+            out.push(Item::Field(Field::Credential));
+            if !self.values.credential.is_empty() {
+                out.push(Item::Note("Its user, key and password win.".into()));
+            }
+        }
         out.push(Item::Field(Field::Password));
         match self.values.password {
             PASSWORD_ASK => {}
@@ -903,6 +918,7 @@ impl SessionForm {
             | Field::Clipboard
             | Field::DeskClipboard
             | Field::Password
+            | Field::Credential
             | Field::Framing
             | Field::Flow
             | Field::MoshPredict => {
@@ -957,6 +973,7 @@ impl SessionForm {
             | Field::Clipboard
             | Field::DeskClipboard
             | Field::Password
+            | Field::Credential
             | Field::Framing
             | Field::Flow
             | Field::MoshPredict => {
@@ -1018,6 +1035,8 @@ impl SessionForm {
             Field::Framing if v.framing.is_empty() => "8N1".to_owned(),
             Field::Framing => v.framing.clone(),
             Field::Flow => v.flow.label().to_owned(),
+            Field::Credential if v.credential.is_empty() => "none: its own login".to_owned(),
+            Field::Credential => v.credential.clone(),
             Field::Theme if v.theme.is_empty() => "by theme rules".to_owned(),
             Field::Theme => v.theme.clone(),
             Field::Tmux => if v.tmux_on {
@@ -1080,8 +1099,18 @@ impl SessionForm {
                 (i + n - 1) % n
             }
         };
+        let credentials = self.hints.credentials.clone();
         let v = &mut self.values;
         match f {
+            Field::Credential => {
+                let mut all = vec![String::new()];
+                all.extend(credentials);
+                let i = all
+                    .iter()
+                    .position(|c| c.eq_ignore_ascii_case(&v.credential))
+                    .unwrap_or(0);
+                v.credential = all.get(step(i, all.len())).cloned().unwrap_or_default();
+            }
             Field::Type => {
                 let kinds = [
                     SessionKind::Ssh,
@@ -1277,6 +1306,7 @@ impl SessionForm {
             | Field::Clipboard
             | Field::DeskClipboard
             | Field::Password
+            | Field::Credential
             | Field::Framing
             | Field::Flow
             | Field::MoshPredict => String::new(),
@@ -2167,6 +2197,16 @@ impl SessionForm {
             )
         });
         p.tags = ferossh_config::settings::parse_tags(&v.tags).unwrap_or_default();
+        p.credential = trimmed(&v.credential).filter(|_| {
+            matches!(
+                v.kind,
+                SessionKind::Ssh
+                    | SessionKind::Mosh
+                    | SessionKind::Sftp
+                    | SessionKind::Tunnel
+                    | SessionKind::WinRm
+            )
+        });
         p.theme = trimmed(&v.theme);
         p.font = trimmed(&v.font);
         p.font_size = v.font_size.trim().parse().ok();
@@ -2378,6 +2418,7 @@ mod tests {
             font: "Cascadia Mono".into(),
             font_size: 11.0,
             scrollback: 10_000,
+            credentials: Vec::new(),
         }
     }
 
@@ -3441,6 +3482,53 @@ mod tests {
         assert_eq!(
             settings.profile("web3").unwrap().password,
             PasswordSource::Ask
+        );
+    }
+
+    #[test]
+    fn a_credential_is_picked_once_there_are_some() {
+        let mut f = new_form();
+        typed(&mut f, "web3");
+        assert!(!f.items().contains(&Item::Field(Field::Credential)));
+        let mut h = hints();
+        h.credentials = vec!["ops-admin".into(), "lab".into()];
+        let mut f = SessionForm::new(
+            None,
+            Source::New,
+            Values::default(),
+            h,
+            Vec::new(),
+            Vec::new(),
+        );
+        typed(&mut f, "web3");
+        // Name, Folder, Tags, Type, Host, User, Port, Key, Browse, Credential.
+        down(&mut f, 9);
+        assert_eq!(f.focused_field(), Some(Field::Credential));
+        assert_eq!(
+            f.options(Field::Credential),
+            ["none: its own login", "ops-admin", "lab"]
+        );
+        f.key(SideKey::Right, 30);
+        assert_eq!(f.values.credential, "ops-admin");
+        assert!(
+            f.items()
+                .contains(&Item::Note("Its user, key and password win.".into()))
+        );
+        let mut settings = Settings::default();
+        assert_eq!(f.check(), Ok(()));
+        f.apply(&mut Vec::new(), &mut settings);
+        assert_eq!(
+            settings.profile("web3").unwrap().credential.as_deref(),
+            Some("ops-admin")
+        );
+        let v = Values::default().with_profile(settings.profile("web3"));
+        assert_eq!(v.credential, "ops-admin");
+        // Serial lines have no login: no credential is kept.
+        f.values.kind = SessionKind::Serial;
+        f.apply(&mut Vec::new(), &mut settings);
+        assert_eq!(
+            settings.profile("web3").and_then(|p| p.credential.clone()),
+            None
         );
     }
 

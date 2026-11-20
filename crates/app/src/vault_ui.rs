@@ -1176,6 +1176,20 @@ fn merge_theirs(settings: &mut Settings, theirs: &str) -> bool {
     let parsed = Settings::parse(theirs);
     settings.profiles =
         bundle::merge_profiles3(&base.profiles, &settings.profiles, &parsed.profiles);
+    // Credentials another PC added come in; ours win where both have one.
+    for c in parsed.credentials {
+        if !settings
+            .credentials
+            .iter()
+            .any(|l| l.name.eq_ignore_ascii_case(&c.name))
+            && !base
+                .credentials
+                .iter()
+                .any(|b| b.name.eq_ignore_ascii_case(&c.name))
+        {
+            settings.credentials.push(c);
+        }
+    }
     true
 }
 

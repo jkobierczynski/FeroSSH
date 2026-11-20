@@ -1882,7 +1882,12 @@ fn load_saved() -> Vec<SavedHost> {
 /// imported hosts.
 fn ssh_env() -> Env {
     let home = home();
-    let mut config = std::fs::read_to_string(home.join(".ssh").join("config")).unwrap_or_default();
+    // Named credentials first: their user and key file win (see
+    // Settings::credential_config).
+    let mut config = app_read(&settings_path())
+        .map(|t| Settings::parse(&t).credential_config())
+        .unwrap_or_default();
+    config.push_str(&std::fs::read_to_string(home.join(".ssh").join("config")).unwrap_or_default());
     if let Ok(made) = app_read(&sessions_path()) {
         // A Host line first: the user's last block must not swallow it.
         config.push_str("\nHost !*\n");
@@ -7192,7 +7197,7 @@ impl Window {
             && !target.https
             && profile.is_some_and(|p| p.winrm_ntlm)
             && same_endpoint();
-        let mut source = profile.map(|p| p.password.clone()).unwrap_or_default();
+        let mut source = self.settings.password_source(&target.alias);
         if source == PasswordSource::Ask && self.workspace_login(id) {
             source = PasswordSource::Windows;
         }
@@ -8023,7 +8028,7 @@ impl Window {
                 .settings
                 .profile(&t.alias)
                 .filter(|p| p.kind == SessionKind::WinRm)
-                .map(|p| p.password.clone())
+                .map(|_| self.settings.password_source(&t.alias))
                 .unwrap_or_default();
             if source == PasswordSource::Ask && self.workspace_login(id) {
                 PasswordSource::Windows
@@ -14386,6 +14391,12 @@ impl Window {
                 .settings
                 .scrollback
                 .unwrap_or(TermSettings::DEFAULT_SCROLLBACK),
+            credentials: self
+                .settings
+                .credentials
+                .iter()
+                .map(|c| c.name.clone())
+                .collect(),
         };
         let themes: Vec<String> = Theme::builtin().iter().map(|t| t.name.to_owned()).collect();
         let form = match host {
@@ -14476,14 +14487,11 @@ impl Window {
                 // Off the Windows Credential Manager, or to another user, host
                 // or port: the old saved password goes. Its name is resolved
                 // before the connection's settings change.
-                let was_windows = form.original.as_deref().is_some_and(|o| {
-                    self.settings
-                        .profile(o)
-                        .is_some_and(|p| p.password == PasswordSource::Windows)
-                });
-                let still_windows = settings
-                    .profile(&name)
-                    .is_some_and(|p| p.password == PasswordSource::Windows);
+                let was_windows = form
+                    .original
+                    .as_deref()
+                    .is_some_and(|o| self.settings.password_source(o) == PasswordSource::Windows);
+                let still_windows = settings.password_source(&name) == PasswordSource::Windows;
                 // A renamed read-only connection is saved as a copy: the
                 // original stays, and so does its password.
                 let old_target = was_windows
@@ -14568,11 +14576,7 @@ impl Window {
         // connections are still saved; removed once they are gone.
         let targets: Vec<String> = names
             .iter()
-            .filter(|name| {
-                self.settings
-                    .profile(name)
-                    .is_some_and(|p| p.password == PasswordSource::Windows)
-            })
+            .filter(|name| self.settings.password_source(name) == PasswordSource::Windows)
             .filter_map(|name| self.saved_password_target(name))
             .collect();
         let mut hosts = load_saved();
@@ -14660,9 +14664,7 @@ impl Window {
                         .iter()
                         .filter(|c| !conflicts.contains(&c.name))
                         .filter(|c| {
-                            self.settings
-                                .profile(&c.name)
-                                .is_some_and(|p| p.password == PasswordSource::Windows)
+                            self.settings.password_source(&c.name) == PasswordSource::Windows
                         })
                         .filter_map(|c| {
                             self.saved_password_target(&c.name)
@@ -14684,10 +14686,8 @@ impl Window {
                 let saved_settings = self.try_save_settings();
                 if saved_settings.is_ok() {
                     for (name, old) in old_targets {
-                        let still_windows = self
-                            .settings
-                            .profile(&name)
-                            .is_some_and(|p| p.password == PasswordSource::Windows);
+                        let still_windows =
+                            self.settings.password_source(&name) == PasswordSource::Windows;
                         if (!still_windows
                             || self.saved_password_target(&name).as_ref() != Some(&old))
                             && let Err(e) = credman::delete(&old)
@@ -15701,11 +15701,8 @@ impl Window {
     /// does (in the vault when one is open), when Log in automatically is
     /// on.
     fn login_source(&self, id: PaneId, alias: &str) -> PasswordSource {
-        let source = self
-            .settings
-            .profile(alias)
-            .map(|p| p.password.clone())
-            .unwrap_or_default();
+        // A named credential's source wins over the connection's own.
+        let source = self.settings.password_source(alias);
         if source == PasswordSource::Ask && self.workspace_login(id) {
             PasswordSource::Windows
         } else {
@@ -22024,6 +22021,7 @@ fn session_menu(hwnd: HWND, host: Option<String>, search: Option<String>) {
     const NEW: u32 = 5;
     const SAVE_SEARCH: u32 = 6;
     const REMOVE_SEARCH: u32 = 7;
+    const CREDENTIALS: u32 = 8;
     // The search typed, when there is one to save.
     let typed = with_window(|w| {
         let q = w.side.list.query().trim().to_owned();
@@ -22060,6 +22058,7 @@ fn session_menu(hwnd: HWND, host: Option<String>, search: Option<String>) {
             let _ = AppendMenuW(menu, MF_SEPARATOR, 0, None);
         }
         let _ = AppendMenuW(menu, MF_STRING, NEW as usize, w!("&New connection...\tIns"));
+        let _ = AppendMenuW(menu, MF_STRING, CREDENTIALS as usize, w!("C&redentials..."));
         if typed.is_some() || search.is_some() {
             let _ = AppendMenuW(menu, MF_SEPARATOR, 0, None);
         }
@@ -22099,6 +22098,10 @@ fn session_menu(hwnd: HWND, host: Option<String>, search: Option<String>) {
         (EDIT, Some(host)) => SideAction::Edit(host),
         (DELETE, Some(host)) => SideAction::Delete(host),
         (NEW, _) => SideAction::New,
+        (CREDENTIALS, _) => {
+            credentials_menu(hwnd);
+            return;
+        }
         (SAVE_SEARCH, _) => match typed {
             Some(q) => SideAction::SaveSearch(q),
             None => return,
@@ -22111,6 +22114,170 @@ fn session_menu(hwnd: HWND, host: Option<String>, search: Option<String>) {
     };
     if let Some(Some(command)) = with_window(|w| w.side_action(Some(action))) {
         run_command(hwnd, command);
+    }
+}
+
+/// The named credentials: a menu of them and New credential; picking one
+/// opens it to change or delete.
+fn credentials_menu(hwnd: HWND) {
+    use crate::native::wide;
+    const NEW: u32 = 1;
+    const FIRST: u32 = 100;
+    let Some(list) = with_window(|w| {
+        w.settings
+            .credentials
+            .iter()
+            .map(|c| (c.name.clone(), crate::credentials::label(&w.settings, c)))
+            .collect::<Vec<_>>()
+    }) else {
+        return;
+    };
+    // SAFETY: a popup menu of our own on our window; TPM_RETURNCMD
+    // returns the picked id.
+    let picked = unsafe {
+        let Ok(menu) = CreatePopupMenu() else {
+            return;
+        };
+        let _ = AppendMenuW(
+            menu,
+            MF_STRING | MF_GRAYED,
+            0,
+            w!("Credentials many connections share"),
+        );
+        let _ = AppendMenuW(menu, MF_SEPARATOR, 0, None);
+        for (i, (_, label)) in list.iter().take(100).enumerate() {
+            let text = wide(&label.replace('&', "&&"));
+            let _ = AppendMenuW(
+                menu,
+                MF_STRING,
+                (FIRST + i as u32) as usize,
+                PCWSTR(text.as_ptr()),
+            );
+        }
+        if !list.is_empty() {
+            let _ = AppendMenuW(menu, MF_SEPARATOR, 0, None);
+        }
+        let _ = AppendMenuW(menu, MF_STRING, NEW as usize, w!("&New credential..."));
+        let mut pt = POINT::default();
+        let _ = GetCursorPos(&mut pt);
+        let chosen = TrackPopupMenu(
+            menu,
+            TPM_RETURNCMD | TPM_NONOTIFY,
+            pt.x,
+            pt.y,
+            None,
+            hwnd,
+            None,
+        );
+        let _ = DestroyMenu(menu);
+        u32::try_from(chosen.0).unwrap_or(0)
+    };
+    let original = match picked {
+        NEW => None,
+        p if p >= FIRST => match list.get((p - FIRST) as usize) {
+            Some((name, _)) => Some(name.clone()),
+            None => return,
+        },
+        _ => return,
+    };
+    edit_credential(hwnd, original);
+}
+
+/// Opens credential `original` (or a new one) to change, rename or
+/// delete; saves what is typed once it checks out.
+fn edit_credential(hwnd: HWND, original: Option<String>) {
+    use crate::credentials::{Typed, remove, save};
+    let mut typed = original
+        .as_deref()
+        .and_then(|o| with_window(|w| w.settings.credential(o).map(Typed::of)).flatten())
+        .unwrap_or_else(|| Typed {
+            password: "ask".into(),
+            ..Typed::default()
+        });
+    let users = original
+        .as_deref()
+        .and_then(|o| with_window(|w| w.settings.credential_users(o)))
+        .unwrap_or_default();
+    let title = match &original {
+        Some(o) => format!("Credential {o}"),
+        None => "New credential".to_owned(),
+    };
+    let mut intro = "A user, a key file and a password source that many connections share. \
+                     Pick it in a connection's form (Credential), or for many at once with \
+                     Change a field. What it sets wins over each connection's own; what it \
+                     leaves empty does not. Password: ask, windows, or a password manager's \
+                     command (%n is the connection's name)."
+        .to_owned();
+    if !users.is_empty() {
+        intro.push_str(&format!("\n\nUsed by {}.", crate::bulk::name_list(&users)));
+    }
+    loop {
+        if DIALOG_OPEN.get() {
+            return;
+        }
+        DIALOG_OPEN.set(true);
+        let answer = crate::fields_view::ask(
+            hwnd,
+            &crate::fields_view::Ask {
+                title: &title,
+                intro: &intro,
+                fields: &[
+                    ("Name", &typed.name),
+                    ("User", &typed.user),
+                    ("Key file", &typed.key),
+                    ("Password", &typed.password),
+                ],
+                option: original.as_ref().map(|_| ("Delete this credential", false)),
+                ok: "Save",
+                cancel: "Cancel",
+            },
+        );
+        DIALOG_OPEN.set(false);
+        let Some(answer) = answer else {
+            return;
+        };
+        let mut f = answer.fields.into_iter();
+        typed = Typed {
+            name: f.next().unwrap_or_default(),
+            user: f.next().unwrap_or_default(),
+            key: f.next().unwrap_or_default(),
+            password: f.next().unwrap_or_default(),
+        };
+        if answer.option
+            && let Some(o) = &original
+        {
+            let mut text = format!("Delete credential {o}?");
+            if !users.is_empty() {
+                text.push_str(&format!(
+                    " {} go back to their own login.",
+                    crate::bulk::name_list(&users)
+                ));
+            }
+            if dialog(hwnd, &text, MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2) == Some(IDYES) {
+                with_window(|w| {
+                    remove(&mut w.settings, o);
+                    w.save_settings();
+                    w.reload_sessions(None);
+                });
+            }
+            return;
+        }
+        let Some(result) = with_window(|w| {
+            let saved = save(&mut w.settings, original.as_deref(), &typed);
+            if saved.is_ok() {
+                w.save_settings();
+                w.reload_sessions(None);
+            }
+            saved
+        }) else {
+            return;
+        };
+        match result {
+            Ok(_) => return,
+            Err(e) => {
+                dialog(hwnd, &e, MB_OK | MB_ICONWARNING);
+            }
+        }
     }
 }
 

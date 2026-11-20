@@ -11,8 +11,8 @@ Already built, so not listed: folders (`# folder:` comments), favourites, search
 | 1 | Several tags per connection | Done (#254) |
 | 2 | Search by field, and saved searches | Done (#255) |
 | 3 | Select several connections and act on them all | Done (#256) |
-| 4 | Change one field on many connections at once | Built |
-| 5 | Named credentials shared by many connections | To do |
+| 4 | Change one field on many connections at once | Done (#257) |
+| 5 | Named credentials shared by many connections | Built |
 | 6 | Credential and security rules by tag or folder | To do |
 | 7 | Inventory columns with CSV export | To do |
 | 8 | Run a script or broadcast to a tag or saved search | To do |
@@ -60,11 +60,16 @@ How it works:
 
 Fields that need the whole form (host, port, forwards, login script) stay one connection at a time. A shared password source by name is item 5.
 
-## 5. Named credentials
+## 5. Named credentials (built)
 
-**What FeroSSH has.** Each connection stores its own user, key file and password source.
+**What FeroSSH had.** Each connection stores its own user, key file and password source.
 
-**What to build.** A credential is a named user plus a key file, agent or password source (Windows, vault, password-manager command). Connections point to it by name (`Credential ops-admin`), and changing it changes every connection that uses it. Kept in `ferossh.conf` and the vault; secrets stay where they are today.
+**What was built.** A credential is a named user, key file and password source: ask, the Windows Credential Manager, or a password manager's command. It is kept as a `Credential` block in `ferossh.conf`, so a vault and an encrypted export carry it.
+
+- **Using one:** a connection names it (`Credential ops-admin` in its profile). It is picked in the connection form (**Credential**, shown once a credential exists) or for many at once with **Change a field** (item 4).
+- **Editing:** **Credentials...** in the connection manager's right-click menu makes, changes, renames (the connections follow) and deletes them.
+- **Precedence:** what a credential sets wins over the connection's own login, and a user typed in the address still wins. This works for SSH, Mosh, SFTP, tunnels, jump hosts and WinRM. The user and key file come through the ssh_config resolution (a `Match originalhost` block placed first). The password source comes from `Settings::password_source`.
+- **Secrets stay where they are today.** A Windows-saved password is still kept per connection. One shared password saved once for all is a possible follow-up.
 
 ## 6. Credential and security rules by tag or folder
 

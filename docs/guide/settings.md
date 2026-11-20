@@ -117,6 +117,7 @@ Profile web1
 | `FontSize N` | Text size in points. |
 | `Theme NAME` | Colour theme, for example `Nord`, `Dracula` or `Production`. |
 | `Tags TAG...` | The connection's own tags (Tags in the connection form), separated by spaces: shown and searched in the connection manager and matched by theme rules, on top of ssh_config's `Tag`. Up to 16, each up to 32 letters, digits, `-`, `_`, `.`, `/` and `:`; others are left out. |
+| `Credential NAME` | The named credential the connection uses (see [Credentials](#credentials)): its user, key file and password source win over the connection's own. |
 | `Scrollback N` | Lines of scrollback for this host's panes. |
 | `Tmux SESSION` | Attaches to this tmux session after every login. `off`, `no` or `none` (or leaving it out) means no tmux; `on`, `yes` or `true` attaches to `main`. |
 | `StartDir PATH` | The server directory shells on this host start in: FeroSSH types `cd` after each login (before tmux attaches) and gives a new tmux session `-c`. New tabs and panes follow the pane they came from and use it only when that pane's directory is not known. Session > Start new tabs and panes in this directory sets it from the focused pane. |
@@ -163,6 +164,22 @@ Profile core-console
     LoginScript expect Password:
     LoginScript secret enable
 ```
+
+## Credentials
+
+A `Credential` block is a named login that many connections share. A profile names it with `Credential NAME`. Whatever the block sets (user, key file, password source) wins over the connection's own; whatever it leaves out does not. Names use letters, digits, `.`, `_` and `-`. The connection manager's **Credentials...** menu edits these blocks.
+
+```
+Credential ops-admin
+    User ops
+    IdentityFile "C:\Keys\ops_ed25519"
+    PasswordSource windows
+
+Profile web1
+    Credential ops-admin
+```
+
+`PasswordCommand ...` works here as in a profile.
 
 ## Secrets
 
