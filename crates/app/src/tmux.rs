@@ -908,7 +908,9 @@ impl Tmux {
         }
         let access = match access {
             Access::Stopped => "Stopped sharing: tmux confirms no other account may connect \
-                                to your shared tmux server, and its socket was made private."
+                                to your shared tmux server. FeroSSH also set its socket back \
+                                to private (tmux does not say whether that worked; the access \
+                                list is what keeps others out)."
                 .to_owned(),
             Access::Left(left) => format!(
                 "Sharing has NOT fully stopped: tmux still lets in {}. Try Stop sharing \
