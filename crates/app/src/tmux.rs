@@ -525,6 +525,10 @@ pub struct Tmux {
     /// [`Tmux::share`] typed its line: open the next control mode's
     /// server to these accounts once its version is known.
     share_pending: Option<Share>,
+    /// Sharing asked for, until the new control session starts: only
+    /// that session's version reply may act on it, never a late one
+    /// from the session being left.
+    share_staged: Option<Share>,
     /// Typed at the shell once control mode has ended (share or join
     /// asked for while attached).
     after_detach: Option<Vec<u8>>,
@@ -661,6 +665,7 @@ impl Tmux {
             told_read_only: false,
             told_joined: false,
             share_pending: None,
+            share_staged: None,
             after_detach: None,
             notice_after_attach: None,
             typed_shared: false,
@@ -720,7 +725,7 @@ impl Tmux {
     pub fn attach(&mut self, name: &str, pick: bool) -> Vec<u8> {
         self.pick_after_attach = pick;
         self.join_pending = None;
-        self.share_pending = None;
+        self.share_staged = None;
         // A shared session comes back on the shared server, whose access
         // list still holds: nothing is granted again.
         let shared = self.reattach_shared.take().as_deref() == Some(name);
@@ -787,7 +792,7 @@ impl Tmux {
         can_type: bool,
     ) -> Vec<Action> {
         self.pick_after_attach = session.is_none();
-        self.share_pending = None;
+        self.share_staged = None;
         self.typed_shared = false;
         self.join_pending = Some(can_type);
         self.type_line(command::join_line(owner, session, can_type))
@@ -800,7 +805,7 @@ impl Tmux {
     pub fn share(&mut self, name: &str, share: Share) -> Vec<Action> {
         self.pick_after_attach = false;
         self.join_pending = None;
-        self.share_pending = Some(share);
+        self.share_staged = Some(share);
         self.typed_shared = true;
         self.type_line(command::share_line(name))
     }
@@ -1020,6 +1025,7 @@ impl Tmux {
                     self.session = None;
                     self.version = None;
                     self.joined = self.join_pending.take();
+                    self.share_pending = self.share_staged.take();
                     self.on_shared = std::mem::take(&mut self.typed_shared);
                     self.told_read_only = false;
                     self.told_joined = false;
@@ -1209,8 +1215,14 @@ impl Tmux {
     pub fn switch_session(&mut self, name: Option<&str>) -> Vec<Action> {
         let mut out = Vec::new();
         match name {
+            // A joined client never brings its environment along
+            // (update-environment) into the owner's sessions.
             Some(n) => self.send(
-                &format!("switch-client -t {}", command::quote(&format!("={n}"))),
+                &format!(
+                    "switch-client{} -t {}",
+                    if self.joined.is_some() { " -E" } else { "" },
+                    command::quote(&format!("={n}"))
+                ),
                 Tag::Ignore,
                 &mut out,
             ),
@@ -2674,6 +2686,11 @@ mod tests {
         ] {
             assert!(writes(&a).is_empty(), "{a:?}");
         }
+        // Switching to another of their sessions brings no environment.
+        assert_eq!(
+            writes(&t.switch_session(Some("other"))),
+            ["switch-client -E -t '=other'"]
+        );
         // Closing leaves, never kills their window.
         assert_eq!(writes(&t.close(n)), ["detach-client"]);
         assert!(t.unshare().is_empty());
@@ -2864,9 +2881,14 @@ mod tests {
             attached(None, None, &[pane_line(0, 0, 80, 24, "b25f,80x24,0,0,0")]);
         let a = t.share("pair", share(&["bob"], true));
         assert_eq!(writes(&a), ["detach-client"]);
+        // A late reply of the session being left cannot take the share.
+        assert!(t.share_pending.is_none());
         let a = t.feed(&mut ws, b"%exit detached\n\x1b\\[detached]\r\n");
         assert_eq!(writes(&a), [command::share_line("pair").trim_end()]);
         assert!(t.reattach.is_none());
+        // The new control session is the one that opens it.
+        t.feed(&mut ws, START);
+        assert_eq!(t.share_pending, Some(share(&["bob"], true)));
     }
 
     #[test]
