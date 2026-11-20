@@ -861,10 +861,17 @@ impl Tmux {
         lines
             .iter()
             // Every entry counts, also names FeroSSH would not accept
-            // typed in: quoted, they can still be taken off.
+            // typed in (spaces too): quoted, they can still be taken off.
+            // A line not in tmux's "NAME (R)" / "NAME (W)" form counts
+            // whole, so it is never mistaken for the owner and passed by.
             .filter_map(|line| {
                 let text = String::from_utf8_lossy(line);
-                text.split_whitespace().next().map(str::to_owned)
+                let text = text.trim_end();
+                let name = text
+                    .strip_suffix(" (R)")
+                    .or_else(|| text.strip_suffix(" (W)"))
+                    .unwrap_or(text);
+                (!name.is_empty()).then(|| name.to_owned())
             })
             // tmux will not take off the owner or root.
             .filter(|a| a != "root" && Some(a.as_str()) != owner)
@@ -2978,15 +2985,27 @@ mod tests {
         // The detach fails (the watcher left), and tmux lists a name
         // FeroSSH would not take typed in: it is still taken off.
         let mut input = reply(n + 3, &[]);
-        input.extend(reply(n + 4, &["alice (W)".into(), "dom\\carol (R)".into()]));
+        input.extend(reply(
+            n + 4,
+            &[
+                "alice (W)".into(),
+                "dom\\carol (R)".into(),
+                "alice helper (W)".into(),
+            ],
+        ));
         input.extend(format!("%begin 9 {0} 1\ngone\n%error 9 {0} 1\n", n + 5).into_bytes());
         let a = t.feed(&mut ws, &input);
         assert_eq!(
             writes(&a),
-            ["server-access -d 'dom\\carol'", "server-access -l"]
+            [
+                "server-access -d 'dom\\carol'",
+                "server-access -d 'alice helper'",
+                "server-access -l"
+            ]
         );
         let mut input = reply(n + 6, &[]);
-        input.extend(reply(n + 7, &["alice (W)".into()]));
+        input.extend(reply(n + 7, &[]));
+        input.extend(reply(n + 8, &["alice (W)".into()]));
         let a = t.feed(&mut ws, &input);
         let told = tells(&a);
         assert!(told[0].starts_with("Stopped sharing"), "{told:?}");
