@@ -162,6 +162,19 @@ Ctrl+Shift+S shows your hosts in the tools pane: those from `~/.ssh/config`, you
 
 **Tags.** A connection can carry several tags, such as `prod web eu`: type them in the connection form's **Tags** box, separated by spaces or commas (a leading `#` is fine). The tag from ssh_config's `Tag` keyword counts too and comes first. Tags show after the `user@host` detail as `#prod #web`, in the tooltip, in the command palette and in the script host picker, and the search finds a host by any of its tags (`prod` or `#prod`). Tags work on hosts from `~/.ssh/config` as well, because FeroSSH keeps them in the host's profile in `ferossh.conf`, never in your ssh_config. A tag is up to 32 letters, digits, `-`, `_`, `.`, `/` and `:`; a connection keeps up to 16. The colour theme rules match these tags as well, so tagging a connection `production` makes its panes red through the built-in rule, unless the connection has a theme of its own in its form (Look), which comes before the rules.
 
+**Searching by field.** Plain words in the search box match the name, `user@host`, folder or a tag. A word with a field name in front matches that field only, and every word must hold:
+
+| Word | Finds |
+| --- | --- |
+| `tag:prod` | connections with the tag `prod` (the whole tag; `tag:prod*` for any tag starting with `prod`) |
+| `folder:db`, `name:web`, `user:root`, `host:10.0.` | part of the folder, name, user or host name |
+| `type:rdp` | connections of that type: `ssh`, `rdp`, `vnc`, `mosh`, `sftp`, `tunnel`, `telnet`, `serial`, `winrm`, `xvfb`, `remoteapp` |
+| `port:2222` | connections on that port |
+| `-tag:legacy` | a `-` in front leaves out what the word finds |
+| `folder:"Home lab"` | double quotes keep spaces in a word |
+
+**Saved searches.** Right-click the connection manager while a search is typed and choose *Save this search as a folder*. The search then shows as a folder named *Search: tag:prod* above the others, listing the connections it finds at that moment; it starts closed. Right-click that folder and choose *Remove this saved search* to drop it. Saved searches are kept in `ferossh.conf` (`SavedSearch`).
+
 ### Saved connections
 
 Insert or the New button opens the connection form in the tools pane; F2, the Edit button or a right click edits the selected connection. It is a Windows form of text boxes and drop-down lists, with a tab per section:

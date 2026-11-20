@@ -8,8 +8,8 @@ Already built, so not listed: folders (`# folder:` comments), favourites, search
 
 | # | Feature | Status |
 | --- | --- | --- |
-| 1 | Several tags per connection | Built |
-| 2 | Search by field, and saved searches | To do |
+| 1 | Several tags per connection | Done (#254) |
+| 2 | Search by field, and saved searches | Built |
 | 3 | Select several connections and act on them all | To do |
 | 4 | Change one field on many connections at once | To do |
 | 5 | Named credentials shared by many connections | To do |
@@ -25,11 +25,11 @@ Already built, so not listed: folders (`# folder:` comments), favourites, search
 
 **What was built.** A **Tags** box in the connection form and a `Tags` keyword in the host's profile in `ferossh.conf`, so hosts from `~/.ssh/config` can be tagged without touching that file. The ssh_config `Tag` comes first, then the connection's own tags, each kept once. Tags show as `#prod #web` after the `user@host` detail and in the tooltip, the command palette and the script host picker, and the search finds hosts by tag. The theme rules match every tag, so tagging a connection `production` makes it red and turns on the Production confirmations.
 
-## 2. Search by field, and saved searches
+## 2. Search by field, and saved searches (built)
 
 **What FeroSSH has.** Plain words matched against the name, `user@host`, folder and (since item 1) tags.
 
-**What to build.** Field prefixes in the connection manager's search: `tag:prod`, `folder:db`, `user:root`, `host:10.0.`, `type:rdp`, `port:2222`, with `-` to exclude (`tag:prod -tag:legacy`). A search can be saved under a name and then shows as a smart folder at the top of the tree, kept in `ferossh.conf` (`SavedSearch`). The same syntax works in the script host picker and the command palette.
+**What was built.** Field words in the connection manager's search: `tag:prod`, `folder:db`, `name:web`, `user:root`, `host:10.0.`, `type:rdp`, `port:2222`, with `-` to leave out (`tag:prod -tag:legacy`), `*` and `?` in tags and types, and double quotes for spaces. Plain words work as before. The right-click menu saves the typed search as a smart folder (*Search: tag:prod*) at the top of the tree, closed at first, kept in `ferossh.conf` (`SavedSearch`); right-clicking it removes it. The script host picker and the command palette get the same language with item 8.
 
 ## 3. Select several connections and act on them all
 

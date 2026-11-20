@@ -769,6 +769,9 @@ pub const MAX_RECENT: usize = 8;
 pub struct Settings {
     pub profiles: Vec<Profile>,
     pub favourites: Vec<String>,
+    /// Connection manager searches kept as smart folders, as typed
+    /// (`SavedSearch tag:prod -tag:legacy`); see [`crate::host_query`].
+    pub saved_searches: Vec<String>,
     /// File > Recent connections: what was last connected to, newest
     /// first, at most [`MAX_RECENT`].
     pub recent: Vec<String>,
@@ -985,6 +988,7 @@ impl Default for Settings {
         Self {
             profiles: Vec::new(),
             favourites: Vec::new(),
+            saved_searches: Vec::new(),
             recent: Vec::new(),
             theme_rules: Vec::new(),
             highlight: true,
@@ -1262,6 +1266,14 @@ impl Settings {
                 "themerule" => {
                     s.theme_rules.push(ThemeRule::new(""));
                     block = Block::Rule(s.theme_rules.len() - 1);
+                }
+                "savedsearch" => {
+                    block = Block::Top;
+                    if let Some(q) = crate::host_query::saved_text(&raw_rest(line))
+                        && !s.saved_searches.iter().any(|x| x.eq_ignore_ascii_case(&q))
+                    {
+                        s.saved_searches.push(q);
+                    }
                 }
                 "favourite" | "favorite" => {
                     block = Block::Top;
@@ -1961,6 +1973,11 @@ impl Settings {
         for f in &self.favourites {
             let _ = writeln!(out, "Favourite {}", arg(f));
         }
+        for q in &self.saved_searches {
+            if let Some(q) = crate::host_query::saved_text(q) {
+                let _ = writeln!(out, "SavedSearch {q}");
+            }
+        }
         for r in &self.recent {
             let _ = writeln!(out, "Recent {}", arg(r));
         }
@@ -2560,6 +2577,21 @@ Profile lab
         let back = Settings::parse(&s.to_text());
         assert_eq!(back.profile("web").unwrap().tags, web.tags);
         assert!(s.to_text().contains("    Tags prod web eu de\n"));
+    }
+
+    #[test]
+    fn saved_searches_round_trip() {
+        let s = Settings::parse(
+            "SavedSearch tag:prod -tag:legacy\nSavedSearch folder:\"Home lab\"\nSavedSearch TAG:PROD -tag:legacy\nSavedSearch\n",
+        );
+        assert_eq!(
+            s.saved_searches,
+            ["tag:prod -tag:legacy", "folder:\"Home lab\""]
+        );
+        assert_eq!(
+            Settings::parse(&s.to_text()).saved_searches,
+            s.saved_searches
+        );
     }
 
     #[test]
