@@ -116,6 +116,20 @@ mod tests {
     use ferossh_term::{Settings, Terminal};
 
     #[test]
+    fn links_typed_as_text_open_with_ctrl_click() {
+        let mut t = Terminal::new(40, 5, &Settings::default());
+        t.feed("ssh://user@192.168.1.159\r\n\u{4e2d} sftp://user@h/d\r\n".as_bytes());
+        assert_eq!(
+            t.text_link_at(3, 0).as_deref(),
+            Some("ssh://user@192.168.1.159")
+        );
+        assert_eq!(t.text_link_at(30, 0), None);
+        // After a wide character, columns and characters differ.
+        assert_eq!(t.text_link_at(4, 1).as_deref(), Some("sftp://user@h/d"));
+        assert_eq!(t.text_link_at(1, 1), None);
+    }
+
+    #[test]
     fn pattern_fits_80_columns() {
         let mut t = Terminal::new(80, 24, &Settings::default());
         t.feed(test_pattern().as_bytes());

@@ -12,7 +12,7 @@ Items that can do nothing for the focused pane are greyed out, and the command p
 
 | Item | Shortcut | What it does |
 | --- | --- | --- |
-| Connect to... | Ctrl+Shift+N | Asks for a host in a new tab. The prompt takes `user@host`, `user@host:2222`, a `Host` alias from your ssh_config, a saved connection's name, `sftp://user@host[:port][/folder]` (file transfer only, no shell), `telnet://host[:port]` or `telnet host port`, `winrm://[user@]host[:port]`, `winrms://[user@]host[:port]` (HTTPS) or `winrm host`, and a COM port such as `COM3` or `COM3:115200`. |
+| Connect to... | Ctrl+Shift+N | Asks for a host in a new tab. The prompt takes `user@host`, `user@host:2222`, a `Host` alias from your ssh_config, a saved connection's name, `ssh://user@host[:port]`, `sftp://user@host[:port][/folder]` (file transfer only, no shell), `telnet://host[:port]` or `telnet host port`, `winrm://[user@]host[:port]`, `winrms://[user@]host[:port]` (HTTPS) or `winrm host`, and a COM port such as `COM3` or `COM3:115200`. |
 | Reconnect | Ctrl+Shift+R | Logs in again on the focused pane's connection. While FeroSSH is already waiting to reconnect, it tries at once instead. |
 | Disconnect | | Ends the focused pane's connection, or stops the retries while it is reconnecting. |
 | Reconnect automatically | ✓ on | Logs in again by itself when a connection drops (see [When the connection drops](everyday-use.md#when-the-connection-drops)). `AutoReconnect`. |
@@ -69,6 +69,7 @@ Items that can do nothing for the focused pane are greyed out, and the command p
 | Full screen | F11 | ✓ while on. The window drops its title bar, frame and menu bar and covers the whole monitor, taskbar too. F11 again (or this item) puts it back as it was, maximized or not. Alt still shows the menu bar; it hides again once a menu closes. |
 | F11 switches full screen | ✓ on | Off, F11 goes to the terminal like the other function keys, for programs that use it; Full screen stays in this menu and the command palette. With another key for Full screen (Key bindings), the item names that key. `FullScreenKey`. |
 | Key bindings... | | A window listing every action of the menus with its shortcuts and its default ones: change them, add a second key, take a key away, or reset one action or all of them. See [Key bindings](#key-bindings). `KeyBinding`. |
+| Open links > Open ssh:// links with FeroSSH, Open sftp:// links with FeroSSH | ✓ while on | Off until you turn them on. On, `ssh://` and `sftp://` links (in a browser, a wiki, an inventory) open in this `ferossh.exe`; written for your Windows account only, and taken out again when you turn it off. When another program opens them, FeroSSH offers itself in Windows' Default apps instead of taking over. See [Opening ssh:// links](everyday-use.md#opening-ssh-links). |
 | Master password > Set a master password... | | Moves your connections, settings and (if ticked) saved passwords into an encrypted vault, `connections.vault`. FeroSSH then asks for the master password when it starts. |
 | Master password > Use a vault file... | | Uses a vault another PC made, in a shared folder such as OneDrive, and adds this PC's connections to it. |
 | Master password > Move the vault file... | | Moves the vault, for example into a OneDrive folder to share it between PCs. |

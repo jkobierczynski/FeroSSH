@@ -166,7 +166,7 @@ use crate::serial_port::{Output as SerialOutput, SerialPort};
 use crate::session_form::{self, FormAction, Hints, SessionForm, Source, Values};
 use crate::sessions::{HostItem, SessionList, SideAction, SideKey};
 use crate::snippets_view::{self, SnipAction, SnippetsView, Vars};
-use crate::ssh::{Effect, Env, ProxyCommand, SshSession, State, Target};
+use crate::ssh::{Effect, Env, Extras, ProxyCommand, SshSession, State, Target};
 use crate::standby::{self, Capture, Picked, Standby, Toggle};
 use crate::statusbar;
 use crate::suggest;
@@ -715,6 +715,9 @@ mod cmd {
     pub const UPDATE_CHECK: u32 = 900;
     pub const UPDATE_WEEKLY: u32 = 901;
     pub const ABOUT: u32 = 902;
+    /// Settings > Open links: plus the index into
+    /// [`crate::url_handler::SCHEMES`].
+    pub const OPEN_LINKS: u32 = 903;
 }
 
 const DIRS: [Dir; 4] = [Dir::Left, Dir::Right, Dir::Up, Dir::Down];
@@ -2762,8 +2765,9 @@ fn create_and_run(launch: Launch, theme: Option<String>) -> Result<()> {
             Launch::Local(_) => with_window(|w| w.start_shell(first)),
             Launch::Ssh {
                 destination: Some(d),
+                extras,
                 ..
-            } => with_window(|w| w.connect(first, &d)),
+            } => with_window(|w| w.connect_with(first, &d, &extras)),
             Launch::Workspace { name, .. } => {
                 with_window(|w| w.ask_destination(first));
                 // The window waits at the connect prompt, so the workspace
@@ -3255,6 +3259,11 @@ fn build_menu() -> Result<HMENU> {
         item(view, cmd::FULL_SCREEN_KEY, "F11 switches full scree&n")?;
         separator(view)?;
         item(view, cmd::KEY_BINDINGS, "Key bin&dings...")?;
+        let links = CreatePopupMenu()?;
+        for (id, scheme) in (cmd::OPEN_LINKS..).zip(crate::url_handler::SCHEMES) {
+            item(links, id, &format!("Open {scheme}:// links with FeroSSH"))?;
+        }
+        AppendMenuW(view, MF_POPUP, links.0 as usize, w!("Open lin&ks"))?;
         let vault = CreatePopupMenu()?;
         item(vault, cmd::VAULT_SET, "&Set a master password...")?;
         item(vault, cmd::VAULT_USE, "&Use a vault file...")?;
@@ -4430,6 +4439,8 @@ impl Window {
                         live::Kind::Mosh
                     } else if s.target.sftp_only {
                         live::Kind::Sftp
+                    } else if s.target.tunnel_only {
+                        live::Kind::Tunnel
                     } else {
                         live::Kind::Ssh
                     };
@@ -6498,7 +6509,44 @@ impl Window {
     /// Connects pane `id` to `destination` (`[user@]host[:port]` or a
     /// Host from ssh_config).
     fn connect(&mut self, id: PaneId, destination: &str) {
+        self.connect_with(id, destination, &Extras::default());
+    }
+
+    /// Like [`Self::connect`], with the command line's `-N` and forwards
+    /// for an SSH login.
+    fn connect_with(&mut self, id: PaneId, destination: &str, extras: &Extras) {
+        // An `ssh://` link is the host it names; one that does not parse
+        // is never read as a host name.
+        let link;
+        let destination = if ferossh_config::ssh_config::has_scheme(destination, "ssh://") {
+            match ferossh_config::ssh_config::ssh_url(destination) {
+                Some(d) => {
+                    link = d;
+                    link.as_str()
+                }
+                None => {
+                    self.end_host(id);
+                    self.show(
+                        id,
+                        "\x1b[0;31mThat is not an SSH link: write ssh://user@host[:port].\x1b[0m\r\n",
+                    );
+                    self.ask_destination(id);
+                    return;
+                }
+            }
+        } else {
+            destination
+        };
         self.workspace_elsewhere(id, destination);
+        if !extras.is_empty() && !self.ssh_destination(destination) {
+            self.end_host(id);
+            self.show(
+                id,
+                "\x1b[0;31m-N, -L, -R and -D are for SSH logins.\x1b[0m\r\n",
+            );
+            self.ask_destination(id);
+            return;
+        }
         if let Some(target) = serial::parse_target(destination) {
             self.open_serial(id, target, None);
             return;
@@ -6509,6 +6557,7 @@ impl Window {
                 Ok(mut target) => {
                     target.sftp_only = true;
                     target.sftp_folder = folder;
+                    extras.apply(&mut target);
                     self.connect_to(id, target, &env);
                 }
                 Err(why) => {
@@ -6520,11 +6569,7 @@ impl Window {
             return;
         }
         // Meant as an `sftp://` address but not one: never a shell login.
-        if destination
-            .trim()
-            .get(..7)
-            .is_some_and(|h| h.eq_ignore_ascii_case("sftp://"))
-        {
+        if ferossh_config::ssh_config::has_scheme(destination, "sftp://") {
             self.end_host(id);
             self.show(
                 id,
@@ -6565,7 +6610,7 @@ impl Window {
             self.connect_winrm(id, target);
             return;
         }
-        let target = match Target::resolve_route(destination, &env) {
+        let mut target = match Target::resolve_route(destination, &env) {
             Ok(t) => t,
             Err(why) => {
                 self.end_host(id);
@@ -6574,7 +6619,27 @@ impl Window {
                 return;
             }
         };
+        extras.apply(&mut target);
         self.connect_to(id, target, &env);
+    }
+
+    /// Whether `destination` logs in over SSH: not a serial port, a
+    /// Telnet or WinRM address, or a saved connection of another type.
+    fn ssh_destination(&self, destination: &str) -> bool {
+        use ferossh_config::ssh_config::has_scheme;
+        if serial::parse_target(destination).is_some()
+            || ["telnet://", "winrm://", "winrms://"]
+                .iter()
+                .any(|s| has_scheme(destination, s))
+        {
+            return false;
+        }
+        self.settings.profile(destination).is_none_or(|p| {
+            matches!(
+                p.kind,
+                SessionKind::Ssh | SessionKind::Mosh | SessionKind::Sftp | SessionKind::Tunnel
+            )
+        })
     }
 
     /// Opens serial console `target` in pane `id`, with the look of saved
@@ -6659,6 +6724,16 @@ impl Window {
             .settings
             .profile(&target.alias)
             .is_some_and(|p| p.kind == SessionKind::Sftp);
+        // Likewise a connection of type *SSH tunnels only*, else
+        // `SessionType none` or `-N` already said so.
+        target.tunnel_only |= self
+            .settings
+            .profile(&target.alias)
+            .is_some_and(|p| p.kind == SessionKind::Tunnel);
+        // No shell, so no Mosh session in its place.
+        if target.tunnel_only {
+            target.mosh = None;
+        }
         if let Some(p) = self.panes.get_mut(&id) {
             p.term.scroll_to_bottom();
         }
@@ -7291,6 +7366,40 @@ impl Window {
                     if !self.start_script(id, &alias, false) {
                         self.workspace_start(id, false);
                     }
+                }
+                Effect::Connected if self.tunnel_only(id) => {
+                    // No shell: no login script, tmux or start folder.
+                    // The tab holds the forwards open.
+                    self.retries.remove(&id);
+                    self.arm_reconnect_timer();
+                    self.start_log(id);
+                    let none = matches!(
+                        self.panes.get(&id).map(|p| &p.host),
+                        Some(Host::Ssh(s)) if s.target.forwards.is_empty() && !s.target.forward_x11
+                    );
+                    self.show(
+                        id,
+                        if none {
+                            "\x1b[0;90mTunnels only: no shell, and no port forwards yet. \
+                             Add them in Port forwards (Ctrl+Shift+P); closing the tab \
+                             logs out.\x1b[0m\r\n"
+                        } else {
+                            "\x1b[0;90mTunnels only: no shell. The forwards stay up while \
+                             this tab is open; closing it logs out.\x1b[0m\r\n"
+                        },
+                    );
+                    self.start_forwards(id);
+                    if none && self.focused_id() == id {
+                        self.show_side(SideView::Forwards, true);
+                    }
+                    // A desktop through this host opens now, and panes
+                    // waiting for this login go on (to log in on their
+                    // own: a tunnel-only connection is never shared).
+                    // A transfer queue opened on this host carries on.
+                    self.sftp_connected(id);
+                    self.desktop_after_login(id);
+                    self.release_workspace_panes(id, true);
+                    self.refresh_chrome();
                 }
                 Effect::Connected if self.sftp_only(id) => {
                     // No shell: no login script, tmux or start folder.
@@ -9334,9 +9443,9 @@ impl Window {
             }
             | Host::Tmux { .. }
             | Host::Serial { port: Some(_), .. } => true,
-            // An SFTP-only login has no shell to type into.
+            // An SFTP-only or tunnel-only login has no shell to type into.
             Host::Ssh(s) => {
-                s.state() == State::Connected && !s.prompt_active() && !s.target.sftp_only
+                s.state() == State::Connected && !s.prompt_active() && !s.target.no_shell()
             }
             Host::Telnet(s) => s.state() == State::Connected,
             Host::Winrm(s) => s.state() == State::Connected,
@@ -10368,7 +10477,7 @@ impl Window {
         let Some(Host::Ssh(s)) = self.panes.get(&id).map(|p| &p.host) else {
             return Some(Command::Notice(HOW.into()));
         };
-        if s.state() != State::Connected || s.target.sftp_only {
+        if s.state() != State::Connected || s.target.no_shell() {
             return Some(Command::Notice(HOW.into()));
         }
         if s.target.mosh.is_some() {
@@ -13431,7 +13540,7 @@ impl Window {
         let Some(Host::Ssh(s)) = self.panes.get(&host_id).map(|p| &p.host) else {
             return;
         };
-        if s.target.sftp_only || !self.workers.contains_key(&connection) {
+        if s.target.no_shell() || !self.workers.contains_key(&connection) {
             return;
         }
         let host = s.target.label();
@@ -14542,6 +14651,7 @@ impl Window {
                     | SessionKind::Telnet
                     | SessionKind::Mosh
                     | SessionKind::Sftp
+                    | SessionKind::Tunnel
                     | SessionKind::WinRm
             )
         {
@@ -16461,7 +16571,10 @@ impl Window {
         match button {
             MouseButton::Left => {
                 if mods.ctrl
-                    && let Some(link) = p.term.link_at(col, row)
+                    && let Some(link) = p
+                        .term
+                        .link_at(col, row)
+                        .or_else(|| p.term.text_link_at(col, row))
                 {
                     return Some(Command::OpenLink(link));
                 }
@@ -16766,6 +16879,38 @@ impl Window {
             cmd::HIDE_MENU => return Some(Command::SetMenuVisible(!self.menu_visible)),
             cmd::FULL_SCREEN => return Some(Command::FullScreen),
             cmd::KEY_BINDINGS => return Some(Command::KeyBindings),
+            id if (cmd::OPEN_LINKS..cmd::OPEN_LINKS + crate::url_handler::SCHEMES.len() as u32)
+                .contains(&id) =>
+            {
+                let scheme = crate::url_handler::SCHEMES
+                    .get((id - cmd::OPEN_LINKS) as usize)
+                    .copied()
+                    .unwrap_or("ssh");
+                let text = if crate::url_handler::registered(scheme) {
+                    crate::url_handler::unregister(scheme);
+                    None
+                } else {
+                    match crate::url_handler::register(scheme) {
+                        Ok(crate::url_handler::Registered::Done) => None,
+                        Ok(crate::url_handler::Registered::ChooseInSettings(other)) => {
+                            Some(format!(
+                                "Another program opens {scheme}:// links{}. FeroSSH is now one of \
+                             the programs that can: to pick it, open Windows Settings > Apps > \
+                             Default apps, search for {upper}, and choose FeroSSH.",
+                                other
+                                    .map(|c| format!(" ({})", crate::ssh::sanitize_line(&c)))
+                                    .unwrap_or_default(),
+                                upper = scheme.to_ascii_uppercase(),
+                            ))
+                        }
+                        Err(e) => Some(e),
+                    }
+                };
+                self.update_menu_checks();
+                if let Some(text) = text {
+                    return Some(Command::Message(text));
+                }
+            }
             cmd::FULL_SCREEN_KEY => {
                 self.settings.full_screen_key = !self.settings.full_screen_key;
                 self.save_settings();
@@ -18100,6 +18245,18 @@ impl Window {
             for (id, on) in [
                 (cmd::COPY_ON_SELECT, s.copy_on_select),
                 (cmd::UPDATE_WEEKLY, s.update_check_weekly),
+                (
+                    cmd::OPEN_LINKS,
+                    crate::url_handler::SCHEMES
+                        .first()
+                        .is_some_and(|s| crate::url_handler::registered(s)),
+                ),
+                (
+                    cmd::OPEN_LINKS + 1,
+                    crate::url_handler::SCHEMES
+                        .get(1)
+                        .is_some_and(|s| crate::url_handler::registered(s)),
+                ),
                 (cmd::RIGHT_CLICK_PASTE, s.right_click_paste),
                 (cmd::SUGGEST, s.command_suggestions),
                 (cmd::LOG_TOGGLE, log),
@@ -18828,6 +18985,15 @@ impl Window {
         matches!(
             self.panes.get(&id).map(|p| &p.host),
             Some(Host::Ssh(s)) if s.target.sftp_only
+        )
+    }
+
+    /// Whether pane `id` is a tunnel-only login (`ssh -N`): forwards, no
+    /// shell.
+    fn tunnel_only(&self, id: PaneId) -> bool {
+        matches!(
+            self.panes.get(&id).map(|p| &p.host),
+            Some(Host::Ssh(s)) if s.target.tunnel_only && !s.target.sftp_only
         )
     }
 
@@ -21764,6 +21930,27 @@ fn run_command(hwnd: HWND, command: Command) {
                 }
             }
         }
+        // An ssh:// or sftp:// link opens in a new tab here, never through
+        // Windows (which may hand it to another program).
+        Command::OpenLink(raw) if crate::url_handler::is_ferossh_link(&raw) => {
+            if crate::url_handler::valid_link(&raw) && raw.chars().all(|c| c.is_ascii_graphic()) {
+                let prompt = format!("Open this link in a new FeroSSH tab?\n\n{raw}");
+                if dialog(hwnd, &prompt, MB_YESNO | MB_ICONQUESTION) == Some(IDYES) {
+                    with_window(|w| {
+                        let id = w.new_tab_pane();
+                        w.focus_terminal();
+                        w.connect(id, &raw);
+                    });
+                }
+            } else {
+                let text = format!(
+                    "FeroSSH does not open this link. An ssh:// link names only \
+                     [user@]host[:port], and an sftp:// link may add a folder.\n\n{}",
+                    clipboard_preview(&raw, PREVIEW_CHARS)
+                );
+                dialog(hwnd, &text, MB_OK | MB_ICONWARNING);
+            }
+        }
         Command::OpenLink(raw) => match check_link(&raw) {
             Some(uri) => {
                 let prompt = format!("Open this link in your browser?\n\n{uri}");
@@ -24200,14 +24387,15 @@ fn capture(hwnd: HWND, on: bool) {
 
 /// Whether a quiet watch can see pane `p`'s work: a recording has no live
 /// output, a remote desktop's updates (or a closed one's nothing) are not
-/// terminal output, and an SFTP-only connection has no shell.
+/// terminal output, and an SFTP-only or tunnel-only connection has no
+/// shell.
 fn quiet_watchable(p: &Pane) -> bool {
-    let sftp_only = matches!(&p.host, Host::Ssh(s) if s.target.sftp_only);
+    let no_shell = matches!(&p.host, Host::Ssh(s) if s.target.no_shell());
     !matches!(
         p.host,
         Host::Replay(_) | Host::Desktop { .. } | Host::Diff(_)
     ) && p.desktop.is_none()
-        && !sftp_only
+        && !no_shell
 }
 
 #[cfg(test)]

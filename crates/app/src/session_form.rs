@@ -616,7 +616,7 @@ impl SessionForm {
                 _ => out.extend([Field::User, Field::Port].map(Item::Field)),
             }
             match kind {
-                SessionKind::Ssh | SessionKind::Mosh | SessionKind::Sftp => {
+                SessionKind::Ssh | SessionKind::Mosh | SessionKind::Sftp | SessionKind::Tunnel => {
                     out.push(Item::Field(Field::Key));
                     if !self.field_locked(Field::Key) {
                         out.push(Item::Browse);
@@ -635,6 +635,11 @@ impl SessionForm {
                     if kind == SessionKind::Sftp {
                         out.push(Item::Note("Logs in without a shell and".into()));
                         out.push(Item::Note("opens File transfer on the host.".into()));
+                    }
+                    if kind == SessionKind::Tunnel {
+                        out.push(Item::Note("Logs in without a shell, like".into()));
+                        out.push(Item::Note("ssh -N: the tab holds the port".into()));
+                        out.push(Item::Note("forwards (under Extras) open.".into()));
                     }
                 }
                 SessionKind::Rdp | SessionKind::Vnc => {
@@ -714,6 +719,13 @@ impl SessionForm {
                 );
             }
         }
+        if kind == SessionKind::Tunnel {
+            out.push(Item::Section(2));
+            if open[2] {
+                self.forward_items(&mut out);
+                out.extend([Field::Kerberos, Field::Legacy].map(Item::Field));
+            }
+        }
         if matches!(kind, SessionKind::Ssh | SessionKind::Mosh) {
             out.push(Item::Section(2));
             if open[2] {
@@ -729,14 +741,7 @@ impl SessionForm {
                 out.push(Item::Field(Field::StartDir));
                 out.push(Item::Field(Field::LocalFolder));
                 out.push(Item::Field(Field::RemoteFolder));
-                let n = self.values.forwards.len();
-                let locked = self.field_locked(Field::Forward(0));
-                for i in 0..n {
-                    let empty = self.values.forwards.get(i).is_none_or(|t| t.is_empty());
-                    if !(locked && empty) {
-                        out.push(Item::Field(Field::Forward(i)));
-                    }
-                }
+                self.forward_items(&mut out);
                 if kind == SessionKind::Mosh {
                     out.extend(
                         [
@@ -793,6 +798,19 @@ impl SessionForm {
         }
         out.push(Item::Buttons);
         out
+    }
+
+    /// The port forward fields: the ones filled in, and an empty one to
+    /// add another (unless locked).
+    fn forward_items(&self, out: &mut Vec<Item>) {
+        let n = self.values.forwards.len();
+        let locked = self.field_locked(Field::Forward(0));
+        for i in 0..n {
+            let empty = self.values.forwards.get(i).is_none_or(|t| t.is_empty());
+            if !(locked && empty) {
+                out.push(Item::Field(Field::Forward(i)));
+            }
+        }
     }
 
     fn focusable(item: &Item) -> bool {
@@ -939,6 +957,7 @@ impl SessionForm {
                 SessionKind::Mosh => "Mosh terminal (SSH + UDP)",
                 SessionKind::WinRm => "WinRM (PowerShell, cmd)",
                 SessionKind::Sftp => "SFTP file transfer only",
+                SessionKind::Tunnel => "SSH tunnels only (no shell)",
                 SessionKind::Xvfb => "Virtual desktop (Xvfb)",
                 SessionKind::RemoteApp => "Remote app (FeroStream)",
             }
@@ -1051,6 +1070,7 @@ impl SessionForm {
                     SessionKind::RemoteApp,
                     SessionKind::Mosh,
                     SessionKind::Sftp,
+                    SessionKind::Tunnel,
                     SessionKind::WinRm,
                     SessionKind::Telnet,
                     SessionKind::Serial,
@@ -1164,6 +1184,7 @@ impl SessionForm {
                     SessionKind::Ssh
                         | SessionKind::Mosh
                         | SessionKind::Sftp
+                        | SessionKind::Tunnel
                         | SessionKind::Telnet
                         | SessionKind::WinRm
                 ) && !v.via.trim().is_empty() =>
@@ -1179,7 +1200,9 @@ impl SessionForm {
                 _ => h.local_user.clone(),
             },
             Field::Port => match v.kind {
-                SessionKind::Ssh | SessionKind::Mosh | SessionKind::Sftp => "22".into(),
+                SessionKind::Ssh | SessionKind::Mosh | SessionKind::Sftp | SessionKind::Tunnel => {
+                    "22".into()
+                }
                 SessionKind::Rdp => "3389".into(),
                 SessionKind::Vnc => "5900".into(),
                 SessionKind::Telnet => "23".into(),
@@ -1447,7 +1470,7 @@ impl SessionForm {
             let jump = v.jump.trim();
             if matches!(
                 v.kind,
-                SessionKind::Ssh | SessionKind::Mosh | SessionKind::Sftp
+                SessionKind::Ssh | SessionKind::Mosh | SessionKind::Sftp | SessionKind::Tunnel
             ) && !jump.is_empty()
             {
                 if !saved::valid_proxy_jump(jump) {
@@ -1464,7 +1487,7 @@ impl SessionForm {
             let proxy = v.proxy.trim();
             if matches!(
                 v.kind,
-                SessionKind::Ssh | SessionKind::Mosh | SessionKind::Sftp
+                SessionKind::Ssh | SessionKind::Mosh | SessionKind::Sftp | SessionKind::Tunnel
             ) && !proxy.is_empty()
             {
                 if ProxyServer::parse(proxy).is_none() {
@@ -1518,6 +1541,7 @@ impl SessionForm {
             SessionKind::Ssh
             | SessionKind::Mosh
             | SessionKind::Sftp
+            | SessionKind::Tunnel
             | SessionKind::Serial
             | SessionKind::Telnet
             | SessionKind::WinRm => {}
@@ -1628,7 +1652,11 @@ impl SessionForm {
         }
         if matches!(
             v.kind,
-            SessionKind::Ssh | SessionKind::Mosh | SessionKind::Sftp | SessionKind::WinRm
+            SessionKind::Ssh
+                | SessionKind::Mosh
+                | SessionKind::Sftp
+                | SessionKind::Tunnel
+                | SessionKind::WinRm
         ) && v.password > PASSWORD_WINDOWS
             && v.password_command.trim().is_empty()
         {
@@ -2040,9 +2068,9 @@ impl SessionForm {
                 }
             } else {
                 let ssh = matches!(v.kind, SessionKind::Ssh | SessionKind::Mosh);
-                // An SFTP-only login has no shell to forward an agent to
-                // or delegate tickets for.
-                let login = ssh || v.kind == SessionKind::Sftp;
+                // An SFTP-only or tunnel-only login has no shell to forward
+                // an agent to or delegate tickets for.
+                let login = ssh || matches!(v.kind, SessionKind::Sftp | SessionKind::Tunnel);
                 SavedHost {
                     alias: name.clone(),
                     folder: trimmed(&v.folder),
@@ -2115,15 +2143,18 @@ impl SessionForm {
         p.font = trimmed(&v.font);
         p.font_size = v.font_size.trim().parse().ok();
         p.scrollback = v.scrollback.trim().parse().ok();
-        p.tmux =
-            (v.tmux_on && !matches!(v.kind, SessionKind::Mosh | SessionKind::Sftp)).then(|| {
-                trimmed(&v.tmux)
-                    .filter(|t| {
-                        !ferossh_config::settings::tmux_off(t)
-                            && !ferossh_config::settings::tmux_on(t)
-                    })
-                    .unwrap_or_else(|| DEFAULT_TMUX.to_owned())
-            });
+        p.tmux = (v.tmux_on
+            && !matches!(
+                v.kind,
+                SessionKind::Mosh | SessionKind::Sftp | SessionKind::Tunnel
+            ))
+        .then(|| {
+            trimmed(&v.tmux)
+                .filter(|t| {
+                    !ferossh_config::settings::tmux_off(t) && !ferossh_config::settings::tmux_on(t)
+                })
+                .unwrap_or_else(|| DEFAULT_TMUX.to_owned())
+        });
         p.start_dir = ferossh_config::settings::start_dir(&v.start_dir);
         p.local_folder = ferossh_config::settings::start_dir(&v.local_folder);
         p.remote_folder = ferossh_config::settings::start_dir(&v.remote_folder);
@@ -2141,12 +2172,21 @@ impl SessionForm {
         p.legacy_algorithms = v.legacy;
         p.password = match (v.kind, v.password) {
             (
-                SessionKind::Ssh | SessionKind::Mosh | SessionKind::Sftp | SessionKind::WinRm,
+                SessionKind::Ssh
+                | SessionKind::Mosh
+                | SessionKind::Sftp
+                | SessionKind::Tunnel
+                | SessionKind::WinRm,
                 PASSWORD_WINDOWS,
             ) => PasswordSource::Windows,
-            (SessionKind::Ssh | SessionKind::Mosh | SessionKind::Sftp | SessionKind::WinRm, i)
-                if i > PASSWORD_WINDOWS =>
-            {
+            (
+                SessionKind::Ssh
+                | SessionKind::Mosh
+                | SessionKind::Sftp
+                | SessionKind::Tunnel
+                | SessionKind::WinRm,
+                i,
+            ) if i > PASSWORD_WINDOWS => {
                 PasswordSource::Command(v.password_command.trim().to_owned())
             }
             _ => PasswordSource::Ask,
@@ -2790,8 +2830,9 @@ mod tests {
         let mut f = new_form();
         typed(&mut f, "laptop");
         down(&mut f, 2);
-        // Type: SSH -> Serial -> Telnet -> WinRM -> SFTP -> Mosh, going back.
-        for _ in 0..5 {
+        // Type: SSH -> Serial -> Telnet -> WinRM -> tunnels -> SFTP -> Mosh,
+        // going back.
+        for _ in 0..6 {
             f.key(SideKey::Left, 30);
         }
         assert_eq!(f.values.kind, SessionKind::Mosh);
@@ -2844,12 +2885,55 @@ mod tests {
     }
 
     #[test]
+    fn tunnel_sessions_hold_forwards_without_a_shell() {
+        let mut f = new_form();
+        typed(&mut f, "db-tunnel");
+        down(&mut f, 2);
+        // Type: SSH -> Serial -> Telnet -> WinRM -> tunnels, going back.
+        for _ in 0..4 {
+            f.key(SideKey::Left, 30);
+        }
+        assert_eq!(f.values.kind, SessionKind::Tunnel);
+        let t = texts(&mut f);
+        assert!(
+            t[4].contains("‹ SSH tunnels only (no shell) ›"),
+            "{:?}",
+            t[4]
+        );
+        assert!(t.iter().any(|l| l.contains("ssh -N")));
+        let rows = f.native_rows();
+        for label in ["Key file", "Jump host", "Kerberos"] {
+            assert!(rows.iter().any(|r| r.label == label), "{label}");
+        }
+        for label in ["Theme", "tmux", "Start dir", "RDP port", "Remote folder"] {
+            assert!(!rows.iter().any(|r| r.label == label), "{label}");
+        }
+        f.values.host = "db.example.org".into();
+        f.values.user = "ops".into();
+        f.values.jump = "bastion".into();
+        f.values.forwards = vec!["L 5432 localhost:5432".into(), String::new()];
+        f.values.tmux_on = true;
+        assert_eq!(f.check(), Ok(()));
+        let (mut hosts, mut settings) = (Vec::new(), Settings::default());
+        f.apply(&mut hosts, &mut settings);
+        assert_eq!(hosts[0].proxy_jump.as_deref(), Some("bastion"));
+        assert_eq!(hosts[0].forwards.len(), 1);
+        let p = settings.profile("db-tunnel").unwrap();
+        assert_eq!(p.kind, SessionKind::Tunnel);
+        assert_eq!(p.tmux, None, "no shell for tmux");
+        assert!(p.login_script.is_empty());
+        let v = Values::from_saved(&hosts[0]).with_profile(Some(p));
+        assert_eq!(v.kind, SessionKind::Tunnel);
+    }
+
+    #[test]
     fn sftp_sessions_log_in_without_a_terminal() {
         let mut f = new_form();
         typed(&mut f, "uploads");
         down(&mut f, 2);
-        // Type: SSH -> Serial -> Telnet -> WinRM -> SFTP, going back.
-        for _ in 0..4 {
+        // Type: SSH -> Serial -> Telnet -> WinRM -> tunnels -> SFTP, going
+        // back.
+        for _ in 0..5 {
             f.key(SideKey::Left, 30);
         }
         assert_eq!(f.values.kind, SessionKind::Sftp);
@@ -3193,7 +3277,7 @@ mod tests {
         assert_eq!(row(&rows, "tmux").section, 2);
         assert!(rows.iter().any(|r| r.kind == NativeKind::Browse));
         let (options, selected) = choice(row(&rows, "Type"));
-        assert_eq!(options.len(), 10);
+        assert_eq!(options.len(), 11);
         assert_eq!(options[selected], "SSH terminal");
         let (options, _) = choice(row(&rows, "Theme"));
         assert_eq!(options, ["by theme rules", "Nord", "Dracula"]);

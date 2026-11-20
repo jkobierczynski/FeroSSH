@@ -1,11 +1,13 @@
 //! Feeds arbitrary text to the checks that stand between the host (or the
 //! clipboard, or someone who edited a log) and the user: window titles,
-//! OSC 8 link targets, clipboard previews, pastes, and the log chain and
-//! index readers. None may panic, and each must keep its promise.
+//! OSC 8 link targets, links typed as text, clipboard previews, pastes,
+//! and the log chain and index readers. None may panic, and each must keep its promise.
 
 #![no_main]
 
-use ferossh_term::{chain, check_link, clipboard_preview, prepare_paste, sanitize_title};
+use ferossh_term::{
+    chain, check_link, clipboard_preview, prepare_paste, sanitize_title, text_link,
+};
 use libfuzzer_sys::fuzz_target;
 
 // The same set as the sanitiser's own, kept here so a change to one shows.
@@ -45,6 +47,21 @@ fuzz_target!(|data: &[u8]| {
                 );
                 assert!(link.len() <= 2048); // MAX_LINK
                 assert!(!link.chars().any(|c| c.is_control() || c.is_whitespace() || invisible(c)));
+            }
+            // A link written as text, around a character picked by `mode`.
+            let chars: Vec<char> = text.chars().collect();
+            let at = usize::from(mode >> 3) % chars.len().max(1);
+            if let Some(link) = text_link(&chars, at) {
+                let lower = link.to_ascii_lowercase();
+                assert!(
+                    ["http://", "https://", "ssh://", "sftp://"]
+                        .iter()
+                        .any(|s| lower.starts_with(s) && lower.len() > s.len()),
+                    "{link:?}"
+                );
+                assert!(link.len() <= 2048); // MAX_LINK
+                assert!(!link.chars().any(|c| c.is_whitespace() || "\"'`<>".contains(c)));
+                assert!(text.contains(&link));
             }
         }
         2 => {

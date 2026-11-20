@@ -7,7 +7,9 @@
 //! an RDP server, after one to a closed port is refused, and still works
 //! after the shell exited. A second login starts with no forwards, then
 //! adds, moves and stops a local and a remote one without reconnecting,
-//! checking that the old ports close on both sides. Skipped where
+//! checking that the old ports close on both sides. A tunnel-only login
+//! (`SessionType none`, like `ssh -N`) carries a local forward with no
+//! shell at all. Skipped where
 //! `sshd` or `ssh-keygen` is missing; the X11 part also needs `xauth`.
 
 #![allow(
@@ -381,6 +383,114 @@ fn local_remote_dynamic_and_x11_forwards() {
     if x11 {
         assert_eq!(conn.x11.as_ref().unwrap().total, 1);
     }
+    forwarder.stop(session.connection);
+}
+
+#[test]
+fn a_tunnel_only_login_forwards_without_a_shell() {
+    let Some(server) = start_sshd("tunnel-only", "") else {
+        return;
+    };
+    let user = local_user();
+    let echo = echo_server();
+    let local = free_port();
+    let env = Env {
+        home: server.dir.clone(),
+        local_user: user.clone(),
+        vars: Vec::new(),
+        config: format!(
+            "Host testhost\n  HostName 127.0.0.1\n  Port {}\n  User {user}\n  \
+             IdentityFile ~/.ssh/id_ed25519\n  SessionType none\n  \
+             LocalForward {local} 127.0.0.1:{echo}\n",
+            server.port
+        ),
+    };
+    let target = Target::resolve("testhost", &env).unwrap();
+    assert!(target.tunnel_only);
+
+    let (ui_read, worker_write) = std::io::pipe().unwrap();
+    let (worker_read, ui_write) = std::io::pipe().unwrap();
+    std::thread::spawn(move || ferossh_worker::run_blocking(worker_read, worker_write));
+    let (forwarder, runner) = Forwarder::new();
+    let link = Link::start(ui_read, ui_write, || {}, forwarder.sink()).unwrap();
+    runner.spawn(link.sender(), || {}).unwrap();
+    let broker = Broker::spawn(|| {}).unwrap();
+    let mut session = SshSession::new(1, target.clone(), env.known_hosts());
+    let setup = Setup {
+        forwards: target.forwards.clone(),
+        gateway_ports: false,
+        x11: None,
+    };
+
+    let mut effects = session.start(80, 24);
+    let (mut shown, mut output) = (String::new(), String::new());
+    let mut used: Option<Instant> = None;
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        for effect in std::mem::take(&mut effects) {
+            match effect {
+                Effect::Send(m) => link.send(m),
+                Effect::Show(s) => shown.push_str(&s),
+                Effect::Output(b) | Effect::Echo(b) => {
+                    output.push_str(&String::from_utf8_lossy(&b))
+                }
+                Effect::Broker(job) => broker.submit(job),
+                Effect::Connected => {
+                    forwarder.start(session.connection, target.label(), setup.clone());
+                }
+                _ => {}
+            }
+        }
+        assert_ne!(session.state(), State::Ended, "ended:\n{shown}\n{output}");
+        if session.prompt_active() {
+            let last = shown.rsplit("\r\n").next().unwrap_or_default().to_owned();
+            let answer = if last.contains("to trust this key") {
+                "yes"
+            } else if last.contains("Passphrase") {
+                "secret"
+            } else {
+                panic!("unexpected prompt {last:?}")
+            };
+            effects.extend(session.prompt_input(answer.as_bytes()));
+            effects.extend(session.prompt_input(b"\r"));
+            continue;
+        }
+        if session.state() == State::Connected && used.is_none() {
+            let listening = forwarder.view().first().is_some_and(|c| {
+                c.forwards
+                    .iter()
+                    .all(|f| matches!(f.state, FwdState::Listening(_)))
+            });
+            if listening {
+                // Nothing to type into, and the forward carries data.
+                assert!(session.input(b"echo hi\n").is_empty());
+                let s = TcpStream::connect(("127.0.0.1", local)).unwrap();
+                assert_eq!(echo_through(s, b"tunnel"), b"tunnel");
+                used = Some(Instant::now());
+            }
+        }
+        // Still up a while later, with no shell holding it open.
+        if used.is_some_and(|t| t.elapsed() > Duration::from_secs(2)) {
+            let s = TcpStream::connect(("127.0.0.1", local)).unwrap();
+            assert_eq!(echo_through(s, b"again"), b"again");
+            break;
+        }
+        if let Some(reply) = broker.try_recv() {
+            effects.extend(session.on_broker(reply));
+            continue;
+        }
+        match link.try_recv() {
+            Some(LinkEvent::Message(m)) => effects.extend(session.on_worker(m)),
+            Some(LinkEvent::Closed(why)) => panic!("worker closed: {why}"),
+            None => {
+                assert!(Instant::now() < deadline, "timed out:\n{shown}\n{output}");
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        }
+    }
+    assert!(output.is_empty(), "a shell ran: {output}");
+    let view = forwarder.view();
+    assert_eq!(view.first().unwrap().forwards.first().unwrap().total, 2);
     forwarder.stop(session.connection);
 }
 

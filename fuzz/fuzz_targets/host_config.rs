@@ -2,12 +2,15 @@
 //! with an Include that serves the same text again (a config including
 //! itself; the unit test `self_including_configs_stay_small` covers the
 //! exponential case), and checks arbitrary host keys against known_hosts.
-//! The first line also goes to the `sftp://` address parser. None may
-//! panic or blow up, a key known_hosts trusts is never also revoked, and
-//! an `sftp://` address yields a destination that parses and an absolute
-//! folder without control characters. The known hosts manager's listing
-//! keeps each line's text and agrees with the lookup: a listed host key
-//! line for the host with this key means the key is trusted (or revoked).
+//! The first line also goes to the `sftp://` and `ssh://` address
+//! parsers. None may panic or blow up, a key known_hosts trusts is never
+//! also revoked, an `sftp://` address yields a destination that parses
+//! and an absolute folder without control characters, and an `ssh://`
+//! link (which a web page can hand FeroSSH) yields one host that parses
+//! and cannot read as an option, a jump host list or more than one word.
+//! The known hosts manager's listing keeps each line's text and agrees
+//! with the lookup: a listed host key line for the host with this key
+//! means the key is trusted (or revoked).
 
 #![no_main]
 
@@ -44,6 +47,19 @@ fuzz_target!(|data: &[u8]| {
             // Absolute, or relative to the home folder (`/~/docs`).
             assert!(!folder.is_empty() && !folder.chars().any(char::is_control));
         }
+    }
+
+    if let Some(destination) = ssh_config::ssh_url(host) {
+        let parsed = ssh_config::parse_destination(&destination);
+        assert!(parsed.is_some());
+        assert!(!destination.starts_with('-'));
+        assert!(!destination.contains([',', ' ', '\t', '"', '#']));
+        assert!(!destination.chars().any(char::is_control));
+        if let Some((user, host, _)) = parsed {
+            assert!(!user.is_some_and(|u| u.starts_with('-')));
+            assert!(!host.starts_with('-'));
+        }
+        assert!(ssh_config::has_scheme(host, "ssh://"));
     }
 
     let kh = KnownHosts::parse(&text);

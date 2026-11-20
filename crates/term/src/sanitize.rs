@@ -57,6 +57,52 @@ pub fn check_link(uri: &str) -> Option<&str> {
     ok.then_some(uri)
 }
 
+/// Schemes a link written as plain text starts with (OSC 8 links can
+/// carry any; [`check_link`] decides which of those open).
+const TEXT_SCHEMES: [&str; 4] = ["https://", "http://", "ssh://", "sftp://"];
+
+/// The link written as plain text around character `at` of `line`: the
+/// run of characters between blanks or quotes that holds `at`, from its
+/// `http://`, `https://`, `ssh://` or `sftp://` on, without the
+/// punctuation a sentence puts after it. `None` when `at` is not on one.
+pub fn text_link(line: &[char], at: usize) -> Option<String> {
+    let edge = |c: &char| c.is_whitespace() || matches!(c, '"' | '\'' | '`' | '<' | '>');
+    if line.get(at).is_none_or(edge) {
+        return None;
+    }
+    let start = line.get(..at)?.iter().rposition(edge).map_or(0, |i| i + 1);
+    let end = line
+        .get(at..)?
+        .iter()
+        .position(edge)
+        .map_or(line.len(), |i| at + i);
+    let word: String = line.get(start..end)?.iter().collect();
+    if word.len() > MAX_LINK {
+        return None;
+    }
+    let lower = word.to_ascii_lowercase();
+    let from = TEXT_SCHEMES.iter().filter_map(|s| lower.find(s)).min()?;
+    // The scheme starts the word or follows punctuation (`(ssh://h)`,
+    // `URL:https://…`), so `xssh://` is not one.
+    if lower
+        .get(..from)?
+        .chars()
+        .next_back()
+        .is_some_and(|c| c.is_alphanumeric())
+    {
+        return None;
+    }
+    // The click is on the link, not on what comes before it.
+    if at - start < lower.get(..from)?.chars().count() {
+        return None;
+    }
+    let link = word
+        .get(from..)?
+        .trim_end_matches(['.', ',', ';', ':', '!', '?', ')', ']', '}']);
+    let (_, rest) = link.split_once("://")?;
+    (!rest.is_empty()).then(|| link.to_owned())
+}
+
 /// Text from the host shown in a confirmation prompt: control characters
 /// made visible, invisible formatting removed, cut at `max_chars`.
 pub fn clipboard_preview(text: &str, max_chars: usize) -> String {
@@ -144,6 +190,40 @@ pub fn prepare_paste(text: &str, bracketed: bool) -> Paste {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn link_at(line: &str, at: usize) -> Option<String> {
+        text_link(&line.chars().collect::<Vec<_>>(), at)
+    }
+
+    #[test]
+    fn plain_text_links() {
+        let line = "see ssh://user@192.168.1.159 or (https://example.com/a).";
+        assert_eq!(
+            link_at(line, 6).as_deref(),
+            Some("ssh://user@192.168.1.159")
+        );
+        assert_eq!(
+            link_at(line, 27).as_deref(),
+            Some("ssh://user@192.168.1.159")
+        );
+        assert_eq!(link_at(line, 40).as_deref(), Some("https://example.com/a"));
+        assert_eq!(link_at(line, 1), None, "not on a link");
+        assert_eq!(link_at(line, 3), None, "a blank");
+        assert_eq!(link_at(line, 32), None, "the bracket before it");
+        assert_eq!(
+            link_at("sftp://user@host/dir", 0).as_deref(),
+            Some("sftp://user@host/dir")
+        );
+        assert_eq!(
+            link_at("SSH://Host:2222", 3).as_deref(),
+            Some("SSH://Host:2222")
+        );
+        assert_eq!(link_at("xssh://host", 3), None);
+        assert_eq!(link_at("ssh://", 2), None, "no host");
+        assert_eq!(link_at("telnet://router", 2), None);
+        assert_eq!(link_at("ssh://a", 99), None);
+        assert_eq!(link_at("'ssh://h'", 3).as_deref(), Some("ssh://h"));
+    }
 
     #[test]
     fn titles_lose_controls_and_bidi_tricks() {

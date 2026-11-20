@@ -56,7 +56,7 @@ Tab
 
 ## Connecting
 
-Ctrl+Shift+N (File > Connect to...) asks for a host in a new tab. It takes `user@host`, `host:2222`, a `Host` alias from `~/.ssh/config`, a saved connection's name, `sftp://user@host/folder` (file transfer only, see [SFTP-only connections](#sftp-only-connections)), `telnet://router`, `winrm://server`, `winrms://server` (WinRM over HTTPS) or a COM port such as `COM3:115200`. File > Reconnect (Ctrl+Shift+R) logs in again and File > Disconnect ends the connection.
+Ctrl+Shift+N (File > Connect to...) asks for a host in a new tab. It takes `user@host`, `host:2222`, a `Host` alias from `~/.ssh/config`, a saved connection's name, `ssh://user@host:2222` (a link, see [Opening ssh:// links](#opening-ssh-links)), `sftp://user@host/folder` (file transfer only, see [SFTP-only connections](#sftp-only-connections)), `telnet://router`, `winrm://server`, `winrms://server` (WinRM over HTTPS) or a COM port such as `COM3:115200`. File > Reconnect (Ctrl+Shift+R) logs in again and File > Disconnect ends the connection.
 
 File > Open local shell opens a Windows command prompt in a new tab. `ferossh.exe --local wsl -d Ubuntu` (or any other program) opens that instead.
 
@@ -75,6 +75,7 @@ Besides `HostName`, `User`, `Port`, `IdentityFile`, `Tag`, `ProxyJump`, `ProxyCo
 | `GSSAPIAuthentication`, `GSSAPIDelegateCredentials`, `GSSAPIServerIdentity` | Kerberos login (see [Kerberos login](#kerberos-login)). |
 | `SendEnv`, `SetEnv` | Sends environment variables (the server's `AcceptEnv` must take them). |
 | `RemoteCommand`, `RequestTTY` | Runs a command instead of the login shell; `RequestTTY no` asks for no terminal. |
+| `SessionType` | `none` logs in for the port forwards only, with no shell, like `ssh -N` (see [Tunnel-only connections](#tunnel-only-connections)). |
 | `StrictHostKeyChecking` | `yes` refuses unknown hosts; `accept-new` (or `no`) trusts a new host without asking. A changed key is always refused. |
 | `UserKnownHostsFile` | Other known_hosts files, in place of `~/.ssh/known_hosts`. |
 | `HostKeyAlias` | Looks the host key up under this name instead of the host's. |
@@ -93,6 +94,14 @@ Besides `HostName`, `User`, `Port`, `IdentityFile`, `Tag`, `ProxyJump`, `ProxyCo
 - A key DNS contradicts is never trusted on its own: `StrictHostKeyChecking accept-new` asks instead. A key `known_hosts` already trusts still connects, with the warning, and a changed key is still refused, with what DNS says on the warning page.
 
 The AD bit is only as trustworthy as the way to the DNS server: anyone between your PC and that server could set it. Use `yes` only with a DNSSEC-validating resolver you trust on a network you trust; `ask` is safe anywhere. The sandbox cannot reach a resolver on this PC (`127.0.0.1`), so with one of those the lookup fails unless FeroSSH runs with `--no-sandbox`.
+
+### Opening ssh:// links
+
+`ssh://[user@]host[:port]` logs in like `user@host:port`, at the connect prompt or on the command line. To have links on web pages, in wikis, inventories or chat open in FeroSSH, turn on Settings > Open links > Open ssh:// links with FeroSSH (and the sftp:// one for [SFTP links](#sftp-only-connections)). FeroSSH has nothing to install, so this is off until you turn it on, and it is written for your Windows account only (under `HKEY_CURRENT_USER`); the same item turns it off again and takes out what it wrote. If you move `ferossh.exe`, turn it on again from the new place.
+
+In a terminal, Ctrl+click an `ssh://` or `sftp://` link, written as plain text (`echo ssh://user@host`) or marked by a program, to open it in a new FeroSSH tab after you confirm. This works without the Settings item, and such a link never goes through Windows. Plain-text `http://` and `https://` links open the same way, in your browser.
+
+A link only ever names a host: a path, a query, options, a second host, a user starting with `-` or anything a shell would read as more is refused, and FeroSSH starts from a link only as `ferossh.exe --url "<link>"`, which takes that one valid link and nothing else. The usual host key check applies, so a link to a host you have never used shows its fingerprint first. When another program already opens links of that kind, FeroSSH leaves it in place and offers itself in Windows Settings > Apps > Default apps, where you pick it; Windows may also ask the first time which program to use.
 
 ### New host keys from the server (UpdateHostKeys)
 
@@ -155,7 +164,7 @@ Ctrl+Shift+S shows your hosts in the tools pane: those from `~/.ssh/config`, you
 
 Insert or the New button opens the connection form in the tools pane; F2, the Edit button or a right click edits the selected connection. It is a Windows form of text boxes and drop-down lists, with a tab per section:
 
-- **Connection**: **Name, Folder, Type**; the type is an SSH terminal, Mosh terminal, SFTP file transfer only, WinRM (PowerShell, cmd), Telnet (unencrypted), Serial console, Remote desktop (RDP) or VNC desktop. Then **Host, User, Port, Key file** (with Browse...), the **Password** source (below), the **Jump host** (see [Jump hosts](#jump-hosts)) and the **Proxy** (see [Proxies](#proxies)). A Mosh terminal adds the **Mosh server** program and its **UDP ports** (see [Mosh](#mosh)). A WinRM connection has **Host, User, Port**, the **Password** source and what it **Runs** (see [WinRM](#winrm-powershell-on-windows-servers)). A serial console has the port, speed, framing and flow control instead.
+- **Connection**: **Name, Folder, Type**; the type is an SSH terminal, Mosh terminal, SFTP file transfer only, SSH tunnels only (no shell), WinRM (PowerShell, cmd), Telnet (unencrypted), Serial console, Remote desktop (RDP) or VNC desktop. Then **Host, User, Port, Key file** (with Browse...), the **Password** source (below), the **Jump host** (see [Jump hosts](#jump-hosts)) and the **Proxy** (see [Proxies](#proxies)). A Mosh terminal adds the **Mosh server** program and its **UDP ports** (see [Mosh](#mosh)). A WinRM connection has **Host, User, Port**, the **Password** source and what it **Runs** (see [WinRM](#winrm-powershell-on-windows-servers)). A serial console has the port, speed, framing and flow control instead.
 - **Look** (a terminal's tab): theme, font, font size and scrollback.
 - **Extras** (a terminal's tab): tmux on or off, the tmux session to attach and its layout, the start directory, File transfer's Local and Remote folders, port forwards (such as `L 8080 localhost:80`), RDP and VNC ports, agent forwarding, Kerberos and passing a ticket on, older crypto, and the login script (see [Login scripts](#login-scripts)).
 
@@ -529,6 +538,16 @@ Changes last through the tab's reconnects; the saved connection is left as it wa
 
 **Unix sockets.** Either side of a local or remote forward may be a Unix socket instead of a port: a field with a `/` or `\` in it is a socket path, as in OpenSSH. `-L 2375:/var/run/docker.sock` makes the server's Docker socket a port on this PC (`docker -H tcp://localhost:2375`), `-R /tmp/app.sock:localhost:80` gives programs on the server a socket that reaches port 80 here, and `-L 8080:/run/app.sock` or `-R /run/user/1000/x.sock:localhost:9000` work too. On this PC, Windows 10 1803 and later has Unix sockets as well: a path there needs a drive letter, written in brackets because of its colon (`-L [C:\Users\me\db.sock]:db:5432`), and its folder's permissions decide who may connect (the check that a loopback port only takes programs of your own session does not apply). FeroSSH removes a socket file it listens on when the forward stops, and one left behind by a FeroSSH that did not end cleanly; it never removes a socket something still listens on, or a file that is not a socket. Paths may not hold spaces. In the form, type a path in the Listen or To box as it is; the brackets are added for you. Local listeners take `127.0.0.1` and `::1` unless you give an address (`*:8080`, or `GatewayPorts yes`). A tab whose connection forwards shows `⇄`, in amber when the server can reach back into your PC (remote forwards or X11).
 
+### Tunnel-only connections
+
+Sometimes a login is only there for its forwards: a database behind a bastion, a web console on a private network, a SOCKS proxy. Like `ssh -N`, a tunnel-only connection logs in without asking for a shell, so nothing runs on the server and nothing can be typed by mistake. Three ways to make one:
+
+- a saved connection of type *SSH tunnels only (no shell)*, with its forwards under Extras;
+- `SessionType none` for the host in your ssh_config, with its `LocalForward`, `RemoteForward` and `DynamicForward` lines;
+- `ferossh.exe -N -L 5432:db.internal:5432 bastion` on the command line (a desktop shortcut works well). `-L`, `-R` and `-D` take the forwards as `ssh` writes them.
+
+The tab says it holds tunnels only and lists the forwards; with none yet, Port forwards opens so you can add them. The forwards stay up while the tab is open, also when other tabs on the same host close, since a tunnel-only connection never shares its login with a shell. A dropped connection logs in again on its own and the forwards come back. Close the tab to log out. Its Extras hold only what makes sense without a shell: the forwards, Kerberos and legacy algorithms. PuTTY sessions with *Don't start a shell or command at all* import as tunnel-only connections.
+
 ## X11 forwarding
 
 `ForwardX11 yes` for a host in your ssh_config sends X programs on the server to an X server on Windows, such as VcXsrv or X410; FeroSSH ships none, and the X server must listen on TCP. The display is `X11Display` in `ferossh.conf`, else `DISPLAY`, else `localhost:0`. The server only gets a fake cookie; FeroSSH puts the real one from `%XAUTHORITY%` or `~\.Xauthority` in its place. X11 is off unless a host turns it on, because X programs on the server can see and type into your other X windows.
@@ -747,7 +766,7 @@ Each picture is decoded by FeroSSH's own small decoders, in safe Rust and fuzz-t
 | Select a block | Alt+drag |
 | Select while a program uses the mouse | Shift+drag |
 | Copy / paste | Ctrl+Shift+C / Ctrl+Shift+V (or Ctrl+Insert / Shift+Insert) |
-| Open a link | Ctrl+click (FeroSSH shows its real target first) |
+| Open a link | Ctrl+click on a marked or plain-text link (FeroSSH shows its real target first; `ssh://` and `sftp://` open in a new tab) |
 | Scroll back / forward a page | Shift+PgUp / Shift+PgDn |
 | Jump to the top / bottom | Ctrl+Shift+Home / Ctrl+Shift+End |
 | Find in scrollback | Ctrl+Shift+F, then Enter for older, Shift+Enter for newer |

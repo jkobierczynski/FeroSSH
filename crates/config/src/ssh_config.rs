@@ -4,7 +4,7 @@
 //! `ForwardAgent`), `Tag`, the forwarding keywords (`LocalForward`,
 //! `RemoteForward`, `DynamicForward`, `ForwardX11`, `GatewayPorts`,
 //! `ClearAllForwardings`), the session (`RemoteCommand`, `RequestTTY`,
-//! `SendEnv`, `SetEnv`), host keys (`StrictHostKeyChecking`,
+//! `SessionType`, `SendEnv`, `SetEnv`), host keys (`StrictHostKeyChecking`,
 //! `UserKnownHostsFile`, `HostKeyAlias`, `VerifyHostKeyDNS`, `UpdateHostKeys`), the
 //! `EscapeChar`, how to get there (`ProxyJump`,
 //! `ProxyCommand`, `AddressFamily`), Kerberos (`GSSAPIAuthentication`,
@@ -77,6 +77,8 @@ pub struct HostConfig {
     /// `RemoteCommand none`.
     pub remote_command: Option<String>,
     pub request_tty: Option<RequestTty>,
+    /// `SessionType`: `none` logs in for the forwards only (`ssh -N`).
+    pub session_type: Option<SessionType>,
     pub strict_host_key_checking: Option<StrictHostKeyChecking>,
     /// `UserKnownHostsFile`: the files to read, the first to write; empty
     /// for `none`.
@@ -111,6 +113,18 @@ pub enum RequestTty {
     Force,
     /// A terminal unless a `RemoteCommand` runs (the default).
     Auto,
+}
+
+/// `SessionType`: what the login asks the server for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionType {
+    /// A shell, or the `RemoteCommand` (the default).
+    Default,
+    /// Nothing: the connection only carries its forwards (`ssh -N`).
+    None,
+    /// A subsystem (`ssh -s`), which FeroSSH does not start: read as the
+    /// default.
+    Subsystem,
 }
 
 /// `StrictHostKeyChecking`: what to do with a host not in known_hosts.
@@ -766,6 +780,14 @@ fn apply(
                     _ => None,
                 };
             }
+            "sessiontype" if cfg.session_type.is_none() => {
+                cfg.session_type = match args.first().map(|a| a.to_ascii_lowercase()).as_deref() {
+                    Some("none") => Some(SessionType::None),
+                    Some("subsystem") => Some(SessionType::Subsystem),
+                    Some("default") => Some(SessionType::Default),
+                    _ => None,
+                };
+            }
             "stricthostkeychecking" if cfg.strict_host_key_checking.is_none() => {
                 cfg.strict_host_key_checking =
                     match args.first().map(|a| a.to_ascii_lowercase()).as_deref() {
@@ -949,38 +971,12 @@ pub fn expand_path(
 /// write it: the destination to log in to, and the absolute folder to
 /// start in (none for the home folder, also for `/~` paths).
 pub fn sftp_url(text: &str) -> Option<(String, Option<String>)> {
-    let text = text.trim();
-    let head = text.get(..7)?;
-    if !head.eq_ignore_ascii_case("sftp://") {
-        return None;
-    }
-    let rest = text.get(7..)?;
+    let rest = strip_scheme(text, "sftp://")?;
     let (authority, path) = match rest.find('/') {
         Some(i) => rest.split_at(i),
         None => (rest, ""),
     };
-    // A bracketed IPv6 address keeps its colons; WinSCP's `;fingerprint=`
-    // and other parameters after the user are not used.
-    let authority = match authority.split_once('@') {
-        Some((user, host)) => {
-            let user = user.split(';').next().unwrap_or_default();
-            let user = crate::import::decode(user);
-            if user.is_empty() {
-                host.to_owned()
-            } else {
-                format!("{user}@{host}")
-            }
-        }
-        None => authority.to_owned(),
-    };
-    // One host, no options: a comma would make it a jump host list.
-    let (user, _, _) = parse_destination(&authority)?;
-    if authority.contains(',')
-        || user.is_some_and(|u| u.starts_with('-'))
-        || !crate::saved::valid_proxy_jump(&authority)
-    {
-        return None;
-    }
+    let authority = url_destination(authority)?;
     let path = crate::import::decode(path);
     if path.chars().any(char::is_control) {
         return None;
@@ -999,6 +995,69 @@ pub fn sftp_url(text: &str) -> Option<(String, Option<String>)> {
         None => (!path.is_empty()).then(|| path.to_owned()),
     };
     Some((authority, folder))
+}
+
+/// `ssh://[user@]host[:port][/]`, as browsers, inventories and RFC
+/// drafts write it (the `ssh` URI of draft-ietf-secsh-scp-sftp-ssh-uri):
+/// the destination to log in to. A link names a host and nothing else:
+/// no path, query or options, so a crafted one cannot change how the
+/// login runs.
+pub fn ssh_url(text: &str) -> Option<String> {
+    let rest = strip_scheme(text, "ssh://")?;
+    // Only a trailing `/` may follow the host: a path, query or fragment
+    // means something FeroSSH would not do.
+    let authority = rest.strip_suffix('/').unwrap_or(rest);
+    if authority.contains(['/', '?', '#']) {
+        return None;
+    }
+    url_destination(authority)
+}
+
+/// Whether `text` begins with URL scheme `scheme` (`ssh://`, in any
+/// case): meant as such a link, valid or not.
+pub fn has_scheme(text: &str, scheme: &str) -> bool {
+    text.trim()
+        .get(..scheme.len())
+        .is_some_and(|h| h.eq_ignore_ascii_case(scheme))
+}
+
+/// The part of `text` after `scheme`, when it starts with it.
+fn strip_scheme<'a>(text: &'a str, scheme: &str) -> Option<&'a str> {
+    let text = text.trim();
+    if !has_scheme(text, scheme) {
+        return None;
+    }
+    text.get(scheme.len()..)
+}
+
+/// A URL's `[user[;params]@]host[:port]` as a destination FeroSSH logs
+/// in to: one host, a user that cannot read as an option, nothing a
+/// shell or ssh_config would read as more.
+fn url_destination(authority: &str) -> Option<String> {
+    // A bracketed IPv6 address keeps its colons; WinSCP's `;fingerprint=`
+    // and other parameters after the user are not used.
+    let authority = match authority.split_once('@') {
+        Some((user, host)) => {
+            let user = user.split(';').next().unwrap_or_default();
+            let user = crate::import::decode(user);
+            if user.is_empty() {
+                host.to_owned()
+            } else {
+                format!("{user}@{host}")
+            }
+        }
+        None => authority.to_owned(),
+    };
+    // One host, no options: a comma would make it a jump host list.
+    let (user, host, _) = parse_destination(&authority)?;
+    if authority.contains(',')
+        || user.is_some_and(|u| u.starts_with('-'))
+        || host.starts_with('-')
+        || !crate::saved::valid_proxy_jump(&authority)
+    {
+        return None;
+    }
+    Some(authority)
 }
 
 /// Parses `[user@]host[:port]` as typed on the command line or at the
@@ -1095,6 +1154,60 @@ mod tests {
         assert_eq!(sftp_url("sftp://a%2Cb@h"), None);
         assert_eq!(sftp_url("sftp://-oProxyCommand=x@h"), None);
         assert_eq!(sftp_url("sftp://a b@h"), None);
+    }
+
+    #[test]
+    fn ssh_links() {
+        assert_eq!(ssh_url("ssh://web1.lan").as_deref(), Some("web1.lan"));
+        assert_eq!(
+            ssh_url("SSH://admin@web1.lan:2222/").as_deref(),
+            Some("admin@web1.lan:2222")
+        );
+        assert_eq!(
+            ssh_url("ssh://ad%20min;fingerprint=ssh-ed25519-xx@[fe80::1]:22").as_deref(),
+            None
+        );
+        assert_eq!(
+            ssh_url("ssh://j.doe;fingerprint=ssh-ed25519-xx@[fe80::1]:22").as_deref(),
+            Some("j.doe@[fe80::1]:22")
+        );
+        assert_eq!(ssh_url(" ssh://h ").as_deref(), Some("h"));
+        // Nothing but a host: no path, query, options or second host.
+        assert_eq!(ssh_url("ssh://h/etc"), None);
+        assert_eq!(ssh_url("ssh://h//"), None);
+        assert_eq!(ssh_url("ssh://h?x=1"), None);
+        assert_eq!(ssh_url("ssh://h#x"), None);
+        assert_eq!(ssh_url("ssh://"), None);
+        assert_eq!(ssh_url("ssh:///"), None);
+        assert_eq!(ssh_url("ssh://h:0"), None);
+        assert_eq!(ssh_url("ssh://h:x"), None);
+        assert_eq!(ssh_url("ssh://a,b"), None);
+        assert_eq!(ssh_url("ssh://-oProxyCommand=calc"), None);
+        assert_eq!(ssh_url("ssh://-oProxyCommand=x@h"), None);
+        assert_eq!(ssh_url("ssh://%2DoProxyCommand=x@h"), None);
+        assert_eq!(ssh_url("ssh://a%2Cb@h"), None);
+        assert_eq!(ssh_url("ssh://a b@h"), None);
+        assert_eq!(ssh_url("ssh://a%0Ab@h"), None);
+        assert_eq!(ssh_url("ssh://a%22@h"), None);
+        assert_eq!(ssh_url("ssh://h\" --no-sandbox"), None);
+        assert_eq!(ssh_url("ssh://h --local calc"), None);
+        assert_eq!(ssh_url("sftp://h"), None);
+        assert_eq!(ssh_url("web1.lan"), None);
+        assert!(has_scheme("SSH://whatever", "ssh://"));
+        assert!(!has_scheme("ssh:/h", "ssh://"));
+    }
+
+    #[test]
+    fn session_type() {
+        let cfg = resolve(
+            "Host t\n  SessionType none\nHost *\n  SessionType default\n",
+            "t",
+        );
+        assert_eq!(cfg.session_type, Some(SessionType::None));
+        let cfg = resolve("Host *\n  SessionType subsystem\n", "x");
+        assert_eq!(cfg.session_type, Some(SessionType::Subsystem));
+        let cfg = resolve("Host *\n  SessionType bogus\n", "x");
+        assert_eq!(cfg.session_type, None);
     }
 
     const CONFIG: &str = r#"

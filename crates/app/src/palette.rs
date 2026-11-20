@@ -104,6 +104,7 @@ impl Entry {
             SessionKind::Mosh => "mosh",
             SessionKind::WinRm => "winrm",
             SessionKind::Sftp => "sftp files file transfer",
+            SessionKind::Tunnel => "tunnel forwards no shell",
             SessionKind::Xvfb => "xvfb virtual desktop",
             SessionKind::RemoteApp => "remote app ferostream",
         };
