@@ -4677,11 +4677,8 @@ mod tests {
         s.keys_only = true;
         s.password_source = true;
         let fx = s.on_worker(password_prompt(1));
-        assert!(shown(&fx).contains("only a key"), "{fx:?}");
-        assert!(
-            matches!(sent(&fx)[..], [Message::Close { channel: 1 }]),
-            "{fx:?}"
-        );
+        assert!(shown(&fx).contains("only a key"));
+        assert!(matches!(sent(&fx)[..], [Message::Close { channel: 1 }]));
         assert!(!s.prompt_active() && !s.fetching_password());
         // A one-time code is not a password: still asked.
         let mut s = SshSession::new(1, Target::resolve("host", &e).unwrap(), e.known_hosts());
