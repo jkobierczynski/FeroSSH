@@ -137,6 +137,8 @@ use crate::import_panel;
 use crate::import_reg;
 use crate::import_view::{Found, ImportAction, ImportView, Items};
 use crate::keymap::{self, KeyDefault, Keymap};
+use crate::known_hosts_panel;
+use crate::known_hosts_view::{self, KnownHostsView};
 use crate::layout::{self, Axis, Closed, Dir, Drop, PaneId, Rect, Workspace};
 use crate::link::{Link, LinkEvent};
 use crate::live::{self, LiveAction, LiveSession, LiveState, LiveView};
@@ -409,6 +411,7 @@ const KEY_DEFAULTS: &[KeyDefault] = {
         d(cmd::LIVE, Always, &["Ctrl+Shift+L"]),
         d(cmd::FILES, Always, &["Ctrl+Shift+E"]),
         d(cmd::FORWARDS, Always, &["Ctrl+Shift+P"]),
+        d(cmd::KNOWN_HOSTS, Always, &["Ctrl+Shift+K"]),
         d(cmd::SNIPPETS, Always, &["Ctrl+Shift+Space"]),
         d(cmd::PALETTE, Always, &["Ctrl+Shift+A"]),
         d(
@@ -528,6 +531,8 @@ mod cmd {
     pub const FULL_SCREEN: u32 = 218;
     /// Settings > F11 switches full screen.
     pub const FULL_SCREEN_KEY: u32 = 219;
+    /// Tools > Known hosts.
+    pub const KNOWN_HOSTS: u32 = 220;
     /// Settings > Server status bar.
     pub const STATUS_BAR: u32 = 230;
     /// Settings > Key bindings.
@@ -1189,6 +1194,8 @@ enum SideView {
     Snippets,
     /// The session manager: the sessions open now.
     Live,
+    /// The known hosts manager (native controls only).
+    KnownHosts,
     /// The command palette, shown over whatever the side pane showed.
     Palette,
 }
@@ -1355,6 +1362,8 @@ struct Window {
     pastes: Vec<PasteBatch>,
     forwards_view: ForwardsView,
     live_view: LiveView,
+    /// Tools > Known hosts.
+    known_hosts_view: KnownHostsView,
     /// tmux control mode, per SSH pane that has run `tmux -CC`.
     tmux: HashMap<PaneId, Tmux>,
     /// SSH panes whose connection dropped while tmux ran: the host's
@@ -2612,6 +2621,7 @@ fn create_and_run(launch: Launch, theme: Option<String>) -> Result<()> {
                 pastes: Vec::new(),
                 forwards_view: ForwardsView::default(),
                 live_view: LiveView::default(),
+                known_hosts_view: KnownHostsView::default(),
                 tmux: HashMap::new(),
                 reattach: HashMap::new(),
                 toast_pane: None,
@@ -2676,6 +2686,7 @@ fn create_and_run(launch: Launch, theme: Option<String>) -> Result<()> {
                 RailItem::Files => cmd::FILES,
                 RailItem::Forwards => cmd::FORWARDS,
                 RailItem::Snippets => cmd::SNIPPETS,
+                RailItem::KnownHosts => cmd::KNOWN_HOSTS,
                 RailItem::Palette => cmd::PALETTE,
                 RailItem::Pin => cmd::TOOLS_PIN,
             });
@@ -2696,6 +2707,8 @@ fn create_and_run(launch: Launch, theme: Option<String>) -> Result<()> {
         let _ = palette_panel::create(hwnd, palette_event, dpi);
         // The port forwards pane's, likewise.
         let _ = fwd_panel::create(hwnd, fwd_event, dpi);
+        // The known hosts manager's, likewise.
+        let _ = known_hosts_panel::create(hwnd, known_hosts_event, dpi);
         // The scripts pane's, likewise.
         let _ = scripts_panel::create(hwnd, scripts_event, dpi);
         // The script editor's, likewise.
@@ -2800,6 +2813,7 @@ fn create_and_run(launch: Launch, theme: Option<String>) -> Result<()> {
                 || palette_panel::pre_translate(&msg)
                 || files_panel::pre_translate(&msg)
                 || fwd_panel::pre_translate(&msg)
+                || known_hosts_panel::pre_translate(&msg)
                 || scripts_panel::pre_translate(&msg)
                 || script_editor::pre_translate(&msg)
                 || script_args::pre_translate(&msg)
@@ -3148,6 +3162,7 @@ fn build_menu() -> Result<HMENU> {
         item(tools, cmd::FILES, "&File transfer\tCtrl+Shift+E")?;
         item(tools, cmd::FORWARDS, "&Port forwards\tCtrl+Shift+P")?;
         item(tools, cmd::SNIPPETS, "Sc&ripts\tCtrl+Shift+Space")?;
+        item(tools, cmd::KNOWN_HOSTS, "Known &hosts\tCtrl+Shift+K")?;
         item(tools, cmd::SNIPPET_FOLDER, "Open scripts f&older")?;
         separator(tools)?;
         item(tools, cmd::NEW_KEY, "New SSH &key...")?;
@@ -10751,6 +10766,7 @@ impl Window {
             SideView::Files => RailItem::Files,
             SideView::Forwards => RailItem::Forwards,
             SideView::Snippets => RailItem::Snippets,
+            SideView::KnownHosts => RailItem::KnownHosts,
             SideView::Palette => RailItem::Palette,
         });
         rail::Look {
@@ -10782,6 +10798,20 @@ impl Window {
     /// Whether the command palette shows as native controls.
     fn palette_native(&self) -> bool {
         self.side.visible && self.side.view == SideView::Palette
+    }
+
+    /// Reads the known_hosts files again for Tools > Known hosts: the one
+    /// FeroSSH writes and the `UserKnownHostsFile`s `~/.ssh/config` names.
+    /// A file that cannot be read is named in the panel.
+    fn reload_known_hosts(&mut self) {
+        let env = ssh_env();
+        let files = known_hosts_view::files_to_list(&env.known_hosts(), &env.config, &env.home);
+        self.known_hosts_view.reload(files);
+    }
+
+    /// Whether the known hosts manager shows (always native controls).
+    fn known_hosts_native(&self) -> bool {
+        self.side.visible && self.side.view == SideView::KnownHosts
     }
 
     /// Whether port forwards show as native controls.
@@ -10882,6 +10912,8 @@ impl Window {
             files_panel::has_focus()
         } else if self.fwd_native() {
             fwd_panel::has_focus()
+        } else if self.known_hosts_native() {
+            known_hosts_panel::has_focus()
         } else if self.scripts_native() {
             scripts_panel::has_focus()
         } else if self.script_editor_native() {
@@ -10943,6 +10975,21 @@ impl Window {
             fwd_panel::place(self.areas.side, self.areas.side_width, self.dpi);
         } else {
             fwd_panel::place(None, 0, self.dpi);
+        }
+        if self.known_hosts_native() {
+            known_hosts_panel::set_search(self.known_hosts_view.query());
+            let note = match self.known_hosts_view.errors() {
+                [] => String::new(),
+                errors => format!("Could not read {}", errors.join("; ")),
+            };
+            known_hosts_panel::set_rows(
+                self.known_hosts_view.rows(),
+                self.known_hosts_view.total(),
+                note,
+            );
+            known_hosts_panel::place(self.areas.side, self.areas.side_width, self.dpi);
+        } else {
+            known_hosts_panel::place(None, 0, self.dpi);
         }
         if self.scripts_native() {
             scripts_panel::seed_folds(self.settings.expanded_script_cats.clone());
@@ -11046,6 +11093,7 @@ impl Window {
             || self.import_native()
             || self.files_visible()
             || self.fwd_native()
+            || self.known_hosts_native()
             || self.scripts_native()
             || self.script_editor_native()
             || self.script_args_native()
@@ -11146,8 +11194,8 @@ impl Window {
                         &self.settings.snippets,
                     );
                 }
-                // Native controls (`files_panel`).
-                SideView::Files => {}
+                // Native controls (`files_panel`, `known_hosts_panel`).
+                SideView::Files | SideView::KnownHosts => {}
             }
             self.invalidate_grid(side);
         }
@@ -12066,6 +12114,7 @@ impl Window {
                 RailItem::Files => cmd::FILES,
                 RailItem::Forwards => cmd::FORWARDS,
                 RailItem::Snippets => cmd::SNIPPETS,
+                RailItem::KnownHosts => cmd::KNOWN_HOSTS,
                 RailItem::Palette => cmd::PALETTE,
                 RailItem::Pin => return String::new(),
             };
@@ -12366,6 +12415,11 @@ impl Window {
 
     /// Pastes into the snippets view when it has the keyboard; `false`
     /// when the paste is for the terminal.
+    /// Whether a paste is for the Known hosts tool.
+    fn known_hosts_paste(&self) -> bool {
+        self.side.visible && self.side.focused && self.side.view == SideView::KnownHosts
+    }
+
     fn paste_side(&mut self, text: &str) -> bool {
         if self.side.visible
             && self.side.focused
@@ -12374,6 +12428,13 @@ impl Window {
         {
             self.live_view.paste(text);
             self.refresh_chrome();
+            return true;
+        }
+        // The search box takes it (see `Command::Paste`: the box's change
+        // event needs the window, so the paste comes after this borrow);
+        // the list has nowhere to paste into, and the terminal behind must
+        // not get it either.
+        if self.known_hosts_paste() {
             return true;
         }
         if !(self.side.visible && self.side.focused && self.side.view == SideView::Snippets) {
@@ -15267,6 +15328,7 @@ impl Window {
                 self.ensure_sftp(self.focused_id());
             }
             SideView::Forwards | SideView::Palette => {}
+            SideView::KnownHosts => self.reload_known_hosts(),
             SideView::Live => {
                 let all = self.open_sessions();
                 self.live_view.reset(&all);
@@ -15305,6 +15367,7 @@ impl Window {
             cmd::FORWARDS => SideView::Forwards,
             cmd::SNIPPETS => SideView::Snippets,
             cmd::LIVE => SideView::Live,
+            cmd::KNOWN_HOSTS => SideView::KnownHosts,
             _ => SideView::Sessions,
         };
         let open = self.side.visible && self.side.view == view;
@@ -17860,6 +17923,10 @@ impl Window {
                 (
                     cmd::SNIPPETS,
                     self.side.visible && self.side.view == SideView::Snippets,
+                ),
+                (
+                    cmd::KNOWN_HOSTS,
+                    self.side.visible && self.side.view == SideView::KnownHosts,
                 ),
                 (cmd::FOLLOW_CD, s.follow_directory),
                 (cmd::VERIFY, s.verify_transfers),
@@ -20639,6 +20706,7 @@ fn tools_have_focus() -> bool {
         || script_args::has_focus()
         || script_hosts::has_focus()
         || script_report::has_focus()
+        || known_hosts_panel::has_focus()
 }
 
 /// Carries out what the user did on a script run's report: its keys go
@@ -20794,6 +20862,82 @@ fn fwd_event(hwnd: HWND, event: fwd_panel::Event) {
     };
     if let Some(command) = command {
         run_command(hwnd, command);
+    }
+}
+
+/// Carries out what the user did in the known hosts manager.
+fn known_hosts_event(hwnd: HWND, event: known_hosts_panel::Event) {
+    use known_hosts_panel::Event;
+    match event {
+        Event::Remove(picks) => remove_known_hosts(hwnd, &picks),
+        Event::CopyFingerprint((file, line)) => {
+            let text = with_window(|w| w.known_hosts_view.fingerprint(file, line)).flatten();
+            // The user asked for it here: no remote-copy prompt.
+            if let Some(text) = text {
+                clipboard::set_text(hwnd, &text);
+            }
+        }
+        Event::CopyLine((file, line)) => {
+            let text = with_window(|w| w.known_hosts_view.line_text(file, line)).flatten();
+            if let Some(text) = text {
+                clipboard::set_text(hwnd, &text);
+            }
+        }
+        Event::Reload => {
+            with_window(|w| {
+                w.reload_known_hosts();
+                w.refresh_chrome();
+            });
+        }
+        Event::Query(query) => {
+            with_window(|w| {
+                w.known_hosts_view.set_query(&query);
+                w.refresh_chrome();
+            });
+        }
+        Event::Focused => tools_focused(),
+        Event::Leave => {
+            with_window(Window::focus_terminal);
+        }
+    }
+}
+
+/// Tools > Known hosts, Remove: asks (twice for a `@revoked` line, whose
+/// key is then trusted again), then removes the lines and lists the files
+/// again.
+fn remove_known_hosts(hwnd: HWND, picks: &[known_hosts_panel::Pick]) {
+    let Some((text, revoked)) = with_window(|w| {
+        w.known_hosts_view
+            .confirm_text(picks)
+            .map(|t| (t, w.known_hosts_view.removes_revoked(picks)))
+    })
+    .flatten() else {
+        return;
+    };
+    if dialog(hwnd, &text, MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2) != Some(IDYES) {
+        return;
+    }
+    if revoked
+        && dialog(
+            hwnd,
+            "Are you sure? A @revoked line refuses a key that was lost or stolen. Without \
+             it, a server offering that key is no longer refused.",
+            MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2,
+        ) != Some(IDYES)
+    {
+        return;
+    }
+    let result = with_window(|w| {
+        let r = w.known_hosts_view.remove(picks);
+        w.refresh_chrome();
+        r
+    });
+    if let Some(Err(why)) = result {
+        dialog(
+            hwnd,
+            &format!("Could not change known_hosts: {why}"),
+            MB_OK | MB_ICONWARNING,
+        );
     }
 }
 
@@ -21078,7 +21222,7 @@ fn session_menu(hwnd: HWND, host: Option<String>) {
 fn is_side_pane(id: u32) -> bool {
     matches!(
         id,
-        cmd::SESSIONS | cmd::LIVE | cmd::FILES | cmd::FORWARDS | cmd::SNIPPETS
+        cmd::SESSIONS | cmd::LIVE | cmd::FILES | cmd::FORWARDS | cmd::SNIPPETS | cmd::KNOWN_HOSTS
     )
 }
 
@@ -21301,6 +21445,9 @@ fn run_command(hwnd: HWND, command: Command) {
                 return;
             };
             if with_window(|w| w.paste_side(&text)) == Some(true) {
+                if with_window(|w| w.known_hosts_paste()) == Some(true) {
+                    known_hosts_panel::paste(&text);
+                }
                 return;
             }
             let Some(id) = with_window(|w| w.focused_id()) else {
@@ -23771,6 +23918,9 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                     1 if want && live => live_panel::focus_list(),
                     1 if want && files => files_panel::focus_first(),
                     1 if want && fwd => fwd_panel::focus_first(),
+                    1 if want && with_window(|w| w.known_hosts_native()) == Some(true) => {
+                        known_hosts_panel::focus_search();
+                    }
                     1 if want && scripts => scripts_panel::focus_first(),
                     1 if want && editor => script_editor::focus_first(),
                     1 if want && args => script_args::focus_first(),
@@ -23905,6 +24055,7 @@ mod tests {
             cmd::FILES,
             cmd::FORWARDS,
             cmd::SNIPPETS,
+            cmd::KNOWN_HOSTS,
         ] {
             assert!(is_side_pane(id), "{id}");
         }

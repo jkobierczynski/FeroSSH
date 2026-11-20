@@ -46,7 +46,16 @@ use std::fmt;
 use zeroize::Zeroize;
 
 /// Protocol version carried in every frame. Bump on any wire change.
-pub const PROTOCOL_VERSION: u8 = 22;
+pub const PROTOCOL_VERSION: u8 = 23;
+
+/// One SSHFP record (RFC 4255): which key algorithm, which hash, and
+/// the hash of the host key.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SshfpRecord {
+    pub algorithm: u8,
+    pub fp_type: u8,
+    pub digest: Vec<u8>,
+}
 
 /// Largest frame body accepted, in bytes. Terminal and SFTP data is chunked
 /// below this, so anything larger is a bug or an attack.
@@ -570,6 +579,10 @@ pub enum Message {
         /// offers it (`GSSAPIAuthentication yes`).
         gssapi: bool,
         proxy: Option<ProxyServer>,
+        /// `VerifyHostKeyDNS`: look up the host's SSHFP records at these
+        /// DNS servers and send them in a [`Message::Sshfp`] just before
+        /// the host key. `None`: no lookup.
+        sshfp: Option<Vec<std::net::SocketAddr>>,
     },
     /// Open another shell on the connection that `connection` (a channel
     /// that made it with [`Message::Connect`]) belongs to. No new login:
@@ -653,6 +666,20 @@ pub enum Message {
     /// The server's host key (SSH wire format), for the UI to check against
     /// known_hosts. The worker waits for a [`Message::HostKeyVerdict`].
     HostKey { channel: ChannelId, key: Vec<u8> },
+    /// The SSHFP records DNS holds for the host, sent once just before
+    /// [`Message::HostKey`] when the [`Message::Connect`] asked for them.
+    /// The UI compares them with the key.
+    Sshfp {
+        channel: ChannelId,
+        records: Vec<SshfpRecord>,
+        /// The DNS server set the AD bit: it validated the answer with
+        /// DNSSEC.
+        authenticated: bool,
+        /// The server that answered (`ip:port`), or empty.
+        server: String,
+        /// Why there is no answer; empty when there is one.
+        error: String,
+    },
     /// The server proved its identity with a host certificate whose CA
     /// signature, type and algorithms the worker has checked. The UI
     /// decides whether `ca` is trusted for this host (known_hosts
@@ -937,6 +964,7 @@ impl Message {
             Message::Signature { .. } => 7,
             Message::Answers { .. } => 8,
             Message::HostKey { .. } => 9,
+            Message::Sshfp { .. } => 39,
             Message::Banner { .. } => 10,
             Message::IdentitiesRequest { .. } => 11,
             Message::SignRequest { .. } => 12,
@@ -1021,6 +1049,7 @@ impl Message {
             | Message::StatsOpen { .. }
             | Message::GssapiReply { .. } => Side::Ui,
             Message::HostKey { .. }
+            | Message::Sshfp { .. }
             | Message::ProxyAuth { .. }
             | Message::HostCert { .. }
             | Message::Banner { .. }
@@ -1069,6 +1098,7 @@ impl Message {
             | Message::Signature { channel, .. }
             | Message::Answers { channel, .. }
             | Message::HostKey { channel, .. }
+            | Message::Sshfp { channel, .. }
             | Message::ProxyAuth { channel, .. }
             | Message::HostCert { channel, .. }
             | Message::Banner { channel, .. }
@@ -1178,6 +1208,22 @@ impl Writer {
 
     fn bool(&mut self, v: bool) {
         self.u8(u8::from(v));
+    }
+
+    fn socket_addr(&mut self, a: &std::net::SocketAddr) {
+        match a {
+            std::net::SocketAddr::V4(a) => {
+                self.u8(4);
+                self.0.extend_from_slice(&a.ip().octets());
+                self.u16(a.port());
+            }
+            std::net::SocketAddr::V6(a) => {
+                self.u8(6);
+                self.0.extend_from_slice(&a.ip().octets());
+                self.u16(a.port());
+                self.u32(a.scope_id());
+            }
+        }
     }
 
     fn opt<T: Copy>(&mut self, v: Option<T>, mut item: impl FnMut(&mut Self, T)) {
@@ -1409,6 +1455,7 @@ pub fn encode(msg: &Message, out: &mut Vec<u8>) -> Result<(), Error> {
             family,
             gssapi,
             proxy,
+            sshfp,
         } => {
             w.u32(*channel);
             w.str(host);
@@ -1443,6 +1490,10 @@ pub fn encode(msg: &Message, out: &mut Vec<u8>) -> Result<(), Error> {
                     w.str(&p.user);
                     w.list(&p.password.0, |w, s| w.str(s));
                 }
+            }
+            w.bool(sshfp.is_some());
+            if let Some(servers) = sshfp {
+                w.list(servers, |w, a| w.socket_addr(a));
             }
         }
         Message::ProxyAuth { channel, accepted } => {
@@ -1570,6 +1621,23 @@ pub fn encode(msg: &Message, out: &mut Vec<u8>) -> Result<(), Error> {
         Message::HostKey { channel, key } => {
             w.u32(*channel);
             w.bytes(key);
+        }
+        Message::Sshfp {
+            channel,
+            records,
+            authenticated,
+            server,
+            error,
+        } => {
+            w.u32(*channel);
+            w.list(records, |w, r| {
+                w.u8(r.algorithm);
+                w.u8(r.fp_type);
+                w.bytes(&r.digest);
+            });
+            w.bool(*authenticated);
+            w.str(server);
+            w.str(error);
         }
         Message::HostCert {
             channel,
@@ -2025,6 +2093,7 @@ fn decode_body(body: &[u8]) -> Result<Message, Error> {
                     }),
                 }
             },
+            sshfp: r.opt(|r| r.list(Reader::socket_addr))?,
         },
         52 => Message::ProxyAuth {
             channel: r.u32()?,
@@ -2049,6 +2118,19 @@ fn decode_body(body: &[u8]) -> Result<Message, Error> {
         9 => Message::HostKey {
             channel: r.u32()?,
             key: r.bytes()?.to_vec(),
+        },
+        39 => Message::Sshfp {
+            channel: r.u32()?,
+            records: r.list(|r| {
+                Ok(SshfpRecord {
+                    algorithm: r.u8()?,
+                    fp_type: r.u8()?,
+                    digest: r.bytes()?.to_vec(),
+                })
+            })?,
+            authenticated: r.bool()?,
+            server: r.string()?,
+            error: r.string()?,
         },
         10 => Message::Banner {
             channel: r.u32()?,
@@ -2398,6 +2480,22 @@ impl<'a> Reader<'a> {
         }
     }
 
+    fn socket_addr(&mut self) -> Result<std::net::SocketAddr, Error> {
+        Ok(match self.u8()? {
+            4 => {
+                let ip = std::net::Ipv4Addr::from(self.take::<4>()?);
+                std::net::SocketAddr::from((ip, self.u16()?))
+            }
+            6 => {
+                let ip = std::net::Ipv6Addr::from(self.take::<16>()?);
+                let port = self.u16()?;
+                let scope = self.u32()?;
+                std::net::SocketAddr::V6(std::net::SocketAddrV6::new(ip, port, 0, scope))
+            }
+            _ => return Err(Error::Invalid),
+        })
+    }
+
     fn opt<T>(
         &mut self,
         item: impl FnOnce(&mut Self) -> Result<T, Error>,
@@ -2608,6 +2706,7 @@ mod tests {
                 family: Family::Any,
                 gssapi: false,
                 proxy: None,
+                sshfp: None,
             },
             Message::Connect {
                 channel: 2,
@@ -2632,6 +2731,7 @@ mod tests {
                     user: "me".into(),
                     password: Secrets(vec!["pw".into()]),
                 }),
+                sshfp: Some(Vec::new()),
             },
             Message::Connect {
                 channel: 3,
@@ -2674,6 +2774,15 @@ mod tests {
                     user: String::new(),
                     password: Secrets::default(),
                 }),
+                sshfp: Some(vec![
+                    "192.168.1.1:53".parse().unwrap(),
+                    std::net::SocketAddr::V6(std::net::SocketAddrV6::new(
+                        "fe80::1".parse().unwrap(),
+                        53,
+                        0,
+                        7,
+                    )),
+                ]),
             },
             Message::HostKeyVerdict {
                 channel: 1,
@@ -2694,6 +2803,24 @@ mod tests {
             Message::HostKey {
                 channel: 1,
                 key: vec![0; 51],
+            },
+            Message::Sshfp {
+                channel: 1,
+                records: vec![
+                    SshfpRecord {
+                        algorithm: 4,
+                        fp_type: 2,
+                        digest: vec![7; 32],
+                    },
+                    SshfpRecord {
+                        algorithm: 1,
+                        fp_type: 1,
+                        digest: Vec::new(),
+                    },
+                ],
+                authenticated: true,
+                server: "192.168.1.1:53".into(),
+                error: String::new(),
             },
             Message::HostCert {
                 channel: 1,
@@ -3218,13 +3345,9 @@ mod tests {
         let mut tags: Vec<u8> = samples().iter().map(Message::tag).collect();
         tags.sort_unstable();
         tags.dedup();
-        // ZMODEM starts at 40, leaving room below; Kerberos at 50, the
+        // SSHFP records are 39; ZMODEM starts at 40; Kerberos at 50, the
         // proxy's verdict at 52, WinRM at 60, server stats at 70.
-        let want: Vec<u8> = (0..=38)
-            .chain(40..=52)
-            .chain(60..=62)
-            .chain(70..=71)
-            .collect();
+        let want: Vec<u8> = (0..=52).chain(60..=62).chain(70..=71).collect();
         assert_eq!(tags, want);
     }
 

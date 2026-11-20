@@ -25,6 +25,7 @@ pub enum RailItem {
     Files,
     Forwards,
     Snippets,
+    KnownHosts,
     /// At the bottom: the command palette.
     Palette,
     /// At the bottom, last: keep the tool open (pinned) or let the
@@ -33,12 +34,13 @@ pub enum RailItem {
 }
 
 impl RailItem {
-    pub const ALL: [RailItem; 7] = [
+    pub const ALL: [RailItem; 8] = [
         RailItem::Connections,
         RailItem::Sessions,
         RailItem::Files,
         RailItem::Forwards,
         RailItem::Snippets,
+        RailItem::KnownHosts,
         RailItem::Palette,
         RailItem::Pin,
     ];
@@ -51,6 +53,7 @@ impl RailItem {
             RailItem::Files => "File transfer",
             RailItem::Forwards => "Port forwards",
             RailItem::Snippets => "Scripts",
+            RailItem::KnownHosts => "Known hosts",
             RailItem::Palette => "Command palette",
             RailItem::Pin if pinned => "Tools stay open (click: the terminal covers them again)",
             RailItem::Pin => "Tools cover again after use (click: keep them open)",
@@ -67,6 +70,7 @@ impl RailItem {
             RailItem::Files => '\u{E8B7}',         // Folder
             RailItem::Forwards => '\u{E8AB}',      // Switch
             RailItem::Snippets => '\u{E943}',      // Code
+            RailItem::KnownHosts => '\u{E72E}',    // Lock
             RailItem::Palette => '\u{E721}',       // Search
             RailItem::Pin if pinned => '\u{E840}', // Pinned
             RailItem::Pin => '\u{E718}',           // Pin
@@ -98,6 +102,7 @@ pub fn item_rect(item: RailItem, rail: i32, height: i32) -> Rect {
             RailItem::Files,
             RailItem::Forwards,
             RailItem::Snippets,
+            RailItem::KnownHosts,
         ];
         Rect::new(pad, pad + index(&tools) * step, size, size)
     }
@@ -107,11 +112,16 @@ pub fn item_rect(item: RailItem, rail: i32, height: i32) -> Rect {
 /// buttons that would overlap the top ones (a very short window) give
 /// way to them.
 pub fn item_at(x: i32, y: i32, rail: i32, height: i32) -> Option<RailItem> {
-    let top_end = item_rect(RailItem::Snippets, rail, height).bottom();
-    RailItem::ALL.into_iter().find(|&i| {
-        let r = item_rect(i, rail, height);
-        r.contains(x, y) && (!i.at_bottom() || r.y >= top_end)
-    })
+    RailItem::ALL
+        .into_iter()
+        .find(|&i| item_shown(i, rail, height) && item_rect(i, rail, height).contains(x, y))
+}
+
+/// Whether a rail button is shown: a bottom one gives way when it would
+/// overlap the top ones. Painting, clicks and tooltips all go by this.
+pub fn item_shown(item: RailItem, rail: i32, height: i32) -> bool {
+    let top_end = item_rect(RailItem::KnownHosts, rail, height).bottom();
+    !item.at_bottom() || item_rect(item, rail, height).y >= top_end
 }
 
 /// What the layout needs to know.
@@ -389,6 +399,10 @@ mod tests {
         assert_eq!(
             item_at(20, 5 + 4 * 35 + 10, 40, 600),
             Some(RailItem::Snippets)
+        );
+        assert_eq!(
+            item_at(20, 5 + 5 * 35 + 10, 40, 600),
+            Some(RailItem::KnownHosts)
         );
         assert_eq!(item_at(20, 600 - 5 - 10, 40, 600), Some(RailItem::Pin));
         assert_eq!(

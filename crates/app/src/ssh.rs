@@ -32,11 +32,14 @@ use ferossh_auth::{
     AgentChoice, Identity, Job, KeyChoice, KeyFileSpec, Reply, SignError, Source, userauth,
 };
 use ferossh_config::known_hosts::{self, KnownHosts, Status};
-use ferossh_config::ssh_config::{AddressFamily, RequestTty, SessionType, StrictHostKeyChecking};
+use ferossh_config::ssh_config::{
+    AddressFamily, RequestTty, SessionType, StrictHostKeyChecking, VerifyHostKeyDns,
+};
+use ferossh_config::sshfp::{self, Verdict};
 use ferossh_config::{ForwardSpec, ProxyKind, ProxyServer, hostkey, ssh_config};
 use ferossh_ipc::{
     ChannelId, Family, GssReply, MAX_DATA_CHUNK, Message, MoshOptions, PromptField, PromptKind,
-    Secrets, ShellOptions, Timing, X11Auth,
+    Secrets, ShellOptions, SshfpRecord, Timing, X11Auth,
 };
 use ferossh_worker::crypto_policy;
 use zeroize::Zeroizing;
@@ -103,6 +106,8 @@ pub struct Target {
     /// Whether the shell gets a terminal (`RequestTTY`).
     pub pty: bool,
     pub strict: StrictHostKeyChecking,
+    /// `VerifyHostKeyDNS`: also check the host key against SSHFP records.
+    pub verify_dns: VerifyHostKeyDns,
     /// `UserKnownHostsFile`, expanded: read all, write the first. `None`
     /// for the usual `~/.ssh/known_hosts`; empty for `none`.
     pub known_hosts_files: Option<Vec<PathBuf>>,
@@ -347,6 +352,7 @@ impl Target {
             strict: cfg
                 .strict_host_key_checking
                 .unwrap_or(StrictHostKeyChecking::Ask),
+            verify_dns: cfg.verify_host_key_dns.unwrap_or(VerifyHostKeyDns::No),
             known_hosts_files: cfg
                 .user_known_hosts_files
                 .as_ref()
@@ -522,6 +528,25 @@ pub enum State {
     Ended,
 }
 
+/// The SSHFP records the worker found for the host, or why it found none.
+#[derive(Debug, Clone)]
+struct DnsAnswer {
+    records: Vec<SshfpRecord>,
+    /// The DNS server validated the answer with DNSSEC (the AD bit).
+    authenticated: bool,
+    server: String,
+    error: String,
+}
+
+/// What DNS says about the offered key, ready to show.
+struct DnsCheck {
+    verdict: Verdict,
+    /// The answer was DNSSEC-validated.
+    secure: bool,
+    /// One line for the user.
+    text: String,
+}
+
 /// What a finished local prompt is for.
 enum Purpose {
     TrustHostKey {
@@ -566,6 +591,10 @@ pub struct SshSession {
     passphrase_tries: u8,
     /// The key that blocked the connection, for "Replace host key".
     changed_key: Option<Vec<u8>>,
+    /// The DNS servers SSHFP lookups go to; `None`: this PC's.
+    pub dns_servers: Option<Vec<std::net::SocketAddr>>,
+    /// What DNS said about the host key (`VerifyHostKeyDNS`).
+    sshfp: Option<DnsAnswer>,
     pub exit_code: Option<u32>,
     /// X11 forwarding for the shell, when the host has it on.
     pub x11: Option<X11Auth>,
@@ -653,6 +682,8 @@ struct Login {
     signatures: u32,
     /// Kerberos steps asked for so far.
     gss_steps: u32,
+    /// The worker sent the SSHFP records.
+    sshfp_told: bool,
     /// The login worked.
     done: bool,
 }
@@ -742,6 +773,8 @@ impl SshSession {
             signing: None,
             passphrase_tries: 0,
             changed_key: None,
+            dns_servers: None,
+            sshfp: None,
             exit_code: None,
             x11: None,
             legacy: false,
@@ -1078,6 +1111,7 @@ impl SshSession {
             started: true,
             ..Login::default()
         };
+        self.sshfp = None;
         let mut effects = vec![Effect::Show(dim(&sanitize(&text)))];
         if let (Some(command), Some(tunnel)) = (&self.proxy, self.tunnel) {
             effects.push(Effect::ProxyCommand {
@@ -1160,6 +1194,73 @@ impl SshSession {
             family: t.family,
             gssapi: t.gssapi,
             proxy,
+            sshfp: self.wants_sshfp().then(|| {
+                self.dns_servers
+                    .clone()
+                    .unwrap_or_else(crate::dns_servers::system)
+            }),
+        })
+    }
+
+    /// Whether the host key is to be checked in DNS too: `VerifyHostKeyDNS`
+    /// is on and the host is a DNS name (not an IP address).
+    fn wants_sshfp(&self) -> bool {
+        self.target.verify_dns != VerifyHostKeyDns::No
+            && ferossh_worker::dns::wire_name(&self.target.hostname).is_some()
+    }
+
+    /// What the SSHFP records say about `key`; `None` when DNS was not
+    /// asked.
+    fn dns_check(&self, key: &[u8], kind: &str) -> Option<DnsCheck> {
+        if !self.wants_sshfp() {
+            return None;
+        }
+        let host = sanitize_line(&self.target.hostname);
+        let Some(answer) = &self.sshfp else {
+            return Some(DnsCheck {
+                verdict: Verdict::NotListed,
+                secure: false,
+                text: format!("No answer from the SSHFP lookup for {host}."),
+            });
+        };
+        if !answer.error.is_empty() {
+            return Some(DnsCheck {
+                verdict: Verdict::NotListed,
+                secure: false,
+                text: sanitize_line(&format!(
+                    "Could not look up SSHFP records for {host} ({}).",
+                    answer.error
+                )),
+            });
+        }
+        let records: Vec<(u8, u8, &[u8])> = answer
+            .records
+            .iter()
+            .map(|r| (r.algorithm, r.fp_type, r.digest.as_slice()))
+            .collect();
+        let verdict = sshfp::check(key, &records);
+        let secure = answer.authenticated;
+        let server = sanitize_line(&answer.server);
+        let text = match (verdict, secure) {
+            (Verdict::Match, true) => format!(
+                "The key matches a DNSSEC-validated SSHFP record for {host} (DNS server {server})."
+            ),
+            (Verdict::Match, false) => format!(
+                "The key matches an SSHFP record for {host} in DNS, but DNS server {server} did \
+                 not validate it with DNSSEC, so that alone proves nothing."
+            ),
+            (Verdict::Mismatch, _) => format!(
+                "WARNING: DNS has {}SSHFP records for {host} that do not match this key.",
+                if secure { "DNSSEC-validated " } else { "" }
+            ),
+            (Verdict::NotListed, _) => {
+                format!("DNS has no SSHFP record for the {kind} key of {host}.")
+            }
+        };
+        Some(DnsCheck {
+            verdict,
+            secure,
+            text,
         })
     }
 
@@ -1442,6 +1543,17 @@ impl SshSession {
                     None
                 }
             }
+            Message::Sshfp { .. } => {
+                if !logging_in {
+                    Some("a DNS answer outside a login")
+                } else if !self.wants_sshfp() {
+                    Some("a DNS answer this connection did not ask for")
+                } else if login.host_asked || login.sshfp_told {
+                    Some("a DNS answer out of turn")
+                } else {
+                    None
+                }
+            }
             Message::HostKey { .. } | Message::HostCert { .. } => {
                 if !logging_in {
                     Some("a host key check outside a login")
@@ -1525,6 +1637,22 @@ impl SshSession {
             Message::ProxyAuth { accepted, .. } => {
                 self.login.proxy_told = true;
                 self.on_proxy_auth(accepted)
+            }
+            Message::Sshfp {
+                records,
+                authenticated,
+                server,
+                error,
+                ..
+            } => {
+                self.login.sshfp_told = true;
+                self.sshfp = Some(DnsAnswer {
+                    records,
+                    authenticated,
+                    server,
+                    error,
+                });
+                Vec::new()
             }
             Message::HostKey { key, .. } => {
                 self.login.host_asked = true;
@@ -1812,8 +1940,25 @@ impl SshSession {
             Ok(k) => k,
             Err(why) => return self.unreadable_known_hosts(&why),
         };
+        let dns = self.dns_check(&key, &desc.kind);
+        let dns_line = |colour: &str| -> Option<Effect> {
+            let d = dns.as_ref()?;
+            let c = if d.verdict == Verdict::Mismatch {
+                RED
+            } else {
+                colour
+            };
+            Some(Effect::Show(format!("{c}{}{RESET}\r\n", d.text)))
+        };
+        let mismatch = dns.as_ref().is_some_and(|d| d.verdict == Verdict::Mismatch);
         match known.check(&host, port, &key) {
-            Status::Trusted => vec![self.verdict(true)],
+            Status::Trusted => {
+                // known_hosts wins; a record that disagrees is said.
+                let mut effects: Vec<Effect> =
+                    dns_line(DIM).filter(|_| mismatch).into_iter().collect();
+                effects.push(self.verdict(true));
+                effects
+            }
             Status::Revoked => vec![
                 Effect::Show(format!(
                     "{RED}The {} host key {} offered by {host} is marked as revoked in \
@@ -1823,33 +1968,59 @@ impl SshSession {
                 self.verdict(false),
             ],
             Status::Changed { lines } => {
-                self.block_changed_key(key, &host, &desc, "a different key", &lines)
+                let mut effects =
+                    self.block_changed_key(key, &host, &desc, "a different key", &lines);
+                if let Some(e) = dns_line(BOLD) {
+                    effects.insert(1, e);
+                }
+                effects
             }
             Status::TypeChanged { types, lines } => {
                 let held = format!("only a {} key", types.join(" and a "));
-                self.block_changed_key(key, &host, &desc, &held, &lines)
+                let mut effects = self.block_changed_key(key, &host, &desc, &held, &lines);
+                if let Some(e) = dns_line(BOLD) {
+                    effects.insert(1, e);
+                }
+                effects
             }
             Status::Unknown => {
+                // VerifyHostKeyDNS yes: a DNSSEC-validated record vouches
+                // for a new key, as in OpenSSH. It is not saved, so DNS
+                // is asked again next time.
+                if self.target.verify_dns == VerifyHostKeyDns::Yes
+                    && let Some(d) = dns
+                        .as_ref()
+                        .filter(|d| d.verdict == Verdict::Match && d.secure)
+                {
+                    let text = format!(
+                        "{} Trusting the {} key {} without asking (VerifyHostKeyDNS yes); \
+                         it is not added to known_hosts.",
+                        d.text, desc.kind, desc.fingerprint
+                    );
+                    return vec![Effect::Show(dim(&sanitize(&text))), self.verdict(true)];
+                }
                 match self.target.strict {
                     StrictHostKeyChecking::Yes => {
-                        return vec![
-                            Effect::Show(sanitize(&format!(
-                                "{RED}{host} is not in known_hosts and StrictHostKeyChecking \
-                                 is yes, so FeroSSH did not connect. Its {} key fingerprint is \
-                                 {}.{RESET}\r\n",
-                                desc.kind, desc.fingerprint
-                            ))),
-                            self.verdict(false),
-                        ];
+                        let mut effects: Vec<Effect> = dns_line(DIM).into_iter().collect();
+                        effects.push(Effect::Show(sanitize(&format!(
+                            "{RED}{host} is not in known_hosts and StrictHostKeyChecking \
+                             is yes, so FeroSSH did not connect. Its {} key fingerprint is \
+                             {}.{RESET}\r\n",
+                            desc.kind, desc.fingerprint
+                        ))));
+                        effects.push(self.verdict(false));
+                        return effects;
                     }
                     // Only for a host known_hosts has nothing on: one
-                    // listed with another key type is blocked above.
-                    StrictHostKeyChecking::AcceptNew => {
-                        let mut effects = vec![Effect::Show(dim(&sanitize(&format!(
+                    // listed with another key type is blocked above. A
+                    // key DNS contradicts is asked about instead.
+                    StrictHostKeyChecking::AcceptNew if !mismatch => {
+                        let mut effects: Vec<Effect> = dns_line(DIM).into_iter().collect();
+                        effects.push(Effect::Show(dim(&sanitize(&format!(
                             "Trusting the new {} key {} of {host} without asking \
                              (StrictHostKeyChecking accept-new).",
                             desc.kind, desc.fingerprint
-                        ))))];
+                        )))));
                         effects.extend(self.trust_new_key(&key));
                         return effects;
                     }
@@ -1864,11 +2035,17 @@ impl SshSession {
                     }
                 );
                 text.push_str(&format!(
-                    "{} key fingerprint is {BOLD}{}{RESET}\r\n{}\r\n\
-                     Type {BOLD}yes{RESET} to trust this key and connect: ",
+                    "{} key fingerprint is {BOLD}{}{RESET}\r\n{}\r\n",
                     desc.kind,
                     desc.fingerprint,
                     desc.randomart.replace('\n', "\r\n"),
+                ));
+                if let Some(d) = &dns {
+                    let c = if mismatch { RED } else { BOLD };
+                    text.push_str(&format!("{c}{}{RESET}\r\n", d.text));
+                }
+                text.push_str(&format!(
+                    "Type {BOLD}yes{RESET} to trust this key and connect: "
                 ));
                 self.prompt = Some(LocalPrompt {
                     echo: true,
@@ -2855,6 +3032,172 @@ mod tests {
                 accept: true
             }]
         );
+    }
+
+    /// A session for `host.example` with these extra config lines, its
+    /// DNS lookups going to a server that is never asked.
+    fn dns_session(dir: &std::path::Path, lines: &str) -> SshSession {
+        let mut e = env(dir);
+        e.config = format!("Host host.example\n{lines}");
+        let mut s = SshSession::new(
+            1,
+            Target::resolve("host.example", &e).unwrap(),
+            e.known_hosts(),
+        );
+        s.dns_servers = Some(vec!["192.0.2.53:53".parse().unwrap()]);
+        s
+    }
+
+    fn sshfp_of(key: &[u8], authenticated: bool) -> Message {
+        Message::Sshfp {
+            channel: 1,
+            records: vec![SshfpRecord {
+                algorithm: 4,
+                fp_type: 2,
+                digest: russh::keys::PublicKey::from_bytes(key)
+                    .unwrap()
+                    .fingerprint(russh::keys::HashAlg::Sha256)
+                    .as_bytes()
+                    .to_vec(),
+            }],
+            authenticated,
+            server: "192.0.2.53:53".into(),
+            error: String::new(),
+        }
+    }
+
+    fn verdict_of(fx: &[Effect]) -> Option<bool> {
+        sent(fx).iter().find_map(|m| match m {
+            Message::HostKeyVerdict { accept, .. } => Some(*accept),
+            _ => None,
+        })
+    }
+
+    #[test]
+    fn verify_host_key_dns_asks_dns_only_when_on() {
+        let dir = temp("dns-on");
+        let mut s = dns_session(&dir, "  VerifyHostKeyDNS ask\n");
+        let fx = s.start(80, 24);
+        assert!(matches!(
+            sent(&fx)[..],
+            [Message::Connect { sshfp: Some(servers), .. }] if servers.len() == 1
+        ));
+        let mut s = dns_session(&dir, "");
+        let fx = s.start(80, 24);
+        assert!(matches!(
+            sent(&fx)[..],
+            [Message::Connect { sshfp: None, .. }]
+        ));
+        // An IP address is never looked up.
+        let mut e = env(&dir);
+        e.config = "Host *\n  VerifyHostKeyDNS yes\n".into();
+        let mut s = SshSession::new(1, Target::resolve("10.0.0.1", &e).unwrap(), e.known_hosts());
+        let fx = s.start(80, 24);
+        assert!(matches!(
+            sent(&fx)[..],
+            [Message::Connect { sshfp: None, .. }]
+        ));
+        // Records it did not ask for end the connection.
+        let fx = s.on_worker(sshfp_of(&ed25519_blob(), true));
+        assert!(shown(&fx).contains("did not ask for"), "{}", shown(&fx));
+    }
+
+    #[test]
+    fn a_validated_sshfp_match_trusts_a_new_key_with_yes() {
+        let dir = temp("dns-yes");
+        let mut s = dns_session(&dir, "  VerifyHostKeyDNS yes\n");
+        s.start(80, 24);
+        assert!(s.on_worker(sshfp_of(&ed25519_blob(), true)).is_empty());
+        let fx = s.on_worker(Message::HostKey {
+            channel: 1,
+            key: ed25519_blob(),
+        });
+        assert_eq!(verdict_of(&fx), Some(true), "{}", shown(&fx));
+        assert!(shown(&fx).contains("DNSSEC-validated"));
+        // Not saved: DNS is asked again next time.
+        assert!(!s.known_hosts.exists());
+        // A second answer is out of turn.
+        let fx = s.on_worker(sshfp_of(&ed25519_blob(), true));
+        assert!(shown(&fx).contains("out of turn") || shown(&fx).contains("outside a login"));
+    }
+
+    #[test]
+    fn unvalidated_or_ask_mode_matches_still_ask() {
+        let dir = temp("dns-ask");
+        for (lines, secure) in [
+            ("  VerifyHostKeyDNS yes\n", false),
+            ("  VerifyHostKeyDNS ask\n", true),
+        ] {
+            let mut s = dns_session(&dir, lines);
+            s.start(80, 24);
+            s.on_worker(sshfp_of(&ed25519_blob(), secure));
+            let fx = s.on_worker(Message::HostKey {
+                channel: 1,
+                key: ed25519_blob(),
+            });
+            assert_eq!(verdict_of(&fx), None, "{lines}");
+            assert!(s.prompt_active());
+            assert!(shown(&fx).contains("matches"), "{}", shown(&fx));
+        }
+    }
+
+    #[test]
+    fn an_sshfp_mismatch_warns_and_never_accepts_on_its_own() {
+        let dir = temp("dns-mismatch");
+        let other = russh::keys::PublicKey::from_openssh(
+            "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIBDDF3Y2l7oW7uX0x6RPEiQ+8+wE5i8jYXIp1zLn6W1x",
+        )
+        .unwrap()
+        .to_bytes()
+        .unwrap();
+        // accept-new asks instead when DNS names another key.
+        let mut s = dns_session(
+            &dir,
+            "  VerifyHostKeyDNS yes\n  StrictHostKeyChecking accept-new\n",
+        );
+        s.start(80, 24);
+        s.on_worker(sshfp_of(&other, true));
+        let fx = s.on_worker(Message::HostKey {
+            channel: 1,
+            key: ed25519_blob(),
+        });
+        assert_eq!(verdict_of(&fx), None);
+        assert!(s.prompt_active());
+        assert!(shown(&fx).contains("do not match"), "{}", shown(&fx));
+        // A key known_hosts trusts still connects, with the warning.
+        known_hosts::add(&s.known_hosts, "host.example", 22, &ed25519_blob()).unwrap();
+        let mut s = dns_session(&dir, "  VerifyHostKeyDNS yes\n");
+        s.start(80, 24);
+        s.on_worker(sshfp_of(&other, true));
+        let fx = s.on_worker(Message::HostKey {
+            channel: 1,
+            key: ed25519_blob(),
+        });
+        assert_eq!(verdict_of(&fx), Some(true));
+        assert!(shown(&fx).contains("do not match"));
+    }
+
+    #[test]
+    fn a_failed_lookup_is_said_and_asks_as_usual() {
+        let dir = temp("dns-fail");
+        let mut s = dns_session(
+            &dir,
+            "  VerifyHostKeyDNS yes\n  StrictHostKeyChecking yes\n",
+        );
+        s.start(80, 24);
+        s.on_worker(Message::Sshfp {
+            channel: 1,
+            records: Vec::new(),
+            authenticated: false,
+            server: String::new(),
+            error: "192.0.2.53:53: no answer".into(),
+        });
+        let fx = s.on_worker(Message::HostKey {
+            channel: 1,
+            key: ed25519_blob(),
+        });
+        assert_eq!(verdict_of(&fx), Some(false));
+        assert!(shown(&fx).contains("Could not look up"), "{}", shown(&fx));
     }
 
     #[test]

@@ -86,7 +86,14 @@ pub struct Params {
     pub gssapi: bool,
     /// Reach the host through this SOCKS 5 or HTTP proxy.
     pub proxy: Option<ProxyServer>,
+    /// `VerifyHostKeyDNS`: the DNS servers to ask for the host's SSHFP
+    /// records (see [`crate::dns`]); `None` for no lookup.
+    pub sshfp: Option<Vec<std::net::SocketAddr>>,
 }
+
+/// An SSHFP lookup running alongside the connection.
+type DnsLookup =
+    tokio::task::JoinHandle<Result<(crate::dns::Answer, std::net::SocketAddr), String>>;
 
 /// Why a session ended early.
 #[derive(Debug)]
@@ -429,6 +436,9 @@ struct Shared {
     /// The host key the UI accepted, so a retried connection to the same
     /// server does not ask again.
     accepted_key: Option<Vec<u8>>,
+    /// The SSHFP lookup, started with the connection and reported just
+    /// before the host key.
+    dns: Option<DnsLookup>,
 }
 
 type SharedRef = Arc<Mutex<Shared>>;
@@ -484,6 +494,10 @@ impl client::Handler for Client {
             .map_err(|_| Failure::Refused("The server's host key is malformed.".into()))?;
         if with(&self.shared, |s| s.accepted_key.as_ref() == Some(&blob)) == Some(true) {
             return Ok(true);
+        }
+        if let Some(lookup) = with(&self.shared, |s| s.dns.take()).flatten() {
+            let msg = sshfp_message(self.channel, lookup).await;
+            self.out.send(msg).await.map_err(|_| Failure::Cancelled)?;
         }
         let (tx, rx) = oneshot::channel();
         with(&self.shared, |s| s.verdict = Some(tx));
@@ -871,6 +885,12 @@ pub async fn run(
     connections: Connections,
 ) {
     let shared: SharedRef = Arc::default();
+    // Started now, so the answer is usually in by the host key.
+    if let Some(servers) = params.sshfp.clone() {
+        let host = params.host.clone();
+        let lookup = tokio::spawn(async move { crate::dns::lookup(&host, &servers).await });
+        with(&shared, |s| s.dns = Some(lookup));
+    }
     let mut ctx = Ctx {
         channel,
         out: out.clone(),
@@ -900,6 +920,39 @@ pub async fn run(
         let _ = out.send(Message::Lost { channel }).await;
     }
     let _ = out.send(Message::Disconnected { channel, reason }).await;
+}
+
+/// The [`Message::Sshfp`] for a lookup's result: what it found, or why it
+/// found nothing.
+async fn sshfp_message(channel: ChannelId, lookup: DnsLookup) -> Message {
+    let result = match lookup.await {
+        Ok(r) => r,
+        Err(_) => Err("the lookup stopped".to_owned()),
+    };
+    match result {
+        Ok((answer, server)) => Message::Sshfp {
+            channel,
+            records: answer
+                .records
+                .into_iter()
+                .map(|r| ferossh_ipc::SshfpRecord {
+                    algorithm: r.algorithm,
+                    fp_type: r.fp_type,
+                    digest: r.digest,
+                })
+                .collect(),
+            authenticated: answer.authenticated,
+            server: server.to_string(),
+            error: String::new(),
+        },
+        Err(error) => Message::Sshfp {
+            channel,
+            records: Vec::new(),
+            authenticated: false,
+            server: String::new(),
+            error,
+        },
+    }
 }
 
 /// What a shell opened on an existing connection asks for.

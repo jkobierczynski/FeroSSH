@@ -5,7 +5,7 @@
 //! `RemoteForward`, `DynamicForward`, `ForwardX11`, `GatewayPorts`,
 //! `ClearAllForwardings`), the session (`RemoteCommand`, `RequestTTY`,
 //! `SessionType`, `SendEnv`, `SetEnv`), host keys (`StrictHostKeyChecking`,
-//! `UserKnownHostsFile`, `HostKeyAlias`), how to get there (`ProxyJump`,
+//! `UserKnownHostsFile`, `HostKeyAlias`, `VerifyHostKeyDNS`), how to get there (`ProxyJump`,
 //! `ProxyCommand`, `AddressFamily`), Kerberos (`GSSAPIAuthentication`,
 //! `GSSAPIDelegateCredentials`, `GSSAPIServerIdentity`), `Include`d
 //! files, and the list of hosts the connection manager shows.
@@ -84,6 +84,8 @@ pub struct HostConfig {
     pub user_known_hosts_files: Option<Vec<String>>,
     /// `HostKeyAlias`: the name to look the host key up under.
     pub host_key_alias: Option<String>,
+    /// `VerifyHostKeyDNS`: check the host key against SSHFP records.
+    pub verify_host_key_dns: Option<VerifyHostKeyDns>,
     pub address_family: Option<AddressFamily>,
     /// `GSSAPIAuthentication`: log in with Kerberos tickets. Unset means
     /// FeroSSH's own choice (when Windows logged on to a domain).
@@ -129,6 +131,18 @@ pub enum StrictHostKeyChecking {
     /// Trust it and add it to known_hosts without asking (`accept-new`,
     /// and `no` or `off`, which FeroSSH treats the same).
     AcceptNew,
+}
+
+/// `VerifyHostKeyDNS`: whether to look the host key up in DNS (SSHFP
+/// records) as well as in known_hosts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VerifyHostKeyDns {
+    /// Trust a key a DNSSEC-validated record matches without asking.
+    Yes,
+    /// Show what DNS says in the prompt, but always ask.
+    Ask,
+    /// Do not look (the default).
+    No,
 }
 
 /// `AddressFamily`: which IP versions to connect over.
@@ -722,6 +736,15 @@ fn apply(
                         Some("accept-new" | "no" | "false" | "off") => {
                             Some(StrictHostKeyChecking::AcceptNew)
                         }
+                        _ => None,
+                    };
+            }
+            "verifyhostkeydns" if cfg.verify_host_key_dns.is_none() => {
+                cfg.verify_host_key_dns =
+                    match args.first().map(|a| a.to_ascii_lowercase()).as_deref() {
+                        Some("yes" | "true") => Some(VerifyHostKeyDns::Yes),
+                        Some("ask") => Some(VerifyHostKeyDns::Ask),
+                        Some("no" | "false") => Some(VerifyHostKeyDns::No),
                         _ => None,
                     };
             }
@@ -1424,7 +1447,9 @@ Host build
     UserKnownHostsFile ~/.ssh/known_hosts_build "C:\keys\more hosts"
     HostKeyAlias build.lan
     AddressFamily inet6
+    VerifyHostKeyDNS ask
 Host *
+    VerifyHostKeyDNS yes
     ForwardAgent no
     RemoteCommand ls
     StrictHostKeyChecking yes
@@ -1464,8 +1489,18 @@ Host *
         );
         assert_eq!(c.host_key_alias.as_deref(), Some("build.lan"));
         assert_eq!(c.address_family, Some(AddressFamily::Inet6));
+        assert_eq!(c.verify_host_key_dns, Some(VerifyHostKeyDns::Ask));
 
         let c = resolve(text, "other");
+        assert_eq!(c.verify_host_key_dns, Some(VerifyHostKeyDns::Yes));
+        assert_eq!(
+            resolve("VerifyHostKeyDNS no\n", "x").verify_host_key_dns,
+            Some(VerifyHostKeyDns::No)
+        );
+        assert_eq!(
+            resolve("VerifyHostKeyDNS maybe\n", "x").verify_host_key_dns,
+            None
+        );
         assert_eq!(c.forward_agent, Some(false));
         assert_eq!(c.remote_command.as_deref(), Some("ls"));
         assert_eq!(c.user_known_hosts_files, Some(Vec::new()));

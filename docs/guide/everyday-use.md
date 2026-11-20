@@ -75,11 +75,23 @@ Besides `HostName`, `User`, `Port`, `IdentityFile`, `Tag`, `ProxyJump`, `ProxyCo
 | `GSSAPIAuthentication`, `GSSAPIDelegateCredentials`, `GSSAPIServerIdentity` | Kerberos login (see [Kerberos login](#kerberos-login)). |
 | `SendEnv`, `SetEnv` | Sends environment variables (the server's `AcceptEnv` must take them). |
 | `RemoteCommand`, `RequestTTY` | Runs a command instead of the login shell; `RequestTTY no` asks for no terminal. |
+| `SessionType` | `none` logs in for the port forwards only, with no shell, like `ssh -N` (see [Tunnel-only connections](#tunnel-only-connections)). |
 | `StrictHostKeyChecking` | `yes` refuses unknown hosts; `accept-new` (or `no`) trusts a new host without asking. A changed key is always refused. |
 | `UserKnownHostsFile` | Other known_hosts files, in place of `~/.ssh/known_hosts`. |
 | `HostKeyAlias` | Looks the host key up under this name instead of the host's. |
+| `VerifyHostKeyDNS` | Also checks the host key against the host's SSHFP records in DNS (see [Host keys in DNS](#host-keys-in-dns-sshfp)). |
 | `AddressFamily` | `inet` for IPv4 only, `inet6` for IPv6 only. |
 | `ProxyServer` | FeroSSH's own: a SOCKS 5 or HTTP proxy to go through (see [Proxies](#proxies)). OpenSSH does not know it, so put `IgnoreUnknown ProxyServer` above it in a file OpenSSH reads too. |
+
+### Host keys in DNS (SSHFP)
+
+`VerifyHostKeyDNS ask` or `yes` makes FeroSSH look up the host's SSHFP records (what `ssh-keygen -r host` prints, published in the host's DNS zone) while it connects, and compare them with the key the server offers. The question goes from the connection's sandboxed worker to the DNS servers Windows uses, asking for DNSSEC; an IP address is never looked up.
+
+- A new host shows what DNS said under its fingerprint: the key matches a record (validated with DNSSEC or not), DNS has no record for it, the records name another key (in red), or the lookup failed.
+- With `yes`, a key that matches a record the DNS server validated with DNSSEC (the AD bit) is trusted without asking, as in OpenSSH, and is not added to `known_hosts`, so DNS is asked again each time. A match that was not validated, and every match with `ask`, still asks.
+- A key DNS contradicts is never trusted on its own: `StrictHostKeyChecking accept-new` asks instead. A key `known_hosts` already trusts still connects, with the warning, and a changed key is still refused, with what DNS says on the warning page.
+
+The AD bit is only as trustworthy as the way to the DNS server: anyone between your PC and that server could set it. Use `yes` only with a DNSSEC-validating resolver you trust on a network you trust; `ask` is safe anywhere. The sandbox cannot reach a resolver on this PC (`127.0.0.1`), so with one of those the lookup fails unless FeroSSH runs with `--no-sandbox`.
 
 ### Opening ssh:// links
 
@@ -113,7 +125,7 @@ File > Reconnect automatically turns this off for all hosts; `AutoReconnect no` 
 
 ## The tools pane
 
-The connection manager, session manager, file transfer, port forwards and scripts open in the tools pane at the side of the window. The tools rail along the window's edge has an icon for each, plus the command palette and a pin at the bottom; hover an icon for its name and shortcut. A click opens that tool, and a click on the open tool's icon closes it again.
+The connection manager, session manager, file transfer, port forwards, scripts and known hosts open in the tools pane at the side of the window. The tools rail along the window's edge has an icon for each, plus the command palette and a pin at the bottom; hover an icon for its name and shortcut. A click opens that tool, and a click on the open tool's icon closes it again.
 
 The terminal slides over the tools pane rather than squeezing it. Drag the terminal's edge to cover part of the tool, or all of it so only the rail is left; the tool keeps its width underneath, so nothing in it rewraps. In File transfer, the buttons at the right edge (Bookmarks, Sync, Follow terminal, Layout, Refresh and the path rows' **...**) move left to stay in view, with the boxes beside them getting shorter, until they would run into the host name. When the lists are stacked, the upload and download arrows between them stay centred in the part you can still see, until there is no longer room for both; side by side, they stay where they are. In Port forwards, **Add** (and **Cancel** while editing) moves left the same way, with the connection box getting shorter, and the run report's buttons wrap onto more rows so none hides under the terminal. Drag the edge out from the rail to uncover the last tool again, or past the tool's width to make it wider. A tool you open again shows as much as it did last time.
 
@@ -478,6 +490,14 @@ Settings > File transfer follows cd, or the Follow terminal button in File trans
 
 On a host without SFTP, such as a console server or a Telnet device, you can use ZMODEM (`rz` and `sz`) instead. Turn on Session > ZMODEM: answer rz and sz; it is off by default, so their output shows as it is. Then `sz file` on the server asks whether to receive it (any output can start a send, so FeroSSH never takes files unasked) and saves it in your download folder (as `name (2)` if one is there already), and `rz` opens a file picker for what to send. Progress shows in the pane, and Ctrl+C cancels. Files over 4 GB need SFTP.
 
+## Known hosts
+
+Tools > Known hosts (Ctrl+Shift+K) lists every entry of the `known_hosts` files FeroSSH checks host keys against: your `~/.ssh/known_hosts` (or the portable folder's), and any other file a `UserKnownHostsFile` line in `~/.ssh/config` names. Each row shows the hosts, the kind (Host key, CA for an `@cert-authority` line, Revoked for an `@revoked` one, or Unreadable for a line FeroSSH and OpenSSH skip), the key type and size, its SHA-256 fingerprint, the file and line, and the comment.
+
+Names FeroSSH (and OpenSSH with `HashKnownHosts yes`) saves are hashed, so they show as *(hashed)*: type the host name in the search box, as `web.example`, `web.example:2222` or `[web.example]:2222`, and the hashed lines for it show with that name. A host name also finds the wildcard lines that cover it, such as a `*.example` CA, the way a connection would find them. A name without a dot (`web01`) is searched as text; write it in brackets, `[web01]`, to find the wildcard lines (`web*`) that cover it. Other words search the hosts, key types, fingerprints, comments and file names.
+
+Remove (Del) takes the picked lines out of their files, whole, after asking: a line that lists several hosts, or a wildcard, goes for all of them (Session > Replace host key changes only one host's entries). When no other line holds a key for the host, the next connection asks about its key again, as for a new host. Removing a `@revoked` line asks twice, since its key is then no longer refused. Lines are removed only if they are still as listed: if another program changed any of the files meanwhile, nothing is removed and the list is read again. Lines that stay keep their line ends, and a file that is a link to another stays a link. Copy fingerprint (Ctrl+C) and the right-click menu's Copy line copy an entry. A file that cannot be read is named under the list.
+
 ## Port forwards
 
 `LocalForward`, `RemoteForward` and `DynamicForward` in your ssh_config, or forwards in a saved connection's Extras, start when you log in. Tools > Port forwards (Ctrl+Shift+P) opens a pane with a form at the top and a list of every connection's forwards and X11 under it, in columns: connection, type, listen, to and state. The line under the list shows the selected forward's open connections, why it stopped and its last error. Everything there works on a live connection, without reconnecting:
@@ -638,7 +658,7 @@ The font menu lists eighteen monospace fonts. Cascadia Mono, Cascadia Code, Cons
 
 There are forty-two themes, in three columns of Settings > Theme. The dark ones are Nord (the default), Ayu Mirage, Carbonfox, Catppuccin Frappé, Macchiato and Mocha, Dracula, Everforest, GitHub Dark, Gruvbox Dark, Gruvbox Material, Kanagawa Dragon and Wave, Monokai, Night Owl, Nightfox, One Dark, Rosé Pine and Rosé Pine Moon, Snazzy, Solarized Dark, Tokyo Night and Tokyo Night Storm, Tomorrow Night and Tomorrow Night Eighties. The light ones are Ayu Light, Catppuccin Latte, Dawnfox, Everforest Light, GitHub Light, Gruvbox Light, Kanagawa Lotus, Rosé Pine Dawn, Solarized Light, Tokyo Night Day and Tomorrow. The classics are Campbell, One Half Dark, One Half Light, Tango Dark and Tango Light from Windows Terminal, and PuTTY's own colours. Every theme's text reads at 4.5:1 contrast or better. Two more are warnings: **Production** (red) and **Staging** (amber). Rules pick the theme by host pattern or ssh_config `Tag`, so production servers always look like production; hosts tagged `production`, `staging` or `development` get Production, Staging or Nord without any rule. `ferossh.exe --theme Production prod-db` opens a session in a theme, handy for desktop shortcuts. See `ThemeRule` and `Profile` in [Settings](settings.md).
 
-The window around the panes (the menu bar and its menus, the title bar, the tab strip, the tools rail and the tools pane: Connection manager, Session manager, the connection form, File transfer, Port forwards, Scripts) has Windows' light look unless you pick something else in Settings > Window colours: the focused pane's colours (dark for a dark theme, red for Production), Windows' own light or dark mode, one of seven neutral greys from Soft grey to Black, or one of eight tinted neutrals that are not grey: Sand, Sage, Mist and Taupe (light), Slate, Moss, Espresso and Heather (dark). The menus and their submenus take the menu bar's colours. Dark buttons and scroll bars need Windows 10 version 1903 or later; the title bar takes the theme's colour on Windows 11.
+The window around the panes (the menu bar and its menus, the title bar, the tab strip, the tools rail and the tools pane: Connection manager, Session manager, the connection form, File transfer, Port forwards, Scripts, Known hosts) has Windows' light look unless you pick something else in Settings > Window colours: the focused pane's colours (dark for a dark theme, red for Production), Windows' own light or dark mode, one of seven neutral greys from Soft grey to Black, or one of eight tinted neutrals that are not grey: Sand, Sage, Mist and Taupe (light), Slate, Moss, Espresso and Heather (dark). The menus and their submenus take the menu bar's colours. Dark buttons and scroll bars need Windows 10 version 1903 or later; the title bar takes the theme's colour on Windows 11.
 
 Resting the mouse on a theme, a custom theme or a window colour in these menus shows it right away, in the focused pane and the window around it. Pick it to keep it; close the menu without a choice (Esc, or a click elsewhere) and the old look comes back. Fonts are not shown this way, because a new font size would resize the remote terminal; a font, and a custom theme's font, change when you pick them.
 

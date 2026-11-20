@@ -89,6 +89,7 @@ fn check_worker(w: &mut Worker, host: &str) -> Result<String, String> {
             family: Default::default(),
             gssapi: false,
             proxy: None,
+            sshfp: None,
         },
     )?;
     loop {

@@ -23,5 +23,9 @@ russh.workspace = true
 sha1 = "0.11"
 zeroize = "1"
 
+[target.'cfg(windows)'.dependencies]
+# ReplaceFileW, so a rewritten known_hosts keeps its own ACL.
+windows = { version = "0.62", features = ["Win32_Storage_FileSystem"] }
+
 [lints]
 workspace = true
