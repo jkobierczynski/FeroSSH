@@ -64,11 +64,16 @@ pub fn clean(text: &str) -> String {
             space = !out.is_empty();
             continue;
         }
+        let len = out.chars().count();
+        // A space only with room for what follows it: never one at the
+        // end, so cleaning what was cleaned changes nothing.
         if space {
+            if len + 1 >= MAX_FIELD {
+                break;
+            }
             out.push(' ');
             space = false;
-        }
-        if out.chars().count() >= MAX_FIELD {
+        } else if len >= MAX_FIELD {
             break;
         }
         out.push(c);
@@ -383,6 +388,17 @@ mod tests {
         inv.rename("short", &long);
         inv.remove(&long);
         assert!(inv.get(&long).is_none());
+        // A space where the name is cut: no space at the end, and a
+        // name cleaned twice is the same name.
+        let p = "h".repeat(MAX_FIELD - 1);
+        let spaced = format!("{p} x");
+        assert_eq!(clean(&spaced), p);
+        assert_eq!(clean(&clean(&spaced)), clean(&spaced));
+        inv.connected(&p, 4, None);
+        inv.connected("short", 5, None);
+        inv.rename("short", &spaced);
+        assert_eq!(inv.get(&p).unwrap().last_connected, Some(5));
+        assert_eq!(inv.records.iter().filter(|(n, _)| n == &p).count(), 1);
     }
 
     #[test]
