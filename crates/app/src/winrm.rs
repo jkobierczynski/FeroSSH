@@ -164,6 +164,15 @@ impl WinrmTarget {
         })
     }
 
+    /// The target with a named credential's `user`, which wins over the
+    /// saved connection's own (as it does for SSH); `None` keeps it.
+    pub fn with_login_user(mut self, user: Option<&str>) -> Self {
+        if let Some(u) = user.filter(|u| valid_user(u)) {
+            self.user = Some(u.to_owned());
+        }
+        self
+    }
+
     /// `host`, or `host:port` off the WinRM port, for titles and logs.
     pub fn label(&self) -> String {
         if self.port == default_port(self.https) {
@@ -1812,5 +1821,22 @@ mod tests {
             op: SspiOp::Start,
         });
         assert_eq!(s.state(), State::Ended);
+    }
+
+    #[test]
+    fn a_credential_user_wins_over_the_saved_one() {
+        let t = WinrmTarget::typed("winrm://alice@dc").unwrap();
+        assert_eq!(
+            t.clone().with_login_user(Some("bob")).user.as_deref(),
+            Some("bob")
+        );
+        assert_eq!(
+            t.clone().with_login_user(None).user.as_deref(),
+            Some("alice")
+        );
+        assert_eq!(
+            t.with_login_user(Some("a\u{7}b")).user.as_deref(),
+            Some("alice")
+        );
     }
 }

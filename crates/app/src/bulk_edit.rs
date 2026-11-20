@@ -378,7 +378,7 @@ pub fn plan(
             {
                 Some("they go through jump hosts; clear them first")
             }
-            EditField::Password | EditField::User
+            EditField::Password | EditField::User | EditField::Credential
                 if t.kind == SessionKind::WinRm
                     && winrm_without_user(field, &value, host, settings, &t.name) =>
             {
@@ -418,15 +418,31 @@ fn winrm_without_user(
     settings: &Settings,
     name: &str,
 ) -> bool {
+    let profile = settings.profile(name);
+    let mut credential = profile.and_then(|p| p.credential.clone());
+    let mut own_user = host.and_then(|h| h.user.clone()).filter(|u| !u.is_empty());
+    let mut own_source = profile.map(|p| p.password.clone()).unwrap_or_default();
+    // The login after the change: the credential's user and source win,
+    // as when connecting.
     match field {
         EditField::Password => {
-            value != "ask" && host.is_none_or(|h| h.user.as_deref().is_none_or(str::is_empty))
+            own_source = match value {
+                "ask" => PasswordSource::Ask,
+                "windows" => PasswordSource::Windows,
+                cmd => PasswordSource::Command(cmd.to_owned()),
+            };
         }
-        EditField::User => {
-            value.is_empty() && settings.password_source(name) != PasswordSource::Ask
-        }
-        _ => false,
+        EditField::User => own_user = Some(value.to_owned()).filter(|v| !v.is_empty()),
+        EditField::Credential => credential = Some(value.to_owned()).filter(|v| !v.is_empty()),
+        _ => return false,
     }
+    let credential = credential.and_then(|n| settings.credential(&n));
+    let user = credential.and_then(|c| c.user.clone()).or(own_user);
+    let source = match credential {
+        Some(c) if c.password != PasswordSource::Ask => c.password.clone(),
+        _ => own_source,
+    };
+    user.is_none() && source != PasswordSource::Ask
 }
 
 /// The planned hosts that may no longer change, with `saved` read again
@@ -797,6 +813,27 @@ mod tests {
         let p = plan(EditField::User, "", &t[1..], &saved, &settings, &[]).unwrap();
         assert!(p.changes.is_empty());
         assert_eq!(p.skipped.len(), 1, "a password source needs a user");
+    }
+
+    #[test]
+    fn a_credential_must_leave_winrm_a_user_for_its_password_source() {
+        let saved = vec![saved_host("win", None)];
+        let t = [target("win", SessionKind::WinRm)];
+        let settings = Settings::parse(
+            "Credential nouser\n    PasswordSource windows\nCredential ops\n    User ops\n    PasswordSource windows\n",
+        );
+        let p = plan(EditField::Credential, "nouser", &t, &saved, &settings, &[]).unwrap();
+        assert!(p.changes.is_empty());
+        assert_eq!(p.skipped.len(), 1);
+        let p = plan(EditField::Credential, "ops", &t, &saved, &settings, &[]).unwrap();
+        assert_eq!(p.changes.len(), 1);
+        // Taking the credential away leaves its own source without a user.
+        let mut settings = settings;
+        settings.profile_mut("win").credential = Some("ops".into());
+        settings.profile_mut("win").password = PasswordSource::Windows;
+        let p = plan(EditField::Credential, "", &t, &saved, &settings, &[]).unwrap();
+        assert!(p.changes.is_empty());
+        assert_eq!(p.skipped.len(), 1);
     }
 
     #[test]

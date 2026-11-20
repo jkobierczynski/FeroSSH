@@ -1036,7 +1036,15 @@ impl SessionForm {
             Field::Framing => v.framing.clone(),
             Field::Flow => v.flow.label().to_owned(),
             Field::Credential if v.credential.is_empty() => "none: its own login".to_owned(),
-            Field::Credential => v.credential.clone(),
+            // As the credential spells its own name, whatever case the
+            // profile wrote, so the list shows it picked.
+            Field::Credential => self
+                .hints
+                .credentials
+                .iter()
+                .find(|c| c.eq_ignore_ascii_case(&v.credential))
+                .unwrap_or(&v.credential)
+                .clone(),
             Field::Theme if v.theme.is_empty() => "by theme rules".to_owned(),
             Field::Theme => v.theme.clone(),
             Field::Tmux => if v.tmux_on {
@@ -3523,6 +3531,9 @@ mod tests {
         );
         let v = Values::default().with_profile(settings.profile("web3"));
         assert_eq!(v.credential, "ops-admin");
+        // Written in another case, it still shows as the one picked.
+        f.values.credential = "OPS-ADMIN".into();
+        assert_eq!(f.choice(Field::Credential), "ops-admin");
         // Serial lines have no login: no credential is kept.
         f.values.kind = SessionKind::Serial;
         f.apply(&mut Vec::new(), &mut settings);

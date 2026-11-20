@@ -71,6 +71,9 @@ struct HostCert {
 pub struct Target {
     /// What the user typed, which names the tab.
     pub alias: String,
+    /// The destination as typed (`user@host:port` or the name), to
+    /// resolve the login again for a reconnect or a split.
+    pub typed: String,
     pub hostname: String,
     pub port: u16,
     pub user: String,
@@ -392,6 +395,7 @@ impl Target {
                 }
             },
             tag: cfg.tag,
+            typed: typed.to_owned(),
             alias,
             hostname,
             user,
@@ -400,6 +404,23 @@ impl Target {
             proxy_command: None,
             proxy_server: None,
         })
+    }
+
+    /// The login (user, key files, certificates, agent) as ssh_config and
+    /// the named credentials give it now, for a reconnect or a split: a
+    /// credential changed since the first login counts. A user or port
+    /// typed in the address still wins; the rest of the target stays.
+    pub fn refresh_login(&mut self, env: &Env) {
+        if let Some(fresh) = Self::resolve_host(&self.typed, env) {
+            self.user = fresh.user;
+            self.key_files = fresh.key_files;
+            self.certificates = fresh.certificates;
+            self.identities_only = fresh.identities_only;
+            self.agent = fresh.agent;
+        }
+        for j in &mut self.jumps {
+            j.refresh_login(env);
+        }
     }
 
     /// What the shell's channel asks for. Jump hosts open no shell.
@@ -4517,6 +4538,27 @@ mod tests {
             [Message::Answers { answers, .. }] => answers.0.clone(),
             ref other => panic!("{other:?}"),
         }
+    }
+
+    #[test]
+    fn a_reconnect_picks_up_a_changed_login_but_keeps_a_typed_user() {
+        let dir = temp("refresh");
+        let mut e = env(&dir);
+        let mut t = Target::resolve("prod", &e).unwrap();
+        let mut typed = Target::resolve("root@prod", &e).unwrap();
+        assert_eq!((t.user.as_str(), typed.user.as_str()), ("admin", "root"));
+        // A credential now names another user and key.
+        e.config = format!(
+            "Match originalhost prod\n  User ops\n  IdentityFile ~/ops_key\n{}",
+            e.config
+        );
+        t.port = 2201;
+        t.refresh_login(&e);
+        typed.refresh_login(&e);
+        assert_eq!(t.user, "ops");
+        assert!(t.key_files[0].path.ends_with("ops_key"));
+        assert_eq!(t.port, 2201, "the rest of the target stays");
+        assert_eq!(typed.user, "root");
     }
 
     #[test]

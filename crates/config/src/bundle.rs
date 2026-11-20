@@ -232,11 +232,13 @@ pub struct Merged {
     pub replaced: usize,
     /// The same here and in the file.
     pub same: usize,
+    /// Named credentials added or replaced (profiles only).
+    pub credentials: usize,
 }
 
 impl Merged {
     pub fn changed(self) -> bool {
-        self.added + self.replaced > 0
+        self.added + self.replaced + self.credentials > 0
     }
 
     pub fn total(self) -> usize {
@@ -249,6 +251,7 @@ impl std::ops::AddAssign for Merged {
         self.added += o.added;
         self.replaced += o.replaced;
         self.same += o.same;
+        self.credentials += o.credentials;
     }
 }
 
@@ -433,8 +436,15 @@ pub fn merge_profiles(local: &mut Settings, incoming: &Settings) -> Merged {
             .iter_mut()
             .find(|l| l.name.eq_ignore_ascii_case(&c.name))
         {
-            Some(l) => *l = c.clone(),
-            None => local.credentials.push(c.clone()),
+            Some(l) if l == c => {}
+            Some(l) => {
+                *l = c.clone();
+                merged.credentials += 1;
+            }
+            None => {
+                local.credentials.push(c.clone());
+                merged.credentials += 1;
+            }
         }
     }
     merged
@@ -465,6 +475,35 @@ pub fn merge_profiles3(
         .filter_map(|h| {
             let (b, o) = (find(base, h), find(ours, h));
             if o == b { find(theirs, h) } else { o }
+        })
+        .collect()
+}
+
+/// The named credentials after two PCs changed them from the same
+/// `base`, as [`merge_profiles3`] does for profiles: one `ours` changed,
+/// added or removed keeps our version; any other takes `theirs` (a change
+/// or a removal there included). Names match in any case.
+pub fn merge_credentials3(
+    base: &[crate::settings::Credential],
+    ours: &[crate::settings::Credential],
+    theirs: &[crate::settings::Credential],
+) -> Vec<crate::settings::Credential> {
+    let find = |list: &[crate::settings::Credential], name: &str| {
+        list.iter()
+            .find(|c| c.name.eq_ignore_ascii_case(name))
+            .cloned()
+    };
+    let mut names: Vec<String> = Vec::new();
+    for c in theirs.iter().chain(ours).chain(base) {
+        if !names.iter().any(|n| n.eq_ignore_ascii_case(&c.name)) {
+            names.push(c.name.clone());
+        }
+    }
+    names
+        .iter()
+        .filter_map(|n| {
+            let (b, o) = (find(base, n), find(ours, n));
+            if o == b { find(theirs, n) } else { o }
         })
         .collect()
 }
@@ -548,7 +587,8 @@ mod tests {
             Merged {
                 added: 1,
                 replaced: 1,
-                same: 1
+                same: 1,
+                credentials: 0
             }
         );
         assert!(out.starts_with("# Sessions made in FeroSSH\n"));
@@ -616,10 +656,42 @@ mod tests {
             Merged {
                 added: 1,
                 replaced: 1,
-                same: 1
+                same: 1,
+                credentials: 0
             }
         );
         assert_eq!(local.profiles.len(), 3);
+    }
+
+    #[test]
+    fn credentials_merge_three_ways() {
+        let parse = |t: &str| Settings::parse(t).credentials;
+        let base = parse(
+            "Credential ops\n    User old\nCredential gone\n    User x\nCredential mine\n    User a\n",
+        );
+        // Ours: changed mine, removed nothing; theirs: changed ops, removed gone, added lab.
+        let ours = parse(
+            "Credential ops\n    User old\nCredential gone\n    User x\nCredential mine\n    User b\nCredential local\n    User l\n",
+        );
+        let theirs = parse(
+            "Credential OPS\n    User new\nCredential mine\n    User a\nCredential lab\n    User pi\n",
+        );
+        let out = merge_credentials3(&base, &ours, &theirs);
+        let user = |n: &str| {
+            out.iter()
+                .find(|c| c.name.eq_ignore_ascii_case(n))
+                .and_then(|c| c.user.clone())
+        };
+        assert_eq!(user("ops").as_deref(), Some("new"));
+        assert_eq!(user("gone"), None);
+        assert_eq!(user("mine").as_deref(), Some("b"));
+        assert_eq!(user("lab").as_deref(), Some("pi"));
+        assert_eq!(user("local").as_deref(), Some("l"));
+        // A credential we removed stays removed.
+        let ours = parse("Credential ops\n    User old\n");
+        let theirs = parse("Credential ops\n    User old\nCredential mine\n    User a\n");
+        let base = parse("Credential ops\n    User old\nCredential mine\n    User a\n");
+        assert_eq!(merge_credentials3(&base, &ours, &theirs).len(), 1);
     }
 
     #[test]
@@ -628,12 +700,20 @@ mod tests {
         let incoming = Settings::parse(
             "Credential OPS\n    User new\nCredential lab\n    User pi\nProfile web\n    Credential lab\n",
         );
-        merge_profiles(&mut local, &incoming);
+        let m = merge_profiles(&mut local, &incoming);
+        assert_eq!(m.credentials, 2);
+        assert!(m.changed());
         assert_eq!(local.credentials.len(), 2);
         assert_eq!(
             local.credential("ops").unwrap().user.as_deref(),
             Some("new")
         );
         assert_eq!(local.credential_of("web").unwrap().name, "lab");
+        // Only a credential that changed counts.
+        let only = Settings::parse("Credential lab\n    User pi\n");
+        let m = merge_profiles(&mut local, &only);
+        assert!(!m.changed());
+        let changed = Settings::parse("Credential lab\n    User root\n");
+        assert!(merge_profiles(&mut local, &changed).changed());
     }
 }

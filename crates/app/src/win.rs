@@ -2081,7 +2081,13 @@ fn host_items(env: &Env, settings: &Settings) -> Vec<HostItem> {
                 // As connect() resolves it: the saved user and port.
                 let own = saved.iter().find(|s| s.alias.eq_ignore_ascii_case(&h.name));
                 let https = settings.profile(&h.name).is_some_and(|p| p.winrm_https);
-                let target = WinrmTarget::resolve(&h.name, env, None, https, own);
+                let target = WinrmTarget::resolve(&h.name, env, None, https, own).map(|t| {
+                    t.with_login_user(
+                        settings
+                            .credential_of(&h.name)
+                            .and_then(|c| c.user.as_deref()),
+                    )
+                });
                 let tags = ferossh_config::settings::host_tags(
                     target.as_ref().and_then(|t| t.tag.as_deref()),
                     settings.profile(&h.name),
@@ -6885,6 +6891,13 @@ impl Window {
                     p.winrm_https,
                     saved.as_ref(),
                 )
+                .map(|t| {
+                    t.with_login_user(
+                        self.settings
+                            .credential_of(destination)
+                            .and_then(|c| c.user.as_deref()),
+                    )
+                })
             }
             _ => WinrmTarget::typed(destination),
         };
@@ -7293,14 +7306,25 @@ impl Window {
                 return;
             }
             Some(Host::Winrm(s)) => {
-                let (target, ask) = (s.target.clone(), s.source_refused());
+                let (mut target, ask) = (s.target.clone(), s.source_refused());
+                // A saved connection's credential may name another user now.
+                if target.saved {
+                    let user = self
+                        .settings
+                        .credential_of(&target.alias)
+                        .and_then(|c| c.user.clone());
+                    target = target.with_login_user(user.as_deref());
+                }
                 self.connect_winrm_with(id, target, ask);
                 return;
             }
             _ => None,
         };
-        if let Some(target) = target {
-            self.connect_to(id, target, &ssh_env());
+        if let Some(mut target) = target {
+            // A credential changed since counts.
+            let env = ssh_env();
+            target.refresh_login(&env);
+            self.connect_to(id, target, &env);
         }
     }
 
@@ -14546,7 +14570,13 @@ impl Window {
             .into_iter()
             .find(|h| h.alias.eq_ignore_ascii_case(name));
         let https = self.settings.profile(name).is_some_and(|p| p.winrm_https);
-        WinrmTarget::resolve(name, &ssh_env(), None, https, saved.as_ref())
+        WinrmTarget::resolve(name, &ssh_env(), None, https, saved.as_ref()).map(|t| {
+            t.with_login_user(
+                self.settings
+                    .credential_of(name)
+                    .and_then(|c| c.user.as_deref()),
+            )
+        })
     }
 
     /// The Credential Manager entry of saved connection `name`'s password:
@@ -16244,8 +16274,10 @@ impl Window {
             _ => Like::Ask,
         };
         match like {
-            Like::Ssh(target) => {
-                self.connect_to(id, *target, &ssh_env());
+            Like::Ssh(mut target) => {
+                let env = ssh_env();
+                target.refresh_login(&env);
+                self.connect_to(id, *target, &env);
                 if let Some(p) = self.panes.get_mut(&id) {
                     p.start_dir = cwd;
                 }
@@ -22254,21 +22286,43 @@ fn edit_credential(hwnd: HWND, original: Option<String>) {
                 ));
             }
             if dialog(hwnd, &text, MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2) == Some(IDYES) {
-                with_window(|w| {
+                let failed = with_window(|w| {
+                    let before = w.settings.clone();
                     remove(&mut w.settings, o);
-                    w.save_settings();
-                    w.reload_sessions(None);
-                });
+                    match w.try_save_settings() {
+                        Ok(()) => {
+                            w.reload_sessions(None);
+                            None
+                        }
+                        Err(e) => {
+                            // Not on disk, so not here either.
+                            w.settings = before;
+                            Some(e)
+                        }
+                    }
+                })
+                .flatten();
+                if let Some(e) = failed {
+                    dialog(hwnd, &e, MB_OK | MB_ICONWARNING);
+                }
             }
             return;
         }
         let Some(result) = with_window(|w| {
-            let saved = save(&mut w.settings, original.as_deref(), &typed);
-            if saved.is_ok() {
-                w.save_settings();
-                w.reload_sessions(None);
+            let before = w.settings.clone();
+            let saved = save(&mut w.settings, original.as_deref(), &typed)?;
+            match w.try_save_settings() {
+                Ok(()) => {
+                    w.reload_sessions(None);
+                    Ok(saved)
+                }
+                Err(e) => {
+                    // Not on disk, so not here either; the window stays
+                    // open with what was typed.
+                    w.settings = before;
+                    Err(e)
+                }
             }
-            saved
         }) else {
             return;
         };
