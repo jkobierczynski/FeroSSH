@@ -511,7 +511,14 @@ pub(crate) fn when(secs: Option<i64>) -> String {
     let Some(secs) = secs else {
         return String::new();
     };
-    let ticks = (secs + 11_644_473_600).max(0) as u64 * 10_000_000;
+    // A time out of FILETIME's range (a damaged file's) shows nothing.
+    let Some(ticks) = secs
+        .checked_add(11_644_473_600)
+        .and_then(|s| u64::try_from(s.max(0)).ok())
+        .and_then(|s| s.checked_mul(10_000_000))
+    else {
+        return String::new();
+    };
     let ft = FILETIME {
         dwLowDateTime: ticks as u32,
         dwHighDateTime: (ticks >> 32) as u32,

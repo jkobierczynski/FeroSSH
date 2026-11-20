@@ -17,33 +17,134 @@ fn store_path() -> Option<std::path::PathBuf> {
     Some(crate::portable::local_dir()?.join("inventory.conf"))
 }
 
-/// The inventory as kept; empty when there is none yet.
+/// The inventory as kept; empty when there is none yet, or when it cannot
+/// be read (for showing only: [`update`] never writes over such a file).
 pub fn load() -> Inventory {
-    store_path()
-        .and_then(|p| std::fs::read_to_string(p).ok())
-        .map(|t| Inventory::parse(&t))
-        .unwrap_or_default()
+    read().unwrap_or_default()
 }
 
-/// Reads the file again, changes it and writes it back, so two FeroSSH
-/// windows each keep what the other wrote.
+/// The inventory as kept: empty when there is no file yet, an error when
+/// there is one that cannot be read.
+fn read() -> std::io::Result<Inventory> {
+    let Some(path) = store_path() else {
+        return Ok(Inventory::default());
+    };
+    match std::fs::read_to_string(path) {
+        Ok(text) => Ok(Inventory::parse(&text)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Inventory::default()),
+        Err(e) => Err(e),
+    }
+}
+
+/// Held while the inventory is read, changed and written: an exclusive
+/// open of `inventory.lock`, which every FeroSSH process takes the same
+/// way, so two windows' changes do not interleave. Released when dropped.
+struct Lock(#[allow(dead_code)] std::fs::File);
+
+fn lock(dir: &std::path::Path) -> std::io::Result<Lock> {
+    std::fs::create_dir_all(dir)?;
+    let path = dir.join("inventory.lock");
+    let mut last = None;
+    // Another window holds it for a few milliseconds at most.
+    for _ in 0..100 {
+        let mut options = std::fs::OpenOptions::new();
+        options.read(true).write(true).create(true).truncate(false);
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::OpenOptionsExt;
+            options.share_mode(0);
+        }
+        match options.open(&path) {
+            Ok(f) => return Ok(Lock(f)),
+            Err(e) => last = Some(e),
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    Err(last.unwrap_or_else(|| std::io::Error::other("the inventory is busy")))
+}
+
+/// Writes `text` through a temporary file of this write's own beside
+/// `path`, then moves it over: a whole file or none.
+fn write_whole(path: &std::path::Path, text: &str) -> std::io::Result<()> {
+    use std::io::Write;
+    static COUNT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    let (tmp, mut file) = loop {
+        let n = COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let mut tmp = path.as_os_str().to_owned();
+        tmp.push(format!(".{}-{n}.tmp", std::process::id()));
+        let tmp = std::path::PathBuf::from(tmp);
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&tmp)
+        {
+            Ok(f) => break (tmp, f),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e),
+        }
+    };
+    let written = file
+        .write_all(text.as_bytes())
+        .and_then(|()| file.sync_all());
+    drop(file);
+    let written = written.and_then(|()| std::fs::rename(&tmp, path));
+    if written.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    written
+}
+
+/// Reads the file again, changes it and writes it back, all under one
+/// lock, so two FeroSSH windows each keep what the other wrote. A file
+/// that cannot be read is left as it is, and the error comes back.
 pub fn update(change: impl FnOnce(&mut Inventory)) -> std::io::Result<()> {
     let Some(path) = store_path() else {
         return Ok(());
     };
-    let mut inv = load();
+    let Some(dir) = path.parent() else {
+        return Ok(());
+    };
+    let _held = lock(dir)?;
+    let mut inv = read()?;
     let before = inv.clone();
     change(&mut inv);
     if inv == before {
         return Ok(());
     }
-    if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir)?;
+    write_whole(&path, &inv.to_text())
+}
+
+/// Writes `text` to a new file `stem.ext` in `dir`, or `stem-2.ext` and
+/// on when that is taken: an earlier export is never written over.
+pub fn write_new(
+    dir: &std::path::Path,
+    stem: &str,
+    ext: &str,
+    text: &str,
+) -> std::io::Result<std::path::PathBuf> {
+    use std::io::Write;
+    std::fs::create_dir_all(dir)?;
+    for n in 1..=100 {
+        let name = if n == 1 {
+            format!("{stem}.{ext}")
+        } else {
+            format!("{stem}-{n}.{ext}")
+        };
+        let path = dir.join(name);
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+        {
+            Ok(mut f) => return f.write_all(text.as_bytes()).map(|()| path),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e),
+        }
     }
-    // A whole file or none: written beside it, then moved over it.
-    let tmp = path.with_extension("conf.tmp");
-    std::fs::write(&tmp, inv.to_text())?;
-    std::fs::rename(&tmp, &path)
+    Err(std::io::Error::new(
+        std::io::ErrorKind::AlreadyExists,
+        "a hundred exports of this second are there already",
+    ))
 }
 
 /// Seconds since 1970, now.
@@ -137,23 +238,18 @@ pub fn rows(hosts: &[HostItem], inventory: &Inventory, settings: &Settings) -> V
 }
 
 /// The rows a connection manager search (`tag:prod -os`, plain words)
-/// keeps; plain words also look at the OS, kernel and fingerprint.
+/// keeps; each plain word also looks at the OS, kernel and fingerprint,
+/// and a field word (`folder:db`) only at its field.
 pub fn filter<'a>(rows: &'a [Row], query: &str) -> Vec<&'a Row> {
     let q = Query::parse(query);
     rows.iter()
         .filter(|r| {
-            q.is_empty() || q.matches(&r.host.facts()) || {
-                let words: Vec<String> = query.split_whitespace().map(str::to_lowercase).collect();
-                let more = format!(
-                    "{} {} {} {} {}",
-                    r.host.name, r.host.detail, r.record.os, r.record.kernel, r.record.fingerprint
-                )
-                .to_lowercase();
-                !words.is_empty()
-                    && words
-                        .iter()
-                        .all(|w| !w.starts_with('-') && more.contains(w))
-            }
+            let more = [
+                r.record.os.as_str(),
+                r.record.kernel.as_str(),
+                r.record.fingerprint.as_str(),
+            ];
+            q.matches_with(&r.host.facts(), &more)
         })
         .collect()
 }
@@ -190,9 +286,13 @@ pub fn text(r: &Row, column: Column, when: impl Fn(u64) -> String) -> String {
 /// How the window says what it shows: "12 of 40 connections; 3 never
 /// connected".
 pub fn summary(shown: &[&Row], all: usize) -> String {
+    // Only SSH logins are recorded: a Telnet or WinRM row is never
+    // counted as not connected to.
     let never = shown
         .iter()
-        .filter(|r| r.record.last_connected.is_none())
+        .filter(|r| {
+            r.host.kind == ferossh_config::SessionKind::Ssh && r.record.last_connected.is_none()
+        })
         .count();
     let what = if shown.len() == all {
         format!("{all} connection{}", if all == 1 { "" } else { "s" })
@@ -326,6 +426,24 @@ mod tests {
         assert_eq!(names("sha256:aaa"), ["web"]);
         assert_eq!(names(""), ["web", "db", "lab"]);
         assert_eq!(names("folder:nothing"), Vec::<String>::new());
+        // Field and plain words together, each word on its own.
+        assert_eq!(names("tag:prod linux"), ["db"]);
+        assert_eq!(names("tag:prod -linux"), ["web"]);
+        assert_eq!(names("\"linux 6\""), ["db"]);
+        // A field word looks only at its field, not at the server's text.
+        assert_eq!(names("folder:linux"), Vec::<String>::new());
+    }
+
+    #[test]
+    fn exports_never_write_over_an_earlier_one() {
+        let dir = std::env::temp_dir().join(format!("ferossh-inv-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let a = write_new(&dir, "inv", "csv", "a").unwrap();
+        let b = write_new(&dir, "inv", "csv", "b").unwrap();
+        assert_eq!(a.file_name().unwrap(), "inv.csv");
+        assert_eq!(b.file_name().unwrap(), "inv-2.csv");
+        assert_eq!(std::fs::read_to_string(&a).unwrap(), "a");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -378,5 +496,9 @@ mod tests {
         );
         let one = filter(&rows, "db");
         assert_eq!(summary(&one, 3), "1 of 3 connections.");
+        // Telnet logins are not recorded: never counted as not connected.
+        let mut telnet = rows[2].clone();
+        telnet.host.kind = SessionKind::Telnet;
+        assert_eq!(summary(&[&telnet], 1), "1 connection.");
     }
 }

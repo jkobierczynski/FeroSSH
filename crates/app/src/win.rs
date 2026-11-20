@@ -5190,6 +5190,8 @@ impl Window {
         self.via.retain(|c, _| workers.contains_key(c));
         self.stats
             .retain(|_, f| workers.contains_key(&f.connection));
+        self.system_reads
+            .retain(|_, r| workers.contains_key(&r.connection));
         // SAFETY: our window and timer.
         unsafe {
             SetTimer(
@@ -5641,10 +5643,16 @@ impl Window {
             return;
         };
         let alias = s.target.alias.clone();
-        if !self.side.list.has_host(&alias) {
+        let key = s.host_key_seen.clone();
+        // The connection manager's list fills only once it is shown: a
+        // saved connection opened before that is looked up where kept.
+        if !self.side.list.has_host(&alias)
+            && !host_items(&ssh_env(), &self.settings)
+                .iter()
+                .any(|h| h.name.eq_ignore_ascii_case(&alias))
+        {
             return;
         }
-        let key = s.host_key_seen.clone();
         if let Err(e) = crate::inventory_view::update(|inv| {
             let key = key.as_ref().map(|(k, f)| (k.as_str(), f.as_str()));
             inv.connected(&alias, crate::inventory_view::now(), key);
@@ -5680,6 +5688,21 @@ impl Window {
                 out: Vec::new(),
             },
         );
+    }
+
+    /// Connection `old` is called `new` now: its inventory row, and a read
+    /// of its OS still under way, follow.
+    fn inventory_renamed(&mut self, old: &str, new: &str) {
+        for r in self.system_reads.values_mut() {
+            if r.alias.eq_ignore_ascii_case(old) {
+                r.alias = new.to_owned();
+            }
+        }
+        if let Err(e) = crate::inventory_view::update(|inv| inv.rename(old, new)) {
+            self.queued.push(Command::Notice(format!(
+                "Could not update the inventory: {e}"
+            )));
+        }
     }
 
     /// What the inventory's system command printed, or that it ended.
@@ -8139,6 +8162,7 @@ impl Window {
                 {
                     // Only the login script and the snippet run: no
                     // forwards, tmux or desktops for a run's sessions.
+                    self.inventory_login(id);
                     self.retries.remove(&id);
                     self.start_log(id);
                     if self.run_login.contains(&id) {
@@ -8177,6 +8201,7 @@ impl Window {
                 Effect::Connected if self.tunnel_only(id) => {
                     // No shell: no login script, tmux or start folder.
                     // The tab holds the forwards open.
+                    self.inventory_login(id);
                     self.retries.remove(&id);
                     self.arm_reconnect_timer();
                     self.start_log(id);
@@ -8211,6 +8236,7 @@ impl Window {
                 Effect::Connected if self.sftp_only(id) => {
                     // No shell: no login script, tmux or start folder.
                     // File transfer opens on the host instead.
+                    self.inventory_login(id);
                     self.retries.remove(&id);
                     self.arm_reconnect_timer();
                     self.start_log(id);
@@ -15219,6 +15245,11 @@ impl Window {
                         sessions_path().display()
                     )));
                 }
+                // The connection has its new name now: its inventory row
+                // goes with it, whatever happens to the settings below.
+                if let Some(old) = renamed.as_deref() {
+                    self.inventory_renamed(old, &name);
+                }
                 self.settings = settings;
                 // Not saved: the form stays open, so nothing typed is lost.
                 if let Err(e) = self.try_save_settings() {
@@ -15229,14 +15260,6 @@ impl Window {
                     && (!still_windows || self.saved_password_target(&name).as_ref() != Some(&old))
                 {
                     self.forget_unused_passwords(vec![old]);
-                }
-                if let Some(old) = renamed {
-                    let new = name.clone();
-                    if let Err(e) = crate::inventory_view::update(|inv| inv.rename(&old, &new)) {
-                        self.queued.push(Command::Notice(format!(
-                            "Could not update the inventory: {e}"
-                        )));
-                    }
                 }
                 self.side.form = None;
                 self.reload_sessions(Some(&name));
@@ -15401,6 +15424,9 @@ impl Window {
         self.settings = settings;
         // Unless another connection keeps its password there too.
         self.forget_unused_passwords(targets);
+        // A read still under way for one of them keeps nothing.
+        self.system_reads
+            .retain(|_, r| !names.iter().any(|n| n.eq_ignore_ascii_case(&r.alias)));
         if let Err(e) = crate::inventory_view::update(|inv| {
             for name in names {
                 inv.remove(name);

@@ -198,7 +198,7 @@ Font, theme and text size apply to the focused pane only. Session > Save font an
 
 ## Right-click menu in the connection manager
 
-Right-clicking a host in the connection manager offers Connect (Enter), Open in a split (Shift+Enter), Edit connection... (F2), Delete connection... (Del) and New connection... (Ins). Everywhere it also offers Credentials... (see [Credentials many connections share](everyday-use.md#credentials-many-connections-share)) and Inventory... (see [Inventory](everyday-use.md#inventory)).
+Right-clicking a host in the connection manager offers Connect (Enter), Open in a split (Shift+Enter), Edit connection... (F2), Delete connection... (Del) and New connection... (Ins). On a host, a folder or empty space it also offers Credentials... (see [Credentials many connections share](everyday-use.md#credentials-many-connections-share)) and Inventory... (see [Inventory](everyday-use.md#inventory)); with several connections selected, the menu acts on them instead, so clear the selection first.
 
 ## Keys in the side panes
 

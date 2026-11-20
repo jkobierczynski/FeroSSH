@@ -152,7 +152,17 @@ impl Query {
 
     /// Whether the host matches every word.
     pub fn matches(&self, h: &HostFacts<'_>) -> bool {
-        self.terms.iter().all(|t| t.hit(h) != t.negate)
+        self.matches_with(h, &[])
+    }
+
+    /// [`Self::matches`], with `more` text a plain word may also be found
+    /// in (a `-` word then must be in none of it); a field word looks only
+    /// at its field.
+    pub fn matches_with(&self, h: &HostFacts<'_>, more: &[&str]) -> bool {
+        self.terms.iter().all(|t| {
+            let hit = t.hit(h) || (t.field.is_none() && more.iter().any(|m| has(m, &t.value)));
+            hit != t.negate
+        })
     }
 }
 

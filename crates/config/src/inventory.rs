@@ -137,10 +137,13 @@ impl Inventory {
         out
     }
 
+    /// The record of connection `name`, looked up as it is kept: cleaned
+    /// and cut to [`MAX_FIELD`] (two names alike that far share one).
     pub fn get(&self, name: &str) -> Option<&Record> {
+        let name = clean(name);
         self.records
             .iter()
-            .find(|(n, _)| n.eq_ignore_ascii_case(name))
+            .find(|(n, _)| n.eq_ignore_ascii_case(&name))
             .map(|(_, r)| r)
     }
 
@@ -187,22 +190,24 @@ impl Inventory {
 
     /// Connection `old` is called `new` now.
     pub fn rename(&mut self, old: &str, new: &str) {
-        if old.eq_ignore_ascii_case(new) || clean(new).is_empty() {
+        let (old, new) = (clean(old), clean(new));
+        if old.eq_ignore_ascii_case(&new) || new.is_empty() {
             return;
         }
-        self.remove(new);
+        self.remove(&new);
         if let Some((n, _)) = self
             .records
             .iter_mut()
-            .find(|(n, _)| n.eq_ignore_ascii_case(old))
+            .find(|(n, _)| n.eq_ignore_ascii_case(&old))
         {
-            *n = clean(new);
+            *n = new;
         }
     }
 
     /// Forgets connection `name`.
     pub fn remove(&mut self, name: &str) {
-        self.records.retain(|(n, _)| !n.eq_ignore_ascii_case(name));
+        let name = clean(name);
+        self.records.retain(|(n, _)| !n.eq_ignore_ascii_case(&name));
     }
 
     /// Keeps the file to [`MAX_RECORDS`] lines.
@@ -368,6 +373,16 @@ mod tests {
         assert!(inv.get("old").is_none());
         inv.remove("NEW");
         assert!(inv.get("new").is_none());
+        // A name longer than is kept is found, renamed and removed by
+        // the same name it was recorded under.
+        let long = "h".repeat(300);
+        inv.connected(&long, 3, None);
+        assert_eq!(inv.get(&long).unwrap().last_connected, Some(3));
+        inv.rename(&long, "short");
+        assert_eq!(inv.get("short").unwrap().last_connected, Some(3));
+        inv.rename("short", &long);
+        inv.remove(&long);
+        assert!(inv.get(&long).is_none());
     }
 
     #[test]

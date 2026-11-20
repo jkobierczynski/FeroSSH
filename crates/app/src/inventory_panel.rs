@@ -57,6 +57,9 @@ const SS_NOPREFIX: u32 = 0x80;
 /// Width and height of the window's inside, in DIPs.
 const WIDTH: i32 = 980;
 const HEIGHT: i32 = 560;
+/// The least it shrinks to on a small screen, in DIPs.
+const MIN_WIDTH: i32 = 480;
+const MIN_HEIGHT: i32 = 320;
 
 #[derive(Clone, Copy)]
 struct Handles {
@@ -185,18 +188,29 @@ unsafe fn create(owner: HWND, dpi: u32) -> windows::core::Result<HWND> {
         let s = |d: i32| scale(d, dpi);
         let style = WS_POPUP | WS_CAPTION | WS_SYSMENU;
         let ex = WS_EX_DLGMODALFRAME | WS_EX_CONTROLPARENT;
-        let mut r = RECT {
-            left: 0,
-            top: 0,
-            right: s(WIDTH),
-            bottom: s(HEIGHT),
+        // The frame's size, then as much of WIDTH x HEIGHT as the owner's
+        // monitor has room for (the list scrolls the rest).
+        let mut frame = RECT::default();
+        let _ = AdjustWindowRectExForDpi(&mut frame, style, false, ex, dpi);
+        let (fw, fh) = (frame.right - frame.left, frame.bottom - frame.top);
+        let work = work_area(owner);
+        let dips = |px: i32| px.max(0) * 96 / dpi.max(1) as i32;
+        let (width, height) = match work {
+            Some(a) => (
+                WIDTH.min(dips(a.right - a.left - fw)).max(MIN_WIDTH),
+                HEIGHT.min(dips(a.bottom - a.top - fh)).max(MIN_HEIGHT),
+            ),
+            None => (WIDTH, HEIGHT),
         };
-        let _ = AdjustWindowRectExForDpi(&mut r, style, false, ex, dpi);
-        let (w, h) = (r.right - r.left, r.bottom - r.top);
+        let (w, h) = (s(width) + fw, s(height) + fh);
         let mut o = RECT::default();
         let _ = GetWindowRect(owner, &mut o);
-        let x = o.left + ((o.right - o.left) - w) / 2;
-        let y = o.top + ((o.bottom - o.top) - h) / 3;
+        let mut x = o.left + ((o.right - o.left) - w) / 2;
+        let mut y = o.top + ((o.bottom - o.top) - h) / 3;
+        if let Some(a) = work {
+            x = x.min(a.right - w).max(a.left);
+            y = y.min(a.bottom - h).max(a.top);
+        }
         let dlg = CreateWindowExW(
             ex,
             class,
@@ -211,6 +225,47 @@ unsafe fn create(owner: HWND, dpi: u32) -> windows::core::Result<HWND> {
             Some(instance.into()),
             None,
         )?;
+        // Destroyed again (with what it holds) unless every control is
+        // made.
+        match controls(dlg, instance.into(), dpi, width, height) {
+            Ok(()) => Ok(dlg),
+            Err(e) => {
+                let _ = DestroyWindow(dlg);
+                Err(e)
+            }
+        }
+    }
+}
+
+/// The work area (less the taskbar) of the monitor `hwnd` is on.
+fn work_area(hwnd: HWND) -> Option<RECT> {
+    use windows::Win32::Graphics::Gdi::{
+        GetMonitorInfoW, MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromWindow,
+    };
+    let mut info = MONITORINFO {
+        cbSize: size_of::<MONITORINFO>() as u32,
+        ..Default::default()
+    };
+    // SAFETY: a window handle and a local out-pointer with its size set.
+    unsafe {
+        let monitor = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
+        GetMonitorInfoW(monitor, &mut info)
+            .as_bool()
+            .then_some(info.rcWork)
+    }
+}
+
+/// The window's controls, laid out in a `width` x `height` DIP client.
+unsafe fn controls(
+    dlg: HWND,
+    instance: windows::Win32::Foundation::HINSTANCE,
+    dpi: u32,
+    width: i32,
+    height: i32,
+) -> windows::core::Result<()> {
+    // SAFETY: the caller's promise; see `create`.
+    unsafe {
+        let s = |d: i32| scale(d, dpi);
         let child = |class: PCWSTR, text: &str, style: u32, id: usize, at: (i32, i32, i32, i32)| {
             let text = wide(text);
             CreateWindowExW(
@@ -224,7 +279,7 @@ unsafe fn create(owner: HWND, dpi: u32) -> windows::core::Result<HWND> {
                 s(at.3),
                 Some(dlg),
                 Some(HMENU(id as *mut _)),
-                Some(instance.into()),
+                Some(instance),
                 None,
             )
         };
@@ -233,7 +288,7 @@ unsafe fn create(owner: HWND, dpi: u32) -> windows::core::Result<HWND> {
             "",
             WS_TABSTOP.0 | WS_BORDER.0 | ES_AUTOHSCROLL as u32,
             ID_SEARCH,
-            (12, 12, WIDTH - 24, 24),
+            (12, 12, width - 24, 24),
         )?;
         let cue = wide("Search: words, tag:prod, folder:db, -tag:legacy, an OS or a fingerprint");
         SendMessageW(
@@ -242,13 +297,13 @@ unsafe fn create(owner: HWND, dpi: u32) -> windows::core::Result<HWND> {
             Some(WPARAM(1)),
             Some(LPARAM(cue.as_ptr() as isize)),
         );
-        let bottom = HEIGHT - 12 - 28;
+        let bottom = height - 12 - 28;
         let list = child(
             WC_LISTVIEWW,
             "",
             WS_TABSTOP.0 | WS_BORDER.0 | LVS_REPORT | LVS_SINGLESEL | LVS_SHOWSELALWAYS,
             ID_LIST,
-            (12, 44, WIDTH - 24, bottom - 44 - 44),
+            (12, 44, width - 24, bottom - 44 - 44),
         )?;
         let _ = SetWindowTheme(list, w!("Explorer"), PCWSTR::null());
         let lex = LVS_EX_FULLROWSELECT | LVS_EX_DOUBLEBUFFER | LVS_EX_LABELTIP;
@@ -278,7 +333,7 @@ unsafe fn create(owner: HWND, dpi: u32) -> windows::core::Result<HWND> {
             "",
             SS_NOPREFIX,
             ID_STATUS,
-            (12, bottom - 38, WIDTH - 24, 34),
+            (12, bottom - 38, width - 24, 34),
         )?;
         let push = WS_TABSTOP.0 | BS_PUSHBUTTON as u32;
         child(WC_BUTTONW, "Save &CSV", push, ID_CSV, (12, bottom, 100, 28))?;
@@ -287,14 +342,14 @@ unsafe fn create(owner: HWND, dpi: u32) -> windows::core::Result<HWND> {
             "C&onnect",
             WS_TABSTOP.0 | BS_DEFPUSHBUTTON as u32,
             IDOK.0 as usize,
-            (WIDTH - 12 - 88 - 8 - 88, bottom, 88, 28),
+            (width - 12 - 88 - 8 - 88, bottom, 88, 28),
         )?;
         child(
             WC_BUTTONW,
             "Close",
             push,
             IDCANCEL.0 as usize,
-            (WIDTH - 12 - 88, bottom, 88, 28),
+            (width - 12 - 88, bottom, 88, 28),
         )?;
         STATE.with(|st| {
             *st.borrow_mut() = Some(State {
@@ -311,7 +366,7 @@ unsafe fn create(owner: HWND, dpi: u32) -> windows::core::Result<HWND> {
                 done: None,
             });
         });
-        Ok(dlg)
+        Ok(())
     }
 }
 
@@ -458,10 +513,10 @@ fn save_csv() {
         .replace(['-', ':'], "")
         .replace('T', "-")
         .replace('Z', "");
-    let path = dir.join(format!("ferossh-inventory-{stamp}.csv"));
-    let note = match std::fs::create_dir_all(&dir).and_then(|()| std::fs::write(&path, text)) {
-        Ok(()) => format!("Saved the list as {}.", path.display()),
-        Err(e) => format!("Could not save the list as {}: {e}", path.display()),
+    let stem = format!("ferossh-inventory-{stamp}");
+    let note = match inventory_view::write_new(&dir, &stem, "csv", &text) {
+        Ok(path) => format!("Saved the list as {}.", path.display()),
+        Err(e) => format!("Could not save the list in {}: {e}", dir.display()),
     };
     if let Some(h) = with(|s| s.h) {
         set_text(h.status, &note);
