@@ -9,8 +9,8 @@ Already built, so not listed: folders (`# folder:` comments), favourites, search
 | # | Feature | Status |
 | --- | --- | --- |
 | 1 | Several tags per connection | Done (#254) |
-| 2 | Search by field, and saved searches | Built |
-| 3 | Select several connections and act on them all | To do |
+| 2 | Search by field, and saved searches | Done (#255) |
+| 3 | Select several connections and act on them all | Built |
 | 4 | Change one field on many connections at once | To do |
 | 5 | Named credentials shared by many connections | To do |
 | 6 | Credential and security rules by tag or folder | To do |
@@ -31,11 +31,11 @@ Already built, so not listed: folders (`# folder:` comments), favourites, search
 
 **What was built.** Field words in the connection manager's search: `tag:prod`, `folder:db`, `name:web`, `user:root`, `host:10.0.`, `type:rdp`, `port:2222`, with `-` to leave out (`tag:prod -tag:legacy`), `*` and `?` in tags and types, and double quotes for spaces. Plain words work as before. The right-click menu saves the typed search as a smart folder (*Search: tag:prod*) at the top of the tree, closed at first, kept in `ferossh.conf` (`SavedSearch`); right-clicking it removes it. The script host picker and the command palette get the same language with item 8.
 
-## 3. Select several connections and act on them all
+## 3. Select several connections and act on them all (built)
 
 **What FeroSSH has.** The Connection manager and its right-click menu act on one connection at a time.
 
-**What to build.** Ctrl+click and Shift+click select several connections (and Ctrl+A all those shown). The right-click menu then offers: open them all in tabs, open them as one tiled tab, run a script on them, move them to a folder, add or remove a tag, and delete them (with one confirmation listing them). Hosts from `~/.ssh/config` stay read-only for the connection itself; tags still apply.
+**What was built.** Ctrl+click, Shift+click, Ctrl+A and Ctrl+Space select several connections in the tree, highlighted until a plain click or Escape. The right-click menu on them offers: connect to all (a tab each, asking above eight), add a tag already in use, remove a connection's own tag, move to a folder of the saved connections or to no folder, delete (one confirmation listing them; Del too), and clear the selection. Moving and deleting change saved connections only; hosts from `~/.ssh/config` or imports are named and left alone. Still open for later items: typing a brand-new tag for many (item 4), opening them as one tiled tab, and running a script on them (item 8).
 
 ## 4. Change one field on many connections at once
 

@@ -23,22 +23,23 @@ use std::collections::HashSet;
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
     BeginPaint, COLOR_WINDOW, COLOR_WINDOWTEXT, DT_LEFT, DT_NOPREFIX, DT_SINGLELINE, DT_VCENTER,
-    DeleteObject, DrawTextW, EndPaint, FillRect, HFONT, HGDIOBJ, PAINTSTRUCT, ScreenToClient,
-    SelectObject, SetBkMode, SetTextColor, TRANSPARENT,
+    DeleteObject, DrawTextW, EndPaint, FillRect, HFONT, HGDIOBJ, InvalidateRect, PAINTSTRUCT,
+    ScreenToClient, SelectObject, SetBkMode, SetTextColor, TRANSPARENT,
 };
 use windows::Win32::UI::Controls::{
-    CDDS_ITEMPOSTPAINT, CDDS_ITEMPREPAINT, CDDS_PREPAINT, CDRF_DODEFAULT, CDRF_NOTIFYITEMDRAW,
-    CDRF_NOTIFYPOSTPAINT, EM_SETCUEBANNER, EM_SETSEL, HTREEITEM, NM_CUSTOMDRAW, NM_DBLCLK,
-    NM_RCLICK, NM_SETFOCUS, NMHDR, NMTREEVIEWW, NMTVCUSTOMDRAW, NMTVGETINFOTIPW, NMTVKEYDOWN,
-    SetWindowTheme, TVE_TOGGLE, TVGN_CARET, TVGN_ROOT, TVHITTESTINFO, TVI_LAST, TVI_ROOT,
-    TVIF_PARAM, TVIF_STATE, TVIF_TEXT, TVINSERTSTRUCTW, TVIS_EXPANDED, TVITEMW, TVM_DELETEITEM,
-    TVM_ENSUREVISIBLE, TVM_EXPAND, TVM_GETITEMRECT, TVM_GETITEMW, TVM_GETNEXTITEM, TVM_HITTEST,
-    TVM_INSERTITEMW, TVM_SELECTITEM, TVM_SETEXTENDEDSTYLE, TVN_GETINFOTIPW, TVN_ITEMEXPANDEDW,
-    TVN_KEYDOWN, TVS_EX_DOUBLEBUFFER, TVS_EX_FADEINOUTEXPANDOS, TVS_FULLROWSELECT, TVS_HASBUTTONS,
-    TVS_INFOTIP, TVS_LINESATROOT, TVS_SHOWSELALWAYS, WC_BUTTONW, WC_EDITW, WC_TREEVIEWW,
+    CDDS_ITEMPOSTPAINT, CDDS_ITEMPREPAINT, CDDS_PREPAINT, CDRF_DODEFAULT, CDRF_NEWFONT,
+    CDRF_NOTIFYITEMDRAW, CDRF_NOTIFYPOSTPAINT, EM_SETCUEBANNER, EM_SETSEL, HTREEITEM, NM_CLICK,
+    NM_CUSTOMDRAW, NM_DBLCLK, NM_RCLICK, NM_SETFOCUS, NMHDR, NMTREEVIEWW, NMTVCUSTOMDRAW,
+    NMTVGETINFOTIPW, NMTVKEYDOWN, SetWindowTheme, TVE_TOGGLE, TVGN_CARET, TVGN_NEXTVISIBLE,
+    TVGN_ROOT, TVHITTESTINFO, TVI_LAST, TVI_ROOT, TVIF_PARAM, TVIF_STATE, TVIF_TEXT,
+    TVINSERTSTRUCTW, TVIS_EXPANDED, TVITEMW, TVM_DELETEITEM, TVM_ENSUREVISIBLE, TVM_EXPAND,
+    TVM_GETITEMRECT, TVM_GETITEMW, TVM_GETNEXTITEM, TVM_HITTEST, TVM_INSERTITEMW, TVM_SELECTITEM,
+    TVM_SETEXTENDEDSTYLE, TVN_GETINFOTIPW, TVN_ITEMEXPANDEDW, TVN_KEYDOWN, TVS_EX_DOUBLEBUFFER,
+    TVS_EX_FADEINOUTEXPANDOS, TVS_FULLROWSELECT, TVS_HASBUTTONS, TVS_INFOTIP, TVS_LINESATROOT,
+    TVS_SHOWSELALWAYS, WC_BUTTONW, WC_EDITW, WC_TREEVIEWW,
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    GetFocus, SetFocus, VK_CONTROL, VK_DELETE, VK_DOWN, VK_F2, VK_F5, VK_INSERT, VK_SHIFT,
+    GetFocus, SetFocus, VK_CONTROL, VK_DELETE, VK_DOWN, VK_F2, VK_F5, VK_INSERT, VK_SHIFT, VK_SPACE,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     BN_CLICKED, BS_DEFPUSHBUTTON, BS_PUSHBUTTON, CS_HREDRAW, CS_VREDRAW, CreateWindowExW,
@@ -69,6 +70,9 @@ pub enum Event {
     Menu {
         host: Option<String>,
         search: Option<String>,
+        /// The hosts Ctrl+click or Shift+click selected, when the click
+        /// was on one of them (or on no host).
+        marked: Vec<String>,
     },
     /// Run this menu command (Import).
     Command(u32),
@@ -78,6 +82,8 @@ pub enum Event {
     Focused,
     /// F5: read the hosts again.
     Refresh,
+    /// Delete with several hosts selected.
+    DeleteMany(Vec<String>),
 }
 
 /// Carries out an [`Event`]; `HWND` is the main window.
@@ -118,6 +124,10 @@ struct State {
     items: Vec<Item>,
     /// Folders the user folded.
     collapsed: HashSet<String>,
+    /// Hosts selected with Ctrl+click, Shift+click or Ctrl+A, by name.
+    marked: Vec<String>,
+    /// Where Shift+click selects from: the item index of a host.
+    anchor: Option<usize>,
     /// The width the controls are laid out for (the tool's whole width).
     width: i32,
 }
@@ -239,6 +249,8 @@ pub fn create(main: HWND, handler: Handler, import: u32, dpi: u32) -> windows::c
                 nodes: None,
                 items: Vec::new(),
                 collapsed: HashSet::new(),
+                marked: Vec::new(),
+                anchor: None,
                 width: 0,
             });
         });
@@ -444,6 +456,12 @@ pub fn set_nodes(nodes: Vec<TreeNode>) {
             }
             items.extend(n.hosts().iter().cloned().map(Item::Host));
         }
+        s.marked.retain(|m| {
+            items.iter().any(
+                |i| matches!(i, Item::Host(h) if !h.workspace && h.name.eq_ignore_ascii_case(m)),
+            )
+        });
+        s.anchor = None;
         s.items = items;
         s.nodes = Some(nodes.clone());
         Some(s.collapsed.clone())
@@ -530,6 +548,136 @@ pub fn set_nodes(nodes: Vec<TreeNode>) {
             );
         }
     }
+}
+
+/// The hosts on screen in the tree (not those in a folded folder), in
+/// the order listed: item index and name. Workspaces are left out.
+fn visible_hosts(tree: HWND) -> Vec<(usize, String)> {
+    let items = STATE.with(|s| {
+        s.try_borrow()
+            .ok()
+            .and_then(|s| s.as_ref().map(|s| s.items.clone()))
+            .unwrap_or_default()
+    });
+    let mut out = Vec::new();
+    // SAFETY: our own control; plain queries.
+    let mut item = unsafe {
+        SendMessageW(
+            tree,
+            TVM_GETNEXTITEM,
+            Some(WPARAM(TVGN_ROOT as usize)),
+            None,
+        )
+    };
+    let mut guard = items.len() + 1;
+    while item.0 != 0 && guard > 0 {
+        guard -= 1;
+        let handle = HTREEITEM(item.0);
+        if let Some(i) = item_index(tree, handle)
+            && let Some(Item::Host(h)) = items.get(i)
+            && !h.workspace
+        {
+            out.push((i, h.name.clone()));
+        }
+        // SAFETY: as above.
+        item = unsafe {
+            SendMessageW(
+                tree,
+                TVM_GETNEXTITEM,
+                Some(WPARAM(TVGN_NEXTVISIBLE as usize)),
+                Some(LPARAM(handle.0)),
+            )
+        };
+    }
+    out
+}
+
+/// Every host in the tree, folded folders too, in the order listed:
+/// item index and name. Workspaces are left out; a host listed twice is
+/// here twice.
+fn host_order() -> Vec<(usize, String)> {
+    STATE.with(|s| {
+        s.try_borrow()
+            .ok()
+            .and_then(|s| {
+                s.as_ref().map(|s| {
+                    s.items
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(i, it)| match it {
+                            Item::Host(h) if !h.workspace => Some((i, h.name.clone())),
+                            _ => None,
+                        })
+                        .collect()
+                })
+            })
+            .unwrap_or_default()
+    })
+}
+
+fn marked() -> Vec<String> {
+    STATE.with(|s| {
+        s.try_borrow()
+            .ok()
+            .and_then(|s| s.as_ref().map(|s| s.marked.clone()))
+            .unwrap_or_default()
+    })
+}
+
+fn is_marked(name: &str) -> bool {
+    STATE.with(|s| {
+        s.try_borrow().ok().is_some_and(|s| {
+            s.as_ref()
+                .is_some_and(|s| s.marked.iter().any(|m| m.eq_ignore_ascii_case(name)))
+        })
+    })
+}
+
+/// Sets the selection of several hosts and repaints the tree.
+fn set_marked(marked: Vec<String>, anchor: Option<usize>) {
+    let Some(h) = handles() else {
+        return;
+    };
+    STATE.with(|s| {
+        if let Ok(mut s) = s.try_borrow_mut()
+            && let Some(s) = s.as_mut()
+        {
+            s.marked = marked;
+            s.anchor = anchor;
+        }
+    });
+    // SAFETY: our own control.
+    unsafe {
+        let _ = InvalidateRect(Some(h.tree), None, true);
+    }
+}
+
+/// Clears the selection of several hosts (Clear the selection, Escape).
+pub fn clear_marks() {
+    if !marked().is_empty() {
+        set_marked(Vec::new(), None);
+    }
+}
+
+/// A Ctrl+click or Shift+click on tree item `index`; `true` when it
+/// changed the selection of several hosts (and the tree should not act on
+/// the click itself).
+fn mark_click(h: Handles, index: usize, hit: HTREEITEM, ctrl: bool, shift: bool) -> bool {
+    // A run of hosts is the one on screen: none from a folded folder.
+    let order = visible_hosts(h.tree);
+    let Some(pos) = order.iter().position(|(i, _)| *i == index) else {
+        return false;
+    };
+    let names: Vec<String> = order.iter().map(|(_, n)| n.clone()).collect();
+    let current = selected(h.tree).and_then(|c| order.iter().position(|(i, _)| *i == c));
+    let anchor = STATE
+        .with(|s| s.try_borrow().ok()?.as_ref()?.anchor)
+        .and_then(|a| order.iter().position(|(i, _)| *i == a));
+    let (marks, anchor) =
+        crate::bulk::click_marks(&names, &marked(), anchor, current, pos, ctrl, shift);
+    select(h.tree, hit);
+    set_marked(marks, anchor.and_then(|p| order.get(p)).map(|(i, _)| *i));
+    true
 }
 
 fn emit(e: Event) {
@@ -647,6 +795,7 @@ fn command(h: Handles, id: usize, code: u32) {
         (ID_SEARCH, EN_CHANGE) => emit(Event::Query(search_text(h.search))),
         (ID_SEARCH, EN_SETFOCUS) => emit(Event::Focused),
         (id, _) if id == IDOK.0 as usize => open_selected(h, focus == h.search),
+        (id, _) if id == IDCANCEL.0 as usize && !marked().is_empty() => clear_marks(),
         (id, _) if id == IDCANCEL.0 as usize => {
             if search_text(h.search).is_empty() {
                 emit(Event::Action(SideAction::Leave));
@@ -757,13 +906,67 @@ fn notify(h: Handles, lparam: LPARAM) -> LRESULT {
                 let cd = &*(lparam.0 as *const NMTVCUSTOMDRAW);
                 return match cd.nmcd.dwDrawStage {
                     CDDS_PREPAINT => LRESULT(CDRF_NOTIFYITEMDRAW as isize),
-                    CDDS_ITEMPREPAINT => LRESULT(CDRF_NOTIFYPOSTPAINT as isize),
+                    CDDS_ITEMPREPAINT => {
+                        let marked = matches!(
+                            item(cd.nmcd.lItemlParam.0 as usize),
+                            Some(Item::Host(host)) if !host.workspace && is_marked(&host.name)
+                        );
+                        if marked {
+                            use windows::Win32::Graphics::Gdi::{
+                                COLOR_HIGHLIGHT, COLOR_HIGHLIGHTTEXT,
+                            };
+                            let cd = &mut *(lparam.0 as *mut NMTVCUSTOMDRAW);
+                            cd.clrTextBk = windows::Win32::Foundation::COLORREF(
+                                crate::ui_theme::sys_color(COLOR_HIGHLIGHT),
+                            );
+                            cd.clrText = windows::Win32::Foundation::COLORREF(
+                                crate::ui_theme::sys_color(COLOR_HIGHLIGHTTEXT),
+                            );
+                            return LRESULT((CDRF_NEWFONT | CDRF_NOTIFYPOSTPAINT) as isize);
+                        }
+                        LRESULT(CDRF_NOTIFYPOSTPAINT as isize)
+                    }
                     CDDS_ITEMPOSTPAINT => {
                         draw_detail(h.tree, cd);
                         LRESULT(CDRF_DODEFAULT as isize)
                     }
                     _ => LRESULT(CDRF_DODEFAULT as isize),
                 };
+            }
+            NM_CLICK => {
+                let ctrl = key_down(VK_CONTROL.0);
+                let shift = key_down(VK_SHIFT.0);
+                if !ctrl && !shift {
+                    // The anchor goes too, even with nothing selected: the
+                    // host clicked is where a Shift+click starts next.
+                    set_marked(Vec::new(), None);
+                    return LRESULT(0);
+                }
+                let pos = GetMessagePos();
+                let mut pt = POINT {
+                    x: i32::from((pos & 0xFFFF) as u16 as i16),
+                    y: i32::from((pos >> 16) as u16 as i16),
+                };
+                let _ = ScreenToClient(h.tree, &mut pt);
+                let mut hit = TVHITTESTINFO {
+                    pt,
+                    ..Default::default()
+                };
+                let hit_item = HTREEITEM(
+                    SendMessageW(
+                        h.tree,
+                        TVM_HITTEST,
+                        Some(WPARAM(0)),
+                        Some(LPARAM(&raw mut hit as isize)),
+                    )
+                    .0,
+                );
+                if hit_item.0 != 0
+                    && let Some(index) = item_index(h.tree, hit_item)
+                    && mark_click(h, index, hit_item, ctrl, shift)
+                {
+                    return LRESULT(1);
+                }
             }
             NM_DBLCLK => {
                 if selected_host().is_some() || selected_workspace().is_some() {
@@ -803,13 +1006,63 @@ fn notify(h: Handles, lparam: LPARAM) -> LRESULT {
                     Item::Folder(name) => saved_search_of(&name).map(str::to_owned),
                     Item::Host(_) => None,
                 });
-                emit(Event::Menu { host, search });
+                // A right click outside the selection of several hosts is
+                // about that one host: the selection goes.
+                let mut marks = marked();
+                if host
+                    .as_ref()
+                    .is_some_and(|n| !marks.iter().any(|m| m.eq_ignore_ascii_case(n)))
+                {
+                    clear_marks();
+                    marks.clear();
+                }
+                emit(Event::Menu {
+                    host,
+                    search,
+                    marked: marks,
+                });
                 return LRESULT(1);
             }
             TVN_KEYDOWN => {
                 let key = &*(lparam.0 as *const NMTVKEYDOWN);
                 let vk = key.wVKey;
                 let ctrl = key_down(VK_CONTROL.0);
+                if vk == u16::from(b'A') && ctrl {
+                    let mut all: Vec<String> = Vec::new();
+                    for (_, n) in host_order() {
+                        if !all.iter().any(|x| x.eq_ignore_ascii_case(&n)) {
+                            all.push(n);
+                        }
+                    }
+                    set_marked(all, None);
+                    return LRESULT(1);
+                }
+                if vk == VK_SPACE.0 && ctrl {
+                    let order = visible_hosts(h.tree);
+                    if let Some(index) = selected(h.tree)
+                        && let Some(pos) = order.iter().position(|(i, _)| *i == index)
+                    {
+                        let names: Vec<String> = order.iter().map(|(_, n)| n.clone()).collect();
+                        let (marks, anchor) = crate::bulk::click_marks(
+                            &names,
+                            &marked(),
+                            None,
+                            None,
+                            pos,
+                            true,
+                            false,
+                        );
+                        set_marked(marks, anchor.and_then(|p| order.get(p)).map(|(i, _)| *i));
+                    }
+                    return LRESULT(1);
+                }
+                let marks = marked();
+                // With hosts selected, Delete is about them, even one left
+                // after Ctrl+clicks, never the caret's host.
+                if vk == VK_DELETE.0 && !marks.is_empty() {
+                    emit(Event::DeleteMany(marks));
+                    return LRESULT(1);
+                }
                 let action = match vk {
                     v if v == VK_F2.0 && selected_workspace().is_some() => {
                         selected_workspace().map(SideAction::EditWorkspace)

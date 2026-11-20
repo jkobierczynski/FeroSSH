@@ -170,6 +170,8 @@ pub enum SideAction {
     SaveSearch(String),
     /// Drop this saved search.
     RemoveSearch(String),
+    /// Change several connections at once.
+    Bulk(crate::bulk::BulkAction),
     /// Give the keyboard back to the terminal.
     Leave,
 }
