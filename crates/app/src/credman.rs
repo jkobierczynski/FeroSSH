@@ -61,14 +61,22 @@ pub fn write(target: &str, user: &str, password: &str) -> Result<(), String> {
 }
 
 /// Forgets the password under `target`, in the vault and here. An error
-/// when the vault could not be saved: the password is still in it.
+/// when the vault could not be saved, or the Credential Manager refused:
+/// the password is still there.
 pub fn delete(target: &str) -> Result<(), String> {
-    let vault = crate::vault::delete_secret(target);
+    let vault = crate::vault::delete_secret(target)
+        .map_err(|e| format!("The saved password could not be forgotten: {e}"));
     // The PC's own passwords are not a portable FeroSSH's to delete.
-    if !crate::portable::is_portable() {
-        os_delete(target);
+    let os = if crate::portable::is_portable() {
+        Ok(())
+    } else {
+        os_delete(target)
+    };
+    match (vault, os) {
+        (Err(a), Err(b)) => Err(format!("{a} {b}")),
+        (Err(e), _) | (_, Err(e)) => Err(e),
+        _ => Ok(()),
     }
-    vault.map_err(|e| format!("The saved password could not be forgotten: {e}"))
 }
 
 /// The password under `target` in the Credential Manager alone.
@@ -133,12 +141,19 @@ pub fn os_write(target: &str, user: &str, password: &str) -> Result<(), String> 
     })
 }
 
-/// Forgets the password under `target` in the Credential Manager.
-pub fn os_delete(target: &str) {
+/// Forgets the password under `target` in the Credential Manager. One
+/// that is not there is already forgotten; any other failure is an error,
+/// since the password is still on this PC.
+pub fn os_delete(target: &str) -> Result<(), String> {
     let name = HSTRING::from(target);
-    // SAFETY: valid name; a missing credential is not an error worth
-    // reporting.
-    let _ = unsafe { CredDeleteW(&name, CRED_TYPE_GENERIC, None) };
+    // SAFETY: valid name.
+    match unsafe { CredDeleteW(&name, CRED_TYPE_GENERIC, None) } {
+        Err(e) if e.code() != ERROR_NOT_FOUND.to_hresult() => Err(format!(
+            "The password for {target} could not be removed from the Windows \
+             Credential Manager ({e})."
+        )),
+        _ => Ok(()),
+    }
 }
 
 /// Every password FeroSSH saved in the Credential Manager (logins,
