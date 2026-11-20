@@ -401,6 +401,166 @@ fn rewrite(path: &Path, host: &str, port: u16, key: Option<&[u8]>) -> io::Result
     replace_file(path, out.as_bytes())
 }
 
+/// What UpdateHostKeys changes for one host in one known_hosts file: the
+/// server's own list of its host keys (`hostkeys-00@openssh.com`) set
+/// against the keys the file holds for the host.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct HostKeyChanges {
+    /// Keys the server has that the file lacks. They are written only
+    /// once the server proved it holds them.
+    pub add: Vec<Vec<u8>>,
+    /// Keys the file holds for the host that the server no longer has.
+    pub remove: Vec<Vec<u8>>,
+}
+
+impl HostKeyChanges {
+    pub fn is_empty(&self) -> bool {
+        self.add.is_empty() && self.remove.is_empty()
+    }
+}
+
+/// What UpdateHostKeys would change in known_hosts `text` for `host` on
+/// `port`, which logged in with key `used` and then listed `announced`;
+/// `Err` says why the file is left alone, as OpenSSH leaves it:
+///
+/// - the server did not list the key it logged in with;
+/// - the file does not hold that key for the host (it was trusted some
+///   other way: a certificate, DNS, another file);
+/// - a line holding a key for the host also names other hosts or
+///   patterns, so changing it would change their trust too.
+///
+/// Keys marked `@revoked` are never added. Hashed lines name one host
+/// each and may be changed.
+pub fn plan_host_keys(
+    text: &str,
+    host: &str,
+    port: u16,
+    used: &[u8],
+    announced: &[Vec<u8>],
+) -> Result<HostKeyChanges, String> {
+    plan_lines(text, host, port, used, announced).map(|(changes, _)| changes)
+}
+
+/// [`plan_host_keys`], with the 1-based numbers of the lines that go.
+fn plan_lines(
+    text: &str,
+    host: &str,
+    port: u16,
+    used: &[u8],
+    announced: &[Vec<u8>],
+) -> Result<(HostKeyChanges, Vec<usize>), String> {
+    let token = host_token(host, port);
+    if !announced.iter().any(|k| k == used) {
+        return Err("the server did not list the key it logged in with".into());
+    }
+    let entries: Vec<Entry> = text
+        .lines()
+        .enumerate()
+        .filter_map(|(i, line)| parse_line(i + 1, line))
+        .collect();
+    let revoked = |key: &[u8]| {
+        entries
+            .iter()
+            .any(|e| e.marker == Some(Marker::Revoked) && e.key == key)
+    };
+    let mut listed: Vec<&Entry> = Vec::new();
+    for e in &entries {
+        if e.marker.is_some() || !host_matches(&e.hosts, &token) {
+            continue;
+        }
+        if let Hosts::Patterns(list) = &e.hosts
+            && !list.eq_ignore_ascii_case(&token)
+        {
+            return Err(format!(
+                "line {} also names other hosts or patterns ({list})",
+                e.line
+            ));
+        }
+        listed.push(e);
+    }
+    if !listed.iter().any(|e| e.key == used) {
+        return Err("the file does not hold the key the host logged in with".into());
+    }
+    let mut changes = HostKeyChanges::default();
+    for key in announced {
+        if !revoked(key) && !listed.iter().any(|e| &e.key == key) && !changes.add.contains(key) {
+            changes.add.push(key.clone());
+        }
+    }
+    let mut lines = Vec::new();
+    for e in &listed {
+        if !announced.contains(&e.key) {
+            lines.push(e.line);
+            if !changes.remove.contains(&e.key) {
+                changes.remove.push(e.key.clone());
+            }
+        }
+    }
+    Ok((changes, lines))
+}
+
+/// Carries out UpdateHostKeys in the known_hosts file at `path`: the
+/// lines holding keys the server no longer has go, and each key in
+/// `proven` the file lacks is added with a hashed hostname. The changes
+/// are worked out again from the file as it is now ([`plan_host_keys`]);
+/// nothing is written when that would add a key the server has not
+/// proven (the file changed meanwhile), or when the file changes while it
+/// is written. Kept lines stay byte for byte. Returns what changed.
+pub fn update_host_keys(
+    path: &Path,
+    host: &str,
+    port: u16,
+    used: &[u8],
+    announced: &[Vec<u8>],
+    proven: &[Vec<u8>],
+) -> io::Result<HostKeyChanges> {
+    let raw = fs::read(path)?;
+    let text = decode(&raw)?;
+    let (changes, gone) =
+        plan_lines(&text, host, port, used, announced).map_err(io::Error::other)?;
+    if changes.add.iter().any(|k| !proven.contains(k)) {
+        return Err(io::Error::other(format!(
+            "{} changed while the server proved its keys; nothing was written",
+            path.display()
+        )));
+    }
+    if changes.is_empty() {
+        return Ok(changes);
+    }
+    let utf16 = raw.contains(&0);
+    if utf16 && text.contains('\u{FFFD}') {
+        return Err(io::Error::other(format!(
+            "{} mixes UTF-16 with bytes that are not text; nothing was written",
+            path.display()
+        )));
+    }
+    let parts: Vec<&[u8]> = if utf16 {
+        text.split_inclusive('\n').map(str::as_bytes).collect()
+    } else {
+        raw.split_inclusive(|&b| b == b'\n').collect()
+    };
+    let eol: &[u8] = if raw.windows(2).any(|w| w == b"\r\n") {
+        b"\r\n"
+    } else {
+        b"\n"
+    };
+    let mut out: Vec<u8> = Vec::with_capacity(raw.len() + 256 * changes.add.len());
+    for (i, line) in parts.into_iter().enumerate() {
+        if !gone.contains(&(i + 1)) {
+            out.extend_from_slice(line);
+        }
+    }
+    if !out.is_empty() && !out.ends_with(b"\n") {
+        out.extend_from_slice(eol);
+    }
+    for key in &changes.add {
+        out.extend_from_slice(hashed_line(host, port, key)?.as_bytes());
+        out.extend_from_slice(eol);
+    }
+    write_over(path, &out, Some(&raw))?;
+    Ok(changes)
+}
+
 /// What a known_hosts line is, as the known hosts manager lists it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LineKind {
@@ -875,6 +1035,107 @@ mod tests {
         for e in &l {
             assert_eq!(text.lines().nth(e.line - 1), Some(e.text.as_str()));
         }
+    }
+
+    #[test]
+    fn host_key_plan_adds_new_and_drops_old_keys() {
+        let ed = blob("ssh-ed25519", b"ed");
+        let ecdsa = blob("ecdsa-sha2-nistp256", b"ec");
+        let old_rsa = blob("rsa-sha2-512", b"old");
+        let bad = blob("ssh-ed25519", b"revoked");
+        let text = format!(
+            "{}\n{}\n{}\n@revoked {}\n",
+            line("web", &ed),
+            line("web", &old_rsa),
+            line("other", &old_rsa),
+            line("*", &bad)
+        );
+        let announced = vec![ed.clone(), ecdsa.clone(), bad.clone(), ecdsa.clone()];
+        let plan = plan_host_keys(&text, "web", 22, &ed, &announced).unwrap();
+        assert_eq!(plan.add, vec![ecdsa.clone()]);
+        assert_eq!(plan.remove, vec![old_rsa.clone()]);
+        // Nothing new, nothing gone.
+        let same = plan_host_keys(&text, "web", 22, &ed, &[ed.clone(), old_rsa.clone()]).unwrap();
+        assert!(same.is_empty());
+        // The key used must be listed by the server and held by the file.
+        assert!(plan_host_keys(&text, "web", 22, &ed, std::slice::from_ref(&ecdsa)).is_err());
+        assert!(plan_host_keys(&text, "web", 22, &ecdsa, &announced).is_err());
+        assert!(plan_host_keys(&text, "web", 2222, &ed, &announced).is_err());
+    }
+
+    #[test]
+    fn host_key_plan_leaves_shared_lines_alone() {
+        let ed = blob("ssh-ed25519", b"ed");
+        let new = blob("ecdsa-sha2-nistp256", b"ec");
+        for hosts in ["web,10.0.0.5", "web*", "*,!db"] {
+            let text = format!("{}\n", line(hosts, &ed));
+            let why = plan_host_keys(&text, "web", 22, &ed, &[ed.clone(), new.clone()]);
+            assert!(why.unwrap_err().contains("other hosts"), "{hosts}");
+        }
+        // A hashed line names one host.
+        let text = format!("{}\n", hashed_line("web", 22, &ed).unwrap());
+        let plan = plan_host_keys(&text, "WEB", 22, &ed, &[ed.clone(), new.clone()]).unwrap();
+        assert_eq!(plan.add, vec![new]);
+        // A non-standard port is its own name.
+        let text = format!("{}\n", line("[web]:2222", &ed));
+        assert!(plan_host_keys(&text, "web", 2222, &ed, std::slice::from_ref(&ed)).is_ok());
+    }
+
+    #[test]
+    fn host_key_update_rewrites_only_the_host() {
+        let dir = std::env::temp_dir().join(format!("ferossh-kh-upd-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("known_hosts");
+        let ed = blob("ssh-ed25519", b"ed");
+        let ecdsa = blob("ecdsa-sha2-nistp256", b"ec");
+        let old = blob("rsa-sha2-512", b"old");
+        let text = format!(
+            "# mine\r\n{} me@pc\r\n{}\r\n{}",
+            line("web", &ed),
+            line("web", &old),
+            line("db", &old)
+        );
+        fs::write(&path, &text).unwrap();
+        let announced = vec![ed.clone(), ecdsa.clone()];
+        // Not proven: nothing is written.
+        assert!(update_host_keys(&path, "web", 22, &ed, &announced, &[]).is_err());
+        assert_eq!(fs::read_to_string(&path).unwrap(), text);
+        let done = update_host_keys(
+            &path,
+            "web",
+            22,
+            &ed,
+            &announced,
+            std::slice::from_ref(&ecdsa),
+        )
+        .unwrap();
+        assert_eq!(done.add, vec![ecdsa.clone()]);
+        assert_eq!(done.remove, vec![old.clone()]);
+        let after = fs::read_to_string(&path).unwrap();
+        let lines: Vec<&str> = after.split("\r\n").collect();
+        assert_eq!(lines[0], "# mine");
+        assert_eq!(lines[1], format!("{} me@pc", line("web", &ed)));
+        assert_eq!(lines[2], line("db", &old));
+        assert!(lines[3].starts_with("|1|"));
+        assert_eq!(lines[4], "");
+        let kh = KnownHosts::parse(&after);
+        assert_eq!(kh.check("web", 22, &ecdsa), Status::Trusted);
+        assert_eq!(kh.check("web", 22, &ed), Status::Trusted);
+        assert!(!matches!(kh.check("web", 22, &old), Status::Trusted));
+        assert_eq!(kh.check("db", 22, &old), Status::Trusted);
+        // Run again: nothing left to do, the file stays as it is.
+        let again = update_host_keys(
+            &path,
+            "web",
+            22,
+            &ed,
+            &announced,
+            std::slice::from_ref(&ecdsa),
+        )
+        .unwrap();
+        assert!(again.is_empty());
+        assert_eq!(fs::read_to_string(&path).unwrap(), after);
+        fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

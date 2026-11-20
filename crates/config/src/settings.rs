@@ -16,6 +16,7 @@
 //! AgentAudit yes
 //! AnswerFromNotification yes
 //! ShiftEnter esc-enter
+//! EscapeChar ~
 //! AutoReconnect yes
 //! RemoteAppCopyAgent yes
 //! RemoteAppRemoveAgent no
@@ -129,7 +130,7 @@ use crate::hotkey::Hotkey;
 use crate::login::{SecretSource, Snippet, Step, parse_hotkey, valid_secret_name};
 use crate::password::PasswordSource;
 use crate::serial::LineSettings;
-use crate::ssh_config::split_line;
+use crate::ssh_config::{EscapeChar, split_line};
 
 /// How one host's panes look. Unset fields use the theme rules and
 /// defaults.
@@ -755,6 +756,10 @@ pub struct Settings {
     pub kitty_keyboard: bool,
     /// What Shift+Enter sends without the kitty keyboard protocol.
     pub shift_enter: ShiftEnterKey,
+    /// What starts an SSH escape sequence (`~.`, `~C`) after a new line in
+    /// an SSH pane; ssh_config's `EscapeChar` for a host wins. `~` unless
+    /// changed; `none` turns them off.
+    pub escape_char: EscapeChar,
     /// Coding agent panes are logged and recorded by themselves, sealed,
     /// as an audit trail of what the agent did on the host. Off unless
     /// turned on.
@@ -907,6 +912,7 @@ impl Default for Settings {
             agent_audit: false,
             answer_from_notification: false,
             shift_enter: ShiftEnterKey::Enter,
+            escape_char: EscapeChar::DEFAULT,
             follow_directory: true,
             transfer_layout: None,
             transfer_sort: None,
@@ -1289,6 +1295,13 @@ impl Settings {
                         .as_deref()
                         .and_then(ShiftEnterKey::parse)
                         .unwrap_or_default();
+                }
+                "escapechar" => {
+                    block = Block::Top;
+                    s.escape_char = first
+                        .as_deref()
+                        .and_then(EscapeChar::parse)
+                        .unwrap_or(EscapeChar::DEFAULT);
                 }
                 "bookmark" => {
                     block = Block::Top;
@@ -1719,6 +1732,7 @@ impl Settings {
         let _ = writeln!(out, "PortPreviews {}", flag(self.port_previews));
         let _ = writeln!(out, "KittyKeyboard {}", flag(self.kitty_keyboard));
         let _ = writeln!(out, "ShiftEnter {}", self.shift_enter.name());
+        let _ = writeln!(out, "EscapeChar {}", self.escape_char.text());
         let _ = writeln!(out, "AgentAudit {}", flag(self.agent_audit));
         let _ = writeln!(
             out,
@@ -2195,6 +2209,16 @@ NewKeyword later
             "off unless turned on"
         );
         assert_eq!(s.shift_enter, ShiftEnterKey::CsiU);
+        assert_eq!(Settings::default().escape_char, EscapeChar::Char(b'~'));
+        for text in ["none", "^]", "%"] {
+            let s = Settings::parse(&format!("EscapeChar {text}\n"));
+            assert_eq!(s.escape_char.text(), text);
+            assert_eq!(Settings::parse(&s.to_text()).escape_char, s.escape_char);
+        }
+        assert_eq!(
+            Settings::parse("EscapeChar xy\n").escape_char,
+            EscapeChar::DEFAULT
+        );
         assert_eq!(Settings::default().shift_enter, ShiftEnterKey::Enter);
         assert_eq!(
             Settings::parse("ShiftEnter esc-enter\n").shift_enter,

@@ -5,7 +5,8 @@
 //! `RemoteForward`, `DynamicForward`, `ForwardX11`, `GatewayPorts`,
 //! `ClearAllForwardings`), the session (`RemoteCommand`, `RequestTTY`,
 //! `SendEnv`, `SetEnv`), host keys (`StrictHostKeyChecking`,
-//! `UserKnownHostsFile`, `HostKeyAlias`, `VerifyHostKeyDNS`), how to get there (`ProxyJump`,
+//! `UserKnownHostsFile`, `HostKeyAlias`, `VerifyHostKeyDNS`, `UpdateHostKeys`), the
+//! `EscapeChar`, how to get there (`ProxyJump`,
 //! `ProxyCommand`, `AddressFamily`), Kerberos (`GSSAPIAuthentication`,
 //! `GSSAPIDelegateCredentials`, `GSSAPIServerIdentity`), `Include`d
 //! files, and the list of hosts the connection manager shows.
@@ -84,6 +85,12 @@ pub struct HostConfig {
     pub host_key_alias: Option<String>,
     /// `VerifyHostKeyDNS`: check the host key against SSHFP records.
     pub verify_host_key_dns: Option<VerifyHostKeyDns>,
+    /// `UpdateHostKeys`: learn the server's other host keys after the
+    /// login.
+    pub update_host_keys: Option<UpdateHostKeys>,
+    /// `EscapeChar`: what starts an escape sequence (`~.`) at the start of
+    /// a line.
+    pub escape_char: Option<EscapeChar>,
     pub address_family: Option<AddressFamily>,
     /// `GSSAPIAuthentication`: log in with Kerberos tickets. Unset means
     /// FeroSSH's own choice (when Windows logged on to a domain).
@@ -129,6 +136,59 @@ pub enum VerifyHostKeyDns {
     Ask,
     /// Do not look (the default).
     No,
+}
+
+/// `UpdateHostKeys`: whether to bring known_hosts up to date with the
+/// host keys a server lists after the login (OpenSSH's
+/// `hostkeys-00@openssh.com`), once it proved it holds them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UpdateHostKeys {
+    /// Add new keys and drop ones the server no longer has (the default).
+    Yes,
+    /// Do it only after the user agreed. FeroSSH says what changed and
+    /// leaves known_hosts alone instead of asking in a live terminal.
+    Ask,
+    No,
+}
+
+/// `EscapeChar`: the character that starts an escape sequence after a
+/// new line, as `~` does in `~.`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EscapeChar {
+    /// `none`: no escape sequences; every key goes to the host.
+    None,
+    /// A printable ASCII character, or a control character (`^]`).
+    Char(u8),
+}
+
+impl EscapeChar {
+    /// `~`, OpenSSH's default.
+    pub const DEFAULT: Self = Self::Char(b'~');
+
+    /// Parses `none`, a single printable character, or `^X` for a
+    /// control character.
+    pub fn parse(text: &str) -> Option<Self> {
+        let text = text.trim();
+        if text.eq_ignore_ascii_case("none") {
+            return Some(Self::None);
+        }
+        match text.as_bytes() {
+            [c] if c.is_ascii_graphic() => Some(Self::Char(*c)),
+            [b'^', c] if (b'@'..=b'_').contains(&c.to_ascii_uppercase()) => {
+                Some(Self::Char(c.to_ascii_uppercase() & 0x1f))
+            }
+            _ => None,
+        }
+    }
+
+    /// How it is written: `~`, `^]` or `none`.
+    pub fn text(self) -> String {
+        match self {
+            Self::None => "none".into(),
+            Self::Char(c) if c < 0x20 => format!("^{}", char::from(c | 0x40)),
+            Self::Char(c) => char::from(c).to_string(),
+        }
+    }
 }
 
 /// `AddressFamily`: which IP versions to connect over.
@@ -726,6 +786,18 @@ fn apply(
                         _ => None,
                     };
             }
+            "updatehostkeys" if cfg.update_host_keys.is_none() => {
+                cfg.update_host_keys = match args.first().map(|a| a.to_ascii_lowercase()).as_deref()
+                {
+                    Some("yes" | "true") => Some(UpdateHostKeys::Yes),
+                    Some("ask") => Some(UpdateHostKeys::Ask),
+                    Some("no" | "false") => Some(UpdateHostKeys::No),
+                    _ => None,
+                };
+            }
+            "escapechar" if cfg.escape_char.is_none() => {
+                cfg.escape_char = args.first().and_then(|a| EscapeChar::parse(a));
+            }
             "userknownhostsfile" if cfg.user_known_hosts_files.is_none() && !args.is_empty() => {
                 cfg.user_known_hosts_files = Some(match args.as_slice() {
                     [one] if one.eq_ignore_ascii_case("none") => Vec::new(),
@@ -970,6 +1042,25 @@ pub fn parse_destination(text: &str) -> Option<(Option<String>, String, Option<u
 #[allow(clippy::unwrap_used, clippy::indexing_slicing, clippy::panic)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reads_update_host_keys_and_escape_char() {
+        let c = resolve("UpdateHostKeys ask\nEscapeChar ^]\n", "x");
+        assert_eq!(c.update_host_keys, Some(UpdateHostKeys::Ask));
+        assert_eq!(c.escape_char, Some(EscapeChar::Char(0x1d)));
+        let c = resolve("UpdateHostKeys no\nEscapeChar none\n", "x");
+        assert_eq!(c.update_host_keys, Some(UpdateHostKeys::No));
+        assert_eq!(c.escape_char, Some(EscapeChar::None));
+        let c = resolve("UpdateHostKeys maybe\nEscapeChar ab\n", "x");
+        assert_eq!(c.update_host_keys, None);
+        assert_eq!(c.escape_char, None);
+        assert_eq!(EscapeChar::parse("%"), Some(EscapeChar::Char(b'%')));
+        assert_eq!(EscapeChar::parse("^a"), Some(EscapeChar::Char(1)));
+        assert_eq!(EscapeChar::parse(" "), None);
+        for e in ["~", "^]", "none", "#"] {
+            assert_eq!(EscapeChar::parse(e).unwrap().text(), e);
+        }
+    }
 
     #[test]
     fn sftp_addresses() {

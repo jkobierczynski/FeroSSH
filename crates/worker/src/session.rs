@@ -14,8 +14,10 @@
 //! asked for and hands them to [`crate::forward`].
 
 use std::collections::HashMap;
+use std::collections::VecDeque;
 use std::fmt;
 use std::future::Future;
+use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
@@ -23,8 +25,8 @@ use std::time::Duration;
 use ferossh_forward::proxy;
 use ferossh_forward::x11::{MIT_COOKIE, hex};
 use ferossh_ipc::{
-    ChannelId, Family, GssReply, MAX_DATA_CHUNK, Message, MoshOptions, PromptField, PromptKind,
-    ProxyKind, ProxyServer, Secrets, ShellOptions, Timing, WORKER_IDS, X11Auth,
+    ChannelId, Family, GssReply, MAX_DATA_CHUNK, MAX_HOST_KEYS, Message, MoshOptions, PromptField,
+    PromptKind, ProxyKind, ProxyServer, Secrets, ShellOptions, Timing, WORKER_IDS, X11Auth,
 };
 use russh::client::{self, AuthResult, DisconnectReason, Handle, KeyboardInteractiveAuthResponse};
 use russh::keys::agent::AgentIdentity;
@@ -439,6 +441,9 @@ struct Shared {
     /// The SSHFP lookup, started with the connection and reported just
     /// before the host key.
     dns: Option<DnsLookup>,
+    /// The server listed its host keys (`hostkeys-00@openssh.com`); a
+    /// second list is ignored.
+    announced: bool,
 }
 
 type SharedRef = Arc<Mutex<Shared>>;
@@ -621,6 +626,36 @@ impl client::Handler for Client {
                 .await;
         }
         Ok(())
+    }
+
+    /// UpdateHostKeys: the server lists all its host keys after the login.
+    /// The UI compares them with known_hosts and asks for proof of the
+    /// ones it lacks ([`Message::HostKeysProve`]); nothing is trusted on
+    /// the list alone. RSA keys below the policy's size are left out, as
+    /// they would be refused as host keys.
+    async fn openssh_ext_host_keys_announced(
+        &mut self,
+        keys: Vec<PublicKey>,
+        _session: &mut client::Session,
+    ) -> Result<(), Failure> {
+        if with(&self.shared, |s| std::mem::replace(&mut s.announced, true)) != Some(false) {
+            return Ok(());
+        }
+        let keys: Vec<Vec<u8>> = keys
+            .iter()
+            .filter(|k| check_key_size(k.key_data(), "host key").is_ok())
+            .filter_map(|k| k.to_bytes().ok())
+            .filter(|k| !k.is_empty())
+            .take(MAX_HOST_KEYS)
+            .collect();
+        if keys.is_empty() {
+            return Ok(());
+        }
+        let msg = Message::HostKeysAnnounced {
+            channel: self.channel,
+            keys,
+        };
+        self.out.send(msg).await.map_err(|_| Failure::Cancelled)
     }
 
     async fn disconnected(&mut self, reason: DisconnectReason<Failure>) -> Result<(), Failure> {
@@ -811,6 +846,9 @@ struct Ctx {
     options: ShellOptions,
     /// The connection's forwarding state, once logged in.
     forwards: Option<Arc<ConnForwards>>,
+    /// Requests for the connection ([`ConnTasks`]) that came while a
+    /// login step was running, for the channel's loop to take.
+    deferred: Vec<Message>,
 }
 
 impl Ctx {
@@ -866,6 +904,13 @@ async fn drive<T>(
                         }
                     }
                     Some(Message::Resize { cols, rows, .. }) => ctx.size = (cols, rows),
+                    // The server may list its host keys while the shell
+                    // is still opening, and the UI answer at once.
+                    Some(m @ (Message::HostKeysProve { .. } | Message::Rekey { .. })) => {
+                        if ctx.deferred.len() < ConnTasks::MAX_QUEUED {
+                            ctx.deferred.push(m);
+                        }
+                    }
                     // Typing before the shell is open goes nowhere, as in ssh.
                     Some(_) => {}
                 }
@@ -899,6 +944,7 @@ pub async fn run(
         x11: params.x11.clone(),
         options: params.options.clone(),
         forwards: None,
+        deferred: Vec::new(),
     };
     let result = session(&params, &mut inbox, tunnel, &mut ctx, &connections).await;
     let server_said = with(&shared, |s| s.server_said.take()).flatten();
@@ -983,6 +1029,7 @@ pub async fn open(
         x11,
         options,
         forwards: None,
+        deferred: Vec::new(),
     };
     let result = match connections.get(connection) {
         Some((conn, names, forwards)) => {
@@ -1124,17 +1171,23 @@ async fn carry(
 ) -> Result<Ended, Failure> {
     ctx.send(connected(ctx)).await?;
     let mut alive = forwards.alive();
+    let mut tasks = ConnTasks::new(&conn, std::mem::take(&mut ctx.deferred));
     let lost = loop {
         tokio::select! {
             msg = inbox.recv() => match msg {
                 None | Some(Message::Close { .. }) => break false,
-                Some(_) => {}
+                Some(m) => {
+                    tasks.take(m);
+                }
             },
+            reply = tasks.next() => ctx.send(reply).await?,
             gone = alive.changed() => if gone.is_err() {
                 break true;
             },
         }
     };
+    // A proof still running no longer matters.
+    drop(tasks);
     let ended = match Arc::into_inner(conn) {
         Some(handle) => {
             let _ = handle.disconnect(Disconnect::ByApplication, "", "en").await;
@@ -1395,6 +1448,108 @@ async fn shell(
     }
 }
 
+/// A request's work, borrowing the connection.
+type Task<'a> = Pin<Box<dyn Future<Output = Option<Message>> + Send + 'a>>;
+
+/// What the UI asks of the connection itself rather than of a channel:
+/// `~R`'s new key exchange, and the proof of host keys the server
+/// announced (UpdateHostKeys). It runs beside a channel's loop, one
+/// request at a time, and borrows the connection that loop holds, so it
+/// never keeps the connection open after its last channel.
+struct ConnTasks<'a> {
+    conn: &'a Connection,
+    queue: VecDeque<Message>,
+    busy: Option<Task<'a>>,
+}
+
+impl<'a> ConnTasks<'a> {
+    /// Requests that may wait their turn; more are dropped (the UI sends
+    /// one proof request per login, and `~R` is typed).
+    const MAX_QUEUED: usize = 4;
+
+    fn new(conn: &'a Connection, deferred: Vec<Message>) -> Self {
+        let mut tasks = Self {
+            conn,
+            queue: VecDeque::new(),
+            busy: None,
+        };
+        for m in deferred {
+            tasks.take(m);
+        }
+        tasks
+    }
+
+    /// Queues `msg` if it is a request for the connection; any other
+    /// message is handed back.
+    fn take(&mut self, msg: Message) -> Option<Message> {
+        match msg {
+            Message::Rekey { .. } | Message::HostKeysProve { .. } => {
+                if self.queue.len() < Self::MAX_QUEUED {
+                    self.queue.push_back(msg);
+                }
+                None
+            }
+            other => Some(other),
+        }
+    }
+
+    /// Runs the queued requests; resolves with the next answer for the
+    /// UI. Pending while there is nothing to do. Cancel-safe: the running
+    /// request is kept across calls.
+    async fn next(&mut self) -> Message {
+        loop {
+            if self.busy.is_none() {
+                match self.queue.pop_front() {
+                    Some(m) => self.busy = Some(self.start(m)),
+                    None => std::future::pending::<()>().await,
+                }
+            }
+            if let Some(task) = &mut self.busy {
+                let answer = task.await;
+                self.busy = None;
+                if let Some(answer) = answer {
+                    return answer;
+                }
+            }
+        }
+    }
+
+    fn start(&self, msg: Message) -> Task<'a> {
+        let conn = self.conn;
+        match msg {
+            Message::HostKeysProve { channel, keys } => Box::pin(async move {
+                let error = match keys
+                    .iter()
+                    .map(|k| PublicKey::from_bytes(k))
+                    .collect::<Result<Vec<_>, _>>()
+                {
+                    Err(_) => "a key to prove is malformed".to_owned(),
+                    Ok(parsed) => match conn.hostkeys_prove(parsed).await {
+                        Ok(()) => String::new(),
+                        Err(russh::Error::RequestDenied) => {
+                            "the server refused to prove it holds them".to_owned()
+                        }
+                        Err(russh::Error::WrongServerSig) => {
+                            "a signature in the server's proof does not verify".to_owned()
+                        }
+                        Err(e) => e.to_string(),
+                    },
+                };
+                Some(Message::HostKeysProven {
+                    channel,
+                    keys,
+                    error,
+                })
+            }),
+            Message::Rekey { .. } => Box::pin(async move {
+                let _ = conn.rekey_soon().await;
+                None
+            }),
+            _ => Box::pin(async { None }),
+        }
+    }
+}
+
 async fn pump(
     conn: &Connection,
     inbox: &mut mpsc::Receiver<Message>,
@@ -1461,6 +1616,7 @@ async fn pump(
 
     let mut zm = Zmodem::new(ctx.channel);
     let mut heard = Instant::now();
+    let mut tasks = ConnTasks::new(conn, std::mem::take(&mut ctx.deferred));
     let result = loop {
         let wake = zm.patience().map(|p| heard + p);
         let step = tokio::select! {
@@ -1502,9 +1658,15 @@ async fn pump(
                 None => break Ok(Closed::Lost),
                 Some(_) => continue,
             },
-            msg = inbox.recv() => match msg {
-                None | Some(Message::Close { .. }) => break Err(Failure::Cancelled),
-                Some(m) => match zm.on_ui(&m) {
+            reply = tasks.next() => {
+                ctx.send(reply).await?;
+                continue;
+            }
+            msg = inbox.recv() => match msg.map(|m| tasks.take(m)) {
+                None | Some(Some(Message::Close { .. })) => break Err(Failure::Cancelled),
+                // Taken by the connection's tasks.
+                Some(None) => continue,
+                Some(Some(m)) => match zm.on_ui(&m) {
                     Some(step) => {
                         heard = Instant::now();
                         step

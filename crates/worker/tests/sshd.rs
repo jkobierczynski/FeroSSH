@@ -192,6 +192,10 @@ struct Seen {
     signed: usize,
     /// A host certificate's CA, principals, key id and serial.
     cert: Option<(Vec<u8>, Vec<String>, String, u64)>,
+    /// The host keys the server listed after the login.
+    announced: Vec<Vec<u8>>,
+    /// The proof of them: empty when it checked out.
+    proven: Option<String>,
 }
 
 /// Plays the UI for one connection until the worker reports it is gone.
@@ -288,6 +292,14 @@ async fn run_ui_with(server: &Server, command: &str, trust: bool, known: Vec<Str
                 })
                 .await;
             }
+            Message::HostKeysAnnounced { keys, .. } => {
+                seen.announced = keys.clone();
+                send(Message::HostKeysProve { channel: 1, keys }).await;
+            }
+            Message::HostKeysProven { keys, error, .. } => {
+                assert_eq!(keys, seen.announced);
+                seen.proven = Some(error);
+            }
             Message::Connected {
                 kex,
                 cipher,
@@ -295,6 +307,9 @@ async fn run_ui_with(server: &Server, command: &str, trust: bool, known: Vec<Str
                 ..
             } => {
                 seen.connected = Some((kex, cipher, host_key));
+                // A new key exchange (`~R`) while the shell runs changes
+                // nothing the shell sees.
+                send(Message::Rekey { channel: 1 }).await;
                 send(Message::Data {
                     channel: 1,
                     bytes: command.as_bytes().to_vec(),
@@ -334,6 +349,24 @@ async fn logs_in_with_a_key_and_runs_a_shell() {
     );
     assert_eq!(cipher, "chacha20-poly1305@openssh.com");
     assert_eq!(host_key, "ssh-ed25519");
+}
+
+/// UpdateHostKeys: OpenSSH lists its host keys after the login, and
+/// proves it holds them when asked; a new key exchange (`~R`) on the way
+/// breaks nothing.
+#[tokio::test]
+async fn proves_the_host_keys_it_announces() {
+    if !available() {
+        return;
+    }
+    let server = start("hostkeys", "");
+    let seen = run_ui(&server, "sleep 1; echo done; exit\n", true).await;
+    assert!(
+        String::from_utf8_lossy(&seen.output).contains("done"),
+        "{seen:?}"
+    );
+    assert_eq!(seen.announced, vec![server.host_key.clone()], "{seen:?}");
+    assert_eq!(seen.proven.as_deref(), Some(""), "{seen:?}");
 }
 
 /// With a CA for the host in known_hosts, the server's host certificate
@@ -531,7 +564,7 @@ async fn second_shell_shares_the_connection() {
                 let i = usize::from(channel == 2);
                 output[i].extend_from_slice(&bytes);
             }
-            Message::ExitStatus { .. } => {}
+            Message::ExitStatus { .. } | Message::HostKeysAnnounced { .. } => {}
             Message::Disconnected { channel: 1, reason } => {
                 assert!(reason.contains("stays open"), "{reason}");
                 ended[0] = Some(reason);
