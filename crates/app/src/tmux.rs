@@ -691,6 +691,18 @@ impl Tmux {
         }
     }
 
+    /// After a dropped connection: whether session `name`, to attach
+    /// again, was on the shared server (forgotten here).
+    pub fn take_reattach_shared(&mut self, name: &str) -> bool {
+        self.reattach_shared.take().as_deref() == Some(name)
+    }
+
+    /// The next [`Tmux::attach`] of session `name` goes to the shared
+    /// server, as it was before the connection dropped.
+    pub fn reattach_on_shared(&mut self, name: &str) {
+        self.reattach_shared = Some(name.to_owned());
+    }
+
     /// The session attached runs on this account's shared server.
     pub fn on_shared_server(&self) -> bool {
         self.on_shared && self.client.is_control()
@@ -893,6 +905,17 @@ impl Tmux {
                 .filter(|_| self.joined.is_none())
                 .map(|(_, n)| n.clone());
             self.reattach_shared = self.reattach.clone().filter(|_| self.on_shared);
+            // A shared session whose name the share line would change is
+            // not attached again at all: never the private server's
+            // session of that name, nor another shared one.
+            if self
+                .reattach_shared
+                .as_deref()
+                .is_some_and(|n| command::session_name(n) != n)
+            {
+                self.reattach = None;
+                self.reattach_shared = None;
+            }
             self.client.reset();
             self.after_detach = None;
             self.teardown(ws, &mut out);
@@ -2615,6 +2638,39 @@ mod tests {
             t.attach("other", false),
             command::attach_line("other").into_bytes()
         );
+    }
+
+    #[test]
+    fn shared_reattach_survives_a_new_watcher_but_not_an_odd_name() {
+        let (mut t, mut ws, _, _) =
+            attached_after("3.4", |t| t.share("pair", share(&["bob"], true)));
+        t.feed(
+            &mut ws,
+            &reply(5, &["/tmp/ferossh-share-alice/default".into()]),
+        );
+        let _ = t.connection_lost(&mut ws);
+        let name = t.reattach.take().unwrap();
+        assert!(t.take_reattach_shared(&name));
+        // The window makes a new watcher for the next login.
+        let (_, gateway) = Workspace::new();
+        let mut fresh = Tmux::new(gateway, Mode::Ferossh, 100);
+        fresh.reattach_on_shared(&name);
+        assert_eq!(
+            fresh.attach(&name, false),
+            command::share_line(&name).into_bytes()
+        );
+
+        // A session switched to on the shared server, named so that the
+        // share line would change it: not attached again anywhere.
+        let (mut t, mut ws, _, _) =
+            attached_after("3.4", |t| t.share("pair", share(&["bob"], true)));
+        t.feed(
+            &mut ws,
+            &reply(5, &["/tmp/ferossh-share-alice/default".into()]),
+        );
+        t.feed(&mut ws, b"%session-changed $3 x y\n");
+        let _ = t.connection_lost(&mut ws);
+        assert_eq!(t.reattach, None);
     }
 
     #[test]

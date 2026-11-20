@@ -1381,7 +1381,7 @@ struct Window {
     tmux: HashMap<PaneId, Tmux>,
     /// SSH panes whose connection dropped while tmux ran: the host's
     /// queue key and the session to attach again after the next login.
-    reattach: HashMap<PaneId, (String, String)>,
+    reattach: HashMap<PaneId, (String, String, bool)>,
     /// The pane of the Windows notification on screen (or last on
     /// screen): clicking it shows that pane.
     toast_pane: Option<PaneId>,
@@ -4139,7 +4139,10 @@ impl Window {
         };
         let actions = t.connection_lost(&mut self.ws);
         if let (Some(name), Some(key)) = (t.reattach.take(), key) {
-            self.reattach.insert(id, (key, name));
+            // The pane's tmux watcher may be made anew before the login:
+            // whether the session was on the shared server goes along.
+            let shared = t.take_reattach_shared(&name);
+            self.reattach.insert(id, (key, name, shared));
         }
         self.run_tmux(id, actions);
     }
@@ -4166,8 +4169,12 @@ impl Window {
         if !workspace {
             self.workspace_tmux.remove(&id);
         }
+        let mut shared = false;
         let (name, rebuild) = match self.reattach.remove(&id) {
-            Some((k, name)) if k == key => (name, None),
+            Some((k, name, on_shared)) if k == key => {
+                shared = on_shared;
+                (name, None)
+            }
             _ => match self.workspace_tmux.get(&id) {
                 Some(w) => (w.name.clone(), w.rebuild.clone()),
                 None => match profile {
@@ -4197,6 +4204,15 @@ impl Window {
         // The plan stays (saving keeps its panes) until tmux shows them.
         if let Some(line) = rebuild {
             self.send_host(id, line.as_bytes());
+        }
+        if shared {
+            if !self.tmux.contains_key(&id) {
+                let t = self.new_tmux(id);
+                self.tmux.insert(id, t);
+            }
+            if let Some(t) = self.tmux.get_mut(&id) {
+                t.reattach_on_shared(&name);
+            }
         }
         self.attach_tmux(id, &name, false)
     }
@@ -14871,7 +14887,13 @@ impl Window {
                 if whole && !tmux.insert(g) {
                     return None;
                 }
-                let session = t.and_then(Tmux::session_name).map(str::to_owned);
+                // Someone else's session, or one on the shared server, is
+                // not attached again by name: that would find the private
+                // server's session of that name.
+                let session = t
+                    .filter(|t| t.joined().is_none() && !t.on_shared_server())
+                    .and_then(Tmux::session_name)
+                    .map(str::to_owned);
                 (self.panes.get(&g)?, Some((session, whole)))
             }
             None => (p, None),
