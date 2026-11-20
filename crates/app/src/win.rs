@@ -14639,8 +14639,17 @@ impl Window {
         if old.is_empty() {
             return;
         }
+        // Every listed connection (saved, from ~/.ssh/config or imports:
+        // a workspace may log in to any of them) and every profile.
         let mut names: Vec<String> = load_saved().into_iter().map(|h| h.alias).collect();
         names.extend(self.settings.profiles.iter().map(|p| p.host.clone()));
+        if self.settings.workspace_auto_login {
+            names.extend(
+                host_items(&ssh_env(), &self.settings)
+                    .into_iter()
+                    .map(|h| h.name),
+            );
+        }
         let in_use = self.windows_targets_of(&names);
         let mut done: Vec<String> = Vec::new();
         for t in old {
