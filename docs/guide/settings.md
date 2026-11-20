@@ -168,7 +168,7 @@ Profile core-console
 
 ## Credentials
 
-A `Credential` block is a named login that many connections share. A profile names it with `Credential NAME`. Whatever the block sets (user, key file, password source) wins over the connection's own; whatever it leaves out does not. Names use letters, digits, `.`, `_` and `-`. The connection manager's **Credentials...** menu edits these blocks.
+A `Credential` block is a named login that many connections share. A profile names it with `Credential NAME`. Whatever the block sets (user, key file, password source) wins over the connection's own; whatever it leaves out does not. Names use letters, digits, `.`, `_` and `-`. Tools > Credential manager edits these blocks.
 
 ```
 Credential ops-admin

@@ -27,6 +27,7 @@ pub enum RailItem {
     Snippets,
     KnownHosts,
     Inventory,
+    Credentials,
     /// At the bottom: the command palette.
     Palette,
     /// At the bottom, last: keep the tool open (pinned) or let the
@@ -35,7 +36,7 @@ pub enum RailItem {
 }
 
 impl RailItem {
-    pub const ALL: [RailItem; 9] = [
+    pub const ALL: [RailItem; 10] = [
         RailItem::Connections,
         RailItem::Sessions,
         RailItem::Files,
@@ -43,6 +44,7 @@ impl RailItem {
         RailItem::Snippets,
         RailItem::KnownHosts,
         RailItem::Inventory,
+        RailItem::Credentials,
         RailItem::Palette,
         RailItem::Pin,
     ];
@@ -57,6 +59,7 @@ impl RailItem {
             RailItem::Snippets => "Scripts",
             RailItem::KnownHosts => "Known hosts",
             RailItem::Inventory => "Inventory",
+            RailItem::Credentials => "Credential manager",
             RailItem::Palette => "Command palette",
             RailItem::Pin if pinned => "Tools stay open (click: the terminal covers them again)",
             RailItem::Pin => "Tools cover again after use (click: keep them open)",
@@ -75,6 +78,7 @@ impl RailItem {
             RailItem::Snippets => '\u{E943}',      // Code
             RailItem::KnownHosts => '\u{E72E}',    // Lock
             RailItem::Inventory => '\u{E8FD}',     // BulletedList
+            RailItem::Credentials => '\u{E8D7}',   // Permissions (a key)
             RailItem::Palette => '\u{E721}',       // Search
             RailItem::Pin if pinned => '\u{E840}', // Pinned
             RailItem::Pin => '\u{E718}',           // Pin
@@ -85,6 +89,18 @@ impl RailItem {
         matches!(self, RailItem::Palette | RailItem::Pin)
     }
 }
+
+/// The tools' buttons, from the top.
+const TOP: [RailItem; 8] = [
+    RailItem::Connections,
+    RailItem::Sessions,
+    RailItem::Files,
+    RailItem::Forwards,
+    RailItem::Snippets,
+    RailItem::KnownHosts,
+    RailItem::Inventory,
+    RailItem::Credentials,
+];
 
 /// Where rail button `item` is, in the rail's own coordinates: square
 /// buttons `rail` pixels wide, the tools from the top and the palette
@@ -100,16 +116,7 @@ pub fn item_rect(item: RailItem, rail: i32, height: i32) -> Rect {
         let y = height - pad - size - from_bottom * step;
         Rect::new(pad, y, size, size)
     } else {
-        let tools = [
-            RailItem::Connections,
-            RailItem::Sessions,
-            RailItem::Files,
-            RailItem::Forwards,
-            RailItem::Snippets,
-            RailItem::KnownHosts,
-            RailItem::Inventory,
-        ];
-        Rect::new(pad, pad + index(&tools) * step, size, size)
+        Rect::new(pad, pad + index(&TOP) * step, size, size)
     }
 }
 
@@ -125,7 +132,8 @@ pub fn item_at(x: i32, y: i32, rail: i32, height: i32) -> Option<RailItem> {
 /// Whether a rail button is shown: a bottom one gives way when it would
 /// overlap the top ones. Painting, clicks and tooltips all go by this.
 pub fn item_shown(item: RailItem, rail: i32, height: i32) -> bool {
-    let top_end = item_rect(RailItem::Inventory, rail, height).bottom();
+    let last = TOP.last().copied().unwrap_or(RailItem::Connections);
+    let top_end = item_rect(last, rail, height).bottom();
     !item.at_bottom() || item_rect(item, rail, height).y >= top_end
 }
 
@@ -412,6 +420,10 @@ mod tests {
         assert_eq!(
             item_at(20, 5 + 6 * 35 + 10, 40, 600),
             Some(RailItem::Inventory)
+        );
+        assert_eq!(
+            item_at(20, 5 + 7 * 35 + 10, 40, 600),
+            Some(RailItem::Credentials)
         );
         assert_eq!(item_at(20, 600 - 5 - 10, 40, 600), Some(RailItem::Pin));
         assert_eq!(

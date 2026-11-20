@@ -137,29 +137,6 @@ pub fn remove(settings: &mut Settings, name: &str) -> Vec<String> {
     users
 }
 
-/// A credential as its menu lists it: `ops-admin: ops, key, Windows (3)`.
-pub fn label(settings: &Settings, c: &Credential) -> String {
-    let mut parts: Vec<String> = Vec::new();
-    if let Some(u) = &c.user {
-        parts.push(u.clone());
-    }
-    if c.key.is_some() {
-        parts.push("key file".into());
-    }
-    match &c.password {
-        PasswordSource::Ask => {}
-        PasswordSource::Windows => parts.push("Windows password".into()),
-        PasswordSource::Command(_) => parts.push("password manager".into()),
-    }
-    let n = settings.credential_users(&c.name).len();
-    format!(
-        "{}: {} ({n} connection{})",
-        c.name,
-        parts.join(", "),
-        if n == 1 { "" } else { "s" }
-    )
-}
-
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::indexing_slicing)]
 mod tests {
@@ -206,10 +183,6 @@ mod tests {
         let c = s.credential("ops-admin").unwrap();
         assert_eq!(c.key.as_deref(), Some("C:\\Keys\\ops"));
         assert_eq!(Typed::of(c).source, "op read x");
-        assert_eq!(
-            label(&s, c),
-            "ops-admin: ops, key file, password manager (2 connections)"
-        );
 
         assert_eq!(remove(&mut s, "OPS-ADMIN"), ["web", "db"]);
         assert!(s.credentials.is_empty());

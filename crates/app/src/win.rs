@@ -122,6 +122,7 @@ use crate::clipboard;
 use crate::conn_view;
 use crate::conpty::{self, Output, Shell};
 use crate::copy_id;
+use crate::credential_panel;
 use crate::credman;
 use crate::custom_theme::{self, CustomTheme};
 use crate::desktop::{Desktop, Protocol, Update as DesktopUpdate};
@@ -616,6 +617,8 @@ mod cmd {
     pub const DESKTOP_SELECTION: u32 = 638;
     /// Tools > New SSH key.
     pub const NEW_KEY: u32 = 639;
+    /// Tools > Credential manager.
+    pub const CREDENTIAL_MANAGER: u32 = 680;
     /// Session > Copy public key to this server.
     pub const COPY_ID: u32 = 640;
     /// Session > Logs and recordings > Record this pane (asciicast), and Play a recording.
@@ -1253,6 +1256,8 @@ enum SideView {
     KnownHosts,
     /// The connection inventory (native controls only).
     Inventory,
+    /// The credential manager (native controls only).
+    Credentials,
     /// The command palette, shown over whatever the side pane showed.
     Palette,
 }
@@ -2853,6 +2858,7 @@ fn create_and_run(launch: Launch, theme: Option<String>) -> Result<()> {
                 RailItem::Snippets => cmd::SNIPPETS,
                 RailItem::KnownHosts => cmd::KNOWN_HOSTS,
                 RailItem::Inventory => cmd::INVENTORY,
+                RailItem::Credentials => cmd::CREDENTIAL_MANAGER,
                 RailItem::Palette => cmd::PALETTE,
                 RailItem::Pin => cmd::TOOLS_PIN,
             });
@@ -2877,6 +2883,8 @@ fn create_and_run(launch: Launch, theme: Option<String>) -> Result<()> {
         let _ = known_hosts_panel::create(hwnd, known_hosts_event, dpi);
         // The inventory's, likewise.
         let _ = inventory_panel::create(hwnd, inventory_event, dpi);
+        // The credential manager's, likewise.
+        let _ = credential_panel::create(hwnd, credential_event, dpi);
         // The scripts pane's, likewise.
         let _ = scripts_panel::create(hwnd, scripts_event, dpi);
         // The script editor's, likewise.
@@ -2983,6 +2991,7 @@ fn create_and_run(launch: Launch, theme: Option<String>) -> Result<()> {
                 || fwd_panel::pre_translate(&msg)
                 || known_hosts_panel::pre_translate(&msg)
                 || inventory_panel::pre_translate(&msg)
+                || credential_panel::pre_translate(&msg)
                 || scripts_panel::pre_translate(&msg)
                 || script_editor::pre_translate(&msg)
                 || script_args::pre_translate(&msg)
@@ -3347,6 +3356,7 @@ fn build_menu() -> Result<HMENU> {
         item(tools, cmd::INVENTORY, "&Inventory\tCtrl+Shift+I")?;
         item(tools, cmd::SNIPPET_FOLDER, "Open scripts f&older")?;
         separator(tools)?;
+        item(tools, cmd::CREDENTIAL_MANAGER, "Cre&dential manager")?;
         item(tools, cmd::NEW_KEY, "New SSH &key...")?;
         item(tools, cmd::PALETTE, "Command p&alette\tCtrl+Shift+A")?;
 
@@ -12138,6 +12148,7 @@ impl Window {
             SideView::Snippets => RailItem::Snippets,
             SideView::KnownHosts => RailItem::KnownHosts,
             SideView::Inventory => RailItem::Inventory,
+            SideView::Credentials => RailItem::Credentials,
             SideView::Palette => RailItem::Palette,
         });
         rail::Look {
@@ -12205,6 +12216,17 @@ impl Window {
     /// Whether the inventory shows (always native controls).
     fn inventory_native(&self) -> bool {
         self.side.visible && self.side.view == SideView::Inventory
+    }
+
+    /// Reads the credentials and saved passwords again for Tools >
+    /// Credential manager, and shows them.
+    fn reload_credentials(&mut self) {
+        credential_panel::set_rows(self.credential_rows());
+    }
+
+    /// Whether the credential manager shows (always native controls).
+    fn credentials_native(&self) -> bool {
+        self.side.visible && self.side.view == SideView::Credentials
     }
 
     /// Whether port forwards show as native controls.
@@ -12309,6 +12331,8 @@ impl Window {
             known_hosts_panel::has_focus()
         } else if self.inventory_native() {
             inventory_panel::has_focus()
+        } else if self.credentials_native() {
+            credential_panel::has_focus()
         } else if self.scripts_native() {
             scripts_panel::has_focus()
         } else if self.script_editor_native() {
@@ -12390,6 +12414,11 @@ impl Window {
             inventory_panel::place(self.areas.side, self.areas.side_width, self.dpi);
         } else {
             inventory_panel::place(None, 0, self.dpi);
+        }
+        if self.credentials_native() {
+            credential_panel::place(self.areas.side, self.areas.side_width, self.dpi);
+        } else {
+            credential_panel::place(None, 0, self.dpi);
         }
         if self.scripts_native() {
             scripts_panel::seed_folds(self.settings.expanded_script_cats.clone());
@@ -12495,6 +12524,7 @@ impl Window {
             || self.fwd_native()
             || self.known_hosts_native()
             || self.inventory_native()
+            || self.credentials_native()
             || self.scripts_native()
             || self.script_editor_native()
             || self.script_args_native()
@@ -12596,8 +12626,11 @@ impl Window {
                     );
                 }
                 // Native controls (`files_panel`, `known_hosts_panel`,
-                // `inventory_panel`).
-                SideView::Files | SideView::KnownHosts | SideView::Inventory => {}
+                // `inventory_panel`, `credential_panel`).
+                SideView::Files
+                | SideView::KnownHosts
+                | SideView::Inventory
+                | SideView::Credentials => {}
             }
             self.invalidate_grid(side);
         }
@@ -13545,6 +13578,7 @@ impl Window {
                 RailItem::Snippets => cmd::SNIPPETS,
                 RailItem::KnownHosts => cmd::KNOWN_HOSTS,
                 RailItem::Inventory => cmd::INVENTORY,
+                RailItem::Credentials => cmd::CREDENTIAL_MANAGER,
                 RailItem::Palette => cmd::PALETTE,
                 RailItem::Pin => return String::new(),
             };
@@ -13880,6 +13914,11 @@ impl Window {
         self.side.visible && self.side.focused && self.side.view == SideView::Inventory
     }
 
+    /// Whether a paste is for the credential manager.
+    fn credentials_paste(&self) -> bool {
+        self.side.visible && self.side.focused && self.side.view == SideView::Credentials
+    }
+
     fn paste_side(&mut self, text: &str) -> bool {
         if self.side.visible
             && self.side.focused
@@ -13894,7 +13933,7 @@ impl Window {
         // event needs the window, so the paste comes after this borrow);
         // the list has nowhere to paste into, and the terminal behind must
         // not get it either.
-        if self.known_hosts_paste() || self.inventory_paste() {
+        if self.known_hosts_paste() || self.inventory_paste() || self.credentials_paste() {
             return true;
         }
         if !(self.side.visible && self.side.focused && self.side.view == SideView::Snippets) {
@@ -15448,6 +15487,81 @@ impl Window {
             })
             .filter_map(|n| self.saved_password_target_in(n, &env))
             .collect()
+    }
+
+    /// Tools > Credential manager's rows: every named credential with the
+    /// connections that pick it, and every password FeroSSH keeps (in the
+    /// Windows Credential Manager or the vault) with the connections whose
+    /// login keeps it there. No password is kept in a row.
+    fn credential_rows(&self) -> Vec<crate::credential_view::Row> {
+        use crate::credential_view::{Place, credential_rows, password_row};
+        let mut rows = credential_rows(&self.settings);
+        let env = ssh_env();
+        // Which connection keeps its password where, as the cleanup counts
+        // them: listed ones set to Windows, and with Log in automatically
+        // on what the saved workspaces open, asking ones too.
+        let mut users: HashMap<String, Vec<String>> = HashMap::new();
+        let mut add = |name: String, ask_too: bool| {
+            let keeps = match self.settings.password_source(&name) {
+                PasswordSource::Windows => true,
+                PasswordSource::Ask => ask_too,
+                PasswordSource::Command(_) => false,
+            };
+            if let Some(t) = keeps
+                .then(|| self.saved_password_target_in(&name, &env))
+                .flatten()
+            {
+                let list = users.entry(t).or_default();
+                if !list.iter().any(|n| n.eq_ignore_ascii_case(&name)) {
+                    list.push(name);
+                }
+            }
+        };
+        for h in load_saved() {
+            add(h.alias, false);
+        }
+        for p in &self.settings.profiles {
+            add(p.host.clone(), false);
+        }
+        for h in host_items(&env, &self.settings) {
+            add(h.name, false);
+        }
+        if self.settings.workspace_auto_login {
+            for n in ferossh_config::workspace::all_connections(&workspaces_dir()) {
+                add(n, true);
+            }
+        }
+        let mut saved: Vec<(String, String, Place)> = Vec::new();
+        let mut keep = |target: String, user: String, windows: bool| {
+            let at = match saved.iter().position(|e| e.0 == target) {
+                Some(i) => i,
+                None => {
+                    saved.push((target, user, Place::default()));
+                    saved.len() - 1
+                }
+            };
+            if let Some(e) = saved.get_mut(at) {
+                if windows {
+                    e.2.windows = true;
+                } else {
+                    e.2.vault = true;
+                }
+            }
+        };
+        // A portable FeroSSH leaves the PC's own passwords alone.
+        if !crate::portable::is_portable() {
+            for s in credman::os_list() {
+                keep(s.target.clone(), s.user.clone(), true);
+            }
+        }
+        for s in crate::vault::secrets() {
+            keep(s.target.clone(), s.user.clone(), false);
+        }
+        for (target, user, place) in saved {
+            let used = users.remove(&target).unwrap_or_default();
+            rows.extend(password_row(&target, &user, place, used));
+        }
+        rows
     }
 
     /// Forgets the Windows-stored passwords under `old` that no saved
@@ -17075,6 +17189,7 @@ impl Window {
             SideView::Forwards | SideView::Palette => {}
             SideView::KnownHosts => self.reload_known_hosts(),
             SideView::Inventory => self.reload_inventory(),
+            SideView::Credentials => self.reload_credentials(),
             SideView::Live => {
                 let all = self.open_sessions();
                 self.live_view.reset(&all);
@@ -17115,6 +17230,7 @@ impl Window {
             cmd::LIVE => SideView::Live,
             cmd::KNOWN_HOSTS => SideView::KnownHosts,
             cmd::INVENTORY => SideView::Inventory,
+            cmd::CREDENTIAL_MANAGER => SideView::Credentials,
             _ => SideView::Sessions,
         };
         let open = self.side.visible && self.side.view == view;
@@ -19725,6 +19841,10 @@ impl Window {
                     cmd::INVENTORY,
                     self.side.visible && self.side.view == SideView::Inventory,
                 ),
+                (
+                    cmd::CREDENTIAL_MANAGER,
+                    self.side.visible && self.side.view == SideView::Credentials,
+                ),
                 (cmd::FOLLOW_CD, s.follow_directory),
                 (cmd::VERIFY, s.verify_transfers),
                 (cmd::ZMODEM, s.zmodem),
@@ -21564,6 +21684,7 @@ enum Command {
     LogRequired(PaneId),
     /// Tools > New SSH key: the window that asks what to make.
     NewKey,
+    /// Tools > Credential manager.
     /// Settings > Key bindings: the window that changes them.
     KeyBindings,
     /// File > Import and export > Export connections, Import encrypted connections and the
@@ -22539,6 +22660,7 @@ fn tools_have_focus() -> bool {
         || script_report::has_focus()
         || known_hosts_panel::has_focus()
         || inventory_panel::has_focus()
+        || credential_panel::has_focus()
 }
 
 /// Carries out what the user did on a script run's report: its keys go
@@ -23037,7 +23159,7 @@ fn session_menu(hwnd: HWND, host: Option<String>, search: Option<String>) {
             let _ = AppendMenuW(menu, MF_SEPARATOR, 0, None);
         }
         let _ = AppendMenuW(menu, MF_STRING, NEW as usize, w!("&New connection...\tIns"));
-        let _ = AppendMenuW(menu, MF_STRING, CREDENTIALS as usize, w!("C&redentials..."));
+        let _ = AppendMenuW(menu, MF_STRING, CREDENTIALS as usize, w!("C&redentials"));
         let _ = AppendMenuW(menu, MF_STRING, INVENTORY as usize, w!("&Inventory"));
         if typed.is_some() || search.is_some() {
             let _ = AppendMenuW(menu, MF_SEPARATOR, 0, None);
@@ -23079,7 +23201,11 @@ fn session_menu(hwnd: HWND, host: Option<String>, search: Option<String>) {
         (DELETE, Some(host)) => SideAction::Delete(host),
         (NEW, _) => SideAction::New,
         (CREDENTIALS, _) => {
-            credentials_menu(hwnd);
+            with_window(|w| {
+                w.show_side(SideView::Credentials, true);
+                w.update_menu_checks();
+            });
+            credential_panel::focus_search();
             return;
         }
         (INVENTORY, _) => {
@@ -23171,76 +23297,72 @@ fn inventory_event(hwnd: HWND, event: inventory_panel::Event) {
     }
 }
 
-/// The named credentials: a menu of them and New credential; picking one
-/// opens it to change or delete.
-fn credentials_menu(hwnd: HWND) {
-    use crate::native::wide;
-    const NEW: u32 = 1;
-    const FIRST: u32 = 100;
-    let Some(list) = with_window(|w| {
-        w.settings
-            .credentials
-            .iter()
-            .map(|c| (c.name.clone(), crate::credentials::label(&w.settings, c)))
-            .collect::<Vec<_>>()
-    }) else {
-        return;
-    };
-    // SAFETY: a popup menu of our own on our window; TPM_RETURNCMD
-    // returns the picked id.
-    let picked = unsafe {
-        let Ok(menu) = CreatePopupMenu() else {
-            return;
-        };
-        let _ = AppendMenuW(
-            menu,
-            MF_STRING | MF_GRAYED,
-            0,
-            w!("Credentials many connections share"),
-        );
-        let _ = AppendMenuW(menu, MF_SEPARATOR, 0, None);
-        for (i, (_, label)) in list.iter().take(100).enumerate() {
-            let text = wide(&label.replace('&', "&&"));
-            let _ = AppendMenuW(
-                menu,
-                MF_STRING,
-                (FIRST + i as u32) as usize,
-                PCWSTR(text.as_ptr()),
-            );
+/// Deletes credential `name` (after the user said yes): the connections
+/// that pick it go back to their own login, and a password kept for its
+/// login goes once nothing uses it.
+fn delete_credential(hwnd: HWND, name: &str) {
+    let failed = with_window(|w| {
+        let before = w.settings.clone();
+        let old = w.windows_targets_of(&w.settings.credential_users(name));
+        crate::credentials::remove(&mut w.settings, name);
+        match w.try_save_settings() {
+            Ok(()) => {
+                w.forget_unused_passwords(old);
+                w.reload_sessions(None);
+                None
+            }
+            Err(e) => {
+                // Not on disk, so not here either.
+                w.settings = before;
+                Some(e)
+            }
         }
-        if !list.is_empty() {
-            let _ = AppendMenuW(menu, MF_SEPARATOR, 0, None);
-        }
-        let _ = AppendMenuW(menu, MF_STRING, NEW as usize, w!("&New credential..."));
-        let mut pt = POINT::default();
-        let _ = GetCursorPos(&mut pt);
-        let chosen = TrackPopupMenu(
-            menu,
-            TPM_RETURNCMD | TPM_NONOTIFY,
-            pt.x,
-            pt.y,
-            None,
-            hwnd,
-            None,
-        );
-        let _ = DestroyMenu(menu);
-        u32::try_from(chosen.0).unwrap_or(0)
-    };
-    let original = match picked {
-        NEW => None,
-        p if p >= FIRST => match list.get((p - FIRST) as usize) {
-            Some((name, _)) => Some(name.clone()),
-            None => return,
+    })
+    .flatten();
+    let next = with_window(|w| std::mem::take(&mut w.queued)).unwrap_or_default();
+    run_commands(hwnd, next);
+    if let Some(e) = failed {
+        dialog(hwnd, &e, MB_OK | MB_ICONWARNING);
+    }
+}
+
+/// Carries out what the user did in the credential manager: New, Edit
+/// and Delete happen here, and the list is read again after.
+fn credential_event(hwnd: HWND, event: credential_panel::Event) {
+    use credential_panel::Event;
+    match event {
+        Event::New => edit_credential(hwnd, None),
+        Event::Edit(name) => edit_credential(hwnd, Some(name)),
+        Event::Delete(row) => match row.kind {
+            crate::credential_view::Kind::Credential => delete_credential(hwnd, &row.id),
+            _ => {
+                if let Err(e) = credman::delete(&row.id) {
+                    dialog(hwnd, &e, MB_OK | MB_ICONWARNING);
+                }
+            }
         },
-        _ => return,
-    };
-    edit_credential(hwnd, original);
+        Event::Reload => {}
+        Event::Focused => {
+            tools_focused();
+            return;
+        }
+        Event::Leave => {
+            with_window(Window::focus_terminal);
+            return;
+        }
+    }
+    with_window(|w| {
+        if w.credentials_native() {
+            w.reload_credentials();
+        }
+        w.refresh_chrome();
+    });
 }
 
 /// Opens credential `original` (or a new one) to change, rename or
 /// delete; saves what is typed once it checks out.
 fn edit_credential(hwnd: HWND, original: Option<String>) {
-    use crate::credentials::{Typed, remove, save};
+    use crate::credentials::{Typed, save};
     let mut typed = original
         .as_deref()
         .and_then(|o| with_window(|w| w.settings.credential(o).map(Typed::of)).flatten())
@@ -23308,31 +23430,7 @@ fn edit_credential(hwnd: HWND, original: Option<String>) {
                 ));
             }
             if dialog(hwnd, &text, MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2) == Some(IDYES) {
-                let failed = with_window(|w| {
-                    let before = w.settings.clone();
-                    // Their logins change: a password kept for the old one
-                    // goes once nothing uses it.
-                    let old = w.windows_targets_of(&w.settings.credential_users(o));
-                    remove(&mut w.settings, o);
-                    match w.try_save_settings() {
-                        Ok(()) => {
-                            w.forget_unused_passwords(old);
-                            w.reload_sessions(None);
-                            None
-                        }
-                        Err(e) => {
-                            // Not on disk, so not here either.
-                            w.settings = before;
-                            Some(e)
-                        }
-                    }
-                })
-                .flatten();
-                let next = with_window(|w| std::mem::take(&mut w.queued)).unwrap_or_default();
-                run_commands(hwnd, next);
-                if let Some(e) = failed {
-                    dialog(hwnd, &e, MB_OK | MB_ICONWARNING);
-                }
+                delete_credential(hwnd, o);
             }
             return;
         }
@@ -23696,6 +23794,7 @@ fn is_side_pane(id: u32) -> bool {
             | cmd::SNIPPETS
             | cmd::KNOWN_HOSTS
             | cmd::INVENTORY
+            | cmd::CREDENTIAL_MANAGER
     )
 }
 
@@ -23923,6 +24022,9 @@ fn run_command(hwnd: HWND, command: Command) {
                 }
                 if with_window(|w| w.inventory_paste()) == Some(true) {
                     inventory_panel::paste(&text);
+                }
+                if with_window(|w| w.credentials_paste()) == Some(true) {
+                    credential_panel::paste(&text);
                 }
                 return;
             }
@@ -26547,6 +26649,9 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                     1 if want && with_window(|w| w.inventory_native()) == Some(true) => {
                         inventory_panel::focus_search();
                     }
+                    1 if want && with_window(|w| w.credentials_native()) == Some(true) => {
+                        credential_panel::focus_search();
+                    }
                     1 if want && scripts => scripts_panel::focus_first(),
                     1 if want && editor => script_editor::focus_first(),
                     1 if want && args => script_args::focus_first(),
@@ -26683,6 +26788,7 @@ mod tests {
             cmd::SNIPPETS,
             cmd::KNOWN_HOSTS,
             cmd::INVENTORY,
+            cmd::CREDENTIAL_MANAGER,
         ] {
             assert!(is_side_pane(id), "{id}");
         }

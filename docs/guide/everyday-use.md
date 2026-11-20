@@ -210,9 +210,22 @@ A command runs without a shell, a window or any input, for at most 60 seconds, a
 
 ### Credentials many connections share
 
-A credential is a named login: a user, a key file and a password source, such as `ops-admin` with user `ops`, key `C:\Keys\ops` and the Windows Credential Manager. Right-click in the connection manager and choose **Credentials...** to make one, change it, rename it or delete it. Then pick it in a connection's form (**Credential**, under the user and key, shown once a credential exists), or for many connections at once with **Change a field** > **Credential**.
+A credential is a named login: a user, a key file and a password source, such as `ops-admin` with user `ops`, key `C:\Keys\ops` and the Windows Credential Manager. Make one, change it, rename it or delete it in the [credential manager](#the-credential-manager) (Tools > Credential manager, the key icon on the tools rail, or **Credentials** when you right-click in the connection manager). Then pick it in a connection's form (**Credential**, under the user and key, shown once a credential exists), or for many connections at once with **Change a field** > **Credential**.
 
 What a credential sets wins over the connection's own user, key file and password source; what it leaves empty does not. A user typed in the address (`root@web`) still wins. Change the credential, and every connection that uses it logs in the new way. Delete it, and they go back to their own login. Secrets stay where they are: the key file on disk, and passwords in the Windows Credential Manager (saved per connection, as before) or your password manager. Credentials live in `ferossh.conf`, so a vault and an encrypted export carry them.
+
+### The credential manager
+
+Tools > Credential manager (the key icon on the tools rail) lists, in the tools pane:
+
+- **Your named credentials**, with their user, key file and password source.
+- **The passwords FeroSSH keeps**: logins, proxy passwords and script secrets, in the Windows Credential Manager, in your vault, or both. The passwords themselves never show.
+
+Every row says what uses it: the connections that pick a credential, or the connections whose login keeps its password there. Search with any words (`-word` leaves rows out, and `nothing` finds the ones nothing uses). Click a column heading to sort by it.
+
+- **New credential...** makes a credential.
+- **Edit...** (Enter or a double click) changes or renames one. Its connections follow a new name.
+- **Delete...** (Del) asks first, and names what still uses it. The connections of a deleted credential go back to their own login. A connection whose saved password you delete asks for it at its next login.
 
 ### Security rules by tag or folder
 
