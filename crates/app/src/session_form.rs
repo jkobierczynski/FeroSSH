@@ -105,6 +105,8 @@ pub struct Values {
     /// `off`.
     pub desk_clipboard: String,
     pub legacy: bool,
+    /// Read the server's OS and kernel after login (`SystemInfo yes`).
+    pub system_info: bool,
     /// WinRM over HTTPS (`WinrmHttps yes`).
     pub winrm_https: bool,
     /// WinRM over HTTP may log in with NTLM (`WinrmNtlm yes`).
@@ -255,6 +257,7 @@ impl Values {
             .map(|(w, h)| format!("{w}x{h}"))
             .unwrap_or_default();
         self.legacy = p.legacy_algorithms;
+        self.system_info = p.system_info;
         (self.password, self.password_command) = password_choice(&p.password);
         self.login_script = p.login_script.iter().map(ToString::to_string).collect();
         self.mosh_server = p.mosh_server.clone().unwrap_or_default();
@@ -309,6 +312,7 @@ enum Field {
     Clipboard,
     DeskClipboard,
     Legacy,
+    SystemInfo,
     WinrmHttps,
     ForwardAgent,
     Kerberos,
@@ -361,6 +365,7 @@ impl Field {
             Field::Clipboard => "App clip",
             Field::DeskClipboard => "Desk clip",
             Field::Legacy => "Old crypto",
+            Field::SystemInfo => "Inventory",
             Field::WinrmHttps => "Transport",
             Field::ForwardAgent => "Fwd agent",
             Field::Kerberos => "Kerberos",
@@ -388,6 +393,7 @@ impl Field {
                 | Field::Tmux
                 | Field::TmuxLayout
                 | Field::Legacy
+                | Field::SystemInfo
                 | Field::WinrmHttps
                 | Field::ForwardAgent
                 | Field::Kerberos
@@ -804,6 +810,7 @@ impl SessionForm {
                             Field::Kerberos,
                             Field::KerberosDelegate,
                             Field::Legacy,
+                            Field::SystemInfo,
                         ]
                         .map(Item::Field),
                     );
@@ -911,6 +918,7 @@ impl SessionForm {
             | Field::Tmux
             | Field::TmuxLayout
             | Field::Legacy
+            | Field::SystemInfo
             | Field::WinrmHttps
             | Field::ForwardAgent
             | Field::Kerberos
@@ -966,6 +974,7 @@ impl SessionForm {
             | Field::Tmux
             | Field::TmuxLayout
             | Field::Legacy
+            | Field::SystemInfo
             | Field::WinrmHttps
             | Field::ForwardAgent
             | Field::Kerberos
@@ -1061,6 +1070,12 @@ impl SessionForm {
             }
             .to_owned(),
             Field::Legacy => if v.legacy { "allowed" } else { "off" }.to_owned(),
+            Field::SystemInfo => if v.system_info {
+                "read OS and kernel"
+            } else {
+                "off"
+            }
+            .to_owned(),
             Field::WinrmHttps => match (v.winrm_https, v.winrm_ntlm) {
                 (true, _) => "HTTPS (5986)",
                 (false, false) => "HTTP, Kerberos only (5985)",
@@ -1175,6 +1190,7 @@ impl SessionForm {
                 };
             }
             Field::Legacy => v.legacy = !v.legacy,
+            Field::SystemInfo => v.system_info = !v.system_info,
             // HTTP Kerberos only, HTTP with NTLM, HTTPS, and round.
             Field::WinrmHttps => {
                 const ORDER: [(bool, bool); 3] = [(false, false), (false, true), (true, false)];
@@ -1307,6 +1323,7 @@ impl SessionForm {
             | Field::Tmux
             | Field::TmuxLayout
             | Field::Legacy
+            | Field::SystemInfo
             | Field::WinrmHttps
             | Field::ForwardAgent
             | Field::Kerberos
@@ -2280,6 +2297,7 @@ impl SessionForm {
         p.desktop_size = ferossh_config::settings::DesktopSize::parse(&v.desktop_size)
             .filter(|d| *d != ferossh_config::settings::DesktopSize::Follow);
         p.legacy_algorithms = v.legacy;
+        p.system_info = v.system_info;
         p.password = match (v.kind, v.password) {
             (
                 SessionKind::Ssh
@@ -3147,8 +3165,8 @@ mod tests {
         // tmux, tmux panes, Start dir, Local folder, Remote folder,
         // Forward 1, RDP port, VNC port, Virtual desk, Desk size, Desk
         // clip, Remote app, Copy agent, Clean up, App clip, Fwd agent,
-        // Kerberos, Fwd ticket, Old crypto.
-        down(&mut f, 20);
+        // Kerberos, Fwd ticket, Old crypto, Inventory.
+        down(&mut f, 21);
         assert_eq!(f.focused_field(), Some(Field::LoginStep(0)));
         let t = texts(&mut f);
         assert!(

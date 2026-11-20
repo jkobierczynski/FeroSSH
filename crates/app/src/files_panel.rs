@@ -506,7 +506,7 @@ fn system_icons() -> isize {
 }
 
 /// `secs` since 1970 as local date and time, `2026-11-09 08:15`.
-fn when(secs: Option<i64>) -> String {
+pub(crate) fn when(secs: Option<i64>) -> String {
     use windows::Win32::Foundation::SYSTEMTIME;
     let Some(secs) = secs else {
         return String::new();

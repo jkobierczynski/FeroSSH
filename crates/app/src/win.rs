@@ -1454,6 +1454,8 @@ struct Window {
     vdesks: HashMap<ChannelId, VirtualDesk>,
     /// Session > Copy public key to this server, by its exec channel.
     key_copies: HashMap<ChannelId, KeyCopy>,
+    /// The inventory's OS and kernel being read, by channel.
+    system_reads: HashMap<ChannelId, SystemRead>,
     /// Show what changed: each running git's channel, and its tab.
     diffs: HashMap<ChannelId, PaneId>,
     /// The server status bar's samples, by their channel: one per
@@ -1736,6 +1738,16 @@ struct StatsFeed {
 
 /// Session > Copy public key to this server: [`copy_id::command`] on an
 /// exec channel of `connection`.
+/// The inventory's OS and kernel, read by
+/// [`ferossh_config::inventory::SYSTEM_COMMAND`] on an exec channel of
+/// `connection` after a login.
+struct SystemRead {
+    connection: ChannelId,
+    /// The connection's name.
+    alias: String,
+    out: Vec<u8>,
+}
+
 struct KeyCopy {
     connection: ChannelId,
     /// The host, as the user knows it.
@@ -2768,6 +2780,7 @@ fn create_and_run(launch: Launch, theme: Option<String>) -> Result<()> {
                 preview_waiting: Vec::new(),
                 vdesks: HashMap::new(),
                 key_copies: HashMap::new(),
+                system_reads: HashMap::new(),
                 diffs: HashMap::new(),
                 stats: HashMap::new(),
                 winrm_closing: HashMap::new(),
@@ -5620,6 +5633,86 @@ impl Window {
         }
     }
 
+    /// Pane `id` logged in: the inventory keeps when, and the host key;
+    /// with `SystemInfo yes`, the server's OS and kernel are read too.
+    /// Only listed connections are kept, not hosts typed at the prompt.
+    fn inventory_login(&mut self, id: PaneId) {
+        let Some(Host::Ssh(s)) = self.panes.get(&id).map(|p| &p.host) else {
+            return;
+        };
+        let alias = s.target.alias.clone();
+        if !self.side.list.has_host(&alias) {
+            return;
+        }
+        let key = s.host_key_seen.clone();
+        if let Err(e) = crate::inventory_view::update(|inv| {
+            let key = key.as_ref().map(|(k, f)| (k.as_str(), f.as_str()));
+            inv.connected(&alias, crate::inventory_view::now(), key);
+        }) {
+            self.queued.push(Command::Notice(format!(
+                "Could not update the inventory: {e}"
+            )));
+        }
+        if !self.settings.profile(&alias).is_some_and(|p| p.system_info) {
+            return;
+        }
+        let Some(connection) = self.pane_connection(id) else {
+            return;
+        };
+        let channel = self.new_channel();
+        let Some(w) = self.workers.get(&connection) else {
+            return;
+        };
+        w.link.send(Message::Exec {
+            channel,
+            connection,
+            command: ferossh_config::inventory::SYSTEM_COMMAND
+                .as_bytes()
+                .to_vec(),
+            split_stderr: true,
+        });
+        w.link.send(Message::Eof { channel });
+        self.system_reads.insert(
+            channel,
+            SystemRead {
+                connection,
+                alias,
+                out: Vec::new(),
+            },
+        );
+    }
+
+    /// What the inventory's system command printed, or that it ended.
+    fn on_system_read(&mut self, channel: ChannelId, msg: Message) {
+        use ferossh_config::inventory::{MAX_SYSTEM_OUTPUT, parse_system};
+        let Some(r) = self.system_reads.get_mut(&channel) else {
+            return;
+        };
+        match msg {
+            Message::Data { bytes, .. } => {
+                let room = MAX_SYSTEM_OUTPUT.saturating_sub(r.out.len());
+                r.out.extend_from_slice(bytes.get(..room).unwrap_or(&bytes));
+            }
+            Message::Disconnected { .. } => {
+                let Some(r) = self.system_reads.remove(&channel) else {
+                    return;
+                };
+                // A server without `sh` prints no mark: nothing is kept.
+                let Some(info) = parse_system(&r.out) else {
+                    return;
+                };
+                if let Err(e) = crate::inventory_view::update(|inv| {
+                    inv.system(&r.alias, crate::inventory_view::now(), &info);
+                }) {
+                    self.queued.push(Command::Notice(format!(
+                        "Could not update the inventory: {e}"
+                    )));
+                }
+            }
+            _ => {}
+        }
+    }
+
     /// What the key copy's command said, or that it ended.
     fn on_key_copy(&mut self, channel: ChannelId, msg: Message) {
         /// More is never needed: the answer is the last line.
@@ -8135,6 +8228,7 @@ impl Window {
                     self.refresh_chrome();
                 }
                 Effect::Connected => {
+                    self.inventory_login(id);
                     self.retries.remove(&id);
                     self.arm_reconnect_timer();
                     self.start_log(id);
@@ -10629,6 +10723,14 @@ impl Window {
                     self.on_key_copy(c, msg);
                     return false;
                 }
+                if self
+                    .system_reads
+                    .get(&c)
+                    .is_some_and(|r| r.connection == connection)
+                {
+                    self.on_system_read(c, msg);
+                    return false;
+                }
                 if self.diff_on(c) == Some(connection) {
                     self.on_diff(c, msg);
                     return false;
@@ -10706,6 +10808,7 @@ impl Window {
                 }
                 self.vdesks.retain(|_, v| v.connection != connection);
                 self.stats.retain(|_, f| f.connection != connection);
+                self.system_reads.retain(|_, r| r.connection != connection);
                 let lost: Vec<ChannelId> = self
                     .key_copies
                     .iter()
@@ -15086,6 +15189,13 @@ impl Window {
                 let mut hosts = load_saved();
                 let mut settings = self.settings.clone();
                 let name = form.apply(&mut hosts, &mut settings);
+                // The inventory follows a renamed connection (a read-only one
+                // saved under a new name is a copy: it has none yet).
+                let renamed = form
+                    .original
+                    .clone()
+                    .filter(|o| !o.eq_ignore_ascii_case(&name))
+                    .filter(|_| !matches!(form.source, Source::ReadOnly(_)));
                 // Off the Windows Credential Manager, or to another user, host
                 // or port: the old saved password goes. Its name is resolved
                 // before the connection's settings change.
@@ -15119,6 +15229,14 @@ impl Window {
                     && (!still_windows || self.saved_password_target(&name).as_ref() != Some(&old))
                 {
                     self.forget_unused_passwords(vec![old]);
+                }
+                if let Some(old) = renamed {
+                    let new = name.clone();
+                    if let Err(e) = crate::inventory_view::update(|inv| inv.rename(&old, &new)) {
+                        self.queued.push(Command::Notice(format!(
+                            "Could not update the inventory: {e}"
+                        )));
+                    }
                 }
                 self.side.form = None;
                 self.reload_sessions(Some(&name));
@@ -15283,6 +15401,15 @@ impl Window {
         self.settings = settings;
         // Unless another connection keeps its password there too.
         self.forget_unused_passwords(targets);
+        if let Err(e) = crate::inventory_view::update(|inv| {
+            for name in names {
+                inv.remove(name);
+            }
+        }) {
+            self.queued.push(Command::Notice(format!(
+                "Could not update the inventory: {e}"
+            )));
+        }
         self.save_settings();
         self.side.form = None;
         self.reload_sessions(None);
@@ -22733,6 +22860,7 @@ fn session_menu(hwnd: HWND, host: Option<String>, search: Option<String>) {
     const SAVE_SEARCH: u32 = 6;
     const REMOVE_SEARCH: u32 = 7;
     const CREDENTIALS: u32 = 8;
+    const INVENTORY: u32 = 9;
     // The search typed, when there is one to save.
     let typed = with_window(|w| {
         let q = w.side.list.query().trim().to_owned();
@@ -22770,6 +22898,7 @@ fn session_menu(hwnd: HWND, host: Option<String>, search: Option<String>) {
         }
         let _ = AppendMenuW(menu, MF_STRING, NEW as usize, w!("&New connection...\tIns"));
         let _ = AppendMenuW(menu, MF_STRING, CREDENTIALS as usize, w!("C&redentials..."));
+        let _ = AppendMenuW(menu, MF_STRING, INVENTORY as usize, w!("&Inventory..."));
         if typed.is_some() || search.is_some() {
             let _ = AppendMenuW(menu, MF_SEPARATOR, 0, None);
         }
@@ -22813,6 +22942,10 @@ fn session_menu(hwnd: HWND, host: Option<String>, search: Option<String>) {
             credentials_menu(hwnd);
             return;
         }
+        (INVENTORY, _) => {
+            inventory_window(hwnd);
+            return;
+        }
         (SAVE_SEARCH, _) => match typed {
             Some(q) => SideAction::SaveSearch(q),
             None => return,
@@ -22836,6 +22969,28 @@ fn login_refused(why: &str) -> String {
          connection manager.\x1b[0m\r\n",
         crate::ssh::sanitize(why)
     )
+}
+
+/// Connection manager > Inventory: every connection with its last login,
+/// host key, OS and kernel, searched as the connection manager is; Connect
+/// there opens the picked one.
+fn inventory_window(hwnd: HWND) {
+    let Some((rows, query, dir, dpi)) = with_window(|w| {
+        let items = host_items(&ssh_env(), &w.settings);
+        let inventory = crate::inventory_view::load();
+        let rows = crate::inventory_view::rows(&items, &inventory, &w.settings);
+        let query = w.side.list.query().trim().to_owned();
+        (rows, query, w.download_dir(), w.dpi)
+    }) else {
+        return;
+    };
+    let answer = crate::inventory_panel::show(hwnd, dpi, rows, &query, dir);
+    if let Some(crate::inventory_panel::Answer::Connect(host)) = answer
+        && let Some(Some(command)) =
+            with_window(|w| w.side_action(Some(SideAction::Open { host, split: false })))
+    {
+        run_command(hwnd, command);
+    }
 }
 
 /// The named credentials: a menu of them and New credential; picking one

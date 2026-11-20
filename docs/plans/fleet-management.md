@@ -13,8 +13,8 @@ Already built, so not listed: folders (`# folder:` comments), favourites, search
 | 3 | Select several connections and act on them all | Done (#256) |
 | 4 | Change one field on many connections at once | Done (#257) |
 | 5 | Named credentials shared by many connections | Done (#258) |
-| 6 | Credential and security rules by tag or folder | Built |
-| 7 | Inventory columns with CSV export | To do |
+| 6 | Credential and security rules by tag or folder | Done (#259, #260) |
+| 7 | Inventory columns with CSV export | Built |
 | 8 | Run a script or broadcast to a tag or saved search | To do |
 | 9 | A shared, read-only connection library for a team | To do |
 | 10 | A machine-wide admin policy file | To do |
@@ -71,7 +71,7 @@ Fields that need the whole form (host, port, forwards, login script) stay one co
 - **Precedence:** what a credential sets wins over the connection's own login, and a user typed in the address still wins. This works for SSH, Mosh, SFTP, tunnels, jump hosts and WinRM. The user and key file come through the ssh_config resolution (a `Match originalhost` block placed first). The password source comes from `Settings::password_source`.
 - **Secrets stay where they are today.** A Windows-saved password is still kept per connection. One shared password saved once for all is a possible follow-up.
 
-## 6. Credential and security rules by tag or folder (built)
+## 6. Credential and security rules by tag or folder (done, #259 and #260)
 
 **What FeroSSH had.** Separate per-host switches: the Production confirmation for scripts, old crypto per host, agent-forwarding confirmation.
 
@@ -83,11 +83,19 @@ Fields that need the whole form (host, port, forwards, login script) stay one co
 - Each hop of a jump route gets its own rules. A connection prints the limits that apply.
 - Rules are edited in the file for now, like theme rules. A rules page in Settings is a possible follow-up.
 
-## 7. Inventory columns with CSV export
+## 7. Inventory columns with CSV export (built)
 
-**What FeroSSH has.** The status bar shows live CPU, memory and disk for the focused pane; script runs give a CSV report.
+**What FeroSSH had.** The status bar shows live CPU, memory and disk for the focused pane; script runs give a CSV report.
 
-**What to build.** A list view in the connection manager with columns: last connected, host key type and fingerprint, and, when switched on per host, OS and kernel collected after login. Export the list as CSV.
+**What was built.** **Inventory...** in the connection manager's right-click menu opens a list of every connection:
+
+- **Columns:** name, address, type, folder, tags, last connected, host key type, SHA-256 fingerprint, OS and kernel. A click on a heading sorts by it.
+- **Search:** the connection manager's search words, starting from its current search; plain words also match the OS, kernel and fingerprint.
+- **Save CSV** writes the rows shown to the download folder, times in UTC, with formula-looking cells made safe for spreadsheets. **Connect** opens the picked one.
+- **What is kept:** each login of a listed SSH connection records the time and the host key the server showed. With **Inventory** on in the form (`SystemInfo yes`, or **Change a field**), one fixed read-only command (`uname -sr`, `/etc/os-release` or `sw_vers`) runs on its own channel after login, and the OS and kernel are kept, cleaned of control characters and cut short.
+- **Where:** `inventory.conf` on this PC only (`%LOCALAPPDATA%\FeroSSH`), read and written again on each change so several windows agree. Renames and deletes follow.
+
+Telnet and WinRM logins are not recorded yet.
 
 ## 8. Run a script or broadcast to a tag or saved search
 

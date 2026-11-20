@@ -27,6 +27,7 @@ pub enum EditField {
     FontSize,
     Tmux,
     StartDir,
+    SystemInfo,
 }
 
 /// What a `tmux` value of `on` attaches to.
@@ -34,7 +35,7 @@ const DEFAULT_TMUX: &str = "main";
 
 impl EditField {
     /// In menu order.
-    pub const ALL: [Self; 11] = [
+    pub const ALL: [Self; 12] = [
         Self::User,
         Self::Key,
         Self::Jump,
@@ -46,6 +47,7 @@ impl EditField {
         Self::FontSize,
         Self::Tmux,
         Self::StartDir,
+        Self::SystemInfo,
     ];
 
     pub fn label(self) -> &'static str {
@@ -61,6 +63,7 @@ impl EditField {
             Self::FontSize => "Font size",
             Self::Tmux => "tmux session",
             Self::StartDir => "Start directory",
+            Self::SystemInfo => "Inventory: OS and kernel",
         }
     }
 
@@ -100,6 +103,10 @@ impl EditField {
                 "The server directory new shells start in. Empty: the home \
                                directory."
             }
+            Self::SystemInfo => {
+                "yes: after each login, read the server's OS and kernel for the \
+                                 inventory. Empty or no: do not."
+            }
         }
     }
 
@@ -118,6 +125,7 @@ impl EditField {
             Self::Password | Self::Credential => login || kind == K::WinRm,
             Self::Tmux => kind == K::Ssh,
             Self::StartDir => matches!(kind, K::Ssh | K::Mosh),
+            Self::SystemInfo => kind == K::Ssh,
             Self::Theme | Self::Font | Self::FontSize => !matches!(
                 kind,
                 K::Rdp | K::Vnc | K::Xvfb | K::RemoteApp | K::Sftp | K::Tunnel
@@ -160,6 +168,12 @@ pub fn current(field: EditField, name: &str, saved: &[SavedHost], settings: &Set
             .and_then(|p| p.tmux.clone())
             .unwrap_or_else(|| "off".into()),
         EditField::StartDir => text(p.and_then(|p| p.start_dir.as_ref())),
+        EditField::SystemInfo => if p.is_some_and(|p| p.system_info) {
+            "yes"
+        } else {
+            "no"
+        }
+        .into(),
     }
 }
 
@@ -335,6 +349,11 @@ fn normalise(
             settings::start_dir(v)
                 .ok_or_else(|| "The start directory cannot hold \" or control characters.".into())
         }
+        EditField::SystemInfo => match v.to_ascii_lowercase().as_str() {
+            "yes" | "on" | "true" => Ok("yes".into()),
+            "" | "no" | "off" | "false" => Ok("no".into()),
+            _ => Err("Type yes or no.".into()),
+        },
     }
 }
 
@@ -514,6 +533,7 @@ pub fn apply(plan: &Plan, saved: &mut [SavedHost], settings: &mut Settings) -> b
             EditField::FontSize => p.font_size = value.as_deref().and_then(|s| s.parse().ok()),
             EditField::Tmux => p.tmux = value.clone().filter(|v| v != "off"),
             EditField::StartDir => p.start_dir = value.clone(),
+            EditField::SystemInfo => p.system_info = plan.value == "yes",
             _ => {}
         }
     }
@@ -649,6 +669,27 @@ mod tests {
         assert_eq!(shared(EditField::User, &t, &saved, &settings), None);
         let p = plan(EditField::User, "x", &t, &saved, &settings, &[]).unwrap();
         assert_eq!(p.changes.len(), 1, "a already has it");
+    }
+
+    #[test]
+    fn system_info_turns_on_for_ssh_connections_only() {
+        let saved = Vec::new();
+        let mut settings = Settings::parse("Profile db\n    SystemInfo yes\n");
+        let t = [
+            target("db", SessionKind::Ssh),
+            target("web", SessionKind::Ssh),
+            target("rdp", SessionKind::Rdp),
+        ];
+        assert!(plan(EditField::SystemInfo, "maybe", &t, &saved, &settings, &[]).is_err());
+        let p = plan(EditField::SystemInfo, " On ", &t, &saved, &settings, &[]).unwrap();
+        assert_eq!(p.value, "yes");
+        assert_eq!(p.changes.len(), 1, "db has it already");
+        assert_eq!(p.skipped.len(), 1, "RDP has no shell to read it from");
+        apply(&p, &mut saved.clone(), &mut settings);
+        assert!(settings.profile("web").unwrap().system_info);
+        let p = plan(EditField::SystemInfo, "", &t, &saved, &settings, &[]).unwrap();
+        apply(&p, &mut saved.clone(), &mut settings);
+        assert!(settings.profile("db").is_none_or(|p| !p.system_info));
     }
 
     #[test]

@@ -87,6 +87,8 @@
 //!     Type winrm
 //!     WinrmCommand cmd
 //!     WinrmHttps yes
+//! Profile db1
+//!     SystemInfo yes
 //! Profile laptop-roaming
 //!     Type mosh
 //!     MoshServer ~/bin/mosh-server
@@ -239,6 +241,9 @@ pub struct Profile {
     /// cannot. Off, only Kerberos logs in over HTTP, because NTLM there
     /// does not prove who answers and its login can be taken or relayed.
     pub winrm_ntlm: bool,
+    /// After an SSH login, read the server's OS and kernel (`uname`,
+    /// `/etc/os-release`) for the inventory (`SystemInfo yes`).
+    pub system_info: bool,
     /// The connection's own tags (`Tags prod web eu`), on top of the one
     /// ssh_config's `Tag` may give it: searched for in the connection
     /// manager and matched by the colour theme rules. See [`parse_tags`].
@@ -665,6 +670,7 @@ impl Profile {
             && self.winrm_command.is_none()
             && !self.winrm_https
             && !self.winrm_ntlm
+            && !self.system_info
             && self.tags.is_empty()
             && self.credential.is_none()
     }
@@ -1811,6 +1817,10 @@ impl Settings {
                             "winrmcommand" => {
                                 p.winrm_command = virtual_desktop(&raw_rest(line));
                             }
+                            "systeminfo" => {
+                                p.system_info =
+                                    first.is_some_and(|v| v.eq_ignore_ascii_case("yes"));
+                            }
                             "winrmhttps" => {
                                 p.winrm_https =
                                     first.is_some_and(|v| v.eq_ignore_ascii_case("yes"));
@@ -2263,6 +2273,9 @@ impl Settings {
             }
             if p.winrm_ntlm {
                 let _ = writeln!(out, "    WinrmNtlm yes");
+            }
+            if p.system_info {
+                let _ = writeln!(out, "    SystemInfo yes");
             }
             let tags: Vec<&str> = p
                 .tags
@@ -2847,6 +2860,17 @@ Profile lab
         let back = Settings::parse(&s.to_text());
         assert_eq!(back.profile("web").unwrap().tags, web.tags);
         assert!(s.to_text().contains("    Tags prod web eu de\n"));
+    }
+
+    #[test]
+    fn system_info_round_trips() {
+        let s =
+            Settings::parse("Profile db1\n    SystemInfo yes\nProfile db2\n    SystemInfo no\n");
+        assert!(s.profile("db1").unwrap().system_info);
+        assert!(s.profile("db2").is_none_or(|p| !p.system_info));
+        let back = Settings::parse(&s.to_text());
+        assert!(back.profile("db1").unwrap().system_info);
+        assert!(s.to_text().contains("    SystemInfo yes\n"));
     }
 
     #[test]
