@@ -64,10 +64,10 @@ use windows::Win32::UI::WindowsAndMessaging::{
     GetWindowLongPtrW, GetWindowRect, HMENU, IsMenu, MENU_ITEM_TYPE, MENUBARINFO, MENUINFO,
     MENUITEMINFOW, MF_BYPOSITION, MF_DISABLED, MF_GRAYED, MF_HILITE, MFT_MENUBARBREAK,
     MFT_MENUBREAK, MFT_OWNERDRAW, MFT_RADIOCHECK, MFT_SEPARATOR, MFT_STRING, MIIM_DATA, MIIM_FTYPE,
-    MIIM_STRING, MIM_BACKGROUND, NONCLIENTMETRICSW, OBJID_MENU, SPI_GETNONCLIENTMETRICS,
-    SendMessageW, SetMenuInfo, SetMenuItemInfoW, WM_CTLCOLORBTN, WM_CTLCOLOREDIT,
-    WM_CTLCOLORLISTBOX, WM_CTLCOLORSTATIC, WM_DRAWITEM, WM_ERASEBKGND, WM_GETFONT, WM_MEASUREITEM,
-    WM_MENUCHAR, WM_NCACTIVATE, WM_NCPAINT, WM_NOTIFY, WM_PAINT,
+    MIIM_ID, MIIM_STRING, MIIM_SUBMENU, MIM_BACKGROUND, NONCLIENTMETRICSW, OBJID_MENU,
+    SPI_GETNONCLIENTMETRICS, SendMessageW, SetMenuInfo, SetMenuItemInfoW, WM_CTLCOLORBTN,
+    WM_CTLCOLOREDIT, WM_CTLCOLORLISTBOX, WM_CTLCOLORSTATIC, WM_DRAWITEM, WM_ERASEBKGND, WM_GETFONT,
+    WM_MEASUREITEM, WM_MENUCHAR, WM_NCACTIVATE, WM_NCPAINT, WM_NOTIFY, WM_PAINT,
 };
 use windows::core::{BOOL, PCSTR, PCWSTR, PWSTR, w};
 
@@ -975,6 +975,11 @@ struct OwnMenu {
 
 thread_local! {
     static OWN: RefCell<Vec<OwnMenu>> = const { RefCell::new(Vec::new()) };
+    /// Every item text seen, by menu and item (its id, or its submenu):
+    /// Windows may report none for an item, even after it is given back,
+    /// and a lost record would leave it blank.
+    static TEXTS: RefCell<std::collections::HashMap<(usize, usize), Vec<u16>>> =
+        RefCell::new(std::collections::HashMap::new());
     /// The owned menus' background brush and the colour it was made in.
     static POPUP_BACK: std::cell::Cell<Option<(Rgb, HBRUSH)>> = const { std::cell::Cell::new(None) };
 }
@@ -1042,6 +1047,12 @@ pub fn own_popup(menu: HMENU) {
             own.retain(|m| unsafe { IsMenu(m.menu) }.as_bool());
         }
     });
+    TEXTS.with(|t| {
+        if let Ok(mut t) = t.try_borrow_mut() {
+            // SAFETY: plain query.
+            t.retain(|(m, _), _| unsafe { IsMenu(HMENU(*m as *mut core::ffi::c_void)) }.as_bool());
+        }
+    });
     let old = OWN.with(|own| {
         let mut own = own.try_borrow_mut().ok()?;
         let at = own.iter().rposition(|m| m.menu == menu)?;
@@ -1060,7 +1071,7 @@ pub fn own_popup(menu: HMENU) {
             let mut buf = [0u16; 256];
             let mut mii = MENUITEMINFOW {
                 cbSize: size_of::<MENUITEMINFOW>() as u32,
-                fMask: MIIM_FTYPE | MIIM_STRING | MIIM_DATA,
+                fMask: MIIM_FTYPE | MIIM_STRING | MIIM_DATA | MIIM_ID | MIIM_SUBMENU,
                 dwTypeData: PWSTR(buf.as_mut_ptr()),
                 cch: buf.len() as u32 - 1,
                 ..Default::default()
@@ -1085,8 +1096,28 @@ pub fn own_popup(menu: HMENU) {
             }
             let ty = mii.fType.0;
             let n = (mii.cch as usize).min(buf.len());
+            let key = (menu.0 as usize, item_key(&mii));
+            let separator = ty & MFT_SEPARATOR.0 != 0;
             if !on && ty & MFT_OWNERDRAW.0 == 0 {
-                // Windows' own already: left as it is.
+                // Windows' own already: left as it is, unless it lost its
+                // text somewhere (then the text seen last goes back).
+                let read = buf.get(..n).unwrap_or_default();
+                let n = read.iter().position(|&c| c == 0).unwrap_or(read.len());
+                if n == 0
+                    && !separator
+                    && let Some(mut seen) = seen_text(key)
+                {
+                    seen.push(0);
+                    let text = MENUITEMINFOW {
+                        cbSize: size_of::<MENUITEMINFOW>() as u32,
+                        fMask: MIIM_STRING,
+                        dwTypeData: PWSTR(seen.as_mut_ptr()),
+                        ..Default::default()
+                    };
+                    let _ = SetMenuItemInfoW(menu, pos, true, &text);
+                } else if n > 0 {
+                    note_seen(key, buf.get(..n).unwrap_or_default());
+                }
                 continue;
             }
             // Windows may keep no text for an owner-drawn item: ours then,
@@ -1105,10 +1136,23 @@ pub fn own_popup(menu: HMENU) {
                     own.iter().filter(|m| m.menu == menu).find_map(find)
                 })
             });
+            // What Windows reports, up to any nul in it.
+            let read = buf.get(..n).unwrap_or_default();
+            let read = read
+                .iter()
+                .position(|&c| c == 0)
+                .map_or(read, |end| read.get(..end).unwrap_or_default());
+            // An owner-drawn item's text is ours: Windows may report none,
+            // or not the one we gave it.
             let text = match kept {
-                Some(k) if n == 0 => k,
-                _ => buf.get(..n).unwrap_or_default().to_vec(),
+                Some(k) if read.is_empty() || ty & MFT_OWNERDRAW.0 != 0 => k,
+                _ if !read.is_empty() => read.to_vec(),
+                // No record has it either: the text seen last.
+                _ => seen_text(key).unwrap_or_default(),
             };
+            if !separator {
+                note_seen(key, &text);
+            }
             let mut item = OwnItem::new(text);
             item.separator = ty & MFT_SEPARATOR.0 != 0;
             item.breaks = ty & (MFT_MENUBARBREAK.0 | MFT_MENUBREAK.0) != 0;
@@ -1176,6 +1220,33 @@ pub fn own_popup(menu: HMENU) {
             }
         });
     }
+}
+
+/// What identifies an item within its menu: its submenu, or its id.
+fn item_key(mii: &MENUITEMINFOW) -> usize {
+    if mii.hSubMenu.is_invalid() {
+        mii.wID as usize
+    } else {
+        mii.hSubMenu.0 as usize
+    }
+}
+
+/// The text last seen for an item, if it had one.
+fn seen_text(key: (usize, usize)) -> Option<Vec<u16>> {
+    TEXTS.with(|t| t.try_borrow().ok()?.get(&key).cloned())
+}
+
+/// Keeps a (non-empty) item text, for when Windows reports none.
+fn note_seen(key: (usize, usize), text: &[u16]) {
+    let text = without_nul(text);
+    if text.is_empty() {
+        return;
+    }
+    TEXTS.with(|t| {
+        if let Ok(mut t) = t.try_borrow_mut() {
+            t.insert(key, text.to_vec());
+        }
+    });
 }
 
 /// Repaints open owned menus in the colours now in use (a window colour
@@ -1264,6 +1335,15 @@ pub fn note_text(menu: HMENU, pos: u32, text: &str) {
             item.set_text(Some(&wide));
         }
     });
+    let mut mii = MENUITEMINFOW {
+        cbSize: size_of::<MENUITEMINFOW>() as u32,
+        fMask: MIIM_ID | MIIM_SUBMENU,
+        ..Default::default()
+    };
+    // SAFETY: a menu of ours and a position in it.
+    if unsafe { GetMenuItemInfoW(menu, pos, true, &mut mii) }.is_ok() {
+        note_seen((menu.0 as usize, item_key(&mii)), &wide);
+    }
 }
 
 /// The window's DPI as a scale for sizes given at 96 DPI.
