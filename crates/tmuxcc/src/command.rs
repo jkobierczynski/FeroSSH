@@ -101,9 +101,15 @@ pub fn account_names(text: &str) -> Result<Vec<String>, String> {
 /// (`/tmp/ferossh-share-<account>/default`), as tmux's `#{socket_path}`
 /// gives it.
 pub fn is_share_socket(path: &str) -> bool {
+    share_owner(path).is_some()
+}
+
+/// The account whose shared server `path` is, if it is one.
+pub fn share_owner(path: &str) -> Option<String> {
     path.strip_prefix(SHARE_DIR_PREFIX)
         .and_then(|rest| rest.strip_suffix("/default"))
-        .is_some_and(|account| account_name(account).as_deref() == Some(account))
+        .filter(|account| account_name(account).as_deref() == Some(*account))
+        .map(str::to_owned)
 }
 
 /// The shell test that `$FEROSSH_SHARE` is a real directory (not a
@@ -213,6 +219,10 @@ mod tests {
         assert_eq!(account_names("bob $(rm)"), Err("$(rm)".into()));
         assert_eq!(account_names(" "), Ok(vec![]));
         assert!(is_share_socket("/tmp/ferossh-share-alice/default"));
+        assert_eq!(
+            share_owner("/tmp/ferossh-share-alice/default").as_deref(),
+            Some("alice")
+        );
         assert!(!is_share_socket("/tmp/tmux-1000/default"));
         assert!(!is_share_socket("/tmp/ferossh-share-a/b/default"));
         assert!(!is_share_socket("/tmp/ferossh-share-/default"));
@@ -233,6 +243,14 @@ mod tests {
         assert!(l.ends_with("fi'\r"));
         assert!(l.contains("-user alice -perm 711"));
         assert!(l.contains("-CC attach-session -f read-only,ignore-size -t =a_b;"));
+        // Only the sh -c wrapper's own quotes: nothing can close it early.
+        assert_eq!(l.matches('\'').count(), 2);
+        assert_eq!(
+            join_line(Some("alice"), Some("x'y"), true)
+                .matches('\'')
+                .count(),
+            2
+        );
         // An owner that is no account name joins nothing of anyone's.
         assert_eq!(
             join_line(Some("x;y"), None, false),

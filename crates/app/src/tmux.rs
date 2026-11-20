@@ -219,6 +219,8 @@ enum Tag {
     UnshareSocket,
     /// Who may connect, to take everyone else off.
     ShareList,
+    /// Who may connect after taking the others off, to check they are.
+    ShareCheck,
     /// The session's read-only clients, to detach when sharing stops.
     Watchers(SessionId),
     /// The reply does not matter.
@@ -235,6 +237,33 @@ pub const ACCESS_LIST_VERSION: Version = Version { major: 3, minor: 3 };
 /// so read-only access for another account would be a promise tmux
 /// does not keep.
 pub const READ_ONLY_VERSION: Version = Version { major: 3, minor: 9 };
+
+/// How Stop sharing went, as its replies come in.
+#[derive(Debug)]
+struct Unsharing {
+    /// How access ended, once known.
+    access: Option<Access>,
+    /// The read-only watchers detached (`None` inside: not listed), once
+    /// known.
+    watchers: Option<Option<usize>>,
+    /// The account that owns the shared server.
+    owner: String,
+}
+
+/// How Stop sharing ended for other accounts' access.
+#[derive(Debug)]
+enum Access {
+    /// tmux lists nobody else any more.
+    Stopped,
+    /// tmux still lists these accounts.
+    Left(Vec<String>),
+    /// tmux did not say who may connect.
+    Unlisted,
+    /// The session is on the private server.
+    Private,
+    /// tmux did not say which server this is.
+    Unknown,
+}
 
 /// Sharing asked for: the accounts that may join, and whether they may
 /// type.
@@ -503,8 +532,8 @@ pub struct Tmux {
     /// After a dropped connection: the session to attach again is this
     /// one on the shared server, which keeps whom it lets in.
     reattach_shared: Option<String>,
-    /// Stop sharing found the shared server and took others off it.
-    unshared: bool,
+    /// Stop sharing, while its replies come in.
+    unsharing: Option<Unsharing>,
     /// tmux said it is a development build (`next-3.9`, `master`,
     /// `openbsd-7.6`): its version does not say which fixes it has.
     dev_build: bool,
@@ -626,7 +655,7 @@ impl Tmux {
             typed_shared: false,
             on_shared: false,
             reattach_shared: None,
-            unshared: false,
+            unsharing: None,
             dev_build: false,
         }
     }
@@ -778,7 +807,15 @@ impl Tmux {
         if !self.client.is_control() || self.joined.is_some() {
             return out;
         }
-        self.unshared = false;
+        self.unsharing = Some(Unsharing {
+            access: None,
+            watchers: if self.session.is_some() {
+                None
+            } else {
+                Some(None)
+            },
+            owner: String::new(),
+        });
         self.send(
             "display-message -p '#{socket_path}'",
             Tag::UnshareSocket,
@@ -792,6 +829,73 @@ impl Tmux {
             );
         }
         out
+    }
+
+    /// The accounts besides the owner and root that `server-access -l`
+    /// (its reply `lines`) lets in.
+    fn others_allowed(&self, lines: &[Vec<u8>]) -> Vec<String> {
+        let owner = self.unsharing.as_ref().map(|u| u.owner.as_str());
+        lines
+            .iter()
+            .filter_map(|line| {
+                let text = String::from_utf8_lossy(line);
+                text.split_whitespace()
+                    .next()
+                    .and_then(command::account_name)
+            })
+            // tmux will not take off the owner or root.
+            .filter(|a| a != "root" && Some(a.as_str()) != owner)
+            .collect()
+    }
+
+    /// Stop sharing knows how access ended.
+    fn unshare_step(&mut self, access: Access, out: &mut Vec<Action>) {
+        if let Some(u) = &mut self.unsharing {
+            u.access = Some(access);
+        }
+        self.unshare_told(out);
+    }
+
+    /// Tells how Stop sharing went, once both access and watchers are done.
+    fn unshare_told(&mut self, out: &mut Vec<Action>) {
+        let Some(Unsharing {
+            access: Some(access),
+            watchers: Some(watchers),
+            ..
+        }) = &self.unsharing
+        else {
+            return;
+        };
+        let detached = match watchers {
+            None => {
+                "FeroSSH could not list this session's watchers, so none were detached.".to_owned()
+            }
+            Some(0) => "Nobody was watching read-only.".to_owned(),
+            Some(1) => "1 read-only watcher was detached.".to_owned(),
+            Some(n) => format!("{n} read-only watchers were detached."),
+        };
+        let access = match access {
+            Access::Stopped => "Stopped sharing: tmux confirms no other account may connect \
+                                to your shared tmux server, and its socket was made private."
+                .to_owned(),
+            Access::Left(left) => format!(
+                "Sharing has NOT fully stopped: tmux still lets in {}. Try Stop sharing \
+                 again, or run tmux server-access -d for them.",
+                left.join(", ")
+            ),
+            Access::Unlisted => "Sharing may not have stopped: tmux did not list who may \
+                                 connect, so FeroSSH cannot confirm other accounts are off."
+                .to_owned(),
+            Access::Private => "This session is on your private tmux, which other accounts \
+                                cannot reach, so nobody needed taking off."
+                .to_owned(),
+            Access::Unknown => "FeroSSH could not tell which tmux server this session is on, \
+                                so it took nobody off. Attach to the shared session and stop \
+                                sharing there."
+                .to_owned(),
+        };
+        out.push(Action::Tell(format!("{access} {detached}")));
+        self.unsharing = None;
     }
 
     /// Opens the shared server to `share.accounts`, once it is known to
@@ -1155,76 +1259,69 @@ impl Tmux {
             }
             Tag::UnshareSocket => {
                 let socket = first();
-                if ok && command::is_share_socket(&socket) {
-                    self.unshared = true;
-                    self.send("server-access -l", Tag::ShareList, out);
-                    self.send(
-                        &format!(
-                            "run-shell {}",
-                            command::quote(&format!("chmod 600 {socket}"))
-                        ),
-                        Tag::Ignore,
-                        out,
-                    );
+                let owner = ok.then(|| command::share_owner(&socket)).flatten();
+                match (ok, owner) {
+                    (true, Some(owner)) => {
+                        if let Some(u) = &mut self.unsharing {
+                            u.owner = owner;
+                        }
+                        // tmux does not say whether a shell command
+                        // worked; who may connect is what it enforces,
+                        // and that is checked below.
+                        self.send(
+                            &format!(
+                                "run-shell {}",
+                                command::quote(&format!("chmod 600 {socket}"))
+                            ),
+                            Tag::Ignore,
+                            out,
+                        );
+                        self.send("server-access -l", Tag::ShareList, out);
+                    }
+                    (true, None) => self.unshare_step(Access::Private, out),
+                    (false, _) => self.unshare_step(Access::Unknown, out),
                 }
             }
             Tag::ShareList => {
                 if !ok {
-                    out.push(Action::Tell(
-                        "tmux did not list who may connect; nobody was taken off.".into(),
-                    ));
+                    self.unshare_step(Access::Unlisted, out);
                     return;
                 }
-                let mut gone = Vec::new();
-                for line in &lines {
-                    let text = String::from_utf8_lossy(line);
-                    let Some(account) = text
-                        .split_whitespace()
-                        .next()
-                        .and_then(command::account_name)
-                    else {
-                        continue;
-                    };
-                    // tmux refuses to take off the owner and root; the
-                    // owner's refusal is ignored.
-                    if account != "root" {
-                        gone.push(account);
-                    }
-                }
-                for account in &gone {
-                    let line = format!("server-access -d {}", command::quote(account));
+                for account in self.others_allowed(&lines) {
+                    let line = format!("server-access -d {}", command::quote(&account));
                     self.send(&line, Tag::Ignore, out);
                 }
+                self.send("server-access -l", Tag::ShareCheck, out);
+            }
+            Tag::ShareCheck => {
+                let access = if !ok {
+                    Access::Unlisted
+                } else {
+                    match self.others_allowed(&lines) {
+                        left if left.is_empty() => Access::Stopped,
+                        left => Access::Left(left),
+                    }
+                };
+                self.unshare_step(access, out);
             }
             Tag::Watchers(session) => {
-                if !ok || self.session.as_ref().map(|(s, _)| *s) != Some(session) {
-                    return;
-                }
-                let mut watchers = 0;
-                for line in &lines {
-                    let text = String::from_utf8_lossy(line);
-                    if let Some(name) = text.trim().strip_suffix(" 1") {
-                        let line = format!("detach-client -t {}", command::quote(name));
-                        self.send(&line, Tag::Ignore, out);
-                        watchers += 1;
+                let mut watchers = None;
+                if ok && self.session.as_ref().map(|(s, _)| *s) == Some(session) {
+                    let mut n = 0;
+                    for line in &lines {
+                        let text = String::from_utf8_lossy(line);
+                        if let Some(name) = text.trim().strip_suffix(" 1") {
+                            let line = format!("detach-client -t {}", command::quote(name));
+                            self.send(&line, Tag::Ignore, out);
+                            n += 1;
+                        }
                     }
+                    watchers = Some(n);
                 }
-                let detached = match watchers {
-                    0 => "Nobody was watching read-only.".to_owned(),
-                    1 => "1 read-only watcher was detached.".to_owned(),
-                    n => format!("{n} read-only watchers were detached."),
-                };
-                out.push(Action::Tell(if std::mem::take(&mut self.unshared) {
-                    format!(
-                        "Stopped sharing: other accounts are off your shared tmux server and its \
-                         socket is private again. {detached}"
-                    )
-                } else {
-                    format!(
-                        "This session is on your private tmux, which other accounts cannot \
-                         reach. {detached}"
-                    )
-                }));
+                if let Some(u) = &mut self.unsharing {
+                    u.watchers = Some(watchers);
+                }
+                self.unshare_told(out);
             }
             Tag::ModeOption => self.mode_option = ok.then(first).filter(|m| !m.is_empty()),
             Tag::LayoutOption => {
@@ -2725,22 +2822,66 @@ mod tests {
         assert_eq!(
             writes(&a),
             [
-                "server-access -l",
                 "run-shell 'chmod 600 /tmp/ferossh-share-alice/default'",
+                "server-access -l",
                 "detach-client -t 'client-9'",
             ]
         );
-        let a = t.feed(
-            &mut ws,
-            &reply(
-                n + 3,
-                &["alice (W)".into(), "bob (R)".into(), "root (W)".into()],
-            ),
+        // Not told yet: nobody has been taken off.
+        assert!(tells(&a).is_empty(), "{a:?}");
+        let mut input = reply(n + 3, &[]);
+        input.extend(reply(
+            n + 4,
+            &["alice (W)".into(), "bob (R)".into(), "root (W)".into()],
+        ));
+        let a = t.feed(&mut ws, &input);
+        assert_eq!(writes(&a), ["server-access -d 'bob'", "server-access -l"]);
+        assert!(tells(&a).is_empty(), "{a:?}");
+        // The check still lists bob: the owner is told so.
+        let mut input = reply(n + 5, &[]);
+        input.extend(reply(n + 6, &[]));
+        input.extend(reply(n + 7, &["alice (W)".into(), "bob (R)".into()]));
+        let a = t.feed(&mut ws, &input);
+        let told = tells(&a);
+        assert!(
+            told[0].contains("NOT fully stopped") && told[0].contains("bob"),
+            "{a:?}"
         );
-        assert_eq!(
-            writes(&a),
-            ["server-access -d 'alice'", "server-access -d 'bob'"]
-        );
+        assert!(told[0].contains("1 read-only watcher"), "{a:?}");
+
+        // Again, and this time tmux takes bob off.
+        let a = t.unshare();
+        assert_eq!(writes(&a).len(), 2);
+        let mut input = reply(n + 8, &["/tmp/ferossh-share-alice/default".into()]);
+        input.extend(reply(n + 9, &["/dev/pts/3 0".into()]));
+        t.feed(&mut ws, &input);
+        let mut input = reply(n + 10, &[]);
+        input.extend(reply(n + 11, &["alice (W)".into(), "bob (R)".into()]));
+        t.feed(&mut ws, &input);
+        let mut input = reply(n + 12, &[]);
+        input.extend(reply(n + 13, &["alice (W)".into()]));
+        let a = t.feed(&mut ws, &input);
+        let told = tells(&a);
+        assert_eq!(told.len(), 1, "{a:?}");
+        assert!(told[0].starts_with("Stopped sharing"), "{a:?}");
+        assert!(told[0].contains("Nobody was watching"), "{a:?}");
+    }
+
+    #[test]
+    fn stop_sharing_says_so_when_tmux_does_not_name_its_server() {
+        let (mut t, mut ws, a) =
+            attached(None, None, &[pane_line(0, 0, 80, 24, "b25f,80x24,0,0,0")]);
+        let mut n = 4;
+        for _ in writes(&a) {
+            n += 1;
+            t.feed(&mut ws, &reply(n, &[]));
+        }
+        t.unshare();
+        let mut input = format!("%begin 9 {} 1\nno\n%error 9 {} 1\n", n + 1, n + 1).into_bytes();
+        input.extend(reply(n + 2, &[]));
+        let a = t.feed(&mut ws, &input);
+        assert!(writes(&a).is_empty(), "{a:?}");
+        assert!(tells(&a)[0].contains("could not tell"), "{a:?}");
     }
 
     /// Attaches to a session with the given panes and saved layout; returns

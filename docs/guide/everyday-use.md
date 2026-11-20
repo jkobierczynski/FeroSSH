@@ -580,7 +580,7 @@ A colleague can watch your tmux session live, or join it to type along. Session 
 
 Session > tmux > Join a shared session asks whose session (empty for your own account) and which one (empty to pick). FeroSSH joins read-only unless you tick **Type into it too**, never changes the owner's window sizes, layout, splits or options, and closing a pane of a shared session only leaves it. It checks that `/tmp/ferossh-share-OWNER` really belongs to that account before connecting, so nobody else can pose as them.
 
-Session > tmux > Stop sharing takes every other account off the shared server (which detaches them), makes its socket private again, and detaches whoever watches your session read-only.
+Session > tmux > Stop sharing takes every other account off the shared server (which detaches them), makes its socket private again, and detaches whoever watches your session read-only. It then asks tmux again who may connect, and says so plainly if any other account is still let in.
 
 Sharing and joining with another account type a short `sh -c '...'` script at the pane's shell, so they work from any login shell (fish and csh included). After a dropped connection, a session on the shared server is attached there again, and the accounts already let in keep their access until Stop sharing.
 
