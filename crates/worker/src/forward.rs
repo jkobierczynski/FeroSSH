@@ -8,11 +8,16 @@
 //! forward. Remote forwards and X11 start at the server ([`incoming`]):
 //! the server opens a channel for a port this connection asked it to
 //! listen on ([`remote`]), or for an X client, and the UI connects it on.
+//! Either end may be a Unix socket: `direct-streamlocal@openssh.com` to
+//! one on the server, `streamlocal-forward@openssh.com` for the server to
+//! listen on one.
 //!
 //! Untrusted bytes are parsed here, inside the sandbox: SOCKS requests
-//! from local programs, and X11 connection setups from the server, where
-//! the fake cookie the server was given is checked. The real cookie never
-//! comes here: the UI checks the setup again and swaps it in.
+//! from local programs, SOCKS requests from programs on the server (a
+//! remote forward without a target, `-R 1080`), and X11 connection
+//! setups from the server, where the fake cookie the server was given is
+//! checked. The real cookie never comes here: the UI checks the setup
+//! again and swaps it in.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -20,12 +25,12 @@ use std::time::Duration;
 
 use ferossh_forward::socks::{self, Handshake, Step};
 use ferossh_forward::x11::{MAX_SETUP, MIT_COOKIE, Setup, swap_cookie};
-use ferossh_ipc::{ChannelId, MAX_DATA_CHUNK, Message, STREAM_WINDOW};
+use ferossh_ipc::{ChannelId, ForwardTarget, MAX_DATA_CHUNK, Message, STREAM_WINDOW};
 use russh::client::Msg;
 use russh::{Channel, ChannelMsg};
 use tokio::sync::mpsc;
 
-use crate::session::{Connection, Connections, Route};
+use crate::session::{Connection, Connections, RemoteListener, Route};
 
 /// Data from the server held for a stream whose UI side is slow, before
 /// the worker stops reading it. russh then holds the rest, which in the
@@ -38,9 +43,11 @@ const OPEN_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Where a channel the server opened comes from.
 pub(crate) enum Incoming {
-    /// A connection to a port a remote forward listens on.
+    /// A connection to a port (or socket) a remote forward listens on;
+    /// with `socks` it asks where to go first.
     Remote {
         listener: ChannelId,
+        socks: bool,
         origin: (String, u32),
     },
     /// An X client.
@@ -128,6 +135,23 @@ impl Stream {
                 Some(Message::Eof { .. }) => self.ui_eof = true,
                 Some(Message::Close { .. }) | None => return FromUi::Gone,
                 Some(_) => {}
+            }
+        }
+    }
+
+    /// Waits for the UI's word that it connected a remote SOCKS stream:
+    /// `false` when it closed the stream instead.
+    async fn connected(&mut self) -> bool {
+        loop {
+            match self.inbox.recv().await {
+                Some(Message::ForwardConnected { .. }) => return true,
+                Some(Message::Window { bytes, .. }) => {
+                    self.credit = self.credit.saturating_add(bytes).min(STREAM_WINDOW);
+                }
+                Some(Message::Eof { .. }) => self.ui_eof = true,
+                Some(Message::Close { .. }) | None => return false,
+                // Nothing comes from the target before it is connected.
+                Some(_) => return false,
             }
         }
     }
@@ -319,7 +343,7 @@ async fn finish(
 pub(crate) async fn open(
     channel: ChannelId,
     connection: ChannelId,
-    target: Option<(String, u16)>,
+    target: Option<ForwardTarget>,
     origin: (String, u16),
     keep: bool,
     inbox: mpsc::UnboundedReceiver<Message>,
@@ -344,18 +368,18 @@ pub(crate) async fn open(
 async fn open_stream(
     stream: &mut Stream,
     connection: ChannelId,
-    target: Option<(String, u16)>,
+    target: Option<ForwardTarget>,
     origin: (String, u16),
     keep: bool,
     connections: &Connections,
 ) -> Result<(Channel<Msg>, Option<Arc<Connection>>), String> {
-    let (host, port, socks) = match target {
-        Some((host, port)) => (host, port, None),
+    let (target, socks) = match target {
+        Some(target) => (target, None),
         None => {
             let (host, port, hs) = tokio::time::timeout(HANDSHAKE_TIMEOUT, stream.socks())
                 .await
                 .map_err(|_| "The program took too long over its SOCKS request.".to_owned())??;
-            (host, port, Some(hs))
+            (ForwardTarget::Tcp(host, port), Some(hs))
         }
     };
     let Some((conn, ..)) = connections.get(connection) else {
@@ -366,14 +390,38 @@ async fn open_stream(
         }
         return Err("That connection is closed.".into());
     };
-    let opening = tokio::time::timeout(
-        OPEN_TIMEOUT,
-        conn.channel_open_direct_tcpip(host.clone(), port.into(), origin.0, origin.1.into()),
-    );
+    let opening = async {
+        match &target {
+            ForwardTarget::Tcp(host, port) => {
+                let open = conn.channel_open_direct_tcpip(
+                    host.clone(),
+                    (*port).into(),
+                    origin.0,
+                    origin.1.into(),
+                );
+                tokio::time::timeout(OPEN_TIMEOUT, open).await
+            }
+            ForwardTarget::Unix(path) => {
+                let open = conn.channel_open_direct_streamlocal(path.clone());
+                tokio::time::timeout(OPEN_TIMEOUT, open).await
+            }
+        }
+    };
     let opened = stream.wait(opening).await;
     // Only a stream asked to keep the connection open holds it.
     let held = keep.then_some(conn);
-    let failed = |why: String| format!("{host}:{port}: {why}");
+    let (host, port) = match target {
+        ForwardTarget::Tcp(host, port) => (host, port),
+        // The UI shows a socket by its path, with no port.
+        ForwardTarget::Unix(path) => (path, 0),
+    };
+    let failed = |why: String| {
+        if port == 0 {
+            format!("{host}: {why}")
+        } else {
+            format!("{host}:{port}: {why}")
+        }
+    };
     let ch = match opened? {
         Ok(Ok(ch)) => ch,
         Ok(Err(e)) => {
@@ -423,8 +471,33 @@ pub(crate) async fn incoming(
     let Some(inbox) = route(&connections, id) else {
         return;
     };
+    let mut socks = None;
     let (listener, x11, origin, held) = match from {
-        Incoming::Remote { listener, origin } => (listener, false, origin, Vec::new()),
+        Incoming::Remote {
+            listener,
+            socks: false,
+            origin,
+        } => (listener, false, origin, Vec::new()),
+        Incoming::Remote {
+            listener,
+            socks: true,
+            origin,
+        } => {
+            let request = tokio::time::timeout(HANDSHAKE_TIMEOUT, server_socks(&mut channel));
+            match request.await {
+                Ok(Some((host, port, hs, rest))) => {
+                    socks = Some((host, port, hs));
+                    (listener, false, origin, rest)
+                }
+                // Not SOCKS, something unsupported, or too slow: nothing
+                // on this side hears of it.
+                _ => {
+                    connections.routes.remove(id);
+                    let _ = channel.close().await;
+                    return;
+                }
+            }
+        }
         Incoming::X11 {
             connection,
             fake,
@@ -449,14 +522,75 @@ pub(crate) async fn incoming(
         x11,
         origin_host: origin.0,
         origin_port: u16::try_from(origin.1).unwrap_or(0),
+        target: socks.as_ref().map(|(h, p, _)| (h.clone(), *p)),
     };
     if out.send(msg).await.is_err() {
         connections.routes.remove(id);
         return;
     }
-    let stream = Stream::new(id, out.clone(), inbox);
+    let mut stream = Stream::new(id, out.clone(), inbox);
+    if let Some((host, port, hs)) = socks {
+        // The UI connects to the target first: only then does the
+        // client hear that it may talk.
+        let connected = tokio::time::timeout(OPEN_TIMEOUT, stream.connected()).await;
+        let ok = matches!(connected, Ok(true));
+        let code = if ok {
+            socks::reply::SUCCEEDED
+        } else {
+            socks::reply::HOST_UNREACHABLE
+        };
+        let replied = channel.data(&hs.finish(code)[..]).await.is_ok();
+        if !ok || !replied {
+            let _ = channel.close().await;
+            let reason = if ok {
+                String::new()
+            } else {
+                format!("{}: this PC could not connect.", target_text(&host, port))
+            };
+            finish(id, Err(reason), &out, &connections).await;
+            return;
+        }
+    }
     let result = stream.relay(channel, held).await;
     finish(id, result, &out, &connections).await;
+}
+
+fn target_text(host: &str, port: u16) -> String {
+    if host.contains(':') {
+        format!("[{host}]:{port}")
+    } else {
+        format!("{host}:{port}")
+    }
+}
+
+/// Reads a SOCKS request from a program on the server, through a remote
+/// forward without a target: the host, the port, the handshake (for the
+/// final reply), and whatever the program sent after the request.
+/// `None` for anything that is not a SOCKS CONNECT FeroSSH supports,
+/// after telling the program so.
+async fn server_socks(channel: &mut Channel<Msg>) -> Option<(String, u16, Handshake, Vec<u8>)> {
+    let mut hs = Handshake::new();
+    loop {
+        let data = match channel.wait().await? {
+            ChannelMsg::Data { data } => data,
+            ChannelMsg::Eof | ChannelMsg::Close => return None,
+            _ => continue,
+        };
+        match hs.feed(&data) {
+            Step::More { reply } => {
+                if !reply.is_empty() {
+                    channel.data(&reply[..]).await.ok()?;
+                }
+            }
+            Step::Connect { host, port, rest } => return Some((host, port, hs, rest)),
+            Step::Refuse { reply } => {
+                if !reply.is_empty() {
+                    let _ = channel.data(&reply[..]).await;
+                }
+                return None;
+            }
+        }
+    }
 }
 
 /// Reads an X client's connection setup and returns it as it is, or
@@ -480,13 +614,26 @@ async fn x11_setup(channel: &mut Channel<Msg>, fake: &[u8]) -> Option<Vec<u8>> {
     }
 }
 
+/// What a remote forward asks the server to listen on.
+#[derive(Debug, Clone)]
+pub(crate) enum Listen {
+    /// An address and a port; with `socks` each connection asks where to
+    /// go.
+    Port {
+        bind: String,
+        port: u16,
+        socks: bool,
+    },
+    /// A Unix socket on the server.
+    Socket(String),
+}
+
 /// Asks the server to listen for a remote forward, and keeps the listener
 /// until the UI closes it or the connection ends.
 pub(crate) async fn remote(
     channel: ChannelId,
     connection: ChannelId,
-    bind: String,
-    port: u16,
+    listen: Listen,
     mut inbox: mpsc::Receiver<Message>,
     out: mpsc::Sender<Message>,
     connections: Connections,
@@ -497,24 +644,56 @@ pub(crate) async fn remote(
             let weak = Arc::downgrade(&conn);
             let mut alive = forwards.alive();
             let asked = tokio::select! {
-                r = conn.tcpip_forward(bind.clone(), port.into()) => Some(r),
+                r = async {
+                    match &listen {
+                        Listen::Port { bind, port, .. } => {
+                            conn.tcpip_forward(bind.clone(), (*port).into()).await
+                        }
+                        Listen::Socket(path) => {
+                            conn.streamlocal_forward(path.clone()).await.map(|()| 0)
+                        }
+                    }
+                } => Some(r),
                 _ = inbox.recv() => None,
             };
             drop(conn);
             match asked {
                 None => String::new(),
-                Some(Err(_)) => format!(
-                    "The server refused to listen on {}:{port} (the port may be taken, or the \
-                     server forbids remote forwarding).",
-                    if bind.is_empty() { "*" } else { &bind }
-                ),
+                Some(Err(_)) => match &listen {
+                    Listen::Port { bind, port, .. } => format!(
+                        "The server refused to listen on {}:{port} (the port may be taken, or \
+                         the server forbids remote forwarding).",
+                        if bind.is_empty() { "*" } else { bind }
+                    ),
+                    Listen::Socket(path) => format!(
+                        "The server refused to listen on {path} (the socket may exist already, \
+                         its folder may be missing, or the server forbids socket forwarding)."
+                    ),
+                },
                 Some(Ok(chosen)) => {
-                    let bound = if port == 0 { chosen } else { port.into() };
-                    forwards.add_remote(&bind, bound, channel);
-                    let listening = Message::ForwardListening {
-                        channel,
-                        port: u16::try_from(bound).unwrap_or(0),
+                    let (registered, port) = match &listen {
+                        Listen::Port { bind, port, socks } => {
+                            let bound = if *port == 0 { chosen } else { (*port).into() };
+                            (
+                                RemoteListener::Port {
+                                    bind: bind.clone(),
+                                    port: bound,
+                                    socks: *socks,
+                                    listener: channel,
+                                },
+                                u16::try_from(bound).unwrap_or(0),
+                            )
+                        }
+                        Listen::Socket(path) => (
+                            RemoteListener::Socket {
+                                path: path.clone(),
+                                listener: channel,
+                            },
+                            0,
+                        ),
                     };
+                    forwards.add_remote(registered);
+                    let listening = Message::ForwardListening { channel, port };
                     let reason = if out.send(listening).await.is_err() {
                         String::new()
                     } else {
@@ -530,11 +709,17 @@ pub(crate) async fn remote(
                     };
                     forwards.remove_remote(channel);
                     if let Some(conn) = weak.upgrade() {
-                        let _ = tokio::time::timeout(
-                            Duration::from_secs(5),
-                            conn.cancel_tcpip_forward(bind.clone(), bound),
-                        )
-                        .await;
+                        let cancel = async {
+                            match &listen {
+                                Listen::Port { bind, .. } => {
+                                    conn.cancel_tcpip_forward(bind.clone(), port.into()).await
+                                }
+                                Listen::Socket(path) => {
+                                    conn.cancel_streamlocal_forward(path.clone()).await
+                                }
+                            }
+                        };
+                        let _ = tokio::time::timeout(Duration::from_secs(5), cancel).await;
                     }
                     reason
                 }

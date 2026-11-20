@@ -628,6 +628,193 @@ fn forwards_change_on_a_live_connection() {
     forwarder.stop(conn);
 }
 
+/// Echoes every connection to a Unix socket at `path` back.
+fn unix_echo_server(path: &Path) {
+    let l = std::os::unix::net::UnixListener::bind(path).unwrap();
+    std::thread::spawn(move || {
+        for s in l.incoming().flatten() {
+            std::thread::spawn(move || {
+                let mut r = s.try_clone().unwrap();
+                let mut w = s;
+                let _ = std::io::copy(&mut r, &mut w);
+            });
+        }
+    });
+}
+
+fn unix_echo_through(path: &Path, data: &[u8]) -> Vec<u8> {
+    let mut s = std::os::unix::net::UnixStream::connect(path).unwrap();
+    s.set_read_timeout(Some(Duration::from_secs(20))).unwrap();
+    s.write_all(data).unwrap();
+    let mut got = vec![0u8; data.len()];
+    s.read_exact(&mut got).unwrap();
+    got
+}
+
+/// Waits for a Unix socket the server makes to accept connections.
+fn wait_for_socket(path: &Path) {
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while std::os::unix::net::UnixStream::connect(path).is_err() {
+        assert!(
+            Instant::now() < deadline,
+            "{} never listened",
+            path.display()
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// A remote forward without a target (`-R port`: SOCKS on the server)
+/// and forwards to and from Unix sockets, on both sides. The test sshd
+/// runs on this machine, so this process plays the programs on the
+/// server too: it speaks SOCKS to the server's port and connects to the
+/// server's sockets.
+#[test]
+fn remote_socks_and_unix_socket_forwards() {
+    let Some(server) = start_sshd("sockets", "") else {
+        return;
+    };
+    let user = local_user();
+    let echo = echo_server();
+    let dir = server.dir.clone();
+    let echo_sock = dir.join("echo.sock");
+    unix_echo_server(&echo_sock);
+    let env = Env {
+        home: server.dir.clone(),
+        local_user: user.clone(),
+        vars: Vec::new(),
+        config: format!(
+            "Host testhost\n  HostName 127.0.0.1\n  Port {}\n  User {user}\n  \
+             IdentityFile ~/.ssh/id_ed25519\n",
+            server.port
+        ),
+    };
+    let target = Target::resolve("testhost", &env).unwrap();
+    let (ui_read, worker_write) = std::io::pipe().unwrap();
+    let (worker_read, ui_write) = std::io::pipe().unwrap();
+    std::thread::spawn(move || ferossh_worker::run_blocking(worker_read, worker_write));
+    let (forwarder, runner) = Forwarder::new();
+    let link = Link::start(ui_read, ui_write, || {}, forwarder.sink()).unwrap();
+    runner.spawn(link.sender(), || {}).unwrap();
+    let mut session = SshSession::new(1, target, env.known_hosts());
+    let effects = session.start(80, 24);
+    let mut shell = Shell {
+        session,
+        link,
+        broker: Broker::spawn(|| {}).unwrap(),
+        forwarder: forwarder.clone(),
+        effects,
+        shown: String::new(),
+        output: String::new(),
+    };
+    shell.until("the login", |s| {
+        s.session.state() == State::Connected && !s.forwarder.view().is_empty()
+    });
+    let conn = shell.session.connection;
+    let spec = |t: String| ferossh_config::forward::parse_option(&t).unwrap();
+
+    let (socks_port, to_sock_port) = (free_port(), free_port());
+    let local_sock = dir.join("local.sock");
+    let remote_sock = dir.join("remote.sock");
+    let remote_to_sock = dir.join("remote2.sock");
+    let echo_sock_text = echo_sock.display().to_string();
+    let specs = [
+        spec(format!("-R {socks_port}")),
+        spec(format!("-L {}:127.0.0.1:{echo}", local_sock.display())),
+        spec(format!("-L 127.0.0.1:{to_sock_port}:{echo_sock_text}")),
+        spec(format!("-R {}:127.0.0.1:{echo}", remote_sock.display())),
+        spec(format!("-R {}:{echo_sock_text}", remote_to_sock.display())),
+    ];
+    for s in &specs {
+        forwarder.add(conn, s.clone());
+    }
+    let fwds = shell.settled(specs.len());
+    assert!(
+        fwds.iter()
+            .all(|f| matches!(f.state, FwdState::Listening(_))),
+        "{fwds:?}"
+    );
+
+    let local_sock_file = local_sock.clone();
+    let checks = std::thread::spawn(move || {
+        // SOCKS on the server: this PC connects where the client asks.
+        assert_eq!(
+            echo_through(socks5(socks_port, echo), b"server socks5"),
+            b"server socks5"
+        );
+        assert_eq!(
+            echo_through(socks4a(socks_port, echo), b"server 4a"),
+            b"server 4a"
+        );
+        // Somewhere nothing listens: the client hears so.
+        let closed = free_port();
+        let mut s = TcpStream::connect(("127.0.0.1", socks_port)).unwrap();
+        s.set_read_timeout(Some(Duration::from_secs(20))).unwrap();
+        s.write_all(&[5, 1, 0]).unwrap();
+        let mut reply = [0u8; 2];
+        s.read_exact(&mut reply).unwrap();
+        let mut req = vec![5, 1, 0, 1, 127, 0, 0, 1];
+        req.extend(closed.to_be_bytes());
+        s.write_all(&req).unwrap();
+        let mut reply = [0u8; 10];
+        s.read_exact(&mut reply).unwrap();
+        assert_ne!(reply[1], 0, "connecting to a closed port succeeded");
+        // Not SOCKS at all: closed without a word.
+        let mut s = TcpStream::connect(("127.0.0.1", socks_port)).unwrap();
+        s.set_read_timeout(Some(Duration::from_secs(20))).unwrap();
+        s.write_all(b"GET / HTTP/1.0\r\n\r\n").unwrap();
+        let mut rest = Vec::new();
+        match s.read_to_end(&mut rest) {
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::ConnectionReset => {}
+            Err(e) => panic!("the connection stayed open: {e}"),
+        }
+        assert!(rest.is_empty(), "{rest:?}");
+
+        // A socket here to a port there, a port here to a socket there.
+        assert_eq!(
+            unix_echo_through(&local_sock, b"from a socket"),
+            b"from a socket"
+        );
+        let s = TcpStream::connect(("127.0.0.1", to_sock_port)).unwrap();
+        assert_eq!(echo_through(s, b"to a socket"), b"to a socket");
+        // Sockets on the server, to a port and to a socket here.
+        wait_for_socket(&remote_sock);
+        assert_eq!(
+            unix_echo_through(&remote_sock, b"remote socket"),
+            b"remote socket"
+        );
+        wait_for_socket(&remote_to_sock);
+        assert_eq!(
+            unix_echo_through(&remote_to_sock, b"socket to socket"),
+            b"socket to socket"
+        );
+    });
+    shell.until("the checks", |_| checks.is_finished());
+    checks.join().unwrap();
+
+    let fwds = shell.forwarder.view().remove(0).forwards;
+    // The one that was not SOCKS never reached this side.
+    assert_eq!(fwds[0].total, 3, "{fwds:?}");
+    for f in &fwds[1..] {
+        assert!(f.total >= 1, "{f:?}");
+    }
+    // Stopping the local socket forward removes its socket file.
+    forwarder.remove(conn, 1);
+    shell.until("the socket forward to stop", |s| {
+        s.forwarder
+            .view()
+            .first()
+            .is_some_and(|c| c.forwards.len() == specs.len() - 1)
+    });
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while local_sock_file.exists() {
+        assert!(Instant::now() < deadline, "the socket file stayed");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    forwarder.stop(conn);
+}
+
 /// Whether `program` is on the PATH.
 fn on_path(program: &str) -> bool {
     std::env::var_os("PATH")

@@ -26,7 +26,7 @@ use ferossh_auth::keyfile::KeyFile;
 use ferossh_auth::sk::soft::SoftAuthenticator;
 use ferossh_auth::sk::{self, DEFAULT_APPLICATION, EnrollRequest, SkAlgorithm};
 use ferossh_auth::userauth;
-use ferossh_ipc::{Message, PROTOCOL_VERSION, Timing};
+use ferossh_ipc::{ForwardTarget, Message, PROTOCOL_VERSION, Timing};
 use ferossh_term::{Action, Settings, Terminal};
 use tokio::sync::mpsc;
 
@@ -1509,7 +1509,7 @@ async fn through(jump: u16, target: &str, keys: &[KeyFile], command: &str) -> Ou
                     .send(Message::ForwardOpen {
                         channel: TUNNEL,
                         connection: 1,
-                        target: Some((target.into(), 22)),
+                        target: Some(ForwardTarget::Tcp(target.into(), 22)),
                         origin_host: "127.0.0.1".into(),
                         origin_port: 0,
                         keep: true,
@@ -1627,6 +1627,8 @@ async fn remote_forwards_on_servers_of_every_age() {
                 connection: 1,
                 bind: "127.0.0.1".into(),
                 port: 4242,
+                socket: None,
+                socks: false,
             })
             .await
             .unwrap();

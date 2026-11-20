@@ -13250,7 +13250,7 @@ impl Window {
             return None;
         }
         let url = pv.url;
-        let target = (url.target().to_owned(), url.port);
+        let target = ferossh_config::forward::Target::Tcp(url.target().to_owned(), url.port);
         let view = self.forward_view();
         if !view.iter().any(|v| v.connection == pv.connection) {
             return Some(Command::Notice(format!(
@@ -13259,9 +13259,12 @@ impl Window {
             )));
         }
         // A forward that already goes there serves.
-        if let Some(f) = forwards_of(&view, pv.connection)
-            .find(|f| f.spec.kind == ForwardKind::Local && f.spec.target.as_ref() == Some(&target))
-        {
+        if let Some(f) = forwards_of(&view, pv.connection).find(|f| {
+            // A socket listener has no address a browser could open.
+            f.spec.kind == ForwardKind::Local
+                && f.spec.socket.is_none()
+                && f.spec.target.as_ref() == Some(&target)
+        }) {
             match &f.state {
                 FwdState::Listening(addrs) => {
                     return url
@@ -13290,6 +13293,7 @@ impl Window {
             kind: ForwardKind::Local,
             bind: Some("127.0.0.1".into()),
             port: local,
+            socket: None,
             target: Some(target),
         };
         let w = self.workers.get(&pv.connection)?;

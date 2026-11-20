@@ -1266,7 +1266,10 @@ impl SshSession {
         let open = Message::ForwardOpen {
             channel: tunnel,
             connection: from,
-            target: Some((next.target.hostname.clone(), next.target.port)),
+            target: Some(ferossh_ipc::ForwardTarget::Tcp(
+                next.target.hostname.clone(),
+                next.target.port,
+            )),
             origin_host: "127.0.0.1".into(),
             origin_port: 0,
             // The stream holds the jump host's connection for as long as
@@ -3537,7 +3540,7 @@ mod tests {
                     Message::ForwardOpen {
                         channel: 3,
                         connection: 2,
-                        target: Some((h, 22)),
+                        target: Some(ferossh_ipc::ForwardTarget::Tcp(h, 22)),
                         keep: true,
                         ..
                     },
@@ -3561,7 +3564,7 @@ mod tests {
             matches!(
                 msgs[..],
                 [
-                    Message::ForwardOpen { channel: 5, connection: 4, target: Some((h, 22)), .. },
+                    Message::ForwardOpen { channel: 5, connection: 4, target: Some(ferossh_ipc::ForwardTarget::Tcp(h, 22)), .. },
                     Message::Connect { channel: 1, tunnel: Some(5), shell: true, cols: 100, rows: 30, .. }
                 ] if h == "10.0.0.5"
             ),

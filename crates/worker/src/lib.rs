@@ -341,15 +341,20 @@ pub async fn serve(mut inbox: mpsc::Receiver<Message>, out: mpsc::Sender<Message
                 connection,
                 bind,
                 port,
+                socket,
+                socks,
             } => {
                 let Some((rx, guard)) = session(channel) else {
                     continue;
                 };
+                let listen = match socket {
+                    Some(path) => forward::Listen::Socket(path),
+                    None => forward::Listen::Port { bind, port, socks },
+                };
                 guard.track(tokio::spawn(forward::remote(
                     channel,
                     connection,
-                    bind,
-                    port,
+                    listen,
                     rx,
                     out.clone(),
                     connections.clone(),
