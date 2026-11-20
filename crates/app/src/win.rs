@@ -1463,9 +1463,11 @@ struct Window {
     /// The inventory's OS and kernel being read, by channel.
     system_reads: HashMap<ChannelId, SystemRead>,
     /// Panes opened under a connection's old name before it was renamed:
-    /// their logins are kept under the name it has now. A pane opened
-    /// after the rename keeps its own name.
-    inventory_renames: HashMap<PaneId, String>,
+    /// the name the pane connects as, and the one the connection has now,
+    /// under which its logins (reconnects too) are kept. A pane opened
+    /// after the rename, or one reused for another connection, keeps its
+    /// own name.
+    inventory_renames: HashMap<PaneId, (String, String)>,
     /// Renames and deletes the inventory file could not take yet: done
     /// first at its next change, so it follows the connections in the end.
     inventory_pending: Vec<InventoryFix>,
@@ -5666,8 +5668,8 @@ impl Window {
         let alias = self
             .inventory_renames
             .get(&id)
-            .cloned()
-            .unwrap_or_else(|| s.target.alias.clone());
+            .filter(|(was, _)| was.eq_ignore_ascii_case(&s.target.alias))
+            .map_or_else(|| s.target.alias.clone(), |(_, now)| now.clone());
         let key = s.host_key_seen.clone();
         // The connection manager's list fills only once it is shown: a
         // saved connection opened before that is looked up where kept.
@@ -5740,20 +5742,27 @@ impl Window {
     /// Connection `old` is called `new` now: its inventory row, and a read
     /// of its OS still under way, follow.
     fn inventory_renamed(&mut self, old: &str, new: &str) {
+        // Marks only for open panes still connecting as they did.
         let panes = &self.panes;
-        self.inventory_renames
-            .retain(|id, _| panes.contains_key(id));
-        let under_old: Vec<PaneId> = self
+        self.inventory_renames.retain(|id, (was, _)| {
+            matches!(panes.get(id).map(|p| &p.host),
+                Some(Host::Ssh(s)) if s.target.alias.eq_ignore_ascii_case(was))
+        });
+        let under_old: Vec<(PaneId, String)> = self
             .panes
             .iter()
             .filter_map(|(id, p)| {
                 let Host::Ssh(s) = &p.host else { return None };
-                let now = self.inventory_renames.get(id).unwrap_or(&s.target.alias);
-                now.eq_ignore_ascii_case(old).then_some(*id)
+                let now = self
+                    .inventory_renames
+                    .get(id)
+                    .map_or(&s.target.alias, |(_, now)| now);
+                now.eq_ignore_ascii_case(old)
+                    .then(|| (*id, s.target.alias.clone()))
             })
             .collect();
-        for id in under_old {
-            self.inventory_renames.insert(id, new.to_owned());
+        for (id, was) in under_old {
+            self.inventory_renames.insert(id, (was, new.to_owned()));
         }
         for r in self.system_reads.values_mut() {
             if r.alias.eq_ignore_ascii_case(old) {
