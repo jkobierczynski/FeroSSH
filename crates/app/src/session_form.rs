@@ -418,10 +418,12 @@ const MAX_TEXT: usize = 260;
 const MAX_TAGS_TEXT: usize =
     ferossh_config::settings::MAX_TAGS * (ferossh_config::settings::MAX_TAG_LEN + 2);
 
-/// The longest value field `f` keeps.
+/// The longest value field `f` keeps, typed or set. Tags keep one
+/// character more than fits, so the check refuses a list that is too
+/// long instead of saving part of it.
 fn max_text(f: Field) -> usize {
     match f {
-        Field::Tags => MAX_TAGS_TEXT,
+        Field::Tags => MAX_TAGS_TEXT + 1,
         _ => MAX_TEXT,
     }
 }
@@ -1406,13 +1408,7 @@ impl SessionForm {
             return;
         }
         if let Some(t) = self.text_mut(field.0) {
-            // One character over for tags, so the check refuses a list
-            // that is too long instead of saving part of it.
-            let keep = match field.0 {
-                Field::Tags => MAX_TAGS_TEXT + 1,
-                f => max_text(f),
-            };
-            *t = text.chars().take(keep).collect();
+            *t = text.chars().take(max_text(field.0)).collect();
         }
         self.tidy_forwards();
     }
@@ -3111,6 +3107,19 @@ mod tests {
             FieldId(Field::Tags),
             &format!("{}{}", full.join(" "), " x".repeat(400)),
         );
+        assert!(f.check().unwrap_err().contains("too long"));
+        // Typing past the limit is refused the same way.
+        f.set_text(FieldId(Field::Tags), &full.join(" "));
+        assert_eq!(f.check(), Ok(()));
+        let at = f
+            .items()
+            .iter()
+            .position(|i| *i == Item::Field(Field::Tags));
+        f.set_focus(at.unwrap());
+        for _ in 0..3 {
+            f.key(SideKey::Char('x'), 30);
+        }
+        assert_eq!(f.values.tags.chars().count(), MAX_TAGS_TEXT + 1);
         assert!(f.check().unwrap_err().contains("too long"));
     }
 
