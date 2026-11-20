@@ -14582,6 +14582,11 @@ impl Window {
     /// The Credential Manager entry of saved connection `name`'s password:
     /// its WinRM or SSH login, as the settings now describe it.
     fn saved_password_target(&self, name: &str) -> Option<String> {
+        self.saved_password_target_in(name, &ssh_env())
+    }
+
+    /// [`Self::saved_password_target`] with ssh_config already read.
+    fn saved_password_target_in(&self, name: &str, env: &Env) -> Option<String> {
         if self
             .settings
             .profile(name)
@@ -14590,8 +14595,42 @@ impl Window {
             let t = self.saved_winrm_target(name)?;
             return Some(credman::target(t.user.as_deref()?, &t.hostname, t.port));
         }
-        let t = Target::resolve(name, &ssh_env())?;
+        let t = Target::resolve(name, env)?;
         Some(credman::target(&t.user, &t.hostname, t.port))
+    }
+
+    /// The Credential Manager entries `names` keep their Windows-stored
+    /// passwords under now, to compare after a change.
+    fn windows_targets_of(&self, names: &[String]) -> Vec<String> {
+        let env = ssh_env();
+        names
+            .iter()
+            .filter(|n| self.settings.password_source(n) == PasswordSource::Windows)
+            .filter_map(|n| self.saved_password_target_in(n, &env))
+            .collect()
+    }
+
+    /// Forgets the Windows-stored passwords under `old` that no saved
+    /// connection uses any more (as the settings are now): one moved off
+    /// the Windows Credential Manager, or kept under another name. One
+    /// another connection still uses stays. Failures become notices.
+    fn forget_unused_passwords(&mut self, old: Vec<String>) {
+        if old.is_empty() {
+            return;
+        }
+        let mut names: Vec<String> = load_saved().into_iter().map(|h| h.alias).collect();
+        names.extend(self.settings.profiles.iter().map(|p| p.host.clone()));
+        let in_use = self.windows_targets_of(&names);
+        let mut done: Vec<String> = Vec::new();
+        for t in old {
+            if in_use.contains(&t) || done.contains(&t) {
+                continue;
+            }
+            if let Err(e) = credman::delete(&t) {
+                self.queued.push(Command::Notice(e));
+            }
+            done.push(t);
+        }
     }
 
     /// Removes saved session `name` (after the user said yes).
@@ -14686,21 +14725,19 @@ impl Window {
                 // Manager goes once the connection is off it or its user
                 // changes the name it is kept under. Names are resolved
                 // before anything changes.
-                let old_targets: Vec<(String, String)> = if matches!(
+                let old_targets: Vec<String> = if matches!(
                     plan.field,
-                    crate::bulk_edit::EditField::User | crate::bulk_edit::EditField::Password
+                    crate::bulk_edit::EditField::User
+                        | crate::bulk_edit::EditField::Password
+                        | crate::bulk_edit::EditField::Credential
                 ) {
-                    plan.changes
+                    let names: Vec<String> = plan
+                        .changes
                         .iter()
                         .filter(|c| !conflicts.contains(&c.name))
-                        .filter(|c| {
-                            self.settings.password_source(&c.name) == PasswordSource::Windows
-                        })
-                        .filter_map(|c| {
-                            self.saved_password_target(&c.name)
-                                .map(|t| (c.name.clone(), t))
-                        })
-                        .collect()
+                        .map(|c| c.name.clone())
+                        .collect();
+                    self.windows_targets_of(&names)
                 } else {
                     Vec::new()
                 };
@@ -14715,16 +14752,7 @@ impl Window {
                 }
                 let saved_settings = self.try_save_settings();
                 if saved_settings.is_ok() {
-                    for (name, old) in old_targets {
-                        let still_windows =
-                            self.settings.password_source(&name) == PasswordSource::Windows;
-                        if (!still_windows
-                            || self.saved_password_target(&name).as_ref() != Some(&old))
-                            && let Err(e) = credman::delete(&old)
-                        {
-                            self.queued.push(Command::Notice(e));
-                        }
-                    }
+                    self.forget_unused_passwords(old_targets);
                 }
                 self.reload_sessions(None);
                 if let Err(e) = saved_settings {
@@ -22288,9 +22316,13 @@ fn edit_credential(hwnd: HWND, original: Option<String>) {
             if dialog(hwnd, &text, MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2) == Some(IDYES) {
                 let failed = with_window(|w| {
                     let before = w.settings.clone();
+                    // Their logins change: a password kept for the old one
+                    // goes once nothing uses it.
+                    let old = w.windows_targets_of(&w.settings.credential_users(o));
                     remove(&mut w.settings, o);
                     match w.try_save_settings() {
                         Ok(()) => {
+                            w.forget_unused_passwords(old);
                             w.reload_sessions(None);
                             None
                         }
@@ -22302,6 +22334,8 @@ fn edit_credential(hwnd: HWND, original: Option<String>) {
                     }
                 })
                 .flatten();
+                let next = with_window(|w| std::mem::take(&mut w.queued)).unwrap_or_default();
+                run_commands(hwnd, next);
                 if let Some(e) = failed {
                     dialog(hwnd, &e, MB_OK | MB_ICONWARNING);
                 }
@@ -22310,9 +22344,14 @@ fn edit_credential(hwnd: HWND, original: Option<String>) {
         }
         let Some(result) = with_window(|w| {
             let before = w.settings.clone();
+            let old = original
+                .as_deref()
+                .map(|o| w.windows_targets_of(&w.settings.credential_users(o)))
+                .unwrap_or_default();
             let saved = save(&mut w.settings, original.as_deref(), &typed)?;
             match w.try_save_settings() {
                 Ok(()) => {
+                    w.forget_unused_passwords(old);
                     w.reload_sessions(None);
                     Ok(saved)
                 }
@@ -22326,6 +22365,8 @@ fn edit_credential(hwnd: HWND, original: Option<String>) {
         }) else {
             return;
         };
+        let next = with_window(|w| std::mem::take(&mut w.queued)).unwrap_or_default();
+        run_commands(hwnd, next);
         match result {
             Ok(_) => return,
             Err(e) => {
