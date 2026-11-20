@@ -461,15 +461,23 @@ pub fn same_tag(a: &str, b: &str) -> bool {
 
 /// A tag with its case folded for comparing, one character for one, so
 /// `?` in a tag pattern still stands for one character (`İ` folds to
-/// `i`, not to the two characters `str::to_lowercase` gives). Greek
-/// final sigma `ς` folds to `σ`, as `Σ` does, so `ΟΣ` and `ος` are one tag.
+/// `i`, not to the two characters `str::to_lowercase` gives). Each
+/// character goes to upper case and back, so letters with two lower-case
+/// forms fold together: `ς` and `σ` (both `Σ`), `ſ` and `s` (both `S`),
+/// `µ` and `μ` (both `Μ`).
 pub fn fold_tag(tag: &str) -> String {
-    tag.chars()
-        .map(|c| match c.to_lowercase().next().unwrap_or(c) {
-            'ς' => 'σ',
-            l => l,
-        })
-        .collect()
+    tag.chars().map(fold_char).collect()
+}
+
+fn fold_char(c: char) -> char {
+    let mut up = c.to_uppercase();
+    let base = match (up.next(), up.next()) {
+        (Some(u), None) => u,
+        // `ß` and the like become two letters in upper case: keep the
+        // character itself.
+        _ => c,
+    };
+    base.to_lowercase().next().unwrap_or(base)
 }
 
 /// Whether `tag` can be a connection's tag: 1 to [`MAX_TAG_LEN`] letters,
@@ -2570,6 +2578,9 @@ Profile lab
         assert_eq!(fold_tag("İÉ").chars().count(), 2);
         assert_eq!(parse_tags("ΟΣ ος").unwrap(), ["ΟΣ"]);
         assert!(same_tag("ος", "ΟΣ"));
+        assert_eq!(parse_tags("ſ S").unwrap(), ["ſ"]);
+        assert!(same_tag("µ", "Μ"));
+        assert_eq!(fold_tag("ßİ").chars().count(), 2);
         assert_eq!(host_tags(Some("ÉQUIPE"), None), ["ÉQUIPE"]);
     }
 

@@ -123,6 +123,9 @@ mod tests {
         let mut t = HostThemes::new();
         t.push(ThemeRule::new("Dracula").tags(&["ος"]));
         assert_eq!(theme(&t, "box", &["ΟΣ"]), Some("Dracula"));
+        let mut t = HostThemes::new();
+        t.push(ThemeRule::new("Dracula").tags(&["S?"]));
+        assert_eq!(theme(&t, "box", &["ſİ"]), Some("Dracula"));
     }
 
     #[test]
