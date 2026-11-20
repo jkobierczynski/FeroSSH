@@ -19485,16 +19485,17 @@ fn menu_key_labels(menu: HMENU, text: &dyn Fn(u32) -> MenuText) {
 }
 
 /// The text of the item at `pos` of `menu`, also while it is owner-drawn
-/// in our colours (Windows may then report none).
+/// by us: then the recorded name, which is what the menu shows (Windows
+/// may report none, or an older one).
 fn menu_text(menu: HMENU, pos: u32) -> String {
+    if let Some(kept) = ui_theme::owned_text(menu, pos).filter(|t| !t.is_empty()) {
+        return kept;
+    }
     let mut buf = [0u16; 256];
     // SAFETY: our menu, a position in it and a local buffer.
     let len = unsafe { GetMenuStringW(menu, pos, Some(&mut buf), MF_BYPOSITION) };
     let len = usize::try_from(len).unwrap_or(0).min(buf.len());
-    match ui_theme::owned_text(menu, pos) {
-        Some(kept) if len == 0 => kept,
-        _ => String::from_utf16_lossy(buf.get(..len).unwrap_or_default()),
-    }
+    String::from_utf16_lossy(buf.get(..len).unwrap_or_default())
 }
 
 /// The command palette's actions: every item of `menu` and its submenus
