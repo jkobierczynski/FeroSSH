@@ -55,8 +55,7 @@ pub struct Piece {
     pub start: usize,
     /// The glyphs to draw.
     pub glyphs: Box<[u16]>,
-    /// How many cells each glyph advances; 0 for the extra glyphs of a
-    /// cluster.
+    /// How many cells each glyph advances: the characters it stands for.
     pub cells: Box<[u8]>,
 }
 
@@ -112,17 +111,21 @@ pub fn pieces(plain: &[u16], glyphs: &[u16], cluster_map: &[u16]) -> Vec<Piece> 
         if tail.0.end - start > MAX_CELLS {
             continue;
         }
-        let mut gl = Vec::new();
-        let mut cells = Vec::new();
-        for (chars, g) in part {
-            for (nth, glyph) in glyphs.get(g.clone()).unwrap_or_default().iter().enumerate() {
-                gl.push(*glyph);
-                let n = if nth == 0 { chars.len() } else { 0 };
-                cells.push(u8::try_from(n).unwrap_or(u8::MAX));
-            }
+        // Every cluster must be one glyph. A cluster of several glyphs
+        // would need the font's placement within it, and one of none
+        // would leave cells uncovered; such stretches stay plain cells.
+        if part.iter().any(|(_, g)| g.len() != 1) {
+            continue;
         }
-        // A piece with no glyph at all leaves its cells blank.
-        if gl.is_empty() {
+        let gl: Vec<u16> = part
+            .iter()
+            .filter_map(|(_, g)| glyphs.get(g.start).copied())
+            .collect();
+        let cells: Vec<u8> = part
+            .iter()
+            .map(|(chars, _)| u8::try_from(chars.len()).unwrap_or(u8::MAX))
+            .collect();
+        if gl.len() != part.len() {
             continue;
         }
         out.push(Piece {
@@ -197,6 +200,18 @@ mod tests {
         assert_eq!(p[0].start, 1);
         assert_eq!(&*p[0].glyphs, &[50]);
         assert_eq!(&*p[0].cells, &[2]);
+    }
+
+    #[test]
+    fn clusters_of_several_glyphs_stay_plain() {
+        // "a->" where '-' and '>' became one cluster of three glyphs.
+        let plain = [1, 2, 3];
+        let shaped = [1, 40, 41, 42];
+        assert!(pieces(&plain, &shaped, &[0, 1, 1]).is_empty());
+        // Two characters as one glyph are fine.
+        assert_eq!(pieces(&[1, 2, 3], &[1, 9], &[0, 1, 1]).len(), 1);
+        // A cluster with no glyph at all stays plain.
+        assert!(pieces(&[1, 2], &[1], &[0, 1]).is_empty());
     }
 
     #[test]

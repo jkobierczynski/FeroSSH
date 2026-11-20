@@ -162,7 +162,10 @@ impl GlyphKey {
         }
     }
 
-    fn piece(style: u8, piece: Piece) -> Self {
+    /// A ligature's key. Its place in the run is left out, so the same
+    /// ligature anywhere shares one atlas slot; the row plan places it.
+    fn piece(style: u8, mut piece: Piece) -> Self {
+        piece.start = 0;
         Self {
             ch: ' ',
             marks: String::new(),
