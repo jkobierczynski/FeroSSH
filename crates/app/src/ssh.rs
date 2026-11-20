@@ -3275,7 +3275,7 @@ mod tests {
             keys: vec![ecdsa_blob()],
             error: String::new(),
         });
-        assert!(fx.iter().any(|e| matches!(e, Effect::Ended)), "{fx:?}");
+        assert!(fx.iter().any(|e| matches!(e, Effect::Ended)));
     }
 
     #[test]
@@ -3309,7 +3309,7 @@ mod tests {
             channel: 1,
             keys: vec![ed25519_blob(), ecdsa_blob()],
         });
-        assert!(fx.is_empty(), "{fx:?}");
+        assert!(fx.is_empty());
 
         // Trusted for this connection only (UserKnownHostsFile none):
         // there is no file to update.
@@ -3321,7 +3321,7 @@ mod tests {
             channel: 1,
             keys: vec![ed25519_blob(), ecdsa_blob()],
         });
-        assert!(fx.is_empty(), "{fx:?}");
+        assert!(fx.is_empty());
 
         // UpdateHostKeys ask: says what is new, changes nothing.
         let mut e = env(&temp("hostkeys-ask"));
@@ -3333,7 +3333,7 @@ mod tests {
             keys: vec![ed25519_blob(), ecdsa_blob()],
         });
         assert!(sent(&fx).is_empty());
-        assert!(shown(&fx).contains("UpdateHostKeys is ask"), "{fx:?}");
+        assert!(shown(&fx).contains("UpdateHostKeys is ask"));
     }
 
     #[test]
