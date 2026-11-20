@@ -53,7 +53,9 @@ use windows::core::{PCWSTR, PWSTR, w};
 
 use crate::layout::Rect;
 use crate::native::{fonts, key_down, pass_edge, scale, search_text, set_font, wide};
-use crate::sessions::{SideAction, TreeHost, TreeNode, open_by_default, saved_search_of};
+use crate::sessions::{
+    SideAction, TreeHost, TreeNode, folder_label, open_by_default, saved_search_of,
+};
 
 /// What the user did in the panel.
 #[derive(Debug)]
@@ -507,7 +509,7 @@ pub fn set_nodes(nodes: Vec<TreeNode>) {
         match n {
             TreeNode::Folder { name, hosts } => {
                 let open = open_by_default(name) != collapsed.contains(name);
-                let folder = insert(TVI_ROOT, name, open, index);
+                let folder = insert(TVI_ROOT, &folder_label(name), open, index);
                 index += 1;
                 for t in hosts {
                     host(folder, t, &mut index);

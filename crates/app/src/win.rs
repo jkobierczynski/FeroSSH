@@ -2095,10 +2095,22 @@ fn host_items(env: &Env, settings: &Settings) -> Vec<HostItem> {
                 target.as_ref().and_then(|t| t.tag.as_deref()),
                 settings.profile(&h.name),
             );
-            let (user, hostname, port) = target
+            let (user, hostname, mut port) = target
                 .as_ref()
                 .map(|t| (Some(t.user.clone()), Some(t.hostname.clone()), Some(t.port)))
                 .unwrap_or_default();
+            // The port the session opens, for port: searches: SSH's 22 is
+            // not Telnet's or a desktop's default.
+            let own_port = || ssh_config::resolve_in(&env.config, &h.name, &includes).port;
+            port = match kind {
+                SessionKind::Telnet => {
+                    Some(own_port().unwrap_or(ferossh_config::DEFAULT_TELNET_PORT))
+                }
+                SessionKind::Rdp => Some(own_port().unwrap_or(DEFAULT_DESKTOP_PORT)),
+                SessionKind::Vnc => Some(own_port().unwrap_or(DEFAULT_VNC_PORT)),
+                SessionKind::Serial | SessionKind::Xvfb | SessionKind::RemoteApp => None,
+                _ => port,
+            };
             let detail = target
                 .map(|t| {
                     let mut d = format!("{}@{}", t.user, t.hostname);

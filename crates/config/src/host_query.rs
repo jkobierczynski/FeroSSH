@@ -53,7 +53,8 @@ pub struct Term {
     pub negate: bool,
     /// The field it names; `None` for a plain word.
     pub field: Option<Field>,
-    /// What to look for, lower-cased.
+    /// What to look for, lower-cased (tags and types folded as
+    /// [`crate::settings::fold_tag`] does).
     pub value: String,
 }
 
@@ -130,10 +131,16 @@ impl Query {
             if value.is_empty() {
                 continue;
             }
+            // Tags and types compare as tags do, a character for a
+            // character (`İ` stays one); the rest as lower case.
+            let value = match field {
+                Some(Field::Tag | Field::Type) => crate::settings::fold_tag(value),
+                _ => value.to_lowercase(),
+            };
             terms.push(Term {
                 negate,
                 field,
-                value: value.to_lowercase(),
+                value,
             });
         }
         Self { terms }
@@ -272,6 +279,16 @@ mod tests {
         assert_eq!(found("legacy", &hosts), ["db-old"]);
         assert_eq!(found("foo:bar", &hosts), Vec::<String>::new());
         assert_eq!(found("tag:", &hosts), ["web1", "db-old", "desk"]);
+        let dotted = tags(&["İzmir"]);
+        let tr = [HostFacts {
+            name: "tr",
+            tags: &dotted,
+            ..HostFacts::default()
+        }];
+        assert_eq!(found("tag:İzmir", &tr), ["tr"]);
+        assert_eq!(found("tag:izmir", &tr), ["tr"]);
+        assert_eq!(found("tag:?zmir", &tr), ["tr"], "one character");
+        assert_eq!(found("tag:İz*", &tr), ["tr"]);
         assert!(Query::parse("  ").is_empty());
     }
 

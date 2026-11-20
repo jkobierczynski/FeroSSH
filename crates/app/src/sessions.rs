@@ -81,17 +81,29 @@ enum Row {
 }
 
 const FAVOURITES: &str = "Favourites";
-/// What a saved search's smart folder is called: this, then the search.
-const SEARCH_PREFIX: &str = "Search: ";
+/// What marks a saved search's smart folder: a control character, which
+/// no ordinary folder name holds ([`SessionList::set_hosts`] drops them),
+/// so a folder of one's own called `Search: x` stays an ordinary folder.
+const SEARCH_KEY: char = '\u{1}';
+/// What a smart folder is shown as: this, then the search.
+const SEARCH_LABEL: &str = "Search: ";
 
-/// The search behind a smart folder's name, if it is one.
+/// The search behind a smart folder's key, if it is one.
 pub fn saved_search_of(folder: &str) -> Option<&str> {
-    folder.strip_prefix(SEARCH_PREFIX)
+    folder.strip_prefix(SEARCH_KEY)
 }
 
-/// The smart folder of a saved search.
+/// The smart folder key of a saved search.
 pub fn saved_search_folder(query: &str) -> String {
-    format!("{SEARCH_PREFIX}{query}")
+    format!("{SEARCH_KEY}{query}")
+}
+
+/// How folder `name` is shown.
+pub fn folder_label(name: &str) -> String {
+    match saved_search_of(name) {
+        Some(q) => format!("{SEARCH_LABEL}{q}"),
+        None => name.to_owned(),
+    }
 }
 
 /// Whether a folder starts open: smart folders start closed, since they
@@ -188,8 +200,13 @@ impl SessionList {
 
     /// Replaces the hosts (after the config or an import changed), keeping
     /// the selection on the same host when it is still there.
-    pub fn set_hosts(&mut self, hosts: Vec<HostItem>, favourites: Vec<String>) {
+    pub fn set_hosts(&mut self, mut hosts: Vec<HostItem>, favourites: Vec<String>) {
         let keep = self.selected_host();
+        for h in &mut hosts {
+            if let Some(f) = &mut h.folder {
+                f.retain(|c| !c.is_control());
+            }
+        }
         self.hosts = hosts;
         self.favourites = favourites;
         self.selected = 0;
@@ -310,7 +327,8 @@ impl SessionList {
         }
         let mut rows = vec![Row::New];
         let group = |name: &str, members: Vec<usize>, rows: &mut Vec<Row>| {
-            if members.is_empty() {
+            // A smart folder stays when nothing matches, as in the tree.
+            if members.is_empty() && saved_search_of(name).is_none() {
                 return;
             }
             let open = self.is_open(name);
@@ -563,7 +581,8 @@ impl SessionList {
                     Flags::empty(),
                 ),
                 Some(Row::Folder { name, open, count }) => {
-                    let label = format!(" {} {name}", if *open { "▾" } else { "▸" });
+                    let label =
+                        format!(" {} {}", if *open { "▾" } else { "▸" }, folder_label(name));
                     let mut cells = line(&label, palette.text, row_bg, Flags::BOLD);
                     let used = label.chars().count() + 1;
                     put_right(&mut cells, &count.to_string(), used, palette.dim, row_bg);
@@ -887,7 +906,9 @@ mod tests {
         l.set_query("");
         // The smart folder comes first, closed, and lists the matches.
         let tree = l.tree();
-        assert!(matches!(&tree[0], TreeNode::Folder { name, .. } if name == "Search: tag:prod"));
+        assert!(
+            matches!(&tree[0], TreeNode::Folder { name, .. } if folder_label(name) == "Search: tag:prod")
+        );
         assert_eq!(
             tree[0]
                 .hosts()
@@ -907,6 +928,25 @@ mod tests {
             t[4].contains("web") && t[5].contains("db1"),
             "opened: {t:#?}"
         );
+        // A folder of one's own called "Search: tag:prod" is no smart
+        // folder and keeps its own open state.
+        let mut own = item("own", Some("Search: tag:prod"));
+        own.tags = vec!["x".into()];
+        l.set_hosts(vec![own], Vec::new());
+        let tree = l.tree();
+        assert_eq!(tree.len(), 2, "{tree:#?}");
+        assert!(matches!(&tree[1], TreeNode::Folder { name, .. } if name == "Search: tag:prod"));
+        assert!(saved_search_of("Search: tag:prod").is_none());
+        // With nothing matching, the smart folder stays, and can be
+        // selected and removed.
+        let t = texts(&mut l);
+        assert!(
+            t[3].contains("Search: tag:prod") && t[3].ends_with('0'),
+            "{t:#?}"
+        );
+        l.key(SideKey::Home, 8);
+        l.key(SideKey::Down, 8);
+        assert_eq!(l.selected_saved_search().as_deref(), Some("tag:prod"));
     }
 
     #[test]

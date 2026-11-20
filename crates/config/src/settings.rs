@@ -1975,7 +1975,9 @@ impl Settings {
         }
         for q in &self.saved_searches {
             if let Some(q) = crate::host_query::saved_text(q) {
-                let _ = writeln!(out, "SavedSearch {q}");
+                // One `=` after the keyword is read as the separator.
+                let sep = if q.starts_with('=') { " = " } else { " " };
+                let _ = writeln!(out, "SavedSearch{sep}{q}");
             }
         }
         for r in &self.recent {
@@ -2592,6 +2594,11 @@ Profile lab
             Settings::parse(&s.to_text()).saved_searches,
             s.saved_searches
         );
+        let eq = Settings {
+            saved_searches: vec!["=prod".into()],
+            ..Settings::default()
+        };
+        assert_eq!(Settings::parse(&eq.to_text()).saved_searches, ["=prod"]);
     }
 
     #[test]
