@@ -174,6 +174,7 @@ Font, theme and text size apply to the focused pane only. Session > Save font an
 | Scripts > Auto-responses from scripts | ✓ on: scripts with a *When* text answer by themselves. Off turns all of them off. `AutoResponses`. |
 | Scripts > Confirm scripts and agents on Production hosts | ✓ on: a script about to be typed into a pane with the Production theme asks first, and so do starting a coding agent there and pasting or dropping into an agent's pane there. `ConfirmProduction`. |
 | Replace host key... | After a host key change you know the reason for, trusts the new key. It asks twice. To look through or remove stored keys without connecting, use Tools > Known hosts. |
+| SSH escape sequences (~. ~C ~? after Enter) | ✓ on: `~.`, `~C`, `~#`, `~R`, `~?` and `~~` typed first on a line work as in OpenSSH (see [Escape sequences](everyday-use.md#escape-sequences-)). Off sends every key to the host in every pane, whatever a host's `EscapeChar` says, and keeps the character for later. `EscapeSequences`; on by default. |
 | Copy public key to this server... | Like `ssh-copy-id`: adds a `.pub` file's key to `~/.ssh/authorized_keys` on the focused pane's host, unless it is there already (see [Making a key](everyday-use.md#making-a-key-and-putting-it-on-a-server)). |
 | Verify transfers (SHA-256) | Compares SHA-256 sums on both ends after each SFTP transfer (the server needs `sha256sum` and `xargs`). ✓ `VerifyTransfers`. |
 | ZMODEM: answer rz and sz | Answers `rz` and `sz` in the terminal (see [ZMODEM](everyday-use.md#zmodem)). ✓ `ZModem`. |

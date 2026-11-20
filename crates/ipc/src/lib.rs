@@ -46,7 +46,7 @@ use std::fmt;
 use zeroize::Zeroize;
 
 /// Protocol version carried in every frame. Bump on any wire change.
-pub const PROTOCOL_VERSION: u8 = 24;
+pub const PROTOCOL_VERSION: u8 = 25;
 
 /// One SSHFP record (RFC 4255): which key algorithm, which hash, and
 /// the hash of the host key.
@@ -56,6 +56,11 @@ pub struct SshfpRecord {
     pub fp_type: u8,
     pub digest: Vec<u8>,
 }
+
+/// Most host keys one [`Message::HostKeysAnnounced`] (or the messages
+/// after it) may list. OpenSSH servers have three or four; the cap keeps a
+/// hostile announcement from turning into a long prove request.
+pub const MAX_HOST_KEYS: usize = 16;
 
 /// Largest frame body accepted, in bytes. Terminal and SFTP data is chunked
 /// below this, so anything larger is a bug or an attack.
@@ -969,6 +974,34 @@ pub enum Message {
         channel: ChannelId,
         stats: ServerStats,
     },
+
+    // UpdateHostKeys (OpenSSH's `hostkeys-00@openssh.com`).
+    /// Worker to UI: after the login, the server listed every host key it
+    /// has (SSH wire format). Nothing in it is proven yet: the UI picks
+    /// the keys known_hosts lacks and asks for proof with
+    /// [`Message::HostKeysProve`].
+    HostKeysAnnounced {
+        channel: ChannelId,
+        keys: Vec<Vec<u8>>,
+    },
+    /// UI to worker: ask the server to prove it holds these announced keys
+    /// (`hostkeys-prove-00@openssh.com`: a signature by each key over the
+    /// session id). The worker answers with [`Message::HostKeysProven`].
+    HostKeysProve {
+        channel: ChannelId,
+        keys: Vec<Vec<u8>>,
+    },
+    /// Worker to UI: the outcome of [`Message::HostKeysProve`] for `keys`:
+    /// every signature checked out when `error` is empty, otherwise none
+    /// of them counts.
+    HostKeysProven {
+        channel: ChannelId,
+        keys: Vec<Vec<u8>>,
+        error: String,
+    },
+    /// UI to worker: start a new key exchange on the connection `channel`
+    /// belongs to (`~R`).
+    Rekey { channel: ChannelId },
 }
 
 impl Message {
@@ -1016,6 +1049,10 @@ impl Message {
             Message::AgentSigned { .. } => 38,
             Message::StatsOpen { .. } => 70,
             Message::Stats { .. } => 71,
+            Message::HostKeysAnnounced { .. } => 80,
+            Message::HostKeysProve { .. } => 81,
+            Message::HostKeysProven { .. } => 82,
+            Message::Rekey { .. } => 83,
             Message::GssapiStep { .. } => 50,
             Message::GssapiReply { .. } => 51,
             Message::ProxyAuth { .. } => 52,
@@ -1069,6 +1106,8 @@ impl Message {
             | Message::AgentKeys { .. }
             | Message::AgentSigned { .. }
             | Message::StatsOpen { .. }
+            | Message::HostKeysProve { .. }
+            | Message::Rekey { .. }
             | Message::GssapiReply { .. } => Side::Ui,
             Message::HostKey { .. }
             | Message::Sshfp { .. }
@@ -1099,6 +1138,8 @@ impl Message {
             | Message::AgentSign { .. }
             | Message::GssapiStep { .. }
             | Message::Stats { .. }
+            | Message::HostKeysAnnounced { .. }
+            | Message::HostKeysProven { .. }
             | Message::SspiRequest { .. } => Side::Worker,
         }
     }
@@ -1163,6 +1204,10 @@ impl Message {
             | Message::AgentSigned { channel, .. }
             | Message::StatsOpen { channel, .. }
             | Message::Stats { channel, .. }
+            | Message::HostKeysAnnounced { channel, .. }
+            | Message::HostKeysProve { channel, .. }
+            | Message::HostKeysProven { channel, .. }
+            | Message::Rekey { channel }
             | Message::GssapiStep { channel, .. }
             | Message::GssapiReply { channel, .. } => *channel,
         })
@@ -1792,6 +1837,20 @@ pub fn encode(msg: &Message, out: &mut Vec<u8>) -> Result<(), Error> {
             w.u32(*connection);
             w.u16(*interval);
         }
+        Message::HostKeysAnnounced { channel, keys } | Message::HostKeysProve { channel, keys } => {
+            w.u32(*channel);
+            w.list(keys, |w, k| w.bytes(k));
+        }
+        Message::HostKeysProven {
+            channel,
+            keys,
+            error,
+        } => {
+            w.u32(*channel);
+            w.list(keys, |w, k| w.bytes(k));
+            w.str(error);
+        }
+        Message::Rekey { channel } => w.u32(*channel),
         Message::Stats { channel, stats } => {
             w.u32(*channel);
             w.opt(stats.cpu, Writer::u16);
@@ -2250,6 +2309,20 @@ fn decode_body(body: &[u8]) -> Result<Message, Error> {
             agent: r.u32()?,
             signature: r.path()?,
         },
+        80 => Message::HostKeysAnnounced {
+            channel: r.u32()?,
+            keys: r.host_keys()?,
+        },
+        81 => Message::HostKeysProve {
+            channel: r.u32()?,
+            keys: r.host_keys()?,
+        },
+        82 => Message::HostKeysProven {
+            channel: r.u32()?,
+            keys: r.host_keys()?,
+            error: r.string()?,
+        },
+        83 => Message::Rekey { channel: r.u32()? },
         70 => Message::StatsOpen {
             channel: r.u32()?,
             connection: r.u32()?,
@@ -2713,6 +2786,24 @@ impl<'a> Reader<'a> {
         Ok(out)
     }
 
+    /// A [`Message::HostKeysAnnounced`]-style list: at most
+    /// [`MAX_HOST_KEYS`] keys, none of them empty.
+    fn host_keys(&mut self) -> Result<Vec<Vec<u8>>, Error> {
+        let count = self.u32()? as usize;
+        if count > MAX_HOST_KEYS {
+            return Err(Error::Invalid);
+        }
+        let mut keys = Vec::with_capacity(count);
+        for _ in 0..count {
+            let key = self.path()?;
+            if key.is_empty() {
+                return Err(Error::Invalid);
+            }
+            keys.push(key);
+        }
+        Ok(keys)
+    }
+
     fn rest(&mut self) -> &[u8] {
         std::mem::take(&mut self.0)
     }
@@ -2989,6 +3080,25 @@ mod tests {
                 channel: 7,
                 stats: ServerStats::default(),
             },
+            Message::HostKeysAnnounced {
+                channel: 1,
+                keys: vec![vec![0, 0, 0, 11, 1, 2], vec![9; 51]],
+            },
+            Message::HostKeysProve {
+                channel: 1,
+                keys: vec![vec![9; 51]],
+            },
+            Message::HostKeysProven {
+                channel: 1,
+                keys: vec![vec![9; 51]],
+                error: String::new(),
+            },
+            Message::HostKeysProven {
+                channel: 1,
+                keys: Vec::new(),
+                error: "refused".into(),
+            },
+            Message::Rekey { channel: 1 },
             Message::GssapiStep {
                 channel: 1,
                 first: true,
@@ -3430,8 +3540,13 @@ mod tests {
         tags.dedup();
         // SSHFP records are 39; ZMODEM starts at 40; Kerberos at 50, the
         // proxy's verdict at 52, a remote SOCKS stream's connect at 53,
-        // WinRM at 60, server stats at 70.
-        let want: Vec<u8> = (0..=53).chain(60..=62).chain(70..=71).collect();
+        // WinRM at 60, server stats at 70, UpdateHostKeys and rekeying
+        // at 80.
+        let want: Vec<u8> = (0..=53)
+            .chain(60..=62)
+            .chain(70..=71)
+            .chain(80..=83)
+            .collect();
         assert_eq!(tags, want);
     }
 
@@ -3529,6 +3644,33 @@ mod tests {
             dec.feed(body);
             assert_eq!(dec.next_message(), Err(Error::Invalid), "{body:?}");
         }
+    }
+
+    #[test]
+    fn rejects_empty_or_too_many_host_keys() {
+        let v = PROTOCOL_VERSION;
+        let frame = |keys: &[Vec<u8>]| {
+            let mut w = Writer(vec![v, 80]);
+            w.u32(1);
+            w.list(keys, |w, k| w.bytes(k));
+            w.0
+        };
+        let empty = frame(&[vec![1], Vec::new()]);
+        let many = frame(&vec![vec![1]; MAX_HOST_KEYS + 1]);
+        for body in [empty, many] {
+            let mut dec = Decoder::new();
+            dec.feed(&(body.len() as u32).to_le_bytes());
+            dec.feed(&body);
+            assert_eq!(dec.next_message(), Err(Error::Invalid));
+        }
+        let mut dec = Decoder::new();
+        let body = frame(&vec![vec![1]; MAX_HOST_KEYS]);
+        dec.feed(&(body.len() as u32).to_le_bytes());
+        dec.feed(&body);
+        assert!(matches!(
+            dec.next_message(),
+            Ok(Some(Message::HostKeysAnnounced { .. }))
+        ));
     }
 
     #[test]

@@ -615,8 +615,10 @@ fn forwards_change_on_a_live_connection() {
     assert_eq!(got, "R2=again");
 
     // Stopped: nothing listens any more, and the shell is still there.
-    forwarder.remove(conn, 1);
-    forwarder.remove(conn, 0);
+    // Back to back, first one first: each names its forward, so the
+    // second still finds its own after the first is gone.
+    forwarder.remove_spec(conn, local2, false);
+    forwarder.remove_spec(conn, remote2, false);
     shell.until("the forwards to stop", |s| {
         s.forwarder
             .view()
@@ -800,7 +802,7 @@ fn remote_socks_and_unix_socket_forwards() {
         assert!(f.total >= 1, "{f:?}");
     }
     // Stopping the local socket forward removes its socket file.
-    forwarder.remove(conn, 1);
+    forwarder.remove_spec(conn, fwds[1].spec.clone(), false);
     shell.until("the socket forward to stop", |s| {
         s.forwarder
             .view()

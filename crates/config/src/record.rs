@@ -313,4 +313,16 @@ mod tests {
         let rec = r.finish();
         assert_eq!(rec.lines, ["@password"]);
     }
+
+    #[test]
+    fn a_held_escape_character_before_a_bracketed_paste_is_recorded_as_text() {
+        // The window records a held `~` on its own, then the paste.
+        let mut r = Recorder::default();
+        r.input(b"~");
+        r.input(b"\x1b[200~alice\x1b[201~");
+        r.output(b"~alice");
+        typing(&mut r, "\r", true);
+        let rec = r.finish();
+        assert_eq!(rec.lines, ["~alice"]);
+    }
 }

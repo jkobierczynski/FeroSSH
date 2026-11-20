@@ -53,16 +53,22 @@ fn keygen(path: &Path, passphrase: &str) {
     assert!(ok);
 }
 
-/// Starts a throwaway sshd whose config ends with `extra`; the user key
-/// `~/.ssh/id_ed25519` under its folder has the passphrase "secret".
-pub(crate) fn start_sshd(name: &str, extra: &str) -> Option<Server> {
-    if !Path::new(SSHD).exists()
-        || Command::new("ssh-keygen")
+/// Whether sshd and ssh-keygen are there; when not, a test that needs
+/// them passes without running, unless CI asks for them
+/// (`FEROSSH_REQUIRE_SSHD`, checked by [`start_sshd`]).
+fn sshd_available() -> bool {
+    Path::new(SSHD).exists()
+        && Command::new("ssh-keygen")
             .arg("-?")
             .stderr(Stdio::null())
             .status()
-            .is_err()
-    {
+            .is_ok()
+}
+
+/// Starts a throwaway sshd whose config ends with `extra`; the user key
+/// `~/.ssh/id_ed25519` under its folder has the passphrase "secret".
+pub(crate) fn start_sshd(name: &str, extra: &str) -> Option<Server> {
+    if !sshd_available() {
         // CI sets this so a missing sshd fails instead of passing quietly.
         assert!(
             std::env::var_os("FEROSSH_REQUIRE_SSHD").is_none(),
@@ -618,4 +624,60 @@ fn refuses_agent_channels_without_forward_agent() {
     );
     assert!(run.output.contains("[none]"), "{}", run.output);
     assert!(run.agent_questions.is_empty());
+}
+
+#[test]
+fn update_host_keys_learns_the_servers_other_key() {
+    // A second host key, made before the server starts. Without sshd,
+    // start_sshd below says whether to skip or fail.
+    let extra_dir = std::env::temp_dir().join(format!("ferossh-e2e-hk-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&extra_dir);
+    std::fs::create_dir_all(&extra_dir).unwrap();
+    let ecdsa = extra_dir.join("host_ecdsa");
+    if sshd_available() {
+        let made = Command::new("ssh-keygen")
+            .args(["-q", "-t", "ecdsa", "-N", "", "-f"])
+            .arg(&ecdsa)
+            .status()
+            .is_ok_and(|s| s.success());
+        assert!(made, "ssh-keygen could not make an ECDSA host key");
+    }
+    let Some(server) = start_sshd("hostkeys", &format!("HostKey {}", ecdsa.display())) else {
+        return;
+    };
+    let user = local_user();
+    let env = Env {
+        home: server.dir.clone(),
+        local_user: user.clone(),
+        vars: Vec::new(),
+        config: format!(
+            "Host testhost\n  HostName 127.0.0.1\n  Port {}\n  User {user}\n\
+             \x20 IdentityFile ~/.ssh/id_ed25519\n  IdentitiesOnly yes\n  IdentityAgent none\n\
+             \x20 StrictHostKeyChecking accept-new\n  RemoteCommand sleep 2\n",
+            server.port
+        ),
+    };
+    let (run, _session) = connect(&env, "", &[("Passphrase", "secret")]);
+    // Whichever key the login used, the other one is learned.
+    assert!(
+        run.shown.contains("Updated the host keys") && run.shown.contains("learned "),
+        "{}",
+        run.shown
+    );
+    let blob = |path: &Path| {
+        let text = std::fs::read_to_string(path.with_extension("pub")).unwrap();
+        russh::keys::PublicKey::from_openssh(text.trim())
+            .unwrap()
+            .to_bytes()
+            .unwrap()
+    };
+    let known = ferossh_config::known_hosts::KnownHosts::load(&env.known_hosts()).unwrap();
+    let port = server.port;
+    for key in [blob(&server.dir.join("host_ed25519")), blob(&ecdsa)] {
+        assert_eq!(
+            known.check("127.0.0.1", port, &key),
+            ferossh_config::known_hosts::Status::Trusted
+        );
+    }
+    let _ = std::fs::remove_dir_all(&extra_dir);
 }
