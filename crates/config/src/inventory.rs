@@ -399,6 +399,13 @@ mod tests {
         inv.rename("short", &spaced);
         assert_eq!(inv.get(&p).unwrap().last_connected, Some(5));
         assert_eq!(inv.records.iter().filter(|(n, _)| n == &p).count(), 1);
+        // The same with a control character where the name is cut: it
+        // reads back from the file under the name it was saved with.
+        let bidi = format!("{p}\u{202e}x");
+        assert_eq!(clean(&bidi), p);
+        inv.connected(&bidi, 6, None);
+        let back = Inventory::parse(&inv.to_text());
+        assert_eq!(back.get(&bidi).unwrap().last_connected, Some(6));
     }
 
     #[test]

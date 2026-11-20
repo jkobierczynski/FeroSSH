@@ -57,9 +57,11 @@ const SS_NOPREFIX: u32 = 0x80;
 /// Width and height of the window's inside, in DIPs.
 const WIDTH: i32 = 980;
 const HEIGHT: i32 = 560;
-/// The least it shrinks to on a small screen, in DIPs.
-const MIN_WIDTH: i32 = 480;
-const MIN_HEIGHT: i32 = 320;
+/// The least it shrinks to on a small screen, in DIPs: the search box,
+/// a few list rows, the status line and the buttons still fit, and so does
+/// a 1366 x 768 screen at 250% scaling.
+const MIN_WIDTH: i32 = 340;
+const MIN_HEIGHT: i32 = 200;
 
 #[derive(Clone, Copy)]
 struct Handles {
