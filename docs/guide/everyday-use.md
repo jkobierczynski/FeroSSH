@@ -180,9 +180,10 @@ Ctrl+Shift+S shows your hosts in the tools pane: those from `~/.ssh/config`, you
 - **Connect to all**: a tab each (FeroSSH asks first when there are more than eight).
 - **Add tag** and **Remove tag**: any tag already used by a connection can be added; a connection's own tags can be removed, while a tag from ssh_config's `Tag` stays. To use a brand-new tag, give it to one connection in its form first.
 - **Move to folder**: one of the folders your saved connections use, or *No folder*.
+- **Change a field**: user, key file, jump hosts, proxy, password source, theme, font, font size, tmux session or start directory. The box starts with the value they share, or is empty when they hold several. An empty box clears the field. **Preview** lists each connection's old and new value before anything changes, and which connections are left alone and why. Use this when a bastion or a user name changes on forty hosts.
 - **Delete**: asks once, listing them (Del does the same).
 
-Moving and deleting change connections saved in FeroSSH only. Hosts from `~/.ssh/config` or an import are left as they are, and FeroSSH names them. Tags work on every host.
+Moving, deleting, and changing the user, key file, jump hosts or proxy change connections saved in FeroSSH only. Hosts from `~/.ssh/config` or an import are left as they are, and FeroSSH names them. Tags and the other fields work on every host. A field a connection's type does not use, such as a key file on a serial line, is left alone.
 
 ### Saved connections
 

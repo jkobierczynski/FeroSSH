@@ -575,10 +575,17 @@ mod tests {
 
     #[tokio::test]
     async fn looks_up_over_udp_and_falls_back_to_tcp() {
-        let udp = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        let tcp = tokio::net::TcpListener::bind(udp.local_addr().unwrap())
-            .await
-            .unwrap();
+        // The UDP port the system picks can be one Windows keeps from TCP
+        // (an excluded port range: WSAEACCES), so try a few.
+        let mut pair = None;
+        for _ in 0..20 {
+            let udp = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            if let Ok(tcp) = tokio::net::TcpListener::bind(udp.local_addr().unwrap()).await {
+                pair = Some((udp, tcp));
+                break;
+            }
+        }
+        let (udp, tcp) = pair.unwrap();
         let server = udp.local_addr().unwrap();
         tokio::spawn(async move {
             let mut buf = [0u8; 512];

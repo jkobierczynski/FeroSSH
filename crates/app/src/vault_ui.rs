@@ -656,10 +656,12 @@ pub(super) fn set(hwnd: HWND) {
         );
         return;
     }
-    let left = remove_plain_files();
+    let mut left = remove_plain_files();
     if moved {
         for s in &b.secrets {
-            credman::os_delete(&s.target);
+            if let Err(e) = credman::os_delete(&s.target) {
+                left.push(e);
+            }
         }
     }
     after_change();
@@ -949,7 +951,11 @@ pub(super) fn use_file(hwnd: HWND) {
                 if vault::secret(&s.target).is_none() {
                     // One that fails stays in the Credential Manager.
                     match vault::set_secret(&s.target, &s.user, &s.password) {
-                        Ok(()) => credman::os_delete(&s.target),
+                        Ok(()) => {
+                            if let Err(e) = credman::os_delete(&s.target) {
+                                notes.push(e);
+                            }
+                        }
                         Err(e) => notes.push(e),
                     }
                 }
