@@ -28,6 +28,7 @@ pub enum RailItem {
     KnownHosts,
     Inventory,
     Credentials,
+    SecurityRules,
     /// At the bottom: the command palette.
     Palette,
     /// At the bottom, last: keep the tool open (pinned) or let the
@@ -36,7 +37,7 @@ pub enum RailItem {
 }
 
 impl RailItem {
-    pub const ALL: [RailItem; 10] = [
+    pub const ALL: [RailItem; 11] = [
         RailItem::Connections,
         RailItem::Sessions,
         RailItem::Files,
@@ -45,6 +46,7 @@ impl RailItem {
         RailItem::KnownHosts,
         RailItem::Inventory,
         RailItem::Credentials,
+        RailItem::SecurityRules,
         RailItem::Palette,
         RailItem::Pin,
     ];
@@ -60,6 +62,7 @@ impl RailItem {
             RailItem::KnownHosts => "Known hosts",
             RailItem::Inventory => "Inventory",
             RailItem::Credentials => "Credential manager",
+            RailItem::SecurityRules => "Security rules",
             RailItem::Palette => "Command palette",
             RailItem::Pin if pinned => "Tools stay open (click: the terminal covers them again)",
             RailItem::Pin => "Tools cover again after use (click: keep them open)",
@@ -76,9 +79,10 @@ impl RailItem {
             RailItem::Files => '\u{E8B7}',         // Folder
             RailItem::Forwards => '\u{E8AB}',      // Switch
             RailItem::Snippets => '\u{E943}',      // Code
-            RailItem::KnownHosts => '\u{E72E}',    // Lock
+            RailItem::KnownHosts => '\u{E928}',    // Fingerprint
             RailItem::Inventory => '\u{E8FD}',     // BulletedList
             RailItem::Credentials => '\u{E8D7}',   // Permissions (a key)
+            RailItem::SecurityRules => '\u{E72E}', // Lock
             RailItem::Palette => '\u{E721}',       // Search
             RailItem::Pin if pinned => '\u{E840}', // Pinned
             RailItem::Pin => '\u{E718}',           // Pin
@@ -91,7 +95,7 @@ impl RailItem {
 }
 
 /// The tools' buttons, from the top.
-const TOP: [RailItem; 8] = [
+const TOP: [RailItem; 9] = [
     RailItem::Connections,
     RailItem::Sessions,
     RailItem::Files,
@@ -100,6 +104,7 @@ const TOP: [RailItem; 8] = [
     RailItem::KnownHosts,
     RailItem::Inventory,
     RailItem::Credentials,
+    RailItem::SecurityRules,
 ];
 
 /// Where rail button `item` is, in the rail's own coordinates: square
@@ -425,13 +430,17 @@ mod tests {
             item_at(20, 5 + 7 * 35 + 10, 40, 600),
             Some(RailItem::Credentials)
         );
+        assert_eq!(
+            item_at(20, 5 + 8 * 35 + 10, 40, 600),
+            Some(RailItem::SecurityRules)
+        );
         assert_eq!(item_at(20, 600 - 5 - 10, 40, 600), Some(RailItem::Pin));
         assert_eq!(
             item_at(20, 600 - 5 - 35 - 10, 40, 600),
             Some(RailItem::Palette)
         );
         // Between the groups.
-        assert_eq!(item_at(20, 300, 40, 600), None);
+        assert_eq!(item_at(20, 400, 40, 600), None);
         // The padding.
         assert_eq!(item_at(1, 20, 40, 600), None);
     }

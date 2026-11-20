@@ -153,6 +153,89 @@ impl SecurityRule {
     }
 }
 
+/// Each of the limits by its name in the Security rules manager, with
+/// its keyword line in the file: in the order the window shows them.
+pub const LIMITS: [(&str, &str); 6] = [
+    ("Keys only: no password logins", "KeysOnly yes"),
+    ("No saved passwords", "SavePassword no"),
+    ("No agent forwarding", "ForwardAgent no"),
+    ("No clipboard writes from the server", "Clipboard no"),
+    ("Ask before connecting", "ConfirmConnect yes"),
+    ("Always log the session", "LogSession yes"),
+];
+
+impl Policy {
+    /// The limits as on/off, in the order of [`LIMITS`].
+    pub fn flags(&self) -> [bool; 6] {
+        [
+            self.keys_only,
+            self.no_saved_password,
+            self.no_agent_forwarding,
+            self.no_clipboard,
+            self.confirm_connect,
+            self.log_session,
+        ]
+    }
+
+    /// Limits from on/off in the order of [`LIMITS`]; missing ones are off.
+    pub fn from_flags(flags: &[bool]) -> Self {
+        let on = |i: usize| flags.get(i).copied().unwrap_or(false);
+        Policy {
+            keys_only: on(0),
+            no_saved_password: on(1),
+            no_agent_forwarding: on(2),
+            no_clipboard: on(3),
+            confirm_connect: on(4),
+            log_session: on(5),
+        }
+    }
+}
+
+impl SecurityRule {
+    /// What the rule matches, in words: `tags prod*; folders Customers`.
+    pub fn describe_match(&self) -> String {
+        [
+            ("hosts", &self.hosts),
+            ("tags", &self.tags),
+            ("folders", &self.folders),
+        ]
+        .into_iter()
+        .filter(|(_, list)| !list.is_empty())
+        .map(|(what, list)| format!("{what} {}", words_text(list)))
+        .collect::<Vec<_>>()
+        .join("; ")
+    }
+}
+
+/// Patterns as typed in one field: split at spaces, with double quotes
+/// around one that has spaces (`"Customers/Big one" Lab`). Control
+/// characters are left out.
+pub fn words(text: &str) -> Vec<String> {
+    let clean: String = text.chars().filter(|c| !c.is_control()).collect();
+    crate::ssh_config::split_line(&format!("x {clean}"))
+        .map(|(_, args)| args)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|w| w.trim().to_owned())
+        .filter(|w| !w.is_empty())
+        .collect()
+}
+
+/// Patterns as one field shows them: the other way from [`words`].
+pub fn words_text(list: &[String]) -> String {
+    list.iter()
+        .map(|w| {
+            let w: String = w.chars().filter(|c| !c.is_control() && *c != '"').collect();
+            if w.contains(char::is_whitespace) {
+                format!("\"{w}\"")
+            } else {
+                w
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 /// The limits every matching rule adds up to.
 pub fn policy_for(rules: &[SecurityRule], subject: &Subject<'_>) -> Policy {
     let mut policy = Policy::default();
@@ -215,6 +298,24 @@ mod tests {
         r.limits.log_session = true;
         assert!(!r.is_inert());
         assert_eq!(r.limits.describe(), ["session logged"]);
+    }
+
+    #[test]
+    fn fields_round_trip_patterns_with_spaces() {
+        let list = words(r#"prod*  "Customers/Big one" Lab"#);
+        assert_eq!(list, ["prod*", "Customers/Big one", "Lab"]);
+        assert_eq!(words_text(&list), r#"prod* "Customers/Big one" Lab"#);
+        assert!(words("   ").is_empty());
+        let mut r = rule();
+        r.tags = vec!["prod*".into()];
+        r.folders = vec!["Big one".into()];
+        assert_eq!(r.describe_match(), r#"tags prod*; folders "Big one""#);
+        let p = Policy {
+            no_clipboard: true,
+            log_session: true,
+            ..Policy::default()
+        };
+        assert_eq!(Policy::from_flags(&p.flags()), p);
     }
 
     #[test]

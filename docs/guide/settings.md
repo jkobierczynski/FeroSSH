@@ -278,7 +278,7 @@ Without any rules, hosts tagged `production`, `staging` or `development` get Pro
 
 ## Security rules
 
-A `SecurityRule` puts limits on connections by tag, folder or host name, whatever each connection's own settings say. A rule can only tighten. Every rule that matches adds its limits, and none takes one away, so a rule such as `ForwardAgent yes` does nothing.
+A `SecurityRule` puts limits on connections by tag, folder or host name, whatever each connection's own settings say. Tools > Security rules edits these blocks for you. A rule can only tighten. Every rule that matches adds its limits, and none takes one away, so a rule such as `ForwardAgent yes` does nothing.
 
 ```
 SecurityRule
