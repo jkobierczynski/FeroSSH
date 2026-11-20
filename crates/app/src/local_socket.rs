@@ -313,6 +313,7 @@ mod identity_tests {
         let _ = std::fs::remove_file(&path);
         let first = bind(&path).unwrap();
         let unlink = Unlink::new(path.clone());
+        assert!(unlink.id.is_some(), "no identity for the bound socket");
         drop(first);
         // Moved away, not removed, so its inode is not reused.
         let aside = format!("{path}.old");
@@ -323,5 +324,22 @@ mod identity_tests {
         drop(second);
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(&aside);
+    }
+
+    #[test]
+    fn its_own_socket_is_removed() {
+        let dir = std::env::temp_dir().join(format!("ferossh-sock-{}-own", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("s.sock").to_string_lossy().into_owned();
+        let _ = std::fs::remove_file(&path);
+        let listener = bind(&path).unwrap();
+        let unlink = Unlink::new(path.clone());
+        assert!(unlink.id.is_some(), "no identity for the bound socket");
+        drop(listener);
+        drop(unlink);
+        assert!(
+            !std::path::Path::new(&path).exists(),
+            "the socket file was left behind"
+        );
     }
 }
