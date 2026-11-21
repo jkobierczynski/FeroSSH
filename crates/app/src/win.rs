@@ -15972,12 +15972,14 @@ impl Window {
                 .policy_of(name, Some(&host), cfg.tag.as_deref())
                 .confirm_connect
             {
-                self.queued.push(Command::ConfirmRdp {
+                self.workspace_asks.push(Command::ConfirmRdp {
                     name: name.to_owned(),
                     addr,
                     size,
                     clipboard,
                 });
+                // SAFETY: our window; replaces any earlier timer with this id.
+                unsafe { SetTimer(Some(self.hwnd), TIMER_WORKSPACE_ASK, 50, None) };
                 return;
             }
             if let Err(e) = launch_rdp_client(&addr, size, clipboard) {
@@ -24704,14 +24706,30 @@ fn run_command(hwnd: HWND, command: Command) {
                 crate::ssh::sanitize_line(&name),
                 crate::ssh::sanitize_line(&addr)
             );
-            if dialog(hwnd, &question, MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2) == Some(IDYES)
-                && let Err(e) = launch_rdp_client(&addr, size, clipboard)
-            {
-                dialog(
-                    hwnd,
-                    &format!("Remote Desktop Connection (mstsc.exe) did not start: {e}"),
-                    MB_OK | MB_ICONINFORMATION,
-                );
+            match dialog(hwnd, &question, MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2) {
+                Some(IDYES) => {
+                    if let Err(e) = launch_rdp_client(&addr, size, clipboard) {
+                        dialog(
+                            hwnd,
+                            &format!("Remote Desktop Connection (mstsc.exe) did not start: {e}"),
+                            MB_OK | MB_ICONINFORMATION,
+                        );
+                    }
+                }
+                Some(_) => {}
+                None => {
+                    // Another dialog is open: ask once it has closed.
+                    with_window(|w| {
+                        w.workspace_asks.push(Command::ConfirmRdp {
+                            name,
+                            addr,
+                            size,
+                            clipboard,
+                        });
+                    });
+                    // SAFETY: our window; replaces any earlier timer with this id.
+                    unsafe { SetTimer(Some(hwnd), TIMER_WORKSPACE_ASK, 500, None) };
+                }
             }
         }
         Command::WriteLibrary => write_library(hwnd),
