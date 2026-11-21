@@ -30,6 +30,8 @@ pub enum RailItem {
     Inventory,
     Credentials,
     SecurityRules,
+    ThemeRules,
+    Themes,
     /// At the bottom: the command palette.
     Palette,
     /// At the bottom, last: keep the tool open (pinned) or let the
@@ -38,7 +40,7 @@ pub enum RailItem {
 }
 
 impl RailItem {
-    pub const ALL: [RailItem; 12] = [
+    pub const ALL: [RailItem; 14] = [
         RailItem::Connections,
         RailItem::Sessions,
         RailItem::Hosts,
@@ -49,6 +51,8 @@ impl RailItem {
         RailItem::Inventory,
         RailItem::Credentials,
         RailItem::SecurityRules,
+        RailItem::ThemeRules,
+        RailItem::Themes,
         RailItem::Palette,
         RailItem::Pin,
     ];
@@ -66,6 +70,8 @@ impl RailItem {
             RailItem::Inventory => "Connection log",
             RailItem::Credentials => "Credential manager",
             RailItem::SecurityRules => "Security rules",
+            RailItem::ThemeRules => "Theme rules",
+            RailItem::Themes => "Theme manager",
             RailItem::Palette => "Command palette",
             RailItem::Pin if pinned => "Tools stay open (click: the terminal covers them again)",
             RailItem::Pin => "Tools cover again after use (click: keep them open)",
@@ -87,6 +93,8 @@ impl RailItem {
             RailItem::Inventory => '\u{E8FD}',     // BulletedList
             RailItem::Credentials => '\u{E8D7}',   // Permissions (a key)
             RailItem::SecurityRules => '\u{E72E}', // Lock
+            RailItem::ThemeRules => '\u{E8EC}',    // Tag
+            RailItem::Themes => '\u{E790}',        // Color
             RailItem::Palette => '\u{E721}',       // Search
             RailItem::Pin if pinned => '\u{E840}', // Pinned
             RailItem::Pin => '\u{E718}',           // Pin
@@ -99,7 +107,7 @@ impl RailItem {
 }
 
 /// The tools' buttons, from the top.
-const TOP: [RailItem; 10] = [
+const TOP: [RailItem; 12] = [
     RailItem::Connections,
     RailItem::Sessions,
     RailItem::Hosts,
@@ -110,6 +118,8 @@ const TOP: [RailItem; 10] = [
     RailItem::Inventory,
     RailItem::Credentials,
     RailItem::SecurityRules,
+    RailItem::ThemeRules,
+    RailItem::Themes,
 ];
 
 /// Where rail button `item` is, in the rail's own coordinates: square
@@ -440,13 +450,21 @@ mod tests {
             item_at(20, 5 + 9 * 35 + 10, 40, 600),
             Some(RailItem::SecurityRules)
         );
+        assert_eq!(
+            item_at(20, 5 + 10 * 35 + 10, 40, 600),
+            Some(RailItem::ThemeRules)
+        );
+        assert_eq!(
+            item_at(20, 5 + 11 * 35 + 10, 40, 600),
+            Some(RailItem::Themes)
+        );
         assert_eq!(item_at(20, 600 - 5 - 10, 40, 600), Some(RailItem::Pin));
         assert_eq!(
             item_at(20, 600 - 5 - 35 - 10, 40, 600),
             Some(RailItem::Palette)
         );
         // Between the groups.
-        assert_eq!(item_at(20, 400, 40, 600), None);
+        assert_eq!(item_at(20, 440, 40, 600), None);
         // The padding.
         assert_eq!(item_at(1, 20, 40, 600), None);
     }

@@ -40,6 +40,10 @@
 //!     Tags production
 //!     Theme Production
 //!     Tint 800000 60
+//! ThemeRule
+//!     Tags lab
+//!     Font "JetBrains Mono"
+//!     FontSize 11
 //! SecurityRule
 //!     Tags production
 //!     KeysOnly yes
@@ -988,6 +992,13 @@ pub struct Settings {
     /// after the cursor while typing; Enter keeps echoed command lines in
     /// an encrypted per-host history. Off unless turned on.
     pub command_suggestions: bool,
+    /// The theme new tabs open with (Theme manager > Set as default);
+    /// Nord when unset or unknown. `--theme` beats it.
+    pub default_theme: Option<String>,
+    /// The font family new tabs open with, when installed.
+    pub default_font: Option<String>,
+    /// The font size new tabs open with, in points (4 to 96).
+    pub default_font_size: Option<f32>,
     /// A global hotkey hides and shows the FeroSSH window (Window >
     /// Standby window). Off unless turned on; the first window that opens
     /// takes the hotkey.
@@ -1101,6 +1112,9 @@ impl Default for Settings {
             font_ligatures: false,
             connection_log_delete: false,
             command_suggestions: false,
+            default_theme: None,
+            default_font: None,
+            default_font_size: None,
             standby: false,
             standby_hotkey: None,
             key_bindings: std::collections::BTreeMap::new(),
@@ -1596,6 +1610,20 @@ impl Settings {
                     block = Block::Top;
                     s.command_suggestions = yes(&args).unwrap_or(false);
                 }
+                "defaulttheme" => {
+                    block = Block::Top;
+                    s.default_theme = first.filter(|t| !t.is_empty());
+                }
+                "defaultfont" => {
+                    block = Block::Top;
+                    s.default_font = first.filter(|t| !t.is_empty());
+                }
+                "defaultfontsize" => {
+                    block = Block::Top;
+                    s.default_font_size = first
+                        .and_then(|v| v.parse::<f32>().ok())
+                        .filter(|v| (4.0..=96.0).contains(v));
+                }
                 "standby" => {
                     block = Block::Top;
                     s.standby = yes(&args).unwrap_or(false);
@@ -1871,6 +1899,12 @@ impl Settings {
                             "hosts" => r.hosts.extend(args),
                             "tags" => r.tags.extend(args),
                             "theme" => r.theme = joined,
+                            "font" => r.font = Some(joined).filter(|f| !f.is_empty()),
+                            "fontsize" => {
+                                r.font_size = first
+                                    .and_then(|v| v.parse::<f32>().ok())
+                                    .filter(|v| (4.0..=96.0).contains(v));
+                            }
                             "tint" => {
                                 let rgb = first.as_deref().and_then(hex_rgb);
                                 let amount = args.get(1).and_then(|a| a.parse::<u8>().ok());
@@ -1979,7 +2013,7 @@ impl Settings {
             }
         }
         s.theme_rules
-            .retain(|r| !r.theme.is_empty() && !(r.hosts.is_empty() && r.tags.is_empty()));
+            .retain(|r| r.sets_something() && !(r.hosts.is_empty() && r.tags.is_empty()));
         s.security_rules.retain(|r| !r.is_inert());
         s.highlight_rules
             .retain(|r| r.regex().is_some() && (r.styled() || r.stop));
@@ -2124,6 +2158,15 @@ impl Settings {
             let _ = writeln!(out, "ConnectionLogDelete yes");
         }
         let _ = writeln!(out, "CommandSuggestions {}", flag(self.command_suggestions));
+        if let Some(t) = &self.default_theme {
+            let _ = writeln!(out, "DefaultTheme {}", arg(t));
+        }
+        if let Some(f) = &self.default_font {
+            let _ = writeln!(out, "DefaultFont {}", arg(f));
+        }
+        if let Some(v) = self.default_font_size {
+            let _ = writeln!(out, "DefaultFontSize {v}");
+        }
         let _ = writeln!(out, "Standby {}", flag(self.standby));
         if let Some(k) = self.standby_hotkey {
             let _ = writeln!(out, "StandbyHotkey {k}");
@@ -2175,7 +2218,15 @@ impl Settings {
                 let tags: Vec<String> = r.tags.iter().map(|t| arg(t)).collect();
                 let _ = writeln!(out, "    Tags {}", tags.join(" "));
             }
-            let _ = writeln!(out, "    Theme {}", arg(&r.theme));
+            if !r.theme.is_empty() {
+                let _ = writeln!(out, "    Theme {}", arg(&r.theme));
+            }
+            if let Some(font) = &r.font {
+                let _ = writeln!(out, "    Font {}", arg(font));
+            }
+            if let Some(size) = r.font_size {
+                let _ = writeln!(out, "    FontSize {size}");
+            }
             if let Some(([red, green, blue], amount)) = r.tint {
                 let _ = writeln!(out, "    Tint {red:02x}{green:02x}{blue:02x} {amount}");
             }
@@ -3343,6 +3394,22 @@ DesktopShareSelection yes
     }
 
     #[test]
+    fn default_look_round_trips() {
+        let s = Settings::parse(
+            "DefaultTheme \"Solarized Dark\"\nDefaultFont \"JetBrains Mono\"\nDefaultFontSize 11.5\n",
+        );
+        assert_eq!(s.default_theme.as_deref(), Some("Solarized Dark"));
+        assert_eq!(s.default_font.as_deref(), Some("JetBrains Mono"));
+        assert_eq!(s.default_font_size, Some(11.5));
+        assert_eq!(Settings::parse(&s.to_text()), s);
+        assert_eq!(
+            Settings::parse("DefaultFontSize 500\n").default_font_size,
+            None
+        );
+        assert_eq!(Settings::default().default_theme, None);
+    }
+
+    #[test]
     fn command_suggestions_are_off_unless_turned_on() {
         assert!(!Settings::default().command_suggestions);
         assert!(Settings::parse("CommandSuggestions yes\n").command_suggestions);
@@ -3483,5 +3550,26 @@ DesktopShareSelection yes
         });
         assert!(p.log_session);
         assert!(s.policy(&Subject::default()).is_empty());
+    }
+
+    #[test]
+    fn theme_rules_keep_a_font_and_may_set_no_theme() {
+        let text = "ThemeRule\n    Tags lab \"my team\"\n    Font \"JetBrains Mono\"\n    FontSize 11.5\n\
+                    ThemeRule\n    Tags web\n    Theme Dracula\n\
+                    ThemeRule\n    Tags empty\n";
+        let s = Settings::parse(text);
+        assert_eq!(
+            s.theme_rules.len(),
+            2,
+            "a rule that sets nothing is dropped"
+        );
+        let lab = &s.theme_rules[0];
+        assert_eq!(lab.tags, ["lab", "my team"]);
+        assert_eq!(lab.theme, "");
+        assert_eq!(lab.font.as_deref(), Some("JetBrains Mono"));
+        assert_eq!(lab.font_size, Some(11.5));
+        let again = Settings::parse(&s.to_text());
+        assert_eq!(again.theme_rules, s.theme_rules);
+        assert!(!s.to_text().contains("Theme \n"));
     }
 }

@@ -24,6 +24,9 @@ FeroSSH reads `~/.ssh/config` and `~/.ssh/known_hosts` too, and writes only to `
 | `NotifyBell no` | yes | Whether the bell counts as asking for attention. Settings > Notify on the bell too. |
 | `AgentCommand claude --model opus` | claude, codex, aider | One coding agent command for Session > Coding agents, typed at the server's shell exactly as written (the rest of the line, quotes and `#` included). Repeat the line for more, up to 16, in menu order; any non-empty line replaces the built-in three; empty lines and lines with control characters are ignored. |
 | `ConnectionLogDelete yes` | no | Tools > Connection log offers Delete..., which forgets what the log holds about one connection. Settings > Allow deleting connection log entries. |
+| `DefaultTheme NAME` | Nord | The theme new tabs open with (Theme manager > Set as default). `--theme` and theme rules come before it. |
+| `DefaultFont FAMILY` | Cascadia Mono | The font new tabs open with, when it is installed (Theme manager > Set as default on a font). |
+| `DefaultFontSize POINTS` | | The font size new tabs open with, 4 to 96 points. |
 | `FontLigatures yes` | no | Joins programming ligatures (`->`, `!=`, `===`) in fonts that have them, in every terminal pane. Settings > Font ligatures. |
 | `FullScreenKey no` | yes | Whether F11 switches full screen (Settings > F11 switches full screen). Off, F11 goes to the terminal. |
 | `KeyBinding 213 Ctrl+K` | | The keys of one action, by its menu command number, written by Settings > Key bindings for the actions you changed: none after the number means no shortcut. Keys are spelled as for `StandbyHotkey` (`Ctrl+Shift+PageUp`, `Alt+Shift+OemPlus`); Win is not allowed. Actions with no `KeyBinding` line keep their default keys. |
@@ -256,7 +259,7 @@ Only text in the terminal's own colours is recoloured. A rule that does not comp
 
 ## Theme rules
 
-Rules pick a theme from the host's name or its tags: ssh_config's `Tag` and the profile's own `Tags`. A host's profile wins over the rules, and the rules win over `--theme`.
+Rules pick a theme, a font and a font size from the host's name or its tags: ssh_config's `Tag` and the profile's own `Tags`. Tools > Theme rules edits these blocks for you and puts them in order. A host's profile wins over the rules, and the rules win over `--theme` and `DefaultTheme`. Each of theme, font and size comes from the first rule that sets it, so a rule may set only a font.
 
 ```
 ThemeRule
@@ -266,13 +269,19 @@ ThemeRule
     Tags staging
     Theme Nord
     Tint ffb000 40
+ThemeRule
+    Tags lab
+    Font "JetBrains Mono"
+    FontSize 11
 ```
 
 | Keyword | Meaning |
 | --- | --- |
 | `Hosts PATTERN...` | ssh_config-style host patterns; `!` excludes. |
 | `Tags TAG...` | Matches hosts with this tag, from ssh_config's `Tag` or the host's profile `Tags`. Patterns such as `prod*` work. |
-| `Theme NAME` | The theme to use. |
+| `Theme NAME` | The theme to use; optional when the rule sets a font. |
+| `Font FAMILY` | The font family to use, unless the connection sets its own. |
+| `FontSize POINTS` | The font size, 4 to 96 points, unless the connection sets its own. |
 | `Tint RRGGBB AMOUNT` | Mixes a colour into the theme by 0 to 255, for example a red tint over your usual theme. |
 
 Without any rules, hosts tagged `production`, `staging` or `development` get Production, Staging or Nord.
