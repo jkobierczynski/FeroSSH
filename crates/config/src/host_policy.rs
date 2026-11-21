@@ -265,7 +265,8 @@ pub fn same_machine(a: &str, b: &str) -> bool {
     let (a, b) = (norm(a), norm(b));
     let loopback = a == "localhost"
         || a.ends_with(".localhost")
-        || a.parse::<std::net::IpAddr>().is_ok_and(|ip| ip.is_loopback());
+        || a.parse::<std::net::IpAddr>()
+            .is_ok_and(|ip| ip.is_loopback());
     !a.is_empty() && !loopback && a == b
 }
 
