@@ -1901,6 +1901,7 @@ impl Settings {
                                 let amount = args.get(1).and_then(|a| a.parse::<u8>().ok());
                                 r.tint = rgb.zip(amount);
                             }
+                            "enforce" => r.enforce = yes(&args).unwrap_or(false),
                             _ => {}
                         }
                     }
@@ -2217,6 +2218,9 @@ impl Settings {
             }
             if let Some(([red, green, blue], amount)) = r.tint {
                 let _ = writeln!(out, "    Tint {red:02x}{green:02x}{blue:02x} {amount}");
+            }
+            if r.enforce {
+                let _ = writeln!(out, "    Enforce yes");
             }
         }
         for r in self.security_rules.iter().filter(|r| !r.is_inert()) {
@@ -3367,6 +3371,18 @@ DesktopShareSelection yes
             ..Settings::default()
         };
         assert!(Settings::parse(&s.to_text()).tmux_keys);
+    }
+
+    #[test]
+    fn an_enforced_theme_rule_round_trips() {
+        let s =
+            Settings::parse("ThemeRule\n    Tags prod\n    Theme Production\n    Enforce yes\n");
+        assert!(s.theme_rules[0].enforce);
+        assert!(s.to_text().contains("    Enforce yes\n"));
+        assert_eq!(Settings::parse(&s.to_text()).theme_rules, s.theme_rules);
+        let s = Settings::parse("ThemeRule\n    Tags prod\n    Theme Production\n");
+        assert!(!s.theme_rules[0].enforce);
+        assert!(!s.to_text().contains("Enforce"));
     }
 
     #[test]

@@ -25,6 +25,11 @@ pub struct ThemeRule {
     pub font: Option<String>,
     /// The font size in points, unless the connection sets one.
     pub font_size: Option<f32>,
+    /// What it sets cannot be changed: not by the connection's own look,
+    /// nor on its panes, the tabs and panes opened from them or its tmux
+    /// windows (Settings > Theme and Font, zoom, workspaces). An earlier
+    /// enforced rule wins over a later one.
+    pub enforce: bool,
 }
 
 impl ThemeRule {
@@ -36,7 +41,14 @@ impl ThemeRule {
             tint: None,
             font: None,
             font_size: None,
+            enforce: false,
         }
+    }
+
+    /// Makes it enforced (see [`ThemeRule::enforce`]).
+    pub fn enforced(mut self) -> Self {
+        self.enforce = true;
+        self
     }
 
     pub fn font(mut self, family: &str, size: Option<f32>) -> Self {
@@ -73,6 +85,9 @@ impl ThemeRule {
             (Some(f), None) => parts.push(f.clone()),
             (None, Some(s)) => parts.push(format!("{s} pt")),
             (None, None) => {}
+        }
+        if self.enforce && !parts.is_empty() {
+            parts.push("enforced".to_owned());
         }
         parts.join(", ")
     }
@@ -168,9 +183,55 @@ impl HostThemes {
             .find(|r| sets(r) && hosts.iter().any(|h| r.matches(h, tags)))
     }
 
+    /// What the enforced rules that match fix: each of theme, font and
+    /// size from the first enforced rule that sets it.
+    pub fn enforced(&self, hosts: &[&str], tags: &[&str]) -> Enforced {
+        let first = |sets: &dyn Fn(&ThemeRule) -> bool| {
+            self.rules
+                .iter()
+                .find(|r| r.enforce && sets(r) && hosts.iter().any(|h| r.matches(h, tags)))
+        };
+        let theme = first(&|r| !r.theme.is_empty());
+        Enforced {
+            theme: theme.map(|r| (r.theme.clone(), r.tint)),
+            font: first(&|r| r.font.is_some()).and_then(|r| r.font.clone()),
+            size: first(&|r| r.font_size.is_some()).and_then(|r| r.font_size),
+            rule: [
+                theme,
+                first(&|r| r.font.is_some()),
+                first(&|r| r.font_size.is_some()),
+            ]
+            .into_iter()
+            .flatten()
+            .next()
+            .map(ThemeRule::describe_match),
+        }
+    }
+
     /// The built-in tag rules, after the user's.
     pub fn builtin() -> &'static [ThemeRule] {
         builtin_rules()
+    }
+}
+
+/// A background tint: colour and strength 0-255.
+pub type Tint = ([u8; 3], u8);
+
+/// What enforced theme rules fix for one host (see
+/// [`HostThemes::enforced`]).
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Enforced {
+    /// The theme and its tint.
+    pub theme: Option<(String, Option<Tint>)>,
+    pub font: Option<String>,
+    pub size: Option<f32>,
+    /// What the first of those rules matches (`tags prod`), to name it.
+    pub rule: Option<String>,
+}
+
+impl Enforced {
+    pub fn is_empty(&self) -> bool {
+        self.theme.is_none() && self.font.is_none() && self.size.is_none()
     }
 }
 
@@ -210,6 +271,32 @@ mod tests {
         let mut t = HostThemes::new();
         t.push(ThemeRule::new("Dracula").tags(&["S?"]));
         assert_eq!(theme(&t, "box", &["ſİ"]), Some("Dracula"));
+    }
+
+    #[test]
+    fn enforced_rules_fix_each_field_from_the_first_that_sets_it() {
+        let mut t = HostThemes::new();
+        t.push(ThemeRule::new("Dracula").tags(&["lab"]));
+        t.push(ThemeRule::new("Production").tags(&["prod"]).enforced());
+        t.push(
+            ThemeRule::new("")
+                .tags(&["prod"])
+                .font("Consolas", Some(12.0))
+                .enforced(),
+        );
+        let e = t.enforced(&["db1"], &["prod", "lab"]);
+        assert_eq!(e.theme, Some(("Production".to_owned(), None)));
+        assert_eq!(e.font.as_deref(), Some("Consolas"));
+        assert_eq!(e.size, Some(12.0));
+        assert_eq!(e.rule.as_deref(), Some("tags prod"));
+        assert!(t.enforced(&["db1"], &["lab"]).is_empty());
+        assert_eq!(
+            ThemeRule::new("Production")
+                .tags(&["prod"])
+                .enforced()
+                .describe_look(),
+            "Production, enforced"
+        );
     }
 
     #[test]

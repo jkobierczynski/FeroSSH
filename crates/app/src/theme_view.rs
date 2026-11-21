@@ -413,7 +413,8 @@ pub fn moved_to(len: usize, at: usize, way: Move) -> Option<usize> {
     }
 }
 
-/// What the rule form typed: host patterns, tags, theme, font, size.
+/// What the rule form typed: host patterns, tags, theme, font, size,
+/// and whether the rule is enforced.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Typed {
     pub hosts: String,
@@ -421,6 +422,7 @@ pub struct Typed {
     pub theme: String,
     pub font: String,
     pub size: String,
+    pub enforce: bool,
 }
 
 /// Checks what was typed and makes the rule (keeping `old`'s tint):
@@ -478,6 +480,7 @@ pub fn check(
     rule.font = font;
     rule.font_size = font_size;
     rule.tint = old.and_then(|o| o.tint);
+    rule.enforce = typed.enforce;
     if rule.hosts.is_empty() && rule.tags.is_empty() {
         return Err(
             "Name the connections the rule is for: a tag or a host name pattern.".to_owned(),
@@ -633,7 +636,20 @@ mod tests {
             theme: theme.into(),
             font: font.into(),
             size: size.into(),
+            enforce: false,
         };
+        let enforced = check(
+            &Typed {
+                enforce: true,
+                ..typed("prod", "Production", "", "")
+            },
+            None,
+            &themes,
+            &fonts,
+            |_| false,
+        )
+        .unwrap();
+        assert!(enforced.enforce);
         let ok = check(
             &typed("lab \"my team\"", "nord", "hack", "11,5"),
             None,

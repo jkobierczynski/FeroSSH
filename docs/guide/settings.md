@@ -258,7 +258,7 @@ Only text in the terminal's own colours is recoloured. A rule that does not comp
 
 ## Theme rules
 
-Rules pick a theme, a font and a font size from the host's name or its tags: ssh_config's `Tag` and the profile's own `Tags`. Tools > Theme rules edits these blocks for you and puts them in order. A host's profile wins over the rules, and the rules win over `--theme` and `DefaultTheme`. Each of theme, font and size comes from the first rule that sets it, so a rule may set only a font.
+Rules pick a theme, a font and a font size from the host's name or its tags: ssh_config's `Tag` and the profile's own `Tags`. Tools > Theme rules edits these blocks for you and puts them in order. A host's profile wins over the rules (except an enforced one), and the rules win over `--theme` and `DefaultTheme`. Each of theme, font and size comes from the first rule that sets it, so a rule may set only a font.
 
 ```
 ThemeRule
@@ -282,6 +282,7 @@ ThemeRule
 | `Font FAMILY` | The font family to use, unless the connection sets its own. |
 | `FontSize POINTS` | The font size, 4 to 96 points, unless the connection sets its own. |
 | `Tint RRGGBB AMOUNT` | Mixes a colour into the theme by 0 to 255, for example a red tint over your usual theme. |
+| `Enforce yes` | What the rule sets cannot be changed: it beats the connection's own look (`Profile`), and Settings > Theme and Font, zoom, custom themes, workspaces and tmux layouts leave it alone on the connection's panes, the tabs and panes opened from them and its tmux windows. The first enforced rule that sets each of theme, font and size wins. |
 
 Without any rules, hosts tagged `production`, `staging` or `development` get Production, Staging or Nord.
 
