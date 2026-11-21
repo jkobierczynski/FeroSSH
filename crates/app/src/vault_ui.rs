@@ -546,28 +546,37 @@ pub(super) fn import(hwnd: HWND) {
     // PC (through a shared vault) may have changed them while the
     // question was open. What that changes is shown and asked about
     // again before anything is written.
-    let mut approved = plan.reviews;
+    let mut approved = (plan.reviews, plan.profiles.credentials);
     let plan = loop {
         let Some(current) = with_window(|w| w.settings.clone()) else {
             return;
         };
         let plan = self::plan(&incoming, &current);
-        if plan.reviews == approved {
+        if plan.reviews == approved.0 && plan.profiles.credentials == approved.1 {
             break plan;
+        }
+        let mut changes = reviews_text(&plan.reviews);
+        if plan.profiles.credentials > 0 {
+            changes.push_str(&format!(
+                "\n- adds or changes {} (Credentials...), which replace yours of the same name",
+                plural(
+                    plan.profiles.credentials,
+                    "named credential",
+                    "named credentials"
+                )
+            ));
+        }
+        if changes.is_empty() {
+            changes = "\n- nothing more to look over".to_owned();
         }
         let question = format!(
             "Your connections changed while the question was open (another window or PC), so \
-             the import now changes this:{}\n\nImport?",
-            if plan.reviews.is_empty() {
-                "\n- nothing more to look over".to_owned()
-            } else {
-                reviews_text(&plan.reviews)
-            }
+             the import now changes this:{changes}\n\nImport?"
         );
         if dialog(hwnd, &question, MB_YESNO | MB_ICONINFORMATION) != Some(IDYES) {
             return;
         }
-        approved = plan.reviews;
+        approved = (plan.reviews, plan.profiles.credentials);
     };
     let mut problems = Vec::new();
     for (p, t) in &plan.files {
