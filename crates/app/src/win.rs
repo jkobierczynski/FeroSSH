@@ -1528,6 +1528,9 @@ struct Window {
     /// Those of them no tab shows: they show only when the login needs
     /// an answer or fails.
     launch_hidden: HashSet<PaneId>,
+    /// Launch sessions shown because they got a security rule warning:
+    /// they stay in their tab when the desktop or app takes over.
+    launch_warned: HashSet<PaneId>,
     /// Remote Desktop Connections running on a connection's tunnel: the
     /// connection stays while they run.
     mstsc: Vec<(std::process::Child, ChannelId)>,
@@ -2847,6 +2850,7 @@ fn create_and_run(launch: Launch, theme: Option<String>) -> Result<()> {
                 clip_pane: None,
                 launches: HashMap::new(),
                 launch_hidden: HashSet::new(),
+                launch_warned: HashSet::new(),
                 mstsc: Vec::new(),
                 passwords: Arc::default(),
                 pending_desktops: HashMap::new(),
@@ -7570,6 +7574,7 @@ impl Window {
         // once the app holds the connection: shown in a tab instead, so
         // the warning is seen and stays.
         if self.launch_hidden.contains(&id) {
+            self.launch_warned.insert(id);
             self.reveal_launch(id);
         }
     }
@@ -16448,15 +16453,17 @@ impl Window {
                 self.end_host(id);
                 self.panes.remove(&id);
                 self.watches.remove(&id);
-            } else if self.ws.tabs.len() > 1
-                || self.ws.tab().is_some_and(|t| t.root.panes().len() > 1)
+            } else if !self.launch_warned.contains(&id)
+                && (self.ws.tabs.len() > 1
+                    || self.ws.tab().is_some_and(|t| t.root.panes().len() > 1))
             {
                 if let Some(c) = self.close_pane(id) {
                     self.queued.push(c);
                 }
             } else {
-                // The window's only tab: it stays, free for another
-                // connection.
+                // The window's only tab, or one showing a rule warning: it
+                // stays, free for another connection.
+                self.launch_warned.remove(&id);
                 self.end_host(id);
                 self.show(
                     id,
@@ -16469,6 +16476,7 @@ impl Window {
         let panes = &self.panes;
         self.launches.retain(|id, _| panes.contains_key(id));
         self.launch_hidden.retain(|id| panes.contains_key(id));
+        self.launch_warned.retain(|id| panes.contains_key(id));
         if self.mstsc.len() != before {
             self.prune_forwards();
         }
