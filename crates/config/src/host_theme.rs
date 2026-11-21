@@ -200,6 +200,7 @@ impl HostThemes {
         };
         let theme = first(&|r| !r.theme.is_empty());
         Enforced {
+            builtin: theme.is_some_and(|r| builtin_rules().iter().any(|b| std::ptr::eq(b, r))),
             theme: theme.map(|r| (r.theme.clone(), r.tint)),
             font: first(&|r| r.font.is_some()).and_then(|r| r.font.clone()),
             size: first(&|r| r.font_size.is_some()).and_then(|r| r.font_size),
@@ -234,6 +235,8 @@ pub struct Enforced {
     pub size: Option<f32>,
     /// What the first of those rules matches (`tags prod`), to name it.
     pub rule: Option<String>,
+    /// The theme comes from a built-in tag rule, which cannot be changed.
+    pub builtin: bool,
 }
 
 impl Enforced {

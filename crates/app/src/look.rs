@@ -88,6 +88,8 @@ pub struct Lock {
     pub size: Option<f32>,
     /// What the rule matches (`tags prod`), to name it.
     pub rule: Option<String>,
+    /// The theme is a built-in tag rule's, which nothing changes.
+    pub builtin: bool,
 }
 
 impl Lock {
@@ -112,10 +114,22 @@ impl Lock {
             (true, false) => "theme is",
             _ => "font is",
         };
+        let rule = self.rule.as_deref().unwrap_or("Theme rules");
+        if self.builtin {
+            let font = if font {
+                " Its font is fixed by an enforced rule of your own, which Tools > Theme rules \
+                 changes."
+            } else {
+                " Your own theme rules can still set its font and size."
+            };
+            return format!(
+                "This connection's theme is set by a built-in theme rule ({rule}), which always \
+                 applies and cannot be changed.{font}"
+            );
+        }
         format!(
-            "This connection's {what} set by an enforced theme rule ({}), so it cannot be \
-             changed here. Tools > Theme rules changes the rule.",
-            self.rule.as_deref().unwrap_or("Theme rules")
+            "This connection's {what} set by an enforced theme rule ({rule}), so it cannot be \
+             changed here. Tools > Theme rules changes the rule."
         )
     }
 }
@@ -139,6 +153,7 @@ pub fn lock_for(settings: &Settings, alias: &str, hostname: &str, tag: Option<&s
         font: e.font,
         size: e.size,
         rule: e.rule,
+        builtin: e.builtin,
     }
 }
 
@@ -221,13 +236,28 @@ Profile db
         assert_eq!(lock.theme(Theme::default()).name, "Production");
         let f = lock.font(FontSpec::new("Hack", 20.0));
         assert_eq!((f.family.as_str(), f.size_pt), ("Hack", 14.0));
+        // The theme is the built-in prod rule's; the size the user's.
+        assert!(lock.builtin);
+        assert!(lock.why().contains("built-in theme rule"), "{}", lock.why());
+        assert!(lock.why().contains("font is fixed"), "{}", lock.why());
+        assert!(lock.why().contains("tags prod"));
+        let own = Settings::parse(
+            "ThemeRule\n    Tags pci\n    Theme Dracula\n    FontSize 14\n    Enforce yes\n",
+        );
+        let lock = lock_for(&own, "web", "x", Some("pci"));
+        assert!(!lock.builtin);
         assert!(
             lock.why().contains("theme and font are set"),
             "{}",
             lock.why()
         );
-        assert!(lock.why().contains("tags prod"));
+        assert!(lock.why().contains("changes the rule"));
         assert_eq!(lock_for(&s, "other", "x", None), Lock::default());
+        // A built-in tag rule's lock says it cannot be changed at all.
+        let prod = lock_for(&Settings::parse(""), "web", "x", Some("prod"));
+        assert!(prod.builtin);
+        assert!(prod.why().contains("built-in theme rule"), "{}", prod.why());
+        assert!(!prod.why().contains("changes the rule"), "{}", prod.why());
         // Not enforced: the connection's own look wins as before.
         let s = Settings::parse(
             "ThemeRule\n    Tags pci\n    Theme Production\n\

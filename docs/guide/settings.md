@@ -266,7 +266,7 @@ ThemeRule
     Hosts *.prod.example.com !prod-sandbox
     Theme Production
 ThemeRule
-    Tags staging
+    Tags qa
     Theme Nord
     Tint ffb000 40
 ThemeRule
