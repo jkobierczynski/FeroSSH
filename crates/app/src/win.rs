@@ -15460,6 +15460,10 @@ impl Window {
 
     /// [`Self::saved_password_target`] with ssh_config already read.
     fn saved_password_target_in(&self, name: &str, env: &Env) -> Option<String> {
+        // A typed `winrm://` or `winrms://` address, as a workspace keeps it.
+        if let Some(t) = WinrmTarget::typed(name) {
+            return Some(credman::target(t.user.as_deref()?, &t.hostname, t.port));
+        }
         if self
             .settings
             .profile(name)
@@ -15470,6 +15474,21 @@ impl Window {
         }
         let t = Target::resolve(name, env)?;
         Some(credman::target(&t.user, &t.hostname, t.port))
+    }
+
+    /// Where a login to `name` takes its password from: the source of the
+    /// connection it resolves to, as the login itself looks it up
+    /// (`bob@web:22` goes by `web`, `winrms://bob@web` by `web`).
+    fn source_of_name(&self, name: &str, env: &Env) -> PasswordSource {
+        if self.settings.profile(name).is_some() {
+            return self.settings.password_source(name);
+        }
+        let alias = match WinrmTarget::typed(name) {
+            Some(t) => Some(t.alias),
+            None => Target::resolve(name, env).map(|t| t.alias),
+        };
+        self.settings
+            .password_source(alias.as_deref().unwrap_or(name))
     }
 
     /// The Credential Manager entries `names` keep their Windows-stored
@@ -15502,7 +15521,7 @@ impl Window {
         // on what the saved workspaces open, asking ones too.
         let mut users: HashMap<String, Vec<String>> = HashMap::new();
         let mut add = |name: String, ask_too: bool| {
-            let keeps = match self.settings.password_source(&name) {
+            let keeps = match self.source_of_name(&name, &env) {
                 PasswordSource::Windows => true,
                 PasswordSource::Ask => ask_too,
                 PasswordSource::Command(_) => false,
@@ -15528,9 +15547,7 @@ impl Window {
         }
         if self.settings.workspace_auto_login {
             for n in ferossh_config::workspace::all_connections(&workspaces_dir()) {
-                // An `sftp://` pane logs in as the `user@host:port` it names.
-                let n = ferossh_config::ssh_config::sftp_url(&n).map_or(n, |(d, _)| d);
-                add(n, true);
+                add(workspace_destination(n), true);
             }
         }
         let mut saved: Vec<(String, String, Place)> = Vec::new();
@@ -15578,7 +15595,7 @@ impl Window {
         let targets = |names: Vec<String>, ask_too: bool| -> Vec<String> {
             names
                 .iter()
-                .filter(|n| match self.settings.password_source(n) {
+                .filter(|n| match self.source_of_name(n, &env) {
                     PasswordSource::Windows => true,
                     PasswordSource::Ask => ask_too,
                     PasswordSource::Command(_) => false,
@@ -15597,7 +15614,10 @@ impl Window {
         // would ask too; an asking connection no workspace opens does not.
         if self.settings.workspace_auto_login {
             in_use.extend(targets(
-                ferossh_config::workspace::all_connections(&workspaces_dir()),
+                ferossh_config::workspace::all_connections(&workspaces_dir())
+                    .into_iter()
+                    .map(workspace_destination)
+                    .collect(),
                 true,
             ));
         }
@@ -26734,6 +26754,13 @@ fn quiet_watchable(p: &Pane) -> bool {
         Host::Replay(_) | Host::Desktop { .. } | Host::Diff(_)
     ) && p.desktop.is_none()
         && !no_shell
+}
+
+/// What a saved workspace's connection `name` logs in to, as
+/// `connect_with` reads it: an `sftp://` pane as the `user@host:port` it
+/// names, anything else as written.
+fn workspace_destination(name: String) -> String {
+    ferossh_config::ssh_config::sftp_url(&name).map_or(name, |(d, _)| d)
 }
 
 #[cfg(test)]
