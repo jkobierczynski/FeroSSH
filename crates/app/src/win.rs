@@ -20240,22 +20240,30 @@ impl Window {
             own.as_ref().and_then(|c| c.size),
             own.as_ref().and_then(|c| c.window),
         );
+        // What the file held, as this window knew it, before it changes.
+        let before = self
+            .custom_themes
+            .iter()
+            .find(|c| c.theme.name == name && same_file(&c.path, path))
+            .map(|c| c.theme.clone());
         self.write_theme_file(path, name, text)?;
         let saved = self
             .custom_named(name)
             .map_or_else(|| edited.clone(), |c| c.theme.clone());
         let mut shown = 0;
-        if name == original.name {
+        // The theme this file held before (the edited one for Save, or the
+        // one a Save as replaced): its copies take the new colours.
+        if let Some(before) = before {
             // Panes with the theme as it was (not tinted by a rule, not
             // another look) change with it; so do their enforced looks.
             let ids: Vec<PaneId> = self
                 .panes
                 .iter()
-                .filter(|(_, p)| p.theme == *original)
+                .filter(|(_, p)| p.theme == before)
                 .map(|(id, _)| *id)
                 .collect();
             for p in self.panes.values_mut() {
-                if p.lock.theme.as_ref() == Some(original) {
+                if p.lock.theme.as_ref() == Some(&before) {
                     p.lock.theme = Some(saved.clone());
                 }
             }
@@ -20263,7 +20271,7 @@ impl Window {
                 self.set_theme(*id, saved.clone());
             }
             // New tabs too, when it is the default theme.
-            if self.default_theme == *original {
+            if self.default_theme == before {
                 self.default_theme = saved.clone();
             }
             shown = ids.len();
@@ -20284,8 +20292,8 @@ impl Window {
             format!("Saved the colours of {name} to {}.{panes}", path.display())
         } else {
             format!(
-                "Saved the theme {name} to {}. It is in the Theme manager and Settings > \
-                 Custom themes; Apply to this pane puts it on a pane.",
+                "Saved the theme {name} to {}.{panes} It is in the Theme manager and \
+                 Settings > Custom themes; Apply to this pane puts it on a pane.",
                 path.display()
             )
         })
@@ -26801,7 +26809,12 @@ fn edit_colours(hwnd: HWND, name: &str) {
                         themes_dir().display()
                     )),
                     Ok(n) => {
+                        // Read the folder again: another window may have
+                        // saved a theme since this one last looked.
                         let taken = with_window(|w| {
+                            if let Ok((themes, _)) = load_custom_themes() {
+                                w.custom_themes = themes;
+                            }
                             w.custom_themes
                                 .iter()
                                 .find(|c| {
