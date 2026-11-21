@@ -14070,6 +14070,11 @@ impl Window {
             Some(view) => {
                 self.side.view = view;
                 self.side.focused = false;
+                // A save while the palette was open may have merged in
+                // rules from another window or PC.
+                if view == SideView::SecurityRules && self.rules_native() {
+                    rules_panel::set_rows(self.rule_rows());
+                }
                 self.refresh_chrome();
                 self.request_full_redraw();
                 self.refresh(self.focused_id());
@@ -16189,11 +16194,17 @@ impl Window {
     }
 
     /// Reads the hosts again after a session was saved or deleted.
-    /// Takes in host profiles another PC changed in a shared vault, and
-    /// shows them in the connection list.
+    /// Takes in host profiles, credentials, rules and saved searches that
+    /// another PC (in a shared vault) or another FeroSSH window changed,
+    /// and shows them: in the connection list, and in the Security rules
+    /// page when it is open. Connections made from now on follow the
+    /// rules taken in.
     fn pull_vault_settings(&mut self) {
         if vault_ui::pull_settings(&mut self.settings) {
             self.reload_sessions(None);
+            if self.rules_native() {
+                rules_panel::set_rows(self.rule_rows());
+            }
         }
     }
 
@@ -18711,7 +18722,37 @@ impl Window {
     /// [`Self::save_settings`], with the failure also returned, for callers
     /// that must not go on without the settings saved.
     fn try_save_settings(&mut self) -> std::result::Result<(), String> {
+        // Another FeroSSH window on this PC waits while this one reads,
+        // merges and writes the settings, so neither drops what the other
+        // added. (A file of its own, not the vault's lock, which the vault
+        // takes itself for each read and write.)
+        // With a vault open, the lock is named after the vault, so an
+        // installed and a portable FeroSSH using the same vault wait for
+        // each other too.
+        let lock_on = crate::vault::path().map_or_else(settings_path, |v| {
+            let mut name = v.into_os_string();
+            name.push(".settings");
+            std::path::PathBuf::from(name)
+        });
+        let Some(_lock) = crate::vault::lock_file(&lock_on) else {
+            // Saving anyway could write over what the other window is
+            // merging in; this window's settings stay as they are and the
+            // next save tries again.
+            let e = "Could not save settings: another FeroSSH window is \
+                     saving them. Try again in a moment."
+                .to_owned();
+            let id = self.focused_id();
+            self.show(id, &format!("\r\n\x1b[0;31m{e}\x1b[0m\r\n"));
+            self.refresh(id);
+            return Err(e);
+        };
+        let rules = self.settings.security_rules.clone();
         vault_ui::sync_settings(&mut self.settings);
+        // Rules the merge brought in show at once: the next focus finds
+        // nothing new to take in.
+        if self.settings.security_rules != rules && self.rules_native() {
+            rules_panel::set_rows(self.rule_rows());
+        }
         // Window colours shown by a menu preview are not saved.
         let shown = self.settings.window_colours;
         if let Some(p) = self

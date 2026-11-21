@@ -1165,21 +1165,30 @@ pub(super) fn note_settings(text: &str) {
     }
 }
 
-/// Before the window saves its settings into a shared vault: host
-/// profiles another PC changed since we read them are taken in, so our
-/// save does not undo them.
-pub(super) fn sync_settings(settings: &mut Settings) {
-    if !vault::is_open() {
-        return;
+/// `ferossh.conf` as it is now: in the vault while one is open, else on
+/// disk, where another FeroSSH window may have written it.
+fn current_settings() -> Option<String> {
+    if vault::is_open() {
+        vault::read("ferossh.conf")
+    } else {
+        std::fs::read_to_string(settings_path()).ok()
     }
-    if let Some(theirs) = vault::read("ferossh.conf") {
+}
+
+/// Before the window saves its settings: what another PC (through a
+/// shared vault) or another FeroSSH window here changed since we read
+/// them is taken in, so our save does not undo it. Security rules above
+/// all: a window that never saw a rule must not delete it.
+pub(super) fn sync_settings(settings: &mut Settings) {
+    if let Some(theirs) = current_settings() {
         merge_theirs(settings, &theirs);
     }
 }
 
-/// Takes in the host profiles of `theirs` (the vault's settings) that
-/// changed since this window last read or wrote them; `false` when
-/// nothing changed.
+/// Takes in what `theirs` (the settings file as it is now) changed since
+/// this window last read or wrote it ([`bundle::merge_shared3`]: host
+/// profiles, credentials, security and theme rules, saved searches and
+/// secrets); `false` when nothing changed.
 fn merge_theirs(settings: &mut Settings, theirs: &str) -> bool {
     let base = SETTINGS_BASE.lock().ok().and_then(|b| b.clone());
     if base.as_deref() == Some(theirs) {
@@ -1187,23 +1196,20 @@ fn merge_theirs(settings: &mut Settings, theirs: &str) -> bool {
     }
     let base = base.map(|b| Settings::parse(&b)).unwrap_or_default();
     let parsed = Settings::parse(theirs);
-    // Credentials too: ours where we changed them, else theirs, and a
-    // profile follows a credential renamed on either side.
-    let (profiles, credentials) = bundle::merge_logins3(&base, settings, &parsed);
-    settings.profiles = profiles;
-    settings.credentials = credentials;
+    // Ours where we changed something, else theirs; a profile follows a
+    // credential renamed on either side, and a rule either side added
+    // stays.
+    bundle::merge_shared3(&base, settings, &parsed);
     true
 }
 
-/// When another PC changed the shared vault's host profiles: takes them
-/// into the window's settings now, so connections open the way they are
-/// saved, without waiting for a save here or a restart. `true` when
-/// something was taken in.
+/// When another PC (through a shared vault) or another FeroSSH window
+/// changed the settings file: takes host profiles, credentials, rules and
+/// saved searches into the window's settings now, so connections open
+/// under the rules as saved, without waiting for a save here or a
+/// restart. `true` when something was taken in.
 pub(super) fn pull_settings(settings: &mut Settings) -> bool {
-    if !vault::is_open() {
-        return false;
-    }
-    let Some(theirs) = vault::read("ferossh.conf") else {
+    let Some(theirs) = current_settings() else {
         return false;
     };
     if !merge_theirs(settings, &theirs) {
