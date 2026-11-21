@@ -25633,7 +25633,11 @@ fn run_command(hwnd: HWND, command: Command) {
                                 ..desktop
                             },
                         );
-                        w.desktop_after_login(pane);
+                        // A gateway reconnecting meanwhile opens it once
+                        // it has logged in again.
+                        if w.pane_connection(pane).is_some() {
+                            w.desktop_after_login(pane);
+                        }
                     });
                 }
                 Some(_) => {
