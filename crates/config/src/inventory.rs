@@ -183,8 +183,17 @@ impl Inventory {
     }
 
     /// The server of connection `name` said this at `now`.
+    /// Only a connection the inventory knows (it logged in first) takes
+    /// it: a read that ends after the record was deleted, in this window
+    /// or another, does not bring it back.
     pub fn system(&mut self, name: &str, now: u64, info: &SystemInfo) {
-        let Some(r) = self.entry(name) else {
+        let name = clean(name);
+        let Some(r) = self
+            .records
+            .iter_mut()
+            .find(|(n, _)| n.eq_ignore_ascii_case(&name))
+            .map(|(_, r)| r)
+        else {
             return;
         };
         r.os = clean(&info.os);
@@ -415,6 +424,7 @@ mod tests {
             os: format!("Evil\tOS\nnext\u{202e}line{}", "x".repeat(1000)),
             kernel: "\x1b]0;title\x07Linux".into(),
         };
+        inv.connected("a", 1, None);
         inv.system("a", 1, &info);
         let text = inv.to_text();
         assert_eq!(text.lines().count(), 2);
@@ -422,6 +432,22 @@ mod tests {
         assert!(r.os.starts_with("Evil OS next line"));
         assert_eq!(r.os.chars().count(), MAX_FIELD);
         assert!(!r.kernel.contains('\x1b'));
+    }
+
+    #[test]
+    fn a_late_os_read_does_not_bring_back_a_deleted_record() {
+        let info = SystemInfo {
+            os: "Debian".into(),
+            kernel: "Linux".into(),
+        };
+        let mut inv = Inventory::default();
+        inv.connected("web", 1, None);
+        inv.remove("web");
+        inv.system("web", 2, &info);
+        assert!(inv.get("web").is_none());
+        inv.connected("web", 3, None);
+        inv.system("WEB", 4, &info);
+        assert_eq!(inv.get("web").unwrap().os, "Debian");
     }
 
     #[test]
