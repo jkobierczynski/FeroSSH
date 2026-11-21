@@ -46,6 +46,18 @@ pub fn sig_path(library: &Path) -> PathBuf {
 /// The largest `.sig` file read: an SSH signature is a few hundred bytes.
 const MAX_SIG_LEN: usize = 64 * 1024;
 
+/// Held from the check that a read is still the newest to its copy's
+/// rename, and while a newer read is announced ([`newest`]), so the two
+/// never cross.
+static COMMIT: Mutex<()> = Mutex::new(());
+
+/// Makes read `n` the newest in `latest`: an older read that has not
+/// put its copy in place by now never will.
+pub fn newest(latest: &AtomicU64, n: u64) {
+    let _held = COMMIT.lock();
+    latest.store(n, Ordering::Release);
+}
+
 /// The checked copy of library `library` in `dir`: one file holding the
 /// library's path on the first line, the signature's length on the
 /// second, the signature, then the library, so the two are always
@@ -94,9 +106,6 @@ fn keep(
 ) -> std::io::Result<()> {
     /// Numbers each write, so two never share a temporary file.
     static WRITES: AtomicU64 = AtomicU64::new(0);
-    /// Held from the check that this read is still the newest to the
-    /// copy's rename.
-    static COMMIT: Mutex<()> = Mutex::new(());
     let file = cache_path(cache_dir, library);
     // The library's path first, checked on reading: two paths whose
     // hashes meet never share a copy.
@@ -285,6 +294,14 @@ mod tests {
         // case-sensitive folder: not this copy either.
         let upper = path.replace("team.ferossh-library", "TEAM.ferossh-library");
         assert!(cached(Some(&upper), &keys, &cache).is_empty());
+        // A read no longer the newest uses what it read but leaves the
+        // copy as it is.
+        let latest = AtomicU64::new(0);
+        newest(&latest, 2);
+        let read_one = || latest.load(Ordering::Acquire) == 1;
+        write_library(&share, "db");
+        assert!(load(Some(path), &keys, &cache, &read_one).team.has("db"));
+        assert!(cached(Some(path), &keys, &cache).has("web"));
         // No library set: nothing, and nothing to say.
         let off = load(None, &keys, &cache, &|| true);
         assert!(off.team.is_empty() && off.note.is_none());

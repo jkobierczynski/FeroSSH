@@ -16410,13 +16410,12 @@ impl Window {
         let keys = self.settings.team_library_keys.clone();
         // Whatever an earlier read finds is no longer wanted.
         self.team_read += 1;
-        self.team_latest.store(self.team_read, Ordering::Release);
+        crate::team_lib::newest(&self.team_latest, self.team_read);
         if library.is_none() {
             self.use_team(crate::team_lib::Loaded::default());
             return;
         }
         let read = self.team_read;
-        self.team_latest.store(read, Ordering::Release);
         let latest = self.team_latest.clone();
         let slot = self.team_loaded.clone();
         let notify = self.notifier();
