@@ -1027,6 +1027,9 @@ struct Pane {
     cast: Option<Recording>,
     font: FontSpec,
     theme: Theme,
+    /// What enforced theme rules fix on this pane's look; its tabs and
+    /// panes opened from it, and its tmux windows, get the same.
+    lock: look::Lock,
     metrics: CellMetrics,
     /// The pane's area in the client, padding included.
     rect: Rect,
@@ -3075,6 +3078,7 @@ fn new_pane(
         cast: None,
         font,
         theme,
+        lock: look::Lock::default(),
         metrics,
         rect: Rect::default(),
         title: None,
@@ -4241,24 +4245,30 @@ impl Window {
         };
         let mut font = g.font.clone();
         let mut metrics = g.metrics;
+        // The connection's enforced look holds for each of its windows.
+        let lock = g.lock.clone();
         // A saved look never overrides a Production or Staging colour.
-        let theme = look
-            .theme
-            .as_deref()
-            .and_then(Theme::by_name)
-            .filter(|t| g_theme.group() != ThemeGroup::Warning && t.group() != ThemeGroup::Warning)
-            .unwrap_or(g_theme);
+        let theme = lock.theme(
+            look.theme
+                .as_deref()
+                .and_then(Theme::by_name)
+                .filter(|t| {
+                    g_theme.group() != ThemeGroup::Warning && t.group() != ThemeGroup::Warning
+                })
+                .unwrap_or(g_theme),
+        );
         if look.font.is_some() || look.size.is_some() {
-            let wanted = FontSpec::new(
+            let wanted = lock.font(FontSpec::new(
                 look.font.as_deref().unwrap_or(&font.family),
                 look.size.unwrap_or(font.size_pt),
-            );
+            ));
             if let Ok(m) = self.renderer.metrics(&wanted, self.dpi) {
                 font = wanted;
                 metrics = m;
             }
         }
         let mut pane = new_pane(native, font, theme, metrics, scrollback);
+        pane.lock = lock;
         pane.term.resize(usize::from(cols), usize::from(rows));
         pane.host = Host::Tmux { gateway, label };
         pane.hl_host = self.panes.get(&gateway).and_then(|g| g.hl_host.clone());
@@ -4717,6 +4727,9 @@ impl Window {
         self.stop_log(id);
         if let Some(p) = self.panes.get_mut(&id) {
             p.host = Host::Ask(String::new());
+            // The connection's enforced look goes with it; the next one
+            // brings its own.
+            p.lock = look::Lock::default();
             p.desktop = None;
             p.title = None;
             p.cwd = None;
@@ -7541,10 +7554,12 @@ impl Window {
             .profile(&alias)
             .and_then(|p| p.scrollback)
             .or(self.settings.scrollback);
+        let lock = look::lock_for(&self.settings, &alias, &target.port, None);
         if let Some(p) = self.panes.get_mut(&id) {
             p.term.set_settings(&term_settings(scrollback));
             p.term.scroll_to_bottom();
             p.hl_host = Some((alias.clone(), target.port.clone()));
+            p.lock = lock;
         }
         self.apply_highlight(id, true);
         self.set_theme(id, theme);
@@ -7895,9 +7910,11 @@ impl Window {
             .profile(alias)
             .and_then(|p| p.scrollback)
             .or(self.settings.scrollback);
+        let lock = look::lock_for(&self.settings, alias, hostname, tag);
         if let Some(p) = self.panes.get_mut(&id) {
             p.term.set_settings(&term_settings(scrollback));
             p.hl_host = Some((alias.to_owned(), hostname.to_owned()));
+            p.lock = lock;
         }
         self.apply_highlight(id, true);
         self.set_theme(id, theme.clone());
@@ -11244,12 +11261,19 @@ impl Window {
                     .into(),
             ));
         }
-        let (label, theme) = self.panes.get(&from).map_or_else(
-            || (String::new(), self.default_theme.clone()),
-            |p| (p.host_label(), p.theme.clone()),
+        let (label, theme, lock) = self.panes.get(&from).map_or_else(
+            || {
+                (
+                    String::new(),
+                    self.default_theme.clone(),
+                    look::Lock::default(),
+                )
+            },
+            |p| (p.host_label(), p.theme.clone(), p.lock.clone()),
         );
         let id = self.new_tab_pane();
         if let Some(p) = self.panes.get_mut(&id) {
+            p.lock = lock;
             // The host's look (a Production host stays red), room for the
             // longest diff shown, and never part of a broadcast.
             p.term.set_theme(&theme);
@@ -11272,6 +11296,10 @@ impl Window {
                 shown: None,
                 files: Vec::new(),
             }));
+        }
+        // The enforced font and size too (the lock holds them from now on).
+        if let Some(font) = self.panes.get(&id).map(|p| p.font.clone()) {
+            self.set_font(id, font);
         }
         self.run_diff(id);
         // Keys go to the new tab, not to a tools pane that had them.
@@ -18736,6 +18764,9 @@ impl Window {
         // return their choice send no WM_COMMAND).
         self.end_look_preview(Some(id));
         let pane = self.focused_id();
+        if let Some(why) = self.look_refused(pane, id) {
+            return Some(Command::Notice(why));
+        }
         match id {
             cmd::EXIT => return Some(Command::Exit),
             cmd::CLOSE_TAB => return Some(Command::CloseTab(self.ws.active)),
@@ -19667,6 +19698,11 @@ impl Window {
     /// or loses cells right away, so a shell started next (the pty-req of
     /// a new connection) gets the rows and columns that fit.
     fn set_font(&mut self, id: PaneId, font: FontSpec) {
+        // An enforced theme rule's font and size stay.
+        let font = match self.panes.get(&id) {
+            Some(p) => p.lock.font(font),
+            None => font,
+        };
         let Ok(metrics) = self.renderer.metrics(&font, self.dpi) else {
             return;
         };
@@ -19680,6 +19716,8 @@ impl Window {
 
     fn set_theme(&mut self, id: PaneId, theme: Theme) {
         if let Some(p) = self.panes.get_mut(&id) {
+            // An enforced theme rule's theme stays.
+            let theme = p.lock.theme(theme);
             p.term.set_theme(&theme);
             p.theme = theme;
         }
@@ -19690,7 +19728,7 @@ impl Window {
     /// answering colour queries with the committed one.
     fn show_theme(&mut self, id: PaneId, theme: Theme) {
         if let Some(p) = self.panes.get_mut(&id) {
-            p.theme = theme;
+            p.theme = p.lock.theme(theme);
         }
         self.update_menu_checks();
     }
@@ -19728,6 +19766,21 @@ impl Window {
             }
         }
         (font, theme)
+    }
+
+    /// Why menu item `id` may not change pane `pane`'s look: an enforced
+    /// theme rule fixes the theme (Settings > Theme, a custom theme), the
+    /// font (Settings > Font) or the size (zoom).
+    fn look_refused(&self, pane: PaneId, id: u32) -> Option<String> {
+        let lock = &self.panes.get(&pane)?.lock;
+        let theme = (cmd::THEME..cmd::THEME + Theme::builtin().len() as u32).contains(&id)
+            || self.custom_at(id).is_some();
+        let family = (cmd::FONT..cmd::FONT + FONT_CHOICES.len() as u32).contains(&id);
+        let size = matches!(id, cmd::ZOOM_IN | cmd::ZOOM_OUT | cmd::ZOOM_RESET);
+        let refused = (theme && lock.theme.is_some())
+            || (family && lock.font.is_some())
+            || (size && lock.size.is_some());
+        refused.then(|| lock.why())
     }
 
     /// The custom theme behind menu id `id`, by its place in the list.
@@ -19899,7 +19952,11 @@ impl Window {
         };
         // A choice applies to the focused pane: a preview on another one
         // (focus moved meanwhile) goes back.
-        let chosen = chosen.filter(|_| self.focused_id() == p.pane);
+        // A pick an enforced theme rule refuses is no choice: what the
+        // preview showed goes back (window colours included).
+        let chosen = chosen
+            .filter(|_| self.focused_id() == p.pane)
+            .filter(|id| self.look_refused(p.pane, *id).is_none());
         let back = |by: Option<u32>| by.is_some() && by != chosen;
         // Only what the preview itself shows goes back.
         let theme_now = self.panes.get(&p.pane).map(|x| &x.theme);
@@ -24187,6 +24244,7 @@ fn edit_theme_rule(
             theme: r.theme.clone(),
             font: r.font.clone().unwrap_or_default(),
             size: r.font_size.map(|s| s.to_string()).unwrap_or_default(),
+            enforce: r.enforce,
         },
         None => Typed {
             theme: theme.unwrap_or_default(),
@@ -24203,7 +24261,10 @@ fn edit_theme_rule(
                  them opens with the theme, font and size set here, unless the connection \
                  sets its own. Leave any of the three empty to keep what it would get \
                  anyway. The first rule that sets each wins. Names as the Theme manager \
-                 lists them; changes apply to connections opened from now on.";
+                 lists them; changes apply to connections opened from now on. Enforced: \
+                 what the rule sets beats the connection's own look and cannot be changed \
+                 on its panes, on the tabs and panes opened from them, or in its tmux \
+                 windows.";
     loop {
         if DIALOG_OPEN.get() {
             return;
@@ -24221,7 +24282,10 @@ fn edit_theme_rule(
                     ("Font", &typed.font),
                     ("Font size (points)", &typed.size),
                 ],
-                checks: &[],
+                checks: &[(
+                    "Enforce: the connections cannot change this look",
+                    typed.enforce,
+                )],
                 option: original.as_ref().map(|_| ("Delete this rule", false)),
                 ok: "Save",
                 cancel: "Cancel",
@@ -24238,6 +24302,7 @@ fn edit_theme_rule(
             theme: f.next().unwrap_or_default(),
             font: f.next().unwrap_or_default(),
             size: f.next().unwrap_or_default(),
+            enforce: answer.checks.first().copied().unwrap_or(false),
         };
         if answer.option
             && let (Some(i), Some(o)) = (index, &original)

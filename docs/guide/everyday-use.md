@@ -793,9 +793,10 @@ Tools > Theme rules (the tag on the tools rail) gives connections a theme and a 
 - **New rule...** asks for tags and host patterns (separated by spaces, with quotes around one that has spaces), and a theme, a font and a font size. Leave any of the three empty to keep what the connection would get anyway.
 - **Edit...** (Enter or a double click) changes a rule. The built-in rules cannot change, but a rule of yours for the same tag comes first.
 - **Move up** and **Move down** change the order.
+- **Enforce** (a box in the rule's form) makes the rule's look stick. It beats the connection's own theme and font, and Settings > Theme and Font, zoom, custom themes, saved workspaces and tmux layouts cannot change it on the connection's panes, on the tabs and panes opened from them, or in its tmux windows; trying says which rule holds it. Use it so production always looks like production. The list shows these rules with "enforced" after what they set.
 - **Delete...** asks first, and names the connections that open with another look from then on.
 
-A connection's own theme and font (Look in its form), and Settings > Font and Theme on a pane, still come before the rules. The first rule that sets a theme wins, and so does the first that sets a font or a size, so one rule can give tag `lab` its font while another gives it its colours. Changes apply to connections opened from then on. The rules are `ThemeRule` blocks in `ferossh.conf`; see [Settings](settings.md#theme-rules).
+A connection's own theme and font (Look in its form), and Settings > Font and Theme on a pane, still come before the rules, unless the rule is enforced. The first rule that sets a theme wins, and so does the first that sets a font or a size, so one rule can give tag `lab` its font while another gives it its colours. Changes apply to connections opened from then on. The rules are `ThemeRule` blocks in `ferossh.conf`; see [Settings](settings.md#theme-rules).
 
 ### Custom themes
 
