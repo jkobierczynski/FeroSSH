@@ -33,16 +33,18 @@ use windows::Win32::Graphics::Gdi::{
     PAINTSTRUCT, SelectObject, SetBkMode, SetTextColor, TRANSPARENT,
 };
 use windows::Win32::UI::Controls::{
-    CDDS_ITEMPREPAINT, CDDS_PREPAINT, CDRF_DODEFAULT, CDRF_NOTIFYITEMDRAW, EM_LIMITTEXT,
-    EM_SETCUEBANNER, EM_SETSEL, LIST_VIEW_ITEM_STATE_FLAGS, LVCF_TEXT, LVCF_WIDTH, LVCOLUMNW,
-    LVGF_GROUPID, LVGF_HEADER, LVGF_STATE, LVGROUP, LVGS_COLLAPSIBLE, LVIF_GROUPID, LVIF_PARAM,
-    LVIF_TEXT, LVIS_FOCUSED, LVIS_SELECTED, LVITEMW, LVM_DELETEALLITEMS, LVM_DELETECOLUMN,
-    LVM_ENABLEGROUPVIEW, LVM_ENSUREVISIBLE, LVM_GETITEMW, LVM_GETNEXTITEM, LVM_INSERTCOLUMNW,
-    LVM_INSERTGROUP, LVM_INSERTITEMW, LVM_REMOVEALLGROUPS, LVM_SETCOLUMNWIDTH,
-    LVM_SETEXTENDEDLISTVIEWSTYLE, LVM_SETITEMSTATE, LVM_SETITEMTEXTW, LVN_COLUMNCLICK,
-    LVN_ITEMCHANGED, LVNI_SELECTED, LVS_EX_DOUBLEBUFFER, LVS_EX_FULLROWSELECT, LVS_EX_LABELTIP,
-    LVS_REPORT, LVS_SHOWSELALWAYS, LVS_SINGLESEL, NM_CUSTOMDRAW, NM_DBLCLK, NM_SETFOCUS, NMHDR,
-    NMLISTVIEW, NMLVCUSTOMDRAW, SetWindowTheme, WC_BUTTONW, WC_EDITW, WC_LISTVIEWW,
+    CDDS_ITEMPREPAINT, CDDS_PREPAINT, CDRF_DODEFAULT, CDRF_NOTIFYITEMDRAW, CDRF_SKIPDEFAULT,
+    EM_LIMITTEXT, EM_SETCUEBANNER, EM_SETSEL, LIST_VIEW_ITEM_STATE_FLAGS, LVCDI_GROUP, LVCF_TEXT,
+    LVCF_WIDTH, LVCOLUMNW, LVGF_GROUPID, LVGF_HEADER, LVGF_STATE, LVGGR_HEADER, LVGROUP,
+    LVGS_COLLAPSED, LVGS_COLLAPSIBLE, LVIF_GROUPID, LVIF_PARAM, LVIF_TEXT, LVIS_FOCUSED,
+    LVIS_SELECTED, LVITEMW, LVM_DELETEALLITEMS, LVM_DELETECOLUMN, LVM_ENABLEGROUPVIEW,
+    LVM_ENSUREVISIBLE, LVM_GETGROUPRECT, LVM_GETGROUPSTATE, LVM_GETITEMW, LVM_GETNEXTITEM,
+    LVM_INSERTCOLUMNW, LVM_INSERTGROUP, LVM_INSERTITEMW, LVM_REMOVEALLGROUPS, LVM_SETCOLUMNWIDTH,
+    LVM_SETEXTENDEDLISTVIEWSTYLE, LVM_SETGROUPINFO, LVM_SETITEMSTATE, LVM_SETITEMTEXTW,
+    LVN_COLUMNCLICK, LVN_ITEMCHANGED, LVNI_SELECTED, LVS_EX_DOUBLEBUFFER, LVS_EX_FULLROWSELECT,
+    LVS_EX_LABELTIP, LVS_REPORT, LVS_SHOWSELALWAYS, LVS_SINGLESEL, NM_CLICK, NM_CUSTOMDRAW,
+    NM_DBLCLK, NM_SETFOCUS, NMHDR, NMITEMACTIVATE, NMLISTVIEW, NMLVCUSTOMDRAW, SetWindowTheme,
+    WC_BUTTONW, WC_EDITW, WC_LISTVIEWW,
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     GetFocus, SetFocus, VK_CONTROL, VK_DELETE, VK_DOWN, VK_F5, VK_RETURN, VK_SHIFT,
@@ -169,6 +171,8 @@ struct State {
     preview: RECT,
     /// Where the panel was put last, to lay it out again for a new page.
     placed: Option<(Rect, i32)>,
+    /// The groups folded away, kept when the list is filled again.
+    folded: Vec<Group>,
 }
 
 thread_local! {
@@ -305,6 +309,7 @@ pub fn create(main: HWND, handler: Handler, dpi: u32) -> windows::core::Result<(
                 defaults: Defaults::default(),
                 preview: RECT::default(),
                 placed: None,
+                folded: Vec::new(),
             });
         });
     }
@@ -590,7 +595,7 @@ fn key(row: &Row) -> (Group, String) {
 /// The rows the search keeps, in the chosen order and their groups, and
 /// the summary; the row `keep` stays picked, else the first row is.
 fn fill(keep: Option<(Group, String)>) {
-    let Some((h, cells, names)) = with(|s| {
+    let Some((h, cells, names, folded)) = with(|s| {
         let query = search_text(s.h.search);
         let page = s.page;
         let mut shown = view::filter(view::on_page(&s.rows, page), &query);
@@ -620,7 +625,7 @@ fn fill(keep: Option<(Group, String)>) {
             })
             .collect();
         let names: Vec<(Group, String)> = shown.iter().map(|r| key(r)).collect();
-        (s.h, cells, names)
+        (s.h, cells, names, s.folded.clone())
     }) else {
         return;
     };
@@ -640,8 +645,12 @@ fn fill(keep: Option<(Group, String)>) {
                 mask: LVGF_HEADER | LVGF_GROUPID | LVGF_STATE,
                 pszHeader: PWSTR(header.as_mut_ptr()),
                 iGroupId: id as i32,
-                stateMask: LVGS_COLLAPSIBLE,
-                state: LVGS_COLLAPSIBLE,
+                stateMask: LVGS_COLLAPSIBLE | LVGS_COLLAPSED,
+                state: if folded.contains(g) {
+                    LVGS_COLLAPSIBLE | LVGS_COLLAPSED
+                } else {
+                    LVGS_COLLAPSIBLE
+                },
                 ..Default::default()
             };
             SendMessageW(
@@ -917,6 +926,100 @@ fn command(h: Handles, id: usize, code: u32) {
     }
 }
 
+/// Draws group heading `id` like the other tool pages: a fold mark, the
+/// name in the window's text colour and the rows shown in grey.
+fn draw_heading(list: HWND, cd: &NMLVCUSTOMDRAW) {
+    let Some(&group) = Group::ALL.get(cd.nmcd.dwItemSpec) else {
+        return;
+    };
+    let Some((folded, count)) = with(|s| {
+        let n = s
+            .shown
+            .iter()
+            .filter(|&&i| s.rows.get(i).is_some_and(|r| r.group == group))
+            .count();
+        (s.folded.contains(&group), n)
+    }) else {
+        return;
+    };
+    let mark = if folded { '\u{25B8}' } else { '\u{25BE}' };
+    let name = format!("{mark} {}", group.title());
+    crate::scripts_panel::draw_group_heading(list, cd, &name, &count.to_string());
+}
+
+/// The group whose heading is at `pt`, in the list's client coordinates.
+fn heading_at(list: HWND, pt: windows::Win32::Foundation::POINT) -> Option<usize> {
+    (0..Group::ALL.len()).find(|&id| {
+        let mut rc = RECT {
+            top: LVGGR_HEADER as i32,
+            ..Default::default()
+        };
+        // SAFETY: our own control; it fills `rc` (and fails for a group
+        // not in the list).
+        unsafe {
+            SendMessageW(
+                list,
+                LVM_GETGROUPRECT,
+                Some(WPARAM(id)),
+                Some(LPARAM(&raw mut rc as isize)),
+            )
+            .0 != 0
+                && pt.x >= rc.left
+                && pt.x < rc.right
+                && pt.y >= rc.top
+                && pt.y < rc.bottom
+        }
+    })
+}
+
+/// Folds group `id` away, or opens it, and remembers which.
+fn toggle(h: Handles, id: usize) {
+    let Some(&group) = Group::ALL.get(id) else {
+        return;
+    };
+    // SAFETY: a plain query of our own control.
+    let now = unsafe {
+        SendMessageW(
+            h.list,
+            LVM_GETGROUPSTATE,
+            Some(WPARAM(id)),
+            Some(LPARAM(LVGS_COLLAPSED.0 as isize)),
+        )
+        .0 != 0
+    };
+    let mine = with(|s| s.folded.contains(&group)).unwrap_or(false);
+    // The list folds a heading itself when its own (hidden) button is
+    // clicked: then what it shows already is the new state.
+    let fold = if now == mine { !now } else { now };
+    with(|s| {
+        s.folded.retain(|g| *g != group);
+        if fold {
+            s.folded.push(group);
+        }
+    });
+    let info = LVGROUP {
+        cbSize: size_of::<LVGROUP>() as u32,
+        mask: LVGF_STATE,
+        stateMask: LVGS_COLLAPSED,
+        state: if fold {
+            LVGS_COLLAPSED
+        } else {
+            Default::default()
+        },
+        ..Default::default()
+    };
+    // SAFETY: our own control; the struct lives through the call.
+    unsafe {
+        SendMessageW(
+            h.list,
+            LVM_SETGROUPINFO,
+            Some(WPARAM(id)),
+            Some(LPARAM(&raw const info as isize)),
+        );
+        let _ = InvalidateRect(Some(h.list), None, true);
+    }
+}
+
 fn notify(h: Handles, lparam: LPARAM) -> LRESULT {
     // SAFETY: Windows passes a valid NMHDR (and the larger struct its code
     // says) for the duration of WM_NOTIFY.
@@ -929,6 +1032,12 @@ fn notify(h: Handles, lparam: LPARAM) -> LRESULT {
             NM_CUSTOMDRAW => {
                 let cd = &mut *(lparam.0 as *mut NMLVCUSTOMDRAW);
                 let stage = cd.nmcd.dwDrawStage;
+                if stage == CDDS_PREPAINT && cd.dwItemType == LVCDI_GROUP {
+                    // The theme draws headings in its own blue: draw them
+                    // as the other tool pages do.
+                    draw_heading(h.list, cd);
+                    return LRESULT(CDRF_SKIPDEFAULT as isize);
+                }
                 if stage == CDDS_PREPAINT {
                     return LRESULT(CDRF_NOTIFYITEMDRAW as isize);
                 }
@@ -950,7 +1059,19 @@ fn notify(h: Handles, lparam: LPARAM) -> LRESULT {
                 return LRESULT(CDRF_DODEFAULT as isize);
             }
             NM_SETFOCUS => emit(Event::Focused),
-            NM_DBLCLK => edit(),
+            NM_DBLCLK => {
+                // A double click on a heading folds it, nothing more.
+                let a = &*(lparam.0 as *const NMITEMACTIVATE);
+                if heading_at(h.list, a.ptAction).is_none() {
+                    edit();
+                }
+            }
+            NM_CLICK => {
+                let a = &*(lparam.0 as *const NMITEMACTIVATE);
+                if let Some(id) = heading_at(h.list, a.ptAction) {
+                    toggle(h, id);
+                }
+            }
             LVN_ITEMCHANGED => update_buttons(h),
             LVN_COLUMNCLICK => {
                 let nm = &*(lparam.0 as *const NMLISTVIEW);
