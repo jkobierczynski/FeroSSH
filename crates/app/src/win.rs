@@ -12246,10 +12246,11 @@ impl Window {
     fn reload_themes(&mut self) {
         self.pull_vault_settings();
         // The themes folder too, so a theme file copied in shows (and a
-        // rule may name it); if it cannot be read, the themes known
-        // before stay, and Settings > Custom themes says why.
-        if let Ok((themes, _)) = load_custom_themes() {
-            self.custom_themes = themes;
+        // rule may name it), refilling Settings > Custom themes with it:
+        // its menu ids index the list. If the folder cannot be read, the
+        // themes known before stay, and that menu says why.
+        if let Some(menu) = custom_themes_menu(self.menu) {
+            self.fill_custom_themes(menu);
         }
         theme_panel::set_rows(self.theme_rows());
     }
