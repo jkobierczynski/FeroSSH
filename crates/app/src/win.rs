@@ -20244,7 +20244,7 @@ impl Window {
         let before = self
             .custom_themes
             .iter()
-            .find(|c| c.theme.name == name && same_file(&c.path, path))
+            .find(|c| same_file(&c.path, path))
             .map(|c| c.theme.clone());
         self.write_theme_file(path, name, text)?;
         let saved = self
@@ -26809,21 +26809,21 @@ fn edit_colours(hwnd: HWND, name: &str) {
                         themes_dir().display()
                     )),
                     Ok(n) => {
-                        // Read the folder again: another window may have
-                        // saved a theme since this one last looked.
-                        let taken = with_window(|w| {
-                            if let Ok((themes, _)) = load_custom_themes() {
-                                w.custom_themes = themes;
-                            }
-                            w.custom_themes
-                                .iter()
-                                .find(|c| {
-                                    c.theme.name.eq_ignore_ascii_case(&n)
-                                        && !same_file(&c.path, &path)
-                                })
-                                .map(|c| c.path.display().to_string())
-                        })
-                        .flatten();
+                        // The folder as it is now (another window may have
+                        // saved a theme since this one last looked), read
+                        // aside: the window's own list stays what its panes
+                        // were given, for the save to recolour them.
+                        let now = custom_theme::load(&themes_dir())
+                            .map(|(themes, _)| themes)
+                            .ok()
+                            .or_else(|| with_window(|w| w.custom_themes.clone()))
+                            .unwrap_or_default();
+                        let taken = now
+                            .iter()
+                            .find(|c| {
+                                c.theme.name.eq_ignore_ascii_case(&n) && !same_file(&c.path, &path)
+                            })
+                            .map(|c| c.path.display().to_string());
                         match taken {
                             Some(other) => Err(format!(
                                 "{other} already holds a theme named {n}. Pick another file \
