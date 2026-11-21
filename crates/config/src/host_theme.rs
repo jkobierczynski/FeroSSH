@@ -10,16 +10,21 @@
 use crate::pattern::{match_host, match_pattern};
 
 /// One rule: which hosts, and how their panes look.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct ThemeRule {
     /// `Host`-style patterns; empty matches no host by name.
     pub hosts: Vec<String>,
     /// Group tags (patterns too, so `prod*` works); empty matches no tag.
     pub tags: Vec<String>,
-    /// A built-in or user theme name.
+    /// A built-in or user theme name; empty when the rule only sets a
+    /// font.
     pub theme: String,
     /// Optional background tint over the theme: colour and strength 0-255.
     pub tint: Option<([u8; 3], u8)>,
+    /// The font family its panes use, unless the connection sets one.
+    pub font: Option<String>,
+    /// The font size in points, unless the connection sets one.
+    pub font_size: Option<f32>,
 }
 
 impl ThemeRule {
@@ -29,7 +34,52 @@ impl ThemeRule {
             tags: Vec::new(),
             theme: theme.to_owned(),
             tint: None,
+            font: None,
+            font_size: None,
         }
+    }
+
+    pub fn font(mut self, family: &str, size: Option<f32>) -> Self {
+        self.font = Some(family.to_owned()).filter(|f| !f.is_empty());
+        self.font_size = size;
+        self
+    }
+
+    /// Whether it sets anything at all: a theme, a font or a size.
+    pub fn sets_something(&self) -> bool {
+        !self.theme.is_empty() || self.font.is_some() || self.font_size.is_some()
+    }
+
+    /// What it matches, for a list: `tags prod*; hosts *.corp`.
+    pub fn describe_match(&self) -> String {
+        let mut parts = Vec::new();
+        if !self.tags.is_empty() {
+            parts.push(format!("tags {}", self.tags.join(" ")));
+        }
+        if !self.hosts.is_empty() {
+            parts.push(format!("hosts {}", self.hosts.join(" ")));
+        }
+        parts.join("; ")
+    }
+
+    /// What it sets, for a list: `Production, Consolas 12 pt`.
+    pub fn describe_look(&self) -> String {
+        let mut parts = Vec::new();
+        if !self.theme.is_empty() {
+            parts.push(self.theme.clone());
+        }
+        match (&self.font, self.font_size) {
+            (Some(f), Some(s)) => parts.push(format!("{f} {s} pt")),
+            (Some(f), None) => parts.push(f.clone()),
+            (None, Some(s)) => parts.push(format!("{s} pt")),
+            (None, None) => {}
+        }
+        parts.join(", ")
+    }
+
+    /// Whether it matches a host by name or one of its tags.
+    pub fn applies_to(&self, host: &str, tags: &[&str]) -> bool {
+        self.matches(host, tags)
     }
 
     pub fn hosts(mut self, patterns: &[&str]) -> Self {
@@ -81,12 +131,46 @@ impl HostThemes {
         self.rules.push(rule);
     }
 
-    /// The rule for a host and its tags, if any.
+    /// The first rule that sets a theme for a host and its tags, if
+    /// any (a rule that only sets a font is passed over).
     pub fn rule_for(&self, host: &str, tags: &[&str]) -> Option<&ThemeRule> {
+        self.rule_for_any(&[host], tags)
+    }
+
+    /// As [`HostThemes::rule_for`], for a host known by several names
+    /// (the alias picked and the host name it goes to): one scan in rule
+    /// order, so an earlier rule matching any name wins.
+    pub fn rule_for_any(&self, hosts: &[&str], tags: &[&str]) -> Option<&ThemeRule> {
+        self.first(hosts, tags, |r| !r.theme.is_empty())
+    }
+
+    /// The font family the first matching rule that sets one gives.
+    pub fn font_for(&self, hosts: &[&str], tags: &[&str]) -> Option<&str> {
+        self.first(hosts, tags, |r| r.font.is_some())
+            .and_then(|r| r.font.as_deref())
+    }
+
+    /// The font size the first matching rule that sets one gives.
+    pub fn font_size_for(&self, hosts: &[&str], tags: &[&str]) -> Option<f32> {
+        self.first(hosts, tags, |r| r.font_size.is_some())
+            .and_then(|r| r.font_size)
+    }
+
+    fn first(
+        &self,
+        hosts: &[&str],
+        tags: &[&str],
+        sets: impl Fn(&ThemeRule) -> bool,
+    ) -> Option<&ThemeRule> {
         self.rules
             .iter()
             .chain(builtin_rules())
-            .find(|r| r.matches(host, tags))
+            .find(|r| sets(r) && hosts.iter().any(|h| r.matches(h, tags)))
+    }
+
+    /// The built-in tag rules, after the user's.
+    pub fn builtin() -> &'static [ThemeRule] {
+        builtin_rules()
     }
 }
 
@@ -156,5 +240,36 @@ mod tests {
         // A user host rule beats a built-in tag.
         assert_eq!(theme(&t, "prod-web", &["dev"]), Some("Dracula"));
         assert_eq!(theme(&t, "dev-web", &["dev"]), Some("Nord"));
+    }
+
+    #[test]
+    fn fonts_and_themes_come_from_the_first_rule_that_sets_them() {
+        let mut t = HostThemes::new();
+        t.push(ThemeRule::new("").tags(&["lab"]).font("Consolas", None));
+        t.push(
+            ThemeRule::new("Dracula")
+                .tags(&["lab", "web"])
+                .font("Hack", Some(13.0)),
+        );
+        assert_eq!(
+            theme(&t, "x", &["lab"]),
+            Some("Dracula"),
+            "the font-only rule is passed over"
+        );
+        assert_eq!(t.font_for(&["x"], &["lab"]), Some("Consolas"));
+        assert_eq!(t.font_size_for(&["x"], &["lab"]), Some(13.0));
+        assert_eq!(t.font_for(&["x"], &["web"]), Some("Hack"));
+        assert_eq!(
+            t.font_for(&["x"], &["prod"]),
+            None,
+            "built-in rules set no font"
+        );
+        assert_eq!(theme(&t, "x", &["prod"]), Some("Production"));
+        let r = ThemeRule::new("Nord")
+            .tags(&["a"])
+            .hosts(&["*.b"])
+            .font("Hack", Some(9.5));
+        assert_eq!(r.describe_match(), "tags a; hosts *.b");
+        assert_eq!(r.describe_look(), "Nord, Hack 9.5 pt");
     }
 }
