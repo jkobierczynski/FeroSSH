@@ -545,9 +545,9 @@ mod cmd {
     /// Tools > Connection log.
     pub const INVENTORY: u32 = 222;
     /// Tools > Hosts.
-    pub const HOSTS: u32 = 682;
+    pub const HOSTS: u32 = 690;
     /// Settings > Allow deleting connection log entries.
-    pub const CONNECTION_LOG_DELETE: u32 = 683;
+    pub const CONNECTION_LOG_DELETE: u32 = 691;
     /// Settings > Font ligatures.
     pub const FONT_LIGATURES: u32 = 221;
     /// Settings > Server status bar.
