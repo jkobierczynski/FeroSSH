@@ -7573,9 +7573,12 @@ impl Window {
         // The login session of a desktop or remote app is hidden and goes
         // once the app holds the connection: shown in a tab instead, so
         // the warning is seen and stays.
-        if self.launch_hidden.contains(&id) {
+        if self.launches.contains_key(&id) {
+            // Also one already shown (to confirm the connection, say).
             self.launch_warned.insert(id);
-            self.reveal_launch(id);
+            if self.launch_hidden.contains(&id) {
+                self.reveal_launch(id);
+            }
         }
     }
 
