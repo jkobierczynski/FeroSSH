@@ -2497,12 +2497,12 @@ impl Settings {
             .and_then(|n| self.credential(n))
     }
 
-    /// The limits the security rules put on `subject`.
     /// Whether any security rule is set, the team's or the user's.
     pub fn has_security_rules(&self) -> bool {
         !self.team.security_rules.is_empty() || !self.security_rules.is_empty()
     }
 
+    /// The limits the security rules put on `subject`.
     pub fn policy(&self, subject: &Subject<'_>) -> Policy {
         // The team's rules and the user's: each can only add limits.
         policy_for(&self.team.security_rules, subject)

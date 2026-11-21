@@ -413,6 +413,32 @@ struct Plan {
     /// Actions whose keys (Settings > Key bindings) the file changes.
     keys: usize,
     settings: Option<Settings>,
+    /// What the import changes in connections already here, and what it
+    /// left as it was ([`bundle::import_hosts`], [`bundle::import_profiles`]).
+    reviews: Vec<bundle::Review>,
+}
+
+/// Our own copy (or none) of each named credential the import brings,
+/// so a change to any of them while the question was open is asked
+/// about again, even when the count of replaced ones stays the same.
+fn credentials_replaced(
+    incoming: &Bundle,
+    current: &Settings,
+) -> Vec<Option<ferossh_config::settings::Credential>> {
+    let Some(theirs) = incoming.file("ferossh.conf") else {
+        return Vec::new();
+    };
+    Settings::parse(theirs)
+        .credentials
+        .iter()
+        .map(|c| {
+            current
+                .credentials
+                .iter()
+                .find(|l| l.name.eq_ignore_ascii_case(&c.name))
+                .cloned()
+        })
+        .collect()
 }
 
 fn plan(incoming: &Bundle, current: &Settings) -> Plan {
@@ -422,6 +448,7 @@ fn plan(incoming: &Bundle, current: &Settings) -> Plan {
         profiles: Merged::default(),
         keys: 0,
         settings: None,
+        reviews: Vec::new(),
     };
     for (name, path) in connection_files() {
         let Some(theirs) = incoming.file(&name) else {
@@ -430,13 +457,17 @@ fn plan(incoming: &Bundle, current: &Settings) -> Plan {
         if name == "ferossh.conf" {
             let mut s = current.clone();
             let theirs = Settings::parse(theirs);
-            plan.profiles = bundle::merge_profiles(&mut s, &theirs);
+            let (merged, reviews) = bundle::import_profiles(&mut s, &theirs);
+            plan.profiles = merged;
+            add_reviews(&mut plan.reviews, reviews);
             plan.keys = merge_keys(&mut s, &theirs);
             plan.settings = Some(s);
             continue;
         }
         let ours = app_read(&path).unwrap_or_default();
-        let (text, m) = bundle::merge_hosts(&ours, theirs);
+        let (theirs, reviews) = bundle::import_hosts(&ours, theirs);
+        add_reviews(&mut plan.reviews, reviews);
+        let (text, m) = bundle::merge_hosts(&ours, &theirs);
         plan.hosts += m;
         if m.changed() {
             plan.files.push((path, text));
@@ -444,6 +475,39 @@ fn plan(incoming: &Bundle, current: &Settings) -> Plan {
     }
     plan
 }
+
+/// `more` added to `all`, a connection's notes together.
+fn add_reviews(all: &mut Vec<bundle::Review>, more: Vec<bundle::Review>) {
+    for r in more {
+        match all
+            .iter_mut()
+            .find(|a| a.name.eq_ignore_ascii_case(&r.name))
+        {
+            Some(a) => a.notes.extend(r.notes),
+            None => all.push(r),
+        }
+    }
+}
+
+/// The import's notes per connection, for its question: at most
+/// [`MAX_REVIEWS`] connections, each line cleaned of control and
+/// direction characters and cut short.
+fn reviews_text(reviews: &[bundle::Review]) -> String {
+    let mut text = String::new();
+    for r in reviews.iter().take(MAX_REVIEWS) {
+        let line = format!("{}: {}", r.name, r.notes.join("; "));
+        let line: String = crate::ssh::sanitize_line(&line).chars().take(300).collect();
+        text.push_str("\n- ");
+        text.push_str(&line);
+    }
+    if reviews.len() > MAX_REVIEWS {
+        text.push_str(&format!("\n- and {} more", reviews.len() - MAX_REVIEWS));
+    }
+    text
+}
+
+/// How many connections an import's question lists by name.
+const MAX_REVIEWS: usize = 12;
 
 /// Takes in the key bindings `incoming` changed: an action it gives
 /// other keys than ours gets its keys (taken from any action of ours
@@ -485,7 +549,11 @@ pub(super) fn import(hwnd: HWND) {
     let Some(incoming) = open_sealed(hwnd, &path, &text, "Import encrypted connections") else {
         return;
     };
-    let Some(current) = with_window(|w| w.settings.clone()) else {
+    let Some(current) = with_window(|w| {
+        // What another PC saved to a shared vault counts too.
+        w.pull_vault_settings();
+        w.settings.clone()
+    }) else {
         return;
     };
     let plan = plan(&incoming, &current);
@@ -545,17 +613,60 @@ pub(super) fn import(hwnd: HWND) {
             plural(plan.keys, "action", "actions")
         ));
     }
+    if !plan.reviews.is_empty() {
+        question.push_str(
+            "\n\nLook these over: a connection that now goes somewhere else gets the password \
+             you type for it. Your tags, folders and Production or Staging themes stay. A \
+             StrictHostKeyChecking line that trusts new host keys without asking is left \
+             out, unless your own copy of that connection already has that very line.",
+        );
+        question.push_str(&reviews_text(&plan.reviews));
+    }
     question.push_str("\n\nImport?");
     if dialog(hwnd, &question, MB_YESNO | MB_ICONINFORMATION) != Some(IDYES) {
         return;
     }
     // Merged again with the files and settings as they are now: another
     // PC (through a shared vault) may have changed them while the
-    // question was open.
-    let Some(current) = with_window(|w| w.settings.clone()) else {
-        return;
+    // question was open. What that changes is shown and asked about
+    // again before anything is written.
+    let mut approved = (plan.reviews, credentials_replaced(&incoming, &current));
+    let plan = loop {
+        let Some(current) = with_window(|w| {
+            // What another PC saved to a shared vault counts too.
+            w.pull_vault_settings();
+            w.settings.clone()
+        }) else {
+            return;
+        };
+        let plan = self::plan(&incoming, &current);
+        let replaced = credentials_replaced(&incoming, &current);
+        if plan.reviews == approved.0 && replaced == approved.1 {
+            break plan;
+        }
+        let mut changes = reviews_text(&plan.reviews);
+        if plan.profiles.credentials > 0 {
+            changes.push_str(&format!(
+                "\n- adds or changes {} (Credentials...), which replace yours of the same name",
+                plural(
+                    plan.profiles.credentials,
+                    "named credential",
+                    "named credentials"
+                )
+            ));
+        }
+        if changes.is_empty() {
+            changes = "\n- nothing more to look over".to_owned();
+        }
+        let question = format!(
+            "Your connections changed while the question was open (another window or PC), so \
+             the import now changes this:{changes}\n\nImport?"
+        );
+        if dialog(hwnd, &question, MB_YESNO | MB_ICONINFORMATION) != Some(IDYES) {
+            return;
+        }
+        approved = (plan.reviews, replaced);
     };
-    let plan = self::plan(&incoming, &current);
     let mut problems = Vec::new();
     for (p, t) in &plan.files {
         if let Err(e) = write_app_file(p, t) {
