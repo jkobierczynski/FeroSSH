@@ -24,6 +24,7 @@ use russh::keys::ssh_key::SshSig;
 use crate::bundle::Bundle;
 use crate::host_policy::SecurityRule;
 use crate::host_theme::ThemeRule;
+use crate::password::PasswordSource;
 use crate::saved::{self, SavedHost};
 use crate::settings::{Profile, Settings};
 
@@ -147,14 +148,39 @@ pub fn parse(bytes: &[u8]) -> Result<Team, Refused> {
         .profiles
         .into_iter()
         .filter(|p| names.iter().any(|n| n.eq_ignore_ascii_case(&p.host)))
+        .map(without_password_command)
+        .collect();
+    // The team's connections sit in the Team folder now: a rule for
+    // folder `Production` is for `Team/Production` as well.
+    let security_rules = settings
+        .security_rules
+        .into_iter()
+        .map(|mut r| {
+            let inside: Vec<String> = r
+                .folders
+                .iter()
+                .map(|f| format!("{FOLDER}/{}", f.trim_matches('/')))
+                .collect();
+            r.folders.extend(inside);
+            r
+        })
         .collect();
     Ok(Team {
         hosts_text: saved::to_text(&hosts),
         names,
         profiles,
-        security_rules: settings.security_rules,
+        security_rules,
         theme_rules: settings.theme_rules,
     })
+}
+
+/// `p` without a password manager command, which could hold a password
+/// itself (`echo ...`): each user sets their own, or a named credential.
+fn without_password_command(mut p: Profile) -> Profile {
+    if matches!(p.password, PasswordSource::Command(_)) {
+        p.password = PasswordSource::Ask;
+    }
+    p
 }
 
 /// Verifies and reads a library: the file's bytes and its `.sig` text.
@@ -174,6 +200,7 @@ pub fn export(sessions: &str, settings: &Settings) -> Vec<u8> {
             .iter()
             .filter(|p| hosts.iter().any(|h| h.alias.eq_ignore_ascii_case(&p.host)))
             .cloned()
+            .map(without_password_command)
             .collect(),
         security_rules: settings.security_rules.clone(),
         theme_rules: settings.theme_rules.clone(),
@@ -223,8 +250,10 @@ mod tests {
     fn library() -> Vec<u8> {
         let sessions = "Host db\n    HostName db.example\n\n# folder: Web\nHost web\n    HostName web.example\n    User admin\n";
         let settings = Settings::parse(
-            "Profile web\n    Tags prod\n    Credential ops\nProfile elsewhere\n    Tags x\n\
+            "Profile web\n    Tags prod\n    Credential ops\n    PasswordCommand echo hunter2\n\
+             Profile elsewhere\n    Tags x\n\
              SecurityRule\n    Tags prod\n    KeysOnly yes\n\
+             SecurityRule\n    Folders Web\n    LogSession yes\n\
              ThemeRule\n    Tags prod\n    Theme Production\n\
              Credential ops\n    User someone\n",
         );
@@ -247,6 +276,16 @@ mod tests {
         assert!(team.has("WEB"));
         // No credential travels, only its name.
         assert!(!String::from_utf8_lossy(&bytes).contains("someone"));
+        // Nor a password command, which could hold a password.
+        assert!(!String::from_utf8_lossy(&bytes).contains("hunter2"));
+        assert_eq!(team.profiles[0].password, PasswordSource::Ask);
+        // A folder rule still finds the team's folder of that name.
+        assert!(
+            team.security_rules[1]
+                .folders
+                .iter()
+                .any(|f| f == "Team/Web")
+        );
     }
 
     #[test]

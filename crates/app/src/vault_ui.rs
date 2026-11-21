@@ -157,9 +157,13 @@ pub(super) fn export_team(hwnd: HWND) {
         return;
     };
     let mut tmp = path.as_os_str().to_owned();
-    tmp.push(".tmp");
+    tmp.push(format!(".{}.tmp", std::process::id()));
     let tmp = PathBuf::from(tmp);
-    let written = std::fs::write(&tmp, &bytes).and_then(|()| std::fs::rename(&tmp, &path));
+    let written = std::fs::write(&tmp, &bytes)
+        .and_then(|()| std::fs::rename(&tmp, &path))
+        .inspect_err(|_| {
+            let _ = std::fs::remove_file(&tmp);
+        });
     match written {
         Ok(()) => {
             let shown = path.display().to_string();

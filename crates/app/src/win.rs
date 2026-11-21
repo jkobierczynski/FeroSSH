@@ -1563,10 +1563,18 @@ struct Window {
     /// finish.
     script_secrets: Arc<std::sync::Mutex<Vec<ScriptSecret>>>,
     /// The team library as read in the background, waiting to be used.
-    team_loaded: Arc<std::sync::Mutex<Option<crate::team_lib::Loaded>>>,
+    /// The read it came from is tagged with [`Self::team_read`]'s number
+    /// then, so a read started before the library or its key changed is
+    /// dropped.
+    team_loaded: Arc<std::sync::Mutex<Option<(u64, crate::team_lib::Loaded)>>>,
+    /// Counts the reads of the team library started.
+    team_read: u64,
     /// What was last said about the team library, so it is not said
     /// again on every refresh.
     team_note: Option<String>,
+    /// A note about the team library not shown yet, because another
+    /// dialog was open.
+    team_note_pending: Option<String>,
     /// Login scripts started so far, which numbers each run.
     script_runs: u64,
     snippets_view: SnippetsView,
@@ -2890,7 +2898,9 @@ fn create_and_run(launch: Launch, theme: Option<String>) -> Result<()> {
                 zmodem: HashMap::new(),
                 script_secrets: Arc::default(),
                 team_loaded: Arc::default(),
+                team_read: 0,
                 team_note: None,
+                team_note_pending: None,
                 script_runs: 0,
                 snippets_view: SnippetsView::default(),
                 snippets_peek: false,
@@ -7264,14 +7274,19 @@ impl Window {
     /// What the security rules forbid for connection `alias` (reaching
     /// `hostname`, with ssh_config's `Tag` `tag`).
     fn policy_of(&self, alias: &str, hostname: Option<&str>, tag: Option<&str>) -> Policy {
-        if self.settings.security_rules.is_empty() {
+        if !self.settings.has_security_rules() {
             return Policy::default();
         }
         let tags = ferossh_config::settings::host_tags(tag, self.settings.profile(alias));
-        // The folder the Connection manager shows it in: a FeroSSH
-        // connection's own, else the one its ssh_config (an import's
-        // file) gives it.
-        let folder = load_saved()
+        // The folder the Connection manager shows it in: the team
+        // library's for its connections, a FeroSSH connection's own, else
+        // the one its ssh_config (an import's file) gives it.
+        let saved = if self.settings.is_team(alias) {
+            ferossh_config::saved::parse(&self.settings.team.hosts_text)
+        } else {
+            load_saved()
+        };
+        let folder = saved
             .into_iter()
             .find(|h| h.alias.eq_ignore_ascii_case(alias))
             .and_then(|h| h.folder)
@@ -7304,7 +7319,7 @@ impl Window {
         extras: &Extras,
         env: &Env,
     ) -> bool {
-        if self.settings.security_rules.is_empty() {
+        if !self.settings.has_security_rules() {
             self.connect_confirmed.remove(&id);
             return true;
         }
@@ -15524,7 +15539,12 @@ impl Window {
             Some(name) => {
                 let profile = self.settings.profile(&name);
                 let saved = load_saved();
-                match saved.iter().find(|h| h.alias.eq_ignore_ascii_case(&name)) {
+                // A team connection is the team's even when a local one
+                // shares its name (that one is not used).
+                let own = (!self.settings.is_team(&name))
+                    .then(|| saved.iter().find(|h| h.alias.eq_ignore_ascii_case(&name)))
+                    .flatten();
+                match own {
                     Some(h) => SessionForm::new(
                         Some(h.alias.clone()),
                         Source::Saved,
@@ -16232,16 +16252,19 @@ impl Window {
     fn refresh_team(&mut self) {
         let library = self.settings.team_library.clone();
         let keys = self.settings.team_library_keys.clone();
+        // Whatever an earlier read finds is no longer wanted.
+        self.team_read += 1;
         if library.is_none() {
             self.use_team(crate::team_lib::Loaded::default());
             return;
         }
+        let read = self.team_read;
         let slot = self.team_loaded.clone();
         let notify = self.notifier();
         std::thread::spawn(move || {
             let loaded = crate::team_lib::load(library.as_deref(), &keys, &app_dir());
             if let Ok(mut s) = slot.lock() {
-                *s = Some(loaded);
+                *s = Some((read, loaded));
             }
             notify();
         });
@@ -16252,8 +16275,23 @@ impl Window {
             Ok(mut s) => s.take(),
             Err(_) => return,
         };
-        if let Some(loaded) = loaded {
+        if let Some((read, loaded)) = loaded
+            && read == self.team_read
+        {
             self.use_team(loaded);
+        }
+        if self.team_note_pending.is_some() {
+            if DIALOG_OPEN.get() {
+                // Said once the dialog open now closes: look again soon.
+                let notify = self.notifier();
+                std::thread::spawn(move || {
+                    std::thread::sleep(std::time::Duration::from_millis(500));
+                    notify();
+                });
+            } else {
+                self.queued
+                    .extend(self.team_note_pending.take().map(Command::Notice));
+            }
         }
     }
 
@@ -16261,7 +16299,10 @@ impl Window {
     /// connection manager, its rules on the next connection.
     fn use_team(&mut self, loaded: crate::team_lib::Loaded) {
         if loaded.note.is_some() && loaded.note != self.team_note {
-            self.queued.extend(loaded.note.clone().map(Command::Notice));
+            // Shown by poll_team when no other dialog is open.
+            self.team_note_pending.clone_from(&loaded.note);
+        } else if loaded.note.is_none() {
+            self.team_note_pending = None;
         }
         self.team_note = loaded.note;
         if loaded.team == self.settings.team {

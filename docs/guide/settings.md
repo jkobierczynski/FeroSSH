@@ -326,7 +326,7 @@ A rule needs at least one of `Hosts`, `Tags` or `Folders`, and at least one limi
 ssh-keygen -Y sign -f admin_key -n ferossh-library team.ferossh-library
 ```
 
-`ssh-keygen` writes `team.ferossh-library.sig` beside it, and both go on the share. FeroSSH reads the library at start (in the background) and on Refresh in the connection manager, and uses it only when the signature is by a `TeamLibraryKey` and made for `ferossh-library`. A library that holds saved passwords is refused. A good library is copied to `team-library.cache` in FeroSSH's folder; when the share cannot be read, or serves a file with a bad signature, FeroSSH says so and uses that copy, checked again against the keys set now.
+`ssh-keygen` writes `team.ferossh-library.sig` beside it, and both go on the share. FeroSSH reads the library at start (in the background) and on Refresh in the connection manager, and uses it only when the signature is by a `TeamLibraryKey` and made for `ferossh-library`. A library that holds saved passwords is refused, and a connection's password manager command (`PasswordCommand`) is left out of an export and ignored in a library, since it could hold a password itself. A good library is copied to a `team-library-….cache` file in FeroSSH's folder (one per library path); when the share cannot be read, or serves a file with a bad signature, FeroSSH says so and uses that copy, checked again against the keys set now.
 
 What the library gives comes before your own settings:
 
@@ -335,5 +335,5 @@ What the library gives comes before your own settings:
 - Its `SecurityRule` blocks apply together with yours, and since rules only add limits, yours cannot loosen them. Tools > Security rules lists them first as "team 1", "team 2" and so on, and they cannot be changed or deleted there.
 - Its `ThemeRule` blocks are tried before yours.
 
-A library connection may name a credential. No credential travels in the library: each person keeps their own credential of that name, with their own user, key and password. Options in your own `~/.ssh/config` that the library does not set for a connection (a `Host *` block, say) still apply to it, and the security rules still limit it.
+A library connection may name a credential. A team security rule for folder `Production` also covers the team's `Team/Production`. No credential travels in the library: each person keeps their own credential of that name, with their own user, key and password. Options in your own `~/.ssh/config` that the library does not set for a connection (a `Host *` block, say) still apply to it, and the security rules still limit it.
 

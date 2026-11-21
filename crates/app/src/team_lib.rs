@@ -4,9 +4,12 @@
 //! a file with a bad signature does not take them away either.
 //!
 //! The copy is checked again each time it is read, against the keys set
-//! now, so changing the key drops a copy signed by the old one.
+//! now, so changing the key drops a copy signed by the old one. Each
+//! library path has its own copy, so setting another library never uses
+//! the copy of the one before.
 
 use std::ffi::OsString;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
@@ -39,37 +42,80 @@ pub fn sig_path(library: &Path) -> PathBuf {
     PathBuf::from(name)
 }
 
-/// The checked copy in `dir`.
-fn cache_paths(dir: &Path) -> (PathBuf, PathBuf) {
-    let file = dir.join("team-library.cache");
-    let sig = sig_path(&file);
-    (file, sig)
+/// The largest `.sig` file read: an SSH signature is a few hundred bytes.
+const MAX_SIG_LEN: usize = 64 * 1024;
+
+/// The checked copy of library `library` in `dir`: one file holding the
+/// signature's length on the first line, the signature, then the library,
+/// so the two are always replaced together. The name carries a hash of
+/// the library's path.
+fn cache_path(dir: &Path, library: &str) -> PathBuf {
+    // FNV-1a: stable across builds, unlike the standard hasher.
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in library.trim().to_lowercase().bytes() {
+        hash ^= u64::from(b);
+        hash = hash.wrapping_mul(0x0100_0000_01b3);
+    }
+    dir.join(format!("team-library-{hash:016x}.cache"))
 }
 
-/// A file read whole, refused when larger than a library may be.
-fn read_capped(path: &Path) -> std::io::Result<Vec<u8>> {
-    let len = std::fs::metadata(path)?.len();
-    if len > MAX_LEN as u64 {
-        return Err(std::io::Error::other("larger than 8 MB"));
+/// A file read whole, refused when larger than `max` bytes; the limit
+/// holds while it is read, so a file that grows meanwhile is refused too.
+fn read_capped(path: &Path, max: usize) -> std::io::Result<Vec<u8>> {
+    let mut bytes = Vec::new();
+    std::fs::File::open(path)?
+        .take(max as u64 + 1)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() > max {
+        return Err(std::io::Error::other(format!(
+            "larger than {} KB",
+            max / 1024
+        )));
     }
-    std::fs::read(path)
+    Ok(bytes)
+}
+
+/// A `.sig` file, read with its own limit.
+fn read_sig(path: &Path) -> std::io::Result<String> {
+    String::from_utf8(read_capped(path, MAX_SIG_LEN)?)
+        .map_err(|_| std::io::Error::other("not text"))
+}
+
+/// Keeps library `bytes` and its signature `sig` as the checked copy
+/// for `library`: written beside it, then moved over the old one, so a
+/// failed write leaves the old copy as it was.
+fn keep(cache_dir: &Path, library: &str, bytes: &[u8], sig: &str) -> std::io::Result<()> {
+    let file = cache_path(cache_dir, library);
+    let mut tmp = file.clone().into_os_string();
+    tmp.push(format!(".{}.tmp", std::process::id()));
+    let tmp = PathBuf::from(tmp);
+    let mut record = format!("{}\n{sig}", sig.len()).into_bytes();
+    record.extend_from_slice(bytes);
+    std::fs::write(&tmp, &record)
+        .and_then(|()| std::fs::rename(&tmp, &file))
+        .inspect_err(|_| {
+            let _ = std::fs::remove_file(&tmp);
+        })
 }
 
 /// The copy in `cache_dir`, if it is still good under `keys`: what a
 /// window starts with, before the share is read.
 pub fn cached(library: Option<&str>, keys: &[String], cache_dir: &Path) -> Team {
-    if library.is_none_or(|l| l.trim().is_empty()) {
-        return Team::default();
+    match library.map(str::trim).filter(|l| !l.is_empty()) {
+        Some(library) => from_cache(library, keys, cache_dir).unwrap_or_default(),
+        None => Team::default(),
     }
-    from_cache(keys, cache_dir).unwrap_or_default()
 }
 
-/// The copy in `cache_dir`, if it is still good under `keys`.
-fn from_cache(keys: &[String], cache_dir: &Path) -> Option<Team> {
-    let (file, sig) = cache_paths(cache_dir);
-    let bytes = read_capped(&file).ok()?;
-    let sig = std::fs::read_to_string(sig).ok()?;
-    team::load(&bytes, &sig, &team::keys(keys)).ok()
+/// The copy of `library` in `cache_dir`, if it is still good under `keys`.
+fn from_cache(library: &str, keys: &[String], cache_dir: &Path) -> Option<Team> {
+    let record = read_capped(&cache_path(cache_dir, library), MAX_LEN + MAX_SIG_LEN + 32).ok()?;
+    let (len, rest) = record.split_at(record.iter().position(|b| *b == b'\n')?);
+    let len: usize = std::str::from_utf8(len).ok()?.parse().ok()?;
+    let rest = rest.get(1..)?;
+    let sig = std::str::from_utf8(rest.get(..len)?).ok()?;
+    let bytes = rest.get(len..)?;
+    team::load(bytes, sig, &team::keys(keys)).ok()
 }
 
 /// What reading the library gave: the team (empty for none) and, when
@@ -89,26 +135,20 @@ pub fn load(library: Option<&str>, keys: &[String], cache_dir: &Path) -> Loaded 
     };
     let path = PathBuf::from(library);
     let shown = crate::ssh::sanitize_line(library);
-    let read = read_capped(&path).and_then(|b| {
-        let sig = std::fs::read_to_string(sig_path(&path))?;
-        Ok((b, sig))
-    });
+    let read = read_capped(&path, MAX_LEN).and_then(|b| Ok((b, read_sig(&sig_path(&path))?)));
     let why = match read {
         Ok((bytes, sig)) => match team::load(&bytes, &sig, &team::keys(keys)) {
             Ok(team) => {
-                let (file, sig_file) = cache_paths(cache_dir);
                 // A copy that cannot be written only costs the offline
                 // fallback.
-                if std::fs::write(&file, &bytes).is_ok() {
-                    let _ = std::fs::write(&sig_file, sig);
-                }
+                let _ = keep(cache_dir, library, &bytes, &sig);
                 return Loaded { team, note: None };
             }
             Err(why) => format!("was not used: {why}"),
         },
         Err(e) => format!("could not be read ({e})"),
     };
-    match from_cache(keys, cache_dir) {
+    match from_cache(library, keys, cache_dir) {
         Some(team) => Loaded {
             team,
             note: Some(format!(
@@ -180,6 +220,12 @@ mod tests {
         // Another key: the copy no longer passes either.
         let other = load(Some(path), &["ssh-ed25519 AAAA junk".into()], &cache);
         assert!(other.team.is_empty());
+        // Another library, not there: not the first one's copy.
+        let elsewhere = share.join("other.ferossh-library");
+        let moved = load(Some(elsewhere.to_str().unwrap()), &keys, &cache);
+        assert!(moved.team.is_empty());
+        assert!(cached(Some(elsewhere.to_str().unwrap()), &keys, &cache).is_empty());
+        assert!(cached(Some(path), &keys, &cache).has("web"));
         // No library set: nothing, and nothing to say.
         let off = load(None, &keys, &cache);
         assert!(off.team.is_empty() && off.note.is_none());
