@@ -15588,6 +15588,26 @@ impl Window {
                 add(workspace_destination(n), true);
             }
         }
+        // Open panes too (a workspace opened from outside the folder
+        // among them): what each logs in to now, it and its jump hosts,
+        // by the source its own login takes.
+        for (&id, p) in &self.panes {
+            let Host::Ssh(s) = &p.host else {
+                continue;
+            };
+            let name = &s.target.alias;
+            let hops = std::iter::once(&s.target).chain(&s.target.jumps);
+            for t in hops {
+                if self.login_source(id, &t.alias) == PasswordSource::Windows {
+                    let list = users
+                        .entry(credman::target(&t.user, &t.hostname, t.port))
+                        .or_default();
+                    if !list.iter().any(|n| n.eq_ignore_ascii_case(name)) {
+                        list.push(name.clone());
+                    }
+                }
+            }
+        }
         let mut saved: Vec<(String, String, Place)> = Vec::new();
         let mut keep = |target: String, user: String, windows: bool| {
             let at = match saved.iter().position(|e| e.0 == target) {
