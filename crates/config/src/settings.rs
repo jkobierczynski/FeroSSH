@@ -988,6 +988,13 @@ pub struct Settings {
     /// after the cursor while typing; Enter keeps echoed command lines in
     /// an encrypted per-host history. Off unless turned on.
     pub command_suggestions: bool,
+    /// The theme new tabs open with (Theme manager > Set as default);
+    /// Nord when unset or unknown. `--theme` beats it.
+    pub default_theme: Option<String>,
+    /// The font family new tabs open with, when installed.
+    pub default_font: Option<String>,
+    /// The font size new tabs open with, in points (4 to 96).
+    pub default_font_size: Option<f32>,
     /// A global hotkey hides and shows the FeroSSH window (Window >
     /// Standby window). Off unless turned on; the first window that opens
     /// takes the hotkey.
@@ -1100,6 +1107,9 @@ impl Default for Settings {
             tmux_keys: false,
             font_ligatures: false,
             command_suggestions: false,
+            default_theme: None,
+            default_font: None,
+            default_font_size: None,
             standby: false,
             standby_hotkey: None,
             key_bindings: std::collections::BTreeMap::new(),
@@ -1590,6 +1600,20 @@ impl Settings {
                 "commandsuggestions" => {
                     block = Block::Top;
                     s.command_suggestions = yes(&args).unwrap_or(false);
+                }
+                "defaulttheme" => {
+                    block = Block::Top;
+                    s.default_theme = first.filter(|t| !t.is_empty());
+                }
+                "defaultfont" => {
+                    block = Block::Top;
+                    s.default_font = first.filter(|t| !t.is_empty());
+                }
+                "defaultfontsize" => {
+                    block = Block::Top;
+                    s.default_font_size = first
+                        .and_then(|v| v.parse::<f32>().ok())
+                        .filter(|v| (4.0..=96.0).contains(v));
                 }
                 "standby" => {
                     block = Block::Top;
@@ -2122,6 +2146,15 @@ impl Settings {
             let _ = writeln!(out, "FontLigatures yes");
         }
         let _ = writeln!(out, "CommandSuggestions {}", flag(self.command_suggestions));
+        if let Some(t) = &self.default_theme {
+            let _ = writeln!(out, "DefaultTheme {}", arg(t));
+        }
+        if let Some(f) = &self.default_font {
+            let _ = writeln!(out, "DefaultFont {}", arg(f));
+        }
+        if let Some(v) = self.default_font_size {
+            let _ = writeln!(out, "DefaultFontSize {v}");
+        }
         let _ = writeln!(out, "Standby {}", flag(self.standby));
         if let Some(k) = self.standby_hotkey {
             let _ = writeln!(out, "StandbyHotkey {k}");
@@ -3334,6 +3367,22 @@ DesktopShareSelection yes
             ..Settings::default()
         };
         assert!(Settings::parse(&s.to_text()).tmux_keys);
+    }
+
+    #[test]
+    fn default_look_round_trips() {
+        let s = Settings::parse(
+            "DefaultTheme \"Solarized Dark\"\nDefaultFont \"JetBrains Mono\"\nDefaultFontSize 11.5\n",
+        );
+        assert_eq!(s.default_theme.as_deref(), Some("Solarized Dark"));
+        assert_eq!(s.default_font.as_deref(), Some("JetBrains Mono"));
+        assert_eq!(s.default_font_size, Some(11.5));
+        assert_eq!(Settings::parse(&s.to_text()), s);
+        assert_eq!(
+            Settings::parse("DefaultFontSize 500\n").default_font_size,
+            None
+        );
+        assert_eq!(Settings::default().default_theme, None);
     }
 
     #[test]

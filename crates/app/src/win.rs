@@ -625,6 +625,8 @@ mod cmd {
     pub const SECURITY_RULES: u32 = 681;
     /// Tools > Theme manager.
     pub const THEME_MANAGER: u32 = 682;
+    /// Tools > Theme rules.
+    pub const THEME_RULES: u32 = 683;
     /// Session > Copy public key to this server.
     pub const COPY_ID: u32 = 640;
     /// Session > Logs and recordings > Record this pane (asciicast), and Play a recording.
@@ -1268,6 +1270,8 @@ enum SideView {
     SecurityRules,
     /// The theme manager (native controls only).
     Themes,
+    /// The theme rules: the theme manager's panel on its other page.
+    ThemeRules,
     /// The command palette, shown over whatever the side pane showed.
     Palette,
 }
@@ -2671,7 +2675,11 @@ fn create_and_run(launch: Launch, theme: Option<String>) -> Result<()> {
         // Read first, so `--theme` and saved looks can name them.
         let custom_themes = load_custom_themes().map(|(t, _)| t).unwrap_or_default();
         // An unknown theme name falls back to the default (Nord).
-        let default_theme = theme.and_then(|n| Theme::by_name(&n)).unwrap_or_default();
+        // `--theme`, else Theme manager > Set as default.
+        let default_theme = theme
+            .or_else(|| settings.default_theme.clone())
+            .and_then(|n| Theme::by_name(&n))
+            .unwrap_or_default();
         let mut renderer = Renderer::new(hwnd, 1, 1)?;
         // A custom `--theme` brings its font and size, when installed.
         if let Some(c) = custom_themes
@@ -2683,6 +2691,13 @@ fn create_and_run(launch: Launch, theme: Option<String>) -> Result<()> {
                 font = FontSpec::new(&family, c.size.unwrap_or(font.size_pt));
             }
         }
+        // The default font picked in the theme manager beats the theme's.
+        let family = settings
+            .default_font
+            .clone()
+            .filter(|f| renderer.has_family(f))
+            .unwrap_or_else(|| font.family.clone());
+        font = FontSpec::new(&family, settings.default_font_size.unwrap_or(font.size_pt));
         for (id, family) in (cmd::FONT..).zip(FONT_CHOICES) {
             if renderer.has_family(family) {
                 continue;
@@ -2870,6 +2885,7 @@ fn create_and_run(launch: Launch, theme: Option<String>) -> Result<()> {
                 RailItem::Inventory => cmd::INVENTORY,
                 RailItem::Credentials => cmd::CREDENTIAL_MANAGER,
                 RailItem::SecurityRules => cmd::SECURITY_RULES,
+                RailItem::ThemeRules => cmd::THEME_RULES,
                 RailItem::Themes => cmd::THEME_MANAGER,
                 RailItem::Palette => cmd::PALETTE,
                 RailItem::Pin => cmd::TOOLS_PIN,
@@ -3376,6 +3392,7 @@ fn build_menu() -> Result<HMENU> {
         separator(tools)?;
         item(tools, cmd::CREDENTIAL_MANAGER, "Cre&dential manager")?;
         item(tools, cmd::SECURITY_RULES, "Securit&y rules")?;
+        item(tools, cmd::THEME_RULES, "Theme r&ules")?;
         item(tools, cmd::THEME_MANAGER, "T&heme manager")?;
         item(tools, cmd::NEW_KEY, "New SSH &key...")?;
         item(tools, cmd::PALETTE, "Command p&alette\tCtrl+Shift+A")?;
@@ -12171,6 +12188,7 @@ impl Window {
             SideView::Credentials => RailItem::Credentials,
             SideView::SecurityRules => RailItem::SecurityRules,
             SideView::Themes => RailItem::Themes,
+            SideView::ThemeRules => RailItem::ThemeRules,
             SideView::Palette => RailItem::Palette,
         });
         rail::Look {
@@ -12276,12 +12294,24 @@ impl Window {
         if let Some(menu) = custom_themes_menu(self.menu) {
             self.fill_custom_themes(menu);
         }
-        theme_panel::set_rows(self.theme_rows());
+        let page = if self.side.view == SideView::ThemeRules {
+            crate::theme_view::Page::Rules
+        } else {
+            crate::theme_view::Page::Looks
+        };
+        theme_panel::set_page(page);
+        let defaults = theme_panel::Defaults {
+            theme: self.default_theme.name.to_owned(),
+            font: self.default_font.family.clone(),
+            size: self.default_font.size_pt,
+        };
+        theme_panel::set_rows(self.theme_rows(), defaults);
     }
 
-    /// Whether the theme manager shows (always native controls).
+    /// Whether the theme manager or the theme rules show (always native
+    /// controls, on one panel).
     fn themes_native(&self) -> bool {
-        self.side.visible && self.side.view == SideView::Themes
+        self.side.visible && matches!(self.side.view, SideView::Themes | SideView::ThemeRules)
     }
 
     /// Whether port forwards show as native controls.
@@ -12704,7 +12734,8 @@ impl Window {
                 | SideView::Inventory
                 | SideView::Credentials
                 | SideView::SecurityRules
-                | SideView::Themes => {}
+                | SideView::Themes
+                | SideView::ThemeRules => {}
             }
             self.invalidate_grid(side);
         }
@@ -13654,6 +13685,7 @@ impl Window {
                 RailItem::Inventory => cmd::INVENTORY,
                 RailItem::Credentials => cmd::CREDENTIAL_MANAGER,
                 RailItem::SecurityRules => cmd::SECURITY_RULES,
+                RailItem::ThemeRules => cmd::THEME_RULES,
                 RailItem::Themes => cmd::THEME_MANAGER,
                 RailItem::Palette => cmd::PALETTE,
                 RailItem::Pin => return String::new(),
@@ -14002,7 +14034,9 @@ impl Window {
 
     /// Whether a paste is for the theme manager.
     fn themes_paste(&self) -> bool {
-        self.side.visible && self.side.focused && self.side.view == SideView::Themes
+        self.side.visible
+            && self.side.focused
+            && matches!(self.side.view, SideView::Themes | SideView::ThemeRules)
     }
 
     fn paste_side(&mut self, text: &str) -> bool {
@@ -15634,38 +15668,79 @@ impl Window {
         rows(&self.settings.security_rules, &all)
     }
 
-    /// Tools > Theme manager: the theme rules with the saved connections
-    /// each matches, then the built-in and custom themes and the fonts,
-    /// each with the connections that open with it.
+    /// The menu item that puts theme or font `row` on the pane: Settings
+    /// > Theme's or Font's.
+    fn look_menu_id(&self, row: &crate::theme_view::Row) -> Option<u32> {
+        if let Some(name) = row.preset_theme() {
+            if let Some(i) = Theme::builtin().iter().position(|t| t.name == name) {
+                return Some(cmd::THEME + i as u32);
+            }
+            let i = self
+                .custom_themes
+                .iter()
+                .position(|c| c.theme.name == name)?;
+            return Some(cmd::THEME + Theme::builtin().len() as u32 + i as u32);
+        }
+        let family = row.preset_font()?;
+        let i = FONT_CHOICES.iter().position(|f| *f == family)?;
+        Some(cmd::FONT + i as u32)
+    }
+
+    /// Theme manager > Set as default: new tabs open with theme or font
+    /// `row` from now on; why not, when it cannot be saved.
+    fn set_default_look(&mut self, row: &crate::theme_view::Row) -> Option<String> {
+        let before = (
+            self.settings.default_theme.clone(),
+            self.settings.default_font.clone(),
+        );
+        if let Some(name) = row.preset_theme() {
+            let theme = Theme::by_name(name)?;
+            self.settings.default_theme = Some(theme.name.to_owned());
+            if let Err(e) = self.try_save_settings() {
+                (self.settings.default_theme, self.settings.default_font) = before;
+                return Some(e);
+            }
+            self.default_theme = theme;
+        } else if let Some(family) = row.preset_font() {
+            if !self.renderer.has_family(family) {
+                return Some(format!(
+                    "{family} is not installed on this PC. Install it first (Apply to this \
+                     pane offers the download page)."
+                ));
+            }
+            self.settings.default_font = Some(family.to_owned());
+            if let Err(e) = self.try_save_settings() {
+                (self.settings.default_theme, self.settings.default_font) = before;
+                return Some(e);
+            }
+            self.default_font = FontSpec::new(family, self.default_font.size_pt);
+        }
+        None
+    }
+
+    /// Tools > Theme rules and Theme manager: the theme rules with the
+    /// saved connections each matches, then the built-in and custom
+    /// themes and the fonts.
     fn theme_rows(&self) -> Vec<crate::theme_view::Row> {
-        use crate::theme_view::{Connection, Font, rows};
+        use crate::theme_view::{Connection, Font, Group, rows};
         let all: Vec<Connection> = host_items(&ssh_env(), &self.settings)
             .into_iter()
-            .map(|h| {
-                let hostname = h.hostname.clone().unwrap_or_else(|| h.name.clone());
-                // ssh_config's Tag comes first; the connection's own tags
-                // are added to it again by the look.
-                let (font, theme) =
-                    self.host_look(&h.name, &hostname, h.tags.first().map(String::as_str));
-                Connection {
-                    name: h.name,
-                    hostname: h.hostname,
-                    tags: h.tags,
-                    theme: theme.name.to_owned(),
-                    font: font.family,
-                }
+            .map(|h| Connection {
+                name: h.name,
+                hostname: h.hostname,
+                tags: h.tags,
             })
             .collect();
-        let builtin: Vec<(&str, &str)> = Theme::builtin()
+        let builtin: Vec<(&str, Group)> = Theme::builtin()
             .iter()
             .map(|t| {
-                let kind = match t.group() {
-                    ThemeGroup::Dark => "Dark",
-                    ThemeGroup::Light => "Light",
-                    ThemeGroup::Warning => "Warning",
-                    ThemeGroup::Classic => "Classic",
+                let group = match t.group() {
+                    ThemeGroup::Dark => Group::Dark,
+                    ThemeGroup::Light => Group::Light,
+                    ThemeGroup::Warning => Group::Warning,
+                    ThemeGroup::Classic => Group::Classic,
                 };
-                (t.name, kind)
+                (t.name, group)
             })
             .collect();
         let custom: Vec<&str> = self.custom_themes.iter().map(|c| c.theme.name).collect();
@@ -17450,7 +17525,7 @@ impl Window {
             SideView::Inventory => self.reload_inventory(),
             SideView::Credentials => self.reload_credentials(),
             SideView::SecurityRules => self.reload_rules(),
-            SideView::Themes => self.reload_themes(),
+            SideView::Themes | SideView::ThemeRules => self.reload_themes(),
             SideView::Live => {
                 let all = self.open_sessions();
                 self.live_view.reset(&all);
@@ -17494,6 +17569,7 @@ impl Window {
             cmd::CREDENTIAL_MANAGER => SideView::Credentials,
             cmd::SECURITY_RULES => SideView::SecurityRules,
             cmd::THEME_MANAGER => SideView::Themes,
+            cmd::THEME_RULES => SideView::ThemeRules,
             _ => SideView::Sessions,
         };
         let open = self.side.visible && self.side.view == view;
@@ -20119,6 +20195,10 @@ impl Window {
                 (
                     cmd::THEME_MANAGER,
                     self.side.visible && self.side.view == SideView::Themes,
+                ),
+                (
+                    cmd::THEME_RULES,
+                    self.side.visible && self.side.view == SideView::ThemeRules,
                 ),
                 (cmd::FOLLOW_CD, s.follow_directory),
                 (cmd::VERIFY, s.verify_transfers),
@@ -23834,12 +23914,53 @@ fn edit_rule(hwnd: HWND, shown: Option<(usize, ferossh_config::host_policy::Secu
     }
 }
 
-/// Carries out what the user did in the theme manager: New, Edit and
-/// Delete happen here, and the list is read again after.
+/// Carries out what the user did in the theme manager or the theme
+/// rules, and reads the list again after.
 fn theme_event(hwnd: HWND, event: theme_panel::Event) {
     use theme_panel::Event;
     match event {
-        Event::New { theme, font } => edit_theme_rule(hwnd, None, theme, font),
+        Event::New { theme, font } => {
+            // Made from a theme or font: on the rules page, where it shows.
+            if theme.is_some() || font.is_some() {
+                with_window(|w| w.show_side(SideView::ThemeRules, true));
+            }
+            edit_theme_rule(hwnd, None, theme, font);
+        }
+        Event::Apply(row) => {
+            let id = with_window(|w| w.look_menu_id(&row)).flatten();
+            if let Some(id) = id {
+                run_command(hwnd, Command::Id(id));
+            }
+        }
+        Event::SetDefault(row) => {
+            let failed = with_window(|w| w.set_default_look(&row)).flatten();
+            if let Some(why) = failed {
+                dialog(hwnd, &why, MB_OK | MB_ICONWARNING);
+            }
+        }
+        Event::OpenFolder => {
+            let dir = themes_dir();
+            let _ = std::fs::create_dir_all(&dir);
+            run_command(hwnd, Command::OpenFolder(dir));
+            return;
+        }
+        Event::Move(row, way) => {
+            if let Some(rule) = row.rule {
+                let lost = std::cell::Cell::new(false);
+                save_theme_rules(hwnd, |rules| {
+                    let to = find_theme_rule(rules, row.index, &rule).and_then(|at| {
+                        crate::theme_view::moved_to(rules.len(), at, way).map(|to| (at, to))
+                    });
+                    match to {
+                        Some((at, to)) => rules.swap(at, to),
+                        None => lost.set(true),
+                    }
+                });
+                if lost.get() {
+                    dialog(hwnd, THEME_RULE_CHANGED, MB_OK | MB_ICONWARNING);
+                }
+            }
+        }
         Event::Edit(row) => {
             if let Some(rule) = row.rule {
                 edit_theme_rule(hwnd, Some((row.index, rule)), None, None);
@@ -24515,6 +24636,7 @@ fn is_side_pane(id: u32) -> bool {
             | cmd::CREDENTIAL_MANAGER
             | cmd::SECURITY_RULES
             | cmd::THEME_MANAGER
+            | cmd::THEME_RULES
     )
 }
 
@@ -27569,6 +27691,7 @@ mod tests {
             cmd::CREDENTIAL_MANAGER,
             cmd::SECURITY_RULES,
             cmd::THEME_MANAGER,
+            cmd::THEME_RULES,
         ] {
             assert!(is_side_pane(id), "{id}");
         }

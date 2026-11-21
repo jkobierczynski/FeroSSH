@@ -93,7 +93,8 @@ Font, theme and text size apply to the focused pane only. Session > Save font an
 | Command palette | Ctrl+Shift+A | One search box over every menu item, connection and script (see [Command palette](everyday-use.md#the-command-palette)). |
 | Credential manager | | Lists your named credentials and the passwords FeroSSH keeps, each with the connections that use it, to search, add, change, rename and delete (see [The credential manager](everyday-use.md#the-credential-manager)). |
 | Security rules | | Lists the security rules, each with what it matches, its limits and the connections it covers, to search, add, change and delete (see [Security rules](everyday-use.md#security-rules-by-tag-or-folder)). Also the padlock on the tools rail. |
-| Theme manager | | Lists the theme rules (tags or host patterns that pick a theme, font and size), the built-in themes, your own themes and the eighteen fonts, each with the connections that use it, to add, change and delete rules (see [The theme manager](everyday-use.md#the-theme-manager)). Also the palette on the tools rail. |
+| Theme rules | | Lists your theme rules (tags or host patterns that pick a theme, font and size) in the order they are tried, then the built-in tag rules, each with the connections it matches, to add, change, reorder and delete rules (see [Theme rules](everyday-use.md#theme-rules)). Also the tag on the tools rail. |
+| Theme manager | | Lists the themes, by kind, and the eighteen fonts, each with the rules that use it, with a preview, to put one on the pane, make it the default for new tabs or use it in a rule (see [The theme manager](everyday-use.md#the-theme-manager)). Also the palette on the tools rail. |
 | New SSH key... | | Makes an Ed25519 key file (with or without a passphrase) or a security key or Windows Hello key, and offers to copy it to the focused pane's host (see [Making a key](everyday-use.md#making-a-key-and-putting-it-on-a-server)). |
 
 ## Window
@@ -333,16 +334,29 @@ The arrow buttons between the lists move the selection across, and the gap betwe
 | Del or Delete... | Deletes the picked rule, after asking. |
 | Escape | Clears the search; with none, gives the keyboard back to the terminal. |
 
+### Theme rules
+
+| Key | Action |
+| --- | --- |
+| Typing | Searches rules, what they set and their connections; `-word` leaves rows out, `unused` finds rules no connection matches. In the list it goes to the search box; Down there moves to the list. |
+| A click on a column heading | Sorts by that column within each group; again for the other way. |
+| Enter in the list, a double click or Edit... | Changes the picked rule (the built-in ones cannot change). |
+| New rule... | Makes a rule, at the end of the list. |
+| Move up, Move down | Moves the picked rule: the first rule that sets something wins. |
+| Del or Delete... | Deletes the picked rule, after asking. |
+| Escape | Clears the search; with none, gives the keyboard back to the terminal. |
+
 ### Theme manager
 
 | Key | Action |
 | --- | --- |
-| Typing | Searches themes, fonts, rules and connections; `-word` leaves rows out, `unused` finds what no connection uses. In the list it goes to the search box; Down there moves to the list. |
+| Typing | Searches themes, fonts and the rules that use them; `-word` leaves rows out, `unused` finds what no rule uses. In the list it goes to the search box; Down there moves to the list. |
 | A click on a column heading | Sorts by that column within each group; again for the other way. |
 | A click on a group heading | Folds or unfolds the group. |
-| Enter in the list, a double click or Edit... | Changes the picked rule; on a theme or font (Use in a rule...), makes a new rule that starts with it. |
-| New rule... | Makes a rule. |
-| Del or Delete... | Deletes the picked rule, after asking. |
+| Enter in the list, a double click or Apply to this pane | Puts the picked theme or font on the pane behind the tools. |
+| Set as default | New tabs open with the picked theme or font. |
+| Use in a rule... | Opens Theme rules with a new rule that starts with the picked theme or font. |
+| Open themes folder | Opens the folder of your own themes in Explorer. |
 | Escape | Clears the search; with none, gives the keyboard back to the terminal. |
 
 ### Scripts (Ctrl+Shift+Space)

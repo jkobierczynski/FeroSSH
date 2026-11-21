@@ -1,22 +1,20 @@
-//! Tools > Theme manager: what the page lists. Four groups: the theme
-//! rules (tags or host patterns that pick a theme and a font), the
-//! built-in themes, the user's own themes (the themes folder) and the
-//! terminal fonts, each with the saved connections that use it. Pure, so
-//! it is tested on any platform; `theme_panel.rs` draws it.
+//! Tools > Theme manager and Tools > Theme rules: what the two pages
+//! list. The theme manager is the looks: the built-in themes, the
+//! user's own themes (the themes folder) and the terminal fonts, each
+//! with the saved connections that open with it. Theme rules are the
+//! user's rules (tags or host patterns that pick a theme and a font), in
+//! the order they are tried, then the built-in tag rules, each with the
+//! connections it matches. Pure, so it is tested on any platform;
+//! `theme_panel.rs` draws it.
 
 use ferossh_config::ThemeRule;
 
-/// A saved connection, as the theme manager sees it: what matches a
-/// rule, and the look it gets when opened.
+/// A saved connection, as theme rules see it: what matches a rule.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Connection {
     pub name: String,
     pub hostname: Option<String>,
     pub tags: Vec<String>,
-    /// The theme it opens with.
-    pub theme: String,
-    /// The font family it opens with.
-    pub font: String,
 }
 
 /// One of the terminal fonts offered.
@@ -29,25 +27,81 @@ pub struct Font {
     pub windows: bool,
 }
 
+/// Which of the two pages.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Page {
+    /// Tools > Theme manager: themes and fonts.
+    #[default]
+    Looks,
+    /// Tools > Theme rules: which connections get which look.
+    Rules,
+}
+
+impl Page {
+    pub fn title(self) -> &'static str {
+        match self {
+            Page::Looks => "Theme manager",
+            Page::Rules => "Theme rules",
+        }
+    }
+}
+
 /// Which group a row is in, in the order shown.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Group {
     Rules,
-    BuiltIn,
+    /// The built-in tag rules (Production, Staging), tried after the
+    /// user's; they cannot be changed.
+    BuiltInRules,
+    /// The built-in themes, by kind.
+    Dark,
+    Light,
+    Warning,
+    Classic,
+    /// The themes folder's.
     Custom,
     Fonts,
 }
 
 impl Group {
-    pub const ALL: [Group; 4] = [Group::Rules, Group::BuiltIn, Group::Custom, Group::Fonts];
+    pub const ALL: [Group; 8] = [
+        Group::Rules,
+        Group::BuiltInRules,
+        Group::Dark,
+        Group::Light,
+        Group::Warning,
+        Group::Classic,
+        Group::Custom,
+        Group::Fonts,
+    ];
 
     pub fn title(self) -> &'static str {
         match self {
-            Group::Rules => "Theme rules (by tag or host)",
-            Group::BuiltIn => "Built-in themes",
+            Group::Rules => "Your rules (tried from the top)",
+            Group::BuiltInRules => "Built-in rules (tried after yours)",
+            Group::Dark => "Dark themes",
+            Group::Light => "Light themes",
+            Group::Warning => "Warning themes",
+            Group::Classic => "Classic themes",
             Group::Custom => "Your themes",
             Group::Fonts => "Fonts",
         }
+    }
+
+    /// The page it is listed on.
+    pub fn page(self) -> Page {
+        match self {
+            Group::Rules | Group::BuiltInRules => Page::Rules,
+            _ => Page::Looks,
+        }
+    }
+
+    /// A group of themes.
+    pub fn is_themes(self) -> bool {
+        matches!(
+            self,
+            Group::Dark | Group::Light | Group::Warning | Group::Classic | Group::Custom
+        )
     }
 }
 
@@ -62,8 +116,11 @@ pub struct Row {
     /// The theme's or font's name; a rule's match.
     pub name: String,
     pub details: String,
-    /// The connections it covers or that use it, by name, sorted.
+    /// The connections a rule covers, by name, sorted.
     pub used_by: Vec<String>,
+    /// The rules that pick a theme or font, as their matches (`tags
+    /// lab`), yours first.
+    pub in_rules: Vec<String>,
     /// Shown grey: a font that is not installed.
     pub dim: bool,
 }
@@ -71,12 +128,17 @@ pub struct Row {
 impl Row {
     /// The theme a new rule made from this row starts with.
     pub fn preset_theme(&self) -> Option<&str> {
-        matches!(self.group, Group::BuiltIn | Group::Custom).then_some(self.name.as_str())
+        self.group.is_themes().then_some(self.name.as_str())
     }
 
     /// The font a new rule made from this row starts with.
     pub fn preset_font(&self) -> Option<&str> {
         (self.group == Group::Fonts).then_some(self.name.as_str())
+    }
+
+    /// One of the user's rules: it can be changed, deleted and moved.
+    pub fn is_own_rule(&self) -> bool {
+        self.group == Group::Rules
     }
 }
 
@@ -85,25 +147,39 @@ pub enum Column {
     Name,
     Details,
     Connections,
+    /// The rules that use a theme or font.
+    Rules,
 }
 
 impl Column {
-    pub const ALL: [Column; 3] = [Column::Name, Column::Details, Column::Connections];
-
-    pub fn title(self) -> &'static str {
-        match self {
-            Column::Name => "Name",
-            Column::Details => "Sets / kind",
-            Column::Connections => "Connections",
+    /// The columns `page` shows: the theme manager only names its
+    /// themes and fonts (the groups say what they are).
+    pub fn on(page: Page) -> &'static [Column] {
+        match page {
+            Page::Looks => &[Column::Name, Column::Rules],
+            Page::Rules => &[Column::Name, Column::Details, Column::Connections],
         }
     }
 
-    /// Width in DIPs.
-    pub fn width(self) -> i32 {
-        match self {
-            Column::Name => 220,
-            Column::Details => 240,
-            Column::Connections => 320,
+    /// The heading on `page`.
+    pub fn title(self, page: Page) -> &'static str {
+        match (self, page) {
+            (Column::Name, Page::Looks) => "Name",
+            (Column::Name, Page::Rules) => "Matches",
+            (Column::Details, _) => "Sets",
+            (Column::Connections, _) => "Connections",
+            (Column::Rules, _) => "Rules",
+        }
+    }
+
+    /// Width in DIPs on `page`.
+    pub fn width(self, page: Page) -> i32 {
+        match (self, page) {
+            (Column::Name, Page::Looks) => 240,
+            (Column::Rules, _) => 360,
+            (Column::Name, Page::Rules) => 220,
+            (Column::Details, _) => 240,
+            (Column::Connections, _) => 320,
         }
     }
 }
@@ -126,96 +202,80 @@ fn covers(rule: &ThemeRule, c: &Connection) -> bool {
             .is_some_and(|h| rule.applies_to(h, &tags))
 }
 
-/// The rows: `rules` (the user's) with the connections each matches,
-/// then the built-in themes (`builtin`: name and kind, such as Dark),
-/// the user's own themes and `fonts`, each with the connections that
-/// open with it.
+/// The rows: `rules` (the user's) and the built-in tag rules, with the
+/// connections each matches; then the looks: the built-in themes
+/// (`builtin`: each with its group, such as [`Group::Dark`]), the user's
+/// own themes and `fonts`.
 pub fn rows(
     rules: &[ThemeRule],
-    builtin: &[(&str, &str)],
+    builtin: &[(&str, Group)],
     custom: &[&str],
     fonts: &[Font],
     all: &[Connection],
 ) -> Vec<Row> {
     let mut out = Vec::new();
-    for (index, rule) in rules.iter().enumerate() {
-        out.push(Row {
-            group: Group::Rules,
-            index,
-            rule: Some(rule.clone()),
-            name: rule.describe_match(),
-            details: rule.describe_look(),
-            used_by: sorted(
-                all.iter()
-                    .filter(|c| covers(rule, c))
-                    .map(|c| c.name.clone())
-                    .collect(),
-            ),
-            dim: false,
-        });
-    }
-    let theme_users = |name: &str| {
-        sorted(
+    let rule_row = |group, index, rule: &ThemeRule| Row {
+        group,
+        index,
+        rule: Some(rule.clone()),
+        name: rule.describe_match(),
+        details: rule.describe_look(),
+        used_by: sorted(
             all.iter()
-                .filter(|c| same(&c.theme, name))
+                .filter(|c| covers(rule, c))
                 .map(|c| c.name.clone())
                 .collect(),
-        )
+        ),
+        in_rules: Vec::new(),
+        dim: false,
     };
-    for (index, (name, kind)) in builtin.iter().enumerate() {
-        // Which tags pick it with no rule of the user's.
-        let by_tag = ferossh_config::HostThemes::builtin()
+    for (index, rule) in rules.iter().enumerate() {
+        out.push(rule_row(Group::Rules, index, rule));
+    }
+    for (index, rule) in ferossh_config::HostThemes::builtin().iter().enumerate() {
+        out.push(rule_row(Group::BuiltInRules, index, rule));
+    }
+    let all_rules: Vec<&ThemeRule> = rules
+        .iter()
+        .chain(ferossh_config::HostThemes::builtin())
+        .collect();
+    let in_rules = |uses: &dyn Fn(&ThemeRule) -> bool| {
+        all_rules
             .iter()
-            .filter(|r| same(&r.theme, name))
-            .map(|r| r.tags.join(", "))
-            .collect::<Vec<_>>();
-        let details = if by_tag.is_empty() {
-            (*kind).to_owned()
+            .filter(|r| uses(r))
+            .map(|r| r.describe_match())
+            .collect::<Vec<_>>()
+    };
+    let look = |group, index, name: &str, details: &str, dim| Row {
+        group,
+        index,
+        rule: None,
+        name: name.to_owned(),
+        // Not shown: the group says it. Searched, so "installed" or
+        // "download" finds fonts.
+        details: details.to_owned(),
+        used_by: Vec::new(),
+        in_rules: if group == Group::Fonts {
+            in_rules(&|r| r.font.as_deref().is_some_and(|f| same(f, name)))
         } else {
-            format!("{kind}; tags {}", by_tag.join(", "))
-        };
-        out.push(Row {
-            group: Group::BuiltIn,
-            index,
-            rule: None,
-            name: (*name).to_owned(),
-            details,
-            used_by: theme_users(name),
-            dim: false,
-        });
+            in_rules(&|r| same(&r.theme, name))
+        },
+        dim,
+    };
+    for (index, (name, group)) in builtin.iter().enumerate() {
+        out.push(look(*group, index, name, "", false));
     }
     for (index, name) in custom.iter().enumerate() {
-        out.push(Row {
-            group: Group::Custom,
-            index,
-            rule: None,
-            name: (*name).to_owned(),
-            details: "Themes folder".to_owned(),
-            used_by: theme_users(name),
-            dim: false,
-        });
+        out.push(look(Group::Custom, index, name, "", false));
     }
     for (index, f) in fonts.iter().enumerate() {
         let details = match (f.installed, f.windows) {
-            (true, true) => "Installed (comes with Windows)",
-            (true, false) => "Installed",
-            (false, true) => "Not installed",
-            (false, false) => "Not installed (free download)",
+            (true, true) => "installed, comes with Windows",
+            (true, false) => "installed",
+            (false, true) => "not installed",
+            (false, false) => "not installed, free download",
         };
-        out.push(Row {
-            group: Group::Fonts,
-            index,
-            rule: None,
-            name: f.family.clone(),
-            details: details.to_owned(),
-            used_by: sorted(
-                all.iter()
-                    .filter(|c| same(&c.font, &f.family))
-                    .map(|c| c.name.clone())
-                    .collect(),
-            ),
-            dim: !f.installed,
-        });
+        out.push(look(Group::Fonts, index, &f.family, details, !f.installed));
     }
     out
 }
@@ -233,6 +293,7 @@ pub fn text(row: &Row, column: Column) -> String {
                 row.used_by.get(..3).unwrap_or_default().join(", ")
             ),
         },
+        Column::Rules => row.in_rules.join("; "),
     };
     clean(&raw)
 }
@@ -247,19 +308,25 @@ fn clean(text: &str) -> String {
         .collect()
 }
 
-/// The rows a search keeps: every word in a row's name, details or
-/// connections (any case); `-word` leaves rows with it out; the word
-/// `unused` keeps rows no connection uses.
-pub fn filter<'a>(rows: &'a [Row], query: &str) -> Vec<&'a Row> {
+/// The rows a search keeps: every word in a row's name, details,
+/// connections or rules (any case); `-word` leaves rows with it out; the
+/// word `unused` keeps rows no connection (a rule) or rule (a theme or
+/// font) uses.
+pub fn filter<'a>(rows: impl IntoIterator<Item = &'a Row>, query: &str) -> Vec<&'a Row> {
     let words: Vec<String> = query.split_whitespace().map(str::to_lowercase).collect();
-    rows.iter()
+    rows.into_iter()
         .filter(|r| {
-            let hay = [r.name.as_str(), r.details.as_str(), &r.used_by.join(" ")]
-                .join(" ")
-                .to_lowercase();
+            let hay = [
+                r.name.as_str(),
+                r.details.as_str(),
+                &r.used_by.join(" "),
+                &r.in_rules.join(" "),
+            ]
+            .join(" ")
+            .to_lowercase();
             words.iter().all(|w| match w.strip_prefix('-') {
                 Some(not) if !not.is_empty() => !hay.contains(not),
-                _ if w == "unused" => r.used_by.is_empty(),
+                _ if w == "unused" => r.used_by.is_empty() && r.in_rules.is_empty(),
                 _ => hay.contains(w.as_str()),
             })
         })
@@ -273,6 +340,7 @@ pub fn sort(rows: &mut [&Row], column: Option<Column>, descending: bool) {
         let by = match column {
             None => a.index.cmp(&b.index),
             Some(Column::Connections) => a.used_by.len().cmp(&b.used_by.len()),
+            Some(Column::Rules) => a.in_rules.len().cmp(&b.in_rules.len()),
             Some(c) => text(a, c).to_lowercase().cmp(&text(b, c).to_lowercase()),
         };
         let by = if descending { by.reverse() } else { by };
@@ -280,22 +348,34 @@ pub fn sort(rows: &mut [&Row], column: Option<Column>, descending: bool) {
     });
 }
 
-/// The line under the list.
-pub fn summary(shown: &[&Row], rules: usize) -> String {
+/// The rows `page` lists.
+pub fn on_page(rows: &[Row], page: Page) -> Vec<&Row> {
+    rows.iter().filter(|r| r.group.page() == page).collect()
+}
+
+/// The line under the list on `page`.
+pub fn summary(page: Page, shown: &[&Row], rules: usize) -> String {
     let count = |g| shown.iter().filter(|r| r.group == g).count();
-    let rules_text = match rules {
-        0 => {
-            "No theme rules of your own yet: New rule... picks a theme and font by tag.".to_owned()
+    match page {
+        Page::Looks => format!(
+            "{} themes, {} fonts shown. Use in a rule... gives one to connections by tag \
+             or host.",
+            shown.iter().filter(|r| r.group.is_themes()).count(),
+            count(Group::Fonts),
+        ),
+        Page::Rules => {
+            let rules_text = match rules {
+                0 => "No theme rules of your own yet: New rule... picks a theme and font by tag."
+                    .to_owned(),
+                1 => "1 theme rule.".to_owned(),
+                n => format!("{n} theme rules."),
+            };
+            format!(
+                "{rules_text} The first rule that sets a theme, font or size wins; \
+                 a connection's own look beats them all."
+            )
         }
-        1 => "1 theme rule.".to_owned(),
-        n => format!("{n} theme rules."),
-    };
-    format!(
-        "{rules_text} {} themes, {} fonts shown. A connection's own theme or font beats a rule; \
-         the first rule that sets each wins.",
-        count(Group::BuiltIn) + count(Group::Custom),
-        count(Group::Fonts),
-    )
+    }
 }
 
 /// The question before deleting rule `row`.
@@ -315,6 +395,22 @@ pub fn delete_question(row: &Row) -> String {
         ));
     }
     text
+}
+
+/// Which way Move up / Move down takes a rule.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Move {
+    Up,
+    Down,
+}
+
+/// Where rule `at` of `len` goes when moved: `None` when it is already
+/// first (up) or last (down).
+pub fn moved_to(len: usize, at: usize, way: Move) -> Option<usize> {
+    match way {
+        Move::Up => at.checked_sub(1),
+        Move::Down => (at + 1 < len).then_some(at + 1),
+    }
 }
 
 /// What the rule form typed: host patterns, tags, theme, font, size.
@@ -398,13 +494,11 @@ pub fn check(
 mod tests {
     use super::*;
 
-    fn conn(name: &str, tags: &[&str], theme: &str, font: &str) -> Connection {
+    fn conn(name: &str, tags: &[&str]) -> Connection {
         Connection {
             name: name.into(),
             hostname: Some(format!("{name}.example")),
             tags: tags.iter().map(|t| (*t).to_owned()).collect(),
-            theme: theme.into(),
-            font: font.into(),
         }
     }
 
@@ -429,16 +523,13 @@ mod tests {
                 windows: false,
             },
         ];
-        let all = [
-            conn("pi", &["Lab"], "Dracula", "Hack"),
-            conn("web", &["prod"], "Production", "Consolas"),
-        ];
+        let all = [conn("pi", &["Lab"]), conn("web", &["prod"])];
         rows(
             &rules,
             &[
-                ("Nord", "Dark"),
-                ("Production", "Warning"),
-                ("Dracula", "Dark"),
+                ("Nord", Group::Dark),
+                ("Production", Group::Warning),
+                ("Dracula", Group::Dark),
             ],
             &["Mine"],
             &fonts,
@@ -447,29 +538,57 @@ mod tests {
     }
 
     #[test]
-    fn rows_list_rules_themes_and_fonts_with_their_connections() {
+    fn rules_list_their_connections_and_looks_their_rules() {
         let rows = sample();
-        assert_eq!(rows.len(), 2 + 3 + 1 + 2);
+        assert_eq!(rows.len(), 2 + 3 + 3 + 1 + 2);
         assert_eq!(rows[0].used_by, ["pi"], "tags match in any case");
         assert_eq!(text(&rows[0], Column::Name), "tags lab");
         assert_eq!(text(&rows[0], Column::Details), "Dracula, Hack 12 pt");
         assert!(rows[1].used_by.is_empty());
-        assert_eq!(rows[3].details, "Warning; tags production, prod");
-        assert_eq!(rows[3].used_by, ["web"]);
-        assert_eq!(rows[5].group, Group::Custom);
+        assert_eq!(rows[2].group, Group::BuiltInRules);
+        assert_eq!(rows[2].used_by, ["web"]);
+        assert!(!rows[2].is_own_rule());
+        let prod = rows.iter().find(|r| r.name == "Production").unwrap();
+        assert_eq!(prod.group, Group::Warning);
+        assert_eq!(text(prod, Column::Rules), "tags production prod");
+        let dracula = rows.iter().find(|r| r.name == "Dracula").unwrap();
+        assert_eq!(dracula.in_rules, ["tags lab"]);
+        assert!(
+            dracula.used_by.is_empty(),
+            "the theme manager lists no connections"
+        );
         let hack = rows.iter().find(|r| r.name == "Hack").unwrap();
         assert!(hack.dim);
-        assert_eq!(hack.used_by, ["pi"]);
+        assert_eq!(hack.in_rules, ["tags lab"]);
         assert_eq!(hack.preset_font(), Some("Hack"));
-        assert_eq!(rows[2].preset_theme(), Some("Nord"));
+        assert_eq!(dracula.preset_theme(), Some("Dracula"));
         assert_eq!(rows[0].preset_theme(), None);
+        let mine = rows.iter().find(|r| r.name == "Mine").unwrap();
+        assert_eq!(mine.preset_theme(), Some("Mine"));
+    }
+
+    #[test]
+    fn each_page_lists_its_own_groups() {
+        let rows = sample();
+        let looks = on_page(&rows, Page::Looks);
+        assert!(looks.iter().all(|r| r.rule.is_none()));
+        assert_eq!(looks.len(), 6);
+        let rules = on_page(&rows, Page::Rules);
+        assert_eq!(rules.len(), 5);
+        assert_eq!(Column::on(Page::Looks), [Column::Name, Column::Rules]);
+        assert_eq!(Column::on(Page::Rules).len(), 3);
     }
 
     #[test]
     fn search_and_sort_keep_the_groups() {
         let rows = sample();
         assert_eq!(filter(&rows, "dracula").len(), 2);
-        assert!(filter(&rows, "unused").iter().all(|r| r.used_by.is_empty()));
+        assert!(
+            filter(&rows, "unused")
+                .iter()
+                .all(|r| r.used_by.is_empty() && r.in_rules.is_empty())
+        );
+        assert!(filter(&rows, "unused").iter().any(|r| r.name == "Mine"));
         assert!(
             filter(&rows, "-installed")
                 .iter()
@@ -481,13 +600,27 @@ mod tests {
         let mut g = groups.clone();
         g.sort();
         assert_eq!(groups, g, "groups stay in order");
+        let dark: Vec<&str> = all
+            .iter()
+            .filter(|r| r.group == Group::Dark)
+            .map(|r| r.name.as_str())
+            .collect();
         assert_eq!(
-            all[2].name, "Production",
+            dark,
+            ["Nord", "Dracula"],
             "names backwards within the group"
         );
         sort(&mut all, None, false);
-        assert_eq!(all[2].name, "Nord");
-        assert!(summary(&all, 2).starts_with("2 theme rules. 4 themes, 2 fonts shown."));
+        let dark: Vec<&str> = all
+            .iter()
+            .filter(|r| r.group == Group::Dark)
+            .map(|r| r.name.as_str())
+            .collect();
+        assert_eq!(dark, ["Nord", "Dracula"]);
+        let looks = on_page(&rows, Page::Looks);
+        assert!(summary(Page::Looks, &looks, 2).starts_with("4 themes, 2 fonts shown."));
+        let rules = on_page(&rows, Page::Rules);
+        assert!(summary(Page::Rules, &rules, 2).starts_with("2 theme rules."));
     }
 
     #[test]
@@ -563,5 +696,18 @@ mod tests {
             "{q}"
         );
         assert!(q.contains("pi opens with another look"), "{q}");
+    }
+
+    #[test]
+    fn rules_move_up_and_down() {
+        let mut list = [
+            ThemeRule::new("Nord").tags(&["a"]),
+            ThemeRule::new("Dracula").tags(&["b"]),
+        ];
+        assert_eq!(moved_to(list.len(), 0, Move::Up), None);
+        assert_eq!(moved_to(list.len(), 0, Move::Down), Some(1));
+        assert_eq!(moved_to(list.len(), 1, Move::Down), None);
+        list.swap(0, 1);
+        assert_eq!(list[0].theme, "Dracula");
     }
 }

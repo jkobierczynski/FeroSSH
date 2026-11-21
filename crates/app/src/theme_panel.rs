@@ -1,18 +1,25 @@
-//! Tools > Theme manager as native Windows controls, on a panel over the
-//! uncovered part of the tools pane like Known hosts: the theme rules
-//! (tags or host patterns that pick a theme and a font), the built-in
-//! themes, the user's own themes and the terminal fonts, in groups, each
-//! with the saved connections that use it (see `theme_view.rs`). Fonts
-//! that are not installed are grey.
+//! Tools > Theme manager and Tools > Theme rules as native Windows
+//! controls, on one panel over the uncovered part of the tools pane like
+//! Known hosts; [`set_page`] picks which (see `theme_view.rs`).
+//!
+//! The theme manager lists the themes (by kind) and the terminal fonts,
+//! with the rules that use each; fonts that are not installed are grey.
+//! A strip under the list previews the picked theme or font. Apply to this
+//! pane (Enter, a double click) puts it on the pane behind the tools; Set
+//! as default makes new tabs open with it; Use in a rule... makes a theme
+//! rule with it.
+//!
+//! Theme rules lists the user's rules in the order they are tried, then
+//! the built-in tag rules (which cannot change), each with the saved
+//! connections it matches. Edit (Enter, a double click) opens one; Move
+//! up and Move down change the order; Delete asks first and says which
+//! connections change.
 //!
 //! A click on a column heading sorts within the groups (again: the other
-//! way). Edit (Enter in the list, a double click) opens a rule; on a
-//! theme or font it makes a new rule that starts with it. New rule makes
-//! one; Delete asks first, and says which connections change. Keys
-//! work as in `known_hosts_panel`: [`pre_translate`] runs in the message
-//! loop, passes Ctrl+Shift shortcuts on to the main window, turns typing
-//! in the list into a search, and gives Tab, Enter and Escape their dialog
-//! meaning.
+//! way). Keys work as in `known_hosts_panel`: [`pre_translate`] runs in
+//! the message loop, passes Ctrl+Shift shortcuts on to the main window,
+//! turns typing in the list into a search, and gives Tab, Enter and
+//! Escape their dialog meaning.
 
 #![allow(unsafe_code)]
 
@@ -20,22 +27,22 @@ use std::cell::RefCell;
 
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
-    BeginPaint, COLOR_GRAYTEXT, COLOR_WINDOW, COLOR_WINDOWTEXT, DT_END_ELLIPSIS, DT_LEFT,
-    DT_NOPREFIX, DT_RIGHT, DT_SINGLELINE, DT_VCENTER, DeleteObject, DrawTextW, EndPaint, FillRect,
-    HFONT, HGDIOBJ, InvalidateRect, PAINTSTRUCT, SelectObject, SetBkMode, SetTextColor,
-    TRANSPARENT,
+    BeginPaint, COLOR_GRAYTEXT, COLOR_WINDOW, COLOR_WINDOWTEXT, CreateFontIndirectW,
+    CreateSolidBrush, DT_END_ELLIPSIS, DT_LEFT, DT_NOPREFIX, DT_RIGHT, DT_SINGLELINE, DT_VCENTER,
+    DeleteObject, DrawTextW, EndPaint, FillRect, HFONT, HGDIOBJ, InvalidateRect, LOGFONTW,
+    PAINTSTRUCT, SelectObject, SetBkMode, SetTextColor, TRANSPARENT,
 };
 use windows::Win32::UI::Controls::{
     CDDS_ITEMPREPAINT, CDDS_PREPAINT, CDRF_DODEFAULT, CDRF_NOTIFYITEMDRAW, EM_LIMITTEXT,
     EM_SETCUEBANNER, EM_SETSEL, LIST_VIEW_ITEM_STATE_FLAGS, LVCF_TEXT, LVCF_WIDTH, LVCOLUMNW,
     LVGF_GROUPID, LVGF_HEADER, LVGF_STATE, LVGROUP, LVGS_COLLAPSIBLE, LVIF_GROUPID, LVIF_PARAM,
-    LVIF_TEXT, LVIS_FOCUSED, LVIS_SELECTED, LVITEMW, LVM_DELETEALLITEMS, LVM_ENABLEGROUPVIEW,
-    LVM_ENSUREVISIBLE, LVM_GETITEMW, LVM_GETNEXTITEM, LVM_INSERTCOLUMNW, LVM_INSERTGROUP,
-    LVM_INSERTITEMW, LVM_REMOVEALLGROUPS, LVM_SETCOLUMNWIDTH, LVM_SETEXTENDEDLISTVIEWSTYLE,
-    LVM_SETITEMSTATE, LVM_SETITEMTEXTW, LVN_COLUMNCLICK, LVN_ITEMCHANGED, LVNI_SELECTED,
-    LVS_EX_DOUBLEBUFFER, LVS_EX_FULLROWSELECT, LVS_EX_LABELTIP, LVS_REPORT, LVS_SHOWSELALWAYS,
-    LVS_SINGLESEL, NM_CUSTOMDRAW, NM_DBLCLK, NM_SETFOCUS, NMHDR, NMLISTVIEW, NMLVCUSTOMDRAW,
-    SetWindowTheme, WC_BUTTONW, WC_EDITW, WC_LISTVIEWW,
+    LVIF_TEXT, LVIS_FOCUSED, LVIS_SELECTED, LVITEMW, LVM_DELETEALLITEMS, LVM_DELETECOLUMN,
+    LVM_ENABLEGROUPVIEW, LVM_ENSUREVISIBLE, LVM_GETITEMW, LVM_GETNEXTITEM, LVM_INSERTCOLUMNW,
+    LVM_INSERTGROUP, LVM_INSERTITEMW, LVM_REMOVEALLGROUPS, LVM_SETCOLUMNWIDTH,
+    LVM_SETEXTENDEDLISTVIEWSTYLE, LVM_SETITEMSTATE, LVM_SETITEMTEXTW, LVN_COLUMNCLICK,
+    LVN_ITEMCHANGED, LVNI_SELECTED, LVS_EX_DOUBLEBUFFER, LVS_EX_FULLROWSELECT, LVS_EX_LABELTIP,
+    LVS_REPORT, LVS_SHOWSELALWAYS, LVS_SINGLESEL, NM_CUSTOMDRAW, NM_DBLCLK, NM_SETFOCUS, NMHDR,
+    NMLISTVIEW, NMLVCUSTOMDRAW, SetWindowTheme, WC_BUTTONW, WC_EDITW, WC_LISTVIEWW,
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     GetFocus, SetFocus, VK_CONTROL, VK_DELETE, VK_DOWN, VK_F5, VK_RETURN, VK_SHIFT,
@@ -53,11 +60,19 @@ use windows::core::{PCWSTR, PWSTR, w};
 
 use crate::layout::Rect;
 use crate::native::{fonts, key_down, pass_edge, scale, search_text, set_font, wide};
-use crate::theme_view::{self as view, Column, Group, Row};
+use crate::theme_view::{self as view, Column, Group, Move, Page, Row};
 
 /// What the user did in the panel.
 #[derive(Debug)]
 pub enum Event {
+    /// Put this theme or font on the pane behind the tools.
+    Apply(Row),
+    /// New tabs open with this theme or font.
+    SetDefault(Row),
+    /// Open the themes folder in Explorer.
+    OpenFolder,
+    /// Move this rule up or down the list.
+    Move(Row, Move),
     /// Make a new rule, starting with this theme and font (from the
     /// theme or font row picked).
     New {
@@ -86,12 +101,40 @@ const ID_LIST: usize = 201;
 const ID_NEW: usize = 210;
 const ID_EDIT: usize = 211;
 const ID_DELETE: usize = 212;
+const ID_UP: usize = 213;
+const ID_DOWN: usize = 214;
+const ID_USE: usize = 220;
+const ID_APPLY: usize = 221;
+const ID_DEFAULT: usize = 222;
+const ID_FOLDER: usize = 223;
 
-/// Buttons: width in DIPs.
-const BUTTONS: [i32; 3] = [88, 72, 80];
+/// Every button: its id, label, width in DIPs and page.
+const BUTTONS: [(usize, &str, i32, Page); 9] = [
+    (ID_APPLY, "Apply to this pane", 120, Page::Looks),
+    (ID_DEFAULT, "Set as default", 100, Page::Looks),
+    (ID_USE, "Use in a rule...", 104, Page::Looks),
+    (ID_FOLDER, "Open themes folder", 128, Page::Looks),
+    (ID_NEW, "New rule...", 88, Page::Rules),
+    (ID_EDIT, "Edit...", 72, Page::Rules),
+    (ID_DELETE, "Delete...", 80, Page::Rules),
+    (ID_UP, "Move up", 76, Page::Rules),
+    (ID_DOWN, "Move down", 84, Page::Rules),
+];
 
 /// The height of the summary line above the buttons, in DIPs.
 const STATUS_DIP: i32 = 22;
+
+/// The height of the theme manager's preview strip, in DIPs.
+const PREVIEW_DIP: i32 = 64;
+
+/// What new tabs open with: the preview of a font shows it in this
+/// theme, and of a theme in this font.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Defaults {
+    pub theme: String,
+    pub font: String,
+    pub size: f32,
+}
 
 #[derive(Clone, Copy)]
 struct Handles {
@@ -99,7 +142,7 @@ struct Handles {
     panel: HWND,
     search: HWND,
     list: HWND,
-    buttons: [HWND; 3],
+    buttons: [HWND; 9],
 }
 
 struct State {
@@ -118,6 +161,14 @@ struct State {
     status: String,
     /// Where the summary line ends: just above the buttons (see `place`).
     status_bottom: i32,
+    /// The page shown.
+    page: Page,
+    /// The look new tabs get, for the preview.
+    defaults: Defaults,
+    /// Where the preview strip is (empty on the rules page).
+    preview: RECT,
+    /// Where the panel was put last, to lay it out again for a new page.
+    placed: Option<(Rect, i32)>,
 }
 
 thread_local! {
@@ -165,7 +216,7 @@ pub fn create(main: HWND, handler: Handler, dpi: u32) -> windows::core::Result<(
             None,
         )?;
         // A control that cannot be made takes the panel down with it.
-        let made = (|| -> windows::core::Result<(HWND, HWND, [HWND; 3])> {
+        let made = (|| -> windows::core::Result<(HWND, HWND, [HWND; 9])> {
             let child = |class: PCWSTR, text: PCWSTR, style: u32, id: usize| {
                 CreateWindowExW(
                     WINDOW_EX_STYLE::default(),
@@ -212,26 +263,12 @@ pub fn create(main: HWND, handler: Handler, dpi: u32) -> windows::core::Result<(
                 Some(WPARAM(ex as usize)),
                 Some(LPARAM(ex as isize)),
             );
-            for (i, c) in Column::ALL.iter().enumerate() {
-                let mut text = wide(c.title());
-                let col = LVCOLUMNW {
-                    mask: LVCF_TEXT | LVCF_WIDTH,
-                    cx: scale(c.width(), dpi),
-                    pszText: PWSTR(text.as_mut_ptr()),
-                    ..Default::default()
-                };
-                SendMessageW(
-                    list,
-                    LVM_INSERTCOLUMNW,
-                    Some(WPARAM(i)),
-                    Some(LPARAM(&raw const col as isize)),
-                );
+            set_columns(list, Page::default(), dpi);
+            let mut buttons = [HWND::default(); 9];
+            for (b, (id, label, _, _)) in buttons.iter_mut().zip(BUTTONS) {
+                let text = wide(label);
+                *b = child(WC_BUTTONW, PCWSTR(text.as_ptr()), BS_PUSHBUTTON as u32, id)?;
             }
-            let buttons = [
-                child(WC_BUTTONW, w!("New rule..."), BS_PUSHBUTTON as u32, ID_NEW)?,
-                child(WC_BUTTONW, w!("Edit..."), BS_PUSHBUTTON as u32, ID_EDIT)?,
-                child(WC_BUTTONW, w!("Delete..."), BS_PUSHBUTTON as u32, ID_DELETE)?,
-            ];
             Ok((search, list, buttons))
         })();
         let (search, list, buttons) = match made {
@@ -264,6 +301,10 @@ pub fn create(main: HWND, handler: Handler, dpi: u32) -> windows::core::Result<(
                 descending: false,
                 status: String::new(),
                 status_bottom: 0,
+                page: Page::default(),
+                defaults: Defaults::default(),
+                preview: RECT::default(),
+                placed: None,
             });
         });
     }
@@ -286,6 +327,11 @@ pub fn place(at: Option<Rect>, width: i32, dpi: u32) {
         }
         return;
     };
+    let page = with(|s| {
+        s.placed = Some((at, width));
+        s.page
+    })
+    .unwrap_or_default();
     let refont = with(|s| {
         if s.dpi == dpi {
             return None;
@@ -303,14 +349,14 @@ pub fn place(at: Option<Rect>, width: i32, dpi: u32) {
         for c in [h.search, h.list].iter().chain(&h.buttons) {
             set_font(*c, font);
         }
-        for (i, c) in Column::ALL.iter().enumerate() {
+        for (i, c) in Column::on(page).iter().enumerate() {
             // SAFETY: our own control.
             unsafe {
                 SendMessageW(
                     h.list,
                     LVM_SETCOLUMNWIDTH,
                     Some(WPARAM(i)),
-                    Some(LPARAM(scale(c.width(), dpi) as isize)),
+                    Some(LPARAM(scale(c.width(page), dpi) as isize)),
                 );
             }
         }
@@ -332,7 +378,8 @@ pub fn place(at: Option<Rect>, width: i32, dpi: u32) {
     // narrow for one.
     let mut spots = Vec::with_capacity(BUTTONS.len());
     let (mut x, mut row) = (pad, 0);
-    for w in BUTTONS {
+    for (_, _, w, _) in BUTTONS.iter().filter(|b| b.3 == page) {
+        let w = *w;
         // Never wider than the tool: a very narrow one squeezes them.
         let w = scale(w, dpi).min(inner.max(1));
         if x > pad && x + w > pad + inner {
@@ -345,17 +392,43 @@ pub fn place(at: Option<Rect>, width: i32, dpi: u32) {
     let rows = row + 1;
     let block = rows * button + (rows - 1) * gap;
     let buttons_y = (at.h - pad - block).max(list_y);
-    let list_h = (buttons_y - gap - status - list_y).max(0);
-    with(|s| s.status_bottom = buttons_y - gap);
+    let preview_h = if page == Page::Looks {
+        scale(PREVIEW_DIP, dpi) + gap
+    } else {
+        0
+    };
+    let list_h = (buttons_y - gap - status - preview_h - list_y).max(0);
+    with(|s| {
+        s.status_bottom = buttons_y - gap;
+        s.preview = if preview_h > 0 {
+            RECT {
+                left: pad,
+                top: list_y + list_h + gap,
+                right: pad + inner,
+                bottom: list_y + list_h + preview_h,
+            }
+        } else {
+            RECT::default()
+        };
+    });
     // SAFETY: moving our own windows.
     unsafe {
         let _ = MoveWindow(h.panel, at.x, at.y, at.w, at.h, true);
         let _ = MoveWindow(h.search, pad, title, inner, field, true);
         let _ = MoveWindow(h.list, pad, list_y, inner, list_h, true);
-        for (b, (x, row, w)) in h.buttons.iter().zip(spots) {
-            let y = buttons_y + row * (button + gap);
-            let _ = MoveWindow(*b, x, y, w, button, true);
+        let mut spots = spots.into_iter();
+        for (b, spec) in h.buttons.iter().zip(BUTTONS) {
+            if spec.3 != page {
+                let _ = ShowWindow(*b, SW_HIDE);
+                continue;
+            }
+            if let Some((x, row, w)) = spots.next() {
+                let y = buttons_y + row * (button + gap);
+                let _ = MoveWindow(*b, x, y, w, button, true);
+                let _ = ShowWindow(*b, SW_SHOWNA);
+            }
         }
+        let _ = InvalidateRect(Some(h.panel), None, false);
         let _ = ShowWindow(h.panel, SW_SHOWNA);
     }
 }
@@ -394,12 +467,72 @@ pub fn paste(text: &str) {
     }
 }
 
-/// Shows `rows` (read afresh). The picked row stays picked when it is
-/// still listed.
-pub fn set_rows(rows: Vec<Row>) {
+/// Shows `rows` (read afresh), with `defaults` for the preview. The
+/// picked row stays picked when it is still listed.
+pub fn set_rows(rows: Vec<Row>, defaults: Defaults) {
     let keep = selected().map(|r| key(&r));
-    with(|s| s.rows = rows);
+    with(|s| {
+        s.rows = rows;
+        s.defaults = defaults;
+    });
     fill(keep);
+}
+
+/// The page shown.
+pub fn page() -> Page {
+    with(|s| s.page).unwrap_or_default()
+}
+
+/// Shows `page`: its columns, buttons and rows. The search and the sort
+/// start afresh.
+pub fn set_page(page: Page) {
+    let Some((h, dpi, placed, was)) = with(|s| {
+        let was = s.page;
+        s.page = page;
+        if was != page {
+            s.sort = None;
+            s.descending = false;
+        }
+        (s.h, s.dpi, s.placed, was)
+    }) else {
+        return;
+    };
+    if was == page {
+        return;
+    }
+    set_columns(h.list, page, dpi);
+    // SAFETY: our own control; EN_CHANGE refills the list.
+    unsafe {
+        let _ = SetWindowTextW(h.search, w!(""));
+    }
+    if let Some((at, width)) = placed {
+        place(Some(at), width, dpi);
+    }
+    fill(None);
+}
+
+/// Gives the list `page`'s columns.
+fn set_columns(list: HWND, page: Page, dpi: u32) {
+    // SAFETY: our own control; each struct and its text live through the
+    // call, which copies them.
+    unsafe {
+        while SendMessageW(list, LVM_DELETECOLUMN, Some(WPARAM(0)), None).0 != 0 {}
+        for (i, c) in Column::on(page).iter().enumerate() {
+            let mut text = wide(c.title(page));
+            let col = LVCOLUMNW {
+                mask: LVCF_TEXT | LVCF_WIDTH,
+                cx: scale(c.width(page), dpi),
+                pszText: PWSTR(text.as_mut_ptr()),
+                ..Default::default()
+            };
+            SendMessageW(
+                list,
+                LVM_INSERTCOLUMNW,
+                Some(WPARAM(i)),
+                Some(LPARAM(&raw const col as isize)),
+            );
+        }
+    }
 }
 
 /// Gives the search box the keyboard (as the tool opens).
@@ -459,10 +592,17 @@ fn key(row: &Row) -> (Group, String) {
 fn fill(keep: Option<(Group, String)>) {
     let Some((h, cells, names)) = with(|s| {
         let query = search_text(s.h.search);
-        let mut shown = view::filter(&s.rows, &query);
+        let page = s.page;
+        let mut shown = view::filter(view::on_page(&s.rows, page), &query);
         view::sort(&mut shown, s.sort, s.descending);
         let rules = s.rows.iter().filter(|r| r.group == Group::Rules).count();
-        s.status = view::summary(&shown, rules);
+        s.status = view::summary(page, &shown, rules);
+        if page == Page::Looks && !s.defaults.theme.is_empty() {
+            s.status = format!(
+                "New tabs: {}, {} {} pt. {}",
+                s.defaults.theme, s.defaults.font, s.defaults.size, s.status
+            );
+        }
         // Every row shown is one of `s.rows`: its index from its address.
         let base = s.rows.as_ptr() as usize;
         let size = std::mem::size_of::<Row>().max(1);
@@ -475,7 +615,7 @@ fn fill(keep: Option<(Group, String)>) {
             .map(|r| {
                 (
                     r.group,
-                    Column::ALL.iter().map(|&c| view::text(r, c)).collect(),
+                    Column::on(page).iter().map(|&c| view::text(r, c)).collect(),
                 )
             })
             .collect();
@@ -555,23 +695,33 @@ fn fill(keep: Option<(Group, String)>) {
     update_buttons(h);
 }
 
-/// Edit... on a theme or font makes a rule with it; Delete... is for
-/// rules only.
+/// The buttons that fit the picked row: on the theme manager, a theme
+/// or font; on theme rules, one of the user's own (and Move up or down
+/// only where it can go).
 fn update_buttons(h: Handles) {
     let row = selected();
-    let rule = row.as_ref().is_some_and(|r| r.group == Group::Rules);
-    let edit = if row.is_none() || rule {
-        w!("Edit...")
-    } else {
-        w!("Use in a rule...")
+    let rules = with(|s| s.rows.iter().filter(|r| r.group == Group::Rules).count()).unwrap_or(0);
+    let own = row.as_ref().filter(|r| r.is_own_rule());
+    let look = row.as_ref().is_some_and(|r| r.group.page() == Page::Looks);
+    let on = |id| match id {
+        ID_EDIT | ID_DELETE => own.is_some(),
+        ID_UP => own.is_some_and(|r| view::moved_to(rules, r.index, Move::Up).is_some()),
+        ID_DOWN => own.is_some_and(|r| view::moved_to(rules, r.index, Move::Down).is_some()),
+        ID_APPLY | ID_DEFAULT | ID_USE => look,
+        _ => true,
     };
-    // SAFETY: our own controls.
-    unsafe {
-        let _ = SetWindowTextW(h.buttons[1], edit);
-        let _ =
-            windows::Win32::UI::Input::KeyboardAndMouse::EnableWindow(h.buttons[1], row.is_some());
-        let _ = windows::Win32::UI::Input::KeyboardAndMouse::EnableWindow(h.buttons[2], rule);
+    for (b, (id, ..)) in h.buttons.iter().zip(BUTTONS) {
+        // SAFETY: our own controls.
+        unsafe {
+            let _ = windows::Win32::UI::Input::KeyboardAndMouse::EnableWindow(*b, on(id));
+        }
     }
+    with(|s| {
+        // SAFETY: our own window; the strip draws the new pick.
+        unsafe {
+            let _ = InvalidateRect(Some(s.h.panel), Some(&raw const s.preview), false);
+        }
+    });
 }
 
 /// The picked row. Its list position maps to `shown`, kept in the order
@@ -616,23 +766,31 @@ fn emit(e: Event) {
     handler(main, e);
 }
 
+/// Enter or a double click: a rule opens, a theme or font goes on the
+/// pane.
 fn edit() {
     match selected() {
-        Some(r) if r.group == Group::Rules => emit(Event::Edit(r)),
-        Some(r) => emit(Event::New {
+        Some(r) if r.is_own_rule() => emit(Event::Edit(r)),
+        Some(r) if r.group.page() == Page::Looks => emit(Event::Apply(r)),
+        _ => {}
+    }
+}
+
+fn use_in_rule() {
+    if let Some(r) = selected().filter(|r| r.group.page() == Page::Looks) {
+        emit(Event::New {
             theme: r.preset_theme().map(str::to_owned),
             font: r.preset_font().map(str::to_owned),
-        }),
-        None => {}
+        });
     }
 }
 
 fn delete(h: Handles) {
-    let Some(row) = selected().filter(|r| r.group == Group::Rules) else {
+    let Some(row) = selected().filter(Row::is_own_rule) else {
         return;
     };
     let text = wide(&view::delete_question(&row));
-    let caption = wide("Theme manager");
+    let caption = wide("Theme rules");
     // SAFETY: a message box over the main window; the strings live
     // through the call.
     let yes = unsafe {
@@ -681,7 +839,7 @@ pub fn pre_translate(msg: &MSG) -> bool {
                     edit();
                     return true;
                 }
-                if msg.hwnd == h.list && vk == VK_DELETE.0 {
+                if msg.hwnd == h.list && vk == VK_DELETE.0 && page() == Page::Rules {
                     delete(h);
                     return true;
                 }
@@ -737,6 +895,24 @@ fn command(h: Handles, id: usize, code: u32) {
         }),
         (ID_EDIT, BN_CLICKED) => edit(),
         (ID_DELETE, BN_CLICKED) => delete(h),
+        (ID_UP | ID_DOWN, BN_CLICKED) => {
+            if let Some(r) = selected().filter(Row::is_own_rule) {
+                let way = if id == ID_UP { Move::Up } else { Move::Down };
+                emit(Event::Move(r, way));
+            }
+        }
+        (ID_APPLY, BN_CLICKED) => {
+            if let Some(r) = selected().filter(|r| r.group.page() == Page::Looks) {
+                emit(Event::Apply(r));
+            }
+        }
+        (ID_DEFAULT, BN_CLICKED) => {
+            if let Some(r) = selected().filter(|r| r.group.page() == Page::Looks) {
+                emit(Event::SetDefault(r));
+            }
+        }
+        (ID_USE, BN_CLICKED) => use_in_rule(),
+        (ID_FOLDER, BN_CLICKED) => emit(Event::OpenFolder),
         _ => {}
     }
 }
@@ -780,7 +956,7 @@ fn notify(h: Handles, lparam: LPARAM) -> LRESULT {
                 let nm = &*(lparam.0 as *const NMLISTVIEW);
                 if let Some(&c) = usize::try_from(nm.iSubItem)
                     .ok()
-                    .and_then(|i| Column::ALL.get(i))
+                    .and_then(|i| Column::on(page()).get(i))
                 {
                     with(|s| {
                         if s.sort == Some(c) {
@@ -788,7 +964,7 @@ fn notify(h: Handles, lparam: LPARAM) -> LRESULT {
                         } else {
                             s.sort = Some(c);
                             // The most used first.
-                            s.descending = c == Column::Connections;
+                            s.descending = matches!(c, Column::Connections | Column::Rules);
                         }
                     });
                     let keep = selected().map(|r| key(&r));
@@ -802,20 +978,27 @@ fn notify(h: Handles, lparam: LPARAM) -> LRESULT {
 }
 
 fn paint(h: Handles) {
-    let Some((title_font, font, dpi, total, status, bottom)) = STATE.with(|s| {
-        s.try_borrow().ok()?.as_ref().map(|s| {
-            (
-                s.title_font,
-                s.font,
-                s.dpi,
-                s.rows.iter().filter(|r| r.group == Group::Rules).count(),
-                s.status.clone(),
-                s.status_bottom,
-            )
+    let Some((title_font, font, dpi, page, total, status, bottom, strip, defaults)) =
+        STATE.with(|s| {
+            s.try_borrow().ok()?.as_ref().map(|s| {
+                (
+                    s.title_font,
+                    s.font,
+                    s.dpi,
+                    s.page,
+                    s.rows.iter().filter(|r| r.group == Group::Rules).count(),
+                    s.status.clone(),
+                    s.status_bottom,
+                    s.preview,
+                    s.defaults.clone(),
+                )
+            })
         })
-    }) else {
+    else {
         return;
     };
+    // Read before painting: `selected` takes the state again.
+    let picked = (page == Page::Looks).then(selected).flatten();
     // SAFETY: a BeginPaint/EndPaint pair on our own window; the font is
     // selected back out.
     unsafe {
@@ -837,14 +1020,14 @@ fn paint(h: Handles) {
             windows::Win32::Foundation::COLORREF(crate::ui_theme::sys_color(COLOR_WINDOWTEXT));
         let grey = windows::Win32::Foundation::COLORREF(crate::ui_theme::sys_color(COLOR_GRAYTEXT));
         SetTextColor(dc, text_colour);
-        let mut text: Vec<u16> = "Theme manager".encode_utf16().collect();
+        let mut text: Vec<u16> = page.title().encode_utf16().collect();
         DrawTextW(
             dc,
             &mut text,
             &mut tr,
             DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX,
         );
-        if total > 0 {
+        if total > 0 && page == Page::Rules {
             SetTextColor(dc, grey);
             let mut count: Vec<u16> = total.to_string().encode_utf16().collect();
             DrawTextW(
@@ -872,8 +1055,130 @@ fn paint(h: Handles) {
                 DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX | DT_END_ELLIPSIS,
             );
         }
+        if page == Page::Looks && strip.bottom > strip.top {
+            preview(dc, strip, picked.as_ref(), &defaults, dpi);
+        }
         SelectObject(dc, old);
         let _ = EndPaint(h.panel, &ps);
+    }
+}
+
+/// The theme manager's preview: a prompt and an `ls` in the picked theme
+/// (else the default one) and font (else the default one), and the
+/// theme's eight colours, on `dc` (being painted).
+fn preview(
+    dc: windows::Win32::Graphics::Gdi::HDC,
+    at: RECT,
+    row: Option<&Row>,
+    d: &Defaults,
+    dpi: u32,
+) {
+    use ferossh_render::Theme;
+    let theme = row
+        .and_then(|r| r.preset_theme())
+        .and_then(Theme::by_name)
+        .or_else(|| Theme::by_name(&d.theme))
+        .unwrap_or_default();
+    let family = row
+        .and_then(|r| r.preset_font())
+        .unwrap_or(d.font.as_str())
+        .to_owned();
+    let pt = if d.size > 0.0 { d.size } else { 10.5 };
+    let colour = |c: ferossh_render::Rgb| {
+        windows::Win32::Foundation::COLORREF(
+            u32::from(c.r) | (u32::from(c.g) << 8) | (u32::from(c.b) << 16),
+        )
+    };
+    // SAFETY: GDI objects made here are selected back out and deleted;
+    // the texts live through each call.
+    unsafe {
+        let fill = |r: RECT, c| {
+            let brush = CreateSolidBrush(colour(c));
+            FillRect(dc, &r, brush);
+            let _ = DeleteObject(HGDIOBJ(brush.0));
+        };
+        fill(at, theme.background);
+        let mut lf = LOGFONTW {
+            lfHeight: -((pt * dpi as f32 / 72.0).round() as i32),
+            ..Default::default()
+        };
+        for (d, s) in lf.lfFaceName.iter_mut().take(31).zip(family.encode_utf16()) {
+            *d = s;
+        }
+        let font = CreateFontIndirectW(&lf);
+        let old = SelectObject(dc, HGDIOBJ(font.0));
+        let pad = scale(8, dpi);
+        let line = (at.bottom - at.top - 2 * pad) / 2;
+        let ansi = |i: usize| theme.ansi.get(i).copied().unwrap_or(theme.foreground);
+        let lines: [&[(&str, ferossh_render::Rgb)]; 2] = [
+            &[
+                ("user@host", ansi(2)),
+                (":", theme.foreground),
+                ("~", ansi(4)),
+                ("$ ", theme.foreground),
+                ("ls", theme.foreground),
+            ],
+            &[
+                ("docs  ", ansi(4)),
+                ("notes.txt  ", theme.foreground),
+                ("run.sh  ", ansi(2)),
+                ("error.log", ansi(1)),
+            ],
+        ];
+        for (n, parts) in lines.iter().enumerate() {
+            let mut x = at.left + pad;
+            let top = at.top + pad + n as i32 * line;
+            for (text, c) in *parts {
+                SetTextColor(dc, colour(*c));
+                let mut t: Vec<u16> = text.encode_utf16().collect();
+                let mut r = RECT {
+                    left: x,
+                    top,
+                    right: at.right - pad,
+                    bottom: top + line,
+                };
+                DrawTextW(
+                    dc,
+                    &mut t,
+                    &mut r,
+                    DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX,
+                );
+                // Where the next part starts: measured the same way.
+                let mut m = RECT {
+                    left: x,
+                    top,
+                    right: at.right,
+                    bottom: top + line,
+                };
+                DrawTextW(
+                    dc,
+                    &mut t,
+                    &mut m,
+                    DT_LEFT
+                        | DT_SINGLELINE
+                        | DT_NOPREFIX
+                        | windows::Win32::Graphics::Gdi::DT_CALCRECT,
+                );
+                x = m.right;
+            }
+        }
+        // The eight normal colours, on the right.
+        let size = scale(12, dpi);
+        for i in 0..8usize {
+            let right = at.right - pad - (7 - i as i32) * (size + scale(3, dpi));
+            let top = at.bottom - pad - size;
+            fill(
+                RECT {
+                    left: right - size,
+                    top,
+                    right,
+                    bottom: top + size,
+                },
+                ansi(i),
+            );
+        }
+        SelectObject(dc, old);
+        let _ = DeleteObject(HGDIOBJ(font.0));
     }
 }
 
