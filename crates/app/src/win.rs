@@ -12607,6 +12607,7 @@ impl Window {
             || self.fwd_native()
             || self.known_hosts_native()
             || self.inventory_native()
+            || self.hosts_native()
             || self.credentials_native()
             || self.rules_native()
             || self.scripts_native()
@@ -14034,6 +14035,7 @@ impl Window {
         // not get it either.
         if self.known_hosts_paste()
             || self.inventory_paste()
+            || self.hosts_paste()
             || self.credentials_paste()
             || self.rules_paste()
         {
@@ -23560,7 +23562,9 @@ fn hosts_event(hwnd: HWND, event: hosts_panel::Event) {
                 w.show_side(SideView::Sessions, true);
                 w.update_menu_checks();
             });
-            conn_view::set_search(&format!("host:{address}"));
+            // `addr:` is the whole address (an IP however it is
+            // written), so db.example does not bring db.example.backup.
+            conn_view::set_search(&format!("addr:{address}"));
         }
         Event::Reload => {
             with_window(|w| {

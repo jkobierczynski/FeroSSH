@@ -168,6 +168,7 @@ Ctrl+Shift+S shows your hosts in the tools pane: those from `~/.ssh/config`, you
 | --- | --- |
 | `tag:prod` | connections with the tag `prod` (the whole tag; `tag:prod*` for any tag starting with `prod`) |
 | `folder:db`, `name:web`, `user:root`, `host:10.0.` | part of the folder, name, user or host name |
+| `addr:db.example`, `addr:2001:db8::1` | the whole host name, an IP address however it is written (`*` and `?` work) |
 | `type:rdp` | connections of that type: `ssh`, `rdp`, `vnc`, `mosh`, `sftp`, `tunnel`, `telnet`, `serial`, `winrm`, `xvfb`, `remoteapp` |
 | `port:2222` | connections on that port |
 | `-tag:legacy` | a `-` in front leaves out what the word finds |
@@ -251,7 +252,7 @@ The connection log is kept on this PC only, in `inventory.conf` in `%LOCALAPPDAT
 
 ### Hosts
 
-**Tools > Hosts** (the screen icon on the tools rail, under the session manager) shows one row per machine: the connections that reach the same address taken together, whatever user or port they log in with. Each row says which connections those are (the one used last first), their users, ports and tags, the latest login through any of them, the host key seen then and the OS last read (see [Connection log](#connection-log)). When the connections saw different host keys for the same machine, the fingerprint says *keys differ*; Known hosts shows them. The search box takes the connection manager's search words, and a host is shown when one of its connections matches (`tag:prod`, `user:root`, `port:2222`); plain words also look at the address, OS, kernel and fingerprints. Click a column heading to sort by it, again for the other way. **Connect** (Enter, a double click) opens the host's connection used last, **Connections** shows them all in the connection manager (searched as `host:` and the address), and **Reload** (F5) reads the list again.
+**Tools > Hosts** (the screen icon on the tools rail, under the session manager) shows one row per machine: the connections that reach the same address taken together, whatever user or port they log in with. Each row says which connections those are (the one used last first), their users, ports and tags, the latest login through any of them, the host key seen then and the OS last read (see [Connection log](#connection-log)). When the connections saw different host keys for the same machine, the fingerprint says *keys differ*; Known hosts shows them. The search box takes the connection manager's search words, and a host is shown when one of its connections matches (`tag:prod`, `user:root`, `port:2222`); plain words also look at the address, OS, kernel and fingerprints. Click a column heading to sort by it, again for the other way. **Connect** (Enter, a double click) opens the host's connection used last, **Connections** shows them all in the connection manager (searched as `addr:` and the address, which matches that address only), and **Reload** (F5) reads the list again.
 
 ### Importing from other clients
 

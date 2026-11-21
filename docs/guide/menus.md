@@ -308,7 +308,7 @@ The arrow buttons between the lists move the selection across, and the gap betwe
 | Typing | Searches with the connection manager's search words; a host shows when one of its connections matches. Plain words also look at the address, OS, kernel and fingerprints. In the list it goes to the search box; Down there moves to the list. |
 | A click on a column heading | Sorts by that column; again for the other way. |
 | Enter in the list, a double click or Connect | Opens the host's connection used last. |
-| Connections | Shows the host's connections in the connection manager. |
+| Connections | Shows the host's connections in the connection manager (searched with `addr:`). |
 | F5 or Reload | Reads the connection log again. |
 | Escape | Clears the search; with none, gives the keyboard back to the terminal. |
 

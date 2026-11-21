@@ -116,8 +116,8 @@ pub fn hosts(rows: &[Connection]) -> Vec<Host> {
             .hostname
             .as_deref()
             .filter(|h| !h.is_empty())
-            .unwrap_or(&r.host.name)
-            .to_ascii_lowercase();
+            .unwrap_or(&r.host.name);
+        let address = ferossh_config::host_query::canonical_address(address);
         let at = match out.iter().position(|h| h.address == address) {
             Some(i) => i,
             None => {
@@ -248,7 +248,11 @@ pub fn text(h: &Host, column: Column, when: impl Fn(u64) -> String) -> String {
         Column::KeyType => h.key_type.clone(),
         Column::Fingerprint if h.keys_differ => format!("{} (keys differ)", h.fingerprint),
         Column::Fingerprint => h.fingerprint.clone(),
-        Column::Os => h.os.clone(),
+        Column::Os => match (h.os.is_empty(), h.kernel.is_empty()) {
+            (_, true) => h.os.clone(),
+            (true, false) => h.kernel.clone(),
+            (false, false) => format!("{} ({})", h.os, h.kernel),
+        },
     }
 }
 
@@ -389,6 +393,24 @@ mod tests {
         let db = &h[0];
         assert_eq!(db.connect_to(), Some("old"));
         assert_eq!(db.fingerprint, "SHA256:b");
+    }
+
+    #[test]
+    fn one_row_for_one_ip_however_written() {
+        let h = hosts(&[
+            conn("a", "u", "2001:db8::1", 22, &[], Record::default()),
+            conn(
+                "b",
+                "u",
+                "2001:0DB8:0:0:0:0:0:1",
+                22,
+                &[],
+                Record::default(),
+            ),
+        ]);
+        assert_eq!(h.len(), 1);
+        assert_eq!(h[0].address, "2001:db8::1");
+        assert_eq!(h[0].connections.len(), 2);
     }
 
     #[test]
