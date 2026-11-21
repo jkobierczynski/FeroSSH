@@ -15528,17 +15528,35 @@ impl Window {
         // on what the saved workspaces open, asking ones too.
         let mut users: HashMap<String, Vec<String>> = HashMap::new();
         let mut add = |name: String, ask_too: bool| {
-            // The proxy it logs in to on the way keeps its password apart.
-            if WinrmTarget::typed(&name).is_none()
-                && let Some(t) = Target::resolve(&name, &env)
-                && let Some(p) = t.proxy_server.as_ref()
-                && let Some(user) = p.user.as_deref()
-            {
-                let list = users
-                    .entry(credman::proxy_target(user, &p.host, p.port))
-                    .or_default();
-                if !list.iter().any(|n| n.eq_ignore_ascii_case(&name)) {
-                    list.push(name.clone());
+            // An SSH login on the way, through a proxy or jump hosts, keeps
+            // their passwords apart. A WinRM connection takes neither.
+            let ssh = WinrmTarget::typed(&name).is_none()
+                && !self
+                    .settings
+                    .profile(&name)
+                    .is_some_and(|p| p.kind == SessionKind::WinRm);
+            if let Some(t) = ssh.then(|| Target::resolve(&name, &env)).flatten() {
+                let mut uses = |target: String| {
+                    let list = users.entry(target).or_default();
+                    if !list.iter().any(|n| n.eq_ignore_ascii_case(&name)) {
+                        list.push(name.clone());
+                    }
+                };
+                if let Some(p) = t.proxy_server.as_ref()
+                    && let Some(user) = p.user.as_deref()
+                {
+                    uses(credman::proxy_target(user, &p.host, p.port));
+                }
+                // Each jump host by its own source, as its login takes it.
+                for hop in &t.jumps {
+                    let keeps = match self.source_of_name(&hop.alias, &env) {
+                        PasswordSource::Windows => true,
+                        PasswordSource::Ask => ask_too,
+                        PasswordSource::Command(_) => false,
+                    };
+                    if keeps {
+                        uses(credman::target(&hop.user, &hop.hostname, hop.port));
+                    }
                 }
             }
             let keeps = match self.source_of_name(&name, &env) {
