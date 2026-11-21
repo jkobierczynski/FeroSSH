@@ -24385,6 +24385,10 @@ fn team_library_settings(hwnd: HWND) {
                 w.settings.team_library.clone(),
                 w.settings.team_library_keys.clone(),
             );
+            // A read still running under the old settings keeps no copy
+            // from now on.
+            w.team_read += 1;
+            crate::team_lib::newest(&w.team_latest, w.team_read);
             w.settings.team_library = Some(library).filter(|l| !l.is_empty());
             w.settings.team_library_keys = if w.settings.team_library.is_some() {
                 keys
@@ -24397,8 +24401,9 @@ fn team_library_settings(hwnd: HWND) {
             } else {
                 // Said again if it still fails.
                 w.team_note = None;
-                w.refresh_team();
             }
+            // Read again under whichever settings stand now.
+            w.refresh_team();
             saved
         });
         if let Some(Err(e)) = saved {
