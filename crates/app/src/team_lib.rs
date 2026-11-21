@@ -12,6 +12,7 @@ use std::ffi::OsString;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use ferossh_config::team::{self, MAX_LEN, Team};
 
@@ -84,18 +85,51 @@ fn read_sig(path: &Path) -> std::io::Result<String> {
 /// Keeps library `bytes` and its signature `sig` as the checked copy
 /// for `library`: written beside it, then moved over the old one, so a
 /// failed write leaves the old copy as it was.
-fn keep(cache_dir: &Path, library: &str, bytes: &[u8], sig: &str) -> std::io::Result<()> {
+fn keep(
+    cache_dir: &Path,
+    library: &str,
+    bytes: &[u8],
+    sig: &str,
+    current: &dyn Fn() -> bool,
+) -> std::io::Result<()> {
+    /// Numbers each write, so two never share a temporary file.
+    static WRITES: AtomicU64 = AtomicU64::new(0);
+    /// Held from the check that this read is still the newest to the
+    /// copy's rename.
+    static COMMIT: Mutex<()> = Mutex::new(());
     let file = cache_path(cache_dir, library);
-    let mut tmp = file.clone().into_os_string();
-    tmp.push(format!(".{}.tmp", std::process::id()));
-    let tmp = PathBuf::from(tmp);
     let mut record = format!("{}\n{sig}", sig.len()).into_bytes();
     record.extend_from_slice(bytes);
-    std::fs::write(&tmp, &record)
-        .and_then(|()| std::fs::rename(&tmp, &file))
+    let tmp = write_new(&file, &record, WRITES.fetch_add(1, Ordering::Relaxed))?;
+    let _held = COMMIT.lock();
+    let done = if current() {
+        std::fs::rename(&tmp, &file)
+    } else {
+        Ok(())
+    };
+    // Still there when not moved: an older read's, or a failed rename.
+    let _ = std::fs::remove_file(&tmp);
+    done
+}
+
+/// Writes `bytes` to a new temporary file beside `file`, created
+/// exclusively (never through a file or link already there), and
+/// returns its path; removed again when writing fails.
+pub fn write_new(file: &Path, bytes: &[u8], n: u64) -> std::io::Result<PathBuf> {
+    use std::io::Write;
+    let mut tmp = file.as_os_str().to_owned();
+    tmp.push(format!(".{}-{n}.tmp", std::process::id()));
+    let tmp = PathBuf::from(tmp);
+    let mut f = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&tmp)?;
+    f.write_all(bytes)
+        .and_then(|()| f.sync_all())
         .inspect_err(|_| {
-            let _ = std::fs::remove_file(&tmp);
-        })
+            drop(std::fs::remove_file(&tmp));
+        })?;
+    Ok(tmp)
 }
 
 /// The copy in `cache_dir`, if it is still good under `keys`: what a
@@ -127,9 +161,14 @@ pub struct Loaded {
 }
 
 /// Reads library `library` (its `.sig` beside it), checks it against
-/// `keys` and keeps a copy in `cache_dir`; on any failure, the copy
-/// checked last.
-pub fn load(library: Option<&str>, keys: &[String], cache_dir: &Path) -> Loaded {
+/// `keys` and keeps a copy in `cache_dir` while `current` (this read is
+/// still the newest); on any failure, the copy checked last.
+pub fn load(
+    library: Option<&str>,
+    keys: &[String],
+    cache_dir: &Path,
+    current: &dyn Fn() -> bool,
+) -> Loaded {
     let Some(library) = library.map(str::trim).filter(|l| !l.is_empty()) else {
         return Loaded::default();
     };
@@ -141,7 +180,7 @@ pub fn load(library: Option<&str>, keys: &[String], cache_dir: &Path) -> Loaded 
             Ok(team) => {
                 // A copy that cannot be written only costs the offline
                 // fallback.
-                let _ = keep(cache_dir, library, &bytes, &sig);
+                let _ = keep(cache_dir, library, &bytes, &sig, current);
                 return Loaded { team, note: None };
             }
             Err(why) => format!("was not used: {why}"),
@@ -204,30 +243,35 @@ mod tests {
         let keys = [admin().public_key().to_openssh().unwrap()];
         let lib = write_library(&share, "web");
         let path = lib.to_str().unwrap();
-        let first = load(Some(path), &keys, &cache);
+        let first = load(Some(path), &keys, &cache, &|| true);
         assert!(first.note.is_none());
         assert!(first.team.has("web"));
         // Tampered on the share: refused, the copy used.
         std::fs::write(&lib, b"FeroSSH connections v1\nend\n").unwrap();
-        let tampered = load(Some(path), &keys, &cache);
+        let tampered = load(Some(path), &keys, &cache, &|| true);
         assert!(tampered.team.has("web"));
         assert!(tampered.note.unwrap().contains("signature does not match"));
         // Gone from the share: the copy.
         std::fs::remove_file(&lib).unwrap();
-        let offline = load(Some(path), &keys, &cache);
+        let offline = load(Some(path), &keys, &cache, &|| true);
         assert!(offline.team.has("web"));
         assert!(offline.note.unwrap().contains("could not be read"));
         // Another key: the copy no longer passes either.
-        let other = load(Some(path), &["ssh-ed25519 AAAA junk".into()], &cache);
+        let other = load(
+            Some(path),
+            &["ssh-ed25519 AAAA junk".into()],
+            &cache,
+            &|| true,
+        );
         assert!(other.team.is_empty());
         // Another library, not there: not the first one's copy.
         let elsewhere = share.join("other.ferossh-library");
-        let moved = load(Some(elsewhere.to_str().unwrap()), &keys, &cache);
+        let moved = load(Some(elsewhere.to_str().unwrap()), &keys, &cache, &|| true);
         assert!(moved.team.is_empty());
         assert!(cached(Some(elsewhere.to_str().unwrap()), &keys, &cache).is_empty());
         assert!(cached(Some(path), &keys, &cache).has("web"));
         // No library set: nothing, and nothing to say.
-        let off = load(None, &keys, &cache);
+        let off = load(None, &keys, &cache, &|| true);
         assert!(off.team.is_empty() && off.note.is_none());
         let _ = std::fs::remove_dir_all(&share);
         let _ = std::fs::remove_dir_all(&cache);

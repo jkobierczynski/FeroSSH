@@ -1569,6 +1569,9 @@ struct Window {
     team_loaded: Arc<std::sync::Mutex<Option<(u64, crate::team_lib::Loaded)>>>,
     /// Counts the reads of the team library started.
     team_read: u64,
+    /// The same, for the reads themselves to see whether they are still
+    /// the newest.
+    team_latest: Arc<std::sync::atomic::AtomicU64>,
     /// What was last said about the team library, so it is not said
     /// again on every refresh.
     team_note: Option<String>,
@@ -2899,6 +2902,7 @@ fn create_and_run(launch: Launch, theme: Option<String>) -> Result<()> {
                 script_secrets: Arc::default(),
                 team_loaded: Arc::default(),
                 team_read: 0,
+                team_latest: Arc::default(),
                 team_note: None,
                 team_note_pending: None,
                 script_runs: 0,
@@ -7281,25 +7285,16 @@ impl Window {
         // The folder the Connection manager shows it in: the team
         // library's for its connections, a FeroSSH connection's own, else
         // the one its ssh_config (an import's file) gives it.
-        let saved = if self.settings.is_team(alias) {
-            ferossh_config::saved::parse(&self.settings.team.hosts_text)
-        } else {
-            load_saved()
-        };
-        let folder = saved
-            .into_iter()
-            .find(|h| h.alias.eq_ignore_ascii_case(alias))
-            .and_then(|h| h.folder)
-            .or_else(|| {
-                let env = ssh_env();
-                let includes = ssh_config::DirIncludes {
-                    home: env.home.clone(),
-                };
-                ssh_config::hosts(&env.config, &includes)
-                    .into_iter()
-                    .find(|h| h.name.eq_ignore_ascii_case(alias))
-                    .and_then(|h| h.folder)
-            });
+        let folder = self.saved_of(alias).and_then(|h| h.folder).or_else(|| {
+            let env = ssh_env();
+            let includes = ssh_config::DirIncludes {
+                home: env.home.clone(),
+            };
+            ssh_config::hosts(&env.config, &includes)
+                .into_iter()
+                .find(|h| h.name.eq_ignore_ascii_case(alias))
+                .and_then(|h| h.folder)
+        });
         self.settings.policy(&Subject {
             name: alias,
             hostname,
@@ -7378,12 +7373,24 @@ impl Window {
 
     /// `destination` as a WinRM session: a saved WinRM connection (its
     /// port, HTTPS and login user), or a typed `winrm://` address.
+    /// Saved connection `alias`: the team library's when it is one of its
+    /// connections (a local one of that name is not used), else the
+    /// user's own.
+    fn saved_of(&self, alias: &str) -> Option<ferossh_config::saved::SavedHost> {
+        let hosts = if self.settings.is_team(alias) {
+            ferossh_config::saved::parse(&self.settings.team.hosts_text)
+        } else {
+            load_saved()
+        };
+        hosts
+            .into_iter()
+            .find(|h| h.alias.eq_ignore_ascii_case(alias))
+    }
+
     fn winrm_target(&self, destination: &str, env: &Env) -> Option<WinrmTarget> {
         match self.settings.profile(destination) {
             Some(p) if p.kind == SessionKind::WinRm => {
-                let saved = load_saved()
-                    .into_iter()
-                    .find(|h| h.alias.eq_ignore_ascii_case(destination));
+                let saved = self.saved_of(destination);
                 WinrmTarget::resolve(
                     destination,
                     env,
@@ -15803,10 +15810,16 @@ impl Window {
     fn rule_rows(&self) -> Vec<crate::rules_view::Row> {
         use crate::rules_view::Connection;
         let saved = load_saved();
+        let team = ferossh_config::saved::parse(&self.settings.team.hosts_text);
         let all: Vec<Connection> = host_items(&ssh_env(), &self.settings)
             .into_iter()
             .map(|h| {
-                let own = saved
+                let from = if self.settings.is_team(&h.name) {
+                    &team
+                } else {
+                    &saved
+                };
+                let own = from
                     .iter()
                     .find(|s| s.alias.eq_ignore_ascii_case(&h.name))
                     .and_then(|s| s.folder.clone());
@@ -16254,16 +16267,24 @@ impl Window {
         let keys = self.settings.team_library_keys.clone();
         // Whatever an earlier read finds is no longer wanted.
         self.team_read += 1;
+        self.team_latest.store(self.team_read, Ordering::Release);
         if library.is_none() {
             self.use_team(crate::team_lib::Loaded::default());
             return;
         }
         let read = self.team_read;
+        self.team_latest.store(read, Ordering::Release);
+        let latest = self.team_latest.clone();
         let slot = self.team_loaded.clone();
         let notify = self.notifier();
         std::thread::spawn(move || {
-            let loaded = crate::team_lib::load(library.as_deref(), &keys, &app_dir());
-            if let Ok(mut s) = slot.lock() {
+            // Only the newest read keeps its copy, so an older one that
+            // finishes late does not replace it.
+            let current = || latest.load(Ordering::Acquire) == read;
+            let loaded = crate::team_lib::load(library.as_deref(), &keys, &app_dir(), &current);
+            if let Ok(mut s) = slot.lock()
+                && s.as_ref().is_none_or(|(had, _)| *had < read)
+            {
                 *s = Some((read, loaded));
             }
             notify();

@@ -156,14 +156,11 @@ pub(super) fn export_team(hwnd: HWND) {
     let Some(path) = save_file(hwnd, w!("Export team library to"), &start, TEAM_FILTER) else {
         return;
     };
-    let mut tmp = path.as_os_str().to_owned();
-    tmp.push(format!(".{}.tmp", std::process::id()));
-    let tmp = PathBuf::from(tmp);
-    let written = std::fs::write(&tmp, &bytes)
-        .and_then(|()| std::fs::rename(&tmp, &path))
-        .inspect_err(|_| {
+    let written = crate::team_lib::write_new(&path, &bytes, 0).and_then(|tmp| {
+        std::fs::rename(&tmp, &path).inspect_err(|_| {
             let _ = std::fs::remove_file(&tmp);
-        });
+        })
+    });
     match written {
         Ok(()) => {
             let shown = path.display().to_string();
@@ -182,7 +179,6 @@ pub(super) fn export_team(hwnd: HWND) {
             );
         }
         Err(e) => {
-            let _ = std::fs::remove_file(&tmp);
             dialog(
                 hwnd,
                 &format!("Could not export to {}: {e}", path.display()),
