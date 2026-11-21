@@ -784,6 +784,7 @@ Tools > Theme manager (the palette on the tools rail) is for the looks. It lists
 - **Apply to this pane** (Enter or a double click) puts the theme or font on the pane behind the tools, as Settings > Theme or Font does. A font that is not installed offers its download page.
 - **Set as default** makes new tabs open with that theme or font, from now on (`DefaultTheme` and `DefaultFont` in [Settings](settings.md)).
 - **Use in a rule...** opens Theme rules with a new rule that starts with that theme or font.
+- **Edit colours...** opens the colour editor for the picked theme: each of its colours (foreground, background, cursor, cursor text and the 16 ANSI colours) with a swatch and its `#RRGGBB`, and a preview. Click a swatch to pick a colour, or type one. **Save** writes one of your own themes back to its file (panes showing it change at once); **Save as...** saves the colours as a new theme file, under the name you give it. A built-in theme is never changed: it only has Save as, which suggests "My <theme>".
 - **Open themes folder** opens the folder of your own themes.
 
 ### Theme rules

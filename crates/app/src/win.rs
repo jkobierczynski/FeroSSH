@@ -20334,6 +20334,175 @@ impl Window {
         })
     }
 
+    /// Writes theme file `path` (theme `name`, text `text`) and reads the
+    /// themes folder again; an error says why it is not a custom theme now.
+    fn write_theme_file(
+        &mut self,
+        path: &Path,
+        name: &str,
+        text: String,
+    ) -> std::result::Result<(), String> {
+        if let Some(dir) = path.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        // Written beside it first, so a failed write leaves an existing
+        // theme as it was.
+        let temp = path.with_extension("theme-new");
+        std::fs::write(&temp, text)
+            .and_then(|()| std::fs::rename(&temp, path))
+            .map_err(|e| {
+                let _ = std::fs::remove_file(&temp);
+                format!("The theme could not be saved to {}: {e}", path.display())
+            })?;
+        let dir = themes_dir();
+        let reason = match load_custom_themes() {
+            Ok((themes, broken)) => {
+                self.custom_themes = themes;
+                let file = path.file_name().map(|f| f.to_string_lossy().into_owned());
+                broken
+                    .into_iter()
+                    .find(|b| Some(&b.file) == file.as_ref())
+                    .map(|b| b.reason)
+            }
+            Err(e) => Some(e),
+        };
+        // The menu (and the command palette, which reads it) matches the
+        // list again.
+        if let Some(menu) = custom_themes_menu(self.menu) {
+            self.fill_custom_themes(menu);
+        }
+        // The saved file itself loaded (not another file's theme of the
+        // same name, which makes this one a duplicate).
+        let listed = path.parent().is_some_and(|parent| same_file(parent, &dir))
+            && reason.is_none()
+            && self.custom_named(name).is_some();
+        if !listed {
+            let why = reason.map(|r| format!(" ({r})")).unwrap_or_default();
+            return Err(format!(
+                "Saved {}, but it is not in Settings > Custom themes{why}. \
+                 Custom themes are read from {}: copy the file there.",
+                path.display(),
+                dir.display()
+            ));
+        }
+        Ok(())
+    }
+
+    /// The colour editor's `edited` colours of theme `original`, written
+    /// to theme file `path` as theme `name`, with the font and window
+    /// colours `original`'s own file has. Saved over its own file (same
+    /// name), the panes showing it get the new colours.
+    fn save_edited_colours(
+        &mut self,
+        original: &Theme,
+        edited: &Theme,
+        path: &Path,
+        name: &str,
+        in_place: bool,
+    ) -> std::result::Result<String, String> {
+        let mut own = self.custom_named(original.name).cloned();
+        if in_place {
+            // Saved over its file: the font and window lines as the file
+            // has them now, and not over colours changed there meanwhile.
+            let now = std::fs::read_to_string(path)
+                .map_err(|e| e.to_string())
+                .and_then(|t| custom_theme::parse(&t, name));
+            match now {
+                Ok(c) if crate::colour_edit::changed(original, &c.theme).is_empty() => {
+                    own = Some(c);
+                }
+                _ => {
+                    return Err(format!(
+                        "{} changed since the colour editor opened, so Save leaves it as it \
+                         is. Save as keeps your colours in a new theme; or cancel and open the \
+                         editor again.",
+                        path.display()
+                    ));
+                }
+            }
+        }
+        let text = custom_theme::write(
+            name,
+            edited,
+            own.as_ref().and_then(|c| c.font.as_deref()),
+            own.as_ref().and_then(|c| c.size),
+            own.as_ref().and_then(|c| c.window),
+        );
+        // What the file held, as this window knew it, before it changes.
+        let before = self
+            .custom_themes
+            .iter()
+            .find(|c| same_file(&c.path, path))
+            .map(|c| c.theme.clone());
+        self.write_theme_file(path, name, text)?;
+        let saved = self
+            .custom_named(name)
+            .map_or_else(|| edited.clone(), |c| c.theme.clone());
+        let mut shown = 0;
+        let mut unsaved = String::new();
+        // The theme this file held before (the edited one for Save, or the
+        // one a Save as replaced): its copies take the new colours.
+        if let Some(before) = before {
+            // Panes with the theme as it was (not tinted by a rule, not
+            // another look) change with it; so do their enforced looks.
+            let ids: Vec<PaneId> = self
+                .panes
+                .iter()
+                .filter(|(_, p)| p.theme == before)
+                .map(|(id, _)| *id)
+                .collect();
+            for p in self.panes.values_mut() {
+                if p.lock.theme.as_ref() == Some(&before) {
+                    p.lock.theme = Some(saved.clone());
+                }
+            }
+            for id in &ids {
+                self.set_theme(*id, saved.clone());
+            }
+            // New tabs too, when it is the default theme; and the saved
+            // default follows a Save as that renamed it.
+            // The saved default is checked on its own: a --theme start
+            // may show another default while the settings name this one.
+            if self.default_theme == before {
+                self.default_theme = saved.clone();
+            }
+            if before.name != name && self.settings.default_theme.as_deref() == Some(before.name) {
+                self.settings.default_theme = Some(name.to_owned());
+                if let Err(e) = self.try_save_settings() {
+                    unsaved = format!(
+                        " The default theme was renamed, but the settings could not be \
+                         saved, so the next start uses the old default ({e})."
+                    );
+                }
+            }
+            shown = ids.len();
+            if shown > 0 {
+                self.sync_tmux();
+                self.request_full_redraw();
+            }
+        }
+        if self.themes_native() {
+            self.reload_themes();
+        }
+        let panes = match shown {
+            0 => String::new(),
+            1 => " The pane showing it has the new colours.".to_owned(),
+            n => format!(" The {n} panes showing it have the new colours."),
+        };
+        Ok(if in_place {
+            format!(
+                "Saved the colours of {name} to {}.{panes}{unsaved}",
+                path.display()
+            )
+        } else {
+            format!(
+                "Saved the theme {name} to {}.{panes} It is in the Theme manager and \
+                 Settings > Custom themes; Apply to this pane puts it on a pane.{unsaved}",
+                path.display()
+            )
+        })
+    }
+
     /// Writes a pane's look as it was when the dialog opened (colours,
     /// font, and the window colours unless they follow something) to
     /// theme file `path`, and gives the pane that theme unless its look
@@ -20355,52 +20524,12 @@ impl Window {
         let text = custom_theme::write(
             &name,
             &look.theme,
-            Some((&look.font.0, look.font.1)),
+            Some(&look.font.0),
+            Some(look.font.1),
             window,
         );
-        if let Some(dir) = path.parent() {
-            let _ = std::fs::create_dir_all(dir);
-        }
-        // Written beside it first, so a failed write leaves an existing
-        // theme as it was.
-        let temp = path.with_extension("theme-new");
-        std::fs::write(&temp, text)
-            .and_then(|()| std::fs::rename(&temp, path))
-            .map_err(|e| {
-                let _ = std::fs::remove_file(&temp);
-                format!("The theme could not be saved to {}: {e}", path.display())
-            })?;
+        self.write_theme_file(path, &name, text)?;
         let saved = path.display();
-        let dir = themes_dir();
-        let reason = match load_custom_themes() {
-            Ok((themes, broken)) => {
-                self.custom_themes = themes;
-                let file = path.file_name().map(|f| f.to_string_lossy().into_owned());
-                broken
-                    .into_iter()
-                    .find(|b| Some(&b.file) == file.as_ref())
-                    .map(|b| b.reason)
-            }
-            Err(e) => Some(e),
-        };
-        // The menu (and the command palette, which reads it) matches the
-        // list again.
-        if let Some(menu) = custom_themes_menu(self.menu) {
-            self.fill_custom_themes(menu);
-        }
-        // The saved file itself loaded (not another file's theme of the
-        // same name, which makes this one a duplicate).
-        let listed = path.parent() == Some(dir.as_path())
-            && reason.is_none()
-            && self.custom_named(&name).is_some();
-        if !listed {
-            let why = reason.map(|r| format!(" ({r})")).unwrap_or_default();
-            return Err(format!(
-                "Saved {saved}, but it is not in Settings > Custom themes{why}. \
-                 Custom themes are read from {}: copy the file there.",
-                dir.display()
-            ));
-        }
         // A warning theme (Production, Staging) stays on the pane, so its
         // confirmations keep working; the saved copy is in the menu.
         // A pane that closed, or whose look changed while the dialog was
@@ -24376,6 +24505,11 @@ fn theme_event(hwnd: HWND, event: theme_panel::Event) {
             run_command(hwnd, Command::OpenFolder(dir));
             return;
         }
+        Event::EditColours(row) => {
+            if let Some(name) = row.preset_theme() {
+                edit_colours(hwnd, name);
+            }
+        }
         Event::Move(row, way) => {
             if let Some(rule) = row.rule {
                 let lost = std::cell::Cell::new(false);
@@ -26889,33 +27023,177 @@ fn pick_workspace(hwnd: HWND, save: bool) -> Option<PathBuf> {
 /// and says what was saved.
 /// Settings > Custom themes > Save this look as a theme: asks for a file in
 /// the themes folder; its name is the theme's.
+/// Theme manager > Edit colours: the colour editor for theme `name`.
+/// Save writes one of the user's own themes back to its file; Save as
+/// asks for a new theme file (the only way for a built-in theme, which
+/// stays as it is). A refused name or failed write goes back to the
+/// editor with the edits kept.
+fn edit_colours(hwnd: HWND, name: &str) {
+    use crate::colour_editor::Choice;
+    let Some((original, file)) = with_window(|w| match w.custom_named(name) {
+        Some(c) => Some((
+            c.theme.clone(),
+            Some(c.path.clone()).filter(|p| !p.as_os_str().is_empty()),
+        )),
+        None => Theme::by_name(name).map(|t| (t, None)),
+    })
+    .flatten() else {
+        return;
+    };
+    let can_save = crate::colour_edit::can_save(original.name) && file.is_some();
+    let mut now = original.clone();
+    loop {
+        if DIALOG_OPEN.get() {
+            return;
+        }
+        DIALOG_OPEN.set(true);
+        let got = crate::colour_editor::edit(hwnd, &original, &now, can_save);
+        DIALOG_OPEN.set(false);
+        let Some((edited, choice)) = got else {
+            return;
+        };
+        now = edited;
+        let (path, new_name, in_place) = match (choice, &file) {
+            (Choice::Save, Some(file)) if can_save => {
+                if now == original {
+                    return;
+                }
+                (file.clone(), original.name.to_owned(), true)
+            }
+            _ => {
+                let suggested = crate::colour_edit::suggested_name(original.name);
+                let Some(path) = ask_theme_path(
+                    hwnd,
+                    &suggested,
+                    "Save these colours as a theme (the file name is its name)",
+                ) else {
+                    continue;
+                };
+                let stem = path
+                    .file_stem()
+                    .map(|s| s.to_string_lossy().into_owned())
+                    .unwrap_or_default();
+                // Refused before anything is written: a name the themes
+                // folder cannot list, a file outside it, or a name another
+                // theme file has (the folder would list only one of them).
+                let refused = match custom_theme::clean_name(&stem) {
+                    Err(e) => Err(format!(
+                        "A theme cannot be saved as {stem}: {e}. Pick another file name."
+                    )),
+                    Ok(_) if !in_themes_dir(&path) => Err(format!(
+                        "Themes are read from {} only: save the theme there.",
+                        themes_dir().display()
+                    )),
+                    Ok(n) => {
+                        // The folder as it is now (another window may have
+                        // saved a theme since this one last looked), read
+                        // aside: the window's own list stays what its panes
+                        // were given, for the save to recolour them.
+                        // Unread, a duplicate name cannot be ruled out:
+                        // nothing is written then.
+                        match custom_theme::load(&themes_dir()) {
+                            Err(e) => Err(format!(
+                                "The themes folder {} could not be read ({e}), so the name \
+                                 {n} cannot be checked. Nothing was saved.",
+                                themes_dir().display()
+                            )),
+                            Ok((now, _)) => match now
+                                .iter()
+                                .find(|c| {
+                                    c.theme.name.eq_ignore_ascii_case(&n)
+                                        && !same_file(&c.path, &path)
+                                })
+                                .map(|c| c.path.display().to_string())
+                            {
+                                Some(other) => Err(format!(
+                                    "{other} already holds a theme named {n}. Pick another \
+                                     file name."
+                                )),
+                                None => Ok(n),
+                            },
+                        }
+                    }
+                };
+                match refused {
+                    Ok(n) => (path, n, false),
+                    Err(text) => {
+                        dialog(hwnd, &text, MB_OK | MB_ICONWARNING);
+                        continue;
+                    }
+                }
+            }
+        };
+        match with_window(|w| w.save_edited_colours(&original, &now, &path, &new_name, in_place)) {
+            Some(Ok(text)) => {
+                dialog(hwnd, &text, MB_OK | MB_ICONINFORMATION);
+                return;
+            }
+            Some(Err(text)) => dialog(hwnd, &text, MB_OK | MB_ICONWARNING),
+            None => return,
+        };
+    }
+}
+
+/// Whether `path` is a file directly in the themes folder.
+fn in_themes_dir(path: &Path) -> bool {
+    path.parent()
+        .is_some_and(|dir| same_file(dir, &themes_dir()))
+}
+
+/// Whether `a` and `b` name the same file or folder: the same path, or
+/// both resolve to one (Windows paths differ in case and form).
+fn same_file(a: &Path, b: &Path) -> bool {
+    a == b
+        || matches!(
+            (std::fs::canonicalize(a), std::fs::canonicalize(b)),
+            (Ok(x), Ok(y)) if x == y
+        )
+}
+
 fn save_theme_as(hwnd: HWND) {
-    use windows::Win32::UI::Controls::Dialogs::{GetSaveFileNameW, OFN_OVERWRITEPROMPT};
     if DIALOG_OPEN.get() {
         return;
     }
-    let dir = themes_dir();
-    let _ = std::fs::create_dir_all(&dir);
     // The pane whose look is saved, and that look, as they are now,
     // whatever happens while the dialog is open.
     let Some((look, suggested)) = with_window(|w| {
         let look = w.look_of(w.focused_id())?;
-        let name = look.theme.name;
-        let suggested = if Theme::is_builtin(name) {
-            format!("My {name}")
-        } else {
-            name.to_owned()
-        };
+        let suggested = crate::colour_edit::suggested_name(look.theme.name);
         Some((look, suggested))
     })
     .flatten() else {
         return;
     };
+    let Some(path) = ask_theme_path(
+        hwnd,
+        &suggested,
+        "Save this look as a theme (the file name is its name)",
+    ) else {
+        return;
+    };
+    let (text, icon) = match with_window(|w| w.save_theme(&look, &path)) {
+        Some(Ok(text)) => (text, MB_ICONINFORMATION),
+        Some(Err(text)) => (text, MB_ICONWARNING),
+        None => return,
+    };
+    dialog(hwnd, &text, MB_OK | icon);
+}
+
+/// Asks for a theme file to save, in the themes folder, starting with
+/// the file for theme `suggested`; ends its name in `.theme` and asks
+/// before replacing a file the dialog did not ask about.
+fn ask_theme_path(hwnd: HWND, suggested: &str, title: &str) -> Option<PathBuf> {
+    use windows::Win32::UI::Controls::Dialogs::{GetSaveFileNameW, OFN_OVERWRITEPROMPT};
+    if DIALOG_OPEN.get() {
+        return None;
+    }
+    let dir = themes_dir();
+    let _ = std::fs::create_dir_all(&dir);
     let dir_w = crate::native::wide(&dir.display().to_string());
     let mut buf = vec![0u16; 4096];
     for (slot, c) in buf
         .iter_mut()
-        .zip(custom_theme::file_name(&suggested).encode_utf16())
+        .zip(custom_theme::file_name(suggested).encode_utf16())
     {
         *slot = c;
     }
@@ -26923,6 +27201,7 @@ fn save_theme_as(hwnd: HWND) {
         .encode_utf16()
         .collect();
     let ext = crate::native::wide(custom_theme::EXTENSION);
+    let title_w = crate::native::wide(title);
     let mut ofn = OPENFILENAMEW {
         lStructSize: std::mem::size_of::<OPENFILENAMEW>() as u32,
         hwndOwner: hwnd,
@@ -26931,18 +27210,18 @@ fn save_theme_as(hwnd: HWND) {
         nMaxFile: (buf.len() - 1) as u32,
         lpstrInitialDir: PCWSTR(dir_w.as_ptr()),
         lpstrDefExt: PCWSTR(ext.as_ptr()),
-        lpstrTitle: w!("Save this look as a theme (the file name is its name)"),
+        lpstrTitle: PCWSTR(title_w.as_ptr()),
         Flags: OFN_EXPLORER | OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR | OFN_OVERWRITEPROMPT,
         ..Default::default()
     };
     DIALOG_OPEN.set(true);
     // SAFETY: the struct is filled in as documented; `buf`, `dir_w`,
-    // `ext` and `filter` outlive the call; the dialog's modal loop holds
+    // `ext`, `title_w` and `filter` outlive the call; the dialog's modal loop holds
     // no state borrow.
     let ok = unsafe { GetSaveFileNameW(&mut ofn) }.as_bool();
     DIALOG_OPEN.set(false);
     if !ok {
-        return;
+        return None;
     }
     let end = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
     let mut path = PathBuf::from(String::from_utf16_lossy(buf.get(..end).unwrap_or_default()));
@@ -26971,15 +27250,10 @@ fn save_theme_as(hwnd: HWND) {
             path.file_name().unwrap_or_default().to_string_lossy()
         );
         if dialog(hwnd, &text, MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2) != Some(IDYES) {
-            return;
+            return None;
         }
     }
-    let (text, icon) = match with_window(|w| w.save_theme(&look, &path)) {
-        Some(Ok(text)) => (text, MB_ICONINFORMATION),
-        Some(Err(text)) => (text, MB_ICONWARNING),
-        None => return,
-    };
-    dialog(hwnd, &text, MB_OK | icon);
+    Some(path)
 }
 
 fn save_workspace_as(hwnd: HWND) {

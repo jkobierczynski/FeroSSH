@@ -58,6 +58,9 @@ pub struct CustomTheme {
     pub window: Option<WindowSpec>,
     /// What was wrong but left out, for the menu to show.
     pub warnings: Vec<String>,
+    /// Its file ([`load`] sets it; empty for a theme not read from one),
+    /// so the colour editor's Save writes it back there, by its own path.
+    pub path: std::path::PathBuf,
 }
 
 /// A theme file that could not be used: its file name and why.
@@ -245,6 +248,7 @@ pub fn parse(text: &str, fallback: &str) -> Result<CustomTheme, String> {
         size,
         window,
         warnings,
+        path: std::path::PathBuf::new(),
     })
 }
 
@@ -262,11 +266,12 @@ fn intern(name: &str) -> &'static str {
 }
 
 /// A theme file's text: theme `name` with `theme`'s colours, and a font
-/// and window colours if given.
+/// family, size and window colours if given.
 pub fn write(
     name: &str,
     theme: &Theme,
-    font: Option<(&str, f32)>,
+    font: Option<&str>,
+    size: Option<f32>,
     window: Option<WindowSpec>,
 ) -> String {
     let mut out = String::from(
@@ -275,8 +280,11 @@ pub fn write(
          # lines are optional.\n",
     );
     out.push_str(&format!("Name       {name}\n"));
-    if let Some((family, size)) = font {
-        out.push_str(&format!("Font       {family}\nFontSize   {size}\n"));
+    if let Some(family) = font {
+        out.push_str(&format!("Font       {family}\n"));
+    }
+    if let Some(size) = size {
+        out.push_str(&format!("FontSize   {size}\n"));
     }
     out.push_str(&format!("Foreground {}\n", hex(theme.foreground)));
     out.push_str(&format!("Background {}\n", hex(theme.background)));
@@ -388,7 +396,10 @@ pub fn load(dir: &Path) -> Result<Loaded, String> {
                 file,
                 reason: format!("more than {MAX} themes"),
             }),
-            Ok(t) => themes.push(t),
+            Ok(mut t) => {
+                t.path = path;
+                themes.push(t);
+            }
             Err(reason) => broken.push(Broken { file, reason }),
         }
     }
@@ -408,7 +419,8 @@ mod tests {
         let text = write(
             "My Dracula",
             &t,
-            Some(("Cascadia Mono", 11.5)),
+            Some("Cascadia Mono"),
+            Some(11.5),
             Some(WindowSpec::Look(WindowColours::Slate)),
         );
         let back = parse(&text, "file").expect("reads");
@@ -419,9 +431,12 @@ mod tests {
         assert!(back.warnings.is_empty(), "{:?}", back.warnings);
 
         let own = WindowSpec::Colours(Rgb::hex(0xECE5D8), Rgb::hex(0x2A241C), Rgb::hex(0x8C5A1E));
-        let back = parse(&write("My Dracula", &t, None, Some(own)), "file").expect("reads");
+        let back = parse(&write("My Dracula", &t, None, None, Some(own)), "file").expect("reads");
         assert_eq!(back.window, Some(own));
         assert_eq!(back.font, None);
+        // A size alone (a theme file may set only that) stays alone.
+        let back = parse(&write("My Dracula", &t, None, Some(9.0), None), "file").expect("reads");
+        assert_eq!((back.font, back.size), (None, Some(9.0)));
     }
 
     #[test]
