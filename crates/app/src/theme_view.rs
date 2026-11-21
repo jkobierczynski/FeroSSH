@@ -372,7 +372,7 @@ pub fn summary(page: Page, shown: &[&Row], rules: usize) -> String {
             };
             format!(
                 "{rules_text} The first rule that sets a theme, font or size wins; \
-                 a connection's own look beats them all."
+                 a connection's own look beats them all, except what an enforced rule sets."
             )
         }
     }

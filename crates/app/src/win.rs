@@ -4708,6 +4708,9 @@ impl Window {
         self.stop_log(id);
         if let Some(p) = self.panes.get_mut(&id) {
             p.host = Host::Ask(String::new());
+            // The connection's enforced look goes with it; the next one
+            // brings its own.
+            p.lock = look::Lock::default();
             p.desktop = None;
             p.title = None;
             p.cwd = None;
@@ -11253,6 +11256,10 @@ impl Window {
                 shown: None,
                 files: Vec::new(),
             }));
+        }
+        // The enforced font and size too (the lock holds them from now on).
+        if let Some(font) = self.panes.get(&id).map(|p| p.font.clone()) {
+            self.set_font(id, font);
         }
         self.run_diff(id);
         // Keys go to the new tab, not to a tools pane that had them.
