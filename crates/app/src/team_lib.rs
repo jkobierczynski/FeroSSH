@@ -47,13 +47,13 @@ pub fn sig_path(library: &Path) -> PathBuf {
 const MAX_SIG_LEN: usize = 64 * 1024;
 
 /// The checked copy of library `library` in `dir`: one file holding the
-/// signature's length on the first line, the signature, then the library,
-/// so the two are always replaced together. The name carries a hash of
-/// the library's path.
+/// library's path on the first line, the signature's length on the
+/// second, the signature, then the library, so the two are always
+/// replaced together. The name carries a hash of the exact path.
 fn cache_path(dir: &Path, library: &str) -> PathBuf {
     // FNV-1a: stable across builds, unlike the standard hasher.
     let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
-    for b in library.trim().to_lowercase().bytes() {
+    for b in library.trim().bytes() {
         hash ^= u64::from(b);
         hash = hash.wrapping_mul(0x0100_0000_01b3);
     }
@@ -98,7 +98,9 @@ fn keep(
     /// copy's rename.
     static COMMIT: Mutex<()> = Mutex::new(());
     let file = cache_path(cache_dir, library);
-    let mut record = format!("{}\n{sig}", sig.len()).into_bytes();
+    // The library's path first, checked on reading: two paths whose
+    // hashes meet never share a copy.
+    let mut record = format!("{}\n{}\n{sig}", library.trim(), sig.len()).into_bytes();
     record.extend_from_slice(bytes);
     let tmp = write_new(&file, &record, WRITES.fetch_add(1, Ordering::Relaxed))?;
     let _held = COMMIT.lock();
@@ -143,8 +145,17 @@ pub fn cached(library: Option<&str>, keys: &[String], cache_dir: &Path) -> Team 
 
 /// The copy of `library` in `cache_dir`, if it is still good under `keys`.
 fn from_cache(library: &str, keys: &[String], cache_dir: &Path) -> Option<Team> {
-    let record = read_capped(&cache_path(cache_dir, library), MAX_LEN + MAX_SIG_LEN + 32).ok()?;
-    let (len, rest) = record.split_at(record.iter().position(|b| *b == b'\n')?);
+    let record = read_capped(
+        &cache_path(cache_dir, library),
+        MAX_LEN + MAX_SIG_LEN + 32 + library.len(),
+    )
+    .ok()?;
+    let (path, rest) = record.split_at(record.iter().position(|b| *b == b'\n')?);
+    if path != library.trim().as_bytes() {
+        return None;
+    }
+    let rest = rest.get(1..)?;
+    let (len, rest) = rest.split_at(rest.iter().position(|b| *b == b'\n')?);
     let len: usize = std::str::from_utf8(len).ok()?.parse().ok()?;
     let rest = rest.get(1..)?;
     let sig = std::str::from_utf8(rest.get(..len)?).ok()?;
@@ -270,6 +281,10 @@ mod tests {
         assert!(moved.team.is_empty());
         assert!(cached(Some(elsewhere.to_str().unwrap()), &keys, &cache).is_empty());
         assert!(cached(Some(path), &keys, &cache).has("web"));
+        // A path that differs only in case is another file on a
+        // case-sensitive folder: not this copy either.
+        let upper = path.replace("team.ferossh-library", "TEAM.ferossh-library");
+        assert!(cached(Some(&upper), &keys, &cache).is_empty());
         // No library set: nothing, and nothing to say.
         let off = load(None, &keys, &cache, &|| true);
         assert!(off.team.is_empty() && off.note.is_none());
