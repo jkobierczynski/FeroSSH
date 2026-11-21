@@ -1,5 +1,5 @@
-//! A small window that asks for a few lines of text and one check box,
-//! like a message box: Session > tmux > Share this session and Join a
+//! A small window that asks for a few lines of text, a few check boxes
+//! and one more check box below them, like a message box: Session > tmux > Share this session and Join a
 //! shared session. [`ask`] runs it modally over the main window.
 
 #![allow(unsafe_code)]
@@ -27,6 +27,9 @@ use crate::native::{fonts, scale, set_font, wide};
 
 const ID_FIELD: usize = 100;
 const ID_OPTION: usize = 90;
+const ID_CHECK: usize = 200;
+/// Check boxes at most.
+const MAX_CHECKS: usize = 8;
 const SS_NOPREFIX: u32 = 0x80;
 const WIDTH: i32 = 480;
 /// Fields at most.
@@ -40,6 +43,9 @@ pub struct Ask<'a> {
     pub intro: &'a str,
     /// Each field's label and starting text.
     pub fields: &'a [(&'a str, &'a str)],
+    /// Check boxes under the fields, two to a row, and whether each
+    /// starts ticked.
+    pub checks: &'a [(&'a str, bool)],
     /// A check box under the fields, and whether it starts ticked.
     pub option: Option<(&'a str, bool)>,
     pub ok: &'a str,
@@ -50,11 +56,14 @@ pub struct Ask<'a> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Answer {
     pub fields: Vec<String>,
+    /// The check boxes, in order.
+    pub checks: Vec<bool>,
     pub option: bool,
 }
 
 struct State {
     fields: Vec<HWND>,
+    checks: Vec<HWND>,
     option: Option<HWND>,
     done: Option<Option<Answer>>,
 }
@@ -133,6 +142,11 @@ fn set_fonts(dlg: HWND, font: HFONT) {
     }
 }
 
+/// The rows of check boxes, two to a row.
+fn check_rows(ask: &Ask) -> i32 {
+    i32::try_from(ask.checks.len().min(MAX_CHECKS).div_ceil(2)).unwrap_or(0)
+}
+
 /// The intro's height in DIPs: about 18 per line of 64 characters.
 fn intro_height(text: &str) -> i32 {
     let lines: usize = text
@@ -164,6 +178,7 @@ unsafe fn create(owner: HWND, dpi: u32, ask: &Ask) -> windows::core::Result<HWND
         let intro_h = intro_height(ask.intro);
         let fields_top = 12 + intro_h + 8;
         let mut height = fields_top + 36 * i32::try_from(fields.len()).unwrap_or(0);
+        height += 28 * check_rows(ask);
         if ask.option.is_some() {
             height += 30;
         }
@@ -270,6 +285,28 @@ unsafe fn build(
             edits.push(e);
             y += 36;
         }
+        let mut checks = Vec::new();
+        let half = (WIDTH - 24) / 2;
+        for (i, (text, on)) in ask.checks.iter().take(MAX_CHECKS).enumerate() {
+            let col = i32::from(i % 2 == 1);
+            let b = child(
+                WC_BUTTONW,
+                text,
+                WS_TABSTOP.0 | BS_AUTOCHECKBOX as u32,
+                ID_CHECK + i,
+                (12 + col * half, y, half - 8, 24),
+            )?;
+            if *on {
+                SendMessageW(b, BM_SETCHECK, Some(WPARAM(BST_CHECKED.0 as usize)), None);
+            }
+            checks.push(b);
+            if col == 1 {
+                y += 28;
+            }
+        }
+        if checks.len() % 2 == 1 {
+            y += 28;
+        }
         let option = match ask.option {
             Some((text, on)) => {
                 let b = child(
@@ -304,6 +341,7 @@ unsafe fn build(
         STATE.with(|st| {
             *st.borrow_mut() = Some(State {
                 fields: edits,
+                checks,
                 option,
                 done: None,
             });
@@ -323,15 +361,24 @@ fn text_of(hwnd: HWND) -> String {
 }
 
 fn ok() {
-    let Some((fields, option)) = with(|s| (s.fields.clone(), s.option)) else {
+    let Some((fields, checks, option)) = with(|s| (s.fields.clone(), s.checks.clone(), s.option))
+    else {
         return;
     };
     let fields = fields.into_iter().map(text_of).collect();
-    let option = option.is_some_and(|b| {
+    let ticked = |b: HWND| {
         // SAFETY: plain query of our own control.
         unsafe { SendMessageW(b, BM_GETCHECK, None, None) }.0 == BST_CHECKED.0 as isize
+    };
+    let checks = checks.into_iter().map(ticked).collect();
+    let option = option.is_some_and(ticked);
+    with(|s| {
+        s.done = Some(Some(Answer {
+            fields,
+            checks,
+            option,
+        }));
     });
-    with(|s| s.done = Some(Some(Answer { fields, option })));
 }
 
 extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {

@@ -28,6 +28,7 @@ pub enum RailItem {
     KnownHosts,
     Inventory,
     Credentials,
+    SecurityRules,
     Themes,
     /// At the bottom: the command palette.
     Palette,
@@ -37,7 +38,7 @@ pub enum RailItem {
 }
 
 impl RailItem {
-    pub const ALL: [RailItem; 11] = [
+    pub const ALL: [RailItem; 12] = [
         RailItem::Connections,
         RailItem::Sessions,
         RailItem::Files,
@@ -46,6 +47,7 @@ impl RailItem {
         RailItem::KnownHosts,
         RailItem::Inventory,
         RailItem::Credentials,
+        RailItem::SecurityRules,
         RailItem::Themes,
         RailItem::Palette,
         RailItem::Pin,
@@ -62,6 +64,7 @@ impl RailItem {
             RailItem::KnownHosts => "Known hosts",
             RailItem::Inventory => "Inventory",
             RailItem::Credentials => "Credential manager",
+            RailItem::SecurityRules => "Security rules",
             RailItem::Themes => "Theme manager",
             RailItem::Palette => "Command palette",
             RailItem::Pin if pinned => "Tools stay open (click: the terminal covers them again)",
@@ -79,9 +82,10 @@ impl RailItem {
             RailItem::Files => '\u{E8B7}',         // Folder
             RailItem::Forwards => '\u{E8AB}',      // Switch
             RailItem::Snippets => '\u{E943}',      // Code
-            RailItem::KnownHosts => '\u{E72E}',    // Lock
+            RailItem::KnownHosts => '\u{E928}',    // Fingerprint
             RailItem::Inventory => '\u{E8FD}',     // BulletedList
             RailItem::Credentials => '\u{E8D7}',   // Permissions (a key)
+            RailItem::SecurityRules => '\u{E72E}', // Lock
             RailItem::Themes => '\u{E790}',        // Color
             RailItem::Palette => '\u{E721}',       // Search
             RailItem::Pin if pinned => '\u{E840}', // Pinned
@@ -95,7 +99,7 @@ impl RailItem {
 }
 
 /// The tools' buttons, from the top.
-const TOP: [RailItem; 9] = [
+const TOP: [RailItem; 10] = [
     RailItem::Connections,
     RailItem::Sessions,
     RailItem::Files,
@@ -104,6 +108,7 @@ const TOP: [RailItem; 9] = [
     RailItem::KnownHosts,
     RailItem::Inventory,
     RailItem::Credentials,
+    RailItem::SecurityRules,
     RailItem::Themes,
 ];
 
@@ -432,6 +437,10 @@ mod tests {
         );
         assert_eq!(
             item_at(20, 5 + 8 * 35 + 10, 40, 600),
+            Some(RailItem::SecurityRules)
+        );
+        assert_eq!(
+            item_at(20, 5 + 9 * 35 + 10, 40, 600),
             Some(RailItem::Themes)
         );
         assert_eq!(item_at(20, 600 - 5 - 10, 40, 600), Some(RailItem::Pin));

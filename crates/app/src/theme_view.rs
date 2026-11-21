@@ -317,44 +317,6 @@ pub fn delete_question(row: &Row) -> String {
     text
 }
 
-/// Patterns as typed in one field: split at spaces (and commas), with
-/// double quotes around one that has spaces (`lab "my team"`). Control
-/// characters are left out.
-pub fn words(text: &str) -> Vec<String> {
-    let mut out = Vec::new();
-    let mut word = String::new();
-    let mut quoted = false;
-    for c in text.chars().filter(|c| !c.is_control()) {
-        match c {
-            '"' => quoted = !quoted,
-            c if !quoted && (c.is_whitespace() || c == ',') => {
-                out.push(std::mem::take(&mut word));
-            }
-            c => word.push(c),
-        }
-    }
-    out.push(word);
-    out.into_iter()
-        .map(|w| w.trim().to_owned())
-        .filter(|w| !w.is_empty())
-        .collect()
-}
-
-/// Patterns as one field shows them: the other way from [`words`].
-pub fn words_text(list: &[String]) -> String {
-    list.iter()
-        .map(|w| {
-            let w: String = w.chars().filter(|c| !c.is_control() && *c != '"').collect();
-            if w.contains(|c: char| c.is_whitespace() || c == ',') {
-                format!("\"{w}\"")
-            } else {
-                w
-            }
-        })
-        .collect::<Vec<_>>()
-        .join(" ")
-}
-
 /// What the rule form typed: host patterns, tags, theme, font, size.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Typed {
@@ -375,6 +337,7 @@ pub fn check(
     fonts: &[&str],
     installed: impl Fn(&str) -> bool,
 ) -> Result<ThemeRule, String> {
+    use ferossh_config::host_policy::words;
     let theme = typed.theme.trim();
     let theme = if theme.is_empty() {
         String::new()
@@ -589,14 +552,6 @@ mod tests {
         )
         .unwrap();
         assert_eq!(kept.tint, Some(([1, 2, 3], 9)));
-    }
-
-    #[test]
-    fn fields_split_into_words_and_back() {
-        let w = words("lab, \"my team\"  prod*\u{7}");
-        assert_eq!(w, ["lab", "my team", "prod*"]);
-        assert_eq!(words_text(&w), "lab \"my team\" prod*");
-        assert_eq!(words(&words_text(&w)), w);
     }
 
     #[test]

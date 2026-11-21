@@ -92,6 +92,7 @@ Font, theme and text size apply to the focused pane only. Session > Save font an
 | Open scripts folder | | Opens `%APPDATA%\FeroSSH\scripts` in Explorer: one file per script, a folder per category, to copy to another PC or back up (see [The scripts folder](everyday-use.md#the-scripts-folder)). |
 | Command palette | Ctrl+Shift+A | One search box over every menu item, connection and script (see [Command palette](everyday-use.md#the-command-palette)). |
 | Credential manager | | Lists your named credentials and the passwords FeroSSH keeps, each with the connections that use it, to search, add, change, rename and delete (see [The credential manager](everyday-use.md#the-credential-manager)). |
+| Security rules | | Lists the security rules, each with what it matches, its limits and the connections it covers, to search, add, change and delete (see [Security rules](everyday-use.md#security-rules-by-tag-or-folder)). Also the padlock on the tools rail. |
 | Theme manager | | Lists the theme rules (tags or host patterns that pick a theme, font and size), the built-in themes, your own themes and the eighteen fonts, each with the connections that use it, to add, change and delete rules (see [The theme manager](everyday-use.md#the-theme-manager)). Also the palette on the tools rail. |
 | New SSH key... | | Makes an Ed25519 key file (with or without a passphrase) or a security key or Windows Hello key, and offers to copy it to the focused pane's host (see [Making a key](everyday-use.md#making-a-key-and-putting-it-on-a-server)). |
 
@@ -319,6 +320,17 @@ The arrow buttons between the lists move the selection across, and the gap betwe
 | Enter in the list, a double click or Edit... | Changes or renames the picked credential. |
 | New credential... | Makes a credential. |
 | Del or Delete... | Deletes the picked row, after asking. |
+| Escape | Clears the search; with none, gives the keyboard back to the terminal. |
+
+### Security rules
+
+| Key | Action |
+| --- | --- |
+| Typing | Searches tags, folders, hosts, limits and connections; `-word` leaves rows out, `nothing` finds rules that cover no connection. In the list it goes to the search box; Down there moves to the list. |
+| A click on a column heading | Sorts by that column; again for the other way. |
+| Enter in the list, a double click or Edit... | Changes the picked rule. |
+| New rule... | Makes a rule. |
+| Del or Delete... | Deletes the picked rule, after asking. |
 | Escape | Clears the search; with none, gives the keyboard back to the terminal. |
 
 ### Theme manager

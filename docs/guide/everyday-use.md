@@ -150,7 +150,7 @@ File > Reconnect automatically turns this off for all hosts; `AutoReconnect no` 
 
 ## The tools pane
 
-The connection manager, session manager, file transfer, port forwards, scripts and known hosts open in the tools pane at the side of the window. The tools rail along the window's edge has an icon for each, plus the command palette and a pin at the bottom; hover an icon for its name and shortcut. A click opens that tool, and a click on the open tool's icon closes it again.
+The connection manager, session manager, file transfer, port forwards, scripts, known hosts (the fingerprint), inventory (the list), credential manager (the key) and security rules (the padlock) open in the tools pane at the side of the window. The tools rail along the window's edge has an icon for each, plus the command palette and a pin at the bottom; hover an icon for its name and shortcut. A click opens that tool, and a click on the open tool's icon closes it again.
 
 The terminal slides over the tools pane rather than squeezing it. Drag the terminal's edge to cover part of the tool, or all of it so only the rail is left; the tool keeps its width underneath, so nothing in it rewraps. In File transfer, the buttons at the right edge (Bookmarks, Sync, Follow terminal, Layout, Refresh and the path rows' **...**) move left to stay in view, with the boxes beside them getting shorter, until they would run into the host name. When the lists are stacked, the upload and download arrows between them stay centred in the part you can still see, until there is no longer room for both; side by side, they stay where they are. In Port forwards, **Add** (and **Cancel** while editing) moves left the same way, with the connection box getting shorter, and the run report's buttons wrap onto more rows so none hides under the terminal. Drag the edge out from the rail to uncover the last tool again, or past the tool's width to make it wider. A tool you open again shows as much as it did last time.
 
@@ -229,7 +229,15 @@ Every row says what uses it: the connections that pick a credential, the connect
 
 ### Security rules by tag or folder
 
-A security rule limits every connection with a tag, in a folder, or matching a host pattern. It can allow keys only (no password login), keep passwords out of the Windows Credential Manager, turn off agent forwarding, keep the server off your clipboard, ask before connecting, or keep a session log that cannot be turned off. Rules only add limits, and a connection lists the ones that apply when it starts. Write them as `SecurityRule` blocks in `ferossh.conf`; see [Settings](settings.md#security-rules).
+A security rule limits every connection with a tag, in a folder, or matching a host pattern. It can allow keys only (no password login), keep passwords out of the Windows Credential Manager, turn off agent forwarding, keep the server off your clipboard, ask before connecting, or keep a session log that cannot be turned off. Rules only add limits, and a connection lists the ones that apply when it starts.
+
+Tools > Security rules (the padlock on the tools rail) lists, in the tools pane, the rules, each with what it matches, its limits and the saved connections it covers, so a rule that covers nothing, or far too much, stands out. Search with any words (`-word` leaves rows out, and `nothing` finds the rules that cover no connection), and click a column heading to sort by it.
+
+- **New rule...** asks for host patterns, tags and folders (separated by spaces, with quotes around one that has spaces) and the limits to tick.
+- **Edit...** (Enter or a double click) changes a rule.
+- **Delete...** asks first, and names the connections that lose its limits.
+
+Changes apply to connections opened from then on. The rules are `SecurityRule` blocks in `ferossh.conf`, and you can still write them there; see [Settings](settings.md#security-rules).
 
 ### Inventory
 
