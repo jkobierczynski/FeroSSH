@@ -18698,7 +18698,15 @@ impl Window {
         // merges and writes the settings, so neither drops what the other
         // added. (A file of its own, not the vault's lock, which the vault
         // takes itself for each read and write.)
-        let Some(_lock) = crate::vault::lock_file(&settings_path()) else {
+        // With a vault open, the lock is named after the vault, so an
+        // installed and a portable FeroSSH using the same vault wait for
+        // each other too.
+        let lock_on = crate::vault::path().map_or_else(settings_path, |v| {
+            let mut name = v.into_os_string();
+            name.push(".settings");
+            std::path::PathBuf::from(name)
+        });
+        let Some(_lock) = crate::vault::lock_file(&lock_on) else {
             // Saving anyway could write over what the other window is
             // merging in; this window's settings stay as they are and the
             // next save tries again.
