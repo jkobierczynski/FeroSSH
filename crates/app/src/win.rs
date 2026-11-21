@@ -1534,6 +1534,9 @@ struct Window {
     /// Launch sessions shown because they got a security rule warning:
     /// they stay in their tab when the desktop or app takes over.
     launch_warned: HashSet<PaneId>,
+    /// Launch sessions whose desktop waits for the user's yes (a
+    /// security rule asks first): kept until it is answered.
+    desktop_asks: HashSet<PaneId>,
     /// Remote Desktop Connections running on a connection's tunnel: the
     /// connection stays while they run.
     mstsc: Vec<(std::process::Child, ChannelId)>,
@@ -1691,6 +1694,8 @@ struct PendingDesktop {
     port: u16,
     kind: SessionKind,
     user: Option<String>,
+    /// Its ssh_config `Tag`, for the security rules.
+    tag: Option<String>,
     /// Said yes to, when a security rule asks before connecting.
     confirmed: bool,
 }
@@ -2856,6 +2861,7 @@ fn create_and_run(launch: Launch, theme: Option<String>) -> Result<()> {
                 launches: HashMap::new(),
                 launch_hidden: HashSet::new(),
                 launch_warned: HashSet::new(),
+                desktop_asks: HashSet::new(),
                 mstsc: Vec::new(),
                 passwords: Arc::default(),
                 pending_desktops: HashMap::new(),
@@ -16392,6 +16398,7 @@ impl Window {
             port,
             kind,
             user: cfg.user,
+            tag: cfg.tag,
             confirmed: false,
         };
         // Only the desktop or app shows: the SSH login runs in a session
@@ -16472,7 +16479,10 @@ impl Window {
             let Some(Host::Ssh(s)) = self.panes.get(&id).map(|p| &p.host) else {
                 continue;
             };
-            if s.state() != State::Connected || self.pending_desktops.contains_key(&id) {
+            if s.state() != State::Connected
+                || self.pending_desktops.contains_key(&id)
+                || self.desktop_asks.contains(&id)
+            {
                 continue;
             }
             let c = s.connection;
@@ -16523,6 +16533,7 @@ impl Window {
         self.launches.retain(|id, _| panes.contains_key(id));
         self.launch_hidden.retain(|id| panes.contains_key(id));
         self.launch_warned.retain(|id| panes.contains_key(id));
+        self.desktop_asks.retain(|id| panes.contains_key(id));
         if self.mstsc.len() != before {
             self.prune_forwards();
         }
@@ -16583,11 +16594,15 @@ impl Window {
             return;
         }
         let size = self.fixed_desktop_size(&p.label);
-        let rules = self.launch_rules(id, Some((&p.label, Some(&p.host))));
+        // With the desktop's own ssh_config Tag, as a direct one has it.
+        let rules = self
+            .launch_rules(id, Some((&p.label, Some(&p.host))))
+            .tightened(&self.policy_of(&p.label, Some(&p.host), p.tag.as_deref()));
         // The tunnel reaches the desktop itself: a security rule that asks
         // before connecting to it asks here, in a message box, as for a
         // direct Remote Desktop connection.
         if rules.confirm_connect && !p.confirmed {
+            self.desktop_asks.insert(id);
             self.workspace_asks.push(Command::ConfirmDesktop {
                 pane: id,
                 desktop: p,
@@ -25610,6 +25625,7 @@ fn run_command(hwnd: HWND, command: Command) {
             match dialog(hwnd, &question, MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2) {
                 Some(IDYES) => {
                     with_window(|w| {
+                        w.desktop_asks.remove(&pane);
                         w.pending_desktops.insert(
                             pane,
                             PendingDesktop {
@@ -25622,6 +25638,7 @@ fn run_command(hwnd: HWND, command: Command) {
                 }
                 Some(_) => {
                     with_window(|w| {
+                        w.desktop_asks.remove(&pane);
                         w.show(pane, "\x1b[0;90mThe desktop was not opened.\x1b[0m\r\n");
                         w.abandon_launch(pane);
                         w.refresh(pane);
