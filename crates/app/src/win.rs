@@ -7227,8 +7227,21 @@ impl Window {
     /// What the security rules forbid for connection `alias` (reaching
     /// `hostname`, with ssh_config's `Tag` `tag`).
     fn policy_of(&self, alias: &str, hostname: Option<&str>, tag: Option<&str>) -> Policy {
+        self.policy_and_peers(alias, hostname, tag).0
+    }
+
+    /// [`Self::policy_of`], and the other connections to the same machine
+    /// whose rules added to it: rules follow the machine, so an address
+    /// typed by hand or another alias gets a saved connection's tag and
+    /// folder rules too.
+    fn policy_and_peers(
+        &self,
+        alias: &str,
+        hostname: Option<&str>,
+        tag: Option<&str>,
+    ) -> (Policy, Vec<String>) {
         if self.settings.security_rules.is_empty() {
-            return Policy::default();
+            return (Policy::default(), Vec::new());
         }
         let tags = ferossh_config::settings::host_tags(tag, self.settings.profile(alias));
         // The folder the Connection manager shows it in: a FeroSSH
@@ -7248,12 +7261,27 @@ impl Window {
                     .find(|h| h.name.eq_ignore_ascii_case(alias))
                     .and_then(|h| h.folder)
             });
-        self.settings.policy(&Subject {
-            name: alias,
-            hostname,
-            tags: &tags,
-            folder: folder.as_deref(),
-        })
+        let all = self.rule_connections();
+        let others: Vec<Subject<'_>> = all
+            .iter()
+            .map(|c| Subject {
+                name: &c.name,
+                hostname: c.hostname.as_deref(),
+                tags: &c.tags,
+                folder: c.folder.as_deref(),
+            })
+            .collect();
+        let (policy, from) = ferossh_config::host_policy::policy_with_peers(
+            &self.settings.security_rules,
+            &Subject {
+                name: alias,
+                hostname,
+                tags: &tags,
+                folder: folder.as_deref(),
+            },
+            &others,
+        );
+        (policy, from.into_iter().map(str::to_owned).collect())
     }
 
     /// Whether pane `id` may connect to `destination` now. A security
@@ -7489,7 +7517,7 @@ impl Window {
         hostname: &str,
         tag: Option<&str>,
     ) -> Policy {
-        let policy = self.policy_of(alias, Some(hostname), tag);
+        let (policy, peers) = self.policy_and_peers(alias, Some(hostname), tag);
         let Some(p) = self.panes.get_mut(&id) else {
             return policy;
         };
@@ -7501,8 +7529,16 @@ impl Window {
             p.log.enabled = before;
         }
         if !policy.is_empty() {
+            let peers = if peers.is_empty() {
+                String::new()
+            } else {
+                format!(
+                    " (also those of {}, which reaches the same machine)",
+                    crate::ssh::sanitize_line(&peers.join(", "))
+                )
+            };
             let text = format!(
-                "\x1b[0;90mSecurity rules: {}.\x1b[0m\r\n",
+                "\x1b[0;90mSecurity rules: {}{peers}.\x1b[0m\r\n",
                 policy.describe().join(", ")
             );
             self.show(id, &text);
@@ -15730,9 +15766,15 @@ impl Window {
     /// covers, matched as a connection is (its folder as the connection
     /// manager shows it).
     fn rule_rows(&self) -> Vec<crate::rules_view::Row> {
-        use crate::rules_view::{Connection, rows};
+        crate::rules_view::rows(&self.settings.security_rules, &self.rule_connections())
+    }
+
+    /// Every connection the Connection manager lists, as the security
+    /// rules see it.
+    fn rule_connections(&self) -> Vec<crate::rules_view::Connection> {
+        use crate::rules_view::Connection;
         let saved = load_saved();
-        let all: Vec<Connection> = host_items(&ssh_env(), &self.settings)
+        host_items(&ssh_env(), &self.settings)
             .into_iter()
             .map(|h| {
                 let own = saved
@@ -15746,8 +15788,7 @@ impl Window {
                     tags: h.tags,
                 }
             })
-            .collect();
-        rows(&self.settings.security_rules, &all)
+            .collect()
     }
 
     /// The menu item that puts theme or font `row` on the pane: Settings
