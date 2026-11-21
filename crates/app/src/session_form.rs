@@ -365,7 +365,7 @@ impl Field {
             Field::Clipboard => "App clip",
             Field::DeskClipboard => "Desk clip",
             Field::Legacy => "Old crypto",
-            Field::SystemInfo => "Inventory",
+            Field::SystemInfo => "Log OS",
             Field::WinrmHttps => "Transport",
             Field::ForwardAgent => "Fwd agent",
             Field::Kerberos => "Kerberos",

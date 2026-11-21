@@ -542,10 +542,12 @@ mod cmd {
     pub const FULL_SCREEN_KEY: u32 = 219;
     /// Tools > Known hosts.
     pub const KNOWN_HOSTS: u32 = 220;
-    /// Tools > Inventory.
+    /// Tools > Connection log.
     pub const INVENTORY: u32 = 222;
     /// Tools > Hosts.
     pub const HOSTS: u32 = 682;
+    /// Settings > Allow deleting connection log entries.
+    pub const CONNECTION_LOG_DELETE: u32 = 683;
     /// Settings > Font ligatures.
     pub const FONT_LIGATURES: u32 = 221;
     /// Settings > Server status bar.
@@ -3372,7 +3374,7 @@ fn build_menu() -> Result<HMENU> {
         item(tools, cmd::FORWARDS, "&Port forwards\tCtrl+Shift+P")?;
         item(tools, cmd::SNIPPETS, "Sc&ripts\tCtrl+Shift+Space")?;
         item(tools, cmd::KNOWN_HOSTS, "Known &hosts\tCtrl+Shift+K")?;
-        item(tools, cmd::INVENTORY, "&Inventory\tCtrl+Shift+I")?;
+        item(tools, cmd::INVENTORY, "Connection &log\tCtrl+Shift+I")?;
         item(tools, cmd::HOSTS, "Ho&sts")?;
         item(tools, cmd::SNIPPET_FOLDER, "Open scripts f&older")?;
         separator(tools)?;
@@ -3456,6 +3458,12 @@ fn build_menu() -> Result<HMENU> {
         )?;
         item(view, cmd::FULL_SCREEN, "F&ull screen\tF11")?;
         item(view, cmd::FULL_SCREEN_KEY, "F11 switches full scree&n")?;
+        separator(view)?;
+        item(
+            view,
+            cmd::CONNECTION_LOG_DELETE,
+            "Allow deleting connection log entries",
+        )?;
         separator(view)?;
         item(view, cmd::KEY_BINDINGS, "Key bin&dings...")?;
         let links = CreatePopupMenu()?;
@@ -5765,7 +5773,7 @@ impl Window {
         if let Err(e) = result {
             self.inventory_pending = fixes;
             self.queued.push(Command::Notice(format!(
-                "Could not update the inventory: {e}"
+                "Could not update the connection log: {e}"
             )));
         }
     }
@@ -12227,13 +12235,17 @@ impl Window {
         let inventory = match crate::inventory_view::read() {
             Ok(inventory) => inventory,
             Err(e) => {
-                inventory_panel::set_status(format!("Could not read the inventory: {e}"));
+                inventory_panel::set_status(format!("Could not read the connection log: {e}"));
                 return;
             }
         };
         let items = host_items(&ssh_env(), &self.settings);
         let rows = crate::inventory_view::rows(&items, &inventory, &self.settings);
-        inventory_panel::set_rows(rows, self.download_dir());
+        inventory_panel::set_rows(
+            rows,
+            self.download_dir(),
+            self.settings.connection_log_delete,
+        );
     }
 
     /// Whether the inventory shows (always native controls).
@@ -12248,7 +12260,7 @@ impl Window {
         let inventory = match crate::inventory_view::read() {
             Ok(inventory) => inventory,
             Err(e) => {
-                hosts_panel::set_status(format!("Could not read the inventory: {e}"));
+                hosts_panel::set_status(format!("Could not read the connection log: {e}"));
                 return;
             }
         };
@@ -18661,6 +18673,16 @@ impl Window {
                 self.save_settings();
                 self.update_menu_checks();
             }
+            cmd::CONNECTION_LOG_DELETE => {
+                self.settings.connection_log_delete = !self.settings.connection_log_delete;
+                self.save_settings();
+                self.update_menu_checks();
+                if self.inventory_native() {
+                    // Delete... shows or goes.
+                    self.reload_inventory();
+                    self.refresh_chrome();
+                }
+            }
             cmd::FONT_LIGATURES => {
                 self.settings.font_ligatures = !self.settings.font_ligatures;
                 self.save_settings();
@@ -20027,6 +20049,7 @@ impl Window {
                 (cmd::FULL_SCREEN, self.full_screen.is_some()),
                 (cmd::FULL_SCREEN_KEY, s.full_screen_key),
                 (cmd::FONT_LIGATURES, s.font_ligatures),
+                (cmd::CONNECTION_LOG_DELETE, s.connection_log_delete),
                 (cmd::TMUX_KEYS, s.tmux_keys),
                 (cmd::RECORD_SNIPPET, self.recording.is_some()),
                 (
@@ -23491,6 +23514,27 @@ fn inventory_event(hwnd: HWND, event: inventory_panel::Event) {
                 w.reload_inventory();
                 w.refresh_chrome();
             });
+        }
+        Event::Delete(name) => {
+            if with_window(|w| w.settings.connection_log_delete) != Some(true) {
+                return;
+            }
+            let question = format!(
+                "Forget what the connection log holds about {}: when you last connected, the \
+                 host key it showed, and its OS and kernel? The connection itself stays; the \
+                 next login logs it again.",
+                crate::ssh::sanitize_line(&name)
+            );
+            if dialog(hwnd, &question, MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2) != Some(IDYES) {
+                return;
+            }
+            let next = with_window(|w| {
+                w.update_inventory(Some(InventoryFix::Remove(vec![name])), |_| {});
+                w.reload_inventory();
+                std::mem::take(&mut w.queued)
+            })
+            .unwrap_or_default();
+            run_commands(hwnd, next);
         }
         Event::Focused => tools_focused(),
         Event::Leave => {

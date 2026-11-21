@@ -23,6 +23,7 @@ FeroSSH reads `~/.ssh/config` and `~/.ssh/known_hosts` too, and writes only to `
 | `Notifications yes` | no | Tab badges and Windows notifications when a pane asks for attention. Settings > Desktop notifications. |
 | `NotifyBell no` | yes | Whether the bell counts as asking for attention. Settings > Notify on the bell too. |
 | `AgentCommand claude --model opus` | claude, codex, aider | One coding agent command for Session > Coding agents, typed at the server's shell exactly as written (the rest of the line, quotes and `#` included). Repeat the line for more, up to 16, in menu order; any non-empty line replaces the built-in three; empty lines and lines with control characters are ignored. |
+| `ConnectionLogDelete yes` | no | Tools > Connection log offers Delete..., which forgets what the log holds about one connection. Settings > Allow deleting connection log entries. |
 | `FontLigatures yes` | no | Joins programming ligatures (`->`, `!=`, `===`) in fonts that have them, in every terminal pane. Settings > Font ligatures. |
 | `FullScreenKey no` | yes | Whether F11 switches full screen (Settings > F11 switches full screen). Off, F11 goes to the terminal. |
 | `KeyBinding 213 Ctrl+K` | | The keys of one action, by its menu command number, written by Settings > Key bindings for the actions you changed: none after the number means no shortcut. Keys are spelled as for `StandbyHotkey` (`Ctrl+Shift+PageUp`, `Alt+Shift+OemPlus`); Win is not allowed. Actions with no `KeyBinding` line keep their default keys. |
@@ -117,7 +118,7 @@ Profile web1
 | `FontSize N` | Text size in points. |
 | `Theme NAME` | Colour theme, for example `Nord`, `Dracula` or `Production`. |
 | `Tags TAG...` | The connection's own tags (Tags in the connection form), separated by spaces: shown and searched in the connection manager and matched by theme rules, on top of ssh_config's `Tag`. Up to 16, each up to 32 letters, digits, `-`, `_`, `.`, `/` and `:`; others are left out. |
-| `SystemInfo yes` | After each SSH login, reads the server's OS and kernel for the [inventory](everyday-use.md#inventory) (Inventory in the connection form's Extras). |
+| `SystemInfo yes` | After each SSH login, reads the server's OS and kernel for the [connection log](everyday-use.md#connection-log) (Log OS in the connection form's Extras). |
 | `Credential NAME` | The named credential the connection uses (see [Credentials](#credentials)): its user, key file and password source win over the connection's own. |
 | `Scrollback N` | Lines of scrollback for this host's panes. |
 | `Tmux SESSION` | Attaches to this tmux session after every login. `off`, `no` or `none` (or leaving it out) means no tmux; `on`, `yes` or `true` attaches to `main`. |

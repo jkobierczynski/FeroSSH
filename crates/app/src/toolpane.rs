@@ -63,7 +63,7 @@ impl RailItem {
             RailItem::Forwards => "Port forwards",
             RailItem::Snippets => "Scripts",
             RailItem::KnownHosts => "Known hosts",
-            RailItem::Inventory => "Inventory",
+            RailItem::Inventory => "Connection log",
             RailItem::Credentials => "Credential manager",
             RailItem::SecurityRules => "Security rules",
             RailItem::Palette => "Command palette",
