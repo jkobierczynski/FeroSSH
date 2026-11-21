@@ -20211,9 +20211,10 @@ impl Window {
         edited: &Theme,
         path: &Path,
         name: &str,
+        in_place: bool,
     ) -> std::result::Result<String, String> {
         let mut own = self.custom_named(original.name).cloned();
-        if name == original.name {
+        if in_place {
             // Saved over its file: the font and window lines as the file
             // has them now, and not over colours changed there meanwhile.
             let now = std::fs::read_to_string(path)
@@ -20251,6 +20252,7 @@ impl Window {
             .custom_named(name)
             .map_or_else(|| edited.clone(), |c| c.theme.clone());
         let mut shown = 0;
+        let mut unsaved = String::new();
         // The theme this file held before (the edited one for Save, or the
         // one a Save as replaced): its copies take the new colours.
         if let Some(before) = before {
@@ -20270,9 +20272,21 @@ impl Window {
             for id in &ids {
                 self.set_theme(*id, saved.clone());
             }
-            // New tabs too, when it is the default theme.
+            // New tabs too, when it is the default theme; and the saved
+            // default follows a Save as that renamed it.
             if self.default_theme == before {
                 self.default_theme = saved.clone();
+                if before.name != name
+                    && self.settings.default_theme.as_deref() == Some(before.name)
+                {
+                    self.settings.default_theme = Some(name.to_owned());
+                    if let Err(e) = self.try_save_settings() {
+                        unsaved = format!(
+                            " New tabs use it now, but the settings could not be saved, so \
+                             the next start uses the old default ({e})."
+                        );
+                    }
+                }
             }
             shown = ids.len();
             if shown > 0 {
@@ -20288,12 +20302,15 @@ impl Window {
             1 => " The pane showing it has the new colours.".to_owned(),
             n => format!(" The {n} panes showing it have the new colours."),
         };
-        Ok(if name == original.name {
-            format!("Saved the colours of {name} to {}.{panes}", path.display())
+        Ok(if in_place {
+            format!(
+                "Saved the colours of {name} to {}.{panes}{unsaved}",
+                path.display()
+            )
         } else {
             format!(
                 "Saved the theme {name} to {}.{panes} It is in the Theme manager and \
-                 Settings > Custom themes; Apply to this pane puts it on a pane.",
+                 Settings > Custom themes; Apply to this pane puts it on a pane.{unsaved}",
                 path.display()
             )
         })
@@ -26777,12 +26794,12 @@ fn edit_colours(hwnd: HWND, name: &str) {
             return;
         };
         now = edited;
-        let (path, new_name) = match (choice, &file) {
+        let (path, new_name, in_place) = match (choice, &file) {
             (Choice::Save, Some(file)) if can_save => {
                 if now == original {
                     return;
                 }
-                (file.clone(), original.name.to_owned())
+                (file.clone(), original.name.to_owned(), true)
             }
             _ => {
                 let suggested = crate::colour_edit::suggested_name(original.name);
@@ -26834,7 +26851,7 @@ fn edit_colours(hwnd: HWND, name: &str) {
                     }
                 };
                 match refused {
-                    Ok(n) => (path, n),
+                    Ok(n) => (path, n, false),
                     Err(text) => {
                         dialog(hwnd, &text, MB_OK | MB_ICONWARNING);
                         continue;
@@ -26842,7 +26859,7 @@ fn edit_colours(hwnd: HWND, name: &str) {
                 }
             }
         };
-        match with_window(|w| w.save_edited_colours(&original, &now, &path, &new_name)) {
+        match with_window(|w| w.save_edited_colours(&original, &now, &path, &new_name, in_place)) {
             Some(Ok(text)) => {
                 dialog(hwnd, &text, MB_OK | MB_ICONINFORMATION);
                 return;
