@@ -19856,7 +19856,11 @@ impl Window {
         };
         // A choice applies to the focused pane: a preview on another one
         // (focus moved meanwhile) goes back.
-        let chosen = chosen.filter(|_| self.focused_id() == p.pane);
+        // A pick an enforced theme rule refuses is no choice: what the
+        // preview showed goes back (window colours included).
+        let chosen = chosen
+            .filter(|_| self.focused_id() == p.pane)
+            .filter(|id| self.look_refused(p.pane, *id).is_none());
         let back = |by: Option<u32>| by.is_some() && by != chosen;
         // Only what the preview itself shows goes back.
         let theme_now = self.panes.get(&p.pane).map(|x| &x.theme);
