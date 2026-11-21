@@ -361,6 +361,29 @@ struct Plan {
     reviews: Vec<bundle::Review>,
 }
 
+/// Our own copy (or none) of each named credential the import brings,
+/// so a change to any of them while the question was open is asked
+/// about again, even when the count of replaced ones stays the same.
+fn credentials_replaced(
+    incoming: &Bundle,
+    current: &Settings,
+) -> Vec<Option<ferossh_config::settings::Credential>> {
+    let Some(theirs) = incoming.file("ferossh.conf") else {
+        return Vec::new();
+    };
+    Settings::parse(theirs)
+        .credentials
+        .iter()
+        .map(|c| {
+            current
+                .credentials
+                .iter()
+                .find(|l| l.name.eq_ignore_ascii_case(&c.name))
+                .cloned()
+        })
+        .collect()
+}
+
 fn plan(incoming: &Bundle, current: &Settings) -> Plan {
     let mut plan = Plan {
         files: Vec::new(),
@@ -546,13 +569,14 @@ pub(super) fn import(hwnd: HWND) {
     // PC (through a shared vault) may have changed them while the
     // question was open. What that changes is shown and asked about
     // again before anything is written.
-    let mut approved = (plan.reviews, plan.profiles.credentials);
+    let mut approved = (plan.reviews, credentials_replaced(&incoming, &current));
     let plan = loop {
         let Some(current) = with_window(|w| w.settings.clone()) else {
             return;
         };
         let plan = self::plan(&incoming, &current);
-        if plan.reviews == approved.0 && plan.profiles.credentials == approved.1 {
+        let replaced = credentials_replaced(&incoming, &current);
+        if plan.reviews == approved.0 && replaced == approved.1 {
             break plan;
         }
         let mut changes = reviews_text(&plan.reviews);
@@ -576,7 +600,7 @@ pub(super) fn import(hwnd: HWND) {
         if dialog(hwnd, &question, MB_YESNO | MB_ICONINFORMATION) != Some(IDYES) {
             return;
         }
-        approved = (plan.reviews, plan.profiles.credentials);
+        approved = (plan.reviews, replaced);
     };
     let mut problems = Vec::new();
     for (p, t) in &plan.files {
