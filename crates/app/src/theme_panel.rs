@@ -445,14 +445,18 @@ fn set_state(list: HWND, index: usize) {
     }
 }
 
-/// Which row it is, across a reload: its group and place.
-fn key(row: &Row) -> (Group, usize) {
-    (row.group, row.index)
+/// Which row it is, across a reload: a rule by what it is (its place
+/// may change when another rule goes), a theme or font by its name.
+fn key(row: &Row) -> (Group, String) {
+    match &row.rule {
+        Some(rule) => (row.group, format!("{rule:?}")),
+        None => (row.group, row.name.clone()),
+    }
 }
 
 /// The rows the search keeps, in the chosen order and their groups, and
 /// the summary; the row `keep` stays picked, else the first row is.
-fn fill(keep: Option<(Group, usize)>) {
+fn fill(keep: Option<(Group, String)>) {
     let Some((h, cells, names)) = with(|s| {
         let query = search_text(s.h.search);
         let mut shown = view::filter(&s.rows, &query);
@@ -475,7 +479,7 @@ fn fill(keep: Option<(Group, usize)>) {
                 )
             })
             .collect();
-        let names: Vec<(Group, usize)> = shown.iter().map(|r| key(r)).collect();
+        let names: Vec<(Group, String)> = shown.iter().map(|r| key(r)).collect();
         (s.h, cells, names)
     }) else {
         return;
@@ -543,7 +547,7 @@ fn fill(keep: Option<(Group, usize)>) {
         let _ = InvalidateRect(Some(h.panel), None, false);
     }
     let at = keep
-        .and_then(|k| names.iter().position(|&n| n == k))
+        .and_then(|k| names.iter().position(|n| *n == k))
         .or((!names.is_empty()).then_some(0));
     if let Some(i) = at {
         set_state(h.list, i);

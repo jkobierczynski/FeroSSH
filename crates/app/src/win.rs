@@ -12245,6 +12245,12 @@ impl Window {
     /// settings file first, as a save would.
     fn reload_themes(&mut self) {
         self.pull_vault_settings();
+        // The themes folder too, so a theme file copied in shows (and a
+        // rule may name it); if it cannot be read, the themes known
+        // before stay, and Settings > Custom themes says why.
+        if let Ok((themes, _)) = load_custom_themes() {
+            self.custom_themes = themes;
+        }
         theme_panel::set_rows(self.theme_rows());
     }
 

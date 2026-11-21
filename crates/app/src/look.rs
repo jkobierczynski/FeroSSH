@@ -31,9 +31,7 @@ pub fn for_host(
         .and_then(|p| p.theme.as_deref())
         .and_then(Theme::by_name)
         .or_else(|| {
-            let rule = rules
-                .rule_for(alias, &tags)
-                .or_else(|| rules.rule_for(hostname, &tags))?;
+            let rule = rules.rule_for_any(&[alias, hostname], &tags)?;
             let theme = Theme::by_name(&rule.theme)?;
             Some(match rule.tint {
                 Some(([r, g, b], amount)) => theme.tinted(Rgb::new(r, g, b), amount),
@@ -57,17 +55,15 @@ pub fn own_font(
     let all = ferossh_config::settings::host_tags(tag, profile);
     let tags: Vec<&str> = all.iter().map(String::as_str).collect();
     let rules = settings.host_themes();
-    let family = profile.and_then(|p| p.font.clone()).or_else(|| {
-        rules
-            .font_for(alias, &tags)
-            .or_else(|| rules.font_for(hostname, &tags))
-            .map(str::to_owned)
-    });
-    let size = profile.and_then(|p| p.font_size).or_else(|| {
-        rules
-            .font_size_for(alias, &tags)
-            .or_else(|| rules.font_size_for(hostname, &tags))
-    });
+    // One scan in rule order over both names: the first rule that sets
+    // each wins, whichever name it matched.
+    let names = [alias, hostname];
+    let family = profile
+        .and_then(|p| p.font.clone())
+        .or_else(|| rules.font_for(&names, &tags).map(str::to_owned));
+    let size = profile
+        .and_then(|p| p.font_size)
+        .or_else(|| rules.font_size_for(&names, &tags));
     (family, size)
 }
 
@@ -169,5 +165,35 @@ Profile db
         let (font, _) = look("own");
         assert_eq!((font.family.as_str(), font.size_pt), ("Consolas", 14.0));
         assert_eq!(own_font(&s, "other", "x", None), (None, None));
+    }
+
+    #[test]
+    fn the_first_rule_wins_whichever_name_or_tag_it_matched() {
+        let s = Settings::parse(
+            "ThemeRule\n    Hosts *.corp.example\n    Theme Dracula\n    Font Hack\n    FontSize 14\n\
+             ThemeRule\n    Tags lab\n    Theme Nord\n    Font Consolas\n    FontSize 12\n\
+             Profile box\n    Tags lab\n",
+        );
+        let look = |alias, hostname| {
+            for_host(
+                &s,
+                alias,
+                hostname,
+                None,
+                &FontSpec::default(),
+                &Theme::default(),
+            )
+        };
+        let (font, theme) = look("box", "db.corp.example");
+        assert_eq!((font.family.as_str(), font.size_pt), ("Hack", 14.0));
+        assert_eq!(theme.name, "Dracula", "rule 1 matched the host name first");
+        let (font, theme) = look("box", "10.0.0.1");
+        assert_eq!((font.family.as_str(), theme.name), ("Consolas", "Nord"));
+        let (font, theme) = look("x.corp.example", "10.0.0.1");
+        assert_eq!(
+            (font.family.as_str(), theme.name),
+            ("Hack", "Dracula"),
+            "by alias"
+        );
     }
 }

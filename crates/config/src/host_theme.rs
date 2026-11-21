@@ -134,31 +134,38 @@ impl HostThemes {
     /// The first rule that sets a theme for a host and its tags, if
     /// any (a rule that only sets a font is passed over).
     pub fn rule_for(&self, host: &str, tags: &[&str]) -> Option<&ThemeRule> {
-        self.first(host, tags, |r| !r.theme.is_empty())
+        self.rule_for_any(&[host], tags)
+    }
+
+    /// As [`HostThemes::rule_for`], for a host known by several names
+    /// (the alias picked and the host name it goes to): one scan in rule
+    /// order, so an earlier rule matching any name wins.
+    pub fn rule_for_any(&self, hosts: &[&str], tags: &[&str]) -> Option<&ThemeRule> {
+        self.first(hosts, tags, |r| !r.theme.is_empty())
     }
 
     /// The font family the first matching rule that sets one gives.
-    pub fn font_for(&self, host: &str, tags: &[&str]) -> Option<&str> {
-        self.first(host, tags, |r| r.font.is_some())
+    pub fn font_for(&self, hosts: &[&str], tags: &[&str]) -> Option<&str> {
+        self.first(hosts, tags, |r| r.font.is_some())
             .and_then(|r| r.font.as_deref())
     }
 
     /// The font size the first matching rule that sets one gives.
-    pub fn font_size_for(&self, host: &str, tags: &[&str]) -> Option<f32> {
-        self.first(host, tags, |r| r.font_size.is_some())
+    pub fn font_size_for(&self, hosts: &[&str], tags: &[&str]) -> Option<f32> {
+        self.first(hosts, tags, |r| r.font_size.is_some())
             .and_then(|r| r.font_size)
     }
 
     fn first(
         &self,
-        host: &str,
+        hosts: &[&str],
         tags: &[&str],
         sets: impl Fn(&ThemeRule) -> bool,
     ) -> Option<&ThemeRule> {
         self.rules
             .iter()
             .chain(builtin_rules())
-            .find(|r| sets(r) && r.matches(host, tags))
+            .find(|r| sets(r) && hosts.iter().any(|h| r.matches(h, tags)))
     }
 
     /// The built-in tag rules, after the user's.
@@ -249,11 +256,11 @@ mod tests {
             Some("Dracula"),
             "the font-only rule is passed over"
         );
-        assert_eq!(t.font_for("x", &["lab"]), Some("Consolas"));
-        assert_eq!(t.font_size_for("x", &["lab"]), Some(13.0));
-        assert_eq!(t.font_for("x", &["web"]), Some("Hack"));
+        assert_eq!(t.font_for(&["x"], &["lab"]), Some("Consolas"));
+        assert_eq!(t.font_size_for(&["x"], &["lab"]), Some(13.0));
+        assert_eq!(t.font_for(&["x"], &["web"]), Some("Hack"));
         assert_eq!(
-            t.font_for("x", &["prod"]),
+            t.font_for(&["x"], &["prod"]),
             None,
             "built-in rules set no font"
         );
