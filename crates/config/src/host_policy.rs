@@ -89,6 +89,18 @@ impl Policy {
         self
     }
 
+    /// A connection's clipboard limit (`both`, `to-host`, `from-host`,
+    /// `off`; unset is both) as these limits leave it: under `Clipboard
+    /// no` nothing comes from the host, so a desktop or remote app may at
+    /// most send text to it.
+    pub fn clipboard_limit(&self, way: Option<&str>) -> Option<String> {
+        if !self.no_clipboard {
+            return way.map(str::to_owned);
+        }
+        let (to_host, _) = crate::settings::clipboard_ways(way);
+        Some(if to_host { "to-host" } else { "off" }.to_owned())
+    }
+
     /// The limits in words, for the line a connection shows.
     pub fn describe(&self) -> Vec<&'static str> {
         [
@@ -346,5 +358,33 @@ mod tests {
             ..Policy::default()
         };
         assert_eq!(keys.allow_source(cmd), PasswordSource::Ask);
+    }
+
+    #[test]
+    fn no_clipboard_leaves_only_text_to_the_host() {
+        let free = Policy::default();
+        assert_eq!(free.clipboard_limit(None), None);
+        assert_eq!(
+            free.clipboard_limit(Some("from-host")).as_deref(),
+            Some("from-host")
+        );
+        let rule = Policy {
+            no_clipboard: true,
+            ..Policy::default()
+        };
+        assert_eq!(rule.clipboard_limit(None).as_deref(), Some("to-host"));
+        assert_eq!(
+            rule.clipboard_limit(Some("Both")).as_deref(),
+            Some("to-host")
+        );
+        assert_eq!(
+            rule.clipboard_limit(Some("from-host")).as_deref(),
+            Some("off")
+        );
+        assert_eq!(rule.clipboard_limit(Some("off")).as_deref(), Some("off"));
+        assert_eq!(
+            crate::settings::clipboard_ways(rule.clipboard_limit(Some("to-host")).as_deref()),
+            (true, false)
+        );
     }
 }

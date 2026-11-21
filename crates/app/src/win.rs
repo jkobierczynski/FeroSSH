@@ -5387,7 +5387,7 @@ impl Window {
         let profile = self.settings.profile(&s.target.alias);
         let label = s.target.label();
         let size = self.fixed_desktop_size(&s.target.alias);
-        let clip_limit = self.desktop_clip_limit(&[&s.target.alias]);
+        let clip_limit = self.desktop_clip_limit(&[&s.target.alias], self.launch_rules(pane, None));
         let rdp_port = profile
             .and_then(|p| p.desktop_port)
             .unwrap_or(DEFAULT_DESKTOP_PORT);
@@ -5559,12 +5559,29 @@ impl Window {
     /// The most the connections `names` let copied text travel to and
     /// from their desktops: each connection's `DesktopClipboard` only
     /// narrows it.
-    fn desktop_clip_limit(&self, names: &[&str]) -> (bool, bool) {
-        names
+    fn desktop_clip_limit(&self, names: &[&str], rules: Policy) -> (bool, bool) {
+        let (to_host, from_host) = names
             .iter()
             .filter_map(|n| self.settings.profile(n))
             .map(|p| ferossh_config::settings::clipboard_ways(p.desktop_clipboard.as_deref()))
-            .fold((true, true), |(a, b), (x, y)| (a && x, b && y))
+            .fold((true, true), |(a, b), (x, y)| (a && x, b && y));
+        // A security rule's `Clipboard no`: nothing from the host.
+        (to_host, from_host && !rules.no_clipboard)
+    }
+
+    /// The security rules on pane `pane`'s connection, with those of
+    /// connection `from` (a saved desktop or remote app opened through
+    /// it, reaching `hostname`) added.
+    fn launch_rules(&self, pane: PaneId, from: Option<(&str, Option<&str>)>) -> Policy {
+        let own = self
+            .panes
+            .get(&self.host_pane(pane))
+            .map(|p| p.policy)
+            .unwrap_or_default();
+        match from {
+            Some((name, hostname)) => own.tightened(&self.policy_of(name, hostname, None)),
+            None => own,
+        }
     }
 
     /// Which ways copied text travels for a desktop: the global
@@ -6007,7 +6024,8 @@ impl Window {
         });
         let follow = fixed.is_none();
         let password = vdesk::password();
-        let clip_limit = self.desktop_clip_limit(&[&alias, &s.target.alias]);
+        let rules = self.launch_rules(pane, from.map(|f| (f, None)));
+        let clip_limit = self.desktop_clip_limit(&[&alias, &s.target.alias], rules);
         let (to_host, from_host) = self.desktop_clip(clip_limit);
         let clip = vdesk::Clip {
             to_host,
@@ -6160,7 +6178,10 @@ impl Window {
                 )));
             }
         };
-        let clip_limit = own.and_then(|p| p.remote_app_clipboard.clone());
+        // A security rule's `Clipboard no` lets nothing come from the host.
+        let clip_limit = self
+            .launch_rules(pane, from.map(|f| (f, None)))
+            .clipboard_limit(own.and_then(|p| p.remote_app_clipboard.as_deref()));
         let clipboard = crate::stream::app_clipboard(&self.settings, clip_limit.as_deref());
         let files = if copy {
             crate::remote_app::agent_files()
@@ -16195,14 +16216,15 @@ impl Window {
             } else {
                 format!("{host}:{port}")
             };
-            let clipboard = self.desktop_clip(self.desktop_clip_limit(&[name])) == (true, true);
+            let rules = self.policy_of(name, Some(&host), cfg.tag.as_deref());
+            // Remote Desktop Connection shares the clipboard both ways or
+            // not at all: `Clipboard no` turns it off.
+            let clipboard =
+                self.desktop_clip(self.desktop_clip_limit(&[name], rules)) == (true, true);
             let size = self.fixed_desktop_size(name);
             // No pane to ask in: a security rule that asks before
             // connecting asks in a message box before mstsc starts.
-            if self
-                .policy_of(name, Some(&host), cfg.tag.as_deref())
-                .confirm_connect
-            {
+            if rules.confirm_connect {
                 self.workspace_asks.push(Command::ConfirmRdp {
                     name: name.to_owned(),
                     addr,
@@ -16438,7 +16460,8 @@ impl Window {
             return;
         }
         let size = self.fixed_desktop_size(&p.label);
-        let clip_limit = self.desktop_clip_limit(&[&p.label, &s.target.alias]);
+        let rules = self.launch_rules(id, Some((&p.label, Some(&p.host))));
+        let clip_limit = self.desktop_clip_limit(&[&p.label, &s.target.alias], rules);
         let (local, want) = match p.kind {
             SessionKind::Vnc => (
                 0,
