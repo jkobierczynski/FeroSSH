@@ -585,6 +585,255 @@ pub fn merge_logins3(
     (profiles, credentials)
 }
 
+/// What an import changes in one connection, worth reading before saying
+/// yes: a changed address, route or host key check, forwarding turned on,
+/// and what the import left as it was here.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Review {
+    pub name: String,
+    pub notes: Vec<String>,
+}
+
+/// Adds `note` to the review for `name` in `reviews`.
+fn review(reviews: &mut Vec<Review>, name: &str, note: String) {
+    match reviews
+        .iter_mut()
+        .find(|r| r.name.eq_ignore_ascii_case(name))
+    {
+        Some(r) => r.notes.push(note),
+        None => reviews.push(Review {
+            name: name.to_owned(),
+            notes: vec![note],
+        }),
+    }
+}
+
+/// The keywords of a `Host` block whose change an import shows: where the
+/// connection goes, how it gets there and how its host key is checked.
+const WATCHED: [&str; 11] = [
+    "hostname",
+    "port",
+    "user",
+    "proxyjump",
+    "proxycommand",
+    "forwardagent",
+    "forwardx11",
+    "forwardx11trusted",
+    "userknownhostsfile",
+    "globalknownhostsfile",
+    "identityfile",
+];
+
+/// A block's first value for each keyword in [`WATCHED`] (ssh_config
+/// takes the first), lowercase keyword to the rest of the line.
+fn watched(text: &str) -> Vec<(String, String)> {
+    let mut out: Vec<(String, String)> = Vec::new();
+    for line in text.lines().skip_while(|l| !is_host_line(l)).skip(1) {
+        let t = line.trim();
+        if t.is_empty() || t.starts_with('#') {
+            continue;
+        }
+        let Some((k, v)) = keyword_value(t) else {
+            continue;
+        };
+        if k == "match" {
+            break;
+        }
+        if WATCHED.contains(&k.as_str()) && !out.iter().any(|(x, _)| *x == k) {
+            out.push((k, v));
+        }
+    }
+    out
+}
+
+fn is_host_line(line: &str) -> bool {
+    keyword_value(line.trim()).is_some_and(|(k, _)| k == "host")
+}
+
+/// A config line's keyword (lowercase) and the rest, `=` or spaces
+/// between.
+fn keyword_value(line: &str) -> Option<(String, String)> {
+    let end = line.find(|c: char| c.is_whitespace() || c == '=')?;
+    let (k, rest) = line.split_at(end);
+    let v = rest.trim_start_matches(|c: char| c.is_whitespace() || c == '=');
+    Some((k.to_ascii_lowercase(), v.trim().to_owned()))
+}
+
+/// Whether a `StrictHostKeyChecking` value trusts a new key without
+/// asking.
+fn trusts_any_key(value: &str) -> bool {
+    let v = value
+        .split_whitespace()
+        .next()
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    matches!(v.as_str(), "no" | "off" | "accept-new")
+}
+
+/// `incoming`'s `Host` blocks for an import into `local`
+/// ([`merge_hosts`] after this), made safe and with what changes said:
+///
+/// - a `StrictHostKeyChecking` that trusts new keys without asking is
+///   left out, unless `local`'s block of the name has that very line;
+/// - a block replacing one of ours keeps our folder (the comments right
+///   above its `Host` line);
+/// - for a block replacing one of ours, each changed address, route,
+///   forwarding, key file or known_hosts file is named.
+pub fn import_hosts(local: &str, incoming: &str) -> (String, Vec<Review>) {
+    let (_, ours) = host_blocks(local);
+    let (in_head, theirs) = host_blocks(incoming);
+    let mut reviews = Vec::new();
+    let mut out = in_head;
+    for b in theirs {
+        let name = b.key.clone();
+        let mine = ours.iter().find(|o| o.key == b.key);
+        let my_lines: Vec<String> = mine
+            .map(|m| m.text.lines().map(|l| l.trim().to_owned()).collect())
+            .unwrap_or_default();
+        let mut text = String::new();
+        let mut in_host = false;
+        for line in b.text.lines() {
+            if is_host_line(line) {
+                in_host = true;
+            }
+            if in_host
+                && let Some((k, v)) = keyword_value(line.trim())
+                && k == "stricthostkeychecking"
+                && trusts_any_key(&v)
+                && !my_lines.iter().any(|l| l == line.trim())
+            {
+                review(
+                    &mut reviews,
+                    &name,
+                    format!(
+                        "left out \"StrictHostKeyChecking {v}\": new host keys are asked about"
+                    ),
+                );
+                continue;
+            }
+            text.push_str(line);
+            text.push('\n');
+        }
+        if let Some(m) = mine {
+            // Our folder (and comments) above the Host line stay.
+            let head = |t: &str| -> String {
+                t.lines()
+                    .take_while(|l| !is_host_line(l))
+                    .map(|l| format!("{l}\n"))
+                    .collect()
+            };
+            let (my_head, their_head) = (head(&m.text), head(&text));
+            if my_head != their_head {
+                let body: String = text
+                    .lines()
+                    .skip_while(|l| !is_host_line(l))
+                    .map(|l| format!("{l}\n"))
+                    .collect();
+                text = format!("{my_head}{body}");
+            }
+            let (before, after) = (watched(&m.text), watched(&text));
+            for k in WATCHED {
+                let old = before.iter().find(|(x, _)| x == k).map(|(_, v)| v.as_str());
+                let new = after.iter().find(|(x, _)| x == k).map(|(_, v)| v.as_str());
+                if old != new {
+                    let shown = |v: Option<&str>| {
+                        v.map_or_else(|| "(not set)".to_owned(), |v| format!("\"{v}\""))
+                    };
+                    review(
+                        &mut reviews,
+                        &name,
+                        format!("{} {} -> {}", display_keyword(k), shown(old), shown(new)),
+                    );
+                }
+            }
+        }
+        out.push_str(&text);
+    }
+    (out, reviews)
+}
+
+/// `keyword` as ssh_config documents it.
+fn display_keyword(keyword: &str) -> &'static str {
+    match keyword {
+        "hostname" => "HostName",
+        "port" => "Port",
+        "user" => "User",
+        "proxyjump" => "ProxyJump",
+        "proxycommand" => "ProxyCommand",
+        "forwardagent" => "ForwardAgent",
+        "forwardx11" => "ForwardX11",
+        "forwardx11trusted" => "ForwardX11Trusted",
+        "userknownhostsfile" => "UserKnownHostsFile",
+        "globalknownhostsfile" => "GlobalKnownHostsFile",
+        "identityfile" => "IdentityFile",
+        _ => "",
+    }
+}
+
+/// [`merge_profiles`] for an import: a connection's own tags here stay
+/// (the file's are added), and so does a Production or Staging theme, so
+/// an import never takes a connection out of a security or theme rule's
+/// reach. What else a replaced profile changes that matters is named.
+pub fn import_profiles(local: &mut Settings, incoming: &Settings) -> (Merged, Vec<Review>) {
+    let before = local.profiles.clone();
+    let merged = merge_profiles(local, incoming);
+    let mut reviews = Vec::new();
+    for p in &mut local.profiles {
+        let Some(old) = before.iter().find(|b| b.host.eq_ignore_ascii_case(&p.host)) else {
+            continue;
+        };
+        if old == p {
+            continue;
+        }
+        let dropped: Vec<String> = old
+            .tags
+            .iter()
+            .filter(|t| !p.tags.iter().any(|n| n.eq_ignore_ascii_case(t)))
+            .cloned()
+            .collect();
+        if !dropped.is_empty() {
+            p.tags.extend(dropped.iter().cloned());
+            review(
+                &mut reviews,
+                &p.host,
+                format!("kept your tags {}", dropped.join(" ")),
+            );
+        }
+        let warning = |t: &Option<String>| {
+            t.as_deref().is_some_and(|t| {
+                t.eq_ignore_ascii_case("Production") || t.eq_ignore_ascii_case("Staging")
+            })
+        };
+        if warning(&old.theme) && p.theme != old.theme {
+            p.theme.clone_from(&old.theme);
+            review(
+                &mut reviews,
+                &p.host,
+                format!(
+                    "kept your {} theme",
+                    old.theme.as_deref().unwrap_or_default()
+                ),
+            );
+        }
+        if p.winrm_ntlm && !old.winrm_ntlm {
+            review(&mut reviews, &p.host, "allows NTLM over plain HTTP".into());
+        }
+        let checks: [(&str, bool); 5] = [
+            ("its password source", p.password != old.password),
+            ("its named credential", p.credential != old.credential),
+            ("its Via SSH connection", p.via != old.via),
+            ("its login script", p.login_script != old.login_script),
+            ("its remote app", p.remote_app != old.remote_app),
+        ];
+        for (what, changed) in checks {
+            if changed {
+                review(&mut reviews, &p.host, format!("changes {what}"));
+            }
+        }
+    }
+    (merged, reviews)
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::indexing_slicing)]
 mod tests {
@@ -879,5 +1128,78 @@ mod tests {
         assert!(!m.changed());
         let changed = Settings::parse("Credential lab\n    User root\n");
         assert!(merge_profiles(&mut local, &changed).changed());
+    }
+
+    #[test]
+    fn an_import_names_what_it_changes_and_keeps_safety() {
+        let local = "# folder: Prod\nHost db1\n    HostName db1.example.com\n    User ops\n\n\
+                     Host lab\n    HostName lab\n    StrictHostKeyChecking no\n";
+        let incoming = "# folder: Misc\nHost db1\n    HostName 10.6.6.6\n    User ops\n    \
+                        StrictHostKeyChecking accept-new\n    ForwardAgent yes\n\n\
+                        Host lab\n    HostName lab\n    StrictHostKeyChecking no\n\n\
+                        Host new\n    StrictHostKeyChecking=off\n";
+        let (text, reviews) = import_hosts(local, incoming);
+        // The host key check that trusts any key is left out, except
+        // where ours already had that very line.
+        assert!(!text.contains("accept-new"));
+        assert!(!text.contains("=off"));
+        assert!(text.contains("Host lab\n    HostName lab\n    StrictHostKeyChecking no\n"));
+        // Our folder stays.
+        assert!(text.contains("# folder: Prod\nHost db1\n"));
+        assert!(!text.contains("Misc"));
+        let db1 = reviews.iter().find(|r| r.name == "db1").unwrap();
+        assert!(db1.notes.iter().any(|n| n.starts_with("left out")));
+        assert!(
+            db1.notes
+                .contains(&"HostName \"db1.example.com\" -> \"10.6.6.6\"".to_owned())
+        );
+        assert!(
+            db1.notes
+                .contains(&"ForwardAgent (not set) -> \"yes\"".to_owned())
+        );
+        assert!(!reviews.iter().any(|r| r.name == "lab"));
+        assert!(reviews.iter().any(|r| r.name == "new"));
+        // And it merges as before.
+        let (merged, m) = merge_hosts(local, &text);
+        assert_eq!((m.added, m.replaced, m.same), (1, 1, 1));
+        assert!(merged.contains("HostName 10.6.6.6"));
+    }
+
+    #[test]
+    fn an_import_keeps_our_tags_and_warning_theme() {
+        let mine = crate::Profile {
+            host: "db1".into(),
+            tags: vec!["prod".into()],
+            theme: Some("Production".into()),
+            ..crate::Profile::default()
+        };
+        let mut local = Settings {
+            profiles: vec![mine],
+            ..Settings::default()
+        };
+        let incoming = Settings {
+            profiles: vec![crate::Profile {
+                host: "DB1".into(),
+                tags: vec!["web".into()],
+                theme: Some("Nord".into()),
+                winrm_ntlm: true,
+                ..crate::Profile::default()
+            }],
+            ..Settings::default()
+        };
+        let (m, reviews) = import_profiles(&mut local, &incoming);
+        assert_eq!(m.replaced, 1);
+        let p = &local.profiles[0];
+        assert_eq!(p.tags, ["web", "prod"]);
+        assert_eq!(p.theme.as_deref(), Some("Production"));
+        assert_eq!(reviews.len(), 1);
+        assert_eq!(
+            reviews[0].notes,
+            [
+                "kept your tags prod",
+                "kept your Production theme",
+                "allows NTLM over plain HTTP"
+            ]
+        );
     }
 }
