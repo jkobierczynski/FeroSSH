@@ -175,7 +175,11 @@ Profile db
     fn profile_then_rules_then_default() {
         let (font, theme) = look("web", "10.0.0.1", Some("production"));
         assert_eq!((font.family.as_str(), font.size_pt), ("Consolas", 13.0));
-        assert_eq!(theme.name, "Solarized Dark", "the profile beats the tag");
+        assert_eq!(
+            theme.name, "Production",
+            "nothing overrides a built-in tag rule, not even the profile"
+        );
+        assert_eq!(look("web", "10.0.0.1", None).1.name, "Solarized Dark");
         let (font, theme) = look("db", "db.corp.example", None);
         assert_eq!(font.family, FontSpec::default().family);
         assert_eq!(font.size_pt, 9.0);
@@ -226,8 +230,8 @@ Profile db
         assert_eq!(lock_for(&s, "other", "x", None), Lock::default());
         // Not enforced: the connection's own look wins as before.
         let s = Settings::parse(
-            "ThemeRule\n    Tags prod\n    Theme Production\n\
-             Profile web\n    Tags prod\n    Theme Dracula\n",
+            "ThemeRule\n    Tags pci\n    Theme Production\n\
+             Profile web\n    Tags pci\n    Theme Dracula\n",
         );
         let (_, theme) = for_host(
             &s,

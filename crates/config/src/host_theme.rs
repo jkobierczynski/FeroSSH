@@ -6,6 +6,8 @@
 //! line such as
 //! `Tag production` both groups the hosts for OpenSSH's `Match tagged` and
 //! colours FeroSSH's panes. The first matching rule wins, like ssh_config.
+//! The built-in tag rules come first and are enforced: no rule, connection
+//! look or pane setting overrides them.
 
 use crate::pattern::{match_host, match_pattern};
 
@@ -127,7 +129,8 @@ impl ThemeRule {
     }
 }
 
-/// The user's rules, then the built-in tag rules.
+/// The built-in tag rules (enforced, so nothing overrides them), then
+/// the user's rules.
 #[derive(Clone, Debug, Default)]
 pub struct HostThemes {
     rules: Vec<ThemeRule>,
@@ -140,7 +143,7 @@ impl HostThemes {
         Self { rules: Vec::new() }
     }
 
-    /// Adds a user rule. User rules are tried in the order added, before
+    /// Adds a user rule. User rules are tried in the order added, after
     /// the built-in ones.
     pub fn push(&mut self, rule: ThemeRule) {
         self.rules.push(rule);
@@ -177,18 +180,22 @@ impl HostThemes {
         tags: &[&str],
         sets: impl Fn(&ThemeRule) -> bool,
     ) -> Option<&ThemeRule> {
-        self.rules
+        // The built-in tag rules are enforced and come first; then the
+        // user's in order.
+        builtin_rules()
             .iter()
-            .chain(builtin_rules())
+            .chain(&self.rules)
             .find(|r| sets(r) && hosts.iter().any(|h| r.matches(h, tags)))
     }
 
     /// What the enforced rules that match fix: each of theme, font and
     /// size from the first enforced rule that sets it.
     pub fn enforced(&self, hosts: &[&str], tags: &[&str]) -> Enforced {
+        // The built-in tag rules first: nothing overrides them.
         let first = |sets: &dyn Fn(&ThemeRule) -> bool| {
-            self.rules
+            builtin_rules()
                 .iter()
+                .chain(&self.rules)
                 .find(|r| r.enforce && sets(r) && hosts.iter().any(|h| r.matches(h, tags)))
         };
         let theme = first(&|r| !r.theme.is_empty());
@@ -208,7 +215,7 @@ impl HostThemes {
         }
     }
 
-    /// The built-in tag rules, after the user's.
+    /// The built-in tag rules: enforced, and tried before the user's.
     pub fn builtin() -> &'static [ThemeRule] {
         builtin_rules()
     }
@@ -240,9 +247,15 @@ fn builtin_rules() -> &'static [ThemeRule] {
     static RULES: OnceLock<[ThemeRule; 3]> = OnceLock::new();
     RULES.get_or_init(|| {
         [
-            ThemeRule::new("Production").tags(&["production", "prod"]),
-            ThemeRule::new("Staging").tags(&["staging", "stage"]),
-            ThemeRule::new("Nord").tags(&["development", "dev"]),
+            ThemeRule::new("Production")
+                .tags(&["production", "prod"])
+                .enforced(),
+            ThemeRule::new("Staging")
+                .tags(&["staging", "stage"])
+                .enforced(),
+            ThemeRule::new("Nord")
+                .tags(&["development", "dev"])
+                .enforced(),
         ]
     })
 }
@@ -277,19 +290,24 @@ mod tests {
     fn enforced_rules_fix_each_field_from_the_first_that_sets_it() {
         let mut t = HostThemes::new();
         t.push(ThemeRule::new("Dracula").tags(&["lab"]));
-        t.push(ThemeRule::new("Production").tags(&["prod"]).enforced());
+        t.push(ThemeRule::new("Production").tags(&["pci"]).enforced());
         t.push(
             ThemeRule::new("")
-                .tags(&["prod"])
+                .tags(&["pci"])
                 .font("Consolas", Some(12.0))
                 .enforced(),
         );
-        let e = t.enforced(&["db1"], &["prod", "lab"]);
+        let e = t.enforced(&["db1"], &["pci", "lab"]);
         assert_eq!(e.theme, Some(("Production".to_owned(), None)));
         assert_eq!(e.font.as_deref(), Some("Consolas"));
         assert_eq!(e.size, Some(12.0));
-        assert_eq!(e.rule.as_deref(), Some("tags prod"));
+        assert_eq!(e.rule.as_deref(), Some("tags pci"));
         assert!(t.enforced(&["db1"], &["lab"]).is_empty());
+        // A built-in tag rule comes before every enforced rule of the user's.
+        t.push(ThemeRule::new("Dracula").tags(&["prod"]).enforced());
+        let e = t.enforced(&["db1"], &["prod"]);
+        assert_eq!(e.theme, Some(("Production".to_owned(), None)));
+        assert_eq!(e.rule.as_deref(), Some("tags production prod"));
         assert_eq!(
             ThemeRule::new("Production")
                 .tags(&["prod"])
@@ -324,8 +342,13 @@ mod tests {
         let r = t.rule_for("db.prod.example.com", &[]);
         assert_eq!(r.map(|r| r.tint), Some(Some(([0x80, 0, 0], 60))));
         assert_eq!(theme(&t, "x", &["qa-eu"]), Some("Staging"));
-        // A user host rule beats a built-in tag.
-        assert_eq!(theme(&t, "prod-web", &["dev"]), Some("Dracula"));
+        // A built-in tag beats every user rule: it cannot be overridden.
+        assert_eq!(theme(&t, "prod-web", &["dev"]), Some("Nord"));
+        assert_eq!(theme(&t, "prod-web", &[]), Some("Dracula"));
+        assert_eq!(
+            t.enforced(&["prod-web"], &["prod"]).theme,
+            Some(("Production".to_owned(), None))
+        );
         assert_eq!(theme(&t, "dev-web", &["dev"]), Some("Nord"));
     }
 
