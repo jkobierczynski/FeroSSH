@@ -139,6 +139,7 @@ use crate::highlight;
 use crate::import_panel;
 use crate::import_reg;
 use crate::import_view::{Found, ImportAction, ImportView, Items};
+use crate::inventory_panel;
 use crate::keymap::{self, KeyDefault, Keymap};
 use crate::known_hosts_panel;
 use crate::known_hosts_view::{self, KnownHostsView};
@@ -415,6 +416,7 @@ const KEY_DEFAULTS: &[KeyDefault] = {
         d(cmd::FILES, Always, &["Ctrl+Shift+E"]),
         d(cmd::FORWARDS, Always, &["Ctrl+Shift+P"]),
         d(cmd::KNOWN_HOSTS, Always, &["Ctrl+Shift+K"]),
+        d(cmd::INVENTORY, Always, &["Ctrl+Shift+I"]),
         d(cmd::SNIPPETS, Always, &["Ctrl+Shift+Space"]),
         d(cmd::PALETTE, Always, &["Ctrl+Shift+A"]),
         d(
@@ -536,6 +538,8 @@ mod cmd {
     pub const FULL_SCREEN_KEY: u32 = 219;
     /// Tools > Known hosts.
     pub const KNOWN_HOSTS: u32 = 220;
+    /// Tools > Inventory.
+    pub const INVENTORY: u32 = 222;
     /// Settings > Font ligatures.
     pub const FONT_LIGATURES: u32 = 221;
     /// Settings > Server status bar.
@@ -1247,6 +1251,8 @@ enum SideView {
     Live,
     /// The known hosts manager (native controls only).
     KnownHosts,
+    /// The connection inventory (native controls only).
+    Inventory,
     /// The command palette, shown over whatever the side pane showed.
     Palette,
 }
@@ -1454,6 +1460,17 @@ struct Window {
     vdesks: HashMap<ChannelId, VirtualDesk>,
     /// Session > Copy public key to this server, by its exec channel.
     key_copies: HashMap<ChannelId, KeyCopy>,
+    /// The inventory's OS and kernel being read, by channel.
+    system_reads: HashMap<ChannelId, SystemRead>,
+    /// Panes opened under a connection's old name before it was renamed:
+    /// the name the pane connects as, and the one the connection has now,
+    /// under which its logins (reconnects too) are kept. A pane opened
+    /// after the rename, or one reused for another connection, keeps its
+    /// own name.
+    inventory_renames: HashMap<PaneId, (String, String)>,
+    /// Renames and deletes the inventory file could not take yet: done
+    /// first at its next change, so it follows the connections in the end.
+    inventory_pending: Vec<InventoryFix>,
     /// Show what changed: each running git's channel, and its tab.
     diffs: HashMap<ChannelId, PaneId>,
     /// The server status bar's samples, by their channel: one per
@@ -1736,6 +1753,16 @@ struct StatsFeed {
 
 /// Session > Copy public key to this server: [`copy_id::command`] on an
 /// exec channel of `connection`.
+/// The inventory's OS and kernel, read by
+/// [`ferossh_config::inventory::SYSTEM_COMMAND`] on an exec channel of
+/// `connection` after a login.
+struct SystemRead {
+    connection: ChannelId,
+    /// The connection's name.
+    alias: String,
+    out: Vec<u8>,
+}
+
 struct KeyCopy {
     connection: ChannelId,
     /// The host, as the user knows it.
@@ -2768,6 +2795,9 @@ fn create_and_run(launch: Launch, theme: Option<String>) -> Result<()> {
                 preview_waiting: Vec::new(),
                 vdesks: HashMap::new(),
                 key_copies: HashMap::new(),
+                system_reads: HashMap::new(),
+                inventory_renames: HashMap::new(),
+                inventory_pending: Vec::new(),
                 diffs: HashMap::new(),
                 stats: HashMap::new(),
                 winrm_closing: HashMap::new(),
@@ -2822,6 +2852,7 @@ fn create_and_run(launch: Launch, theme: Option<String>) -> Result<()> {
                 RailItem::Forwards => cmd::FORWARDS,
                 RailItem::Snippets => cmd::SNIPPETS,
                 RailItem::KnownHosts => cmd::KNOWN_HOSTS,
+                RailItem::Inventory => cmd::INVENTORY,
                 RailItem::Palette => cmd::PALETTE,
                 RailItem::Pin => cmd::TOOLS_PIN,
             });
@@ -2844,6 +2875,8 @@ fn create_and_run(launch: Launch, theme: Option<String>) -> Result<()> {
         let _ = fwd_panel::create(hwnd, fwd_event, dpi);
         // The known hosts manager's, likewise.
         let _ = known_hosts_panel::create(hwnd, known_hosts_event, dpi);
+        // The inventory's, likewise.
+        let _ = inventory_panel::create(hwnd, inventory_event, dpi);
         // The scripts pane's, likewise.
         let _ = scripts_panel::create(hwnd, scripts_event, dpi);
         // The script editor's, likewise.
@@ -2949,6 +2982,7 @@ fn create_and_run(launch: Launch, theme: Option<String>) -> Result<()> {
                 || files_panel::pre_translate(&msg)
                 || fwd_panel::pre_translate(&msg)
                 || known_hosts_panel::pre_translate(&msg)
+                || inventory_panel::pre_translate(&msg)
                 || scripts_panel::pre_translate(&msg)
                 || script_editor::pre_translate(&msg)
                 || script_args::pre_translate(&msg)
@@ -3310,6 +3344,7 @@ fn build_menu() -> Result<HMENU> {
         item(tools, cmd::FORWARDS, "&Port forwards\tCtrl+Shift+P")?;
         item(tools, cmd::SNIPPETS, "Sc&ripts\tCtrl+Shift+Space")?;
         item(tools, cmd::KNOWN_HOSTS, "Known &hosts\tCtrl+Shift+K")?;
+        item(tools, cmd::INVENTORY, "&Inventory\tCtrl+Shift+I")?;
         item(tools, cmd::SNIPPET_FOLDER, "Open scripts f&older")?;
         separator(tools)?;
         item(tools, cmd::NEW_KEY, "New SSH &key...")?;
@@ -5177,6 +5212,8 @@ impl Window {
         self.via.retain(|c, _| workers.contains_key(c));
         self.stats
             .retain(|_, f| workers.contains_key(&f.connection));
+        self.system_reads
+            .retain(|_, r| workers.contains_key(&r.connection));
         // SAFETY: our window and timer.
         unsafe {
             SetTimer(
@@ -5617,6 +5654,151 @@ impl Window {
             .is_some_and(|c| c == connection);
         if shown {
             self.refresh_status();
+        }
+    }
+
+    /// Pane `id` logged in: the inventory keeps when, and the host key;
+    /// with `SystemInfo yes`, the server's OS and kernel are read too.
+    /// Only listed connections are kept, not hosts typed at the prompt.
+    fn inventory_login(&mut self, id: PaneId) {
+        let Some(Host::Ssh(s)) = self.panes.get(&id).map(|p| &p.host) else {
+            return;
+        };
+        // Renamed since the pane was opened: kept under the name it has now.
+        let alias = self
+            .inventory_renames
+            .get(&id)
+            .filter(|(was, _)| was.eq_ignore_ascii_case(&s.target.alias))
+            .map_or_else(|| s.target.alias.clone(), |(_, now)| now.clone());
+        let key = s.host_key_seen.clone();
+        // The connection manager's list fills only once it is shown: a
+        // saved connection opened before that is looked up where kept.
+        if !self.side.list.has_host(&alias)
+            && !host_items(&ssh_env(), &self.settings)
+                .iter()
+                .any(|h| h.name.eq_ignore_ascii_case(&alias))
+        {
+            return;
+        }
+        self.update_inventory(None, |inv| {
+            let key = key.as_ref().map(|(k, f)| (k.as_str(), f.as_str()));
+            inv.connected(&alias, crate::inventory_view::now(), key);
+        });
+        if !self.settings.profile(&alias).is_some_and(|p| p.system_info) {
+            return;
+        }
+        let Some(connection) = self.pane_connection(id) else {
+            return;
+        };
+        let channel = self.new_channel();
+        let Some(w) = self.workers.get(&connection) else {
+            return;
+        };
+        w.link.send(Message::Exec {
+            channel,
+            connection,
+            command: ferossh_config::inventory::SYSTEM_COMMAND
+                .as_bytes()
+                .to_vec(),
+            split_stderr: true,
+        });
+        w.link.send(Message::Eof { channel });
+        self.system_reads.insert(
+            channel,
+            SystemRead {
+                connection,
+                alias,
+                out: Vec::new(),
+            },
+        );
+    }
+
+    /// Changes the inventory file with `fix` (a rename or delete that must
+    /// reach it in the end) and `change`, after what earlier failed writes
+    /// left to do. When the file cannot be written, the fixes wait for the
+    /// next change and the user is told; `change` (a login's time) is
+    /// dropped.
+    fn update_inventory(
+        &mut self,
+        fix: Option<InventoryFix>,
+        change: impl FnOnce(&mut ferossh_config::inventory::Inventory),
+    ) {
+        let mut fixes = std::mem::take(&mut self.inventory_pending);
+        fixes.extend(fix);
+        let result = crate::inventory_view::update(|inv| {
+            for f in &fixes {
+                f.apply(inv);
+            }
+            change(inv);
+        });
+        if let Err(e) = result {
+            self.inventory_pending = fixes;
+            self.queued.push(Command::Notice(format!(
+                "Could not update the inventory: {e}"
+            )));
+        }
+    }
+
+    /// Connection `old` is called `new` now: its inventory row, and a read
+    /// of its OS still under way, follow.
+    fn inventory_renamed(&mut self, old: &str, new: &str) {
+        // Marks only for open panes still connecting as they did.
+        let panes = &self.panes;
+        self.inventory_renames.retain(|id, (was, _)| {
+            matches!(panes.get(id).map(|p| &p.host),
+                Some(Host::Ssh(s)) if s.target.alias.eq_ignore_ascii_case(was))
+        });
+        let under_old: Vec<(PaneId, String)> = self
+            .panes
+            .iter()
+            .filter_map(|(id, p)| {
+                let Host::Ssh(s) = &p.host else { return None };
+                let now = self
+                    .inventory_renames
+                    .get(id)
+                    .map_or(&s.target.alias, |(_, now)| now);
+                now.eq_ignore_ascii_case(old)
+                    .then(|| (*id, s.target.alias.clone()))
+            })
+            .collect();
+        for (id, was) in under_old {
+            self.inventory_renames.insert(id, (was, new.to_owned()));
+        }
+        for r in self.system_reads.values_mut() {
+            if r.alias.eq_ignore_ascii_case(old) {
+                r.alias = new.to_owned();
+            }
+        }
+        self.update_inventory(
+            Some(InventoryFix::Rename(old.to_owned(), new.to_owned())),
+            |_| {},
+        );
+    }
+
+    /// What the inventory's system command printed, or that it ended.
+    fn on_system_read(&mut self, channel: ChannelId, msg: Message) {
+        use ferossh_config::inventory::{MAX_SYSTEM_OUTPUT, parse_system};
+        let Some(r) = self.system_reads.get_mut(&channel) else {
+            return;
+        };
+        match msg {
+            Message::Data { bytes, .. } => {
+                let room = MAX_SYSTEM_OUTPUT.saturating_sub(r.out.len());
+                r.out.extend_from_slice(bytes.get(..room).unwrap_or(&bytes));
+            }
+            Message::Disconnected { .. } => {
+                let Some(r) = self.system_reads.remove(&channel) else {
+                    return;
+                };
+                // A server without `sh` prints no mark: nothing is kept.
+                let Some(info) = parse_system(&r.out) else {
+                    return;
+                };
+                self.update_inventory(None, |inv| {
+                    inv.system(&r.alias, crate::inventory_view::now(), &info);
+                });
+            }
+            _ => {}
         }
     }
 
@@ -6865,6 +7047,9 @@ impl Window {
     /// Like [`Self::connect`], with the command line's `-N` and forwards
     /// for an SSH login.
     fn connect_with(&mut self, id: PaneId, destination: &str, extras: &Extras) {
+        // A connection picked anew, even one with the old name, is not the
+        // renamed one: only a reconnect follows a rename.
+        self.inventory_renames.remove(&id);
         // An `ssh://` link is the host it names; one that does not parse
         // is never read as a host name.
         let link;
@@ -7371,14 +7556,19 @@ impl Window {
             self.policy_of(&j.alias, Some(&j.hostname), j.tag.as_deref())
                 .keys_only
         });
-        let shared = (!rules.keys_only && !hops_keys_only)
+        // The connection to share, and the host key it was checked with
+        // (the shared login sees no key of its own).
+        let shared_with = (!rules.keys_only && !hops_keys_only)
             .then(|| {
                 self.panes.values().find_map(|p| match &p.host {
-                    Host::Ssh(s) if p.id != id && s.can_share(&target) => Some(s.connection),
+                    Host::Ssh(s) if p.id != id && s.can_share(&target) => {
+                        Some((s.connection, s.host_key_seen.clone()))
+                    }
                     _ => None,
                 })
             })
             .flatten();
+        let shared = shared_with.as_ref().map(|(c, _)| *c);
         let channel = self.new_channel();
         // A new login runs in a worker of its own; a shared connection's
         // shell in that connection's.
@@ -7410,6 +7600,9 @@ impl Window {
             .unwrap_or(self.settings.auto_reconnect);
         let mut session = SshSession::new(channel, target, env.known_hosts());
         session.auto_reconnect = auto_reconnect;
+        if let Some((_, key)) = shared_with {
+            session.host_key_seen = key;
+        }
         // A saved proxy password is read only where no rule on the way
         // forbids saved passwords.
         let mut proxy_rules = policy;
@@ -8046,6 +8239,7 @@ impl Window {
                 {
                     // Only the login script and the snippet run: no
                     // forwards, tmux or desktops for a run's sessions.
+                    self.inventory_login(id);
                     self.retries.remove(&id);
                     self.start_log(id);
                     if self.run_login.contains(&id) {
@@ -8084,6 +8278,7 @@ impl Window {
                 Effect::Connected if self.tunnel_only(id) => {
                     // No shell: no login script, tmux or start folder.
                     // The tab holds the forwards open.
+                    self.inventory_login(id);
                     self.retries.remove(&id);
                     self.arm_reconnect_timer();
                     self.start_log(id);
@@ -8118,6 +8313,7 @@ impl Window {
                 Effect::Connected if self.sftp_only(id) => {
                     // No shell: no login script, tmux or start folder.
                     // File transfer opens on the host instead.
+                    self.inventory_login(id);
                     self.retries.remove(&id);
                     self.arm_reconnect_timer();
                     self.start_log(id);
@@ -8135,6 +8331,7 @@ impl Window {
                     self.refresh_chrome();
                 }
                 Effect::Connected => {
+                    self.inventory_login(id);
                     self.retries.remove(&id);
                     self.arm_reconnect_timer();
                     self.start_log(id);
@@ -10629,6 +10826,14 @@ impl Window {
                     self.on_key_copy(c, msg);
                     return false;
                 }
+                if self
+                    .system_reads
+                    .get(&c)
+                    .is_some_and(|r| r.connection == connection)
+                {
+                    self.on_system_read(c, msg);
+                    return false;
+                }
                 if self.diff_on(c) == Some(connection) {
                     self.on_diff(c, msg);
                     return false;
@@ -10706,6 +10911,7 @@ impl Window {
                 }
                 self.vdesks.retain(|_, v| v.connection != connection);
                 self.stats.retain(|_, f| f.connection != connection);
+                self.system_reads.retain(|_, r| r.connection != connection);
                 let lost: Vec<ChannelId> = self
                     .key_copies
                     .iter()
@@ -11931,6 +12137,7 @@ impl Window {
             SideView::Forwards => RailItem::Forwards,
             SideView::Snippets => RailItem::Snippets,
             SideView::KnownHosts => RailItem::KnownHosts,
+            SideView::Inventory => RailItem::Inventory,
             SideView::Palette => RailItem::Palette,
         });
         rail::Look {
@@ -11976,6 +12183,28 @@ impl Window {
     /// Whether the known hosts manager shows (always native controls).
     fn known_hosts_native(&self) -> bool {
         self.side.visible && self.side.view == SideView::KnownHosts
+    }
+
+    /// Reads the inventory and the connections again for Tools >
+    /// Inventory, and shows them.
+    fn reload_inventory(&mut self) {
+        // A file that cannot be read leaves what the list showed, and
+        // says why: a reload never blanks the login history.
+        let inventory = match crate::inventory_view::read() {
+            Ok(inventory) => inventory,
+            Err(e) => {
+                inventory_panel::set_status(format!("Could not read the inventory: {e}"));
+                return;
+            }
+        };
+        let items = host_items(&ssh_env(), &self.settings);
+        let rows = crate::inventory_view::rows(&items, &inventory, &self.settings);
+        inventory_panel::set_rows(rows, self.download_dir());
+    }
+
+    /// Whether the inventory shows (always native controls).
+    fn inventory_native(&self) -> bool {
+        self.side.visible && self.side.view == SideView::Inventory
     }
 
     /// Whether port forwards show as native controls.
@@ -12078,6 +12307,8 @@ impl Window {
             fwd_panel::has_focus()
         } else if self.known_hosts_native() {
             known_hosts_panel::has_focus()
+        } else if self.inventory_native() {
+            inventory_panel::has_focus()
         } else if self.scripts_native() {
             scripts_panel::has_focus()
         } else if self.script_editor_native() {
@@ -12154,6 +12385,11 @@ impl Window {
             known_hosts_panel::place(self.areas.side, self.areas.side_width, self.dpi);
         } else {
             known_hosts_panel::place(None, 0, self.dpi);
+        }
+        if self.inventory_native() {
+            inventory_panel::place(self.areas.side, self.areas.side_width, self.dpi);
+        } else {
+            inventory_panel::place(None, 0, self.dpi);
         }
         if self.scripts_native() {
             scripts_panel::seed_folds(self.settings.expanded_script_cats.clone());
@@ -12258,6 +12494,7 @@ impl Window {
             || self.files_visible()
             || self.fwd_native()
             || self.known_hosts_native()
+            || self.inventory_native()
             || self.scripts_native()
             || self.script_editor_native()
             || self.script_args_native()
@@ -12358,8 +12595,9 @@ impl Window {
                         &self.settings.snippets,
                     );
                 }
-                // Native controls (`files_panel`, `known_hosts_panel`).
-                SideView::Files | SideView::KnownHosts => {}
+                // Native controls (`files_panel`, `known_hosts_panel`,
+                // `inventory_panel`).
+                SideView::Files | SideView::KnownHosts | SideView::Inventory => {}
             }
             self.invalidate_grid(side);
         }
@@ -13306,6 +13544,7 @@ impl Window {
                 RailItem::Forwards => cmd::FORWARDS,
                 RailItem::Snippets => cmd::SNIPPETS,
                 RailItem::KnownHosts => cmd::KNOWN_HOSTS,
+                RailItem::Inventory => cmd::INVENTORY,
                 RailItem::Palette => cmd::PALETTE,
                 RailItem::Pin => return String::new(),
             };
@@ -13636,6 +13875,11 @@ impl Window {
         self.side.visible && self.side.focused && self.side.view == SideView::KnownHosts
     }
 
+    /// Whether a paste is for the Inventory tool.
+    fn inventory_paste(&self) -> bool {
+        self.side.visible && self.side.focused && self.side.view == SideView::Inventory
+    }
+
     fn paste_side(&mut self, text: &str) -> bool {
         if self.side.visible
             && self.side.focused
@@ -13650,7 +13894,7 @@ impl Window {
         // event needs the window, so the paste comes after this borrow);
         // the list has nowhere to paste into, and the terminal behind must
         // not get it either.
-        if self.known_hosts_paste() {
+        if self.known_hosts_paste() || self.inventory_paste() {
             return true;
         }
         if !(self.side.visible && self.side.focused && self.side.view == SideView::Snippets) {
@@ -15086,6 +15330,13 @@ impl Window {
                 let mut hosts = load_saved();
                 let mut settings = self.settings.clone();
                 let name = form.apply(&mut hosts, &mut settings);
+                // The inventory follows a renamed connection (a read-only one
+                // saved under a new name is a copy: it has none yet).
+                let renamed = form
+                    .original
+                    .clone()
+                    .filter(|o| !o.eq_ignore_ascii_case(&name))
+                    .filter(|_| !matches!(form.source, Source::ReadOnly(_)));
                 // Off the Windows Credential Manager, or to another user, host
                 // or port: the old saved password goes. Its name is resolved
                 // before the connection's settings change.
@@ -15108,6 +15359,11 @@ impl Window {
                         "Could not save the connection to {}: {e}",
                         sessions_path().display()
                     )));
+                }
+                // The connection has its new name now: its inventory row
+                // goes with it, whatever happens to the settings below.
+                if let Some(old) = renamed.as_deref() {
+                    self.inventory_renamed(old, &name);
                 }
                 self.settings = settings;
                 // Not saved: the form stays open, so nothing typed is lost.
@@ -15283,6 +15539,10 @@ impl Window {
         self.settings = settings;
         // Unless another connection keeps its password there too.
         self.forget_unused_passwords(targets);
+        // A read still under way for one of them keeps nothing.
+        self.system_reads
+            .retain(|_, r| !names.iter().any(|n| n.eq_ignore_ascii_case(&r.alias)));
+        self.update_inventory(Some(InventoryFix::Remove(names.to_vec())), |_| {});
         self.save_settings();
         self.side.form = None;
         self.reload_sessions(None);
@@ -16814,6 +17074,7 @@ impl Window {
             }
             SideView::Forwards | SideView::Palette => {}
             SideView::KnownHosts => self.reload_known_hosts(),
+            SideView::Inventory => self.reload_inventory(),
             SideView::Live => {
                 let all = self.open_sessions();
                 self.live_view.reset(&all);
@@ -16853,6 +17114,7 @@ impl Window {
             cmd::SNIPPETS => SideView::Snippets,
             cmd::LIVE => SideView::Live,
             cmd::KNOWN_HOSTS => SideView::KnownHosts,
+            cmd::INVENTORY => SideView::Inventory,
             _ => SideView::Sessions,
         };
         let open = self.side.visible && self.side.view == view;
@@ -19458,6 +19720,10 @@ impl Window {
                 (
                     cmd::KNOWN_HOSTS,
                     self.side.visible && self.side.view == SideView::KnownHosts,
+                ),
+                (
+                    cmd::INVENTORY,
+                    self.side.visible && self.side.view == SideView::Inventory,
                 ),
                 (cmd::FOLLOW_CD, s.follow_directory),
                 (cmd::VERIFY, s.verify_transfers),
@@ -22272,6 +22538,7 @@ fn tools_have_focus() -> bool {
         || script_hosts::has_focus()
         || script_report::has_focus()
         || known_hosts_panel::has_focus()
+        || inventory_panel::has_focus()
 }
 
 /// Carries out what the user did on a script run's report: its keys go
@@ -22733,6 +23000,7 @@ fn session_menu(hwnd: HWND, host: Option<String>, search: Option<String>) {
     const SAVE_SEARCH: u32 = 6;
     const REMOVE_SEARCH: u32 = 7;
     const CREDENTIALS: u32 = 8;
+    const INVENTORY: u32 = 9;
     // The search typed, when there is one to save.
     let typed = with_window(|w| {
         let q = w.side.list.query().trim().to_owned();
@@ -22770,6 +23038,7 @@ fn session_menu(hwnd: HWND, host: Option<String>, search: Option<String>) {
         }
         let _ = AppendMenuW(menu, MF_STRING, NEW as usize, w!("&New connection...\tIns"));
         let _ = AppendMenuW(menu, MF_STRING, CREDENTIALS as usize, w!("C&redentials..."));
+        let _ = AppendMenuW(menu, MF_STRING, INVENTORY as usize, w!("&Inventory"));
         if typed.is_some() || search.is_some() {
             let _ = AppendMenuW(menu, MF_SEPARATOR, 0, None);
         }
@@ -22813,6 +23082,10 @@ fn session_menu(hwnd: HWND, host: Option<String>, search: Option<String>) {
             credentials_menu(hwnd);
             return;
         }
+        (INVENTORY, _) => {
+            inventory_window(hwnd);
+            return;
+        }
         (SAVE_SEARCH, _) => match typed {
             Some(q) => SideAction::SaveSearch(q),
             None => return,
@@ -22836,6 +23109,66 @@ fn login_refused(why: &str) -> String {
          connection manager.\x1b[0m\r\n",
         crate::ssh::sanitize(why)
     )
+}
+
+/// Connection manager > Inventory: Tools > Inventory, searched as the
+/// connection manager is.
+fn inventory_window(hwnd: HWND) {
+    let Some(query) = with_window(|w| w.side.list.query().trim().to_owned()) else {
+        return;
+    };
+    let _ = hwnd;
+    with_window(|w| {
+        w.show_side(SideView::Inventory, true);
+        w.update_menu_checks();
+    });
+    inventory_panel::set_search(&query);
+    inventory_panel::focus_search();
+}
+
+/// A change the inventory file must get even when writing it fails at
+/// first: see [`Window::update_inventory`].
+#[derive(Debug, Clone)]
+enum InventoryFix {
+    Rename(String, String),
+    Remove(Vec<String>),
+}
+
+impl InventoryFix {
+    fn apply(&self, inv: &mut ferossh_config::inventory::Inventory) {
+        match self {
+            InventoryFix::Rename(old, new) => inv.rename(old, new),
+            InventoryFix::Remove(names) => {
+                for name in names {
+                    inv.remove(name);
+                }
+            }
+        }
+    }
+}
+
+/// Carries out what the user did in the inventory.
+fn inventory_event(hwnd: HWND, event: inventory_panel::Event) {
+    use inventory_panel::Event;
+    match event {
+        Event::Connect(host) => {
+            if let Some(Some(command)) =
+                with_window(|w| w.side_action(Some(SideAction::Open { host, split: false })))
+            {
+                run_command(hwnd, command);
+            }
+        }
+        Event::Reload => {
+            with_window(|w| {
+                w.reload_inventory();
+                w.refresh_chrome();
+            });
+        }
+        Event::Focused => tools_focused(),
+        Event::Leave => {
+            with_window(Window::focus_terminal);
+        }
+    }
 }
 
 /// The named credentials: a menu of them and New credential; picking one
@@ -23356,7 +23689,13 @@ fn delete_many(hwnd: HWND, names: Vec<String>) {
 fn is_side_pane(id: u32) -> bool {
     matches!(
         id,
-        cmd::SESSIONS | cmd::LIVE | cmd::FILES | cmd::FORWARDS | cmd::SNIPPETS | cmd::KNOWN_HOSTS
+        cmd::SESSIONS
+            | cmd::LIVE
+            | cmd::FILES
+            | cmd::FORWARDS
+            | cmd::SNIPPETS
+            | cmd::KNOWN_HOSTS
+            | cmd::INVENTORY
     )
 }
 
@@ -23581,6 +23920,9 @@ fn run_command(hwnd: HWND, command: Command) {
             if with_window(|w| w.paste_side(&text)) == Some(true) {
                 if with_window(|w| w.known_hosts_paste()) == Some(true) {
                     known_hosts_panel::paste(&text);
+                }
+                if with_window(|w| w.inventory_paste()) == Some(true) {
+                    inventory_panel::paste(&text);
                 }
                 return;
             }
@@ -26202,6 +26544,9 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                     1 if want && with_window(|w| w.known_hosts_native()) == Some(true) => {
                         known_hosts_panel::focus_search();
                     }
+                    1 if want && with_window(|w| w.inventory_native()) == Some(true) => {
+                        inventory_panel::focus_search();
+                    }
                     1 if want && scripts => scripts_panel::focus_first(),
                     1 if want && editor => script_editor::focus_first(),
                     1 if want && args => script_args::focus_first(),
@@ -26337,6 +26682,7 @@ mod tests {
             cmd::FORWARDS,
             cmd::SNIPPETS,
             cmd::KNOWN_HOSTS,
+            cmd::INVENTORY,
         ] {
             assert!(is_side_pane(id), "{id}");
         }

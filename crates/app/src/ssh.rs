@@ -695,6 +695,9 @@ pub struct SshSession {
     /// A security rule allows keys, the agent or a security key only: a
     /// password prompt ends the login.
     pub keys_only: bool,
+    /// The host key the server showed: its type and SHA-256 fingerprint,
+    /// for the inventory.
+    pub host_key_seen: Option<(String, String)>,
     /// The kind of the server prompt being answered.
     prompt_kind: Option<PromptKind>,
     /// The source was asked once; a second password prompt is typed.
@@ -947,6 +950,7 @@ impl SshSession {
             password_source: false,
             remember_password: false,
             keys_only: false,
+            host_key_seen: None,
             prompt_kind: None,
             source_tried: false,
             source_used: false,
@@ -2099,6 +2103,7 @@ impl SshSession {
         else {
             return vec![self.verdict(false)];
         };
+        self.host_key_seen = Some((format!("{} cert", key.kind), key.fingerprint.clone()));
         let known = match self.known() {
             Ok(k) => k,
             Err(why) => return self.unreadable_known_hosts(&why),
@@ -2163,6 +2168,7 @@ impl SshSession {
         let Some(desc) = hostkey::describe(&key) else {
             return vec![self.verdict(false)];
         };
+        self.host_key_seen = Some((desc.kind.clone(), desc.fingerprint.clone()));
         let known = match self.known() {
             Ok(k) => k,
             Err(why) => return self.unreadable_known_hosts(&why),

@@ -270,6 +270,11 @@ impl SessionList {
     }
 
     /// Whether the search typed is one of the saved ones already.
+    /// Whether `name` is one of the listed connections.
+    pub fn has_host(&self, name: &str) -> bool {
+        self.hosts.iter().any(|h| h.name.eq_ignore_ascii_case(name))
+    }
+
     pub fn query_saved(&self) -> bool {
         let q = self.query.trim();
         self.saved_searches

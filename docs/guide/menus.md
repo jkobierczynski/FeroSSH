@@ -88,6 +88,7 @@ Font, theme and text size apply to the focused pane only. Session > Save font an
 | Port forwards | Ctrl+Shift+P | Lists, adds, changes and stops port forwards on live connections (see [Port forwards](everyday-use.md#port-forwards)). |
 | Scripts | Ctrl+Shift+Space | Lists your scripts by category, to type one into the pane or edit them (see [Scripts](everyday-use.md#scripts)). |
 | Known hosts | Ctrl+Shift+K | Lists the host keys in `known_hosts` to search, copy and remove, `@cert-authority` and `@revoked` lines and hashed host names included (see [Known hosts](everyday-use.md#known-hosts)). |
+| Inventory | Ctrl+Shift+I | Lists every connection with its last login, host key and, where read, OS and kernel, to search, sort, save as CSV and connect (see [Inventory](everyday-use.md#inventory)). |
 | Open scripts folder | | Opens `%APPDATA%\FeroSSH\scripts` in Explorer: one file per script, a folder per category, to copy to another PC or back up (see [The scripts folder](everyday-use.md#the-scripts-folder)). |
 | Command palette | Ctrl+Shift+A | One search box over every menu item, connection and script (see [Command palette](everyday-use.md#the-command-palette)). |
 | New SSH key... | | Makes an Ed25519 key file (with or without a passphrase) or a security key or Windows Hello key, and offers to copy it to the focused pane's host (see [Making a key](everyday-use.md#making-a-key-and-putting-it-on-a-server)). |
@@ -198,7 +199,7 @@ Font, theme and text size apply to the focused pane only. Session > Save font an
 
 ## Right-click menu in the connection manager
 
-Right-clicking a host in the connection manager offers Connect (Enter), Open in a split (Shift+Enter), Edit connection... (F2), Delete connection... (Del) and New connection... (Ins). On an empty spot it offers only New connection.
+Right-clicking a host in the connection manager offers Connect (Enter), Open in a split (Shift+Enter), Edit connection... (F2), Delete connection... (Del) and New connection... (Ins). On a host, a folder or empty space it also offers Credentials... (see [Credentials many connections share](everyday-use.md#credentials-many-connections-share)) and Inventory, which opens Tools > Inventory with the connection manager's search (see [Inventory](everyday-use.md#inventory)); with several connections selected, the menu acts on them instead, so clear the selection first.
 
 ## Keys in the side panes
 
@@ -294,6 +295,17 @@ The arrow buttons between the lists move the selection across, and the gap betwe
 | Ctrl+C or Copy fingerprint | Copies the entry's SHA-256 fingerprint. |
 | F5 or Reload | Reads the files again. |
 | Right click or Shift+F10 | Copy fingerprint, Copy line and Remove for the entry. |
+| Escape | Clears the search; with none, gives the keyboard back to the terminal. |
+
+### Inventory (Ctrl+Shift+I)
+
+| Key | Action |
+| --- | --- |
+| Typing | Searches with the connection manager's search words (`tag:prod`, `folder:db`, `-tag:legacy`); plain words also look at the OS, kernel and fingerprint. In the list it goes to the search box; Down there moves to the list. |
+| A click on a column heading | Sorts by that column; again for the other way. |
+| Enter in the list, a double click or Connect | Opens the picked connection. |
+| Save CSV | Writes the rows shown, in their order, to the download folder. |
+| F5 or Reload | Reads the inventory again. |
 | Escape | Clears the search; with none, gives the keyboard back to the terminal. |
 
 ### Scripts (Ctrl+Shift+Space)

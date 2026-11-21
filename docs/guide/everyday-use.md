@@ -218,6 +218,14 @@ What a credential sets wins over the connection's own user, key file and passwor
 
 A security rule limits every connection with a tag, in a folder, or matching a host pattern. It can allow keys only (no password login), keep passwords out of the Windows Credential Manager, turn off agent forwarding, keep the server off your clipboard, ask before connecting, or keep a session log that cannot be turned off. Rules only add limits, and a connection lists the ones that apply when it starts. Write them as `SecurityRule` blocks in `ferossh.conf`; see [Settings](settings.md#security-rules).
 
+### Inventory
+
+**Tools > Inventory** (Ctrl+Shift+I, or the list icon on the tools rail) shows every connection with its address, type, folder, tags, when you last connected, and the host key's type and SHA-256 fingerprint as the server showed it then. The search box takes the connection manager's search words (`tag:prod -tag:legacy`, `folder:db`) and plain words, which also look at the OS, kernel and fingerprint; right-clicking in the connection manager and choosing **Inventory** opens it with what the connection manager's search holds. Click a column heading to sort by it, again for the other way. **Save CSV** writes the rows shown, in that order, to the download folder (times in UTC). **Connect** (Enter, a double click) opens the picked connection, and **Reload** (F5) reads the list again.
+
+The OS and kernel columns are filled for SSH connections that ask for it: **Inventory** in the connection form's Extras, `SystemInfo yes` in the profile, or **Change a field** > **Inventory: OS and kernel** for many. After each login FeroSSH then runs one fixed, read-only command on a channel of its own (`uname -sr`, then `/etc/os-release`, or `sw_vers` on macOS) and keeps the OS name and kernel; nothing is typed into your shell. A login to a server without `sh`, such as Windows, reads nothing new: the columns stay empty, or keep what an earlier login read.
+
+The inventory is kept on this PC only, in `inventory.conf` in `%LOCALAPPDATA%\FeroSSH` (in the data folder when FeroSSH is portable). Only connections in the connection manager are kept, not hosts typed at Connect to...; Telnet and WinRM connections are listed, but only SSH logins are recorded, so their last-connected column stays empty; a renamed connection keeps its row and a deleted one loses it.
+
 ### Importing from other clients
 
 File > Import and export > Import connections lists the clients that have saved sessions on your account: PuTTY and KiTTY (from the registry), WinSCP (registry or `WinSCP.ini`), MobaXterm (`MobaXterm.ini`), mRemoteNG (`confCons.xml`) and SecureCRT (its `Config\Sessions` folder). Pick one to see its sessions, untick what you don't want, and choose Import. *From a file...* reads the same files from a portable install or an export.

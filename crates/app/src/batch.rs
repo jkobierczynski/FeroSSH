@@ -168,7 +168,7 @@ fn neutral(text: &str) -> String {
 }
 
 /// Quotes a CSV field when it needs it, after making it [`neutral`].
-fn csv_field(text: &str) -> String {
+pub(crate) fn csv_field(text: &str) -> String {
     let text = neutral(&text.replace(['\r', '\n'], " "));
     if text.contains([',', '"', ';']) || text.starts_with(' ') {
         format!("\"{}\"", text.replace('"', "\"\""))
