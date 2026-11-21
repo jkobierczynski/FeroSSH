@@ -611,12 +611,13 @@ fn review(reviews: &mut Vec<Review>, name: &str, note: String) {
 
 /// The keywords of a `Host` block whose change an import shows: where the
 /// connection goes, how it gets there and how its host key is checked.
-const WATCHED: [&str; 11] = [
+const WATCHED: [&str; 12] = [
     "hostname",
     "port",
     "user",
     "proxyjump",
     "proxycommand",
+    "proxyserver",
     "forwardagent",
     "forwardx11",
     "forwardx11trusted",
@@ -645,6 +646,19 @@ fn watched(text: &str) -> Vec<(String, String)> {
         }
     }
     out
+}
+
+/// The `Match` sections of a block (the lines from its first `Match`
+/// on, trimmed, without comments): they can set the route or anything
+/// else, so a change to them is named as a whole.
+fn match_lines(text: &str) -> Vec<&str> {
+    text.lines()
+        .skip_while(|l| !is_host_line(l))
+        .skip(1)
+        .map(str::trim)
+        .filter(|t| !t.is_empty() && !t.starts_with('#'))
+        .skip_while(|t| keyword_value(t).is_none_or(|(k, _)| k != "match"))
+        .collect()
 }
 
 /// A list without names (security rules, theme rules, saved searches)
@@ -798,6 +812,15 @@ pub fn import_hosts(local: &str, incoming: &str) -> (String, Vec<Review>) {
                     );
                 }
             }
+            if match_lines(&m.text) != match_lines(&text) {
+                review(
+                    &mut reviews,
+                    &name,
+                    "changes its Match sections, which can change the route or any other \
+                     setting: look them over in the file"
+                        .to_owned(),
+                );
+            }
         }
         out.push_str(&text);
     }
@@ -812,6 +835,7 @@ fn display_keyword(keyword: &str) -> &'static str {
         "user" => "User",
         "proxyjump" => "ProxyJump",
         "proxycommand" => "ProxyCommand",
+        "proxyserver" => "ProxyServer",
         "forwardagent" => "ForwardAgent",
         "forwardx11" => "ForwardX11",
         "forwardx11trusted" => "ForwardX11Trusted",
@@ -1257,6 +1281,29 @@ mod tests {
         assert!(!m.changed());
         let changed = Settings::parse("Credential lab\n    User root\n");
         assert!(merge_profiles(&mut local, &changed).changed());
+    }
+
+    #[test]
+    fn an_import_names_proxy_server_and_match_changes() {
+        let local = "Host web\n    HostName web.example\n    ProxyServer http://a:3128\n\
+                     Match originalhost web\n    ProxyJump trusted\n";
+        let incoming = "Host web\n    HostName web.example\n    ProxyServer http://b:3128\n\
+                        Match originalhost web\n    ProxyJump other\n";
+        let (_, reviews) = import_hosts(local, incoming);
+        assert_eq!(reviews.len(), 1);
+        let notes = &reviews[0].notes;
+        assert!(
+            notes.iter().any(|n| n.starts_with("ProxyServer ")),
+            "{notes:?}"
+        );
+        assert!(
+            notes.iter().any(|n| n.contains("Match sections")),
+            "{notes:?}"
+        );
+        // The same Match sections, comments aside: nothing to say.
+        let same = "Host web\n    HostName web.example\n    ProxyServer http://a:3128\n\
+                    # ours\nMatch originalhost web\n    ProxyJump trusted\n";
+        assert!(import_hosts(local, same).1.is_empty());
     }
 
     #[test]
